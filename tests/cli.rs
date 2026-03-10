@@ -31,6 +31,27 @@ fn startup_summary_shows_role_models() {
 }
 
 #[test]
+fn interactive_mode_accepts_multiple_prompts_from_stdin() {
+    let temp = tempdir().expect("tempdir");
+
+    Command::new(assert_cmd::cargo::cargo_bin!("anvil"))
+        .env("ANVIL_HOME", temp.path())
+        .args(["--model", "pm-model"])
+        .write_stdin("inspect the repository layout\nquit\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "interactive commands: enter a prompt, or `exit` to finish",
+        ))
+        .stdout(predicate::str::contains(
+            "prompt: inspect the repository layout",
+        ))
+        .stdout(predicate::str::contains("response: Reader inspected "))
+        .stdout(predicate::str::contains("awaiting next prompt"))
+        .stdout(predicate::str::contains("interactive mode ended"));
+}
+
+#[test]
 fn prompt_conflicts_with_handoff_command() {
     Command::new(assert_cmd::cargo::cargo_bin!("anvil"))
         .args(["-p", "inspect", "handoff", "export", "session-1"])
@@ -120,6 +141,40 @@ fn resume_can_run_follow_up_prompt() {
         .stdout(predicate::str::contains(
             "Last completed step: summarize the current session",
         ));
+}
+
+#[test]
+fn resumed_session_accepts_interactive_follow_up_from_stdin() {
+    let temp = tempdir().expect("tempdir");
+
+    let start = Command::new(assert_cmd::cargo::cargo_bin!("anvil"))
+        .env("ANVIL_HOME", temp.path())
+        .args(["-p", "inspect the repository layout", "--model", "pm-model"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(start).expect("utf8");
+    let session_line = stdout
+        .lines()
+        .find(|line| line.starts_with("session: "))
+        .expect("session line");
+    let session_id = session_line.trim_start_matches("session: ");
+
+    Command::new(assert_cmd::cargo::cargo_bin!("anvil"))
+        .env("ANVIL_HOME", temp.path())
+        .args(["resume", session_id])
+        .write_stdin("summarize the current session\nexit\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("resuming session"))
+        .stdout(predicate::str::contains(
+            "prompt: summarize the current session",
+        ))
+        .stdout(predicate::str::contains("response: Reader inspected "))
+        .stdout(predicate::str::contains("interactive mode ended"));
 }
 
 #[test]

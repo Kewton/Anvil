@@ -1,3 +1,4 @@
+use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
 use anyhow::{bail, Context};
@@ -62,6 +63,16 @@ pub fn execute(cli: Cli) -> anyhow::Result<()> {
                 "{}",
                 render_startup_summary(&models, permission_mode, network_policy)
             );
+            if cli.prompt.is_none() {
+                run_interactive_loop(
+                    &store,
+                    &registry,
+                    &mut session,
+                    &models,
+                    permission_mode,
+                    network_policy,
+                )?;
+            }
         }
         Some(Command::Handoff { action }) => match action {
             HandoffAction::Export { session_id } => {
@@ -157,8 +168,61 @@ pub fn execute(cli: Cli) -> anyhow::Result<()> {
                     render_startup_summary(&models, permission_mode, network_policy)
                 );
                 println!("state: {}", path.display());
+                run_interactive_loop(
+                    &store,
+                    &registry,
+                    &mut session,
+                    &models,
+                    permission_mode,
+                    network_policy,
+                )?;
             }
         }
+    }
+
+    Ok(())
+}
+
+fn run_interactive_loop(
+    store: &StateStore,
+    registry: &RoleRegistry,
+    session: &mut SessionState,
+    models: &EffectiveModels,
+    permission_mode: PermissionMode,
+    network_policy: NetworkPolicy,
+) -> anyhow::Result<()> {
+    println!("interactive commands: enter a prompt, or `exit` to finish");
+    let stdin = io::stdin();
+    let mut stdout = io::stdout();
+
+    for line in stdin.lock().lines() {
+        let prompt = line.context("failed to read interactive prompt from stdin")?;
+        let trimmed = prompt.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if matches!(trimmed, "exit" | "quit") {
+            println!("interactive mode ended");
+            break;
+        }
+
+        let response = execute_prompt_turn(
+            store,
+            registry,
+            session,
+            models,
+            permission_mode,
+            network_policy,
+            trimmed,
+        )?;
+        println!("prompt: {trimmed}");
+        println!("response: {response}");
+        let snapshot = render_session_snapshot(session);
+        if !snapshot.is_empty() {
+            println!("{snapshot}");
+        }
+        writeln!(stdout, "awaiting next prompt").ok();
+        stdout.flush().ok();
     }
 
     Ok(())
