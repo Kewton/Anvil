@@ -29,16 +29,20 @@ Completed:
 - bounded Editor file mutation through the runtime permission layer
 - task-aware Tester command planning with stdout/stderr evidence capture
 - interactive multi-turn loop for new and resumed sessions
-- interactive slash commands for help, status, snapshot, model summary, and exit
+- interactive slash commands for help, status, snapshot, model summary, history, and exit
+- richer session introspection with recent delegation and recent result history
+- normalized pending/completed-step lifecycle handling for semantically matching steps
+- LM Studio OpenAI-compatible HTTP adapter
+- fixture-based resume/edit/review CLI end-to-end coverage
+- implementation-facing documentation promoted into `README.md` and `docs/runtime-overview.md`
 - initial automated test coverage for CLI, state, policy, trust, runtime/tools, and PM/model routing
 
 Not yet completed:
 
-- LM Studio real request adapter implementation
-- richer turn history and session introspection beyond latest snapshot
-- completed-step / pending-step lifecycle beyond simple append and replace
-- end-to-end validation
-- documentation promotion from `workspace/` into `docs/` and `README.md`
+- broader fixture-based end-to-end coverage including tester and handoff flows
+- live LM Studio smoke verification
+- richer step lifecycle semantics beyond normalized de-duplication
+- further documentation promotion from `workspace/` into stable docs where still needed
 
 ---
 
@@ -168,7 +172,7 @@ Status:
 
 - model client trait is implemented
 - Ollama adapter is implemented and locally validated
-- LM Studio routing exists but is still a stub adapter
+- LM Studio adapter is implemented through the OpenAI-compatible chat completions endpoint
 
 ### 9. Tool Layer
 
@@ -215,7 +219,7 @@ Status:
 - bounded delegation is implemented for Reader, Editor, Tester, and Reviewer
 - `anvil -p` and `anvil resume <id> -p ...` execute through the PM/runtime path
 - new and resumed sessions now support interactive multi-turn stdin loops
-- interactive slash commands provide help, status, snapshot, model summary, and exit controls
+- interactive slash commands provide help, status, snapshot, model summary, history, and exit controls
 
 ### 11. Validation and Test Coverage
 
@@ -236,7 +240,8 @@ Status:
 
 - the listed areas have baseline automated coverage
 - interactive CLI command coverage is in place
-- remaining gaps are true end-to-end flows, live adapter integration tests, and richer fixture coverage
+- a fixture-based resume/edit/review CLI flow is now covered
+- remaining gaps are broader end-to-end flows, live adapter integration tests, and richer fixture coverage
 
 ### 12. Documentation Promotion and Cleanup
 
@@ -253,11 +258,11 @@ Goal:
 
 ## Recommended Immediate Next Steps
 
-1. Implement the real LM Studio adapter and add adapter-level integration tests
-2. Add richer interactive session introspection such as `/history` and recent delegation display
-3. Tighten pending/completed-step lifecycle semantics beyond append-and-replace
-4. Add fixture-based end-to-end tests covering prompt, mutation, validation, resume, and handoff flows
-5. Promote implementation-aligned docs from `workspace/` into `docs/` and update `README.md`
+1. Extend fixture-based end-to-end tests to cover tester and handoff flows
+2. Add live LM Studio smoke verification guidance and optional integration coverage
+3. Tighten pending/completed-step lifecycle semantics beyond normalized de-duplication
+4. Promote any remaining implementation-aligned documents from `workspace/` into stable docs
+5. Add richer session summary or history views only where they improve operator clarity
 
 ---
 
@@ -265,11 +270,11 @@ Goal:
 
 The highest-value remaining items are:
 
-- finish model-provider parity by implementing the LM Studio HTTP adapter
-- expose richer session continuity in the CLI, especially around history and delegation visibility
-- tighten pending/completed work lifecycle semantics
+- broaden end-to-end coverage across tester and handoff paths
+- add repeatable LM Studio live verification
+- tighten pending/completed work lifecycle semantics further
 - add true end-to-end tests that exercise prompt execution, persistence, resume, and tool use together
-- promote current implementation notes into durable user/developer documentation
+- finish promoting implementation notes into durable user/developer documentation
 
 ---
 
@@ -292,6 +297,7 @@ The highest-value remaining items are:
 - cover `anvil -p`, `anvil resume`, and `anvil resume -p` for both PM fast-path and delegated paths
 - add tests that verify startup/session snapshots include last result, pending steps, completed steps, and recommendations
 - add tests for interactive slash commands and multi-turn stdin loops
+- keep expanding fixture-based resume flows
 - add tests for blocked and confirmation-required tool paths surfaced through CLI output
 
 ### 4. Runtime and Tool Tests
@@ -303,7 +309,7 @@ The highest-value remaining items are:
 ### 5. Live Adapter Verification
 
 - keep a local Ollama smoke test using `qwen3.5:35b`
-- add a reproducible LM Studio smoke test once its adapter is implemented
+- add a reproducible LM Studio smoke test now that its adapter is implemented
 - separate live-adapter tests from default unit/integration runs so CI remains stable
 
 ### 6. End-to-End Validation

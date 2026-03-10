@@ -30,6 +30,7 @@ Still in progress:
 - LM Studio
 
 Ollama has been locally verified with `qwen3.5:35b`.
+LM Studio uses the OpenAI-compatible `http://127.0.0.1:1234/v1/chat/completions` endpoint and expects model names in the form `lmstudio/<model-id>`.
 
 ## Implemented CLI Surface
 
@@ -104,6 +105,13 @@ cargo test
 ```
 
 The test suite includes CLI integration tests, session/handoff roundtrips, permission and trust tests, PM/model routing tests, and a small fixture-based resume/edit/review flow.
+
+Manual smoke examples:
+
+```bash
+anvil -p "Reply with exactly: OK" --model qwen3.5:35b --network local-only
+anvil -p "Reply with exactly: OK" --model lmstudio/<your-model-id> --network local-only
+```
 
 ## Docs
 

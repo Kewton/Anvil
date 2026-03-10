@@ -443,3 +443,60 @@ fn e2e_resume_flow_inspects_mutates_and_reviews_fixture_repo() {
         ))
         .stdout(predicate::str::contains("Last delegation: reviewer via pm-model"));
 }
+
+#[test]
+fn handoff_export_and_import_roundtrip_via_cli() {
+    let temp = tempdir().expect("tempdir");
+    let home = temp.path().join("anvil-home");
+    fs::create_dir_all(&home).expect("create anvil home");
+
+    let start = Command::new(assert_cmd::cargo::cargo_bin!("anvil"))
+        .env("ANVIL_HOME", &home)
+        .args(["-p", "inspect sample", "--model", "pm-model"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(start).expect("utf8");
+    let session_line = stdout
+        .lines()
+        .find(|line| line.starts_with("session: "))
+        .expect("session line");
+    let session_id = session_line.trim_start_matches("session: ");
+
+    let export = Command::new(assert_cmd::cargo::cargo_bin!("anvil"))
+        .env("ANVIL_HOME", &home)
+        .args(["handoff", "export", session_id])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let export_path = temp.path().join("handoff.json");
+    fs::write(&export_path, export).expect("write handoff export");
+
+    Command::new(assert_cmd::cargo::cargo_bin!("anvil"))
+        .env("ANVIL_HOME", &home)
+        .args([
+            "handoff",
+            "import",
+            export_path.to_str().expect("utf8 path"),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("imported handoff into"));
+
+    Command::new(assert_cmd::cargo::cargo_bin!("anvil"))
+        .env("ANVIL_HOME", &home)
+        .args(["resume", session_id])
+        .write_stdin("/status\n/exit\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Objective: inspect sample"))
+        .stdout(predicate::str::contains(
+            "Working summary: Reader inspected ",
+        ));
+}

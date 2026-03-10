@@ -94,3 +94,44 @@ Slash commands:
 - step lifecycle is improved but still heuristic
 - end-to-end coverage is still small and fixture-based
 - documentation is still being promoted out of `workspace/`
+
+## Manual Smoke Checks
+
+### Ollama
+
+Validated model:
+
+- `qwen3.5:35b`
+
+Example:
+
+```bash
+anvil -p "Reply with exactly: OK" --model qwen3.5:35b --network local-only
+```
+
+Expected shape:
+
+- response comes from the PM fast path
+- output contains `OK`
+
+### LM Studio
+
+Anvil expects LM Studio's OpenAI-compatible endpoint at `http://127.0.0.1:1234/v1/chat/completions`.
+
+Example:
+
+```bash
+anvil -p "Reply with exactly: OK" --model lmstudio/<your-model-id> --network local-only
+```
+
+Expected shape:
+
+- response comes from the PM fast path
+- output contains `OK`
+- the `lmstudio/` prefix is only routing metadata and is stripped before the HTTP request
+
+If the request fails:
+
+- confirm LM Studio local server is running
+- confirm the loaded model id matches the suffix after `lmstudio/`
+- confirm the server exposes the OpenAI-compatible `/v1/chat/completions` route
