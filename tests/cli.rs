@@ -354,6 +354,24 @@ fn prompt_mode_shows_tester_result_details() {
 }
 
 #[test]
+fn prompt_mode_surfaces_blocked_tester_path() {
+    let temp = tempdir().expect("tempdir");
+
+    Command::new(assert_cmd::cargo::cargo_bin!("anvil"))
+        .env("ANVIL_HOME", temp.path())
+        .args(["-p", "run a build", "--model", "pm-model"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "response: Tester blocked: local validation commands require workspace-write or stronger",
+        ))
+        .stdout(predicate::str::contains(
+            "Last result: tester via pm-model - Tester blocked: local validation commands require workspace-write or stronger",
+        ))
+        .stdout(predicate::str::contains("Permission mode: read-only"));
+}
+
+#[test]
 fn e2e_resume_flow_inspects_mutates_and_reviews_fixture_repo() {
     let temp = tempdir().expect("tempdir");
     let home = temp.path().join("anvil-home");
