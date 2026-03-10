@@ -20,6 +20,8 @@ pub struct AgentResult {
     pub summary: String,
     pub next_recommendation: Option<String>,
     pub commands_run: Vec<String>,
+    pub changed_files: Vec<String>,
+    pub evidence: Vec<(String, String)>,
 }
 
 impl AgentResult {
@@ -29,6 +31,8 @@ impl AgentResult {
             summary: summary.into(),
             next_recommendation: None,
             commands_run: Vec::new(),
+            changed_files: Vec::new(),
+            evidence: Vec::new(),
         }
     }
 
@@ -39,6 +43,16 @@ impl AgentResult {
 
     pub fn with_commands_run(mut self, values: Vec<String>) -> Self {
         self.commands_run = values;
+        self
+    }
+
+    pub fn with_changed_files(mut self, values: Vec<String>) -> Self {
+        self.changed_files = values;
+        self
+    }
+
+    pub fn with_evidence(mut self, values: Vec<(String, String)>) -> Self {
+        self.evidence = values;
         self
     }
 }

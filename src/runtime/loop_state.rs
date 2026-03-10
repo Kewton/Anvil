@@ -1,7 +1,7 @@
 use crate::agents::pm::{AgentRole, PmAgent};
 use crate::roles::EffectiveModels;
 use crate::runtime::engine::RuntimeEngine;
-use crate::state::session::{DelegationRecord, ResultRecord, SessionState};
+use crate::state::session::{DelegationRecord, EvidenceRecord, ResultRecord, SessionState};
 use crate::util::clock::now_rfc3339;
 
 #[derive(Debug, Default)]
@@ -37,12 +37,22 @@ impl RuntimeLoop {
                 .expect("non-pm results must come from delegated roles");
             let next_recommendation = outcome.result.next_recommendation.clone();
             let commands_run = outcome.result.commands_run.clone();
+            let changed_files = outcome.result.changed_files.clone();
+            let evidence = outcome
+                .result
+                .evidence
+                .iter()
+                .map(|(source_type, value)| EvidenceRecord {
+                    source_type: source_type.clone(),
+                    value: value.clone(),
+                })
+                .collect();
             session.recent_results.push(ResultRecord {
                 role: outcome.result.role.clone(),
                 model: resolved_model_for(models, role).to_string(),
                 summary: outcome.result.summary.clone(),
-                evidence: Vec::new(),
-                changed_files: Vec::new(),
+                evidence,
+                changed_files,
                 commands_run,
                 next_recommendation: next_recommendation.clone(),
                 findings: Vec::new(),

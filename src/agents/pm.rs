@@ -124,6 +124,8 @@ fn decide_strategy(prompt: &str) -> ExecutionStrategy {
         || normalized.contains("implement")
         || normalized.contains("change")
         || normalized.contains("fix")
+        || normalized.contains("apply")
+        || normalized.contains("update")
     {
         return ExecutionStrategy::Delegate(AgentRole::Editor);
     }

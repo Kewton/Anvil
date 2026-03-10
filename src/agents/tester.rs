@@ -16,17 +16,28 @@ impl TesterAgent {
                 cwd: task.workspace_root.clone(),
             },
         }) {
-            Ok(RuntimeToolOutcome::Allowed(ToolResponse::ExecResult(result))) => AgentResult::new(
-                "tester",
-                format!(
-                    "Tester ran `{}` with exit code {:?} while handling: {}",
-                    command.display, result.exit_code, task.description
-                ),
-            )
-            .with_next_recommendation(
-                "Inspect the validation output and decide whether another focused check is needed",
-            )
-            .with_commands_run(vec![command.display.to_string()]),
+            Ok(RuntimeToolOutcome::Allowed(ToolResponse::ExecResult(result))) => {
+                let mut evidence = Vec::new();
+                if let Some(stdout) = first_non_empty_line(&result.stdout) {
+                    evidence.push(("tool-output".to_string(), format!("stdout: {stdout}")));
+                }
+                if let Some(stderr) = first_non_empty_line(&result.stderr) {
+                    evidence.push(("tool-output".to_string(), format!("stderr: {stderr}")));
+                }
+
+                AgentResult::new(
+                    "tester",
+                    format!(
+                        "Tester ran `{}` with exit code {:?} while handling: {}",
+                        command.display, result.exit_code, task.description
+                    ),
+                )
+                .with_next_recommendation(
+                    "Inspect the validation output and decide whether another focused check is needed",
+                )
+                .with_commands_run(vec![command.display.to_string()])
+                .with_evidence(evidence)
+            }
             Ok(RuntimeToolOutcome::Blocked(reason)) => {
                 AgentResult::new("tester", format!("Tester blocked: {reason}"))
             }
@@ -42,6 +53,13 @@ impl TesterAgent {
             ),
         }
     }
+}
+
+fn first_non_empty_line(text: &str) -> Option<String> {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| line.chars().take(200).collect())
 }
 
 struct ValidationCommand {

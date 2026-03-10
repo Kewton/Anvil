@@ -10,6 +10,8 @@ use anvil::runtime::{NetworkPolicy, PermissionMode};
 use anvil::state::session::{AgentModels, SessionState};
 use anvil::tools::registry::ToolRegistry;
 use clap::Parser;
+use std::fs;
+use tempfile::tempdir;
 
 struct TestClient {
     prefix: &'static str,
@@ -110,6 +112,41 @@ fn pm_agent_delegates_editor_work() {
 }
 
 #[test]
+fn editor_can_apply_bounded_mutation_when_explicitly_requested() {
+    let registry = RoleRegistry::load_builtin().expect("registry");
+    let cli = anvil::cli::Cli::parse_from([
+        "anvil",
+        "--model",
+        "pm-model",
+        "--permission-mode",
+        "workspace-write",
+    ]);
+    let models = EffectiveModels::from_cli(&cli, &registry).expect("models");
+    let pm = PmAgent::default();
+    let temp = tempdir().expect("tempdir");
+    let file = temp.path().join("sample.rs");
+    fs::write(&file, "fn main() {}\n").expect("write fixture");
+    let runtime = runtime_at(temp.path().to_path_buf(), PermissionMode::WorkspaceWrite);
+
+    let outcome = pm
+        .run_turn(
+            &models,
+            "apply update file sample",
+            "[source=user]\napply update file sample",
+            &runtime,
+        )
+        .expect("pm turn");
+
+    assert_eq!(outcome.delegated_role, Some(AgentRole::Editor));
+    assert!(outcome
+        .result
+        .summary
+        .contains("applied a bounded mutation"));
+    let updated = fs::read_to_string(&file).expect("read mutated file");
+    assert!(updated.contains("anvil-mvp: apply update file sample"));
+}
+
+#[test]
 fn runtime_loop_records_delegations_and_results() {
     let registry = RoleRegistry::load_builtin().expect("registry");
     let cli = anvil::cli::Cli::parse_from([
@@ -179,6 +216,7 @@ fn pm_agent_subagents_use_runtime_tools() {
     assert_eq!(tester.delegated_role, Some(AgentRole::Tester));
     assert!(tester.result.summary.contains("cargo check"));
     assert_eq!(tester.result.commands_run, vec!["cargo check"]);
+    assert!(!tester.result.evidence.is_empty());
 
     let editor = pm
         .run_turn(
@@ -190,6 +228,7 @@ fn pm_agent_subagents_use_runtime_tools() {
         .expect("editor turn");
     assert_eq!(editor.delegated_role, Some(AgentRole::Editor));
     assert!(editor.result.summary.contains("target"));
+    assert!(!editor.result.changed_files.is_empty());
 
     let reviewer = pm
         .run_turn(
@@ -226,6 +265,10 @@ fn sample_session() -> SessionState {
 
 fn runtime(permission_mode: PermissionMode) -> RuntimeEngine {
     let root = std::env::current_dir().expect("cwd");
+    runtime_at(root, permission_mode)
+}
+
+fn runtime_at(root: std::path::PathBuf, permission_mode: PermissionMode) -> RuntimeEngine {
     RuntimeEngine::new(
         SandboxPolicy::new(permission_mode, NetworkPolicy::Disabled, root, vec![]),
         ToolRegistry::default(),

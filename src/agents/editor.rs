@@ -37,6 +37,16 @@ impl EditorAgent {
             .as_ref()
             .and_then(|path| read_preview(runtime, path).ok())
             .unwrap_or_else(|| "no preview available".to_string());
+        let changed_files: Vec<String> = target
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect();
+
+        if should_apply_mutation(&task.description) {
+            if let Some(path) = target.as_ref() {
+                return apply_mutation(task, runtime, path, preview, changed_files);
+            }
+        }
 
         AgentResult::new(
             "editor",
@@ -51,6 +61,7 @@ impl EditorAgent {
             ),
         )
         .with_next_recommendation("Apply the smallest viable patch to the selected target file")
+        .with_changed_files(changed_files)
     }
 }
 
@@ -84,4 +95,95 @@ fn read_preview(runtime: &RuntimeEngine, path: &PathBuf) -> anyhow::Result<Strin
         RuntimeToolOutcome::Blocked(reason) => Ok(format!("blocked: {reason}")),
         RuntimeToolOutcome::NeedsConfirmation(reason) => Ok(format!("confirm: {reason}")),
     }
+}
+
+fn read_contents(runtime: &RuntimeEngine, path: &PathBuf) -> anyhow::Result<String> {
+    match runtime.checked_execute(ToolRequest::ReadFile { path: path.clone() })? {
+        RuntimeToolOutcome::Allowed(ToolResponse::FileContents(result)) => Ok(result.contents),
+        RuntimeToolOutcome::Allowed(_) => Ok(String::new()),
+        RuntimeToolOutcome::Blocked(reason) => Ok(format!("blocked: {reason}")),
+        RuntimeToolOutcome::NeedsConfirmation(reason) => Ok(format!("confirm: {reason}")),
+    }
+}
+
+fn should_apply_mutation(description: &str) -> bool {
+    let normalized = description.to_ascii_lowercase();
+    normalized.contains("apply")
+        || normalized.contains("append")
+        || normalized.contains("write")
+        || normalized.contains("update file")
+}
+
+fn apply_mutation(
+    task: &AgentTask,
+    runtime: &RuntimeEngine,
+    path: &PathBuf,
+    preview: String,
+    changed_files: Vec<String>,
+) -> AgentResult {
+    let existing = match read_contents(runtime, path) {
+        Ok(contents) => contents,
+        Err(error) => {
+            return AgentResult::new(
+                "editor",
+                format!("Editor failed to read target file: {error}"),
+            )
+        }
+    };
+
+    let note = build_note(path, &task.description);
+    let updated = if existing.ends_with('\n') {
+        format!("{existing}{note}\n")
+    } else {
+        format!("{existing}\n{note}\n")
+    };
+
+    match runtime.checked_execute(ToolRequest::WriteFile {
+        path: path.clone(),
+        contents: updated,
+    }) {
+        Ok(RuntimeToolOutcome::Allowed(ToolResponse::WriteResult(result))) => AgentResult::new(
+            "editor",
+            format!(
+                "Editor applied a bounded mutation for {} to {} ({} bytes) with preview: {}",
+                task.description,
+                result.path.display(),
+                result.bytes_written,
+                preview
+            ),
+        )
+        .with_next_recommendation("Run a focused tester pass against the mutated file")
+        .with_changed_files(changed_files)
+        .with_evidence(vec![(
+            "repo-file".to_string(),
+            format!("mutated {}", result.path.display()),
+        )]),
+        Ok(RuntimeToolOutcome::Blocked(reason)) => {
+            AgentResult::new("editor", format!("Editor blocked: {reason}"))
+        }
+        Ok(RuntimeToolOutcome::NeedsConfirmation(reason)) => {
+            AgentResult::new("editor", format!("Editor awaiting confirmation: {reason}"))
+        }
+        Ok(RuntimeToolOutcome::Allowed(_)) | Err(_) => AgentResult::new(
+            "editor",
+            format!(
+                "Editor could not apply a bounded mutation for: {}",
+                task.description
+            ),
+        ),
+    }
+}
+
+fn build_note(path: &PathBuf, description: &str) -> String {
+    let prefix = match path.extension().and_then(|ext| ext.to_str()) {
+        Some("rs" | "js" | "ts" | "tsx" | "jsx" | "java" | "c" | "cc" | "cpp" | "go" | "swift") => {
+            "//"
+        }
+        Some("py" | "sh" | "rb" | "yml" | "yaml" | "toml") => "#",
+        Some("md" | "txt") => "-",
+        _ => "//",
+    };
+
+    let summary: String = description.chars().take(120).collect();
+    format!("{prefix} anvil-mvp: {summary}")
 }
