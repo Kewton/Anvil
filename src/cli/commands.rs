@@ -23,13 +23,13 @@ pub fn execute(cli: Cli) -> anyhow::Result<()> {
     let registry = RoleRegistry::load_builtin().context("failed to load builtin role registry")?;
     let store = StateStore::default();
 
-    if cli.prompt.is_some() && cli.command.is_some() {
-        bail!("--prompt cannot be used together with a subcommand");
+    if cli.prompt.is_some() && matches!(cli.command, Some(Command::Handoff { .. })) {
+        bail!("--prompt cannot be used together with handoff commands");
     }
 
     match &cli.command {
         Some(Command::Resume { session_id }) => {
-            let session = store.load_session(&registry, session_id)?;
+            let mut session = store.load_session(&registry, session_id)?;
             let models = EffectiveModels::from_session(&cli, &registry, &session)?;
             let permission_mode = cli
                 .permission_mode
@@ -41,6 +41,19 @@ pub fn execute(cli: Cli) -> anyhow::Result<()> {
                 .unwrap_or(session.network_policy);
             println!("resuming session: {session_id}");
             println!("objective: {}", session.objective);
+            if let Some(prompt) = &cli.prompt {
+                let response = execute_prompt_turn(
+                    &store,
+                    &registry,
+                    &mut session,
+                    &models,
+                    permission_mode,
+                    network_policy,
+                    prompt,
+                )?;
+                println!("prompt: {prompt}");
+                println!("response: {response}");
+            }
             println!(
                 "{}",
                 render_startup_summary(&models, permission_mode, network_policy)
@@ -102,23 +115,15 @@ pub fn execute(cli: Cli) -> anyhow::Result<()> {
             let mut session = build_session_state(&cli, &models, permission_mode, network_policy);
 
             if let Some(prompt) = &cli.prompt {
-                let workspace_root =
-                    std::env::current_dir().context("failed to determine current directory")?;
-                let repo_instructions = RepoInstructions::load(&workspace_root)?;
-                let sandbox =
-                    SandboxPolicy::new(permission_mode, network_policy, workspace_root, vec![]);
-                let engine =
-                    RuntimeEngine::new(sandbox, ToolRegistry::default(), repo_instructions);
-                let context = engine.build_context(prompt, Vec::new());
-                let response = RuntimeLoop::run_prompt(
+                let response = execute_prompt_turn(
+                    &store,
+                    &registry,
                     &mut session,
                     &models,
-                    &PmAgent::default(),
-                    &engine,
-                    &context,
+                    permission_mode,
+                    network_policy,
                     prompt,
                 )?;
-                let path = store.save_session(&registry, &session)?;
                 println!("prompt mode");
                 println!("prompt: {prompt}");
                 println!("response: {response}");
@@ -127,7 +132,10 @@ pub fn execute(cli: Cli) -> anyhow::Result<()> {
                     "{}",
                     render_startup_summary(&models, permission_mode, network_policy)
                 );
-                println!("state: {}", path.display());
+                println!(
+                    "state: {}",
+                    store.session_path(&session.session_id).display()
+                );
             } else {
                 let path = store.save_session(&registry, &session)?;
                 println!("interactive mode");
@@ -142,6 +150,33 @@ pub fn execute(cli: Cli) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn execute_prompt_turn(
+    store: &StateStore,
+    registry: &RoleRegistry,
+    session: &mut SessionState,
+    models: &EffectiveModels,
+    permission_mode: PermissionMode,
+    network_policy: NetworkPolicy,
+    prompt: &str,
+) -> anyhow::Result<String> {
+    let workspace_root =
+        std::env::current_dir().context("failed to determine current directory")?;
+    let repo_instructions = RepoInstructions::load(&workspace_root)?;
+    let sandbox = SandboxPolicy::new(permission_mode, network_policy, workspace_root, vec![]);
+    let engine = RuntimeEngine::new(sandbox, ToolRegistry::default(), repo_instructions);
+    let context = engine.build_context(prompt, Vec::new());
+    let response = RuntimeLoop::run_prompt(
+        session,
+        models,
+        &PmAgent::default(),
+        &engine,
+        &context,
+        prompt,
+    )?;
+    store.save_session(registry, session)?;
+    Ok(response)
 }
 
 fn build_session_state(

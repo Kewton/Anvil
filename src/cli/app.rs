@@ -21,7 +21,7 @@ pub struct Cli {
     pub permission_mode: Option<PermissionModeArg>,
     #[arg(long = "network", value_enum, global = true)]
     pub network_policy: Option<NetworkPolicyArg>,
-    #[arg(short = 'p', long)]
+    #[arg(short = 'p', long, global = true)]
     pub prompt: Option<String>,
     #[command(subcommand)]
     pub command: Option<Command>,

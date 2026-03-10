@@ -28,13 +28,13 @@ fn startup_summary_shows_role_models() {
 }
 
 #[test]
-fn prompt_conflicts_with_subcommand() {
+fn prompt_conflicts_with_handoff_command() {
     Command::new(assert_cmd::cargo::cargo_bin!("anvil"))
-        .args(["-p", "inspect", "resume", "session-1"])
+        .args(["-p", "inspect", "handoff", "export", "session-1"])
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "--prompt cannot be used together with a subcommand",
+            "--prompt cannot be used together with handoff commands",
         ));
 }
 
@@ -79,6 +79,38 @@ fn resume_uses_stored_models_until_overridden() {
         .stdout(predicate::str::contains("Editor: editor-override"))
         .stdout(predicate::str::contains("Permission mode: workspace-write"))
         .stdout(predicate::str::contains("Network: local-only"));
+}
+
+#[test]
+fn resume_can_run_follow_up_prompt() {
+    let temp = tempdir().expect("tempdir");
+
+    let start = Command::new(assert_cmd::cargo::cargo_bin!("anvil"))
+        .env("ANVIL_HOME", temp.path())
+        .args(["-p", "inspect the repository layout", "--model", "pm-model"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(start).expect("utf8");
+    let session_line = stdout
+        .lines()
+        .find(|line| line.starts_with("session: "))
+        .expect("session line");
+    let session_id = session_line.trim_start_matches("session: ");
+
+    Command::new(assert_cmd::cargo::cargo_bin!("anvil"))
+        .env("ANVIL_HOME", temp.path())
+        .args(["resume", session_id, "-p", "summarize the current session"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("resuming session"))
+        .stdout(predicate::str::contains(
+            "prompt: summarize the current session",
+        ))
+        .stdout(predicate::str::contains("response: Reader inspected "));
 }
 
 #[test]
