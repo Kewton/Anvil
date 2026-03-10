@@ -116,6 +116,9 @@ fn resume_can_run_follow_up_prompt() {
         .stdout(predicate::str::contains("response: Reader inspected "))
         .stdout(predicate::str::contains(
             "Working summary: Reader inspected ",
+        ))
+        .stdout(predicate::str::contains(
+            "Last completed step: summarize the current session",
         ));
 }
 
@@ -134,6 +137,9 @@ fn prompt_mode_returns_pm_or_subagent_result() {
         ))
         .stdout(predicate::str::contains(
             "Pending steps: Use the matched files",
+        ))
+        .stdout(predicate::str::contains(
+            "Last completed step: inspect the repository layout",
         ))
         .stdout(predicate::str::contains(
             "Next recommendation: Use the matched files",

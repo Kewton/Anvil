@@ -25,7 +25,8 @@ impl TesterAgent {
             )
             .with_next_recommendation(
                 "Inspect the validation output and decide whether another focused check is needed",
-            ),
+            )
+            .with_commands_run(vec![command.display.to_string()]),
             Ok(RuntimeToolOutcome::Blocked(reason)) => {
                 AgentResult::new("tester", format!("Tester blocked: {reason}"))
             }

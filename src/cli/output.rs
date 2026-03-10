@@ -48,6 +48,10 @@ pub fn render_session_snapshot(session: &SessionState) -> String {
         ));
     }
 
+    if let Some(step) = session.completed_steps.last() {
+        lines.push(format!("Last completed step: {step}"));
+    }
+
     if let Some(result) = session.recent_results.last() {
         lines.push(format!(
             "Last result: {} via {} - {}",

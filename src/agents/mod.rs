@@ -19,6 +19,7 @@ pub struct AgentResult {
     pub role: String,
     pub summary: String,
     pub next_recommendation: Option<String>,
+    pub commands_run: Vec<String>,
 }
 
 impl AgentResult {
@@ -27,11 +28,17 @@ impl AgentResult {
             role: role.into(),
             summary: summary.into(),
             next_recommendation: None,
+            commands_run: Vec::new(),
         }
     }
 
     pub fn with_next_recommendation(mut self, value: impl Into<String>) -> Self {
         self.next_recommendation = Some(value.into());
+        self
+    }
+
+    pub fn with_commands_run(mut self, values: Vec<String>) -> Self {
+        self.commands_run = values;
         self
     }
 }

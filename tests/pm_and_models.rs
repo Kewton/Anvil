@@ -139,6 +139,8 @@ fn runtime_loop_records_delegations_and_results() {
     assert_eq!(session.recent_delegations[0].role, "reviewer");
     assert_eq!(session.recent_delegations[0].resolved_model, "review-model");
     assert_eq!(session.recent_results.len(), 1);
+    assert_eq!(session.completed_steps, vec!["review the current diff"]);
+    assert!(session.pending_steps[0].contains("Review the flagged files"));
 }
 
 #[test]
@@ -176,6 +178,7 @@ fn pm_agent_subagents_use_runtime_tools() {
         .expect("tester turn");
     assert_eq!(tester.delegated_role, Some(AgentRole::Tester));
     assert!(tester.result.summary.contains("cargo check"));
+    assert_eq!(tester.result.commands_run, vec!["cargo check"]);
 
     let editor = pm
         .run_turn(
