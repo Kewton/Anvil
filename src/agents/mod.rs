@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 pub mod editor;
 pub mod pm;
 pub mod prompt_loader;
@@ -9,6 +11,7 @@ pub mod tester;
 pub struct AgentTask {
     pub description: String,
     pub context: String,
+    pub workspace_root: PathBuf,
 }
 
 #[derive(Debug, Clone)]

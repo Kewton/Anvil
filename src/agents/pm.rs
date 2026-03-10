@@ -6,6 +6,7 @@ use crate::agents::{AgentResult, AgentTask};
 use crate::models::client::ModelRequest;
 use crate::models::routing::ModelRouter;
 use crate::roles::EffectiveModels;
+use crate::runtime::engine::RuntimeEngine;
 
 pub struct PmAgent {
     router: ModelRouter,
@@ -43,6 +44,7 @@ impl PmAgent {
         models: &EffectiveModels,
         user_prompt: &str,
         context: &str,
+        runtime: &RuntimeEngine,
     ) -> anyhow::Result<PmTurnOutcome> {
         match decide_strategy(user_prompt) {
             ExecutionStrategy::FastPath => {
@@ -69,12 +71,13 @@ impl PmAgent {
                 let task = AgentTask {
                     description: user_prompt.to_string(),
                     context: context.to_string(),
+                    workspace_root: runtime.workspace_root().to_path_buf(),
                 };
                 let result = match role {
-                    AgentRole::Reader => self.reader.run(&task),
-                    AgentRole::Editor => self.editor.run(&task),
-                    AgentRole::Tester => self.tester.run(&task),
-                    AgentRole::Reviewer => self.reviewer.run(&task),
+                    AgentRole::Reader => self.reader.run(&task, runtime),
+                    AgentRole::Editor => self.editor.run(&task, runtime),
+                    AgentRole::Tester => self.tester.run(&task, runtime),
+                    AgentRole::Reviewer => self.reviewer.run(&task, runtime),
                 };
 
                 Ok(PmTurnOutcome {

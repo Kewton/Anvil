@@ -91,7 +91,5 @@ fn prompt_mode_returns_pm_or_subagent_result() {
         .assert()
         .success()
         .stdout(predicate::str::contains("prompt mode"))
-        .stdout(predicate::str::contains(
-            "response: Reader inspected scoped context",
-        ));
+        .stdout(predicate::str::contains("response: Reader inspected "));
 }

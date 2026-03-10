@@ -1,10 +1,14 @@
 use anvil::agents::pm::{AgentRole, PmAgent};
+use anvil::config::repo_instructions::RepoInstructions;
 use anvil::models::client::{ModelClient, ModelRequest, ModelResponse};
 use anvil::models::routing::ModelRouter;
 use anvil::roles::{EffectiveModels, RoleRegistry};
+use anvil::runtime::engine::RuntimeEngine;
 use anvil::runtime::loop_state::RuntimeLoop;
+use anvil::runtime::sandbox::SandboxPolicy;
 use anvil::runtime::{NetworkPolicy, PermissionMode};
 use anvil::state::session::{AgentModels, SessionState};
+use anvil::tools::registry::ToolRegistry;
 use clap::Parser;
 
 struct TestClient {
@@ -63,12 +67,14 @@ fn pm_agent_uses_fast_path_for_small_clarifications() {
         prefix: "",
         provider: "pm-test",
     })]));
+    let runtime = runtime(PermissionMode::ReadOnly);
 
     let outcome = pm
         .run_turn(
             &models,
             "what is the current objective?",
             "[source=user]\nwhat is the current objective?",
+            &runtime,
         )
         .expect("pm turn");
 
@@ -85,17 +91,22 @@ fn pm_agent_delegates_editor_work() {
     let cli = anvil::cli::Cli::parse_from(["anvil", "--model", "pm-model"]);
     let models = EffectiveModels::from_cli(&cli, &registry).expect("models");
     let pm = PmAgent::default();
+    let runtime = runtime(PermissionMode::WorkspaceWrite);
 
     let outcome = pm
         .run_turn(
             &models,
             "implement the parser fix",
             "[source=user]\nimplement the parser fix",
+            &runtime,
         )
         .expect("pm turn");
 
     assert_eq!(outcome.delegated_role, Some(AgentRole::Editor));
-    assert!(outcome.result.summary.contains("Editor prepared"));
+    assert!(outcome
+        .result
+        .summary
+        .contains("Editor prepared a bounded edit plan"));
 }
 
 #[test]
@@ -111,11 +122,13 @@ fn runtime_loop_records_delegations_and_results() {
     let models = EffectiveModels::from_cli(&cli, &registry).expect("models");
     let pm = PmAgent::default();
     let mut session = sample_session();
+    let runtime = runtime(PermissionMode::WorkspaceWrite);
 
     let summary = RuntimeLoop::run_prompt(
         &mut session,
         &models,
         &pm,
+        &runtime,
         "[source=user]\nreview the current diff",
         "review the current diff",
     )
@@ -126,6 +139,65 @@ fn runtime_loop_records_delegations_and_results() {
     assert_eq!(session.recent_delegations[0].role, "reviewer");
     assert_eq!(session.recent_delegations[0].resolved_model, "review-model");
     assert_eq!(session.recent_results.len(), 1);
+}
+
+#[test]
+fn pm_agent_subagents_use_runtime_tools() {
+    let registry = RoleRegistry::load_builtin().expect("registry");
+    let cli = anvil::cli::Cli::parse_from([
+        "anvil",
+        "--model",
+        "pm-model",
+        "--permission-mode",
+        "workspace-write",
+    ]);
+    let models = EffectiveModels::from_cli(&cli, &registry).expect("models");
+    let pm = PmAgent::default();
+    let runtime = runtime(PermissionMode::WorkspaceWrite);
+
+    let reader = pm
+        .run_turn(
+            &models,
+            "inspect the repository layout",
+            "[source=user]\ninspect the repository layout",
+            &runtime,
+        )
+        .expect("reader turn");
+    assert_eq!(reader.delegated_role, Some(AgentRole::Reader));
+    assert!(reader.result.summary.contains("Reader inspected"));
+
+    let tester = pm
+        .run_turn(
+            &models,
+            "test the current setup",
+            "[source=user]\ntest the current setup",
+            &runtime,
+        )
+        .expect("tester turn");
+    assert_eq!(tester.delegated_role, Some(AgentRole::Tester));
+    assert!(tester.result.summary.contains("cargo --version"));
+
+    let editor = pm
+        .run_turn(
+            &models,
+            "implement the parser fix",
+            "[source=user]\nimplement the parser fix",
+            &runtime,
+        )
+        .expect("editor turn");
+    assert_eq!(editor.delegated_role, Some(AgentRole::Editor));
+    assert!(editor.result.summary.contains("target"));
+
+    let reviewer = pm
+        .run_turn(
+            &models,
+            "review the current diff",
+            "[source=user]\nreview the current diff",
+            &runtime,
+        )
+        .expect("reviewer turn");
+    assert_eq!(reviewer.delegated_role, Some(AgentRole::Reviewer));
+    assert!(reviewer.result.summary.contains("risk pass"));
 }
 
 fn sample_session() -> SessionState {
@@ -147,4 +219,13 @@ fn sample_session() -> SessionState {
         recent_delegations: Vec::new(),
         recent_results: Vec::new(),
     }
+}
+
+fn runtime(permission_mode: PermissionMode) -> RuntimeEngine {
+    let root = std::env::current_dir().expect("cwd");
+    RuntimeEngine::new(
+        SandboxPolicy::new(permission_mode, NetworkPolicy::Disabled, root, vec![]),
+        ToolRegistry::default(),
+        RepoInstructions::default(),
+    )
 }

@@ -1,5 +1,6 @@
 use crate::agents::pm::{AgentRole, PmAgent};
 use crate::roles::EffectiveModels;
+use crate::runtime::engine::RuntimeEngine;
 use crate::state::session::{DelegationRecord, ResultRecord, SessionState};
 use crate::util::clock::now_rfc3339;
 
@@ -11,10 +12,11 @@ impl RuntimeLoop {
         session: &mut SessionState,
         models: &EffectiveModels,
         pm: &PmAgent,
+        runtime: &RuntimeEngine,
         context: &str,
         prompt: &str,
     ) -> anyhow::Result<String> {
-        let outcome = pm.run_turn(models, prompt, context)?;
+        let outcome = pm.run_turn(models, prompt, context, runtime)?;
 
         if let Some(role) = outcome.delegated_role {
             session.recent_delegations.push(DelegationRecord {

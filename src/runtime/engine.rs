@@ -7,7 +7,6 @@ use crate::runtime::sandbox::{PermissionDecision, SandboxPolicy};
 use crate::runtime::trust::SourceType;
 use crate::tools::registry::{ToolRegistry, ToolRequest, ToolResponse};
 
-#[derive(Debug)]
 pub struct RuntimeEngine {
     sandbox: SandboxPolicy,
     tools: ToolRegistry,
@@ -28,19 +27,29 @@ impl RuntimeEngine {
     }
 
     pub fn execute(&self, request: ToolRequest) -> anyhow::Result<RuntimeEvent> {
+        match self.checked_execute(request)? {
+            RuntimeToolOutcome::Allowed(response) => Ok(RuntimeEvent {
+                message: describe_response(&response),
+            }),
+            RuntimeToolOutcome::NeedsConfirmation(reason) => Ok(RuntimeEvent {
+                message: format!("confirmation required: {reason}"),
+            }),
+            RuntimeToolOutcome::Blocked(reason) => Ok(RuntimeEvent {
+                message: format!("blocked: {reason}"),
+            }),
+        }
+    }
+
+    pub fn checked_execute(&self, request: ToolRequest) -> anyhow::Result<RuntimeToolOutcome> {
         match self.sandbox.evaluate(&request) {
             PermissionDecision::Allowed => {
                 let response = self.tools.execute(request)?;
-                Ok(RuntimeEvent {
-                    message: describe_response(&response),
-                })
+                Ok(RuntimeToolOutcome::Allowed(response))
             }
-            PermissionDecision::NeedsConfirmation(reason) => Ok(RuntimeEvent {
-                message: format!("confirmation required: {reason}"),
-            }),
-            PermissionDecision::Blocked(reason) => Ok(RuntimeEvent {
-                message: format!("blocked: {reason}"),
-            }),
+            PermissionDecision::NeedsConfirmation(reason) => {
+                Ok(RuntimeToolOutcome::NeedsConfirmation(reason))
+            }
+            PermissionDecision::Blocked(reason) => Ok(RuntimeToolOutcome::Blocked(reason)),
         }
     }
 
@@ -77,4 +86,11 @@ fn describe_response(response: &ToolResponse) -> String {
         }
         ToolResponse::Diff(diff) => format!("diff produced {} bytes", diff.len()),
     }
+}
+
+#[derive(Debug, Clone)]
+pub enum RuntimeToolOutcome {
+    Allowed(ToolResponse),
+    NeedsConfirmation(String),
+    Blocked(String),
 }

@@ -114,6 +114,7 @@ pub fn execute(cli: Cli) -> anyhow::Result<()> {
                     &mut session,
                     &models,
                     &PmAgent::default(),
+                    &engine,
                     &context,
                     prompt,
                 )?;
