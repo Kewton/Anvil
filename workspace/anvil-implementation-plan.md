@@ -33,16 +33,18 @@ Completed:
 - richer session introspection with recent delegation and recent result history
 - normalized pending/completed-step lifecycle handling for semantically matching steps
 - LM Studio OpenAI-compatible HTTP adapter
-- fixture-based resume/edit/review CLI end-to-end coverage
+- fixture-based resume/edit/test/review CLI end-to-end coverage
+- CLI handoff export/import roundtrip coverage
+- CLI blocked tester-path coverage in read-only mode
 - implementation-facing documentation promoted into `README.md` and `docs/runtime-overview.md`
 - initial automated test coverage for CLI, state, policy, trust, runtime/tools, and PM/model routing
 
 Not yet completed:
 
-- broader fixture-based end-to-end coverage including tester and handoff flows
 - live LM Studio smoke verification
 - richer step lifecycle semantics beyond normalized de-duplication
 - further documentation promotion from `workspace/` into stable docs where still needed
+- CLI-visible confirmation-path coverage for networked or destructive actions
 
 ---
 
@@ -240,8 +242,9 @@ Status:
 
 - the listed areas have baseline automated coverage
 - interactive CLI command coverage is in place
-- a fixture-based resume/edit/review CLI flow is now covered
-- remaining gaps are broader end-to-end flows, live adapter integration tests, and richer fixture coverage
+- fixture-based resume/edit/test/review and handoff CLI flows are now covered
+- blocked tester-path CLI coverage is in place
+- remaining gaps are live adapter integration tests, confirmation-path CLI coverage, and richer fixture breadth
 
 ### 12. Documentation Promotion and Cleanup
 
@@ -258,9 +261,9 @@ Goal:
 
 ## Recommended Immediate Next Steps
 
-1. Extend fixture-based end-to-end tests to cover tester and handoff flows
-2. Add live LM Studio smoke verification guidance and optional integration coverage
-3. Tighten pending/completed-step lifecycle semantics beyond normalized de-duplication
+1. Add repeatable LM Studio live verification and optional integration coverage
+2. Tighten pending/completed-step lifecycle semantics beyond normalized de-duplication
+3. Expose or test confirmation-required CLI paths for networked or destructive actions
 4. Promote any remaining implementation-aligned documents from `workspace/` into stable docs
 5. Add richer session summary or history views only where they improve operator clarity
 
@@ -270,10 +273,10 @@ Goal:
 
 The highest-value remaining items are:
 
-- broaden end-to-end coverage across tester and handoff paths
 - add repeatable LM Studio live verification
 - tighten pending/completed work lifecycle semantics further
-- add true end-to-end tests that exercise prompt execution, persistence, resume, and tool use together
+- add CLI-visible confirmation-path coverage for networked or destructive actions
+- add more true end-to-end tests that exercise prompt execution, persistence, resume, and tool use together
 - finish promoting implementation notes into durable user/developer documentation
 
 ---
@@ -297,7 +300,7 @@ The highest-value remaining items are:
 - cover `anvil -p`, `anvil resume`, and `anvil resume -p` for both PM fast-path and delegated paths
 - add tests that verify startup/session snapshots include last result, pending steps, completed steps, and recommendations
 - add tests for interactive slash commands and multi-turn stdin loops
-- keep expanding fixture-based resume flows
+- keep expanding fixture-based resume flows where they add new behavioral coverage
 - add tests for blocked and confirmation-required tool paths surfaced through CLI output
 
 ### 4. Runtime and Tool Tests
