@@ -7,6 +7,7 @@ Anvil/
 ├─ README.md
 ├─ docs/
 │  └─ directory-structure.md
+│  └─ memory-policy.md
 │  └─ runtime-overview.md
 ├─ schemas/
 │  ├─ role-registry.schema.json
@@ -56,5 +57,6 @@ Anvil/
 
 - `schemas/role-registry.json` is the canonical checked-in role registry instance.
 - `schemas/*.schema.json` define the machine-readable contracts used by runtime state.
+- `docs/memory-policy.md` captures the current intended policy for optional user memory.
 - `docs/runtime-overview.md` describes the currently implemented runtime surfaces.
 - `workspace/` still holds active planning documents that have not yet been promoted into stable docs.

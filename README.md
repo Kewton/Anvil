@@ -123,5 +123,6 @@ ANVIL_LM_STUDIO_MODEL=lmstudio/<your-model-id> \
 ## Docs
 
 - [Runtime Overview](/Users/maenokota/share/work/github_kewton/Anvil/docs/runtime-overview.md)
+- [Memory Policy](/Users/maenokota/share/work/github_kewton/Anvil/docs/memory-policy.md)
 - [Directory Structure](/Users/maenokota/share/work/github_kewton/Anvil/docs/directory-structure.md)
 - [Current Implementation Plan](/Users/maenokota/share/work/github_kewton/Anvil/workspace/anvil-implementation-plan.md)
