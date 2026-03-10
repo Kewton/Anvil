@@ -1,0 +1,79 @@
+{
+  "formatVersion": "1",
+  "defaultSessionRole": "pm",
+  "roles": [
+    {
+      "id": "pm",
+      "displayName": "PM",
+      "description": "Primary user-facing coordinator responsible for session state, delegation, and final responses.",
+      "enabledInMvp": true,
+      "userFacing": true,
+      "supportsModelOverride": true,
+      "defaultPermission": "read-only",
+      "capabilities": [
+        "user-interaction",
+        "state-management"
+      ]
+    },
+    {
+      "id": "reader",
+      "displayName": "Reader",
+      "description": "Repository inspection and factual understanding over bounded code context.",
+      "enabledInMvp": true,
+      "userFacing": true,
+      "supportsModelOverride": true,
+      "defaultPermission": "read-only",
+      "capabilities": [
+        "repository-inspection"
+      ]
+    },
+    {
+      "id": "planner",
+      "displayName": "Planner",
+      "description": "Optional internal planning role that may remain merged into PM during the MVP.",
+      "enabledInMvp": false,
+      "userFacing": false,
+      "supportsModelOverride": false,
+      "defaultPermission": "read-only",
+      "capabilities": [
+        "planning"
+      ]
+    },
+    {
+      "id": "editor",
+      "displayName": "Editor",
+      "description": "Focused code modification within an explicit file scope.",
+      "enabledInMvp": true,
+      "userFacing": true,
+      "supportsModelOverride": true,
+      "defaultPermission": "workspace-write",
+      "capabilities": [
+        "file-edit"
+      ]
+    },
+    {
+      "id": "tester",
+      "displayName": "Tester",
+      "description": "Validation through tests, builds, linters, and bounded command execution.",
+      "enabledInMvp": true,
+      "userFacing": true,
+      "supportsModelOverride": true,
+      "defaultPermission": "workspace-write",
+      "capabilities": [
+        "command-execution"
+      ]
+    },
+    {
+      "id": "reviewer",
+      "displayName": "Reviewer",
+      "description": "Diff and regression review focused on correctness risks and missing validation.",
+      "enabledInMvp": true,
+      "userFacing": true,
+      "supportsModelOverride": true,
+      "defaultPermission": "read-only",
+      "capabilities": [
+        "review"
+      ]
+    }
+  ]
+}

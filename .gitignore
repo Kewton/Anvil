@@ -1,0 +1,13 @@
+/target
+/.idea
+/.vscode
+/.DS_Store
+*.log
+
+# Local runtime state
+/.anvil
+/tmp
+
+# Environment files
+.env
+.env.*
