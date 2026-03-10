@@ -35,6 +35,7 @@ impl RuntimeLoop {
             let role = outcome
                 .delegated_role
                 .expect("non-pm results must come from delegated roles");
+            let next_recommendation = outcome.result.next_recommendation.clone();
             session.recent_results.push(ResultRecord {
                 role: outcome.result.role.clone(),
                 model: resolved_model_for(models, role).to_string(),
@@ -42,10 +43,11 @@ impl RuntimeLoop {
                 evidence: Vec::new(),
                 changed_files: Vec::new(),
                 commands_run: Vec::new(),
-                next_recommendation: None,
+                next_recommendation: next_recommendation.clone(),
                 findings: Vec::new(),
             });
             trim_tail(&mut session.recent_results, 20);
+            update_pending_steps(session, next_recommendation);
         }
         session.working_summary = outcome.result.summary.clone();
 
@@ -57,6 +59,14 @@ fn trim_tail<T>(items: &mut Vec<T>, max: usize) {
     if items.len() > max {
         let excess = items.len() - max;
         items.drain(0..excess);
+    }
+}
+
+fn update_pending_steps(session: &mut SessionState, next_recommendation: Option<String>) {
+    if let Some(step) = next_recommendation {
+        session.pending_steps.retain(|existing| existing != &step);
+        session.pending_steps.push(step);
+        trim_tail(&mut session.pending_steps, 20);
     }
 }
 

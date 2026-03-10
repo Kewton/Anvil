@@ -22,6 +22,9 @@ impl ReviewerAgent {
                         task.description, changed_files
                     ),
                 )
+                .with_next_recommendation(
+                    "Review the flagged files and decide whether a tester pass is needed",
+                )
             }
             Ok(RuntimeToolOutcome::Blocked(reason)) => {
                 AgentResult::new("reviewer", format!("Reviewer blocked: {reason}"))

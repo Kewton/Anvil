@@ -50,6 +50,7 @@ impl EditorAgent {
                 preview
             ),
         )
+        .with_next_recommendation("Apply the smallest viable patch to the selected target file")
     }
 }
 

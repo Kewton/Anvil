@@ -132,5 +132,11 @@ fn prompt_mode_returns_pm_or_subagent_result() {
         .stdout(predicate::str::contains(
             "Working summary: Reader inspected ",
         ))
+        .stdout(predicate::str::contains(
+            "Pending steps: Use the matched files",
+        ))
+        .stdout(predicate::str::contains(
+            "Next recommendation: Use the matched files",
+        ))
         .stdout(predicate::str::contains("response: Reader inspected "));
 }

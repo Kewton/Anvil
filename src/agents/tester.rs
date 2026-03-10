@@ -22,6 +22,9 @@ impl TesterAgent {
                     "Tester ran `{}` with exit code {:?} while handling: {}",
                     command.display, result.exit_code, task.description
                 ),
+            )
+            .with_next_recommendation(
+                "Inspect the validation output and decide whether another focused check is needed",
             ),
             Ok(RuntimeToolOutcome::Blocked(reason)) => {
                 AgentResult::new("tester", format!("Tester blocked: {reason}"))

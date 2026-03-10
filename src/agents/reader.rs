@@ -39,6 +39,9 @@ impl ReaderAgent {
                 cwd, matches, needle, task.description
             ),
         )
+        .with_next_recommendation(
+            "Use the matched files to decide whether editing or review is needed",
+        )
     }
 }
 

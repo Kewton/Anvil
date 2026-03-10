@@ -18,6 +18,7 @@ pub struct AgentTask {
 pub struct AgentResult {
     pub role: String,
     pub summary: String,
+    pub next_recommendation: Option<String>,
 }
 
 impl AgentResult {
@@ -25,6 +26,12 @@ impl AgentResult {
         Self {
             role: role.into(),
             summary: summary.into(),
+            next_recommendation: None,
         }
+    }
+
+    pub fn with_next_recommendation(mut self, value: impl Into<String>) -> Self {
+        self.next_recommendation = Some(value.into());
+        self
     }
 }

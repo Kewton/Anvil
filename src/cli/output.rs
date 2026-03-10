@@ -53,6 +53,9 @@ pub fn render_session_snapshot(session: &SessionState) -> String {
             "Last result: {} via {} - {}",
             result.role, result.model, result.summary
         ));
+        if let Some(next) = &result.next_recommendation {
+            lines.push(format!("Next recommendation: {next}"));
+        }
     } else if let Some(delegation) = session.recent_delegations.last() {
         lines.push(format!(
             "Last delegation: {} via {}",
