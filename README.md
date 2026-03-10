@@ -124,6 +124,7 @@ ANVIL_LM_STUDIO_MODEL=lmstudio/<your-model-id> \
 
 - [Runtime Overview](/Users/maenokota/share/work/github_kewton/Anvil/docs/runtime-overview.md)
 - [Agent Architecture](/Users/maenokota/share/work/github_kewton/Anvil/docs/agent-architecture.md)
+- [Model Routing](/Users/maenokota/share/work/github_kewton/Anvil/docs/model-routing.md)
 - [Runtime Permissions](/Users/maenokota/share/work/github_kewton/Anvil/docs/runtime-permissions.md)
 - [Memory Policy](/Users/maenokota/share/work/github_kewton/Anvil/docs/memory-policy.md)
 - [Trust Model](/Users/maenokota/share/work/github_kewton/Anvil/docs/trust-model.md)

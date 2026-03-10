@@ -9,6 +9,7 @@ Anvil/
 │  └─ directory-structure.md
 │  └─ agent-architecture.md
 │  └─ memory-policy.md
+│  └─ model-routing.md
 │  └─ runtime-permissions.md
 │  └─ runtime-overview.md
 │  └─ trust-model.md
@@ -62,6 +63,7 @@ Anvil/
 - `schemas/*.schema.json` define the machine-readable contracts used by runtime state.
 - `docs/agent-architecture.md` describes the PM-centered delegation model and current role boundaries.
 - `docs/memory-policy.md` captures the current intended policy for optional user memory.
+- `docs/model-routing.md` captures PM-default model inheritance and per-role override behavior.
 - `docs/runtime-permissions.md` captures the currently implemented runtime permission model.
 - `docs/runtime-overview.md` describes the currently implemented runtime surfaces.
 - `docs/trust-model.md` captures the current source-precedence and prompt-injection posture.
