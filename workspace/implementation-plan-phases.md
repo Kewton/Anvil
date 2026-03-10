@@ -17,6 +17,11 @@ Anvil の実装は Phase ごとに進める。
 - agent loop と CLI は統合テストで押さえる
 - 危険操作、権限、壊れた tool call は必ず回帰テストを持つ
 
+テストモデル方針:
+
+- Ollama を使う実機確認では `qwen3.5:35b` を基準モデルとして使用する
+- provider adapter の unit test は fake server を使うが、Milestone 受け入れテストでは `qwen3.5:35b` を実際に使う
+
 ## レビュー結果
 
 この計画は大枠では十分だが、初版には以下の不足があったため本版で反映した。
@@ -51,6 +56,7 @@ Anvil の実装は Phase ごとに進める。
 - [ ] `AuditEvent` serialize / deserialize テスト
 - [ ] `AuditEvent` schema version 後方互換テスト
 - [ ] fake HTTP / fake FS / fake clock の基盤テスト
+- [ ] `cargo fmt --check` / `clippy` を通す最小 quality gate テスト
 
 実装:
 
@@ -69,6 +75,7 @@ Anvil の実装は Phase ごとに進める。
 - [ ] `PermissionPolicy` の表駆動テストがすべて通る
 - [ ] 監査イベント型が JSONL 化できる
 - [ ] CI 上で単体テストと最小統合テストが実行できる
+- [ ] `fmt` / `clippy` を常時回せる
 
 ## Phase 1: Ollama MVP
 
@@ -97,6 +104,7 @@ Anvil の実装は Phase ごとに進める。
 - [ ] `ANVIL-MEMORY.md` load と `/memory add` の統合テスト
 - [ ] permission flow の回帰テスト
 - [ ] session persistence の回帰テスト
+- [ ] `qwen3.5:35b` を使った Ollama 実機疎通テスト
 
 実装:
 
@@ -111,6 +119,7 @@ Anvil の実装は Phase ごとに進める。
 - [ ] `src/instructions/anvil_md.rs`
 - [ ] `src/state/memory.rs`
 - [ ] `src/slash/builtins.rs` の `/memory add`
+- [ ] Ollama 実機確認用 fixture / smoke prompt
 
 TDD の観点:
 
@@ -127,6 +136,7 @@ TDD の観点:
 - [ ] 権限確認と audit log が破綻しない
 - [ ] `ANVIL.md` と `ANVIL-MEMORY.md` の基本機能が動く
 - [ ] Ollama だけで MVP が完結する
+- [ ] 壊れた tool call を誤実行せず fail-closed で停止できる
 
 ## Phase 2: 実用化
 
@@ -197,6 +207,8 @@ TDD の観点:
 - [ ] TTY 非依存 renderer contract test
 - [ ] file change detection method の回帰テスト
 - [ ] audit log volume / rotation の性能テスト
+- [ ] summary latency budget テスト
+- [ ] subagent 起動時の latency budget テスト
 
 実装:
 
@@ -218,6 +230,7 @@ TDD の観点:
 - [ ] UI が Claude Code に近い操作感を持つ
 - [ ] token budget 制御が機能する
 - [ ] change detection が大規模リポジトリでも過負荷にならない
+- [ ] summary / subagent / audit log の性能予算が守られる
 
 ## Phase 4: 拡張フェーズ
 
@@ -299,6 +312,23 @@ TDD の観点:
 
 - [ ] Phase 1 完了
 - [ ] Ollama MVP が使える
+- [ ] `qwen3.5:35b` での Ollama 受け入れ確認が完了している
+- [ ] `./sandbox/<timestamp>/` を作成し、「ブラウザから直接実行可能なカッコ良いスペースインベーダーゲーム」を生成できる
+- [ ] 生成物をブラウザで実行して動作確認できる
+
+Milestone B 受け入れテスト:
+
+1. `./sandbox` 配下にタイムスタンプ付きディレクトリを作成する
+2. `qwen3.5:35b` を使って one-shot または対話モードでゲーム生成タスクを実行する
+3. 出力先はブラウザから直接実行可能な静的ファイル構成にする
+4. 見た目が明確に作り込まれたスペースインベーダーゲームであることを確認する
+5. ブラウザで起動し、少なくとも以下を確認する
+   - ゲーム画面が表示される
+   - 自機移動ができる
+   - 敵が表示される
+   - 弾発射ができる
+   - 当たり判定またはスコア更新が動く
+6. 生成時の監査ログと実行ログを保存する
 
 ### Milestone C
 
