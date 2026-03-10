@@ -10,6 +10,7 @@ Anvil/
 │  └─ agent-architecture.md
 │  └─ memory-policy.md
 │  └─ model-routing.md
+│  └─ repo-instructions.md
 │  └─ runtime-permissions.md
 │  └─ runtime-overview.md
 │  └─ trust-model.md
@@ -28,6 +29,8 @@ Anvil/
 │  ├─ anvil.md
 │  ├─ config.example.toml
 │  └─ handoff.example.json
+├─ scripts/
+│  └─ lm_studio_smoke.sh
 ├─ src/
 │  ├─ main.rs
 │  ├─ lib.rs
@@ -61,9 +64,11 @@ Anvil/
 
 - `schemas/role-registry.json` is the canonical checked-in role registry instance.
 - `schemas/*.schema.json` define the machine-readable contracts used by runtime state.
+- `scripts/lm_studio_smoke.sh` wraps the opt-in LM Studio live smoke test with endpoint/model env defaults.
 - `docs/agent-architecture.md` describes the PM-centered delegation model and current role boundaries.
 - `docs/memory-policy.md` captures the current intended policy for optional user memory.
 - `docs/model-routing.md` captures PM-default model inheritance and per-role override behavior.
+- `docs/repo-instructions.md` explains how `anvil.md` is loaded and where its authority stops.
 - `docs/runtime-permissions.md` captures the currently implemented runtime permission model.
 - `docs/runtime-overview.md` describes the currently implemented runtime surfaces.
 - `docs/trust-model.md` captures the current source-precedence and prompt-injection posture.

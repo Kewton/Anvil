@@ -147,3 +147,11 @@ Optional integration test:
 ANVIL_LM_STUDIO_MODEL=lmstudio/<your-model-id> \
   cargo test --test pm_and_models -- --ignored lm_studio_live_smoke_test
 ```
+
+Repeatable wrapper:
+
+```bash
+ANVIL_LM_STUDIO_ENDPOINT=http://192.168.11.6:1234 \
+ANVIL_LM_STUDIO_MODEL=lmstudio/qwen3.5-35b-a3b \
+./scripts/lm_studio_smoke.sh
+```

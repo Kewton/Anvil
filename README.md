@@ -22,7 +22,6 @@ Implemented today:
 
 Still in progress:
 
-- repeatable LM Studio live verification in a running local environment
 - further lifecycle refinement beyond the current normalized and role-local pending-step rules
 - any remaining `workspace/` drafts that prove stable enough to promote
 
@@ -125,12 +124,21 @@ ANVIL_LM_STUDIO_MODEL=lmstudio/<your-model-id> \
   cargo test --test pm_and_models -- --ignored lm_studio_live_smoke_test
 ```
 
+Repeatable wrapper:
+
+```bash
+ANVIL_LM_STUDIO_ENDPOINT=http://192.168.11.6:1234 \
+ANVIL_LM_STUDIO_MODEL=lmstudio/qwen3.5-35b-a3b \
+./scripts/lm_studio_smoke.sh
+```
+
 ## Docs
 
 - [Runtime Overview](/Users/maenokota/share/work/github_kewton/Anvil/docs/runtime-overview.md)
 - [Agent Architecture](/Users/maenokota/share/work/github_kewton/Anvil/docs/agent-architecture.md)
 - [Model Routing](/Users/maenokota/share/work/github_kewton/Anvil/docs/model-routing.md)
 - [Runtime Permissions](/Users/maenokota/share/work/github_kewton/Anvil/docs/runtime-permissions.md)
+- [Repository Instructions](/Users/maenokota/share/work/github_kewton/Anvil/docs/repo-instructions.md)
 - [Memory Policy](/Users/maenokota/share/work/github_kewton/Anvil/docs/memory-policy.md)
 - [Trust Model](/Users/maenokota/share/work/github_kewton/Anvil/docs/trust-model.md)
 - [Directory Structure](/Users/maenokota/share/work/github_kewton/Anvil/docs/directory-structure.md)

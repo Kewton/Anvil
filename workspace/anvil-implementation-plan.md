@@ -41,6 +41,7 @@ Completed:
 - CLI confirmation-required tester-path coverage for destructive validation requests
 - CLI approval and denial coverage for destructive confirmation paths
 - opt-in LM Studio live smoke test coverage
+- repeatable LM Studio smoke wrapper under `scripts/lm_studio_smoke.sh`
 - role-aware pending-step replacement for successive recommendations
 - stale pending-step cleanup through normalization-aware compaction
 - implementation-facing documentation promoted into `README.md` and `docs/runtime-overview.md`
@@ -48,7 +49,6 @@ Completed:
 
 Not yet completed:
 
-- repeatable execution of LM Studio live smoke verification in a running local environment
 - lifecycle semantics beyond normalization, role-local replacement, and stale-step compaction
 - further documentation promotion from `workspace/` into stable docs where still needed
 
@@ -270,11 +270,11 @@ Goal:
 
 ## Recommended Immediate Next Steps
 
-1. Run repeatable LM Studio live verification in a running local environment
-2. Tighten pending/completed-step lifecycle semantics beyond the current normalization and compaction heuristics
-3. Promote any remaining implementation-aligned documents from `workspace/` into stable docs
-4. Expand fixture coverage only where it adds genuinely new runtime behavior
-5. Add richer session inspection only where it materially improves operator clarity
+1. Tighten pending/completed-step lifecycle semantics beyond the current normalization and compaction heuristics
+2. Promote any remaining implementation-aligned documents from `workspace/` into stable docs
+3. Expand fixture coverage only where it adds genuinely new runtime behavior
+4. Add richer session inspection only where it materially improves operator clarity
+5. Keep the LM Studio wrapper aligned with real operator environments as endpoint defaults evolve
 
 ---
 
@@ -282,7 +282,6 @@ Goal:
 
 The highest-value remaining items are:
 
-- add repeatable LM Studio live verification
 - tighten pending/completed work lifecycle semantics further
 - add more end-to-end tests only where they exercise behavior not already covered by current fixture and confirmation flows
 - finish promoting implementation notes into durable user/developer documentation
@@ -321,7 +320,7 @@ The highest-value remaining items are:
 ### 5. Live Adapter Verification
 
 - keep a local Ollama smoke test using `qwen3.5:35b`
-- add a reproducible LM Studio smoke test now that its adapter is implemented
+- keep the reproducible LM Studio smoke wrapper working against real operator endpoints
 - separate live-adapter tests from default unit/integration runs so CI remains stable
 
 ### 6. End-to-End Validation
