@@ -399,6 +399,30 @@ fn prompt_mode_surfaces_confirmation_required_tester_path() {
 }
 
 #[test]
+fn prompt_mode_surfaces_destructive_confirmation_required_tester_path() {
+    let temp = tempdir().expect("tempdir");
+
+    Command::new(assert_cmd::cargo::cargo_bin!("anvil"))
+        .env("ANVIL_HOME", temp.path())
+        .args([
+            "-p",
+            "test clean the workspace",
+            "--model",
+            "pm-model",
+            "--permission-mode",
+            "workspace-write",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "response: Tester awaiting confirmation: destructive commands require explicit user confirmation",
+        ))
+        .stdout(predicate::str::contains(
+            "Last result: tester via pm-model - Tester awaiting confirmation: destructive commands require explicit user confirmation",
+        ));
+}
+
+#[test]
 fn e2e_resume_flow_inspects_mutates_and_reviews_fixture_repo() {
     let temp = tempdir().expect("tempdir");
     let home = temp.path().join("anvil-home");

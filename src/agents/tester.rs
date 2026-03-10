@@ -71,6 +71,18 @@ struct ValidationCommand {
 fn select_validation_command(description: &str) -> ValidationCommand {
     let normalized = description.to_ascii_lowercase();
 
+    if normalized.contains("clean")
+        || normalized.contains("reset")
+        || normalized.contains("remove")
+        || normalized.contains("delete")
+    {
+        return ValidationCommand {
+            program: "git",
+            args: &["clean", "-fd"],
+            display: "git clean -fd",
+        };
+    }
+
     if normalized.contains("network")
         || normalized.contains("download")
         || normalized.contains("fetch")
