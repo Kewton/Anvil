@@ -36,7 +36,6 @@ Not yet completed:
 - completed-step / pending-step lifecycle beyond simple append and replace
 - interactive multi-turn loop beyond `-p` and resumed single-turn execution
 - end-to-end validation
-- end-to-end validation
 
 ---
 
