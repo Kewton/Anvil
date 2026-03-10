@@ -6,7 +6,7 @@ use anyhow::{bail, Context};
 use crate::agents::pm::PmAgent;
 use crate::cli::app::{Cli, Command, HandoffAction};
 use crate::cli::flags::{NetworkPolicyArg, PermissionModeArg};
-use crate::cli::output::{render_session_snapshot, render_startup_summary};
+use crate::cli::output::{render_session_history, render_session_snapshot, render_startup_summary};
 use crate::config::repo_instructions::RepoInstructions;
 use crate::roles::{EffectiveModels, RoleRegistry};
 use crate::runtime::engine::RuntimeEngine;
@@ -231,6 +231,12 @@ fn run_interactive_loop(
             stdout.flush().ok();
             continue;
         }
+        if matches!(trimmed, "history" | ":history" | "/history") {
+            println!("{}", render_session_history(session));
+            writeln!(stdout, "awaiting next prompt").ok();
+            stdout.flush().ok();
+            continue;
+        }
 
         let response = execute_prompt_turn(
             store,
@@ -255,7 +261,7 @@ fn run_interactive_loop(
 }
 
 fn render_interactive_help() -> &'static str {
-    "interactive commands: `/help`, `/status`, `/snapshot`, `/models`, `/exit`"
+    "interactive commands: `/help`, `/status`, `/snapshot`, `/models`, `/history`, `/exit`"
 }
 
 fn render_interactive_status(session: &SessionState, session_path: &PathBuf) -> String {

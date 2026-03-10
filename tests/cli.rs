@@ -67,17 +67,18 @@ fn interactive_mode_supports_help_status_and_models_commands() {
             "--network",
             "local-only",
         ])
-        .write_stdin("/help\n/status\n/models\n/quit\n")
+        .write_stdin("/help\n/status\n/models\n/history\n/quit\n")
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "interactive commands: `/help`, `/status`, `/snapshot`, `/models`, `/exit`",
+            "interactive commands: `/help`, `/status`, `/snapshot`, `/models`, `/history`, `/exit`",
         ))
         .stdout(predicate::str::contains("Objective: interactive session"))
         .stdout(predicate::str::contains("/sessions/"))
         .stdout(predicate::str::contains(
             "Working summary: interactive session",
         ))
+        .stdout(predicate::str::contains("Session history is empty"))
         .stdout(predicate::str::contains("PM: pm-model"))
         .stdout(predicate::str::contains("Editor: editor-model"))
         .stdout(predicate::str::contains("Permission mode: workspace-write"))
@@ -245,6 +246,42 @@ fn resumed_session_status_command_shows_existing_snapshot() {
         ))
         .stdout(predicate::str::contains("awaiting next prompt"))
         .stdout(predicate::str::contains("interactive mode ended"));
+}
+
+#[test]
+fn resumed_session_history_command_shows_results_and_delegations() {
+    let temp = tempdir().expect("tempdir");
+
+    let start = Command::new(assert_cmd::cargo::cargo_bin!("anvil"))
+        .env("ANVIL_HOME", temp.path())
+        .args(["-p", "inspect the repository layout", "--model", "pm-model"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(start).expect("utf8");
+    let session_line = stdout
+        .lines()
+        .find(|line| line.starts_with("session: "))
+        .expect("session line");
+    let session_id = session_line.trim_start_matches("session: ");
+
+    Command::new(assert_cmd::cargo::cargo_bin!("anvil"))
+        .env("ANVIL_HOME", temp.path())
+        .args(["resume", session_id])
+        .write_stdin("/history\n/exit\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Recent results:"))
+        .stdout(predicate::str::contains(
+            "- reader via pm-model: Reader inspected ",
+        ))
+        .stdout(predicate::str::contains("Recent delegations:"))
+        .stdout(predicate::str::contains(
+            "- reader via pm-model: inspect the repository layout",
+        ));
 }
 
 #[test]
