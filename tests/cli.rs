@@ -435,6 +435,18 @@ fn e2e_resume_flow_inspects_mutates_and_reviews_fixture_repo() {
     Command::new(assert_cmd::cargo::cargo_bin!("anvil"))
         .env("ANVIL_HOME", &home)
         .current_dir(temp.path())
+        .args(["resume", session_id, "-p", "run a build"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "response: Tester ran `cargo build`",
+        ))
+        .stdout(predicate::str::contains("Commands run: cargo build"))
+        .stdout(predicate::str::contains("Evidence: tool-output:"));
+
+    Command::new(assert_cmd::cargo::cargo_bin!("anvil"))
+        .env("ANVIL_HOME", &home)
+        .current_dir(temp.path())
         .args(["resume", session_id, "-p", "review the current diff"])
         .assert()
         .success()
