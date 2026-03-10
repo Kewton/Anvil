@@ -1,5 +1,7 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
+use std::fs;
+use std::process::Command as ProcessCommand;
 use tempfile::tempdir;
 
 #[test]
@@ -349,4 +351,95 @@ fn prompt_mode_shows_tester_result_details() {
         .stdout(predicate::str::contains(
             "Next recommendation: Inspect the validation output",
         ));
+}
+
+#[test]
+fn e2e_resume_flow_inspects_mutates_and_reviews_fixture_repo() {
+    let temp = tempdir().expect("tempdir");
+    let home = temp.path().join("anvil-home");
+    fs::create_dir_all(&home).expect("create anvil home");
+    fs::write(temp.path().join("sample.rs"), "fn main() {}\n").expect("write sample");
+
+    let init = ProcessCommand::new("git")
+        .args(["init"])
+        .current_dir(temp.path())
+        .output()
+        .expect("git init");
+    assert!(init.status.success());
+    let config_name = ProcessCommand::new("git")
+        .args(["config", "user.name", "Anvil Test"])
+        .current_dir(temp.path())
+        .output()
+        .expect("git config user.name");
+    assert!(config_name.status.success());
+    let config_email = ProcessCommand::new("git")
+        .args(["config", "user.email", "anvil@example.test"])
+        .current_dir(temp.path())
+        .output()
+        .expect("git config user.email");
+    assert!(config_email.status.success());
+    let add = ProcessCommand::new("git")
+        .args(["add", "sample.rs"])
+        .current_dir(temp.path())
+        .output()
+        .expect("git add");
+    assert!(add.status.success());
+    let commit = ProcessCommand::new("git")
+        .args(["commit", "-m", "initial fixture"])
+        .current_dir(temp.path())
+        .output()
+        .expect("git commit");
+    assert!(commit.status.success());
+
+    let start = Command::new(assert_cmd::cargo::cargo_bin!("anvil"))
+        .env("ANVIL_HOME", &home)
+        .current_dir(temp.path())
+        .args([
+            "-p",
+            "inspect sample",
+            "--model",
+            "pm-model",
+            "--permission-mode",
+            "workspace-write",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(start).expect("utf8");
+    let session_line = stdout
+        .lines()
+        .find(|line| line.starts_with("session: "))
+        .expect("session line");
+    let session_id = session_line.trim_start_matches("session: ");
+
+    Command::new(assert_cmd::cargo::cargo_bin!("anvil"))
+        .env("ANVIL_HOME", &home)
+        .current_dir(temp.path())
+        .args(["resume", session_id, "-p", "apply update file sample"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "response: Editor applied a bounded mutation",
+        ))
+        .stdout(predicate::str::contains("Changed files:"))
+        .stdout(predicate::str::contains(
+            "Next recommendation: Run a focused tester pass",
+        ));
+
+    let updated = fs::read_to_string(temp.path().join("sample.rs")).expect("read sample");
+    assert!(updated.contains("anvil-mvp: apply update file sample"));
+
+    Command::new(assert_cmd::cargo::cargo_bin!("anvil"))
+        .env("ANVIL_HOME", &home)
+        .current_dir(temp.path())
+        .args(["resume", session_id, "-p", "review the current diff"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "response: Reviewer prepared a risk pass for review the current diff across 1 changed files",
+        ))
+        .stdout(predicate::str::contains("Last delegation: reviewer via pm-model"));
 }

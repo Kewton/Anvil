@@ -3,11 +3,11 @@
 ```text
 Anvil/
 ├─ Cargo.toml
+├─ Cargo.lock
 ├─ README.md
-├─ LICENSE
-├─ .gitignore
 ├─ docs/
 │  └─ directory-structure.md
+│  └─ runtime-overview.md
 ├─ schemas/
 │  ├─ role-registry.schema.json
 │  ├─ role-registry.json
@@ -42,13 +42,19 @@ Anvil/
 │  ├─ util/
 │  └─ error/
 ├─ tests/
-│  └─ role_registry.rs
+│  ├─ cli.rs
+│  ├─ pm_and_models.rs
+│  ├─ policy_and_trust.rs
+│  ├─ role_registry.rs
+│  ├─ runtime_and_tools.rs
+│  └─ state_roundtrip.rs
 └─ workspace/
-   └─ design and product drafts
+   └─ implementation and design drafts
 ```
 
 ## Notes
 
 - `schemas/role-registry.json` is the canonical checked-in role registry instance.
 - `schemas/*.schema.json` define the machine-readable contracts used by runtime state.
-- `workspace/` remains the design area until implementation-facing docs are promoted into `docs/`.
+- `docs/runtime-overview.md` describes the currently implemented runtime surfaces.
+- `workspace/` still holds active planning documents that have not yet been promoted into stable docs.
