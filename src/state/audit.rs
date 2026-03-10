@@ -140,3 +140,24 @@ impl AuditLog {
 fn open_append(path: &Path) -> anyhow::Result<File> {
     Ok(OpenOptions::new().create(true).append(true).open(path)?)
 }
+
+pub fn redact_value(key: &str, value: &str) -> String {
+    let lower = key.to_ascii_lowercase();
+    if lower.contains("token")
+        || lower.contains("secret")
+        || lower.contains("password")
+        || lower.contains("authorization")
+        || lower.contains("api_key")
+    {
+        "[REDACTED]".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+pub fn redact_map(input: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    input
+        .iter()
+        .map(|(key, value)| (key.clone(), redact_value(key, value)))
+        .collect()
+}

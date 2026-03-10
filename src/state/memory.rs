@@ -35,4 +35,17 @@ impl MemoryStore {
         std::fs::write(&self.path, current)?;
         Ok(())
     }
+
+    pub fn replace_all(&self, text: &str) -> anyhow::Result<()> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let normalized = if text.starts_with("# ANVIL Memory") {
+            text.to_string()
+        } else {
+            format!("# ANVIL Memory\n\n{}", text.trim())
+        };
+        std::fs::write(&self.path, normalized)?;
+        Ok(())
+    }
 }

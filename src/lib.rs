@@ -4,5 +4,6 @@ pub mod config;
 pub mod instructions;
 pub mod models;
 pub mod policy;
+pub mod slash;
 pub mod state;
 pub mod tools;

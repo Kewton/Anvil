@@ -92,14 +92,14 @@ Anvil の実装は Phase ごとに進める。
 
 先に書くテスト:
 
-- [ ] Ollama provider の health / list_models / chat / chat_stream のモックテスト
-- [ ] NDJSON ストリーム正規化テスト
+- [x] Ollama provider の health / list_models / chat / chat_stream のモックテスト
+- [x] NDJSON ストリーム正規化テスト
 - [x] 壊れた tool call を fail-closed で拒否するテスト
-- [ ] `Read` / `Write` / `Edit` / `Exec` / `Glob` / `Search` / `Diff` の単体テスト
+- [x] `Read` / `Write` / `Edit` / `Exec` / `Glob` / `Search` / `Diff` の単体テスト
 - [x] `--permission-mode ask|accept-edits|bypass-permissions` の統合テスト
 - [x] `anvil -p` の one-shot 統合テスト
 - [x] append-only audit log 出力テスト
-- [ ] audit log redaction テスト
+- [x] audit log redaction テスト
 - [x] `ANVIL.md` nearest-only 読み込みテスト
 - [x] `ANVIL-MEMORY.md` load と `/memory add` の統合テスト
 - [x] permission flow の回帰テスト
@@ -109,7 +109,7 @@ Anvil の実装は Phase ごとに進める。
 実装:
 
 - [x] `src/models/ollama.rs`
-- [ ] `src/models/stream.rs`
+- [x] `src/models/stream.rs`
 - [x] `src/agent/mod.rs` の single-loop MVP
 - [x] `src/tools/*`
 - [x] `src/main.rs` / `src/agent/mod.rs` の plain interactive UI
@@ -142,19 +142,19 @@ TDD の観点:
 
 目的:
 
-- [ ] LM Studio 対応
+- [x] LM Studio 対応
 - [ ] Plan / Act
-- [ ] `/memory show`
-- [ ] `/memory edit`
+- [x] `/memory show`
+- [x] `/memory edit`
 - [ ] カスタム slash command
 - [ ] 単一サブエージェント
 
 先に書くテスト:
 
-- [ ] LM Studio SSE ストリーム正規化テスト
+- [x] LM Studio SSE ストリーム正規化テスト
 - [ ] OpenAI 互換レスポンス差分テスト
-- [ ] `/memory show`, `/memory edit` の CLI テスト
-- [ ] `ANVIL-MEMORY.md` normalize / update テスト
+- [x] `/memory show`, `/memory edit` の CLI テスト
+- [x] `ANVIL-MEMORY.md` normalize / update テスト
 - [ ] schema 付き custom command load / validate / invoke テスト
 - [ ] Plan / Act 遷移テスト
 - [ ] plan file load / inject テスト
@@ -165,13 +165,13 @@ TDD の観点:
 
 実装:
 
-- [ ] `src/models/lm_studio.rs`
-- [ ] `src/slash/registry.rs`
-- [ ] `src/slash/builtins.rs`
-- [ ] `src/slash/custom.rs`
+- [x] `src/models/lm_studio.rs`
+- [x] `src/slash/registry.rs`
+- [x] `src/slash/builtins.rs`
+- [x] `src/slash/custom.rs`
 - [ ] `src/agent/plan.rs`
 - [ ] `src/agent/subagent.rs`
-- [ ] memory edit/show の更新
+- [x] memory edit/show の更新
 
 TDD の観点:
 
@@ -181,7 +181,7 @@ TDD の観点:
 
 完了条件:
 
-- [ ] LM Studio でも基本操作が動く
+- [x] LM Studio でも基本操作が動く
 - [ ] custom slash command を schema 付きで追加できる
 - [ ] Plan / Act が安定して動く
 - [ ] subagent が report 経由で文脈圧縮に使える

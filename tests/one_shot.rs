@@ -1,7 +1,7 @@
 use std::fs;
 
 use anvil::agent::{Agent, OneShotRequest};
-use anvil::config::AppConfig;
+use anvil::config::{AppConfig, ProviderKind};
 use anvil::policy::permissions::{
     ExecutionContext, InteractionMode, NonInteractiveBehavior, PermissionMode,
 };
@@ -16,8 +16,9 @@ async fn one_shot_requires_live_model_or_fails_cleanly() {
     let dir = tempdir().unwrap();
     let cfg = AppConfig {
         cwd: dir.path().to_path_buf(),
+        provider: ProviderKind::Ollama,
         model: "qwen3.5:35b".to_string(),
-        ollama_host: "http://127.0.0.1:11434".to_string(),
+        host: "http://127.0.0.1:11434".to_string(),
         permission_mode: PermissionMode::Ask,
         execution_context: ExecutionContext {
             interaction_mode: InteractionMode::NonInteractive,

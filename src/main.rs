@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
 use anvil::agent::{Agent, OneShotRequest};
-use anvil::cli::{Cli, PermissionModeArg};
-use anvil::config::AppConfig;
+use anvil::cli::{Cli, PermissionModeArg, ProviderArg};
+use anvil::config::{AppConfig, ProviderKind};
 use anvil::policy::permissions::{
     ExecutionContext, InteractionMode, NonInteractiveBehavior, PermissionMode,
 };
@@ -16,6 +16,10 @@ async fn main() -> anyhow::Result<()> {
         PermissionModeArg::Ask => PermissionMode::Ask,
         PermissionModeArg::AcceptEdits => PermissionMode::AcceptEdits,
         PermissionModeArg::BypassPermissions => PermissionMode::BypassPermissions,
+    };
+    let provider = match cli.provider {
+        ProviderArg::Ollama => ProviderKind::Ollama,
+        ProviderArg::LmStudio => ProviderKind::LmStudio,
     };
 
     let execution_context = if cli.prompt.is_some() {
@@ -36,8 +40,9 @@ async fn main() -> anyhow::Result<()> {
 
     let config = AppConfig {
         cwd,
+        provider,
         model: cli.model,
-        ollama_host: cli.ollama_host,
+        host: cli.host,
         permission_mode,
         execution_context,
         state_dir: cli

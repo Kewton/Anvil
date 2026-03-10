@@ -4,6 +4,8 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
+use crate::models::stream::NdjsonStreamParser;
+
 #[derive(Debug, Clone)]
 pub struct OllamaClient {
     base_url: String,
@@ -117,26 +119,27 @@ impl OllamaClient {
             .error_for_status()?
             .bytes_stream();
 
-        let mut buf = String::new();
+        let mut parser = NdjsonStreamParser::default();
         let mut out = String::new();
         while let Some(chunk) = resp_stream.next().await {
             let text = String::from_utf8(chunk?.to_vec())?;
-            buf.push_str(&text);
-            while let Some(pos) = buf.find('\n') {
-                let line = buf[..pos].trim().to_string();
-                buf = buf[pos + 1..].to_string();
-                if line.is_empty() {
-                    continue;
-                }
-                let parsed: StreamChunk = serde_json::from_str(&line)?;
+            for parsed in parser.push::<StreamChunk>(&text) {
+                let parsed = parsed?;
                 if let Some(message) = parsed.message {
                     out.push_str(&message.content);
-                    print!("{}", message.content);
                 }
                 if parsed.done.unwrap_or(false) {
-                    println!();
                     return Ok(out);
                 }
+            }
+        }
+        for parsed in parser.finish::<StreamChunk>() {
+            let parsed = parsed?;
+            if let Some(message) = parsed.message {
+                out.push_str(&message.content);
+            }
+            if parsed.done.unwrap_or(false) {
+                return Ok(out);
             }
         }
         Ok(out)
