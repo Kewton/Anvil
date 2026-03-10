@@ -21,7 +21,8 @@ fn startup_summary_shows_role_models() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("interactive mode"))
+        .stdout(predicate::str::contains("Anvil  local-first coding agent"))
+        .stdout(predicate::str::contains("Try one of these:"))
         .stdout(predicate::str::contains(
             "Working summary: interactive session",
         ))
@@ -42,15 +43,12 @@ fn interactive_mode_accepts_multiple_prompts_from_stdin() {
         .write_stdin("inspect the repository layout\nquit\n")
         .assert()
         .success()
-        .stdout(predicate::str::contains(
-            "interactive commands: enter a prompt, or `exit` to finish",
-        ))
+        .stdout(predicate::str::contains("anvil> "))
         .stdout(predicate::str::contains(
             "prompt: inspect the repository layout",
         ))
-        .stdout(predicate::str::contains("response: Reader inspected "))
-        .stdout(predicate::str::contains("awaiting next prompt"))
-        .stdout(predicate::str::contains("interactive mode ended"));
+        .stdout(predicate::str::contains("response: Inspected "))
+        .stdout(predicate::str::contains("Session closed."));
 }
 
 #[test]
@@ -72,9 +70,7 @@ fn interactive_mode_supports_help_status_and_models_commands() {
         .write_stdin("/help\n/status\n/models\n/history\n/quit\n")
         .assert()
         .success()
-        .stdout(predicate::str::contains(
-            "interactive commands: `/help`, `/status`, `/snapshot`, `/models`, `/history`, `/approve`, `/deny`, `/exit`",
-        ))
+        .stdout(predicate::str::contains("Commands: `/help`, `/status`, `/snapshot`, `/models`, `/history`, `/approve`, `/deny`, `/exit`"))
         .stdout(predicate::str::contains("Objective: interactive session"))
         .stdout(predicate::str::contains("/sessions/"))
         .stdout(predicate::str::contains(
@@ -170,9 +166,9 @@ fn resume_can_run_follow_up_prompt() {
         .stdout(predicate::str::contains(
             "prompt: summarize the current session",
         ))
-        .stdout(predicate::str::contains("response: Reader inspected "))
+        .stdout(predicate::str::contains("response: Inspected "))
         .stdout(predicate::str::contains(
-            "Working summary: Reader inspected ",
+            "Working summary: Inspected ",
         ))
         .stdout(predicate::str::contains(
             "Last completed step: summarize the current session",
@@ -209,8 +205,8 @@ fn resumed_session_accepts_interactive_follow_up_from_stdin() {
         .stdout(predicate::str::contains(
             "prompt: summarize the current session",
         ))
-        .stdout(predicate::str::contains("response: Reader inspected "))
-        .stdout(predicate::str::contains("interactive mode ended"));
+        .stdout(predicate::str::contains("response: Inspected "))
+        .stdout(predicate::str::contains("Session closed."));
 }
 
 #[test]
@@ -244,10 +240,10 @@ fn resumed_session_status_command_shows_existing_snapshot() {
             "Objective: inspect the repository layout",
         ))
         .stdout(predicate::str::contains(
-            "Working summary: Reader inspected ",
+            "Working summary: Inspected ",
         ))
-        .stdout(predicate::str::contains("awaiting next prompt"))
-        .stdout(predicate::str::contains("interactive mode ended"));
+        .stdout(predicate::str::contains("anvil> "))
+        .stdout(predicate::str::contains("Session closed."));
 }
 
 #[test]
@@ -299,7 +295,7 @@ fn natural_language_status_still_routes_as_prompt() {
         .stdout(predicate::str::contains(
             "prompt: inspect status of the repository",
         ))
-        .stdout(predicate::str::contains("response: Reader inspected "));
+        .stdout(predicate::str::contains("response: Inspected "));
 }
 
 #[test]
@@ -313,7 +309,7 @@ fn prompt_mode_returns_pm_or_subagent_result() {
         .success()
         .stdout(predicate::str::contains("prompt mode"))
         .stdout(predicate::str::contains(
-            "Working summary: Reader inspected ",
+            "Working summary: Inspected ",
         ))
         .stdout(predicate::str::contains(
             "Pending steps: Use the matched files",
@@ -324,7 +320,7 @@ fn prompt_mode_returns_pm_or_subagent_result() {
         .stdout(predicate::str::contains(
             "Next recommendation: Use the matched files",
         ))
-        .stdout(predicate::str::contains("response: Reader inspected "));
+        .stdout(predicate::str::contains("response: Inspected "));
 }
 
 #[test]
@@ -363,7 +359,7 @@ fn prompt_mode_surfaces_blocked_tester_path() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "response: Tester blocked: local validation commands require workspace-write or stronger",
+            "response: Blocked: local validation commands require workspace-write or stronger",
         ))
         .stdout(predicate::str::contains(
             "Last result: tester via pm-model - Tester blocked: local validation commands require workspace-write or stronger",
@@ -390,7 +386,7 @@ fn prompt_mode_surfaces_confirmation_required_tester_path() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "response: Tester awaiting confirmation: networked commands require explicit approval",
+            "response: Awaiting confirmation: networked commands require explicit approval",
         ))
         .stdout(predicate::str::contains(
             "Last result: tester via pm-model - Tester awaiting confirmation: networked commands require explicit approval",
@@ -418,7 +414,7 @@ fn prompt_mode_surfaces_destructive_confirmation_required_tester_path() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "response: Tester awaiting confirmation: destructive commands require explicit user confirmation",
+            "response: Awaiting confirmation: destructive commands require explicit user confirmation",
         ))
         .stdout(predicate::str::contains(
             "Last result: tester via pm-model - Tester awaiting confirmation: destructive commands require explicit user confirmation",
@@ -455,7 +451,7 @@ fn interactive_mode_can_approve_pending_destructive_command() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "response: Tester awaiting confirmation: destructive commands require explicit user confirmation",
+            "response: Awaiting confirmation: destructive commands require explicit user confirmation",
         ))
         .stdout(predicate::str::contains(
             "approval: Tester ran `git clean -fd`",
@@ -492,7 +488,7 @@ fn interactive_mode_can_deny_pending_destructive_command() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "response: Tester awaiting confirmation: destructive commands require explicit user confirmation",
+            "response: Awaiting confirmation: destructive commands require explicit user confirmation",
         ))
         .stdout(predicate::str::contains(
             "denial: Declined pending confirmation for tester: destructive commands require explicit user confirmation",
@@ -570,7 +566,7 @@ fn e2e_resume_flow_inspects_mutates_and_reviews_fixture_repo() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "response: Editor applied a bounded mutation",
+            "response: Applied a bounded mutation",
         ))
         .stdout(predicate::str::contains("Changed files:"))
         .stdout(predicate::str::contains(
@@ -587,7 +583,7 @@ fn e2e_resume_flow_inspects_mutates_and_reviews_fixture_repo() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "response: Tester ran `cargo build`",
+            "response: Ran `cargo build`",
         ))
         .stdout(predicate::str::contains("Commands run: cargo build"))
         .stdout(predicate::str::contains("Evidence: tool-output:"));
@@ -599,7 +595,7 @@ fn e2e_resume_flow_inspects_mutates_and_reviews_fixture_repo() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "response: Reviewer prepared a risk pass for review the current diff across 1 changed files",
+            "response: Prepared a risk pass for review the current diff across 1 changed files",
         ))
         .stdout(predicate::str::contains("Last delegation: reviewer via pm-model"));
 }
@@ -657,7 +653,7 @@ fn handoff_export_and_import_roundtrip_via_cli() {
         .success()
         .stdout(predicate::str::contains("Objective: inspect sample"))
         .stdout(predicate::str::contains(
-            "Working summary: Reader inspected ",
+            "Working summary: Inspected ",
         ));
 }
 
@@ -718,7 +714,7 @@ fn imported_handoff_can_resume_with_follow_up_prompt() {
             "prompt: review the current diff",
         ))
         .stdout(predicate::str::contains(
-            "response: Reviewer prepared a risk pass",
+            "response: Prepared a risk pass",
         ))
         .stdout(predicate::str::contains("Last delegation: reviewer via pm-model"));
 }

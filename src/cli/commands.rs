@@ -1,12 +1,21 @@
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::PathBuf;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{bail, Context};
 
 use crate::agents::pm::PmAgent;
 use crate::cli::app::{Cli, Command, HandoffAction};
 use crate::cli::flags::{NetworkPolicyArg, PermissionModeArg};
-use crate::cli::output::{render_session_history, render_session_snapshot, render_startup_summary};
+use crate::cli::output::{
+    render_interactive_welcome, render_session_history, render_session_snapshot,
+    render_startup_summary,
+};
 use crate::config::repo_instructions::RepoInstructions;
 use crate::roles::{EffectiveModels, RoleRegistry};
 use crate::runtime::engine::RuntimeEngine;
@@ -43,7 +52,9 @@ pub fn execute(cli: Cli) -> anyhow::Result<()> {
             println!("resuming session: {session_id}");
             println!("objective: {}", session.objective);
             if let Some(prompt) = &cli.prompt {
-                let response = execute_prompt_turn(
+                let mut stdout = io::stdout();
+                let mut streamed = false;
+                let response = execute_prompt_turn_with_feedback(
                     &store,
                     &registry,
                     &mut session,
@@ -51,9 +62,13 @@ pub fn execute(cli: Cli) -> anyhow::Result<()> {
                     permission_mode,
                     network_policy,
                     prompt,
+                    &mut stdout,
+                    &mut streamed,
                 )?;
                 println!("prompt: {prompt}");
-                println!("response: {response}");
+                if !streamed {
+                    println!("response: {response}");
+                }
             }
             let snapshot = render_session_snapshot(&session);
             if !snapshot.is_empty() {
@@ -64,6 +79,16 @@ pub fn execute(cli: Cli) -> anyhow::Result<()> {
                 render_startup_summary(&models, permission_mode, network_policy)
             );
             if cli.prompt.is_none() {
+                println!(
+                    "{}",
+                    render_interactive_welcome(
+                        &session,
+                        &store.session_path(&session.session_id).display().to_string(),
+                        &models,
+                        permission_mode,
+                        network_policy,
+                    )
+                );
                 run_interactive_loop(
                     &store,
                     &registry,
@@ -131,7 +156,9 @@ pub fn execute(cli: Cli) -> anyhow::Result<()> {
             let mut session = build_session_state(&cli, &models, permission_mode, network_policy);
 
             if let Some(prompt) = &cli.prompt {
-                let response = execute_prompt_turn(
+                let mut stdout = io::stdout();
+                let mut streamed = false;
+                let response = execute_prompt_turn_with_feedback(
                     &store,
                     &registry,
                     &mut session,
@@ -139,10 +166,14 @@ pub fn execute(cli: Cli) -> anyhow::Result<()> {
                     permission_mode,
                     network_policy,
                     prompt,
+                    &mut stdout,
+                    &mut streamed,
                 )?;
                 println!("prompt mode");
                 println!("prompt: {prompt}");
-                println!("response: {response}");
+                if !streamed {
+                    println!("response: {response}");
+                }
                 println!("session: {}", session.session_id);
                 let snapshot = render_session_snapshot(&session);
                 if !snapshot.is_empty() {
@@ -158,17 +189,16 @@ pub fn execute(cli: Cli) -> anyhow::Result<()> {
                 );
             } else {
                 let path = store.save_session(&registry, &session)?;
-                println!("interactive mode");
-                println!("session: {}", session.session_id);
-                let snapshot = render_session_snapshot(&session);
-                if !snapshot.is_empty() {
-                    println!("{snapshot}");
-                }
                 println!(
                     "{}",
-                    render_startup_summary(&models, permission_mode, network_policy)
+                    render_interactive_welcome(
+                        &session,
+                        &path.display().to_string(),
+                        &models,
+                        permission_mode,
+                        network_policy,
+                    )
                 );
-                println!("state: {}", path.display());
                 run_interactive_loop(
                     &store,
                     &registry,
@@ -192,19 +222,22 @@ fn run_interactive_loop(
     permission_mode: PermissionMode,
     network_policy: NetworkPolicy,
 ) -> anyhow::Result<()> {
-    println!("interactive commands: enter a prompt, or `exit` to finish");
     let session_path = store.session_path(&session.session_id);
     let stdin = io::stdin();
     let mut stdout = io::stdout();
+    write!(stdout, "anvil> ").ok();
+    stdout.flush().ok();
 
     for line in stdin.lock().lines() {
         let prompt = line.context("failed to read interactive prompt from stdin")?;
         let trimmed = prompt.trim();
         if trimmed.is_empty() {
+            write!(stdout, "anvil> ").ok();
+            stdout.flush().ok();
             continue;
         }
         if matches!(trimmed, "exit" | "quit" | "/exit" | "/quit") {
-            println!("interactive mode ended");
+            println!("Session closed.");
             break;
         }
         if matches!(trimmed, "approve" | ":approve" | "/approve") {
@@ -220,7 +253,7 @@ fn run_interactive_loop(
                 }
                 None => println!("approval: no pending confirmation"),
             }
-            writeln!(stdout, "awaiting next prompt").ok();
+            write!(stdout, "anvil> ").ok();
             stdout.flush().ok();
             continue;
         }
@@ -236,13 +269,13 @@ fn run_interactive_loop(
                 }
                 None => println!("denial: no pending confirmation"),
             }
-            writeln!(stdout, "awaiting next prompt").ok();
+            write!(stdout, "anvil> ").ok();
             stdout.flush().ok();
             continue;
         }
         if matches!(trimmed, "help" | ":help" | "/help") {
             println!("{}", render_interactive_help());
-            writeln!(stdout, "awaiting next prompt").ok();
+            write!(stdout, "anvil> ").ok();
             stdout.flush().ok();
             continue;
         }
@@ -252,7 +285,7 @@ fn run_interactive_loop(
         ) {
             let status = render_interactive_status(session, &session_path);
             println!("{status}");
-            writeln!(stdout, "awaiting next prompt").ok();
+            write!(stdout, "anvil> ").ok();
             stdout.flush().ok();
             continue;
         }
@@ -261,18 +294,19 @@ fn run_interactive_loop(
                 "{}",
                 render_startup_summary(models, permission_mode, network_policy)
             );
-            writeln!(stdout, "awaiting next prompt").ok();
+            write!(stdout, "anvil> ").ok();
             stdout.flush().ok();
             continue;
         }
         if matches!(trimmed, "history" | ":history" | "/history") {
             println!("{}", render_session_history(session));
-            writeln!(stdout, "awaiting next prompt").ok();
+            write!(stdout, "anvil> ").ok();
             stdout.flush().ok();
             continue;
         }
 
-        let response = execute_prompt_turn(
+        let mut streamed = false;
+        let response = execute_prompt_turn_with_feedback(
             store,
             registry,
             session,
@@ -280,14 +314,18 @@ fn run_interactive_loop(
             permission_mode,
             network_policy,
             trimmed,
+            &mut stdout,
+            &mut streamed,
         )?;
         println!("prompt: {trimmed}");
-        println!("response: {response}");
+        if !streamed {
+            println!("response: {response}");
+        }
         let snapshot = render_session_snapshot(session);
         if !snapshot.is_empty() {
             println!("{snapshot}");
         }
-        writeln!(stdout, "awaiting next prompt").ok();
+        write!(stdout, "anvil> ").ok();
         stdout.flush().ok();
     }
 
@@ -295,7 +333,69 @@ fn run_interactive_loop(
 }
 
 fn render_interactive_help() -> &'static str {
-    "interactive commands: `/help`, `/status`, `/snapshot`, `/models`, `/history`, `/approve`, `/deny`, `/exit`"
+    "Commands: `/help`, `/status`, `/snapshot`, `/models`, `/history`, `/approve`, `/deny`, `/exit`\nType any other text to send it as a task."
+}
+
+fn with_processing_indicator<T>(
+    action: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let spinner = ProcessingSpinner::start("Anvil is working");
+    let result = action();
+    spinner.stop();
+    result
+}
+
+struct ProcessingSpinner {
+    running: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+    enabled: bool,
+}
+
+impl ProcessingSpinner {
+    fn start(label: &'static str) -> Self {
+        if !io::stderr().is_terminal() {
+            return Self {
+                running: Arc::new(AtomicBool::new(false)),
+                handle: None,
+                enabled: false,
+            };
+        }
+
+        let running = Arc::new(AtomicBool::new(true));
+        let thread_running = Arc::clone(&running);
+        let handle = thread::spawn(move || {
+            let frames = ["|", "/", "-", "\\"];
+            let mut stderr = io::stderr();
+            let mut index = 0usize;
+
+            while thread_running.load(Ordering::Relaxed) {
+                let _ = write!(stderr, "\r{} {}", frames[index % frames.len()], label);
+                let _ = stderr.flush();
+                index += 1;
+                thread::sleep(Duration::from_millis(100));
+            }
+
+            let clear = " ".repeat(label.len() + 2);
+            let _ = write!(stderr, "\r{}\r", clear);
+            let _ = stderr.flush();
+        });
+
+        Self {
+            running,
+            handle: Some(handle),
+            enabled: true,
+        }
+    }
+
+    fn stop(mut self) {
+        if !self.enabled {
+            return;
+        }
+        self.running.store(false, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 fn render_interactive_status(session: &SessionState, session_path: &PathBuf) -> String {
@@ -332,6 +432,66 @@ fn execute_prompt_turn(
         &context,
         prompt,
     )?;
+    store.save_session(registry, session)?;
+    Ok(response)
+}
+
+fn execute_prompt_turn_with_feedback(
+    store: &StateStore,
+    registry: &RoleRegistry,
+    session: &mut SessionState,
+    models: &EffectiveModels,
+    permission_mode: PermissionMode,
+    network_policy: NetworkPolicy,
+    prompt: &str,
+    stdout: &mut io::Stdout,
+    streamed: &mut bool,
+) -> anyhow::Result<String> {
+    if !stdout.is_terminal() {
+        return with_processing_indicator(|| {
+            execute_prompt_turn(
+                store,
+                registry,
+                session,
+                models,
+                permission_mode,
+                network_policy,
+                prompt,
+            )
+        });
+    }
+
+    let engine = build_runtime_engine(permission_mode, network_policy)?;
+    let context = engine.build_context(prompt, Vec::new());
+    let mut spinner = Some(ProcessingSpinner::start("Anvil is working"));
+    let mut emitted = false;
+    let mut on_chunk = |chunk: &str| {
+        if let Some(active) = spinner.take() {
+            active.stop();
+        }
+        if !emitted {
+            print!("response: ");
+            emitted = true;
+        }
+        print!("{chunk}");
+        let _ = io::stdout().flush();
+    };
+    let response = RuntimeLoop::run_prompt_with_stream(
+        session,
+        models,
+        &PmAgent::default(),
+        &engine,
+        &context,
+        prompt,
+        Some(&mut on_chunk),
+    )?;
+    if let Some(active) = spinner.take() {
+        active.stop();
+    }
+    if emitted {
+        println!();
+        *streamed = true;
+    }
     store.save_session(registry, session)?;
     Ok(response)
 }

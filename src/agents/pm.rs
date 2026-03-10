@@ -46,16 +46,32 @@ impl PmAgent {
         context: &str,
         runtime: &RuntimeEngine,
     ) -> anyhow::Result<PmTurnOutcome> {
+        self.run_turn_with_stream(models, user_prompt, context, runtime, None)
+    }
+
+    pub fn run_turn_with_stream(
+        &self,
+        models: &EffectiveModels,
+        user_prompt: &str,
+        context: &str,
+        runtime: &RuntimeEngine,
+        mut on_chunk: Option<&mut dyn FnMut(&str)>,
+    ) -> anyhow::Result<PmTurnOutcome> {
         match decide_strategy(user_prompt) {
             ExecutionStrategy::FastPath => {
-                let response = self.router.complete(&ModelRequest {
+                let request = ModelRequest {
                     model: models.pm_model.clone(),
                     system_prompt: "PM fast-path".to_string(),
                     user_prompt: user_prompt.to_string(),
-                })?;
+                };
+                let response = match on_chunk.as_mut() {
+                    Some(callback) => self.router.stream_complete(&request, *callback)?,
+                    None => self.router.complete(&request)?,
+                };
 
                 Ok(PmTurnOutcome {
                     delegated_role: None,
+                    user_response: response.output.clone(),
                     result: AgentResult::new(
                         "pm",
                         format!(
@@ -79,10 +95,12 @@ impl PmAgent {
                     AgentRole::Tester => self.tester.run(&task, runtime),
                     AgentRole::Reviewer => self.reviewer.run(&task, runtime),
                 };
+                let user_response = present_subagent_result(&result.summary);
 
                 Ok(PmTurnOutcome {
                     delegated_role: Some(role),
                     result,
+                    user_response,
                 })
             }
         }
@@ -101,6 +119,7 @@ pub enum AgentRole {
 pub struct PmTurnOutcome {
     pub delegated_role: Option<AgentRole>,
     pub result: AgentResult,
+    pub user_response: String,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -111,6 +130,18 @@ enum ExecutionStrategy {
 
 fn decide_strategy(prompt: &str) -> ExecutionStrategy {
     let normalized = prompt.to_ascii_lowercase();
+
+    if normalized.contains("branch")
+        || normalized.contains("commit")
+        || normalized.contains("commits")
+        || normalized.contains("log")
+        || prompt.contains("ブランチ")
+        || prompt.contains("コミット")
+        || prompt.contains("履歴")
+        || prompt.contains("解説")
+    {
+        return ExecutionStrategy::Delegate(AgentRole::Reader);
+    }
 
     if normalized.contains("test") || normalized.contains("lint") || normalized.contains("build") {
         return ExecutionStrategy::Delegate(AgentRole::Tester);
@@ -139,4 +170,21 @@ fn decide_strategy(prompt: &str) -> ExecutionStrategy {
     }
 
     ExecutionStrategy::FastPath
+}
+
+fn present_subagent_result(summary: &str) -> String {
+    let trimmed = summary.trim();
+    let body = ["Reader ", "Editor ", "Tester ", "Reviewer "]
+        .iter()
+        .find_map(|prefix| trimmed.strip_prefix(prefix))
+        .unwrap_or(trimmed);
+    capitalize_first(body)
+}
+
+fn capitalize_first(value: &str) -> String {
+    let mut chars = value.chars();
+    match chars.next() {
+        Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+        None => String::new(),
+    }
 }

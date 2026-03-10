@@ -37,15 +37,15 @@
     },
     "objective": {
       "type": "string",
-      "maxLength": 2000
+      "maxLength": 131072
     },
     "workingSummary": {
       "type": "string",
-      "maxLength": 2000
+      "maxLength": 131072
     },
     "repositorySummary": {
       "type": "string",
-      "maxLength": 2000
+      "maxLength": 131072
     },
     "pendingSteps": {
       "type": "array",
@@ -165,7 +165,7 @@
         },
         "summary": {
           "type": "string",
-          "maxLength": 1000
+          "maxLength": 131072
         },
         "evidence": {
           "type": "array",

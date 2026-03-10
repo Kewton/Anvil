@@ -1,5 +1,6 @@
 use crate::agents::{AgentResult, AgentTask};
 use crate::runtime::engine::{RuntimeEngine, RuntimeToolOutcome};
+use crate::tools::exec::ExecRequest;
 use crate::tools::registry::{ToolRequest, ToolResponse};
 
 #[derive(Debug, Default)]
@@ -7,6 +8,10 @@ pub struct ReaderAgent;
 
 impl ReaderAgent {
     pub fn run(&self, task: &AgentTask, runtime: &RuntimeEngine) -> AgentResult {
+        if looks_like_git_inspection(&task.description) {
+            return inspect_git_state(task, runtime);
+        }
+
         let cwd = match runtime.checked_execute(ToolRequest::InspectEnv) {
             Ok(RuntimeToolOutcome::Allowed(ToolResponse::EnvSnapshot(snapshot))) => {
                 snapshot.cwd.display().to_string()
@@ -45,10 +50,139 @@ impl ReaderAgent {
     }
 }
 
+fn inspect_git_state(task: &AgentTask, runtime: &RuntimeEngine) -> AgentResult {
+    let branch = match run_safe_git(
+        runtime,
+        &task.workspace_root,
+        &["status", "--short", "--branch"],
+    ) {
+        Ok(output) => output,
+        Err(result) => return result,
+    };
+
+    let recent_commits = match run_safe_git(
+        runtime,
+        &task.workspace_root,
+        &["log", "--oneline", "--decorate", "-5"],
+    ) {
+        Ok(output) => output,
+        Err(result) => return result,
+    };
+
+    let branch_line = branch.lines().next().unwrap_or("branch status unavailable");
+    let status_entries: Vec<&str> = branch.lines().skip(1).filter(|line| !line.is_empty()).collect();
+    let diff_stat = match run_safe_git(runtime, &task.workspace_root, &["diff", "--stat", "--", "."]) {
+        Ok(output) => output,
+        Err(result) => return result,
+    };
+    let parsed_branch = parse_branch_line(branch_line);
+    let top_commit = recent_commits
+        .lines()
+        .next()
+        .unwrap_or("no recent commits available");
+    let diff_summary = summarize_diff_stat(&diff_stat, status_entries.len());
+
+    AgentResult::new(
+        "reader",
+        format!(
+            "{}。直近のコミットは {}。{}。",
+            parsed_branch, top_commit, diff_summary
+        ),
+    )
+    .with_evidence(vec![
+        ("tool-output".to_string(), format!("git status: {branch_line}")),
+        (
+            "tool-output".to_string(),
+            format!("git log: {}", truncate_line(top_commit)),
+        ),
+    ])
+    .with_next_recommendation("Use git diff or review if you need a deeper explanation of the changes")
+}
+
+fn run_safe_git(
+    runtime: &RuntimeEngine,
+    cwd: &std::path::Path,
+    args: &[&str],
+) -> Result<String, AgentResult> {
+    match runtime.checked_execute(ToolRequest::Exec {
+        request: ExecRequest {
+            program: "git".to_string(),
+            args: args.iter().map(|arg| arg.to_string()).collect(),
+            cwd: cwd.to_path_buf(),
+        },
+    }) {
+        Ok(RuntimeToolOutcome::Allowed(ToolResponse::ExecResult(result))) => Ok(result.stdout),
+        Ok(RuntimeToolOutcome::Blocked(reason)) => {
+            Err(AgentResult::new("reader", format!("Reader blocked: {reason}")))
+        }
+        Ok(RuntimeToolOutcome::NeedsConfirmation(reason)) => Err(AgentResult::new(
+            "reader",
+            format!("Reader awaiting confirmation: {reason}"),
+        )),
+        Ok(RuntimeToolOutcome::Allowed(_)) | Err(_) => Err(AgentResult::new(
+            "reader",
+            "Reader could not inspect the current git state",
+        )),
+    }
+}
+
 fn select_search_term(description: &str) -> String {
     description
         .split(|char: char| !char.is_alphanumeric())
         .find(|token| token.len() >= 4)
         .unwrap_or("fn")
         .to_ascii_lowercase()
+}
+
+fn looks_like_git_inspection(description: &str) -> bool {
+    let normalized = description.to_ascii_lowercase();
+    normalized.contains("branch")
+        || normalized.contains("commit")
+        || normalized.contains("commits")
+        || normalized.contains("log")
+        || description.contains("ブランチ")
+        || description.contains("コミット")
+        || description.contains("履歴")
+        || description.contains("このブランチ")
+}
+
+fn truncate_line(line: &str) -> String {
+    line.chars().take(200).collect()
+}
+
+fn parse_branch_line(line: &str) -> String {
+    let trimmed = line.trim().trim_start_matches("## ").trim();
+    let (branch_name, upstream) = trimmed
+        .split_once("...")
+        .map(|(branch, upstream)| (branch.trim(), Some(upstream.trim())))
+        .unwrap_or((trimmed, None));
+
+    let mut summary = format!("現在のブランチは `{branch_name}` です");
+    if let Some(upstream) = upstream {
+        if upstream.contains("[gone]") {
+            let remote = upstream.split_whitespace().next().unwrap_or(upstream);
+            summary.push_str(&format!("。追跡先の `{remote}` は現在見つかりません"));
+        } else if !upstream.is_empty() {
+            summary.push_str(&format!("。追跡先は `{}` です", upstream));
+        }
+    }
+    summary
+}
+
+fn summarize_diff_stat(diff_stat: &str, status_count: usize) -> String {
+    let diff_line = diff_stat
+        .lines()
+        .rev()
+        .find(|line| line.contains("file changed") || line.contains("files changed"))
+        .map(str::trim);
+
+    if let Some(diff_line) = diff_line {
+        return format!("ワークツリー差分は {diff_line}");
+    }
+
+    if status_count == 0 {
+        "ワークツリーはクリーンです".to_string()
+    } else {
+        format!("未コミット変更は {status_count} 件あります")
+    }
 }

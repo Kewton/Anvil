@@ -172,7 +172,7 @@ fn runtime_loop_records_delegations_and_results() {
     )
     .expect("runtime loop");
 
-    assert!(summary.contains("Reviewer prepared"));
+    assert!(summary.contains("Prepared a risk pass"));
     assert_eq!(session.recent_delegations.len(), 1);
     assert_eq!(session.recent_delegations[0].role, "reviewer");
     assert_eq!(session.recent_delegations[0].resolved_model, "review-model");
@@ -205,6 +205,18 @@ fn pm_agent_subagents_use_runtime_tools() {
         .expect("reader turn");
     assert_eq!(reader.delegated_role, Some(AgentRole::Reader));
     assert!(reader.result.summary.contains("Reader inspected"));
+
+    let git_reader = pm
+        .run_turn(
+            &models,
+            "このブランチを解説して",
+            "[source=user]\nこのブランチを解説して",
+            &runtime,
+        )
+        .expect("git reader turn");
+    assert_eq!(git_reader.delegated_role, Some(AgentRole::Reader));
+    assert!(git_reader.result.summary.contains("現在のブランチは"));
+    assert!(!git_reader.result.evidence.is_empty());
 
     let tester = pm
         .run_turn(

@@ -20,7 +20,19 @@ impl RuntimeLoop {
         context: &str,
         prompt: &str,
     ) -> anyhow::Result<String> {
-        let outcome = pm.run_turn(models, prompt, context, runtime)?;
+        Self::run_prompt_with_stream(session, models, pm, runtime, context, prompt, None)
+    }
+
+    pub fn run_prompt_with_stream(
+        session: &mut SessionState,
+        models: &EffectiveModels,
+        pm: &PmAgent,
+        runtime: &RuntimeEngine,
+        context: &str,
+        prompt: &str,
+        on_chunk: Option<&mut dyn FnMut(&str)>,
+    ) -> anyhow::Result<String> {
+        let outcome = pm.run_turn_with_stream(models, prompt, context, runtime, on_chunk)?;
         session.pending_confirmation = None;
 
         if let Some(role) = outcome.delegated_role {
@@ -67,11 +79,11 @@ impl RuntimeLoop {
             session.pending_confirmation = pending_confirmation;
             update_pending_steps(session, &outcome.result.role, next_recommendation);
         }
-        session.working_summary = outcome.result.summary.clone();
+        session.working_summary = outcome.user_response.clone();
         mark_completed_step(session, prompt);
         compact_pending_steps(session);
 
-        Ok(outcome.result.summary)
+        Ok(outcome.user_response)
     }
 
     pub fn approve_pending(

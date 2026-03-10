@@ -40,4 +40,17 @@ impl ModelRouter {
         }
         Ok(response)
     }
+
+    pub fn stream_complete(
+        &self,
+        request: &ModelRequest,
+        on_chunk: &mut dyn FnMut(&str),
+    ) -> anyhow::Result<ModelResponse> {
+        let client = self.route(&request.model)?;
+        let response = client.stream_complete(request, on_chunk)?;
+        if response.model != request.model {
+            bail!("model router returned a mismatched model response");
+        }
+        Ok(response)
+    }
 }

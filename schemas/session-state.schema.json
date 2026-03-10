@@ -55,19 +55,19 @@
     },
     "objective": {
       "type": "string",
-      "maxLength": 2000
+      "maxLength": 131072
     },
     "workingSummary": {
       "type": "string",
-      "maxLength": 2000
+      "maxLength": 131072
     },
     "userPreferencesSummary": {
       "type": "string",
-      "maxLength": 2000
+      "maxLength": 131072
     },
     "repositorySummary": {
       "type": "string",
-      "maxLength": 2000
+      "maxLength": 131072
     },
     "activeConstraints": {
       "type": "array",
@@ -132,7 +132,7 @@
         },
         "resolvedModel": { "type": "string" },
         "inheritedFromPm": { "type": "boolean" },
-        "task": { "type": "string", "maxLength": 1000 },
+        "task": { "type": "string", "maxLength": 131072 },
         "requestedPermission": {
           "type": "string",
           "enum": ["read-only", "workspace-write", "full-access"]
@@ -192,7 +192,7 @@
         },
         "summary": {
           "type": "string",
-          "maxLength": 1000
+          "maxLength": 131072
         },
         "evidence": {
           "type": "array",
@@ -235,11 +235,11 @@
         },
         "task": {
           "type": "string",
-          "maxLength": 1000
+          "maxLength": 131072
         },
         "summary": {
           "type": "string",
-          "maxLength": 1000
+          "maxLength": 131072
         },
         "reason": {
           "type": "string",

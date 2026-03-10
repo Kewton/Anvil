@@ -3,7 +3,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::roles::RoleRegistry;
 use crate::runtime::{NetworkPolicy, PermissionMode};
-use crate::state::session::{AgentModels, EvidenceRecord, Finding, ResultRecord, SessionState};
+use crate::state::session::{
+    AgentModels, EvidenceRecord, Finding, ResultRecord, SessionState, DEFAULT_TEXT_LIMIT,
+};
 use crate::util::json::validate_serializable;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -74,6 +76,7 @@ impl HandoffFile {
 
     pub fn validate(&self, registry: &RoleRegistry) -> anyhow::Result<()> {
         const SCHEMA: &str = include_str!("../../schemas/handoff-file.schema.json");
+        let text_limit = DEFAULT_TEXT_LIMIT;
 
         ensure!(
             self.format_version == "2",
@@ -90,6 +93,20 @@ impl HandoffFile {
             ),
             "handoff source must be an allowed value"
         );
+        ensure!(
+            self.objective.len() <= text_limit,
+            "handoff objective exceeds maximum length of {text_limit}"
+        );
+        ensure!(
+            self.working_summary.len() <= text_limit,
+            "handoff working_summary exceeds maximum length of {text_limit}"
+        );
+        if let Some(repository_summary) = &self.repository_summary {
+            ensure!(
+                repository_summary.len() <= text_limit,
+                "handoff repository_summary exceeds maximum length of {text_limit}"
+            );
+        }
         self.agent_models.validate(registry)?;
         validate_serializable("handoff-file.schema.json", SCHEMA, "HandoffFile", self)
     }

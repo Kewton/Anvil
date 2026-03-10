@@ -1,6 +1,7 @@
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::env;
+use std::io::{BufRead, BufReader};
 use std::time::Duration;
 
 use crate::models::client::{ModelClient, ModelRequest, ModelResponse};
@@ -74,6 +75,68 @@ impl ModelClient for LmStudioClient {
             output,
         })
     }
+
+    fn stream_complete(
+        &self,
+        request: &ModelRequest,
+        on_chunk: &mut dyn FnMut(&str),
+    ) -> anyhow::Result<ModelResponse> {
+        let client = reqwest::blocking::Client::builder()
+            .connect_timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(600))
+            .build()
+            .context("failed to build LM Studio HTTP client")?;
+        let response = client
+            .post(format!(
+                "{}/v1/chat/completions",
+                self.endpoint.trim_end_matches('/')
+            ))
+            .json(&LmStudioChatRequest {
+                model: external_model_name(&request.model).to_string(),
+                messages: vec![
+                    ChatMessage {
+                        role: "system".to_string(),
+                        content: request.system_prompt.trim().to_string(),
+                    },
+                    ChatMessage {
+                        role: "user".to_string(),
+                        content: request.user_prompt.trim().to_string(),
+                    },
+                ],
+                stream: true,
+            })
+            .send()
+            .with_context(|| format!("failed to reach LM Studio endpoint {}", self.endpoint))?
+            .error_for_status()
+            .context("LM Studio returned an error status")?;
+
+        let mut output = String::new();
+        for line in BufReader::new(response).lines() {
+            let line = line.context("failed to read streamed LM Studio response")?;
+            let line = line.trim();
+            if line.is_empty() || !line.starts_with("data: ") {
+                continue;
+            }
+            let payload = line.trim_start_matches("data: ").trim();
+            if payload == "[DONE]" {
+                break;
+            }
+            let chunk: LmStudioStreamChunk = serde_json::from_str(payload)
+                .context("failed to decode streamed LM Studio chunk")?;
+            for choice in chunk.choices {
+                if let Some(content) = choice.delta.content.filter(|content| !content.is_empty()) {
+                    on_chunk(&content);
+                    output.push_str(&content);
+                }
+            }
+        }
+
+        Ok(ModelResponse {
+            provider: self.provider_name().to_string(),
+            model: request.model.clone(),
+            output: output.trim().to_string(),
+        })
+    }
 }
 
 fn external_model_name(model: &str) -> &str {
@@ -101,6 +164,23 @@ struct LmStudioChatResponse {
 #[derive(Debug, Clone, Deserialize)]
 struct LmStudioChoice {
     message: ChatMessage,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LmStudioStreamChunk {
+    #[serde(default)]
+    choices: Vec<LmStudioStreamChoice>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LmStudioStreamChoice {
+    delta: LmStudioDelta,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct LmStudioDelta {
+    #[serde(default)]
+    content: Option<String>,
 }
 
 #[cfg(test)]

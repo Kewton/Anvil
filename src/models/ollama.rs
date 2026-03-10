@@ -1,6 +1,7 @@
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::env;
+use std::io::{BufRead, BufReader};
 use std::time::Duration;
 
 use crate::models::client::{ModelClient, ModelRequest, ModelResponse};
@@ -61,6 +62,56 @@ impl ModelClient for OllamaClient {
             output: response.response.trim().to_string(),
         })
     }
+
+    fn stream_complete(
+        &self,
+        request: &ModelRequest,
+        on_chunk: &mut dyn FnMut(&str),
+    ) -> anyhow::Result<ModelResponse> {
+        let client = reqwest::blocking::Client::builder()
+            .connect_timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(600))
+            .build()
+            .context("failed to build Ollama HTTP client")?;
+        let response = client
+            .post(format!(
+                "{}/api/generate",
+                self.endpoint.trim_end_matches('/')
+            ))
+            .json(&OllamaGenerateRequest {
+                model: request.model.clone(),
+                prompt: format!(
+                    "{}\n\n{}",
+                    request.system_prompt.trim(),
+                    request.user_prompt.trim()
+                ),
+                stream: true,
+            })
+            .send()
+            .with_context(|| format!("failed to reach Ollama endpoint {}", self.endpoint))?
+            .error_for_status()
+            .context("Ollama returned an error status")?;
+
+        let mut output = String::new();
+        for line in BufReader::new(response).lines() {
+            let line = line.context("failed to read streamed Ollama response")?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let chunk: OllamaStreamChunk =
+                serde_json::from_str(&line).context("failed to decode streamed Ollama chunk")?;
+            if !chunk.response.is_empty() {
+                on_chunk(&chunk.response);
+                output.push_str(&chunk.response);
+            }
+        }
+
+        Ok(ModelResponse {
+            provider: self.provider_name().to_string(),
+            model: request.model.clone(),
+            output: output.trim().to_string(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -72,6 +123,12 @@ struct OllamaGenerateRequest {
 
 #[derive(Debug, Clone, Deserialize)]
 struct OllamaGenerateResponse {
+    response: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OllamaStreamChunk {
+    #[serde(default)]
     response: String,
 }
 

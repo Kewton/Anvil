@@ -5,6 +5,8 @@ use crate::roles::RoleRegistry;
 use crate::runtime::{NetworkPolicy, PermissionMode};
 use crate::util::json::validate_serializable;
 
+pub const DEFAULT_TEXT_LIMIT: usize = 131_072;
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionState {
@@ -107,17 +109,18 @@ pub enum PendingAction {
 impl SessionState {
     pub fn validate(&self, registry: &RoleRegistry) -> anyhow::Result<()> {
         const SCHEMA: &str = include_str!("../../schemas/session-state.schema.json");
+        let text_limit = DEFAULT_TEXT_LIMIT;
 
         ensure_non_empty("session_id", &self.session_id)?;
         ensure_non_empty("pm_model", &self.pm_model)?;
-        bounded_len("objective", &self.objective, 2000)?;
-        bounded_len("working_summary", &self.working_summary, 2000)?;
+        bounded_len("objective", &self.objective, text_limit)?;
+        bounded_len("working_summary", &self.working_summary, text_limit)?;
         bounded_len(
             "user_preferences_summary",
             &self.user_preferences_summary,
-            2000,
+            text_limit,
         )?;
-        bounded_len("repository_summary", &self.repository_summary, 2000)?;
+        bounded_len("repository_summary", &self.repository_summary, text_limit)?;
         validate_string_list("active_constraints", &self.active_constraints, 20, 300)?;
         validate_string_list("open_questions", &self.open_questions, 10, 300)?;
         validate_string_list("completed_steps", &self.completed_steps, 50, 300)?;
@@ -158,6 +161,7 @@ impl AgentModels {
 
 impl PendingConfirmation {
     fn validate(&self, registry: &RoleRegistry) -> anyhow::Result<()> {
+        let text_limit = DEFAULT_TEXT_LIMIT;
         ensure!(
             registry.role(&self.role).is_some()
                 && self.role != "pm"
@@ -166,9 +170,9 @@ impl PendingConfirmation {
             self.role
         );
         ensure_non_empty("pending_confirmation.task", &self.task)?;
-        bounded_len("pending_confirmation.task", &self.task, 1000)?;
+        bounded_len("pending_confirmation.task", &self.task, text_limit)?;
         ensure_non_empty("pending_confirmation.summary", &self.summary)?;
-        bounded_len("pending_confirmation.summary", &self.summary, 1000)?;
+        bounded_len("pending_confirmation.summary", &self.summary, text_limit)?;
         ensure_non_empty("pending_confirmation.reason", &self.reason)?;
         bounded_len("pending_confirmation.reason", &self.reason, 300)?;
 
@@ -201,6 +205,7 @@ fn validate_role_records(
     recent_delegations: &[DelegationRecord],
     recent_results: &[ResultRecord],
 ) -> anyhow::Result<()> {
+    let text_limit = DEFAULT_TEXT_LIMIT;
     if recent_delegations.len() > 20 {
         bail!("recent_delegations exceeds maximum size of 20");
     }
@@ -211,7 +216,7 @@ fn validate_role_records(
     for record in recent_delegations {
         ensure_non_empty("delegation.id", &record.id)?;
         ensure_non_empty("delegation.resolved_model", &record.resolved_model)?;
-        bounded_len("delegation.task", &record.task, 1000)?;
+        bounded_len("delegation.task", &record.task, text_limit)?;
         ensure!(
             registry.role(&record.role).is_some()
                 && record.role != "pm"
@@ -223,7 +228,7 @@ fn validate_role_records(
 
     for result in recent_results {
         ensure_non_empty("result.model", &result.model)?;
-        bounded_len("result.summary", &result.summary, 1000)?;
+        bounded_len("result.summary", &result.summary, text_limit)?;
         ensure!(
             registry.role(&result.role).is_some()
                 && result.role != "pm"
