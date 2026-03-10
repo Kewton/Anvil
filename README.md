@@ -113,6 +113,13 @@ anvil -p "Reply with exactly: OK" --model qwen3.5:35b --network local-only
 anvil -p "Reply with exactly: OK" --model lmstudio/<your-model-id> --network local-only
 ```
 
+Optional live LM Studio test:
+
+```bash
+ANVIL_LM_STUDIO_MODEL=lmstudio/<your-model-id> \
+  cargo test --test pm_and_models -- --ignored lm_studio_live_smoke_test
+```
+
 ## Docs
 
 - [Runtime Overview](/Users/maenokota/share/work/github_kewton/Anvil/docs/runtime-overview.md)

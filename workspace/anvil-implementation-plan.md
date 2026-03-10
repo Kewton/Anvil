@@ -36,15 +36,17 @@ Completed:
 - fixture-based resume/edit/test/review CLI end-to-end coverage
 - CLI handoff export/import roundtrip coverage
 - CLI blocked tester-path coverage in read-only mode
+- CLI confirmation-required tester-path coverage for networked validation requests
+- opt-in LM Studio live smoke test coverage
 - implementation-facing documentation promoted into `README.md` and `docs/runtime-overview.md`
 - initial automated test coverage for CLI, state, policy, trust, runtime/tools, and PM/model routing
 
 Not yet completed:
 
-- live LM Studio smoke verification
+- repeatable execution of LM Studio live smoke verification in a running local environment
 - richer step lifecycle semantics beyond normalized de-duplication
 - further documentation promotion from `workspace/` into stable docs where still needed
-- CLI-visible confirmation-path coverage for networked or destructive actions
+- CLI-visible confirmation-path coverage for destructive actions
 
 ---
 
@@ -244,7 +246,8 @@ Status:
 - interactive CLI command coverage is in place
 - fixture-based resume/edit/test/review and handoff CLI flows are now covered
 - blocked tester-path CLI coverage is in place
-- remaining gaps are live adapter integration tests, confirmation-path CLI coverage, and richer fixture breadth
+- confirmation-required tester-path CLI coverage is in place
+- remaining gaps are live adapter execution in a running local environment, destructive confirmation coverage, and richer fixture breadth
 
 ### 12. Documentation Promotion and Cleanup
 
@@ -261,9 +264,9 @@ Goal:
 
 ## Recommended Immediate Next Steps
 
-1. Add repeatable LM Studio live verification and optional integration coverage
+1. Run repeatable LM Studio live verification in a running local environment
 2. Tighten pending/completed-step lifecycle semantics beyond normalized de-duplication
-3. Expose or test confirmation-required CLI paths for networked or destructive actions
+3. Expose or test destructive confirmation-required CLI paths
 4. Promote any remaining implementation-aligned documents from `workspace/` into stable docs
 5. Add richer session summary or history views only where they improve operator clarity
 
@@ -275,7 +278,7 @@ The highest-value remaining items are:
 
 - add repeatable LM Studio live verification
 - tighten pending/completed work lifecycle semantics further
-- add CLI-visible confirmation-path coverage for networked or destructive actions
+- add CLI-visible confirmation-path coverage for destructive actions
 - add more true end-to-end tests that exercise prompt execution, persistence, resume, and tool use together
 - finish promoting implementation notes into durable user/developer documentation
 

@@ -90,7 +90,7 @@ Slash commands:
 
 ## Current Limits
 
-- LM Studio live smoke verification is not yet automated
+- LM Studio live smoke verification is opt-in rather than part of the default suite
 - step lifecycle is improved but still heuristic
 - end-to-end coverage is still small and fixture-based
 - documentation is still being promoted out of `workspace/`
@@ -135,3 +135,10 @@ If the request fails:
 - confirm LM Studio local server is running
 - confirm the loaded model id matches the suffix after `lmstudio/`
 - confirm the server exposes the OpenAI-compatible `/v1/chat/completions` route
+
+Optional integration test:
+
+```bash
+ANVIL_LM_STUDIO_MODEL=lmstudio/<your-model-id> \
+  cargo test --test pm_and_models -- --ignored lm_studio_live_smoke_test
+```
