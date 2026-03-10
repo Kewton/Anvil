@@ -39,13 +39,14 @@ Completed:
 - CLI confirmation-required tester-path coverage for networked validation requests
 - CLI confirmation-required tester-path coverage for destructive validation requests
 - opt-in LM Studio live smoke test coverage
+- role-aware pending-step replacement for successive recommendations
 - implementation-facing documentation promoted into `README.md` and `docs/runtime-overview.md`
 - initial automated test coverage for CLI, state, policy, trust, runtime/tools, and PM/model routing
 
 Not yet completed:
 
 - repeatable execution of LM Studio live smoke verification in a running local environment
-- richer step lifecycle semantics beyond normalized de-duplication
+- richer step lifecycle semantics beyond normalization and role-local replacement
 - further documentation promotion from `workspace/` into stable docs where still needed
 
 ---
@@ -265,7 +266,7 @@ Goal:
 ## Recommended Immediate Next Steps
 
 1. Run repeatable LM Studio live verification in a running local environment
-2. Tighten pending/completed-step lifecycle semantics beyond normalized de-duplication
+2. Tighten pending/completed-step lifecycle semantics beyond normalization and role-local replacement
 3. Promote any remaining implementation-aligned documents from `workspace/` into stable docs
 4. Add richer session summary or history views only where they improve operator clarity
 5. Expand fixture coverage only where it adds new runtime behavior
