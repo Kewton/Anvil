@@ -660,3 +660,65 @@ fn handoff_export_and_import_roundtrip_via_cli() {
             "Working summary: Reader inspected ",
         ));
 }
+
+#[test]
+fn imported_handoff_can_resume_with_follow_up_prompt() {
+    let temp = tempdir().expect("tempdir");
+    let home = temp.path().join("anvil-home");
+    fs::create_dir_all(&home).expect("create anvil home");
+
+    let start = Command::new(assert_cmd::cargo::cargo_bin!("anvil"))
+        .env("ANVIL_HOME", &home)
+        .args(["-p", "inspect sample", "--model", "pm-model"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(start).expect("utf8");
+    let session_line = stdout
+        .lines()
+        .find(|line| line.starts_with("session: "))
+        .expect("session line");
+    let session_id = session_line.trim_start_matches("session: ");
+
+    let export = Command::new(assert_cmd::cargo::cargo_bin!("anvil"))
+        .env("ANVIL_HOME", &home)
+        .args(["handoff", "export", session_id])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let exported_session_id = format!("{session_id}-imported");
+    let mutated_export = String::from_utf8(export)
+        .expect("utf8")
+        .replace(session_id, &exported_session_id);
+    let export_path = temp.path().join("handoff-import.json");
+    fs::write(&export_path, mutated_export).expect("write handoff import");
+
+    Command::new(assert_cmd::cargo::cargo_bin!("anvil"))
+        .env("ANVIL_HOME", &home)
+        .args([
+            "handoff",
+            "import",
+            export_path.to_str().expect("utf8 path"),
+        ])
+        .assert()
+        .success();
+
+    Command::new(assert_cmd::cargo::cargo_bin!("anvil"))
+        .env("ANVIL_HOME", &home)
+        .args(["resume", &exported_session_id, "-p", "review the current diff"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "prompt: review the current diff",
+        ))
+        .stdout(predicate::str::contains(
+            "response: Reviewer prepared a risk pass",
+        ))
+        .stdout(predicate::str::contains("Last delegation: reviewer via pm-model"));
+}

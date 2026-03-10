@@ -10,6 +10,7 @@ Anvil/
 │  └─ agent-architecture.md
 │  └─ memory-policy.md
 │  └─ model-routing.md
+│  └─ prompting.md
 │  └─ repo-instructions.md
 │  └─ runtime-permissions.md
 │  └─ runtime-overview.md
@@ -68,6 +69,7 @@ Anvil/
 - `docs/agent-architecture.md` describes the PM-centered delegation model and current role boundaries.
 - `docs/memory-policy.md` captures the current intended policy for optional user memory.
 - `docs/model-routing.md` captures PM-default model inheritance and per-role override behavior.
+- `docs/prompting.md` summarizes PM and subagent prompting strategy for local-model operation.
 - `docs/repo-instructions.md` explains how `anvil.md` is loaded and where its authority stops.
 - `docs/runtime-permissions.md` captures the currently implemented runtime permission model.
 - `docs/runtime-overview.md` describes the currently implemented runtime surfaces.

@@ -217,8 +217,51 @@ fn compact_pending_steps(session: &mut SessionState) {
         }
     }
 
-    compacted.reverse();
+    compacted.sort_by_key(|step| step_sort_key(session, step));
     session.pending_steps = compacted;
+}
+
+fn step_sort_key(session: &SessionState, step: &str) -> (usize, usize) {
+    let role_priority = latest_recommending_role(session, step)
+        .map(role_priority)
+        .unwrap_or(usize::MAX);
+    let recency = latest_recommendation_index(session, step)
+        .map(|index| session.recent_results.len().saturating_sub(index))
+        .unwrap_or(usize::MAX);
+    (role_priority, recency)
+}
+
+fn latest_recommending_role<'a>(session: &'a SessionState, step: &str) -> Option<&'a str> {
+    session
+        .recent_results
+        .iter()
+        .rev()
+        .find(|result| {
+            result
+                .next_recommendation
+                .as_deref()
+                .is_some_and(|next| same_step(next, step))
+        })
+        .map(|result| result.role.as_str())
+}
+
+fn latest_recommendation_index(session: &SessionState, step: &str) -> Option<usize> {
+    session.recent_results.iter().rposition(|result| {
+        result
+            .next_recommendation
+            .as_deref()
+            .is_some_and(|next| same_step(next, step))
+    })
+}
+
+fn role_priority(role: &str) -> usize {
+    match role {
+        "editor" => 0,
+        "tester" => 1,
+        "reviewer" => 2,
+        "reader" => 3,
+        _ => 4,
+    }
 }
 
 fn remove_previous_recommendation_for_role(session: &mut SessionState, role: &str, step: &str) {
@@ -384,7 +427,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_pending_steps_deduplicates_and_drops_completed_entries() {
+    fn compact_pending_steps_deduplicates_drops_completed_and_sorts_by_role_priority() {
         let mut session = sample_session();
         session.completed_steps = vec!["Run cargo check".to_string()];
         session.pending_steps = vec![
@@ -392,6 +435,41 @@ mod tests {
             "run cargo check".to_string(),
             "Inspect matched files!".to_string(),
             "Review the changed files".to_string(),
+            "Run a focused tester pass against the mutated file".to_string(),
+        ];
+        session.recent_results = vec![
+            ResultRecord {
+                role: "reader".to_string(),
+                model: "pm-model".to_string(),
+                summary: "reader summary".to_string(),
+                evidence: Vec::new(),
+                changed_files: Vec::new(),
+                commands_run: Vec::new(),
+                next_recommendation: Some("Inspect matched files".to_string()),
+                findings: Vec::new(),
+            },
+            ResultRecord {
+                role: "reviewer".to_string(),
+                model: "pm-model".to_string(),
+                summary: "reviewer summary".to_string(),
+                evidence: Vec::new(),
+                changed_files: Vec::new(),
+                commands_run: Vec::new(),
+                next_recommendation: Some("Review the changed files".to_string()),
+                findings: Vec::new(),
+            },
+            ResultRecord {
+                role: "tester".to_string(),
+                model: "pm-model".to_string(),
+                summary: "tester summary".to_string(),
+                evidence: Vec::new(),
+                changed_files: Vec::new(),
+                commands_run: Vec::new(),
+                next_recommendation: Some(
+                    "Run a focused tester pass against the mutated file".to_string(),
+                ),
+                findings: Vec::new(),
+            },
         ];
 
         compact_pending_steps(&mut session);
@@ -399,8 +477,9 @@ mod tests {
         assert_eq!(
             session.pending_steps,
             vec![
-                "Inspect matched files!".to_string(),
+                "Run a focused tester pass against the mutated file".to_string(),
                 "Review the changed files".to_string(),
+                "Inspect matched files!".to_string(),
             ]
         );
     }

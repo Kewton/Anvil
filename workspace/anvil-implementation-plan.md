@@ -44,6 +44,9 @@ Completed:
 - repeatable LM Studio smoke wrapper under `scripts/lm_studio_smoke.sh`
 - role-aware pending-step replacement for successive recommendations
 - stale pending-step cleanup through normalization-aware compaction
+- handoff import followed by resumed delegated work coverage
+- trust-boundary coverage showing that ordinary repo files are not loaded as repository instructions
+- prompting strategy documentation promoted into stable docs
 - implementation-facing documentation promoted into `README.md` and `docs/runtime-overview.md`
 - initial automated test coverage for CLI, state, policy, trust, runtime/tools, and PM/model routing
 
@@ -251,9 +254,10 @@ Status:
 - interactive CLI command coverage is in place
 - fixture-based resume/edit/test/review and handoff CLI flows are now covered
 - confirmation approval/denial flows are covered in CLI integration tests
+- handoff import followed by resumed delegated work is covered
 - blocked tester-path CLI coverage is in place
 - confirmation-required tester-path CLI coverage is in place
-- remaining gaps are live adapter execution in a running local environment, broader fixture breadth, and deeper step lifecycle refinement
+- remaining gaps are broader fixture breadth only where it adds new runtime behavior, deeper step lifecycle refinement, and any final doc promotions worth keeping
 
 ### 12. Documentation Promotion and Cleanup
 

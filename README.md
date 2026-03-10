@@ -137,6 +137,7 @@ ANVIL_LM_STUDIO_MODEL=lmstudio/qwen3.5-35b-a3b \
 - [Runtime Overview](/Users/maenokota/share/work/github_kewton/Anvil/docs/runtime-overview.md)
 - [Agent Architecture](/Users/maenokota/share/work/github_kewton/Anvil/docs/agent-architecture.md)
 - [Model Routing](/Users/maenokota/share/work/github_kewton/Anvil/docs/model-routing.md)
+- [Prompting Strategy](/Users/maenokota/share/work/github_kewton/Anvil/docs/prompting.md)
 - [Runtime Permissions](/Users/maenokota/share/work/github_kewton/Anvil/docs/runtime-permissions.md)
 - [Repository Instructions](/Users/maenokota/share/work/github_kewton/Anvil/docs/repo-instructions.md)
 - [Memory Policy](/Users/maenokota/share/work/github_kewton/Anvil/docs/memory-policy.md)
