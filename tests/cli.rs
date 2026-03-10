@@ -146,3 +146,29 @@ fn prompt_mode_returns_pm_or_subagent_result() {
         ))
         .stdout(predicate::str::contains("response: Reader inspected "));
 }
+
+#[test]
+fn prompt_mode_shows_tester_result_details() {
+    let temp = tempdir().expect("tempdir");
+
+    Command::new(assert_cmd::cargo::cargo_bin!("anvil"))
+        .env("ANVIL_HOME", temp.path())
+        .args([
+            "-p",
+            "run a build",
+            "--model",
+            "pm-model",
+            "--permission-mode",
+            "workspace-write",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Last result: tester via pm-model - Tester ran `cargo build`",
+        ))
+        .stdout(predicate::str::contains("Commands run: cargo build"))
+        .stdout(predicate::str::contains("Evidence: tool-output:"))
+        .stdout(predicate::str::contains(
+            "Next recommendation: Inspect the validation output",
+        ));
+}
