@@ -25,17 +25,20 @@ Completed:
 - PM fast path and bounded Reader, Editor, Tester, and Reviewer delegation
 - Ollama-backed PM fast-path model execution with local validation against `qwen3.5:35b`
 - CLI resume follow-up prompts and session snapshots
+- structured `recentResults` capture for commands, changed files, evidence, recommendations, and completed steps
+- bounded Editor file mutation through the runtime permission layer
+- task-aware Tester command planning with stdout/stderr evidence capture
+- interactive multi-turn loop for new and resumed sessions
+- interactive slash commands for help, status, snapshot, model summary, and exit
 - initial automated test coverage for CLI, state, policy, trust, runtime/tools, and PM/model routing
 
 Not yet completed:
 
 - LM Studio real request adapter implementation
-- structured tool-result capture beyond summary strings
-- subagent-driven file mutation flow instead of edit planning only
-- richer command planning and output capture for Tester
+- richer turn history and session introspection beyond latest snapshot
 - completed-step / pending-step lifecycle beyond simple append and replace
-- interactive multi-turn loop beyond `-p` and resumed single-turn execution
 - end-to-end validation
+- documentation promotion from `workspace/` into `docs/` and `README.md`
 
 ---
 
@@ -188,7 +191,7 @@ Status:
 
 - built-in tools exist and are permission-gated
 - Reader, Tester, Editor, and Reviewer now execute through the runtime tool layer
-- Editor still produces bounded edit plans rather than applying file mutations through the PM flow
+- Editor can now apply bounded file mutations when explicitly requested
 
 ### 10. PM Loop and Subagent Execution
 
@@ -211,7 +214,8 @@ Status:
 - PM fast path is implemented
 - bounded delegation is implemented for Reader, Editor, Tester, and Reviewer
 - `anvil -p` and `anvil resume <id> -p ...` execute through the PM/runtime path
-- full interactive multi-turn shell loop is still not implemented
+- new and resumed sessions now support interactive multi-turn stdin loops
+- interactive slash commands provide help, status, snapshot, model summary, and exit controls
 
 ### 11. Validation and Test Coverage
 
@@ -231,6 +235,7 @@ Goal:
 Status:
 
 - the listed areas have baseline automated coverage
+- interactive CLI command coverage is in place
 - remaining gaps are true end-to-end flows, live adapter integration tests, and richer fixture coverage
 
 ### 12. Documentation Promotion and Cleanup
@@ -249,10 +254,10 @@ Goal:
 ## Recommended Immediate Next Steps
 
 1. Implement the real LM Studio adapter and add adapter-level integration tests
-2. Upgrade Editor from bounded planning to runtime-mediated file mutation with diff capture
-3. Capture command stdout/stderr summaries and tool evidence into `recentResults`
-4. Implement a real interactive multi-turn loop on top of the current PM/runtime path
-5. Promote implementation-aligned docs from `workspace/` into `docs/`
+2. Add richer interactive session introspection such as `/history` and recent delegation display
+3. Tighten pending/completed-step lifecycle semantics beyond append-and-replace
+4. Add fixture-based end-to-end tests covering prompt, mutation, validation, resume, and handoff flows
+5. Promote implementation-aligned docs from `workspace/` into `docs/` and update `README.md`
 
 ---
 
@@ -261,10 +266,10 @@ Goal:
 The highest-value remaining items are:
 
 - finish model-provider parity by implementing the LM Studio HTTP adapter
-- make Editor capable of applying bounded file changes through the runtime permission layer
-- improve Tester to record structured command evidence rather than only command names
-- expose richer session continuity in the CLI, especially around pending/completed work
+- expose richer session continuity in the CLI, especially around history and delegation visibility
+- tighten pending/completed work lifecycle semantics
 - add true end-to-end tests that exercise prompt execution, persistence, resume, and tool use together
+- promote current implementation notes into durable user/developer documentation
 
 ---
 
@@ -286,12 +291,13 @@ The highest-value remaining items are:
 
 - cover `anvil -p`, `anvil resume`, and `anvil resume -p` for both PM fast-path and delegated paths
 - add tests that verify startup/session snapshots include last result, pending steps, completed steps, and recommendations
+- add tests for interactive slash commands and multi-turn stdin loops
 - add tests for blocked and confirmation-required tool paths surfaced through CLI output
 
 ### 4. Runtime and Tool Tests
 
-- add targeted tests for Editor file-write flow once mutation is implemented
-- add targeted tests for Tester command-output summarization once evidence capture lands
+- extend targeted tests around Editor file-write flow and diff/evidence capture
+- extend targeted tests around Tester command-output summarization and blocked-command paths
 - add tests that verify destructive and networked commands remain confirmation-gated
 
 ### 5. Live Adapter Verification
@@ -323,11 +329,13 @@ This is more important for the MVP than immediately wiring real LLM calls, becau
 
 ## Bottom Line
 
-The project is ready to move from design to implementation, but the first engineering focus should be:
+The current MVP foundation is in place:
 
 - registry-driven role handling
 - schema-backed state
 - permission enforcement
 - trust-aware prompt construction
+- runtime-mediated subagent execution
+- resumable interactive CLI sessions
 
-Those pieces should land before broad tool coverage or more ambitious multi-agent behavior.
+The remaining work is now concentrated in provider parity, deeper session ergonomics, fixture-based end-to-end validation, and documentation cleanup.
