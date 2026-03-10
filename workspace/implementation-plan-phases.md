@@ -42,84 +42,84 @@ Anvil の実装は Phase ごとに進める。
 
 目的:
 
-- [ ] プロジェクト骨格
-- [ ] テスト基盤
-- [ ] CI 最低限
-- [ ] TDD を回せる状態の確立
+- [x] プロジェクト骨格
+- [x] テスト基盤
+- [x] CI 最低限
+- [x] TDD を回せる状態の確立
 
 先に書くテスト:
 
-- [ ] `cargo test` が通る最小 smoke test
-- [ ] CLI 起動の smoke test
-- [ ] config 読み込みの基本テスト
-- [ ] `PermissionMode` / `PermissionPolicy` の表駆動テスト
-- [ ] `AuditEvent` serialize / deserialize テスト
-- [ ] `AuditEvent` schema version 後方互換テスト
+- [x] `cargo test` が通る最小 smoke test
+- [x] CLI 起動の smoke test
+- [x] config 読み込みの基本テスト
+- [x] `PermissionMode` / `PermissionPolicy` の表駆動テスト
+- [x] `AuditEvent` serialize / deserialize テスト
+- [x] `AuditEvent` schema version 後方互換テスト
 - [ ] fake HTTP / fake FS / fake clock の基盤テスト
-- [ ] `cargo fmt --check` / `clippy` を通す最小 quality gate テスト
+- [x] `cargo fmt --check` / `clippy` を通す最小 quality gate テスト
 
 実装:
 
-- [ ] Cargo workspace / module 骨格
-- [ ] `src/main.rs`
-- [ ] `src/cli/`
-- [ ] `src/policy/permissions.rs`
-- [ ] `src/state/audit.rs`
-- [ ] `src/config/`
+- [x] Cargo workspace / module 骨格
+- [x] `src/main.rs`
+- [x] `src/cli.rs`
+- [x] `src/policy/permissions.rs`
+- [x] `src/state/audit.rs`
+- [x] `src/config.rs`
 - [ ] tracing 初期化
 - [ ] test support module (`fake_server`, `fake_fs`, `fixtures`)
 
 完了条件:
 
-- [ ] テスト基盤が動く
-- [ ] `PermissionPolicy` の表駆動テストがすべて通る
-- [ ] 監査イベント型が JSONL 化できる
-- [ ] CI 上で単体テストと最小統合テストが実行できる
-- [ ] `fmt` / `clippy` を常時回せる
+- [x] テスト基盤が動く
+- [x] `PermissionPolicy` の表駆動テストがすべて通る
+- [x] 監査イベント型が JSONL 化できる
+- [x] CI 上で単体テストと最小統合テストが実行できる
+- [x] `fmt` / `clippy` を常時回せる
 
 ## Phase 1: Ollama MVP
 
 目的:
 
-- [ ] 単一エージェント
-- [ ] Ollama 接続
-- [ ] 基本ツール
-- [ ] ストリーミング
-- [ ] 権限確認
-- [ ] `ANVIL.md`
-- [ ] `ANVIL-MEMORY.md`
-- [ ] `/memory add`
+- [x] 単一エージェント
+- [x] Ollama 接続
+- [x] 基本ツール
+- [x] ストリーミング
+- [x] 権限確認
+- [x] `ANVIL.md`
+- [x] `ANVIL-MEMORY.md`
+- [x] `/memory add`
 
 先に書くテスト:
 
 - [ ] Ollama provider の health / list_models / chat / chat_stream のモックテスト
 - [ ] NDJSON ストリーム正規化テスト
-- [ ] 壊れた tool call を fail-closed で拒否するテスト
+- [x] 壊れた tool call を fail-closed で拒否するテスト
 - [ ] `Read` / `Write` / `Edit` / `Exec` / `Glob` / `Search` / `Diff` の単体テスト
-- [ ] `--permission-mode ask|accept-edits|bypass-permissions` の統合テスト
-- [ ] `anvil -p` の one-shot 統合テスト
-- [ ] append-only audit log 出力テスト
+- [x] `--permission-mode ask|accept-edits|bypass-permissions` の統合テスト
+- [x] `anvil -p` の one-shot 統合テスト
+- [x] append-only audit log 出力テスト
 - [ ] audit log redaction テスト
-- [ ] `ANVIL.md` nearest-only 読み込みテスト
-- [ ] `ANVIL-MEMORY.md` load と `/memory add` の統合テスト
-- [ ] permission flow の回帰テスト
-- [ ] session persistence の回帰テスト
-- [ ] `qwen3.5:35b` を使った Ollama 実機疎通テスト
+- [x] `ANVIL.md` nearest-only 読み込みテスト
+- [x] `ANVIL-MEMORY.md` load と `/memory add` の統合テスト
+- [x] permission flow の回帰テスト
+- [x] session persistence の回帰テスト
+- [x] `qwen3.5:35b` を使った Ollama 実機疎通テスト
 
 実装:
 
-- [ ] `src/models/ollama.rs`
+- [x] `src/models/ollama.rs`
 - [ ] `src/models/stream.rs`
-- [ ] `src/agent/loop.rs`
-- [ ] `src/tools/*`
-- [ ] `src/ui/plain.rs`
-- [ ] `src/cli/args.rs`
-- [ ] `src/state/session.rs`
-- [ ] `src/state/audit_log.rs`
-- [ ] `src/instructions/anvil_md.rs`
-- [ ] `src/state/memory.rs`
-- [ ] `src/slash/builtins.rs` の `/memory add`
-- [ ] Ollama 実機確認用 fixture / smoke prompt
+- [x] `src/agent/mod.rs` の single-loop MVP
+- [x] `src/tools/*`
+- [x] `src/main.rs` / `src/agent/mod.rs` の plain interactive UI
+- [x] `src/cli.rs`
+- [x] `src/state/session.rs`
+- [x] `src/state/audit.rs`
+- [x] `src/instructions/mod.rs`
+- [x] `src/state/memory.rs`
+- [x] `src/agent/mod.rs` の `/memory add`
+- [x] Ollama 実機確認用 fixture / smoke prompt
 
 TDD の観点:
 
@@ -130,13 +130,13 @@ TDD の観点:
 
 完了条件:
 
-- [ ] `anvil` で対話起動できる
-- [ ] `anvil -p "..."` が動く
-- [ ] 基本ツールが使える
-- [ ] 権限確認と audit log が破綻しない
-- [ ] `ANVIL.md` と `ANVIL-MEMORY.md` の基本機能が動く
-- [ ] Ollama だけで MVP が完結する
-- [ ] 壊れた tool call を誤実行せず fail-closed で停止できる
+- [x] `anvil` で対話起動できる
+- [x] `anvil -p "..."` が動く
+- [x] 基本ツールが使える
+- [x] 権限確認と audit log が破綻しない
+- [x] `ANVIL.md` と `ANVIL-MEMORY.md` の基本機能が動く
+- [x] Ollama だけで MVP が完結する
+- [x] 壊れた tool call を誤実行せず fail-closed で停止できる
 
 ## Phase 2: 実用化
 
@@ -305,16 +305,16 @@ TDD の観点:
 
 ### Milestone A
 
-- [ ] Phase 0 完了
-- [ ] 権限と監査の中核型が固まる
+- [x] Phase 0 完了
+- [x] 権限と監査の中核型が固まる
 
 ### Milestone B
 
-- [ ] Phase 1 完了
-- [ ] Ollama MVP が使える
-- [ ] `qwen3.5:35b` での Ollama 受け入れ確認が完了している
-- [ ] `./sandbox/<timestamp>/` を作成し、「ブラウザから直接実行可能なカッコ良いスペースインベーダーゲーム」を生成できる
-- [ ] 生成物をブラウザで実行して動作確認できる
+- [x] Phase 1 完了
+- [x] Ollama MVP が使える
+- [x] `qwen3.5:35b` での Ollama 受け入れ確認が完了している
+- [x] `./sandbox/<timestamp>/` を作成し、「ブラウザから直接実行可能なカッコ良いスペースインベーダーゲーム」を生成できる
+- [x] 生成物をブラウザで実行して動作確認できる
 
 Milestone B 受け入れテスト:
 
