@@ -7,7 +7,9 @@ Anvil/
 ├─ README.md
 ├─ docs/
 │  └─ directory-structure.md
+│  └─ agent-architecture.md
 │  └─ memory-policy.md
+│  └─ runtime-permissions.md
 │  └─ runtime-overview.md
 │  └─ trust-model.md
 ├─ schemas/
@@ -58,7 +60,9 @@ Anvil/
 
 - `schemas/role-registry.json` is the canonical checked-in role registry instance.
 - `schemas/*.schema.json` define the machine-readable contracts used by runtime state.
+- `docs/agent-architecture.md` describes the PM-centered delegation model and current role boundaries.
 - `docs/memory-policy.md` captures the current intended policy for optional user memory.
+- `docs/runtime-permissions.md` captures the currently implemented runtime permission model.
 - `docs/runtime-overview.md` describes the currently implemented runtime surfaces.
 - `docs/trust-model.md` captures the current source-precedence and prompt-injection posture.
 - `workspace/` still holds active planning documents that have not yet been promoted into stable docs.
