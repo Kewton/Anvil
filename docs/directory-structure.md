@@ -9,6 +9,7 @@ Anvil/
 │  └─ directory-structure.md
 │  └─ memory-policy.md
 │  └─ runtime-overview.md
+│  └─ trust-model.md
 ├─ schemas/
 │  ├─ role-registry.schema.json
 │  ├─ role-registry.json
@@ -59,4 +60,5 @@ Anvil/
 - `schemas/*.schema.json` define the machine-readable contracts used by runtime state.
 - `docs/memory-policy.md` captures the current intended policy for optional user memory.
 - `docs/runtime-overview.md` describes the currently implemented runtime surfaces.
+- `docs/trust-model.md` captures the current source-precedence and prompt-injection posture.
 - `workspace/` still holds active planning documents that have not yet been promoted into stable docs.
