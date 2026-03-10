@@ -17,6 +17,8 @@ pub struct SessionState {
     pub agent_models: AgentModels,
     pub objective: String,
     pub working_summary: String,
+    pub active_plan_summary: String,
+    pub latest_evidence_summary: String,
     pub user_preferences_summary: String,
     pub repository_summary: String,
     pub active_constraints: Vec<String>,
@@ -61,6 +63,13 @@ pub struct EvidenceRecord {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct FactRecord {
+    pub key: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Finding {
     pub severity: String,
     pub message: String,
@@ -73,6 +82,8 @@ pub struct ResultRecord {
     pub role: String,
     pub model: String,
     pub summary: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub facts: Vec<FactRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<EvidenceRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -115,6 +126,12 @@ impl SessionState {
         ensure_non_empty("pm_model", &self.pm_model)?;
         bounded_len("objective", &self.objective, text_limit)?;
         bounded_len("working_summary", &self.working_summary, text_limit)?;
+        bounded_len("active_plan_summary", &self.active_plan_summary, text_limit)?;
+        bounded_len(
+            "latest_evidence_summary",
+            &self.latest_evidence_summary,
+            text_limit,
+        )?;
         bounded_len(
             "user_preferences_summary",
             &self.user_preferences_summary,
@@ -236,6 +253,12 @@ fn validate_role_records(
             "result role {} is not a persisted subagent role",
             result.role
         );
+        ensure!(result.facts.len() <= 20, "result.facts exceeds maximum size of 20");
+        for fact in &result.facts {
+            ensure_non_empty("result.fact.key", &fact.key)?;
+            bounded_len("result.fact.key", &fact.key, 100)?;
+            bounded_len("result.fact.value", &fact.value, 500)?;
+        }
     }
 
     Ok(())

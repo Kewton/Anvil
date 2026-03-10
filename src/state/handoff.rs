@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use crate::roles::RoleRegistry;
 use crate::runtime::{NetworkPolicy, PermissionMode};
 use crate::state::session::{
-    AgentModels, EvidenceRecord, Finding, ResultRecord, SessionState, DEFAULT_TEXT_LIMIT,
+    AgentModels, EvidenceRecord, FactRecord, Finding, ResultRecord, SessionState, DEFAULT_TEXT_LIMIT,
 };
 use crate::util::json::validate_serializable;
 
@@ -17,6 +17,8 @@ pub struct HandoffFile {
     pub session_id: String,
     pub objective: String,
     pub working_summary: String,
+    pub active_plan_summary: String,
+    pub latest_evidence_summary: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repository_summary: Option<String>,
     pub pending_steps: Vec<String>,
@@ -53,6 +55,8 @@ impl HandoffFile {
             session_id: session.session_id.clone(),
             objective: session.objective.clone(),
             working_summary: session.working_summary.clone(),
+            active_plan_summary: session.active_plan_summary.clone(),
+            latest_evidence_summary: session.latest_evidence_summary.clone(),
             repository_summary: Some(session.repository_summary.clone()),
             pending_steps: session.pending_steps.clone(),
             completed_steps: session.completed_steps.clone(),
@@ -101,6 +105,14 @@ impl HandoffFile {
             self.working_summary.len() <= text_limit,
             "handoff working_summary exceeds maximum length of {text_limit}"
         );
+        ensure!(
+            self.active_plan_summary.len() <= text_limit,
+            "handoff active_plan_summary exceeds maximum length of {text_limit}"
+        );
+        ensure!(
+            self.latest_evidence_summary.len() <= text_limit,
+            "handoff latest_evidence_summary exceeds maximum length of {text_limit}"
+        );
         if let Some(repository_summary) = &self.repository_summary {
             ensure!(
                 repository_summary.len() <= text_limit,
@@ -119,6 +131,8 @@ pub struct HandoffResultRecord {
     pub model: String,
     pub summary: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub facts: Vec<FactRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<EvidenceRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub changed_files: Vec<String>,
@@ -134,6 +148,7 @@ impl From<ResultRecord> for HandoffResultRecord {
             role: value.role,
             model: value.model,
             summary: value.summary,
+            facts: value.facts,
             evidence: value.evidence,
             changed_files: value.changed_files,
             commands_run: value.commands_run,

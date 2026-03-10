@@ -332,9 +332,9 @@ fn prompt_mode_repo_analysis_uses_repo_grounded_reader_path() {
         .args(["-p", "このリポジトリを解析して", "--model", "pm-model"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("response: Inspected the repository"))
-        .stdout(predicate::str::contains("Representative paths:"))
-        .stdout(predicate::str::contains("差分観点では"))
+        .stdout(predicate::str::contains("response: リポジトリには"))
+        .stdout(predicate::str::contains("tracked file"))
+        .stdout(predicate::str::contains("Facts: diff.changed_files="))
         .stdout(predicate::str::contains("Last delegation: reviewer via pm-model"));
 }
 
@@ -598,8 +598,9 @@ fn e2e_resume_flow_inspects_mutates_and_reviews_fixture_repo() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "response: Ran `cargo build`",
+            "response: `cargo build` を実行し、exit code は",
         ))
+        .stdout(predicate::str::contains("Facts: validation.command=cargo build"))
         .stdout(predicate::str::contains("Commands run: cargo build"))
         .stdout(predicate::str::contains("Evidence: tool-output:"));
 
@@ -610,8 +611,9 @@ fn e2e_resume_flow_inspects_mutates_and_reviews_fixture_repo() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "response: Summarized the current diff for review the current diff",
+            "response: 差分は",
         ))
+        .stdout(predicate::str::contains("Facts: diff.changed_files="))
         .stdout(predicate::str::contains("Last delegation: reviewer via pm-model"));
 }
 
@@ -729,7 +731,8 @@ fn imported_handoff_can_resume_with_follow_up_prompt() {
             "prompt: review the current diff",
         ))
         .stdout(predicate::str::contains(
-            "response: Summarized the current diff",
+            "response: 差分は",
         ))
+        .stdout(predicate::str::contains("Facts: diff.changed_files="))
         .stdout(predicate::str::contains("Last delegation: reviewer via pm-model"));
 }

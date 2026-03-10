@@ -54,6 +54,79 @@ Not yet completed:
 
 - lifecycle semantics beyond normalization, role-local replacement, and stale-step compaction
 - further documentation promotion from `workspace/` into stable docs where still needed
+- local-LLM-first orchestration roadmap below beyond the initial planner extraction
+
+---
+
+## Local-First Runtime Roadmap
+
+Goal:
+
+- make Anvil robust with local models that are weaker, less obedient, and more tool-confused than frontier hosted models
+- bias the system toward runtime guarantees, bounded execution, and compact state rather than long free-form reasoning
+
+Workstreams:
+
+### A. Planning Layer
+
+Tasks:
+
+- extract `TaskAnalyzer` from `PmAgent`
+- extract `TurnPlanner` and `PlannedStep` from `PmAgent`
+- keep repo-grounded work off the PM fast path by default
+- add task-shape tests for conversation, inspect, analyze, change, validate, and review prompts
+
+Status:
+
+- `TaskAnalyzer` and `TurnPlanner` extraction is now in progress
+
+### B. Step Executor
+
+Tasks:
+
+- add an explicit `StepExecutor` that owns `allowed_tools`, stop conditions, and fallback behavior per step
+- stop relying on subagent summary text to decide whether the turn should halt
+- represent blocked and confirmation-gated steps as structured execution outcomes
+
+### C. Evidence Store
+
+Tasks:
+
+- shift session updates away from summary-centric storage toward fact/evidence-centric storage
+- persist normalized facts such as branch, top directories, changed files, command exit codes, and validation outputs
+- teach the PM to synthesize user-facing responses from evidence instead of raw subagent prose
+
+### D. Memory Compaction
+
+Tasks:
+
+- separate `objective`, `active plan`, `open questions`, `latest evidence`, and `next steps`
+- compact old turn output instead of feeding long raw summaries back into the model
+- bound context by evidence relevance rather than simple recency
+
+### E. Local Model Profiles
+
+Tasks:
+
+- add model capability profiles for PM, sidecar, and execution roles
+- introduce sidecar routing for lightweight classification and summarization
+- tune routing and prompt style for local-only providers such as Ollama and LM Studio
+
+### F. Verification-First Editing
+
+Tasks:
+
+- make Editor use an explicit sequence of locate -> preview -> patch -> verify
+- keep patch size and target-file scope bounded before writes are allowed
+- attach focused tester passes automatically to mutation plans
+
+### G. Failure Recovery
+
+Tasks:
+
+- add deterministic fallback recipes for common tool failures
+- retry known safe alternatives in the runtime before asking the model to improvise
+- expose failure state clearly in CLI snapshots and history
 
 ---
 

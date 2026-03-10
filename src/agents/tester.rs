@@ -1,4 +1,4 @@
-use crate::agents::{AgentResult, AgentTask};
+use crate::agents::{AgentFact, AgentResult, AgentTask};
 use crate::runtime::engine::{RuntimeEngine, RuntimeToolOutcome};
 use crate::state::session::{PendingAction, PendingConfirmation};
 use crate::tools::exec::ExecRequest;
@@ -22,10 +22,13 @@ impl TesterAgent {
                 summarize_exec_result(&task.user_request, command.display, result)
             }
             Ok(RuntimeToolOutcome::Blocked(reason)) => {
-                AgentResult::new("tester", format!("Tester blocked: {reason}"))
+                AgentResult::blocked("tester", format!("Tester blocked: {reason}"))
             }
             Ok(RuntimeToolOutcome::NeedsConfirmation(reason)) => {
-                AgentResult::new("tester", format!("Tester awaiting confirmation: {reason}"))
+                AgentResult::awaiting_confirmation(
+                    "tester",
+                    format!("Tester awaiting confirmation: {reason}"),
+                )
                     .with_pending_confirmation(PendingConfirmation {
                         role: "tester".to_string(),
                         task: task.user_request.clone(),
@@ -101,6 +104,19 @@ fn summarize_exec_result(
             display, result.exit_code, task_description
         ),
     )
+    .with_facts(vec![
+        AgentFact {
+            key: "validation.command".to_string(),
+            value: display.to_string(),
+        },
+        AgentFact {
+            key: "validation.exit_code".to_string(),
+            value: result
+                .exit_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+        },
+    ])
     .with_next_recommendation(
         "Inspect the validation output and decide whether another focused check is needed",
     )

@@ -1,15 +1,21 @@
+use crate::agents::executor::StepExecutor;
+use crate::agents::planning::{TaskAnalyzer, TaskKind, TurnPlan, TurnPlanner};
 use crate::agents::editor::EditorAgent;
 use crate::agents::reader::ReaderAgent;
 use crate::agents::reviewer::ReviewerAgent;
 use crate::agents::tester::TesterAgent;
 use crate::agents::{AgentResult, AgentTask};
 use crate::models::client::ModelRequest;
+use crate::models::profile::LocalModelProfile;
 use crate::models::routing::ModelRouter;
 use crate::roles::EffectiveModels;
 use crate::runtime::engine::RuntimeEngine;
 
 pub struct PmAgent {
     router: ModelRouter,
+    analyzer: TaskAnalyzer,
+    planner: TurnPlanner,
+    executor: StepExecutor,
     reader: ReaderAgent,
     editor: EditorAgent,
     tester: TesterAgent,
@@ -20,6 +26,9 @@ impl Default for PmAgent {
     fn default() -> Self {
         Self {
             router: ModelRouter::default(),
+            analyzer: TaskAnalyzer,
+            planner: TurnPlanner,
+            executor: StepExecutor,
             reader: ReaderAgent,
             editor: EditorAgent,
             tester: TesterAgent,
@@ -32,6 +41,9 @@ impl PmAgent {
     pub fn new(router: ModelRouter) -> Self {
         Self {
             router,
+            analyzer: TaskAnalyzer,
+            planner: TurnPlanner,
+            executor: StepExecutor,
             reader: ReaderAgent,
             editor: EditorAgent,
             tester: TesterAgent,
@@ -57,10 +69,12 @@ impl PmAgent {
         runtime: &RuntimeEngine,
         mut on_chunk: Option<&mut dyn FnMut(&str)>,
     ) -> anyhow::Result<PmTurnOutcome> {
-        let analysis = analyze_task(user_prompt);
-        let plan = build_turn_plan(user_prompt, &analysis);
+        let analysis = self.analyzer.analyze(user_prompt);
+        let plan = self.planner.build(user_prompt, &analysis);
 
-        if plan.allow_fast_path {
+        if plan.allow_fast_path
+            && LocalModelProfile::from_model_name(&models.pm_model).allows_fast_path(user_prompt)
+        {
             let request = ModelRequest {
                 model: models.pm_model.clone(),
                 system_prompt: "PM fast-path".to_string(),
@@ -86,35 +100,21 @@ impl PmAgent {
             });
         }
 
-        let mut delegated_roles = Vec::new();
-        let mut results = Vec::new();
-        let mut step_context = context.to_string();
-
-        for step in &plan.steps {
-            let result = self.run_agent(
+        let trace = self.executor.execute(&plan.steps, context, |step, step_context| {
+            self.run_agent(
                 step.role,
                 user_prompt,
                 &step.objective,
-                &step_context,
+                step_context,
                 runtime,
-            );
-            delegated_roles.push(step.role);
-            step_context.push_str("\n[source=subagent]\n");
-            step_context.push_str(&result.role);
-            step_context.push_str(": ");
-            step_context.push_str(&result.summary);
-            let should_stop = result.is_blocked() || result.needs_confirmation();
-            results.push(result);
-            if should_stop {
-                break;
-            }
-        }
+            )
+        });
 
-        let user_response = synthesize_plan_response(user_prompt, &plan, &results);
+        let user_response = synthesize_plan_response(user_prompt, &plan, &trace.results);
 
         Ok(PmTurnOutcome {
-            delegated_roles,
-            results,
+            delegated_roles: trace.delegated_roles,
+            results: trace.results,
             user_response,
         })
     }
@@ -157,183 +157,6 @@ pub struct PmTurnOutcome {
     pub user_response: String,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum TaskKind {
-    Conversational,
-    RepositoryAnalysis,
-    BranchAnalysis,
-    Review,
-    Change,
-    Validation,
-    Inspection,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct TaskAnalysis {
-    kind: TaskKind,
-    wants_validation: bool,
-    wants_review: bool,
-}
-
-#[derive(Debug, Clone)]
-struct TurnPlan {
-    kind: TaskKind,
-    allow_fast_path: bool,
-    steps: Vec<PlanStep>,
-}
-
-#[derive(Debug, Clone)]
-struct PlanStep {
-    role: AgentRole,
-    objective: String,
-}
-
-fn analyze_task(prompt: &str) -> TaskAnalysis {
-    let normalized = prompt.to_ascii_lowercase();
-    let branchish = contains_any(&normalized, &["branch", "commit", "log", "history"])
-        || contains_any(prompt, &["ブランチ", "コミット", "履歴"]);
-    let repoish = contains_any(&normalized, &["repository", "repo", "codebase"])
-        || contains_any(prompt, &["リポジトリ", "コードベース"]);
-    let explainish = contains_any(&normalized, &["analy", "explain", "summarize"])
-        || contains_any(prompt, &["分析", "解説", "解析", "要約"]);
-    let inspectish = contains_any(&normalized, &["inspect", "read"])
-        || contains_any(prompt, &["調査", "確認"]);
-    let reviewish = contains_any(&normalized, &["review", "regression", "diff"])
-        || contains_any(prompt, &["レビュー", "差分"]);
-    let changeish = contains_any(
-        &normalized,
-        &["edit", "implement", "change", "fix", "apply", "update", "write"],
-    ) || contains_any(prompt, &["修正", "変更", "実装", "更新"]);
-    let validationish = contains_any(
-        &normalized,
-        &["test", "lint", "build", "check", "validate", "clippy", "format", "fmt"],
-    ) || contains_any(prompt, &["テスト", "ビルド", "検証", "確認"]);
-    let contextual = repoish || branchish || reviewish;
-
-    let kind = if branchish && (explainish || reviewish) {
-        TaskKind::BranchAnalysis
-    } else if repoish && explainish {
-        TaskKind::RepositoryAnalysis
-    } else if changeish {
-        TaskKind::Change
-    } else if validationish {
-        TaskKind::Validation
-    } else if reviewish {
-        TaskKind::Review
-    } else if inspectish || contextual || explainish {
-        TaskKind::Inspection
-    } else {
-        TaskKind::Conversational
-    };
-
-    TaskAnalysis {
-        kind,
-        wants_validation: validationish,
-        wants_review: reviewish || matches!(kind, TaskKind::BranchAnalysis),
-    }
-}
-
-fn build_turn_plan(prompt: &str, analysis: &TaskAnalysis) -> TurnPlan {
-    use AgentRole::{Editor, Reader, Reviewer, Tester};
-
-    let mut steps = Vec::new();
-
-    match analysis.kind {
-        TaskKind::Conversational => {
-            return TurnPlan {
-                kind: analysis.kind,
-                allow_fast_path: true,
-                steps,
-            };
-        }
-        TaskKind::RepositoryAnalysis => {
-            steps.push(plan_step(
-                Reader,
-                format!("inspect the repository layout and summarize the main areas for: {prompt}"),
-            ));
-            steps.push(plan_step(
-                Reviewer,
-                format!("review the current diff and highlight notable risk areas for: {prompt}"),
-            ));
-        }
-        TaskKind::BranchAnalysis => {
-            steps.push(plan_step(
-                Reader,
-                format!("inspect the current branch and recent commits for: {prompt}"),
-            ));
-            steps.push(plan_step(
-                Reviewer,
-                format!("review the current diff and highlight notable risk areas for: {prompt}"),
-            ));
-        }
-        TaskKind::Review => {
-            steps.push(plan_step(
-                Reviewer,
-                format!("review the current diff for: {prompt}"),
-            ));
-        }
-        TaskKind::Change => {
-            steps.push(plan_step(
-                Reader,
-                format!("inspect the relevant code paths before editing for: {prompt}"),
-            ));
-            steps.push(plan_step(
-                Editor,
-                format!("implement or update the relevant file for: {prompt}"),
-            ));
-            if analysis.wants_validation || prompt_mentions_fix(prompt) {
-                steps.push(plan_step(
-                    Tester,
-                    format!("validate the recent change for: {prompt}"),
-                ));
-            }
-            if analysis.wants_review {
-                steps.push(plan_step(
-                    Reviewer,
-                    format!("review the resulting diff for: {prompt}"),
-                ));
-            }
-        }
-        TaskKind::Validation => {
-            steps.push(plan_step(
-                Tester,
-                format!("run the appropriate validation command for: {prompt}"),
-            ));
-        }
-        TaskKind::Inspection => {
-            steps.push(plan_step(
-                Reader,
-                format!("inspect the relevant repository context for: {prompt}"),
-            ));
-            if analysis.wants_review {
-                steps.push(plan_step(
-                    Reviewer,
-                    format!("review the current diff for: {prompt}"),
-                ));
-            }
-        }
-    }
-
-    TurnPlan {
-        kind: analysis.kind,
-        allow_fast_path: false,
-        steps,
-    }
-}
-
-fn plan_step(role: AgentRole, objective: String) -> PlanStep {
-    PlanStep { role, objective }
-}
-
-fn prompt_mentions_fix(prompt: &str) -> bool {
-    let normalized = prompt.to_ascii_lowercase();
-    contains_any(&normalized, &["fix", "implement", "repair"]) || contains_any(prompt, &["修正", "直す"])
-}
-
-fn contains_any(haystack: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|needle| haystack.contains(needle))
-}
-
 fn synthesize_plan_response(prompt: &str, plan: &TurnPlan, results: &[AgentResult]) -> String {
     if results.is_empty() {
         return format!("{} に向けて調査を始めましたが、まだ十分な結果を得られていません。", prompt);
@@ -369,16 +192,44 @@ fn synthesize_plan_response(prompt: &str, plan: &TurnPlan, results: &[AgentResul
 
     match plan.kind {
         TaskKind::RepositoryAnalysis => {
-            let mut parts = vec![presented[0].clone()];
-            if let Some(review) = presented.get(1) {
+            let mut parts = Vec::new();
+            if let Some(tracked) = latest_fact(results, "repo.tracked_files") {
+                if let Some(areas) = latest_fact(results, "repo.top_areas") {
+                    parts.push(format!(
+                        "リポジトリには {} 個の tracked file があり、主な領域は {} です",
+                        tracked, areas
+                    ));
+                }
+            } else {
+                parts.push(presented[0].clone());
+            }
+            if let Some(changed) = latest_fact(results, "diff.changed_files") {
+                let additions = latest_fact(results, "diff.additions").unwrap_or("0");
+                let deletions = latest_fact(results, "diff.deletions").unwrap_or("0");
+                parts.push(format!(
+                    "差分は {} files で、+{} / -{} です",
+                    changed, additions, deletions
+                ));
+            } else if let Some(review) = presented.get(1) {
                 parts.push(format!("差分観点では {review}"));
             }
             parts.push("必要ならこのまま主要ディレクトリ、変更点、テスト経路を順に掘り下げられます。".to_string());
             join_sentences(&parts)
         }
         TaskKind::BranchAnalysis => {
-            let mut parts = vec![presented[0].clone()];
-            if let Some(review) = presented.get(1) {
+            let mut parts = Vec::new();
+            if let Some(branch) = latest_fact(results, "git.branch") {
+                let mut line = format!("現在のブランチは `{}` です", branch);
+                if let Some(commit) = latest_fact(results, "git.latest_commit") {
+                    line.push_str(&format!("。直近のコミットは {} です", commit));
+                }
+                parts.push(line);
+            } else {
+                parts.push(presented[0].clone());
+            }
+            if let Some(diff_summary) = latest_fact(results, "git.diff_summary") {
+                parts.push(diff_summary.to_string());
+            } else if let Some(review) = presented.get(1) {
                 parts.push(format!("差分観点では {review}"));
             }
             parts.push("必要なら次に変更ファイル単位で要点を分解します。".to_string());
@@ -400,21 +251,43 @@ fn synthesize_plan_response(prompt: &str, plan: &TurnPlan, results: &[AgentResul
             }
             join_sentences(&parts)
         }
-        TaskKind::Validation => join_sentences(
-            &presented
-                .into_iter()
-                .enumerate()
-                .map(|(index, item)| {
-                    if index == 0 && results.len() > 1 {
-                        format!("事前確認として {item}")
-                    } else {
-                        item
-                    }
-                })
-                .collect::<Vec<_>>(),
-        ),
-        TaskKind::Review | TaskKind::Inspection | TaskKind::Conversational => join_sentences(&presented),
+        TaskKind::Validation => {
+            if let Some(command) = latest_fact(results, "validation.command") {
+                let exit_code = latest_fact(results, "validation.exit_code").unwrap_or("unknown");
+                return format!(
+                    "`{}` を実行し、exit code は {} でした。必要なら出力を掘り下げます。",
+                    command, exit_code
+                );
+            }
+            join_sentences(&presented)
+        }
+        TaskKind::Review => {
+            if let Some(changed) = latest_fact(results, "diff.changed_files") {
+                let additions = latest_fact(results, "diff.additions").unwrap_or("0");
+                let deletions = latest_fact(results, "diff.deletions").unwrap_or("0");
+                return format!(
+                    "差分は {} files で、+{} / -{} です。必要なら高リスク箇所をさらに分解します。",
+                    changed, additions, deletions
+                );
+            }
+            join_sentences(&presented)
+        }
+        TaskKind::Inspection | TaskKind::Conversational => join_sentences(&presented),
     }
+}
+
+fn latest_fact<'a>(results: &'a [AgentResult], key: &str) -> Option<&'a str> {
+    results
+        .iter()
+        .rev()
+        .find_map(|result| {
+            result
+                .facts
+                .iter()
+                .rev()
+                .find(|fact| fact.key == key)
+                .map(|fact| fact.value.as_str())
+        })
 }
 
 fn join_sentences(parts: &[String]) -> String {

@@ -1,4 +1,7 @@
+use anvil::agents::AgentResult;
+use anvil::agents::executor::StepExecutor;
 use anvil::agents::pm::{AgentRole, PmAgent};
+use anvil::agents::planning::{PlanStep, TaskAnalyzer, TaskKind, TurnPlanner};
 use anvil::config::repo_instructions::RepoInstructions;
 use anvil::models::client::{ModelClient, ModelRequest, ModelResponse};
 use anvil::models::routing::ModelRouter;
@@ -64,7 +67,7 @@ fn model_router_routes_to_matching_provider() {
 #[test]
 fn pm_agent_uses_fast_path_for_small_clarifications() {
     let registry = RoleRegistry::load_builtin().expect("registry");
-    let cli = anvil::cli::Cli::parse_from(["anvil", "--model", "pm-model"]);
+    let cli = anvil::cli::Cli::parse_from(["anvil", "--model", "qwen3.5:35b"]);
     let models = EffectiveModels::from_cli(&cli, &registry).expect("models");
     let pm = PmAgent::new(ModelRouter::new(vec![Box::new(TestClient {
         prefix: "",
@@ -176,11 +179,17 @@ fn runtime_loop_records_delegations_and_results() {
     )
     .expect("runtime loop");
 
-    assert!(summary.contains("Summarized the current diff"));
+    assert!(summary.contains("差分は"));
     assert_eq!(session.recent_delegations.len(), 1);
     assert_eq!(session.recent_delegations[0].role, "reviewer");
     assert_eq!(session.recent_delegations[0].resolved_model, "review-model");
     assert_eq!(session.recent_results.len(), 1);
+    assert!(session.recent_results[0]
+        .facts
+        .iter()
+        .any(|fact| fact.key == "diff.changed_files"));
+    assert!(session.active_plan_summary.contains("Review the highest-risk files"));
+    assert!(session.latest_evidence_summary.contains("diff.changed_files="));
     assert_eq!(session.completed_steps, vec!["review the current diff"]);
     assert!(session.pending_steps[0].contains("Review the highest-risk files"));
 }
@@ -272,6 +281,73 @@ fn pm_agent_subagents_use_runtime_tools() {
 }
 
 #[test]
+fn task_analyzer_and_turn_planner_classify_repo_grounded_work() {
+    let analyzer = TaskAnalyzer;
+    let planner = TurnPlanner;
+
+    let repo_analysis = analyzer.analyze("このリポジトリを解析して");
+    assert_eq!(repo_analysis.kind, TaskKind::RepositoryAnalysis);
+    assert!(repo_analysis.needs_repo_grounding);
+
+    let repo_plan = planner.build("このリポジトリを解析して", &repo_analysis);
+    assert!(!repo_plan.allow_fast_path);
+    assert_eq!(repo_plan.steps.len(), 2);
+    assert_eq!(repo_plan.steps[0].role, AgentRole::Reader);
+    assert_eq!(repo_plan.steps[1].role, AgentRole::Reviewer);
+
+    let change = analyzer.analyze("implement the parser fix");
+    assert_eq!(change.kind, TaskKind::Change);
+    let change_plan = planner.build("implement the parser fix", &change);
+    assert_eq!(
+        change_plan
+            .steps
+            .iter()
+            .map(|step| step.role)
+            .collect::<Vec<_>>(),
+        vec![AgentRole::Reader, AgentRole::Editor, AgentRole::Tester]
+    );
+
+    let conversational = analyzer.analyze("what is the current objective?");
+    assert_eq!(conversational.kind, TaskKind::Conversational);
+    let conversational_plan = planner.build("what is the current objective?", &conversational);
+    assert!(conversational_plan.allow_fast_path);
+    assert!(conversational_plan.steps.is_empty());
+}
+
+#[test]
+fn step_executor_halts_after_confirmation_or_blocked_step() {
+    let executor = StepExecutor;
+    let steps = vec![
+        PlanStep {
+            role: AgentRole::Reader,
+            objective: "read".to_string(),
+        },
+        PlanStep {
+            role: AgentRole::Tester,
+            objective: "test".to_string(),
+        },
+        PlanStep {
+            role: AgentRole::Reviewer,
+            objective: "review".to_string(),
+        },
+    ];
+
+    let trace = executor.execute(&steps, "[source=user]\nrun checks", |step, _| match step.role {
+        AgentRole::Reader => AgentResult::new("reader", "Reader inspected the repo"),
+        AgentRole::Tester => AgentResult::awaiting_confirmation(
+            "tester",
+            "Tester awaiting confirmation: networked commands require explicit approval",
+        ),
+        AgentRole::Reviewer => AgentResult::new("reviewer", "Reviewer summarized the diff"),
+        AgentRole::Editor => AgentResult::new("editor", "Editor prepared a patch"),
+    });
+
+    assert_eq!(trace.delegated_roles, vec![AgentRole::Reader, AgentRole::Tester]);
+    assert_eq!(trace.results.len(), 2);
+    assert!(trace.results[1].needs_confirmation());
+}
+
+#[test]
 #[ignore = "requires a running LM Studio server and a loaded local model"]
 fn lm_studio_live_smoke_test() {
     let model =
@@ -300,6 +376,8 @@ fn sample_session() -> SessionState {
         agent_models: AgentModels::default(),
         objective: "objective".to_string(),
         working_summary: "summary".to_string(),
+        active_plan_summary: String::new(),
+        latest_evidence_summary: String::new(),
         user_preferences_summary: String::new(),
         repository_summary: String::new(),
         active_constraints: Vec::new(),

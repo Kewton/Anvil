@@ -12,6 +12,8 @@
     "networkPolicy",
     "objective",
     "workingSummary",
+    "activePlanSummary",
+    "latestEvidenceSummary",
     "userPreferencesSummary",
     "repositorySummary",
     "activeConstraints",
@@ -58,6 +60,14 @@
       "maxLength": 131072
     },
     "workingSummary": {
+      "type": "string",
+      "maxLength": 131072
+    },
+    "activePlanSummary": {
+      "type": "string",
+      "maxLength": 131072
+    },
+    "latestEvidenceSummary": {
       "type": "string",
       "maxLength": 131072
     },
@@ -155,6 +165,21 @@
         }
       }
     },
+    "factRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "value"],
+      "properties": {
+        "key": {
+          "type": "string",
+          "maxLength": 100
+        },
+        "value": {
+          "type": "string",
+          "maxLength": 500
+        }
+      }
+    },
     "finding": {
       "type": "object",
       "additionalProperties": false,
@@ -193,6 +218,13 @@
         "summary": {
           "type": "string",
           "maxLength": 131072
+        },
+        "facts": {
+          "type": "array",
+          "maxItems": 20,
+          "items": {
+            "$ref": "#/$defs/factRecord"
+          }
         },
         "evidence": {
           "type": "array",

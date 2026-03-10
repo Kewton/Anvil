@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::agents::{AgentResult, AgentTask};
+use crate::agents::{AgentFact, AgentResult, AgentTask};
 use crate::runtime::engine::{RuntimeEngine, RuntimeToolOutcome};
 use crate::tools::registry::{ToolRequest, ToolResponse};
 
@@ -18,10 +18,10 @@ impl EditorAgent {
                 matches.into_iter().next()
             }
             Ok(RuntimeToolOutcome::Blocked(reason)) => {
-                return AgentResult::new("editor", format!("Editor blocked: {reason}"));
+                return AgentResult::blocked("editor", format!("Editor blocked: {reason}"));
             }
             Ok(RuntimeToolOutcome::NeedsConfirmation(reason)) => {
-                return AgentResult::new(
+                return AgentResult::awaiting_confirmation(
                     "editor",
                     format!("Editor awaiting confirmation: {reason}"),
                 );
@@ -61,6 +61,15 @@ impl EditorAgent {
             ),
         )
         .with_next_recommendation("Apply the smallest viable patch to the selected target file")
+        .with_facts(
+            target
+                .iter()
+                .map(|path| AgentFact {
+                    key: "file.target".to_string(),
+                    value: path.display().to_string(),
+                })
+                .collect(),
+        )
         .with_changed_files(changed_files)
     }
 }
@@ -153,16 +162,29 @@ fn apply_mutation(
             ),
         )
         .with_next_recommendation("Run a focused tester pass against the mutated file")
+        .with_facts(vec![
+            AgentFact {
+                key: "file.target".to_string(),
+                value: path.display().to_string(),
+            },
+            AgentFact {
+                key: "edit.bytes_written".to_string(),
+                value: result.bytes_written.to_string(),
+            },
+        ])
         .with_changed_files(changed_files)
         .with_evidence(vec![(
             "repo-file".to_string(),
             format!("mutated {}", result.path.display()),
         )]),
         Ok(RuntimeToolOutcome::Blocked(reason)) => {
-            AgentResult::new("editor", format!("Editor blocked: {reason}"))
+            AgentResult::blocked("editor", format!("Editor blocked: {reason}"))
         }
         Ok(RuntimeToolOutcome::NeedsConfirmation(reason)) => {
-            AgentResult::new("editor", format!("Editor awaiting confirmation: {reason}"))
+            AgentResult::awaiting_confirmation(
+                "editor",
+                format!("Editor awaiting confirmation: {reason}"),
+            )
         }
         Ok(RuntimeToolOutcome::Allowed(_)) | Err(_) => AgentResult::new(
             "editor",

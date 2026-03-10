@@ -3,7 +3,7 @@ use crate::agents::tester::TesterAgent;
 use crate::roles::EffectiveModels;
 use crate::runtime::engine::RuntimeEngine;
 use crate::state::session::{
-    DelegationRecord, EvidenceRecord, PendingAction, ResultRecord, SessionState,
+    DelegationRecord, EvidenceRecord, FactRecord, PendingAction, ResultRecord, SessionState,
 };
 use crate::tools::exec::ExecRequest;
 use crate::util::clock::now_rfc3339;
@@ -70,10 +70,19 @@ impl RuntimeLoop {
                     value: value.clone(),
                 })
                 .collect();
+            let facts = result
+                .facts
+                .iter()
+                .map(|fact| FactRecord {
+                    key: fact.key.clone(),
+                    value: fact.value.clone(),
+                })
+                .collect();
             session.recent_results.push(ResultRecord {
                 role: result.role.clone(),
                 model: resolved_model_for(models, role).to_string(),
                 summary: result.summary.clone(),
+                facts,
                 evidence,
                 changed_files,
                 commands_run,
@@ -87,6 +96,8 @@ impl RuntimeLoop {
             update_pending_steps(session, &result.role, next_recommendation);
         }
         session.working_summary = outcome.user_response.clone();
+        refresh_session_facts(session);
+        refresh_compact_memory(session);
         mark_completed_step(session, prompt);
         compact_pending_steps(session);
 
@@ -133,6 +144,14 @@ impl RuntimeLoop {
             role: result.role.clone(),
             model: resolved_model_for_role_id(models, &result.role).to_string(),
             summary: result.summary.clone(),
+            facts: result
+                .facts
+                .iter()
+                .map(|fact| FactRecord {
+                    key: fact.key.clone(),
+                    value: fact.value.clone(),
+                })
+                .collect(),
             evidence: result
                 .evidence
                 .iter()
@@ -148,6 +167,8 @@ impl RuntimeLoop {
         });
         trim_tail(&mut session.recent_results, 20);
         update_pending_steps(session, &result.role, result.next_recommendation);
+        refresh_session_facts(session);
+        refresh_compact_memory(session);
         compact_pending_steps(session);
 
         Ok(Some(result.summary))
@@ -160,6 +181,7 @@ impl RuntimeLoop {
             pending.role, pending.reason
         );
         session.working_summary = summary.clone();
+        refresh_compact_memory(session);
         Some(summary)
     }
 }
@@ -169,6 +191,88 @@ fn trim_tail<T>(items: &mut Vec<T>, max: usize) {
         let excess = items.len() - max;
         items.drain(0..excess);
     }
+}
+
+fn refresh_session_facts(session: &mut SessionState) {
+    if let Some(summary) = latest_fact_value(session, "repo.summary") {
+        session.repository_summary = summary;
+    }
+
+    let mut files = Vec::new();
+    for result in session.recent_results.iter().rev() {
+        for fact in &result.facts {
+            if fact.key == "file.target" || fact.key == "diff.changed_file" {
+                if !files.iter().any(|existing| existing == &fact.value) {
+                    files.push(fact.value.clone());
+                }
+                if files.len() == 20 {
+                    break;
+                }
+            }
+        }
+        if files.len() == 20 {
+            break;
+        }
+    }
+
+    if !files.is_empty() {
+        session.relevant_files = files;
+    }
+}
+
+fn refresh_compact_memory(session: &mut SessionState) {
+    session.active_plan_summary = if session.pending_steps.is_empty() {
+        String::new()
+    } else {
+        session
+            .pending_steps
+            .iter()
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" | ")
+    };
+
+    session.latest_evidence_summary = latest_evidence_summary(session);
+}
+
+fn latest_evidence_summary(session: &SessionState) -> String {
+    let Some(result) = session.recent_results.last() else {
+        return String::new();
+    };
+
+    let facts = result
+        .facts
+        .iter()
+        .take(3)
+        .map(|fact| format!("{}={}", fact.key, fact.value))
+        .collect::<Vec<_>>();
+    if !facts.is_empty() {
+        return facts.join(" | ");
+    }
+
+    result
+        .evidence
+        .iter()
+        .take(2)
+        .map(|record| format!("{}: {}", record.source_type, record.value))
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn latest_fact_value(session: &SessionState, key: &str) -> Option<String> {
+    session
+        .recent_results
+        .iter()
+        .rev()
+        .find_map(|result| {
+            result
+                .facts
+                .iter()
+                .rev()
+                .find(|fact| fact.key == key)
+                .map(|fact| fact.value.clone())
+        })
 }
 
 fn update_pending_steps(
@@ -409,6 +513,7 @@ mod tests {
                 role: "reader".to_string(),
                 model: "pm-model".to_string(),
                 summary: "reader summary".to_string(),
+                facts: Vec::new(),
                 evidence: Vec::new(),
                 changed_files: Vec::new(),
                 commands_run: Vec::new(),
@@ -422,6 +527,7 @@ mod tests {
                 role: "reader".to_string(),
                 model: "pm-model".to_string(),
                 summary: "reader summary 2".to_string(),
+                facts: Vec::new(),
                 evidence: Vec::new(),
                 changed_files: Vec::new(),
                 commands_run: Vec::new(),
@@ -461,6 +567,7 @@ mod tests {
                 role: "reader".to_string(),
                 model: "pm-model".to_string(),
                 summary: "reader summary".to_string(),
+                facts: Vec::new(),
                 evidence: Vec::new(),
                 changed_files: Vec::new(),
                 commands_run: Vec::new(),
@@ -471,6 +578,7 @@ mod tests {
                 role: "reviewer".to_string(),
                 model: "pm-model".to_string(),
                 summary: "reviewer summary".to_string(),
+                facts: Vec::new(),
                 evidence: Vec::new(),
                 changed_files: Vec::new(),
                 commands_run: Vec::new(),
@@ -481,6 +589,7 @@ mod tests {
                 role: "tester".to_string(),
                 model: "pm-model".to_string(),
                 summary: "tester summary".to_string(),
+                facts: Vec::new(),
                 evidence: Vec::new(),
                 changed_files: Vec::new(),
                 commands_run: Vec::new(),
@@ -512,6 +621,8 @@ mod tests {
             agent_models: AgentModels::default(),
             objective: "objective".to_string(),
             working_summary: String::new(),
+            active_plan_summary: String::new(),
+            latest_evidence_summary: String::new(),
             user_preferences_summary: String::new(),
             repository_summary: String::new(),
             active_constraints: Vec::new(),

@@ -4,7 +4,8 @@ use anvil::roles::RoleRegistry;
 use anvil::runtime::{NetworkPolicy, PermissionMode};
 use anvil::state::handoff::HandoffFile;
 use anvil::state::session::{
-    AgentModels, DelegationRecord, EvidenceRecord, Finding, ResultRecord, SessionState,
+    AgentModels, DelegationRecord, EvidenceRecord, FactRecord, Finding, ResultRecord,
+    SessionState,
 };
 use anvil::state::store::StateStore;
 use tempfile::tempdir;
@@ -24,6 +25,8 @@ fn session_state_roundtrip_validates_and_persists() {
         .expect("load session");
 
     assert_eq!(loaded.session_id, session.session_id);
+    assert_eq!(loaded.active_plan_summary, session.active_plan_summary);
+    assert_eq!(loaded.latest_evidence_summary, session.latest_evidence_summary);
     assert_eq!(path, temp.path().join("sessions/session-123.json"));
 }
 
@@ -42,6 +45,8 @@ fn handoff_roundtrip_validates_and_persists() {
 
     assert_eq!(loaded.session_id, session.session_id);
     assert_eq!(loaded.pending_steps, session.pending_steps);
+    assert_eq!(loaded.active_plan_summary, session.active_plan_summary);
+    assert_eq!(loaded.latest_evidence_summary, session.latest_evidence_summary);
     assert_eq!(path, temp.path().join("handoffs/session-123.json"));
 }
 
@@ -59,6 +64,8 @@ fn sample_session() -> SessionState {
         },
         objective: "Implement the MVP runtime permission layer".to_string(),
         working_summary: "Permission checks are partly stubbed and need wiring.".to_string(),
+        active_plan_summary: "Add permission policy tests | Wire destructive classification".to_string(),
+        latest_evidence_summary: "diff.changed_files=1 | validation.command=cargo test".to_string(),
         user_preferences_summary: "Prefer small, reviewable changes.".to_string(),
         repository_summary: "Rust CLI with schema files under schemas/.".to_string(),
         active_constraints: vec!["No network by default".to_string()],
@@ -79,6 +86,10 @@ fn sample_session() -> SessionState {
             role: "reviewer".to_string(),
             model: "deepseek-coder-14b".to_string(),
             summary: "Noted that destructive command handling lacks tests.".to_string(),
+            facts: vec![FactRecord {
+                key: "diff.changed_files".to_string(),
+                value: "1".to_string(),
+            }],
             evidence: vec![EvidenceRecord {
                 source_type: "repo-file".to_string(),
                 value: "src/policy/command_classification.rs".to_string(),

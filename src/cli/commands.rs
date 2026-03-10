@@ -17,10 +17,12 @@ use crate::cli::output::{
     render_startup_summary,
 };
 use crate::config::repo_instructions::RepoInstructions;
+use crate::prompts::context::ContextBlock;
 use crate::roles::{EffectiveModels, RoleRegistry};
 use crate::runtime::engine::RuntimeEngine;
 use crate::runtime::loop_state::RuntimeLoop;
 use crate::runtime::sandbox::SandboxPolicy;
+use crate::runtime::trust::SourceType;
 use crate::runtime::{NetworkPolicy, PermissionMode};
 use crate::state::handoff::HandoffFile;
 use crate::state::session::{ResultRecord, SessionState};
@@ -115,6 +117,8 @@ pub fn execute(cli: Cli) -> anyhow::Result<()> {
                     agent_models: handoff.agent_models.clone(),
                     objective: handoff.objective.clone(),
                     working_summary: handoff.working_summary.clone(),
+                    active_plan_summary: handoff.active_plan_summary.clone(),
+                    latest_evidence_summary: handoff.latest_evidence_summary.clone(),
                     user_preferences_summary: String::new(),
                     repository_summary: handoff.repository_summary.unwrap_or_default(),
                     active_constraints: handoff.active_constraints.clone(),
@@ -130,6 +134,7 @@ pub fn execute(cli: Cli) -> anyhow::Result<()> {
                             role: result.role,
                             model: result.model,
                             summary: result.summary,
+                            facts: result.facts,
                             evidence: result.evidence,
                             changed_files: result.changed_files,
                             commands_run: result.commands_run,
@@ -423,7 +428,7 @@ fn execute_prompt_turn(
     prompt: &str,
 ) -> anyhow::Result<String> {
     let engine = build_runtime_engine(permission_mode, network_policy)?;
-    let context = engine.build_context(prompt, Vec::new());
+    let context = engine.build_context(prompt, build_session_memory_blocks(session));
     let response = RuntimeLoop::run_prompt(
         session,
         models,
@@ -462,7 +467,7 @@ fn execute_prompt_turn_with_feedback(
     }
 
     let engine = build_runtime_engine(permission_mode, network_policy)?;
-    let context = engine.build_context(prompt, Vec::new());
+    let context = engine.build_context(prompt, build_session_memory_blocks(session));
     let mut spinner = Some(ProcessingSpinner::start("Anvil is working"));
     let mut emitted = false;
     let mut on_chunk = |chunk: &str| {
@@ -530,6 +535,8 @@ fn build_session_state(
         agent_models: models.agent_models(),
         objective: objective.clone(),
         working_summary: objective,
+        active_plan_summary: String::new(),
+        latest_evidence_summary: String::new(),
         user_preferences_summary: String::new(),
         repository_summary: String::new(),
         active_constraints: Vec::new(),
@@ -541,4 +548,57 @@ fn build_session_state(
         recent_results: Vec::new(),
         pending_confirmation: None,
     }
+}
+
+fn build_session_memory_blocks(session: &SessionState) -> Vec<ContextBlock> {
+    let mut lines = vec![format!("objective: {}", session.objective)];
+    if !session.active_plan_summary.is_empty() {
+        lines.push(format!("active_plan: {}", session.active_plan_summary));
+    }
+    if !session.latest_evidence_summary.is_empty() {
+        lines.push(format!("latest_evidence: {}", session.latest_evidence_summary));
+    }
+    if !session.repository_summary.is_empty() {
+        lines.push(format!("repository_summary: {}", session.repository_summary));
+    }
+    if !session.relevant_files.is_empty() {
+        lines.push(format!(
+            "relevant_files: {}",
+            session
+                .relevant_files
+                .iter()
+                .take(8)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if !session.active_constraints.is_empty() {
+        lines.push(format!(
+            "constraints: {}",
+            session
+                .active_constraints
+                .iter()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" | ")
+        ));
+    }
+    if !session.open_questions.is_empty() {
+        lines.push(format!(
+            "open_questions: {}",
+            session
+                .open_questions
+                .iter()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" | ")
+        ));
+    }
+    if lines.len() == 1 && session.objective.is_empty() {
+        return Vec::new();
+    }
+    vec![ContextBlock::new(SourceType::Memory, lines.join("\n"))]
 }

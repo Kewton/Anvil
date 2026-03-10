@@ -88,6 +88,14 @@ pub fn render_session_snapshot(session: &SessionState) -> String {
         lines.push(format!("Working summary: {}", session.working_summary));
     }
 
+    if !session.active_plan_summary.is_empty() {
+        lines.push(format!("Active plan: {}", session.active_plan_summary));
+    }
+
+    if !session.latest_evidence_summary.is_empty() {
+        lines.push(format!("Latest evidence: {}", session.latest_evidence_summary));
+    }
+
     if !session.pending_steps.is_empty() {
         lines.push(format!(
             "Pending steps: {}",
@@ -104,6 +112,15 @@ pub fn render_session_snapshot(session: &SessionState) -> String {
             "Last result: {} via {} - {}",
             result.role, result.model, result.summary
         ));
+        if !result.facts.is_empty() {
+            let facts: Vec<String> = result
+                .facts
+                .iter()
+                .take(3)
+                .map(|fact| format!("{}={}", fact.key, fact.value))
+                .collect();
+            lines.push(format!("Facts: {}", facts.join(" | ")));
+        }
         if !result.commands_run.is_empty() {
             lines.push(format!("Commands run: {}", result.commands_run.join(" | ")));
         }
@@ -158,6 +175,15 @@ pub fn render_session_history(session: &SessionState) -> String {
                 "- {} via {}: {}",
                 result.role, result.model, result.summary
             ));
+            if !result.facts.is_empty() {
+                let facts: Vec<String> = result
+                    .facts
+                    .iter()
+                    .take(2)
+                    .map(|fact| format!("{}={}", fact.key, fact.value))
+                    .collect();
+                lines.push(format!("  facts: {}", facts.join(" | ")));
+            }
         }
     }
 
@@ -183,8 +209,8 @@ mod tests {
     use crate::roles::EffectiveModels;
     use crate::runtime::{NetworkPolicy, PermissionMode};
     use crate::state::session::{
-        AgentModels, DelegationRecord, EvidenceRecord, PendingAction, PendingConfirmation,
-        ResultRecord, SessionState,
+        AgentModels, DelegationRecord, EvidenceRecord, FactRecord, PendingAction,
+        PendingConfirmation, ResultRecord, SessionState,
     };
 
     #[test]
@@ -197,6 +223,8 @@ mod tests {
             agent_models: AgentModels::default(),
             objective: "objective".to_string(),
             working_summary: "working".to_string(),
+            active_plan_summary: "plan next".to_string(),
+            latest_evidence_summary: "file.target=src/main.rs".to_string(),
             user_preferences_summary: String::new(),
             repository_summary: String::new(),
             active_constraints: Vec::new(),
@@ -217,6 +245,10 @@ mod tests {
                 role: "editor".to_string(),
                 model: "editor-model".to_string(),
                 summary: "applied change".to_string(),
+                facts: vec![FactRecord {
+                    key: "file.target".to_string(),
+                    value: "src/main.rs".to_string(),
+                }],
                 evidence: vec![
                     EvidenceRecord {
                         source_type: "repo-file".to_string(),
@@ -247,7 +279,10 @@ mod tests {
         };
 
         let rendered = render_session_snapshot(&session);
+        assert!(rendered.contains("Active plan: plan next"));
+        assert!(rendered.contains("Latest evidence: file.target=src/main.rs"));
         assert!(rendered.contains("Commands run: cargo check"));
+        assert!(rendered.contains("Facts: file.target=src/main.rs"));
         assert!(rendered.contains("Changed files: src/main.rs"));
         assert!(rendered.contains("Evidence: repo-file: mutated src/main.rs"));
         assert!(rendered.contains("tool-output: stdout: ok"));
@@ -265,6 +300,8 @@ mod tests {
             agent_models: AgentModels::default(),
             objective: "objective".to_string(),
             working_summary: "working".to_string(),
+            active_plan_summary: String::new(),
+            latest_evidence_summary: String::new(),
             user_preferences_summary: String::new(),
             repository_summary: String::new(),
             active_constraints: Vec::new(),
@@ -285,6 +322,10 @@ mod tests {
                 role: "reader".to_string(),
                 model: "pm-model".to_string(),
                 summary: "Reader inspected the repo".to_string(),
+                facts: vec![FactRecord {
+                    key: "repo.tracked_files".to_string(),
+                    value: "42".to_string(),
+                }],
                 evidence: Vec::new(),
                 changed_files: Vec::new(),
                 commands_run: Vec::new(),
@@ -297,6 +338,7 @@ mod tests {
         let rendered = render_session_history(&session);
         assert!(rendered.contains("Recent results:"));
         assert!(rendered.contains("- reader via pm-model: Reader inspected the repo"));
+        assert!(rendered.contains("facts: repo.tracked_files=42"));
         assert!(rendered.contains("Recent delegations:"));
         assert!(rendered.contains("- reader via pm-model: inspect repo"));
     }
@@ -311,6 +353,8 @@ mod tests {
             agent_models: AgentModels::default(),
             objective: "objective".to_string(),
             working_summary: "working".to_string(),
+            active_plan_summary: String::new(),
+            latest_evidence_summary: String::new(),
             user_preferences_summary: String::new(),
             repository_summary: String::new(),
             active_constraints: Vec::new(),

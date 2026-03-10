@@ -1,4 +1,4 @@
-use crate::agents::{AgentResult, AgentTask};
+use crate::agents::{AgentFact, AgentResult, AgentTask};
 use crate::runtime::engine::{RuntimeEngine, RuntimeToolOutcome};
 use crate::tools::exec::ExecRequest;
 use crate::tools::registry::{ToolRequest, ToolResponse};
@@ -29,10 +29,10 @@ impl ReaderAgent {
         }) {
             Ok(RuntimeToolOutcome::Allowed(ToolResponse::SearchMatches(matches))) => matches.len(),
             Ok(RuntimeToolOutcome::Blocked(reason)) => {
-                return AgentResult::new("reader", format!("Reader blocked: {reason}"));
+                return AgentResult::blocked("reader", format!("Reader blocked: {reason}"));
             }
             Ok(RuntimeToolOutcome::NeedsConfirmation(reason)) => {
-                return AgentResult::new(
+                return AgentResult::awaiting_confirmation(
                     "reader",
                     format!("Reader awaiting confirmation: {reason}"),
                 );
@@ -63,10 +63,10 @@ fn inspect_repository(task: &AgentTask, runtime: &RuntimeEngine) -> AgentResult 
     }) {
         Ok(RuntimeToolOutcome::Allowed(ToolResponse::ExecResult(result))) => result.stdout,
         Ok(RuntimeToolOutcome::Blocked(reason)) => {
-            return AgentResult::new("reader", format!("Reader blocked: {reason}"));
+            return AgentResult::blocked("reader", format!("Reader blocked: {reason}"));
         }
         Ok(RuntimeToolOutcome::NeedsConfirmation(reason)) => {
-            return AgentResult::new(
+            return AgentResult::awaiting_confirmation(
                 "reader",
                 format!("Reader awaiting confirmation: {reason}"),
             );
@@ -96,6 +96,32 @@ fn inspect_repository(task: &AgentTask, runtime: &RuntimeEngine) -> AgentResult 
             }
         ),
     )
+    .with_facts(vec![
+        AgentFact {
+            key: "repo.tracked_files".to_string(),
+            value: file_list.len().to_string(),
+        },
+        AgentFact {
+            key: "repo.top_areas".to_string(),
+            value: if top_dirs.is_empty() {
+                "top-level files".to_string()
+            } else {
+                top_dirs.join(", ")
+            },
+        },
+        AgentFact {
+            key: "repo.summary".to_string(),
+            value: format!(
+                "{} tracked files across {}",
+                file_list.len(),
+                if top_dirs.is_empty() {
+                    "top-level files".to_string()
+                } else {
+                    top_dirs.join(", ")
+                }
+            ),
+        },
+    ])
     .with_evidence(vec![(
         "tool-output".to_string(),
         format!(
@@ -162,6 +188,24 @@ fn inspect_git_state(task: &AgentTask, runtime: &RuntimeEngine) -> AgentResult {
             parsed_branch, top_commit, diff_summary
         ),
     )
+    .with_facts(vec![
+        AgentFact {
+            key: "git.branch".to_string(),
+            value: parse_branch_name(branch_line),
+        },
+        AgentFact {
+            key: "git.latest_commit".to_string(),
+            value: truncate_line(top_commit),
+        },
+        AgentFact {
+            key: "git.diff_summary".to_string(),
+            value: diff_summary.clone(),
+        },
+        AgentFact {
+            key: "repo.summary".to_string(),
+            value: format!("{}; {}", parse_branch_line(branch_line), diff_summary),
+        },
+    ])
     .with_evidence(vec![
         ("tool-output".to_string(), format!("git status: {branch_line}")),
         (
@@ -186,9 +230,9 @@ fn run_safe_git(
     }) {
         Ok(RuntimeToolOutcome::Allowed(ToolResponse::ExecResult(result))) => Ok(result.stdout),
         Ok(RuntimeToolOutcome::Blocked(reason)) => {
-            Err(AgentResult::new("reader", format!("Reader blocked: {reason}")))
+            Err(AgentResult::blocked("reader", format!("Reader blocked: {reason}")))
         }
-        Ok(RuntimeToolOutcome::NeedsConfirmation(reason)) => Err(AgentResult::new(
+        Ok(RuntimeToolOutcome::NeedsConfirmation(reason)) => Err(AgentResult::awaiting_confirmation(
             "reader",
             format!("Reader awaiting confirmation: {reason}"),
         )),
@@ -249,6 +293,14 @@ fn parse_branch_line(line: &str) -> String {
         }
     }
     summary
+}
+
+fn parse_branch_name(line: &str) -> String {
+    let trimmed = line.trim().trim_start_matches("## ").trim();
+    trimmed
+        .split_once("...")
+        .map(|(branch, _)| branch.trim().to_string())
+        .unwrap_or_else(|| trimmed.to_string())
 }
 
 fn summarize_diff_stat(diff_stat: &str, status_count: usize) -> String {

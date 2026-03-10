@@ -1,4 +1,4 @@
-use crate::agents::{AgentResult, AgentTask};
+use crate::agents::{AgentFact, AgentResult, AgentTask};
 use crate::runtime::engine::{RuntimeEngine, RuntimeToolOutcome};
 use crate::tools::registry::{ToolRequest, ToolResponse};
 
@@ -33,6 +33,20 @@ impl ReviewerAgent {
                 .with_next_recommendation(
                     "Review the highest-risk files first and decide whether another tester pass is needed",
                 )
+                .with_facts(vec![
+                    AgentFact {
+                        key: "diff.changed_files".to_string(),
+                        value: changed_files.to_string(),
+                    },
+                    AgentFact {
+                        key: "diff.additions".to_string(),
+                        value: additions.to_string(),
+                    },
+                    AgentFact {
+                        key: "diff.deletions".to_string(),
+                        value: deletions.to_string(),
+                    },
+                ])
                 .with_evidence(vec![(
                     "tool-output".to_string(),
                     format!(
@@ -42,9 +56,9 @@ impl ReviewerAgent {
                 )])
             }
             Ok(RuntimeToolOutcome::Blocked(reason)) => {
-                AgentResult::new("reviewer", format!("Reviewer blocked: {reason}"))
+                AgentResult::blocked("reviewer", format!("Reviewer blocked: {reason}"))
             }
-            Ok(RuntimeToolOutcome::NeedsConfirmation(reason)) => AgentResult::new(
+            Ok(RuntimeToolOutcome::NeedsConfirmation(reason)) => AgentResult::awaiting_confirmation(
                 "reviewer",
                 format!("Reviewer awaiting confirmation: {reason}"),
             ),

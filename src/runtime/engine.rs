@@ -62,12 +62,12 @@ impl RuntimeEngine {
         }
     }
 
-    pub fn build_context(&self, user_prompt: &str, repo_file_blocks: Vec<ContextBlock>) -> String {
+    pub fn build_context(&self, user_prompt: &str, context_blocks: Vec<ContextBlock>) -> String {
         let mut blocks = vec![ContextBlock::new(SourceType::User, user_prompt)];
         if let Some(instructions) = self.repo_instructions.as_context_block() {
             blocks.push(instructions);
         }
-        blocks.extend(repo_file_blocks);
+        blocks.extend(context_blocks);
         render_context_blocks(&blocks)
     }
 
