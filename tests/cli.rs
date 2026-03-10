@@ -20,6 +20,9 @@ fn startup_summary_shows_role_models() {
         .assert()
         .success()
         .stdout(predicate::str::contains("interactive mode"))
+        .stdout(predicate::str::contains(
+            "Working summary: interactive session",
+        ))
         .stdout(predicate::str::contains("PM: pm-model"))
         .stdout(predicate::str::contains("Reader: pm-model (inherited)"))
         .stdout(predicate::str::contains("Editor: editor-model"))
@@ -110,7 +113,10 @@ fn resume_can_run_follow_up_prompt() {
         .stdout(predicate::str::contains(
             "prompt: summarize the current session",
         ))
-        .stdout(predicate::str::contains("response: Reader inspected "));
+        .stdout(predicate::str::contains("response: Reader inspected "))
+        .stdout(predicate::str::contains(
+            "Working summary: Reader inspected ",
+        ));
 }
 
 #[test]
@@ -123,5 +129,8 @@ fn prompt_mode_returns_pm_or_subagent_result() {
         .assert()
         .success()
         .stdout(predicate::str::contains("prompt mode"))
+        .stdout(predicate::str::contains(
+            "Working summary: Reader inspected ",
+        ))
         .stdout(predicate::str::contains("response: Reader inspected "));
 }

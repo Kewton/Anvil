@@ -5,7 +5,7 @@ use anyhow::{bail, Context};
 use crate::agents::pm::PmAgent;
 use crate::cli::app::{Cli, Command, HandoffAction};
 use crate::cli::flags::{NetworkPolicyArg, PermissionModeArg};
-use crate::cli::output::render_startup_summary;
+use crate::cli::output::{render_session_snapshot, render_startup_summary};
 use crate::config::repo_instructions::RepoInstructions;
 use crate::roles::{EffectiveModels, RoleRegistry};
 use crate::runtime::engine::RuntimeEngine;
@@ -53,6 +53,10 @@ pub fn execute(cli: Cli) -> anyhow::Result<()> {
                 )?;
                 println!("prompt: {prompt}");
                 println!("response: {response}");
+            }
+            let snapshot = render_session_snapshot(&session);
+            if !snapshot.is_empty() {
+                println!("{snapshot}");
             }
             println!(
                 "{}",
@@ -128,6 +132,10 @@ pub fn execute(cli: Cli) -> anyhow::Result<()> {
                 println!("prompt: {prompt}");
                 println!("response: {response}");
                 println!("session: {}", session.session_id);
+                let snapshot = render_session_snapshot(&session);
+                if !snapshot.is_empty() {
+                    println!("{snapshot}");
+                }
                 println!(
                     "{}",
                     render_startup_summary(&models, permission_mode, network_policy)
@@ -140,6 +148,10 @@ pub fn execute(cli: Cli) -> anyhow::Result<()> {
                 let path = store.save_session(&registry, &session)?;
                 println!("interactive mode");
                 println!("session: {}", session.session_id);
+                let snapshot = render_session_snapshot(&session);
+                if !snapshot.is_empty() {
+                    println!("{snapshot}");
+                }
                 println!(
                     "{}",
                     render_startup_summary(&models, permission_mode, network_policy)

@@ -175,7 +175,7 @@ fn pm_agent_subagents_use_runtime_tools() {
         )
         .expect("tester turn");
     assert_eq!(tester.delegated_role, Some(AgentRole::Tester));
-    assert!(tester.result.summary.contains("cargo --version"));
+    assert!(tester.result.summary.contains("cargo check"));
 
     let editor = pm
         .run_turn(

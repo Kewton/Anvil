@@ -1,5 +1,6 @@
 use crate::roles::EffectiveModels;
 use crate::runtime::{NetworkPolicy, PermissionMode};
+use crate::state::session::SessionState;
 
 pub fn render_startup_summary(
     models: &EffectiveModels,
@@ -31,4 +32,33 @@ fn permission_mode_label(mode: PermissionMode) -> &'static str {
 
 fn network_policy_label(policy: NetworkPolicy) -> &'static str {
     policy.as_str()
+}
+
+pub fn render_session_snapshot(session: &SessionState) -> String {
+    let mut lines = Vec::new();
+
+    if !session.working_summary.is_empty() {
+        lines.push(format!("Working summary: {}", session.working_summary));
+    }
+
+    if !session.pending_steps.is_empty() {
+        lines.push(format!(
+            "Pending steps: {}",
+            session.pending_steps.join(" | ")
+        ));
+    }
+
+    if let Some(result) = session.recent_results.last() {
+        lines.push(format!(
+            "Last result: {} via {} - {}",
+            result.role, result.model, result.summary
+        ));
+    } else if let Some(delegation) = session.recent_delegations.last() {
+        lines.push(format!(
+            "Last delegation: {} via {}",
+            delegation.role, delegation.resolved_model
+        ));
+    }
+
+    lines.join("\n")
 }
