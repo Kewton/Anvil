@@ -1,9 +1,0 @@
-pm_model = "qwen-coder-14b"
-permission_mode = "workspace-write"
-network_policy = "local-only"
-
-[agent_models]
-reader = "qwen-coder-7b"
-editor = "qwen-coder-14b"
-tester = "qwen-coder-14b"
-reviewer = "deepseek-coder-14b"
