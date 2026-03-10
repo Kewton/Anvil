@@ -76,7 +76,12 @@ fn trim_tail<T>(items: &mut Vec<T>, max: usize) {
 
 fn update_pending_steps(session: &mut SessionState, next_recommendation: Option<String>) {
     if let Some(step) = next_recommendation {
-        session.pending_steps.retain(|existing| existing != &step);
+        if matches_recent_completed_step(session, &step) {
+            return;
+        }
+        session
+            .pending_steps
+            .retain(|existing| !same_step(existing, &step));
         session.pending_steps.push(step);
         trim_tail(&mut session.pending_steps, 20);
     }
@@ -88,10 +93,43 @@ fn mark_completed_step(session: &mut SessionState, prompt: &str) {
         return;
     }
 
-    session.completed_steps.retain(|existing| existing != step);
+    session
+        .completed_steps
+        .retain(|existing| !same_step(existing, step));
     session.completed_steps.push(step.to_string());
     trim_tail(&mut session.completed_steps, 50);
-    session.pending_steps.retain(|existing| existing != step);
+    session
+        .pending_steps
+        .retain(|existing| !same_step(existing, step));
+}
+
+fn matches_recent_completed_step(session: &SessionState, step: &str) -> bool {
+    session
+        .completed_steps
+        .iter()
+        .rev()
+        .take(5)
+        .any(|existing| same_step(existing, step))
+}
+
+fn same_step(left: &str, right: &str) -> bool {
+    normalize_step(left) == normalize_step(right)
+}
+
+fn normalize_step(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn role_label(role: AgentRole) -> &'static str {
@@ -121,4 +159,68 @@ fn role_inherits(models: &EffectiveModels, role: AgentRole) -> bool {
         .find(|entry| entry.role_id == role_id)
         .map(|entry| entry.inherited)
         .unwrap_or(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{mark_completed_step, update_pending_steps};
+    use crate::runtime::{NetworkPolicy, PermissionMode};
+    use crate::state::session::{AgentModels, SessionState};
+
+    #[test]
+    fn completed_step_removes_semantically_matching_pending_entry() {
+        let mut session = sample_session();
+        session.pending_steps = vec![
+            "Run a focused tester pass against the mutated file".to_string(),
+            "Inspect the validation output".to_string(),
+        ];
+
+        mark_completed_step(
+            &mut session,
+            "run a focused tester pass against the mutated file.",
+        );
+
+        assert_eq!(
+            session.pending_steps,
+            vec!["Inspect the validation output".to_string()]
+        );
+        assert_eq!(
+            session.completed_steps,
+            vec!["run a focused tester pass against the mutated file.".to_string()]
+        );
+    }
+
+    #[test]
+    fn pending_step_is_not_readded_when_recently_completed() {
+        let mut session = sample_session();
+        session.completed_steps = vec!["Inspect the validation output".to_string()];
+
+        update_pending_steps(
+            &mut session,
+            Some("inspect the validation output!".to_string()),
+        );
+
+        assert!(session.pending_steps.is_empty());
+    }
+
+    fn sample_session() -> SessionState {
+        SessionState {
+            session_id: "session-1".to_string(),
+            pm_model: "pm-model".to_string(),
+            permission_mode: PermissionMode::ReadOnly,
+            network_policy: NetworkPolicy::Disabled,
+            agent_models: AgentModels::default(),
+            objective: "objective".to_string(),
+            working_summary: String::new(),
+            user_preferences_summary: String::new(),
+            repository_summary: String::new(),
+            active_constraints: Vec::new(),
+            open_questions: Vec::new(),
+            completed_steps: Vec::new(),
+            pending_steps: Vec::new(),
+            relevant_files: Vec::new(),
+            recent_delegations: Vec::new(),
+            recent_results: Vec::new(),
+        }
+    }
 }
