@@ -10,6 +10,7 @@ use anvil::runtime::{NetworkPolicy, PermissionMode};
 use anvil::state::session::{AgentModels, SessionState};
 use anvil::tools::registry::ToolRegistry;
 use clap::Parser;
+use std::env;
 use std::fs;
 use tempfile::tempdir;
 
@@ -240,6 +241,26 @@ fn pm_agent_subagents_use_runtime_tools() {
         .expect("reviewer turn");
     assert_eq!(reviewer.delegated_role, Some(AgentRole::Reviewer));
     assert!(reviewer.result.summary.contains("risk pass"));
+}
+
+#[test]
+#[ignore = "requires a running LM Studio server and a loaded local model"]
+fn lm_studio_live_smoke_test() {
+    let model =
+        env::var("ANVIL_LM_STUDIO_MODEL").unwrap_or_else(|_| "lmstudio/qwen2.5-coder".to_string());
+    let router = ModelRouter::default();
+
+    let response = router
+        .complete(&ModelRequest {
+            model: model.clone(),
+            system_prompt: "Reply with exactly: OK".to_string(),
+            user_prompt: "Reply with exactly: OK".to_string(),
+        })
+        .expect("lm studio response");
+
+    assert_eq!(response.provider, "lm_studio");
+    assert_eq!(response.model, model);
+    assert!(response.output.contains("OK"));
 }
 
 fn sample_session() -> SessionState {
