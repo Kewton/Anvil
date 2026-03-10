@@ -1,10 +1,10 @@
-use crate::cli::flags::{NetworkPolicyArg, PermissionModeArg};
 use crate::roles::EffectiveModels;
+use crate::runtime::{NetworkPolicy, PermissionMode};
 
 pub fn render_startup_summary(
     models: &EffectiveModels,
-    permission_mode: PermissionModeArg,
-    network_policy: NetworkPolicyArg,
+    permission_mode: PermissionMode,
+    network_policy: NetworkPolicy,
 ) -> String {
     let mut lines = Vec::new();
     lines.push(format!("PM: {}", models.pm_model));
@@ -17,23 +17,18 @@ pub fn render_startup_summary(
         }
     }
 
-    lines.push(format!("Permission mode: {}", permission_mode_label(permission_mode)));
+    lines.push(format!(
+        "Permission mode: {}",
+        permission_mode_label(permission_mode)
+    ));
     lines.push(format!("Network: {}", network_policy_label(network_policy)));
     lines.join("\n")
 }
 
-fn permission_mode_label(mode: PermissionModeArg) -> &'static str {
-    match mode {
-        PermissionModeArg::ReadOnly => "read-only",
-        PermissionModeArg::WorkspaceWrite => "workspace-write",
-        PermissionModeArg::FullAccess => "full-access",
-    }
+fn permission_mode_label(mode: PermissionMode) -> &'static str {
+    mode.as_str()
 }
 
-fn network_policy_label(policy: NetworkPolicyArg) -> &'static str {
-    match policy {
-        NetworkPolicyArg::Disabled => "disabled",
-        NetworkPolicyArg::LocalOnly => "local-only",
-        NetworkPolicyArg::EnabledWithApproval => "enabled-with-approval",
-    }
+fn network_policy_label(policy: NetworkPolicy) -> &'static str {
+    policy.as_str()
 }

@@ -4,7 +4,12 @@ pub fn public_model_override_roles(registry: &RoleRegistry) -> Vec<&RoleDefiniti
     registry
         .roles
         .iter()
-        .filter(|role| role.enabled_in_mvp && role.user_facing && role.supports_model_override && role.id != "pm")
+        .filter(|role| {
+            role.enabled_in_mvp
+                && role.user_facing
+                && role.supports_model_override
+                && role.id != "pm"
+        })
         .collect()
 }
 

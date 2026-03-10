@@ -1,3 +1,17 @@
-pub fn now_rfc3339() -> &'static str {
-    "1970-01-01T00:00:00Z"
+use std::time::{SystemTime, UNIX_EPOCH};
+
+pub fn now_rfc3339() -> String {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    format!("{seconds}Z")
+}
+
+pub fn session_id() -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    format!("session-{millis}")
 }
