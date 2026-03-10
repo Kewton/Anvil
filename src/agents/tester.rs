@@ -71,6 +71,17 @@ struct ValidationCommand {
 fn select_validation_command(description: &str) -> ValidationCommand {
     let normalized = description.to_ascii_lowercase();
 
+    if normalized.contains("network")
+        || normalized.contains("download")
+        || normalized.contains("fetch")
+    {
+        return ValidationCommand {
+            program: "curl",
+            args: &["-I", "https://example.com"],
+            display: "curl -I https://example.com",
+        };
+    }
+
     if normalized.contains("lint") || normalized.contains("clippy") {
         return ValidationCommand {
             program: "cargo",
