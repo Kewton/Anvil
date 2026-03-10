@@ -1,5 +1,6 @@
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
+use std::env;
 use std::time::Duration;
 
 use crate::models::client::{ModelClient, ModelRequest, ModelResponse};
@@ -12,7 +13,8 @@ pub struct OllamaClient {
 impl Default for OllamaClient {
     fn default() -> Self {
         Self {
-            endpoint: "http://127.0.0.1:11434".to_string(),
+            endpoint: env::var("ANVIL_OLLAMA_ENDPOINT")
+                .unwrap_or_else(|_| "http://127.0.0.1:11434".to_string()),
         }
     }
 }
@@ -71,4 +73,18 @@ struct OllamaGenerateRequest {
 #[derive(Debug, Clone, Deserialize)]
 struct OllamaGenerateResponse {
     response: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OllamaClient;
+    use std::env;
+
+    #[test]
+    fn default_client_uses_endpoint_override_when_present() {
+        env::set_var("ANVIL_OLLAMA_ENDPOINT", "http://192.168.11.7:11434");
+        let client = OllamaClient::default();
+        assert_eq!(client.endpoint, "http://192.168.11.7:11434");
+        env::remove_var("ANVIL_OLLAMA_ENDPOINT");
+    }
 }

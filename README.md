@@ -29,8 +29,8 @@ Still in progress:
 - Ollama
 - LM Studio
 
-Ollama has been locally verified with `qwen3.5:35b`.
-LM Studio uses the OpenAI-compatible `http://127.0.0.1:1234/v1/chat/completions` endpoint and expects model names in the form `lmstudio/<model-id>`.
+Ollama defaults to `http://127.0.0.1:11434` and can be overridden with `ANVIL_OLLAMA_ENDPOINT`.
+LM Studio defaults to `http://127.0.0.1:1234/v1/chat/completions` and can be overridden with `ANVIL_LM_STUDIO_ENDPOINT`. LM Studio model names should use the form `lmstudio/<model-id>`.
 
 ## Implemented CLI Surface
 

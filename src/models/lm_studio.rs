@@ -1,5 +1,6 @@
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
+use std::env;
 use std::time::Duration;
 
 use crate::models::client::{ModelClient, ModelRequest, ModelResponse};
@@ -12,7 +13,8 @@ pub struct LmStudioClient {
 impl Default for LmStudioClient {
     fn default() -> Self {
         Self {
-            endpoint: "http://127.0.0.1:1234".to_string(),
+            endpoint: env::var("ANVIL_LM_STUDIO_ENDPOINT")
+                .unwrap_or_else(|_| "http://127.0.0.1:1234".to_string()),
         }
     }
 }
@@ -103,7 +105,8 @@ struct LmStudioChoice {
 
 #[cfg(test)]
 mod tests {
-    use super::external_model_name;
+    use super::{external_model_name, LmStudioClient};
+    use std::env;
 
     #[test]
     fn external_model_name_strips_lmstudio_prefix() {
@@ -112,5 +115,13 @@ mod tests {
             "qwen2.5-coder"
         );
         assert_eq!(external_model_name("plain-model"), "plain-model");
+    }
+
+    #[test]
+    fn default_client_uses_endpoint_override_when_present() {
+        env::set_var("ANVIL_LM_STUDIO_ENDPOINT", "http://192.168.11.6:1234");
+        let client = LmStudioClient::default();
+        assert_eq!(client.endpoint, "http://192.168.11.6:1234");
+        env::remove_var("ANVIL_LM_STUDIO_ENDPOINT");
     }
 }

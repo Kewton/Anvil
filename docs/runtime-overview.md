@@ -18,6 +18,8 @@ Anvil runs through a PM-centered loop.
 - Ollama handles default model names
 - LM Studio handles models prefixed with `lmstudio/`
 - PM and subagents can inherit the PM model or use explicit per-role overrides
+- Ollama defaults to `http://127.0.0.1:11434` and honors `ANVIL_OLLAMA_ENDPOINT`
+- LM Studio defaults to `http://127.0.0.1:1234` and honors `ANVIL_LM_STUDIO_ENDPOINT`
 
 ## Implemented Tooling
 
