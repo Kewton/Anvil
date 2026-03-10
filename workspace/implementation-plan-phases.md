@@ -17,69 +17,100 @@ Anvil の実装は Phase ごとに進める。
 - agent loop と CLI は統合テストで押さえる
 - 危険操作、権限、壊れた tool call は必ず回帰テストを持つ
 
+## レビュー結果
+
+この計画は大枠では十分だが、初版には以下の不足があったため本版で反映した。
+
+- Phase 1 と仕様の不整合
+  - `ANVIL.md` 読み込み
+  - `ANVIL-MEMORY.md` 読み込み
+  - `/memory add`
+  が仕様上は Phase 1 だったが、初版では Phase 2 に寄っていた
+- 監査ログの versioning と backward compatibility テストが不足していた
+- parser / provider / policy の単体テストに比べ、session / redaction / audit recovery の観点が弱かった
+- UI 強化 Phase に対して renderer のみで、TTY 非依存の event contract テストが不足していた
+- 拡張フェーズに対して conformance test の前提整備が弱かった
+
+以下の計画は上記を反映済みである。
+
 ## Phase 0: 土台整備
 
 目的:
 
-- プロジェクト骨格
-- テスト基盤
-- CI 最低限
-- TDD を回せる状態の確立
+- [ ] プロジェクト骨格
+- [ ] テスト基盤
+- [ ] CI 最低限
+- [ ] TDD を回せる状態の確立
 
 先に書くテスト:
 
-- `cargo test` が通る最小 smoke test
-- CLI 起動の smoke test
-- config 読み込みの基本テスト
-- `PermissionMode` / `PermissionPolicy` の表駆動テスト
-- `AuditEvent` serialize / deserialize テスト
+- [ ] `cargo test` が通る最小 smoke test
+- [ ] CLI 起動の smoke test
+- [ ] config 読み込みの基本テスト
+- [ ] `PermissionMode` / `PermissionPolicy` の表駆動テスト
+- [ ] `AuditEvent` serialize / deserialize テスト
+- [ ] `AuditEvent` schema version 後方互換テスト
+- [ ] fake HTTP / fake FS / fake clock の基盤テスト
 
 実装:
 
-- Cargo workspace / module 骨格
-- `src/main.rs`
-- `src/cli/`
-- `src/policy/permissions.rs`
-- `src/state/audit.rs`
-- `src/config/`
-- tracing 初期化
+- [ ] Cargo workspace / module 骨格
+- [ ] `src/main.rs`
+- [ ] `src/cli/`
+- [ ] `src/policy/permissions.rs`
+- [ ] `src/state/audit.rs`
+- [ ] `src/config/`
+- [ ] tracing 初期化
+- [ ] test support module (`fake_server`, `fake_fs`, `fixtures`)
 
 完了条件:
 
-- テスト基盤が動く
-- `PermissionPolicy` の表駆動テストがすべて通る
-- 監査イベント型が JSONL 化できる
+- [ ] テスト基盤が動く
+- [ ] `PermissionPolicy` の表駆動テストがすべて通る
+- [ ] 監査イベント型が JSONL 化できる
+- [ ] CI 上で単体テストと最小統合テストが実行できる
 
 ## Phase 1: Ollama MVP
 
 目的:
 
-- 単一エージェント
-- Ollama 接続
-- 基本ツール
-- ストリーミング
-- 権限確認
+- [ ] 単一エージェント
+- [ ] Ollama 接続
+- [ ] 基本ツール
+- [ ] ストリーミング
+- [ ] 権限確認
+- [ ] `ANVIL.md`
+- [ ] `ANVIL-MEMORY.md`
+- [ ] `/memory add`
 
 先に書くテスト:
 
-- Ollama provider の health / list_models / chat / chat_stream のモックテスト
-- NDJSON ストリーム正規化テスト
-- 壊れた tool call を fail-closed で拒否するテスト
-- `Read` / `Write` / `Edit` / `Exec` / `Glob` / `Search` / `Diff` の単体テスト
-- `--permission-mode ask|accept-edits|bypass-permissions` の統合テスト
-- `anvil -p` の one-shot 統合テスト
-- append-only audit log 出力テスト
+- [ ] Ollama provider の health / list_models / chat / chat_stream のモックテスト
+- [ ] NDJSON ストリーム正規化テスト
+- [ ] 壊れた tool call を fail-closed で拒否するテスト
+- [ ] `Read` / `Write` / `Edit` / `Exec` / `Glob` / `Search` / `Diff` の単体テスト
+- [ ] `--permission-mode ask|accept-edits|bypass-permissions` の統合テスト
+- [ ] `anvil -p` の one-shot 統合テスト
+- [ ] append-only audit log 出力テスト
+- [ ] audit log redaction テスト
+- [ ] `ANVIL.md` nearest-only 読み込みテスト
+- [ ] `ANVIL-MEMORY.md` load と `/memory add` の統合テスト
+- [ ] permission flow の回帰テスト
+- [ ] session persistence の回帰テスト
 
 実装:
 
-- `src/models/ollama.rs`
-- `src/models/stream.rs`
-- `src/agent/loop.rs`
-- `src/tools/*`
-- `src/ui/plain.rs`
-- `src/cli/args.rs`
-- `src/state/session.rs`
-- `src/state/audit_log.rs`
+- [ ] `src/models/ollama.rs`
+- [ ] `src/models/stream.rs`
+- [ ] `src/agent/loop.rs`
+- [ ] `src/tools/*`
+- [ ] `src/ui/plain.rs`
+- [ ] `src/cli/args.rs`
+- [ ] `src/state/session.rs`
+- [ ] `src/state/audit_log.rs`
+- [ ] `src/instructions/anvil_md.rs`
+- [ ] `src/state/memory.rs`
+- [ ] `src/slash/builtins.rs` の `/memory add`
 
 TDD の観点:
 
@@ -90,45 +121,47 @@ TDD の観点:
 
 完了条件:
 
-- `anvil` で対話起動できる
-- `anvil -p "..."` が動く
-- 基本ツールが使える
-- 権限確認と audit log が破綻しない
-- Ollama だけで MVP が完結する
+- [ ] `anvil` で対話起動できる
+- [ ] `anvil -p "..."` が動く
+- [ ] 基本ツールが使える
+- [ ] 権限確認と audit log が破綻しない
+- [ ] `ANVIL.md` と `ANVIL-MEMORY.md` の基本機能が動く
+- [ ] Ollama だけで MVP が完結する
 
 ## Phase 2: 実用化
 
 目的:
 
-- LM Studio 対応
-- Plan / Act
-- `ANVIL.md`
-- `ANVIL-MEMORY.md`
-- カスタム slash command
-- 単一サブエージェント
+- [ ] LM Studio 対応
+- [ ] Plan / Act
+- [ ] `/memory show`
+- [ ] `/memory edit`
+- [ ] カスタム slash command
+- [ ] 単一サブエージェント
 
 先に書くテスト:
 
-- LM Studio SSE ストリーム正規化テスト
-- OpenAI 互換レスポンス差分テスト
-- `ANVIL.md` nearest only ローダーテスト
-- `ANVIL-MEMORY.md` load / normalize / update テスト
-- `/memory add`, `/memory show`, `/memory edit` の CLI テスト
-- schema 付き custom command load / validate / invoke テスト
-- Plan / Act 遷移テスト
-- subagent report 圧縮テスト
-- subagent 承認イベントの audit log テスト
+- [ ] LM Studio SSE ストリーム正規化テスト
+- [ ] OpenAI 互換レスポンス差分テスト
+- [ ] `/memory show`, `/memory edit` の CLI テスト
+- [ ] `ANVIL-MEMORY.md` normalize / update テスト
+- [ ] schema 付き custom command load / validate / invoke テスト
+- [ ] Plan / Act 遷移テスト
+- [ ] plan file load / inject テスト
+- [ ] subagent report 圧縮テスト
+- [ ] subagent 承認イベントの audit log テスト
+- [ ] subagent permission leak 回帰テスト
+- [ ] custom command schema bypass 回帰テスト
 
 実装:
 
-- `src/models/lm_studio.rs`
-- `src/instructions/anvil_md.rs`
-- `src/state/memory.rs`
-- `src/slash/registry.rs`
-- `src/slash/builtins.rs`
-- `src/slash/custom.rs`
-- `src/agent/plan.rs`
-- `src/agent/subagent.rs`
+- [ ] `src/models/lm_studio.rs`
+- [ ] `src/slash/registry.rs`
+- [ ] `src/slash/builtins.rs`
+- [ ] `src/slash/custom.rs`
+- [ ] `src/agent/plan.rs`
+- [ ] `src/agent/subagent.rs`
+- [ ] memory edit/show の更新
 
 TDD の観点:
 
@@ -138,38 +171,41 @@ TDD の観点:
 
 完了条件:
 
-- LM Studio でも基本操作が動く
-- `ANVIL.md` と `ANVIL-MEMORY.md` が反映される
-- custom slash command を schema 付きで追加できる
-- subagent が report 経由で文脈圧縮に使える
+- [ ] LM Studio でも基本操作が動く
+- [ ] custom slash command を schema 付きで追加できる
+- [ ] Plan / Act が安定して動く
+- [ ] subagent が report 経由で文脈圧縮に使える
 
 ## Phase 3: パフォーマンスと UX 強化
 
 目的:
 
-- コンテキスト圧縮の高度化
-- Claude Code ライク UI の強化
-- footer UI
-- type-ahead
-- rich diff
-- モデル選択補助
+- [ ] コンテキスト圧縮の高度化
+- [ ] Claude Code ライク UI の強化
+- [ ] footer UI
+- [ ] type-ahead
+- [ ] rich diff
+- [ ] モデル選択補助
 
 先に書くテスト:
 
-- summary 発火条件の表駆動テスト
-- token budget 超過時の圧縮テスト
-- 大きい tool output truncate テスト
-- renderer snapshot test
-- UI event sequence test
-- file change detection method の回帰テスト
+- [ ] summary 発火条件の表駆動テスト
+- [ ] token budget 超過時の圧縮テスト
+- [ ] 大きい tool output truncate テスト
+- [ ] renderer snapshot test
+- [ ] UI event sequence test
+- [ ] TTY 非依存 renderer contract test
+- [ ] file change detection method の回帰テスト
+- [ ] audit log volume / rotation の性能テスト
 
 実装:
 
-- `src/state/summary.rs`
-- `src/ui/interactive.rs`
-- `src/ui/render.rs`
-- `src/config/model_profiles.rs`
-- `src/policy/change_detection.rs`
+- [ ] `src/state/summary.rs`
+- [ ] `src/ui/interactive.rs`
+- [ ] `src/ui/render.rs`
+- [ ] `src/config/model_profiles.rs`
+- [ ] `src/policy/change_detection.rs`
+- [ ] `src/state/artifacts.rs`
 
 TDD の観点:
 
@@ -178,38 +214,42 @@ TDD の観点:
 
 完了条件:
 
-- 長時間セッションでも劣化が抑えられる
-- UI が Claude Code に近い操作感を持つ
-- token budget 制御が機能する
+- [ ] 長時間セッションでも劣化が抑えられる
+- [ ] UI が Claude Code に近い操作感を持つ
+- [ ] token budget 制御が機能する
+- [ ] change detection が大規模リポジトリでも過負荷にならない
 
 ## Phase 4: 拡張フェーズ
 
 目的:
 
-- 並列サブエージェント
-- Notebook / Web / RAG
-- 追加 provider / tool
-- 高度な automation
+- [ ] 並列サブエージェント
+- [ ] Notebook / Web / RAG
+- [ ] 追加 provider / tool
+- [ ] 高度な automation
 
 先に書くテスト:
 
-- 並列 subagent の isolation test
-- 複数 subagent の audit ordering test
-- Notebook / Web / RAG の capability test
-- provider 追加時の conformance test
+- [ ] 並列 subagent の isolation test
+- [ ] 複数 subagent の audit ordering test
+- [ ] Notebook / Web / RAG の capability test
+- [ ] provider 追加時の conformance test
+- [ ] registry 拡張時の backward compatibility test
 
 実装:
 
-- `src/agent/parallel_subagent.rs`
-- `src/tools/notebook.rs`
-- `src/tools/web.rs`
-- `src/tools/rag.rs`
-- provider conformance test harness
+- [ ] `src/agent/parallel_subagent.rs`
+- [ ] `src/tools/notebook.rs`
+- [ ] `src/tools/web.rs`
+- [ ] `src/tools/rag.rs`
+- [ ] provider conformance test harness
+- [ ] extensibility fixtures / golden cases
 
 完了条件:
 
-- 拡張機能が core を壊さずに追加できる
-- 監査と権限モデルが維持される
+- [ ] 拡張機能が core を壊さずに追加できる
+- [ ] 監査と権限モデルが維持される
+- [ ] 新 provider / tool 追加時に conformance test を通せる
 
 ## TDD の運用ルール
 
@@ -242,35 +282,35 @@ TDD の観点:
 
 ### 4. PR 単位の進め方
 
-1. failing test を追加
-2. 最小実装
-3. refactor
-4. audit / regression test 追加
-5. doc 更新
+1. [ ] failing test を追加
+2. [ ] 最小実装
+3. [ ] refactor
+4. [ ] audit / regression test 追加
+5. [ ] doc 更新
 
 ## 推奨マイルストーン
 
 ### Milestone A
 
-- Phase 0 完了
-- 権限と監査の中核型が固まる
+- [ ] Phase 0 完了
+- [ ] 権限と監査の中核型が固まる
 
 ### Milestone B
 
-- Phase 1 完了
-- Ollama MVP が使える
+- [ ] Phase 1 完了
+- [ ] Ollama MVP が使える
 
 ### Milestone C
 
-- Phase 2 完了
-- 実用機能が揃う
+- [ ] Phase 2 完了
+- [ ] 実用機能が揃う
 
 ### Milestone D
 
-- Phase 3 完了
-- UX と性能が実用域に入る
+- [ ] Phase 3 完了
+- [ ] UX と性能が実用域に入る
 
 ### Milestone E
 
-- Phase 4 完了
-- 拡張機能を安全に載せられる
+- [ ] Phase 4 完了
+- [ ] 拡張機能を安全に載せられる
