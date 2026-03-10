@@ -14,18 +14,28 @@ Completed:
 - trust model specification
 - role registry schema and canonical registry instance
 - Rust project skeleton
-- initial CLI, roles, runtime, state, and prompt-loading stubs
-- initial repository structure and examples
+- MVP dependency expansion in `Cargo.toml`
+- compile and test verification with `cargo`
+- registry-driven CLI model routing and persisted role handling
+- schema-backed session and handoff persistence
+- out-of-repository state storage by default
+- runtime permission classification and enforcement for built-in tools
+- trust-aware prompt context labeling with `anvil.md` loading
+- first-party tool execution for file read, file write, search, diff, exec, and env inspection
+- PM fast path and bounded Reader, Editor, Tester, and Reviewer delegation
+- Ollama-backed PM fast-path model execution with local validation against `qwen3.5:35b`
+- CLI resume follow-up prompts and session snapshots
+- initial automated test coverage for CLI, state, policy, trust, runtime/tools, and PM/model routing
 
 Not yet completed:
 
-- dependency expansion beyond the initial minimal crate set
-- compile verification in an environment with `cargo`
-- runtime permission enforcement
-- trust-boundary application in prompt construction
-- model adapter implementation
-- tool execution implementation
-- PM loop and subagent execution
+- LM Studio real request adapter implementation
+- structured tool-result capture beyond summary strings
+- subagent-driven file mutation flow instead of edit planning only
+- richer command planning and output capture for Tester
+- completed-step / pending-step lifecycle beyond simple append and replace
+- interactive multi-turn loop beyond `-p` and resumed single-turn execution
+- end-to-end validation
 - end-to-end validation
 
 ---
@@ -152,6 +162,12 @@ Goal:
 
 - Anvil can issue real model requests under the current routing design
 
+Status:
+
+- model client trait is implemented
+- Ollama adapter is implemented and locally validated
+- LM Studio routing exists but is still a stub adapter
+
 ### 9. Tool Layer
 
 Implement first-party tools:
@@ -169,6 +185,12 @@ Goal:
 
 - the PM and subagents can operate through structured tools instead of free-form shell output
 
+Status:
+
+- built-in tools exist and are permission-gated
+- Reader, Tester, Editor, and Reviewer now execute through the runtime tool layer
+- Editor still produces bounded edit plans rather than applying file mutations through the PM flow
+
 ### 10. PM Loop and Subagent Execution
 
 Implement:
@@ -185,6 +207,13 @@ Goal:
 
 - the interactive execution loop becomes usable without overcommitting to unnecessary orchestration
 
+Status:
+
+- PM fast path is implemented
+- bounded delegation is implemented for Reader, Editor, Tester, and Reviewer
+- `anvil -p` and `anvil resume <id> -p ...` execute through the PM/runtime path
+- full interactive multi-turn shell loop is still not implemented
+
 ### 11. Validation and Test Coverage
 
 Add tests for:
@@ -199,6 +228,11 @@ Add tests for:
 Goal:
 
 - high-risk architectural rules are test-backed before feature expansion
+
+Status:
+
+- the listed areas have baseline automated coverage
+- remaining gaps are true end-to-end flows, live adapter integration tests, and richer fixture coverage
 
 ### 12. Documentation Promotion and Cleanup
 
@@ -215,11 +249,63 @@ Goal:
 
 ## Recommended Immediate Next Steps
 
-1. Add the MVP dependency set to `Cargo.toml`
-2. Build in a Rust environment with `cargo`
-3. Make role-derived CLI behavior test-backed
-4. Implement session and handoff schema validation
-5. Start the runtime permission layer before adding real command execution
+1. Implement the real LM Studio adapter and add adapter-level integration tests
+2. Upgrade Editor from bounded planning to runtime-mediated file mutation with diff capture
+3. Capture command stdout/stderr summaries and tool evidence into `recentResults`
+4. Implement a real interactive multi-turn loop on top of the current PM/runtime path
+5. Promote implementation-aligned docs from `workspace/` into `docs/`
+
+---
+
+## Remaining Work Summary
+
+The highest-value remaining items are:
+
+- finish model-provider parity by implementing the LM Studio HTTP adapter
+- make Editor capable of applying bounded file changes through the runtime permission layer
+- improve Tester to record structured command evidence rather than only command names
+- expose richer session continuity in the CLI, especially around pending/completed work
+- add true end-to-end tests that exercise prompt execution, persistence, resume, and tool use together
+
+---
+
+## Test Plan
+
+### 1. Unit Tests
+
+- keep covering role derivation, permission classification, network/path policy, and trust ordering
+- add direct tests for pending/completed-step lifecycle updates
+- add direct tests for command-selection heuristics in Tester
+
+### 2. Schema and State Tests
+
+- keep roundtrip coverage for session and handoff schemas
+- add fixture tests that verify imported handoffs preserve actionable fields used by resume flows
+- add negative tests for oversized lists, invalid role ids, and invalid `nextRecommendation` payloads
+
+### 3. CLI Integration Tests
+
+- cover `anvil -p`, `anvil resume`, and `anvil resume -p` for both PM fast-path and delegated paths
+- add tests that verify startup/session snapshots include last result, pending steps, completed steps, and recommendations
+- add tests for blocked and confirmation-required tool paths surfaced through CLI output
+
+### 4. Runtime and Tool Tests
+
+- add targeted tests for Editor file-write flow once mutation is implemented
+- add targeted tests for Tester command-output summarization once evidence capture lands
+- add tests that verify destructive and networked commands remain confirmation-gated
+
+### 5. Live Adapter Verification
+
+- keep a local Ollama smoke test using `qwen3.5:35b`
+- add a reproducible LM Studio smoke test once its adapter is implemented
+- separate live-adapter tests from default unit/integration runs so CI remains stable
+
+### 6. End-to-End Validation
+
+- create small fixture repositories for read-only inspection, bounded edit, validation, and review flows
+- verify session creation, persistence, resume, and handoff import/export across those fixtures
+- verify that permission and trust boundaries still hold when repository files contain misleading instructions
 
 ---
 
