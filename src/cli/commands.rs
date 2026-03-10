@@ -192,6 +192,7 @@ fn run_interactive_loop(
     network_policy: NetworkPolicy,
 ) -> anyhow::Result<()> {
     println!("interactive commands: enter a prompt, or `exit` to finish");
+    let session_path = store.session_path(&session.session_id);
     let stdin = io::stdin();
     let mut stdout = io::stdout();
 
@@ -201,9 +202,34 @@ fn run_interactive_loop(
         if trimmed.is_empty() {
             continue;
         }
-        if matches!(trimmed, "exit" | "quit") {
+        if matches!(trimmed, "exit" | "quit" | "/exit" | "/quit") {
             println!("interactive mode ended");
             break;
+        }
+        if matches!(trimmed, "help" | ":help" | "/help") {
+            println!("{}", render_interactive_help());
+            writeln!(stdout, "awaiting next prompt").ok();
+            stdout.flush().ok();
+            continue;
+        }
+        if matches!(
+            trimmed,
+            "status" | ":status" | "/status" | "snapshot" | ":snapshot" | "/snapshot"
+        ) {
+            let status = render_interactive_status(session, &session_path);
+            println!("{status}");
+            writeln!(stdout, "awaiting next prompt").ok();
+            stdout.flush().ok();
+            continue;
+        }
+        if matches!(trimmed, "models" | ":models" | "/models") {
+            println!(
+                "{}",
+                render_startup_summary(models, permission_mode, network_policy)
+            );
+            writeln!(stdout, "awaiting next prompt").ok();
+            stdout.flush().ok();
+            continue;
         }
 
         let response = execute_prompt_turn(
@@ -226,6 +252,25 @@ fn run_interactive_loop(
     }
 
     Ok(())
+}
+
+fn render_interactive_help() -> &'static str {
+    "interactive commands: `/help`, `/status`, `/snapshot`, `/models`, `/exit`"
+}
+
+fn render_interactive_status(session: &SessionState, session_path: &PathBuf) -> String {
+    let mut lines = vec![
+        format!("Session: {}", session.session_id),
+        format!("Objective: {}", session.objective),
+        format!("State: {}", session_path.display()),
+    ];
+    let snapshot = render_session_snapshot(session);
+    if snapshot.is_empty() {
+        lines.push("Session snapshot is empty".to_string());
+    } else {
+        lines.push(snapshot);
+    }
+    lines.join("\n")
 }
 
 fn execute_prompt_turn(

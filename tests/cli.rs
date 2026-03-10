@@ -52,6 +52,39 @@ fn interactive_mode_accepts_multiple_prompts_from_stdin() {
 }
 
 #[test]
+fn interactive_mode_supports_help_status_and_models_commands() {
+    let temp = tempdir().expect("tempdir");
+
+    Command::new(assert_cmd::cargo::cargo_bin!("anvil"))
+        .env("ANVIL_HOME", temp.path())
+        .args([
+            "--model",
+            "pm-model",
+            "--editor-model",
+            "editor-model",
+            "--permission-mode",
+            "workspace-write",
+            "--network",
+            "local-only",
+        ])
+        .write_stdin("/help\n/status\n/models\n/quit\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "interactive commands: `/help`, `/status`, `/snapshot`, `/models`, `/exit`",
+        ))
+        .stdout(predicate::str::contains("Objective: interactive session"))
+        .stdout(predicate::str::contains("/sessions/"))
+        .stdout(predicate::str::contains(
+            "Working summary: interactive session",
+        ))
+        .stdout(predicate::str::contains("PM: pm-model"))
+        .stdout(predicate::str::contains("Editor: editor-model"))
+        .stdout(predicate::str::contains("Permission mode: workspace-write"))
+        .stdout(predicate::str::contains("Network: local-only"));
+}
+
+#[test]
 fn prompt_conflicts_with_handoff_command() {
     Command::new(assert_cmd::cargo::cargo_bin!("anvil"))
         .args(["-p", "inspect", "handoff", "export", "session-1"])
@@ -175,6 +208,59 @@ fn resumed_session_accepts_interactive_follow_up_from_stdin() {
         ))
         .stdout(predicate::str::contains("response: Reader inspected "))
         .stdout(predicate::str::contains("interactive mode ended"));
+}
+
+#[test]
+fn resumed_session_status_command_shows_existing_snapshot() {
+    let temp = tempdir().expect("tempdir");
+
+    let start = Command::new(assert_cmd::cargo::cargo_bin!("anvil"))
+        .env("ANVIL_HOME", temp.path())
+        .args(["-p", "inspect the repository layout", "--model", "pm-model"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(start).expect("utf8");
+    let session_line = stdout
+        .lines()
+        .find(|line| line.starts_with("session: "))
+        .expect("session line");
+    let session_id = session_line.trim_start_matches("session: ");
+
+    Command::new(assert_cmd::cargo::cargo_bin!("anvil"))
+        .env("ANVIL_HOME", temp.path())
+        .args(["resume", session_id])
+        .write_stdin("/status\n/exit\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("resuming session"))
+        .stdout(predicate::str::contains(
+            "Objective: inspect the repository layout",
+        ))
+        .stdout(predicate::str::contains(
+            "Working summary: Reader inspected ",
+        ))
+        .stdout(predicate::str::contains("awaiting next prompt"))
+        .stdout(predicate::str::contains("interactive mode ended"));
+}
+
+#[test]
+fn natural_language_status_still_routes_as_prompt() {
+    let temp = tempdir().expect("tempdir");
+
+    Command::new(assert_cmd::cargo::cargo_bin!("anvil"))
+        .env("ANVIL_HOME", temp.path())
+        .args(["--model", "pm-model"])
+        .write_stdin("inspect status of the repository\n/exit\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "prompt: inspect status of the repository",
+        ))
+        .stdout(predicate::str::contains("response: Reader inspected "));
 }
 
 #[test]
