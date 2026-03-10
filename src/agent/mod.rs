@@ -1,3 +1,6 @@
+pub mod plan;
+pub mod subagent;
+
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -5,12 +8,16 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, anyhow};
 use serde::Deserialize;
 
+use crate::agent::plan::{PlanDocument, PlanState};
+use crate::agent::subagent::{SubagentRequest, SubagentRunner};
 use crate::config::{AppConfig, ProviderKind};
 use crate::instructions::{LoadedInstructions, load_instructions};
 use crate::models::lm_studio::LmStudioClient;
 use crate::models::ollama::OllamaClient;
 use crate::policy::permissions::{PermissionCategory, PermissionPolicy};
-use crate::slash::registry::SlashRegistry;
+use crate::slash::builtins::BuiltinCommand;
+use crate::slash::custom::CustomExecutionContext;
+use crate::slash::registry::{ResolvedSlashCommand, SlashRegistry};
 use crate::state::audit::{
     AuditActor, AuditEvent, AuditEventData, AuditLog, AuditMetadata, AuditSource, ToolResultStatus,
     redact_map,
@@ -137,10 +144,11 @@ impl Agent {
         println!("provider: {:?}", self.config.provider);
         println!("model: {}", self.config.model);
         println!("cwd: {}", self.config.cwd.display());
-        println!("type /exit to quit, /memory add|show|edit to manage memory");
+        println!("type /exit to quit, /memory add|show|edit, /plan, /act, /subagent");
 
         let memory = MemoryStore::new(self.config.cwd.join("ANVIL-MEMORY.md"));
-        let registry = SlashRegistry;
+        let registry = SlashRegistry::load(&self.config.cwd)?;
+        let mut plan_state = PlanState::default();
         loop {
             print!("anvil> ");
             io::stdout().flush()?;
@@ -153,8 +161,10 @@ impl Agent {
             if input == "/exit" || input == "/quit" {
                 break;
             }
-            if let Some(command) = registry.resolve(input) {
-                let output = command.execute(memory.path())?;
+            if let Some(command) = registry.resolve(input)? {
+                let output = self
+                    .execute_slash(command, memory.path(), &mut plan_state)
+                    .await?;
                 println!("{output}");
                 continue;
             }
@@ -162,7 +172,12 @@ impl Agent {
             let policy =
                 PermissionPolicy::from_mode(self.config.permission_mode, PermissionCategory::Read);
             println!("permission policy: {:?}", policy.base_requirement());
-            let reply = self.chat_stream(input).await?;
+            let prompt = if let Some(injection) = plan_state.injection() {
+                format!("{injection}\n\nUser task:\n{input}")
+            } else {
+                input.to_string()
+            };
+            let reply = self.chat_stream(&prompt).await?;
             println!("\n---\n{}", truncate(&reply, 240));
         }
         Ok(())
@@ -179,6 +194,61 @@ impl Agent {
         match &self.model {
             ModelBackend::Ollama(client) => client.chat_stream(&self.config.model, prompt).await,
             ModelBackend::LmStudio(client) => client.chat_stream(&self.config.model, prompt).await,
+        }
+    }
+
+    async fn execute_slash(
+        &self,
+        command: ResolvedSlashCommand,
+        memory_path: &Path,
+        plan_state: &mut PlanState,
+    ) -> anyhow::Result<String> {
+        match command {
+            ResolvedSlashCommand::Builtin(command) => match command {
+                BuiltinCommand::MemoryAdd { .. }
+                | BuiltinCommand::MemoryShow
+                | BuiltinCommand::MemoryEdit { .. } => command.execute(memory_path),
+                BuiltinCommand::PlanCreate { slug, text } => {
+                    let doc = PlanState::create_plan(&self.config.cwd, &slug, &text)?;
+                    *plan_state = PlanState::enter_plan(doc);
+                    Ok(format!(
+                        "plan created: {}",
+                        plan_state.active_path_display()
+                    ))
+                }
+                BuiltinCommand::PlanShow => Ok(plan_state
+                    .show()
+                    .unwrap_or_else(|| "no active plan".to_string())),
+                BuiltinCommand::Act { path } => {
+                    let doc = if let Some(path) = path {
+                        PlanDocument::load(&self.config.cwd.join(path))?
+                    } else if let Some(doc) = plan_state.active_document().cloned() {
+                        doc
+                    } else {
+                        anyhow::bail!("no plan available to activate");
+                    };
+                    *plan_state = PlanState::activate(doc);
+                    Ok("mode switched to act".to_string())
+                }
+                BuiltinCommand::SubagentRun { task } => {
+                    let audit = AuditLog::new(self.config.state_dir.join("audit.log.jsonl"));
+                    let runner = SubagentRunner::new(&self.config.cwd, &self.config.state_dir);
+                    let report = runner.run(
+                        "sess_interactive",
+                        &audit,
+                        SubagentRequest {
+                            task,
+                            granted_permissions: vec![PermissionCategory::SubagentRead],
+                        },
+                    )?;
+                    Ok(report.summary)
+                }
+            },
+            ResolvedSlashCommand::Custom(invocation) => {
+                invocation.execute(&CustomExecutionContext {
+                    memory_path: memory_path.to_path_buf(),
+                })
+            }
         }
     }
 }

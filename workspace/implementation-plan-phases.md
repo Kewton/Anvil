@@ -143,25 +143,25 @@ TDD の観点:
 目的:
 
 - [x] LM Studio 対応
-- [ ] Plan / Act
+- [x] Plan / Act
 - [x] `/memory show`
 - [x] `/memory edit`
-- [ ] カスタム slash command
-- [ ] 単一サブエージェント
+- [x] カスタム slash command
+- [x] 単一サブエージェント
 
 先に書くテスト:
 
 - [x] LM Studio SSE ストリーム正規化テスト
-- [ ] OpenAI 互換レスポンス差分テスト
+- [x] OpenAI 互換レスポンス差分テスト
 - [x] `/memory show`, `/memory edit` の CLI テスト
 - [x] `ANVIL-MEMORY.md` normalize / update テスト
-- [ ] schema 付き custom command load / validate / invoke テスト
-- [ ] Plan / Act 遷移テスト
-- [ ] plan file load / inject テスト
-- [ ] subagent report 圧縮テスト
-- [ ] subagent 承認イベントの audit log テスト
-- [ ] subagent permission leak 回帰テスト
-- [ ] custom command schema bypass 回帰テスト
+- [x] schema 付き custom command load / validate / invoke テスト
+- [x] Plan / Act 遷移テスト
+- [x] plan file load / inject テスト
+- [x] subagent report 圧縮テスト
+- [x] subagent 承認イベントの audit log テスト
+- [x] subagent permission leak 回帰テスト
+- [x] custom command schema bypass 回帰テスト
 
 実装:
 
@@ -169,8 +169,8 @@ TDD の観点:
 - [x] `src/slash/registry.rs`
 - [x] `src/slash/builtins.rs`
 - [x] `src/slash/custom.rs`
-- [ ] `src/agent/plan.rs`
-- [ ] `src/agent/subagent.rs`
+- [x] `src/agent/plan.rs`
+- [x] `src/agent/subagent.rs`
 - [x] memory edit/show の更新
 
 TDD の観点:
@@ -182,9 +182,9 @@ TDD の観点:
 完了条件:
 
 - [x] LM Studio でも基本操作が動く
-- [ ] custom slash command を schema 付きで追加できる
-- [ ] Plan / Act が安定して動く
-- [ ] subagent が report 経由で文脈圧縮に使える
+- [x] custom slash command を schema 付きで追加できる
+- [x] Plan / Act が安定して動く
+- [x] subagent が report 経由で文脈圧縮に使える
 
 ## Phase 3: パフォーマンスと UX 強化
 

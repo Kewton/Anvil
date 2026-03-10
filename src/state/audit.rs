@@ -14,6 +14,7 @@ use crate::policy::permissions::{PermissionCategory, PermissionMode, PermissionR
 pub enum AuditActor {
     User,
     MainAgent,
+    Subagent,
     System,
 }
 
@@ -87,6 +88,28 @@ pub enum AuditEventData {
     },
     MemoryUpdated {
         summary: String,
+    },
+    SubagentStarted {
+        subagent_id: String,
+        task: String,
+        granted_permissions: Vec<String>,
+        input_summary: String,
+    },
+    SubagentPermissionRequested {
+        subagent_id: String,
+        requested_permissions: Vec<String>,
+    },
+    SubagentPermissionResolved {
+        subagent_id: String,
+        allowed: bool,
+        granted_permissions: Vec<String>,
+    },
+    SubagentFinished {
+        subagent_id: String,
+        executed_tools: Vec<String>,
+        changed_files: Vec<PathBuf>,
+        report_summary: String,
+        report_ref: PathBuf,
     },
     Error {
         message: String,
