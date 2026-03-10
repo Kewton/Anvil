@@ -35,12 +35,12 @@ impl RuntimeLoop {
         let outcome = pm.run_turn_with_stream(models, prompt, context, runtime, on_chunk)?;
         session.pending_confirmation = None;
 
-        if let Some(role) = outcome.delegated_role {
+        for role in &outcome.delegated_roles {
             session.recent_delegations.push(DelegationRecord {
                 id: format!("delegation-{}", session.recent_delegations.len() + 1),
-                role: role_label(role).to_string(),
-                resolved_model: resolved_model_for(models, role).to_string(),
-                inherited_from_pm: role_inherits(models, role),
+                role: role_label(*role).to_string(),
+                resolved_model: resolved_model_for(models, *role).to_string(),
+                inherited_from_pm: role_inherits(models, *role),
                 task: prompt.to_string(),
                 requested_permission: None,
                 created_at: now_rfc3339(),
@@ -48,16 +48,21 @@ impl RuntimeLoop {
             trim_tail(&mut session.recent_delegations, 20);
         }
 
-        if outcome.result.role != "pm" {
+        for result in &outcome.results {
+            if result.role == "pm" {
+                continue;
+            }
             let role = outcome
-                .delegated_role
+                .delegated_roles
+                .iter()
+                .find(|role| role_label(**role) == result.role)
+                .copied()
                 .expect("non-pm results must come from delegated roles");
-            let pending_confirmation = outcome.result.pending_confirmation.clone();
-            let next_recommendation = outcome.result.next_recommendation.clone();
-            let commands_run = outcome.result.commands_run.clone();
-            let changed_files = outcome.result.changed_files.clone();
-            let evidence = outcome
-                .result
+            let pending_confirmation = result.pending_confirmation.clone();
+            let next_recommendation = result.next_recommendation.clone();
+            let commands_run = result.commands_run.clone();
+            let changed_files = result.changed_files.clone();
+            let evidence = result
                 .evidence
                 .iter()
                 .map(|(source_type, value)| EvidenceRecord {
@@ -66,9 +71,9 @@ impl RuntimeLoop {
                 })
                 .collect();
             session.recent_results.push(ResultRecord {
-                role: outcome.result.role.clone(),
+                role: result.role.clone(),
                 model: resolved_model_for(models, role).to_string(),
-                summary: outcome.result.summary.clone(),
+                summary: result.summary.clone(),
                 evidence,
                 changed_files,
                 commands_run,
@@ -76,8 +81,10 @@ impl RuntimeLoop {
                 findings: Vec::new(),
             });
             trim_tail(&mut session.recent_results, 20);
-            session.pending_confirmation = pending_confirmation;
-            update_pending_steps(session, &outcome.result.role, next_recommendation);
+            if pending_confirmation.is_some() {
+                session.pending_confirmation = pending_confirmation;
+            }
+            update_pending_steps(session, &result.role, next_recommendation);
         }
         session.working_summary = outcome.user_response.clone();
         mark_completed_step(session, prompt);

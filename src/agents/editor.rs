@@ -52,7 +52,7 @@ impl EditorAgent {
             "editor",
             format!(
                 "Editor prepared a bounded edit plan for {} using target {} with preview: {}",
-                task.description,
+                task.user_request,
                 target
                     .as_ref()
                     .map(|path| path.display().to_string())
@@ -131,7 +131,7 @@ fn apply_mutation(
         }
     };
 
-    let note = build_note(path, &task.description);
+    let note = build_note(path, &task.user_request);
     let updated = if existing.ends_with('\n') {
         format!("{existing}{note}\n")
     } else {
@@ -146,7 +146,7 @@ fn apply_mutation(
             "editor",
             format!(
                 "Editor applied a bounded mutation for {} to {} ({} bytes) with preview: {}",
-                task.description,
+                task.user_request,
                 result.path.display(),
                 result.bytes_written,
                 preview
@@ -168,7 +168,7 @@ fn apply_mutation(
             "editor",
             format!(
                 "Editor could not apply a bounded mutation for: {}",
-                task.description
+                task.user_request
             ),
         ),
     }

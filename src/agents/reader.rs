@@ -11,6 +11,9 @@ impl ReaderAgent {
         if looks_like_git_inspection(&task.description) {
             return inspect_git_state(task, runtime);
         }
+        if looks_like_repository_analysis(&task.description) {
+            return inspect_repository(task, runtime);
+        }
 
         let cwd = match runtime.checked_execute(ToolRequest::InspectEnv) {
             Ok(RuntimeToolOutcome::Allowed(ToolResponse::EnvSnapshot(snapshot))) => {
@@ -41,13 +44,83 @@ impl ReaderAgent {
             "reader",
             format!(
                 "Reader inspected {} and found {} matches for \"{}\" while handling: {}",
-                cwd, matches, needle, task.description
+                cwd, matches, needle, task.user_request
             ),
         )
         .with_next_recommendation(
             "Use the matched files to decide whether editing or review is needed",
         )
     }
+}
+
+fn inspect_repository(task: &AgentTask, runtime: &RuntimeEngine) -> AgentResult {
+    let files = match runtime.checked_execute(ToolRequest::Exec {
+        request: ExecRequest {
+            program: "rg".to_string(),
+            args: vec!["--files".to_string(), ".".to_string()],
+            cwd: task.workspace_root.clone(),
+        },
+    }) {
+        Ok(RuntimeToolOutcome::Allowed(ToolResponse::ExecResult(result))) => result.stdout,
+        Ok(RuntimeToolOutcome::Blocked(reason)) => {
+            return AgentResult::new("reader", format!("Reader blocked: {reason}"));
+        }
+        Ok(RuntimeToolOutcome::NeedsConfirmation(reason)) => {
+            return AgentResult::new(
+                "reader",
+                format!("Reader awaiting confirmation: {reason}"),
+            );
+        }
+        Ok(RuntimeToolOutcome::Allowed(_)) | Err(_) => String::new(),
+    };
+
+    let file_list: Vec<&str> = files.lines().filter(|line| !line.is_empty()).collect();
+    let sample: Vec<&str> = file_list.iter().take(6).copied().collect();
+    let top_dirs = summarize_top_directories(&file_list);
+
+    AgentResult::new(
+        "reader",
+        format!(
+            "Reader inspected the repository for {}. It currently exposes {} tracked files. Main areas: {}. Representative paths: {}.",
+            task.user_request,
+            file_list.len(),
+            if top_dirs.is_empty() {
+                "top-level files".to_string()
+            } else {
+                top_dirs.join(", ")
+            },
+            if sample.is_empty() {
+                "none".to_string()
+            } else {
+                sample.join(", ")
+            }
+        ),
+    )
+    .with_evidence(vec![(
+        "tool-output".to_string(),
+        format!(
+            "rg --files: {}",
+            sample.iter().take(3).copied().collect::<Vec<_>>().join(", ")
+        ),
+    )])
+    .with_next_recommendation(
+        "Use targeted inspection on the main directories or review the current diff for deeper analysis",
+    )
+}
+
+fn summarize_top_directories(files: &[&str]) -> Vec<String> {
+    let mut names = Vec::new();
+    for file in files {
+        let top = file.split('/').next().unwrap_or(file);
+        if top.is_empty() || names.iter().any(|existing| existing == top) {
+            continue;
+        }
+        names.push(top.to_string());
+        if names.len() == 4 {
+            break;
+        }
+    }
+    names
 }
 
 fn inspect_git_state(task: &AgentTask, runtime: &RuntimeEngine) -> AgentResult {
@@ -144,6 +217,15 @@ fn looks_like_git_inspection(description: &str) -> bool {
         || description.contains("コミット")
         || description.contains("履歴")
         || description.contains("このブランチ")
+}
+
+fn looks_like_repository_analysis(description: &str) -> bool {
+    let normalized = description.to_ascii_lowercase();
+    normalized.contains("repository")
+        || normalized.contains("repo")
+        || normalized.contains("codebase")
+        || description.contains("リポジトリ")
+        || description.contains("コードベース")
 }
 
 fn truncate_line(line: &str) -> String {

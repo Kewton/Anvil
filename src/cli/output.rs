@@ -2,6 +2,53 @@ use crate::roles::EffectiveModels;
 use crate::runtime::{NetworkPolicy, PermissionMode};
 use crate::state::session::SessionState;
 
+pub fn render_branding() -> &'static str {
+    concat!(
+        "    _              _ _\n",
+        "   / \\   _ __   __(_) |\n",
+        "  / _ \\ | '_ \\ / _` | |\n",
+        " / ___ \\| | | | (_| | |\n",
+        "/_/   \\_\\_| |_|\\__,_|_|\n",
+        "\n",
+        "Anvil  local-first coding agent\n"
+    )
+}
+
+pub fn render_interactive_welcome(
+    session: &SessionState,
+    state_path: &str,
+    models: &EffectiveModels,
+    permission_mode: PermissionMode,
+    network_policy: NetworkPolicy,
+) -> String {
+    let mut lines = vec![
+        render_branding().trim_end().to_string(),
+        format!("Session : {}", session.session_id),
+        format!("State   : {state_path}"),
+        format!("Mode    : {}", permission_mode_label(permission_mode)),
+        format!("Network : {}", network_policy_label(network_policy)),
+        String::new(),
+        "Try one of these:".to_string(),
+        "  inspect the repository layout".to_string(),
+        "  /status".to_string(),
+        "  /history".to_string(),
+        "  /help".to_string(),
+        "  /exit".to_string(),
+        String::new(),
+        "Type a task or command below.".to_string(),
+    ];
+
+    let snapshot = render_session_snapshot(session);
+    if !snapshot.is_empty() {
+        lines.push(String::new());
+        lines.push(snapshot);
+    }
+
+    lines.push(String::new());
+    lines.push(render_startup_summary(models, permission_mode, network_policy));
+    lines.join("\n")
+}
+
 pub fn render_startup_summary(
     models: &EffectiveModels,
     permission_mode: PermissionMode,
@@ -129,7 +176,11 @@ pub fn render_session_history(session: &SessionState) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{render_session_history, render_session_snapshot};
+    use super::{
+        render_branding, render_interactive_welcome, render_session_history,
+        render_session_snapshot,
+    };
+    use crate::roles::EffectiveModels;
     use crate::runtime::{NetworkPolicy, PermissionMode};
     use crate::state::session::{
         AgentModels, DelegationRecord, EvidenceRecord, PendingAction, PendingConfirmation,
@@ -248,5 +299,45 @@ mod tests {
         assert!(rendered.contains("- reader via pm-model: Reader inspected the repo"));
         assert!(rendered.contains("Recent delegations:"));
         assert!(rendered.contains("- reader via pm-model: inspect repo"));
+    }
+
+    #[test]
+    fn interactive_welcome_renders_branding_and_examples() {
+        let session = SessionState {
+            session_id: "session-1".to_string(),
+            pm_model: "pm-model".to_string(),
+            permission_mode: PermissionMode::WorkspaceWrite,
+            network_policy: NetworkPolicy::Disabled,
+            agent_models: AgentModels::default(),
+            objective: "objective".to_string(),
+            working_summary: "working".to_string(),
+            user_preferences_summary: String::new(),
+            repository_summary: String::new(),
+            active_constraints: Vec::new(),
+            open_questions: Vec::new(),
+            completed_steps: Vec::new(),
+            pending_steps: Vec::new(),
+            relevant_files: Vec::new(),
+            recent_delegations: Vec::new(),
+            recent_results: Vec::new(),
+            pending_confirmation: None,
+        };
+        let models = EffectiveModels {
+            pm_model: "pm-model".to_string(),
+            roles: Vec::new(),
+        };
+
+        let rendered = render_interactive_welcome(
+            &session,
+            "/tmp/session-1.json",
+            &models,
+            PermissionMode::WorkspaceWrite,
+            NetworkPolicy::Disabled,
+        );
+
+        assert!(render_branding().contains("Anvil"));
+        assert!(rendered.contains("Try one of these:"));
+        assert!(rendered.contains("inspect the repository layout"));
+        assert!(rendered.contains("Type a task or command below."));
     }
 }

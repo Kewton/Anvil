@@ -19,7 +19,7 @@ impl TesterAgent {
             request: request.clone(),
         }) {
             Ok(RuntimeToolOutcome::Allowed(ToolResponse::ExecResult(result))) => {
-                summarize_exec_result(&task.description, command.display, result)
+                summarize_exec_result(&task.user_request, command.display, result)
             }
             Ok(RuntimeToolOutcome::Blocked(reason)) => {
                 AgentResult::new("tester", format!("Tester blocked: {reason}"))
@@ -28,10 +28,10 @@ impl TesterAgent {
                 AgentResult::new("tester", format!("Tester awaiting confirmation: {reason}"))
                     .with_pending_confirmation(PendingConfirmation {
                         role: "tester".to_string(),
-                        task: task.description.clone(),
+                        task: task.user_request.clone(),
                         summary: format!(
                             "Tester is waiting to run `{}` for: {}",
-                            command.display, task.description
+                            command.display, task.user_request
                         ),
                         reason,
                         action: PendingAction::Exec {
@@ -46,7 +46,7 @@ impl TesterAgent {
                 "tester",
                 format!(
                     "Tester could not summarize command execution for: {}",
-                    task.description
+                    task.user_request
                 ),
             ),
         }

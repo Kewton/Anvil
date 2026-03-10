@@ -12,6 +12,7 @@ pub mod tester;
 #[derive(Debug, Clone)]
 pub struct AgentTask {
     pub description: String,
+    pub user_request: String,
     pub context: String,
     pub workspace_root: PathBuf,
 }
@@ -63,5 +64,13 @@ impl AgentResult {
     pub fn with_pending_confirmation(mut self, value: PendingConfirmation) -> Self {
         self.pending_confirmation = Some(value);
         self
+    }
+
+    pub fn is_blocked(&self) -> bool {
+        self.summary.contains(" blocked:")
+    }
+
+    pub fn needs_confirmation(&self) -> bool {
+        self.pending_confirmation.is_some() || self.summary.contains(" awaiting confirmation:")
     }
 }

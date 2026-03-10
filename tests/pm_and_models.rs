@@ -81,9 +81,9 @@ fn pm_agent_uses_fast_path_for_small_clarifications() {
         )
         .expect("pm turn");
 
-    assert!(outcome.delegated_role.is_none());
+    assert!(outcome.delegated_roles.is_empty());
     assert!(outcome
-        .result
+        .results[0]
         .summary
         .contains("PM handled the request directly"));
 }
@@ -105,11 +105,15 @@ fn pm_agent_delegates_editor_work() {
         )
         .expect("pm turn");
 
-    assert_eq!(outcome.delegated_role, Some(AgentRole::Editor));
+    assert_eq!(
+        outcome.delegated_roles,
+        vec![AgentRole::Reader, AgentRole::Editor, AgentRole::Tester]
+    );
+    assert!(outcome.user_response.contains("その上で"));
     assert!(outcome
-        .result
-        .summary
-        .contains("Editor prepared a bounded edit plan"));
+        .results
+        .iter()
+        .any(|result| result.summary.contains("Editor prepared a bounded edit plan")));
 }
 
 #[test]
@@ -138,11 +142,11 @@ fn editor_can_apply_bounded_mutation_when_explicitly_requested() {
         )
         .expect("pm turn");
 
-    assert_eq!(outcome.delegated_role, Some(AgentRole::Editor));
+    assert_eq!(outcome.delegated_roles, vec![AgentRole::Reader, AgentRole::Editor]);
     assert!(outcome
-        .result
-        .summary
-        .contains("applied a bounded mutation"));
+        .results
+        .iter()
+        .any(|result| result.summary.contains("applied a bounded mutation")));
     let updated = fs::read_to_string(&file).expect("read mutated file");
     assert!(updated.contains("anvil-mvp: apply update file sample"));
 }
@@ -172,13 +176,13 @@ fn runtime_loop_records_delegations_and_results() {
     )
     .expect("runtime loop");
 
-    assert!(summary.contains("Prepared a risk pass"));
+    assert!(summary.contains("Summarized the current diff"));
     assert_eq!(session.recent_delegations.len(), 1);
     assert_eq!(session.recent_delegations[0].role, "reviewer");
     assert_eq!(session.recent_delegations[0].resolved_model, "review-model");
     assert_eq!(session.recent_results.len(), 1);
     assert_eq!(session.completed_steps, vec!["review the current diff"]);
-    assert!(session.pending_steps[0].contains("Review the flagged files"));
+    assert!(session.pending_steps[0].contains("Review the highest-risk files"));
 }
 
 #[test]
@@ -203,8 +207,8 @@ fn pm_agent_subagents_use_runtime_tools() {
             &runtime,
         )
         .expect("reader turn");
-    assert_eq!(reader.delegated_role, Some(AgentRole::Reader));
-    assert!(reader.result.summary.contains("Reader inspected"));
+    assert_eq!(reader.delegated_roles, vec![AgentRole::Reader]);
+    assert!(reader.results[0].summary.contains("Reader inspected"));
 
     let git_reader = pm
         .run_turn(
@@ -214,9 +218,12 @@ fn pm_agent_subagents_use_runtime_tools() {
             &runtime,
         )
         .expect("git reader turn");
-    assert_eq!(git_reader.delegated_role, Some(AgentRole::Reader));
-    assert!(git_reader.result.summary.contains("現在のブランチは"));
-    assert!(!git_reader.result.evidence.is_empty());
+    assert_eq!(
+        git_reader.delegated_roles,
+        vec![AgentRole::Reader, AgentRole::Reviewer]
+    );
+    assert!(git_reader.user_response.contains("現在のブランチは"));
+    assert_eq!(git_reader.results.len(), 2);
 
     let tester = pm
         .run_turn(
@@ -226,10 +233,10 @@ fn pm_agent_subagents_use_runtime_tools() {
             &runtime,
         )
         .expect("tester turn");
-    assert_eq!(tester.delegated_role, Some(AgentRole::Tester));
-    assert!(tester.result.summary.contains("cargo check"));
-    assert_eq!(tester.result.commands_run, vec!["cargo check"]);
-    assert!(!tester.result.evidence.is_empty());
+    assert_eq!(tester.delegated_roles, vec![AgentRole::Tester]);
+    assert!(tester.results[0].summary.contains("cargo check"));
+    assert_eq!(tester.results[0].commands_run, vec!["cargo check"]);
+    assert!(!tester.results[0].evidence.is_empty());
 
     let editor = pm
         .run_turn(
@@ -239,9 +246,18 @@ fn pm_agent_subagents_use_runtime_tools() {
             &runtime,
         )
         .expect("editor turn");
-    assert_eq!(editor.delegated_role, Some(AgentRole::Editor));
-    assert!(editor.result.summary.contains("target"));
-    assert!(!editor.result.changed_files.is_empty());
+    assert_eq!(
+        editor.delegated_roles,
+        vec![AgentRole::Reader, AgentRole::Editor, AgentRole::Tester]
+    );
+    assert!(editor
+        .results
+        .iter()
+        .any(|result| result.summary.contains("target")));
+    assert!(editor
+        .results
+        .iter()
+        .any(|result| !result.changed_files.is_empty()));
 
     let reviewer = pm
         .run_turn(
@@ -251,8 +267,8 @@ fn pm_agent_subagents_use_runtime_tools() {
             &runtime,
         )
         .expect("reviewer turn");
-    assert_eq!(reviewer.delegated_role, Some(AgentRole::Reviewer));
-    assert!(reviewer.result.summary.contains("risk pass"));
+    assert_eq!(reviewer.delegated_roles, vec![AgentRole::Reviewer]);
+    assert!(reviewer.results[0].summary.contains("summarized the current diff"));
 }
 
 #[test]

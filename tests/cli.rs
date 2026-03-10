@@ -312,15 +312,30 @@ fn prompt_mode_returns_pm_or_subagent_result() {
             "Working summary: Inspected ",
         ))
         .stdout(predicate::str::contains(
-            "Pending steps: Use the matched files",
+            "Pending steps: Use targeted inspection on the main directories",
         ))
         .stdout(predicate::str::contains(
             "Last completed step: inspect the repository layout",
         ))
         .stdout(predicate::str::contains(
-            "Next recommendation: Use the matched files",
+            "Next recommendation: Use targeted inspection on the main directories",
         ))
         .stdout(predicate::str::contains("response: Inspected "));
+}
+
+#[test]
+fn prompt_mode_repo_analysis_uses_repo_grounded_reader_path() {
+    let temp = tempdir().expect("tempdir");
+
+    Command::new(assert_cmd::cargo::cargo_bin!("anvil"))
+        .env("ANVIL_HOME", temp.path())
+        .args(["-p", "このリポジトリを解析して", "--model", "pm-model"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("response: Inspected the repository"))
+        .stdout(predicate::str::contains("Representative paths:"))
+        .stdout(predicate::str::contains("差分観点では"))
+        .stdout(predicate::str::contains("Last delegation: reviewer via pm-model"));
 }
 
 #[test]
@@ -566,7 +581,7 @@ fn e2e_resume_flow_inspects_mutates_and_reviews_fixture_repo() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "response: Applied a bounded mutation",
+            "Applied a bounded mutation",
         ))
         .stdout(predicate::str::contains("Changed files:"))
         .stdout(predicate::str::contains(
@@ -595,7 +610,7 @@ fn e2e_resume_flow_inspects_mutates_and_reviews_fixture_repo() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "response: Prepared a risk pass for review the current diff across 1 changed files",
+            "response: Summarized the current diff for review the current diff",
         ))
         .stdout(predicate::str::contains("Last delegation: reviewer via pm-model"));
 }
@@ -714,7 +729,7 @@ fn imported_handoff_can_resume_with_follow_up_prompt() {
             "prompt: review the current diff",
         ))
         .stdout(predicate::str::contains(
-            "response: Prepared a risk pass",
+            "response: Summarized the current diff",
         ))
         .stdout(predicate::str::contains("Last delegation: reviewer via pm-model"));
 }
