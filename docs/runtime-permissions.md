@@ -124,3 +124,10 @@ This applies to:
 - commands whose intent cannot be classified confidently
 
 The runtime should surface the exact command, affected scope, and reason for the confirmation requirement.
+
+In interactive CLI sessions, confirmation-gated actions can then be handled with:
+
+- `/approve`
+- `/deny`
+
+Pending confirmation state is persisted with the session so resumed sessions can continue from the same point.

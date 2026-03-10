@@ -107,6 +107,9 @@
       "items": {
         "$ref": "#/$defs/resultRecord"
       }
+    },
+    "pendingConfirmation": {
+      "$ref": "#/$defs/pendingConfirmation"
     }
   },
   "$defs": {
@@ -220,6 +223,65 @@
           }
         }
       }
+    },
+    "pendingConfirmation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "task", "summary", "reason", "action"],
+      "properties": {
+        "role": {
+          "type": "string",
+          "enum": ["reader", "editor", "tester", "reviewer"]
+        },
+        "task": {
+          "type": "string",
+          "maxLength": 1000
+        },
+        "summary": {
+          "type": "string",
+          "maxLength": 1000
+        },
+        "reason": {
+          "type": "string",
+          "maxLength": 300
+        },
+        "action": {
+          "$ref": "#/$defs/pendingAction"
+        }
+      }
+    },
+    "pendingAction": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "program", "args", "cwd", "display"],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "exec"
+            },
+            "program": {
+              "type": "string",
+              "minLength": 1
+            },
+            "args": {
+              "type": "array",
+              "maxItems": 20,
+              "items": { "type": "string", "maxLength": 300 }
+            },
+            "cwd": {
+              "type": "string",
+              "minLength": 1
+            },
+            "display": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 500
+            }
+          }
+        }
+      ]
     }
   }
 }

@@ -73,7 +73,7 @@ fn interactive_mode_supports_help_status_and_models_commands() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "interactive commands: `/help`, `/status`, `/snapshot`, `/models`, `/history`, `/exit`",
+            "interactive commands: `/help`, `/status`, `/snapshot`, `/models`, `/history`, `/approve`, `/deny`, `/exit`",
         ))
         .stdout(predicate::str::contains("Objective: interactive session"))
         .stdout(predicate::str::contains("/sessions/"))
@@ -395,6 +395,9 @@ fn prompt_mode_surfaces_confirmation_required_tester_path() {
         .stdout(predicate::str::contains(
             "Last result: tester via pm-model - Tester awaiting confirmation: networked commands require explicit approval",
         ))
+        .stdout(predicate::str::contains(
+            "Pending confirmation: tester - networked commands require explicit approval",
+        ))
         .stdout(predicate::str::contains("Network: disabled"));
 }
 
@@ -419,7 +422,83 @@ fn prompt_mode_surfaces_destructive_confirmation_required_tester_path() {
         ))
         .stdout(predicate::str::contains(
             "Last result: tester via pm-model - Tester awaiting confirmation: destructive commands require explicit user confirmation",
+        ))
+        .stdout(predicate::str::contains(
+            "Pending confirmation: tester - destructive commands require explicit user confirmation",
         ));
+}
+
+#[test]
+fn interactive_mode_can_approve_pending_destructive_command() {
+    let temp = tempdir().expect("tempdir");
+    let home = temp.path().join("anvil-home");
+    fs::create_dir_all(&home).expect("create anvil home");
+    fs::write(temp.path().join("junk.tmp"), "trash\n").expect("write junk");
+
+    let init = ProcessCommand::new("git")
+        .args(["init"])
+        .current_dir(temp.path())
+        .output()
+        .expect("git init");
+    assert!(init.status.success());
+
+    Command::new(assert_cmd::cargo::cargo_bin!("anvil"))
+        .env("ANVIL_HOME", &home)
+        .current_dir(temp.path())
+        .args([
+            "--model",
+            "pm-model",
+            "--permission-mode",
+            "workspace-write",
+        ])
+        .write_stdin("test clean the workspace\n/approve\n/exit\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "response: Tester awaiting confirmation: destructive commands require explicit user confirmation",
+        ))
+        .stdout(predicate::str::contains(
+            "approval: Tester ran `git clean -fd`",
+        ))
+        .stdout(predicate::str::contains("Commands run: git clean -fd"));
+
+    assert!(!temp.path().join("junk.tmp").exists());
+}
+
+#[test]
+fn interactive_mode_can_deny_pending_destructive_command() {
+    let temp = tempdir().expect("tempdir");
+    let home = temp.path().join("anvil-home");
+    fs::create_dir_all(&home).expect("create anvil home");
+    fs::write(temp.path().join("junk.tmp"), "trash\n").expect("write junk");
+
+    let init = ProcessCommand::new("git")
+        .args(["init"])
+        .current_dir(temp.path())
+        .output()
+        .expect("git init");
+    assert!(init.status.success());
+
+    Command::new(assert_cmd::cargo::cargo_bin!("anvil"))
+        .env("ANVIL_HOME", &home)
+        .current_dir(temp.path())
+        .args([
+            "--model",
+            "pm-model",
+            "--permission-mode",
+            "workspace-write",
+        ])
+        .write_stdin("test clean the workspace\n/deny\n/exit\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "response: Tester awaiting confirmation: destructive commands require explicit user confirmation",
+        ))
+        .stdout(predicate::str::contains(
+            "denial: Declined pending confirmation for tester: destructive commands require explicit user confirmation",
+        ));
+
+    assert!(temp.path().join("junk.tmp").exists());
 }
 
 #[test]

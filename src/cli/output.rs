@@ -87,6 +87,13 @@ pub fn render_session_snapshot(session: &SessionState) -> String {
         ));
     }
 
+    if let Some(pending) = &session.pending_confirmation {
+        lines.push(format!(
+            "Pending confirmation: {} - {}",
+            pending.role, pending.reason
+        ));
+    }
+
     lines.join("\n")
 }
 
@@ -125,7 +132,8 @@ mod tests {
     use super::{render_session_history, render_session_snapshot};
     use crate::runtime::{NetworkPolicy, PermissionMode};
     use crate::state::session::{
-        AgentModels, DelegationRecord, EvidenceRecord, ResultRecord, SessionState,
+        AgentModels, DelegationRecord, EvidenceRecord, PendingAction, PendingConfirmation,
+        ResultRecord, SessionState,
     };
 
     #[test]
@@ -173,6 +181,18 @@ mod tests {
                 next_recommendation: Some("run tests".to_string()),
                 findings: Vec::new(),
             }],
+            pending_confirmation: Some(PendingConfirmation {
+                role: "tester".to_string(),
+                task: "run a build".to_string(),
+                summary: "Tester is waiting to run `cargo build`".to_string(),
+                reason: "destructive commands require explicit user confirmation".to_string(),
+                action: PendingAction::Exec {
+                    program: "git".to_string(),
+                    args: vec!["clean".to_string(), "-fd".to_string()],
+                    cwd: "/tmp".to_string(),
+                    display: "git clean -fd".to_string(),
+                },
+            }),
         };
 
         let rendered = render_session_snapshot(&session);
@@ -181,6 +201,7 @@ mod tests {
         assert!(rendered.contains("Evidence: repo-file: mutated src/main.rs"));
         assert!(rendered.contains("tool-output: stdout: ok"));
         assert!(rendered.contains("Last delegation: editor via editor-model"));
+        assert!(rendered.contains("Pending confirmation: tester - destructive commands require explicit user confirmation"));
     }
 
     #[test]
@@ -219,6 +240,7 @@ mod tests {
                 next_recommendation: None,
                 findings: Vec::new(),
             }],
+            pending_confirmation: None,
         };
 
         let rendered = render_session_history(&session);

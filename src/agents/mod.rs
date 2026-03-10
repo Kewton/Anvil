@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use crate::state::session::PendingConfirmation;
+
 pub mod editor;
 pub mod pm;
 pub mod prompt_loader;
@@ -22,6 +24,7 @@ pub struct AgentResult {
     pub commands_run: Vec<String>,
     pub changed_files: Vec<String>,
     pub evidence: Vec<(String, String)>,
+    pub pending_confirmation: Option<PendingConfirmation>,
 }
 
 impl AgentResult {
@@ -33,6 +36,7 @@ impl AgentResult {
             commands_run: Vec::new(),
             changed_files: Vec::new(),
             evidence: Vec::new(),
+            pending_confirmation: None,
         }
     }
 
@@ -53,6 +57,11 @@ impl AgentResult {
 
     pub fn with_evidence(mut self, values: Vec<(String, String)>) -> Self {
         self.evidence = values;
+        self
+    }
+
+    pub fn with_pending_confirmation(mut self, value: PendingConfirmation) -> Self {
+        self.pending_confirmation = Some(value);
         self
     }
 }

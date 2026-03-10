@@ -53,6 +53,15 @@ impl RuntimeEngine {
         }
     }
 
+    pub fn execute_confirmed(&self, request: ToolRequest) -> anyhow::Result<ToolResponse> {
+        match self.sandbox.evaluate(&request) {
+            PermissionDecision::Allowed | PermissionDecision::NeedsConfirmation(_) => {
+                self.tools.execute(request)
+            }
+            PermissionDecision::Blocked(reason) => anyhow::bail!(reason),
+        }
+    }
+
     pub fn build_context(&self, user_prompt: &str, repo_file_blocks: Vec<ContextBlock>) -> String {
         let mut blocks = vec![ContextBlock::new(SourceType::User, user_prompt)];
         if let Some(instructions) = self.repo_instructions.as_context_block() {

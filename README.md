@@ -16,13 +16,15 @@ Implemented today:
 - Ollama HTTP adapter
 - LM Studio HTTP adapter
 - `anvil -p`, `anvil resume`, `anvil resume -p`
-- interactive multi-turn CLI sessions with `/help`, `/status`, `/snapshot`, `/models`, `/history`, `/exit`
+- interactive multi-turn CLI sessions with `/help`, `/status`, `/snapshot`, `/models`, `/history`, `/approve`, `/deny`, `/exit`
+- persisted pending-confirmation state for confirmation-gated tester actions
+- fixture-based CLI end-to-end coverage for inspect, edit, test, review, handoff, and confirmation flows
 
 Still in progress:
 
-- broader fixture-based end-to-end coverage
-- richer step lifecycle semantics
-- documentation promotion beyond the current core docs
+- repeatable LM Studio live verification in a running local environment
+- further lifecycle refinement beyond the current normalized and role-local pending-step rules
+- any remaining `workspace/` drafts that prove stable enough to promote
 
 ## Supported Model Providers
 
@@ -65,6 +67,8 @@ Inside `anvil` interactive mode or `anvil resume <session-id>`:
 - `/snapshot`
 - `/models`
 - `/history`
+- `/approve`
+- `/deny`
 - `/exit`
 
 ## Example
@@ -94,6 +98,7 @@ anvil -p "inspect the repository layout" --model qwen3.5:35b
 - repository instructions are loaded from `anvil.md`
 - repository content and tool output are treated as lower-trust evidence
 - runtime permissions gate writes, validation commands, networked commands, and destructive commands
+- confirmation-gated actions are stored in session state until approved or denied
 - subagent results are persisted into bounded session state
 - sessions can be resumed or exported as handoff files
 
@@ -104,7 +109,7 @@ cargo fmt
 cargo test
 ```
 
-The test suite includes CLI integration tests, session/handoff roundtrips, permission and trust tests, PM/model routing tests, and a small fixture-based resume/edit/review flow.
+The test suite includes CLI integration tests, session/handoff roundtrips, permission and trust tests, PM/model routing tests, and fixture-based flows for resume, edit, test, review, handoff, and approval paths.
 
 Manual smoke examples:
 

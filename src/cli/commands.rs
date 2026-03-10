@@ -112,6 +112,7 @@ pub fn execute(cli: Cli) -> anyhow::Result<()> {
                             findings: Vec::new(),
                         })
                         .collect(),
+                    pending_confirmation: None,
                 };
                 let path = store.save_session(&registry, &session)?;
                 println!("imported handoff into {}", path.display());
@@ -206,6 +207,39 @@ fn run_interactive_loop(
             println!("interactive mode ended");
             break;
         }
+        if matches!(trimmed, "approve" | ":approve" | "/approve") {
+            let engine = build_runtime_engine(permission_mode, network_policy)?;
+            match RuntimeLoop::approve_pending(session, models, &engine)? {
+                Some(summary) => {
+                    store.save_session(registry, session)?;
+                    println!("approval: {summary}");
+                    let snapshot = render_session_snapshot(session);
+                    if !snapshot.is_empty() {
+                        println!("{snapshot}");
+                    }
+                }
+                None => println!("approval: no pending confirmation"),
+            }
+            writeln!(stdout, "awaiting next prompt").ok();
+            stdout.flush().ok();
+            continue;
+        }
+        if matches!(trimmed, "deny" | ":deny" | "/deny") {
+            match RuntimeLoop::deny_pending(session) {
+                Some(summary) => {
+                    store.save_session(registry, session)?;
+                    println!("denial: {summary}");
+                    let snapshot = render_session_snapshot(session);
+                    if !snapshot.is_empty() {
+                        println!("{snapshot}");
+                    }
+                }
+                None => println!("denial: no pending confirmation"),
+            }
+            writeln!(stdout, "awaiting next prompt").ok();
+            stdout.flush().ok();
+            continue;
+        }
         if matches!(trimmed, "help" | ":help" | "/help") {
             println!("{}", render_interactive_help());
             writeln!(stdout, "awaiting next prompt").ok();
@@ -261,7 +295,7 @@ fn run_interactive_loop(
 }
 
 fn render_interactive_help() -> &'static str {
-    "interactive commands: `/help`, `/status`, `/snapshot`, `/models`, `/history`, `/exit`"
+    "interactive commands: `/help`, `/status`, `/snapshot`, `/models`, `/history`, `/approve`, `/deny`, `/exit`"
 }
 
 fn render_interactive_status(session: &SessionState, session_path: &PathBuf) -> String {
@@ -288,11 +322,7 @@ fn execute_prompt_turn(
     network_policy: NetworkPolicy,
     prompt: &str,
 ) -> anyhow::Result<String> {
-    let workspace_root =
-        std::env::current_dir().context("failed to determine current directory")?;
-    let repo_instructions = RepoInstructions::load(&workspace_root)?;
-    let sandbox = SandboxPolicy::new(permission_mode, network_policy, workspace_root, vec![]);
-    let engine = RuntimeEngine::new(sandbox, ToolRegistry::default(), repo_instructions);
+    let engine = build_runtime_engine(permission_mode, network_policy)?;
     let context = engine.build_context(prompt, Vec::new());
     let response = RuntimeLoop::run_prompt(
         session,
@@ -304,6 +334,21 @@ fn execute_prompt_turn(
     )?;
     store.save_session(registry, session)?;
     Ok(response)
+}
+
+fn build_runtime_engine(
+    permission_mode: PermissionMode,
+    network_policy: NetworkPolicy,
+) -> anyhow::Result<RuntimeEngine> {
+    let workspace_root =
+        std::env::current_dir().context("failed to determine current directory")?;
+    let repo_instructions = RepoInstructions::load(&workspace_root)?;
+    let sandbox = SandboxPolicy::new(permission_mode, network_policy, workspace_root, vec![]);
+    Ok(RuntimeEngine::new(
+        sandbox,
+        ToolRegistry::default(),
+        repo_instructions,
+    ))
 }
 
 fn build_session_state(
@@ -334,5 +379,6 @@ fn build_session_state(
         relevant_files: Vec::new(),
         recent_delegations: Vec::new(),
         recent_results: Vec::new(),
+        pending_confirmation: None,
     }
 }

@@ -1,7 +1,11 @@
 use crate::agents::pm::{AgentRole, PmAgent};
+use crate::agents::tester::TesterAgent;
 use crate::roles::EffectiveModels;
 use crate::runtime::engine::RuntimeEngine;
-use crate::state::session::{DelegationRecord, EvidenceRecord, ResultRecord, SessionState};
+use crate::state::session::{
+    DelegationRecord, EvidenceRecord, PendingAction, ResultRecord, SessionState,
+};
+use crate::tools::exec::ExecRequest;
 use crate::util::clock::now_rfc3339;
 
 #[derive(Debug, Default)]
@@ -17,6 +21,7 @@ impl RuntimeLoop {
         prompt: &str,
     ) -> anyhow::Result<String> {
         let outcome = pm.run_turn(models, prompt, context, runtime)?;
+        session.pending_confirmation = None;
 
         if let Some(role) = outcome.delegated_role {
             session.recent_delegations.push(DelegationRecord {
@@ -35,6 +40,7 @@ impl RuntimeLoop {
             let role = outcome
                 .delegated_role
                 .expect("non-pm results must come from delegated roles");
+            let pending_confirmation = outcome.result.pending_confirmation.clone();
             let next_recommendation = outcome.result.next_recommendation.clone();
             let commands_run = outcome.result.commands_run.clone();
             let changed_files = outcome.result.changed_files.clone();
@@ -58,12 +64,84 @@ impl RuntimeLoop {
                 findings: Vec::new(),
             });
             trim_tail(&mut session.recent_results, 20);
+            session.pending_confirmation = pending_confirmation;
             update_pending_steps(session, &outcome.result.role, next_recommendation);
         }
         session.working_summary = outcome.result.summary.clone();
         mark_completed_step(session, prompt);
+        compact_pending_steps(session);
 
         Ok(outcome.result.summary)
+    }
+
+    pub fn approve_pending(
+        session: &mut SessionState,
+        models: &EffectiveModels,
+        runtime: &RuntimeEngine,
+    ) -> anyhow::Result<Option<String>> {
+        let Some(pending) = session.pending_confirmation.clone() else {
+            return Ok(None);
+        };
+
+        let result = match pending.action {
+            PendingAction::Exec {
+                program,
+                args,
+                cwd,
+                display,
+            } if pending.role == "tester" => TesterAgent.approve_pending(
+                runtime,
+                &pending.task,
+                ExecRequest {
+                    program,
+                    args,
+                    cwd: cwd.into(),
+                },
+                &display,
+            ),
+            PendingAction::Exec { .. } => {
+                session.pending_confirmation = None;
+                return Ok(Some(format!(
+                    "Pending confirmation for role {} is not executable yet",
+                    pending.role
+                )));
+            }
+        };
+
+        session.pending_confirmation = None;
+        session.working_summary = result.summary.clone();
+        session.recent_results.push(ResultRecord {
+            role: result.role.clone(),
+            model: resolved_model_for_role_id(models, &result.role).to_string(),
+            summary: result.summary.clone(),
+            evidence: result
+                .evidence
+                .iter()
+                .map(|(source_type, value)| EvidenceRecord {
+                    source_type: source_type.clone(),
+                    value: value.clone(),
+                })
+                .collect(),
+            changed_files: result.changed_files.clone(),
+            commands_run: result.commands_run.clone(),
+            next_recommendation: result.next_recommendation.clone(),
+            findings: Vec::new(),
+        });
+        trim_tail(&mut session.recent_results, 20);
+        update_pending_steps(session, &result.role, result.next_recommendation);
+        compact_pending_steps(session);
+
+        Ok(Some(result.summary))
+    }
+
+    pub fn deny_pending(session: &mut SessionState) -> Option<String> {
+        let pending = session.pending_confirmation.take()?;
+        let summary = format!(
+            "Declined pending confirmation for {}: {}",
+            pending.role, pending.reason
+        );
+        session.working_summary = summary.clone();
+        Some(summary)
     }
 }
 
@@ -88,7 +166,6 @@ fn update_pending_steps(
             .pending_steps
             .retain(|existing| !same_step(existing, &step));
         session.pending_steps.push(step);
-        trim_tail(&mut session.pending_steps, 20);
     }
 }
 
@@ -115,6 +192,33 @@ fn matches_recent_completed_step(session: &SessionState, step: &str) -> bool {
         .rev()
         .take(5)
         .any(|existing| same_step(existing, step))
+}
+
+fn compact_pending_steps(session: &mut SessionState) {
+    let completed_tail: Vec<String> = session
+        .completed_steps
+        .iter()
+        .rev()
+        .take(10)
+        .cloned()
+        .collect();
+    let mut compacted = Vec::new();
+
+    for step in session.pending_steps.iter().rev() {
+        if completed_tail.iter().any(|completed| same_step(completed, step)) {
+            continue;
+        }
+        if compacted.iter().any(|existing: &String| same_step(existing, step)) {
+            continue;
+        }
+        compacted.push(step.clone());
+        if compacted.len() == 12 {
+            break;
+        }
+    }
+
+    compacted.reverse();
+    session.pending_steps = compacted;
 }
 
 fn remove_previous_recommendation_for_role(session: &mut SessionState, role: &str, step: &str) {
@@ -166,6 +270,10 @@ fn role_label(role: AgentRole) -> &'static str {
 
 fn resolved_model_for(models: &EffectiveModels, role: AgentRole) -> &str {
     let role_id = role_label(role);
+    resolved_model_for_role_id(models, role_id)
+}
+
+fn resolved_model_for_role_id<'a>(models: &'a EffectiveModels, role_id: &str) -> &'a str {
     models
         .roles
         .iter()
@@ -186,7 +294,7 @@ fn role_inherits(models: &EffectiveModels, role: AgentRole) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{mark_completed_step, update_pending_steps};
+    use super::{compact_pending_steps, mark_completed_step, update_pending_steps};
     use crate::runtime::{NetworkPolicy, PermissionMode};
     use crate::state::session::{AgentModels, ResultRecord, SessionState};
 
@@ -275,6 +383,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn compact_pending_steps_deduplicates_and_drops_completed_entries() {
+        let mut session = sample_session();
+        session.completed_steps = vec!["Run cargo check".to_string()];
+        session.pending_steps = vec![
+            "Inspect matched files".to_string(),
+            "run cargo check".to_string(),
+            "Inspect matched files!".to_string(),
+            "Review the changed files".to_string(),
+        ];
+
+        compact_pending_steps(&mut session);
+
+        assert_eq!(
+            session.pending_steps,
+            vec![
+                "Inspect matched files!".to_string(),
+                "Review the changed files".to_string(),
+            ]
+        );
+    }
+
     fn sample_session() -> SessionState {
         SessionState {
             session_id: "session-1".to_string(),
@@ -293,6 +423,7 @@ mod tests {
             relevant_files: Vec::new(),
             recent_delegations: Vec::new(),
             recent_results: Vec::new(),
+            pending_confirmation: None,
         }
     }
 }

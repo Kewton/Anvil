@@ -92,5 +92,6 @@ fn sample_session() -> SessionState {
                 file: Some("src/policy/command_classification.rs".to_string()),
             }],
         }],
+        pending_confirmation: None,
     }
 }

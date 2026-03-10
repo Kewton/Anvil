@@ -281,6 +281,7 @@ fn sample_session() -> SessionState {
         relevant_files: Vec::new(),
         recent_delegations: Vec::new(),
         recent_results: Vec::new(),
+        pending_confirmation: None,
     }
 }
 

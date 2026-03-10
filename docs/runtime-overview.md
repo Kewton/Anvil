@@ -68,6 +68,7 @@ Persisted session state includes:
 - recent delegations
 - recent results
 - pending and completed steps
+- pending confirmation state for confirmation-gated actions
 - changed files, commands run, and evidence for recent delegated turns
 
 Supported state actions:
@@ -88,14 +89,16 @@ Slash commands:
 - `/snapshot`
 - `/models`
 - `/history`
+- `/approve`
+- `/deny`
 - `/exit`
 
 ## Current Limits
 
 - LM Studio live smoke verification is opt-in rather than part of the default suite
 - step lifecycle is improved but still heuristic
-- end-to-end coverage is still small and fixture-based
-- documentation is still being promoted out of `workspace/`
+- approval flow is currently implemented for confirmation-gated tester exec actions
+- some design notes still live under `workspace/`
 
 ## Manual Smoke Checks
 

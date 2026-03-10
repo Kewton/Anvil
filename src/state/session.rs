@@ -24,6 +24,8 @@ pub struct SessionState {
     pub relevant_files: Vec<String>,
     pub recent_delegations: Vec<DelegationRecord>,
     pub recent_results: Vec<ResultRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_confirmation: Option<PendingConfirmation>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -81,6 +83,27 @@ pub struct ResultRecord {
     pub findings: Vec<Finding>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingConfirmation {
+    pub role: String,
+    pub task: String,
+    pub summary: String,
+    pub reason: String,
+    pub action: PendingAction,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum PendingAction {
+    Exec {
+        program: String,
+        args: Vec<String>,
+        cwd: String,
+        display: String,
+    },
+}
+
 impl SessionState {
     pub fn validate(&self, registry: &RoleRegistry) -> anyhow::Result<()> {
         const SCHEMA: &str = include_str!("../../schemas/session-state.schema.json");
@@ -102,6 +125,9 @@ impl SessionState {
         validate_string_list("relevant_files", &self.relevant_files, 200, 400)?;
         self.agent_models.validate(registry)?;
         validate_role_records(registry, &self.recent_delegations, &self.recent_results)?;
+        if let Some(pending) = &self.pending_confirmation {
+            pending.validate(registry)?;
+        }
         validate_serializable("session-state.schema.json", SCHEMA, "SessionState", self)
     }
 }
@@ -123,6 +149,46 @@ impl AgentModels {
         ] {
             if let Some(model) = value {
                 ensure_non_empty(field, model)?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl PendingConfirmation {
+    fn validate(&self, registry: &RoleRegistry) -> anyhow::Result<()> {
+        ensure!(
+            registry.role(&self.role).is_some()
+                && self.role != "pm"
+                && self.role != "planner",
+            "pending confirmation role {} is not a persisted subagent role",
+            self.role
+        );
+        ensure_non_empty("pending_confirmation.task", &self.task)?;
+        bounded_len("pending_confirmation.task", &self.task, 1000)?;
+        ensure_non_empty("pending_confirmation.summary", &self.summary)?;
+        bounded_len("pending_confirmation.summary", &self.summary, 1000)?;
+        ensure_non_empty("pending_confirmation.reason", &self.reason)?;
+        bounded_len("pending_confirmation.reason", &self.reason, 300)?;
+
+        match &self.action {
+            PendingAction::Exec {
+                program,
+                args,
+                cwd,
+                display,
+            } => {
+                ensure_non_empty("pending_confirmation.exec.program", program)?;
+                ensure_non_empty("pending_confirmation.exec.cwd", cwd)?;
+                ensure_non_empty("pending_confirmation.exec.display", display)?;
+                ensure!(
+                    args.len() <= 20,
+                    "pending_confirmation.exec.args exceeds maximum size of 20"
+                );
+                for arg in args {
+                    bounded_len("pending_confirmation.exec.args", arg, 300)?;
+                }
             }
         }
 

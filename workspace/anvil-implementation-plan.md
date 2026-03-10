@@ -29,24 +29,27 @@ Completed:
 - bounded Editor file mutation through the runtime permission layer
 - task-aware Tester command planning with stdout/stderr evidence capture
 - interactive multi-turn loop for new and resumed sessions
-- interactive slash commands for help, status, snapshot, model summary, history, and exit
+- interactive slash commands for help, status, snapshot, model summary, history, approval, denial, and exit
 - richer session introspection with recent delegation and recent result history
 - normalized pending/completed-step lifecycle handling for semantically matching steps
+- persisted pending-confirmation state plus interactive approval and denial flow for confirmation-gated tester actions
 - LM Studio OpenAI-compatible HTTP adapter
 - fixture-based resume/edit/test/review CLI end-to-end coverage
 - CLI handoff export/import roundtrip coverage
 - CLI blocked tester-path coverage in read-only mode
 - CLI confirmation-required tester-path coverage for networked validation requests
 - CLI confirmation-required tester-path coverage for destructive validation requests
+- CLI approval and denial coverage for destructive confirmation paths
 - opt-in LM Studio live smoke test coverage
 - role-aware pending-step replacement for successive recommendations
+- stale pending-step cleanup through normalization-aware compaction
 - implementation-facing documentation promoted into `README.md` and `docs/runtime-overview.md`
 - initial automated test coverage for CLI, state, policy, trust, runtime/tools, and PM/model routing
 
 Not yet completed:
 
 - repeatable execution of LM Studio live smoke verification in a running local environment
-- richer step lifecycle semantics beyond normalization and role-local replacement
+- lifecycle semantics beyond normalization, role-local replacement, and stale-step compaction
 - further documentation promotion from `workspace/` into stable docs where still needed
 
 ---
@@ -225,6 +228,7 @@ Status:
 - `anvil -p` and `anvil resume <id> -p ...` execute through the PM/runtime path
 - new and resumed sessions now support interactive multi-turn stdin loops
 - interactive slash commands provide help, status, snapshot, model summary, history, and exit controls
+- confirmation-gated tester actions can now be approved or denied from interactive sessions
 
 ### 11. Validation and Test Coverage
 
@@ -246,6 +250,7 @@ Status:
 - the listed areas have baseline automated coverage
 - interactive CLI command coverage is in place
 - fixture-based resume/edit/test/review and handoff CLI flows are now covered
+- confirmation approval/denial flows are covered in CLI integration tests
 - blocked tester-path CLI coverage is in place
 - confirmation-required tester-path CLI coverage is in place
 - remaining gaps are live adapter execution in a running local environment, broader fixture breadth, and deeper step lifecycle refinement
@@ -266,10 +271,10 @@ Goal:
 ## Recommended Immediate Next Steps
 
 1. Run repeatable LM Studio live verification in a running local environment
-2. Tighten pending/completed-step lifecycle semantics beyond normalization and role-local replacement
+2. Tighten pending/completed-step lifecycle semantics beyond the current normalization and compaction heuristics
 3. Promote any remaining implementation-aligned documents from `workspace/` into stable docs
-4. Add richer session summary or history views only where they improve operator clarity
-5. Expand fixture coverage only where it adds new runtime behavior
+4. Expand fixture coverage only where it adds genuinely new runtime behavior
+5. Add richer session inspection only where it materially improves operator clarity
 
 ---
 
@@ -279,7 +284,7 @@ The highest-value remaining items are:
 
 - add repeatable LM Studio live verification
 - tighten pending/completed work lifecycle semantics further
-- add more true end-to-end tests that exercise prompt execution, persistence, resume, and tool use together
+- add more end-to-end tests only where they exercise behavior not already covered by current fixture and confirmation flows
 - finish promoting implementation notes into durable user/developer documentation
 
 ---
@@ -303,6 +308,7 @@ The highest-value remaining items are:
 - cover `anvil -p`, `anvil resume`, and `anvil resume -p` for both PM fast-path and delegated paths
 - add tests that verify startup/session snapshots include last result, pending steps, completed steps, and recommendations
 - add tests for interactive slash commands and multi-turn stdin loops
+- add tests for `/approve` and `/deny` flows that execute or decline confirmation-gated actions
 - keep expanding fixture-based resume flows where they add new behavioral coverage
 - add tests for blocked and confirmation-required tool paths surfaced through CLI output
 

@@ -1,5 +1,6 @@
 use crate::agents::{AgentResult, AgentTask};
 use crate::runtime::engine::{RuntimeEngine, RuntimeToolOutcome};
+use crate::state::session::{PendingAction, PendingConfirmation};
 use crate::tools::exec::ExecRequest;
 use crate::tools::registry::{ToolRequest, ToolResponse};
 
@@ -9,46 +10,64 @@ pub struct TesterAgent;
 impl TesterAgent {
     pub fn run(&self, task: &AgentTask, runtime: &RuntimeEngine) -> AgentResult {
         let command = select_validation_command(&task.description);
+        let request = ExecRequest {
+            program: command.program.to_string(),
+            args: command.args.iter().map(|arg| arg.to_string()).collect(),
+            cwd: task.workspace_root.clone(),
+        };
         match runtime.checked_execute(ToolRequest::Exec {
-            request: ExecRequest {
-                program: command.program.to_string(),
-                args: command.args.iter().map(|arg| arg.to_string()).collect(),
-                cwd: task.workspace_root.clone(),
-            },
+            request: request.clone(),
         }) {
             Ok(RuntimeToolOutcome::Allowed(ToolResponse::ExecResult(result))) => {
-                let mut evidence = Vec::new();
-                if let Some(stdout) = first_non_empty_line(&result.stdout) {
-                    evidence.push(("tool-output".to_string(), format!("stdout: {stdout}")));
-                }
-                if let Some(stderr) = first_non_empty_line(&result.stderr) {
-                    evidence.push(("tool-output".to_string(), format!("stderr: {stderr}")));
-                }
-
-                AgentResult::new(
-                    "tester",
-                    format!(
-                        "Tester ran `{}` with exit code {:?} while handling: {}",
-                        command.display, result.exit_code, task.description
-                    ),
-                )
-                .with_next_recommendation(
-                    "Inspect the validation output and decide whether another focused check is needed",
-                )
-                .with_commands_run(vec![command.display.to_string()])
-                .with_evidence(evidence)
+                summarize_exec_result(&task.description, command.display, result)
             }
             Ok(RuntimeToolOutcome::Blocked(reason)) => {
                 AgentResult::new("tester", format!("Tester blocked: {reason}"))
             }
             Ok(RuntimeToolOutcome::NeedsConfirmation(reason)) => {
                 AgentResult::new("tester", format!("Tester awaiting confirmation: {reason}"))
+                    .with_pending_confirmation(PendingConfirmation {
+                        role: "tester".to_string(),
+                        task: task.description.clone(),
+                        summary: format!(
+                            "Tester is waiting to run `{}` for: {}",
+                            command.display, task.description
+                        ),
+                        reason,
+                        action: PendingAction::Exec {
+                            program: request.program,
+                            args: request.args,
+                            cwd: request.cwd.display().to_string(),
+                            display: command.display.to_string(),
+                        },
+                    })
             }
             Ok(RuntimeToolOutcome::Allowed(_)) | Err(_) => AgentResult::new(
                 "tester",
                 format!(
                     "Tester could not summarize command execution for: {}",
                     task.description
+                ),
+            ),
+        }
+    }
+
+    pub fn approve_pending(
+        &self,
+        runtime: &RuntimeEngine,
+        task_description: &str,
+        request: ExecRequest,
+        display: &str,
+    ) -> AgentResult {
+        match runtime.execute_confirmed(ToolRequest::Exec { request }) {
+            Ok(ToolResponse::ExecResult(result)) => {
+                summarize_exec_result(task_description, display, result)
+            }
+            Ok(_) | Err(_) => AgentResult::new(
+                "tester",
+                format!(
+                    "Tester could not execute the approved command for: {}",
+                    task_description
                 ),
             ),
         }
@@ -60,6 +79,33 @@ fn first_non_empty_line(text: &str) -> Option<String> {
         .map(str::trim)
         .find(|line| !line.is_empty())
         .map(|line| line.chars().take(200).collect())
+}
+
+fn summarize_exec_result(
+    task_description: &str,
+    display: &str,
+    result: crate::tools::exec::ExecResult,
+) -> AgentResult {
+    let mut evidence = Vec::new();
+    if let Some(stdout) = first_non_empty_line(&result.stdout) {
+        evidence.push(("tool-output".to_string(), format!("stdout: {stdout}")));
+    }
+    if let Some(stderr) = first_non_empty_line(&result.stderr) {
+        evidence.push(("tool-output".to_string(), format!("stderr: {stderr}")));
+    }
+
+    AgentResult::new(
+        "tester",
+        format!(
+            "Tester ran `{}` with exit code {:?} while handling: {}",
+            display, result.exit_code, task_description
+        ),
+    )
+    .with_next_recommendation(
+        "Inspect the validation output and decide whether another focused check is needed",
+    )
+    .with_commands_run(vec![display.to_string()])
+    .with_evidence(evidence)
 }
 
 struct ValidationCommand {
