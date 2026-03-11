@@ -326,6 +326,53 @@ TDD の観点:
 - [ ] `このブランチを解説して` と `ゲームを作って出力して` の両方が安定して完走する
 - [ ] `qwen3.5:35b` 実機確認で Phase 3.1 より明確に完走率が改善する
 
+## Phase 3.3: 生成タスク収束性の改善
+
+目的:
+
+- [ ] create / output 系タスクでの path 誤読を抑止する
+- [ ] `mkdir` 後に `stat_path` / `list_dir` を反復する停滞ループを解消する
+- [ ] 「prepare -> write -> verify -> final」の段階遷移を loop policy として明確化する
+- [ ] ユーザーから見て、同じ失敗を繰り返していることが分かる可観測性を追加する
+
+先に書くテスト:
+
+- [ ] ユーザーが指定した出力先 path と tool call path がズレた場合に `path_mismatch` で差し戻す統合テスト
+- [ ] `./sandbox/test31_011` のような複雑な path を `./sandbox11` に崩さない回帰テスト
+- [ ] create task で `mkdir` 成功後に `write_file` へ進む統合テスト
+- [ ] create task で空 directory に対する `stat_path` / `list_dir` の反復を block する統合テスト
+- [ ] `prepare -> write -> verify -> final` の段階遷移テスト
+- [ ] internal `ToolError` が UI event として表示される contract test
+- [ ] `duplicate_empty_result` / `stalled_pre_write_inspection` / `path_mismatch` の observer event テスト
+- [ ] `qwen3.5:35b` 実機回帰テスト
+  - [ ] 単一 HTML 生成
+  - [ ] `./sandbox/<name>/` への静的ゲーム出力
+  - [ ] 誤 path からの self-correction
+
+実装:
+
+- [ ] ユーザー入力から期待出力 path を抽出し loop state に保持する
+- [ ] tool call path が期待 path と意味的にズレる場合の `path_mismatch` validator を追加する
+- [ ] create task 用の phase state (`prepare`, `write`, `verify`, `final`) を追加する
+- [ ] `prepare` 完了後の無意味な `stat_path` / `list_dir` / `path_exists` を block する
+- [ ] `write` 未実行時は `write_file` を優先する completion hint を強化する
+- [ ] `ToolError` を UI に表示する observer event を追加する
+- [ ] one-shot と interactive の両方で同じ create-task policy を使うよう整理する
+
+TDD の観点:
+
+- まず path mismatch の validator を赤で固定する
+- 次に create-task phase state を unit test / integration test で固める
+- その後 UI event contract を追加する
+- 最後に `qwen3.5:35b` 実機でゲーム生成の完走を確認する
+
+完了条件:
+
+- [ ] 指定出力 path の誤読が loop 内で自己修正される
+- [ ] create task が `mkdir` 後の空 directory inspection で停滞しない
+- [ ] internal retry / tool error がユーザーから追える
+- [ ] `ブラウザから直接実行可能ないけてるスペースインベーダーゲーム` の生成が `qwen3.5:35b` で完走する
+
 ## Phase 4: 拡張フェーズ
 
 目的:
