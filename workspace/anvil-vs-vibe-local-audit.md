@@ -52,3 +52,4 @@
 2. `cache invalidation matrix`, `phase truth source migration`, `provider streaming capability model`, `message-structured prompt layout` を別設計書に具体化する
 3. `provider runtime policy`, `working transcript -> carryover summary` 昇格規則, `RequirementState` の粒度, `repeat recovery` fail-safe を Phase 3.8 設計へ追加する
 4. `RequirementState` を `EntryPointVerified / CoreBehaviorVerified` 粒度へ見直し、`transcript retention policy`, `fallback reason codes`, `assistant transition note`, `evidence delta` を Phase 3.8 設計へ追加する
+5. `sidecar compaction policy`, `tool/result pairing integrity`, `provider retry/backoff policy`, `clarification escape hatch` を Phase 3.8 設計へ追加する

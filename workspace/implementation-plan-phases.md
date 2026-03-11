@@ -588,7 +588,7 @@ TDD の観点:
 - [ ] provider capability が `Unknown -> Supported/Unsupported` に遷移する table-driven test
 - [ ] `RequirementState.remaining -> CreatePhase` mapping test
 - [ ] message-structured layout で `ANVIL.md / memory / carryover / contract / transcript` が期待 role に分かれる test
-- [ ] `EntryPointVerified / CoreBehaviorVerified / ReviewCompleted` の粒度を固定する test
+- [ ] `EntryPointVerified / RuntimeVerified / RequestedOutputVerified / CoreLoopVerified / ReviewCompleted` の粒度を固定する test
 - [ ] provider runtime policy が tool mode で temperature / keep-alive / num_ctx を切り替える test
 - [ ] `working transcript -> carryover summary` 昇格規則の compaction test
 - [ ] repeat detector が state redesign 後も fail-safe のまま残る回帰 test
@@ -596,6 +596,9 @@ TDD の観点:
 - [ ] provider fallback reason code が `unsupported / probe_failed / missing_delta / parse_error` に分類される test
 - [ ] `assistant transition note` が loop context に残る test
 - [ ] evidence delta が `new / strengthened / none / conflicting` に分類される test
+- [ ] sidecar compaction が有効でも transcript integrity が壊れない test
+- [ ] assistant tool_calls と tool results の pairing integrity test
+- [ ] provider runtime policy の timeout / retry / backoff / empty-response handling test
 
 実装:
 
@@ -605,7 +608,7 @@ TDD の観点:
   - path-scoped invalidation は gate 条件が揃うまで入れない
 - [ ] phase 遷移の truth source を `RequirementState.remaining` へ一元化する
   - `CreatePhase` は derived UI state に格下げする
-  - `DeliverableVerified` は `EntryPointVerified` と `CoreBehaviorVerified` に分解する
+  - `DeliverableVerified` は `EntryPointVerified / RuntimeVerified / RequestedOutputVerified / CoreLoopVerified` に分解する
 - [ ] provider capability model を追加する
   - `Unknown / Supported / Unsupported`
   - `provider + model + endpoint fingerprint` 単位の probe once + cached fallback
@@ -615,8 +618,13 @@ TDD の観点:
   - context window reflection
   - stream preference
   - tool mode / text-only mode / creative final mode の precedence rule
+  - timeout / retry / backoff / empty-response handling
 - [ ] Ollama / LM Studio で tool streaming 対応 path と sync fallback path を分離する
 - [ ] provider fallback reason code を audit/debug に残す
+- [ ] sidecar compaction policy を追加する
+  - sidecar selection
+  - fallback to main
+  - compaction audit events
 - [ ] `ANVIL.md / memory / carryover / contract / transcript` を message-structured layout へ分割する
   - base policy
   - project instructions
@@ -631,8 +639,12 @@ TDD の観点:
   - raw evidence を残す条件
   - summary へ昇格する条件
   - finalize 前に優先保持する evidence
+- [ ] transcript integrity rules を追加する
+  - assistant tool_calls と tool results の pairing
+  - orphaned tool result を作らない
 - [ ] tool result 後の短い assistant summary hook を追加する
 - [ ] `assistant transition note` を loop context に残す
+  - user-visible note と model-visible note の分離可能性を残す
 - [ ] evidence delta evaluator を追加する
   - new evidence
   - strengthened evidence
@@ -642,6 +654,10 @@ TDD の観点:
   - same read-only repeated without new evidence
   - repeated finalize probe
   - same-tool repeated after `no_progress`
+- [ ] clarification escape hatch を将来追加できる接続点を残す
+  - conflicting evidence
+  - requirement conflict
+  - verification ambiguity
 
 完了条件:
 
@@ -653,6 +669,8 @@ TDD の観点:
 - [ ] compaction 後も creative guidance と carryover summary が両立する
 - [ ] repeat detector が redesign 後も安全装置として機能する
 - [ ] transcript retention / transition note / evidence delta の責務分離が明確になる
+- [ ] sidecar compaction の有無で loop correctness が変わらない
+- [ ] transcript compaction 後も tool/result pairing が壊れない
 
 ## Phase 4: 拡張フェーズ
 
