@@ -588,10 +588,14 @@ TDD の観点:
 - [ ] provider capability が `Unknown -> Supported/Unsupported` に遷移する table-driven test
 - [ ] `RequirementState.remaining -> CreatePhase` mapping test
 - [ ] message-structured layout で `ANVIL.md / memory / carryover / contract / transcript` が期待 role に分かれる test
-- [ ] `DeliverableStructureVerified / CoreRequirementsVerified / ReviewCompleted` の粒度を固定する test
+- [ ] `EntryPointVerified / CoreBehaviorVerified / ReviewCompleted` の粒度を固定する test
 - [ ] provider runtime policy が tool mode で temperature / keep-alive / num_ctx を切り替える test
 - [ ] `working transcript -> carryover summary` 昇格規則の compaction test
 - [ ] repeat detector が state redesign 後も fail-safe のまま残る回帰 test
+- [ ] transcript retention policy に従って raw evidence と summary evidence が分かれる test
+- [ ] provider fallback reason code が `unsupported / probe_failed / missing_delta / parse_error` に分類される test
+- [ ] `assistant transition note` が loop context に残る test
+- [ ] evidence delta が `new / strengthened / none / conflicting` に分類される test
 
 実装:
 
@@ -601,7 +605,7 @@ TDD の観点:
   - path-scoped invalidation は gate 条件が揃うまで入れない
 - [ ] phase 遷移の truth source を `RequirementState.remaining` へ一元化する
   - `CreatePhase` は derived UI state に格下げする
-  - `DeliverableVerified` は `DeliverableStructureVerified` と `CoreRequirementsVerified` に分解する
+  - `DeliverableVerified` は `EntryPointVerified` と `CoreBehaviorVerified` に分解する
 - [ ] provider capability model を追加する
   - `Unknown / Supported / Unsupported`
   - `provider + model + endpoint fingerprint` 単位の probe once + cached fallback
@@ -610,7 +614,9 @@ TDD の観点:
   - keep-alive
   - context window reflection
   - stream preference
+  - tool mode / text-only mode / creative final mode の precedence rule
 - [ ] Ollama / LM Studio で tool streaming 対応 path と sync fallback path を分離する
+- [ ] provider fallback reason code を audit/debug に残す
 - [ ] `ANVIL.md / memory / carryover / contract / transcript` を message-structured layout へ分割する
   - base policy
   - project instructions
@@ -621,7 +627,17 @@ TDD の観点:
   - compacted transcript
   - working transcript と carryover summary の昇格規則を持つ
   - Phase 3.7 の creative guidance は contract message に残す
+- [ ] transcript retention policy を追加する
+  - raw evidence を残す条件
+  - summary へ昇格する条件
+  - finalize 前に優先保持する evidence
 - [ ] tool result 後の短い assistant summary hook を追加する
+- [ ] `assistant transition note` を loop context に残す
+- [ ] evidence delta evaluator を追加する
+  - new evidence
+  - strengthened evidence
+  - no evidence
+  - conflicting evidence
 - [ ] repeat recovery を state/evidence 駆動へ寄せる
   - same read-only repeated without new evidence
   - repeated finalize probe
@@ -636,6 +652,7 @@ TDD の観点:
 - [ ] provider runtime tuning と tool streaming capability の責務分離が明確になる
 - [ ] compaction 後も creative guidance と carryover summary が両立する
 - [ ] repeat detector が redesign 後も安全装置として機能する
+- [ ] transcript retention / transition note / evidence delta の責務分離が明確になる
 
 ## Phase 4: 拡張フェーズ
 
