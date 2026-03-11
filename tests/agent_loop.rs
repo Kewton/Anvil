@@ -143,6 +143,8 @@ async fn loop_rejects_shell_style_exec_command() {
     let model = ScriptedModel::new(vec![
         r#"{"type":"tool_calls","calls":[{"tool":"exec","args":{"command":"git status | cat"}}]}"#
             .to_string(),
+        r#"{"type":"tool_calls","calls":[{"tool":"exec","args":{"command":"git status | cat"}}]}"#
+            .to_string(),
     ]);
     let driver = LoopDriver::new(LoopConfig::default());
 
@@ -180,11 +182,60 @@ async fn loop_fail_closed_on_invalid_tool_schema() {
     let model = ScriptedModel::new(vec![
         r#"{"type":"tool_calls","calls":[{"tool":"read_file","args":{"unknown":"x"}}]}"#
             .to_string(),
+        r#"{"type":"tool_calls","calls":[{"tool":"read_file","args":{"unknown":"x"}}]}"#
+            .to_string(),
     ]);
     let driver = LoopDriver::new(LoopConfig::default());
 
     let err = driver
         .run(&model, dir.path(), "bad schema", Vec::<ModelTurn>::new())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, LoopError::InvalidToolCall(_)));
+}
+
+#[tokio::test]
+async fn loop_reprompts_after_schema_error_and_recovers() {
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("README.md"), "hello\n").unwrap();
+    let model = ScriptedModel::new(vec![
+        r#"{"type":"tool_calls","calls":[{"tool":"glob","args":{"path":"./sandbox/test31_001"}}]}"#
+            .to_string(),
+        r#"{"type":"tool_calls","calls":[{"tool":"read_file","args":{"path":"README.md"}}]}"#
+            .to_string(),
+        r#"{"type":"final","content":"recovered after tool error"}"#.to_string(),
+    ]);
+    let driver = LoopDriver::new(LoopConfig::default());
+
+    let out = driver
+        .run(
+            &model,
+            dir.path(),
+            "recover from bad glob call",
+            Vec::<ModelTurn>::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(out.final_text, "recovered after tool error");
+    let prompts = model.prompts();
+    assert_eq!(prompts.len(), 3);
+    assert!(prompts[1].contains("TOOL_ERROR glob"));
+    assert!(prompts[1].contains("expected `pattern`"));
+}
+
+#[tokio::test]
+async fn loop_stops_after_repeated_schema_errors() {
+    let dir = tempdir().unwrap();
+    let model = ScriptedModel::new(vec![
+        r#"{"type":"tool_calls","calls":[{"tool":"glob","args":{"path":"a"}}]}"#.to_string(),
+        r#"{"type":"tool_calls","calls":[{"tool":"glob","args":{"path":"b"}}]}"#.to_string(),
+    ]);
+    let driver = LoopDriver::new(LoopConfig::default());
+
+    let err = driver
+        .run(&model, dir.path(), "keep failing", Vec::<ModelTurn>::new())
         .await
         .unwrap_err();
 

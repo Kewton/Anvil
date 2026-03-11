@@ -16,7 +16,16 @@ pub trait ModelExchange: Send + Sync {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelTurn {
-    ToolResult { tool: String, output: String },
+    ToolResult {
+        tool: String,
+        output: String,
+    },
+    ToolError {
+        tool: String,
+        error_kind: String,
+        message: String,
+        hint: String,
+    },
     AssistantFinal(String),
 }
 
@@ -24,6 +33,7 @@ pub enum ModelTurn {
 pub struct LoopConfig {
     pub max_steps: usize,
     pub max_tool_output_chars: usize,
+    pub max_schema_retries: usize,
 }
 
 impl Default for LoopConfig {
@@ -31,6 +41,7 @@ impl Default for LoopConfig {
         Self {
             max_steps: 6,
             max_tool_output_chars: 1_200,
+            max_schema_retries: 1,
         }
     }
 }
@@ -72,6 +83,7 @@ impl LoopDriver {
     ) -> Result<LoopOutput, LoopError> {
         let mut turns = prior_turns;
         let mut seen = BTreeSet::new();
+        let mut schema_retries = 0usize;
 
         for _ in 0..self.config.max_steps {
             let prompt = build_loop_prompt(task, &turns);
@@ -88,7 +100,26 @@ impl LoopDriver {
                 }
                 ModelResponse::ToolCalls { calls } => {
                     for call in calls {
-                        let validated = validate_tool_call(&call)?;
+                        let validated = match validate_tool_call(&call) {
+                            Ok(validated) => {
+                                schema_retries = 0;
+                                validated
+                            }
+                            Err(LoopError::InvalidToolCall(message)) => {
+                                if schema_retries >= self.config.max_schema_retries {
+                                    return Err(LoopError::InvalidToolCall(message));
+                                }
+                                schema_retries += 1;
+                                turns.push(ModelTurn::ToolError {
+                                    tool: call.tool.clone(),
+                                    error_kind: "schema_validation".to_string(),
+                                    message: message.clone(),
+                                    hint: tool_error_hint(&call.tool),
+                                });
+                                continue;
+                            }
+                            Err(other) => return Err(other),
+                        };
                         let normalized = serde_json::to_string(&validated)
                             .map_err(|err| LoopError::InvalidToolCall(err.to_string()))?;
                         if !seen.insert(normalized.clone()) {
@@ -326,6 +357,16 @@ Invalid or partial tool args are forbidden.\n\n",
             ModelTurn::ToolResult { tool, output } => {
                 prompt.push_str(&format!("TOOL_RESULT {tool}\n{output}\n\n"));
             }
+            ModelTurn::ToolError {
+                tool,
+                error_kind,
+                message,
+                hint,
+            } => {
+                prompt.push_str(&format!(
+                    "TOOL_ERROR {tool}\nkind={error_kind}\nmessage={message}\nhint={hint}\n\n"
+                ));
+            }
             ModelTurn::AssistantFinal(content) => {
                 prompt.push_str(&format!("ASSISTANT_FINAL\n{content}\n\n"));
             }
@@ -344,4 +385,16 @@ fn truncate(text: &str, max_chars: usize) -> String {
         "{} ... [truncated]",
         text.chars().take(max_chars).collect::<String>()
     )
+}
+
+fn tool_error_hint(tool: &str) -> String {
+    match tool {
+        "glob" => "glob requires args.pattern as a glob string".to_string(),
+        "exec" => "exec requires args.argv as a string array, or args.command without shell syntax"
+            .to_string(),
+        "read_file" | "write_file" | "edit_file" => "file tools require args.path".to_string(),
+        "search" => "search requires args.needle".to_string(),
+        "diff" => "diff requires args.before and args.after".to_string(),
+        _ => "review the tool schema and retry with valid arguments".to_string(),
+    }
 }
