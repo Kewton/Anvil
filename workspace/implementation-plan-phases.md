@@ -232,38 +232,6 @@ TDD の観点:
 - [x] change detection が大規模リポジトリでも過負荷にならない
 - [x] summary / subagent / audit log の性能予算が守られる
 
-## Phase 4: 拡張フェーズ
-
-目的:
-
-- [ ] 並列サブエージェント
-- [ ] Notebook / Web / RAG
-- [ ] 追加 provider / tool
-- [ ] 高度な automation
-
-先に書くテスト:
-
-- [ ] 並列 subagent の isolation test
-- [ ] 複数 subagent の audit ordering test
-- [ ] Notebook / Web / RAG の capability test
-- [ ] provider 追加時の conformance test
-- [ ] registry 拡張時の backward compatibility test
-
-実装:
-
-- [ ] `src/agent/parallel_subagent.rs`
-- [ ] `src/tools/notebook.rs`
-- [ ] `src/tools/web.rs`
-- [ ] `src/tools/rag.rs`
-- [ ] provider conformance test harness
-- [ ] extensibility fixtures / golden cases
-
-完了条件:
-
-- [ ] 拡張機能が core を壊さずに追加できる
-- [ ] 監査と権限モデルが維持される
-- [ ] 新 provider / tool 追加時に conformance test を通せる
-
 ## Phase 3.1: Agent Loop 強化
 
 目的:
@@ -303,6 +271,38 @@ TDD の観点:
 - [ ] `このブランチを解説して` のような依頼をルール追加なしで処理できる
 - [ ] tool loop が fail-closed と権限モデルを維持したまま安定動作する
 - [ ] Claude Code / vibe-local に近い「調べてから答える」挙動を再現できる
+
+## Phase 4: 拡張フェーズ
+
+目的:
+
+- [ ] 並列サブエージェント
+- [ ] Notebook / Web / RAG
+- [ ] 追加 provider / tool
+- [ ] 高度な automation
+
+先に書くテスト:
+
+- [ ] 並列 subagent の isolation test
+- [ ] 複数 subagent の audit ordering test
+- [ ] Notebook / Web / RAG の capability test
+- [ ] provider 追加時の conformance test
+- [ ] registry 拡張時の backward compatibility test
+
+実装:
+
+- [ ] `src/agent/parallel_subagent.rs`
+- [ ] `src/tools/notebook.rs`
+- [ ] `src/tools/web.rs`
+- [ ] `src/tools/rag.rs`
+- [ ] provider conformance test harness
+- [ ] extensibility fixtures / golden cases
+
+完了条件:
+
+- [ ] 拡張機能が core を壊さずに追加できる
+- [ ] 監査と権限モデルが維持される
+- [ ] 新 provider / tool 追加時に conformance test を通せる
 
 ## TDD の運用ルール
 

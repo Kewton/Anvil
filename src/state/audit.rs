@@ -147,6 +147,16 @@ impl AuditLog {
         Ok(())
     }
 
+    pub fn append_raw_line(&self, line: &str) -> anyhow::Result<()> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut file = open_append(&self.path)?;
+        file.write_all(line.as_bytes())?;
+        file.write_all(b"\n")?;
+        Ok(())
+    }
+
     pub fn load_all(&self) -> anyhow::Result<Vec<AuditEvent>> {
         if !self.path.exists() {
             return Ok(Vec::new());
@@ -157,6 +167,34 @@ impl AuditLog {
             events.push(serde_json::from_str(line)?);
         }
         Ok(events)
+    }
+
+    pub fn rotate_if_needed(&self, max_bytes: u64) -> anyhow::Result<()> {
+        if !self.path.exists() {
+            return Ok(());
+        }
+        let size = std::fs::metadata(&self.path)?.len();
+        if size <= max_bytes {
+            return Ok(());
+        }
+        let rotated = self.rotated_path();
+        std::fs::rename(&self.path, rotated)?;
+        Ok(())
+    }
+
+    fn rotated_path(&self) -> PathBuf {
+        let stem = self
+            .path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("audit");
+        let ext = self
+            .path
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("jsonl");
+        let ts = chrono::Utc::now().format("%Y%m%d%H%M%S");
+        self.path.with_file_name(format!("{stem}.{ts}.{ext}"))
     }
 }
 

@@ -10,6 +10,7 @@ use serde::Deserialize;
 
 use crate::agent::plan::{PlanDocument, PlanState};
 use crate::agent::subagent::{SubagentRequest, SubagentRunner};
+use crate::config::model_profiles::profile_for_model;
 use crate::config::{AppConfig, ProviderKind};
 use crate::instructions::{LoadedInstructions, load_instructions};
 use crate::models::lm_studio::LmStudioClient;
@@ -24,7 +25,10 @@ use crate::state::audit::{
 };
 use crate::state::memory::MemoryStore;
 use crate::state::session::Session;
+use crate::state::summary::{SummaryController, SummaryInput, SummaryPolicy};
 use crate::tools::{GeneratedFile, write_files};
+use crate::ui::interactive::{FooterState, InteractiveFrame, SpinnerHandle, UiEvent};
+use crate::ui::render::{render_banner, render_frame};
 
 #[derive(Debug, Clone)]
 pub struct Agent {
@@ -140,6 +144,7 @@ impl Agent {
     }
 
     pub async fn run_interactive(&self) -> anyhow::Result<()> {
+        println!("{}", render_banner());
         println!("Anvil interactive mode");
         println!("provider: {:?}", self.config.provider);
         println!("model: {}", self.config.model);
@@ -149,7 +154,27 @@ impl Agent {
         let memory = MemoryStore::new(self.config.cwd.join("ANVIL-MEMORY.md"));
         let registry = SlashRegistry::load(&self.config.cwd)?;
         let mut plan_state = PlanState::default();
+        let profile = profile_for_model(&self.config.model);
+        let summary = SummaryController::new(SummaryPolicy::default());
+        let mut transcript = Vec::new();
         loop {
+            let frame = InteractiveFrame {
+                title: "Anvil".to_string(),
+                provider: format!("{:?}", self.config.provider).to_lowercase(),
+                model: self.config.model.clone(),
+                cwd: self.config.cwd.display().to_string(),
+                transcript: transcript.clone(),
+                footer: FooterState {
+                    mode: format!("{:?}", plan_state.mode).to_lowercase(),
+                    pending_hint: "/memory show".to_string(),
+                    token_status: format!(
+                        "{}/{}",
+                        transcript.len() * 1200,
+                        profile.max_context_tokens
+                    ),
+                },
+            };
+            println!("{}", render_frame(&frame));
             print!("anvil> ");
             io::stdout().flush()?;
             let mut line = String::new();
@@ -161,10 +186,14 @@ impl Agent {
             if input == "/exit" || input == "/quit" {
                 break;
             }
+            transcript.push(UiEvent::UserInput(input.to_string()));
             if let Some(command) = registry.resolve(input)? {
+                let spinner = SpinnerHandle::start("slash");
                 let output = self
                     .execute_slash(command, memory.path(), &mut plan_state)
                     .await?;
+                spinner.stop("slash command finished");
+                transcript.push(UiEvent::AgentText(output.clone()));
                 println!("{output}");
                 continue;
             }
@@ -177,7 +206,29 @@ impl Agent {
             } else {
                 input.to_string()
             };
+            if summary.should_summarize(SummaryInput {
+                tokens: transcript.len() * 1200,
+                turns: transcript.len() / 2,
+            }) {
+                transcript.push(UiEvent::AgentText(
+                    summary.summarize_history(
+                        &transcript
+                            .iter()
+                            .map(|event| match event {
+                                UiEvent::UserInput(text)
+                                | UiEvent::AgentText(text)
+                                | UiEvent::ToolCall(text) => text.clone(),
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+                ));
+            }
+            let spinner = SpinnerHandle::start("model");
             let reply = self.chat_stream(&prompt).await?;
+            spinner.stop("model response received");
+            transcript.push(UiEvent::AgentText(
+                summary.truncate_tool_output(&reply, 800),
+            ));
             println!("\n---\n{}", truncate(&reply, 240));
         }
         Ok(())

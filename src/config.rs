@@ -2,6 +2,9 @@ use std::path::PathBuf;
 
 use crate::policy::permissions::{ExecutionContext, PermissionMode};
 
+#[path = "config/model_profiles.rs"]
+pub mod model_profiles;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderKind {
     Ollama,
