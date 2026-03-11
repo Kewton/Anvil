@@ -1,4 +1,4 @@
-use anvil::state::summary::{SummaryController, SummaryInput, SummaryPolicy};
+use anvil::state::summary::{CarryoverState, SummaryController, SummaryInput, SummaryPolicy};
 
 #[test]
 fn summary_policy_table_driven_thresholds() {
@@ -56,6 +56,47 @@ fn summary_controller_truncates_large_output_and_produces_rolling_summary() {
     assert!(summary.len() < 800);
     assert!(truncated.len() <= 2_050);
     assert!(truncated.contains("truncated"));
+}
+
+#[test]
+fn summary_controller_estimates_tokens_and_builds_prompt_prefix() {
+    let controller = SummaryController::new(SummaryPolicy::default());
+    let history = vec![
+        "You requested a browser-runnable game".to_string(),
+        "Tool wrote ./sandbox/demo/index.html".to_string(),
+    ];
+    let summary = controller.summarize_for_carryover(None, &history);
+    let carryover = CarryoverState {
+        rolling_summary: Some(summary.clone()),
+        summarized_events: 12,
+    };
+
+    let estimated = controller.estimate_tokens(&history, Some(&summary));
+    let prefix = controller.prompt_prefix(&carryover).unwrap();
+
+    assert!(estimated > 0);
+    assert!(prefix.contains("Session carryover summary"));
+    assert!(prefix.contains("Summarized prior events: 12"));
+}
+
+#[test]
+fn compact_history_returns_summary_and_retains_recent_events() {
+    let controller = SummaryController::new(SummaryPolicy::default());
+    let history = (0..16)
+        .map(|idx| format!("event {idx} ./sandbox/file{idx}.html"))
+        .collect::<Vec<_>>();
+
+    let outcome = controller.compact_history(None, &history).unwrap();
+
+    assert!(outcome.rolling_summary.contains("Changed files"));
+    assert_eq!(
+        outcome.retained_events,
+        controller.policy().keep_recent_events
+    );
+    assert_eq!(
+        outcome.summarized_events,
+        16 - controller.policy().keep_recent_events
+    );
 }
 
 #[test]

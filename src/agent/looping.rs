@@ -56,7 +56,7 @@ pub struct LoopConfig {
 impl Default for LoopConfig {
     fn default() -> Self {
         Self {
-            max_steps: 12,
+            max_steps: 16,
             max_tool_output_chars: 1_200,
             max_schema_retries: 1,
             max_cached_reuses_per_call: 2,
@@ -92,6 +92,9 @@ pub enum LoopEvent {
     StepStarted {
         step: usize,
         purpose: String,
+        objective: String,
+        phase: String,
+        plan: Vec<String>,
     },
     ModelResponseReceived {
         bytes: usize,
@@ -195,9 +198,13 @@ impl LoopDriver {
         for step in 0..self.config.max_steps {
             let step_number = step + 1;
             let step_started_at = Instant::now();
+            let plan = step_plan(task, &turns);
             observer(LoopEvent::StepStarted {
                 step: step_number,
                 purpose: step_purpose(task, &turns),
+                objective: step_objective(task),
+                phase: plan.phase.clone(),
+                plan: plan.items,
             });
             let prompt = build_loop_prompt(task, &turns);
             let model_started_at = Instant::now();
@@ -518,8 +525,12 @@ where
 }
 
 fn task_requires_write_action(task: &str) -> bool {
+    extract_task_contract(task).requires_write
+}
+
+fn extract_task_contract(task: &str) -> TaskContract {
     let lower = task.to_lowercase();
-    let markers = [
+    let requires_write = [
         "create",
         "write",
         "save",
@@ -537,7 +548,32 @@ fn task_requires_write_action(task: &str) -> bool {
         "更新",
         "実装",
     ];
-    markers.iter().any(|marker| lower.contains(marker))
+    let browser_runnable = [
+        "browser",
+        "html",
+        "directly runnable",
+        "ブラウザ",
+        "直接実行可能",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
+    let must_review = task_requires_review(task);
+    let deliverable_kind = if browser_runnable || lower.contains("html") {
+        DeliverableKind::HtmlApp
+    } else if lower.contains("rust") || lower.contains(".rs") {
+        DeliverableKind::RustCode
+    } else {
+        DeliverableKind::GenericFile
+    };
+    TaskContract {
+        output_root: extract_path_like_tokens(task)
+            .into_iter()
+            .find(|path| path.components().count() > 1),
+        requires_write: requires_write.iter().any(|marker| lower.contains(marker)),
+        must_review,
+        browser_runnable,
+        deliverable_kind,
+    }
 }
 
 fn has_write_evidence(turns: &[ModelTurn]) -> bool {
@@ -647,7 +683,30 @@ enum CreatePhase {
     Prepare,
     Write,
     Verify,
+    Review,
     Finalize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StepPlan {
+    phase: String,
+    items: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeliverableKind {
+    HtmlApp,
+    RustCode,
+    GenericFile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TaskContract {
+    output_root: Option<PathBuf>,
+    requires_write: bool,
+    must_review: bool,
+    browser_runnable: bool,
+    deliverable_kind: DeliverableKind,
 }
 
 impl ToolCall {
@@ -809,7 +868,8 @@ fn contains_shell_metacharacters(command: &str) -> bool {
 }
 
 fn build_loop_prompt(task: &str, turns: &[ModelTurn]) -> String {
-    let expected_root = expected_output_root(task);
+    let contract = extract_task_contract(task);
+    let expected_root = contract.output_root.clone();
     let create_phase = create_phase_for_task(task, turns);
     let mut prompt = String::from(
         "You are Anvil. Solve the task by selecting tools when needed.\n\
@@ -859,16 +919,40 @@ Invalid or partial tool args are forbidden.\n\n",
         prompt.push_str(&expected_root.display().to_string());
         prompt.push_str("\n\n");
     }
-    if task_requires_write_action(task) {
+    if contract.requires_write {
         prompt.push_str("CREATE_PHASE\n");
         prompt.push_str(match create_phase {
             CreatePhase::Prepare => "prepare",
             CreatePhase::Write => "write",
             CreatePhase::Verify => "verify",
+            CreatePhase::Review => "review",
             CreatePhase::Finalize => "finalize",
         });
         prompt.push_str("\n\n");
     }
+    prompt.push_str("TASK_CONTRACT\n");
+    prompt.push_str(&format!(
+        "requires_write={}\nmust_review={}\nbrowser_runnable={}\ndeliverable_kind={}\n",
+        contract.requires_write,
+        contract.must_review,
+        contract.browser_runnable,
+        deliverable_kind_label(contract.deliverable_kind)
+    ));
+    if let Some(root) = &contract.output_root {
+        prompt.push_str(&format!("output_root={}\n", root.display()));
+    }
+    prompt.push('\n');
+    prompt.push_str("TASK_OBJECTIVE\n");
+    prompt.push_str(&step_objective(task));
+    prompt.push_str("\n\n");
+    let plan = step_plan(task, turns);
+    prompt.push_str("PLAN\n");
+    for item in plan.items {
+        prompt.push_str("- ");
+        prompt.push_str(&item);
+        prompt.push('\n');
+    }
+    prompt.push('\n');
     if let Some(hint) = completion_hint(task, turns) {
         prompt.push_str("COMPLETION_HINT\n");
         prompt.push_str(&hint);
@@ -1008,12 +1092,28 @@ fn compact_turns(turns: &[ModelTurn]) -> Vec<ModelTurn> {
 }
 
 fn completion_hint(task: &str, turns: &[ModelTurn]) -> Option<String> {
-    let expected_root = expected_output_root(task);
-    if task_requires_write_action(task) {
+    let contract = extract_task_contract(task);
+    let expected_root = contract.output_root.clone();
+    if contract.requires_write {
+        if let Some(unmet) = unmet_requirements(&contract, turns) {
+            return Some(unmet);
+        }
         match create_phase_for_task(task, turns) {
-            CreatePhase::Verify | CreatePhase::Finalize => {
+            CreatePhase::Review => {
                 return Some(
-                    "A write/edit has already succeeded. Prefer returning final with a concise summary of created or changed files unless another tool is strictly necessary."
+                    "Verification is complete. Read the generated file and perform the requested code review before returning final."
+                        .to_string(),
+                );
+            }
+            CreatePhase::Finalize => {
+                return Some(
+                    "The implementation work is complete. Return final with a concise summary of created or changed files and include the requested review findings if any."
+                        .to_string(),
+                );
+            }
+            CreatePhase::Verify => {
+                return Some(
+                    "A write/edit has already succeeded. Verify the generated output by reading the main deliverable file before returning final."
                         .to_string(),
                 );
             }
@@ -1055,6 +1155,7 @@ fn step_purpose(task: &str, turns: &[ModelTurn]) -> String {
             CreatePhase::Prepare => "prepare output path".to_string(),
             CreatePhase::Write => "write deliverable".to_string(),
             CreatePhase::Verify => "verify generated output".to_string(),
+            CreatePhase::Review => "review generated output".to_string(),
             CreatePhase::Finalize => "finalize response".to_string(),
         };
     }
@@ -1070,6 +1171,14 @@ fn step_purpose(task: &str, turns: &[ModelTurn]) -> String {
     }
 
     "gather context".to_string()
+}
+
+fn deliverable_kind_label(kind: DeliverableKind) -> &'static str {
+    match kind {
+        DeliverableKind::HtmlApp => "html_app",
+        DeliverableKind::RustCode => "rust_code",
+        DeliverableKind::GenericFile => "generic_file",
+    }
 }
 
 fn is_branch_inspection_task(task: &str) -> bool {
@@ -1132,10 +1241,14 @@ fn has_empty_directory_evidence(turns: &[ModelTurn]) -> bool {
 }
 
 fn create_phase_for_task(task: &str, turns: &[ModelTurn]) -> CreatePhase {
-    if !task_requires_write_action(task) {
+    let contract = extract_task_contract(task);
+    if !contract.requires_write {
         return CreatePhase::Finalize;
     }
     if has_write_evidence(turns) {
+        if contract.must_review && has_verification_evidence(turns) && !has_review_evidence(turns) {
+            return CreatePhase::Review;
+        }
         if has_verification_evidence(turns) {
             return CreatePhase::Finalize;
         }
@@ -1160,13 +1273,108 @@ fn has_verification_evidence(turns: &[ModelTurn]) -> bool {
     })
 }
 
-fn expected_output_root(task: &str) -> Option<PathBuf> {
-    if !task_requires_write_action(task) {
-        return None;
+fn has_review_evidence(turns: &[ModelTurn]) -> bool {
+    let write_index = turns.iter().position(|turn| {
+        matches!(
+            turn,
+            ModelTurn::ToolResult { tool, .. } if tool == "write_file" || tool == "edit_file"
+        )
+    });
+    let Some(write_index) = write_index else {
+        return false;
+    };
+
+    turns.iter().skip(write_index + 1).any(|turn| match turn {
+        ModelTurn::ToolResult { tool, output } if tool == "read_file" => !output.trim().is_empty(),
+        ModelTurn::ToolResult { tool, output } if tool == "diff" => !output.trim().is_empty(),
+        _ => false,
+    })
+}
+
+fn task_requires_review(task: &str) -> bool {
+    let lower = task.to_lowercase();
+    ["review", "code review", "レビュー", "コードレビュー"]
+        .iter()
+        .any(|needle| lower.contains(needle))
+}
+
+fn step_objective(task: &str) -> String {
+    truncate(task.trim(), 140)
+}
+
+fn step_plan(task: &str, turns: &[ModelTurn]) -> StepPlan {
+    let contract = extract_task_contract(task);
+    let phase = if contract.requires_write {
+        match create_phase_for_task(task, turns) {
+            CreatePhase::Prepare => "prepare".to_string(),
+            CreatePhase::Write => "write".to_string(),
+            CreatePhase::Verify => "verify".to_string(),
+            CreatePhase::Review => "review".to_string(),
+            CreatePhase::Finalize => "finalize".to_string(),
+        }
+    } else if is_branch_inspection_task(task) {
+        "inspect".to_string()
+    } else {
+        "gather".to_string()
+    };
+
+    let mut items = Vec::new();
+    items.push(format!("objective: {}", step_objective(task)));
+    if let Some(expected_root) = &contract.output_root {
+        items.push(format!("output root: {}", expected_root.display()));
     }
-    extract_path_like_tokens(task)
-        .into_iter()
-        .find(|path| path.components().count() > 1)
+    if contract.requires_write {
+        items.push("plan: prepare -> write -> verify".to_string());
+        items.push(format!(
+            "deliverable: {}",
+            deliverable_kind_label(contract.deliverable_kind)
+        ));
+        if contract.browser_runnable {
+            items.push("runtime: browser-runnable output required".to_string());
+        }
+        if contract.must_review {
+            items.push("review requested: include code review before final".to_string());
+            items.push("plan tail: review -> finalize".to_string());
+        } else {
+            items.push("plan tail: finalize".to_string());
+        }
+    }
+    if let Some(hint) = completion_hint(task, turns) {
+        items.push(format!("current guidance: {}", truncate(&hint, 160)));
+    }
+    StepPlan { phase, items }
+}
+
+fn unmet_requirements(contract: &TaskContract, turns: &[ModelTurn]) -> Option<String> {
+    if contract.requires_write && !has_write_evidence(turns) {
+        if let Some(root) = &contract.output_root {
+            return Some(format!(
+                "The task still requires a written deliverable under {}. Create the output there before returning final.",
+                root.display()
+            ));
+        }
+        return Some(
+            "The task still requires a written deliverable. Use write_file or edit_file before returning final."
+                .to_string(),
+        );
+    }
+    if contract.browser_runnable && !has_verification_evidence(turns) {
+        return Some(
+            "Browser-runnable output is requested but not yet verified. Read the generated HTML or entry file before returning final."
+                .to_string(),
+        );
+    }
+    if contract.must_review && !has_review_evidence(turns) {
+        return Some(
+            "A code review was requested and is still missing. Inspect the generated file and include review findings before returning final."
+                .to_string(),
+        );
+    }
+    None
+}
+
+fn expected_output_root(task: &str) -> Option<PathBuf> {
+    extract_task_contract(task).output_root
 }
 
 fn extract_path_like_tokens(task: &str) -> Vec<PathBuf> {

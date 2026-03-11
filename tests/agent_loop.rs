@@ -453,7 +453,7 @@ async fn create_task_prompt_includes_expected_root_and_phase() {
         .run(
             &model,
             dir.path(),
-            "ブラウザから直接実行可能なページを作成し、./sandbox/test31_011に出力してください",
+            "ブラウザから直接実行可能なページを作成し、./sandbox/test31_011に出力してください。コードレビューしてください。",
             Vec::<ModelTurn>::new(),
         )
         .await;
@@ -463,6 +463,10 @@ async fn create_task_prompt_includes_expected_root_and_phase() {
     assert!(prompts[0].contains("./sandbox/test31_011"));
     assert!(prompts[0].contains("CREATE_PHASE"));
     assert!(prompts[0].contains("prepare"));
+    assert!(prompts[0].contains("TASK_CONTRACT"));
+    assert!(prompts[0].contains("must_review=true"));
+    assert!(prompts[0].contains("browser_runnable=true"));
+    assert!(prompts[0].contains("deliverable_kind=html_app"));
     assert!(prompts[1].contains("write"));
 }
 
@@ -759,6 +763,44 @@ async fn observer_receives_raw_preview_and_validated_tool_events() {
 fn default_loop_config_allows_longer_generation_tasks() {
     let config = LoopConfig::default();
 
-    assert_eq!(config.max_steps, 12);
+    assert_eq!(config.max_steps, 16);
     assert_eq!(config.max_cached_reuses_per_call, 2);
+}
+
+#[tokio::test]
+async fn step_started_event_includes_phase_and_plan_context() {
+    let dir = tempdir().unwrap();
+    let model = ScriptedModel::new(vec![
+        r#"{"type":"tool_calls","calls":[{"tool":"mkdir","args":{"path":"./sandbox/demo"}}]}"#
+            .to_string(),
+        r#"{"type":"final","content":"done"}"#.to_string(),
+    ]);
+    let driver = LoopDriver::new(LoopConfig::default());
+    let events = Arc::new(Mutex::new(Vec::<LoopEvent>::new()));
+    let sink = Arc::clone(&events);
+
+    let _ = driver
+        .run_with_observer(
+            &model,
+            dir.path(),
+            "ブラウザから直接実行可能なゲームを ./sandbox/demo に出力してください。コードレビューしてください。",
+            Vec::<ModelTurn>::new(),
+            move |event| sink.lock().unwrap().push(event),
+        )
+        .await;
+
+    let events = events.lock().unwrap();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        LoopEvent::StepStarted {
+            purpose,
+            phase,
+            objective,
+            plan,
+            ..
+        } if purpose.contains("prepare")
+            && phase == "prepare"
+            && objective.contains("./sandbox/demo")
+            && plan.iter().any(|item| item.contains("review requested"))
+    )));
 }

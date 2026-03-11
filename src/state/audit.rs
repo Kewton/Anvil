@@ -89,6 +89,11 @@ pub enum AuditEventData {
     MemoryUpdated {
         summary: String,
     },
+    SessionCompacted {
+        summary: String,
+        summarized_events: usize,
+        retained_events: usize,
+    },
     SubagentStarted {
         subagent_id: String,
         task: String,

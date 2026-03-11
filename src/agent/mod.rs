@@ -24,7 +24,7 @@ use crate::state::audit::{
 };
 use crate::state::memory::MemoryStore;
 use crate::state::session::Session;
-use crate::state::summary::{SummaryController, SummaryInput, SummaryPolicy};
+use crate::state::summary::{CarryoverState, SummaryController, SummaryInput, SummaryPolicy};
 use crate::ui::interactive::{FooterState, InteractiveFrame, LineEditor, SpinnerHandle, UiEvent};
 use crate::ui::render::{render_banner, render_frame, render_result_block, render_startup_help};
 use anyhow::anyhow;
@@ -140,6 +140,33 @@ impl Agent {
 
         let memory = MemoryStore::new(self.config.cwd.join("ANVIL-MEMORY.md"));
         let registry = SlashRegistry::load(&self.config.cwd)?;
+        let session_path = self.config.state_dir.join("session.json");
+        let mut session = if session_path.exists() {
+            Session::load(&session_path).unwrap_or_else(|_| Session::new(&self.config.cwd))
+        } else {
+            Session::new(&self.config.cwd)
+        };
+        session.root = self.config.cwd.clone();
+        let audit = AuditLog::new(self.config.state_dir.join("audit.log.jsonl"));
+        if !session_path.exists() {
+            audit.append(&AuditEvent {
+                meta: AuditMetadata::new(
+                    &session.id,
+                    AuditActor::MainAgent,
+                    AuditSource::Interactive,
+                    &self.config.cwd,
+                ),
+                data: AuditEventData::SessionStarted {
+                    model: self.config.model.clone(),
+                    permission_mode: self.config.permission_mode,
+                },
+            })?;
+        }
+        session.save(&session_path)?;
+        let mut carryover = CarryoverState {
+            rolling_summary: session.rolling_summary.clone(),
+            summarized_events: session.summarized_events,
+        };
         let mut plan_state = PlanState::default();
         let profile = profile_for_model(&self.config.model);
         let summary = SummaryController::new(SummaryPolicy::default());
@@ -147,7 +174,21 @@ impl Agent {
         let loop_driver = LoopDriver::new(LoopConfig::default());
         let mut loop_turns = Vec::new();
         let mut line_editor = LineEditor::new()?;
+        if let Some(existing_summary) = carryover.rolling_summary.as_deref()
+            && !existing_summary.trim().is_empty()
+        {
+            transcript.push(UiEvent::AgentText(format!(
+                "🧠 Restored session summary ({})",
+                truncate(existing_summary, 120)
+            )));
+        }
         loop {
+            let transcript_strings = transcript
+                .iter()
+                .map(transcript_event_text)
+                .collect::<Vec<_>>();
+            let estimated_tokens =
+                summary.estimate_tokens(&transcript_strings, carryover.rolling_summary.as_deref());
             let frame = InteractiveFrame {
                 title: "Anvil".to_string(),
                 provider: format!("{:?}", self.config.provider).to_lowercase(),
@@ -157,11 +198,7 @@ impl Agent {
                 footer: FooterState {
                     mode: format!("{:?}", plan_state.mode).to_lowercase(),
                     pending_hint: "/memory show".to_string(),
-                    token_status: format!(
-                        "{}/{}",
-                        transcript.len() * 1200,
-                        profile.max_context_tokens
-                    ),
+                    token_status: format!("{estimated_tokens}/{}", profile.max_context_tokens),
                 },
             };
             println!("{}", render_frame(&frame));
@@ -187,27 +224,45 @@ impl Agent {
             let policy =
                 PermissionPolicy::from_mode(self.config.permission_mode, PermissionCategory::Read);
             println!("permission policy: {:?}", policy.base_requirement());
-            let prompt = if let Some(injection) = plan_state.injection() {
+            let mut prompt = if let Some(injection) = plan_state.injection() {
                 format!("{injection}\n\nUser task:\n{input}")
             } else {
                 input.to_string()
             };
             if summary.should_summarize(SummaryInput {
-                tokens: transcript.len() * 1200,
+                tokens: estimated_tokens,
                 turns: transcript.len() / 2,
-            }) {
-                transcript.push(UiEvent::AgentText(
-                    summary.summarize_history(
-                        &transcript
-                            .iter()
-                            .map(|event| match event {
-                                UiEvent::UserInput(text)
-                                | UiEvent::AgentText(text)
-                                | UiEvent::ToolCall(text) => text.clone(),
-                            })
-                            .collect::<Vec<_>>(),
+            }) && let Some(outcome) =
+                summary.compact_history(carryover.rolling_summary.as_deref(), &transcript_strings)
+            {
+                carryover.rolling_summary = Some(outcome.rolling_summary.clone());
+                carryover.summarized_events += outcome.summarized_events;
+                prune_transcript(&mut transcript, outcome.retained_events);
+                transcript.push(UiEvent::AgentText(format!(
+                    "🧠 Context compacted: summarized {} prior events",
+                    outcome.summarized_events
+                )));
+                session.update_summary(
+                    carryover.rolling_summary.clone(),
+                    carryover.summarized_events,
+                );
+                session.save(&session_path)?;
+                audit.append(&AuditEvent {
+                    meta: AuditMetadata::new(
+                        &session.id,
+                        AuditActor::System,
+                        AuditSource::Interactive,
+                        &self.config.cwd,
                     ),
-                ));
+                    data: AuditEventData::SessionCompacted {
+                        summary: outcome.rolling_summary,
+                        summarized_events: outcome.summarized_events,
+                        retained_events: outcome.retained_events,
+                    },
+                })?;
+            }
+            if let Some(prefix) = summary.prompt_prefix(&carryover) {
+                prompt = format!("{prefix}\n{prompt}");
             }
             let spinner = SpinnerHandle::start("model");
             let reply = loop_driver
@@ -225,6 +280,11 @@ impl Agent {
             transcript.push(UiEvent::AgentText(
                 summary.truncate_tool_output(&reply.final_text, 800),
             ));
+            session.update_summary(
+                carryover.rolling_summary.clone(),
+                carryover.summarized_events,
+            );
+            session.save(&session_path)?;
             let result_details = collect_result_details(&reply.final_text, &self.config.cwd);
             println!(
                 "\n{}",
@@ -297,6 +357,22 @@ impl Agent {
     }
 }
 
+fn prune_transcript(transcript: &mut Vec<UiEvent>, retained_events: usize) {
+    if transcript.len() <= retained_events {
+        return;
+    }
+    let start = transcript.len() - retained_events;
+    transcript.drain(..start);
+}
+
+fn transcript_event_text(event: &UiEvent) -> String {
+    match event {
+        UiEvent::UserInput(text) => format!("User: {text}"),
+        UiEvent::AgentText(text) => format!("Agent: {text}"),
+        UiEvent::ToolCall(text) => format!("Tool: {text}"),
+    }
+}
+
 fn collect_result_details(text: &str, cwd: &Path) -> Vec<String> {
     let mut details = Vec::new();
     for token in text.split_whitespace() {
@@ -329,8 +405,19 @@ fn collect_result_details(text: &str, cwd: &Path) -> Vec<String> {
 
 fn print_loop_event(event: &LoopEvent) {
     match event {
-        LoopEvent::StepStarted { step, purpose } => {
-            println!("\n▶ Agent Step {step}: {purpose}")
+        LoopEvent::StepStarted {
+            step,
+            purpose,
+            objective,
+            phase,
+            plan,
+        } => {
+            println!("\n▶ Agent Step {step}: {purpose}");
+            println!("  🧭 Phase: {phase}");
+            println!("  🎯 Objective: {}", truncate(objective, 140));
+            for item in plan.iter().take(4) {
+                println!("  📋 {item}");
+            }
         }
         LoopEvent::ModelResponseReceived { bytes, elapsed_ms } => {
             println!("  ◦ Model chunk ({bytes} bytes, {elapsed_ms} ms)")

@@ -7,6 +7,10 @@ use uuid::Uuid;
 pub struct Session {
     pub id: String,
     pub root: PathBuf,
+    #[serde(default)]
+    pub rolling_summary: Option<String>,
+    #[serde(default)]
+    pub summarized_events: usize,
 }
 
 impl Session {
@@ -14,7 +18,14 @@ impl Session {
         Self {
             id: format!("sess_{}", Uuid::new_v4().simple()),
             root: root.into(),
+            rolling_summary: None,
+            summarized_events: 0,
         }
+    }
+
+    pub fn update_summary(&mut self, summary: Option<String>, summarized_events: usize) {
+        self.rolling_summary = summary;
+        self.summarized_events = summarized_events;
     }
 
     pub fn save(&self, path: &std::path::Path) -> anyhow::Result<()> {
