@@ -190,34 +190,34 @@ TDD の観点:
 
 目的:
 
-- [ ] コンテキスト圧縮の高度化
-- [ ] Claude Code ライク UI の強化
-- [ ] footer UI
-- [ ] type-ahead
-- [ ] rich diff
-- [ ] モデル選択補助
+- [x] コンテキスト圧縮の高度化
+- [x] Claude Code ライク UI の強化
+- [x] footer UI
+- [x] type-ahead
+- [x] rich diff
+- [x] モデル選択補助
 
 先に書くテスト:
 
-- [ ] summary 発火条件の表駆動テスト
-- [ ] token budget 超過時の圧縮テスト
-- [ ] 大きい tool output truncate テスト
-- [ ] renderer snapshot test
-- [ ] UI event sequence test
-- [ ] TTY 非依存 renderer contract test
-- [ ] file change detection method の回帰テスト
-- [ ] audit log volume / rotation の性能テスト
-- [ ] summary latency budget テスト
-- [ ] subagent 起動時の latency budget テスト
+- [x] summary 発火条件の表駆動テスト
+- [x] token budget 超過時の圧縮テスト
+- [x] 大きい tool output truncate テスト
+- [x] renderer snapshot test
+- [x] UI event sequence test
+- [x] TTY 非依存 renderer contract test
+- [x] file change detection method の回帰テスト
+- [x] audit log volume / rotation の性能テスト
+- [x] summary latency budget テスト
+- [x] subagent 起動時の latency budget テスト
 
 実装:
 
-- [ ] `src/state/summary.rs`
-- [ ] `src/ui/interactive.rs`
-- [ ] `src/ui/render.rs`
-- [ ] `src/config/model_profiles.rs`
-- [ ] `src/policy/change_detection.rs`
-- [ ] `src/state/artifacts.rs`
+- [x] `src/state/summary.rs`
+- [x] `src/ui/interactive.rs`
+- [x] `src/ui/render.rs`
+- [x] `src/config/model_profiles.rs`
+- [x] `src/policy/change_detection.rs`
+- [x] `src/state/artifacts.rs`
 
 TDD の観点:
 
@@ -226,11 +226,11 @@ TDD の観点:
 
 完了条件:
 
-- [ ] 長時間セッションでも劣化が抑えられる
-- [ ] UI が Claude Code に近い操作感を持つ
-- [ ] token budget 制御が機能する
-- [ ] change detection が大規模リポジトリでも過負荷にならない
-- [ ] summary / subagent / audit log の性能予算が守られる
+- [x] 長時間セッションでも劣化が抑えられる
+- [x] UI が Claude Code に近い操作感を持つ
+- [x] token budget 制御が機能する
+- [x] change detection が大規模リポジトリでも過負荷にならない
+- [x] summary / subagent / audit log の性能予算が守られる
 
 ## Phase 4: 拡張フェーズ
 
@@ -263,6 +263,46 @@ TDD の観点:
 - [ ] 拡張機能が core を壊さずに追加できる
 - [ ] 監査と権限モデルが維持される
 - [ ] 新 provider / tool 追加時に conformance test を通せる
+
+## Phase 3.1: Agent Loop 強化
+
+目的:
+
+- [ ] Claude Code / vibe-local 的な核心である、モデル主導のツール実行ループを完成させる
+- [ ] ルール追加ではなく、tool-calling 中心の agent loop を強化する
+- [ ] 自然言語の依頼から必要なコンテキスト収集をモデル主導で完走できるようにする
+
+先に書くテスト:
+
+- [ ] 自然言語タスクから `Read` / `Exec` / `Diff` を段階実行する統合テスト
+- [ ] `git branch` / `git status` / `git log` / `git diff` を用いたブランチ説明タスクの統合テスト
+- [ ] モデルが追加情報不足時に適切なツール呼び出しへ進む回帰テスト
+- [ ] 同一ツール・同一引数の無限反復を停止するループ防止テスト
+- [ ] tool result を踏まえた再推論で最終回答へ収束するテスト
+- [ ] tool call schema validation と fail-closed の統合テスト
+
+実装:
+
+- [ ] `src/agent/mod.rs` を単発プロンプト実行から multi-step tool loop へ拡張
+- [ ] モデル出力から tool call を抽出する parser / validator を追加
+- [ ] `Read` / `Write` / `Edit` / `Exec` / `Diff` / `Search` / `Glob` を agent loop に接続
+- [ ] tool 実行結果を履歴へ圧縮注入する state 更新を追加
+- [ ] 反復上限、重複呼び出し検出、失敗時の別手段誘導を追加
+- [ ] ブランチ説明のような Git 文脈タスクを一般 tool loop で解けることを確認
+
+TDD の観点:
+
+- まず tool call parser と validation を固定する
+- 次に 2-step / 3-step の最小 loop を統合テストで通す
+- その後 Git を含む実タスクへ広げる
+- 個別ルールではなく、モデルがツールを選んで完走できる形を優先する
+
+完了条件:
+
+- [ ] モデルが必要に応じてツールを自律選択して回答に必要な文脈を集められる
+- [ ] `このブランチを解説して` のような依頼をルール追加なしで処理できる
+- [ ] tool loop が fail-closed と権限モデルを維持したまま安定動作する
+- [ ] Claude Code / vibe-local に近い「調べてから答える」挙動を再現できる
 
 ## TDD の運用ルール
 
