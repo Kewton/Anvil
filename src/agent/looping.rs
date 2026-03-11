@@ -92,9 +92,12 @@ pub enum LoopEvent {
     StepStarted {
         step: usize,
         purpose: String,
-        objective: String,
+        brief: String,
         phase: String,
         plan: Vec<String>,
+        workflow: Vec<String>,
+        phase_index: usize,
+        phase_total: usize,
     },
     ModelResponseReceived {
         bytes: usize,
@@ -202,9 +205,12 @@ impl LoopDriver {
             observer(LoopEvent::StepStarted {
                 step: step_number,
                 purpose: step_purpose(task, &turns),
-                objective: step_objective(task),
+                brief: step_instruction(task, &turns),
                 phase: plan.phase.clone(),
                 plan: plan.items,
+                workflow: plan.workflow,
+                phase_index: plan.phase_index,
+                phase_total: plan.phase_total,
             });
             let prompt = build_loop_prompt(task, &turns);
             let model_started_at = Instant::now();
@@ -691,6 +697,9 @@ enum CreatePhase {
 struct StepPlan {
     phase: String,
     items: Vec<String>,
+    workflow: Vec<String>,
+    phase_index: usize,
+    phase_total: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1302,29 +1311,74 @@ fn step_objective(task: &str) -> String {
     truncate(task.trim(), 140)
 }
 
+fn step_instruction(task: &str, turns: &[ModelTurn]) -> String {
+    let contract = extract_task_contract(task);
+    match create_phase_for_task(task, turns) {
+        CreatePhase::Prepare => {
+            if let Some(root) = &contract.output_root {
+                format!("Prepare the requested output location at {}", root.display())
+            } else {
+                "Prepare the output location and required inputs".to_string()
+            }
+        }
+        CreatePhase::Write => match contract.deliverable_kind {
+            DeliverableKind::HtmlApp => {
+                "Write the browser-runnable HTML deliverable with the requested game implementation"
+                    .to_string()
+            }
+            DeliverableKind::RustCode => {
+                "Write the requested Rust deliverable and keep it buildable".to_string()
+            }
+            DeliverableKind::GenericFile => {
+                "Write the requested deliverable to the target location".to_string()
+            }
+        },
+        CreatePhase::Verify => {
+            "Verify the generated output by reading the main deliverable and checking key requirements"
+                .to_string()
+        }
+        CreatePhase::Review => {
+            "Review the generated code and prepare review findings before finalizing".to_string()
+        }
+        CreatePhase::Finalize => {
+            "Summarize the result, changed files, and any review findings for the final answer"
+                .to_string()
+        }
+    }
+}
+
 fn step_plan(task: &str, turns: &[ModelTurn]) -> StepPlan {
     let contract = extract_task_contract(task);
+    let workflow = build_workflow(&contract);
     let phase = if contract.requires_write {
-        match create_phase_for_task(task, turns) {
-            CreatePhase::Prepare => "prepare".to_string(),
-            CreatePhase::Write => "write".to_string(),
-            CreatePhase::Verify => "verify".to_string(),
-            CreatePhase::Review => "review".to_string(),
-            CreatePhase::Finalize => "finalize".to_string(),
-        }
+        workflow
+            .get(phase_position(
+                &contract,
+                create_phase_for_task(task, turns),
+            ))
+            .cloned()
+            .unwrap_or_else(|| "finalize".to_string())
     } else if is_branch_inspection_task(task) {
         "inspect".to_string()
     } else {
         "gather".to_string()
     };
+    let phase_index = if contract.requires_write {
+        phase_position(&contract, create_phase_for_task(task, turns)) + 1
+    } else {
+        1
+    };
+    let phase_total = if contract.requires_write {
+        workflow.len()
+    } else {
+        1
+    };
 
     let mut items = Vec::new();
-    items.push(format!("objective: {}", step_objective(task)));
     if let Some(expected_root) = &contract.output_root {
         items.push(format!("output root: {}", expected_root.display()));
     }
     if contract.requires_write {
-        items.push("plan: prepare -> write -> verify".to_string());
         items.push(format!(
             "deliverable: {}",
             deliverable_kind_label(contract.deliverable_kind)
@@ -1334,15 +1388,56 @@ fn step_plan(task: &str, turns: &[ModelTurn]) -> StepPlan {
         }
         if contract.must_review {
             items.push("review requested: include code review before final".to_string());
-            items.push("plan tail: review -> finalize".to_string());
-        } else {
-            items.push("plan tail: finalize".to_string());
         }
     }
     if let Some(hint) = completion_hint(task, turns) {
         items.push(format!("current guidance: {}", truncate(&hint, 160)));
     }
-    StepPlan { phase, items }
+    StepPlan {
+        phase,
+        items,
+        workflow,
+        phase_index,
+        phase_total,
+    }
+}
+
+fn build_workflow(contract: &TaskContract) -> Vec<String> {
+    if !contract.requires_write {
+        return vec!["gather".to_string()];
+    }
+    let mut workflow = vec![
+        "prepare".to_string(),
+        "write".to_string(),
+        "verify".to_string(),
+    ];
+    if contract.must_review {
+        workflow.push("review".to_string());
+    }
+    workflow.push("finalize".to_string());
+    workflow
+}
+
+fn phase_position(contract: &TaskContract, phase: CreatePhase) -> usize {
+    match phase {
+        CreatePhase::Prepare => 0,
+        CreatePhase::Write => 1,
+        CreatePhase::Verify => 2,
+        CreatePhase::Review => {
+            if contract.must_review {
+                3
+            } else {
+                2
+            }
+        }
+        CreatePhase::Finalize => {
+            if contract.must_review {
+                4
+            } else {
+                3
+            }
+        }
+    }
 }
 
 fn unmet_requirements(contract: &TaskContract, turns: &[ModelTurn]) -> Option<String> {

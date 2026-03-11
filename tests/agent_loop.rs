@@ -795,12 +795,18 @@ async fn step_started_event_includes_phase_and_plan_context() {
         LoopEvent::StepStarted {
             purpose,
             phase,
-            objective,
+            brief,
             plan,
+            workflow,
+            phase_index,
+            phase_total,
             ..
         } if purpose.contains("prepare")
             && phase == "prepare"
-            && objective.contains("./sandbox/demo")
+            && brief.contains("output location")
             && plan.iter().any(|item| item.contains("review requested"))
+            && workflow.iter().any(|item| item == "review")
+            && *phase_index == 1
+            && *phase_total == 5
     )));
 }

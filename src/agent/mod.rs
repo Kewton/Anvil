@@ -365,6 +365,22 @@ fn prune_transcript(transcript: &mut Vec<UiEvent>, retained_events: usize) {
     transcript.drain(..start);
 }
 
+fn render_workflow(workflow: &[String], current_index: usize) -> String {
+    workflow
+        .iter()
+        .enumerate()
+        .map(|(idx, phase)| {
+            let position = idx + 1;
+            if position == current_index {
+                format!("[{position}:{phase}]")
+            } else {
+                format!("{position}:{phase}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" -> ")
+}
+
 fn transcript_event_text(event: &UiEvent) -> String {
     match event {
         UiEvent::UserInput(text) => format!("User: {text}"),
@@ -408,13 +424,20 @@ fn print_loop_event(event: &LoopEvent) {
         LoopEvent::StepStarted {
             step,
             purpose,
-            objective,
+            brief,
             phase,
             plan,
+            workflow,
+            phase_index,
+            phase_total,
         } => {
             println!("\n▶ Agent Step {step}: {purpose}");
-            println!("  🧭 Phase: {phase}");
-            println!("  🎯 Objective: {}", truncate(objective, 140));
+            println!(
+                "  🧭 Workflow {phase_index}/{phase_total}: {}",
+                render_workflow(workflow, *phase_index)
+            );
+            println!("  📝 Agent brief: {}", truncate(brief, 160));
+            println!("  📍 Current phase: {phase}");
             for item in plan.iter().take(4) {
                 println!("  📋 {item}");
             }
