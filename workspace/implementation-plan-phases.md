@@ -473,34 +473,44 @@ TDD の観点:
 
 目的:
 
+- [ ] Phase 3.6 の対象を create task に限定し、requirement 数を 5 個前後に抑える
 - [ ] create task を phase 名中心ではなく `Requirement Set` 中心で制御する
-- [ ] 各 tool result が requirement をどれだけ前進させたかを `Evidence` として評価する
+- [ ] 各 tool result を `tool / path / output_root match / result shape / main deliverable` を含む `Evidence` として評価する
 - [ ] stalled verification / stalled inspection を固定禁止ルールではなく progress 判定で止める
 - [ ] task type と progress に応じた adaptive upper bound を本格化する
+- [ ] `finalize` を actual final text 生成ではなく「final を返してよい内部状態」として扱う
 
 先に書くテスト:
 
 - [ ] `output_root_exists / deliverable_written / browser_entry_verified / review_completed` を requirement として抽出する test
 - [ ] `mkdir`, `write_file`, `read_file`, `path_exists` が requirement 充足へ変換される evidence test
+- [ ] evidence evaluator が `path`, `output_root match`, `main deliverable`, `non-empty result` を見て判定する test
 - [ ] verify phase で `list_dir` を繰り返しても progress 0 と判定される test
+- [ ] `progress class` (`new_requirement_satisfied`, `requirement_strengthened`, `no_requirement_change`) を返す test
 - [ ] 進捗が出た create task は loop budget が延長される test
 - [ ] stalled create task は loop budget が早めに打ち切られる test
 - [ ] 複数の valid tool sequence を許容しつつ、同じ requirement set を満たせる integration test
+- [ ] `remaining requirements`, `progress class`, `stall count` が UI / audit に出る test
 
 実装:
 
 - [ ] create task 用 `RequirementSet` 型を追加する
+- [ ] 将来の inspect 系拡張を見据え、`CreateRequirement` と他 taxonomy を分離可能な形で定義する
 - [ ] tool result を `Evidence` へ正規化する evaluator を追加する
-- [ ] `remaining requirements` と `progress score` を loop state に持たせる
+- [ ] `remaining requirements` と `progress class` を loop state に持たせ、必要なら補助的に score を併用する
 - [ ] adaptive upper bound を `base budget + progress extension - stall penalty` で管理する
 - [ ] `completion hint` を unmet requirement と low-progress から生成する
-- [ ] UI に `remaining requirements` と `this step progress` を表示する
+- [ ] UI に `remaining requirements`, `this step progress`, `stall count`, `remaining budget` を表示する
+- [ ] audit / debug trace に `requirements_before`, `evidence_gained`, `requirements_after`, `progress_class` を出す
 - [ ] verify / review / finalize の遷移を phase 固定ではなく requirement 充足ベースへ寄せる
+- [ ] `finalize` は `final_summary_ready` のような内部 readiness と actual final text 生成を分離する
+- [ ] 既存の repeat detector を fail-safe として維持する
+- [ ] requirement/evidence state を compaction / persistence 対象に含め、Phase 3.5 の carryover と接続する
 
 TDD の観点:
 
-- まず requirement extraction と evidence mapping を unit test で赤にする
-- 次に progress score と adaptive budget を table-driven test で固定する
+- まず create task 限定の requirement extraction と evidence mapping を unit test で赤にする
+- 次に `progress class` と adaptive budget を table-driven test で固定する
 - その後 create task の integration test で複数経路を許容できることを確認する
 - 最後に `qwen3.5:35b` 実機で stalled verification が減ることを確認する
 
@@ -510,6 +520,7 @@ TDD の観点:
 - [ ] create task が複数の tool sequence を取りつつ、同じ requirement set に収束できる
 - [ ] progress がある task は完走しやすく、progress のない task は無駄に長引かない
 - [ ] verify / review / finalize の遷移が requirement/evidence ベースで説明可能になる
+- [ ] UI と audit から「なぜ stalled / finalize / continue と判断したか」を追跡できる
 
 ## Phase 4: 拡張フェーズ
 
