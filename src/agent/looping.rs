@@ -431,7 +431,12 @@ impl LoopDriver {
                                     tool: validated.tool_name().to_string(),
                                     preview: truncate(&cached_output.replace('\n', "\\n"), 220),
                                 });
-                                requirement_state.record_no_progress();
+                                requirement_state.record_evidence(
+                                    task,
+                                    &validated,
+                                    cached_output,
+                                    phase,
+                                );
                                 turns.push(ModelTurn::ToolResult {
                                     tool: validated.tool_name().to_string(),
                                     output: cached_output.clone(),
@@ -1083,7 +1088,9 @@ fn evaluate_evidence(
                 && !result.trim().is_empty()
                 && matches_main_deliverable(contract, &args.path)
             {
-                if contract.must_review && phase == CreatePhase::Review {
+                if contract.must_review
+                    && matches!(phase, CreatePhase::Review | CreatePhase::Finalize)
+                {
                     return EvidenceResult::Advanced(CreateRequirement::ReviewCompleted);
                 }
                 return EvidenceResult::Advanced(CreateRequirement::DeliverableVerified);

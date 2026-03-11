@@ -922,3 +922,39 @@ async fn progress_extends_budget_for_generation_tasks() {
     assert!(budgets.len() >= 3);
     assert!(budgets[1] >= budgets[0].saturating_sub(1));
 }
+
+#[tokio::test]
+async fn finalize_can_complete_review_requirement_from_reused_main_deliverable_read() {
+    let dir = tempdir().unwrap();
+    let model = ScriptedModel::new(vec![
+        r#"{"type":"tool_calls","calls":[{"tool":"mkdir","args":{"path":"./sandbox/demo"}}]}"#
+            .to_string(),
+        r#"{"type":"tool_calls","calls":[{"tool":"write_file","args":{"path":"./sandbox/demo/space_invaders.html","content":"<html>ok</html>"}}]}"#
+            .to_string(),
+        r#"{"type":"tool_calls","calls":[{"tool":"read_file","args":{"path":"./sandbox/demo/space_invaders.html"}}]}"#
+            .to_string(),
+        r#"{"type":"tool_calls","calls":[{"tool":"read_file","args":{"path":"./sandbox/demo/space_invaders.html"}}]}"#
+            .to_string(),
+        r#"{"type":"final","content":"done with review"}"#.to_string(),
+    ]);
+    let driver = LoopDriver::new(LoopConfig::default());
+
+    let out = driver
+        .run(
+            &model,
+            dir.path(),
+            "ブラウザから直接実行可能ないけてるゲームを ./sandbox/demo に出力してください。コードレビューしてください。",
+            Vec::<ModelTurn>::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(out.final_text, "done with review");
+    let prompts = model.prompts();
+    assert!(
+        prompts
+            .iter()
+            .any(|prompt| prompt.contains("review_completed"))
+    );
+    assert!(prompts.last().unwrap().contains("COMPLETION_HINT"));
+}
