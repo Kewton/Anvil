@@ -1313,37 +1313,40 @@ fn step_objective(task: &str) -> String {
 
 fn step_instruction(task: &str, turns: &[ModelTurn]) -> String {
     let contract = extract_task_contract(task);
+    let output_root = contract
+        .output_root
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "(not specified)".to_string());
+    let review_note = if contract.must_review {
+        " Include a code review before finalizing."
+    } else {
+        ""
+    };
     match create_phase_for_task(task, turns) {
-        CreatePhase::Prepare => {
-            if let Some(root) = &contract.output_root {
-                format!("Prepare the requested output location at {}", root.display())
-            } else {
-                "Prepare the output location and required inputs".to_string()
-            }
-        }
+        CreatePhase::Prepare => format!(
+            "Prepare the requested output location at {output_root}. Do not write outside that root. After preparation, move to implementation.{review_note}"
+        ),
         CreatePhase::Write => match contract.deliverable_kind {
-            DeliverableKind::HtmlApp => {
-                "Write the browser-runnable HTML deliverable with the requested game implementation"
-                    .to_string()
-            }
-            DeliverableKind::RustCode => {
-                "Write the requested Rust deliverable and keep it buildable".to_string()
-            }
-            DeliverableKind::GenericFile => {
-                "Write the requested deliverable to the target location".to_string()
-            }
+            DeliverableKind::HtmlApp => format!(
+                "Create the main browser-runnable HTML deliverable under {output_root}. Implement the requested game behavior from the task, keep it directly runnable in a browser, and prefer a complete playable result over placeholders.{review_note}"
+            ),
+            DeliverableKind::RustCode => format!(
+                "Write the requested Rust deliverable under {output_root}. Keep the code buildable and aligned with the task requirements.{review_note}"
+            ),
+            DeliverableKind::GenericFile => format!(
+                "Write the requested deliverable to {output_root}. Satisfy the task requirements and keep the output self-contained.{review_note}"
+            ),
         },
-        CreatePhase::Verify => {
-            "Verify the generated output by reading the main deliverable and checking key requirements"
-                .to_string()
-        }
-        CreatePhase::Review => {
-            "Review the generated code and prepare review findings before finalizing".to_string()
-        }
-        CreatePhase::Finalize => {
-            "Summarize the result, changed files, and any review findings for the final answer"
-                .to_string()
-        }
+        CreatePhase::Verify => format!(
+            "Verify the generated output under {output_root}. Read the main deliverable, confirm the key task requirements are present, and identify anything still missing.{review_note}"
+        ),
+        CreatePhase::Review => format!(
+            "Perform the requested code review for the generated output under {output_root}. Note concrete findings, risks, and obvious regressions before finalizing."
+        ),
+        CreatePhase::Finalize => format!(
+            "Prepare the final response for the work under {output_root}. Summarize created files, implementation status, and include review findings if requested."
+        ),
     }
 }
 
