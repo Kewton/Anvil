@@ -430,6 +430,10 @@ fn print_loop_event(event: &LoopEvent) {
             workflow,
             phase_index,
             phase_total,
+            remaining_requirements,
+            progress_class,
+            stall_count,
+            remaining_budget,
         } => {
             println!("\n▶ Agent Step {step}: {purpose}");
             println!(
@@ -438,6 +442,15 @@ fn print_loop_event(event: &LoopEvent) {
             );
             println!("  📝 Agent brief: {}", truncate(brief, 160));
             println!("  📍 Current phase: {phase}");
+            println!("  📈 Progress: {progress_class}");
+            println!("  ⏱ Remaining budget: {remaining_budget} steps");
+            println!("  🧱 Stall count: {stall_count}");
+            if !remaining_requirements.is_empty() {
+                println!(
+                    "  ✅ Remaining requirements: {}",
+                    remaining_requirements.join(", ")
+                );
+            }
             for item in plan.iter().take(4) {
                 println!("  📋 {item}");
             }

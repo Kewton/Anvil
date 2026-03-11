@@ -48,6 +48,9 @@ pub enum ModelTurn {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LoopConfig {
     pub max_steps: usize,
+    pub create_task_base_budget: usize,
+    pub inspect_task_base_budget: usize,
+    pub finalize_phase_budget: usize,
     pub max_tool_output_chars: usize,
     pub max_schema_retries: usize,
     pub max_cached_reuses_per_call: usize,
@@ -56,7 +59,10 @@ pub struct LoopConfig {
 impl Default for LoopConfig {
     fn default() -> Self {
         Self {
-            max_steps: 16,
+            max_steps: 24,
+            create_task_base_budget: 14,
+            inspect_task_base_budget: 8,
+            finalize_phase_budget: 3,
             max_tool_output_chars: 1_200,
             max_schema_retries: 1,
             max_cached_reuses_per_call: 2,
@@ -98,6 +104,10 @@ pub enum LoopEvent {
         workflow: Vec<String>,
         phase_index: usize,
         phase_total: usize,
+        remaining_requirements: Vec<String>,
+        progress_class: String,
+        stall_count: usize,
+        remaining_budget: usize,
     },
     ModelResponseReceived {
         bytes: usize,
@@ -197,11 +207,17 @@ impl LoopDriver {
         let mut tool_exec_retry_state: Option<(String, usize)> = None;
         let task_requires_write = task_requires_write_action(task);
         let expected_output_root = expected_output_root(task);
+        let mut requirement_state = RequirementState::new(task, self.config);
 
         for step in 0..self.config.max_steps {
+            if requirement_state.should_stop(step) {
+                return Err(LoopError::MaxStepsReached);
+            }
             let step_number = step + 1;
             let step_started_at = Instant::now();
             let plan = step_plan(task, &turns);
+            let phase = create_phase_for_task(task, &turns);
+            requirement_state.note_phase(step_number, phase);
             observer(LoopEvent::StepStarted {
                 step: step_number,
                 purpose: step_purpose(task, &turns),
@@ -211,8 +227,12 @@ impl LoopDriver {
                 workflow: plan.workflow,
                 phase_index: plan.phase_index,
                 phase_total: plan.phase_total,
+                remaining_requirements: requirement_state.remaining_labels(),
+                progress_class: requirement_state.last_progress_label().to_string(),
+                stall_count: requirement_state.stall_count,
+                remaining_budget: requirement_state.remaining_budget(step_number),
             });
-            let prompt = build_loop_prompt(task, &turns);
+            let prompt = build_loop_prompt(task, &turns, &requirement_state);
             let model_started_at = Instant::now();
             let response = match model.complete_with_tools(&prompt, &tool_specs()).await? {
                 Some(native) => {
@@ -411,6 +431,7 @@ impl LoopDriver {
                                     tool: validated.tool_name().to_string(),
                                     preview: truncate(&cached_output.replace('\n', "\\n"), 220),
                                 });
+                                requirement_state.record_no_progress();
                                 turns.push(ModelTurn::ToolResult {
                                     tool: validated.tool_name().to_string(),
                                     output: cached_output.clone(),
@@ -473,6 +494,7 @@ impl LoopDriver {
                             tool: validated.tool_name().to_string(),
                             preview: truncate(&result.replace('\n', "\\n"), 220),
                         });
+                        requirement_state.record_evidence(task, &validated, &result, phase);
                         if can_reuse_cached_result(&validated) && !result.trim().is_empty() {
                             cached_results.insert(normalized, (result.clone(), 0));
                         }
@@ -718,6 +740,152 @@ struct TaskContract {
     deliverable_kind: DeliverableKind,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum CreateRequirement {
+    OutputRootExists,
+    DeliverableWritten,
+    DeliverableVerified,
+    ReviewCompleted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProgressClass {
+    None,
+    Reinforcing,
+    Advanced,
+    Completed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EvidenceResult {
+    None,
+    Reinforcing,
+    Advanced(CreateRequirement),
+}
+
+#[derive(Debug, Clone)]
+struct RequirementState {
+    create_task: bool,
+    remaining: BTreeSet<CreateRequirement>,
+    last_progress: ProgressClass,
+    stall_count: usize,
+    effective_budget: usize,
+    hard_cap: usize,
+    finalize_phase_budget: usize,
+    finalize_started_step: Option<usize>,
+}
+
+impl RequirementState {
+    fn new(task: &str, config: LoopConfig) -> Self {
+        let contract = extract_task_contract(task);
+        let mut remaining = BTreeSet::new();
+        let effective_budget = if contract.requires_write {
+            remaining.insert(CreateRequirement::OutputRootExists);
+            remaining.insert(CreateRequirement::DeliverableWritten);
+            remaining.insert(CreateRequirement::DeliverableVerified);
+            if contract.must_review {
+                remaining.insert(CreateRequirement::ReviewCompleted);
+            }
+            config.create_task_base_budget
+        } else {
+            config.inspect_task_base_budget
+        };
+        Self {
+            create_task: contract.requires_write,
+            remaining,
+            last_progress: ProgressClass::None,
+            stall_count: 0,
+            effective_budget,
+            hard_cap: config.max_steps,
+            finalize_phase_budget: config.finalize_phase_budget,
+            finalize_started_step: None,
+        }
+    }
+
+    fn note_phase(&mut self, step_number: usize, phase: CreatePhase) {
+        if !self.create_task {
+            self.finalize_started_step = None;
+            return;
+        }
+        if phase == CreatePhase::Finalize {
+            self.finalize_started_step
+                .get_or_insert(step_number.saturating_sub(1));
+        } else {
+            self.finalize_started_step = None;
+        }
+    }
+
+    fn remaining_labels(&self) -> Vec<String> {
+        self.remaining
+            .iter()
+            .map(|requirement| requirement_label(*requirement).to_string())
+            .collect()
+    }
+
+    fn last_progress_label(&self) -> &'static str {
+        match self.last_progress {
+            ProgressClass::None => "no_progress",
+            ProgressClass::Reinforcing => "reinforcing",
+            ProgressClass::Advanced => "advanced",
+            ProgressClass::Completed => "completed",
+        }
+    }
+
+    fn remaining_budget(&self, step_number: usize) -> usize {
+        let global_remaining = self
+            .effective_budget
+            .saturating_sub(step_number.saturating_sub(1));
+        let finalize_remaining = self
+            .finalize_started_step
+            .map(|start| {
+                self.finalize_phase_budget
+                    .saturating_sub(step_number.saturating_sub(start))
+            })
+            .unwrap_or(global_remaining);
+        global_remaining.min(finalize_remaining)
+    }
+
+    fn should_stop(&self, step_index: usize) -> bool {
+        step_index >= self.effective_budget
+            || (self.create_task
+                && self
+                    .finalize_started_step
+                    .is_some_and(|start| step_index >= start + self.finalize_phase_budget))
+    }
+
+    fn record_no_progress(&mut self) {
+        self.last_progress = ProgressClass::None;
+        self.stall_count += 1;
+    }
+
+    fn record_evidence(&mut self, task: &str, call: &ToolCall, result: &str, phase: CreatePhase) {
+        let contract = extract_task_contract(task);
+        let evidence = evaluate_evidence(&contract, call, result, phase);
+        match evidence {
+            EvidenceResult::None => self.record_no_progress(),
+            EvidenceResult::Reinforcing => {
+                self.last_progress = if self.remaining.is_empty() {
+                    ProgressClass::Completed
+                } else {
+                    ProgressClass::Reinforcing
+                };
+                self.stall_count = 0;
+                self.effective_budget = (self.effective_budget + 1).min(self.hard_cap);
+            }
+            EvidenceResult::Advanced(requirement) => {
+                self.remaining.remove(&requirement);
+                self.last_progress = if self.remaining.is_empty() {
+                    ProgressClass::Completed
+                } else {
+                    ProgressClass::Advanced
+                };
+                self.stall_count = 0;
+                self.effective_budget = (self.effective_budget + 2).min(self.hard_cap);
+            }
+        }
+    }
+}
+
 impl ToolCall {
     fn tool_name(&self) -> &'static str {
         match self {
@@ -733,6 +901,127 @@ impl ToolCall {
             Self::PathExists(_) => "path_exists",
             Self::Mkdir(_) => "mkdir",
         }
+    }
+}
+
+fn requirement_label(requirement: CreateRequirement) -> &'static str {
+    match requirement {
+        CreateRequirement::OutputRootExists => "output_root_exists",
+        CreateRequirement::DeliverableWritten => "deliverable_written",
+        CreateRequirement::DeliverableVerified => "deliverable_verified",
+        CreateRequirement::ReviewCompleted => "review_completed",
+    }
+}
+
+fn evaluate_evidence(
+    contract: &TaskContract,
+    call: &ToolCall,
+    result: &str,
+    phase: CreatePhase,
+) -> EvidenceResult {
+    let output_root = contract.output_root.as_deref();
+    match call {
+        ToolCall::Mkdir(args) => {
+            if output_root.is_some_and(|root| path_matches_expected(root, &args.path)) {
+                return EvidenceResult::Advanced(CreateRequirement::OutputRootExists);
+            }
+            EvidenceResult::Reinforcing
+        }
+        ToolCall::StatPath(args) => {
+            if output_root.is_some_and(|root| path_matches_expected(root, &args.path))
+                && result.contains("kind=directory")
+            {
+                return EvidenceResult::Advanced(CreateRequirement::OutputRootExists);
+            }
+            if result.contains("kind=file")
+                && output_root.is_some_and(|root| path_under_root(root, &args.path))
+                && matches_main_deliverable(contract, &args.path)
+            {
+                return EvidenceResult::Advanced(CreateRequirement::DeliverableVerified);
+            }
+            EvidenceResult::Reinforcing
+        }
+        ToolCall::PathExists(args) => {
+            if output_root.is_some_and(|root| path_matches_expected(root, &args.path))
+                && result.trim() == "true"
+            {
+                return EvidenceResult::Advanced(CreateRequirement::OutputRootExists);
+            }
+            if result.trim() == "true"
+                && output_root.is_some_and(|root| path_under_root(root, &args.path))
+                && matches_main_deliverable(contract, &args.path)
+            {
+                return EvidenceResult::Advanced(CreateRequirement::DeliverableVerified);
+            }
+            EvidenceResult::None
+        }
+        ToolCall::ListDir(args) => {
+            if output_root.is_some_and(|root| path_matches_expected(root, &args.path)) {
+                return EvidenceResult::Advanced(CreateRequirement::OutputRootExists);
+            }
+            EvidenceResult::None
+        }
+        ToolCall::WriteFile(_) | ToolCall::EditFile(_) => {
+            let path = match call {
+                ToolCall::WriteFile(args) => &args.path,
+                ToolCall::EditFile(args) => &args.path,
+                _ => unreachable!(),
+            };
+            if output_root.is_some_and(|root| path_under_root(root, path)) {
+                return EvidenceResult::Advanced(CreateRequirement::DeliverableWritten);
+            }
+            EvidenceResult::Reinforcing
+        }
+        ToolCall::ReadFile(args) => {
+            if output_root.is_some_and(|root| path_under_root(root, &args.path))
+                && !result.trim().is_empty()
+                && matches_main_deliverable(contract, &args.path)
+            {
+                if contract.must_review && phase == CreatePhase::Review {
+                    return EvidenceResult::Advanced(CreateRequirement::ReviewCompleted);
+                }
+                return EvidenceResult::Advanced(CreateRequirement::DeliverableVerified);
+            }
+            EvidenceResult::None
+        }
+        ToolCall::Diff(_) => {
+            if contract.must_review && phase == CreatePhase::Review {
+                EvidenceResult::Advanced(CreateRequirement::ReviewCompleted)
+            } else {
+                EvidenceResult::Reinforcing
+            }
+        }
+        ToolCall::Exec(args) => {
+            if is_read_only_exec(&args.argv) {
+                EvidenceResult::Reinforcing
+            } else {
+                EvidenceResult::None
+            }
+        }
+        ToolCall::Glob(args) => {
+            if let Some(root) = output_root
+                && args.pattern.contains(&root.to_string_lossy().to_string())
+            {
+                return EvidenceResult::Reinforcing;
+            }
+            EvidenceResult::None
+        }
+        ToolCall::Search(_) => EvidenceResult::Reinforcing,
+    }
+}
+
+fn path_under_root(root: &Path, actual: &Path) -> bool {
+    path_matches_expected(root, actual)
+}
+
+fn matches_main_deliverable(contract: &TaskContract, path: &Path) -> bool {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    match contract.deliverable_kind {
+        DeliverableKind::HtmlApp => matches!(file_name, "index.html" | "space_invaders.html"),
+        DeliverableKind::RustCode => file_name.ends_with(".rs"),
+        DeliverableKind::GenericFile => true,
     }
 }
 
@@ -876,7 +1165,11 @@ fn contains_shell_metacharacters(command: &str) -> bool {
         .any(|needle| command.contains(needle))
 }
 
-fn build_loop_prompt(task: &str, turns: &[ModelTurn]) -> String {
+fn build_loop_prompt(
+    task: &str,
+    turns: &[ModelTurn],
+    requirement_state: &RequirementState,
+) -> String {
     let contract = extract_task_contract(task);
     let expected_root = contract.output_root.clone();
     let create_phase = create_phase_for_task(task, turns);
@@ -938,6 +1231,24 @@ Invalid or partial tool args are forbidden.\n\n",
             CreatePhase::Finalize => "finalize",
         });
         prompt.push_str("\n\n");
+        prompt.push_str("REMAINING_REQUIREMENTS\n");
+        if requirement_state.remaining.is_empty() {
+            prompt.push_str("- none\n");
+        } else {
+            for requirement in requirement_state.remaining_labels() {
+                prompt.push_str("- ");
+                prompt.push_str(&requirement);
+                prompt.push('\n');
+            }
+        }
+        prompt.push('\n');
+        prompt.push_str("PROGRESS_STATE\n");
+        prompt.push_str(&format!(
+            "last_progress={}\nstall_count={}\ncurrent_budget={}\n\n",
+            requirement_state.last_progress_label(),
+            requirement_state.stall_count,
+            requirement_state.effective_budget,
+        ));
     }
     prompt.push_str("TASK_CONTRACT\n");
     prompt.push_str(&format!(

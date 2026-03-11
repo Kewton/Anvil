@@ -763,7 +763,10 @@ async fn observer_receives_raw_preview_and_validated_tool_events() {
 fn default_loop_config_allows_longer_generation_tasks() {
     let config = LoopConfig::default();
 
-    assert_eq!(config.max_steps, 16);
+    assert_eq!(config.max_steps, 24);
+    assert_eq!(config.create_task_base_budget, 14);
+    assert_eq!(config.inspect_task_base_budget, 8);
+    assert_eq!(config.finalize_phase_budget, 3);
     assert_eq!(config.max_cached_reuses_per_call, 2);
 }
 
@@ -800,6 +803,10 @@ async fn step_started_event_includes_phase_and_plan_context() {
             workflow,
             phase_index,
             phase_total,
+            remaining_requirements,
+            progress_class,
+            stall_count,
+            remaining_budget,
             ..
         } if purpose.contains("prepare")
             && phase == "prepare"
@@ -808,5 +815,76 @@ async fn step_started_event_includes_phase_and_plan_context() {
             && workflow.iter().any(|item| item == "review")
             && *phase_index == 1
             && *phase_total == 5
+            && remaining_requirements.iter().any(|item| item == "output_root_exists")
+            && progress_class == "no_progress"
+            && *stall_count == 0
+            && *remaining_budget >= 1
     )));
+}
+
+#[tokio::test]
+async fn prompts_include_requirement_state_for_create_tasks() {
+    let dir = tempdir().unwrap();
+    let model = ScriptedModel::new(vec![
+        r#"{"type":"tool_calls","calls":[{"tool":"mkdir","args":{"path":"./sandbox/demo"}}]}"#
+            .to_string(),
+        r#"{"type":"final","content":"done"}"#.to_string(),
+    ]);
+    let driver = LoopDriver::new(LoopConfig::default());
+
+    let _ = driver
+        .run(
+            &model,
+            dir.path(),
+            "ブラウザから直接実行可能なゲームを ./sandbox/demo に出力してください。",
+            Vec::<ModelTurn>::new(),
+        )
+        .await;
+
+    let prompts = model.prompts();
+    assert!(prompts[0].contains("REMAINING_REQUIREMENTS"));
+    assert!(prompts[0].contains("output_root_exists"));
+    assert!(prompts[0].contains("deliverable_written"));
+    assert!(prompts[0].contains("deliverable_verified"));
+}
+
+#[tokio::test]
+async fn progress_extends_budget_for_generation_tasks() {
+    let dir = tempdir().unwrap();
+    let model = ScriptedModel::new(vec![
+        r#"{"type":"tool_calls","calls":[{"tool":"mkdir","args":{"path":"./sandbox/demo"}}]}"#
+            .to_string(),
+        r#"{"type":"tool_calls","calls":[{"tool":"write_file","args":{"path":"./sandbox/demo/index.html","content":"<html></html>"}}]}"#
+            .to_string(),
+        r#"{"type":"tool_calls","calls":[{"tool":"read_file","args":{"path":"./sandbox/demo/index.html"}}]}"#
+            .to_string(),
+        r#"{"type":"final","content":"done"}"#.to_string(),
+    ]);
+    let driver = LoopDriver::new(LoopConfig::default());
+    let events = Arc::new(Mutex::new(Vec::<LoopEvent>::new()));
+    let sink = Arc::clone(&events);
+
+    let _ = driver
+        .run_with_observer(
+            &model,
+            dir.path(),
+            "ブラウザから直接実行可能なゲームを ./sandbox/demo に出力してください。",
+            Vec::<ModelTurn>::new(),
+            move |event| sink.lock().unwrap().push(event),
+        )
+        .await
+        .unwrap();
+
+    let events = events.lock().unwrap();
+    let budgets: Vec<usize> = events
+        .iter()
+        .filter_map(|event| match event {
+            LoopEvent::StepStarted {
+                remaining_budget, ..
+            } => Some(*remaining_budget),
+            _ => None,
+        })
+        .collect();
+    assert!(budgets.len() >= 3);
+    assert!(budgets[1] >= budgets[0].saturating_sub(1));
 }
