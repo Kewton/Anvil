@@ -272,6 +272,60 @@ TDD の観点:
 - [x] tool loop が fail-closed と権限モデルを維持したまま安定動作する
 - [x] Claude Code / vibe-local に近い「調べてから答える」挙動を再現できる
 
+## Phase 3.2: ローカルLLM安定化
+
+目的:
+
+- [x] ローカルLLMでの tool calling 不安定性の主因を除去する
+- [x] `vibe-local` と比べて不安定になっている構造要因を解消する
+- [ ] 生成系タスクでの完走率を実用域まで引き上げる
+- [ ] Phase 3.1 の loop を「動く」から「ローカルモデルで安定して使える」へ引き上げる
+
+先に書くテスト:
+
+- [x] Ollama native tool calling adapter の unit test
+- [x] native tool calling と text-JSON fallback の切り替え統合テスト
+- [ ] `write_file` 大規模 payload を native tool call で壊さず処理する統合テスト
+- [x] `list_dir` / `stat_path` / `path_exists` / `mkdir` の単体テスト
+- [x] directory を `read_file` せず `list_dir` または `stat_path` へ進む統合テスト
+- [ ] create task で空 `glob` を反復せず `mkdir -> write_file` へ進む統合テスト
+- [x] empty result cache が探索停止を悪化させない回帰テスト
+- [x] `final` 判定が create task / inspect task で適切に分かれる統合テスト
+- [x] `loop_turns` compaction が長大 tool result でも劣化しない性能テスト
+- [x] tool-use 時の provider options (`temperature`, `num_ctx`, `keep_alive`) 回帰テスト
+- [ ] `qwen3.5:35b` での実機受け入れテスト
+  - [x] ブランチ説明
+  - [ ] 単一 HTML 生成
+  - [ ] `./sandbox/<name>/` への静的ゲーム出力
+
+実装:
+
+- [x] `src/models/ollama.rs` に native tool calling 対応を追加
+- [x] `src/models/lm_studio.rs` の provider 差分を native tool calling 前提で再整理
+- [x] `src/agent/looping.rs` に provider-native tool call path と fallback path を分離実装
+- [x] `src/tools/` に `list_dir`, `stat_path`, `path_exists`, `mkdir` を追加
+- [x] create / write 系タスク向けの loop policy を追加
+- [x] empty `glob` / `search` / empty cached result の扱いを見直す
+- [x] `loop_turns` 用 compaction / summarization を追加
+- [x] tool-use 時の provider tuning を `model profile` と統合する
+- [ ] `write_file` 大規模 content の分割・圧縮方針を整理する
+
+TDD の観点:
+
+- まず provider-native tool calling を adapter test で固定する
+- 次に file/dir 判定用ツールを unit test で固める
+- その後 create task の統合テストを赤で追加する
+- 最後に `qwen3.5:35b` の実機受け入れで完走率を確認する
+
+完了条件:
+
+- [x] Ollama で native tool calling を優先利用できる
+- [x] `write_file` の巨大 JSON 本文生成に依存しない
+- [x] directory/file の取り違えで loop が破綻しない
+- [ ] create task が空 `glob` の反復に陥りにくい
+- [ ] `このブランチを解説して` と `ゲームを作って出力して` の両方が安定して完走する
+- [ ] `qwen3.5:35b` 実機確認で Phase 3.1 より明確に完走率が改善する
+
 ## Phase 4: 拡張フェーズ
 
 目的:

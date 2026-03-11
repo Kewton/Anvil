@@ -6,13 +6,23 @@ use anyhow::anyhow;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
+use crate::models::tool_calling::{NativeModelResponse, NativeToolCall, NativeToolSpec};
 use crate::tools::{
-    edit_file, exec_in_dir, glob_paths, read_file, search_in_files, unified_diff, write_file,
+    edit_file, exec_in_dir, glob_paths, list_dir, mkdir_p, path_exists, read_file, search_in_files,
+    stat_path, unified_diff, write_file,
 };
 
 #[async_trait::async_trait]
 pub trait ModelExchange: Send + Sync {
     async fn complete(&self, prompt: &str) -> anyhow::Result<String>;
+
+    async fn complete_with_tools(
+        &self,
+        _prompt: &str,
+        _tools: &[NativeToolSpec],
+    ) -> anyhow::Result<Option<NativeModelResponse>> {
+        Ok(None)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,45 +191,60 @@ impl LoopDriver {
             observer(LoopEvent::StepStarted { step: step_number });
             let prompt = build_loop_prompt(task, &turns);
             let model_started_at = Instant::now();
-            let raw = model.complete(&prompt).await?;
-            observer(LoopEvent::ModelResponseReceived {
-                bytes: raw.len(),
-                elapsed_ms: model_started_at.elapsed().as_millis(),
-            });
-            observer(LoopEvent::ModelResponsePreview {
-                preview: truncate(&raw.replace('\n', "\\n"), 240),
-            });
-            let response = match parse_model_response(&raw) {
-                Ok(response) => {
+            let response = match model.complete_with_tools(&prompt, &tool_specs()).await? {
+                Some(native) => {
+                    observer(LoopEvent::ModelResponseReceived {
+                        bytes: estimate_native_response_size(&native),
+                        elapsed_ms: model_started_at.elapsed().as_millis(),
+                    });
+                    observer(LoopEvent::ModelResponsePreview {
+                        preview: truncate(&format!("{native:?}"), 240),
+                    });
                     protocol_retry_state = None;
-                    response
+                    native_to_model_response(native)?
                 }
-                Err(LoopError::InvalidToolCall(message)) => {
-                    let retry = next_retry_count(
-                        &mut protocol_retry_state,
-                        format!("invalid_json:{message}"),
-                    );
-                    if retry > self.config.max_schema_retries {
-                        return Err(LoopError::InvalidToolCall(message));
+                None => {
+                    let raw = model.complete(&prompt).await?;
+                    observer(LoopEvent::ModelResponseReceived {
+                        bytes: raw.len(),
+                        elapsed_ms: model_started_at.elapsed().as_millis(),
+                    });
+                    observer(LoopEvent::ModelResponsePreview {
+                        preview: truncate(&raw.replace('\n', "\\n"), 240),
+                    });
+                    match parse_model_response(&raw) {
+                        Ok(response) => {
+                            protocol_retry_state = None;
+                            response
+                        }
+                        Err(LoopError::InvalidToolCall(message)) => {
+                            let retry = next_retry_count(
+                                &mut protocol_retry_state,
+                                format!("invalid_json:{message}"),
+                            );
+                            if retry > self.config.max_schema_retries {
+                                return Err(LoopError::InvalidToolCall(message));
+                            }
+                            observer(LoopEvent::ProtocolRetry {
+                                error_kind: "invalid_json".to_string(),
+                                message: message.clone(),
+                                retry,
+                                max_retries: self.config.max_schema_retries,
+                            });
+                            turns.push(ModelTurn::ProtocolError {
+                                error_kind: "invalid_json".to_string(),
+                                message,
+                                hint: "return one complete JSON object only; do not emit partial or truncated JSON".to_string(),
+                            });
+                            observer(LoopEvent::StepFinished {
+                                step: step_number,
+                                elapsed_ms: step_started_at.elapsed().as_millis(),
+                            });
+                            continue;
+                        }
+                        Err(other) => return Err(other),
                     }
-                    observer(LoopEvent::ProtocolRetry {
-                        error_kind: "invalid_json".to_string(),
-                        message: message.clone(),
-                        retry,
-                        max_retries: self.config.max_schema_retries,
-                    });
-                    turns.push(ModelTurn::ProtocolError {
-                        error_kind: "invalid_json".to_string(),
-                        message,
-                        hint: "return one complete JSON object only; do not emit partial or truncated JSON".to_string(),
-                    });
-                    observer(LoopEvent::StepFinished {
-                        step: step_number,
-                        elapsed_ms: step_started_at.elapsed().as_millis(),
-                    });
-                    continue;
                 }
-                Err(other) => return Err(other),
             };
 
             match response {
@@ -299,16 +324,40 @@ impl LoopDriver {
                             tool: validated.tool_name().to_string(),
                             normalized: truncate(&normalized, 240),
                         });
+                        if should_block_pre_write_inspection(task, &turns, &validated) {
+                            turns.push(ModelTurn::ToolError {
+                                tool: validated.tool_name().to_string(),
+                                error_kind: "stalled_pre_write_inspection".to_string(),
+                                message: "the output directory is already ready; more directory inspection is not useful"
+                                    .to_string(),
+                                hint: "use write_file now to create the deliverable file instead of inspecting the empty directory again".to_string(),
+                            });
+                            continue;
+                        }
                         if !seen.insert(normalized.clone()) {
                             if can_reuse_cached_result(&validated) {
                                 let Some((cached_output, reuse_count)) =
                                     cached_results.get_mut(&normalized)
                                 else {
-                                    return Err(LoopError::DuplicateToolCall(normalized));
+                                    turns.push(ModelTurn::ToolError {
+                                        tool: validated.tool_name().to_string(),
+                                        error_kind: "duplicate_empty_result".to_string(),
+                                        message: "previous identical read-only call returned no reusable result"
+                                            .to_string(),
+                                        hint: "change strategy: use mkdir, list_dir, stat_path, or write_file instead of repeating the same empty lookup".to_string(),
+                                    });
+                                    continue;
                                 };
                                 *reuse_count += 1;
                                 if *reuse_count > self.config.max_cached_reuses_per_call {
-                                    return Err(LoopError::DuplicateToolCall(normalized));
+                                    turns.push(ModelTurn::ToolError {
+                                        tool: validated.tool_name().to_string(),
+                                        error_kind: "duplicate_reuse_limit".to_string(),
+                                        message: "identical read-only call was repeated too many times"
+                                            .to_string(),
+                                        hint: "use the existing tool results to answer, or choose a different tool instead of repeating the same read-only call".to_string(),
+                                    });
+                                    continue;
                                 }
                                 observer(LoopEvent::ToolResultReused {
                                     tool: validated.tool_name().to_string(),
@@ -375,7 +424,7 @@ impl LoopDriver {
                             tool: validated.tool_name().to_string(),
                             preview: truncate(&result.replace('\n', "\\n"), 220),
                         });
-                        if can_reuse_cached_result(&validated) {
+                        if can_reuse_cached_result(&validated) && !result.trim().is_empty() {
                             cached_results.insert(normalized, (result.clone(), 0));
                         }
                         turns.push(ModelTurn::ToolResult {
@@ -466,6 +515,10 @@ enum ToolCall {
     Diff(DiffArgs),
     Search(SearchArgs),
     Glob(GlobArgs),
+    ListDir(ListDirArgs),
+    StatPath(PathArgs),
+    PathExists(PathArgs),
+    Mkdir(PathArgs),
 }
 
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
@@ -517,6 +570,18 @@ struct GlobArgs {
     pattern: String,
 }
 
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct ListDirArgs {
+    path: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct PathArgs {
+    path: PathBuf,
+}
+
 impl ToolCall {
     fn tool_name(&self) -> &'static str {
         match self {
@@ -527,6 +592,10 @@ impl ToolCall {
             Self::Diff(_) => "diff",
             Self::Search(_) => "search",
             Self::Glob(_) => "glob",
+            Self::ListDir(_) => "list_dir",
+            Self::StatPath(_) => "stat_path",
+            Self::PathExists(_) => "path_exists",
+            Self::Mkdir(_) => "mkdir",
         }
     }
 }
@@ -577,6 +646,18 @@ fn validate_tool_call(raw: &RawToolCall) -> Result<ToolCall, LoopError> {
         "glob" => serde_json::from_value(args)
             .map(ToolCall::Glob)
             .map_err(|err| LoopError::InvalidToolCall(err.to_string())),
+        "list_dir" => serde_json::from_value(args)
+            .map(ToolCall::ListDir)
+            .map_err(|err| LoopError::InvalidToolCall(err.to_string())),
+        "stat_path" => serde_json::from_value(args)
+            .map(ToolCall::StatPath)
+            .map_err(|err| LoopError::InvalidToolCall(err.to_string())),
+        "path_exists" => serde_json::from_value(args)
+            .map(ToolCall::PathExists)
+            .map_err(|err| LoopError::InvalidToolCall(err.to_string())),
+        "mkdir" => serde_json::from_value(args)
+            .map(ToolCall::Mkdir)
+            .map_err(|err| LoopError::InvalidToolCall(err.to_string())),
         other => Err(LoopError::InvalidToolCall(format!("unknown tool: {other}"))),
     }
 }
@@ -614,6 +695,17 @@ fn execute_validated_tool_call(
             .map(|p| p.display().to_string())
             .collect::<Vec<_>>()
             .join("\n"),
+        ToolCall::ListDir(args) => list_dir(&cwd.join(&args.path))?
+            .into_iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        ToolCall::StatPath(args) => stat_path(&cwd.join(&args.path))?,
+        ToolCall::PathExists(args) => path_exists(&cwd.join(&args.path)).to_string(),
+        ToolCall::Mkdir(args) => {
+            mkdir_p(&cwd.join(&args.path))?;
+            "ok".to_string()
+        }
     };
     Ok(truncate(&output, max_chars))
 }
@@ -654,11 +746,16 @@ fn build_loop_prompt(task: &str, turns: &[ModelTurn]) -> String {
 Return only JSON.\n\
 For tools: {\"type\":\"tool_calls\",\"calls\":[{\"tool\":\"read_file\",\"args\":{...}}]}\n\
 For final answer: {\"type\":\"final\",\"content\":\"...\"}\n\
-Available tools: read_file, write_file, edit_file, exec, diff, search, glob.\n\
+Available tools: read_file, write_file, edit_file, exec, diff, search, glob, list_dir, stat_path, path_exists, mkdir.\n\
 Use tools when context is missing. Do not ask the user for git details if you can inspect them.\n\
+Use list_dir or stat_path for directories. Do not use read_file on directories.\n\
+For create/output tasks, prefer mkdir then write_file. If glob/search returns empty, change strategy instead of repeating it.\n\
+For inspect/explain tasks, once you have enough evidence, stop using tools and return final.\n\
+For branch/repository questions, prefer focused git commands over broad filesystem scans.\n\
+Do not repeat the same read-only call once its result already answers the question.\n\
 Invalid or partial tool args are forbidden.\n\n",
     );
-    for turn in turns {
+    for turn in compact_turns(turns) {
         match turn {
             ModelTurn::ToolResult { tool, output } => {
                 prompt.push_str(&format!("TOOL_RESULT {tool}\n{output}\n\n"));
@@ -687,6 +784,11 @@ Invalid or partial tool args are forbidden.\n\n",
             }
         }
     }
+    if let Some(hint) = completion_hint(task, turns) {
+        prompt.push_str("COMPLETION_HINT\n");
+        prompt.push_str(&hint);
+        prompt.push_str("\n\n");
+    }
     prompt.push_str("TASK\n");
     prompt.push_str(task);
     prompt
@@ -707,7 +809,8 @@ fn tool_error_hint(tool: &str) -> String {
         "glob" => "glob requires args.pattern as a glob string".to_string(),
         "exec" => "exec requires args.argv as a string array, or args.command without shell syntax"
             .to_string(),
-        "read_file" | "write_file" | "edit_file" => "file tools require args.path".to_string(),
+        "read_file" | "write_file" | "edit_file" | "list_dir" | "stat_path" | "path_exists"
+        | "mkdir" => "path-based tools require args.path".to_string(),
         "search" => "search requires args.needle".to_string(),
         "diff" => "diff requires args.before and args.after".to_string(),
         _ => "review the tool schema and retry with valid arguments".to_string(),
@@ -736,6 +839,15 @@ fn tool_execution_error_hint(call: &ToolCall) -> String {
             "glob failed for pattern {}. Retry with a valid glob pattern",
             args.pattern
         ),
+        ToolCall::ListDir(args) => format!(
+            "list_dir failed for {}. Retry with an existing directory path",
+            args.path.display()
+        ),
+        ToolCall::StatPath(args) | ToolCall::PathExists(args) | ToolCall::Mkdir(args) => format!(
+            "{} failed for {}. Verify the path and retry",
+            call.tool_name(),
+            args.path.display()
+        ),
         ToolCall::Search(args) => format!(
             "search failed for needle {}. Retry after narrowing the query or checking paths",
             truncate(&args.needle, 80)
@@ -753,14 +865,25 @@ fn tool_call_summary(call: &ToolCall) -> String {
         ToolCall::Diff(_) => "diff provided content".to_string(),
         ToolCall::Search(args) => format!("search {}", truncate(&args.needle, 80)),
         ToolCall::Glob(args) => format!("glob {}", truncate(&args.pattern, 80)),
+        ToolCall::ListDir(args) => format!("list_dir {}", args.path.display()),
+        ToolCall::StatPath(args) => format!("stat_path {}", args.path.display()),
+        ToolCall::PathExists(args) => format!("path_exists {}", args.path.display()),
+        ToolCall::Mkdir(args) => format!("mkdir {}", args.path.display()),
     }
 }
 
 fn can_reuse_cached_result(call: &ToolCall) -> bool {
     match call {
-        ToolCall::ReadFile(_) | ToolCall::Search(_) | ToolCall::Glob(_) => true,
+        ToolCall::ReadFile(_)
+        | ToolCall::Search(_)
+        | ToolCall::Glob(_)
+        | ToolCall::ListDir(_)
+        | ToolCall::StatPath(_)
+        | ToolCall::PathExists(_) => true,
         ToolCall::Exec(args) => is_read_only_exec(&args.argv),
-        ToolCall::WriteFile(_) | ToolCall::EditFile(_) | ToolCall::Diff(_) => false,
+        ToolCall::WriteFile(_) | ToolCall::EditFile(_) | ToolCall::Diff(_) | ToolCall::Mkdir(_) => {
+            false
+        }
     }
 }
 
@@ -769,4 +892,276 @@ fn is_read_only_exec(argv: &[String]) -> bool {
         argv.first().map(String::as_str),
         Some("ls" | "cat" | "pwd" | "git" | "find" | "rg")
     )
+}
+
+fn compact_turns(turns: &[ModelTurn]) -> Vec<ModelTurn> {
+    if turns.len() <= 10 {
+        return turns.to_vec();
+    }
+    let older = turns.len() - 8;
+    let mut compacted = vec![ModelTurn::ProtocolError {
+        error_kind: "compacted_history".to_string(),
+        message: format!("{} earlier turns summarized", older),
+        hint: "focus on the latest tool results and change strategy if prior attempts failed"
+            .to_string(),
+    }];
+    compacted.extend_from_slice(&turns[older..]);
+    compacted
+}
+
+fn completion_hint(task: &str, turns: &[ModelTurn]) -> Option<String> {
+    if task_requires_write_action(task) {
+        if has_write_evidence(turns) {
+            return Some(
+                "A write/edit has already succeeded. Prefer returning final with a concise summary of created or changed files unless another tool is strictly necessary."
+                    .to_string(),
+            );
+        }
+        if has_mkdir_evidence(turns) && has_empty_directory_evidence(turns) {
+            return Some(
+                "The target directory now exists and is empty. Stop inspecting it and use write_file to create the deliverable file(s) now."
+                    .to_string(),
+            );
+        }
+        return None;
+    }
+
+    if is_branch_inspection_task(task)
+        && has_branch_evidence(turns)
+        && has_commit_history_evidence(turns)
+        && has_status_evidence(turns)
+    {
+        return Some(
+            "You already have enough git evidence to answer the branch/repository question. Stop using tools and return final now."
+                .to_string(),
+        );
+    }
+
+    None
+}
+
+fn is_branch_inspection_task(task: &str) -> bool {
+    let lower = task.to_lowercase();
+    [
+        "branch",
+        "repository",
+        "repo",
+        "ブランチ",
+        "リポジトリ",
+        "差分",
+        "変更",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn has_branch_evidence(turns: &[ModelTurn]) -> bool {
+    turns.iter().any(|turn| match turn {
+        ModelTurn::ToolResult { output, .. } => {
+            output.contains("On branch ") || output.contains("remotes/origin/")
+        }
+        _ => false,
+    })
+}
+
+fn has_commit_history_evidence(turns: &[ModelTurn]) -> bool {
+    turns.iter().any(|turn| match turn {
+        ModelTurn::ToolResult { output, .. } => output.lines().any(looks_like_commit_line),
+        _ => false,
+    })
+}
+
+fn has_status_evidence(turns: &[ModelTurn]) -> bool {
+    turns.iter().any(|turn| match turn {
+        ModelTurn::ToolResult { output, .. } => {
+            output.contains("Changes not staged for commit")
+                || output.contains("nothing to commit")
+                || output.contains("Your branch is ahead of")
+        }
+        _ => false,
+    })
+}
+
+fn has_mkdir_evidence(turns: &[ModelTurn]) -> bool {
+    turns.iter().any(|turn| match turn {
+        ModelTurn::ToolResult { tool, output } => tool == "mkdir" && output.trim() == "ok",
+        _ => false,
+    })
+}
+
+fn has_empty_directory_evidence(turns: &[ModelTurn]) -> bool {
+    turns.iter().any(|turn| match turn {
+        ModelTurn::ToolResult { tool, output } if tool == "list_dir" => output.trim().is_empty(),
+        ModelTurn::ToolResult { tool, output } if tool == "stat_path" => {
+            output.contains("kind=directory")
+        }
+        _ => false,
+    })
+}
+
+fn looks_like_commit_line(line: &str) -> bool {
+    let prefix = line.split_whitespace().next().unwrap_or_default();
+    prefix.len() >= 7 && prefix.chars().take(7).all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn should_block_pre_write_inspection(task: &str, turns: &[ModelTurn], call: &ToolCall) -> bool {
+    if !task_requires_write_action(task) || has_write_evidence(turns) {
+        return false;
+    }
+    if !has_mkdir_evidence(turns) || !has_empty_directory_evidence(turns) {
+        return false;
+    }
+    matches!(
+        call,
+        ToolCall::ListDir(_) | ToolCall::StatPath(_) | ToolCall::PathExists(_)
+    )
+}
+
+fn tool_specs() -> Vec<NativeToolSpec> {
+    vec![
+        path_tool_spec("read_file", "Read a text file"),
+        write_tool_spec(),
+        edit_tool_spec(),
+        NativeToolSpec {
+            name: "exec",
+            description: "Run a safe command using argv or a simple command string",
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "argv": {"type": "array", "items": {"type": "string"}},
+                    "command": {"type": "string"}
+                }
+            }),
+        },
+        NativeToolSpec {
+            name: "diff",
+            description: "Produce a unified diff between two strings",
+            input_schema: serde_json::json!({
+                "type": "object",
+                "required": ["before", "after"],
+                "properties": {
+                    "before": {"type": "string"},
+                    "after": {"type": "string"}
+                }
+            }),
+        },
+        NativeToolSpec {
+            name: "search",
+            description: "Search files for a string",
+            input_schema: serde_json::json!({
+                "type": "object",
+                "required": ["needle"],
+                "properties": {"needle": {"type": "string"}}
+            }),
+        },
+        NativeToolSpec {
+            name: "glob",
+            description: "Find paths matching a glob pattern",
+            input_schema: serde_json::json!({
+                "type": "object",
+                "required": ["pattern"],
+                "properties": {"pattern": {"type": "string"}}
+            }),
+        },
+        path_tool_spec("list_dir", "List entries in a directory"),
+        path_tool_spec("stat_path", "Describe a path"),
+        path_tool_spec("path_exists", "Check whether a path exists"),
+        path_tool_spec("mkdir", "Create a directory recursively"),
+    ]
+}
+
+fn path_tool_spec(name: &'static str, description: &'static str) -> NativeToolSpec {
+    NativeToolSpec {
+        name,
+        description,
+        input_schema: serde_json::json!({
+            "type": "object",
+            "required": ["path"],
+            "properties": {"path": {"type": "string"}}
+        }),
+    }
+}
+
+fn write_tool_spec() -> NativeToolSpec {
+    NativeToolSpec {
+        name: "write_file",
+        description: "Write a text file, creating parent directories if needed",
+        input_schema: serde_json::json!({
+            "type": "object",
+            "required": ["path", "content"],
+            "properties": {
+                "path": {"type": "string"},
+                "content": {"type": "string"}
+            }
+        }),
+    }
+}
+
+fn edit_tool_spec() -> NativeToolSpec {
+    NativeToolSpec {
+        name: "edit_file",
+        description: "Replace text in an existing file",
+        input_schema: serde_json::json!({
+            "type": "object",
+            "required": ["path", "from", "to"],
+            "properties": {
+                "path": {"type": "string"},
+                "from": {"type": "string"},
+                "to": {"type": "string"}
+            }
+        }),
+    }
+}
+
+fn estimate_native_response_size(response: &NativeModelResponse) -> usize {
+    match response {
+        NativeModelResponse::Message(text) => text.len(),
+        NativeModelResponse::ToolCalls(calls) => serde_json::to_string(calls)
+            .map(|text| text.len())
+            .unwrap_or(0),
+    }
+}
+
+fn native_to_model_response(native: NativeModelResponse) -> Result<ModelResponse, LoopError> {
+    match native {
+        NativeModelResponse::Message(content) => Ok(ModelResponse::Final { content }),
+        NativeModelResponse::ToolCalls(calls) => {
+            if let Some(content) = extract_native_final(&calls)? {
+                Ok(ModelResponse::Final { content })
+            } else {
+                Ok(ModelResponse::ToolCalls {
+                    calls: calls.into_iter().map(raw_from_native_call).collect(),
+                })
+            }
+        }
+    }
+}
+
+fn raw_from_native_call(call: NativeToolCall) -> RawToolCall {
+    RawToolCall {
+        tool: call.name,
+        args: Some(call.arguments),
+        extra: Map::new(),
+    }
+}
+
+fn extract_native_final(calls: &[NativeToolCall]) -> Result<Option<String>, LoopError> {
+    if calls.len() != 1 || calls[0].name != "final" {
+        return Ok(None);
+    }
+
+    let args = &calls[0].arguments;
+    if let Some(content) = args.get("content").and_then(Value::as_str) {
+        return Ok(Some(content.to_string()));
+    }
+    if let Some(message) = args.get("message").and_then(Value::as_str) {
+        return Ok(Some(message.to_string()));
+    }
+    if let Some(text) = args.get("text").and_then(Value::as_str) {
+        return Ok(Some(text.to_string()));
+    }
+
+    Err(LoopError::InvalidToolCall(
+        "native final tool call requires content, message, or text".to_string(),
+    ))
 }

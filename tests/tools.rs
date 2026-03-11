@@ -1,5 +1,6 @@
 use anvil::tools::{
-    edit_file, exec_in_dir, glob_paths, read_file, search_in_files, unified_diff, write_file,
+    edit_file, exec_in_dir, glob_paths, list_dir, mkdir_p, path_exists, read_file, search_in_files,
+    stat_path, unified_diff, write_file,
 };
 use tempfile::tempdir;
 
@@ -52,4 +53,20 @@ fn tool_glob_search_and_diff_work() {
     let diff = unified_diff("before\n", "after\n");
     assert!(diff.contains("-before"));
     assert!(diff.contains("+after"));
+}
+
+#[test]
+fn tool_directory_primitives_work() {
+    let dir = tempdir().unwrap();
+    let nested = dir.path().join("nested");
+    mkdir_p(&nested).unwrap();
+    write_file(&nested.join("a.txt"), "hello\n").unwrap();
+
+    let entries = list_dir(&nested).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert!(entries[0].ends_with("a.txt"));
+    assert!(path_exists(&nested));
+
+    let stat = stat_path(&nested).unwrap();
+    assert!(stat.contains("kind=directory"));
 }

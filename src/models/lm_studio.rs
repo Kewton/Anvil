@@ -3,8 +3,12 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::models::stream::SseStreamParser;
+use crate::models::tool_calling::{
+    NativeModelResponse, NativeToolCall, NativeToolSpec, ToolUseOptions,
+};
 
 #[derive(Debug, Clone)]
 pub struct LmStudioClient {
@@ -17,6 +21,10 @@ struct ChatRequest<'a> {
     model: &'a str,
     stream: bool,
     messages: Vec<Message<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<ToolSpec<'a>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -49,6 +57,33 @@ struct Choice {
 #[derive(Debug, Clone, Deserialize)]
 struct AssistantMessage {
     content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<OpenAiToolCall>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ToolSpec<'a> {
+    r#type: &'static str,
+    function: ToolFunction<'a>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ToolFunction<'a> {
+    name: &'a str,
+    description: &'a str,
+    parameters: Value,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OpenAiToolCall {
+    id: Option<String>,
+    function: OpenAiFunctionCall,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OpenAiFunctionCall {
+    name: String,
+    arguments: Value,
 }
 
 impl LmStudioClient {
@@ -94,6 +129,8 @@ impl LmStudioClient {
                     role: "user",
                     content: prompt,
                 }],
+                tools: None,
+                temperature: None,
             })
             .send()
             .await?
@@ -119,6 +156,8 @@ impl LmStudioClient {
                     role: "user",
                     content: prompt,
                 }],
+                tools: None,
+                temperature: None,
             })
             .send()
             .await?
@@ -146,5 +185,68 @@ impl LmStudioClient {
             }
         }
         Ok(out)
+    }
+
+    pub async fn chat_with_tools(
+        &self,
+        model: &str,
+        prompt: &str,
+        tools: &[NativeToolSpec],
+        options: ToolUseOptions,
+    ) -> anyhow::Result<NativeModelResponse> {
+        let body: ChatResponse = self
+            .client
+            .post(format!("{}/v1/chat/completions", self.base_url))
+            .json(&ChatRequest {
+                model,
+                stream: false,
+                messages: vec![Message {
+                    role: "user",
+                    content: prompt,
+                }],
+                tools: Some(
+                    tools
+                        .iter()
+                        .map(|tool| ToolSpec {
+                            r#type: "function",
+                            function: ToolFunction {
+                                name: tool.name,
+                                description: tool.description,
+                                parameters: tool.input_schema.clone(),
+                            },
+                        })
+                        .collect(),
+                ),
+                temperature: Some(options.temperature),
+            })
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        let Some(choice) = body.choices.into_iter().next() else {
+            return Ok(NativeModelResponse::Message(String::new()));
+        };
+        let message = choice.message.or(choice.delta).unwrap_or(AssistantMessage {
+            content: None,
+            tool_calls: Vec::new(),
+        });
+        if !message.tool_calls.is_empty() {
+            return Ok(NativeModelResponse::ToolCalls(
+                message
+                    .tool_calls
+                    .into_iter()
+                    .map(|call| NativeToolCall {
+                        id: call.id,
+                        name: call.function.name,
+                        arguments: call.function.arguments,
+                    })
+                    .collect(),
+            ));
+        }
+        Ok(NativeModelResponse::Message(
+            message.content.unwrap_or_default(),
+        ))
     }
 }

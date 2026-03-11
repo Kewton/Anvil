@@ -7,6 +7,8 @@ fn profile_for_qwen35_35b_prefers_large_context_local_defaults() {
     assert_eq!(profile.name, "qwen3.5:35b");
     assert!(profile.max_context_tokens >= 200_000);
     assert!(profile.summary_trigger_tokens >= 40_000);
+    assert!(profile.tool_context_tokens >= 48_000);
+    assert!(profile.tool_temperature <= 0.2);
 }
 
 #[test]

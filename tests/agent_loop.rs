@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use anvil::agent::looping::{
     LoopConfig, LoopDriver, LoopError, LoopEvent, ModelExchange, ModelTurn,
 };
+use anvil::models::tool_calling::{NativeModelResponse, NativeToolCall, NativeToolSpec};
 use tempfile::tempdir;
 
 #[derive(Clone, Default)]
@@ -36,6 +37,40 @@ impl ModelExchange for ScriptedModel {
     }
 }
 
+#[derive(Clone, Default)]
+struct ScriptedNativeModel {
+    replies: Arc<Mutex<Vec<NativeModelResponse>>>,
+    prompts: Arc<Mutex<Vec<String>>>,
+}
+
+impl ScriptedNativeModel {
+    fn new(replies: Vec<NativeModelResponse>) -> Self {
+        Self {
+            replies: Arc::new(Mutex::new(replies.into_iter().rev().collect())),
+            prompts: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ModelExchange for ScriptedNativeModel {
+    async fn complete(&self, prompt: &str) -> anyhow::Result<String> {
+        self.prompts.lock().unwrap().push(prompt.to_string());
+        Err(anyhow::anyhow!("text path should not be used"))
+    }
+
+    async fn complete_with_tools(
+        &self,
+        prompt: &str,
+        _tools: &[NativeToolSpec],
+    ) -> anyhow::Result<Option<NativeModelResponse>> {
+        self.prompts.lock().unwrap().push(prompt.to_string());
+        Ok(Some(self.replies.lock().unwrap().pop().ok_or_else(
+            || anyhow::anyhow!("no scripted native reply left"),
+        )?))
+    }
+}
+
 #[tokio::test]
 async fn loop_executes_read_then_returns_final_answer() {
     let dir = tempdir().unwrap();
@@ -64,6 +99,30 @@ async fn loop_executes_read_then_returns_final_answer() {
     assert_eq!(prompts.len(), 2);
     assert!(prompts[1].contains("TOOL_RESULT"));
     assert!(prompts[1].contains("hello branch"));
+}
+
+#[tokio::test]
+async fn loop_accepts_native_final_tool_call() {
+    let dir = tempdir().unwrap();
+    let model =
+        ScriptedNativeModel::new(vec![NativeModelResponse::ToolCalls(vec![NativeToolCall {
+            id: None,
+            name: "final".to_string(),
+            arguments: serde_json::json!({ "content": "native final answer" }),
+        }])]);
+    let driver = LoopDriver::new(LoopConfig::default());
+
+    let out = driver
+        .run(
+            &model,
+            dir.path(),
+            "Explain the branch",
+            Vec::<ModelTurn>::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(out.final_text, "native final answer");
 }
 
 #[tokio::test]
@@ -233,6 +292,90 @@ async fn loop_reuses_duplicate_read_only_tool_calls() {
     assert_eq!(out.final_text, "done after reread");
     let prompts = model.prompts();
     assert!(prompts[2].contains("TOOL_RESULT read_file"));
+}
+
+#[tokio::test]
+async fn loop_turns_excessive_duplicate_read_only_calls_into_tool_error() {
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
+    let model = ScriptedModel::new(vec![
+        r#"{"type":"tool_calls","calls":[{"tool":"read_file","args":{"path":"a.txt"}}]}"#
+            .to_string(),
+        r#"{"type":"tool_calls","calls":[{"tool":"read_file","args":{"path":"a.txt"}}]}"#
+            .to_string(),
+        r#"{"type":"tool_calls","calls":[{"tool":"read_file","args":{"path":"a.txt"}}]}"#
+            .to_string(),
+        r#"{"type":"tool_calls","calls":[{"tool":"read_file","args":{"path":"a.txt"}}]}"#
+            .to_string(),
+        r#"{"type":"final","content":"done after duplicate limit"}"#.to_string(),
+    ]);
+    let driver = LoopDriver::new(LoopConfig::default());
+
+    let out = driver
+        .run(&model, dir.path(), "inspect file", Vec::<ModelTurn>::new())
+        .await
+        .unwrap();
+
+    assert_eq!(out.final_text, "done after duplicate limit");
+    let prompts = model.prompts();
+    assert!(prompts[4].contains("duplicate_reuse_limit"));
+}
+
+#[tokio::test]
+async fn loop_turns_duplicate_empty_glob_into_tool_error_instead_of_reuse() {
+    let dir = tempdir().unwrap();
+    let model = ScriptedModel::new(vec![
+        r#"{"type":"tool_calls","calls":[{"tool":"glob","args":{"pattern":"missing/*"}}]}"#
+            .to_string(),
+        r#"{"type":"tool_calls","calls":[{"tool":"glob","args":{"pattern":"missing/*"}}]}"#
+            .to_string(),
+        r#"{"type":"final","content":"changed strategy"}"#.to_string(),
+    ]);
+    let driver = LoopDriver::new(LoopConfig::default());
+
+    let out = driver
+        .run(
+            &model,
+            dir.path(),
+            "inspect missing dir",
+            Vec::<ModelTurn>::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(out.final_text, "changed strategy");
+    let prompts = model.prompts();
+    assert!(prompts[2].contains("duplicate_empty_result"));
+}
+
+#[tokio::test]
+async fn loop_blocks_repeated_pre_write_directory_inspection() {
+    let dir = tempdir().unwrap();
+    let model = ScriptedModel::new(vec![
+        r#"{"type":"tool_calls","calls":[{"tool":"mkdir","args":{"path":"out"}}]}"#.to_string(),
+        r#"{"type":"tool_calls","calls":[{"tool":"list_dir","args":{"path":"out"}}]}"#
+            .to_string(),
+        r#"{"type":"tool_calls","calls":[{"tool":"stat_path","args":{"path":"out"}}]}"#
+            .to_string(),
+        r#"{"type":"tool_calls","calls":[{"tool":"write_file","args":{"path":"out/index.html","content":"<html>ok</html>"}}]}"#
+            .to_string(),
+        r#"{"type":"final","content":"created output"}"#.to_string(),
+    ]);
+    let driver = LoopDriver::new(LoopConfig::default());
+
+    let out = driver
+        .run(
+            &model,
+            dir.path(),
+            "Create browser output in out",
+            Vec::<ModelTurn>::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(out.final_text, "created output");
+    let prompts = model.prompts();
+    assert!(prompts[3].contains("stalled_pre_write_inspection"));
 }
 
 #[tokio::test]

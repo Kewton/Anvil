@@ -1,9 +1,11 @@
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ModelProfile {
     pub name: String,
     pub max_context_tokens: usize,
     pub summary_trigger_tokens: usize,
     pub subagent_trigger_tokens: usize,
+    pub tool_temperature: f32,
+    pub tool_context_tokens: usize,
 }
 
 impl ModelProfile {
@@ -13,6 +15,8 @@ impl ModelProfile {
             max_context_tokens: 200_000,
             summary_trigger_tokens: 48_000,
             subagent_trigger_tokens: 96_000,
+            tool_temperature: 0.2,
+            tool_context_tokens: 48_000,
         }
     }
 }
@@ -24,6 +28,8 @@ pub fn profile_for_model(name: &str) -> ModelProfile {
             max_context_tokens: 200_000,
             summary_trigger_tokens: 48_000,
             subagent_trigger_tokens: 96_000,
+            tool_temperature: 0.2,
+            tool_context_tokens: 64_000,
         },
         _ => ModelProfile::default_for(name),
     }

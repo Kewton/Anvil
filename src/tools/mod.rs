@@ -40,6 +40,41 @@ pub fn read_file(path: &Path) -> anyhow::Result<String> {
     Ok(std::fs::read_to_string(path)?)
 }
 
+pub fn list_dir(path: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let mut entries = std::fs::read_dir(path)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    entries.sort();
+    Ok(entries)
+}
+
+pub fn stat_path(path: &Path) -> anyhow::Result<String> {
+    let meta = std::fs::metadata(path)?;
+    let kind = if meta.is_dir() {
+        "directory"
+    } else if meta.is_file() {
+        "file"
+    } else {
+        "other"
+    };
+    Ok(format!(
+        "path={}\nkind={}\nsize={}",
+        path.display(),
+        kind,
+        meta.len()
+    ))
+}
+
+pub fn path_exists(path: &Path) -> bool {
+    path.exists()
+}
+
+pub fn mkdir_p(path: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(path)?;
+    Ok(())
+}
+
 pub fn write_file(path: &Path, content: &str) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;

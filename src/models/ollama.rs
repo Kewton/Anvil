@@ -3,8 +3,12 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::models::stream::NdjsonStreamParser;
+use crate::models::tool_calling::{
+    NativeModelResponse, NativeToolCall, NativeToolSpec, ToolUseOptions,
+};
 
 #[derive(Debug, Clone)]
 pub struct OllamaClient {
@@ -17,6 +21,12 @@ struct ChatRequest<'a> {
     model: &'a str,
     stream: bool,
     messages: Vec<Message<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<ToolSpec<'a>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    options: Option<OllamaOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    keep_alive: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -33,12 +43,44 @@ struct ChatResponse {
 #[derive(Debug, Clone, Deserialize)]
 struct ChatMessage {
     content: String,
+    #[serde(default)]
+    tool_calls: Vec<OllamaToolCall>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct StreamChunk {
     message: Option<ChatMessage>,
     done: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ToolSpec<'a> {
+    r#type: &'static str,
+    function: ToolFunction<'a>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ToolFunction<'a> {
+    name: &'a str,
+    description: &'a str,
+    parameters: Value,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OllamaToolCall {
+    function: OllamaToolFunctionCall,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OllamaToolFunctionCall {
+    name: String,
+    arguments: Value,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OllamaOptions {
+    temperature: f32,
+    num_ctx: usize,
 }
 
 impl OllamaClient {
@@ -87,6 +129,9 @@ impl OllamaClient {
                 role: "user",
                 content: prompt,
             }],
+            tools: None,
+            options: None,
+            keep_alive: None,
         };
         let body: ChatResponse = self
             .client
@@ -109,6 +154,9 @@ impl OllamaClient {
                 role: "user",
                 content: prompt,
             }],
+            tools: None,
+            options: None,
+            keep_alive: None,
         };
         let mut resp_stream = self
             .client
@@ -143,5 +191,68 @@ impl OllamaClient {
             }
         }
         Ok(out)
+    }
+
+    pub async fn chat_with_tools(
+        &self,
+        model: &str,
+        prompt: &str,
+        tools: &[NativeToolSpec],
+        options: ToolUseOptions,
+    ) -> anyhow::Result<NativeModelResponse> {
+        let url = format!("{}/api/chat", self.base_url);
+        let req = ChatRequest {
+            model,
+            stream: false,
+            messages: vec![Message {
+                role: "user",
+                content: prompt,
+            }],
+            tools: Some(
+                tools
+                    .iter()
+                    .map(|tool| ToolSpec {
+                        r#type: "function",
+                        function: ToolFunction {
+                            name: tool.name,
+                            description: tool.description,
+                            parameters: tool.input_schema.clone(),
+                        },
+                    })
+                    .collect(),
+            ),
+            options: Some(OllamaOptions {
+                temperature: options.temperature,
+                num_ctx: options.max_context_tokens,
+            }),
+            keep_alive: options.keep_alive.then_some(-1),
+        };
+        let body: ChatResponse = self
+            .client
+            .post(url)
+            .json(&req)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let message = body.message.unwrap_or(ChatMessage {
+            content: String::new(),
+            tool_calls: Vec::new(),
+        });
+        if !message.tool_calls.is_empty() {
+            return Ok(NativeModelResponse::ToolCalls(
+                message
+                    .tool_calls
+                    .into_iter()
+                    .map(|call| NativeToolCall {
+                        id: None,
+                        name: call.function.name,
+                        arguments: call.function.arguments,
+                    })
+                    .collect(),
+            ));
+        }
+        Ok(NativeModelResponse::Message(message.content))
     }
 }
