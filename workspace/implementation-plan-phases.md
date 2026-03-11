@@ -569,6 +569,35 @@ TDD の観点:
 - [ ] stretch goals は満たせなくても task failure にならない
 - [ ] UI から「何を最低限満たし、何を品質向上目標として狙っているか」が分かる
 
+## Phase 3.8: Loop State と Provider I/O の安定化
+
+目的:
+
+- [ ] stale な read-only observation cache を生成タスクで引きずらない設計にする
+- [ ] phase truth source を `RequirementState` と整合する単一の設計へ寄せる
+- [ ] provider-native tool streaming を活かし、tool use の体感待ち時間を減らす
+- [ ] 巨大な単一 prompt 依存を減らし、message-structured な loop へ段階的に寄せる
+
+先に書くテスト:
+
+- [ ] write/edit/mkdir 後に stale cache が使われない設計テスト
+- [ ] `current phase` と `remaining requirements` が矛盾しない設計テスト
+- [ ] tool streaming が有効な provider で streaming path を通るテスト
+- [ ] prompt/message 構成変更後も既存 loop recovery が壊れない回帰テスト
+
+実装:
+
+- [ ] read-only cache invalidation policy を設計し、`RequirementState` / audit と整合させる
+- [ ] phase 遷移の truth source を一元化する
+- [ ] Ollama / LM Studio の native tool streaming 活用方針を整理する
+- [ ] `ANVIL.md` / memory / tool history / contract を単一巨大 prompt ではなく message 分割に寄せる設計を行う
+
+完了条件:
+
+- [ ] verify/review が stale な read-only result に引きずられにくくなる
+- [ ] `phase` と `remaining requirements` の不整合が設計上起きにくい
+- [ ] 同一モデルでも `vibe-local` に近い tool use 応答性へ寄せられる見込みが立つ
+
 ## Phase 4: 拡張フェーズ
 
 目的:
