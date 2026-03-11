@@ -27,7 +27,7 @@ use crate::state::memory::MemoryStore;
 use crate::state::session::Session;
 use crate::state::summary::{SummaryController, SummaryInput, SummaryPolicy};
 use crate::ui::interactive::{FooterState, InteractiveFrame, SpinnerHandle, UiEvent};
-use crate::ui::render::{render_banner, render_frame};
+use crate::ui::render::{render_banner, render_frame, render_result_block, render_startup_help};
 use anyhow::anyhow;
 
 #[derive(Debug, Clone)]
@@ -137,6 +137,7 @@ impl Agent {
         println!("model: {}", self.config.model);
         println!("cwd: {}", self.config.cwd.display());
         println!("type /exit to quit, /memory add|show|edit, /plan, /act, /subagent");
+        println!("{}", render_startup_help());
 
         let memory = MemoryStore::new(self.config.cwd.join("ANVIL-MEMORY.md"));
         let registry = SlashRegistry::load(&self.config.cwd)?;
@@ -166,9 +167,7 @@ impl Agent {
             println!("{}", render_frame(&frame));
             print!("anvil> ");
             io::stdout().flush()?;
-            let mut line = String::new();
-            io::stdin().read_line(&mut line)?;
-            let input = line.trim();
+            let input = read_user_input()?;
             if input.is_empty() {
                 continue;
             }
@@ -176,7 +175,7 @@ impl Agent {
                 break;
             }
             transcript.push(UiEvent::UserInput(input.to_string()));
-            if let Some(command) = registry.resolve(input)? {
+            if let Some(command) = registry.resolve(&input)? {
                 let spinner = SpinnerHandle::start("slash");
                 let output = self
                     .execute_slash(command, memory.path(), &mut plan_state)
@@ -228,7 +227,11 @@ impl Agent {
             transcript.push(UiEvent::AgentText(
                 summary.truncate_tool_output(&reply.final_text, 800),
             ));
-            println!("\n---\n{}", truncate(&reply.final_text, 240));
+            let result_details = collect_result_details(&reply.final_text, &self.config.cwd);
+            println!(
+                "\n{}",
+                render_result_block(&truncate(&reply.final_text, 240), &result_details)
+            );
         }
         Ok(())
     }
@@ -296,14 +299,67 @@ impl Agent {
     }
 }
 
+fn read_user_input() -> anyhow::Result<String> {
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    let trimmed = line.trim_end_matches(['\r', '\n']);
+    if trimmed != "\"\"\"" {
+        return Ok(trimmed.trim().to_string());
+    }
+
+    let mut lines = Vec::new();
+    loop {
+        let mut block_line = String::new();
+        io::stdin().read_line(&mut block_line)?;
+        let content = block_line.trim_end_matches(['\r', '\n']);
+        if content == "\"\"\"" {
+            break;
+        }
+        lines.push(content.to_string());
+    }
+    Ok(lines.join("\n").trim().to_string())
+}
+
+fn collect_result_details(text: &str, cwd: &Path) -> Vec<String> {
+    let mut details = Vec::new();
+    for token in text.split_whitespace() {
+        let candidate = token.trim_matches(|ch: char| {
+            matches!(ch, '`' | '"' | '\'' | ',' | '.' | ')' | '(' | ':' | ';')
+        });
+        if !(candidate.starts_with("./") || candidate.starts_with('/')) {
+            continue;
+        }
+        let path = PathBuf::from(candidate);
+        let normalized = if path.is_absolute() {
+            path
+        } else {
+            cwd.join(path)
+        };
+        let display = if normalized.starts_with(cwd) {
+            match normalized.strip_prefix(cwd) {
+                Ok(relative) => format!("./{}", relative.display()),
+                Err(_) => normalized.display().to_string(),
+            }
+        } else {
+            normalized.display().to_string()
+        };
+        if !details.contains(&display) {
+            details.push(display);
+        }
+    }
+    details
+}
+
 fn print_loop_event(event: &LoopEvent) {
     match event {
-        LoopEvent::StepStarted { step } => println!("\n- agent loop step {step}"),
+        LoopEvent::StepStarted { step, purpose } => {
+            println!("\n▶ Agent Step {step}: {purpose}")
+        }
         LoopEvent::ModelResponseReceived { bytes, elapsed_ms } => {
-            println!("- model response chunk received ({bytes} bytes, {elapsed_ms} ms)")
+            println!("  ◦ Model chunk ({bytes} bytes, {elapsed_ms} ms)")
         }
         LoopEvent::ModelResponsePreview { preview } => {
-            println!("- model raw: {}", truncate(preview, 200))
+            println!("  ◦ Model raw: {}", truncate(preview, 200))
         }
         LoopEvent::ProtocolRetry {
             error_kind,
@@ -311,7 +367,7 @@ fn print_loop_event(event: &LoopEvent) {
             retry,
             max_retries,
         } => println!(
-            "- protocol error [{error_kind}] retrying {retry}/{max_retries}: {}",
+            "  ! Recovery protocol [{error_kind}] retry {retry}/{max_retries}: {}",
             truncate(message, 120)
         ),
         LoopEvent::FinalRejected {
@@ -319,7 +375,7 @@ fn print_loop_event(event: &LoopEvent) {
             retry,
             max_retries,
         } => println!(
-            "- final rejected retrying {retry}/{max_retries}: {}",
+            "  ! Recovery final rejected {retry}/{max_retries}: {}",
             truncate(reason, 120)
         ),
         LoopEvent::ToolSchemaRetry {
@@ -328,7 +384,7 @@ fn print_loop_event(event: &LoopEvent) {
             retry,
             max_retries,
         } => println!(
-            "- tool schema retry [{tool}] {retry}/{max_retries}: {}",
+            "  ! Recovery schema [{tool}] {retry}/{max_retries}: {}",
             truncate(message, 120)
         ),
         LoopEvent::ToolExecutionRetry {
@@ -337,36 +393,36 @@ fn print_loop_event(event: &LoopEvent) {
             retry,
             max_retries,
         } => println!(
-            "- tool execution retry [{tool}] {retry}/{max_retries}: {}",
+            "  ! Recovery execution [{tool}] {retry}/{max_retries}: {}",
             truncate(message, 120)
         ),
         LoopEvent::ToolExecutionStarted { tool, summary } => {
-            println!("- tool start [{tool}] {summary}")
+            println!("  ⚙ Tool start [{tool}] {summary}")
         }
         LoopEvent::ToolCallValidated { tool, normalized } => {
-            println!("- tool validated [{tool}] {}", truncate(normalized, 200))
+            println!("  ✓ Tool validated [{tool}] {}", truncate(normalized, 200))
         }
         LoopEvent::ToolExecutionFinished { tool, elapsed_ms } => {
-            println!("- tool done [{tool}] ({elapsed_ms} ms)")
+            println!("  ✓ Tool done [{tool}] ({elapsed_ms} ms)")
         }
         LoopEvent::ToolResultPreview { tool, preview } => {
-            println!("- tool result [{tool}] {}", truncate(preview, 180))
+            println!("  ◦ Tool result [{tool}] {}", truncate(preview, 180))
         }
         LoopEvent::ToolResultReused { tool, reuse_count } => {
-            println!("- tool result reused [{tool}] (reuse #{reuse_count})")
+            println!("  ◦ Tool reused [{tool}] (reuse #{reuse_count})")
         }
         LoopEvent::ToolErrorRecorded {
             tool,
             error_kind,
             message,
         } => println!(
-            "- tool error [{tool}] {error_kind}: {}",
+            "  ! Recovery tool [{tool}] {error_kind}: {}",
             truncate(message, 120)
         ),
         LoopEvent::StepFinished { step, elapsed_ms } => {
-            println!("- step {step} finished ({elapsed_ms} ms)")
+            println!("  ✓ Agent step {step} finished ({elapsed_ms} ms)")
         }
-        LoopEvent::FinalReady => println!("- final response ready"),
+        LoopEvent::FinalReady => println!("✔ Agent result ready"),
     }
 }
 

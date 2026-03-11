@@ -1,6 +1,7 @@
 use anvil::ui::interactive::{FooterState, InteractiveFrame, UiEvent};
 use anvil::ui::render::{
-    render_banner, render_event_log, render_frame, render_rich_diff, type_ahead_suggestions,
+    render_banner, render_event_log, render_frame, render_result_block, render_rich_diff,
+    render_startup_help, type_ahead_suggestions,
 };
 
 #[test]
@@ -25,9 +26,10 @@ fn renderer_snapshot_contains_claude_code_like_sections() {
     let rendered = render_frame(&frame);
 
     assert!(rendered.contains("Anvil"));
-    assert!(rendered.contains("provider: ollama"));
-    assert!(rendered.contains("mode: act"));
+    assert!(rendered.contains("🦙 provider"));
+    assert!(rendered.contains("🔐 mode"));
     assert!(rendered.contains("48k/200k"));
+    assert!(rendered.contains("📁 cwd"));
 }
 
 #[test]
@@ -40,9 +42,9 @@ fn renderer_event_sequence_and_contract_are_stable() {
     let rendered = render_event_log(&events);
 
     assert!(rendered.lines().count() >= 3);
-    assert!(rendered.contains("user> hello"));
-    assert!(rendered.contains("agent> world"));
-    assert!(rendered.contains("tool> diff"));
+    assert!(rendered.contains("You  hello"));
+    assert!(rendered.contains("Anvil  world"));
+    assert!(rendered.contains("Tool  diff"));
 }
 
 #[test]
@@ -62,7 +64,26 @@ fn rich_diff_and_type_ahead_are_available() {
 fn startup_banner_contains_colored_anvil_wordmark() {
     let banner = render_banner();
 
-    assert!(banner.contains("A N V I L"));
+    assert!(banner.contains("A N V I L") || banner.contains("ANVIL"));
     assert!(banner.contains("\x1b[38;5;196m"));
-    assert!(banner.contains("/\\\\"));
+    assert!(banner.contains("_   _"));
+}
+
+#[test]
+fn startup_help_describes_multiline_input() {
+    let help = render_startup_help();
+
+    assert!(help.contains("\"\"\""));
+    assert!(help.contains("multiline"));
+    assert!(help.contains("/exit"));
+}
+
+#[test]
+fn result_block_is_visually_separated() {
+    let rendered =
+        render_result_block("Created output", &["./sandbox/demo/index.html".to_string()]);
+
+    assert!(rendered.contains("RESULT"));
+    assert!(rendered.contains("Created output"));
+    assert!(rendered.contains("./sandbox/demo/index.html"));
 }

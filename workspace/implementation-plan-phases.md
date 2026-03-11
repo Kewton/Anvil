@@ -377,32 +377,32 @@ TDD の観点:
 
 目的:
 
-- [ ] 起動直後に `ANVIL` だと一目で分かるワードマークと起動画面にする
-- [ ] provider / model / mode / cwd / permission などの状態を視覚的に読みやすくする
-- [ ] 入力方法、とくに複数行入力のやり方を迷わないようにする
-- [ ] agent loop の「開始」「途中経過」「回復」「完了」を見分けやすくする
-- [ ] 最終結果を操作ログから視覚的に分離し、メリハリをつける
+- [x] 起動直後に `ANVIL` だと一目で分かるワードマークと起動画面にする
+- [x] provider / model / mode / cwd / permission などの状態を視覚的に読みやすくする
+- [x] 入力方法、とくに複数行入力のやり方を迷わないようにする
+- [x] agent loop の「開始」「途中経過」「回復」「完了」を見分けやすくする
+- [x] 最終結果を操作ログから視覚的に分離し、メリハリをつける
 
 先に書くテスト:
 
-- [ ] 起動バナーの snapshot test を `ANVIL` 可読ワードマーク前提で更新する
-- [ ] status header の renderer snapshot test
-- [ ] 起動ヘルプに複数行入力案内が含まれる contract test
-- [ ] loop event renderer が `agent / tool / recovery / result` を別スタイルで描く snapshot test
-- [ ] create task の phase 表示 (`prepare`, `write`, `verify`, `finalize`) contract test
-- [ ] final response block の snapshot test
-- [ ] one-shot と interactive で共通の result block を使う renderer test
+- [x] 起動バナーの snapshot test を `ANVIL` 可読ワードマーク前提で更新する
+- [x] status header の renderer snapshot test
+- [x] 起動ヘルプに複数行入力案内が含まれる contract test
+- [x] loop event renderer が `agent / tool / recovery / result` を別スタイルで描く snapshot test
+- [x] create task の phase 表示 (`prepare`, `write`, `verify`, `finalize`) contract test
+- [x] final response block の snapshot test
+- [x] one-shot と interactive で共通の result block を使う renderer test
 
 実装:
 
-- [ ] `render_banner()` を読める `ANVIL` ワードマークへ置き換える
-- [ ] 起動時の status header に記号 / 絵文字 / ラベルを追加する
-- [ ] 複数行入力方法を起動時ヘルプへ追加する
-- [ ] `print_loop_event()` を単純ログ列から段階別表示へ変更する
-- [ ] step ごとに「何をしようとしているか」を表示する
-- [ ] create / inspect それぞれで phase / intent を UI に出す
-- [ ] final response を `Result` ブロックとして分離する
-- [ ] one-shot でも interactive と同じ progress / result 表示方針を使う
+- [x] `render_banner()` を読める `ANVIL` ワードマークへ置き換える
+- [x] 起動時の status header に記号 / 絵文字 / ラベルを追加する
+- [x] 複数行入力方法を起動時ヘルプへ追加する
+- [x] `print_loop_event()` を単純ログ列から段階別表示へ変更する
+- [x] step ごとに「何をしようとしているか」を表示する
+- [x] create / inspect それぞれで phase / intent を UI に出す
+- [x] final response を `Result` ブロックとして分離する
+- [x] one-shot でも interactive と同じ progress / result 表示方針を使う
 
 TDD の観点:
 
@@ -412,10 +412,10 @@ TDD の観点:
 
 完了条件:
 
-- [ ] 起動画面だけで `ANVIL` / provider / model / mode が瞬時に分かる
-- [ ] 複数行入力方法をユーザーが迷わない
-- [ ] `agent loop step` と `tool` と `recovery` の違いが見分けられる
-- [ ] 最終結果がログの流れに埋もれず、明確に読める
+- [x] 起動画面だけで `ANVIL` / provider / model / mode が瞬時に分かる
+- [x] 複数行入力方法をユーザーが迷わない
+- [x] `agent loop step` と `tool` と `recovery` の違いが見分けられる
+- [x] 最終結果がログの流れに埋もれず、明確に読める
 
 ## Phase 4: 拡張フェーズ
 

@@ -91,6 +91,7 @@ pub struct LoopDriver {
 pub enum LoopEvent {
     StepStarted {
         step: usize,
+        purpose: String,
     },
     ModelResponseReceived {
         bytes: usize,
@@ -194,7 +195,10 @@ impl LoopDriver {
         for step in 0..self.config.max_steps {
             let step_number = step + 1;
             let step_started_at = Instant::now();
-            observer(LoopEvent::StepStarted { step: step_number });
+            observer(LoopEvent::StepStarted {
+                step: step_number,
+                purpose: step_purpose(task, &turns),
+            });
             let prompt = build_loop_prompt(task, &turns);
             let model_started_at = Instant::now();
             let response = match model.complete_with_tools(&prompt, &tool_specs()).await? {
@@ -1043,6 +1047,29 @@ fn completion_hint(task: &str, turns: &[ModelTurn]) -> Option<String> {
     }
 
     None
+}
+
+fn step_purpose(task: &str, turns: &[ModelTurn]) -> String {
+    if task_requires_write_action(task) {
+        return match create_phase_for_task(task, turns) {
+            CreatePhase::Prepare => "prepare output path".to_string(),
+            CreatePhase::Write => "write deliverable".to_string(),
+            CreatePhase::Verify => "verify generated output".to_string(),
+            CreatePhase::Finalize => "finalize response".to_string(),
+        };
+    }
+
+    if is_branch_inspection_task(task) {
+        if has_branch_evidence(turns)
+            && has_commit_history_evidence(turns)
+            && has_status_evidence(turns)
+        {
+            return "summarize gathered git evidence".to_string();
+        }
+        return "inspect repository state".to_string();
+    }
+
+    "gather context".to_string()
 }
 
 fn is_branch_inspection_task(task: &str) -> bool {

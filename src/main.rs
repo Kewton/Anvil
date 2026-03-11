@@ -6,6 +6,7 @@ use anvil::config::{AppConfig, ProviderKind};
 use anvil::policy::permissions::{
     ExecutionContext, InteractionMode, NonInteractiveBehavior, PermissionMode,
 };
+use anvil::ui::render::render_result_block;
 use clap::Parser;
 
 #[tokio::main]
@@ -58,10 +59,16 @@ async fn main() -> anyhow::Result<()> {
                 target_dir: config.cwd.clone(),
             })
             .await?;
-        println!("{}", output.final_message);
-        for file in output.written_files {
-            println!("wrote {}", file.display());
-        }
+        let details = output
+            .written_files
+            .iter()
+            .map(|file| {
+                file.strip_prefix(&config.cwd)
+                    .map(|relative| format!("./{}", relative.display()))
+                    .unwrap_or_else(|_| file.display().to_string())
+            })
+            .collect::<Vec<_>>();
+        println!("{}", render_result_block(&output.final_message, &details));
         return Ok(());
     }
 
