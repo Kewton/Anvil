@@ -577,6 +577,7 @@ TDD の観点:
 - [ ] phase truth source を `RequirementState` と整合する単一の設計へ寄せる
 - [ ] provider-native tool streaming を活かし、tool use の体感待ち時間を減らす
 - [ ] 巨大な単一 prompt 依存を減らし、message-structured な loop へ段階的に寄せる
+- [ ] 詳細設計は [phase3.8-loop-state-and-provider-design.md](/Users/maenokota/share/work/github_kewton/Anvil/workspace/phase3.8-loop-state-and-provider-design.md) に固定する
 
 先に書くテスト:
 
@@ -584,19 +585,57 @@ TDD の観点:
 - [ ] `current phase` と `remaining requirements` が矛盾しない設計テスト
 - [ ] tool streaming が有効な provider で streaming path を通るテスト
 - [ ] prompt/message 構成変更後も既存 loop recovery が壊れない回帰テスト
+- [ ] provider capability が `Unknown -> Supported/Unsupported` に遷移する table-driven test
+- [ ] `RequirementState.remaining -> CreatePhase` mapping test
+- [ ] message-structured layout で `ANVIL.md / memory / carryover / contract / transcript` が期待 role に分かれる test
+- [ ] `DeliverableStructureVerified / CoreRequirementsVerified / ReviewCompleted` の粒度を固定する test
+- [ ] provider runtime policy が tool mode で temperature / keep-alive / num_ctx を切り替える test
+- [ ] `working transcript -> carryover summary` 昇格規則の compaction test
+- [ ] repeat detector が state redesign 後も fail-safe のまま残る回帰 test
 
 実装:
 
-- [ ] read-only cache invalidation policy を設計し、`RequirementState` / audit と整合させる
-- [ ] phase 遷移の truth source を一元化する
-- [ ] Ollama / LM Studio の native tool streaming 活用方針を整理する
-- [ ] `ANVIL.md` / memory / tool history / contract を単一巨大 prompt ではなく message 分割に寄せる設計を行う
+- [ ] read-only cache invalidation matrix を設計どおり実装する
+  - Phase 3.8 初期は `write_file / edit_file / mkdir / non-read-only exec` 後に read-only cache を全破棄
+  - audit に `cache_invalidated` を出す
+  - path-scoped invalidation は gate 条件が揃うまで入れない
+- [ ] phase 遷移の truth source を `RequirementState.remaining` へ一元化する
+  - `CreatePhase` は derived UI state に格下げする
+  - `DeliverableVerified` は `DeliverableStructureVerified` と `CoreRequirementsVerified` に分解する
+- [ ] provider capability model を追加する
+  - `Unknown / Supported / Unsupported`
+  - `provider + model + endpoint fingerprint` 単位の probe once + cached fallback
+- [ ] provider runtime policy を追加する
+  - tool-call 時の temperature cap
+  - keep-alive
+  - context window reflection
+  - stream preference
+- [ ] Ollama / LM Studio で tool streaming 対応 path と sync fallback path を分離する
+- [ ] `ANVIL.md / memory / carryover / contract / transcript` を message-structured layout へ分割する
+  - base policy
+  - project instructions
+  - memory
+  - carryover
+  - task contract
+  - user objective
+  - compacted transcript
+  - working transcript と carryover summary の昇格規則を持つ
+  - Phase 3.7 の creative guidance は contract message に残す
+- [ ] tool result 後の短い assistant summary hook を追加する
+- [ ] repeat recovery を state/evidence 駆動へ寄せる
+  - same read-only repeated without new evidence
+  - repeated finalize probe
+  - same-tool repeated after `no_progress`
 
 完了条件:
 
 - [ ] verify/review が stale な read-only result に引きずられにくくなる
 - [ ] `phase` と `remaining requirements` の不整合が設計上起きにくい
 - [ ] 同一モデルでも `vibe-local` に近い tool use 応答性へ寄せられる見込みが立つ
+- [ ] 実装者が cache invalidation / phase derivation / provider fallback で迷わない粒度まで設計が固定される
+- [ ] provider runtime tuning と tool streaming capability の責務分離が明確になる
+- [ ] compaction 後も creative guidance と carryover summary が両立する
+- [ ] repeat detector が redesign 後も安全装置として機能する
 
 ## Phase 4: 拡張フェーズ
 

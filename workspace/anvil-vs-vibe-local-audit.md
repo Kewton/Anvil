@@ -48,5 +48,6 @@
 
 ## Applied Responses (this turn)
 
-1. 上位 2 件の loop stability 問題を優先して修正する
-2. review 文書は `workspace` に保存し、残りの改善の基準にする
+1. 上位の論点を `Phase 3.8` の設計課題として計画書へ反映する
+2. `cache invalidation matrix`, `phase truth source migration`, `provider streaming capability model`, `message-structured prompt layout` を別設計書に具体化する
+3. `provider runtime policy`, `working transcript -> carryover summary` 昇格規則, `RequirementState` の粒度, `repeat recovery` fail-safe を Phase 3.8 設計へ追加する
