@@ -67,6 +67,60 @@ async fn loop_executes_read_then_returns_final_answer() {
 }
 
 #[tokio::test]
+async fn loop_rejects_final_before_required_write_and_recovers() {
+    let dir = tempdir().unwrap();
+    let model = ScriptedModel::new(vec![
+        r#"{"type":"final","content":"I need to create the file first."}"#.to_string(),
+        r#"{"type":"tool_calls","calls":[{"tool":"write_file","args":{"path":"index.html","content":"<html></html>"}}]}"#
+            .to_string(),
+        r#"{"type":"final","content":"created index.html"}"#.to_string(),
+    ]);
+    let driver = LoopDriver::new(LoopConfig::default());
+
+    let out = driver
+        .run(
+            &model,
+            dir.path(),
+            "index.html を作成して出力してください",
+            Vec::<ModelTurn>::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(out.final_text, "created index.html");
+    let prompts = model.prompts();
+    assert!(prompts[1].contains("final_without_action"));
+    assert!(std::fs::read_to_string(dir.path().join("index.html")).is_ok());
+}
+
+#[tokio::test]
+async fn loop_accepts_flat_write_file_tool_call_without_args_wrapper() {
+    let dir = tempdir().unwrap();
+    let model = ScriptedModel::new(vec![
+        r#"{"type":"tool_calls","calls":[{"tool":"write_file","path":"flat.html","content":"<html>flat</html>"}]}"#
+            .to_string(),
+        r#"{"type":"final","content":"created flat.html"}"#.to_string(),
+    ]);
+    let driver = LoopDriver::new(LoopConfig::default());
+
+    let out = driver
+        .run(
+            &model,
+            dir.path(),
+            "flat.html を作成して出力してください",
+            Vec::<ModelTurn>::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(out.final_text, "created flat.html");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("flat.html")).unwrap(),
+        "<html>flat</html>"
+    );
+}
+
+#[tokio::test]
 async fn loop_can_explain_branch_via_git_commands_without_rules() {
     let dir = tempdir().unwrap();
     std::process::Command::new("git")
@@ -159,7 +213,7 @@ async fn loop_rejects_shell_style_exec_command() {
 }
 
 #[tokio::test]
-async fn loop_stops_on_duplicate_tool_calls() {
+async fn loop_reuses_duplicate_read_only_tool_calls() {
     let dir = tempdir().unwrap();
     std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
     let model = ScriptedModel::new(vec![
@@ -167,15 +221,18 @@ async fn loop_stops_on_duplicate_tool_calls() {
             .to_string(),
         r#"{"type":"tool_calls","calls":[{"tool":"read_file","args":{"path":"a.txt"}}]}"#
             .to_string(),
+        r#"{"type":"final","content":"done after reread"}"#.to_string(),
     ]);
     let driver = LoopDriver::new(LoopConfig::default());
 
-    let err = driver
+    let out = driver
         .run(&model, dir.path(), "loop forever", Vec::<ModelTurn>::new())
         .await
-        .unwrap_err();
+        .unwrap();
 
-    assert!(matches!(err, LoopError::DuplicateToolCall(_)));
+    assert_eq!(out.final_text, "done after reread");
+    let prompts = model.prompts();
+    assert!(prompts[2].contains("TOOL_RESULT read_file"));
 }
 
 #[tokio::test]
@@ -274,6 +331,37 @@ async fn loop_retries_after_invalid_json_and_recovers() {
 }
 
 #[tokio::test]
+async fn loop_retries_after_tool_execution_error_and_recovers() {
+    let dir = tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("nested")).unwrap();
+    std::fs::write(dir.path().join("nested/file.txt"), "hello\n").unwrap();
+    let model = ScriptedModel::new(vec![
+        r#"{"type":"tool_calls","calls":[{"tool":"read_file","args":{"path":"nested"}}]}"#
+            .to_string(),
+        r#"{"type":"tool_calls","calls":[{"tool":"glob","args":{"pattern":"nested/*"}}]}"#
+            .to_string(),
+        r#"{"type":"final","content":"recovered after execution error"}"#.to_string(),
+    ]);
+    let driver = LoopDriver::new(LoopConfig::default());
+
+    let out = driver
+        .run(
+            &model,
+            dir.path(),
+            "inspect nested directory",
+            Vec::<ModelTurn>::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(out.final_text, "recovered after execution error");
+    let prompts = model.prompts();
+    assert_eq!(prompts.len(), 3);
+    assert!(prompts[1].contains("TOOL_ERROR read_file"));
+    assert!(prompts[1].contains("execution_error"));
+}
+
+#[tokio::test]
 async fn loop_stops_after_repeated_invalid_json() {
     let dir = tempdir().unwrap();
     let model = ScriptedModel::new(vec![
@@ -347,10 +435,34 @@ async fn loop_allows_retry_after_different_validation_error() {
 }
 
 #[tokio::test]
+async fn loop_stops_on_duplicate_write_tool_calls() {
+    let dir = tempdir().unwrap();
+    let model = ScriptedModel::new(vec![
+        r#"{"type":"tool_calls","calls":[{"tool":"write_file","args":{"path":"a.txt","content":"x"}}]}"#
+            .to_string(),
+        r#"{"type":"tool_calls","calls":[{"tool":"write_file","args":{"path":"a.txt","content":"x"}}]}"#
+            .to_string(),
+    ]);
+    let driver = LoopDriver::new(LoopConfig::default());
+
+    let err = driver
+        .run(&model, dir.path(), "write once", Vec::<ModelTurn>::new())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, LoopError::DuplicateToolCall(_)));
+}
+
+#[tokio::test]
 async fn observer_receives_raw_preview_and_validated_tool_events() {
     let dir = tempdir().unwrap();
     std::fs::write(dir.path().join("README.md"), "hello\n").unwrap();
+    std::fs::create_dir_all(dir.path().join("nested")).unwrap();
     let model = ScriptedModel::new(vec![
+        r#"{"type":"tool_calls","calls":[{"tool":"read_file","args":{"path":"nested"}}]}"#
+            .to_string(),
+        r#"{"type":"tool_calls","calls":[{"tool":"read_file","args":{"path":"README.md"}}]}"#
+            .to_string(),
         r#"{"type":"tool_calls","calls":[{"tool":"read_file","args":{"path":"README.md"}}]}"#
             .to_string(),
         r#"{"type":"final","content":"done"}"#.to_string(),
@@ -387,6 +499,16 @@ async fn observer_receives_raw_preview_and_validated_tool_events() {
             .iter()
             .any(|event| matches!(event, LoopEvent::ToolResultPreview { .. }))
     );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, LoopEvent::ToolResultReused { .. }))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, LoopEvent::ToolExecutionRetry { .. }))
+    );
     assert!(events.iter().any(|event| matches!(
         event,
         LoopEvent::ModelResponseReceived { elapsed_ms: _, .. }
@@ -407,4 +529,5 @@ fn default_loop_config_allows_longer_generation_tasks() {
     let config = LoopConfig::default();
 
     assert_eq!(config.max_steps, 12);
+    assert_eq!(config.max_cached_reuses_per_call, 2);
 }

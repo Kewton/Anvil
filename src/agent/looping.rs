@@ -1,10 +1,10 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use anyhow::{Context, anyhow};
+use anyhow::anyhow;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::tools::{
     edit_file, exec_in_dir, glob_paths, read_file, search_in_files, unified_diff, write_file,
@@ -40,6 +40,7 @@ pub struct LoopConfig {
     pub max_steps: usize,
     pub max_tool_output_chars: usize,
     pub max_schema_retries: usize,
+    pub max_cached_reuses_per_call: usize,
 }
 
 impl Default for LoopConfig {
@@ -48,6 +49,7 @@ impl Default for LoopConfig {
             max_steps: 12,
             max_tool_output_chars: 1_200,
             max_schema_retries: 1,
+            max_cached_reuses_per_call: 2,
         }
     }
 }
@@ -93,7 +95,18 @@ pub enum LoopEvent {
         retry: usize,
         max_retries: usize,
     },
+    FinalRejected {
+        reason: String,
+        retry: usize,
+        max_retries: usize,
+    },
     ToolSchemaRetry {
+        tool: String,
+        message: String,
+        retry: usize,
+        max_retries: usize,
+    },
+    ToolExecutionRetry {
         tool: String,
         message: String,
         retry: usize,
@@ -114,6 +127,10 @@ pub enum LoopEvent {
     ToolResultPreview {
         tool: String,
         preview: String,
+    },
+    ToolResultReused {
+        tool: String,
+        reuse_count: usize,
     },
     StepFinished {
         step: usize,
@@ -152,8 +169,11 @@ impl LoopDriver {
     {
         let mut turns = prior_turns;
         let mut seen = BTreeSet::new();
+        let mut cached_results = BTreeMap::<String, (String, usize)>::new();
         let mut protocol_retry_state: Option<(String, usize)> = None;
         let mut tool_retry_state: Option<(String, usize)> = None;
+        let mut tool_exec_retry_state: Option<(String, usize)> = None;
+        let task_requires_write = task_requires_write_action(task);
 
         for step in 0..self.config.max_steps {
             let step_number = step + 1;
@@ -204,6 +224,33 @@ impl LoopDriver {
 
             match response {
                 ModelResponse::Final { content } => {
+                    if task_requires_write && !has_write_evidence(&turns) {
+                        let reason =
+                            "task requires file changes but no successful write_file/edit_file has occurred yet"
+                                .to_string();
+                        let retry = next_retry_count(
+                            &mut protocol_retry_state,
+                            format!("final_without_action:{reason}"),
+                        );
+                        if retry > self.config.max_schema_retries {
+                            return Err(LoopError::InvalidToolCall(reason));
+                        }
+                        observer(LoopEvent::FinalRejected {
+                            reason: reason.clone(),
+                            retry,
+                            max_retries: self.config.max_schema_retries,
+                        });
+                        turns.push(ModelTurn::ProtocolError {
+                            error_kind: "final_without_action".to_string(),
+                            message: reason,
+                            hint: "if the task requires creating or updating files, use write_file or edit_file before returning final".to_string(),
+                        });
+                        observer(LoopEvent::StepFinished {
+                            step: step_number,
+                            elapsed_ms: step_started_at.elapsed().as_millis(),
+                        });
+                        continue;
+                    }
                     observer(LoopEvent::FinalReady);
                     observer(LoopEvent::StepFinished {
                         step: step_number,
@@ -253,6 +300,30 @@ impl LoopDriver {
                             normalized: truncate(&normalized, 240),
                         });
                         if !seen.insert(normalized.clone()) {
+                            if can_reuse_cached_result(&validated) {
+                                let Some((cached_output, reuse_count)) =
+                                    cached_results.get_mut(&normalized)
+                                else {
+                                    return Err(LoopError::DuplicateToolCall(normalized));
+                                };
+                                *reuse_count += 1;
+                                if *reuse_count > self.config.max_cached_reuses_per_call {
+                                    return Err(LoopError::DuplicateToolCall(normalized));
+                                }
+                                observer(LoopEvent::ToolResultReused {
+                                    tool: validated.tool_name().to_string(),
+                                    reuse_count: *reuse_count,
+                                });
+                                observer(LoopEvent::ToolResultPreview {
+                                    tool: validated.tool_name().to_string(),
+                                    preview: truncate(&cached_output.replace('\n', "\\n"), 220),
+                                });
+                                turns.push(ModelTurn::ToolResult {
+                                    tool: validated.tool_name().to_string(),
+                                    output: cached_output.clone(),
+                                });
+                                continue;
+                            }
                             return Err(LoopError::DuplicateToolCall(normalized));
                         }
                         observer(LoopEvent::ToolExecutionStarted {
@@ -264,9 +335,38 @@ impl LoopDriver {
                             cwd,
                             &validated,
                             self.config.max_tool_output_chars,
-                        )
-                        .with_context(|| format!("tool failed: {:?}", call))
-                        .map_err(LoopError::Other)?;
+                        );
+                        let result = match result {
+                            Ok(result) => {
+                                tool_exec_retry_state = None;
+                                result
+                            }
+                            Err(err) => {
+                                let message = err.to_string();
+                                let retry = next_retry_count(
+                                    &mut tool_exec_retry_state,
+                                    format!("{}:{message}", validated.tool_name()),
+                                );
+                                if retry > self.config.max_schema_retries {
+                                    return Err(LoopError::Other(
+                                        err.context(format!("tool failed: {:?}", call)),
+                                    ));
+                                }
+                                observer(LoopEvent::ToolExecutionRetry {
+                                    tool: validated.tool_name().to_string(),
+                                    message: message.clone(),
+                                    retry,
+                                    max_retries: self.config.max_schema_retries,
+                                });
+                                turns.push(ModelTurn::ToolError {
+                                    tool: validated.tool_name().to_string(),
+                                    error_kind: "execution_error".to_string(),
+                                    message,
+                                    hint: tool_execution_error_hint(&validated),
+                                });
+                                continue;
+                            }
+                        };
                         observer(LoopEvent::ToolExecutionFinished {
                             tool: validated.tool_name().to_string(),
                             elapsed_ms: tool_started_at.elapsed().as_millis(),
@@ -275,6 +375,9 @@ impl LoopDriver {
                             tool: validated.tool_name().to_string(),
                             preview: truncate(&result.replace('\n', "\\n"), 220),
                         });
+                        if can_reuse_cached_result(&validated) {
+                            cached_results.insert(normalized, (result.clone(), 0));
+                        }
                         turns.push(ModelTurn::ToolResult {
                             tool: validated.tool_name().to_string(),
                             output: result,
@@ -305,6 +408,38 @@ fn next_retry_count(state: &mut Option<(String, usize)>, key: String) -> usize {
     }
 }
 
+fn task_requires_write_action(task: &str) -> bool {
+    let lower = task.to_lowercase();
+    let markers = [
+        "create",
+        "write",
+        "save",
+        "generate",
+        "output",
+        "edit",
+        "modify",
+        "implement",
+        "fix",
+        "作成",
+        "出力",
+        "保存",
+        "生成",
+        "修正",
+        "更新",
+        "実装",
+    ];
+    markers.iter().any(|marker| lower.contains(marker))
+}
+
+fn has_write_evidence(turns: &[ModelTurn]) -> bool {
+    turns.iter().any(|turn| {
+        matches!(
+            turn,
+            ModelTurn::ToolResult { tool, .. } if tool == "write_file" || tool == "edit_file"
+        )
+    })
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ModelResponse {
@@ -315,7 +450,10 @@ enum ModelResponse {
 #[derive(Debug, Clone, Deserialize)]
 struct RawToolCall {
     tool: String,
-    args: Value,
+    #[serde(default)]
+    args: Option<Value>,
+    #[serde(flatten)]
+    extra: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -404,7 +542,15 @@ fn parse_model_response(raw: &str) -> Result<ModelResponse, LoopError> {
 }
 
 fn validate_tool_call(raw: &RawToolCall) -> Result<ToolCall, LoopError> {
-    let args = raw.args.clone();
+    let args = match &raw.args {
+        Some(args) => args.clone(),
+        None if !raw.extra.is_empty() => Value::Object(raw.extra.clone()),
+        None => {
+            return Err(LoopError::InvalidToolCall(
+                "missing field `args`".to_string(),
+            ));
+        }
+    };
     match raw.tool.as_str() {
         "read_file" => serde_json::from_value(args)
             .map(ToolCall::ReadFile)
@@ -568,6 +714,36 @@ fn tool_error_hint(tool: &str) -> String {
     }
 }
 
+fn tool_execution_error_hint(call: &ToolCall) -> String {
+    match call {
+        ToolCall::ReadFile(args) => format!(
+            "read_file requires a file path. If {} is a directory, use glob or exec ls instead",
+            args.path.display()
+        ),
+        ToolCall::WriteFile(args) => format!(
+            "write_file failed for {}. Verify the path and retry with valid file content",
+            args.path.display()
+        ),
+        ToolCall::EditFile(args) => format!(
+            "edit_file failed for {}. Read the file first and ensure the target text exists",
+            args.path.display()
+        ),
+        ToolCall::Exec(args) => format!(
+            "exec failed for `{}`. Review stderr and retry with a valid read-only or safe command",
+            args.argv.join(" ")
+        ),
+        ToolCall::Glob(args) => format!(
+            "glob failed for pattern {}. Retry with a valid glob pattern",
+            args.pattern
+        ),
+        ToolCall::Search(args) => format!(
+            "search failed for needle {}. Retry after narrowing the query or checking paths",
+            truncate(&args.needle, 80)
+        ),
+        ToolCall::Diff(_) => "diff failed. Retry with valid before/after content".to_string(),
+    }
+}
+
 fn tool_call_summary(call: &ToolCall) -> String {
     match call {
         ToolCall::ReadFile(args) => format!("read {}", args.path.display()),
@@ -578,4 +754,19 @@ fn tool_call_summary(call: &ToolCall) -> String {
         ToolCall::Search(args) => format!("search {}", truncate(&args.needle, 80)),
         ToolCall::Glob(args) => format!("glob {}", truncate(&args.pattern, 80)),
     }
+}
+
+fn can_reuse_cached_result(call: &ToolCall) -> bool {
+    match call {
+        ToolCall::ReadFile(_) | ToolCall::Search(_) | ToolCall::Glob(_) => true,
+        ToolCall::Exec(args) => is_read_only_exec(&args.argv),
+        ToolCall::WriteFile(_) | ToolCall::EditFile(_) | ToolCall::Diff(_) => false,
+    }
+}
+
+fn is_read_only_exec(argv: &[String]) -> bool {
+    matches!(
+        argv.first().map(String::as_str),
+        Some("ls" | "cat" | "pwd" | "git" | "find" | "rg")
+    )
 }

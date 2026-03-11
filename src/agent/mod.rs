@@ -329,6 +329,14 @@ fn print_loop_event(event: &LoopEvent) {
             "- protocol error [{error_kind}] retrying {retry}/{max_retries}: {}",
             truncate(message, 120)
         ),
+        LoopEvent::FinalRejected {
+            reason,
+            retry,
+            max_retries,
+        } => println!(
+            "- final rejected retrying {retry}/{max_retries}: {}",
+            truncate(reason, 120)
+        ),
         LoopEvent::ToolSchemaRetry {
             tool,
             message,
@@ -336,6 +344,15 @@ fn print_loop_event(event: &LoopEvent) {
             max_retries,
         } => println!(
             "- tool schema retry [{tool}] {retry}/{max_retries}: {}",
+            truncate(message, 120)
+        ),
+        LoopEvent::ToolExecutionRetry {
+            tool,
+            message,
+            retry,
+            max_retries,
+        } => println!(
+            "- tool execution retry [{tool}] {retry}/{max_retries}: {}",
             truncate(message, 120)
         ),
         LoopEvent::ToolExecutionStarted { tool, summary } => {
@@ -349,6 +366,9 @@ fn print_loop_event(event: &LoopEvent) {
         }
         LoopEvent::ToolResultPreview { tool, preview } => {
             println!("- tool result [{tool}] {}", truncate(preview, 180))
+        }
+        LoopEvent::ToolResultReused { tool, reuse_count } => {
+            println!("- tool result reused [{tool}] (reuse #{reuse_count})")
         }
         LoopEvent::StepFinished { step, elapsed_ms } => {
             println!("- step {step} finished ({elapsed_ms} ms)")
