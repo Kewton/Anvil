@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, anyhow};
 use serde::Deserialize;
 
-use crate::agent::looping::{LoopConfig, LoopDriver, ModelExchange};
+use crate::agent::looping::{LoopConfig, LoopDriver, LoopEvent, ModelExchange};
 use crate::agent::plan::{PlanDocument, PlanState};
 use crate::agent::subagent::{SubagentRequest, SubagentRunner};
 use crate::config::model_profiles::profile_for_model;
@@ -229,10 +229,16 @@ impl Agent {
             }
             let spinner = SpinnerHandle::start("model");
             let reply = loop_driver
-                .run(self, &self.config.cwd, &prompt, loop_turns.clone())
-                .await
-                .map_err(|err| anyhow!(err.to_string()))?;
+                .run_with_observer(
+                    self,
+                    &self.config.cwd,
+                    &prompt,
+                    loop_turns.clone(),
+                    |event| print_loop_event(&event),
+                )
+                .await;
             spinner.stop("model response received");
+            let reply = reply.map_err(|err| anyhow!(err.to_string()))?;
             loop_turns = reply.turns.clone();
             transcript.push(UiEvent::AgentText(
                 summary.truncate_tool_output(&reply.final_text, 800),
@@ -302,6 +308,44 @@ impl Agent {
                 })
             }
         }
+    }
+}
+
+fn print_loop_event(event: &LoopEvent) {
+    match event {
+        LoopEvent::StepStarted { step } => println!("\n- agent loop step {step}"),
+        LoopEvent::ModelResponseReceived { bytes } => {
+            println!("- model response chunk received ({bytes} bytes)")
+        }
+        LoopEvent::ModelResponsePreview { preview } => {
+            println!("- model raw: {}", truncate(preview, 200))
+        }
+        LoopEvent::ProtocolRetry {
+            error_kind,
+            message,
+            retry,
+            max_retries,
+        } => println!(
+            "- protocol error [{error_kind}] retrying {retry}/{max_retries}: {}",
+            truncate(message, 120)
+        ),
+        LoopEvent::ToolSchemaRetry {
+            tool,
+            message,
+            retry,
+            max_retries,
+        } => println!(
+            "- tool schema retry [{tool}] {retry}/{max_retries}: {}",
+            truncate(message, 120)
+        ),
+        LoopEvent::ToolExecutionStarted { tool, summary } => {
+            println!("- tool start [{tool}] {summary}")
+        }
+        LoopEvent::ToolCallValidated { tool, normalized } => {
+            println!("- tool validated [{tool}] {}", truncate(normalized, 200))
+        }
+        LoopEvent::ToolExecutionFinished { tool } => println!("- tool done [{tool}]"),
+        LoopEvent::FinalReady => println!("- final response ready"),
     }
 }
 

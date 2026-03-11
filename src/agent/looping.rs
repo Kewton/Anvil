@@ -26,6 +26,11 @@ pub enum ModelTurn {
         message: String,
         hint: String,
     },
+    ProtocolError {
+        error_kind: String,
+        message: String,
+        hint: String,
+    },
     AssistantFinal(String),
 }
 
@@ -69,6 +74,43 @@ pub struct LoopDriver {
     config: LoopConfig,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoopEvent {
+    StepStarted {
+        step: usize,
+    },
+    ModelResponseReceived {
+        bytes: usize,
+    },
+    ModelResponsePreview {
+        preview: String,
+    },
+    ProtocolRetry {
+        error_kind: String,
+        message: String,
+        retry: usize,
+        max_retries: usize,
+    },
+    ToolSchemaRetry {
+        tool: String,
+        message: String,
+        retry: usize,
+        max_retries: usize,
+    },
+    ToolExecutionStarted {
+        tool: String,
+        summary: String,
+    },
+    ToolCallValidated {
+        tool: String,
+        normalized: String,
+    },
+    ToolExecutionFinished {
+        tool: String,
+    },
+    FinalReady,
+}
+
 impl LoopDriver {
     pub fn new(config: LoopConfig) -> Self {
         Self { config }
@@ -81,17 +123,67 @@ impl LoopDriver {
         task: &str,
         prior_turns: Vec<ModelTurn>,
     ) -> Result<LoopOutput, LoopError> {
+        self.run_with_observer(model, cwd, task, prior_turns, |_| {})
+            .await
+    }
+
+    pub async fn run_with_observer<M, F>(
+        &self,
+        model: &M,
+        cwd: &Path,
+        task: &str,
+        prior_turns: Vec<ModelTurn>,
+        mut observer: F,
+    ) -> Result<LoopOutput, LoopError>
+    where
+        M: ModelExchange,
+        F: FnMut(LoopEvent),
+    {
         let mut turns = prior_turns;
         let mut seen = BTreeSet::new();
-        let mut schema_retries = 0usize;
+        let mut protocol_retry_state: Option<(String, usize)> = None;
+        let mut tool_retry_state: Option<(String, usize)> = None;
 
-        for _ in 0..self.config.max_steps {
+        for step in 0..self.config.max_steps {
+            observer(LoopEvent::StepStarted { step: step + 1 });
             let prompt = build_loop_prompt(task, &turns);
             let raw = model.complete(&prompt).await?;
-            let response = parse_model_response(&raw)?;
+            observer(LoopEvent::ModelResponseReceived { bytes: raw.len() });
+            observer(LoopEvent::ModelResponsePreview {
+                preview: truncate(&raw.replace('\n', "\\n"), 240),
+            });
+            let response = match parse_model_response(&raw) {
+                Ok(response) => {
+                    protocol_retry_state = None;
+                    response
+                }
+                Err(LoopError::InvalidToolCall(message)) => {
+                    let retry = next_retry_count(
+                        &mut protocol_retry_state,
+                        format!("invalid_json:{message}"),
+                    );
+                    if retry > self.config.max_schema_retries {
+                        return Err(LoopError::InvalidToolCall(message));
+                    }
+                    observer(LoopEvent::ProtocolRetry {
+                        error_kind: "invalid_json".to_string(),
+                        message: message.clone(),
+                        retry,
+                        max_retries: self.config.max_schema_retries,
+                    });
+                    turns.push(ModelTurn::ProtocolError {
+                        error_kind: "invalid_json".to_string(),
+                        message,
+                        hint: "return one complete JSON object only; do not emit partial or truncated JSON".to_string(),
+                    });
+                    continue;
+                }
+                Err(other) => return Err(other),
+            };
 
             match response {
                 ModelResponse::Final { content } => {
+                    observer(LoopEvent::FinalReady);
                     turns.push(ModelTurn::AssistantFinal(content.clone()));
                     return Ok(LoopOutput {
                         final_text: content,
@@ -102,14 +194,23 @@ impl LoopDriver {
                     for call in calls {
                         let validated = match validate_tool_call(&call) {
                             Ok(validated) => {
-                                schema_retries = 0;
+                                tool_retry_state = None;
                                 validated
                             }
                             Err(LoopError::InvalidToolCall(message)) => {
-                                if schema_retries >= self.config.max_schema_retries {
+                                let retry = next_retry_count(
+                                    &mut tool_retry_state,
+                                    format!("{}:{message}", call.tool),
+                                );
+                                if retry > self.config.max_schema_retries {
                                     return Err(LoopError::InvalidToolCall(message));
                                 }
-                                schema_retries += 1;
+                                observer(LoopEvent::ToolSchemaRetry {
+                                    tool: call.tool.clone(),
+                                    message: message.clone(),
+                                    retry,
+                                    max_retries: self.config.max_schema_retries,
+                                });
                                 turns.push(ModelTurn::ToolError {
                                     tool: call.tool.clone(),
                                     error_kind: "schema_validation".to_string(),
@@ -122,9 +223,17 @@ impl LoopDriver {
                         };
                         let normalized = serde_json::to_string(&validated)
                             .map_err(|err| LoopError::InvalidToolCall(err.to_string()))?;
+                        observer(LoopEvent::ToolCallValidated {
+                            tool: validated.tool_name().to_string(),
+                            normalized: truncate(&normalized, 240),
+                        });
                         if !seen.insert(normalized.clone()) {
                             return Err(LoopError::DuplicateToolCall(normalized));
                         }
+                        observer(LoopEvent::ToolExecutionStarted {
+                            tool: validated.tool_name().to_string(),
+                            summary: tool_call_summary(&validated),
+                        });
                         let result = execute_validated_tool_call(
                             cwd,
                             &validated,
@@ -132,6 +241,9 @@ impl LoopDriver {
                         )
                         .with_context(|| format!("tool failed: {:?}", call))
                         .map_err(LoopError::Other)?;
+                        observer(LoopEvent::ToolExecutionFinished {
+                            tool: validated.tool_name().to_string(),
+                        });
                         turns.push(ModelTurn::ToolResult {
                             tool: validated.tool_name().to_string(),
                             output: result,
@@ -142,6 +254,19 @@ impl LoopDriver {
         }
 
         Err(LoopError::MaxStepsReached)
+    }
+}
+
+fn next_retry_count(state: &mut Option<(String, usize)>, key: String) -> usize {
+    match state {
+        Some((current_key, retries)) if *current_key == key => {
+            *retries += 1;
+            *retries
+        }
+        _ => {
+            *state = Some((key, 1));
+            1
+        }
     }
 }
 
@@ -370,6 +495,15 @@ Invalid or partial tool args are forbidden.\n\n",
             ModelTurn::AssistantFinal(content) => {
                 prompt.push_str(&format!("ASSISTANT_FINAL\n{content}\n\n"));
             }
+            ModelTurn::ProtocolError {
+                error_kind,
+                message,
+                hint,
+            } => {
+                prompt.push_str(&format!(
+                    "MODEL_ERROR\nkind={error_kind}\nmessage={message}\nhint={hint}\n\n"
+                ));
+            }
         }
     }
     prompt.push_str("TASK\n");
@@ -396,5 +530,17 @@ fn tool_error_hint(tool: &str) -> String {
         "search" => "search requires args.needle".to_string(),
         "diff" => "diff requires args.before and args.after".to_string(),
         _ => "review the tool schema and retry with valid arguments".to_string(),
+    }
+}
+
+fn tool_call_summary(call: &ToolCall) -> String {
+    match call {
+        ToolCall::ReadFile(args) => format!("read {}", args.path.display()),
+        ToolCall::WriteFile(args) => format!("write {}", args.path.display()),
+        ToolCall::EditFile(args) => format!("edit {}", args.path.display()),
+        ToolCall::Exec(args) => format!("exec {}", args.argv.join(" ")),
+        ToolCall::Diff(_) => "diff provided content".to_string(),
+        ToolCall::Search(args) => format!("search {}", truncate(&args.needle, 80)),
+        ToolCall::Glob(args) => format!("glob {}", truncate(&args.pattern, 80)),
     }
 }

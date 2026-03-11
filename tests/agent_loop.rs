@@ -1,6 +1,8 @@
 use std::sync::{Arc, Mutex};
 
-use anvil::agent::looping::{LoopConfig, LoopDriver, LoopError, ModelExchange, ModelTurn};
+use anvil::agent::looping::{
+    LoopConfig, LoopDriver, LoopError, LoopEvent, ModelExchange, ModelTurn,
+};
 use tempfile::tempdir;
 
 #[derive(Clone, Default)]
@@ -243,6 +245,57 @@ async fn loop_stops_after_repeated_schema_errors() {
 }
 
 #[tokio::test]
+async fn loop_retries_after_invalid_json_and_recovers() {
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("README.md"), "hello\n").unwrap();
+    let model = ScriptedModel::new(vec![
+        "{\"type\":\"tool_calls\",\"calls\":[{\"tool\":\"read_file\",\"args\":{\"path\":\"README.md\"}}".to_string(),
+        r#"{"type":"tool_calls","calls":[{"tool":"read_file","args":{"path":"README.md"}}]}"#
+            .to_string(),
+        r#"{"type":"final","content":"recovered after invalid json"}"#.to_string(),
+    ]);
+    let driver = LoopDriver::new(LoopConfig::default());
+
+    let out = driver
+        .run(
+            &model,
+            dir.path(),
+            "recover from invalid json",
+            Vec::<ModelTurn>::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(out.final_text, "recovered after invalid json");
+    let prompts = model.prompts();
+    assert_eq!(prompts.len(), 3);
+    assert!(prompts[1].contains("MODEL_ERROR"));
+    assert!(prompts[1].contains("invalid_json"));
+}
+
+#[tokio::test]
+async fn loop_stops_after_repeated_invalid_json() {
+    let dir = tempdir().unwrap();
+    let model = ScriptedModel::new(vec![
+        "{\"type\":\"tool_calls\",\"calls\":[".to_string(),
+        "{\"type\":\"tool_calls\",\"calls\":[".to_string(),
+    ]);
+    let driver = LoopDriver::new(LoopConfig::default());
+
+    let err = driver
+        .run(
+            &model,
+            dir.path(),
+            "keep breaking json",
+            Vec::<ModelTurn>::new(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, LoopError::InvalidToolCall(_)));
+}
+
+#[tokio::test]
 async fn loop_carries_prior_context_into_prompt() {
     let dir = tempdir().unwrap();
     let model = ScriptedModel::new(vec![r#"{"type":"final","content":"ok"}"#.to_string()]);
@@ -259,4 +312,74 @@ async fn loop_carries_prior_context_into_prompt() {
 
     let prompts = model.prompts();
     assert!(prompts[0].contains("found branch notes"));
+}
+
+#[tokio::test]
+async fn loop_allows_retry_after_different_validation_error() {
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("README.md"), "hello\n").unwrap();
+    let model = ScriptedModel::new(vec![
+        r#"{"type":"tool_calls","calls":[{"tool":"read_file","args":{"create_if_not_exists":true}}]}"#
+            .to_string(),
+        r#"{"type":"tool_calls","calls":[{"tool":"exec","args":{"command":"cat > README.md"}}]}"#
+            .to_string(),
+        r#"{"type":"tool_calls","calls":[{"tool":"read_file","args":{"path":"README.md"}}]}"#
+            .to_string(),
+        r#"{"type":"final","content":"recovered after multiple validation errors"}"#.to_string(),
+    ]);
+    let driver = LoopDriver::new(LoopConfig::default());
+
+    let out = driver
+        .run(
+            &model,
+            dir.path(),
+            "recover from different validation errors",
+            Vec::<ModelTurn>::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(out.final_text, "recovered after multiple validation errors");
+    let prompts = model.prompts();
+    assert_eq!(prompts.len(), 4);
+    assert!(prompts[1].contains("TOOL_ERROR read_file"));
+    assert!(prompts[2].contains("TOOL_ERROR exec"));
+}
+
+#[tokio::test]
+async fn observer_receives_raw_preview_and_validated_tool_events() {
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("README.md"), "hello\n").unwrap();
+    let model = ScriptedModel::new(vec![
+        r#"{"type":"tool_calls","calls":[{"tool":"read_file","args":{"path":"README.md"}}]}"#
+            .to_string(),
+        r#"{"type":"final","content":"done"}"#.to_string(),
+    ]);
+    let driver = LoopDriver::new(LoopConfig::default());
+    let events = Arc::new(Mutex::new(Vec::<LoopEvent>::new()));
+    let sink = Arc::clone(&events);
+
+    let out = driver
+        .run_with_observer(
+            &model,
+            dir.path(),
+            "inspect readme",
+            Vec::<ModelTurn>::new(),
+            move |event| sink.lock().unwrap().push(event),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(out.final_text, "done");
+    let events = events.lock().unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, LoopEvent::ModelResponsePreview { .. }))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, LoopEvent::ToolCallValidated { .. }))
+    );
 }
