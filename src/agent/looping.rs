@@ -593,6 +593,33 @@ fn extract_task_contract(task: &str) -> TaskContract {
     } else {
         DeliverableKind::GenericFile
     };
+    let polished_request = [
+        "cool",
+        "polished",
+        "fancy",
+        "stylish",
+        "awesome",
+        "いけてる",
+        "カッコ",
+        "かっこ",
+        "凝った",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
+    let game_like = ["game", "invader", "arcade", "ゲーム", "インベーダー"]
+        .iter()
+        .any(|marker| lower.contains(marker));
+    let creative_mode = if !requires_write.iter().any(|marker| lower.contains(marker)) {
+        CreativeMode::Disabled
+    } else if polished_request || (browser_runnable && game_like) {
+        CreativeMode::Enhanced
+    } else if browser_runnable {
+        CreativeMode::Standard
+    } else {
+        CreativeMode::Disabled
+    };
+    let quality_targets = quality_targets_for(deliverable_kind, creative_mode, game_like);
+    let stretch_goals = stretch_goals_for(deliverable_kind, creative_mode, game_like);
     TaskContract {
         output_root: extract_path_like_tokens(task)
             .into_iter()
@@ -601,6 +628,9 @@ fn extract_task_contract(task: &str) -> TaskContract {
         must_review,
         browser_runnable,
         deliverable_kind,
+        creative_mode,
+        quality_targets,
+        stretch_goals,
     }
 }
 
@@ -731,6 +761,13 @@ enum DeliverableKind {
     GenericFile,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CreativeMode {
+    Disabled,
+    Standard,
+    Enhanced,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TaskContract {
     output_root: Option<PathBuf>,
@@ -738,6 +775,9 @@ struct TaskContract {
     must_review: bool,
     browser_runnable: bool,
     deliverable_kind: DeliverableKind,
+    creative_mode: CreativeMode,
+    quality_targets: Vec<String>,
+    stretch_goals: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -910,6 +950,72 @@ fn requirement_label(requirement: CreateRequirement) -> &'static str {
         CreateRequirement::DeliverableWritten => "deliverable_written",
         CreateRequirement::DeliverableVerified => "deliverable_verified",
         CreateRequirement::ReviewCompleted => "review_completed",
+    }
+}
+
+fn creative_mode_label(mode: CreativeMode) -> &'static str {
+    match mode {
+        CreativeMode::Disabled => "disabled",
+        CreativeMode::Standard => "standard",
+        CreativeMode::Enhanced => "enhanced",
+    }
+}
+
+fn quality_targets_for(
+    deliverable_kind: DeliverableKind,
+    creative_mode: CreativeMode,
+    game_like: bool,
+) -> Vec<String> {
+    if creative_mode == CreativeMode::Disabled {
+        return Vec::new();
+    }
+    match deliverable_kind {
+        DeliverableKind::HtmlApp if game_like => vec![
+            "browser-runnable single-file entry".to_string(),
+            "playable core loop".to_string(),
+            "clear HUD for score or status".to_string(),
+            "obvious restart or replay path".to_string(),
+            "basic visual polish beyond plain placeholders".to_string(),
+        ],
+        DeliverableKind::HtmlApp => vec![
+            "browser-runnable entry".to_string(),
+            "clear primary interaction path".to_string(),
+            "visible user feedback or status".to_string(),
+            "basic visual polish".to_string(),
+        ],
+        DeliverableKind::RustCode => vec![
+            "buildable structure".to_string(),
+            "clear module boundaries".to_string(),
+            "sensible defaults and error handling".to_string(),
+        ],
+        DeliverableKind::GenericFile => vec![
+            "self-contained output".to_string(),
+            "clear user-facing structure".to_string(),
+        ],
+    }
+}
+
+fn stretch_goals_for(
+    deliverable_kind: DeliverableKind,
+    creative_mode: CreativeMode,
+    game_like: bool,
+) -> Vec<String> {
+    if creative_mode != CreativeMode::Enhanced {
+        return Vec::new();
+    }
+    match deliverable_kind {
+        DeliverableKind::HtmlApp if game_like => vec![
+            "start screen or attract mode".to_string(),
+            "level progression or difficulty ramp".to_string(),
+            "enemy fire or richer challenge loop".to_string(),
+            "stronger retro presentation".to_string(),
+        ],
+        DeliverableKind::HtmlApp => vec![
+            "more intentional layout polish".to_string(),
+            "micro-feedback for key actions".to_string(),
+        ],
+        DeliverableKind::RustCode => vec!["one extra ergonomics improvement".to_string()],
+        DeliverableKind::GenericFile => vec!["one small quality-of-life refinement".to_string()],
     }
 }
 
@@ -1252,16 +1358,35 @@ Invalid or partial tool args are forbidden.\n\n",
     }
     prompt.push_str("TASK_CONTRACT\n");
     prompt.push_str(&format!(
-        "requires_write={}\nmust_review={}\nbrowser_runnable={}\ndeliverable_kind={}\n",
+        "requires_write={}\nmust_review={}\nbrowser_runnable={}\ndeliverable_kind={}\ncreative_mode={}\n",
         contract.requires_write,
         contract.must_review,
         contract.browser_runnable,
-        deliverable_kind_label(contract.deliverable_kind)
+        deliverable_kind_label(contract.deliverable_kind),
+        creative_mode_label(contract.creative_mode),
     ));
     if let Some(root) = &contract.output_root {
         prompt.push_str(&format!("output_root={}\n", root.display()));
     }
     prompt.push('\n');
+    if !contract.quality_targets.is_empty() {
+        prompt.push_str("QUALITY_TARGETS\n");
+        for target in &contract.quality_targets {
+            prompt.push_str("- ");
+            prompt.push_str(target);
+            prompt.push('\n');
+        }
+        prompt.push('\n');
+    }
+    if !contract.stretch_goals.is_empty() {
+        prompt.push_str("STRETCH_GOALS\n");
+        for goal in &contract.stretch_goals {
+            prompt.push_str("- ");
+            prompt.push_str(goal);
+            prompt.push('\n');
+        }
+        prompt.push('\n');
+    }
     prompt.push_str("TASK_OBJECTIVE\n");
     prompt.push_str(&step_objective(task));
     prompt.push_str("\n\n");
@@ -1634,26 +1759,54 @@ fn step_instruction(task: &str, turns: &[ModelTurn]) -> String {
     } else {
         ""
     };
+    let quality_note = if contract.quality_targets.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Aim for {}.",
+            contract
+                .quality_targets
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    let stretch_note = if contract.stretch_goals.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " If budget allows, also try {}.",
+            contract
+                .stretch_goals
+                .iter()
+                .take(2)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
     match create_phase_for_task(task, turns) {
         CreatePhase::Prepare => format!(
-            "Prepare the requested output location at {output_root}. Do not write outside that root. After preparation, move to implementation.{review_note}"
+            "Prepare the requested output location at {output_root}. Do not write outside that root. After preparation, move to implementation.{review_note}{quality_note}"
         ),
         CreatePhase::Write => match contract.deliverable_kind {
             DeliverableKind::HtmlApp => format!(
-                "Create the main browser-runnable HTML deliverable under {output_root}. Implement the requested game behavior from the task, keep it directly runnable in a browser, and prefer a complete playable result over placeholders.{review_note}"
+                "Create the main browser-runnable HTML deliverable under {output_root}. Implement the requested game behavior from the task, keep it directly runnable in a browser, and prefer a complete playable result over placeholders.{review_note}{quality_note}{stretch_note}"
             ),
             DeliverableKind::RustCode => format!(
-                "Write the requested Rust deliverable under {output_root}. Keep the code buildable and aligned with the task requirements.{review_note}"
+                "Write the requested Rust deliverable under {output_root}. Keep the code buildable and aligned with the task requirements.{review_note}{quality_note}{stretch_note}"
             ),
             DeliverableKind::GenericFile => format!(
-                "Write the requested deliverable to {output_root}. Satisfy the task requirements and keep the output self-contained.{review_note}"
+                "Write the requested deliverable to {output_root}. Satisfy the task requirements and keep the output self-contained.{review_note}{quality_note}{stretch_note}"
             ),
         },
         CreatePhase::Verify => format!(
-            "Verify the generated output under {output_root}. Read the main deliverable, confirm the key task requirements are present, and identify anything still missing.{review_note}"
+            "Verify the generated output under {output_root}. Read the main deliverable, confirm the key task requirements are present, and identify anything still missing.{review_note}{quality_note}"
         ),
         CreatePhase::Review => format!(
-            "Perform the requested code review for the generated output under {output_root}. Note concrete findings, risks, and obvious regressions before finalizing."
+            "Perform the requested code review for the generated output under {output_root}. Note concrete findings, risks, obvious regressions, and missing polish before finalizing.{quality_note}"
         ),
         CreatePhase::Finalize => format!(
             "Prepare the final response for the work under {output_root}. Summarize created files, implementation status, and include review findings if requested."
@@ -1697,11 +1850,41 @@ fn step_plan(task: &str, turns: &[ModelTurn]) -> StepPlan {
             "deliverable: {}",
             deliverable_kind_label(contract.deliverable_kind)
         ));
+        if contract.creative_mode != CreativeMode::Disabled {
+            items.push(format!(
+                "creative mode: {}",
+                creative_mode_label(contract.creative_mode)
+            ));
+        }
         if contract.browser_runnable {
             items.push("runtime: browser-runnable output required".to_string());
         }
         if contract.must_review {
             items.push("review requested: include code review before final".to_string());
+        }
+        if !contract.quality_targets.is_empty() {
+            items.push(format!(
+                "quality targets: {}",
+                contract
+                    .quality_targets
+                    .iter()
+                    .take(3)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if !contract.stretch_goals.is_empty() {
+            items.push(format!(
+                "stretch goals: {}",
+                contract
+                    .stretch_goals
+                    .iter()
+                    .take(2)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
         }
     }
     if let Some(hint) = completion_hint(task, turns) {

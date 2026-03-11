@@ -522,6 +522,53 @@ TDD の観点:
 - [ ] verify / review / finalize の遷移が requirement/evidence ベースで説明可能になる
 - [ ] UI と audit から「なぜ stalled / finalize / continue と判断したか」を追跡できる
 
+## Phase 3.7: Create Task の Quality Targets と Creative Mode
+
+目的:
+
+- [ ] create task の安定性を維持しつつ、`vibe-local` 相当以上の「凝った出力」に寄せる
+- [ ] requirement/evidence と creative guidance を分離し、必須要件と品質向上目標を混同しない
+- [ ] `quality targets / stretch goals / creative mode` を create task 専用の軽量 policy として導入する
+- [ ] creative mode を固定シナリオ化せず、model-driven な tool choice と実装自由度を維持する
+- [ ] browser-runnable game / app 生成で、開始画面、HUD、再開導線、演出などの完成度を底上げする
+- [ ] `quality targets / stretch goals` を non-blocking guidance に固定する
+
+先に書くテスト:
+
+- [ ] create task から `creative_mode`, `quality_targets`, `stretch_goals` を抽出する test
+- [ ] `browser-runnable + game + polished` 系 task で richer targets が有効になる test
+- [ ] inspect task では creative mode が無効なままになる test
+- [ ] prompt に `CREATIVE_MODE`, `QUALITY_TARGETS`, `STRETCH_GOALS` が注入される test
+- [ ] step UI に creative guidance の要点が出る test
+- [ ] requirement 未充足時は stretch goals が final blocking requirement にならない test
+- [ ] write / verify / review phase で quality guidance が brief に反映される test
+
+実装:
+
+- [ ] `TaskContract` に `creative_mode`, `quality_targets`, `stretch_goals` を追加する
+- [ ] `creative_mode` は `disabled / standard / enhanced` の 3 段階程度に抑える
+- [ ] deliverable kind と task wording から lightweight な quality target extractor を追加する
+- [ ] `quality targets` は「あると望ましい完成度目標」、`stretch goals` は「余力があれば狙う追加価値」として分離する
+- [ ] prompt に `CREATIVE_MODE`, `QUALITY_TARGETS`, `STRETCH_GOALS` を追加する
+- [ ] `step_instruction` と `step_plan` に quality guidance を反映する
+- [ ] requirement/evidence 側は creative targets を blocking requirement にしない
+- [ ] UI には creative mode と代表的な quality targets / stretch goals だけを表示する
+- [ ] game/html 系 create task で quality guidance を少し強めるが、tool sequence は固定しない
+
+TDD の観点:
+
+- まず contract extraction の unit test で creative mode と targets を固定する
+- 次に prompt / brief / plan への反映を snapshot 的に確認する
+- その後 requirement/evidence と creative guidance の分離を integration test で確認する
+- 最後に HTML game 生成の実機で `qwen3.5:35b` がより厚い成果物へ寄るかを見る
+
+完了条件:
+
+- [ ] create task の必須要件を壊さずに、より厚い deliverable を出しやすくなる
+- [ ] quality targets が fixed workflow ではなく model guidance として機能する
+- [ ] stretch goals は満たせなくても task failure にならない
+- [ ] UI から「何を最低限満たし、何を品質向上目標として狙っているか」が分かる
+
 ## Phase 4: 拡張フェーズ
 
 目的:

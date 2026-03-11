@@ -451,7 +451,7 @@ fn print_loop_event(event: &LoopEvent) {
                     remaining_requirements.join(", ")
                 );
             }
-            for item in plan.iter().take(4) {
+            for item in plan.iter().take(6) {
                 println!("  📋 {item}");
             }
         }

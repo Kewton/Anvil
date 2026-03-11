@@ -453,7 +453,7 @@ async fn create_task_prompt_includes_expected_root_and_phase() {
         .run(
             &model,
             dir.path(),
-            "ブラウザから直接実行可能なページを作成し、./sandbox/test31_011に出力してください。コードレビューしてください。",
+            "ブラウザから直接実行可能ないけてるゲームページを作成し、./sandbox/test31_011に出力してください。コードレビューしてください。",
             Vec::<ModelTurn>::new(),
         )
         .await;
@@ -467,6 +467,11 @@ async fn create_task_prompt_includes_expected_root_and_phase() {
     assert!(prompts[0].contains("must_review=true"));
     assert!(prompts[0].contains("browser_runnable=true"));
     assert!(prompts[0].contains("deliverable_kind=html_app"));
+    assert!(prompts[0].contains("creative_mode=enhanced"));
+    assert!(prompts[0].contains("QUALITY_TARGETS"));
+    assert!(prompts[0].contains("playable core loop"));
+    assert!(prompts[0].contains("STRETCH_GOALS"));
+    assert!(prompts[0].contains("start screen or attract mode"));
     assert!(prompts[1].contains("write"));
 }
 
@@ -812,6 +817,8 @@ async fn step_started_event_includes_phase_and_plan_context() {
             && phase == "prepare"
             && brief.contains("output location")
             && plan.iter().any(|item| item.contains("review requested"))
+            && plan.iter().any(|item| item.contains("creative mode"))
+            && plan.iter().any(|item| item.contains("quality targets"))
             && workflow.iter().any(|item| item == "review")
             && *phase_index == 1
             && *phase_total == 5
@@ -846,6 +853,33 @@ async fn prompts_include_requirement_state_for_create_tasks() {
     assert!(prompts[0].contains("output_root_exists"));
     assert!(prompts[0].contains("deliverable_written"));
     assert!(prompts[0].contains("deliverable_verified"));
+}
+
+#[tokio::test]
+async fn inspect_tasks_do_not_enable_creative_mode() {
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("README.md"), "hello\n").unwrap();
+    let model = ScriptedModel::new(vec![
+        r#"{"type":"tool_calls","calls":[{"tool":"read_file","args":{"path":"README.md"}}]}"#
+            .to_string(),
+        r#"{"type":"final","content":"done"}"#.to_string(),
+    ]);
+    let driver = LoopDriver::new(LoopConfig::default());
+
+    let _ = driver
+        .run(
+            &model,
+            dir.path(),
+            "このブランチを分析して",
+            Vec::<ModelTurn>::new(),
+        )
+        .await
+        .unwrap();
+
+    let prompts = model.prompts();
+    assert!(!prompts[0].contains("creative_mode=enhanced"));
+    assert!(!prompts[0].contains("QUALITY_TARGETS"));
+    assert!(!prompts[0].contains("STRETCH_GOALS"));
 }
 
 #[tokio::test]
