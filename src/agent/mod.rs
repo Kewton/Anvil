@@ -314,8 +314,8 @@ impl Agent {
 fn print_loop_event(event: &LoopEvent) {
     match event {
         LoopEvent::StepStarted { step } => println!("\n- agent loop step {step}"),
-        LoopEvent::ModelResponseReceived { bytes } => {
-            println!("- model response chunk received ({bytes} bytes)")
+        LoopEvent::ModelResponseReceived { bytes, elapsed_ms } => {
+            println!("- model response chunk received ({bytes} bytes, {elapsed_ms} ms)")
         }
         LoopEvent::ModelResponsePreview { preview } => {
             println!("- model raw: {}", truncate(preview, 200))
@@ -344,7 +344,15 @@ fn print_loop_event(event: &LoopEvent) {
         LoopEvent::ToolCallValidated { tool, normalized } => {
             println!("- tool validated [{tool}] {}", truncate(normalized, 200))
         }
-        LoopEvent::ToolExecutionFinished { tool } => println!("- tool done [{tool}]"),
+        LoopEvent::ToolExecutionFinished { tool, elapsed_ms } => {
+            println!("- tool done [{tool}] ({elapsed_ms} ms)")
+        }
+        LoopEvent::ToolResultPreview { tool, preview } => {
+            println!("- tool result [{tool}] {}", truncate(preview, 180))
+        }
+        LoopEvent::StepFinished { step, elapsed_ms } => {
+            println!("- step {step} finished ({elapsed_ms} ms)")
+        }
         LoopEvent::FinalReady => println!("- final response ready"),
     }
 }

@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::{Context, anyhow};
 use serde::Deserialize;
@@ -44,7 +45,7 @@ pub struct LoopConfig {
 impl Default for LoopConfig {
     fn default() -> Self {
         Self {
-            max_steps: 6,
+            max_steps: 12,
             max_tool_output_chars: 1_200,
             max_schema_retries: 1,
         }
@@ -81,6 +82,7 @@ pub enum LoopEvent {
     },
     ModelResponseReceived {
         bytes: usize,
+        elapsed_ms: u128,
     },
     ModelResponsePreview {
         preview: String,
@@ -107,6 +109,15 @@ pub enum LoopEvent {
     },
     ToolExecutionFinished {
         tool: String,
+        elapsed_ms: u128,
+    },
+    ToolResultPreview {
+        tool: String,
+        preview: String,
+    },
+    StepFinished {
+        step: usize,
+        elapsed_ms: u128,
     },
     FinalReady,
 }
@@ -145,10 +156,16 @@ impl LoopDriver {
         let mut tool_retry_state: Option<(String, usize)> = None;
 
         for step in 0..self.config.max_steps {
-            observer(LoopEvent::StepStarted { step: step + 1 });
+            let step_number = step + 1;
+            let step_started_at = Instant::now();
+            observer(LoopEvent::StepStarted { step: step_number });
             let prompt = build_loop_prompt(task, &turns);
+            let model_started_at = Instant::now();
             let raw = model.complete(&prompt).await?;
-            observer(LoopEvent::ModelResponseReceived { bytes: raw.len() });
+            observer(LoopEvent::ModelResponseReceived {
+                bytes: raw.len(),
+                elapsed_ms: model_started_at.elapsed().as_millis(),
+            });
             observer(LoopEvent::ModelResponsePreview {
                 preview: truncate(&raw.replace('\n', "\\n"), 240),
             });
@@ -176,6 +193,10 @@ impl LoopDriver {
                         message,
                         hint: "return one complete JSON object only; do not emit partial or truncated JSON".to_string(),
                     });
+                    observer(LoopEvent::StepFinished {
+                        step: step_number,
+                        elapsed_ms: step_started_at.elapsed().as_millis(),
+                    });
                     continue;
                 }
                 Err(other) => return Err(other),
@@ -184,6 +205,10 @@ impl LoopDriver {
             match response {
                 ModelResponse::Final { content } => {
                     observer(LoopEvent::FinalReady);
+                    observer(LoopEvent::StepFinished {
+                        step: step_number,
+                        elapsed_ms: step_started_at.elapsed().as_millis(),
+                    });
                     turns.push(ModelTurn::AssistantFinal(content.clone()));
                     return Ok(LoopOutput {
                         final_text: content,
@@ -234,6 +259,7 @@ impl LoopDriver {
                             tool: validated.tool_name().to_string(),
                             summary: tool_call_summary(&validated),
                         });
+                        let tool_started_at = Instant::now();
                         let result = execute_validated_tool_call(
                             cwd,
                             &validated,
@@ -243,12 +269,21 @@ impl LoopDriver {
                         .map_err(LoopError::Other)?;
                         observer(LoopEvent::ToolExecutionFinished {
                             tool: validated.tool_name().to_string(),
+                            elapsed_ms: tool_started_at.elapsed().as_millis(),
+                        });
+                        observer(LoopEvent::ToolResultPreview {
+                            tool: validated.tool_name().to_string(),
+                            preview: truncate(&result.replace('\n', "\\n"), 220),
                         });
                         turns.push(ModelTurn::ToolResult {
                             tool: validated.tool_name().to_string(),
                             output: result,
                         });
                     }
+                    observer(LoopEvent::StepFinished {
+                        step: step_number,
+                        elapsed_ms: step_started_at.elapsed().as_millis(),
+                    });
                 }
             }
         }

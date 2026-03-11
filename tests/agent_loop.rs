@@ -382,4 +382,29 @@ async fn observer_receives_raw_preview_and_validated_tool_events() {
             .iter()
             .any(|event| matches!(event, LoopEvent::ToolCallValidated { .. }))
     );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, LoopEvent::ToolResultPreview { .. }))
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        LoopEvent::ModelResponseReceived { elapsed_ms: _, .. }
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        LoopEvent::ToolExecutionFinished { elapsed_ms: _, .. }
+    )));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, LoopEvent::StepFinished { elapsed_ms: _, .. }))
+    );
+}
+
+#[test]
+fn default_loop_config_allows_longer_generation_tasks() {
+    let config = LoopConfig::default();
+
+    assert_eq!(config.max_steps, 12);
 }
