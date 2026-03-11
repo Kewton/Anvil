@@ -42,9 +42,13 @@ fn renderer_event_sequence_and_contract_are_stable() {
     let rendered = render_event_log(&events);
 
     assert!(rendered.lines().count() >= 3);
-    assert!(rendered.contains("You  hello"));
-    assert!(rendered.contains("Anvil  world"));
-    assert!(rendered.contains("Tool  diff"));
+    assert!(rendered.contains("👤 You"));
+    assert!(rendered.contains("🧱 Anvil"));
+    assert!(rendered.contains("🛠 Tool"));
+    assert!(rendered.contains("hello"));
+    assert!(rendered.contains("world"));
+    assert!(rendered.contains("diff"));
+    assert!(rendered.contains("\x1b[48;5;52m"));
 }
 
 #[test]

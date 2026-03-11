@@ -16,9 +16,15 @@ pub fn render_event_log(events: &[UiEvent]) -> String {
     events
         .iter()
         .map(|event| match event {
-            UiEvent::UserInput(text) => format!("You  {text}"),
-            UiEvent::AgentText(text) => format!("Anvil  {text}"),
-            UiEvent::ToolCall(text) => format!("Tool  {text}"),
+            UiEvent::UserInput(text) => format!(
+                "\x1b[48;5;238m\x1b[38;5;255m 👤 You     \x1b[0m  \x1b[38;5;252m{text}\x1b[0m"
+            ),
+            UiEvent::AgentText(text) => format!(
+                "\x1b[48;5;52m\x1b[38;5;255m 🧱 Anvil   \x1b[0m  \x1b[38;5;255m{text}\x1b[0m"
+            ),
+            UiEvent::ToolCall(text) => format!(
+                "\x1b[48;5;24m\x1b[38;5;255m 🛠 Tool    \x1b[0m  \x1b[38;5;153m{text}\x1b[0m"
+            ),
         })
         .collect::<Vec<_>>()
         .join("\n")

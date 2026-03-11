@@ -3,7 +3,6 @@ pub mod plan;
 pub mod subagent;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use crate::agent::looping::{LoopConfig, LoopDriver, LoopEvent, ModelExchange};
@@ -26,7 +25,7 @@ use crate::state::audit::{
 use crate::state::memory::MemoryStore;
 use crate::state::session::Session;
 use crate::state::summary::{SummaryController, SummaryInput, SummaryPolicy};
-use crate::ui::interactive::{FooterState, InteractiveFrame, SpinnerHandle, UiEvent};
+use crate::ui::interactive::{FooterState, InteractiveFrame, LineEditor, SpinnerHandle, UiEvent};
 use crate::ui::render::{render_banner, render_frame, render_result_block, render_startup_help};
 use anyhow::anyhow;
 
@@ -147,6 +146,7 @@ impl Agent {
         let mut transcript = Vec::new();
         let loop_driver = LoopDriver::new(LoopConfig::default());
         let mut loop_turns = Vec::new();
+        let mut line_editor = LineEditor::new()?;
         loop {
             let frame = InteractiveFrame {
                 title: "Anvil".to_string(),
@@ -165,9 +165,7 @@ impl Agent {
                 },
             };
             println!("{}", render_frame(&frame));
-            print!("anvil> ");
-            io::stdout().flush()?;
-            let input = read_user_input()?;
+            let input = line_editor.read_command("anvil> ")?;
             if input.is_empty() {
                 continue;
             }
@@ -297,27 +295,6 @@ impl Agent {
             }
         }
     }
-}
-
-fn read_user_input() -> anyhow::Result<String> {
-    let mut line = String::new();
-    io::stdin().read_line(&mut line)?;
-    let trimmed = line.trim_end_matches(['\r', '\n']);
-    if trimmed != "\"\"\"" {
-        return Ok(trimmed.trim().to_string());
-    }
-
-    let mut lines = Vec::new();
-    loop {
-        let mut block_line = String::new();
-        io::stdin().read_line(&mut block_line)?;
-        let content = block_line.trim_end_matches(['\r', '\n']);
-        if content == "\"\"\"" {
-            break;
-        }
-        lines.push(content.to_string());
-    }
-    Ok(lines.join("\n").trim().to_string())
 }
 
 fn collect_result_details(text: &str, cwd: &Path) -> Vec<String> {
