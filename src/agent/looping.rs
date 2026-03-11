@@ -163,7 +163,10 @@ struct EditFileArgs {
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct ExecArgs {
+    #[serde(default)]
     argv: Vec<String>,
+    #[serde(default)]
+    command: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
@@ -221,9 +224,13 @@ fn validate_tool_call(raw: &RawToolCall) -> Result<ToolCall, LoopError> {
         "edit_file" => serde_json::from_value(args)
             .map(ToolCall::EditFile)
             .map_err(|err| LoopError::InvalidToolCall(err.to_string())),
-        "exec" => serde_json::from_value(args)
-            .map(ToolCall::Exec)
-            .map_err(|err| LoopError::InvalidToolCall(err.to_string())),
+        "exec" => {
+            let parsed: ExecArgs = serde_json::from_value(args)
+                .map_err(|err| LoopError::InvalidToolCall(err.to_string()))?;
+            let normalized = normalize_exec_args(parsed)
+                .map_err(|err| LoopError::InvalidToolCall(err.to_string()))?;
+            Ok(ToolCall::Exec(normalized))
+        }
         "diff" => serde_json::from_value(args)
             .map(ToolCall::Diff)
             .map_err(|err| LoopError::InvalidToolCall(err.to_string())),
@@ -272,6 +279,36 @@ fn execute_validated_tool_call(
             .join("\n"),
     };
     Ok(truncate(&output, max_chars))
+}
+
+fn normalize_exec_args(args: ExecArgs) -> Result<ExecArgs, anyhow::Error> {
+    if !args.argv.is_empty() {
+        return Ok(ExecArgs {
+            argv: args.argv,
+            command: None,
+        });
+    }
+
+    let Some(command) = args.command else {
+        anyhow::bail!("exec requires argv or command");
+    };
+    if contains_shell_metacharacters(&command) {
+        anyhow::bail!("shell-style command syntax is not allowed");
+    }
+    let argv = shlex::split(&command).ok_or_else(|| anyhow!("failed to parse command"))?;
+    if argv.is_empty() {
+        anyhow::bail!("command parsed to empty argv");
+    }
+    Ok(ExecArgs {
+        argv,
+        command: None,
+    })
+}
+
+fn contains_shell_metacharacters(command: &str) -> bool {
+    ["|", "&&", "||", ";", "$(", "`", ">", "<"]
+        .iter()
+        .any(|needle| command.contains(needle))
 }
 
 fn build_loop_prompt(task: &str, turns: &[ModelTurn]) -> String {

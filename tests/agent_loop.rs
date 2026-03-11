@@ -118,6 +118,43 @@ async fn loop_can_explain_branch_via_git_commands_without_rules() {
 }
 
 #[tokio::test]
+async fn loop_accepts_safe_exec_command_and_normalizes_to_argv() {
+    let dir = tempdir().unwrap();
+    let model = ScriptedModel::new(vec![
+        r#"{"type":"tool_calls","calls":[{"tool":"exec","args":{"command":"git status --short"}}]}"#
+            .to_string(),
+        r#"{"type":"final","content":"done"}"#.to_string(),
+    ]);
+    let driver = LoopDriver::new(LoopConfig::default());
+
+    let out = driver
+        .run(&model, dir.path(), "inspect repo", Vec::<ModelTurn>::new())
+        .await
+        .unwrap();
+
+    assert_eq!(out.final_text, "done");
+    let prompts = model.prompts();
+    assert!(prompts[1].contains("status="));
+}
+
+#[tokio::test]
+async fn loop_rejects_shell_style_exec_command() {
+    let dir = tempdir().unwrap();
+    let model = ScriptedModel::new(vec![
+        r#"{"type":"tool_calls","calls":[{"tool":"exec","args":{"command":"git status | cat"}}]}"#
+            .to_string(),
+    ]);
+    let driver = LoopDriver::new(LoopConfig::default());
+
+    let err = driver
+        .run(&model, dir.path(), "inspect repo", Vec::<ModelTurn>::new())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, LoopError::InvalidToolCall(_)));
+}
+
+#[tokio::test]
 async fn loop_stops_on_duplicate_tool_calls() {
     let dir = tempdir().unwrap();
     std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
