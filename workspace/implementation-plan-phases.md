@@ -469,6 +469,48 @@ TDD の観点:
 - [ ] local model 前提の長時間対話で、速度低下と文脈欠落が実用範囲に収まる
 - [ ] create task が固定シナリオに寄らず複数の実装経路を取れて、なお path / review / deliverable 要件を落としにくい
 
+## Phase 3.6: Requirement Set と Progress-Based Loop Control
+
+目的:
+
+- [ ] create task を phase 名中心ではなく `Requirement Set` 中心で制御する
+- [ ] 各 tool result が requirement をどれだけ前進させたかを `Evidence` として評価する
+- [ ] stalled verification / stalled inspection を固定禁止ルールではなく progress 判定で止める
+- [ ] task type と progress に応じた adaptive upper bound を本格化する
+
+先に書くテスト:
+
+- [ ] `output_root_exists / deliverable_written / browser_entry_verified / review_completed` を requirement として抽出する test
+- [ ] `mkdir`, `write_file`, `read_file`, `path_exists` が requirement 充足へ変換される evidence test
+- [ ] verify phase で `list_dir` を繰り返しても progress 0 と判定される test
+- [ ] 進捗が出た create task は loop budget が延長される test
+- [ ] stalled create task は loop budget が早めに打ち切られる test
+- [ ] 複数の valid tool sequence を許容しつつ、同じ requirement set を満たせる integration test
+
+実装:
+
+- [ ] create task 用 `RequirementSet` 型を追加する
+- [ ] tool result を `Evidence` へ正規化する evaluator を追加する
+- [ ] `remaining requirements` と `progress score` を loop state に持たせる
+- [ ] adaptive upper bound を `base budget + progress extension - stall penalty` で管理する
+- [ ] `completion hint` を unmet requirement と low-progress から生成する
+- [ ] UI に `remaining requirements` と `this step progress` を表示する
+- [ ] verify / review / finalize の遷移を phase 固定ではなく requirement 充足ベースへ寄せる
+
+TDD の観点:
+
+- まず requirement extraction と evidence mapping を unit test で赤にする
+- 次に progress score と adaptive budget を table-driven test で固定する
+- その後 create task の integration test で複数経路を許容できることを確認する
+- 最後に `qwen3.5:35b` 実機で stalled verification が減ることを確認する
+
+完了条件:
+
+- [ ] `list_dir` / `glob` の反復を個別禁止ルールなしで stalled 判定できる
+- [ ] create task が複数の tool sequence を取りつつ、同じ requirement set に収束できる
+- [ ] progress がある task は完走しやすく、progress のない task は無駄に長引かない
+- [ ] verify / review / finalize の遷移が requirement/evidence ベースで説明可能になる
+
 ## Phase 4: 拡張フェーズ
 
 目的:
