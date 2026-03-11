@@ -236,27 +236,27 @@ TDD の観点:
 
 目的:
 
-- [ ] Claude Code / vibe-local 的な核心である、モデル主導のツール実行ループを完成させる
-- [ ] ルール追加ではなく、tool-calling 中心の agent loop を強化する
-- [ ] 自然言語の依頼から必要なコンテキスト収集をモデル主導で完走できるようにする
+- [x] Claude Code / vibe-local 的な核心である、モデル主導のツール実行ループを完成させる
+- [x] ルール追加ではなく、tool-calling 中心の agent loop を強化する
+- [x] 自然言語の依頼から必要なコンテキスト収集をモデル主導で完走できるようにする
 
 先に書くテスト:
 
-- [ ] 自然言語タスクから `Read` / `Exec` / `Diff` を段階実行する統合テスト
-- [ ] `git branch` / `git status` / `git log` / `git diff` を用いたブランチ説明タスクの統合テスト
-- [ ] モデルが追加情報不足時に適切なツール呼び出しへ進む回帰テスト
-- [ ] 同一ツール・同一引数の無限反復を停止するループ防止テスト
-- [ ] tool result を踏まえた再推論で最終回答へ収束するテスト
-- [ ] tool call schema validation と fail-closed の統合テスト
+- [x] 自然言語タスクから `Read` / `Exec` / `Diff` を段階実行する統合テスト
+- [x] `git branch` / `git status` / `git log` / `git diff` を用いたブランチ説明タスクの統合テスト
+- [x] モデルが追加情報不足時に適切なツール呼び出しへ進む回帰テスト
+- [x] 同一ツール・同一引数の無限反復を停止するループ防止テスト
+- [x] tool result を踏まえた再推論で最終回答へ収束するテスト
+- [x] tool call schema validation と fail-closed の統合テスト
 
 実装:
 
-- [ ] `src/agent/mod.rs` を単発プロンプト実行から multi-step tool loop へ拡張
-- [ ] モデル出力から tool call を抽出する parser / validator を追加
-- [ ] `Read` / `Write` / `Edit` / `Exec` / `Diff` / `Search` / `Glob` を agent loop に接続
-- [ ] tool 実行結果を履歴へ圧縮注入する state 更新を追加
-- [ ] 反復上限、重複呼び出し検出、失敗時の別手段誘導を追加
-- [ ] ブランチ説明のような Git 文脈タスクを一般 tool loop で解けることを確認
+- [x] `src/agent/mod.rs` を単発プロンプト実行から multi-step tool loop へ拡張
+- [x] モデル出力から tool call を抽出する parser / validator を追加
+- [x] `Read` / `Write` / `Edit` / `Exec` / `Diff` / `Search` / `Glob` を agent loop に接続
+- [x] tool 実行結果を履歴へ圧縮注入する state 更新を追加
+- [x] 反復上限、重複呼び出し検出、失敗時の別手段誘導を追加
+- [x] ブランチ説明のような Git 文脈タスクを一般 tool loop で解けることを確認
 
 TDD の観点:
 
@@ -267,10 +267,10 @@ TDD の観点:
 
 完了条件:
 
-- [ ] モデルが必要に応じてツールを自律選択して回答に必要な文脈を集められる
-- [ ] `このブランチを解説して` のような依頼をルール追加なしで処理できる
-- [ ] tool loop が fail-closed と権限モデルを維持したまま安定動作する
-- [ ] Claude Code / vibe-local に近い「調べてから答える」挙動を再現できる
+- [x] モデルが必要に応じてツールを自律選択して回答に必要な文脈を集められる
+- [x] `このブランチを解説して` のような依頼をルール追加なしで処理できる
+- [x] tool loop が fail-closed と権限モデルを維持したまま安定動作する
+- [x] Claude Code / vibe-local に近い「調べてから答える」挙動を再現できる
 
 ## Phase 4: 拡張フェーズ
 

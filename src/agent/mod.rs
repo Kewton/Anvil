@@ -1,3 +1,4 @@
+pub mod looping;
 pub mod plan;
 pub mod subagent;
 
@@ -8,6 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, anyhow};
 use serde::Deserialize;
 
+use crate::agent::looping::{LoopConfig, LoopDriver, ModelExchange};
 use crate::agent::plan::{PlanDocument, PlanState};
 use crate::agent::subagent::{SubagentRequest, SubagentRunner};
 use crate::config::model_profiles::profile_for_model;
@@ -157,6 +159,8 @@ impl Agent {
         let profile = profile_for_model(&self.config.model);
         let summary = SummaryController::new(SummaryPolicy::default());
         let mut transcript = Vec::new();
+        let loop_driver = LoopDriver::new(LoopConfig::default());
+        let mut loop_turns = Vec::new();
         loop {
             let frame = InteractiveFrame {
                 title: "Anvil".to_string(),
@@ -224,12 +228,16 @@ impl Agent {
                 ));
             }
             let spinner = SpinnerHandle::start("model");
-            let reply = self.chat_stream(&prompt).await?;
+            let reply = loop_driver
+                .run(self, &self.config.cwd, &prompt, loop_turns.clone())
+                .await
+                .map_err(|err| anyhow!(err.to_string()))?;
             spinner.stop("model response received");
+            loop_turns = reply.turns.clone();
             transcript.push(UiEvent::AgentText(
-                summary.truncate_tool_output(&reply, 800),
+                summary.truncate_tool_output(&reply.final_text, 800),
             ));
-            println!("\n---\n{}", truncate(&reply, 240));
+            println!("\n---\n{}", truncate(&reply.final_text, 240));
         }
         Ok(())
     }
@@ -238,13 +246,6 @@ impl Agent {
         match &self.model {
             ModelBackend::Ollama(client) => client.chat(&self.config.model, prompt).await,
             ModelBackend::LmStudio(client) => client.chat(&self.config.model, prompt).await,
-        }
-    }
-
-    async fn chat_stream(&self, prompt: &str) -> anyhow::Result<String> {
-        match &self.model {
-            ModelBackend::Ollama(client) => client.chat_stream(&self.config.model, prompt).await,
-            ModelBackend::LmStudio(client) => client.chat_stream(&self.config.model, prompt).await,
         }
     }
 
@@ -301,6 +302,21 @@ impl Agent {
                 })
             }
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl ModelExchange for Agent {
+    async fn complete(&self, prompt: &str) -> anyhow::Result<String> {
+        self.chat(&format!(
+            "Project instructions:\n{}\n\nMemory:\n{}\n\n{}",
+            load_instructions(&self.config.cwd)?
+                .project_text
+                .unwrap_or_else(|| "(none)".to_string()),
+            load_instructions(&self.config.cwd)?.memory_text,
+            prompt
+        ))
+        .await
     }
 }
 
