@@ -417,6 +417,58 @@ TDD の観点:
 - [x] `agent loop step` と `tool` と `recovery` の違いが見分けられる
 - [x] 最終結果がログの流れに埋もれず、明確に読める
 
+## Phase 3.5: Context Compaction と Session 引き継ぎの実用化
+
+目的:
+
+- [ ] token 使用量が閾値へ近づいたときに、安全に文脈圧縮へ移行する
+- [ ] rolling summary を UI 表示用ではなく次ターン prompt に実際に効かせる
+- [ ] interactive session の長時間利用でも、重要な文脈が崩れずに引き継がれるようにする
+- [ ] local model 向けに `20万` token 前提でも速度と安定性を両立する
+- [ ] create task を固定フロー化せず、`Task Contract + Evidence + Phase Gate` で柔軟性と精度を両立する
+
+先に書くテスト:
+
+- [ ] transcript compaction が summary を prompt に注入する integration test
+- [ ] summary 発火後も `ANVIL.md` / `ANVIL-MEMORY.md` / 現在 task の優先度が維持される test
+- [ ] 長い対話履歴で branch explanation / create task が回帰しない test
+- [ ] loop turns compaction が tool evidence を過剰に失わない test
+- [ ] token budget 到達時に `summarize -> continue` が発火する contract test
+- [ ] summary 後の follow-up 質問で文脈が引き継がれる end-to-end test
+- [ ] `Task Contract` が `output_root / deliverable_type / must_review / browser_runnable` を抽出できる test
+- [ ] 同じ create task でも複数の tool sequence を許容しつつ、未充足制約だけを差し戻す test
+- [ ] evidence-based phase transition が `implement / verify / review / finalize` を過不足なく遷移する test
+
+実装:
+
+- [ ] transcript summary を独立 state として保持し、次ターン prompt の先頭へ注入する
+- [ ] `transcript.len() * 1200` の概算依存を減らし、より妥当な budget 管理へ寄せる
+- [ ] `loop_turns` compaction と interactive transcript compaction の責務を分離する
+- [ ] summary 後に生 transcript を無限増殖させない rotation / pruning を入れる
+- [ ] summary に含めるべき内容を `user goals / accepted facts / pending tasks / changed files` に正規化する
+- [ ] summary 発火、compaction、carryover を UI と監査ログに出す
+- [ ] `qwen3.5:35b` 実機で長めの multi-turn セッション回帰を行う
+- [ ] create task 用の `Task Contract` 層を追加し、要求から守るべき制約だけを構造化する
+- [ ] `completion hint` を固定手順ではなく `未充足制約` ベースで生成する
+- [ ] phase 制御を「推奨フロー」ではなく evidence-based gate として実装する
+- [ ] review / verification / output path を phase 名ではなく `required capability` としても扱えるようにする
+
+TDD の観点:
+
+- まず summary carryover の failing integration test を追加する
+- 次に transcript summary state と prompt injection を最小実装する
+- その後 pruning / rotation と UI event を追加する
+- 最後に長時間セッションの実機回帰で精度低下がないことを確認する
+- create task については、文言マッチによる固定分岐を増やさず、contract 抽出と evidence 判定から先に赤で固定する
+
+完了条件:
+
+- [ ] summary 発火後の follow-up 質問でも、直前までの task 文脈を保持できる
+- [ ] 長い対話でも branch explanation と create task の両方が破綻しにくい
+- [ ] transcript が無制限に膨らまず、summary / carryover の状態が追跡できる
+- [ ] local model 前提の長時間対話で、速度低下と文脈欠落が実用範囲に収まる
+- [ ] create task が固定シナリオに寄らず複数の実装経路を取れて、なお path / review / deliverable 要件を落としにくい
+
 ## Phase 4: 拡張フェーズ
 
 目的:
