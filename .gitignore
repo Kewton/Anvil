@@ -6,6 +6,7 @@
 
 # Local runtime state
 /.anvil
+/sandbox
 /tmp
 
 # Environment files
