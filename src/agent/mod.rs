@@ -104,7 +104,9 @@ impl Agent {
         })?;
 
         let output = loop_driver
-            .run(self, &self.config.cwd, &req.prompt, Vec::new())
+            .run_with_observer(self, &self.config.cwd, &req.prompt, Vec::new(), |event| {
+                print_loop_event(&event)
+            })
             .await?;
         let after_files = collect_files_recursive(&req.target_dir)?;
         let written_files = diff_new_or_changed_files(&before_files, &after_files);
@@ -353,6 +355,14 @@ fn print_loop_event(event: &LoopEvent) {
         LoopEvent::ToolResultReused { tool, reuse_count } => {
             println!("- tool result reused [{tool}] (reuse #{reuse_count})")
         }
+        LoopEvent::ToolErrorRecorded {
+            tool,
+            error_kind,
+            message,
+        } => println!(
+            "- tool error [{tool}] {error_kind}: {}",
+            truncate(message, 120)
+        ),
         LoopEvent::StepFinished { step, elapsed_ms } => {
             println!("- step {step} finished ({elapsed_ms} ms)")
         }

@@ -379,6 +379,94 @@ async fn loop_blocks_repeated_pre_write_directory_inspection() {
 }
 
 #[tokio::test]
+async fn loop_rejects_path_mismatch_against_requested_output_root() {
+    let dir = tempdir().unwrap();
+    let model = ScriptedModel::new(vec![
+        r#"{"type":"tool_calls","calls":[{"tool":"stat_path","args":{"path":"./sandbox11"}}]}"#
+            .to_string(),
+        r#"{"type":"tool_calls","calls":[{"tool":"mkdir","args":{"path":"./sandbox/test31_011"}}]}"#
+            .to_string(),
+        r#"{"type":"tool_calls","calls":[{"tool":"write_file","args":{"path":"./sandbox/test31_011/index.html","content":"<html>ok</html>"}}]}"#
+            .to_string(),
+        r#"{"type":"final","content":"created output"}"#.to_string(),
+    ]);
+    let driver = LoopDriver::new(LoopConfig::default());
+
+    let out = driver
+        .run(
+            &model,
+            dir.path(),
+            "ブラウザから直接実行可能なページを作成し、./sandbox/test31_011に出力してください",
+            Vec::<ModelTurn>::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(out.final_text, "created output");
+    let prompts = model.prompts();
+    assert!(prompts[1].contains("path_mismatch"));
+    assert!(std::fs::read_to_string(dir.path().join("sandbox/test31_011/index.html")).is_ok());
+}
+
+#[tokio::test]
+async fn observer_receives_tool_error_events() {
+    let dir = tempdir().unwrap();
+    let model = ScriptedModel::new(vec![
+        r#"{"type":"tool_calls","calls":[{"tool":"stat_path","args":{"path":"./sandbox11"}}]}"#
+            .to_string(),
+        r#"{"type":"final","content":"done"}"#.to_string(),
+    ]);
+    let driver = LoopDriver::new(LoopConfig::default());
+    let mut events = Vec::new();
+
+    let _ = driver
+        .run_with_observer(
+            &model,
+            dir.path(),
+            "ブラウザから直接実行可能なページを作成し、./sandbox/test31_011に出力してください",
+            Vec::<ModelTurn>::new(),
+            |event| events.push(event),
+        )
+        .await;
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        LoopEvent::ToolErrorRecorded {
+            tool,
+            error_kind,
+            ..
+        } if tool == "stat_path" && error_kind == "path_mismatch"
+    )));
+}
+
+#[tokio::test]
+async fn create_task_prompt_includes_expected_root_and_phase() {
+    let dir = tempdir().unwrap();
+    let model = ScriptedModel::new(vec![
+        r#"{"type":"tool_calls","calls":[{"tool":"mkdir","args":{"path":"./sandbox/test31_011"}}]}"#
+            .to_string(),
+        r#"{"type":"final","content":"done"}"#.to_string(),
+    ]);
+    let driver = LoopDriver::new(LoopConfig::default());
+
+    let _ = driver
+        .run(
+            &model,
+            dir.path(),
+            "ブラウザから直接実行可能なページを作成し、./sandbox/test31_011に出力してください",
+            Vec::<ModelTurn>::new(),
+        )
+        .await;
+
+    let prompts = model.prompts();
+    assert!(prompts[0].contains("EXPECTED_OUTPUT_ROOT"));
+    assert!(prompts[0].contains("./sandbox/test31_011"));
+    assert!(prompts[0].contains("CREATE_PHASE"));
+    assert!(prompts[0].contains("prepare"));
+    assert!(prompts[1].contains("write"));
+}
+
+#[tokio::test]
 async fn loop_fail_closed_on_invalid_tool_schema() {
     let dir = tempdir().unwrap();
     let model = ScriptedModel::new(vec![

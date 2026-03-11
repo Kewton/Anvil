@@ -142,6 +142,11 @@ pub enum LoopEvent {
         tool: String,
         reuse_count: usize,
     },
+    ToolErrorRecorded {
+        tool: String,
+        error_kind: String,
+        message: String,
+    },
     StepFinished {
         step: usize,
         elapsed_ms: u128,
@@ -184,6 +189,7 @@ impl LoopDriver {
         let mut tool_retry_state: Option<(String, usize)> = None;
         let mut tool_exec_retry_state: Option<(String, usize)> = None;
         let task_requires_write = task_requires_write_action(task);
+        let expected_output_root = expected_output_root(task);
 
         for step in 0..self.config.max_steps {
             let step_number = step + 1;
@@ -231,11 +237,12 @@ impl LoopDriver {
                                 retry,
                                 max_retries: self.config.max_schema_retries,
                             });
-                            turns.push(ModelTurn::ProtocolError {
+                            let turn = ModelTurn::ProtocolError {
                                 error_kind: "invalid_json".to_string(),
                                 message,
                                 hint: "return one complete JSON object only; do not emit partial or truncated JSON".to_string(),
-                            });
+                            };
+                            push_turn(&mut turns, turn, &mut observer);
                             observer(LoopEvent::StepFinished {
                                 step: step_number,
                                 elapsed_ms: step_started_at.elapsed().as_millis(),
@@ -265,11 +272,12 @@ impl LoopDriver {
                             retry,
                             max_retries: self.config.max_schema_retries,
                         });
-                        turns.push(ModelTurn::ProtocolError {
+                        let turn = ModelTurn::ProtocolError {
                             error_kind: "final_without_action".to_string(),
                             message: reason,
                             hint: "if the task requires creating or updating files, use write_file or edit_file before returning final".to_string(),
-                        });
+                        };
+                        push_turn(&mut turns, turn, &mut observer);
                         observer(LoopEvent::StepFinished {
                             step: step_number,
                             elapsed_ms: step_started_at.elapsed().as_millis(),
@@ -308,30 +316,49 @@ impl LoopDriver {
                                     retry,
                                     max_retries: self.config.max_schema_retries,
                                 });
-                                turns.push(ModelTurn::ToolError {
+                                let turn = ModelTurn::ToolError {
                                     tool: call.tool.clone(),
                                     error_kind: "schema_validation".to_string(),
                                     message: message.clone(),
                                     hint: tool_error_hint(&call.tool),
-                                });
+                                };
+                                push_turn(&mut turns, turn, &mut observer);
                                 continue;
                             }
                             Err(other) => return Err(other),
                         };
+                        if let Some(expected_root) = expected_output_root.as_deref()
+                            && let Some(mismatch_message) =
+                                validate_expected_output_path(task, expected_root, &validated)
+                        {
+                            let turn = ModelTurn::ToolError {
+                                tool: validated.tool_name().to_string(),
+                                error_kind: "path_mismatch".to_string(),
+                                message: mismatch_message,
+                                hint: format!(
+                                    "use the exact requested output path under {}",
+                                    expected_root.display()
+                                ),
+                            };
+                            push_turn(&mut turns, turn, &mut observer);
+                            continue;
+                        }
                         let normalized = serde_json::to_string(&validated)
                             .map_err(|err| LoopError::InvalidToolCall(err.to_string()))?;
                         observer(LoopEvent::ToolCallValidated {
                             tool: validated.tool_name().to_string(),
                             normalized: truncate(&normalized, 240),
                         });
-                        if should_block_pre_write_inspection(task, &turns, &validated) {
-                            turns.push(ModelTurn::ToolError {
+                        let create_phase = create_phase_for_task(task, &turns);
+                        if should_block_pre_write_inspection(task, create_phase, &validated) {
+                            let turn = ModelTurn::ToolError {
                                 tool: validated.tool_name().to_string(),
                                 error_kind: "stalled_pre_write_inspection".to_string(),
                                 message: "the output directory is already ready; more directory inspection is not useful"
                                     .to_string(),
                                 hint: "use write_file now to create the deliverable file instead of inspecting the empty directory again".to_string(),
-                            });
+                            };
+                            push_turn(&mut turns, turn, &mut observer);
                             continue;
                         }
                         if !seen.insert(normalized.clone()) {
@@ -339,24 +366,24 @@ impl LoopDriver {
                                 let Some((cached_output, reuse_count)) =
                                     cached_results.get_mut(&normalized)
                                 else {
-                                    turns.push(ModelTurn::ToolError {
-                                        tool: validated.tool_name().to_string(),
-                                        error_kind: "duplicate_empty_result".to_string(),
-                                        message: "previous identical read-only call returned no reusable result"
-                                            .to_string(),
-                                        hint: "change strategy: use mkdir, list_dir, stat_path, or write_file instead of repeating the same empty lookup".to_string(),
-                                    });
+                                    let turn = duplicate_empty_result_turn(
+                                        task,
+                                        expected_output_root.as_deref(),
+                                        &validated,
+                                    );
+                                    push_turn(&mut turns, turn, &mut observer);
                                     continue;
                                 };
                                 *reuse_count += 1;
                                 if *reuse_count > self.config.max_cached_reuses_per_call {
-                                    turns.push(ModelTurn::ToolError {
+                                    let turn = ModelTurn::ToolError {
                                         tool: validated.tool_name().to_string(),
                                         error_kind: "duplicate_reuse_limit".to_string(),
                                         message: "identical read-only call was repeated too many times"
                                             .to_string(),
                                         hint: "use the existing tool results to answer, or choose a different tool instead of repeating the same read-only call".to_string(),
-                                    });
+                                    };
+                                    push_turn(&mut turns, turn, &mut observer);
                                     continue;
                                 }
                                 observer(LoopEvent::ToolResultReused {
@@ -407,12 +434,17 @@ impl LoopDriver {
                                     retry,
                                     max_retries: self.config.max_schema_retries,
                                 });
-                                turns.push(ModelTurn::ToolError {
+                                let turn = ModelTurn::ToolError {
                                     tool: validated.tool_name().to_string(),
                                     error_kind: "execution_error".to_string(),
                                     message,
-                                    hint: tool_execution_error_hint(&validated),
-                                });
+                                    hint: tool_execution_error_hint(
+                                        task,
+                                        expected_output_root.as_deref(),
+                                        &validated,
+                                    ),
+                                };
+                                push_turn(&mut turns, turn, &mut observer);
                                 continue;
                             }
                         };
@@ -427,10 +459,14 @@ impl LoopDriver {
                         if can_reuse_cached_result(&validated) && !result.trim().is_empty() {
                             cached_results.insert(normalized, (result.clone(), 0));
                         }
-                        turns.push(ModelTurn::ToolResult {
-                            tool: validated.tool_name().to_string(),
-                            output: result,
-                        });
+                        push_turn(
+                            &mut turns,
+                            ModelTurn::ToolResult {
+                                tool: validated.tool_name().to_string(),
+                                output: result,
+                            },
+                            &mut observer,
+                        );
                     }
                     observer(LoopEvent::StepFinished {
                         step: step_number,
@@ -455,6 +491,26 @@ fn next_retry_count(state: &mut Option<(String, usize)>, key: String) -> usize {
             1
         }
     }
+}
+
+fn push_turn<F>(turns: &mut Vec<ModelTurn>, turn: ModelTurn, observer: &mut F)
+where
+    F: FnMut(LoopEvent),
+{
+    if let ModelTurn::ToolError {
+        tool,
+        error_kind,
+        message,
+        ..
+    } = &turn
+    {
+        observer(LoopEvent::ToolErrorRecorded {
+            tool: tool.clone(),
+            error_kind: error_kind.clone(),
+            message: message.clone(),
+        });
+    }
+    turns.push(turn);
 }
 
 fn task_requires_write_action(task: &str) -> bool {
@@ -580,6 +636,14 @@ struct ListDirArgs {
 #[serde(deny_unknown_fields)]
 struct PathArgs {
     path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CreatePhase {
+    Prepare,
+    Write,
+    Verify,
+    Finalize,
 }
 
 impl ToolCall {
@@ -741,6 +805,8 @@ fn contains_shell_metacharacters(command: &str) -> bool {
 }
 
 fn build_loop_prompt(task: &str, turns: &[ModelTurn]) -> String {
+    let expected_root = expected_output_root(task);
+    let create_phase = create_phase_for_task(task, turns);
     let mut prompt = String::from(
         "You are Anvil. Solve the task by selecting tools when needed.\n\
 Return only JSON.\n\
@@ -784,6 +850,21 @@ Invalid or partial tool args are forbidden.\n\n",
             }
         }
     }
+    if let Some(expected_root) = &expected_root {
+        prompt.push_str("EXPECTED_OUTPUT_ROOT\n");
+        prompt.push_str(&expected_root.display().to_string());
+        prompt.push_str("\n\n");
+    }
+    if task_requires_write_action(task) {
+        prompt.push_str("CREATE_PHASE\n");
+        prompt.push_str(match create_phase {
+            CreatePhase::Prepare => "prepare",
+            CreatePhase::Write => "write",
+            CreatePhase::Verify => "verify",
+            CreatePhase::Finalize => "finalize",
+        });
+        prompt.push_str("\n\n");
+    }
     if let Some(hint) = completion_hint(task, turns) {
         prompt.push_str("COMPLETION_HINT\n");
         prompt.push_str(&hint);
@@ -817,7 +898,7 @@ fn tool_error_hint(tool: &str) -> String {
     }
 }
 
-fn tool_execution_error_hint(call: &ToolCall) -> String {
+fn tool_execution_error_hint(task: &str, expected_root: Option<&Path>, call: &ToolCall) -> String {
     match call {
         ToolCall::ReadFile(args) => format!(
             "read_file requires a file path. If {} is a directory, use glob or exec ls instead",
@@ -843,11 +924,24 @@ fn tool_execution_error_hint(call: &ToolCall) -> String {
             "list_dir failed for {}. Retry with an existing directory path",
             args.path.display()
         ),
-        ToolCall::StatPath(args) | ToolCall::PathExists(args) | ToolCall::Mkdir(args) => format!(
-            "{} failed for {}. Verify the path and retry",
-            call.tool_name(),
-            args.path.display()
-        ),
+        ToolCall::StatPath(args) | ToolCall::PathExists(args) | ToolCall::Mkdir(args) => {
+            if task_requires_write_action(task)
+                && let Some(expected_root) = expected_root
+                && path_matches_expected(expected_root, &args.path)
+            {
+                return format!(
+                    "{} failed for {}. If the requested output root does not exist yet, use mkdir {} next.",
+                    call.tool_name(),
+                    args.path.display(),
+                    expected_root.display()
+                );
+            }
+            format!(
+                "{} failed for {}. Verify the path and retry",
+                call.tool_name(),
+                args.path.display()
+            )
+        }
         ToolCall::Search(args) => format!(
             "search failed for needle {}. Retry after narrowing the query or checking paths",
             truncate(&args.needle, 80)
@@ -910,18 +1004,29 @@ fn compact_turns(turns: &[ModelTurn]) -> Vec<ModelTurn> {
 }
 
 fn completion_hint(task: &str, turns: &[ModelTurn]) -> Option<String> {
+    let expected_root = expected_output_root(task);
     if task_requires_write_action(task) {
-        if has_write_evidence(turns) {
-            return Some(
-                "A write/edit has already succeeded. Prefer returning final with a concise summary of created or changed files unless another tool is strictly necessary."
-                    .to_string(),
-            );
-        }
-        if has_mkdir_evidence(turns) && has_empty_directory_evidence(turns) {
-            return Some(
-                "The target directory now exists and is empty. Stop inspecting it and use write_file to create the deliverable file(s) now."
-                    .to_string(),
-            );
+        match create_phase_for_task(task, turns) {
+            CreatePhase::Verify | CreatePhase::Finalize => {
+                return Some(
+                    "A write/edit has already succeeded. Prefer returning final with a concise summary of created or changed files unless another tool is strictly necessary."
+                        .to_string(),
+                );
+            }
+            CreatePhase::Write => {
+                return Some(
+                    "Preparation is complete. Use write_file now to create the deliverable file at the requested output path instead of inspecting the directory again."
+                        .to_string(),
+                );
+            }
+            CreatePhase::Prepare => {
+                if let Some(expected_root) = expected_root {
+                    return Some(format!(
+                        "The requested output root {} is not ready yet. Use mkdir on that exact path next, then use write_file. Do not inspect parent directories or repeat stat_path on the missing target.",
+                        expected_root.display()
+                    ));
+                }
+            }
         }
         return None;
     }
@@ -999,16 +1104,164 @@ fn has_empty_directory_evidence(turns: &[ModelTurn]) -> bool {
     })
 }
 
+fn create_phase_for_task(task: &str, turns: &[ModelTurn]) -> CreatePhase {
+    if !task_requires_write_action(task) {
+        return CreatePhase::Finalize;
+    }
+    if has_write_evidence(turns) {
+        if has_verification_evidence(turns) {
+            return CreatePhase::Finalize;
+        }
+        return CreatePhase::Verify;
+    }
+    if has_mkdir_evidence(turns) || has_empty_directory_evidence(turns) {
+        return CreatePhase::Write;
+    }
+    CreatePhase::Prepare
+}
+
+fn has_verification_evidence(turns: &[ModelTurn]) -> bool {
+    turns.iter().rev().take(4).any(|turn| match turn {
+        ModelTurn::ToolResult { tool, output } if tool == "read_file" => !output.trim().is_empty(),
+        ModelTurn::ToolResult { tool, output } if tool == "stat_path" => {
+            output.contains("kind=file")
+        }
+        ModelTurn::ToolResult { tool, output } if tool == "path_exists" => {
+            output.contains("exists=true")
+        }
+        _ => false,
+    })
+}
+
+fn expected_output_root(task: &str) -> Option<PathBuf> {
+    if !task_requires_write_action(task) {
+        return None;
+    }
+    extract_path_like_tokens(task)
+        .into_iter()
+        .find(|path| path.components().count() > 1)
+}
+
+fn extract_path_like_tokens(task: &str) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut current = String::new();
+    let mut capturing = false;
+
+    for ch in task.chars() {
+        let is_start = ch == '.' || ch == '/';
+        let is_path_char = ch.is_ascii_alphanumeric() || matches!(ch, '.' | '/' | '_' | '-');
+        if !capturing {
+            if is_start {
+                capturing = true;
+                current.push(ch);
+            }
+            continue;
+        }
+        if is_path_char {
+            current.push(ch);
+            continue;
+        }
+        if current.len() > 1 {
+            paths.push(PathBuf::from(trim_path_token(&current)));
+        }
+        current.clear();
+        capturing = false;
+    }
+
+    if capturing && current.len() > 1 {
+        paths.push(PathBuf::from(trim_path_token(&current)));
+    }
+    paths
+}
+
+fn trim_path_token(path: &str) -> &str {
+    path.trim_end_matches(['.', ',', ')', ']', '"', '\''])
+}
+
+fn validate_expected_output_path(
+    task: &str,
+    expected_root: &Path,
+    call: &ToolCall,
+) -> Option<String> {
+    if !task_requires_write_action(task) {
+        return None;
+    }
+    let actual = tool_call_primary_path(call)?;
+    if path_matches_expected(expected_root, actual) {
+        return None;
+    }
+    Some(format!(
+        "tool path {} does not match requested output path {}",
+        actual.display(),
+        expected_root.display()
+    ))
+}
+
+fn duplicate_empty_result_turn(
+    task: &str,
+    expected_root: Option<&Path>,
+    call: &ToolCall,
+) -> ModelTurn {
+    if task_requires_write_action(task)
+        && let Some(expected_root) = expected_root
+        && let Some(actual) = tool_call_primary_path(call)
+        && path_matches_expected(expected_root, actual)
+    {
+        return ModelTurn::ToolError {
+            tool: call.tool_name().to_string(),
+            error_kind: "stalled_missing_output_root".to_string(),
+            message:
+                "the requested output root is still missing; repeating the same probe will not help"
+                    .to_string(),
+            hint: format!(
+                "use mkdir on {} next, then write_file under that directory",
+                expected_root.display()
+            ),
+        };
+    }
+
+    ModelTurn::ToolError {
+        tool: call.tool_name().to_string(),
+        error_kind: "duplicate_empty_result".to_string(),
+        message: "previous identical read-only call returned no reusable result".to_string(),
+        hint: "change strategy: use mkdir, list_dir, stat_path, or write_file instead of repeating the same empty lookup".to_string(),
+    }
+}
+
+fn tool_call_primary_path(call: &ToolCall) -> Option<&Path> {
+    match call {
+        ToolCall::ReadFile(args) => Some(args.path.as_path()),
+        ToolCall::WriteFile(args) => Some(args.path.as_path()),
+        ToolCall::EditFile(args) => Some(args.path.as_path()),
+        ToolCall::ListDir(args) => Some(args.path.as_path()),
+        ToolCall::StatPath(args) => Some(args.path.as_path()),
+        ToolCall::PathExists(args) => Some(args.path.as_path()),
+        ToolCall::Mkdir(args) => Some(args.path.as_path()),
+        ToolCall::Glob(_) | ToolCall::Exec(_) | ToolCall::Diff(_) | ToolCall::Search(_) => None,
+    }
+}
+
+fn path_matches_expected(expected_root: &Path, actual: &Path) -> bool {
+    let expected_text = expected_root.to_string_lossy();
+    let actual_text = actual.to_string_lossy();
+    actual_text == expected_text
+        || actual_text.starts_with(&format!("{expected_text}/"))
+        || actual_text.starts_with(&format!("{expected_text}."))
+        || actual_text.ends_with(expected_text.as_ref())
+        || actual_text.contains(&format!("/{expected_text}"))
+}
+
 fn looks_like_commit_line(line: &str) -> bool {
     let prefix = line.split_whitespace().next().unwrap_or_default();
     prefix.len() >= 7 && prefix.chars().take(7).all(|ch| ch.is_ascii_hexdigit())
 }
 
-fn should_block_pre_write_inspection(task: &str, turns: &[ModelTurn], call: &ToolCall) -> bool {
-    if !task_requires_write_action(task) || has_write_evidence(turns) {
-        return false;
-    }
-    if !has_mkdir_evidence(turns) || !has_empty_directory_evidence(turns) {
+fn should_block_pre_write_inspection(
+    task: &str,
+    create_phase: CreatePhase,
+    call: &ToolCall,
+) -> bool {
+    if !task_requires_write_action(task) || create_phase != CreatePhase::Write {
         return false;
     }
     matches!(
