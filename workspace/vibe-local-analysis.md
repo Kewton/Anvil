@@ -77,6 +77,8 @@ The goal is to keep code observation separate from evaluation and strategy.
 - `Read` has special handling for images, PDFs, and notebooks.
 - `Bash` sanitizes environment variables and blocks several dangerous shell patterns.
 - `Write` and `Edit` are treated as side-effecting operations and can trigger checkpointing and auto-tests.
+- The runtime distinguishes between safe tools, confirmation-required tools, and network tools through `PermissionMgr`.
+- Only a subset of tools are eligible for parallel execution, and side-effecting tools remain sequential.
 
 ### Tool Call Recovery and Agent Loop
 
@@ -96,6 +98,8 @@ The goal is to keep code observation separate from evaluation and strategy.
 - Even in `yes_mode`, certain dangerous bash patterns still require confirmation.
 - The code contains path sanitization, symlink checks, protected path checks, localhost restriction for Ollama host, and several shell-pattern blocks.
 - Git checkpoint and rollback functionality is implemented with `git stash`.
+- In plan mode, `Write` is restricted to the plans directory until the user switches to act mode.
+- The agent pads missing tool results on interruption so assistant tool-call history remains structurally valid.
 
 ### Extended Capability Layers
 
@@ -112,6 +116,8 @@ The goal is to keep code observation separate from evaluation and strategy.
 - `tests/test_vibe_coder.py` contains many unit-level tests covering config, safety, parsing, and runtime behaviors.
 - `test_tui_pty.py` validates terminal behavior through a minimal VT100 emulator and PTY interaction.
 - `test_scroll_region.py` is a standalone diagnostic for the DECSTBM-based footer behavior.
+- The test suite is especially concentrated around configuration behavior, safety checks, parsing fallbacks, and terminal footer correctness.
+- Terminal rendering behavior is not only implemented but explicitly regression-tested, which is unusual for a small CLI codebase.
 
 ## Inferences
 
@@ -165,6 +171,22 @@ The goal is to keep code observation separate from evaluation and strategy.
 - It is not justified from code inspection alone to claim category-wide No.1 status on speed, quality, or stability.
 - Any such claim would require benchmark definitions and empirical comparison.
 
+### Competitive Axes Hypothesis
+
+The implementation suggests that `vibe-local` is most competitive on these axes:
+
+- time-to-first-usable-session on a local machine
+- resilience to malformed or weak tool-calling behavior
+- safety for interactive local execution with weaker models
+- terminal UX quality relative to its dependency footprint
+
+The implementation suggests it is less likely to lead on these axes:
+
+- raw runtime throughput
+- large-repository retrieval sophistication
+- long-term architectural extensibility
+- richer structured UX beyond the current terminal model
+
 ### Strength Hypothesis
 
 Based on the implementation, the strongest case for `vibe-local` is:
@@ -179,27 +201,31 @@ Based on the implementation, the strongest case for `vibe-local` is:
 Based on the implementation, the strongest weakness hypotheses are:
 
 - maintainability ceiling from the monolithic structure
-- raw performance ceiling from Python and string-heavy interfaces
+- raw performance ceiling from the combination of Python, string-heavy tool transport, single-process coordination, ANSI-state-heavy UI handling, and brute-force retrieval
 - limited architectural headroom for richer UX and more typed state management
 - limited retrieval sophistication for large-scale long-context codebase work
 
 ## Implications for Anvil
 
-### What Anvil Should Preserve
+### Priority 1: Preserve or Exceed
 
 - Keep a local-first assumption set rather than treating local inference as an optional backend.
 - Design explicitly for imperfect tool-calling and malformed structured output.
 - Preserve session persistence, rollback, permission gating, and context hygiene as first-class capabilities.
-- Maintain a strong terminal UX baseline rather than treating UX as secondary to backend logic.
 - Use model-aware routing and sidecar models where they improve cost, latency, or context management.
 
-### What Anvil Should Improve
+### Priority 1: Improve Immediately
 
 - Replace the single-file monolith with explicit subsystem boundaries.
 - Replace string-heavy internal interfaces with typed events, typed tool payloads, and typed results.
 - Improve raw runtime efficiency through Rust process management, concurrency control, and lower-overhead streaming.
-- Build a more extensible terminal architecture so richer UX can be added without terminal-state fragility dominating the design.
+- Build the terminal architecture so user input, agent output, status, and commands are clearly separated from day one.
+
+### Priority 2: Improve Early
+
 - Improve long-context and retrieval handling beyond brute-force SQLite-based local RAG.
+- Build a more extensible terminal architecture so richer UX can be added without terminal-state fragility dominating the design.
+- Treat execution policy as a first-class subsystem: safe/ask/network classes, parallel-safe classes, plan-mode restrictions, and interruption recovery should be explicit in the design.
 
 ### Architectural Targets Suggested by This Analysis
 
@@ -214,6 +240,7 @@ Based on the implementation, the strongest weakness hypotheses are:
 
 If Anvil aims to beat `vibe-local` for local LLM coding use, the likely winning path is:
 
+- match or exceed its speed of local setup and first-use experience
 - match or exceed its resilience to weak local model behavior
 - exceed it on runtime efficiency
 - exceed it on architectural extensibility
