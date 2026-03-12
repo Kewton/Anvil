@@ -105,7 +105,6 @@ The goal is to keep code observation separate from evaluation and strategy.
 
 - MCP servers are loaded from config and project-local JSON files, then exposed as tools.
 - Skills are loaded from markdown files in global and project-level directories.
-- Plan mode restricts `Write` to a plans directory until the user switches to act mode.
 - File watching is implemented through polling.
 - Auto-test can run syntax checks and inferred test commands after edits.
 - Local RAG is implemented with Ollama embeddings plus SQLite storage and brute-force cosine similarity.
@@ -123,51 +122,51 @@ The goal is to keep code observation separate from evaluation and strategy.
 
 ### Architectural Character
 
-- `vibe-local` is functionally ambitious but physically centralized.
-- The main design pattern is to accumulate features inside one runtime rather than isolate them behind strong module boundaries.
-- The codebase is optimized more for distribution simplicity and inspectability than for long-term internal separation.
+- `vibe-local` is functionally ambitious but physically centralized. `Evidence strength: strong`
+- The main design pattern is to accumulate features inside one runtime rather than isolate them behind strong module boundaries. `Evidence strength: strong`
+- The codebase is optimized more for distribution simplicity and inspectability than for long-term internal separation. `Evidence strength: moderate`
 
 ### Product Intent
 
-- The repository appears intentionally optimized for low-friction local/offline use rather than for maximum architectural purity.
-- The implementation choices align with the README positioning around education, research, and offline operation.
-- Several "rough" design choices look deliberate rather than accidental, especially stdlib-only implementation and direct ANSI terminal control.
+- The repository appears intentionally optimized for low-friction local/offline use rather than for maximum architectural purity. `Evidence strength: strong`
+- The implementation choices align with the README positioning around education, research, and offline operation. `Evidence strength: strong`
+- Several "rough" design choices look deliberate rather than accidental, especially stdlib-only implementation and direct ANSI terminal control. `Evidence strength: moderate`
 
 ### Local-LLM Alignment
 
-- The runtime is more aligned with local LLM constraints than many generic coding agents that merely support local providers.
-- The code repeatedly assumes imperfect tool-calling behavior and includes explicit recovery paths for malformed outputs.
-- Sidecar summarization, context compaction, low dependency overhead, and direct Ollama control suggest the product is tuned for practical local usage rather than cloud-first assumptions.
+- The runtime is more aligned with local LLM constraints than many generic coding agents that merely support local providers. `Evidence strength: moderate`
+- The code repeatedly assumes imperfect tool-calling behavior and includes explicit recovery paths for malformed outputs. `Evidence strength: strong`
+- Sidecar summarization, context compaction, low dependency overhead, and direct Ollama control suggest the product is tuned for practical local usage rather than cloud-first assumptions. `Evidence strength: strong`
 
 ### UX Quality
 
-- `vibe-local` invests meaningfully in terminal UX despite not using a rich TUI framework.
-- Features such as fixed footer, ESC interrupt, type-ahead, slash commands, and session resume indicate product attention beyond a barebones CLI.
-- The current UX is likely stronger than what the repository shape alone would suggest.
+- `vibe-local` invests meaningfully in terminal UX despite not using a rich TUI framework. `Evidence strength: strong`
+- Features such as fixed footer, ESC interrupt, type-ahead, slash commands, and session resume indicate product attention beyond a barebones CLI. `Evidence strength: strong`
+- The current UX is likely stronger than what the repository shape alone would suggest. `Evidence strength: moderate`
 
 ### Reliability Profile
 
-- The code shows a pragmatic reliability strategy: permission prompts, shell blocking, rollback, auto-save, loop detection, and compaction.
-- This likely improves user experience with weaker or less predictable local models.
-- Stability here appears to come from layered guardrails rather than from a deeply typed or formally structured architecture.
+- The code shows a pragmatic reliability strategy: permission prompts, shell blocking, rollback, auto-save, loop detection, and compaction. `Evidence strength: strong`
+- This likely improves user experience with weaker or less predictable local models. `Evidence strength: moderate`
+- Stability here appears to come from layered guardrails rather than from a deeply typed or formally structured architecture. `Evidence strength: strong`
 
 ### Performance Profile
 
-- The implementation likely has low deployment friction and relatively low framework overhead.
-- However, the Python runtime, monolithic process structure, heavy string handling, and text-based tool interfaces likely place a ceiling on raw runtime efficiency and future scaling.
-- RAG and retrieval are functional for smaller scopes but likely not optimized for very large corpora or very large repositories.
+- The implementation likely has low deployment friction and relatively low framework overhead. `Evidence strength: moderate`
+- However, the Python runtime, monolithic process structure, heavy string handling, and text-based tool interfaces likely place a ceiling on raw runtime efficiency and future scaling. `Evidence strength: moderate`
+- RAG and retrieval are functional for smaller scopes but likely not optimized for very large corpora or very large repositories. `Evidence strength: strong`
 
 ### Maintainability Profile
 
-- The single-file core almost certainly increases coupling and makes future feature growth more expensive.
-- The conceptual subsystem count is high relative to the physical module separation.
-- This suggests feature velocity may eventually be constrained by coordination cost inside the monolith.
+- The single-file core almost certainly increases coupling and makes future feature growth more expensive. `Evidence strength: strong`
+- The conceptual subsystem count is high relative to the physical module separation. `Evidence strength: strong`
+- This suggests feature velocity may eventually be constrained by coordination cost inside the monolith. `Evidence strength: moderate`
 
 ### Competitive Interpretation
 
-- `vibe-local` looks strongest when evaluated as a local-first runtime wrapper around imperfect local models.
-- Its strongest differentiation appears to be operational pragmatism rather than raw algorithmic novelty.
-- It is reasonable to hypothesize that it can outperform more cloud-assumption-heavy agents in some local/offline workflows.
+- `vibe-local` looks strongest when evaluated as a local-first runtime wrapper around imperfect local models. `Evidence strength: moderate`
+- Its strongest differentiation appears to be operational pragmatism rather than raw algorithmic novelty. `Evidence strength: moderate`
+- It is reasonable to hypothesize that it can outperform more cloud-assumption-heavy agents in some local/offline workflows. `Evidence strength: weak`
 - It is not justified from code inspection alone to claim category-wide No.1 status on speed, quality, or stability.
 - Any such claim would require benchmark definitions and empirical comparison.
 
@@ -209,6 +208,11 @@ Based on the implementation, the strongest weakness hypotheses are:
 
 ### Priority 1: Preserve or Exceed
 
+Priority rule:
+
+- `Priority 1` means either fundamental to local-agent usefulness or expensive to retrofit later.
+- `Priority 2` means important, but deferrable if the initial architecture leaves a clean insertion point.
+
 - Keep a local-first assumption set rather than treating local inference as an optional backend.
 - Design explicitly for imperfect tool-calling and malformed structured output.
 - Preserve session persistence, rollback, permission gating, and context hygiene as first-class capabilities.
@@ -246,6 +250,27 @@ If Anvil aims to beat `vibe-local` for local LLM coding use, the likely winning 
 - exceed it on architectural extensibility
 - exceed it on structured UX clarity
 - exceed it on large-context and large-repository handling
+
+Suggested measurable comparison axes:
+
+- first-launch setup effort and time-to-first-usable-session
+- first prompt latency and steady-state iteration latency
+- malformed tool-call recovery success rate
+- interruption safety and session survival rate
+- context reuse effectiveness across long sessions
+- repo-scale retrieval quality and latency
+
+### Advantage-to-Response Mapping
+
+| vibe-local advantage or weakness | Why it matters | Anvil response |
+|---|---|---|
+| Fast local onboarding and low setup friction | Determines adoption and first impression | Keep install/runtime path simple even with Rust architecture |
+| Strong recovery from malformed tool-calling | Critical for imperfect local models | Make malformed-output recovery a first-class agent-loop concern |
+| Practical safety model with approval, rollback, and interruption handling | Improves trust and reduces blast radius | Implement execution policy, rollback, and interruption recovery as core subsystems |
+| Surprisingly capable terminal UX with minimal stack | Raises usability without cloud dependencies | Build a clearer and more extensible terminal UX while preserving immediacy |
+| Monolithic structure | Limits maintainability and future growth | Enforce subsystem boundaries early |
+| String-heavy tool transport | Adds parsing and correctness overhead | Use typed tool payloads and typed internal events |
+| Basic brute-force local RAG | Caps large-repo reasoning quality and scale | Build stronger long-context and retrieval architecture |
 
 ### Practical Conclusion
 
