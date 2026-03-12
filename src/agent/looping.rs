@@ -855,6 +855,7 @@ struct RequirementState {
     hard_cap: usize,
     finalize_phase_budget: usize,
     finalize_started_step: Option<usize>,
+    last_written_deliverable: Option<PathBuf>,
 }
 
 impl RequirementState {
@@ -889,6 +890,7 @@ impl RequirementState {
             hard_cap: config.max_steps,
             finalize_phase_budget: config.finalize_phase_budget,
             finalize_started_step: None,
+            last_written_deliverable: None,
         }
     }
 
@@ -949,6 +951,24 @@ impl RequirementState {
     }
 
     fn record_evidence(&mut self, task: &str, call: &ToolCall, result: &str) {
+        if let ToolCall::WriteFile(args) = call
+            && self
+                .contract
+                .output_root
+                .as_deref()
+                .is_some_and(|root| path_under_root(root, &args.path))
+        {
+            self.last_written_deliverable = Some(args.path.clone());
+        }
+        if let ToolCall::EditFile(args) = call
+            && self
+                .contract
+                .output_root
+                .as_deref()
+                .is_some_and(|root| path_under_root(root, &args.path))
+        {
+            self.last_written_deliverable = Some(args.path.clone());
+        }
         let evidence = evaluate_evidence(task, &self.contract, call, result, self.current_phase());
         match evidence {
             EvidenceResult::None => self.record_no_progress(),
@@ -1007,6 +1027,10 @@ impl RequirementState {
             return CreatePhase::Review;
         }
         CreatePhase::Finalize
+    }
+
+    fn preferred_deliverable_path(&self) -> Option<&Path> {
+        self.last_written_deliverable.as_deref()
     }
 }
 
@@ -2174,24 +2198,74 @@ fn unmet_requirements(
                 .to_string()
         }
         CreateRequirement::EntryPointVerified => {
-            "The main deliverable has not been read back yet. Read the entry file before returning final."
-                .to_string()
+            requirement_state
+                .preferred_deliverable_path()
+                .map(|path| {
+                    format!(
+                        "The main deliverable has not been read back yet. Read {} before returning final.",
+                        path.display()
+                    )
+                })
+                .unwrap_or_else(|| {
+                    "The main deliverable has not been read back yet. Read the entry file before returning final."
+                        .to_string()
+                })
         }
         CreateRequirement::RequestedOutputVerified => {
-            "The requested output path has not been verified yet. Confirm the generated file lives under the exact requested root."
-                .to_string()
+            requirement_state
+                .preferred_deliverable_path()
+                .map(|path| {
+                    format!(
+                        "The requested output path has not been verified yet. Confirm that {} is the generated file under the exact requested root.",
+                        path.display()
+                    )
+                })
+                .unwrap_or_else(|| {
+                    "The requested output path has not been verified yet. Confirm the generated file lives under the exact requested root."
+                        .to_string()
+                })
         }
         CreateRequirement::RuntimeVerified => {
-            "Browser-runnable output was requested but runtime readiness is not yet verified. Confirm that the HTML entry contains executable browser logic."
-                .to_string()
+            requirement_state
+                .preferred_deliverable_path()
+                .map(|path| {
+                    format!(
+                        "Browser-runnable output was requested but runtime readiness is not yet verified. Read {} and confirm that it contains executable browser logic.",
+                        path.display()
+                    )
+                })
+                .unwrap_or_else(|| {
+                    "Browser-runnable output was requested but runtime readiness is not yet verified. Confirm that the HTML entry contains executable browser logic."
+                        .to_string()
+                })
         }
         CreateRequirement::CoreLoopVerified => {
-            "The requested core behavior is not yet verified. Read the generated file and confirm the playable loop or key interaction exists."
-                .to_string()
+            requirement_state
+                .preferred_deliverable_path()
+                .map(|path| {
+                    format!(
+                        "The requested core behavior is not yet verified. Read {} and confirm the playable loop or key interaction exists.",
+                        path.display()
+                    )
+                })
+                .unwrap_or_else(|| {
+                    "The requested core behavior is not yet verified. Read the generated file and confirm the playable loop or key interaction exists."
+                        .to_string()
+                })
         }
         CreateRequirement::ReviewCompleted => {
-            "A code review was requested and is still missing. Inspect the generated file and include review findings before final."
-                .to_string()
+            requirement_state
+                .preferred_deliverable_path()
+                .map(|path| {
+                    format!(
+                        "A code review was requested and is still missing. Inspect {} and include review findings before final.",
+                        path.display()
+                    )
+                })
+                .unwrap_or_else(|| {
+                    "A code review was requested and is still missing. Inspect the generated file and include review findings before final."
+                        .to_string()
+                })
         }
     })
 }
@@ -2263,19 +2337,32 @@ fn duplicate_empty_result_turn(
     if task_requires_write_action(task)
         && let Some(expected_root) = expected_root
         && let Some(actual) = tool_call_primary_path(call)
-        && path_matches_expected(expected_root, actual)
     {
-        return ModelTurn::ToolError {
-            tool: call.tool_name().to_string(),
-            error_kind: "stalled_missing_output_root".to_string(),
-            message:
-                "the requested output root is still missing; repeating the same probe will not help"
+        if actual == expected_root {
+            return ModelTurn::ToolError {
+                tool: call.tool_name().to_string(),
+                error_kind: "stalled_missing_output_root".to_string(),
+                message:
+                    "the requested output root is still missing; repeating the same probe will not help"
+                        .to_string(),
+                hint: format!(
+                    "use mkdir on {} next, then write_file under that directory",
+                    expected_root.display()
+                ),
+            };
+        }
+        if path_under_root(expected_root, actual) {
+            return ModelTurn::ToolError {
+                tool: call.tool_name().to_string(),
+                error_kind: "stalled_missing_entry_point".to_string(),
+                message: "the requested root exists, but this specific file probe is still empty"
                     .to_string(),
-            hint: format!(
-                "use mkdir on {} next, then write_file under that directory",
-                expected_root.display()
-            ),
-        };
+                hint: format!(
+                    "read the actual written deliverable under {} or list the directory once to discover the correct file; do not keep probing the same missing file",
+                    expected_root.display()
+                ),
+            };
+        }
     }
 
     ModelTurn::ToolError {
