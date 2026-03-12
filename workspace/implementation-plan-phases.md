@@ -602,6 +602,11 @@ TDD の観点:
 - [ ] sidecar compaction input/output contract の schema test
 - [ ] permission event が raw transcript と carryover summary へ正しく残る test
 - [ ] streaming parse failure から sync fallback へ 1 回だけ移行する test
+- [ ] `Verify -> Review/Finalize` の transition guard test
+- [ ] task-class execution stance が contract message に乗る test
+- [ ] permission state snapshot が loop context に乗る test
+- [ ] next action hint schema が transition note に残る test
+- [ ] fallback ladder の非 native path が将来拡張可能な shape になっている test
 
 実装:
 
@@ -612,6 +617,7 @@ TDD の観点:
 - [ ] phase 遷移の truth source を `RequirementState.remaining` へ一元化する
   - `CreatePhase` は derived UI state に格下げする
   - `DeliverableVerified` は `EntryPointVerified / RuntimeVerified / RequestedOutputVerified / CoreLoopVerified` に分解する
+  - `Verify -> Review/Finalize` の transition guard を持つ
 - [ ] provider capability model を追加する
   - `Unknown / Supported / Unsupported`
   - `provider + model + endpoint fingerprint` 単位の probe once + cached fallback
@@ -624,11 +630,19 @@ TDD の観点:
   - timeout / retry / backoff / empty-response handling
 - [ ] Ollama / LM Studio で tool streaming 対応 path と sync fallback path を分離する
 - [ ] provider fallback reason code を audit/debug に残す
+- [ ] fallback ladder の拡張余地を残す
+  - native
+  - normalized fallback extractor
+  - clarification or deny
 - [ ] sidecar compaction policy を追加する
   - sidecar selection
   - fallback to main
   - compaction audit events
   - sidecar compaction input/output contract
+- [ ] sidecar selection strategy を追加する
+  - installed models
+  - preferred family
+  - RAM/VRAM tier
 - [ ] `ANVIL.md / memory / carryover / contract / transcript` を message-structured layout へ分割する
   - base policy
   - project instructions
@@ -650,9 +664,16 @@ TDD の観点:
 - [ ] permission event retention policy を追加する
   - raw transcript
   - carryover summary
+- [ ] permission state snapshot を loop context に載せる
 - [ ] tool result 後の短い assistant summary hook を追加する
 - [ ] `assistant transition note` を loop context に残す
   - user-visible note と model-visible note の分離可能性を残す
+  - next action hint schema を持つ
+- [ ] task-class execution stance を contract message に追加する
+  - inspect: evidence-first
+  - edit: minimal-change-first
+  - create: deliverable-first
+  - review: finding-first
 - [ ] evidence delta evaluator を追加する
   - new evidence
   - strengthened evidence
@@ -684,6 +705,7 @@ TDD の観点:
 - [ ] sidecar compaction の有無で loop correctness が変わらない
 - [ ] transcript compaction 後も tool/result pairing が壊れない
 - [ ] permission decision と provider fallback が carryover 後も追跡できる
+- [ ] `vibe-local` よりも task stance と permission state が構造化され、再現性高く運用できる
 
 ## Phase 4: 拡張フェーズ
 
