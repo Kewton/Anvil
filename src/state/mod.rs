@@ -5,8 +5,10 @@ pub enum StateTransition {
     StartThinking,
     RequestApproval,
     StartWorking,
+    ResumeThinking,
     Interrupt,
     Finish,
+    Fail,
     ResetToReady,
 }
 
@@ -54,8 +56,10 @@ impl StateMachine {
             StateTransition::StartThinking => RuntimeState::Thinking,
             StateTransition::RequestApproval => RuntimeState::AwaitingApproval,
             StateTransition::StartWorking => RuntimeState::Working,
+            StateTransition::ResumeThinking => RuntimeState::Thinking,
             StateTransition::Interrupt => RuntimeState::Interrupted,
             StateTransition::Finish => RuntimeState::Done,
+            StateTransition::Fail => RuntimeState::Error,
             StateTransition::ResetToReady => RuntimeState::Ready,
         };
 
@@ -65,35 +69,79 @@ impl StateMachine {
 
         let valid = matches!(
             (from, transition, to),
-            (RuntimeState::Ready, StateTransition::ResetToReady, RuntimeState::Ready)
-                | (RuntimeState::Ready, StateTransition::StartThinking, RuntimeState::Thinking)
-                | (
-                    RuntimeState::Thinking,
-                    StateTransition::RequestApproval,
-                    RuntimeState::AwaitingApproval
-                )
-                | (RuntimeState::Thinking, StateTransition::StartWorking, RuntimeState::Working)
-                | (RuntimeState::Thinking, StateTransition::Interrupt, RuntimeState::Interrupted)
-                | (RuntimeState::Thinking, StateTransition::Finish, RuntimeState::Done)
-                | (
-                    RuntimeState::AwaitingApproval,
-                    StateTransition::StartWorking,
-                    RuntimeState::Working
-                )
-                | (
-                    RuntimeState::AwaitingApproval,
-                    StateTransition::ResetToReady,
-                    RuntimeState::Ready
-                )
-                | (
-                    RuntimeState::AwaitingApproval,
-                    StateTransition::Interrupt,
-                    RuntimeState::Interrupted
-                )
-                | (RuntimeState::Working, StateTransition::Interrupt, RuntimeState::Interrupted)
-                | (RuntimeState::Working, StateTransition::Finish, RuntimeState::Done)
-                | (RuntimeState::Interrupted, StateTransition::ResetToReady, RuntimeState::Ready)
-                | (RuntimeState::Done, StateTransition::ResetToReady, RuntimeState::Ready)
+            (
+                RuntimeState::Ready,
+                StateTransition::ResetToReady,
+                RuntimeState::Ready
+            ) | (
+                RuntimeState::Ready,
+                StateTransition::StartThinking,
+                RuntimeState::Thinking
+            ) | (
+                RuntimeState::Thinking,
+                StateTransition::RequestApproval,
+                RuntimeState::AwaitingApproval
+            ) | (
+                RuntimeState::Thinking,
+                StateTransition::StartWorking,
+                RuntimeState::Working
+            ) | (
+                RuntimeState::Thinking,
+                StateTransition::Interrupt,
+                RuntimeState::Interrupted
+            ) | (
+                RuntimeState::Thinking,
+                StateTransition::Finish,
+                RuntimeState::Done
+            ) | (
+                RuntimeState::AwaitingApproval,
+                StateTransition::StartWorking,
+                RuntimeState::Working
+            ) | (
+                RuntimeState::AwaitingApproval,
+                StateTransition::ResetToReady,
+                RuntimeState::Ready
+            ) | (
+                RuntimeState::AwaitingApproval,
+                StateTransition::Interrupt,
+                RuntimeState::Interrupted
+            ) | (
+                RuntimeState::AwaitingApproval,
+                StateTransition::Fail,
+                RuntimeState::Error
+            ) | (
+                RuntimeState::Working,
+                StateTransition::ResumeThinking,
+                RuntimeState::Thinking
+            ) | (
+                RuntimeState::Working,
+                StateTransition::Interrupt,
+                RuntimeState::Interrupted
+            ) | (
+                RuntimeState::Working,
+                StateTransition::Finish,
+                RuntimeState::Done
+            ) | (
+                RuntimeState::Working,
+                StateTransition::Fail,
+                RuntimeState::Error
+            ) | (
+                RuntimeState::Thinking,
+                StateTransition::Fail,
+                RuntimeState::Error
+            ) | (
+                RuntimeState::Interrupted,
+                StateTransition::ResetToReady,
+                RuntimeState::Ready
+            ) | (
+                RuntimeState::Done,
+                StateTransition::ResetToReady,
+                RuntimeState::Ready
+            ) | (
+                RuntimeState::Error,
+                StateTransition::ResetToReady,
+                RuntimeState::Ready
+            )
         );
 
         if !valid {

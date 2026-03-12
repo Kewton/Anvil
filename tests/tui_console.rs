@@ -1,0 +1,260 @@
+mod common;
+
+use anvil::config::EffectiveConfig;
+use anvil::provider::ProviderRuntimeContext;
+use anvil::tui::Tui;
+
+#[test]
+fn tui_renders_status_line() {
+    let mut app = common::build_app();
+    let tui = Tui::new();
+
+    let _ = app
+        .initial_snapshot()
+        .expect("initial snapshot should build");
+    let rendered = app.render_console(&tui).expect("render should succeed");
+
+    assert!(rendered.contains("[A] anvil >"));
+    assert!(rendered.contains("Ready."));
+    assert!(rendered.contains("provider=ollama"));
+    assert!(rendered.contains("Enter to send"));
+    assert!(rendered.contains("[U] you >"));
+    assert!(rendered.contains("model:local-default"));
+}
+
+#[test]
+fn mock_thinking_snapshot_contains_plan_and_reasoning() {
+    let mut app = common::build_app();
+
+    let snapshot = app
+        .mock_thinking_snapshot()
+        .expect("thinking snapshot should build");
+
+    assert_eq!(snapshot.state, anvil::contracts::RuntimeState::Thinking);
+    assert!(snapshot.plan.is_some());
+    assert!(!snapshot.reasoning_summary.is_empty());
+    assert!(snapshot.elapsed_ms.is_some());
+    assert!(snapshot.context_usage.is_some());
+    let rendered = app
+        .render_console(&anvil::tui::Tui::new())
+        .expect("console render should succeed");
+    assert!(rendered.contains("working on 2/3"));
+    assert!(rendered.contains("[U] you > /status /help /plan"));
+}
+
+#[test]
+fn mock_approval_snapshot_represents_one_tool_call() {
+    let mut app = common::build_app();
+    let _ = app
+        .mock_thinking_snapshot()
+        .expect("thinking snapshot should build");
+
+    let snapshot = app
+        .mock_approval_snapshot()
+        .expect("approval snapshot should build");
+    let approval = snapshot.approval.expect("approval should exist");
+
+    assert_eq!(
+        snapshot.state,
+        anvil::contracts::RuntimeState::AwaitingApproval
+    );
+    assert_eq!(approval.tool_name, "Write");
+    assert_eq!(approval.tool_call_id, "call_001");
+}
+
+#[test]
+fn mock_interrupted_snapshot_exposes_next_actions() {
+    let mut app = common::build_app();
+    let _ = app
+        .mock_thinking_snapshot()
+        .expect("thinking snapshot should build");
+
+    let snapshot = app
+        .mock_interrupted_snapshot()
+        .expect("interrupted snapshot should build");
+    let interrupt = snapshot.interrupt.expect("interrupt details should exist");
+
+    assert_eq!(snapshot.state, anvil::contracts::RuntimeState::Interrupted);
+    assert_eq!(interrupt.interrupted_what, "provider turn");
+    assert!(!interrupt.next_actions.is_empty());
+    assert_eq!(
+        app.session().session_event,
+        Some(anvil::contracts::AppEvent::SessionNormalizedAfterInterrupt)
+    );
+    assert!(
+        app.session()
+            .event_log
+            .contains(&anvil::contracts::AppEvent::SessionNormalizedAfterInterrupt)
+    );
+}
+
+#[test]
+fn tui_renders_approval_and_interrupt_sections() {
+    let config = EffectiveConfig::load().expect("config should load");
+    let provider = ProviderRuntimeContext::bootstrap(&config).expect("provider should bootstrap");
+    let mut app = anvil::app::App::new(config.clone(), provider).expect("app should initialize");
+    let tui = Tui::new();
+
+    let _ = app
+        .mock_thinking_snapshot()
+        .expect("thinking snapshot should build");
+    let _ = app
+        .mock_approval_snapshot()
+        .expect("approval snapshot should build");
+    let approval_rendered = app.render_console(&tui).expect("render should succeed");
+
+    let provider = ProviderRuntimeContext::bootstrap(&config).expect("provider should bootstrap");
+    let mut interrupted_app =
+        anvil::app::App::new(config, provider).expect("app should initialize");
+    let _ = interrupted_app
+        .mock_thinking_snapshot()
+        .expect("thinking snapshot should build");
+    let _ = interrupted_app
+        .mock_interrupted_snapshot()
+        .expect("interrupted snapshot should build");
+    let interrupted_rendered = interrupted_app
+        .render_console(&tui)
+        .expect("render should succeed");
+
+    assert!(approval_rendered.contains("[A] anvil > approval"));
+    assert!(approval_rendered.contains("tool : Write"));
+    assert!(interrupted_rendered.contains("[A] anvil > interrupted"));
+    assert!(interrupted_rendered.contains("next :"));
+    assert!(interrupted_rendered.contains("/resume"));
+}
+
+#[test]
+fn startup_screen_shows_logo_model_and_project() {
+    let config = EffectiveConfig::load().expect("config should load");
+    let provider = ProviderRuntimeContext::bootstrap(&config).expect("provider should bootstrap");
+    let mut app = anvil::app::App::new(config.clone(), provider).expect("app should initialize");
+    let tui = Tui::new();
+
+    let rendered = tui.render_startup(
+        &config,
+        &app.initial_snapshot()
+            .expect("initial snapshot should build"),
+    );
+
+    assert!(rendered.contains("local coding agent for serious terminal work"));
+    assert!(rendered.contains("Model   :"));
+    assert!(rendered.contains("Project :"));
+    assert!(rendered.contains("[U] you >"));
+}
+
+#[test]
+fn tui_renders_working_and_done_views_with_tool_logs() {
+    let mut app = common::build_app();
+    let tui = Tui::new();
+
+    app.record_user_input("msg_001", "inspect state handling")
+        .expect("user input should persist");
+    let _ = app
+        .mock_thinking_snapshot()
+        .expect("thinking snapshot should build");
+
+    let _ = app
+        .mock_working_snapshot()
+        .expect("working snapshot should build");
+    let working = app
+        .render_console(&tui)
+        .expect("working render should succeed");
+    let _ = app
+        .mock_done_snapshot()
+        .expect("done snapshot should build");
+    let done = app
+        .render_console(&tui)
+        .expect("done render should succeed");
+
+    assert!(working.contains("[U] you > inspect state handling"));
+    assert!(working.contains("[T] tool  > Read"));
+    assert!(working.contains("tools active"));
+    assert!(done.contains("[A] anvil > 調査結果を整理しました。"));
+    assert!(done.contains("[A] anvil > result"));
+    assert!(done.contains("session saved"));
+    assert!(done.contains("/continue"));
+    assert!(
+        done.find("[T] tool  > Read")
+            .expect("tool log should exist")
+            < done
+                .find("[A] anvil > result")
+                .expect("result should exist")
+    );
+    assert!(
+        done.find("[A] anvil > 調査結果を整理しました。")
+            .expect("assistant body should exist")
+            < done
+                .find("[T] tool  > Read")
+                .expect("tool log should exist")
+    );
+}
+
+#[test]
+fn app_can_render_console_from_runtime_state_without_manual_message_plumbing() {
+    let mut app = common::build_app();
+    let tui = Tui::new();
+
+    app.record_user_input("msg_001", "trace runtime-driven rendering")
+        .expect("user input should persist");
+    let _ = app
+        .mock_thinking_snapshot()
+        .expect("thinking snapshot should build");
+
+    let rendered = app
+        .render_console(&tui)
+        .expect("console render should succeed");
+
+    assert!(rendered.contains("[U] you > trace runtime-driven rendering"));
+    assert!(rendered.contains("[A] anvil > Thinking."));
+    assert!(rendered.contains("typeahead enabled"));
+}
+
+#[test]
+fn tui_limits_rendered_history_to_recent_messages() {
+    let mut app = common::build_app();
+    let tui = Tui::new();
+
+    for index in 0..8 {
+        app.record_user_input(format!("msg_{index:03}"), format!("message {index}"))
+            .expect("user input should persist");
+    }
+    let _ = app
+        .mock_thinking_snapshot()
+        .expect("thinking snapshot should build");
+
+    let rendered = app
+        .render_console(&tui)
+        .expect("console render should succeed");
+
+    assert!(!rendered.contains("[U] you > message 0"));
+    assert!(rendered.contains("[U] you > message 7"));
+    assert!(rendered.contains("history: recent 5 messages"));
+}
+
+#[test]
+fn tui_rendering_uses_runtime_render_path_not_snapshot_model_fields() {
+    let mut app = common::build_app();
+    let tui = Tui::new();
+    let _ = app
+        .initial_snapshot()
+        .expect("initial snapshot should build");
+
+    let rendered = app.render_console(&tui).expect("render should succeed");
+
+    assert!(rendered.contains("model:local-default"));
+}
+
+#[test]
+fn busy_prompt_hints_include_slash_commands() {
+    let mut app = common::build_app();
+    let tui = Tui::new();
+    let _ = app
+        .mock_thinking_snapshot()
+        .expect("thinking snapshot should build");
+
+    let rendered = app.render_console(&tui).expect("render should succeed");
+
+    assert!(rendered.contains("/help"));
+    assert!(rendered.contains("/status"));
+    assert!(rendered.contains("[U] you > /status /help /plan"));
+}

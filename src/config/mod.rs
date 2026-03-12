@@ -1,6 +1,11 @@
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
-use std::{error::Error, fmt::{Display, Formatter}};
+use std::{
+    error::Error,
+    fmt::{Display, Formatter},
+};
 
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -29,6 +34,9 @@ pub struct PathConfig {
     pub cwd: PathBuf,
     pub workspace_dir: PathBuf,
     pub config_file: PathBuf,
+    pub state_dir: PathBuf,
+    pub session_dir: PathBuf,
+    pub session_file: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -76,6 +84,9 @@ impl EffectiveConfig {
     }
 
     fn default_for_paths(cwd: PathBuf, workspace_dir: PathBuf, config_file: PathBuf) -> Self {
+        let state_dir = cwd.join(".anvil").join("state");
+        let session_dir = cwd.join(".anvil").join("sessions");
+        let session_file = session_dir.join(format!("{}.json", session_key_for_cwd(&cwd)));
         Self {
             runtime: RuntimeConfig {
                 provider: "ollama".to_string(),
@@ -93,6 +104,9 @@ impl EffectiveConfig {
                 cwd,
                 workspace_dir,
                 config_file,
+                state_dir,
+                session_dir,
+                session_file,
             },
         }
     }
@@ -119,7 +133,10 @@ impl EffectiveConfig {
             let Some((key, value)) = line.split_once('=') else {
                 return Err(ConfigError::InvalidConfigLine(line.to_string()));
             };
-            map.insert(key.trim().to_string(), value.trim().trim_matches('"').to_string());
+            map.insert(
+                key.trim().to_string(),
+                value.trim().trim_matches('"').to_string(),
+            );
         }
 
         self.apply_map(&map)
@@ -248,8 +265,17 @@ impl EffectiveConfig {
     }
 }
 
+fn session_key_for_cwd(cwd: &std::path::Path) -> String {
+    let mut hasher = DefaultHasher::new();
+    cwd.hash(&mut hasher);
+    format!("session_{:x}", hasher.finish())
+}
+
 fn parse_bool(value: &str) -> bool {
-    matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 fn parse_reasoning_visibility(value: &str) -> Result<ReasoningVisibility, ConfigError> {

@@ -36,23 +36,23 @@
 
 ## Phase 3: Build State and Session Primitives
 
-- [ ] Implement state primitives and state snapshots
-- [ ] Implement state transition rules
-- [ ] Implement message model
-- [ ] Implement session persistence
-- [ ] Implement interruption-safe session normalization
+- [x] Implement state primitives and state snapshots
+- [x] Implement state transition rules
+- [x] Implement message model
+- [x] Implement session persistence
+- [x] Implement interruption-safe session normalization
 
 ## Phase 4: Expand the TUI Into the Intended Operator Console
 
 - [x] Implement TUI skeleton
-- [ ] Implement startup screen
-- [ ] Implement visual separation for `[U]`, `[A]`, `[T]`
-- [ ] Implement status/footer area
+- [x] Implement startup screen
+- [x] Implement visual separation for `[U]`, `[A]`, `[T]`
+- [x] Implement status/footer area
 - [x] Implement mock `Ready`, `Thinking`, `AwaitingApproval`, and `Interrupted` views
 - [x] Implement mock plan display during thinking
 - [x] Implement mock reasoning-log display during thinking
-- [ ] Implement full `Working` and `Done` views
-- [ ] Replace mock rendering with runtime-driven rendering
+- [x] Implement full `Working` and `Done` views
+- [x] Replace mock rendering with runtime-driven rendering
 
 ## Phase 5: Replace Mock Flow With Runtime-Driven Flow
 

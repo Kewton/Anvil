@@ -49,7 +49,11 @@ impl ProviderRuntimeContext {
         // Later phases can replace or refine this with live capability discovery.
         let backend = match config.runtime.provider.as_str() {
             "ollama" => ProviderBackend::Ollama,
-            other => return Err(ProviderBootstrapError::UnsupportedBackend(other.to_string())),
+            other => {
+                return Err(ProviderBootstrapError::UnsupportedBackend(
+                    other.to_string(),
+                ));
+            }
         };
 
         let capabilities = match backend {
