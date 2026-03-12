@@ -838,11 +838,11 @@ enum ProgressClass {
     Completed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum EvidenceResult {
     None,
     Reinforcing,
-    Advanced(CreateRequirement),
+    Advanced(Vec<CreateRequirement>),
 }
 
 #[derive(Debug, Clone)]
@@ -981,8 +981,10 @@ impl RequirementState {
                 self.stall_count = 0;
                 self.effective_budget = (self.effective_budget + 1).min(self.hard_cap);
             }
-            EvidenceResult::Advanced(requirement) => {
-                self.remaining.remove(&requirement);
+            EvidenceResult::Advanced(requirements) => {
+                for requirement in requirements {
+                    self.remaining.remove(&requirement);
+                }
                 self.last_progress = if self.remaining.is_empty() {
                     ProgressClass::Completed
                 } else {
@@ -1223,7 +1225,7 @@ fn evaluate_evidence(
     match call {
         ToolCall::Mkdir(args) => {
             if output_root.is_some_and(|root| path_matches_expected(root, &args.path)) {
-                return EvidenceResult::Advanced(CreateRequirement::OutputRootExists);
+                return EvidenceResult::Advanced(vec![CreateRequirement::OutputRootExists]);
             }
             EvidenceResult::Reinforcing
         }
@@ -1231,13 +1233,16 @@ fn evaluate_evidence(
             if output_root.is_some_and(|root| path_matches_expected(root, &args.path))
                 && result.contains("kind=directory")
             {
-                return EvidenceResult::Advanced(CreateRequirement::OutputRootExists);
+                return EvidenceResult::Advanced(vec![CreateRequirement::OutputRootExists]);
             }
             if result.contains("kind=file")
                 && output_root.is_some_and(|root| path_under_root(root, &args.path))
                 && matches_main_deliverable(contract, &args.path)
             {
-                return EvidenceResult::Advanced(CreateRequirement::EntryPointVerified);
+                return EvidenceResult::Advanced(vec![
+                    CreateRequirement::EntryPointVerified,
+                    CreateRequirement::RequestedOutputVerified,
+                ]);
             }
             EvidenceResult::Reinforcing
         }
@@ -1245,19 +1250,22 @@ fn evaluate_evidence(
             if output_root.is_some_and(|root| path_matches_expected(root, &args.path))
                 && result.trim() == "true"
             {
-                return EvidenceResult::Advanced(CreateRequirement::OutputRootExists);
+                return EvidenceResult::Advanced(vec![CreateRequirement::OutputRootExists]);
             }
             if result.trim() == "true"
                 && output_root.is_some_and(|root| path_under_root(root, &args.path))
                 && matches_main_deliverable(contract, &args.path)
             {
-                return EvidenceResult::Advanced(CreateRequirement::EntryPointVerified);
+                return EvidenceResult::Advanced(vec![
+                    CreateRequirement::EntryPointVerified,
+                    CreateRequirement::RequestedOutputVerified,
+                ]);
             }
             EvidenceResult::None
         }
         ToolCall::ListDir(args) => {
             if output_root.is_some_and(|root| path_matches_expected(root, &args.path)) {
-                return EvidenceResult::Advanced(CreateRequirement::OutputRootExists);
+                return EvidenceResult::Advanced(vec![CreateRequirement::OutputRootExists]);
             }
             EvidenceResult::None
         }
@@ -1268,7 +1276,7 @@ fn evaluate_evidence(
                 _ => unreachable!(),
             };
             if output_root.is_some_and(|root| path_under_root(root, path)) {
-                return EvidenceResult::Advanced(CreateRequirement::DeliverableWritten);
+                return EvidenceResult::Advanced(vec![CreateRequirement::DeliverableWritten]);
             }
             EvidenceResult::Reinforcing
         }
@@ -1280,29 +1288,25 @@ fn evaluate_evidence(
                 if contract.must_review
                     && matches!(phase, CreatePhase::Review | CreatePhase::Finalize)
                 {
-                    return EvidenceResult::Advanced(CreateRequirement::ReviewCompleted);
+                    return EvidenceResult::Advanced(vec![CreateRequirement::ReviewCompleted]);
+                }
+                let mut requirements = vec![CreateRequirement::EntryPointVerified];
+                if verifies_requested_output(task, &args.path) {
+                    requirements.push(CreateRequirement::RequestedOutputVerified);
                 }
                 if verifies_runtime(contract, result) {
-                    return EvidenceResult::Advanced(CreateRequirement::RuntimeVerified);
-                }
-                if verifies_requested_output(task, &args.path) {
-                    return EvidenceResult::Advanced(CreateRequirement::RequestedOutputVerified);
+                    requirements.push(CreateRequirement::RuntimeVerified);
                 }
                 if verifies_core_loop(contract, result) {
-                    return EvidenceResult::Advanced(CreateRequirement::CoreLoopVerified);
+                    requirements.push(CreateRequirement::CoreLoopVerified);
                 }
-                if contract.must_review
-                    && matches!(phase, CreatePhase::Review | CreatePhase::Finalize)
-                {
-                    return EvidenceResult::Advanced(CreateRequirement::ReviewCompleted);
-                }
-                return EvidenceResult::Advanced(CreateRequirement::EntryPointVerified);
+                return EvidenceResult::Advanced(requirements);
             }
             EvidenceResult::None
         }
         ToolCall::Diff(_) => {
             if contract.must_review && phase == CreatePhase::Review {
-                EvidenceResult::Advanced(CreateRequirement::ReviewCompleted)
+                EvidenceResult::Advanced(vec![CreateRequirement::ReviewCompleted])
             } else {
                 EvidenceResult::Reinforcing
             }
