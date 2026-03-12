@@ -56,10 +56,10 @@
 
 ## Phase 5: Replace Mock Flow With Runtime-Driven Flow
 
-- [ ] Implement mock/runtime bridge loop
-- [ ] Implement one-tool-call approval flow through runtime state
-- [ ] Implement interruption flow from `Thinking -> Interrupted -> Ready` through runtime state
-- [ ] Demonstrate one full runtime-driven turn through the visible states
+- [x] Implement mock/runtime bridge loop
+- [x] Implement one-tool-call approval flow through runtime state
+- [x] Implement interruption flow from `Thinking -> Interrupted -> Ready` through runtime state
+- [x] Demonstrate one full runtime-driven turn through the visible states
 
 ## Phase 6: Add Real Runtime Integration
 

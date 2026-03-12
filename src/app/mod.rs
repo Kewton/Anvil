@@ -1,3 +1,4 @@
+use crate::agent::{AgentEvent, AgentRuntime};
 use crate::config::EffectiveConfig;
 use crate::contracts::{
     AppEvent, AppStateSnapshot, ConsoleRenderContext, RuntimeState, ToolLogView,
@@ -19,6 +20,7 @@ pub struct App {
     state_machine: StateMachine,
     session_store: SessionStore,
     session: SessionRecord,
+    pending_runtime_events: Vec<AgentEvent>,
 }
 
 #[derive(Debug)]
@@ -27,6 +29,7 @@ pub enum AppError {
     ProviderBootstrap(ProviderBootstrapError),
     Session(SessionError),
     StateTransition(crate::state::StateTransitionError),
+    NoPendingApproval,
 }
 
 impl Display for AppError {
@@ -36,6 +39,7 @@ impl Display for AppError {
             Self::ProviderBootstrap(err) => write!(f, "{err}"),
             Self::Session(err) => write!(f, "{err}"),
             Self::StateTransition(err) => write!(f, "{err}"),
+            Self::NoPendingApproval => write!(f, "no pending approval to continue"),
         }
     }
 }
@@ -80,6 +84,7 @@ impl App {
             state_machine: StateMachine::new(),
             session_store,
             session,
+            pending_runtime_events: Vec::new(),
         })
     }
 
@@ -151,6 +156,41 @@ impl App {
         ));
         self.persist_session(AppEvent::SessionSaved)?;
         Ok(())
+    }
+
+    pub fn run_runtime_turn(
+        &mut self,
+        user_input: impl Into<String>,
+        runtime: &AgentRuntime,
+        tui: &Tui,
+    ) -> Result<Vec<String>, AppError> {
+        let user_input = user_input.into();
+        self.pending_runtime_events.clear();
+        self.record_user_input(self.next_message_id("user"), user_input)?;
+        self.execute_runtime_events(runtime.events(), tui)
+    }
+
+    pub fn approve_and_continue(
+        &mut self,
+        _runtime: &AgentRuntime,
+        tui: &Tui,
+    ) -> Result<Vec<String>, AppError> {
+        if self.pending_runtime_events.is_empty() {
+            return Err(AppError::NoPendingApproval);
+        }
+
+        let remaining = std::mem::take(&mut self.pending_runtime_events);
+        self.execute_runtime_events(&remaining, tui)
+    }
+
+    pub fn reset_to_ready(&mut self) -> Result<AppStateSnapshot, AppError> {
+        let snapshot = AppStateSnapshot::new(RuntimeState::Ready)
+            .with_status("Ready for the next task".to_string())
+            .with_context_usage(
+                self.session.estimated_token_count(),
+                self.config.runtime.context_window,
+            );
+        self.apply_transition(snapshot, StateTransition::ResetToReady)
     }
 
     pub fn mock_thinking_snapshot(&mut self) -> Result<AppStateSnapshot, AppError> {
@@ -293,6 +333,157 @@ impl App {
         Ok(())
     }
 
+    fn execute_runtime_events(
+        &mut self,
+        events: &[AgentEvent],
+        tui: &Tui,
+    ) -> Result<Vec<String>, AppError> {
+        let mut frames = Vec::new();
+        self.pending_runtime_events.clear();
+
+        for (index, event) in events.iter().enumerate() {
+            let snapshot = self.apply_agent_event(event)?;
+            frames.push(self.render_console(tui)?);
+
+            if snapshot.state == RuntimeState::AwaitingApproval {
+                self.pending_runtime_events = events[index + 1..].to_vec();
+                break;
+            }
+        }
+
+        Ok(frames)
+    }
+
+    fn apply_agent_event(&mut self, event: &AgentEvent) -> Result<AppStateSnapshot, AppError> {
+        match event {
+            AgentEvent::Thinking {
+                status,
+                plan_items,
+                active_index,
+                reasoning_summary,
+                elapsed_ms,
+            } => {
+                let snapshot = AppStateSnapshot::new(RuntimeState::Thinking)
+                    .with_status(status.clone())
+                    .with_plan(plan_items.clone(), *active_index)
+                    .with_reasoning_summary(reasoning_summary.clone())
+                    .with_elapsed_ms(*elapsed_ms)
+                    .with_context_usage(
+                        self.session.estimated_token_count(),
+                        self.config.runtime.context_window,
+                    );
+
+                let transition = match self.state_machine.snapshot().state {
+                    RuntimeState::Working => StateTransition::ResumeThinking,
+                    _ => StateTransition::StartThinking,
+                };
+
+                self.apply_transition(snapshot, transition)
+            }
+            AgentEvent::ApprovalRequested {
+                status,
+                tool_name,
+                summary,
+                risk,
+                tool_call_id,
+                elapsed_ms,
+            } => {
+                let snapshot = AppStateSnapshot::new(RuntimeState::AwaitingApproval)
+                    .with_status(status.clone())
+                    .with_approval(
+                        tool_name.clone(),
+                        summary.clone(),
+                        risk.clone(),
+                        tool_call_id.clone(),
+                    )
+                    .with_elapsed_ms(*elapsed_ms)
+                    .with_context_usage(
+                        self.session.estimated_token_count(),
+                        self.config.runtime.context_window,
+                    );
+                self.apply_transition(snapshot, StateTransition::RequestApproval)
+            }
+            AgentEvent::Working {
+                status,
+                plan_items,
+                active_index,
+                tool_logs,
+                elapsed_ms,
+            } => {
+                let snapshot = AppStateSnapshot::new(RuntimeState::Working)
+                    .with_status(status.clone())
+                    .with_plan(plan_items.clone(), *active_index)
+                    .with_tool_logs(build_tool_logs(tool_logs))
+                    .with_elapsed_ms(*elapsed_ms)
+                    .with_context_usage(
+                        self.session.estimated_token_count(),
+                        self.config.runtime.context_window,
+                    );
+                self.apply_transition(snapshot, StateTransition::StartWorking)
+            }
+            AgentEvent::Done {
+                status,
+                assistant_message,
+                completion_summary,
+                saved_status,
+                tool_logs,
+                elapsed_ms,
+            } => {
+                self.record_assistant_output(self.next_message_id("assistant"), assistant_message)?;
+                let snapshot = AppStateSnapshot::new(RuntimeState::Done)
+                    .with_status(status.clone())
+                    .with_tool_logs(build_tool_logs(tool_logs))
+                    .with_completion_summary(completion_summary.clone(), saved_status.clone())
+                    .with_elapsed_ms(*elapsed_ms)
+                    .with_context_usage(
+                        self.session.estimated_token_count(),
+                        self.config.runtime.context_window,
+                    );
+                self.apply_transition(snapshot, StateTransition::Finish)
+            }
+            AgentEvent::Interrupted {
+                status,
+                interrupted_what,
+                saved_status,
+                next_actions,
+                elapsed_ms,
+            } => {
+                self.session.normalize_interrupted_turn(interrupted_what);
+                let snapshot = AppStateSnapshot::new(RuntimeState::Interrupted)
+                    .with_status(status.clone())
+                    .with_interrupt(
+                        interrupted_what.clone(),
+                        saved_status.clone(),
+                        next_actions.clone(),
+                    )
+                    .with_elapsed_ms(*elapsed_ms)
+                    .with_context_usage(
+                        self.session.estimated_token_count(),
+                        self.config.runtime.context_window,
+                    );
+                self.apply_transition(snapshot, StateTransition::Interrupt)?;
+                self.persist_session(AppEvent::SessionNormalizedAfterInterrupt)?;
+                Ok(self.state_machine.snapshot().clone())
+            }
+            AgentEvent::Failed {
+                status,
+                error_summary,
+                recommended_actions,
+                elapsed_ms,
+            } => {
+                let snapshot = AppStateSnapshot::new(RuntimeState::Error)
+                    .with_status(status.clone())
+                    .with_error_summary(error_summary.clone(), recommended_actions.clone())
+                    .with_elapsed_ms(*elapsed_ms)
+                    .with_context_usage(
+                        self.session.estimated_token_count(),
+                        self.config.runtime.context_window,
+                    );
+                self.apply_transition(snapshot, StateTransition::Fail)
+            }
+        }
+    }
+
     fn build_console_render_context(&self) -> ConsoleRenderContext {
         self.session.console_render_context(
             self.state_machine.snapshot(),
@@ -300,6 +491,20 @@ impl App {
             MAX_CONSOLE_MESSAGES,
         )
     }
+
+    fn next_message_id(&self, prefix: &str) -> String {
+        format!("{prefix}_{:04}", self.session.message_count() + 1)
+    }
+}
+
+fn build_tool_logs(logs: &[(String, String, String)]) -> Vec<ToolLogView> {
+    logs.iter()
+        .map(|(tool_name, action, target)| ToolLogView {
+            tool_name: tool_name.clone(),
+            action: action.clone(),
+            target: target.clone(),
+        })
+        .collect()
 }
 
 pub fn run() -> Result<(), AppError> {
