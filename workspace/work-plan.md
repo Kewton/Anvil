@@ -21,18 +21,18 @@
 
 ## Phase 1: Create the Rust Skeleton
 
-- [ ] Create initial Cargo project structure
-- [ ] Create module skeleton under `src/`
-- [ ] Create shared `contracts` layer
-- [ ] Add module tests and integration-test skeleton
+- [x] Create initial Cargo project structure
+- [x] Create module skeleton under `src/`
+- [x] Create shared `contracts` layer
+- [x] Add module tests and integration-test skeleton
 
 ## Phase 2: Build the Core App Foundation
 
-- [ ] Implement config loading and app bootstrap
-- [ ] Implement `EffectiveConfig`
-- [ ] Implement provider capability model
-- [ ] Implement top-level app error model
-- [ ] Implement structured event definitions
+- [x] Implement config loading and app bootstrap
+- [x] Implement `EffectiveConfig`
+- [x] Implement provider capability model
+- [x] Implement top-level app error model
+- [x] Implement structured event definitions
 
 ## Phase 3: Build State and Session Primitives
 
@@ -42,22 +42,24 @@
 - [ ] Implement session persistence
 - [ ] Implement interruption-safe session normalization
 
-## Phase 4: Build the First TUI Vertical Slice
+## Phase 4: Expand the TUI Into the Intended Operator Console
 
-- [ ] Implement TUI skeleton
+- [x] Implement TUI skeleton
 - [ ] Implement startup screen
 - [ ] Implement visual separation for `[U]`, `[A]`, `[T]`
 - [ ] Implement status/footer area
-- [ ] Implement `Ready`, `Thinking`, `AwaitingApproval`, `Working`, `Interrupted`, and `Done` views
-- [ ] Implement plan display during thinking
-- [ ] Implement reasoning-log display during thinking
+- [x] Implement mock `Ready`, `Thinking`, `AwaitingApproval`, and `Interrupted` views
+- [x] Implement mock plan display during thinking
+- [x] Implement mock reasoning-log display during thinking
+- [ ] Implement full `Working` and `Done` views
+- [ ] Replace mock rendering with runtime-driven rendering
 
-## Phase 5: Build the Mock Runtime Slice
+## Phase 5: Replace Mock Flow With Runtime-Driven Flow
 
-- [ ] Implement mock runtime loop
-- [ ] Implement one-tool-call approval flow
-- [ ] Implement interruption flow from `Thinking -> Interrupted -> Ready`
-- [ ] Demonstrate one full mock turn through the visible states
+- [ ] Implement mock/runtime bridge loop
+- [ ] Implement one-tool-call approval flow through runtime state
+- [ ] Implement interruption flow from `Thinking -> Interrupted -> Ready` through runtime state
+- [ ] Demonstrate one full runtime-driven turn through the visible states
 
 ## Phase 6: Add Real Runtime Integration
 
