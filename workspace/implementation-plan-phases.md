@@ -599,6 +599,9 @@ TDD の観点:
 - [ ] sidecar compaction が有効でも transcript integrity が壊れない test
 - [ ] assistant tool_calls と tool results の pairing integrity test
 - [ ] provider runtime policy の timeout / retry / backoff / empty-response handling test
+- [ ] sidecar compaction input/output contract の schema test
+- [ ] permission event が raw transcript と carryover summary へ正しく残る test
+- [ ] streaming parse failure から sync fallback へ 1 回だけ移行する test
 
 実装:
 
@@ -625,6 +628,7 @@ TDD の観点:
   - sidecar selection
   - fallback to main
   - compaction audit events
+  - sidecar compaction input/output contract
 - [ ] `ANVIL.md / memory / carryover / contract / transcript` を message-structured layout へ分割する
   - base policy
   - project instructions
@@ -642,6 +646,10 @@ TDD の観点:
 - [ ] transcript integrity rules を追加する
   - assistant tool_calls と tool results の pairing
   - orphaned tool result を作らない
+  - pair replacement rule を持つ
+- [ ] permission event retention policy を追加する
+  - raw transcript
+  - carryover summary
 - [ ] tool result 後の短い assistant summary hook を追加する
 - [ ] `assistant transition note` を loop context に残す
   - user-visible note と model-visible note の分離可能性を残す
@@ -654,6 +662,10 @@ TDD の観点:
   - same read-only repeated without new evidence
   - repeated finalize probe
   - same-tool repeated after `no_progress`
+- [ ] streaming fallback retry rule を追加する
+  - stream path 1 回
+  - sync fallback 1 回
+  - それ以上は上位 error
 - [ ] clarification escape hatch を将来追加できる接続点を残す
   - conflicting evidence
   - requirement conflict
@@ -671,6 +683,7 @@ TDD の観点:
 - [ ] transcript retention / transition note / evidence delta の責務分離が明確になる
 - [ ] sidecar compaction の有無で loop correctness が変わらない
 - [ ] transcript compaction 後も tool/result pairing が壊れない
+- [ ] permission decision と provider fallback が carryover 後も追跡できる
 
 ## Phase 4: 拡張フェーズ
 

@@ -53,3 +53,4 @@
 3. `provider runtime policy`, `working transcript -> carryover summary` 昇格規則, `RequirementState` の粒度, `repeat recovery` fail-safe を Phase 3.8 設計へ追加する
 4. `RequirementState` を `EntryPointVerified / CoreBehaviorVerified` 粒度へ見直し、`transcript retention policy`, `fallback reason codes`, `assistant transition note`, `evidence delta` を Phase 3.8 設計へ追加する
 5. `sidecar compaction policy`, `tool/result pairing integrity`, `provider retry/backoff policy`, `clarification escape hatch` を Phase 3.8 設計へ追加する
+6. `RequirementState -> CreatePhase` の整合修正、`sidecar compaction input/output contract`, `permission event retention`, `pair replacement rule`, `streaming fallback retry rule` を Phase 3.8 設計へ追加する
