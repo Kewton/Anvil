@@ -421,11 +421,11 @@ TDD の観点:
 
 目的:
 
-- [ ] token 使用量が閾値へ近づいたときに、安全に文脈圧縮へ移行する
-- [ ] rolling summary を UI 表示用ではなく次ターン prompt に実際に効かせる
-- [ ] interactive session の長時間利用でも、重要な文脈が崩れずに引き継がれるようにする
-- [ ] local model 向けに `20万` token 前提でも速度と安定性を両立する
-- [ ] create task を固定フロー化せず、`Task Contract + Evidence + Phase Gate` で柔軟性と精度を両立する
+- [x] token 使用量が閾値へ近づいたときに、安全に文脈圧縮へ移行する
+- [x] rolling summary を UI 表示用ではなく次ターン prompt に実際に効かせる
+- [x] interactive session の長時間利用でも、重要な文脈が崩れずに引き継がれるようにする
+- [x] local model 向けに `20万` token 前提でも速度と安定性を両立する
+- [x] create task を固定フロー化せず、`Task Contract + Evidence + Phase Gate` で柔軟性と精度を両立する
 
 先に書くテスト:
 
@@ -463,22 +463,29 @@ TDD の観点:
 
 完了条件:
 
-- [ ] summary 発火後の follow-up 質問でも、直前までの task 文脈を保持できる
-- [ ] 長い対話でも branch explanation と create task の両方が破綻しにくい
-- [ ] transcript が無制限に膨らまず、summary / carryover の状態が追跡できる
-- [ ] local model 前提の長時間対話で、速度低下と文脈欠落が実用範囲に収まる
-- [ ] create task が固定シナリオに寄らず複数の実装経路を取れて、なお path / review / deliverable 要件を落としにくい
+- [x] summary 発火後の follow-up 質問でも、直前までの task 文脈を保持できる
+- [x] 長い対話でも branch explanation と create task の両方が破綻しにくい
+- [x] transcript が無制限に膨らまず、summary / carryover の状態が追跡できる
+- [x] local model 前提の長時間対話で、速度低下と文脈欠落が実用範囲に収まる
+- [x] create task が固定シナリオに寄らず複数の実装経路を取れて、なお path / review / deliverable 要件を落としにくい
+
+実績:
+
+- [x] rolling summary を session state として保存し、次ターン prompt に注入
+- [x] transcript compaction と loop carryover の責務を分離
+- [x] `Task Contract + Evidence + Phase Gate` の基本設計を導入
+- [x] `qwen3.5:35b` 前提の長時間対話でも session carryover が機能する状態まで到達
 
 ## Phase 3.6: Requirement Set と Progress-Based Loop Control
 
 目的:
 
-- [ ] Phase 3.6 の対象を create task に限定し、requirement 数を 5 個前後に抑える
-- [ ] create task を phase 名中心ではなく `Requirement Set` 中心で制御する
-- [ ] 各 tool result を `tool / path / output_root match / result shape / main deliverable` を含む `Evidence` として評価する
-- [ ] stalled verification / stalled inspection を固定禁止ルールではなく progress 判定で止める
-- [ ] task type と progress に応じた adaptive upper bound を本格化する
-- [ ] `finalize` を actual final text 生成ではなく「final を返してよい内部状態」として扱う
+- [x] Phase 3.6 の対象を create task に限定し、requirement 数を 5 個前後に抑える
+- [x] create task を phase 名中心ではなく `Requirement Set` 中心で制御する
+- [x] 各 tool result を `tool / path / output_root match / result shape / main deliverable` を含む `Evidence` として評価する
+- [x] stalled verification / stalled inspection を固定禁止ルールではなく progress 判定で止める
+- [x] task type と progress に応じた adaptive upper bound を本格化する
+- [x] `finalize` を actual final text 生成ではなく「final を返してよい内部状態」として扱う
 
 先に書くテスト:
 
@@ -516,22 +523,29 @@ TDD の観点:
 
 完了条件:
 
-- [ ] `list_dir` / `glob` の反復を個別禁止ルールなしで stalled 判定できる
-- [ ] create task が複数の tool sequence を取りつつ、同じ requirement set に収束できる
-- [ ] progress がある task は完走しやすく、progress のない task は無駄に長引かない
-- [ ] verify / review / finalize の遷移が requirement/evidence ベースで説明可能になる
-- [ ] UI と audit から「なぜ stalled / finalize / continue と判断したか」を追跡できる
+- [x] `list_dir` / `glob` の反復を個別禁止ルールなしで stalled 判定できる
+- [x] create task が複数の tool sequence を取りつつ、同じ requirement set に収束できる
+- [x] progress がある task は完走しやすく、progress のない task は無駄に長引かない
+- [x] verify / review / finalize の遷移が requirement/evidence ベースで説明可能になる
+- [x] UI と audit から「なぜ stalled / finalize / continue と判断したか」を追跡できる
+
+実績:
+
+- [x] create task 用 `RequirementSet / Evidence / ProgressClass` を導入
+- [x] adaptive budget と stalled 判定を requirement/evidence 駆動へ移行
+- [x] `remaining requirements / progress / stall count / budget` の UI 可視化
+- [x] finalize を requirement readiness と actual final text 生成へ分離
 
 ## Phase 3.7: Create Task の Quality Targets と Creative Mode
 
 目的:
 
-- [ ] create task の安定性を維持しつつ、`vibe-local` 相当以上の「凝った出力」に寄せる
-- [ ] requirement/evidence と creative guidance を分離し、必須要件と品質向上目標を混同しない
-- [ ] `quality targets / stretch goals / creative mode` を create task 専用の軽量 policy として導入する
-- [ ] creative mode を固定シナリオ化せず、model-driven な tool choice と実装自由度を維持する
-- [ ] browser-runnable game / app 生成で、開始画面、HUD、再開導線、演出などの完成度を底上げする
-- [ ] `quality targets / stretch goals` を non-blocking guidance に固定する
+- [x] create task の安定性を維持しつつ、`vibe-local` 相当以上の「凝った出力」に寄せる
+- [x] requirement/evidence と creative guidance を分離し、必須要件と品質向上目標を混同しない
+- [x] `quality targets / stretch goals / creative mode` を create task 専用の軽量 policy として導入する
+- [x] creative mode を固定シナリオ化せず、model-driven な tool choice と実装自由度を維持する
+- [x] browser-runnable game / app 生成で、開始画面、HUD、再開導線、演出などの完成度を底上げする
+- [x] `quality targets / stretch goals` を non-blocking guidance に固定する
 
 先に書くテスト:
 
@@ -564,10 +578,17 @@ TDD の観点:
 
 完了条件:
 
-- [ ] create task の必須要件を壊さずに、より厚い deliverable を出しやすくなる
-- [ ] quality targets が fixed workflow ではなく model guidance として機能する
-- [ ] stretch goals は満たせなくても task failure にならない
-- [ ] UI から「何を最低限満たし、何を品質向上目標として狙っているか」が分かる
+- [x] create task の必須要件を壊さずに、より厚い deliverable を出しやすくなる
+- [x] quality targets が fixed workflow ではなく model guidance として機能する
+- [x] stretch goals は満たせなくても task failure にならない
+- [x] UI から「何を最低限満たし、何を品質向上目標として狙っているか」が分かる
+
+実績:
+
+- [x] `creative_mode / quality_targets / stretch_goals` を `TaskContract` に導入
+- [x] requirement/evidence と creative guidance を non-blocking に分離
+- [x] game / html 系 create task で richer guidance を prompt と brief に反映
+- [x] fixed workflow に寄せず、model-driven な出力厚みの底上げ方針を確立
 
 ## Phase 3.8: Loop State と Provider I/O の安定化
 
@@ -612,6 +633,11 @@ TDD の観点:
 - [ ] permission lifetime policy が session/resume/dangerous allow を正しく扱う test
 - [ ] safe fallback scope が read-only 系に限定される test
 - [ ] compaction quality guard が required fields 欠落時に summary を棄却する test
+- [ ] profile selection rule が `TaskContract` から deterministic に選べる test
+- [ ] profile confidence model が `selected / confidence / fallback` を持つ test
+- [ ] artifact link graph が `plan -> evidence -> finding -> final` を辿れる test
+- [ ] approval compression policy が低リスク確認だけを畳む test
+- [ ] fallback provenance / quality penalty が finalize 判定へ反映される test
 
 実装:
 
@@ -628,6 +654,9 @@ TDD の観点:
   - `game`
   - `cli_tool`
   - `refactor`
+- [ ] profile selection rule を追加する
+  - `TaskContract` -> profile
+  - profile confidence / fallback profile
 - [ ] provider capability model を追加する
   - `Unknown / Supported / Unsupported`
   - `provider + model + endpoint fingerprint` 単位の probe once + cached fallback
@@ -644,6 +673,9 @@ TDD の観点:
   - native
   - normalized fallback extractor
   - clarification or deny
+- [ ] fallback provenance / quality penalty を追加する
+  - native / normalized / denied
+  - finalize 前の追加確認
 - [ ] sidecar compaction policy を追加する
   - sidecar selection
   - fallback to main
@@ -654,6 +686,10 @@ TDD の観点:
   - preferred family
   - RAM/VRAM tier
   - compaction quality guard
+- [ ] artifact link graph を追加する
+  - plan -> execution evidence
+  - evidence -> review finding
+  - finding -> final response
 - [ ] `ANVIL.md / memory / carryover / contract / transcript` を message-structured layout へ分割する
   - base policy
   - project instructions
@@ -680,6 +716,9 @@ TDD の観点:
   - session only
   - explicit resume carryover
   - dangerous blanket allow は永続化しない
+- [ ] approval compression policy を追加する
+  - low-risk approve compression
+  - dangerous action exclusion
 - [ ] tool result 後の短い assistant summary hook を追加する
 - [ ] `assistant transition note` を loop context に残す
   - user-visible note と model-visible note の分離可能性を残す
@@ -735,6 +774,7 @@ TDD の観点:
 - [ ] permission decision と provider fallback が carryover 後も追跡できる
 - [ ] `vibe-local` よりも task stance と permission state が構造化され、再現性高く運用できる
 - [ ] 柔軟性を損なわずに task profile / stance / requirement を制約として使える
+- [ ] `vibe-local` よりも profile confidence / artifact linkage / fallback provenance が説明可能になる
 
 ## Phase 4: 拡張フェーズ
 
