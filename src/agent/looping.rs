@@ -419,7 +419,13 @@ impl LoopDriver {
                                     continue;
                                 };
                                 *reuse_count += 1;
-                                if *reuse_count > self.config.max_cached_reuses_per_call {
+                                let mut trial_state = requirement_state.clone();
+                                trial_state.record_evidence(task, &validated, cached_output);
+                                let advanced_requirements =
+                                    trial_state.remaining.len() < requirement_state.remaining.len();
+                                if *reuse_count > self.config.max_cached_reuses_per_call
+                                    && !advanced_requirements
+                                {
                                     let turn = ModelTurn::ToolError {
                                         tool: validated.tool_name().to_string(),
                                         error_kind: "duplicate_reuse_limit".to_string(),
@@ -438,7 +444,7 @@ impl LoopDriver {
                                     tool: validated.tool_name().to_string(),
                                     preview: truncate(&cached_output.replace('\n', "\\n"), 220),
                                 });
-                                requirement_state.record_evidence(task, &validated, cached_output);
+                                requirement_state = trial_state;
                                 turns.push(ModelTurn::ToolResult {
                                     tool: validated.tool_name().to_string(),
                                     output: cached_output.clone(),

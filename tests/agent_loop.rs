@@ -1029,3 +1029,40 @@ async fn single_read_can_satisfy_multiple_verify_requirements() {
                 && prompt.contains("review_completed"))
     );
 }
+
+#[tokio::test]
+async fn duplicate_reuse_limit_allows_reuse_when_new_requirement_is_cleared() {
+    let dir = tempdir().unwrap();
+    let model = ScriptedModel::new(vec![
+        r#"{"type":"tool_calls","calls":[{"tool":"mkdir","args":{"path":"./sandbox/demo"}}]}"#
+            .to_string(),
+        r#"{"type":"tool_calls","calls":[{"tool":"write_file","args":{"path":"./sandbox/demo/space_invaders.html","content":"<html><script>const score=1; const player=1; const enemy=1; function loop(){ requestAnimationFrame(loop); } document.addEventListener('keydown', ()=>{});</script></html>"}}]}"#
+            .to_string(),
+        r#"{"type":"tool_calls","calls":[{"tool":"read_file","args":{"path":"./sandbox/demo/space_invaders.html"}}]}"#
+            .to_string(),
+        r#"{"type":"tool_calls","calls":[{"tool":"read_file","args":{"path":"./sandbox/demo/space_invaders.html"}}]}"#
+            .to_string(),
+        r#"{"type":"tool_calls","calls":[{"tool":"read_file","args":{"path":"./sandbox/demo/space_invaders.html"}}]}"#
+            .to_string(),
+        r#"{"type":"final","content":"done"}"#.to_string(),
+    ]);
+    let driver = LoopDriver::new(LoopConfig::default());
+
+    let out = driver
+        .run(
+            &model,
+            dir.path(),
+            "ブラウザから直接実行可能ないけてるスペースインベーダーゲームを ./sandbox/demo に出力してください。コードレビューしてください。",
+            Vec::<ModelTurn>::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(out.final_text, "done");
+    let prompts = model.prompts();
+    assert!(
+        prompts
+            .iter()
+            .any(|prompt| prompt.contains("review_completed"))
+    );
+}
