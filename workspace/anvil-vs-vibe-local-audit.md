@@ -55,3 +55,4 @@
 5. `sidecar compaction policy`, `tool/result pairing integrity`, `provider retry/backoff policy`, `clarification escape hatch` を Phase 3.8 設計へ追加する
 6. `RequirementState -> CreatePhase` の整合修正、`sidecar compaction input/output contract`, `permission event retention`, `pair replacement rule`, `streaming fallback retry rule` を Phase 3.8 設計へ追加する
 7. `task-class execution stance`, `permission state snapshot`, `sidecar selection strategy`, `next action hint schema`, `fallback ladder` を Phase 3.8 設計へ追加する
+8. `task-type requirement profile`, `dynamic execution stance`, `permission lifetime policy`, `safe fallback scope`, `compaction quality guard`, `plan/execution artifact split` を Phase 3.8 設計へ追加する

@@ -607,6 +607,11 @@ TDD の観点:
 - [ ] permission state snapshot が loop context に乗る test
 - [ ] next action hint schema が transition note に残る test
 - [ ] fallback ladder の非 native path が将来拡張可能な shape になっている test
+- [ ] task-type requirement profile が fixed workflow でなく複数の valid path を許容する test
+- [ ] dynamic execution stance が `phase / evidence delta / budget` で更新される test
+- [ ] permission lifetime policy が session/resume/dangerous allow を正しく扱う test
+- [ ] safe fallback scope が read-only 系に限定される test
+- [ ] compaction quality guard が required fields 欠落時に summary を棄却する test
 
 実装:
 
@@ -618,6 +623,11 @@ TDD の観点:
   - `CreatePhase` は derived UI state に格下げする
   - `DeliverableVerified` は `EntryPointVerified / RuntimeVerified / RequestedOutputVerified / CoreLoopVerified` に分解する
   - `Verify -> Review/Finalize` の transition guard を持つ
+- [ ] task-type requirement profile を追加する
+  - `html_app`
+  - `game`
+  - `cli_tool`
+  - `refactor`
 - [ ] provider capability model を追加する
   - `Unknown / Supported / Unsupported`
   - `provider + model + endpoint fingerprint` 単位の probe once + cached fallback
@@ -643,6 +653,7 @@ TDD の観点:
   - installed models
   - preferred family
   - RAM/VRAM tier
+  - compaction quality guard
 - [ ] `ANVIL.md / memory / carryover / contract / transcript` を message-structured layout へ分割する
   - base policy
   - project instructions
@@ -665,6 +676,10 @@ TDD の観点:
   - raw transcript
   - carryover summary
 - [ ] permission state snapshot を loop context に載せる
+- [ ] permission lifetime policy を追加する
+  - session only
+  - explicit resume carryover
+  - dangerous blanket allow は永続化しない
 - [ ] tool result 後の短い assistant summary hook を追加する
 - [ ] `assistant transition note` を loop context に残す
   - user-visible note と model-visible note の分離可能性を残す
@@ -674,6 +689,11 @@ TDD の観点:
   - edit: minimal-change-first
   - create: deliverable-first
   - review: finding-first
+- [ ] dynamic execution stance を追加する
+  - task class
+  - current phase
+  - evidence delta
+  - remaining budget
 - [ ] evidence delta evaluator を追加する
   - new evidence
   - strengthened evidence
@@ -687,10 +707,18 @@ TDD の観点:
   - stream path 1 回
   - sync fallback 1 回
   - それ以上は上位 error
+- [ ] safe fallback scope を追加する
+  - read-only / inspect 限定
+  - write/edit/mkdir/exec には使わない
 - [ ] clarification escape hatch を将来追加できる接続点を残す
   - conflicting evidence
   - requirement conflict
   - verification ambiguity
+- [ ] plan artifact / execution artifact split を追加する
+  - plan summary
+  - task contract
+  - execution evidence
+  - review findings
 
 完了条件:
 
@@ -706,6 +734,7 @@ TDD の観点:
 - [ ] transcript compaction 後も tool/result pairing が壊れない
 - [ ] permission decision と provider fallback が carryover 後も追跡できる
 - [ ] `vibe-local` よりも task stance と permission state が構造化され、再現性高く運用できる
+- [ ] 柔軟性を損なわずに task profile / stance / requirement を制約として使える
 
 ## Phase 4: 拡張フェーズ
 
