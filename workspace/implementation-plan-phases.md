@@ -600,16 +600,27 @@ TDD の観点:
 - [ ] 巨大な単一 prompt 依存を減らし、message-structured な loop へ段階的に寄せる
 - [ ] 詳細設計は [phase3.8-loop-state-and-provider-design.md](/Users/maenokota/share/work/github_kewton/Anvil/workspace/phase3.8-loop-state-and-provider-design.md) に固定する
 
+実績:
+
+- [x] `RequirementState` を coarse 4要件から `OutputRootExists / DeliverableWritten / EntryPointVerified / RequestedOutputVerified / RuntimeVerified / CoreLoopVerified / ReviewCompleted` に分解
+- [x] `CreatePhase` を `RequirementState.remaining` から派生する UI state に変更
+- [x] `write_file / edit_file / mkdir / non-read-only exec` 成功後に read-only cache を全破棄する初期 invalidation を実装
+- [x] loop prompt を section 付きの message-structured 風レイアウトへ変更
+- [x] `TaskContract` に `profile / profile_confidence / fallback_profile` を追加
+- [x] `execution stance` を step plan に表示し、create task の guide を requirement 主導へ寄せた
+- [ ] provider-native tool streaming の runtime path 分離
+- [ ] sidecar compaction / transcript integrity / permission snapshot まわりの残項目
+
 先に書くテスト:
 
-- [ ] write/edit/mkdir 後に stale cache が使われない設計テスト
-- [ ] `current phase` と `remaining requirements` が矛盾しない設計テスト
+- [x] write/edit/mkdir 後に stale cache が使われない設計テスト
+- [x] `current phase` と `remaining requirements` が矛盾しない設計テスト
 - [ ] tool streaming が有効な provider で streaming path を通るテスト
 - [ ] prompt/message 構成変更後も既存 loop recovery が壊れない回帰テスト
 - [ ] provider capability が `Unknown -> Supported/Unsupported` に遷移する table-driven test
-- [ ] `RequirementState.remaining -> CreatePhase` mapping test
-- [ ] message-structured layout で `ANVIL.md / memory / carryover / contract / transcript` が期待 role に分かれる test
-- [ ] `EntryPointVerified / RuntimeVerified / RequestedOutputVerified / CoreLoopVerified / ReviewCompleted` の粒度を固定する test
+- [x] `RequirementState.remaining -> CreatePhase` mapping test
+- [x] message-structured layout で `ANVIL.md / memory / carryover / contract / transcript` が期待 role に分かれる test
+- [x] `EntryPointVerified / RuntimeVerified / RequestedOutputVerified / CoreLoopVerified / ReviewCompleted` の粒度を固定する test
 - [ ] provider runtime policy が tool mode で temperature / keep-alive / num_ctx を切り替える test
 - [ ] `working transcript -> carryover summary` 昇格規則の compaction test
 - [ ] repeat detector が state redesign 後も fail-safe のまま残る回帰 test
@@ -623,38 +634,38 @@ TDD の観点:
 - [ ] sidecar compaction input/output contract の schema test
 - [ ] permission event が raw transcript と carryover summary へ正しく残る test
 - [ ] streaming parse failure から sync fallback へ 1 回だけ移行する test
-- [ ] `Verify -> Review/Finalize` の transition guard test
-- [ ] task-class execution stance が contract message に乗る test
+- [x] `Verify -> Review/Finalize` の transition guard test
+- [x] task-class execution stance が contract message に乗る test
 - [ ] permission state snapshot が loop context に乗る test
 - [ ] next action hint schema が transition note に残る test
 - [ ] fallback ladder の非 native path が将来拡張可能な shape になっている test
-- [ ] task-type requirement profile が fixed workflow でなく複数の valid path を許容する test
+- [x] task-type requirement profile が fixed workflow でなく複数の valid path を許容する test
 - [ ] dynamic execution stance が `phase / evidence delta / budget` で更新される test
 - [ ] permission lifetime policy が session/resume/dangerous allow を正しく扱う test
 - [ ] safe fallback scope が read-only 系に限定される test
 - [ ] compaction quality guard が required fields 欠落時に summary を棄却する test
-- [ ] profile selection rule が `TaskContract` から deterministic に選べる test
-- [ ] profile confidence model が `selected / confidence / fallback` を持つ test
+- [x] profile selection rule が `TaskContract` から deterministic に選べる test
+- [x] profile confidence model が `selected / confidence / fallback` を持つ test
 - [ ] artifact link graph が `plan -> evidence -> finding -> final` を辿れる test
 - [ ] approval compression policy が低リスク確認だけを畳む test
 - [ ] fallback provenance / quality penalty が finalize 判定へ反映される test
 
 実装:
 
-- [ ] read-only cache invalidation matrix を設計どおり実装する
+- [x] read-only cache invalidation matrix を設計どおり実装する
   - Phase 3.8 初期は `write_file / edit_file / mkdir / non-read-only exec` 後に read-only cache を全破棄
   - audit に `cache_invalidated` を出す
   - path-scoped invalidation は gate 条件が揃うまで入れない
-- [ ] phase 遷移の truth source を `RequirementState.remaining` へ一元化する
+- [x] phase 遷移の truth source を `RequirementState.remaining` へ一元化する
   - `CreatePhase` は derived UI state に格下げする
   - `DeliverableVerified` は `EntryPointVerified / RuntimeVerified / RequestedOutputVerified / CoreLoopVerified` に分解する
   - `Verify -> Review/Finalize` の transition guard を持つ
-- [ ] task-type requirement profile を追加する
+- [x] task-type requirement profile を追加する
   - `html_app`
   - `game`
   - `cli_tool`
   - `refactor`
-- [ ] profile selection rule を追加する
+- [x] profile selection rule を追加する
   - `TaskContract` -> profile
   - profile confidence / fallback profile
 - [ ] provider capability model を追加する
@@ -690,7 +701,7 @@ TDD の観点:
   - plan -> execution evidence
   - evidence -> review finding
   - finding -> final response
-- [ ] `ANVIL.md / memory / carryover / contract / transcript` を message-structured layout へ分割する
+- [x] `ANVIL.md / memory / carryover / contract / transcript` を message-structured layout へ分割する
   - base policy
   - project instructions
   - memory
@@ -723,7 +734,7 @@ TDD の観点:
 - [ ] `assistant transition note` を loop context に残す
   - user-visible note と model-visible note の分離可能性を残す
   - next action hint schema を持つ
-- [ ] task-class execution stance を contract message に追加する
+- [x] task-class execution stance を contract message に追加する
   - inspect: evidence-first
   - edit: minimal-change-first
   - create: deliverable-first

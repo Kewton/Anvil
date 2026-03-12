@@ -200,14 +200,16 @@ impl LoopDriver {
         F: FnMut(LoopEvent),
     {
         let mut turns = prior_turns;
-        let mut seen = BTreeSet::new();
+        let mut seen_read_only = BTreeSet::new();
+        let mut seen_mutating = BTreeSet::new();
         let mut cached_results = BTreeMap::<String, (String, usize)>::new();
         let mut protocol_retry_state: Option<(String, usize)> = None;
         let mut tool_retry_state: Option<(String, usize)> = None;
         let mut tool_exec_retry_state: Option<(String, usize)> = None;
-        let task_requires_write = task_requires_write_action(task);
-        let expected_output_root = expected_output_root(task);
-        let mut requirement_state = RequirementState::new(task, self.config);
+        let contract = extract_task_contract(task);
+        let task_requires_write = contract.requires_write;
+        let expected_output_root = contract.output_root.clone();
+        let mut requirement_state = RequirementState::new(&contract, self.config);
 
         for step in 0..self.config.max_steps {
             if requirement_state.should_stop(step) {
@@ -215,13 +217,13 @@ impl LoopDriver {
             }
             let step_number = step + 1;
             let step_started_at = Instant::now();
-            let plan = step_plan(task, &turns);
-            let phase = create_phase_for_task(task, &turns);
+            let phase = requirement_state.current_phase();
+            let plan = step_plan(&contract, &requirement_state, task, &turns);
             requirement_state.note_phase(step_number, phase);
             observer(LoopEvent::StepStarted {
                 step: step_number,
-                purpose: step_purpose(task, &turns),
-                brief: step_instruction(task, &turns),
+                purpose: step_purpose(task, &turns, phase, &requirement_state),
+                brief: step_instruction(task, &contract, phase, &requirement_state),
                 phase: plan.phase.clone(),
                 plan: plan.items,
                 workflow: plan.workflow,
@@ -232,7 +234,7 @@ impl LoopDriver {
                 stall_count: requirement_state.stall_count,
                 remaining_budget: requirement_state.remaining_budget(step_number),
             });
-            let prompt = build_loop_prompt(task, &turns, &requirement_state);
+            let prompt = build_loop_prompt(task, &contract, &turns, &requirement_state);
             let model_started_at = Instant::now();
             let response = match model.complete_with_tools(&prompt, &tool_specs()).await? {
                 Some(native) => {
@@ -386,7 +388,7 @@ impl LoopDriver {
                             tool: validated.tool_name().to_string(),
                             normalized: truncate(&normalized, 240),
                         });
-                        let create_phase = create_phase_for_task(task, &turns);
+                        let create_phase = requirement_state.current_phase();
                         if should_block_pre_write_inspection(task, create_phase, &validated) {
                             let turn = ModelTurn::ToolError {
                                 tool: validated.tool_name().to_string(),
@@ -398,7 +400,12 @@ impl LoopDriver {
                             push_turn(&mut turns, turn, &mut observer);
                             continue;
                         }
-                        if !seen.insert(normalized.clone()) {
+                        let seen_bucket = if can_reuse_cached_result(&validated) {
+                            &mut seen_read_only
+                        } else {
+                            &mut seen_mutating
+                        };
+                        if !seen_bucket.insert(normalized.clone()) {
                             if can_reuse_cached_result(&validated) {
                                 let Some((cached_output, reuse_count)) =
                                     cached_results.get_mut(&normalized)
@@ -431,12 +438,7 @@ impl LoopDriver {
                                     tool: validated.tool_name().to_string(),
                                     preview: truncate(&cached_output.replace('\n', "\\n"), 220),
                                 });
-                                requirement_state.record_evidence(
-                                    task,
-                                    &validated,
-                                    cached_output,
-                                    phase,
-                                );
+                                requirement_state.record_evidence(task, &validated, cached_output);
                                 turns.push(ModelTurn::ToolResult {
                                     tool: validated.tool_name().to_string(),
                                     output: cached_output.clone(),
@@ -499,7 +501,11 @@ impl LoopDriver {
                             tool: validated.tool_name().to_string(),
                             preview: truncate(&result.replace('\n', "\\n"), 220),
                         });
-                        requirement_state.record_evidence(task, &validated, &result, phase);
+                        requirement_state.record_evidence(task, &validated, &result);
+                        if invalidates_read_only_cache(&validated) {
+                            seen_read_only.clear();
+                            cached_results.clear();
+                        }
                         if can_reuse_cached_result(&validated) && !result.trim().is_empty() {
                             cached_results.insert(normalized, (result.clone(), 0));
                         }
@@ -625,6 +631,12 @@ fn extract_task_contract(task: &str) -> TaskContract {
     };
     let quality_targets = quality_targets_for(deliverable_kind, creative_mode, game_like);
     let stretch_goals = stretch_goals_for(deliverable_kind, creative_mode, game_like);
+    let (profile, profile_confidence, fallback_profile) = select_task_profile(
+        requires_write.iter().any(|marker| lower.contains(marker)),
+        deliverable_kind,
+        game_like,
+        &lower,
+    );
     TaskContract {
         output_root: extract_path_like_tokens(task)
             .into_iter()
@@ -636,6 +648,9 @@ fn extract_task_contract(task: &str) -> TaskContract {
         creative_mode,
         quality_targets,
         stretch_goals,
+        profile,
+        profile_confidence,
+        fallback_profile,
     }
 }
 
@@ -773,6 +788,22 @@ enum CreativeMode {
     Enhanced,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskTypeProfile {
+    HtmlApp,
+    Game,
+    CliTool,
+    Refactor,
+    GenericCreate,
+    Inspect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProfileConfidence {
+    High,
+    Medium,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TaskContract {
     output_root: Option<PathBuf>,
@@ -783,13 +814,19 @@ struct TaskContract {
     creative_mode: CreativeMode,
     quality_targets: Vec<String>,
     stretch_goals: Vec<String>,
+    profile: TaskTypeProfile,
+    profile_confidence: ProfileConfidence,
+    fallback_profile: Option<TaskTypeProfile>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum CreateRequirement {
     OutputRootExists,
     DeliverableWritten,
-    DeliverableVerified,
+    EntryPointVerified,
+    RequestedOutputVerified,
+    RuntimeVerified,
+    CoreLoopVerified,
     ReviewCompleted,
 }
 
@@ -810,7 +847,7 @@ enum EvidenceResult {
 
 #[derive(Debug, Clone)]
 struct RequirementState {
-    create_task: bool,
+    contract: TaskContract,
     remaining: BTreeSet<CreateRequirement>,
     last_progress: ProgressClass,
     stall_count: usize,
@@ -821,13 +858,21 @@ struct RequirementState {
 }
 
 impl RequirementState {
-    fn new(task: &str, config: LoopConfig) -> Self {
-        let contract = extract_task_contract(task);
+    fn new(contract: &TaskContract, config: LoopConfig) -> Self {
         let mut remaining = BTreeSet::new();
         let effective_budget = if contract.requires_write {
             remaining.insert(CreateRequirement::OutputRootExists);
             remaining.insert(CreateRequirement::DeliverableWritten);
-            remaining.insert(CreateRequirement::DeliverableVerified);
+            remaining.insert(CreateRequirement::EntryPointVerified);
+            remaining.insert(CreateRequirement::RequestedOutputVerified);
+            if contract.browser_runnable {
+                remaining.insert(CreateRequirement::RuntimeVerified);
+            }
+            if matches!(contract.deliverable_kind, DeliverableKind::HtmlApp)
+                && contract.creative_mode == CreativeMode::Enhanced
+            {
+                remaining.insert(CreateRequirement::CoreLoopVerified);
+            }
             if contract.must_review {
                 remaining.insert(CreateRequirement::ReviewCompleted);
             }
@@ -836,7 +881,7 @@ impl RequirementState {
             config.inspect_task_base_budget
         };
         Self {
-            create_task: contract.requires_write,
+            contract: contract.clone(),
             remaining,
             last_progress: ProgressClass::None,
             stall_count: 0,
@@ -848,7 +893,7 @@ impl RequirementState {
     }
 
     fn note_phase(&mut self, step_number: usize, phase: CreatePhase) {
-        if !self.create_task {
+        if !self.contract.requires_write {
             self.finalize_started_step = None;
             return;
         }
@@ -892,7 +937,7 @@ impl RequirementState {
 
     fn should_stop(&self, step_index: usize) -> bool {
         step_index >= self.effective_budget
-            || (self.create_task
+            || (self.contract.requires_write
                 && self
                     .finalize_started_step
                     .is_some_and(|start| step_index >= start + self.finalize_phase_budget))
@@ -903,9 +948,8 @@ impl RequirementState {
         self.stall_count += 1;
     }
 
-    fn record_evidence(&mut self, task: &str, call: &ToolCall, result: &str, phase: CreatePhase) {
-        let contract = extract_task_contract(task);
-        let evidence = evaluate_evidence(&contract, call, result, phase);
+    fn record_evidence(&mut self, task: &str, call: &ToolCall, result: &str) {
+        let evidence = evaluate_evidence(task, &self.contract, call, result, self.current_phase());
         match evidence {
             EvidenceResult::None => self.record_no_progress(),
             EvidenceResult::Reinforcing => {
@@ -928,6 +972,41 @@ impl RequirementState {
                 self.effective_budget = (self.effective_budget + 2).min(self.hard_cap);
             }
         }
+    }
+
+    fn current_phase(&self) -> CreatePhase {
+        if !self.contract.requires_write {
+            return CreatePhase::Finalize;
+        }
+        if self
+            .remaining
+            .contains(&CreateRequirement::OutputRootExists)
+        {
+            return CreatePhase::Prepare;
+        }
+        if self
+            .remaining
+            .contains(&CreateRequirement::DeliverableWritten)
+        {
+            return CreatePhase::Write;
+        }
+        if self
+            .remaining
+            .contains(&CreateRequirement::EntryPointVerified)
+            || self
+                .remaining
+                .contains(&CreateRequirement::RequestedOutputVerified)
+            || self.remaining.contains(&CreateRequirement::RuntimeVerified)
+            || self
+                .remaining
+                .contains(&CreateRequirement::CoreLoopVerified)
+        {
+            return CreatePhase::Verify;
+        }
+        if self.remaining.contains(&CreateRequirement::ReviewCompleted) {
+            return CreatePhase::Review;
+        }
+        CreatePhase::Finalize
     }
 }
 
@@ -953,7 +1032,10 @@ fn requirement_label(requirement: CreateRequirement) -> &'static str {
     match requirement {
         CreateRequirement::OutputRootExists => "output_root_exists",
         CreateRequirement::DeliverableWritten => "deliverable_written",
-        CreateRequirement::DeliverableVerified => "deliverable_verified",
+        CreateRequirement::EntryPointVerified => "entry_point_verified",
+        CreateRequirement::RequestedOutputVerified => "requested_output_verified",
+        CreateRequirement::RuntimeVerified => "runtime_verified",
+        CreateRequirement::CoreLoopVerified => "core_loop_verified",
         CreateRequirement::ReviewCompleted => "review_completed",
     }
 }
@@ -963,6 +1045,88 @@ fn creative_mode_label(mode: CreativeMode) -> &'static str {
         CreativeMode::Disabled => "disabled",
         CreativeMode::Standard => "standard",
         CreativeMode::Enhanced => "enhanced",
+    }
+}
+
+fn profile_label(profile: TaskTypeProfile) -> &'static str {
+    match profile {
+        TaskTypeProfile::HtmlApp => "html_app",
+        TaskTypeProfile::Game => "game",
+        TaskTypeProfile::CliTool => "cli_tool",
+        TaskTypeProfile::Refactor => "refactor",
+        TaskTypeProfile::GenericCreate => "generic_create",
+        TaskTypeProfile::Inspect => "inspect",
+    }
+}
+
+fn profile_confidence_label(confidence: ProfileConfidence) -> &'static str {
+    match confidence {
+        ProfileConfidence::High => "high",
+        ProfileConfidence::Medium => "medium",
+    }
+}
+
+fn select_task_profile(
+    requires_write: bool,
+    deliverable_kind: DeliverableKind,
+    game_like: bool,
+    lower: &str,
+) -> (TaskTypeProfile, ProfileConfidence, Option<TaskTypeProfile>) {
+    if !requires_write {
+        return (TaskTypeProfile::Inspect, ProfileConfidence::Medium, None);
+    }
+    if lower.contains("refactor") || lower.contains("リファクタ") {
+        return (TaskTypeProfile::Refactor, ProfileConfidence::High, None);
+    }
+    if lower.contains("cli") || lower.contains("command line") || lower.contains("コマンド") {
+        return (
+            TaskTypeProfile::CliTool,
+            ProfileConfidence::Medium,
+            Some(TaskTypeProfile::GenericCreate),
+        );
+    }
+    match deliverable_kind {
+        DeliverableKind::HtmlApp if game_like => (
+            TaskTypeProfile::Game,
+            ProfileConfidence::High,
+            Some(TaskTypeProfile::HtmlApp),
+        ),
+        DeliverableKind::HtmlApp => (TaskTypeProfile::HtmlApp, ProfileConfidence::High, None),
+        _ => (
+            TaskTypeProfile::GenericCreate,
+            ProfileConfidence::Medium,
+            None,
+        ),
+    }
+}
+
+fn execution_stance(
+    contract: &TaskContract,
+    phase: CreatePhase,
+    last_progress: ProgressClass,
+    remaining_budget: usize,
+) -> &'static str {
+    if phase == CreatePhase::Review {
+        return "finding-first";
+    }
+    if !contract.requires_write {
+        return "evidence-first";
+    }
+    if matches!(contract.profile, TaskTypeProfile::Refactor) {
+        return "minimal-change-first";
+    }
+    if phase == CreatePhase::Write {
+        return "deliverable-first";
+    }
+    if matches!(last_progress, ProgressClass::None) && remaining_budget <= 1 {
+        return "evidence-first";
+    }
+    match contract.profile {
+        TaskTypeProfile::Game | TaskTypeProfile::HtmlApp | TaskTypeProfile::GenericCreate => {
+            "deliverable-first"
+        }
+        TaskTypeProfile::CliTool | TaskTypeProfile::Refactor => "minimal-change-first",
+        TaskTypeProfile::Inspect => "evidence-first",
     }
 }
 
@@ -1025,6 +1189,7 @@ fn stretch_goals_for(
 }
 
 fn evaluate_evidence(
+    task: &str,
     contract: &TaskContract,
     call: &ToolCall,
     result: &str,
@@ -1048,7 +1213,7 @@ fn evaluate_evidence(
                 && output_root.is_some_and(|root| path_under_root(root, &args.path))
                 && matches_main_deliverable(contract, &args.path)
             {
-                return EvidenceResult::Advanced(CreateRequirement::DeliverableVerified);
+                return EvidenceResult::Advanced(CreateRequirement::EntryPointVerified);
             }
             EvidenceResult::Reinforcing
         }
@@ -1062,7 +1227,7 @@ fn evaluate_evidence(
                 && output_root.is_some_and(|root| path_under_root(root, &args.path))
                 && matches_main_deliverable(contract, &args.path)
             {
-                return EvidenceResult::Advanced(CreateRequirement::DeliverableVerified);
+                return EvidenceResult::Advanced(CreateRequirement::EntryPointVerified);
             }
             EvidenceResult::None
         }
@@ -1093,7 +1258,21 @@ fn evaluate_evidence(
                 {
                     return EvidenceResult::Advanced(CreateRequirement::ReviewCompleted);
                 }
-                return EvidenceResult::Advanced(CreateRequirement::DeliverableVerified);
+                if verifies_runtime(contract, result) {
+                    return EvidenceResult::Advanced(CreateRequirement::RuntimeVerified);
+                }
+                if verifies_requested_output(task, &args.path) {
+                    return EvidenceResult::Advanced(CreateRequirement::RequestedOutputVerified);
+                }
+                if verifies_core_loop(contract, result) {
+                    return EvidenceResult::Advanced(CreateRequirement::CoreLoopVerified);
+                }
+                if contract.must_review
+                    && matches!(phase, CreatePhase::Review | CreatePhase::Finalize)
+                {
+                    return EvidenceResult::Advanced(CreateRequirement::ReviewCompleted);
+                }
+                return EvidenceResult::Advanced(CreateRequirement::EntryPointVerified);
             }
             EvidenceResult::None
         }
@@ -1136,6 +1315,43 @@ fn matches_main_deliverable(contract: &TaskContract, path: &Path) -> bool {
         DeliverableKind::RustCode => file_name.ends_with(".rs"),
         DeliverableKind::GenericFile => true,
     }
+}
+
+fn verifies_requested_output(task: &str, path: &Path) -> bool {
+    let Some(expected_root) = expected_output_root(task) else {
+        return false;
+    };
+    path_matches_expected(&expected_root, path)
+}
+
+fn verifies_runtime(contract: &TaskContract, content: &str) -> bool {
+    if !contract.browser_runnable {
+        return false;
+    }
+    let lower = content.to_lowercase();
+    lower.contains("<html") && (lower.contains("<script") || lower.contains("<canvas"))
+}
+
+fn verifies_core_loop(contract: &TaskContract, content: &str) -> bool {
+    if !(matches!(contract.deliverable_kind, DeliverableKind::HtmlApp)
+        && contract.creative_mode == CreativeMode::Enhanced)
+    {
+        return false;
+    }
+    let lower = content.to_lowercase();
+    let markers = [
+        "score",
+        "player",
+        "enemy",
+        "invader",
+        "requestanimationframe",
+        "keydown",
+    ];
+    markers
+        .iter()
+        .filter(|marker| lower.contains(**marker))
+        .count()
+        >= 3
 }
 
 fn parse_model_response(raw: &str) -> Result<ModelResponse, LoopError> {
@@ -1280,14 +1496,15 @@ fn contains_shell_metacharacters(command: &str) -> bool {
 
 fn build_loop_prompt(
     task: &str,
+    contract: &TaskContract,
     turns: &[ModelTurn],
     requirement_state: &RequirementState,
 ) -> String {
-    let contract = extract_task_contract(task);
     let expected_root = contract.output_root.clone();
-    let create_phase = create_phase_for_task(task, turns);
+    let create_phase = requirement_state.current_phase();
     let mut prompt = String::from(
-        "You are Anvil. Solve the task by selecting tools when needed.\n\
+        "[BASE_POLICY]\n\
+You are Anvil. Solve the task by selecting tools when needed.\n\
 Return only JSON.\n\
 For tools: {\"type\":\"tool_calls\",\"calls\":[{\"tool\":\"read_file\",\"args\":{...}}]}\n\
 For final answer: {\"type\":\"final\",\"content\":\"...\"}\n\
@@ -1300,10 +1517,33 @@ For branch/repository questions, prefer focused git commands over broad filesyst
 Do not repeat the same read-only call once its result already answers the question.\n\
 Invalid or partial tool args are forbidden.\n\n",
     );
+    prompt.push_str("[TASK_CONTRACT]\n");
+    prompt.push_str(&format!(
+        "requires_write={}\nmust_review={}\nbrowser_runnable={}\ndeliverable_kind={}\ncreative_mode={}\nprofile={}\nprofile_confidence={}\n",
+        contract.requires_write,
+        contract.must_review,
+        contract.browser_runnable,
+        deliverable_kind_label(contract.deliverable_kind),
+        creative_mode_label(contract.creative_mode),
+        profile_label(contract.profile),
+        profile_confidence_label(contract.profile_confidence),
+    ));
+    if let Some(root) = &contract.output_root {
+        prompt.push_str(&format!("output_root={}\n", root.display()));
+    }
+    if let Some(fallback_profile) = contract.fallback_profile {
+        prompt.push_str(&format!(
+            "fallback_profile={}\n",
+            profile_label(fallback_profile)
+        ));
+    }
+    prompt.push('\n');
     for turn in compact_turns(turns) {
         match turn {
             ModelTurn::ToolResult { tool, output } => {
-                prompt.push_str(&format!("TOOL_RESULT {tool}\n{output}\n\n"));
+                prompt.push_str(&format!(
+                    "[WORKING_TRANSCRIPT]\nTOOL_RESULT {tool}\n{output}\n\n"
+                ));
             }
             ModelTurn::ToolError {
                 tool,
@@ -1312,11 +1552,13 @@ Invalid or partial tool args are forbidden.\n\n",
                 hint,
             } => {
                 prompt.push_str(&format!(
-                    "TOOL_ERROR {tool}\nkind={error_kind}\nmessage={message}\nhint={hint}\n\n"
+                    "[WORKING_TRANSCRIPT]\nTOOL_ERROR {tool}\nkind={error_kind}\nmessage={message}\nhint={hint}\n\n"
                 ));
             }
             ModelTurn::AssistantFinal(content) => {
-                prompt.push_str(&format!("ASSISTANT_FINAL\n{content}\n\n"));
+                prompt.push_str(&format!(
+                    "[WORKING_TRANSCRIPT]\nASSISTANT_FINAL\n{content}\n\n"
+                ));
             }
             ModelTurn::ProtocolError {
                 error_kind,
@@ -1324,7 +1566,7 @@ Invalid or partial tool args are forbidden.\n\n",
                 hint,
             } => {
                 prompt.push_str(&format!(
-                    "MODEL_ERROR\nkind={error_kind}\nmessage={message}\nhint={hint}\n\n"
+                    "[WORKING_TRANSCRIPT]\nMODEL_ERROR\nkind={error_kind}\nmessage={message}\nhint={hint}\n\n"
                 ));
             }
         }
@@ -1362,22 +1604,10 @@ Invalid or partial tool args are forbidden.\n\n",
             requirement_state.stall_count,
             requirement_state.effective_budget,
         ));
+        prompt.push('\n');
     }
-    prompt.push_str("TASK_CONTRACT\n");
-    prompt.push_str(&format!(
-        "requires_write={}\nmust_review={}\nbrowser_runnable={}\ndeliverable_kind={}\ncreative_mode={}\n",
-        contract.requires_write,
-        contract.must_review,
-        contract.browser_runnable,
-        deliverable_kind_label(contract.deliverable_kind),
-        creative_mode_label(contract.creative_mode),
-    ));
-    if let Some(root) = &contract.output_root {
-        prompt.push_str(&format!("output_root={}\n", root.display()));
-    }
-    prompt.push('\n');
     if !contract.quality_targets.is_empty() {
-        prompt.push_str("QUALITY_TARGETS\n");
+        prompt.push_str("[QUALITY_TARGETS]\n");
         for target in &contract.quality_targets {
             prompt.push_str("- ");
             prompt.push_str(target);
@@ -1386,7 +1616,7 @@ Invalid or partial tool args are forbidden.\n\n",
         prompt.push('\n');
     }
     if !contract.stretch_goals.is_empty() {
-        prompt.push_str("STRETCH_GOALS\n");
+        prompt.push_str("[STRETCH_GOALS]\n");
         for goal in &contract.stretch_goals {
             prompt.push_str("- ");
             prompt.push_str(goal);
@@ -1394,23 +1624,23 @@ Invalid or partial tool args are forbidden.\n\n",
         }
         prompt.push('\n');
     }
-    prompt.push_str("TASK_OBJECTIVE\n");
+    prompt.push_str("[USER_OBJECTIVE]\n");
     prompt.push_str(&step_objective(task));
     prompt.push_str("\n\n");
-    let plan = step_plan(task, turns);
-    prompt.push_str("PLAN\n");
+    let plan = step_plan(contract, requirement_state, task, turns);
+    prompt.push_str("[PLAN]\n");
     for item in plan.items {
         prompt.push_str("- ");
         prompt.push_str(&item);
         prompt.push('\n');
     }
     prompt.push('\n');
-    if let Some(hint) = completion_hint(task, turns) {
-        prompt.push_str("COMPLETION_HINT\n");
+    if let Some(hint) = completion_hint(contract, requirement_state, task, turns) {
+        prompt.push_str("[NEXT_ACTION_HINT]\n");
         prompt.push_str(&hint);
         prompt.push_str("\n\n");
     }
-    prompt.push_str("TASK\n");
+    prompt.push_str("[TASK]\n");
     prompt.push_str(task);
     prompt
 }
@@ -1521,6 +1751,20 @@ fn can_reuse_cached_result(call: &ToolCall) -> bool {
     }
 }
 
+fn invalidates_read_only_cache(call: &ToolCall) -> bool {
+    match call {
+        ToolCall::WriteFile(_) | ToolCall::EditFile(_) | ToolCall::Mkdir(_) => true,
+        ToolCall::Exec(args) => !is_read_only_exec(&args.argv),
+        ToolCall::ReadFile(_)
+        | ToolCall::Diff(_)
+        | ToolCall::Search(_)
+        | ToolCall::Glob(_)
+        | ToolCall::ListDir(_)
+        | ToolCall::StatPath(_)
+        | ToolCall::PathExists(_) => false,
+    }
+}
+
 fn is_read_only_exec(argv: &[String]) -> bool {
     matches!(
         argv.first().map(String::as_str),
@@ -1543,14 +1787,18 @@ fn compact_turns(turns: &[ModelTurn]) -> Vec<ModelTurn> {
     compacted
 }
 
-fn completion_hint(task: &str, turns: &[ModelTurn]) -> Option<String> {
-    let contract = extract_task_contract(task);
+fn completion_hint(
+    contract: &TaskContract,
+    requirement_state: &RequirementState,
+    task: &str,
+    turns: &[ModelTurn],
+) -> Option<String> {
     let expected_root = contract.output_root.clone();
     if contract.requires_write {
-        if let Some(unmet) = unmet_requirements(&contract, turns) {
+        if let Some(unmet) = unmet_requirements(contract, requirement_state) {
             return Some(unmet);
         }
-        match create_phase_for_task(task, turns) {
+        match requirement_state.current_phase() {
             CreatePhase::Review => {
                 return Some(
                     "Verification is complete. Read the generated file and perform the requested code review before returning final."
@@ -1601,9 +1849,14 @@ fn completion_hint(task: &str, turns: &[ModelTurn]) -> Option<String> {
     None
 }
 
-fn step_purpose(task: &str, turns: &[ModelTurn]) -> String {
-    if task_requires_write_action(task) {
-        return match create_phase_for_task(task, turns) {
+fn step_purpose(
+    task: &str,
+    turns: &[ModelTurn],
+    phase: CreatePhase,
+    requirement_state: &RequirementState,
+) -> String {
+    if requirement_state.contract.requires_write {
+        return match phase {
             CreatePhase::Prepare => "prepare output path".to_string(),
             CreatePhase::Write => "write deliverable".to_string(),
             CreatePhase::Verify => "verify generated output".to_string(),
@@ -1675,74 +1928,6 @@ fn has_status_evidence(turns: &[ModelTurn]) -> bool {
     })
 }
 
-fn has_mkdir_evidence(turns: &[ModelTurn]) -> bool {
-    turns.iter().any(|turn| match turn {
-        ModelTurn::ToolResult { tool, output } => tool == "mkdir" && output.trim() == "ok",
-        _ => false,
-    })
-}
-
-fn has_empty_directory_evidence(turns: &[ModelTurn]) -> bool {
-    turns.iter().any(|turn| match turn {
-        ModelTurn::ToolResult { tool, output } if tool == "list_dir" => output.trim().is_empty(),
-        ModelTurn::ToolResult { tool, output } if tool == "stat_path" => {
-            output.contains("kind=directory")
-        }
-        _ => false,
-    })
-}
-
-fn create_phase_for_task(task: &str, turns: &[ModelTurn]) -> CreatePhase {
-    let contract = extract_task_contract(task);
-    if !contract.requires_write {
-        return CreatePhase::Finalize;
-    }
-    if has_write_evidence(turns) {
-        if contract.must_review && has_verification_evidence(turns) && !has_review_evidence(turns) {
-            return CreatePhase::Review;
-        }
-        if has_verification_evidence(turns) {
-            return CreatePhase::Finalize;
-        }
-        return CreatePhase::Verify;
-    }
-    if has_mkdir_evidence(turns) || has_empty_directory_evidence(turns) {
-        return CreatePhase::Write;
-    }
-    CreatePhase::Prepare
-}
-
-fn has_verification_evidence(turns: &[ModelTurn]) -> bool {
-    turns.iter().rev().take(4).any(|turn| match turn {
-        ModelTurn::ToolResult { tool, output } if tool == "read_file" => !output.trim().is_empty(),
-        ModelTurn::ToolResult { tool, output } if tool == "stat_path" => {
-            output.contains("kind=file")
-        }
-        ModelTurn::ToolResult { tool, output } if tool == "path_exists" => {
-            output.contains("exists=true")
-        }
-        _ => false,
-    })
-}
-
-fn has_review_evidence(turns: &[ModelTurn]) -> bool {
-    let write_index = turns.iter().position(|turn| {
-        matches!(
-            turn,
-            ModelTurn::ToolResult { tool, .. } if tool == "write_file" || tool == "edit_file"
-        )
-    });
-    let Some(write_index) = write_index else {
-        return false;
-    };
-
-    turns.iter().skip(write_index + 1).any(|turn| match turn {
-        ModelTurn::ToolResult { tool, output } if tool == "read_file" => !output.trim().is_empty(),
-        ModelTurn::ToolResult { tool, output } if tool == "diff" => !output.trim().is_empty(),
-        _ => false,
-    })
-}
-
 fn task_requires_review(task: &str) -> bool {
     let lower = task.to_lowercase();
     ["review", "code review", "レビュー", "コードレビュー"]
@@ -1754,8 +1939,12 @@ fn step_objective(task: &str) -> String {
     truncate(task.trim(), 140)
 }
 
-fn step_instruction(task: &str, turns: &[ModelTurn]) -> String {
-    let contract = extract_task_contract(task);
+fn step_instruction(
+    _task: &str,
+    contract: &TaskContract,
+    phase: CreatePhase,
+    requirement_state: &RequirementState,
+) -> String {
     let output_root = contract
         .output_root
         .as_ref()
@@ -1794,42 +1983,44 @@ fn step_instruction(task: &str, turns: &[ModelTurn]) -> String {
                 .join(", ")
         )
     };
-    match create_phase_for_task(task, turns) {
+    let remaining = requirement_state.remaining_labels().join(", ");
+    match phase {
         CreatePhase::Prepare => format!(
-            "Prepare the requested output location at {output_root}. Do not write outside that root. After preparation, move to implementation.{review_note}{quality_note}"
+            "Prepare the requested output location at {output_root}. Do not write outside that root. After preparation, move to implementation. Remaining requirements: {remaining}.{review_note}{quality_note}"
         ),
         CreatePhase::Write => match contract.deliverable_kind {
             DeliverableKind::HtmlApp => format!(
-                "Create the main browser-runnable HTML deliverable under {output_root}. Implement the requested game behavior from the task, keep it directly runnable in a browser, and prefer a complete playable result over placeholders.{review_note}{quality_note}{stretch_note}"
+                "Create the main browser-runnable HTML deliverable under {output_root}. Implement the requested game behavior from the task, keep it directly runnable in a browser, and prefer a complete playable result over placeholders. Remaining requirements: {remaining}.{review_note}{quality_note}{stretch_note}"
             ),
             DeliverableKind::RustCode => format!(
-                "Write the requested Rust deliverable under {output_root}. Keep the code buildable and aligned with the task requirements.{review_note}{quality_note}{stretch_note}"
+                "Write the requested Rust deliverable under {output_root}. Keep the code buildable and aligned with the task requirements. Remaining requirements: {remaining}.{review_note}{quality_note}{stretch_note}"
             ),
             DeliverableKind::GenericFile => format!(
-                "Write the requested deliverable to {output_root}. Satisfy the task requirements and keep the output self-contained.{review_note}{quality_note}{stretch_note}"
+                "Write the requested deliverable to {output_root}. Satisfy the task requirements and keep the output self-contained. Remaining requirements: {remaining}.{review_note}{quality_note}{stretch_note}"
             ),
         },
         CreatePhase::Verify => format!(
-            "Verify the generated output under {output_root}. Read the main deliverable, confirm the key task requirements are present, and identify anything still missing.{review_note}{quality_note}"
+            "Verify the generated output under {output_root}. Read the main deliverable, confirm the key task requirements are present, and identify anything still missing. Remaining requirements: {remaining}.{review_note}{quality_note}"
         ),
         CreatePhase::Review => format!(
-            "Perform the requested code review for the generated output under {output_root}. Note concrete findings, risks, obvious regressions, and missing polish before finalizing.{quality_note}"
+            "Perform the requested code review for the generated output under {output_root}. Note concrete findings, risks, obvious regressions, and missing polish before finalizing. Remaining requirements: {remaining}.{quality_note}"
         ),
         CreatePhase::Finalize => format!(
-            "Prepare the final response for the work under {output_root}. Summarize created files, implementation status, and include review findings if requested."
+            "Prepare the final response for the work under {output_root}. Summarize created files, implementation status, and include review findings if requested. Only use more tools if they satisfy: {remaining}."
         ),
     }
 }
 
-fn step_plan(task: &str, turns: &[ModelTurn]) -> StepPlan {
-    let contract = extract_task_contract(task);
-    let workflow = build_workflow(&contract);
+fn step_plan(
+    contract: &TaskContract,
+    requirement_state: &RequirementState,
+    task: &str,
+    turns: &[ModelTurn],
+) -> StepPlan {
+    let workflow = build_workflow(contract);
     let phase = if contract.requires_write {
         workflow
-            .get(phase_position(
-                &contract,
-                create_phase_for_task(task, turns),
-            ))
+            .get(phase_position(contract, requirement_state.current_phase()))
             .cloned()
             .unwrap_or_else(|| "finalize".to_string())
     } else if is_branch_inspection_task(task) {
@@ -1838,7 +2029,7 @@ fn step_plan(task: &str, turns: &[ModelTurn]) -> StepPlan {
         "gather".to_string()
     };
     let phase_index = if contract.requires_write {
-        phase_position(&contract, create_phase_for_task(task, turns)) + 1
+        phase_position(contract, requirement_state.current_phase()) + 1
     } else {
         1
     };
@@ -1856,6 +2047,26 @@ fn step_plan(task: &str, turns: &[ModelTurn]) -> StepPlan {
         items.push(format!(
             "deliverable: {}",
             deliverable_kind_label(contract.deliverable_kind)
+        ));
+        items.push(format!("profile: {}", profile_label(contract.profile)));
+        items.push(format!(
+            "profile confidence: {}",
+            profile_confidence_label(contract.profile_confidence)
+        ));
+        if let Some(fallback_profile) = contract.fallback_profile {
+            items.push(format!(
+                "fallback profile: {}",
+                profile_label(fallback_profile)
+            ));
+        }
+        items.push(format!(
+            "execution stance: {}",
+            execution_stance(
+                contract,
+                requirement_state.current_phase(),
+                requirement_state.last_progress,
+                requirement_state.remaining_budget(phase_index)
+            )
         ));
         if contract.creative_mode != CreativeMode::Disabled {
             items.push(format!(
@@ -1894,7 +2105,7 @@ fn step_plan(task: &str, turns: &[ModelTurn]) -> StepPlan {
             ));
         }
     }
-    if let Some(hint) = completion_hint(task, turns) {
+    if let Some(hint) = completion_hint(contract, requirement_state, task, turns) {
         items.push(format!("current guidance: {}", truncate(&hint, 160)));
     }
     StepPlan {
@@ -1944,32 +2155,45 @@ fn phase_position(contract: &TaskContract, phase: CreatePhase) -> usize {
     }
 }
 
-fn unmet_requirements(contract: &TaskContract, turns: &[ModelTurn]) -> Option<String> {
-    if contract.requires_write && !has_write_evidence(turns) {
-        if let Some(root) = &contract.output_root {
-            return Some(format!(
-                "The task still requires a written deliverable under {}. Create the output there before returning final.",
-                root.display()
-            ));
+fn unmet_requirements(
+    contract: &TaskContract,
+    requirement_state: &RequirementState,
+) -> Option<String> {
+    let first = requirement_state.remaining.iter().next().copied()?;
+    Some(match first {
+        CreateRequirement::OutputRootExists => {
+            let root = contract
+                .output_root
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "the requested output root".to_string());
+            format!("The output root is not ready yet. Create or verify {root} before doing anything else.")
         }
-        return Some(
-            "The task still requires a written deliverable. Use write_file or edit_file before returning final."
-                .to_string(),
-        );
-    }
-    if contract.browser_runnable && !has_verification_evidence(turns) {
-        return Some(
-            "Browser-runnable output is requested but not yet verified. Read the generated HTML or entry file before returning final."
-                .to_string(),
-        );
-    }
-    if contract.must_review && !has_review_evidence(turns) {
-        return Some(
-            "A code review was requested and is still missing. Inspect the generated file and include review findings before returning final."
-                .to_string(),
-        );
-    }
-    None
+        CreateRequirement::DeliverableWritten => {
+            "A deliverable file is still missing. Use write_file or edit_file to create the requested output under the target root."
+                .to_string()
+        }
+        CreateRequirement::EntryPointVerified => {
+            "The main deliverable has not been read back yet. Read the entry file before returning final."
+                .to_string()
+        }
+        CreateRequirement::RequestedOutputVerified => {
+            "The requested output path has not been verified yet. Confirm the generated file lives under the exact requested root."
+                .to_string()
+        }
+        CreateRequirement::RuntimeVerified => {
+            "Browser-runnable output was requested but runtime readiness is not yet verified. Confirm that the HTML entry contains executable browser logic."
+                .to_string()
+        }
+        CreateRequirement::CoreLoopVerified => {
+            "The requested core behavior is not yet verified. Read the generated file and confirm the playable loop or key interaction exists."
+                .to_string()
+        }
+        CreateRequirement::ReviewCompleted => {
+            "A code review was requested and is still missing. Inspect the generated file and include review findings before final."
+                .to_string()
+        }
+    })
 }
 
 fn expected_output_root(task: &str) -> Option<PathBuf> {

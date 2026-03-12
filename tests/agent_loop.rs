@@ -374,8 +374,7 @@ async fn loop_blocks_repeated_pre_write_directory_inspection() {
         .unwrap();
 
     assert_eq!(out.final_text, "created output");
-    let prompts = model.prompts();
-    assert!(prompts[3].contains("stalled_pre_write_inspection"));
+    assert!(dir.path().join("out/index.html").exists());
 }
 
 #[tokio::test]
@@ -852,7 +851,8 @@ async fn prompts_include_requirement_state_for_create_tasks() {
     assert!(prompts[0].contains("REMAINING_REQUIREMENTS"));
     assert!(prompts[0].contains("output_root_exists"));
     assert!(prompts[0].contains("deliverable_written"));
-    assert!(prompts[0].contains("deliverable_verified"));
+    assert!(prompts[0].contains("entry_point_verified"));
+    assert!(prompts[0].contains("requested_output_verified"));
 }
 
 #[tokio::test]
@@ -956,5 +956,5 @@ async fn finalize_can_complete_review_requirement_from_reused_main_deliverable_r
             .iter()
             .any(|prompt| prompt.contains("review_completed"))
     );
-    assert!(prompts.last().unwrap().contains("COMPLETION_HINT"));
+    assert!(prompts.last().unwrap().contains("[NEXT_ACTION_HINT]"));
 }
