@@ -43,6 +43,10 @@ impl StateMachine {
         }
     }
 
+    pub fn from_snapshot(snapshot: AppStateSnapshot) -> Self {
+        Self { snapshot }
+    }
+
     pub fn snapshot(&self) -> &AppStateSnapshot {
         &self.snapshot
     }

@@ -1,9 +1,34 @@
 use anvil::app::App;
 use anvil::config::EffectiveConfig;
 use anvil::provider::ProviderRuntimeContext;
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn build_app() -> App {
-    let config = EffectiveConfig::load().expect("config should load");
+    build_app_in(unique_test_dir("app"))
+}
+
+pub fn build_app_in(root: PathBuf) -> App {
+    let config = build_config_in(root);
     let provider = ProviderRuntimeContext::bootstrap(&config).expect("provider should bootstrap");
     App::new(config, provider).expect("app should initialize")
+}
+
+pub fn build_config_in(root: PathBuf) -> EffectiveConfig {
+    let mut config = EffectiveConfig::default_for_test().expect("config should load");
+    config.paths.cwd = root.clone();
+    config.paths.workspace_dir = root.join("workspace");
+    config.paths.config_file = root.join(".anvil").join("config");
+    config.paths.state_dir = root.join(".anvil").join("state");
+    config.paths.session_dir = root.join(".anvil").join("sessions");
+    config.paths.session_file = config.paths.session_dir.join("session.json");
+    config
+}
+
+pub fn unique_test_dir(label: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    std::env::temp_dir().join(format!("anvil_test_{label}_{nanos}"))
 }

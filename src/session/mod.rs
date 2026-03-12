@@ -1,3 +1,4 @@
+use crate::agent::AgentEvent;
 use crate::config::EffectiveConfig;
 use crate::contracts::{
     AppEvent, AppStateSnapshot, ConsoleMessageRole, ConsoleMessageView, ConsoleRenderContext,
@@ -81,6 +82,8 @@ pub struct SessionRecord {
     pub session_event: Option<AppEvent>,
     #[serde(default)]
     pub event_log: Vec<AppEvent>,
+    #[serde(default)]
+    pub pending_runtime_events: Vec<AgentEvent>,
 }
 
 impl SessionRecord {
@@ -97,6 +100,7 @@ impl SessionRecord {
             last_snapshot: None,
             session_event: None,
             event_log: Vec::new(),
+            pending_runtime_events: Vec::new(),
         }
     }
 
@@ -196,6 +200,20 @@ impl SessionRecord {
     pub fn record_event(&mut self, event: AppEvent) {
         self.session_event = Some(event);
         self.event_log.push(event);
+    }
+
+    pub fn set_pending_runtime_events(&mut self, events: Vec<AgentEvent>) {
+        self.pending_runtime_events = events;
+        self.touch();
+    }
+
+    pub fn clear_pending_runtime_events(&mut self) {
+        self.pending_runtime_events.clear();
+        self.touch();
+    }
+
+    pub fn has_pending_runtime_events(&self) -> bool {
+        !self.pending_runtime_events.is_empty()
     }
 
     fn touch(&mut self) {

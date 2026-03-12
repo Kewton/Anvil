@@ -77,14 +77,18 @@ impl App {
     ) -> Result<Self, AppError> {
         let session_store = SessionStore::from_config(&config);
         let session = session_store.load_or_create(&config.paths.cwd)?;
+        let initial_state_snapshot = session
+            .last_snapshot
+            .clone()
+            .unwrap_or_else(|| AppStateSnapshot::new(RuntimeState::Ready));
 
         Ok(Self {
             config,
             provider,
-            state_machine: StateMachine::new(),
+            state_machine: StateMachine::from_snapshot(initial_state_snapshot),
             session_store,
+            pending_runtime_events: session.pending_runtime_events.clone(),
             session,
-            pending_runtime_events: Vec::new(),
         })
     }
 
@@ -165,7 +169,7 @@ impl App {
         tui: &Tui,
     ) -> Result<Vec<String>, AppError> {
         let user_input = user_input.into();
-        self.pending_runtime_events.clear();
+        self.clear_pending_runtime_events()?;
         self.record_user_input(self.next_message_id("user"), user_input)?;
         self.execute_runtime_events(runtime.events(), tui)
     }
@@ -180,10 +184,32 @@ impl App {
         }
 
         let remaining = std::mem::take(&mut self.pending_runtime_events);
+        self.clear_pending_runtime_events()?;
         self.execute_runtime_events(&remaining, tui)
     }
 
+    pub fn deny_and_abort(&mut self, tui: &Tui) -> Result<Vec<String>, AppError> {
+        if self.pending_runtime_events.is_empty() {
+            return Err(AppError::NoPendingApproval);
+        }
+
+        self.clear_pending_runtime_events()?;
+        self.record_assistant_output(
+            self.next_message_id("assistant"),
+            "Approval denied. No tool was executed.",
+        )?;
+        let snapshot = AppStateSnapshot::new(RuntimeState::Ready)
+            .with_status("Approval denied. Ready for the next task".to_string())
+            .with_context_usage(
+                self.session.estimated_token_count(),
+                self.config.runtime.context_window,
+            );
+        self.apply_transition(snapshot, StateTransition::ResetToReady)?;
+        Ok(vec![self.render_console(tui)?])
+    }
+
     pub fn reset_to_ready(&mut self) -> Result<AppStateSnapshot, AppError> {
+        self.clear_pending_runtime_events()?;
         let snapshot = AppStateSnapshot::new(RuntimeState::Ready)
             .with_status("Ready for the next task".to_string())
             .with_context_usage(
@@ -339,16 +365,19 @@ impl App {
         tui: &Tui,
     ) -> Result<Vec<String>, AppError> {
         let mut frames = Vec::new();
-        self.pending_runtime_events.clear();
 
         for (index, event) in events.iter().enumerate() {
             let snapshot = self.apply_agent_event(event)?;
             frames.push(self.render_console(tui)?);
 
             if snapshot.state == RuntimeState::AwaitingApproval {
-                self.pending_runtime_events = events[index + 1..].to_vec();
+                self.set_pending_runtime_events(events[index + 1..].to_vec())?;
                 break;
             }
+        }
+
+        if self.pending_runtime_events.is_empty() {
+            self.clear_pending_runtime_events()?;
         }
 
         Ok(frames)
@@ -494,6 +523,25 @@ impl App {
 
     fn next_message_id(&self, prefix: &str) -> String {
         format!("{prefix}_{:04}", self.session.message_count() + 1)
+    }
+
+    pub fn has_pending_runtime_events(&self) -> bool {
+        !self.pending_runtime_events.is_empty()
+    }
+
+    fn set_pending_runtime_events(&mut self, events: Vec<AgentEvent>) -> Result<(), AppError> {
+        self.pending_runtime_events = events.clone();
+        self.session.set_pending_runtime_events(events);
+        self.persist_session(AppEvent::SessionSaved)
+    }
+
+    fn clear_pending_runtime_events(&mut self) -> Result<(), AppError> {
+        if self.pending_runtime_events.is_empty() && !self.session.has_pending_runtime_events() {
+            return Ok(());
+        }
+        self.pending_runtime_events.clear();
+        self.session.clear_pending_runtime_events();
+        self.persist_session(AppEvent::SessionSaved)
     }
 }
 

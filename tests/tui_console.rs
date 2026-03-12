@@ -1,6 +1,5 @@
 mod common;
 
-use anvil::config::EffectiveConfig;
 use anvil::provider::ProviderRuntimeContext;
 use anvil::tui::Tui;
 
@@ -90,9 +89,10 @@ fn mock_interrupted_snapshot_exposes_next_actions() {
 
 #[test]
 fn tui_renders_approval_and_interrupt_sections() {
-    let config = EffectiveConfig::load().expect("config should load");
-    let provider = ProviderRuntimeContext::bootstrap(&config).expect("provider should bootstrap");
-    let mut app = anvil::app::App::new(config.clone(), provider).expect("app should initialize");
+    let approval_config = common::build_config_in(common::unique_test_dir("tui_approval"));
+    let provider =
+        ProviderRuntimeContext::bootstrap(&approval_config).expect("provider should bootstrap");
+    let mut app = anvil::app::App::new(approval_config, provider).expect("app should initialize");
     let tui = Tui::new();
 
     let _ = app
@@ -103,9 +103,11 @@ fn tui_renders_approval_and_interrupt_sections() {
         .expect("approval snapshot should build");
     let approval_rendered = app.render_console(&tui).expect("render should succeed");
 
-    let provider = ProviderRuntimeContext::bootstrap(&config).expect("provider should bootstrap");
+    let interrupt_config = common::build_config_in(common::unique_test_dir("tui_interrupt"));
+    let provider =
+        ProviderRuntimeContext::bootstrap(&interrupt_config).expect("provider should bootstrap");
     let mut interrupted_app =
-        anvil::app::App::new(config, provider).expect("app should initialize");
+        anvil::app::App::new(interrupt_config, provider).expect("app should initialize");
     let _ = interrupted_app
         .mock_thinking_snapshot()
         .expect("thinking snapshot should build");
@@ -125,7 +127,7 @@ fn tui_renders_approval_and_interrupt_sections() {
 
 #[test]
 fn startup_screen_shows_logo_model_and_project() {
-    let config = EffectiveConfig::load().expect("config should load");
+    let config = common::build_config_in(common::unique_test_dir("startup"));
     let provider = ProviderRuntimeContext::bootstrap(&config).expect("provider should bootstrap");
     let mut app = anvil::app::App::new(config.clone(), provider).expect("app should initialize");
     let tui = Tui::new();
