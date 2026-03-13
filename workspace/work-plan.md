@@ -72,12 +72,12 @@
 
 ## Phase 7: Add the Typed Tool System
 
-- [ ] Implement typed tool registry
-- [ ] Implement tool input and result schemas
-- [ ] Implement execution policy classes
-- [ ] Implement permission flow
-- [ ] Implement parallel-safe tool execution path
-- [ ] Implement rollback and checkpoint support
+- [x] Implement typed tool registry
+- [x] Implement tool input and result schemas
+- [x] Implement execution policy classes
+- [x] Implement permission flow
+- [x] Implement parallel-safe tool execution path
+- [x] Implement rollback and checkpoint support
 
 ## Phase 8: Reach the First Useful Version
 
