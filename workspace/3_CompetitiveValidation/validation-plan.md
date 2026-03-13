@@ -20,6 +20,15 @@ Compare Anvil against `vibe-local` on the axes defined in `workspace/1_ProductDe
 - Record cold-start and warm-start values separately.
 - Record exact prompt text.
 - Record any manual setup or retry steps.
+- Label every row as either `Measured` or `OperationalScore`.
+- Prefer benchmark harness runs for command-level latency where automation is possible.
+- Keep scored rows explicitly separate from measured rows in findings and scorecards.
+
+## Automation Baseline
+
+- Use the Rust benchmark harness in `src/metrics/mod.rs` for repeated command execution timing.
+- Record raw per-run timings in the run log, then write averaged values into the scorecard.
+- Treat qualitative UX or maturity judgments as `OperationalScore` until a repeatable harness exists.
 
 ## Required Outputs
 

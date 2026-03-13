@@ -1,3 +1,7 @@
+use std::fmt::{Display, Formatter};
+use std::process::Command;
+use std::time::Instant;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BenchmarkTarget {
     Anvil,
@@ -26,6 +30,12 @@ pub enum PreferredDirection {
     HigherIsBetter,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeasurementSource {
+    Measured,
+    OperationalScore,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScenarioDefinition {
     pub id: &'static str,
@@ -41,6 +51,7 @@ pub struct MeasurementRecord {
     pub target: BenchmarkTarget,
     pub scenario_id: String,
     pub value: u32,
+    pub source: MeasurementSource,
     pub notes: String,
 }
 
@@ -56,6 +67,71 @@ pub struct ComparisonOutcome {
 #[derive(Debug, Default)]
 pub struct MetricsRegistry {
     scenarios: Vec<ScenarioDefinition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandBenchmark<'a> {
+    program: &'a str,
+    args: Vec<&'a str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandBenchmarkResult {
+    pub runs_ms: Vec<u32>,
+    pub average_ms: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandBenchmarkError {
+    message: String,
+}
+
+impl Display for CommandBenchmarkError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for CommandBenchmarkError {}
+
+impl<'a> CommandBenchmark<'a> {
+    pub fn new(program: &'a str, args: &[&'a str]) -> Self {
+        Self {
+            program,
+            args: args.to_vec(),
+        }
+    }
+
+    pub fn run(&self, runs: usize) -> Result<CommandBenchmarkResult, CommandBenchmarkError> {
+        let mut results = Vec::new();
+
+        for _ in 0..runs {
+            let started = Instant::now();
+            let status = Command::new(self.program)
+                .args(&self.args)
+                .status()
+                .map_err(|err| CommandBenchmarkError {
+                    message: format!("failed to run benchmark command: {err}"),
+                })?;
+            if !status.success() {
+                return Err(CommandBenchmarkError {
+                    message: format!("benchmark command failed with status {status}"),
+                });
+            }
+            results.push(started.elapsed().as_millis() as u32);
+        }
+
+        let average_ms = if results.is_empty() {
+            0
+        } else {
+            results.iter().sum::<u32>() / results.len() as u32
+        };
+
+        Ok(CommandBenchmarkResult {
+            runs_ms: results,
+            average_ms,
+        })
+    }
 }
 
 impl MetricsRegistry {
@@ -125,8 +201,8 @@ impl MetricsRegistry {
         let mut lines = vec![
             "# Competitive Validation Summary".to_string(),
             String::new(),
-            "| Scenario | Axis | Anvil | vibe-local | Winner |".to_string(),
-            "| --- | --- | ---: | ---: | --- |".to_string(),
+            "| Scenario | Axis | Source | Anvil | vibe-local | Winner |".to_string(),
+            "| --- | --- | --- | ---: | ---: | --- |".to_string(),
         ];
 
         for scenario in self.scenarios() {
@@ -139,7 +215,7 @@ impl MetricsRegistry {
                 None => "Tie/Unknown",
             };
             lines.push(format!(
-                "| {} | {} | {} | {} | {} |",
+                "| {} | {} | {} | {} | {} | {} |",
                 scenario.title,
                 axis_label(scenario.axis),
                 outcome
@@ -150,7 +226,8 @@ impl MetricsRegistry {
                     .vibe_local_value
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "-".to_string()),
-                winner
+                winner,
+                source_label(records, scenario.id)
             ));
         }
 
@@ -210,5 +287,15 @@ fn axis_label(axis: ComparisonAxis) -> &'static str {
         ComparisonAxis::StabilityAndRecovery => "StabilityAndRecovery",
         ComparisonAxis::LongSessionUsability => "LongSessionUsability",
         ComparisonAxis::UxClarity => "UxClarity",
+    }
+}
+
+fn source_label(records: &[MeasurementRecord], scenario_id: &str) -> &'static str {
+    match records.iter().find(|record| record.scenario_id == scenario_id) {
+        Some(record) => match record.source {
+            MeasurementSource::Measured => "Measured",
+            MeasurementSource::OperationalScore => "OperationalScore",
+        },
+        None => "-",
     }
 }

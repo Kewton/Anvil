@@ -1,9 +1,9 @@
 # Scorecard Template
 
-| Scenario | Axis | Anvil | vibe-local | Winner | Notes |
-| --- | --- | ---: | ---: | --- | --- |
-| Startup latency | FirstUseExperience | - | - | - | |
-| First prompt latency | IterationSpeed | - | - | - | |
-| Interrupt recovery score | StabilityAndRecovery | - | - | - | |
-| Long-session resume score | LongSessionUsability | - | - | - | |
-| UX clarity score | UxClarity | - | - | - | |
+| Scenario | Axis | Source | Anvil | vibe-local | Winner | Notes |
+| --- | --- | --- | ---: | ---: | --- | --- |
+| Startup latency | FirstUseExperience | Measured | - | - | - | |
+| First prompt latency | IterationSpeed | Measured or OperationalScore | - | - | - | |
+| Interrupt recovery score | StabilityAndRecovery | OperationalScore | - | - | - | |
+| Long-session resume score | LongSessionUsability | OperationalScore | - | - | - | |
+| UX clarity score | UxClarity | OperationalScore | - | - | - | |
