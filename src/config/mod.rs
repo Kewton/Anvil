@@ -10,6 +10,7 @@ use std::{
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     pub provider: String,
+    pub provider_url: String,
     pub model: String,
     pub sidecar_model: Option<String>,
     pub context_window: u32,
@@ -90,6 +91,7 @@ impl EffectiveConfig {
         Self {
             runtime: RuntimeConfig {
                 provider: "ollama".to_string(),
+                provider_url: "http://127.0.0.1:11434".to_string(),
                 model: "local-default".to_string(),
                 sidecar_model: None,
                 context_window: 200_000,
@@ -147,6 +149,7 @@ impl EffectiveConfig {
         for key in [
             "ANVIL_PROVIDER",
             "ANVIL_MODEL",
+            "ANVIL_PROVIDER_URL",
             "ANVIL_SIDECAR_MODEL",
             "ANVIL_CONTEXT_WINDOW",
             "ANVIL_INTERACTIVE",
@@ -175,6 +178,11 @@ impl EffectiveConfig {
                 "--model" => {
                     if let Some(value) = args.next() {
                         map.insert("ANVIL_MODEL".to_string(), value);
+                    }
+                }
+                "--provider-url" => {
+                    if let Some(value) = args.next() {
+                        map.insert("ANVIL_PROVIDER_URL".to_string(), value);
                     }
                 }
                 "--sidecar-model" => {
@@ -212,6 +220,7 @@ impl EffectiveConfig {
         for (key, value) in map {
             match key.as_str() {
                 "provider" | "ANVIL_PROVIDER" => self.runtime.provider = value.clone(),
+                "provider_url" | "ANVIL_PROVIDER_URL" => self.runtime.provider_url = value.clone(),
                 "model" | "ANVIL_MODEL" => self.runtime.model = value.clone(),
                 "sidecar_model" | "ANVIL_SIDECAR_MODEL" => {
                     self.runtime.sidecar_model = if value.is_empty() {

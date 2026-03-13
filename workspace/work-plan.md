@@ -64,11 +64,11 @@
 ## Phase 6: Add Real Runtime Integration
 
 - [x] Add provider request/response contracts and a fake-provider live-turn slice
-- [ ] Implement provider abstraction for local LLM backends
-- [ ] Implement Ollama-first backend
-- [ ] Implement basic agent loop
-- [ ] Implement message/context handoff between session and provider
-- [ ] Implement interruption and cancellation handling for live runtime
+- [x] Implement provider abstraction for local LLM backends
+- [x] Implement Ollama-first backend
+- [x] Implement basic agent loop
+- [x] Implement message/context handoff between session and provider
+- [x] Implement interruption and cancellation handling for live runtime
 
 ## Phase 7: Add the Typed Tool System
 

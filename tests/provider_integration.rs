@@ -2,8 +2,8 @@ mod common;
 
 use anvil::agent::{AgentEvent, AgentRuntime};
 use anvil::provider::{
-    OllamaChatMessage, OllamaProviderClient, ProviderClient, ProviderEvent, ProviderMessageRole,
-    ProviderTurnError, ProviderTurnRequest,
+    HttpTransport, OllamaChatMessage, OllamaProviderClient, ProviderClient, ProviderEvent,
+    ProviderMessageRole, ProviderTurnError, ProviderTurnRequest,
 };
 use anvil::tui::Tui;
 use std::cell::RefCell;
@@ -14,6 +14,30 @@ struct RecordingProvider {
     seen_requests: Rc<RefCell<Vec<ProviderTurnRequest>>>,
     events: Vec<ProviderEvent>,
     error: Option<ProviderTurnError>,
+}
+
+#[derive(Clone)]
+struct MockHttpTransport {
+    seen_authority: Rc<RefCell<Vec<String>>>,
+    seen_paths: Rc<RefCell<Vec<String>>>,
+    seen_bodies: Rc<RefCell<Vec<Vec<u8>>>>,
+    response: Vec<u8>,
+}
+
+impl HttpTransport for MockHttpTransport {
+    fn post_json(
+        &self,
+        authority: &str,
+        _host: &str,
+        _port: u16,
+        path: &str,
+        body: &[u8],
+    ) -> Result<Vec<u8>, ProviderTurnError> {
+        self.seen_authority.borrow_mut().push(authority.to_string());
+        self.seen_paths.borrow_mut().push(path.to_string());
+        self.seen_bodies.borrow_mut().push(body.to_vec());
+        Ok(self.response.clone())
+    }
 }
 
 impl ProviderClient for RecordingProvider {
@@ -118,7 +142,8 @@ fn ollama_provider_builds_chat_request_shape() {
         true,
     );
 
-    let ollama_request = OllamaProviderClient::build_chat_request(&request);
+    let ollama_request =
+        OllamaProviderClient::<anvil::provider::TcpHttpTransport>::build_chat_request(&request);
 
     assert_eq!(ollama_request.model, "local-default");
     assert!(ollama_request.stream);
@@ -310,4 +335,133 @@ fn live_turn_can_pause_for_provider_approval_and_resume() {
             .expect("done frame should exist")
             .contains("live approval resumed")
     );
+}
+
+#[test]
+fn ollama_provider_normalizes_ndjson_stream_to_provider_events() {
+    let chunks = vec![
+        r#"{"message":{"role":"assistant","content":"draft "},"done":false}"#.to_string(),
+        r#"{"message":{"role":"assistant","content":"answer"},"done":false}"#.to_string(),
+        r#"{"message":{"role":"assistant","content":""},"done":true}"#.to_string(),
+    ];
+
+    let events =
+        OllamaProviderClient::<anvil::provider::TcpHttpTransport>::normalize_stream_chunks(&chunks)
+            .expect("ollama stream should normalize");
+
+    assert_eq!(
+        events,
+        vec![
+            ProviderEvent::TokenDelta("draft ".to_string()),
+            ProviderEvent::TokenDelta("answer".to_string()),
+            ProviderEvent::Agent(AgentEvent::Done {
+                status: "Done. session saved".to_string(),
+                assistant_message: "draft answer".to_string(),
+                completion_summary: "Provider turn finished successfully.".to_string(),
+                saved_status: "session saved".to_string(),
+                tool_logs: Vec::new(),
+                elapsed_ms: 0,
+            }),
+        ]
+    );
+}
+
+#[test]
+fn ollama_provider_rejects_invalid_stream_chunk() {
+    let chunks = vec!["not-json".to_string()];
+
+    let err =
+        OllamaProviderClient::<anvil::provider::TcpHttpTransport>::normalize_stream_chunks(&chunks)
+            .expect_err("invalid ollama chunk should fail");
+
+    assert!(err.to_string().contains("invalid ollama response"));
+}
+
+#[test]
+fn ollama_provider_stream_turn_posts_chat_request_and_normalizes_chunked_response() {
+    let seen_authority = Rc::new(RefCell::new(Vec::new()));
+    let seen_paths = Rc::new(RefCell::new(Vec::new()));
+    let seen_bodies = Rc::new(RefCell::new(Vec::new()));
+    let body = concat!(
+        "{\"message\":{\"role\":\"assistant\",\"content\":\"draft \"},\"done\":false}\n",
+        "{\"message\":{\"role\":\"assistant\",\"content\":\"answer\"},\"done\":false}\n",
+        "{\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true}\n"
+    );
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n{:X}\r\n{}\r\n0\r\n\r\n",
+        body.len(),
+        body
+    )
+    .into_bytes();
+    let provider = OllamaProviderClient::with_transport(
+        "http://127.0.0.1:11434",
+        MockHttpTransport {
+            seen_authority: seen_authority.clone(),
+            seen_paths: seen_paths.clone(),
+            seen_bodies: seen_bodies.clone(),
+            response,
+        },
+    );
+    let request = ProviderTurnRequest::new(
+        "local-default".to_string(),
+        vec![anvil::provider::ProviderMessage::new(
+            ProviderMessageRole::User,
+            "inspect src/provider",
+        )],
+        true,
+    );
+    let mut events = Vec::new();
+
+    provider
+        .stream_turn(&request, &mut |event| events.push(event))
+        .expect("provider should normalize chunked response");
+    let bodies = seen_bodies.borrow();
+    let body_text = String::from_utf8(bodies[0].clone()).expect("body should be utf8");
+    assert_eq!(seen_authority.borrow().as_slice(), ["127.0.0.1:11434"]);
+    assert_eq!(seen_paths.borrow().as_slice(), ["/api/chat"]);
+    assert!(body_text.contains("\"model\":\"local-default\""));
+    assert!(body_text.contains("\"content\":\"inspect src/provider\""));
+
+    assert_eq!(
+        events,
+        vec![
+            ProviderEvent::TokenDelta("draft ".to_string()),
+            ProviderEvent::TokenDelta("answer".to_string()),
+            ProviderEvent::Agent(AgentEvent::Done {
+                status: "Done. session saved".to_string(),
+                assistant_message: "draft answer".to_string(),
+                completion_summary: "Provider turn finished successfully.".to_string(),
+                saved_status: "session saved".to_string(),
+                tool_logs: Vec::new(),
+                elapsed_ms: 0,
+            }),
+        ]
+    );
+}
+
+#[test]
+fn ollama_provider_surfaces_non_success_status_as_backend_error() {
+    let provider = OllamaProviderClient::with_transport(
+        "http://127.0.0.1:11434",
+        MockHttpTransport {
+            seen_authority: Rc::new(RefCell::new(Vec::new())),
+            seen_paths: Rc::new(RefCell::new(Vec::new())),
+            seen_bodies: Rc::new(RefCell::new(Vec::new())),
+            response: b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 11\r\nConnection: close\r\n\r\nollama down".to_vec(),
+        },
+    );
+    let request = ProviderTurnRequest::new(
+        "local-default".to_string(),
+        vec![anvil::provider::ProviderMessage::new(
+            ProviderMessageRole::User,
+            "inspect src/provider",
+        )],
+        true,
+    );
+    let err = provider
+        .stream_turn(&request, &mut |_event| {})
+        .expect_err("non-success status should fail");
+
+    assert!(err.to_string().contains("ollama request failed"));
+    assert!(err.to_string().contains("500"));
 }

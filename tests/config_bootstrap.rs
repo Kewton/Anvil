@@ -3,7 +3,7 @@ mod common;
 use anvil::config::EffectiveConfig;
 use anvil::config::ReasoningVisibility;
 use anvil::contracts::AppEvent;
-use anvil::provider::ProviderRuntimeContext;
+use anvil::provider::{ProviderRuntimeContext, build_local_provider_client};
 use std::collections::HashMap;
 
 #[test]
@@ -28,6 +28,7 @@ fn effective_config_derives_workspace_and_session_paths() {
     );
     assert!(config.mode.interactive);
     assert!(config.mode.approval_required);
+    assert_eq!(config.runtime.provider_url, "http://127.0.0.1:11434");
     assert_eq!(
         config.mode.reasoning_visibility,
         ReasoningVisibility::Summary
@@ -42,6 +43,18 @@ fn provider_runtime_context_bootstraps_capabilities() {
 
     assert!(provider.capabilities.streaming);
     assert!(provider.capabilities.tool_calling);
+}
+
+#[test]
+fn local_provider_client_builds_from_effective_config() {
+    let config = EffectiveConfig::load().expect("config should load");
+
+    let client = build_local_provider_client(&config).expect("provider client should build");
+
+    assert!(matches!(
+        client,
+        anvil::provider::LocalProviderClient::Ollama(_)
+    ));
 }
 
 #[test]

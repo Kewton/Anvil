@@ -1,10 +1,16 @@
 use crate::agent::AgentEvent;
 use crate::config::EffectiveConfig;
 use serde::{Deserialize, Serialize};
+use std::io::{Read, Write};
+use std::net::TcpStream;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderBackend {
     Ollama,
+}
+
+pub enum LocalProviderClient {
+    Ollama(OllamaProviderClient),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +117,19 @@ pub trait ProviderClient {
     ) -> Result<(), ProviderTurnError>;
 }
 
+pub trait HttpTransport {
+    fn post_json(
+        &self,
+        authority: &str,
+        host: &str,
+        port: u16,
+        path: &str,
+        body: &[u8],
+    ) -> Result<Vec<u8>, ProviderTurnError>;
+}
+
+pub struct TcpHttpTransport;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OllamaChatMessage {
     pub role: String,
@@ -124,9 +143,40 @@ pub struct OllamaChatRequest {
     pub stream: bool,
 }
 
-pub struct OllamaProviderClient;
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct OllamaChatChunk {
+    #[serde(default)]
+    message: Option<OllamaChatMessage>,
+    #[serde(default)]
+    done: bool,
+}
+
+pub struct OllamaProviderClient<T = TcpHttpTransport> {
+    base_url: String,
+    transport: T,
+}
 
 impl OllamaProviderClient {
+    pub fn new(base_url: impl Into<String>) -> Self {
+        Self {
+            base_url: base_url.into(),
+            transport: TcpHttpTransport,
+        }
+    }
+
+    pub fn from_config(config: &EffectiveConfig) -> Self {
+        Self::new(config.runtime.provider_url.clone())
+    }
+}
+
+impl<T> OllamaProviderClient<T> {
+    pub fn with_transport(base_url: impl Into<String>, transport: T) -> Self {
+        Self {
+            base_url: base_url.into(),
+            transport,
+        }
+    }
+
     pub fn build_chat_request(request: &ProviderTurnRequest) -> OllamaChatRequest {
         OllamaChatRequest {
             model: request.model.clone(),
@@ -145,6 +195,114 @@ impl OllamaProviderClient {
                 .collect(),
             stream: request.stream,
         }
+    }
+
+    pub fn normalize_stream_chunks(
+        chunks: &[String],
+    ) -> Result<Vec<ProviderEvent>, ProviderTurnError> {
+        let mut events = Vec::new();
+        let mut assistant_output = String::new();
+
+        for chunk in chunks {
+            let parsed: OllamaChatChunk = serde_json::from_str(chunk).map_err(|err| {
+                ProviderTurnError::Backend(format!("invalid ollama response: {err}"))
+            })?;
+
+            if let Some(message) = parsed.message {
+                if !message.content.is_empty() {
+                    assistant_output.push_str(&message.content);
+                    events.push(ProviderEvent::TokenDelta(message.content));
+                }
+            }
+
+            if parsed.done {
+                events.push(ProviderEvent::Agent(AgentEvent::Done {
+                    status: "Done. session saved".to_string(),
+                    assistant_message: assistant_output.clone(),
+                    completion_summary: "Provider turn finished successfully.".to_string(),
+                    saved_status: "session saved".to_string(),
+                    tool_logs: Vec::new(),
+                    elapsed_ms: 0,
+                }));
+            }
+        }
+
+        Ok(events)
+    }
+}
+
+impl<T: HttpTransport> OllamaProviderClient<T> {
+    fn send_chat_request(
+        &self,
+        request: &ProviderTurnRequest,
+    ) -> Result<Vec<String>, ProviderTurnError> {
+        let endpoint = parse_http_base_url(&self.base_url)?;
+        let chat_request = Self::build_chat_request(request);
+        let request_body = serde_json::to_vec(&chat_request).map_err(|err| {
+            ProviderTurnError::Backend(format!("failed to encode ollama request: {err}"))
+        })?;
+        let request_path = format!("{}/api/chat", endpoint.path_prefix);
+
+        let response = self.transport.post_json(
+            &endpoint.authority,
+            &endpoint.host,
+            endpoint.port,
+            &request_path,
+            &request_body,
+        )?;
+        decode_ollama_response(&response)
+    }
+}
+
+impl Default for OllamaProviderClient {
+    fn default() -> Self {
+        Self::new("http://127.0.0.1:11434")
+    }
+}
+
+impl<T: HttpTransport> ProviderClient for OllamaProviderClient<T> {
+    fn stream_turn(
+        &self,
+        request: &ProviderTurnRequest,
+        emit: &mut dyn FnMut(ProviderEvent),
+    ) -> Result<(), ProviderTurnError> {
+        let chunks = self.send_chat_request(request)?;
+        for event in Self::normalize_stream_chunks(&chunks)? {
+            emit(event);
+        }
+        Ok(())
+    }
+}
+
+impl HttpTransport for TcpHttpTransport {
+    fn post_json(
+        &self,
+        authority: &str,
+        host: &str,
+        port: u16,
+        path: &str,
+        body: &[u8],
+    ) -> Result<Vec<u8>, ProviderTurnError> {
+        let mut stream = TcpStream::connect((host, port)).map_err(|err| {
+            ProviderTurnError::Backend(format!("failed to connect to ollama: {err}"))
+        })?;
+        let http_request = format!(
+            "POST {path} HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream
+            .write_all(http_request.as_bytes())
+            .and_then(|_| stream.write_all(body))
+            .map_err(|err| {
+                ProviderTurnError::Backend(format!("failed to send ollama request: {err}"))
+            })?;
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).map_err(|err| {
+            ProviderTurnError::Backend(format!("failed to read ollama response: {err}"))
+        })?;
+        Ok(response)
     }
 }
 
@@ -190,4 +348,155 @@ impl ProviderRuntimeContext {
             capabilities,
         })
     }
+}
+
+impl ProviderClient for LocalProviderClient {
+    fn stream_turn(
+        &self,
+        request: &ProviderTurnRequest,
+        emit: &mut dyn FnMut(ProviderEvent),
+    ) -> Result<(), ProviderTurnError> {
+        match self {
+            Self::Ollama(client) => client.stream_turn(request, emit),
+        }
+    }
+}
+
+pub fn build_local_provider_client(
+    config: &EffectiveConfig,
+) -> Result<LocalProviderClient, ProviderBootstrapError> {
+    match config.runtime.provider.as_str() {
+        "ollama" => Ok(LocalProviderClient::Ollama(
+            OllamaProviderClient::from_config(config),
+        )),
+        other => Err(ProviderBootstrapError::UnsupportedBackend(
+            other.to_string(),
+        )),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedHttpEndpoint {
+    authority: String,
+    host: String,
+    port: u16,
+    path_prefix: String,
+}
+
+fn parse_http_base_url(base_url: &str) -> Result<ParsedHttpEndpoint, ProviderTurnError> {
+    let without_scheme = base_url.strip_prefix("http://").ok_or_else(|| {
+        ProviderTurnError::Backend("ollama base url must use http://".to_string())
+    })?;
+    let (authority, path) = match without_scheme.split_once('/') {
+        Some((authority, path)) => (authority, format!("/{}", path.trim_matches('/'))),
+        None => (without_scheme, String::new()),
+    };
+
+    let (host, port) = match authority.split_once(':') {
+        Some((host, port)) => {
+            let port = port.parse::<u16>().map_err(|_| {
+                ProviderTurnError::Backend(format!("invalid ollama port in base url: {base_url}"))
+            })?;
+            (host.to_string(), port)
+        }
+        None => (authority.to_string(), 80),
+    };
+
+    Ok(ParsedHttpEndpoint {
+        authority: authority.to_string(),
+        host,
+        port,
+        path_prefix: path,
+    })
+}
+
+fn decode_ollama_response(response: &[u8]) -> Result<Vec<String>, ProviderTurnError> {
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| ProviderTurnError::Backend("invalid ollama response headers".to_string()))?;
+    let headers = &response[..header_end];
+    let body = &response[header_end + 4..];
+    let headers_text = String::from_utf8_lossy(headers);
+    let mut header_lines = headers_text.lines();
+    let status_line = header_lines
+        .next()
+        .ok_or_else(|| ProviderTurnError::Backend("missing ollama status line".to_string()))?;
+    let status_code = status_line
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| ProviderTurnError::Backend("invalid ollama status line".to_string()))?;
+    if status_code != "200" {
+        let response_body = String::from_utf8_lossy(body);
+        return Err(ProviderTurnError::Backend(format!(
+            "ollama request failed with status {status_code}: {}",
+            response_body.trim()
+        )));
+    }
+
+    let is_chunked = header_lines.any(|line| {
+        let lower = line.to_ascii_lowercase();
+        lower.starts_with("transfer-encoding:") && lower.contains("chunked")
+    });
+
+    let decoded_body = if is_chunked {
+        decode_chunked_body(body)?
+    } else {
+        body.to_vec()
+    };
+
+    Ok(String::from_utf8_lossy(&decoded_body)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect())
+}
+
+fn decode_chunked_body(body: &[u8]) -> Result<Vec<u8>, ProviderTurnError> {
+    let mut decoded = Vec::new();
+    let mut cursor = 0usize;
+
+    while cursor < body.len() {
+        let line_end = find_crlf(body, cursor).ok_or_else(|| {
+            ProviderTurnError::Backend("invalid chunked ollama response".to_string())
+        })?;
+        let size_text = String::from_utf8_lossy(&body[cursor..line_end]);
+        let size = usize::from_str_radix(size_text.trim(), 16).map_err(|_| {
+            ProviderTurnError::Backend("invalid chunk size in ollama response".to_string())
+        })?;
+        cursor = line_end + 2;
+
+        if size == 0 {
+            break;
+        }
+
+        let chunk_end = cursor.checked_add(size).ok_or_else(|| {
+            ProviderTurnError::Backend("overflow in ollama chunk size".to_string())
+        })?;
+        if chunk_end > body.len() {
+            return Err(ProviderTurnError::Backend(
+                "truncated ollama chunked response".to_string(),
+            ));
+        }
+
+        decoded.extend_from_slice(&body[cursor..chunk_end]);
+        cursor = chunk_end;
+
+        if body.get(cursor..cursor + 2) != Some(b"\r\n") {
+            return Err(ProviderTurnError::Backend(
+                "missing chunk terminator in ollama response".to_string(),
+            ));
+        }
+        cursor += 2;
+    }
+
+    Ok(decoded)
+}
+
+fn find_crlf(body: &[u8], start: usize) -> Option<usize> {
+    body[start..]
+        .windows(2)
+        .position(|window| window == b"\r\n")
+        .map(|offset| start + offset)
 }
