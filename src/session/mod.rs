@@ -3,6 +3,7 @@ use crate::config::EffectiveConfig;
 use crate::contracts::{
     AppEvent, AppStateSnapshot, ConsoleMessageRole, ConsoleMessageView, ConsoleRenderContext,
 };
+use crate::provider::ProviderErrorRecord;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::fmt::{Display, Formatter};
@@ -84,6 +85,8 @@ pub struct SessionRecord {
     pub event_log: Vec<AppEvent>,
     #[serde(default)]
     pub pending_turn: Option<PendingTurnState>,
+    #[serde(default)]
+    pub provider_errors: Vec<ProviderErrorRecord>,
 }
 
 impl SessionRecord {
@@ -101,6 +104,7 @@ impl SessionRecord {
             session_event: None,
             event_log: Vec::new(),
             pending_turn: None,
+            provider_errors: Vec::new(),
         }
     }
 
@@ -214,6 +218,11 @@ impl SessionRecord {
 
     pub fn has_pending_turn(&self) -> bool {
         self.pending_turn.is_some()
+    }
+
+    pub fn push_provider_error(&mut self, provider_error: ProviderErrorRecord) {
+        self.provider_errors.push(provider_error);
+        self.touch();
     }
 
     fn touch(&mut self) {

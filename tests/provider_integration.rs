@@ -1,6 +1,6 @@
 mod common;
 
-use anvil::agent::AgentEvent;
+use anvil::agent::{AgentEvent, AgentRuntime};
 use anvil::provider::{
     OllamaChatMessage, OllamaProviderClient, ProviderClient, ProviderEvent, ProviderMessageRole,
     ProviderTurnError, ProviderTurnRequest,
@@ -155,6 +155,30 @@ fn basic_agent_loop_applies_context_shaping_limit() {
 }
 
 #[test]
+fn basic_agent_loop_derives_context_budget_from_context_window() {
+    let mut app = common::build_app();
+    for index in 0..20 {
+        app.record_user_input(format!("msg_u_{index:02}"), "1234567890".repeat(50))
+            .expect("persist");
+    }
+
+    let small = anvil::agent::BasicAgentLoop::build_turn_request(
+        "local-default",
+        app.session(),
+        true,
+        1_000,
+    );
+    let large = anvil::agent::BasicAgentLoop::build_turn_request(
+        "local-default",
+        app.session(),
+        true,
+        200_000,
+    );
+
+    assert!(small.messages.len() < large.messages.len());
+}
+
+#[test]
 fn live_turn_records_provider_backend_error_detail_in_session() {
     let mut app = common::build_app();
     let tui = Tui::new();
@@ -180,10 +204,110 @@ fn live_turn_records_provider_backend_error_detail_in_session() {
     );
     assert!(
         app.session()
-            .messages
+            .provider_errors
             .last()
             .expect("provider detail should exist")
-            .content
+            .message
             .contains("socket closed")
+    );
+}
+
+#[test]
+fn live_turn_surfaces_token_delta_progress() {
+    let mut app = common::build_app();
+    let tui = Tui::new();
+    let provider = RecordingProvider {
+        seen_requests: Rc::new(RefCell::new(Vec::new())),
+        events: vec![
+            ProviderEvent::TokenDelta("drafting ".to_string()),
+            ProviderEvent::TokenDelta("response".to_string()),
+            ProviderEvent::Agent(AgentEvent::Done {
+                status: "Done. session saved".to_string(),
+                assistant_message: "stream finished".to_string(),
+                completion_summary: "Streaming completed.".to_string(),
+                saved_status: "session saved".to_string(),
+                tool_logs: Vec::new(),
+                elapsed_ms: 90,
+            }),
+        ],
+        error: None,
+    };
+
+    let frames = app
+        .run_live_turn("stream this", &provider, &tui)
+        .expect("live turn should succeed");
+
+    assert!(
+        frames
+            .iter()
+            .any(|frame| frame.contains("drafting response"))
+    );
+}
+
+#[test]
+fn live_turn_can_pause_for_provider_approval_and_resume() {
+    let mut app = common::build_app();
+    let tui = Tui::new();
+    let provider = RecordingProvider {
+        seen_requests: Rc::new(RefCell::new(Vec::new())),
+        events: vec![
+            ProviderEvent::Agent(AgentEvent::Thinking {
+                status: "Thinking. model=local-default".to_string(),
+                plan_items: vec!["prepare write".to_string()],
+                active_index: Some(0),
+                reasoning_summary: vec!["approval needed".to_string()],
+                elapsed_ms: 40,
+            }),
+            ProviderEvent::Agent(AgentEvent::ApprovalRequested {
+                status: "Awaiting approval for 1 tool call".to_string(),
+                tool_name: "Write".to_string(),
+                summary: "Update src/provider/mod.rs".to_string(),
+                risk: "Confirm".to_string(),
+                tool_call_id: "call_live_001".to_string(),
+                elapsed_ms: 70,
+            }),
+            ProviderEvent::Agent(AgentEvent::Working {
+                status: "Working on approved tool execution".to_string(),
+                plan_items: vec!["prepare write".to_string()],
+                active_index: Some(0),
+                tool_logs: vec![(
+                    "Write".to_string(),
+                    "update".to_string(),
+                    "src/provider/mod.rs".to_string(),
+                )],
+                elapsed_ms: 90,
+            }),
+            ProviderEvent::Agent(AgentEvent::Done {
+                status: "Done. session saved".to_string(),
+                assistant_message: "live approval resumed".to_string(),
+                completion_summary: "Approval flow completed.".to_string(),
+                saved_status: "session saved".to_string(),
+                tool_logs: Vec::new(),
+                elapsed_ms: 120,
+            }),
+        ],
+        error: None,
+    };
+
+    let frames = app
+        .run_live_turn("approve this", &provider, &tui)
+        .expect("provider-backed approval should pause");
+
+    assert!(app.has_pending_runtime_events());
+    assert!(
+        frames
+            .iter()
+            .any(|frame| frame.contains("[A] anvil > approval"))
+    );
+
+    let resumed = app
+        .approve_and_continue(&AgentRuntime::new(), &tui)
+        .expect("approval should resume");
+
+    assert!(
+        resumed
+            .last()
+            .expect("done frame should exist")
+            .contains("live approval resumed")
     );
 }

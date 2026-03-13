@@ -80,6 +80,18 @@ pub enum ProviderTurnError {
     Backend(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProviderErrorKind {
+    Cancelled,
+    Backend,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderErrorRecord {
+    pub kind: ProviderErrorKind,
+    pub message: String,
+}
+
 impl std::fmt::Display for ProviderTurnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
