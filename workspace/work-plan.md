@@ -81,13 +81,13 @@
 
 ## Phase 8: Reach the First Useful Version
 
-- [ ] Support startup and interactive prompt
-- [ ] Support user input -> agent output flow
-- [ ] Support tool execution display
-- [ ] Support follow-up instructions in one session
-- [ ] Support session save and resume
-- [ ] Implement slash command framework
-- [ ] Reach a usable local-first CLI prototype
+- [x] Support startup and interactive prompt
+- [x] Support user input -> agent output flow
+- [x] Support tool execution display
+- [x] Support follow-up instructions in one session
+- [x] Support session save and resume
+- [x] Implement slash command framework
+- [x] Reach a usable local-first CLI prototype
 
 ## Phase 9: Competitive Validation
 

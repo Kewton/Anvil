@@ -1,8 +1,8 @@
 use anvil::tooling::{
     ExecutionClass, ParallelExecutionPlan, ParallelExecutionPlanError, PermissionClass,
     PlanModePolicy, RollbackPolicy, ToolCallRequest, ToolExecutionError, ToolExecutionPayload,
-    ToolExecutionResult, ToolExecutionStatus, ToolInput, ToolKind, ToolRegistry,
-    ToolValidationError,
+    ToolExecutionPolicy, ToolExecutionResult, ToolExecutionStatus, ToolInput, ToolKind,
+    ToolRegistry, ToolValidationError,
 };
 
 fn build_registry() -> ToolRegistry {
@@ -51,9 +51,11 @@ fn registry_exposes_explicit_execution_and_permission_policy() {
     let read_spec = registry.get("file.read").expect("read spec should exist");
     let write_spec = registry.get("file.write").expect("write spec should exist");
 
+    assert_eq!(read_spec.version, 1);
     assert_eq!(read_spec.execution_class, ExecutionClass::ReadOnly);
     assert_eq!(read_spec.permission_class, PermissionClass::Safe);
     assert_eq!(read_spec.plan_mode, PlanModePolicy::Allowed);
+    assert_eq!(write_spec.version, 1);
     assert_eq!(write_spec.execution_class, ExecutionClass::Mutating);
     assert_eq!(write_spec.permission_class, PermissionClass::Confirm);
     assert_eq!(write_spec.plan_mode, PlanModePolicy::AllowedWithScope);
@@ -126,13 +128,21 @@ fn parallel_execution_plan_only_accepts_parallel_safe_and_approved_calls() {
         ))
         .expect("write should validate");
 
-    let plan = ParallelExecutionPlan::build(vec![read_a.clone(), read_b.clone()], true)
-        .expect("parallel-safe approved calls should build");
-    let denied_for_permission =
-        ParallelExecutionPlan::build(vec![read_a.clone(), write.clone()], true)
-            .expect_err("confirm tool should not enter parallel plan before individual approval");
-    let denied_for_mode = ParallelExecutionPlan::build(vec![read_a, write.approve()], true)
-        .expect_err("sequential-only tool should not enter parallel-safe batch");
+    let plan = ParallelExecutionPlan::build(
+        vec![read_a.clone(), read_b.clone()],
+        ToolExecutionPolicy::default(),
+    )
+    .expect("parallel-safe approved calls should build");
+    let denied_for_permission = ParallelExecutionPlan::build(
+        vec![read_a.clone(), write.clone()],
+        ToolExecutionPolicy::default(),
+    )
+    .expect_err("confirm tool should not enter parallel plan before individual approval");
+    let denied_for_mode = ParallelExecutionPlan::build(
+        vec![read_a, write.approve()],
+        ToolExecutionPolicy::default(),
+    )
+    .expect_err("sequential-only tool should not enter parallel-safe batch");
 
     assert_eq!(plan.calls.len(), 2);
     assert_eq!(
@@ -178,7 +188,7 @@ fn validated_tool_call_builds_typed_execution_request_and_result() {
         ))
         .expect("read should validate");
     let execution = read
-        .into_execution_request(true)
+        .into_execution_request(ToolExecutionPolicy::default())
         .expect("safe tool should become execution request");
     let result = ToolExecutionResult {
         tool_call_id: execution.tool_call_id.clone(),
@@ -209,11 +219,148 @@ fn restricted_tool_is_blocked_before_execution() {
         .expect("shell should validate");
 
     let err = shell
-        .into_execution_request(true)
+        .into_execution_request(ToolExecutionPolicy::default())
         .expect_err("restricted tool should be blocked");
 
     assert_eq!(
         err,
         ToolExecutionError::RestrictedTool("shell.exec".to_string())
     );
+}
+
+#[test]
+fn restricted_tool_can_be_allowed_by_explicit_policy_override() {
+    let registry = build_registry();
+    let shell = registry
+        .validate(ToolCallRequest::new(
+            "call_shell_001",
+            "shell.exec",
+            ToolInput::ShellExec {
+                command: "git status".to_string(),
+            },
+        ))
+        .expect("shell should validate")
+        .approve();
+
+    let execution = shell
+        .into_execution_request(ToolExecutionPolicy {
+            allow_restricted: true,
+            ..ToolExecutionPolicy::default()
+        })
+        .expect("policy should allow restricted tool");
+
+    assert_eq!(execution.spec.kind, ToolKind::ShellExec);
+}
+
+#[test]
+fn plan_mode_policy_is_enforced_for_blocked_and_scoped_tools() {
+    let registry = build_registry();
+    let write = registry
+        .validate(ToolCallRequest::new(
+            "call_write_001",
+            "file.write",
+            ToolInput::FileWrite {
+                path: "src/app/mod.rs".to_string(),
+                content: "updated".to_string(),
+            },
+        ))
+        .expect("write should validate")
+        .approve();
+    let shell = registry
+        .validate(ToolCallRequest::new(
+            "call_shell_001",
+            "shell.exec",
+            ToolInput::ShellExec {
+                command: "git status".to_string(),
+            },
+        ))
+        .expect("shell should validate")
+        .approve();
+
+    let write_err = write
+        .clone()
+        .into_execution_request(ToolExecutionPolicy {
+            plan_mode: true,
+            allow_restricted: false,
+            plan_scope_granted: false,
+            approval_required: true,
+        })
+        .expect_err("scoped plan-mode tool should require explicit scope");
+    let shell_err = shell
+        .into_execution_request(ToolExecutionPolicy {
+            plan_mode: true,
+            allow_restricted: true,
+            plan_scope_granted: true,
+            approval_required: true,
+        })
+        .expect_err("blocked plan-mode tool should be denied");
+    let write_ok = write
+        .into_execution_request(ToolExecutionPolicy {
+            plan_mode: true,
+            allow_restricted: false,
+            plan_scope_granted: true,
+            approval_required: true,
+        })
+        .expect("scoped plan-mode tool should pass when scope is granted");
+
+    assert_eq!(
+        write_err,
+        ToolExecutionError::PlanModeScopeRequired("file.write".to_string())
+    );
+    assert_eq!(
+        shell_err,
+        ToolExecutionError::PlanModeBlocked("shell.exec".to_string())
+    );
+    assert_eq!(write_ok.spec.kind, ToolKind::FileWrite);
+}
+
+#[test]
+fn validation_reports_missing_required_field_details() {
+    let registry = build_registry();
+    let missing_path = registry
+        .validate(ToolCallRequest::new(
+            "call_read_001",
+            "file.read",
+            ToolInput::FileRead {
+                path: "".to_string(),
+            },
+        ))
+        .expect_err("empty path should be rejected");
+    let missing_pattern = registry
+        .validate(ToolCallRequest::new(
+            "call_search_001",
+            "file.search",
+            ToolInput::FileSearch {
+                root: "src".to_string(),
+                pattern: " ".to_string(),
+            },
+        ))
+        .expect_err("empty pattern should be rejected");
+
+    assert_eq!(
+        missing_path,
+        ToolValidationError::MissingRequiredField("path".to_string())
+    );
+    assert_eq!(
+        missing_pattern,
+        ToolValidationError::MissingRequiredField("pattern".to_string())
+    );
+}
+
+#[test]
+fn tool_execution_result_can_bridge_into_console_tool_log_view() {
+    let result = ToolExecutionResult {
+        tool_call_id: "call_read_001".to_string(),
+        tool_name: "file.read".to_string(),
+        status: ToolExecutionStatus::Completed,
+        summary: "Read src/app/mod.rs".to_string(),
+        payload: ToolExecutionPayload::Text("mod app".to_string()),
+        artifacts: vec!["src/app/mod.rs".to_string()],
+        elapsed_ms: 12,
+    };
+    let log = result.to_tool_log_view();
+
+    assert_eq!(log.tool_name, "file.read");
+    assert_eq!(log.action, "completed");
+    assert_eq!(log.target, "Read src/app/mod.rs");
 }

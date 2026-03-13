@@ -1,3 +1,4 @@
+use crate::contracts::ToolLogView;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +85,7 @@ impl ToolCallRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolSpec {
+    pub version: u32,
     pub name: String,
     pub kind: ToolKind,
     pub execution_class: ExecutionClass,
@@ -91,6 +93,25 @@ pub struct ToolSpec {
     pub execution_mode: ExecutionMode,
     pub plan_mode: PlanModePolicy,
     pub rollback_policy: RollbackPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolExecutionPolicy {
+    pub approval_required: bool,
+    pub allow_restricted: bool,
+    pub plan_mode: bool,
+    pub plan_scope_granted: bool,
+}
+
+impl Default for ToolExecutionPolicy {
+    fn default() -> Self {
+        Self {
+            approval_required: true,
+            allow_restricted: false,
+            plan_mode: false,
+            plan_scope_granted: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,13 +149,28 @@ impl ValidatedToolCall {
 
     pub fn into_execution_request(
         self,
-        approval_mode: bool,
+        policy: ToolExecutionPolicy,
     ) -> Result<ToolExecutionRequest, ToolExecutionError> {
-        if self.spec.permission_class == PermissionClass::Restricted {
+        if policy.plan_mode {
+            match self.spec.plan_mode {
+                PlanModePolicy::Allowed => {}
+                PlanModePolicy::AllowedWithScope if policy.plan_scope_granted => {}
+                PlanModePolicy::AllowedWithScope => {
+                    return Err(ToolExecutionError::PlanModeScopeRequired(
+                        self.spec.name.clone(),
+                    ));
+                }
+                PlanModePolicy::Blocked => {
+                    return Err(ToolExecutionError::PlanModeBlocked(self.spec.name.clone()));
+                }
+            }
+        }
+
+        if self.spec.permission_class == PermissionClass::Restricted && !policy.allow_restricted {
             return Err(ToolExecutionError::RestrictedTool(self.spec.name.clone()));
         }
 
-        if self.approval_required(approval_mode).is_some() && !self.approved {
+        if self.approval_required(policy.approval_required).is_some() && !self.approved {
             return Err(ToolExecutionError::ApprovalRequired(
                 self.request.tool_call_id.clone(),
             ));
@@ -180,16 +216,35 @@ pub struct ToolExecutionResult {
     pub elapsed_ms: u128,
 }
 
+impl ToolExecutionResult {
+    pub fn to_tool_log_view(&self) -> ToolLogView {
+        let action = match self.status {
+            ToolExecutionStatus::Completed => "completed",
+            ToolExecutionStatus::Failed => "failed",
+            ToolExecutionStatus::Interrupted => "interrupted",
+        };
+
+        ToolLogView {
+            tool_name: self.tool_name.clone(),
+            action: action.to_string(),
+            target: self.summary.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolExecutionError {
     ApprovalRequired(String),
     RestrictedTool(String),
+    PlanModeBlocked(String),
+    PlanModeScopeRequired(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolValidationError {
     UnknownTool,
     InputKindMismatch,
+    MissingRequiredField(String),
 }
 
 #[derive(Debug, Default)]
@@ -214,6 +269,7 @@ impl ToolRegistry {
 
     pub fn register_file_read(&mut self) {
         self.register(ToolSpec {
+            version: 1,
             name: "file.read".to_string(),
             kind: ToolKind::FileRead,
             execution_class: ExecutionClass::ReadOnly,
@@ -226,6 +282,7 @@ impl ToolRegistry {
 
     pub fn register_file_write(&mut self) {
         self.register(ToolSpec {
+            version: 1,
             name: "file.write".to_string(),
             kind: ToolKind::FileWrite,
             execution_class: ExecutionClass::Mutating,
@@ -238,6 +295,7 @@ impl ToolRegistry {
 
     pub fn register_file_search(&mut self) {
         self.register(ToolSpec {
+            version: 1,
             name: "file.search".to_string(),
             kind: ToolKind::FileSearch,
             execution_class: ExecutionClass::ReadOnly,
@@ -250,6 +308,7 @@ impl ToolRegistry {
 
     pub fn register_shell_exec(&mut self) {
         self.register(ToolSpec {
+            version: 1,
             name: "shell.exec".to_string(),
             kind: ToolKind::ShellExec,
             execution_class: ExecutionClass::Interactive,
@@ -274,6 +333,8 @@ impl ToolRegistry {
             return Err(ToolValidationError::InputKindMismatch);
         }
 
+        validate_required_fields(&request.input)?;
+
         Ok(ValidatedToolCall {
             spec,
             request,
@@ -296,10 +357,10 @@ pub enum ParallelExecutionPlanError {
 impl ParallelExecutionPlan {
     pub fn build(
         calls: Vec<ValidatedToolCall>,
-        approval_mode: bool,
+        policy: ToolExecutionPolicy,
     ) -> Result<Self, ParallelExecutionPlanError> {
         for call in &calls {
-            if approval_mode
+            if policy.approval_required
                 && call.spec.permission_class != PermissionClass::Safe
                 && !call.approved
             {
@@ -317,4 +378,49 @@ impl ParallelExecutionPlan {
 
         Ok(Self { calls })
     }
+}
+
+fn validate_required_fields(input: &ToolInput) -> Result<(), ToolValidationError> {
+    match input {
+        ToolInput::FileRead { path } => {
+            if path.trim().is_empty() {
+                return Err(ToolValidationError::MissingRequiredField(
+                    "path".to_string(),
+                ));
+            }
+        }
+        ToolInput::FileWrite { path, content } => {
+            if path.trim().is_empty() {
+                return Err(ToolValidationError::MissingRequiredField(
+                    "path".to_string(),
+                ));
+            }
+            if content.trim().is_empty() {
+                return Err(ToolValidationError::MissingRequiredField(
+                    "content".to_string(),
+                ));
+            }
+        }
+        ToolInput::FileSearch { root, pattern } => {
+            if root.trim().is_empty() {
+                return Err(ToolValidationError::MissingRequiredField(
+                    "root".to_string(),
+                ));
+            }
+            if pattern.trim().is_empty() {
+                return Err(ToolValidationError::MissingRequiredField(
+                    "pattern".to_string(),
+                ));
+            }
+        }
+        ToolInput::ShellExec { command } => {
+            if command.trim().is_empty() {
+                return Err(ToolValidationError::MissingRequiredField(
+                    "command".to_string(),
+                ));
+            }
+        }
+    }
+
+    Ok(())
 }

@@ -102,9 +102,25 @@ impl StateMachine {
                 StateTransition::Finish,
                 RuntimeState::Done
             ) | (
+                RuntimeState::Done,
+                StateTransition::StartThinking,
+                RuntimeState::Thinking
+            ) | (
+                RuntimeState::Error,
+                StateTransition::StartThinking,
+                RuntimeState::Thinking
+            ) | (
+                RuntimeState::Interrupted,
+                StateTransition::StartThinking,
+                RuntimeState::Thinking
+            ) | (
                 RuntimeState::AwaitingApproval,
                 StateTransition::StartWorking,
                 RuntimeState::Working
+            ) | (
+                RuntimeState::AwaitingApproval,
+                StateTransition::Finish,
+                RuntimeState::Done
             ) | (
                 RuntimeState::AwaitingApproval,
                 StateTransition::ResetToReady,
