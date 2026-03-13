@@ -62,6 +62,12 @@ impl AgentRuntimeScript {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingTurnState {
+    pub waiting_tool_call_id: String,
+    pub remaining_events: Vec<AgentEvent>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentRuntime {
     script: AgentRuntimeScript,

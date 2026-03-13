@@ -1,5 +1,6 @@
 mod common;
 
+use anvil::app::mock::MockAppExt;
 use anvil::provider::ProviderRuntimeContext;
 use anvil::tui::Tui;
 

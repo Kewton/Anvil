@@ -1,4 +1,6 @@
-use crate::agent::{AgentEvent, AgentRuntime};
+pub mod mock;
+
+use crate::agent::{AgentEvent, AgentRuntime, PendingTurnState};
 use crate::config::EffectiveConfig;
 use crate::contracts::{
     AppEvent, AppStateSnapshot, ConsoleRenderContext, RuntimeState, ToolLogView,
@@ -20,7 +22,7 @@ pub struct App {
     state_machine: StateMachine,
     session_store: SessionStore,
     session: SessionRecord,
-    pending_runtime_events: Vec<AgentEvent>,
+    pending_turn: Option<PendingTurnState>,
 }
 
 #[derive(Debug)]
@@ -30,6 +32,7 @@ pub enum AppError {
     Session(SessionError),
     StateTransition(crate::state::StateTransitionError),
     NoPendingApproval,
+    PendingApprovalRequired,
 }
 
 impl Display for AppError {
@@ -40,6 +43,9 @@ impl Display for AppError {
             Self::Session(err) => write!(f, "{err}"),
             Self::StateTransition(err) => write!(f, "{err}"),
             Self::NoPendingApproval => write!(f, "no pending approval to continue"),
+            Self::PendingApprovalRequired => {
+                write!(f, "resolve the pending approval before starting a new turn")
+            }
         }
     }
 }
@@ -87,7 +93,7 @@ impl App {
             provider,
             state_machine: StateMachine::from_snapshot(initial_state_snapshot),
             session_store,
-            pending_runtime_events: session.pending_runtime_events.clone(),
+            pending_turn: session.pending_turn.clone(),
             session,
         })
     }
@@ -123,6 +129,14 @@ impl App {
 
     pub fn session_store(&self) -> &SessionStore {
         &self.session_store
+    }
+
+    pub(crate) fn config(&self) -> &EffectiveConfig {
+        &self.config
+    }
+
+    pub(crate) fn session_mut(&mut self) -> &mut SessionRecord {
+        &mut self.session
     }
 
     pub fn render_console(&self, tui: &Tui) -> Result<String, AppError> {
@@ -168,8 +182,10 @@ impl App {
         runtime: &AgentRuntime,
         tui: &Tui,
     ) -> Result<Vec<String>, AppError> {
+        if self.pending_turn.is_some() {
+            return Err(AppError::PendingApprovalRequired);
+        }
         let user_input = user_input.into();
-        self.clear_pending_runtime_events()?;
         self.record_user_input(self.next_message_id("user"), user_input)?;
         self.execute_runtime_events(runtime.events(), tui)
     }
@@ -179,27 +195,27 @@ impl App {
         _runtime: &AgentRuntime,
         tui: &Tui,
     ) -> Result<Vec<String>, AppError> {
-        if self.pending_runtime_events.is_empty() {
+        let Some(pending_turn) = self.pending_turn.clone() else {
             return Err(AppError::NoPendingApproval);
-        }
+        };
 
-        let remaining = std::mem::take(&mut self.pending_runtime_events);
-        self.clear_pending_runtime_events()?;
-        self.execute_runtime_events(&remaining, tui)
+        self.clear_pending_turn()?;
+        self.execute_runtime_events(&pending_turn.remaining_events, tui)
     }
 
     pub fn deny_and_abort(&mut self, tui: &Tui) -> Result<Vec<String>, AppError> {
-        if self.pending_runtime_events.is_empty() {
+        if self.pending_turn.is_none() {
             return Err(AppError::NoPendingApproval);
         }
 
-        self.clear_pending_runtime_events()?;
+        self.clear_pending_turn()?;
         self.record_assistant_output(
             self.next_message_id("assistant"),
             "Approval denied. No tool was executed.",
         )?;
         let snapshot = AppStateSnapshot::new(RuntimeState::Ready)
             .with_status("Approval denied. Ready for the next task".to_string())
+            .with_completion_summary("Approval denied. No tool was executed.", "no changes made")
             .with_context_usage(
                 self.session.estimated_token_count(),
                 self.config.runtime.context_window,
@@ -209,7 +225,7 @@ impl App {
     }
 
     pub fn reset_to_ready(&mut self) -> Result<AppStateSnapshot, AppError> {
-        self.clear_pending_runtime_events()?;
+        self.clear_pending_turn()?;
         let snapshot = AppStateSnapshot::new(RuntimeState::Ready)
             .with_status("Ready for the next task".to_string())
             .with_context_usage(
@@ -219,125 +235,12 @@ impl App {
         self.apply_transition(snapshot, StateTransition::ResetToReady)
     }
 
-    pub fn mock_thinking_snapshot(&mut self) -> Result<AppStateSnapshot, AppError> {
-        let snapshot = AppStateSnapshot::new(RuntimeState::Thinking)
-            .with_status(format!("Thinking. model={}", self.config.runtime.model))
-            .with_plan(
-                vec![
-                    "inspect repository structure".to_string(),
-                    "map runtime and tool flow".to_string(),
-                    "summarize constraints".to_string(),
-                ],
-                Some(1),
-            )
-            .with_reasoning_summary(vec![
-                "main startup wiring is the current focus".to_string(),
-                "provider integration is not enabled yet".to_string(),
-            ])
-            .with_elapsed_ms(240)
-            .with_context_usage(
-                self.session.estimated_token_count(),
-                self.config.runtime.context_window,
-            );
-        self.apply_transition(snapshot, StateTransition::StartThinking)
-    }
-
-    pub fn mock_approval_snapshot(&mut self) -> Result<AppStateSnapshot, AppError> {
-        let snapshot = AppStateSnapshot::new(RuntimeState::AwaitingApproval)
-            .with_status("Awaiting approval for 1 tool call".to_string())
-            .with_approval(
-                "Write".to_string(),
-                "Create workspace/anvil-notes.md".to_string(),
-                "Confirm".to_string(),
-                "call_001".to_string(),
-            )
-            .with_elapsed_ms(510)
-            .with_context_usage(
-                self.session.estimated_token_count(),
-                self.config.runtime.context_window,
-            );
-        self.apply_transition(snapshot, StateTransition::RequestApproval)
-    }
-
-    pub fn mock_interrupted_snapshot(&mut self) -> Result<AppStateSnapshot, AppError> {
-        let snapshot = AppStateSnapshot::new(RuntimeState::Interrupted)
-            .with_status("Interrupted safely".to_string())
-            .with_interrupt(
-                "provider turn".to_string(),
-                "session preserved".to_string(),
-                vec!["resume work".to_string(), "inspect status".to_string()],
-            )
-            .with_elapsed_ms(820)
-            .with_context_usage(
-                self.session.estimated_token_count(),
-                self.config.runtime.context_window,
-            );
-        self.session.normalize_interrupted_turn("provider turn");
-        self.apply_transition(snapshot, StateTransition::Interrupt)?;
-        self.persist_session(AppEvent::SessionNormalizedAfterInterrupt)?;
-        Ok(self.state_machine.snapshot().clone())
-    }
-
-    pub fn mock_working_snapshot(&mut self) -> Result<AppStateSnapshot, AppError> {
-        let snapshot = AppStateSnapshot::new(RuntimeState::Working)
-            .with_status("Working on tool execution".to_string())
-            .with_plan(
-                vec![
-                    "inspect repository structure".to_string(),
-                    "execute reads and summarize findings".to_string(),
-                    "prepare next action".to_string(),
-                ],
-                Some(1),
-            )
-            .with_tool_logs(vec![
-                ToolLogView {
-                    tool_name: "Read".to_string(),
-                    action: "open".to_string(),
-                    target: "src/app/mod.rs".to_string(),
-                },
-                ToolLogView {
-                    tool_name: "Grep".to_string(),
-                    action: "search".to_string(),
-                    target: "StateTransition".to_string(),
-                },
-            ])
-            .with_elapsed_ms(1_240)
-            .with_context_usage(
-                self.session.estimated_token_count(),
-                self.config.runtime.context_window,
-            );
-        self.apply_transition(snapshot, StateTransition::StartWorking)
-    }
-
-    pub fn mock_done_snapshot(&mut self) -> Result<AppStateSnapshot, AppError> {
-        self.record_assistant_output(
-            "msg_assistant_done",
-            "調査結果を整理しました。local-first の強みを保ちつつ、runtime と tui の責務を分離できます。",
-        )?;
-        let snapshot = AppStateSnapshot::new(RuntimeState::Done)
-            .with_status("Done. session saved".to_string())
-            .with_tool_logs(vec![
-                ToolLogView {
-                    tool_name: "Read".to_string(),
-                    action: "open".to_string(),
-                    target: "src/app/mod.rs".to_string(),
-                },
-                ToolLogView {
-                    tool_name: "Write".to_string(),
-                    action: "update".to_string(),
-                    target: "workspace/work-plan.md".to_string(),
-                },
-            ])
-            .with_completion_summary(
-                "Updated the state and session foundation and saved the session.",
-                "session saved",
-            )
-            .with_elapsed_ms(3_120)
-            .with_context_usage(
-                self.session.estimated_token_count(),
-                self.config.runtime.context_window,
-            );
-        self.apply_transition(snapshot, StateTransition::Finish)
+    pub(crate) fn apply_transition_for_mock(
+        &mut self,
+        snapshot: AppStateSnapshot,
+        transition: StateTransition,
+    ) -> Result<AppStateSnapshot, AppError> {
+        self.apply_transition(snapshot, transition)
     }
 
     fn apply_transition(
@@ -351,6 +254,13 @@ impl App {
             .set_last_snapshot(self.state_machine.snapshot().clone());
         self.persist_session(AppEvent::SessionSaved)?;
         Ok(snapshot)
+    }
+
+    pub(crate) fn persist_session_event_for_mock(
+        &mut self,
+        event: AppEvent,
+    ) -> Result<(), AppError> {
+        self.persist_session(event)
     }
 
     fn persist_session(&mut self, event: AppEvent) -> Result<(), AppError> {
@@ -371,13 +281,16 @@ impl App {
             frames.push(self.render_console(tui)?);
 
             if snapshot.state == RuntimeState::AwaitingApproval {
-                self.set_pending_runtime_events(events[index + 1..].to_vec())?;
+                self.set_pending_turn(PendingTurnState {
+                    waiting_tool_call_id: approval_tool_call_id(event),
+                    remaining_events: events[index + 1..].to_vec(),
+                })?;
                 break;
             }
         }
 
-        if self.pending_runtime_events.is_empty() {
-            self.clear_pending_runtime_events()?;
+        if self.pending_turn.is_none() {
+            self.clear_pending_turn()?;
         }
 
         Ok(frames)
@@ -526,21 +439,21 @@ impl App {
     }
 
     pub fn has_pending_runtime_events(&self) -> bool {
-        !self.pending_runtime_events.is_empty()
+        self.pending_turn.is_some()
     }
 
-    fn set_pending_runtime_events(&mut self, events: Vec<AgentEvent>) -> Result<(), AppError> {
-        self.pending_runtime_events = events.clone();
-        self.session.set_pending_runtime_events(events);
+    fn set_pending_turn(&mut self, pending_turn: PendingTurnState) -> Result<(), AppError> {
+        self.pending_turn = Some(pending_turn.clone());
+        self.session.set_pending_turn(pending_turn);
         self.persist_session(AppEvent::SessionSaved)
     }
 
-    fn clear_pending_runtime_events(&mut self) -> Result<(), AppError> {
-        if self.pending_runtime_events.is_empty() && !self.session.has_pending_runtime_events() {
+    fn clear_pending_turn(&mut self) -> Result<(), AppError> {
+        if self.pending_turn.is_none() && !self.session.has_pending_turn() {
             return Ok(());
         }
-        self.pending_runtime_events.clear();
-        self.session.clear_pending_runtime_events();
+        self.pending_turn = None;
+        self.session.clear_pending_turn();
         self.persist_session(AppEvent::SessionSaved)
     }
 }
@@ -553,6 +466,13 @@ fn build_tool_logs(logs: &[(String, String, String)]) -> Vec<ToolLogView> {
             target: target.clone(),
         })
         .collect()
+}
+
+fn approval_tool_call_id(event: &AgentEvent) -> String {
+    match event {
+        AgentEvent::ApprovalRequested { tool_call_id, .. } => tool_call_id.clone(),
+        _ => "pending_approval".to_string(),
+    }
 }
 
 pub fn run() -> Result<(), AppError> {

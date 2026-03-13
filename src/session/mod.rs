@@ -1,4 +1,4 @@
-use crate::agent::AgentEvent;
+use crate::agent::PendingTurnState;
 use crate::config::EffectiveConfig;
 use crate::contracts::{
     AppEvent, AppStateSnapshot, ConsoleMessageRole, ConsoleMessageView, ConsoleRenderContext,
@@ -83,7 +83,7 @@ pub struct SessionRecord {
     #[serde(default)]
     pub event_log: Vec<AppEvent>,
     #[serde(default)]
-    pub pending_runtime_events: Vec<AgentEvent>,
+    pub pending_turn: Option<PendingTurnState>,
 }
 
 impl SessionRecord {
@@ -100,7 +100,7 @@ impl SessionRecord {
             last_snapshot: None,
             session_event: None,
             event_log: Vec::new(),
-            pending_runtime_events: Vec::new(),
+            pending_turn: None,
         }
     }
 
@@ -202,18 +202,18 @@ impl SessionRecord {
         self.event_log.push(event);
     }
 
-    pub fn set_pending_runtime_events(&mut self, events: Vec<AgentEvent>) {
-        self.pending_runtime_events = events;
+    pub fn set_pending_turn(&mut self, pending_turn: PendingTurnState) {
+        self.pending_turn = Some(pending_turn);
         self.touch();
     }
 
-    pub fn clear_pending_runtime_events(&mut self) {
-        self.pending_runtime_events.clear();
+    pub fn clear_pending_turn(&mut self) {
+        self.pending_turn = None;
         self.touch();
     }
 
-    pub fn has_pending_runtime_events(&self) -> bool {
-        !self.pending_runtime_events.is_empty()
+    pub fn has_pending_turn(&self) -> bool {
+        self.pending_turn.is_some()
     }
 
     fn touch(&mut self) {

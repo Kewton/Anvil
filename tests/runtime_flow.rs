@@ -77,6 +77,10 @@ fn runtime_turn_pauses_for_single_tool_call_approval_and_resumes_to_done() {
             .content,
         "wire runtime flow"
     );
+    assert!(matches!(
+        app.run_runtime_turn("new request before approval", &runtime, &tui),
+        Err(anvil::app::AppError::PendingApprovalRequired)
+    ));
 
     let resumed = app
         .approve_and_continue(&runtime, &tui)
