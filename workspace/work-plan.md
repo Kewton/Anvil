@@ -96,11 +96,13 @@
 
 ## Phase 9: Competitive Validation
 
-- [ ] Compare startup and first-use flow against `vibe-local`
-- [ ] Compare iteration latency against `vibe-local`
-- [ ] Compare interruption and recovery behavior against `vibe-local`
-- [ ] Compare long-session context handling against `vibe-local`
-- [ ] Identify remaining gaps versus Claude Code-level UX
+- [x] Define benchmark scenarios and scorecard structures
+- [x] Create the competitive-validation workspace and templates
+- [x] Compare startup and first-use flow against `vibe-local`
+- [x] Compare iteration latency against `vibe-local`
+- [x] Compare interruption and recovery behavior against `vibe-local`
+- [x] Compare long-session context handling against `vibe-local`
+- [x] Identify remaining gaps versus Claude Code-level UX
 
 ## Phase 10: Later Expansion
 
