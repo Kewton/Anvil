@@ -69,14 +69,9 @@ impl ProviderTurnRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProviderTurnResponse {
-    pub events: Vec<AgentEvent>,
-}
-
-impl ProviderTurnResponse {
-    pub fn new(events: Vec<AgentEvent>) -> Self {
-        Self { events }
-    }
+pub enum ProviderEvent {
+    Agent(AgentEvent),
+    TokenDelta(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,10 +92,11 @@ impl std::fmt::Display for ProviderTurnError {
 impl std::error::Error for ProviderTurnError {}
 
 pub trait ProviderClient {
-    fn perform_turn(
+    fn stream_turn(
         &self,
         request: &ProviderTurnRequest,
-    ) -> Result<ProviderTurnResponse, ProviderTurnError>;
+        emit: &mut dyn FnMut(ProviderEvent),
+    ) -> Result<(), ProviderTurnError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

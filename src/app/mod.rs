@@ -7,11 +7,12 @@ use crate::contracts::{
     AppEvent, AppStateSnapshot, ConsoleRenderContext, RuntimeState, ToolLogView,
 };
 use crate::provider::{
-    ProviderBootstrapError, ProviderClient, ProviderRuntimeContext, ProviderTurnError,
+    ProviderBootstrapError, ProviderClient, ProviderEvent, ProviderRuntimeContext,
+    ProviderTurnError,
 };
 use crate::session::{
-    MessageStatus, SessionError, SessionRecord, SessionStore, new_assistant_message,
-    new_user_message,
+    MessageRole, MessageStatus, SessionError, SessionMessage, SessionRecord, SessionStore,
+    new_assistant_message, new_user_message,
 };
 use crate::state::{StateMachine, StateTransition};
 use crate::tui::Tui;
@@ -213,7 +214,7 @@ impl App {
 
         let user_input = user_input.into();
         self.record_user_input(self.next_message_id("user"), user_input)?;
-        let mut frames = vec![self.render_live_thinking_frame(tui)?];
+        self.begin_live_turn_state()?;
 
         let request = BasicAgentLoop::build_turn_request(
             self.config.runtime.model.clone(),
@@ -222,12 +223,33 @@ impl App {
         );
 
         match BasicAgentLoop::run_turn(provider_client, &request) {
-            Ok(response) => {
-                frames.extend(self.execute_runtime_events(&response.events, tui)?);
+            Ok(provider_events) => {
+                let mut frames = Vec::new();
+                for (index, event) in provider_events.iter().enumerate() {
+                    if let ProviderEvent::Agent(agent_event) = event {
+                        let snapshot = self.apply_agent_event(&agent_event)?;
+                        frames.push(self.render_console(tui)?);
+                        if snapshot.state == RuntimeState::AwaitingApproval {
+                            let remaining_events = provider_events[index + 1..]
+                                .iter()
+                                .filter_map(|event| match event {
+                                    ProviderEvent::Agent(agent_event) => Some(agent_event.clone()),
+                                    ProviderEvent::TokenDelta(_) => None,
+                                })
+                                .collect::<Vec<_>>();
+                            self.set_pending_turn(PendingTurnState {
+                                waiting_tool_call_id: approval_tool_call_id(agent_event),
+                                remaining_events,
+                            })?;
+                            break;
+                        }
+                    }
+                }
                 Ok(frames)
             }
             Err(ProviderTurnError::Cancelled) => {
-                frames.extend(self.execute_runtime_events(
+                self.record_provider_detail("provider turn cancelled")?;
+                self.execute_runtime_events(
                     &[AgentEvent::Interrupted {
                         status: "Interrupted safely".to_string(),
                         interrupted_what: "provider turn".to_string(),
@@ -236,11 +258,11 @@ impl App {
                         elapsed_ms: 0,
                     }],
                     tui,
-                )?);
-                Ok(frames)
+                )
             }
             Err(ProviderTurnError::Backend(message)) => {
-                frames.extend(self.execute_runtime_events(
+                self.record_provider_detail(format!("provider backend error: {message}"))?;
+                self.execute_runtime_events(
                     &[AgentEvent::Failed {
                         status: "Error. provider turn failed".to_string(),
                         error_summary: message,
@@ -251,8 +273,7 @@ impl App {
                         elapsed_ms: 0,
                     }],
                     tui,
-                )?);
-                Ok(frames)
+                )
             }
         }
     }
@@ -361,18 +382,6 @@ impl App {
         }
 
         Ok(frames)
-    }
-
-    fn render_live_thinking_frame(&mut self, tui: &Tui) -> Result<String, AppError> {
-        let snapshot = AppStateSnapshot::new(RuntimeState::Thinking)
-            .with_status(format!("Thinking. model={}", self.config.runtime.model))
-            .with_elapsed_ms(0)
-            .with_context_usage(
-                self.session.estimated_token_count(),
-                self.config.runtime.context_window,
-            );
-        self.apply_transition(snapshot, StateTransition::StartThinking)?;
-        self.render_console(tui)
     }
 
     fn apply_agent_event(&mut self, event: &AgentEvent) -> Result<AppStateSnapshot, AppError> {
@@ -515,6 +524,26 @@ impl App {
 
     fn next_message_id(&self, prefix: &str) -> String {
         format!("{prefix}_{:04}", self.session.message_count() + 1)
+    }
+
+    fn begin_live_turn_state(&mut self) -> Result<(), AppError> {
+        let snapshot = AppStateSnapshot::new(RuntimeState::Thinking)
+            .with_status(format!("Thinking. model={}", self.config.runtime.model))
+            .with_elapsed_ms(0)
+            .with_context_usage(
+                self.session.estimated_token_count(),
+                self.config.runtime.context_window,
+            );
+        self.apply_transition(snapshot, StateTransition::StartThinking)?;
+        Ok(())
+    }
+
+    fn record_provider_detail(&mut self, content: impl Into<String>) -> Result<(), AppError> {
+        self.session.push_message(
+            SessionMessage::new(MessageRole::System, "provider", content)
+                .with_id(self.next_message_id("provider")),
+        );
+        self.persist_session(AppEvent::SessionSaved)
     }
 
     pub fn has_pending_runtime_events(&self) -> bool {

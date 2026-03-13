@@ -1,6 +1,6 @@
 use crate::provider::{
-    ProviderClient, ProviderMessage, ProviderMessageRole, ProviderTurnError, ProviderTurnRequest,
-    ProviderTurnResponse,
+    ProviderClient, ProviderEvent, ProviderMessage, ProviderMessageRole, ProviderTurnError,
+    ProviderTurnRequest,
 };
 use crate::session::{MessageRole, SessionRecord};
 use serde::{Deserialize, Serialize};
@@ -102,10 +102,20 @@ impl BasicAgentLoop {
         session: &SessionRecord,
         stream: bool,
     ) -> ProviderTurnRequest {
+        Self::build_turn_request_with_limit(model, session, stream, 12)
+    }
+
+    pub fn build_turn_request_with_limit(
+        model: impl Into<String>,
+        session: &SessionRecord,
+        stream: bool,
+        max_messages: usize,
+    ) -> ProviderTurnRequest {
+        let len = session.messages.len();
+        let start = len.saturating_sub(max_messages);
         ProviderTurnRequest::new(
             model.into(),
-            session
-                .messages
+            session.messages[start..]
                 .iter()
                 .map(|message| {
                     let role = match message.role {
@@ -124,7 +134,9 @@ impl BasicAgentLoop {
     pub fn run_turn<C: ProviderClient>(
         provider: &C,
         request: &ProviderTurnRequest,
-    ) -> Result<ProviderTurnResponse, ProviderTurnError> {
-        provider.perform_turn(request)
+    ) -> Result<Vec<ProviderEvent>, ProviderTurnError> {
+        let mut events = Vec::new();
+        provider.stream_turn(request, &mut |event| events.push(event))?;
+        Ok(events)
     }
 }
