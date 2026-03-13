@@ -6,6 +6,7 @@ use crate::config::EffectiveConfig;
 use crate::contracts::{
     AppEvent, AppStateSnapshot, ConsoleRenderContext, RuntimeState, ToolLogView,
 };
+use crate::extensions::{ExtensionRegistry, SlashCommandAction, SlashCommandSpec};
 use crate::provider::{
     ProviderBootstrapError, ProviderClient, ProviderErrorKind, ProviderErrorRecord, ProviderEvent,
     ProviderRuntimeContext, ProviderTurnError, build_local_provider_client,
@@ -15,6 +16,7 @@ use crate::session::{
     new_assistant_message, new_user_message,
 };
 use crate::state::{StateMachine, StateTransition};
+use crate::tooling::{ToolExecutionPayload, ToolExecutionResult, ToolExecutionStatus};
 use crate::tui::Tui;
 use std::fmt::{Display, Formatter};
 use std::io::{self, BufRead, Write};
@@ -28,6 +30,7 @@ pub struct App {
     session_store: SessionStore,
     session: SessionRecord,
     pending_turn: Option<PendingTurnState>,
+    extensions: ExtensionRegistry,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,68 +43,6 @@ pub struct CliTurnOutput {
     pub frames: Vec<String>,
     pub control: SessionControl,
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SlashCommandAction {
-    Help,
-    Status,
-    Plan,
-    Model,
-    Approve,
-    Deny,
-    Reset,
-    Exit,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SlashCommandSpec {
-    pub name: &'static str,
-    pub description: &'static str,
-    pub action: SlashCommandAction,
-}
-
-const SLASH_COMMANDS: [SlashCommandSpec; 8] = [
-    SlashCommandSpec {
-        name: "/help",
-        description: "show available commands",
-        action: SlashCommandAction::Help,
-    },
-    SlashCommandSpec {
-        name: "/status",
-        description: "show the current console state",
-        action: SlashCommandAction::Status,
-    },
-    SlashCommandSpec {
-        name: "/plan",
-        description: "show the current plan and active step",
-        action: SlashCommandAction::Plan,
-    },
-    SlashCommandSpec {
-        name: "/model",
-        description: "show the current model context",
-        action: SlashCommandAction::Model,
-    },
-    SlashCommandSpec {
-        name: "/approve",
-        description: "continue the pending approved tool call",
-        action: SlashCommandAction::Approve,
-    },
-    SlashCommandSpec {
-        name: "/deny",
-        description: "reject the pending tool call",
-        action: SlashCommandAction::Deny,
-    },
-    SlashCommandSpec {
-        name: "/reset",
-        description: "return to Ready",
-        action: SlashCommandAction::Reset,
-    },
-    SlashCommandSpec {
-        name: "/exit",
-        description: "exit the session",
-        action: SlashCommandAction::Exit,
-    },
-];
 
 #[derive(Debug)]
 pub enum AppError {
@@ -181,6 +122,7 @@ impl App {
             session_store,
             pending_turn: session.pending_turn.clone(),
             session,
+            extensions: ExtensionRegistry::new(),
         })
     }
 
@@ -697,7 +639,7 @@ impl App {
                 control: SessionControl::Continue,
             }),
             Err(AppError::PendingApprovalRequired) => Ok(CliTurnOutput {
-                frames: vec![render_pending_approval_frame()],
+                frames: vec![render_pending_approval_frame(self.state_machine.snapshot())],
                 control: SessionControl::Continue,
             }),
             Err(err) => Err(err),
@@ -724,7 +666,11 @@ impl App {
         command: &str,
         tui: &Tui,
     ) -> Result<CliTurnOutput, AppError> {
-        let output = match find_slash_command(command).map(|spec| spec.action) {
+        let output = match self
+            .extensions
+            .find_slash_command(command)
+            .map(|spec| spec.action)
+        {
             Some(SlashCommandAction::Help) => CliTurnOutput {
                 frames: vec![render_help_frame()],
                 control: SessionControl::Continue,
@@ -774,11 +720,16 @@ impl App {
 
 fn build_tool_logs(logs: &[(String, String, String)]) -> Vec<ToolLogView> {
     logs.iter()
-        .map(|(tool_name, action, target)| ToolLogView {
+        .map(|(tool_name, action, target)| ToolExecutionResult {
+            tool_call_id: format!("{tool_name}:{target}"),
             tool_name: tool_name.clone(),
-            action: action.clone(),
-            target: target.clone(),
+            status: map_tool_status(action),
+            summary: format!("{action} {target}"),
+            payload: ToolExecutionPayload::None,
+            artifacts: vec![target.clone()],
+            elapsed_ms: 0,
         })
+        .map(|result| result.to_tool_log_view())
         .collect()
 }
 
@@ -838,19 +789,27 @@ pub fn cli_prompt() -> &'static str {
 }
 
 pub fn slash_commands() -> &'static [SlashCommandSpec] {
-    &SLASH_COMMANDS
+    ExtensionRegistry::new().slash_commands()
 }
 
-fn find_slash_command(command: &str) -> Option<SlashCommandSpec> {
-    slash_commands()
-        .iter()
-        .copied()
-        .find(|spec| spec.name == command || (spec.name == "/exit" && command == "/quit"))
+fn render_pending_approval_frame(snapshot: &AppStateSnapshot) -> String {
+    if let Some(approval) = &snapshot.approval {
+        format!(
+            "[A] anvil > resolve the pending approval before starting a new turn\n  pending: {} {}\n  call: {}\n  use /approve or /deny",
+            approval.tool_name, approval.summary, approval.tool_call_id
+        )
+    } else {
+        "[A] anvil > resolve the pending approval before starting a new turn\n  use /approve or /deny"
+            .to_string()
+    }
 }
 
-fn render_pending_approval_frame() -> String {
-    "[A] anvil > resolve the pending approval before starting a new turn\n  use /approve or /deny"
-        .to_string()
+fn map_tool_status(action: &str) -> ToolExecutionStatus {
+    match action {
+        "failed" => ToolExecutionStatus::Failed,
+        "interrupted" => ToolExecutionStatus::Interrupted,
+        _ => ToolExecutionStatus::Completed,
+    }
 }
 
 pub fn run_session_loop<C: ProviderClient, R: BufRead, W: Write>(

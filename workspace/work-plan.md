@@ -82,11 +82,16 @@
 ## Phase 8: Reach the First Useful Version
 
 - [x] Support startup and interactive prompt
+- [x] Align the live CLI prompt with the operator-console identity
 - [x] Support user input -> agent output flow
 - [x] Support tool execution display
+- [x] Bridge typed tool execution results into console tool-log rendering
 - [x] Support follow-up instructions in one session
 - [x] Support session save and resume
+- [x] Show startup metadata when resuming an existing session
 - [x] Implement slash command framework
+- [x] Move slash command definitions into an extension-friendly registry
+- [x] Convert pending-approval input errors into user-facing console guidance
 - [x] Reach a usable local-first CLI prototype
 
 ## Phase 9: Competitive Validation

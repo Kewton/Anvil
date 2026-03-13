@@ -192,6 +192,13 @@ fn slash_approve_and_deny_resolve_pending_tool_approval() {
             .expect("blocked frame")
             .contains("resolve the pending approval")
     );
+    assert!(
+        blocked
+            .frames
+            .last()
+            .expect("blocked frame")
+            .contains("call_approve_001")
+    );
 
     let approved = app
         .handle_cli_line("/approve", &provider, &tui)
@@ -330,6 +337,7 @@ fn run_session_loop_uses_operator_prompt_and_exits_on_command() {
 #[test]
 fn help_frame_is_built_from_registered_slash_commands() {
     let help = anvil::app::render_help_frame();
+    let commands = anvil::app::slash_commands();
 
     assert!(help.contains("/help"));
     assert!(help.contains("show available commands"));
@@ -337,4 +345,6 @@ fn help_frame_is_built_from_registered_slash_commands() {
     assert!(help.contains("continue the pending approved tool call"));
     assert!(help.contains("/exit"));
     assert!(help.contains("exit the session"));
+    assert!(commands.iter().any(|spec| spec.name == "/plan"));
+    assert!(commands.iter().any(|spec| spec.name == "/model"));
 }
