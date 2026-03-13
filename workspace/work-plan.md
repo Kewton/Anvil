@@ -63,6 +63,7 @@
 
 ## Phase 6: Add Real Runtime Integration
 
+- [x] Add provider request/response contracts and a fake-provider live-turn slice
 - [ ] Implement provider abstraction for local LLM backends
 - [ ] Implement Ollama-first backend
 - [ ] Implement basic agent loop

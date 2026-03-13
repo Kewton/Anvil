@@ -1,3 +1,8 @@
+use crate::provider::{
+    ProviderClient, ProviderMessage, ProviderMessageRole, ProviderTurnError, ProviderTurnRequest,
+    ProviderTurnResponse,
+};
+use crate::session::{MessageRole, SessionRecord};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,5 +91,40 @@ impl AgentRuntime {
 
     pub fn events(&self) -> &[AgentEvent] {
         self.script.events()
+    }
+}
+
+pub struct BasicAgentLoop;
+
+impl BasicAgentLoop {
+    pub fn build_turn_request(
+        model: impl Into<String>,
+        session: &SessionRecord,
+        stream: bool,
+    ) -> ProviderTurnRequest {
+        ProviderTurnRequest::new(
+            model.into(),
+            session
+                .messages
+                .iter()
+                .map(|message| {
+                    let role = match message.role {
+                        MessageRole::System => ProviderMessageRole::System,
+                        MessageRole::User => ProviderMessageRole::User,
+                        MessageRole::Assistant => ProviderMessageRole::Assistant,
+                        MessageRole::Tool => ProviderMessageRole::Tool,
+                    };
+                    ProviderMessage::new(role, message.content.clone())
+                })
+                .collect(),
+            stream,
+        )
+    }
+
+    pub fn run_turn<C: ProviderClient>(
+        provider: &C,
+        request: &ProviderTurnRequest,
+    ) -> Result<ProviderTurnResponse, ProviderTurnError> {
+        provider.perform_turn(request)
     }
 }

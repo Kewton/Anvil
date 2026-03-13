@@ -1,11 +1,14 @@
 pub mod mock;
 
+use crate::agent::BasicAgentLoop;
 use crate::agent::{AgentEvent, AgentRuntime, PendingTurnState};
 use crate::config::EffectiveConfig;
 use crate::contracts::{
     AppEvent, AppStateSnapshot, ConsoleRenderContext, RuntimeState, ToolLogView,
 };
-use crate::provider::{ProviderBootstrapError, ProviderRuntimeContext};
+use crate::provider::{
+    ProviderBootstrapError, ProviderClient, ProviderRuntimeContext, ProviderTurnError,
+};
 use crate::session::{
     MessageStatus, SessionError, SessionRecord, SessionStore, new_assistant_message,
     new_user_message,
@@ -30,6 +33,7 @@ pub enum AppError {
     Config(crate::config::ConfigError),
     ProviderBootstrap(ProviderBootstrapError),
     Session(SessionError),
+    ProviderTurn(ProviderTurnError),
     StateTransition(crate::state::StateTransitionError),
     NoPendingApproval,
     PendingApprovalRequired,
@@ -41,6 +45,7 @@ impl Display for AppError {
             Self::Config(err) => write!(f, "{err}"),
             Self::ProviderBootstrap(err) => write!(f, "{err}"),
             Self::Session(err) => write!(f, "{err}"),
+            Self::ProviderTurn(err) => write!(f, "{err}"),
             Self::StateTransition(err) => write!(f, "{err}"),
             Self::NoPendingApproval => write!(f, "no pending approval to continue"),
             Self::PendingApprovalRequired => {
@@ -67,6 +72,12 @@ impl From<ProviderBootstrapError> for AppError {
 impl From<SessionError> for AppError {
     fn from(value: SessionError) -> Self {
         Self::Session(value)
+    }
+}
+
+impl From<ProviderTurnError> for AppError {
+    fn from(value: ProviderTurnError) -> Self {
+        Self::ProviderTurn(value)
     }
 }
 
@@ -190,6 +201,62 @@ impl App {
         self.execute_runtime_events(runtime.events(), tui)
     }
 
+    pub fn run_live_turn<C: ProviderClient>(
+        &mut self,
+        user_input: impl Into<String>,
+        provider_client: &C,
+        tui: &Tui,
+    ) -> Result<Vec<String>, AppError> {
+        if self.pending_turn.is_some() {
+            return Err(AppError::PendingApprovalRequired);
+        }
+
+        let user_input = user_input.into();
+        self.record_user_input(self.next_message_id("user"), user_input)?;
+        let mut frames = vec![self.render_live_thinking_frame(tui)?];
+
+        let request = BasicAgentLoop::build_turn_request(
+            self.config.runtime.model.clone(),
+            &self.session,
+            self.provider.capabilities.streaming,
+        );
+
+        match BasicAgentLoop::run_turn(provider_client, &request) {
+            Ok(response) => {
+                frames.extend(self.execute_runtime_events(&response.events, tui)?);
+                Ok(frames)
+            }
+            Err(ProviderTurnError::Cancelled) => {
+                frames.extend(self.execute_runtime_events(
+                    &[AgentEvent::Interrupted {
+                        status: "Interrupted safely".to_string(),
+                        interrupted_what: "provider turn".to_string(),
+                        saved_status: "session preserved".to_string(),
+                        next_actions: vec!["resume work".to_string(), "inspect status".to_string()],
+                        elapsed_ms: 0,
+                    }],
+                    tui,
+                )?);
+                Ok(frames)
+            }
+            Err(ProviderTurnError::Backend(message)) => {
+                frames.extend(self.execute_runtime_events(
+                    &[AgentEvent::Failed {
+                        status: "Error. provider turn failed".to_string(),
+                        error_summary: message,
+                        recommended_actions: vec![
+                            "retry turn".to_string(),
+                            "inspect provider".to_string(),
+                        ],
+                        elapsed_ms: 0,
+                    }],
+                    tui,
+                )?);
+                Ok(frames)
+            }
+        }
+    }
+
     pub fn approve_and_continue(
         &mut self,
         _runtime: &AgentRuntime,
@@ -294,6 +361,18 @@ impl App {
         }
 
         Ok(frames)
+    }
+
+    fn render_live_thinking_frame(&mut self, tui: &Tui) -> Result<String, AppError> {
+        let snapshot = AppStateSnapshot::new(RuntimeState::Thinking)
+            .with_status(format!("Thinking. model={}", self.config.runtime.model))
+            .with_elapsed_ms(0)
+            .with_context_usage(
+                self.session.estimated_token_count(),
+                self.config.runtime.context_window,
+            );
+        self.apply_transition(snapshot, StateTransition::StartThinking)?;
+        self.render_console(tui)
     }
 
     fn apply_agent_event(&mut self, event: &AgentEvent) -> Result<AppStateSnapshot, AppError> {

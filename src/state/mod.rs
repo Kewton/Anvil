@@ -83,6 +83,10 @@ impl StateMachine {
                 RuntimeState::Thinking
             ) | (
                 RuntimeState::Thinking,
+                StateTransition::StartThinking,
+                RuntimeState::Thinking
+            ) | (
+                RuntimeState::Thinking,
                 StateTransition::RequestApproval,
                 RuntimeState::AwaitingApproval
             ) | (
