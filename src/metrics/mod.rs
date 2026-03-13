@@ -82,6 +82,15 @@ pub struct CommandBenchmarkResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BenchmarkArtifact {
+    pub scenario_id: String,
+    pub target: BenchmarkTarget,
+    pub command: String,
+    pub runs_ms: Vec<u32>,
+    pub average_ms: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandBenchmarkError {
     message: String,
 }
@@ -130,6 +139,24 @@ impl<'a> CommandBenchmark<'a> {
         Ok(CommandBenchmarkResult {
             runs_ms: results,
             average_ms,
+        })
+    }
+
+    pub fn run_artifact(
+        &self,
+        scenario_id: &str,
+        target: BenchmarkTarget,
+        runs: usize,
+    ) -> Result<BenchmarkArtifact, CommandBenchmarkError> {
+        let result = self.run(runs)?;
+        Ok(BenchmarkArtifact {
+            scenario_id: scenario_id.to_string(),
+            target,
+            command: format!("{} {}", self.program, self.args.join(" "))
+                .trim()
+                .to_string(),
+            runs_ms: result.runs_ms,
+            average_ms: result.average_ms,
         })
     }
 }
@@ -218,6 +245,7 @@ impl MetricsRegistry {
                 "| {} | {} | {} | {} | {} | {} |",
                 scenario.title,
                 axis_label(scenario.axis),
+                source_label(records, scenario.id),
                 outcome
                     .anvil_value
                     .map(|value| value.to_string())
@@ -226,9 +254,39 @@ impl MetricsRegistry {
                     .vibe_local_value
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "-".to_string()),
-                winner,
-                source_label(records, scenario.id)
+                winner
             ));
+        }
+
+        lines.join("\n")
+    }
+
+    pub fn render_run_log(&self, artifacts: &[BenchmarkArtifact]) -> String {
+        let mut lines = vec![
+            "# Competitive Validation Run Log".to_string(),
+            String::new(),
+        ];
+
+        for scenario in self.scenarios() {
+            let scenario_artifacts: Vec<&BenchmarkArtifact> = artifacts
+                .iter()
+                .filter(|artifact| artifact.scenario_id == scenario.id)
+                .collect();
+            if scenario_artifacts.is_empty() {
+                continue;
+            }
+
+            lines.push(format!("## {}", scenario.title));
+            lines.push(String::new());
+
+            for artifact in scenario_artifacts {
+                lines.push(format!("### {}", target_label(artifact.target)));
+                lines.push(String::new());
+                lines.push(format!("- command: `{}`", artifact.command));
+                lines.push(format!("- runs_ms: {:?}", artifact.runs_ms));
+                lines.push(format!("- average_ms: {}", artifact.average_ms));
+                lines.push(String::new());
+            }
         }
 
         lines.join("\n")
@@ -291,11 +349,21 @@ fn axis_label(axis: ComparisonAxis) -> &'static str {
 }
 
 fn source_label(records: &[MeasurementRecord], scenario_id: &str) -> &'static str {
-    match records.iter().find(|record| record.scenario_id == scenario_id) {
+    match records
+        .iter()
+        .find(|record| record.scenario_id == scenario_id)
+    {
         Some(record) => match record.source {
             MeasurementSource::Measured => "Measured",
             MeasurementSource::OperationalScore => "OperationalScore",
         },
         None => "-",
+    }
+}
+
+fn target_label(target: BenchmarkTarget) -> &'static str {
+    match target {
+        BenchmarkTarget::Anvil => "Anvil",
+        BenchmarkTarget::VibeLocal => "vibe-local",
     }
 }

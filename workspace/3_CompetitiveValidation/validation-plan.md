@@ -27,6 +27,7 @@ Compare Anvil against `vibe-local` on the axes defined in `workspace/1_ProductDe
 ## Automation Baseline
 
 - Use the Rust benchmark harness in `src/metrics/mod.rs` for repeated command execution timing.
+- Store raw command benchmark artifacts before reducing them into scorecard rows.
 - Record raw per-run timings in the run log, then write averaged values into the scorecard.
 - Treat qualitative UX or maturity judgments as `OperationalScore` until a repeatable harness exists.
 

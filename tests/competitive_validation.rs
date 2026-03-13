@@ -1,6 +1,6 @@
 use anvil::metrics::{
-    BenchmarkTarget, CommandBenchmark, ComparisonAxis, MeasurementRecord, MeasurementSource,
-    MetricsRegistry,
+    BenchmarkArtifact, BenchmarkTarget, CommandBenchmark, ComparisonAxis, MeasurementRecord,
+    MeasurementSource, MetricsRegistry,
 };
 
 #[test]
@@ -99,15 +99,17 @@ fn markdown_summary_renders_registered_scenarios() {
     assert!(markdown.contains("Startup latency"));
     assert!(markdown.contains("Anvil"));
     assert!(markdown.contains("Measured"));
+    assert!(
+        markdown
+            .contains("| Startup latency | FirstUseExperience | Measured | 420 | 610 | Anvil |")
+    );
 }
 
 #[test]
 fn command_benchmark_runs_multiple_times_and_reports_average_ms() {
     let benchmark = CommandBenchmark::new("python3", &["-c", "import time; time.sleep(0.01)"]);
 
-    let result = benchmark
-        .run(2)
-        .expect("benchmark command should succeed");
+    let result = benchmark.run(2).expect("benchmark command should succeed");
 
     assert_eq!(result.runs_ms.len(), 2);
     assert!(result.average_ms >= 5);
@@ -119,4 +121,34 @@ fn command_benchmark_surfaces_non_zero_exit_as_error() {
     let err = benchmark.run(1).expect_err("non-zero exit should fail");
 
     assert!(err.to_string().contains("benchmark command failed"));
+}
+
+#[test]
+fn command_benchmark_can_build_run_log_artifact() {
+    let benchmark = CommandBenchmark::new("python3", &["-c", "import time; time.sleep(0.01)"]);
+
+    let artifact = benchmark
+        .run_artifact("startup_latency_ms", BenchmarkTarget::Anvil, 2)
+        .expect("artifact benchmark should succeed");
+
+    assert_eq!(artifact.scenario_id, "startup_latency_ms");
+    assert_eq!(artifact.target, BenchmarkTarget::Anvil);
+    assert_eq!(artifact.runs_ms.len(), 2);
+    assert!(artifact.average_ms >= 5);
+}
+
+#[test]
+fn run_log_renders_raw_benchmark_artifacts() {
+    let registry = MetricsRegistry::new();
+    let log = registry.render_run_log(&[BenchmarkArtifact {
+        scenario_id: "startup_latency_ms".to_string(),
+        target: BenchmarkTarget::Anvil,
+        command: "cargo run --quiet -- --help".to_string(),
+        runs_ms: vec![210, 220, 220],
+        average_ms: 216,
+    }]);
+
+    assert!(log.contains("# Competitive Validation Run Log"));
+    assert!(log.contains("## Startup latency"));
+    assert!(log.contains("- average_ms: 216"));
 }
