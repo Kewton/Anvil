@@ -1,5 +1,9 @@
 use crate::contracts::ToolLogView;
 use std::collections::HashMap;
+use std::fmt::{Display, Formatter};
+use std::fs;
+use std::path::{Component, Path, PathBuf};
+use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermissionClass {
@@ -319,6 +323,13 @@ impl ToolRegistry {
         });
     }
 
+    pub fn register_standard_tools(&mut self) {
+        self.register_file_read();
+        self.register_file_write();
+        self.register_file_search();
+        self.register_shell_exec();
+    }
+
     pub fn validate(
         &self,
         request: ToolCallRequest,
@@ -340,6 +351,121 @@ impl ToolRegistry {
             request,
             approved: false,
         })
+    }
+}
+
+pub struct LocalToolExecutor {
+    root: PathBuf,
+}
+
+#[derive(Debug)]
+pub enum ToolRuntimeError {
+    InvalidPath(String),
+    Io(String),
+}
+
+impl Display for ToolRuntimeError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidPath(path) => write!(f, "invalid tool path: {path}"),
+            Self::Io(message) => write!(f, "{message}"),
+        }
+    }
+}
+
+impl std::error::Error for ToolRuntimeError {}
+
+impl LocalToolExecutor {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    pub fn execute(
+        &self,
+        request: ToolExecutionRequest,
+    ) -> Result<ToolExecutionResult, ToolRuntimeError> {
+        let started = Instant::now();
+        match request.input {
+            ToolInput::FileRead { path } => {
+                let resolved = self.resolve_path(&path)?;
+                let content = if resolved.is_dir() {
+                    render_directory_listing(&resolved)?
+                } else {
+                    fs::read_to_string(&resolved).map_err(|err| {
+                        ToolRuntimeError::Io(format!(
+                            "file.read failed for {}: {err}",
+                            resolved.display()
+                        ))
+                    })?
+                };
+                Ok(ToolExecutionResult {
+                    tool_call_id: request.tool_call_id,
+                    tool_name: request.spec.name,
+                    status: ToolExecutionStatus::Completed,
+                    summary: path,
+                    payload: ToolExecutionPayload::Text(content),
+                    artifacts: vec![resolved.display().to_string()],
+                    elapsed_ms: started.elapsed().as_millis(),
+                })
+            }
+            ToolInput::FileWrite { path, content } => {
+                let resolved = self.resolve_path(&path)?;
+                if let Some(parent) = resolved.parent() {
+                    fs::create_dir_all(parent).map_err(|err| {
+                        ToolRuntimeError::Io(format!(
+                            "file.write failed to create parent {}: {err}",
+                            parent.display()
+                        ))
+                    })?;
+                }
+                fs::write(&resolved, &content).map_err(|err| {
+                    ToolRuntimeError::Io(format!(
+                        "file.write failed for {}: {err}",
+                        resolved.display()
+                    ))
+                })?;
+                Ok(ToolExecutionResult {
+                    tool_call_id: request.tool_call_id,
+                    tool_name: request.spec.name,
+                    status: ToolExecutionStatus::Completed,
+                    summary: path,
+                    payload: ToolExecutionPayload::None,
+                    artifacts: vec![resolved.display().to_string()],
+                    elapsed_ms: started.elapsed().as_millis(),
+                })
+            }
+            ToolInput::FileSearch { root, pattern } => {
+                let resolved_root = self.resolve_path(&root)?;
+                let mut matches = Vec::new();
+                collect_search_matches(&resolved_root, &pattern, &mut matches)?;
+                Ok(ToolExecutionResult {
+                    tool_call_id: request.tool_call_id,
+                    tool_name: request.spec.name,
+                    status: ToolExecutionStatus::Completed,
+                    summary: format!("{root} :: {pattern}"),
+                    payload: ToolExecutionPayload::Paths(matches.clone()),
+                    artifacts: matches,
+                    elapsed_ms: started.elapsed().as_millis(),
+                })
+            }
+            ToolInput::ShellExec { command } => Err(ToolRuntimeError::Io(format!(
+                "shell.exec is not enabled in the local executor: {command}"
+            ))),
+        }
+    }
+
+    fn resolve_path(&self, raw: &str) -> Result<PathBuf, ToolRuntimeError> {
+        let candidate = Path::new(raw);
+        if candidate.is_absolute() {
+            return Err(ToolRuntimeError::InvalidPath(raw.to_string()));
+        }
+        if candidate
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+        {
+            return Err(ToolRuntimeError::InvalidPath(raw.to_string()));
+        }
+        Ok(self.root.join(candidate))
     }
 }
 
@@ -423,4 +549,63 @@ fn validate_required_fields(input: &ToolInput) -> Result<(), ToolValidationError
     }
 
     Ok(())
+}
+
+fn collect_search_matches(
+    root: &Path,
+    pattern: &str,
+    matches: &mut Vec<String>,
+) -> Result<(), ToolRuntimeError> {
+    if root.is_file() {
+        let content = fs::read_to_string(root).unwrap_or_default();
+        if root.display().to_string().contains(pattern) || content.contains(pattern) {
+            matches.push(root.display().to_string());
+        }
+        return Ok(());
+    }
+
+    let entries = fs::read_dir(root).map_err(|err| {
+        ToolRuntimeError::Io(format!("file.search failed for {}: {err}", root.display()))
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|err| {
+            ToolRuntimeError::Io(format!(
+                "file.search failed while reading {}: {err}",
+                root.display()
+            ))
+        })?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_search_matches(&path, pattern, matches)?;
+        } else {
+            let content = fs::read_to_string(&path).unwrap_or_default();
+            if path.display().to_string().contains(pattern) || content.contains(pattern) {
+                matches.push(path.display().to_string());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn render_directory_listing(path: &Path) -> Result<String, ToolRuntimeError> {
+    let entries = fs::read_dir(path).map_err(|err| {
+        ToolRuntimeError::Io(format!("file.read failed for {}: {err}", path.display()))
+    })?;
+    let mut lines = Vec::new();
+
+    for entry in entries {
+        let entry = entry.map_err(|err| {
+            ToolRuntimeError::Io(format!(
+                "file.read failed while reading {}: {err}",
+                path.display()
+            ))
+        })?;
+        let entry_path = entry.path();
+        let suffix = if entry_path.is_dir() { "/" } else { "" };
+        lines.push(format!("{}{}", entry.file_name().to_string_lossy(), suffix));
+    }
+
+    lines.sort();
+    Ok(lines.join("\n"))
 }

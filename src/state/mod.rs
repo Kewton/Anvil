@@ -154,6 +154,14 @@ impl StateMachine {
                 StateTransition::Fail,
                 RuntimeState::Error
             ) | (
+                RuntimeState::Thinking,
+                StateTransition::ResetToReady,
+                RuntimeState::Ready
+            ) | (
+                RuntimeState::Working,
+                StateTransition::ResetToReady,
+                RuntimeState::Ready
+            ) | (
                 RuntimeState::Interrupted,
                 StateTransition::ResetToReady,
                 RuntimeState::Ready

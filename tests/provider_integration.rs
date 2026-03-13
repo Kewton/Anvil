@@ -7,6 +7,7 @@ use anvil::provider::{
 };
 use anvil::tui::Tui;
 use std::cell::RefCell;
+use std::fs;
 use std::rc::Rc;
 
 #[derive(Clone)]
@@ -93,15 +94,107 @@ fn live_turn_hands_session_messages_to_provider_and_renders_done() {
     let requests = seen_requests.borrow();
     let request = requests.last().expect("provider request should exist");
     assert_eq!(request.model, "local-default");
-    assert_eq!(request.messages.len(), 3);
-    assert_eq!(request.messages[0].role, ProviderMessageRole::User);
-    assert_eq!(request.messages[1].role, ProviderMessageRole::Assistant);
-    assert_eq!(request.messages[2].content, "current task");
+    assert_eq!(request.messages.len(), 4);
+    assert_eq!(request.messages[0].role, ProviderMessageRole::System);
+    assert_eq!(request.messages[1].role, ProviderMessageRole::User);
+    assert_eq!(request.messages[2].role, ProviderMessageRole::Assistant);
+    assert_eq!(request.messages[3].content, "current task");
     assert!(
         frames
             .last()
             .expect("done frame should exist")
             .contains("provider-backed turn completed")
+    );
+    assert!(request.messages[0].content.contains("ANVIL_TOOL"));
+}
+
+#[test]
+fn live_turn_executes_structured_file_write_response_without_approval() {
+    let root = common::unique_test_dir("structured_write");
+    let mut config = common::build_config_in(root.clone());
+    config.mode.approval_required = false;
+    let provider_ctx =
+        anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
+    let mut app = anvil::app::App::new(config, provider_ctx).expect("app should initialize");
+    let tui = Tui::new();
+    let provider = RecordingProvider {
+        seen_requests: Rc::new(RefCell::new(Vec::new())),
+        events: vec![ProviderEvent::Agent(AgentEvent::Done {
+            status: "Done. session saved".to_string(),
+            assistant_message: concat!(
+                "```ANVIL_TOOL\n",
+                "{\"id\":\"call_write_001\",\"tool\":\"file.write\",\"path\":\"./sandbox/test1_001/index.html\",\"content\":\"<html><body>invaders</body></html>\"}\n",
+                "```\n",
+                "```ANVIL_FINAL\n",
+                "Created the browser game shell in ./sandbox/test1_001 and reviewed the generated code for structure and launchability.\n",
+                "```\n"
+            )
+            .to_string(),
+            completion_summary: "Provider turn finished successfully.".to_string(),
+            saved_status: "session saved".to_string(),
+            tool_logs: Vec::new(),
+            elapsed_ms: 120,
+        })],
+        error: None,
+    };
+
+    let frames = app
+        .run_live_turn("build the game", &provider, &tui)
+        .expect("structured response should execute");
+
+    let written = fs::read_to_string(root.join("sandbox/test1_001/index.html"))
+        .expect("file.write should materialize output");
+    assert!(written.contains("invaders"));
+    assert!(
+        frames
+            .iter()
+            .any(|frame| frame.contains("[T] tool  > file.write"))
+    );
+    assert!(
+        frames
+            .last()
+            .expect("done frame should exist")
+            .contains("Created the browser game shell")
+    );
+}
+
+#[test]
+fn live_turn_executes_complete_structured_response_from_token_stream() {
+    let root = common::unique_test_dir("structured_stream_write");
+    let mut config = common::build_config_in(root.clone());
+    config.mode.approval_required = false;
+    let provider_ctx =
+        anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
+    let mut app = anvil::app::App::new(config, provider_ctx).expect("app should initialize");
+    let tui = Tui::new();
+    let provider = RecordingProvider {
+        seen_requests: Rc::new(RefCell::new(Vec::new())),
+        events: vec![ProviderEvent::TokenDelta(
+            concat!(
+                "```ANVIL_TOOL\n",
+                "{\"id\":\"call_write_001\",\"tool\":\"file.write\",\"path\":\"./sandbox/test1_001/index.html\",\"content\":\"<html><body>streamed invaders</body></html>\"}\n",
+                "```\n",
+                "```ANVIL_FINAL\n",
+                "Streamed game output was created and reviewed.\n",
+                "```\n"
+            )
+            .to_string(),
+        )],
+        error: None,
+    };
+
+    let frames = app
+        .run_live_turn("build from stream", &provider, &tui)
+        .expect("structured token stream should execute");
+
+    let written = fs::read_to_string(root.join("sandbox/test1_001/index.html"))
+        .expect("streamed file.write should materialize output");
+    assert!(written.contains("streamed invaders"));
+    assert!(
+        frames
+            .last()
+            .expect("done frame should exist")
+            .contains("Streamed game output was created")
     );
 }
 
@@ -436,6 +529,48 @@ fn ollama_provider_stream_turn_posts_chat_request_and_normalizes_chunked_respons
                 elapsed_ms: 0,
             }),
         ]
+    );
+}
+
+#[test]
+fn ollama_provider_accepts_dechunked_body_even_if_chunked_header_remains() {
+    let body = concat!(
+        "{\"message\":{\"role\":\"assistant\",\"content\":\"draft \"},\"done\":false}\n",
+        "{\"message\":{\"role\":\"assistant\",\"content\":\"answer\"},\"done\":false}\n",
+        "{\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true}\n"
+    );
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n{}",
+        body
+    )
+    .into_bytes();
+    let provider = OllamaProviderClient::with_transport(
+        "http://127.0.0.1:11434",
+        MockHttpTransport {
+            seen_authority: Rc::new(RefCell::new(Vec::new())),
+            seen_paths: Rc::new(RefCell::new(Vec::new())),
+            seen_bodies: Rc::new(RefCell::new(Vec::new())),
+            response,
+        },
+    );
+    let request = ProviderTurnRequest::new(
+        "local-default".to_string(),
+        vec![anvil::provider::ProviderMessage::new(
+            ProviderMessageRole::User,
+            "inspect src/provider",
+        )],
+        true,
+    );
+    let mut events = Vec::new();
+
+    provider
+        .stream_turn(&request, &mut |event| events.push(event))
+        .expect("provider should accept curl-style dechunked body");
+
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, ProviderEvent::TokenDelta(_)))
     );
 }
 

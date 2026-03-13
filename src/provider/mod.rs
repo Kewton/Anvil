@@ -1,8 +1,8 @@
 use crate::agent::AgentEvent;
 use crate::config::EffectiveConfig;
 use serde::{Deserialize, Serialize};
-use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::io::Write;
+use std::process::{Command, Stdio};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderBackend {
@@ -283,26 +283,8 @@ impl HttpTransport for TcpHttpTransport {
         path: &str,
         body: &[u8],
     ) -> Result<Vec<u8>, ProviderTurnError> {
-        let mut stream = TcpStream::connect((host, port)).map_err(|err| {
-            ProviderTurnError::Backend(format!("failed to connect to ollama: {err}"))
-        })?;
-        let http_request = format!(
-            "POST {path} HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        );
-        stream
-            .write_all(http_request.as_bytes())
-            .and_then(|_| stream.write_all(body))
-            .map_err(|err| {
-                ProviderTurnError::Backend(format!("failed to send ollama request: {err}"))
-            })?;
-        let _ = stream.shutdown(std::net::Shutdown::Write);
-
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response).map_err(|err| {
-            ProviderTurnError::Backend(format!("failed to read ollama response: {err}"))
-        })?;
-        Ok(response)
+        let url = format!("http://{host}:{port}{path}");
+        post_json_with_curl(&url, authority, host, body)
     }
 }
 
@@ -440,7 +422,10 @@ fn decode_ollama_response(response: &[u8]) -> Result<Vec<String>, ProviderTurnEr
     });
 
     let decoded_body = if is_chunked {
-        decode_chunked_body(body)?
+        match decode_chunked_body(body) {
+            Ok(decoded) => decoded,
+            Err(_) => body.to_vec(),
+        }
     } else {
         body.to_vec()
     };
@@ -499,4 +484,59 @@ fn find_crlf(body: &[u8], start: usize) -> Option<usize> {
         .windows(2)
         .position(|window| window == b"\r\n")
         .map(|offset| start + offset)
+}
+
+fn post_json_with_curl(
+    url: &str,
+    authority: &str,
+    host: &str,
+    body: &[u8],
+) -> Result<Vec<u8>, ProviderTurnError> {
+    let mut child = Command::new("curl")
+        .args([
+            "-sS",
+            "--http1.1",
+            "-i",
+            "-X",
+            "POST",
+            "-H",
+            &format!("Host: {authority}"),
+            "-H",
+            "Content-Type: application/json",
+            "--data-binary",
+            "@-",
+            url,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| {
+            ProviderTurnError::Backend(format!("failed to connect to ollama via curl: {err}"))
+        })?;
+
+    child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| {
+            ProviderTurnError::Backend("failed to open curl stdin for ollama request".to_string())
+        })?
+        .write_all(body)
+        .map_err(|err| {
+            ProviderTurnError::Backend(format!("failed to send ollama request via curl: {err}"))
+        })?;
+
+    let output = child.wait_with_output().map_err(|err| {
+        ProviderTurnError::Backend(format!("failed to read ollama response via curl: {err}"))
+    })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(ProviderTurnError::Backend(format!(
+            "failed to connect to ollama via curl for host {host}: {}",
+            stderr.trim()
+        )));
+    }
+
+    Ok(output.stdout)
 }

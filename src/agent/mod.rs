@@ -3,7 +3,9 @@ use crate::provider::{
     ProviderTurnRequest,
 };
 use crate::session::{MessageRole, SessionRecord};
+use crate::tooling::{ToolCallRequest, ToolInput};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AgentEvent {
@@ -96,6 +98,12 @@ impl AgentRuntime {
 
 pub struct BasicAgentLoop;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructuredAssistantResponse {
+    pub tool_calls: Vec<ToolCallRequest>,
+    pub final_response: String,
+}
+
 impl BasicAgentLoop {
     pub fn build_turn_request(
         model: impl Into<String>,
@@ -155,18 +163,20 @@ impl BasicAgentLoop {
 
         ProviderTurnRequest::new(
             model.into(),
-            selected
-                .into_iter()
-                .map(|message| {
-                    let role = match message.role {
-                        MessageRole::System => ProviderMessageRole::System,
-                        MessageRole::User => ProviderMessageRole::User,
-                        MessageRole::Assistant => ProviderMessageRole::Assistant,
-                        MessageRole::Tool => ProviderMessageRole::Tool,
-                    };
-                    ProviderMessage::new(role, message.content.clone())
-                })
-                .collect(),
+            std::iter::once(ProviderMessage::new(
+                ProviderMessageRole::System,
+                tool_protocol_system_prompt(),
+            ))
+            .chain(selected.into_iter().map(|message| {
+                let role = match message.role {
+                    MessageRole::System => ProviderMessageRole::System,
+                    MessageRole::User => ProviderMessageRole::User,
+                    MessageRole::Assistant => ProviderMessageRole::Assistant,
+                    MessageRole::Tool => ProviderMessageRole::Tool,
+                };
+                ProviderMessage::new(role, message.content.clone())
+            }))
+            .collect(),
             stream,
         )
     }
@@ -179,6 +189,77 @@ impl BasicAgentLoop {
         provider.stream_turn(request, &mut |event| events.push(event))?;
         Ok(events)
     }
+
+    pub fn parse_structured_response(content: &str) -> Result<StructuredAssistantResponse, String> {
+        let tool_blocks = extract_fenced_blocks(content, "ANVIL_TOOL");
+        let final_block = extract_final_block(content, "ANVIL_FINAL");
+
+        let mut tool_calls = Vec::new();
+        for block in tool_blocks {
+            let value: Value = serde_json::from_str(&block)
+                .map_err(|err| format!("invalid ANVIL_TOOL JSON: {err}"))?;
+            let tool_name = value
+                .get("tool")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "missing tool in ANVIL_TOOL block".to_string())?;
+            let tool_call_id = value
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("call_generated_001");
+            let input = match tool_name {
+                "file.write" => ToolInput::FileWrite {
+                    path: value
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| "missing path in file.write tool block".to_string())?
+                        .to_string(),
+                    content: value
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| "missing content in file.write tool block".to_string())?
+                        .to_string(),
+                },
+                "file.read" => ToolInput::FileRead {
+                    path: value
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| "missing path in file.read tool block".to_string())?
+                        .to_string(),
+                },
+                "file.search" => ToolInput::FileSearch {
+                    root: value
+                        .get("root")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| "missing root in file.search tool block".to_string())?
+                        .to_string(),
+                    pattern: value
+                        .get("pattern")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| "missing pattern in file.search tool block".to_string())?
+                        .to_string(),
+                },
+                other => return Err(format!("unsupported tool in ANVIL_TOOL block: {other}")),
+            };
+            tool_calls.push(ToolCallRequest::new(
+                tool_call_id.to_string(),
+                tool_name.to_string(),
+                input,
+            ));
+        }
+
+        let final_response = final_block
+            .map(|block| block.trim().to_string())
+            .unwrap_or_else(|| content.trim().to_string());
+
+        Ok(StructuredAssistantResponse {
+            tool_calls,
+            final_response,
+        })
+    }
+
+    pub fn is_complete_structured_response(content: &str) -> bool {
+        extract_final_block(content, "ANVIL_FINAL").is_some()
+    }
 }
 
 fn derive_context_budget(context_window: u32) -> usize {
@@ -189,4 +270,48 @@ fn derive_context_budget(context_window: u32) -> usize {
 fn estimate_message_tokens(content: &str) -> usize {
     let chars = content.chars().count();
     chars.div_ceil(4).max(1)
+}
+
+fn tool_protocol_system_prompt() -> &'static str {
+    concat!(
+        "You are Anvil. When a task requires file changes, respond using this protocol.\n",
+        "Use one or more fenced blocks exactly like:\n",
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_001\",\"tool\":\"file.write\",\"path\":\"./relative/path\",\"content\":\"...\"}\n",
+        "```\n",
+        "Supported tools: file.write, file.read, file.search.\n",
+        "After tool blocks, include exactly one final fenced block:\n",
+        "```ANVIL_FINAL\n",
+        "User-facing summary and code review notes.\n",
+        "```\n",
+        "Do not use any other tool syntax."
+    )
+}
+
+fn extract_fenced_blocks(content: &str, label: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let start_marker = format!("```{label}\n");
+    let end_marker = "\n```";
+    let mut cursor = 0usize;
+
+    while let Some(start) = content[cursor..].find(&start_marker) {
+        let block_start = cursor + start + start_marker.len();
+        if let Some(end) = content[block_start..].find(end_marker) {
+            let block_end = block_start + end;
+            blocks.push(content[block_start..block_end].to_string());
+            cursor = block_end + end_marker.len();
+        } else {
+            break;
+        }
+    }
+
+    blocks
+}
+
+fn extract_final_block(content: &str, label: &str) -> Option<String> {
+    let start_marker = format!("```{label}\n");
+    let start = content.find(&start_marker)?;
+    let block_start = start + start_marker.len();
+    let block_end = content.rfind("\n```")?;
+    (block_end >= block_start).then(|| content[block_start..block_end].to_string())
 }

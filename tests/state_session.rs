@@ -91,6 +91,23 @@ fn state_machine_allows_working_to_resume_thinking() {
 }
 
 #[test]
+fn state_machine_allows_reset_from_thinking() {
+    let mut machine = StateMachine::new();
+    machine
+        .transition_to(
+            AppStateSnapshot::new(RuntimeState::Thinking),
+            StateTransition::StartThinking,
+        )
+        .expect("ready -> thinking should be valid");
+    machine
+        .transition_to(
+            AppStateSnapshot::new(RuntimeState::Ready),
+            StateTransition::ResetToReady,
+        )
+        .expect("thinking -> ready reset should be valid");
+}
+
+#[test]
 fn session_store_persists_and_restores_messages() {
     let root = unique_test_dir("session_roundtrip");
     let mut config =

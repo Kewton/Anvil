@@ -1,7 +1,7 @@
 pub mod mock;
 
 use crate::agent::BasicAgentLoop;
-use crate::agent::{AgentEvent, AgentRuntime, PendingTurnState};
+use crate::agent::{AgentEvent, AgentRuntime, PendingTurnState, StructuredAssistantResponse};
 use crate::config::EffectiveConfig;
 use crate::contracts::{
     AppEvent, AppStateSnapshot, ConsoleRenderContext, RuntimeState, ToolLogView,
@@ -16,7 +16,10 @@ use crate::session::{
     new_assistant_message, new_user_message,
 };
 use crate::state::{StateMachine, StateTransition};
-use crate::tooling::{ToolExecutionPayload, ToolExecutionResult, ToolExecutionStatus};
+use crate::tooling::{
+    LocalToolExecutor, ToolExecutionError, ToolExecutionPayload, ToolExecutionPolicy,
+    ToolExecutionResult, ToolExecutionStatus, ToolRegistry, ToolRuntimeError,
+};
 use crate::tui::Tui;
 use std::fmt::{Display, Formatter};
 use std::io::{self, BufRead, Write};
@@ -31,6 +34,7 @@ pub struct App {
     session: SessionRecord,
     pending_turn: Option<PendingTurnState>,
     extensions: ExtensionRegistry,
+    tools: ToolRegistry,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +55,7 @@ pub enum AppError {
     Session(SessionError),
     ProviderTurn(ProviderTurnError),
     StateTransition(crate::state::StateTransitionError),
+    ToolExecution(String),
     NoPendingApproval,
     PendingApprovalRequired,
 }
@@ -63,6 +68,7 @@ impl Display for AppError {
             Self::Session(err) => write!(f, "{err}"),
             Self::ProviderTurn(err) => write!(f, "{err}"),
             Self::StateTransition(err) => write!(f, "{err}"),
+            Self::ToolExecution(err) => write!(f, "{err}"),
             Self::NoPendingApproval => write!(f, "no pending approval to continue"),
             Self::PendingApprovalRequired => {
                 write!(f, "resolve the pending approval before starting a new turn")
@@ -116,6 +122,7 @@ impl App {
             .unwrap_or_else(|| AppStateSnapshot::new(RuntimeState::Ready));
 
         Ok(Self {
+            tools: standard_tool_registry(),
             config,
             provider,
             state_machine: StateMachine::from_snapshot(initial_state_snapshot),
@@ -259,27 +266,46 @@ impl App {
                 for (index, event) in provider_events.iter().enumerate() {
                     match event {
                         ProviderEvent::Agent(agent_event) => {
-                            let snapshot = self.apply_agent_event(&agent_event)?;
-                            frames.push(self.render_console(tui)?);
-                            if snapshot.state == RuntimeState::AwaitingApproval {
-                                let remaining_events = provider_events[index + 1..]
-                                    .iter()
-                                    .filter_map(|event| match event {
-                                        ProviderEvent::Agent(agent_event) => {
-                                            Some(agent_event.clone())
-                                        }
-                                        ProviderEvent::TokenDelta(_) => None,
-                                    })
-                                    .collect::<Vec<_>>();
-                                self.set_pending_turn(PendingTurnState {
-                                    waiting_tool_call_id: approval_tool_call_id(agent_event),
-                                    remaining_events,
-                                })?;
-                                break;
+                            if let Some(structured_frames) =
+                                self.handle_structured_done(agent_event, tui)?
+                            {
+                                frames.extend(structured_frames);
+                            } else {
+                                let snapshot = self.apply_agent_event(&agent_event)?;
+                                frames.push(self.render_console(tui)?);
+                                if snapshot.state == RuntimeState::AwaitingApproval {
+                                    let remaining_events = provider_events[index + 1..]
+                                        .iter()
+                                        .filter_map(|event| match event {
+                                            ProviderEvent::Agent(agent_event) => {
+                                                Some(agent_event.clone())
+                                            }
+                                            ProviderEvent::TokenDelta(_) => None,
+                                        })
+                                        .collect::<Vec<_>>();
+                                    self.set_pending_turn(PendingTurnState {
+                                        waiting_tool_call_id: approval_tool_call_id(agent_event),
+                                        remaining_events,
+                                    })?;
+                                    break;
+                                }
                             }
                         }
                         ProviderEvent::TokenDelta(delta) => {
                             token_buffer.push_str(delta);
+                            if BasicAgentLoop::is_complete_structured_response(&token_buffer) {
+                                let structured =
+                                    BasicAgentLoop::parse_structured_response(&token_buffer)
+                                        .map_err(AppError::ToolExecution)?;
+                                frames.extend(self.complete_structured_response(
+                                    structured,
+                                    "Done. session saved",
+                                    "session saved",
+                                    0,
+                                    tui,
+                                )?);
+                                break;
+                            }
                             frames.push(self.render_token_delta_frame(&token_buffer, tui)?);
                         }
                     }
@@ -421,6 +447,114 @@ impl App {
         }
 
         Ok(frames)
+    }
+
+    fn handle_structured_done(
+        &mut self,
+        event: &AgentEvent,
+        tui: &Tui,
+    ) -> Result<Option<Vec<String>>, AppError> {
+        let AgentEvent::Done {
+            status,
+            assistant_message,
+            completion_summary: _,
+            saved_status,
+            tool_logs: _,
+            elapsed_ms,
+        } = event
+        else {
+            return Ok(None);
+        };
+
+        let structured = BasicAgentLoop::parse_structured_response(assistant_message)
+            .map_err(AppError::ToolExecution)?;
+        if structured.tool_calls.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(self.complete_structured_response(
+            structured,
+            status,
+            saved_status,
+            *elapsed_ms,
+            tui,
+        )?))
+    }
+
+    fn complete_structured_response(
+        &mut self,
+        structured: StructuredAssistantResponse,
+        status: &str,
+        saved_status: &str,
+        elapsed_ms: u128,
+        tui: &Tui,
+    ) -> Result<Vec<String>, AppError> {
+        let results = self.execute_structured_tool_calls(&structured)?;
+        let tool_log_views = results
+            .iter()
+            .map(ToolExecutionResult::to_tool_log_view)
+            .collect::<Vec<_>>();
+
+        let working = AppStateSnapshot::new(RuntimeState::Working)
+            .with_status("Executing tool plan".to_string())
+            .with_tool_logs(tool_log_views.clone())
+            .with_elapsed_ms(elapsed_ms)
+            .with_context_usage(
+                self.session.estimated_token_count(),
+                self.config.runtime.context_window,
+            );
+        let _ = self.apply_transition(working, StateTransition::StartWorking)?;
+
+        self.record_assistant_output(self.next_message_id("assistant"), structured.final_response)?;
+        let done = AppStateSnapshot::new(RuntimeState::Done)
+            .with_status(status.to_string())
+            .with_tool_logs(tool_log_views)
+            .with_completion_summary(
+                format!("Executed {} tool call(s). {}", results.len(), saved_status),
+                saved_status.to_string(),
+            )
+            .with_elapsed_ms(elapsed_ms)
+            .with_context_usage(
+                self.session.estimated_token_count(),
+                self.config.runtime.context_window,
+            );
+        let _ = self.apply_transition(done, StateTransition::Finish)?;
+
+        Ok(vec![self.render_console(tui)?])
+    }
+
+    fn execute_structured_tool_calls(
+        &mut self,
+        structured: &StructuredAssistantResponse,
+    ) -> Result<Vec<ToolExecutionResult>, AppError> {
+        let executor = LocalToolExecutor::new(self.config.paths.cwd.clone());
+        let mut results = Vec::new();
+        for call in &structured.tool_calls {
+            let validated = self.tools.validate(call.clone()).map_err(|err| {
+                AppError::ToolExecution(format!("tool validation failed: {err:?}"))
+            })?;
+            let request = validated
+                .approve()
+                .into_execution_request(ToolExecutionPolicy {
+                    approval_required: self.config.mode.approval_required,
+                    allow_restricted: false,
+                    plan_mode: false,
+                    plan_scope_granted: true,
+                })
+                .map_err(map_tool_execution_error)?;
+            let result = executor.execute(request).map_err(map_tool_runtime_error)?;
+            self.session.push_message(
+                SessionMessage::new(
+                    MessageRole::Tool,
+                    "tool",
+                    format!("{} {}", result.tool_name, result.summary),
+                )
+                .with_id(self.next_message_id("tool")),
+            );
+            results.push(result);
+        }
+        self.persist_session(AppEvent::SessionSaved)?;
+        Ok(results)
     }
 
     fn apply_agent_event(&mut self, event: &AgentEvent) -> Result<AppStateSnapshot, AppError> {
@@ -731,6 +865,29 @@ fn build_tool_logs(logs: &[(String, String, String)]) -> Vec<ToolLogView> {
         })
         .map(|result| result.to_tool_log_view())
         .collect()
+}
+
+fn standard_tool_registry() -> ToolRegistry {
+    let mut registry = ToolRegistry::new();
+    registry.register_standard_tools();
+    registry
+}
+
+fn map_tool_execution_error(error: ToolExecutionError) -> AppError {
+    AppError::ToolExecution(match error {
+        ToolExecutionError::ApprovalRequired(call_id) => {
+            format!("tool approval required for {call_id}")
+        }
+        ToolExecutionError::RestrictedTool(tool) => format!("restricted tool blocked: {tool}"),
+        ToolExecutionError::PlanModeBlocked(tool) => format!("tool blocked in plan mode: {tool}"),
+        ToolExecutionError::PlanModeScopeRequired(tool) => {
+            format!("tool scope required in plan mode: {tool}")
+        }
+    })
+}
+
+fn map_tool_runtime_error(error: ToolRuntimeError) -> AppError {
+    AppError::ToolExecution(error.to_string())
 }
 
 fn approval_tool_call_id(event: &AgentEvent) -> String {

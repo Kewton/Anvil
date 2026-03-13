@@ -1,9 +1,10 @@
 use anvil::tooling::{
-    ExecutionClass, ParallelExecutionPlan, ParallelExecutionPlanError, PermissionClass,
-    PlanModePolicy, RollbackPolicy, ToolCallRequest, ToolExecutionError, ToolExecutionPayload,
-    ToolExecutionPolicy, ToolExecutionResult, ToolExecutionStatus, ToolInput, ToolKind,
-    ToolRegistry, ToolValidationError,
+    ExecutionClass, LocalToolExecutor, ParallelExecutionPlan, ParallelExecutionPlanError,
+    PermissionClass, PlanModePolicy, RollbackPolicy, ToolCallRequest, ToolExecutionError,
+    ToolExecutionPayload, ToolExecutionPolicy, ToolExecutionRequest, ToolExecutionResult,
+    ToolExecutionStatus, ToolInput, ToolKind, ToolRegistry, ToolValidationError,
 };
+use std::fs;
 
 fn build_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
@@ -363,4 +364,33 @@ fn tool_execution_result_can_bridge_into_console_tool_log_view() {
     assert_eq!(log.tool_name, "file.read");
     assert_eq!(log.action, "completed");
     assert_eq!(log.target, "Read src/app/mod.rs");
+}
+
+#[test]
+fn local_tool_executor_reads_directory_as_listing() {
+    let root = std::env::temp_dir().join("anvil_tool_executor_dir_listing");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("sandbox/test1_001")).expect("dir should exist");
+    fs::write(root.join("sandbox/test1_001/index.html"), "<html></html>").expect("file exists");
+    let executor = LocalToolExecutor::new(root.clone());
+
+    let result = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_dir_read_001".to_string(),
+            spec: build_registry()
+                .get("file.read")
+                .expect("file.read spec")
+                .clone(),
+            input: ToolInput::FileRead {
+                path: "./sandbox/test1_001".to_string(),
+            },
+        })
+        .expect("directory listing should succeed");
+
+    match result.payload {
+        ToolExecutionPayload::Text(listing) => {
+            assert!(listing.contains("index.html"));
+        }
+        other => panic!("unexpected payload: {other:?}"),
+    }
 }
