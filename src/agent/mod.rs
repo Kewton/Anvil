@@ -196,55 +196,7 @@ impl BasicAgentLoop {
 
         let mut tool_calls = Vec::new();
         for block in tool_blocks {
-            let value: Value = serde_json::from_str(&block)
-                .map_err(|err| format!("invalid ANVIL_TOOL JSON: {err}"))?;
-            let tool_name = value
-                .get("tool")
-                .and_then(Value::as_str)
-                .ok_or_else(|| "missing tool in ANVIL_TOOL block".to_string())?;
-            let tool_call_id = value
-                .get("id")
-                .and_then(Value::as_str)
-                .unwrap_or("call_generated_001");
-            let input = match tool_name {
-                "file.write" => ToolInput::FileWrite {
-                    path: value
-                        .get("path")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| "missing path in file.write tool block".to_string())?
-                        .to_string(),
-                    content: value
-                        .get("content")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| "missing content in file.write tool block".to_string())?
-                        .to_string(),
-                },
-                "file.read" => ToolInput::FileRead {
-                    path: value
-                        .get("path")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| "missing path in file.read tool block".to_string())?
-                        .to_string(),
-                },
-                "file.search" => ToolInput::FileSearch {
-                    root: value
-                        .get("root")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| "missing root in file.search tool block".to_string())?
-                        .to_string(),
-                    pattern: value
-                        .get("pattern")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| "missing pattern in file.search tool block".to_string())?
-                        .to_string(),
-                },
-                other => return Err(format!("unsupported tool in ANVIL_TOOL block: {other}")),
-            };
-            tool_calls.push(ToolCallRequest::new(
-                tool_call_id.to_string(),
-                tool_name.to_string(),
-                input,
-            ));
+            tool_calls.push(parse_tool_call_block(&block)?);
         }
 
         let final_response = final_block
@@ -260,6 +212,137 @@ impl BasicAgentLoop {
     pub fn is_complete_structured_response(content: &str) -> bool {
         extract_final_block(content, "ANVIL_FINAL").is_some()
     }
+}
+
+fn parse_tool_call_block(block: &str) -> Result<ToolCallRequest, String> {
+    match serde_json::from_str::<Value>(block) {
+        Ok(value) => parse_tool_call_value(&value),
+        Err(err) => repair_tool_call_block(block)
+            .ok_or_else(|| format!("invalid ANVIL_TOOL JSON: {err}")),
+    }
+}
+
+fn parse_tool_call_value(value: &Value) -> Result<ToolCallRequest, String> {
+    let tool_name = value
+        .get("tool")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "missing tool in ANVIL_TOOL block".to_string())?;
+    let tool_call_id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("call_generated_001");
+    let input = match tool_name {
+        "file.write" => ToolInput::FileWrite {
+            path: value
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "missing path in file.write tool block".to_string())?
+                .to_string(),
+            content: value
+                .get("content")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "missing content in file.write tool block".to_string())?
+                .to_string(),
+        },
+        "file.read" => ToolInput::FileRead {
+            path: value
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "missing path in file.read tool block".to_string())?
+                .to_string(),
+        },
+        "file.search" => ToolInput::FileSearch {
+            root: value
+                .get("root")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "missing root in file.search tool block".to_string())?
+                .to_string(),
+            pattern: value
+                .get("pattern")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "missing pattern in file.search tool block".to_string())?
+                .to_string(),
+        },
+        other => return Err(format!("unsupported tool in ANVIL_TOOL block: {other}")),
+    };
+
+    Ok(ToolCallRequest::new(
+        tool_call_id.to_string(),
+        tool_name.to_string(),
+        input,
+    ))
+}
+
+fn repair_tool_call_block(block: &str) -> Option<ToolCallRequest> {
+    let tool_name = extract_simple_string_field(block, "tool")?;
+    let tool_call_id =
+        extract_simple_string_field(block, "id").unwrap_or_else(|| "call_generated_001".to_string());
+
+    let input = match tool_name.as_str() {
+        "file.write" => ToolInput::FileWrite {
+            path: extract_simple_string_field(block, "path")?,
+            content: extract_trailing_string_field(block, "content")?,
+        },
+        "file.read" => ToolInput::FileRead {
+            path: extract_simple_string_field(block, "path")?,
+        },
+        "file.search" => ToolInput::FileSearch {
+            root: extract_simple_string_field(block, "root")?,
+            pattern: extract_simple_string_field(block, "pattern")?,
+        },
+        _ => return None,
+    };
+
+    Some(ToolCallRequest::new(tool_call_id, tool_name, input))
+}
+
+fn extract_simple_string_field(block: &str, key: &str) -> Option<String> {
+    let marker = format!("\"{key}\":\"");
+    let start = block.find(&marker)? + marker.len();
+    let tail = &block[start..];
+    let mut result = String::new();
+    let mut escaped = false;
+
+    for ch in tail.chars() {
+        if escaped {
+            result.push(match ch {
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                '"' => '"',
+                '\\' => '\\',
+                other => other,
+            });
+            escaped = false;
+            continue;
+        }
+
+        match ch {
+            '\\' => escaped = true,
+            '"' => return Some(result),
+            other => result.push(other),
+        }
+    }
+
+    None
+}
+
+fn extract_trailing_string_field(block: &str, key: &str) -> Option<String> {
+    let marker = format!("\"{key}\":\"");
+    let start = block.find(&marker)? + marker.len();
+    let closing_brace = block.rfind('}')?;
+    let before_brace = &block[..closing_brace];
+    let end = before_brace.rfind('"')?;
+    (end >= start).then(|| loose_unescape(&block[start..end]))
+}
+
+fn loose_unescape(value: &str) -> String {
+    value
+        .replace("\\n", "\n")
+        .replace("\\r", "\r")
+        .replace("\\t", "\t")
+        .replace("\\\"", "\"")
+        .replace("\\\\", "\\")
 }
 
 fn derive_context_budget(context_window: u32) -> usize {

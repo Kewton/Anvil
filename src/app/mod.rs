@@ -255,7 +255,7 @@ impl App {
         let request = BasicAgentLoop::build_turn_request(
             self.config.runtime.model.clone(),
             &self.session,
-            self.provider.capabilities.streaming,
+            self.provider.capabilities.streaming && self.config.runtime.stream,
             self.config.runtime.context_window,
         );
 
@@ -263,6 +263,7 @@ impl App {
             Ok(provider_events) => {
                 let mut frames = Vec::new();
                 let mut token_buffer = String::new();
+                let mut last_rendered_len = 0usize;
                 for (index, event) in provider_events.iter().enumerate() {
                     match event {
                         ProviderEvent::Agent(agent_event) => {
@@ -306,7 +307,14 @@ impl App {
                                 )?);
                                 break;
                             }
-                            frames.push(self.render_token_delta_frame(&token_buffer, tui)?);
+                            if should_render_stream_progress(
+                                &token_buffer,
+                                delta,
+                                last_rendered_len,
+                            ) {
+                                frames.push(self.render_token_delta_frame(&token_buffer, tui)?);
+                                last_rendered_len = token_buffer.len();
+                            }
                         }
                     }
                 }
@@ -716,9 +724,10 @@ impl App {
         token_buffer: &str,
         tui: &Tui,
     ) -> Result<String, AppError> {
+        let visible = recent_stream_excerpt(token_buffer, 400);
         let snapshot = AppStateSnapshot::new(RuntimeState::Thinking)
             .with_status(format!("Streaming. model={}", self.config.runtime.model))
-            .with_reasoning_summary(vec![token_buffer.to_string()])
+            .with_reasoning_summary(vec![visible])
             .with_context_usage(
                 self.session.estimated_token_count(),
                 self.config.runtime.context_window,
@@ -888,6 +897,27 @@ fn map_tool_execution_error(error: ToolExecutionError) -> AppError {
 
 fn map_tool_runtime_error(error: ToolRuntimeError) -> AppError {
     AppError::ToolExecution(error.to_string())
+}
+
+fn should_render_stream_progress(
+    token_buffer: &str,
+    delta: &str,
+    last_rendered_len: usize,
+) -> bool {
+    last_rendered_len == 0
+        || token_buffer.len().saturating_sub(last_rendered_len) >= 512
+        || delta.contains('\n')
+        || delta.contains("```ANVIL_")
+}
+
+fn recent_stream_excerpt(content: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = content.chars().collect();
+    if chars.len() <= max_chars {
+        return content.to_string();
+    }
+
+    let tail: String = chars[chars.len() - max_chars..].iter().collect();
+    format!("...{tail}")
 }
 
 fn approval_tool_call_id(event: &AgentEvent) -> String {

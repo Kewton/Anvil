@@ -29,6 +29,7 @@ fn effective_config_derives_workspace_and_session_paths() {
     assert!(config.mode.interactive);
     assert!(config.mode.approval_required);
     assert_eq!(config.runtime.provider_url, "http://127.0.0.1:11434");
+    assert!(config.runtime.stream);
     assert_eq!(
         config.mode.reasoning_visibility,
         ReasoningVisibility::Summary
@@ -91,9 +92,11 @@ fn override_precedence_is_file_then_env_then_cli() {
     let mut env_values = HashMap::new();
     env_values.insert("ANVIL_MODEL".to_string(), "env-model".to_string());
     env_values.insert("ANVIL_DEBUG".to_string(), "true".to_string());
+    env_values.insert("ANVIL_STREAM".to_string(), "true".to_string());
 
     let mut cli_values = HashMap::new();
     cli_values.insert("ANVIL_MODEL".to_string(), "cli-model".to_string());
+    cli_values.insert("ANVIL_STREAM".to_string(), "false".to_string());
 
     config
         .apply_overrides_for_test(&file_values, &env_values, &cli_values)
@@ -101,4 +104,5 @@ fn override_precedence_is_file_then_env_then_cli() {
 
     assert_eq!(config.runtime.model, "cli-model");
     assert!(config.mode.debug_logging);
+    assert!(!config.runtime.stream);
 }

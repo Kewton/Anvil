@@ -14,6 +14,7 @@ pub struct RuntimeConfig {
     pub model: String,
     pub sidecar_model: Option<String>,
     pub context_window: u32,
+    pub stream: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +96,7 @@ impl EffectiveConfig {
                 model: "local-default".to_string(),
                 sidecar_model: None,
                 context_window: 200_000,
+                stream: true,
             },
             mode: ModeConfig {
                 interactive: true,
@@ -152,6 +154,7 @@ impl EffectiveConfig {
             "ANVIL_PROVIDER_URL",
             "ANVIL_SIDECAR_MODEL",
             "ANVIL_CONTEXT_WINDOW",
+            "ANVIL_STREAM",
             "ANVIL_INTERACTIVE",
             "ANVIL_APPROVAL_REQUIRED",
             "ANVIL_REASONING_VISIBILITY",
@@ -195,6 +198,9 @@ impl EffectiveConfig {
                         map.insert("ANVIL_CONTEXT_WINDOW".to_string(), value);
                     }
                 }
+                "--no-stream" => {
+                    map.insert("ANVIL_STREAM".to_string(), "false".to_string());
+                }
                 "--debug" => {
                     map.insert("ANVIL_DEBUG".to_string(), "true".to_string());
                 }
@@ -233,6 +239,9 @@ impl EffectiveConfig {
                     self.runtime.context_window = value
                         .parse()
                         .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                }
+                "stream" | "ANVIL_STREAM" => {
+                    self.runtime.stream = parse_bool(value);
                 }
                 "interactive" | "ANVIL_INTERACTIVE" => {
                     self.mode.interactive = parse_bool(value);

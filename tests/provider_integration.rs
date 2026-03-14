@@ -199,6 +199,81 @@ fn live_turn_executes_complete_structured_response_from_token_stream() {
 }
 
 #[test]
+fn structured_response_parser_repairs_malformed_file_write_block() {
+    let response = anvil::agent::BasicAgentLoop::parse_structured_response(concat!(
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_write_001\",\"tool\":\"file.write\",\"path\":\"./sandbox/test1_002/Invader.html\",\"content\":\"<html>\n",
+        "<body>\n",
+        "<button aria-label=\"left\">LEFT</button>\n",
+        "</body>\n",
+        "</html>\"}\n",
+        "```\n",
+        "```ANVIL_FINAL\n",
+        "Created the game and reviewed the output.\n",
+        "```\n"
+    ))
+    .expect("parser should repair malformed file.write JSON");
+
+    assert_eq!(response.tool_calls.len(), 1);
+    match &response.tool_calls[0].input {
+        anvil::tooling::ToolInput::FileWrite { path, content } => {
+            assert_eq!(path, "./sandbox/test1_002/Invader.html");
+            assert!(content.contains("aria-label=\"left\""));
+            assert!(content.contains("<button"));
+        }
+        other => panic!("unexpected tool input: {other:?}"),
+    }
+}
+
+#[test]
+fn live_turn_executes_malformed_structured_file_write_response() {
+    let root = common::unique_test_dir("malformed_structured_write");
+    let mut config = common::build_config_in(root.clone());
+    config.mode.approval_required = false;
+    let provider_ctx =
+        anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
+    let mut app = anvil::app::App::new(config, provider_ctx).expect("app should initialize");
+    let tui = Tui::new();
+    let provider = RecordingProvider {
+        seen_requests: Rc::new(RefCell::new(Vec::new())),
+        events: vec![ProviderEvent::Agent(AgentEvent::Done {
+            status: "Done. session saved".to_string(),
+            assistant_message: concat!(
+                "```ANVIL_TOOL\n",
+                "{\"id\":\"call_write_001\",\"tool\":\"file.write\",\"path\":\"./sandbox/test1_002/Invader.html\",\"content\":\"<html>\n",
+                "<body>\n",
+                "<button aria-label=\"left\">LEFT</button>\n",
+                "</body>\n",
+                "</html>\"}\n",
+                "```\n",
+                "```ANVIL_FINAL\n",
+                "Created the browser game and reviewed the generated code.\n",
+                "```\n"
+            )
+            .to_string(),
+            completion_summary: "Provider turn finished successfully.".to_string(),
+            saved_status: "session saved".to_string(),
+            tool_logs: Vec::new(),
+            elapsed_ms: 120,
+        })],
+        error: None,
+    };
+
+    let frames = app
+        .run_live_turn("build the game", &provider, &tui)
+        .expect("malformed structured response should execute");
+
+    let written = fs::read_to_string(root.join("sandbox/test1_002/Invader.html"))
+        .expect("file.write should materialize output");
+    assert!(written.contains("aria-label=\"left\""));
+    assert!(
+        frames
+            .iter()
+            .any(|frame| frame.contains("file.write completed ./sandbox/test1_002/Invader.html"))
+    );
+}
+
+#[test]
 fn live_turn_maps_provider_cancellation_to_interrupted_state() {
     let mut app = common::build_app();
     let tui = Tui::new();
@@ -240,6 +315,7 @@ fn ollama_provider_builds_chat_request_shape() {
 
     assert_eq!(ollama_request.model, "local-default");
     assert!(ollama_request.stream);
+    assert!(!ollama_request.think);
     assert_eq!(
         ollama_request.messages,
         vec![OllamaChatMessage {
@@ -355,11 +431,7 @@ fn live_turn_surfaces_token_delta_progress() {
         .run_live_turn("stream this", &provider, &tui)
         .expect("live turn should succeed");
 
-    assert!(
-        frames
-            .iter()
-            .any(|frame| frame.contains("drafting response"))
-    );
+    assert!(frames.iter().any(|frame| frame.contains("drafting ")));
 }
 
 #[test]

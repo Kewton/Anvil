@@ -141,6 +141,8 @@ pub struct OllamaChatRequest {
     pub model: String,
     pub messages: Vec<OllamaChatMessage>,
     pub stream: bool,
+    #[serde(default)]
+    pub think: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,6 +196,7 @@ impl<T> OllamaProviderClient<T> {
                 })
                 .collect(),
             stream: request.stream,
+            think: false,
         }
     }
 
