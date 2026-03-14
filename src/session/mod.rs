@@ -1,3 +1,8 @@
+/// Session persistence and message history.
+///
+/// [`SessionRecord`] captures the full conversation state and is serialised
+/// to disk via [`SessionStore`] so that sessions survive process restarts.
+
 use crate::agent::PendingTurnState;
 use crate::config::EffectiveConfig;
 use crate::contracts::{

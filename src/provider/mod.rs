@@ -1,18 +1,30 @@
+/// Provider integration layer.
+///
+/// Abstracts LLM provider communication behind the [`ProviderClient`] trait,
+/// allowing both Ollama and OpenAI-compatible backends to share the same
+/// application-level flow.  HTTP transport is pluggable via [`HttpTransport`].
+pub mod openai;
+
 use crate::agent::AgentEvent;
 use crate::config::EffectiveConfig;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+/// Supported LLM provider backends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderBackend {
     Ollama,
+    OpenAi,
 }
 
+/// Dispatch enum for concrete provider clients.
 pub enum LocalProviderClient {
     Ollama(OllamaProviderClient),
+    OpenAi(openai::OpenAiCompatibleProviderClient),
 }
 
+/// Feature flags discovered (or assumed) for a provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderCapabilities {
     pub streaming: bool,
@@ -28,12 +40,14 @@ impl Default for ProviderCapabilities {
     }
 }
 
+/// Bootstrapped provider context available for the lifetime of a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderRuntimeContext {
     pub backend: ProviderBackend,
     pub capabilities: ProviderCapabilities,
 }
 
+/// Message role used in provider requests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderMessageRole {
     System,
@@ -42,6 +56,7 @@ pub enum ProviderMessageRole {
     Tool,
 }
 
+/// A single message in a provider request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderMessage {
     pub role: ProviderMessageRole,
@@ -57,6 +72,7 @@ impl ProviderMessage {
     }
 }
 
+/// Request payload sent to a provider for one turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderTurnRequest {
     pub model: String,
@@ -74,24 +90,28 @@ impl ProviderTurnRequest {
     }
 }
 
+/// Events emitted by a provider during a turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderEvent {
     Agent(AgentEvent),
     TokenDelta(String),
 }
 
+/// Errors that can occur during a provider turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderTurnError {
     Cancelled,
     Backend(String),
 }
 
+/// Classification of provider errors for persistence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProviderErrorKind {
     Cancelled,
     Backend,
 }
 
+/// A provider error record stored in the session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderErrorRecord {
     pub kind: ProviderErrorKind,
@@ -109,6 +129,10 @@ impl std::fmt::Display for ProviderTurnError {
 
 impl std::error::Error for ProviderTurnError {}
 
+/// Abstraction over LLM provider communication.
+///
+/// Implementors receive a request and emit [`ProviderEvent`]s via the
+/// provided callback.
 pub trait ProviderClient {
     fn stream_turn(
         &self,
@@ -117,25 +141,53 @@ pub trait ProviderClient {
     ) -> Result<(), ProviderTurnError>;
 }
 
-pub trait HttpTransport {
-    fn post_json(
-        &self,
-        authority: &str,
-        host: &str,
-        port: u16,
-        path: &str,
-        body: &[u8],
-    ) -> Result<Vec<u8>, ProviderTurnError>;
+// ---------------------------------------------------------------------------
+// HTTP transport abstraction
+// ---------------------------------------------------------------------------
+
+/// Parsed HTTP response returned by an [`HttpTransport`] implementation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpResponse {
+    pub status_code: u16,
+    pub body: Vec<u8>,
 }
 
-pub struct TcpHttpTransport;
+/// Low-level HTTP transport used by provider clients.
+///
+/// The trait is intentionally simple so that it can be backed by `curl`,
+/// a Rust HTTP library, or a test mock.
+pub trait HttpTransport {
+    fn post_json(&self, url: &str, body: &[u8]) -> Result<HttpResponse, ProviderTurnError>;
+}
 
+/// HTTP transport backed by the `curl` subprocess.
+///
+/// This is the default transport.  It works on any system where `curl` is
+/// installed and avoids pulling in native TLS dependencies.
+pub struct CurlHttpTransport;
+
+/// Backward-compatible alias.
+pub type TcpHttpTransport = CurlHttpTransport;
+
+impl HttpTransport for CurlHttpTransport {
+    fn post_json(&self, url: &str, body: &[u8]) -> Result<HttpResponse, ProviderTurnError> {
+        let raw = post_json_with_curl(url, body)?;
+        parse_raw_http_response(&raw)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Ollama provider
+// ---------------------------------------------------------------------------
+
+/// Wire format for Ollama chat messages.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OllamaChatMessage {
     pub role: String,
     pub content: String,
 }
 
+/// Wire format for an Ollama `/api/chat` request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OllamaChatRequest {
     pub model: String,
@@ -153,7 +205,10 @@ struct OllamaChatChunk {
     done: bool,
 }
 
-pub struct OllamaProviderClient<T = TcpHttpTransport> {
+/// Client for the Ollama local inference server.
+///
+/// Generic over [`HttpTransport`] so tests can inject a mock.
+pub struct OllamaProviderClient<T = CurlHttpTransport> {
     base_url: String,
     transport: T,
 }
@@ -162,7 +217,7 @@ impl OllamaProviderClient {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into(),
-            transport: TcpHttpTransport,
+            transport: CurlHttpTransport,
         }
     }
 
@@ -239,21 +294,23 @@ impl<T: HttpTransport> OllamaProviderClient<T> {
         &self,
         request: &ProviderTurnRequest,
     ) -> Result<Vec<String>, ProviderTurnError> {
-        let endpoint = parse_http_base_url(&self.base_url)?;
         let chat_request = Self::build_chat_request(request);
         let request_body = serde_json::to_vec(&chat_request).map_err(|err| {
             ProviderTurnError::Backend(format!("failed to encode ollama request: {err}"))
         })?;
-        let request_path = format!("{}/api/chat", endpoint.path_prefix);
+        let url = format!("{}/api/chat", self.base_url.trim_end_matches('/'));
 
-        let response = self.transport.post_json(
-            &endpoint.authority,
-            &endpoint.host,
-            endpoint.port,
-            &request_path,
-            &request_body,
-        )?;
-        decode_ollama_response(&response)
+        let response = self.transport.post_json(&url, &request_body)?;
+        if response.status_code != 200 {
+            let body_text = String::from_utf8_lossy(&response.body);
+            return Err(ProviderTurnError::Backend(format!(
+                "ollama request failed with status {}: {}",
+                response.status_code,
+                body_text.trim()
+            )));
+        }
+
+        Ok(parse_ndjson_lines(&response.body))
     }
 }
 
@@ -277,20 +334,11 @@ impl<T: HttpTransport> ProviderClient for OllamaProviderClient<T> {
     }
 }
 
-impl HttpTransport for TcpHttpTransport {
-    fn post_json(
-        &self,
-        authority: &str,
-        host: &str,
-        port: u16,
-        path: &str,
-        body: &[u8],
-    ) -> Result<Vec<u8>, ProviderTurnError> {
-        let url = format!("http://{host}:{port}{path}");
-        post_json_with_curl(&url, authority, host, body)
-    }
-}
+// ---------------------------------------------------------------------------
+// Bootstrap / dispatch
+// ---------------------------------------------------------------------------
 
+/// Errors during provider bootstrap.
 #[derive(Debug)]
 pub enum ProviderBootstrapError {
     UnsupportedBackend(String),
@@ -310,10 +358,9 @@ impl std::error::Error for ProviderBootstrapError {}
 
 impl ProviderRuntimeContext {
     pub fn bootstrap(config: &EffectiveConfig) -> Result<Self, ProviderBootstrapError> {
-        // Phase 2 bootstrap uses backend-level preset capabilities.
-        // Later phases can replace or refine this with live capability discovery.
         let backend = match config.runtime.provider.as_str() {
             "ollama" => ProviderBackend::Ollama,
+            "openai" => ProviderBackend::OpenAi,
             other => {
                 return Err(ProviderBootstrapError::UnsupportedBackend(
                     other.to_string(),
@@ -323,6 +370,10 @@ impl ProviderRuntimeContext {
 
         let capabilities = match backend {
             ProviderBackend::Ollama => ProviderCapabilities {
+                streaming: true,
+                tool_calling: true,
+            },
+            ProviderBackend::OpenAi => ProviderCapabilities {
                 streaming: true,
                 tool_calling: true,
             },
@@ -343,10 +394,12 @@ impl ProviderClient for LocalProviderClient {
     ) -> Result<(), ProviderTurnError> {
         match self {
             Self::Ollama(client) => client.stream_turn(request, emit),
+            Self::OpenAi(client) => client.stream_turn(request, emit),
         }
     }
 }
 
+/// Build a concrete provider client from the effective config.
 pub fn build_local_provider_client(
     config: &EffectiveConfig,
 ) -> Result<LocalProviderClient, ProviderBootstrapError> {
@@ -354,70 +407,49 @@ pub fn build_local_provider_client(
         "ollama" => Ok(LocalProviderClient::Ollama(
             OllamaProviderClient::from_config(config),
         )),
+        "openai" => Ok(LocalProviderClient::OpenAi(
+            openai::OpenAiCompatibleProviderClient::from_config(config),
+        )),
         other => Err(ProviderBootstrapError::UnsupportedBackend(
             other.to_string(),
         )),
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ParsedHttpEndpoint {
-    authority: String,
-    host: String,
-    port: u16,
-    path_prefix: String,
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/// Parse NDJSON (newline-delimited JSON) body into individual lines.
+fn parse_ndjson_lines(body: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(body)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
-fn parse_http_base_url(base_url: &str) -> Result<ParsedHttpEndpoint, ProviderTurnError> {
-    let without_scheme = base_url.strip_prefix("http://").ok_or_else(|| {
-        ProviderTurnError::Backend("ollama base url must use http://".to_string())
-    })?;
-    let (authority, path) = match without_scheme.split_once('/') {
-        Some((authority, path)) => (authority, format!("/{}", path.trim_matches('/'))),
-        None => (without_scheme, String::new()),
-    };
-
-    let (host, port) = match authority.split_once(':') {
-        Some((host, port)) => {
-            let port = port.parse::<u16>().map_err(|_| {
-                ProviderTurnError::Backend(format!("invalid ollama port in base url: {base_url}"))
-            })?;
-            (host.to_string(), port)
-        }
-        None => (authority.to_string(), 80),
-    };
-
-    Ok(ParsedHttpEndpoint {
-        authority: authority.to_string(),
-        host,
-        port,
-        path_prefix: path,
-    })
-}
-
-fn decode_ollama_response(response: &[u8]) -> Result<Vec<String>, ProviderTurnError> {
-    let header_end = response
+/// Parse a raw HTTP response (as returned by `curl -i`) into status code and body.
+fn parse_raw_http_response(raw: &[u8]) -> Result<HttpResponse, ProviderTurnError> {
+    let header_end = raw
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
-        .ok_or_else(|| ProviderTurnError::Backend("invalid ollama response headers".to_string()))?;
-    let headers = &response[..header_end];
-    let body = &response[header_end + 4..];
+        .ok_or_else(|| ProviderTurnError::Backend("invalid HTTP response headers".to_string()))?;
+    let headers = &raw[..header_end];
+    let body = &raw[header_end + 4..];
+
     let headers_text = String::from_utf8_lossy(headers);
     let mut header_lines = headers_text.lines();
     let status_line = header_lines
         .next()
-        .ok_or_else(|| ProviderTurnError::Backend("missing ollama status line".to_string()))?;
-    let status_code = status_line
+        .ok_or_else(|| ProviderTurnError::Backend("missing HTTP status line".to_string()))?;
+    let status_code: u16 = status_line
         .split_whitespace()
         .nth(1)
-        .ok_or_else(|| ProviderTurnError::Backend("invalid ollama status line".to_string()))?;
-    if status_code != "200" {
-        let response_body = String::from_utf8_lossy(body);
-        return Err(ProviderTurnError::Backend(format!(
-            "ollama request failed with status {status_code}: {}",
-            response_body.trim()
-        )));
-    }
+        .ok_or_else(|| ProviderTurnError::Backend("invalid HTTP status line".to_string()))?
+        .parse()
+        .map_err(|_| ProviderTurnError::Backend("non-numeric HTTP status code".to_string()))?;
 
     let is_chunked = header_lines.any(|line| {
         let lower = line.to_ascii_lowercase();
@@ -433,12 +465,10 @@ fn decode_ollama_response(response: &[u8]) -> Result<Vec<String>, ProviderTurnEr
         body.to_vec()
     };
 
-    Ok(String::from_utf8_lossy(&decoded_body)
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(ToOwned::to_owned)
-        .collect())
+    Ok(HttpResponse {
+        status_code,
+        body: decoded_body,
+    })
 }
 
 fn decode_chunked_body(body: &[u8]) -> Result<Vec<u8>, ProviderTurnError> {
@@ -447,11 +477,11 @@ fn decode_chunked_body(body: &[u8]) -> Result<Vec<u8>, ProviderTurnError> {
 
     while cursor < body.len() {
         let line_end = find_crlf(body, cursor).ok_or_else(|| {
-            ProviderTurnError::Backend("invalid chunked ollama response".to_string())
+            ProviderTurnError::Backend("invalid chunked response".to_string())
         })?;
         let size_text = String::from_utf8_lossy(&body[cursor..line_end]);
         let size = usize::from_str_radix(size_text.trim(), 16).map_err(|_| {
-            ProviderTurnError::Backend("invalid chunk size in ollama response".to_string())
+            ProviderTurnError::Backend("invalid chunk size in response".to_string())
         })?;
         cursor = line_end + 2;
 
@@ -460,11 +490,11 @@ fn decode_chunked_body(body: &[u8]) -> Result<Vec<u8>, ProviderTurnError> {
         }
 
         let chunk_end = cursor.checked_add(size).ok_or_else(|| {
-            ProviderTurnError::Backend("overflow in ollama chunk size".to_string())
+            ProviderTurnError::Backend("overflow in chunk size".to_string())
         })?;
         if chunk_end > body.len() {
             return Err(ProviderTurnError::Backend(
-                "truncated ollama chunked response".to_string(),
+                "truncated chunked response".to_string(),
             ));
         }
 
@@ -473,7 +503,7 @@ fn decode_chunked_body(body: &[u8]) -> Result<Vec<u8>, ProviderTurnError> {
 
         if body.get(cursor..cursor + 2) != Some(b"\r\n") {
             return Err(ProviderTurnError::Backend(
-                "missing chunk terminator in ollama response".to_string(),
+                "missing chunk terminator in response".to_string(),
             ));
         }
         cursor += 2;
@@ -489,54 +519,42 @@ fn find_crlf(body: &[u8], start: usize) -> Option<usize> {
         .map(|offset| start + offset)
 }
 
-fn post_json_with_curl(
-    url: &str,
-    authority: &str,
-    host: &str,
-    body: &[u8],
-) -> Result<Vec<u8>, ProviderTurnError> {
+fn post_json_with_curl(url: &str, body: &[u8]) -> Result<Vec<u8>, ProviderTurnError> {
     let mut child = Command::new("curl")
-        .args([
-            "-sS",
-            "--http1.1",
-            "-i",
-            "-X",
-            "POST",
-            "-H",
-            &format!("Host: {authority}"),
-            "-H",
-            "Content-Type: application/json",
-            "--data-binary",
-            "@-",
-            url,
-        ])
+        .args(["-sS", "--http1.1", "-i", "-X", "POST"])
+        .arg("-H")
+        .arg("Content-Type: application/json")
+        .arg("--data-binary")
+        .arg("@-")
+        .arg("--")
+        .arg(url)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|err| {
-            ProviderTurnError::Backend(format!("failed to connect to ollama via curl: {err}"))
+            ProviderTurnError::Backend(format!("failed to spawn curl: {err}"))
         })?;
 
     child
         .stdin
         .as_mut()
         .ok_or_else(|| {
-            ProviderTurnError::Backend("failed to open curl stdin for ollama request".to_string())
+            ProviderTurnError::Backend("failed to open curl stdin".to_string())
         })?
         .write_all(body)
         .map_err(|err| {
-            ProviderTurnError::Backend(format!("failed to send ollama request via curl: {err}"))
+            ProviderTurnError::Backend(format!("failed to write to curl stdin: {err}"))
         })?;
 
     let output = child.wait_with_output().map_err(|err| {
-        ProviderTurnError::Backend(format!("failed to read ollama response via curl: {err}"))
+        ProviderTurnError::Backend(format!("failed to read curl output: {err}"))
     })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(ProviderTurnError::Backend(format!(
-            "failed to connect to ollama via curl for host {host}: {}",
+            "curl request failed: {}",
             stderr.trim()
         )));
     }

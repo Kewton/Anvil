@@ -1,3 +1,8 @@
+/// Competitive benchmarking and metrics framework.
+///
+/// Provides scenario definitions, measurement records, and comparison logic
+/// for evaluating Anvil against alternative tools.
+
 use std::fmt::{Display, Formatter};
 use std::process::Command;
 use std::time::Instant;

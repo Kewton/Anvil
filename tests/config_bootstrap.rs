@@ -59,6 +59,23 @@ fn local_provider_client_builds_from_effective_config() {
 }
 
 #[test]
+fn openai_provider_bootstraps_from_config() {
+    let mut config = EffectiveConfig::load().expect("config should load");
+    config.runtime.provider = "openai".to_string();
+    config.runtime.provider_url = "http://localhost:8080".to_string();
+
+    let provider = ProviderRuntimeContext::bootstrap(&config).expect("openai should bootstrap");
+    let client = build_local_provider_client(&config).expect("openai client should build");
+
+    assert_eq!(provider.backend, anvil::provider::ProviderBackend::OpenAi);
+    assert!(provider.capabilities.streaming);
+    assert!(matches!(
+        client,
+        anvil::provider::LocalProviderClient::OpenAi(_)
+    ));
+}
+
+#[test]
 fn provider_bootstrap_rejects_unknown_backend() {
     let mut config = EffectiveConfig::load().expect("config should load");
     config.runtime.provider = "unknown".to_string();

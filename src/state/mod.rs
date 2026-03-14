@@ -1,5 +1,11 @@
+/// Explicit state machine governing application lifecycle.
+///
+/// All state transitions are validated by [`StateMachine::transition_to`]
+/// against a whitelist of legal (from, transition, to) triples.
+
 use crate::contracts::{AppEvent, AppStateSnapshot, RuntimeState};
 
+/// Named transitions between runtime states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StateTransition {
     StartThinking,

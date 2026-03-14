@@ -1,1 +1,5 @@
 /target
+.DS_Store
+.anvil/
+sandbox/
+workspace/*.json

@@ -1,3 +1,9 @@
+/// Configuration loading with file / environment / CLI precedence.
+///
+/// [`EffectiveConfig`] is the single source of truth for all runtime
+/// settings.  It is assembled once at startup and then treated as
+/// immutable for the lifetime of the session.
+
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -8,11 +14,13 @@ use std::{
 };
 
 #[derive(Debug, Clone)]
+/// Provider, model, and transport settings.
 pub struct RuntimeConfig {
     pub provider: String,
     pub provider_url: String,
     pub model: String,
     pub sidecar_model: Option<String>,
+    pub api_key: Option<String>,
     pub context_window: u32,
     pub stream: bool,
 }
@@ -95,6 +103,7 @@ impl EffectiveConfig {
                 provider_url: "http://127.0.0.1:11434".to_string(),
                 model: "local-default".to_string(),
                 sidecar_model: None,
+                api_key: None,
                 context_window: 200_000,
                 stream: true,
             },
@@ -153,6 +162,7 @@ impl EffectiveConfig {
             "ANVIL_MODEL",
             "ANVIL_PROVIDER_URL",
             "ANVIL_SIDECAR_MODEL",
+            "ANVIL_API_KEY",
             "ANVIL_CONTEXT_WINDOW",
             "ANVIL_STREAM",
             "ANVIL_INTERACTIVE",
@@ -230,6 +240,13 @@ impl EffectiveConfig {
                 "model" | "ANVIL_MODEL" => self.runtime.model = value.clone(),
                 "sidecar_model" | "ANVIL_SIDECAR_MODEL" => {
                     self.runtime.sidecar_model = if value.is_empty() {
+                        None
+                    } else {
+                        Some(value.clone())
+                    };
+                }
+                "api_key" | "ANVIL_API_KEY" => {
+                    self.runtime.api_key = if value.is_empty() {
                         None
                     } else {
                         Some(value.clone())

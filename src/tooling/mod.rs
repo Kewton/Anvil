@@ -1,3 +1,9 @@
+/// Tool registry, validation, and local execution.
+///
+/// Tools are declared as [`ToolSpec`] entries in a [`ToolRegistry`], validated
+/// through a permission and plan-mode pipeline, and executed by
+/// [`LocalToolExecutor`] within a sandboxed workspace root.
+
 use crate::contracts::ToolLogView;
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
@@ -249,6 +255,7 @@ pub enum ToolValidationError {
     UnknownTool,
     InputKindMismatch,
     MissingRequiredField(String),
+    DangerousCommand(String),
 }
 
 #[derive(Debug, Default)]
@@ -545,6 +552,31 @@ fn validate_required_fields(input: &ToolInput) -> Result<(), ToolValidationError
                     "command".to_string(),
                 ));
             }
+            validate_shell_command_safety(command)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Reject shell commands that contain dangerous patterns.
+///
+/// This is a defence-in-depth measure.  The primary protection is the
+/// `Restricted` permission class which blocks `shell.exec` by default.
+fn validate_shell_command_safety(command: &str) -> Result<(), ToolValidationError> {
+    const BLOCKED_PATTERNS: &[&str] = &[
+        "rm -rf /",
+        "rm -rf ~",
+        "mkfs",
+        "dd if=",
+        ":(){",
+        ">(", // process substitution
+    ];
+
+    let lower = command.to_ascii_lowercase();
+    for pattern in BLOCKED_PATTERNS {
+        if lower.contains(pattern) {
+            return Err(ToolValidationError::DangerousCommand(command.to_string()));
         }
     }
 

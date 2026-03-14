@@ -1,8 +1,14 @@
+/// Terminal user interface rendering.
+///
+/// [`Tui`] is a stateless renderer that converts [`ConsoleRenderContext`]
+/// snapshots into plain-text frames for the terminal.
+
 use crate::config::EffectiveConfig;
 use crate::contracts::{
     AppStateSnapshot, ConsoleMessageRole, ConsoleMessageView, ConsoleRenderContext, RuntimeState,
 };
 
+/// Stateless console renderer.
 pub struct Tui;
 
 impl Tui {

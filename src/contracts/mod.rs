@@ -1,5 +1,12 @@
+/// Shared contract types used across modules.
+///
+/// These types form the schema for snapshots, console rendering, and
+/// persistent session state.  They are intentionally plain data with
+/// `Serialize`/`Deserialize` support.
+
 use serde::{Deserialize, Serialize};
 
+/// The runtime lifecycle states of the application.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RuntimeState {
     Ready,

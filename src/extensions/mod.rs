@@ -1,3 +1,8 @@
+/// Slash command registry for interactive CLI extensions.
+///
+/// Commands are statically defined and looked up by the [`ExtensionRegistry`].
+
+/// Action to perform when a slash command is invoked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlashCommandAction {
     Help,

@@ -1,3 +1,8 @@
+/// Agent loop and event processing.
+///
+/// Defines the [`AgentEvent`] lifecycle and the [`BasicAgentLoop`] that
+/// bridges provider responses into structured tool calls.
+
 use crate::provider::{
     ProviderClient, ProviderEvent, ProviderMessage, ProviderMessageRole, ProviderTurnError,
     ProviderTurnRequest,
@@ -7,6 +12,7 @@ use crate::tooling::{ToolCallRequest, ToolInput};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Events emitted by the agent during a single turn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AgentEvent {
     Thinking {

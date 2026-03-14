@@ -1,4 +1,10 @@
+/// Core application orchestrator.
+///
+/// [`App`] owns the session, state machine, tool registry and config,
+/// coordinating turns between the user, the LLM provider, and the tool
+/// executor.
 pub mod mock;
+pub mod render;
 
 use crate::agent::BasicAgentLoop;
 use crate::agent::{AgentEvent, AgentRuntime, PendingTurnState, StructuredAssistantResponse};
@@ -6,7 +12,7 @@ use crate::config::EffectiveConfig;
 use crate::contracts::{
     AppEvent, AppStateSnapshot, ConsoleRenderContext, RuntimeState, ToolLogView,
 };
-use crate::extensions::{ExtensionRegistry, SlashCommandAction, SlashCommandSpec};
+use crate::extensions::{ExtensionRegistry, SlashCommandAction};
 use crate::provider::{
     ProviderBootstrapError, ProviderClient, ProviderErrorKind, ProviderErrorRecord, ProviderEvent,
     ProviderRuntimeContext, ProviderTurnError, build_local_provider_client,
@@ -17,15 +23,19 @@ use crate::session::{
 };
 use crate::state::{StateMachine, StateTransition};
 use crate::tooling::{
-    LocalToolExecutor, ToolExecutionError, ToolExecutionPayload, ToolExecutionPolicy,
-    ToolExecutionResult, ToolExecutionStatus, ToolRegistry, ToolRuntimeError,
+    LocalToolExecutor, ToolExecutionError, ToolExecutionPolicy, ToolExecutionResult, ToolRegistry,
+    ToolRuntimeError,
 };
 use crate::tui::Tui;
 use std::fmt::{Display, Formatter};
 use std::io::{self, BufRead, Write};
 
+// Re-export render helpers that form the public API.
+pub use render::{cli_prompt, render_help_frame, slash_commands};
+
 const MAX_CONSOLE_MESSAGES: usize = 5;
 
+/// Central application state.
 pub struct App {
     config: EffectiveConfig,
     provider: ProviderRuntimeContext,
@@ -37,17 +47,20 @@ pub struct App {
     tools: ToolRegistry,
 }
 
+/// Whether the session loop should continue or exit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionControl {
     Continue,
     Exit,
 }
 
+/// Output of a single CLI turn: rendered frames and control signal.
 pub struct CliTurnOutput {
     pub frames: Vec<String>,
     pub control: SessionControl,
 }
 
+/// Errors raised by the application layer.
 #[derive(Debug)]
 pub enum AppError {
     Config(crate::config::ConfigError),
@@ -186,7 +199,7 @@ impl App {
 
         Ok(format!(
             "{}\n{}",
-            render_resume_header(&self.config),
+            render::render_resume_header(&self.config),
             tui.render_console(&self.build_console_render_context())
         ))
     }
@@ -272,20 +285,20 @@ impl App {
                             {
                                 frames.extend(structured_frames);
                             } else {
-                                let snapshot = self.apply_agent_event(&agent_event)?;
+                                let snapshot = self.apply_agent_event(agent_event)?;
                                 frames.push(self.render_console(tui)?);
                                 if snapshot.state == RuntimeState::AwaitingApproval {
                                     let remaining_events = provider_events[index + 1..]
                                         .iter()
-                                        .filter_map(|event| match event {
-                                            ProviderEvent::Agent(agent_event) => {
-                                                Some(agent_event.clone())
-                                            }
+                                        .filter_map(|ev| match ev {
+                                            ProviderEvent::Agent(ae) => Some(ae.clone()),
                                             ProviderEvent::TokenDelta(_) => None,
                                         })
                                         .collect::<Vec<_>>();
                                     self.set_pending_turn(PendingTurnState {
-                                        waiting_tool_call_id: approval_tool_call_id(agent_event),
+                                        waiting_tool_call_id: render::approval_tool_call_id(
+                                            agent_event,
+                                        ),
                                         remaining_events,
                                     })?;
                                     break;
@@ -307,7 +320,7 @@ impl App {
                                 )?);
                                 break;
                             }
-                            if should_render_stream_progress(
+                            if render::should_render_stream_progress(
                                 &token_buffer,
                                 delta,
                                 last_rendered_len,
@@ -356,11 +369,10 @@ impl App {
         _runtime: &AgentRuntime,
         tui: &Tui,
     ) -> Result<Vec<String>, AppError> {
-        let Some(pending_turn) = self.pending_turn.clone() else {
-            return Err(AppError::NoPendingApproval);
-        };
+        let pending_turn = self.pending_turn.take().ok_or(AppError::NoPendingApproval)?;
 
-        self.clear_pending_turn()?;
+        self.session.clear_pending_turn();
+        self.persist_session(AppEvent::SessionSaved)?;
         self.execute_runtime_events(&pending_turn.remaining_events, tui)
     }
 
@@ -443,7 +455,7 @@ impl App {
 
             if snapshot.state == RuntimeState::AwaitingApproval {
                 self.set_pending_turn(PendingTurnState {
-                    waiting_tool_call_id: approval_tool_call_id(event),
+                    waiting_tool_call_id: render::approval_tool_call_id(event),
                     remaining_events: events[index + 1..].to_vec(),
                 })?;
                 break;
@@ -498,10 +510,10 @@ impl App {
         tui: &Tui,
     ) -> Result<Vec<String>, AppError> {
         let results = self.execute_structured_tool_calls(&structured)?;
-        let tool_log_views = results
+        let tool_log_views: Vec<ToolLogView> = results
             .iter()
             .map(ToolExecutionResult::to_tool_log_view)
-            .collect::<Vec<_>>();
+            .collect();
 
         let working = AppStateSnapshot::new(RuntimeState::Working)
             .with_status("Executing tool plan".to_string())
@@ -624,7 +636,7 @@ impl App {
                 let snapshot = AppStateSnapshot::new(RuntimeState::Working)
                     .with_status(status.clone())
                     .with_plan(plan_items.clone(), *active_index)
-                    .with_tool_logs(build_tool_logs(tool_logs))
+                    .with_tool_logs(render::build_tool_logs(tool_logs))
                     .with_elapsed_ms(*elapsed_ms)
                     .with_context_usage(
                         self.session.estimated_token_count(),
@@ -643,7 +655,7 @@ impl App {
                 self.record_assistant_output(self.next_message_id("assistant"), assistant_message)?;
                 let snapshot = AppStateSnapshot::new(RuntimeState::Done)
                     .with_status(status.clone())
-                    .with_tool_logs(build_tool_logs(tool_logs))
+                    .with_tool_logs(render::build_tool_logs(tool_logs))
                     .with_completion_summary(completion_summary.clone(), saved_status.clone())
                     .with_elapsed_ms(*elapsed_ms)
                     .with_context_usage(
@@ -724,7 +736,7 @@ impl App {
         token_buffer: &str,
         tui: &Tui,
     ) -> Result<String, AppError> {
-        let visible = recent_stream_excerpt(token_buffer, 400);
+        let visible = render::recent_stream_excerpt(token_buffer, 400);
         let snapshot = AppStateSnapshot::new(RuntimeState::Thinking)
             .with_status(format!("Streaming. model={}", self.config.runtime.model))
             .with_reasoning_summary(vec![visible])
@@ -758,6 +770,10 @@ impl App {
         self.pending_turn.is_some()
     }
 
+    /// Process a single line of CLI input.
+    ///
+    /// Dispatches slash-commands to the extension registry and regular text
+    /// to the live provider turn.
     pub fn handle_cli_line<C: ProviderClient>(
         &mut self,
         line: &str,
@@ -782,7 +798,9 @@ impl App {
                 control: SessionControl::Continue,
             }),
             Err(AppError::PendingApprovalRequired) => Ok(CliTurnOutput {
-                frames: vec![render_pending_approval_frame(self.state_machine.snapshot())],
+                frames: vec![render::render_pending_approval_frame(
+                    self.state_machine.snapshot(),
+                )],
                 control: SessionControl::Continue,
             }),
             Err(err) => Err(err),
@@ -815,7 +833,7 @@ impl App {
             .map(|spec| spec.action)
         {
             Some(SlashCommandAction::Help) => CliTurnOutput {
-                frames: vec![render_help_frame()],
+                frames: vec![render::render_help_frame()],
                 control: SessionControl::Continue,
             },
             Some(SlashCommandAction::Status) => CliTurnOutput {
@@ -823,11 +841,11 @@ impl App {
                 control: SessionControl::Continue,
             },
             Some(SlashCommandAction::Plan) => CliTurnOutput {
-                frames: vec![render_plan_frame(self.state_machine.snapshot())],
+                frames: vec![render::render_plan_frame(self.state_machine.snapshot())],
                 control: SessionControl::Continue,
             },
             Some(SlashCommandAction::Model) => CliTurnOutput {
-                frames: vec![render_model_frame(&self.config)],
+                frames: vec![render::render_model_frame(&self.config)],
                 control: SessionControl::Continue,
             },
             Some(SlashCommandAction::Approve) => CliTurnOutput {
@@ -861,21 +879,6 @@ impl App {
     }
 }
 
-fn build_tool_logs(logs: &[(String, String, String)]) -> Vec<ToolLogView> {
-    logs.iter()
-        .map(|(tool_name, action, target)| ToolExecutionResult {
-            tool_call_id: format!("{tool_name}:{target}"),
-            tool_name: tool_name.clone(),
-            status: map_tool_status(action),
-            summary: format!("{action} {target}"),
-            payload: ToolExecutionPayload::None,
-            artifacts: vec![target.clone()],
-            elapsed_ms: 0,
-        })
-        .map(|result| result.to_tool_log_view())
-        .collect()
-}
-
 fn standard_tool_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.register_standard_tools();
@@ -899,106 +902,10 @@ fn map_tool_runtime_error(error: ToolRuntimeError) -> AppError {
     AppError::ToolExecution(error.to_string())
 }
 
-fn should_render_stream_progress(
-    token_buffer: &str,
-    delta: &str,
-    last_rendered_len: usize,
-) -> bool {
-    last_rendered_len == 0
-        || token_buffer.len().saturating_sub(last_rendered_len) >= 512
-        || delta.contains('\n')
-        || delta.contains("```ANVIL_")
-}
-
-fn recent_stream_excerpt(content: &str, max_chars: usize) -> String {
-    let chars: Vec<char> = content.chars().collect();
-    if chars.len() <= max_chars {
-        return content.to_string();
-    }
-
-    let tail: String = chars[chars.len() - max_chars..].iter().collect();
-    format!("...{tail}")
-}
-
-fn approval_tool_call_id(event: &AgentEvent) -> String {
-    match event {
-        AgentEvent::ApprovalRequested { tool_call_id, .. } => tool_call_id.clone(),
-        _ => "pending_approval".to_string(),
-    }
-}
-
-pub fn render_help_frame() -> String {
-    let mut lines = vec!["Anvil slash commands".to_string(), String::new()];
-    for spec in slash_commands() {
-        lines.push(format!("{:<10} {}", spec.name, spec.description));
-    }
-    lines.join("\n")
-}
-
-fn render_plan_frame(snapshot: &AppStateSnapshot) -> String {
-    let mut lines = vec!["[A] anvil > plan".to_string()];
-    if let Some(plan) = &snapshot.plan {
-        for (index, item) in plan.items.iter().enumerate() {
-            let marker = if plan.active_index == Some(index) {
-                "*"
-            } else {
-                "-"
-            };
-            lines.push(format!("  {marker} {}. {}", index + 1, item));
-        }
-    } else {
-        lines.push("  no active plan".to_string());
-    }
-    lines.join("\n")
-}
-
-fn render_model_frame(config: &EffectiveConfig) -> String {
-    format!(
-        "[A] anvil > current model: {}\n  provider: {}\n  context window: {}",
-        config.runtime.model, config.runtime.provider, config.runtime.context_window
-    )
-}
-
-fn render_resume_header(config: &EffectiveConfig) -> String {
-    [
-        "  --------------------------------------------------------------".to_string(),
-        "  Resuming existing session".to_string(),
-        format!("  Model   : {}", config.runtime.model),
-        format!("  Context : {}k", config.runtime.context_window / 1_000),
-        format!("  Project : {}", config.paths.cwd.display()),
-        "  --------------------------------------------------------------".to_string(),
-    ]
-    .join("\n")
-}
-
-pub fn cli_prompt() -> &'static str {
-    "[U] you > "
-}
-
-pub fn slash_commands() -> &'static [SlashCommandSpec] {
-    ExtensionRegistry::new().slash_commands()
-}
-
-fn render_pending_approval_frame(snapshot: &AppStateSnapshot) -> String {
-    if let Some(approval) = &snapshot.approval {
-        format!(
-            "[A] anvil > resolve the pending approval before starting a new turn\n  pending: {} {}\n  call: {}\n  use /approve or /deny",
-            approval.tool_name, approval.summary, approval.tool_call_id
-        )
-    } else {
-        "[A] anvil > resolve the pending approval before starting a new turn\n  use /approve or /deny"
-            .to_string()
-    }
-}
-
-fn map_tool_status(action: &str) -> ToolExecutionStatus {
-    match action {
-        "failed" => ToolExecutionStatus::Failed,
-        "interrupted" => ToolExecutionStatus::Interrupted,
-        _ => ToolExecutionStatus::Completed,
-    }
-}
-
+/// Drive the interactive CLI session loop.
+///
+/// Reads lines from `input`, dispatches them through [`App::handle_cli_line`],
+/// and writes rendered frames to `output` until the user exits.
 pub fn run_session_loop<C: ProviderClient, R: BufRead, W: Write>(
     app: &mut App,
     provider_client: &C,
@@ -1034,6 +941,7 @@ pub fn run_session_loop<C: ProviderClient, R: BufRead, W: Write>(
     Ok(())
 }
 
+/// Application entry point.
 pub fn run() -> Result<(), AppError> {
     let config = EffectiveConfig::load()?;
     let provider = ProviderRuntimeContext::bootstrap(&config)?;
