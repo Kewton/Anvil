@@ -198,7 +198,9 @@ impl BasicAgentLoop {
 
     pub fn parse_structured_response(content: &str) -> Result<StructuredAssistantResponse, String> {
         let tool_blocks = extract_fenced_blocks(content, "ANVIL_TOOL");
-        let final_block = extract_final_block(content, "ANVIL_FINAL");
+        // Try strict extraction first, fall back to lenient for unclosed blocks.
+        let final_block = extract_final_block(content, "ANVIL_FINAL")
+            .or_else(|| extract_final_block_lenient(content, "ANVIL_FINAL"));
 
         let mut tool_calls = Vec::new();
         for block in tool_blocks {
@@ -397,10 +399,28 @@ fn extract_fenced_blocks(content: &str, label: &str) -> Vec<String> {
     blocks
 }
 
+/// Extract the ANVIL_FINAL block with strict closing (for streaming detection).
 fn extract_final_block(content: &str, label: &str) -> Option<String> {
     let start_marker = format!("```{label}\n");
     let start = content.find(&start_marker)?;
     let block_start = start + start_marker.len();
-    let block_end = content.rfind("\n```")?;
-    (block_end >= block_start).then(|| content[block_start..block_end].to_string())
+    // Search for closing marker AFTER the block start, not from the end.
+    content[block_start..]
+        .find("\n```")
+        .map(|pos| content[block_start..block_start + pos].to_string())
+}
+
+/// Lenient extraction: accept an unclosed ANVIL_FINAL block.
+///
+/// LLMs sometimes omit the closing ``` for the final block.  When called
+/// from the Done-event path (where we know the response is complete),
+/// this fallback captures everything after the opening marker.
+fn extract_final_block_lenient(content: &str, label: &str) -> Option<String> {
+    let start_marker = format!("```{label}\n");
+    let start = content.find(&start_marker)?;
+    let block_start = start + start_marker.len();
+    let tail = content[block_start..].trim_end();
+    // Strip a trailing ``` if present (model may close without preceding newline)
+    let tail = tail.strip_suffix("```").unwrap_or(tail).trim_end();
+    Some(tail.to_string())
 }
