@@ -64,14 +64,7 @@ impl App {
             frames.push(self.render_console(tui)?);
 
             // Execute tool calls and record results WITH payload
-            let results = match self.execute_structured_tool_calls(&current)? {
-                Some(r) => r,
-                None => {
-                    // Paused for approval — return frames so far
-                    frames.push(self.render_console(tui)?);
-                    return Ok(frames);
-                }
-            };
+            let results = self.execute_structured_tool_calls(&current)?;
             total_tool_count += results.len();
 
             let tool_log_views: Vec<ToolLogView> = results
@@ -196,17 +189,13 @@ impl App {
         Ok(frames)
     }
 
-    /// Execute tool calls from a structured response.
-    ///
-    /// Returns `Ok(Some(results))` when all calls executed, or `Ok(None)`
-    /// when the loop paused for user approval (pending_turn is set).
     pub(crate) fn execute_structured_tool_calls(
         &mut self,
         structured: &StructuredAssistantResponse,
-    ) -> Result<Option<Vec<ToolExecutionResult>>, AppError> {
+    ) -> Result<Vec<ToolExecutionResult>, AppError> {
         let executor = LocalToolExecutor::new(self.config.paths.cwd.clone());
         let mut results = Vec::new();
-        for (idx, call) in structured.tool_calls.iter().enumerate() {
+        for call in &structured.tool_calls {
             let validated = match self.tools.validate(call.clone()) {
                 Ok(v) => v,
                 Err(err) => {
@@ -238,41 +227,41 @@ impl App {
             if self.config.mode.approval_required
                 && validated.approval_required(true).is_some()
             {
-                // Pause for approval: store remaining calls as pending
-                let remaining_calls: Vec<_> =
-                    structured.tool_calls[idx..].to_vec();
-                let tool_name = call.tool_name.clone();
                 let summary = match &call.input {
                     crate::tooling::ToolInput::ShellExec { command } => {
-                        format!("Run: {command}")
+                        format!("{}: {command}", call.tool_name)
                     }
                     crate::tooling::ToolInput::FileWrite { path, .. } => {
-                        format!("Write: {path}")
+                        format!("{}: {path}", call.tool_name)
                     }
-                    other => format!("{:?}", other.kind()),
+                    _ => call.tool_name.clone(),
                 };
-                self.set_pending_turn(crate::agent::PendingTurnState {
-                    waiting_tool_call_id: call.tool_call_id.clone(),
-                    remaining_events: Vec::new(),
-                    pending_tool_calls: remaining_calls,
-                })?;
-                // Transition to AwaitingApproval
-                let snapshot = crate::contracts::AppStateSnapshot::new(
-                    RuntimeState::AwaitingApproval,
-                )
-                .with_status("Awaiting approval for tool call".to_string())
-                .with_approval(
-                    tool_name,
-                    summary,
-                    "Confirm".to_string(),
-                    call.tool_call_id.clone(),
-                );
-                self.transition_with_context(
-                    snapshot,
-                    crate::state::StateTransition::RequestApproval,
-                )?;
-                self.persist_session(crate::contracts::AppEvent::SessionSaved)?;
-                return Ok(None); // Paused
+                // Ask user inline via stderr/stdin
+                let approved = prompt_inline_approval(&summary);
+                if !approved {
+                    let denied_result = ToolExecutionResult {
+                        tool_call_id: call.tool_call_id.clone(),
+                        tool_name: call.tool_name.clone(),
+                        status: crate::tooling::ToolExecutionStatus::Failed,
+                        summary: "denied by user".to_string(),
+                        payload: crate::tooling::ToolExecutionPayload::None,
+                        artifacts: Vec::new(),
+                        elapsed_ms: 0,
+                    };
+                    self.session.push_message(
+                        SessionMessage::new(
+                            MessageRole::Tool,
+                            "tool",
+                            format_tool_result_message(
+                                &denied_result,
+                                self.config.runtime.tool_result_max_chars,
+                            ),
+                        )
+                        .with_id(self.next_message_id("tool")),
+                    );
+                    results.push(denied_result);
+                    continue;
+                }
             }
             let request = match validated.approve().into_execution_request(ToolExecutionPolicy {
                 approval_required: false,
@@ -330,7 +319,7 @@ impl App {
             results.push(result);
         }
         self.persist_session(crate::contracts::AppEvent::SessionSaved)?;
-        Ok(Some(results))
+        Ok(results)
     }
 
     pub(crate) fn handle_structured_done<C: ProviderClient>(
@@ -426,6 +415,21 @@ pub(crate) fn format_tool_result_message(
                 listing
             )
         }
+    }
+}
+
+/// Prompt the user for inline approval via stderr/stdin.
+/// Returns `true` if the user approves, `false` otherwise.
+fn prompt_inline_approval(summary: &str) -> bool {
+    use std::io::{BufRead, Write};
+    let _ = write!(std::io::stderr(), "\n  Allow {summary}? [y/n] ");
+    let _ = std::io::stderr().flush();
+    let mut input = String::new();
+    if std::io::stdin().lock().read_line(&mut input).is_ok() {
+        let answer = input.trim().to_ascii_lowercase();
+        matches!(answer.as_str(), "y" | "yes")
+    } else {
+        false
     }
 }
 

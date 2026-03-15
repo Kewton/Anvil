@@ -415,11 +415,10 @@ impl App {
         result
     }
 
-    pub fn approve_and_continue<C: ProviderClient>(
+    pub fn approve_and_continue(
         &mut self,
         _runtime: &AgentRuntime,
         tui: &Tui,
-        provider_client: &C,
     ) -> Result<Vec<String>, AppError> {
         let pending_turn = self
             .session
@@ -427,26 +426,6 @@ impl App {
             .take()
             .ok_or(AppError::NoPendingApproval)?;
         self.persist_session(AppEvent::SessionSaved)?;
-
-        // If we have pending structured tool calls (from the agentic loop),
-        // execute them directly rather than via AgentEvent replay.
-        if !pending_turn.pending_tool_calls.is_empty() {
-            let structured = crate::agent::StructuredAssistantResponse {
-                tool_calls: pending_turn.pending_tool_calls,
-                final_response: String::new(),
-            };
-            let result = self.complete_structured_response(
-                structured,
-                "Done. session saved",
-                "session saved",
-                0,
-                tui,
-                provider_client,
-            );
-            self.flush_session()?;
-            return result;
-        }
-
         let result = self.execute_runtime_events(&pending_turn.remaining_events, tui);
         self.flush_session()?;
         result
@@ -845,7 +824,7 @@ impl App {
                 control: SessionControl::Continue,
             },
             Some(SlashCommandAction::Approve) => CliTurnOutput {
-                frames: self.approve_and_continue(&AgentRuntime::new(), tui, provider_client)?,
+                frames: self.approve_and_continue(&AgentRuntime::new(), tui)?,
                 control: SessionControl::Continue,
             },
             Some(SlashCommandAction::Deny) => CliTurnOutput {

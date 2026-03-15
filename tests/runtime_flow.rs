@@ -2,21 +2,7 @@ mod common;
 
 use anvil::agent::{AgentEvent, AgentRuntime, AgentRuntimeScript};
 use anvil::contracts::{AppEvent, RuntimeState};
-use anvil::provider::{ProviderClient, ProviderEvent, ProviderTurnError, ProviderTurnRequest};
 use anvil::tui::Tui;
-
-/// No-op provider for tests that only use the AgentRuntime event path.
-struct NoopProvider;
-
-impl ProviderClient for NoopProvider {
-    fn stream_turn(
-        &self,
-        _request: &ProviderTurnRequest,
-        _emit: &mut dyn FnMut(ProviderEvent),
-    ) -> Result<(), ProviderTurnError> {
-        Ok(())
-    }
-}
 
 #[test]
 fn runtime_turn_pauses_for_single_tool_call_approval_and_resumes_to_done() {
@@ -97,7 +83,7 @@ fn runtime_turn_pauses_for_single_tool_call_approval_and_resumes_to_done() {
     ));
 
     let resumed = app
-        .approve_and_continue(&runtime, &tui, &NoopProvider)
+        .approve_and_continue(&runtime, &tui)
         .expect("runtime turn should resume after approval");
 
     assert_eq!(app.state_machine().snapshot().state, RuntimeState::Done);
@@ -299,7 +285,7 @@ fn runtime_turn_supports_multiple_approvals_in_one_turn() {
     assert!(app.has_pending_runtime_events());
 
     let resumed_once = app
-        .approve_and_continue(&runtime, &tui, &NoopProvider)
+        .approve_and_continue(&runtime, &tui)
         .expect("second approval pause should succeed");
     assert!(
         resumed_once
@@ -313,7 +299,7 @@ fn runtime_turn_supports_multiple_approvals_in_one_turn() {
     assert!(app.has_pending_runtime_events());
 
     let resumed_twice = app
-        .approve_and_continue(&runtime, &tui, &NoopProvider)
+        .approve_and_continue(&runtime, &tui)
         .expect("final completion should succeed");
     assert_eq!(app.state_machine().snapshot().state, RuntimeState::Done);
     assert!(!app.has_pending_runtime_events());
@@ -461,7 +447,7 @@ fn pending_approval_survives_app_reload() {
     assert!(reloaded.has_pending_runtime_events());
 
     let resumed = reloaded
-        .approve_and_continue(&runtime, &tui, &NoopProvider)
+        .approve_and_continue(&runtime, &tui)
         .expect("reloaded app should resume");
     assert_eq!(
         reloaded.state_machine().snapshot().state,

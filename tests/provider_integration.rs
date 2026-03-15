@@ -767,7 +767,7 @@ fn live_turn_can_pause_for_provider_approval_and_resume() {
     );
 
     let resumed = app
-        .approve_and_continue(&AgentRuntime::new(), &tui, &provider)
+        .approve_and_continue(&AgentRuntime::new(), &tui)
         .expect("approval should resume");
 
     assert!(
