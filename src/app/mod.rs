@@ -1162,6 +1162,9 @@ pub fn run_session_loop<C: ProviderClient, R: BufRead, W: Write>(
 }
 
 /// Application entry point.
+///
+/// Uses `rustyline` for interactive input, providing cursor movement,
+/// line editing, and input history.
 pub fn run() -> Result<(), AppError> {
     let config = EffectiveConfig::load()?;
     let provider = ProviderRuntimeContext::bootstrap(&config)?;
@@ -1174,9 +1177,60 @@ pub fn run() -> Result<(), AppError> {
         return Ok(());
     }
 
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
-    run_session_loop(&mut app, &provider_client, &tui, stdin.lock(), &mut stdout)?;
+    run_interactive_loop(&mut app, &provider_client, &tui)
+}
+
+/// Interactive session loop powered by `rustyline`.
+///
+/// Supports arrow-key cursor movement, line editing, and input history.
+/// Falls back to the `BufRead`-based [`run_session_loop`] for
+/// non-interactive contexts (tests, piped input).
+fn run_interactive_loop<C: ProviderClient>(
+    app: &mut App,
+    provider_client: &C,
+    tui: &Tui,
+) -> Result<(), AppError> {
+    use rustyline::error::ReadlineError;
+
+    let history_path = app.config.paths.state_dir.join("input-history.txt");
+    let mut rl = rustyline::DefaultEditor::new().map_err(|err| {
+        AppError::Session(SessionError::SessionReadFailed(io::Error::new(
+            io::ErrorKind::Other,
+            format!("failed to initialize line editor: {err}"),
+        )))
+    })?;
+    let _ = rl.load_history(&history_path);
+
+    let prompt = cli_prompt();
+    loop {
+        match rl.readline(prompt) {
+            Ok(line) => {
+                if !line.trim().is_empty() {
+                    let _ = rl.add_history_entry(&line);
+                }
+                let turn = app.handle_cli_line(&line, provider_client, tui)?;
+                for frame in &turn.frames {
+                    println!("{frame}");
+                }
+                if turn.control == SessionControl::Exit {
+                    break;
+                }
+            }
+            Err(ReadlineError::Interrupted | ReadlineError::Eof) => {
+                break;
+            }
+            Err(err) => {
+                return Err(AppError::Session(SessionError::SessionReadFailed(
+                    io::Error::new(io::ErrorKind::Other, format!("readline error: {err}")),
+                )));
+            }
+        }
+    }
+
+    if let Some(parent) = history_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = rl.save_history(&history_path);
 
     Ok(())
 }
