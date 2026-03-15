@@ -255,7 +255,7 @@ pub enum ToolValidationError {
     UnknownTool,
     InputKindMismatch,
     MissingRequiredField(String),
-    DangerousCommand(String),
+    DangerousCommand { command: String, reason: String },
 }
 
 #[derive(Debug, Default)]
@@ -564,19 +564,22 @@ fn validate_required_fields(input: &ToolInput) -> Result<(), ToolValidationError
 /// This is a defence-in-depth measure.  The primary protection is the
 /// `Restricted` permission class which blocks `shell.exec` by default.
 fn validate_shell_command_safety(command: &str) -> Result<(), ToolValidationError> {
-    const BLOCKED_PATTERNS: &[&str] = &[
-        "rm -rf /",
-        "rm -rf ~",
-        "mkfs",
-        "dd if=",
-        ":(){",
-        ">(", // process substitution
+    const BLOCKED: &[(&str, &str)] = &[
+        ("rm -rf /", "recursive deletion of root filesystem"),
+        ("rm -rf ~", "recursive deletion of home directory"),
+        ("mkfs", "filesystem formatting — destroys all data on device"),
+        ("dd if=", "raw disk write — can overwrite partitions or boot sectors"),
+        (":(){", "fork bomb — exhausts system process table"),
+        (">(", "process substitution — can be used for command injection"),
     ];
 
     let lower = command.to_ascii_lowercase();
-    for pattern in BLOCKED_PATTERNS {
+    for (pattern, reason) in BLOCKED {
         if lower.contains(pattern) {
-            return Err(ToolValidationError::DangerousCommand(command.to_string()));
+            return Err(ToolValidationError::DangerousCommand {
+                command: command.to_string(),
+                reason: reason.to_string(),
+            });
         }
     }
 
@@ -588,10 +591,26 @@ fn collect_search_matches(
     pattern: &str,
     matches: &mut Vec<String>,
 ) -> Result<(), ToolRuntimeError> {
+    use std::io::BufRead;
+
     if root.is_file() {
-        let content = fs::read_to_string(root).unwrap_or_default();
-        if root.display().to_string().contains(pattern) || content.contains(pattern) {
-            matches.push(root.display().to_string());
+        let path_str = root.display().to_string();
+        if path_str.contains(pattern) {
+            matches.push(path_str);
+            return Ok(());
+        }
+        if !is_searchable_file(root) {
+            return Ok(());
+        }
+        if let Ok(file) = fs::File::open(root) {
+            let reader = std::io::BufReader::new(file);
+            for line in reader.lines() {
+                let Ok(line) = line else { break };
+                if line.contains(pattern) {
+                    matches.push(path_str);
+                    break;
+                }
+            }
         }
         return Ok(());
     }
@@ -607,17 +626,48 @@ fn collect_search_matches(
             ))
         })?;
         let path = entry.path();
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+
+        // Skip common non-project directories
         if path.is_dir() {
+            if matches!(name_str.as_ref(), ".git" | "target" | ".anvil" | "node_modules" | ".DS_Store") {
+                continue;
+            }
             collect_search_matches(&path, pattern, matches)?;
         } else {
-            let content = fs::read_to_string(&path).unwrap_or_default();
-            if path.display().to_string().contains(pattern) || content.contains(pattern) {
-                matches.push(path.display().to_string());
+            let path_str = path.display().to_string();
+            if path_str.contains(pattern) {
+                matches.push(path_str);
+                continue;
+            }
+            if !is_searchable_file(&path) {
+                continue;
+            }
+            if let Ok(file) = fs::File::open(&path) {
+                let reader = std::io::BufReader::new(file);
+                for line in reader.lines() {
+                    let Ok(line) = line else { break };
+                    if line.contains(pattern) {
+                        matches.push(path_str);
+                        break;
+                    }
+                }
             }
         }
     }
 
     Ok(())
+}
+
+/// Check if a file is likely to be text and worth searching.
+fn is_searchable_file(path: &Path) -> bool {
+    !matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some("png" | "jpg" | "jpeg" | "gif" | "pdf" | "zip" | "gz" | "tar"
+            | "wasm" | "ico" | "exe" | "dll" | "so" | "dylib" | "o" | "a"
+            | "class" | "pyc" | "pyo" | "lock")
+    )
 }
 
 fn render_directory_listing(path: &Path) -> Result<String, ToolRuntimeError> {

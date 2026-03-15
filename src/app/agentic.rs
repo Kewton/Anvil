@@ -54,18 +54,14 @@ impl App {
                 .with_reasoning_summary(vec![
                     "validated structured tool response".to_string(),
                     "ready to execute tool plan".to_string(),
-                ])
-                .with_context_usage(
-                    self.session.estimated_token_count(),
-                    self.config.runtime.context_window,
-                );
+                ]);
             // Use ResumeThinking when coming from Working state (iteration > 0)
             let transition = if self.state_machine.snapshot().state == RuntimeState::Working {
                 StateTransition::ResumeThinking
             } else {
                 StateTransition::StartThinking
             };
-            let _ = self.apply_transition(thinking, transition)?;
+            let _ = self.transition_with_context(thinking, transition)?;
             frames.push(self.render_console(tui)?);
 
             // Execute tool calls and record results WITH payload
@@ -84,12 +80,8 @@ impl App {
                     results.len()
                 ))
                 .with_tool_logs(tool_log_views)
-                .with_elapsed_ms(elapsed_ms)
-                .with_context_usage(
-                    self.session.estimated_token_count(),
-                    self.config.runtime.context_window,
-                );
-            let _ = self.apply_transition(working, StateTransition::StartWorking)?;
+                .with_elapsed_ms(elapsed_ms);
+            let _ = self.transition_with_context(working, StateTransition::StartWorking)?;
             frames.push(self.render_console(tui)?);
 
             // Send tool results back to LLM for the next turn
@@ -176,12 +168,8 @@ impl App {
                 ),
                 saved_status.to_string(),
             )
-            .with_elapsed_ms(elapsed_ms)
-            .with_context_usage(
-                self.session.estimated_token_count(),
-                self.config.runtime.context_window,
-            );
-        let _ = self.apply_transition(done, StateTransition::Finish)?;
+            .with_elapsed_ms(elapsed_ms);
+        let _ = self.transition_with_context(done, StateTransition::Finish)?;
         frames.push(self.render_console(tui)?);
         Ok(frames)
     }

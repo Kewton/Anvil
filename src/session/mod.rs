@@ -124,6 +124,9 @@ impl SessionRecord {
         }
     }
 
+    /// Maximum messages before auto-compaction triggers.
+    const AUTO_COMPACT_THRESHOLD: usize = 64;
+
     pub fn push_message(&mut self, message: SessionMessage) {
         // Update cached token count incrementally
         let msg_tokens = estimate_tokens(&message.content);
@@ -132,6 +135,10 @@ impl SessionRecord {
         }
         self.messages.push(message);
         self.touch();
+        // Auto-compact when message count grows too large
+        if self.messages.len() > Self::AUTO_COMPACT_THRESHOLD {
+            self.compact_history(Self::AUTO_COMPACT_THRESHOLD / 2);
+        }
     }
 
     pub fn set_last_snapshot(&mut self, snapshot: AppStateSnapshot) {

@@ -485,6 +485,22 @@ impl App {
         Ok(snapshot)
     }
 
+    /// Build a snapshot with context usage attached and apply the transition.
+    ///
+    /// Reduces boilerplate by combining the common `with_context_usage` +
+    /// `apply_transition` pattern.
+    fn transition_with_context(
+        &mut self,
+        snapshot: AppStateSnapshot,
+        transition: StateTransition,
+    ) -> Result<AppStateSnapshot, AppError> {
+        let snapshot = snapshot.with_context_usage(
+            self.session.estimated_token_count(),
+            self.config.runtime.context_window,
+        );
+        self.apply_transition(snapshot, transition)
+    }
+
     pub(crate) fn persist_session_event_for_mock(
         &mut self,
         event: AppEvent,
@@ -555,18 +571,14 @@ impl App {
                     .with_status(status.clone())
                     .with_plan(plan_items.clone(), *active_index)
                     .with_reasoning_summary(reasoning_summary.clone())
-                    .with_elapsed_ms(*elapsed_ms)
-                    .with_context_usage(
-                        self.session.estimated_token_count(),
-                        self.config.runtime.context_window,
-                    );
+                    .with_elapsed_ms(*elapsed_ms);
 
                 let transition = match self.state_machine.snapshot().state {
                     RuntimeState::Working => StateTransition::ResumeThinking,
                     _ => StateTransition::StartThinking,
                 };
 
-                self.apply_transition(snapshot, transition)
+                self.transition_with_context(snapshot, transition)
             }
             AgentEvent::ApprovalRequested {
                 status,
@@ -584,12 +596,8 @@ impl App {
                         risk.clone(),
                         tool_call_id.clone(),
                     )
-                    .with_elapsed_ms(*elapsed_ms)
-                    .with_context_usage(
-                        self.session.estimated_token_count(),
-                        self.config.runtime.context_window,
-                    );
-                self.apply_transition(snapshot, StateTransition::RequestApproval)
+                    .with_elapsed_ms(*elapsed_ms);
+                self.transition_with_context(snapshot, StateTransition::RequestApproval)
             }
             AgentEvent::Working {
                 status,
@@ -602,12 +610,8 @@ impl App {
                     .with_status(status.clone())
                     .with_plan(plan_items.clone(), *active_index)
                     .with_tool_logs(render::build_tool_logs(tool_logs))
-                    .with_elapsed_ms(*elapsed_ms)
-                    .with_context_usage(
-                        self.session.estimated_token_count(),
-                        self.config.runtime.context_window,
-                    );
-                self.apply_transition(snapshot, StateTransition::StartWorking)
+                    .with_elapsed_ms(*elapsed_ms);
+                self.transition_with_context(snapshot, StateTransition::StartWorking)
             }
             AgentEvent::Done {
                 status,
@@ -622,12 +626,8 @@ impl App {
                     .with_status(status.clone())
                     .with_tool_logs(render::build_tool_logs(tool_logs))
                     .with_completion_summary(completion_summary.clone(), saved_status.clone())
-                    .with_elapsed_ms(*elapsed_ms)
-                    .with_context_usage(
-                        self.session.estimated_token_count(),
-                        self.config.runtime.context_window,
-                    );
-                self.apply_transition(snapshot, StateTransition::Finish)
+                    .with_elapsed_ms(*elapsed_ms);
+                self.transition_with_context(snapshot, StateTransition::Finish)
             }
             AgentEvent::Interrupted {
                 status,
@@ -644,12 +644,8 @@ impl App {
                         saved_status.clone(),
                         next_actions.clone(),
                     )
-                    .with_elapsed_ms(*elapsed_ms)
-                    .with_context_usage(
-                        self.session.estimated_token_count(),
-                        self.config.runtime.context_window,
-                    );
-                self.apply_transition(snapshot, StateTransition::Interrupt)?;
+                    .with_elapsed_ms(*elapsed_ms);
+                self.transition_with_context(snapshot, StateTransition::Interrupt)?;
                 self.persist_session(AppEvent::SessionNormalizedAfterInterrupt)?;
                 Ok(self.state_machine.snapshot().clone())
             }
@@ -662,12 +658,8 @@ impl App {
                 let snapshot = AppStateSnapshot::new(RuntimeState::Error)
                     .with_status(status.clone())
                     .with_error_summary(error_summary.clone(), recommended_actions.clone())
-                    .with_elapsed_ms(*elapsed_ms)
-                    .with_context_usage(
-                        self.session.estimated_token_count(),
-                        self.config.runtime.context_window,
-                    );
-                self.apply_transition(snapshot, StateTransition::Fail)
+                    .with_elapsed_ms(*elapsed_ms);
+                self.transition_with_context(snapshot, StateTransition::Fail)
             }
         }
     }
