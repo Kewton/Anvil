@@ -199,24 +199,21 @@ fn live_turn_executes_structured_file_write_response_without_approval() {
     let written = fs::read_to_string(root.join("sandbox/test1_001/index.html"))
         .expect("file.write should materialize output");
     assert!(written.contains("invaders"));
+    // Intermediate Thinking/Working frames are no longer emitted to avoid
+    // duplicate output (Issue #1).  Only the final Done frame is returned,
+    // which contains tool_logs and completion_summary.
     assert!(
         frames
             .iter()
-            .any(|frame| frame.contains("[T] tool  > file.write"))
+            .any(|frame| frame.contains("[T] tool  > file.write")),
+        "done frame should contain tool log for file.write"
     );
-    assert!(
-        frames
-            .iter()
-            .any(|frame| frame.contains("[A] anvil > plan"))
-    );
-    assert!(frames.iter().any(|frame| frame.contains("working on 1/")));
-    // The agentic loop feeds tool results back to the LLM.  The final
-    // answer comes from the follow-up turn (not the original ANVIL_FINAL).
     assert!(
         frames
             .last()
             .expect("done frame should exist")
-            .contains("Executed")
+            .contains("Executed"),
+        "done frame should contain execution summary"
     );
 }
 

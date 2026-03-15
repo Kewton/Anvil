@@ -169,16 +169,20 @@ fn tui_renders_working_and_done_views_with_tool_logs() {
         .render_console(&tui)
         .expect("done render should succeed");
 
-    assert!(working.contains("[U] you > inspect state handling"));
+    // All messages (user, tool, assistant) are excluded from live-turn
+    // frames because they were already shown during the turn via stderr
+    // streaming and tool execution output (Issue #1).
+    assert!(
+        !working.contains("[U] you > inspect state handling"),
+        "user message should not appear in working frame (already shown)"
+    );
     assert!(working.contains("[T] tool  > progress"));
     assert!(working.contains("completed:2"));
     assert!(working.contains("[T] tool  > Read"));
     assert!(working.contains("tools active"));
-    // Assistant message is excluded from frame rendering because it was
-    // already streamed to stderr (Issue #1). It should still be in the session.
     assert!(
         !done.contains("[A] anvil > 調査結果を整理しました。"),
-        "assistant message should not appear in done frame (streamed to stderr)"
+        "assistant message should not appear in done frame"
     );
     assert!(
         app.session()
@@ -207,7 +211,11 @@ fn app_can_render_console_from_runtime_state_without_manual_message_plumbing() {
         .render_console(&tui)
         .expect("console render should succeed");
 
-    assert!(rendered.contains("[U] you > trace runtime-driven rendering"));
+    // Messages are excluded from live-turn frames (Issue #1).
+    assert!(
+        !rendered.contains("[U] you > trace runtime-driven rendering"),
+        "user message should not appear in live-turn frame"
+    );
     assert!(rendered.contains("[A] anvil > Thinking."));
     assert!(rendered.contains("typeahead enabled"));
 }
@@ -225,13 +233,15 @@ fn tui_limits_rendered_history_to_recent_messages() {
         .mock_thinking_snapshot()
         .expect("thinking snapshot should build");
 
-    let rendered = app
-        .render_console(&tui)
-        .expect("console render should succeed");
+    // Live-turn frames exclude all messages (Issue #1), so verify via
+    // startup rendering where history is displayed.
+    let startup = app
+        .startup_console(&tui)
+        .expect("startup render should succeed");
 
-    assert!(!rendered.contains("[U] you > message 0"));
-    assert!(rendered.contains("[U] you > message 7"));
-    assert!(rendered.contains("history: recent 5 messages"));
+    assert!(!startup.contains("[U] you > message 0"));
+    assert!(startup.contains("[U] you > message 7"));
+    assert!(startup.contains("history: recent 5 messages"));
 }
 
 #[test]
@@ -269,13 +279,15 @@ fn done_frame_excludes_streamed_assistant_messages() {
         .render_console(&tui)
         .expect("done render should succeed");
 
-    // The assistant message was already streamed to stderr during the turn,
-    // so the frame should NOT render it again in the message list.
-    // User messages should still appear.
-    assert!(rendered.contains("[U] you > ask a question"));
+    // All messages are excluded from live-turn frames because they were
+    // already shown via stderr streaming and tool output (Issue #1).
+    assert!(
+        !rendered.contains("[U] you > ask a question"),
+        "user message should not appear in done frame (already shown)"
+    );
     assert!(
         !rendered.contains("[A] anvil > 調査結果を整理しました。"),
-        "assistant message should be excluded from done frame to avoid duplicate output"
+        "assistant message should be excluded from done frame"
     );
     // The frame should still contain the status/result sections
     assert!(rendered.contains("[A] anvil > result"));
