@@ -268,11 +268,14 @@ fn parse_tool_call_value(value: &Value) -> Result<ToolCallRequest, String> {
         "file.search" => ToolInput::FileSearch {
             root: value
                 .get("root")
+                .or_else(|| value.get("path"))
                 .and_then(Value::as_str)
                 .ok_or_else(|| "missing root in file.search tool block".to_string())?
                 .to_string(),
             pattern: value
                 .get("pattern")
+                .or_else(|| value.get("content"))
+                .or_else(|| value.get("query"))
                 .and_then(Value::as_str)
                 .ok_or_else(|| "missing pattern in file.search tool block".to_string())?
                 .to_string(),
@@ -301,8 +304,11 @@ fn repair_tool_call_block(block: &str) -> Option<ToolCallRequest> {
             path: extract_simple_string_field(block, "path")?,
         },
         "file.search" => ToolInput::FileSearch {
-            root: extract_simple_string_field(block, "root")?,
-            pattern: extract_simple_string_field(block, "pattern")?,
+            root: extract_simple_string_field(block, "root")
+                .or_else(|| extract_simple_string_field(block, "path"))?,
+            pattern: extract_simple_string_field(block, "pattern")
+                .or_else(|| extract_simple_string_field(block, "content"))
+                .or_else(|| extract_simple_string_field(block, "query"))?,
         },
         _ => return None,
     };
@@ -371,17 +377,36 @@ fn estimate_message_tokens(content: &str) -> usize {
 
 fn tool_protocol_system_prompt() -> &'static str {
     concat!(
-        "You are Anvil. When a task requires file changes, respond using this protocol.\n",
-        "Use one or more fenced blocks exactly like:\n",
+        "You are Anvil, a local coding agent for serious terminal work.\n",
+        "When a task requires file operations, respond using this protocol.\n",
+        "\n",
+        "Available tools (use one or more fenced blocks):\n",
+        "\n",
+        "1. file.read — read a file or list a directory:\n",
         "```ANVIL_TOOL\n",
-        "{\"id\":\"call_001\",\"tool\":\"file.write\",\"path\":\"./relative/path\",\"content\":\"...\"}\n",
+        "{\"id\":\"call_001\",\"tool\":\"file.read\",\"path\":\"./relative/path\"}\n",
         "```\n",
-        "Supported tools: file.write, file.read, file.search.\n",
-        "After tool blocks, include exactly one final fenced block:\n",
+        "\n",
+        "2. file.write — create or overwrite a file:\n",
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_002\",\"tool\":\"file.write\",\"path\":\"./relative/path\",\"content\":\"file content here\"}\n",
+        "```\n",
+        "\n",
+        "3. file.search — search for files by name or content:\n",
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_003\",\"tool\":\"file.search\",\"root\":\".\",\"pattern\":\"search term\"}\n",
+        "```\n",
+        "\n",
+        "After ALL tool blocks, include exactly one final block with your summary:\n",
         "```ANVIL_FINAL\n",
         "User-facing summary and code review notes.\n",
         "```\n",
-        "Do not use any other tool syntax."
+        "\n",
+        "Rules:\n",
+        "- All paths must be relative (start with ./ or a directory name).\n",
+        "- Do not use any other tool syntax.\n",
+        "- Always include ANVIL_FINAL after your tool blocks.\n",
+        "- If no file operations are needed, just respond normally without tool blocks."
     )
 }
 
