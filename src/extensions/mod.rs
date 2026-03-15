@@ -11,6 +11,7 @@ pub enum SlashCommandAction {
     PlanAdd(String),
     PlanFocus(usize),
     PlanClear,
+    RepoFind(String),
     Model,
     Approve,
     Deny,
@@ -109,6 +110,9 @@ impl ExtensionRegistry {
         if let Some(parsed) = parse_plan_command(command) {
             return Some(parsed);
         }
+        if let Some(parsed) = parse_repo_command(command) {
+            return Some(parsed);
+        }
         self.commands
             .iter()
             .find(|spec| spec.name == command || (spec.name == "/exit" && command == "/quit"))
@@ -147,6 +151,11 @@ pub fn builtin_slash_commands() -> Vec<SlashCommandSpec> {
             name: "/plan-clear".to_string(),
             description: "clear the current plan".to_string(),
             action: SlashCommandAction::PlanClear,
+        },
+        SlashCommandSpec {
+            name: "/repo-find".to_string(),
+            description: "search the repo by path and content".to_string(),
+            action: SlashCommandAction::RepoFind(String::new()),
         },
         SlashCommandSpec {
             name: "/model".to_string(),
@@ -225,4 +234,17 @@ fn parse_plan_command(command: &str) -> Option<SlashCommandSpec> {
     }
 
     None
+}
+
+fn parse_repo_command(command: &str) -> Option<SlashCommandSpec> {
+    let rest = command.strip_prefix("/repo-find ")?;
+    let query = rest.trim();
+    if query.is_empty() {
+        return None;
+    }
+    Some(SlashCommandSpec {
+        name: "/repo-find".to_string(),
+        description: "search the repo by path and content".to_string(),
+        action: SlashCommandAction::RepoFind(query.to_string()),
+    })
 }

@@ -58,6 +58,9 @@ fn slash_commands_support_help_status_reset_and_exit() {
     let plan_clear = app
         .handle_cli_line("/plan-clear", &provider, &tui)
         .expect("plan clear should render");
+    let repo_find = app
+        .handle_cli_line("/repo-find Cargo.toml", &provider, &tui)
+        .expect("repo find should render");
     let model = app
         .handle_cli_line("/model", &provider, &tui)
         .expect("model should render");
@@ -103,6 +106,13 @@ fn slash_commands_support_help_status_reset_and_exit() {
             .last()
             .expect("plan clear frame")
             .contains("no active plan")
+    );
+    assert!(
+        repo_find
+            .frames
+            .last()
+            .expect("repo-find frame")
+            .contains("[A] anvil > repo-find Cargo.toml")
     );
     assert!(
         model
@@ -379,6 +389,7 @@ fn help_frame_is_built_from_registered_slash_commands() {
     assert!(help.contains("/plan-add"));
     assert!(help.contains("/plan-focus"));
     assert!(help.contains("/plan-clear"));
+    assert!(help.contains("/repo-find"));
     assert!(commands.iter().any(|spec| spec.name == "/plan"));
     assert!(commands.iter().any(|spec| spec.name == "/model"));
 }

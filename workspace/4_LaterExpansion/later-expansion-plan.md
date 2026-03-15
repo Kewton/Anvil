@@ -18,11 +18,16 @@
   - normalized into the same provider contract as Ollama
   - covered by config/bootstrap and provider integration tests
 
+- Improved large-repo retrieval
+  - `/repo-find <query>` path and content search
+  - repository walking with basic filtering
+  - operator-console rendering for retrieval results
+
 ## Next Slices
 
 - Improved large-repo retrieval
-  - repository indexing
-  - path/name/content hybrid retrieval
+  - persistent repository indexing
+  - path/name/content hybrid retrieval scoring refinement
   - retrieval scoring
   - compaction and summary snapshots for long sessions
 

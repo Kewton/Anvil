@@ -5,6 +5,7 @@ pub mod contracts;
 pub mod extensions;
 pub mod metrics;
 pub mod provider;
+pub mod retrieval;
 pub mod session;
 pub mod state;
 pub mod tooling;

@@ -1,0 +1,189 @@
+use std::fmt::{Display, Formatter};
+use std::fs;
+use std::path::Path;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetrievalMatch {
+    pub path: String,
+    pub score: i32,
+    pub snippets: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetrievalResult {
+    pub query: String,
+    pub matches: Vec<RetrievalMatch>,
+}
+
+#[derive(Debug)]
+pub enum RetrievalError {
+    Walk(std::io::Error),
+}
+
+impl Display for RetrievalError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Walk(err) => write!(f, "failed to index repository: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for RetrievalError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IndexedFile {
+    relative_path: String,
+    content: String,
+}
+
+pub struct RepositoryIndex {
+    files: Vec<IndexedFile>,
+}
+
+impl RepositoryIndex {
+    pub fn build(root: &Path) -> Result<Self, RetrievalError> {
+        let mut files = Vec::new();
+        collect_files(root, root, &mut files)?;
+        Ok(Self { files })
+    }
+
+    pub fn search(&self, query: &str, limit: usize) -> RetrievalResult {
+        let needle = query.trim().to_ascii_lowercase();
+        if needle.is_empty() {
+            return RetrievalResult {
+                query: query.to_string(),
+                matches: Vec::new(),
+            };
+        }
+
+        let mut matches = self
+            .files
+            .iter()
+            .filter_map(|file| score_file(file, &needle))
+            .collect::<Vec<_>>();
+        matches.sort_by(|left, right| {
+            right
+                .score
+                .cmp(&left.score)
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        matches.truncate(limit);
+
+        RetrievalResult {
+            query: query.to_string(),
+            matches,
+        }
+    }
+}
+
+pub fn render_retrieval_result(result: &RetrievalResult) -> String {
+    let mut lines = vec![format!("[A] anvil > repo-find {}", result.query)];
+    if result.matches.is_empty() {
+        lines.push("  no matches".to_string());
+        return lines.join("\n");
+    }
+
+    for item in &result.matches {
+        lines.push(format!("  - {} (score {})", item.path, item.score));
+        for snippet in &item.snippets {
+            lines.push(format!("      {snippet}"));
+        }
+    }
+    lines.join("\n")
+}
+
+fn collect_files(
+    root: &Path,
+    current: &Path,
+    files: &mut Vec<IndexedFile>,
+) -> Result<(), RetrievalError> {
+    let entries = fs::read_dir(current).map_err(RetrievalError::Walk)?;
+    for entry in entries {
+        let entry = entry.map_err(RetrievalError::Walk)?;
+        let path = entry.path();
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+
+        if should_skip(&file_name, &path) {
+            continue;
+        }
+
+        if path.is_dir() {
+            collect_files(root, &path, files)?;
+            continue;
+        }
+
+        if !path.is_file() || is_binary_path(&path) {
+            continue;
+        }
+
+        let Ok(content) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let relative = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .to_string();
+        files.push(IndexedFile {
+            relative_path: relative,
+            content,
+        });
+    }
+
+    Ok(())
+}
+
+fn should_skip(file_name: &str, path: &Path) -> bool {
+    file_name == ".git"
+        || file_name == "target"
+        || file_name == ".anvil"
+        || file_name == ".DS_Store"
+        || path.components().any(|component| {
+            let text = component.as_os_str().to_string_lossy();
+            text == ".git" || text == "target" || text == ".anvil"
+        })
+}
+
+fn is_binary_path(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some("png" | "jpg" | "jpeg" | "gif" | "pdf" | "zip" | "gz" | "wasm" | "ico")
+    )
+}
+
+fn score_file(file: &IndexedFile, needle: &str) -> Option<RetrievalMatch> {
+    let path_lc = file.relative_path.to_ascii_lowercase();
+    let mut score = 0;
+    let mut snippets = Vec::new();
+
+    if path_lc.contains(needle) {
+        score += 50;
+        snippets.push(format!("path match: {}", file.relative_path));
+    }
+
+    for line in file.content.lines() {
+        if line.to_ascii_lowercase().contains(needle) {
+            score += 10;
+            if snippets.len() < 3 {
+                snippets.push(compact_line(line));
+            }
+        }
+    }
+
+    (score > 0).then(|| RetrievalMatch {
+        path: file.relative_path.clone(),
+        score,
+        snippets,
+    })
+}
+
+fn compact_line(line: &str) -> String {
+    let trimmed = line.trim();
+    if trimmed.chars().count() <= 120 {
+        trimmed.to_string()
+    } else {
+        let compact: String = trimmed.chars().take(117).collect();
+        format!("{compact}...")
+    }
+}
