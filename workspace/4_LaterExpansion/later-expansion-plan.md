@@ -22,6 +22,7 @@
 
 - Improved large-repo retrieval
   - repository indexing
+  - path/name/content hybrid retrieval
   - retrieval scoring
   - compaction and summary snapshots for long sessions
 
@@ -29,3 +30,13 @@
   - richer tool-progress display
   - session timeline inspection
   - more expressive but still legible status views
+
+- Architectural cleanup for richer planning
+  - typed planner events instead of direct snapshot replacement
+  - execution checkpoints
+  - tool-batch review
+
+- Backend parity expansion
+  - OpenAI-compatible streaming parity
+  - provider-specific error normalization
+  - structured tool-response parity checks
