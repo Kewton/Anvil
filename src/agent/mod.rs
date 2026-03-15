@@ -79,6 +79,9 @@ impl AgentRuntimeScript {
 pub struct PendingTurnState {
     pub waiting_tool_call_id: String,
     pub remaining_events: Vec<AgentEvent>,
+    /// Pending structured tool calls awaiting approval in the agentic loop.
+    #[serde(default)]
+    pub pending_tool_calls: Vec<ToolCallRequest>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

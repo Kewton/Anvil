@@ -339,6 +339,7 @@ fn session_interrupt_persists_and_resumes_correctly() {
     session.set_pending_turn(PendingTurnState {
         waiting_tool_call_id: "call_001".to_string(),
         remaining_events: vec![],
+        pending_tool_calls: vec![],
     });
     session.normalize_interrupted_turn("provider turn");
     store.save(&session).expect("session should save");

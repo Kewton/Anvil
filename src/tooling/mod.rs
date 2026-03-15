@@ -5,6 +5,7 @@
 //! [`LocalToolExecutor`] within a sandboxed workspace root.
 
 use crate::contracts::ToolLogView;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::fs;
@@ -53,7 +54,7 @@ pub enum ToolKind {
     ShellExec,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolInput {
     FileRead { path: String },
     FileWrite { path: String, content: String },
@@ -72,7 +73,7 @@ impl ToolInput {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCallRequest {
     pub tool_call_id: String,
     pub tool_name: String,
