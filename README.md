@@ -153,6 +153,7 @@ ANVIL_MAX_CONSOLE_MESSAGES=5      # 表示するメッセージ数
 ANVIL_AUTO_COMPACT_THRESHOLD=64   # 自動圧縮の閾値
 ANVIL_TOOL_RESULT_MAX_CHARS=8000  # ツール結果の最大文字数
 ANVIL_CURL_TIMEOUT=300            # curlタイムアウト（秒）
+ANVIL_SHELL_TIMEOUT=0             # shell.execタイムアウト（0=無制限）
 ANVIL_API_KEY=sk-...              # OpenAI互換APIキー
 ```
 

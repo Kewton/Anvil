@@ -443,8 +443,8 @@ fn tool_protocol_system_prompt() -> &'static str {
         "- If no file operations are needed, just respond normally without tool blocks.\n",
         "- Start exploration with file.read on \".\" to list the project root before reading specific files.\n",
         "- Do not assume files like README.md exist — verify first.\n",
-        "- shell.exec has a 30-second timeout. For long-running processes (servers, watch modes), use background execution: e.g. 'npm run dev &' or 'nohup ... &'.\n",
-        "- Never run commands that block indefinitely (npm run dev, cargo watch, etc.) without '&'."
+        "- For dev servers and watch processes (npm run dev, cargo watch, etc.), use background execution with '&' so the command returns immediately.\n",
+        "- shell.exec output is streamed to the terminal in real-time. The user can press Ctrl+C to cancel."
     )
 }
 

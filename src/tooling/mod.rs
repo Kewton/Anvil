@@ -457,12 +457,12 @@ impl LocalToolExecutor {
                 })
             }
             ToolInput::ShellExec { command } => {
-                use std::io::Read as _;
+                use std::io::{BufRead, Write as _};
 
-                let timeout_secs: u64 = std::env::var("ANVIL_SHELL_TIMEOUT")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(30);
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "\n  $ {command}"
+                );
 
                 let mut child = std::process::Command::new("sh")
                     .arg("-c")
@@ -477,64 +477,58 @@ impl LocalToolExecutor {
                         ))
                     })?;
 
-                let deadline = std::time::Instant::now()
-                    + std::time::Duration::from_secs(timeout_secs);
+                // Stream stdout to stderr in real-time so the user can
+                // see progress and Ctrl+C if needed.
+                let stdout_handle = child.stdout.take();
+                let stderr_handle = child.stderr.take();
 
-                // Poll for completion with timeout
-                let timed_out = loop {
-                    match child.try_wait() {
-                        Ok(Some(_)) => break false,
-                        Ok(None) => {
-                            if std::time::Instant::now() >= deadline {
-                                let _ = child.kill();
-                                let _ = child.wait();
-                                break true;
-                            }
-                            std::thread::sleep(std::time::Duration::from_millis(100));
+                let stdout_thread = std::thread::spawn(move || {
+                    let mut captured = String::new();
+                    if let Some(out) = stdout_handle {
+                        let reader = std::io::BufReader::new(out);
+                        for line in reader.lines() {
+                            let Ok(line) = line else { break };
+                            let _ = writeln!(std::io::stderr(), "  {line}");
+                            captured.push_str(&line);
+                            captured.push('\n');
                         }
-                        Err(_) => break false,
                     }
-                };
+                    captured
+                });
 
-                let mut stdout_buf = String::new();
-                let mut stderr_buf = String::new();
-                if let Some(mut out) = child.stdout.take() {
-                    let _ = out.read_to_string(&mut stdout_buf);
-                }
-                if let Some(mut err) = child.stderr.take() {
-                    let _ = err.read_to_string(&mut stderr_buf);
-                }
-
-                let combined = if timed_out {
-                    let partial = if !stdout_buf.is_empty() {
-                        format!("{stdout_buf}\n")
-                    } else {
-                        String::new()
-                    };
-                    format!(
-                        "{partial}[shell.exec timed out after {timeout_secs}s — \
-                         use background execution for long-running commands, \
-                         e.g. 'npm run dev &']"
-                    )
-                } else if stderr_buf.is_empty() {
-                    stdout_buf
-                } else if stdout_buf.is_empty() {
-                    stderr_buf
-                } else {
-                    format!("{stdout_buf}\n--- stderr ---\n{stderr_buf}")
-                };
+                let stderr_thread = std::thread::spawn(move || {
+                    let mut captured = String::new();
+                    if let Some(err) = stderr_handle {
+                        let reader = std::io::BufReader::new(err);
+                        for line in reader.lines() {
+                            let Ok(line) = line else { break };
+                            let _ = writeln!(std::io::stderr(), "  {line}");
+                            captured.push_str(&line);
+                            captured.push('\n');
+                        }
+                    }
+                    captured
+                });
 
                 let exit_status = child.wait().ok();
-                let success = !timed_out
-                    && exit_status.is_some_and(|s| s.success());
+                let stdout_buf = stdout_thread.join().unwrap_or_default();
+                let stderr_buf = stderr_thread.join().unwrap_or_default();
+
+                let combined = if stderr_buf.trim().is_empty() {
+                    stdout_buf
+                } else if stdout_buf.trim().is_empty() {
+                    stderr_buf
+                } else {
+                    format!("{stdout_buf}--- stderr ---\n{stderr_buf}")
+                };
+
+                let success = exit_status.is_some_and(|s| s.success());
                 let status = if success {
                     ToolExecutionStatus::Completed
                 } else {
                     ToolExecutionStatus::Failed
                 };
-                let summary = if timed_out {
-                    format!("shell.exec timed out ({timeout_secs}s): {command}")
-                } else if success {
+                let summary = if success {
                     format!("shell.exec completed: {command}")
                 } else {
                     format!(
