@@ -335,7 +335,7 @@ impl App {
                     match event {
                         ProviderEvent::Agent(agent_event) => {
                             if let Some(structured_frames) =
-                                self.handle_structured_done(agent_event, tui)?
+                                self.handle_structured_done(agent_event, tui, provider_client)?
                             {
                                 frames.extend(structured_frames);
                             } else {
@@ -371,6 +371,7 @@ impl App {
                                     "session saved",
                                     0,
                                     tui,
+                                    provider_client,
                                 )?);
                                 break;
                             }
@@ -518,10 +519,11 @@ impl App {
         Ok(frames)
     }
 
-    fn handle_structured_done(
+    fn handle_structured_done<C: ProviderClient>(
         &mut self,
         event: &AgentEvent,
         tui: &Tui,
+        provider_client: &C,
     ) -> Result<Option<Vec<String>>, AppError> {
         let AgentEvent::Done {
             status,
@@ -547,55 +549,159 @@ impl App {
             saved_status,
             *elapsed_ms,
             tui,
+            provider_client,
         )?))
     }
 
-    fn complete_structured_response(
+    /// Execute tool calls and feed results back to the LLM in a loop.
+    ///
+    /// This implements the agentic tool-use loop:
+    /// 1. Execute tool calls from the structured response
+    /// 2. Record results (with full payload) into the session
+    /// 3. Send updated session back to the LLM
+    /// 4. If the LLM responds with more tool calls, repeat (up to MAX_AGENT_ITERATIONS)
+    /// 5. When the LLM responds without tool calls, record as final answer
+    fn complete_structured_response<C: ProviderClient>(
         &mut self,
         structured: StructuredAssistantResponse,
         status: &str,
         saved_status: &str,
         elapsed_ms: u128,
         tui: &Tui,
+        provider_client: &C,
     ) -> Result<Vec<String>, AppError> {
-        let inferred_plan = infer_plan_from_structured_response(&structured);
+        const MAX_AGENT_ITERATIONS: usize = 10;
+        let mut current = structured;
         let mut frames = Vec::new();
-        let thinking = AppStateSnapshot::new(RuntimeState::Thinking)
-            .with_status("Prepared execution plan from model response".to_string())
-            .with_plan(inferred_plan, Some(0))
-            .with_reasoning_summary(vec![
-                "validated structured tool response".to_string(),
-                "ready to execute tool plan".to_string(),
-            ])
-            .with_context_usage(
-                self.session.estimated_token_count(),
+        let mut total_tool_count = 0usize;
+        let mut all_tool_log_views: Vec<ToolLogView> = Vec::new();
+
+        for iteration in 0..MAX_AGENT_ITERATIONS {
+            // Show plan for this iteration
+            let inferred_plan = infer_plan_from_structured_response(&current);
+            let thinking = AppStateSnapshot::new(RuntimeState::Thinking)
+                .with_status(format!(
+                    "Prepared execution plan (iteration {})",
+                    iteration + 1
+                ))
+                .with_plan(inferred_plan, Some(0))
+                .with_reasoning_summary(vec![
+                    "validated structured tool response".to_string(),
+                    "ready to execute tool plan".to_string(),
+                ])
+                .with_context_usage(
+                    self.session.estimated_token_count(),
+                    self.config.runtime.context_window,
+                );
+            // Use ResumeThinking when coming from Working state (iteration > 0)
+            let transition = if self.state_machine.snapshot().state == RuntimeState::Working {
+                StateTransition::ResumeThinking
+            } else {
+                StateTransition::StartThinking
+            };
+            let _ = self.apply_transition(thinking, transition)?;
+            frames.push(self.render_console(tui)?);
+
+            // Execute tool calls and record results WITH payload
+            let results = self.execute_structured_tool_calls(&current)?;
+            total_tool_count += results.len();
+
+            let tool_log_views: Vec<ToolLogView> = results
+                .iter()
+                .map(ToolExecutionResult::to_tool_log_view)
+                .collect();
+            all_tool_log_views.extend(tool_log_views.clone());
+
+            let working = AppStateSnapshot::new(RuntimeState::Working)
+                .with_status(format!(
+                    "Executed {} tool call(s). Sending results to model...",
+                    results.len()
+                ))
+                .with_tool_logs(tool_log_views)
+                .with_elapsed_ms(elapsed_ms)
+                .with_context_usage(
+                    self.session.estimated_token_count(),
+                    self.config.runtime.context_window,
+                );
+            let _ = self.apply_transition(working, StateTransition::StartWorking)?;
+            frames.push(self.render_console(tui)?);
+
+            // Send tool results back to LLM for the next turn
+            let spinner = Spinner::start(format!(
+                "Analyzing results. model={} (iteration {})",
+                self.config.runtime.model,
+                iteration + 2
+            ));
+
+            let request = BasicAgentLoop::build_turn_request(
+                self.config.runtime.model.clone(),
+                &self.session,
+                self.provider.capabilities.streaming && self.config.runtime.stream,
                 self.config.runtime.context_window,
             );
-        let _ = self.apply_transition(thinking, StateTransition::StartThinking)?;
-        frames.push(self.render_console(tui)?);
 
-        let results = self.execute_structured_tool_calls(&structured)?;
-        let tool_log_views: Vec<ToolLogView> = results
-            .iter()
-            .map(ToolExecutionResult::to_tool_log_view)
-            .collect();
+            let mut next_token_buffer = String::new();
+            let mut first_token = true;
+            let mut spinner_opt = Some(spinner);
 
-        let working = AppStateSnapshot::new(RuntimeState::Working)
-            .with_status("Executing tool plan".to_string())
-            .with_tool_logs(tool_log_views.clone())
-            .with_elapsed_ms(elapsed_ms)
-            .with_context_usage(
-                self.session.estimated_token_count(),
-                self.config.runtime.context_window,
-            );
-        let _ = self.apply_transition(working, StateTransition::StartWorking)?;
+            let stream_result =
+                provider_client.stream_turn(&request, &mut |event| {
+                    if let Some(s) = spinner_opt.take() {
+                        s.stop();
+                    }
+                    if let ProviderEvent::TokenDelta(delta) = &event {
+                        next_token_buffer.push_str(delta);
+                        if first_token {
+                            first_token = false;
+                        }
+                        let _ = write!(io::stderr(), "{delta}");
+                        let _ = io::stderr().flush();
+                    }
+                });
 
-        self.record_assistant_output(self.next_message_id("assistant"), structured.final_response)?;
+            if let Some(s) = spinner_opt.take() {
+                s.stop();
+            }
+            if !first_token {
+                let _ = writeln!(io::stderr());
+            }
+
+            stream_result.map_err(|err| match err {
+                ProviderTurnError::Backend(msg) => {
+                    AppError::ToolExecution(format!("agentic follow-up failed: {msg}"))
+                }
+                ProviderTurnError::Cancelled => AppError::ToolExecution(
+                    "agentic follow-up cancelled".to_string(),
+                ),
+            })?;
+
+            // Parse the follow-up response
+            let next_structured =
+                BasicAgentLoop::parse_structured_response(&next_token_buffer)
+                    .map_err(AppError::ToolExecution)?;
+
+            if next_structured.tool_calls.is_empty() {
+                // No more tool calls — this is the final answer
+                self.record_assistant_output(
+                    self.next_message_id("assistant"),
+                    next_structured.final_response,
+                )?;
+                break;
+            }
+
+            // More tool calls — continue the loop
+            current = next_structured;
+        }
+
+        // Transition to Done
         let done = AppStateSnapshot::new(RuntimeState::Done)
             .with_status(status.to_string())
-            .with_tool_logs(tool_log_views)
+            .with_tool_logs(all_tool_log_views)
             .with_completion_summary(
-                format!("Executed {} tool call(s). {}", results.len(), saved_status),
+                format!(
+                    "Executed {} tool call(s) across agentic loop. {}",
+                    total_tool_count, saved_status
+                ),
                 saved_status.to_string(),
             )
             .with_elapsed_ms(elapsed_ms)
@@ -604,7 +710,6 @@ impl App {
                 self.config.runtime.context_window,
             );
         let _ = self.apply_transition(done, StateTransition::Finish)?;
-
         frames.push(self.render_console(tui)?);
         Ok(frames)
     }
@@ -629,11 +734,12 @@ impl App {
                 })
                 .map_err(map_tool_execution_error)?;
             let result = executor.execute(request).map_err(map_tool_runtime_error)?;
+            // Record tool result WITH actual payload so the LLM can see it
             self.session.push_message(
                 SessionMessage::new(
                     MessageRole::Tool,
                     "tool",
-                    format!("{} {}", result.tool_name, result.summary),
+                    format_tool_result_message(&result),
                 )
                 .with_id(self.next_message_id("tool")),
             );
@@ -1103,6 +1209,40 @@ fn standard_tool_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.register_standard_tools();
     registry
+}
+
+/// Format a tool execution result into a message that the LLM can interpret.
+///
+/// Includes the actual payload (file content, search matches) so the LLM
+/// can reason about the results in subsequent turns.
+fn format_tool_result_message(result: &ToolExecutionResult) -> String {
+    use crate::tooling::ToolExecutionPayload;
+    match &result.payload {
+        ToolExecutionPayload::None => {
+            format!("[tool result: {}] {}", result.tool_name, result.summary)
+        }
+        ToolExecutionPayload::Text(content) => {
+            let truncated = if content.len() > 8000 {
+                format!("{}...\n[truncated, {} bytes total]", &content[..8000], content.len())
+            } else {
+                content.clone()
+            };
+            format!(
+                "[tool result: {}] {}\n{}",
+                result.tool_name, result.summary, truncated
+            )
+        }
+        ToolExecutionPayload::Paths(paths) => {
+            let listing = paths.join("\n");
+            format!(
+                "[tool result: {}] {} — {} match(es)\n{}",
+                result.tool_name,
+                result.summary,
+                paths.len(),
+                listing
+            )
+        }
+    }
 }
 
 fn map_tool_execution_error(error: ToolExecutionError) -> AppError {

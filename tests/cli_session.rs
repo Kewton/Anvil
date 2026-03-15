@@ -22,7 +22,22 @@ impl ProviderClient for RecordingProvider {
         request: &ProviderTurnRequest,
         emit: &mut dyn FnMut(ProviderEvent),
     ) -> Result<(), ProviderTurnError> {
+        let call_index = self.seen_requests.borrow().len();
         self.seen_requests.borrow_mut().push(request.clone());
+
+        // Agentic follow-up: return plain Done to terminate the loop
+        if call_index > 0 {
+            emit(ProviderEvent::Agent(AgentEvent::Done {
+                status: "Done. session saved".to_string(),
+                assistant_message: "Agentic follow-up completed.".to_string(),
+                completion_summary: "Follow-up turn finished.".to_string(),
+                saved_status: "session saved".to_string(),
+                tool_logs: Vec::new(),
+                elapsed_ms: 0,
+            }));
+            return Ok(());
+        }
+
         for event in self.events.clone() {
             emit(event);
         }

@@ -13,10 +13,17 @@ use std::rc::Rc;
 
 type HeaderLog = Rc<RefCell<Vec<Vec<(String, String)>>>>;
 
+/// Mock provider that supports multi-turn agentic loops.
+///
+/// On the first `stream_turn` call it emits `events`.  On subsequent calls
+/// (triggered by the agentic follow-up) it emits `followup_events`, which
+/// defaults to a simple Done with empty text (no tool calls) so the loop
+/// terminates.
 #[derive(Clone)]
 struct RecordingProvider {
     seen_requests: Rc<RefCell<Vec<ProviderTurnRequest>>>,
     events: Vec<ProviderEvent>,
+    followup_events: Vec<ProviderEvent>,
     error: Option<ProviderTurnError>,
 }
 
@@ -63,7 +70,30 @@ impl ProviderClient for RecordingProvider {
         request: &ProviderTurnRequest,
         emit: &mut dyn FnMut(ProviderEvent),
     ) -> Result<(), ProviderTurnError> {
+        let call_index = self.seen_requests.borrow().len();
         self.seen_requests.borrow_mut().push(request.clone());
+
+        // For agentic follow-up calls: if followup_events is configured, use
+        // those.  Otherwise emit a plain-text Done (no tool calls) so the
+        // agentic loop terminates.
+        if call_index > 0 {
+            if !self.followup_events.is_empty() {
+                for event in self.followup_events.clone() {
+                    emit(event);
+                }
+            } else {
+                emit(ProviderEvent::Agent(AgentEvent::Done {
+                    status: "Done. session saved".to_string(),
+                    assistant_message: "Agentic follow-up completed.".to_string(),
+                    completion_summary: "Follow-up turn finished.".to_string(),
+                    saved_status: "session saved".to_string(),
+                    tool_logs: Vec::new(),
+                    elapsed_ms: 0,
+                }));
+            }
+            return self.error.clone().map_or(Ok(()), Err);
+        }
+
         for event in self.events.clone() {
             emit(event);
         }
@@ -95,6 +125,7 @@ fn live_turn_hands_session_messages_to_provider_and_renders_done() {
                 elapsed_ms: 120,
             }),
         ],
+        followup_events: Vec::new(),
         error: None,
     };
 
@@ -151,6 +182,7 @@ fn live_turn_executes_structured_file_write_response_without_approval() {
             tool_logs: Vec::new(),
             elapsed_ms: 120,
         })],
+        followup_events: Vec::new(),
         error: None,
     };
 
@@ -172,11 +204,13 @@ fn live_turn_executes_structured_file_write_response_without_approval() {
             .iter()
             .any(|frame| frame.contains("working on 1/"))
     );
+    // The agentic loop feeds tool results back to the LLM.  The final
+    // answer comes from the follow-up turn (not the original ANVIL_FINAL).
     assert!(
         frames
             .last()
             .expect("done frame should exist")
-            .contains("Created the browser game shell")
+            .contains("Executed")
     );
 }
 
@@ -214,6 +248,7 @@ fn live_turn_executes_complete_structured_response_from_token_stream() {
             )
             .to_string(),
         )],
+        followup_events: Vec::new(),
         error: None,
     };
 
@@ -228,7 +263,7 @@ fn live_turn_executes_complete_structured_response_from_token_stream() {
         frames
             .last()
             .expect("done frame should exist")
-            .contains("Streamed game output was created")
+            .contains("Executed")
     );
 }
 
@@ -290,6 +325,7 @@ fn live_turn_executes_malformed_structured_file_write_response() {
             tool_logs: Vec::new(),
             elapsed_ms: 120,
         })],
+        followup_events: Vec::new(),
         error: None,
     };
 
@@ -314,6 +350,7 @@ fn live_turn_maps_provider_cancellation_to_interrupted_state() {
     let provider = RecordingProvider {
         seen_requests: Rc::new(RefCell::new(Vec::new())),
         events: Vec::new(),
+        followup_events: Vec::new(),
         error: Some(ProviderTurnError::Cancelled),
     };
 
@@ -608,6 +645,7 @@ fn live_turn_records_provider_backend_error_detail_in_session() {
     let provider = RecordingProvider {
         seen_requests: Rc::new(RefCell::new(Vec::new())),
         events: Vec::new(),
+        followup_events: Vec::new(),
         error: Some(ProviderTurnError::Backend("socket closed".to_string())),
     };
 
@@ -653,6 +691,7 @@ fn live_turn_surfaces_token_delta_progress() {
                 elapsed_ms: 90,
             }),
         ],
+        followup_events: Vec::new(),
         error: None,
     };
 
@@ -712,6 +751,7 @@ fn live_turn_can_pause_for_provider_approval_and_resume() {
                 elapsed_ms: 120,
             }),
         ],
+        followup_events: Vec::new(),
         error: None,
     };
 
