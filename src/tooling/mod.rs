@@ -323,9 +323,9 @@ impl ToolRegistry {
             name: "shell.exec".to_string(),
             kind: ToolKind::ShellExec,
             execution_class: ExecutionClass::Interactive,
-            permission_class: PermissionClass::Restricted,
+            permission_class: PermissionClass::Confirm,
             execution_mode: ExecutionMode::SequentialOnly,
-            plan_mode: PlanModePolicy::Blocked,
+            plan_mode: PlanModePolicy::AllowedWithScope,
             rollback_policy: RollbackPolicy::None,
         });
     }

@@ -219,13 +219,14 @@ fn restricted_tool_is_blocked_before_execution() {
         ))
         .expect("shell should validate");
 
+    // shell.exec is Confirm class: requires approval in default policy
     let err = shell
         .into_execution_request(ToolExecutionPolicy::default())
-        .expect_err("restricted tool should be blocked");
+        .expect_err("confirm tool should require approval");
 
     assert_eq!(
         err,
-        ToolExecutionError::RestrictedTool("shell.exec".to_string())
+        ToolExecutionError::ApprovalRequired("call_shell_001".to_string())
     );
 }
 
@@ -287,14 +288,24 @@ fn plan_mode_policy_is_enforced_for_blocked_and_scoped_tools() {
             approval_required: true,
         })
         .expect_err("scoped plan-mode tool should require explicit scope");
+    // shell.exec is AllowedWithScope: should require scope in plan mode
     let shell_err = shell
+        .clone()
         .into_execution_request(ToolExecutionPolicy {
             plan_mode: true,
-            allow_restricted: true,
-            plan_scope_granted: true,
+            allow_restricted: false,
+            plan_scope_granted: false,
             approval_required: true,
         })
-        .expect_err("blocked plan-mode tool should be denied");
+        .expect_err("shell in plan-mode without scope should be denied");
+    let _shell_ok = shell
+        .into_execution_request(ToolExecutionPolicy {
+            plan_mode: true,
+            allow_restricted: false,
+            plan_scope_granted: true,
+            approval_required: false,
+        })
+        .expect("shell in plan-mode with scope should pass");
     let write_ok = write
         .into_execution_request(ToolExecutionPolicy {
             plan_mode: true,
@@ -310,7 +321,7 @@ fn plan_mode_policy_is_enforced_for_blocked_and_scoped_tools() {
     );
     assert_eq!(
         shell_err,
-        ToolExecutionError::PlanModeBlocked("shell.exec".to_string())
+        ToolExecutionError::PlanModeScopeRequired("shell.exec".to_string())
     );
     assert_eq!(write_ok.spec.kind, ToolKind::FileWrite);
 }
