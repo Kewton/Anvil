@@ -207,6 +207,26 @@ impl SessionRecord {
             .sum()
     }
 
+    pub fn compact_history(&mut self, keep_recent: usize) -> bool {
+        if self.messages.len() <= keep_recent {
+            return false;
+        }
+
+        let split_at = self.messages.len() - keep_recent;
+        let compacted = &self.messages[..split_at];
+        let summary = summarize_messages(compacted);
+        self.messages.drain(..split_at);
+        self.messages.insert(
+            0,
+            SessionMessage::new(MessageRole::System, "anvil", summary)
+                .with_id(format!("compact_{}", now_ms()))
+                .with_status(MessageStatus::Committed),
+        );
+        self.record_event(AppEvent::SessionCompacted);
+        self.touch();
+        true
+    }
+
     pub fn normalize_interrupted_turn(&mut self, interrupted_what: &str) {
         let mut normalized_count = 0usize;
 
@@ -396,4 +416,25 @@ fn compact_preview(content: &str, max_chars: usize) -> String {
         let preview: String = chars[..max_chars.saturating_sub(3)].iter().collect();
         format!("{preview}...")
     }
+}
+
+fn summarize_messages(messages: &[SessionMessage]) -> String {
+    let mut lines = vec!["[compacted session summary]".to_string()];
+    for message in messages.iter().take(8) {
+        let role = match message.role {
+            MessageRole::System => "system",
+            MessageRole::User => "you",
+            MessageRole::Assistant => "anvil",
+            MessageRole::Tool => "tool",
+        };
+        lines.push(format!(
+            "- {}: {}",
+            role,
+            compact_preview(&message.content, 96)
+        ));
+    }
+    if messages.len() > 8 {
+        lines.push(format!("- ... {} more message(s)", messages.len() - 8));
+    }
+    lines.join("\n")
 }

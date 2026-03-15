@@ -135,7 +135,13 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
             self.base_url.trim_end_matches('/')
         );
 
-        let response = self.transport.post_json(&url, &request_body)?;
+        let mut headers = Vec::new();
+        if let Some(api_key) = &self.api_key {
+            headers.push(("Authorization", api_key.as_str()));
+        }
+        let response = self
+            .transport
+            .post_json_with_headers(&url, &request_body, &headers)?;
         if response.status_code != 200 {
             let body_text = normalize_openai_error(&response.body);
             return Err(ProviderTurnError::Backend(format!(

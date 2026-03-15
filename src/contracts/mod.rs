@@ -27,6 +27,7 @@ pub enum AppEvent {
     PlanItemAdded,
     PlanFocusChanged,
     PlanCleared,
+    SessionCompacted,
     SessionLoaded,
     SessionSaved,
     SessionNormalizedAfterInterrupt,

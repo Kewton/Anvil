@@ -875,6 +875,10 @@ impl App {
                 frames: vec![self.session.render_timeline(8)],
                 control: SessionControl::Continue,
             },
+            Some(SlashCommandAction::Compact) => CliTurnOutput {
+                frames: vec![self.compact_session_history()?],
+                control: SessionControl::Continue,
+            },
             Some(SlashCommandAction::Model) => CliTurnOutput {
                 frames: vec![render::render_model_frame(&self.config)],
                 control: SessionControl::Continue,
@@ -988,6 +992,16 @@ impl App {
             .map_err(|err| AppError::ToolExecution(err.to_string()))?;
         let result = index.search(query, 5);
         Ok(render_retrieval_result(&result))
+    }
+
+    fn compact_session_history(&mut self) -> Result<String, AppError> {
+        let changed = self.session.compact_history(8);
+        if changed {
+            self.persist_session(AppEvent::SessionSaved)?;
+            Ok("[A] anvil > compacted older session history".to_string())
+        } else {
+            Ok("[A] anvil > nothing to compact".to_string())
+        }
     }
 }
 

@@ -158,6 +158,15 @@ pub struct HttpResponse {
 /// a Rust HTTP library, or a test mock.
 pub trait HttpTransport {
     fn post_json(&self, url: &str, body: &[u8]) -> Result<HttpResponse, ProviderTurnError>;
+
+    fn post_json_with_headers(
+        &self,
+        url: &str,
+        body: &[u8],
+        _headers: &[(&str, &str)],
+    ) -> Result<HttpResponse, ProviderTurnError> {
+        self.post_json(url, body)
+    }
 }
 
 /// HTTP transport backed by the `curl` subprocess.

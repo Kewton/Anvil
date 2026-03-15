@@ -64,6 +64,9 @@ fn slash_commands_support_help_status_reset_and_exit() {
     let timeline = app
         .handle_cli_line("/timeline", &provider, &tui)
         .expect("timeline should render");
+    let compact = app
+        .handle_cli_line("/compact", &provider, &tui)
+        .expect("compact should render");
     let model = app
         .handle_cli_line("/model", &provider, &tui)
         .expect("model should render");
@@ -123,6 +126,13 @@ fn slash_commands_support_help_status_reset_and_exit() {
             .last()
             .expect("timeline frame")
             .contains("[A] anvil > timeline")
+    );
+    assert!(
+        compact
+            .frames
+            .last()
+            .expect("compact frame")
+            .contains("nothing to compact")
     );
     assert!(
         model
@@ -401,6 +411,7 @@ fn help_frame_is_built_from_registered_slash_commands() {
     assert!(help.contains("/plan-clear"));
     assert!(help.contains("/repo-find"));
     assert!(help.contains("/timeline"));
+    assert!(help.contains("/compact"));
     assert!(commands.iter().any(|spec| spec.name == "/plan"));
     assert!(commands.iter().any(|spec| spec.name == "/model"));
 }
@@ -489,4 +500,38 @@ fn plan_commands_record_typed_events_in_timeline() {
     assert!(frame.contains("PlanItemAdded"));
     assert!(frame.contains("PlanFocusChanged"));
     assert!(frame.contains("inspect provider"));
+}
+
+#[test]
+fn compact_command_summarizes_older_messages() {
+    let mut app = common::build_app();
+    let tui = Tui::new();
+    let provider = RecordingProvider {
+        seen_requests: Rc::new(RefCell::new(Vec::new())),
+        events: Vec::new(),
+    };
+
+    for index in 0..12 {
+        let _ = app
+            .handle_cli_line(&format!("message {index}"), &provider, &tui)
+            .expect("message should be accepted");
+    }
+
+    let compact = app
+        .handle_cli_line("/compact", &provider, &tui)
+        .expect("compact should work");
+    let timeline = app
+        .handle_cli_line("/timeline", &provider, &tui)
+        .expect("timeline should render");
+
+    assert!(
+        compact
+            .frames
+            .last()
+            .expect("compact frame")
+            .contains("compacted older session history")
+    );
+    let frame = timeline.frames.last().expect("timeline frame");
+    assert!(frame.contains("SessionCompacted"));
+    assert!(app.session().messages[0].content.contains("[compacted session summary]"));
 }

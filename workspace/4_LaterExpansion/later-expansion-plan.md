@@ -29,6 +29,12 @@
   - `/timeline` for recent session events and message flow
   - plan visibility inside the timeline view
   - keeps actor separation and current-state visibility intact
+  - `/compact` for explicit long-session compaction
+
+- Long-session compaction
+  - summarize older messages into a system summary snapshot
+  - preserve recent interactive context
+  - record compaction in the session event log
 
 ## Next Slices
 
@@ -36,7 +42,7 @@
   - cache invalidation strategy
   - path/name/content hybrid retrieval scoring refinement
   - retrieval scoring
-  - compaction and summary snapshots for long sessions
+  - retrieval-aware compaction and summary snapshots
 
 - Advanced UX without losing clarity
   - richer tool-progress display

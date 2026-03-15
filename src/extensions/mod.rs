@@ -13,6 +13,7 @@ pub enum SlashCommandAction {
     PlanClear,
     RepoFind(String),
     Timeline,
+    Compact,
     Model,
     Approve,
     Deny,
@@ -162,6 +163,11 @@ pub fn builtin_slash_commands() -> Vec<SlashCommandSpec> {
             name: "/timeline".to_string(),
             description: "show the recent session timeline".to_string(),
             action: SlashCommandAction::Timeline,
+        },
+        SlashCommandSpec {
+            name: "/compact".to_string(),
+            description: "compact older session history into a summary".to_string(),
+            action: SlashCommandAction::Compact,
         },
         SlashCommandSpec {
             name: "/model".to_string(),

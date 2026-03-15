@@ -21,6 +21,7 @@ struct RecordingProvider {
 struct MockHttpTransport {
     seen_urls: Rc<RefCell<Vec<String>>>,
     seen_bodies: Rc<RefCell<Vec<Vec<u8>>>>,
+    seen_headers: Rc<RefCell<Vec<Vec<(String, String)>>>>,
     response: HttpResponse,
 }
 
@@ -32,6 +33,23 @@ impl HttpTransport for MockHttpTransport {
     ) -> Result<HttpResponse, ProviderTurnError> {
         self.seen_urls.borrow_mut().push(url.to_string());
         self.seen_bodies.borrow_mut().push(body.to_vec());
+        Ok(self.response.clone())
+    }
+
+    fn post_json_with_headers(
+        &self,
+        url: &str,
+        body: &[u8],
+        headers: &[(&str, &str)],
+    ) -> Result<HttpResponse, ProviderTurnError> {
+        self.seen_urls.borrow_mut().push(url.to_string());
+        self.seen_bodies.borrow_mut().push(body.to_vec());
+        self.seen_headers.borrow_mut().push(
+            headers
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+        );
         Ok(self.response.clone())
     }
 }
@@ -335,6 +353,7 @@ fn openai_compatible_provider_maps_response_into_done_event() {
     let transport = MockHttpTransport {
         seen_urls: seen_urls.clone(),
         seen_bodies: Rc::new(RefCell::new(Vec::new())),
+        seen_headers: Rc::new(RefCell::new(Vec::new())),
         response: HttpResponse {
             status_code: 200,
             body: br#"{"choices":[{"message":{"role":"assistant","content":"openai-compatible answer"}}]}"#
@@ -378,6 +397,7 @@ fn openai_compatible_provider_parses_sse_streams() {
     let transport = MockHttpTransport {
         seen_urls: Rc::new(RefCell::new(Vec::new())),
         seen_bodies: Rc::new(RefCell::new(Vec::new())),
+        seen_headers: Rc::new(RefCell::new(Vec::new())),
         response: HttpResponse {
             status_code: 200,
             body: concat!(
@@ -422,6 +442,7 @@ fn openai_compatible_provider_normalizes_error_message() {
     let transport = MockHttpTransport {
         seen_urls: Rc::new(RefCell::new(Vec::new())),
         seen_bodies: Rc::new(RefCell::new(Vec::new())),
+        seen_headers: Rc::new(RefCell::new(Vec::new())),
         response: HttpResponse {
             status_code: 401,
             body: br#"{"error":{"message":"invalid api key"}}"#.to_vec(),
@@ -438,6 +459,78 @@ fn openai_compatible_provider_normalizes_error_message() {
         .expect_err("error body should be normalized");
 
     assert!(err.to_string().contains("invalid api key"));
+}
+
+#[test]
+fn openai_compatible_provider_forwards_authorization_header() {
+    let request = ProviderTurnRequest::new(
+        "local-openai".to_string(),
+        vec![anvil::provider::ProviderMessage::new(
+            ProviderMessageRole::User,
+            "inspect src/provider",
+        )],
+        false,
+    );
+    let seen_headers = Rc::new(RefCell::new(Vec::new()));
+    let transport = MockHttpTransport {
+        seen_urls: Rc::new(RefCell::new(Vec::new())),
+        seen_bodies: Rc::new(RefCell::new(Vec::new())),
+        seen_headers: seen_headers.clone(),
+        response: HttpResponse {
+            status_code: 200,
+            body: br#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#.to_vec(),
+        },
+    };
+    let client = anvil::provider::openai::OpenAiCompatibleProviderClient::with_transport(
+        "http://localhost:1234",
+        transport,
+    )
+    .with_api_key("Bearer test-key");
+
+    client
+        .stream_turn(&request, &mut |_event| {})
+        .expect("authorized request should succeed");
+
+    let recorded = seen_headers.borrow();
+    assert!(recorded[0]
+        .iter()
+        .any(|(name, value)| name == "Authorization" && value == "Bearer test-key"));
+}
+
+#[test]
+fn live_turn_executes_structured_response_from_openai_compatible_provider() {
+    let root = common::unique_test_dir("openai_structured_write");
+    let mut config = common::build_config_in(root.clone());
+    config.mode.approval_required = false;
+    config.runtime.provider = "openai".to_string();
+    config.runtime.provider_url = "http://localhost:1234".to_string();
+    let provider_ctx =
+        anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
+    let mut app = anvil::app::App::new(config, provider_ctx).expect("app should initialize");
+    let tui = Tui::new();
+
+    let transport = MockHttpTransport {
+        seen_urls: Rc::new(RefCell::new(Vec::new())),
+        seen_bodies: Rc::new(RefCell::new(Vec::new())),
+        seen_headers: Rc::new(RefCell::new(Vec::new())),
+        response: HttpResponse {
+            status_code: 200,
+            body: br#"{"choices":[{"message":{"role":"assistant","content":"```ANVIL_TOOL\n{\"id\":\"call_write_001\",\"tool\":\"file.write\",\"path\":\"./sandbox/openai/index.html\",\"content\":\"<html><body>openai parity</body></html>\"}\n```\n```ANVIL_FINAL\nOpenAI-compatible backend created the file and reviewed the output.\n```"}}]}"#.to_vec(),
+        },
+    };
+    let client = anvil::provider::openai::OpenAiCompatibleProviderClient::with_transport(
+        "http://localhost:1234",
+        transport,
+    );
+
+    let frames = app
+        .run_live_turn("build via openai-compatible provider", &client, &tui)
+        .expect("structured response should execute");
+
+    let written = fs::read_to_string(root.join("sandbox/openai/index.html"))
+        .expect("file should be written");
+    assert!(written.contains("openai parity"));
+    assert!(frames.iter().any(|frame| frame.contains("file.write completed ./sandbox/openai/index.html")));
 }
 
 #[test]
@@ -671,6 +764,7 @@ fn ollama_provider_stream_turn_posts_chat_request_and_normalizes_response() {
         MockHttpTransport {
             seen_urls: seen_urls.clone(),
             seen_bodies: seen_bodies.clone(),
+            seen_headers: Rc::new(RefCell::new(Vec::new())),
             response: HttpResponse {
                 status_code: 200,
                 body: body.as_bytes().to_vec(),
@@ -723,6 +817,7 @@ fn ollama_provider_surfaces_non_success_status_as_backend_error() {
         MockHttpTransport {
             seen_urls: Rc::new(RefCell::new(Vec::new())),
             seen_bodies: Rc::new(RefCell::new(Vec::new())),
+            seen_headers: Rc::new(RefCell::new(Vec::new())),
             response: HttpResponse {
                 status_code: 500,
                 body: b"ollama down".to_vec(),
