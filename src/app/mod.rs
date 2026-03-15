@@ -35,8 +35,6 @@ use std::io::{self, Write};
 // Re-export render helpers that form the public API.
 pub use render::{cli_prompt, render_help_frame, slash_commands};
 
-const MAX_CONSOLE_MESSAGES: usize = 5;
-
 /// Central application state.
 pub struct App {
     config: EffectiveConfig,
@@ -137,7 +135,7 @@ impl App {
         provider: ProviderRuntimeContext,
     ) -> Result<Self, AppError> {
         let session_store = SessionStore::from_config(&config);
-        let session = if config.mode.fresh_session {
+        let mut session = if config.mode.fresh_session {
             SessionRecord::new(config.paths.cwd.clone())
         } else {
             session_store.load_or_create(&config.paths.cwd)?
@@ -147,6 +145,7 @@ impl App {
             .clone()
             .unwrap_or_else(|| AppStateSnapshot::new(RuntimeState::Ready));
         let extensions = ExtensionRegistry::load(&config.paths.cwd)?;
+        session.auto_compact_threshold = config.runtime.auto_compact_threshold;
 
         Ok(Self {
             tools: standard_tool_registry(),
@@ -514,7 +513,9 @@ impl App {
     }
 
     /// Flush session to disk if the dirty flag is set.
+    /// Also runs deferred auto-compaction before writing.
     fn flush_session(&mut self) -> Result<(), AppError> {
+        self.session.compact_if_needed();
         if self.session.dirty {
             self.session_store.save(&self.session)?;
             self.session.clear_dirty();
@@ -668,7 +669,7 @@ impl App {
         self.session.console_render_context(
             self.state_machine.snapshot(),
             &self.config.runtime.model,
-            MAX_CONSOLE_MESSAGES,
+            self.config.runtime.max_console_messages,
         )
     }
 
@@ -918,13 +919,24 @@ pub fn error_guidance(err: &AppError) -> String {
             "  Valid keys: provider, model, provider_url, context_window, stream\n",
             "  Environment variables also accepted (e.g. ANVIL_MODEL, ANVIL_PROVIDER_URL)"
         ).to_string(),
-        AppError::ProviderBootstrap(_) => concat!(
-            "Hint: the LLM provider could not be reached\n",
-            "  - Is Ollama running? Try: ollama serve\n",
-            "  - Check provider URL with --provider-url\n",
-            "  - For OpenAI-compatible backends: --provider openai --provider-url <url>\n",
-            "  - Set API key with ANVIL_API_KEY if required"
-        ).to_string(),
+        AppError::ProviderBootstrap(bootstrap_err) => {
+            let detail = bootstrap_err.to_string();
+            if detail.contains("ollama") || detail.contains("unsupported") {
+                concat!(
+                    "Hint: Ollama provider could not be reached\n",
+                    "  - Is Ollama running? Try: ollama serve\n",
+                    "  - Check URL: --provider-url http://127.0.0.1:11434\n",
+                    "  - List models: ollama list"
+                ).to_string()
+            } else {
+                concat!(
+                    "Hint: provider could not be reached\n",
+                    "  - For Ollama: ensure `ollama serve` is running\n",
+                    "  - For OpenAI-compatible: --provider openai --provider-url <url>\n",
+                    "  - Set API key with ANVIL_API_KEY if required"
+                ).to_string()
+            }
+        }
         AppError::Session(_) => concat!(
             "Hint: session file may be corrupted or inaccessible\n",
             "  - Try --fresh-session to start a new session\n",
@@ -935,11 +947,16 @@ pub fn error_guidance(err: &AppError) -> String {
             "  - Check .anvil/slash-commands.json for valid JSON\n",
             "  - Each entry needs: name, description, prompt"
         ).to_string(),
-        AppError::ProviderTurn(_) => concat!(
-            "Hint: the provider turn failed\n",
-            "  - Check if the model is available: ollama list\n",
-            "  - Network issues may cause transient failures — try again"
-        ).to_string(),
+        AppError::ProviderTurn(turn_err) => {
+            let detail = turn_err.to_string();
+            if detail.contains("timeout") || detail.contains("max-time") {
+                "Hint: the request timed out\n  - Increase timeout: ANVIL_CURL_TIMEOUT=600\n  - Check if the model is responding: ollama ps".to_string()
+            } else if detail.contains("401") || detail.contains("403") || detail.contains("api key") {
+                "Hint: authentication failed\n  - Set your API key: ANVIL_API_KEY=<key>\n  - Check the key format (some providers require 'Bearer ' prefix)".to_string()
+            } else {
+                "Hint: the provider turn failed\n  - Check if the model is available: ollama list\n  - Network issues may cause transient failures — try again".to_string()
+            }
+        }
         _ => String::new(),
     }
 }

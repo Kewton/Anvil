@@ -101,6 +101,9 @@ pub struct SessionRecord {
     /// Uses `Cell` for interior mutability so callers can use `&self`.
     #[serde(skip)]
     cached_token_count: std::cell::Cell<Option<usize>>,
+    /// Auto-compaction threshold (configurable, default 64).
+    #[serde(skip)]
+    pub auto_compact_threshold: usize,
 }
 
 impl SessionRecord {
@@ -121,11 +124,9 @@ impl SessionRecord {
             provider_errors: Vec::new(),
             dirty: false,
             cached_token_count: std::cell::Cell::new(None),
+            auto_compact_threshold: 64,
         }
     }
-
-    /// Maximum messages before auto-compaction triggers.
-    const AUTO_COMPACT_THRESHOLD: usize = 64;
 
     pub fn push_message(&mut self, message: SessionMessage) {
         // Update cached token count incrementally
@@ -135,9 +136,17 @@ impl SessionRecord {
         }
         self.messages.push(message);
         self.touch();
-        // Auto-compact when message count grows too large
-        if self.messages.len() > Self::AUTO_COMPACT_THRESHOLD {
-            self.compact_history(Self::AUTO_COMPACT_THRESHOLD / 2);
+    }
+
+    /// Run auto-compaction if message count exceeds the threshold.
+    /// Called at turn boundaries (before flush) to avoid per-message overhead.
+    pub fn compact_if_needed(&mut self) -> bool {
+        if self.auto_compact_threshold > 0
+            && self.messages.len() > self.auto_compact_threshold
+        {
+            self.compact_history(self.auto_compact_threshold / 2)
+        } else {
+            false
         }
     }
 

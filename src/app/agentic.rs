@@ -139,10 +139,26 @@ impl App {
                 ),
             })?;
 
-            // Parse the follow-up response
-            let next_structured =
-                BasicAgentLoop::parse_structured_response(&next_token_buffer)
-                    .map_err(AppError::ToolExecution)?;
+            // Parse the follow-up response (retry once on parse failure)
+            let next_structured = match BasicAgentLoop::parse_structured_response(
+                &next_token_buffer,
+            ) {
+                Ok(parsed) => parsed,
+                Err(first_err) => {
+                    // LLMs occasionally produce malformed output; treat the
+                    // raw text as a plain final answer rather than failing the
+                    // entire turn.
+                    let trimmed = next_token_buffer.trim();
+                    if !trimmed.is_empty() {
+                        StructuredAssistantResponse {
+                            tool_calls: Vec::new(),
+                            final_response: trimmed.to_string(),
+                        }
+                    } else {
+                        return Err(AppError::ToolExecution(first_err));
+                    }
+                }
+            };
 
             if next_structured.tool_calls.is_empty() {
                 // No more tool calls — this is the final answer
@@ -199,7 +215,7 @@ impl App {
                 SessionMessage::new(
                     MessageRole::Tool,
                     "tool",
-                    format_tool_result_message(&result),
+                    format_tool_result_message(&result, self.config.runtime.tool_result_max_chars),
                 )
                 .with_id(self.next_message_id("tool")),
             );
@@ -269,16 +285,19 @@ pub(crate) fn infer_plan_from_structured_response(
 ///
 /// Includes the actual payload (file content, search matches) so the LLM
 /// can reason about the results in subsequent turns.
-pub(crate) fn format_tool_result_message(result: &ToolExecutionResult) -> String {
+pub(crate) fn format_tool_result_message(
+    result: &ToolExecutionResult,
+    max_chars: usize,
+) -> String {
     match &result.payload {
         ToolExecutionPayload::None => {
             format!("[tool result: {}] {}", result.tool_name, result.summary)
         }
         ToolExecutionPayload::Text(content) => {
-            let truncated = if content.len() > 8000 {
+            let truncated = if content.len() > max_chars {
                 format!(
                     "{}...\n[truncated, {} bytes total]",
-                    &content[..8000],
+                    &content[..max_chars],
                     content.len()
                 )
             } else {

@@ -24,6 +24,9 @@ pub struct RuntimeConfig {
     pub context_window: u32,
     pub context_budget: Option<u32>,
     pub max_agent_iterations: usize,
+    pub max_console_messages: usize,
+    pub auto_compact_threshold: usize,
+    pub tool_result_max_chars: usize,
     pub stream: bool,
 }
 
@@ -110,6 +113,9 @@ impl EffectiveConfig {
                 context_window: 200_000,
                 context_budget: None,
                 max_agent_iterations: 10,
+                max_console_messages: 5,
+                auto_compact_threshold: 64,
+                tool_result_max_chars: 8000,
                 stream: true,
             },
             mode: ModeConfig {
@@ -172,6 +178,9 @@ impl EffectiveConfig {
             "ANVIL_CONTEXT_WINDOW",
             "ANVIL_CONTEXT_BUDGET",
             "ANVIL_MAX_AGENT_ITERATIONS",
+            "ANVIL_MAX_CONSOLE_MESSAGES",
+            "ANVIL_AUTO_COMPACT_THRESHOLD",
+            "ANVIL_TOOL_RESULT_MAX_CHARS",
             "ANVIL_STREAM",
             "ANVIL_INTERACTIVE",
             "ANVIL_APPROVAL_REQUIRED",
@@ -292,6 +301,21 @@ impl EffectiveConfig {
                 }
                 "max_agent_iterations" | "ANVIL_MAX_AGENT_ITERATIONS" => {
                     self.runtime.max_agent_iterations = value
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                }
+                "max_console_messages" | "ANVIL_MAX_CONSOLE_MESSAGES" => {
+                    self.runtime.max_console_messages = value
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                }
+                "auto_compact_threshold" | "ANVIL_AUTO_COMPACT_THRESHOLD" => {
+                    self.runtime.auto_compact_threshold = value
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                }
+                "tool_result_max_chars" | "ANVIL_TOOL_RESULT_MAX_CHARS" => {
+                    self.runtime.tool_result_max_chars = value
                         .parse()
                         .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
                 }
