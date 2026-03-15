@@ -36,7 +36,7 @@ Issue情報からブランチ名を自動生成：
 
 ```bash
 WORKTREE_DIR="../anvil-issue-${ISSUE_NUMBER}"
-git worktree add -b "$BRANCH_NAME" "$WORKTREE_DIR" main
+git worktree add -b "$BRANCH_NAME" "$WORKTREE_DIR" develop
 ```
 
 ### 5. 環境セットアップ
