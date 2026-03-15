@@ -11,8 +11,7 @@ use crate::session::{MessageRole, SessionMessage};
 use crate::spinner::Spinner;
 use crate::state::StateTransition;
 use crate::tooling::{
-    LocalToolExecutor, ToolExecutionError, ToolExecutionPayload, ToolExecutionPolicy,
-    ToolExecutionResult, ToolRuntimeError,
+    LocalToolExecutor, ToolExecutionPayload, ToolExecutionPolicy, ToolExecutionResult,
 };
 use crate::tui::Tui;
 
@@ -197,19 +196,77 @@ impl App {
         let executor = LocalToolExecutor::new(self.config.paths.cwd.clone());
         let mut results = Vec::new();
         for call in &structured.tool_calls {
-            let validated = self.tools.validate(call.clone()).map_err(|err| {
-                AppError::ToolExecution(format!("tool validation failed: {err:?}"))
-            })?;
-            let request = validated
-                .approve()
-                .into_execution_request(ToolExecutionPolicy {
-                    approval_required: self.config.mode.approval_required,
-                    allow_restricted: false,
-                    plan_mode: false,
-                    plan_scope_granted: true,
-                })
-                .map_err(map_tool_execution_error)?;
-            let result = executor.execute(request).map_err(map_tool_runtime_error)?;
+            let validated = match self.tools.validate(call.clone()) {
+                Ok(v) => v,
+                Err(err) => {
+                    let error_result = ToolExecutionResult {
+                        tool_call_id: call.tool_call_id.clone(),
+                        tool_name: call.tool_name.clone(),
+                        status: crate::tooling::ToolExecutionStatus::Failed,
+                        summary: format!("validation failed: {err:?}"),
+                        payload: crate::tooling::ToolExecutionPayload::None,
+                        artifacts: Vec::new(),
+                        elapsed_ms: 0,
+                    };
+                    self.session.push_message(
+                        SessionMessage::new(
+                            MessageRole::Tool,
+                            "tool",
+                            format_tool_result_message(
+                                &error_result,
+                                self.config.runtime.tool_result_max_chars,
+                            ),
+                        )
+                        .with_id(self.next_message_id("tool")),
+                    );
+                    results.push(error_result);
+                    continue;
+                }
+            };
+            let request = match validated.approve().into_execution_request(ToolExecutionPolicy {
+                approval_required: self.config.mode.approval_required,
+                allow_restricted: false,
+                plan_mode: false,
+                plan_scope_granted: true,
+            }) {
+                Ok(r) => r,
+                Err(err) => {
+                    let error_result = ToolExecutionResult {
+                        tool_call_id: call.tool_call_id.clone(),
+                        tool_name: call.tool_name.clone(),
+                        status: crate::tooling::ToolExecutionStatus::Failed,
+                        summary: format!("{err:?}"),
+                        payload: crate::tooling::ToolExecutionPayload::None,
+                        artifacts: Vec::new(),
+                        elapsed_ms: 0,
+                    };
+                    self.session.push_message(
+                        SessionMessage::new(
+                            MessageRole::Tool,
+                            "tool",
+                            format_tool_result_message(
+                                &error_result,
+                                self.config.runtime.tool_result_max_chars,
+                            ),
+                        )
+                        .with_id(self.next_message_id("tool")),
+                    );
+                    results.push(error_result);
+                    continue;
+                }
+            };
+            let result = match executor.execute(request) {
+                Ok(r) => r,
+                Err(err) => ToolExecutionResult {
+                    tool_call_id: call.tool_call_id.clone(),
+                    tool_name: call.tool_name.clone(),
+                    status: crate::tooling::ToolExecutionStatus::Failed,
+                    summary: err.to_string(),
+                    payload: crate::tooling::ToolExecutionPayload::Text(err.to_string()),
+                    artifacts: Vec::new(),
+                    elapsed_ms: 0,
+                },
+            };
             // Record tool result WITH actual payload so the LLM can see it
             self.session.push_message(
                 SessionMessage::new(
@@ -321,19 +378,3 @@ pub(crate) fn format_tool_result_message(
     }
 }
 
-fn map_tool_execution_error(error: ToolExecutionError) -> AppError {
-    AppError::ToolExecution(match error {
-        ToolExecutionError::ApprovalRequired(call_id) => {
-            format!("tool approval required for {call_id}")
-        }
-        ToolExecutionError::RestrictedTool(tool) => format!("restricted tool blocked: {tool}"),
-        ToolExecutionError::PlanModeBlocked(tool) => format!("tool blocked in plan mode: {tool}"),
-        ToolExecutionError::PlanModeScopeRequired(tool) => {
-            format!("tool scope required in plan mode: {tool}")
-        }
-    })
-}
-
-fn map_tool_runtime_error(error: ToolRuntimeError) -> AppError {
-    AppError::ToolExecution(error.to_string())
-}
