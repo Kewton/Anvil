@@ -455,9 +455,49 @@ impl LocalToolExecutor {
                     elapsed_ms: started.elapsed().as_millis(),
                 })
             }
-            ToolInput::ShellExec { command } => Err(ToolRuntimeError::Io(format!(
-                "shell.exec is not enabled in the local executor: {command}"
-            ))),
+            ToolInput::ShellExec { command } => {
+                let output = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(&command)
+                    .current_dir(&self.root)
+                    .output()
+                    .map_err(|err| {
+                        ToolRuntimeError::Io(format!(
+                            "shell.exec failed to spawn: {err}"
+                        ))
+                    })?;
+                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                let combined = if stderr.is_empty() {
+                    stdout
+                } else if stdout.is_empty() {
+                    stderr
+                } else {
+                    format!("{stdout}\n--- stderr ---\n{stderr}")
+                };
+                let status = if output.status.success() {
+                    ToolExecutionStatus::Completed
+                } else {
+                    ToolExecutionStatus::Failed
+                };
+                let summary = if output.status.success() {
+                    format!("shell.exec completed: {command}")
+                } else {
+                    format!(
+                        "shell.exec failed (exit {}): {command}",
+                        output.status.code().unwrap_or(-1)
+                    )
+                };
+                Ok(ToolExecutionResult {
+                    tool_call_id: request.tool_call_id,
+                    tool_name: request.spec.name,
+                    status,
+                    summary,
+                    payload: ToolExecutionPayload::Text(combined),
+                    artifacts: Vec::new(),
+                    elapsed_ms: started.elapsed().as_millis(),
+                })
+            }
         }
     }
 

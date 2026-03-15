@@ -225,7 +225,7 @@ impl App {
             };
             let request = match validated.approve().into_execution_request(ToolExecutionPolicy {
                 approval_required: self.config.mode.approval_required,
-                allow_restricted: false,
+                allow_restricted: !self.config.mode.approval_required,
                 plan_mode: false,
                 plan_scope_granted: true,
             }) {
