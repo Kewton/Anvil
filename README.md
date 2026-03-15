@@ -4,10 +4,26 @@
 
 ## インストール
 
+### バイナリダウンロード（推奨）
+
+[GitHub Releases](https://github.com/Kewton/Anvil/releases) からビルド済みバイナリをダウンロード:
+
 ```bash
-# Rust toolchain (1.85+) が必要
+# macOS (Apple Silicon)
+curl -L https://github.com/Kewton/Anvil/releases/download/v0.0.1/anvil-darwin-arm64.gz -o anvil.gz
+gunzip anvil.gz
+chmod +x anvil
+sudo mv anvil /usr/local/bin/
+```
+
+### ソースからビルド
+
+```bash
+# Rust toolchain (1.85+) が必要: https://rustup.rs
+git clone https://github.com/Kewton/Anvil.git
+cd Anvil
 cargo build --release
-# バイナリは target/release/anvil に生成されます
+sudo cp target/release/anvil /usr/local/bin/
 ```
 
 ### 前提条件
