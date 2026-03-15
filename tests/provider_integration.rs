@@ -4,6 +4,7 @@ use anvil::agent::{AgentEvent, AgentRuntime};
 use anvil::provider::{
     HttpResponse, HttpTransport, OllamaChatMessage, OllamaProviderClient, ProviderClient,
     ProviderEvent, ProviderMessageRole, ProviderTurnError, ProviderTurnRequest,
+    resolve_ollama_model_alias,
 };
 use anvil::tui::Tui;
 use std::cell::RefCell;
@@ -165,12 +166,30 @@ fn live_turn_executes_structured_file_write_response_without_approval() {
             .iter()
             .any(|frame| frame.contains("[T] tool  > file.write"))
     );
+    assert!(frames.iter().any(|frame| frame.contains("[A] anvil > plan")));
+    assert!(
+        frames
+            .iter()
+            .any(|frame| frame.contains("working on 1/"))
+    );
     assert!(
         frames
             .last()
             .expect("done frame should exist")
             .contains("Created the browser game shell")
     );
+}
+
+#[test]
+fn ollama_model_alias_resolution_prefers_unique_installed_prefix_match() {
+    let resolved = resolve_ollama_model_alias(
+        "qwen3.5:35b",
+        &[
+            "qwen3.5:35b-a3b-q8_0".to_string(),
+            "qwen3.5:27b-q8_0".to_string(),
+        ],
+    );
+    assert_eq!(resolved, "qwen3.5:35b-a3b-q8_0");
 }
 
 #[test]

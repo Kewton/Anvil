@@ -29,6 +29,7 @@ pub struct RuntimeConfig {
 pub struct ModeConfig {
     pub interactive: bool,
     pub approval_required: bool,
+    pub fresh_session: bool,
     pub reasoning_visibility: ReasoningVisibility,
     pub debug_logging: bool,
 }
@@ -110,6 +111,7 @@ impl EffectiveConfig {
             mode: ModeConfig {
                 interactive: true,
                 approval_required: true,
+                fresh_session: false,
                 reasoning_visibility: ReasoningVisibility::Summary,
                 debug_logging: false,
             },
@@ -167,6 +169,7 @@ impl EffectiveConfig {
             "ANVIL_STREAM",
             "ANVIL_INTERACTIVE",
             "ANVIL_APPROVAL_REQUIRED",
+            "ANVIL_FRESH_SESSION",
             "ANVIL_REASONING_VISIBILITY",
             "ANVIL_DEBUG",
         ] {
@@ -217,6 +220,9 @@ impl EffectiveConfig {
                 "--no-approval" => {
                     map.insert("ANVIL_APPROVAL_REQUIRED".to_string(), "false".to_string());
                 }
+                "--fresh-session" => {
+                    map.insert("ANVIL_FRESH_SESSION".to_string(), "true".to_string());
+                }
                 "--oneshot" => {
                     map.insert("ANVIL_INTERACTIVE".to_string(), "false".to_string());
                 }
@@ -265,6 +271,9 @@ impl EffectiveConfig {
                 }
                 "approval_required" | "ANVIL_APPROVAL_REQUIRED" => {
                     self.mode.approval_required = parse_bool(value);
+                }
+                "fresh_session" | "ANVIL_FRESH_SESSION" => {
+                    self.mode.fresh_session = parse_bool(value);
                 }
                 "debug" | "ANVIL_DEBUG" => {
                     self.mode.debug_logging = parse_bool(value);

@@ -137,7 +137,11 @@ impl App {
         provider: ProviderRuntimeContext,
     ) -> Result<Self, AppError> {
         let session_store = SessionStore::from_config(&config);
-        let session = session_store.load_or_create(&config.paths.cwd)?;
+        let session = if config.mode.fresh_session {
+            SessionRecord::new(config.paths.cwd.clone())
+        } else {
+            session_store.load_or_create(&config.paths.cwd)?
+        };
         let initial_state_snapshot = session
             .last_snapshot
             .clone()
@@ -519,6 +523,22 @@ impl App {
         elapsed_ms: u128,
         tui: &Tui,
     ) -> Result<Vec<String>, AppError> {
+        let inferred_plan = infer_plan_from_structured_response(&structured);
+        let mut frames = Vec::new();
+        let thinking = AppStateSnapshot::new(RuntimeState::Thinking)
+            .with_status("Prepared execution plan from model response".to_string())
+            .with_plan(inferred_plan, Some(0))
+            .with_reasoning_summary(vec![
+                "validated structured tool response".to_string(),
+                "ready to execute tool plan".to_string(),
+            ])
+            .with_context_usage(
+                self.session.estimated_token_count(),
+                self.config.runtime.context_window,
+            );
+        let _ = self.apply_transition(thinking, StateTransition::StartThinking)?;
+        frames.push(self.render_console(tui)?);
+
         let results = self.execute_structured_tool_calls(&structured)?;
         let tool_log_views: Vec<ToolLogView> = results
             .iter()
@@ -550,7 +570,8 @@ impl App {
             );
         let _ = self.apply_transition(done, StateTransition::Finish)?;
 
-        Ok(vec![self.render_console(tui)?])
+        frames.push(self.render_console(tui)?);
+        Ok(frames)
     }
 
     fn execute_structured_tool_calls(
@@ -1039,6 +1060,25 @@ impl App {
             Ok("[A] anvil > nothing to compact".to_string())
         }
     }
+}
+
+fn infer_plan_from_structured_response(structured: &StructuredAssistantResponse) -> Vec<String> {
+    let mut plan = vec!["validate requested output scope".to_string()];
+    for call in &structured.tool_calls {
+        let item = match &call.input {
+            crate::tooling::ToolInput::FileWrite { path, .. } => format!("write {path}"),
+            crate::tooling::ToolInput::FileRead { path } => format!("read {path}"),
+            crate::tooling::ToolInput::FileSearch { pattern, .. } => {
+                format!("search for {pattern}")
+            }
+            crate::tooling::ToolInput::ShellExec { command } => {
+                format!("run shell command: {command}")
+            }
+        };
+        plan.push(item);
+    }
+    plan.push("review generated result and summarize".to_string());
+    plan
 }
 
 fn standard_tool_registry() -> ToolRegistry {

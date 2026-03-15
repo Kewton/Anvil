@@ -8,6 +8,7 @@ pub mod openai;
 use crate::agent::AgentEvent;
 use crate::config::EffectiveConfig;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -299,12 +300,35 @@ impl<T> OllamaProviderClient<T> {
     }
 }
 
+pub fn resolve_ollama_model_alias(requested: &str, available: &[String]) -> String {
+    if available.iter().any(|name| name == requested) {
+        return requested.to_string();
+    }
+
+    let mut prefix_matches = available
+        .iter()
+        .filter(|name| name.starts_with(requested))
+        .cloned()
+        .collect::<Vec<_>>();
+    prefix_matches.sort();
+    prefix_matches.dedup();
+
+    if prefix_matches.len() == 1 {
+        prefix_matches.remove(0)
+    } else {
+        requested.to_string()
+    }
+}
+
 impl<T: HttpTransport> OllamaProviderClient<T> {
     fn send_chat_request(
         &self,
         request: &ProviderTurnRequest,
     ) -> Result<Vec<String>, ProviderTurnError> {
-        let chat_request = Self::build_chat_request(request);
+        let resolved_model = resolve_model_with_ollama_tags(&self.base_url, &request.model);
+        let mut resolved_request = request.clone();
+        resolved_request.model = resolved_model;
+        let chat_request = Self::build_chat_request(&resolved_request);
         let request_body = serde_json::to_vec(&chat_request).map_err(|err| {
             ProviderTurnError::Backend(format!("failed to encode ollama request: {err}"))
         })?;
@@ -520,6 +544,36 @@ fn decode_chunked_body(body: &[u8]) -> Result<Vec<u8>, ProviderTurnError> {
     }
 
     Ok(decoded)
+}
+
+fn resolve_model_with_ollama_tags(base_url: &str, requested: &str) -> String {
+    let url = format!("{}/api/tags", base_url.trim_end_matches('/'));
+    let output = Command::new("curl")
+        .arg("-sS")
+        .arg("--max-time")
+        .arg("5")
+        .arg(url)
+        .output();
+
+    let Ok(output) = output else {
+        return requested.to_string();
+    };
+    if !output.status.success() {
+        return requested.to_string();
+    }
+
+    let Ok(value) = serde_json::from_slice::<Value>(&output.stdout) else {
+        return requested.to_string();
+    };
+    let Some(models) = value.get("models").and_then(Value::as_array) else {
+        return requested.to_string();
+    };
+    let names = models
+        .iter()
+        .filter_map(|model| model.get("name").and_then(Value::as_str))
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    resolve_ollama_model_alias(requested, &names)
 }
 
 fn find_crlf(body: &[u8], start: usize) -> Option<usize> {

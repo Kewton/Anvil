@@ -350,6 +350,31 @@ fn startup_console_resumes_existing_session_history() {
 }
 
 #[test]
+fn startup_console_can_ignore_saved_history_in_fresh_session_mode() {
+    let root = common::unique_test_dir("cli_fresh_session");
+    let mut first = common::build_app_in(root.clone());
+    first
+        .record_user_input("msg_001", "old task")
+        .expect("history should persist");
+    first
+        .record_assistant_output("msg_002", "old answer")
+        .expect("history should persist");
+
+    let mut config = common::build_config_in(root);
+    config.mode.fresh_session = true;
+    let provider = anvil::provider::ProviderRuntimeContext::bootstrap(&config)
+        .expect("provider should bootstrap");
+    let mut fresh = anvil::app::App::new(config, provider).expect("app should initialize");
+    let tui = Tui::new();
+
+    let startup = fresh.startup_console(&tui).expect("startup should render");
+
+    assert!(startup.contains("Ask for a task"));
+    assert!(!startup.contains("old answer"));
+    assert!(!startup.contains("[U] you > old task"));
+}
+
+#[test]
 fn regular_input_surfaces_tool_execution_logs_in_console() {
     let mut app = common::build_app();
     let tui = Tui::new();
