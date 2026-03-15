@@ -1,7 +1,7 @@
-/// OpenAI-compatible provider client.
-///
-/// Works with the standard `/v1/chat/completions` endpoint used by
-/// OpenAI, Azure OpenAI, LM Studio, and other compatible servers.
+//! OpenAI-compatible provider client.
+//!
+//! Works with the standard `/v1/chat/completions` endpoint used by
+//! OpenAI, Azure OpenAI, LM Studio, and other compatible servers.
 
 use super::{
     AgentEvent, CurlHttpTransport, HttpTransport, ProviderClient, ProviderEvent,

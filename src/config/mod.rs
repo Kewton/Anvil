@@ -1,8 +1,8 @@
-/// Configuration loading with file / environment / CLI precedence.
-///
-/// [`EffectiveConfig`] is the single source of truth for all runtime
-/// settings.  It is assembled once at startup and then treated as
-/// immutable for the lifetime of the session.
+//! Configuration loading with file / environment / CLI precedence.
+//!
+//! [`EffectiveConfig`] is the single source of truth for all runtime
+//! settings.  It is assembled once at startup and then treated as
+//! immutable for the lifetime of the session.
 
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;

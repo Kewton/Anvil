@@ -1002,8 +1002,7 @@ impl App {
         snapshot.last_event = Some(event);
         self.state_machine.replace_snapshot(snapshot.clone());
         self.session.set_last_snapshot(snapshot);
-        self.persist_session(event)?;
-        self.persist_session(AppEvent::SessionSaved)
+        self.persist_session(event)
     }
 
     fn repo_find(&mut self, query: &str) -> Result<String, AppError> {

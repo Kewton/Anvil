@@ -1,7 +1,7 @@
-/// Explicit state machine governing application lifecycle.
-///
-/// All state transitions are validated by [`StateMachine::transition_to`]
-/// against a whitelist of legal (from, transition, to) triples.
+//! Explicit state machine governing application lifecycle.
+//!
+//! All state transitions are validated by [`StateMachine::transition_to`]
+//! against a whitelist of legal (from, transition, to) triples.
 
 use crate::contracts::{AppEvent, AppStateSnapshot, RuntimeState};
 
@@ -41,6 +41,12 @@ impl std::fmt::Display for StateTransitionError {
 }
 
 impl std::error::Error for StateTransitionError {}
+
+impl Default for StateMachine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl StateMachine {
     pub fn new() -> Self {

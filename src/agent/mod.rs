@@ -1,7 +1,7 @@
-/// Agent loop and event processing.
-///
-/// Defines the [`AgentEvent`] lifecycle and the [`BasicAgentLoop`] that
-/// bridges provider responses into structured tool calls.
+//! Agent loop and event processing.
+//!
+//! Defines the [`AgentEvent`] lifecycle and the [`BasicAgentLoop`] that
+//! bridges provider responses into structured tool calls.
 
 use crate::provider::{
     ProviderClient, ProviderEvent, ProviderMessage, ProviderMessageRole, ProviderTurnError,
@@ -84,6 +84,12 @@ pub struct PendingTurnState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentRuntime {
     script: AgentRuntimeScript,
+}
+
+impl Default for AgentRuntime {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AgentRuntime {

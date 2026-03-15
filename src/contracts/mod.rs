@@ -1,8 +1,8 @@
-/// Shared contract types used across modules.
-///
-/// These types form the schema for snapshots, console rendering, and
-/// persistent session state.  They are intentionally plain data with
-/// `Serialize`/`Deserialize` support.
+//! Shared contract types used across modules.
+//!
+//! These types form the schema for snapshots, console rendering, and
+//! persistent session state.  They are intentionally plain data with
+//! `Serialize`/`Deserialize` support.
 
 use serde::{Deserialize, Serialize};
 

@@ -25,19 +25,10 @@ pub enum LocalProviderClient {
 }
 
 /// Feature flags discovered (or assumed) for a provider.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ProviderCapabilities {
     pub streaming: bool,
     pub tool_calling: bool,
-}
-
-impl Default for ProviderCapabilities {
-    fn default() -> Self {
-        Self {
-            streaming: false,
-            tool_calling: false,
-        }
-    }
 }
 
 /// Bootstrapped provider context available for the lifetime of a session.
@@ -180,7 +171,17 @@ pub type TcpHttpTransport = CurlHttpTransport;
 
 impl HttpTransport for CurlHttpTransport {
     fn post_json(&self, url: &str, body: &[u8]) -> Result<HttpResponse, ProviderTurnError> {
-        let raw = post_json_with_curl(url, body)?;
+        let raw = post_json_with_curl(url, body, &[])?;
+        parse_raw_http_response(&raw)
+    }
+
+    fn post_json_with_headers(
+        &self,
+        url: &str,
+        body: &[u8],
+        headers: &[(&str, &str)],
+    ) -> Result<HttpResponse, ProviderTurnError> {
+        let raw = post_json_with_curl(url, body, headers)?;
         parse_raw_http_response(&raw)
     }
 }
@@ -275,11 +276,11 @@ impl<T> OllamaProviderClient<T> {
                 ProviderTurnError::Backend(format!("invalid ollama response: {err}"))
             })?;
 
-            if let Some(message) = parsed.message {
-                if !message.content.is_empty() {
-                    assistant_output.push_str(&message.content);
-                    events.push(ProviderEvent::TokenDelta(message.content));
-                }
+            if let Some(message) = parsed.message
+                && !message.content.is_empty()
+            {
+                assistant_output.push_str(&message.content);
+                events.push(ProviderEvent::TokenDelta(message.content));
             }
 
             if parsed.done {
@@ -528,11 +529,19 @@ fn find_crlf(body: &[u8], start: usize) -> Option<usize> {
         .map(|offset| start + offset)
 }
 
-fn post_json_with_curl(url: &str, body: &[u8]) -> Result<Vec<u8>, ProviderTurnError> {
-    let mut child = Command::new("curl")
-        .args(["-sS", "--http1.1", "-i", "-X", "POST"])
+fn post_json_with_curl(
+    url: &str,
+    body: &[u8],
+    extra_headers: &[(&str, &str)],
+) -> Result<Vec<u8>, ProviderTurnError> {
+    let mut cmd = Command::new("curl");
+    cmd.args(["-sS", "--http1.1", "-i", "-X", "POST"])
         .arg("-H")
-        .arg("Content-Type: application/json")
+        .arg("Content-Type: application/json");
+    for (name, value) in extra_headers {
+        cmd.arg("-H").arg(format!("{name}: {value}"));
+    }
+    let mut child = cmd
         .arg("--data-binary")
         .arg("@-")
         .arg("--")

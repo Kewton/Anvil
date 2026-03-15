@@ -10,6 +10,8 @@ use std::cell::RefCell;
 use std::fs;
 use std::rc::Rc;
 
+type HeaderLog = Rc<RefCell<Vec<Vec<(String, String)>>>>;
+
 #[derive(Clone)]
 struct RecordingProvider {
     seen_requests: Rc<RefCell<Vec<ProviderTurnRequest>>>,
@@ -21,7 +23,7 @@ struct RecordingProvider {
 struct MockHttpTransport {
     seen_urls: Rc<RefCell<Vec<String>>>,
     seen_bodies: Rc<RefCell<Vec<Vec<u8>>>>,
-    seen_headers: Rc<RefCell<Vec<Vec<(String, String)>>>>,
+    seen_headers: HeaderLog,
     response: HttpResponse,
 }
 

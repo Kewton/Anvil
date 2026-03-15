@@ -1,7 +1,7 @@
-/// Terminal user interface rendering.
-///
-/// [`Tui`] is a stateless renderer that converts [`ConsoleRenderContext`]
-/// snapshots into plain-text frames for the terminal.
+//! Terminal user interface rendering.
+//!
+//! [`Tui`] is a stateless renderer that converts [`ConsoleRenderContext`]
+//! snapshots into plain-text frames for the terminal.
 
 use crate::config::EffectiveConfig;
 use crate::contracts::{
@@ -10,6 +10,12 @@ use crate::contracts::{
 
 /// Stateless console renderer.
 pub struct Tui;
+
+impl Default for Tui {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Tui {
     pub fn new() -> Self {
@@ -72,15 +78,15 @@ impl Tui {
                 lines.push(format!("  {marker} {}. {}", index + 1, item));
             }
 
-            if let Some(index) = plan.active_index {
-                if let Some(item) = plan.items.get(index) {
-                    lines.push(format!(
-                        "[A] anvil > working on {}/{}: {}",
-                        index + 1,
-                        plan.items.len(),
-                        item
-                    ));
-                }
+            if let Some(index) = plan.active_index
+                && let Some(item) = plan.items.get(index)
+            {
+                lines.push(format!(
+                    "[A] anvil > working on {}/{}: {}",
+                    index + 1,
+                    plan.items.len(),
+                    item
+                ));
             }
         }
 

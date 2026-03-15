@@ -1,7 +1,7 @@
-/// Session persistence and message history.
-///
-/// [`SessionRecord`] captures the full conversation state and is serialised
-/// to disk via [`SessionStore`] so that sessions survive process restarts.
+//! Session persistence and message history.
+//!
+//! [`SessionRecord`] captures the full conversation state and is serialised
+//! to disk via [`SessionStore`] so that sessions survive process restarts.
 
 use crate::agent::PendingTurnState;
 use crate::config::EffectiveConfig;
@@ -455,6 +455,21 @@ fn extract_reference_like_tokens(content: &str) -> Vec<String> {
         .map(|token| token.trim_matches(|char: char| ",:;()[]{}<>\"'`".contains(char)))
         .filter(|token| token.contains('/') || token.contains('.'))
         .filter(|token| token.len() > 2)
+        .filter(|token| !is_noise_token(token))
         .map(|token| token.to_string())
         .collect()
+}
+
+/// Reject tokens that look like prose punctuation rather than file paths
+/// or code references.
+fn is_noise_token(token: &str) -> bool {
+    // Reject tokens that are just a trailing period on a word (e.g. "sentence.")
+    if token.ends_with('.') && !token[..token.len() - 1].contains('.') {
+        return true;
+    }
+    // Reject very short tokens that are likely abbreviations (e.g. "e.g.")
+    if token.len() <= 4 && token.chars().filter(|&c| c == '.').count() >= 2 {
+        return true;
+    }
+    false
 }

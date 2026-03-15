@@ -1,7 +1,7 @@
-/// Console rendering helpers extracted from the main app module.
-///
-/// These are pure functions that produce display strings from application
-/// state.  They have no side effects and do not depend on the [`App`] struct.
+//! Console rendering helpers extracted from the main app module.
+//!
+//! These are pure functions that produce display strings from application
+//! state.  They have no side effects and do not depend on the [`App`] struct.
 
 use crate::config::EffectiveConfig;
 use crate::contracts::{AppStateSnapshot, ToolLogView};

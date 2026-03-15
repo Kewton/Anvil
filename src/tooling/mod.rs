@@ -1,8 +1,8 @@
-/// Tool registry, validation, and local execution.
-///
-/// Tools are declared as [`ToolSpec`] entries in a [`ToolRegistry`], validated
-/// through a permission and plan-mode pipeline, and executed by
-/// [`LocalToolExecutor`] within a sandboxed workspace root.
+//! Tool registry, validation, and local execution.
+//!
+//! Tools are declared as [`ToolSpec`] entries in a [`ToolRegistry`], validated
+//! through a permission and plan-mode pipeline, and executed by
+//! [`LocalToolExecutor`] within a sandboxed workspace root.
 
 use crate::contracts::ToolLogView;
 use std::collections::HashMap;
