@@ -862,12 +862,22 @@ impl App {
                 },
                 Err(err) => return Err(err),
             },
-            _ => CliTurnOutput {
-                frames: vec![format!(
-                    "Unknown command: {command}\nTry /help for available commands."
-                )],
-                control: SessionControl::Continue,
-            },
+            _ => {
+                let suggestion = self.extensions.suggest_command(command);
+                let msg = if let Some(suggested) = suggestion {
+                    format!(
+                        "Unknown command: {command}\nDid you mean: {suggested}?\nTry /help for available commands."
+                    )
+                } else {
+                    format!(
+                        "Unknown command: {command}\nTry /help for available commands."
+                    )
+                };
+                CliTurnOutput {
+                    frames: vec![msg],
+                    control: SessionControl::Continue,
+                }
+            }
         };
 
         self.flush_session()?;

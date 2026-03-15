@@ -128,6 +128,17 @@ impl ExtensionRegistry {
             .find(|spec| spec.name == command || (spec.name == "/exit" && command == "/quit"))
             .cloned()
     }
+
+    /// Suggest the closest matching command name for typo correction.
+    pub fn suggest_command(&self, input: &str) -> Option<&str> {
+        let cmd = input.split_whitespace().next().unwrap_or(input);
+        self.commands
+            .iter()
+            .map(|spec| (spec.name.as_str(), edit_distance(cmd, &spec.name)))
+            .filter(|(_, dist)| *dist <= 2)
+            .min_by_key(|(_, dist)| *dist)
+            .map(|(name, _)| name)
+    }
 }
 
 pub fn builtin_slash_commands() -> Vec<SlashCommandSpec> {
@@ -276,6 +287,25 @@ fn parse_plan_command(command: &str) -> Option<SlashCommandSpec> {
     }
 
     None
+}
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let n = b.len();
+    let mut prev = (0..=n).collect::<Vec<_>>();
+    let mut curr = vec![0usize; n + 1];
+    for (i, ca) in a.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = if ca == cb { 0 } else { 1 };
+            curr[j + 1] = (prev[j + 1] + 1)
+                .min(curr[j] + 1)
+                .min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[n]
 }
 
 fn parse_repo_command(command: &str) -> Option<SlashCommandSpec> {

@@ -126,3 +126,41 @@ fn override_precedence_is_file_then_env_then_cli() {
     assert!(!config.runtime.stream);
     assert!(config.mode.fresh_session);
 }
+
+#[test]
+fn max_agent_iterations_defaults_to_ten() {
+    let config = EffectiveConfig::default_for_test().expect("config should load");
+    assert_eq!(config.runtime.max_agent_iterations, 10);
+}
+
+#[test]
+fn max_agent_iterations_configurable_via_map() {
+    let mut config = EffectiveConfig::default_for_test().expect("config should load");
+    let mut map = HashMap::new();
+    map.insert("ANVIL_MAX_AGENT_ITERATIONS".to_string(), "25".to_string());
+    config.apply_overrides_for_test(&HashMap::new(), &map, &HashMap::new())
+        .expect("should apply");
+    assert_eq!(config.runtime.max_agent_iterations, 25);
+}
+
+#[test]
+fn context_budget_configurable_via_map() {
+    let mut config = EffectiveConfig::default_for_test().expect("config should load");
+    assert!(config.runtime.context_budget.is_none());
+
+    let mut map = HashMap::new();
+    map.insert("ANVIL_CONTEXT_BUDGET".to_string(), "4096".to_string());
+    config.apply_overrides_for_test(&HashMap::new(), &map, &HashMap::new())
+        .expect("should apply");
+    assert_eq!(config.runtime.context_budget, Some(4096));
+}
+
+#[test]
+fn invalid_numeric_config_value_returns_error() {
+    let mut config = EffectiveConfig::default_for_test().expect("config should load");
+    let mut map = HashMap::new();
+    map.insert("ANVIL_CONTEXT_WINDOW".to_string(), "not_a_number".to_string());
+    let result = config.apply_overrides_for_test(&map, &HashMap::new(), &HashMap::new());
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("not_a_number"));
+}
