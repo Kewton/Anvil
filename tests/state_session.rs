@@ -184,3 +184,35 @@ fn session_normalization_adds_synthetic_entry_when_no_partial_message_exists() {
     assert_eq!(last.status, MessageStatus::Interrupted);
     assert!(last.content.contains("interrupted"));
 }
+
+#[test]
+fn compact_history_keeps_recent_messages_and_mentions_file_targets() {
+    let mut session = SessionRecord::new(PathBuf::from("/tmp/anvil-session-compact"));
+    session.push_message(new_user_message("msg_001", "inspect src/provider/openai.rs"));
+    session.push_message(
+        anvil::session::SessionMessage::new(
+            anvil::session::MessageRole::Tool,
+            "tool",
+            "file.write wrote ./sandbox/demo/Invader.html",
+        )
+        .with_id("tool_001"),
+    );
+    session.push_message(new_assistant_message(
+        "msg_002",
+        "I updated ./sandbox/demo/Invader.html and reviewed the code.",
+        MessageStatus::Committed,
+    ));
+    for index in 3..14 {
+        session.push_message(new_user_message(
+            format!("msg_{index:03}"),
+            format!("follow up {index}"),
+        ));
+    }
+
+    let changed = session.compact_history(8);
+
+    assert!(changed);
+    assert!(session.messages[0].content.contains("[compacted session summary]"));
+    assert!(session.messages[0].content.contains("./sandbox/demo/Invader.html"));
+    assert!(session.event_log.contains(&AppEvent::SessionCompacted));
+}

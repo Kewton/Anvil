@@ -170,6 +170,8 @@ fn tui_renders_working_and_done_views_with_tool_logs() {
         .expect("done render should succeed");
 
     assert!(working.contains("[U] you > inspect state handling"));
+    assert!(working.contains("[T] tool  > progress"));
+    assert!(working.contains("completed:2"));
     assert!(working.contains("[T] tool  > Read"));
     assert!(working.contains("tools active"));
     assert!(done.contains("[A] anvil > 調査結果を整理しました。"));
@@ -245,6 +247,7 @@ fn tui_rendering_uses_runtime_render_path_not_snapshot_model_fields() {
     let rendered = app.render_console(&tui).expect("render should succeed");
 
     assert!(rendered.contains("model:local-default"));
+    assert!(rendered.contains("event:StateChanged"));
 }
 
 #[test]

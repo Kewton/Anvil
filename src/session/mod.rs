@@ -420,6 +420,7 @@ fn compact_preview(content: &str, max_chars: usize) -> String {
 
 fn summarize_messages(messages: &[SessionMessage]) -> String {
     let mut lines = vec!["[compacted session summary]".to_string()];
+    let mut references = Vec::new();
     for message in messages.iter().take(8) {
         let role = match message.role {
             MessageRole::System => "system",
@@ -427,6 +428,7 @@ fn summarize_messages(messages: &[SessionMessage]) -> String {
             MessageRole::Assistant => "anvil",
             MessageRole::Tool => "tool",
         };
+        references.extend(extract_reference_like_tokens(&message.content));
         lines.push(format!(
             "- {}: {}",
             role,
@@ -436,5 +438,23 @@ fn summarize_messages(messages: &[SessionMessage]) -> String {
     if messages.len() > 8 {
         lines.push(format!("- ... {} more message(s)", messages.len() - 8));
     }
+    references.sort();
+    references.dedup();
+    if !references.is_empty() {
+        lines.push("- refs:".to_string());
+        for reference in references.into_iter().take(5) {
+            lines.push(format!("  - {reference}"));
+        }
+    }
     lines.join("\n")
+}
+
+fn extract_reference_like_tokens(content: &str) -> Vec<String> {
+    content
+        .split_whitespace()
+        .map(|token| token.trim_matches(|char: char| ",:;()[]{}<>\"'`".contains(char)))
+        .filter(|token| token.contains('/') || token.contains('.'))
+        .filter(|token| token.len() > 2)
+        .map(|token| token.to_string())
+        .collect()
 }

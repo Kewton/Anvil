@@ -24,12 +24,17 @@
   - repository walking with basic filtering
   - operator-console rendering for retrieval results
   - persistent cache in `.anvil/state/retrieval-index.json`
+  - cache invalidation when the repository changes
+  - hybrid path / file-name / content scoring
+  - retrieval summaries become more useful after `/compact`
 
 - Advanced UX without losing clarity
   - `/timeline` for recent session events and message flow
   - plan visibility inside the timeline view
   - keeps actor separation and current-state visibility intact
   - `/compact` for explicit long-session compaction
+  - focused tool-progress summary above tool logs
+  - footer now includes the latest typed event for clearer status reading
 
 - Long-session compaction
   - summarize older messages into a system summary snapshot
@@ -38,20 +43,14 @@
 
 ## Next Slices
 
-- Improved large-repo retrieval
-  - cache invalidation strategy
-  - path/name/content hybrid retrieval scoring refinement
-  - retrieval scoring
-  - retrieval-aware compaction and summary snapshots
-
-- Advanced UX without losing clarity
-  - richer tool-progress display
-  - more expressive but still legible status views
-
 - Architectural cleanup for richer planning
   - execution checkpoints
   - tool-batch review
 
 - Backend parity expansion
-  - structured tool-response parity checks
-  - auth/header support for remote-compatible servers
+  - multi-provider configuration UX
+  - deeper remote-compatible provider diagnostics
+
+- Retrieval and UX refinement
+  - semantic or symbol-aware retrieval ranking
+  - live tool-progress updates for long-running executions

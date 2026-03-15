@@ -111,11 +111,18 @@ impl Tui {
             }
         }
 
-        for log in &snapshot.tool_logs {
+        if !snapshot.tool_logs.is_empty() {
+            let (completed, failed, interrupted) = summarize_tool_logs(&snapshot.tool_logs);
+            lines.push("[T] tool  > progress".to_string());
             lines.push(format!(
-                "[T] tool  > {:<6} {} {}",
-                log.tool_name, log.action, log.target
+                "  completed:{completed} failed:{failed} interrupted:{interrupted}"
             ));
+            for log in &snapshot.tool_logs {
+                lines.push(format!(
+                    "[T] tool  > {:<6} {} {}",
+                    log.tool_name, log.action, log.target
+                ));
+            }
         }
 
         if let Some(summary) = &snapshot.completion_summary {
@@ -187,7 +194,12 @@ impl Tui {
             })
             .unwrap_or_else(|| "active:-".to_string());
 
-        format!("{state}. {elapsed}   model:{model_name}   {ctx}   {active}")
+        let event = snapshot
+            .last_event
+            .map(|event| format!("event:{event:?}"))
+            .unwrap_or_else(|| "event:-".to_string());
+
+        format!("{state}. {elapsed}   model:{model_name}   {ctx}   {active}   {event}")
     }
 }
 
@@ -214,4 +226,20 @@ fn render_hint_line(snapshot: &crate::contracts::AppStateSnapshot) -> String {
 
 fn status_divider() -> String {
     "--------------------------------------------------------------".to_string()
+}
+
+fn summarize_tool_logs(logs: &[crate::contracts::ToolLogView]) -> (usize, usize, usize) {
+    let mut completed = 0;
+    let mut failed = 0;
+    let mut interrupted = 0;
+
+    for log in logs {
+        match log.action.as_str() {
+            "failed" => failed += 1,
+            "interrupted" => interrupted += 1,
+            _ => completed += 1,
+        }
+    }
+
+    (completed, failed, interrupted)
 }

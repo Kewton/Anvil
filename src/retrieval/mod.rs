@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetrievalMatch {
@@ -46,22 +47,36 @@ struct IndexedFile {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct IndexedFileMeta {
+    relative_path: String,
+    size_bytes: u64,
+    modified_ms: u128,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepositoryIndex {
+    #[serde(default)]
+    manifest: Vec<IndexedFileMeta>,
     files: Vec<IndexedFile>,
 }
 
 impl RepositoryIndex {
     pub fn build(root: &Path) -> Result<Self, RetrievalError> {
         let mut files = Vec::new();
-        collect_files(root, root, &mut files)?;
-        Ok(Self { files })
+        let mut manifest = Vec::new();
+        collect_files(root, root, &mut files, &mut manifest)?;
+        manifest.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        Ok(Self { manifest, files })
     }
 
     pub fn load_or_build(root: &Path, cache_path: &Path) -> Result<Self, RetrievalError> {
         if cache_path.exists() {
             let bytes = fs::read(cache_path).map_err(RetrievalError::CacheRead)?;
-            let index = serde_json::from_slice(&bytes).map_err(RetrievalError::CacheDecode)?;
-            return Ok(index);
+            let index: RepositoryIndex =
+                serde_json::from_slice(&bytes).map_err(RetrievalError::CacheDecode)?;
+            if index.is_current_for(root)? {
+                return Ok(index);
+            }
         }
 
         let index = Self::build(root)?;
@@ -104,6 +119,13 @@ impl RepositoryIndex {
         let bytes = serde_json::to_vec(self).map_err(RetrievalError::CacheEncode)?;
         fs::write(cache_path, bytes).map_err(RetrievalError::CacheWrite)
     }
+
+    fn is_current_for(&self, root: &Path) -> Result<bool, RetrievalError> {
+        let mut current = Vec::new();
+        collect_manifest(root, root, &mut current)?;
+        current.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        Ok(self.manifest == current)
+    }
 }
 
 pub fn render_retrieval_result(result: &RetrievalResult) -> String {
@@ -126,6 +148,7 @@ fn collect_files(
     root: &Path,
     current: &Path,
     files: &mut Vec<IndexedFile>,
+    manifest: &mut Vec<IndexedFileMeta>,
 ) -> Result<(), RetrievalError> {
     let entries = fs::read_dir(current).map_err(RetrievalError::Walk)?;
     for entry in entries {
@@ -139,7 +162,7 @@ fn collect_files(
         }
 
         if path.is_dir() {
-            collect_files(root, &path, files)?;
+            collect_files(root, &path, files, manifest)?;
             continue;
         }
 
@@ -147,20 +170,59 @@ fn collect_files(
             continue;
         }
 
-        let Ok(content) = fs::read_to_string(&path) else {
-            continue;
-        };
         let relative = path
             .strip_prefix(root)
             .unwrap_or(&path)
             .to_string_lossy()
             .to_string();
+        if let Some(meta) = metadata_for(&path, &relative) {
+            manifest.push(meta);
+        }
+
+        let Ok(content) = fs::read_to_string(&path) else {
+            continue;
+        };
         files.push(IndexedFile {
             relative_path: relative,
             content,
         });
     }
 
+    Ok(())
+}
+
+fn collect_manifest(
+    root: &Path,
+    current: &Path,
+    manifest: &mut Vec<IndexedFileMeta>,
+) -> Result<(), RetrievalError> {
+    let entries = fs::read_dir(current).map_err(RetrievalError::Walk)?;
+    for entry in entries {
+        let entry = entry.map_err(RetrievalError::Walk)?;
+        let path = entry.path();
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+
+        if should_skip(&file_name, &path) {
+            continue;
+        }
+        if path.is_dir() {
+            collect_manifest(root, &path, manifest)?;
+            continue;
+        }
+        if !path.is_file() || is_binary_path(&path) {
+            continue;
+        }
+
+        let relative = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .to_string();
+        if let Some(meta) = metadata_for(&path, &relative) {
+            manifest.push(meta);
+        }
+    }
     Ok(())
 }
 
@@ -188,17 +250,32 @@ fn is_binary_path(path: &Path) -> bool {
 
 fn score_file(file: &IndexedFile, needle: &str) -> Option<RetrievalMatch> {
     let path_lc = file.relative_path.to_ascii_lowercase();
+    let file_name = Path::new(&file.relative_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     let mut score = 0;
     let mut snippets = Vec::new();
 
+    if file_name == needle {
+        score += 140;
+        snippets.push(format!("file match: {}", file.relative_path));
+    } else if file_name.contains(needle) {
+        score += 100;
+        snippets.push(format!("file match: {}", file.relative_path));
+    }
+
     if path_lc.contains(needle) {
-        score += 50;
-        snippets.push(format!("path match: {}", file.relative_path));
+        score += 60;
+        if !snippets.iter().any(|item| item.starts_with("path match:")) {
+            snippets.push(format!("path match: {}", file.relative_path));
+        }
     }
 
     for line in file.content.lines() {
         if line.to_ascii_lowercase().contains(needle) {
-            score += 10;
+            score += 12;
             if snippets.len() < 3 {
                 snippets.push(compact_line(line));
             }
@@ -220,4 +297,19 @@ fn compact_line(line: &str) -> String {
         let compact: String = trimmed.chars().take(117).collect();
         format!("{compact}...")
     }
+}
+
+fn metadata_for(path: &Path, relative_path: &str) -> Option<IndexedFileMeta> {
+    let metadata = fs::metadata(path).ok()?;
+    let modified_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .map(|value| value.as_millis())
+        .unwrap_or(0);
+    Some(IndexedFileMeta {
+        relative_path: relative_path.to_string(),
+        size_bytes: metadata.len(),
+        modified_ms,
+    })
 }
