@@ -36,13 +36,13 @@ impl App {
         tui: &Tui,
         provider_client: &C,
     ) -> Result<Vec<String>, AppError> {
-        const MAX_AGENT_ITERATIONS: usize = 10;
+        let max_iterations = self.config.runtime.max_agent_iterations;
         let mut current = structured;
         let mut frames = Vec::new();
         let mut total_tool_count = 0usize;
         let mut all_tool_log_views: Vec<ToolLogView> = Vec::new();
 
-        for iteration in 0..MAX_AGENT_ITERATIONS {
+        for iteration in 0..max_iterations {
             // Show plan for this iteration
             let inferred_plan = infer_plan_from_structured_response(&current);
             let thinking = AppStateSnapshot::new(RuntimeState::Thinking)

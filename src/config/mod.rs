@@ -23,6 +23,7 @@ pub struct RuntimeConfig {
     pub api_key: Option<String>,
     pub context_window: u32,
     pub context_budget: Option<u32>,
+    pub max_agent_iterations: usize,
     pub stream: bool,
 }
 
@@ -108,6 +109,7 @@ impl EffectiveConfig {
                 api_key: None,
                 context_window: 200_000,
                 context_budget: None,
+                max_agent_iterations: 10,
                 stream: true,
             },
             mode: ModeConfig {
@@ -169,6 +171,7 @@ impl EffectiveConfig {
             "ANVIL_API_KEY",
             "ANVIL_CONTEXT_WINDOW",
             "ANVIL_CONTEXT_BUDGET",
+            "ANVIL_MAX_AGENT_ITERATIONS",
             "ANVIL_STREAM",
             "ANVIL_INTERACTIVE",
             "ANVIL_APPROVAL_REQUIRED",
@@ -217,6 +220,11 @@ impl EffectiveConfig {
                 "--context-budget" => {
                     if let Some(value) = args.next() {
                         map.insert("ANVIL_CONTEXT_BUDGET".to_string(), value);
+                    }
+                }
+                "--max-iterations" => {
+                    if let Some(value) = args.next() {
+                        map.insert("ANVIL_MAX_AGENT_ITERATIONS".to_string(), value);
                     }
                 }
                 "--no-stream" => {
@@ -281,6 +289,11 @@ impl EffectiveConfig {
                                 .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?,
                         )
                     };
+                }
+                "max_agent_iterations" | "ANVIL_MAX_AGENT_ITERATIONS" => {
+                    self.runtime.max_agent_iterations = value
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
                 }
                 "stream" | "ANVIL_STREAM" => {
                     self.runtime.stream = parse_bool(value);

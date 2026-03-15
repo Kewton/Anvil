@@ -96,6 +96,11 @@ pub struct SessionRecord {
     /// Not serialized — always starts as `false` after deserialization.
     #[serde(skip)]
     pub dirty: bool,
+    /// Cached estimated token count, updated incrementally on message changes.
+    /// Not serialized — rebuilt lazily after deserialization.
+    /// Uses `Cell` for interior mutability so callers can use `&self`.
+    #[serde(skip)]
+    cached_token_count: std::cell::Cell<Option<usize>>,
 }
 
 impl SessionRecord {
@@ -115,10 +120,16 @@ impl SessionRecord {
             pending_turn: None,
             provider_errors: Vec::new(),
             dirty: false,
+            cached_token_count: std::cell::Cell::new(None),
         }
     }
 
     pub fn push_message(&mut self, message: SessionMessage) {
+        // Update cached token count incrementally
+        let msg_tokens = estimate_tokens(&message.content);
+        if let Some(cached) = self.cached_token_count.get() {
+            self.cached_token_count.set(Some(cached + msg_tokens));
+        }
         self.messages.push(message);
         self.touch();
     }
@@ -206,10 +217,16 @@ impl SessionRecord {
     }
 
     pub fn estimated_token_count(&self) -> usize {
-        self.messages
+        if let Some(cached) = self.cached_token_count.get() {
+            return cached;
+        }
+        let count: usize = self
+            .messages
             .iter()
             .map(|message| estimate_tokens(&message.content))
-            .sum()
+            .sum();
+        self.cached_token_count.set(Some(count));
+        count
     }
 
     pub fn compact_history(&mut self, keep_recent: usize) -> bool {
@@ -221,6 +238,7 @@ impl SessionRecord {
         let compacted = &self.messages[..split_at];
         let summary = summarize_messages(compacted);
         self.messages.drain(..split_at);
+        self.cached_token_count.set(None); // Invalidate cache after drain
         self.messages.insert(
             0,
             SessionMessage::new(MessageRole::System, "anvil", summary)
