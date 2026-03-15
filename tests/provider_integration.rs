@@ -365,6 +365,82 @@ fn openai_compatible_provider_maps_response_into_done_event() {
 }
 
 #[test]
+fn openai_compatible_provider_parses_sse_streams() {
+    let request = ProviderTurnRequest::new(
+        "local-openai".to_string(),
+        vec![anvil::provider::ProviderMessage::new(
+            ProviderMessageRole::User,
+            "inspect src/provider",
+        )],
+        true,
+    );
+
+    let transport = MockHttpTransport {
+        seen_urls: Rc::new(RefCell::new(Vec::new())),
+        seen_bodies: Rc::new(RefCell::new(Vec::new())),
+        response: HttpResponse {
+            status_code: 200,
+            body: concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"draft \"},\"finish_reason\":null}]}\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":\"stop\"}]}\n",
+                "data: [DONE]\n"
+            )
+            .as_bytes()
+            .to_vec(),
+        },
+    };
+    let client =
+        anvil::provider::openai::OpenAiCompatibleProviderClient::with_transport(
+            "http://localhost:1234",
+            transport,
+        );
+
+    let mut events = Vec::new();
+    client
+        .stream_turn(&request, &mut |event| events.push(event))
+        .expect("openai-compatible stream should succeed");
+
+    assert!(events.iter().any(
+        |event| matches!(event, ProviderEvent::TokenDelta(delta) if delta == "draft ")
+    ));
+    assert!(events.iter().any(
+        |event| matches!(event, ProviderEvent::Agent(AgentEvent::Done { assistant_message, .. }) if assistant_message == "draft answer")
+    ));
+}
+
+#[test]
+fn openai_compatible_provider_normalizes_error_message() {
+    let request = ProviderTurnRequest::new(
+        "local-openai".to_string(),
+        vec![anvil::provider::ProviderMessage::new(
+            ProviderMessageRole::User,
+            "inspect src/provider",
+        )],
+        false,
+    );
+
+    let transport = MockHttpTransport {
+        seen_urls: Rc::new(RefCell::new(Vec::new())),
+        seen_bodies: Rc::new(RefCell::new(Vec::new())),
+        response: HttpResponse {
+            status_code: 401,
+            body: br#"{"error":{"message":"invalid api key"}}"#.to_vec(),
+        },
+    };
+    let client =
+        anvil::provider::openai::OpenAiCompatibleProviderClient::with_transport(
+            "http://localhost:1234",
+            transport,
+        );
+
+    let err = client
+        .stream_turn(&request, &mut |_| {})
+        .expect_err("error body should be normalized");
+
+    assert!(err.to_string().contains("invalid api key"));
+}
+
+#[test]
 fn basic_agent_loop_applies_context_shaping_limit() {
     let mut app = common::build_app();
     app.record_user_input("msg_001", "u1").expect("persist");

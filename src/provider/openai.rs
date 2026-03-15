@@ -38,8 +38,37 @@ struct OpenAiChatResponse {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct OpenAiStreamChunk {
+    choices: Vec<OpenAiDeltaChoice>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OpenAiDeltaChoice {
+    #[serde(default)]
+    delta: OpenAiDeltaMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct OpenAiDeltaMessage {
+    #[serde(default)]
+    content: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct OpenAiChoice {
     message: OpenAiChatMessage,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OpenAiErrorEnvelope {
+    error: OpenAiErrorBody,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OpenAiErrorBody {
+    message: String,
 }
 
 impl OpenAiCompatibleProviderClient {
@@ -79,7 +108,7 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
     fn send_chat_request(
         &self,
         request: &ProviderTurnRequest,
-    ) -> Result<String, ProviderTurnError> {
+    ) -> Result<Vec<ProviderEvent>, ProviderTurnError> {
         let chat_request = OpenAiChatRequest {
             model: request.model.clone(),
             messages: request
@@ -95,7 +124,7 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
                     content: m.content.clone(),
                 })
                 .collect(),
-            stream: false,
+            stream: request.stream,
         };
 
         let request_body = serde_json::to_vec(&chat_request).map_err(|err| {
@@ -108,7 +137,7 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
 
         let response = self.transport.post_json(&url, &request_body)?;
         if response.status_code != 200 {
-            let body_text = String::from_utf8_lossy(&response.body);
+            let body_text = normalize_openai_error(&response.body);
             return Err(ProviderTurnError::Backend(format!(
                 "openai request failed with status {}: {}",
                 response.status_code,
@@ -116,18 +145,32 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
             )));
         }
 
-        let parsed: OpenAiChatResponse =
-            serde_json::from_slice(&response.body).map_err(|err| {
-                ProviderTurnError::Backend(format!("invalid openai response: {err}"))
-            })?;
+        if request.stream && looks_like_sse_stream(&response.body) {
+            return parse_openai_sse_response(&response.body);
+        }
 
-        parsed
+        let parsed: OpenAiChatResponse = serde_json::from_slice(&response.body)
+            .map_err(|err| ProviderTurnError::Backend(format!("invalid openai response: {err}")))?;
+
+        let content = parsed
             .choices
             .first()
             .map(|choice| choice.message.content.clone())
             .ok_or_else(|| {
                 ProviderTurnError::Backend("openai response contained no choices".to_string())
-            })
+            })?;
+
+        Ok(vec![
+            ProviderEvent::TokenDelta(content.clone()),
+            ProviderEvent::Agent(AgentEvent::Done {
+                status: "Done. session saved".to_string(),
+                assistant_message: content,
+                completion_summary: "Provider turn finished successfully.".to_string(),
+                saved_status: "session saved".to_string(),
+                tool_logs: Vec::new(),
+                elapsed_ms: 0,
+            }),
+        ])
     }
 }
 
@@ -137,18 +180,72 @@ impl<T: HttpTransport> ProviderClient for OpenAiCompatibleProviderClient<T> {
         request: &ProviderTurnRequest,
         emit: &mut dyn FnMut(ProviderEvent),
     ) -> Result<(), ProviderTurnError> {
-        let content = self.send_chat_request(request)?;
+        for event in self.send_chat_request(request)? {
+            emit(event);
+        }
 
-        emit(ProviderEvent::TokenDelta(content.clone()));
-        emit(ProviderEvent::Agent(AgentEvent::Done {
+        Ok(())
+    }
+}
+
+fn parse_openai_sse_response(body: &[u8]) -> Result<Vec<ProviderEvent>, ProviderTurnError> {
+    let text = String::from_utf8_lossy(body);
+    let mut content = String::new();
+    let mut events = Vec::new();
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || !trimmed.starts_with("data: ") {
+            continue;
+        }
+        let payload = &trimmed[6..];
+        if payload == "[DONE]" {
+            break;
+        }
+
+        let chunk: OpenAiStreamChunk = serde_json::from_str(payload)
+            .map_err(|err| ProviderTurnError::Backend(format!("invalid openai stream chunk: {err}")))?;
+
+        for choice in chunk.choices {
+            if let Some(delta) = choice.delta.content {
+                content.push_str(&delta);
+                events.push(ProviderEvent::TokenDelta(delta));
+            }
+            if choice.finish_reason.is_some() {
+                events.push(ProviderEvent::Agent(AgentEvent::Done {
+                    status: "Done. session saved".to_string(),
+                    assistant_message: content.clone(),
+                    completion_summary: "Provider turn finished successfully.".to_string(),
+                    saved_status: "session saved".to_string(),
+                    tool_logs: Vec::new(),
+                    elapsed_ms: 0,
+                }));
+            }
+        }
+    }
+
+    if events.iter().all(|event| !matches!(event, ProviderEvent::Agent(AgentEvent::Done { .. }))) {
+        events.push(ProviderEvent::Agent(AgentEvent::Done {
             status: "Done. session saved".to_string(),
-            assistant_message: content,
+            assistant_message: content.clone(),
             completion_summary: "Provider turn finished successfully.".to_string(),
             saved_status: "session saved".to_string(),
             tool_logs: Vec::new(),
             elapsed_ms: 0,
         }));
-
-        Ok(())
     }
+
+    Ok(events)
+}
+
+fn normalize_openai_error(body: &[u8]) -> String {
+    serde_json::from_slice::<OpenAiErrorEnvelope>(body)
+        .map(|parsed| parsed.error.message)
+        .unwrap_or_else(|_| String::from_utf8_lossy(body).to_string())
+}
+
+fn looks_like_sse_stream(body: &[u8]) -> bool {
+    String::from_utf8_lossy(body)
+        .lines()
+        .any(|line| line.trim_start().starts_with("data: "))
 }

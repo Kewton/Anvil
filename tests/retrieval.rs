@@ -45,3 +45,18 @@ fn retrieval_result_renders_operator_console_frame() {
     assert!(rendered.contains("[A] anvil > repo-find repo_find"));
     assert!(rendered.contains("src/app.rs"));
 }
+
+#[test]
+fn repository_index_can_persist_and_reload_cache() {
+    let root = common::unique_test_dir("retrieval_cache");
+    let state_dir = root.join(".anvil/state");
+    fs::create_dir_all(root.join("src")).expect("src dir");
+    fs::write(root.join("src/app.rs"), "fn repo_find() {}\n").expect("write file");
+
+    let cache_path = anvil::retrieval::default_cache_path(&state_dir);
+    let built = RepositoryIndex::load_or_build(&root, &cache_path).expect("cache build");
+    let loaded = RepositoryIndex::load_or_build(&root, &cache_path).expect("cache load");
+
+    assert_eq!(built.search("repo_find", 5), loaded.search("repo_find", 5));
+    assert!(cache_path.exists());
+}

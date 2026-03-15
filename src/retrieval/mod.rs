@@ -1,6 +1,7 @@
+use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetrievalMatch {
@@ -18,24 +19,33 @@ pub struct RetrievalResult {
 #[derive(Debug)]
 pub enum RetrievalError {
     Walk(std::io::Error),
+    CacheRead(std::io::Error),
+    CacheWrite(std::io::Error),
+    CacheDecode(serde_json::Error),
+    CacheEncode(serde_json::Error),
 }
 
 impl Display for RetrievalError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Walk(err) => write!(f, "failed to index repository: {err}"),
+            Self::CacheRead(err) => write!(f, "failed to read retrieval cache: {err}"),
+            Self::CacheWrite(err) => write!(f, "failed to write retrieval cache: {err}"),
+            Self::CacheDecode(err) => write!(f, "invalid retrieval cache json: {err}"),
+            Self::CacheEncode(err) => write!(f, "failed to encode retrieval cache: {err}"),
         }
     }
 }
 
 impl std::error::Error for RetrievalError {}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct IndexedFile {
     relative_path: String,
     content: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepositoryIndex {
     files: Vec<IndexedFile>,
 }
@@ -45,6 +55,18 @@ impl RepositoryIndex {
         let mut files = Vec::new();
         collect_files(root, root, &mut files)?;
         Ok(Self { files })
+    }
+
+    pub fn load_or_build(root: &Path, cache_path: &Path) -> Result<Self, RetrievalError> {
+        if cache_path.exists() {
+            let bytes = fs::read(cache_path).map_err(RetrievalError::CacheRead)?;
+            let index = serde_json::from_slice(&bytes).map_err(RetrievalError::CacheDecode)?;
+            return Ok(index);
+        }
+
+        let index = Self::build(root)?;
+        index.save(cache_path)?;
+        Ok(index)
     }
 
     pub fn search(&self, query: &str, limit: usize) -> RetrievalResult {
@@ -73,6 +95,14 @@ impl RepositoryIndex {
             query: query.to_string(),
             matches,
         }
+    }
+
+    pub fn save(&self, cache_path: &Path) -> Result<(), RetrievalError> {
+        if let Some(parent) = cache_path.parent() {
+            fs::create_dir_all(parent).map_err(RetrievalError::CacheWrite)?;
+        }
+        let bytes = serde_json::to_vec(self).map_err(RetrievalError::CacheEncode)?;
+        fs::write(cache_path, bytes).map_err(RetrievalError::CacheWrite)
     }
 }
 
@@ -132,6 +162,10 @@ fn collect_files(
     }
 
     Ok(())
+}
+
+pub fn default_cache_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("retrieval-index.json")
 }
 
 fn should_skip(file_name: &str, path: &Path) -> bool {

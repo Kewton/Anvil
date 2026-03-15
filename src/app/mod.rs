@@ -17,7 +17,7 @@ use crate::provider::{
     ProviderBootstrapError, ProviderClient, ProviderErrorKind, ProviderErrorRecord, ProviderEvent,
     ProviderRuntimeContext, ProviderTurnError, build_local_provider_client,
 };
-use crate::retrieval::{RepositoryIndex, render_retrieval_result};
+use crate::retrieval::{RepositoryIndex, default_cache_path, render_retrieval_result};
 use crate::session::{
     MessageRole, MessageStatus, SessionError, SessionMessage, SessionRecord, SessionStore,
     new_assistant_message, new_user_message,
@@ -983,7 +983,8 @@ impl App {
     }
 
     fn repo_find(&self, query: &str) -> Result<String, AppError> {
-        let index = RepositoryIndex::build(&self.config.paths.cwd)
+        let cache_path = default_cache_path(&self.config.paths.state_dir);
+        let index = RepositoryIndex::load_or_build(&self.config.paths.cwd, &cache_path)
             .map_err(|err| AppError::ToolExecution(err.to_string()))?;
         let result = index.search(query, 5);
         Ok(render_retrieval_result(&result))

@@ -17,11 +17,13 @@
   - OpenAI-compatible backend support
   - normalized into the same provider contract as Ollama
   - covered by config/bootstrap and provider integration tests
+  - streaming and error normalization parity slice added
 
 - Improved large-repo retrieval
   - `/repo-find <query>` path and content search
   - repository walking with basic filtering
   - operator-console rendering for retrieval results
+  - persistent cache in `.anvil/state/retrieval-index.json`
 
 - Advanced UX without losing clarity
   - `/timeline` for recent session events and message flow
@@ -31,7 +33,7 @@
 ## Next Slices
 
 - Improved large-repo retrieval
-  - persistent repository indexing
+  - cache invalidation strategy
   - path/name/content hybrid retrieval scoring refinement
   - retrieval scoring
   - compaction and summary snapshots for long sessions
@@ -45,6 +47,5 @@
   - tool-batch review
 
 - Backend parity expansion
-  - OpenAI-compatible streaming parity
-  - provider-specific error normalization
   - structured tool-response parity checks
+  - auth/header support for remote-compatible servers
