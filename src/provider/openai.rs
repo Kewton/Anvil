@@ -3,9 +3,9 @@
 //! Works with the standard `/v1/chat/completions` endpoint used by
 //! OpenAI, Azure OpenAI, LM Studio, and other compatible servers.
 
+use super::transport::{CurlHttpTransport, HttpTransport};
 use super::{
-    AgentEvent, CurlHttpTransport, HttpTransport, ProviderClient, ProviderEvent,
-    ProviderTurnError, ProviderTurnRequest,
+    AgentEvent, ProviderClient, ProviderEvent, ProviderTurnError, ProviderTurnRequest,
 };
 use crate::config::EffectiveConfig;
 use serde::{Deserialize, Serialize};
