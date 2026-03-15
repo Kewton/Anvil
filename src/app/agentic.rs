@@ -223,12 +223,22 @@ impl App {
                     continue;
                 }
             };
-            let request = match validated.approve().into_execution_request(ToolExecutionPolicy {
+            // Only auto-approve when approval is not required.
+            // Safe tools don't need approval regardless.
+            let policy = ToolExecutionPolicy {
                 approval_required: self.config.mode.approval_required,
                 allow_restricted: !self.config.mode.approval_required,
                 plan_mode: false,
                 plan_scope_granted: true,
-            }) {
+            };
+            let ready = if !self.config.mode.approval_required
+                || validated.approval_required(true).is_none()
+            {
+                validated.approve()
+            } else {
+                validated
+            };
+            let request = match ready.into_execution_request(policy) {
                 Ok(r) => r,
                 Err(err) => {
                     let error_result = ToolExecutionResult {
