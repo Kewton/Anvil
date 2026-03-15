@@ -61,7 +61,8 @@ impl App {
                 StateTransition::StartThinking
             };
             let _ = self.transition_with_context(thinking, transition)?;
-            frames.push(self.render_console(tui)?);
+            // Skip intermediate Thinking frames — the user already sees
+            // live streaming output on stderr (Issue #1).
 
             // Execute tool calls and record results WITH payload
             let results = self.execute_structured_tool_calls(&current)?;
@@ -81,7 +82,8 @@ impl App {
                 .with_tool_logs(tool_log_views)
                 .with_elapsed_ms(elapsed_ms);
             let _ = self.transition_with_context(working, StateTransition::StartWorking)?;
-            frames.push(self.render_console(tui)?);
+            // Skip intermediate Working frames — tool execution output
+            // is already shown on stderr (Issue #1).
 
             // Send tool results back to LLM for the next turn
             let spinner = Spinner::start(format!(

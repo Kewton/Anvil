@@ -160,20 +160,21 @@ impl SessionRecord {
     pub fn recent_message_views(
         &self,
         limit: usize,
-        exclude_assistant: bool,
+        exclude_messages: bool,
     ) -> Vec<ConsoleMessageView> {
+        // When exclude_messages is true, skip ALL messages because they
+        // were already shown during the live turn (streaming to stderr,
+        // tool execution output, etc.).  Rendering them again in the
+        // console frame would cause duplicate output (Issue #1).
+        if exclude_messages {
+            return Vec::new();
+        }
+
         let len = self.messages.len();
         let start = len.saturating_sub(limit);
 
         self.messages[start..]
             .iter()
-            .filter(|message| {
-                // When exclude_assistant is true, skip Assistant messages
-                // because they were already streamed to stderr in real-time.
-                // Rendering them again in the console frame would cause
-                // duplicate output (Issue #1).
-                !exclude_assistant || message.role != MessageRole::Assistant
-            })
             .map(|message| ConsoleMessageView {
                 role: match message.role {
                     MessageRole::User => ConsoleMessageRole::User,
@@ -233,10 +234,14 @@ impl SessionRecord {
         snapshot: &AppStateSnapshot,
         model_name: &str,
         visible_message_limit: usize,
-        exclude_assistant: bool,
+        exclude_messages: bool,
     ) -> ConsoleRenderContext {
-        let messages = self.recent_message_views(visible_message_limit, exclude_assistant);
-        let history_summary = self.recent_history_summary(messages.len());
+        let messages = self.recent_message_views(visible_message_limit, exclude_messages);
+        let history_summary = if exclude_messages {
+            None
+        } else {
+            self.recent_history_summary(messages.len())
+        };
 
         ConsoleRenderContext {
             snapshot: snapshot.clone(),

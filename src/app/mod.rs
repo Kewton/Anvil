@@ -663,8 +663,9 @@ impl App {
     }
 
     fn build_console_render_context(&self) -> ConsoleRenderContext {
-        // Exclude assistant messages from frame rendering because they were
-        // already streamed to stderr in real-time (Issue #1).
+        // Exclude all messages from frame rendering because they were
+        // already shown during the live turn — streaming to stderr and
+        // tool execution output (Issue #1).
         self.session.console_render_context(
             self.state_machine.snapshot(),
             &self.config.runtime.model,
