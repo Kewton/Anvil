@@ -44,7 +44,6 @@ pub struct App {
     state_machine: StateMachine,
     session_store: SessionStore,
     session: SessionRecord,
-    pending_turn: Option<PendingTurnState>,
     extensions: ExtensionRegistry,
     tools: ToolRegistry,
 }
@@ -155,7 +154,6 @@ impl App {
             provider,
             state_machine: StateMachine::from_snapshot(initial_state_snapshot),
             session_store,
-            pending_turn: session.pending_turn.clone(),
             session,
             extensions,
         })
@@ -258,7 +256,7 @@ impl App {
         runtime: &AgentRuntime,
         tui: &Tui,
     ) -> Result<Vec<String>, AppError> {
-        if self.pending_turn.is_some() {
+        if self.session.has_pending_turn() {
             return Err(AppError::PendingApprovalRequired);
         }
         let user_input = user_input.into();
@@ -272,7 +270,7 @@ impl App {
         provider_client: &C,
         tui: &Tui,
     ) -> Result<Vec<String>, AppError> {
-        if self.pending_turn.is_some() {
+        if self.session.has_pending_turn() {
             return Err(AppError::PendingApprovalRequired);
         }
 
@@ -422,9 +420,11 @@ impl App {
         _runtime: &AgentRuntime,
         tui: &Tui,
     ) -> Result<Vec<String>, AppError> {
-        let pending_turn = self.pending_turn.take().ok_or(AppError::NoPendingApproval)?;
-
-        self.session.clear_pending_turn();
+        let pending_turn = self
+            .session
+            .pending_turn
+            .take()
+            .ok_or(AppError::NoPendingApproval)?;
         self.persist_session(AppEvent::SessionSaved)?;
         let result = self.execute_runtime_events(&pending_turn.remaining_events, tui);
         self.flush_session()?;
@@ -432,7 +432,7 @@ impl App {
     }
 
     pub fn deny_and_abort(&mut self, tui: &Tui) -> Result<Vec<String>, AppError> {
-        if self.pending_turn.is_none() {
+        if !self.session.has_pending_turn() {
             return Err(AppError::NoPendingApproval);
         }
 
@@ -550,7 +550,7 @@ impl App {
             }
         }
 
-        if self.pending_turn.is_none() {
+        if !self.session.has_pending_turn() {
             self.clear_pending_turn()?;
         }
 
@@ -708,7 +708,7 @@ impl App {
     }
 
     pub fn has_pending_runtime_events(&self) -> bool {
-        self.pending_turn.is_some()
+        self.session.has_pending_turn()
     }
 
     /// Process a single line of CLI input.
@@ -749,16 +749,14 @@ impl App {
     }
 
     fn set_pending_turn(&mut self, pending_turn: PendingTurnState) -> Result<(), AppError> {
-        self.pending_turn = Some(pending_turn.clone());
         self.session.set_pending_turn(pending_turn);
         self.persist_session_immediate(AppEvent::SessionSaved)
     }
 
     fn clear_pending_turn(&mut self) -> Result<(), AppError> {
-        if self.pending_turn.is_none() && !self.session.has_pending_turn() {
+        if !self.session.has_pending_turn() {
             return Ok(());
         }
-        self.pending_turn = None;
         self.session.clear_pending_turn();
         self.persist_session_immediate(AppEvent::SessionSaved)
     }

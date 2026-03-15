@@ -312,3 +312,67 @@ fn estimated_token_count_caches_across_calls() {
     let after_push = session.estimated_token_count();
     assert!(after_push > first);
 }
+
+#[test]
+fn session_interrupt_persists_and_resumes_correctly() {
+    use anvil::agent::PendingTurnState;
+
+    let root = unique_test_dir("interrupt_resume");
+    let mut config =
+        anvil::config::EffectiveConfig::default_for_test().expect("config should load");
+    config.paths.cwd = root.clone();
+    config.paths.session_dir = root.join(".anvil").join("sessions");
+    config.paths.session_file = config.paths.session_dir.join("session_interrupt.json");
+
+    let store = anvil::session::SessionStore::from_config(&config);
+    let mut session = store
+        .load_or_create(&config.paths.cwd)
+        .expect("session should load");
+
+    // Simulate a turn that was interrupted during approval
+    session.push_message(new_user_message("msg_001", "do something"));
+    session.push_message(new_assistant_message(
+        "msg_002",
+        "",
+        MessageStatus::InProgress,
+    ));
+    session.set_pending_turn(PendingTurnState {
+        waiting_tool_call_id: "call_001".to_string(),
+        remaining_events: vec![],
+    });
+    session.normalize_interrupted_turn("provider turn");
+    store.save(&session).expect("session should save");
+
+    // Reload and verify state
+    let reloaded = store.load().expect("session should reload");
+    assert!(
+        reloaded.has_pending_turn(),
+        "pending turn should survive reload"
+    );
+    assert_eq!(
+        reloaded.pending_turn.as_ref().unwrap().waiting_tool_call_id,
+        "call_001"
+    );
+
+    // Verify interrupted messages are properly marked
+    let last_msg = reloaded
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.status == MessageStatus::Interrupted);
+    assert!(
+        last_msg.is_some(),
+        "should have an interrupted message after normalize"
+    );
+    assert!(
+        last_msg.unwrap().content.contains("interrupted"),
+        "interrupted message should contain reason"
+    );
+
+    // Verify the session can be cleared and new turn started
+    let mut resumed = reloaded;
+    resumed.clear_pending_turn();
+    assert!(!resumed.has_pending_turn());
+    resumed.push_message(new_user_message("msg_003", "continue"));
+    assert_eq!(resumed.message_count(), 3); // original 2 (msg_002 marked interrupted in-place) + new
+}

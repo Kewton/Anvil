@@ -472,7 +472,24 @@ impl LocalToolExecutor {
         {
             return Err(ToolRuntimeError::InvalidPath(raw.to_string()));
         }
-        Ok(self.root.join(candidate))
+        let joined = self.root.join(candidate);
+        // If the path exists, canonicalize to resolve symlinks and verify
+        // the result is still within the sandbox root.
+        if joined.exists() {
+            let canonical = fs::canonicalize(&joined).map_err(|err| {
+                ToolRuntimeError::Io(format!(
+                    "failed to resolve path {}: {err}",
+                    joined.display()
+                ))
+            })?;
+            let root_canonical = fs::canonicalize(&self.root).unwrap_or_else(|_| self.root.clone());
+            if !canonical.starts_with(&root_canonical) {
+                return Err(ToolRuntimeError::InvalidPath(format!(
+                    "{raw} resolves outside sandbox"
+                )));
+            }
+        }
+        Ok(joined)
     }
 }
 

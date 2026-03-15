@@ -189,6 +189,17 @@ fn decode_chunked_body(body: &[u8]) -> Result<Vec<u8>, ProviderTurnError> {
 
 /// Spawn curl in streaming mode (`-N`) and deliver each response line
 /// to the callback as it arrives from the server.
+/// Default timeout for curl requests in seconds.
+const CURL_TIMEOUT_SECS: &str = "300";
+
+fn curl_timeout() -> &'static str {
+    // Allow override via environment variable
+    static TIMEOUT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TIMEOUT.get_or_init(|| {
+        std::env::var("ANVIL_CURL_TIMEOUT").unwrap_or_else(|_| CURL_TIMEOUT_SECS.to_string())
+    })
+}
+
 fn curl_stream_lines(
     url: &str,
     body: &[u8],
@@ -197,6 +208,8 @@ fn curl_stream_lines(
 ) -> Result<(), ProviderTurnError> {
     let mut cmd = Command::new("curl");
     cmd.args(["-sS", "-N", "-X", "POST"])
+        .arg("--max-time")
+        .arg(curl_timeout())
         .arg("-H")
         .arg("Content-Type: application/json");
     for (name, value) in extra_headers {
@@ -259,6 +272,8 @@ fn post_json_with_curl(
 ) -> Result<Vec<u8>, ProviderTurnError> {
     let mut cmd = Command::new("curl");
     cmd.args(["-sS", "--http1.1", "-i", "-X", "POST"])
+        .arg("--max-time")
+        .arg(curl_timeout())
         .arg("-H")
         .arg("Content-Type: application/json");
     for (name, value) in extra_headers {
