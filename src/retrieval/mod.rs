@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
+use std::collections::hash_map::DefaultHasher;
 use std::fmt::{Display, Formatter};
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -57,6 +59,8 @@ struct IndexedFileMeta {
 pub struct RepositoryIndex {
     #[serde(default)]
     manifest: Vec<IndexedFileMeta>,
+    #[serde(default)]
+    manifest_hash: u64,
     files: Vec<IndexedFile>,
 }
 
@@ -66,7 +70,12 @@ impl RepositoryIndex {
         let mut manifest = Vec::new();
         collect_files(root, root, &mut files, &mut manifest)?;
         manifest.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-        Ok(Self { manifest, files })
+        let manifest_hash = compute_manifest_hash(&manifest);
+        Ok(Self {
+            manifest,
+            manifest_hash,
+            files,
+        })
     }
 
     pub fn load_or_build(root: &Path, cache_path: &Path) -> Result<Self, RetrievalError> {
@@ -124,7 +133,12 @@ impl RepositoryIndex {
         let mut current = Vec::new();
         collect_manifest(root, root, &mut current)?;
         current.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-        Ok(self.manifest == current)
+        let current_hash = compute_manifest_hash(&current);
+        if current_hash != self.manifest_hash {
+            return Ok(false);
+        }
+        // Hash matched — skip full comparison for speed
+        Ok(true)
     }
 }
 
@@ -297,6 +311,22 @@ fn compact_line(line: &str) -> String {
         let compact: String = trimmed.chars().take(117).collect();
         format!("{compact}...")
     }
+}
+
+fn compute_manifest_hash(manifest: &[IndexedFileMeta]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    manifest.len().hash(&mut hasher);
+    let mut total_size: u64 = 0;
+    let mut max_mtime: u128 = 0;
+    for entry in manifest {
+        total_size += entry.size_bytes;
+        if entry.modified_ms > max_mtime {
+            max_mtime = entry.modified_ms;
+        }
+    }
+    total_size.hash(&mut hasher);
+    max_mtime.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn metadata_for(path: &Path, relative_path: &str) -> Option<IndexedFileMeta> {

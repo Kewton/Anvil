@@ -97,31 +97,45 @@ pub struct ConsoleRenderContext {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppStateSnapshot {
+    /// Current lifecycle state. Set in every state.
     pub state: RuntimeState,
+    /// Most recent event that caused this snapshot. Set in every state.
     #[serde(default)]
     pub last_event: Option<AppEvent>,
+    /// Human-readable status line. Set in every state.
     #[serde(default)]
     pub status: StatusView,
+    /// Active plan items. Used in: Thinking, Working, Done.
     #[serde(default)]
     pub plan: Option<PlanView>,
+    /// LLM reasoning steps. Used in: Thinking.
     #[serde(default)]
     pub reasoning_summary: Vec<String>,
+    /// Pending approval details. Used in: AwaitingApproval.
     #[serde(default)]
     pub approval: Option<ApprovalView>,
+    /// Interrupt details. Used in: Interrupted.
     #[serde(default)]
     pub interrupt: Option<InterruptView>,
+    /// Tool execution log entries. Used in: Working, Done.
     #[serde(default)]
     pub tool_logs: Vec<ToolLogView>,
+    /// Wall-clock milliseconds for the current turn. Used in: Thinking, Working, Done, Interrupted, Error.
     #[serde(default)]
     pub elapsed_ms: Option<u128>,
+    /// Token budget usage. Set in every state.
     #[serde(default)]
     pub context_usage: Option<ContextUsageView>,
+    /// Summary of what was accomplished. Used in: Done.
     #[serde(default)]
     pub completion_summary: Option<String>,
+    /// Session persistence status. Used in: Done, Interrupted.
     #[serde(default)]
     pub saved_status: Option<String>,
+    /// Error description. Used in: Error.
     #[serde(default)]
     pub error_summary: Option<String>,
+    /// Suggested recovery actions. Used in: Error, Interrupted.
     #[serde(default)]
     pub recommended_actions: Vec<String>,
 }
@@ -237,5 +251,33 @@ impl AppStateSnapshot {
         self.error_summary = Some(error_summary.into());
         self.recommended_actions = recommended_actions;
         self
+    }
+}
+
+#[cfg(test)]
+impl AppStateSnapshot {
+    /// Assert that the snapshot has the expected fields populated for its state.
+    pub fn assert_valid_for_state(&self) {
+        match self.state {
+            RuntimeState::AwaitingApproval => {
+                assert!(self.approval.is_some(), "AwaitingApproval must have approval");
+            }
+            RuntimeState::Done => {
+                assert!(
+                    self.completion_summary.is_some(),
+                    "Done must have completion_summary"
+                );
+            }
+            RuntimeState::Error => {
+                assert!(
+                    self.error_summary.is_some(),
+                    "Error must have error_summary"
+                );
+            }
+            RuntimeState::Interrupted => {
+                assert!(self.interrupt.is_some(), "Interrupted must have interrupt");
+            }
+            _ => {}
+        }
     }
 }

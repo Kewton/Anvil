@@ -3,14 +3,16 @@
 /// [`App`] owns the session, state machine, tool registry and config,
 /// coordinating turns between the user, the LLM provider, and the tool
 /// executor.
+pub mod agentic;
 pub mod mock;
+pub mod plan;
 pub mod render;
 
 use crate::agent::BasicAgentLoop;
-use crate::agent::{AgentEvent, AgentRuntime, PendingTurnState, StructuredAssistantResponse};
+use crate::agent::{AgentEvent, AgentRuntime, PendingTurnState};
 use crate::config::EffectiveConfig;
 use crate::contracts::{
-    AppEvent, AppStateSnapshot, ConsoleRenderContext, RuntimeState, ToolLogView,
+    AppEvent, AppStateSnapshot, ConsoleRenderContext, RuntimeState,
 };
 use crate::extensions::{ExtensionLoadError, ExtensionRegistry, SlashCommandAction};
 use crate::provider::{
@@ -23,10 +25,7 @@ use crate::session::{
     new_assistant_message, new_user_message,
 };
 use crate::state::{StateMachine, StateTransition};
-use crate::tooling::{
-    LocalToolExecutor, ToolExecutionError, ToolExecutionPolicy, ToolExecutionResult, ToolRegistry,
-    ToolRuntimeError,
-};
+use crate::tooling::ToolRegistry;
 use crate::spinner::Spinner;
 use crate::tui::Tui;
 use std::fmt::{Display, Formatter};
@@ -328,7 +327,7 @@ impl App {
         }
 
         // Phase 2: Process collected events for state management.
-        match stream_result {
+        let result = match stream_result {
             Ok(()) => {
                 let mut frames = Vec::new();
                 for (index, event) in collected_events.iter().enumerate() {
@@ -411,7 +410,10 @@ impl App {
                     tui,
                 )
             }
-        }
+        };
+
+        self.flush_session()?;
+        result
     }
 
     pub fn approve_and_continue(
@@ -423,7 +425,9 @@ impl App {
 
         self.session.clear_pending_turn();
         self.persist_session(AppEvent::SessionSaved)?;
-        self.execute_runtime_events(&pending_turn.remaining_events, tui)
+        let result = self.execute_runtime_events(&pending_turn.remaining_events, tui);
+        self.flush_session()?;
+        result
     }
 
     pub fn deny_and_abort(&mut self, tui: &Tui) -> Result<Vec<String>, AppError> {
@@ -444,6 +448,7 @@ impl App {
                 self.config.runtime.context_window,
             );
         self.apply_transition(snapshot, StateTransition::ResetToReady)?;
+        self.flush_session()?;
         Ok(vec![self.render_console(tui)?])
     }
 
@@ -488,7 +493,23 @@ impl App {
 
     fn persist_session(&mut self, event: AppEvent) -> Result<(), AppError> {
         self.session.record_event(event);
+        Ok(())
+    }
+
+    /// Flush session to disk if the dirty flag is set.
+    fn flush_session(&mut self) -> Result<(), AppError> {
+        if self.session.dirty {
+            self.session_store.save(&self.session)?;
+            self.session.clear_dirty();
+        }
+        Ok(())
+    }
+
+    /// Immediately persist session to disk (for crash-safety critical paths).
+    fn persist_session_immediate(&mut self, event: AppEvent) -> Result<(), AppError> {
+        self.session.record_event(event);
         self.session_store.save(&self.session)?;
+        self.session.clear_dirty();
         Ok(())
     }
 
@@ -516,237 +537,8 @@ impl App {
             self.clear_pending_turn()?;
         }
 
+        self.flush_session()?;
         Ok(frames)
-    }
-
-    fn handle_structured_done<C: ProviderClient>(
-        &mut self,
-        event: &AgentEvent,
-        tui: &Tui,
-        provider_client: &C,
-    ) -> Result<Option<Vec<String>>, AppError> {
-        let AgentEvent::Done {
-            status,
-            assistant_message,
-            completion_summary: _,
-            saved_status,
-            tool_logs: _,
-            elapsed_ms,
-        } = event
-        else {
-            return Ok(None);
-        };
-
-        let structured = BasicAgentLoop::parse_structured_response(assistant_message)
-            .map_err(AppError::ToolExecution)?;
-        if structured.tool_calls.is_empty() {
-            return Ok(None);
-        }
-
-        Ok(Some(self.complete_structured_response(
-            structured,
-            status,
-            saved_status,
-            *elapsed_ms,
-            tui,
-            provider_client,
-        )?))
-    }
-
-    /// Execute tool calls and feed results back to the LLM in a loop.
-    ///
-    /// This implements the agentic tool-use loop:
-    /// 1. Execute tool calls from the structured response
-    /// 2. Record results (with full payload) into the session
-    /// 3. Send updated session back to the LLM
-    /// 4. If the LLM responds with more tool calls, repeat (up to MAX_AGENT_ITERATIONS)
-    /// 5. When the LLM responds without tool calls, record as final answer
-    fn complete_structured_response<C: ProviderClient>(
-        &mut self,
-        structured: StructuredAssistantResponse,
-        status: &str,
-        saved_status: &str,
-        elapsed_ms: u128,
-        tui: &Tui,
-        provider_client: &C,
-    ) -> Result<Vec<String>, AppError> {
-        const MAX_AGENT_ITERATIONS: usize = 10;
-        let mut current = structured;
-        let mut frames = Vec::new();
-        let mut total_tool_count = 0usize;
-        let mut all_tool_log_views: Vec<ToolLogView> = Vec::new();
-
-        for iteration in 0..MAX_AGENT_ITERATIONS {
-            // Show plan for this iteration
-            let inferred_plan = infer_plan_from_structured_response(&current);
-            let thinking = AppStateSnapshot::new(RuntimeState::Thinking)
-                .with_status(format!(
-                    "Prepared execution plan (iteration {})",
-                    iteration + 1
-                ))
-                .with_plan(inferred_plan, Some(0))
-                .with_reasoning_summary(vec![
-                    "validated structured tool response".to_string(),
-                    "ready to execute tool plan".to_string(),
-                ])
-                .with_context_usage(
-                    self.session.estimated_token_count(),
-                    self.config.runtime.context_window,
-                );
-            // Use ResumeThinking when coming from Working state (iteration > 0)
-            let transition = if self.state_machine.snapshot().state == RuntimeState::Working {
-                StateTransition::ResumeThinking
-            } else {
-                StateTransition::StartThinking
-            };
-            let _ = self.apply_transition(thinking, transition)?;
-            frames.push(self.render_console(tui)?);
-
-            // Execute tool calls and record results WITH payload
-            let results = self.execute_structured_tool_calls(&current)?;
-            total_tool_count += results.len();
-
-            let tool_log_views: Vec<ToolLogView> = results
-                .iter()
-                .map(ToolExecutionResult::to_tool_log_view)
-                .collect();
-            all_tool_log_views.extend(tool_log_views.clone());
-
-            let working = AppStateSnapshot::new(RuntimeState::Working)
-                .with_status(format!(
-                    "Executed {} tool call(s). Sending results to model...",
-                    results.len()
-                ))
-                .with_tool_logs(tool_log_views)
-                .with_elapsed_ms(elapsed_ms)
-                .with_context_usage(
-                    self.session.estimated_token_count(),
-                    self.config.runtime.context_window,
-                );
-            let _ = self.apply_transition(working, StateTransition::StartWorking)?;
-            frames.push(self.render_console(tui)?);
-
-            // Send tool results back to LLM for the next turn
-            let spinner = Spinner::start(format!(
-                "Analyzing results. model={} (iteration {})",
-                self.config.runtime.model,
-                iteration + 2
-            ));
-
-            let request = BasicAgentLoop::build_turn_request(
-                self.config.runtime.model.clone(),
-                &self.session,
-                self.provider.capabilities.streaming && self.config.runtime.stream,
-                self.config.runtime.context_window,
-            );
-
-            let mut next_token_buffer = String::new();
-            let mut first_token = true;
-            let mut spinner_opt = Some(spinner);
-
-            let stream_result =
-                provider_client.stream_turn(&request, &mut |event| {
-                    if let Some(s) = spinner_opt.take() {
-                        s.stop();
-                    }
-                    if let ProviderEvent::TokenDelta(delta) = &event {
-                        next_token_buffer.push_str(delta);
-                        if first_token {
-                            first_token = false;
-                        }
-                        let _ = write!(io::stderr(), "{delta}");
-                        let _ = io::stderr().flush();
-                    }
-                });
-
-            if let Some(s) = spinner_opt.take() {
-                s.stop();
-            }
-            if !first_token {
-                let _ = writeln!(io::stderr());
-            }
-
-            stream_result.map_err(|err| match err {
-                ProviderTurnError::Backend(msg) => {
-                    AppError::ToolExecution(format!("agentic follow-up failed: {msg}"))
-                }
-                ProviderTurnError::Cancelled => AppError::ToolExecution(
-                    "agentic follow-up cancelled".to_string(),
-                ),
-            })?;
-
-            // Parse the follow-up response
-            let next_structured =
-                BasicAgentLoop::parse_structured_response(&next_token_buffer)
-                    .map_err(AppError::ToolExecution)?;
-
-            if next_structured.tool_calls.is_empty() {
-                // No more tool calls — this is the final answer
-                self.record_assistant_output(
-                    self.next_message_id("assistant"),
-                    next_structured.final_response,
-                )?;
-                break;
-            }
-
-            // More tool calls — continue the loop
-            current = next_structured;
-        }
-
-        // Transition to Done
-        let done = AppStateSnapshot::new(RuntimeState::Done)
-            .with_status(status.to_string())
-            .with_tool_logs(all_tool_log_views)
-            .with_completion_summary(
-                format!(
-                    "Executed {} tool call(s) across agentic loop. {}",
-                    total_tool_count, saved_status
-                ),
-                saved_status.to_string(),
-            )
-            .with_elapsed_ms(elapsed_ms)
-            .with_context_usage(
-                self.session.estimated_token_count(),
-                self.config.runtime.context_window,
-            );
-        let _ = self.apply_transition(done, StateTransition::Finish)?;
-        frames.push(self.render_console(tui)?);
-        Ok(frames)
-    }
-
-    fn execute_structured_tool_calls(
-        &mut self,
-        structured: &StructuredAssistantResponse,
-    ) -> Result<Vec<ToolExecutionResult>, AppError> {
-        let executor = LocalToolExecutor::new(self.config.paths.cwd.clone());
-        let mut results = Vec::new();
-        for call in &structured.tool_calls {
-            let validated = self.tools.validate(call.clone()).map_err(|err| {
-                AppError::ToolExecution(format!("tool validation failed: {err:?}"))
-            })?;
-            let request = validated
-                .approve()
-                .into_execution_request(ToolExecutionPolicy {
-                    approval_required: self.config.mode.approval_required,
-                    allow_restricted: false,
-                    plan_mode: false,
-                    plan_scope_granted: true,
-                })
-                .map_err(map_tool_execution_error)?;
-            let result = executor.execute(request).map_err(map_tool_runtime_error)?;
-            // Record tool result WITH actual payload so the LLM can see it
-            self.session.push_message(
-                SessionMessage::new(
-                    MessageRole::Tool,
-                    "tool",
-                    format_tool_result_message(&result),
-                )
-                .with_id(self.next_message_id("tool")),
-            );
-            results.push(result);
-        }
-        self.persist_session(AppEvent::SessionSaved)?;
-        Ok(results)
     }
 
     fn apply_agent_event(&mut self, event: &AgentEvent) -> Result<AppStateSnapshot, AppError> {
@@ -918,7 +710,8 @@ impl App {
         );
         self.session
             .push_provider_error(ProviderErrorRecord { kind, message });
-        self.persist_session(AppEvent::SessionSaved)
+        self.persist_session(AppEvent::SessionSaved)?;
+        self.flush_session()
     }
 
     pub fn has_pending_runtime_events(&self) -> bool {
@@ -965,7 +758,7 @@ impl App {
     fn set_pending_turn(&mut self, pending_turn: PendingTurnState) -> Result<(), AppError> {
         self.pending_turn = Some(pending_turn.clone());
         self.session.set_pending_turn(pending_turn);
-        self.persist_session(AppEvent::SessionSaved)
+        self.persist_session_immediate(AppEvent::SessionSaved)
     }
 
     fn clear_pending_turn(&mut self) -> Result<(), AppError> {
@@ -974,7 +767,7 @@ impl App {
         }
         self.pending_turn = None;
         self.session.clear_pending_turn();
-        self.persist_session(AppEvent::SessionSaved)
+        self.persist_session_immediate(AppEvent::SessionSaved)
     }
 
     fn handle_slash_command(
@@ -1076,78 +869,8 @@ impl App {
             },
         };
 
+        self.flush_session()?;
         Ok(output)
-    }
-
-    fn add_plan_item(&mut self, item: String) -> Result<String, AppError> {
-        let mut items = self
-            .state_machine
-            .snapshot()
-            .plan
-            .as_ref()
-            .map(|plan| plan.items.clone())
-            .unwrap_or_default();
-        items.push(item);
-        let active_index = self
-            .state_machine
-            .snapshot()
-            .plan
-            .as_ref()
-            .and_then(|plan| plan.active_index)
-            .or(Some(0));
-        self.update_plan_snapshot(items, active_index, AppEvent::PlanItemAdded)?;
-        Ok(render::render_plan_frame(self.state_machine.snapshot()))
-    }
-
-    fn focus_plan_item(&mut self, index: usize) -> Result<String, AppError> {
-        let items = self
-            .state_machine
-            .snapshot()
-            .plan
-            .as_ref()
-            .map(|plan| plan.items.clone())
-            .unwrap_or_default();
-        if items.is_empty() {
-            return Ok("[A] anvil > plan\n  no active plan".to_string());
-        }
-        let active_index = Some(index.min(items.len().saturating_sub(1)));
-        self.update_plan_snapshot(items, active_index, AppEvent::PlanFocusChanged)?;
-        Ok(render::render_plan_frame(self.state_machine.snapshot()))
-    }
-
-    fn clear_plan_items(&mut self) -> Result<String, AppError> {
-        self.update_plan_snapshot(Vec::new(), None, AppEvent::PlanCleared)?;
-        Ok(render::render_plan_frame(self.state_machine.snapshot()))
-    }
-
-    fn save_plan_checkpoint(&mut self, note: String) -> Result<String, AppError> {
-        let checkpoint = SessionMessage::new(
-            MessageRole::System,
-            "anvil",
-            format!("[plan checkpoint] {note}"),
-        )
-        .with_id(self.next_message_id("checkpoint"));
-        self.session.push_message(checkpoint);
-        self.persist_session(AppEvent::PlanCheckpointSaved)?;
-        Ok(format!("[A] anvil > checkpoint saved\n  {note}"))
-    }
-
-    fn update_plan_snapshot(
-        &mut self,
-        items: Vec<String>,
-        active_index: Option<usize>,
-        event: AppEvent,
-    ) -> Result<(), AppError> {
-        let mut snapshot = self.state_machine.snapshot().clone();
-        snapshot.plan = if items.is_empty() {
-            None
-        } else {
-            Some(crate::contracts::PlanView { items, active_index })
-        };
-        snapshot.last_event = Some(event);
-        self.state_machine.replace_snapshot(snapshot.clone());
-        self.session.set_last_snapshot(snapshot);
-        self.persist_session(event)
     }
 
     fn repo_find(&mut self, query: &str) -> Result<String, AppError> {
@@ -1186,80 +909,10 @@ impl App {
     }
 }
 
-fn infer_plan_from_structured_response(structured: &StructuredAssistantResponse) -> Vec<String> {
-    let mut plan = vec!["validate requested output scope".to_string()];
-    for call in &structured.tool_calls {
-        let item = match &call.input {
-            crate::tooling::ToolInput::FileWrite { path, .. } => format!("write {path}"),
-            crate::tooling::ToolInput::FileRead { path } => format!("read {path}"),
-            crate::tooling::ToolInput::FileSearch { pattern, .. } => {
-                format!("search for {pattern}")
-            }
-            crate::tooling::ToolInput::ShellExec { command } => {
-                format!("run shell command: {command}")
-            }
-        };
-        plan.push(item);
-    }
-    plan.push("review generated result and summarize".to_string());
-    plan
-}
-
 fn standard_tool_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.register_standard_tools();
     registry
-}
-
-/// Format a tool execution result into a message that the LLM can interpret.
-///
-/// Includes the actual payload (file content, search matches) so the LLM
-/// can reason about the results in subsequent turns.
-fn format_tool_result_message(result: &ToolExecutionResult) -> String {
-    use crate::tooling::ToolExecutionPayload;
-    match &result.payload {
-        ToolExecutionPayload::None => {
-            format!("[tool result: {}] {}", result.tool_name, result.summary)
-        }
-        ToolExecutionPayload::Text(content) => {
-            let truncated = if content.len() > 8000 {
-                format!("{}...\n[truncated, {} bytes total]", &content[..8000], content.len())
-            } else {
-                content.clone()
-            };
-            format!(
-                "[tool result: {}] {}\n{}",
-                result.tool_name, result.summary, truncated
-            )
-        }
-        ToolExecutionPayload::Paths(paths) => {
-            let listing = paths.join("\n");
-            format!(
-                "[tool result: {}] {} — {} match(es)\n{}",
-                result.tool_name,
-                result.summary,
-                paths.len(),
-                listing
-            )
-        }
-    }
-}
-
-fn map_tool_execution_error(error: ToolExecutionError) -> AppError {
-    AppError::ToolExecution(match error {
-        ToolExecutionError::ApprovalRequired(call_id) => {
-            format!("tool approval required for {call_id}")
-        }
-        ToolExecutionError::RestrictedTool(tool) => format!("restricted tool blocked: {tool}"),
-        ToolExecutionError::PlanModeBlocked(tool) => format!("tool blocked in plan mode: {tool}"),
-        ToolExecutionError::PlanModeScopeRequired(tool) => {
-            format!("tool scope required in plan mode: {tool}")
-        }
-    })
-}
-
-fn map_tool_runtime_error(error: ToolRuntimeError) -> AppError {
-    AppError::ToolExecution(error.to_string())
 }
 
 /// Drive the interactive CLI session loop.

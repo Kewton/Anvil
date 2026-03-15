@@ -22,6 +22,7 @@ pub struct RuntimeConfig {
     pub sidecar_model: Option<String>,
     pub api_key: Option<String>,
     pub context_window: u32,
+    pub context_budget: Option<u32>,
     pub stream: bool,
 }
 
@@ -106,6 +107,7 @@ impl EffectiveConfig {
                 sidecar_model: None,
                 api_key: None,
                 context_window: 200_000,
+                context_budget: None,
                 stream: true,
             },
             mode: ModeConfig {
@@ -166,6 +168,7 @@ impl EffectiveConfig {
             "ANVIL_SIDECAR_MODEL",
             "ANVIL_API_KEY",
             "ANVIL_CONTEXT_WINDOW",
+            "ANVIL_CONTEXT_BUDGET",
             "ANVIL_STREAM",
             "ANVIL_INTERACTIVE",
             "ANVIL_APPROVAL_REQUIRED",
@@ -209,6 +212,11 @@ impl EffectiveConfig {
                 "--context-window" => {
                     if let Some(value) = args.next() {
                         map.insert("ANVIL_CONTEXT_WINDOW".to_string(), value);
+                    }
+                }
+                "--context-budget" => {
+                    if let Some(value) = args.next() {
+                        map.insert("ANVIL_CONTEXT_BUDGET".to_string(), value);
                     }
                 }
                 "--no-stream" => {
@@ -262,6 +270,17 @@ impl EffectiveConfig {
                     self.runtime.context_window = value
                         .parse()
                         .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                }
+                "context_budget" | "ANVIL_CONTEXT_BUDGET" => {
+                    self.runtime.context_budget = if value.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            value
+                                .parse()
+                                .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?,
+                        )
+                    };
                 }
                 "stream" | "ANVIL_STREAM" => {
                     self.runtime.stream = parse_bool(value);

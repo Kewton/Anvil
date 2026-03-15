@@ -366,8 +366,14 @@ fn loose_unescape(value: &str) -> String {
 }
 
 fn derive_context_budget(context_window: u32) -> usize {
+    if let Ok(override_val) = std::env::var("ANVIL_CONTEXT_BUDGET")
+        && let Ok(budget) = override_val.parse::<usize>()
+    {
+        return budget;
+    }
     let quarter = (context_window / 4) as usize;
-    quarter.clamp(256, 8_192)
+    let half = (context_window / 2) as usize;
+    quarter.clamp(256, half)
 }
 
 fn estimate_message_tokens(content: &str) -> usize {

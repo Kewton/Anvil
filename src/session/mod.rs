@@ -92,6 +92,10 @@ pub struct SessionRecord {
     pub pending_turn: Option<PendingTurnState>,
     #[serde(default)]
     pub provider_errors: Vec<ProviderErrorRecord>,
+    /// Tracks whether in-memory state has diverged from disk.
+    /// Not serialized — always starts as `false` after deserialization.
+    #[serde(skip)]
+    pub dirty: bool,
 }
 
 impl SessionRecord {
@@ -110,6 +114,7 @@ impl SessionRecord {
             event_log: Vec::new(),
             pending_turn: None,
             provider_errors: Vec::new(),
+            dirty: false,
         }
     }
 
@@ -262,6 +267,7 @@ impl SessionRecord {
     pub fn record_event(&mut self, event: AppEvent) {
         self.session_event = Some(event);
         self.event_log.push(event);
+        self.dirty = true;
     }
 
     pub fn set_pending_turn(&mut self, pending_turn: PendingTurnState) {
@@ -285,6 +291,15 @@ impl SessionRecord {
 
     fn touch(&mut self) {
         self.metadata.updated_at_ms = now_ms();
+        self.dirty = true;
+    }
+
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    pub fn clear_dirty(&mut self) {
+        self.dirty = false;
     }
 }
 

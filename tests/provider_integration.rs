@@ -907,3 +907,307 @@ fn ollama_provider_surfaces_non_success_status_as_backend_error() {
     assert!(err.to_string().contains("request failed"));
     assert!(err.to_string().contains("500"));
 }
+
+// --- Agentic loop unit tests ---
+
+#[test]
+fn agentic_loop_multi_iteration_tool_calls_then_final_answer() {
+    let root = common::unique_test_dir("agentic_multi_iter");
+    let mut config = common::build_config_in(root.clone());
+    config.mode.approval_required = false;
+    let provider_ctx =
+        anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
+    let mut app = anvil::app::App::new(config, provider_ctx).expect("app should initialize");
+    let tui = Tui::new();
+
+    // Create files that the tool calls will read
+    std::fs::create_dir_all(root.join("src")).expect("create src dir");
+    std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"test\"")
+        .expect("write Cargo.toml");
+    std::fs::write(root.join("src/lib.rs"), "// lib").expect("write lib.rs");
+
+    let seen_requests = Rc::new(RefCell::new(Vec::new()));
+
+    struct MultiIterProvider {
+        seen_requests: Rc<RefCell<Vec<ProviderTurnRequest>>>,
+    }
+
+    impl ProviderClient for MultiIterProvider {
+        fn stream_turn(
+            &self,
+            request: &ProviderTurnRequest,
+            emit: &mut dyn FnMut(ProviderEvent),
+        ) -> Result<(), ProviderTurnError> {
+            let call_index = self.seen_requests.borrow().len();
+            self.seen_requests.borrow_mut().push(request.clone());
+
+            match call_index {
+                0 => {
+                    emit(ProviderEvent::Agent(AgentEvent::Done {
+                        status: "Done. session saved".to_string(),
+                        assistant_message: concat!(
+                            "```ANVIL_TOOL\n",
+                            "{\"id\":\"call_001\",\"tool\":\"file.read\",\"path\":\"./Cargo.toml\"}\n",
+                            "```\n",
+                            "```ANVIL_FINAL\n",
+                            "Reading Cargo.toml first.\n",
+                            "```\n"
+                        )
+                        .to_string(),
+                        completion_summary: "turn 1".to_string(),
+                        saved_status: "session saved".to_string(),
+                        tool_logs: Vec::new(),
+                        elapsed_ms: 0,
+                    }));
+                }
+                1 => {
+                    emit(ProviderEvent::TokenDelta(
+                        concat!(
+                            "```ANVIL_TOOL\n",
+                            "{\"id\":\"call_002\",\"tool\":\"file.read\",\"path\":\"./src\"}\n",
+                            "```\n",
+                            "```ANVIL_FINAL\n",
+                            "Now reading src directory.\n",
+                            "```\n"
+                        )
+                        .to_string(),
+                    ));
+                }
+                _ => {
+                    emit(ProviderEvent::TokenDelta(
+                        "All done! Found the files.".to_string(),
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    let provider = MultiIterProvider {
+        seen_requests: seen_requests.clone(),
+    };
+
+    let frames = app
+        .run_live_turn("analyze the project", &provider, &tui)
+        .expect("multi-iteration agentic loop should succeed");
+
+    let requests = seen_requests.borrow();
+    // Should have made 3 calls: initial + 2 follow-ups
+    assert_eq!(requests.len(), 3, "expected 3 provider calls for multi-iteration loop");
+
+    // Final frame should show Done state
+    assert!(
+        frames
+            .last()
+            .expect("done frame should exist")
+            .contains("Executed"),
+        "final frame should contain execution summary"
+    );
+}
+
+#[test]
+fn agentic_loop_tool_result_payload_included_in_session_messages() {
+    let root = common::unique_test_dir("agentic_tool_result");
+    let mut config = common::build_config_in(root.clone());
+    config.mode.approval_required = false;
+    let provider_ctx =
+        anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
+    let mut app = anvil::app::App::new(config, provider_ctx).expect("app should initialize");
+    let tui = Tui::new();
+
+    // Write a test file so file.read has something to return
+    std::fs::create_dir_all(root.join("testdir")).expect("create testdir");
+    std::fs::write(root.join("testdir/hello.txt"), "Hello World content")
+        .expect("write test file");
+
+    let provider = RecordingProvider {
+        seen_requests: Rc::new(RefCell::new(Vec::new())),
+        events: vec![ProviderEvent::Agent(AgentEvent::Done {
+            status: "Done. session saved".to_string(),
+            assistant_message: concat!(
+                "```ANVIL_TOOL\n",
+                "{\"id\":\"call_001\",\"tool\":\"file.read\",\"path\":\"./testdir/hello.txt\"}\n",
+                "```\n",
+                "```ANVIL_FINAL\n",
+                "Read the file.\n",
+                "```\n"
+            )
+            .to_string(),
+            completion_summary: "turn finished".to_string(),
+            saved_status: "session saved".to_string(),
+            tool_logs: Vec::new(),
+            elapsed_ms: 0,
+        })],
+        followup_events: Vec::new(),
+        error: None,
+    };
+
+    app.run_live_turn("read hello.txt", &provider, &tui)
+        .expect("tool result test should succeed");
+
+    // Check that session messages contain the tool result with actual file content
+    let tool_messages: Vec<_> = app
+        .session()
+        .messages
+        .iter()
+        .filter(|m| m.role == anvil::session::MessageRole::Tool)
+        .collect();
+
+    assert!(
+        !tool_messages.is_empty(),
+        "should have at least one tool result message"
+    );
+    assert!(
+        tool_messages[0].content.contains("[tool result: file.read]"),
+        "tool result should include tool name format"
+    );
+    assert!(
+        tool_messages[0].content.contains("Hello World content"),
+        "tool result should include actual file content"
+    );
+}
+
+#[test]
+fn agentic_loop_respects_max_iteration_limit() {
+    let root = common::unique_test_dir("agentic_max_iter");
+    let mut config = common::build_config_in(root.clone());
+    config.mode.approval_required = false;
+    let provider_ctx =
+        anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
+    let mut app = anvil::app::App::new(config, provider_ctx).expect("app should initialize");
+    let tui = Tui::new();
+
+    // Create file so file.read succeeds
+    std::fs::create_dir_all(&root).expect("create root");
+    std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"test\"")
+        .expect("write Cargo.toml");
+
+    struct AlwaysToolCallProvider {
+        call_count: Rc<RefCell<usize>>,
+    }
+
+    impl ProviderClient for AlwaysToolCallProvider {
+        fn stream_turn(
+            &self,
+            _request: &ProviderTurnRequest,
+            emit: &mut dyn FnMut(ProviderEvent),
+        ) -> Result<(), ProviderTurnError> {
+            let count = {
+                let mut c = self.call_count.borrow_mut();
+                *c += 1;
+                *c
+            };
+
+            // Always return a file.read tool call
+            emit(ProviderEvent::Agent(AgentEvent::Done {
+                status: "Done. session saved".to_string(),
+                assistant_message: format!(
+                    concat!(
+                        "```ANVIL_TOOL\n",
+                        "{{\"id\":\"call_{count:03}\",\"tool\":\"file.read\",\"path\":\"./Cargo.toml\"}}\n",
+                        "```\n",
+                        "```ANVIL_FINAL\n",
+                        "Iteration {count}.\n",
+                        "```\n"
+                    ),
+                    count = count
+                ),
+                completion_summary: format!("iteration {count}"),
+                saved_status: "session saved".to_string(),
+                tool_logs: Vec::new(),
+                elapsed_ms: 0,
+            }));
+            Ok(())
+        }
+    }
+
+    let call_count = Rc::new(RefCell::new(0));
+    let provider = AlwaysToolCallProvider {
+        call_count: call_count.clone(),
+    };
+
+    let _frames = app
+        .run_live_turn("infinite loop test", &provider, &tui)
+        .expect("max iteration should complete without error");
+
+    // MAX_AGENT_ITERATIONS is 10, plus the initial call = 11 total
+    let total_calls = *call_count.borrow();
+    assert!(
+        total_calls <= 11,
+        "should not exceed MAX_AGENT_ITERATIONS (10) + 1 initial call, got {total_calls}"
+    );
+}
+
+#[test]
+fn agentic_loop_error_during_followup_propagates() {
+    let root = common::unique_test_dir("agentic_followup_error");
+    let mut config = common::build_config_in(root.clone());
+    config.mode.approval_required = false;
+    let provider_ctx =
+        anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
+    let mut app = anvil::app::App::new(config, provider_ctx).expect("app should initialize");
+    let tui = Tui::new();
+
+    // Create file so file.read succeeds on the first iteration
+    std::fs::create_dir_all(&root).expect("create root");
+    std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"test\"")
+        .expect("write Cargo.toml");
+
+    struct ErrorOnFollowupProvider {
+        call_count: Rc<RefCell<usize>>,
+    }
+
+    impl ProviderClient for ErrorOnFollowupProvider {
+        fn stream_turn(
+            &self,
+            _request: &ProviderTurnRequest,
+            emit: &mut dyn FnMut(ProviderEvent),
+        ) -> Result<(), ProviderTurnError> {
+            let count = {
+                let mut c = self.call_count.borrow_mut();
+                let v = *c;
+                *c += 1;
+                v
+            };
+
+            if count == 0 {
+                emit(ProviderEvent::Agent(AgentEvent::Done {
+                    status: "Done. session saved".to_string(),
+                    assistant_message: concat!(
+                        "```ANVIL_TOOL\n",
+                        "{\"id\":\"call_001\",\"tool\":\"file.read\",\"path\":\"./Cargo.toml\"}\n",
+                        "```\n",
+                        "```ANVIL_FINAL\n",
+                        "Reading Cargo.toml.\n",
+                        "```\n"
+                    )
+                    .to_string(),
+                    completion_summary: "turn 1".to_string(),
+                    saved_status: "session saved".to_string(),
+                    tool_logs: Vec::new(),
+                    elapsed_ms: 0,
+                }));
+                Ok(())
+            } else {
+                Err(ProviderTurnError::Backend(
+                    "connection reset during follow-up".to_string(),
+                ))
+            }
+        }
+    }
+
+    let provider = ErrorOnFollowupProvider {
+        call_count: Rc::new(RefCell::new(0)),
+    };
+    let result = app.run_live_turn("trigger followup error", &provider, &tui);
+
+    assert!(
+        result.is_err(),
+        "error during agentic follow-up should propagate"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("agentic follow-up failed"),
+        "error message should indicate agentic follow-up failure, got: {err_msg}"
+    );
+}
