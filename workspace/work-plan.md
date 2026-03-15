@@ -122,14 +122,14 @@
 
 ## Phase 11: Maturity and Daily-Driver Improvements
 
-- [ ] Add execution checkpoints for planning and reviewable runs
+- [x] Add execution checkpoints for planning and reviewable runs
 - [ ] Add tool-batch review before mutating execution
-- [ ] Strengthen typed planner event coverage
+- [x] Strengthen typed planner event coverage
 - [ ] Add semantic or symbol-aware retrieval ranking
-- [ ] Connect retrieval to provider context handoff
+- [x] Connect retrieval to provider context handoff
 - [ ] Improve large-repo navigation flows
 - [ ] Add multi-provider configuration UX
-- [ ] Improve remote-compatible backend diagnostics
+- [x] Improve remote-compatible backend diagnostics
 - [ ] Strengthen structured tool-response parity across backends
 - [ ] Add live tool-progress updates for longer-running tools
 - [ ] Add diff-oriented completion summaries

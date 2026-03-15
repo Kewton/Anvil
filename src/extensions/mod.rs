@@ -11,10 +11,12 @@ pub enum SlashCommandAction {
     PlanAdd(String),
     PlanFocus(usize),
     PlanClear,
+    Checkpoint(String),
     RepoFind(String),
     Timeline,
     Compact,
     Model,
+    Provider,
     Approve,
     Deny,
     Reset,
@@ -155,6 +157,11 @@ pub fn builtin_slash_commands() -> Vec<SlashCommandSpec> {
             action: SlashCommandAction::PlanClear,
         },
         SlashCommandSpec {
+            name: "/checkpoint".to_string(),
+            description: "save a planning checkpoint note".to_string(),
+            action: SlashCommandAction::Checkpoint(String::new()),
+        },
+        SlashCommandSpec {
             name: "/repo-find".to_string(),
             description: "search the repo by path and content".to_string(),
             action: SlashCommandAction::RepoFind(String::new()),
@@ -173,6 +180,11 @@ pub fn builtin_slash_commands() -> Vec<SlashCommandSpec> {
             name: "/model".to_string(),
             description: "show the current model context".to_string(),
             action: SlashCommandAction::Model,
+        },
+        SlashCommandSpec {
+            name: "/provider".to_string(),
+            description: "show provider backend and capability diagnostics".to_string(),
+            action: SlashCommandAction::Provider,
         },
         SlashCommandSpec {
             name: "/approve".to_string(),
@@ -242,6 +254,18 @@ fn parse_plan_command(command: &str) -> Option<SlashCommandSpec> {
             name: "/plan-clear".to_string(),
             description: "clear the current plan".to_string(),
             action: SlashCommandAction::PlanClear,
+        });
+    }
+
+    if let Some(rest) = command.strip_prefix("/checkpoint ") {
+        let note = rest.trim();
+        if note.is_empty() {
+            return None;
+        }
+        return Some(SlashCommandSpec {
+            name: "/checkpoint".to_string(),
+            description: "save a planning checkpoint note".to_string(),
+            action: SlashCommandAction::Checkpoint(note.to_string()),
         });
     }
 

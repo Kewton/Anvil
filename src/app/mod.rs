@@ -867,6 +867,10 @@ impl App {
                 frames: vec![self.clear_plan_items()?],
                 control: SessionControl::Continue,
             },
+            Some(SlashCommandAction::Checkpoint(note)) => CliTurnOutput {
+                frames: vec![self.save_plan_checkpoint(note)?],
+                control: SessionControl::Continue,
+            },
             Some(SlashCommandAction::RepoFind(query)) => CliTurnOutput {
                 frames: vec![self.repo_find(&query)?],
                 control: SessionControl::Continue,
@@ -881,6 +885,10 @@ impl App {
             },
             Some(SlashCommandAction::Model) => CliTurnOutput {
                 frames: vec![render::render_model_frame(&self.config)],
+                control: SessionControl::Continue,
+            },
+            Some(SlashCommandAction::Provider) => CliTurnOutput {
+                frames: vec![render::render_provider_frame(&self.config, &self.provider)],
                 control: SessionControl::Continue,
             },
             Some(SlashCommandAction::Approve) => CliTurnOutput {
@@ -967,6 +975,18 @@ impl App {
         Ok(render::render_plan_frame(self.state_machine.snapshot()))
     }
 
+    fn save_plan_checkpoint(&mut self, note: String) -> Result<String, AppError> {
+        let checkpoint = SessionMessage::new(
+            MessageRole::System,
+            "anvil",
+            format!("[plan checkpoint] {note}"),
+        )
+        .with_id(self.next_message_id("checkpoint"));
+        self.session.push_message(checkpoint);
+        self.persist_session(AppEvent::PlanCheckpointSaved)?;
+        Ok(format!("[A] anvil > checkpoint saved\n  {note}"))
+    }
+
     fn update_plan_snapshot(
         &mut self,
         items: Vec<String>,
@@ -986,11 +1006,28 @@ impl App {
         self.persist_session(AppEvent::SessionSaved)
     }
 
-    fn repo_find(&self, query: &str) -> Result<String, AppError> {
+    fn repo_find(&mut self, query: &str) -> Result<String, AppError> {
         let cache_path = default_cache_path(&self.config.paths.state_dir);
         let index = RepositoryIndex::load_or_build(&self.config.paths.cwd, &cache_path)
             .map_err(|err| AppError::ToolExecution(err.to_string()))?;
         let result = index.search(query, 5);
+        if !result.matches.is_empty() {
+            let summary = result
+                .matches
+                .iter()
+                .map(|item| format!("{} (score {})", item.path, item.score))
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.session.push_message(
+                SessionMessage::new(
+                    MessageRole::System,
+                    "anvil",
+                    format!("[retrieval context] query={query}; matches={summary}"),
+                )
+                .with_id(self.next_message_id("retrieval")),
+            );
+            self.persist_session(AppEvent::SessionSaved)?;
+        }
         Ok(render_retrieval_result(&result))
     }
 

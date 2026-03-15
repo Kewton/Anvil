@@ -67,9 +67,15 @@ fn slash_commands_support_help_status_reset_and_exit() {
     let compact = app
         .handle_cli_line("/compact", &provider, &tui)
         .expect("compact should render");
+    let checkpoint = app
+        .handle_cli_line("/checkpoint lock current plan", &provider, &tui)
+        .expect("checkpoint should render");
     let model = app
         .handle_cli_line("/model", &provider, &tui)
         .expect("model should render");
+    let provider_status = app
+        .handle_cli_line("/provider", &provider, &tui)
+        .expect("provider should render");
     let reset = app
         .handle_cli_line("/reset", &provider, &tui)
         .expect("reset should render");
@@ -135,11 +141,25 @@ fn slash_commands_support_help_status_reset_and_exit() {
             .contains("nothing to compact")
     );
     assert!(
+        checkpoint
+            .frames
+            .last()
+            .expect("checkpoint frame")
+            .contains("checkpoint saved")
+    );
+    assert!(
         model
             .frames
             .last()
             .expect("model frame")
             .contains("current model: local-default")
+    );
+    assert!(
+        provider_status
+            .frames
+            .last()
+            .expect("provider frame")
+            .contains("provider: ollama")
     );
     assert_eq!(app.state_machine().snapshot().state, RuntimeState::Ready);
     assert!(
@@ -412,6 +432,8 @@ fn help_frame_is_built_from_registered_slash_commands() {
     assert!(help.contains("/repo-find"));
     assert!(help.contains("/timeline"));
     assert!(help.contains("/compact"));
+    assert!(help.contains("/checkpoint"));
+    assert!(help.contains("/provider"));
     assert!(commands.iter().any(|spec| spec.name == "/plan"));
     assert!(commands.iter().any(|spec| spec.name == "/model"));
 }
@@ -534,4 +556,43 @@ fn compact_command_summarizes_older_messages() {
     let frame = timeline.frames.last().expect("timeline frame");
     assert!(frame.contains("SessionCompacted"));
     assert!(app.session().messages[0].content.contains("[compacted session summary]"));
+}
+
+#[test]
+fn repo_find_adds_retrieval_context_to_following_provider_turn() {
+    let root = common::unique_test_dir("repo_find_context");
+    fs::create_dir_all(root.join("src")).expect("src dir");
+    fs::write(
+        root.join("src/provider_notes.rs"),
+        "pub fn provider_notes() { println!(\"provider diagnostics\"); }\n",
+    )
+    .expect("write file");
+
+    let mut app = common::build_app_in(root);
+    let tui = Tui::new();
+    let seen_requests = Rc::new(RefCell::new(Vec::new()));
+    let provider = RecordingProvider {
+        seen_requests: seen_requests.clone(),
+        events: vec![ProviderEvent::Agent(AgentEvent::Done {
+            status: "Done. session saved".to_string(),
+            assistant_message: "provider-backed answer".to_string(),
+            completion_summary: "Completed the requested task.".to_string(),
+            saved_status: "session saved".to_string(),
+            tool_logs: Vec::new(),
+            elapsed_ms: 120,
+        })],
+    };
+
+    let _ = app
+        .handle_cli_line("/repo-find provider_notes", &provider, &tui)
+        .expect("repo find should work");
+    let _ = app
+        .handle_cli_line("summarize provider notes", &provider, &tui)
+        .expect("follow-up should run");
+
+    let borrowed = seen_requests.borrow();
+    let request = borrowed.last().expect("request should exist");
+    assert!(request.messages.iter().any(|message| {
+        message.content.contains("[retrieval context]") && message.content.contains("src/provider_notes.rs")
+    }));
 }

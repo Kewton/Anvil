@@ -11,11 +11,16 @@ agent for repeated real-world use.
   - execution checkpoints
   - tool-batch review before mutating runs
   - stronger typed planner events instead of ad-hoc snapshot updates
+  - current slice:
+    - `/checkpoint <note>`
+    - `PlanCheckpointSaved` event recording
 
 - Retrieval quality
   - semantic or symbol-aware ranking
   - retrieval-aware context handoff into provider requests
   - better large-repo navigation and narrowing flows
+  - current slice:
+    - `/repo-find` writes retrieval context back into session history for the next live turn
 
 ## Priority 2
 
@@ -23,6 +28,8 @@ agent for repeated real-world use.
   - multi-provider configuration UX
   - clearer diagnostics for remote-compatible backends
   - stronger parity for structured tool-response handling across backends
+  - current slice:
+    - `/provider` shows backend, URL, model, and capability diagnostics
 
 - Operator UX polish
   - live tool-progress updates for longer tool runs

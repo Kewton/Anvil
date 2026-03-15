@@ -61,6 +61,20 @@ pub fn render_model_frame(config: &EffectiveConfig) -> String {
     )
 }
 
+pub fn render_provider_frame(
+    config: &EffectiveConfig,
+    provider: &crate::provider::ProviderRuntimeContext,
+) -> String {
+    format!(
+        "[A] anvil > provider: {}\n  url: {}\n  model: {}\n  streaming: {}\n  tool-calling: {}",
+        config.runtime.provider,
+        config.runtime.provider_url,
+        config.runtime.model,
+        provider.capabilities.streaming,
+        provider.capabilities.tool_calling
+    )
+}
+
 pub fn render_resume_header(config: &EffectiveConfig) -> String {
     [
         "  --------------------------------------------------------------".to_string(),
