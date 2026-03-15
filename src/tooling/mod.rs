@@ -457,36 +457,91 @@ impl LocalToolExecutor {
                 })
             }
             ToolInput::ShellExec { command } => {
-                let output = std::process::Command::new("sh")
+                use std::io::Read as _;
+
+                let timeout_secs: u64 = std::env::var("ANVIL_SHELL_TIMEOUT")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(30);
+
+                let mut child = std::process::Command::new("sh")
                     .arg("-c")
                     .arg(&command)
                     .current_dir(&self.root)
-                    .output()
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
                     .map_err(|err| {
                         ToolRuntimeError::Io(format!(
                             "shell.exec failed to spawn: {err}"
                         ))
                     })?;
-                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                let combined = if stderr.is_empty() {
-                    stdout
-                } else if stdout.is_empty() {
-                    stderr
-                } else {
-                    format!("{stdout}\n--- stderr ---\n{stderr}")
+
+                let deadline = std::time::Instant::now()
+                    + std::time::Duration::from_secs(timeout_secs);
+
+                // Poll for completion with timeout
+                let timed_out = loop {
+                    match child.try_wait() {
+                        Ok(Some(_)) => break false,
+                        Ok(None) => {
+                            if std::time::Instant::now() >= deadline {
+                                let _ = child.kill();
+                                let _ = child.wait();
+                                break true;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        }
+                        Err(_) => break false,
+                    }
                 };
-                let status = if output.status.success() {
+
+                let mut stdout_buf = String::new();
+                let mut stderr_buf = String::new();
+                if let Some(mut out) = child.stdout.take() {
+                    let _ = out.read_to_string(&mut stdout_buf);
+                }
+                if let Some(mut err) = child.stderr.take() {
+                    let _ = err.read_to_string(&mut stderr_buf);
+                }
+
+                let combined = if timed_out {
+                    let partial = if !stdout_buf.is_empty() {
+                        format!("{stdout_buf}\n")
+                    } else {
+                        String::new()
+                    };
+                    format!(
+                        "{partial}[shell.exec timed out after {timeout_secs}s — \
+                         use background execution for long-running commands, \
+                         e.g. 'npm run dev &']"
+                    )
+                } else if stderr_buf.is_empty() {
+                    stdout_buf
+                } else if stdout_buf.is_empty() {
+                    stderr_buf
+                } else {
+                    format!("{stdout_buf}\n--- stderr ---\n{stderr_buf}")
+                };
+
+                let exit_status = child.wait().ok();
+                let success = !timed_out
+                    && exit_status.is_some_and(|s| s.success());
+                let status = if success {
                     ToolExecutionStatus::Completed
                 } else {
                     ToolExecutionStatus::Failed
                 };
-                let summary = if output.status.success() {
+                let summary = if timed_out {
+                    format!("shell.exec timed out ({timeout_secs}s): {command}")
+                } else if success {
                     format!("shell.exec completed: {command}")
                 } else {
                     format!(
                         "shell.exec failed (exit {}): {command}",
-                        output.status.code().unwrap_or(-1)
+                        exit_status
+                            .and_then(|s| s.code())
+                            .unwrap_or(-1)
                     )
                 };
                 Ok(ToolExecutionResult {

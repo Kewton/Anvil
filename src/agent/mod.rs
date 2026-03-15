@@ -442,7 +442,9 @@ fn tool_protocol_system_prompt() -> &'static str {
         "- Always include ANVIL_FINAL after your tool blocks.\n",
         "- If no file operations are needed, just respond normally without tool blocks.\n",
         "- Start exploration with file.read on \".\" to list the project root before reading specific files.\n",
-        "- Do not assume files like README.md exist — verify first."
+        "- Do not assume files like README.md exist — verify first.\n",
+        "- shell.exec has a 30-second timeout. For long-running processes (servers, watch modes), use background execution: e.g. 'npm run dev &' or 'nohup ... &'.\n",
+        "- Never run commands that block indefinitely (npm run dev, cargo watch, etc.) without '&'."
     )
 }
 
