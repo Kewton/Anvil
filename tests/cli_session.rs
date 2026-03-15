@@ -49,6 +49,15 @@ fn slash_commands_support_help_status_reset_and_exit() {
     let plan = app
         .handle_cli_line("/plan", &provider, &tui)
         .expect("plan should render");
+    let plan_add = app
+        .handle_cli_line("/plan-add inspect repo layout", &provider, &tui)
+        .expect("plan add should render");
+    let plan_focus = app
+        .handle_cli_line("/plan-focus 1", &provider, &tui)
+        .expect("plan focus should render");
+    let plan_clear = app
+        .handle_cli_line("/plan-clear", &provider, &tui)
+        .expect("plan clear should render");
     let model = app
         .handle_cli_line("/model", &provider, &tui)
         .expect("model should render");
@@ -73,6 +82,27 @@ fn slash_commands_support_help_status_reset_and_exit() {
             .last()
             .expect("plan frame")
             .contains("[A] anvil > plan")
+    );
+    assert!(
+        plan_add
+            .frames
+            .last()
+            .expect("plan add frame")
+            .contains("inspect repo layout")
+    );
+    assert!(
+        plan_focus
+            .frames
+            .last()
+            .expect("plan focus frame")
+            .contains("* 1. inspect repo layout")
+    );
+    assert!(
+        plan_clear
+            .frames
+            .last()
+            .expect("plan clear frame")
+            .contains("no active plan")
     );
     assert!(
         model
@@ -346,6 +376,9 @@ fn help_frame_is_built_from_registered_slash_commands() {
     assert!(help.contains("continue the pending approved tool call"));
     assert!(help.contains("/exit"));
     assert!(help.contains("exit the session"));
+    assert!(help.contains("/plan-add"));
+    assert!(help.contains("/plan-focus"));
+    assert!(help.contains("/plan-clear"));
     assert!(commands.iter().any(|spec| spec.name == "/plan"));
     assert!(commands.iter().any(|spec| spec.name == "/model"));
 }

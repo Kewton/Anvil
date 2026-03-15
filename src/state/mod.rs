@@ -57,6 +57,10 @@ impl StateMachine {
         &self.snapshot
     }
 
+    pub fn replace_snapshot(&mut self, snapshot: AppStateSnapshot) {
+        self.snapshot = snapshot;
+    }
+
     pub fn transition_to(
         &mut self,
         snapshot: AppStateSnapshot,

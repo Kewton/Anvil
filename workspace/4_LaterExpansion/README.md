@@ -11,5 +11,8 @@ Current focus:
 - additional local model backends
 - advanced UX improvements that preserve console clarity
 
-The first completed slice in this phase is custom slash command extensions via
-project-local `.anvil/slash-commands.json`.
+Completed slices in this phase:
+
+- custom slash command extensions via project-local `.anvil/slash-commands.json`
+- richer plan editing commands for the operator console
+- OpenAI-compatible backend support alongside Ollama

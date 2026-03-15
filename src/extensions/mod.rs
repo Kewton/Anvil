@@ -8,6 +8,9 @@ pub enum SlashCommandAction {
     Help,
     Status,
     Plan,
+    PlanAdd(String),
+    PlanFocus(usize),
+    PlanClear,
     Model,
     Approve,
     Deny,
@@ -103,6 +106,9 @@ impl ExtensionRegistry {
     }
 
     pub fn find_slash_command(&self, command: &str) -> Option<SlashCommandSpec> {
+        if let Some(parsed) = parse_plan_command(command) {
+            return Some(parsed);
+        }
         self.commands
             .iter()
             .find(|spec| spec.name == command || (spec.name == "/exit" && command == "/quit"))
@@ -126,6 +132,21 @@ pub fn builtin_slash_commands() -> Vec<SlashCommandSpec> {
             name: "/plan".to_string(),
             description: "show the current plan and active step".to_string(),
             action: SlashCommandAction::Plan,
+        },
+        SlashCommandSpec {
+            name: "/plan-add".to_string(),
+            description: "append a new item to the current plan".to_string(),
+            action: SlashCommandAction::PlanAdd(String::new()),
+        },
+        SlashCommandSpec {
+            name: "/plan-focus".to_string(),
+            description: "set the active plan step by 1-based index".to_string(),
+            action: SlashCommandAction::PlanFocus(0),
+        },
+        SlashCommandSpec {
+            name: "/plan-clear".to_string(),
+            description: "clear the current plan".to_string(),
+            action: SlashCommandAction::PlanClear,
         },
         SlashCommandSpec {
             name: "/model".to_string(),
@@ -168,4 +189,40 @@ fn normalize_command_name(name: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+fn parse_plan_command(command: &str) -> Option<SlashCommandSpec> {
+    if let Some(rest) = command.strip_prefix("/plan-add ") {
+        let item = rest.trim();
+        if item.is_empty() {
+            return None;
+        }
+        return Some(SlashCommandSpec {
+            name: "/plan-add".to_string(),
+            description: "append a new item to the current plan".to_string(),
+            action: SlashCommandAction::PlanAdd(item.to_string()),
+        });
+    }
+
+    if let Some(rest) = command.strip_prefix("/plan-focus ") {
+        let one_based = rest.trim().parse::<usize>().ok()?;
+        if one_based == 0 {
+            return None;
+        }
+        return Some(SlashCommandSpec {
+            name: "/plan-focus".to_string(),
+            description: "set the active plan step by 1-based index".to_string(),
+            action: SlashCommandAction::PlanFocus(one_based - 1),
+        });
+    }
+
+    if command == "/plan-clear" {
+        return Some(SlashCommandSpec {
+            name: "/plan-clear".to_string(),
+            description: "clear the current plan".to_string(),
+            action: SlashCommandAction::PlanClear,
+        });
+    }
+
+    None
 }

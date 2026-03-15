@@ -854,6 +854,18 @@ impl App {
                 frames: vec![render::render_plan_frame(self.state_machine.snapshot())],
                 control: SessionControl::Continue,
             },
+            Some(SlashCommandAction::PlanAdd(item)) => CliTurnOutput {
+                frames: vec![self.add_plan_item(item)?],
+                control: SessionControl::Continue,
+            },
+            Some(SlashCommandAction::PlanFocus(index)) => CliTurnOutput {
+                frames: vec![self.focus_plan_item(index)?],
+                control: SessionControl::Continue,
+            },
+            Some(SlashCommandAction::PlanClear) => CliTurnOutput {
+                frames: vec![self.clear_plan_items()?],
+                control: SessionControl::Continue,
+            },
             Some(SlashCommandAction::Model) => CliTurnOutput {
                 frames: vec![render::render_model_frame(&self.config)],
                 control: SessionControl::Continue,
@@ -899,6 +911,64 @@ impl App {
         };
 
         Ok(output)
+    }
+
+    fn add_plan_item(&mut self, item: String) -> Result<String, AppError> {
+        let mut items = self
+            .state_machine
+            .snapshot()
+            .plan
+            .as_ref()
+            .map(|plan| plan.items.clone())
+            .unwrap_or_default();
+        items.push(item);
+        let active_index = self
+            .state_machine
+            .snapshot()
+            .plan
+            .as_ref()
+            .and_then(|plan| plan.active_index)
+            .or(Some(0));
+        self.update_plan_snapshot(items, active_index)?;
+        Ok(render::render_plan_frame(self.state_machine.snapshot()))
+    }
+
+    fn focus_plan_item(&mut self, index: usize) -> Result<String, AppError> {
+        let items = self
+            .state_machine
+            .snapshot()
+            .plan
+            .as_ref()
+            .map(|plan| plan.items.clone())
+            .unwrap_or_default();
+        if items.is_empty() {
+            return Ok("[A] anvil > plan\n  no active plan".to_string());
+        }
+        let active_index = Some(index.min(items.len().saturating_sub(1)));
+        self.update_plan_snapshot(items, active_index)?;
+        Ok(render::render_plan_frame(self.state_machine.snapshot()))
+    }
+
+    fn clear_plan_items(&mut self) -> Result<String, AppError> {
+        self.update_plan_snapshot(Vec::new(), None)?;
+        Ok(render::render_plan_frame(self.state_machine.snapshot()))
+    }
+
+    fn update_plan_snapshot(
+        &mut self,
+        items: Vec<String>,
+        active_index: Option<usize>,
+    ) -> Result<(), AppError> {
+        let mut snapshot = self.state_machine.snapshot().clone();
+        snapshot.plan = if items.is_empty() {
+            None
+        } else {
+            Some(crate::contracts::PlanView { items, active_index })
+        };
+        snapshot.last_event = Some(AppEvent::StateChanged);
+        self.state_machine.replace_snapshot(snapshot.clone());
+        self.session.set_last_snapshot(snapshot);
+        self.persist_session(AppEvent::SessionSaved)
     }
 }
 

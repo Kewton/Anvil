@@ -107,7 +107,7 @@
 ## Phase 10: Later Expansion
 
 - [x] Add custom slash command extensions
-- [ ] Add richer planning and execution flows
+- [x] Add richer planning and execution flows
 - [ ] Add improved large-repo retrieval
-- [ ] Add additional local model backends if needed
+- [x] Add additional local model backends if needed
 - [ ] Add more advanced UX features without breaking core clarity

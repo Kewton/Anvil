@@ -321,6 +321,50 @@ fn ollama_provider_builds_chat_request_shape() {
 }
 
 #[test]
+fn openai_compatible_provider_maps_response_into_done_event() {
+    let request = ProviderTurnRequest::new(
+        "local-openai".to_string(),
+        vec![anvil::provider::ProviderMessage::new(
+            ProviderMessageRole::User,
+            "inspect src/provider",
+        )],
+        true,
+    );
+
+    let seen_urls = Rc::new(RefCell::new(Vec::new()));
+    let transport = MockHttpTransport {
+        seen_urls: seen_urls.clone(),
+        seen_bodies: Rc::new(RefCell::new(Vec::new())),
+        response: HttpResponse {
+            status_code: 200,
+            body: br#"{"choices":[{"message":{"role":"assistant","content":"openai-compatible answer"}}]}"#
+                .to_vec(),
+        },
+    };
+    let client =
+        anvil::provider::openai::OpenAiCompatibleProviderClient::with_transport(
+            "http://localhost:1234",
+            transport,
+        );
+
+    let mut events = Vec::new();
+    client
+        .stream_turn(&request, &mut |event| events.push(event))
+        .expect("openai-compatible turn should succeed");
+
+    assert_eq!(
+        seen_urls.borrow()[0],
+        "http://localhost:1234/v1/chat/completions"
+    );
+    assert!(events.iter().any(
+        |event| matches!(event, ProviderEvent::TokenDelta(delta) if delta == "openai-compatible answer")
+    ));
+    assert!(events.iter().any(
+        |event| matches!(event, ProviderEvent::Agent(AgentEvent::Done { assistant_message, .. }) if assistant_message == "openai-compatible answer")
+    ));
+}
+
+#[test]
 fn basic_agent_loop_applies_context_shaping_limit() {
     let mut app = common::build_app();
     app.record_user_input("msg_001", "u1").expect("persist");
