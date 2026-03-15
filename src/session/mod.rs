@@ -141,9 +141,7 @@ impl SessionRecord {
     /// Run auto-compaction if message count exceeds the threshold.
     /// Called at turn boundaries (before flush) to avoid per-message overhead.
     pub fn compact_if_needed(&mut self) -> bool {
-        if self.auto_compact_threshold > 0
-            && self.messages.len() > self.auto_compact_threshold
-        {
+        if self.auto_compact_threshold > 0 && self.messages.len() > self.auto_compact_threshold {
             self.compact_history(self.auto_compact_threshold / 2)
         } else {
             false
@@ -190,7 +188,11 @@ impl SessionRecord {
         {
             lines.push("  plan :".to_string());
             for (index, item) in plan.items.iter().enumerate() {
-                let marker = if plan.active_index == Some(index) { "*" } else { "-" };
+                let marker = if plan.active_index == Some(index) {
+                    "*"
+                } else {
+                    "-"
+                };
                 lines.push(format!("    {marker} {}. {}", index + 1, item));
             }
         }

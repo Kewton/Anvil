@@ -12,9 +12,7 @@ pub mod render;
 use crate::agent::BasicAgentLoop;
 use crate::agent::{AgentEvent, AgentRuntime, PendingTurnState};
 use crate::config::EffectiveConfig;
-use crate::contracts::{
-    AppEvent, AppStateSnapshot, ConsoleRenderContext, RuntimeState,
-};
+use crate::contracts::{AppEvent, AppStateSnapshot, ConsoleRenderContext, RuntimeState};
 use crate::extensions::{ExtensionLoadError, ExtensionRegistry, SlashCommandAction};
 use crate::provider::{
     ProviderBootstrapError, ProviderClient, ProviderErrorKind, ProviderErrorRecord, ProviderEvent,
@@ -25,9 +23,9 @@ use crate::session::{
     MessageRole, MessageStatus, SessionError, SessionMessage, SessionRecord, SessionStore,
     new_assistant_message, new_user_message,
 };
+use crate::spinner::Spinner;
 use crate::state::{StateMachine, StateTransition};
 use crate::tooling::ToolRegistry;
-use crate::spinner::Spinner;
 use crate::tui::Tui;
 use std::fmt::{Display, Formatter};
 use std::io::{self, Write};
@@ -385,10 +383,7 @@ impl App {
                         status: "Interrupted safely".to_string(),
                         interrupted_what: "provider turn".to_string(),
                         saved_status: "session preserved".to_string(),
-                        next_actions: vec![
-                            "resume work".to_string(),
-                            "inspect status".to_string(),
-                        ],
+                        next_actions: vec!["resume work".to_string(), "inspect status".to_string()],
                         elapsed_ms: 0,
                     }],
                     tui,
@@ -776,7 +771,9 @@ impl App {
             .map(|spec| spec.action)
         {
             Some(SlashCommandAction::Help) => CliTurnOutput {
-                frames: vec![render::render_help_frame_for(self.extensions.slash_commands())],
+                frames: vec![render::render_help_frame_for(
+                    self.extensions.slash_commands(),
+                )],
                 control: SessionControl::Continue,
             },
             Some(SlashCommandAction::Status) => CliTurnOutput {
@@ -842,19 +839,21 @@ impl App {
                 frames: vec!["Exiting Anvil.".to_string()],
                 control: SessionControl::Exit,
             },
-            Some(SlashCommandAction::Prompt(prompt)) => match self.run_live_turn(prompt, provider_client, tui) {
-                Ok(frames) => CliTurnOutput {
-                    frames,
-                    control: SessionControl::Continue,
-                },
-                Err(AppError::PendingApprovalRequired) => CliTurnOutput {
-                    frames: vec![render::render_pending_approval_frame(
-                        self.state_machine.snapshot(),
-                    )],
-                    control: SessionControl::Continue,
-                },
-                Err(err) => return Err(err),
-            },
+            Some(SlashCommandAction::Prompt(prompt)) => {
+                match self.run_live_turn(prompt, provider_client, tui) {
+                    Ok(frames) => CliTurnOutput {
+                        frames,
+                        control: SessionControl::Continue,
+                    },
+                    Err(AppError::PendingApprovalRequired) => CliTurnOutput {
+                        frames: vec![render::render_pending_approval_frame(
+                            self.state_machine.snapshot(),
+                        )],
+                        control: SessionControl::Continue,
+                    },
+                    Err(err) => return Err(err),
+                }
+            }
             _ => {
                 let suggestion = self.extensions.suggest_command(command);
                 let msg = if let Some(suggested) = suggestion {
@@ -862,9 +861,7 @@ impl App {
                         "Unknown command: {command}\nDid you mean: {suggested}?\nTry /help for available commands."
                     )
                 } else {
-                    format!(
-                        "Unknown command: {command}\nTry /help for available commands."
-                    )
+                    format!("Unknown command: {command}\nTry /help for available commands.")
                 };
                 CliTurnOutput {
                     frames: vec![msg],
@@ -920,7 +917,8 @@ pub fn error_guidance(err: &AppError) -> String {
             "Hint: check your config file at .anvil/config\n",
             "  Valid keys: provider, model, provider_url, context_window, stream\n",
             "  Environment variables also accepted (e.g. ANVIL_MODEL, ANVIL_PROVIDER_URL)"
-        ).to_string(),
+        )
+        .to_string(),
         AppError::ProviderBootstrap(bootstrap_err) => {
             let detail = bootstrap_err.to_string();
             if detail.contains("ollama") || detail.contains("unsupported") {
@@ -929,31 +927,36 @@ pub fn error_guidance(err: &AppError) -> String {
                     "  - Is Ollama running? Try: ollama serve\n",
                     "  - Check URL: --provider-url http://127.0.0.1:11434\n",
                     "  - List models: ollama list"
-                ).to_string()
+                )
+                .to_string()
             } else {
                 concat!(
                     "Hint: provider could not be reached\n",
                     "  - For Ollama: ensure `ollama serve` is running\n",
                     "  - For OpenAI-compatible: --provider openai --provider-url <url>\n",
                     "  - Set API key with ANVIL_API_KEY if required"
-                ).to_string()
+                )
+                .to_string()
             }
         }
         AppError::Session(_) => concat!(
             "Hint: session file may be corrupted or inaccessible\n",
             "  - Try --fresh-session to start a new session\n",
             "  - Check file permissions in .anvil/sessions/"
-        ).to_string(),
+        )
+        .to_string(),
         AppError::Extension(_) => concat!(
             "Hint: failed to load custom slash commands\n",
             "  - Check .anvil/slash-commands.json for valid JSON\n",
             "  - Each entry needs: name, description, prompt"
-        ).to_string(),
+        )
+        .to_string(),
         AppError::ProviderTurn(turn_err) => {
             let detail = turn_err.to_string();
             if detail.contains("timeout") || detail.contains("max-time") {
                 "Hint: the request timed out\n  - Increase timeout: ANVIL_CURL_TIMEOUT=600\n  - Check if the model is responding: ollama ps".to_string()
-            } else if detail.contains("401") || detail.contains("403") || detail.contains("api key") {
+            } else if detail.contains("401") || detail.contains("403") || detail.contains("api key")
+            {
                 "Hint: authentication failed\n  - Set your API key: ANVIL_API_KEY=<key>\n  - Check the key format (some providers require 'Bearer ' prefix)".to_string()
             } else {
                 "Hint: the provider turn failed\n  - Check if the model is available: ollama list\n  - Network issues may cause transient failures — try again".to_string()

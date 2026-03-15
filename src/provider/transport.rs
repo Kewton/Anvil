@@ -151,9 +151,8 @@ fn decode_chunked_body(body: &[u8]) -> Result<Vec<u8>, ProviderTurnError> {
     let mut cursor = 0usize;
 
     while cursor < body.len() {
-        let line_end = find_crlf(body, cursor).ok_or_else(|| {
-            ProviderTurnError::Backend("invalid chunked response".to_string())
-        })?;
+        let line_end = find_crlf(body, cursor)
+            .ok_or_else(|| ProviderTurnError::Backend("invalid chunked response".to_string()))?;
         let size_text = String::from_utf8_lossy(&body[cursor..line_end]);
         let size = usize::from_str_radix(size_text.trim(), 16).map_err(|_| {
             ProviderTurnError::Backend("invalid chunk size in response".to_string())
@@ -164,9 +163,9 @@ fn decode_chunked_body(body: &[u8]) -> Result<Vec<u8>, ProviderTurnError> {
             break;
         }
 
-        let chunk_end = cursor.checked_add(size).ok_or_else(|| {
-            ProviderTurnError::Backend("overflow in chunk size".to_string())
-        })?;
+        let chunk_end = cursor
+            .checked_add(size)
+            .ok_or_else(|| ProviderTurnError::Backend("overflow in chunk size".to_string()))?;
         if chunk_end > body.len() {
             return Err(ProviderTurnError::Backend(
                 "truncated chunked response".to_string(),
@@ -246,9 +245,9 @@ fn curl_stream_lines(
         }
     }
 
-    let status = child.wait().map_err(|err| {
-        ProviderTurnError::Backend(format!("curl process error: {err}"))
-    })?;
+    let status = child
+        .wait()
+        .map_err(|err| ProviderTurnError::Backend(format!("curl process error: {err}")))?;
     if !status.success() {
         return Err(ProviderTurnError::Backend(
             "curl streaming request failed".to_string(),
@@ -288,24 +287,20 @@ fn post_json_with_curl(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|err| {
-            ProviderTurnError::Backend(format!("failed to spawn curl: {err}"))
-        })?;
+        .map_err(|err| ProviderTurnError::Backend(format!("failed to spawn curl: {err}")))?;
 
     child
         .stdin
         .as_mut()
-        .ok_or_else(|| {
-            ProviderTurnError::Backend("failed to open curl stdin".to_string())
-        })?
+        .ok_or_else(|| ProviderTurnError::Backend("failed to open curl stdin".to_string()))?
         .write_all(body)
         .map_err(|err| {
             ProviderTurnError::Backend(format!("failed to write to curl stdin: {err}"))
         })?;
 
-    let output = child.wait_with_output().map_err(|err| {
-        ProviderTurnError::Backend(format!("failed to read curl output: {err}"))
-    })?;
+    let output = child
+        .wait_with_output()
+        .map_err(|err| ProviderTurnError::Backend(format!("failed to read curl output: {err}")))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

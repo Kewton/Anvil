@@ -459,10 +459,7 @@ impl LocalToolExecutor {
             ToolInput::ShellExec { command } => {
                 use std::io::{BufRead, Write as _};
 
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "\n  $ {command}"
-                );
+                let _ = writeln!(std::io::stderr(), "\n  $ {command}");
 
                 let mut child = std::process::Command::new("sh")
                     .arg("-c")
@@ -472,9 +469,7 @@ impl LocalToolExecutor {
                     .stderr(std::process::Stdio::piped())
                     .spawn()
                     .map_err(|err| {
-                        ToolRuntimeError::Io(format!(
-                            "shell.exec failed to spawn: {err}"
-                        ))
+                        ToolRuntimeError::Io(format!("shell.exec failed to spawn: {err}"))
                     })?;
 
                 // Stream stdout to stderr in real-time so the user can
@@ -533,9 +528,7 @@ impl LocalToolExecutor {
                 } else {
                     format!(
                         "shell.exec failed (exit {}): {command}",
-                        exit_status
-                            .and_then(|s| s.code())
-                            .unwrap_or(-1)
+                        exit_status.and_then(|s| s.code()).unwrap_or(-1)
                     )
                 };
                 Ok(ToolExecutionResult {
@@ -674,10 +667,19 @@ fn validate_shell_command_safety(command: &str) -> Result<(), ToolValidationErro
     const BLOCKED: &[(&str, &str)] = &[
         ("rm -rf /", "recursive deletion of root filesystem"),
         ("rm -rf ~", "recursive deletion of home directory"),
-        ("mkfs", "filesystem formatting — destroys all data on device"),
-        ("dd if=", "raw disk write — can overwrite partitions or boot sectors"),
+        (
+            "mkfs",
+            "filesystem formatting — destroys all data on device",
+        ),
+        (
+            "dd if=",
+            "raw disk write — can overwrite partitions or boot sectors",
+        ),
         (":(){", "fork bomb — exhausts system process table"),
-        (">(", "process substitution — can be used for command injection"),
+        (
+            ">(",
+            "process substitution — can be used for command injection",
+        ),
     ];
 
     let lower = command.to_ascii_lowercase();
@@ -738,7 +740,10 @@ fn collect_search_matches(
 
         // Skip common non-project directories
         if path.is_dir() {
-            if matches!(name_str.as_ref(), ".git" | "target" | ".anvil" | "node_modules" | ".DS_Store") {
+            if matches!(
+                name_str.as_ref(),
+                ".git" | "target" | ".anvil" | "node_modules" | ".DS_Store"
+            ) {
                 continue;
             }
             collect_search_matches(&path, pattern, matches)?;
@@ -771,9 +776,28 @@ fn collect_search_matches(
 fn is_searchable_file(path: &Path) -> bool {
     !matches!(
         path.extension().and_then(|ext| ext.to_str()),
-        Some("png" | "jpg" | "jpeg" | "gif" | "pdf" | "zip" | "gz" | "tar"
-            | "wasm" | "ico" | "exe" | "dll" | "so" | "dylib" | "o" | "a"
-            | "class" | "pyc" | "pyo" | "lock")
+        Some(
+            "png"
+                | "jpg"
+                | "jpeg"
+                | "gif"
+                | "pdf"
+                | "zip"
+                | "gz"
+                | "tar"
+                | "wasm"
+                | "ico"
+                | "exe"
+                | "dll"
+                | "so"
+                | "dylib"
+                | "o"
+                | "a"
+                | "class"
+                | "pyc"
+                | "pyo"
+                | "lock"
+        )
     )
 }
 

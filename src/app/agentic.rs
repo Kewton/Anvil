@@ -101,63 +101,56 @@ impl App {
             let mut first_token = true;
             let mut spinner_opt = Some(spinner);
 
-            let stream_result =
-                provider_client.stream_turn(&request, &mut |event| {
-                    if let Some(s) = spinner_opt.take() {
-                        s.stop();
+            let stream_result = provider_client.stream_turn(&request, &mut |event| {
+                if let Some(s) = spinner_opt.take() {
+                    s.stop();
+                }
+                if let ProviderEvent::TokenDelta(delta) = &event {
+                    next_token_buffer.push_str(delta);
+                    if first_token {
+                        first_token = false;
                     }
-                    if let ProviderEvent::TokenDelta(delta) = &event {
-                        next_token_buffer.push_str(delta);
-                        if first_token {
-                            first_token = false;
-                        }
-                        let _ = std::io::Write::write_fmt(
-                            &mut std::io::stderr(),
-                            format_args!("{delta}"),
-                        );
-                        let _ = std::io::Write::flush(&mut std::io::stderr());
-                    }
-                });
+                    let _ =
+                        std::io::Write::write_fmt(&mut std::io::stderr(), format_args!("{delta}"));
+                    let _ = std::io::Write::flush(&mut std::io::stderr());
+                }
+            });
 
             if let Some(s) = spinner_opt.take() {
                 s.stop();
             }
             if !first_token {
-                let _ = std::io::Write::write_fmt(
-                    &mut std::io::stderr(),
-                    format_args!("\n"),
-                );
+                let _ = std::io::Write::write_fmt(&mut std::io::stderr(), format_args!("\n"));
             }
 
             stream_result.map_err(|err| match err {
                 crate::provider::ProviderTurnError::Backend(msg) => {
                     AppError::ToolExecution(format!("agentic follow-up failed: {msg}"))
                 }
-                crate::provider::ProviderTurnError::Cancelled => AppError::ToolExecution(
-                    "agentic follow-up cancelled".to_string(),
-                ),
+                crate::provider::ProviderTurnError::Cancelled => {
+                    AppError::ToolExecution("agentic follow-up cancelled".to_string())
+                }
             })?;
 
             // Parse the follow-up response (retry once on parse failure)
-            let next_structured = match BasicAgentLoop::parse_structured_response(
-                &next_token_buffer,
-            ) {
-                Ok(parsed) => parsed,
-                Err(first_err) => {
-                    // LLMs occasionally produce malformed output; treat the
-                    // raw text as a plain final answer rather than failing the
-                    // entire turn.
-                    let trimmed = next_token_buffer.trim();
-                    if !trimmed.is_empty() {
-                        StructuredAssistantResponse {
-                            tool_calls: Vec::new(),
-                            final_response: trimmed.to_string(),
+            let next_structured =
+                match BasicAgentLoop::parse_structured_response(&next_token_buffer) {
+                    Ok(parsed) => parsed,
+                    Err(first_err) => {
+                        // LLMs occasionally produce malformed output; treat the
+                        // raw text as a plain final answer rather than failing the
+                        // entire turn.
+                        let trimmed = next_token_buffer.trim();
+                        if !trimmed.is_empty() {
+                            StructuredAssistantResponse {
+                                tool_calls: Vec::new(),
+                                final_response: trimmed.to_string(),
+                            }
+                        } else {
+                            return Err(AppError::ToolExecution(first_err));
                         }
-                    } else {
-                        return Err(AppError::ToolExecution(first_err));
                     }
-                }
-            };
+                };
 
             if next_structured.tool_calls.is_empty() {
                 // No more tool calls — this is the final answer
@@ -224,9 +217,7 @@ impl App {
                 }
             };
             // Check if this tool needs approval in the current mode
-            if self.config.mode.approval_required
-                && validated.approval_required(true).is_some()
-            {
+            if self.config.mode.approval_required && validated.approval_required(true).is_some() {
                 let summary = match &call.input {
                     crate::tooling::ToolInput::ShellExec { command } => {
                         format!("{}: {command}", call.tool_name)
@@ -263,12 +254,14 @@ impl App {
                     continue;
                 }
             }
-            let request = match validated.approve().into_execution_request(ToolExecutionPolicy {
-                approval_required: false,
-                allow_restricted: true,
-                plan_mode: false,
-                plan_scope_granted: true,
-            }) {
+            let request = match validated
+                .approve()
+                .into_execution_request(ToolExecutionPolicy {
+                    approval_required: false,
+                    allow_restricted: true,
+                    plan_mode: false,
+                    plan_scope_granted: true,
+                }) {
                 Ok(r) => r,
                 Err(err) => {
                     let error_result = ToolExecutionResult {
@@ -382,10 +375,7 @@ pub(crate) fn infer_plan_from_structured_response(
 ///
 /// Includes the actual payload (file content, search matches) so the LLM
 /// can reason about the results in subsequent turns.
-pub(crate) fn format_tool_result_message(
-    result: &ToolExecutionResult,
-    max_chars: usize,
-) -> String {
+pub(crate) fn format_tool_result_message(result: &ToolExecutionResult, max_chars: usize) -> String {
     match &result.payload {
         ToolExecutionPayload::None => {
             format!("[tool result: {}] {}", result.tool_name, result.summary)
@@ -432,4 +422,3 @@ fn prompt_inline_approval(summary: &str) -> bool {
         false
     }
 }
-

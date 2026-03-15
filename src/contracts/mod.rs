@@ -260,7 +260,10 @@ impl AppStateSnapshot {
     pub fn assert_valid_for_state(&self) {
         match self.state {
             RuntimeState::AwaitingApproval => {
-                assert!(self.approval.is_some(), "AwaitingApproval must have approval");
+                assert!(
+                    self.approval.is_some(),
+                    "AwaitingApproval must have approval"
+                );
             }
             RuntimeState::Done => {
                 assert!(

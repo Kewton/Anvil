@@ -70,7 +70,10 @@ impl App {
         snapshot.plan = if items.is_empty() {
             None
         } else {
-            Some(crate::contracts::PlanView { items, active_index })
+            Some(crate::contracts::PlanView {
+                items,
+                active_index,
+            })
         };
         snapshot.last_event = Some(event);
         self.state_machine.replace_snapshot(snapshot.clone());

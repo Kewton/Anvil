@@ -535,7 +535,8 @@ fn custom_slash_commands_load_from_extension_file_and_run_live_turn() {
         seen_requests.borrow()[0]
             .messages
             .iter()
-            .any(|message| message.content == "Create the requested invader prototype in the sandbox.")
+            .any(|message| message.content
+                == "Create the requested invader prototype in the sandbox.")
     );
 }
 
@@ -595,7 +596,11 @@ fn compact_command_summarizes_older_messages() {
     );
     let frame = timeline.frames.last().expect("timeline frame");
     assert!(frame.contains("SessionCompacted"));
-    assert!(app.session().messages[0].content.contains("[compacted session summary]"));
+    assert!(
+        app.session().messages[0]
+            .content
+            .contains("[compacted session summary]")
+    );
 }
 
 #[test]
@@ -633,6 +638,7 @@ fn repo_find_adds_retrieval_context_to_following_provider_turn() {
     let borrowed = seen_requests.borrow();
     let request = borrowed.last().expect("request should exist");
     assert!(request.messages.iter().any(|message| {
-        message.content.contains("[retrieval context]") && message.content.contains("src/provider_notes.rs")
+        message.content.contains("[retrieval context]")
+            && message.content.contains("src/provider_notes.rs")
     }));
 }

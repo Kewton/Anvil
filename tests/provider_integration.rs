@@ -36,11 +36,7 @@ struct MockHttpTransport {
 }
 
 impl HttpTransport for MockHttpTransport {
-    fn post_json(
-        &self,
-        url: &str,
-        body: &[u8],
-    ) -> Result<HttpResponse, ProviderTurnError> {
+    fn post_json(&self, url: &str, body: &[u8]) -> Result<HttpResponse, ProviderTurnError> {
         self.seen_urls.borrow_mut().push(url.to_string());
         self.seen_bodies.borrow_mut().push(body.to_vec());
         Ok(self.response.clone())
@@ -198,12 +194,12 @@ fn live_turn_executes_structured_file_write_response_without_approval() {
             .iter()
             .any(|frame| frame.contains("[T] tool  > file.write"))
     );
-    assert!(frames.iter().any(|frame| frame.contains("[A] anvil > plan")));
     assert!(
         frames
             .iter()
-            .any(|frame| frame.contains("working on 1/"))
+            .any(|frame| frame.contains("[A] anvil > plan"))
     );
+    assert!(frames.iter().any(|frame| frame.contains("working on 1/")));
     // The agentic loop feeds tool results back to the LLM.  The final
     // answer comes from the follow-up turn (not the original ANVIL_FINAL).
     assert!(
@@ -418,11 +414,10 @@ fn openai_compatible_provider_maps_response_into_done_event() {
                 .to_vec(),
         },
     };
-    let client =
-        anvil::provider::openai::OpenAiCompatibleProviderClient::with_transport(
-            "http://localhost:1234",
-            transport,
-        );
+    let client = anvil::provider::openai::OpenAiCompatibleProviderClient::with_transport(
+        "http://localhost:1234",
+        transport,
+    );
 
     let mut events = Vec::new();
     client
@@ -467,20 +462,21 @@ fn openai_compatible_provider_parses_sse_streams() {
             .to_vec(),
         },
     };
-    let client =
-        anvil::provider::openai::OpenAiCompatibleProviderClient::with_transport(
-            "http://localhost:1234",
-            transport,
-        );
+    let client = anvil::provider::openai::OpenAiCompatibleProviderClient::with_transport(
+        "http://localhost:1234",
+        transport,
+    );
 
     let mut events = Vec::new();
     client
         .stream_turn(&request, &mut |event| events.push(event))
         .expect("openai-compatible stream should succeed");
 
-    assert!(events.iter().any(
-        |event| matches!(event, ProviderEvent::TokenDelta(delta) if delta == "draft ")
-    ));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, ProviderEvent::TokenDelta(delta) if delta == "draft "))
+    );
     assert!(events.iter().any(
         |event| matches!(event, ProviderEvent::Agent(AgentEvent::Done { assistant_message, .. }) if assistant_message == "draft answer")
     ));
@@ -506,11 +502,10 @@ fn openai_compatible_provider_normalizes_error_message() {
             body: br#"{"error":{"message":"invalid api key"}}"#.to_vec(),
         },
     };
-    let client =
-        anvil::provider::openai::OpenAiCompatibleProviderClient::with_transport(
-            "http://localhost:1234",
-            transport,
-        );
+    let client = anvil::provider::openai::OpenAiCompatibleProviderClient::with_transport(
+        "http://localhost:1234",
+        transport,
+    );
 
     let err = client
         .stream_turn(&request, &mut |_| {})
@@ -550,9 +545,11 @@ fn openai_compatible_provider_forwards_authorization_header() {
         .expect("authorized request should succeed");
 
     let recorded = seen_headers.borrow();
-    assert!(recorded[0]
-        .iter()
-        .any(|(name, value)| name == "Authorization" && value == "Bearer test-key"));
+    assert!(
+        recorded[0]
+            .iter()
+            .any(|(name, value)| name == "Authorization" && value == "Bearer test-key")
+    );
 }
 
 #[test]
@@ -585,10 +582,14 @@ fn live_turn_executes_structured_response_from_openai_compatible_provider() {
         .run_live_turn("build via openai-compatible provider", &client, &tui)
         .expect("structured response should execute");
 
-    let written = fs::read_to_string(root.join("sandbox/openai/index.html"))
-        .expect("file should be written");
+    let written =
+        fs::read_to_string(root.join("sandbox/openai/index.html")).expect("file should be written");
     assert!(written.contains("openai parity"));
-    assert!(frames.iter().any(|frame| frame.contains("file.write completed ./sandbox/openai/index.html")));
+    assert!(
+        frames
+            .iter()
+            .any(|frame| frame.contains("file.write completed ./sandbox/openai/index.html"))
+    );
 }
 
 #[test]
@@ -993,7 +994,11 @@ fn agentic_loop_multi_iteration_tool_calls_then_final_answer() {
 
     let requests = seen_requests.borrow();
     // Should have made 3 calls: initial + 2 follow-ups
-    assert_eq!(requests.len(), 3, "expected 3 provider calls for multi-iteration loop");
+    assert_eq!(
+        requests.len(),
+        3,
+        "expected 3 provider calls for multi-iteration loop"
+    );
 
     // Final frame should show Done state
     assert!(
@@ -1017,8 +1022,7 @@ fn agentic_loop_tool_result_payload_included_in_session_messages() {
 
     // Write a test file so file.read has something to return
     std::fs::create_dir_all(root.join("testdir")).expect("create testdir");
-    std::fs::write(root.join("testdir/hello.txt"), "Hello World content")
-        .expect("write test file");
+    std::fs::write(root.join("testdir/hello.txt"), "Hello World content").expect("write test file");
 
     let provider = RecordingProvider {
         seen_requests: Rc::new(RefCell::new(Vec::new())),
@@ -1058,7 +1062,9 @@ fn agentic_loop_tool_result_payload_included_in_session_messages() {
         "should have at least one tool result message"
     );
     assert!(
-        tool_messages[0].content.contains("[tool result: file.read]"),
+        tool_messages[0]
+            .content
+            .contains("[tool result: file.read]"),
         "tool result should include tool name format"
     );
     assert!(

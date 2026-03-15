@@ -4,9 +4,7 @@
 //! OpenAI, Azure OpenAI, LM Studio, and other compatible servers.
 
 use super::transport::{CurlHttpTransport, HttpTransport};
-use super::{
-    AgentEvent, ProviderClient, ProviderEvent, ProviderTurnError, ProviderTurnRequest,
-};
+use super::{AgentEvent, ProviderClient, ProviderEvent, ProviderTurnError, ProviderTurnRequest};
 use crate::config::EffectiveConfig;
 use serde::{Deserialize, Serialize};
 
@@ -236,11 +234,8 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
         let mut emitted_done = false;
         let mut had_error: Option<ProviderTurnError> = None;
 
-        self.transport.stream_lines(
-            &url,
-            &request_body,
-            &headers,
-            &mut |line| {
+        self.transport
+            .stream_lines(&url, &request_body, &headers, &mut |line| {
                 if had_error.is_some() || emitted_done {
                     return;
                 }
@@ -316,8 +311,7 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
                         )));
                     }
                 }
-            },
-        )?;
+            })?;
 
         if let Some(err) = had_error {
             return Err(err);
@@ -351,8 +345,9 @@ fn parse_openai_sse_response(body: &[u8]) -> Result<Vec<ProviderEvent>, Provider
             break;
         }
 
-        let chunk: OpenAiStreamChunk = serde_json::from_str(payload)
-            .map_err(|err| ProviderTurnError::Backend(format!("invalid openai stream chunk: {err}")))?;
+        let chunk: OpenAiStreamChunk = serde_json::from_str(payload).map_err(|err| {
+            ProviderTurnError::Backend(format!("invalid openai stream chunk: {err}"))
+        })?;
 
         for choice in chunk.choices {
             if let Some(delta) = choice.delta.content {
@@ -372,7 +367,10 @@ fn parse_openai_sse_response(body: &[u8]) -> Result<Vec<ProviderEvent>, Provider
         }
     }
 
-    if events.iter().all(|event| !matches!(event, ProviderEvent::Agent(AgentEvent::Done { .. }))) {
+    if events
+        .iter()
+        .all(|event| !matches!(event, ProviderEvent::Agent(AgentEvent::Done { .. })))
+    {
         events.push(ProviderEvent::Agent(AgentEvent::Done {
             status: "Done. session saved".to_string(),
             assistant_message: content.clone(),

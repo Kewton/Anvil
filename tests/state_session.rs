@@ -188,7 +188,10 @@ fn session_normalization_adds_synthetic_entry_when_no_partial_message_exists() {
 #[test]
 fn compact_history_keeps_recent_messages_and_mentions_file_targets() {
     let mut session = SessionRecord::new(PathBuf::from("/tmp/anvil-session-compact"));
-    session.push_message(new_user_message("msg_001", "inspect src/provider/openai.rs"));
+    session.push_message(new_user_message(
+        "msg_001",
+        "inspect src/provider/openai.rs",
+    ));
     session.push_message(
         anvil::session::SessionMessage::new(
             anvil::session::MessageRole::Tool,
@@ -212,8 +215,16 @@ fn compact_history_keeps_recent_messages_and_mentions_file_targets() {
     let changed = session.compact_history(8);
 
     assert!(changed);
-    assert!(session.messages[0].content.contains("[compacted session summary]"));
-    assert!(session.messages[0].content.contains("./sandbox/demo/Invader.html"));
+    assert!(
+        session.messages[0]
+            .content
+            .contains("[compacted session summary]")
+    );
+    assert!(
+        session.messages[0]
+            .content
+            .contains("./sandbox/demo/Invader.html")
+    );
     assert!(session.event_log.contains(&AppEvent::SessionCompacted));
 }
 
@@ -224,7 +235,10 @@ fn state_machine_rejects_invalid_transition_from_ready_to_working() {
         AppStateSnapshot::new(RuntimeState::Working),
         StateTransition::StartWorking,
     );
-    assert!(result.is_err(), "Ready -> Working should be invalid (must go through Thinking)");
+    assert!(
+        result.is_err(),
+        "Ready -> Working should be invalid (must go through Thinking)"
+    );
     let err = result.unwrap_err();
     assert_eq!(err.from, RuntimeState::Ready);
     assert_eq!(err.to, RuntimeState::Working);
@@ -235,65 +249,87 @@ fn state_machine_allows_full_happy_path_cycle() {
     let mut machine = StateMachine::new();
 
     // Ready -> Thinking
-    machine.transition_to(
-        AppStateSnapshot::new(RuntimeState::Thinking),
-        StateTransition::StartThinking,
-    ).expect("Ready -> Thinking");
+    machine
+        .transition_to(
+            AppStateSnapshot::new(RuntimeState::Thinking),
+            StateTransition::StartThinking,
+        )
+        .expect("Ready -> Thinking");
 
     // Thinking -> Working
-    machine.transition_to(
-        AppStateSnapshot::new(RuntimeState::Working),
-        StateTransition::StartWorking,
-    ).expect("Thinking -> Working");
+    machine
+        .transition_to(
+            AppStateSnapshot::new(RuntimeState::Working),
+            StateTransition::StartWorking,
+        )
+        .expect("Thinking -> Working");
 
     // Working -> Thinking (resume)
-    machine.transition_to(
-        AppStateSnapshot::new(RuntimeState::Thinking),
-        StateTransition::ResumeThinking,
-    ).expect("Working -> Thinking (resume)");
+    machine
+        .transition_to(
+            AppStateSnapshot::new(RuntimeState::Thinking),
+            StateTransition::ResumeThinking,
+        )
+        .expect("Working -> Thinking (resume)");
 
     // Thinking -> Done
-    machine.transition_to(
-        AppStateSnapshot::new(RuntimeState::Done),
-        StateTransition::Finish,
-    ).expect("Thinking -> Done");
+    machine
+        .transition_to(
+            AppStateSnapshot::new(RuntimeState::Done),
+            StateTransition::Finish,
+        )
+        .expect("Thinking -> Done");
 
     // Done -> Ready (reset)
-    machine.transition_to(
-        AppStateSnapshot::new(RuntimeState::Ready),
-        StateTransition::ResetToReady,
-    ).expect("Done -> Ready (reset)");
+    machine
+        .transition_to(
+            AppStateSnapshot::new(RuntimeState::Ready),
+            StateTransition::ResetToReady,
+        )
+        .expect("Done -> Ready (reset)");
 }
 
 #[test]
 fn state_machine_allows_error_recovery() {
     let mut machine = StateMachine::new();
 
-    machine.transition_to(
-        AppStateSnapshot::new(RuntimeState::Thinking),
-        StateTransition::StartThinking,
-    ).expect("Ready -> Thinking");
+    machine
+        .transition_to(
+            AppStateSnapshot::new(RuntimeState::Thinking),
+            StateTransition::StartThinking,
+        )
+        .expect("Ready -> Thinking");
 
-    machine.transition_to(
-        AppStateSnapshot::new(RuntimeState::Error),
-        StateTransition::Fail,
-    ).expect("Thinking -> Error");
+    machine
+        .transition_to(
+            AppStateSnapshot::new(RuntimeState::Error),
+            StateTransition::Fail,
+        )
+        .expect("Thinking -> Error");
 
     // Error -> Thinking (retry)
-    machine.transition_to(
-        AppStateSnapshot::new(RuntimeState::Thinking),
-        StateTransition::StartThinking,
-    ).expect("Error -> Thinking (retry)");
+    machine
+        .transition_to(
+            AppStateSnapshot::new(RuntimeState::Thinking),
+            StateTransition::StartThinking,
+        )
+        .expect("Error -> Thinking (retry)");
 }
 
 #[test]
 fn state_machine_allows_reset_from_all_terminal_states() {
-    for from_state in [RuntimeState::Done, RuntimeState::Error, RuntimeState::Interrupted] {
+    for from_state in [
+        RuntimeState::Done,
+        RuntimeState::Error,
+        RuntimeState::Interrupted,
+    ] {
         let mut machine = StateMachine::from_snapshot(AppStateSnapshot::new(from_state));
-        machine.transition_to(
-            AppStateSnapshot::new(RuntimeState::Ready),
-            StateTransition::ResetToReady,
-        ).unwrap_or_else(|_| panic!("Reset from {from_state:?} should be valid"));
+        machine
+            .transition_to(
+                AppStateSnapshot::new(RuntimeState::Ready),
+                StateTransition::ResetToReady,
+            )
+            .unwrap_or_else(|_| panic!("Reset from {from_state:?} should be valid"));
     }
 }
 

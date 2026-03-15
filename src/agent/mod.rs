@@ -234,8 +234,9 @@ impl BasicAgentLoop {
 fn parse_tool_call_block(block: &str) -> Result<ToolCallRequest, String> {
     match serde_json::from_str::<Value>(block) {
         Ok(value) => parse_tool_call_value(&value),
-        Err(err) => repair_tool_call_block(block)
-            .ok_or_else(|| format!("invalid ANVIL_TOOL JSON: {err}")),
+        Err(err) => {
+            repair_tool_call_block(block).ok_or_else(|| format!("invalid ANVIL_TOOL JSON: {err}"))
+        }
     }
 }
 
@@ -302,8 +303,8 @@ fn parse_tool_call_value(value: &Value) -> Result<ToolCallRequest, String> {
 
 fn repair_tool_call_block(block: &str) -> Option<ToolCallRequest> {
     let tool_name = extract_simple_string_field(block, "tool")?;
-    let tool_call_id =
-        extract_simple_string_field(block, "id").unwrap_or_else(|| "call_generated_001".to_string());
+    let tool_call_id = extract_simple_string_field(block, "id")
+        .unwrap_or_else(|| "call_generated_001".to_string());
 
     let input = match tool_name.as_str() {
         "file.write" => ToolInput::FileWrite {
