@@ -1,5 +1,38 @@
-/target
+# Rust / Cargo
+/target/
+**/*.rs.bk
+*.pdb
+
+# macOS
 .DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Anvil runtime data
 .anvil/
+
+# Sandbox (LLMが生成したテストファイル)
 sandbox/
+
+# Workspace artifacts
 workspace/*.json
+
+# Development reports (Issue開発の中間成果物)
+dev-reports/
+
+# Claude Code
+.claude/settings.local.json
+
+# Editor
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+*.iml
+
+# Environment
+.env
+.env.local
+.env.*.local
