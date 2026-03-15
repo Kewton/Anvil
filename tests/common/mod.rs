@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use anvil::app::App;
 use anvil::config::EffectiveConfig;
 use anvil::provider::ProviderRuntimeContext;
