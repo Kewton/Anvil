@@ -27,6 +27,7 @@ use crate::tooling::{
     LocalToolExecutor, ToolExecutionError, ToolExecutionPolicy, ToolExecutionResult, ToolRegistry,
     ToolRuntimeError,
 };
+use crate::spinner::Spinner;
 use crate::tui::Tui;
 use std::fmt::{Display, Formatter};
 use std::io::{self, BufRead, Write};
@@ -286,12 +287,51 @@ impl App {
             self.config.runtime.context_window,
         );
 
-        match BasicAgentLoop::run_turn(provider_client, &request) {
-            Ok(provider_events) => {
+        // Phase 1: Collect events from provider with spinner + streaming output.
+        let mut spinner_opt = Some(Spinner::start(format!(
+            "Thinking. model={}",
+            self.config.runtime.model
+        )));
+
+        let mut token_buffer = String::new();
+        let mut collected_events: Vec<ProviderEvent> = Vec::new();
+        let mut first_token = true;
+
+        let stream_result = provider_client.stream_turn(&request, &mut |event| {
+            // Stop spinner completely before any output (joins the thread)
+            if let Some(s) = spinner_opt.take() {
+                s.stop();
+            }
+
+            match &event {
+                ProviderEvent::TokenDelta(delta) => {
+                    token_buffer.push_str(delta);
+                    if first_token {
+                        first_token = false;
+                    }
+                    let _ = write!(io::stderr(), "{delta}");
+                    let _ = io::stderr().flush();
+                }
+                ProviderEvent::Agent(_) => {}
+            }
+            collected_events.push(event);
+        });
+
+        // Ensure spinner is stopped if no events arrived
+        if let Some(s) = spinner_opt.take() {
+            s.stop();
+        }
+
+        // End streaming output with newline
+        if !first_token {
+            let _ = writeln!(io::stderr());
+        }
+
+        // Phase 2: Process collected events for state management.
+        match stream_result {
+            Ok(()) => {
                 let mut frames = Vec::new();
-                let mut token_buffer = String::new();
-                let mut last_rendered_len = 0usize;
-                for (index, event) in provider_events.iter().enumerate() {
+                for (index, event) in collected_events.iter().enumerate() {
                     match event {
                         ProviderEvent::Agent(agent_event) => {
                             if let Some(structured_frames) =
@@ -302,7 +342,7 @@ impl App {
                                 let snapshot = self.apply_agent_event(agent_event)?;
                                 frames.push(self.render_console(tui)?);
                                 if snapshot.state == RuntimeState::AwaitingApproval {
-                                    let remaining_events = provider_events[index + 1..]
+                                    let remaining_events = collected_events[index + 1..]
                                         .iter()
                                         .filter_map(|ev| match ev {
                                             ProviderEvent::Agent(ae) => Some(ae.clone()),
@@ -319,8 +359,8 @@ impl App {
                                 }
                             }
                         }
-                        ProviderEvent::TokenDelta(delta) => {
-                            token_buffer.push_str(delta);
+                        ProviderEvent::TokenDelta(_) => {
+                            // Already streamed to stderr. Check for structured response.
                             if BasicAgentLoop::is_complete_structured_response(&token_buffer) {
                                 let structured =
                                     BasicAgentLoop::parse_structured_response(&token_buffer)
@@ -334,14 +374,6 @@ impl App {
                                 )?);
                                 break;
                             }
-                            if render::should_render_stream_progress(
-                                &token_buffer,
-                                delta,
-                                last_rendered_len,
-                            ) {
-                                frames.push(self.render_token_delta_frame(&token_buffer, tui)?);
-                                last_rendered_len = token_buffer.len();
-                            }
                         }
                     }
                 }
@@ -354,7 +386,10 @@ impl App {
                         status: "Interrupted safely".to_string(),
                         interrupted_what: "provider turn".to_string(),
                         saved_status: "session preserved".to_string(),
-                        next_actions: vec!["resume work".to_string(), "inspect status".to_string()],
+                        next_actions: vec![
+                            "resume work".to_string(),
+                            "inspect status".to_string(),
+                        ],
                         elapsed_ms: 0,
                     }],
                     tui,
@@ -760,23 +795,6 @@ impl App {
             );
         self.apply_transition(snapshot, StateTransition::StartThinking)?;
         Ok(())
-    }
-
-    fn render_token_delta_frame(
-        &mut self,
-        token_buffer: &str,
-        tui: &Tui,
-    ) -> Result<String, AppError> {
-        let visible = render::recent_stream_excerpt(token_buffer, 400);
-        let snapshot = AppStateSnapshot::new(RuntimeState::Thinking)
-            .with_status(format!("Streaming. model={}", self.config.runtime.model))
-            .with_reasoning_summary(vec![visible])
-            .with_context_usage(
-                self.session.estimated_token_count(),
-                self.config.runtime.context_window,
-            );
-        self.apply_transition(snapshot, StateTransition::StartThinking)?;
-        self.render_console(tui)
     }
 
     fn record_provider_error(&mut self, error: ProviderTurnError) -> Result<(), AppError> {

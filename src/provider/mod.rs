@@ -159,6 +159,37 @@ pub trait HttpTransport {
     ) -> Result<HttpResponse, ProviderTurnError> {
         self.post_json(url, body)
     }
+
+    /// Stream the response body line-by-line via a callback.
+    ///
+    /// The default implementation falls back to [`Self::post_json_with_headers`],
+    /// splits the body into lines, and calls `on_line` for each.
+    /// [`CurlHttpTransport`] overrides this with true streaming using
+    /// `curl -N` and unbuffered stdout reading.
+    fn stream_lines(
+        &self,
+        url: &str,
+        body: &[u8],
+        headers: &[(&str, &str)],
+        on_line: &mut dyn FnMut(&str),
+    ) -> Result<(), ProviderTurnError> {
+        let response = self.post_json_with_headers(url, body, headers)?;
+        if response.status_code != 200 {
+            let body_text = String::from_utf8_lossy(&response.body);
+            return Err(ProviderTurnError::Backend(format!(
+                "request failed with status {}: {}",
+                response.status_code,
+                body_text.trim()
+            )));
+        }
+        for line in String::from_utf8_lossy(&response.body).lines() {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                on_line(trimmed);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// HTTP transport backed by the `curl` subprocess.
@@ -184,6 +215,18 @@ impl HttpTransport for CurlHttpTransport {
     ) -> Result<HttpResponse, ProviderTurnError> {
         let raw = post_json_with_curl(url, body, headers)?;
         parse_raw_http_response(&raw)
+    }
+
+    /// True streaming: spawn curl with `-N` (no buffering) and read lines
+    /// from stdout as they arrive.
+    fn stream_lines(
+        &self,
+        url: &str,
+        body: &[u8],
+        headers: &[(&str, &str)],
+        on_line: &mut dyn FnMut(&str),
+    ) -> Result<(), ProviderTurnError> {
+        curl_stream_lines(url, body, headers, on_line)
     }
 }
 
@@ -320,34 +363,6 @@ pub fn resolve_ollama_model_alias(requested: &str, available: &[String]) -> Stri
     }
 }
 
-impl<T: HttpTransport> OllamaProviderClient<T> {
-    fn send_chat_request(
-        &self,
-        request: &ProviderTurnRequest,
-    ) -> Result<Vec<String>, ProviderTurnError> {
-        let resolved_model = resolve_model_with_ollama_tags(&self.base_url, &request.model);
-        let mut resolved_request = request.clone();
-        resolved_request.model = resolved_model;
-        let chat_request = Self::build_chat_request(&resolved_request);
-        let request_body = serde_json::to_vec(&chat_request).map_err(|err| {
-            ProviderTurnError::Backend(format!("failed to encode ollama request: {err}"))
-        })?;
-        let url = format!("{}/api/chat", self.base_url.trim_end_matches('/'));
-
-        let response = self.transport.post_json(&url, &request_body)?;
-        if response.status_code != 200 {
-            let body_text = String::from_utf8_lossy(&response.body);
-            return Err(ProviderTurnError::Backend(format!(
-                "ollama request failed with status {}: {}",
-                response.status_code,
-                body_text.trim()
-            )));
-        }
-
-        Ok(parse_ndjson_lines(&response.body))
-    }
-}
-
 impl Default for OllamaProviderClient {
     fn default() -> Self {
         Self::new("http://127.0.0.1:11434")
@@ -360,9 +375,59 @@ impl<T: HttpTransport> ProviderClient for OllamaProviderClient<T> {
         request: &ProviderTurnRequest,
         emit: &mut dyn FnMut(ProviderEvent),
     ) -> Result<(), ProviderTurnError> {
-        let chunks = self.send_chat_request(request)?;
-        for event in Self::normalize_stream_chunks(&chunks)? {
-            emit(event);
+        let resolved_model = resolve_model_with_ollama_tags(&self.base_url, &request.model);
+        let mut resolved_request = request.clone();
+        resolved_request.model = resolved_model;
+        let chat_request = Self::build_chat_request(&resolved_request);
+        let request_body = serde_json::to_vec(&chat_request).map_err(|err| {
+            ProviderTurnError::Backend(format!("failed to encode ollama request: {err}"))
+        })?;
+        let url = format!("{}/api/chat", self.base_url.trim_end_matches('/'));
+
+        let mut assistant_output = String::new();
+        let mut had_error: Option<ProviderTurnError> = None;
+
+        self.transport.stream_lines(&url, &request_body, &[], &mut |line| {
+            if had_error.is_some() {
+                return;
+            }
+            match serde_json::from_str::<OllamaChatChunk>(line) {
+                Ok(chunk) => {
+                    if let Some(message) = chunk.message
+                        && !message.content.is_empty()
+                    {
+                        assistant_output.push_str(&message.content);
+                        emit(ProviderEvent::TokenDelta(message.content));
+                    }
+                    if chunk.done {
+                        emit(ProviderEvent::Agent(AgentEvent::Done {
+                            status: "Done. session saved".to_string(),
+                            assistant_message: assistant_output.clone(),
+                            completion_summary: "Provider turn finished successfully."
+                                .to_string(),
+                            saved_status: "session saved".to_string(),
+                            tool_logs: Vec::new(),
+                            elapsed_ms: 0,
+                        }));
+                    }
+                }
+                Err(err) => {
+                    // Check if the line is an Ollama error response
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+                        if let Some(error) = value.get("error").and_then(|v| v.as_str()) {
+                            had_error = Some(ProviderTurnError::Backend(error.to_string()));
+                            return;
+                        }
+                    }
+                    had_error = Some(ProviderTurnError::Backend(format!(
+                        "invalid ollama response: {err}"
+                    )));
+                }
+            }
+        })?;
+
+        if let Some(err) = had_error {
+            return Err(err);
         }
         Ok(())
     }
@@ -453,16 +518,6 @@ pub fn build_local_provider_client(
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
-
-/// Parse NDJSON (newline-delimited JSON) body into individual lines.
-fn parse_ndjson_lines(body: &[u8]) -> Vec<String> {
-    String::from_utf8_lossy(body)
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
-}
 
 /// Parse a raw HTTP response (as returned by `curl -i`) into status code and body.
 fn parse_raw_http_response(raw: &[u8]) -> Result<HttpResponse, ProviderTurnError> {
@@ -574,6 +629,64 @@ fn resolve_model_with_ollama_tags(base_url: &str, requested: &str) -> String {
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();
     resolve_ollama_model_alias(requested, &names)
+}
+
+/// Spawn curl in streaming mode (`-N`) and deliver each response line
+/// to the callback as it arrives from the server.
+fn curl_stream_lines(
+    url: &str,
+    body: &[u8],
+    extra_headers: &[(&str, &str)],
+    on_line: &mut dyn FnMut(&str),
+) -> Result<(), ProviderTurnError> {
+    let mut cmd = Command::new("curl");
+    cmd.args(["-sS", "-N", "-X", "POST"])
+        .arg("-H")
+        .arg("Content-Type: application/json");
+    for (name, value) in extra_headers {
+        cmd.arg("-H").arg(format!("{name}: {value}"));
+    }
+    let mut child = cmd
+        .arg("--data-binary")
+        .arg("@-")
+        .arg("--")
+        .arg(url)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|err| ProviderTurnError::Backend(format!("failed to spawn curl: {err}")))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(body).map_err(|err| {
+            ProviderTurnError::Backend(format!("failed to write to curl stdin: {err}"))
+        })?;
+    }
+
+    if let Some(stdout) = child.stdout.take() {
+        let reader = std::io::BufReader::new(stdout);
+        use std::io::BufRead;
+        for line in reader.lines() {
+            let line = line.map_err(|err| {
+                ProviderTurnError::Backend(format!("failed to read curl output: {err}"))
+            })?;
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                on_line(trimmed);
+            }
+        }
+    }
+
+    let status = child.wait().map_err(|err| {
+        ProviderTurnError::Backend(format!("curl process error: {err}"))
+    })?;
+    if !status.success() {
+        return Err(ProviderTurnError::Backend(
+            "curl streaming request failed".to_string(),
+        ));
+    }
+
+    Ok(())
 }
 
 fn find_crlf(body: &[u8], start: usize) -> Option<usize> {

@@ -660,7 +660,14 @@ fn live_turn_surfaces_token_delta_progress() {
         .run_live_turn("stream this", &provider, &tui)
         .expect("live turn should succeed");
 
-    assert!(frames.iter().any(|frame| frame.contains("drafting ")));
+    // Token deltas are now streamed to stderr in real-time.
+    // Frames contain only the final Done state with the assistant message.
+    assert!(
+        frames
+            .last()
+            .expect("done frame should exist")
+            .contains("stream finished")
+    );
 }
 
 #[test]
@@ -857,6 +864,6 @@ fn ollama_provider_surfaces_non_success_status_as_backend_error() {
         .stream_turn(&request, &mut |_event| {})
         .expect_err("non-success status should fail");
 
-    assert!(err.to_string().contains("ollama request failed"));
+    assert!(err.to_string().contains("request failed"));
     assert!(err.to_string().contains("500"));
 }

@@ -186,10 +186,152 @@ impl<T: HttpTransport> ProviderClient for OpenAiCompatibleProviderClient<T> {
         request: &ProviderTurnRequest,
         emit: &mut dyn FnMut(ProviderEvent),
     ) -> Result<(), ProviderTurnError> {
+        if request.stream {
+            return self.stream_turn_sse(request, emit);
+        }
         for event in self.send_chat_request(request)? {
             emit(event);
         }
+        Ok(())
+    }
+}
 
+impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
+    fn stream_turn_sse(
+        &self,
+        request: &ProviderTurnRequest,
+        emit: &mut dyn FnMut(ProviderEvent),
+    ) -> Result<(), ProviderTurnError> {
+        let chat_request = OpenAiChatRequest {
+            model: request.model.clone(),
+            messages: request
+                .messages
+                .iter()
+                .map(|m| OpenAiChatMessage {
+                    role: match m.role {
+                        super::ProviderMessageRole::System => "system".to_string(),
+                        super::ProviderMessageRole::User => "user".to_string(),
+                        super::ProviderMessageRole::Assistant => "assistant".to_string(),
+                        super::ProviderMessageRole::Tool => "tool".to_string(),
+                    },
+                    content: m.content.clone(),
+                })
+                .collect(),
+            stream: true,
+        };
+
+        let request_body = serde_json::to_vec(&chat_request).map_err(|err| {
+            ProviderTurnError::Backend(format!("failed to encode openai request: {err}"))
+        })?;
+        let url = format!(
+            "{}/v1/chat/completions",
+            self.base_url.trim_end_matches('/')
+        );
+        let mut headers = Vec::new();
+        if let Some(api_key) = &self.api_key {
+            headers.push(("Authorization", api_key.as_str()));
+        }
+
+        let mut content = String::new();
+        let mut emitted_done = false;
+        let mut had_error: Option<ProviderTurnError> = None;
+
+        self.transport.stream_lines(
+            &url,
+            &request_body,
+            &headers,
+            &mut |line| {
+                if had_error.is_some() || emitted_done {
+                    return;
+                }
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    return;
+                }
+                if !trimmed.starts_with("data: ") {
+                    // Not SSE — try as a regular OpenAI JSON response (fallback)
+                    if let Ok(parsed) = serde_json::from_str::<OpenAiChatResponse>(trimmed) {
+                        if let Some(choice) = parsed.choices.first() {
+                            content.push_str(&choice.message.content);
+                            emit(ProviderEvent::TokenDelta(choice.message.content.clone()));
+                            emit(ProviderEvent::Agent(AgentEvent::Done {
+                                status: "Done. session saved".to_string(),
+                                assistant_message: content.clone(),
+                                completion_summary: "Provider turn finished successfully."
+                                    .to_string(),
+                                saved_status: "session saved".to_string(),
+                                tool_logs: Vec::new(),
+                                elapsed_ms: 0,
+                            }));
+                            emitted_done = true;
+                        }
+                        return;
+                    }
+                    // Check if error envelope
+                    if let Ok(parsed) = serde_json::from_str::<OpenAiErrorEnvelope>(trimmed) {
+                        had_error = Some(ProviderTurnError::Backend(parsed.error.message));
+                    }
+                    return;
+                }
+                let payload = &trimmed[6..];
+                if payload == "[DONE]" {
+                    if !emitted_done {
+                        emit(ProviderEvent::Agent(AgentEvent::Done {
+                            status: "Done. session saved".to_string(),
+                            assistant_message: content.clone(),
+                            completion_summary: "Provider turn finished successfully.".to_string(),
+                            saved_status: "session saved".to_string(),
+                            tool_logs: Vec::new(),
+                            elapsed_ms: 0,
+                        }));
+                        emitted_done = true;
+                    }
+                    return;
+                }
+
+                match serde_json::from_str::<OpenAiStreamChunk>(payload) {
+                    Ok(chunk) => {
+                        for choice in chunk.choices {
+                            if let Some(delta) = choice.delta.content {
+                                content.push_str(&delta);
+                                emit(ProviderEvent::TokenDelta(delta));
+                            }
+                            if choice.finish_reason.is_some() && !emitted_done {
+                                emit(ProviderEvent::Agent(AgentEvent::Done {
+                                    status: "Done. session saved".to_string(),
+                                    assistant_message: content.clone(),
+                                    completion_summary: "Provider turn finished successfully."
+                                        .to_string(),
+                                    saved_status: "session saved".to_string(),
+                                    tool_logs: Vec::new(),
+                                    elapsed_ms: 0,
+                                }));
+                                emitted_done = true;
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        had_error = Some(ProviderTurnError::Backend(format!(
+                            "invalid openai stream chunk: {err}"
+                        )));
+                    }
+                }
+            },
+        )?;
+
+        if let Some(err) = had_error {
+            return Err(err);
+        }
+        if !emitted_done {
+            emit(ProviderEvent::Agent(AgentEvent::Done {
+                status: "Done. session saved".to_string(),
+                assistant_message: content,
+                completion_summary: "Provider turn finished successfully.".to_string(),
+                saved_status: "session saved".to_string(),
+                tool_logs: Vec::new(),
+                elapsed_ms: 0,
+            }));
+        }
         Ok(())
     }
 }

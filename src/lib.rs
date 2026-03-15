@@ -7,6 +7,7 @@ pub mod metrics;
 pub mod provider;
 pub mod retrieval;
 pub mod session;
+pub mod spinner;
 pub mod state;
 pub mod tooling;
 pub mod tui;
