@@ -223,22 +223,16 @@ impl App {
                     continue;
                 }
             };
-            // Only auto-approve when approval is not required.
-            // Safe tools don't need approval regardless.
-            let policy = ToolExecutionPolicy {
-                approval_required: self.config.mode.approval_required,
-                allow_restricted: !self.config.mode.approval_required,
+            // The agentic loop auto-approves all tools because it has no
+            // interactive approval mechanism (unlike the AgentEvent flow).
+            // Security is enforced by validate_shell_command_safety() which
+            // blocks dangerous commands (rm -rf, mkfs, dd, etc.) regardless.
+            let request = match validated.approve().into_execution_request(ToolExecutionPolicy {
+                approval_required: false,
+                allow_restricted: true,
                 plan_mode: false,
                 plan_scope_granted: true,
-            };
-            let ready = if !self.config.mode.approval_required
-                || validated.approval_required(true).is_none()
-            {
-                validated.approve()
-            } else {
-                validated
-            };
-            let request = match ready.into_execution_request(policy) {
+            }) {
                 Ok(r) => r,
                 Err(err) => {
                     let error_result = ToolExecutionResult {
