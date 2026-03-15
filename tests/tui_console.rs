@@ -174,24 +174,22 @@ fn tui_renders_working_and_done_views_with_tool_logs() {
     assert!(working.contains("completed:2"));
     assert!(working.contains("[T] tool  > Read"));
     assert!(working.contains("tools active"));
-    assert!(done.contains("[A] anvil > 調査結果を整理しました。"));
+    // Assistant message is excluded from frame rendering because it was
+    // already streamed to stderr (Issue #1). It should still be in the session.
+    assert!(
+        !done.contains("[A] anvil > 調査結果を整理しました。"),
+        "assistant message should not appear in done frame (streamed to stderr)"
+    );
+    assert!(
+        app.session()
+            .messages
+            .iter()
+            .any(|m| m.content.contains("調査結果を整理しました。")),
+        "assistant message should still be in session history"
+    );
     assert!(done.contains("[A] anvil > result"));
     assert!(done.contains("session saved"));
     assert!(done.contains("/continue"));
-    assert!(
-        done.find("[T] tool  > Read")
-            .expect("tool log should exist")
-            < done
-                .find("[A] anvil > result")
-                .expect("result should exist")
-    );
-    assert!(
-        done.find("[A] anvil > 調査結果を整理しました。")
-            .expect("assistant body should exist")
-            < done
-                .find("[T] tool  > Read")
-                .expect("tool log should exist")
-    );
 }
 
 #[test]
@@ -248,6 +246,40 @@ fn tui_rendering_uses_runtime_render_path_not_snapshot_model_fields() {
 
     assert!(rendered.contains("model:local-default"));
     assert!(rendered.contains("event:StateChanged"));
+}
+
+#[test]
+fn done_frame_excludes_streamed_assistant_messages() {
+    let mut app = common::build_app();
+    let tui = Tui::new();
+
+    app.record_user_input("msg_001", "ask a question")
+        .expect("user input should persist");
+    let _ = app
+        .mock_thinking_snapshot()
+        .expect("thinking snapshot should build");
+
+    // Simulate the Done event which records an assistant message via
+    // record_assistant_output (same as the streaming path).
+    let _ = app
+        .mock_done_snapshot()
+        .expect("done snapshot should build");
+
+    let rendered = app
+        .render_console(&tui)
+        .expect("done render should succeed");
+
+    // The assistant message was already streamed to stderr during the turn,
+    // so the frame should NOT render it again in the message list.
+    // User messages should still appear.
+    assert!(rendered.contains("[U] you > ask a question"));
+    assert!(
+        !rendered.contains("[A] anvil > 調査結果を整理しました。"),
+        "assistant message should be excluded from done frame to avoid duplicate output"
+    );
+    // The frame should still contain the status/result sections
+    assert!(rendered.contains("[A] anvil > result"));
+    assert!(rendered.contains("[A] anvil > Done."));
 }
 
 #[test]

@@ -142,11 +142,21 @@ fn live_turn_hands_session_messages_to_provider_and_renders_done() {
     assert_eq!(request.messages[1].role, ProviderMessageRole::User);
     assert_eq!(request.messages[2].role, ProviderMessageRole::Assistant);
     assert_eq!(request.messages[3].content, "current task");
+    // Assistant message is excluded from frame rendering (streamed to stderr,
+    // Issue #1). The Done frame shows result/completion_summary instead.
     assert!(
         frames
             .last()
             .expect("done frame should exist")
-            .contains("provider-backed turn completed")
+            .contains("[A] anvil > result"),
+        "done frame should contain result section"
+    );
+    assert!(
+        app.session()
+            .messages
+            .iter()
+            .any(|m| m.content == "provider-backed turn completed"),
+        "assistant message should be in session history"
     );
     assert!(request.messages[0].content.contains("ANVIL_TOOL"));
 }
@@ -700,13 +710,21 @@ fn live_turn_surfaces_token_delta_progress() {
         .run_live_turn("stream this", &provider, &tui)
         .expect("live turn should succeed");
 
-    // Token deltas are now streamed to stderr in real-time.
-    // Frames contain only the final Done state with the assistant message.
+    // Token deltas are streamed to stderr in real-time. Assistant messages
+    // are excluded from frame rendering to avoid duplicate output (Issue #1).
     assert!(
         frames
             .last()
             .expect("done frame should exist")
-            .contains("stream finished")
+            .contains("[A] anvil > result"),
+        "done frame should contain result section"
+    );
+    assert!(
+        app.session()
+            .messages
+            .iter()
+            .any(|m| m.content == "stream finished"),
+        "assistant message should be in session history"
     );
 }
 
@@ -771,11 +789,21 @@ fn live_turn_can_pause_for_provider_approval_and_resume() {
         .approve_and_continue(&AgentRuntime::new(), &tui)
         .expect("approval should resume");
 
+    // Assistant message is excluded from frame rendering (streamed to stderr,
+    // Issue #1). The Done frame shows result/completion_summary instead.
     assert!(
         resumed
             .last()
             .expect("done frame should exist")
-            .contains("live approval resumed")
+            .contains("[A] anvil > result"),
+        "done frame should contain result section"
+    );
+    assert!(
+        app.session()
+            .messages
+            .iter()
+            .any(|m| m.content == "live approval resumed"),
+        "assistant message should be in session history"
     );
 }
 
