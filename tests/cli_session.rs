@@ -6,6 +6,7 @@ use anvil::contracts::RuntimeState;
 use anvil::provider::{ProviderClient, ProviderEvent, ProviderTurnError, ProviderTurnRequest};
 use anvil::tui::Tui;
 use std::cell::RefCell;
+use std::fs;
 use std::io::Cursor;
 use std::rc::Rc;
 
@@ -347,4 +348,65 @@ fn help_frame_is_built_from_registered_slash_commands() {
     assert!(help.contains("exit the session"));
     assert!(commands.iter().any(|spec| spec.name == "/plan"));
     assert!(commands.iter().any(|spec| spec.name == "/model"));
+}
+
+#[test]
+fn custom_slash_commands_load_from_extension_file_and_run_live_turn() {
+    let root = common::unique_test_dir("custom_slash_command");
+    fs::create_dir_all(root.join(".anvil")).expect("extension dir should exist");
+    fs::write(
+        root.join(".anvil/slash-commands.json"),
+        r#"{
+  "commands": [
+    {
+      "name": "/invaders",
+      "description": "build the browser invaders demo",
+      "prompt": "Create the requested invader prototype in the sandbox."
+    }
+  ]
+}"#,
+    )
+    .expect("custom slash command file should be written");
+
+    let mut app = common::build_app_in(root);
+    let tui = Tui::new();
+    let seen_requests = Rc::new(RefCell::new(Vec::new()));
+    let provider = RecordingProvider {
+        seen_requests: seen_requests.clone(),
+        events: vec![ProviderEvent::Agent(AgentEvent::Done {
+            status: "Done. session saved".to_string(),
+            assistant_message: "custom command completed".to_string(),
+            completion_summary: "Custom slash command completed.".to_string(),
+            saved_status: "session saved".to_string(),
+            tool_logs: Vec::new(),
+            elapsed_ms: 90,
+        })],
+    };
+
+    let help = app
+        .handle_cli_line("/help", &provider, &tui)
+        .expect("help should include custom command");
+    let invaders = app
+        .handle_cli_line("/invaders", &provider, &tui)
+        .expect("custom slash command should run");
+
+    assert!(
+        help.frames
+            .last()
+            .expect("help frame")
+            .contains("/invaders")
+    );
+    assert!(
+        invaders
+            .frames
+            .last()
+            .expect("custom command frame")
+            .contains("custom command completed")
+    );
+    assert!(
+        seen_requests.borrow()[0]
+            .messages
+            .iter()
+            .any(|message| message.content == "Create the requested invader prototype in the sandbox.")
+    );
 }

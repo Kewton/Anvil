@@ -5,7 +5,7 @@
 
 use crate::config::EffectiveConfig;
 use crate::contracts::{AppStateSnapshot, ToolLogView};
-use crate::extensions::{ExtensionRegistry, SlashCommandSpec};
+use crate::extensions::{ExtensionRegistry, SlashCommandSpec, builtin_slash_commands};
 use crate::tooling::{ToolExecutionPayload, ToolExecutionResult, ToolExecutionStatus};
 
 use crate::agent::AgentEvent;
@@ -26,8 +26,12 @@ pub fn build_tool_logs(logs: &[(String, String, String)]) -> Vec<ToolLogView> {
 }
 
 pub fn render_help_frame() -> String {
+    render_help_frame_for(&builtin_slash_commands())
+}
+
+pub fn render_help_frame_for(commands: &[SlashCommandSpec]) -> String {
     let mut lines = vec!["Anvil slash commands".to_string(), String::new()];
-    for spec in slash_commands() {
+    for spec in commands {
         lines.push(format!("{:<10} {}", spec.name, spec.description));
     }
     lines.join("\n")
@@ -73,8 +77,8 @@ pub fn cli_prompt() -> &'static str {
     "[U] you > "
 }
 
-pub fn slash_commands() -> &'static [SlashCommandSpec] {
-    ExtensionRegistry::new().slash_commands()
+pub fn slash_commands() -> Vec<SlashCommandSpec> {
+    ExtensionRegistry::new().slash_commands().to_vec()
 }
 
 pub fn render_pending_approval_frame(snapshot: &AppStateSnapshot) -> String {

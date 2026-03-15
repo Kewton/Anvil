@@ -12,7 +12,7 @@ use crate::config::EffectiveConfig;
 use crate::contracts::{
     AppEvent, AppStateSnapshot, ConsoleRenderContext, RuntimeState, ToolLogView,
 };
-use crate::extensions::{ExtensionRegistry, SlashCommandAction};
+use crate::extensions::{ExtensionLoadError, ExtensionRegistry, SlashCommandAction};
 use crate::provider::{
     ProviderBootstrapError, ProviderClient, ProviderErrorKind, ProviderErrorRecord, ProviderEvent,
     ProviderRuntimeContext, ProviderTurnError, build_local_provider_client,
@@ -65,6 +65,7 @@ pub struct CliTurnOutput {
 pub enum AppError {
     Config(crate::config::ConfigError),
     ProviderBootstrap(ProviderBootstrapError),
+    Extension(ExtensionLoadError),
     Session(SessionError),
     ProviderTurn(ProviderTurnError),
     StateTransition(crate::state::StateTransitionError),
@@ -78,6 +79,7 @@ impl Display for AppError {
         match self {
             Self::Config(err) => write!(f, "{err}"),
             Self::ProviderBootstrap(err) => write!(f, "{err}"),
+            Self::Extension(err) => write!(f, "{err}"),
             Self::Session(err) => write!(f, "{err}"),
             Self::ProviderTurn(err) => write!(f, "{err}"),
             Self::StateTransition(err) => write!(f, "{err}"),
@@ -101,6 +103,12 @@ impl From<crate::config::ConfigError> for AppError {
 impl From<ProviderBootstrapError> for AppError {
     fn from(value: ProviderBootstrapError) -> Self {
         Self::ProviderBootstrap(value)
+    }
+}
+
+impl From<ExtensionLoadError> for AppError {
+    fn from(value: ExtensionLoadError) -> Self {
+        Self::Extension(value)
     }
 }
 
@@ -133,6 +141,7 @@ impl App {
             .last_snapshot
             .clone()
             .unwrap_or_else(|| AppStateSnapshot::new(RuntimeState::Ready));
+        let extensions = ExtensionRegistry::load(&config.paths.cwd)?;
 
         Ok(Self {
             tools: standard_tool_registry(),
@@ -142,7 +151,7 @@ impl App {
             session_store,
             pending_turn: session.pending_turn.clone(),
             session,
-            extensions: ExtensionRegistry::new(),
+            extensions,
         })
     }
 
@@ -789,7 +798,7 @@ impl App {
         }
 
         if trimmed.starts_with('/') {
-            return self.handle_slash_command(trimmed, tui);
+            return self.handle_slash_command(trimmed, provider_client, tui);
         }
 
         match self.run_live_turn(trimmed, provider_client, tui) {
@@ -825,6 +834,7 @@ impl App {
     fn handle_slash_command(
         &mut self,
         command: &str,
+        provider_client: &impl ProviderClient,
         tui: &Tui,
     ) -> Result<CliTurnOutput, AppError> {
         let output = match self
@@ -833,7 +843,7 @@ impl App {
             .map(|spec| spec.action)
         {
             Some(SlashCommandAction::Help) => CliTurnOutput {
-                frames: vec![render::render_help_frame()],
+                frames: vec![render::render_help_frame_for(self.extensions.slash_commands())],
                 control: SessionControl::Continue,
             },
             Some(SlashCommandAction::Status) => CliTurnOutput {
@@ -866,6 +876,19 @@ impl App {
             Some(SlashCommandAction::Exit) => CliTurnOutput {
                 frames: vec!["Exiting Anvil.".to_string()],
                 control: SessionControl::Exit,
+            },
+            Some(SlashCommandAction::Prompt(prompt)) => match self.run_live_turn(prompt, provider_client, tui) {
+                Ok(frames) => CliTurnOutput {
+                    frames,
+                    control: SessionControl::Continue,
+                },
+                Err(AppError::PendingApprovalRequired) => CliTurnOutput {
+                    frames: vec![render::render_pending_approval_frame(
+                        self.state_machine.snapshot(),
+                    )],
+                    control: SessionControl::Continue,
+                },
+                Err(err) => return Err(err),
             },
             _ => CliTurnOutput {
                 frames: vec![format!(
