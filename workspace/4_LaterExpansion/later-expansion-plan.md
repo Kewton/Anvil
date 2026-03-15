@@ -23,6 +23,11 @@
   - repository walking with basic filtering
   - operator-console rendering for retrieval results
 
+- Advanced UX without losing clarity
+  - `/timeline` for recent session events and message flow
+  - plan visibility inside the timeline view
+  - keeps actor separation and current-state visibility intact
+
 ## Next Slices
 
 - Improved large-repo retrieval
@@ -33,11 +38,9 @@
 
 - Advanced UX without losing clarity
   - richer tool-progress display
-  - session timeline inspection
   - more expressive but still legible status views
 
 - Architectural cleanup for richer planning
-  - typed planner events instead of direct snapshot replacement
   - execution checkpoints
   - tool-batch review
 

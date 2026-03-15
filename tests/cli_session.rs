@@ -61,6 +61,9 @@ fn slash_commands_support_help_status_reset_and_exit() {
     let repo_find = app
         .handle_cli_line("/repo-find Cargo.toml", &provider, &tui)
         .expect("repo find should render");
+    let timeline = app
+        .handle_cli_line("/timeline", &provider, &tui)
+        .expect("timeline should render");
     let model = app
         .handle_cli_line("/model", &provider, &tui)
         .expect("model should render");
@@ -113,6 +116,13 @@ fn slash_commands_support_help_status_reset_and_exit() {
             .last()
             .expect("repo-find frame")
             .contains("[A] anvil > repo-find Cargo.toml")
+    );
+    assert!(
+        timeline
+            .frames
+            .last()
+            .expect("timeline frame")
+            .contains("[A] anvil > timeline")
     );
     assert!(
         model
@@ -390,6 +400,7 @@ fn help_frame_is_built_from_registered_slash_commands() {
     assert!(help.contains("/plan-focus"));
     assert!(help.contains("/plan-clear"));
     assert!(help.contains("/repo-find"));
+    assert!(help.contains("/timeline"));
     assert!(commands.iter().any(|spec| spec.name == "/plan"));
     assert!(commands.iter().any(|spec| spec.name == "/model"));
 }
@@ -453,4 +464,29 @@ fn custom_slash_commands_load_from_extension_file_and_run_live_turn() {
             .iter()
             .any(|message| message.content == "Create the requested invader prototype in the sandbox.")
     );
+}
+
+#[test]
+fn plan_commands_record_typed_events_in_timeline() {
+    let mut app = common::build_app();
+    let tui = Tui::new();
+    let provider = RecordingProvider {
+        seen_requests: Rc::new(RefCell::new(Vec::new())),
+        events: Vec::new(),
+    };
+
+    let _ = app
+        .handle_cli_line("/plan-add inspect provider", &provider, &tui)
+        .expect("plan add should work");
+    let _ = app
+        .handle_cli_line("/plan-focus 1", &provider, &tui)
+        .expect("plan focus should work");
+    let timeline = app
+        .handle_cli_line("/timeline", &provider, &tui)
+        .expect("timeline should render");
+
+    let frame = timeline.frames.last().expect("timeline frame");
+    assert!(frame.contains("PlanItemAdded"));
+    assert!(frame.contains("PlanFocusChanged"));
+    assert!(frame.contains("inspect provider"));
 }

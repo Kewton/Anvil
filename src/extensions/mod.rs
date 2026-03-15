@@ -12,6 +12,7 @@ pub enum SlashCommandAction {
     PlanFocus(usize),
     PlanClear,
     RepoFind(String),
+    Timeline,
     Model,
     Approve,
     Deny,
@@ -156,6 +157,11 @@ pub fn builtin_slash_commands() -> Vec<SlashCommandSpec> {
             name: "/repo-find".to_string(),
             description: "search the repo by path and content".to_string(),
             action: SlashCommandAction::RepoFind(String::new()),
+        },
+        SlashCommandSpec {
+            name: "/timeline".to_string(),
+            description: "show the recent session timeline".to_string(),
+            action: SlashCommandAction::Timeline,
         },
         SlashCommandSpec {
             name: "/model".to_string(),

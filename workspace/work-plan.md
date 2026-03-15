@@ -111,6 +111,6 @@
 - [ ] Add improved large-repo retrieval
 - [x] Add initial large-repo retrieval slice
 - [x] Add additional local model backends if needed
-- [ ] Add more advanced UX features without breaking core clarity
-- [ ] Replace direct plan snapshot mutation with typed planner events
+- [x] Add initial advanced UX feature slices without breaking core clarity
+- [x] Replace direct plan snapshot mutation with typed planner events
 - [ ] Add backend parity improvements for OpenAI-compatible streaming and errors

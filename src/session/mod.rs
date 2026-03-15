@@ -150,6 +150,39 @@ impl SessionRecord {
             .then(|| format!("history: recent {visible_count} messages"))
     }
 
+    pub fn render_timeline(&self, limit: usize) -> String {
+        let mut lines = vec!["[A] anvil > timeline".to_string()];
+
+        if let Some(snapshot) = &self.last_snapshot
+            && let Some(plan) = &snapshot.plan
+        {
+            lines.push("  plan :".to_string());
+            for (index, item) in plan.items.iter().enumerate() {
+                let marker = if plan.active_index == Some(index) { "*" } else { "-" };
+                lines.push(format!("    {marker} {}. {}", index + 1, item));
+            }
+        }
+
+        let event_start = self.event_log.len().saturating_sub(limit);
+        for event in &self.event_log[event_start..] {
+            lines.push(format!("  event: {:?}", event));
+        }
+
+        let message_start = self.messages.len().saturating_sub(limit);
+        for message in &self.messages[message_start..] {
+            let role = match message.role {
+                MessageRole::System => "system",
+                MessageRole::User => "you",
+                MessageRole::Assistant => "anvil",
+                MessageRole::Tool => "tool",
+            };
+            let preview = compact_preview(&message.content, 72);
+            lines.push(format!("  msg  : {role} > {preview}"));
+        }
+
+        lines.join("\n")
+    }
+
     pub fn console_render_context(
         &self,
         snapshot: &AppStateSnapshot,
@@ -352,4 +385,15 @@ fn session_id_for_cwd(cwd: &Path) -> String {
 fn estimate_tokens(content: &str) -> usize {
     let chars = content.chars().count();
     chars.div_ceil(4).max(1)
+}
+
+fn compact_preview(content: &str, max_chars: usize) -> String {
+    let trimmed = content.trim().replace('\n', " ");
+    let chars: Vec<char> = trimmed.chars().collect();
+    if chars.len() <= max_chars {
+        trimmed
+    } else {
+        let preview: String = chars[..max_chars.saturating_sub(3)].iter().collect();
+        format!("{preview}...")
+    }
 }

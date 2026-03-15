@@ -871,6 +871,10 @@ impl App {
                 frames: vec![self.repo_find(&query)?],
                 control: SessionControl::Continue,
             },
+            Some(SlashCommandAction::Timeline) => CliTurnOutput {
+                frames: vec![self.session.render_timeline(8)],
+                control: SessionControl::Continue,
+            },
             Some(SlashCommandAction::Model) => CliTurnOutput {
                 frames: vec![render::render_model_frame(&self.config)],
                 control: SessionControl::Continue,
@@ -934,7 +938,7 @@ impl App {
             .as_ref()
             .and_then(|plan| plan.active_index)
             .or(Some(0));
-        self.update_plan_snapshot(items, active_index)?;
+        self.update_plan_snapshot(items, active_index, AppEvent::PlanItemAdded)?;
         Ok(render::render_plan_frame(self.state_machine.snapshot()))
     }
 
@@ -950,12 +954,12 @@ impl App {
             return Ok("[A] anvil > plan\n  no active plan".to_string());
         }
         let active_index = Some(index.min(items.len().saturating_sub(1)));
-        self.update_plan_snapshot(items, active_index)?;
+        self.update_plan_snapshot(items, active_index, AppEvent::PlanFocusChanged)?;
         Ok(render::render_plan_frame(self.state_machine.snapshot()))
     }
 
     fn clear_plan_items(&mut self) -> Result<String, AppError> {
-        self.update_plan_snapshot(Vec::new(), None)?;
+        self.update_plan_snapshot(Vec::new(), None, AppEvent::PlanCleared)?;
         Ok(render::render_plan_frame(self.state_machine.snapshot()))
     }
 
@@ -963,6 +967,7 @@ impl App {
         &mut self,
         items: Vec<String>,
         active_index: Option<usize>,
+        event: AppEvent,
     ) -> Result<(), AppError> {
         let mut snapshot = self.state_machine.snapshot().clone();
         snapshot.plan = if items.is_empty() {
@@ -970,9 +975,10 @@ impl App {
         } else {
             Some(crate::contracts::PlanView { items, active_index })
         };
-        snapshot.last_event = Some(AppEvent::StateChanged);
+        snapshot.last_event = Some(event);
         self.state_machine.replace_snapshot(snapshot.clone());
         self.session.set_last_snapshot(snapshot);
+        self.persist_session(event)?;
         self.persist_session(AppEvent::SessionSaved)
     }
 
