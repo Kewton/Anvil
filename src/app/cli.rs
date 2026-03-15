@@ -84,8 +84,7 @@ fn run_interactive_loop<C: ProviderClient>(
 
     let history_path = app.config.paths.state_dir.join("input-history.txt");
     let mut rl = rustyline::DefaultEditor::new().map_err(|err| {
-        AppError::Session(SessionError::SessionReadFailed(io::Error::new(
-            io::ErrorKind::Other,
+        AppError::Session(SessionError::SessionReadFailed(io::Error::other(
             format!("failed to initialize line editor: {err}"),
         )))
     })?;
@@ -111,7 +110,7 @@ fn run_interactive_loop<C: ProviderClient>(
             }
             Err(err) => {
                 return Err(AppError::Session(SessionError::SessionReadFailed(
-                    io::Error::new(io::ErrorKind::Other, format!("readline error: {err}")),
+                    io::Error::other(format!("readline error: {err}")),
                 )));
             }
         }
