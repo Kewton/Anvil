@@ -142,15 +142,7 @@ impl BasicAgentLoop {
             model.into(),
             session.messages[start..]
                 .iter()
-                .map(|message| {
-                    let role = match message.role {
-                        MessageRole::System => ProviderMessageRole::System,
-                        MessageRole::User => ProviderMessageRole::User,
-                        MessageRole::Assistant => ProviderMessageRole::Assistant,
-                        MessageRole::Tool => ProviderMessageRole::Tool,
-                    };
-                    ProviderMessage::new(role, message.content.clone())
-                })
+                .map(to_provider_message)
                 .collect(),
             stream,
         )
@@ -182,15 +174,7 @@ impl BasicAgentLoop {
                 ProviderMessageRole::System,
                 tool_protocol_system_prompt(),
             ))
-            .chain(selected.into_iter().map(|message| {
-                let role = match message.role {
-                    MessageRole::System => ProviderMessageRole::System,
-                    MessageRole::User => ProviderMessageRole::User,
-                    MessageRole::Assistant => ProviderMessageRole::Assistant,
-                    MessageRole::Tool => ProviderMessageRole::Tool,
-                };
-                ProviderMessage::new(role, message.content.clone())
-            }))
+            .chain(selected.into_iter().map(to_provider_message))
             .collect(),
             stream,
         )
@@ -249,57 +233,7 @@ fn parse_tool_call_value(value: &Value) -> Result<ToolCallRequest, String> {
         .get("id")
         .and_then(Value::as_str)
         .unwrap_or("call_generated_001");
-    let input = match tool_name {
-        "file.write" => ToolInput::FileWrite {
-            path: value
-                .get("path")
-                .and_then(Value::as_str)
-                .ok_or_else(|| "missing path in file.write tool block".to_string())?
-                .to_string(),
-            content: value
-                .get("content")
-                .and_then(Value::as_str)
-                .ok_or_else(|| "missing content in file.write tool block".to_string())?
-                .to_string(),
-        },
-        "file.read" => ToolInput::FileRead {
-            path: value
-                .get("path")
-                .and_then(Value::as_str)
-                .ok_or_else(|| "missing path in file.read tool block".to_string())?
-                .to_string(),
-        },
-        "file.search" => ToolInput::FileSearch {
-            root: value
-                .get("root")
-                .or_else(|| value.get("path"))
-                .and_then(Value::as_str)
-                .ok_or_else(|| "missing root in file.search tool block".to_string())?
-                .to_string(),
-            pattern: value
-                .get("pattern")
-                .or_else(|| value.get("content"))
-                .or_else(|| value.get("query"))
-                .and_then(Value::as_str)
-                .ok_or_else(|| "missing pattern in file.search tool block".to_string())?
-                .to_string(),
-        },
-        "shell.exec" | "shell" => ToolInput::ShellExec {
-            command: value
-                .get("command")
-                .and_then(Value::as_str)
-                .ok_or_else(|| "missing command in shell.exec tool block".to_string())?
-                .to_string(),
-        },
-        "web.fetch" => ToolInput::WebFetch {
-            url: value
-                .get("url")
-                .and_then(Value::as_str)
-                .ok_or_else(|| "missing url in web.fetch tool block".to_string())?
-                .to_string(),
-        },
-        other => return Err(format!("unsupported tool in ANVIL_TOOL block: {other}")),
-    };
+    let input = ToolInput::from_json(tool_name, value)?;
 
     Ok(ToolCallRequest::new(
         tool_call_id.to_string(),
@@ -313,29 +247,12 @@ fn repair_tool_call_block(block: &str) -> Option<ToolCallRequest> {
     let tool_call_id = extract_simple_string_field(block, "id")
         .unwrap_or_else(|| "call_generated_001".to_string());
 
-    let input = match tool_name.as_str() {
-        "file.write" => ToolInput::FileWrite {
-            path: extract_simple_string_field(block, "path")?,
-            content: extract_trailing_string_field(block, "content")?,
-        },
-        "file.read" => ToolInput::FileRead {
-            path: extract_simple_string_field(block, "path")?,
-        },
-        "file.search" => ToolInput::FileSearch {
-            root: extract_simple_string_field(block, "root")
-                .or_else(|| extract_simple_string_field(block, "path"))?,
-            pattern: extract_simple_string_field(block, "pattern")
-                .or_else(|| extract_simple_string_field(block, "content"))
-                .or_else(|| extract_simple_string_field(block, "query"))?,
-        },
-        "shell.exec" | "shell" => ToolInput::ShellExec {
-            command: extract_simple_string_field(block, "command")?,
-        },
-        "web.fetch" => ToolInput::WebFetch {
-            url: extract_simple_string_field(block, "url")?,
-        },
-        _ => return None,
-    };
+    let input = ToolInput::repair_from_block(
+        &tool_name,
+        block,
+        extract_simple_string_field,
+        extract_trailing_string_field,
+    )?;
 
     Some(ToolCallRequest::new(tool_call_id, tool_name, input))
 }
@@ -387,6 +304,16 @@ fn loose_unescape(value: &str) -> String {
         .replace("\\t", "\t")
         .replace("\\\"", "\"")
         .replace("\\\\", "\\")
+}
+
+fn to_provider_message(message: &crate::session::SessionMessage) -> ProviderMessage {
+    let role = match message.role {
+        MessageRole::System => ProviderMessageRole::System,
+        MessageRole::User => ProviderMessageRole::User,
+        MessageRole::Assistant => ProviderMessageRole::Assistant,
+        MessageRole::Tool => ProviderMessageRole::Tool,
+    };
+    ProviderMessage::new(role, message.content.clone())
 }
 
 fn derive_context_budget(context_window: u32) -> usize {
@@ -447,6 +374,12 @@ fn tool_protocol_system_prompt() -> &'static str {
         "{\"id\":\"call_005\",\"tool\":\"web.fetch\",\"url\":\"https://example.com\"}\n",
         "```\n",
         "\n",
+        "6. web.search — search the web by keyword:\n",
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_006\",\"tool\":\"web.search\",\"query\":\"search keywords here\"}\n",
+        "```\n",
+        "Use web.search when you need to look up error messages, library usage, or any information not available locally.\n",
+        "\n",
         "After ALL tool blocks, include exactly one final block with your summary:\n",
         "```ANVIL_FINAL\n",
         "User-facing summary and code review notes.\n",
@@ -460,7 +393,15 @@ fn tool_protocol_system_prompt() -> &'static str {
         "- Start exploration with file.read on \".\" to list the project root before reading specific files.\n",
         "- Do not assume files like README.md exist — verify first.\n",
         "- For dev servers and watch processes (npm run dev, cargo watch, etc.), use background execution with '&' so the command returns immediately.\n",
-        "- shell.exec output is streamed to the terminal in real-time. The user can press Ctrl+C to cancel."
+        "- shell.exec output is streamed to the terminal in real-time. The user can press Ctrl+C to cancel.\n",
+        "\n",
+        "## GitHub Insights\n",
+        "When asked about repository statistics, use shell.exec with gh api:\n",
+        "- Contributors: gh api repos/{owner}/{repo}/stats/contributors\n",
+        "- Commit activity: gh api repos/{owner}/{repo}/stats/commit_activity\n",
+        "- Code frequency: gh api repos/{owner}/{repo}/stats/code_frequency\n",
+        "- Detect repo: gh repo view --json owner,name\n",
+        "- GitHub stats endpoints (contributors, commit_activity) may return {} on first request. If you get an empty response, wait 3 seconds with shell.exec sleep 3 and retry the same API call."
     )
 }
 
