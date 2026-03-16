@@ -1,5 +1,24 @@
 # Changelog
 
+## [Unreleased]
+
+## [0.0.2] - 2026-03-16
+
+### Added
+- web.search tool and GitHub Insights support (#6)
+- web.fetch tool for HTTP content retrieval (#2)
+- Release skills and GitHub Actions release workflow (#34)
+- Issue-enhance, pm-auto-issue2dev, pm-auto-design2dev slash commands
+- Port remaining slash commands from MyCodeBranchDesk
+
+### Fixed
+- Duplicate response output in assistant messages (#1)
+- Exclude all messages from live-turn frames and skip intermediate frames (#1)
+
+### Documentation
+- Restructure README with user-focused quick start and developer section
+- Add binary download instructions to README
+
 ## [0.0.1] - 2026-03-15
 
 ### Added
