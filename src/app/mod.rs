@@ -162,7 +162,14 @@ impl App {
         session.auto_compact_threshold = config.runtime.auto_compact_threshold;
 
         let detected_languages = detect_project_languages(&config.paths.cwd);
-        let system_prompt = crate::agent::tool_protocol_system_prompt(&detected_languages);
+        let base_prompt = crate::agent::tool_protocol_system_prompt(&detected_languages);
+        let system_prompt = match config.project_instructions() {
+            Some(instructions) => format!(
+                "{}\n\n## Project instructions (from ANVIL.md)\n{}",
+                base_prompt, instructions
+            ),
+            None => base_prompt,
+        };
 
         Ok(Self {
             tools: standard_tool_registry(),

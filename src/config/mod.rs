@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::{
     error::Error,
     fmt::{Display, Formatter},
@@ -20,7 +20,7 @@ pub enum WebSearchProvider {
     SerperApi,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 /// Provider, model, and transport settings.
 pub struct RuntimeConfig {
     pub provider: String,
@@ -46,6 +46,7 @@ pub struct ModeConfig {
     pub fresh_session: bool,
     pub reasoning_visibility: ReasoningVisibility,
     pub debug_logging: bool,
+    pub log_filter: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +63,7 @@ pub struct PathConfig {
     pub state_dir: PathBuf,
     pub session_dir: PathBuf,
     pub session_file: PathBuf,
+    pub logs_dir: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -69,6 +71,7 @@ pub struct EffectiveConfig {
     pub runtime: RuntimeConfig,
     pub mode: ModeConfig,
     pub paths: PathConfig,
+    project_instructions: Option<String>,
 }
 
 #[derive(Debug)]
@@ -103,12 +106,23 @@ impl Display for ConfigError {
 impl Error for ConfigError {}
 
 impl EffectiveConfig {
+    pub fn project_instructions(&self) -> Option<&str> {
+        self.project_instructions.as_deref()
+    }
+
+    /// Test-only setter for project_instructions.
+    /// In production code, this field is set only via `load()`.
+    pub fn set_project_instructions_for_test(&mut self, instructions: Option<String>) {
+        self.project_instructions = instructions;
+    }
+
     pub fn load() -> Result<Self, ConfigError> {
         let cwd = std::env::current_dir().map_err(ConfigError::CurrentDirUnavailable)?;
         let workspace_dir = cwd.join("workspace");
         let config_file = cwd.join(".anvil").join("config");
         let mut config = Self::default_for_paths(cwd, workspace_dir, config_file);
         config.apply_standard_sources()?;
+        config.project_instructions = config.paths.load_project_instructions();
         Ok(config)
     }
 
@@ -116,6 +130,7 @@ impl EffectiveConfig {
         let state_dir = cwd.join(".anvil").join("state");
         let session_dir = cwd.join(".anvil").join("sessions");
         let session_file = session_dir.join(format!("{}.json", session_key_for_cwd(&cwd)));
+        let logs_dir = cwd.join(".anvil").join("logs");
         Self {
             runtime: RuntimeConfig {
                 provider: "ollama".to_string(),
@@ -139,6 +154,7 @@ impl EffectiveConfig {
                 fresh_session: false,
                 reasoning_visibility: ReasoningVisibility::Summary,
                 debug_logging: false,
+                log_filter: None,
             },
             paths: PathConfig {
                 cwd,
@@ -147,7 +163,9 @@ impl EffectiveConfig {
                 state_dir,
                 session_dir,
                 session_file,
+                logs_dir,
             },
+            project_instructions: None,
         }
     }
 
@@ -204,6 +222,7 @@ impl EffectiveConfig {
             "ANVIL_DEBUG",
             "ANVIL_WEB_SEARCH_PROVIDER",
             "SERPER_API_KEY",
+            "ANVIL_LOG",
         ] {
             if let Ok(value) = std::env::var(key) {
                 map.insert(key.to_string(), value);
@@ -364,6 +383,9 @@ impl EffectiveConfig {
                         Some(value.clone())
                     };
                 }
+                "log_filter" | "ANVIL_LOG" => {
+                    self.mode.log_filter = Some(value.clone());
+                }
                 _ => {}
             }
         }
@@ -382,6 +404,14 @@ impl EffectiveConfig {
         Ok(())
     }
 
+    pub fn session_key(&self) -> &str {
+        self.paths
+            .session_file
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+    }
+
     pub fn default_for_test() -> Result<Self, ConfigError> {
         let cwd = std::env::current_dir().map_err(ConfigError::CurrentDirUnavailable)?;
         Ok(Self::default_for_paths(
@@ -390,6 +420,127 @@ impl EffectiveConfig {
             cwd.join(".anvil").join("config"),
         ))
     }
+}
+
+const MAX_PROJECT_INSTRUCTIONS_CHARS: usize = 4000;
+
+impl PathConfig {
+    /// Load project instructions from ANVIL.md files.
+    /// Delegates to `load_project_instructions_from()` for testability.
+    pub fn load_project_instructions(&self) -> Option<String> {
+        let home_dir = std::env::var("HOME").ok().map(PathBuf::from);
+        Self::load_project_instructions_from(&self.cwd, home_dir.as_deref())
+    }
+
+    /// Internal method: accepts cwd and home_dir as arguments so tests can
+    /// pass temp directories without depending on the HOME environment variable.
+    pub fn load_project_instructions_from(cwd: &Path, home_dir: Option<&Path>) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+        let mut sources: Vec<String> = Vec::new();
+        let mut has_user_scope = false;
+        let mut has_project_scope = false;
+
+        // 1. User scope: ~/.anvil/ANVIL.md
+        if let Some(home) = home_dir {
+            let user_path = home.join(".anvil").join("ANVIL.md");
+            match std::fs::read_to_string(&user_path) {
+                Ok(content) => {
+                    sources.push(format!("{}", user_path.display()));
+                    parts.push(content);
+                    has_user_scope = true;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    eprintln!("Warning: failed to read {}: {}", user_path.display(), e);
+                }
+            }
+        }
+
+        // 2. Project scope (exclusive: .anvil/ANVIL.md takes priority)
+        let project_path = {
+            let dotdir = cwd.join(".anvil").join("ANVIL.md");
+            if dotdir.exists() {
+                Some(dotdir)
+            } else {
+                let root = cwd.join("ANVIL.md");
+                if root.exists() { Some(root) } else { None }
+            }
+        };
+
+        if let Some(path) = project_path {
+            match std::fs::read_to_string(&path) {
+                Ok(content) => {
+                    sources.push(format!("{}", path.display()));
+                    parts.push(content);
+                    has_project_scope = true;
+                }
+                Err(e) => {
+                    eprintln!("Warning: failed to read {}: {}", path.display(), e);
+                }
+            }
+        }
+
+        if parts.is_empty() {
+            return None;
+        }
+
+        eprintln!("ANVIL.md loaded from: {}", sources.join(", "));
+
+        // Combine with scope labels
+        let mut combined = if has_user_scope && has_project_scope {
+            format!(
+                "## User scope\n{}\n\n---\n\n## Project scope\n{}",
+                parts[0], parts[1]
+            )
+        } else if has_user_scope {
+            format!("## User scope\n{}", parts[0])
+        } else {
+            format!("## Project scope\n{}", parts[0])
+        };
+
+        // SEC-3/SEC-9: Sanitize ANVIL_TOOL/ANVIL_FINAL markers
+        let (sanitized, had_markers) = sanitize_markers(&combined);
+        if had_markers {
+            eprintln!(
+                "Warning: ANVIL.md contains ANVIL_TOOL/ANVIL_FINAL markers. \
+                 These have been sanitized to prevent interference with tool protocol."
+            );
+        }
+        combined = sanitized;
+
+        // 4000-character limit with newline-boundary snap
+        if combined.chars().count() > MAX_PROJECT_INSTRUCTIONS_CHARS {
+            eprintln!(
+                "Warning: ANVIL.md content exceeds {} characters, truncating",
+                MAX_PROJECT_INSTRUCTIONS_CHARS
+            );
+            let truncated: String = combined
+                .chars()
+                .take(MAX_PROJECT_INSTRUCTIONS_CHARS)
+                .collect();
+            combined = match truncated.rfind('\n') {
+                Some(pos) => format!("{}\n[...truncated]", &truncated[..pos]),
+                None => format!("{}\n[...truncated]", truncated),
+            };
+        }
+
+        Some(combined)
+    }
+}
+
+/// Sanitize ANVIL_TOOL/ANVIL_FINAL markers in content (SEC-3/SEC-9).
+/// Replaces backtick-triple markers with full-width backticks to neutralize them.
+pub fn sanitize_markers(content: &str) -> (String, bool) {
+    let mut sanitized = content.to_string();
+    let mut found = false;
+    for marker in &["```ANVIL_TOOL", "```ANVIL_FINAL"] {
+        if sanitized.contains(marker) {
+            found = true;
+            sanitized =
+                sanitized.replace(marker, &marker.replace("```", "\u{FF40}\u{FF40}\u{FF40}"));
+        }
+    }
+    (sanitized, found)
 }
 
 fn session_key_for_cwd(cwd: &std::path::Path) -> String {
@@ -410,6 +561,27 @@ fn parse_reasoning_visibility(value: &str) -> Result<ReasoningVisibility, Config
         "hidden" => Ok(ReasoningVisibility::Hidden),
         "summary" => Ok(ReasoningVisibility::Summary),
         other => Err(ConfigError::InvalidReasoningVisibility(other.to_string())),
+    }
+}
+
+impl std::fmt::Debug for RuntimeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeConfig")
+            .field("provider", &self.provider)
+            .field("provider_url", &self.provider_url)
+            .field("model", &self.model)
+            .field("sidecar_model", &self.sidecar_model)
+            .field("api_key", &"[REDACTED]")
+            .field("context_window", &self.context_window)
+            .field("context_budget", &self.context_budget)
+            .field("max_agent_iterations", &self.max_agent_iterations)
+            .field("max_console_messages", &self.max_console_messages)
+            .field("auto_compact_threshold", &self.auto_compact_threshold)
+            .field("tool_result_max_chars", &self.tool_result_max_chars)
+            .field("stream", &self.stream)
+            .field("web_search_provider", &self.web_search_provider)
+            .field("serper_api_key", &"[REDACTED]")
+            .finish()
     }
 }
 

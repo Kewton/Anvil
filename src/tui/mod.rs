@@ -29,7 +29,7 @@ impl Tui {
             "local / auto"
         };
 
-        [
+        let mut lines = vec![
             "    ___              _ __".to_string(),
             "   /   |  ____ _   _(_) /_".to_string(),
             "  / /| | / __ \\ | / / / __/".to_string(),
@@ -42,6 +42,13 @@ impl Tui {
             format!("  Context : {}k", config.runtime.context_window / 1_000),
             format!("  Mode    : {mode}"),
             format!("  Project : {}", config.paths.cwd.display()),
+        ];
+
+        if config.project_instructions().is_some() {
+            lines.push("  ANVIL.md: loaded".to_string());
+        }
+
+        lines.extend([
             String::new(),
             "  --------------------------------------------------------------".to_string(),
             format!("  {}", snapshot.status.line),
@@ -49,8 +56,9 @@ impl Tui {
             "  --------------------------------------------------------------".to_string(),
             String::new(),
             "  [U] you >".to_string(),
-        ]
-        .join("\n")
+        ]);
+
+        lines.join("\n")
     }
 
     pub fn render_console(&self, view: &ConsoleRenderContext) -> String {

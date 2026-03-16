@@ -1185,3 +1185,269 @@ mod blocked_commands {
         );
     }
 }
+
+// --- file.edit tests ---
+
+#[test]
+fn file_edit_validates_typed_tool_input() {
+    let registry = build_registry();
+    let valid = ToolCallRequest::new(
+        "call_edit_001",
+        "file.edit",
+        ToolInput::FileEdit {
+            path: "src/main.rs".to_string(),
+            old_string: "fn main()".to_string(),
+            new_string: "fn main() -> Result<(), Box<dyn std::error::Error>>".to_string(),
+        },
+    );
+    let validated = registry
+        .validate(valid)
+        .expect("matching typed input should validate");
+    assert_eq!(validated.spec.name, "file.edit");
+    assert_eq!(validated.spec.kind, ToolKind::FileEdit);
+}
+
+#[test]
+fn file_edit_spec_policies() {
+    let registry = build_registry();
+    let spec = registry.get("file.edit").expect("file.edit should exist");
+    assert_eq!(spec.version, 1);
+    assert_eq!(spec.execution_class, ExecutionClass::Mutating);
+    assert_eq!(spec.permission_class, PermissionClass::Confirm);
+    assert_eq!(
+        spec.execution_mode,
+        anvil::tooling::ExecutionMode::SequentialOnly
+    );
+    assert_eq!(spec.plan_mode, PlanModePolicy::AllowedWithScope);
+    assert_eq!(spec.rollback_policy, RollbackPolicy::CheckpointBeforeWrite);
+}
+
+#[test]
+fn file_edit_missing_path_error() {
+    let registry = build_registry();
+    let err = registry
+        .validate(ToolCallRequest::new(
+            "call_edit_002",
+            "file.edit",
+            ToolInput::FileEdit {
+                path: "".to_string(),
+                old_string: "hello".to_string(),
+                new_string: "world".to_string(),
+            },
+        ))
+        .expect_err("empty path should be rejected");
+    assert_eq!(
+        err,
+        ToolValidationError::MissingRequiredField("path".to_string())
+    );
+}
+
+#[test]
+fn file_edit_missing_old_string_error() {
+    let registry = build_registry();
+    let err = registry
+        .validate(ToolCallRequest::new(
+            "call_edit_003",
+            "file.edit",
+            ToolInput::FileEdit {
+                path: "src/main.rs".to_string(),
+                old_string: "".to_string(),
+                new_string: "world".to_string(),
+            },
+        ))
+        .expect_err("empty old_string should be rejected");
+    assert_eq!(
+        err,
+        ToolValidationError::MissingRequiredField("old_string".to_string())
+    );
+}
+
+#[test]
+fn file_edit_execution_replaces_unique_match() {
+    let root = std::env::temp_dir().join("anvil_file_edit_replace");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("dir should exist");
+    let file_path = root.join("test.txt");
+    fs::write(&file_path, "hello world").expect("write should succeed");
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
+    let result = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_edit_exec_001".to_string(),
+            spec: build_registry()
+                .get("file.edit")
+                .expect("file.edit spec")
+                .clone(),
+            input: ToolInput::FileEdit {
+                path: "./test.txt".to_string(),
+                old_string: "hello".to_string(),
+                new_string: "goodbye".to_string(),
+            },
+        })
+        .expect("edit should succeed");
+
+    assert_eq!(result.status, ToolExecutionStatus::Completed);
+    let content = fs::read_to_string(&file_path).expect("read should succeed");
+    assert_eq!(content, "goodbye world");
+}
+
+#[test]
+fn file_edit_old_string_not_found() {
+    let root = std::env::temp_dir().join("anvil_file_edit_not_found");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("dir should exist");
+    fs::write(root.join("test.txt"), "hello world").expect("write should succeed");
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
+    let err = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_edit_nf_001".to_string(),
+            spec: build_registry()
+                .get("file.edit")
+                .expect("file.edit spec")
+                .clone(),
+            input: ToolInput::FileEdit {
+                path: "./test.txt".to_string(),
+                old_string: "nonexistent".to_string(),
+                new_string: "replacement".to_string(),
+            },
+        })
+        .expect_err("should fail when old_string not found");
+
+    assert!(err.to_string().contains("not found"));
+}
+
+#[test]
+fn file_edit_old_string_multiple_matches() {
+    let root = std::env::temp_dir().join("anvil_file_edit_multi_match");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("dir should exist");
+    fs::write(root.join("test.txt"), "aaa bbb aaa").expect("write should succeed");
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
+    let err = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_edit_mm_001".to_string(),
+            spec: build_registry()
+                .get("file.edit")
+                .expect("file.edit spec")
+                .clone(),
+            input: ToolInput::FileEdit {
+                path: "./test.txt".to_string(),
+                old_string: "aaa".to_string(),
+                new_string: "ccc".to_string(),
+            },
+        })
+        .expect_err("should fail when old_string matches multiple times");
+
+    assert!(err.to_string().contains("found 2 times"));
+}
+
+#[test]
+fn file_edit_empty_new_string_deletes() {
+    let root = std::env::temp_dir().join("anvil_file_edit_delete");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("dir should exist");
+    let file_path = root.join("test.txt");
+    fs::write(&file_path, "hello world").expect("write should succeed");
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
+    let result = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_edit_del_001".to_string(),
+            spec: build_registry()
+                .get("file.edit")
+                .expect("file.edit spec")
+                .clone(),
+            input: ToolInput::FileEdit {
+                path: "./test.txt".to_string(),
+                old_string: " world".to_string(),
+                new_string: "".to_string(),
+            },
+        })
+        .expect("edit should succeed");
+
+    assert_eq!(result.status, ToolExecutionStatus::Completed);
+    let content = fs::read_to_string(&file_path).expect("read should succeed");
+    assert_eq!(content, "hello");
+}
+
+#[test]
+fn file_edit_noop_when_strings_equal() {
+    let root = std::env::temp_dir().join("anvil_file_edit_noop");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("dir should exist");
+    let file_path = root.join("test.txt");
+    fs::write(&file_path, "hello world").expect("write should succeed");
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
+    let result = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_edit_noop_001".to_string(),
+            spec: build_registry()
+                .get("file.edit")
+                .expect("file.edit spec")
+                .clone(),
+            input: ToolInput::FileEdit {
+                path: "./test.txt".to_string(),
+                old_string: "hello".to_string(),
+                new_string: "hello".to_string(),
+            },
+        })
+        .expect("noop edit should succeed");
+
+    assert_eq!(result.status, ToolExecutionStatus::Completed);
+    assert!(result.summary.contains("no changes"));
+    let content = fs::read_to_string(&file_path).expect("read should succeed");
+    assert_eq!(content, "hello world");
+}
+
+#[test]
+fn file_edit_file_not_found() {
+    let root = std::env::temp_dir().join("anvil_file_edit_no_file");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("dir should exist");
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
+    let err = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_edit_nofile_001".to_string(),
+            spec: build_registry()
+                .get("file.edit")
+                .expect("file.edit spec")
+                .clone(),
+            input: ToolInput::FileEdit {
+                path: "./nonexistent.txt".to_string(),
+                old_string: "hello".to_string(),
+                new_string: "world".to_string(),
+            },
+        })
+        .expect_err("should fail for nonexistent file");
+
+    assert!(err.to_string().contains("file.edit failed to read"));
+}
+
+#[test]
+fn file_edit_sandbox_escape_rejected() {
+    let root = std::env::temp_dir().join("anvil_file_edit_sandbox");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("dir should exist");
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
+    let err = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_edit_escape_001".to_string(),
+            spec: build_registry()
+                .get("file.edit")
+                .expect("file.edit spec")
+                .clone(),
+            input: ToolInput::FileEdit {
+                path: "../../../etc/passwd".to_string(),
+                old_string: "root".to_string(),
+                new_string: "hacked".to_string(),
+            },
+        })
+        .expect_err("should reject sandbox escape");
+
+    assert!(err.to_string().contains("invalid tool path"));
+}

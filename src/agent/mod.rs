@@ -148,15 +148,19 @@ impl BasicAgentLoop {
         session: &SessionRecord,
         stream: bool,
         max_messages: usize,
+        system_prompt: &str,
     ) -> ProviderTurnRequest {
         let len = session.messages.len();
         let start = len.saturating_sub(max_messages);
+
         ProviderTurnRequest::new(
             model.into(),
-            session.messages[start..]
-                .iter()
-                .map(to_provider_message)
-                .collect(),
+            std::iter::once(ProviderMessage::new(
+                ProviderMessageRole::System,
+                system_prompt,
+            ))
+            .chain(session.messages[start..].iter().map(to_provider_message))
+            .collect(),
             stream,
         )
     }
@@ -181,6 +185,13 @@ impl BasicAgentLoop {
         }
 
         selected.reverse();
+
+        tracing::debug!(
+            selected_messages = selected.len(),
+            used_tokens = used_tokens,
+            budget = token_budget,
+            "built turn request"
+        );
 
         ProviderTurnRequest::new(
             model.into(),
@@ -338,7 +349,13 @@ fn derive_context_budget(context_window: u32) -> usize {
     }
     let quarter = (context_window / 4) as usize;
     let half = (context_window / 2) as usize;
-    quarter.clamp(256, half)
+    let budget = quarter.clamp(256, half);
+    tracing::debug!(
+        budget = budget,
+        context_window = context_window,
+        "context budget derived"
+    );
+    budget
 }
 
 fn estimate_message_tokens(content: &str) -> usize {
@@ -373,22 +390,27 @@ pub fn tool_protocol_system_prompt(languages: &[ProjectLanguage]) -> String {
         "{\"id\":\"call_002\",\"tool\":\"file.write\",\"path\":\"./relative/path\",\"content\":\"file content here\"}\n",
         "```\n",
         "\n",
-        "3. file.search — search for files by name or content:\n",
+        "3. file.edit — edit a file by replacing a specific string:\n",
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_007\",\"tool\":\"file.edit\",\"path\":\"./relative/path\",\"old_string\":\"text to find\",\"new_string\":\"replacement text\"}\n",
+        "```\n",
+        "\n",
+        "4. file.search — search for files by name or content:\n",
         "```ANVIL_TOOL\n",
         "{\"id\":\"call_003\",\"tool\":\"file.search\",\"root\":\".\",\"pattern\":\"search term\"}\n",
         "```\n",
         "\n",
-        "4. shell.exec — run a shell command and capture its output:\n",
+        "5. shell.exec — run a shell command and capture its output:\n",
         "```ANVIL_TOOL\n",
         "{\"id\":\"call_004\",\"tool\":\"shell.exec\",\"command\":\"ls -la\"}\n",
         "```\n",
         "\n",
-        "5. web.fetch — fetch the contents of a URL:\n",
+        "6. web.fetch — fetch the contents of a URL:\n",
         "```ANVIL_TOOL\n",
         "{\"id\":\"call_005\",\"tool\":\"web.fetch\",\"url\":\"https://example.com\"}\n",
         "```\n",
         "\n",
-        "6. web.search — search the web by keyword:\n",
+        "7. web.search — search the web by keyword:\n",
         "```ANVIL_TOOL\n",
         "{\"id\":\"call_006\",\"tool\":\"web.search\",\"query\":\"search keywords here\"}\n",
         "```\n",

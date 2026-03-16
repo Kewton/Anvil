@@ -76,15 +76,20 @@ pub fn render_provider_frame(
 }
 
 pub fn render_resume_header(config: &EffectiveConfig) -> String {
-    [
+    let mut lines = vec![
         "  --------------------------------------------------------------".to_string(),
         "  Resuming existing session".to_string(),
         format!("  Model   : {}", config.runtime.model),
         format!("  Context : {}k", config.runtime.context_window / 1_000),
         format!("  Project : {}", config.paths.cwd.display()),
-        "  --------------------------------------------------------------".to_string(),
-    ]
-    .join("\n")
+    ];
+
+    if config.project_instructions().is_some() {
+        lines.push("  ANVIL.md: loaded".to_string());
+    }
+
+    lines.push("  --------------------------------------------------------------".to_string());
+    lines.join("\n")
 }
 
 pub fn cli_prompt() -> &'static str {

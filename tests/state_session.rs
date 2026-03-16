@@ -118,6 +118,7 @@ fn session_store_persists_and_restores_messages() {
     config.paths.state_dir = root.join(".anvil").join("state");
     config.paths.session_dir = root.join(".anvil").join("sessions");
     config.paths.session_file = config.paths.session_dir.join("session_roundtrip.json");
+    config.paths.logs_dir = root.join(".anvil").join("logs");
 
     let store = SessionStore::from_config(&config);
     let mut session = store
@@ -359,6 +360,7 @@ fn session_interrupt_persists_and_resumes_correctly() {
     config.paths.cwd = root.clone();
     config.paths.session_dir = root.join(".anvil").join("sessions");
     config.paths.session_file = config.paths.session_dir.join("session_interrupt.json");
+    config.paths.logs_dir = root.join(".anvil").join("logs");
 
     let store = anvil::session::SessionStore::from_config(&config);
     let mut session = store
@@ -440,6 +442,45 @@ fn web_search_pending_turn_state_serde_roundtrip() {
     match &deserialized.pending_tool_calls[0].input {
         ToolInput::WebSearch { query } => {
             assert_eq!(query, "rust serde tutorial");
+        }
+        other => panic!("unexpected tool input: {other:?}"),
+    }
+}
+
+#[test]
+fn file_edit_pending_turn_state_serde_roundtrip() {
+    use anvil::agent::PendingTurnState;
+    use anvil::tooling::{ToolCallRequest, ToolInput};
+
+    let pending = PendingTurnState {
+        waiting_tool_call_id: "call_edit_001".to_string(),
+        remaining_events: vec![],
+        pending_tool_calls: vec![ToolCallRequest::new(
+            "call_edit_001",
+            "file.edit",
+            ToolInput::FileEdit {
+                path: "./src/main.rs".to_string(),
+                old_string: "fn main()".to_string(),
+                new_string: "fn main() -> Result<()>".to_string(),
+            },
+        )],
+    };
+
+    let json = serde_json::to_string(&pending).expect("serialize should succeed");
+    let deserialized: PendingTurnState =
+        serde_json::from_str(&json).expect("deserialize should succeed");
+
+    assert_eq!(pending, deserialized);
+    assert_eq!(deserialized.pending_tool_calls[0].tool_name, "file.edit");
+    match &deserialized.pending_tool_calls[0].input {
+        ToolInput::FileEdit {
+            path,
+            old_string,
+            new_string,
+        } => {
+            assert_eq!(path, "./src/main.rs");
+            assert_eq!(old_string, "fn main()");
+            assert_eq!(new_string, "fn main() -> Result<()>");
         }
         other => panic!("unexpected tool input: {other:?}"),
     }
