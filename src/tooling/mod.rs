@@ -4,13 +4,14 @@
 //! through a permission and plan-mode pipeline, and executed by
 //! [`LocalToolExecutor`] within a sandboxed workspace root.
 
+use crate::config::{RuntimeConfig, WebSearchProvider};
 use crate::contracts::ToolLogView;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermissionClass {
@@ -53,6 +54,7 @@ pub enum ToolKind {
     FileSearch,
     ShellExec,
     WebFetch,
+    WebSearch,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,6 +64,7 @@ pub enum ToolInput {
     FileSearch { root: String, pattern: String },
     ShellExec { command: String },
     WebFetch { url: String },
+    WebSearch { query: String },
 }
 
 impl ToolInput {
@@ -72,6 +75,108 @@ impl ToolInput {
             Self::FileSearch { .. } => ToolKind::FileSearch,
             Self::ShellExec { .. } => ToolKind::ShellExec,
             Self::WebFetch { .. } => ToolKind::WebFetch,
+            Self::WebSearch { .. } => ToolKind::WebSearch,
+        }
+    }
+
+    /// Parse a JSON value into a `ToolInput` given a tool name.
+    ///
+    /// This centralises all field-name knowledge in the `ToolInput` enum
+    /// definition, keeping the agent parser thin.
+    pub fn from_json(tool_name: &str, value: &serde_json::Value) -> Result<ToolInput, String> {
+        match tool_name {
+            "file.write" => Ok(ToolInput::FileWrite {
+                path: value
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "missing path in file.write tool block".to_string())?
+                    .to_string(),
+                content: value
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "missing content in file.write tool block".to_string())?
+                    .to_string(),
+            }),
+            "file.read" => Ok(ToolInput::FileRead {
+                path: value
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "missing path in file.read tool block".to_string())?
+                    .to_string(),
+            }),
+            "file.search" => Ok(ToolInput::FileSearch {
+                root: value
+                    .get("root")
+                    .or_else(|| value.get("path"))
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "missing root in file.search tool block".to_string())?
+                    .to_string(),
+                pattern: value
+                    .get("pattern")
+                    .or_else(|| value.get("content"))
+                    .or_else(|| value.get("query"))
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "missing pattern in file.search tool block".to_string())?
+                    .to_string(),
+            }),
+            "shell.exec" | "shell" => Ok(ToolInput::ShellExec {
+                command: value
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "missing command in shell.exec tool block".to_string())?
+                    .to_string(),
+            }),
+            "web.fetch" => Ok(ToolInput::WebFetch {
+                url: value
+                    .get("url")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "missing url in web.fetch tool block".to_string())?
+                    .to_string(),
+            }),
+            "web.search" => Ok(ToolInput::WebSearch {
+                query: value
+                    .get("query")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "missing query in web.search tool block".to_string())?
+                    .to_string(),
+            }),
+            other => Err(format!("unsupported tool in ANVIL_TOOL block: {other}")),
+        }
+    }
+
+    /// Attempt to repair a malformed JSON block into a `ToolInput`.
+    ///
+    /// Uses simple string extraction as a fallback when JSON parsing fails.
+    pub fn repair_from_block(
+        tool_name: &str,
+        block: &str,
+        extract_simple: fn(&str, &str) -> Option<String>,
+        extract_trailing: fn(&str, &str) -> Option<String>,
+    ) -> Option<ToolInput> {
+        match tool_name {
+            "file.write" => Some(ToolInput::FileWrite {
+                path: extract_simple(block, "path")?,
+                content: extract_trailing(block, "content")?,
+            }),
+            "file.read" => Some(ToolInput::FileRead {
+                path: extract_simple(block, "path")?,
+            }),
+            "file.search" => Some(ToolInput::FileSearch {
+                root: extract_simple(block, "root").or_else(|| extract_simple(block, "path"))?,
+                pattern: extract_simple(block, "pattern")
+                    .or_else(|| extract_simple(block, "content"))
+                    .or_else(|| extract_simple(block, "query"))?,
+            }),
+            "shell.exec" | "shell" => Some(ToolInput::ShellExec {
+                command: extract_simple(block, "command")?,
+            }),
+            "web.fetch" => Some(ToolInput::WebFetch {
+                url: extract_simple(block, "url")?,
+            }),
+            "web.search" => Some(ToolInput::WebSearch {
+                query: extract_simple(block, "query")?,
+            }),
+            _ => None,
         }
     }
 }
@@ -147,13 +252,15 @@ impl ValidatedToolCall {
             return None;
         }
 
-        match self.spec.permission_class {
-            PermissionClass::Safe => None,
-            PermissionClass::Confirm | PermissionClass::Restricted => Some(ApprovalRequest {
-                tool_call_id: self.request.tool_call_id.clone(),
-                tool_name: self.spec.name.clone(),
-            }),
+        let effective = effective_permission_class(&self.request.input, &self.spec);
+        if effective == PermissionClass::Safe {
+            return None;
         }
+
+        Some(ApprovalRequest {
+            tool_call_id: self.request.tool_call_id.clone(),
+            tool_name: self.spec.name.clone(),
+        })
     }
 
     pub fn approve(mut self) -> Self {
@@ -348,12 +455,26 @@ impl ToolRegistry {
         });
     }
 
+    pub fn register_web_search(&mut self) {
+        self.register(ToolSpec {
+            version: 1,
+            name: "web.search".to_string(),
+            kind: ToolKind::WebSearch,
+            execution_class: ExecutionClass::Network,
+            permission_class: PermissionClass::Confirm,
+            execution_mode: ExecutionMode::SequentialOnly,
+            plan_mode: PlanModePolicy::Allowed,
+            rollback_policy: RollbackPolicy::None,
+        });
+    }
+
     pub fn register_standard_tools(&mut self) {
         self.register_file_read();
         self.register_file_write();
         self.register_file_search();
         self.register_shell_exec();
         self.register_web_fetch();
+        self.register_web_search();
     }
 
     pub fn validate(
@@ -380,8 +501,16 @@ impl ToolRegistry {
     }
 }
 
+// Rate limit intervals per provider.
+const RATE_LIMIT_DUCKDUCKGO: Duration = Duration::from_secs(2);
+const RATE_LIMIT_SERPER_API: Duration = Duration::from_secs(1);
+
 pub struct LocalToolExecutor {
     root: PathBuf,
+    last_web_search: Option<Instant>,
+    web_search_min_interval: Duration,
+    web_search_provider: WebSearchProvider,
+    serper_api_key: Option<String>,
 }
 
 #[derive(Debug)]
@@ -402,201 +531,426 @@ impl Display for ToolRuntimeError {
 impl std::error::Error for ToolRuntimeError {}
 
 impl LocalToolExecutor {
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+    pub fn new(root: impl Into<PathBuf>, config: &RuntimeConfig) -> Self {
+        let interval = match config.web_search_provider {
+            WebSearchProvider::DuckDuckGo => RATE_LIMIT_DUCKDUCKGO,
+            WebSearchProvider::SerperApi => RATE_LIMIT_SERPER_API,
+        };
+        Self {
+            root: root.into(),
+            last_web_search: None,
+            web_search_min_interval: interval,
+            web_search_provider: config.web_search_provider,
+            serper_api_key: config.serper_api_key.clone(),
+        }
+    }
+
+    /// Create an executor without rate limiting (for tests).
+    pub fn new_without_rate_limit(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            last_web_search: None,
+            web_search_min_interval: Duration::ZERO,
+            web_search_provider: WebSearchProvider::DuckDuckGo,
+            serper_api_key: None,
+        }
     }
 
     pub fn execute(
-        &self,
+        &mut self,
         request: ToolExecutionRequest,
     ) -> Result<ToolExecutionResult, ToolRuntimeError> {
         let started = Instant::now();
         match request.input {
-            ToolInput::FileRead { path } => {
-                let resolved = self.resolve_path(&path)?;
-                let content = if resolved.is_dir() {
-                    render_directory_listing(&resolved)?
-                } else {
-                    fs::read_to_string(&resolved).map_err(|err| {
-                        ToolRuntimeError::Io(format!(
-                            "file.read failed for {}: {err}",
-                            resolved.display()
-                        ))
-                    })?
-                };
-                Ok(ToolExecutionResult {
-                    tool_call_id: request.tool_call_id,
-                    tool_name: request.spec.name,
-                    status: ToolExecutionStatus::Completed,
-                    summary: path,
-                    payload: ToolExecutionPayload::Text(content),
-                    artifacts: vec![resolved.display().to_string()],
-                    elapsed_ms: started.elapsed().as_millis(),
-                })
+            ToolInput::FileRead { ref path } => self.execute_file_read(&request, path, started),
+            ToolInput::FileWrite {
+                ref path,
+                ref content,
+            } => self.execute_file_write(&request, path, content, started),
+            ToolInput::FileSearch {
+                ref root,
+                ref pattern,
+            } => self.execute_file_search(&request, root, pattern, started),
+            ToolInput::WebFetch { ref url } => self.execute_web_fetch(&request, url, started),
+            ToolInput::ShellExec { ref command } => {
+                self.execute_shell_exec(&request, command, started)
             }
-            ToolInput::FileWrite { path, content } => {
-                let resolved = self.resolve_path(&path)?;
-                if let Some(parent) = resolved.parent() {
-                    fs::create_dir_all(parent).map_err(|err| {
-                        ToolRuntimeError::Io(format!(
-                            "file.write failed to create parent {}: {err}",
-                            parent.display()
-                        ))
-                    })?;
+            ToolInput::WebSearch { ref query } => self.execute_web_search(&request, query, started),
+        }
+    }
+
+    fn execute_file_read(
+        &self,
+        request: &ToolExecutionRequest,
+        path: &str,
+        started: Instant,
+    ) -> Result<ToolExecutionResult, ToolRuntimeError> {
+        let resolved = self.resolve_path(path)?;
+        let content = if resolved.is_dir() {
+            render_directory_listing(&resolved)?
+        } else {
+            fs::read_to_string(&resolved).map_err(|err| {
+                ToolRuntimeError::Io(format!(
+                    "file.read failed for {}: {err}",
+                    resolved.display()
+                ))
+            })?
+        };
+        Ok(build_completed_result(
+            request,
+            path.to_string(),
+            ToolExecutionPayload::Text(content),
+            vec![resolved.display().to_string()],
+            started,
+        ))
+    }
+
+    fn execute_file_write(
+        &self,
+        request: &ToolExecutionRequest,
+        path: &str,
+        content: &str,
+        started: Instant,
+    ) -> Result<ToolExecutionResult, ToolRuntimeError> {
+        let resolved = self.resolve_path(path)?;
+        if let Some(parent) = resolved.parent() {
+            fs::create_dir_all(parent).map_err(|err| {
+                ToolRuntimeError::Io(format!(
+                    "file.write failed to create parent {}: {err}",
+                    parent.display()
+                ))
+            })?;
+        }
+        fs::write(&resolved, content).map_err(|err| {
+            ToolRuntimeError::Io(format!(
+                "file.write failed for {}: {err}",
+                resolved.display()
+            ))
+        })?;
+        Ok(build_completed_result(
+            request,
+            path.to_string(),
+            ToolExecutionPayload::None,
+            vec![resolved.display().to_string()],
+            started,
+        ))
+    }
+
+    fn execute_file_search(
+        &self,
+        request: &ToolExecutionRequest,
+        root: &str,
+        pattern: &str,
+        started: Instant,
+    ) -> Result<ToolExecutionResult, ToolRuntimeError> {
+        let resolved_root = self.resolve_path(root)?;
+        let mut matches = Vec::new();
+        collect_search_matches(&resolved_root, pattern, &mut matches)?;
+        Ok(build_completed_result(
+            request,
+            format!("{root} :: {pattern}"),
+            ToolExecutionPayload::Paths(matches.clone()),
+            matches,
+            started,
+        ))
+    }
+
+    fn execute_web_fetch(
+        &self,
+        request: &ToolExecutionRequest,
+        url: &str,
+        started: Instant,
+    ) -> Result<ToolExecutionResult, ToolRuntimeError> {
+        let output = std::process::Command::new("curl")
+            .args([
+                "-s",
+                "-L",
+                "--fail",
+                "--max-time",
+                "30",
+                "--max-filesize",
+                "1048576",
+                "--max-redirs",
+                "5",
+                "--",
+                url,
+            ])
+            .output()
+            .map_err(|err| {
+                ToolRuntimeError::Io(format!("web.fetch failed to spawn curl: {err}"))
+            })?;
+
+        if output.status.success() {
+            let body = String::from_utf8_lossy(&output.stdout).to_string();
+            Ok(build_completed_result(
+                request,
+                url.to_string(),
+                ToolExecutionPayload::Text(body),
+                Vec::new(),
+                started,
+            ))
+        } else {
+            let stderr_msg = String::from_utf8_lossy(&output.stderr).to_string();
+            Err(ToolRuntimeError::Io(format!(
+                "web.fetch failed for {url}: {stderr_msg}"
+            )))
+        }
+    }
+
+    fn execute_shell_exec(
+        &self,
+        request: &ToolExecutionRequest,
+        command: &str,
+        started: Instant,
+    ) -> Result<ToolExecutionResult, ToolRuntimeError> {
+        use std::io::{BufRead, Write as _};
+
+        let _ = writeln!(std::io::stderr(), "\n  $ {command}");
+
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .current_dir(&self.root)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|err| ToolRuntimeError::Io(format!("shell.exec failed to spawn: {err}")))?;
+
+        let stdout_handle = child.stdout.take();
+        let stderr_handle = child.stderr.take();
+
+        let stdout_thread = std::thread::spawn(move || {
+            let mut captured = String::new();
+            if let Some(out) = stdout_handle {
+                let reader = std::io::BufReader::new(out);
+                for line in reader.lines() {
+                    let Ok(line) = line else { break };
+                    let _ = writeln!(std::io::stderr(), "  {line}");
+                    captured.push_str(&line);
+                    captured.push('\n');
                 }
-                fs::write(&resolved, &content).map_err(|err| {
-                    ToolRuntimeError::Io(format!(
-                        "file.write failed for {}: {err}",
-                        resolved.display()
-                    ))
-                })?;
-                Ok(ToolExecutionResult {
-                    tool_call_id: request.tool_call_id,
-                    tool_name: request.spec.name,
-                    status: ToolExecutionStatus::Completed,
-                    summary: path,
-                    payload: ToolExecutionPayload::None,
-                    artifacts: vec![resolved.display().to_string()],
-                    elapsed_ms: started.elapsed().as_millis(),
-                })
             }
-            ToolInput::FileSearch { root, pattern } => {
-                let resolved_root = self.resolve_path(&root)?;
-                let mut matches = Vec::new();
-                collect_search_matches(&resolved_root, &pattern, &mut matches)?;
-                Ok(ToolExecutionResult {
-                    tool_call_id: request.tool_call_id,
-                    tool_name: request.spec.name,
-                    status: ToolExecutionStatus::Completed,
-                    summary: format!("{root} :: {pattern}"),
-                    payload: ToolExecutionPayload::Paths(matches.clone()),
-                    artifacts: matches,
-                    elapsed_ms: started.elapsed().as_millis(),
-                })
-            }
-            ToolInput::WebFetch { url } => {
-                let output = std::process::Command::new("curl")
-                    .args([
-                        "-s",
-                        "-L",
-                        "--fail",
-                        "--max-time",
-                        "30",
-                        "--max-filesize",
-                        "1048576",
-                        "--max-redirs",
-                        "5",
-                        &url,
-                    ])
-                    .output()
-                    .map_err(|err| {
-                        ToolRuntimeError::Io(format!("web.fetch failed to spawn curl: {err}"))
-                    })?;
+            captured
+        });
 
-                if output.status.success() {
-                    let body = String::from_utf8_lossy(&output.stdout).to_string();
-                    Ok(ToolExecutionResult {
-                        tool_call_id: request.tool_call_id,
-                        tool_name: request.spec.name,
-                        status: ToolExecutionStatus::Completed,
-                        summary: url,
-                        payload: ToolExecutionPayload::Text(body),
-                        artifacts: Vec::new(),
-                        elapsed_ms: started.elapsed().as_millis(),
-                    })
-                } else {
-                    let stderr_msg = String::from_utf8_lossy(&output.stderr).to_string();
-                    Err(ToolRuntimeError::Io(format!(
-                        "web.fetch failed for {url}: {stderr_msg}"
-                    )))
+        let stderr_thread = std::thread::spawn(move || {
+            let mut captured = String::new();
+            if let Some(err) = stderr_handle {
+                let reader = std::io::BufReader::new(err);
+                for line in reader.lines() {
+                    let Ok(line) = line else { break };
+                    let _ = writeln!(std::io::stderr(), "  {line}");
+                    captured.push_str(&line);
+                    captured.push('\n');
                 }
             }
-            ToolInput::ShellExec { command } => {
-                use std::io::{BufRead, Write as _};
+            captured
+        });
 
-                let _ = writeln!(std::io::stderr(), "\n  $ {command}");
+        let exit_status = child.wait().ok();
+        let stdout_buf = stdout_thread.join().unwrap_or_default();
+        let stderr_buf = stderr_thread.join().unwrap_or_default();
 
-                let mut child = std::process::Command::new("sh")
-                    .arg("-c")
-                    .arg(&command)
-                    .current_dir(&self.root)
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped())
-                    .spawn()
-                    .map_err(|err| {
-                        ToolRuntimeError::Io(format!("shell.exec failed to spawn: {err}"))
-                    })?;
+        let combined = if stderr_buf.trim().is_empty() {
+            stdout_buf
+        } else if stdout_buf.trim().is_empty() {
+            stderr_buf
+        } else {
+            format!("{stdout_buf}--- stderr ---\n{stderr_buf}")
+        };
 
-                // Stream stdout to stderr in real-time so the user can
-                // see progress and Ctrl+C if needed.
-                let stdout_handle = child.stdout.take();
-                let stderr_handle = child.stderr.take();
+        let success = exit_status.is_some_and(|s| s.success());
+        let status = if success {
+            ToolExecutionStatus::Completed
+        } else {
+            ToolExecutionStatus::Failed
+        };
+        let summary = if success {
+            format!("shell.exec completed: {command}")
+        } else {
+            format!(
+                "shell.exec failed (exit {}): {command}",
+                exit_status.and_then(|s| s.code()).unwrap_or(-1)
+            )
+        };
+        Ok(ToolExecutionResult {
+            tool_call_id: request.tool_call_id.clone(),
+            tool_name: request.spec.name.clone(),
+            status,
+            summary,
+            payload: ToolExecutionPayload::Text(combined),
+            artifacts: Vec::new(),
+            elapsed_ms: started.elapsed().as_millis(),
+        })
+    }
 
-                let stdout_thread = std::thread::spawn(move || {
-                    let mut captured = String::new();
-                    if let Some(out) = stdout_handle {
-                        let reader = std::io::BufReader::new(out);
-                        for line in reader.lines() {
-                            let Ok(line) = line else { break };
-                            let _ = writeln!(std::io::stderr(), "  {line}");
-                            captured.push_str(&line);
-                            captured.push('\n');
-                        }
-                    }
-                    captured
-                });
+    fn execute_web_search(
+        &mut self,
+        request: &ToolExecutionRequest,
+        query: &str,
+        started: Instant,
+    ) -> Result<ToolExecutionResult, ToolRuntimeError> {
+        self.enforce_rate_limit();
 
-                let stderr_thread = std::thread::spawn(move || {
-                    let mut captured = String::new();
-                    if let Some(err) = stderr_handle {
-                        let reader = std::io::BufReader::new(err);
-                        for line in reader.lines() {
-                            let Ok(line) = line else { break };
-                            let _ = writeln!(std::io::stderr(), "  {line}");
-                            captured.push_str(&line);
-                            captured.push('\n');
-                        }
-                    }
-                    captured
-                });
+        match self.web_search_provider {
+            WebSearchProvider::DuckDuckGo => {
+                self.execute_web_search_duckduckgo(request, query, started)
+            }
+            WebSearchProvider::SerperApi => self.execute_web_search_serper(request, query, started),
+        }
+    }
 
-                let exit_status = child.wait().ok();
-                let stdout_buf = stdout_thread.join().unwrap_or_default();
-                let stderr_buf = stderr_thread.join().unwrap_or_default();
+    fn execute_web_search_duckduckgo(
+        &self,
+        request: &ToolExecutionRequest,
+        query: &str,
+        started: Instant,
+    ) -> Result<ToolExecutionResult, ToolRuntimeError> {
+        let encoded_query = percent_encode(query);
+        let url = format!("https://html.duckduckgo.com/html/?q={encoded_query}");
 
-                let combined = if stderr_buf.trim().is_empty() {
-                    stdout_buf
-                } else if stdout_buf.trim().is_empty() {
-                    stderr_buf
-                } else {
-                    format!("{stdout_buf}--- stderr ---\n{stderr_buf}")
-                };
+        let output = std::process::Command::new("curl")
+            .args([
+                "-s",
+                "-L",
+                "--fail",
+                "--max-time",
+                "15",
+                "-H",
+                "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "--",
+            ])
+            .arg(&url)
+            .output()
+            .map_err(|err| {
+                ToolRuntimeError::Io(format!("web.search failed to spawn curl: {err}"))
+            })?;
 
-                let success = exit_status.is_some_and(|s| s.success());
-                let status = if success {
-                    ToolExecutionStatus::Completed
-                } else {
-                    ToolExecutionStatus::Failed
-                };
-                let summary = if success {
-                    format!("shell.exec completed: {command}")
-                } else {
-                    format!(
-                        "shell.exec failed (exit {}): {command}",
-                        exit_status.and_then(|s| s.code()).unwrap_or(-1)
-                    )
-                };
-                Ok(ToolExecutionResult {
-                    tool_call_id: request.tool_call_id,
-                    tool_name: request.spec.name,
-                    status,
-                    summary,
-                    payload: ToolExecutionPayload::Text(combined),
-                    artifacts: Vec::new(),
-                    elapsed_ms: started.elapsed().as_millis(),
-                })
+        if !output.status.success() {
+            return Err(ToolRuntimeError::Io(
+                "DuckDuckGo search failed. CAPTCHA/rate limit may be active. Please wait and retry."
+                    .to_string(),
+            ));
+        }
+
+        let body = String::from_utf8_lossy(&output.stdout).to_string();
+
+        // Parse results using regex
+        let results = parse_duckduckgo_results(&body);
+
+        // CAPTCHA / bot detection
+        if results.is_empty() {
+            let lower = body.to_ascii_lowercase();
+            let has_result_elements = lower.contains("result__a");
+            if !has_result_elements && (lower.contains("captcha") || lower.contains("bot")) {
+                return Err(ToolRuntimeError::Io(
+                    "DuckDuckGo search blocked by CAPTCHA/rate limit. Please wait and retry."
+                        .to_string(),
+                ));
             }
         }
+
+        let formatted = format_search_results(&results);
+
+        Ok(build_completed_result(
+            request,
+            format!("web.search: {query}"),
+            ToolExecutionPayload::Text(formatted),
+            Vec::new(),
+            started,
+        ))
+    }
+
+    fn execute_web_search_serper(
+        &self,
+        request: &ToolExecutionRequest,
+        query: &str,
+        started: Instant,
+    ) -> Result<ToolExecutionResult, ToolRuntimeError> {
+        let api_key = self.serper_api_key.as_deref().ok_or_else(|| {
+            ToolRuntimeError::Io("SerperAPI search failed. SERPER_API_KEY is not set.".to_string())
+        })?;
+
+        let body = serde_json::json!({"q": query}).to_string();
+        let header_value = format!("X-API-KEY: {api_key}");
+
+        let output = std::process::Command::new("curl")
+            .args([
+                "-s",
+                "-o",
+                "-",
+                "-w",
+                "\n%{http_code}",
+                "--max-time",
+                "10",
+                "-H",
+                &header_value,
+                "-H",
+                "Content-Type: application/json",
+                "-d",
+                &body,
+                "--",
+                "https://google.serper.dev/search",
+            ])
+            .output()
+            .map_err(|err| {
+                ToolRuntimeError::Io(format!(
+                    "web.search (SerperAPI) failed to spawn curl: {err}"
+                ))
+            })?;
+
+        if !output.status.success() {
+            let stderr_msg = String::from_utf8_lossy(&output.stderr).to_string();
+            return Err(ToolRuntimeError::Io(format!(
+                "Failed to reach SerperAPI. Check your network connection. {stderr_msg}"
+            )));
+        }
+
+        let raw_output = String::from_utf8_lossy(&output.stdout).to_string();
+        // Extract HTTP status code from the last line (appended by -w '\n%{http_code}')
+        let (response_body, http_code) = match raw_output.rsplit_once('\n') {
+            Some((body, code)) => (body.to_string(), code.trim().to_string()),
+            None => (raw_output, String::new()),
+        };
+
+        match http_code.as_str() {
+            "200" => {} // success
+            "401" | "403" => {
+                return Err(ToolRuntimeError::Io(
+                    "Invalid or expired SerperAPI key.".to_string(),
+                ));
+            }
+            "429" => {
+                return Err(ToolRuntimeError::Io(
+                    "SerperAPI rate limit exceeded. Please wait and retry.".to_string(),
+                ));
+            }
+            code => {
+                return Err(ToolRuntimeError::Io(format!(
+                    "SerperAPI request failed with HTTP {code}."
+                )));
+            }
+        }
+        let results = parse_serper_results(&response_body);
+        let formatted = format_search_results(&results);
+
+        Ok(build_completed_result(
+            request,
+            format!("web.search: {query}"),
+            ToolExecutionPayload::Text(formatted),
+            Vec::new(),
+            started,
+        ))
+    }
+
+    fn enforce_rate_limit(&mut self) {
+        if let Some(prev) = self.last_web_search {
+            let elapsed = prev.elapsed();
+            if elapsed < self.web_search_min_interval {
+                std::thread::sleep(self.web_search_min_interval - elapsed);
+            }
+        }
+        self.last_web_search = Some(Instant::now());
     }
 
     fn resolve_path(&self, raw: &str) -> Result<PathBuf, ToolRuntimeError> {
@@ -628,6 +982,27 @@ impl LocalToolExecutor {
             }
         }
         Ok(joined)
+    }
+}
+
+/// Build a [`ToolExecutionResult`] with `Completed` status.
+///
+/// Centralises the boilerplate shared by every successful execution path.
+fn build_completed_result(
+    request: &ToolExecutionRequest,
+    summary: String,
+    payload: ToolExecutionPayload,
+    artifacts: Vec<String>,
+    started: Instant,
+) -> ToolExecutionResult {
+    ToolExecutionResult {
+        tool_call_id: request.tool_call_id.clone(),
+        tool_name: request.spec.name.clone(),
+        status: ToolExecutionStatus::Completed,
+        summary,
+        payload,
+        artifacts,
+        elapsed_ms: started.elapsed().as_millis(),
     }
 }
 
@@ -720,6 +1095,24 @@ fn validate_required_fields(input: &ToolInput) -> Result<(), ToolValidationError
                 });
             }
         }
+        ToolInput::WebSearch { query } => {
+            if query.trim().is_empty() {
+                return Err(ToolValidationError::MissingRequiredField(
+                    "query".to_string(),
+                ));
+            }
+            const MAX_QUERY_LENGTH: usize = 500;
+            if query.len() > MAX_QUERY_LENGTH {
+                return Err(ToolValidationError::InvalidFieldValue {
+                    field: "query".to_string(),
+                    reason: format!(
+                        "query length {} exceeds maximum of {} characters",
+                        query.len(),
+                        MAX_QUERY_LENGTH
+                    ),
+                });
+            }
+        }
     }
 
     Ok(())
@@ -761,32 +1154,328 @@ fn validate_shell_command_safety(command: &str) -> Result<(), ToolValidationErro
     Ok(())
 }
 
+/// Determine whether a shell command is safe enough to auto-approve.
+///
+/// Commands that pass this check are promoted from `Confirm` to `Safe`
+/// by [`effective_permission_class`], skipping the approval prompt.
+pub fn is_safe_shell_command(command: &str) -> bool {
+    let trimmed = command.trim();
+
+    // Reject command chaining / injection vectors
+    if trimmed.contains('|')
+        || trimmed.contains(';')
+        || trimmed.contains('`')
+        || trimmed.contains("$(")
+        || trimmed.contains("${")
+        || trimmed.contains('\n')
+    {
+        return false;
+    }
+
+    // gh api: GET-only is safe (token-split based flag detection)
+    if trimmed.starts_with("gh api ") {
+        let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+        let mutation_flags = [
+            "--method",
+            "-X",
+            "--input",
+            "-f",
+            "--field",
+            "-F",
+            "--raw-field",
+        ];
+        let mutation_combined = [
+            "-XPOST",
+            "-XPUT",
+            "-XPATCH",
+            "-XDELETE",
+            "--method=POST",
+            "--method=PUT",
+            "--method=PATCH",
+            "--method=DELETE",
+            "--input=",
+            "-f=",
+            "--field=",
+            "-F=",
+            "--raw-field=",
+        ];
+
+        for (i, token) in tokens.iter().enumerate() {
+            // Check flag + next-token patterns (e.g. --method POST)
+            if mutation_flags.iter().any(|f| token == f) {
+                if let Some(next) = tokens.get(i + 1) {
+                    let upper = next.to_uppercase();
+                    if ["POST", "PUT", "PATCH", "DELETE"].contains(&upper.as_str()) {
+                        return false;
+                    }
+                }
+                // -f, --field, -F, --raw-field, --input are mutation flags by themselves
+                if ["-f", "--field", "-F", "--raw-field", "--input"].contains(token) {
+                    return false;
+                }
+            }
+            // Check combined forms (e.g. -XPOST, --method=POST, --input=file)
+            if mutation_combined.iter().any(|f| token.starts_with(f)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    const SAFE_PREFIXES: &[&str] = &[
+        "gh repo view",
+        "gh pr list",
+        "gh issue list",
+        "git log",
+        "git status",
+        "git diff",
+    ];
+    if !SAFE_PREFIXES
+        .iter()
+        .any(|prefix| trimmed.starts_with(prefix))
+    {
+        return false;
+    }
+
+    // Block dangerous options that may launch external processes
+    let dangerous_options = ["--web", "--browse"];
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    for token in &tokens {
+        if dangerous_options.iter().any(|opt| token == opt) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Compute the effective permission class for a tool call.
+///
+/// Safe shell commands (as determined by [`is_safe_shell_command`]) are
+/// promoted from `Confirm` to `Safe`, skipping the approval prompt.
+pub fn effective_permission_class(input: &ToolInput, spec: &ToolSpec) -> PermissionClass {
+    match input {
+        ToolInput::ShellExec { command } if is_safe_shell_command(command) => PermissionClass::Safe,
+        _ => spec.permission_class,
+    }
+}
+
+// --- Search result parsing helpers ---
+
+struct SearchResult {
+    title: String,
+    url: String,
+    snippet: String,
+}
+
+fn parse_duckduckgo_results(html: &str) -> Vec<SearchResult> {
+    use regex::Regex;
+
+    let mut results = Vec::new();
+
+    // Filter out ad results
+    let ad_re = Regex::new(r#"class="[^"]*result--ad[^"]*""#).ok();
+
+    // Match result links: <a ... class="result__a" ... href="URL">TITLE</a>
+    let link_re = Regex::new(r#"<a[^>]+class="result__a"[^>]*href="([^"]*)"[^>]*>(.*?)</a>"#).ok();
+
+    // Match snippets: <a class="result__snippet" ...>SNIPPET</a>
+    // Also try <td class="result__snippet"> for alternative format
+    let snippet_re = Regex::new(r#"class="result__snippet"[^>]*>(.*?)</(?:a|td)>"#).ok();
+
+    let (Some(link_re), Some(snippet_re)) = (link_re, snippet_re) else {
+        return results;
+    };
+
+    // Split the HTML into result blocks (each starts with result__a)
+    let link_captures: Vec<_> = link_re.captures_iter(html).collect();
+    let snippet_captures: Vec<_> = snippet_re.captures_iter(html).collect();
+
+    for (i, link_cap) in link_captures.iter().enumerate() {
+        if results.len() >= 10 {
+            break;
+        }
+
+        // Check if this result is within an ad block
+        let match_start = link_cap.get(0).map(|m| m.start()).unwrap_or(0);
+        if let Some(ref ad_re) = ad_re {
+            // Look backwards for ad class marker
+            let preceding = &html[..match_start];
+            let last_result_start = preceding.rfind("class=\"result ");
+            let last_ad = preceding.rfind("result--ad");
+            if let (Some(result_pos), Some(ad_pos)) = (last_result_start, last_ad)
+                && ad_pos > result_pos
+            {
+                continue;
+            }
+            // Also check forward context for ad markers
+            let end = (match_start + 500).min(html.len());
+            let context = &html[match_start..end];
+            if ad_re.is_match(context) {
+                continue;
+            }
+        }
+
+        let raw_url = link_cap.get(1).map_or("", |m| m.as_str());
+        let raw_title = link_cap.get(2).map_or("", |m| m.as_str());
+
+        // Decode DuckDuckGo redirect URLs
+        let url = decode_duckduckgo_url(raw_url);
+        let title = strip_html_tags(raw_title);
+
+        let snippet = snippet_captures
+            .get(i)
+            .and_then(|cap| cap.get(1))
+            .map(|m| strip_html_tags(m.as_str()))
+            .unwrap_or_default();
+
+        if !title.is_empty() && !url.is_empty() {
+            results.push(SearchResult {
+                title,
+                url,
+                snippet,
+            });
+        }
+    }
+
+    results
+}
+
+fn parse_serper_results(json_str: &str) -> Vec<SearchResult> {
+    let mut results = Vec::new();
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) else {
+        return results;
+    };
+
+    if let Some(organic) = value.get("organic").and_then(|v| v.as_array()) {
+        for item in organic.iter().take(10) {
+            let title = item
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let url = item
+                .get("link")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let snippet = item
+                .get("snippet")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if !title.is_empty() && !url.is_empty() {
+                results.push(SearchResult {
+                    title,
+                    url,
+                    snippet,
+                });
+            }
+        }
+    }
+
+    results
+}
+
+fn format_search_results(results: &[SearchResult]) -> String {
+    if results.is_empty() {
+        return "No search results found.".to_string();
+    }
+    let mut lines = Vec::new();
+    for (i, result) in results.iter().enumerate() {
+        lines.push(format!("[{}] {}", i + 1, result.title));
+        lines.push(format!("    {}", result.url));
+        if !result.snippet.is_empty() {
+            lines.push(format!("    {}", result.snippet));
+        }
+        lines.push(String::new());
+    }
+    lines.join("\n")
+}
+
+/// Percent-encode a query string for use in URLs.
+fn percent_encode(input: &str) -> String {
+    use std::fmt::Write;
+    let mut encoded = String::with_capacity(input.len() * 3);
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            b' ' => encoded.push('+'),
+            _ => {
+                let _ = write!(encoded, "%{byte:02X}");
+            }
+        }
+    }
+    encoded
+}
+
+/// Decode a DuckDuckGo redirect URL to extract the actual target URL.
+fn decode_duckduckgo_url(url: &str) -> String {
+    // DuckDuckGo wraps URLs in redirects like //duckduckgo.com/l/?uddg=ENCODED_URL&...
+    if (url.contains("duckduckgo.com/l/") || url.contains("uddg="))
+        && let Some(start) = url.find("uddg=")
+    {
+        let rest = &url[start + 5..];
+        let end = rest.find('&').unwrap_or(rest.len());
+        let encoded = &rest[..end];
+        return percent_decode(encoded);
+    }
+    url.to_string()
+}
+
+/// Simple percent-decode.
+fn percent_decode(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let mut chars = input.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '%' {
+            let hex: String = chars.by_ref().take(2).collect();
+            if let Ok(byte) = u8::from_str_radix(&hex, 16) {
+                result.push(byte as char);
+            } else {
+                result.push('%');
+                result.push_str(&hex);
+            }
+        } else if ch == '+' {
+            result.push(' ');
+        } else {
+            result.push(ch);
+        }
+    }
+    result
+}
+
+/// Strip HTML tags from a string.
+fn strip_html_tags(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let mut in_tag = false;
+    for ch in input.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => result.push(ch),
+            _ => {}
+        }
+    }
+    // Decode common HTML entities
+    result
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#x27;", "'")
+        .replace("&apos;", "'")
+        .replace("&#39;", "'")
+}
+
 fn collect_search_matches(
     root: &Path,
     pattern: &str,
     matches: &mut Vec<String>,
 ) -> Result<(), ToolRuntimeError> {
-    use std::io::BufRead;
-
     if root.is_file() {
-        let path_str = root.display().to_string();
-        if path_str.contains(pattern) {
-            matches.push(path_str);
-            return Ok(());
-        }
-        if !is_searchable_file(root) {
-            return Ok(());
-        }
-        if let Ok(file) = fs::File::open(root) {
-            let reader = std::io::BufReader::new(file);
-            for line in reader.lines() {
-                let Ok(line) = line else { break };
-                if line.contains(pattern) {
-                    matches.push(path_str);
-                    break;
-                }
-            }
-        }
+        check_file_match(root, pattern, matches);
         return Ok(());
     }
 
@@ -814,28 +1503,35 @@ fn collect_search_matches(
             }
             collect_search_matches(&path, pattern, matches)?;
         } else {
-            let path_str = path.display().to_string();
-            if path_str.contains(pattern) {
-                matches.push(path_str);
-                continue;
-            }
-            if !is_searchable_file(&path) {
-                continue;
-            }
-            if let Ok(file) = fs::File::open(&path) {
-                let reader = std::io::BufReader::new(file);
-                for line in reader.lines() {
-                    let Ok(line) = line else { break };
-                    if line.contains(pattern) {
-                        matches.push(path_str);
-                        break;
-                    }
-                }
-            }
+            check_file_match(&path, pattern, matches);
         }
     }
 
     Ok(())
+}
+
+/// Check whether a single file matches `pattern` by path name or content.
+fn check_file_match(path: &Path, pattern: &str, matches: &mut Vec<String>) {
+    use std::io::BufRead;
+
+    let path_str = path.display().to_string();
+    if path_str.contains(pattern) {
+        matches.push(path_str);
+        return;
+    }
+    if !is_searchable_file(path) {
+        return;
+    }
+    if let Ok(file) = fs::File::open(path) {
+        let reader = std::io::BufReader::new(file);
+        for line in reader.lines() {
+            let Ok(line) = line else { break };
+            if line.contains(pattern) {
+                matches.push(path_str);
+                break;
+            }
+        }
+    }
 }
 
 /// Check if a file is likely to be text and worth searching.

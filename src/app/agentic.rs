@@ -188,73 +188,28 @@ impl App {
         &mut self,
         structured: &StructuredAssistantResponse,
     ) -> Result<Vec<ToolExecutionResult>, AppError> {
-        let executor = LocalToolExecutor::new(self.config.paths.cwd.clone());
+        let mut executor =
+            LocalToolExecutor::new(self.config.paths.cwd.clone(), &self.config.runtime);
         let mut results = Vec::new();
         for call in &structured.tool_calls {
             let validated = match self.tools.validate(call.clone()) {
                 Ok(v) => v,
                 Err(err) => {
-                    let error_result = ToolExecutionResult {
-                        tool_call_id: call.tool_call_id.clone(),
-                        tool_name: call.tool_name.clone(),
-                        status: crate::tooling::ToolExecutionStatus::Failed,
-                        summary: format!("validation failed: {err:?}"),
-                        payload: crate::tooling::ToolExecutionPayload::None,
-                        artifacts: Vec::new(),
-                        elapsed_ms: 0,
-                    };
-                    self.session.push_message(
-                        SessionMessage::new(
-                            MessageRole::Tool,
-                            "tool",
-                            format_tool_result_message(
-                                &error_result,
-                                self.config.runtime.tool_result_max_chars,
-                            ),
-                        )
-                        .with_id(self.next_message_id("tool")),
-                    );
+                    let error_result =
+                        build_failed_result(call, format!("validation failed: {err:?}"));
+                    self.record_tool_result(&error_result);
                     results.push(error_result);
                     continue;
                 }
             };
             // Check if this tool needs approval in the current mode
             if self.config.mode.approval_required && validated.approval_required(true).is_some() {
-                let summary = match &call.input {
-                    crate::tooling::ToolInput::ShellExec { command } => {
-                        format!("{}: {command}", call.tool_name)
-                    }
-                    crate::tooling::ToolInput::FileWrite { path, .. } => {
-                        format!("{}: {path}", call.tool_name)
-                    }
-                    crate::tooling::ToolInput::WebFetch { url } => {
-                        format!("{}: {url}", call.tool_name)
-                    }
-                    _ => call.tool_name.clone(),
-                };
+                let summary = tool_call_approval_summary(call);
                 // Ask user inline via stderr/stdin
                 let approved = prompt_inline_approval(&summary);
                 if !approved {
-                    let denied_result = ToolExecutionResult {
-                        tool_call_id: call.tool_call_id.clone(),
-                        tool_name: call.tool_name.clone(),
-                        status: crate::tooling::ToolExecutionStatus::Failed,
-                        summary: "denied by user".to_string(),
-                        payload: crate::tooling::ToolExecutionPayload::None,
-                        artifacts: Vec::new(),
-                        elapsed_ms: 0,
-                    };
-                    self.session.push_message(
-                        SessionMessage::new(
-                            MessageRole::Tool,
-                            "tool",
-                            format_tool_result_message(
-                                &denied_result,
-                                self.config.runtime.tool_result_max_chars,
-                            ),
-                        )
-                        .with_id(self.next_message_id("tool")),
-                    );
+                    let denied_result = build_failed_result(call, "denied by user".to_string());
+                    self.record_tool_result(&denied_result);
                     results.push(denied_result);
                     continue;
                 }
@@ -269,26 +224,8 @@ impl App {
                 }) {
                 Ok(r) => r,
                 Err(err) => {
-                    let error_result = ToolExecutionResult {
-                        tool_call_id: call.tool_call_id.clone(),
-                        tool_name: call.tool_name.clone(),
-                        status: crate::tooling::ToolExecutionStatus::Failed,
-                        summary: format!("{err:?}"),
-                        payload: crate::tooling::ToolExecutionPayload::None,
-                        artifacts: Vec::new(),
-                        elapsed_ms: 0,
-                    };
-                    self.session.push_message(
-                        SessionMessage::new(
-                            MessageRole::Tool,
-                            "tool",
-                            format_tool_result_message(
-                                &error_result,
-                                self.config.runtime.tool_result_max_chars,
-                            ),
-                        )
-                        .with_id(self.next_message_id("tool")),
-                    );
+                    let error_result = build_failed_result(call, format!("{err:?}"));
+                    self.record_tool_result(&error_result);
                     results.push(error_result);
                     continue;
                 }
@@ -306,18 +243,23 @@ impl App {
                 },
             };
             // Record tool result WITH actual payload so the LLM can see it
-            self.session.push_message(
-                SessionMessage::new(
-                    MessageRole::Tool,
-                    "tool",
-                    format_tool_result_message(&result, self.config.runtime.tool_result_max_chars),
-                )
-                .with_id(self.next_message_id("tool")),
-            );
+            self.record_tool_result(&result);
             results.push(result);
         }
         self.persist_session(crate::contracts::AppEvent::SessionSaved)?;
         Ok(results)
+    }
+
+    /// Push a tool execution result into the session as a tool message.
+    fn record_tool_result(&mut self, result: &ToolExecutionResult) {
+        self.session.push_message(
+            SessionMessage::new(
+                MessageRole::Tool,
+                "tool",
+                format_tool_result_message(result, self.config.runtime.tool_result_max_chars),
+            )
+            .with_id(self.next_message_id("tool")),
+        );
     }
 
     pub(crate) fn handle_structured_done<C: ProviderClient>(
@@ -370,6 +312,9 @@ pub(crate) fn infer_plan_from_structured_response(
                 format!("run shell command: {command}")
             }
             crate::tooling::ToolInput::WebFetch { url } => format!("fetch {url}"),
+            crate::tooling::ToolInput::WebSearch { query } => {
+                format!("web search: {query}")
+            }
         };
         plan.push(item);
     }
@@ -411,6 +356,41 @@ pub(crate) fn format_tool_result_message(result: &ToolExecutionResult, max_chars
                 listing
             )
         }
+    }
+}
+
+/// Build a failed [`ToolExecutionResult`] with no payload.
+fn build_failed_result(
+    call: &crate::tooling::ToolCallRequest,
+    summary: String,
+) -> ToolExecutionResult {
+    ToolExecutionResult {
+        tool_call_id: call.tool_call_id.clone(),
+        tool_name: call.tool_name.clone(),
+        status: crate::tooling::ToolExecutionStatus::Failed,
+        summary,
+        payload: crate::tooling::ToolExecutionPayload::None,
+        artifacts: Vec::new(),
+        elapsed_ms: 0,
+    }
+}
+
+/// Produce a human-readable summary of a tool call for the approval prompt.
+fn tool_call_approval_summary(call: &crate::tooling::ToolCallRequest) -> String {
+    match &call.input {
+        crate::tooling::ToolInput::ShellExec { command } => {
+            format!("{}: {command}", call.tool_name)
+        }
+        crate::tooling::ToolInput::FileWrite { path, .. } => {
+            format!("{}: {path}", call.tool_name)
+        }
+        crate::tooling::ToolInput::WebFetch { url } => {
+            format!("{}: {url}", call.tool_name)
+        }
+        crate::tooling::ToolInput::WebSearch { query } => {
+            format!("Web search: {query}")
+        }
+        _ => call.tool_name.clone(),
     }
 }
 

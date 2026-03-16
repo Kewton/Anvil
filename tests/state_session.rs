@@ -413,3 +413,34 @@ fn session_interrupt_persists_and_resumes_correctly() {
     resumed.push_message(new_user_message("msg_003", "continue"));
     assert_eq!(resumed.message_count(), 3); // original 2 (msg_002 marked interrupted in-place) + new
 }
+
+#[test]
+fn web_search_pending_turn_state_serde_roundtrip() {
+    use anvil::agent::PendingTurnState;
+    use anvil::tooling::{ToolCallRequest, ToolInput};
+
+    let pending = PendingTurnState {
+        waiting_tool_call_id: "call_ws_001".to_string(),
+        remaining_events: vec![],
+        pending_tool_calls: vec![ToolCallRequest::new(
+            "call_ws_001",
+            "web.search",
+            ToolInput::WebSearch {
+                query: "rust serde tutorial".to_string(),
+            },
+        )],
+    };
+
+    let json = serde_json::to_string(&pending).expect("serialize should succeed");
+    let deserialized: PendingTurnState =
+        serde_json::from_str(&json).expect("deserialize should succeed");
+
+    assert_eq!(pending, deserialized);
+    assert_eq!(deserialized.pending_tool_calls[0].tool_name, "web.search");
+    match &deserialized.pending_tool_calls[0].input {
+        ToolInput::WebSearch { query } => {
+            assert_eq!(query, "rust serde tutorial");
+        }
+        other => panic!("unexpected tool input: {other:?}"),
+    }
+}

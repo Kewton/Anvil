@@ -13,6 +13,13 @@ use std::{
     fmt::{Display, Formatter},
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WebSearchProvider {
+    #[default]
+    DuckDuckGo,
+    SerperApi,
+}
+
 #[derive(Debug, Clone)]
 /// Provider, model, and transport settings.
 pub struct RuntimeConfig {
@@ -28,6 +35,8 @@ pub struct RuntimeConfig {
     pub auto_compact_threshold: usize,
     pub tool_result_max_chars: usize,
     pub stream: bool,
+    pub web_search_provider: WebSearchProvider,
+    pub serper_api_key: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -69,6 +78,7 @@ pub enum ConfigError {
     InvalidConfigLine(String),
     InvalidNumericValue(String),
     InvalidReasoningVisibility(String),
+    InvalidWebSearchProvider(String),
 }
 
 impl Display for ConfigError {
@@ -82,6 +92,9 @@ impl Display for ConfigError {
             Self::InvalidNumericValue(value) => write!(f, "invalid numeric config value: {value}"),
             Self::InvalidReasoningVisibility(value) => {
                 write!(f, "invalid reasoning visibility: {value}")
+            }
+            Self::InvalidWebSearchProvider(value) => {
+                write!(f, "invalid web search provider: {value}")
             }
         }
     }
@@ -117,6 +130,8 @@ impl EffectiveConfig {
                 auto_compact_threshold: 64,
                 tool_result_max_chars: 8000,
                 stream: true,
+                web_search_provider: WebSearchProvider::default(),
+                serper_api_key: None,
             },
             mode: ModeConfig {
                 interactive: true,
@@ -187,6 +202,8 @@ impl EffectiveConfig {
             "ANVIL_FRESH_SESSION",
             "ANVIL_REASONING_VISIBILITY",
             "ANVIL_DEBUG",
+            "ANVIL_WEB_SEARCH_PROVIDER",
+            "SERPER_API_KEY",
         ] {
             if let Ok(value) = std::env::var(key) {
                 map.insert(key.to_string(), value);
@@ -337,6 +354,16 @@ impl EffectiveConfig {
                 "reasoning_visibility" | "ANVIL_REASONING_VISIBILITY" => {
                     self.mode.reasoning_visibility = parse_reasoning_visibility(value)?;
                 }
+                "web_search_provider" | "ANVIL_WEB_SEARCH_PROVIDER" => {
+                    self.runtime.web_search_provider = parse_web_search_provider(value)?;
+                }
+                "serper_api_key" | "SERPER_API_KEY" => {
+                    self.runtime.serper_api_key = if value.is_empty() {
+                        None
+                    } else {
+                        Some(value.clone())
+                    };
+                }
                 _ => {}
             }
         }
@@ -383,5 +410,13 @@ fn parse_reasoning_visibility(value: &str) -> Result<ReasoningVisibility, Config
         "hidden" => Ok(ReasoningVisibility::Hidden),
         "summary" => Ok(ReasoningVisibility::Summary),
         other => Err(ConfigError::InvalidReasoningVisibility(other.to_string())),
+    }
+}
+
+fn parse_web_search_provider(value: &str) -> Result<WebSearchProvider, ConfigError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "duckduckgo" => Ok(WebSearchProvider::DuckDuckGo),
+        "serper_api" | "serperapi" | "serper" => Ok(WebSearchProvider::SerperApi),
+        other => Err(ConfigError::InvalidWebSearchProvider(other.to_string())),
     }
 }
