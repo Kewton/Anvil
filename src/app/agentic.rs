@@ -97,7 +97,7 @@ impl App {
                 &self.session,
                 self.provider.capabilities.streaming && self.config.runtime.stream,
                 self.config.runtime.context_window,
-                self.config.project_instructions(),
+                &self.system_prompt,
             );
 
             let mut next_token_buffer = String::new();

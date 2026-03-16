@@ -12,6 +12,12 @@ use crate::tooling::{ToolCallRequest, ToolInput};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectLanguage {
+    Rust,
+    NodeJs,
+}
+
 /// Events emitted by the agent during a single turn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AgentEvent {
@@ -120,24 +126,12 @@ pub struct StructuredAssistantResponse {
 }
 
 impl BasicAgentLoop {
-    /// Build the system prompt string, optionally appending ANVIL.md content.
-    fn build_system_content(project_instructions: Option<&str>) -> String {
-        match project_instructions {
-            Some(instructions) => format!(
-                "{}\n\n## Project instructions (from ANVIL.md)\n{}",
-                tool_protocol_system_prompt(),
-                instructions
-            ),
-            None => tool_protocol_system_prompt().to_string(),
-        }
-    }
-
     pub fn build_turn_request(
         model: impl Into<String>,
         session: &SessionRecord,
         stream: bool,
         context_window: u32,
-        project_instructions: Option<&str>,
+        system_prompt: &str,
     ) -> ProviderTurnRequest {
         let token_budget = derive_context_budget(context_window);
         Self::build_turn_request_with_token_budget(
@@ -145,7 +139,7 @@ impl BasicAgentLoop {
             session,
             stream,
             token_budget,
-            project_instructions,
+            system_prompt,
         )
     }
 
@@ -154,18 +148,16 @@ impl BasicAgentLoop {
         session: &SessionRecord,
         stream: bool,
         max_messages: usize,
-        project_instructions: Option<&str>,
+        system_prompt: &str,
     ) -> ProviderTurnRequest {
         let len = session.messages.len();
         let start = len.saturating_sub(max_messages);
-
-        let system_content = Self::build_system_content(project_instructions);
 
         ProviderTurnRequest::new(
             model.into(),
             std::iter::once(ProviderMessage::new(
                 ProviderMessageRole::System,
-                &system_content,
+                system_prompt,
             ))
             .chain(session.messages[start..].iter().map(to_provider_message))
             .collect(),
@@ -178,7 +170,7 @@ impl BasicAgentLoop {
         session: &SessionRecord,
         stream: bool,
         token_budget: usize,
-        project_instructions: Option<&str>,
+        system_prompt: &str,
     ) -> ProviderTurnRequest {
         let mut selected = Vec::new();
         let mut used_tokens = 0usize;
@@ -201,13 +193,11 @@ impl BasicAgentLoop {
             "built turn request"
         );
 
-        let system_content = Self::build_system_content(project_instructions);
-
         ProviderTurnRequest::new(
             model.into(),
             std::iter::once(ProviderMessage::new(
                 ProviderMessageRole::System,
-                &system_content,
+                system_prompt,
             ))
             .chain(selected.into_iter().map(to_provider_message))
             .collect(),
@@ -373,8 +363,8 @@ fn estimate_message_tokens(content: &str) -> usize {
     chars.div_ceil(4).max(1)
 }
 
-fn tool_protocol_system_prompt() -> &'static str {
-    concat!(
+pub fn tool_protocol_system_prompt(languages: &[ProjectLanguage]) -> String {
+    let base = concat!(
         "You are Anvil, a local coding agent for serious terminal work.\n",
         "\n",
         "## Work approach\n",
@@ -448,7 +438,72 @@ fn tool_protocol_system_prompt() -> &'static str {
         "- Code frequency: gh api repos/{owner}/{repo}/stats/code_frequency\n",
         "- Detect repo: gh repo view --json owner,name\n",
         "- GitHub stats endpoints (contributors, commit_activity) may return {} on first request. If you get an empty response, wait 3 seconds with shell.exec sleep 3 and retry the same API call."
-    )
+    );
+    let mut prompt = base.to_string();
+
+    // Always include: Git operations guide
+    prompt.push_str(concat!(
+        "\n\n## Git operations\n",
+        "When working with Git, follow these safety categories:\n",
+        "\n",
+        "**Safe (auto-approved):**\n",
+        "- git status, git log, git diff, git branch, git show <ref>, git remote -v, git rev-parse\n",
+        "\n",
+        "**Change (requires confirmation):**\n",
+        "- git add, git commit, git push, git checkout, git merge, git rebase, git stash\n",
+        "\n",
+        "**NEVER use these without explicit user request:**\n",
+        "- git reset --hard — destroys uncommitted changes irreversibly\n",
+        "- git clean -fd — deletes untracked files permanently\n",
+        "- git push --force — rewrites remote history, can lose team members' work\n",
+        "- git rebase on shared branches — rewrites history others depend on\n",
+        "- --no-verify flag — skips safety hooks, always blocked by the system\n",
+    ));
+
+    // Always include: Environment inspection guide
+    prompt.push_str(concat!(
+        "\n## Environment inspection\n",
+        "Use these to check the development environment:\n",
+        "- which <tool> — check if a tool is installed\n",
+        "- uname — identify the operating system\n",
+        "- node -v, rustc --version, python --version, go version — check language versions\n",
+    ));
+
+    // Always include: Process management guide
+    prompt.push_str(concat!(
+        "\n## Process management\n",
+        "- lsof -i — check network port usage\n",
+        "- For dev servers (npm run dev, cargo watch), use background execution with '&'\n",
+    ));
+
+    // Rust-specific guide (only when Rust detected)
+    if languages.contains(&ProjectLanguage::Rust) {
+        prompt.push_str(concat!(
+            "\n## Rust development\n",
+            "Build, test, and lint commands (auto-approved):\n",
+            "- cargo build — compile the project\n",
+            "- cargo test — run all tests\n",
+            "- cargo clippy --all-targets — run linter (aim for zero warnings)\n",
+            "- cargo fmt --check — check formatting\n",
+            "- cargo check — type-check without building\n",
+            "When fixing issues, iterate: make changes, then cargo build, cargo test, cargo clippy.\n",
+        ));
+    }
+
+    // Node.js-specific guide (only when NodeJs detected)
+    if languages.contains(&ProjectLanguage::NodeJs) {
+        prompt.push_str(concat!(
+            "\n## Node.js development\n",
+            "Build, test, and lint commands (auto-approved):\n",
+            "- npm test — run test suite\n",
+            "- npx jest <path> — run specific tests\n",
+            "- npx eslint <path> — run linter\n",
+            "- npx prettier --check <path> — check formatting\n",
+            "When fixing issues, iterate: make changes, then npm test, npx eslint.\n",
+        ));
+    }
+
+    prompt
 }
 
 fn extract_fenced_blocks(content: &str, label: &str) -> Vec<String> {

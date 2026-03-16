@@ -1271,7 +1271,8 @@ fn validate_required_fields(input: &ToolInput) -> Result<(), ToolValidationError
 /// This is a defence-in-depth measure.  The primary protection is the
 /// `Restricted` permission class which blocks `shell.exec` by default.
 fn validate_shell_command_safety(command: &str) -> Result<(), ToolValidationError> {
-    const BLOCKED: &[(&str, &str)] = &[
+    /// Patterns that are unconditionally blocked regardless of context.
+    const BLOCKED_PATTERNS: &[(&str, &str)] = &[
         ("rm -rf /", "recursive deletion of root filesystem"),
         ("rm -rf ~", "recursive deletion of home directory"),
         (
@@ -1289,13 +1290,43 @@ fn validate_shell_command_safety(command: &str) -> Result<(), ToolValidationErro
         ),
     ];
 
+    /// Git sub-commands where --no-verify / -n is blocked.
+    const GIT_NO_VERIFY_BLOCKED: &[&str] = &["commit", "push", "merge"];
+
     let lower = command.to_ascii_lowercase();
-    for (pattern, reason) in BLOCKED {
+
+    for (pattern, reason) in BLOCKED_PATTERNS {
         if lower.contains(pattern) {
             return Err(ToolValidationError::DangerousCommand {
                 command: command.to_string(),
                 reason: reason.to_string(),
             });
+        }
+    }
+
+    // Block --no-verify / -n on git commands that support hook bypass.
+    if lower.starts_with("git ") {
+        let tokens: Vec<&str> = lower.split_whitespace().collect();
+        let is_blocked_subcommand = tokens
+            .get(1)
+            .is_some_and(|sub| GIT_NO_VERIFY_BLOCKED.contains(sub));
+        if is_blocked_subcommand {
+            let has_no_verify = tokens.contains(&"--no-verify");
+            let has_short_n = tokens.contains(&"-n");
+            if has_no_verify {
+                return Err(ToolValidationError::DangerousCommand {
+                    command: command.to_string(),
+                    reason: "skipping git hooks can bypass safety checks".to_string(),
+                });
+            }
+            if has_short_n {
+                return Err(ToolValidationError::DangerousCommand {
+                    command: command.to_string(),
+                    reason:
+                        "skipping git hooks can bypass safety checks (-n is short for --no-verify)"
+                            .to_string(),
+                });
+            }
         }
     }
 
@@ -1316,6 +1347,9 @@ pub fn is_safe_shell_command(command: &str) -> bool {
         || trimmed.contains("$(")
         || trimmed.contains("${")
         || trimmed.contains('\n')
+        || trimmed.contains("&&")
+        || trimmed.contains('>')
+        || trimmed.contains('<')
     {
         return false;
     }
@@ -1323,16 +1357,12 @@ pub fn is_safe_shell_command(command: &str) -> bool {
     // gh api: GET-only is safe (token-split based flag detection)
     if trimmed.starts_with("gh api ") {
         let tokens: Vec<&str> = trimmed.split_whitespace().collect();
-        let mutation_flags = [
-            "--method",
-            "-X",
-            "--input",
-            "-f",
-            "--field",
-            "-F",
-            "--raw-field",
-        ];
-        let mutation_combined = [
+
+        // Flags that imply a mutating request by their mere presence.
+        const BODY_FLAGS: &[&str] = &["-f", "--field", "-F", "--raw-field", "--input"];
+
+        // Combined flag=value forms that imply mutation.
+        const MUTATION_COMBINED: &[&str] = &[
             "-XPOST",
             "-XPUT",
             "-XPATCH",
@@ -1349,35 +1379,70 @@ pub fn is_safe_shell_command(command: &str) -> bool {
         ];
 
         for (i, token) in tokens.iter().enumerate() {
-            // Check flag + next-token patterns (e.g. --method POST)
-            if mutation_flags.iter().any(|f| token == f) {
-                if let Some(next) = tokens.get(i + 1) {
-                    let upper = next.to_uppercase();
-                    if ["POST", "PUT", "PATCH", "DELETE"].contains(&upper.as_str()) {
-                        return false;
-                    }
-                }
-                // -f, --field, -F, --raw-field, --input are mutation flags by themselves
-                if ["-f", "--field", "-F", "--raw-field", "--input"].contains(token) {
+            // Body/field flags always imply mutation (POST is the gh default).
+            if BODY_FLAGS.iter().any(|f| token == f) {
+                return false;
+            }
+
+            // --method / -X followed by a mutating HTTP verb.
+            if (*token == "--method" || *token == "-X")
+                && let Some(next) = tokens.get(i + 1)
+            {
+                let upper = next.to_uppercase();
+                if ["POST", "PUT", "PATCH", "DELETE"].contains(&upper.as_str()) {
                     return false;
                 }
             }
-            // Check combined forms (e.g. -XPOST, --method=POST, --input=file)
-            if mutation_combined.iter().any(|f| token.starts_with(f)) {
+
+            // Combined forms (e.g. -XPOST, --method=POST, --input=file)
+            if MUTATION_COMBINED.iter().any(|f| token.starts_with(f)) {
                 return false;
             }
         }
         return true;
     }
 
+    // Auto-approved command prefixes, grouped by category for readability.
     const SAFE_PREFIXES: &[&str] = &[
-        "gh repo view",
-        "gh pr list",
-        "gh issue list",
+        // Git read-only
         "git log",
         "git status",
         "git diff",
+        "git branch",
+        "git show ", // trailing space requires an argument (ref)
+        "git remote -v",
+        "git rev-parse",
+        // GitHub CLI read-only
+        "gh repo view",
+        "gh pr list",
+        "gh issue list",
+        "gh pr view",
+        "gh issue view",
+        "gh auth status",
+        // Rust build/test/lint
+        "cargo clippy",
+        "cargo fmt --check",
+        "cargo test",
+        "cargo check",
+        "cargo build",
+        // Node.js build/test/lint
+        "npm test",
+        "npx jest ",
+        "npx eslint ",
+        "npx prettier --check",
+        // Environment inspection
+        "which ",
+        "uname",
+        "node -v",
+        "node --version",
+        "rustc --version",
+        "cargo --version",
+        "python --version",
+        "go version",
+        // Process inspection
+        "lsof -i",
     ];
+
     if !SAFE_PREFIXES
         .iter()
         .any(|prefix| trimmed.starts_with(prefix))
