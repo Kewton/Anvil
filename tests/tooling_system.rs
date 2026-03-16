@@ -12,6 +12,7 @@ fn build_registry() -> ToolRegistry {
     registry.register_file_write();
     registry.register_file_search();
     registry.register_shell_exec();
+    registry.register_web_fetch();
     registry
 }
 
@@ -404,4 +405,137 @@ fn local_tool_executor_reads_directory_as_listing() {
         }
         other => panic!("unexpected payload: {other:?}"),
     }
+}
+
+// --- web.fetch tests ---
+
+#[test]
+fn web_fetch_is_registered_after_register_standard_tools() {
+    let mut registry = ToolRegistry::new();
+    registry.register_standard_tools();
+    let spec = registry
+        .get("web.fetch")
+        .expect("web.fetch should be registered");
+    assert_eq!(spec.kind, ToolKind::WebFetch);
+    assert_eq!(spec.execution_class, ExecutionClass::Network);
+    assert_eq!(spec.permission_class, PermissionClass::Safe);
+}
+
+#[test]
+fn web_fetch_input_maps_to_web_fetch_kind() {
+    let input = ToolInput::WebFetch {
+        url: "https://example.com".to_string(),
+    };
+    assert_eq!(input.kind(), ToolKind::WebFetch);
+}
+
+#[test]
+fn web_fetch_validation_rejects_empty_url() {
+    let registry = build_registry();
+    let err = registry
+        .validate(ToolCallRequest::new(
+            "call_fetch_001",
+            "web.fetch",
+            ToolInput::WebFetch {
+                url: "".to_string(),
+            },
+        ))
+        .expect_err("empty URL should be rejected");
+    assert_eq!(
+        err,
+        ToolValidationError::MissingRequiredField("url".to_string())
+    );
+}
+
+#[test]
+fn web_fetch_validation_accepts_http_url() {
+    let registry = build_registry();
+    let result = registry.validate(ToolCallRequest::new(
+        "call_fetch_002",
+        "web.fetch",
+        ToolInput::WebFetch {
+            url: "http://example.com".to_string(),
+        },
+    ));
+    assert!(result.is_ok(), "http:// URL should be accepted");
+}
+
+#[test]
+fn web_fetch_validation_accepts_https_url() {
+    let registry = build_registry();
+    let result = registry.validate(ToolCallRequest::new(
+        "call_fetch_003",
+        "web.fetch",
+        ToolInput::WebFetch {
+            url: "https://example.com".to_string(),
+        },
+    ));
+    assert!(result.is_ok(), "https:// URL should be accepted");
+}
+
+#[test]
+fn web_fetch_validation_rejects_file_scheme() {
+    let registry = build_registry();
+    let err = registry
+        .validate(ToolCallRequest::new(
+            "call_fetch_004",
+            "web.fetch",
+            ToolInput::WebFetch {
+                url: "file:///etc/passwd".to_string(),
+            },
+        ))
+        .expect_err("file:// URL should be rejected");
+    assert_eq!(
+        err,
+        ToolValidationError::InvalidFieldValue {
+            field: "url".to_string(),
+            reason: "must start with http:// or https://".to_string(),
+        }
+    );
+}
+
+#[test]
+fn web_fetch_validation_rejects_ftp_scheme() {
+    let registry = build_registry();
+    let err = registry
+        .validate(ToolCallRequest::new(
+            "call_fetch_005",
+            "web.fetch",
+            ToolInput::WebFetch {
+                url: "ftp://example.com/file".to_string(),
+            },
+        ))
+        .expect_err("ftp:// URL should be rejected");
+    assert_eq!(
+        err,
+        ToolValidationError::InvalidFieldValue {
+            field: "url".to_string(),
+            reason: "must start with http:// or https://".to_string(),
+        }
+    );
+}
+
+#[test]
+fn web_fetch_serde_round_trip() {
+    let input = ToolInput::WebFetch {
+        url: "https://example.com/page".to_string(),
+    };
+    let json = serde_json::to_string(&input).expect("serialize should succeed");
+    let deserialized: ToolInput = serde_json::from_str(&json).expect("deserialize should succeed");
+    assert_eq!(input, deserialized);
+}
+
+#[test]
+fn web_fetch_spec_has_correct_policies() {
+    let registry = build_registry();
+    let spec = registry.get("web.fetch").expect("web.fetch should exist");
+    assert_eq!(spec.version, 1);
+    assert_eq!(spec.permission_class, PermissionClass::Safe);
+    assert_eq!(spec.execution_class, ExecutionClass::Network);
+    assert_eq!(
+        spec.execution_mode,
+        anvil::tooling::ExecutionMode::ParallelSafe
+    );
+    assert_eq!(spec.plan_mode, PlanModePolicy::Allowed);
+    assert_eq!(spec.rollback_policy, RollbackPolicy::None);
 }

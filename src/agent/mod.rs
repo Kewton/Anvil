@@ -291,6 +291,13 @@ fn parse_tool_call_value(value: &Value) -> Result<ToolCallRequest, String> {
                 .ok_or_else(|| "missing command in shell.exec tool block".to_string())?
                 .to_string(),
         },
+        "web.fetch" => ToolInput::WebFetch {
+            url: value
+                .get("url")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "missing url in web.fetch tool block".to_string())?
+                .to_string(),
+        },
         other => return Err(format!("unsupported tool in ANVIL_TOOL block: {other}")),
     };
 
@@ -323,6 +330,9 @@ fn repair_tool_call_block(block: &str) -> Option<ToolCallRequest> {
         },
         "shell.exec" | "shell" => ToolInput::ShellExec {
             command: extract_simple_string_field(block, "command")?,
+        },
+        "web.fetch" => ToolInput::WebFetch {
+            url: extract_simple_string_field(block, "url")?,
         },
         _ => return None,
     };
@@ -430,6 +440,11 @@ fn tool_protocol_system_prompt() -> &'static str {
         "4. shell.exec — run a shell command and capture its output:\n",
         "```ANVIL_TOOL\n",
         "{\"id\":\"call_004\",\"tool\":\"shell.exec\",\"command\":\"ls -la\"}\n",
+        "```\n",
+        "\n",
+        "5. web.fetch — fetch the contents of a URL:\n",
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_005\",\"tool\":\"web.fetch\",\"url\":\"https://example.com\"}\n",
         "```\n",
         "\n",
         "After ALL tool blocks, include exactly one final block with your summary:\n",

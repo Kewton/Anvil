@@ -1242,3 +1242,60 @@ fn agentic_loop_error_during_followup_propagates() {
         "error message should indicate agentic follow-up failure, got: {err_msg}"
     );
 }
+
+// --- web.fetch agent protocol tests ---
+
+#[test]
+fn structured_response_parser_handles_web_fetch_tool_block() {
+    let response = anvil::agent::BasicAgentLoop::parse_structured_response(concat!(
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_fetch_001\",\"tool\":\"web.fetch\",\"url\":\"https://example.com\"}\n",
+        "```\n",
+        "```ANVIL_FINAL\n",
+        "Fetched the page content.\n",
+        "```\n"
+    ))
+    .expect("parser should handle web.fetch block");
+
+    assert_eq!(response.tool_calls.len(), 1);
+    assert_eq!(response.tool_calls[0].tool_name, "web.fetch");
+    match &response.tool_calls[0].input {
+        anvil::tooling::ToolInput::WebFetch { url } => {
+            assert_eq!(url, "https://example.com");
+        }
+        other => panic!("unexpected tool input: {other:?}"),
+    }
+}
+
+#[test]
+fn structured_response_parser_repairs_web_fetch_block() {
+    // Simulate malformed JSON that the repair path should handle
+    let response = anvil::agent::BasicAgentLoop::parse_structured_response(concat!(
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_fetch_002\",\"tool\":\"web.fetch\",\"url\":\"https://example.com/page\"\n",
+        "```\n",
+        "```ANVIL_FINAL\n",
+        "Fetched the page.\n",
+        "```\n"
+    ))
+    .expect("parser should repair web.fetch block");
+
+    assert_eq!(response.tool_calls.len(), 1);
+    match &response.tool_calls[0].input {
+        anvil::tooling::ToolInput::WebFetch { url } => {
+            assert_eq!(url, "https://example.com/page");
+        }
+        other => panic!("unexpected tool input: {other:?}"),
+    }
+}
+
+#[test]
+fn system_prompt_includes_web_fetch_tool() {
+    let session = anvil::session::SessionRecord::new(std::path::PathBuf::from("/tmp"));
+    let request =
+        anvil::agent::BasicAgentLoop::build_turn_request("test-model", &session, false, 4096);
+    assert!(
+        request.messages[0].content.contains("web.fetch"),
+        "system prompt should mention web.fetch"
+    );
+}
