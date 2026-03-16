@@ -208,24 +208,28 @@ fn regular_input_runs_live_turn_and_supports_follow_up_in_same_session() {
     let first = app
         .handle_cli_line("inspect app bootstrap", &provider, &tui)
         .expect("first prompt should run");
-    let second = app
+    let _second = app
         .handle_cli_line("now summarize config behavior", &provider, &tui)
         .expect("follow-up prompt should run");
 
     assert_eq!(first.control, SessionControl::Continue);
+    // Assistant messages are excluded from frame rendering (streamed to stderr,
+    // Issue #1). The Done frame shows the completion_summary instead.
     assert!(
         first
             .frames
             .last()
             .expect("first frame")
-            .contains("provider-backed answer")
+            .contains("[A] anvil > result"),
+        "done frame should contain result section"
     );
+    // The assistant message should be stored in session for LLM context.
     assert!(
-        second
-            .frames
-            .last()
-            .expect("second frame")
-            .contains("provider-backed answer")
+        app.session()
+            .messages
+            .iter()
+            .any(|m| m.content == "provider-backed answer"),
+        "assistant message should be in session history"
     );
     assert_eq!(seen_requests.borrow().len(), 2);
     assert!(
@@ -299,12 +303,22 @@ fn slash_approve_and_deny_resolve_pending_tool_approval() {
     let approved = app
         .handle_cli_line("/approve", &provider, &tui)
         .expect("approve should continue");
+    // Assistant message is excluded from frame rendering (streamed to stderr,
+    // Issue #1). The Done frame shows result/completion_summary instead.
     assert!(
         approved
             .frames
             .last()
             .expect("approved frame")
-            .contains("approved write completed")
+            .contains("[A] anvil > result"),
+        "approved done frame should contain result section"
+    );
+    assert!(
+        app.session()
+            .messages
+            .iter()
+            .any(|m| m.content == "approved write completed"),
+        "assistant message should be in session history"
     );
 
     let provider_deny = RecordingProvider {
@@ -524,12 +538,22 @@ fn custom_slash_commands_load_from_extension_file_and_run_live_turn() {
             .expect("help frame")
             .contains("/invaders")
     );
+    // Assistant message is excluded from frame rendering (streamed to stderr,
+    // Issue #1). The Done frame shows result/completion_summary instead.
     assert!(
         invaders
             .frames
             .last()
             .expect("custom command frame")
-            .contains("custom command completed")
+            .contains("[A] anvil > result"),
+        "custom command done frame should contain result section"
+    );
+    assert!(
+        app.session()
+            .messages
+            .iter()
+            .any(|m| m.content == "custom command completed"),
+        "assistant message should be in session history"
     );
     assert!(
         seen_requests.borrow()[0]

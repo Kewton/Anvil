@@ -157,7 +157,19 @@ impl SessionRecord {
         self.messages.len()
     }
 
-    pub fn recent_message_views(&self, limit: usize) -> Vec<ConsoleMessageView> {
+    pub fn recent_message_views(
+        &self,
+        limit: usize,
+        exclude_messages: bool,
+    ) -> Vec<ConsoleMessageView> {
+        // When exclude_messages is true, skip ALL messages because they
+        // were already shown during the live turn (streaming to stderr,
+        // tool execution output, etc.).  Rendering them again in the
+        // console frame would cause duplicate output (Issue #1).
+        if exclude_messages {
+            return Vec::new();
+        }
+
         let len = self.messages.len();
         let start = len.saturating_sub(limit);
 
@@ -222,9 +234,14 @@ impl SessionRecord {
         snapshot: &AppStateSnapshot,
         model_name: &str,
         visible_message_limit: usize,
+        exclude_messages: bool,
     ) -> ConsoleRenderContext {
-        let messages = self.recent_message_views(visible_message_limit);
-        let history_summary = self.recent_history_summary(messages.len());
+        let messages = self.recent_message_views(visible_message_limit, exclude_messages);
+        let history_summary = if exclude_messages {
+            None
+        } else {
+            self.recent_history_summary(messages.len())
+        };
 
         ConsoleRenderContext {
             snapshot: snapshot.clone(),

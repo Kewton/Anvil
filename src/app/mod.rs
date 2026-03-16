@@ -210,7 +210,7 @@ impl App {
         Ok(format!(
             "{}\n{}",
             render::render_resume_header(&self.config),
-            tui.render_console(&self.build_console_render_context())
+            tui.render_console(&self.build_startup_render_context())
         ))
     }
 
@@ -663,10 +663,25 @@ impl App {
     }
 
     fn build_console_render_context(&self) -> ConsoleRenderContext {
+        // Exclude all messages from frame rendering because they were
+        // already shown during the live turn — streaming to stderr and
+        // tool execution output (Issue #1).
         self.session.console_render_context(
             self.state_machine.snapshot(),
             &self.config.runtime.model,
             self.config.runtime.max_console_messages,
+            true,
+        )
+    }
+
+    fn build_startup_render_context(&self) -> ConsoleRenderContext {
+        // On startup/resume, include assistant messages so the user can see
+        // the conversation history from the previous session.
+        self.session.console_render_context(
+            self.state_machine.snapshot(),
+            &self.config.runtime.model,
+            self.config.runtime.max_console_messages,
+            false,
         )
     }
 

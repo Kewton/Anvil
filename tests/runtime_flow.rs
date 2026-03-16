@@ -93,11 +93,21 @@ fn runtime_turn_pauses_for_single_tool_call_approval_and_resumes_to_done() {
             .iter()
             .any(|frame| frame.contains("[A] anvil > result"))
     );
+    // Assistant message is excluded from frame rendering (streamed to stderr,
+    // Issue #1). Verify it is in session but not in the frame.
     assert!(
         resumed
             .last()
             .expect("done frame should exist")
-            .contains("[A] anvil > session flow is now runtime-driven")
+            .contains("[A] anvil > result"),
+        "done frame should contain result section"
+    );
+    assert!(
+        app.session()
+            .messages
+            .iter()
+            .any(|m| m.content == "session flow is now runtime-driven"),
+        "assistant message should be in session history"
     );
 }
 
@@ -303,11 +313,21 @@ fn runtime_turn_supports_multiple_approvals_in_one_turn() {
         .expect("final completion should succeed");
     assert_eq!(app.state_machine().snapshot().state, RuntimeState::Done);
     assert!(!app.has_pending_runtime_events());
+    // Assistant message is excluded from frame rendering (streamed to stderr,
+    // Issue #1). Verify it is in session but not in the frame.
     assert!(
         resumed_twice
             .last()
             .expect("done frame should exist")
-            .contains("both approvals were processed")
+            .contains("[A] anvil > result"),
+        "done frame should contain result section"
+    );
+    assert!(
+        app.session()
+            .messages
+            .iter()
+            .any(|m| m.content == "both approvals were processed"),
+        "assistant message should be in session history"
     );
 }
 
@@ -453,10 +473,21 @@ fn pending_approval_survives_app_reload() {
         reloaded.state_machine().snapshot().state,
         RuntimeState::Done
     );
+    // Assistant message is excluded from frame rendering (streamed to stderr,
+    // Issue #1). Verify it is in session but not in the frame.
     assert!(
         resumed
             .last()
             .expect("done frame should exist")
-            .contains("approval resumed after reload")
+            .contains("[A] anvil > result"),
+        "done frame should contain result section"
+    );
+    assert!(
+        reloaded
+            .session()
+            .messages
+            .iter()
+            .any(|m| m.content == "approval resumed after reload"),
+        "assistant message should be in session history"
     );
 }

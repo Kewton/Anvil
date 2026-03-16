@@ -142,11 +142,21 @@ fn live_turn_hands_session_messages_to_provider_and_renders_done() {
     assert_eq!(request.messages[1].role, ProviderMessageRole::User);
     assert_eq!(request.messages[2].role, ProviderMessageRole::Assistant);
     assert_eq!(request.messages[3].content, "current task");
+    // Assistant message is excluded from frame rendering (streamed to stderr,
+    // Issue #1). The Done frame shows result/completion_summary instead.
     assert!(
         frames
             .last()
             .expect("done frame should exist")
-            .contains("provider-backed turn completed")
+            .contains("[A] anvil > result"),
+        "done frame should contain result section"
+    );
+    assert!(
+        app.session()
+            .messages
+            .iter()
+            .any(|m| m.content == "provider-backed turn completed"),
+        "assistant message should be in session history"
     );
     assert!(request.messages[0].content.contains("ANVIL_TOOL"));
 }
@@ -189,24 +199,21 @@ fn live_turn_executes_structured_file_write_response_without_approval() {
     let written = fs::read_to_string(root.join("sandbox/test1_001/index.html"))
         .expect("file.write should materialize output");
     assert!(written.contains("invaders"));
+    // Intermediate Thinking/Working frames are no longer emitted to avoid
+    // duplicate output (Issue #1).  Only the final Done frame is returned,
+    // which contains tool_logs and completion_summary.
     assert!(
         frames
             .iter()
-            .any(|frame| frame.contains("[T] tool  > file.write"))
+            .any(|frame| frame.contains("[T] tool  > file.write")),
+        "done frame should contain tool log for file.write"
     );
-    assert!(
-        frames
-            .iter()
-            .any(|frame| frame.contains("[A] anvil > plan"))
-    );
-    assert!(frames.iter().any(|frame| frame.contains("working on 1/")));
-    // The agentic loop feeds tool results back to the LLM.  The final
-    // answer comes from the follow-up turn (not the original ANVIL_FINAL).
     assert!(
         frames
             .last()
             .expect("done frame should exist")
-            .contains("Executed")
+            .contains("Executed"),
+        "done frame should contain execution summary"
     );
 }
 
@@ -700,13 +707,21 @@ fn live_turn_surfaces_token_delta_progress() {
         .run_live_turn("stream this", &provider, &tui)
         .expect("live turn should succeed");
 
-    // Token deltas are now streamed to stderr in real-time.
-    // Frames contain only the final Done state with the assistant message.
+    // Token deltas are streamed to stderr in real-time. Assistant messages
+    // are excluded from frame rendering to avoid duplicate output (Issue #1).
     assert!(
         frames
             .last()
             .expect("done frame should exist")
-            .contains("stream finished")
+            .contains("[A] anvil > result"),
+        "done frame should contain result section"
+    );
+    assert!(
+        app.session()
+            .messages
+            .iter()
+            .any(|m| m.content == "stream finished"),
+        "assistant message should be in session history"
     );
 }
 
@@ -771,11 +786,21 @@ fn live_turn_can_pause_for_provider_approval_and_resume() {
         .approve_and_continue(&AgentRuntime::new(), &tui)
         .expect("approval should resume");
 
+    // Assistant message is excluded from frame rendering (streamed to stderr,
+    // Issue #1). The Done frame shows result/completion_summary instead.
     assert!(
         resumed
             .last()
             .expect("done frame should exist")
-            .contains("live approval resumed")
+            .contains("[A] anvil > result"),
+        "done frame should contain result section"
+    );
+    assert!(
+        app.session()
+            .messages
+            .iter()
+            .any(|m| m.content == "live approval resumed"),
+        "assistant message should be in session history"
     );
 }
 
@@ -1215,5 +1240,153 @@ fn agentic_loop_error_during_followup_propagates() {
     assert!(
         err_msg.contains("agentic follow-up failed"),
         "error message should indicate agentic follow-up failure, got: {err_msg}"
+    );
+}
+
+// --- web.fetch agent protocol tests ---
+
+#[test]
+fn structured_response_parser_handles_web_fetch_tool_block() {
+    let response = anvil::agent::BasicAgentLoop::parse_structured_response(concat!(
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_fetch_001\",\"tool\":\"web.fetch\",\"url\":\"https://example.com\"}\n",
+        "```\n",
+        "```ANVIL_FINAL\n",
+        "Fetched the page content.\n",
+        "```\n"
+    ))
+    .expect("parser should handle web.fetch block");
+
+    assert_eq!(response.tool_calls.len(), 1);
+    assert_eq!(response.tool_calls[0].tool_name, "web.fetch");
+    match &response.tool_calls[0].input {
+        anvil::tooling::ToolInput::WebFetch { url } => {
+            assert_eq!(url, "https://example.com");
+        }
+        other => panic!("unexpected tool input: {other:?}"),
+    }
+}
+
+#[test]
+fn structured_response_parser_repairs_web_fetch_block() {
+    // Simulate malformed JSON that the repair path should handle
+    let response = anvil::agent::BasicAgentLoop::parse_structured_response(concat!(
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_fetch_002\",\"tool\":\"web.fetch\",\"url\":\"https://example.com/page\"\n",
+        "```\n",
+        "```ANVIL_FINAL\n",
+        "Fetched the page.\n",
+        "```\n"
+    ))
+    .expect("parser should repair web.fetch block");
+
+    assert_eq!(response.tool_calls.len(), 1);
+    match &response.tool_calls[0].input {
+        anvil::tooling::ToolInput::WebFetch { url } => {
+            assert_eq!(url, "https://example.com/page");
+        }
+        other => panic!("unexpected tool input: {other:?}"),
+    }
+}
+
+#[test]
+fn system_prompt_includes_web_fetch_tool() {
+    let session = anvil::session::SessionRecord::new(std::path::PathBuf::from("/tmp"));
+    let request =
+        anvil::agent::BasicAgentLoop::build_turn_request("test-model", &session, false, 4096);
+    assert!(
+        request.messages[0].content.contains("web.fetch"),
+        "system prompt should mention web.fetch"
+    );
+}
+
+// --- web.search agent protocol tests ---
+
+#[test]
+fn structured_response_parser_handles_web_search_tool_block() {
+    let response = anvil::agent::BasicAgentLoop::parse_structured_response(concat!(
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_search_001\",\"tool\":\"web.search\",\"query\":\"rust error handling\"}\n",
+        "```\n",
+        "```ANVIL_FINAL\n",
+        "Searched for rust error handling.\n",
+        "```\n"
+    ))
+    .expect("parser should handle web.search block");
+
+    assert_eq!(response.tool_calls.len(), 1);
+    assert_eq!(response.tool_calls[0].tool_name, "web.search");
+    match &response.tool_calls[0].input {
+        anvil::tooling::ToolInput::WebSearch { query } => {
+            assert_eq!(query, "rust error handling");
+        }
+        other => panic!("unexpected tool input: {other:?}"),
+    }
+}
+
+#[test]
+fn structured_response_parser_rejects_web_search_missing_query() {
+    let result = anvil::agent::BasicAgentLoop::parse_structured_response(concat!(
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_search_002\",\"tool\":\"web.search\"}\n",
+        "```\n",
+        "```ANVIL_FINAL\n",
+        "Done.\n",
+        "```\n"
+    ));
+
+    assert!(result.is_err(), "missing query should fail");
+    let err = result.unwrap_err();
+    assert!(
+        err.contains("missing query"),
+        "error should mention missing query, got: {err}"
+    );
+}
+
+#[test]
+fn structured_response_parser_repairs_web_search_block() {
+    // Simulate malformed JSON that the repair path should handle
+    let response = anvil::agent::BasicAgentLoop::parse_structured_response(concat!(
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_search_003\",\"tool\":\"web.search\",\"query\":\"serde derive\"\n",
+        "```\n",
+        "```ANVIL_FINAL\n",
+        "Searched.\n",
+        "```\n"
+    ))
+    .expect("parser should repair web.search block");
+
+    assert_eq!(response.tool_calls.len(), 1);
+    match &response.tool_calls[0].input {
+        anvil::tooling::ToolInput::WebSearch { query } => {
+            assert_eq!(query, "serde derive");
+        }
+        other => panic!("unexpected tool input: {other:?}"),
+    }
+}
+
+#[test]
+fn system_prompt_includes_web_search_tool() {
+    let session = anvil::session::SessionRecord::new(std::path::PathBuf::from("/tmp"));
+    let request =
+        anvil::agent::BasicAgentLoop::build_turn_request("test-model", &session, false, 4096);
+    assert!(
+        request.messages[0].content.contains("web.search"),
+        "system prompt should mention web.search"
+    );
+}
+
+#[test]
+fn system_prompt_includes_github_insights() {
+    let session = anvil::session::SessionRecord::new(std::path::PathBuf::from("/tmp"));
+    let request =
+        anvil::agent::BasicAgentLoop::build_turn_request("test-model", &session, false, 4096);
+    assert!(
+        request.messages[0].content.contains("GitHub Insights"),
+        "system prompt should mention GitHub Insights"
+    );
+    assert!(
+        request.messages[0].content.contains("gh api"),
+        "system prompt should mention gh api"
     );
 }
