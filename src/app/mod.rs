@@ -10,7 +10,7 @@ pub mod plan;
 pub mod render;
 
 use crate::agent::BasicAgentLoop;
-use crate::agent::{AgentEvent, AgentRuntime, PendingTurnState};
+use crate::agent::{AgentEvent, AgentRuntime, PendingTurnState, ProjectLanguage};
 use crate::config::EffectiveConfig;
 use crate::contracts::{AppEvent, AppStateSnapshot, ConsoleRenderContext, RuntimeState};
 use crate::extensions::{ExtensionLoadError, ExtensionRegistry, SlashCommandAction};
@@ -33,6 +33,21 @@ use std::io::{self, Write};
 // Re-export render helpers that form the public API.
 pub use render::{cli_prompt, render_help_frame, slash_commands};
 
+/// Detect project languages from the project root directory.
+///
+/// Checks for the presence of language-specific manifest files and returns
+/// a list of detected languages. Called once at session start and cached.
+pub fn detect_project_languages(project_root: &std::path::Path) -> Vec<ProjectLanguage> {
+    let mut languages = Vec::new();
+    if project_root.join("Cargo.toml").exists() {
+        languages.push(ProjectLanguage::Rust);
+    }
+    if project_root.join("package.json").exists() {
+        languages.push(ProjectLanguage::NodeJs);
+    }
+    languages
+}
+
 /// Central application state.
 pub struct App {
     config: EffectiveConfig,
@@ -42,6 +57,7 @@ pub struct App {
     session: SessionRecord,
     extensions: ExtensionRegistry,
     tools: ToolRegistry,
+    system_prompt: String,
 }
 
 /// Whether the session loop should continue or exit.
@@ -145,6 +161,9 @@ impl App {
         let extensions = ExtensionRegistry::load(&config.paths.cwd)?;
         session.auto_compact_threshold = config.runtime.auto_compact_threshold;
 
+        let detected_languages = detect_project_languages(&config.paths.cwd);
+        let system_prompt = crate::agent::tool_protocol_system_prompt(&detected_languages);
+
         Ok(Self {
             tools: standard_tool_registry(),
             config,
@@ -153,6 +172,7 @@ impl App {
             session_store,
             session,
             extensions,
+            system_prompt,
         })
     }
 
@@ -280,6 +300,7 @@ impl App {
             &self.session,
             self.provider.capabilities.streaming && self.config.runtime.stream,
             self.config.runtime.context_window,
+            &self.system_prompt,
         );
 
         // Phase 1: Collect events from provider with spinner + streaming output.

@@ -630,17 +630,20 @@ fn basic_agent_loop_derives_context_budget_from_context_window() {
             .expect("persist");
     }
 
+    let system_prompt = anvil::agent::tool_protocol_system_prompt(&[]);
     let small = anvil::agent::BasicAgentLoop::build_turn_request(
         "local-default",
         app.session(),
         true,
         1_000,
+        &system_prompt,
     );
     let large = anvil::agent::BasicAgentLoop::build_turn_request(
         "local-default",
         app.session(),
         true,
         200_000,
+        &system_prompt,
     );
 
     assert!(small.messages.len() < large.messages.len());
@@ -1292,8 +1295,14 @@ fn structured_response_parser_repairs_web_fetch_block() {
 #[test]
 fn system_prompt_includes_web_fetch_tool() {
     let session = anvil::session::SessionRecord::new(std::path::PathBuf::from("/tmp"));
-    let request =
-        anvil::agent::BasicAgentLoop::build_turn_request("test-model", &session, false, 4096);
+    let system_prompt = anvil::agent::tool_protocol_system_prompt(&[]);
+    let request = anvil::agent::BasicAgentLoop::build_turn_request(
+        "test-model",
+        &session,
+        false,
+        4096,
+        &system_prompt,
+    );
     assert!(
         request.messages[0].content.contains("web.fetch"),
         "system prompt should mention web.fetch"
@@ -1368,8 +1377,14 @@ fn structured_response_parser_repairs_web_search_block() {
 #[test]
 fn system_prompt_includes_web_search_tool() {
     let session = anvil::session::SessionRecord::new(std::path::PathBuf::from("/tmp"));
-    let request =
-        anvil::agent::BasicAgentLoop::build_turn_request("test-model", &session, false, 4096);
+    let system_prompt = anvil::agent::tool_protocol_system_prompt(&[]);
+    let request = anvil::agent::BasicAgentLoop::build_turn_request(
+        "test-model",
+        &session,
+        false,
+        4096,
+        &system_prompt,
+    );
     assert!(
         request.messages[0].content.contains("web.search"),
         "system prompt should mention web.search"
@@ -1379,8 +1394,14 @@ fn system_prompt_includes_web_search_tool() {
 #[test]
 fn system_prompt_includes_github_insights() {
     let session = anvil::session::SessionRecord::new(std::path::PathBuf::from("/tmp"));
-    let request =
-        anvil::agent::BasicAgentLoop::build_turn_request("test-model", &session, false, 4096);
+    let system_prompt = anvil::agent::tool_protocol_system_prompt(&[]);
+    let request = anvil::agent::BasicAgentLoop::build_turn_request(
+        "test-model",
+        &session,
+        false,
+        4096,
+        &system_prompt,
+    );
     assert!(
         request.messages[0].content.contains("GitHub Insights"),
         "system prompt should mention GitHub Insights"
@@ -1388,5 +1409,111 @@ fn system_prompt_includes_github_insights() {
     assert!(
         request.messages[0].content.contains("gh api"),
         "system prompt should mention gh api"
+    );
+}
+
+// --- Phase 3: detect_project_languages tests ---
+
+#[test]
+fn detect_rust_project() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    std::fs::write(tmp.path().join("Cargo.toml"), "[package]\nname = \"test\"").expect("write");
+    let languages = anvil::app::detect_project_languages(tmp.path());
+    assert_eq!(languages, vec![anvil::agent::ProjectLanguage::Rust]);
+}
+
+#[test]
+fn detect_nodejs_project() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    std::fs::write(tmp.path().join("package.json"), "{}").expect("write");
+    let languages = anvil::app::detect_project_languages(tmp.path());
+    assert_eq!(languages, vec![anvil::agent::ProjectLanguage::NodeJs]);
+}
+
+#[test]
+fn detect_empty_project() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    let languages = anvil::app::detect_project_languages(tmp.path());
+    assert!(languages.is_empty());
+}
+
+#[test]
+fn detect_both_rust_and_nodejs() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    std::fs::write(tmp.path().join("Cargo.toml"), "[package]").expect("write");
+    std::fs::write(tmp.path().join("package.json"), "{}").expect("write");
+    let languages = anvil::app::detect_project_languages(tmp.path());
+    assert_eq!(
+        languages,
+        vec![
+            anvil::agent::ProjectLanguage::Rust,
+            anvil::agent::ProjectLanguage::NodeJs,
+        ]
+    );
+}
+
+// --- Phase 3: tool_protocol_system_prompt dynamic guide tests ---
+
+#[test]
+fn system_prompt_rust_includes_git_and_cargo() {
+    use anvil::agent::ProjectLanguage;
+    let prompt = anvil::agent::tool_protocol_system_prompt(&[ProjectLanguage::Rust]);
+    assert!(
+        prompt.contains("Git operations"),
+        "should contain Git operations guide"
+    );
+    assert!(
+        prompt.contains("cargo build"),
+        "should contain cargo build guide"
+    );
+}
+
+#[test]
+fn system_prompt_nodejs_includes_git_and_npm_but_not_cargo() {
+    use anvil::agent::ProjectLanguage;
+    let prompt = anvil::agent::tool_protocol_system_prompt(&[ProjectLanguage::NodeJs]);
+    assert!(
+        prompt.contains("Git operations"),
+        "should contain Git operations guide"
+    );
+    assert!(prompt.contains("npm"), "should contain npm guide");
+    assert!(
+        !prompt.contains("cargo build"),
+        "should not contain cargo build guide"
+    );
+}
+
+#[test]
+fn system_prompt_empty_has_git_only() {
+    let prompt = anvil::agent::tool_protocol_system_prompt(&[]);
+    assert!(
+        prompt.contains("Git operations"),
+        "should contain Git operations guide"
+    );
+    assert!(
+        !prompt.contains("cargo build"),
+        "should not contain cargo build guide"
+    );
+    assert!(!prompt.contains("npm test"), "should not contain npm guide");
+}
+
+#[test]
+fn system_prompt_both_languages_includes_both() {
+    use anvil::agent::ProjectLanguage;
+    let prompt = anvil::agent::tool_protocol_system_prompt(&[
+        ProjectLanguage::Rust,
+        ProjectLanguage::NodeJs,
+    ]);
+    assert!(prompt.contains("cargo build"), "should contain cargo guide");
+    assert!(prompt.contains("npm"), "should contain npm guide");
+}
+
+#[test]
+fn system_prompt_includes_never_guide() {
+    use anvil::agent::ProjectLanguage;
+    let prompt = anvil::agent::tool_protocol_system_prompt(&[ProjectLanguage::Rust]);
+    assert!(
+        prompt.contains("NEVER"),
+        "should contain NEVER guide for dangerous operations"
     );
 }

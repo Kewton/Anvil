@@ -3,7 +3,6 @@ use anvil::tooling::{
     PermissionClass, PlanModePolicy, RollbackPolicy, ToolCallRequest, ToolExecutionError,
     ToolExecutionPayload, ToolExecutionPolicy, ToolExecutionRequest, ToolExecutionResult,
     ToolExecutionStatus, ToolInput, ToolKind, ToolRegistry, ToolValidationError,
-    effective_permission_class, is_safe_shell_command,
 };
 use std::fs;
 
@@ -660,232 +659,529 @@ fn web_search_serde_round_trip() {
     assert_eq!(input, deserialized);
 }
 
-// --- is_safe_shell_command tests (23 cases) ---
+// --- is_safe_shell_command: gh api tests ---
 
-#[test]
-fn safe_shell_01_gh_api_get_is_safe() {
-    assert!(is_safe_shell_command("gh api repos/o/r/stats/contributors"));
+mod safe_shell_gh_api {
+    use anvil::tooling::is_safe_shell_command;
+
+    #[test]
+    fn get_is_safe() {
+        assert!(is_safe_shell_command("gh api repos/o/r/stats/contributors"));
+    }
+
+    #[test]
+    fn method_post_is_unsafe() {
+        assert!(!is_safe_shell_command(
+            "gh api --method POST repos/o/r/issues"
+        ));
+    }
+
+    #[test]
+    fn method_eq_post_is_unsafe() {
+        assert!(!is_safe_shell_command(
+            "gh api --method=POST repos/o/r/issues"
+        ));
+    }
+
+    #[test]
+    fn x_delete_is_unsafe() {
+        assert!(!is_safe_shell_command(
+            "gh api -X DELETE repos/o/r/issues/1"
+        ));
+    }
+
+    #[test]
+    fn xdelete_combined_is_unsafe() {
+        assert!(!is_safe_shell_command("gh api -XDELETE repos/o/r/issues/1"));
+    }
+
+    #[test]
+    fn pipe_is_unsafe() {
+        assert!(!is_safe_shell_command("gh api repos/o/r/issues | jq ."));
+    }
+
+    #[test]
+    fn semicolon_is_unsafe() {
+        assert!(!is_safe_shell_command("gh api repos/o/r/issues; rm -rf /"));
+    }
+
+    #[test]
+    fn input_flag_is_unsafe() {
+        assert!(!is_safe_shell_command(
+            "gh api --input data.json repos/o/r/issues"
+        ));
+    }
+
+    #[test]
+    fn input_eq_is_unsafe() {
+        assert!(!is_safe_shell_command(
+            "gh api --input=data.json repos/o/r/issues"
+        ));
+    }
+
+    #[test]
+    fn xput_is_unsafe() {
+        assert!(!is_safe_shell_command("gh api -XPUT repos/o/r/topics"));
+    }
+
+    #[test]
+    fn xpatch_is_unsafe() {
+        assert!(!is_safe_shell_command("gh api -XPATCH repos/o/r/issues/1"));
+    }
+
+    #[test]
+    fn url_with_method_in_path_is_safe() {
+        // Token-based splitting prevents false positive on URLs containing "--method-POST"
+        assert!(is_safe_shell_command(
+            "gh api repos/o/repo-with--method-POST/stats"
+        ));
+    }
+
+    #[test]
+    fn newline_bypass_is_unsafe() {
+        assert!(!is_safe_shell_command("gh api repos/o/r/issues\nrm -rf /"));
+    }
+
+    #[test]
+    fn f_flag_implicit_post_is_unsafe() {
+        assert!(!is_safe_shell_command(
+            "gh api -f title=hacked repos/o/r/issues"
+        ));
+    }
+
+    #[test]
+    fn field_flag_implicit_post_is_unsafe() {
+        assert!(!is_safe_shell_command(
+            "gh api --field title=hacked repos/o/r/issues"
+        ));
+    }
+
+    #[test]
+    fn f_uppercase_flag_implicit_post_is_unsafe() {
+        assert!(!is_safe_shell_command(
+            "gh api -F body=@file.txt repos/o/r/issues"
+        ));
+    }
+
+    #[test]
+    fn raw_field_implicit_post_is_unsafe() {
+        assert!(!is_safe_shell_command(
+            "gh api --raw-field body=test repos/o/r/issues"
+        ));
+    }
 }
 
-#[test]
-fn safe_shell_02_gh_api_method_post_is_unsafe() {
-    assert!(!is_safe_shell_command(
-        "gh api --method POST repos/o/r/issues"
-    ));
+// --- is_safe_shell_command: gh CLI / git / misc tests ---
+
+mod safe_shell_prefixes {
+    use anvil::tooling::is_safe_shell_command;
+
+    #[test]
+    fn git_log_is_safe() {
+        assert!(is_safe_shell_command("git log --oneline"));
+    }
+
+    #[test]
+    fn git_status_is_safe() {
+        assert!(is_safe_shell_command("git status"));
+    }
+
+    #[test]
+    fn curl_is_not_safe() {
+        assert!(!is_safe_shell_command("curl https://example.com"));
+    }
+
+    #[test]
+    fn gh_repo_view_web_is_unsafe() {
+        assert!(!is_safe_shell_command("gh repo view --web"));
+    }
+
+    #[test]
+    fn gh_repo_view_json_is_safe() {
+        assert!(is_safe_shell_command("gh repo view --json owner,name"));
+    }
+
+    #[test]
+    fn gh_issue_list_browse_is_unsafe() {
+        assert!(!is_safe_shell_command("gh issue list --browse"));
+    }
+
+    #[test]
+    fn cargo_build_is_safe() {
+        assert!(is_safe_shell_command("cargo build"));
+    }
+
+    #[test]
+    fn cargo_test_is_safe() {
+        assert!(is_safe_shell_command("cargo test"));
+    }
+
+    #[test]
+    fn cargo_clippy_is_safe() {
+        assert!(is_safe_shell_command("cargo clippy --all-targets"));
+    }
+
+    #[test]
+    fn cargo_fmt_check_is_safe() {
+        assert!(is_safe_shell_command("cargo fmt --check"));
+    }
+
+    #[test]
+    fn cargo_check_is_safe() {
+        assert!(is_safe_shell_command("cargo check"));
+    }
+
+    #[test]
+    fn npm_test_is_safe() {
+        assert!(is_safe_shell_command("npm test"));
+    }
+
+    #[test]
+    fn npx_jest_with_args_is_safe() {
+        assert!(is_safe_shell_command("npx jest src/tests"));
+    }
+
+    #[test]
+    fn npx_eslint_with_args_is_safe() {
+        assert!(is_safe_shell_command("npx eslint src/"));
+    }
+
+    #[test]
+    fn npx_prettier_check_is_safe() {
+        assert!(is_safe_shell_command("npx prettier --check src/"));
+    }
+
+    #[test]
+    fn git_branch_is_safe() {
+        assert!(is_safe_shell_command("git branch"));
+    }
+
+    #[test]
+    fn git_show_with_ref_is_safe() {
+        assert!(is_safe_shell_command("git show HEAD"));
+    }
+
+    #[test]
+    fn git_show_alone_is_not_safe() {
+        // "git show" without trailing space won't match "git show "
+        assert!(!is_safe_shell_command("git show"));
+    }
+
+    #[test]
+    fn git_remote_v_is_safe() {
+        assert!(is_safe_shell_command("git remote -v"));
+    }
+
+    #[test]
+    fn git_rev_parse_is_safe() {
+        assert!(is_safe_shell_command("git rev-parse HEAD"));
+    }
+
+    #[test]
+    fn gh_pr_view_is_safe() {
+        assert!(is_safe_shell_command("gh pr view 123"));
+    }
+
+    #[test]
+    fn gh_issue_view_is_safe() {
+        assert!(is_safe_shell_command("gh issue view 456"));
+    }
+
+    #[test]
+    fn gh_auth_status_is_safe() {
+        assert!(is_safe_shell_command("gh auth status"));
+    }
+
+    #[test]
+    fn which_is_safe() {
+        assert!(is_safe_shell_command("which rustc"));
+    }
+
+    #[test]
+    fn uname_is_safe() {
+        assert!(is_safe_shell_command("uname"));
+    }
+
+    #[test]
+    fn node_version_is_safe() {
+        assert!(is_safe_shell_command("node -v"));
+        assert!(is_safe_shell_command("node --version"));
+    }
+
+    #[test]
+    fn rustc_version_is_safe() {
+        assert!(is_safe_shell_command("rustc --version"));
+    }
+
+    #[test]
+    fn cargo_version_is_safe() {
+        assert!(is_safe_shell_command("cargo --version"));
+    }
+
+    #[test]
+    fn python_version_is_safe() {
+        assert!(is_safe_shell_command("python --version"));
+    }
+
+    #[test]
+    fn go_version_is_safe() {
+        assert!(is_safe_shell_command("go version"));
+    }
+
+    #[test]
+    fn lsof_i_is_safe() {
+        assert!(is_safe_shell_command("lsof -i"));
+    }
 }
 
-#[test]
-fn safe_shell_03_gh_api_method_eq_post_is_unsafe() {
-    assert!(!is_safe_shell_command(
-        "gh api --method=POST repos/o/r/issues"
-    ));
-}
+// --- Injection vector tests ---
 
-#[test]
-fn safe_shell_04_gh_api_x_delete_is_unsafe() {
-    assert!(!is_safe_shell_command(
-        "gh api -X DELETE repos/o/r/issues/1"
-    ));
-}
+mod safe_shell_injection {
+    use anvil::tooling::is_safe_shell_command;
 
-#[test]
-fn safe_shell_05_gh_api_xdelete_combined_is_unsafe() {
-    assert!(!is_safe_shell_command("gh api -XDELETE repos/o/r/issues/1"));
-}
+    #[test]
+    fn cargo_test_chain_is_unsafe() {
+        assert!(!is_safe_shell_command("cargo test && rm -rf /"));
+    }
 
-#[test]
-fn safe_shell_06_gh_api_with_pipe_is_unsafe() {
-    assert!(!is_safe_shell_command("gh api repos/o/r/issues | jq ."));
-}
+    #[test]
+    fn git_log_redirect_is_unsafe() {
+        assert!(!is_safe_shell_command("git log > ~/.bashrc"));
+    }
 
-#[test]
-fn safe_shell_07_gh_api_with_semicolon_is_unsafe() {
-    assert!(!is_safe_shell_command("gh api repos/o/r/issues; rm -rf /"));
-}
-
-#[test]
-fn safe_shell_08_git_log_is_safe() {
-    assert!(is_safe_shell_command("git log --oneline"));
-}
-
-#[test]
-fn safe_shell_09_git_status_is_safe() {
-    assert!(is_safe_shell_command("git status"));
-}
-
-#[test]
-fn safe_shell_10_curl_is_not_safe() {
-    assert!(!is_safe_shell_command("curl https://example.com"));
-}
-
-#[test]
-fn safe_shell_11_gh_api_input_flag_is_unsafe() {
-    assert!(!is_safe_shell_command(
-        "gh api --input data.json repos/o/r/issues"
-    ));
-}
-
-#[test]
-fn safe_shell_12_gh_api_input_eq_is_unsafe() {
-    assert!(!is_safe_shell_command(
-        "gh api --input=data.json repos/o/r/issues"
-    ));
-}
-
-#[test]
-fn safe_shell_13_gh_api_xput_is_unsafe() {
-    assert!(!is_safe_shell_command("gh api -XPUT repos/o/r/topics"));
-}
-
-#[test]
-fn safe_shell_14_gh_api_xpatch_is_unsafe() {
-    assert!(!is_safe_shell_command("gh api -XPATCH repos/o/r/issues/1"));
-}
-
-#[test]
-fn safe_shell_15_gh_api_url_with_method_in_path_is_safe() {
-    // Token-based splitting prevents false positive on URLs containing "--method-POST"
-    assert!(is_safe_shell_command(
-        "gh api repos/o/repo-with--method-POST/stats"
-    ));
-}
-
-#[test]
-fn safe_shell_16_gh_api_newline_bypass_is_unsafe() {
-    assert!(!is_safe_shell_command("gh api repos/o/r/issues\nrm -rf /"));
-}
-
-#[test]
-fn safe_shell_17_gh_api_f_flag_implicit_post_is_unsafe() {
-    assert!(!is_safe_shell_command(
-        "gh api -f title=hacked repos/o/r/issues"
-    ));
-}
-
-#[test]
-fn safe_shell_18_gh_api_field_flag_implicit_post_is_unsafe() {
-    assert!(!is_safe_shell_command(
-        "gh api --field title=hacked repos/o/r/issues"
-    ));
-}
-
-#[test]
-fn safe_shell_19_gh_api_f_uppercase_flag_implicit_post_is_unsafe() {
-    assert!(!is_safe_shell_command(
-        "gh api -F body=@file.txt repos/o/r/issues"
-    ));
-}
-
-#[test]
-fn safe_shell_20_gh_api_raw_field_implicit_post_is_unsafe() {
-    assert!(!is_safe_shell_command(
-        "gh api --raw-field body=test repos/o/r/issues"
-    ));
-}
-
-#[test]
-fn safe_shell_21_gh_repo_view_web_is_unsafe() {
-    assert!(!is_safe_shell_command("gh repo view --web"));
-}
-
-#[test]
-fn safe_shell_22_gh_repo_view_json_is_safe() {
-    assert!(is_safe_shell_command("gh repo view --json owner,name"));
-}
-
-#[test]
-fn safe_shell_23_gh_issue_list_browse_is_unsafe() {
-    assert!(!is_safe_shell_command("gh issue list --browse"));
+    #[test]
+    fn git_status_input_redirect_is_unsafe() {
+        assert!(!is_safe_shell_command("git status < /etc/passwd"));
+    }
 }
 
 // --- effective_permission_class tests ---
 
-#[test]
-fn effective_permission_class_promotes_safe_shell_to_safe() {
-    let registry = build_registry();
-    let spec = registry.get("shell.exec").expect("shell.exec should exist");
-    let input = ToolInput::ShellExec {
-        command: "git status".to_string(),
-    };
-    assert_eq!(
-        effective_permission_class(&input, spec),
-        PermissionClass::Safe
-    );
-}
+mod effective_permission {
+    use anvil::tooling::{PermissionClass, ToolInput, ToolRegistry, effective_permission_class};
 
-#[test]
-fn effective_permission_class_keeps_unsafe_shell_as_confirm() {
-    let registry = build_registry();
-    let spec = registry.get("shell.exec").expect("shell.exec should exist");
-    let input = ToolInput::ShellExec {
-        command: "rm -rf target".to_string(),
-    };
-    assert_eq!(
-        effective_permission_class(&input, spec),
-        PermissionClass::Confirm
-    );
-}
+    fn build_registry() -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        registry.register_standard_tools();
+        registry
+    }
 
-#[test]
-fn effective_permission_class_web_search_stays_confirm() {
-    let registry = build_registry();
-    let spec = registry.get("web.search").expect("web.search should exist");
-    let input = ToolInput::WebSearch {
-        query: "rust error".to_string(),
-    };
-    assert_eq!(
-        effective_permission_class(&input, spec),
-        PermissionClass::Confirm
-    );
-}
+    #[test]
+    fn promotes_safe_shell_to_safe() {
+        let registry = build_registry();
+        let spec = registry.get("shell.exec").expect("shell.exec should exist");
+        let input = ToolInput::ShellExec {
+            command: "git status".to_string(),
+        };
+        assert_eq!(
+            effective_permission_class(&input, spec),
+            PermissionClass::Safe
+        );
+    }
 
-#[test]
-fn effective_permission_class_file_read_stays_safe() {
-    let registry = build_registry();
-    let spec = registry.get("file.read").expect("file.read should exist");
-    let input = ToolInput::FileRead {
-        path: "src/main.rs".to_string(),
-    };
-    assert_eq!(
-        effective_permission_class(&input, spec),
-        PermissionClass::Safe
-    );
+    #[test]
+    fn keeps_unsafe_shell_as_confirm() {
+        let registry = build_registry();
+        let spec = registry.get("shell.exec").expect("shell.exec should exist");
+        let input = ToolInput::ShellExec {
+            command: "rm -rf target".to_string(),
+        };
+        assert_eq!(
+            effective_permission_class(&input, spec),
+            PermissionClass::Confirm
+        );
+    }
+
+    #[test]
+    fn web_search_stays_confirm() {
+        let registry = build_registry();
+        let spec = registry.get("web.search").expect("web.search should exist");
+        let input = ToolInput::WebSearch {
+            query: "rust error".to_string(),
+        };
+        assert_eq!(
+            effective_permission_class(&input, spec),
+            PermissionClass::Confirm
+        );
+    }
+
+    #[test]
+    fn file_read_stays_safe() {
+        let registry = build_registry();
+        let spec = registry.get("file.read").expect("file.read should exist");
+        let input = ToolInput::FileRead {
+            path: "src/main.rs".to_string(),
+        };
+        assert_eq!(
+            effective_permission_class(&input, spec),
+            PermissionClass::Safe
+        );
+    }
 }
 
 // --- approval_required uses effective_permission_class ---
 
-#[test]
-fn approval_not_required_for_safe_shell_command() {
-    let registry = build_registry();
-    let validated = registry
-        .validate(ToolCallRequest::new(
-            "call_shell_safe",
-            "shell.exec",
-            ToolInput::ShellExec {
-                command: "git status".to_string(),
-            },
-        ))
-        .expect("should validate");
-    assert!(
-        validated.approval_required(true).is_none(),
-        "safe shell commands should not require approval"
-    );
+mod approval_with_effective_permission {
+    use anvil::tooling::{ToolCallRequest, ToolInput, ToolRegistry};
+
+    fn build_registry() -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        registry.register_standard_tools();
+        registry
+    }
+
+    #[test]
+    fn not_required_for_safe_shell_command() {
+        let registry = build_registry();
+        let validated = registry
+            .validate(ToolCallRequest::new(
+                "call_shell_safe",
+                "shell.exec",
+                ToolInput::ShellExec {
+                    command: "git status".to_string(),
+                },
+            ))
+            .expect("should validate");
+        assert!(
+            validated.approval_required(true).is_none(),
+            "safe shell commands should not require approval"
+        );
+    }
+
+    #[test]
+    fn required_for_unsafe_shell_command() {
+        let registry = build_registry();
+        let validated = registry
+            .validate(ToolCallRequest::new(
+                "call_shell_unsafe",
+                "shell.exec",
+                ToolInput::ShellExec {
+                    command: "curl https://example.com".to_string(),
+                },
+            ))
+            .expect("should validate");
+        assert!(
+            validated.approval_required(true).is_some(),
+            "unsafe shell commands should require approval"
+        );
+    }
 }
 
-#[test]
-fn approval_required_for_unsafe_shell_command() {
-    let registry = build_registry();
-    let validated = registry
-        .validate(ToolCallRequest::new(
-            "call_shell_unsafe",
+// --- Blocked command validation tests ---
+
+mod blocked_commands {
+    use anvil::tooling::{ToolCallRequest, ToolInput, ToolRegistry, ToolValidationError};
+
+    fn build_registry() -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        registry.register_standard_tools();
+        registry
+    }
+
+    fn assert_blocked(command: &str, msg: &str) {
+        let registry = build_registry();
+        let err = registry
+            .validate(ToolCallRequest::new(
+                "call_001",
+                "shell.exec",
+                ToolInput::ShellExec {
+                    command: command.to_string(),
+                },
+            ))
+            .expect_err(msg);
+        match err {
+            ToolValidationError::DangerousCommand { .. } => {}
+            other => panic!("expected DangerousCommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rm_rf_root() {
+        assert_blocked("rm -rf /", "rm -rf / should be blocked");
+    }
+
+    #[test]
+    fn mkfs() {
+        assert_blocked("mkfs.ext4 /dev/sda", "mkfs should be blocked");
+    }
+
+    #[test]
+    fn git_commit_no_verify() {
+        let registry = build_registry();
+        let err = registry
+            .validate(ToolCallRequest::new(
+                "call_001",
+                "shell.exec",
+                ToolInput::ShellExec {
+                    command: "git commit --no-verify -m 'test'".to_string(),
+                },
+            ))
+            .expect_err("git commit --no-verify should be blocked");
+        match err {
+            ToolValidationError::DangerousCommand { reason, .. } => {
+                assert!(reason.contains("git hooks"));
+            }
+            other => panic!("expected DangerousCommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn git_push_no_verify() {
+        assert_blocked(
+            "git push --no-verify origin main",
+            "git push --no-verify should be blocked",
+        );
+    }
+
+    #[test]
+    fn git_merge_no_verify() {
+        assert_blocked(
+            "git merge --no-verify feature",
+            "git merge --no-verify should be blocked",
+        );
+    }
+
+    #[test]
+    fn git_commit_n_shorthand() {
+        let registry = build_registry();
+        let err = registry
+            .validate(ToolCallRequest::new(
+                "call_001",
+                "shell.exec",
+                ToolInput::ShellExec {
+                    command: "git commit -n -m 'test'".to_string(),
+                },
+            ))
+            .expect_err("git commit -n should be blocked");
+        match err {
+            ToolValidationError::DangerousCommand { reason, .. } => {
+                assert!(reason.contains("-n"));
+            }
+            other => panic!("expected DangerousCommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn npm_publish_no_verify_is_not_blocked() {
+        let registry = build_registry();
+        let result = registry.validate(ToolCallRequest::new(
+            "call_001",
             "shell.exec",
             ToolInput::ShellExec {
-                command: "curl https://example.com".to_string(),
+                command: "npm publish --no-verify".to_string(),
             },
-        ))
-        .expect("should validate");
-    assert!(
-        validated.approval_required(true).is_some(),
-        "unsafe shell commands should require approval"
-    );
+        ));
+        assert!(
+            result.is_ok(),
+            "npm publish --no-verify should not be blocked by git-specific patterns"
+        );
+    }
+
+    #[test]
+    fn safe_prefix_with_blocked_content_is_still_blocked() {
+        assert_blocked(
+            "git commit --no-verify",
+            "blocked patterns should be checked during validation",
+        );
+    }
 }
