@@ -1390,3 +1390,44 @@ fn system_prompt_includes_github_insights() {
         "system prompt should mention gh api"
     );
 }
+
+// --- file.edit agent protocol tests ---
+
+#[test]
+fn file_edit_anvil_tool_block_parses() {
+    let response = anvil::agent::BasicAgentLoop::parse_structured_response(concat!(
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_edit_001\",\"tool\":\"file.edit\",\"path\":\"./src/main.rs\",\"old_string\":\"fn main()\",\"new_string\":\"fn main() -> Result<()>\"}\n",
+        "```\n",
+        "```ANVIL_FINAL\n",
+        "Edited the file.\n",
+        "```\n"
+    ))
+    .expect("parser should handle file.edit block");
+
+    assert_eq!(response.tool_calls.len(), 1);
+    assert_eq!(response.tool_calls[0].tool_name, "file.edit");
+    match &response.tool_calls[0].input {
+        anvil::tooling::ToolInput::FileEdit {
+            path,
+            old_string,
+            new_string,
+        } => {
+            assert_eq!(path, "./src/main.rs");
+            assert_eq!(old_string, "fn main()");
+            assert_eq!(new_string, "fn main() -> Result<()>");
+        }
+        other => panic!("unexpected tool input: {other:?}"),
+    }
+}
+
+#[test]
+fn system_prompt_includes_file_edit_tool() {
+    let session = anvil::session::SessionRecord::new(std::path::PathBuf::from("/tmp"));
+    let request =
+        anvil::agent::BasicAgentLoop::build_turn_request("test-model", &session, false, 4096);
+    assert!(
+        request.messages[0].content.contains("file.edit"),
+        "system prompt should mention file.edit"
+    );
+}
