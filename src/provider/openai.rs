@@ -225,6 +225,13 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
             "{}/v1/chat/completions",
             self.base_url.trim_end_matches('/')
         );
+        tracing::debug!(
+            model = %request.model,
+            messages = request.messages.len(),
+            stream = request.stream,
+            "sending openai chat request"
+        );
+
         let mut headers = Vec::new();
         if let Some(api_key) = &self.api_key {
             headers.push(("Authorization", api_key.as_str()));
@@ -314,6 +321,7 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
             })?;
 
         if let Some(err) = had_error {
+            tracing::error!(error = %err, "openai provider request failed");
             return Err(err);
         }
         if !emitted_done {

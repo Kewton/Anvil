@@ -109,6 +109,7 @@ src/
 ├── config/mod.rs        # 設定管理
 ├── contracts/mod.rs     # 共通型定義
 ├── extensions/mod.rs    # スラッシュコマンド・拡張
+├── logging.rs           # 構造化ロギング（tracing初期化）
 ├── metrics/mod.rs       # ベンチマーク
 ├── provider/
 │   ├── mod.rs           # プロバイダー抽象化

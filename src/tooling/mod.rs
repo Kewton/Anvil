@@ -560,8 +560,10 @@ impl LocalToolExecutor {
         &mut self,
         request: ToolExecutionRequest,
     ) -> Result<ToolExecutionResult, ToolRuntimeError> {
+        let tool_name = &request.spec.name;
+        tracing::info!(tool = %tool_name, "executing tool");
         let started = Instant::now();
-        match request.input {
+        let result = match request.input {
             ToolInput::FileRead { ref path } => self.execute_file_read(&request, path, started),
             ToolInput::FileWrite {
                 ref path,
@@ -576,7 +578,13 @@ impl LocalToolExecutor {
                 self.execute_shell_exec(&request, command, started)
             }
             ToolInput::WebSearch { ref query } => self.execute_web_search(&request, query, started),
-        }
+        };
+        tracing::info!(
+            tool = %tool_name,
+            elapsed_ms = %started.elapsed().as_millis(),
+            "tool execution completed"
+        );
+        result
     }
 
     fn execute_file_read(
