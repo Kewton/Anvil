@@ -295,6 +295,39 @@ fn done_frame_excludes_streamed_assistant_messages() {
 }
 
 #[test]
+fn startup_shows_anvil_md_loaded() {
+    let mut config = common::build_config_in(common::unique_test_dir("startup_anvil"));
+    config.set_project_instructions_for_test(Some("test instructions".to_string()));
+    let provider = ProviderRuntimeContext::bootstrap(&config).expect("provider should bootstrap");
+    let mut app = anvil::app::App::new(config.clone(), provider).expect("app should initialize");
+    let tui = Tui::new();
+
+    let rendered = tui.render_startup(
+        &config,
+        &app.initial_snapshot()
+            .expect("initial snapshot should build"),
+    );
+
+    assert!(rendered.contains("ANVIL.md: loaded"));
+}
+
+#[test]
+fn startup_without_anvil_md() {
+    let config = common::build_config_in(common::unique_test_dir("startup_no_anvil"));
+    let provider = ProviderRuntimeContext::bootstrap(&config).expect("provider should bootstrap");
+    let mut app = anvil::app::App::new(config.clone(), provider).expect("app should initialize");
+    let tui = Tui::new();
+
+    let rendered = tui.render_startup(
+        &config,
+        &app.initial_snapshot()
+            .expect("initial snapshot should build"),
+    );
+
+    assert!(!rendered.contains("ANVIL.md: loaded"));
+}
+
+#[test]
 fn busy_prompt_hints_include_slash_commands() {
     let mut app = common::build_app();
     let tui = Tui::new();

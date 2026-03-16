@@ -280,6 +280,7 @@ impl App {
             &self.session,
             self.provider.capabilities.streaming && self.config.runtime.stream,
             self.config.runtime.context_window,
+            self.config.project_instructions(),
         );
 
         // Phase 1: Collect events from provider with spinner + streaming output.
