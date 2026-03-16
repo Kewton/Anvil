@@ -305,6 +305,7 @@ pub(crate) fn infer_plan_from_structured_response(
     for call in &structured.tool_calls {
         let item = match &call.input {
             crate::tooling::ToolInput::FileWrite { path, .. } => format!("write {path}"),
+            crate::tooling::ToolInput::FileEdit { path, .. } => format!("edit {path}"),
             crate::tooling::ToolInput::FileRead { path } => format!("read {path}"),
             crate::tooling::ToolInput::FileSearch { pattern, .. } => {
                 format!("search for {pattern}")
@@ -383,6 +384,9 @@ fn tool_call_approval_summary(call: &crate::tooling::ToolCallRequest) -> String 
             format!("{}: {command}", call.tool_name)
         }
         crate::tooling::ToolInput::FileWrite { path, .. } => {
+            format!("{}: {path}", call.tool_name)
+        }
+        crate::tooling::ToolInput::FileEdit { path, .. } => {
             format!("{}: {path}", call.tool_name)
         }
         crate::tooling::ToolInput::WebFetch { url } => {
