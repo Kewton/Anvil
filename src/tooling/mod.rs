@@ -52,6 +52,7 @@ pub enum ToolKind {
     FileWrite,
     FileSearch,
     ShellExec,
+    WebFetch,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +61,7 @@ pub enum ToolInput {
     FileWrite { path: String, content: String },
     FileSearch { root: String, pattern: String },
     ShellExec { command: String },
+    WebFetch { url: String },
 }
 
 impl ToolInput {
@@ -69,6 +71,7 @@ impl ToolInput {
             Self::FileWrite { .. } => ToolKind::FileWrite,
             Self::FileSearch { .. } => ToolKind::FileSearch,
             Self::ShellExec { .. } => ToolKind::ShellExec,
+            Self::WebFetch { .. } => ToolKind::WebFetch,
         }
     }
 }
@@ -256,6 +259,7 @@ pub enum ToolValidationError {
     UnknownTool,
     InputKindMismatch,
     MissingRequiredField(String),
+    InvalidFieldValue { field: String, reason: String },
     DangerousCommand { command: String, reason: String },
 }
 
@@ -331,11 +335,25 @@ impl ToolRegistry {
         });
     }
 
+    pub fn register_web_fetch(&mut self) {
+        self.register(ToolSpec {
+            version: 1,
+            name: "web.fetch".to_string(),
+            kind: ToolKind::WebFetch,
+            execution_class: ExecutionClass::Network,
+            permission_class: PermissionClass::Safe,
+            execution_mode: ExecutionMode::ParallelSafe,
+            plan_mode: PlanModePolicy::Allowed,
+            rollback_policy: RollbackPolicy::None,
+        });
+    }
+
     pub fn register_standard_tools(&mut self) {
         self.register_file_read();
         self.register_file_write();
         self.register_file_search();
         self.register_shell_exec();
+        self.register_web_fetch();
     }
 
     pub fn validate(
@@ -455,6 +473,43 @@ impl LocalToolExecutor {
                     artifacts: matches,
                     elapsed_ms: started.elapsed().as_millis(),
                 })
+            }
+            ToolInput::WebFetch { url } => {
+                let output = std::process::Command::new("curl")
+                    .args([
+                        "-s",
+                        "-L",
+                        "--fail",
+                        "--max-time",
+                        "30",
+                        "--max-filesize",
+                        "1048576",
+                        "--max-redirs",
+                        "5",
+                        &url,
+                    ])
+                    .output()
+                    .map_err(|err| {
+                        ToolRuntimeError::Io(format!("web.fetch failed to spawn curl: {err}"))
+                    })?;
+
+                if output.status.success() {
+                    let body = String::from_utf8_lossy(&output.stdout).to_string();
+                    Ok(ToolExecutionResult {
+                        tool_call_id: request.tool_call_id,
+                        tool_name: request.spec.name,
+                        status: ToolExecutionStatus::Completed,
+                        summary: url,
+                        payload: ToolExecutionPayload::Text(body),
+                        artifacts: Vec::new(),
+                        elapsed_ms: started.elapsed().as_millis(),
+                    })
+                } else {
+                    let stderr_msg = String::from_utf8_lossy(&output.stderr).to_string();
+                    Err(ToolRuntimeError::Io(format!(
+                        "web.fetch failed for {url}: {stderr_msg}"
+                    )))
+                }
             }
             ToolInput::ShellExec { command } => {
                 use std::io::{BufRead, Write as _};
@@ -653,6 +708,17 @@ fn validate_required_fields(input: &ToolInput) -> Result<(), ToolValidationError
                 ));
             }
             validate_shell_command_safety(command)?;
+        }
+        ToolInput::WebFetch { url } => {
+            if url.trim().is_empty() {
+                return Err(ToolValidationError::MissingRequiredField("url".to_string()));
+            }
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                return Err(ToolValidationError::InvalidFieldValue {
+                    field: "url".to_string(),
+                    reason: "must start with http:// or https://".to_string(),
+                });
+            }
         }
     }
 

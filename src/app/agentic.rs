@@ -227,6 +227,9 @@ impl App {
                     crate::tooling::ToolInput::FileWrite { path, .. } => {
                         format!("{}: {path}", call.tool_name)
                     }
+                    crate::tooling::ToolInput::WebFetch { url } => {
+                        format!("{}: {url}", call.tool_name)
+                    }
                     _ => call.tool_name.clone(),
                 };
                 // Ask user inline via stderr/stdin
@@ -366,6 +369,7 @@ pub(crate) fn infer_plan_from_structured_response(
             crate::tooling::ToolInput::ShellExec { command } => {
                 format!("run shell command: {command}")
             }
+            crate::tooling::ToolInput::WebFetch { url } => format!("fetch {url}"),
         };
         plan.push(item);
     }
