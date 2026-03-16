@@ -446,3 +446,42 @@ fn web_search_pending_turn_state_serde_roundtrip() {
         other => panic!("unexpected tool input: {other:?}"),
     }
 }
+
+#[test]
+fn file_edit_pending_turn_state_serde_roundtrip() {
+    use anvil::agent::PendingTurnState;
+    use anvil::tooling::{ToolCallRequest, ToolInput};
+
+    let pending = PendingTurnState {
+        waiting_tool_call_id: "call_edit_001".to_string(),
+        remaining_events: vec![],
+        pending_tool_calls: vec![ToolCallRequest::new(
+            "call_edit_001",
+            "file.edit",
+            ToolInput::FileEdit {
+                path: "./src/main.rs".to_string(),
+                old_string: "fn main()".to_string(),
+                new_string: "fn main() -> Result<()>".to_string(),
+            },
+        )],
+    };
+
+    let json = serde_json::to_string(&pending).expect("serialize should succeed");
+    let deserialized: PendingTurnState =
+        serde_json::from_str(&json).expect("deserialize should succeed");
+
+    assert_eq!(pending, deserialized);
+    assert_eq!(deserialized.pending_tool_calls[0].tool_name, "file.edit");
+    match &deserialized.pending_tool_calls[0].input {
+        ToolInput::FileEdit {
+            path,
+            old_string,
+            new_string,
+        } => {
+            assert_eq!(path, "./src/main.rs");
+            assert_eq!(old_string, "fn main()");
+            assert_eq!(new_string, "fn main() -> Result<()>");
+        }
+        other => panic!("unexpected tool input: {other:?}"),
+    }
+}

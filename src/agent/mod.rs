@@ -120,14 +120,33 @@ pub struct StructuredAssistantResponse {
 }
 
 impl BasicAgentLoop {
+    /// Build the system prompt string, optionally appending ANVIL.md content.
+    fn build_system_content(project_instructions: Option<&str>) -> String {
+        match project_instructions {
+            Some(instructions) => format!(
+                "{}\n\n## Project instructions (from ANVIL.md)\n{}",
+                tool_protocol_system_prompt(),
+                instructions
+            ),
+            None => tool_protocol_system_prompt().to_string(),
+        }
+    }
+
     pub fn build_turn_request(
         model: impl Into<String>,
         session: &SessionRecord,
         stream: bool,
         context_window: u32,
+        project_instructions: Option<&str>,
     ) -> ProviderTurnRequest {
         let token_budget = derive_context_budget(context_window);
-        Self::build_turn_request_with_token_budget(model, session, stream, token_budget)
+        Self::build_turn_request_with_token_budget(
+            model,
+            session,
+            stream,
+            token_budget,
+            project_instructions,
+        )
     }
 
     pub fn build_turn_request_with_limit(
@@ -135,15 +154,21 @@ impl BasicAgentLoop {
         session: &SessionRecord,
         stream: bool,
         max_messages: usize,
+        project_instructions: Option<&str>,
     ) -> ProviderTurnRequest {
         let len = session.messages.len();
         let start = len.saturating_sub(max_messages);
+
+        let system_content = Self::build_system_content(project_instructions);
+
         ProviderTurnRequest::new(
             model.into(),
-            session.messages[start..]
-                .iter()
-                .map(to_provider_message)
-                .collect(),
+            std::iter::once(ProviderMessage::new(
+                ProviderMessageRole::System,
+                &system_content,
+            ))
+            .chain(session.messages[start..].iter().map(to_provider_message))
+            .collect(),
             stream,
         )
     }
@@ -153,6 +178,7 @@ impl BasicAgentLoop {
         session: &SessionRecord,
         stream: bool,
         token_budget: usize,
+        project_instructions: Option<&str>,
     ) -> ProviderTurnRequest {
         let mut selected = Vec::new();
         let mut used_tokens = 0usize;
@@ -175,11 +201,13 @@ impl BasicAgentLoop {
             "built turn request"
         );
 
+        let system_content = Self::build_system_content(project_instructions);
+
         ProviderTurnRequest::new(
             model.into(),
             std::iter::once(ProviderMessage::new(
                 ProviderMessageRole::System,
-                tool_protocol_system_prompt(),
+                &system_content,
             ))
             .chain(selected.into_iter().map(to_provider_message))
             .collect(),
@@ -372,22 +400,27 @@ fn tool_protocol_system_prompt() -> &'static str {
         "{\"id\":\"call_002\",\"tool\":\"file.write\",\"path\":\"./relative/path\",\"content\":\"file content here\"}\n",
         "```\n",
         "\n",
-        "3. file.search — search for files by name or content:\n",
+        "3. file.edit — edit a file by replacing a specific string:\n",
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_007\",\"tool\":\"file.edit\",\"path\":\"./relative/path\",\"old_string\":\"text to find\",\"new_string\":\"replacement text\"}\n",
+        "```\n",
+        "\n",
+        "4. file.search — search for files by name or content:\n",
         "```ANVIL_TOOL\n",
         "{\"id\":\"call_003\",\"tool\":\"file.search\",\"root\":\".\",\"pattern\":\"search term\"}\n",
         "```\n",
         "\n",
-        "4. shell.exec — run a shell command and capture its output:\n",
+        "5. shell.exec — run a shell command and capture its output:\n",
         "```ANVIL_TOOL\n",
         "{\"id\":\"call_004\",\"tool\":\"shell.exec\",\"command\":\"ls -la\"}\n",
         "```\n",
         "\n",
-        "5. web.fetch — fetch the contents of a URL:\n",
+        "6. web.fetch — fetch the contents of a URL:\n",
         "```ANVIL_TOOL\n",
         "{\"id\":\"call_005\",\"tool\":\"web.fetch\",\"url\":\"https://example.com\"}\n",
         "```\n",
         "\n",
-        "6. web.search — search the web by keyword:\n",
+        "7. web.search — search the web by keyword:\n",
         "```ANVIL_TOOL\n",
         "{\"id\":\"call_006\",\"tool\":\"web.search\",\"query\":\"search keywords here\"}\n",
         "```\n",

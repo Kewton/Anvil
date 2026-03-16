@@ -51,6 +51,7 @@ pub enum RollbackPolicy {
 pub enum ToolKind {
     FileRead,
     FileWrite,
+    FileEdit,
     FileSearch,
     ShellExec,
     WebFetch,
@@ -59,12 +60,31 @@ pub enum ToolKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolInput {
-    FileRead { path: String },
-    FileWrite { path: String, content: String },
-    FileSearch { root: String, pattern: String },
-    ShellExec { command: String },
-    WebFetch { url: String },
-    WebSearch { query: String },
+    FileRead {
+        path: String,
+    },
+    FileWrite {
+        path: String,
+        content: String,
+    },
+    FileEdit {
+        path: String,
+        old_string: String,
+        new_string: String,
+    },
+    FileSearch {
+        root: String,
+        pattern: String,
+    },
+    ShellExec {
+        command: String,
+    },
+    WebFetch {
+        url: String,
+    },
+    WebSearch {
+        query: String,
+    },
 }
 
 impl ToolInput {
@@ -72,6 +92,7 @@ impl ToolInput {
         match self {
             Self::FileRead { .. } => ToolKind::FileRead,
             Self::FileWrite { .. } => ToolKind::FileWrite,
+            Self::FileEdit { .. } => ToolKind::FileEdit,
             Self::FileSearch { .. } => ToolKind::FileSearch,
             Self::ShellExec { .. } => ToolKind::ShellExec,
             Self::WebFetch { .. } => ToolKind::WebFetch,
@@ -97,6 +118,28 @@ impl ToolInput {
                     .ok_or_else(|| "missing content in file.write tool block".to_string())?
                     .to_string(),
             }),
+            "file.edit" => {
+                let path = value
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .map(String::from)
+                    .ok_or_else(|| "missing path in file.edit tool block".to_string())?;
+                let old_string = value
+                    .get("old_string")
+                    .and_then(serde_json::Value::as_str)
+                    .map(String::from)
+                    .ok_or_else(|| "missing old_string in file.edit tool block".to_string())?;
+                let new_string = value
+                    .get("new_string")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                Ok(ToolInput::FileEdit {
+                    path,
+                    old_string,
+                    new_string,
+                })
+            }
             "file.read" => Ok(ToolInput::FileRead {
                 path: value
                     .get("path")
@@ -158,6 +201,16 @@ impl ToolInput {
                 path: extract_simple(block, "path")?,
                 content: extract_trailing(block, "content")?,
             }),
+            "file.edit" => {
+                let path = extract_simple(block, "path")?;
+                let old_string = extract_simple(block, "old_string")?;
+                let new_string = extract_trailing(block, "new_string").unwrap_or_default();
+                Some(ToolInput::FileEdit {
+                    path,
+                    old_string,
+                    new_string,
+                })
+            }
             "file.read" => Some(ToolInput::FileRead {
                 path: extract_simple(block, "path")?,
             }),
@@ -416,6 +469,19 @@ impl ToolRegistry {
         });
     }
 
+    pub fn register_file_edit(&mut self) {
+        self.register(ToolSpec {
+            version: 1,
+            name: "file.edit".to_string(),
+            kind: ToolKind::FileEdit,
+            execution_class: ExecutionClass::Mutating,
+            permission_class: PermissionClass::Confirm,
+            execution_mode: ExecutionMode::SequentialOnly,
+            plan_mode: PlanModePolicy::AllowedWithScope,
+            rollback_policy: RollbackPolicy::CheckpointBeforeWrite,
+        });
+    }
+
     pub fn register_file_search(&mut self) {
         self.register(ToolSpec {
             version: 1,
@@ -471,6 +537,7 @@ impl ToolRegistry {
     pub fn register_standard_tools(&mut self) {
         self.register_file_read();
         self.register_file_write();
+        self.register_file_edit();
         self.register_file_search();
         self.register_shell_exec();
         self.register_web_fetch();
@@ -569,6 +636,11 @@ impl LocalToolExecutor {
                 ref path,
                 ref content,
             } => self.execute_file_write(&request, path, content, started),
+            ToolInput::FileEdit {
+                ref path,
+                ref old_string,
+                ref new_string,
+            } => self.execute_file_edit(&request, path, old_string, new_string, started),
             ToolInput::FileSearch {
                 ref root,
                 ref pattern,
@@ -632,6 +704,60 @@ impl LocalToolExecutor {
         fs::write(&resolved, content).map_err(|err| {
             ToolRuntimeError::Io(format!(
                 "file.write failed for {}: {err}",
+                resolved.display()
+            ))
+        })?;
+        Ok(build_completed_result(
+            request,
+            path.to_string(),
+            ToolExecutionPayload::None,
+            vec![resolved.display().to_string()],
+            started,
+        ))
+    }
+
+    fn execute_file_edit(
+        &self,
+        request: &ToolExecutionRequest,
+        path: &str,
+        old_string: &str,
+        new_string: &str,
+        started: Instant,
+    ) -> Result<ToolExecutionResult, ToolRuntimeError> {
+        let resolved = self.resolve_path(path)?;
+        let content = fs::read_to_string(&resolved).map_err(|err| {
+            ToolRuntimeError::Io(format!(
+                "file.edit failed to read {}: {err}",
+                resolved.display()
+            ))
+        })?;
+        if old_string == new_string {
+            return Ok(build_completed_result(
+                request,
+                format!("{path} (no changes)"),
+                ToolExecutionPayload::None,
+                vec![],
+                started,
+            ));
+        }
+        let count = content.matches(old_string).count();
+        if count == 0 {
+            return Err(ToolRuntimeError::Io(format!(
+                "file.edit: old_string not found in {path}. \
+                 Ensure the string exactly matches the file content, \
+                 including whitespace and indentation."
+            )));
+        }
+        if count > 1 {
+            return Err(ToolRuntimeError::Io(format!(
+                "file.edit: old_string found {count} times in {path}. \
+                 Include more surrounding context to make the match unique."
+            )));
+        }
+        let new_content = content.replacen(old_string, new_string, 1);
+        fs::write(&resolved, &new_content).map_err(|err| {
+            ToolRuntimeError::Io(format!(
+                "file.edit failed to write {}: {err}",
                 resolved.display()
             ))
         })?;
@@ -1069,6 +1195,20 @@ fn validate_required_fields(input: &ToolInput) -> Result<(), ToolValidationError
             if content.trim().is_empty() {
                 return Err(ToolValidationError::MissingRequiredField(
                     "content".to_string(),
+                ));
+            }
+        }
+        ToolInput::FileEdit {
+            path, old_string, ..
+        } => {
+            if path.trim().is_empty() {
+                return Err(ToolValidationError::MissingRequiredField(
+                    "path".to_string(),
+                ));
+            }
+            if old_string.is_empty() {
+                return Err(ToolValidationError::MissingRequiredField(
+                    "old_string".to_string(),
                 ));
             }
         }

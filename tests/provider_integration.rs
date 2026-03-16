@@ -615,11 +615,17 @@ fn basic_agent_loop_applies_context_shaping_limit() {
         app.session(),
         true,
         3,
+        None,
     );
 
-    assert_eq!(request.messages.len(), 3);
-    assert_eq!(request.messages[0].content, "u2");
-    assert_eq!(request.messages[2].content, "u3");
+    // System prompt is now injected as messages[0]
+    assert_eq!(request.messages.len(), 4);
+    assert_eq!(
+        request.messages[0].role,
+        anvil::provider::ProviderMessageRole::System
+    );
+    assert_eq!(request.messages[1].content, "u2");
+    assert_eq!(request.messages[3].content, "u3");
 }
 
 #[test]
@@ -635,12 +641,14 @@ fn basic_agent_loop_derives_context_budget_from_context_window() {
         app.session(),
         true,
         1_000,
+        None,
     );
     let large = anvil::agent::BasicAgentLoop::build_turn_request(
         "local-default",
         app.session(),
         true,
         200_000,
+        None,
     );
 
     assert!(small.messages.len() < large.messages.len());
@@ -1293,7 +1301,7 @@ fn structured_response_parser_repairs_web_fetch_block() {
 fn system_prompt_includes_web_fetch_tool() {
     let session = anvil::session::SessionRecord::new(std::path::PathBuf::from("/tmp"));
     let request =
-        anvil::agent::BasicAgentLoop::build_turn_request("test-model", &session, false, 4096);
+        anvil::agent::BasicAgentLoop::build_turn_request("test-model", &session, false, 4096, None);
     assert!(
         request.messages[0].content.contains("web.fetch"),
         "system prompt should mention web.fetch"
@@ -1369,7 +1377,7 @@ fn structured_response_parser_repairs_web_search_block() {
 fn system_prompt_includes_web_search_tool() {
     let session = anvil::session::SessionRecord::new(std::path::PathBuf::from("/tmp"));
     let request =
-        anvil::agent::BasicAgentLoop::build_turn_request("test-model", &session, false, 4096);
+        anvil::agent::BasicAgentLoop::build_turn_request("test-model", &session, false, 4096, None);
     assert!(
         request.messages[0].content.contains("web.search"),
         "system prompt should mention web.search"
@@ -1380,7 +1388,7 @@ fn system_prompt_includes_web_search_tool() {
 fn system_prompt_includes_github_insights() {
     let session = anvil::session::SessionRecord::new(std::path::PathBuf::from("/tmp"));
     let request =
-        anvil::agent::BasicAgentLoop::build_turn_request("test-model", &session, false, 4096);
+        anvil::agent::BasicAgentLoop::build_turn_request("test-model", &session, false, 4096, None);
     assert!(
         request.messages[0].content.contains("GitHub Insights"),
         "system prompt should mention GitHub Insights"
@@ -1388,5 +1396,126 @@ fn system_prompt_includes_github_insights() {
     assert!(
         request.messages[0].content.contains("gh api"),
         "system prompt should mention gh api"
+    );
+}
+
+// --- file.edit agent protocol tests ---
+
+#[test]
+fn file_edit_anvil_tool_block_parses() {
+    let response = anvil::agent::BasicAgentLoop::parse_structured_response(concat!(
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_edit_001\",\"tool\":\"file.edit\",\"path\":\"./src/main.rs\",\"old_string\":\"fn main()\",\"new_string\":\"fn main() -> Result<()>\"}\n",
+        "```\n",
+        "```ANVIL_FINAL\n",
+        "Edited the file.\n",
+        "```\n"
+    ))
+    .expect("parser should handle file.edit block");
+
+    assert_eq!(response.tool_calls.len(), 1);
+    assert_eq!(response.tool_calls[0].tool_name, "file.edit");
+    match &response.tool_calls[0].input {
+        anvil::tooling::ToolInput::FileEdit {
+            path,
+            old_string,
+            new_string,
+        } => {
+            assert_eq!(path, "./src/main.rs");
+            assert_eq!(old_string, "fn main()");
+            assert_eq!(new_string, "fn main() -> Result<()>");
+        }
+        other => panic!("unexpected tool input: {other:?}"),
+    }
+}
+
+#[test]
+fn system_prompt_includes_file_edit_tool() {
+    let session = anvil::session::SessionRecord::new(std::path::PathBuf::from("/tmp"));
+    let request =
+        anvil::agent::BasicAgentLoop::build_turn_request("test-model", &session, false, 4096, None);
+    assert!(
+        request.messages[0].content.contains("file.edit"),
+        "system prompt should mention file.edit"
+    );
+}
+
+// --- ANVIL.md project instructions tests ---
+
+#[test]
+fn system_prompt_includes_project_instructions() {
+    let session = anvil::session::SessionRecord::new(std::path::PathBuf::from("/tmp"));
+    let instructions = "Always use snake_case for function names.";
+    let request = anvil::agent::BasicAgentLoop::build_turn_request(
+        "test-model",
+        &session,
+        false,
+        4096,
+        Some(instructions),
+    );
+
+    assert!(
+        request.messages[0]
+            .content
+            .contains("Project instructions (from ANVIL.md)"),
+        "system prompt should contain ANVIL.md header"
+    );
+    assert!(
+        request.messages[0].content.contains(instructions),
+        "system prompt should contain the project instructions"
+    );
+    assert!(
+        request.messages[0].content.contains("You are Anvil"),
+        "system prompt should still contain base prompt"
+    );
+}
+
+#[test]
+fn system_prompt_without_project_instructions() {
+    let session = anvil::session::SessionRecord::new(std::path::PathBuf::from("/tmp"));
+    let request =
+        anvil::agent::BasicAgentLoop::build_turn_request("test-model", &session, false, 4096, None);
+
+    assert!(
+        !request.messages[0]
+            .content
+            .contains("Project instructions (from ANVIL.md)"),
+        "system prompt should NOT contain ANVIL.md header when None"
+    );
+    assert!(
+        request.messages[0].content.contains("You are Anvil"),
+        "system prompt should contain base prompt"
+    );
+}
+
+#[test]
+fn build_turn_request_with_limit_includes_system_prompt() {
+    let mut app = common::build_app();
+    app.record_user_input("msg_001", "u1").expect("persist");
+    app.record_assistant_output("msg_002", "a1")
+        .expect("persist");
+    app.record_user_input("msg_003", "u2").expect("persist");
+
+    let instructions = "Test project instructions.";
+    let request = anvil::agent::BasicAgentLoop::build_turn_request_with_limit(
+        "local-default",
+        app.session(),
+        true,
+        3,
+        Some(instructions),
+    );
+
+    assert_eq!(request.messages.len(), 4);
+    assert_eq!(
+        request.messages[0].role,
+        anvil::provider::ProviderMessageRole::System
+    );
+    assert!(
+        request.messages[0].content.contains(instructions),
+        "system prompt should contain project instructions"
+    );
+    assert!(
+        request.messages[0].content.contains("You are Anvil"),
+        "system prompt should contain base prompt"
     );
 }
