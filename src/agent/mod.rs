@@ -120,14 +120,33 @@ pub struct StructuredAssistantResponse {
 }
 
 impl BasicAgentLoop {
+    /// Build the system prompt string, optionally appending ANVIL.md content.
+    fn build_system_content(project_instructions: Option<&str>) -> String {
+        match project_instructions {
+            Some(instructions) => format!(
+                "{}\n\n## Project instructions (from ANVIL.md)\n{}",
+                tool_protocol_system_prompt(),
+                instructions
+            ),
+            None => tool_protocol_system_prompt().to_string(),
+        }
+    }
+
     pub fn build_turn_request(
         model: impl Into<String>,
         session: &SessionRecord,
         stream: bool,
         context_window: u32,
+        project_instructions: Option<&str>,
     ) -> ProviderTurnRequest {
         let token_budget = derive_context_budget(context_window);
-        Self::build_turn_request_with_token_budget(model, session, stream, token_budget)
+        Self::build_turn_request_with_token_budget(
+            model,
+            session,
+            stream,
+            token_budget,
+            project_instructions,
+        )
     }
 
     pub fn build_turn_request_with_limit(
@@ -135,15 +154,21 @@ impl BasicAgentLoop {
         session: &SessionRecord,
         stream: bool,
         max_messages: usize,
+        project_instructions: Option<&str>,
     ) -> ProviderTurnRequest {
         let len = session.messages.len();
         let start = len.saturating_sub(max_messages);
+
+        let system_content = Self::build_system_content(project_instructions);
+
         ProviderTurnRequest::new(
             model.into(),
-            session.messages[start..]
-                .iter()
-                .map(to_provider_message)
-                .collect(),
+            std::iter::once(ProviderMessage::new(
+                ProviderMessageRole::System,
+                &system_content,
+            ))
+            .chain(session.messages[start..].iter().map(to_provider_message))
+            .collect(),
             stream,
         )
     }
@@ -153,6 +178,7 @@ impl BasicAgentLoop {
         session: &SessionRecord,
         stream: bool,
         token_budget: usize,
+        project_instructions: Option<&str>,
     ) -> ProviderTurnRequest {
         let mut selected = Vec::new();
         let mut used_tokens = 0usize;
@@ -168,11 +194,13 @@ impl BasicAgentLoop {
 
         selected.reverse();
 
+        let system_content = Self::build_system_content(project_instructions);
+
         ProviderTurnRequest::new(
             model.into(),
             std::iter::once(ProviderMessage::new(
                 ProviderMessageRole::System,
-                tool_protocol_system_prompt(),
+                &system_content,
             ))
             .chain(selected.into_iter().map(to_provider_message))
             .collect(),
