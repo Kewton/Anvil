@@ -269,6 +269,13 @@ impl SessionRecord {
             return false;
         }
 
+        let messages_to_compact = self.messages.len() - keep_recent;
+        tracing::debug!(
+            compacted = messages_to_compact,
+            kept = keep_recent,
+            "compacting session history"
+        );
+
         let split_at = self.messages.len() - keep_recent;
         let compacted = &self.messages[..split_at];
         let summary = summarize_messages(compacted);
@@ -375,6 +382,7 @@ impl SessionStore {
     }
 
     pub fn load_or_create(&self, cwd: &Path) -> Result<SessionRecord, SessionError> {
+        tracing::debug!(path = %self.file_path.display(), "loading session");
         if self.file_path.exists() {
             match self.load() {
                 Ok(mut record) => {
@@ -382,6 +390,7 @@ impl SessionStore {
                     return Ok(record);
                 }
                 Err(SessionError::SessionDeserializeFailed(_)) => {
+                    tracing::debug!("creating new session");
                     let mut record = SessionRecord::new(cwd.to_path_buf());
                     record.record_event(AppEvent::SessionLoaded);
                     self.save(&record)?;
@@ -391,6 +400,7 @@ impl SessionStore {
             }
         }
 
+        tracing::debug!("creating new session");
         let mut record = SessionRecord::new(cwd.to_path_buf());
         record.record_event(AppEvent::SessionLoaded);
         self.save(&record)?;
@@ -410,7 +420,9 @@ impl SessionStore {
 
         let contents =
             serde_json::to_string_pretty(record).map_err(SessionError::SessionSerializeFailed)?;
-        std::fs::write(&self.file_path, contents).map_err(SessionError::SessionWriteFailed)
+        std::fs::write(&self.file_path, contents).map_err(SessionError::SessionWriteFailed)?;
+        tracing::debug!(path = %self.file_path.display(), "session saved");
+        Ok(())
     }
 }
 

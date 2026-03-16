@@ -194,6 +194,13 @@ impl BasicAgentLoop {
 
         selected.reverse();
 
+        tracing::debug!(
+            selected_messages = selected.len(),
+            used_tokens = used_tokens,
+            budget = token_budget,
+            "built turn request"
+        );
+
         let system_content = Self::build_system_content(project_instructions);
 
         ProviderTurnRequest::new(
@@ -352,7 +359,13 @@ fn derive_context_budget(context_window: u32) -> usize {
     }
     let quarter = (context_window / 4) as usize;
     let half = (context_window / 2) as usize;
-    quarter.clamp(256, half)
+    let budget = quarter.clamp(256, half);
+    tracing::debug!(
+        budget = budget,
+        context_window = context_window,
+        "context budget derived"
+    );
+    budget
 }
 
 fn estimate_message_tokens(content: &str) -> usize {

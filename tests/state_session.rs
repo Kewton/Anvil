@@ -118,6 +118,7 @@ fn session_store_persists_and_restores_messages() {
     config.paths.state_dir = root.join(".anvil").join("state");
     config.paths.session_dir = root.join(".anvil").join("sessions");
     config.paths.session_file = config.paths.session_dir.join("session_roundtrip.json");
+    config.paths.logs_dir = root.join(".anvil").join("logs");
 
     let store = SessionStore::from_config(&config);
     let mut session = store
@@ -359,6 +360,7 @@ fn session_interrupt_persists_and_resumes_correctly() {
     config.paths.cwd = root.clone();
     config.paths.session_dir = root.join(".anvil").join("sessions");
     config.paths.session_file = config.paths.session_dir.join("session_interrupt.json");
+    config.paths.logs_dir = root.join(".anvil").join("logs");
 
     let store = anvil::session::SessionStore::from_config(&config);
     let mut session = store

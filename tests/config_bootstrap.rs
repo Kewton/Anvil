@@ -36,6 +36,8 @@ fn effective_config_derives_workspace_and_session_paths() {
         ReasoningVisibility::Summary
     );
     assert!(!config.mode.debug_logging);
+    assert!(config.paths.logs_dir.ends_with("logs"));
+    assert!(config.mode.log_filter.is_none());
 }
 
 #[test]

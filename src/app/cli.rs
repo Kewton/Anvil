@@ -4,6 +4,7 @@
 //! that drive the interactive CLI experience.
 
 use crate::config::EffectiveConfig;
+use crate::logging::{LogGuard, init_tracing};
 use crate::provider::{ProviderClient, ProviderRuntimeContext, build_local_provider_client};
 use crate::session::SessionError;
 use crate::tui::Tui;
@@ -57,6 +58,22 @@ pub fn run_session_loop<C: ProviderClient, R: BufRead, W: Write>(
 /// line editing, and input history.
 pub fn run() -> Result<(), AppError> {
     let config = EffectiveConfig::load()?;
+
+    let _guard: Option<LogGuard> = init_tracing(
+        config.mode.log_filter.as_deref(),
+        config.mode.debug_logging,
+        &config.paths.logs_dir,
+        config.session_key(),
+    );
+
+    tracing::info!(
+        provider = %config.runtime.provider,
+        model = %config.runtime.model,
+        context_window = config.runtime.context_window,
+        debug_logging = config.mode.debug_logging,
+        "anvil started with effective config"
+    );
+
     let provider = ProviderRuntimeContext::bootstrap(&config)?;
     let provider_client = build_local_provider_client(&config)?;
     let mut app = App::new(config, provider)?;

@@ -163,6 +163,13 @@ impl<T: HttpTransport> ProviderClient for OllamaProviderClient<T> {
         })?;
         let url = format!("{}/api/chat", self.base_url.trim_end_matches('/'));
 
+        tracing::debug!(
+            model = %resolved_request.model,
+            messages = resolved_request.messages.len(),
+            stream = resolved_request.stream,
+            "sending ollama chat request"
+        );
+
         let mut assistant_output = String::new();
         let mut had_error: Option<ProviderTurnError> = None;
 
@@ -206,6 +213,7 @@ impl<T: HttpTransport> ProviderClient for OllamaProviderClient<T> {
             })?;
 
         if let Some(err) = had_error {
+            tracing::error!(error = %err, "ollama provider request failed");
             return Err(err);
         }
         Ok(())

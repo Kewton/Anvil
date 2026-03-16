@@ -20,7 +20,7 @@ pub enum WebSearchProvider {
     SerperApi,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 /// Provider, model, and transport settings.
 pub struct RuntimeConfig {
     pub provider: String,
@@ -46,6 +46,7 @@ pub struct ModeConfig {
     pub fresh_session: bool,
     pub reasoning_visibility: ReasoningVisibility,
     pub debug_logging: bool,
+    pub log_filter: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +63,7 @@ pub struct PathConfig {
     pub state_dir: PathBuf,
     pub session_dir: PathBuf,
     pub session_file: PathBuf,
+    pub logs_dir: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -128,6 +130,7 @@ impl EffectiveConfig {
         let state_dir = cwd.join(".anvil").join("state");
         let session_dir = cwd.join(".anvil").join("sessions");
         let session_file = session_dir.join(format!("{}.json", session_key_for_cwd(&cwd)));
+        let logs_dir = cwd.join(".anvil").join("logs");
         Self {
             runtime: RuntimeConfig {
                 provider: "ollama".to_string(),
@@ -151,6 +154,7 @@ impl EffectiveConfig {
                 fresh_session: false,
                 reasoning_visibility: ReasoningVisibility::Summary,
                 debug_logging: false,
+                log_filter: None,
             },
             paths: PathConfig {
                 cwd,
@@ -159,6 +163,7 @@ impl EffectiveConfig {
                 state_dir,
                 session_dir,
                 session_file,
+                logs_dir,
             },
             project_instructions: None,
         }
@@ -217,6 +222,7 @@ impl EffectiveConfig {
             "ANVIL_DEBUG",
             "ANVIL_WEB_SEARCH_PROVIDER",
             "SERPER_API_KEY",
+            "ANVIL_LOG",
         ] {
             if let Ok(value) = std::env::var(key) {
                 map.insert(key.to_string(), value);
@@ -377,6 +383,9 @@ impl EffectiveConfig {
                         Some(value.clone())
                     };
                 }
+                "log_filter" | "ANVIL_LOG" => {
+                    self.mode.log_filter = Some(value.clone());
+                }
                 _ => {}
             }
         }
@@ -393,6 +402,14 @@ impl EffectiveConfig {
         self.apply_map(env_values)?;
         self.apply_map(cli_values)?;
         Ok(())
+    }
+
+    pub fn session_key(&self) -> &str {
+        self.paths
+            .session_file
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
     }
 
     pub fn default_for_test() -> Result<Self, ConfigError> {
@@ -544,6 +561,27 @@ fn parse_reasoning_visibility(value: &str) -> Result<ReasoningVisibility, Config
         "hidden" => Ok(ReasoningVisibility::Hidden),
         "summary" => Ok(ReasoningVisibility::Summary),
         other => Err(ConfigError::InvalidReasoningVisibility(other.to_string())),
+    }
+}
+
+impl std::fmt::Debug for RuntimeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeConfig")
+            .field("provider", &self.provider)
+            .field("provider_url", &self.provider_url)
+            .field("model", &self.model)
+            .field("sidecar_model", &self.sidecar_model)
+            .field("api_key", &"[REDACTED]")
+            .field("context_window", &self.context_window)
+            .field("context_budget", &self.context_budget)
+            .field("max_agent_iterations", &self.max_agent_iterations)
+            .field("max_console_messages", &self.max_console_messages)
+            .field("auto_compact_threshold", &self.auto_compact_threshold)
+            .field("tool_result_max_chars", &self.tool_result_max_chars)
+            .field("stream", &self.stream)
+            .field("web_search_provider", &self.web_search_provider)
+            .field("serper_api_key", &"[REDACTED]")
+            .finish()
     }
 }
 
