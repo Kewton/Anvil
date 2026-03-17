@@ -33,15 +33,10 @@ struct MockHttpTransport {
     seen_bodies: Rc<RefCell<Vec<Vec<u8>>>>,
     seen_headers: HeaderLog,
     response: HttpResponse,
+    get_response: Option<HttpResponse>,
 }
 
 impl HttpTransport for MockHttpTransport {
-    fn post_json(&self, url: &str, body: &[u8]) -> Result<HttpResponse, ProviderTurnError> {
-        self.seen_urls.borrow_mut().push(url.to_string());
-        self.seen_bodies.borrow_mut().push(body.to_vec());
-        Ok(self.response.clone())
-    }
-
     fn post_json_with_headers(
         &self,
         url: &str,
@@ -57,6 +52,24 @@ impl HttpTransport for MockHttpTransport {
                 .collect(),
         );
         Ok(self.response.clone())
+    }
+
+    fn get_with_headers(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<HttpResponse, ProviderTurnError> {
+        self.seen_urls.borrow_mut().push(url.to_string());
+        self.seen_headers.borrow_mut().push(
+            headers
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+        );
+        Ok(self
+            .get_response
+            .clone()
+            .unwrap_or_else(|| self.response.clone()))
     }
 }
 
@@ -420,6 +433,7 @@ fn openai_compatible_provider_maps_response_into_done_event() {
             body: br#"{"choices":[{"message":{"role":"assistant","content":"openai-compatible answer"}}]}"#
                 .to_vec(),
         },
+        get_response: None,
     };
     let client = anvil::provider::openai::OpenAiCompatibleProviderClient::with_transport(
         "http://localhost:1234",
@@ -468,6 +482,7 @@ fn openai_compatible_provider_parses_sse_streams() {
             .as_bytes()
             .to_vec(),
         },
+        get_response: None,
     };
     let client = anvil::provider::openai::OpenAiCompatibleProviderClient::with_transport(
         "http://localhost:1234",
@@ -508,6 +523,7 @@ fn openai_compatible_provider_normalizes_error_message() {
             status_code: 401,
             body: br#"{"error":{"message":"invalid api key"}}"#.to_vec(),
         },
+        get_response: None,
     };
     let client = anvil::provider::openai::OpenAiCompatibleProviderClient::with_transport(
         "http://localhost:1234",
@@ -540,6 +556,7 @@ fn openai_compatible_provider_forwards_authorization_header() {
             status_code: 200,
             body: br#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#.to_vec(),
         },
+        get_response: None,
     };
     let client = anvil::provider::openai::OpenAiCompatibleProviderClient::with_transport(
         "http://localhost:1234",
@@ -579,6 +596,7 @@ fn live_turn_executes_structured_response_from_openai_compatible_provider() {
             status_code: 200,
             body: br#"{"choices":[{"message":{"role":"assistant","content":"```ANVIL_TOOL\n{\"id\":\"call_write_001\",\"tool\":\"file.write\",\"path\":\"./sandbox/openai/index.html\",\"content\":\"<html><body>openai parity</body></html>\"}\n```\n```ANVIL_FINAL\nOpenAI-compatible backend created the file and reviewed the output.\n```"}}]}"#.to_vec(),
         },
+        get_response: None,
     };
     let client = anvil::provider::openai::OpenAiCompatibleProviderClient::with_transport(
         "http://localhost:1234",
@@ -873,6 +891,7 @@ fn ollama_provider_stream_turn_posts_chat_request_and_normalizes_response() {
                 status_code: 200,
                 body: body.as_bytes().to_vec(),
             },
+            get_response: None,
         },
     );
     let request = ProviderTurnRequest::new(
@@ -926,6 +945,7 @@ fn ollama_provider_surfaces_non_success_status_as_backend_error() {
                 status_code: 500,
                 body: b"ollama down".to_vec(),
             },
+            get_response: None,
         },
     );
     let request = ProviderTurnRequest::new(
@@ -940,8 +960,139 @@ fn ollama_provider_surfaces_non_success_status_as_backend_error() {
         .stream_turn(&request, &mut |_event| {})
         .expect_err("non-success status should fail");
 
-    assert!(err.to_string().contains("request failed"));
-    assert!(err.to_string().contains("500"));
+    assert!(
+        matches!(
+            err,
+            ProviderTurnError::ServerError {
+                status_code: 500,
+                ..
+            }
+        ),
+        "500 status should be classified as ServerError, got: {err:?}"
+    );
+}
+
+// --- HttpTransport GET and header validation tests ---
+
+#[test]
+fn mock_transport_get_returns_configured_response() {
+    let transport = MockHttpTransport {
+        seen_urls: Rc::new(RefCell::new(Vec::new())),
+        seen_bodies: Rc::new(RefCell::new(Vec::new())),
+        seen_headers: Rc::new(RefCell::new(Vec::new())),
+        response: HttpResponse {
+            status_code: 200,
+            body: b"post response".to_vec(),
+        },
+        get_response: Some(HttpResponse {
+            status_code: 200,
+            body: b"get response".to_vec(),
+        }),
+    };
+
+    let result = transport.get("http://localhost/api/tags").unwrap();
+    assert_eq!(result.status_code, 200);
+    assert_eq!(result.body, b"get response");
+
+    // Verify the URL was recorded
+    let urls = transport.seen_urls.borrow();
+    assert_eq!(urls.len(), 1);
+    assert_eq!(urls[0], "http://localhost/api/tags");
+}
+
+#[test]
+fn mock_transport_get_with_headers_records_headers() {
+    let seen_headers: HeaderLog = Rc::new(RefCell::new(Vec::new()));
+    let transport = MockHttpTransport {
+        seen_urls: Rc::new(RefCell::new(Vec::new())),
+        seen_bodies: Rc::new(RefCell::new(Vec::new())),
+        seen_headers: seen_headers.clone(),
+        response: HttpResponse {
+            status_code: 200,
+            body: b"ok".to_vec(),
+        },
+        get_response: None,
+    };
+
+    let result = transport
+        .get_with_headers(
+            "http://localhost/v1/models",
+            &[("Authorization", "Bearer sk-test")],
+        )
+        .unwrap();
+    assert_eq!(result.status_code, 200);
+
+    let headers = seen_headers.borrow();
+    assert_eq!(headers.len(), 1);
+    assert_eq!(headers[0].len(), 1);
+    assert_eq!(headers[0][0].0, "Authorization");
+    assert_eq!(headers[0][0].1, "Bearer sk-test");
+}
+
+#[test]
+fn mock_transport_get_falls_back_to_post_response_when_get_response_is_none() {
+    let transport = MockHttpTransport {
+        seen_urls: Rc::new(RefCell::new(Vec::new())),
+        seen_bodies: Rc::new(RefCell::new(Vec::new())),
+        seen_headers: Rc::new(RefCell::new(Vec::new())),
+        response: HttpResponse {
+            status_code: 200,
+            body: b"fallback response".to_vec(),
+        },
+        get_response: None,
+    };
+
+    let result = transport.get("http://localhost/api/tags").unwrap();
+    assert_eq!(result.body, b"fallback response");
+}
+
+#[test]
+fn post_json_default_delegates_to_post_json_with_headers() {
+    let seen_headers: HeaderLog = Rc::new(RefCell::new(Vec::new()));
+    let transport = MockHttpTransport {
+        seen_urls: Rc::new(RefCell::new(Vec::new())),
+        seen_bodies: Rc::new(RefCell::new(Vec::new())),
+        seen_headers: seen_headers.clone(),
+        response: HttpResponse {
+            status_code: 200,
+            body: b"ok".to_vec(),
+        },
+        get_response: None,
+    };
+
+    // post_json should delegate to post_json_with_headers with empty headers
+    let result = transport
+        .post_json("http://localhost/api/chat", b"{}")
+        .unwrap();
+    assert_eq!(result.status_code, 200);
+
+    let headers = seen_headers.borrow();
+    assert_eq!(headers.len(), 1);
+    // Default impl passes empty headers slice
+    assert!(headers[0].is_empty());
+}
+
+#[test]
+fn get_default_delegates_to_get_with_headers() {
+    let seen_headers: HeaderLog = Rc::new(RefCell::new(Vec::new()));
+    let transport = MockHttpTransport {
+        seen_urls: Rc::new(RefCell::new(Vec::new())),
+        seen_bodies: Rc::new(RefCell::new(Vec::new())),
+        seen_headers: seen_headers.clone(),
+        response: HttpResponse {
+            status_code: 200,
+            body: b"ok".to_vec(),
+        },
+        get_response: None,
+    };
+
+    // get() should delegate to get_with_headers with empty headers
+    let result = transport.get("http://localhost/api/tags").unwrap();
+    assert_eq!(result.status_code, 200);
+
+    let headers = seen_headers.borrow();
+    assert_eq!(headers.len(), 1);
+    assert!(headers[0].is_empty());
 }
 
 // --- Agentic loop unit tests ---
@@ -1666,4 +1817,687 @@ fn build_turn_request_with_limit_includes_system_prompt() {
         request.messages[0].content.contains("You are Anvil"),
         "system prompt should contain base prompt"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1: ProviderTurnError expansion tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn provider_turn_error_is_retryable_network() {
+    let err = ProviderTurnError::Network("connection refused".to_string());
+    assert!(err.is_retryable());
+}
+
+#[test]
+fn provider_turn_error_is_retryable_server_error() {
+    let err = ProviderTurnError::ServerError {
+        status_code: 500,
+        message: "internal server error".to_string(),
+    };
+    assert!(err.is_retryable());
+}
+
+#[test]
+fn provider_turn_error_is_retryable_timeout() {
+    let err = ProviderTurnError::Timeout("request timed out".to_string());
+    assert!(err.is_retryable());
+}
+
+#[test]
+fn provider_turn_error_not_retryable_cancelled() {
+    let err = ProviderTurnError::Cancelled;
+    assert!(!err.is_retryable());
+}
+
+#[test]
+fn provider_turn_error_not_retryable_client_error() {
+    let err = ProviderTurnError::ClientError {
+        status_code: 401,
+        message: "unauthorized".to_string(),
+    };
+    assert!(!err.is_retryable());
+}
+
+#[test]
+fn provider_turn_error_not_retryable_parse() {
+    let err = ProviderTurnError::Parse("invalid JSON".to_string());
+    assert!(!err.is_retryable());
+}
+
+#[test]
+fn provider_turn_error_not_retryable_backend() {
+    let err = ProviderTurnError::Backend("unknown error".to_string());
+    assert!(!err.is_retryable());
+}
+
+#[test]
+fn provider_turn_error_display_network() {
+    let err = ProviderTurnError::Network("connection refused".to_string());
+    assert_eq!(err.to_string(), "network error: connection refused");
+}
+
+#[test]
+fn provider_turn_error_display_server_error() {
+    let err = ProviderTurnError::ServerError {
+        status_code: 502,
+        message: "bad gateway".to_string(),
+    };
+    assert_eq!(err.to_string(), "server error (502): bad gateway");
+}
+
+#[test]
+fn provider_turn_error_display_client_error() {
+    let err = ProviderTurnError::ClientError {
+        status_code: 403,
+        message: "forbidden".to_string(),
+    };
+    assert_eq!(err.to_string(), "client error (403): forbidden");
+}
+
+#[test]
+fn provider_turn_error_display_timeout() {
+    let err = ProviderTurnError::Timeout("timed out after 30s".to_string());
+    assert_eq!(err.to_string(), "timeout: timed out after 30s");
+}
+
+#[test]
+fn provider_turn_error_display_parse() {
+    let err = ProviderTurnError::Parse("expected '{'".to_string());
+    assert_eq!(err.to_string(), "parse error: expected '{'");
+}
+
+#[test]
+fn provider_turn_error_display_cancelled() {
+    let err = ProviderTurnError::Cancelled;
+    assert_eq!(err.to_string(), "provider turn cancelled");
+}
+
+#[test]
+fn provider_turn_error_display_backend() {
+    let err = ProviderTurnError::Backend("something went wrong".to_string());
+    assert_eq!(
+        err.to_string(),
+        "provider backend error: something went wrong"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1: ProviderErrorKind serde tests
+// ---------------------------------------------------------------------------
+
+use anvil::provider::ProviderErrorKind;
+
+#[test]
+fn provider_error_kind_serde_roundtrip_known_variants() {
+    let variants = vec![
+        ProviderErrorKind::Cancelled,
+        ProviderErrorKind::Network,
+        ProviderErrorKind::ServerError,
+        ProviderErrorKind::ClientError,
+        ProviderErrorKind::Timeout,
+        ProviderErrorKind::Parse,
+        ProviderErrorKind::Backend,
+    ];
+    for variant in variants {
+        let json = serde_json::to_string(&variant).unwrap();
+        let deserialized: ProviderErrorKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(variant, deserialized);
+    }
+}
+
+#[test]
+fn provider_error_kind_unknown_variant_fallback() {
+    // A future variant name that doesn't exist should deserialize to Unknown.
+    let json = r#""RateLimit""#;
+    let deserialized: ProviderErrorKind = serde_json::from_str(json).unwrap();
+    assert_eq!(deserialized, ProviderErrorKind::Unknown);
+}
+
+#[test]
+fn provider_error_kind_unknown_variant_arbitrary_string() {
+    let json = r#""SomethingCompletelyNew""#;
+    let deserialized: ProviderErrorKind = serde_json::from_str(json).unwrap();
+    assert_eq!(deserialized, ProviderErrorKind::Unknown);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: Error classification tests
+// ---------------------------------------------------------------------------
+
+use anvil::provider::{
+    classify_curl_error, classify_http_error, redact_secrets, sanitize_error_message,
+};
+
+#[test]
+fn classify_http_error_500_returns_server_error() {
+    let err = classify_http_error(500, "internal server error");
+    assert!(matches!(
+        err,
+        ProviderTurnError::ServerError {
+            status_code: 500,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn classify_http_error_502_returns_server_error() {
+    let err = classify_http_error(502, "bad gateway");
+    assert!(matches!(
+        err,
+        ProviderTurnError::ServerError {
+            status_code: 502,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn classify_http_error_401_returns_client_error() {
+    let err = classify_http_error(401, "unauthorized");
+    assert!(matches!(
+        err,
+        ProviderTurnError::ClientError {
+            status_code: 401,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn classify_http_error_404_returns_client_error() {
+    let err = classify_http_error(404, "not found");
+    assert!(matches!(
+        err,
+        ProviderTurnError::ClientError {
+            status_code: 404,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn classify_http_error_299_returns_backend() {
+    let err = classify_http_error(299, "unexpected");
+    assert!(matches!(err, ProviderTurnError::Backend(_)));
+}
+
+#[test]
+fn classify_curl_error_exit_28_returns_timeout() {
+    let err = classify_curl_error(28, "operation timed out");
+    assert!(matches!(err, ProviderTurnError::Timeout(_)));
+}
+
+#[test]
+fn classify_curl_error_exit_7_returns_network() {
+    let err = classify_curl_error(7, "failed to connect");
+    assert!(matches!(err, ProviderTurnError::Network(_)));
+}
+
+#[test]
+fn classify_curl_error_exit_6_returns_network() {
+    let err = classify_curl_error(6, "could not resolve host");
+    assert!(matches!(err, ProviderTurnError::Network(_)));
+}
+
+#[test]
+fn classify_curl_error_exit_other_returns_network() {
+    let err = classify_curl_error(56, "recv failure");
+    assert!(matches!(err, ProviderTurnError::Network(_)));
+}
+
+#[test]
+fn sanitize_error_message_truncates_to_500_chars() {
+    let long_message = "a".repeat(600);
+    let sanitized = sanitize_error_message(&long_message);
+    assert!(sanitized.contains("... [truncated, 600 bytes total]"));
+    assert!(sanitized.len() < 600);
+}
+
+#[test]
+fn sanitize_error_message_short_message_unchanged() {
+    let msg = "short error";
+    let sanitized = sanitize_error_message(msg);
+    assert_eq!(sanitized, "short error");
+}
+
+#[test]
+fn redact_secrets_authorization_header() {
+    let msg = "Authorization: Bearer sk-1234567890abcdef";
+    let redacted = redact_secrets(msg);
+    assert!(redacted.contains("[REDACTED]"));
+    assert!(!redacted.contains("sk-1234567890abcdef"));
+}
+
+#[test]
+fn redact_secrets_bearer_token() {
+    let msg = "error with Bearer my-secret-token in message";
+    let redacted = redact_secrets(msg);
+    assert!(redacted.contains("[REDACTED]"));
+    assert!(!redacted.contains("my-secret-token"));
+}
+
+#[test]
+fn redact_secrets_api_key() {
+    let msg = "api_key: my-secret-key";
+    let redacted = redact_secrets(msg);
+    assert!(redacted.contains("[REDACTED]"));
+    assert!(!redacted.contains("my-secret-key"));
+}
+
+#[test]
+fn redact_secrets_no_secrets_unchanged() {
+    let msg = "normal error message";
+    let redacted = redact_secrets(msg);
+    assert_eq!(redacted, "normal error message");
+}
+
+#[test]
+fn classify_http_error_sanitizes_body_with_secrets() {
+    let err = classify_http_error(500, "error with Authorization: Bearer sk-secret");
+    if let ProviderTurnError::ServerError { message, .. } = err {
+        assert!(message.contains("[REDACTED]"));
+        assert!(!message.contains("sk-secret"));
+    } else {
+        panic!("expected ServerError");
+    }
+}
+
+#[test]
+fn classify_http_error_is_retryable_for_server_errors() {
+    let err = classify_http_error(500, "internal error");
+    assert!(err.is_retryable());
+}
+
+#[test]
+fn classify_http_error_not_retryable_for_client_errors() {
+    let err = classify_http_error(401, "unauthorized");
+    assert!(!err.is_retryable());
+}
+
+#[test]
+fn classify_curl_error_timeout_is_retryable() {
+    let err = classify_curl_error(28, "timed out");
+    assert!(err.is_retryable());
+}
+
+#[test]
+fn classify_curl_error_network_is_retryable() {
+    let err = classify_curl_error(7, "connection refused");
+    assert!(err.is_retryable());
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: RetryTransport tests
+// ---------------------------------------------------------------------------
+
+use anvil::provider::{RetryConfig, RetryTransport};
+
+/// Mock transport that fails a configurable number of times before succeeding.
+#[derive(Clone)]
+struct RetryMockTransport {
+    call_count: Rc<RefCell<usize>>,
+    fail_count: usize,
+    error: ProviderTurnError,
+    response: HttpResponse,
+    /// If set, stream_lines will invoke the callback before failing.
+    invoke_callback_before_error: bool,
+}
+
+impl RetryMockTransport {
+    fn new(fail_count: usize, error: ProviderTurnError) -> Self {
+        Self {
+            call_count: Rc::new(RefCell::new(0)),
+            fail_count,
+            error,
+            response: HttpResponse {
+                status_code: 200,
+                body: b"ok".to_vec(),
+            },
+            invoke_callback_before_error: false,
+        }
+    }
+}
+
+impl HttpTransport for RetryMockTransport {
+    fn post_json_with_headers(
+        &self,
+        _url: &str,
+        _body: &[u8],
+        _headers: &[(&str, &str)],
+    ) -> Result<HttpResponse, ProviderTurnError> {
+        let mut count = self.call_count.borrow_mut();
+        *count += 1;
+        if *count <= self.fail_count {
+            Err(self.error.clone())
+        } else {
+            Ok(self.response.clone())
+        }
+    }
+
+    fn get_with_headers(
+        &self,
+        _url: &str,
+        _headers: &[(&str, &str)],
+    ) -> Result<HttpResponse, ProviderTurnError> {
+        let mut count = self.call_count.borrow_mut();
+        *count += 1;
+        if *count <= self.fail_count {
+            Err(self.error.clone())
+        } else {
+            Ok(self.response.clone())
+        }
+    }
+
+    fn stream_lines(
+        &self,
+        _url: &str,
+        _body: &[u8],
+        _headers: &[(&str, &str)],
+        on_line: &mut dyn FnMut(&str),
+    ) -> Result<(), ProviderTurnError> {
+        let mut count = self.call_count.borrow_mut();
+        *count += 1;
+        if *count <= self.fail_count {
+            if self.invoke_callback_before_error {
+                on_line("partial data");
+            }
+            Err(self.error.clone())
+        } else {
+            on_line("success line");
+            Ok(())
+        }
+    }
+}
+
+fn fast_retry_config(max_retries: u32) -> RetryConfig {
+    RetryConfig {
+        max_retries,
+        base_delay_ms: 0,
+        backoff_factor: 2,
+        max_delay_ms: 0,
+    }
+}
+
+#[test]
+fn retry_transport_succeeds_on_second_attempt() {
+    let mock = RetryMockTransport::new(1, ProviderTurnError::Network("fail".into()));
+    let call_count = mock.call_count.clone();
+    let transport = RetryTransport::with_config(mock, fast_retry_config(3));
+
+    let result = transport.post_json_with_headers("http://test", b"body", &[]);
+    assert!(result.is_ok());
+    assert_eq!(*call_count.borrow(), 2);
+}
+
+#[test]
+fn retry_transport_exhausts_max_retries() {
+    // max_retries=3 means 4 total attempts (initial + 3 retries)
+    let mock = RetryMockTransport::new(10, ProviderTurnError::Network("fail".into()));
+    let call_count = mock.call_count.clone();
+    let transport = RetryTransport::with_config(mock, fast_retry_config(3));
+
+    let result = transport.post_json_with_headers("http://test", b"body", &[]);
+    assert!(result.is_err());
+    assert_eq!(*call_count.borrow(), 4);
+}
+
+#[test]
+fn retry_transport_no_retry_on_client_error() {
+    let mock = RetryMockTransport::new(
+        10,
+        ProviderTurnError::ClientError {
+            status_code: 401,
+            message: "unauthorized".into(),
+        },
+    );
+    let call_count = mock.call_count.clone();
+    let transport = RetryTransport::with_config(mock, fast_retry_config(3));
+
+    let result = transport.post_json_with_headers("http://test", b"body", &[]);
+    assert!(result.is_err());
+    assert_eq!(*call_count.borrow(), 1);
+}
+
+#[test]
+fn retry_transport_no_retry_on_parse_error() {
+    let mock = RetryMockTransport::new(10, ProviderTurnError::Parse("bad json".into()));
+    let call_count = mock.call_count.clone();
+    let transport = RetryTransport::with_config(mock, fast_retry_config(3));
+
+    let result = transport.get_with_headers("http://test", &[]);
+    assert!(result.is_err());
+    assert_eq!(*call_count.borrow(), 1);
+}
+
+#[test]
+fn retry_transport_get_succeeds_on_second_attempt() {
+    let mock = RetryMockTransport::new(1, ProviderTurnError::Timeout("slow".into()));
+    let call_count = mock.call_count.clone();
+    let transport = RetryTransport::with_config(mock, fast_retry_config(3));
+
+    let result = transport.get_with_headers("http://test", &[]);
+    assert!(result.is_ok());
+    assert_eq!(*call_count.borrow(), 2);
+}
+
+#[test]
+fn retry_transport_stream_lines_retries_on_connection_error() {
+    let mock = RetryMockTransport::new(1, ProviderTurnError::Network("refused".into()));
+    let call_count = mock.call_count.clone();
+    let transport = RetryTransport::with_config(mock, fast_retry_config(3));
+
+    let mut lines = Vec::new();
+    let result = transport.stream_lines("http://test", b"body", &[], &mut |line| {
+        lines.push(line.to_string());
+    });
+    assert!(result.is_ok());
+    assert_eq!(*call_count.borrow(), 2);
+    assert!(lines.contains(&"success line".to_string()));
+}
+
+#[test]
+fn retry_transport_server_error_retries() {
+    let mock = RetryMockTransport::new(
+        2,
+        ProviderTurnError::ServerError {
+            status_code: 503,
+            message: "service unavailable".into(),
+        },
+    );
+    let call_count = mock.call_count.clone();
+    let transport = RetryTransport::with_config(mock, fast_retry_config(3));
+
+    let result = transport.get_with_headers("http://test", &[]);
+    assert!(result.is_ok());
+    assert_eq!(*call_count.borrow(), 3);
+}
+
+#[test]
+fn retry_transport_stream_lines_no_retry_after_callback_invoked() {
+    let mut mock = RetryMockTransport::new(10, ProviderTurnError::Network("mid-stream".into()));
+    mock.invoke_callback_before_error = true;
+    let call_count = mock.call_count.clone();
+    let transport = RetryTransport::with_config(mock, fast_retry_config(3));
+
+    let mut lines = Vec::new();
+    let result = transport.stream_lines("http://test", b"body", &[], &mut |line| {
+        lines.push(line.to_string());
+    });
+    assert!(result.is_err());
+    // Only 1 call because callback was invoked, so guard prevents retry
+    assert_eq!(*call_count.borrow(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6: Health check tests
+// ---------------------------------------------------------------------------
+
+use anvil::provider::openai::OpenAiCompatibleProviderClient;
+
+#[test]
+fn ollama_health_check_success() {
+    let mock = MockHttpTransport {
+        seen_urls: Rc::new(RefCell::new(Vec::new())),
+        seen_bodies: Rc::new(RefCell::new(Vec::new())),
+        seen_headers: Rc::new(RefCell::new(Vec::new())),
+        response: HttpResponse {
+            status_code: 200,
+            body: br#"{"models":[]}"#.to_vec(),
+        },
+        get_response: Some(HttpResponse {
+            status_code: 200,
+            body: br#"{"models":[]}"#.to_vec(),
+        }),
+    };
+    let urls = mock.seen_urls.clone();
+    let client = OllamaProviderClient::with_transport("http://localhost:11434", mock);
+    let result = client.health_check();
+    assert!(result.is_ok());
+    let seen = urls.borrow();
+    assert!(
+        seen.iter().any(|u| u.contains("/api/tags")),
+        "health check should hit /api/tags"
+    );
+}
+
+#[test]
+fn ollama_health_check_failure() {
+    /// Mock transport that always fails with a network error.
+    #[derive(Clone)]
+    struct FailingTransport;
+
+    impl HttpTransport for FailingTransport {
+        fn post_json_with_headers(
+            &self,
+            _url: &str,
+            _body: &[u8],
+            _headers: &[(&str, &str)],
+        ) -> Result<HttpResponse, ProviderTurnError> {
+            Err(ProviderTurnError::Network("connection refused".into()))
+        }
+
+        fn get_with_headers(
+            &self,
+            _url: &str,
+            _headers: &[(&str, &str)],
+        ) -> Result<HttpResponse, ProviderTurnError> {
+            Err(ProviderTurnError::Network("connection refused".into()))
+        }
+    }
+
+    let client = OllamaProviderClient::with_transport("http://localhost:11434", FailingTransport);
+    let result = client.health_check();
+    assert!(result.is_err());
+    let err_msg = result.unwrap_err();
+    assert!(err_msg.contains("Ollamaに接続できません"));
+    assert!(err_msg.contains("localhost:11434"));
+}
+
+#[test]
+fn openai_health_check_success_with_auth() {
+    let mock = MockHttpTransport {
+        seen_urls: Rc::new(RefCell::new(Vec::new())),
+        seen_bodies: Rc::new(RefCell::new(Vec::new())),
+        seen_headers: Rc::new(RefCell::new(Vec::new())),
+        response: HttpResponse {
+            status_code: 200,
+            body: br#"{"data":[]}"#.to_vec(),
+        },
+        get_response: Some(HttpResponse {
+            status_code: 200,
+            body: br#"{"data":[]}"#.to_vec(),
+        }),
+    };
+    let urls = mock.seen_urls.clone();
+    let headers = mock.seen_headers.clone();
+    let client = OpenAiCompatibleProviderClient::with_transport("http://localhost:8080", mock)
+        .with_api_key("test-key-123");
+    let result = client.health_check();
+    assert!(result.is_ok());
+    let seen_urls = urls.borrow();
+    assert!(
+        seen_urls.iter().any(|u| u.contains("/v1/models")),
+        "health check should hit /v1/models"
+    );
+    let seen_headers = headers.borrow();
+    let last_headers = seen_headers.last().expect("should have headers");
+    assert!(
+        last_headers
+            .iter()
+            .any(|(k, v)| k == "Authorization" && v == "test-key-123"),
+        "should send Authorization header with api_key"
+    );
+}
+
+#[test]
+fn openai_health_check_failure_with_auth_guidance() {
+    #[derive(Clone)]
+    struct FailingTransport;
+
+    impl HttpTransport for FailingTransport {
+        fn post_json_with_headers(
+            &self,
+            _url: &str,
+            _body: &[u8],
+            _headers: &[(&str, &str)],
+        ) -> Result<HttpResponse, ProviderTurnError> {
+            Err(ProviderTurnError::Network("connection refused".into()))
+        }
+
+        fn get_with_headers(
+            &self,
+            _url: &str,
+            _headers: &[(&str, &str)],
+        ) -> Result<HttpResponse, ProviderTurnError> {
+            Err(ProviderTurnError::ClientError {
+                status_code: 401,
+                message: "unauthorized".into(),
+            })
+        }
+    }
+
+    let client =
+        OpenAiCompatibleProviderClient::with_transport("http://localhost:8080", FailingTransport)
+            .with_api_key("bad-key");
+    let result = client.health_check();
+    assert!(result.is_err());
+    let err_msg = result.unwrap_err();
+    assert!(err_msg.contains("OpenAI互換プロバイダーに接続できません"));
+    assert!(err_msg.contains("認証情報の形式を確認してください"));
+}
+
+#[test]
+fn openai_health_check_no_auth_no_guidance() {
+    #[derive(Clone)]
+    struct FailingTransport;
+
+    impl HttpTransport for FailingTransport {
+        fn post_json_with_headers(
+            &self,
+            _url: &str,
+            _body: &[u8],
+            _headers: &[(&str, &str)],
+        ) -> Result<HttpResponse, ProviderTurnError> {
+            Err(ProviderTurnError::Network("refused".into()))
+        }
+
+        fn get_with_headers(
+            &self,
+            _url: &str,
+            _headers: &[(&str, &str)],
+        ) -> Result<HttpResponse, ProviderTurnError> {
+            Err(ProviderTurnError::Network("refused".into()))
+        }
+    }
+
+    let client =
+        OpenAiCompatibleProviderClient::with_transport("http://localhost:8080", FailingTransport);
+    let result = client.health_check();
+    assert!(result.is_err());
+    let err_msg = result.unwrap_err();
+    assert!(err_msg.contains("OpenAI互換プロバイダーに接続できません"));
+    // No auth guidance when no api_key is set
+    assert!(!err_msg.contains("認証情報の形式を確認してください"));
 }

@@ -3,7 +3,7 @@
 //! Implements the [`ProviderClient`] trait for the Ollama local inference
 //! server via its `/api/chat` endpoint.
 
-use super::transport::{CurlHttpTransport, HttpTransport};
+use super::transport::{CurlHttpTransport, HttpTransport, RetryTransport};
 use super::{
     AgentEvent, ProviderClient, ProviderEvent, ProviderMessageRole, ProviderTurnError,
     ProviderTurnRequest,
@@ -41,7 +41,7 @@ struct OllamaChatChunk {
 /// Client for the Ollama local inference server.
 ///
 /// Generic over [`HttpTransport`] so tests can inject a mock.
-pub struct OllamaProviderClient<T = CurlHttpTransport> {
+pub struct OllamaProviderClient<T = RetryTransport<CurlHttpTransport>> {
     base_url: String,
     transport: T,
 }
@@ -50,7 +50,7 @@ impl OllamaProviderClient {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into(),
-            transport: CurlHttpTransport,
+            transport: RetryTransport::new(CurlHttpTransport),
         }
     }
 
@@ -144,7 +144,25 @@ pub fn resolve_ollama_model_alias(requested: &str, available: &[String]) -> Stri
 
 impl Default for OllamaProviderClient {
     fn default() -> Self {
-        Self::new("http://127.0.0.1:11434")
+        Self {
+            base_url: "http://127.0.0.1:11434".to_string(),
+            transport: RetryTransport::new(CurlHttpTransport),
+        }
+    }
+}
+
+impl<T: HttpTransport> OllamaProviderClient<T> {
+    /// Check connectivity to the Ollama server by requesting `/api/tags`.
+    ///
+    /// Returns `Ok(())` if the server responds, or an error message string
+    /// on failure.  The health check uses the client's configured transport
+    /// (which includes [`RetryTransport`] for automatic retry).
+    pub fn health_check(&self) -> Result<(), String> {
+        let url = format!("{}/api/tags", self.base_url.trim_end_matches('/'));
+        match self.transport.get(&url) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(format!("Ollamaに接続できません ({}): {}", self.base_url, e)),
+        }
     }
 }
 

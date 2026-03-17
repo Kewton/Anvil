@@ -76,6 +76,12 @@ pub fn run() -> Result<(), AppError> {
 
     let provider = ProviderRuntimeContext::bootstrap(&config)?;
     let provider_client = build_local_provider_client(&config)?;
+
+    // Health check: warn on failure but continue startup.
+    if let Err(warning) = provider_client.health_check() {
+        eprintln!("\u{26a0} {warning}");
+    }
+
     let mut app = App::new(config, provider)?;
     let tui = Tui::new();
     println!("{}", app.startup_console(&tui)?);
