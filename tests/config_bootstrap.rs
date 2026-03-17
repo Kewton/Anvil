@@ -1,7 +1,10 @@
 mod common;
 
 use anvil::config::EffectiveConfig;
-use anvil::config::{PathConfig, ReasoningVisibility, sanitize_markers};
+use anvil::config::{
+    PathConfig, ReasoningVisibility, check_config_security_warnings, check_gitignore_anvil_dir,
+    sanitize_markers,
+};
 use anvil::contracts::AppEvent;
 use anvil::provider::{ProviderRuntimeContext, build_local_provider_client};
 use std::collections::HashMap;
@@ -408,4 +411,92 @@ fn validate_skips_context_budget_when_none() {
     config.runtime.context_budget = None;
     config.validate_for_test().unwrap();
     assert!(config.runtime.context_budget.is_none());
+}
+
+// --- Security warning tests ---
+
+#[test]
+fn security_warning_api_key_in_config() {
+    let mut map = HashMap::new();
+    map.insert("api_key".to_string(), "sk-test-key".to_string());
+    let warnings = check_config_security_warnings(&map);
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].contains("api_key"));
+    assert!(warnings[0].contains("ANVIL_API_KEY"));
+}
+
+#[test]
+fn security_warning_serper_api_key_in_config() {
+    let mut map = HashMap::new();
+    map.insert("serper_api_key".to_string(), "test-serper-key".to_string());
+    let warnings = check_config_security_warnings(&map);
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].contains("serper_api_key"));
+    assert!(warnings[0].contains("SERPER_API_KEY"));
+}
+
+#[test]
+fn security_warning_both_api_keys() {
+    let mut map = HashMap::new();
+    map.insert("api_key".to_string(), "sk-test".to_string());
+    map.insert("serper_api_key".to_string(), "serper-test".to_string());
+    let warnings = check_config_security_warnings(&map);
+    assert_eq!(warnings.len(), 2);
+}
+
+#[test]
+fn security_warning_no_api_key() {
+    let mut map = HashMap::new();
+    map.insert("model".to_string(), "gpt-4".to_string());
+    let warnings = check_config_security_warnings(&map);
+    assert!(warnings.is_empty());
+}
+
+#[test]
+fn security_warning_correct_env_var_names() {
+    let mut map = HashMap::new();
+    map.insert("api_key".to_string(), "test".to_string());
+    map.insert("serper_api_key".to_string(), "test".to_string());
+    let warnings = check_config_security_warnings(&map);
+    // api_key should recommend ANVIL_API_KEY (with ANVIL_ prefix)
+    let api_warning = warnings
+        .iter()
+        .find(|w| w.contains("api_key found"))
+        .unwrap();
+    assert!(api_warning.contains("ANVIL_API_KEY"));
+    // serper_api_key should recommend SERPER_API_KEY (NO ANVIL_ prefix)
+    let serper_warning = warnings
+        .iter()
+        .find(|w| w.contains("serper_api_key found"))
+        .unwrap();
+    assert!(serper_warning.contains("SERPER_API_KEY"));
+    assert!(!serper_warning.contains("ANVIL_SERPER_API_KEY"));
+}
+
+#[test]
+fn gitignore_check_with_anvil_dir() {
+    let dir = common::unique_test_dir("gitignore_with");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(".gitignore"), ".anvil/\ntarget/\n").unwrap();
+    let result = check_gitignore_anvil_dir(&dir);
+    assert!(result.is_none());
+}
+
+#[test]
+fn gitignore_check_without_anvil_dir() {
+    let dir = common::unique_test_dir("gitignore_without");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(".gitignore"), "target/\n*.log\n").unwrap();
+    let result = check_gitignore_anvil_dir(&dir);
+    assert!(result.is_some());
+    assert!(result.unwrap().contains(".anvil"));
+}
+
+#[test]
+fn gitignore_check_no_gitignore_file() {
+    let dir = common::unique_test_dir("gitignore_none");
+    std::fs::create_dir_all(&dir).unwrap();
+    let result = check_gitignore_anvil_dir(&dir);
+    assert!(result.is_some());
+    assert!(result.unwrap().contains(".gitignore"));
 }

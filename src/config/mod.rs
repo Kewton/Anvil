@@ -124,6 +124,14 @@ impl EffectiveConfig {
         let config_file = cwd.join(".anvil").join("config");
         let mut config = Self::default_for_paths(cwd, workspace_dir, config_file);
         config.apply_standard_sources()?;
+
+        // Check .gitignore for .anvil/ directory
+        if let Some(repo_root) = find_repo_root(&config.paths.cwd)
+            && let Some(warning) = check_gitignore_anvil_dir(&repo_root)
+        {
+            eprintln!("{warning}");
+        }
+
         config.validate()?;
         config.project_instructions = config.paths.load_project_instructions();
         Ok(config)
@@ -198,6 +206,11 @@ impl EffectiveConfig {
                 key.trim().to_string(),
                 value.trim().trim_matches('"').to_string(),
             );
+        }
+
+        // Security warnings for API keys in config file
+        for warning in check_config_security_warnings(&map) {
+            eprintln!("{warning}");
         }
 
         self.apply_map(&map)
@@ -509,6 +522,68 @@ const MAX_PROJECT_INSTRUCTIONS_CHARS: usize = 4000;
 const MIN_CONTEXT_WINDOW: u32 = 1000;
 const MIN_AGENT_ITERATIONS: usize = 1;
 const MAX_AGENT_ITERATIONS: usize = 100;
+
+/// Sensitive keys and their recommended environment variable names.
+/// To add a new sensitive key, simply add an entry to this array.
+const SENSITIVE_KEYS: &[(&str, &str)] = &[
+    ("api_key", "ANVIL_API_KEY"),
+    ("serper_api_key", "SERPER_API_KEY"),
+];
+
+/// Detect API keys in config file map and return warning messages.
+/// Only checks keys from the config file; env/CLI keys are not warned about.
+pub fn check_config_security_warnings(map: &HashMap<String, String>) -> Vec<String> {
+    SENSITIVE_KEYS
+        .iter()
+        .filter(|(key, _)| map.contains_key(*key))
+        .map(|(key, env_var)| {
+            format!(
+                "⚠ Warning: {key} found in config file. \
+                Consider using {env_var} environment variable \
+                instead for better security."
+            )
+        })
+        .collect()
+}
+
+/// Walk up from `start` looking for a `.git` directory to find the repo root.
+fn find_repo_root(start: &Path) -> Option<PathBuf> {
+    let mut current = start.to_path_buf();
+    loop {
+        if current.join(".git").exists() {
+            return Some(current);
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
+/// Check whether `.anvil/` is listed in `.gitignore`.
+/// Returns `Some(warning)` if it is missing or `.gitignore` does not exist.
+pub fn check_gitignore_anvil_dir(repo_root: &Path) -> Option<String> {
+    let gitignore_path = repo_root.join(".gitignore");
+    let Ok(contents) = std::fs::read_to_string(&gitignore_path) else {
+        return Some(
+            "⚠ Warning: .gitignore not found. Consider adding .anvil/ \
+            to .gitignore to prevent config files from being committed."
+                .to_string(),
+        );
+    };
+
+    if contents.lines().any(|line| {
+        let trimmed = line.trim();
+        !trimmed.starts_with('#') && trimmed.contains(".anvil")
+    }) {
+        None
+    } else {
+        Some(
+            "⚠ Warning: .anvil/ is not in .gitignore. Consider adding it \
+            to prevent config files from being committed."
+                .to_string(),
+        )
+    }
+}
 
 impl PathConfig {
     /// Load project instructions from ANVIL.md files.

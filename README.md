@@ -230,6 +230,24 @@ anvil [オプション]
 
 優先順位: CLI > 環境変数 > 設定ファイル > デフォルト値
 
+### APIキーのセキュリティ
+
+APIキーは設定ファイルではなく**環境変数**で設定することを推奨します:
+
+```bash
+export ANVIL_API_KEY=sk-...        # OpenAI互換APIキー
+export SERPER_API_KEY=...          # Serper Web検索APIキー
+```
+
+設定ファイル（`.anvil/config`）にAPIキーが記載されている場合、起動時に警告メッセージが表示されます。また、`.anvil/` ディレクトリが `.gitignore` に登録されていない場合も警告が表示されます。
+
+設定ファイルの誤コミットによるAPIキー漏洩を防ぐため、`.gitignore` に `.anvil/` を追加してください:
+
+```
+# .gitignore
+.anvil/
+```
+
 ## カスタムコマンド
 
 `.anvil/slash-commands.json` で独自のスラッシュコマンドを定義できます:
