@@ -260,6 +260,36 @@ echo "${テスト入力}" | ./target/release/anvil --model qwen3.5:35b --no-appr
 
 単一Issueの場合は全体サマリーは生成せず、Issue単体のレポートのみ出力する。
 
+### 10. テスト結果のIssueへの記録
+
+テスト実施後、各Issueのコメントにテスト結果サマリーを記録する。
+
+```bash
+gh issue comment $ISSUE_NUM --repo Kewton/Anvil --body "$(cat <<'COMMENT_EOF'
+## 受入テスト結果 (UAT) - ${実施日}
+
+**ブランチ**: develop | **コミット**: ${COMMIT_HASH} | **判定**: ${ACCEPTED or REJECTED}
+
+### 結果サマリー
+
+| ID | テスト項目 | 結果 |
+|-----|-----------|------|
+| AT-N-1 | テスト項目名 | ✅ PASS / ❌ FAIL |
+| ... | ... | ... |
+
+### FAIL詳細（FAILがある場合）
+
+各FAIL項目の原因と詳細を記載する。
+
+---
+📋 HTMLレポート: `sandbox/${ISSUE_NUM}/report.html`
+🤖 Generated with Claude Code
+COMMENT_EOF
+)"
+```
+
+これにより、Issue上でテストの実施履歴と結果を追跡できるようにする。
+
 ## 完了条件
 
 - [ ] 全Issueの全テスト項目が実行されている
@@ -268,6 +298,7 @@ echo "${テスト入力}" | ./target/release/anvil --model qwen3.5:35b --no-appr
 - [ ] レポートがブラウザで正しく表示される
 - [ ] 各テストにエビデンス（ログ出力）が含まれている
 - [ ] 結果サマリーがユーザーに報告されている
+- [ ] 各IssueのGitHubコメントにテスト結果サマリーが記録されている
 
 ## エラーハンドリング
 
