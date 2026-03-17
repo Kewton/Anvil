@@ -7,6 +7,8 @@
 use super::ProviderTurnError;
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Parsed HTTP response returned by an [`HttpTransport`] implementation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,7 +83,31 @@ pub trait HttpTransport {
 ///
 /// This is the default transport.  It works on any system where `curl` is
 /// installed and avoids pulling in native TLS dependencies.
-pub struct CurlHttpTransport;
+pub struct CurlHttpTransport {
+    shutdown_flag: Option<Arc<AtomicBool>>,
+}
+
+impl Default for CurlHttpTransport {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CurlHttpTransport {
+    /// Create a new transport without shutdown flag (backward-compatible).
+    pub fn new() -> Self {
+        Self {
+            shutdown_flag: None,
+        }
+    }
+
+    /// Create a new transport with a shutdown flag for graceful shutdown.
+    pub fn with_shutdown_flag(shutdown_flag: Arc<AtomicBool>) -> Self {
+        Self {
+            shutdown_flag: Some(shutdown_flag),
+        }
+    }
+}
 
 /// Backward-compatible alias.
 pub type TcpHttpTransport = CurlHttpTransport;
@@ -115,7 +141,7 @@ impl HttpTransport for CurlHttpTransport {
         headers: &[(&str, &str)],
         on_line: &mut dyn FnMut(&str),
     ) -> Result<(), ProviderTurnError> {
-        curl_stream_lines(url, body, headers, on_line)
+        curl_stream_lines(url, body, headers, on_line, &self.shutdown_flag)
     }
 }
 
@@ -221,6 +247,7 @@ fn curl_stream_lines(
     body: &[u8],
     extra_headers: &[(&str, &str)],
     on_line: &mut dyn FnMut(&str),
+    shutdown_flag: &Option<Arc<AtomicBool>>,
 ) -> Result<(), ProviderTurnError> {
     let mut cmd = Command::new("curl");
     cmd.args(["-sS", "-N", "-X", "POST"])
@@ -253,6 +280,15 @@ fn curl_stream_lines(
         let reader = std::io::BufReader::new(stdout);
         use std::io::BufRead;
         for line in reader.lines() {
+            // Check shutdown flag before processing each line
+            if shutdown_flag
+                .as_ref()
+                .is_some_and(|f| f.load(Ordering::Relaxed))
+            {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ProviderTurnError::Cancelled);
+            }
             let line = line.map_err(|err| {
                 ProviderTurnError::Network(format!("failed to read curl output: {err}"))
             })?;
@@ -495,6 +531,7 @@ impl Default for RetryConfig {
 pub struct RetryTransport<T: HttpTransport> {
     inner: T,
     config: RetryConfig,
+    shutdown_flag: Option<Arc<AtomicBool>>,
 }
 
 impl<T: HttpTransport> RetryTransport<T> {
@@ -502,11 +539,44 @@ impl<T: HttpTransport> RetryTransport<T> {
         Self {
             inner,
             config: RetryConfig::default(),
+            shutdown_flag: None,
         }
     }
 
     pub fn with_config(inner: T, config: RetryConfig) -> Self {
-        Self { inner, config }
+        Self {
+            inner,
+            config,
+            shutdown_flag: None,
+        }
+    }
+
+    /// Create a retry transport with a shutdown flag for graceful shutdown.
+    pub fn with_shutdown_flag(inner: T, config: RetryConfig, flag: Arc<AtomicBool>) -> Self {
+        Self {
+            inner,
+            config,
+            shutdown_flag: Some(flag),
+        }
+    }
+
+    fn is_shutdown(&self) -> bool {
+        self.shutdown_flag
+            .as_ref()
+            .is_some_and(|f| f.load(Ordering::Relaxed))
+    }
+
+    /// Interruptible sleep that checks the shutdown flag every 100ms.
+    /// Returns `true` if interrupted by shutdown.
+    fn interruptible_sleep(&self, duration: std::time::Duration) -> bool {
+        let start = std::time::Instant::now();
+        while start.elapsed() < duration {
+            if self.is_shutdown() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        false
     }
 
     /// Common retry loop with an additional guard closure.
@@ -530,7 +600,9 @@ impl<T: HttpTransport> RetryTransport<T> {
                         .base_delay_ms
                         .saturating_mul(self.config.backoff_factor.saturating_pow(attempt))
                         .min(self.config.max_delay_ms);
-                    std::thread::sleep(std::time::Duration::from_millis(delay));
+                    if self.interruptible_sleep(std::time::Duration::from_millis(delay)) {
+                        return Err(ProviderTurnError::Cancelled);
+                    }
                     last_error = Some(err);
                 }
                 Err(err) => return Err(err),

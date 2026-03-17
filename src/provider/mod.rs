@@ -10,6 +10,8 @@ pub mod transport;
 use crate::agent::AgentEvent;
 use crate::config::EffectiveConfig;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 // Re-export key types so existing `use crate::provider::*` continues to work.
 pub use ollama::{
@@ -280,8 +282,11 @@ impl ProviderClient for LocalProviderClient {
 /// backoff.
 pub fn build_local_provider_client(
     config: &EffectiveConfig,
+    shutdown_flag: Arc<AtomicBool>,
 ) -> Result<LocalProviderClient, ProviderBootstrapError> {
-    let transport = RetryTransport::new(CurlHttpTransport);
+    let curl_transport = CurlHttpTransport::with_shutdown_flag(Arc::clone(&shutdown_flag));
+    let transport =
+        RetryTransport::with_shutdown_flag(curl_transport, RetryConfig::default(), shutdown_flag);
     match config.runtime.provider.as_str() {
         "ollama" => {
             let client = OllamaProviderClient::with_transport(

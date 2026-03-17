@@ -11,6 +11,7 @@ regex = { version = "1", default-features = false, features = ["std"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi", "registry"] }
 tracing-appender = "0.2"
+signal-hook = "0.3"
 
 [dev-dependencies]
 tempfile = "3"

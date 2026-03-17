@@ -181,7 +181,12 @@ fn live_turn_executes_structured_file_write_response_without_approval() {
     config.mode.approval_required = false;
     let provider_ctx =
         anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
-    let mut app = anvil::app::App::new(config, provider_ctx).expect("app should initialize");
+    let mut app = anvil::app::App::new(
+        config,
+        provider_ctx,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("app should initialize");
     let tui = Tui::new();
     let provider = RecordingProvider {
         seen_requests: Rc::new(RefCell::new(Vec::new())),
@@ -249,7 +254,12 @@ fn live_turn_executes_complete_structured_response_from_token_stream() {
     config.mode.approval_required = false;
     let provider_ctx =
         anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
-    let mut app = anvil::app::App::new(config, provider_ctx).expect("app should initialize");
+    let mut app = anvil::app::App::new(
+        config,
+        provider_ctx,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("app should initialize");
     let tui = Tui::new();
     let provider = RecordingProvider {
         seen_requests: Rc::new(RefCell::new(Vec::new())),
@@ -317,7 +327,12 @@ fn live_turn_executes_malformed_structured_file_write_response() {
     config.mode.approval_required = false;
     let provider_ctx =
         anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
-    let mut app = anvil::app::App::new(config, provider_ctx).expect("app should initialize");
+    let mut app = anvil::app::App::new(
+        config,
+        provider_ctx,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("app should initialize");
     let tui = Tui::new();
     let provider = RecordingProvider {
         seen_requests: Rc::new(RefCell::new(Vec::new())),
@@ -585,7 +600,12 @@ fn live_turn_executes_structured_response_from_openai_compatible_provider() {
     config.runtime.provider_url = "http://localhost:1234".to_string();
     let provider_ctx =
         anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
-    let mut app = anvil::app::App::new(config, provider_ctx).expect("app should initialize");
+    let mut app = anvil::app::App::new(
+        config,
+        provider_ctx,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("app should initialize");
     let tui = Tui::new();
 
     let transport = MockHttpTransport {
@@ -1104,7 +1124,12 @@ fn agentic_loop_multi_iteration_tool_calls_then_final_answer() {
     config.mode.approval_required = false;
     let provider_ctx =
         anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
-    let mut app = anvil::app::App::new(config, provider_ctx).expect("app should initialize");
+    let mut app = anvil::app::App::new(
+        config,
+        provider_ctx,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("app should initialize");
     let tui = Tui::new();
 
     // Create files that the tool calls will read
@@ -1203,7 +1228,12 @@ fn agentic_loop_tool_result_payload_included_in_session_messages() {
     config.mode.approval_required = false;
     let provider_ctx =
         anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
-    let mut app = anvil::app::App::new(config, provider_ctx).expect("app should initialize");
+    let mut app = anvil::app::App::new(
+        config,
+        provider_ctx,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("app should initialize");
     let tui = Tui::new();
 
     // Write a test file so file.read has something to return
@@ -1266,7 +1296,12 @@ fn agentic_loop_respects_max_iteration_limit() {
     config.mode.approval_required = false;
     let provider_ctx =
         anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
-    let mut app = anvil::app::App::new(config, provider_ctx).expect("app should initialize");
+    let mut app = anvil::app::App::new(
+        config,
+        provider_ctx,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("app should initialize");
     let tui = Tui::new();
 
     // Create file so file.read succeeds
@@ -1337,7 +1372,12 @@ fn agentic_loop_error_during_followup_propagates() {
     config.mode.approval_required = false;
     let provider_ctx =
         anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
-    let mut app = anvil::app::App::new(config, provider_ctx).expect("app should initialize");
+    let mut app = anvil::app::App::new(
+        config,
+        provider_ctx,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("app should initialize");
     let tui = Tui::new();
 
     // Create file so file.read succeeds on the first iteration

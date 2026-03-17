@@ -93,7 +93,12 @@ fn tui_renders_approval_and_interrupt_sections() {
     let approval_config = common::build_config_in(common::unique_test_dir("tui_approval"));
     let provider =
         ProviderRuntimeContext::bootstrap(&approval_config).expect("provider should bootstrap");
-    let mut app = anvil::app::App::new(approval_config, provider).expect("app should initialize");
+    let mut app = anvil::app::App::new(
+        approval_config,
+        provider,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("app should initialize");
     let tui = Tui::new();
 
     let _ = app
@@ -107,8 +112,12 @@ fn tui_renders_approval_and_interrupt_sections() {
     let interrupt_config = common::build_config_in(common::unique_test_dir("tui_interrupt"));
     let provider =
         ProviderRuntimeContext::bootstrap(&interrupt_config).expect("provider should bootstrap");
-    let mut interrupted_app =
-        anvil::app::App::new(interrupt_config, provider).expect("app should initialize");
+    let mut interrupted_app = anvil::app::App::new(
+        interrupt_config,
+        provider,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("app should initialize");
     let _ = interrupted_app
         .mock_thinking_snapshot()
         .expect("thinking snapshot should build");
@@ -130,7 +139,12 @@ fn tui_renders_approval_and_interrupt_sections() {
 fn startup_screen_shows_logo_model_and_project() {
     let config = common::build_config_in(common::unique_test_dir("startup"));
     let provider = ProviderRuntimeContext::bootstrap(&config).expect("provider should bootstrap");
-    let mut app = anvil::app::App::new(config.clone(), provider).expect("app should initialize");
+    let mut app = anvil::app::App::new(
+        config.clone(),
+        provider,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("app should initialize");
     let tui = Tui::new();
 
     let rendered = tui.render_startup(
@@ -299,7 +313,12 @@ fn startup_shows_anvil_md_loaded() {
     let mut config = common::build_config_in(common::unique_test_dir("startup_anvil"));
     config.set_project_instructions_for_test(Some("test instructions".to_string()));
     let provider = ProviderRuntimeContext::bootstrap(&config).expect("provider should bootstrap");
-    let mut app = anvil::app::App::new(config.clone(), provider).expect("app should initialize");
+    let mut app = anvil::app::App::new(
+        config.clone(),
+        provider,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("app should initialize");
     let tui = Tui::new();
 
     let rendered = tui.render_startup(
@@ -315,7 +334,12 @@ fn startup_shows_anvil_md_loaded() {
 fn startup_without_anvil_md() {
     let config = common::build_config_in(common::unique_test_dir("startup_no_anvil"));
     let provider = ProviderRuntimeContext::bootstrap(&config).expect("provider should bootstrap");
-    let mut app = anvil::app::App::new(config.clone(), provider).expect("app should initialize");
+    let mut app = anvil::app::App::new(
+        config.clone(),
+        provider,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("app should initialize");
     let tui = Tui::new();
 
     let rendered = tui.render_startup(
