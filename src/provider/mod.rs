@@ -15,7 +15,13 @@ use serde::{Deserialize, Serialize};
 pub use ollama::{
     OllamaChatMessage, OllamaChatRequest, OllamaProviderClient, resolve_ollama_model_alias,
 };
-pub use transport::{CurlHttpTransport, HttpResponse, HttpTransport, TcpHttpTransport};
+pub use transport::{
+    CurlHttpTransport, HttpResponse, HttpTransport, RetryConfig, RetryTransport, TcpHttpTransport,
+    classify_curl_error, classify_http_error, redact_secrets, sanitize_error_message,
+};
+
+/// Default transport used by provider clients: curl with retry wrapper.
+pub type DefaultTransport = RetryTransport<CurlHttpTransport>;
 
 /// Supported LLM provider backends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,14 +104,40 @@ pub enum ProviderEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderTurnError {
     Cancelled,
+    Network(String),
+    ServerError { status_code: u16, message: String },
+    ClientError { status_code: u16, message: String },
+    Timeout(String),
+    Parse(String),
     Backend(String),
+}
+
+impl ProviderTurnError {
+    /// Returns `true` if this error is eligible for automatic retry.
+    ///
+    /// Network errors, server errors (5xx), and timeouts are retryable.
+    /// Client errors (4xx), parse errors, cancellations, and unclassified
+    /// backend errors are not.
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::Network(_) | Self::ServerError { .. } | Self::Timeout(_)
+        )
+    }
 }
 
 /// Classification of provider errors for persistence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProviderErrorKind {
     Cancelled,
+    Network,
+    ServerError,
+    ClientError,
+    Timeout,
+    Parse,
     Backend,
+    #[serde(other)]
+    Unknown,
 }
 
 /// A provider error record stored in the session.
@@ -119,12 +151,37 @@ impl std::fmt::Display for ProviderTurnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Cancelled => write!(f, "provider turn cancelled"),
+            Self::Network(msg) => write!(f, "network error: {msg}"),
+            Self::ServerError {
+                status_code,
+                message,
+            } => write!(f, "server error ({status_code}): {message}"),
+            Self::ClientError {
+                status_code,
+                message,
+            } => write!(f, "client error ({status_code}): {message}"),
+            Self::Timeout(msg) => write!(f, "timeout: {msg}"),
+            Self::Parse(msg) => write!(f, "parse error: {msg}"),
             Self::Backend(message) => write!(f, "provider backend error: {message}"),
         }
     }
 }
 
 impl std::error::Error for ProviderTurnError {}
+
+impl From<&ProviderTurnError> for ProviderErrorKind {
+    fn from(err: &ProviderTurnError) -> Self {
+        match err {
+            ProviderTurnError::Cancelled => Self::Cancelled,
+            ProviderTurnError::Network(_) => Self::Network,
+            ProviderTurnError::ServerError { .. } => Self::ServerError,
+            ProviderTurnError::ClientError { .. } => Self::ClientError,
+            ProviderTurnError::Timeout(_) => Self::Timeout,
+            ProviderTurnError::Parse(_) => Self::Parse,
+            ProviderTurnError::Backend(_) => Self::Backend,
+        }
+    }
+}
 
 /// Abstraction over LLM provider communication.
 ///
@@ -190,6 +247,19 @@ impl ProviderRuntimeContext {
     }
 }
 
+impl LocalProviderClient {
+    /// Check connectivity to the configured provider.
+    ///
+    /// Dispatches to the inner client's `health_check` method.
+    /// Returns `Ok(())` on success or a human-readable error message on failure.
+    pub fn health_check(&self) -> Result<(), String> {
+        match self {
+            Self::Ollama(client) => client.health_check(),
+            Self::OpenAi(client) => client.health_check(),
+        }
+    }
+}
+
 impl ProviderClient for LocalProviderClient {
     fn stream_turn(
         &self,
@@ -204,16 +274,32 @@ impl ProviderClient for LocalProviderClient {
 }
 
 /// Build a concrete provider client from the effective config.
+///
+/// The returned client wraps its HTTP transport in [`RetryTransport`] so that
+/// transient network/server errors are automatically retried with exponential
+/// backoff.
 pub fn build_local_provider_client(
     config: &EffectiveConfig,
 ) -> Result<LocalProviderClient, ProviderBootstrapError> {
+    let transport = RetryTransport::new(CurlHttpTransport);
     match config.runtime.provider.as_str() {
-        "ollama" => Ok(LocalProviderClient::Ollama(
-            OllamaProviderClient::from_config(config),
-        )),
-        "openai" => Ok(LocalProviderClient::OpenAi(
-            openai::OpenAiCompatibleProviderClient::from_config(config),
-        )),
+        "ollama" => {
+            let client = OllamaProviderClient::with_transport(
+                config.runtime.provider_url.clone(),
+                transport,
+            );
+            Ok(LocalProviderClient::Ollama(client))
+        }
+        "openai" => {
+            let mut client = openai::OpenAiCompatibleProviderClient::with_transport(
+                config.runtime.provider_url.clone(),
+                transport,
+            );
+            if let Some(ref key) = config.runtime.api_key {
+                client = client.with_api_key(key.clone());
+            }
+            Ok(LocalProviderClient::OpenAi(client))
+        }
         other => Err(ProviderBootstrapError::UnsupportedBackend(
             other.to_string(),
         )),

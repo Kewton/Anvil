@@ -3,7 +3,7 @@
 //! Works with the standard `/v1/chat/completions` endpoint used by
 //! OpenAI, Azure OpenAI, LM Studio, and other compatible servers.
 
-use super::transport::{CurlHttpTransport, HttpTransport};
+use super::transport::{CurlHttpTransport, HttpTransport, RetryTransport};
 use super::{AgentEvent, ProviderClient, ProviderEvent, ProviderTurnError, ProviderTurnRequest};
 use crate::config::EffectiveConfig;
 use serde::{Deserialize, Serialize};
@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 /// Client for OpenAI-compatible chat completion APIs.
 ///
 /// Generic over [`HttpTransport`] for testability.
-pub struct OpenAiCompatibleProviderClient<T = CurlHttpTransport> {
+pub struct OpenAiCompatibleProviderClient<T = RetryTransport<CurlHttpTransport>> {
     base_url: String,
     api_key: Option<String>,
     transport: T,
@@ -74,7 +74,7 @@ impl OpenAiCompatibleProviderClient {
         Self {
             base_url: base_url.into(),
             api_key: None,
-            transport: CurlHttpTransport,
+            transport: RetryTransport::new(CurlHttpTransport),
         }
     }
 
@@ -82,7 +82,7 @@ impl OpenAiCompatibleProviderClient {
         Self {
             base_url: config.runtime.provider_url.clone(),
             api_key: config.runtime.api_key.clone(),
-            transport: CurlHttpTransport,
+            transport: RetryTransport::new(CurlHttpTransport),
         }
     }
 }
@@ -103,6 +103,34 @@ impl<T> OpenAiCompatibleProviderClient<T> {
 }
 
 impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
+    /// Check connectivity to the OpenAI-compatible server by requesting `/v1/models`.
+    ///
+    /// If an API key is configured, it is sent as an `Authorization` header
+    /// (without `Bearer` prefix, matching the existing code pattern in
+    /// `send_chat_request`).
+    pub fn health_check(&self) -> Result<(), String> {
+        let url = format!("{}/v1/models", self.base_url.trim_end_matches('/'));
+        let headers: Vec<(&str, &str)> = self
+            .api_key
+            .as_deref()
+            .map(|key| vec![("Authorization", key)])
+            .unwrap_or_default();
+        match self.transport.get_with_headers(&url, &headers) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let guidance = if self.api_key.is_some() {
+                    " (認証情報の形式を確認してください。'Bearer <api-key>' 形式が必要な場合があります)"
+                } else {
+                    ""
+                };
+                Err(format!(
+                    "OpenAI互換プロバイダーに接続できません ({}): {}{}",
+                    self.base_url, e, guidance
+                ))
+            }
+        }
+    }
+
     fn send_chat_request(
         &self,
         request: &ProviderTurnRequest,

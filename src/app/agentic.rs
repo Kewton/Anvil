@@ -127,12 +127,10 @@ impl App {
             }
 
             stream_result.map_err(|err| match err {
-                crate::provider::ProviderTurnError::Backend(msg) => {
-                    AppError::ToolExecution(format!("agentic follow-up failed: {msg}"))
-                }
                 crate::provider::ProviderTurnError::Cancelled => {
                     AppError::ToolExecution("agentic follow-up cancelled".to_string())
                 }
+                other => AppError::ToolExecution(format!("agentic follow-up failed: {other}")),
             })?;
 
             // Parse the follow-up response (retry once on parse failure)

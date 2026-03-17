@@ -417,15 +417,57 @@ impl App {
                     tui,
                 )
             }
-            Err(ProviderTurnError::Backend(message)) => {
-                self.record_provider_error(ProviderTurnError::Backend(message.clone()))?;
+            Err(
+                ref err @ ProviderTurnError::Network(ref msg)
+                | ref err @ ProviderTurnError::ServerError {
+                    message: ref msg, ..
+                }
+                | ref err @ ProviderTurnError::Timeout(ref msg)
+                | ref err @ ProviderTurnError::Backend(ref msg),
+            ) => {
+                self.record_provider_error(err.clone())?;
                 self.execute_runtime_events(
                     &[AgentEvent::Failed {
                         status: "Error. provider turn failed".to_string(),
-                        error_summary: message,
+                        error_summary: msg.clone(),
                         recommended_actions: vec![
                             "retry turn".to_string(),
                             "inspect provider".to_string(),
+                        ],
+                        elapsed_ms: 0,
+                    }],
+                    tui,
+                )
+            }
+            Err(
+                ref err @ ProviderTurnError::ClientError {
+                    status_code,
+                    ref message,
+                },
+            ) => {
+                self.record_provider_error(err.clone())?;
+                self.execute_runtime_events(
+                    &[AgentEvent::Failed {
+                        status: "Error. provider turn failed".to_string(),
+                        error_summary: format!("client error ({status_code}): {message}"),
+                        recommended_actions: vec![
+                            "check authentication credentials".to_string(),
+                            "verify API key and provider URL".to_string(),
+                        ],
+                        elapsed_ms: 0,
+                    }],
+                    tui,
+                )
+            }
+            Err(ref err @ ProviderTurnError::Parse(ref msg)) => {
+                self.record_provider_error(err.clone())?;
+                self.execute_runtime_events(
+                    &[AgentEvent::Failed {
+                        status: "Error. provider turn failed".to_string(),
+                        error_summary: format!("parse error: {msg}"),
+                        recommended_actions: vec![
+                            "retry turn".to_string(),
+                            "check model compatibility".to_string(),
                         ],
                         elapsed_ms: 0,
                     }],
@@ -730,13 +772,8 @@ impl App {
     }
 
     fn record_provider_error(&mut self, error: ProviderTurnError) -> Result<(), AppError> {
-        let (kind, message) = match error {
-            ProviderTurnError::Cancelled => (
-                ProviderErrorKind::Cancelled,
-                "provider turn cancelled".to_string(),
-            ),
-            ProviderTurnError::Backend(message) => (ProviderErrorKind::Backend, message),
-        };
+        let kind = ProviderErrorKind::from(&error);
+        let message = error.to_string();
 
         self.session.push_message(
             SessionMessage::new(MessageRole::System, "provider", message.clone())
