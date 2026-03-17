@@ -660,7 +660,7 @@ fn basic_agent_loop_derives_context_budget_from_context_window() {
         "local-default",
         app.session(),
         true,
-        1_000,
+        8_000,
         &system_prompt,
     );
     let large = anvil::agent::BasicAgentLoop::build_turn_request(

@@ -3,6 +3,7 @@
 //! Defines the [`AgentEvent`] lifecycle and the [`BasicAgentLoop`] that
 //! bridges provider responses into structured tool calls.
 
+use crate::contracts::tokens::{ContentKind, estimate_tokens};
 use crate::provider::{
     ProviderClient, ProviderEvent, ProviderMessage, ProviderMessageRole, ProviderTurnError,
     ProviderTurnRequest,
@@ -117,6 +118,10 @@ impl AgentRuntime {
     }
 }
 
+/// Minimum token budget reserved for messages even when the system prompt
+/// consumes most of the budget.  Guarantees at least ~1 message is included.
+const MINIMUM_MESSAGE_BUDGET: usize = 256;
+
 pub struct BasicAgentLoop;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,12 +177,18 @@ impl BasicAgentLoop {
         token_budget: usize,
         system_prompt: &str,
     ) -> ProviderTurnRequest {
+        let system_prompt_tokens = estimate_tokens(system_prompt, ContentKind::Text);
+        let budget_for_messages = token_budget
+            .saturating_sub(system_prompt_tokens)
+            .max(MINIMUM_MESSAGE_BUDGET);
+
         let mut selected = Vec::new();
         let mut used_tokens = 0usize;
 
         for message in session.messages.iter().rev() {
-            let estimated = estimate_message_tokens(&message.content);
-            if !selected.is_empty() && used_tokens + estimated > token_budget {
+            let kind = ContentKind::from_message_role(message.role);
+            let estimated = estimate_tokens(&message.content, kind);
+            if !selected.is_empty() && used_tokens + estimated > budget_for_messages {
                 break;
             }
             used_tokens += estimated;
@@ -189,6 +200,8 @@ impl BasicAgentLoop {
         tracing::debug!(
             selected_messages = selected.len(),
             used_tokens = used_tokens,
+            system_prompt_tokens = system_prompt_tokens,
+            budget_for_messages = budget_for_messages,
             budget = token_budget,
             "built turn request"
         );
@@ -356,11 +369,6 @@ fn derive_context_budget(context_window: u32) -> usize {
         "context budget derived"
     );
     budget
-}
-
-fn estimate_message_tokens(content: &str) -> usize {
-    let chars = content.chars().count();
-    chars.div_ceil(4).max(1)
 }
 
 pub fn tool_protocol_system_prompt(languages: &[ProjectLanguage]) -> String {

@@ -5,6 +5,7 @@
 
 use crate::agent::PendingTurnState;
 use crate::config::EffectiveConfig;
+use crate::contracts::tokens::{ContentKind, estimate_tokens as contracts_estimate_tokens};
 use crate::contracts::{
     AppEvent, AppStateSnapshot, ConsoleMessageRole, ConsoleMessageView, ConsoleRenderContext,
 };
@@ -130,7 +131,8 @@ impl SessionRecord {
 
     pub fn push_message(&mut self, message: SessionMessage) {
         // Update cached token count incrementally
-        let msg_tokens = estimate_tokens(&message.content);
+        let kind = ContentKind::from_message_role(message.role);
+        let msg_tokens = contracts_estimate_tokens(&message.content, kind);
         if let Some(cached) = self.cached_token_count.get() {
             self.cached_token_count.set(Some(cached + msg_tokens));
         }
@@ -258,7 +260,10 @@ impl SessionRecord {
         let count: usize = self
             .messages
             .iter()
-            .map(|message| estimate_tokens(&message.content))
+            .map(|message| {
+                let kind = ContentKind::from_message_role(message.role);
+                contracts_estimate_tokens(&message.content, kind)
+            })
             .sum();
         self.cached_token_count.set(Some(count));
         count
@@ -508,11 +513,6 @@ fn session_id_for_cwd(cwd: &Path) -> String {
     let mut hasher = DefaultHasher::new();
     cwd.hash(&mut hasher);
     format!("session_{:x}", hasher.finish())
-}
-
-fn estimate_tokens(content: &str) -> usize {
-    let chars = content.chars().count();
-    chars.div_ceil(4).max(1)
 }
 
 fn compact_preview(content: &str, max_chars: usize) -> String {

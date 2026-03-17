@@ -107,7 +107,9 @@ src/
 │   ├── render.rs        # コンソール描画
 │   └── mock.rs          # テスト用モック
 ├── config/mod.rs        # 設定管理
-├── contracts/mod.rs     # 共通型定義
+├── contracts/
+│   ├── mod.rs           # 共通型定義
+│   └── tokens.rs        # トークン推定（CJK対応ヒューリスティック）
 ├── extensions/mod.rs    # スラッシュコマンド・拡張
 ├── logging.rs           # 構造化ロギング（tracing初期化）
 ├── metrics/mod.rs       # ベンチマーク
