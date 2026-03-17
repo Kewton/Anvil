@@ -932,6 +932,48 @@ mod safe_shell_prefixes {
     fn lsof_i_is_safe() {
         assert!(is_safe_shell_command("lsof -i"));
     }
+
+    #[test]
+    fn pytest_is_safe() {
+        assert!(is_safe_shell_command("pytest"));
+        assert!(is_safe_shell_command("pytest tests/"));
+    }
+
+    #[test]
+    fn ruff_check_is_safe() {
+        assert!(is_safe_shell_command("ruff check ."));
+    }
+
+    #[test]
+    fn flake8_is_safe() {
+        assert!(is_safe_shell_command("flake8"));
+        assert!(is_safe_shell_command("flake8 src/"));
+    }
+
+    #[test]
+    fn go_test_is_safe() {
+        assert!(is_safe_shell_command("go test ./..."));
+    }
+
+    #[test]
+    fn go_vet_is_safe() {
+        assert!(is_safe_shell_command("go vet ./..."));
+    }
+
+    #[test]
+    fn golangci_lint_is_safe() {
+        assert!(is_safe_shell_command("golangci-lint run"));
+    }
+
+    #[test]
+    fn make_test_is_safe() {
+        assert!(is_safe_shell_command("make test"));
+    }
+
+    #[test]
+    fn make_check_is_safe() {
+        assert!(is_safe_shell_command("make check"));
+    }
 }
 
 // --- Injection vector tests ---
@@ -1103,6 +1145,26 @@ mod blocked_commands {
     #[test]
     fn mkfs() {
         assert_blocked("mkfs.ext4 /dev/sda", "mkfs should be blocked");
+    }
+
+    #[test]
+    fn rm_rf_home() {
+        assert_blocked("rm -rf ~", "rm -rf ~ should be blocked");
+    }
+
+    #[test]
+    fn dd_if() {
+        assert_blocked("dd if=/dev/zero of=/dev/sda", "dd if= should be blocked");
+    }
+
+    #[test]
+    fn fork_bomb() {
+        assert_blocked(":(){:|:&};:", "fork bomb should be blocked");
+    }
+
+    #[test]
+    fn process_substitution() {
+        assert_blocked("echo foo >(bar)", "process substitution should be blocked");
     }
 
     #[test]
