@@ -308,3 +308,104 @@ fn load_project_instructions_sanitizes_markers() {
         "markers should be sanitized"
     );
 }
+
+// --- Validation tests ---
+
+#[test]
+fn validate_default_config_passes() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    config.validate_for_test().unwrap();
+}
+
+#[test]
+fn validate_rejects_empty_provider_url() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    config.runtime.provider_url = String::new();
+    let result = config.validate_for_test();
+    assert!(result.is_err());
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("provider_url must not be empty")
+    );
+}
+
+#[test]
+fn validate_rejects_invalid_provider_url_scheme() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    config.runtime.provider_url = "ftp://example.com".to_string();
+    let result = config.validate_for_test();
+    assert!(result.is_err());
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("must start with http://")
+    );
+}
+
+#[test]
+fn validate_rejects_empty_model() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    config.runtime.model = String::new();
+    let result = config.validate_for_test();
+    assert!(result.is_err());
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("model must not be empty")
+    );
+}
+
+#[test]
+fn validate_clamps_context_window_below_minimum() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    config.runtime.context_window = 500;
+    config.validate_for_test().unwrap();
+    assert_eq!(config.runtime.context_window, 1000);
+}
+
+#[test]
+fn validate_clamps_context_budget_exceeding_window() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    config.runtime.context_window = 200_000;
+    config.runtime.context_budget = Some(300_000);
+    config.validate_for_test().unwrap();
+    assert_eq!(config.runtime.context_budget, Some(199_999));
+}
+
+#[test]
+fn validate_clamps_max_agent_iterations_below_minimum() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    config.runtime.max_agent_iterations = 0;
+    config.validate_for_test().unwrap();
+    assert_eq!(config.runtime.max_agent_iterations, 1);
+}
+
+#[test]
+fn validate_clamps_max_agent_iterations_above_maximum() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    config.runtime.max_agent_iterations = 200;
+    config.validate_for_test().unwrap();
+    assert_eq!(config.runtime.max_agent_iterations, 100);
+}
+
+#[test]
+fn validate_clamps_both_context_window_and_budget() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    config.runtime.context_window = 500;
+    config.runtime.context_budget = Some(1500);
+    config.validate_for_test().unwrap();
+    assert_eq!(config.runtime.context_window, 1000);
+    assert_eq!(config.runtime.context_budget, Some(999));
+}
+
+#[test]
+fn validate_skips_context_budget_when_none() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    config.runtime.context_budget = None;
+    config.validate_for_test().unwrap();
+    assert!(config.runtime.context_budget.is_none());
+}
