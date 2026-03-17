@@ -420,10 +420,38 @@ impl SessionStore {
 
         let contents =
             serde_json::to_string_pretty(record).map_err(SessionError::SessionSerializeFailed)?;
-        std::fs::write(&self.file_path, contents).map_err(SessionError::SessionWriteFailed)?;
-        tracing::debug!(path = %self.file_path.display(), "session saved");
+
+        atomic_write_file(&self.file_path, contents.as_bytes())
+            .map_err(SessionError::SessionWriteFailed)?;
+
+        tracing::debug!(path = %self.file_path.display(), "session saved (atomic)");
         Ok(())
     }
+}
+
+/// Atomic file write using the tmp-file + fsync + rename pattern.
+/// Ensures crash-safe writes by first writing to a temporary file,
+/// fsyncing it, then atomically renaming over the target path.
+fn atomic_write_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    // with_extension("json.tmp") replaces the existing .json extension with .json.tmp
+    let tmp_path = path.with_extension("json.tmp");
+
+    // Step 1: Write to temporary file + fsync
+    let mut file = std::fs::File::create(&tmp_path)?;
+    if let Err(err) = file.write_all(contents).and_then(|_| file.sync_all()) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+
+    // Step 2: Atomic rename
+    if let Err(err) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+
+    Ok(())
 }
 
 #[derive(Debug)]

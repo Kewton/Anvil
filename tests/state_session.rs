@@ -485,3 +485,43 @@ fn file_edit_pending_turn_state_serde_roundtrip() {
         other => panic!("unexpected tool input: {other:?}"),
     }
 }
+
+#[test]
+fn atomic_write_leaves_no_tmp_file_on_success() {
+    let root = unique_test_dir("atomic_write");
+    let mut config =
+        anvil::config::EffectiveConfig::default_for_test().expect("config should load");
+    config.paths.cwd = root.clone();
+    config.paths.workspace_dir = root.join("workspace");
+    config.paths.config_file = root.join(".anvil").join("config");
+    config.paths.state_dir = root.join(".anvil").join("state");
+    config.paths.session_dir = root.join(".anvil").join("sessions");
+    config.paths.session_file = config.paths.session_dir.join("session_atomic.json");
+    config.paths.logs_dir = root.join(".anvil").join("logs");
+
+    let store = SessionStore::from_config(&config);
+    let mut session = store
+        .load_or_create(&config.paths.cwd)
+        .expect("session should load");
+    session.push_message(new_user_message("msg_001", "atomic write test"));
+    store.save(&session).expect("session should save");
+
+    // The session file should exist
+    assert!(
+        config.paths.session_file.exists(),
+        "session file should exist"
+    );
+
+    // The temporary file (.json.tmp) should NOT exist after a successful save
+    let tmp_path = config.paths.session_file.with_extension("json.tmp");
+    assert!(
+        !tmp_path.exists(),
+        "temporary file should not exist after successful atomic write"
+    );
+
+    // Verify the saved data is readable
+    let reloaded = store
+        .load()
+        .expect("session should reload after atomic write");
+    assert_eq!(reloaded.message_count(), session.message_count());
+}
