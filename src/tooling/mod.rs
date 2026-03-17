@@ -1430,6 +1430,17 @@ pub fn is_safe_shell_command(command: &str) -> bool {
         "npx jest ",
         "npx eslint ",
         "npx prettier --check",
+        // Python test/lint
+        "pytest",
+        "ruff check ",
+        "flake8",
+        // Go build/test/lint
+        "go test",
+        "go vet",
+        "golangci-lint",
+        // Make build/test
+        "make test",
+        "make check",
         // Environment inspection
         "which ",
         "uname",
