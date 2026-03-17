@@ -82,6 +82,7 @@ pub enum ConfigError {
     InvalidNumericValue(String),
     InvalidReasoningVisibility(String),
     InvalidWebSearchProvider(String),
+    ValidationError(String),
 }
 
 impl Display for ConfigError {
@@ -99,6 +100,7 @@ impl Display for ConfigError {
             Self::InvalidWebSearchProvider(value) => {
                 write!(f, "invalid web search provider: {value}")
             }
+            Self::ValidationError(msg) => write!(f, "config validation failed: {msg}"),
         }
     }
 }
@@ -122,6 +124,7 @@ impl EffectiveConfig {
         let config_file = cwd.join(".anvil").join("config");
         let mut config = Self::default_for_paths(cwd, workspace_dir, config_file);
         config.apply_standard_sources()?;
+        config.validate()?;
         config.project_instructions = config.paths.load_project_instructions();
         Ok(config)
     }
@@ -404,6 +407,86 @@ impl EffectiveConfig {
         Ok(())
     }
 
+    fn validate(&mut self) -> Result<(), ConfigError> {
+        self.check_provider_url()?;
+        self.check_model()?;
+        self.clamp_context_window();
+        self.clamp_context_budget();
+        self.clamp_agent_iterations();
+        Ok(())
+    }
+
+    fn check_provider_url(&self) -> Result<(), ConfigError> {
+        if self.runtime.provider_url.is_empty() {
+            return Err(ConfigError::ValidationError(
+                "provider_url must not be empty — set it in .anvil/config or ANVIL_PROVIDER_URL"
+                    .to_string(),
+            ));
+        }
+        if !self.runtime.provider_url.starts_with("http://")
+            && !self.runtime.provider_url.starts_with("https://")
+        {
+            return Err(ConfigError::ValidationError(format!(
+                "provider_url must start with http:// or https://, got: {} — fix in .anvil/config or ANVIL_PROVIDER_URL",
+                self.runtime.provider_url
+            )));
+        }
+        Ok(())
+    }
+
+    fn check_model(&self) -> Result<(), ConfigError> {
+        if self.runtime.model.is_empty() {
+            return Err(ConfigError::ValidationError(
+                "model must not be empty — set it in .anvil/config or ANVIL_MODEL".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn clamp_context_window(&mut self) {
+        if self.runtime.context_window < MIN_CONTEXT_WINDOW {
+            let old = self.runtime.context_window;
+            self.runtime.context_window = MIN_CONTEXT_WINDOW;
+            eprintln!(
+                "Warning: context_window={old} is below minimum ({MIN_CONTEXT_WINDOW}), adjusted to {MIN_CONTEXT_WINDOW}"
+            );
+        }
+    }
+
+    fn clamp_context_budget(&mut self) {
+        if let Some(budget) = self.runtime.context_budget
+            && budget >= self.runtime.context_window
+        {
+            let old = budget;
+            let new = self.runtime.context_window.saturating_sub(1);
+            self.runtime.context_budget = Some(new);
+            eprintln!(
+                "Warning: context_budget={old} >= context_window ({}), adjusted to {new}",
+                self.runtime.context_window
+            );
+        }
+    }
+
+    fn clamp_agent_iterations(&mut self) {
+        if self.runtime.max_agent_iterations < MIN_AGENT_ITERATIONS {
+            let old = self.runtime.max_agent_iterations;
+            self.runtime.max_agent_iterations = MIN_AGENT_ITERATIONS;
+            eprintln!(
+                "Warning: max_agent_iterations={old} is below minimum ({MIN_AGENT_ITERATIONS}), adjusted to {MIN_AGENT_ITERATIONS}"
+            );
+        } else if self.runtime.max_agent_iterations > MAX_AGENT_ITERATIONS {
+            let old = self.runtime.max_agent_iterations;
+            self.runtime.max_agent_iterations = MAX_AGENT_ITERATIONS;
+            eprintln!(
+                "Warning: max_agent_iterations={old} exceeds maximum ({MAX_AGENT_ITERATIONS}), adjusted to {MAX_AGENT_ITERATIONS}"
+            );
+        }
+    }
+
+    pub fn validate_for_test(&mut self) -> Result<(), ConfigError> {
+        self.validate()
+    }
+
     pub fn session_key(&self) -> &str {
         self.paths
             .session_file
@@ -423,6 +506,9 @@ impl EffectiveConfig {
 }
 
 const MAX_PROJECT_INSTRUCTIONS_CHARS: usize = 4000;
+const MIN_CONTEXT_WINDOW: u32 = 1000;
+const MIN_AGENT_ITERATIONS: usize = 1;
+const MAX_AGENT_ITERATIONS: usize = 100;
 
 impl PathConfig {
     /// Load project instructions from ANVIL.md files.
