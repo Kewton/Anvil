@@ -74,7 +74,7 @@ impl OpenAiCompatibleProviderClient {
         Self {
             base_url: base_url.into(),
             api_key: None,
-            transport: RetryTransport::new(CurlHttpTransport),
+            transport: RetryTransport::new(CurlHttpTransport::new()),
         }
     }
 
@@ -82,7 +82,7 @@ impl OpenAiCompatibleProviderClient {
         Self {
             base_url: config.runtime.provider_url.clone(),
             api_key: config.runtime.api_key.clone(),
-            transport: RetryTransport::new(CurlHttpTransport),
+            transport: RetryTransport::new(CurlHttpTransport::new()),
         }
     }
 }

@@ -578,6 +578,7 @@ pub struct LocalToolExecutor {
     web_search_min_interval: Duration,
     web_search_provider: WebSearchProvider,
     serper_api_key: Option<String>,
+    shutdown_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 #[derive(Debug)]
@@ -609,6 +610,7 @@ impl LocalToolExecutor {
             web_search_min_interval: interval,
             web_search_provider: config.web_search_provider,
             serper_api_key: config.serper_api_key.clone(),
+            shutdown_flag: None,
         }
     }
 
@@ -620,7 +622,24 @@ impl LocalToolExecutor {
             web_search_min_interval: Duration::ZERO,
             web_search_provider: WebSearchProvider::DuckDuckGo,
             serper_api_key: None,
+            shutdown_flag: None,
         }
+    }
+
+    /// Set the shutdown flag for graceful shutdown support.
+    pub fn with_shutdown_flag(
+        mut self,
+        flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        self.shutdown_flag = Some(flag);
+        self
+    }
+
+    /// Check whether a shutdown has been requested via the shared flag.
+    fn is_shutdown(&self) -> bool {
+        self.shutdown_flag
+            .as_ref()
+            .is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     pub fn execute(
@@ -881,17 +900,36 @@ impl LocalToolExecutor {
             captured
         });
 
-        let exit_status = child.wait().ok();
+        // Poll child process with shutdown flag check
+        let exit_status = loop {
+            if self.is_shutdown() {
+                if let Err(e) = child.kill() {
+                    tracing::warn!("failed to kill child process: {e}");
+                }
+                let stdout_buf = stdout_thread.join().unwrap_or_default();
+                let stderr_buf = stderr_thread.join().unwrap_or_default();
+                let _ = child.wait();
+                let combined = combine_process_output(stdout_buf, stderr_buf);
+                return Ok(ToolExecutionResult {
+                    tool_call_id: request.tool_call_id.clone(),
+                    tool_name: request.spec.name.clone(),
+                    status: ToolExecutionStatus::Interrupted,
+                    summary: format!("shell.exec interrupted: {command}"),
+                    payload: ToolExecutionPayload::Text(combined),
+                    artifacts: Vec::new(),
+                    elapsed_ms: started.elapsed().as_millis(),
+                });
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                Err(_) => break None,
+            }
+        };
         let stdout_buf = stdout_thread.join().unwrap_or_default();
         let stderr_buf = stderr_thread.join().unwrap_or_default();
 
-        let combined = if stderr_buf.trim().is_empty() {
-            stdout_buf
-        } else if stdout_buf.trim().is_empty() {
-            stderr_buf
-        } else {
-            format!("{stdout_buf}--- stderr ---\n{stderr_buf}")
-        };
+        let combined = combine_process_output(stdout_buf, stderr_buf);
 
         let success = exit_status.is_some_and(|s| s.success());
         let status = if success {
@@ -1614,6 +1652,20 @@ fn format_search_results(results: &[SearchResult]) -> String {
         lines.push(String::new());
     }
     lines.join("\n")
+}
+
+/// Combine stdout and stderr into a single output string.
+///
+/// If only one stream has content, returns just that stream.
+/// If both have content, joins them with a `--- stderr ---` separator.
+fn combine_process_output(stdout: String, stderr: String) -> String {
+    if stderr.trim().is_empty() {
+        stdout
+    } else if stdout.trim().is_empty() {
+        stderr
+    } else {
+        format!("{stdout}--- stderr ---\n{stderr}")
+    }
 }
 
 /// Percent-encode a query string for use in URLs.

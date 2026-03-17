@@ -53,7 +53,11 @@ fn provider_runtime_context_bootstraps_capabilities() {
 fn local_provider_client_builds_from_effective_config() {
     let config = EffectiveConfig::load().expect("config should load");
 
-    let client = build_local_provider_client(&config).expect("provider client should build");
+    let client = build_local_provider_client(
+        &config,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("provider client should build");
 
     assert!(matches!(
         client,
@@ -68,7 +72,11 @@ fn openai_provider_bootstraps_from_config() {
     config.runtime.provider_url = "http://localhost:8080".to_string();
 
     let provider = ProviderRuntimeContext::bootstrap(&config).expect("openai should bootstrap");
-    let client = build_local_provider_client(&config).expect("openai client should build");
+    let client = build_local_provider_client(
+        &config,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("openai client should build");
 
     assert_eq!(provider.backend, anvil::provider::ProviderBackend::OpenAi);
     assert!(provider.capabilities.streaming);

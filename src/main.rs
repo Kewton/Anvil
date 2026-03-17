@@ -1,8 +1,11 @@
-fn main() {
+use std::process::ExitCode;
+
+fn main() -> ExitCode {
     if let Err(err) = anvil::app::run() {
         eprintln!("anvil error: {err}");
         eprintln!();
         eprintln!("{}", anvil::app::error_guidance(&err));
-        std::process::exit(1);
+        return ExitCode::FAILURE;
     }
+    ExitCode::SUCCESS
 }

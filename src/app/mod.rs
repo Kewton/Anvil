@@ -29,6 +29,8 @@ use crate::tooling::ToolRegistry;
 use crate::tui::Tui;
 use std::fmt::{Display, Formatter};
 use std::io::{self, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // Re-export render helpers that form the public API.
 pub use render::{cli_prompt, render_help_frame, slash_commands};
@@ -58,6 +60,7 @@ pub struct App {
     extensions: ExtensionRegistry,
     tools: ToolRegistry,
     system_prompt: String,
+    shutdown_flag: Arc<AtomicBool>,
 }
 
 /// Whether the session loop should continue or exit.
@@ -147,6 +150,7 @@ impl App {
     pub fn new(
         config: EffectiveConfig,
         provider: ProviderRuntimeContext,
+        shutdown_flag: Arc<AtomicBool>,
     ) -> Result<Self, AppError> {
         let session_store = SessionStore::from_config(&config);
         let mut session = if config.mode.fresh_session {
@@ -180,6 +184,7 @@ impl App {
             session,
             extensions,
             system_prompt,
+            shutdown_flag,
         })
     }
 
@@ -218,6 +223,21 @@ impl App {
 
     pub(crate) fn config(&self) -> &EffectiveConfig {
         &self.config
+    }
+
+    /// Check whether a shutdown has been requested via the shared flag.
+    pub fn is_shutdown_requested(&self) -> bool {
+        self.shutdown_flag.load(Ordering::Relaxed)
+    }
+
+    /// Save the session on exit (wrapper for flush_session).
+    pub(crate) fn save_session_on_exit(&mut self) {
+        let _ = self.flush_session();
+    }
+
+    /// Get a clone of the shutdown flag for injection into sub-components.
+    pub(crate) fn shutdown_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.shutdown_flag)
     }
 
     pub(crate) fn session_mut(&mut self) -> &mut SessionRecord {

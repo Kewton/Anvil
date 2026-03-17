@@ -12,6 +12,8 @@ use crate::tui::Tui;
 use super::{App, AppError, SessionControl, cli_prompt};
 
 use std::io::{self, BufRead, Write};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 /// Drive the interactive CLI session loop.
 ///
@@ -52,6 +54,29 @@ pub fn run_session_loop<C: ProviderClient, R: BufRead, W: Write>(
     Ok(())
 }
 
+/// Initialize signal handlers for graceful shutdown.
+///
+/// Registers SIGTERM (always) and SIGINT (non-interactive mode only).
+/// In interactive mode, SIGINT is handled by rustyline.
+fn setup_shutdown_handler(interactive: bool) -> Arc<AtomicBool> {
+    use signal_hook::consts::{SIGINT, SIGTERM};
+    use signal_hook::flag;
+
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+
+    // SIGTERM is always registered
+    if let Err(e) = flag::register(SIGTERM, Arc::clone(&shutdown_flag)) {
+        eprintln!("Warning: failed to register SIGTERM handler: {e}");
+    }
+
+    // In non-interactive mode, also register SIGINT
+    if !interactive && let Err(e) = flag::register(SIGINT, Arc::clone(&shutdown_flag)) {
+        eprintln!("Warning: failed to register SIGINT handler: {e}");
+    }
+
+    shutdown_flag
+}
+
 /// Application entry point.
 ///
 /// Uses `rustyline` for interactive input, providing cursor movement,
@@ -74,15 +99,18 @@ pub fn run() -> Result<(), AppError> {
         "anvil started with effective config"
     );
 
+    // Setup shutdown handler before config is moved
+    let shutdown_flag = setup_shutdown_handler(config.mode.interactive);
+
     let provider = ProviderRuntimeContext::bootstrap(&config)?;
-    let provider_client = build_local_provider_client(&config)?;
+    let provider_client = build_local_provider_client(&config, Arc::clone(&shutdown_flag))?;
 
     // Health check: warn on failure but continue startup.
     if let Err(warning) = provider_client.health_check() {
         eprintln!("\u{26a0} {warning}");
     }
 
-    let mut app = App::new(config, provider)?;
+    let mut app = App::new(config, provider, Arc::clone(&shutdown_flag))?;
     let tui = Tui::new();
     println!("{}", app.startup_console(&tui)?);
 
@@ -115,8 +143,17 @@ fn run_interactive_loop<C: ProviderClient>(
 
     let prompt = cli_prompt();
     loop {
+        // Check shutdown flag before readline
+        if app.is_shutdown_requested() {
+            break;
+        }
+
         match rl.readline(prompt) {
             Ok(line) => {
+                // Check shutdown flag after readline
+                if app.is_shutdown_requested() {
+                    break;
+                }
                 if !line.trim().is_empty() {
                     let _ = rl.add_history_entry(&line);
                 }
@@ -138,6 +175,9 @@ fn run_interactive_loop<C: ProviderClient>(
             }
         }
     }
+
+    // Save session on exit
+    app.save_session_on_exit();
 
     if let Some(parent) = history_path.parent() {
         let _ = std::fs::create_dir_all(parent);

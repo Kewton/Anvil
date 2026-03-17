@@ -50,7 +50,7 @@ impl OllamaProviderClient {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into(),
-            transport: RetryTransport::new(CurlHttpTransport),
+            transport: RetryTransport::new(CurlHttpTransport::new()),
         }
     }
 
@@ -146,7 +146,7 @@ impl Default for OllamaProviderClient {
     fn default() -> Self {
         Self {
             base_url: "http://127.0.0.1:11434".to_string(),
-            transport: RetryTransport::new(CurlHttpTransport),
+            transport: RetryTransport::new(CurlHttpTransport::new()),
         }
     }
 }

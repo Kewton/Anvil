@@ -42,6 +42,11 @@ impl App {
         let mut all_tool_log_views: Vec<ToolLogView> = Vec::new();
 
         for iteration in 0..max_iterations {
+            // Check shutdown flag before tool execution
+            if self.is_shutdown_requested() {
+                break;
+            }
+
             // Show plan for this iteration
             let inferred_plan = infer_plan_from_structured_response(&current);
             let thinking = AppStateSnapshot::new(RuntimeState::Thinking)
@@ -85,6 +90,11 @@ impl App {
             // Skip intermediate Working frames — tool execution output
             // is already shown on stderr (Issue #1).
 
+            // Check shutdown flag before LLM call
+            if self.is_shutdown_requested() {
+                break;
+            }
+
             // Send tool results back to LLM for the next turn
             let spinner = Spinner::start(format!(
                 "Analyzing results. model={} (iteration {})",
@@ -126,12 +136,23 @@ impl App {
                 let _ = std::io::Write::write_fmt(&mut std::io::stderr(), format_args!("\n"));
             }
 
-            stream_result.map_err(|err| match err {
-                crate::provider::ProviderTurnError::Cancelled => {
-                    AppError::ToolExecution("agentic follow-up cancelled".to_string())
+            match stream_result {
+                Err(crate::provider::ProviderTurnError::Cancelled)
+                    if self.is_shutdown_requested() =>
+                {
+                    break;
                 }
-                other => AppError::ToolExecution(format!("agentic follow-up failed: {other}")),
-            })?;
+                other => {
+                    other.map_err(|err| match err {
+                        crate::provider::ProviderTurnError::Cancelled => {
+                            AppError::ToolExecution("agentic follow-up cancelled".to_string())
+                        }
+                        other => {
+                            AppError::ToolExecution(format!("agentic follow-up failed: {other}"))
+                        }
+                    })?;
+                }
+            }
 
             // Parse the follow-up response (retry once on parse failure)
             let next_structured =
@@ -188,7 +209,8 @@ impl App {
         structured: &StructuredAssistantResponse,
     ) -> Result<Vec<ToolExecutionResult>, AppError> {
         let mut executor =
-            LocalToolExecutor::new(self.config.paths.cwd.clone(), &self.config.runtime);
+            LocalToolExecutor::new(self.config.paths.cwd.clone(), &self.config.runtime)
+                .with_shutdown_flag(self.shutdown_flag());
         let mut results = Vec::new();
         for call in &structured.tool_calls {
             let validated = match self.tools.validate(call.clone()) {

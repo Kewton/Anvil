@@ -393,7 +393,12 @@ fn startup_console_can_ignore_saved_history_in_fresh_session_mode() {
     config.mode.fresh_session = true;
     let provider = anvil::provider::ProviderRuntimeContext::bootstrap(&config)
         .expect("provider should bootstrap");
-    let mut fresh = anvil::app::App::new(config, provider).expect("app should initialize");
+    let mut fresh = anvil::app::App::new(
+        config,
+        provider,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("app should initialize");
     let tui = Tui::new();
 
     let startup = fresh.startup_console(&tui).expect("startup should render");
