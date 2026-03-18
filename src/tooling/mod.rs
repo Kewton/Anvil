@@ -74,6 +74,7 @@ pub enum ToolKind {
     ShellExec,
     WebFetch,
     WebSearch,
+    Mcp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,6 +104,11 @@ pub enum ToolInput {
     WebSearch {
         query: String,
     },
+    Mcp {
+        server: String,
+        tool: String,
+        arguments: serde_json::Value,
+    },
 }
 
 impl ToolInput {
@@ -115,6 +121,7 @@ impl ToolInput {
             Self::ShellExec { .. } => ToolKind::ShellExec,
             Self::WebFetch { .. } => ToolKind::WebFetch,
             Self::WebSearch { .. } => ToolKind::WebSearch,
+            Self::Mcp { .. } => ToolKind::Mcp,
         }
     }
 
@@ -201,7 +208,18 @@ impl ToolInput {
                     .ok_or_else(|| "missing query in web.search tool block".to_string())?
                     .to_string(),
             }),
-            other => Err(format!("unsupported tool in ANVIL_TOOL block: {other}")),
+            other => {
+                // mcp__<server>__<tool> pattern detection
+                if let Some((server, tool)) = parse_mcp_tool_name(other) {
+                    Ok(ToolInput::Mcp {
+                        server,
+                        tool,
+                        arguments: value.clone(),
+                    })
+                } else {
+                    Err(format!("unsupported tool in ANVIL_TOOL block: {other}"))
+                }
+            }
         }
     }
 
@@ -691,6 +709,7 @@ impl LocalToolExecutor {
                 self.execute_shell_exec(&request, command, started)
             }
             ToolInput::WebSearch { ref query } => self.execute_web_search(&request, query, started),
+            ToolInput::Mcp { .. } => unreachable!("MCP tools are dispatched in agentic.rs"),
         };
         tracing::info!(
             tool = %tool_name,
@@ -1379,6 +1398,8 @@ fn validate_required_fields(input: &ToolInput) -> Result<(), ToolValidationError
                 });
             }
         }
+        // [D3-001] MCP tool input validation is handled by the MCP server side
+        ToolInput::Mcp { .. } => {}
     }
 
     Ok(())
@@ -1594,10 +1615,23 @@ pub fn is_safe_shell_command(command: &str) -> bool {
 ///
 /// Safe shell commands (as determined by [`is_safe_shell_command`]) are
 /// promoted from `Confirm` to `Safe`, skipping the approval prompt.
+/// All other tools (including MCP) use their spec's permission class directly.
 pub fn effective_permission_class(input: &ToolInput, spec: &ToolSpec) -> PermissionClass {
     match input {
         ToolInput::ShellExec { command } if is_safe_shell_command(command) => PermissionClass::Safe,
         _ => spec.permission_class,
+    }
+}
+
+/// Parse an MCP tool name: "mcp__github__create_issue" → ("github", "create_issue").
+///
+/// Returns `None` if the name does not follow the `mcp__<server>__<tool>` convention.
+pub fn parse_mcp_tool_name(name: &str) -> Option<(String, String)> {
+    let parts: Vec<&str> = name.splitn(3, "__").collect();
+    if parts.len() == 3 && parts[0] == "mcp" && !parts[1].is_empty() && !parts[2].is_empty() {
+        Some((parts[1].to_string(), parts[2].to_string()))
+    } else {
+        None
     }
 }
 

@@ -649,7 +649,7 @@ fn basic_agent_loop_applies_context_shaping_limit() {
         .expect("persist");
     app.record_user_input("msg_005", "u3").expect("persist");
 
-    let system_prompt = anvil::agent::tool_protocol_system_prompt(&[]);
+    let system_prompt = anvil::agent::tool_protocol_system_prompt(&[], None);
     let request = anvil::agent::BasicAgentLoop::build_turn_request_with_limit(
         "local-default",
         app.session(),
@@ -676,7 +676,7 @@ fn basic_agent_loop_derives_context_budget_from_context_window() {
             .expect("persist");
     }
 
-    let system_prompt = anvil::agent::tool_protocol_system_prompt(&[]);
+    let system_prompt = anvil::agent::tool_protocol_system_prompt(&[], None);
     let small = anvil::agent::BasicAgentLoop::build_turn_request(
         "local-default",
         app.session(),
@@ -1494,7 +1494,7 @@ fn structured_response_parser_repairs_web_fetch_block() {
 #[test]
 fn system_prompt_includes_web_fetch_tool() {
     let session = anvil::session::SessionRecord::new(std::path::PathBuf::from("/tmp"));
-    let system_prompt = anvil::agent::tool_protocol_system_prompt(&[]);
+    let system_prompt = anvil::agent::tool_protocol_system_prompt(&[], None);
     let request = anvil::agent::BasicAgentLoop::build_turn_request(
         "test-model",
         &session,
@@ -1576,7 +1576,7 @@ fn structured_response_parser_repairs_web_search_block() {
 #[test]
 fn system_prompt_includes_web_search_tool() {
     let session = anvil::session::SessionRecord::new(std::path::PathBuf::from("/tmp"));
-    let system_prompt = anvil::agent::tool_protocol_system_prompt(&[]);
+    let system_prompt = anvil::agent::tool_protocol_system_prompt(&[], None);
     let request = anvil::agent::BasicAgentLoop::build_turn_request(
         "test-model",
         &session,
@@ -1593,7 +1593,7 @@ fn system_prompt_includes_web_search_tool() {
 #[test]
 fn system_prompt_includes_github_insights() {
     let session = anvil::session::SessionRecord::new(std::path::PathBuf::from("/tmp"));
-    let system_prompt = anvil::agent::tool_protocol_system_prompt(&[]);
+    let system_prompt = anvil::agent::tool_protocol_system_prompt(&[], None);
     let request = anvil::agent::BasicAgentLoop::build_turn_request(
         "test-model",
         &session,
@@ -1656,7 +1656,7 @@ fn detect_both_rust_and_nodejs() {
 #[test]
 fn system_prompt_rust_includes_git_and_cargo() {
     use anvil::agent::ProjectLanguage;
-    let prompt = anvil::agent::tool_protocol_system_prompt(&[ProjectLanguage::Rust]);
+    let prompt = anvil::agent::tool_protocol_system_prompt(&[ProjectLanguage::Rust], None);
     assert!(
         prompt.contains("Git operations"),
         "should contain Git operations guide"
@@ -1670,7 +1670,7 @@ fn system_prompt_rust_includes_git_and_cargo() {
 #[test]
 fn system_prompt_nodejs_includes_git_and_npm_but_not_cargo() {
     use anvil::agent::ProjectLanguage;
-    let prompt = anvil::agent::tool_protocol_system_prompt(&[ProjectLanguage::NodeJs]);
+    let prompt = anvil::agent::tool_protocol_system_prompt(&[ProjectLanguage::NodeJs], None);
     assert!(
         prompt.contains("Git operations"),
         "should contain Git operations guide"
@@ -1684,7 +1684,7 @@ fn system_prompt_nodejs_includes_git_and_npm_but_not_cargo() {
 
 #[test]
 fn system_prompt_empty_has_git_only() {
-    let prompt = anvil::agent::tool_protocol_system_prompt(&[]);
+    let prompt = anvil::agent::tool_protocol_system_prompt(&[], None);
     assert!(
         prompt.contains("Git operations"),
         "should contain Git operations guide"
@@ -1699,10 +1699,10 @@ fn system_prompt_empty_has_git_only() {
 #[test]
 fn system_prompt_both_languages_includes_both() {
     use anvil::agent::ProjectLanguage;
-    let prompt = anvil::agent::tool_protocol_system_prompt(&[
-        ProjectLanguage::Rust,
-        ProjectLanguage::NodeJs,
-    ]);
+    let prompt = anvil::agent::tool_protocol_system_prompt(
+        &[ProjectLanguage::Rust, ProjectLanguage::NodeJs],
+        None,
+    );
     assert!(prompt.contains("cargo build"), "should contain cargo guide");
     assert!(prompt.contains("npm"), "should contain npm guide");
 }
@@ -1710,7 +1710,7 @@ fn system_prompt_both_languages_includes_both() {
 #[test]
 fn system_prompt_includes_never_guide() {
     use anvil::agent::ProjectLanguage;
-    let prompt = anvil::agent::tool_protocol_system_prompt(&[ProjectLanguage::Rust]);
+    let prompt = anvil::agent::tool_protocol_system_prompt(&[ProjectLanguage::Rust], None);
     assert!(
         prompt.contains("NEVER"),
         "should contain NEVER guide for dangerous operations"
@@ -1750,7 +1750,7 @@ fn file_edit_anvil_tool_block_parses() {
 #[test]
 fn system_prompt_includes_file_edit_tool() {
     let session = anvil::session::SessionRecord::new(std::path::PathBuf::from("/tmp"));
-    let system_prompt = anvil::agent::tool_protocol_system_prompt(&[]);
+    let system_prompt = anvil::agent::tool_protocol_system_prompt(&[], None);
     let request = anvil::agent::BasicAgentLoop::build_turn_request(
         "test-model",
         &session,
@@ -1770,7 +1770,7 @@ fn system_prompt_includes_file_edit_tool() {
 fn system_prompt_includes_project_instructions() {
     let session = anvil::session::SessionRecord::new(std::path::PathBuf::from("/tmp"));
     let instructions = "Always use snake_case for function names.";
-    let base_prompt = anvil::agent::tool_protocol_system_prompt(&[]);
+    let base_prompt = anvil::agent::tool_protocol_system_prompt(&[], None);
     let system_prompt = format!(
         "{}\n\n## Project instructions (from ANVIL.md)\n{}",
         base_prompt, instructions
@@ -1802,7 +1802,7 @@ fn system_prompt_includes_project_instructions() {
 #[test]
 fn system_prompt_without_project_instructions() {
     let session = anvil::session::SessionRecord::new(std::path::PathBuf::from("/tmp"));
-    let system_prompt = anvil::agent::tool_protocol_system_prompt(&[]);
+    let system_prompt = anvil::agent::tool_protocol_system_prompt(&[], None);
     let request = anvil::agent::BasicAgentLoop::build_turn_request(
         "test-model",
         &session,
@@ -1832,7 +1832,7 @@ fn build_turn_request_with_limit_includes_system_prompt() {
     app.record_user_input("msg_003", "u2").expect("persist");
 
     let instructions = "Test project instructions.";
-    let base_prompt = anvil::agent::tool_protocol_system_prompt(&[]);
+    let base_prompt = anvil::agent::tool_protocol_system_prompt(&[], None);
     let system_prompt = format!(
         "{}\n\n## Project instructions (from ANVIL.md)\n{}",
         base_prompt, instructions

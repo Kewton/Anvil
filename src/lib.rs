@@ -4,6 +4,7 @@ pub mod config;
 pub mod contracts;
 pub mod extensions;
 pub mod logging;
+pub mod mcp;
 pub mod metrics;
 pub mod provider;
 pub mod retrieval;

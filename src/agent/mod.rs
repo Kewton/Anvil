@@ -428,7 +428,10 @@ fn derive_context_budget(context_window: u32) -> usize {
     budget
 }
 
-pub fn tool_protocol_system_prompt(languages: &[ProjectLanguage]) -> String {
+pub fn tool_protocol_system_prompt(
+    languages: &[ProjectLanguage],
+    mcp_tool_descriptions: Option<&str>,
+) -> String {
     let base = concat!(
         "You are Anvil, a local coding agent for serious terminal work.\n",
         "\n",
@@ -505,6 +508,13 @@ pub fn tool_protocol_system_prompt(languages: &[ProjectLanguage]) -> String {
         "- GitHub stats endpoints (contributors, commit_activity) may return {} on first request. If you get an empty response, wait 3 seconds with shell.exec sleep 3 and retry the same API call."
     );
     let mut prompt = base.to_string();
+
+    // MCPツール説明を動的追加
+    // [D4-010] mcp_tool_descriptions is sanitized by generate_mcp_tool_descriptions()
+    if let Some(mcp_desc) = mcp_tool_descriptions {
+        prompt.push_str("\n\n## MCP External Tools\n\n");
+        prompt.push_str(mcp_desc);
+    }
 
     // Always include: Git operations guide
     prompt.push_str(concat!(
@@ -615,4 +625,63 @@ fn extract_final_block_lenient(content: &str, label: &str) -> Option<String> {
     // Strip a trailing ``` if present (model may close without preceding newline)
     let tail = tail.strip_suffix("```").unwrap_or(tail).trim_end();
     Some(tail.to_string())
+}
+
+// --- MCP tool description generation ---
+
+use crate::mcp::McpToolInfo;
+use std::collections::HashMap;
+
+/// Maximum characters for MCP tool descriptions in the system prompt.
+/// [D3-009] Prevents system prompt bloat that compresses message budget.
+const MAX_MCP_PROMPT_CHARS: usize = 8000;
+
+/// Maximum characters per individual tool description.
+const MAX_TOOL_DESC_CHARS: usize = 500;
+
+/// Generate MCP tool descriptions for inclusion in the system prompt.
+///
+/// [D4-010] Sanitizes descriptions to remove ANVIL_TOOL/ANVIL_FINAL markers.
+/// [D3-009] Falls back to tool-name-only list if total exceeds MAX_MCP_PROMPT_CHARS.
+pub fn generate_mcp_tool_descriptions(tools: &HashMap<String, Vec<McpToolInfo>>) -> String {
+    let mut full_descriptions = String::new();
+
+    for (server_name, tool_list) in tools {
+        for tool_info in tool_list {
+            let mcp_name = format!("mcp__{server_name}__{}", tool_info.name);
+
+            // [D4-010] Sanitize description: remove ANVIL_TOOL/ANVIL_FINAL markers
+            let (mut desc, _) = crate::config::sanitize_markers(&tool_info.description);
+
+            // Truncate per-tool description
+            if desc.chars().count() > MAX_TOOL_DESC_CHARS {
+                desc = desc.chars().take(MAX_TOOL_DESC_CHARS).collect::<String>();
+                desc.push_str("...");
+            }
+
+            let schema_str = serde_json::to_string(&tool_info.input_schema).unwrap_or_default();
+
+            full_descriptions.push_str(&format!(
+                "- **{mcp_name}**: {desc}\n  Input schema: {schema_str}\n  Usage:\n  ```ANVIL_TOOL\n  {{\"id\":\"call_mcp\",\"tool\":\"{mcp_name}\",... }}\n  ```\n\n"
+            ));
+        }
+    }
+
+    // [D3-009] Check total size and fall back to name-only list if too large
+    if full_descriptions.chars().count() > MAX_MCP_PROMPT_CHARS {
+        eprintln!(
+            "Warning: MCP tool descriptions exceed {} characters, falling back to tool-name-only list.",
+            MAX_MCP_PROMPT_CHARS
+        );
+        let mut fallback = String::from("Available MCP tools (use ANVIL_TOOL blocks to call):\n");
+        for (server_name, tool_list) in tools {
+            for tool_info in tool_list {
+                let mcp_name = format!("mcp__{server_name}__{}", tool_info.name);
+                fallback.push_str(&format!("- {mcp_name}\n"));
+            }
+        }
+        return fallback;
+    }
+
+    full_descriptions
 }
