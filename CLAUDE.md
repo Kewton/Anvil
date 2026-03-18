@@ -110,7 +110,9 @@ src/
 ├── contracts/
 │   ├── mod.rs           # 共通型定義
 │   └── tokens.rs        # トークン推定（CJK対応ヒューリスティック）
-├── extensions/mod.rs    # スラッシュコマンド・拡張
+├── extensions/
+│   ├── mod.rs           # スラッシュコマンド・拡張
+│   └── skills.rs        # SKILL.mdベースのスキルシステム
 ├── logging.rs           # 構造化ロギング（tracing初期化）
 ├── metrics/mod.rs       # ベンチマーク
 ├── provider/
@@ -133,7 +135,8 @@ tests/
 ├── runtime_flow.rs      # ランタイムフローテスト
 ├── state_session.rs     # 状態・セッションテスト
 ├── tooling_system.rs    # ツールシステムテスト
-└── tui_console.rs       # TUIテスト
+├── tui_console.rs       # TUIテスト
+└── skills_system.rs     # スキルシステムテスト
 ```
 
 ---
