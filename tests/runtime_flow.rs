@@ -499,7 +499,7 @@ fn pending_approval_survives_app_reload() {
 #[test]
 fn system_prompt_mentions_image_support_for_file_read() {
     use anvil::agent::{ProjectLanguage, tool_protocol_system_prompt};
-    let prompt = tool_protocol_system_prompt(&[ProjectLanguage::Rust]);
+    let prompt = tool_protocol_system_prompt(&[ProjectLanguage::Rust], None);
     assert!(
         prompt.contains("image files"),
         "system prompt should mention image support in file.read"
