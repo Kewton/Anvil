@@ -12,7 +12,10 @@ pub mod render;
 use crate::agent::BasicAgentLoop;
 use crate::agent::{AgentEvent, AgentRuntime, PendingTurnState, ProjectLanguage};
 use crate::config::EffectiveConfig;
-use crate::contracts::{AppEvent, AppStateSnapshot, ConsoleRenderContext, RuntimeState};
+use crate::contracts::{
+    AppEvent, AppStateSnapshot, ConsoleRenderContext, ContextUsageView, ContextWarningLevel,
+    RuntimeState,
+};
 use crate::extensions::{ExtensionLoadError, ExtensionRegistry, SlashCommandAction};
 use crate::provider::{
     ProviderBootstrapError, ProviderClient, ProviderErrorKind, ProviderErrorRecord, ProviderEvent,
@@ -50,6 +53,51 @@ pub fn detect_project_languages(project_root: &std::path::Path) -> Vec<ProjectLa
     languages
 }
 
+/// Tracks context overflow warning state to avoid duplicate notifications.
+///
+/// Private to the app module; not persisted across sessions.
+struct ContextWarningTracker {
+    warned_warning: bool,
+    warned_critical: bool,
+}
+
+impl ContextWarningTracker {
+    fn new() -> Self {
+        Self {
+            warned_warning: false,
+            warned_critical: false,
+        }
+    }
+
+    /// Evaluate current context usage and return a warning level if not yet notified.
+    fn evaluate(&mut self, usage: &ContextUsageView) -> Option<ContextWarningLevel> {
+        let level = usage.warning_level();
+        match level {
+            Some(ContextWarningLevel::Critical) if !self.warned_critical => {
+                self.warned_critical = true;
+                self.warned_warning = true;
+                Some(ContextWarningLevel::Critical)
+            }
+            Some(ContextWarningLevel::Warning) if !self.warned_warning => {
+                self.warned_warning = true;
+                Some(ContextWarningLevel::Warning)
+            }
+            _ => None,
+        }
+    }
+
+    /// Reset flags when usage drops below thresholds (e.g. after /compact).
+    fn reset_if_below_threshold(&mut self, usage: &ContextUsageView) {
+        let ratio = usage.usage_ratio();
+        if ratio < 0.8 {
+            self.warned_warning = false;
+        }
+        if ratio < 0.9 {
+            self.warned_critical = false;
+        }
+    }
+}
+
 /// Central application state.
 pub struct App {
     config: EffectiveConfig,
@@ -61,6 +109,7 @@ pub struct App {
     tools: ToolRegistry,
     system_prompt: String,
     shutdown_flag: Arc<AtomicBool>,
+    warning_tracker: ContextWarningTracker,
 }
 
 /// Whether the session loop should continue or exit.
@@ -185,6 +234,7 @@ impl App {
             extensions,
             system_prompt,
             shutdown_flag,
+            warning_tracker: ContextWarningTracker::new(),
         })
     }
 
@@ -528,12 +578,8 @@ impl App {
         )?;
         let snapshot = AppStateSnapshot::new(RuntimeState::Ready)
             .with_status("Approval denied. Ready for the next task".to_string())
-            .with_completion_summary("Approval denied. No tool was executed.", "no changes made")
-            .with_context_usage(
-                self.session.estimated_token_count(),
-                self.config.runtime.context_window,
-            );
-        self.apply_transition(snapshot, StateTransition::ResetToReady)?;
+            .with_completion_summary("Approval denied. No tool was executed.", "no changes made");
+        self.transition_with_context(snapshot, StateTransition::ResetToReady)?;
         self.flush_session()?;
         Ok(vec![self.render_console(tui)?])
     }
@@ -541,12 +587,8 @@ impl App {
     pub fn reset_to_ready(&mut self) -> Result<AppStateSnapshot, AppError> {
         self.clear_pending_turn()?;
         let snapshot = AppStateSnapshot::new(RuntimeState::Ready)
-            .with_status("Ready for the next task".to_string())
-            .with_context_usage(
-                self.session.estimated_token_count(),
-                self.config.runtime.context_window,
-            );
-        self.apply_transition(snapshot, StateTransition::ResetToReady)
+            .with_status("Ready for the next task".to_string());
+        self.transition_with_context(snapshot, StateTransition::ResetToReady)
     }
 
     pub(crate) fn apply_transition_for_mock(
@@ -584,6 +626,18 @@ impl App {
             self.config.runtime.context_window,
         );
         self.apply_transition(snapshot, transition)
+    }
+
+    /// Evaluate context warning on a snapshot and update the state machine if needed.
+    pub(crate) fn evaluate_context_warning(&mut self, snapshot: &mut AppStateSnapshot) {
+        if let Some(usage) = &snapshot.context_usage
+            && let Some(level) = self.warning_tracker.evaluate(usage)
+        {
+            snapshot.context_warning = Some(level);
+            self.state_machine.replace_snapshot(snapshot.clone());
+            self.session
+                .set_last_snapshot(self.state_machine.snapshot().clone());
+        }
     }
 
     pub(crate) fn persist_session_event_for_mock(
@@ -715,7 +769,10 @@ impl App {
                     .with_tool_logs(render::build_tool_logs(tool_logs))
                     .with_completion_summary(completion_summary.clone(), saved_status.clone())
                     .with_elapsed_ms(*elapsed_ms);
-                self.transition_with_context(snapshot, StateTransition::Finish)
+                let mut snapshot =
+                    self.transition_with_context(snapshot, StateTransition::Finish)?;
+                self.evaluate_context_warning(&mut snapshot);
+                Ok(snapshot)
             }
             AgentEvent::Interrupted {
                 status,
@@ -782,12 +839,8 @@ impl App {
     fn begin_live_turn_state(&mut self) -> Result<(), AppError> {
         let snapshot = AppStateSnapshot::new(RuntimeState::Thinking)
             .with_status(format!("Thinking. model={}", self.config.runtime.model))
-            .with_elapsed_ms(0)
-            .with_context_usage(
-                self.session.estimated_token_count(),
-                self.config.runtime.context_window,
-            );
-        self.apply_transition(snapshot, StateTransition::StartThinking)?;
+            .with_elapsed_ms(0);
+        self.transition_with_context(snapshot, StateTransition::StartThinking)?;
         Ok(())
     }
 
@@ -877,7 +930,11 @@ impl App {
                 control: SessionControl::Continue,
             },
             Some(SlashCommandAction::Status) => CliTurnOutput {
-                frames: vec![self.render_console(tui)?],
+                frames: vec![format!(
+                    "{}\n{}",
+                    self.render_console(tui)?,
+                    render::render_status_detail(self.state_machine.snapshot())
+                )],
                 control: SessionControl::Continue,
             },
             Some(SlashCommandAction::Plan) => CliTurnOutput {
@@ -1003,6 +1060,11 @@ impl App {
         let changed = self.session.compact_history(8);
         if changed {
             self.persist_session(AppEvent::SessionSaved)?;
+            let usage = ContextUsageView {
+                estimated_tokens: self.session.estimated_token_count(),
+                max_tokens: self.config.runtime.context_window,
+            };
+            self.warning_tracker.reset_if_below_threshold(&usage);
             Ok("[A] anvil > compacted older session history".to_string())
         } else {
             Ok("[A] anvil > nothing to compact".to_string())
@@ -1074,3 +1136,86 @@ fn standard_tool_registry() -> ToolRegistry {
 
 // Re-export CLI entry points from the cli module.
 pub use cli::{run, run_session_loop, run_with_args};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_usage(estimated: usize, max: u32) -> ContextUsageView {
+        ContextUsageView {
+            estimated_tokens: estimated,
+            max_tokens: max,
+        }
+    }
+
+    #[test]
+    fn tracker_evaluate_first_warning() {
+        let mut tracker = ContextWarningTracker::new();
+        let usage = make_usage(8500, 10000);
+        assert_eq!(tracker.evaluate(&usage), Some(ContextWarningLevel::Warning));
+    }
+
+    #[test]
+    fn tracker_evaluate_suppresses_duplicate_warning() {
+        let mut tracker = ContextWarningTracker::new();
+        let usage = make_usage(8500, 10000);
+        assert_eq!(tracker.evaluate(&usage), Some(ContextWarningLevel::Warning));
+        assert_eq!(tracker.evaluate(&usage), None);
+    }
+
+    #[test]
+    fn tracker_evaluate_first_critical() {
+        let mut tracker = ContextWarningTracker::new();
+        let usage = make_usage(9500, 10000);
+        assert_eq!(
+            tracker.evaluate(&usage),
+            Some(ContextWarningLevel::Critical)
+        );
+    }
+
+    #[test]
+    fn tracker_evaluate_critical_also_sets_warning_flag() {
+        let mut tracker = ContextWarningTracker::new();
+        let critical = make_usage(9500, 10000);
+        assert_eq!(
+            tracker.evaluate(&critical),
+            Some(ContextWarningLevel::Critical)
+        );
+        // Warning should also be suppressed since critical set the flag
+        let warning = make_usage(8500, 10000);
+        assert_eq!(tracker.evaluate(&warning), None);
+    }
+
+    #[test]
+    fn tracker_evaluate_below_threshold_returns_none() {
+        let mut tracker = ContextWarningTracker::new();
+        let usage = make_usage(5000, 10000);
+        assert_eq!(tracker.evaluate(&usage), None);
+    }
+
+    #[test]
+    fn tracker_reset_below_80_clears_warning() {
+        let mut tracker = ContextWarningTracker::new();
+        let high = make_usage(8500, 10000);
+        tracker.evaluate(&high);
+        assert!(tracker.warned_warning);
+
+        let low = make_usage(7000, 10000);
+        tracker.reset_if_below_threshold(&low);
+        assert!(!tracker.warned_warning);
+    }
+
+    #[test]
+    fn tracker_reset_below_90_clears_critical() {
+        let mut tracker = ContextWarningTracker::new();
+        let high = make_usage(9500, 10000);
+        tracker.evaluate(&high);
+        assert!(tracker.warned_critical);
+
+        let medium = make_usage(8500, 10000);
+        tracker.reset_if_below_threshold(&medium);
+        assert!(!tracker.warned_critical);
+        // Warning flag should remain since 85% >= 80%
+        assert!(tracker.warned_warning);
+    }
+}

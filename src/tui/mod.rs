@@ -5,7 +5,8 @@
 
 use crate::config::EffectiveConfig;
 use crate::contracts::{
-    AppStateSnapshot, ConsoleMessageRole, ConsoleMessageView, ConsoleRenderContext, RuntimeState,
+    AppStateSnapshot, ConsoleMessageRole, ConsoleMessageView, ConsoleRenderContext,
+    ContextWarningLevel, RuntimeState,
 };
 
 /// Stateless console renderer.
@@ -152,6 +153,26 @@ impl Tui {
             }
         }
 
+        if let Some(warning_level) = &snapshot.context_warning {
+            let percent = snapshot
+                .context_usage
+                .as_ref()
+                .map(|u| u.usage_percent())
+                .unwrap_or(0);
+            match warning_level {
+                ContextWarningLevel::Warning => {
+                    lines.push(format!(
+                        "[!] Warning: Context usage at {percent}%. Consider running /compact to free space."
+                    ));
+                }
+                ContextWarningLevel::Critical => {
+                    lines.push(format!(
+                        "[!] CRITICAL: Context usage at {percent}%! Run /compact immediately to avoid degraded responses."
+                    ));
+                }
+            }
+        }
+
         lines.push(status_divider());
         lines.push(self.render_footer(snapshot, &view.model_name));
         lines.push(render_hint_line(snapshot));
@@ -188,15 +209,7 @@ impl Tui {
         let ctx = snapshot
             .context_usage
             .as_ref()
-            .map(|usage| {
-                let percent = if usage.max_tokens == 0 {
-                    0
-                } else {
-                    ((usage.estimated_tokens as f64 / usage.max_tokens as f64) * 100.0).round()
-                        as u32
-                };
-                format!("ctx:{percent}%")
-            })
+            .map(|usage| format!("ctx:{}%", usage.usage_percent()))
             .unwrap_or_else(|| "ctx:-".to_string());
 
         let active = snapshot
@@ -233,7 +246,7 @@ fn render_hint_line(snapshot: &crate::contracts::AppStateSnapshot) -> String {
         RuntimeState::Working => "ESC stop  /help  /status  /plan  tools active".to_string(),
         RuntimeState::AwaitingApproval => "approve:y  deny:n  /help  /status".to_string(),
         RuntimeState::Interrupted => "/status  /resume  /reset".to_string(),
-        RuntimeState::Done => "/diff  /save  /continue".to_string(),
+        RuntimeState::Done => "/diff  /save  /continue  /compact".to_string(),
         RuntimeState::Error => "/status  /retry  /reset".to_string(),
     }
 }
