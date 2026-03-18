@@ -29,6 +29,7 @@ pub fn build_config_in(root: PathBuf) -> EffectiveConfig {
     config.paths.session_file = config.paths.session_dir.join("session.json");
     config.paths.logs_dir = root.join(".anvil").join("logs");
     config.paths.mcp_config_file = root.join(".anvil").join("mcp.json");
+    config.paths.hooks_config_file = root.join(".anvil").join("hooks.json");
     config
 }
 

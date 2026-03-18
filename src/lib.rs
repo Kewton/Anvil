@@ -3,6 +3,7 @@ pub mod app;
 pub mod config;
 pub mod contracts;
 pub mod extensions;
+pub mod hooks;
 pub mod logging;
 pub mod mcp;
 pub mod metrics;

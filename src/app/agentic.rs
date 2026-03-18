@@ -472,8 +472,78 @@ impl App {
         structured: &StructuredAssistantResponse,
     ) -> Result<Vec<ToolExecutionResult>, AppError> {
         // Phase 1: Validation + Approval
-        let (validated_requests, failed_results) =
+        let (validated_requests, mut failed_results) =
             self.validate_and_approve_all(&structured.tool_calls);
+
+        // Phase 1.5: PreToolUse hooks (DR design judgment #1)
+        // Build tool_input_map before grouping (DR3-003, DR3-005)
+        let tool_input_map: std::collections::HashMap<String, (String, serde_json::Value)> =
+            validated_requests
+                .iter()
+                .map(|(_, r)| {
+                    (
+                        r.tool_call_id.clone(),
+                        (
+                            r.spec.name.clone(),
+                            serde_json::to_value(&r.input).unwrap_or_default(),
+                        ),
+                    )
+                })
+                .collect();
+
+        // Run PreToolUse hooks and filter blocked requests
+        let validated_requests = if let Some(ref engine) = self.hooks_engine {
+            let mut remaining = Vec::new();
+            for (idx, request) in validated_requests {
+                if let Some((tool_name, tool_input)) = tool_input_map.get(&request.tool_call_id) {
+                    let event = crate::hooks::PreToolUseEvent {
+                        hook_point: "PreToolUse",
+                        tool_name: tool_name.clone(),
+                        tool_input: tool_input.clone(),
+                        tool_call_id: request.tool_call_id.clone(),
+                    };
+                    match engine.run_pre_tool_use(event) {
+                        Ok(crate::hooks::PreToolUseOutcome::Continue) => {
+                            remaining.push((idx, request));
+                        }
+                        Ok(crate::hooks::PreToolUseOutcome::Block { reason, .. }) => {
+                            tracing::info!(
+                                tool = %tool_name,
+                                reason = %reason,
+                                "PreToolUse hook blocked tool call"
+                            );
+                            failed_results.push((
+                                idx,
+                                ToolExecutionResult {
+                                    tool_call_id: request.tool_call_id.clone(),
+                                    tool_name: request.spec.name.clone(),
+                                    status: ToolExecutionStatus::Failed,
+                                    summary: format!("blocked by hook: {reason}"),
+                                    payload: crate::tooling::ToolExecutionPayload::None,
+                                    artifacts: Vec::new(),
+                                    elapsed_ms: 0,
+                                },
+                            ));
+                        }
+                        Err(crate::hooks::HookError::Shutdown) => {
+                            // Propagate shutdown
+                            remaining.push((idx, request));
+                            break;
+                        }
+                        Err(err) => {
+                            // Soft-fail: continue
+                            tracing::warn!("PreToolUse hook error: {err}");
+                            remaining.push((idx, request));
+                        }
+                    }
+                } else {
+                    remaining.push((idx, request));
+                }
+            }
+            remaining
+        } else {
+            validated_requests
+        };
 
         // Phase 2: Grouping
         let groups = group_by_execution_mode(&validated_requests);
@@ -504,15 +574,37 @@ impl App {
             }
         }
 
-        // Phase 4: Sort by index, batch record, persist session
+        // Phase 4: Sort by index, record results, run PostToolUse hooks (DR2-004)
         indexed_results.sort_by_key(|(idx, _)| *idx);
-        let results: Vec<ToolExecutionResult> = indexed_results
-            .into_iter()
-            .map(|(_, result)| {
-                self.record_tool_result(&result);
-                result
-            })
-            .collect();
+        let mut results: Vec<ToolExecutionResult> = Vec::with_capacity(indexed_results.len());
+        for (_, result) in indexed_results {
+            self.record_tool_result(&result);
+
+            // PostToolUse hook (soft-fail)
+            if let Some(ref engine) = self.hooks_engine
+                && let Some((tool_name, tool_input)) = tool_input_map.get(&result.tool_call_id)
+            {
+                let status_str = match result.status {
+                    ToolExecutionStatus::Completed => "completed",
+                    ToolExecutionStatus::Failed | ToolExecutionStatus::Interrupted => "failed",
+                };
+                let event = crate::hooks::PostToolUseEvent {
+                    hook_point: "PostToolUse",
+                    tool_name: tool_name.clone(),
+                    tool_input: tool_input.clone(),
+                    tool_call_id: result.tool_call_id.clone(),
+                    tool_result: crate::hooks::HookToolResult {
+                        status: status_str.to_string(),
+                        summary: result.summary.clone(),
+                    },
+                };
+                if let Err(err) = engine.run_post_tool_use(event) {
+                    tracing::warn!("PostToolUse hook error: {err}");
+                }
+            }
+
+            results.push(result);
+        }
 
         self.persist_session(crate::contracts::AppEvent::SessionSaved)?;
         Ok(results)

@@ -90,6 +90,7 @@ pub struct PathConfig {
     pub session_file: PathBuf,
     pub logs_dir: PathBuf,
     pub mcp_config_file: PathBuf,
+    pub hooks_config_file: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -210,6 +211,7 @@ impl EffectiveConfig {
             },
             paths: PathConfig {
                 mcp_config_file: cwd.join(".anvil").join("mcp.json"),
+                hooks_config_file: cwd.join(".anvil").join("hooks.json"),
                 cwd,
                 workspace_dir,
                 config_file,
@@ -889,4 +891,62 @@ fn check_mcp_config_security_warnings(configs: &HashMap<String, McpServerConfig>
             }
         }
     }
+}
+
+// --- Hooks configuration loading ---
+
+use crate::hooks::{HookError, HooksConfig, MAX_ENTRIES_PER_HOOK_POINT};
+
+/// Load hooks configuration from `.anvil/hooks.json`.
+///
+/// Returns `Ok(None)` if the file does not exist (hooks are optional).
+/// Returns `Ok(Some(...))` on successful parse.
+/// Returns `Err(...)` on parse errors (DR2-009).
+///
+/// DR4-005: Validates the hooks.json path is within cwd/.anvil/.
+/// DR4-007: Caps entries per hook point to 16.
+pub fn load_hooks_config(paths: &PathConfig) -> Result<Option<HooksConfig>, HookError> {
+    if !paths.hooks_config_file.exists() {
+        return Ok(None);
+    }
+
+    // DR4-005: Validate path is within cwd
+    if let Ok(canonical) = paths.hooks_config_file.canonicalize()
+        && let Ok(cwd_canonical) = paths.cwd.canonicalize()
+        && !canonical.starts_with(&cwd_canonical)
+    {
+        return Err(HookError::ParseError {
+            file: paths.hooks_config_file.clone(),
+            reason: "hooks.json path is outside the project directory".to_string(),
+        });
+    }
+
+    tracing::info!(path = %paths.hooks_config_file.display(), "hooks.json detected");
+
+    let content =
+        std::fs::read_to_string(&paths.hooks_config_file).map_err(|e| HookError::ParseError {
+            file: paths.hooks_config_file.clone(),
+            reason: format!("failed to read: {e}"),
+        })?;
+
+    let mut config: HooksConfig =
+        serde_json::from_str(&content).map_err(|e| HookError::ParseError {
+            file: paths.hooks_config_file.clone(),
+            reason: format!("failed to parse: {e}"),
+        })?;
+
+    // DR4-007: Cap entries per hook point
+    for (point, entries) in config.hooks.iter_mut() {
+        if entries.len() > MAX_ENTRIES_PER_HOOK_POINT {
+            tracing::warn!(
+                hook_point = ?point,
+                count = entries.len(),
+                max = MAX_ENTRIES_PER_HOOK_POINT,
+                "hook entries exceed limit, truncating"
+            );
+            entries.truncate(MAX_ENTRIES_PER_HOOK_POINT);
+        }
+    }
+
+    Ok(Some(config))
 }
