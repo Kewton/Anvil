@@ -98,7 +98,9 @@ hotfix/*  --PR--> main (緊急時のみ)
 src/
 ├── main.rs              # エントリポイント
 ├── lib.rs               # モジュール宣言
-├── agent/mod.rs         # エージェントループ・プロトコル
+├── agent/
+│   ├── mod.rs           # エージェントループ・プロトコル
+│   └── subagent.rs      # サブエージェント実行ループ（Explore/Plan）
 ├── app/
 │   ├── mod.rs           # アプリケーションオーケストレータ
 │   ├── agentic.rs       # agenticツール実行ループ

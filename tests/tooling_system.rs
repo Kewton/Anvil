@@ -2009,3 +2009,490 @@ fn format_tool_result_message_image_payload() {
     assert!(msg.contains("/tmp/photo.png"));
     assert!(msg.contains("画像"));
 }
+
+// ============================================================
+// Sub-agent tool tests (Issue #24 Phase 1)
+// ============================================================
+
+fn build_registry_with_subagent_tools() -> ToolRegistry {
+    let mut registry = ToolRegistry::new();
+    registry.register_standard_tools();
+    registry.register_agent_explore();
+    registry.register_agent_plan();
+    registry
+}
+
+// --- from_json tests ---
+
+#[test]
+fn from_json_parses_agent_explore_with_scope() {
+    let json: serde_json::Value = serde_json::json!({
+        "prompt": "Investigate the module structure",
+        "scope": "src/tooling"
+    });
+    let input = ToolInput::from_json("agent.explore", &json).expect("should parse agent.explore");
+    assert_eq!(
+        input,
+        ToolInput::AgentExplore {
+            prompt: "Investigate the module structure".to_string(),
+            scope: Some("src/tooling".to_string()),
+        }
+    );
+}
+
+#[test]
+fn from_json_parses_agent_explore_without_scope() {
+    let json: serde_json::Value = serde_json::json!({
+        "prompt": "Explore the codebase"
+    });
+    let input = ToolInput::from_json("agent.explore", &json).expect("should parse agent.explore");
+    assert_eq!(
+        input,
+        ToolInput::AgentExplore {
+            prompt: "Explore the codebase".to_string(),
+            scope: None,
+        }
+    );
+}
+
+#[test]
+fn from_json_parses_agent_plan_with_scope() {
+    let json: serde_json::Value = serde_json::json!({
+        "prompt": "Plan the refactoring",
+        "scope": "src/app"
+    });
+    let input = ToolInput::from_json("agent.plan", &json).expect("should parse agent.plan");
+    assert_eq!(
+        input,
+        ToolInput::AgentPlan {
+            prompt: "Plan the refactoring".to_string(),
+            scope: Some("src/app".to_string()),
+        }
+    );
+}
+
+#[test]
+fn from_json_parses_agent_plan_without_scope() {
+    let json: serde_json::Value = serde_json::json!({
+        "prompt": "Create implementation plan"
+    });
+    let input = ToolInput::from_json("agent.plan", &json).expect("should parse agent.plan");
+    assert_eq!(
+        input,
+        ToolInput::AgentPlan {
+            prompt: "Create implementation plan".to_string(),
+            scope: None,
+        }
+    );
+}
+
+#[test]
+fn from_json_agent_explore_missing_prompt_fails() {
+    let json: serde_json::Value = serde_json::json!({
+        "scope": "src/tooling"
+    });
+    let err = ToolInput::from_json("agent.explore", &json).expect_err("should fail without prompt");
+    assert!(err.contains("missing prompt"));
+}
+
+#[test]
+fn from_json_agent_plan_missing_prompt_fails() {
+    let json: serde_json::Value = serde_json::json!({
+        "scope": "src/app"
+    });
+    let err = ToolInput::from_json("agent.plan", &json).expect_err("should fail without prompt");
+    assert!(err.contains("missing prompt"));
+}
+
+// --- kind() tests ---
+
+#[test]
+fn kind_returns_agent_explore_for_agent_explore_input() {
+    let input = ToolInput::AgentExplore {
+        prompt: "test".to_string(),
+        scope: None,
+    };
+    assert_eq!(input.kind(), ToolKind::AgentExplore);
+}
+
+#[test]
+fn kind_returns_agent_plan_for_agent_plan_input() {
+    let input = ToolInput::AgentPlan {
+        prompt: "test".to_string(),
+        scope: None,
+    };
+    assert_eq!(input.kind(), ToolKind::AgentPlan);
+}
+
+// --- validate_required_fields tests ---
+
+#[test]
+fn validate_agent_explore_empty_prompt_fails() {
+    let registry = build_registry_with_subagent_tools();
+    let call = ToolCallRequest::new(
+        "call_explore_001",
+        "agent.explore",
+        ToolInput::AgentExplore {
+            prompt: "".to_string(),
+            scope: None,
+        },
+    );
+    let err = registry
+        .validate(call)
+        .expect_err("empty prompt should fail");
+    assert_eq!(
+        err,
+        ToolValidationError::MissingRequiredField("prompt".to_string())
+    );
+}
+
+#[test]
+fn validate_agent_plan_empty_prompt_fails() {
+    let registry = build_registry_with_subagent_tools();
+    let call = ToolCallRequest::new(
+        "call_plan_001",
+        "agent.plan",
+        ToolInput::AgentPlan {
+            prompt: "   ".to_string(),
+            scope: None,
+        },
+    );
+    let err = registry
+        .validate(call)
+        .expect_err("whitespace-only prompt should fail");
+    assert_eq!(
+        err,
+        ToolValidationError::MissingRequiredField("prompt".to_string())
+    );
+}
+
+#[test]
+fn validate_agent_explore_too_long_prompt_fails() {
+    let registry = build_registry_with_subagent_tools();
+    let long_prompt = "a".repeat(10001);
+    let call = ToolCallRequest::new(
+        "call_explore_002",
+        "agent.explore",
+        ToolInput::AgentExplore {
+            prompt: long_prompt,
+            scope: None,
+        },
+    );
+    let err = registry
+        .validate(call)
+        .expect_err("too long prompt should fail");
+    match err {
+        ToolValidationError::InvalidFieldValue { field, .. } => {
+            assert_eq!(field, "prompt");
+        }
+        other => panic!("expected InvalidFieldValue, got {other:?}"),
+    }
+}
+
+#[test]
+fn validate_agent_plan_too_long_prompt_fails() {
+    let registry = build_registry_with_subagent_tools();
+    let long_prompt = "b".repeat(10001);
+    let call = ToolCallRequest::new(
+        "call_plan_002",
+        "agent.plan",
+        ToolInput::AgentPlan {
+            prompt: long_prompt,
+            scope: None,
+        },
+    );
+    let err = registry
+        .validate(call)
+        .expect_err("too long prompt should fail");
+    match err {
+        ToolValidationError::InvalidFieldValue { field, .. } => {
+            assert_eq!(field, "prompt");
+        }
+        other => panic!("expected InvalidFieldValue, got {other:?}"),
+    }
+}
+
+#[test]
+fn validate_agent_explore_valid_prompt_succeeds() {
+    let registry = build_registry_with_subagent_tools();
+    let call = ToolCallRequest::new(
+        "call_explore_003",
+        "agent.explore",
+        ToolInput::AgentExplore {
+            prompt: "Investigate how error handling works".to_string(),
+            scope: Some("src/tooling".to_string()),
+        },
+    );
+    let validated = registry.validate(call).expect("valid prompt should pass");
+    assert_eq!(validated.spec.name, "agent.explore");
+    assert_eq!(validated.spec.kind, ToolKind::AgentExplore);
+}
+
+#[test]
+fn validate_agent_plan_valid_prompt_succeeds() {
+    let registry = build_registry_with_subagent_tools();
+    let call = ToolCallRequest::new(
+        "call_plan_003",
+        "agent.plan",
+        ToolInput::AgentPlan {
+            prompt: "Plan the implementation of feature X".to_string(),
+            scope: None,
+        },
+    );
+    let validated = registry.validate(call).expect("valid prompt should pass");
+    assert_eq!(validated.spec.name, "agent.plan");
+    assert_eq!(validated.spec.kind, ToolKind::AgentPlan);
+}
+
+// --- ToolSpec attribute tests ---
+
+#[test]
+fn agent_explore_spec_has_correct_attributes() {
+    let registry = build_registry_with_subagent_tools();
+    let spec = registry
+        .get("agent.explore")
+        .expect("agent.explore should be registered");
+    assert_eq!(spec.kind, ToolKind::AgentExplore);
+    assert_eq!(spec.execution_class, ExecutionClass::ReadOnly);
+    assert_eq!(spec.permission_class, PermissionClass::Safe);
+    assert_eq!(spec.execution_mode, ExecutionMode::SequentialOnly);
+    assert_eq!(spec.plan_mode, PlanModePolicy::Allowed);
+    assert_eq!(spec.rollback_policy, RollbackPolicy::None);
+}
+
+#[test]
+fn agent_plan_spec_has_correct_attributes() {
+    let registry = build_registry_with_subagent_tools();
+    let spec = registry
+        .get("agent.plan")
+        .expect("agent.plan should be registered");
+    assert_eq!(spec.kind, ToolKind::AgentPlan);
+    assert_eq!(spec.execution_class, ExecutionClass::ReadOnly);
+    assert_eq!(spec.permission_class, PermissionClass::Safe);
+    assert_eq!(spec.execution_mode, ExecutionMode::SequentialOnly);
+    assert_eq!(spec.plan_mode, PlanModePolicy::Allowed);
+    assert_eq!(spec.rollback_policy, RollbackPolicy::None);
+}
+
+// --- ToolRegistry subset tests ---
+
+#[test]
+fn explore_tools_registry_contains_only_file_read_and_file_search() {
+    let mut registry = ToolRegistry::new();
+    registry.register_explore_tools();
+    assert!(registry.get("file.read").is_some());
+    assert!(registry.get("file.search").is_some());
+    assert!(registry.get("file.write").is_none());
+    assert!(registry.get("shell.exec").is_none());
+    assert!(registry.get("web.fetch").is_none());
+    assert!(registry.get("agent.explore").is_none());
+    assert!(registry.get("agent.plan").is_none());
+}
+
+#[test]
+fn plan_tools_registry_contains_file_read_file_search_and_web_fetch() {
+    let mut registry = ToolRegistry::new();
+    registry.register_plan_tools();
+    assert!(registry.get("file.read").is_some());
+    assert!(registry.get("file.search").is_some());
+    assert!(registry.get("web.fetch").is_some());
+    assert!(registry.get("file.write").is_none());
+    assert!(registry.get("shell.exec").is_none());
+    assert!(registry.get("agent.explore").is_none());
+    assert!(registry.get("agent.plan").is_none());
+}
+
+// --- repair_from_block tests ---
+
+#[test]
+fn repair_from_block_agent_explore_with_prompt_and_scope() {
+    fn extract_simple(block: &str, key: &str) -> Option<String> {
+        let pattern = format!("\"{}\":", key);
+        let start = block.find(&pattern)? + pattern.len();
+        let rest = &block[start..];
+        let rest = rest.trim_start();
+        if let Some(inner) = rest.strip_prefix('"') {
+            let end = inner.find('"')?;
+            Some(inner[..end].to_string())
+        } else {
+            None
+        }
+    }
+    fn extract_trailing(block: &str, key: &str) -> Option<String> {
+        extract_simple(block, key)
+    }
+
+    let block = r#"{"prompt": "explore this", "scope": "src/app"}"#;
+    let result =
+        ToolInput::repair_from_block("agent.explore", block, extract_simple, extract_trailing);
+    assert_eq!(
+        result,
+        Some(ToolInput::AgentExplore {
+            prompt: "explore this".to_string(),
+            scope: Some("src/app".to_string()),
+        })
+    );
+}
+
+#[test]
+fn repair_from_block_agent_plan_without_scope() {
+    fn extract_simple(block: &str, key: &str) -> Option<String> {
+        let pattern = format!("\"{}\":", key);
+        let start = block.find(&pattern)? + pattern.len();
+        let rest = &block[start..];
+        let rest = rest.trim_start();
+        if let Some(inner) = rest.strip_prefix('"') {
+            let end = inner.find('"')?;
+            Some(inner[..end].to_string())
+        } else {
+            None
+        }
+    }
+    fn extract_trailing(block: &str, key: &str) -> Option<String> {
+        extract_simple(block, key)
+    }
+
+    let block = r#"{"prompt": "plan the implementation"}"#;
+    let result =
+        ToolInput::repair_from_block("agent.plan", block, extract_simple, extract_trailing);
+    assert_eq!(
+        result,
+        Some(ToolInput::AgentPlan {
+            prompt: "plan the implementation".to_string(),
+            scope: None,
+        })
+    );
+}
+
+#[test]
+fn repair_from_block_agent_explore_missing_prompt_returns_none() {
+    fn extract_simple(block: &str, key: &str) -> Option<String> {
+        let pattern = format!("\"{}\":", key);
+        let start = block.find(&pattern)? + pattern.len();
+        let rest = &block[start..];
+        let rest = rest.trim_start();
+        if let Some(inner) = rest.strip_prefix('"') {
+            let end = inner.find('"')?;
+            Some(inner[..end].to_string())
+        } else {
+            None
+        }
+    }
+    fn extract_trailing(block: &str, key: &str) -> Option<String> {
+        extract_simple(block, key)
+    }
+
+    let block = r#"{"scope": "src/app"}"#;
+    let result =
+        ToolInput::repair_from_block("agent.explore", block, extract_simple, extract_trailing);
+    assert!(result.is_none());
+}
+
+// --- max prompt length boundary test ---
+
+#[test]
+fn validate_agent_explore_exactly_max_prompt_length_succeeds() {
+    let registry = build_registry_with_subagent_tools();
+    let exact_prompt = "x".repeat(10000);
+    let call = ToolCallRequest::new(
+        "call_explore_004",
+        "agent.explore",
+        ToolInput::AgentExplore {
+            prompt: exact_prompt,
+            scope: None,
+        },
+    );
+    registry
+        .validate(call)
+        .expect("exactly 10000 chars should pass");
+}
+
+// --- SubAgentKind::from_tool_input() tests ---
+
+#[test]
+fn subagent_kind_from_tool_input_explore() {
+    use anvil::agent::subagent::SubAgentKind;
+    let input = ToolInput::AgentExplore {
+        prompt: "test".to_string(),
+        scope: None,
+    };
+    assert_eq!(
+        SubAgentKind::from_tool_input(&input),
+        Some(SubAgentKind::Explore)
+    );
+}
+
+#[test]
+fn subagent_kind_from_tool_input_plan() {
+    use anvil::agent::subagent::SubAgentKind;
+    let input = ToolInput::AgentPlan {
+        prompt: "test".to_string(),
+        scope: Some("./src".to_string()),
+    };
+    assert_eq!(
+        SubAgentKind::from_tool_input(&input),
+        Some(SubAgentKind::Plan)
+    );
+}
+
+#[test]
+fn subagent_kind_from_tool_input_returns_none_for_other_tools() {
+    use anvil::agent::subagent::SubAgentKind;
+    let input = ToolInput::FileRead {
+        path: "./foo".to_string(),
+    };
+    assert_eq!(SubAgentKind::from_tool_input(&input), None);
+}
+
+#[test]
+fn subagent_error_display_formats_correctly() {
+    use anvil::agent::subagent::SubAgentError;
+    use anvil::provider::ProviderTurnError;
+
+    let e = SubAgentError::Timeout;
+    assert_eq!(e.to_string(), "SubAgent timed out");
+
+    let e = SubAgentError::MaxIterations;
+    assert_eq!(e.to_string(), "SubAgent reached max iterations");
+
+    let e = SubAgentError::SandboxViolation("../escape".to_string());
+    assert!(e.to_string().contains("../escape"));
+
+    let e = SubAgentError::Provider(ProviderTurnError::Cancelled);
+    assert!(e.to_string().contains("provider"));
+
+    let e = SubAgentError::ToolExecution("bad tool".to_string());
+    assert!(e.to_string().contains("bad tool"));
+}
+
+#[test]
+fn subagent_error_into_tool_execution_result_status_mapping() {
+    use anvil::agent::subagent::SubAgentError;
+    use anvil::tooling::ToolExecutionStatus;
+
+    let call = ToolCallRequest::new(
+        "call_001",
+        "agent.explore",
+        ToolInput::AgentExplore {
+            prompt: "test".to_string(),
+            scope: None,
+        },
+    );
+
+    // Timeout -> Completed (partial result)
+    let result = SubAgentError::Timeout.into_tool_execution_result(&call);
+    assert_eq!(result.status, ToolExecutionStatus::Completed);
+
+    // MaxIterations -> Completed (partial result)
+    let result = SubAgentError::MaxIterations.into_tool_execution_result(&call);
+    assert_eq!(result.status, ToolExecutionStatus::Completed);
+
+    // SandboxViolation -> Failed
+    let result =
+        SubAgentError::SandboxViolation("bad".to_string()).into_tool_execution_result(&call);
+    assert_eq!(result.status, ToolExecutionStatus::Failed);
+
+    // ToolExecution -> Failed
+    let result = SubAgentError::ToolExecution("err".to_string()).into_tool_execution_result(&call);
+    assert_eq!(result.status, ToolExecutionStatus::Failed);
+}

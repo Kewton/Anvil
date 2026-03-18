@@ -3,6 +3,8 @@
 //! Defines the [`AgentEvent`] lifecycle and the [`BasicAgentLoop`] that
 //! bridges provider responses into structured tool calls.
 
+pub mod subagent;
+
 use crate::contracts::tokens::{ContentKind, estimate_tokens};
 use crate::provider::{
     ImageContent, ProviderClient, ProviderEvent, ProviderMessage, ProviderMessageRole,
@@ -483,6 +485,18 @@ pub fn tool_protocol_system_prompt(
         "{\"id\":\"call_006\",\"tool\":\"web.search\",\"query\":\"search keywords here\"}\n",
         "```\n",
         "Use web.search when you need to look up error messages, library usage, or any information not available locally.\n",
+        "\n",
+        "8. agent.explore — launch a read-only sub-agent to explore the codebase:\n",
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_008\",\"tool\":\"agent.explore\",\"prompt\":\"Investigate the module structure under src/\",\"scope\":\"./src\"}\n",
+        "```\n",
+        "The sub-agent can only use file.read and file.search within the given scope directory.\n",
+        "\n",
+        "9. agent.plan — launch a read-only sub-agent to create an implementation plan:\n",
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_009\",\"tool\":\"agent.plan\",\"prompt\":\"Create a plan to add error handling\",\"scope\":\"./src\"}\n",
+        "```\n",
+        "The sub-agent can use file.read, file.search, and web.fetch within the given scope directory.\n",
         "\n",
         "After ALL tool blocks, include exactly one final block with your summary:\n",
         "```ANVIL_FINAL\n",
