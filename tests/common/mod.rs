@@ -36,5 +36,6 @@ pub fn unique_test_dir(label: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("time should be monotonic")
         .as_nanos();
-    std::env::temp_dir().join(format!("anvil_test_{label}_{nanos}"))
+    let tid = std::thread::current().id();
+    std::env::temp_dir().join(format!("anvil_test_{label}_{nanos}_{tid:?}"))
 }

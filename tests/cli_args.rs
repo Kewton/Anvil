@@ -1,7 +1,8 @@
 mod common;
 
-use anvil::config::{CliArgs, EffectiveConfig, ReasoningVisibility};
+use anvil::config::{CliArgs, EffectiveConfig, PromptSource, ReasoningVisibility};
 use clap::Parser;
+use std::path::PathBuf;
 
 // --- CliArgs parsing tests ---
 
@@ -20,6 +21,8 @@ fn cli_args_default_has_all_none_and_false() {
     assert!(!args.no_approval);
     assert!(!args.fresh_session);
     assert!(!args.oneshot);
+    assert!(args.exec.is_none());
+    assert!(args.exec_file.is_none());
     assert!(args.reasoning_visibility.is_none());
 }
 
@@ -282,4 +285,225 @@ fn apply_cli_args_invalid_reasoning_visibility_errors() {
 
     let result = config.apply_cli_args(&args);
     assert!(result.is_err());
+}
+
+// --- --exec / --exec-file CLI args parsing tests ---
+
+#[test]
+fn cli_args_exec_flag_parse() {
+    let args = CliArgs::try_parse_from(["anvil", "--exec", "analyze this code"]).unwrap();
+    assert_eq!(args.exec.as_deref(), Some("analyze this code"));
+    assert!(args.exec_file.is_none());
+    assert!(!args.oneshot);
+}
+
+#[test]
+fn cli_args_exec_file_flag_parse() {
+    let args = CliArgs::try_parse_from(["anvil", "--exec-file", "/tmp/prompt.txt"]).unwrap();
+    assert_eq!(args.exec_file, Some(PathBuf::from("/tmp/prompt.txt")));
+    assert!(args.exec.is_none());
+    assert!(!args.oneshot);
+}
+
+#[test]
+fn cli_args_exec_oneshot_conflict() {
+    let result = CliArgs::try_parse_from(["anvil", "--exec", "hello", "--oneshot"]);
+    assert!(result.is_err(), "exec and oneshot should conflict");
+}
+
+#[test]
+fn cli_args_exec_exec_file_conflict() {
+    let result = CliArgs::try_parse_from(["anvil", "--exec", "hello", "--exec-file", "/tmp/p.txt"]);
+    assert!(result.is_err(), "exec and exec-file should conflict");
+}
+
+#[test]
+fn cli_args_exec_file_oneshot_conflict() {
+    let result = CliArgs::try_parse_from(["anvil", "--exec-file", "/tmp/p.txt", "--oneshot"]);
+    assert!(result.is_err(), "exec-file and oneshot should conflict");
+}
+
+// --- PromptSource / apply_cli_args integration tests ---
+
+#[test]
+fn prompt_source_default_is_interactive() {
+    let config = EffectiveConfig::default_for_test().unwrap();
+    assert!(config.mode.prompt_source.is_interactive());
+}
+
+#[test]
+fn apply_cli_args_exec_sets_non_interactive() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let args = CliArgs {
+        exec: Some("do something".to_string()),
+        ..CliArgs::default()
+    };
+    config.apply_cli_args(&args).unwrap();
+
+    assert!(
+        !config.mode.interactive,
+        "exec should set interactive=false"
+    );
+    assert!(matches!(config.mode.prompt_source, PromptSource::Exec(_)));
+}
+
+#[test]
+fn apply_cli_args_exec_sets_approval_false() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    assert!(config.mode.approval_required); // default is true
+    let args = CliArgs {
+        exec: Some("do something".to_string()),
+        ..CliArgs::default()
+    };
+    config.apply_cli_args(&args).unwrap();
+
+    assert!(
+        !config.mode.approval_required,
+        "exec should auto-disable approval"
+    );
+}
+
+#[test]
+fn apply_cli_args_exec_sets_fresh_session() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    assert!(!config.mode.fresh_session); // default is false
+    let args = CliArgs {
+        exec: Some("do something".to_string()),
+        ..CliArgs::default()
+    };
+    config.apply_cli_args(&args).unwrap();
+
+    assert!(
+        config.mode.fresh_session,
+        "exec should auto-set fresh_session=true"
+    );
+}
+
+#[test]
+fn apply_cli_args_exec_file_sets_non_interactive() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let args = CliArgs {
+        exec_file: Some(PathBuf::from("/tmp/prompt.txt")),
+        ..CliArgs::default()
+    };
+    config.apply_cli_args(&args).unwrap();
+
+    assert!(!config.mode.interactive);
+    assert!(!config.mode.approval_required);
+    assert!(config.mode.fresh_session);
+    assert!(matches!(
+        config.mode.prompt_source,
+        PromptSource::ExecFile(_)
+    ));
+}
+
+#[test]
+fn apply_cli_args_oneshot_sets_stdin_source() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let args = CliArgs {
+        oneshot: true,
+        ..CliArgs::default()
+    };
+    config.apply_cli_args(&args).unwrap();
+
+    assert!(!config.mode.interactive);
+    assert!(!config.mode.approval_required);
+    assert!(config.mode.fresh_session);
+    assert!(matches!(config.mode.prompt_source, PromptSource::Stdin));
+}
+
+// --- AppError::exit_code tests ---
+
+#[test]
+fn app_error_exit_code_tool_execution() {
+    let err = anvil::app::AppError::ToolExecution("test".to_string());
+    assert_eq!(err.exit_code(), 2);
+}
+
+#[test]
+fn app_error_exit_code_config() {
+    let err = anvil::app::AppError::Config(anvil::config::ConfigError::ValidationError(
+        "test".to_string(),
+    ));
+    assert_eq!(err.exit_code(), 1);
+}
+
+// --- SessionRecord helper tests ---
+
+#[test]
+fn session_last_assistant_message_returns_last() {
+    use anvil::session::{MessageRole, SessionMessage, SessionRecord};
+    use std::path::PathBuf;
+
+    let mut session = SessionRecord::new(PathBuf::from("/tmp/test"));
+    session.push_message(SessionMessage::new(MessageRole::User, "you", "hello"));
+    session.push_message(SessionMessage::new(
+        MessageRole::Assistant,
+        "anvil",
+        "first reply",
+    ));
+    session.push_message(SessionMessage::new(MessageRole::User, "you", "follow up"));
+    session.push_message(SessionMessage::new(
+        MessageRole::Assistant,
+        "anvil",
+        "second reply",
+    ));
+
+    assert_eq!(session.last_assistant_message(), Some("second reply"));
+}
+
+#[test]
+fn session_last_assistant_message_returns_none_when_empty() {
+    use anvil::session::SessionRecord;
+    use std::path::PathBuf;
+
+    let session = SessionRecord::new(PathBuf::from("/tmp/test"));
+    assert_eq!(session.last_assistant_message(), None);
+}
+
+#[test]
+fn session_last_turn_tool_results_returns_tools_after_last_user() {
+    use anvil::session::{MessageRole, SessionMessage, SessionRecord};
+    use std::path::PathBuf;
+
+    let mut session = SessionRecord::new(PathBuf::from("/tmp/test"));
+    // First turn
+    session.push_message(SessionMessage::new(MessageRole::User, "you", "first"));
+    let mut tool1 = SessionMessage::new(MessageRole::Tool, "tool", "result1");
+    tool1.is_error = false;
+    session.push_message(tool1);
+    // Second turn
+    session.push_message(SessionMessage::new(MessageRole::User, "you", "second"));
+    let mut tool2 = SessionMessage::new(MessageRole::Tool, "tool", "result2");
+    tool2.is_error = true;
+    session.push_message(tool2);
+
+    let results: Vec<_> = session.last_turn_tool_results().collect();
+    assert_eq!(results.len(), 1, "should only include tools from last turn");
+    assert!(results[0].is_error);
+}
+
+#[test]
+fn session_message_is_error_deserialize_compat() {
+    // Verify that old JSON without is_error deserializes with default false
+    let json = r#"{
+        "id": "test_1",
+        "role": "Tool",
+        "author": "tool",
+        "content": "result",
+        "status": "Committed",
+        "tool_call_id": null
+    }"#;
+    let msg: anvil::session::SessionMessage = serde_json::from_str(json).unwrap();
+    assert!(!msg.is_error, "is_error should default to false");
+}
+
+// --- Spinner no-op test ---
+
+#[test]
+fn spinner_noop_in_non_interactive() {
+    // Verify that Spinner::start with enabled=false does not panic
+    // and can be stopped immediately.
+    let spinner = anvil::spinner::Spinner::start("test message", false);
+    spinner.stop(); // should be a no-op, no panic
 }

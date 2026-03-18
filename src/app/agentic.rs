@@ -216,11 +216,14 @@ impl App {
             }
 
             // Send tool results back to LLM for the next turn
-            let spinner = Spinner::start(format!(
-                "Analyzing results. model={} (iteration {})",
-                self.config.runtime.model,
-                iteration + 2
-            ));
+            let spinner = Spinner::start(
+                format!(
+                    "Analyzing results. model={} (iteration {})",
+                    self.config.runtime.model,
+                    iteration + 2
+                ),
+                self.config.mode.interactive,
+            );
 
             let request = BasicAgentLoop::build_turn_request(
                 self.config.runtime.model.clone(),
@@ -450,14 +453,15 @@ impl App {
 
     /// Push a tool execution result into the session as a tool message.
     fn record_tool_result(&mut self, result: &ToolExecutionResult) {
-        self.session.push_message(
-            SessionMessage::new(
-                MessageRole::Tool,
-                "tool",
-                format_tool_result_message(result, self.config.runtime.tool_result_max_chars),
-            )
-            .with_id(self.next_message_id("tool")),
-        );
+        let is_error = result.status == ToolExecutionStatus::Failed;
+        let mut msg = SessionMessage::new(
+            MessageRole::Tool,
+            "tool",
+            format_tool_result_message(result, self.config.runtime.tool_result_max_chars),
+        )
+        .with_id(self.next_message_id("tool"));
+        msg.is_error = is_error;
+        self.session.push_message(msg);
     }
 
     pub(crate) fn handle_structured_done<C: ProviderClient>(

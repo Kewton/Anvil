@@ -3,7 +3,7 @@
 //! Contains the `run_session_loop` and `run_interactive_loop` functions
 //! that drive the interactive CLI experience.
 
-use crate::config::{CliArgs, EffectiveConfig};
+use crate::config::{CliArgs, EffectiveConfig, PromptSource};
 use crate::logging::{LogGuard, init_tracing};
 use crate::provider::{ProviderClient, ProviderRuntimeContext, build_local_provider_client};
 use crate::session::SessionError;
@@ -11,7 +11,7 @@ use crate::tui::Tui;
 
 use super::{App, AppError, SessionControl, cli_prompt};
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read as _, Write};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -121,14 +121,64 @@ fn run_with_config(config: EffectiveConfig) -> Result<(), AppError> {
     }
 
     let mut app = App::new(config, provider, Arc::clone(&shutdown_flag))?;
-    let tui = Tui::new();
-    println!("{}", app.startup_console(&tui)?);
 
-    if !app.config.mode.interactive {
-        return Ok(());
+    match app.config.mode.prompt_source {
+        PromptSource::Interactive => {
+            let tui = Tui::new();
+            println!("{}", app.startup_console(&tui)?);
+            run_interactive_loop(&mut app, &provider_client, &tui)
+        }
+        ref source => {
+            let source = source.clone();
+            run_non_interactive(&mut app, &provider_client, &source)
+        }
+    }
+}
+
+/// Read all of stdin into a string.
+fn read_stdin() -> Result<String, AppError> {
+    let mut buf = String::new();
+    io::stdin().lock().read_to_string(&mut buf).map_err(|e| {
+        AppError::Config(crate::config::ConfigError::ValidationError(format!(
+            "failed to read stdin: {e}"
+        )))
+    })?;
+    Ok(buf)
+}
+
+/// Non-interactive execution path for --exec, --exec-file, and --oneshot modes.
+fn run_non_interactive<C: ProviderClient>(
+    app: &mut App,
+    provider_client: &C,
+    source: &PromptSource,
+) -> Result<(), AppError> {
+    // 1. Get prompt from the appropriate source
+    let prompt = match source {
+        PromptSource::Stdin => read_stdin()?,
+        PromptSource::Exec(s) => s.clone(),
+        PromptSource::ExecFile(path) => std::fs::read_to_string(path).map_err(|e| {
+            AppError::Config(crate::config::ConfigError::ValidationError(format!(
+                "failed to read exec file: {e}"
+            )))
+        })?,
+        PromptSource::Interactive => unreachable!(),
+    };
+
+    // 2. Execute the prompt via run_live_turn
+    let tui = Tui::new();
+    let _frames = app.run_live_turn(&prompt, provider_client, &tui)?;
+
+    // 3. Output the last assistant message to stdout
+    if let Some(response) = app.session().last_assistant_message() {
+        print!("{}", response);
     }
 
-    run_interactive_loop(&mut app, &provider_client, &tui)
+    // 4. Check for tool execution failures
+    if app.has_tool_execution_failure() {
+        return Err(AppError::ToolExecution("tool execution failed".to_string()));
+    }
+
+    Ok(())
 }
 
 /// Interactive session loop powered by `rustyline`.

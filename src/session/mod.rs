@@ -40,6 +40,10 @@ pub struct SessionMessage {
     pub content: String,
     pub status: MessageStatus,
     pub tool_call_id: Option<String>,
+    /// Whether this tool result represents an error.
+    /// Added for non-interactive mode exit code determination.
+    #[serde(default)]
+    pub is_error: bool,
 }
 
 impl SessionMessage {
@@ -51,6 +55,7 @@ impl SessionMessage {
             content: content.into(),
             status: MessageStatus::Committed,
             tool_call_id: None,
+            is_error: false,
         }
     }
 
@@ -365,6 +370,28 @@ impl SessionRecord {
 
     pub fn clear_dirty(&mut self) {
         self.dirty = false;
+    }
+
+    /// Return the content of the last assistant message, if any.
+    pub fn last_assistant_message(&self) -> Option<&str> {
+        self.messages
+            .iter()
+            .rev()
+            .find(|m| m.role == MessageRole::Assistant)
+            .map(|m| m.content.as_str())
+    }
+
+    /// Return tool result messages from the last turn (after the last user message).
+    pub fn last_turn_tool_results(&self) -> impl Iterator<Item = &SessionMessage> {
+        let last_user_idx = self
+            .messages
+            .iter()
+            .rposition(|m| m.role == MessageRole::User)
+            .unwrap_or(0);
+
+        self.messages[last_user_idx..]
+            .iter()
+            .filter(|m| m.role == MessageRole::Tool)
     }
 }
 

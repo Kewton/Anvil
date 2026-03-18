@@ -159,6 +159,18 @@ impl Display for AppError {
 
 impl std::error::Error for AppError {}
 
+impl AppError {
+    /// Return the process exit code for non-interactive mode.
+    /// - ToolExecution errors → 2 (tool failure)
+    /// - All other errors → 1 (general error)
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            AppError::ToolExecution(_) => 2,
+            _ => 1,
+        }
+    }
+}
+
 impl From<crate::config::ConfigError> for AppError {
     fn from(value: crate::config::ConfigError) -> Self {
         Self::Config(value)
@@ -280,6 +292,14 @@ impl App {
         self.shutdown_flag.load(Ordering::Relaxed)
     }
 
+    /// Check whether the last turn had any tool execution failures.
+    /// Used by non-interactive mode to determine exit code.
+    pub fn has_tool_execution_failure(&self) -> bool {
+        self.session
+            .last_turn_tool_results()
+            .any(|result| result.is_error)
+    }
+
     /// Save the session on exit (wrapper for flush_session).
     pub(crate) fn save_session_on_exit(&mut self) {
         let _ = self.flush_session();
@@ -381,10 +401,10 @@ impl App {
         );
 
         // Phase 1: Collect events from provider with spinner + streaming output.
-        let mut spinner_opt = Some(Spinner::start(format!(
-            "Thinking. model={}",
-            self.config.runtime.model
-        )));
+        let mut spinner_opt = Some(Spinner::start(
+            format!("Thinking. model={}", self.config.runtime.model),
+            self.config.mode.interactive,
+        ));
 
         let mut token_buffer = String::new();
         let mut collected_events: Vec<ProviderEvent> = Vec::new();
@@ -654,7 +674,11 @@ impl App {
 
     /// Flush session to disk if the dirty flag is set.
     /// Also runs deferred auto-compaction before writing.
+    /// In non-interactive mode, skip disk persistence entirely.
     fn flush_session(&mut self) -> Result<(), AppError> {
+        if !self.config.mode.interactive {
+            return Ok(());
+        }
         self.session.compact_if_needed();
         if self.session.dirty {
             self.session_store.save(&self.session)?;
@@ -664,7 +688,12 @@ impl App {
     }
 
     /// Immediately persist session to disk (for crash-safety critical paths).
+    /// In non-interactive mode, skip disk persistence entirely.
     fn persist_session_immediate(&mut self, event: AppEvent) -> Result<(), AppError> {
+        if !self.config.mode.interactive {
+            self.session.record_event(event);
+            return Ok(());
+        }
         self.session.record_event(event);
         self.session_store.save(&self.session)?;
         self.session.clear_dirty();

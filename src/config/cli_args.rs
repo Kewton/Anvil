@@ -4,6 +4,7 @@
 //! [`super::EffectiveConfig::load_with_args`] for configuration override.
 
 use clap::Parser;
+use std::path::PathBuf;
 
 #[derive(Parser, Debug, Default)]
 #[command(name = "anvil", version, about = "Local coding agent powered by LLM")]
@@ -52,9 +53,17 @@ pub struct CliArgs {
     #[arg(long = "fresh-session")]
     pub fresh_session: bool,
 
-    /// Non-interactive mode
-    #[arg(long)]
+    /// Non-interactive mode (read prompt from stdin)
+    #[arg(long, conflicts_with_all = ["exec", "exec_file"])]
     pub oneshot: bool,
+
+    /// Execute a single prompt and exit (non-interactive)
+    #[arg(long, conflicts_with_all = ["exec_file", "oneshot"])]
+    pub exec: Option<String>,
+
+    /// Execute prompt from a file and exit (non-interactive)
+    #[arg(long = "exec-file", conflicts_with_all = ["exec", "oneshot"])]
+    pub exec_file: Option<PathBuf>,
 
     /// Reasoning visibility level (hidden|summary)
     #[arg(long = "reasoning-visibility")]

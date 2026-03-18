@@ -17,6 +17,26 @@ use std::{
     fmt::{Display, Formatter},
 };
 
+/// Determines where the user prompt originates from.
+#[derive(Debug, Clone)]
+pub enum PromptSource {
+    /// Interactive REPL mode (default).
+    Interactive,
+    /// Read prompt from stdin (--oneshot).
+    Stdin,
+    /// Prompt provided directly via --exec flag.
+    Exec(String),
+    /// Prompt read from a file via --exec-file flag.
+    ExecFile(PathBuf),
+}
+
+impl PromptSource {
+    /// Returns true if this source represents an interactive session.
+    pub fn is_interactive(&self) -> bool {
+        matches!(self, PromptSource::Interactive)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WebSearchProvider {
     #[default]
@@ -45,6 +65,7 @@ pub struct RuntimeConfig {
 
 #[derive(Debug, Clone)]
 pub struct ModeConfig {
+    pub prompt_source: PromptSource,
     pub interactive: bool,
     pub approval_required: bool,
     pub fresh_session: bool,
@@ -178,6 +199,7 @@ impl EffectiveConfig {
                 serper_api_key: None,
             },
             mode: ModeConfig {
+                prompt_source: PromptSource::Interactive,
                 interactive: true,
                 approval_required: true,
                 fresh_session: false,
@@ -269,6 +291,22 @@ impl EffectiveConfig {
     /// Uses direct field assignment (not `apply_map`) to avoid redundant
     /// string round-trips for already-typed values.
     pub fn apply_cli_args(&mut self, cli: &CliArgs) -> Result<(), ConfigError> {
+        // Determine PromptSource from CLI args
+        if let Some(ref prompt) = cli.exec {
+            self.mode.prompt_source = PromptSource::Exec(prompt.clone());
+        } else if let Some(ref path) = cli.exec_file {
+            self.mode.prompt_source = PromptSource::ExecFile(path.clone());
+        } else if cli.oneshot {
+            self.mode.prompt_source = PromptSource::Stdin;
+        }
+
+        // Derive interactive / approval_required / fresh_session for non-interactive modes
+        if !self.mode.prompt_source.is_interactive() {
+            self.mode.interactive = false;
+            self.mode.approval_required = false;
+            self.mode.fresh_session = true;
+        }
+
         // String fields
         if let Some(ref v) = cli.provider {
             self.runtime.provider = v.clone();
