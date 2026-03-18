@@ -5,13 +5,15 @@
 
 use crate::contracts::tokens::{ContentKind, estimate_tokens};
 use crate::provider::{
-    ProviderClient, ProviderEvent, ProviderMessage, ProviderMessageRole, ProviderTurnError,
-    ProviderTurnRequest,
+    ImageContent, ProviderClient, ProviderEvent, ProviderMessage, ProviderMessageRole,
+    ProviderTurnError, ProviderTurnRequest,
 };
 use crate::session::{MessageRole, SessionRecord};
-use crate::tooling::{ToolCallRequest, ToolInput};
+use crate::tooling::{ToolCallRequest, ToolInput, detect_image_mime};
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectLanguage {
@@ -157,17 +159,20 @@ impl BasicAgentLoop {
     ) -> ProviderTurnRequest {
         let len = session.messages.len();
         let start = len.saturating_sub(max_messages);
+        let sandbox_root = std::fs::canonicalize(&session.metadata.cwd).ok();
 
-        ProviderTurnRequest::new(
-            model.into(),
-            std::iter::once(ProviderMessage::new(
-                ProviderMessageRole::System,
-                system_prompt,
-            ))
-            .chain(session.messages[start..].iter().map(to_provider_message))
-            .collect(),
-            stream,
+        let messages: Vec<ProviderMessage> = std::iter::once(ProviderMessage::new(
+            ProviderMessageRole::System,
+            system_prompt,
+        ))
+        .chain(
+            session.messages[start..]
+                .iter()
+                .map(|sm| to_provider_message_with_images(sm, sandbox_root.as_deref())),
         )
+        .collect();
+
+        ProviderTurnRequest::new(model.into(), messages, stream)
     }
 
     pub fn build_turn_request_with_token_budget(
@@ -206,16 +211,20 @@ impl BasicAgentLoop {
             "built turn request"
         );
 
-        ProviderTurnRequest::new(
-            model.into(),
-            std::iter::once(ProviderMessage::new(
-                ProviderMessageRole::System,
-                system_prompt,
-            ))
-            .chain(selected.into_iter().map(to_provider_message))
-            .collect(),
-            stream,
+        let sandbox_root = std::fs::canonicalize(&session.metadata.cwd).ok();
+
+        let messages: Vec<ProviderMessage> = std::iter::once(ProviderMessage::new(
+            ProviderMessageRole::System,
+            system_prompt,
+        ))
+        .chain(
+            selected
+                .into_iter()
+                .map(|sm| to_provider_message_with_images(sm, sandbox_root.as_deref())),
         )
+        .collect();
+
+        ProviderTurnRequest::new(model.into(), messages, stream)
     }
 
     pub fn run_turn<C: ProviderClient>(
@@ -344,14 +353,62 @@ fn loose_unescape(value: &str) -> String {
         .replace("\\\\", "\\")
 }
 
-fn to_provider_message(message: &crate::session::SessionMessage) -> ProviderMessage {
+/// Resolve image paths to base64-encoded [`ImageContent`] values.
+///
+/// Each path is canonicalized and checked against `sandbox_root` to prevent
+/// path-traversal attacks.  On error (file missing, outside sandbox) the
+/// caller is expected to log and skip.
+fn resolve_image_content(
+    image_paths: &[String],
+    sandbox_root: &Path,
+) -> Result<Vec<ImageContent>, std::io::Error> {
+    image_paths
+        .iter()
+        .map(|path| {
+            let canonical = std::fs::canonicalize(path)?;
+            if !canonical.starts_with(sandbox_root) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("image path outside sandbox: {}", path),
+                ));
+            }
+            let data = std::fs::read(&canonical)?;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+            let mime_type = detect_image_mime(&canonical)
+                .unwrap_or("application/octet-stream")
+                .to_string();
+            Ok(ImageContent {
+                base64: b64,
+                mime_type,
+            })
+        })
+        .collect()
+}
+
+/// Convert a session message to a provider message, optionally resolving
+/// attached image paths into base64-encoded [`ImageContent`].
+fn to_provider_message_with_images(
+    message: &crate::session::SessionMessage,
+    sandbox_root: Option<&Path>,
+) -> ProviderMessage {
     let role = match message.role {
         MessageRole::System => ProviderMessageRole::System,
         MessageRole::User => ProviderMessageRole::User,
         MessageRole::Assistant => ProviderMessageRole::Assistant,
         MessageRole::Tool => ProviderMessageRole::Tool,
     };
-    ProviderMessage::new(role, message.content.clone())
+    let mut msg = ProviderMessage::new(role, message.content.clone());
+    if let Some(ref paths) = message.image_paths
+        && let Some(root) = sandbox_root
+    {
+        match resolve_image_content(paths, root) {
+            Ok(images) => msg.images = Some(images),
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to resolve image content, sending without images");
+            }
+        }
+    }
+    msg
 }
 
 fn derive_context_budget(context_window: u32) -> usize {
@@ -371,7 +428,10 @@ fn derive_context_budget(context_window: u32) -> usize {
     budget
 }
 
-pub fn tool_protocol_system_prompt(languages: &[ProjectLanguage]) -> String {
+pub fn tool_protocol_system_prompt(
+    languages: &[ProjectLanguage],
+    mcp_tool_descriptions: Option<&str>,
+) -> String {
     let base = concat!(
         "You are Anvil, a local coding agent for serious terminal work.\n",
         "\n",
@@ -388,7 +448,7 @@ pub fn tool_protocol_system_prompt(languages: &[ProjectLanguage]) -> String {
         "\n",
         "Available tools:\n",
         "\n",
-        "1. file.read — read a file or list a directory:\n",
+        "1. file.read — read a file or list a directory (also supports image files: PNG/JPG/JPEG/GIF/WebP, max 20MB):\n",
         "```ANVIL_TOOL\n",
         "{\"id\":\"call_001\",\"tool\":\"file.read\",\"path\":\"./relative/path\"}\n",
         "```\n",
@@ -448,6 +508,13 @@ pub fn tool_protocol_system_prompt(languages: &[ProjectLanguage]) -> String {
         "- GitHub stats endpoints (contributors, commit_activity) may return {} on first request. If you get an empty response, wait 3 seconds with shell.exec sleep 3 and retry the same API call."
     );
     let mut prompt = base.to_string();
+
+    // MCPツール説明を動的追加
+    // [D4-010] mcp_tool_descriptions is sanitized by generate_mcp_tool_descriptions()
+    if let Some(mcp_desc) = mcp_tool_descriptions {
+        prompt.push_str("\n\n## MCP External Tools\n\n");
+        prompt.push_str(mcp_desc);
+    }
 
     // Always include: Git operations guide
     prompt.push_str(concat!(
@@ -558,4 +625,63 @@ fn extract_final_block_lenient(content: &str, label: &str) -> Option<String> {
     // Strip a trailing ``` if present (model may close without preceding newline)
     let tail = tail.strip_suffix("```").unwrap_or(tail).trim_end();
     Some(tail.to_string())
+}
+
+// --- MCP tool description generation ---
+
+use crate::mcp::McpToolInfo;
+use std::collections::HashMap;
+
+/// Maximum characters for MCP tool descriptions in the system prompt.
+/// [D3-009] Prevents system prompt bloat that compresses message budget.
+const MAX_MCP_PROMPT_CHARS: usize = 8000;
+
+/// Maximum characters per individual tool description.
+const MAX_TOOL_DESC_CHARS: usize = 500;
+
+/// Generate MCP tool descriptions for inclusion in the system prompt.
+///
+/// [D4-010] Sanitizes descriptions to remove ANVIL_TOOL/ANVIL_FINAL markers.
+/// [D3-009] Falls back to tool-name-only list if total exceeds MAX_MCP_PROMPT_CHARS.
+pub fn generate_mcp_tool_descriptions(tools: &HashMap<String, Vec<McpToolInfo>>) -> String {
+    let mut full_descriptions = String::new();
+
+    for (server_name, tool_list) in tools {
+        for tool_info in tool_list {
+            let mcp_name = format!("mcp__{server_name}__{}", tool_info.name);
+
+            // [D4-010] Sanitize description: remove ANVIL_TOOL/ANVIL_FINAL markers
+            let (mut desc, _) = crate::config::sanitize_markers(&tool_info.description);
+
+            // Truncate per-tool description
+            if desc.chars().count() > MAX_TOOL_DESC_CHARS {
+                desc = desc.chars().take(MAX_TOOL_DESC_CHARS).collect::<String>();
+                desc.push_str("...");
+            }
+
+            let schema_str = serde_json::to_string(&tool_info.input_schema).unwrap_or_default();
+
+            full_descriptions.push_str(&format!(
+                "- **{mcp_name}**: {desc}\n  Input schema: {schema_str}\n  Usage:\n  ```ANVIL_TOOL\n  {{\"id\":\"call_mcp\",\"tool\":\"{mcp_name}\",... }}\n  ```\n\n"
+            ));
+        }
+    }
+
+    // [D3-009] Check total size and fall back to name-only list if too large
+    if full_descriptions.chars().count() > MAX_MCP_PROMPT_CHARS {
+        eprintln!(
+            "Warning: MCP tool descriptions exceed {} characters, falling back to tool-name-only list.",
+            MAX_MCP_PROMPT_CHARS
+        );
+        let mut fallback = String::from("Available MCP tools (use ANVIL_TOOL blocks to call):\n");
+        for (server_name, tool_list) in tools {
+            for tool_info in tool_list {
+                let mcp_name = format!("mcp__{server_name}__{}", tool_info.name);
+                fallback.push_str(&format!("- {mcp_name}\n"));
+            }
+        }
+        return fallback;
+    }
+
+    full_descriptions
 }

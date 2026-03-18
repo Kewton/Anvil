@@ -5,7 +5,9 @@
 
 use crate::agent::PendingTurnState;
 use crate::config::EffectiveConfig;
-use crate::contracts::tokens::{ContentKind, estimate_tokens as contracts_estimate_tokens};
+use crate::contracts::tokens::{
+    ContentKind, IMAGE_TOKENS, estimate_tokens as contracts_estimate_tokens,
+};
 use crate::contracts::{
     AppEvent, AppStateSnapshot, ConsoleMessageRole, ConsoleMessageView, ConsoleRenderContext,
 };
@@ -44,6 +46,8 @@ pub struct SessionMessage {
     /// Added for non-interactive mode exit code determination.
     #[serde(default)]
     pub is_error: bool,
+    #[serde(default)]
+    pub image_paths: Option<Vec<String>>,
 }
 
 impl SessionMessage {
@@ -56,6 +60,7 @@ impl SessionMessage {
             status: MessageStatus::Committed,
             tool_call_id: None,
             is_error: false,
+            image_paths: None,
         }
     }
 
@@ -71,6 +76,11 @@ impl SessionMessage {
 
     pub fn with_tool_call_id(mut self, tool_call_id: impl Into<String>) -> Self {
         self.tool_call_id = Some(tool_call_id.into());
+        self
+    }
+
+    pub fn with_image_paths(mut self, paths: Vec<String>) -> Self {
+        self.image_paths = Some(paths);
         self
     }
 }
@@ -137,7 +147,11 @@ impl SessionRecord {
     pub fn push_message(&mut self, message: SessionMessage) {
         // Update cached token count incrementally
         let kind = ContentKind::from_message_role(message.role);
-        let msg_tokens = contracts_estimate_tokens(&message.content, kind);
+        let mut msg_tokens = contracts_estimate_tokens(&message.content, kind);
+        // Add fixed 300 tokens per image
+        if let Some(ref paths) = message.image_paths {
+            msg_tokens += IMAGE_TOKENS * paths.len();
+        }
         if let Some(cached) = self.cached_token_count.get() {
             self.cached_token_count.set(Some(cached + msg_tokens));
         }
@@ -267,7 +281,11 @@ impl SessionRecord {
             .iter()
             .map(|message| {
                 let kind = ContentKind::from_message_role(message.role);
-                contracts_estimate_tokens(&message.content, kind)
+                let mut tokens = contracts_estimate_tokens(&message.content, kind);
+                if let Some(ref paths) = message.image_paths {
+                    tokens += IMAGE_TOKENS * paths.len();
+                }
+                tokens
             })
             .sum();
         self.cached_token_count.set(Some(count));

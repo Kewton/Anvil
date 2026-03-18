@@ -382,7 +382,28 @@ impl App {
     }
 
     /// Phase 3 helper: execute a single tool request.
+    ///
+    /// [D2-008] MCP tools are dispatched here before reaching LocalToolExecutor.
+    /// MCP tools have ExecutionMode::SequentialOnly so they never enter
+    /// execute_parallel_group_standalone().
     fn execute_single(&mut self, request: ToolExecutionRequest) -> ToolExecutionResult {
+        // [D2-008] MCP tool branch -- dispatch via McpManager directly
+        if let crate::tooling::ToolInput::Mcp {
+            ref server,
+            ref tool,
+            ref arguments,
+        } = request.input
+        {
+            return self.execute_mcp_tool(
+                request.tool_call_id.clone(),
+                request.spec.name.clone(),
+                server,
+                tool,
+                arguments.clone(),
+            );
+        }
+
+        // Built-in tools: delegate to LocalToolExecutor
         let mut executor =
             LocalToolExecutor::new(self.config.paths.cwd.clone(), &self.config.runtime)
                 .with_shutdown_flag(self.shutdown_flag());
@@ -398,6 +419,52 @@ impl App {
                 artifacts: Vec::new(),
                 elapsed_ms: 0,
             })
+    }
+
+    /// Execute an MCP tool call via the McpManager.
+    fn execute_mcp_tool(
+        &mut self,
+        tool_call_id: String,
+        tool_name: String,
+        server: &str,
+        tool: &str,
+        arguments: serde_json::Value,
+    ) -> ToolExecutionResult {
+        let Some(ref mut manager) = self.mcp_manager else {
+            return ToolExecutionResult {
+                tool_call_id,
+                tool_name,
+                status: ToolExecutionStatus::Failed,
+                summary: "MCP manager not available".to_string(),
+                payload: ToolExecutionPayload::None,
+                artifacts: Vec::new(),
+                elapsed_ms: 0,
+            };
+        };
+
+        let started = std::time::Instant::now();
+        let (status, summary, payload) = match manager.call_tool(server, tool, arguments) {
+            Ok(result) => (
+                ToolExecutionStatus::Completed,
+                "MCP tool call succeeded".to_string(),
+                ToolExecutionPayload::Text(result),
+            ),
+            Err(e) => (
+                ToolExecutionStatus::Failed,
+                format!("{e}"),
+                ToolExecutionPayload::Text(format!("{e:?}")),
+            ),
+        };
+
+        ToolExecutionResult {
+            tool_call_id,
+            tool_name,
+            status,
+            summary,
+            payload,
+            artifacts: Vec::new(),
+            elapsed_ms: started.elapsed().as_millis(),
+        }
     }
 
     pub(crate) fn execute_structured_tool_calls(
@@ -461,6 +528,12 @@ impl App {
         )
         .with_id(self.next_message_id("tool"));
         msg.is_error = is_error;
+
+        // Attach image paths for Image payloads so the agent layer can
+        // resolve them to base64 when building the provider request.
+        if let ToolExecutionPayload::Image { source_path, .. } = &result.payload {
+            msg = msg.with_image_paths(vec![source_path.clone()]);
+        }
         self.session.push_message(msg);
     }
 
@@ -518,6 +591,9 @@ pub(crate) fn infer_plan_from_structured_response(
             crate::tooling::ToolInput::WebSearch { query } => {
                 format!("web search: {query}")
             }
+            crate::tooling::ToolInput::Mcp { server, tool, .. } => {
+                format!("mcp call {server}/{tool}")
+            }
         };
         plan.push(item);
     }
@@ -529,7 +605,7 @@ pub(crate) fn infer_plan_from_structured_response(
 ///
 /// Includes the actual payload (file content, search matches) so the LLM
 /// can reason about the results in subsequent turns.
-pub(crate) fn format_tool_result_message(result: &ToolExecutionResult, max_chars: usize) -> String {
+pub fn format_tool_result_message(result: &ToolExecutionResult, max_chars: usize) -> String {
     match &result.payload {
         ToolExecutionPayload::None => {
             format!("[tool result: {}] {}", result.tool_name, result.summary)
@@ -557,6 +633,12 @@ pub(crate) fn format_tool_result_message(result: &ToolExecutionResult, max_chars
                 result.summary,
                 paths.len(),
                 listing
+            )
+        }
+        ToolExecutionPayload::Image { source_path, .. } => {
+            format!(
+                "[tool result: {}] [画像: {}]",
+                result.tool_name, source_path
             )
         }
     }
@@ -595,6 +677,22 @@ fn tool_call_approval_summary(call: &crate::tooling::ToolCallRequest) -> String 
         }
         crate::tooling::ToolInput::WebSearch { query } => {
             format!("Web search: {query}")
+        }
+        crate::tooling::ToolInput::Mcp {
+            server,
+            tool,
+            arguments,
+        } => {
+            let args_preview = {
+                let formatted = serde_json::to_string_pretty(arguments)
+                    .unwrap_or_else(|_| arguments.to_string());
+                if formatted.len() > 500 {
+                    format!("{}...(truncated)", &formatted[..500])
+                } else {
+                    formatted
+                }
+            };
+            format!("MCP {server}/{tool}\n  arguments: {args_preview}")
         }
         _ => call.tool_name.clone(),
     }

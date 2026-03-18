@@ -423,6 +423,7 @@ fn ollama_provider_builds_chat_request_shape() {
         vec![OllamaChatMessage {
             role: "user".to_string(),
             content: "inspect src/provider".to_string(),
+            images: None,
         }]
     );
 }
@@ -648,7 +649,7 @@ fn basic_agent_loop_applies_context_shaping_limit() {
         .expect("persist");
     app.record_user_input("msg_005", "u3").expect("persist");
 
-    let system_prompt = anvil::agent::tool_protocol_system_prompt(&[]);
+    let system_prompt = anvil::agent::tool_protocol_system_prompt(&[], None);
     let request = anvil::agent::BasicAgentLoop::build_turn_request_with_limit(
         "local-default",
         app.session(),
@@ -675,7 +676,7 @@ fn basic_agent_loop_derives_context_budget_from_context_window() {
             .expect("persist");
     }
 
-    let system_prompt = anvil::agent::tool_protocol_system_prompt(&[]);
+    let system_prompt = anvil::agent::tool_protocol_system_prompt(&[], None);
     let small = anvil::agent::BasicAgentLoop::build_turn_request(
         "local-default",
         app.session(),
@@ -1493,7 +1494,7 @@ fn structured_response_parser_repairs_web_fetch_block() {
 #[test]
 fn system_prompt_includes_web_fetch_tool() {
     let session = anvil::session::SessionRecord::new(std::path::PathBuf::from("/tmp"));
-    let system_prompt = anvil::agent::tool_protocol_system_prompt(&[]);
+    let system_prompt = anvil::agent::tool_protocol_system_prompt(&[], None);
     let request = anvil::agent::BasicAgentLoop::build_turn_request(
         "test-model",
         &session,
@@ -1575,7 +1576,7 @@ fn structured_response_parser_repairs_web_search_block() {
 #[test]
 fn system_prompt_includes_web_search_tool() {
     let session = anvil::session::SessionRecord::new(std::path::PathBuf::from("/tmp"));
-    let system_prompt = anvil::agent::tool_protocol_system_prompt(&[]);
+    let system_prompt = anvil::agent::tool_protocol_system_prompt(&[], None);
     let request = anvil::agent::BasicAgentLoop::build_turn_request(
         "test-model",
         &session,
@@ -1592,7 +1593,7 @@ fn system_prompt_includes_web_search_tool() {
 #[test]
 fn system_prompt_includes_github_insights() {
     let session = anvil::session::SessionRecord::new(std::path::PathBuf::from("/tmp"));
-    let system_prompt = anvil::agent::tool_protocol_system_prompt(&[]);
+    let system_prompt = anvil::agent::tool_protocol_system_prompt(&[], None);
     let request = anvil::agent::BasicAgentLoop::build_turn_request(
         "test-model",
         &session,
@@ -1655,7 +1656,7 @@ fn detect_both_rust_and_nodejs() {
 #[test]
 fn system_prompt_rust_includes_git_and_cargo() {
     use anvil::agent::ProjectLanguage;
-    let prompt = anvil::agent::tool_protocol_system_prompt(&[ProjectLanguage::Rust]);
+    let prompt = anvil::agent::tool_protocol_system_prompt(&[ProjectLanguage::Rust], None);
     assert!(
         prompt.contains("Git operations"),
         "should contain Git operations guide"
@@ -1669,7 +1670,7 @@ fn system_prompt_rust_includes_git_and_cargo() {
 #[test]
 fn system_prompt_nodejs_includes_git_and_npm_but_not_cargo() {
     use anvil::agent::ProjectLanguage;
-    let prompt = anvil::agent::tool_protocol_system_prompt(&[ProjectLanguage::NodeJs]);
+    let prompt = anvil::agent::tool_protocol_system_prompt(&[ProjectLanguage::NodeJs], None);
     assert!(
         prompt.contains("Git operations"),
         "should contain Git operations guide"
@@ -1683,7 +1684,7 @@ fn system_prompt_nodejs_includes_git_and_npm_but_not_cargo() {
 
 #[test]
 fn system_prompt_empty_has_git_only() {
-    let prompt = anvil::agent::tool_protocol_system_prompt(&[]);
+    let prompt = anvil::agent::tool_protocol_system_prompt(&[], None);
     assert!(
         prompt.contains("Git operations"),
         "should contain Git operations guide"
@@ -1698,10 +1699,10 @@ fn system_prompt_empty_has_git_only() {
 #[test]
 fn system_prompt_both_languages_includes_both() {
     use anvil::agent::ProjectLanguage;
-    let prompt = anvil::agent::tool_protocol_system_prompt(&[
-        ProjectLanguage::Rust,
-        ProjectLanguage::NodeJs,
-    ]);
+    let prompt = anvil::agent::tool_protocol_system_prompt(
+        &[ProjectLanguage::Rust, ProjectLanguage::NodeJs],
+        None,
+    );
     assert!(prompt.contains("cargo build"), "should contain cargo guide");
     assert!(prompt.contains("npm"), "should contain npm guide");
 }
@@ -1709,7 +1710,7 @@ fn system_prompt_both_languages_includes_both() {
 #[test]
 fn system_prompt_includes_never_guide() {
     use anvil::agent::ProjectLanguage;
-    let prompt = anvil::agent::tool_protocol_system_prompt(&[ProjectLanguage::Rust]);
+    let prompt = anvil::agent::tool_protocol_system_prompt(&[ProjectLanguage::Rust], None);
     assert!(
         prompt.contains("NEVER"),
         "should contain NEVER guide for dangerous operations"
@@ -1749,7 +1750,7 @@ fn file_edit_anvil_tool_block_parses() {
 #[test]
 fn system_prompt_includes_file_edit_tool() {
     let session = anvil::session::SessionRecord::new(std::path::PathBuf::from("/tmp"));
-    let system_prompt = anvil::agent::tool_protocol_system_prompt(&[]);
+    let system_prompt = anvil::agent::tool_protocol_system_prompt(&[], None);
     let request = anvil::agent::BasicAgentLoop::build_turn_request(
         "test-model",
         &session,
@@ -1769,7 +1770,7 @@ fn system_prompt_includes_file_edit_tool() {
 fn system_prompt_includes_project_instructions() {
     let session = anvil::session::SessionRecord::new(std::path::PathBuf::from("/tmp"));
     let instructions = "Always use snake_case for function names.";
-    let base_prompt = anvil::agent::tool_protocol_system_prompt(&[]);
+    let base_prompt = anvil::agent::tool_protocol_system_prompt(&[], None);
     let system_prompt = format!(
         "{}\n\n## Project instructions (from ANVIL.md)\n{}",
         base_prompt, instructions
@@ -1801,7 +1802,7 @@ fn system_prompt_includes_project_instructions() {
 #[test]
 fn system_prompt_without_project_instructions() {
     let session = anvil::session::SessionRecord::new(std::path::PathBuf::from("/tmp"));
-    let system_prompt = anvil::agent::tool_protocol_system_prompt(&[]);
+    let system_prompt = anvil::agent::tool_protocol_system_prompt(&[], None);
     let request = anvil::agent::BasicAgentLoop::build_turn_request(
         "test-model",
         &session,
@@ -1831,7 +1832,7 @@ fn build_turn_request_with_limit_includes_system_prompt() {
     app.record_user_input("msg_003", "u2").expect("persist");
 
     let instructions = "Test project instructions.";
-    let base_prompt = anvil::agent::tool_protocol_system_prompt(&[]);
+    let base_prompt = anvil::agent::tool_protocol_system_prompt(&[], None);
     let system_prompt = format!(
         "{}\n\n## Project instructions (from ANVIL.md)\n{}",
         base_prompt, instructions
@@ -2540,4 +2541,54 @@ fn openai_health_check_no_auth_no_guidance() {
     assert!(err_msg.contains("OpenAI互換プロバイダーに接続できません"));
     // No auth guidance when no api_key is set
     assert!(!err_msg.contains("認証情報の形式を確認してください"));
+}
+
+// -----------------------------------------------------------------------
+// Phase 5.1: Ollama image serialization tests
+// -----------------------------------------------------------------------
+
+#[test]
+fn ollama_chat_message_with_images_serializes_correctly() {
+    let msg = OllamaChatMessage {
+        role: "user".to_string(),
+        content: "describe this image".to_string(),
+        images: Some(vec!["aGVsbG8=".to_string()]),
+    };
+    let json = serde_json::to_value(&msg).unwrap();
+    assert_eq!(json["role"], "user");
+    assert_eq!(json["content"], "describe this image");
+    assert_eq!(json["images"][0], "aGVsbG8=");
+}
+
+#[test]
+fn ollama_chat_message_without_images_omits_images_key() {
+    let msg = OllamaChatMessage {
+        role: "user".to_string(),
+        content: "hello".to_string(),
+        images: None,
+    };
+    let json = serde_json::to_value(&msg).unwrap();
+    assert!(json.get("images").is_none());
+}
+
+#[test]
+fn ollama_build_chat_request_maps_provider_images() {
+    use anvil::provider::{ImageContent, ProviderMessage, ProviderTurnRequest};
+
+    let images = vec![ImageContent {
+        base64: "dGVzdA==".to_string(),
+        mime_type: "image/png".to_string(),
+    }];
+    let request = ProviderTurnRequest::new(
+        "llava".to_string(),
+        vec![ProviderMessage::new(ProviderMessageRole::User, "describe").with_images(images)],
+        false,
+    );
+    let ollama_req =
+        OllamaProviderClient::<anvil::provider::TcpHttpTransport>::build_chat_request(&request);
+    let first = &ollama_req.messages[0];
+    assert_eq!(
+        first.images.as_ref().unwrap(),
+        &vec!["dGVzdA==".to_string()]
+    );
 }

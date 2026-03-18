@@ -15,6 +15,22 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
+/// Maximum image file size in bytes (20 MB).
+const IMAGE_SIZE_LIMIT: u64 = 20 * 1024 * 1024;
+
+/// Detect the MIME type of an image file based on its extension.
+///
+/// Returns `None` for non-image extensions.
+pub fn detect_image_mime(path: &Path) -> Option<&'static str> {
+    match path.extension()?.to_str()?.to_lowercase().as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermissionClass {
     Safe,
@@ -58,6 +74,7 @@ pub enum ToolKind {
     ShellExec,
     WebFetch,
     WebSearch,
+    Mcp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,6 +104,11 @@ pub enum ToolInput {
     WebSearch {
         query: String,
     },
+    Mcp {
+        server: String,
+        tool: String,
+        arguments: serde_json::Value,
+    },
 }
 
 impl ToolInput {
@@ -99,6 +121,7 @@ impl ToolInput {
             Self::ShellExec { .. } => ToolKind::ShellExec,
             Self::WebFetch { .. } => ToolKind::WebFetch,
             Self::WebSearch { .. } => ToolKind::WebSearch,
+            Self::Mcp { .. } => ToolKind::Mcp,
         }
     }
 
@@ -185,7 +208,18 @@ impl ToolInput {
                     .ok_or_else(|| "missing query in web.search tool block".to_string())?
                     .to_string(),
             }),
-            other => Err(format!("unsupported tool in ANVIL_TOOL block: {other}")),
+            other => {
+                // mcp__<server>__<tool> pattern detection
+                if let Some((server, tool)) = parse_mcp_tool_name(other) {
+                    Ok(ToolInput::Mcp {
+                        server,
+                        tool,
+                        arguments: value.clone(),
+                    })
+                } else {
+                    Err(format!("unsupported tool in ANVIL_TOOL block: {other}"))
+                }
+            }
         }
     }
 
@@ -379,6 +413,10 @@ pub enum ToolExecutionPayload {
     None,
     Text(String),
     Paths(Vec<String>),
+    Image {
+        source_path: String,
+        mime_type: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -671,6 +709,7 @@ impl LocalToolExecutor {
                 self.execute_shell_exec(&request, command, started)
             }
             ToolInput::WebSearch { ref query } => self.execute_web_search(&request, query, started),
+            ToolInput::Mcp { .. } => unreachable!("MCP tools are dispatched in agentic.rs"),
         };
         tracing::info!(
             tool = %tool_name,
@@ -687,20 +726,68 @@ impl LocalToolExecutor {
         started: Instant,
     ) -> Result<ToolExecutionResult, ToolRuntimeError> {
         let resolved = self.resolve_path(path)?;
-        let content = if resolved.is_dir() {
-            render_directory_listing(&resolved)?
-        } else {
-            fs::read_to_string(&resolved).map_err(|err| {
-                ToolRuntimeError::Io(format!(
-                    "file.read failed for {}: {err}",
-                    resolved.display()
-                ))
-            })?
-        };
+        if resolved.is_dir() {
+            let content = render_directory_listing(&resolved)?;
+            return Ok(build_completed_result(
+                request,
+                path.to_string(),
+                ToolExecutionPayload::Text(content),
+                vec![resolved.display().to_string()],
+                started,
+            ));
+        }
+        // Check if the file is an image based on extension
+        if let Some(mime_type) = detect_image_mime(&resolved) {
+            return self.execute_image_read(request, path, &resolved, mime_type, started);
+        }
+        let content = fs::read_to_string(&resolved).map_err(|err| {
+            ToolRuntimeError::Io(format!(
+                "file.read failed for {}: {err}",
+                resolved.display()
+            ))
+        })?;
         Ok(build_completed_result(
             request,
             path.to_string(),
             ToolExecutionPayload::Text(content),
+            vec![resolved.display().to_string()],
+            started,
+        ))
+    }
+
+    fn execute_image_read(
+        &self,
+        request: &ToolExecutionRequest,
+        path: &str,
+        resolved: &Path,
+        mime_type: &str,
+        started: Instant,
+    ) -> Result<ToolExecutionResult, ToolRuntimeError> {
+        let metadata = fs::metadata(resolved).map_err(|err| {
+            ToolRuntimeError::Io(format!(
+                "file.read failed for {}: {err}",
+                resolved.display()
+            ))
+        })?;
+        if metadata.len() > IMAGE_SIZE_LIMIT {
+            return Ok(build_completed_result(
+                request,
+                path.to_string(),
+                ToolExecutionPayload::Text(format!(
+                    "ファイルサイズが上限(20MB)を超えています: {} bytes",
+                    metadata.len()
+                )),
+                vec![resolved.display().to_string()],
+                started,
+            ));
+        }
+        Ok(build_completed_result(
+            request,
+            path.to_string(),
+            ToolExecutionPayload::Image {
+                source_path: resolved.display().to_string(),
+                mime_type: mime_type.to_string(),
+            },
             vec![resolved.display().to_string()],
             started,
         ))
@@ -1311,6 +1398,8 @@ fn validate_required_fields(input: &ToolInput) -> Result<(), ToolValidationError
                 });
             }
         }
+        // [D3-001] MCP tool input validation is handled by the MCP server side
+        ToolInput::Mcp { .. } => {}
     }
 
     Ok(())
@@ -1526,10 +1615,23 @@ pub fn is_safe_shell_command(command: &str) -> bool {
 ///
 /// Safe shell commands (as determined by [`is_safe_shell_command`]) are
 /// promoted from `Confirm` to `Safe`, skipping the approval prompt.
+/// All other tools (including MCP) use their spec's permission class directly.
 pub fn effective_permission_class(input: &ToolInput, spec: &ToolSpec) -> PermissionClass {
     match input {
         ToolInput::ShellExec { command } if is_safe_shell_command(command) => PermissionClass::Safe,
         _ => spec.permission_class,
+    }
+}
+
+/// Parse an MCP tool name: "mcp__github__create_issue" → ("github", "create_issue").
+///
+/// Returns `None` if the name does not follow the `mcp__<server>__<tool>` convention.
+pub fn parse_mcp_tool_name(name: &str) -> Option<(String, String)> {
+    let parts: Vec<&str> = name.splitn(3, "__").collect();
+    if parts.len() == 3 && parts[0] == "mcp" && !parts[1].is_empty() && !parts[2].is_empty() {
+        Some((parts[1].to_string(), parts[2].to_string()))
+    } else {
+        None
     }
 }
 
