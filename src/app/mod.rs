@@ -217,7 +217,8 @@ impl App {
             .last_snapshot
             .clone()
             .unwrap_or_else(|| AppStateSnapshot::new(RuntimeState::Ready));
-        let extensions = ExtensionRegistry::load(&config.paths.cwd)?;
+        let home_dir = std::env::var("HOME").ok().map(std::path::PathBuf::from);
+        let extensions = ExtensionRegistry::load(&config.paths.cwd, home_dir.as_deref())?;
         session.auto_compact_threshold = config.runtime.auto_compact_threshold;
 
         // --- MCP initialization (Task 3.2) ---
@@ -960,7 +961,17 @@ impl App {
             return self.handle_slash_command(trimmed, provider_client, tui);
         }
 
-        match self.run_live_turn(trimmed, provider_client, tui) {
+        self.run_turn_to_output(trimmed, provider_client, tui)
+    }
+
+    /// Run a live turn and wrap the result into a `CliTurnOutput`.
+    fn run_turn_to_output<C: ProviderClient>(
+        &mut self,
+        prompt: impl Into<String>,
+        provider_client: &C,
+        tui: &Tui,
+    ) -> Result<CliTurnOutput, AppError> {
+        match self.run_live_turn(prompt, provider_client, tui) {
             Ok(frames) => Ok(CliTurnOutput {
                 frames,
                 control: SessionControl::Continue,
@@ -1073,19 +1084,17 @@ impl App {
                 control: SessionControl::Exit,
             },
             Some(SlashCommandAction::Prompt(prompt)) => {
-                match self.run_live_turn(prompt, provider_client, tui) {
-                    Ok(frames) => CliTurnOutput {
-                        frames,
-                        control: SessionControl::Continue,
-                    },
-                    Err(AppError::PendingApprovalRequired) => CliTurnOutput {
-                        frames: vec![render::render_pending_approval_frame(
-                            self.state_machine.snapshot(),
-                        )],
-                        control: SessionControl::Continue,
-                    },
-                    Err(err) => return Err(err),
-                }
+                self.run_turn_to_output(prompt, provider_client, tui)?
+            }
+            Some(SlashCommandAction::Skill {
+                args,
+                content,
+                skill_dir,
+                ..
+            }) => {
+                let prompt =
+                    crate::extensions::skills::expand_variables(&content, &args, &skill_dir);
+                self.run_turn_to_output(prompt, provider_client, tui)?
             }
             _ => {
                 let suggestion = self.extensions.suggest_command(command);

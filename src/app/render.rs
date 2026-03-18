@@ -5,6 +5,7 @@
 
 use crate::config::EffectiveConfig;
 use crate::contracts::{AppStateSnapshot, ToolLogView};
+use crate::extensions::skills::SkillScope;
 use crate::extensions::{ExtensionRegistry, SlashCommandSpec, builtin_slash_commands};
 use crate::tooling::{ToolExecutionPayload, ToolExecutionResult, ToolExecutionStatus};
 
@@ -31,8 +32,18 @@ pub fn render_help_frame() -> String {
 
 pub fn render_help_frame_for(commands: &[SlashCommandSpec]) -> String {
     let mut lines = vec!["Anvil slash commands".to_string(), String::new()];
+    let max_name_len = commands.iter().map(|s| s.name.len()).max().unwrap_or(10);
+    let width = max_name_len.max(10);
     for spec in commands {
-        lines.push(format!("{:<10} {}", spec.name, spec.description));
+        let scope_tag = match &spec.scope {
+            Some(SkillScope::User) => " [user]",
+            Some(SkillScope::Project) => " [project]",
+            None => "",
+        };
+        lines.push(format!(
+            "{:<width$} {}{}",
+            spec.name, spec.description, scope_tag
+        ));
     }
     lines.join("\n")
 }
