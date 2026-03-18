@@ -1073,4 +1073,4 @@ fn standard_tool_registry() -> ToolRegistry {
 }
 
 // Re-export CLI entry points from the cli module.
-pub use cli::{run, run_session_loop};
+pub use cli::{run, run_session_loop, run_with_args};
