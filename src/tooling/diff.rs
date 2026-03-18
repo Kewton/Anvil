@@ -34,6 +34,8 @@ pub fn generate_diff_preview(workspace_root: &Path, tool_input: &ToolInput) -> O
             new_string,
             ..
         } => generate_file_edit_diff(old_string, new_string),
+        // MCP tools do not have diff previews
+        ToolInput::Mcp { .. } => None,
         _ => None,
     }
 }
