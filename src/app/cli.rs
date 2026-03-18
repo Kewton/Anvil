@@ -3,7 +3,7 @@
 //! Contains the `run_session_loop` and `run_interactive_loop` functions
 //! that drive the interactive CLI experience.
 
-use crate::config::EffectiveConfig;
+use crate::config::{CliArgs, EffectiveConfig};
 use crate::logging::{LogGuard, init_tracing};
 use crate::provider::{ProviderClient, ProviderRuntimeContext, build_local_provider_client};
 use crate::session::SessionError;
@@ -77,13 +77,23 @@ fn setup_shutdown_handler(interactive: bool) -> Arc<AtomicBool> {
     shutdown_flag
 }
 
-/// Application entry point.
+/// Production entry point: parse pre-built CLI args into config, then run.
+pub fn run_with_args(cli: &CliArgs) -> Result<(), AppError> {
+    let config = EffectiveConfig::load_with_args(cli)?;
+    run_with_config(config)
+}
+
+/// Test-compatible entry point (no CliArgs required).
 ///
-/// Uses `rustyline` for interactive input, providing cursor movement,
-/// line editing, and input history.
+/// Uses `EffectiveConfig::load()` which falls back gracefully when
+/// `std::env::args()` contains test-harness arguments.
 pub fn run() -> Result<(), AppError> {
     let config = EffectiveConfig::load()?;
+    run_with_config(config)
+}
 
+/// Common startup logic shared by `run_with_args` and `run`.
+fn run_with_config(config: EffectiveConfig) -> Result<(), AppError> {
     let _guard: Option<LogGuard> = init_tracing(
         config.mode.log_filter.as_deref(),
         config.mode.debug_logging,
