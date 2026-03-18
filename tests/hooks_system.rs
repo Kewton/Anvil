@@ -208,6 +208,7 @@ fn hook_runner_execute_block_via_json_stdout() {
         writeln!(f, "#!/bin/sh").unwrap();
         writeln!(f, "echo 'blocked by security policy'").unwrap();
         writeln!(f, "exit 2").unwrap();
+        f.sync_all().unwrap();
     }
     #[cfg(unix)]
     {
@@ -243,6 +244,7 @@ fn hook_runner_execute_block_via_json() {
         )
         .unwrap();
         writeln!(f, "exit 0").unwrap();
+        f.sync_all().unwrap();
     }
     #[cfg(unix)]
     {
@@ -377,6 +379,7 @@ fn hook_runner_stdin_receives_json() {
         let mut f = std::fs::File::create(&script_path).unwrap();
         writeln!(f, "#!/bin/sh").unwrap();
         writeln!(f, "cat > {}", output_file.display()).unwrap();
+        f.sync_all().unwrap();
     }
     #[cfg(unix)]
     {
@@ -752,6 +755,7 @@ fn create_block_script(dir: &std::path::Path) -> PathBuf {
         writeln!(f, "#!/bin/sh").unwrap();
         writeln!(f, "echo 'blocked by hook'").unwrap();
         writeln!(f, "exit 2").unwrap();
+        f.sync_all().unwrap();
     }
     #[cfg(unix)]
     {
