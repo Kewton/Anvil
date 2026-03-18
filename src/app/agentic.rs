@@ -319,7 +319,8 @@ impl App {
                 saved_status.to_string(),
             )
             .with_elapsed_ms(elapsed_ms);
-        let _ = self.transition_with_context(done, StateTransition::Finish)?;
+        let mut done_snapshot = self.transition_with_context(done, StateTransition::Finish)?;
+        self.evaluate_context_warning(&mut done_snapshot);
         frames.push(self.render_console(tui)?);
         Ok(frames)
     }
