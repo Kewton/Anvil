@@ -4,6 +4,8 @@
 //! through a permission and plan-mode pipeline, and executed by
 //! [`LocalToolExecutor`] within a sandboxed workspace root.
 
+pub mod diff;
+
 use crate::config::{RuntimeConfig, WebSearchProvider};
 use crate::contracts::ToolLogView;
 use serde::{Deserialize, Serialize};
@@ -1126,35 +1128,45 @@ impl LocalToolExecutor {
     }
 
     fn resolve_path(&self, raw: &str) -> Result<PathBuf, ToolRuntimeError> {
-        let candidate = Path::new(raw);
-        if candidate.is_absolute() {
-            return Err(ToolRuntimeError::InvalidPath(raw.to_string()));
-        }
-        if candidate
-            .components()
-            .any(|component| matches!(component, Component::ParentDir))
-        {
-            return Err(ToolRuntimeError::InvalidPath(raw.to_string()));
-        }
-        let joined = self.root.join(candidate);
-        // If the path exists, canonicalize to resolve symlinks and verify
-        // the result is still within the sandbox root.
-        if joined.exists() {
-            let canonical = fs::canonicalize(&joined).map_err(|err| {
-                ToolRuntimeError::Io(format!(
-                    "failed to resolve path {}: {err}",
-                    joined.display()
-                ))
-            })?;
-            let root_canonical = fs::canonicalize(&self.root).unwrap_or_else(|_| self.root.clone());
-            if !canonical.starts_with(&root_canonical) {
-                return Err(ToolRuntimeError::InvalidPath(format!(
-                    "{raw} resolves outside sandbox"
-                )));
-            }
-        }
-        Ok(joined)
+        resolve_sandbox_path(&self.root, raw)
     }
+}
+
+/// Resolve a relative path within a sandbox root directory.
+///
+/// Rejects absolute paths, parent-directory traversal (`..`), and symlinks
+/// that resolve outside the sandbox root.  This is the same logic used by
+/// [`LocalToolExecutor::resolve_path`], extracted as a pure function for
+/// reuse in diff preview generation.
+pub(crate) fn resolve_sandbox_path(root: &Path, raw: &str) -> Result<PathBuf, ToolRuntimeError> {
+    let candidate = Path::new(raw);
+    if candidate.is_absolute() {
+        return Err(ToolRuntimeError::InvalidPath(raw.to_string()));
+    }
+    if candidate
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(ToolRuntimeError::InvalidPath(raw.to_string()));
+    }
+    let joined = root.join(candidate);
+    // If the path exists, canonicalize to resolve symlinks and verify
+    // the result is still within the sandbox root.
+    if joined.exists() {
+        let canonical = fs::canonicalize(&joined).map_err(|err| {
+            ToolRuntimeError::Io(format!(
+                "failed to resolve path {}: {err}",
+                joined.display()
+            ))
+        })?;
+        let root_canonical = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        if !canonical.starts_with(&root_canonical) {
+            return Err(ToolRuntimeError::InvalidPath(format!(
+                "{raw} resolves outside sandbox"
+            )));
+        }
+    }
+    Ok(joined)
 }
 
 /// Build a [`ToolExecutionResult`] with `Completed` status.

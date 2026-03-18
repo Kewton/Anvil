@@ -111,6 +111,12 @@ impl Tui {
             lines.push(format!("  action : {}", approval.summary));
             lines.push(format!("  risk : {}", approval.risk));
             lines.push(format!("  call : {}", approval.tool_call_id));
+            if let Some(diff) = &approval.diff_preview {
+                lines.push("  diff :".to_string());
+                for diff_line in colorize_diff(diff).lines() {
+                    lines.push(format!("    {diff_line}"));
+                }
+            }
         }
 
         if let Some(interrupt) = &snapshot.interrupt {
@@ -240,6 +246,31 @@ fn render_hint_line(snapshot: &crate::contracts::AppStateSnapshot) -> String {
 
 fn status_divider() -> String {
     "--------------------------------------------------------------".to_string()
+}
+
+/// Apply ANSI colour codes to a plain-text diff string.
+///
+/// - Lines starting with `+` (but not `+++`) are coloured green.
+/// - Lines starting with `-` (but not `---`) are coloured red.
+/// - All other lines are left unmodified.
+pub fn colorize_diff(diff_text: &str) -> String {
+    const GREEN: &str = "\x1b[32m";
+    const RED: &str = "\x1b[31m";
+    const RESET: &str = "\x1b[0m";
+
+    diff_text
+        .lines()
+        .map(|line| {
+            if line.starts_with('+') && !line.starts_with("+++") {
+                format!("{GREEN}{line}{RESET}")
+            } else if line.starts_with('-') && !line.starts_with("---") {
+                format!("{RED}{line}{RESET}")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn summarize_tool_logs(logs: &[crate::contracts::ToolLogView]) -> (usize, usize, usize) {

@@ -12,6 +12,7 @@ use crate::spinner::Spinner;
 use crate::state::StateTransition;
 use crate::tooling::{
     LocalToolExecutor, ToolExecutionPayload, ToolExecutionPolicy, ToolExecutionResult,
+    diff::generate_diff_preview,
 };
 use crate::tui::Tui;
 
@@ -226,8 +227,9 @@ impl App {
             // Check if this tool needs approval in the current mode
             if self.config.mode.approval_required && validated.approval_required(true).is_some() {
                 let summary = tool_call_approval_summary(call);
+                let diff_preview = generate_diff_preview(&self.config.paths.cwd, &call.input);
                 // Ask user inline via stderr/stdin
-                let approved = prompt_inline_approval(&summary);
+                let approved = prompt_inline_approval(&summary, diff_preview.as_deref());
                 if !approved {
                     let denied_result = build_failed_result(call, "denied by user".to_string());
                     self.record_tool_result(&denied_result);
@@ -421,8 +423,11 @@ fn tool_call_approval_summary(call: &crate::tooling::ToolCallRequest) -> String 
 
 /// Prompt the user for inline approval via stderr/stdin.
 /// Returns `true` if the user approves, `false` otherwise.
-fn prompt_inline_approval(summary: &str) -> bool {
+fn prompt_inline_approval(summary: &str, diff_preview: Option<&str>) -> bool {
     use std::io::{BufRead, Write};
+    if let Some(diff) = diff_preview {
+        let _ = write!(std::io::stderr(), "\n{}\n", crate::tui::colorize_diff(diff));
+    }
     let _ = write!(std::io::stderr(), "\n  Allow {summary}? [y/n] ");
     let _ = std::io::stderr().flush();
     let mut input = String::new();
