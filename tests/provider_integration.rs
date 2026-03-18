@@ -423,6 +423,7 @@ fn ollama_provider_builds_chat_request_shape() {
         vec![OllamaChatMessage {
             role: "user".to_string(),
             content: "inspect src/provider".to_string(),
+            images: None,
         }]
     );
 }
@@ -2540,4 +2541,54 @@ fn openai_health_check_no_auth_no_guidance() {
     assert!(err_msg.contains("OpenAI互換プロバイダーに接続できません"));
     // No auth guidance when no api_key is set
     assert!(!err_msg.contains("認証情報の形式を確認してください"));
+}
+
+// -----------------------------------------------------------------------
+// Phase 5.1: Ollama image serialization tests
+// -----------------------------------------------------------------------
+
+#[test]
+fn ollama_chat_message_with_images_serializes_correctly() {
+    let msg = OllamaChatMessage {
+        role: "user".to_string(),
+        content: "describe this image".to_string(),
+        images: Some(vec!["aGVsbG8=".to_string()]),
+    };
+    let json = serde_json::to_value(&msg).unwrap();
+    assert_eq!(json["role"], "user");
+    assert_eq!(json["content"], "describe this image");
+    assert_eq!(json["images"][0], "aGVsbG8=");
+}
+
+#[test]
+fn ollama_chat_message_without_images_omits_images_key() {
+    let msg = OllamaChatMessage {
+        role: "user".to_string(),
+        content: "hello".to_string(),
+        images: None,
+    };
+    let json = serde_json::to_value(&msg).unwrap();
+    assert!(json.get("images").is_none());
+}
+
+#[test]
+fn ollama_build_chat_request_maps_provider_images() {
+    use anvil::provider::{ImageContent, ProviderMessage, ProviderTurnRequest};
+
+    let images = vec![ImageContent {
+        base64: "dGVzdA==".to_string(),
+        mime_type: "image/png".to_string(),
+    }];
+    let request = ProviderTurnRequest::new(
+        "llava".to_string(),
+        vec![ProviderMessage::new(ProviderMessageRole::User, "describe").with_images(images)],
+        false,
+    );
+    let ollama_req =
+        OllamaProviderClient::<anvil::provider::TcpHttpTransport>::build_chat_request(&request);
+    let first = &ollama_req.messages[0];
+    assert_eq!(
+        first.images.as_ref().unwrap(),
+        &vec!["dGVzdA==".to_string()]
+    );
 }

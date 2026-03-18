@@ -4,9 +4,12 @@
 //! OpenAI, Azure OpenAI, LM Studio, and other compatible servers.
 
 use super::transport::{CurlHttpTransport, HttpTransport, RetryTransport};
-use super::{AgentEvent, ProviderClient, ProviderEvent, ProviderTurnError, ProviderTurnRequest};
+use super::{
+    AgentEvent, ImageContent, ProviderClient, ProviderEvent, ProviderTurnError, ProviderTurnRequest,
+};
 use crate::config::EffectiveConfig;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// Client for OpenAI-compatible chat completion APIs.
 ///
@@ -24,10 +27,20 @@ struct OpenAiChatRequest {
     stream: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Request message: content is `Value` to support both plain text and
+/// multimodal (text + image_url) arrays.
+#[derive(Debug, Clone, Serialize)]
 struct OpenAiChatMessage {
     role: String,
-    content: String,
+    content: Value,
+}
+
+/// Response message: content is always a plain string from the API.
+#[derive(Debug, Clone, Deserialize)]
+struct OpenAiResponseMessage {
+    #[allow(dead_code)]
+    role: String,
+    content: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -56,7 +69,7 @@ struct OpenAiDeltaMessage {
 
 #[derive(Debug, Clone, Deserialize)]
 struct OpenAiChoice {
-    message: OpenAiChatMessage,
+    message: OpenAiResponseMessage,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -67,6 +80,32 @@ struct OpenAiErrorEnvelope {
 #[derive(Debug, Clone, Deserialize)]
 struct OpenAiErrorBody {
     message: String,
+}
+
+/// Build the `content` field for an OpenAI chat message.
+///
+/// When images are present, returns a JSON array containing a text part
+/// followed by `image_url` parts (base64 data URIs).  Otherwise returns
+/// a plain JSON string.
+fn build_openai_content(text: &str, images: Option<&[ImageContent]>) -> Value {
+    match images {
+        Some(imgs) if !imgs.is_empty() => {
+            let mut parts = vec![serde_json::json!({
+                "type": "text",
+                "text": text,
+            })];
+            for img in imgs {
+                parts.push(serde_json::json!({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": format!("data:{};base64,{}", img.mime_type, img.base64),
+                    },
+                }));
+            }
+            Value::Array(parts)
+        }
+        _ => Value::String(text.to_string()),
+    }
 }
 
 impl OpenAiCompatibleProviderClient {
@@ -147,7 +186,7 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
                         super::ProviderMessageRole::Assistant => "assistant".to_string(),
                         super::ProviderMessageRole::Tool => "tool".to_string(),
                     },
-                    content: m.content.clone(),
+                    content: build_openai_content(&m.content, m.images.as_deref()),
                 })
                 .collect(),
             stream: request.stream,
@@ -187,7 +226,7 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
         let content = parsed
             .choices
             .first()
-            .map(|choice| choice.message.content.clone())
+            .and_then(|choice| choice.message.content.clone())
             .ok_or_else(|| {
                 ProviderTurnError::Backend("openai response contained no choices".to_string())
             })?;
@@ -240,7 +279,7 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
                         super::ProviderMessageRole::Assistant => "assistant".to_string(),
                         super::ProviderMessageRole::Tool => "tool".to_string(),
                     },
-                    content: m.content.clone(),
+                    content: build_openai_content(&m.content, m.images.as_deref()),
                 })
                 .collect(),
             stream: true,
@@ -282,8 +321,9 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
                     // Not SSE — try as a regular OpenAI JSON response (fallback)
                     if let Ok(parsed) = serde_json::from_str::<OpenAiChatResponse>(trimmed) {
                         if let Some(choice) = parsed.choices.first() {
-                            content.push_str(&choice.message.content);
-                            emit(ProviderEvent::TokenDelta(choice.message.content.clone()));
+                            let msg_content = choice.message.content.clone().unwrap_or_default();
+                            content.push_str(&msg_content);
+                            emit(ProviderEvent::TokenDelta(msg_content));
                             emit(ProviderEvent::Agent(AgentEvent::Done {
                                 status: "Done. session saved".to_string(),
                                 assistant_message: content.clone(),

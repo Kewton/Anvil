@@ -450,14 +450,20 @@ impl App {
 
     /// Push a tool execution result into the session as a tool message.
     fn record_tool_result(&mut self, result: &ToolExecutionResult) {
-        self.session.push_message(
-            SessionMessage::new(
-                MessageRole::Tool,
-                "tool",
-                format_tool_result_message(result, self.config.runtime.tool_result_max_chars),
-            )
-            .with_id(self.next_message_id("tool")),
-        );
+        let mut msg = SessionMessage::new(
+            MessageRole::Tool,
+            "tool",
+            format_tool_result_message(result, self.config.runtime.tool_result_max_chars),
+        )
+        .with_id(self.next_message_id("tool"));
+
+        // Attach image paths for Image payloads so the agent layer can
+        // resolve them to base64 when building the provider request.
+        if let ToolExecutionPayload::Image { source_path, .. } = &result.payload {
+            msg = msg.with_image_paths(vec![source_path.clone()]);
+        }
+
+        self.session.push_message(msg);
     }
 
     pub(crate) fn handle_structured_done<C: ProviderClient>(
@@ -525,7 +531,7 @@ pub(crate) fn infer_plan_from_structured_response(
 ///
 /// Includes the actual payload (file content, search matches) so the LLM
 /// can reason about the results in subsequent turns.
-pub(crate) fn format_tool_result_message(result: &ToolExecutionResult, max_chars: usize) -> String {
+pub fn format_tool_result_message(result: &ToolExecutionResult, max_chars: usize) -> String {
     match &result.payload {
         ToolExecutionPayload::None => {
             format!("[tool result: {}] {}", result.tool_name, result.summary)
@@ -553,6 +559,12 @@ pub(crate) fn format_tool_result_message(result: &ToolExecutionResult, max_chars
                 result.summary,
                 paths.len(),
                 listing
+            )
+        }
+        ToolExecutionPayload::Image { source_path, .. } => {
+            format!(
+                "[tool result: {}] [画像: {}]",
+                result.tool_name, source_path
             )
         }
     }

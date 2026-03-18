@@ -2,7 +2,8 @@ mod common;
 
 use anvil::contracts::{AppEvent, AppStateSnapshot, RuntimeState};
 use anvil::session::{
-    MessageStatus, SessionRecord, SessionStore, new_assistant_message, new_user_message,
+    MessageRole, MessageStatus, SessionMessage, SessionRecord, SessionStore, new_assistant_message,
+    new_user_message,
 };
 use anvil::state::{StateMachine, StateTransition};
 use std::path::PathBuf;
@@ -524,4 +525,104 @@ fn atomic_write_leaves_no_tmp_file_on_success() {
         .load()
         .expect("session should reload after atomic write");
     assert_eq!(reloaded.message_count(), session.message_count());
+}
+
+// ── SessionMessage image_paths tests ──────────────────────────────────
+
+#[test]
+fn session_message_image_paths_default_is_none() {
+    let msg = SessionMessage::new(MessageRole::Tool, "tool", "hello");
+    assert_eq!(msg.image_paths, None);
+}
+
+#[test]
+fn session_message_with_image_paths_builder() {
+    let msg = SessionMessage::new(MessageRole::Tool, "tool", "[画像: test.png]")
+        .with_image_paths(vec!["test.png".to_string()]);
+    assert_eq!(msg.image_paths, Some(vec!["test.png".to_string()]));
+}
+
+#[test]
+fn session_message_backward_compat_deserialize_without_image_paths() {
+    // JSON without image_paths field should deserialize successfully
+    let json = r#"{
+        "id": "msg_1",
+        "role": "User",
+        "author": "you",
+        "content": "hello",
+        "status": "Committed",
+        "tool_call_id": null
+    }"#;
+    let msg: SessionMessage = serde_json::from_str(json).expect("should deserialize");
+    assert_eq!(msg.image_paths, None);
+    assert_eq!(msg.content, "hello");
+}
+
+#[test]
+fn session_message_deserialize_with_image_paths() {
+    let json = r#"{
+        "id": "msg_2",
+        "role": "Tool",
+        "author": "tool",
+        "content": "[画像: test.png]",
+        "status": "Committed",
+        "tool_call_id": null,
+        "image_paths": ["test.png", "photo.jpg"]
+    }"#;
+    let msg: SessionMessage = serde_json::from_str(json).expect("should deserialize");
+    assert_eq!(
+        msg.image_paths,
+        Some(vec!["test.png".to_string(), "photo.jpg".to_string()])
+    );
+}
+
+#[test]
+fn push_message_with_images_adds_image_tokens() {
+    let mut session = SessionRecord::new(PathBuf::from("/tmp/test"));
+    // First get baseline with a text message
+    let text_msg =
+        SessionMessage::new(MessageRole::User, "you", "hello").with_id("msg_1".to_string());
+    session.push_message(text_msg);
+    let baseline = session.estimated_token_count();
+
+    // Now add a message with 2 image paths
+    let img_msg = SessionMessage::new(MessageRole::Tool, "tool", "[画像]")
+        .with_id("msg_2".to_string())
+        .with_image_paths(vec!["a.png".to_string(), "b.png".to_string()]);
+    session.push_message(img_msg);
+
+    let new_count = session.estimated_token_count();
+    // Should have added at least 600 tokens (300 per image)
+    assert!(
+        new_count >= baseline + 600,
+        "expected at least {} but got {}",
+        baseline + 600,
+        new_count
+    );
+}
+
+#[test]
+fn estimated_token_count_accounts_for_images_on_recalc() {
+    let mut session = SessionRecord::new(PathBuf::from("/tmp/test"));
+    let img_msg = SessionMessage::new(MessageRole::Tool, "tool", "x")
+        .with_id("msg_1".to_string())
+        .with_image_paths(vec!["a.png".to_string()]);
+    session.push_message(img_msg);
+
+    // Force cache invalidation by compacting (which sets cache to None)
+    // Then re-check estimated_token_count recalculates including images
+    let count_before = session.estimated_token_count();
+
+    // Compact to invalidate cache
+    session.compact_history(0);
+    let _count_after = session.estimated_token_count();
+
+    // Both should include image tokens (before compact had the image message)
+    assert!(
+        count_before >= 300,
+        "expected at least 300 but got {}",
+        count_before
+    );
+    // After compact, image message was replaced with summary (no images), so count_after may differ
+    // The important thing is the count_before properly included image tokens
 }

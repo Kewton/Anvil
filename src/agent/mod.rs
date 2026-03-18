@@ -5,13 +5,15 @@
 
 use crate::contracts::tokens::{ContentKind, estimate_tokens};
 use crate::provider::{
-    ProviderClient, ProviderEvent, ProviderMessage, ProviderMessageRole, ProviderTurnError,
-    ProviderTurnRequest,
+    ImageContent, ProviderClient, ProviderEvent, ProviderMessage, ProviderMessageRole,
+    ProviderTurnError, ProviderTurnRequest,
 };
 use crate::session::{MessageRole, SessionRecord};
-use crate::tooling::{ToolCallRequest, ToolInput};
+use crate::tooling::{ToolCallRequest, ToolInput, detect_image_mime};
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectLanguage {
@@ -157,17 +159,20 @@ impl BasicAgentLoop {
     ) -> ProviderTurnRequest {
         let len = session.messages.len();
         let start = len.saturating_sub(max_messages);
+        let sandbox_root = std::fs::canonicalize(&session.metadata.cwd).ok();
 
-        ProviderTurnRequest::new(
-            model.into(),
-            std::iter::once(ProviderMessage::new(
-                ProviderMessageRole::System,
-                system_prompt,
-            ))
-            .chain(session.messages[start..].iter().map(to_provider_message))
-            .collect(),
-            stream,
+        let messages: Vec<ProviderMessage> = std::iter::once(ProviderMessage::new(
+            ProviderMessageRole::System,
+            system_prompt,
+        ))
+        .chain(
+            session.messages[start..]
+                .iter()
+                .map(|sm| to_provider_message_with_images(sm, sandbox_root.as_deref())),
         )
+        .collect();
+
+        ProviderTurnRequest::new(model.into(), messages, stream)
     }
 
     pub fn build_turn_request_with_token_budget(
@@ -206,16 +211,20 @@ impl BasicAgentLoop {
             "built turn request"
         );
 
-        ProviderTurnRequest::new(
-            model.into(),
-            std::iter::once(ProviderMessage::new(
-                ProviderMessageRole::System,
-                system_prompt,
-            ))
-            .chain(selected.into_iter().map(to_provider_message))
-            .collect(),
-            stream,
+        let sandbox_root = std::fs::canonicalize(&session.metadata.cwd).ok();
+
+        let messages: Vec<ProviderMessage> = std::iter::once(ProviderMessage::new(
+            ProviderMessageRole::System,
+            system_prompt,
+        ))
+        .chain(
+            selected
+                .into_iter()
+                .map(|sm| to_provider_message_with_images(sm, sandbox_root.as_deref())),
         )
+        .collect();
+
+        ProviderTurnRequest::new(model.into(), messages, stream)
     }
 
     pub fn run_turn<C: ProviderClient>(
@@ -344,14 +353,62 @@ fn loose_unescape(value: &str) -> String {
         .replace("\\\\", "\\")
 }
 
-fn to_provider_message(message: &crate::session::SessionMessage) -> ProviderMessage {
+/// Resolve image paths to base64-encoded [`ImageContent`] values.
+///
+/// Each path is canonicalized and checked against `sandbox_root` to prevent
+/// path-traversal attacks.  On error (file missing, outside sandbox) the
+/// caller is expected to log and skip.
+fn resolve_image_content(
+    image_paths: &[String],
+    sandbox_root: &Path,
+) -> Result<Vec<ImageContent>, std::io::Error> {
+    image_paths
+        .iter()
+        .map(|path| {
+            let canonical = std::fs::canonicalize(path)?;
+            if !canonical.starts_with(sandbox_root) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("image path outside sandbox: {}", path),
+                ));
+            }
+            let data = std::fs::read(&canonical)?;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+            let mime_type = detect_image_mime(&canonical)
+                .unwrap_or("application/octet-stream")
+                .to_string();
+            Ok(ImageContent {
+                base64: b64,
+                mime_type,
+            })
+        })
+        .collect()
+}
+
+/// Convert a session message to a provider message, optionally resolving
+/// attached image paths into base64-encoded [`ImageContent`].
+fn to_provider_message_with_images(
+    message: &crate::session::SessionMessage,
+    sandbox_root: Option<&Path>,
+) -> ProviderMessage {
     let role = match message.role {
         MessageRole::System => ProviderMessageRole::System,
         MessageRole::User => ProviderMessageRole::User,
         MessageRole::Assistant => ProviderMessageRole::Assistant,
         MessageRole::Tool => ProviderMessageRole::Tool,
     };
-    ProviderMessage::new(role, message.content.clone())
+    let mut msg = ProviderMessage::new(role, message.content.clone());
+    if let Some(ref paths) = message.image_paths
+        && let Some(root) = sandbox_root
+    {
+        match resolve_image_content(paths, root) {
+            Ok(images) => msg.images = Some(images),
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to resolve image content, sending without images");
+            }
+        }
+    }
+    msg
 }
 
 fn derive_context_budget(context_window: u32) -> usize {
@@ -388,7 +445,7 @@ pub fn tool_protocol_system_prompt(languages: &[ProjectLanguage]) -> String {
         "\n",
         "Available tools:\n",
         "\n",
-        "1. file.read — read a file or list a directory:\n",
+        "1. file.read — read a file or list a directory (also supports image files: PNG/JPG/JPEG/GIF/WebP, max 20MB):\n",
         "```ANVIL_TOOL\n",
         "{\"id\":\"call_001\",\"tool\":\"file.read\",\"path\":\"./relative/path\"}\n",
         "```\n",
