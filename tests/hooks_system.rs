@@ -5,10 +5,31 @@ mod common;
 use anvil::config::load_hooks_config;
 use anvil::hooks::*;
 use std::collections::HashMap;
-use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+
+/// Helper: write a shell script atomically, wait for the kernel to release it,
+/// then set the executable bit.  The short sleep avoids ETXTBSY on Linux CI.
+#[cfg(unix)]
+fn create_test_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(name);
+    let content = format!("#!/bin/sh\n{body}\n");
+    std::fs::write(&path, content).unwrap();
+    // Ensure the file is fully flushed and closed before chmod + exec
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+#[cfg(not(unix))]
+fn create_test_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+    let path = dir.join(name);
+    let content = format!("#!/bin/sh\n{body}\n");
+    std::fs::write(&path, content).unwrap();
+    path
+}
 
 // ---------------------------------------------------------------------------
 // HooksConfig parsing tests
@@ -202,19 +223,11 @@ fn hook_runner_execute_block_via_json_stdout() {
 
     // Test block via exit code 2
     let tmpdir = tempfile::tempdir().unwrap();
-    let script_path = tmpdir.path().join("block.sh");
-    {
-        let mut f = std::fs::File::create(&script_path).unwrap();
-        writeln!(f, "#!/bin/sh").unwrap();
-        writeln!(f, "echo 'blocked by security policy'").unwrap();
-        writeln!(f, "exit 2").unwrap();
-        f.sync_all().unwrap();
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    let script_path = create_test_script(
+        tmpdir.path(),
+        "block.sh",
+        "echo 'blocked by security policy'\nexit 2",
+    );
 
     let result = runner
         .execute(script_path.to_str().unwrap(), b"{}", 5000, "continue")
@@ -234,23 +247,12 @@ fn hook_runner_execute_block_via_json() {
     let runner = HookRunner::new(shutdown);
 
     let tmpdir = tempfile::tempdir().unwrap();
-    let script_path = tmpdir.path().join("block_json.sh");
-    {
-        let mut f = std::fs::File::create(&script_path).unwrap();
-        writeln!(f, "#!/bin/sh").unwrap();
-        writeln!(
-            f,
-            r#"echo '{{"decision":"block","reason":"forbidden tool"}}'"#
-        )
-        .unwrap();
-        writeln!(f, "exit 0").unwrap();
-        f.sync_all().unwrap();
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    let script_path = create_test_script(
+        tmpdir.path(),
+        "block_json.sh",
+        r#"echo '{"decision":"block","reason":"forbidden tool"}'
+exit 0"#,
+    );
 
     let result = runner
         .execute(script_path.to_str().unwrap(), b"{}", 5000, "continue")
@@ -374,18 +376,11 @@ fn hook_runner_stdin_receives_json() {
 
     let tmpdir = tempfile::tempdir().unwrap();
     let output_file = tmpdir.path().join("stdin_output.txt");
-    let script_path = tmpdir.path().join("read_stdin.sh");
-    {
-        let mut f = std::fs::File::create(&script_path).unwrap();
-        writeln!(f, "#!/bin/sh").unwrap();
-        writeln!(f, "cat > {}", output_file.display()).unwrap();
-        f.sync_all().unwrap();
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    let script_path = create_test_script(
+        tmpdir.path(),
+        "read_stdin.sh",
+        &format!("cat > {}", output_file.display()),
+    );
 
     let input_json = r#"{"tool_name":"file.read","tool_call_id":"call_001"}"#;
     let result = runner.execute(
@@ -749,18 +744,5 @@ fn make_config_with_command(point_name: &str, command: &str) -> HooksConfig {
 }
 
 fn create_block_script(dir: &std::path::Path) -> PathBuf {
-    let script_path = dir.join("block_hook.sh");
-    {
-        let mut f = std::fs::File::create(&script_path).unwrap();
-        writeln!(f, "#!/bin/sh").unwrap();
-        writeln!(f, "echo 'blocked by hook'").unwrap();
-        writeln!(f, "exit 2").unwrap();
-        f.sync_all().unwrap();
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    script_path
+    create_test_script(dir, "block_hook.sh", "echo 'blocked by hook'\nexit 2")
 }
