@@ -20,7 +20,16 @@ pub struct Spinner {
 
 impl Spinner {
     /// Start a spinner with the given message.
-    pub fn start(message: impl Into<String>) -> Self {
+    ///
+    /// When `enabled` is false, returns a no-op spinner that does nothing.
+    /// This is used in non-interactive mode to suppress terminal output.
+    pub fn start(message: impl Into<String>, enabled: bool) -> Self {
+        if !enabled {
+            return Self {
+                running: Arc::new(AtomicBool::new(false)),
+                handle: None,
+            };
+        }
         let running = Arc::new(AtomicBool::new(true));
         let flag = running.clone();
         let message = message.into();

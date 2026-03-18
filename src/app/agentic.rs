@@ -216,11 +216,14 @@ impl App {
             }
 
             // Send tool results back to LLM for the next turn
-            let spinner = Spinner::start(format!(
-                "Analyzing results. model={} (iteration {})",
-                self.config.runtime.model,
-                iteration + 2
-            ));
+            let spinner = Spinner::start(
+                format!(
+                    "Analyzing results. model={} (iteration {})",
+                    self.config.runtime.model,
+                    iteration + 2
+                ),
+                self.config.mode.interactive,
+            );
 
             let request = BasicAgentLoop::build_turn_request(
                 self.config.runtime.model.clone(),
@@ -517,19 +520,20 @@ impl App {
 
     /// Push a tool execution result into the session as a tool message.
     fn record_tool_result(&mut self, result: &ToolExecutionResult) {
+        let is_error = result.status == ToolExecutionStatus::Failed;
         let mut msg = SessionMessage::new(
             MessageRole::Tool,
             "tool",
             format_tool_result_message(result, self.config.runtime.tool_result_max_chars),
         )
         .with_id(self.next_message_id("tool"));
+        msg.is_error = is_error;
 
         // Attach image paths for Image payloads so the agent layer can
         // resolve them to base64 when building the provider request.
         if let ToolExecutionPayload::Image { source_path, .. } = &result.payload {
             msg = msg.with_image_paths(vec![source_path.clone()]);
         }
-
         self.session.push_message(msg);
     }
 
