@@ -100,6 +100,19 @@ pub fn slash_commands() -> Vec<SlashCommandSpec> {
     ExtensionRegistry::new().slash_commands().to_vec()
 }
 
+pub fn render_status_detail(snapshot: &AppStateSnapshot) -> String {
+    if let Some(usage) = &snapshot.context_usage {
+        format!(
+            "  tokens: {}/{} ({}%)",
+            usage.estimated_tokens,
+            usage.max_tokens,
+            usage.usage_percent()
+        )
+    } else {
+        "  tokens: -/-".to_string()
+    }
+}
+
 pub fn render_pending_approval_frame(snapshot: &AppStateSnapshot) -> String {
     if let Some(approval) = &snapshot.approval {
         let mut text = format!(

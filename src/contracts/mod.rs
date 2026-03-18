@@ -71,10 +71,49 @@ pub struct ToolLogView {
     pub target: String,
 }
 
+/// Context usage warning level based on threshold evaluation.
+///
+/// Used as `Option<ContextWarningLevel>` where `None` means no warning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContextWarningLevel {
+    /// Usage >= 80%: warning
+    Warning,
+    /// Usage >= 90%: critical
+    Critical,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextUsageView {
     pub estimated_tokens: usize,
     pub max_tokens: u32,
+}
+
+impl ContextUsageView {
+    /// Context usage ratio clamped to 0.0..=1.0. Returns 0.0 if max_tokens is 0.
+    pub fn usage_ratio(&self) -> f64 {
+        if self.max_tokens == 0 {
+            return 0.0;
+        }
+        let ratio = self.estimated_tokens as f64 / self.max_tokens as f64;
+        ratio.clamp(0.0, 1.0)
+    }
+
+    /// Warning level based on usage thresholds (>=0.9 Critical, >=0.8 Warning, else None).
+    pub fn warning_level(&self) -> Option<ContextWarningLevel> {
+        let ratio = self.usage_ratio();
+        if ratio >= 0.9 {
+            Some(ContextWarningLevel::Critical)
+        } else if ratio >= 0.8 {
+            Some(ContextWarningLevel::Warning)
+        } else {
+            None
+        }
+    }
+
+    /// Usage percentage for display (0..=100).
+    pub fn usage_percent(&self) -> u32 {
+        (self.usage_ratio() * 100.0).round() as u32
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,6 +181,9 @@ pub struct AppStateSnapshot {
     /// Suggested recovery actions. Used in: Error, Interrupted.
     #[serde(default)]
     pub recommended_actions: Vec<String>,
+    /// Context overflow warning level. Used in: Done.
+    #[serde(default)]
+    pub context_warning: Option<ContextWarningLevel>,
 }
 
 impl AppStateSnapshot {
@@ -163,6 +205,7 @@ impl AppStateSnapshot {
             saved_status: None,
             error_summary: None,
             recommended_actions: Vec::new(),
+            context_warning: None,
         }
     }
 
@@ -264,6 +307,11 @@ impl AppStateSnapshot {
         self.recommended_actions = recommended_actions;
         self
     }
+
+    pub fn with_context_warning(mut self, level: ContextWarningLevel) -> Self {
+        self.context_warning = Some(level);
+        self
+    }
 }
 
 #[cfg(test)]
@@ -294,5 +342,124 @@ impl AppStateSnapshot {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_ratio_normal() {
+        let usage = ContextUsageView {
+            estimated_tokens: 5000,
+            max_tokens: 10000,
+        };
+        assert!((usage.usage_ratio() - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn usage_ratio_zero_max_tokens() {
+        let usage = ContextUsageView {
+            estimated_tokens: 100,
+            max_tokens: 0,
+        };
+        assert!((usage.usage_ratio() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn usage_ratio_clamped_above_one() {
+        let usage = ContextUsageView {
+            estimated_tokens: 15000,
+            max_tokens: 10000,
+        };
+        assert!((usage.usage_ratio() - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn usage_ratio_boundary_values() {
+        let usage_80 = ContextUsageView {
+            estimated_tokens: 8000,
+            max_tokens: 10000,
+        };
+        assert!((usage_80.usage_ratio() - 0.8).abs() < f64::EPSILON);
+
+        let usage_90 = ContextUsageView {
+            estimated_tokens: 9000,
+            max_tokens: 10000,
+        };
+        assert!((usage_90.usage_ratio() - 0.9).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn warning_level_below_80_is_none() {
+        let usage = ContextUsageView {
+            estimated_tokens: 7999,
+            max_tokens: 10000,
+        };
+        assert_eq!(usage.warning_level(), None);
+    }
+
+    #[test]
+    fn warning_level_at_80_is_warning() {
+        let usage = ContextUsageView {
+            estimated_tokens: 8000,
+            max_tokens: 10000,
+        };
+        assert_eq!(usage.warning_level(), Some(ContextWarningLevel::Warning));
+    }
+
+    #[test]
+    fn warning_level_at_89_is_warning() {
+        let usage = ContextUsageView {
+            estimated_tokens: 8999,
+            max_tokens: 10000,
+        };
+        assert_eq!(usage.warning_level(), Some(ContextWarningLevel::Warning));
+    }
+
+    #[test]
+    fn warning_level_at_90_is_critical() {
+        let usage = ContextUsageView {
+            estimated_tokens: 9000,
+            max_tokens: 10000,
+        };
+        assert_eq!(usage.warning_level(), Some(ContextWarningLevel::Critical));
+    }
+
+    #[test]
+    fn warning_level_at_100_is_critical() {
+        let usage = ContextUsageView {
+            estimated_tokens: 10000,
+            max_tokens: 10000,
+        };
+        assert_eq!(usage.warning_level(), Some(ContextWarningLevel::Critical));
+    }
+
+    #[test]
+    fn usage_percent_normal() {
+        let usage = ContextUsageView {
+            estimated_tokens: 2200,
+            max_tokens: 10000,
+        };
+        assert_eq!(usage.usage_percent(), 22);
+    }
+
+    #[test]
+    fn usage_percent_rounding() {
+        let usage = ContextUsageView {
+            estimated_tokens: 3333,
+            max_tokens: 10000,
+        };
+        assert_eq!(usage.usage_percent(), 33);
+    }
+
+    #[test]
+    fn usage_percent_zero_max() {
+        let usage = ContextUsageView {
+            estimated_tokens: 100,
+            max_tokens: 0,
+        };
+        assert_eq!(usage.usage_percent(), 0);
     }
 }

@@ -4,6 +4,10 @@
 //! settings.  It is assembled once at startup and then treated as
 //! immutable for the lifetime of the session.
 
+pub mod cli_args;
+pub use cli_args::CliArgs;
+
+use clap::Parser;
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -118,12 +122,26 @@ impl EffectiveConfig {
         self.project_instructions = instructions;
     }
 
+    /// Test-compatible entry point. In production, use `load_with_args()` via
+    /// `main.rs -> CliArgs::parse() -> run_with_args() -> load_with_args()`.
+    ///
+    /// Attempts to parse CLI args from `std::env::args()`. Falls back to
+    /// `CliArgs::default()` when parsing fails (e.g. cargo-test harness args).
     pub fn load() -> Result<Self, ConfigError> {
+        match CliArgs::try_parse_from(std::env::args()) {
+            Ok(cli) => Self::load_with_args(&cli),
+            Err(_) => Self::load_with_args(&CliArgs::default()),
+        }
+    }
+
+    /// Production entry point: apply file, env, then CLI arg overrides.
+    pub fn load_with_args(cli: &CliArgs) -> Result<Self, ConfigError> {
         let cwd = std::env::current_dir().map_err(ConfigError::CurrentDirUnavailable)?;
         let workspace_dir = cwd.join("workspace");
         let config_file = cwd.join(".anvil").join("config");
         let mut config = Self::default_for_paths(cwd, workspace_dir, config_file);
-        config.apply_standard_sources()?;
+        config.apply_file_and_env_overrides()?;
+        config.apply_cli_args(cli)?;
 
         // Check .gitignore for .anvil/ directory
         if let Some(repo_root) = find_repo_root(&config.paths.cwd)
@@ -180,12 +198,11 @@ impl EffectiveConfig {
         }
     }
 
-    fn apply_standard_sources(&mut self) -> Result<(), ConfigError> {
+    fn apply_file_and_env_overrides(&mut self) -> Result<(), ConfigError> {
         if self.paths.config_file.exists() {
             self.apply_file_overrides()?;
         }
         self.apply_env_overrides()?;
-        self.apply_cli_overrides()?;
         Ok(())
     }
 
@@ -247,72 +264,59 @@ impl EffectiveConfig {
         self.apply_map(&map)
     }
 
-    fn apply_cli_overrides(&mut self) -> Result<(), ConfigError> {
-        let mut args = std::env::args().skip(1);
-        let mut map = HashMap::new();
-
-        while let Some(arg) = args.next() {
-            match arg.as_str() {
-                "--provider" => {
-                    if let Some(value) = args.next() {
-                        map.insert("ANVIL_PROVIDER".to_string(), value);
-                    }
-                }
-                "--model" => {
-                    if let Some(value) = args.next() {
-                        map.insert("ANVIL_MODEL".to_string(), value);
-                    }
-                }
-                "--provider-url" => {
-                    if let Some(value) = args.next() {
-                        map.insert("ANVIL_PROVIDER_URL".to_string(), value);
-                    }
-                }
-                "--sidecar-model" => {
-                    if let Some(value) = args.next() {
-                        map.insert("ANVIL_SIDECAR_MODEL".to_string(), value);
-                    }
-                }
-                "--context-window" => {
-                    if let Some(value) = args.next() {
-                        map.insert("ANVIL_CONTEXT_WINDOW".to_string(), value);
-                    }
-                }
-                "--context-budget" => {
-                    if let Some(value) = args.next() {
-                        map.insert("ANVIL_CONTEXT_BUDGET".to_string(), value);
-                    }
-                }
-                "--max-iterations" => {
-                    if let Some(value) = args.next() {
-                        map.insert("ANVIL_MAX_AGENT_ITERATIONS".to_string(), value);
-                    }
-                }
-                "--no-stream" => {
-                    map.insert("ANVIL_STREAM".to_string(), "false".to_string());
-                }
-                "--debug" => {
-                    map.insert("ANVIL_DEBUG".to_string(), "true".to_string());
-                }
-                "--no-approval" => {
-                    map.insert("ANVIL_APPROVAL_REQUIRED".to_string(), "false".to_string());
-                }
-                "--fresh-session" => {
-                    map.insert("ANVIL_FRESH_SESSION".to_string(), "true".to_string());
-                }
-                "--oneshot" => {
-                    map.insert("ANVIL_INTERACTIVE".to_string(), "false".to_string());
-                }
-                "--reasoning-visibility" => {
-                    if let Some(value) = args.next() {
-                        map.insert("ANVIL_REASONING_VISIBILITY".to_string(), value);
-                    }
-                }
-                _ => {}
-            }
+    /// Apply CLI argument overrides from a parsed [`CliArgs`] struct.
+    ///
+    /// Uses direct field assignment (not `apply_map`) to avoid redundant
+    /// string round-trips for already-typed values.
+    pub fn apply_cli_args(&mut self, cli: &CliArgs) -> Result<(), ConfigError> {
+        // String fields
+        if let Some(ref v) = cli.provider {
+            self.runtime.provider = v.clone();
+        }
+        if let Some(ref v) = cli.model {
+            self.runtime.model = v.clone();
+        }
+        if let Some(ref v) = cli.provider_url {
+            self.runtime.provider_url = v.clone();
+        }
+        if let Some(ref v) = cli.sidecar_model {
+            self.runtime.sidecar_model = Some(v.clone());
         }
 
-        self.apply_map(&map)
+        // Numeric fields (already parsed by clap)
+        if let Some(v) = cli.context_window {
+            self.runtime.context_window = v;
+        }
+        if let Some(v) = cli.context_budget {
+            self.runtime.context_budget = Some(v);
+        }
+        if let Some(v) = cli.max_iterations {
+            self.runtime.max_agent_iterations = v;
+        }
+
+        // Boolean flags: only apply when set (true)
+        if cli.no_stream {
+            self.runtime.stream = false;
+        }
+        if cli.debug {
+            self.mode.debug_logging = true;
+        }
+        if cli.no_approval {
+            self.mode.approval_required = false;
+        }
+        if cli.fresh_session {
+            self.mode.fresh_session = true;
+        }
+        if cli.oneshot {
+            self.mode.interactive = false;
+        }
+
+        // Enum field
+        if let Some(ref v) = cli.reasoning_visibility {
+            self.mode.reasoning_visibility = parse_reasoning_visibility(v)?;
+        }
+
+        Ok(())
     }
 
     fn apply_map(&mut self, map: &HashMap<String, String>) -> Result<(), ConfigError> {

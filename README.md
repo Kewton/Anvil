@@ -213,19 +213,23 @@ ANVIL_API_KEY=sk-...              # OpenAI互換APIキー
 ### CLI オプション
 
 ```
-anvil [オプション]
+anvil [OPTIONS]
 
---provider <名前>           プロバイダー (ollama / openai)
---model <名前>              モデル名
---provider-url <URL>        プロバイダーURL
---context-window <数値>     コンテキストウィンドウサイズ
---context-budget <数値>     トークンバジェット明示指定
---max-iterations <数値>     agenticループ最大反復数
---no-approval               全ツール自動承認
---no-stream                 ストリーミング無効
---fresh-session             新規セッションで開始
---oneshot                   非対話モード
---debug                     デバッグログ有効
+  -p, --provider <PROVIDER>              プロバイダー (ollama|openai)
+  -m, --model <MODEL>                    モデル名
+  -u, --provider-url <URL>               プロバイダーURL
+      --sidecar-model <MODEL>            サイドカーモデル名
+      --context-window <SIZE>            コンテキストウィンドウサイズ
+      --context-budget <TOKENS>          トークンバジェット明示指定
+      --max-iterations <N>               agenticループ最大反復数
+      --no-stream                        ストリーミング無効
+      --debug                            デバッグログ有効
+      --no-approval                      全ツール自動承認
+      --fresh-session                    新規セッションで開始
+      --oneshot                          非対話モード
+      --reasoning-visibility <LEVEL>     推論表示レベル (hidden|summary)
+  -h, --help                             ヘルプ表示
+  -V, --version                          バージョン表示
 ```
 
 優先順位: CLI > 環境変数 > 設定ファイル > デフォルト値

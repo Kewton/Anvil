@@ -208,6 +208,7 @@ fn tui_renders_working_and_done_views_with_tool_logs() {
     assert!(done.contains("[A] anvil > result"));
     assert!(done.contains("session saved"));
     assert!(done.contains("/continue"));
+    assert!(done.contains("/compact"));
 }
 
 #[test]
@@ -349,6 +350,117 @@ fn startup_without_anvil_md() {
     );
 
     assert!(!rendered.contains("ANVIL.md: loaded"));
+}
+
+#[test]
+fn context_warning_bar_displayed_for_warning_level() {
+    let tui = Tui::new();
+    let snapshot = anvil::contracts::AppStateSnapshot::new(anvil::contracts::RuntimeState::Done)
+        .with_status("Done. session saved".to_string())
+        .with_completion_summary("completed task", "session saved")
+        .with_context_usage(8500, 10000)
+        .with_context_warning(anvil::contracts::ContextWarningLevel::Warning);
+
+    let context = anvil::contracts::ConsoleRenderContext {
+        snapshot,
+        model_name: "test-model".to_string(),
+        messages: vec![],
+        history_summary: None,
+    };
+
+    let rendered = tui.render_console(&context);
+    assert!(
+        rendered.contains("[!] Warning: Context usage at 85%"),
+        "warning bar should display at 85% usage"
+    );
+    assert!(
+        rendered.contains("/compact"),
+        "warning should suggest /compact"
+    );
+}
+
+#[test]
+fn context_warning_bar_displayed_for_critical_level() {
+    let tui = Tui::new();
+    let snapshot = anvil::contracts::AppStateSnapshot::new(anvil::contracts::RuntimeState::Done)
+        .with_status("Done. session saved".to_string())
+        .with_completion_summary("completed task", "session saved")
+        .with_context_usage(9500, 10000)
+        .with_context_warning(anvil::contracts::ContextWarningLevel::Critical);
+
+    let context = anvil::contracts::ConsoleRenderContext {
+        snapshot,
+        model_name: "test-model".to_string(),
+        messages: vec![],
+        history_summary: None,
+    };
+
+    let rendered = tui.render_console(&context);
+    assert!(
+        rendered.contains("[!] CRITICAL: Context usage at 95%"),
+        "critical bar should display at 95% usage"
+    );
+    assert!(
+        rendered.contains("/compact immediately"),
+        "critical warning should suggest immediate /compact"
+    );
+}
+
+#[test]
+fn context_warning_bar_absent_when_no_warning() {
+    let tui = Tui::new();
+    let snapshot = anvil::contracts::AppStateSnapshot::new(anvil::contracts::RuntimeState::Done)
+        .with_status("Done. session saved".to_string())
+        .with_completion_summary("completed task", "session saved")
+        .with_context_usage(5000, 10000);
+
+    let context = anvil::contracts::ConsoleRenderContext {
+        snapshot,
+        model_name: "test-model".to_string(),
+        messages: vec![],
+        history_summary: None,
+    };
+
+    let rendered = tui.render_console(&context);
+    assert!(
+        !rendered.contains("[!]"),
+        "no warning bar should appear when usage is below threshold"
+    );
+}
+
+#[test]
+fn done_hint_line_includes_compact() {
+    let tui = Tui::new();
+    let snapshot = anvil::contracts::AppStateSnapshot::new(anvil::contracts::RuntimeState::Done)
+        .with_status("Done. session saved".to_string())
+        .with_completion_summary("completed task", "session saved")
+        .with_context_usage(5000, 10000);
+
+    let context = anvil::contracts::ConsoleRenderContext {
+        snapshot,
+        model_name: "test-model".to_string(),
+        messages: vec![],
+        history_summary: None,
+    };
+
+    let rendered = tui.render_console(&context);
+    assert!(
+        rendered.contains("/compact"),
+        "Done hint line should include /compact"
+    );
+}
+
+#[test]
+fn status_detail_shows_token_usage() {
+    let snapshot = anvil::contracts::AppStateSnapshot::new(anvil::contracts::RuntimeState::Done)
+        .with_status("Done. session saved".to_string())
+        .with_completion_summary("completed task", "session saved")
+        .with_context_usage(45000, 200000);
+
+    let detail = anvil::app::render::render_status_detail(&snapshot);
+    assert!(detail.contains("45000"));
+    assert!(detail.contains("200000"));
+    assert!(detail.contains("22%") || detail.contains("23%"));
 }
 
 #[test]
