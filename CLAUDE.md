@@ -122,7 +122,9 @@ src/
 ├── session/mod.rs       # セッション永続化
 ├── spinner.rs           # スピナーUI
 ├── state/mod.rs         # 状態マシン
-├── tooling/mod.rs       # ツール実行・検証
+├── tooling/
+│   ├── mod.rs           # ツール実行・検証
+│   └── diff.rs          # 差分プレビュー生成（file.write/file.edit承認時）
 └── tui/mod.rs           # TUI描画
 tests/
 ├── cli_session.rs       # CLIセッションテスト

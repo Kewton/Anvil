@@ -730,6 +730,23 @@ impl App {
                 tool_call_id,
                 elapsed_ms,
             } => {
+                // Attempt to generate a diff preview from pending tool calls.
+                let diff_preview = self
+                    .session
+                    .pending_turn
+                    .as_ref()
+                    .and_then(|pending| {
+                        pending
+                            .pending_tool_calls
+                            .iter()
+                            .find(|tc| tc.tool_call_id == *tool_call_id)
+                    })
+                    .and_then(|tc| {
+                        crate::tooling::diff::generate_diff_preview(
+                            &self.config.paths.cwd,
+                            &tc.input,
+                        )
+                    });
                 let snapshot = AppStateSnapshot::new(RuntimeState::AwaitingApproval)
                     .with_status(status.clone())
                     .with_approval(
@@ -738,6 +755,7 @@ impl App {
                         risk.clone(),
                         tool_call_id.clone(),
                     )
+                    .with_diff_preview(diff_preview)
                     .with_elapsed_ms(*elapsed_ms);
                 self.transition_with_context(snapshot, StateTransition::RequestApproval)
             }

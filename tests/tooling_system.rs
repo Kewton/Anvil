@@ -1516,6 +1516,191 @@ fn file_edit_sandbox_escape_rejected() {
     assert!(err.to_string().contains("invalid tool path"));
 }
 
+// ---- Diff preview tests ----
+
+use anvil::tooling::diff::{generate_diff_preview, is_binary_content};
+
+#[test]
+fn test_diff_preview_existing_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file_path = dir.path().join("hello.txt");
+    fs::write(&file_path, "line1\nline2\nline3\n").expect("write");
+
+    let input = ToolInput::FileWrite {
+        path: "hello.txt".to_string(),
+        content: "line1\nline2 modified\nline3\nline4\n".to_string(),
+    };
+    let result = generate_diff_preview(dir.path(), &input);
+    assert!(result.is_some());
+    let diff = result.unwrap();
+    assert!(diff.contains("-line2"));
+    assert!(diff.contains("+line2 modified"));
+    assert!(diff.contains("+line4"));
+}
+
+#[test]
+fn test_diff_preview_new_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = ToolInput::FileWrite {
+        path: "brand_new.txt".to_string(),
+        content: "first line\nsecond line\n".to_string(),
+    };
+    let result = generate_diff_preview(dir.path(), &input);
+    assert!(result.is_some());
+    let preview = result.unwrap();
+    assert!(preview.contains("(new file)"));
+    assert!(preview.contains("+first line"));
+    assert!(preview.contains("+second line"));
+}
+
+#[test]
+fn test_diff_preview_binary_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file_path = dir.path().join("binary.bin");
+    let mut content = vec![0u8; 100];
+    content[50] = 0; // NUL byte
+    fs::write(&file_path, &content).expect("write");
+
+    let input = ToolInput::FileWrite {
+        path: "binary.bin".to_string(),
+        content: "new content".to_string(),
+    };
+    let result = generate_diff_preview(dir.path(), &input);
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("binary file"));
+}
+
+#[test]
+fn test_diff_preview_large_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file_path = dir.path().join("big.txt");
+    // Create a file larger than 1MB
+    let big_content = "x".repeat(1_048_577);
+    fs::write(&file_path, &big_content).expect("write");
+
+    let input = ToolInput::FileWrite {
+        path: "big.txt".to_string(),
+        content: "replacement".to_string(),
+    };
+    let result = generate_diff_preview(dir.path(), &input);
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("file too large"));
+}
+
+#[test]
+fn test_diff_preview_large_diff() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file_path = dir.path().join("many_lines.txt");
+    // Create a file with many lines
+    let old_lines: Vec<String> = (0..100).map(|i| format!("old line {i}")).collect();
+    fs::write(&file_path, old_lines.join("\n")).expect("write");
+
+    let new_lines: Vec<String> = (0..100).map(|i| format!("new line {i}")).collect();
+    let input = ToolInput::FileWrite {
+        path: "many_lines.txt".to_string(),
+        content: new_lines.join("\n"),
+    };
+    let result = generate_diff_preview(dir.path(), &input);
+    assert!(result.is_some());
+    let diff = result.unwrap();
+    // Should be truncated
+    assert!(diff.contains("..."));
+    assert!(diff.contains("lines added"));
+    assert!(diff.contains("lines deleted"));
+}
+
+#[test]
+fn test_diff_preview_file_edit() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = ToolInput::FileEdit {
+        path: "some_file.rs".to_string(),
+        old_string: "fn old_function() {}".to_string(),
+        new_string: "fn new_function() {\n    println!(\"hello\");\n}".to_string(),
+    };
+    let result = generate_diff_preview(dir.path(), &input);
+    assert!(result.is_some());
+    let diff = result.unwrap();
+    assert!(diff.contains("-fn old_function() {}"));
+    assert!(diff.contains("+fn new_function() {"));
+}
+
+#[test]
+fn test_diff_preview_nonexistent_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = ToolInput::FileWrite {
+        path: "does_not_exist.txt".to_string(),
+        content: "hello world\n".to_string(),
+    };
+    let result = generate_diff_preview(dir.path(), &input);
+    assert!(result.is_some());
+    let preview = result.unwrap();
+    assert!(preview.contains("(new file)"));
+    assert!(preview.contains("+hello world"));
+}
+
+#[test]
+fn test_diff_preview_line_truncation() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // Create a new file with a very long line (> 200 chars)
+    let long_line = "a".repeat(300);
+    let input = ToolInput::FileWrite {
+        path: "long_line.txt".to_string(),
+        content: format!("{long_line}\nshort\n"),
+    };
+    let result = generate_diff_preview(dir.path(), &input);
+    assert!(result.is_some());
+    let preview = result.unwrap();
+    assert!(preview.contains("(new file)"));
+    // The long line should be truncated with "..."
+    assert!(preview.contains("..."));
+    // Should not contain the full 300-char line
+    assert!(!preview.contains(&"a".repeat(300)));
+}
+
+#[test]
+fn test_is_binary_content() {
+    // Text content
+    assert!(!is_binary_content(b"hello world\nfoo bar\n"));
+    // Binary content with NUL byte
+    assert!(is_binary_content(b"hello\x00world"));
+    // Empty content
+    assert!(!is_binary_content(b""));
+    // Pure NUL
+    assert!(is_binary_content(&[0u8; 10]));
+}
+
+#[test]
+fn test_file_edit_diff_no_file_access() {
+    // file.edit diff generation should work without any file on disk
+    let dir = tempfile::tempdir().expect("tempdir");
+    // No files created in dir
+
+    let input = ToolInput::FileEdit {
+        path: "nonexistent.rs".to_string(),
+        old_string: "old code".to_string(),
+        new_string: "new code".to_string(),
+    };
+    let result = generate_diff_preview(dir.path(), &input);
+    assert!(result.is_some());
+    let diff = result.unwrap();
+    assert!(diff.contains("-old code"));
+    assert!(diff.contains("+new code"));
+}
+
+#[test]
+fn test_diff_preview_other_tool_input_returns_none() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = ToolInput::FileRead {
+        path: "foo.txt".to_string(),
+    };
+    assert!(generate_diff_preview(dir.path(), &input).is_none());
+
+    let input = ToolInput::ShellExec {
+        command: "ls".to_string(),
+    };
+    assert!(generate_diff_preview(dir.path(), &input).is_none());
+}
+
 // --- Parallel execution grouping tests ---
 
 /// Build a ToolExecutionRequest with a given spec name and execution mode.

@@ -477,3 +477,61 @@ fn busy_prompt_hints_include_slash_commands() {
     assert!(rendered.contains("/status"));
     assert!(rendered.contains("[U] you > /status /help /plan"));
 }
+
+#[test]
+fn test_approval_view_serialize_skips_diff_preview() {
+    let view = anvil::contracts::ApprovalView {
+        tool_name: "file.write".to_string(),
+        summary: "write foo.txt".to_string(),
+        risk: "medium".to_string(),
+        tool_call_id: "call_001".to_string(),
+        diff_preview: Some("--- a\n+++ b\n-old\n+new\n".to_string()),
+    };
+    let json = serde_json::to_string(&view).expect("serialize");
+    // #[serde(skip)] means diff_preview should not appear in output
+    assert!(!json.contains("diff_preview"));
+    assert!(!json.contains("old"));
+}
+
+#[test]
+fn test_approval_view_deserialize_without_diff_preview() {
+    // Old JSON without diff_preview field should still deserialize
+    let json = r#"{"tool_name":"file.write","summary":"write foo.txt","risk":"medium","tool_call_id":"call_001"}"#;
+    let view: anvil::contracts::ApprovalView =
+        serde_json::from_str(json).expect("deserialize should succeed");
+    assert_eq!(view.tool_name, "file.write");
+    assert!(view.diff_preview.is_none());
+}
+
+#[test]
+fn test_approval_view_with_diff_preview() {
+    use anvil::contracts::{AppStateSnapshot, RuntimeState};
+    let snapshot = AppStateSnapshot::new(RuntimeState::AwaitingApproval)
+        .with_approval(
+            "file.write".to_string(),
+            "write test.txt".to_string(),
+            "medium".to_string(),
+            "call_002".to_string(),
+        )
+        .with_diff_preview(Some("-old line\n+new line\n".to_string()));
+
+    let approval = snapshot.approval.as_ref().expect("approval present");
+    assert_eq!(
+        approval.diff_preview.as_deref(),
+        Some("-old line\n+new line\n")
+    );
+}
+
+#[test]
+fn test_approval_view_without_diff_preview() {
+    use anvil::contracts::{AppStateSnapshot, RuntimeState};
+    let snapshot = AppStateSnapshot::new(RuntimeState::AwaitingApproval).with_approval(
+        "file.write".to_string(),
+        "write test.txt".to_string(),
+        "medium".to_string(),
+        "call_003".to_string(),
+    );
+
+    let approval = snapshot.approval.as_ref().expect("approval present");
+    assert!(approval.diff_preview.is_none());
+}

@@ -115,10 +115,14 @@ pub fn render_status_detail(snapshot: &AppStateSnapshot) -> String {
 
 pub fn render_pending_approval_frame(snapshot: &AppStateSnapshot) -> String {
     if let Some(approval) = &snapshot.approval {
-        format!(
+        let mut text = format!(
             "[A] anvil > resolve the pending approval before starting a new turn\n  pending: {} {}\n  call: {}\n  use /approve or /deny",
             approval.tool_name, approval.summary, approval.tool_call_id
-        )
+        );
+        if let Some(diff) = &approval.diff_preview {
+            text.push_str(&format!("\n{}", crate::tui::colorize_diff(diff)));
+        }
+        text
     } else {
         "[A] anvil > resolve the pending approval before starting a new turn\n  use /approve or /deny"
             .to_string()

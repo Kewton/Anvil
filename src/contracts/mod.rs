@@ -53,6 +53,8 @@ pub struct ApprovalView {
     pub summary: String,
     pub risk: String,
     pub tool_call_id: String,
+    #[serde(skip)]
+    pub diff_preview: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -242,7 +244,15 @@ impl AppStateSnapshot {
             summary,
             risk,
             tool_call_id,
+            diff_preview: None,
         });
+        self
+    }
+
+    pub fn with_diff_preview(mut self, preview: Option<String>) -> Self {
+        if let Some(ref mut approval) = self.approval {
+            approval.diff_preview = preview;
+        }
         self
     }
 
