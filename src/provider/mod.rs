@@ -52,6 +52,13 @@ pub struct ProviderRuntimeContext {
     pub capabilities: ProviderCapabilities,
 }
 
+/// Base64-encoded image data for multimodal provider requests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageContent {
+    pub base64: String,
+    pub mime_type: String,
+}
+
 /// Message role used in provider requests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderMessageRole {
@@ -66,6 +73,7 @@ pub enum ProviderMessageRole {
 pub struct ProviderMessage {
     pub role: ProviderMessageRole,
     pub content: String,
+    pub images: Option<Vec<ImageContent>>,
 }
 
 impl ProviderMessage {
@@ -73,7 +81,13 @@ impl ProviderMessage {
         Self {
             role,
             content: content.into(),
+            images: None,
         }
+    }
+
+    pub fn with_images(mut self, images: Vec<ImageContent>) -> Self {
+        self.images = Some(images);
+        self
     }
 }
 
@@ -308,5 +322,37 @@ pub fn build_local_provider_client(
         other => Err(ProviderBootstrapError::UnsupportedBackend(
             other.to_string(),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_message_new_has_images_none() {
+        let msg = ProviderMessage::new(ProviderMessageRole::User, "hello");
+        assert_eq!(msg.images, None);
+    }
+
+    #[test]
+    fn provider_message_with_images_sets_images() {
+        let images = vec![ImageContent {
+            base64: "abc123".to_string(),
+            mime_type: "image/png".to_string(),
+        }];
+        let msg =
+            ProviderMessage::new(ProviderMessageRole::User, "hello").with_images(images.clone());
+        assert_eq!(msg.images, Some(images));
+    }
+
+    #[test]
+    fn image_content_clone_and_eq() {
+        let img = ImageContent {
+            base64: "data".to_string(),
+            mime_type: "image/jpeg".to_string(),
+        };
+        let img2 = img.clone();
+        assert_eq!(img, img2);
     }
 }

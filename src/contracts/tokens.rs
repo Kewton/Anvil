@@ -3,6 +3,9 @@
 //! Provides a unified `estimate_tokens` function that replaces the duplicated
 //! per-module estimators with improved CJK and code-aware heuristics.
 
+/// Fixed token count for a single image in provider requests.
+pub const IMAGE_TOKENS: usize = 300;
+
 /// Content kind for token estimation.
 /// Callers map message role information to the appropriate kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11,6 +14,8 @@ pub enum ContentKind {
     Text,
     /// Code / tool output (Tool role messages, etc.)
     Code,
+    /// Image content — fixed 300 tokens per image.
+    Image,
 }
 
 impl ContentKind {
@@ -53,6 +58,7 @@ const CHARS_PER_TOKEN_OTHER: usize = 4;
 ///   `ceil(count / CHARS_PER_TOKEN_OTHER)`, minimum 1.
 pub fn estimate_tokens(content: &str, kind: ContentKind) -> usize {
     match kind {
+        ContentKind::Image => IMAGE_TOKENS,
         ContentKind::Code => {
             let chars = content.chars().count();
             (chars as f64 / CHARS_PER_TOKEN_CODE).ceil().max(1.0) as usize
@@ -126,6 +132,17 @@ mod tests {
         // Empty string should return minimum 1
         assert_eq!(estimate_tokens("", ContentKind::Text), 1);
         assert_eq!(estimate_tokens("", ContentKind::Code), 1);
+    }
+
+    #[test]
+    fn estimate_tokens_image_returns_fixed_300() {
+        // Image content always returns a fixed 300 tokens regardless of input
+        assert_eq!(estimate_tokens("", ContentKind::Image), 300);
+        assert_eq!(estimate_tokens("anything", ContentKind::Image), 300);
+        assert_eq!(
+            estimate_tokens("long content here", ContentKind::Image),
+            300
+        );
     }
 
     #[test]

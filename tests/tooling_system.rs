@@ -4,9 +4,10 @@ use anvil::tooling::{
     ParallelExecutionPlanError, PermissionClass, PlanModePolicy, RollbackPolicy, ToolCallRequest,
     ToolExecutionError, ToolExecutionPayload, ToolExecutionPolicy, ToolExecutionRequest,
     ToolExecutionResult, ToolExecutionStatus, ToolInput, ToolKind, ToolRegistry,
-    ToolValidationError,
+    ToolValidationError, detect_image_mime,
 };
 use std::fs;
+use std::path::Path;
 
 fn build_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
@@ -1895,4 +1896,116 @@ fn parallel_execution_preserves_result_order() {
             _ => panic!("expected Text payload for file_{i}"),
         }
     }
+}
+
+// ── ToolExecutionPayload::Image tests ──────────────────────────────────
+
+#[test]
+fn tool_execution_payload_image_construction() {
+    let payload = ToolExecutionPayload::Image {
+        source_path: "/tmp/test.png".to_string(),
+        mime_type: "image/png".to_string(),
+    };
+    match payload {
+        ToolExecutionPayload::Image {
+            source_path,
+            mime_type,
+        } => {
+            assert_eq!(source_path, "/tmp/test.png");
+            assert_eq!(mime_type, "image/png");
+        }
+        _ => panic!("expected Image payload"),
+    }
+}
+
+#[test]
+fn tool_execution_payload_image_debug_and_clone() {
+    let payload = ToolExecutionPayload::Image {
+        source_path: "photo.jpg".to_string(),
+        mime_type: "image/jpeg".to_string(),
+    };
+    let cloned = payload.clone();
+    assert_eq!(payload, cloned);
+    // Debug should work
+    let debug_str = format!("{:?}", payload);
+    assert!(debug_str.contains("Image"));
+}
+
+// -----------------------------------------------------------------------
+// Phase 2: detect_image_mime tests
+// -----------------------------------------------------------------------
+
+#[test]
+fn detect_image_mime_png() {
+    assert_eq!(detect_image_mime(Path::new("photo.png")), Some("image/png"));
+}
+
+#[test]
+fn detect_image_mime_jpg() {
+    assert_eq!(
+        detect_image_mime(Path::new("photo.jpg")),
+        Some("image/jpeg")
+    );
+}
+
+#[test]
+fn detect_image_mime_jpeg() {
+    assert_eq!(
+        detect_image_mime(Path::new("photo.jpeg")),
+        Some("image/jpeg")
+    );
+}
+
+#[test]
+fn detect_image_mime_gif() {
+    assert_eq!(detect_image_mime(Path::new("anim.gif")), Some("image/gif"));
+}
+
+#[test]
+fn detect_image_mime_webp() {
+    assert_eq!(
+        detect_image_mime(Path::new("photo.webp")),
+        Some("image/webp")
+    );
+}
+
+#[test]
+fn detect_image_mime_unknown_returns_none() {
+    assert_eq!(detect_image_mime(Path::new("file.txt")), None);
+    assert_eq!(detect_image_mime(Path::new("file.rs")), None);
+    assert_eq!(detect_image_mime(Path::new("no_extension")), None);
+}
+
+#[test]
+fn detect_image_mime_case_insensitive() {
+    assert_eq!(detect_image_mime(Path::new("PHOTO.PNG")), Some("image/png"));
+    assert_eq!(
+        detect_image_mime(Path::new("photo.JPG")),
+        Some("image/jpeg")
+    );
+}
+
+// -----------------------------------------------------------------------
+// Phase 3: format_tool_result_message for Image payload
+// -----------------------------------------------------------------------
+
+#[test]
+fn format_tool_result_message_image_payload() {
+    use anvil::app::agentic::format_tool_result_message;
+    let result = ToolExecutionResult {
+        tool_call_id: "call_001".to_string(),
+        tool_name: "file.read".to_string(),
+        status: ToolExecutionStatus::Completed,
+        summary: "read image".to_string(),
+        payload: ToolExecutionPayload::Image {
+            source_path: "/tmp/photo.png".to_string(),
+            mime_type: "image/png".to_string(),
+        },
+        artifacts: Vec::new(),
+        elapsed_ms: 10,
+    };
+    let msg = format_tool_result_message(&result, 10000);
+    assert!(msg.contains("file.read"));
+    assert!(msg.contains("/tmp/photo.png"));
+    assert!(msg.contains("画像"));
 }

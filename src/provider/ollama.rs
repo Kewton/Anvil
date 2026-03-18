@@ -18,6 +18,8 @@ use std::process::Command;
 pub struct OllamaChatMessage {
     pub role: String,
     pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub images: Option<Vec<String>>,
 }
 
 /// Wire format for an Ollama `/api/chat` request.
@@ -73,14 +75,21 @@ impl<T> OllamaProviderClient<T> {
             messages: request
                 .messages
                 .iter()
-                .map(|message| OllamaChatMessage {
-                    role: match message.role {
-                        ProviderMessageRole::System => "system".to_string(),
-                        ProviderMessageRole::User => "user".to_string(),
-                        ProviderMessageRole::Assistant => "assistant".to_string(),
-                        ProviderMessageRole::Tool => "tool".to_string(),
-                    },
-                    content: message.content.clone(),
+                .map(|message| {
+                    let images = message
+                        .images
+                        .as_ref()
+                        .map(|imgs| imgs.iter().map(|img| img.base64.clone()).collect());
+                    OllamaChatMessage {
+                        role: match message.role {
+                            ProviderMessageRole::System => "system".to_string(),
+                            ProviderMessageRole::User => "user".to_string(),
+                            ProviderMessageRole::Assistant => "assistant".to_string(),
+                            ProviderMessageRole::Tool => "tool".to_string(),
+                        },
+                        content: message.content.clone(),
+                        images,
+                    }
                 })
                 .collect(),
             stream: request.stream,
