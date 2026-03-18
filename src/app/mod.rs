@@ -277,6 +277,9 @@ impl App {
         // [D1-009] ToolSpec conversion and ToolRegistry registration done by App side (SRP)
         // [D2-003] standard_tool_registry() is a free function
         let mut tools = standard_tool_registry();
+        // Register sub-agent tools separately (design decision #6, DR1-008)
+        tools.register_agent_explore();
+        tools.register_agent_plan();
         if let Some(ref manager) = mcp_manager {
             let mcp_tools = manager.get_tools();
             for (server_name, tool_list) in &mcp_tools {

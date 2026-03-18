@@ -75,6 +75,8 @@ pub enum ToolKind {
     WebFetch,
     WebSearch,
     Mcp,
+    AgentExplore,
+    AgentPlan,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,6 +111,14 @@ pub enum ToolInput {
         tool: String,
         arguments: serde_json::Value,
     },
+    AgentExplore {
+        prompt: String,
+        scope: Option<String>,
+    },
+    AgentPlan {
+        prompt: String,
+        scope: Option<String>,
+    },
 }
 
 impl ToolInput {
@@ -122,6 +132,8 @@ impl ToolInput {
             Self::WebFetch { .. } => ToolKind::WebFetch,
             Self::WebSearch { .. } => ToolKind::WebSearch,
             Self::Mcp { .. } => ToolKind::Mcp,
+            Self::AgentExplore { .. } => ToolKind::AgentExplore,
+            Self::AgentPlan { .. } => ToolKind::AgentPlan,
         }
     }
 
@@ -208,6 +220,28 @@ impl ToolInput {
                     .ok_or_else(|| "missing query in web.search tool block".to_string())?
                     .to_string(),
             }),
+            "agent.explore" => Ok(ToolInput::AgentExplore {
+                prompt: value
+                    .get("prompt")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "missing prompt in agent.explore tool block".to_string())?
+                    .to_string(),
+                scope: value
+                    .get("scope")
+                    .and_then(serde_json::Value::as_str)
+                    .map(String::from),
+            }),
+            "agent.plan" => Ok(ToolInput::AgentPlan {
+                prompt: value
+                    .get("prompt")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "missing prompt in agent.plan tool block".to_string())?
+                    .to_string(),
+                scope: value
+                    .get("scope")
+                    .and_then(serde_json::Value::as_str)
+                    .map(String::from),
+            }),
             other => {
                 // mcp__<server>__<tool> pattern detection
                 if let Some((server, tool)) = parse_mcp_tool_name(other) {
@@ -264,6 +298,14 @@ impl ToolInput {
             }),
             "web.search" => Some(ToolInput::WebSearch {
                 query: extract_simple(block, "query")?,
+            }),
+            "agent.explore" => Some(ToolInput::AgentExplore {
+                prompt: extract_simple(block, "prompt")?,
+                scope: extract_simple(block, "scope"),
+            }),
+            "agent.plan" => Some(ToolInput::AgentPlan {
+                prompt: extract_simple(block, "prompt")?,
+                scope: extract_simple(block, "scope"),
             }),
             _ => None,
         }
@@ -574,6 +616,45 @@ impl ToolRegistry {
         });
     }
 
+    pub fn register_agent_explore(&mut self) {
+        self.register(ToolSpec {
+            version: 1,
+            name: "agent.explore".to_string(),
+            kind: ToolKind::AgentExplore,
+            execution_class: ExecutionClass::ReadOnly,
+            permission_class: PermissionClass::Safe,
+            execution_mode: ExecutionMode::SequentialOnly,
+            plan_mode: PlanModePolicy::Allowed,
+            rollback_policy: RollbackPolicy::None,
+        });
+    }
+
+    pub fn register_agent_plan(&mut self) {
+        self.register(ToolSpec {
+            version: 1,
+            name: "agent.plan".to_string(),
+            kind: ToolKind::AgentPlan,
+            execution_class: ExecutionClass::ReadOnly,
+            permission_class: PermissionClass::Safe,
+            execution_mode: ExecutionMode::SequentialOnly,
+            plan_mode: PlanModePolicy::Allowed,
+            rollback_policy: RollbackPolicy::None,
+        });
+    }
+
+    /// Register the subset of tools available to the Explore sub-agent.
+    pub fn register_explore_tools(&mut self) {
+        self.register_file_read();
+        self.register_file_search();
+    }
+
+    /// Register the subset of tools available to the Plan sub-agent.
+    pub fn register_plan_tools(&mut self) {
+        self.register_file_read();
+        self.register_file_search();
+        self.register_web_fetch();
+    }
+
     pub fn register_standard_tools(&mut self) {
         self.register_file_read();
         self.register_file_write();
@@ -710,6 +791,9 @@ impl LocalToolExecutor {
             }
             ToolInput::WebSearch { ref query } => self.execute_web_search(&request, query, started),
             ToolInput::Mcp { .. } => unreachable!("MCP tools are dispatched in agentic.rs"),
+            ToolInput::AgentExplore { .. } | ToolInput::AgentPlan { .. } => {
+                unreachable!("agent tools are dispatched in agentic.rs")
+            }
         };
         tracing::info!(
             tool = %tool_name,
@@ -1394,6 +1478,24 @@ fn validate_required_fields(input: &ToolInput) -> Result<(), ToolValidationError
                         "query length {} exceeds maximum of {} characters",
                         query.len(),
                         MAX_QUERY_LENGTH
+                    ),
+                });
+            }
+        }
+        ToolInput::AgentExplore { prompt, .. } | ToolInput::AgentPlan { prompt, .. } => {
+            if prompt.trim().is_empty() {
+                return Err(ToolValidationError::MissingRequiredField(
+                    "prompt".to_string(),
+                ));
+            }
+            const MAX_PROMPT_LENGTH: usize = 10000;
+            if prompt.len() > MAX_PROMPT_LENGTH {
+                return Err(ToolValidationError::InvalidFieldValue {
+                    field: "prompt".to_string(),
+                    reason: format!(
+                        "prompt length {} exceeds maximum of {} characters",
+                        prompt.len(),
+                        MAX_PROMPT_LENGTH
                     ),
                 });
             }

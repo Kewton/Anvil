@@ -4,6 +4,7 @@
 //! helpers.  These are `impl App` methods in a separate file for
 //! maintainability — the same pattern used by `mock.rs`.
 
+use crate::agent::subagent::{SubAgentError, SubAgentKind, SubAgentSession};
 use crate::agent::{BasicAgentLoop, StructuredAssistantResponse};
 use crate::contracts::{AppStateSnapshot, RuntimeState, ToolLogView};
 use crate::provider::{ProviderClient, ProviderEvent};
@@ -11,10 +12,12 @@ use crate::session::{MessageRole, SessionMessage};
 use crate::spinner::Spinner;
 use crate::state::StateTransition;
 use crate::tooling::{
-    ExecutionMode, LocalToolExecutor, ToolExecutionPayload, ToolExecutionPolicy,
-    ToolExecutionRequest, ToolExecutionResult, ToolExecutionStatus, diff::generate_diff_preview,
+    ExecutionMode, LocalToolExecutor, ToolCallRequest, ToolExecutionPayload, ToolExecutionPolicy,
+    ToolExecutionRequest, ToolExecutionResult, ToolExecutionStatus, ToolInput,
+    diff::generate_diff_preview, resolve_sandbox_path,
 };
 use crate::tui::Tui;
+use std::sync::atomic::Ordering;
 
 use super::{App, AppError};
 
@@ -137,7 +140,101 @@ fn execute_parallel_group_standalone(
     all_results
 }
 
+/// Maximum number of sub-agent calls allowed in a single turn (SR4-006).
+const MAX_SUBAGENT_CALLS_PER_TURN: usize = 3;
+
 impl App {
+    /// Extract sub-agent tool calls, execute them, and return results along
+    /// with the remaining normal tool calls (DR1-003).
+    fn extract_and_run_subagent_calls<C: ProviderClient>(
+        &mut self,
+        tool_calls: &[ToolCallRequest],
+        provider_client: &C,
+    ) -> (Vec<ToolExecutionResult>, Vec<ToolCallRequest>) {
+        let (agent_calls, normal_calls): (Vec<_>, Vec<_>) = tool_calls
+            .iter()
+            .cloned()
+            .partition(|tc| SubAgentKind::from_tool_input(&tc.input).is_some());
+
+        let mut agent_results = Vec::new();
+        for (index, call) in agent_calls.iter().enumerate() {
+            // SR4-006: limit sub-agent calls per turn
+            if index >= MAX_SUBAGENT_CALLS_PER_TURN {
+                agent_results.push(ToolExecutionResult {
+                    tool_call_id: call.tool_call_id.clone(),
+                    tool_name: call.tool_name.clone(),
+                    status: ToolExecutionStatus::Failed,
+                    summary: "too many subagent calls in a single turn".to_string(),
+                    payload: ToolExecutionPayload::Text(
+                        "too many subagent calls in a single turn".to_string(),
+                    ),
+                    artifacts: Vec::new(),
+                    elapsed_ms: 0,
+                });
+                continue;
+            }
+
+            // IR3-004: check shutdown flag
+            if self.shutdown_flag.load(Ordering::Relaxed) {
+                break;
+            }
+
+            let kind = SubAgentKind::from_tool_input(&call.input).unwrap();
+            let (prompt, scope) = match &call.input {
+                ToolInput::AgentExplore { prompt, scope } => (prompt.as_str(), scope.as_deref()),
+                ToolInput::AgentPlan { prompt, scope } => (prompt.as_str(), scope.as_deref()),
+                _ => unreachable!(),
+            };
+
+            // SR4-001/SR4-008: scope validation
+            let scope_path = if let Some(scope_str) = scope {
+                // SR4-008: NUL byte / control character check
+                if scope_str.chars().any(|c| c.is_control()) {
+                    agent_results.push(
+                        SubAgentError::SandboxViolation(format!(
+                            "scope contains control characters: {:?}",
+                            scope_str
+                        ))
+                        .into_tool_execution_result(call),
+                    );
+                    continue;
+                }
+                // SR4-001: path traversal check
+                match resolve_sandbox_path(&self.config.paths.cwd, scope_str) {
+                    Ok(resolved) => resolved,
+                    Err(_) => {
+                        agent_results.push(
+                            SubAgentError::SandboxViolation(format!(
+                                "scope path traversal detected: {}",
+                                scope_str
+                            ))
+                            .into_tool_execution_result(call),
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                self.config.paths.cwd.clone()
+            };
+
+            let session = SubAgentSession::new(
+                kind,
+                prompt,
+                &scope_path,
+                provider_client,
+                &self.config,
+                self.shutdown_flag(),
+            );
+            let result = session.run();
+            agent_results.push(match result {
+                Ok(r) => r.into_tool_execution_result(call),
+                Err(e) => e.into_tool_execution_result(call),
+            });
+        }
+
+        (agent_results, normal_calls)
+    }
+
     /// Execute tool calls and feed results back to the LLM in a loop.
     ///
     /// This implements the agentic tool-use loop:
@@ -167,6 +264,22 @@ impl App {
                 break;
             }
 
+            // Step 1: Extract and run sub-agent calls (IR3-001)
+            let (agent_results, normal_calls) =
+                self.extract_and_run_subagent_calls(&current.tool_calls, provider_client);
+
+            // Record sub-agent results first (IR3-002)
+            for result in &agent_results {
+                self.record_tool_result(result);
+            }
+            total_tool_count += agent_results.len();
+
+            // Rebuild structured response with only normal calls
+            let current_normal = StructuredAssistantResponse {
+                tool_calls: normal_calls,
+                final_response: current.final_response.clone(),
+            };
+
             // Show plan for this iteration
             let inferred_plan = infer_plan_from_structured_response(&current);
             let thinking = AppStateSnapshot::new(RuntimeState::Thinking)
@@ -189,8 +302,8 @@ impl App {
             // Skip intermediate Thinking frames — the user already sees
             // live streaming output on stderr (Issue #1).
 
-            // Execute tool calls and record results WITH payload
-            let results = self.execute_structured_tool_calls(&current)?;
+            // Execute normal tool calls and record results WITH payload
+            let results = self.execute_structured_tool_calls(&current_normal)?;
             total_tool_count += results.len();
 
             let tool_log_views: Vec<ToolLogView> = results
@@ -686,6 +799,14 @@ pub(crate) fn infer_plan_from_structured_response(
             crate::tooling::ToolInput::Mcp { server, tool, .. } => {
                 format!("mcp call {server}/{tool}")
             }
+            crate::tooling::ToolInput::AgentExplore { prompt, .. } => {
+                let truncated = truncate_chars(prompt, 50);
+                format!("explore: {truncated}")
+            }
+            crate::tooling::ToolInput::AgentPlan { prompt, .. } => {
+                let truncated = truncate_chars(prompt, 50);
+                format!("plan: {truncated}")
+            }
         };
         plan.push(item);
     }
@@ -778,13 +899,19 @@ fn tool_call_approval_summary(call: &crate::tooling::ToolCallRequest) -> String 
             let args_preview = {
                 let formatted = serde_json::to_string_pretty(arguments)
                     .unwrap_or_else(|_| arguments.to_string());
-                if formatted.len() > 500 {
-                    format!("{}...(truncated)", &formatted[..500])
-                } else {
-                    formatted
-                }
+                truncate_chars(&formatted, 500)
             };
             format!("MCP {server}/{tool}\n  arguments: {args_preview}")
+        }
+        crate::tooling::ToolInput::AgentExplore { prompt, scope, .. } => {
+            let scope_info = scope.as_deref().unwrap_or("(project root)");
+            let truncated = truncate_chars(prompt, 100);
+            format!("agent.explore [scope: {scope_info}]: {truncated}")
+        }
+        crate::tooling::ToolInput::AgentPlan { prompt, scope, .. } => {
+            let scope_info = scope.as_deref().unwrap_or("(project root)");
+            let truncated = truncate_chars(prompt, 100);
+            format!("agent.plan [scope: {scope_info}]: {truncated}")
         }
         _ => call.tool_name.clone(),
     }
@@ -805,5 +932,17 @@ fn prompt_inline_approval(summary: &str, diff_preview: Option<&str>) -> bool {
         matches!(answer.as_str(), "y" | "yes")
     } else {
         false
+    }
+}
+
+/// Truncate a string to at most `max_chars` Unicode characters, appending
+/// "..." if truncation occurred.  This is safe for multi-byte UTF-8 strings
+/// unlike byte-index slicing (`&s[..n]`), which can panic mid-character.
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max_chars).collect();
+        format!("{truncated}...")
     }
 }
