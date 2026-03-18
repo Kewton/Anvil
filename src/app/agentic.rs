@@ -11,11 +11,131 @@ use crate::session::{MessageRole, SessionMessage};
 use crate::spinner::Spinner;
 use crate::state::StateTransition;
 use crate::tooling::{
-    LocalToolExecutor, ToolExecutionPayload, ToolExecutionPolicy, ToolExecutionResult,
+    ExecutionMode, LocalToolExecutor, ToolExecutionPayload, ToolExecutionPolicy,
+    ToolExecutionRequest, ToolExecutionResult, ToolExecutionStatus,
 };
 use crate::tui::Tui;
 
 use super::{App, AppError};
+
+/// Maximum number of parallel threads for tool execution.
+const MAX_PARALLEL_THREADS: usize = 8;
+
+/// Tool call execution group produced by [`group_by_execution_mode`].
+#[derive(Debug)]
+pub enum ExecutionGroup {
+    /// A group of tools that can be executed in parallel.
+    /// Uses parallel execution when 2+ items, sequential for 1 item.
+    Parallel(Vec<(usize, ToolExecutionRequest)>),
+    /// A single tool that must be executed sequentially.
+    Sequential(usize, ToolExecutionRequest),
+}
+
+/// Group indexed tool execution requests by their [`ExecutionMode`].
+///
+/// Consecutive `ParallelSafe` requests are collected into a single
+/// [`ExecutionGroup::Parallel`] group.  Each `SequentialOnly` request
+/// flushes any accumulated parallel group and becomes its own
+/// [`ExecutionGroup::Sequential`] item.
+pub fn group_by_execution_mode(requests: &[(usize, ToolExecutionRequest)]) -> Vec<ExecutionGroup> {
+    let mut groups = Vec::new();
+    let mut current_parallel: Vec<(usize, ToolExecutionRequest)> = Vec::new();
+
+    for (idx, request) in requests {
+        if request.spec.execution_mode == ExecutionMode::ParallelSafe {
+            current_parallel.push((*idx, request.clone()));
+        } else {
+            if !current_parallel.is_empty() {
+                groups.push(ExecutionGroup::Parallel(std::mem::take(
+                    &mut current_parallel,
+                )));
+            }
+            groups.push(ExecutionGroup::Sequential(*idx, request.clone()));
+        }
+    }
+
+    if !current_parallel.is_empty() {
+        groups.push(ExecutionGroup::Parallel(current_parallel));
+    }
+
+    groups
+}
+
+/// Execute a group of tool requests in parallel using scoped threads.
+///
+/// This is a standalone function (not an `App` method) to avoid borrow
+/// conflicts with `&mut self` in [`App::execute_structured_tool_calls`].
+/// Each thread creates its own [`LocalToolExecutor`] instance.
+fn execute_parallel_group_standalone(
+    config: &crate::config::EffectiveConfig,
+    shutdown_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    requests: Vec<(usize, ToolExecutionRequest)>,
+) -> Vec<(usize, ToolExecutionResult)> {
+    let cwd = config.paths.cwd.clone();
+    let runtime = &config.runtime;
+    let mut all_results = Vec::new();
+
+    for chunk in requests.chunks(MAX_PARALLEL_THREADS) {
+        all_results.extend(std::thread::scope(|s| {
+            let handles: Vec<_> = chunk
+                .iter()
+                .map(|(idx, request)| {
+                    let cwd = cwd.clone();
+                    let shutdown = shutdown_flag.clone();
+                    let idx = *idx;
+                    s.spawn(move || {
+                        let mut executor =
+                            LocalToolExecutor::new(cwd, runtime).with_shutdown_flag(shutdown);
+                        let tool_call_id = request.tool_call_id.clone();
+                        let tool_name = request.spec.name.clone();
+                        let result = executor.execute(request.clone()).unwrap_or_else(|err| {
+                            ToolExecutionResult {
+                                tool_call_id,
+                                tool_name,
+                                status: ToolExecutionStatus::Failed,
+                                summary: err.to_string(),
+                                payload: ToolExecutionPayload::Text(err.to_string()),
+                                artifacts: Vec::new(),
+                                elapsed_ms: 0,
+                            }
+                        });
+                        (idx, result)
+                    })
+                })
+                .collect();
+
+            let mut results = Vec::new();
+            for handle in handles {
+                match handle.join() {
+                    Ok(indexed_result) => results.push(indexed_result),
+                    Err(panic_payload) => {
+                        let detail = panic_payload
+                            .downcast_ref::<String>()
+                            .map(|s| s.as_str())
+                            .or_else(|| panic_payload.downcast_ref::<&str>().copied())
+                            .unwrap_or("unknown");
+                        tracing::error!("parallel tool thread panicked: {detail}");
+                        results.push((
+                            usize::MAX,
+                            ToolExecutionResult {
+                                tool_call_id: String::new(),
+                                tool_name: String::new(),
+                                status: ToolExecutionStatus::Failed,
+                                summary: "parallel tool execution failed unexpectedly".to_string(),
+                                payload: ToolExecutionPayload::None,
+                                artifacts: Vec::new(),
+                                elapsed_ms: 0,
+                            },
+                        ));
+                    }
+                }
+            }
+            results
+        }));
+    }
+
+    all_results
+}
 
 impl App {
     /// Execute tool calls and feed results back to the LLM in a loop.
@@ -204,38 +324,41 @@ impl App {
         Ok(frames)
     }
 
-    pub(crate) fn execute_structured_tool_calls(
+    /// Phase 1 helper: validate and approve all tool calls.
+    ///
+    /// Returns a tuple of (successful requests with index, failed results with index).
+    #[allow(clippy::type_complexity)]
+    fn validate_and_approve_all(
         &mut self,
-        structured: &StructuredAssistantResponse,
-    ) -> Result<Vec<ToolExecutionResult>, AppError> {
-        let mut executor =
-            LocalToolExecutor::new(self.config.paths.cwd.clone(), &self.config.runtime)
-                .with_shutdown_flag(self.shutdown_flag());
-        let mut results = Vec::new();
-        for call in &structured.tool_calls {
+        tool_calls: &[crate::tooling::ToolCallRequest],
+    ) -> (
+        Vec<(usize, ToolExecutionRequest)>,
+        Vec<(usize, ToolExecutionResult)>,
+    ) {
+        let mut requests = Vec::new();
+        let mut failed_results = Vec::new();
+
+        for (idx, call) in tool_calls.iter().enumerate() {
             let validated = match self.tools.validate(call.clone()) {
                 Ok(v) => v,
                 Err(err) => {
-                    let error_result =
-                        build_failed_result(call, format!("validation failed: {err:?}"));
-                    self.record_tool_result(&error_result);
-                    results.push(error_result);
+                    failed_results.push((
+                        idx,
+                        build_failed_result(call, format!("validation failed: {err:?}")),
+                    ));
                     continue;
                 }
             };
-            // Check if this tool needs approval in the current mode
             if self.config.mode.approval_required && validated.approval_required(true).is_some() {
                 let summary = tool_call_approval_summary(call);
-                // Ask user inline via stderr/stdin
                 let approved = prompt_inline_approval(&summary);
                 if !approved {
-                    let denied_result = build_failed_result(call, "denied by user".to_string());
-                    self.record_tool_result(&denied_result);
-                    results.push(denied_result);
+                    failed_results
+                        .push((idx, build_failed_result(call, "denied by user".to_string())));
                     continue;
                 }
             }
-            let request = match validated
+            match validated
                 .approve()
                 .into_execution_request(ToolExecutionPolicy {
                     approval_required: false,
@@ -243,30 +366,82 @@ impl App {
                     plan_mode: false,
                     plan_scope_granted: true,
                 }) {
-                Ok(r) => r,
+                Ok(request) => requests.push((idx, request)),
                 Err(err) => {
-                    let error_result = build_failed_result(call, format!("{err:?}"));
-                    self.record_tool_result(&error_result);
-                    results.push(error_result);
-                    continue;
+                    failed_results.push((idx, build_failed_result(call, format!("{err:?}"))));
                 }
-            };
-            let result = match executor.execute(request) {
-                Ok(r) => r,
-                Err(err) => ToolExecutionResult {
-                    tool_call_id: call.tool_call_id.clone(),
-                    tool_name: call.tool_name.clone(),
-                    status: crate::tooling::ToolExecutionStatus::Failed,
-                    summary: err.to_string(),
-                    payload: crate::tooling::ToolExecutionPayload::Text(err.to_string()),
-                    artifacts: Vec::new(),
-                    elapsed_ms: 0,
-                },
-            };
-            // Record tool result WITH actual payload so the LLM can see it
-            self.record_tool_result(&result);
-            results.push(result);
+            }
         }
+
+        (requests, failed_results)
+    }
+
+    /// Phase 3 helper: execute a single tool request.
+    fn execute_single(&mut self, request: ToolExecutionRequest) -> ToolExecutionResult {
+        let mut executor =
+            LocalToolExecutor::new(self.config.paths.cwd.clone(), &self.config.runtime)
+                .with_shutdown_flag(self.shutdown_flag());
+
+        executor
+            .execute(request)
+            .unwrap_or_else(|err| ToolExecutionResult {
+                tool_call_id: String::new(),
+                tool_name: String::new(),
+                status: ToolExecutionStatus::Failed,
+                summary: err.to_string(),
+                payload: ToolExecutionPayload::Text(err.to_string()),
+                artifacts: Vec::new(),
+                elapsed_ms: 0,
+            })
+    }
+
+    pub(crate) fn execute_structured_tool_calls(
+        &mut self,
+        structured: &StructuredAssistantResponse,
+    ) -> Result<Vec<ToolExecutionResult>, AppError> {
+        // Phase 1: Validation + Approval
+        let (validated_requests, failed_results) =
+            self.validate_and_approve_all(&structured.tool_calls);
+
+        // Phase 2: Grouping
+        let groups = group_by_execution_mode(&validated_requests);
+
+        // Phase 3: Execution
+        let mut indexed_results: Vec<(usize, ToolExecutionResult)> = failed_results;
+        for group in groups {
+            match group {
+                ExecutionGroup::Parallel(requests) if requests.len() >= 2 => {
+                    let parallel_results = execute_parallel_group_standalone(
+                        &self.config,
+                        self.shutdown_flag(),
+                        requests,
+                    );
+                    indexed_results.extend(parallel_results);
+                }
+                ExecutionGroup::Parallel(requests) => {
+                    // Single ParallelSafe item — execute sequentially
+                    for (idx, req) in requests {
+                        let result = self.execute_single(req);
+                        indexed_results.push((idx, result));
+                    }
+                }
+                ExecutionGroup::Sequential(idx, req) => {
+                    let result = self.execute_single(req);
+                    indexed_results.push((idx, result));
+                }
+            }
+        }
+
+        // Phase 4: Sort by index, batch record, persist session
+        indexed_results.sort_by_key(|(idx, _)| *idx);
+        let results: Vec<ToolExecutionResult> = indexed_results
+            .into_iter()
+            .map(|(_, result)| {
+                self.record_tool_result(&result);
+                result
+            })
+            .collect();
+
         self.persist_session(crate::contracts::AppEvent::SessionSaved)?;
         Ok(results)
     }

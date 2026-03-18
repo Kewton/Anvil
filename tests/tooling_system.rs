@@ -1,8 +1,10 @@
+use anvil::app::agentic::{ExecutionGroup, group_by_execution_mode};
 use anvil::tooling::{
-    ExecutionClass, LocalToolExecutor, ParallelExecutionPlan, ParallelExecutionPlanError,
-    PermissionClass, PlanModePolicy, RollbackPolicy, ToolCallRequest, ToolExecutionError,
-    ToolExecutionPayload, ToolExecutionPolicy, ToolExecutionRequest, ToolExecutionResult,
-    ToolExecutionStatus, ToolInput, ToolKind, ToolRegistry, ToolValidationError,
+    ExecutionClass, ExecutionMode, LocalToolExecutor, ParallelExecutionPlan,
+    ParallelExecutionPlanError, PermissionClass, PlanModePolicy, RollbackPolicy, ToolCallRequest,
+    ToolExecutionError, ToolExecutionPayload, ToolExecutionPolicy, ToolExecutionRequest,
+    ToolExecutionResult, ToolExecutionStatus, ToolInput, ToolKind, ToolRegistry,
+    ToolValidationError,
 };
 use std::fs;
 
@@ -1512,4 +1514,200 @@ fn file_edit_sandbox_escape_rejected() {
         .expect_err("should reject sandbox escape");
 
     assert!(err.to_string().contains("invalid tool path"));
+}
+
+// --- Parallel execution grouping tests ---
+
+/// Build a ToolExecutionRequest with a given spec name and execution mode.
+fn build_exec_request(name: &str, mode: ExecutionMode) -> ToolExecutionRequest {
+    let registry = build_registry();
+    // Pick a real spec that matches the desired execution mode.
+    let mut spec = match mode {
+        ExecutionMode::ParallelSafe => registry.get("file.read").unwrap().clone(),
+        ExecutionMode::SequentialOnly => registry.get("file.write").unwrap().clone(),
+    };
+    // Override the name for test clarity (the spec already has the right execution_mode).
+    spec.name = name.to_string();
+    ToolExecutionRequest {
+        tool_call_id: format!("call_{name}"),
+        spec,
+        input: ToolInput::FileRead {
+            path: "dummy.txt".to_string(),
+        },
+    }
+}
+
+#[test]
+fn group_by_execution_mode_all_parallel() {
+    let requests: Vec<(usize, ToolExecutionRequest)> = vec![
+        (0, build_exec_request("read1", ExecutionMode::ParallelSafe)),
+        (1, build_exec_request("read2", ExecutionMode::ParallelSafe)),
+        (2, build_exec_request("read3", ExecutionMode::ParallelSafe)),
+    ];
+
+    let groups = group_by_execution_mode(&requests);
+    assert_eq!(groups.len(), 1);
+    match &groups[0] {
+        ExecutionGroup::Parallel(items) => assert_eq!(items.len(), 3),
+        _ => panic!("expected Parallel group"),
+    }
+}
+
+#[test]
+fn group_by_execution_mode_all_sequential() {
+    let requests: Vec<(usize, ToolExecutionRequest)> = vec![
+        (
+            0,
+            build_exec_request("write1", ExecutionMode::SequentialOnly),
+        ),
+        (
+            1,
+            build_exec_request("write2", ExecutionMode::SequentialOnly),
+        ),
+        (
+            2,
+            build_exec_request("write3", ExecutionMode::SequentialOnly),
+        ),
+    ];
+
+    let groups = group_by_execution_mode(&requests);
+    assert_eq!(groups.len(), 3);
+    for group in &groups {
+        match group {
+            ExecutionGroup::Sequential(_, _) => {}
+            _ => panic!("expected Sequential group"),
+        }
+    }
+}
+
+#[test]
+fn group_by_execution_mode_mixed() {
+    // [read, read, write, read, search] -> [Parallel([read,read]), Sequential(write), Parallel([read,search])]
+    let requests: Vec<(usize, ToolExecutionRequest)> = vec![
+        (0, build_exec_request("read1", ExecutionMode::ParallelSafe)),
+        (1, build_exec_request("read2", ExecutionMode::ParallelSafe)),
+        (
+            2,
+            build_exec_request("write1", ExecutionMode::SequentialOnly),
+        ),
+        (3, build_exec_request("read3", ExecutionMode::ParallelSafe)),
+        (
+            4,
+            build_exec_request("search1", ExecutionMode::ParallelSafe),
+        ),
+    ];
+
+    let groups = group_by_execution_mode(&requests);
+    assert_eq!(groups.len(), 3);
+
+    match &groups[0] {
+        ExecutionGroup::Parallel(items) => {
+            assert_eq!(items.len(), 2);
+            assert_eq!(items[0].0, 0);
+            assert_eq!(items[1].0, 1);
+        }
+        _ => panic!("expected Parallel group at index 0"),
+    }
+    match &groups[1] {
+        ExecutionGroup::Sequential(idx, _) => assert_eq!(*idx, 2),
+        _ => panic!("expected Sequential group at index 1"),
+    }
+    match &groups[2] {
+        ExecutionGroup::Parallel(items) => {
+            assert_eq!(items.len(), 2);
+            assert_eq!(items[0].0, 3);
+            assert_eq!(items[1].0, 4);
+        }
+        _ => panic!("expected Parallel group at index 2"),
+    }
+}
+
+#[test]
+fn group_by_execution_mode_empty() {
+    let requests: Vec<(usize, ToolExecutionRequest)> = vec![];
+    let groups = group_by_execution_mode(&requests);
+    assert!(groups.is_empty());
+}
+
+#[test]
+fn group_by_execution_mode_single_parallel() {
+    let requests: Vec<(usize, ToolExecutionRequest)> =
+        vec![(0, build_exec_request("read1", ExecutionMode::ParallelSafe))];
+
+    let groups = group_by_execution_mode(&requests);
+    assert_eq!(groups.len(), 1);
+    match &groups[0] {
+        ExecutionGroup::Parallel(items) => assert_eq!(items.len(), 1),
+        _ => panic!("expected Parallel group with 1 element"),
+    }
+}
+
+#[test]
+fn parallel_execution_preserves_result_order() {
+    // Create multiple real files and read them in parallel.
+    // Verify results come back in the original request order.
+    let root = std::env::temp_dir().join("anvil_parallel_order_test");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("dir should exist");
+
+    let file_count = 5;
+    for i in 0..file_count {
+        fs::write(root.join(format!("file_{i}.txt")), format!("content_{i}"))
+            .expect("write should succeed");
+    }
+
+    let registry = build_registry();
+    let read_spec = registry.get("file.read").unwrap().clone();
+
+    let requests: Vec<(usize, ToolExecutionRequest)> = (0..file_count)
+        .map(|i| {
+            (
+                i,
+                ToolExecutionRequest {
+                    tool_call_id: format!("call_read_{i}"),
+                    spec: read_spec.clone(),
+                    input: ToolInput::FileRead {
+                        path: format!("./file_{i}.txt"),
+                    },
+                },
+            )
+        })
+        .collect();
+
+    // Execute using LocalToolExecutor in parallel via thread::scope
+    let mut results: Vec<(usize, ToolExecutionResult)> = Vec::new();
+    std::thread::scope(|s| {
+        let handles: Vec<_> = requests
+            .iter()
+            .map(|(idx, req)| {
+                let root = root.clone();
+                let idx = *idx;
+                let req = req.clone();
+                s.spawn(move || {
+                    let mut executor = LocalToolExecutor::new_without_rate_limit(root);
+                    let result = executor.execute(req).expect("read should succeed");
+                    (idx, result)
+                })
+            })
+            .collect();
+        for handle in handles {
+            results.push(handle.join().expect("thread should not panic"));
+        }
+    });
+
+    // Sort by index (as the real implementation does)
+    results.sort_by_key(|(idx, _)| *idx);
+
+    // Verify order and content
+    assert_eq!(results.len(), file_count);
+    for (i, (idx, result)) in results.iter().enumerate() {
+        assert_eq!(*idx, i);
+        assert_eq!(result.status, ToolExecutionStatus::Completed);
+        match &result.payload {
+            ToolExecutionPayload::Text(content) => {
+                assert!(content.contains(&format!("content_{i}")));
+            }
+            _ => panic!("expected Text payload for file_{i}"),
+        }
+    }
 }
