@@ -113,6 +113,9 @@ pub struct App {
     system_prompt: String,
     shutdown_flag: Arc<AtomicBool>,
     warning_tracker: ContextWarningTracker,
+    /// Hooks engine. `None` when hooks.json is absent or initialization failed.
+    /// Declared before mcp_manager to maintain Drop order (DR3-007).
+    hooks_engine: Option<crate::hooks::HooksEngine>,
     /// MCP server manager. `None` when mcp.json is absent or initialization failed.
     /// [D2-010] Declared last so it is dropped last (Drop order = declaration order).
     mcp_manager: Option<crate::mcp::McpManager>,
@@ -252,6 +255,25 @@ impl App {
             }
         };
 
+        // --- Hooks initialization (MCP pattern, DR3-010) ---
+        let hooks_engine = match crate::config::load_hooks_config(&config.paths) {
+            Ok(Some(hooks_config)) => {
+                if hooks_config.is_empty() {
+                    None
+                } else {
+                    Some(crate::hooks::HooksEngine::new(
+                        hooks_config,
+                        Arc::clone(&shutdown_flag),
+                    ))
+                }
+            }
+            Ok(None) => None, // hooks.json not found → skip completely
+            Err(e) => {
+                eprintln!("Warning: hooks config error: {e}");
+                None // graceful degradation
+            }
+        };
+
         // [D1-009] ToolSpec conversion and ToolRegistry registration done by App side (SRP)
         // [D2-003] standard_tool_registry() is a free function
         let mut tools = standard_tool_registry();
@@ -305,6 +327,7 @@ impl App {
             system_prompt,
             shutdown_flag,
             warning_tracker: ContextWarningTracker::new(),
+            hooks_engine,
             mcp_manager,
         })
     }
@@ -362,6 +385,59 @@ impl App {
     /// Save the session on exit (wrapper for flush_session).
     pub(crate) fn save_session_on_exit(&mut self) {
         let _ = self.flush_session();
+    }
+
+    /// Run PostSession hook (DR2-005, DR2-007 facade method).
+    ///
+    /// Builds PostSessionEvent from config and session, then delegates to
+    /// HooksEngine. Soft-fail: errors are logged but not propagated.
+    pub(crate) fn run_post_session_hook(&mut self) {
+        let Some(ref engine) = self.hooks_engine else {
+            return;
+        };
+        let event = crate::hooks::PostSessionEvent {
+            hook_point: "PostSession",
+            session_id: self.session.metadata.session_id.clone(),
+            mode: if self.config.mode.interactive {
+                "interactive".to_string()
+            } else {
+                "non-interactive".to_string()
+            },
+        };
+        if let Err(err) = engine.run_post_session(event) {
+            tracing::warn!("PostSession hook error: {err}");
+        }
+    }
+
+    /// Run PreCompact hook + compact_history (DR1-005 wrapper, DR2-003).
+    ///
+    /// trigger: "auto" or "manual"
+    /// For auto: checks should_compact() first, keep_recent = threshold/2
+    /// For manual: unconditional, keep_recent = 8
+    fn compact_with_hooks(&mut self, trigger: &str) -> bool {
+        if trigger == "auto" && !self.session.should_compact() {
+            return false;
+        }
+
+        // Run PreCompact hook (soft-fail)
+        if let Some(ref engine) = self.hooks_engine {
+            let event = crate::hooks::PreCompactEvent {
+                hook_point: "PreCompact",
+                session_id: self.session.metadata.session_id.clone(),
+                trigger: trigger.to_string(),
+                message_count: self.session.messages.len(),
+            };
+            if let Err(err) = engine.run_pre_compact(event) {
+                tracing::warn!("PreCompact hook error: {err}");
+            }
+        }
+
+        let keep_recent = if trigger == "auto" {
+            self.session.auto_compact_threshold / 2
+        } else {
+            8
+        };
+        self.session.compact_history(keep_recent)
     }
 
     /// Get a clone of the shutdown flag for injection into sub-components.
@@ -738,7 +814,7 @@ impl App {
         if !self.config.mode.interactive {
             return Ok(());
         }
-        self.session.compact_if_needed();
+        self.compact_with_hooks("auto");
         if self.session.dirty {
             self.session_store.save(&self.session)?;
             self.session.clear_dirty();
@@ -1171,7 +1247,7 @@ impl App {
     }
 
     fn compact_session_history(&mut self) -> Result<String, AppError> {
-        let changed = self.session.compact_history(8);
+        let changed = self.compact_with_hooks("manual");
         if changed {
             self.persist_session(AppEvent::SessionSaved)?;
             let usage = ContextUsageView {

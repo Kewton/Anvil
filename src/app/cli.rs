@@ -166,19 +166,29 @@ fn run_non_interactive<C: ProviderClient>(
 
     // 2. Execute the prompt via run_live_turn
     let tui = Tui::new();
-    let _frames = app.run_live_turn(&prompt, provider_client, &tui)?;
+    match app.run_live_turn(&prompt, provider_client, &tui) {
+        Ok(_frames) => {
+            // 3. Output the last assistant message to stdout
+            if let Some(response) = app.session().last_assistant_message() {
+                print!("{}", response);
+            }
 
-    // 3. Output the last assistant message to stdout
-    if let Some(response) = app.session().last_assistant_message() {
-        print!("{}", response);
+            // Run PostSession hook (DR3-004: after run_live_turn success)
+            app.run_post_session_hook();
+
+            // 4. Check for tool execution failures
+            if app.has_tool_execution_failure() {
+                return Err(AppError::ToolExecution("tool execution failed".to_string()));
+            }
+
+            Ok(())
+        }
+        Err(err) => {
+            // DR3-004: Run PostSession hook on error paths after run_live_turn
+            app.run_post_session_hook();
+            Err(err)
+        }
     }
-
-    // 4. Check for tool execution failures
-    if app.has_tool_execution_failure() {
-        return Err(AppError::ToolExecution("tool execution failed".to_string()));
-    }
-
-    Ok(())
 }
 
 /// Interactive session loop powered by `rustyline`.
@@ -235,6 +245,9 @@ fn run_interactive_loop<C: ProviderClient>(
             }
         }
     }
+
+    // Run PostSession hook before saving
+    app.run_post_session_hook();
 
     // Save session on exit
     app.save_session_on_exit();

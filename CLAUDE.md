@@ -113,6 +113,8 @@ src/
 ├── extensions/
 │   ├── mod.rs           # スラッシュコマンド・拡張
 │   └── skills.rs        # SKILL.mdベースのスキルシステム
+├── hooks/
+│   └── mod.rs           # ライフサイクルフック（HooksConfig, HookRunner, HooksEngine）
 ├── logging.rs           # 構造化ロギング（tracing初期化）
 ├── mcp/
 │   ├── mod.rs           # MCPクライアント（McpManager, McpConnection, McpError）
@@ -140,7 +142,8 @@ tests/
 ├── tooling_system.rs    # ツールシステムテスト
 ├── mcp_integration.rs   # MCP統合テスト
 ├── tui_console.rs       # TUIテスト
-└── skills_system.rs     # スキルシステムテスト
+├── skills_system.rs     # スキルシステムテスト
+└── hooks_system.rs      # フックシステムテスト
 ```
 
 ---

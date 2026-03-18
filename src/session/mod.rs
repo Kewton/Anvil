@@ -159,6 +159,12 @@ impl SessionRecord {
         self.touch();
     }
 
+    /// Check whether auto-compaction should run (DR3-001).
+    /// Zero-guard: returns false if auto_compact_threshold == 0.
+    pub fn should_compact(&self) -> bool {
+        self.auto_compact_threshold > 0 && self.messages.len() > self.auto_compact_threshold
+    }
+
     /// Run auto-compaction if message count exceeds the threshold.
     /// Called at turn boundaries (before flush) to avoid per-message overhead.
     pub fn compact_if_needed(&mut self) -> bool {
