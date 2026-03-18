@@ -68,6 +68,7 @@ pub struct PathConfig {
     pub session_dir: PathBuf,
     pub session_file: PathBuf,
     pub logs_dir: PathBuf,
+    pub mcp_config_file: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -186,6 +187,7 @@ impl EffectiveConfig {
                 log_filter: None,
             },
             paths: PathConfig {
+                mcp_config_file: cwd.join(".anvil").join("mcp.json"),
                 cwd,
                 workspace_dir,
                 config_file,
@@ -755,5 +757,98 @@ fn parse_web_search_provider(value: &str) -> Result<WebSearchProvider, ConfigErr
         "duckduckgo" => Ok(WebSearchProvider::DuckDuckGo),
         "serper_api" | "serperapi" | "serper" => Ok(WebSearchProvider::SerperApi),
         other => Err(ConfigError::InvalidWebSearchProvider(other.to_string())),
+    }
+}
+
+// --- MCP configuration loading ---
+
+use crate::mcp::{McpConfigFile, McpServerConfig};
+
+/// Load MCP configuration from `.anvil/mcp.json`.
+///
+/// Returns `Ok(None)` if the file does not exist (MCP is optional).
+/// Returns `Ok(Some(...))` with expanded environment variables on success.
+/// Returns `Err(...)` on parse or env-var expansion errors.
+pub fn load_mcp_config(
+    paths: &PathConfig,
+) -> Result<Option<HashMap<String, McpServerConfig>>, String> {
+    if !paths.mcp_config_file.exists() {
+        return Ok(None);
+    }
+    let content = std::fs::read_to_string(&paths.mcp_config_file)
+        .map_err(|e| format!("Failed to read mcp.json: {e}"))?;
+    let config: McpConfigFile =
+        serde_json::from_str(&content).map_err(|e| format!("Failed to parse mcp.json: {e}"))?;
+
+    // Expand environment variable references ($VAR_NAME → actual value)
+    // [D4-008] Undefined variables cause an error for the affected server
+    let expanded = expand_env_vars(config.mcp_servers)?;
+
+    // [D4-008] Check for plaintext API key values in env fields
+    check_mcp_config_security_warnings(&expanded);
+
+    Ok(Some(expanded))
+}
+
+/// Expand `$VAR_NAME` references in MCP server config env values.
+///
+/// [D4-008] If a `$VAR_NAME` reference is undefined, returns an error
+/// naming the variable and the server that requires it.
+fn expand_env_vars(
+    configs: HashMap<String, McpServerConfig>,
+) -> Result<HashMap<String, McpServerConfig>, String> {
+    let mut result = HashMap::new();
+    for (server_name, mut config) in configs {
+        let mut expanded_env = HashMap::new();
+        for (key, value) in &config.env {
+            if let Some(var_name) = value.strip_prefix('$') {
+                match std::env::var(var_name) {
+                    Ok(resolved) => {
+                        expanded_env.insert(key.clone(), resolved);
+                    }
+                    Err(_) => {
+                        return Err(format!(
+                            "Environment variable ${var_name} is not set (required by server '{server_name}')"
+                        ));
+                    }
+                }
+            } else {
+                expanded_env.insert(key.clone(), value.clone());
+            }
+        }
+        config.env = expanded_env;
+        result.insert(server_name, config);
+    }
+    Ok(result)
+}
+
+/// Known prefixes that indicate an API key or token.
+const KNOWN_SECRET_PREFIXES: &[&str] = &["ghp_", "sk-", "xoxb-", "xoxp-", "ghu_", "ghs_"];
+
+/// [D4-008] Check MCP config env fields for plaintext API keys.
+///
+/// Warns if an env value appears to be a hardcoded secret rather than
+/// an environment variable reference (`$VAR`).
+fn check_mcp_config_security_warnings(configs: &HashMap<String, McpServerConfig>) {
+    for (server_name, config) in configs {
+        for (key, value) in &config.env {
+            // Skip env-var references
+            if value.starts_with('$') {
+                continue;
+            }
+            // Check length and known prefixes
+            if value.len() >= 20 {
+                let looks_like_secret = KNOWN_SECRET_PREFIXES
+                    .iter()
+                    .any(|prefix| value.starts_with(prefix));
+                if looks_like_secret {
+                    eprintln!(
+                        "⚠ Warning: MCP server '{server_name}' env key '{key}' appears to contain \
+                         a plaintext API key. Consider using an environment variable reference \
+                         (e.g., \"${key}\") instead for better security."
+                    );
+                }
+            }
+        }
     }
 }

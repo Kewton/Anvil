@@ -28,7 +28,10 @@ use crate::session::{
 };
 use crate::spinner::Spinner;
 use crate::state::{StateMachine, StateTransition};
-use crate::tooling::ToolRegistry;
+use crate::tooling::{
+    ExecutionClass, ExecutionMode, PermissionClass, PlanModePolicy, RollbackPolicy, ToolKind,
+    ToolRegistry, ToolSpec,
+};
 use crate::tui::Tui;
 use std::fmt::{Display, Formatter};
 use std::io::{self, Write};
@@ -110,6 +113,9 @@ pub struct App {
     system_prompt: String,
     shutdown_flag: Arc<AtomicBool>,
     warning_tracker: ContextWarningTracker,
+    /// MCP server manager. `None` when mcp.json is absent or initialization failed.
+    /// [D2-010] Declared last so it is dropped last (Drop order = declaration order).
+    mcp_manager: Option<crate::mcp::McpManager>,
 }
 
 /// Whether the session loop should continue or exit.
@@ -214,8 +220,59 @@ impl App {
         let extensions = ExtensionRegistry::load(&config.paths.cwd)?;
         session.auto_compact_threshold = config.runtime.auto_compact_threshold;
 
+        // --- MCP initialization (Task 3.2) ---
+        // [D1-007] shutdown_flag is managed by App side (YAGNI)
+        let mcp_manager = match crate::config::load_mcp_config(&config.paths) {
+            Ok(Some(mcp_configs)) => {
+                match crate::mcp::McpManager::start_all(mcp_configs) {
+                    Ok(manager) => Some(manager),
+                    Err(e) => {
+                        eprintln!("Warning: MCP initialization failed: {e}");
+                        None // graceful degradation
+                    }
+                }
+            }
+            Ok(None) => None, // mcp.json not found → skip completely
+            Err(e) => {
+                eprintln!("Warning: MCP config parse error: {e}");
+                None // graceful degradation
+            }
+        };
+
+        // [D1-009] ToolSpec conversion and ToolRegistry registration done by App side (SRP)
+        // [D2-003] standard_tool_registry() is a free function
+        let mut tools = standard_tool_registry();
+        if let Some(ref manager) = mcp_manager {
+            let mcp_tools = manager.get_tools();
+            for (server_name, tool_list) in &mcp_tools {
+                for tool_info in tool_list {
+                    // [D1-011, D2-001] Default ToolSpec values for MCP tools
+                    let spec = ToolSpec {
+                        version: 1,
+                        name: format!("mcp__{server_name}__{}", tool_info.name),
+                        kind: ToolKind::Mcp,
+                        execution_class: ExecutionClass::Network,
+                        permission_class: PermissionClass::Confirm,
+                        execution_mode: ExecutionMode::SequentialOnly,
+                        plan_mode: PlanModePolicy::Allowed,
+                        rollback_policy: RollbackPolicy::None,
+                    };
+                    tools.register(spec);
+                }
+            }
+        }
+
+        // [D1-009] System prompt generation with MCP tool descriptions done by App side
+        let mcp_descriptions = mcp_manager.as_ref().map(|manager| {
+            let mcp_tools = manager.get_tools();
+            crate::agent::generate_mcp_tool_descriptions(&mcp_tools)
+        });
+
         let detected_languages = detect_project_languages(&config.paths.cwd);
-        let base_prompt = crate::agent::tool_protocol_system_prompt(&detected_languages);
+        let base_prompt = crate::agent::tool_protocol_system_prompt(
+            &detected_languages,
+            mcp_descriptions.as_deref(),
+        );
         let system_prompt = match config.project_instructions() {
             Some(instructions) => format!(
                 "{}\n\n## Project instructions (from ANVIL.md)\n{}",
@@ -225,7 +282,7 @@ impl App {
         };
 
         Ok(Self {
-            tools: standard_tool_registry(),
+            tools,
             config,
             provider,
             state_machine: StateMachine::from_snapshot(initial_state_snapshot),
@@ -235,6 +292,7 @@ impl App {
             system_prompt,
             shutdown_flag,
             warning_tracker: ContextWarningTracker::new(),
+            mcp_manager,
         })
     }
 

@@ -112,6 +112,9 @@ src/
 │   └── tokens.rs        # トークン推定（CJK対応ヒューリスティック）
 ├── extensions/mod.rs    # スラッシュコマンド・拡張
 ├── logging.rs           # 構造化ロギング（tracing初期化）
+├── mcp/
+│   ├── mod.rs           # MCPクライアント（McpManager, McpConnection, McpError）
+│   └── transport.rs     # STDIOトランスポート（McpTransport trait, StdioTransport）
 ├── metrics/mod.rs       # ベンチマーク
 ├── provider/
 │   ├── mod.rs           # プロバイダー抽象化
@@ -133,6 +136,7 @@ tests/
 ├── runtime_flow.rs      # ランタイムフローテスト
 ├── state_session.rs     # 状態・セッションテスト
 ├── tooling_system.rs    # ツールシステムテスト
+├── mcp_integration.rs   # MCP統合テスト
 └── tui_console.rs       # TUIテスト
 ```
 
