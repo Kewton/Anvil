@@ -15,7 +15,8 @@ use std::sync::atomic::AtomicBool;
 
 // Re-export key types so existing `use crate::provider::*` continues to work.
 pub use ollama::{
-    OllamaChatMessage, OllamaChatRequest, OllamaProviderClient, resolve_ollama_model_alias,
+    OllamaChatMessage, OllamaChatRequest, OllamaProviderClient, fetch_context_length_from_ollama,
+    parse_context_length_from_show_response, resolve_ollama_model_alias,
 };
 pub use transport::{
     CurlHttpTransport, HttpResponse, HttpTransport, RetryConfig, RetryTransport, TcpHttpTransport,

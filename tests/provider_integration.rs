@@ -2592,3 +2592,81 @@ fn ollama_build_chat_request_maps_provider_images() {
         &vec!["dGVzdA==".to_string()]
     );
 }
+
+// --- parse_context_length_from_show_response tests ---
+
+use anvil::provider::parse_context_length_from_show_response;
+
+#[test]
+fn parse_context_length_typical_ollama_show_response() {
+    let json = br#"{
+        "model_info": {
+            "general.architecture": "llama",
+            "llama.context_length": 131072,
+            "llama.embedding_length": 4096
+        }
+    }"#;
+    let result = parse_context_length_from_show_response(json);
+    assert_eq!(result, Some(131072));
+}
+
+#[test]
+fn parse_context_length_qwen_architecture() {
+    let json = br#"{
+        "model_info": {
+            "general.architecture": "qwen2",
+            "qwen2.context_length": 32768
+        }
+    }"#;
+    let result = parse_context_length_from_show_response(json);
+    assert_eq!(result, Some(32768));
+}
+
+#[test]
+fn parse_context_length_missing_model_info() {
+    let json = br#"{"details": {"family": "llama"}}"#;
+    let result = parse_context_length_from_show_response(json);
+    assert_eq!(result, None);
+}
+
+#[test]
+fn parse_context_length_no_context_length_key() {
+    let json = br#"{
+        "model_info": {
+            "general.architecture": "llama",
+            "llama.embedding_length": 4096
+        }
+    }"#;
+    let result = parse_context_length_from_show_response(json);
+    assert_eq!(result, None);
+}
+
+#[test]
+fn parse_context_length_zero_value_returns_none() {
+    let json = br#"{
+        "model_info": {
+            "llama.context_length": 0
+        }
+    }"#;
+    let result = parse_context_length_from_show_response(json);
+    assert_eq!(result, None);
+}
+
+#[test]
+fn parse_context_length_invalid_json_returns_none() {
+    let json = b"not json";
+    let result = parse_context_length_from_show_response(json);
+    assert_eq!(result, None);
+}
+
+#[test]
+fn parse_context_length_clamped_to_max() {
+    // Value exceeding MAX_CONTEXT_LENGTH (10_000_000) should be clamped
+    let json = br#"{
+        "model_info": {
+            "llama.context_length": 999999999
+        }
+    }"#;
+    let result = parse_context_length_from_show_response(json);
+    assert_eq!(result, Some(10_000_000));
+}

@@ -92,8 +92,37 @@ pub fn run() -> Result<(), AppError> {
     run_with_config(config)
 }
 
+/// If the provider is Ollama and the user did not explicitly set
+/// `context_window`, query the model's actual context length via
+/// `/api/show` and apply it.
+fn auto_detect_and_apply_context_window(
+    config: &mut EffectiveConfig,
+    provider: &ProviderRuntimeContext,
+) {
+    use crate::provider::{ProviderBackend, fetch_context_length_from_ollama};
+
+    if provider.backend != ProviderBackend::Ollama {
+        return;
+    }
+    if config.runtime.context_window_explicitly_set {
+        return;
+    }
+
+    if let Some(detected) =
+        fetch_context_length_from_ollama(&config.runtime.provider_url, &config.runtime.model)
+    {
+        eprintln!(
+            "Auto-detected context_window={detected} from Ollama model '{}'",
+            config.runtime.model
+        );
+        config.runtime.context_window = detected;
+        config.clamp_context_window();
+        config.clamp_context_budget();
+    }
+}
+
 /// Common startup logic shared by `run_with_args` and `run`.
-fn run_with_config(config: EffectiveConfig) -> Result<(), AppError> {
+fn run_with_config(mut config: EffectiveConfig) -> Result<(), AppError> {
     let _guard: Option<LogGuard> = init_tracing(
         config.mode.log_filter.as_deref(),
         config.mode.debug_logging,
@@ -113,6 +142,10 @@ fn run_with_config(config: EffectiveConfig) -> Result<(), AppError> {
     let shutdown_flag = setup_shutdown_handler(config.mode.interactive);
 
     let provider = ProviderRuntimeContext::bootstrap(&config)?;
+
+    // Auto-detect context_window from Ollama if not explicitly set.
+    auto_detect_and_apply_context_window(&mut config, &provider);
+
     let provider_client = build_local_provider_client(&config, Arc::clone(&shutdown_flag))?;
 
     // Health check: warn on failure but continue startup.
