@@ -147,9 +147,13 @@ impl Tui {
                 "  completed:{completed} failed:{failed} interrupted:{interrupted}"
             ));
             for log in &snapshot.tool_logs {
+                let elapsed_suffix = log
+                    .elapsed_ms
+                    .map(|ms| format!(" ({})", crate::spinner::format_elapsed_ms(ms)))
+                    .unwrap_or_default();
                 lines.push(format!(
-                    "[T] tool  > {:<6} {} {}",
-                    log.tool_name, log.action, log.target
+                    "[T] tool  > {:<6} {} {}{}",
+                    log.tool_name, log.action, log.target, elapsed_suffix
                 ));
             }
         }

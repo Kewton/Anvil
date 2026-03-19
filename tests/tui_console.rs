@@ -549,6 +549,59 @@ fn test_approval_view_without_diff_preview() {
 }
 
 #[test]
+fn tool_log_displays_elapsed_ms() {
+    let tui = Tui::new();
+    let snapshot = anvil::contracts::AppStateSnapshot::new(anvil::contracts::RuntimeState::Working)
+        .with_status("Working.".to_string())
+        .with_tool_logs(vec![anvil::contracts::ToolLogView {
+            tool_name: "file.read".to_string(),
+            action: "completed".to_string(),
+            target: "src/main.rs".to_string(),
+            elapsed_ms: Some(1234),
+        }]);
+
+    let context = anvil::contracts::ConsoleRenderContext {
+        snapshot,
+        model_name: "test-model".to_string(),
+        messages: vec![],
+        history_summary: None,
+    };
+
+    let rendered = tui.render_console(&context);
+    assert!(
+        rendered.contains("(1.2s)"),
+        "tool log should display elapsed time as (1.2s), got:\n{rendered}"
+    );
+}
+
+#[test]
+fn tool_log_omits_elapsed_ms_when_none() {
+    let tui = Tui::new();
+    let snapshot = anvil::contracts::AppStateSnapshot::new(anvil::contracts::RuntimeState::Working)
+        .with_status("Working.".to_string())
+        .with_tool_logs(vec![anvil::contracts::ToolLogView {
+            tool_name: "file.read".to_string(),
+            action: "completed".to_string(),
+            target: "src/main.rs".to_string(),
+            elapsed_ms: None,
+        }]);
+
+    let context = anvil::contracts::ConsoleRenderContext {
+        snapshot,
+        model_name: "test-model".to_string(),
+        messages: vec![],
+        history_summary: None,
+    };
+
+    let rendered = tui.render_console(&context);
+    // Should not contain any time display like "(X.Xs)"
+    assert!(
+        !rendered.contains("(0.0s)"),
+        "tool log should not display elapsed time when None"
+    );
+}
+
+#[test]
 fn footer_shows_perf_with_metrics() {
     let tui = Tui::new();
     let snapshot = anvil::contracts::AppStateSnapshot::new(anvil::contracts::RuntimeState::Done)
