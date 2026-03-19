@@ -379,6 +379,160 @@ pub fn parse_context_length_from_show_response(json_bytes: &[u8]) -> Option<u32>
     None
 }
 
+// ---------------------------------------------------------------------------
+// Model list / info types and parse functions (Issue #77)
+// ---------------------------------------------------------------------------
+
+/// An entry from the Ollama `/api/tags` model list.
+#[derive(Debug)]
+pub struct OllamaModelEntry {
+    pub name: String,
+    pub size: u64,
+}
+
+/// Detailed model information from the Ollama `/api/show` endpoint.
+#[derive(Debug)]
+pub struct OllamaModelInfo {
+    pub parameter_size: Option<String>,
+    pub quantization_level: Option<String>,
+    pub context_length: Option<u32>,
+}
+
+/// Maximum allowed response size from `/api/tags` (5 MiB).
+const MAX_TAGS_RESPONSE_SIZE: usize = 5_242_880;
+
+/// Parse an Ollama `/api/tags` JSON response body and extract the model list.
+///
+/// Pure-logic function for unit testing without network access.
+pub fn parse_model_list_from_tags_response(json_bytes: &[u8]) -> Option<Vec<OllamaModelEntry>> {
+    let value: Value = serde_json::from_slice(json_bytes).ok()?;
+    let models = value.get("models")?.as_array()?;
+    let mut entries = Vec::new();
+    for model in models {
+        let name = model.get("name")?.as_str()?.to_string();
+        let size = model.get("size").and_then(Value::as_u64).unwrap_or(0);
+        entries.push(OllamaModelEntry { name, size });
+    }
+    Some(entries)
+}
+
+/// Parse an Ollama `/api/show` JSON response body and extract model info.
+///
+/// Pure-logic function for unit testing without network access.
+/// Extends the existing `parse_context_length_from_show_response` pattern.
+pub fn parse_model_info_from_show_response(json_bytes: &[u8]) -> Option<OllamaModelInfo> {
+    let value: Value = serde_json::from_slice(json_bytes).ok()?;
+
+    // Extract parameter_size and quantization_level from details
+    let details = value.get("details");
+    let parameter_size = details
+        .and_then(|d| d.get("parameter_size"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let quantization_level = details
+        .and_then(|d| d.get("quantization_level"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+
+    // Extract context_length from model_info (same logic as parse_context_length_from_show_response)
+    let context_length =
+        value
+            .get("model_info")
+            .and_then(Value::as_object)
+            .and_then(|model_info| {
+                for (key, val) in model_info {
+                    if key.ends_with(".context_length")
+                        && let Some(ctx_len) = val.as_u64()
+                    {
+                        let clamped =
+                            u32::try_from(ctx_len.min(u64::from(MAX_CONTEXT_LENGTH))).ok()?;
+                        if clamped > 0 {
+                            return Some(clamped);
+                        }
+                    }
+                }
+                None
+            });
+
+    Some(OllamaModelInfo {
+        parameter_size,
+        quantization_level,
+        context_length,
+    })
+}
+
+/// Fetch the list of available models from Ollama `/api/tags`.
+///
+/// Returns `None` on any failure (network, parse, missing key).
+pub fn fetch_model_list_from_ollama(provider_url: &str) -> Option<Vec<OllamaModelEntry>> {
+    let url = format!("{}/api/tags", provider_url.trim_end_matches('/'));
+
+    let output = Command::new("curl")
+        .arg("-sS")
+        .arg("--max-time")
+        .arg("5")
+        .arg("--proto")
+        .arg("=http,https")
+        .arg("--max-filesize")
+        .arg(MAX_TAGS_RESPONSE_SIZE.to_string())
+        .arg("--")
+        .arg(&url)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    parse_model_list_from_tags_response(&output.stdout)
+}
+
+/// Fetch detailed model information from Ollama `/api/show`.
+///
+/// Returns `None` on any failure (network, parse, missing key).
+pub fn fetch_model_info_from_ollama(provider_url: &str, model: &str) -> Option<OllamaModelInfo> {
+    let url = format!("{}/api/show", provider_url.trim_end_matches('/'));
+    let body = serde_json::to_vec(&ShowRequest {
+        model: model.to_string(),
+    })
+    .ok()?;
+
+    let output = Command::new("curl")
+        .arg("-sS")
+        .arg("--max-time")
+        .arg("5")
+        .arg("--proto")
+        .arg("=http,https")
+        .arg("--max-filesize")
+        .arg(MAX_SHOW_RESPONSE_SIZE.to_string())
+        .arg("--data-binary")
+        .arg("@-")
+        .arg("--")
+        .arg(&url)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .ok()
+        .and_then(|mut child| {
+            use std::io::Write;
+            if let Some(ref mut stdin) = child.stdin {
+                let _ = stdin.write_all(&body);
+            }
+            child.wait_with_output().ok()
+        })?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    parse_model_info_from_show_response(&output.stdout)
+}
+
+// TODO: fetch_context_length_from_ollama, fetch_model_list_from_ollama,
+// fetch_model_info_from_ollamaをOllamaProviderClient::メソッドに統合し、
+// HttpTransport経由で実装するリファクタリング（別Issue）
+
 fn resolve_model_with_ollama_tags(base_url: &str, requested: &str) -> String {
     let url = format!("{}/api/tags", base_url.trim_end_matches('/'));
     let output = Command::new("curl")

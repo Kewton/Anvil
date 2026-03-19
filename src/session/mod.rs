@@ -49,6 +49,10 @@ pub struct SessionMessage {
     pub is_error: bool,
     #[serde(default)]
     pub image_paths: Option<Vec<String>>,
+    /// Expanded content after @file reference resolution.
+    /// Not serialized — only exists in memory during the live session.
+    #[serde(skip)]
+    pub expanded_content: Option<String>,
 }
 
 impl SessionMessage {
@@ -62,6 +66,7 @@ impl SessionMessage {
             tool_call_id: None,
             is_error: false,
             image_paths: None,
+            expanded_content: None,
         }
     }
 
@@ -83,6 +88,12 @@ impl SessionMessage {
     pub fn with_image_paths(mut self, paths: Vec<String>) -> Self {
         self.image_paths = Some(paths);
         self
+    }
+
+    /// Return expanded_content if set, otherwise fall back to content.
+    /// Used for token estimation and LLM message construction (DRY).
+    pub fn effective_content(&self) -> &str {
+        self.expanded_content.as_deref().unwrap_or(&self.content)
     }
 }
 
@@ -165,7 +176,7 @@ impl SessionRecord {
     pub fn push_message(&mut self, message: SessionMessage) {
         // Update cached token count incrementally
         let kind = ContentKind::from_message_role(message.role);
-        let mut msg_tokens = contracts_estimate_tokens(&message.content, kind);
+        let mut msg_tokens = contracts_estimate_tokens(message.effective_content(), kind);
         // Add fixed 300 tokens per image
         if let Some(ref paths) = message.image_paths {
             msg_tokens += IMAGE_TOKENS * paths.len();
@@ -305,7 +316,7 @@ impl SessionRecord {
             .iter()
             .map(|message| {
                 let kind = ContentKind::from_message_role(message.role);
-                let mut tokens = contracts_estimate_tokens(&message.content, kind);
+                let mut tokens = contracts_estimate_tokens(message.effective_content(), kind);
                 if let Some(ref paths) = message.image_paths {
                     tokens += IMAGE_TOKENS * paths.len();
                 }

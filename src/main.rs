@@ -3,7 +3,8 @@ use std::process::ExitCode;
 use clap::Parser;
 
 fn main() -> ExitCode {
-    let cli = anvil::config::CliArgs::parse();
+    let mut cli = anvil::config::CliArgs::parse();
+    cli.resolve_tag_protocol();
     if let Err(err) = anvil::app::run_with_args(&cli) {
         let code = err.exit_code();
         eprintln!("anvil error: {err}");

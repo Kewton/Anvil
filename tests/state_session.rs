@@ -969,7 +969,12 @@ fn render_resume_header_includes_session_name() {
     use anvil::config::EffectiveConfig;
 
     let config = EffectiveConfig::default_for_test().expect("config should load");
-    let output = render_resume_header(&config, "my-feature");
+    let output = render_resume_header(
+        &config.runtime.model,
+        config.runtime.context_window,
+        &config,
+        "my-feature",
+    );
     assert!(
         output.contains("my-feature"),
         "resume header should include session name"

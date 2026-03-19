@@ -32,6 +32,8 @@ pub fn check_offline_blocked(config: &EffectiveConfig, call: &ToolCallRequest) -
             "{} {}",
             call.tool_name, OFFLINE_BLOCK_SUMMARY_SUFFIX
         )),
+        // Git tools are local-only, never blocked in offline mode
+        ToolInput::GitStatus {} | ToolInput::GitDiff { .. } | ToolInput::GitLog { .. } => None,
         _ => None,
     }
 }

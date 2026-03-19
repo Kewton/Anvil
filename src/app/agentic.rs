@@ -4,7 +4,7 @@
 //! helpers.  These are `impl App` methods in a separate file for
 //! maintainability — the same pattern used by `mock.rs`.
 
-use crate::agent::subagent::{SubAgentError, SubAgentKind, SubAgentSession};
+use crate::agent::subagent::{SubAgentError, SubAgentKind, SubAgentOverrides, SubAgentSession};
 use crate::agent::{BasicAgentLoop, StructuredAssistantResponse};
 use crate::contracts::{AppStateSnapshot, RuntimeState, ToolLogView};
 use crate::provider::{ProviderClient, ProviderEvent};
@@ -221,6 +221,10 @@ impl App {
                 self.config.paths.cwd.clone()
             };
 
+            let overrides = SubAgentOverrides {
+                model: self.active_model.clone(),
+                context_window: self.active_context_window,
+            };
             let session = SubAgentSession::new(
                 kind,
                 prompt,
@@ -228,6 +232,7 @@ impl App {
                 provider_client,
                 &self.config,
                 self.shutdown_flag(),
+                overrides,
             );
             let result = session.run();
             agent_results.push(match result {
@@ -338,7 +343,7 @@ impl App {
             let spinner = Spinner::start(
                 format!(
                     "Analyzing results. model={} (iteration {})",
-                    self.config.runtime.model,
+                    self.effective_model(),
                     iteration + 2
                 ),
                 self.config.mode.interactive,
@@ -346,10 +351,10 @@ impl App {
 
             let system_prompt = self.build_dynamic_system_prompt();
             let request = BasicAgentLoop::build_turn_request(
-                self.config.runtime.model.clone(),
+                self.effective_model().to_string(),
                 &self.session,
                 self.provider.capabilities.streaming && self.config.runtime.stream,
-                self.config.runtime.context_window,
+                self.effective_context_window(),
                 &system_prompt,
             );
 
@@ -933,8 +938,12 @@ pub(crate) fn infer_plan_from_structured_response(
             crate::tooling::ToolInput::FileWrite { path, .. } => format!("write {path}"),
             crate::tooling::ToolInput::FileEdit { path, .. } => format!("edit {path}"),
             crate::tooling::ToolInput::FileRead { path } => format!("read {path}"),
-            crate::tooling::ToolInput::FileSearch { pattern, .. } => {
-                format!("search for {pattern}")
+            crate::tooling::ToolInput::FileSearch { pattern, regex, .. } => {
+                if *regex {
+                    format!("regex search for {pattern}")
+                } else {
+                    format!("search for {pattern}")
+                }
             }
             crate::tooling::ToolInput::ShellExec { command } => {
                 format!("run shell command: {command}")
@@ -953,6 +962,22 @@ pub(crate) fn infer_plan_from_structured_response(
             crate::tooling::ToolInput::AgentPlan { prompt, .. } => {
                 let truncated = truncate_chars(prompt, 50);
                 format!("plan: {truncated}")
+            }
+            crate::tooling::ToolInput::GitStatus {} => "git status".to_string(),
+            crate::tooling::ToolInput::GitDiff { path, .. } => {
+                if let Some(p) = path {
+                    format!("git diff {p}")
+                } else {
+                    "git diff".to_string()
+                }
+            }
+            crate::tooling::ToolInput::GitLog { count, path } => {
+                let count_str = count.map_or("10".to_string(), |c| c.to_string());
+                if let Some(p) = path {
+                    format!("git log -{count_str} {p}")
+                } else {
+                    format!("git log -{count_str}")
+                }
             }
         };
         plan.push(item);

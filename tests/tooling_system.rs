@@ -115,6 +115,8 @@ fn parallel_execution_plan_only_accepts_parallel_safe_and_approved_calls() {
             ToolInput::FileSearch {
                 root: "src".to_string(),
                 pattern: "ProviderClient".to_string(),
+                regex: false,
+                context_lines: 0,
             },
         ))
         .expect("search should validate");
@@ -345,6 +347,8 @@ fn validation_reports_missing_required_field_details() {
             ToolInput::FileSearch {
                 root: "src".to_string(),
                 pattern: " ".to_string(),
+                regex: false,
+                context_lines: 0,
             },
         ))
         .expect_err("empty pattern should be rejected");
@@ -2973,4 +2977,912 @@ fn test_eviction_mark_adjustment() {
     assert_eq!(rolled_back.len(), 3);
     // Pre-mark entries: 19 - 2 evicted = 17 remaining
     assert_eq!(stack.len(), 17);
+}
+
+// ===================================================================
+// Git tools tests (Issue #75)
+// ===================================================================
+
+#[test]
+fn git_tools_registered_in_standard_tools() {
+    let registry = build_registry();
+    assert!(registry.get("git.status").is_some());
+    assert!(registry.get("git.diff").is_some());
+    assert!(registry.get("git.log").is_some());
+
+    let status_spec = registry.get("git.status").unwrap();
+    assert_eq!(status_spec.kind, ToolKind::GitStatus);
+    assert_eq!(status_spec.execution_class, ExecutionClass::ReadOnly);
+    assert_eq!(status_spec.permission_class, PermissionClass::Safe);
+    assert_eq!(status_spec.execution_mode, ExecutionMode::ParallelSafe);
+    assert_eq!(status_spec.plan_mode, PlanModePolicy::Allowed);
+    assert_eq!(status_spec.rollback_policy, RollbackPolicy::None);
+}
+
+#[test]
+fn git_tools_registered_in_explore_tools() {
+    let mut registry = ToolRegistry::new();
+    registry.register_explore_tools();
+    assert!(registry.get("git.status").is_some());
+    assert!(registry.get("git.diff").is_some());
+    assert!(registry.get("git.log").is_some());
+}
+
+#[test]
+fn git_status_registered_in_plan_tools() {
+    let mut registry = ToolRegistry::new();
+    registry.register_plan_tools();
+    assert!(registry.get("git.status").is_some());
+    assert!(registry.get("git.diff").is_none());
+    assert!(registry.get("git.log").is_none());
+}
+
+#[test]
+fn from_json_parses_git_status() {
+    let value = serde_json::json!({"tool": "git.status"});
+    let input = ToolInput::from_json("git.status", &value).unwrap();
+    assert_eq!(input, ToolInput::GitStatus {});
+    assert_eq!(input.kind(), ToolKind::GitStatus);
+}
+
+#[test]
+fn from_json_parses_git_diff_with_all_params() {
+    let value = serde_json::json!({
+        "tool": "git.diff",
+        "path": "src/main.rs",
+        "staged": true,
+        "commit": "HEAD~3"
+    });
+    let input = ToolInput::from_json("git.diff", &value).unwrap();
+    assert_eq!(
+        input,
+        ToolInput::GitDiff {
+            path: Some("src/main.rs".to_string()),
+            staged: Some(true),
+            commit: Some("HEAD~3".to_string()),
+        }
+    );
+    assert_eq!(input.kind(), ToolKind::GitDiff);
+}
+
+#[test]
+fn from_json_parses_git_diff_without_params() {
+    let value = serde_json::json!({"tool": "git.diff"});
+    let input = ToolInput::from_json("git.diff", &value).unwrap();
+    assert_eq!(
+        input,
+        ToolInput::GitDiff {
+            path: None,
+            staged: None,
+            commit: None,
+        }
+    );
+}
+
+#[test]
+fn from_json_parses_git_log_with_params() {
+    let value = serde_json::json!({
+        "tool": "git.log",
+        "count": 20,
+        "path": "src/"
+    });
+    let input = ToolInput::from_json("git.log", &value).unwrap();
+    assert_eq!(
+        input,
+        ToolInput::GitLog {
+            count: Some(20),
+            path: Some("src/".to_string()),
+        }
+    );
+    assert_eq!(input.kind(), ToolKind::GitLog);
+}
+
+#[test]
+fn from_json_parses_git_log_without_params() {
+    let value = serde_json::json!({"tool": "git.log"});
+    let input = ToolInput::from_json("git.log", &value).unwrap();
+    assert_eq!(
+        input,
+        ToolInput::GitLog {
+            count: None,
+            path: None,
+        }
+    );
+}
+
+#[test]
+fn git_diff_commit_injection_rejected() {
+    let registry = build_registry();
+    // Reject commit starting with -
+    let result = registry.validate(ToolCallRequest::new(
+        "call_001",
+        "git.diff",
+        ToolInput::GitDiff {
+            path: None,
+            staged: None,
+            commit: Some("-c".to_string()),
+        },
+    ));
+    assert!(result.is_err());
+    assert!(matches!(
+        result.unwrap_err(),
+        ToolValidationError::InvalidFieldValue { .. }
+    ));
+}
+
+#[test]
+fn git_diff_commit_flag_injection_rejected() {
+    let registry = build_registry();
+    let result = registry.validate(ToolCallRequest::new(
+        "call_001",
+        "git.diff",
+        ToolInput::GitDiff {
+            path: None,
+            staged: None,
+            commit: Some("--exec".to_string()),
+        },
+    ));
+    assert!(result.is_err());
+}
+
+#[test]
+fn git_diff_valid_commit_accepted() {
+    let registry = build_registry();
+    // HEAD~3 should be accepted
+    let result = registry.validate(ToolCallRequest::new(
+        "call_001",
+        "git.diff",
+        ToolInput::GitDiff {
+            path: None,
+            staged: None,
+            commit: Some("HEAD~3".to_string()),
+        },
+    ));
+    assert!(result.is_ok());
+
+    // main should be accepted
+    let result = registry.validate(ToolCallRequest::new(
+        "call_002",
+        "git.diff",
+        ToolInput::GitDiff {
+            path: None,
+            staged: None,
+            commit: Some("main".to_string()),
+        },
+    ));
+    assert!(result.is_ok());
+}
+
+#[test]
+fn git_diff_path_traversal_rejected() {
+    let registry = build_registry();
+    let result = registry.validate(ToolCallRequest::new(
+        "call_001",
+        "git.diff",
+        ToolInput::GitDiff {
+            path: Some("../secret".to_string()),
+            staged: None,
+            commit: None,
+        },
+    ));
+    assert!(result.is_err());
+    assert!(matches!(
+        result.unwrap_err(),
+        ToolValidationError::InvalidFieldValue { .. }
+    ));
+}
+
+#[test]
+fn git_diff_valid_path_accepted() {
+    let registry = build_registry();
+    let result = registry.validate(ToolCallRequest::new(
+        "call_001",
+        "git.diff",
+        ToolInput::GitDiff {
+            path: Some("src/main.rs".to_string()),
+            staged: None,
+            commit: None,
+        },
+    ));
+    assert!(result.is_ok());
+}
+
+#[test]
+fn git_log_count_zero_rejected() {
+    let registry = build_registry();
+    let result = registry.validate(ToolCallRequest::new(
+        "call_001",
+        "git.log",
+        ToolInput::GitLog {
+            count: Some(0),
+            path: None,
+        },
+    ));
+    assert!(result.is_err());
+    assert!(matches!(
+        result.unwrap_err(),
+        ToolValidationError::InvalidFieldValue { .. }
+    ));
+}
+
+#[test]
+fn git_log_count_over_100_rejected() {
+    let registry = build_registry();
+    let result = registry.validate(ToolCallRequest::new(
+        "call_001",
+        "git.log",
+        ToolInput::GitLog {
+            count: Some(101),
+            path: None,
+        },
+    ));
+    assert!(result.is_err());
+}
+
+#[test]
+fn git_log_valid_count_accepted() {
+    let registry = build_registry();
+    // count=10 should be accepted
+    let result = registry.validate(ToolCallRequest::new(
+        "call_001",
+        "git.log",
+        ToolInput::GitLog {
+            count: Some(10),
+            path: None,
+        },
+    ));
+    assert!(result.is_ok());
+
+    // count=100 should be accepted
+    let result = registry.validate(ToolCallRequest::new(
+        "call_002",
+        "git.log",
+        ToolInput::GitLog {
+            count: Some(100),
+            path: None,
+        },
+    ));
+    assert!(result.is_ok());
+
+    // count=1 should be accepted
+    let result = registry.validate(ToolCallRequest::new(
+        "call_003",
+        "git.log",
+        ToolInput::GitLog {
+            count: Some(1),
+            path: None,
+        },
+    ));
+    assert!(result.is_ok());
+}
+
+#[test]
+fn git_log_path_traversal_rejected() {
+    let registry = build_registry();
+    let result = registry.validate(ToolCallRequest::new(
+        "call_001",
+        "git.log",
+        ToolInput::GitLog {
+            count: None,
+            path: Some("../secret".to_string()),
+        },
+    ));
+    assert!(result.is_err());
+}
+
+#[test]
+fn git_status_execution_in_git_repo() {
+    // This test runs in the project root which is a git repo
+    let root = std::env::current_dir().expect("should get current dir");
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root);
+    let registry = build_registry();
+
+    let result = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_git_status".to_string(),
+            spec: registry.get("git.status").unwrap().clone(),
+            input: ToolInput::GitStatus {},
+        })
+        .expect("git.status should succeed in git repo");
+
+    assert_eq!(result.status, ToolExecutionStatus::Completed);
+    // Porcelain output is valid (may be empty if clean)
+    assert!(matches!(result.payload, ToolExecutionPayload::Text(_)));
+}
+
+#[test]
+fn git_diff_execution_in_git_repo() {
+    let root = std::env::current_dir().expect("should get current dir");
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root);
+    let registry = build_registry();
+
+    let result = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_git_diff".to_string(),
+            spec: registry.get("git.diff").unwrap().clone(),
+            input: ToolInput::GitDiff {
+                path: None,
+                staged: None,
+                commit: None,
+            },
+        })
+        .expect("git.diff should succeed in git repo");
+
+    assert_eq!(result.status, ToolExecutionStatus::Completed);
+}
+
+#[test]
+fn git_log_execution_in_git_repo() {
+    let root = std::env::current_dir().expect("should get current dir");
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root);
+    let registry = build_registry();
+
+    let result = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_git_log".to_string(),
+            spec: registry.get("git.log").unwrap().clone(),
+            input: ToolInput::GitLog {
+                count: Some(5),
+                path: None,
+            },
+        })
+        .expect("git.log should succeed in git repo");
+
+    assert_eq!(result.status, ToolExecutionStatus::Completed);
+    if let ToolExecutionPayload::Text(output) = &result.payload {
+        // Should have at most 5 lines of output
+        let lines: Vec<&str> = output.trim().lines().collect();
+        assert!(
+            lines.len() <= 5,
+            "expected at most 5 lines, got {}",
+            lines.len()
+        );
+    } else {
+        panic!("expected Text payload");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #74: file.search regex + context_lines tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn file_search_serde_backward_compat_missing_regex_and_context_lines() {
+    // JSON without regex/context_lines should deserialize with defaults
+    let json_str = r#"{"FileSearch":{"root":".","pattern":"hello"}}"#;
+    let input: ToolInput = serde_json::from_str(json_str).expect("should deserialize");
+    match input {
+        ToolInput::FileSearch {
+            root,
+            pattern,
+            regex,
+            context_lines,
+        } => {
+            assert_eq!(root, ".");
+            assert_eq!(pattern, "hello");
+            assert!(!regex);
+            assert_eq!(context_lines, 0);
+        }
+        _ => panic!("expected FileSearch"),
+    }
+}
+
+#[test]
+fn git_status_fails_in_non_git_repo() {
+    let tmp = std::env::temp_dir().join("anvil_git_non_repo_test");
+    let _ = fs::remove_dir_all(&tmp);
+    fs::create_dir_all(&tmp).expect("should create temp dir");
+    let mut executor = LocalToolExecutor::new_without_rate_limit(tmp.clone());
+    let registry = build_registry();
+
+    let result = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_git_status_fail".to_string(),
+            spec: registry.get("git.status").unwrap().clone(),
+            input: ToolInput::GitStatus {},
+        })
+        .expect("execute should return result, not runtime error");
+
+    assert_eq!(result.status, ToolExecutionStatus::Failed);
+    if let ToolExecutionPayload::Text(msg) = &result.payload {
+        assert!(
+            msg.contains("not a git repository") || msg.contains("fatal"),
+            "expected git repo error message, got: {msg}"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn git_status_no_approval_required() {
+    let registry = build_registry();
+    let validated = registry
+        .validate(ToolCallRequest::new(
+            "call_git_001",
+            "git.status",
+            ToolInput::GitStatus {},
+        ))
+        .expect("git.status should validate");
+
+    // Safe tools don't require approval
+    assert!(validated.approval_required(true).is_none());
+}
+
+#[test]
+fn git_diff_staged_priority_over_commit() {
+    // When both staged=true and commit are provided, staged takes priority
+    let root = std::env::current_dir().expect("should get current dir");
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root);
+    let registry = build_registry();
+
+    let result = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_git_diff_staged".to_string(),
+            spec: registry.get("git.diff").unwrap().clone(),
+            input: ToolInput::GitDiff {
+                path: None,
+                staged: Some(true),
+                commit: Some("HEAD~1".to_string()),
+            },
+        })
+        .expect("git.diff with staged should succeed");
+
+    // Should complete without error (staged takes priority, commit ignored)
+    assert_eq!(result.status, ToolExecutionStatus::Completed);
+}
+
+#[test]
+fn file_search_serde_with_new_fields() {
+    let json_str =
+        r#"{"FileSearch":{"root":"src","pattern":"fn\\s+main","regex":true,"context_lines":3}}"#;
+    let input: ToolInput = serde_json::from_str(json_str).expect("should deserialize");
+    match input {
+        ToolInput::FileSearch {
+            regex,
+            context_lines,
+            ..
+        } => {
+            assert!(regex);
+            assert_eq!(context_lines, 3);
+        }
+        _ => panic!("expected FileSearch"),
+    }
+}
+
+#[test]
+fn file_search_from_json_with_regex_and_context_lines() {
+    let value = serde_json::json!({
+        "root": ".",
+        "pattern": "fn\\s+main",
+        "regex": true,
+        "context_lines": 5
+    });
+    let input = ToolInput::from_json("file.search", &value).expect("should parse");
+    match input {
+        ToolInput::FileSearch {
+            regex,
+            context_lines,
+            ..
+        } => {
+            assert!(regex);
+            assert_eq!(context_lines, 5);
+        }
+        _ => panic!("expected FileSearch"),
+    }
+}
+
+#[test]
+fn file_search_from_json_defaults_when_omitted() {
+    let value = serde_json::json!({
+        "root": ".",
+        "pattern": "hello"
+    });
+    let input = ToolInput::from_json("file.search", &value).expect("should parse");
+    match input {
+        ToolInput::FileSearch {
+            regex,
+            context_lines,
+            ..
+        } => {
+            assert!(!regex);
+            assert_eq!(context_lines, 0);
+        }
+        _ => panic!("expected FileSearch"),
+    }
+}
+
+#[test]
+fn file_search_validation_rejects_excessive_context_lines() {
+    let registry = build_registry();
+    let result = registry.validate(ToolCallRequest::new(
+        "call_001",
+        "file.search",
+        ToolInput::FileSearch {
+            root: ".".to_string(),
+            pattern: "test".to_string(),
+            regex: false,
+            context_lines: 11,
+        },
+    ));
+    match result {
+        Err(ToolValidationError::InvalidFieldValue { field, .. }) => {
+            assert_eq!(field, "context_lines");
+        }
+        other => panic!("expected InvalidFieldValue, got {other:?}"),
+    }
+}
+
+#[test]
+fn file_search_validation_accepts_max_context_lines() {
+    let registry = build_registry();
+    let result = registry.validate(ToolCallRequest::new(
+        "call_001",
+        "file.search",
+        ToolInput::FileSearch {
+            root: ".".to_string(),
+            pattern: "test".to_string(),
+            regex: false,
+            context_lines: 10,
+        },
+    ));
+    assert!(result.is_ok());
+}
+
+#[test]
+fn file_search_validation_rejects_invalid_regex() {
+    let registry = build_registry();
+    let result = registry.validate(ToolCallRequest::new(
+        "call_001",
+        "file.search",
+        ToolInput::FileSearch {
+            root: ".".to_string(),
+            pattern: "[invalid".to_string(),
+            regex: true,
+            context_lines: 0,
+        },
+    ));
+    match result {
+        Err(ToolValidationError::InvalidFieldValue { field, .. }) => {
+            assert_eq!(field, "pattern");
+        }
+        other => panic!("expected InvalidFieldValue for pattern, got {other:?}"),
+    }
+}
+
+#[test]
+fn file_search_validation_accepts_valid_regex() {
+    let registry = build_registry();
+    let result = registry.validate(ToolCallRequest::new(
+        "call_001",
+        "file.search",
+        ToolInput::FileSearch {
+            root: ".".to_string(),
+            pattern: r"fn\s+\w+".to_string(),
+            regex: true,
+            context_lines: 0,
+        },
+    ));
+    assert!(result.is_ok());
+}
+
+#[test]
+fn file_search_literal_backward_compatible() {
+    // Ensure default (regex=false, context_lines=0) still returns Paths
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("hello.txt");
+    fs::write(&file_path, "hello world\nfoo bar\n").unwrap();
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(dir.path());
+    let mut registry = ToolRegistry::new();
+    registry.register_file_search();
+    let validated = registry
+        .validate(ToolCallRequest::new(
+            "call_001",
+            "file.search",
+            ToolInput::FileSearch {
+                root: ".".to_string(),
+                pattern: "hello".to_string(),
+                regex: false,
+                context_lines: 0,
+            },
+        ))
+        .unwrap();
+    let exec_req = validated
+        .approve()
+        .into_execution_request(ToolExecutionPolicy {
+            approval_required: false,
+            ..Default::default()
+        })
+        .unwrap();
+    let result = executor.execute(exec_req).unwrap();
+    match &result.payload {
+        ToolExecutionPayload::Paths(paths) => {
+            assert!(!paths.is_empty());
+            assert!(paths[0].contains("hello.txt"));
+        }
+        other => panic!("expected Paths, got {other:?}"),
+    }
+}
+
+#[test]
+fn file_search_regex_matches_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("code.rs");
+    fs::write(&file_path, "fn main() {\n    println!(\"hello\");\n}\n").unwrap();
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(dir.path());
+    let mut registry = ToolRegistry::new();
+    registry.register_file_search();
+    let validated = registry
+        .validate(ToolCallRequest::new(
+            "call_001",
+            "file.search",
+            ToolInput::FileSearch {
+                root: ".".to_string(),
+                pattern: r"fn\s+main".to_string(),
+                regex: true,
+                context_lines: 0,
+            },
+        ))
+        .unwrap();
+    let exec_req = validated
+        .approve()
+        .into_execution_request(ToolExecutionPolicy {
+            approval_required: false,
+            ..Default::default()
+        })
+        .unwrap();
+    let result = executor.execute(exec_req).unwrap();
+    match &result.payload {
+        ToolExecutionPayload::Paths(paths) => {
+            assert!(!paths.is_empty());
+            assert!(paths[0].contains("code.rs"));
+        }
+        other => panic!("expected Paths, got {other:?}"),
+    }
+}
+
+#[test]
+fn file_search_regex_no_match() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("code.rs");
+    fs::write(&file_path, "fn main() {}\n").unwrap();
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(dir.path());
+    let mut registry = ToolRegistry::new();
+    registry.register_file_search();
+    let validated = registry
+        .validate(ToolCallRequest::new(
+            "call_001",
+            "file.search",
+            ToolInput::FileSearch {
+                root: ".".to_string(),
+                pattern: r"class\s+Foo".to_string(),
+                regex: true,
+                context_lines: 0,
+            },
+        ))
+        .unwrap();
+    let exec_req = validated
+        .approve()
+        .into_execution_request(ToolExecutionPolicy {
+            approval_required: false,
+            ..Default::default()
+        })
+        .unwrap();
+    let result = executor.execute(exec_req).unwrap();
+    match &result.payload {
+        ToolExecutionPayload::Paths(paths) => {
+            assert!(paths.is_empty());
+        }
+        other => panic!("expected empty Paths, got {other:?}"),
+    }
+}
+
+#[test]
+fn file_search_context_lines_returns_text_payload() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("test.txt");
+    fs::write(
+        &file_path,
+        "line1\nline2\nMATCH_HERE\nline4\nline5\nline6\n",
+    )
+    .unwrap();
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(dir.path());
+    let mut registry = ToolRegistry::new();
+    registry.register_file_search();
+    let validated = registry
+        .validate(ToolCallRequest::new(
+            "call_001",
+            "file.search",
+            ToolInput::FileSearch {
+                root: ".".to_string(),
+                pattern: "MATCH_HERE".to_string(),
+                regex: false,
+                context_lines: 2,
+            },
+        ))
+        .unwrap();
+    let exec_req = validated
+        .approve()
+        .into_execution_request(ToolExecutionPolicy {
+            approval_required: false,
+            ..Default::default()
+        })
+        .unwrap();
+    let result = executor.execute(exec_req).unwrap();
+    match &result.payload {
+        ToolExecutionPayload::Text(text) => {
+            // Should contain the match line and context
+            assert!(text.contains("MATCH_HERE"), "should contain match line");
+            assert!(text.contains("line2"), "should contain before context");
+            assert!(text.contains("line4"), "should contain after context");
+            assert!(text.contains(":3:"), "should contain line number 3");
+        }
+        other => panic!("expected Text with context, got {other:?}"),
+    }
+}
+
+#[test]
+fn file_search_context_lines_at_file_boundaries() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("test.txt");
+    fs::write(&file_path, "MATCH_FIRST\nline2\nline3\n").unwrap();
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(dir.path());
+    let mut registry = ToolRegistry::new();
+    registry.register_file_search();
+    let validated = registry
+        .validate(ToolCallRequest::new(
+            "call_001",
+            "file.search",
+            ToolInput::FileSearch {
+                root: ".".to_string(),
+                pattern: "MATCH_FIRST".to_string(),
+                regex: false,
+                context_lines: 5,
+            },
+        ))
+        .unwrap();
+    let exec_req = validated
+        .approve()
+        .into_execution_request(ToolExecutionPolicy {
+            approval_required: false,
+            ..Default::default()
+        })
+        .unwrap();
+    let result = executor.execute(exec_req).unwrap();
+    match &result.payload {
+        ToolExecutionPayload::Text(text) => {
+            assert!(text.contains("MATCH_FIRST"));
+            assert!(text.contains(":1:"), "match at line 1");
+            // Should have after context but no before context
+            assert!(text.contains("line2"));
+        }
+        other => panic!("expected Text, got {other:?}"),
+    }
+}
+
+#[test]
+fn file_search_regex_with_context_lines() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("code.rs");
+    fs::write(
+        &file_path,
+        "// header\nfn main() {\n    println!(\"hello\");\n}\n// footer\n",
+    )
+    .unwrap();
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(dir.path());
+    let mut registry = ToolRegistry::new();
+    registry.register_file_search();
+    let validated = registry
+        .validate(ToolCallRequest::new(
+            "call_001",
+            "file.search",
+            ToolInput::FileSearch {
+                root: ".".to_string(),
+                pattern: r"fn\s+main".to_string(),
+                regex: true,
+                context_lines: 1,
+            },
+        ))
+        .unwrap();
+    let exec_req = validated
+        .approve()
+        .into_execution_request(ToolExecutionPolicy {
+            approval_required: false,
+            ..Default::default()
+        })
+        .unwrap();
+    let result = executor.execute(exec_req).unwrap();
+    match &result.payload {
+        ToolExecutionPayload::Text(text) => {
+            assert!(text.contains("fn main()"));
+            assert!(text.contains("// header"), "before context");
+            assert!(text.contains("println!"), "after context");
+        }
+        other => panic!("expected Text, got {other:?}"),
+    }
+}
+
+#[test]
+fn file_search_path_only_match_with_context_returns_path_in_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("searchable_dir");
+    fs::create_dir(&sub).unwrap();
+    let file_path = sub.join("target_file.rs");
+    fs::write(&file_path, "no match content\n").unwrap();
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(dir.path());
+    let mut registry = ToolRegistry::new();
+    registry.register_file_search();
+    let validated = registry
+        .validate(ToolCallRequest::new(
+            "call_001",
+            "file.search",
+            ToolInput::FileSearch {
+                root: ".".to_string(),
+                pattern: "target_file".to_string(),
+                regex: false,
+                context_lines: 2,
+            },
+        ))
+        .unwrap();
+    let exec_req = validated
+        .approve()
+        .into_execution_request(ToolExecutionPolicy {
+            approval_required: false,
+            ..Default::default()
+        })
+        .unwrap();
+    let result = executor.execute(exec_req).unwrap();
+    match &result.payload {
+        ToolExecutionPayload::Text(text) => {
+            assert!(
+                text.contains("target_file.rs"),
+                "path-only match should appear in text"
+            );
+        }
+        other => panic!("expected Text, got {other:?}"),
+    }
+}
+
+#[test]
+fn file_search_zero_matches_with_context_returns_empty_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("nothing.txt");
+    fs::write(&file_path, "no match here\n").unwrap();
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(dir.path());
+    let mut registry = ToolRegistry::new();
+    registry.register_file_search();
+    let validated = registry
+        .validate(ToolCallRequest::new(
+            "call_001",
+            "file.search",
+            ToolInput::FileSearch {
+                root: ".".to_string(),
+                pattern: "NONEXISTENT_PATTERN_XYZ".to_string(),
+                regex: false,
+                context_lines: 3,
+            },
+        ))
+        .unwrap();
+    let exec_req = validated
+        .approve()
+        .into_execution_request(ToolExecutionPolicy {
+            approval_required: false,
+            ..Default::default()
+        })
+        .unwrap();
+    let result = executor.execute(exec_req).unwrap();
+    match &result.payload {
+        ToolExecutionPayload::Text(text) => {
+            assert!(text.is_empty(), "no matches should produce empty text");
+        }
+        other => panic!("expected empty Text, got {other:?}"),
+    }
 }

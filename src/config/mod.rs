@@ -63,6 +63,9 @@ pub struct RuntimeConfig {
     /// environment variable, or CLI flag.  When `false`, the auto-detect
     /// logic in `cli.rs` may override `context_window` from the provider.
     pub context_window_explicitly_set: bool,
+    /// Tag-based tool protocol mode override.
+    /// `Some(true)` = force tag-based, `Some(false)` = force JSON, `None` = auto-detect from model name.
+    pub tag_protocol: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -158,7 +161,10 @@ impl EffectiveConfig {
     /// `CliArgs::default()` when parsing fails (e.g. cargo-test harness args).
     pub fn load() -> Result<Self, ConfigError> {
         match CliArgs::try_parse_from(std::env::args()) {
-            Ok(cli) => Self::load_with_args(&cli),
+            Ok(mut cli) => {
+                cli.resolve_tag_protocol();
+                Self::load_with_args(&cli)
+            }
             Err(_) => Self::load_with_args(&CliArgs::default()),
         }
     }
@@ -206,6 +212,7 @@ impl EffectiveConfig {
                 web_search_provider: WebSearchProvider::default(),
                 serper_api_key: None,
                 context_window_explicitly_set: false,
+                tag_protocol: None,
             },
             mode: ModeConfig {
                 prompt_source: PromptSource::Interactive,
@@ -298,6 +305,7 @@ impl EffectiveConfig {
             "SERPER_API_KEY",
             "ANVIL_LOG",
             "ANVIL_OFFLINE",
+            "ANVIL_TAG_PROTOCOL",
         ] {
             if let Ok(value) = std::env::var(key) {
                 map.insert(key.to_string(), value);
@@ -379,6 +387,11 @@ impl EffectiveConfig {
         }
         if cli.trust {
             self.mode.trust_all = true;
+        }
+
+        // Tag protocol flag
+        if let Some(v) = cli.tag_protocol {
+            self.runtime.tag_protocol = Some(v);
         }
 
         // --session flag: override session file path
@@ -481,6 +494,9 @@ impl EffectiveConfig {
                 }
                 "offline" | "ANVIL_OFFLINE" => {
                     self.mode.offline = parse_bool(value);
+                }
+                "tag_protocol" | "ANVIL_TAG_PROTOCOL" => {
+                    self.runtime.tag_protocol = Some(parse_bool(value));
                 }
                 _ => {}
             }
@@ -827,6 +843,7 @@ impl std::fmt::Debug for RuntimeConfig {
                 "context_window_explicitly_set",
                 &self.context_window_explicitly_set,
             )
+            .field("tag_protocol", &self.tag_protocol)
             .finish()
     }
 }
