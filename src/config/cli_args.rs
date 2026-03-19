@@ -72,4 +72,8 @@ pub struct CliArgs {
     /// Run in offline mode (disable web tools and MCP)
     #[arg(long)]
     pub offline: bool,
+
+    /// Auto-approve built-in tool execution (MCP tools require individual trust)
+    #[arg(long)]
+    pub trust: bool,
 }
