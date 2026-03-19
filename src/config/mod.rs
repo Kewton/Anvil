@@ -75,6 +75,9 @@ pub struct ModeConfig {
     pub debug_logging: bool,
     pub log_filter: Option<String>,
     pub offline: bool,
+    /// Trust mode: auto-approve built-in tool execution.
+    /// Set only via `--trust` CLI flag (not from config file deserialization).
+    pub trust_all: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,6 +216,7 @@ impl EffectiveConfig {
                 debug_logging: false,
                 log_filter: None,
                 offline: false,
+                trust_all: false,
             },
             paths: PathConfig {
                 mcp_config_file: cwd.join(".anvil").join("mcp.json"),
@@ -372,6 +376,9 @@ impl EffectiveConfig {
 
         if cli.offline {
             self.mode.offline = true;
+        }
+        if cli.trust {
+            self.mode.trust_all = true;
         }
 
         // --session flag: override session file path

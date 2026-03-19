@@ -234,7 +234,15 @@ fn run_non_interactive<C: ProviderClient>(
             // Run PostSession hook (DR3-004: after run_live_turn success)
             app.run_post_session_hook();
 
-            // 4. Check for tool execution failures
+            // 4. Check for provider errors (e.g. ModelNotFound) that
+            //    run_live_turn converted to AgentEvent::Failed
+            if let Some(record) = app.last_provider_error() {
+                return Err(AppError::ProviderTurn(
+                    ProviderTurnError::from_error_record(record),
+                ));
+            }
+
+            // 5. Check for tool execution failures
             if app.has_tool_execution_failure() {
                 return Err(AppError::ToolExecution("tool execution failed".to_string()));
             }

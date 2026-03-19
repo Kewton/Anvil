@@ -34,6 +34,7 @@ pub enum AppEvent {
     SessionLoaded,
     SessionSaved,
     SessionNormalizedAfterInterrupt,
+    UndoExecuted,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

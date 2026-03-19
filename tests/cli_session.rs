@@ -678,3 +678,82 @@ fn repo_find_adds_retrieval_context_to_following_provider_turn() {
             && message.content.contains("src/provider_notes.rs")
     }));
 }
+
+// ---------------------------------------------------------------------------
+// /undo command tests (Issue #68)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn undo_command_is_recognized() {
+    let mut app = common::build_app();
+    let tui = Tui::new();
+    let provider = RecordingProvider {
+        seen_requests: Rc::new(RefCell::new(Vec::new())),
+        events: Vec::new(),
+    };
+
+    let result = app
+        .handle_cli_line("/undo", &provider, &tui)
+        .expect("undo should be recognized");
+    assert_eq!(result.control, SessionControl::Continue);
+    assert!(
+        result
+            .frames
+            .last()
+            .expect("undo frame")
+            .contains("No changes to undo"),
+        "empty undo stack should show appropriate message"
+    );
+}
+
+#[test]
+fn undo_command_parses_numeric_argument() {
+    let mut app = common::build_app();
+    let tui = Tui::new();
+    let provider = RecordingProvider {
+        seen_requests: Rc::new(RefCell::new(Vec::new())),
+        events: Vec::new(),
+    };
+
+    let result = app
+        .handle_cli_line("/undo 3", &provider, &tui)
+        .expect("undo with argument should be recognized");
+    assert_eq!(result.control, SessionControl::Continue);
+    assert!(
+        result
+            .frames
+            .last()
+            .expect("undo frame")
+            .contains("No changes to undo"),
+        "empty undo stack should show appropriate message even with N argument"
+    );
+}
+
+#[test]
+fn undo_command_no_target_shows_message() {
+    let mut app = common::build_app();
+    let tui = Tui::new();
+    let provider = RecordingProvider {
+        seen_requests: Rc::new(RefCell::new(Vec::new())),
+        events: Vec::new(),
+    };
+
+    let result = app
+        .handle_cli_line("/undo", &provider, &tui)
+        .expect("undo should work");
+    let frame = result.frames.last().expect("frame");
+    assert!(
+        frame.contains("No changes to undo"),
+        "should indicate nothing to undo"
+    );
+}
+
+#[test]
+fn help_frame_includes_undo_command() {
+    let help = anvil::app::render_help_frame();
+    assert!(help.contains("/undo"), "help should list /undo command");
+    assert!(
+        help.contains("undo the last file change"),
+        "help should show undo description"
+    );
+}
