@@ -3958,3 +3958,143 @@ fn file_search_zero_matches_with_context_returns_empty_text() {
         other => panic!("expected empty Text, got {other:?}"),
     }
 }
+
+// --- resolve_locale_params tests ---
+
+mod locale_params {
+    use anvil::tooling::resolve_locale_params;
+
+    #[test]
+    fn resolve_locale_params_japanese() {
+        let result = resolve_locale_params("ja_JP.UTF-8");
+        let params = result.expect("should return Some for Japanese locale");
+        assert_eq!(params.kl, "jp-ja");
+        assert_eq!(params.accept_language, "ja,en;q=0.9");
+    }
+
+    #[test]
+    fn resolve_locale_params_chinese() {
+        let result = resolve_locale_params("zh_CN.UTF-8");
+        let params = result.expect("should return Some for Chinese locale");
+        assert_eq!(params.kl, "cn-zh");
+        assert_eq!(params.accept_language, "zh,en;q=0.9");
+    }
+
+    #[test]
+    fn resolve_locale_params_korean() {
+        let result = resolve_locale_params("ko_KR.UTF-8");
+        let params = result.expect("should return Some for Korean locale");
+        assert_eq!(params.kl, "kr-kr");
+        assert_eq!(params.accept_language, "ko,en;q=0.9");
+    }
+
+    #[test]
+    fn resolve_locale_params_english() {
+        let result = resolve_locale_params("en_US.UTF-8");
+        assert!(result.is_none(), "English locale should return None");
+    }
+
+    #[test]
+    fn resolve_locale_params_c_locale() {
+        let result = resolve_locale_params("C");
+        assert!(result.is_none(), "C locale should return None");
+    }
+
+    #[test]
+    fn resolve_locale_params_posix() {
+        let result = resolve_locale_params("POSIX");
+        assert!(result.is_none(), "POSIX locale should return None");
+    }
+
+    #[test]
+    fn resolve_locale_params_c_utf8() {
+        let result = resolve_locale_params("C.UTF-8");
+        assert!(result.is_none(), "C.UTF-8 locale should return None");
+    }
+
+    #[test]
+    fn resolve_locale_params_bare_ja() {
+        let result = resolve_locale_params("ja");
+        let params = result.expect("should return Some for bare 'ja'");
+        assert_eq!(params.kl, "jp-ja");
+    }
+
+    #[test]
+    fn resolve_locale_params_zh_tw() {
+        let result = resolve_locale_params("zh_TW.UTF-8");
+        let params = result.expect("should return Some for zh_TW locale");
+        assert_eq!(params.kl, "cn-zh");
+    }
+}
+
+// --- is_captcha_response tests ---
+
+mod captcha_detection {
+    use anvil::tooling::is_captcha_response;
+
+    #[test]
+    fn is_captcha_response_ddg_specific() {
+        let body = "<html><body>Unfortunately, bots use DuckDuckGo too.</body></html>";
+        assert!(
+            is_captcha_response(body, 0),
+            "DDG-specific CAPTCHA string should be detected"
+        );
+    }
+
+    #[test]
+    fn is_captcha_response_generic_captcha() {
+        let body = "<html><body>Please solve this CAPTCHA to continue.</body></html>";
+        assert!(
+            is_captcha_response(body, 0),
+            "Generic 'captcha' keyword should be detected"
+        );
+    }
+
+    #[test]
+    fn is_captcha_response_not_triggered_with_results() {
+        let body = "<html><body>Unfortunately, bots use DuckDuckGo too.</body></html>";
+        assert!(
+            !is_captcha_response(body, 3),
+            "Should not trigger CAPTCHA when results_count > 0"
+        );
+    }
+
+    #[test]
+    fn is_captcha_response_no_false_positive_bot_query() {
+        let body = "<html><body>Learn about chatbot development and bot frameworks.</body></html>";
+        assert!(
+            !is_captcha_response(body, 0),
+            "Should not false-positive on 'bot' keyword without 'captcha'"
+        );
+    }
+}
+
+// --- CaptchaBlocked error tests ---
+
+mod captcha_blocked_error {
+    use anvil::tooling::ToolRuntimeError;
+
+    #[test]
+    fn captcha_blocked_error_display() {
+        let err = ToolRuntimeError::CaptchaBlocked {
+            query: "test query".to_string(),
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("SERPER_API_KEY"),
+            "CaptchaBlocked message should mention SERPER_API_KEY, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn captcha_blocked_error_display_includes_web_fetch() {
+        let err = ToolRuntimeError::CaptchaBlocked {
+            query: "test query".to_string(),
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("web.fetch"),
+            "CaptchaBlocked message should mention web.fetch, got: {msg}"
+        );
+    }
+}
