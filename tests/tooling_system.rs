@@ -2815,3 +2815,162 @@ fn checkpoint_entry_generate_restore_preview_no_changes() {
 
     fs::remove_dir_all(&dir).ok();
 }
+
+// ---------------------------------------------------------------------------
+// CheckpointStack transaction (mark/rollback/commit) tests (Issue #69)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_mark_and_rollback_basic() {
+    let mut stack = CheckpointStack::new();
+    // Push a pre-existing entry before the mark
+    stack.push(make_checkpoint_entry("/tmp/pre.rs", Some("pre")));
+
+    // Start transaction
+    let mark = stack.mark();
+    assert_eq!(mark, 1); // mark is at position 1 (after the pre-existing entry)
+    assert!(stack.is_in_transaction());
+
+    // Push 2 entries within the transaction
+    stack.push(make_checkpoint_entry("/tmp/a.rs", Some("a")));
+    stack.push(make_checkpoint_entry("/tmp/b.rs", Some("b")));
+    assert_eq!(stack.len(), 3);
+
+    // Rollback to mark: should return the 2 transaction entries
+    let rolled_back = stack.rollback_to_mark(mark);
+    assert_eq!(rolled_back.len(), 2);
+    assert!(!stack.is_in_transaction()); // mark cleared
+    assert_eq!(stack.len(), 1); // pre-existing entry remains
+    // Verify newest-first ordering from pop_n
+    assert_eq!(rolled_back[0].path, Path::new("/tmp/b.rs"));
+    assert_eq!(rolled_back[1].path, Path::new("/tmp/a.rs"));
+}
+
+#[test]
+fn test_mark_and_commit() {
+    let mut stack = CheckpointStack::new();
+    let mark = stack.mark();
+    assert_eq!(mark, 0);
+    assert!(stack.is_in_transaction());
+
+    stack.push(make_checkpoint_entry("/tmp/a.rs", Some("a")));
+    stack.push(make_checkpoint_entry("/tmp/b.rs", Some("b")));
+
+    // Commit: entries remain, mark is cleared
+    stack.commit_mark();
+    assert!(!stack.is_in_transaction());
+    assert_eq!(stack.len(), 2); // entries preserved for /undo
+}
+
+#[test]
+fn test_rollback_empty() {
+    let mut stack = CheckpointStack::new();
+    let mark = stack.mark();
+
+    // Rollback immediately without pushing anything
+    let rolled_back = stack.rollback_to_mark(mark);
+    assert!(rolled_back.is_empty());
+    assert!(!stack.is_in_transaction());
+}
+
+#[test]
+fn test_mark_rollback_deduplication() {
+    let mut stack = CheckpointStack::new();
+    let mark = stack.mark();
+
+    // Same file edited twice within transaction
+    stack.push(make_checkpoint_entry("/tmp/a.rs", Some("original")));
+    stack.push(make_checkpoint_entry("/tmp/b.rs", Some("b")));
+    stack.push(make_checkpoint_entry("/tmp/a.rs", Some("after_first_edit")));
+
+    let rolled_back = stack.rollback_to_mark(mark);
+    // Deduplication: /tmp/a.rs should keep "original" (the oldest checkpoint)
+    assert_eq!(rolled_back.len(), 2);
+    let a_entry = rolled_back
+        .iter()
+        .find(|e| e.path == Path::new("/tmp/a.rs"))
+        .expect("a.rs should exist");
+    assert_eq!(a_entry.previous_content.as_deref(), Some("original"));
+    assert!(stack.is_empty());
+}
+
+#[test]
+fn test_mark_with_remove_interaction() {
+    let mut stack = CheckpointStack::new();
+    let mark = stack.mark();
+    assert_eq!(mark, 0);
+
+    // Push A (tool succeeds, kept) at index 0
+    let idx_a = stack.push(make_checkpoint_entry("/tmp/a.rs", Some("a")));
+    assert_eq!(idx_a, 0);
+
+    // Push B (tool fails, removed individually) at index 1
+    let idx_b = stack.push(make_checkpoint_entry("/tmp/b.rs", Some("b")));
+    assert_eq!(idx_b, 1);
+
+    // Remove B (index 1, which is >= mark=0 so mark stays at 0)
+    stack.remove(idx_b);
+    assert_eq!(stack.len(), 1);
+
+    // Rollback to mark: only A should be returned
+    let rolled_back = stack.rollback_to_mark(mark);
+    assert_eq!(rolled_back.len(), 1);
+    assert_eq!(rolled_back[0].path, Path::new("/tmp/a.rs"));
+}
+
+#[test]
+fn test_eviction_with_active_mark() {
+    let mut stack = CheckpointStack::new();
+    // Push 18 entries before mark (max_depth=20)
+    for i in 0..18 {
+        stack.push(make_checkpoint_entry(&format!("/tmp/pre{i}.rs"), Some("x")));
+    }
+    assert_eq!(stack.len(), 18);
+
+    // Mark at position 18
+    let mark = stack.mark();
+    assert_eq!(mark, 18);
+
+    // Push 5 entries within transaction (total would be 23, exceeding max_depth=20)
+    for i in 0..5 {
+        stack.push(make_checkpoint_entry(&format!("/tmp/tx{i}.rs"), Some("t")));
+    }
+
+    // Eviction should only remove pre-mark entries, preserving all 5 transaction entries
+    // max_depth=20, so eviction removes 3 oldest pre-mark entries (18+5=23, need to drop 3)
+    assert_eq!(stack.len(), 20);
+
+    // All 5 transaction entries should still be present after rollback
+    // active_mark was adjusted from 18 to 15 by eviction
+    let rolled_back = stack.rollback_to_mark(mark);
+    assert_eq!(rolled_back.len(), 5);
+    assert!(!stack.is_in_transaction());
+}
+
+#[test]
+fn test_eviction_mark_adjustment() {
+    let mut stack = CheckpointStack::new();
+    // Push 19 entries before mark
+    for i in 0..19 {
+        stack.push(make_checkpoint_entry(&format!("/tmp/pre{i}.rs"), Some("x")));
+    }
+
+    let mark = stack.mark();
+    assert_eq!(mark, 19);
+    assert!(stack.is_in_transaction());
+
+    // Push 3 entries within transaction (total 22 > max_depth=20)
+    // This should evict 2 pre-mark entries, adjusting active_mark from 19 to 17
+    for i in 0..3 {
+        stack.push(make_checkpoint_entry(&format!("/tmp/tx{i}.rs"), Some("t")));
+    }
+
+    assert_eq!(stack.len(), 20);
+
+    // Rollback should still correctly return all 3 transaction entries
+    // because active_mark was adjusted to 17 internally
+    let rolled_back = stack.rollback_to_mark(mark);
+    assert_eq!(rolled_back.len(), 3);
+    // Pre-mark entries: 19 - 2 evicted = 17 remaining
+    assert_eq!(stack.len(), 17);
+}

@@ -13,7 +13,7 @@ use crate::spinner::Spinner;
 use crate::state::StateTransition;
 use crate::tooling::{
     ExecutionMode, LocalToolExecutor, ToolCallRequest, ToolExecutionPayload, ToolExecutionPolicy,
-    ToolExecutionRequest, ToolExecutionResult, ToolExecutionStatus, ToolInput,
+    ToolExecutionRequest, ToolExecutionResult, ToolExecutionStatus, ToolInput, ToolKind,
     diff::generate_diff_preview, resolve_sandbox_path,
 };
 use crate::tui::Tui;
@@ -570,9 +570,12 @@ impl App {
                 elapsed_ms: 0,
             });
 
-        // Remove checkpoint if tool execution failed
+        // Remove checkpoint if tool execution failed.
+        // During a transaction, skip individual removal — rollback_to_mark()
+        // will handle bulk cleanup.
         if result.status == ToolExecutionStatus::Failed
             && let Some(idx) = checkpoint_idx
+            && !self.checkpoint_stack.is_in_transaction()
         {
             self.checkpoint_stack.remove(idx);
         }
@@ -707,6 +710,15 @@ impl App {
         // Phase 2: Grouping
         let groups = group_by_execution_mode(&validated_requests);
 
+        // Transaction begin: mark the checkpoint stack position before execution.
+        let mark = self.checkpoint_stack.mark();
+
+        // Build tool_call_id → ToolKind map for rollback judgment.
+        let tool_kind_map: std::collections::HashMap<String, ToolKind> = validated_requests
+            .iter()
+            .map(|(_, req)| (req.tool_call_id.clone(), req.spec.kind))
+            .collect();
+
         // Phase 3: Execution
         let mut indexed_results: Vec<(usize, ToolExecutionResult)> = failed_results;
         for group in groups {
@@ -733,13 +745,79 @@ impl App {
             }
         }
 
+        // Helper: check whether a tool_call_id refers to a file-mutating tool.
+        let is_file_mutation = |tool_call_id: &str| -> bool {
+            tool_kind_map
+                .get(tool_call_id)
+                .is_some_and(|kind| matches!(kind, ToolKind::FileWrite | ToolKind::FileEdit))
+        };
+
+        // Transaction check: determine if any file-mutating tool failed.
+        let has_file_mutation_failure = indexed_results.iter().any(|(_, r)| {
+            r.status == ToolExecutionStatus::Failed && is_file_mutation(&r.tool_call_id)
+        });
+
+        let rolled_back_ids: std::collections::HashSet<String> = if has_file_mutation_failure {
+            let entries = self.checkpoint_stack.rollback_to_mark(mark);
+            let restore_results: Vec<_> = entries.iter().map(|e| e.restore()).collect();
+            let restored_count = restore_results
+                .iter()
+                .filter(|r| r.action != crate::tooling::RestoreAction::Skipped)
+                .count();
+            let failed_restore_count = restore_results.len() - restored_count;
+
+            // Count failed file-mutating tools for the notification message
+            let failed_count = indexed_results
+                .iter()
+                .filter(|(_, r)| {
+                    r.status == ToolExecutionStatus::Failed && is_file_mutation(&r.tool_call_id)
+                })
+                .count();
+
+            // Build set of tool_call_ids that were involved in file mutations
+            // (both successful and failed) -- all are rolled back
+            let rb_ids: std::collections::HashSet<String> = indexed_results
+                .iter()
+                .filter(|(_, r)| is_file_mutation(&r.tool_call_id))
+                .map(|(_, r)| r.tool_call_id.clone())
+                .collect();
+
+            // Annotate successful file-mutating results with rollback info
+            for (_, r) in &mut indexed_results {
+                if r.status == ToolExecutionStatus::Completed && rb_ids.contains(&r.tool_call_id) {
+                    r.summary = format!("{} [rolled back: atomic transaction failed]", r.summary);
+                }
+            }
+
+            // Record system message for LLM awareness
+            let rollback_msg = format!(
+                "[System] Atomic transaction rolled back. {} file(s) restored to pre-transaction state \
+                 ({} restore failures). Reason: {} file tool(s) failed. \
+                 All file changes in this turn have been reverted.",
+                restored_count, failed_restore_count, failed_count
+            );
+            self.session.push_message(
+                SessionMessage::new(MessageRole::System, "system", rollback_msg)
+                    .with_id(self.next_message_id("system")),
+            );
+
+            rb_ids
+        } else {
+            self.checkpoint_stack.commit_mark();
+            std::collections::HashSet::new()
+        };
+
         // Phase 4: Sort by index, record results, run PostToolUse hooks (DR2-004)
         indexed_results.sort_by_key(|(idx, _)| *idx);
         let mut results: Vec<ToolExecutionResult> = Vec::with_capacity(indexed_results.len());
         for (_, result) in indexed_results {
             self.record_tool_result(&result);
 
-            // PostToolUse hook (soft-fail)
+            // PostToolUse hook (soft-fail) — skip for rolled-back results
+            if rolled_back_ids.contains(&result.tool_call_id) {
+                results.push(result);
+                continue;
+            }
             if let Some(ref engine) = self.hooks_engine
                 && let Some((tool_name, tool_input)) = tool_input_map.get(&result.tool_call_id)
             {
