@@ -14,6 +14,7 @@ pub mod render;
 use crate::agent::BasicAgentLoop;
 use crate::agent::{AgentEvent, AgentRuntime, PendingTurnState, ProjectLanguage};
 use crate::config::EffectiveConfig;
+use crate::contracts::tokens::TokenCalibrationStore;
 use crate::contracts::{
     AppEvent, AppStateSnapshot, ConsoleRenderContext, ContextUsageView, ContextWarningLevel,
     RuntimeState,
@@ -136,6 +137,11 @@ pub struct App {
     active_model: Option<String>,
     /// Session-scoped context window override (Issue #77).
     active_context_window: Option<u32>,
+    /// Token calibration store: accumulates actual vs estimated ratios per model.
+    calibration_store: TokenCalibrationStore,
+    /// Last estimated prompt tokens from build_turn_request_calibrated.
+    /// Consumed by apply_agent_event Done handler via Option::take.
+    last_estimated_prompt_tokens: Option<usize>,
 }
 
 /// Whether the session loop should continue or exit.
@@ -369,6 +375,8 @@ impl App {
             trusted_tools: HashSet::new(),
             active_model: None,
             active_context_window: None,
+            calibration_store: TokenCalibrationStore::new(),
+            last_estimated_prompt_tokens: None,
         })
     }
 
@@ -746,13 +754,16 @@ impl App {
         self.begin_live_turn_state()?;
 
         let system_prompt = self.build_dynamic_system_prompt();
-        let request = BasicAgentLoop::build_turn_request(
+        let calibration_ratio = self.calibration_store.get_ratio(self.effective_model());
+        let (request, estimated_prompt_tokens) = BasicAgentLoop::build_turn_request_calibrated(
             self.effective_model().to_string(),
             &self.session,
             self.provider.capabilities.streaming && self.config.runtime.stream,
             self.effective_context_window(),
             &system_prompt,
+            calibration_ratio,
         );
+        self.last_estimated_prompt_tokens = Some(estimated_prompt_tokens);
 
         // Phase 1: Collect events from provider with spinner + streaming output.
         let mut spinner_opt = Some(Spinner::start(
@@ -1227,6 +1238,16 @@ impl App {
                 inference_performance,
             } => {
                 self.record_assistant_output(self.next_message_id("assistant"), assistant_message)?;
+
+                // Update calibration store with actual vs estimated prompt tokens.
+                let estimated = self.last_estimated_prompt_tokens.take();
+                if let Some(perf) = inference_performance
+                    && let (Some(actual_prompt), Some(est)) = (perf.prompt_tokens, estimated)
+                {
+                    let model = self.effective_model().to_string();
+                    self.calibration_store.update(&model, actual_prompt, est);
+                }
+
                 let mut snapshot = AppStateSnapshot::new(RuntimeState::Done)
                     .with_status(status.clone())
                     .with_tool_logs(render::build_tool_logs(tool_logs))

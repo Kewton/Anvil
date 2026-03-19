@@ -10,7 +10,7 @@ pub mod tag_spec;
 pub use model_classifier::ToolProtocolMode;
 
 use crate::contracts::InferencePerformanceView;
-use crate::contracts::tokens::{ContentKind, estimate_tokens};
+use crate::contracts::tokens::{ContentKind, NO_CALIBRATION, estimate_tokens_calibrated};
 use crate::provider::{
     ImageContent, ProviderClient, ProviderEvent, ProviderMessage, ProviderMessageRole,
     ProviderTurnError, ProviderTurnRequest,
@@ -191,49 +191,38 @@ impl BasicAgentLoop {
         token_budget: usize,
         system_prompt: &str,
     ) -> ProviderTurnRequest {
-        let system_prompt_tokens = estimate_tokens(system_prompt, ContentKind::Text);
-        let budget_for_messages = token_budget
-            .saturating_sub(system_prompt_tokens)
-            .max(MINIMUM_MESSAGE_BUDGET);
-
-        let mut selected = Vec::new();
-        let mut used_tokens = 0usize;
-
-        for message in session.messages.iter().rev() {
-            let kind = ContentKind::from_message_role(message.role);
-            let estimated = estimate_tokens(message.effective_content(), kind);
-            if !selected.is_empty() && used_tokens + estimated > budget_for_messages {
-                break;
-            }
-            used_tokens += estimated;
-            selected.push(message);
-        }
-
-        selected.reverse();
-
-        tracing::debug!(
-            selected_messages = selected.len(),
-            used_tokens = used_tokens,
-            system_prompt_tokens = system_prompt_tokens,
-            budget_for_messages = budget_for_messages,
-            budget = token_budget,
-            "built turn request"
-        );
-
-        let sandbox_root = std::fs::canonicalize(&session.metadata.cwd).ok();
-
-        let messages: Vec<ProviderMessage> = std::iter::once(ProviderMessage::new(
-            ProviderMessageRole::System,
+        let (request, _) = build_turn_request_with_calibration(
+            model,
+            session,
+            stream,
+            token_budget,
             system_prompt,
-        ))
-        .chain(
-            selected
-                .into_iter()
-                .map(|sm| to_provider_message_with_images(sm, sandbox_root.as_deref())),
-        )
-        .collect();
+            NO_CALIBRATION,
+        );
+        request
+    }
 
-        ProviderTurnRequest::new(model.into(), messages, stream)
+    /// Build a provider turn request with calibration ratio applied.
+    ///
+    /// Returns `(ProviderTurnRequest, estimated_prompt_tokens)`.
+    /// `calibration_ratio` is obtained from `TokenCalibrationStore::get_ratio()`.
+    pub fn build_turn_request_calibrated(
+        model: impl Into<String>,
+        session: &SessionRecord,
+        stream: bool,
+        context_window: u32,
+        system_prompt: &str,
+        calibration_ratio: f64,
+    ) -> (ProviderTurnRequest, usize) {
+        let token_budget = derive_context_budget(context_window);
+        build_turn_request_with_calibration(
+            model,
+            session,
+            stream,
+            token_budget,
+            system_prompt,
+            calibration_ratio,
+        )
     }
 
     pub fn run_turn<C: ProviderClient>(
@@ -418,6 +407,72 @@ fn to_provider_message_with_images(
         }
     }
     msg
+}
+
+/// Internal helper: build a turn request with calibration ratio applied.
+///
+/// Both `build_turn_request_with_token_budget` (ratio=NO_CALIBRATION) and
+/// `build_turn_request_calibrated` delegate to this function.
+fn build_turn_request_with_calibration(
+    model: impl Into<String>,
+    session: &SessionRecord,
+    stream: bool,
+    token_budget: usize,
+    system_prompt: &str,
+    calibration_ratio: f64,
+) -> (ProviderTurnRequest, usize) {
+    let system_prompt_tokens =
+        estimate_tokens_calibrated(system_prompt, ContentKind::Text, calibration_ratio);
+    let budget_for_messages = token_budget
+        .saturating_sub(system_prompt_tokens)
+        .max(MINIMUM_MESSAGE_BUDGET);
+
+    let mut selected = Vec::new();
+    let mut used_tokens = 0usize;
+
+    for message in session.messages.iter().rev() {
+        let kind = ContentKind::from_message_role(message.role);
+        let estimated =
+            estimate_tokens_calibrated(message.effective_content(), kind, calibration_ratio);
+        if !selected.is_empty() && used_tokens + estimated > budget_for_messages {
+            break;
+        }
+        used_tokens += estimated;
+        selected.push(message);
+    }
+
+    selected.reverse();
+
+    let estimated_prompt_tokens = system_prompt_tokens + used_tokens;
+
+    tracing::debug!(
+        selected_messages = selected.len(),
+        used_tokens = used_tokens,
+        system_prompt_tokens = system_prompt_tokens,
+        budget_for_messages = budget_for_messages,
+        budget = token_budget,
+        calibration_ratio = calibration_ratio,
+        estimated_prompt_tokens = estimated_prompt_tokens,
+        "built turn request"
+    );
+
+    let sandbox_root = std::fs::canonicalize(&session.metadata.cwd).ok();
+
+    let messages: Vec<ProviderMessage> = std::iter::once(ProviderMessage::new(
+        ProviderMessageRole::System,
+        system_prompt,
+    ))
+    .chain(
+        selected
+            .into_iter()
+            .map(|sm| to_provider_message_with_images(sm, sandbox_root.as_deref())),
+    )
+    .collect();
+
+    (
+        ProviderTurnRequest::new(model.into(), messages, stream),
+        estimated_prompt_tokens,
+    )
 }
 
 fn derive_context_budget(context_window: u32) -> usize {

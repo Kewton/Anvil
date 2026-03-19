@@ -5,7 +5,8 @@
 
 use super::transport::{CurlHttpTransport, HttpTransport, RetryTransport, sanitize_error_message};
 use super::{
-    AgentEvent, ImageContent, ProviderClient, ProviderEvent, ProviderTurnError, ProviderTurnRequest,
+    AgentEvent, ImageContent, ProviderClient, ProviderEvent, ProviderTurnError,
+    ProviderTurnRequest, build_provider_done_event,
 };
 use crate::config::EffectiveConfig;
 use crate::contracts::InferencePerformanceView;
@@ -26,6 +27,8 @@ struct OpenAiChatRequest {
     model: String,
     messages: Vec<OpenAiChatMessage>,
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<serde_json::Value>,
 }
 
 /// Request message: content is `Value` to support both plain text and
@@ -47,7 +50,6 @@ struct OpenAiResponseMessage {
 #[derive(Debug, Clone, Deserialize)]
 struct OpenAiUsage {
     #[serde(default)]
-    #[allow(dead_code)]
     prompt_tokens: Option<u64>,
     #[serde(default)]
     completion_tokens: Option<u64>,
@@ -66,6 +68,8 @@ struct OpenAiChatResponse {
 #[derive(Debug, Clone, Deserialize)]
 struct OpenAiStreamChunk {
     choices: Vec<OpenAiDeltaChoice>,
+    #[serde(default)]
+    usage: Option<OpenAiUsage>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -127,26 +131,10 @@ fn build_openai_content(text: &str, images: Option<&[ImageContent]>) -> Value {
 fn extract_openai_performance(usage: &Option<OpenAiUsage>) -> Option<InferencePerformanceView> {
     let usage = usage.as_ref()?;
     Some(InferencePerformanceView {
-        tokens_per_sec_tenths: None,
         eval_tokens: usage.completion_tokens,
-        eval_duration_ms: None,
+        prompt_tokens: usage.prompt_tokens,
+        ..Default::default()
     })
-}
-
-/// Build a Done AgentEvent for OpenAI (shared helper).
-fn build_openai_done_event(
-    content: &str,
-    inference_performance: Option<InferencePerformanceView>,
-) -> AgentEvent {
-    AgentEvent::Done {
-        status: "Done. session saved".to_string(),
-        assistant_message: content.to_string(),
-        completion_summary: "Provider turn finished successfully.".to_string(),
-        saved_status: "session saved".to_string(),
-        tool_logs: Vec::new(),
-        elapsed_ms: 0,
-        inference_performance,
-    }
 }
 
 impl OpenAiCompatibleProviderClient {
@@ -179,6 +167,31 @@ impl<T> OpenAiCompatibleProviderClient<T> {
     pub fn with_api_key(mut self, key: impl Into<String>) -> Self {
         self.api_key = Some(key.into());
         self
+    }
+
+    /// Build an OpenAI chat request from a provider turn request.
+    fn build_chat_request(
+        request: &ProviderTurnRequest,
+        stream_options: Option<serde_json::Value>,
+    ) -> OpenAiChatRequest {
+        OpenAiChatRequest {
+            model: request.model.clone(),
+            messages: request
+                .messages
+                .iter()
+                .map(|m| OpenAiChatMessage {
+                    role: match m.role {
+                        super::ProviderMessageRole::System => "system".to_string(),
+                        super::ProviderMessageRole::User => "user".to_string(),
+                        super::ProviderMessageRole::Assistant => "assistant".to_string(),
+                        super::ProviderMessageRole::Tool => "tool".to_string(),
+                    },
+                    content: build_openai_content(&m.content, m.images.as_deref()),
+                })
+                .collect(),
+            stream: request.stream,
+            stream_options,
+        }
     }
 }
 
@@ -224,23 +237,7 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
         &self,
         request: &ProviderTurnRequest,
     ) -> Result<Vec<ProviderEvent>, ProviderTurnError> {
-        let chat_request = OpenAiChatRequest {
-            model: request.model.clone(),
-            messages: request
-                .messages
-                .iter()
-                .map(|m| OpenAiChatMessage {
-                    role: match m.role {
-                        super::ProviderMessageRole::System => "system".to_string(),
-                        super::ProviderMessageRole::User => "user".to_string(),
-                        super::ProviderMessageRole::Assistant => "assistant".to_string(),
-                        super::ProviderMessageRole::Tool => "tool".to_string(),
-                    },
-                    content: build_openai_content(&m.content, m.images.as_deref()),
-                })
-                .collect(),
-            stream: request.stream,
-        };
+        let chat_request = Self::build_chat_request(request, None);
 
         let request_body = serde_json::to_vec(&chat_request).map_err(|err| {
             ProviderTurnError::Backend(format!("failed to encode openai request: {err}"))
@@ -291,7 +288,7 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
 
         Ok(vec![
             ProviderEvent::TokenDelta(content.clone()),
-            ProviderEvent::Agent(build_openai_done_event(&content, perf)),
+            ProviderEvent::Agent(build_provider_done_event(&content, perf)),
         ])
     }
 }
@@ -318,23 +315,8 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
         request: &ProviderTurnRequest,
         emit: &mut dyn FnMut(ProviderEvent),
     ) -> Result<(), ProviderTurnError> {
-        let chat_request = OpenAiChatRequest {
-            model: request.model.clone(),
-            messages: request
-                .messages
-                .iter()
-                .map(|m| OpenAiChatMessage {
-                    role: match m.role {
-                        super::ProviderMessageRole::System => "system".to_string(),
-                        super::ProviderMessageRole::User => "user".to_string(),
-                        super::ProviderMessageRole::Assistant => "assistant".to_string(),
-                        super::ProviderMessageRole::Tool => "tool".to_string(),
-                    },
-                    content: build_openai_content(&m.content, m.images.as_deref()),
-                })
-                .collect(),
-            stream: true,
-        };
+        let chat_request =
+            Self::build_chat_request(request, Some(serde_json::json!({ "include_usage": true })));
 
         let request_body = serde_json::to_vec(&chat_request).map_err(|err| {
             ProviderTurnError::Backend(format!("failed to encode openai request: {err}"))
@@ -358,6 +340,7 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
         let mut content = String::new();
         let mut emitted_done = false;
         let mut had_error: Option<ProviderTurnError> = None;
+        let mut stream_usage: Option<OpenAiUsage> = None;
 
         self.transport
             .stream_lines(&url, &request_body, &headers, &mut |line| {
@@ -376,7 +359,7 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
                             let msg_content = choice.message.content.clone().unwrap_or_default();
                             content.push_str(&msg_content);
                             emit(ProviderEvent::TokenDelta(msg_content));
-                            emit(ProviderEvent::Agent(build_openai_done_event(
+                            emit(ProviderEvent::Agent(build_provider_done_event(
                                 &content, perf,
                             )));
                             emitted_done = true;
@@ -392,8 +375,9 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
                 let payload = &trimmed[6..];
                 if payload == "[DONE]" {
                     if !emitted_done {
-                        emit(ProviderEvent::Agent(build_openai_done_event(
-                            &content, None,
+                        let perf = extract_openai_performance(&stream_usage);
+                        emit(ProviderEvent::Agent(build_provider_done_event(
+                            &content, perf,
                         )));
                         emitted_done = true;
                     }
@@ -402,14 +386,19 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
 
                 match serde_json::from_str::<OpenAiStreamChunk>(payload) {
                     Ok(chunk) => {
+                        // Capture usage from final SSE chunk (stream_options: include_usage)
+                        if let Some(usage) = chunk.usage {
+                            stream_usage = Some(usage);
+                        }
                         for choice in chunk.choices {
                             if let Some(delta) = choice.delta.content {
                                 content.push_str(&delta);
                                 emit(ProviderEvent::TokenDelta(delta));
                             }
                             if choice.finish_reason.is_some() && !emitted_done {
-                                emit(ProviderEvent::Agent(build_openai_done_event(
-                                    &content, None,
+                                let perf = extract_openai_performance(&stream_usage);
+                                emit(ProviderEvent::Agent(build_provider_done_event(
+                                    &content, perf,
                                 )));
                                 emitted_done = true;
                             }
@@ -428,8 +417,9 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
             return Err(err);
         }
         if !emitted_done {
-            emit(ProviderEvent::Agent(build_openai_done_event(
-                &content, None,
+            let perf = extract_openai_performance(&stream_usage);
+            emit(ProviderEvent::Agent(build_provider_done_event(
+                &content, perf,
             )));
         }
         Ok(())
@@ -461,7 +451,7 @@ fn parse_openai_sse_response(body: &[u8]) -> Result<Vec<ProviderEvent>, Provider
                 events.push(ProviderEvent::TokenDelta(delta));
             }
             if choice.finish_reason.is_some() {
-                events.push(ProviderEvent::Agent(build_openai_done_event(
+                events.push(ProviderEvent::Agent(build_provider_done_event(
                     &content, None,
                 )));
             }
@@ -472,7 +462,7 @@ fn parse_openai_sse_response(body: &[u8]) -> Result<Vec<ProviderEvent>, Provider
         .iter()
         .all(|event| !matches!(event, ProviderEvent::Agent(AgentEvent::Done { .. })))
     {
-        events.push(ProviderEvent::Agent(build_openai_done_event(
+        events.push(ProviderEvent::Agent(build_provider_done_event(
             &content, None,
         )));
     }
