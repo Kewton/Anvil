@@ -243,12 +243,14 @@ impl App {
     /// 3. Send updated session back to the LLM
     /// 4. If the LLM responds with more tool calls, repeat (up to MAX_AGENT_ITERATIONS)
     /// 5. When the LLM responds without tool calls, record as final answer
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn complete_structured_response<C: ProviderClient>(
         &mut self,
         structured: StructuredAssistantResponse,
         status: &str,
         saved_status: &str,
         elapsed_ms: u128,
+        inference_performance: Option<crate::contracts::InferencePerformanceView>,
         tui: &Tui,
         provider_client: &C,
     ) -> Result<Vec<String>, AppError> {
@@ -424,7 +426,7 @@ impl App {
         }
 
         // Transition to Done
-        let done = AppStateSnapshot::new(RuntimeState::Done)
+        let mut done = AppStateSnapshot::new(RuntimeState::Done)
             .with_status(status.to_string())
             .with_tool_logs(all_tool_log_views)
             .with_completion_summary(
@@ -435,6 +437,9 @@ impl App {
                 saved_status.to_string(),
             )
             .with_elapsed_ms(elapsed_ms);
+        if let Some(perf) = inference_performance {
+            done = done.with_inference_performance(perf);
+        }
         let mut done_snapshot = self.transition_with_context(done, StateTransition::Finish)?;
         self.evaluate_context_warning(&mut done_snapshot);
         frames.push(self.render_console(tui)?);
@@ -755,6 +760,7 @@ impl App {
             saved_status,
             tool_logs: _,
             elapsed_ms,
+            inference_performance,
         } = event
         else {
             return Ok(None);
@@ -771,6 +777,7 @@ impl App {
             status,
             saved_status,
             *elapsed_ms,
+            inference_performance.clone(),
             tui,
             provider_client,
         )?))

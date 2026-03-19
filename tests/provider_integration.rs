@@ -98,6 +98,7 @@ impl ProviderClient for RecordingProvider {
                     saved_status: "session saved".to_string(),
                     tool_logs: Vec::new(),
                     elapsed_ms: 0,
+                    inference_performance: None,
                 }));
             }
             return self.error.clone().map_or(Ok(()), Err);
@@ -132,6 +133,7 @@ fn live_turn_hands_session_messages_to_provider_and_renders_done() {
                 saved_status: "session saved".to_string(),
                 tool_logs: Vec::new(),
                 elapsed_ms: 120,
+                inference_performance: None,
             }),
         ],
         followup_events: Vec::new(),
@@ -205,6 +207,7 @@ fn live_turn_executes_structured_file_write_response_without_approval() {
             saved_status: "session saved".to_string(),
             tool_logs: Vec::new(),
             elapsed_ms: 120,
+            inference_performance: None,
         })],
         followup_events: Vec::new(),
         error: None,
@@ -355,6 +358,7 @@ fn live_turn_executes_malformed_structured_file_write_response() {
             saved_status: "session saved".to_string(),
             tool_logs: Vec::new(),
             elapsed_ms: 120,
+            inference_performance: None,
         })],
         followup_events: Vec::new(),
         error: None,
@@ -746,6 +750,7 @@ fn live_turn_surfaces_token_delta_progress() {
                 saved_status: "session saved".to_string(),
                 tool_logs: Vec::new(),
                 elapsed_ms: 90,
+                inference_performance: None,
             }),
         ],
         followup_events: Vec::new(),
@@ -814,6 +819,7 @@ fn live_turn_can_pause_for_provider_approval_and_resume() {
                 saved_status: "session saved".to_string(),
                 tool_logs: Vec::new(),
                 elapsed_ms: 120,
+                inference_performance: None,
             }),
         ],
         followup_events: Vec::new(),
@@ -877,6 +883,7 @@ fn ollama_provider_normalizes_ndjson_stream_to_provider_events() {
                 saved_status: "session saved".to_string(),
                 tool_logs: Vec::new(),
                 elapsed_ms: 0,
+                inference_performance: None,
             }),
         ]
     );
@@ -949,6 +956,7 @@ fn ollama_provider_stream_turn_posts_chat_request_and_normalizes_response() {
                 saved_status: "session saved".to_string(),
                 tool_logs: Vec::new(),
                 elapsed_ms: 0,
+                inference_performance: None,
             }),
         ]
     );
@@ -1171,6 +1179,7 @@ fn agentic_loop_multi_iteration_tool_calls_then_final_answer() {
                         saved_status: "session saved".to_string(),
                         tool_logs: Vec::new(),
                         elapsed_ms: 0,
+                        inference_performance: None,
                     }));
                 }
                 1 => {
@@ -1258,6 +1267,7 @@ fn agentic_loop_tool_result_payload_included_in_session_messages() {
             saved_status: "session saved".to_string(),
             tool_logs: Vec::new(),
             elapsed_ms: 0,
+            inference_performance: None,
         })],
         followup_events: Vec::new(),
         error: None,
@@ -1344,6 +1354,7 @@ fn agentic_loop_respects_max_iteration_limit() {
                 saved_status: "session saved".to_string(),
                 tool_logs: Vec::new(),
                 elapsed_ms: 0,
+                inference_performance: None,
             }));
             Ok(())
         }
@@ -1419,6 +1430,7 @@ fn agentic_loop_error_during_followup_propagates() {
                     saved_status: "session saved".to_string(),
                     tool_logs: Vec::new(),
                     elapsed_ms: 0,
+                    inference_performance: None,
                 }));
                 Ok(())
             } else {

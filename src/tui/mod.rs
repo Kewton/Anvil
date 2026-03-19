@@ -227,12 +227,19 @@ impl Tui {
             })
             .unwrap_or_else(|| "active:-".to_string());
 
+        let perf = snapshot
+            .inference_performance
+            .as_ref()
+            .and_then(|p| p.formatted_tokens_per_sec())
+            .map(|s| format!("perf:{s}"))
+            .unwrap_or_else(|| "perf:-".to_string());
+
         let event = snapshot
             .last_event
             .map(|event| format!("event:{event:?}"))
             .unwrap_or_else(|| "event:-".to_string());
 
-        format!("{state}. {elapsed}   model:{model_name}   {ctx}   {active}   {event}")
+        format!("{state}. {elapsed}   model:{model_name}   {ctx}   {perf}   {active}   {event}")
     }
 }
 

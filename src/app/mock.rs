@@ -126,6 +126,11 @@ impl MockAppExt for App {
                 "session saved",
             )
             .with_elapsed_ms(3_120)
+            .with_inference_performance(crate::contracts::InferencePerformanceView {
+                tokens_per_sec_tenths: Some(325),
+                eval_tokens: Some(150),
+                eval_duration_ms: Some(4615),
+            })
             .with_context_usage(
                 self.session().estimated_token_count(),
                 self.config().runtime.context_window,

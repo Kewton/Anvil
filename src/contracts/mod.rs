@@ -116,6 +116,24 @@ impl ContextUsageView {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InferencePerformanceView {
+    /// tokens/sec * 10 (integer). e.g. 32.5 tok/s -> 325
+    pub tokens_per_sec_tenths: Option<u64>,
+    /// Generated token count (for session persistence / debug)
+    pub eval_tokens: Option<u64>,
+    /// Evaluation time in milliseconds (for session persistence / debug)
+    pub eval_duration_ms: Option<u64>,
+}
+
+impl InferencePerformanceView {
+    /// Return a formatted string for TUI display.
+    pub fn formatted_tokens_per_sec(&self) -> Option<String> {
+        self.tokens_per_sec_tenths
+            .map(|tenths| format!("{}.{}tok/s", tenths / 10, tenths % 10))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConsoleMessageRole {
     User,
@@ -184,6 +202,9 @@ pub struct AppStateSnapshot {
     /// Context overflow warning level. Used in: Done.
     #[serde(default)]
     pub context_warning: Option<ContextWarningLevel>,
+    /// Inference performance metrics. Used in: Done.
+    #[serde(default)]
+    pub inference_performance: Option<InferencePerformanceView>,
 }
 
 impl AppStateSnapshot {
@@ -206,6 +227,7 @@ impl AppStateSnapshot {
             error_summary: None,
             recommended_actions: Vec::new(),
             context_warning: None,
+            inference_performance: None,
         }
     }
 
@@ -310,6 +332,11 @@ impl AppStateSnapshot {
 
     pub fn with_context_warning(mut self, level: ContextWarningLevel) -> Self {
         self.context_warning = Some(level);
+        self
+    }
+
+    pub fn with_inference_performance(mut self, perf: InferencePerformanceView) -> Self {
+        self.inference_performance = Some(perf);
         self
     }
 }
@@ -461,5 +488,88 @@ mod tests {
             max_tokens: 0,
         };
         assert_eq!(usage.usage_percent(), 0);
+    }
+
+    #[test]
+    fn inference_performance_default_is_all_none() {
+        let perf = InferencePerformanceView::default();
+        assert_eq!(perf.tokens_per_sec_tenths, None);
+        assert_eq!(perf.eval_tokens, None);
+        assert_eq!(perf.eval_duration_ms, None);
+        assert_eq!(perf.formatted_tokens_per_sec(), None);
+    }
+
+    #[test]
+    fn inference_performance_formatted_tokens_per_sec() {
+        let perf = InferencePerformanceView {
+            tokens_per_sec_tenths: Some(325),
+            eval_tokens: Some(100),
+            eval_duration_ms: Some(3077),
+        };
+        assert_eq!(
+            perf.formatted_tokens_per_sec(),
+            Some("32.5tok/s".to_string())
+        );
+    }
+
+    #[test]
+    fn inference_performance_formatted_tokens_per_sec_zero_fraction() {
+        let perf = InferencePerformanceView {
+            tokens_per_sec_tenths: Some(100),
+            eval_tokens: None,
+            eval_duration_ms: None,
+        };
+        assert_eq!(
+            perf.formatted_tokens_per_sec(),
+            Some("10.0tok/s".to_string())
+        );
+    }
+
+    #[test]
+    fn inference_performance_formatted_tokens_per_sec_none_when_no_tenths() {
+        let perf = InferencePerformanceView {
+            tokens_per_sec_tenths: None,
+            eval_tokens: Some(50),
+            eval_duration_ms: Some(1000),
+        };
+        assert_eq!(perf.formatted_tokens_per_sec(), None);
+    }
+
+    #[test]
+    fn inference_performance_serialize_deserialize() {
+        let perf = InferencePerformanceView {
+            tokens_per_sec_tenths: Some(325),
+            eval_tokens: Some(100),
+            eval_duration_ms: Some(3077),
+        };
+        let json = serde_json::to_string(&perf).expect("serialize");
+        let back: InferencePerformanceView = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(perf, back);
+    }
+
+    #[test]
+    fn app_state_snapshot_backward_compat_without_inference_performance() {
+        // Old JSON without inference_performance field should still deserialize
+        let json = r#"{
+            "state": "Done",
+            "status": {"line": "Done."},
+            "reasoning_summary": [],
+            "tool_logs": [],
+            "recommended_actions": []
+        }"#;
+        let snapshot: AppStateSnapshot = serde_json::from_str(json).expect("deserialize");
+        assert!(snapshot.inference_performance.is_none());
+    }
+
+    #[test]
+    fn app_state_snapshot_with_inference_performance_builder() {
+        let perf = InferencePerformanceView {
+            tokens_per_sec_tenths: Some(200),
+            eval_tokens: Some(80),
+            eval_duration_ms: Some(4000),
+        };
+        let snapshot =
+            AppStateSnapshot::new(RuntimeState::Done).with_inference_performance(perf.clone());
+        assert_eq!(snapshot.inference_performance, Some(perf));
     }
 }
