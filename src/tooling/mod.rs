@@ -18,6 +18,12 @@ use std::time::{Duration, Instant};
 /// Maximum image file size in bytes (20 MB).
 const IMAGE_SIZE_LIMIT: u64 = 20 * 1024 * 1024;
 
+/// Maximum number of context lines around a match (file.search).
+const MAX_CONTEXT_LINES: u32 = 10;
+
+/// Maximum number of matched files returned by file.search.
+const MAX_SEARCH_RESULTS: usize = 100;
+
 /// Detect the MIME type of an image file based on its extension.
 ///
 /// Returns `None` for non-image extensions.
@@ -96,6 +102,10 @@ pub enum ToolInput {
     FileSearch {
         root: String,
         pattern: String,
+        #[serde(default)]
+        regex: bool,
+        #[serde(default)]
+        context_lines: u32,
     },
     ShellExec {
         command: String,
@@ -198,6 +208,14 @@ impl ToolInput {
                     .and_then(serde_json::Value::as_str)
                     .ok_or_else(|| "missing pattern in file.search tool block".to_string())?
                     .to_string(),
+                regex: value
+                    .get("regex")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                context_lines: value
+                    .get("context_lines")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as u32,
             }),
             "shell.exec" | "shell" => Ok(ToolInput::ShellExec {
                 command: value
@@ -289,6 +307,12 @@ impl ToolInput {
                 pattern: extract_simple(block, "pattern")
                     .or_else(|| extract_simple(block, "content"))
                     .or_else(|| extract_simple(block, "query"))?,
+                regex: extract_simple(block, "regex")
+                    .map(|v| v == "true")
+                    .unwrap_or(false),
+                context_lines: extract_simple(block, "context_lines")
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .unwrap_or(0),
             }),
             "shell.exec" | "shell" => Some(ToolInput::ShellExec {
                 command: extract_simple(block, "command")?,
@@ -784,7 +808,9 @@ impl LocalToolExecutor {
             ToolInput::FileSearch {
                 ref root,
                 ref pattern,
-            } => self.execute_file_search(&request, root, pattern, started),
+                regex,
+                context_lines,
+            } => self.execute_file_search(&request, root, pattern, regex, context_lines, started),
             ToolInput::WebFetch { ref url } => self.execute_web_fetch(&request, url, started),
             ToolInput::ShellExec { ref command } => {
                 self.execute_shell_exec(&request, command, started)
@@ -967,16 +993,40 @@ impl LocalToolExecutor {
         request: &ToolExecutionRequest,
         root: &str,
         pattern: &str,
+        regex: bool,
+        context_lines: u32,
         started: Instant,
     ) -> Result<ToolExecutionResult, ToolRuntimeError> {
         let resolved_root = self.resolve_path(root)?;
-        let mut matches = Vec::new();
-        collect_search_matches(&resolved_root, pattern, &mut matches)?;
+
+        let search_pattern = if regex {
+            let re = regex::RegexBuilder::new(pattern)
+                .size_limit(1 << 20)
+                .build()
+                .map_err(|err| ToolRuntimeError::Io(format!("invalid regex pattern: {err}")))?;
+            SearchPattern::Regex(re)
+        } else {
+            SearchPattern::Literal(pattern.to_string())
+        };
+
+        let mut file_matches: Vec<FileMatchResult> = Vec::new();
+        let mut total_count: usize = 0;
+        collect_search_matches_v2(
+            &resolved_root,
+            &search_pattern,
+            context_lines,
+            &mut file_matches,
+            &mut total_count,
+        )?;
+
+        let (payload, artifacts) =
+            format_file_search_results(&file_matches, context_lines, total_count);
+
         Ok(build_completed_result(
             request,
             format!("{root} :: {pattern}"),
-            ToolExecutionPayload::Paths(matches.clone()),
-            matches,
+            payload,
+            artifacts,
             started,
         ))
     }
@@ -1433,7 +1483,12 @@ fn validate_required_fields(input: &ToolInput) -> Result<(), ToolValidationError
                 ));
             }
         }
-        ToolInput::FileSearch { root, pattern } => {
+        ToolInput::FileSearch {
+            root,
+            pattern,
+            regex,
+            context_lines,
+        } => {
             if root.trim().is_empty() {
                 return Err(ToolValidationError::MissingRequiredField(
                     "root".to_string(),
@@ -1443,6 +1498,21 @@ fn validate_required_fields(input: &ToolInput) -> Result<(), ToolValidationError
                 return Err(ToolValidationError::MissingRequiredField(
                     "pattern".to_string(),
                 ));
+            }
+            if *context_lines > MAX_CONTEXT_LINES {
+                return Err(ToolValidationError::InvalidFieldValue {
+                    field: "context_lines".to_string(),
+                    reason: format!(
+                        "context_lines {} exceeds maximum of {}",
+                        context_lines, MAX_CONTEXT_LINES
+                    ),
+                });
+            }
+            if *regex && let Err(err) = regex::Regex::new(pattern) {
+                return Err(ToolValidationError::InvalidFieldValue {
+                    field: "pattern".to_string(),
+                    reason: format!("invalid regex pattern: {err}"),
+                });
             }
         }
         ToolInput::ShellExec { command } => {
@@ -1961,13 +2031,95 @@ fn strip_html_tags(input: &str) -> String {
         .replace("&#39;", "'")
 }
 
-fn collect_search_matches(
+// ---------------------------------------------------------------------------
+// file.search v2: regex support, context lines, result limits
+// ---------------------------------------------------------------------------
+
+/// Internal search pattern representation.
+enum SearchPattern {
+    Literal(String),
+    Regex(regex::Regex),
+}
+
+impl SearchPattern {
+    /// Check whether `text` matches this pattern.
+    fn is_match(&self, text: &str) -> bool {
+        match self {
+            SearchPattern::Literal(lit) => text.contains(lit.as_str()),
+            SearchPattern::Regex(re) => re.is_match(text),
+        }
+    }
+}
+
+/// A single matched line with surrounding context.
+struct MatchedLine {
+    line_number: usize,
+    content: String,
+    context_before: Vec<String>,
+    context_after: Vec<String>,
+}
+
+/// Intermediate search result for a single file.
+struct FileMatchResult {
+    path: String,
+    matched_lines: Vec<MatchedLine>,
+}
+
+/// Maximum number of matches collected per file.
+const MAX_MATCHES_PER_FILE: usize = 50;
+
+/// Collect context lines around matches in a single file.
+fn collect_context_lines(
+    path: &Path,
+    pattern: &SearchPattern,
+    context_lines: u32,
+) -> Vec<MatchedLine> {
+    use std::io::BufRead;
+
+    let Ok(file) = fs::File::open(path) else {
+        return Vec::new();
+    };
+    let reader = std::io::BufReader::new(file);
+    let all_lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
+    let ctx = context_lines as usize;
+
+    let mut results = Vec::new();
+    for (idx, line) in all_lines.iter().enumerate() {
+        if results.len() >= MAX_MATCHES_PER_FILE {
+            break;
+        }
+        if pattern.is_match(line) {
+            let start = idx.saturating_sub(ctx);
+            let end = (idx + ctx + 1).min(all_lines.len());
+
+            let context_before: Vec<String> = all_lines[start..idx].to_vec();
+            let context_after: Vec<String> = if idx + 1 < end {
+                all_lines[idx + 1..end].to_vec()
+            } else {
+                Vec::new()
+            };
+
+            results.push(MatchedLine {
+                line_number: idx + 1, // 1-based
+                content: line.clone(),
+                context_before,
+                context_after,
+            });
+        }
+    }
+    results
+}
+
+/// Recursively collect file matches with search pattern support and result limits.
+fn collect_search_matches_v2(
     root: &Path,
-    pattern: &str,
-    matches: &mut Vec<String>,
+    pattern: &SearchPattern,
+    context_lines: u32,
+    results: &mut Vec<FileMatchResult>,
+    total_count: &mut usize,
 ) -> Result<(), ToolRuntimeError> {
     if root.is_file() {
-        check_file_match(root, pattern, matches);
+        check_file_match_v2(root, pattern, context_lines, results, total_count);
         return Ok(());
     }
 
@@ -1975,6 +2127,9 @@ fn collect_search_matches(
         ToolRuntimeError::Io(format!("file.search failed for {}: {err}", root.display()))
     })?;
     for entry in entries {
+        if results.len() >= MAX_SEARCH_RESULTS {
+            break;
+        }
         let entry = entry.map_err(|err| {
             ToolRuntimeError::Io(format!(
                 "file.search failed while reading {}: {err}",
@@ -1993,36 +2148,158 @@ fn collect_search_matches(
             ) {
                 continue;
             }
-            collect_search_matches(&path, pattern, matches)?;
+            collect_search_matches_v2(&path, pattern, context_lines, results, total_count)?;
         } else {
-            check_file_match(&path, pattern, matches);
+            check_file_match_v2(&path, pattern, context_lines, results, total_count);
         }
     }
-
     Ok(())
 }
 
-/// Check whether a single file matches `pattern` by path name or content.
-fn check_file_match(path: &Path, pattern: &str, matches: &mut Vec<String>) {
+/// Check whether a single file matches the pattern. Collects context if requested.
+fn check_file_match_v2(
+    path: &Path,
+    pattern: &SearchPattern,
+    context_lines: u32,
+    results: &mut Vec<FileMatchResult>,
+    total_count: &mut usize,
+) {
     use std::io::BufRead;
 
     let path_str = path.display().to_string();
-    if path_str.contains(pattern) {
-        matches.push(path_str);
+
+    // Path name match is always literal contains (even for regex mode).
+    let pattern_str = match pattern {
+        SearchPattern::Literal(lit) => lit.as_str(),
+        SearchPattern::Regex(re) => re.as_str(),
+    };
+    if path_str.contains(pattern_str) {
+        *total_count += 1;
+        if results.len() < MAX_SEARCH_RESULTS {
+            results.push(FileMatchResult {
+                path: path_str,
+                matched_lines: Vec::new(), // path-only match
+            });
+        }
         return;
     }
+
     if !is_searchable_file(path) {
         return;
     }
-    if let Ok(file) = fs::File::open(path) {
-        let reader = std::io::BufReader::new(file);
-        for line in reader.lines() {
-            let Ok(line) = line else { break };
-            if line.contains(pattern) {
-                matches.push(path_str);
-                break;
+
+    // Content search
+    if context_lines > 0 {
+        let matched = collect_context_lines(path, pattern, context_lines);
+        if !matched.is_empty() {
+            *total_count += 1;
+            if results.len() < MAX_SEARCH_RESULTS {
+                results.push(FileMatchResult {
+                    path: path_str,
+                    matched_lines: matched,
+                });
             }
         }
+    } else {
+        // Fast path: just check if any line matches
+        if let Ok(file) = fs::File::open(path) {
+            let reader = std::io::BufReader::new(file);
+            for line in reader.lines() {
+                let Ok(line) = line else { break };
+                if pattern.is_match(&line) {
+                    *total_count += 1;
+                    if results.len() < MAX_SEARCH_RESULTS {
+                        results.push(FileMatchResult {
+                            path: path_str,
+                            matched_lines: Vec::new(),
+                        });
+                    }
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Format file search results into a `ToolExecutionPayload`.
+///
+/// Returns `(payload, artifacts)`.
+fn format_file_search_results(
+    results: &[FileMatchResult],
+    context_lines: u32,
+    total_count: usize,
+) -> (ToolExecutionPayload, Vec<String>) {
+    let truncated = total_count > MAX_SEARCH_RESULTS;
+
+    if context_lines == 0 {
+        // Paths mode (backward compatible)
+        let paths: Vec<String> = results.iter().map(|r| r.path.clone()).collect();
+        let artifacts = paths.clone();
+        let mut payload = ToolExecutionPayload::Paths(paths);
+        if truncated {
+            // Wrap in Text with notification
+            if let ToolExecutionPayload::Paths(ref p) = payload {
+                let mut text = p.join("\n");
+                text.push_str(&format!(
+                    "\n\n({total_count}件中{MAX_SEARCH_RESULTS}件を表示しています。パターンを絞り込んでください。)"
+                ));
+                payload = ToolExecutionPayload::Text(text);
+            }
+        }
+        (payload, artifacts)
+    } else {
+        // Text mode with context lines
+        let mut output = String::new();
+        let artifacts: Vec<String> = results.iter().map(|r| r.path.clone()).collect();
+
+        for (file_idx, result) in results.iter().enumerate() {
+            if file_idx > 0 {
+                output.push_str("--\n");
+            }
+
+            if result.matched_lines.is_empty() {
+                // Path-only match
+                output.push_str(&result.path);
+                output.push('\n');
+            } else {
+                for matched in &result.matched_lines {
+                    // Context before
+                    let start_line = matched
+                        .line_number
+                        .saturating_sub(matched.context_before.len());
+                    for (i, ctx_line) in matched.context_before.iter().enumerate() {
+                        output.push_str(&format!(
+                            "{}:{}: {}\n",
+                            result.path,
+                            start_line + i,
+                            ctx_line
+                        ));
+                    }
+                    // Match line
+                    output.push_str(&format!(
+                        "{}:{}: {}\n",
+                        result.path, matched.line_number, matched.content
+                    ));
+                    // Context after
+                    for (i, ctx_line) in matched.context_after.iter().enumerate() {
+                        output.push_str(&format!(
+                            "{}:{}: {}\n",
+                            result.path,
+                            matched.line_number + 1 + i,
+                            ctx_line
+                        ));
+                    }
+                }
+            }
+        }
+
+        if truncated {
+            output.push_str(&format!(
+                "\n({total_count}件中{MAX_SEARCH_RESULTS}件を表示しています。パターンを絞り込んでください。)"
+            ));
+        }
+
+        (ToolExecutionPayload::Text(output), artifacts)
     }
 }
 
