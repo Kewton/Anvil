@@ -304,6 +304,81 @@ impl<T: HttpTransport> ProviderClient for OllamaProviderClient<T> {
     }
 }
 
+/// Request body for the Ollama `/api/show` endpoint.
+#[derive(Serialize)]
+struct ShowRequest {
+    model: String,
+}
+
+/// Maximum allowed response size from `/api/show` (1 MiB).
+const MAX_SHOW_RESPONSE_SIZE: usize = 1_048_576;
+
+/// Upper bound for a sane `context_length` value (10 million tokens).
+const MAX_CONTEXT_LENGTH: u32 = 10_000_000;
+
+/// Query the Ollama `/api/show` endpoint and extract the model's
+/// `context_length` from `model_info`.
+///
+/// Returns `None` on any failure (network, parse, missing key).
+pub fn fetch_context_length_from_ollama(provider_url: &str, model: &str) -> Option<u32> {
+    let url = format!("{}/api/show", provider_url.trim_end_matches('/'));
+    let body = serde_json::to_vec(&ShowRequest {
+        model: model.to_string(),
+    })
+    .ok()?;
+
+    let output = Command::new("curl")
+        .arg("-sS")
+        .arg("--max-time")
+        .arg("5")
+        .arg("--proto")
+        .arg("=http,https")
+        .arg("--max-filesize")
+        .arg(MAX_SHOW_RESPONSE_SIZE.to_string())
+        .arg("--data-binary")
+        .arg("@-")
+        .arg("--")
+        .arg(&url)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .ok()
+        .and_then(|mut child| {
+            use std::io::Write;
+            if let Some(ref mut stdin) = child.stdin {
+                let _ = stdin.write_all(&body);
+            }
+            child.wait_with_output().ok()
+        })?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    parse_context_length_from_show_response(&output.stdout)
+}
+
+/// Parse an Ollama `/api/show` JSON response body and extract context_length.
+///
+/// This is the pure-logic core of [`fetch_context_length_from_ollama`],
+/// extracted for unit testing without network access.
+pub fn parse_context_length_from_show_response(json_bytes: &[u8]) -> Option<u32> {
+    let value: Value = serde_json::from_slice(json_bytes).ok()?;
+    let model_info = value.get("model_info")?.as_object()?;
+
+    for (key, val) in model_info {
+        if key.ends_with(".context_length") {
+            let ctx_len = val.as_u64()?;
+            let clamped = u32::try_from(ctx_len.min(u64::from(MAX_CONTEXT_LENGTH))).ok()?;
+            if clamped > 0 {
+                return Some(clamped);
+            }
+        }
+    }
+    None
+}
+
 fn resolve_model_with_ollama_tags(base_url: &str, requested: &str) -> String {
     let url = format!("{}/api/tags", base_url.trim_end_matches('/'));
     let output = Command::new("curl")

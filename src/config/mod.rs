@@ -61,6 +61,10 @@ pub struct RuntimeConfig {
     pub stream: bool,
     pub web_search_provider: WebSearchProvider,
     pub serper_api_key: Option<String>,
+    /// `true` when the user explicitly set `context_window` via config file,
+    /// environment variable, or CLI flag.  When `false`, the auto-detect
+    /// logic in `cli.rs` may override `context_window` from the provider.
+    pub context_window_explicitly_set: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -200,6 +204,7 @@ impl EffectiveConfig {
                 stream: true,
                 web_search_provider: WebSearchProvider::default(),
                 serper_api_key: None,
+                context_window_explicitly_set: false,
             },
             mode: ModeConfig {
                 prompt_source: PromptSource::Interactive,
@@ -224,6 +229,12 @@ impl EffectiveConfig {
             },
             project_instructions: None,
         }
+    }
+
+    /// Set `context_window` and mark it as explicitly set by the user.
+    fn set_context_window(&mut self, value: u32) {
+        self.runtime.context_window = value;
+        self.runtime.context_window_explicitly_set = true;
     }
 
     fn apply_file_and_env_overrides(&mut self) -> Result<(), ConfigError> {
@@ -330,7 +341,7 @@ impl EffectiveConfig {
 
         // Numeric fields (already parsed by clap)
         if let Some(v) = cli.context_window {
-            self.runtime.context_window = v;
+            self.set_context_window(v);
         }
         if let Some(v) = cli.context_budget {
             self.runtime.context_budget = Some(v);
@@ -389,9 +400,10 @@ impl EffectiveConfig {
                     };
                 }
                 "context_window" | "ANVIL_CONTEXT_WINDOW" => {
-                    self.runtime.context_window = value
+                    let v: u32 = value
                         .parse()
                         .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                    self.set_context_window(v);
                 }
                 "context_budget" | "ANVIL_CONTEXT_BUDGET" => {
                     self.runtime.context_budget = if value.is_empty() {
@@ -512,7 +524,7 @@ impl EffectiveConfig {
         Ok(())
     }
 
-    fn clamp_context_window(&mut self) {
+    pub(crate) fn clamp_context_window(&mut self) {
         if self.runtime.context_window < MIN_CONTEXT_WINDOW {
             let old = self.runtime.context_window;
             self.runtime.context_window = MIN_CONTEXT_WINDOW;
@@ -522,7 +534,7 @@ impl EffectiveConfig {
         }
     }
 
-    fn clamp_context_budget(&mut self) {
+    pub(crate) fn clamp_context_budget(&mut self) {
         if let Some(budget) = self.runtime.context_budget
             && budget >= self.runtime.context_window
         {
@@ -798,6 +810,10 @@ impl std::fmt::Debug for RuntimeConfig {
             .field("stream", &self.stream)
             .field("web_search_provider", &self.web_search_provider)
             .field("serper_api_key", &"[REDACTED]")
+            .field(
+                "context_window_explicitly_set",
+                &self.context_window_explicitly_set,
+            )
             .finish()
     }
 }

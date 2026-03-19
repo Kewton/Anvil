@@ -550,3 +550,58 @@ fn gitignore_check_no_gitignore_file() {
     assert!(result.is_some());
     assert!(result.unwrap().contains(".gitignore"));
 }
+
+// --- context_window_explicitly_set tests ---
+
+#[test]
+fn context_window_explicitly_set_defaults_to_false() {
+    let config = EffectiveConfig::default_for_test().unwrap();
+    assert!(
+        !config.runtime.context_window_explicitly_set,
+        "default config should have context_window_explicitly_set=false"
+    );
+}
+
+#[test]
+fn context_window_explicitly_set_via_config_file_map() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let mut file_values = HashMap::new();
+    file_values.insert("context_window".to_string(), "8192".to_string());
+    config
+        .apply_overrides_for_test(&file_values, &HashMap::new(), &HashMap::new())
+        .expect("should apply");
+    assert!(
+        config.runtime.context_window_explicitly_set,
+        "context_window set via config file should mark explicitly_set=true"
+    );
+    assert_eq!(config.runtime.context_window, 8192);
+}
+
+#[test]
+fn context_window_explicitly_set_via_env_map() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let mut env_values = HashMap::new();
+    env_values.insert("ANVIL_CONTEXT_WINDOW".to_string(), "16384".to_string());
+    config
+        .apply_overrides_for_test(&HashMap::new(), &env_values, &HashMap::new())
+        .expect("should apply");
+    assert!(
+        config.runtime.context_window_explicitly_set,
+        "context_window set via env should mark explicitly_set=true"
+    );
+    assert_eq!(config.runtime.context_window, 16384);
+}
+
+#[test]
+fn context_window_explicitly_set_remains_false_when_not_set() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let mut file_values = HashMap::new();
+    file_values.insert("model".to_string(), "some-model".to_string());
+    config
+        .apply_overrides_for_test(&file_values, &HashMap::new(), &HashMap::new())
+        .expect("should apply");
+    assert!(
+        !config.runtime.context_window_explicitly_set,
+        "setting other config keys should not mark context_window as explicitly set"
+    );
+}
