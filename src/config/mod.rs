@@ -72,6 +72,7 @@ pub struct ModeConfig {
     pub reasoning_visibility: ReasoningVisibility,
     pub debug_logging: bool,
     pub log_filter: Option<String>,
+    pub offline: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,6 +209,7 @@ impl EffectiveConfig {
                 reasoning_visibility: ReasoningVisibility::Summary,
                 debug_logging: false,
                 log_filter: None,
+                offline: false,
             },
             paths: PathConfig {
                 mcp_config_file: cwd.join(".anvil").join("mcp.json"),
@@ -282,6 +284,7 @@ impl EffectiveConfig {
             "ANVIL_WEB_SEARCH_PROVIDER",
             "SERPER_API_KEY",
             "ANVIL_LOG",
+            "ANVIL_OFFLINE",
         ] {
             if let Ok(value) = std::env::var(key) {
                 map.insert(key.to_string(), value);
@@ -356,6 +359,10 @@ impl EffectiveConfig {
         // Enum field
         if let Some(ref v) = cli.reasoning_visibility {
             self.mode.reasoning_visibility = parse_reasoning_visibility(v)?;
+        }
+
+        if cli.offline {
+            self.mode.offline = true;
         }
 
         Ok(())
@@ -447,6 +454,9 @@ impl EffectiveConfig {
                 }
                 "log_filter" | "ANVIL_LOG" => {
                     self.mode.log_filter = Some(value.clone());
+                }
+                "offline" | "ANVIL_OFFLINE" => {
+                    self.mode.offline = parse_bool(value);
                 }
                 _ => {}
             }

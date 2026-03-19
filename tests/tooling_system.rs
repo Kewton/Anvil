@@ -2496,3 +2496,137 @@ fn subagent_error_into_tool_execution_result_status_mapping() {
     let result = SubAgentError::ToolExecution("err".to_string()).into_tool_execution_result(&call);
     assert_eq!(result.status, ToolExecutionStatus::Failed);
 }
+
+// ============================================================
+// Offline mode tests (Issue #67)
+// ============================================================
+
+#[test]
+fn build_subagent_system_prompt_plan_offline_excludes_web_fetch() {
+    use anvil::agent::subagent::{SubAgentKind, build_subagent_system_prompt};
+    let prompt = build_subagent_system_prompt(&SubAgentKind::Plan, true);
+    assert!(
+        !prompt.contains("web.fetch"),
+        "offline Plan prompt should not contain web.fetch tool description"
+    );
+    assert!(
+        prompt.contains("Offline mode is active"),
+        "offline Plan prompt should contain offline note"
+    );
+    assert!(
+        !prompt.contains("You may fetch web URLs"),
+        "offline Plan prompt should not contain web URL permission"
+    );
+}
+
+#[test]
+fn build_subagent_system_prompt_plan_online_includes_web_fetch() {
+    use anvil::agent::subagent::{SubAgentKind, build_subagent_system_prompt};
+    let prompt = build_subagent_system_prompt(&SubAgentKind::Plan, false);
+    assert!(
+        prompt.contains("web.fetch"),
+        "online Plan prompt should contain web.fetch tool description"
+    );
+    assert!(
+        prompt.contains("You may fetch web URLs"),
+        "online Plan prompt should contain web URL permission"
+    );
+    assert!(
+        !prompt.contains("Offline mode is active"),
+        "online Plan prompt should not contain offline note"
+    );
+}
+
+#[test]
+fn build_subagent_system_prompt_explore_unaffected_by_offline() {
+    use anvil::agent::subagent::{SubAgentKind, build_subagent_system_prompt};
+    let online_prompt = build_subagent_system_prompt(&SubAgentKind::Explore, false);
+    let offline_prompt = build_subagent_system_prompt(&SubAgentKind::Explore, true);
+    assert_eq!(
+        online_prompt, offline_prompt,
+        "Explore prompt should be identical regardless of offline flag"
+    );
+}
+
+#[test]
+fn check_offline_blocked_blocks_web_fetch_in_offline_mode() {
+    use anvil::app::policy::check_offline_blocked;
+    let mut config = anvil::config::EffectiveConfig::default_for_test().unwrap();
+    config.mode.offline = true;
+    let call = ToolCallRequest::new(
+        "call_001",
+        "web.fetch",
+        ToolInput::WebFetch {
+            url: "https://example.com".to_string(),
+        },
+    );
+    let result = check_offline_blocked(&config, &call);
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("is unavailable in offline mode"));
+}
+
+#[test]
+fn check_offline_blocked_allows_file_read_in_offline_mode() {
+    use anvil::app::policy::check_offline_blocked;
+    let mut config = anvil::config::EffectiveConfig::default_for_test().unwrap();
+    config.mode.offline = true;
+    let call = ToolCallRequest::new(
+        "call_002",
+        "file.read",
+        ToolInput::FileRead {
+            path: "./test.rs".to_string(),
+        },
+    );
+    assert!(check_offline_blocked(&config, &call).is_none());
+}
+
+#[test]
+fn check_offline_blocked_allows_web_fetch_when_not_offline() {
+    use anvil::app::policy::check_offline_blocked;
+    let config = anvil::config::EffectiveConfig::default_for_test().unwrap();
+    assert!(!config.mode.offline);
+    let call = ToolCallRequest::new(
+        "call_003",
+        "web.fetch",
+        ToolInput::WebFetch {
+            url: "https://example.com".to_string(),
+        },
+    );
+    assert!(check_offline_blocked(&config, &call).is_none());
+}
+
+#[test]
+fn check_offline_blocked_blocks_mcp_in_offline_mode() {
+    use anvil::app::policy::check_offline_blocked;
+    let mut config = anvil::config::EffectiveConfig::default_for_test().unwrap();
+    config.mode.offline = true;
+    let call = ToolCallRequest::new(
+        "call_004",
+        "mcp__server__tool",
+        ToolInput::Mcp {
+            server: "server".to_string(),
+            tool: "tool".to_string(),
+            arguments: serde_json::Value::Null,
+        },
+    );
+    let result = check_offline_blocked(&config, &call);
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("is unavailable in offline mode"));
+}
+
+#[test]
+fn check_offline_blocked_blocks_web_search_in_offline_mode() {
+    use anvil::app::policy::check_offline_blocked;
+    let mut config = anvil::config::EffectiveConfig::default_for_test().unwrap();
+    config.mode.offline = true;
+    let call = ToolCallRequest::new(
+        "call_005",
+        "web.search",
+        ToolInput::WebSearch {
+            query: "test".to_string(),
+        },
+    );
+    let result = check_offline_blocked(&config, &call);
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("web.search"));
+}
