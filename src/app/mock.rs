@@ -87,11 +87,13 @@ impl MockAppExt for App {
                     tool_name: "Read".to_string(),
                     action: "open".to_string(),
                     target: "src/app/mod.rs".to_string(),
+                    elapsed_ms: None,
                 },
                 ToolLogView {
                     tool_name: "Grep".to_string(),
                     action: "search".to_string(),
                     target: "StateTransition".to_string(),
+                    elapsed_ms: None,
                 },
             ])
             .with_elapsed_ms(1_240)
@@ -114,11 +116,13 @@ impl MockAppExt for App {
                     tool_name: "Read".to_string(),
                     action: "open".to_string(),
                     target: "src/app/mod.rs".to_string(),
+                    elapsed_ms: None,
                 },
                 ToolLogView {
                     tool_name: "Write".to_string(),
                     action: "update".to_string(),
                     target: "workspace/work-plan.md".to_string(),
+                    elapsed_ms: None,
                 },
             ])
             .with_completion_summary(
