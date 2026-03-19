@@ -147,10 +147,14 @@ fn startup_screen_shows_logo_model_and_project() {
     .expect("app should initialize");
     let tui = Tui::new();
 
+    let snapshot = app
+        .initial_snapshot()
+        .expect("initial snapshot should build");
     let rendered = tui.render_startup(
         &config,
-        &app.initial_snapshot()
-            .expect("initial snapshot should build"),
+        &snapshot,
+        &config.runtime.model,
+        config.runtime.context_window,
     );
 
     assert!(rendered.contains("local coding agent for serious terminal work"));
@@ -322,10 +326,14 @@ fn startup_shows_anvil_md_loaded() {
     .expect("app should initialize");
     let tui = Tui::new();
 
+    let snapshot = app
+        .initial_snapshot()
+        .expect("initial snapshot should build");
     let rendered = tui.render_startup(
         &config,
-        &app.initial_snapshot()
-            .expect("initial snapshot should build"),
+        &snapshot,
+        &config.runtime.model,
+        config.runtime.context_window,
     );
 
     assert!(rendered.contains("ANVIL.md: loaded"));
@@ -343,10 +351,14 @@ fn startup_without_anvil_md() {
     .expect("app should initialize");
     let tui = Tui::new();
 
+    let snapshot = app
+        .initial_snapshot()
+        .expect("initial snapshot should build");
     let rendered = tui.render_startup(
         &config,
-        &app.initial_snapshot()
-            .expect("initial snapshot should build"),
+        &snapshot,
+        &config.runtime.model,
+        config.runtime.context_window,
     );
 
     assert!(!rendered.contains("ANVIL.md: loaded"));
