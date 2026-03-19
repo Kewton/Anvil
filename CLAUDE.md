@@ -113,7 +113,7 @@ src/
 ├── config/mod.rs        # 設定管理
 ├── contracts/
 │   ├── mod.rs           # 共通型定義
-│   └── tokens.rs        # トークン推定（CJK対応ヒューリスティック）
+│   └── tokens.rs        # トークン推定（CJK対応ヒューリスティック・モデル実測値ベースEMA補正）
 ├── extensions/
 │   ├── mod.rs           # スラッシュコマンド・拡張
 │   └── skills.rs        # SKILL.mdベースのスキルシステム

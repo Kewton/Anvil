@@ -606,6 +606,7 @@ fn footer_shows_perf_with_metrics() {
             tokens_per_sec_tenths: Some(325),
             eval_tokens: Some(100),
             eval_duration_ms: Some(3077),
+            ..Default::default()
         });
 
     let context = anvil::contracts::ConsoleRenderContext {
