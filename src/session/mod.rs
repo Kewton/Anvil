@@ -13,6 +13,7 @@ use crate::contracts::{
 };
 use crate::provider::ProviderErrorRecord;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::fmt::{Display, Formatter};
 use std::hash::{Hash, Hasher};
@@ -119,6 +120,10 @@ pub struct SessionRecord {
     pub pending_turn: Option<PendingTurnState>,
     #[serde(default)]
     pub provider_errors: Vec<ProviderErrorRecord>,
+    /// Set of tool names that have been used in this session.
+    /// Used for dynamic system prompt generation (Issue #73).
+    #[serde(default)]
+    pub used_tools: HashSet<String>,
     /// Tracks whether in-memory state has diverged from disk.
     /// Not serialized — always starts as `false` after deserialization.
     #[serde(skip)]
@@ -161,6 +166,7 @@ impl SessionRecord {
             event_log: Vec::new(),
             pending_turn: None,
             provider_errors: Vec::new(),
+            used_tools: HashSet::new(),
             dirty: false,
             cached_token_count: std::cell::Cell::new(None),
             auto_compact_threshold: 64,

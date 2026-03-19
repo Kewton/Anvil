@@ -113,7 +113,9 @@ pub struct App {
     session: SessionRecord,
     extensions: ExtensionRegistry,
     tools: ToolRegistry,
-    system_prompt: String,
+    detected_languages: Vec<ProjectLanguage>,
+    mcp_descriptions: Option<String>,
+    project_instructions: Option<String>,
     shutdown_flag: Arc<AtomicBool>,
     warning_tracker: ContextWarningTracker,
     /// Undo checkpoint stack. In-memory only, discarded on session exit.
@@ -327,23 +329,10 @@ impl App {
         });
 
         let detected_languages = detect_project_languages(&config.paths.cwd);
-        let base_prompt = crate::agent::tool_protocol_system_prompt(
-            &detected_languages,
-            mcp_descriptions.as_deref(),
-        );
-        let mut system_prompt = match config.project_instructions() {
-            Some(instructions) => format!(
-                "{}\n\n## Project instructions (from ANVIL.md)\n{}",
-                base_prompt, instructions
-            ),
-            None => base_prompt,
-        };
+        let project_instructions = config.project_instructions().map(|s| s.to_string());
 
-        // Offline mode: append note to system prompt and warn about shell.exec
+        // Offline mode: warn about shell.exec network access
         if config.mode.offline {
-            system_prompt.push_str(
-                "\n\nNote: Offline mode is active. web.fetch and web.search are unavailable. Do not use shell.exec to make network requests (curl, wget, etc.). Use local tools only."
-            );
             eprintln!(
                 "Warning: shell.exec can still access the network in offline mode. For full network isolation, use OS/firewall-level controls."
             );
@@ -367,7 +356,9 @@ impl App {
             session_store,
             session,
             extensions,
-            system_prompt,
+            detected_languages,
+            mcp_descriptions,
+            project_instructions,
             shutdown_flag,
             warning_tracker: ContextWarningTracker::new(),
             checkpoint_stack: CheckpointStack::new(),
@@ -420,6 +411,51 @@ impl App {
 
     pub(crate) fn config(&self) -> &EffectiveConfig {
         &self.config
+    }
+
+    /// Build a dynamic system prompt based on current session state.
+    ///
+    /// Called each turn to include only relevant tool descriptions.
+    /// Offline mode filters out web.* tools from the effective used_tools set.
+    fn build_dynamic_system_prompt(&self) -> String {
+        use crate::agent::tool_protocol_system_prompt;
+
+        // Offline mode: exclude web.* tools from used_tools.
+        // Non-offline: pass a reference directly to avoid cloning.
+        let filtered_tools;
+        let effective_used_tools = if self.config.mode.offline {
+            filtered_tools = self
+                .session
+                .used_tools
+                .iter()
+                .filter(|t| !t.starts_with("web."))
+                .cloned()
+                .collect();
+            &filtered_tools
+        } else {
+            &self.session.used_tools
+        };
+
+        let mut prompt = tool_protocol_system_prompt(
+            &self.detected_languages,
+            self.mcp_descriptions.as_deref(),
+            effective_used_tools,
+        );
+
+        // Project instructions (from ANVIL.md)
+        if let Some(ref instructions) = self.project_instructions {
+            prompt.push_str("\n\n## Project instructions (from ANVIL.md)\n");
+            prompt.push_str(instructions);
+        }
+
+        // Offline mode annotation
+        if self.config.mode.offline {
+            prompt.push_str(
+                "\n\nNote: Offline mode is active. web.fetch and web.search are unavailable. Do not use shell.exec to make network requests (curl, wget, etc.). Use local tools only."
+            );
+        }
+
+        prompt
     }
 
     /// Check whether a shutdown has been requested via the shared flag.
@@ -709,12 +745,13 @@ impl App {
         )?;
         self.begin_live_turn_state()?;
 
+        let system_prompt = self.build_dynamic_system_prompt();
         let request = BasicAgentLoop::build_turn_request(
             self.effective_model().to_string(),
             &self.session,
             self.provider.capabilities.streaming && self.config.runtime.stream,
             self.effective_context_window(),
-            &self.system_prompt,
+            &system_prompt,
         );
 
         // Phase 1: Collect events from provider with spinner + streaming output.
