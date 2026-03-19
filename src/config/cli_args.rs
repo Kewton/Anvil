@@ -82,12 +82,14 @@ pub struct CliArgs {
     pub trust: bool,
 
     /// Enable tag-based tool protocol (--tag-protocol).
+    #[doc(hidden)]
     #[arg(long = "tag-protocol")]
-    tag_protocol_flag: bool,
+    pub tag_protocol_flag: bool,
 
     /// Force JSON tool protocol (--no-tag-protocol).
+    #[doc(hidden)]
     #[arg(long = "no-tag-protocol")]
-    no_tag_protocol_flag: bool,
+    pub no_tag_protocol_flag: bool,
 
     /// Computed tag_protocol value: Some(true) for --tag-protocol,
     /// Some(false) for --no-tag-protocol, None when neither is specified.

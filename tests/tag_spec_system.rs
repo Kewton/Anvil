@@ -1,6 +1,6 @@
 //! Tests for src/agent/tag_spec.rs — tag-based tool syntax definition table.
 
-use anvil::agent::tag_spec::{find_spec, TOOL_TAG_SPECS};
+use anvil::agent::tag_spec::{TOOL_TAG_SPECS, find_spec};
 
 #[test]
 fn tool_tag_specs_has_nine_entries() {

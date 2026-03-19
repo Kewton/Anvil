@@ -33,7 +33,12 @@ pub fn determine_protocol_mode(
 
 /// Small-model family names that default to tag-based protocol.
 const SMALL_MODEL_FAMILIES: &[&str] = &[
-    "gemma", "phi", "qwen2", "stablelm", "tinyllama", "codegemma",
+    "gemma",
+    "phi",
+    "qwen2",
+    "stablelm",
+    "tinyllama",
+    "codegemma",
 ];
 
 /// Classify model size from its name and return the appropriate protocol mode.
@@ -44,14 +49,14 @@ const SMALL_MODEL_FAMILIES: &[&str] = &[
 fn classify_model_size(model_name: &str) -> ToolProtocolMode {
     // Try to extract parameter count from suffix like ":8b", ":70b"
     let re = Regex::new(r":([0-9]+)[bB]").expect("valid regex");
-    if let Some(caps) = re.captures(model_name) {
-        if let Ok(size) = caps[1].parse::<u64>() {
-            return if size <= 13 {
-                ToolProtocolMode::TagBased
-            } else {
-                ToolProtocolMode::Json
-            };
-        }
+    if let Some(caps) = re.captures(model_name)
+        && let Ok(size) = caps[1].parse::<u64>()
+    {
+        return if size <= 13 {
+            ToolProtocolMode::TagBased
+        } else {
+            ToolProtocolMode::Json
+        };
     }
 
     // Check model family name dictionary
