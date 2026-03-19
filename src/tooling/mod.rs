@@ -2055,6 +2055,240 @@ fn is_searchable_file(path: &Path) -> bool {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Checkpoint / Undo types (Issue #68)
+// ---------------------------------------------------------------------------
+
+/// Maximum file size for checkpoint capture (1 MB).
+pub const CHECKPOINT_FILE_SIZE_LIMIT: u64 = 1_048_576;
+
+/// Checkpoint entry representing a single file state before a tool write.
+#[derive(Debug, Clone)]
+pub struct CheckpointEntry {
+    /// Sandbox-resolved absolute path.
+    pub path: PathBuf,
+    /// File content before the write (`None` = file did not exist).
+    pub previous_content: Option<String>,
+    /// Byte size of the stored content (for capacity tracking).
+    pub byte_size: usize,
+}
+
+impl CheckpointEntry {
+    /// Generate a diff preview showing current file state vs. the checkpoint.
+    ///
+    /// Returns `None` when the file cannot be read (e.g. already deleted).
+    pub fn generate_restore_preview(&self) -> Option<String> {
+        let current = match std::fs::read_to_string(&self.path) {
+            Ok(content) => content,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                if self.previous_content.is_none() {
+                    return Some("(file does not exist, nothing to restore)".to_string());
+                }
+                return Some("(file was deleted externally, will recreate)".to_string());
+            }
+            Err(_) => return None,
+        };
+
+        let previous = self.previous_content.as_deref().unwrap_or("");
+        if current == previous {
+            return Some("(no changes to undo)".to_string());
+        }
+
+        let diff = similar::TextDiff::from_lines(current.as_str(), previous);
+        let diff_text = diff
+            .unified_diff()
+            .context_radius(3)
+            .header("a (current)", "b (restored)")
+            .to_string();
+
+        if diff_text.trim().is_empty() {
+            Some("(no changes to undo)".to_string())
+        } else {
+            Some(diff_text)
+        }
+    }
+
+    /// Restore this checkpoint entry to disk.
+    ///
+    /// Returns a [`RestoreResult`] describing the outcome.
+    pub fn restore(&self) -> RestoreResult {
+        let diff_preview = self.generate_restore_preview();
+        match &self.previous_content {
+            None => match std::fs::remove_file(&self.path) {
+                Ok(()) => RestoreResult {
+                    path: self.path.clone(),
+                    action: RestoreAction::FileRemoved,
+                    diff_preview,
+                },
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => RestoreResult {
+                    path: self.path.clone(),
+                    action: RestoreAction::Skipped,
+                    diff_preview: Some("(file already removed)".to_string()),
+                },
+                Err(err) => {
+                    tracing::warn!(
+                        path = %self.path.display(),
+                        "undo: failed to remove file: {err}"
+                    );
+                    RestoreResult {
+                        path: self.path.clone(),
+                        action: RestoreAction::Skipped,
+                        diff_preview: Some(format!("(IO error: {err})")),
+                    }
+                }
+            },
+            Some(content) => match std::fs::write(&self.path, content) {
+                Ok(()) => RestoreResult {
+                    path: self.path.clone(),
+                    action: RestoreAction::ContentRestored,
+                    diff_preview,
+                },
+                Err(err) => {
+                    tracing::warn!(
+                        path = %self.path.display(),
+                        "undo: failed to restore file: {err}"
+                    );
+                    RestoreResult {
+                        path: self.path.clone(),
+                        action: RestoreAction::Skipped,
+                        diff_preview: Some(format!("(IO error: {err})")),
+                    }
+                }
+            },
+        }
+    }
+}
+
+/// Result of restoring a single checkpoint entry.
+#[derive(Debug, Clone)]
+pub struct RestoreResult {
+    /// Path of the restored file.
+    pub path: PathBuf,
+    /// What kind of restoration was performed.
+    pub action: RestoreAction,
+    /// Diff preview (for display).
+    pub diff_preview: Option<String>,
+}
+
+/// Describes the type of restore action taken.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestoreAction {
+    /// File content was restored to its previous state.
+    ContentRestored,
+    /// A newly created file was removed.
+    FileRemoved,
+    /// The entry was skipped (e.g. IO error).
+    Skipped,
+}
+
+/// Stack-based checkpoint store for undo functionality.
+pub struct CheckpointStack {
+    entries: Vec<CheckpointEntry>,
+    total_bytes: usize,
+    max_depth: usize,
+    max_bytes: usize,
+}
+
+impl CheckpointStack {
+    /// Default max depth = 20, max bytes = 10 MB.
+    pub fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            total_bytes: 0,
+            max_depth: 20,
+            max_bytes: 10 * 1024 * 1024,
+        }
+    }
+
+    /// Push a checkpoint entry. Returns the index at which it was stored.
+    ///
+    /// When the stack exceeds depth or byte limits, the oldest entries are
+    /// discarded automatically.
+    pub fn push(&mut self, entry: CheckpointEntry) -> usize {
+        self.total_bytes += entry.byte_size;
+        self.entries.push(entry);
+
+        // Evict oldest entries if depth exceeded
+        while self.entries.len() > self.max_depth {
+            let removed = self.entries.remove(0);
+            self.total_bytes = self.total_bytes.saturating_sub(removed.byte_size);
+        }
+
+        // Evict oldest entries if byte limit exceeded
+        while self.total_bytes > self.max_bytes && !self.entries.is_empty() {
+            let removed = self.entries.remove(0);
+            self.total_bytes = self.total_bytes.saturating_sub(removed.byte_size);
+        }
+
+        self.entries.len() - 1
+    }
+
+    /// Remove the entry at the given index (for rollback on tool failure).
+    pub fn remove(&mut self, index: usize) -> Option<CheckpointEntry> {
+        if index < self.entries.len() {
+            let removed = self.entries.remove(index);
+            self.total_bytes = self.total_bytes.saturating_sub(removed.byte_size);
+            Some(removed)
+        } else {
+            None
+        }
+    }
+
+    /// Pop the most recent entry.
+    pub fn pop(&mut self) -> Option<CheckpointEntry> {
+        let entry = self.entries.pop()?;
+        self.total_bytes = self.total_bytes.saturating_sub(entry.byte_size);
+        Some(entry)
+    }
+
+    /// Pop up to `n` entries from the stack (newest first).
+    ///
+    /// When the same file path appears multiple times, only the oldest
+    /// entry (earliest checkpoint) is kept so that undo restores the file
+    /// to its state before the first change.
+    pub fn pop_n(&mut self, n: usize) -> Vec<CheckpointEntry> {
+        let actual = n.min(self.entries.len());
+        let mut popped = Vec::with_capacity(actual);
+        for _ in 0..actual {
+            if let Some(entry) = self.pop() {
+                popped.push(entry);
+            }
+        }
+
+        // Deduplicate by path: keep the oldest entry for each path.
+        // Since we pop newest-first, the last occurrence in `popped` is the
+        // oldest checkpoint. We iterate in reverse (oldest-first) and keep the
+        // first occurrence we see for each path.
+        let mut seen = std::collections::HashSet::new();
+        let mut deduped = Vec::new();
+        for entry in popped.into_iter().rev() {
+            if !seen.insert(entry.path.clone()) {
+                continue;
+            }
+            deduped.push(entry);
+        }
+        // Reverse back to newest-first order
+        deduped.reverse();
+        deduped
+    }
+
+    /// Number of entries currently in the stack.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the stack is empty.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+impl Default for CheckpointStack {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn render_directory_listing(path: &Path) -> Result<String, ToolRuntimeError> {
     let entries = fs::read_dir(path).map_err(|err| {
         ToolRuntimeError::Io(format!("file.read failed for {}: {err}", path.display()))

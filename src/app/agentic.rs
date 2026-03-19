@@ -548,12 +548,17 @@ impl App {
             );
         }
 
-        // Built-in tools: delegate to LocalToolExecutor
-        let mut executor =
-            LocalToolExecutor::new(self.config.paths.cwd.clone(), &self.config.runtime)
-                .with_shutdown_flag(self.shutdown_flag());
+        // Capture checkpoint before file-mutating tools (Issue #68)
+        let cwd = self.config.paths.cwd.clone();
+        let checkpoint_idx = self
+            .capture_checkpoint_if_needed(&request, &cwd)
+            .map(|entry| self.checkpoint_stack.push(entry));
 
-        executor
+        // Built-in tools: delegate to LocalToolExecutor
+        let mut executor = LocalToolExecutor::new(cwd, &self.config.runtime)
+            .with_shutdown_flag(self.shutdown_flag());
+
+        let result = executor
             .execute(request)
             .unwrap_or_else(|err| ToolExecutionResult {
                 tool_call_id: String::new(),
@@ -563,7 +568,16 @@ impl App {
                 payload: ToolExecutionPayload::Text(err.to_string()),
                 artifacts: Vec::new(),
                 elapsed_ms: 0,
-            })
+            });
+
+        // Remove checkpoint if tool execution failed
+        if result.status == ToolExecutionStatus::Failed
+            && let Some(idx) = checkpoint_idx
+        {
+            self.checkpoint_stack.remove(idx);
+        }
+
+        result
     }
 
     /// Execute an MCP tool call via the McpManager.
