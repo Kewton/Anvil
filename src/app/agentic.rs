@@ -929,8 +929,12 @@ pub(crate) fn infer_plan_from_structured_response(
             crate::tooling::ToolInput::FileWrite { path, .. } => format!("write {path}"),
             crate::tooling::ToolInput::FileEdit { path, .. } => format!("edit {path}"),
             crate::tooling::ToolInput::FileRead { path } => format!("read {path}"),
-            crate::tooling::ToolInput::FileSearch { pattern, .. } => {
-                format!("search for {pattern}")
+            crate::tooling::ToolInput::FileSearch { pattern, regex, .. } => {
+                if *regex {
+                    format!("regex search for {pattern}")
+                } else {
+                    format!("search for {pattern}")
+                }
             }
             crate::tooling::ToolInput::ShellExec { command } => {
                 format!("run shell command: {command}")

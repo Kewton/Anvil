@@ -115,6 +115,8 @@ fn parallel_execution_plan_only_accepts_parallel_safe_and_approved_calls() {
             ToolInput::FileSearch {
                 root: "src".to_string(),
                 pattern: "ProviderClient".to_string(),
+                regex: false,
+                context_lines: 0,
             },
         ))
         .expect("search should validate");
@@ -345,6 +347,8 @@ fn validation_reports_missing_required_field_details() {
             ToolInput::FileSearch {
                 root: "src".to_string(),
                 pattern: " ".to_string(),
+                regex: false,
+                context_lines: 0,
             },
         ))
         .expect_err("empty pattern should be rejected");
@@ -2973,4 +2977,484 @@ fn test_eviction_mark_adjustment() {
     assert_eq!(rolled_back.len(), 3);
     // Pre-mark entries: 19 - 2 evicted = 17 remaining
     assert_eq!(stack.len(), 17);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #74: file.search regex + context_lines tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn file_search_serde_backward_compat_missing_regex_and_context_lines() {
+    // JSON without regex/context_lines should deserialize with defaults
+    let json_str = r#"{"FileSearch":{"root":".","pattern":"hello"}}"#;
+    let input: ToolInput = serde_json::from_str(json_str).expect("should deserialize");
+    match input {
+        ToolInput::FileSearch {
+            root,
+            pattern,
+            regex,
+            context_lines,
+        } => {
+            assert_eq!(root, ".");
+            assert_eq!(pattern, "hello");
+            assert!(!regex);
+            assert_eq!(context_lines, 0);
+        }
+        _ => panic!("expected FileSearch"),
+    }
+}
+
+#[test]
+fn file_search_serde_with_new_fields() {
+    let json_str =
+        r#"{"FileSearch":{"root":"src","pattern":"fn\\s+main","regex":true,"context_lines":3}}"#;
+    let input: ToolInput = serde_json::from_str(json_str).expect("should deserialize");
+    match input {
+        ToolInput::FileSearch {
+            regex,
+            context_lines,
+            ..
+        } => {
+            assert!(regex);
+            assert_eq!(context_lines, 3);
+        }
+        _ => panic!("expected FileSearch"),
+    }
+}
+
+#[test]
+fn file_search_from_json_with_regex_and_context_lines() {
+    let value = serde_json::json!({
+        "root": ".",
+        "pattern": "fn\\s+main",
+        "regex": true,
+        "context_lines": 5
+    });
+    let input = ToolInput::from_json("file.search", &value).expect("should parse");
+    match input {
+        ToolInput::FileSearch {
+            regex,
+            context_lines,
+            ..
+        } => {
+            assert!(regex);
+            assert_eq!(context_lines, 5);
+        }
+        _ => panic!("expected FileSearch"),
+    }
+}
+
+#[test]
+fn file_search_from_json_defaults_when_omitted() {
+    let value = serde_json::json!({
+        "root": ".",
+        "pattern": "hello"
+    });
+    let input = ToolInput::from_json("file.search", &value).expect("should parse");
+    match input {
+        ToolInput::FileSearch {
+            regex,
+            context_lines,
+            ..
+        } => {
+            assert!(!regex);
+            assert_eq!(context_lines, 0);
+        }
+        _ => panic!("expected FileSearch"),
+    }
+}
+
+#[test]
+fn file_search_validation_rejects_excessive_context_lines() {
+    let registry = build_registry();
+    let result = registry.validate(ToolCallRequest::new(
+        "call_001",
+        "file.search",
+        ToolInput::FileSearch {
+            root: ".".to_string(),
+            pattern: "test".to_string(),
+            regex: false,
+            context_lines: 11,
+        },
+    ));
+    match result {
+        Err(ToolValidationError::InvalidFieldValue { field, .. }) => {
+            assert_eq!(field, "context_lines");
+        }
+        other => panic!("expected InvalidFieldValue, got {other:?}"),
+    }
+}
+
+#[test]
+fn file_search_validation_accepts_max_context_lines() {
+    let registry = build_registry();
+    let result = registry.validate(ToolCallRequest::new(
+        "call_001",
+        "file.search",
+        ToolInput::FileSearch {
+            root: ".".to_string(),
+            pattern: "test".to_string(),
+            regex: false,
+            context_lines: 10,
+        },
+    ));
+    assert!(result.is_ok());
+}
+
+#[test]
+fn file_search_validation_rejects_invalid_regex() {
+    let registry = build_registry();
+    let result = registry.validate(ToolCallRequest::new(
+        "call_001",
+        "file.search",
+        ToolInput::FileSearch {
+            root: ".".to_string(),
+            pattern: "[invalid".to_string(),
+            regex: true,
+            context_lines: 0,
+        },
+    ));
+    match result {
+        Err(ToolValidationError::InvalidFieldValue { field, .. }) => {
+            assert_eq!(field, "pattern");
+        }
+        other => panic!("expected InvalidFieldValue for pattern, got {other:?}"),
+    }
+}
+
+#[test]
+fn file_search_validation_accepts_valid_regex() {
+    let registry = build_registry();
+    let result = registry.validate(ToolCallRequest::new(
+        "call_001",
+        "file.search",
+        ToolInput::FileSearch {
+            root: ".".to_string(),
+            pattern: r"fn\s+\w+".to_string(),
+            regex: true,
+            context_lines: 0,
+        },
+    ));
+    assert!(result.is_ok());
+}
+
+#[test]
+fn file_search_literal_backward_compatible() {
+    // Ensure default (regex=false, context_lines=0) still returns Paths
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("hello.txt");
+    fs::write(&file_path, "hello world\nfoo bar\n").unwrap();
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(dir.path());
+    let mut registry = ToolRegistry::new();
+    registry.register_file_search();
+    let validated = registry
+        .validate(ToolCallRequest::new(
+            "call_001",
+            "file.search",
+            ToolInput::FileSearch {
+                root: ".".to_string(),
+                pattern: "hello".to_string(),
+                regex: false,
+                context_lines: 0,
+            },
+        ))
+        .unwrap();
+    let exec_req = validated
+        .approve()
+        .into_execution_request(ToolExecutionPolicy {
+            approval_required: false,
+            ..Default::default()
+        })
+        .unwrap();
+    let result = executor.execute(exec_req).unwrap();
+    match &result.payload {
+        ToolExecutionPayload::Paths(paths) => {
+            assert!(!paths.is_empty());
+            assert!(paths[0].contains("hello.txt"));
+        }
+        other => panic!("expected Paths, got {other:?}"),
+    }
+}
+
+#[test]
+fn file_search_regex_matches_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("code.rs");
+    fs::write(&file_path, "fn main() {\n    println!(\"hello\");\n}\n").unwrap();
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(dir.path());
+    let mut registry = ToolRegistry::new();
+    registry.register_file_search();
+    let validated = registry
+        .validate(ToolCallRequest::new(
+            "call_001",
+            "file.search",
+            ToolInput::FileSearch {
+                root: ".".to_string(),
+                pattern: r"fn\s+main".to_string(),
+                regex: true,
+                context_lines: 0,
+            },
+        ))
+        .unwrap();
+    let exec_req = validated
+        .approve()
+        .into_execution_request(ToolExecutionPolicy {
+            approval_required: false,
+            ..Default::default()
+        })
+        .unwrap();
+    let result = executor.execute(exec_req).unwrap();
+    match &result.payload {
+        ToolExecutionPayload::Paths(paths) => {
+            assert!(!paths.is_empty());
+            assert!(paths[0].contains("code.rs"));
+        }
+        other => panic!("expected Paths, got {other:?}"),
+    }
+}
+
+#[test]
+fn file_search_regex_no_match() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("code.rs");
+    fs::write(&file_path, "fn main() {}\n").unwrap();
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(dir.path());
+    let mut registry = ToolRegistry::new();
+    registry.register_file_search();
+    let validated = registry
+        .validate(ToolCallRequest::new(
+            "call_001",
+            "file.search",
+            ToolInput::FileSearch {
+                root: ".".to_string(),
+                pattern: r"class\s+Foo".to_string(),
+                regex: true,
+                context_lines: 0,
+            },
+        ))
+        .unwrap();
+    let exec_req = validated
+        .approve()
+        .into_execution_request(ToolExecutionPolicy {
+            approval_required: false,
+            ..Default::default()
+        })
+        .unwrap();
+    let result = executor.execute(exec_req).unwrap();
+    match &result.payload {
+        ToolExecutionPayload::Paths(paths) => {
+            assert!(paths.is_empty());
+        }
+        other => panic!("expected empty Paths, got {other:?}"),
+    }
+}
+
+#[test]
+fn file_search_context_lines_returns_text_payload() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("test.txt");
+    fs::write(
+        &file_path,
+        "line1\nline2\nMATCH_HERE\nline4\nline5\nline6\n",
+    )
+    .unwrap();
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(dir.path());
+    let mut registry = ToolRegistry::new();
+    registry.register_file_search();
+    let validated = registry
+        .validate(ToolCallRequest::new(
+            "call_001",
+            "file.search",
+            ToolInput::FileSearch {
+                root: ".".to_string(),
+                pattern: "MATCH_HERE".to_string(),
+                regex: false,
+                context_lines: 2,
+            },
+        ))
+        .unwrap();
+    let exec_req = validated
+        .approve()
+        .into_execution_request(ToolExecutionPolicy {
+            approval_required: false,
+            ..Default::default()
+        })
+        .unwrap();
+    let result = executor.execute(exec_req).unwrap();
+    match &result.payload {
+        ToolExecutionPayload::Text(text) => {
+            // Should contain the match line and context
+            assert!(text.contains("MATCH_HERE"), "should contain match line");
+            assert!(text.contains("line2"), "should contain before context");
+            assert!(text.contains("line4"), "should contain after context");
+            assert!(text.contains(":3:"), "should contain line number 3");
+        }
+        other => panic!("expected Text with context, got {other:?}"),
+    }
+}
+
+#[test]
+fn file_search_context_lines_at_file_boundaries() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("test.txt");
+    fs::write(&file_path, "MATCH_FIRST\nline2\nline3\n").unwrap();
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(dir.path());
+    let mut registry = ToolRegistry::new();
+    registry.register_file_search();
+    let validated = registry
+        .validate(ToolCallRequest::new(
+            "call_001",
+            "file.search",
+            ToolInput::FileSearch {
+                root: ".".to_string(),
+                pattern: "MATCH_FIRST".to_string(),
+                regex: false,
+                context_lines: 5,
+            },
+        ))
+        .unwrap();
+    let exec_req = validated
+        .approve()
+        .into_execution_request(ToolExecutionPolicy {
+            approval_required: false,
+            ..Default::default()
+        })
+        .unwrap();
+    let result = executor.execute(exec_req).unwrap();
+    match &result.payload {
+        ToolExecutionPayload::Text(text) => {
+            assert!(text.contains("MATCH_FIRST"));
+            assert!(text.contains(":1:"), "match at line 1");
+            // Should have after context but no before context
+            assert!(text.contains("line2"));
+        }
+        other => panic!("expected Text, got {other:?}"),
+    }
+}
+
+#[test]
+fn file_search_regex_with_context_lines() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("code.rs");
+    fs::write(
+        &file_path,
+        "// header\nfn main() {\n    println!(\"hello\");\n}\n// footer\n",
+    )
+    .unwrap();
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(dir.path());
+    let mut registry = ToolRegistry::new();
+    registry.register_file_search();
+    let validated = registry
+        .validate(ToolCallRequest::new(
+            "call_001",
+            "file.search",
+            ToolInput::FileSearch {
+                root: ".".to_string(),
+                pattern: r"fn\s+main".to_string(),
+                regex: true,
+                context_lines: 1,
+            },
+        ))
+        .unwrap();
+    let exec_req = validated
+        .approve()
+        .into_execution_request(ToolExecutionPolicy {
+            approval_required: false,
+            ..Default::default()
+        })
+        .unwrap();
+    let result = executor.execute(exec_req).unwrap();
+    match &result.payload {
+        ToolExecutionPayload::Text(text) => {
+            assert!(text.contains("fn main()"));
+            assert!(text.contains("// header"), "before context");
+            assert!(text.contains("println!"), "after context");
+        }
+        other => panic!("expected Text, got {other:?}"),
+    }
+}
+
+#[test]
+fn file_search_path_only_match_with_context_returns_path_in_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("searchable_dir");
+    fs::create_dir(&sub).unwrap();
+    let file_path = sub.join("target_file.rs");
+    fs::write(&file_path, "no match content\n").unwrap();
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(dir.path());
+    let mut registry = ToolRegistry::new();
+    registry.register_file_search();
+    let validated = registry
+        .validate(ToolCallRequest::new(
+            "call_001",
+            "file.search",
+            ToolInput::FileSearch {
+                root: ".".to_string(),
+                pattern: "target_file".to_string(),
+                regex: false,
+                context_lines: 2,
+            },
+        ))
+        .unwrap();
+    let exec_req = validated
+        .approve()
+        .into_execution_request(ToolExecutionPolicy {
+            approval_required: false,
+            ..Default::default()
+        })
+        .unwrap();
+    let result = executor.execute(exec_req).unwrap();
+    match &result.payload {
+        ToolExecutionPayload::Text(text) => {
+            assert!(
+                text.contains("target_file.rs"),
+                "path-only match should appear in text"
+            );
+        }
+        other => panic!("expected Text, got {other:?}"),
+    }
+}
+
+#[test]
+fn file_search_zero_matches_with_context_returns_empty_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("nothing.txt");
+    fs::write(&file_path, "no match here\n").unwrap();
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(dir.path());
+    let mut registry = ToolRegistry::new();
+    registry.register_file_search();
+    let validated = registry
+        .validate(ToolCallRequest::new(
+            "call_001",
+            "file.search",
+            ToolInput::FileSearch {
+                root: ".".to_string(),
+                pattern: "NONEXISTENT_PATTERN_XYZ".to_string(),
+                regex: false,
+                context_lines: 3,
+            },
+        ))
+        .unwrap();
+    let exec_req = validated
+        .approve()
+        .into_execution_request(ToolExecutionPolicy {
+            approval_required: false,
+            ..Default::default()
+        })
+        .unwrap();
+    let result = executor.execute(exec_req).unwrap();
+    match &result.payload {
+        ToolExecutionPayload::Text(text) => {
+            assert!(text.is_empty(), "no matches should produce empty text");
+        }
+        other => panic!("expected empty Text, got {other:?}"),
+    }
 }

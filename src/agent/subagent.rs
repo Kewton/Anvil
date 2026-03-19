@@ -54,9 +54,16 @@ const TOOL_DESC_FILE_READ: &str = r#"- file.read — read a file or list a direc
 
 "#;
 
-const TOOL_DESC_FILE_SEARCH: &str = r#"- file.search — search for files by name or content:
+pub(crate) const TOOL_DESC_FILE_SEARCH: &str = r#"- file.search — search for files by name or content (supports regex and context lines):
 ```ANVIL_TOOL
 {"id":"call_002","tool":"file.search","root":".","pattern":"search term"}
+```
+  Optional parameters:
+  - "regex": true — interpret pattern as a regular expression (default: false)
+  - "context_lines": N — show N lines before/after each match, max 10 (default: 0)
+  Example with regex and context:
+```ANVIL_TOOL
+{"id":"call_010","tool":"file.search","root":".","pattern":"fn\\s+main","regex":true,"context_lines":3}
 ```
 
 "#;
