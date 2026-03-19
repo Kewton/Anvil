@@ -1021,6 +1021,7 @@ impl LocalToolExecutor {
                     "file.write failed to create parent {}: {err}",
                     parent.display()
                 ))
+            })?;
         }
         fs::write(&resolved, content).map_err(|err| {
             ToolRuntimeError::Io(format!(
@@ -1155,8 +1156,9 @@ impl LocalToolExecutor {
                 url,
             ])
             .output()
-            .map_err(|err| ToolRuntimeError::Io(format!("web.search failed: {err}")))?;
+            .map_err(|err| {
                 ToolRuntimeError::Io(format!("web.fetch failed to spawn curl: {err}"))
+            })?;
 
         if output.status.success() {
             let body = String::from_utf8_lossy(&output.stdout).to_string();
@@ -1319,8 +1321,9 @@ impl LocalToolExecutor {
             ])
             .arg(&url)
             .output()
-            .map_err(|err| ToolRuntimeError::Io(format!("web.search failed: {err}")))?;
+            .map_err(|err| {
                 ToolRuntimeError::Io(format!("web.search failed to spawn curl: {err}"))
+            })?;
 
         if !output.status.success() {
             return Err(ToolRuntimeError::Io(
@@ -1389,10 +1392,11 @@ impl LocalToolExecutor {
                 "https://google.serper.dev/search",
             ])
             .output()
-            .map_err(|err| ToolRuntimeError::Io(format!("web.search failed: {err}")))?;
+            .map_err(|err| {
                 ToolRuntimeError::Io(format!(
                     "web.search (SerperAPI) failed to spawn curl: {err}"
                 ))
+            })?;
 
         if !output.status.success() {
             let stderr_msg = String::from_utf8_lossy(&output.stderr).to_string();
