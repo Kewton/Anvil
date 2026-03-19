@@ -30,8 +30,8 @@ use crate::session::{
 use crate::spinner::Spinner;
 use crate::state::{StateMachine, StateTransition};
 use crate::tooling::{
-    ExecutionClass, ExecutionMode, PermissionClass, PlanModePolicy, RollbackPolicy, ToolKind,
-    ToolRegistry, ToolSpec,
+    CheckpointStack, ExecutionClass, ExecutionMode, PermissionClass, PlanModePolicy,
+    RollbackPolicy, ToolKind, ToolRegistry, ToolSpec,
 };
 use crate::tui::Tui;
 use std::collections::HashSet;
@@ -115,6 +115,8 @@ pub struct App {
     system_prompt: String,
     shutdown_flag: Arc<AtomicBool>,
     warning_tracker: ContextWarningTracker,
+    /// Undo checkpoint stack. In-memory only, discarded on session exit.
+    checkpoint_stack: CheckpointStack,
     /// Hooks engine. `None` when hooks.json is absent or initialization failed.
     /// Declared before mcp_manager to maintain Drop order (DR3-007).
     hooks_engine: Option<crate::hooks::HooksEngine>,
@@ -353,6 +355,7 @@ impl App {
             system_prompt,
             shutdown_flag,
             warning_tracker: ContextWarningTracker::new(),
+            checkpoint_stack: CheckpointStack::new(),
             hooks_engine,
             mcp_manager,
             trust_all,
@@ -412,6 +415,18 @@ impl App {
         self.session
             .last_turn_tool_results()
             .any(|result| result.is_error)
+    }
+
+    /// Check whether a provider error was recorded during this session.
+    /// Used by non-interactive mode to detect errors that `run_live_turn`
+    /// converted to `AgentEvent::Failed` (returning `Ok` instead of `Err`).
+    pub fn has_provider_error(&self) -> bool {
+        !self.session.provider_errors.is_empty()
+    }
+
+    /// Return the last recorded provider error, if any.
+    pub fn last_provider_error(&self) -> Option<&crate::provider::ProviderErrorRecord> {
+        self.session.provider_errors.last()
     }
 
     /// Save the session on exit (wrapper for flush_session).
@@ -1336,6 +1351,13 @@ impl App {
                 frames: vec!["Exiting Anvil.".to_string()],
                 control: SessionControl::Exit,
             },
+            Some(SlashCommandAction::Undo(n)) => {
+                let msg = self.execute_undo(n)?;
+                CliTurnOutput {
+                    frames: vec![msg],
+                    control: SessionControl::Continue,
+                }
+            }
             Some(SlashCommandAction::Prompt(prompt)) => {
                 self.run_turn_to_output(prompt, provider_client, tui)?
             }
@@ -1392,6 +1414,103 @@ impl App {
             self.persist_session(AppEvent::SessionSaved)?;
         }
         Ok(render_retrieval_result(&result))
+    }
+
+    /// Capture a checkpoint for file-mutating tools before execution.
+    ///
+    /// Returns `Some(CheckpointEntry)` when the tool has
+    /// `RollbackPolicy::CheckpointBeforeWrite` and the file can be read.
+    pub(crate) fn capture_checkpoint_if_needed(
+        &self,
+        request: &crate::tooling::ToolExecutionRequest,
+        cwd: &std::path::Path,
+    ) -> Option<crate::tooling::CheckpointEntry> {
+        use crate::tooling::{
+            CHECKPOINT_FILE_SIZE_LIMIT, RollbackPolicy, ToolInput, diff::is_binary_content,
+        };
+
+        if request.spec.rollback_policy != RollbackPolicy::CheckpointBeforeWrite {
+            return None;
+        }
+
+        let rel_path = match &request.input {
+            ToolInput::FileWrite { path, .. } | ToolInput::FileEdit { path, .. } => path,
+            _ => return None,
+        };
+
+        let resolved = crate::tooling::resolve_sandbox_path(cwd, rel_path).ok()?;
+
+        match std::fs::read(&resolved) {
+            Ok(bytes) => {
+                if is_binary_content(&bytes) || bytes.len() as u64 > CHECKPOINT_FILE_SIZE_LIMIT {
+                    return None;
+                }
+                let content = String::from_utf8(bytes).ok()?;
+                let byte_size = content.len();
+                Some(crate::tooling::CheckpointEntry {
+                    path: resolved,
+                    previous_content: Some(content),
+                    byte_size,
+                })
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                // New file -- record None so undo can delete it
+                Some(crate::tooling::CheckpointEntry {
+                    path: resolved,
+                    previous_content: None,
+                    byte_size: 0,
+                })
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// Execute an undo operation, restoring up to `n` checkpoint entries.
+    fn execute_undo(&mut self, n: usize) -> Result<String, AppError> {
+        if self.checkpoint_stack.is_empty() {
+            return Ok("No changes to undo.".to_string());
+        }
+
+        let entries = self.checkpoint_stack.pop_n(n);
+        let results: Vec<crate::tooling::RestoreResult> =
+            entries.iter().map(|entry| entry.restore()).collect();
+
+        let restored_count = results
+            .iter()
+            .filter(|r| r.action != crate::tooling::RestoreAction::Skipped)
+            .count();
+
+        // Build result message
+        let mut lines = Vec::new();
+        for result in &results {
+            let action_str = match result.action {
+                crate::tooling::RestoreAction::ContentRestored => "restored",
+                crate::tooling::RestoreAction::FileRemoved => "removed",
+                crate::tooling::RestoreAction::Skipped => "skipped",
+            };
+            lines.push(format!("  {} {}", action_str, result.path.display()));
+            if let Some(ref preview) = result.diff_preview {
+                for diff_line in preview.lines().take(10) {
+                    lines.push(format!("    {diff_line}"));
+                }
+            }
+        }
+
+        let summary = if restored_count == entries.len() {
+            format!("Undid {} change(s).", restored_count)
+        } else {
+            format!("Undid {} of {} requested change(s).", restored_count, n)
+        };
+        lines.insert(0, summary.clone());
+
+        // Record in session
+        self.session.push_message(
+            SessionMessage::new(MessageRole::System, "anvil", format!("[undo] {summary}"))
+                .with_id(self.next_message_id("undo")),
+        );
+        self.persist_session(AppEvent::UndoExecuted)?;
+
+        Ok(lines.join("\n"))
     }
 
     fn compact_session_history(&mut self) -> Result<String, AppError> {

@@ -1,10 +1,10 @@
 use anvil::app::agentic::{ExecutionGroup, group_by_execution_mode};
 use anvil::tooling::{
-    ExecutionClass, ExecutionMode, LocalToolExecutor, ParallelExecutionPlan,
-    ParallelExecutionPlanError, PermissionClass, PlanModePolicy, RollbackPolicy, ToolCallRequest,
-    ToolExecutionError, ToolExecutionPayload, ToolExecutionPolicy, ToolExecutionRequest,
-    ToolExecutionResult, ToolExecutionStatus, ToolInput, ToolKind, ToolRegistry,
-    ToolValidationError, detect_image_mime,
+    CheckpointEntry, CheckpointStack, ExecutionClass, ExecutionMode, LocalToolExecutor,
+    ParallelExecutionPlan, ParallelExecutionPlanError, PermissionClass, PlanModePolicy,
+    RollbackPolicy, ToolCallRequest, ToolExecutionError, ToolExecutionPayload, ToolExecutionPolicy,
+    ToolExecutionRequest, ToolExecutionResult, ToolExecutionStatus, ToolInput, ToolKind,
+    ToolRegistry, ToolValidationError, detect_image_mime,
 };
 use std::fs;
 use std::path::Path;
@@ -2629,4 +2629,348 @@ fn check_offline_blocked_blocks_web_search_in_offline_mode() {
     let result = check_offline_blocked(&config, &call);
     assert!(result.is_some());
     assert!(result.unwrap().contains("web.search"));
+}
+
+// ---------------------------------------------------------------------------
+// CheckpointStack tests (Issue #68)
+// ---------------------------------------------------------------------------
+
+fn make_checkpoint_entry(path: &str, content: Option<&str>) -> CheckpointEntry {
+    let byte_size = content.map_or(0, |c| c.len());
+    CheckpointEntry {
+        path: std::path::PathBuf::from(path),
+        previous_content: content.map(String::from),
+        byte_size,
+    }
+}
+
+#[test]
+fn checkpoint_stack_new_initial_state() {
+    let stack = CheckpointStack::new();
+    assert_eq!(stack.len(), 0);
+    assert!(stack.is_empty());
+}
+
+#[test]
+fn checkpoint_stack_push_pop_basic() {
+    let mut stack = CheckpointStack::new();
+    let entry = make_checkpoint_entry("/tmp/a.rs", Some("hello"));
+    stack.push(entry);
+    assert_eq!(stack.len(), 1);
+    assert!(!stack.is_empty());
+
+    let popped = stack.pop().expect("should pop");
+    assert_eq!(popped.path, std::path::PathBuf::from("/tmp/a.rs"));
+    assert_eq!(popped.previous_content.as_deref(), Some("hello"));
+    assert!(stack.is_empty());
+}
+
+#[test]
+fn checkpoint_stack_push_returns_index_and_remove_works() {
+    let mut stack = CheckpointStack::new();
+    let idx0 = stack.push(make_checkpoint_entry("/tmp/a.rs", Some("a")));
+    let idx1 = stack.push(make_checkpoint_entry("/tmp/b.rs", Some("b")));
+    assert_eq!(idx0, 0);
+    assert_eq!(idx1, 1);
+
+    let removed = stack.remove(0).expect("should remove");
+    assert_eq!(removed.path, std::path::PathBuf::from("/tmp/a.rs"));
+    assert_eq!(stack.len(), 1);
+
+    let remaining = stack.pop().expect("should pop remaining");
+    assert_eq!(remaining.path, std::path::PathBuf::from("/tmp/b.rs"));
+}
+
+#[test]
+fn checkpoint_stack_pop_n_partial() {
+    let mut stack = CheckpointStack::new();
+    stack.push(make_checkpoint_entry("/tmp/a.rs", Some("a")));
+    stack.push(make_checkpoint_entry("/tmp/b.rs", Some("b")));
+    stack.push(make_checkpoint_entry("/tmp/c.rs", Some("c")));
+
+    let popped = stack.pop_n(2);
+    assert_eq!(popped.len(), 2);
+    // Newest first
+    assert_eq!(popped[0].path, std::path::PathBuf::from("/tmp/c.rs"));
+    assert_eq!(popped[1].path, std::path::PathBuf::from("/tmp/b.rs"));
+    assert_eq!(stack.len(), 1);
+}
+
+#[test]
+fn checkpoint_stack_pop_n_exceeds_depth() {
+    let mut stack = CheckpointStack::new();
+    stack.push(make_checkpoint_entry("/tmp/a.rs", Some("a")));
+    stack.push(make_checkpoint_entry("/tmp/b.rs", Some("b")));
+
+    let popped = stack.pop_n(10);
+    assert_eq!(popped.len(), 2);
+    assert!(stack.is_empty());
+}
+
+#[test]
+fn checkpoint_stack_pop_n_deduplicates_same_file() {
+    let mut stack = CheckpointStack::new();
+    stack.push(make_checkpoint_entry("/tmp/a.rs", Some("original")));
+    stack.push(make_checkpoint_entry("/tmp/b.rs", Some("b")));
+    stack.push(make_checkpoint_entry("/tmp/a.rs", Some("modified")));
+
+    let popped = stack.pop_n(3);
+    // Same file /tmp/a.rs appeared twice; only the oldest ("original") should be kept
+    assert_eq!(popped.len(), 2);
+    let a_entry = popped
+        .iter()
+        .find(|e| e.path == Path::new("/tmp/a.rs"))
+        .expect("a.rs should exist");
+    assert_eq!(a_entry.previous_content.as_deref(), Some("original"));
+}
+
+#[test]
+fn checkpoint_stack_depth_limit_evicts_oldest() {
+    let mut stack = CheckpointStack::new();
+    for i in 0..25 {
+        stack.push(make_checkpoint_entry(&format!("/tmp/{i}.rs"), Some("x")));
+    }
+    // max_depth = 20
+    assert_eq!(stack.len(), 20);
+    // The first 5 should have been evicted; entry at index 0 should be /tmp/5.rs
+    let first = stack.pop().expect("should pop");
+    assert_eq!(first.path, std::path::PathBuf::from("/tmp/24.rs"));
+}
+
+#[test]
+fn checkpoint_stack_byte_limit_evicts_oldest() {
+    let mut stack = CheckpointStack::new();
+    // Each entry is ~1MB (1_048_576 bytes). Push 12 to exceed 10MB limit.
+    let big_content = "x".repeat(1_048_576);
+    for i in 0..12 {
+        stack.push(make_checkpoint_entry(
+            &format!("/tmp/{i}.rs"),
+            Some(&big_content),
+        ));
+    }
+    // Should have evicted enough to stay under 10MB
+    assert!(stack.len() < 12);
+    assert!(stack.len() >= 9); // floor(10MB / 1MB) = 10, but some eviction margin
+}
+
+#[test]
+fn checkpoint_stack_new_file_entry_has_none_content() {
+    let mut stack = CheckpointStack::new();
+    stack.push(make_checkpoint_entry("/tmp/new.rs", None));
+    let popped = stack.pop().expect("should pop");
+    assert!(popped.previous_content.is_none());
+    assert_eq!(popped.byte_size, 0);
+}
+
+#[test]
+fn checkpoint_entry_generate_restore_preview_for_existing_file() {
+    let dir = std::env::temp_dir().join(format!(
+        "anvil_test_restore_preview_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    let file_path = dir.join("test.rs");
+    fs::write(&file_path, "modified content").unwrap();
+
+    let entry = CheckpointEntry {
+        path: file_path.clone(),
+        previous_content: Some("original content".to_string()),
+        byte_size: 16,
+    };
+
+    let preview = entry.generate_restore_preview();
+    assert!(preview.is_some());
+    let text = preview.unwrap();
+    // Should contain diff information
+    assert!(text.contains("current") || text.contains("restored") || text.contains("-"));
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn checkpoint_entry_generate_restore_preview_no_changes() {
+    let dir = std::env::temp_dir().join(format!(
+        "anvil_test_no_change_preview_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    let file_path = dir.join("test.rs");
+    fs::write(&file_path, "same content").unwrap();
+
+    let entry = CheckpointEntry {
+        path: file_path.clone(),
+        previous_content: Some("same content".to_string()),
+        byte_size: 12,
+    };
+
+    let preview = entry.generate_restore_preview();
+    assert!(preview.is_some());
+    assert!(preview.unwrap().contains("no changes to undo"));
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// CheckpointStack transaction (mark/rollback/commit) tests (Issue #69)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_mark_and_rollback_basic() {
+    let mut stack = CheckpointStack::new();
+    // Push a pre-existing entry before the mark
+    stack.push(make_checkpoint_entry("/tmp/pre.rs", Some("pre")));
+
+    // Start transaction
+    let mark = stack.mark();
+    assert_eq!(mark, 1); // mark is at position 1 (after the pre-existing entry)
+    assert!(stack.is_in_transaction());
+
+    // Push 2 entries within the transaction
+    stack.push(make_checkpoint_entry("/tmp/a.rs", Some("a")));
+    stack.push(make_checkpoint_entry("/tmp/b.rs", Some("b")));
+    assert_eq!(stack.len(), 3);
+
+    // Rollback to mark: should return the 2 transaction entries
+    let rolled_back = stack.rollback_to_mark(mark);
+    assert_eq!(rolled_back.len(), 2);
+    assert!(!stack.is_in_transaction()); // mark cleared
+    assert_eq!(stack.len(), 1); // pre-existing entry remains
+    // Verify newest-first ordering from pop_n
+    assert_eq!(rolled_back[0].path, Path::new("/tmp/b.rs"));
+    assert_eq!(rolled_back[1].path, Path::new("/tmp/a.rs"));
+}
+
+#[test]
+fn test_mark_and_commit() {
+    let mut stack = CheckpointStack::new();
+    let mark = stack.mark();
+    assert_eq!(mark, 0);
+    assert!(stack.is_in_transaction());
+
+    stack.push(make_checkpoint_entry("/tmp/a.rs", Some("a")));
+    stack.push(make_checkpoint_entry("/tmp/b.rs", Some("b")));
+
+    // Commit: entries remain, mark is cleared
+    stack.commit_mark();
+    assert!(!stack.is_in_transaction());
+    assert_eq!(stack.len(), 2); // entries preserved for /undo
+}
+
+#[test]
+fn test_rollback_empty() {
+    let mut stack = CheckpointStack::new();
+    let mark = stack.mark();
+
+    // Rollback immediately without pushing anything
+    let rolled_back = stack.rollback_to_mark(mark);
+    assert!(rolled_back.is_empty());
+    assert!(!stack.is_in_transaction());
+}
+
+#[test]
+fn test_mark_rollback_deduplication() {
+    let mut stack = CheckpointStack::new();
+    let mark = stack.mark();
+
+    // Same file edited twice within transaction
+    stack.push(make_checkpoint_entry("/tmp/a.rs", Some("original")));
+    stack.push(make_checkpoint_entry("/tmp/b.rs", Some("b")));
+    stack.push(make_checkpoint_entry("/tmp/a.rs", Some("after_first_edit")));
+
+    let rolled_back = stack.rollback_to_mark(mark);
+    // Deduplication: /tmp/a.rs should keep "original" (the oldest checkpoint)
+    assert_eq!(rolled_back.len(), 2);
+    let a_entry = rolled_back
+        .iter()
+        .find(|e| e.path == Path::new("/tmp/a.rs"))
+        .expect("a.rs should exist");
+    assert_eq!(a_entry.previous_content.as_deref(), Some("original"));
+    assert!(stack.is_empty());
+}
+
+#[test]
+fn test_mark_with_remove_interaction() {
+    let mut stack = CheckpointStack::new();
+    let mark = stack.mark();
+    assert_eq!(mark, 0);
+
+    // Push A (tool succeeds, kept) at index 0
+    let idx_a = stack.push(make_checkpoint_entry("/tmp/a.rs", Some("a")));
+    assert_eq!(idx_a, 0);
+
+    // Push B (tool fails, removed individually) at index 1
+    let idx_b = stack.push(make_checkpoint_entry("/tmp/b.rs", Some("b")));
+    assert_eq!(idx_b, 1);
+
+    // Remove B (index 1, which is >= mark=0 so mark stays at 0)
+    stack.remove(idx_b);
+    assert_eq!(stack.len(), 1);
+
+    // Rollback to mark: only A should be returned
+    let rolled_back = stack.rollback_to_mark(mark);
+    assert_eq!(rolled_back.len(), 1);
+    assert_eq!(rolled_back[0].path, Path::new("/tmp/a.rs"));
+}
+
+#[test]
+fn test_eviction_with_active_mark() {
+    let mut stack = CheckpointStack::new();
+    // Push 18 entries before mark (max_depth=20)
+    for i in 0..18 {
+        stack.push(make_checkpoint_entry(&format!("/tmp/pre{i}.rs"), Some("x")));
+    }
+    assert_eq!(stack.len(), 18);
+
+    // Mark at position 18
+    let mark = stack.mark();
+    assert_eq!(mark, 18);
+
+    // Push 5 entries within transaction (total would be 23, exceeding max_depth=20)
+    for i in 0..5 {
+        stack.push(make_checkpoint_entry(&format!("/tmp/tx{i}.rs"), Some("t")));
+    }
+
+    // Eviction should only remove pre-mark entries, preserving all 5 transaction entries
+    // max_depth=20, so eviction removes 3 oldest pre-mark entries (18+5=23, need to drop 3)
+    assert_eq!(stack.len(), 20);
+
+    // All 5 transaction entries should still be present after rollback
+    // active_mark was adjusted from 18 to 15 by eviction
+    let rolled_back = stack.rollback_to_mark(mark);
+    assert_eq!(rolled_back.len(), 5);
+    assert!(!stack.is_in_transaction());
+}
+
+#[test]
+fn test_eviction_mark_adjustment() {
+    let mut stack = CheckpointStack::new();
+    // Push 19 entries before mark
+    for i in 0..19 {
+        stack.push(make_checkpoint_entry(&format!("/tmp/pre{i}.rs"), Some("x")));
+    }
+
+    let mark = stack.mark();
+    assert_eq!(mark, 19);
+    assert!(stack.is_in_transaction());
+
+    // Push 3 entries within transaction (total 22 > max_depth=20)
+    // This should evict 2 pre-mark entries, adjusting active_mark from 19 to 17
+    for i in 0..3 {
+        stack.push(make_checkpoint_entry(&format!("/tmp/tx{i}.rs"), Some("t")));
+    }
+
+    assert_eq!(stack.len(), 20);
+
+    // Rollback should still correctly return all 3 transaction entries
+    // because active_mark was adjusted to 17 internally
+    let rolled_back = stack.rollback_to_mark(mark);
+    assert_eq!(rolled_back.len(), 3);
+    // Pre-mark entries: 19 - 2 evicted = 17 remaining
+    assert_eq!(stack.len(), 17);
 }

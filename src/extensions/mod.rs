@@ -41,6 +41,7 @@ pub enum SlashCommandAction {
         skill_dir: PathBuf,
     },
     Trust(TrustAction),
+    Undo(usize),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,6 +144,9 @@ impl ExtensionRegistry {
     }
 
     pub fn find_slash_command(&self, command: &str) -> Option<SlashCommandSpec> {
+        if let Some(parsed) = parse_undo_command(command) {
+            return Some(parsed);
+        }
         if let Some(parsed) = parse_plan_command(command) {
             return Some(parsed);
         }
@@ -278,6 +282,12 @@ pub fn builtin_slash_commands() -> Vec<SlashCommandSpec> {
             scope: None,
         },
         SlashCommandSpec {
+            name: "/undo".to_string(),
+            description: "undo the last file change(s)".to_string(),
+            action: SlashCommandAction::Undo(1),
+            scope: None,
+        },
+        SlashCommandSpec {
             name: "/exit".to_string(),
             description: "exit the session".to_string(),
             action: SlashCommandAction::Exit,
@@ -368,6 +378,30 @@ fn edit_distance(a: &str, b: &str) -> usize {
         std::mem::swap(&mut prev, &mut curr);
     }
     prev[n]
+}
+
+/// Maximum number of undo steps allowed in a single `/undo N` command.
+const MAX_UNDO_STEPS: usize = 20;
+
+fn parse_undo_command(command: &str) -> Option<SlashCommandSpec> {
+    let n = if command == "/undo" {
+        1
+    } else if let Some(rest) = command.strip_prefix("/undo ") {
+        let parsed = rest.trim().parse::<usize>().ok()?;
+        if parsed == 0 {
+            return None;
+        }
+        parsed.min(MAX_UNDO_STEPS)
+    } else {
+        return None;
+    };
+
+    Some(SlashCommandSpec {
+        name: "/undo".to_string(),
+        description: "undo the last file change(s)".to_string(),
+        action: SlashCommandAction::Undo(n),
+        scope: None,
+    })
 }
 
 fn parse_repo_command(command: &str) -> Option<SlashCommandSpec> {

@@ -3032,3 +3032,66 @@ fn error_guidance_timeout() {
     assert!(guidance.contains("timed out"));
     assert!(guidance.contains("smaller model"));
 }
+
+/// Regression test for Issue #86: `ProviderTurnError::from_error_record` must
+/// reconstruct a `ModelNotFound` error so that non-interactive mode can return
+/// it after `run_live_turn` converts the error to `AgentEvent::Failed`.
+#[test]
+fn from_error_record_reconstructs_model_not_found() {
+    use anvil::provider::{ProviderErrorKind, ProviderErrorRecord};
+
+    let record = ProviderErrorRecord {
+        kind: ProviderErrorKind::ModelNotFound,
+        message: "model 'nonexistent_xyz' not found: model 'nonexistent_xyz' not found".into(),
+    };
+    let err = ProviderTurnError::from_error_record(&record);
+    match &err {
+        ProviderTurnError::ModelNotFound { model, .. } => {
+            assert_eq!(model, "nonexistent_xyz");
+        }
+        other => panic!("expected ModelNotFound, got: {other:?}"),
+    }
+
+    // The reconstructed error should produce correct guidance
+    let app_err = anvil::app::AppError::ProviderTurn(err);
+    let guidance = anvil::app::error_guidance(&app_err);
+    assert!(
+        guidance.contains("ollama pull"),
+        "guidance should suggest ollama pull: {guidance}"
+    );
+    assert!(
+        guidance.contains("nonexistent_xyz"),
+        "guidance should mention the model name: {guidance}"
+    );
+}
+
+/// Issue #86: `from_error_record` round-trips all error kinds correctly.
+#[test]
+fn from_error_record_round_trips_all_kinds() {
+    use anvil::provider::{ProviderErrorKind, ProviderErrorRecord};
+
+    let cases = vec![
+        (ProviderErrorKind::Cancelled, "provider turn cancelled"),
+        (ProviderErrorKind::Network, "network error: timeout"),
+        (
+            ProviderErrorKind::ConnectionRefused,
+            "connection refused: localhost",
+        ),
+        (ProviderErrorKind::DnsFailure, "DNS resolution failed: host"),
+        (ProviderErrorKind::Timeout, "timeout: 30s exceeded"),
+        (
+            ProviderErrorKind::Backend,
+            "provider backend error: internal",
+        ),
+    ];
+
+    for (kind, message) in cases {
+        let record = ProviderErrorRecord {
+            kind: kind.clone(),
+            message: message.into(),
+        };
+        let err = ProviderTurnError::from_error_record(&record);
+        let round_tripped_kind = ProviderErrorKind::from(&err);
+        assert_eq!(round_tripped_kind, kind, "round-trip failed for {kind:?}");
+    }
+}

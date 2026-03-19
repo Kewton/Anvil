@@ -223,6 +223,50 @@ impl std::fmt::Display for ProviderTurnError {
 
 impl std::error::Error for ProviderTurnError {}
 
+/// Extract a model name from a `ProviderTurnError::ModelNotFound` Display string.
+/// Expected format: `"model '<name>' not found: <detail>"`.
+fn extract_model_from_message(message: &str) -> String {
+    if let Some(start) = message.find("model '") {
+        let rest = &message[start + 7..];
+        if let Some(end) = rest.find('\'') {
+            return rest[..end].to_string();
+        }
+    }
+    "unknown".to_string()
+}
+
+impl ProviderTurnError {
+    /// Reconstruct a `ProviderTurnError` from a persisted `ProviderErrorRecord`.
+    pub fn from_error_record(record: &ProviderErrorRecord) -> Self {
+        match record.kind {
+            ProviderErrorKind::Cancelled => Self::Cancelled,
+            ProviderErrorKind::Network => Self::Network(record.message.clone()),
+            ProviderErrorKind::ConnectionRefused => Self::ConnectionRefused(record.message.clone()),
+            ProviderErrorKind::DnsFailure => Self::DnsFailure(record.message.clone()),
+            ProviderErrorKind::ServerError => Self::ServerError {
+                status_code: 500,
+                message: record.message.clone(),
+            },
+            ProviderErrorKind::ClientError => Self::ClientError {
+                status_code: 400,
+                message: record.message.clone(),
+            },
+            ProviderErrorKind::Timeout => Self::Timeout(record.message.clone()),
+            ProviderErrorKind::Parse => Self::Parse(record.message.clone()),
+            ProviderErrorKind::Backend => Self::Backend(record.message.clone()),
+            ProviderErrorKind::ModelNotFound => Self::ModelNotFound {
+                model: extract_model_from_message(&record.message),
+                message: record.message.clone(),
+            },
+            ProviderErrorKind::AuthenticationFailed => Self::AuthenticationFailed {
+                status_code: 401,
+                message: record.message.clone(),
+            },
+            ProviderErrorKind::Unknown => Self::Backend(record.message.clone()),
+        }
+    }
+}
+
 impl From<&ProviderTurnError> for ProviderErrorKind {
     fn from(err: &ProviderTurnError) -> Self {
         match err {
