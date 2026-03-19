@@ -535,7 +535,7 @@ fn system_prompt_includes_agent_explore_and_plan_descriptions() {
 #[test]
 fn build_subagent_system_prompt_explore_contains_expected_tools() {
     use anvil::agent::subagent::{SubAgentKind, build_subagent_system_prompt};
-    let prompt = build_subagent_system_prompt(&SubAgentKind::Explore);
+    let prompt = build_subagent_system_prompt(&SubAgentKind::Explore, false);
     assert!(
         prompt.contains("file.read"),
         "Explore prompt should include file.read"
@@ -561,7 +561,7 @@ fn build_subagent_system_prompt_explore_contains_expected_tools() {
 #[test]
 fn build_subagent_system_prompt_plan_contains_expected_tools() {
     use anvil::agent::subagent::{SubAgentKind, build_subagent_system_prompt};
-    let prompt = build_subagent_system_prompt(&SubAgentKind::Plan);
+    let prompt = build_subagent_system_prompt(&SubAgentKind::Plan, false);
     assert!(
         prompt.contains("file.read"),
         "Plan prompt should include file.read"

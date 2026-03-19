@@ -41,6 +41,7 @@ fn effective_config_derives_workspace_and_session_paths() {
     assert!(!config.mode.debug_logging);
     assert!(config.paths.logs_dir.ends_with("logs"));
     assert!(config.mode.log_filter.is_none());
+    assert!(!config.mode.offline);
 }
 
 #[test]
@@ -181,6 +182,47 @@ fn invalid_numeric_config_value_returns_error() {
     let result = config.apply_overrides_for_test(&map, &HashMap::new(), &HashMap::new());
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("not_a_number"));
+}
+
+#[test]
+fn offline_mode_configurable_via_map() {
+    let mut config = EffectiveConfig::default_for_test().expect("config should load");
+    assert!(!config.mode.offline);
+
+    let mut map = HashMap::new();
+    map.insert("offline".to_string(), "true".to_string());
+    config
+        .apply_overrides_for_test(&map, &HashMap::new(), &HashMap::new())
+        .expect("should apply");
+    assert!(config.mode.offline);
+}
+
+#[test]
+fn offline_mode_configurable_via_env_key() {
+    let mut config = EffectiveConfig::default_for_test().expect("config should load");
+
+    let mut map = HashMap::new();
+    map.insert("ANVIL_OFFLINE".to_string(), "true".to_string());
+    config
+        .apply_overrides_for_test(&HashMap::new(), &map, &HashMap::new())
+        .expect("should apply");
+    assert!(config.mode.offline);
+}
+
+#[test]
+fn offline_mode_cli_overrides_file() {
+    let mut config = EffectiveConfig::default_for_test().expect("config should load");
+
+    let mut file_values = HashMap::new();
+    file_values.insert("offline".to_string(), "false".to_string());
+
+    let mut cli_values = HashMap::new();
+    cli_values.insert("ANVIL_OFFLINE".to_string(), "true".to_string());
+
+    config
+        .apply_overrides_for_test(&file_values, &HashMap::new(), &cli_values)
+        .expect("should apply");
+    assert!(config.mode.offline, "CLI should override file config");
 }
 
 // --- ANVIL.md project instructions tests ---

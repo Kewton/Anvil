@@ -19,6 +19,7 @@ use crate::tooling::{
 use crate::tui::Tui;
 use std::sync::atomic::Ordering;
 
+use super::policy::{OFFLINE_BLOCK_PAYLOAD, check_offline_blocked};
 use super::{App, AppError};
 
 /// Maximum number of parallel threads for tool execution.
@@ -466,6 +467,24 @@ impl App {
                     continue;
                 }
             };
+
+            // Offline policy check: block network tools before approval
+            if let Some(summary) = check_offline_blocked(&self.config, call) {
+                failed_results.push((
+                    idx,
+                    ToolExecutionResult {
+                        tool_call_id: call.tool_call_id.clone(),
+                        tool_name: call.tool_name.clone(),
+                        status: ToolExecutionStatus::Failed,
+                        summary,
+                        payload: ToolExecutionPayload::Text(OFFLINE_BLOCK_PAYLOAD.to_string()),
+                        artifacts: Vec::new(),
+                        elapsed_ms: 0,
+                    },
+                ));
+                continue;
+            }
+
             if self.config.mode.approval_required && validated.approval_required(true).is_some() {
                 let summary = tool_call_approval_summary(call);
                 let diff_preview = generate_diff_preview(&self.config.paths.cwd, &call.input);

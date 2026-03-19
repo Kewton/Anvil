@@ -3,6 +3,7 @@
 //! Provides [`SubAgentSession`] which runs an independent LLM loop with a
 //! restricted tool set (read-only) within a sandboxed scope directory.
 
+use crate::app::policy::{OFFLINE_BLOCK_PAYLOAD, check_offline_blocked};
 use crate::config::EffectiveConfig;
 use crate::provider::{ProviderClient, ProviderEvent, ProviderTurnError};
 use crate::session::{MessageRole, SessionMessage, SessionRecord};
@@ -82,8 +83,19 @@ You are a Plan sub-agent. Your task is to create an implementation plan.
 - You only have read-only access: file.read, file.search, and web.fetch.
 "#;
 
+const PLAN_ROLE_PROMPT_OFFLINE: &str = r#"## Your role
+You are a Plan sub-agent. Your task is to create an implementation plan.
+- Read files and search the codebase to understand existing patterns.
+- Produce a detailed, actionable plan in ANVIL_FINAL.
+- You only have read-only access: file.read and file.search.
+- Note: Offline mode is active. Web access is unavailable.
+"#;
+
 /// Build a system prompt for a sub-agent of the given kind.
-pub fn build_subagent_system_prompt(kind: &SubAgentKind) -> String {
+///
+/// When `offline` is `true`, web-related tool descriptions and prompts
+/// are excluded from the Plan sub-agent prompt.
+pub fn build_subagent_system_prompt(kind: &SubAgentKind, offline: bool) -> String {
     let mut prompt = String::new();
     prompt.push_str(SUBAGENT_PROTOCOL_BASE);
     match kind {
@@ -95,8 +107,14 @@ pub fn build_subagent_system_prompt(kind: &SubAgentKind) -> String {
         SubAgentKind::Plan => {
             prompt.push_str(TOOL_DESC_FILE_READ);
             prompt.push_str(TOOL_DESC_FILE_SEARCH);
-            prompt.push_str(TOOL_DESC_WEB_FETCH);
-            prompt.push_str(PLAN_ROLE_PROMPT);
+            if !offline {
+                prompt.push_str(TOOL_DESC_WEB_FETCH);
+            }
+            prompt.push_str(if offline {
+                PLAN_ROLE_PROMPT_OFFLINE
+            } else {
+                PLAN_ROLE_PROMPT
+            });
         }
     }
     prompt
@@ -273,7 +291,7 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
         }
 
         // 3. Dedicated system prompt
-        let system_prompt = build_subagent_system_prompt(&kind);
+        let system_prompt = build_subagent_system_prompt(&kind, config.mode.offline);
 
         SubAgentSession {
             kind,
@@ -360,6 +378,19 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
                     continue;
                 }
             };
+
+            // Offline policy check (validate succeeded, check before approve)
+            if let Some(summary) = check_offline_blocked(self.config, call) {
+                self.session.push_message(SessionMessage::new(
+                    MessageRole::Tool,
+                    "tool",
+                    format!(
+                        "[tool result: {}] {}\n{}",
+                        call.tool_name, summary, OFFLINE_BLOCK_PAYLOAD
+                    ),
+                ));
+                continue;
+            }
 
             // Auto-approve (sub-agent tools are all Safe)
             let approved = validated.approve();

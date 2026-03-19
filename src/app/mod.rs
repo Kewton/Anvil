@@ -7,6 +7,7 @@ pub mod agentic;
 pub mod cli;
 pub mod mock;
 pub mod plan;
+pub mod policy;
 pub mod render;
 
 use crate::agent::BasicAgentLoop;
@@ -238,20 +239,25 @@ impl App {
 
         // --- MCP initialization (Task 3.2) ---
         // [D1-007] shutdown_flag is managed by App side (YAGNI)
-        let mcp_manager = match crate::config::load_mcp_config(&config.paths) {
-            Ok(Some(mcp_configs)) => {
-                match crate::mcp::McpManager::start_all(mcp_configs) {
-                    Ok(manager) => Some(manager),
-                    Err(e) => {
-                        eprintln!("Warning: MCP initialization failed: {e}");
-                        None // graceful degradation
+        // Offline mode: skip MCP initialization entirely (load_mcp_config included)
+        let mcp_manager = if config.mode.offline {
+            None
+        } else {
+            match crate::config::load_mcp_config(&config.paths) {
+                Ok(Some(mcp_configs)) => {
+                    match crate::mcp::McpManager::start_all(mcp_configs) {
+                        Ok(manager) => Some(manager),
+                        Err(e) => {
+                            eprintln!("Warning: MCP initialization failed: {e}");
+                            None // graceful degradation
+                        }
                     }
                 }
-            }
-            Ok(None) => None, // mcp.json not found → skip completely
-            Err(e) => {
-                eprintln!("Warning: MCP config parse error: {e}");
-                None // graceful degradation
+                Ok(None) => None, // mcp.json not found → skip completely
+                Err(e) => {
+                    eprintln!("Warning: MCP config parse error: {e}");
+                    None // graceful degradation
+                }
             }
         };
 
@@ -311,13 +317,23 @@ impl App {
             &detected_languages,
             mcp_descriptions.as_deref(),
         );
-        let system_prompt = match config.project_instructions() {
+        let mut system_prompt = match config.project_instructions() {
             Some(instructions) => format!(
                 "{}\n\n## Project instructions (from ANVIL.md)\n{}",
                 base_prompt, instructions
             ),
             None => base_prompt,
         };
+
+        // Offline mode: append note to system prompt and warn about shell.exec
+        if config.mode.offline {
+            system_prompt.push_str(
+                "\n\nNote: Offline mode is active. web.fetch and web.search are unavailable. Do not use shell.exec to make network requests (curl, wget, etc.). Use local tools only."
+            );
+            eprintln!(
+                "Warning: shell.exec can still access the network in offline mode. For full network isolation, use OS/firewall-level controls."
+            );
+        }
 
         Ok(Self {
             tools,
@@ -341,15 +357,19 @@ impl App {
     }
 
     fn build_initial_snapshot(&self) -> AppStateSnapshot {
+        let mut status = format!(
+            "Ready. provider={} model={} stream={} tools={}",
+            self.config.runtime.provider,
+            self.config.runtime.model,
+            self.provider.capabilities.streaming,
+            self.provider.capabilities.tool_calling
+        );
+        if self.config.mode.offline {
+            status.push_str(" offline=true");
+        }
         AppStateSnapshot::new(RuntimeState::Ready)
             .with_event(AppEvent::StartupCompleted)
-            .with_status(format!(
-                "Ready. provider={} model={} stream={} tools={}",
-                self.config.runtime.provider,
-                self.config.runtime.model,
-                self.provider.capabilities.streaming,
-                self.provider.capabilities.tool_calling
-            ))
+            .with_status(status)
             .with_context_usage(
                 self.session.estimated_token_count(),
                 self.config.runtime.context_window,

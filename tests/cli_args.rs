@@ -24,6 +24,7 @@ fn cli_args_default_has_all_none_and_false() {
     assert!(args.exec.is_none());
     assert!(args.exec_file.is_none());
     assert!(args.reasoning_visibility.is_none());
+    assert!(!args.offline);
 }
 
 #[test]
@@ -109,6 +110,18 @@ fn cli_args_parse_bool_flags() {
     assert!(args.no_approval);
     assert!(args.fresh_session);
     assert!(args.oneshot);
+}
+
+#[test]
+fn cli_args_parse_offline_flag() {
+    let args = CliArgs::try_parse_from(["anvil", "--offline"]).unwrap();
+    assert!(args.offline);
+}
+
+#[test]
+fn cli_args_offline_default_is_false() {
+    let args = CliArgs::try_parse_from(["anvil"]).unwrap();
+    assert!(!args.offline);
 }
 
 #[test]
@@ -285,6 +298,32 @@ fn apply_cli_args_invalid_reasoning_visibility_errors() {
 
     let result = config.apply_cli_args(&args);
     assert!(result.is_err());
+}
+
+#[test]
+fn apply_cli_args_offline_sets_mode_offline() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    assert!(!config.mode.offline);
+    let args = CliArgs {
+        offline: true,
+        ..CliArgs::default()
+    };
+    config.apply_cli_args(&args).unwrap();
+    assert!(
+        config.mode.offline,
+        "offline flag should set mode.offline=true"
+    );
+}
+
+#[test]
+fn apply_cli_args_offline_false_preserves_default() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let args = CliArgs {
+        offline: false,
+        ..CliArgs::default()
+    };
+    config.apply_cli_args(&args).unwrap();
+    assert!(!config.mode.offline);
 }
 
 // --- --exec / --exec-file CLI args parsing tests ---
