@@ -325,11 +325,12 @@ fn find_crlf(body: &[u8], start: usize) -> Option<usize> {
 /// 1. Truncates to 500 characters (D4-007: prevent information leakage)
 /// 2. Redacts Authorization/Bearer/api_key patterns (D4-003: prevent API key leakage)
 pub fn sanitize_error_message(message: &str) -> String {
-    let truncated = if message.len() > 500 {
+    let truncated = if message.chars().count() > 500 {
+        let cut: String = message.chars().take(500).collect();
         format!(
-            "{}... [truncated, {} bytes total]",
-            &message[..500],
-            message.len()
+            "{}... [truncated, {} chars total]",
+            cut,
+            message.chars().count()
         )
     } else {
         message.to_string()
