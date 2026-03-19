@@ -246,6 +246,13 @@ enum TurnOutcome {
 // SubAgentSession
 // ---------------------------------------------------------------------------
 
+/// Override settings for sub-agent model/context_window (Issue #77).
+#[derive(Debug, Clone, Default)]
+pub struct SubAgentOverrides {
+    pub model: Option<String>,
+    pub context_window: Option<u32>,
+}
+
 /// An independent sub-agent session that runs within a restricted scope.
 ///
 /// Responsibilities:
@@ -264,6 +271,8 @@ pub struct SubAgentSession<'a, C: ProviderClient> {
     scope_path: std::path::PathBuf,
     /// Running count of iterations used (for result reporting).
     iterations_used: u32,
+    /// Model/context_window overrides from the parent App (Issue #77).
+    overrides: SubAgentOverrides,
 }
 
 impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
@@ -278,6 +287,7 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
         provider_client: &'a C,
         config: &'a EffectiveConfig,
         shutdown_flag: Arc<AtomicBool>,
+        overrides: SubAgentOverrides,
     ) -> Self {
         // 1. Independent session with scope as cwd
         let mut session = SessionRecord::new(scope.to_path_buf());
@@ -303,17 +313,33 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
             shutdown_flag,
             scope_path: scope.to_path_buf(),
             iterations_used: 0,
+            overrides,
         }
+    }
+
+    /// Return the effective model for this sub-agent session.
+    fn effective_model(&self) -> &str {
+        self.overrides
+            .model
+            .as_deref()
+            .unwrap_or(&self.config.runtime.model)
+    }
+
+    /// Return the effective context window for this sub-agent session.
+    fn effective_context_window(&self) -> u32 {
+        self.overrides
+            .context_window
+            .unwrap_or(self.config.runtime.context_window)
     }
 
     /// Execute one LLM turn: request -> stream -> parse -> validate -> execute -> record.
     fn run_turn(&mut self) -> Result<TurnOutcome, SubAgentError> {
         // Build the provider request
         let request = BasicAgentLoop::build_turn_request(
-            &self.config.runtime.model,
+            self.effective_model(),
             &self.session,
             true,
-            self.config.runtime.context_window,
+            self.effective_context_window(),
             &self.system_prompt,
         );
 

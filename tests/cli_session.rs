@@ -163,12 +163,10 @@ fn slash_commands_support_help_status_reset_and_exit() {
             .expect("checkpoint frame")
             .contains("checkpoint saved")
     );
+    let model_frame = model.frames.last().expect("model frame");
     assert!(
-        model
-            .frames
-            .last()
-            .expect("model frame")
-            .contains("current model: local-default")
+        model_frame.contains("local-default"),
+        "model frame should contain the model name 'local-default', got: {model_frame}"
     );
     assert!(
         provider_status
