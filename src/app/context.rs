@@ -252,6 +252,24 @@ pub(crate) fn expand_at_references(
     (result, errors)
 }
 
+/// Format the current date and timezone for system prompt injection.
+///
+/// Called per-turn by `build_dynamic_system_prompt()` so the date stays
+/// fresh even in long-running sessions.
+pub(crate) fn format_date_prompt() -> String {
+    use chrono::Local;
+
+    let now = Local::now();
+    let date_str = now.format("%Y-%m-%d (%a)").to_string();
+    let tz_offset = now.format("%:z").to_string();
+
+    format!(
+        "\n\n## Current date\nToday is {date_str}. Time zone: {tz_offset}.\n\
+         If the user asks for the current time or other runtime-local facts, \
+         use `shell.exec` to verify.\n"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,6 +361,15 @@ mod tests {
             "raw input",
         );
         assert_eq!(msg.effective_content(), "raw input");
+    }
+
+    #[test]
+    fn format_date_prompt_contains_date_and_timezone() {
+        let prompt = super::format_date_prompt();
+        assert!(prompt.contains("Today is "));
+        assert!(prompt.contains("Time zone: "));
+        assert!(prompt.contains("shell.exec"));
+        assert!(prompt.contains("## Current date"));
     }
 
     // ---- Task 2.1: is_sensitive_file tests ----
