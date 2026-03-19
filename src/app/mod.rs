@@ -665,6 +665,66 @@ impl App {
                     tui,
                 )
             }
+            Err(ref err @ ProviderTurnError::ConnectionRefused(ref msg)) => {
+                self.record_provider_error(err.clone())?;
+                self.execute_runtime_events(
+                    &[AgentEvent::Failed {
+                        status: "Error. connection refused".to_string(),
+                        error_summary: msg.clone(),
+                        recommended_actions: vec![
+                            "check provider is running (e.g. ollama serve)".to_string(),
+                            "verify provider URL".to_string(),
+                        ],
+                        elapsed_ms: 0,
+                    }],
+                    tui,
+                )
+            }
+            Err(ref err @ ProviderTurnError::DnsFailure(ref msg)) => {
+                self.record_provider_error(err.clone())?;
+                self.execute_runtime_events(
+                    &[AgentEvent::Failed {
+                        status: "Error. DNS resolution failed".to_string(),
+                        error_summary: msg.clone(),
+                        recommended_actions: vec![
+                            "check provider URL for typos".to_string(),
+                            "verify DNS settings and network connectivity".to_string(),
+                        ],
+                        elapsed_ms: 0,
+                    }],
+                    tui,
+                )
+            }
+            Err(ref err @ ProviderTurnError::ModelNotFound { ref model, .. }) => {
+                self.record_provider_error(err.clone())?;
+                self.execute_runtime_events(
+                    &[AgentEvent::Failed {
+                        status: "Error. model not found".to_string(),
+                        error_summary: format!("model '{}' not found", model),
+                        recommended_actions: vec![
+                            format!("download model: ollama pull {}", model),
+                            "list available models: ollama list".to_string(),
+                        ],
+                        elapsed_ms: 0,
+                    }],
+                    tui,
+                )
+            }
+            Err(ref err @ ProviderTurnError::AuthenticationFailed { ref message, .. }) => {
+                self.record_provider_error(err.clone())?;
+                self.execute_runtime_events(
+                    &[AgentEvent::Failed {
+                        status: "Error. authentication failed".to_string(),
+                        error_summary: message.clone(),
+                        recommended_actions: vec![
+                            "check API key: export ANVIL_API_KEY=<key>".to_string(),
+                            "verify provider credentials".to_string(),
+                        ],
+                        elapsed_ms: 0,
+                    }],
+                    tui,
+                )
+            }
             Err(
                 ref err @ ProviderTurnError::Network(ref msg)
                 | ref err @ ProviderTurnError::ServerError {
@@ -1326,17 +1386,48 @@ pub fn error_guidance(err: &AppError) -> String {
             "  - Each entry needs: name, description, prompt"
         )
         .to_string(),
-        AppError::ProviderTurn(turn_err) => {
-            let detail = turn_err.to_string();
-            if detail.contains("timeout") || detail.contains("max-time") {
-                "Hint: the request timed out\n  - Increase timeout: ANVIL_CURL_TIMEOUT=600\n  - Check if the model is responding: ollama ps".to_string()
-            } else if detail.contains("401") || detail.contains("403") || detail.contains("api key")
-            {
-                "Hint: authentication failed\n  - Set your API key: ANVIL_API_KEY=<key>\n  - Check the key format (some providers require 'Bearer ' prefix)".to_string()
-            } else {
-                "Hint: the provider turn failed\n  - Check if the model is available: ollama list\n  - Network issues may cause transient failures — try again".to_string()
+        AppError::ProviderTurn(turn_err) => match turn_err {
+            ProviderTurnError::ConnectionRefused(_) => concat!(
+                "Hint: Connection refused\n",
+                "  - Is the provider running? Try: ollama serve\n",
+                "  - Check URL: --provider-url http://127.0.0.1:11434\n",
+            )
+            .to_string(),
+            ProviderTurnError::DnsFailure(_) => concat!(
+                "Hint: DNS resolution failed\n",
+                "  - Check the provider URL for typos\n",
+                "  - Verify network connectivity\n",
+            )
+            .to_string(),
+            ProviderTurnError::ModelNotFound { model, .. } => format!(
+                "Hint: Model '{}' not found\n\
+                 \x20 - Download it: ollama pull {}\n\
+                 \x20 - List available models: ollama list\n",
+                model, model
+            ),
+            ProviderTurnError::AuthenticationFailed { .. } => concat!(
+                "Hint: Authentication failed\n",
+                "  - Check your API key or server configuration\n",
+                "  - Set API key: export ANVIL_API_KEY=<your-key>\n",
+                "  - API key format: some providers require 'Bearer <key>' prefix\n",
+                "  - IMPORTANT: Never share your API key in error reports or forums\n",
+            )
+            .to_string(),
+            ProviderTurnError::Timeout(_) => concat!(
+                "Hint: Request timed out\n",
+                "  - The provider may be overloaded\n",
+                "  - Try again or use a smaller model\n",
+            )
+            .to_string(),
+            _ => {
+                let detail = turn_err.to_string();
+                if detail.contains("401") || detail.contains("403") || detail.contains("api key") {
+                    "Hint: authentication failed\n  - Set your API key: ANVIL_API_KEY=<key>\n  - Check the key format (some providers require 'Bearer ' prefix)".to_string()
+                } else {
+                    "Hint: the provider turn failed\n  - Check if the model is available: ollama list\n  - Network issues may cause transient failures — try again".to_string()
+                }
             }
-        }
+        },
         _ => String::new(),
     }
 }

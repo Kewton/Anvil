@@ -5,11 +5,13 @@
 
 use crate::config::{CliArgs, EffectiveConfig, PromptSource};
 use crate::logging::{LogGuard, init_tracing};
-use crate::provider::{ProviderClient, ProviderRuntimeContext, build_local_provider_client};
+use crate::provider::{
+    ProviderClient, ProviderRuntimeContext, ProviderTurnError, build_local_provider_client,
+};
 use crate::session::SessionError;
 use crate::tui::Tui;
 
-use super::{App, AppError, SessionControl, cli_prompt};
+use super::{App, AppError, SessionControl, cli_prompt, error_guidance};
 
 use std::io::{self, BufRead, Read as _, Write};
 use std::sync::Arc;
@@ -115,9 +117,32 @@ fn run_with_config(config: EffectiveConfig) -> Result<(), AppError> {
     let provider = ProviderRuntimeContext::bootstrap(&config)?;
     let provider_client = build_local_provider_client(&config, Arc::clone(&shutdown_flag))?;
 
-    // Health check: warn on failure but continue startup.
-    if let Err(warning) = provider_client.health_check() {
-        eprintln!("\u{26a0} {warning}");
+    // Health check: staged error handling based on error type.
+    match provider_client.health_check() {
+        Ok(()) => {}
+        Err(ref err @ ProviderTurnError::ConnectionRefused(_))
+        | Err(ref err @ ProviderTurnError::DnsFailure(_)) => {
+            eprintln!("Error: {err}");
+            eprintln!("{}", error_guidance(&AppError::ProviderTurn(err.clone())));
+            return Err(AppError::ProviderTurn(err.clone()));
+        }
+        Err(ref err @ ProviderTurnError::AuthenticationFailed { .. }) => {
+            if config.runtime.api_key.is_some() {
+                // api_key configured -> authentication problem -> error exit
+                eprintln!("Error: {err}");
+                eprintln!("Hint: Your API key appears to be invalid. Verify the key.");
+                return Err(AppError::ProviderTurn(err.clone()));
+            } else {
+                // api_key not configured -> LM Studio etc. possibility -> warn and continue
+                eprintln!("Warning: {err}");
+                eprintln!("Hint: If this server requires an API key, set ANVIL_API_KEY.");
+                eprintln!("      If using LM Studio or similar, verify the server URL.");
+            }
+        }
+        Err(ref err) => {
+            // Timeout, ServerError etc. -> warn and continue
+            eprintln!("Warning: {err}");
+        }
     }
 
     let mut app = App::new(config, provider, Arc::clone(&shutdown_flag))?;
