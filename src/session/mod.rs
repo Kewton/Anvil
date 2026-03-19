@@ -123,11 +123,23 @@ pub struct SessionRecord {
 }
 
 impl SessionRecord {
+    /// Create a new session with a hash-based ID derived from the working directory.
     pub fn new(cwd: PathBuf) -> Self {
+        Self::with_id(session_id_for_cwd(&cwd), cwd)
+    }
+
+    /// Create a new session with an explicit name after validation.
+    pub fn new_named(name: &str, cwd: PathBuf) -> Result<Self, SessionError> {
+        validate_session_name(name)?;
+        Ok(Self::with_id(name.to_string(), cwd))
+    }
+
+    /// Internal constructor shared by `new` and `new_named`.
+    fn with_id(session_id: String, cwd: PathBuf) -> Self {
         let now = now_ms();
         Self {
             metadata: SessionMetadata {
-                session_id: session_id_for_cwd(&cwd),
+                session_id,
                 cwd,
                 created_at_ms: now,
                 updated_at_ms: now,
@@ -419,22 +431,49 @@ impl SessionRecord {
     }
 }
 
+/// Information about a session for listing purposes.
+#[derive(Debug, Clone)]
+pub struct SessionInfo {
+    pub name: String,
+    pub updated_at_ms: u128,
+    pub message_count: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionStore {
     file_path: PathBuf,
+    session_dir: PathBuf,
 }
 
 impl SessionStore {
-    pub fn new(file_path: PathBuf) -> Self {
-        Self { file_path }
+    pub fn new(file_path: PathBuf, session_dir: PathBuf) -> Self {
+        Self {
+            file_path,
+            session_dir,
+        }
     }
 
     pub fn from_config(config: &EffectiveConfig) -> Self {
-        Self::new(config.paths.session_file.clone())
+        Self::new(
+            config.paths.session_file.clone(),
+            config.paths.session_dir.clone(),
+        )
     }
 
     pub fn file_path(&self) -> &Path {
         &self.file_path
+    }
+
+    pub fn session_dir(&self) -> &Path {
+        &self.session_dir
+    }
+
+    /// Extract the session name from the file path stem (e.g. "default" from "default.json").
+    fn session_name(&self) -> &str {
+        self.file_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("default")
     }
 
     pub fn load_or_create(&self, cwd: &Path) -> Result<SessionRecord, SessionError> {
@@ -456,11 +495,98 @@ impl SessionStore {
             }
         }
 
+        // Migration: look for old hash-based session file
+        let old_key = session_id_for_cwd(cwd);
+        let old_path = self.session_dir.join(format!("{old_key}.json"));
+        let session_name = self.session_name();
+        if old_path.exists() {
+            tracing::debug!(old = %old_path.display(), new = %self.file_path.display(), "migrating old session file");
+            std::fs::rename(&old_path, &self.file_path)
+                .map_err(SessionError::SessionWriteFailed)?;
+            let mut session = self.load()?;
+            session.metadata.session_id = session_name.to_string();
+            session.record_event(AppEvent::SessionLoaded);
+            self.save(&session)?;
+            return Ok(session);
+        }
+
+        // New session creation using named constructor
         tracing::debug!("creating new session");
-        let mut record = SessionRecord::new(cwd.to_path_buf());
+        let mut record = if validate_session_name(session_name).is_ok() {
+            SessionRecord::new_named(session_name, cwd.to_path_buf())?
+        } else {
+            // Fallback for non-conforming file names (e.g. hash-based)
+            SessionRecord::new(cwd.to_path_buf())
+        };
         record.record_event(AppEvent::SessionLoaded);
         self.save(&record)?;
         Ok(record)
+    }
+
+    /// List all sessions in the session directory.
+    /// Skips symlinks and non-JSON files.
+    pub fn list_sessions(&self) -> Result<Vec<SessionInfo>, SessionError> {
+        let entries = match std::fs::read_dir(&self.session_dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Vec::new());
+            }
+            Err(err) => return Err(SessionError::SessionReadFailed(err)),
+        };
+
+        let mut sessions = Vec::new();
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            let path = entry.path();
+
+            // Skip symlinks
+            if path.symlink_metadata().map_or(true, |m| m.is_symlink()) {
+                continue;
+            }
+
+            // Only process .json files (skip .json.tmp and others)
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+
+            let name = match path.file_stem().and_then(|s| s.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+
+            // Try to read and deserialize the session
+            let contents = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let record: SessionRecord = match serde_json::from_str(&contents) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+
+            sessions.push(SessionInfo {
+                name,
+                updated_at_ms: record.metadata.updated_at_ms,
+                message_count: record.messages.len(),
+            });
+        }
+
+        Ok(sessions)
+    }
+
+    /// Delete a session by name. Validates the name and checks existence.
+    pub fn delete_session(&self, name: &str) -> Result<(), SessionError> {
+        validate_session_name(name)?;
+        let path = self.session_dir.join(format!("{name}.json"));
+        if !path.exists() {
+            return Err(SessionError::SessionNotFound(name.to_string()));
+        }
+        std::fs::remove_file(&path).map_err(SessionError::SessionWriteFailed)?;
+        Ok(())
     }
 
     pub fn load(&self) -> Result<SessionRecord, SessionError> {
@@ -517,6 +643,9 @@ pub enum SessionError {
     SessionWriteFailed(std::io::Error),
     SessionSerializeFailed(serde_json::Error),
     SessionDeserializeFailed(serde_json::Error),
+    InvalidSessionName(String),
+    SessionNotFound(String),
+    ActiveSessionCannotBeDeleted,
 }
 
 impl Display for SessionError {
@@ -532,6 +661,18 @@ impl Display for SessionError {
             }
             Self::SessionDeserializeFailed(err) => {
                 write!(f, "failed to deserialize session: {err}")
+            }
+            Self::InvalidSessionName(name) => {
+                write!(
+                    f,
+                    "invalid session name: '{name}' (allowed: alphanumeric, hyphen, underscore, 1-64 chars)"
+                )
+            }
+            Self::SessionNotFound(name) => {
+                write!(f, "session not found: '{name}'")
+            }
+            Self::ActiveSessionCannotBeDeleted => {
+                write!(f, "cannot delete the active session")
             }
         }
     }
@@ -560,10 +701,27 @@ fn now_ms() -> u128 {
         .as_millis()
 }
 
-fn session_id_for_cwd(cwd: &Path) -> String {
+pub(crate) fn session_id_for_cwd(cwd: &Path) -> String {
     let mut hasher = DefaultHasher::new();
     cwd.hash(&mut hasher);
     format!("session_{:x}", hasher.finish())
+}
+
+/// Validate a session name: alphanumeric, hyphen, underscore only, 1-64 chars.
+/// Rejects `.`, `..`, NUL bytes, and any other special characters.
+pub fn validate_session_name(name: &str) -> Result<(), SessionError> {
+    // The alphanumeric + hyphen + underscore check below already rejects
+    // '.', '..', NUL bytes, and all other special characters, so no
+    // separate guards are needed.
+    let valid = !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    if !valid {
+        return Err(SessionError::InvalidSessionName(name.to_string()));
+    }
+    Ok(())
 }
 
 fn compact_preview(content: &str, max_chars: usize) -> String {

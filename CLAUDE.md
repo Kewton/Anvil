@@ -129,7 +129,7 @@ src/
 │   ├── openai.rs        # OpenAI互換クライアント
 │   └── transport.rs     # HTTPトランスポート
 ├── retrieval/mod.rs     # リポジトリ検索
-├── session/mod.rs       # セッション永続化
+├── session/mod.rs       # セッション永続化（名前付きセッション・一覧・切替・削除・マイグレーション）
 ├── spinner.rs           # スピナーUI
 ├── state/mod.rs         # 状態マシン
 ├── tooling/

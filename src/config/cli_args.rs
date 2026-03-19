@@ -73,6 +73,10 @@ pub struct CliArgs {
     #[arg(long)]
     pub offline: bool,
 
+    /// Named session to use
+    #[arg(long)]
+    pub session: Option<String>,
+
     /// Auto-approve built-in tool execution (MCP tools require individual trust)
     #[arg(long)]
     pub trust: bool,

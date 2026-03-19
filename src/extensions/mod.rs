@@ -40,6 +40,9 @@ pub enum SlashCommandAction {
         content: String,
         skill_dir: PathBuf,
     },
+    SessionList,
+    SessionSwitch(String),
+    SessionDelete(String),
     Trust(TrustAction),
     Undo(usize),
 }
@@ -151,6 +154,9 @@ impl ExtensionRegistry {
             return Some(parsed);
         }
         if let Some(parsed) = parse_repo_command(command) {
+            return Some(parsed);
+        }
+        if let Some(parsed) = parse_session_command(command) {
             return Some(parsed);
         }
         if let Some(parsed) = parse_trust_command(command) {
@@ -293,6 +299,12 @@ pub fn builtin_slash_commands() -> Vec<SlashCommandSpec> {
             action: SlashCommandAction::Exit,
             scope: None,
         },
+        SlashCommandSpec {
+            name: "/session".to_string(),
+            description: "manage sessions (list/switch/delete)".to_string(),
+            action: SlashCommandAction::SessionList,
+            scope: None,
+        },
     ]
 }
 
@@ -378,6 +390,35 @@ fn edit_distance(a: &str, b: &str) -> usize {
         std::mem::swap(&mut prev, &mut curr);
     }
     prev[n]
+}
+
+fn parse_session_command(command: &str) -> Option<SlashCommandSpec> {
+    let rest = command.strip_prefix("/session")?.trim();
+
+    let action = if rest.is_empty() || rest == "list" {
+        SlashCommandAction::SessionList
+    } else if let Some(name) = rest.strip_prefix("switch ") {
+        let name = name.trim();
+        if name.is_empty() {
+            return None;
+        }
+        SlashCommandAction::SessionSwitch(name.to_string())
+    } else if let Some(name) = rest.strip_prefix("delete ") {
+        let name = name.trim();
+        if name.is_empty() {
+            return None;
+        }
+        SlashCommandAction::SessionDelete(name.to_string())
+    } else {
+        return None;
+    };
+
+    Some(SlashCommandSpec {
+        name: "/session".to_string(),
+        description: "manage sessions (list/switch/delete)".to_string(),
+        action,
+        scope: None,
+    })
 }
 
 /// Maximum number of undo steps allowed in a single `/undo N` command.
