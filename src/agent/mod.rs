@@ -3,7 +3,11 @@
 //! Defines the [`AgentEvent`] lifecycle and the [`BasicAgentLoop`] that
 //! bridges provider responses into structured tool calls.
 
+pub mod model_classifier;
 pub mod subagent;
+pub mod tag_spec;
+
+pub use model_classifier::ToolProtocolMode;
 
 use crate::contracts::InferencePerformanceView;
 use crate::contracts::tokens::{ContentKind, estimate_tokens};
