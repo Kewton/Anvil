@@ -16,6 +16,7 @@ use super::{
 /// {"error":"no such model 'invalid-name'"}
 const MODEL_NOT_FOUND_PATTERNS: &[&str] = &["not found", "no such model"];
 use crate::config::EffectiveConfig;
+use crate::contracts::InferencePerformanceView;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::process::Command;
@@ -45,6 +46,52 @@ struct OllamaChatChunk {
     message: Option<OllamaChatMessage>,
     #[serde(default)]
     done: bool,
+    #[serde(default)]
+    eval_count: Option<u64>,
+    #[serde(default)]
+    eval_duration: Option<u64>,
+    #[serde(default)]
+    prompt_eval_count: Option<u64>,
+    #[serde(default)]
+    prompt_eval_duration: Option<u64>,
+}
+
+/// Extract InferencePerformanceView from Ollama eval metrics.
+fn extract_inference_performance(
+    eval_count: Option<u64>,
+    eval_duration: Option<u64>,
+) -> Option<InferencePerformanceView> {
+    let eval_count = eval_count?;
+    let eval_duration = eval_duration?;
+    let eval_duration_ms = eval_duration / 1_000_000;
+    let tokens_per_sec_tenths = if eval_duration > 0 {
+        eval_count
+            .checked_mul(10_000_000_000)
+            .map(|v| v / eval_duration)
+    } else {
+        None
+    };
+    Some(InferencePerformanceView {
+        tokens_per_sec_tenths,
+        eval_tokens: Some(eval_count),
+        eval_duration_ms: Some(eval_duration_ms),
+    })
+}
+
+/// Build a Done AgentEvent (shared by stream_turn and normalize_stream_chunks).
+fn build_done_event(
+    assistant_output: &str,
+    inference_performance: Option<InferencePerformanceView>,
+) -> AgentEvent {
+    AgentEvent::Done {
+        status: "Done. session saved".to_string(),
+        assistant_message: assistant_output.to_string(),
+        completion_summary: "Provider turn finished successfully.".to_string(),
+        saved_status: "session saved".to_string(),
+        tool_logs: Vec::new(),
+        elapsed_ms: 0,
+        inference_performance,
+    }
 }
 
 /// Client for the Ollama local inference server.
@@ -115,6 +162,9 @@ impl<T> OllamaProviderClient<T> {
                 ProviderTurnError::Backend(format!("invalid ollama response: {err}"))
             })?;
 
+            let eval_count = parsed.eval_count;
+            let eval_duration = parsed.eval_duration;
+
             if let Some(message) = parsed.message
                 && !message.content.is_empty()
             {
@@ -123,14 +173,11 @@ impl<T> OllamaProviderClient<T> {
             }
 
             if parsed.done {
-                events.push(ProviderEvent::Agent(AgentEvent::Done {
-                    status: "Done. session saved".to_string(),
-                    assistant_message: assistant_output.clone(),
-                    completion_summary: "Provider turn finished successfully.".to_string(),
-                    saved_status: "session saved".to_string(),
-                    tool_logs: Vec::new(),
-                    elapsed_ms: 0,
-                }));
+                let perf = extract_inference_performance(eval_count, eval_duration);
+                events.push(ProviderEvent::Agent(build_done_event(
+                    &assistant_output,
+                    perf,
+                )));
             }
         }
 
@@ -211,6 +258,8 @@ impl<T: HttpTransport> ProviderClient for OllamaProviderClient<T> {
                 }
                 match serde_json::from_str::<OllamaChatChunk>(line) {
                     Ok(chunk) => {
+                        let eval_count = chunk.eval_count;
+                        let eval_duration = chunk.eval_duration;
                         if let Some(message) = chunk.message
                             && !message.content.is_empty()
                         {
@@ -218,15 +267,11 @@ impl<T: HttpTransport> ProviderClient for OllamaProviderClient<T> {
                             emit(ProviderEvent::TokenDelta(message.content));
                         }
                         if chunk.done {
-                            emit(ProviderEvent::Agent(AgentEvent::Done {
-                                status: "Done. session saved".to_string(),
-                                assistant_message: assistant_output.clone(),
-                                completion_summary: "Provider turn finished successfully."
-                                    .to_string(),
-                                saved_status: "session saved".to_string(),
-                                tool_logs: Vec::new(),
-                                elapsed_ms: 0,
-                            }));
+                            let perf = extract_inference_performance(eval_count, eval_duration);
+                            emit(ProviderEvent::Agent(build_done_event(
+                                &assistant_output,
+                                perf,
+                            )));
                         }
                     }
                     Err(err) => {

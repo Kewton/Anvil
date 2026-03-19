@@ -5,6 +5,7 @@
 
 pub mod subagent;
 
+use crate::contracts::InferencePerformanceView;
 use crate::contracts::tokens::{ContentKind, estimate_tokens};
 use crate::provider::{
     ImageContent, ProviderClient, ProviderEvent, ProviderMessage, ProviderMessageRole,
@@ -55,6 +56,8 @@ pub enum AgentEvent {
         saved_status: String,
         tool_logs: Vec<(String, String, String)>,
         elapsed_ms: u128,
+        #[serde(default)]
+        inference_performance: Option<InferencePerformanceView>,
     },
     Interrupted {
         status: String,

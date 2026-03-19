@@ -642,6 +642,7 @@ impl App {
                                     "Done. session saved",
                                     "session saved",
                                     0,
+                                    None,
                                     tui,
                                     provider_client,
                                 )?);
@@ -1027,13 +1028,17 @@ impl App {
                 saved_status,
                 tool_logs,
                 elapsed_ms,
+                inference_performance,
             } => {
                 self.record_assistant_output(self.next_message_id("assistant"), assistant_message)?;
-                let snapshot = AppStateSnapshot::new(RuntimeState::Done)
+                let mut snapshot = AppStateSnapshot::new(RuntimeState::Done)
                     .with_status(status.clone())
                     .with_tool_logs(render::build_tool_logs(tool_logs))
                     .with_completion_summary(completion_summary.clone(), saved_status.clone())
                     .with_elapsed_ms(*elapsed_ms);
+                if let Some(perf) = inference_performance {
+                    snapshot = snapshot.with_inference_performance(perf.clone());
+                }
                 let mut snapshot =
                     self.transition_with_context(snapshot, StateTransition::Finish)?;
                 self.evaluate_context_warning(&mut snapshot);

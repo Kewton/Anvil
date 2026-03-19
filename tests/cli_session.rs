@@ -34,6 +34,7 @@ impl ProviderClient for RecordingProvider {
                 saved_status: "session saved".to_string(),
                 tool_logs: Vec::new(),
                 elapsed_ms: 0,
+                inference_performance: None,
             }));
             return Ok(());
         }
@@ -202,6 +203,7 @@ fn regular_input_runs_live_turn_and_supports_follow_up_in_same_session() {
             saved_status: "session saved".to_string(),
             tool_logs: Vec::new(),
             elapsed_ms: 120,
+            inference_performance: None,
         })],
     };
 
@@ -268,6 +270,7 @@ fn slash_approve_and_deny_resolve_pending_tool_approval() {
                 saved_status: "session saved".to_string(),
                 tool_logs: Vec::new(),
                 elapsed_ms: 240,
+                inference_performance: None,
             }),
         ],
     };
@@ -362,6 +365,7 @@ fn startup_console_resumes_existing_session_history() {
             saved_status: "session saved".to_string(),
             tool_logs: Vec::new(),
             elapsed_ms: 100,
+            inference_performance: None,
         })],
     };
     let mut first = common::build_app_in(root.clone());
@@ -437,6 +441,7 @@ fn regular_input_surfaces_tool_execution_logs_in_console() {
                     "src/app/mod.rs".to_string(),
                 )],
                 elapsed_ms: 140,
+                inference_performance: None,
             }),
         ],
     };
@@ -527,6 +532,7 @@ fn custom_slash_commands_load_from_extension_file_and_run_live_turn() {
             saved_status: "session saved".to_string(),
             tool_logs: Vec::new(),
             elapsed_ms: 90,
+            inference_performance: None,
         })],
     };
 
@@ -654,6 +660,7 @@ fn repo_find_adds_retrieval_context_to_following_provider_turn() {
             saved_status: "session saved".to_string(),
             tool_logs: Vec::new(),
             elapsed_ms: 120,
+            inference_performance: None,
         })],
     };
 
