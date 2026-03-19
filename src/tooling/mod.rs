@@ -83,6 +83,9 @@ pub enum ToolKind {
     Mcp,
     AgentExplore,
     AgentPlan,
+    GitStatus,
+    GitDiff,
+    GitLog,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,6 +132,16 @@ pub enum ToolInput {
         prompt: String,
         scope: Option<String>,
     },
+    GitStatus {},
+    GitDiff {
+        path: Option<String>,
+        staged: Option<bool>,
+        commit: Option<String>,
+    },
+    GitLog {
+        count: Option<u32>,
+        path: Option<String>,
+    },
 }
 
 impl ToolInput {
@@ -144,6 +157,9 @@ impl ToolInput {
             Self::Mcp { .. } => ToolKind::Mcp,
             Self::AgentExplore { .. } => ToolKind::AgentExplore,
             Self::AgentPlan { .. } => ToolKind::AgentPlan,
+            Self::GitStatus { .. } => ToolKind::GitStatus,
+            Self::GitDiff { .. } => ToolKind::GitDiff,
+            Self::GitLog { .. } => ToolKind::GitLog,
         }
     }
 
@@ -260,6 +276,28 @@ impl ToolInput {
                     .and_then(serde_json::Value::as_str)
                     .map(String::from),
             }),
+            "git.status" => Ok(ToolInput::GitStatus {}),
+            "git.diff" => Ok(ToolInput::GitDiff {
+                path: value
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .map(String::from),
+                staged: value.get("staged").and_then(serde_json::Value::as_bool),
+                commit: value
+                    .get("commit")
+                    .and_then(serde_json::Value::as_str)
+                    .map(String::from),
+            }),
+            "git.log" => Ok(ToolInput::GitLog {
+                count: value
+                    .get("count")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|v| v as u32),
+                path: value
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .map(String::from),
+            }),
             other => {
                 // mcp__<server>__<tool> pattern detection
                 if let Some((server, tool)) = parse_mcp_tool_name(other) {
@@ -330,6 +368,16 @@ impl ToolInput {
             "agent.plan" => Some(ToolInput::AgentPlan {
                 prompt: extract_simple(block, "prompt")?,
                 scope: extract_simple(block, "scope"),
+            }),
+            "git.status" => Some(ToolInput::GitStatus {}),
+            "git.diff" => Some(ToolInput::GitDiff {
+                path: extract_simple(block, "path"),
+                staged: extract_simple(block, "staged").and_then(|s| s.parse::<bool>().ok()),
+                commit: extract_simple(block, "commit"),
+            }),
+            "git.log" => Some(ToolInput::GitLog {
+                count: extract_simple(block, "count").and_then(|s| s.parse::<u32>().ok()),
+                path: extract_simple(block, "path"),
             }),
             _ => None,
         }
@@ -666,10 +714,52 @@ impl ToolRegistry {
         });
     }
 
+    pub fn register_git_status(&mut self) {
+        self.register(ToolSpec {
+            version: 1,
+            name: "git.status".to_string(),
+            kind: ToolKind::GitStatus,
+            execution_class: ExecutionClass::ReadOnly,
+            permission_class: PermissionClass::Safe,
+            execution_mode: ExecutionMode::ParallelSafe,
+            plan_mode: PlanModePolicy::Allowed,
+            rollback_policy: RollbackPolicy::None,
+        });
+    }
+
+    pub fn register_git_diff(&mut self) {
+        self.register(ToolSpec {
+            version: 1,
+            name: "git.diff".to_string(),
+            kind: ToolKind::GitDiff,
+            execution_class: ExecutionClass::ReadOnly,
+            permission_class: PermissionClass::Safe,
+            execution_mode: ExecutionMode::ParallelSafe,
+            plan_mode: PlanModePolicy::Allowed,
+            rollback_policy: RollbackPolicy::None,
+        });
+    }
+
+    pub fn register_git_log(&mut self) {
+        self.register(ToolSpec {
+            version: 1,
+            name: "git.log".to_string(),
+            kind: ToolKind::GitLog,
+            execution_class: ExecutionClass::ReadOnly,
+            permission_class: PermissionClass::Safe,
+            execution_mode: ExecutionMode::ParallelSafe,
+            plan_mode: PlanModePolicy::Allowed,
+            rollback_policy: RollbackPolicy::None,
+        });
+    }
+
     /// Register the subset of tools available to the Explore sub-agent.
     pub fn register_explore_tools(&mut self) {
         self.register_file_read();
         self.register_file_search();
+        self.register_git_status();
+        self.register_git_diff();
+        self.register_git_log();
     }
 
     /// Register the subset of tools available to the Plan sub-agent.
@@ -677,6 +767,7 @@ impl ToolRegistry {
         self.register_file_read();
         self.register_file_search();
         self.register_web_fetch();
+        self.register_git_status();
     }
 
     pub fn register_standard_tools(&mut self) {
@@ -687,6 +778,9 @@ impl ToolRegistry {
         self.register_shell_exec();
         self.register_web_fetch();
         self.register_web_search();
+        self.register_git_status();
+        self.register_git_diff();
+        self.register_git_log();
     }
 
     pub fn validate(
@@ -816,6 +910,16 @@ impl LocalToolExecutor {
                 self.execute_shell_exec(&request, command, started)
             }
             ToolInput::WebSearch { ref query } => self.execute_web_search(&request, query, started),
+            ToolInput::GitStatus {} => self.execute_git_status(&request, started),
+            ToolInput::GitDiff {
+                ref path,
+                ref staged,
+                ref commit,
+            } => self.execute_git_diff(&request, path, staged, commit, started),
+            ToolInput::GitLog {
+                ref count,
+                ref path,
+            } => self.execute_git_log(&request, count, path, started),
             ToolInput::Mcp { .. } => unreachable!("MCP tools are dispatched in agentic.rs"),
             ToolInput::AgentExplore { .. } | ToolInput::AgentPlan { .. } => {
                 unreachable!("agent tools are dispatched in agentic.rs")
@@ -1338,6 +1442,102 @@ impl LocalToolExecutor {
         ))
     }
 
+    /// Shared helper: execute a git command and return a [`ToolExecutionResult`].
+    fn run_git_command(
+        &self,
+        args: &[&str],
+        request: &ToolExecutionRequest,
+        started: Instant,
+    ) -> Result<ToolExecutionResult, ToolRuntimeError> {
+        let mut cmd = std::process::Command::new("git");
+        for arg in args {
+            cmd.arg(arg);
+        }
+        cmd.current_dir(&self.root);
+        let output = cmd
+            .output()
+            .map_err(|e| ToolRuntimeError::Io(format!("failed to execute git: {e}")))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+        if !output.status.success() {
+            let exit_code = output.status.code().unwrap_or(-1);
+            let error_msg = if exit_code == 128 {
+                format!("not a git repository: {stderr}")
+            } else {
+                format!("git command failed (exit {exit_code}): {stderr}")
+            };
+            return Ok(ToolExecutionResult {
+                tool_call_id: request.tool_call_id.clone(),
+                tool_name: request.spec.name.clone(),
+                status: ToolExecutionStatus::Failed,
+                summary: error_msg.clone(),
+                payload: ToolExecutionPayload::Text(error_msg),
+                artifacts: Vec::new(),
+                elapsed_ms: started.elapsed().as_millis(),
+            });
+        }
+
+        let combined = combine_process_output(stdout, stderr);
+        Ok(build_completed_result(
+            request,
+            format!("{} completed", request.spec.name),
+            ToolExecutionPayload::Text(combined),
+            Vec::new(),
+            started,
+        ))
+    }
+
+    fn execute_git_status(
+        &self,
+        request: &ToolExecutionRequest,
+        started: Instant,
+    ) -> Result<ToolExecutionResult, ToolRuntimeError> {
+        self.run_git_command(&["status", "--porcelain"], request, started)
+    }
+
+    fn execute_git_diff(
+        &self,
+        request: &ToolExecutionRequest,
+        path: &Option<String>,
+        staged: &Option<bool>,
+        commit: &Option<String>,
+        started: Instant,
+    ) -> Result<ToolExecutionResult, ToolRuntimeError> {
+        let mut args: Vec<String> = vec!["diff".to_string()];
+        if staged.unwrap_or(false) {
+            args.push("--staged".to_string());
+        } else if let Some(c) = commit {
+            args.push(c.clone());
+        }
+        if let Some(p) = path {
+            args.push("--".to_string());
+            args.push(p.clone());
+        }
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        self.run_git_command(&arg_refs, request, started)
+    }
+
+    fn execute_git_log(
+        &self,
+        request: &ToolExecutionRequest,
+        count: &Option<u32>,
+        path: &Option<String>,
+        started: Instant,
+    ) -> Result<ToolExecutionResult, ToolRuntimeError> {
+        let count_val = count.unwrap_or(10);
+        let count_str = count_val.to_string();
+        let mut args: Vec<&str> = vec!["log", "--oneline", "-n", &count_str];
+        let path_owned;
+        if let Some(p) = path {
+            path_owned = p.clone();
+            args.push("--");
+            args.push(&path_owned);
+        }
+        self.run_git_command(&args, request, started)
+    }
+
     fn enforce_rate_limit(&mut self) {
         if let Some(prev) = self.last_web_search {
             let elapsed = prev.elapsed();
@@ -1572,8 +1772,66 @@ fn validate_required_fields(input: &ToolInput) -> Result<(), ToolValidationError
         }
         // [D3-001] MCP tool input validation is handled by the MCP server side
         ToolInput::Mcp { .. } => {}
+        ToolInput::GitStatus {} => {}
+        ToolInput::GitDiff { commit, path, .. } => {
+            if let Some(c) = commit {
+                validate_git_ref(c)?;
+            }
+            if let Some(p) = path {
+                validate_git_path(p)?;
+            }
+        }
+        ToolInput::GitLog { count, path } => {
+            if let Some(c) = count
+                && (*c == 0 || *c > 100)
+            {
+                return Err(ToolValidationError::InvalidFieldValue {
+                    field: "count".to_string(),
+                    reason: "count must be between 1 and 100".to_string(),
+                });
+            }
+            if let Some(p) = path {
+                validate_git_path(p)?;
+            }
+        }
     }
 
+    Ok(())
+}
+
+/// Validate a git ref value (commit, branch name, etc.).
+///
+/// Rejects values starting with `-` (flag injection) and values not matching
+/// `^[a-zA-Z0-9_.~^/-]+$`.
+fn validate_git_ref(value: &str) -> Result<(), ToolValidationError> {
+    if value.starts_with('-') {
+        return Err(ToolValidationError::InvalidFieldValue {
+            field: "commit".to_string(),
+            reason: "commit must not start with '-' (flag injection prevention)".to_string(),
+        });
+    }
+    if !value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '~' | '^' | '/' | '-'))
+    {
+        return Err(ToolValidationError::InvalidFieldValue {
+            field: "commit".to_string(),
+            reason: format!("commit contains invalid characters: {value}"),
+        });
+    }
+    Ok(())
+}
+
+/// Validate a git path parameter.
+///
+/// Rejects paths containing `..` as a defence-in-depth measure.
+fn validate_git_path(path: &str) -> Result<(), ToolValidationError> {
+    if path.contains("..") {
+        return Err(ToolValidationError::InvalidFieldValue {
+            field: "path".to_string(),
+            reason: "path must not contain '..' (path traversal prevention)".to_string(),
+        });
+    }
     Ok(())
 }
 
