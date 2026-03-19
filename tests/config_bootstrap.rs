@@ -605,3 +605,117 @@ fn context_window_explicitly_set_remains_false_when_not_set() {
         "setting other config keys should not mark context_window as explicitly set"
     );
 }
+
+// --- tag_protocol configuration tests ---
+
+#[test]
+fn tag_protocol_defaults_to_none() {
+    let config = EffectiveConfig::default_for_test().unwrap();
+    assert!(
+        config.runtime.tag_protocol.is_none(),
+        "tag_protocol should default to None"
+    );
+}
+
+#[test]
+fn tag_protocol_configurable_via_config_file_key() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let mut file_values = HashMap::new();
+    file_values.insert("tag_protocol".to_string(), "true".to_string());
+    config
+        .apply_overrides_for_test(&file_values, &HashMap::new(), &HashMap::new())
+        .expect("should apply");
+    assert_eq!(config.runtime.tag_protocol, Some(true));
+}
+
+#[test]
+fn tag_protocol_configurable_via_env_key() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let mut env_values = HashMap::new();
+    env_values.insert("ANVIL_TAG_PROTOCOL".to_string(), "true".to_string());
+    config
+        .apply_overrides_for_test(&HashMap::new(), &env_values, &HashMap::new())
+        .expect("should apply");
+    assert_eq!(config.runtime.tag_protocol, Some(true));
+}
+
+#[test]
+fn tag_protocol_false_via_config_file() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let mut file_values = HashMap::new();
+    file_values.insert("tag_protocol".to_string(), "false".to_string());
+    config
+        .apply_overrides_for_test(&file_values, &HashMap::new(), &HashMap::new())
+        .expect("should apply");
+    assert_eq!(config.runtime.tag_protocol, Some(false));
+}
+
+#[test]
+fn tag_protocol_cli_overrides_file_and_env() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+
+    let mut file_values = HashMap::new();
+    file_values.insert("tag_protocol".to_string(), "false".to_string());
+
+    let mut env_values = HashMap::new();
+    env_values.insert("ANVIL_TAG_PROTOCOL".to_string(), "false".to_string());
+
+    let mut cli_values = HashMap::new();
+    cli_values.insert("ANVIL_TAG_PROTOCOL".to_string(), "true".to_string());
+
+    config
+        .apply_overrides_for_test(&file_values, &env_values, &cli_values)
+        .expect("should apply");
+    assert_eq!(
+        config.runtime.tag_protocol,
+        Some(true),
+        "CLI should override file and env config"
+    );
+}
+
+#[test]
+fn tag_protocol_remains_none_when_not_set() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let mut file_values = HashMap::new();
+    file_values.insert("model".to_string(), "some-model".to_string());
+    config
+        .apply_overrides_for_test(&file_values, &HashMap::new(), &HashMap::new())
+        .expect("should apply");
+    assert!(
+        config.runtime.tag_protocol.is_none(),
+        "setting other config keys should not affect tag_protocol"
+    );
+}
+
+#[test]
+fn tag_protocol_cli_args_tag_protocol_flag() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let cli = anvil::config::CliArgs {
+        tag_protocol: Some(true),
+        ..Default::default()
+    };
+    config.apply_cli_args(&cli).expect("should apply");
+    assert_eq!(config.runtime.tag_protocol, Some(true));
+}
+
+#[test]
+fn tag_protocol_cli_args_no_tag_protocol_flag() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let cli = anvil::config::CliArgs {
+        tag_protocol: Some(false),
+        ..Default::default()
+    };
+    config.apply_cli_args(&cli).expect("should apply");
+    assert_eq!(config.runtime.tag_protocol, Some(false));
+}
+
+#[test]
+fn tag_protocol_cli_args_unset_leaves_none() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let cli = anvil::config::CliArgs::default();
+    config.apply_cli_args(&cli).expect("should apply");
+    assert!(
+        config.runtime.tag_protocol.is_none(),
+        "unset CLI arg should leave tag_protocol as None"
+    );
+}

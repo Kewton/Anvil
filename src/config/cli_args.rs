@@ -80,4 +80,31 @@ pub struct CliArgs {
     /// Auto-approve built-in tool execution (MCP tools require individual trust)
     #[arg(long)]
     pub trust: bool,
+
+    /// Enable tag-based tool protocol (--tag-protocol).
+    #[arg(long = "tag-protocol")]
+    tag_protocol_flag: bool,
+
+    /// Force JSON tool protocol (--no-tag-protocol).
+    #[arg(long = "no-tag-protocol")]
+    no_tag_protocol_flag: bool,
+
+    /// Computed tag_protocol value: Some(true) for --tag-protocol,
+    /// Some(false) for --no-tag-protocol, None when neither is specified.
+    /// Not parsed from CLI args directly.
+    #[arg(skip)]
+    pub tag_protocol: Option<bool>,
+}
+
+impl CliArgs {
+    /// Resolve the `tag_protocol` field from the raw CLI flags.
+    /// Call this after `clap::Parser::parse()` to compute the final value.
+    pub fn resolve_tag_protocol(&mut self) {
+        if self.tag_protocol_flag {
+            self.tag_protocol = Some(true);
+        } else if self.no_tag_protocol_flag {
+            self.tag_protocol = Some(false);
+        }
+        // Otherwise remains None (auto-detect)
+    }
 }
