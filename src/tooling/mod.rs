@@ -830,12 +830,23 @@ pub struct LocalToolExecutor {
     web_search_provider: WebSearchProvider,
     serper_api_key: Option<String>,
     shutdown_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    http_client: reqwest::blocking::Client,
+}
+
+/// Build the shared HTTP client used by tooling (web.fetch / web.search).
+fn build_tooling_http_client() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("Failed to build HTTP client for tooling")
 }
 
 #[derive(Debug)]
 pub enum ToolRuntimeError {
     InvalidPath(String),
     Io(String),
+    CaptchaBlocked { query: String },
 }
 
 impl Display for ToolRuntimeError {
@@ -843,6 +854,12 @@ impl Display for ToolRuntimeError {
         match self {
             Self::InvalidPath(path) => write!(f, "invalid tool path: {path}"),
             Self::Io(message) => write!(f, "{message}"),
+            Self::CaptchaBlocked { query } => write!(
+                f,
+                "DuckDuckGo search for '{query}' blocked by CAPTCHA. \
+                 Consider setting SERPER_API_KEY for automatic fallback, \
+                 or use web.fetch to access specific URLs directly."
+            ),
         }
     }
 }
@@ -862,6 +879,7 @@ impl LocalToolExecutor {
             web_search_provider: config.web_search_provider,
             serper_api_key: config.serper_api_key.clone(),
             shutdown_flag: None,
+            http_client: build_tooling_http_client(),
         }
     }
 
@@ -874,7 +892,15 @@ impl LocalToolExecutor {
             web_search_provider: WebSearchProvider::DuckDuckGo,
             serper_api_key: None,
             shutdown_flag: None,
+            http_client: build_tooling_http_client(),
         }
+    }
+
+    /// Create an executor with a Serper API key set (for testing fallback).
+    pub fn new_test_with_serper_key(root: impl Into<PathBuf>, key: String) -> Self {
+        let mut executor = Self::new_without_rate_limit(root);
+        executor.serper_api_key = Some(key);
+        executor
     }
 
     /// Set the shutdown flag for graceful shutdown support.
@@ -1153,40 +1179,44 @@ impl LocalToolExecutor {
         url: &str,
         started: Instant,
     ) -> Result<ToolExecutionResult, ToolRuntimeError> {
-        let output = std::process::Command::new("curl")
-            .args([
-                "-s",
-                "-L",
-                "--fail",
-                "--max-time",
-                "30",
-                "--max-filesize",
-                "1048576",
-                "--max-redirs",
-                "5",
-                "--",
-                url,
-            ])
-            .output()
-            .map_err(|err| {
-                ToolRuntimeError::Io(format!("web.fetch failed to spawn curl: {err}"))
-            })?;
-
-        if output.status.success() {
-            let body = String::from_utf8_lossy(&output.stdout).to_string();
-            Ok(build_completed_result(
-                request,
-                url.to_string(),
-                ToolExecutionPayload::Text(body),
-                Vec::new(),
-                started,
-            ))
-        } else {
-            let stderr_msg = String::from_utf8_lossy(&output.stderr).to_string();
-            Err(ToolRuntimeError::Io(format!(
-                "web.fetch failed for {url}: {stderr_msg}"
-            )))
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            return Err(ToolRuntimeError::Io(
+                "Only http/https URLs allowed".to_string(),
+            ));
         }
+        let response = self
+            .http_client
+            .get(url)
+            .send()
+            .map_err(|err| ToolRuntimeError::Io(format!("web.fetch failed: {err}")))?;
+        if !response.status().is_success() {
+            return Err(ToolRuntimeError::Io(format!(
+                "web.fetch failed for {url}: HTTP {}",
+                response.status()
+            )));
+        }
+        if let Some(len) = response.content_length()
+            && len > 1_048_576
+        {
+            return Err(ToolRuntimeError::Io(
+                "Response too large (>1MB)".to_string(),
+            ));
+        }
+        let max_size: u64 = 1_048_576;
+        let mut body_bytes = Vec::new();
+        use std::io::Read;
+        response
+            .take(max_size)
+            .read_to_end(&mut body_bytes)
+            .map_err(|err| ToolRuntimeError::Io(format!("web.fetch read error: {err}")))?;
+        let body = String::from_utf8_lossy(&body_bytes).to_string();
+        Ok(build_completed_result(
+            request,
+            url.to_string(),
+            ToolExecutionPayload::Text(body),
+            Vec::new(),
+            started,
+        ))
     }
 
     fn execute_shell_exec(
@@ -1305,7 +1335,14 @@ impl LocalToolExecutor {
 
         match self.web_search_provider {
             WebSearchProvider::DuckDuckGo => {
-                self.execute_web_search_duckduckgo(request, query, started)
+                match self.execute_web_search_duckduckgo(request, query, started) {
+                    Err(ToolRuntimeError::CaptchaBlocked { .. })
+                        if self.serper_api_key.is_some() =>
+                    {
+                        self.execute_web_search_serper(request, query, started)
+                    }
+                    other => other,
+                }
             }
             WebSearchProvider::SerperApi => self.execute_web_search_serper(request, query, started),
         }
@@ -1318,47 +1355,56 @@ impl LocalToolExecutor {
         started: Instant,
     ) -> Result<ToolExecutionResult, ToolRuntimeError> {
         let encoded_query = percent_encode(query);
-        let url = format!("https://html.duckduckgo.com/html/?q={encoded_query}");
 
-        let output = std::process::Command::new("curl")
-            .args([
-                "-s",
-                "-L",
-                "--fail",
-                "--max-time",
-                "15",
-                "-H",
-                "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "--",
-            ])
-            .arg(&url)
-            .output()
-            .map_err(|err| {
-                ToolRuntimeError::Io(format!("web.search failed to spawn curl: {err}"))
-            })?;
+        // Resolve locale parameters for CJK languages
+        let locale_params = detect_system_locale().and_then(|lang| resolve_locale_params(&lang));
 
-        if !output.status.success() {
-            return Err(ToolRuntimeError::Io(
-                "DuckDuckGo search failed. CAPTCHA/rate limit may be active. Please wait and retry."
-                    .to_string(),
-            ));
+        let url = if let Some(ref lp) = locale_params {
+            format!(
+                "https://html.duckduckgo.com/html/?q={encoded_query}&kl={}",
+                lp.kl
+            )
+        } else {
+            format!("https://html.duckduckgo.com/html/?q={encoded_query}")
+        };
+
+        let mut request_builder = self
+            .http_client
+            .get(&url)
+            .header(
+                "User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            );
+
+        // Add Accept-Language header for CJK locales
+        if let Some(ref lp) = locale_params {
+            request_builder = request_builder.header("Accept-Language", &lp.accept_language);
         }
 
-        let body = String::from_utf8_lossy(&output.stdout).to_string();
+        let response = request_builder
+            .send()
+            .map_err(|err| {
+                ToolRuntimeError::Io(format!("web.search failed: {err}"))
+            })?;
+
+        if !response.status().is_success() {
+            return Err(ToolRuntimeError::CaptchaBlocked {
+                query: query.to_string(),
+            });
+        }
+
+        let body = response
+            .text()
+            .map_err(|err| ToolRuntimeError::Io(format!("web.search read error: {err}")))?;
 
         // Parse results using regex
         let results = parse_duckduckgo_results(&body);
 
-        // CAPTCHA / bot detection
-        if results.is_empty() {
-            let lower = body.to_ascii_lowercase();
-            let has_result_elements = lower.contains("result__a");
-            if !has_result_elements && (lower.contains("captcha") || lower.contains("bot")) {
-                return Err(ToolRuntimeError::Io(
-                    "DuckDuckGo search blocked by CAPTCHA/rate limit. Please wait and retry."
-                        .to_string(),
-                ));
-            }
+        // CAPTCHA detection using pure function
+        if is_captcha_response(&body, results.len()) {
+            return Err(ToolRuntimeError::CaptchaBlocked {
+                query: query.to_string(),
+            });
         }
 
         let formatted = format_search_results(&results);
@@ -1383,55 +1429,29 @@ impl LocalToolExecutor {
         })?;
 
         let body = serde_json::json!({"q": query}).to_string();
-        let header_value = format!("X-API-KEY: {api_key}");
 
-        let output = std::process::Command::new("curl")
-            .args([
-                "-s",
-                "-o",
-                "-",
-                "-w",
-                "\n%{http_code}",
-                "--max-time",
-                "10",
-                "-H",
-                &header_value,
-                "-H",
-                "Content-Type: application/json",
-                "-d",
-                &body,
-                "--",
-                "https://google.serper.dev/search",
-            ])
-            .output()
+        let response = self
+            .http_client
+            .post("https://google.serper.dev/search")
+            .header("X-API-KEY", api_key)
+            .header("Content-Type", "application/json")
+            .body(body)
+            .send()
             .map_err(|err| {
                 ToolRuntimeError::Io(format!(
-                    "web.search (SerperAPI) failed to spawn curl: {err}"
+                    "Failed to reach SerperAPI. Check your network connection. {err}"
                 ))
             })?;
 
-        if !output.status.success() {
-            let stderr_msg = String::from_utf8_lossy(&output.stderr).to_string();
-            return Err(ToolRuntimeError::Io(format!(
-                "Failed to reach SerperAPI. Check your network connection. {stderr_msg}"
-            )));
-        }
-
-        let raw_output = String::from_utf8_lossy(&output.stdout).to_string();
-        // Extract HTTP status code from the last line (appended by -w '\n%{http_code}')
-        let (response_body, http_code) = match raw_output.rsplit_once('\n') {
-            Some((body, code)) => (body.to_string(), code.trim().to_string()),
-            None => (raw_output, String::new()),
-        };
-
-        match http_code.as_str() {
-            "200" => {} // success
-            "401" | "403" => {
+        let status = response.status().as_u16();
+        match status {
+            200 => {} // success
+            401 | 403 => {
                 return Err(ToolRuntimeError::Io(
                     "Invalid or expired SerperAPI key.".to_string(),
                 ));
             }
-            "429" => {
+            429 => {
                 return Err(ToolRuntimeError::Io(
                     "SerperAPI rate limit exceeded. Please wait and retry.".to_string(),
                 ));
@@ -1442,6 +1462,10 @@ impl LocalToolExecutor {
                 )));
             }
         }
+
+        let response_body = response
+            .text()
+            .map_err(|err| ToolRuntimeError::Io(format!("SerperAPI read error: {err}")))?;
         let results = parse_serper_results(&response_body);
         let formatted = format_search_results(&results);
 
@@ -2222,6 +2246,61 @@ fn combine_process_output(stdout: String, stderr: String) -> String {
     } else {
         format!("{stdout}--- stderr ---\n{stderr}")
     }
+}
+
+/// Locale parameters for DuckDuckGo search (CJK locale support).
+pub struct LocaleParams {
+    pub kl: String,
+    pub accept_language: String,
+}
+
+/// Resolve a LANG/LC_ALL string into DuckDuckGo locale parameters.
+/// Returns `None` for non-CJK locales (English, C, POSIX, etc.).
+pub fn resolve_locale_params(lang: &str) -> Option<LocaleParams> {
+    let prefix = lang
+        .split(['_', '.', '-'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match prefix.as_str() {
+        "ja" => Some(LocaleParams {
+            kl: "jp-ja".into(),
+            accept_language: "ja,en;q=0.9".into(),
+        }),
+        "zh" => Some(LocaleParams {
+            kl: "cn-zh".into(),
+            accept_language: "zh,en;q=0.9".into(),
+        }),
+        "ko" => Some(LocaleParams {
+            kl: "kr-kr".into(),
+            accept_language: "ko,en;q=0.9".into(),
+        }),
+        _ => None,
+    }
+}
+
+/// Detect the system locale from environment variables.
+fn detect_system_locale() -> Option<String> {
+    std::env::var("LC_ALL")
+        .or_else(|_| std::env::var("LANG"))
+        .ok()
+        .filter(|v| !v.is_empty())
+}
+
+/// Detect whether a DuckDuckGo response body indicates a CAPTCHA block.
+/// Returns `false` when search results are present (`results_count > 0`)
+/// or when result elements are found in the HTML.
+pub fn is_captcha_response(body: &str, results_count: usize) -> bool {
+    if results_count > 0 {
+        return false;
+    }
+    let lower = body.to_ascii_lowercase();
+    if lower.contains("result__a") {
+        return false;
+    }
+    let ddg_captcha = body.contains("Unfortunately, bots use DuckDuckGo too.");
+    let generic_captcha = lower.contains("captcha");
+    ddg_captcha || generic_captcha
 }
 
 /// Percent-encode a query string for use in URLs.

@@ -538,6 +538,24 @@ fn system_prompt_includes_agent_explore_and_plan_descriptions() {
 }
 
 #[test]
+fn system_prompt_includes_confirm_class_guidance() {
+    use anvil::agent::{ProjectLanguage, tool_protocol_system_prompt_all_tools};
+    let prompt = tool_protocol_system_prompt_all_tools(&[ProjectLanguage::Rust], None);
+    assert!(
+        prompt.contains("Tool approval"),
+        "system prompt must include confirm-class guidance section"
+    );
+    assert!(
+        prompt.contains("Do NOT ask the user for permission in natural language"),
+        "system prompt must instruct LLM not to double-confirm"
+    );
+    assert!(
+        prompt.contains("denied by user"),
+        "system prompt must explain denial handling"
+    );
+}
+
+#[test]
 fn build_subagent_system_prompt_explore_contains_expected_tools() {
     use anvil::agent::subagent::{SubAgentKind, build_subagent_system_prompt};
     let prompt = build_subagent_system_prompt(&SubAgentKind::Explore, false);

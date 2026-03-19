@@ -64,7 +64,7 @@
 - Actionable error guidance for startup failures
 - Symlink sandbox escape prevention (canonicalize check)
 - Dangerous command blocking (rm -rf, mkfs, dd, fork bombs)
-- Curl request timeout (ANVIL_CURL_TIMEOUT)
+- HTTP request timeout (ANVIL_HTTP_TIMEOUT, with ANVIL_CURL_TIMEOUT fallback)
 - Configurable limits: max_agent_iterations, max_console_messages, auto_compact_threshold, tool_result_max_chars
 - Graceful fallback when LLM produces unparseable follow-up output
 - Interactive line editing with rustyline (arrow keys, history)

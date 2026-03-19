@@ -134,6 +134,7 @@ impl MockAppExt for App {
                 tokens_per_sec_tenths: Some(325),
                 eval_tokens: Some(150),
                 eval_duration_ms: Some(4615),
+                ..Default::default()
             })
             .with_context_usage(
                 self.session().estimated_token_count(),

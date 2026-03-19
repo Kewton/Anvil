@@ -9,6 +9,7 @@ pub mod transport;
 
 use crate::agent::AgentEvent;
 use crate::config::EffectiveConfig;
+use crate::contracts::InferencePerformanceView;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -21,12 +22,13 @@ pub use ollama::{
     parse_model_list_from_tags_response, resolve_ollama_model_alias,
 };
 pub use transport::{
-    CurlHttpTransport, HttpResponse, HttpTransport, RetryConfig, RetryTransport, TcpHttpTransport,
-    classify_curl_error, classify_http_error, redact_secrets, sanitize_error_message,
+    HttpResponse, HttpTransport, ReqwestHttpTransport, RetryConfig, RetryTransport,
+    classify_http_error, classify_reqwest_error, http_timeout, redact_secrets,
+    sanitize_error_message,
 };
 
-/// Default transport used by provider clients: curl with retry wrapper.
-pub type DefaultTransport = RetryTransport<CurlHttpTransport>;
+/// Default transport used by provider clients: reqwest with retry wrapper.
+pub type DefaultTransport = RetryTransport<ReqwestHttpTransport>;
 
 /// Supported LLM provider backends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -287,6 +289,22 @@ impl From<&ProviderTurnError> for ProviderErrorKind {
     }
 }
 
+/// Build a Done AgentEvent from provider response (shared by ollama and openai).
+pub(crate) fn build_provider_done_event(
+    assistant_output: &str,
+    inference_performance: Option<InferencePerformanceView>,
+) -> AgentEvent {
+    AgentEvent::Done {
+        status: "Done. session saved".to_string(),
+        assistant_message: assistant_output.to_string(),
+        completion_summary: "Provider turn finished successfully.".to_string(),
+        saved_status: "session saved".to_string(),
+        tool_logs: Vec::new(),
+        elapsed_ms: 0,
+        inference_performance,
+    }
+}
+
 /// Abstraction over LLM provider communication.
 ///
 /// Implementors receive a request and emit [`ProviderEvent`]s via the
@@ -386,9 +404,12 @@ pub fn build_local_provider_client(
     config: &EffectiveConfig,
     shutdown_flag: Arc<AtomicBool>,
 ) -> Result<LocalProviderClient, ProviderBootstrapError> {
-    let curl_transport = CurlHttpTransport::with_shutdown_flag(Arc::clone(&shutdown_flag));
-    let transport =
-        RetryTransport::with_shutdown_flag(curl_transport, RetryConfig::default(), shutdown_flag);
+    let reqwest_transport = ReqwestHttpTransport::with_shutdown_flag(Arc::clone(&shutdown_flag));
+    let transport = RetryTransport::with_shutdown_flag(
+        reqwest_transport,
+        RetryConfig::default(),
+        shutdown_flag,
+    );
     match config.runtime.provider.as_str() {
         "ollama" => {
             let client = OllamaProviderClient::with_transport(

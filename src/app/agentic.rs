@@ -1044,11 +1044,12 @@ pub fn format_tool_result_message(result: &ToolExecutionResult, max_chars: usize
             format!("[tool result: {}] {}", result.tool_name, result.summary)
         }
         ToolExecutionPayload::Text(content) => {
-            let truncated = if content.len() > max_chars {
+            let truncated = if content.chars().count() > max_chars {
+                let cut: String = content.chars().take(max_chars).collect();
                 format!(
-                    "{}...\n[truncated, {} bytes total]",
-                    &content[..max_chars],
-                    content.len()
+                    "{}...\n[truncated, {} chars total]",
+                    cut,
+                    content.chars().count()
                 )
             } else {
                 content.clone()

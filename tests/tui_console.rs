@@ -18,7 +18,9 @@ fn tui_renders_status_line() {
     assert!(rendered.contains("Ready."));
     assert!(rendered.contains("provider=ollama"));
     assert!(rendered.contains("Enter to send"));
-    assert!(rendered.contains("[U] you >"));
+    // Issue #96: [U] you > is no longer rendered by render_console()
+    // for Ready/Done states — the interactive readline prompt handles it.
+    assert!(!rendered.contains("[U] you >"));
     assert!(rendered.contains("model:local-default"));
 }
 
@@ -490,6 +492,51 @@ fn busy_prompt_hints_include_slash_commands() {
     assert!(rendered.contains("[U] you > /status /help /plan"));
 }
 
+/// Issue #96: render_console() must NOT include `[U] you >` when state is
+/// Done or Ready, because the interactive readline prompt already displays it.
+#[test]
+fn done_frame_omits_user_prompt_to_avoid_duplicate() {
+    let mut app = common::build_app();
+    let tui = Tui::new();
+
+    app.record_user_input("msg_001", "hello")
+        .expect("user input should persist");
+    let _ = app
+        .mock_thinking_snapshot()
+        .expect("thinking snapshot should build");
+    let _ = app
+        .mock_working_snapshot()
+        .expect("working snapshot should build");
+    let _ = app
+        .mock_done_snapshot()
+        .expect("done snapshot should build");
+
+    let rendered = app.render_console(&tui).expect("render should succeed");
+
+    assert!(
+        !rendered.contains("[U] you >"),
+        "Done frame should not contain [U] you > (readline handles it). Got:\n{rendered}"
+    );
+}
+
+/// Issue #96: render_console() must NOT include `[U] you >` when state is
+/// Ready (initial state), because the interactive readline prompt handles it.
+#[test]
+fn ready_frame_omits_user_prompt_to_avoid_duplicate() {
+    let mut app = common::build_app();
+    let tui = Tui::new();
+
+    let _ = app
+        .initial_snapshot()
+        .expect("initial snapshot should build");
+    let rendered = app.render_console(&tui).expect("render should succeed");
+
+    assert!(
+        !rendered.contains("[U] you >"),
+        "Ready frame should not contain [U] you > (readline handles it). Got:\n{rendered}"
+    );
+}
+
 #[test]
 fn test_approval_view_serialize_skips_diff_preview() {
     let view = anvil::contracts::ApprovalView {
@@ -612,6 +659,7 @@ fn footer_shows_perf_with_metrics() {
             tokens_per_sec_tenths: Some(325),
             eval_tokens: Some(100),
             eval_duration_ms: Some(3077),
+            ..Default::default()
         });
 
     let context = anvil::contracts::ConsoleRenderContext {
