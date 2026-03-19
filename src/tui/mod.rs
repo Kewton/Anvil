@@ -24,10 +24,12 @@ impl Tui {
     }
 
     pub fn render_startup(&self, config: &EffectiveConfig, snapshot: &AppStateSnapshot) -> String {
-        let mode = if config.mode.approval_required {
-            "local / confirm"
-        } else {
+        let mode = if !config.mode.approval_required {
             "local / auto"
+        } else if config.mode.trust_all {
+            "local / trust"
+        } else {
+            "local / confirm"
         };
 
         let mut lines = vec![

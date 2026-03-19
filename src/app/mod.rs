@@ -17,7 +17,7 @@ use crate::contracts::{
     AppEvent, AppStateSnapshot, ConsoleRenderContext, ContextUsageView, ContextWarningLevel,
     RuntimeState,
 };
-use crate::extensions::{ExtensionLoadError, ExtensionRegistry, SlashCommandAction};
+use crate::extensions::{ExtensionLoadError, ExtensionRegistry, SlashCommandAction, TrustAction};
 use crate::provider::{
     ProviderBootstrapError, ProviderClient, ProviderErrorKind, ProviderErrorRecord, ProviderEvent,
     ProviderRuntimeContext, ProviderTurnError,
@@ -34,6 +34,7 @@ use crate::tooling::{
     RollbackPolicy, ToolKind, ToolRegistry, ToolSpec,
 };
 use crate::tui::Tui;
+use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -122,6 +123,10 @@ pub struct App {
     /// MCP server manager. `None` when mcp.json is absent or initialization failed.
     /// [D2-010] Declared last so it is dropped last (Drop order = declaration order).
     mcp_manager: Option<crate::mcp::McpManager>,
+    /// Trust mode: auto-approve built-in (non-MCP) tool execution.
+    trust_all: bool,
+    /// Individually trusted tool names (including MCP tools).
+    trusted_tools: HashSet<String>,
 }
 
 /// Whether the session loop should continue or exit.
@@ -337,6 +342,8 @@ impl App {
             );
         }
 
+        let trust_all = config.mode.trust_all;
+
         Ok(Self {
             tools,
             config,
@@ -351,6 +358,8 @@ impl App {
             checkpoint_stack: CheckpointStack::new(),
             hooks_engine,
             mcp_manager,
+            trust_all,
+            trusted_tools: HashSet::new(),
         })
     }
 
@@ -1280,6 +1289,57 @@ impl App {
                 frames: self.deny_and_abort(tui)?,
                 control: SessionControl::Continue,
             },
+            Some(SlashCommandAction::Trust(action)) => {
+                let msg = match action {
+                    TrustAction::Show => {
+                        if self.trust_all {
+                            let mut lines = vec![
+                                "Trust mode: ON (all)".to_string(),
+                                "  Trusted tools: (all non-MCP tools)".to_string(),
+                            ];
+                            if !self.trusted_tools.is_empty() {
+                                let mut tools: Vec<_> =
+                                    self.trusted_tools.iter().cloned().collect();
+                                tools.sort();
+                                lines.push(format!("  Individually trusted: {}", tools.join(", ")));
+                            }
+                            lines.join("\n")
+                        } else if !self.trusted_tools.is_empty() {
+                            let mut tools: Vec<_> = self.trusted_tools.iter().cloned().collect();
+                            tools.sort();
+                            let mut lines = vec!["Trust mode: ON (selective)".to_string()];
+                            lines.push("  Trusted tools:".to_string());
+                            for tool in &tools {
+                                lines.push(format!("    - {tool}"));
+                            }
+                            lines.join("\n")
+                        } else {
+                            "Trust mode: OFF\n  No tools are trusted. Use /trust <tool> or /trust all.".to_string()
+                        }
+                    }
+                    TrustAction::Tool(name) => {
+                        if self.tools.get(&name).is_some() {
+                            self.trusted_tools.insert(name.clone());
+                            format!("Trusted: {name}")
+                        } else {
+                            format!("Unknown tool: {name}. Use /trust to see trusted tools.")
+                        }
+                    }
+                    TrustAction::All => {
+                        self.trust_all = true;
+                        "Trust mode: ON (all non-MCP tools auto-approved)".to_string()
+                    }
+                    TrustAction::Off => {
+                        self.trust_all = false;
+                        self.trusted_tools.clear();
+                        "Trust mode: OFF".to_string()
+                    }
+                };
+                CliTurnOutput {
+                    frames: vec![msg],
+                    control: SessionControl::Continue,
+                }
+            }
             Some(SlashCommandAction::Reset) => {
                 let _ = self.reset_to_ready()?;
                 CliTurnOutput {

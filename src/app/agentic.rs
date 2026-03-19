@@ -19,6 +19,9 @@ use crate::tooling::{
 use crate::tui::Tui;
 use std::sync::atomic::Ordering;
 
+use crate::tooling::PermissionClass;
+use std::collections::HashSet;
+
 use super::policy::{OFFLINE_BLOCK_PAYLOAD, check_offline_blocked};
 use super::{App, AppError};
 
@@ -499,13 +502,27 @@ impl App {
             }
 
             if self.config.mode.approval_required && validated.approval_required(true).is_some() {
-                let summary = tool_call_approval_summary(call);
-                let diff_preview = generate_diff_preview(&self.config.paths.cwd, &call.input);
-                let approved = prompt_inline_approval(&summary, diff_preview.as_deref());
-                if !approved {
-                    failed_results
-                        .push((idx, build_failed_result(call, "denied by user".to_string())));
-                    continue;
+                if is_trusted(
+                    &call.tool_name,
+                    validated.spec.kind,
+                    validated.spec.permission_class,
+                    self.trust_all,
+                    &self.trusted_tools,
+                ) {
+                    let summary = tool_call_approval_summary(call);
+                    let _ = std::io::Write::write_fmt(
+                        &mut std::io::stderr(),
+                        format_args!("\n  [trusted] {summary}\n"),
+                    );
+                } else {
+                    let summary = tool_call_approval_summary(call);
+                    let diff_preview = generate_diff_preview(&self.config.paths.cwd, &call.input);
+                    let approved = prompt_inline_approval(&summary, diff_preview.as_deref());
+                    if !approved {
+                        failed_results
+                            .push((idx, build_failed_result(call, "denied by user".to_string())));
+                        continue;
+                    }
                 }
             }
             match validated
@@ -1070,5 +1087,103 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
     } else {
         let truncated: String = s.chars().take(max_chars).collect();
         format!("{truncated}...")
+    }
+}
+
+/// Determine whether a tool call should be auto-approved based on trust settings.
+///
+/// This is a pure function for testability; it does not access `App` state directly.
+pub(crate) fn is_trusted(
+    tool_name: &str,
+    kind: ToolKind,
+    permission_class: PermissionClass,
+    trust_all: bool,
+    trusted_tools: &HashSet<String>,
+) -> bool {
+    if permission_class == PermissionClass::Restricted {
+        return false;
+    }
+    if trust_all && kind != ToolKind::Mcp {
+        return true;
+    }
+    trusted_tools.contains(tool_name)
+}
+
+#[cfg(test)]
+mod trust_tests {
+    use super::*;
+
+    #[test]
+    fn trust_all_auto_approves_confirm_tools() {
+        let trusted_tools = HashSet::new();
+        assert!(is_trusted(
+            "shell.exec",
+            ToolKind::ShellExec,
+            PermissionClass::Confirm,
+            true,
+            &trusted_tools,
+        ));
+    }
+
+    #[test]
+    fn trust_all_blocks_restricted_tools() {
+        let trusted_tools = HashSet::new();
+        assert!(!is_trusted(
+            "some.restricted",
+            ToolKind::ShellExec,
+            PermissionClass::Restricted,
+            true,
+            &trusted_tools,
+        ));
+    }
+
+    #[test]
+    fn trust_all_blocks_mcp_tools() {
+        let trusted_tools = HashSet::new();
+        assert!(!is_trusted(
+            "mcp__github__create_issue",
+            ToolKind::Mcp,
+            PermissionClass::Confirm,
+            true,
+            &trusted_tools,
+        ));
+    }
+
+    #[test]
+    fn individual_trust_approves_specific_tool() {
+        let mut trusted_tools = HashSet::new();
+        trusted_tools.insert("file.edit".to_string());
+        assert!(is_trusted(
+            "file.edit",
+            ToolKind::FileEdit,
+            PermissionClass::Confirm,
+            false,
+            &trusted_tools,
+        ));
+    }
+
+    #[test]
+    fn individual_trust_allows_mcp() {
+        let mut trusted_tools = HashSet::new();
+        trusted_tools.insert("mcp__github__create_issue".to_string());
+        assert!(is_trusted(
+            "mcp__github__create_issue",
+            ToolKind::Mcp,
+            PermissionClass::Confirm,
+            false,
+            &trusted_tools,
+        ));
+    }
+
+    #[test]
+    fn untrusted_tool_returns_false() {
+        let trusted_tools = HashSet::new();
+        assert!(!is_trusted(
+            "file.edit",
+            ToolKind::FileEdit,
+            PermissionClass::Confirm,
+            false,
+            &trusted_tools,
+        ));
     }
 }

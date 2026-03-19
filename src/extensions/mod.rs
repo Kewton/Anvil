@@ -5,6 +5,15 @@ use skills::SkillScope;
 use std::fmt::{Display, Formatter};
 use std::path::{Path, PathBuf};
 
+/// Sub-actions for the /trust slash command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrustAction {
+    Show,
+    Tool(String),
+    All,
+    Off,
+}
+
 /// Action to perform when a slash command is invoked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlashCommandAction {
@@ -31,6 +40,7 @@ pub enum SlashCommandAction {
         content: String,
         skill_dir: PathBuf,
     },
+    Trust(TrustAction),
     Undo(usize),
 }
 
@@ -141,6 +151,9 @@ impl ExtensionRegistry {
             return Some(parsed);
         }
         if let Some(parsed) = parse_repo_command(command) {
+            return Some(parsed);
+        }
+        if let Some(parsed) = parse_trust_command(command) {
             return Some(parsed);
         }
         if let found @ Some(_) = self
@@ -260,6 +273,12 @@ pub fn builtin_slash_commands() -> Vec<SlashCommandSpec> {
             name: "/reset".to_string(),
             description: "return to Ready".to_string(),
             action: SlashCommandAction::Reset,
+            scope: None,
+        },
+        SlashCommandSpec {
+            name: "/trust".to_string(),
+            description: "show or manage trust settings (/trust [all|off|<tool>])".to_string(),
+            action: SlashCommandAction::Trust(TrustAction::Show),
             scope: None,
         },
         SlashCommandSpec {
@@ -397,4 +416,90 @@ fn parse_repo_command(command: &str) -> Option<SlashCommandSpec> {
         action: SlashCommandAction::RepoFind(query.to_string()),
         scope: None,
     })
+}
+
+fn parse_trust_command(command: &str) -> Option<SlashCommandSpec> {
+    if command == "/trust" {
+        return Some(SlashCommandSpec {
+            name: "/trust".to_string(),
+            description: "show current trust settings".to_string(),
+            action: SlashCommandAction::Trust(TrustAction::Show),
+            scope: None,
+        });
+    }
+
+    let rest = command.strip_prefix("/trust ")?.trim();
+    if rest.is_empty() {
+        return Some(SlashCommandSpec {
+            name: "/trust".to_string(),
+            description: "show current trust settings".to_string(),
+            action: SlashCommandAction::Trust(TrustAction::Show),
+            scope: None,
+        });
+    }
+
+    let action = match rest {
+        "all" => TrustAction::All,
+        "off" => TrustAction::Off,
+        tool_name => TrustAction::Tool(tool_name.to_string()),
+    };
+
+    Some(SlashCommandSpec {
+        name: "/trust".to_string(),
+        description: "manage trust settings".to_string(),
+        action: SlashCommandAction::Trust(action),
+        scope: None,
+    })
+}
+
+#[cfg(test)]
+mod trust_parse_tests {
+    use super::*;
+
+    #[test]
+    fn parse_trust_show() {
+        let result = parse_trust_command("/trust").unwrap();
+        assert_eq!(result.action, SlashCommandAction::Trust(TrustAction::Show));
+    }
+
+    #[test]
+    fn parse_trust_show_with_trailing_space() {
+        let result = parse_trust_command("/trust ").unwrap();
+        assert_eq!(result.action, SlashCommandAction::Trust(TrustAction::Show));
+    }
+
+    #[test]
+    fn parse_trust_all() {
+        let result = parse_trust_command("/trust all").unwrap();
+        assert_eq!(result.action, SlashCommandAction::Trust(TrustAction::All));
+    }
+
+    #[test]
+    fn parse_trust_off() {
+        let result = parse_trust_command("/trust off").unwrap();
+        assert_eq!(result.action, SlashCommandAction::Trust(TrustAction::Off));
+    }
+
+    #[test]
+    fn parse_trust_tool() {
+        let result = parse_trust_command("/trust file.edit").unwrap();
+        assert_eq!(
+            result.action,
+            SlashCommandAction::Trust(TrustAction::Tool("file.edit".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_trust_mcp_tool() {
+        let result = parse_trust_command("/trust mcp__github__create_issue").unwrap();
+        assert_eq!(
+            result.action,
+            SlashCommandAction::Trust(TrustAction::Tool("mcp__github__create_issue".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_non_trust_command_returns_none() {
+        assert!(parse_trust_command("/help").is_none());
+    }
 }
