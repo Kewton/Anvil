@@ -125,6 +125,10 @@ pub struct InferencePerformanceView {
     pub eval_tokens: Option<u64>,
     /// Evaluation time in milliseconds (for session persistence / debug)
     pub eval_duration_ms: Option<u64>,
+    /// Actual prompt token count from provider response.
+    /// Ollama: `prompt_eval_count`, OpenAI: `prompt_tokens`.
+    #[serde(default)]
+    pub prompt_tokens: Option<u64>,
 }
 
 impl InferencePerformanceView {
@@ -506,6 +510,7 @@ mod tests {
             tokens_per_sec_tenths: Some(325),
             eval_tokens: Some(100),
             eval_duration_ms: Some(3077),
+            ..Default::default()
         };
         assert_eq!(
             perf.formatted_tokens_per_sec(),
@@ -517,8 +522,7 @@ mod tests {
     fn inference_performance_formatted_tokens_per_sec_zero_fraction() {
         let perf = InferencePerformanceView {
             tokens_per_sec_tenths: Some(100),
-            eval_tokens: None,
-            eval_duration_ms: None,
+            ..Default::default()
         };
         assert_eq!(
             perf.formatted_tokens_per_sec(),
@@ -529,9 +533,9 @@ mod tests {
     #[test]
     fn inference_performance_formatted_tokens_per_sec_none_when_no_tenths() {
         let perf = InferencePerformanceView {
-            tokens_per_sec_tenths: None,
             eval_tokens: Some(50),
             eval_duration_ms: Some(1000),
+            ..Default::default()
         };
         assert_eq!(perf.formatted_tokens_per_sec(), None);
     }
@@ -542,6 +546,7 @@ mod tests {
             tokens_per_sec_tenths: Some(325),
             eval_tokens: Some(100),
             eval_duration_ms: Some(3077),
+            ..Default::default()
         };
         let json = serde_json::to_string(&perf).expect("serialize");
         let back: InferencePerformanceView = serde_json::from_str(&json).expect("deserialize");
@@ -563,11 +568,35 @@ mod tests {
     }
 
     #[test]
+    fn inference_perf_without_prompt_tokens() {
+        // Old JSON without prompt_tokens field should still deserialize
+        let json = r#"{"tokens_per_sec_tenths":325,"eval_tokens":100,"eval_duration_ms":3077}"#;
+        let perf: InferencePerformanceView = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(perf.tokens_per_sec_tenths, Some(325));
+        assert_eq!(perf.prompt_tokens, None);
+    }
+
+    #[test]
+    fn inference_perf_with_prompt_tokens() {
+        let perf = InferencePerformanceView {
+            tokens_per_sec_tenths: Some(325),
+            eval_tokens: Some(100),
+            eval_duration_ms: Some(3077),
+            prompt_tokens: Some(500),
+        };
+        let json = serde_json::to_string(&perf).expect("serialize");
+        let back: InferencePerformanceView = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(perf, back);
+        assert_eq!(back.prompt_tokens, Some(500));
+    }
+
+    #[test]
     fn app_state_snapshot_with_inference_performance_builder() {
         let perf = InferencePerformanceView {
             tokens_per_sec_tenths: Some(200),
             eval_tokens: Some(80),
             eval_duration_ms: Some(4000),
+            ..Default::default()
         };
         let snapshot =
             AppStateSnapshot::new(RuntimeState::Done).with_inference_performance(perf.clone());

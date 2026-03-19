@@ -2089,7 +2089,7 @@ fn classify_http_error_299_returns_backend() {
 fn sanitize_error_message_truncates_to_500_chars() {
     let long_message = "a".repeat(600);
     let sanitized = sanitize_error_message(&long_message);
-    assert!(sanitized.contains("... [truncated, 600 bytes total]"));
+    assert!(sanitized.contains("... [truncated, 600 chars total]"));
     assert!(sanitized.len() < 600);
 }
 
@@ -2098,6 +2098,26 @@ fn sanitize_error_message_short_message_unchanged() {
     let msg = "short error";
     let sanitized = sanitize_error_message(msg);
     assert_eq!(sanitized, "short error");
+}
+
+#[test]
+fn sanitize_error_message_truncates_multibyte_safely() {
+    // 200 CJK characters (each 3 bytes = 600 bytes total).
+    // With a 500-char limit this should truncate without panic.
+    let cjk_message: String = "競".repeat(600);
+    let sanitized = sanitize_error_message(&cjk_message);
+    assert!(sanitized.contains("truncated"));
+}
+
+#[test]
+fn sanitize_error_message_boundary_multibyte() {
+    // 499 ASCII + one 3-byte CJK + more text.  The 500th char is CJK.
+    let mut msg = "x".repeat(499);
+    msg.push('競');
+    msg.push_str(&"y".repeat(100));
+    // Must not panic
+    let sanitized = sanitize_error_message(&msg);
+    assert!(sanitized.contains("truncated"));
 }
 
 #[test]

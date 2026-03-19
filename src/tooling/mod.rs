@@ -834,6 +834,7 @@ fn build_tooling_http_client() -> reqwest::blocking::Client {
 pub enum ToolRuntimeError {
     InvalidPath(String),
     Io(String),
+    CaptchaBlocked { query: String },
 }
 
 impl Display for ToolRuntimeError {
@@ -841,6 +842,12 @@ impl Display for ToolRuntimeError {
         match self {
             Self::InvalidPath(path) => write!(f, "invalid tool path: {path}"),
             Self::Io(message) => write!(f, "{message}"),
+            Self::CaptchaBlocked { query } => write!(
+                f,
+                "DuckDuckGo search for '{query}' blocked by CAPTCHA. \
+                 Consider setting SERPER_API_KEY for automatic fallback, \
+                 or use web.fetch to access specific URLs directly."
+            ),
         }
     }
 }
@@ -875,6 +882,13 @@ impl LocalToolExecutor {
             shutdown_flag: None,
             http_client: build_tooling_http_client(),
         }
+    }
+
+    /// Create an executor with a Serper API key set (for testing fallback).
+    pub fn new_test_with_serper_key(root: impl Into<PathBuf>, key: String) -> Self {
+        let mut executor = Self::new_without_rate_limit(root);
+        executor.serper_api_key = Some(key);
+        executor
     }
 
     /// Set the shutdown flag for graceful shutdown support.
@@ -1309,7 +1323,14 @@ impl LocalToolExecutor {
 
         match self.web_search_provider {
             WebSearchProvider::DuckDuckGo => {
-                self.execute_web_search_duckduckgo(request, query, started)
+                match self.execute_web_search_duckduckgo(request, query, started) {
+                    Err(ToolRuntimeError::CaptchaBlocked { .. })
+                        if self.serper_api_key.is_some() =>
+                    {
+                        self.execute_web_search_serper(request, query, started)
+                    }
+                    other => other,
+                }
             }
             WebSearchProvider::SerperApi => self.execute_web_search_serper(request, query, started),
         }
@@ -1322,25 +1343,42 @@ impl LocalToolExecutor {
         started: Instant,
     ) -> Result<ToolExecutionResult, ToolRuntimeError> {
         let encoded_query = percent_encode(query);
-        let url = format!("https://html.duckduckgo.com/html/?q={encoded_query}");
 
-        let response = self
+        // Resolve locale parameters for CJK languages
+        let locale_params = detect_system_locale().and_then(|lang| resolve_locale_params(&lang));
+
+        let url = if let Some(ref lp) = locale_params {
+            format!(
+                "https://html.duckduckgo.com/html/?q={encoded_query}&kl={}",
+                lp.kl
+            )
+        } else {
+            format!("https://html.duckduckgo.com/html/?q={encoded_query}")
+        };
+
+        let mut request_builder = self
             .http_client
             .get(&url)
             .header(
                 "User-Agent",
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            )
+            );
+
+        // Add Accept-Language header for CJK locales
+        if let Some(ref lp) = locale_params {
+            request_builder = request_builder.header("Accept-Language", &lp.accept_language);
+        }
+
+        let response = request_builder
             .send()
             .map_err(|err| {
                 ToolRuntimeError::Io(format!("web.search failed: {err}"))
             })?;
 
         if !response.status().is_success() {
-            return Err(ToolRuntimeError::Io(
-                "DuckDuckGo search failed. CAPTCHA/rate limit may be active. Please wait and retry."
-                    .to_string(),
-            ));
+            return Err(ToolRuntimeError::CaptchaBlocked {
+                query: query.to_string(),
+            });
         }
 
         let body = response
@@ -1350,16 +1388,11 @@ impl LocalToolExecutor {
         // Parse results using regex
         let results = parse_duckduckgo_results(&body);
 
-        // CAPTCHA / bot detection
-        if results.is_empty() {
-            let lower = body.to_ascii_lowercase();
-            let has_result_elements = lower.contains("result__a");
-            if !has_result_elements && (lower.contains("captcha") || lower.contains("bot")) {
-                return Err(ToolRuntimeError::Io(
-                    "DuckDuckGo search blocked by CAPTCHA/rate limit. Please wait and retry."
-                        .to_string(),
-                ));
-            }
+        // CAPTCHA detection using pure function
+        if is_captcha_response(&body, results.len()) {
+            return Err(ToolRuntimeError::CaptchaBlocked {
+                query: query.to_string(),
+            });
         }
 
         let formatted = format_search_results(&results);
@@ -2201,6 +2234,61 @@ fn combine_process_output(stdout: String, stderr: String) -> String {
     } else {
         format!("{stdout}--- stderr ---\n{stderr}")
     }
+}
+
+/// Locale parameters for DuckDuckGo search (CJK locale support).
+pub struct LocaleParams {
+    pub kl: String,
+    pub accept_language: String,
+}
+
+/// Resolve a LANG/LC_ALL string into DuckDuckGo locale parameters.
+/// Returns `None` for non-CJK locales (English, C, POSIX, etc.).
+pub fn resolve_locale_params(lang: &str) -> Option<LocaleParams> {
+    let prefix = lang
+        .split(['_', '.', '-'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match prefix.as_str() {
+        "ja" => Some(LocaleParams {
+            kl: "jp-ja".into(),
+            accept_language: "ja,en;q=0.9".into(),
+        }),
+        "zh" => Some(LocaleParams {
+            kl: "cn-zh".into(),
+            accept_language: "zh,en;q=0.9".into(),
+        }),
+        "ko" => Some(LocaleParams {
+            kl: "kr-kr".into(),
+            accept_language: "ko,en;q=0.9".into(),
+        }),
+        _ => None,
+    }
+}
+
+/// Detect the system locale from environment variables.
+fn detect_system_locale() -> Option<String> {
+    std::env::var("LC_ALL")
+        .or_else(|_| std::env::var("LANG"))
+        .ok()
+        .filter(|v| !v.is_empty())
+}
+
+/// Detect whether a DuckDuckGo response body indicates a CAPTCHA block.
+/// Returns `false` when search results are present (`results_count > 0`)
+/// or when result elements are found in the HTML.
+pub fn is_captcha_response(body: &str, results_count: usize) -> bool {
+    if results_count > 0 {
+        return false;
+    }
+    let lower = body.to_ascii_lowercase();
+    if lower.contains("result__a") {
+        return false;
+    }
+    let ddg_captcha = body.contains("Unfortunately, bots use DuckDuckGo too.");
+    let generic_captcha = lower.contains("captcha");
+    ddg_captcha || generic_captcha
 }
 
 /// Percent-encode a query string for use in URLs.

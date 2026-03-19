@@ -9,6 +9,7 @@ pub mod transport;
 
 use crate::agent::AgentEvent;
 use crate::config::EffectiveConfig;
+use crate::contracts::InferencePerformanceView;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -285,6 +286,22 @@ impl From<&ProviderTurnError> for ProviderErrorKind {
             ProviderTurnError::ModelNotFound { .. } => Self::ModelNotFound,
             ProviderTurnError::AuthenticationFailed { .. } => Self::AuthenticationFailed,
         }
+    }
+}
+
+/// Build a Done AgentEvent from provider response (shared by ollama and openai).
+pub(crate) fn build_provider_done_event(
+    assistant_output: &str,
+    inference_performance: Option<InferencePerformanceView>,
+) -> AgentEvent {
+    AgentEvent::Done {
+        status: "Done. session saved".to_string(),
+        assistant_message: assistant_output.to_string(),
+        completion_summary: "Provider turn finished successfully.".to_string(),
+        saved_status: "session saved".to_string(),
+        tool_logs: Vec::new(),
+        elapsed_ms: 0,
+        inference_performance,
     }
 }
 
