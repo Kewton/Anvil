@@ -5,6 +5,7 @@
 
 use crate::config::EffectiveConfig;
 use crate::contracts::{AppStateSnapshot, ToolLogView};
+use crate::extensions::skills::SkillScope;
 use crate::extensions::{ExtensionRegistry, SlashCommandSpec, builtin_slash_commands};
 use crate::tooling::{ToolExecutionPayload, ToolExecutionResult, ToolExecutionStatus};
 
@@ -31,8 +32,18 @@ pub fn render_help_frame() -> String {
 
 pub fn render_help_frame_for(commands: &[SlashCommandSpec]) -> String {
     let mut lines = vec!["Anvil slash commands".to_string(), String::new()];
+    let max_name_len = commands.iter().map(|s| s.name.len()).max().unwrap_or(10);
+    let width = max_name_len.max(10);
     for spec in commands {
-        lines.push(format!("{:<10} {}", spec.name, spec.description));
+        let scope_tag = match &spec.scope {
+            Some(SkillScope::User) => " [user]",
+            Some(SkillScope::Project) => " [project]",
+            None => "",
+        };
+        lines.push(format!(
+            "{:<width$} {}{}",
+            spec.name, spec.description, scope_tag
+        ));
     }
     lines.join("\n")
 }
@@ -76,15 +87,20 @@ pub fn render_provider_frame(
 }
 
 pub fn render_resume_header(config: &EffectiveConfig) -> String {
-    [
+    let mut lines = vec![
         "  --------------------------------------------------------------".to_string(),
         "  Resuming existing session".to_string(),
         format!("  Model   : {}", config.runtime.model),
         format!("  Context : {}k", config.runtime.context_window / 1_000),
         format!("  Project : {}", config.paths.cwd.display()),
-        "  --------------------------------------------------------------".to_string(),
-    ]
-    .join("\n")
+    ];
+
+    if config.project_instructions().is_some() {
+        lines.push("  ANVIL.md: loaded".to_string());
+    }
+
+    lines.push("  --------------------------------------------------------------".to_string());
+    lines.join("\n")
 }
 
 pub fn cli_prompt() -> &'static str {
@@ -95,12 +111,29 @@ pub fn slash_commands() -> Vec<SlashCommandSpec> {
     ExtensionRegistry::new().slash_commands().to_vec()
 }
 
+pub fn render_status_detail(snapshot: &AppStateSnapshot) -> String {
+    if let Some(usage) = &snapshot.context_usage {
+        format!(
+            "  tokens: {}/{} ({}%)",
+            usage.estimated_tokens,
+            usage.max_tokens,
+            usage.usage_percent()
+        )
+    } else {
+        "  tokens: -/-".to_string()
+    }
+}
+
 pub fn render_pending_approval_frame(snapshot: &AppStateSnapshot) -> String {
     if let Some(approval) = &snapshot.approval {
-        format!(
+        let mut text = format!(
             "[A] anvil > resolve the pending approval before starting a new turn\n  pending: {} {}\n  call: {}\n  use /approve or /deny",
             approval.tool_name, approval.summary, approval.tool_call_id
-        )
+        );
+        if let Some(diff) = &approval.diff_preview {
+            text.push_str(&format!("\n{}", crate::tui::colorize_diff(diff)));
+        }
+        text
     } else {
         "[A] anvil > resolve the pending approval before starting a new turn\n  use /approve or /deny"
             .to_string()

@@ -1,11 +1,13 @@
+use anvil::app::agentic::{ExecutionGroup, group_by_execution_mode};
 use anvil::tooling::{
-    ExecutionClass, LocalToolExecutor, ParallelExecutionPlan, ParallelExecutionPlanError,
-    PermissionClass, PlanModePolicy, RollbackPolicy, ToolCallRequest, ToolExecutionError,
-    ToolExecutionPayload, ToolExecutionPolicy, ToolExecutionRequest, ToolExecutionResult,
-    ToolExecutionStatus, ToolInput, ToolKind, ToolRegistry, ToolValidationError,
-    effective_permission_class, is_safe_shell_command,
+    ExecutionClass, ExecutionMode, LocalToolExecutor, ParallelExecutionPlan,
+    ParallelExecutionPlanError, PermissionClass, PlanModePolicy, RollbackPolicy, ToolCallRequest,
+    ToolExecutionError, ToolExecutionPayload, ToolExecutionPolicy, ToolExecutionRequest,
+    ToolExecutionResult, ToolExecutionStatus, ToolInput, ToolKind, ToolRegistry,
+    ToolValidationError, detect_image_mime,
 };
 use std::fs;
+use std::path::Path;
 
 fn build_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
@@ -660,232 +662,1837 @@ fn web_search_serde_round_trip() {
     assert_eq!(input, deserialized);
 }
 
-// --- is_safe_shell_command tests (23 cases) ---
+// --- is_safe_shell_command: gh api tests ---
 
-#[test]
-fn safe_shell_01_gh_api_get_is_safe() {
-    assert!(is_safe_shell_command("gh api repos/o/r/stats/contributors"));
+mod safe_shell_gh_api {
+    use anvil::tooling::is_safe_shell_command;
+
+    #[test]
+    fn get_is_safe() {
+        assert!(is_safe_shell_command("gh api repos/o/r/stats/contributors"));
+    }
+
+    #[test]
+    fn method_post_is_unsafe() {
+        assert!(!is_safe_shell_command(
+            "gh api --method POST repos/o/r/issues"
+        ));
+    }
+
+    #[test]
+    fn method_eq_post_is_unsafe() {
+        assert!(!is_safe_shell_command(
+            "gh api --method=POST repos/o/r/issues"
+        ));
+    }
+
+    #[test]
+    fn x_delete_is_unsafe() {
+        assert!(!is_safe_shell_command(
+            "gh api -X DELETE repos/o/r/issues/1"
+        ));
+    }
+
+    #[test]
+    fn xdelete_combined_is_unsafe() {
+        assert!(!is_safe_shell_command("gh api -XDELETE repos/o/r/issues/1"));
+    }
+
+    #[test]
+    fn pipe_is_unsafe() {
+        assert!(!is_safe_shell_command("gh api repos/o/r/issues | jq ."));
+    }
+
+    #[test]
+    fn semicolon_is_unsafe() {
+        assert!(!is_safe_shell_command("gh api repos/o/r/issues; rm -rf /"));
+    }
+
+    #[test]
+    fn input_flag_is_unsafe() {
+        assert!(!is_safe_shell_command(
+            "gh api --input data.json repos/o/r/issues"
+        ));
+    }
+
+    #[test]
+    fn input_eq_is_unsafe() {
+        assert!(!is_safe_shell_command(
+            "gh api --input=data.json repos/o/r/issues"
+        ));
+    }
+
+    #[test]
+    fn xput_is_unsafe() {
+        assert!(!is_safe_shell_command("gh api -XPUT repos/o/r/topics"));
+    }
+
+    #[test]
+    fn xpatch_is_unsafe() {
+        assert!(!is_safe_shell_command("gh api -XPATCH repos/o/r/issues/1"));
+    }
+
+    #[test]
+    fn url_with_method_in_path_is_safe() {
+        // Token-based splitting prevents false positive on URLs containing "--method-POST"
+        assert!(is_safe_shell_command(
+            "gh api repos/o/repo-with--method-POST/stats"
+        ));
+    }
+
+    #[test]
+    fn newline_bypass_is_unsafe() {
+        assert!(!is_safe_shell_command("gh api repos/o/r/issues\nrm -rf /"));
+    }
+
+    #[test]
+    fn f_flag_implicit_post_is_unsafe() {
+        assert!(!is_safe_shell_command(
+            "gh api -f title=hacked repos/o/r/issues"
+        ));
+    }
+
+    #[test]
+    fn field_flag_implicit_post_is_unsafe() {
+        assert!(!is_safe_shell_command(
+            "gh api --field title=hacked repos/o/r/issues"
+        ));
+    }
+
+    #[test]
+    fn f_uppercase_flag_implicit_post_is_unsafe() {
+        assert!(!is_safe_shell_command(
+            "gh api -F body=@file.txt repos/o/r/issues"
+        ));
+    }
+
+    #[test]
+    fn raw_field_implicit_post_is_unsafe() {
+        assert!(!is_safe_shell_command(
+            "gh api --raw-field body=test repos/o/r/issues"
+        ));
+    }
 }
 
-#[test]
-fn safe_shell_02_gh_api_method_post_is_unsafe() {
-    assert!(!is_safe_shell_command(
-        "gh api --method POST repos/o/r/issues"
-    ));
+// --- is_safe_shell_command: gh CLI / git / misc tests ---
+
+mod safe_shell_prefixes {
+    use anvil::tooling::is_safe_shell_command;
+
+    #[test]
+    fn git_log_is_safe() {
+        assert!(is_safe_shell_command("git log --oneline"));
+    }
+
+    #[test]
+    fn git_status_is_safe() {
+        assert!(is_safe_shell_command("git status"));
+    }
+
+    #[test]
+    fn curl_is_not_safe() {
+        assert!(!is_safe_shell_command("curl https://example.com"));
+    }
+
+    #[test]
+    fn gh_repo_view_web_is_unsafe() {
+        assert!(!is_safe_shell_command("gh repo view --web"));
+    }
+
+    #[test]
+    fn gh_repo_view_json_is_safe() {
+        assert!(is_safe_shell_command("gh repo view --json owner,name"));
+    }
+
+    #[test]
+    fn gh_issue_list_browse_is_unsafe() {
+        assert!(!is_safe_shell_command("gh issue list --browse"));
+    }
+
+    #[test]
+    fn cargo_build_is_safe() {
+        assert!(is_safe_shell_command("cargo build"));
+    }
+
+    #[test]
+    fn cargo_test_is_safe() {
+        assert!(is_safe_shell_command("cargo test"));
+    }
+
+    #[test]
+    fn cargo_clippy_is_safe() {
+        assert!(is_safe_shell_command("cargo clippy --all-targets"));
+    }
+
+    #[test]
+    fn cargo_fmt_check_is_safe() {
+        assert!(is_safe_shell_command("cargo fmt --check"));
+    }
+
+    #[test]
+    fn cargo_check_is_safe() {
+        assert!(is_safe_shell_command("cargo check"));
+    }
+
+    #[test]
+    fn npm_test_is_safe() {
+        assert!(is_safe_shell_command("npm test"));
+    }
+
+    #[test]
+    fn npx_jest_with_args_is_safe() {
+        assert!(is_safe_shell_command("npx jest src/tests"));
+    }
+
+    #[test]
+    fn npx_eslint_with_args_is_safe() {
+        assert!(is_safe_shell_command("npx eslint src/"));
+    }
+
+    #[test]
+    fn npx_prettier_check_is_safe() {
+        assert!(is_safe_shell_command("npx prettier --check src/"));
+    }
+
+    #[test]
+    fn git_branch_is_safe() {
+        assert!(is_safe_shell_command("git branch"));
+    }
+
+    #[test]
+    fn git_show_with_ref_is_safe() {
+        assert!(is_safe_shell_command("git show HEAD"));
+    }
+
+    #[test]
+    fn git_show_alone_is_not_safe() {
+        // "git show" without trailing space won't match "git show "
+        assert!(!is_safe_shell_command("git show"));
+    }
+
+    #[test]
+    fn git_remote_v_is_safe() {
+        assert!(is_safe_shell_command("git remote -v"));
+    }
+
+    #[test]
+    fn git_rev_parse_is_safe() {
+        assert!(is_safe_shell_command("git rev-parse HEAD"));
+    }
+
+    #[test]
+    fn gh_pr_view_is_safe() {
+        assert!(is_safe_shell_command("gh pr view 123"));
+    }
+
+    #[test]
+    fn gh_issue_view_is_safe() {
+        assert!(is_safe_shell_command("gh issue view 456"));
+    }
+
+    #[test]
+    fn gh_auth_status_is_safe() {
+        assert!(is_safe_shell_command("gh auth status"));
+    }
+
+    #[test]
+    fn which_is_safe() {
+        assert!(is_safe_shell_command("which rustc"));
+    }
+
+    #[test]
+    fn uname_is_safe() {
+        assert!(is_safe_shell_command("uname"));
+    }
+
+    #[test]
+    fn node_version_is_safe() {
+        assert!(is_safe_shell_command("node -v"));
+        assert!(is_safe_shell_command("node --version"));
+    }
+
+    #[test]
+    fn rustc_version_is_safe() {
+        assert!(is_safe_shell_command("rustc --version"));
+    }
+
+    #[test]
+    fn cargo_version_is_safe() {
+        assert!(is_safe_shell_command("cargo --version"));
+    }
+
+    #[test]
+    fn python_version_is_safe() {
+        assert!(is_safe_shell_command("python --version"));
+    }
+
+    #[test]
+    fn go_version_is_safe() {
+        assert!(is_safe_shell_command("go version"));
+    }
+
+    #[test]
+    fn lsof_i_is_safe() {
+        assert!(is_safe_shell_command("lsof -i"));
+    }
+
+    #[test]
+    fn pytest_is_safe() {
+        assert!(is_safe_shell_command("pytest"));
+        assert!(is_safe_shell_command("pytest tests/"));
+    }
+
+    #[test]
+    fn ruff_check_is_safe() {
+        assert!(is_safe_shell_command("ruff check ."));
+    }
+
+    #[test]
+    fn flake8_is_safe() {
+        assert!(is_safe_shell_command("flake8"));
+        assert!(is_safe_shell_command("flake8 src/"));
+    }
+
+    #[test]
+    fn go_test_is_safe() {
+        assert!(is_safe_shell_command("go test ./..."));
+    }
+
+    #[test]
+    fn go_vet_is_safe() {
+        assert!(is_safe_shell_command("go vet ./..."));
+    }
+
+    #[test]
+    fn golangci_lint_is_safe() {
+        assert!(is_safe_shell_command("golangci-lint run"));
+    }
+
+    #[test]
+    fn make_test_is_safe() {
+        assert!(is_safe_shell_command("make test"));
+    }
+
+    #[test]
+    fn make_check_is_safe() {
+        assert!(is_safe_shell_command("make check"));
+    }
 }
 
-#[test]
-fn safe_shell_03_gh_api_method_eq_post_is_unsafe() {
-    assert!(!is_safe_shell_command(
-        "gh api --method=POST repos/o/r/issues"
-    ));
-}
+// --- Injection vector tests ---
 
-#[test]
-fn safe_shell_04_gh_api_x_delete_is_unsafe() {
-    assert!(!is_safe_shell_command(
-        "gh api -X DELETE repos/o/r/issues/1"
-    ));
-}
+mod safe_shell_injection {
+    use anvil::tooling::is_safe_shell_command;
 
-#[test]
-fn safe_shell_05_gh_api_xdelete_combined_is_unsafe() {
-    assert!(!is_safe_shell_command("gh api -XDELETE repos/o/r/issues/1"));
-}
+    #[test]
+    fn cargo_test_chain_is_unsafe() {
+        assert!(!is_safe_shell_command("cargo test && rm -rf /"));
+    }
 
-#[test]
-fn safe_shell_06_gh_api_with_pipe_is_unsafe() {
-    assert!(!is_safe_shell_command("gh api repos/o/r/issues | jq ."));
-}
+    #[test]
+    fn git_log_redirect_is_unsafe() {
+        assert!(!is_safe_shell_command("git log > ~/.bashrc"));
+    }
 
-#[test]
-fn safe_shell_07_gh_api_with_semicolon_is_unsafe() {
-    assert!(!is_safe_shell_command("gh api repos/o/r/issues; rm -rf /"));
-}
-
-#[test]
-fn safe_shell_08_git_log_is_safe() {
-    assert!(is_safe_shell_command("git log --oneline"));
-}
-
-#[test]
-fn safe_shell_09_git_status_is_safe() {
-    assert!(is_safe_shell_command("git status"));
-}
-
-#[test]
-fn safe_shell_10_curl_is_not_safe() {
-    assert!(!is_safe_shell_command("curl https://example.com"));
-}
-
-#[test]
-fn safe_shell_11_gh_api_input_flag_is_unsafe() {
-    assert!(!is_safe_shell_command(
-        "gh api --input data.json repos/o/r/issues"
-    ));
-}
-
-#[test]
-fn safe_shell_12_gh_api_input_eq_is_unsafe() {
-    assert!(!is_safe_shell_command(
-        "gh api --input=data.json repos/o/r/issues"
-    ));
-}
-
-#[test]
-fn safe_shell_13_gh_api_xput_is_unsafe() {
-    assert!(!is_safe_shell_command("gh api -XPUT repos/o/r/topics"));
-}
-
-#[test]
-fn safe_shell_14_gh_api_xpatch_is_unsafe() {
-    assert!(!is_safe_shell_command("gh api -XPATCH repos/o/r/issues/1"));
-}
-
-#[test]
-fn safe_shell_15_gh_api_url_with_method_in_path_is_safe() {
-    // Token-based splitting prevents false positive on URLs containing "--method-POST"
-    assert!(is_safe_shell_command(
-        "gh api repos/o/repo-with--method-POST/stats"
-    ));
-}
-
-#[test]
-fn safe_shell_16_gh_api_newline_bypass_is_unsafe() {
-    assert!(!is_safe_shell_command("gh api repos/o/r/issues\nrm -rf /"));
-}
-
-#[test]
-fn safe_shell_17_gh_api_f_flag_implicit_post_is_unsafe() {
-    assert!(!is_safe_shell_command(
-        "gh api -f title=hacked repos/o/r/issues"
-    ));
-}
-
-#[test]
-fn safe_shell_18_gh_api_field_flag_implicit_post_is_unsafe() {
-    assert!(!is_safe_shell_command(
-        "gh api --field title=hacked repos/o/r/issues"
-    ));
-}
-
-#[test]
-fn safe_shell_19_gh_api_f_uppercase_flag_implicit_post_is_unsafe() {
-    assert!(!is_safe_shell_command(
-        "gh api -F body=@file.txt repos/o/r/issues"
-    ));
-}
-
-#[test]
-fn safe_shell_20_gh_api_raw_field_implicit_post_is_unsafe() {
-    assert!(!is_safe_shell_command(
-        "gh api --raw-field body=test repos/o/r/issues"
-    ));
-}
-
-#[test]
-fn safe_shell_21_gh_repo_view_web_is_unsafe() {
-    assert!(!is_safe_shell_command("gh repo view --web"));
-}
-
-#[test]
-fn safe_shell_22_gh_repo_view_json_is_safe() {
-    assert!(is_safe_shell_command("gh repo view --json owner,name"));
-}
-
-#[test]
-fn safe_shell_23_gh_issue_list_browse_is_unsafe() {
-    assert!(!is_safe_shell_command("gh issue list --browse"));
+    #[test]
+    fn git_status_input_redirect_is_unsafe() {
+        assert!(!is_safe_shell_command("git status < /etc/passwd"));
+    }
 }
 
 // --- effective_permission_class tests ---
 
-#[test]
-fn effective_permission_class_promotes_safe_shell_to_safe() {
-    let registry = build_registry();
-    let spec = registry.get("shell.exec").expect("shell.exec should exist");
-    let input = ToolInput::ShellExec {
-        command: "git status".to_string(),
-    };
-    assert_eq!(
-        effective_permission_class(&input, spec),
-        PermissionClass::Safe
-    );
-}
+mod effective_permission {
+    use anvil::tooling::{PermissionClass, ToolInput, ToolRegistry, effective_permission_class};
 
-#[test]
-fn effective_permission_class_keeps_unsafe_shell_as_confirm() {
-    let registry = build_registry();
-    let spec = registry.get("shell.exec").expect("shell.exec should exist");
-    let input = ToolInput::ShellExec {
-        command: "rm -rf target".to_string(),
-    };
-    assert_eq!(
-        effective_permission_class(&input, spec),
-        PermissionClass::Confirm
-    );
-}
+    fn build_registry() -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        registry.register_standard_tools();
+        registry
+    }
 
-#[test]
-fn effective_permission_class_web_search_stays_confirm() {
-    let registry = build_registry();
-    let spec = registry.get("web.search").expect("web.search should exist");
-    let input = ToolInput::WebSearch {
-        query: "rust error".to_string(),
-    };
-    assert_eq!(
-        effective_permission_class(&input, spec),
-        PermissionClass::Confirm
-    );
-}
+    #[test]
+    fn promotes_safe_shell_to_safe() {
+        let registry = build_registry();
+        let spec = registry.get("shell.exec").expect("shell.exec should exist");
+        let input = ToolInput::ShellExec {
+            command: "git status".to_string(),
+        };
+        assert_eq!(
+            effective_permission_class(&input, spec),
+            PermissionClass::Safe
+        );
+    }
 
-#[test]
-fn effective_permission_class_file_read_stays_safe() {
-    let registry = build_registry();
-    let spec = registry.get("file.read").expect("file.read should exist");
-    let input = ToolInput::FileRead {
-        path: "src/main.rs".to_string(),
-    };
-    assert_eq!(
-        effective_permission_class(&input, spec),
-        PermissionClass::Safe
-    );
+    #[test]
+    fn keeps_unsafe_shell_as_confirm() {
+        let registry = build_registry();
+        let spec = registry.get("shell.exec").expect("shell.exec should exist");
+        let input = ToolInput::ShellExec {
+            command: "rm -rf target".to_string(),
+        };
+        assert_eq!(
+            effective_permission_class(&input, spec),
+            PermissionClass::Confirm
+        );
+    }
+
+    #[test]
+    fn web_search_stays_confirm() {
+        let registry = build_registry();
+        let spec = registry.get("web.search").expect("web.search should exist");
+        let input = ToolInput::WebSearch {
+            query: "rust error".to_string(),
+        };
+        assert_eq!(
+            effective_permission_class(&input, spec),
+            PermissionClass::Confirm
+        );
+    }
+
+    #[test]
+    fn file_read_stays_safe() {
+        let registry = build_registry();
+        let spec = registry.get("file.read").expect("file.read should exist");
+        let input = ToolInput::FileRead {
+            path: "src/main.rs".to_string(),
+        };
+        assert_eq!(
+            effective_permission_class(&input, spec),
+            PermissionClass::Safe
+        );
+    }
 }
 
 // --- approval_required uses effective_permission_class ---
 
-#[test]
-fn approval_not_required_for_safe_shell_command() {
-    let registry = build_registry();
-    let validated = registry
-        .validate(ToolCallRequest::new(
-            "call_shell_safe",
+mod approval_with_effective_permission {
+    use anvil::tooling::{ToolCallRequest, ToolInput, ToolRegistry};
+
+    fn build_registry() -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        registry.register_standard_tools();
+        registry
+    }
+
+    #[test]
+    fn not_required_for_safe_shell_command() {
+        let registry = build_registry();
+        let validated = registry
+            .validate(ToolCallRequest::new(
+                "call_shell_safe",
+                "shell.exec",
+                ToolInput::ShellExec {
+                    command: "git status".to_string(),
+                },
+            ))
+            .expect("should validate");
+        assert!(
+            validated.approval_required(true).is_none(),
+            "safe shell commands should not require approval"
+        );
+    }
+
+    #[test]
+    fn required_for_unsafe_shell_command() {
+        let registry = build_registry();
+        let validated = registry
+            .validate(ToolCallRequest::new(
+                "call_shell_unsafe",
+                "shell.exec",
+                ToolInput::ShellExec {
+                    command: "curl https://example.com".to_string(),
+                },
+            ))
+            .expect("should validate");
+        assert!(
+            validated.approval_required(true).is_some(),
+            "unsafe shell commands should require approval"
+        );
+    }
+}
+
+// --- Blocked command validation tests ---
+
+mod blocked_commands {
+    use anvil::tooling::{ToolCallRequest, ToolInput, ToolRegistry, ToolValidationError};
+
+    fn build_registry() -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        registry.register_standard_tools();
+        registry
+    }
+
+    fn assert_blocked(command: &str, msg: &str) {
+        let registry = build_registry();
+        let err = registry
+            .validate(ToolCallRequest::new(
+                "call_001",
+                "shell.exec",
+                ToolInput::ShellExec {
+                    command: command.to_string(),
+                },
+            ))
+            .expect_err(msg);
+        match err {
+            ToolValidationError::DangerousCommand { .. } => {}
+            other => panic!("expected DangerousCommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rm_rf_root() {
+        assert_blocked("rm -rf /", "rm -rf / should be blocked");
+    }
+
+    #[test]
+    fn mkfs() {
+        assert_blocked("mkfs.ext4 /dev/sda", "mkfs should be blocked");
+    }
+
+    #[test]
+    fn rm_rf_home() {
+        assert_blocked("rm -rf ~", "rm -rf ~ should be blocked");
+    }
+
+    #[test]
+    fn dd_if() {
+        assert_blocked("dd if=/dev/zero of=/dev/sda", "dd if= should be blocked");
+    }
+
+    #[test]
+    fn fork_bomb() {
+        assert_blocked(":(){:|:&};:", "fork bomb should be blocked");
+    }
+
+    #[test]
+    fn process_substitution() {
+        assert_blocked("echo foo >(bar)", "process substitution should be blocked");
+    }
+
+    #[test]
+    fn git_commit_no_verify() {
+        let registry = build_registry();
+        let err = registry
+            .validate(ToolCallRequest::new(
+                "call_001",
+                "shell.exec",
+                ToolInput::ShellExec {
+                    command: "git commit --no-verify -m 'test'".to_string(),
+                },
+            ))
+            .expect_err("git commit --no-verify should be blocked");
+        match err {
+            ToolValidationError::DangerousCommand { reason, .. } => {
+                assert!(reason.contains("git hooks"));
+            }
+            other => panic!("expected DangerousCommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn git_push_no_verify() {
+        assert_blocked(
+            "git push --no-verify origin main",
+            "git push --no-verify should be blocked",
+        );
+    }
+
+    #[test]
+    fn git_merge_no_verify() {
+        assert_blocked(
+            "git merge --no-verify feature",
+            "git merge --no-verify should be blocked",
+        );
+    }
+
+    #[test]
+    fn git_commit_n_shorthand() {
+        let registry = build_registry();
+        let err = registry
+            .validate(ToolCallRequest::new(
+                "call_001",
+                "shell.exec",
+                ToolInput::ShellExec {
+                    command: "git commit -n -m 'test'".to_string(),
+                },
+            ))
+            .expect_err("git commit -n should be blocked");
+        match err {
+            ToolValidationError::DangerousCommand { reason, .. } => {
+                assert!(reason.contains("-n"));
+            }
+            other => panic!("expected DangerousCommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn npm_publish_no_verify_is_not_blocked() {
+        let registry = build_registry();
+        let result = registry.validate(ToolCallRequest::new(
+            "call_001",
             "shell.exec",
             ToolInput::ShellExec {
-                command: "git status".to_string(),
+                command: "npm publish --no-verify".to_string(),
+            },
+        ));
+        assert!(
+            result.is_ok(),
+            "npm publish --no-verify should not be blocked by git-specific patterns"
+        );
+    }
+
+    #[test]
+    fn safe_prefix_with_blocked_content_is_still_blocked() {
+        assert_blocked(
+            "git commit --no-verify",
+            "blocked patterns should be checked during validation",
+        );
+    }
+}
+
+// --- file.edit tests ---
+
+#[test]
+fn file_edit_validates_typed_tool_input() {
+    let registry = build_registry();
+    let valid = ToolCallRequest::new(
+        "call_edit_001",
+        "file.edit",
+        ToolInput::FileEdit {
+            path: "src/main.rs".to_string(),
+            old_string: "fn main()".to_string(),
+            new_string: "fn main() -> Result<(), Box<dyn std::error::Error>>".to_string(),
+        },
+    );
+    let validated = registry
+        .validate(valid)
+        .expect("matching typed input should validate");
+    assert_eq!(validated.spec.name, "file.edit");
+    assert_eq!(validated.spec.kind, ToolKind::FileEdit);
+}
+
+#[test]
+fn file_edit_spec_policies() {
+    let registry = build_registry();
+    let spec = registry.get("file.edit").expect("file.edit should exist");
+    assert_eq!(spec.version, 1);
+    assert_eq!(spec.execution_class, ExecutionClass::Mutating);
+    assert_eq!(spec.permission_class, PermissionClass::Confirm);
+    assert_eq!(
+        spec.execution_mode,
+        anvil::tooling::ExecutionMode::SequentialOnly
+    );
+    assert_eq!(spec.plan_mode, PlanModePolicy::AllowedWithScope);
+    assert_eq!(spec.rollback_policy, RollbackPolicy::CheckpointBeforeWrite);
+}
+
+#[test]
+fn file_edit_missing_path_error() {
+    let registry = build_registry();
+    let err = registry
+        .validate(ToolCallRequest::new(
+            "call_edit_002",
+            "file.edit",
+            ToolInput::FileEdit {
+                path: "".to_string(),
+                old_string: "hello".to_string(),
+                new_string: "world".to_string(),
             },
         ))
-        .expect("should validate");
-    assert!(
-        validated.approval_required(true).is_none(),
-        "safe shell commands should not require approval"
+        .expect_err("empty path should be rejected");
+    assert_eq!(
+        err,
+        ToolValidationError::MissingRequiredField("path".to_string())
     );
 }
 
 #[test]
-fn approval_required_for_unsafe_shell_command() {
+fn file_edit_missing_old_string_error() {
     let registry = build_registry();
-    let validated = registry
+    let err = registry
         .validate(ToolCallRequest::new(
-            "call_shell_unsafe",
-            "shell.exec",
-            ToolInput::ShellExec {
-                command: "curl https://example.com".to_string(),
+            "call_edit_003",
+            "file.edit",
+            ToolInput::FileEdit {
+                path: "src/main.rs".to_string(),
+                old_string: "".to_string(),
+                new_string: "world".to_string(),
             },
         ))
-        .expect("should validate");
-    assert!(
-        validated.approval_required(true).is_some(),
-        "unsafe shell commands should require approval"
+        .expect_err("empty old_string should be rejected");
+    assert_eq!(
+        err,
+        ToolValidationError::MissingRequiredField("old_string".to_string())
     );
+}
+
+#[test]
+fn file_edit_execution_replaces_unique_match() {
+    let root = std::env::temp_dir().join("anvil_file_edit_replace");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("dir should exist");
+    let file_path = root.join("test.txt");
+    fs::write(&file_path, "hello world").expect("write should succeed");
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
+    let result = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_edit_exec_001".to_string(),
+            spec: build_registry()
+                .get("file.edit")
+                .expect("file.edit spec")
+                .clone(),
+            input: ToolInput::FileEdit {
+                path: "./test.txt".to_string(),
+                old_string: "hello".to_string(),
+                new_string: "goodbye".to_string(),
+            },
+        })
+        .expect("edit should succeed");
+
+    assert_eq!(result.status, ToolExecutionStatus::Completed);
+    let content = fs::read_to_string(&file_path).expect("read should succeed");
+    assert_eq!(content, "goodbye world");
+}
+
+#[test]
+fn file_edit_old_string_not_found() {
+    let root = std::env::temp_dir().join("anvil_file_edit_not_found");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("dir should exist");
+    fs::write(root.join("test.txt"), "hello world").expect("write should succeed");
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
+    let err = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_edit_nf_001".to_string(),
+            spec: build_registry()
+                .get("file.edit")
+                .expect("file.edit spec")
+                .clone(),
+            input: ToolInput::FileEdit {
+                path: "./test.txt".to_string(),
+                old_string: "nonexistent".to_string(),
+                new_string: "replacement".to_string(),
+            },
+        })
+        .expect_err("should fail when old_string not found");
+
+    assert!(err.to_string().contains("not found"));
+}
+
+#[test]
+fn file_edit_old_string_multiple_matches() {
+    let root = std::env::temp_dir().join("anvil_file_edit_multi_match");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("dir should exist");
+    fs::write(root.join("test.txt"), "aaa bbb aaa").expect("write should succeed");
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
+    let err = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_edit_mm_001".to_string(),
+            spec: build_registry()
+                .get("file.edit")
+                .expect("file.edit spec")
+                .clone(),
+            input: ToolInput::FileEdit {
+                path: "./test.txt".to_string(),
+                old_string: "aaa".to_string(),
+                new_string: "ccc".to_string(),
+            },
+        })
+        .expect_err("should fail when old_string matches multiple times");
+
+    assert!(err.to_string().contains("found 2 times"));
+}
+
+#[test]
+fn file_edit_empty_new_string_deletes() {
+    let root = std::env::temp_dir().join("anvil_file_edit_delete");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("dir should exist");
+    let file_path = root.join("test.txt");
+    fs::write(&file_path, "hello world").expect("write should succeed");
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
+    let result = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_edit_del_001".to_string(),
+            spec: build_registry()
+                .get("file.edit")
+                .expect("file.edit spec")
+                .clone(),
+            input: ToolInput::FileEdit {
+                path: "./test.txt".to_string(),
+                old_string: " world".to_string(),
+                new_string: "".to_string(),
+            },
+        })
+        .expect("edit should succeed");
+
+    assert_eq!(result.status, ToolExecutionStatus::Completed);
+    let content = fs::read_to_string(&file_path).expect("read should succeed");
+    assert_eq!(content, "hello");
+}
+
+#[test]
+fn file_edit_noop_when_strings_equal() {
+    let root = std::env::temp_dir().join("anvil_file_edit_noop");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("dir should exist");
+    let file_path = root.join("test.txt");
+    fs::write(&file_path, "hello world").expect("write should succeed");
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
+    let result = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_edit_noop_001".to_string(),
+            spec: build_registry()
+                .get("file.edit")
+                .expect("file.edit spec")
+                .clone(),
+            input: ToolInput::FileEdit {
+                path: "./test.txt".to_string(),
+                old_string: "hello".to_string(),
+                new_string: "hello".to_string(),
+            },
+        })
+        .expect("noop edit should succeed");
+
+    assert_eq!(result.status, ToolExecutionStatus::Completed);
+    assert!(result.summary.contains("no changes"));
+    let content = fs::read_to_string(&file_path).expect("read should succeed");
+    assert_eq!(content, "hello world");
+}
+
+#[test]
+fn file_edit_file_not_found() {
+    let root = std::env::temp_dir().join("anvil_file_edit_no_file");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("dir should exist");
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
+    let err = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_edit_nofile_001".to_string(),
+            spec: build_registry()
+                .get("file.edit")
+                .expect("file.edit spec")
+                .clone(),
+            input: ToolInput::FileEdit {
+                path: "./nonexistent.txt".to_string(),
+                old_string: "hello".to_string(),
+                new_string: "world".to_string(),
+            },
+        })
+        .expect_err("should fail for nonexistent file");
+
+    assert!(err.to_string().contains("file.edit failed to read"));
+}
+
+#[test]
+fn file_edit_sandbox_escape_rejected() {
+    let root = std::env::temp_dir().join("anvil_file_edit_sandbox");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("dir should exist");
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
+    let err = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_edit_escape_001".to_string(),
+            spec: build_registry()
+                .get("file.edit")
+                .expect("file.edit spec")
+                .clone(),
+            input: ToolInput::FileEdit {
+                path: "../../../etc/passwd".to_string(),
+                old_string: "root".to_string(),
+                new_string: "hacked".to_string(),
+            },
+        })
+        .expect_err("should reject sandbox escape");
+
+    assert!(err.to_string().contains("invalid tool path"));
+}
+
+// ---- Diff preview tests ----
+
+use anvil::tooling::diff::{generate_diff_preview, is_binary_content};
+
+#[test]
+fn test_diff_preview_existing_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file_path = dir.path().join("hello.txt");
+    fs::write(&file_path, "line1\nline2\nline3\n").expect("write");
+
+    let input = ToolInput::FileWrite {
+        path: "hello.txt".to_string(),
+        content: "line1\nline2 modified\nline3\nline4\n".to_string(),
+    };
+    let result = generate_diff_preview(dir.path(), &input);
+    assert!(result.is_some());
+    let diff = result.unwrap();
+    assert!(diff.contains("-line2"));
+    assert!(diff.contains("+line2 modified"));
+    assert!(diff.contains("+line4"));
+}
+
+#[test]
+fn test_diff_preview_new_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = ToolInput::FileWrite {
+        path: "brand_new.txt".to_string(),
+        content: "first line\nsecond line\n".to_string(),
+    };
+    let result = generate_diff_preview(dir.path(), &input);
+    assert!(result.is_some());
+    let preview = result.unwrap();
+    assert!(preview.contains("(new file)"));
+    assert!(preview.contains("+first line"));
+    assert!(preview.contains("+second line"));
+}
+
+#[test]
+fn test_diff_preview_binary_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file_path = dir.path().join("binary.bin");
+    let mut content = vec![0u8; 100];
+    content[50] = 0; // NUL byte
+    fs::write(&file_path, &content).expect("write");
+
+    let input = ToolInput::FileWrite {
+        path: "binary.bin".to_string(),
+        content: "new content".to_string(),
+    };
+    let result = generate_diff_preview(dir.path(), &input);
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("binary file"));
+}
+
+#[test]
+fn test_diff_preview_large_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file_path = dir.path().join("big.txt");
+    // Create a file larger than 1MB
+    let big_content = "x".repeat(1_048_577);
+    fs::write(&file_path, &big_content).expect("write");
+
+    let input = ToolInput::FileWrite {
+        path: "big.txt".to_string(),
+        content: "replacement".to_string(),
+    };
+    let result = generate_diff_preview(dir.path(), &input);
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("file too large"));
+}
+
+#[test]
+fn test_diff_preview_large_diff() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file_path = dir.path().join("many_lines.txt");
+    // Create a file with many lines
+    let old_lines: Vec<String> = (0..100).map(|i| format!("old line {i}")).collect();
+    fs::write(&file_path, old_lines.join("\n")).expect("write");
+
+    let new_lines: Vec<String> = (0..100).map(|i| format!("new line {i}")).collect();
+    let input = ToolInput::FileWrite {
+        path: "many_lines.txt".to_string(),
+        content: new_lines.join("\n"),
+    };
+    let result = generate_diff_preview(dir.path(), &input);
+    assert!(result.is_some());
+    let diff = result.unwrap();
+    // Should be truncated
+    assert!(diff.contains("..."));
+    assert!(diff.contains("lines added"));
+    assert!(diff.contains("lines deleted"));
+}
+
+#[test]
+fn test_diff_preview_file_edit() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = ToolInput::FileEdit {
+        path: "some_file.rs".to_string(),
+        old_string: "fn old_function() {}".to_string(),
+        new_string: "fn new_function() {\n    println!(\"hello\");\n}".to_string(),
+    };
+    let result = generate_diff_preview(dir.path(), &input);
+    assert!(result.is_some());
+    let diff = result.unwrap();
+    assert!(diff.contains("-fn old_function() {}"));
+    assert!(diff.contains("+fn new_function() {"));
+}
+
+#[test]
+fn test_diff_preview_nonexistent_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = ToolInput::FileWrite {
+        path: "does_not_exist.txt".to_string(),
+        content: "hello world\n".to_string(),
+    };
+    let result = generate_diff_preview(dir.path(), &input);
+    assert!(result.is_some());
+    let preview = result.unwrap();
+    assert!(preview.contains("(new file)"));
+    assert!(preview.contains("+hello world"));
+}
+
+#[test]
+fn test_diff_preview_line_truncation() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // Create a new file with a very long line (> 200 chars)
+    let long_line = "a".repeat(300);
+    let input = ToolInput::FileWrite {
+        path: "long_line.txt".to_string(),
+        content: format!("{long_line}\nshort\n"),
+    };
+    let result = generate_diff_preview(dir.path(), &input);
+    assert!(result.is_some());
+    let preview = result.unwrap();
+    assert!(preview.contains("(new file)"));
+    // The long line should be truncated with "..."
+    assert!(preview.contains("..."));
+    // Should not contain the full 300-char line
+    assert!(!preview.contains(&"a".repeat(300)));
+}
+
+#[test]
+fn test_is_binary_content() {
+    // Text content
+    assert!(!is_binary_content(b"hello world\nfoo bar\n"));
+    // Binary content with NUL byte
+    assert!(is_binary_content(b"hello\x00world"));
+    // Empty content
+    assert!(!is_binary_content(b""));
+    // Pure NUL
+    assert!(is_binary_content(&[0u8; 10]));
+}
+
+#[test]
+fn test_file_edit_diff_no_file_access() {
+    // file.edit diff generation should work without any file on disk
+    let dir = tempfile::tempdir().expect("tempdir");
+    // No files created in dir
+
+    let input = ToolInput::FileEdit {
+        path: "nonexistent.rs".to_string(),
+        old_string: "old code".to_string(),
+        new_string: "new code".to_string(),
+    };
+    let result = generate_diff_preview(dir.path(), &input);
+    assert!(result.is_some());
+    let diff = result.unwrap();
+    assert!(diff.contains("-old code"));
+    assert!(diff.contains("+new code"));
+}
+
+#[test]
+fn test_diff_preview_other_tool_input_returns_none() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = ToolInput::FileRead {
+        path: "foo.txt".to_string(),
+    };
+    assert!(generate_diff_preview(dir.path(), &input).is_none());
+
+    let input = ToolInput::ShellExec {
+        command: "ls".to_string(),
+    };
+    assert!(generate_diff_preview(dir.path(), &input).is_none());
+}
+
+// --- Parallel execution grouping tests ---
+
+/// Build a ToolExecutionRequest with a given spec name and execution mode.
+fn build_exec_request(name: &str, mode: ExecutionMode) -> ToolExecutionRequest {
+    let registry = build_registry();
+    // Pick a real spec that matches the desired execution mode.
+    let mut spec = match mode {
+        ExecutionMode::ParallelSafe => registry.get("file.read").unwrap().clone(),
+        ExecutionMode::SequentialOnly => registry.get("file.write").unwrap().clone(),
+    };
+    // Override the name for test clarity (the spec already has the right execution_mode).
+    spec.name = name.to_string();
+    ToolExecutionRequest {
+        tool_call_id: format!("call_{name}"),
+        spec,
+        input: ToolInput::FileRead {
+            path: "dummy.txt".to_string(),
+        },
+    }
+}
+
+#[test]
+fn group_by_execution_mode_all_parallel() {
+    let requests: Vec<(usize, ToolExecutionRequest)> = vec![
+        (0, build_exec_request("read1", ExecutionMode::ParallelSafe)),
+        (1, build_exec_request("read2", ExecutionMode::ParallelSafe)),
+        (2, build_exec_request("read3", ExecutionMode::ParallelSafe)),
+    ];
+
+    let groups = group_by_execution_mode(&requests);
+    assert_eq!(groups.len(), 1);
+    match &groups[0] {
+        ExecutionGroup::Parallel(items) => assert_eq!(items.len(), 3),
+        _ => panic!("expected Parallel group"),
+    }
+}
+
+#[test]
+fn group_by_execution_mode_all_sequential() {
+    let requests: Vec<(usize, ToolExecutionRequest)> = vec![
+        (
+            0,
+            build_exec_request("write1", ExecutionMode::SequentialOnly),
+        ),
+        (
+            1,
+            build_exec_request("write2", ExecutionMode::SequentialOnly),
+        ),
+        (
+            2,
+            build_exec_request("write3", ExecutionMode::SequentialOnly),
+        ),
+    ];
+
+    let groups = group_by_execution_mode(&requests);
+    assert_eq!(groups.len(), 3);
+    for group in &groups {
+        match group {
+            ExecutionGroup::Sequential(_, _) => {}
+            _ => panic!("expected Sequential group"),
+        }
+    }
+}
+
+#[test]
+fn group_by_execution_mode_mixed() {
+    // [read, read, write, read, search] -> [Parallel([read,read]), Sequential(write), Parallel([read,search])]
+    let requests: Vec<(usize, ToolExecutionRequest)> = vec![
+        (0, build_exec_request("read1", ExecutionMode::ParallelSafe)),
+        (1, build_exec_request("read2", ExecutionMode::ParallelSafe)),
+        (
+            2,
+            build_exec_request("write1", ExecutionMode::SequentialOnly),
+        ),
+        (3, build_exec_request("read3", ExecutionMode::ParallelSafe)),
+        (
+            4,
+            build_exec_request("search1", ExecutionMode::ParallelSafe),
+        ),
+    ];
+
+    let groups = group_by_execution_mode(&requests);
+    assert_eq!(groups.len(), 3);
+
+    match &groups[0] {
+        ExecutionGroup::Parallel(items) => {
+            assert_eq!(items.len(), 2);
+            assert_eq!(items[0].0, 0);
+            assert_eq!(items[1].0, 1);
+        }
+        _ => panic!("expected Parallel group at index 0"),
+    }
+    match &groups[1] {
+        ExecutionGroup::Sequential(idx, _) => assert_eq!(*idx, 2),
+        _ => panic!("expected Sequential group at index 1"),
+    }
+    match &groups[2] {
+        ExecutionGroup::Parallel(items) => {
+            assert_eq!(items.len(), 2);
+            assert_eq!(items[0].0, 3);
+            assert_eq!(items[1].0, 4);
+        }
+        _ => panic!("expected Parallel group at index 2"),
+    }
+}
+
+#[test]
+fn group_by_execution_mode_empty() {
+    let requests: Vec<(usize, ToolExecutionRequest)> = vec![];
+    let groups = group_by_execution_mode(&requests);
+    assert!(groups.is_empty());
+}
+
+#[test]
+fn group_by_execution_mode_single_parallel() {
+    let requests: Vec<(usize, ToolExecutionRequest)> =
+        vec![(0, build_exec_request("read1", ExecutionMode::ParallelSafe))];
+
+    let groups = group_by_execution_mode(&requests);
+    assert_eq!(groups.len(), 1);
+    match &groups[0] {
+        ExecutionGroup::Parallel(items) => assert_eq!(items.len(), 1),
+        _ => panic!("expected Parallel group with 1 element"),
+    }
+}
+
+#[test]
+fn parallel_execution_preserves_result_order() {
+    // Create multiple real files and read them in parallel.
+    // Verify results come back in the original request order.
+    let root = std::env::temp_dir().join("anvil_parallel_order_test");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("dir should exist");
+
+    let file_count = 5;
+    for i in 0..file_count {
+        fs::write(root.join(format!("file_{i}.txt")), format!("content_{i}"))
+            .expect("write should succeed");
+    }
+
+    let registry = build_registry();
+    let read_spec = registry.get("file.read").unwrap().clone();
+
+    let requests: Vec<(usize, ToolExecutionRequest)> = (0..file_count)
+        .map(|i| {
+            (
+                i,
+                ToolExecutionRequest {
+                    tool_call_id: format!("call_read_{i}"),
+                    spec: read_spec.clone(),
+                    input: ToolInput::FileRead {
+                        path: format!("./file_{i}.txt"),
+                    },
+                },
+            )
+        })
+        .collect();
+
+    // Execute using LocalToolExecutor in parallel via thread::scope
+    let mut results: Vec<(usize, ToolExecutionResult)> = Vec::new();
+    std::thread::scope(|s| {
+        let handles: Vec<_> = requests
+            .iter()
+            .map(|(idx, req)| {
+                let root = root.clone();
+                let idx = *idx;
+                let req = req.clone();
+                s.spawn(move || {
+                    let mut executor = LocalToolExecutor::new_without_rate_limit(root);
+                    let result = executor.execute(req).expect("read should succeed");
+                    (idx, result)
+                })
+            })
+            .collect();
+        for handle in handles {
+            results.push(handle.join().expect("thread should not panic"));
+        }
+    });
+
+    // Sort by index (as the real implementation does)
+    results.sort_by_key(|(idx, _)| *idx);
+
+    // Verify order and content
+    assert_eq!(results.len(), file_count);
+    for (i, (idx, result)) in results.iter().enumerate() {
+        assert_eq!(*idx, i);
+        assert_eq!(result.status, ToolExecutionStatus::Completed);
+        match &result.payload {
+            ToolExecutionPayload::Text(content) => {
+                assert!(content.contains(&format!("content_{i}")));
+            }
+            _ => panic!("expected Text payload for file_{i}"),
+        }
+    }
+}
+
+// ── ToolExecutionPayload::Image tests ──────────────────────────────────
+
+#[test]
+fn tool_execution_payload_image_construction() {
+    let payload = ToolExecutionPayload::Image {
+        source_path: "/tmp/test.png".to_string(),
+        mime_type: "image/png".to_string(),
+    };
+    match payload {
+        ToolExecutionPayload::Image {
+            source_path,
+            mime_type,
+        } => {
+            assert_eq!(source_path, "/tmp/test.png");
+            assert_eq!(mime_type, "image/png");
+        }
+        _ => panic!("expected Image payload"),
+    }
+}
+
+#[test]
+fn tool_execution_payload_image_debug_and_clone() {
+    let payload = ToolExecutionPayload::Image {
+        source_path: "photo.jpg".to_string(),
+        mime_type: "image/jpeg".to_string(),
+    };
+    let cloned = payload.clone();
+    assert_eq!(payload, cloned);
+    // Debug should work
+    let debug_str = format!("{:?}", payload);
+    assert!(debug_str.contains("Image"));
+}
+
+// -----------------------------------------------------------------------
+// Phase 2: detect_image_mime tests
+// -----------------------------------------------------------------------
+
+#[test]
+fn detect_image_mime_png() {
+    assert_eq!(detect_image_mime(Path::new("photo.png")), Some("image/png"));
+}
+
+#[test]
+fn detect_image_mime_jpg() {
+    assert_eq!(
+        detect_image_mime(Path::new("photo.jpg")),
+        Some("image/jpeg")
+    );
+}
+
+#[test]
+fn detect_image_mime_jpeg() {
+    assert_eq!(
+        detect_image_mime(Path::new("photo.jpeg")),
+        Some("image/jpeg")
+    );
+}
+
+#[test]
+fn detect_image_mime_gif() {
+    assert_eq!(detect_image_mime(Path::new("anim.gif")), Some("image/gif"));
+}
+
+#[test]
+fn detect_image_mime_webp() {
+    assert_eq!(
+        detect_image_mime(Path::new("photo.webp")),
+        Some("image/webp")
+    );
+}
+
+#[test]
+fn detect_image_mime_unknown_returns_none() {
+    assert_eq!(detect_image_mime(Path::new("file.txt")), None);
+    assert_eq!(detect_image_mime(Path::new("file.rs")), None);
+    assert_eq!(detect_image_mime(Path::new("no_extension")), None);
+}
+
+#[test]
+fn detect_image_mime_case_insensitive() {
+    assert_eq!(detect_image_mime(Path::new("PHOTO.PNG")), Some("image/png"));
+    assert_eq!(
+        detect_image_mime(Path::new("photo.JPG")),
+        Some("image/jpeg")
+    );
+}
+
+// -----------------------------------------------------------------------
+// Phase 3: format_tool_result_message for Image payload
+// -----------------------------------------------------------------------
+
+#[test]
+fn format_tool_result_message_image_payload() {
+    use anvil::app::agentic::format_tool_result_message;
+    let result = ToolExecutionResult {
+        tool_call_id: "call_001".to_string(),
+        tool_name: "file.read".to_string(),
+        status: ToolExecutionStatus::Completed,
+        summary: "read image".to_string(),
+        payload: ToolExecutionPayload::Image {
+            source_path: "/tmp/photo.png".to_string(),
+            mime_type: "image/png".to_string(),
+        },
+        artifacts: Vec::new(),
+        elapsed_ms: 10,
+    };
+    let msg = format_tool_result_message(&result, 10000);
+    assert!(msg.contains("file.read"));
+    assert!(msg.contains("/tmp/photo.png"));
+    assert!(msg.contains("画像"));
+}
+
+// ============================================================
+// Sub-agent tool tests (Issue #24 Phase 1)
+// ============================================================
+
+fn build_registry_with_subagent_tools() -> ToolRegistry {
+    let mut registry = ToolRegistry::new();
+    registry.register_standard_tools();
+    registry.register_agent_explore();
+    registry.register_agent_plan();
+    registry
+}
+
+// --- from_json tests ---
+
+#[test]
+fn from_json_parses_agent_explore_with_scope() {
+    let json: serde_json::Value = serde_json::json!({
+        "prompt": "Investigate the module structure",
+        "scope": "src/tooling"
+    });
+    let input = ToolInput::from_json("agent.explore", &json).expect("should parse agent.explore");
+    assert_eq!(
+        input,
+        ToolInput::AgentExplore {
+            prompt: "Investigate the module structure".to_string(),
+            scope: Some("src/tooling".to_string()),
+        }
+    );
+}
+
+#[test]
+fn from_json_parses_agent_explore_without_scope() {
+    let json: serde_json::Value = serde_json::json!({
+        "prompt": "Explore the codebase"
+    });
+    let input = ToolInput::from_json("agent.explore", &json).expect("should parse agent.explore");
+    assert_eq!(
+        input,
+        ToolInput::AgentExplore {
+            prompt: "Explore the codebase".to_string(),
+            scope: None,
+        }
+    );
+}
+
+#[test]
+fn from_json_parses_agent_plan_with_scope() {
+    let json: serde_json::Value = serde_json::json!({
+        "prompt": "Plan the refactoring",
+        "scope": "src/app"
+    });
+    let input = ToolInput::from_json("agent.plan", &json).expect("should parse agent.plan");
+    assert_eq!(
+        input,
+        ToolInput::AgentPlan {
+            prompt: "Plan the refactoring".to_string(),
+            scope: Some("src/app".to_string()),
+        }
+    );
+}
+
+#[test]
+fn from_json_parses_agent_plan_without_scope() {
+    let json: serde_json::Value = serde_json::json!({
+        "prompt": "Create implementation plan"
+    });
+    let input = ToolInput::from_json("agent.plan", &json).expect("should parse agent.plan");
+    assert_eq!(
+        input,
+        ToolInput::AgentPlan {
+            prompt: "Create implementation plan".to_string(),
+            scope: None,
+        }
+    );
+}
+
+#[test]
+fn from_json_agent_explore_missing_prompt_fails() {
+    let json: serde_json::Value = serde_json::json!({
+        "scope": "src/tooling"
+    });
+    let err = ToolInput::from_json("agent.explore", &json).expect_err("should fail without prompt");
+    assert!(err.contains("missing prompt"));
+}
+
+#[test]
+fn from_json_agent_plan_missing_prompt_fails() {
+    let json: serde_json::Value = serde_json::json!({
+        "scope": "src/app"
+    });
+    let err = ToolInput::from_json("agent.plan", &json).expect_err("should fail without prompt");
+    assert!(err.contains("missing prompt"));
+}
+
+// --- kind() tests ---
+
+#[test]
+fn kind_returns_agent_explore_for_agent_explore_input() {
+    let input = ToolInput::AgentExplore {
+        prompt: "test".to_string(),
+        scope: None,
+    };
+    assert_eq!(input.kind(), ToolKind::AgentExplore);
+}
+
+#[test]
+fn kind_returns_agent_plan_for_agent_plan_input() {
+    let input = ToolInput::AgentPlan {
+        prompt: "test".to_string(),
+        scope: None,
+    };
+    assert_eq!(input.kind(), ToolKind::AgentPlan);
+}
+
+// --- validate_required_fields tests ---
+
+#[test]
+fn validate_agent_explore_empty_prompt_fails() {
+    let registry = build_registry_with_subagent_tools();
+    let call = ToolCallRequest::new(
+        "call_explore_001",
+        "agent.explore",
+        ToolInput::AgentExplore {
+            prompt: "".to_string(),
+            scope: None,
+        },
+    );
+    let err = registry
+        .validate(call)
+        .expect_err("empty prompt should fail");
+    assert_eq!(
+        err,
+        ToolValidationError::MissingRequiredField("prompt".to_string())
+    );
+}
+
+#[test]
+fn validate_agent_plan_empty_prompt_fails() {
+    let registry = build_registry_with_subagent_tools();
+    let call = ToolCallRequest::new(
+        "call_plan_001",
+        "agent.plan",
+        ToolInput::AgentPlan {
+            prompt: "   ".to_string(),
+            scope: None,
+        },
+    );
+    let err = registry
+        .validate(call)
+        .expect_err("whitespace-only prompt should fail");
+    assert_eq!(
+        err,
+        ToolValidationError::MissingRequiredField("prompt".to_string())
+    );
+}
+
+#[test]
+fn validate_agent_explore_too_long_prompt_fails() {
+    let registry = build_registry_with_subagent_tools();
+    let long_prompt = "a".repeat(10001);
+    let call = ToolCallRequest::new(
+        "call_explore_002",
+        "agent.explore",
+        ToolInput::AgentExplore {
+            prompt: long_prompt,
+            scope: None,
+        },
+    );
+    let err = registry
+        .validate(call)
+        .expect_err("too long prompt should fail");
+    match err {
+        ToolValidationError::InvalidFieldValue { field, .. } => {
+            assert_eq!(field, "prompt");
+        }
+        other => panic!("expected InvalidFieldValue, got {other:?}"),
+    }
+}
+
+#[test]
+fn validate_agent_plan_too_long_prompt_fails() {
+    let registry = build_registry_with_subagent_tools();
+    let long_prompt = "b".repeat(10001);
+    let call = ToolCallRequest::new(
+        "call_plan_002",
+        "agent.plan",
+        ToolInput::AgentPlan {
+            prompt: long_prompt,
+            scope: None,
+        },
+    );
+    let err = registry
+        .validate(call)
+        .expect_err("too long prompt should fail");
+    match err {
+        ToolValidationError::InvalidFieldValue { field, .. } => {
+            assert_eq!(field, "prompt");
+        }
+        other => panic!("expected InvalidFieldValue, got {other:?}"),
+    }
+}
+
+#[test]
+fn validate_agent_explore_valid_prompt_succeeds() {
+    let registry = build_registry_with_subagent_tools();
+    let call = ToolCallRequest::new(
+        "call_explore_003",
+        "agent.explore",
+        ToolInput::AgentExplore {
+            prompt: "Investigate how error handling works".to_string(),
+            scope: Some("src/tooling".to_string()),
+        },
+    );
+    let validated = registry.validate(call).expect("valid prompt should pass");
+    assert_eq!(validated.spec.name, "agent.explore");
+    assert_eq!(validated.spec.kind, ToolKind::AgentExplore);
+}
+
+#[test]
+fn validate_agent_plan_valid_prompt_succeeds() {
+    let registry = build_registry_with_subagent_tools();
+    let call = ToolCallRequest::new(
+        "call_plan_003",
+        "agent.plan",
+        ToolInput::AgentPlan {
+            prompt: "Plan the implementation of feature X".to_string(),
+            scope: None,
+        },
+    );
+    let validated = registry.validate(call).expect("valid prompt should pass");
+    assert_eq!(validated.spec.name, "agent.plan");
+    assert_eq!(validated.spec.kind, ToolKind::AgentPlan);
+}
+
+// --- ToolSpec attribute tests ---
+
+#[test]
+fn agent_explore_spec_has_correct_attributes() {
+    let registry = build_registry_with_subagent_tools();
+    let spec = registry
+        .get("agent.explore")
+        .expect("agent.explore should be registered");
+    assert_eq!(spec.kind, ToolKind::AgentExplore);
+    assert_eq!(spec.execution_class, ExecutionClass::ReadOnly);
+    assert_eq!(spec.permission_class, PermissionClass::Safe);
+    assert_eq!(spec.execution_mode, ExecutionMode::SequentialOnly);
+    assert_eq!(spec.plan_mode, PlanModePolicy::Allowed);
+    assert_eq!(spec.rollback_policy, RollbackPolicy::None);
+}
+
+#[test]
+fn agent_plan_spec_has_correct_attributes() {
+    let registry = build_registry_with_subagent_tools();
+    let spec = registry
+        .get("agent.plan")
+        .expect("agent.plan should be registered");
+    assert_eq!(spec.kind, ToolKind::AgentPlan);
+    assert_eq!(spec.execution_class, ExecutionClass::ReadOnly);
+    assert_eq!(spec.permission_class, PermissionClass::Safe);
+    assert_eq!(spec.execution_mode, ExecutionMode::SequentialOnly);
+    assert_eq!(spec.plan_mode, PlanModePolicy::Allowed);
+    assert_eq!(spec.rollback_policy, RollbackPolicy::None);
+}
+
+// --- ToolRegistry subset tests ---
+
+#[test]
+fn explore_tools_registry_contains_only_file_read_and_file_search() {
+    let mut registry = ToolRegistry::new();
+    registry.register_explore_tools();
+    assert!(registry.get("file.read").is_some());
+    assert!(registry.get("file.search").is_some());
+    assert!(registry.get("file.write").is_none());
+    assert!(registry.get("shell.exec").is_none());
+    assert!(registry.get("web.fetch").is_none());
+    assert!(registry.get("agent.explore").is_none());
+    assert!(registry.get("agent.plan").is_none());
+}
+
+#[test]
+fn plan_tools_registry_contains_file_read_file_search_and_web_fetch() {
+    let mut registry = ToolRegistry::new();
+    registry.register_plan_tools();
+    assert!(registry.get("file.read").is_some());
+    assert!(registry.get("file.search").is_some());
+    assert!(registry.get("web.fetch").is_some());
+    assert!(registry.get("file.write").is_none());
+    assert!(registry.get("shell.exec").is_none());
+    assert!(registry.get("agent.explore").is_none());
+    assert!(registry.get("agent.plan").is_none());
+}
+
+// --- repair_from_block tests ---
+
+#[test]
+fn repair_from_block_agent_explore_with_prompt_and_scope() {
+    fn extract_simple(block: &str, key: &str) -> Option<String> {
+        let pattern = format!("\"{}\":", key);
+        let start = block.find(&pattern)? + pattern.len();
+        let rest = &block[start..];
+        let rest = rest.trim_start();
+        if let Some(inner) = rest.strip_prefix('"') {
+            let end = inner.find('"')?;
+            Some(inner[..end].to_string())
+        } else {
+            None
+        }
+    }
+    fn extract_trailing(block: &str, key: &str) -> Option<String> {
+        extract_simple(block, key)
+    }
+
+    let block = r#"{"prompt": "explore this", "scope": "src/app"}"#;
+    let result =
+        ToolInput::repair_from_block("agent.explore", block, extract_simple, extract_trailing);
+    assert_eq!(
+        result,
+        Some(ToolInput::AgentExplore {
+            prompt: "explore this".to_string(),
+            scope: Some("src/app".to_string()),
+        })
+    );
+}
+
+#[test]
+fn repair_from_block_agent_plan_without_scope() {
+    fn extract_simple(block: &str, key: &str) -> Option<String> {
+        let pattern = format!("\"{}\":", key);
+        let start = block.find(&pattern)? + pattern.len();
+        let rest = &block[start..];
+        let rest = rest.trim_start();
+        if let Some(inner) = rest.strip_prefix('"') {
+            let end = inner.find('"')?;
+            Some(inner[..end].to_string())
+        } else {
+            None
+        }
+    }
+    fn extract_trailing(block: &str, key: &str) -> Option<String> {
+        extract_simple(block, key)
+    }
+
+    let block = r#"{"prompt": "plan the implementation"}"#;
+    let result =
+        ToolInput::repair_from_block("agent.plan", block, extract_simple, extract_trailing);
+    assert_eq!(
+        result,
+        Some(ToolInput::AgentPlan {
+            prompt: "plan the implementation".to_string(),
+            scope: None,
+        })
+    );
+}
+
+#[test]
+fn repair_from_block_agent_explore_missing_prompt_returns_none() {
+    fn extract_simple(block: &str, key: &str) -> Option<String> {
+        let pattern = format!("\"{}\":", key);
+        let start = block.find(&pattern)? + pattern.len();
+        let rest = &block[start..];
+        let rest = rest.trim_start();
+        if let Some(inner) = rest.strip_prefix('"') {
+            let end = inner.find('"')?;
+            Some(inner[..end].to_string())
+        } else {
+            None
+        }
+    }
+    fn extract_trailing(block: &str, key: &str) -> Option<String> {
+        extract_simple(block, key)
+    }
+
+    let block = r#"{"scope": "src/app"}"#;
+    let result =
+        ToolInput::repair_from_block("agent.explore", block, extract_simple, extract_trailing);
+    assert!(result.is_none());
+}
+
+// --- max prompt length boundary test ---
+
+#[test]
+fn validate_agent_explore_exactly_max_prompt_length_succeeds() {
+    let registry = build_registry_with_subagent_tools();
+    let exact_prompt = "x".repeat(10000);
+    let call = ToolCallRequest::new(
+        "call_explore_004",
+        "agent.explore",
+        ToolInput::AgentExplore {
+            prompt: exact_prompt,
+            scope: None,
+        },
+    );
+    registry
+        .validate(call)
+        .expect("exactly 10000 chars should pass");
+}
+
+// --- SubAgentKind::from_tool_input() tests ---
+
+#[test]
+fn subagent_kind_from_tool_input_explore() {
+    use anvil::agent::subagent::SubAgentKind;
+    let input = ToolInput::AgentExplore {
+        prompt: "test".to_string(),
+        scope: None,
+    };
+    assert_eq!(
+        SubAgentKind::from_tool_input(&input),
+        Some(SubAgentKind::Explore)
+    );
+}
+
+#[test]
+fn subagent_kind_from_tool_input_plan() {
+    use anvil::agent::subagent::SubAgentKind;
+    let input = ToolInput::AgentPlan {
+        prompt: "test".to_string(),
+        scope: Some("./src".to_string()),
+    };
+    assert_eq!(
+        SubAgentKind::from_tool_input(&input),
+        Some(SubAgentKind::Plan)
+    );
+}
+
+#[test]
+fn subagent_kind_from_tool_input_returns_none_for_other_tools() {
+    use anvil::agent::subagent::SubAgentKind;
+    let input = ToolInput::FileRead {
+        path: "./foo".to_string(),
+    };
+    assert_eq!(SubAgentKind::from_tool_input(&input), None);
+}
+
+#[test]
+fn subagent_error_display_formats_correctly() {
+    use anvil::agent::subagent::SubAgentError;
+    use anvil::provider::ProviderTurnError;
+
+    let e = SubAgentError::Timeout;
+    assert_eq!(e.to_string(), "SubAgent timed out");
+
+    let e = SubAgentError::MaxIterations;
+    assert_eq!(e.to_string(), "SubAgent reached max iterations");
+
+    let e = SubAgentError::SandboxViolation("../escape".to_string());
+    assert!(e.to_string().contains("../escape"));
+
+    let e = SubAgentError::Provider(ProviderTurnError::Cancelled);
+    assert!(e.to_string().contains("provider"));
+
+    let e = SubAgentError::ToolExecution("bad tool".to_string());
+    assert!(e.to_string().contains("bad tool"));
+}
+
+#[test]
+fn subagent_error_into_tool_execution_result_status_mapping() {
+    use anvil::agent::subagent::SubAgentError;
+    use anvil::tooling::ToolExecutionStatus;
+
+    let call = ToolCallRequest::new(
+        "call_001",
+        "agent.explore",
+        ToolInput::AgentExplore {
+            prompt: "test".to_string(),
+            scope: None,
+        },
+    );
+
+    // Timeout -> Completed (partial result)
+    let result = SubAgentError::Timeout.into_tool_execution_result(&call);
+    assert_eq!(result.status, ToolExecutionStatus::Completed);
+
+    // MaxIterations -> Completed (partial result)
+    let result = SubAgentError::MaxIterations.into_tool_execution_result(&call);
+    assert_eq!(result.status, ToolExecutionStatus::Completed);
+
+    // SandboxViolation -> Failed
+    let result =
+        SubAgentError::SandboxViolation("bad".to_string()).into_tool_execution_result(&call);
+    assert_eq!(result.status, ToolExecutionStatus::Failed);
+
+    // ToolExecution -> Failed
+    let result = SubAgentError::ToolExecution("err".to_string()).into_tool_execution_result(&call);
+    assert_eq!(result.status, ToolExecutionStatus::Failed);
 }

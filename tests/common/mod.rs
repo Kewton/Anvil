@@ -4,6 +4,8 @@ use anvil::app::App;
 use anvil::config::EffectiveConfig;
 use anvil::provider::ProviderRuntimeContext;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn build_app() -> App {
@@ -13,7 +15,8 @@ pub fn build_app() -> App {
 pub fn build_app_in(root: PathBuf) -> App {
     let config = build_config_in(root);
     let provider = ProviderRuntimeContext::bootstrap(&config).expect("provider should bootstrap");
-    App::new(config, provider).expect("app should initialize")
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    App::new(config, provider, shutdown_flag).expect("app should initialize")
 }
 
 pub fn build_config_in(root: PathBuf) -> EffectiveConfig {
@@ -24,6 +27,9 @@ pub fn build_config_in(root: PathBuf) -> EffectiveConfig {
     config.paths.state_dir = root.join(".anvil").join("state");
     config.paths.session_dir = root.join(".anvil").join("sessions");
     config.paths.session_file = config.paths.session_dir.join("session.json");
+    config.paths.logs_dir = root.join(".anvil").join("logs");
+    config.paths.mcp_config_file = root.join(".anvil").join("mcp.json");
+    config.paths.hooks_config_file = root.join(".anvil").join("hooks.json");
     config
 }
 
@@ -32,5 +38,6 @@ pub fn unique_test_dir(label: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("time should be monotonic")
         .as_nanos();
-    std::env::temp_dir().join(format!("anvil_test_{label}_{nanos}"))
+    let tid = std::thread::current().id();
+    std::env::temp_dir().join(format!("anvil_test_{label}_{nanos}_{tid:?}"))
 }

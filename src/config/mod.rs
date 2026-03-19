@@ -4,14 +4,38 @@
 //! settings.  It is assembled once at startup and then treated as
 //! immutable for the lifetime of the session.
 
+pub mod cli_args;
+pub use cli_args::CliArgs;
+
+use clap::Parser;
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::{
     error::Error,
     fmt::{Display, Formatter},
 };
+
+/// Determines where the user prompt originates from.
+#[derive(Debug, Clone)]
+pub enum PromptSource {
+    /// Interactive REPL mode (default).
+    Interactive,
+    /// Read prompt from stdin (--oneshot).
+    Stdin,
+    /// Prompt provided directly via --exec flag.
+    Exec(String),
+    /// Prompt read from a file via --exec-file flag.
+    ExecFile(PathBuf),
+}
+
+impl PromptSource {
+    /// Returns true if this source represents an interactive session.
+    pub fn is_interactive(&self) -> bool {
+        matches!(self, PromptSource::Interactive)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WebSearchProvider {
@@ -20,7 +44,7 @@ pub enum WebSearchProvider {
     SerperApi,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 /// Provider, model, and transport settings.
 pub struct RuntimeConfig {
     pub provider: String,
@@ -41,11 +65,13 @@ pub struct RuntimeConfig {
 
 #[derive(Debug, Clone)]
 pub struct ModeConfig {
+    pub prompt_source: PromptSource,
     pub interactive: bool,
     pub approval_required: bool,
     pub fresh_session: bool,
     pub reasoning_visibility: ReasoningVisibility,
     pub debug_logging: bool,
+    pub log_filter: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +88,9 @@ pub struct PathConfig {
     pub state_dir: PathBuf,
     pub session_dir: PathBuf,
     pub session_file: PathBuf,
+    pub logs_dir: PathBuf,
+    pub mcp_config_file: PathBuf,
+    pub hooks_config_file: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -69,6 +98,7 @@ pub struct EffectiveConfig {
     pub runtime: RuntimeConfig,
     pub mode: ModeConfig,
     pub paths: PathConfig,
+    project_instructions: Option<String>,
 }
 
 #[derive(Debug)]
@@ -79,6 +109,7 @@ pub enum ConfigError {
     InvalidNumericValue(String),
     InvalidReasoningVisibility(String),
     InvalidWebSearchProvider(String),
+    ValidationError(String),
 }
 
 impl Display for ConfigError {
@@ -96,6 +127,7 @@ impl Display for ConfigError {
             Self::InvalidWebSearchProvider(value) => {
                 write!(f, "invalid web search provider: {value}")
             }
+            Self::ValidationError(msg) => write!(f, "config validation failed: {msg}"),
         }
     }
 }
@@ -103,12 +135,46 @@ impl Display for ConfigError {
 impl Error for ConfigError {}
 
 impl EffectiveConfig {
+    pub fn project_instructions(&self) -> Option<&str> {
+        self.project_instructions.as_deref()
+    }
+
+    /// Test-only setter for project_instructions.
+    /// In production code, this field is set only via `load()`.
+    pub fn set_project_instructions_for_test(&mut self, instructions: Option<String>) {
+        self.project_instructions = instructions;
+    }
+
+    /// Test-compatible entry point. In production, use `load_with_args()` via
+    /// `main.rs -> CliArgs::parse() -> run_with_args() -> load_with_args()`.
+    ///
+    /// Attempts to parse CLI args from `std::env::args()`. Falls back to
+    /// `CliArgs::default()` when parsing fails (e.g. cargo-test harness args).
     pub fn load() -> Result<Self, ConfigError> {
+        match CliArgs::try_parse_from(std::env::args()) {
+            Ok(cli) => Self::load_with_args(&cli),
+            Err(_) => Self::load_with_args(&CliArgs::default()),
+        }
+    }
+
+    /// Production entry point: apply file, env, then CLI arg overrides.
+    pub fn load_with_args(cli: &CliArgs) -> Result<Self, ConfigError> {
         let cwd = std::env::current_dir().map_err(ConfigError::CurrentDirUnavailable)?;
         let workspace_dir = cwd.join("workspace");
         let config_file = cwd.join(".anvil").join("config");
         let mut config = Self::default_for_paths(cwd, workspace_dir, config_file);
-        config.apply_standard_sources()?;
+        config.apply_file_and_env_overrides()?;
+        config.apply_cli_args(cli)?;
+
+        // Check .gitignore for .anvil/ directory
+        if let Some(repo_root) = find_repo_root(&config.paths.cwd)
+            && let Some(warning) = check_gitignore_anvil_dir(&repo_root)
+        {
+            eprintln!("{warning}");
+        }
+
+        config.validate()?;
+        config.project_instructions = config.paths.load_project_instructions();
         Ok(config)
     }
 
@@ -116,6 +182,7 @@ impl EffectiveConfig {
         let state_dir = cwd.join(".anvil").join("state");
         let session_dir = cwd.join(".anvil").join("sessions");
         let session_file = session_dir.join(format!("{}.json", session_key_for_cwd(&cwd)));
+        let logs_dir = cwd.join(".anvil").join("logs");
         Self {
             runtime: RuntimeConfig {
                 provider: "ollama".to_string(),
@@ -134,29 +201,34 @@ impl EffectiveConfig {
                 serper_api_key: None,
             },
             mode: ModeConfig {
+                prompt_source: PromptSource::Interactive,
                 interactive: true,
                 approval_required: true,
                 fresh_session: false,
                 reasoning_visibility: ReasoningVisibility::Summary,
                 debug_logging: false,
+                log_filter: None,
             },
             paths: PathConfig {
+                mcp_config_file: cwd.join(".anvil").join("mcp.json"),
+                hooks_config_file: cwd.join(".anvil").join("hooks.json"),
                 cwd,
                 workspace_dir,
                 config_file,
                 state_dir,
                 session_dir,
                 session_file,
+                logs_dir,
             },
+            project_instructions: None,
         }
     }
 
-    fn apply_standard_sources(&mut self) -> Result<(), ConfigError> {
+    fn apply_file_and_env_overrides(&mut self) -> Result<(), ConfigError> {
         if self.paths.config_file.exists() {
             self.apply_file_overrides()?;
         }
         self.apply_env_overrides()?;
-        self.apply_cli_overrides()?;
         Ok(())
     }
 
@@ -177,6 +249,11 @@ impl EffectiveConfig {
                 key.trim().to_string(),
                 value.trim().trim_matches('"').to_string(),
             );
+        }
+
+        // Security warnings for API keys in config file
+        for warning in check_config_security_warnings(&map) {
+            eprintln!("{warning}");
         }
 
         self.apply_map(&map)
@@ -204,6 +281,7 @@ impl EffectiveConfig {
             "ANVIL_DEBUG",
             "ANVIL_WEB_SEARCH_PROVIDER",
             "SERPER_API_KEY",
+            "ANVIL_LOG",
         ] {
             if let Ok(value) = std::env::var(key) {
                 map.insert(key.to_string(), value);
@@ -212,72 +290,75 @@ impl EffectiveConfig {
         self.apply_map(&map)
     }
 
-    fn apply_cli_overrides(&mut self) -> Result<(), ConfigError> {
-        let mut args = std::env::args().skip(1);
-        let mut map = HashMap::new();
-
-        while let Some(arg) = args.next() {
-            match arg.as_str() {
-                "--provider" => {
-                    if let Some(value) = args.next() {
-                        map.insert("ANVIL_PROVIDER".to_string(), value);
-                    }
-                }
-                "--model" => {
-                    if let Some(value) = args.next() {
-                        map.insert("ANVIL_MODEL".to_string(), value);
-                    }
-                }
-                "--provider-url" => {
-                    if let Some(value) = args.next() {
-                        map.insert("ANVIL_PROVIDER_URL".to_string(), value);
-                    }
-                }
-                "--sidecar-model" => {
-                    if let Some(value) = args.next() {
-                        map.insert("ANVIL_SIDECAR_MODEL".to_string(), value);
-                    }
-                }
-                "--context-window" => {
-                    if let Some(value) = args.next() {
-                        map.insert("ANVIL_CONTEXT_WINDOW".to_string(), value);
-                    }
-                }
-                "--context-budget" => {
-                    if let Some(value) = args.next() {
-                        map.insert("ANVIL_CONTEXT_BUDGET".to_string(), value);
-                    }
-                }
-                "--max-iterations" => {
-                    if let Some(value) = args.next() {
-                        map.insert("ANVIL_MAX_AGENT_ITERATIONS".to_string(), value);
-                    }
-                }
-                "--no-stream" => {
-                    map.insert("ANVIL_STREAM".to_string(), "false".to_string());
-                }
-                "--debug" => {
-                    map.insert("ANVIL_DEBUG".to_string(), "true".to_string());
-                }
-                "--no-approval" => {
-                    map.insert("ANVIL_APPROVAL_REQUIRED".to_string(), "false".to_string());
-                }
-                "--fresh-session" => {
-                    map.insert("ANVIL_FRESH_SESSION".to_string(), "true".to_string());
-                }
-                "--oneshot" => {
-                    map.insert("ANVIL_INTERACTIVE".to_string(), "false".to_string());
-                }
-                "--reasoning-visibility" => {
-                    if let Some(value) = args.next() {
-                        map.insert("ANVIL_REASONING_VISIBILITY".to_string(), value);
-                    }
-                }
-                _ => {}
-            }
+    /// Apply CLI argument overrides from a parsed [`CliArgs`] struct.
+    ///
+    /// Uses direct field assignment (not `apply_map`) to avoid redundant
+    /// string round-trips for already-typed values.
+    pub fn apply_cli_args(&mut self, cli: &CliArgs) -> Result<(), ConfigError> {
+        // Determine PromptSource from CLI args
+        if let Some(ref prompt) = cli.exec {
+            self.mode.prompt_source = PromptSource::Exec(prompt.clone());
+        } else if let Some(ref path) = cli.exec_file {
+            self.mode.prompt_source = PromptSource::ExecFile(path.clone());
+        } else if cli.oneshot {
+            self.mode.prompt_source = PromptSource::Stdin;
         }
 
-        self.apply_map(&map)
+        // Derive interactive / approval_required / fresh_session for non-interactive modes
+        if !self.mode.prompt_source.is_interactive() {
+            self.mode.interactive = false;
+            self.mode.approval_required = false;
+            self.mode.fresh_session = true;
+        }
+
+        // String fields
+        if let Some(ref v) = cli.provider {
+            self.runtime.provider = v.clone();
+        }
+        if let Some(ref v) = cli.model {
+            self.runtime.model = v.clone();
+        }
+        if let Some(ref v) = cli.provider_url {
+            self.runtime.provider_url = v.clone();
+        }
+        if let Some(ref v) = cli.sidecar_model {
+            self.runtime.sidecar_model = Some(v.clone());
+        }
+
+        // Numeric fields (already parsed by clap)
+        if let Some(v) = cli.context_window {
+            self.runtime.context_window = v;
+        }
+        if let Some(v) = cli.context_budget {
+            self.runtime.context_budget = Some(v);
+        }
+        if let Some(v) = cli.max_iterations {
+            self.runtime.max_agent_iterations = v;
+        }
+
+        // Boolean flags: only apply when set (true)
+        if cli.no_stream {
+            self.runtime.stream = false;
+        }
+        if cli.debug {
+            self.mode.debug_logging = true;
+        }
+        if cli.no_approval {
+            self.mode.approval_required = false;
+        }
+        if cli.fresh_session {
+            self.mode.fresh_session = true;
+        }
+        if cli.oneshot {
+            self.mode.interactive = false;
+        }
+
+        // Enum field
+        if let Some(ref v) = cli.reasoning_visibility {
+            self.mode.reasoning_visibility = parse_reasoning_visibility(v)?;
+        }
+
+        Ok(())
     }
 
     fn apply_map(&mut self, map: &HashMap<String, String>) -> Result<(), ConfigError> {
@@ -364,6 +445,9 @@ impl EffectiveConfig {
                         Some(value.clone())
                     };
                 }
+                "log_filter" | "ANVIL_LOG" => {
+                    self.mode.log_filter = Some(value.clone());
+                }
                 _ => {}
             }
         }
@@ -382,6 +466,94 @@ impl EffectiveConfig {
         Ok(())
     }
 
+    fn validate(&mut self) -> Result<(), ConfigError> {
+        self.check_provider_url()?;
+        self.check_model()?;
+        self.clamp_context_window();
+        self.clamp_context_budget();
+        self.clamp_agent_iterations();
+        Ok(())
+    }
+
+    fn check_provider_url(&self) -> Result<(), ConfigError> {
+        if self.runtime.provider_url.is_empty() {
+            return Err(ConfigError::ValidationError(
+                "provider_url must not be empty — set it in .anvil/config or ANVIL_PROVIDER_URL"
+                    .to_string(),
+            ));
+        }
+        if !self.runtime.provider_url.starts_with("http://")
+            && !self.runtime.provider_url.starts_with("https://")
+        {
+            return Err(ConfigError::ValidationError(format!(
+                "provider_url must start with http:// or https://, got: {} — fix in .anvil/config or ANVIL_PROVIDER_URL",
+                self.runtime.provider_url
+            )));
+        }
+        Ok(())
+    }
+
+    fn check_model(&self) -> Result<(), ConfigError> {
+        if self.runtime.model.is_empty() {
+            return Err(ConfigError::ValidationError(
+                "model must not be empty — set it in .anvil/config or ANVIL_MODEL".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn clamp_context_window(&mut self) {
+        if self.runtime.context_window < MIN_CONTEXT_WINDOW {
+            let old = self.runtime.context_window;
+            self.runtime.context_window = MIN_CONTEXT_WINDOW;
+            eprintln!(
+                "Warning: context_window={old} is below minimum ({MIN_CONTEXT_WINDOW}), adjusted to {MIN_CONTEXT_WINDOW}"
+            );
+        }
+    }
+
+    fn clamp_context_budget(&mut self) {
+        if let Some(budget) = self.runtime.context_budget
+            && budget >= self.runtime.context_window
+        {
+            let old = budget;
+            let new = self.runtime.context_window.saturating_sub(1);
+            self.runtime.context_budget = Some(new);
+            eprintln!(
+                "Warning: context_budget={old} >= context_window ({}), adjusted to {new}",
+                self.runtime.context_window
+            );
+        }
+    }
+
+    fn clamp_agent_iterations(&mut self) {
+        if self.runtime.max_agent_iterations < MIN_AGENT_ITERATIONS {
+            let old = self.runtime.max_agent_iterations;
+            self.runtime.max_agent_iterations = MIN_AGENT_ITERATIONS;
+            eprintln!(
+                "Warning: max_agent_iterations={old} is below minimum ({MIN_AGENT_ITERATIONS}), adjusted to {MIN_AGENT_ITERATIONS}"
+            );
+        } else if self.runtime.max_agent_iterations > MAX_AGENT_ITERATIONS {
+            let old = self.runtime.max_agent_iterations;
+            self.runtime.max_agent_iterations = MAX_AGENT_ITERATIONS;
+            eprintln!(
+                "Warning: max_agent_iterations={old} exceeds maximum ({MAX_AGENT_ITERATIONS}), adjusted to {MAX_AGENT_ITERATIONS}"
+            );
+        }
+    }
+
+    pub fn validate_for_test(&mut self) -> Result<(), ConfigError> {
+        self.validate()
+    }
+
+    pub fn session_key(&self) -> &str {
+        self.paths
+            .session_file
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+    }
+
     pub fn default_for_test() -> Result<Self, ConfigError> {
         let cwd = std::env::current_dir().map_err(ConfigError::CurrentDirUnavailable)?;
         Ok(Self::default_for_paths(
@@ -390,6 +562,192 @@ impl EffectiveConfig {
             cwd.join(".anvil").join("config"),
         ))
     }
+}
+
+const MAX_PROJECT_INSTRUCTIONS_CHARS: usize = 4000;
+const MIN_CONTEXT_WINDOW: u32 = 1000;
+const MIN_AGENT_ITERATIONS: usize = 1;
+const MAX_AGENT_ITERATIONS: usize = 100;
+
+/// Sensitive keys and their recommended environment variable names.
+/// To add a new sensitive key, simply add an entry to this array.
+const SENSITIVE_KEYS: &[(&str, &str)] = &[
+    ("api_key", "ANVIL_API_KEY"),
+    ("serper_api_key", "SERPER_API_KEY"),
+];
+
+/// Detect API keys in config file map and return warning messages.
+/// Only checks keys from the config file; env/CLI keys are not warned about.
+pub fn check_config_security_warnings(map: &HashMap<String, String>) -> Vec<String> {
+    SENSITIVE_KEYS
+        .iter()
+        .filter(|(key, _)| map.contains_key(*key))
+        .map(|(key, env_var)| {
+            format!(
+                "⚠ Warning: {key} found in config file. \
+                Consider using {env_var} environment variable \
+                instead for better security."
+            )
+        })
+        .collect()
+}
+
+/// Walk up from `start` looking for a `.git` directory to find the repo root.
+fn find_repo_root(start: &Path) -> Option<PathBuf> {
+    let mut current = start.to_path_buf();
+    loop {
+        if current.join(".git").exists() {
+            return Some(current);
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
+/// Check whether `.anvil/` is listed in `.gitignore`.
+/// Returns `Some(warning)` if it is missing or `.gitignore` does not exist.
+pub fn check_gitignore_anvil_dir(repo_root: &Path) -> Option<String> {
+    let gitignore_path = repo_root.join(".gitignore");
+    let Ok(contents) = std::fs::read_to_string(&gitignore_path) else {
+        return Some(
+            "⚠ Warning: .gitignore not found. Consider adding .anvil/ \
+            to .gitignore to prevent config files from being committed."
+                .to_string(),
+        );
+    };
+
+    if contents.lines().any(|line| {
+        let trimmed = line.trim();
+        !trimmed.starts_with('#') && trimmed.contains(".anvil")
+    }) {
+        None
+    } else {
+        Some(
+            "⚠ Warning: .anvil/ is not in .gitignore. Consider adding it \
+            to prevent config files from being committed."
+                .to_string(),
+        )
+    }
+}
+
+impl PathConfig {
+    /// Load project instructions from ANVIL.md files.
+    /// Delegates to `load_project_instructions_from()` for testability.
+    pub fn load_project_instructions(&self) -> Option<String> {
+        let home_dir = std::env::var("HOME").ok().map(PathBuf::from);
+        Self::load_project_instructions_from(&self.cwd, home_dir.as_deref())
+    }
+
+    /// Internal method: accepts cwd and home_dir as arguments so tests can
+    /// pass temp directories without depending on the HOME environment variable.
+    pub fn load_project_instructions_from(cwd: &Path, home_dir: Option<&Path>) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+        let mut sources: Vec<String> = Vec::new();
+        let mut has_user_scope = false;
+        let mut has_project_scope = false;
+
+        // 1. User scope: ~/.anvil/ANVIL.md
+        if let Some(home) = home_dir {
+            let user_path = home.join(".anvil").join("ANVIL.md");
+            match std::fs::read_to_string(&user_path) {
+                Ok(content) => {
+                    sources.push(format!("{}", user_path.display()));
+                    parts.push(content);
+                    has_user_scope = true;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    eprintln!("Warning: failed to read {}: {}", user_path.display(), e);
+                }
+            }
+        }
+
+        // 2. Project scope (exclusive: .anvil/ANVIL.md takes priority)
+        let project_path = {
+            let dotdir = cwd.join(".anvil").join("ANVIL.md");
+            if dotdir.exists() {
+                Some(dotdir)
+            } else {
+                let root = cwd.join("ANVIL.md");
+                if root.exists() { Some(root) } else { None }
+            }
+        };
+
+        if let Some(path) = project_path {
+            match std::fs::read_to_string(&path) {
+                Ok(content) => {
+                    sources.push(format!("{}", path.display()));
+                    parts.push(content);
+                    has_project_scope = true;
+                }
+                Err(e) => {
+                    eprintln!("Warning: failed to read {}: {}", path.display(), e);
+                }
+            }
+        }
+
+        if parts.is_empty() {
+            return None;
+        }
+
+        eprintln!("ANVIL.md loaded from: {}", sources.join(", "));
+
+        // Combine with scope labels
+        let mut combined = if has_user_scope && has_project_scope {
+            format!(
+                "## User scope\n{}\n\n---\n\n## Project scope\n{}",
+                parts[0], parts[1]
+            )
+        } else if has_user_scope {
+            format!("## User scope\n{}", parts[0])
+        } else {
+            format!("## Project scope\n{}", parts[0])
+        };
+
+        // SEC-3/SEC-9: Sanitize ANVIL_TOOL/ANVIL_FINAL markers
+        let (sanitized, had_markers) = sanitize_markers(&combined);
+        if had_markers {
+            eprintln!(
+                "Warning: ANVIL.md contains ANVIL_TOOL/ANVIL_FINAL markers. \
+                 These have been sanitized to prevent interference with tool protocol."
+            );
+        }
+        combined = sanitized;
+
+        // 4000-character limit with newline-boundary snap
+        if combined.chars().count() > MAX_PROJECT_INSTRUCTIONS_CHARS {
+            eprintln!(
+                "Warning: ANVIL.md content exceeds {} characters, truncating",
+                MAX_PROJECT_INSTRUCTIONS_CHARS
+            );
+            let truncated: String = combined
+                .chars()
+                .take(MAX_PROJECT_INSTRUCTIONS_CHARS)
+                .collect();
+            combined = match truncated.rfind('\n') {
+                Some(pos) => format!("{}\n[...truncated]", &truncated[..pos]),
+                None => format!("{}\n[...truncated]", truncated),
+            };
+        }
+
+        Some(combined)
+    }
+}
+
+/// Sanitize ANVIL_TOOL/ANVIL_FINAL markers in content (SEC-3/SEC-9).
+/// Replaces backtick-triple markers with full-width backticks to neutralize them.
+pub fn sanitize_markers(content: &str) -> (String, bool) {
+    let mut sanitized = content.to_string();
+    let mut found = false;
+    for marker in &["```ANVIL_TOOL", "```ANVIL_FINAL"] {
+        if sanitized.contains(marker) {
+            found = true;
+            sanitized =
+                sanitized.replace(marker, &marker.replace("```", "\u{FF40}\u{FF40}\u{FF40}"));
+        }
+    }
+    (sanitized, found)
 }
 
 fn session_key_for_cwd(cwd: &std::path::Path) -> String {
@@ -413,10 +771,182 @@ fn parse_reasoning_visibility(value: &str) -> Result<ReasoningVisibility, Config
     }
 }
 
+impl std::fmt::Debug for RuntimeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeConfig")
+            .field("provider", &self.provider)
+            .field("provider_url", &self.provider_url)
+            .field("model", &self.model)
+            .field("sidecar_model", &self.sidecar_model)
+            .field("api_key", &"[REDACTED]")
+            .field("context_window", &self.context_window)
+            .field("context_budget", &self.context_budget)
+            .field("max_agent_iterations", &self.max_agent_iterations)
+            .field("max_console_messages", &self.max_console_messages)
+            .field("auto_compact_threshold", &self.auto_compact_threshold)
+            .field("tool_result_max_chars", &self.tool_result_max_chars)
+            .field("stream", &self.stream)
+            .field("web_search_provider", &self.web_search_provider)
+            .field("serper_api_key", &"[REDACTED]")
+            .finish()
+    }
+}
+
 fn parse_web_search_provider(value: &str) -> Result<WebSearchProvider, ConfigError> {
     match value.trim().to_ascii_lowercase().as_str() {
         "duckduckgo" => Ok(WebSearchProvider::DuckDuckGo),
         "serper_api" | "serperapi" | "serper" => Ok(WebSearchProvider::SerperApi),
         other => Err(ConfigError::InvalidWebSearchProvider(other.to_string())),
     }
+}
+
+// --- MCP configuration loading ---
+
+use crate::mcp::{McpConfigFile, McpServerConfig};
+
+/// Load MCP configuration from `.anvil/mcp.json`.
+///
+/// Returns `Ok(None)` if the file does not exist (MCP is optional).
+/// Returns `Ok(Some(...))` with expanded environment variables on success.
+/// Returns `Err(...)` on parse or env-var expansion errors.
+pub fn load_mcp_config(
+    paths: &PathConfig,
+) -> Result<Option<HashMap<String, McpServerConfig>>, String> {
+    if !paths.mcp_config_file.exists() {
+        return Ok(None);
+    }
+    let content = std::fs::read_to_string(&paths.mcp_config_file)
+        .map_err(|e| format!("Failed to read mcp.json: {e}"))?;
+    let config: McpConfigFile =
+        serde_json::from_str(&content).map_err(|e| format!("Failed to parse mcp.json: {e}"))?;
+
+    // Expand environment variable references ($VAR_NAME → actual value)
+    // [D4-008] Undefined variables cause an error for the affected server
+    let expanded = expand_env_vars(config.mcp_servers)?;
+
+    // [D4-008] Check for plaintext API key values in env fields
+    check_mcp_config_security_warnings(&expanded);
+
+    Ok(Some(expanded))
+}
+
+/// Expand `$VAR_NAME` references in MCP server config env values.
+///
+/// [D4-008] If a `$VAR_NAME` reference is undefined, returns an error
+/// naming the variable and the server that requires it.
+fn expand_env_vars(
+    configs: HashMap<String, McpServerConfig>,
+) -> Result<HashMap<String, McpServerConfig>, String> {
+    let mut result = HashMap::new();
+    for (server_name, mut config) in configs {
+        let mut expanded_env = HashMap::new();
+        for (key, value) in &config.env {
+            if let Some(var_name) = value.strip_prefix('$') {
+                match std::env::var(var_name) {
+                    Ok(resolved) => {
+                        expanded_env.insert(key.clone(), resolved);
+                    }
+                    Err(_) => {
+                        return Err(format!(
+                            "Environment variable ${var_name} is not set (required by server '{server_name}')"
+                        ));
+                    }
+                }
+            } else {
+                expanded_env.insert(key.clone(), value.clone());
+            }
+        }
+        config.env = expanded_env;
+        result.insert(server_name, config);
+    }
+    Ok(result)
+}
+
+/// Known prefixes that indicate an API key or token.
+const KNOWN_SECRET_PREFIXES: &[&str] = &["ghp_", "sk-", "xoxb-", "xoxp-", "ghu_", "ghs_"];
+
+/// [D4-008] Check MCP config env fields for plaintext API keys.
+///
+/// Warns if an env value appears to be a hardcoded secret rather than
+/// an environment variable reference (`$VAR`).
+fn check_mcp_config_security_warnings(configs: &HashMap<String, McpServerConfig>) {
+    for (server_name, config) in configs {
+        for (key, value) in &config.env {
+            // Skip env-var references
+            if value.starts_with('$') {
+                continue;
+            }
+            // Check length and known prefixes
+            if value.len() >= 20 {
+                let looks_like_secret = KNOWN_SECRET_PREFIXES
+                    .iter()
+                    .any(|prefix| value.starts_with(prefix));
+                if looks_like_secret {
+                    eprintln!(
+                        "⚠ Warning: MCP server '{server_name}' env key '{key}' appears to contain \
+                         a plaintext API key. Consider using an environment variable reference \
+                         (e.g., \"${key}\") instead for better security."
+                    );
+                }
+            }
+        }
+    }
+}
+
+// --- Hooks configuration loading ---
+
+use crate::hooks::{HookError, HooksConfig, MAX_ENTRIES_PER_HOOK_POINT};
+
+/// Load hooks configuration from `.anvil/hooks.json`.
+///
+/// Returns `Ok(None)` if the file does not exist (hooks are optional).
+/// Returns `Ok(Some(...))` on successful parse.
+/// Returns `Err(...)` on parse errors (DR2-009).
+///
+/// DR4-005: Validates the hooks.json path is within cwd/.anvil/.
+/// DR4-007: Caps entries per hook point to 16.
+pub fn load_hooks_config(paths: &PathConfig) -> Result<Option<HooksConfig>, HookError> {
+    if !paths.hooks_config_file.exists() {
+        return Ok(None);
+    }
+
+    // DR4-005: Validate path is within cwd
+    if let Ok(canonical) = paths.hooks_config_file.canonicalize()
+        && let Ok(cwd_canonical) = paths.cwd.canonicalize()
+        && !canonical.starts_with(&cwd_canonical)
+    {
+        return Err(HookError::ParseError {
+            file: paths.hooks_config_file.clone(),
+            reason: "hooks.json path is outside the project directory".to_string(),
+        });
+    }
+
+    tracing::info!(path = %paths.hooks_config_file.display(), "hooks.json detected");
+
+    let content =
+        std::fs::read_to_string(&paths.hooks_config_file).map_err(|e| HookError::ParseError {
+            file: paths.hooks_config_file.clone(),
+            reason: format!("failed to read: {e}"),
+        })?;
+
+    let mut config: HooksConfig =
+        serde_json::from_str(&content).map_err(|e| HookError::ParseError {
+            file: paths.hooks_config_file.clone(),
+            reason: format!("failed to parse: {e}"),
+        })?;
+
+    // DR4-007: Cap entries per hook point
+    for (point, entries) in config.hooks.iter_mut() {
+        if entries.len() > MAX_ENTRIES_PER_HOOK_POINT {
+            tracing::warn!(
+                hook_point = ?point,
+                count = entries.len(),
+                max = MAX_ENTRIES_PER_HOOK_POINT,
+                "hook entries exceed limit, truncating"
+            );
+            entries.truncate(MAX_ENTRIES_PER_HOOK_POINT);
+        }
+    }
+
+    Ok(Some(config))
 }

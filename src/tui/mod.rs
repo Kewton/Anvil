@@ -5,7 +5,8 @@
 
 use crate::config::EffectiveConfig;
 use crate::contracts::{
-    AppStateSnapshot, ConsoleMessageRole, ConsoleMessageView, ConsoleRenderContext, RuntimeState,
+    AppStateSnapshot, ConsoleMessageRole, ConsoleMessageView, ConsoleRenderContext,
+    ContextWarningLevel, RuntimeState,
 };
 
 /// Stateless console renderer.
@@ -29,7 +30,7 @@ impl Tui {
             "local / auto"
         };
 
-        [
+        let mut lines = vec![
             "    ___              _ __".to_string(),
             "   /   |  ____ _   _(_) /_".to_string(),
             "  / /| | / __ \\ | / / / __/".to_string(),
@@ -42,6 +43,13 @@ impl Tui {
             format!("  Context : {}k", config.runtime.context_window / 1_000),
             format!("  Mode    : {mode}"),
             format!("  Project : {}", config.paths.cwd.display()),
+        ];
+
+        if config.project_instructions().is_some() {
+            lines.push("  ANVIL.md: loaded".to_string());
+        }
+
+        lines.extend([
             String::new(),
             "  --------------------------------------------------------------".to_string(),
             format!("  {}", snapshot.status.line),
@@ -49,8 +57,9 @@ impl Tui {
             "  --------------------------------------------------------------".to_string(),
             String::new(),
             "  [U] you >".to_string(),
-        ]
-        .join("\n")
+        ]);
+
+        lines.join("\n")
     }
 
     pub fn render_console(&self, view: &ConsoleRenderContext) -> String {
@@ -103,6 +112,12 @@ impl Tui {
             lines.push(format!("  action : {}", approval.summary));
             lines.push(format!("  risk : {}", approval.risk));
             lines.push(format!("  call : {}", approval.tool_call_id));
+            if let Some(diff) = &approval.diff_preview {
+                lines.push("  diff :".to_string());
+                for diff_line in colorize_diff(diff).lines() {
+                    lines.push(format!("    {diff_line}"));
+                }
+            }
         }
 
         if let Some(interrupt) = &snapshot.interrupt {
@@ -144,6 +159,26 @@ impl Tui {
             }
         }
 
+        if let Some(warning_level) = &snapshot.context_warning {
+            let percent = snapshot
+                .context_usage
+                .as_ref()
+                .map(|u| u.usage_percent())
+                .unwrap_or(0);
+            match warning_level {
+                ContextWarningLevel::Warning => {
+                    lines.push(format!(
+                        "[!] Warning: Context usage at {percent}%. Consider running /compact to free space."
+                    ));
+                }
+                ContextWarningLevel::Critical => {
+                    lines.push(format!(
+                        "[!] CRITICAL: Context usage at {percent}%! Run /compact immediately to avoid degraded responses."
+                    ));
+                }
+            }
+        }
+
         lines.push(status_divider());
         lines.push(self.render_footer(snapshot, &view.model_name));
         lines.push(render_hint_line(snapshot));
@@ -180,15 +215,7 @@ impl Tui {
         let ctx = snapshot
             .context_usage
             .as_ref()
-            .map(|usage| {
-                let percent = if usage.max_tokens == 0 {
-                    0
-                } else {
-                    ((usage.estimated_tokens as f64 / usage.max_tokens as f64) * 100.0).round()
-                        as u32
-                };
-                format!("ctx:{percent}%")
-            })
+            .map(|usage| format!("ctx:{}%", usage.usage_percent()))
             .unwrap_or_else(|| "ctx:-".to_string());
 
         let active = snapshot
@@ -225,13 +252,38 @@ fn render_hint_line(snapshot: &crate::contracts::AppStateSnapshot) -> String {
         RuntimeState::Working => "ESC stop  /help  /status  /plan  tools active".to_string(),
         RuntimeState::AwaitingApproval => "approve:y  deny:n  /help  /status".to_string(),
         RuntimeState::Interrupted => "/status  /resume  /reset".to_string(),
-        RuntimeState::Done => "/diff  /save  /continue".to_string(),
+        RuntimeState::Done => "/diff  /save  /continue  /compact".to_string(),
         RuntimeState::Error => "/status  /retry  /reset".to_string(),
     }
 }
 
 fn status_divider() -> String {
     "--------------------------------------------------------------".to_string()
+}
+
+/// Apply ANSI colour codes to a plain-text diff string.
+///
+/// - Lines starting with `+` (but not `+++`) are coloured green.
+/// - Lines starting with `-` (but not `---`) are coloured red.
+/// - All other lines are left unmodified.
+pub fn colorize_diff(diff_text: &str) -> String {
+    const GREEN: &str = "\x1b[32m";
+    const RED: &str = "\x1b[31m";
+    const RESET: &str = "\x1b[0m";
+
+    diff_text
+        .lines()
+        .map(|line| {
+            if line.starts_with('+') && !line.starts_with("+++") {
+                format!("{GREEN}{line}{RESET}")
+            } else if line.starts_with('-') && !line.starts_with("---") {
+                format!("{RED}{line}{RESET}")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn summarize_tool_logs(logs: &[crate::contracts::ToolLogView]) -> (usize, usize, usize) {

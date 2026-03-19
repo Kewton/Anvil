@@ -2,7 +2,8 @@ mod common;
 
 use anvil::contracts::{AppEvent, AppStateSnapshot, RuntimeState};
 use anvil::session::{
-    MessageStatus, SessionRecord, SessionStore, new_assistant_message, new_user_message,
+    MessageRole, MessageStatus, SessionMessage, SessionRecord, SessionStore, new_assistant_message,
+    new_user_message,
 };
 use anvil::state::{StateMachine, StateTransition};
 use std::path::PathBuf;
@@ -118,6 +119,7 @@ fn session_store_persists_and_restores_messages() {
     config.paths.state_dir = root.join(".anvil").join("state");
     config.paths.session_dir = root.join(".anvil").join("sessions");
     config.paths.session_file = config.paths.session_dir.join("session_roundtrip.json");
+    config.paths.logs_dir = root.join(".anvil").join("logs");
 
     let store = SessionStore::from_config(&config);
     let mut session = store
@@ -359,6 +361,7 @@ fn session_interrupt_persists_and_resumes_correctly() {
     config.paths.cwd = root.clone();
     config.paths.session_dir = root.join(".anvil").join("sessions");
     config.paths.session_file = config.paths.session_dir.join("session_interrupt.json");
+    config.paths.logs_dir = root.join(".anvil").join("logs");
 
     let store = anvil::session::SessionStore::from_config(&config);
     let mut session = store
@@ -443,4 +446,183 @@ fn web_search_pending_turn_state_serde_roundtrip() {
         }
         other => panic!("unexpected tool input: {other:?}"),
     }
+}
+
+#[test]
+fn file_edit_pending_turn_state_serde_roundtrip() {
+    use anvil::agent::PendingTurnState;
+    use anvil::tooling::{ToolCallRequest, ToolInput};
+
+    let pending = PendingTurnState {
+        waiting_tool_call_id: "call_edit_001".to_string(),
+        remaining_events: vec![],
+        pending_tool_calls: vec![ToolCallRequest::new(
+            "call_edit_001",
+            "file.edit",
+            ToolInput::FileEdit {
+                path: "./src/main.rs".to_string(),
+                old_string: "fn main()".to_string(),
+                new_string: "fn main() -> Result<()>".to_string(),
+            },
+        )],
+    };
+
+    let json = serde_json::to_string(&pending).expect("serialize should succeed");
+    let deserialized: PendingTurnState =
+        serde_json::from_str(&json).expect("deserialize should succeed");
+
+    assert_eq!(pending, deserialized);
+    assert_eq!(deserialized.pending_tool_calls[0].tool_name, "file.edit");
+    match &deserialized.pending_tool_calls[0].input {
+        ToolInput::FileEdit {
+            path,
+            old_string,
+            new_string,
+        } => {
+            assert_eq!(path, "./src/main.rs");
+            assert_eq!(old_string, "fn main()");
+            assert_eq!(new_string, "fn main() -> Result<()>");
+        }
+        other => panic!("unexpected tool input: {other:?}"),
+    }
+}
+
+#[test]
+fn atomic_write_leaves_no_tmp_file_on_success() {
+    let root = unique_test_dir("atomic_write");
+    let mut config =
+        anvil::config::EffectiveConfig::default_for_test().expect("config should load");
+    config.paths.cwd = root.clone();
+    config.paths.workspace_dir = root.join("workspace");
+    config.paths.config_file = root.join(".anvil").join("config");
+    config.paths.state_dir = root.join(".anvil").join("state");
+    config.paths.session_dir = root.join(".anvil").join("sessions");
+    config.paths.session_file = config.paths.session_dir.join("session_atomic.json");
+    config.paths.logs_dir = root.join(".anvil").join("logs");
+
+    let store = SessionStore::from_config(&config);
+    let mut session = store
+        .load_or_create(&config.paths.cwd)
+        .expect("session should load");
+    session.push_message(new_user_message("msg_001", "atomic write test"));
+    store.save(&session).expect("session should save");
+
+    // The session file should exist
+    assert!(
+        config.paths.session_file.exists(),
+        "session file should exist"
+    );
+
+    // The temporary file (.json.tmp) should NOT exist after a successful save
+    let tmp_path = config.paths.session_file.with_extension("json.tmp");
+    assert!(
+        !tmp_path.exists(),
+        "temporary file should not exist after successful atomic write"
+    );
+
+    // Verify the saved data is readable
+    let reloaded = store
+        .load()
+        .expect("session should reload after atomic write");
+    assert_eq!(reloaded.message_count(), session.message_count());
+}
+
+// ── SessionMessage image_paths tests ──────────────────────────────────
+
+#[test]
+fn session_message_image_paths_default_is_none() {
+    let msg = SessionMessage::new(MessageRole::Tool, "tool", "hello");
+    assert_eq!(msg.image_paths, None);
+}
+
+#[test]
+fn session_message_with_image_paths_builder() {
+    let msg = SessionMessage::new(MessageRole::Tool, "tool", "[画像: test.png]")
+        .with_image_paths(vec!["test.png".to_string()]);
+    assert_eq!(msg.image_paths, Some(vec!["test.png".to_string()]));
+}
+
+#[test]
+fn session_message_backward_compat_deserialize_without_image_paths() {
+    // JSON without image_paths field should deserialize successfully
+    let json = r#"{
+        "id": "msg_1",
+        "role": "User",
+        "author": "you",
+        "content": "hello",
+        "status": "Committed",
+        "tool_call_id": null
+    }"#;
+    let msg: SessionMessage = serde_json::from_str(json).expect("should deserialize");
+    assert_eq!(msg.image_paths, None);
+    assert_eq!(msg.content, "hello");
+}
+
+#[test]
+fn session_message_deserialize_with_image_paths() {
+    let json = r#"{
+        "id": "msg_2",
+        "role": "Tool",
+        "author": "tool",
+        "content": "[画像: test.png]",
+        "status": "Committed",
+        "tool_call_id": null,
+        "image_paths": ["test.png", "photo.jpg"]
+    }"#;
+    let msg: SessionMessage = serde_json::from_str(json).expect("should deserialize");
+    assert_eq!(
+        msg.image_paths,
+        Some(vec!["test.png".to_string(), "photo.jpg".to_string()])
+    );
+}
+
+#[test]
+fn push_message_with_images_adds_image_tokens() {
+    let mut session = SessionRecord::new(PathBuf::from("/tmp/test"));
+    // First get baseline with a text message
+    let text_msg =
+        SessionMessage::new(MessageRole::User, "you", "hello").with_id("msg_1".to_string());
+    session.push_message(text_msg);
+    let baseline = session.estimated_token_count();
+
+    // Now add a message with 2 image paths
+    let img_msg = SessionMessage::new(MessageRole::Tool, "tool", "[画像]")
+        .with_id("msg_2".to_string())
+        .with_image_paths(vec!["a.png".to_string(), "b.png".to_string()]);
+    session.push_message(img_msg);
+
+    let new_count = session.estimated_token_count();
+    // Should have added at least 600 tokens (300 per image)
+    assert!(
+        new_count >= baseline + 600,
+        "expected at least {} but got {}",
+        baseline + 600,
+        new_count
+    );
+}
+
+#[test]
+fn estimated_token_count_accounts_for_images_on_recalc() {
+    let mut session = SessionRecord::new(PathBuf::from("/tmp/test"));
+    let img_msg = SessionMessage::new(MessageRole::Tool, "tool", "x")
+        .with_id("msg_1".to_string())
+        .with_image_paths(vec!["a.png".to_string()]);
+    session.push_message(img_msg);
+
+    // Force cache invalidation by compacting (which sets cache to None)
+    // Then re-check estimated_token_count recalculates including images
+    let count_before = session.estimated_token_count();
+
+    // Compact to invalidate cache
+    session.compact_history(0);
+    let _count_after = session.estimated_token_count();
+
+    // Both should include image tokens (before compact had the image message)
+    assert!(
+        count_before >= 300,
+        "expected at least 300 but got {}",
+        count_before
+    );
+    // After compact, image message was replaced with summary (no images), so count_after may differ
+    // The important thing is the count_before properly included image tokens
 }

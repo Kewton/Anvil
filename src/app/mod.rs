@@ -10,9 +10,12 @@ pub mod plan;
 pub mod render;
 
 use crate::agent::BasicAgentLoop;
-use crate::agent::{AgentEvent, AgentRuntime, PendingTurnState};
+use crate::agent::{AgentEvent, AgentRuntime, PendingTurnState, ProjectLanguage};
 use crate::config::EffectiveConfig;
-use crate::contracts::{AppEvent, AppStateSnapshot, ConsoleRenderContext, RuntimeState};
+use crate::contracts::{
+    AppEvent, AppStateSnapshot, ConsoleRenderContext, ContextUsageView, ContextWarningLevel,
+    RuntimeState,
+};
 use crate::extensions::{ExtensionLoadError, ExtensionRegistry, SlashCommandAction};
 use crate::provider::{
     ProviderBootstrapError, ProviderClient, ProviderErrorKind, ProviderErrorRecord, ProviderEvent,
@@ -25,13 +28,78 @@ use crate::session::{
 };
 use crate::spinner::Spinner;
 use crate::state::{StateMachine, StateTransition};
-use crate::tooling::ToolRegistry;
+use crate::tooling::{
+    ExecutionClass, ExecutionMode, PermissionClass, PlanModePolicy, RollbackPolicy, ToolKind,
+    ToolRegistry, ToolSpec,
+};
 use crate::tui::Tui;
 use std::fmt::{Display, Formatter};
 use std::io::{self, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // Re-export render helpers that form the public API.
 pub use render::{cli_prompt, render_help_frame, slash_commands};
+
+/// Detect project languages from the project root directory.
+///
+/// Checks for the presence of language-specific manifest files and returns
+/// a list of detected languages. Called once at session start and cached.
+pub fn detect_project_languages(project_root: &std::path::Path) -> Vec<ProjectLanguage> {
+    let mut languages = Vec::new();
+    if project_root.join("Cargo.toml").exists() {
+        languages.push(ProjectLanguage::Rust);
+    }
+    if project_root.join("package.json").exists() {
+        languages.push(ProjectLanguage::NodeJs);
+    }
+    languages
+}
+
+/// Tracks context overflow warning state to avoid duplicate notifications.
+///
+/// Private to the app module; not persisted across sessions.
+struct ContextWarningTracker {
+    warned_warning: bool,
+    warned_critical: bool,
+}
+
+impl ContextWarningTracker {
+    fn new() -> Self {
+        Self {
+            warned_warning: false,
+            warned_critical: false,
+        }
+    }
+
+    /// Evaluate current context usage and return a warning level if not yet notified.
+    fn evaluate(&mut self, usage: &ContextUsageView) -> Option<ContextWarningLevel> {
+        let level = usage.warning_level();
+        match level {
+            Some(ContextWarningLevel::Critical) if !self.warned_critical => {
+                self.warned_critical = true;
+                self.warned_warning = true;
+                Some(ContextWarningLevel::Critical)
+            }
+            Some(ContextWarningLevel::Warning) if !self.warned_warning => {
+                self.warned_warning = true;
+                Some(ContextWarningLevel::Warning)
+            }
+            _ => None,
+        }
+    }
+
+    /// Reset flags when usage drops below thresholds (e.g. after /compact).
+    fn reset_if_below_threshold(&mut self, usage: &ContextUsageView) {
+        let ratio = usage.usage_ratio();
+        if ratio < 0.8 {
+            self.warned_warning = false;
+        }
+        if ratio < 0.9 {
+            self.warned_critical = false;
+        }
+    }
+}
 
 /// Central application state.
 pub struct App {
@@ -42,6 +110,15 @@ pub struct App {
     session: SessionRecord,
     extensions: ExtensionRegistry,
     tools: ToolRegistry,
+    system_prompt: String,
+    shutdown_flag: Arc<AtomicBool>,
+    warning_tracker: ContextWarningTracker,
+    /// Hooks engine. `None` when hooks.json is absent or initialization failed.
+    /// Declared before mcp_manager to maintain Drop order (DR3-007).
+    hooks_engine: Option<crate::hooks::HooksEngine>,
+    /// MCP server manager. `None` when mcp.json is absent or initialization failed.
+    /// [D2-010] Declared last so it is dropped last (Drop order = declaration order).
+    mcp_manager: Option<crate::mcp::McpManager>,
 }
 
 /// Whether the session loop should continue or exit.
@@ -91,6 +168,18 @@ impl Display for AppError {
 
 impl std::error::Error for AppError {}
 
+impl AppError {
+    /// Return the process exit code for non-interactive mode.
+    /// - ToolExecution errors → 2 (tool failure)
+    /// - All other errors → 1 (general error)
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            AppError::ToolExecution(_) => 2,
+            _ => 1,
+        }
+    }
+}
+
 impl From<crate::config::ConfigError> for AppError {
     fn from(value: crate::config::ConfigError) -> Self {
         Self::Config(value)
@@ -131,6 +220,7 @@ impl App {
     pub fn new(
         config: EffectiveConfig,
         provider: ProviderRuntimeContext,
+        shutdown_flag: Arc<AtomicBool>,
     ) -> Result<Self, AppError> {
         let session_store = SessionStore::from_config(&config);
         let mut session = if config.mode.fresh_session {
@@ -142,17 +232,106 @@ impl App {
             .last_snapshot
             .clone()
             .unwrap_or_else(|| AppStateSnapshot::new(RuntimeState::Ready));
-        let extensions = ExtensionRegistry::load(&config.paths.cwd)?;
+        let home_dir = std::env::var("HOME").ok().map(std::path::PathBuf::from);
+        let extensions = ExtensionRegistry::load(&config.paths.cwd, home_dir.as_deref())?;
         session.auto_compact_threshold = config.runtime.auto_compact_threshold;
 
+        // --- MCP initialization (Task 3.2) ---
+        // [D1-007] shutdown_flag is managed by App side (YAGNI)
+        let mcp_manager = match crate::config::load_mcp_config(&config.paths) {
+            Ok(Some(mcp_configs)) => {
+                match crate::mcp::McpManager::start_all(mcp_configs) {
+                    Ok(manager) => Some(manager),
+                    Err(e) => {
+                        eprintln!("Warning: MCP initialization failed: {e}");
+                        None // graceful degradation
+                    }
+                }
+            }
+            Ok(None) => None, // mcp.json not found → skip completely
+            Err(e) => {
+                eprintln!("Warning: MCP config parse error: {e}");
+                None // graceful degradation
+            }
+        };
+
+        // --- Hooks initialization (MCP pattern, DR3-010) ---
+        let hooks_engine = match crate::config::load_hooks_config(&config.paths) {
+            Ok(Some(hooks_config)) => {
+                if hooks_config.is_empty() {
+                    None
+                } else {
+                    Some(crate::hooks::HooksEngine::new(
+                        hooks_config,
+                        Arc::clone(&shutdown_flag),
+                    ))
+                }
+            }
+            Ok(None) => None, // hooks.json not found → skip completely
+            Err(e) => {
+                eprintln!("Warning: hooks config error: {e}");
+                None // graceful degradation
+            }
+        };
+
+        // [D1-009] ToolSpec conversion and ToolRegistry registration done by App side (SRP)
+        // [D2-003] standard_tool_registry() is a free function
+        let mut tools = standard_tool_registry();
+        // Register sub-agent tools separately (design decision #6, DR1-008)
+        tools.register_agent_explore();
+        tools.register_agent_plan();
+        if let Some(ref manager) = mcp_manager {
+            let mcp_tools = manager.get_tools();
+            for (server_name, tool_list) in &mcp_tools {
+                for tool_info in tool_list {
+                    // [D1-011, D2-001] Default ToolSpec values for MCP tools
+                    let spec = ToolSpec {
+                        version: 1,
+                        name: format!("mcp__{server_name}__{}", tool_info.name),
+                        kind: ToolKind::Mcp,
+                        execution_class: ExecutionClass::Network,
+                        permission_class: PermissionClass::Confirm,
+                        execution_mode: ExecutionMode::SequentialOnly,
+                        plan_mode: PlanModePolicy::Allowed,
+                        rollback_policy: RollbackPolicy::None,
+                    };
+                    tools.register(spec);
+                }
+            }
+        }
+
+        // [D1-009] System prompt generation with MCP tool descriptions done by App side
+        let mcp_descriptions = mcp_manager.as_ref().map(|manager| {
+            let mcp_tools = manager.get_tools();
+            crate::agent::generate_mcp_tool_descriptions(&mcp_tools)
+        });
+
+        let detected_languages = detect_project_languages(&config.paths.cwd);
+        let base_prompt = crate::agent::tool_protocol_system_prompt(
+            &detected_languages,
+            mcp_descriptions.as_deref(),
+        );
+        let system_prompt = match config.project_instructions() {
+            Some(instructions) => format!(
+                "{}\n\n## Project instructions (from ANVIL.md)\n{}",
+                base_prompt, instructions
+            ),
+            None => base_prompt,
+        };
+
         Ok(Self {
-            tools: standard_tool_registry(),
+            tools,
             config,
             provider,
             state_machine: StateMachine::from_snapshot(initial_state_snapshot),
             session_store,
             session,
             extensions,
+            system_prompt,
+            shutdown_flag,
+            warning_tracker: ContextWarningTracker::new(),
+            hooks_engine,
+            mcp_manager,
         })
     }
 
@@ -191,6 +370,82 @@ impl App {
 
     pub(crate) fn config(&self) -> &EffectiveConfig {
         &self.config
+    }
+
+    /// Check whether a shutdown has been requested via the shared flag.
+    pub fn is_shutdown_requested(&self) -> bool {
+        self.shutdown_flag.load(Ordering::Relaxed)
+    }
+
+    /// Check whether the last turn had any tool execution failures.
+    /// Used by non-interactive mode to determine exit code.
+    pub fn has_tool_execution_failure(&self) -> bool {
+        self.session
+            .last_turn_tool_results()
+            .any(|result| result.is_error)
+    }
+
+    /// Save the session on exit (wrapper for flush_session).
+    pub(crate) fn save_session_on_exit(&mut self) {
+        let _ = self.flush_session();
+    }
+
+    /// Run PostSession hook (DR2-005, DR2-007 facade method).
+    ///
+    /// Builds PostSessionEvent from config and session, then delegates to
+    /// HooksEngine. Soft-fail: errors are logged but not propagated.
+    pub(crate) fn run_post_session_hook(&mut self) {
+        let Some(ref engine) = self.hooks_engine else {
+            return;
+        };
+        let event = crate::hooks::PostSessionEvent {
+            hook_point: "PostSession",
+            session_id: self.session.metadata.session_id.clone(),
+            mode: if self.config.mode.interactive {
+                "interactive".to_string()
+            } else {
+                "non-interactive".to_string()
+            },
+        };
+        if let Err(err) = engine.run_post_session(event) {
+            tracing::warn!("PostSession hook error: {err}");
+        }
+    }
+
+    /// Run PreCompact hook + compact_history (DR1-005 wrapper, DR2-003).
+    ///
+    /// trigger: "auto" or "manual"
+    /// For auto: checks should_compact() first, keep_recent = threshold/2
+    /// For manual: unconditional, keep_recent = 8
+    fn compact_with_hooks(&mut self, trigger: &str) -> bool {
+        if trigger == "auto" && !self.session.should_compact() {
+            return false;
+        }
+
+        // Run PreCompact hook (soft-fail)
+        if let Some(ref engine) = self.hooks_engine {
+            let event = crate::hooks::PreCompactEvent {
+                hook_point: "PreCompact",
+                session_id: self.session.metadata.session_id.clone(),
+                trigger: trigger.to_string(),
+                message_count: self.session.messages.len(),
+            };
+            if let Err(err) = engine.run_pre_compact(event) {
+                tracing::warn!("PreCompact hook error: {err}");
+            }
+        }
+
+        let keep_recent = if trigger == "auto" {
+            self.session.auto_compact_threshold / 2
+        } else {
+            8
+        };
+        self.session.compact_history(keep_recent)
+    }
+
+    /// Get a clone of the shutdown flag for injection into sub-components.
+    pub(crate) fn shutdown_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.shutdown_flag)
     }
 
     pub(crate) fn session_mut(&mut self) -> &mut SessionRecord {
@@ -280,13 +535,14 @@ impl App {
             &self.session,
             self.provider.capabilities.streaming && self.config.runtime.stream,
             self.config.runtime.context_window,
+            &self.system_prompt,
         );
 
         // Phase 1: Collect events from provider with spinner + streaming output.
-        let mut spinner_opt = Some(Spinner::start(format!(
-            "Thinking. model={}",
-            self.config.runtime.model
-        )));
+        let mut spinner_opt = Some(Spinner::start(
+            format!("Thinking. model={}", self.config.runtime.model),
+            self.config.mode.interactive,
+        ));
 
         let mut token_buffer = String::new();
         let mut collected_events: Vec<ProviderEvent> = Vec::new();
@@ -389,15 +645,57 @@ impl App {
                     tui,
                 )
             }
-            Err(ProviderTurnError::Backend(message)) => {
-                self.record_provider_error(ProviderTurnError::Backend(message.clone()))?;
+            Err(
+                ref err @ ProviderTurnError::Network(ref msg)
+                | ref err @ ProviderTurnError::ServerError {
+                    message: ref msg, ..
+                }
+                | ref err @ ProviderTurnError::Timeout(ref msg)
+                | ref err @ ProviderTurnError::Backend(ref msg),
+            ) => {
+                self.record_provider_error(err.clone())?;
                 self.execute_runtime_events(
                     &[AgentEvent::Failed {
                         status: "Error. provider turn failed".to_string(),
-                        error_summary: message,
+                        error_summary: msg.clone(),
                         recommended_actions: vec![
                             "retry turn".to_string(),
                             "inspect provider".to_string(),
+                        ],
+                        elapsed_ms: 0,
+                    }],
+                    tui,
+                )
+            }
+            Err(
+                ref err @ ProviderTurnError::ClientError {
+                    status_code,
+                    ref message,
+                },
+            ) => {
+                self.record_provider_error(err.clone())?;
+                self.execute_runtime_events(
+                    &[AgentEvent::Failed {
+                        status: "Error. provider turn failed".to_string(),
+                        error_summary: format!("client error ({status_code}): {message}"),
+                        recommended_actions: vec![
+                            "check authentication credentials".to_string(),
+                            "verify API key and provider URL".to_string(),
+                        ],
+                        elapsed_ms: 0,
+                    }],
+                    tui,
+                )
+            }
+            Err(ref err @ ProviderTurnError::Parse(ref msg)) => {
+                self.record_provider_error(err.clone())?;
+                self.execute_runtime_events(
+                    &[AgentEvent::Failed {
+                        status: "Error. provider turn failed".to_string(),
+                        error_summary: format!("parse error: {msg}"),
+                        recommended_actions: vec![
+                            "retry turn".to_string(),
+                            "check model compatibility".to_string(),
                         ],
                         elapsed_ms: 0,
                     }],
@@ -438,12 +736,8 @@ impl App {
         )?;
         let snapshot = AppStateSnapshot::new(RuntimeState::Ready)
             .with_status("Approval denied. Ready for the next task".to_string())
-            .with_completion_summary("Approval denied. No tool was executed.", "no changes made")
-            .with_context_usage(
-                self.session.estimated_token_count(),
-                self.config.runtime.context_window,
-            );
-        self.apply_transition(snapshot, StateTransition::ResetToReady)?;
+            .with_completion_summary("Approval denied. No tool was executed.", "no changes made");
+        self.transition_with_context(snapshot, StateTransition::ResetToReady)?;
         self.flush_session()?;
         Ok(vec![self.render_console(tui)?])
     }
@@ -451,12 +745,8 @@ impl App {
     pub fn reset_to_ready(&mut self) -> Result<AppStateSnapshot, AppError> {
         self.clear_pending_turn()?;
         let snapshot = AppStateSnapshot::new(RuntimeState::Ready)
-            .with_status("Ready for the next task".to_string())
-            .with_context_usage(
-                self.session.estimated_token_count(),
-                self.config.runtime.context_window,
-            );
-        self.apply_transition(snapshot, StateTransition::ResetToReady)
+            .with_status("Ready for the next task".to_string());
+        self.transition_with_context(snapshot, StateTransition::ResetToReady)
     }
 
     pub(crate) fn apply_transition_for_mock(
@@ -496,6 +786,18 @@ impl App {
         self.apply_transition(snapshot, transition)
     }
 
+    /// Evaluate context warning on a snapshot and update the state machine if needed.
+    pub(crate) fn evaluate_context_warning(&mut self, snapshot: &mut AppStateSnapshot) {
+        if let Some(usage) = &snapshot.context_usage
+            && let Some(level) = self.warning_tracker.evaluate(usage)
+        {
+            snapshot.context_warning = Some(level);
+            self.state_machine.replace_snapshot(snapshot.clone());
+            self.session
+                .set_last_snapshot(self.state_machine.snapshot().clone());
+        }
+    }
+
     pub(crate) fn persist_session_event_for_mock(
         &mut self,
         event: AppEvent,
@@ -510,8 +812,12 @@ impl App {
 
     /// Flush session to disk if the dirty flag is set.
     /// Also runs deferred auto-compaction before writing.
+    /// In non-interactive mode, skip disk persistence entirely.
     fn flush_session(&mut self) -> Result<(), AppError> {
-        self.session.compact_if_needed();
+        if !self.config.mode.interactive {
+            return Ok(());
+        }
+        self.compact_with_hooks("auto");
         if self.session.dirty {
             self.session_store.save(&self.session)?;
             self.session.clear_dirty();
@@ -520,7 +826,12 @@ impl App {
     }
 
     /// Immediately persist session to disk (for crash-safety critical paths).
+    /// In non-interactive mode, skip disk persistence entirely.
     fn persist_session_immediate(&mut self, event: AppEvent) -> Result<(), AppError> {
+        if !self.config.mode.interactive {
+            self.session.record_event(event);
+            return Ok(());
+        }
         self.session.record_event(event);
         self.session_store.save(&self.session)?;
         self.session.clear_dirty();
@@ -586,6 +897,23 @@ impl App {
                 tool_call_id,
                 elapsed_ms,
             } => {
+                // Attempt to generate a diff preview from pending tool calls.
+                let diff_preview = self
+                    .session
+                    .pending_turn
+                    .as_ref()
+                    .and_then(|pending| {
+                        pending
+                            .pending_tool_calls
+                            .iter()
+                            .find(|tc| tc.tool_call_id == *tool_call_id)
+                    })
+                    .and_then(|tc| {
+                        crate::tooling::diff::generate_diff_preview(
+                            &self.config.paths.cwd,
+                            &tc.input,
+                        )
+                    });
                 let snapshot = AppStateSnapshot::new(RuntimeState::AwaitingApproval)
                     .with_status(status.clone())
                     .with_approval(
@@ -594,6 +922,7 @@ impl App {
                         risk.clone(),
                         tool_call_id.clone(),
                     )
+                    .with_diff_preview(diff_preview)
                     .with_elapsed_ms(*elapsed_ms);
                 self.transition_with_context(snapshot, StateTransition::RequestApproval)
             }
@@ -625,7 +954,10 @@ impl App {
                     .with_tool_logs(render::build_tool_logs(tool_logs))
                     .with_completion_summary(completion_summary.clone(), saved_status.clone())
                     .with_elapsed_ms(*elapsed_ms);
-                self.transition_with_context(snapshot, StateTransition::Finish)
+                let mut snapshot =
+                    self.transition_with_context(snapshot, StateTransition::Finish)?;
+                self.evaluate_context_warning(&mut snapshot);
+                Ok(snapshot)
             }
             AgentEvent::Interrupted {
                 status,
@@ -692,23 +1024,14 @@ impl App {
     fn begin_live_turn_state(&mut self) -> Result<(), AppError> {
         let snapshot = AppStateSnapshot::new(RuntimeState::Thinking)
             .with_status(format!("Thinking. model={}", self.config.runtime.model))
-            .with_elapsed_ms(0)
-            .with_context_usage(
-                self.session.estimated_token_count(),
-                self.config.runtime.context_window,
-            );
-        self.apply_transition(snapshot, StateTransition::StartThinking)?;
+            .with_elapsed_ms(0);
+        self.transition_with_context(snapshot, StateTransition::StartThinking)?;
         Ok(())
     }
 
     fn record_provider_error(&mut self, error: ProviderTurnError) -> Result<(), AppError> {
-        let (kind, message) = match error {
-            ProviderTurnError::Cancelled => (
-                ProviderErrorKind::Cancelled,
-                "provider turn cancelled".to_string(),
-            ),
-            ProviderTurnError::Backend(message) => (ProviderErrorKind::Backend, message),
-        };
+        let kind = ProviderErrorKind::from(&error);
+        let message = error.to_string();
 
         self.session.push_message(
             SessionMessage::new(MessageRole::System, "provider", message.clone())
@@ -746,7 +1069,17 @@ impl App {
             return self.handle_slash_command(trimmed, provider_client, tui);
         }
 
-        match self.run_live_turn(trimmed, provider_client, tui) {
+        self.run_turn_to_output(trimmed, provider_client, tui)
+    }
+
+    /// Run a live turn and wrap the result into a `CliTurnOutput`.
+    fn run_turn_to_output<C: ProviderClient>(
+        &mut self,
+        prompt: impl Into<String>,
+        provider_client: &C,
+        tui: &Tui,
+    ) -> Result<CliTurnOutput, AppError> {
+        match self.run_live_turn(prompt, provider_client, tui) {
             Ok(frames) => Ok(CliTurnOutput {
                 frames,
                 control: SessionControl::Continue,
@@ -792,7 +1125,11 @@ impl App {
                 control: SessionControl::Continue,
             },
             Some(SlashCommandAction::Status) => CliTurnOutput {
-                frames: vec![self.render_console(tui)?],
+                frames: vec![format!(
+                    "{}\n{}",
+                    self.render_console(tui)?,
+                    render::render_status_detail(self.state_machine.snapshot())
+                )],
                 control: SessionControl::Continue,
             },
             Some(SlashCommandAction::Plan) => CliTurnOutput {
@@ -855,19 +1192,17 @@ impl App {
                 control: SessionControl::Exit,
             },
             Some(SlashCommandAction::Prompt(prompt)) => {
-                match self.run_live_turn(prompt, provider_client, tui) {
-                    Ok(frames) => CliTurnOutput {
-                        frames,
-                        control: SessionControl::Continue,
-                    },
-                    Err(AppError::PendingApprovalRequired) => CliTurnOutput {
-                        frames: vec![render::render_pending_approval_frame(
-                            self.state_machine.snapshot(),
-                        )],
-                        control: SessionControl::Continue,
-                    },
-                    Err(err) => return Err(err),
-                }
+                self.run_turn_to_output(prompt, provider_client, tui)?
+            }
+            Some(SlashCommandAction::Skill {
+                args,
+                content,
+                skill_dir,
+                ..
+            }) => {
+                let prompt =
+                    crate::extensions::skills::expand_variables(&content, &args, &skill_dir);
+                self.run_turn_to_output(prompt, provider_client, tui)?
             }
             _ => {
                 let suggestion = self.extensions.suggest_command(command);
@@ -915,9 +1250,14 @@ impl App {
     }
 
     fn compact_session_history(&mut self) -> Result<String, AppError> {
-        let changed = self.session.compact_history(8);
+        let changed = self.compact_with_hooks("manual");
         if changed {
             self.persist_session(AppEvent::SessionSaved)?;
+            let usage = ContextUsageView {
+                estimated_tokens: self.session.estimated_token_count(),
+                max_tokens: self.config.runtime.context_window,
+            };
+            self.warning_tracker.reset_if_below_threshold(&usage);
             Ok("[A] anvil > compacted older session history".to_string())
         } else {
             Ok("[A] anvil > nothing to compact".to_string())
@@ -988,4 +1328,87 @@ fn standard_tool_registry() -> ToolRegistry {
 }
 
 // Re-export CLI entry points from the cli module.
-pub use cli::{run, run_session_loop};
+pub use cli::{run, run_session_loop, run_with_args};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_usage(estimated: usize, max: u32) -> ContextUsageView {
+        ContextUsageView {
+            estimated_tokens: estimated,
+            max_tokens: max,
+        }
+    }
+
+    #[test]
+    fn tracker_evaluate_first_warning() {
+        let mut tracker = ContextWarningTracker::new();
+        let usage = make_usage(8500, 10000);
+        assert_eq!(tracker.evaluate(&usage), Some(ContextWarningLevel::Warning));
+    }
+
+    #[test]
+    fn tracker_evaluate_suppresses_duplicate_warning() {
+        let mut tracker = ContextWarningTracker::new();
+        let usage = make_usage(8500, 10000);
+        assert_eq!(tracker.evaluate(&usage), Some(ContextWarningLevel::Warning));
+        assert_eq!(tracker.evaluate(&usage), None);
+    }
+
+    #[test]
+    fn tracker_evaluate_first_critical() {
+        let mut tracker = ContextWarningTracker::new();
+        let usage = make_usage(9500, 10000);
+        assert_eq!(
+            tracker.evaluate(&usage),
+            Some(ContextWarningLevel::Critical)
+        );
+    }
+
+    #[test]
+    fn tracker_evaluate_critical_also_sets_warning_flag() {
+        let mut tracker = ContextWarningTracker::new();
+        let critical = make_usage(9500, 10000);
+        assert_eq!(
+            tracker.evaluate(&critical),
+            Some(ContextWarningLevel::Critical)
+        );
+        // Warning should also be suppressed since critical set the flag
+        let warning = make_usage(8500, 10000);
+        assert_eq!(tracker.evaluate(&warning), None);
+    }
+
+    #[test]
+    fn tracker_evaluate_below_threshold_returns_none() {
+        let mut tracker = ContextWarningTracker::new();
+        let usage = make_usage(5000, 10000);
+        assert_eq!(tracker.evaluate(&usage), None);
+    }
+
+    #[test]
+    fn tracker_reset_below_80_clears_warning() {
+        let mut tracker = ContextWarningTracker::new();
+        let high = make_usage(8500, 10000);
+        tracker.evaluate(&high);
+        assert!(tracker.warned_warning);
+
+        let low = make_usage(7000, 10000);
+        tracker.reset_if_below_threshold(&low);
+        assert!(!tracker.warned_warning);
+    }
+
+    #[test]
+    fn tracker_reset_below_90_clears_critical() {
+        let mut tracker = ContextWarningTracker::new();
+        let high = make_usage(9500, 10000);
+        tracker.evaluate(&high);
+        assert!(tracker.warned_critical);
+
+        let medium = make_usage(8500, 10000);
+        tracker.reset_if_below_threshold(&medium);
+        assert!(!tracker.warned_critical);
+        // Warning flag should remain since 85% >= 80%
+        assert!(tracker.warned_warning);
+    }
+}

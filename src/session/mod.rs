@@ -5,6 +5,9 @@
 
 use crate::agent::PendingTurnState;
 use crate::config::EffectiveConfig;
+use crate::contracts::tokens::{
+    ContentKind, IMAGE_TOKENS, estimate_tokens as contracts_estimate_tokens,
+};
 use crate::contracts::{
     AppEvent, AppStateSnapshot, ConsoleMessageRole, ConsoleMessageView, ConsoleRenderContext,
 };
@@ -39,6 +42,12 @@ pub struct SessionMessage {
     pub content: String,
     pub status: MessageStatus,
     pub tool_call_id: Option<String>,
+    /// Whether this tool result represents an error.
+    /// Added for non-interactive mode exit code determination.
+    #[serde(default)]
+    pub is_error: bool,
+    #[serde(default)]
+    pub image_paths: Option<Vec<String>>,
 }
 
 impl SessionMessage {
@@ -50,6 +59,8 @@ impl SessionMessage {
             content: content.into(),
             status: MessageStatus::Committed,
             tool_call_id: None,
+            is_error: false,
+            image_paths: None,
         }
     }
 
@@ -65,6 +76,11 @@ impl SessionMessage {
 
     pub fn with_tool_call_id(mut self, tool_call_id: impl Into<String>) -> Self {
         self.tool_call_id = Some(tool_call_id.into());
+        self
+    }
+
+    pub fn with_image_paths(mut self, paths: Vec<String>) -> Self {
+        self.image_paths = Some(paths);
         self
     }
 }
@@ -130,12 +146,23 @@ impl SessionRecord {
 
     pub fn push_message(&mut self, message: SessionMessage) {
         // Update cached token count incrementally
-        let msg_tokens = estimate_tokens(&message.content);
+        let kind = ContentKind::from_message_role(message.role);
+        let mut msg_tokens = contracts_estimate_tokens(&message.content, kind);
+        // Add fixed 300 tokens per image
+        if let Some(ref paths) = message.image_paths {
+            msg_tokens += IMAGE_TOKENS * paths.len();
+        }
         if let Some(cached) = self.cached_token_count.get() {
             self.cached_token_count.set(Some(cached + msg_tokens));
         }
         self.messages.push(message);
         self.touch();
+    }
+
+    /// Check whether auto-compaction should run (DR3-001).
+    /// Zero-guard: returns false if auto_compact_threshold == 0.
+    pub fn should_compact(&self) -> bool {
+        self.auto_compact_threshold > 0 && self.messages.len() > self.auto_compact_threshold
     }
 
     /// Run auto-compaction if message count exceeds the threshold.
@@ -258,7 +285,14 @@ impl SessionRecord {
         let count: usize = self
             .messages
             .iter()
-            .map(|message| estimate_tokens(&message.content))
+            .map(|message| {
+                let kind = ContentKind::from_message_role(message.role);
+                let mut tokens = contracts_estimate_tokens(&message.content, kind);
+                if let Some(ref paths) = message.image_paths {
+                    tokens += IMAGE_TOKENS * paths.len();
+                }
+                tokens
+            })
             .sum();
         self.cached_token_count.set(Some(count));
         count
@@ -268,6 +302,13 @@ impl SessionRecord {
         if self.messages.len() <= keep_recent {
             return false;
         }
+
+        let messages_to_compact = self.messages.len() - keep_recent;
+        tracing::debug!(
+            compacted = messages_to_compact,
+            kept = keep_recent,
+            "compacting session history"
+        );
 
         let split_at = self.messages.len() - keep_recent;
         let compacted = &self.messages[..split_at];
@@ -354,6 +395,28 @@ impl SessionRecord {
     pub fn clear_dirty(&mut self) {
         self.dirty = false;
     }
+
+    /// Return the content of the last assistant message, if any.
+    pub fn last_assistant_message(&self) -> Option<&str> {
+        self.messages
+            .iter()
+            .rev()
+            .find(|m| m.role == MessageRole::Assistant)
+            .map(|m| m.content.as_str())
+    }
+
+    /// Return tool result messages from the last turn (after the last user message).
+    pub fn last_turn_tool_results(&self) -> impl Iterator<Item = &SessionMessage> {
+        let last_user_idx = self
+            .messages
+            .iter()
+            .rposition(|m| m.role == MessageRole::User)
+            .unwrap_or(0);
+
+        self.messages[last_user_idx..]
+            .iter()
+            .filter(|m| m.role == MessageRole::Tool)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -375,6 +438,7 @@ impl SessionStore {
     }
 
     pub fn load_or_create(&self, cwd: &Path) -> Result<SessionRecord, SessionError> {
+        tracing::debug!(path = %self.file_path.display(), "loading session");
         if self.file_path.exists() {
             match self.load() {
                 Ok(mut record) => {
@@ -382,6 +446,7 @@ impl SessionStore {
                     return Ok(record);
                 }
                 Err(SessionError::SessionDeserializeFailed(_)) => {
+                    tracing::debug!("creating new session");
                     let mut record = SessionRecord::new(cwd.to_path_buf());
                     record.record_event(AppEvent::SessionLoaded);
                     self.save(&record)?;
@@ -391,6 +456,7 @@ impl SessionStore {
             }
         }
 
+        tracing::debug!("creating new session");
         let mut record = SessionRecord::new(cwd.to_path_buf());
         record.record_event(AppEvent::SessionLoaded);
         self.save(&record)?;
@@ -410,8 +476,38 @@ impl SessionStore {
 
         let contents =
             serde_json::to_string_pretty(record).map_err(SessionError::SessionSerializeFailed)?;
-        std::fs::write(&self.file_path, contents).map_err(SessionError::SessionWriteFailed)
+
+        atomic_write_file(&self.file_path, contents.as_bytes())
+            .map_err(SessionError::SessionWriteFailed)?;
+
+        tracing::debug!(path = %self.file_path.display(), "session saved (atomic)");
+        Ok(())
     }
+}
+
+/// Atomic file write using the tmp-file + fsync + rename pattern.
+/// Ensures crash-safe writes by first writing to a temporary file,
+/// fsyncing it, then atomically renaming over the target path.
+fn atomic_write_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    // with_extension("json.tmp") replaces the existing .json extension with .json.tmp
+    let tmp_path = path.with_extension("json.tmp");
+
+    // Step 1: Write to temporary file + fsync
+    let mut file = std::fs::File::create(&tmp_path)?;
+    if let Err(err) = file.write_all(contents).and_then(|_| file.sync_all()) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+
+    // Step 2: Atomic rename
+    if let Err(err) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -468,11 +564,6 @@ fn session_id_for_cwd(cwd: &Path) -> String {
     let mut hasher = DefaultHasher::new();
     cwd.hash(&mut hasher);
     format!("session_{:x}", hasher.finish())
-}
-
-fn estimate_tokens(content: &str) -> usize {
-    let chars = content.chars().count();
-    chars.div_ceil(4).max(1)
 }
 
 fn compact_preview(content: &str, max_chars: usize) -> String {

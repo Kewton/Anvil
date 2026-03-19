@@ -93,7 +93,12 @@ fn tui_renders_approval_and_interrupt_sections() {
     let approval_config = common::build_config_in(common::unique_test_dir("tui_approval"));
     let provider =
         ProviderRuntimeContext::bootstrap(&approval_config).expect("provider should bootstrap");
-    let mut app = anvil::app::App::new(approval_config, provider).expect("app should initialize");
+    let mut app = anvil::app::App::new(
+        approval_config,
+        provider,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("app should initialize");
     let tui = Tui::new();
 
     let _ = app
@@ -107,8 +112,12 @@ fn tui_renders_approval_and_interrupt_sections() {
     let interrupt_config = common::build_config_in(common::unique_test_dir("tui_interrupt"));
     let provider =
         ProviderRuntimeContext::bootstrap(&interrupt_config).expect("provider should bootstrap");
-    let mut interrupted_app =
-        anvil::app::App::new(interrupt_config, provider).expect("app should initialize");
+    let mut interrupted_app = anvil::app::App::new(
+        interrupt_config,
+        provider,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("app should initialize");
     let _ = interrupted_app
         .mock_thinking_snapshot()
         .expect("thinking snapshot should build");
@@ -130,7 +139,12 @@ fn tui_renders_approval_and_interrupt_sections() {
 fn startup_screen_shows_logo_model_and_project() {
     let config = common::build_config_in(common::unique_test_dir("startup"));
     let provider = ProviderRuntimeContext::bootstrap(&config).expect("provider should bootstrap");
-    let mut app = anvil::app::App::new(config.clone(), provider).expect("app should initialize");
+    let mut app = anvil::app::App::new(
+        config.clone(),
+        provider,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("app should initialize");
     let tui = Tui::new();
 
     let rendered = tui.render_startup(
@@ -194,6 +208,7 @@ fn tui_renders_working_and_done_views_with_tool_logs() {
     assert!(done.contains("[A] anvil > result"));
     assert!(done.contains("session saved"));
     assert!(done.contains("/continue"));
+    assert!(done.contains("/compact"));
 }
 
 #[test]
@@ -295,6 +310,160 @@ fn done_frame_excludes_streamed_assistant_messages() {
 }
 
 #[test]
+fn startup_shows_anvil_md_loaded() {
+    let mut config = common::build_config_in(common::unique_test_dir("startup_anvil"));
+    config.set_project_instructions_for_test(Some("test instructions".to_string()));
+    let provider = ProviderRuntimeContext::bootstrap(&config).expect("provider should bootstrap");
+    let mut app = anvil::app::App::new(
+        config.clone(),
+        provider,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("app should initialize");
+    let tui = Tui::new();
+
+    let rendered = tui.render_startup(
+        &config,
+        &app.initial_snapshot()
+            .expect("initial snapshot should build"),
+    );
+
+    assert!(rendered.contains("ANVIL.md: loaded"));
+}
+
+#[test]
+fn startup_without_anvil_md() {
+    let config = common::build_config_in(common::unique_test_dir("startup_no_anvil"));
+    let provider = ProviderRuntimeContext::bootstrap(&config).expect("provider should bootstrap");
+    let mut app = anvil::app::App::new(
+        config.clone(),
+        provider,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("app should initialize");
+    let tui = Tui::new();
+
+    let rendered = tui.render_startup(
+        &config,
+        &app.initial_snapshot()
+            .expect("initial snapshot should build"),
+    );
+
+    assert!(!rendered.contains("ANVIL.md: loaded"));
+}
+
+#[test]
+fn context_warning_bar_displayed_for_warning_level() {
+    let tui = Tui::new();
+    let snapshot = anvil::contracts::AppStateSnapshot::new(anvil::contracts::RuntimeState::Done)
+        .with_status("Done. session saved".to_string())
+        .with_completion_summary("completed task", "session saved")
+        .with_context_usage(8500, 10000)
+        .with_context_warning(anvil::contracts::ContextWarningLevel::Warning);
+
+    let context = anvil::contracts::ConsoleRenderContext {
+        snapshot,
+        model_name: "test-model".to_string(),
+        messages: vec![],
+        history_summary: None,
+    };
+
+    let rendered = tui.render_console(&context);
+    assert!(
+        rendered.contains("[!] Warning: Context usage at 85%"),
+        "warning bar should display at 85% usage"
+    );
+    assert!(
+        rendered.contains("/compact"),
+        "warning should suggest /compact"
+    );
+}
+
+#[test]
+fn context_warning_bar_displayed_for_critical_level() {
+    let tui = Tui::new();
+    let snapshot = anvil::contracts::AppStateSnapshot::new(anvil::contracts::RuntimeState::Done)
+        .with_status("Done. session saved".to_string())
+        .with_completion_summary("completed task", "session saved")
+        .with_context_usage(9500, 10000)
+        .with_context_warning(anvil::contracts::ContextWarningLevel::Critical);
+
+    let context = anvil::contracts::ConsoleRenderContext {
+        snapshot,
+        model_name: "test-model".to_string(),
+        messages: vec![],
+        history_summary: None,
+    };
+
+    let rendered = tui.render_console(&context);
+    assert!(
+        rendered.contains("[!] CRITICAL: Context usage at 95%"),
+        "critical bar should display at 95% usage"
+    );
+    assert!(
+        rendered.contains("/compact immediately"),
+        "critical warning should suggest immediate /compact"
+    );
+}
+
+#[test]
+fn context_warning_bar_absent_when_no_warning() {
+    let tui = Tui::new();
+    let snapshot = anvil::contracts::AppStateSnapshot::new(anvil::contracts::RuntimeState::Done)
+        .with_status("Done. session saved".to_string())
+        .with_completion_summary("completed task", "session saved")
+        .with_context_usage(5000, 10000);
+
+    let context = anvil::contracts::ConsoleRenderContext {
+        snapshot,
+        model_name: "test-model".to_string(),
+        messages: vec![],
+        history_summary: None,
+    };
+
+    let rendered = tui.render_console(&context);
+    assert!(
+        !rendered.contains("[!]"),
+        "no warning bar should appear when usage is below threshold"
+    );
+}
+
+#[test]
+fn done_hint_line_includes_compact() {
+    let tui = Tui::new();
+    let snapshot = anvil::contracts::AppStateSnapshot::new(anvil::contracts::RuntimeState::Done)
+        .with_status("Done. session saved".to_string())
+        .with_completion_summary("completed task", "session saved")
+        .with_context_usage(5000, 10000);
+
+    let context = anvil::contracts::ConsoleRenderContext {
+        snapshot,
+        model_name: "test-model".to_string(),
+        messages: vec![],
+        history_summary: None,
+    };
+
+    let rendered = tui.render_console(&context);
+    assert!(
+        rendered.contains("/compact"),
+        "Done hint line should include /compact"
+    );
+}
+
+#[test]
+fn status_detail_shows_token_usage() {
+    let snapshot = anvil::contracts::AppStateSnapshot::new(anvil::contracts::RuntimeState::Done)
+        .with_status("Done. session saved".to_string())
+        .with_completion_summary("completed task", "session saved")
+        .with_context_usage(45000, 200000);
+
+    let detail = anvil::app::render::render_status_detail(&snapshot);
+    assert!(detail.contains("45000"));
+    assert!(detail.contains("200000"));
+    assert!(detail.contains("22%") || detail.contains("23%"));
+}
+
+#[test]
 fn busy_prompt_hints_include_slash_commands() {
     let mut app = common::build_app();
     let tui = Tui::new();
@@ -307,4 +476,62 @@ fn busy_prompt_hints_include_slash_commands() {
     assert!(rendered.contains("/help"));
     assert!(rendered.contains("/status"));
     assert!(rendered.contains("[U] you > /status /help /plan"));
+}
+
+#[test]
+fn test_approval_view_serialize_skips_diff_preview() {
+    let view = anvil::contracts::ApprovalView {
+        tool_name: "file.write".to_string(),
+        summary: "write foo.txt".to_string(),
+        risk: "medium".to_string(),
+        tool_call_id: "call_001".to_string(),
+        diff_preview: Some("--- a\n+++ b\n-old\n+new\n".to_string()),
+    };
+    let json = serde_json::to_string(&view).expect("serialize");
+    // #[serde(skip)] means diff_preview should not appear in output
+    assert!(!json.contains("diff_preview"));
+    assert!(!json.contains("old"));
+}
+
+#[test]
+fn test_approval_view_deserialize_without_diff_preview() {
+    // Old JSON without diff_preview field should still deserialize
+    let json = r#"{"tool_name":"file.write","summary":"write foo.txt","risk":"medium","tool_call_id":"call_001"}"#;
+    let view: anvil::contracts::ApprovalView =
+        serde_json::from_str(json).expect("deserialize should succeed");
+    assert_eq!(view.tool_name, "file.write");
+    assert!(view.diff_preview.is_none());
+}
+
+#[test]
+fn test_approval_view_with_diff_preview() {
+    use anvil::contracts::{AppStateSnapshot, RuntimeState};
+    let snapshot = AppStateSnapshot::new(RuntimeState::AwaitingApproval)
+        .with_approval(
+            "file.write".to_string(),
+            "write test.txt".to_string(),
+            "medium".to_string(),
+            "call_002".to_string(),
+        )
+        .with_diff_preview(Some("-old line\n+new line\n".to_string()));
+
+    let approval = snapshot.approval.as_ref().expect("approval present");
+    assert_eq!(
+        approval.diff_preview.as_deref(),
+        Some("-old line\n+new line\n")
+    );
+}
+
+#[test]
+fn test_approval_view_without_diff_preview() {
+    use anvil::contracts::{AppStateSnapshot, RuntimeState};
+    let snapshot = AppStateSnapshot::new(RuntimeState::AwaitingApproval).with_approval(
+        "file.write".to_string(),
+        "write test.txt".to_string(),
+        "medium".to_string(),
+        "call_003".to_string(),
+    );
+
+    let approval = snapshot.approval.as_ref().expect("approval present");
+    assert!(approval.diff_preview.is_none());
 }

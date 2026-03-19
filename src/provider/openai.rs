@@ -3,15 +3,18 @@
 //! Works with the standard `/v1/chat/completions` endpoint used by
 //! OpenAI, Azure OpenAI, LM Studio, and other compatible servers.
 
-use super::transport::{CurlHttpTransport, HttpTransport};
-use super::{AgentEvent, ProviderClient, ProviderEvent, ProviderTurnError, ProviderTurnRequest};
+use super::transport::{CurlHttpTransport, HttpTransport, RetryTransport};
+use super::{
+    AgentEvent, ImageContent, ProviderClient, ProviderEvent, ProviderTurnError, ProviderTurnRequest,
+};
 use crate::config::EffectiveConfig;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// Client for OpenAI-compatible chat completion APIs.
 ///
 /// Generic over [`HttpTransport`] for testability.
-pub struct OpenAiCompatibleProviderClient<T = CurlHttpTransport> {
+pub struct OpenAiCompatibleProviderClient<T = RetryTransport<CurlHttpTransport>> {
     base_url: String,
     api_key: Option<String>,
     transport: T,
@@ -24,10 +27,20 @@ struct OpenAiChatRequest {
     stream: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Request message: content is `Value` to support both plain text and
+/// multimodal (text + image_url) arrays.
+#[derive(Debug, Clone, Serialize)]
 struct OpenAiChatMessage {
     role: String,
-    content: String,
+    content: Value,
+}
+
+/// Response message: content is always a plain string from the API.
+#[derive(Debug, Clone, Deserialize)]
+struct OpenAiResponseMessage {
+    #[allow(dead_code)]
+    role: String,
+    content: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -56,7 +69,7 @@ struct OpenAiDeltaMessage {
 
 #[derive(Debug, Clone, Deserialize)]
 struct OpenAiChoice {
-    message: OpenAiChatMessage,
+    message: OpenAiResponseMessage,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -69,12 +82,38 @@ struct OpenAiErrorBody {
     message: String,
 }
 
+/// Build the `content` field for an OpenAI chat message.
+///
+/// When images are present, returns a JSON array containing a text part
+/// followed by `image_url` parts (base64 data URIs).  Otherwise returns
+/// a plain JSON string.
+fn build_openai_content(text: &str, images: Option<&[ImageContent]>) -> Value {
+    match images {
+        Some(imgs) if !imgs.is_empty() => {
+            let mut parts = vec![serde_json::json!({
+                "type": "text",
+                "text": text,
+            })];
+            for img in imgs {
+                parts.push(serde_json::json!({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": format!("data:{};base64,{}", img.mime_type, img.base64),
+                    },
+                }));
+            }
+            Value::Array(parts)
+        }
+        _ => Value::String(text.to_string()),
+    }
+}
+
 impl OpenAiCompatibleProviderClient {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into(),
             api_key: None,
-            transport: CurlHttpTransport,
+            transport: RetryTransport::new(CurlHttpTransport::new()),
         }
     }
 
@@ -82,7 +121,7 @@ impl OpenAiCompatibleProviderClient {
         Self {
             base_url: config.runtime.provider_url.clone(),
             api_key: config.runtime.api_key.clone(),
-            transport: CurlHttpTransport,
+            transport: RetryTransport::new(CurlHttpTransport::new()),
         }
     }
 }
@@ -103,6 +142,34 @@ impl<T> OpenAiCompatibleProviderClient<T> {
 }
 
 impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
+    /// Check connectivity to the OpenAI-compatible server by requesting `/v1/models`.
+    ///
+    /// If an API key is configured, it is sent as an `Authorization` header
+    /// (without `Bearer` prefix, matching the existing code pattern in
+    /// `send_chat_request`).
+    pub fn health_check(&self) -> Result<(), String> {
+        let url = format!("{}/v1/models", self.base_url.trim_end_matches('/'));
+        let headers: Vec<(&str, &str)> = self
+            .api_key
+            .as_deref()
+            .map(|key| vec![("Authorization", key)])
+            .unwrap_or_default();
+        match self.transport.get_with_headers(&url, &headers) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let guidance = if self.api_key.is_some() {
+                    " (認証情報の形式を確認してください。'Bearer <api-key>' 形式が必要な場合があります)"
+                } else {
+                    ""
+                };
+                Err(format!(
+                    "OpenAI互換プロバイダーに接続できません ({}): {}{}",
+                    self.base_url, e, guidance
+                ))
+            }
+        }
+    }
+
     fn send_chat_request(
         &self,
         request: &ProviderTurnRequest,
@@ -119,7 +186,7 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
                         super::ProviderMessageRole::Assistant => "assistant".to_string(),
                         super::ProviderMessageRole::Tool => "tool".to_string(),
                     },
-                    content: m.content.clone(),
+                    content: build_openai_content(&m.content, m.images.as_deref()),
                 })
                 .collect(),
             stream: request.stream,
@@ -159,7 +226,7 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
         let content = parsed
             .choices
             .first()
-            .map(|choice| choice.message.content.clone())
+            .and_then(|choice| choice.message.content.clone())
             .ok_or_else(|| {
                 ProviderTurnError::Backend("openai response contained no choices".to_string())
             })?;
@@ -212,7 +279,7 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
                         super::ProviderMessageRole::Assistant => "assistant".to_string(),
                         super::ProviderMessageRole::Tool => "tool".to_string(),
                     },
-                    content: m.content.clone(),
+                    content: build_openai_content(&m.content, m.images.as_deref()),
                 })
                 .collect(),
             stream: true,
@@ -225,6 +292,13 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
             "{}/v1/chat/completions",
             self.base_url.trim_end_matches('/')
         );
+        tracing::debug!(
+            model = %request.model,
+            messages = request.messages.len(),
+            stream = request.stream,
+            "sending openai chat request"
+        );
+
         let mut headers = Vec::new();
         if let Some(api_key) = &self.api_key {
             headers.push(("Authorization", api_key.as_str()));
@@ -247,8 +321,9 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
                     // Not SSE — try as a regular OpenAI JSON response (fallback)
                     if let Ok(parsed) = serde_json::from_str::<OpenAiChatResponse>(trimmed) {
                         if let Some(choice) = parsed.choices.first() {
-                            content.push_str(&choice.message.content);
-                            emit(ProviderEvent::TokenDelta(choice.message.content.clone()));
+                            let msg_content = choice.message.content.clone().unwrap_or_default();
+                            content.push_str(&msg_content);
+                            emit(ProviderEvent::TokenDelta(msg_content));
                             emit(ProviderEvent::Agent(AgentEvent::Done {
                                 status: "Done. session saved".to_string(),
                                 assistant_message: content.clone(),
@@ -314,6 +389,7 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
             })?;
 
         if let Some(err) = had_error {
+            tracing::error!(error = %err, "openai provider request failed");
             return Err(err);
         }
         if !emitted_done {

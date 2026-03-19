@@ -3,14 +3,25 @@
 //! Defines the [`AgentEvent`] lifecycle and the [`BasicAgentLoop`] that
 //! bridges provider responses into structured tool calls.
 
+pub mod subagent;
+
+use crate::contracts::tokens::{ContentKind, estimate_tokens};
 use crate::provider::{
-    ProviderClient, ProviderEvent, ProviderMessage, ProviderMessageRole, ProviderTurnError,
-    ProviderTurnRequest,
+    ImageContent, ProviderClient, ProviderEvent, ProviderMessage, ProviderMessageRole,
+    ProviderTurnError, ProviderTurnRequest,
 };
 use crate::session::{MessageRole, SessionRecord};
-use crate::tooling::{ToolCallRequest, ToolInput};
+use crate::tooling::{ToolCallRequest, ToolInput, detect_image_mime};
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::path::Path;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectLanguage {
+    Rust,
+    NodeJs,
+}
 
 /// Events emitted by the agent during a single turn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,6 +122,10 @@ impl AgentRuntime {
     }
 }
 
+/// Minimum token budget reserved for messages even when the system prompt
+/// consumes most of the budget.  Guarantees at least ~1 message is included.
+const MINIMUM_MESSAGE_BUDGET: usize = 256;
+
 pub struct BasicAgentLoop;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,9 +140,16 @@ impl BasicAgentLoop {
         session: &SessionRecord,
         stream: bool,
         context_window: u32,
+        system_prompt: &str,
     ) -> ProviderTurnRequest {
         let token_budget = derive_context_budget(context_window);
-        Self::build_turn_request_with_token_budget(model, session, stream, token_budget)
+        Self::build_turn_request_with_token_budget(
+            model,
+            session,
+            stream,
+            token_budget,
+            system_prompt,
+        )
     }
 
     pub fn build_turn_request_with_limit(
@@ -135,17 +157,24 @@ impl BasicAgentLoop {
         session: &SessionRecord,
         stream: bool,
         max_messages: usize,
+        system_prompt: &str,
     ) -> ProviderTurnRequest {
         let len = session.messages.len();
         let start = len.saturating_sub(max_messages);
-        ProviderTurnRequest::new(
-            model.into(),
+        let sandbox_root = std::fs::canonicalize(&session.metadata.cwd).ok();
+
+        let messages: Vec<ProviderMessage> = std::iter::once(ProviderMessage::new(
+            ProviderMessageRole::System,
+            system_prompt,
+        ))
+        .chain(
             session.messages[start..]
                 .iter()
-                .map(to_provider_message)
-                .collect(),
-            stream,
+                .map(|sm| to_provider_message_with_images(sm, sandbox_root.as_deref())),
         )
+        .collect();
+
+        ProviderTurnRequest::new(model.into(), messages, stream)
     }
 
     pub fn build_turn_request_with_token_budget(
@@ -153,13 +182,20 @@ impl BasicAgentLoop {
         session: &SessionRecord,
         stream: bool,
         token_budget: usize,
+        system_prompt: &str,
     ) -> ProviderTurnRequest {
+        let system_prompt_tokens = estimate_tokens(system_prompt, ContentKind::Text);
+        let budget_for_messages = token_budget
+            .saturating_sub(system_prompt_tokens)
+            .max(MINIMUM_MESSAGE_BUDGET);
+
         let mut selected = Vec::new();
         let mut used_tokens = 0usize;
 
         for message in session.messages.iter().rev() {
-            let estimated = estimate_message_tokens(&message.content);
-            if !selected.is_empty() && used_tokens + estimated > token_budget {
+            let kind = ContentKind::from_message_role(message.role);
+            let estimated = estimate_tokens(&message.content, kind);
+            if !selected.is_empty() && used_tokens + estimated > budget_for_messages {
                 break;
             }
             used_tokens += estimated;
@@ -168,16 +204,29 @@ impl BasicAgentLoop {
 
         selected.reverse();
 
-        ProviderTurnRequest::new(
-            model.into(),
-            std::iter::once(ProviderMessage::new(
-                ProviderMessageRole::System,
-                tool_protocol_system_prompt(),
-            ))
-            .chain(selected.into_iter().map(to_provider_message))
-            .collect(),
-            stream,
+        tracing::debug!(
+            selected_messages = selected.len(),
+            used_tokens = used_tokens,
+            system_prompt_tokens = system_prompt_tokens,
+            budget_for_messages = budget_for_messages,
+            budget = token_budget,
+            "built turn request"
+        );
+
+        let sandbox_root = std::fs::canonicalize(&session.metadata.cwd).ok();
+
+        let messages: Vec<ProviderMessage> = std::iter::once(ProviderMessage::new(
+            ProviderMessageRole::System,
+            system_prompt,
+        ))
+        .chain(
+            selected
+                .into_iter()
+                .map(|sm| to_provider_message_with_images(sm, sandbox_root.as_deref())),
         )
+        .collect();
+
+        ProviderTurnRequest::new(model.into(), messages, stream)
     }
 
     pub fn run_turn<C: ProviderClient>(
@@ -306,14 +355,62 @@ fn loose_unescape(value: &str) -> String {
         .replace("\\\\", "\\")
 }
 
-fn to_provider_message(message: &crate::session::SessionMessage) -> ProviderMessage {
+/// Resolve image paths to base64-encoded [`ImageContent`] values.
+///
+/// Each path is canonicalized and checked against `sandbox_root` to prevent
+/// path-traversal attacks.  On error (file missing, outside sandbox) the
+/// caller is expected to log and skip.
+fn resolve_image_content(
+    image_paths: &[String],
+    sandbox_root: &Path,
+) -> Result<Vec<ImageContent>, std::io::Error> {
+    image_paths
+        .iter()
+        .map(|path| {
+            let canonical = std::fs::canonicalize(path)?;
+            if !canonical.starts_with(sandbox_root) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("image path outside sandbox: {}", path),
+                ));
+            }
+            let data = std::fs::read(&canonical)?;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+            let mime_type = detect_image_mime(&canonical)
+                .unwrap_or("application/octet-stream")
+                .to_string();
+            Ok(ImageContent {
+                base64: b64,
+                mime_type,
+            })
+        })
+        .collect()
+}
+
+/// Convert a session message to a provider message, optionally resolving
+/// attached image paths into base64-encoded [`ImageContent`].
+fn to_provider_message_with_images(
+    message: &crate::session::SessionMessage,
+    sandbox_root: Option<&Path>,
+) -> ProviderMessage {
     let role = match message.role {
         MessageRole::System => ProviderMessageRole::System,
         MessageRole::User => ProviderMessageRole::User,
         MessageRole::Assistant => ProviderMessageRole::Assistant,
         MessageRole::Tool => ProviderMessageRole::Tool,
     };
-    ProviderMessage::new(role, message.content.clone())
+    let mut msg = ProviderMessage::new(role, message.content.clone());
+    if let Some(ref paths) = message.image_paths
+        && let Some(root) = sandbox_root
+    {
+        match resolve_image_content(paths, root) {
+            Ok(images) => msg.images = Some(images),
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to resolve image content, sending without images");
+            }
+        }
+    }
+    msg
 }
 
 fn derive_context_budget(context_window: u32) -> usize {
@@ -324,16 +421,20 @@ fn derive_context_budget(context_window: u32) -> usize {
     }
     let quarter = (context_window / 4) as usize;
     let half = (context_window / 2) as usize;
-    quarter.clamp(256, half)
+    let budget = quarter.clamp(256, half);
+    tracing::debug!(
+        budget = budget,
+        context_window = context_window,
+        "context budget derived"
+    );
+    budget
 }
 
-fn estimate_message_tokens(content: &str) -> usize {
-    let chars = content.chars().count();
-    chars.div_ceil(4).max(1)
-}
-
-fn tool_protocol_system_prompt() -> &'static str {
-    concat!(
+pub fn tool_protocol_system_prompt(
+    languages: &[ProjectLanguage],
+    mcp_tool_descriptions: Option<&str>,
+) -> String {
+    let base = concat!(
         "You are Anvil, a local coding agent for serious terminal work.\n",
         "\n",
         "## Work approach\n",
@@ -349,7 +450,7 @@ fn tool_protocol_system_prompt() -> &'static str {
         "\n",
         "Available tools:\n",
         "\n",
-        "1. file.read — read a file or list a directory:\n",
+        "1. file.read — read a file or list a directory (also supports image files: PNG/JPG/JPEG/GIF/WebP, max 20MB):\n",
         "```ANVIL_TOOL\n",
         "{\"id\":\"call_001\",\"tool\":\"file.read\",\"path\":\"./relative/path\"}\n",
         "```\n",
@@ -359,26 +460,43 @@ fn tool_protocol_system_prompt() -> &'static str {
         "{\"id\":\"call_002\",\"tool\":\"file.write\",\"path\":\"./relative/path\",\"content\":\"file content here\"}\n",
         "```\n",
         "\n",
-        "3. file.search — search for files by name or content:\n",
+        "3. file.edit — edit a file by replacing a specific string:\n",
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_007\",\"tool\":\"file.edit\",\"path\":\"./relative/path\",\"old_string\":\"text to find\",\"new_string\":\"replacement text\"}\n",
+        "```\n",
+        "\n",
+        "4. file.search — search for files by name or content:\n",
         "```ANVIL_TOOL\n",
         "{\"id\":\"call_003\",\"tool\":\"file.search\",\"root\":\".\",\"pattern\":\"search term\"}\n",
         "```\n",
         "\n",
-        "4. shell.exec — run a shell command and capture its output:\n",
+        "5. shell.exec — run a shell command and capture its output:\n",
         "```ANVIL_TOOL\n",
         "{\"id\":\"call_004\",\"tool\":\"shell.exec\",\"command\":\"ls -la\"}\n",
         "```\n",
         "\n",
-        "5. web.fetch — fetch the contents of a URL:\n",
+        "6. web.fetch — fetch the contents of a URL:\n",
         "```ANVIL_TOOL\n",
         "{\"id\":\"call_005\",\"tool\":\"web.fetch\",\"url\":\"https://example.com\"}\n",
         "```\n",
         "\n",
-        "6. web.search — search the web by keyword:\n",
+        "7. web.search — search the web by keyword:\n",
         "```ANVIL_TOOL\n",
         "{\"id\":\"call_006\",\"tool\":\"web.search\",\"query\":\"search keywords here\"}\n",
         "```\n",
         "Use web.search when you need to look up error messages, library usage, or any information not available locally.\n",
+        "\n",
+        "8. agent.explore — launch a read-only sub-agent to explore the codebase:\n",
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_008\",\"tool\":\"agent.explore\",\"prompt\":\"Investigate the module structure under src/\",\"scope\":\"./src\"}\n",
+        "```\n",
+        "The sub-agent can only use file.read and file.search within the given scope directory.\n",
+        "\n",
+        "9. agent.plan — launch a read-only sub-agent to create an implementation plan:\n",
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_009\",\"tool\":\"agent.plan\",\"prompt\":\"Create a plan to add error handling\",\"scope\":\"./src\"}\n",
+        "```\n",
+        "The sub-agent can use file.read, file.search, and web.fetch within the given scope directory.\n",
         "\n",
         "After ALL tool blocks, include exactly one final block with your summary:\n",
         "```ANVIL_FINAL\n",
@@ -402,7 +520,79 @@ fn tool_protocol_system_prompt() -> &'static str {
         "- Code frequency: gh api repos/{owner}/{repo}/stats/code_frequency\n",
         "- Detect repo: gh repo view --json owner,name\n",
         "- GitHub stats endpoints (contributors, commit_activity) may return {} on first request. If you get an empty response, wait 3 seconds with shell.exec sleep 3 and retry the same API call."
-    )
+    );
+    let mut prompt = base.to_string();
+
+    // MCPツール説明を動的追加
+    // [D4-010] mcp_tool_descriptions is sanitized by generate_mcp_tool_descriptions()
+    if let Some(mcp_desc) = mcp_tool_descriptions {
+        prompt.push_str("\n\n## MCP External Tools\n\n");
+        prompt.push_str(mcp_desc);
+    }
+
+    // Always include: Git operations guide
+    prompt.push_str(concat!(
+        "\n\n## Git operations\n",
+        "When working with Git, follow these safety categories:\n",
+        "\n",
+        "**Safe (auto-approved):**\n",
+        "- git status, git log, git diff, git branch, git show <ref>, git remote -v, git rev-parse\n",
+        "\n",
+        "**Change (requires confirmation):**\n",
+        "- git add, git commit, git push, git checkout, git merge, git rebase, git stash\n",
+        "\n",
+        "**NEVER use these without explicit user request:**\n",
+        "- git reset --hard — destroys uncommitted changes irreversibly\n",
+        "- git clean -fd — deletes untracked files permanently\n",
+        "- git push --force — rewrites remote history, can lose team members' work\n",
+        "- git rebase on shared branches — rewrites history others depend on\n",
+        "- --no-verify flag — skips safety hooks, always blocked by the system\n",
+    ));
+
+    // Always include: Environment inspection guide
+    prompt.push_str(concat!(
+        "\n## Environment inspection\n",
+        "Use these to check the development environment:\n",
+        "- which <tool> — check if a tool is installed\n",
+        "- uname — identify the operating system\n",
+        "- node -v, rustc --version, python --version, go version — check language versions\n",
+    ));
+
+    // Always include: Process management guide
+    prompt.push_str(concat!(
+        "\n## Process management\n",
+        "- lsof -i — check network port usage\n",
+        "- For dev servers (npm run dev, cargo watch), use background execution with '&'\n",
+    ));
+
+    // Rust-specific guide (only when Rust detected)
+    if languages.contains(&ProjectLanguage::Rust) {
+        prompt.push_str(concat!(
+            "\n## Rust development\n",
+            "Build, test, and lint commands (auto-approved):\n",
+            "- cargo build — compile the project\n",
+            "- cargo test — run all tests\n",
+            "- cargo clippy --all-targets — run linter (aim for zero warnings)\n",
+            "- cargo fmt --check — check formatting\n",
+            "- cargo check — type-check without building\n",
+            "When fixing issues, iterate: make changes, then cargo build, cargo test, cargo clippy.\n",
+        ));
+    }
+
+    // Node.js-specific guide (only when NodeJs detected)
+    if languages.contains(&ProjectLanguage::NodeJs) {
+        prompt.push_str(concat!(
+            "\n## Node.js development\n",
+            "Build, test, and lint commands (auto-approved):\n",
+            "- npm test — run test suite\n",
+            "- npx jest <path> — run specific tests\n",
+            "- npx eslint <path> — run linter\n",
+            "- npx prettier --check <path> — check formatting\n",
+            "When fixing issues, iterate: make changes, then npm test, npx eslint.\n",
+        ));
+    }
+
+    prompt
 }
 
 fn extract_fenced_blocks(content: &str, label: &str) -> Vec<String> {
@@ -449,4 +639,63 @@ fn extract_final_block_lenient(content: &str, label: &str) -> Option<String> {
     // Strip a trailing ``` if present (model may close without preceding newline)
     let tail = tail.strip_suffix("```").unwrap_or(tail).trim_end();
     Some(tail.to_string())
+}
+
+// --- MCP tool description generation ---
+
+use crate::mcp::McpToolInfo;
+use std::collections::HashMap;
+
+/// Maximum characters for MCP tool descriptions in the system prompt.
+/// [D3-009] Prevents system prompt bloat that compresses message budget.
+const MAX_MCP_PROMPT_CHARS: usize = 8000;
+
+/// Maximum characters per individual tool description.
+const MAX_TOOL_DESC_CHARS: usize = 500;
+
+/// Generate MCP tool descriptions for inclusion in the system prompt.
+///
+/// [D4-010] Sanitizes descriptions to remove ANVIL_TOOL/ANVIL_FINAL markers.
+/// [D3-009] Falls back to tool-name-only list if total exceeds MAX_MCP_PROMPT_CHARS.
+pub fn generate_mcp_tool_descriptions(tools: &HashMap<String, Vec<McpToolInfo>>) -> String {
+    let mut full_descriptions = String::new();
+
+    for (server_name, tool_list) in tools {
+        for tool_info in tool_list {
+            let mcp_name = format!("mcp__{server_name}__{}", tool_info.name);
+
+            // [D4-010] Sanitize description: remove ANVIL_TOOL/ANVIL_FINAL markers
+            let (mut desc, _) = crate::config::sanitize_markers(&tool_info.description);
+
+            // Truncate per-tool description
+            if desc.chars().count() > MAX_TOOL_DESC_CHARS {
+                desc = desc.chars().take(MAX_TOOL_DESC_CHARS).collect::<String>();
+                desc.push_str("...");
+            }
+
+            let schema_str = serde_json::to_string(&tool_info.input_schema).unwrap_or_default();
+
+            full_descriptions.push_str(&format!(
+                "- **{mcp_name}**: {desc}\n  Input schema: {schema_str}\n  Usage:\n  ```ANVIL_TOOL\n  {{\"id\":\"call_mcp\",\"tool\":\"{mcp_name}\",... }}\n  ```\n\n"
+            ));
+        }
+    }
+
+    // [D3-009] Check total size and fall back to name-only list if too large
+    if full_descriptions.chars().count() > MAX_MCP_PROMPT_CHARS {
+        eprintln!(
+            "Warning: MCP tool descriptions exceed {} characters, falling back to tool-name-only list.",
+            MAX_MCP_PROMPT_CHARS
+        );
+        let mut fallback = String::from("Available MCP tools (use ANVIL_TOOL blocks to call):\n");
+        for (server_name, tool_list) in tools {
+            for tool_info in tool_list {
+                let mcp_name = format!("mcp__{server_name}__{}", tool_info.name);
+                fallback.push_str(&format!("- {mcp_name}\n"));
+            }
+        }
+        return fallback;
+    }
+
+    full_descriptions
 }

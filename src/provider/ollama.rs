@@ -3,7 +3,7 @@
 //! Implements the [`ProviderClient`] trait for the Ollama local inference
 //! server via its `/api/chat` endpoint.
 
-use super::transport::{CurlHttpTransport, HttpTransport};
+use super::transport::{CurlHttpTransport, HttpTransport, RetryTransport};
 use super::{
     AgentEvent, ProviderClient, ProviderEvent, ProviderMessageRole, ProviderTurnError,
     ProviderTurnRequest,
@@ -18,6 +18,8 @@ use std::process::Command;
 pub struct OllamaChatMessage {
     pub role: String,
     pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub images: Option<Vec<String>>,
 }
 
 /// Wire format for an Ollama `/api/chat` request.
@@ -41,7 +43,7 @@ struct OllamaChatChunk {
 /// Client for the Ollama local inference server.
 ///
 /// Generic over [`HttpTransport`] so tests can inject a mock.
-pub struct OllamaProviderClient<T = CurlHttpTransport> {
+pub struct OllamaProviderClient<T = RetryTransport<CurlHttpTransport>> {
     base_url: String,
     transport: T,
 }
@@ -50,7 +52,7 @@ impl OllamaProviderClient {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into(),
-            transport: CurlHttpTransport,
+            transport: RetryTransport::new(CurlHttpTransport::new()),
         }
     }
 
@@ -73,14 +75,21 @@ impl<T> OllamaProviderClient<T> {
             messages: request
                 .messages
                 .iter()
-                .map(|message| OllamaChatMessage {
-                    role: match message.role {
-                        ProviderMessageRole::System => "system".to_string(),
-                        ProviderMessageRole::User => "user".to_string(),
-                        ProviderMessageRole::Assistant => "assistant".to_string(),
-                        ProviderMessageRole::Tool => "tool".to_string(),
-                    },
-                    content: message.content.clone(),
+                .map(|message| {
+                    let images = message
+                        .images
+                        .as_ref()
+                        .map(|imgs| imgs.iter().map(|img| img.base64.clone()).collect());
+                    OllamaChatMessage {
+                        role: match message.role {
+                            ProviderMessageRole::System => "system".to_string(),
+                            ProviderMessageRole::User => "user".to_string(),
+                            ProviderMessageRole::Assistant => "assistant".to_string(),
+                            ProviderMessageRole::Tool => "tool".to_string(),
+                        },
+                        content: message.content.clone(),
+                        images,
+                    }
                 })
                 .collect(),
             stream: request.stream,
@@ -144,7 +153,25 @@ pub fn resolve_ollama_model_alias(requested: &str, available: &[String]) -> Stri
 
 impl Default for OllamaProviderClient {
     fn default() -> Self {
-        Self::new("http://127.0.0.1:11434")
+        Self {
+            base_url: "http://127.0.0.1:11434".to_string(),
+            transport: RetryTransport::new(CurlHttpTransport::new()),
+        }
+    }
+}
+
+impl<T: HttpTransport> OllamaProviderClient<T> {
+    /// Check connectivity to the Ollama server by requesting `/api/tags`.
+    ///
+    /// Returns `Ok(())` if the server responds, or an error message string
+    /// on failure.  The health check uses the client's configured transport
+    /// (which includes [`RetryTransport`] for automatic retry).
+    pub fn health_check(&self) -> Result<(), String> {
+        let url = format!("{}/api/tags", self.base_url.trim_end_matches('/'));
+        match self.transport.get(&url) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(format!("Ollamaに接続できません ({}): {}", self.base_url, e)),
+        }
     }
 }
 
@@ -162,6 +189,13 @@ impl<T: HttpTransport> ProviderClient for OllamaProviderClient<T> {
             ProviderTurnError::Backend(format!("failed to encode ollama request: {err}"))
         })?;
         let url = format!("{}/api/chat", self.base_url.trim_end_matches('/'));
+
+        tracing::debug!(
+            model = %resolved_request.model,
+            messages = resolved_request.messages.len(),
+            stream = resolved_request.stream,
+            "sending ollama chat request"
+        );
 
         let mut assistant_output = String::new();
         let mut had_error: Option<ProviderTurnError> = None;
@@ -206,6 +240,7 @@ impl<T: HttpTransport> ProviderClient for OllamaProviderClient<T> {
             })?;
 
         if let Some(err) = had_error {
+            tracing::error!(error = %err, "ollama provider request failed");
             return Err(err);
         }
         Ok(())

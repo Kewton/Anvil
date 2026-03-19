@@ -98,7 +98,9 @@ hotfix/*  --PR--> main (緊急時のみ)
 src/
 ├── main.rs              # エントリポイント
 ├── lib.rs               # モジュール宣言
-├── agent/mod.rs         # エージェントループ・プロトコル
+├── agent/
+│   ├── mod.rs           # エージェントループ・プロトコル
+│   └── subagent.rs      # サブエージェント実行ループ（Explore/Plan）
 ├── app/
 │   ├── mod.rs           # アプリケーションオーケストレータ
 │   ├── agentic.rs       # agenticツール実行ループ
@@ -107,8 +109,18 @@ src/
 │   ├── render.rs        # コンソール描画
 │   └── mock.rs          # テスト用モック
 ├── config/mod.rs        # 設定管理
-├── contracts/mod.rs     # 共通型定義
-├── extensions/mod.rs    # スラッシュコマンド・拡張
+├── contracts/
+│   ├── mod.rs           # 共通型定義
+│   └── tokens.rs        # トークン推定（CJK対応ヒューリスティック）
+├── extensions/
+│   ├── mod.rs           # スラッシュコマンド・拡張
+│   └── skills.rs        # SKILL.mdベースのスキルシステム
+├── hooks/
+│   └── mod.rs           # ライフサイクルフック（HooksConfig, HookRunner, HooksEngine）
+├── logging.rs           # 構造化ロギング（tracing初期化）
+├── mcp/
+│   ├── mod.rs           # MCPクライアント（McpManager, McpConnection, McpError）
+│   └── transport.rs     # STDIOトランスポート（McpTransport trait, StdioTransport）
 ├── metrics/mod.rs       # ベンチマーク
 ├── provider/
 │   ├── mod.rs           # プロバイダー抽象化
@@ -119,7 +131,9 @@ src/
 ├── session/mod.rs       # セッション永続化
 ├── spinner.rs           # スピナーUI
 ├── state/mod.rs         # 状態マシン
-├── tooling/mod.rs       # ツール実行・検証
+├── tooling/
+│   ├── mod.rs           # ツール実行・検証
+│   └── diff.rs          # 差分プレビュー生成（file.write/file.edit承認時）
 └── tui/mod.rs           # TUI描画
 tests/
 ├── cli_session.rs       # CLIセッションテスト
@@ -128,7 +142,10 @@ tests/
 ├── runtime_flow.rs      # ランタイムフローテスト
 ├── state_session.rs     # 状態・セッションテスト
 ├── tooling_system.rs    # ツールシステムテスト
-└── tui_console.rs       # TUIテスト
+├── mcp_integration.rs   # MCP統合テスト
+├── tui_console.rs       # TUIテスト
+├── skills_system.rs     # スキルシステムテスト
+└── hooks_system.rs      # フックシステムテスト
 ```
 
 ---

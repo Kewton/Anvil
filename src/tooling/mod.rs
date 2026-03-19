@@ -4,6 +4,8 @@
 //! through a permission and plan-mode pipeline, and executed by
 //! [`LocalToolExecutor`] within a sandboxed workspace root.
 
+pub mod diff;
+
 use crate::config::{RuntimeConfig, WebSearchProvider};
 use crate::contracts::ToolLogView;
 use serde::{Deserialize, Serialize};
@@ -12,6 +14,22 @@ use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
+
+/// Maximum image file size in bytes (20 MB).
+const IMAGE_SIZE_LIMIT: u64 = 20 * 1024 * 1024;
+
+/// Detect the MIME type of an image file based on its extension.
+///
+/// Returns `None` for non-image extensions.
+pub fn detect_image_mime(path: &Path) -> Option<&'static str> {
+    match path.extension()?.to_str()?.to_lowercase().as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        _ => None,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermissionClass {
@@ -51,20 +69,56 @@ pub enum RollbackPolicy {
 pub enum ToolKind {
     FileRead,
     FileWrite,
+    FileEdit,
     FileSearch,
     ShellExec,
     WebFetch,
     WebSearch,
+    Mcp,
+    AgentExplore,
+    AgentPlan,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolInput {
-    FileRead { path: String },
-    FileWrite { path: String, content: String },
-    FileSearch { root: String, pattern: String },
-    ShellExec { command: String },
-    WebFetch { url: String },
-    WebSearch { query: String },
+    FileRead {
+        path: String,
+    },
+    FileWrite {
+        path: String,
+        content: String,
+    },
+    FileEdit {
+        path: String,
+        old_string: String,
+        new_string: String,
+    },
+    FileSearch {
+        root: String,
+        pattern: String,
+    },
+    ShellExec {
+        command: String,
+    },
+    WebFetch {
+        url: String,
+    },
+    WebSearch {
+        query: String,
+    },
+    Mcp {
+        server: String,
+        tool: String,
+        arguments: serde_json::Value,
+    },
+    AgentExplore {
+        prompt: String,
+        scope: Option<String>,
+    },
+    AgentPlan {
+        prompt: String,
+        scope: Option<String>,
+    },
 }
 
 impl ToolInput {
@@ -72,10 +126,14 @@ impl ToolInput {
         match self {
             Self::FileRead { .. } => ToolKind::FileRead,
             Self::FileWrite { .. } => ToolKind::FileWrite,
+            Self::FileEdit { .. } => ToolKind::FileEdit,
             Self::FileSearch { .. } => ToolKind::FileSearch,
             Self::ShellExec { .. } => ToolKind::ShellExec,
             Self::WebFetch { .. } => ToolKind::WebFetch,
             Self::WebSearch { .. } => ToolKind::WebSearch,
+            Self::Mcp { .. } => ToolKind::Mcp,
+            Self::AgentExplore { .. } => ToolKind::AgentExplore,
+            Self::AgentPlan { .. } => ToolKind::AgentPlan,
         }
     }
 
@@ -97,6 +155,28 @@ impl ToolInput {
                     .ok_or_else(|| "missing content in file.write tool block".to_string())?
                     .to_string(),
             }),
+            "file.edit" => {
+                let path = value
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .map(String::from)
+                    .ok_or_else(|| "missing path in file.edit tool block".to_string())?;
+                let old_string = value
+                    .get("old_string")
+                    .and_then(serde_json::Value::as_str)
+                    .map(String::from)
+                    .ok_or_else(|| "missing old_string in file.edit tool block".to_string())?;
+                let new_string = value
+                    .get("new_string")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                Ok(ToolInput::FileEdit {
+                    path,
+                    old_string,
+                    new_string,
+                })
+            }
             "file.read" => Ok(ToolInput::FileRead {
                 path: value
                     .get("path")
@@ -140,7 +220,40 @@ impl ToolInput {
                     .ok_or_else(|| "missing query in web.search tool block".to_string())?
                     .to_string(),
             }),
-            other => Err(format!("unsupported tool in ANVIL_TOOL block: {other}")),
+            "agent.explore" => Ok(ToolInput::AgentExplore {
+                prompt: value
+                    .get("prompt")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "missing prompt in agent.explore tool block".to_string())?
+                    .to_string(),
+                scope: value
+                    .get("scope")
+                    .and_then(serde_json::Value::as_str)
+                    .map(String::from),
+            }),
+            "agent.plan" => Ok(ToolInput::AgentPlan {
+                prompt: value
+                    .get("prompt")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "missing prompt in agent.plan tool block".to_string())?
+                    .to_string(),
+                scope: value
+                    .get("scope")
+                    .and_then(serde_json::Value::as_str)
+                    .map(String::from),
+            }),
+            other => {
+                // mcp__<server>__<tool> pattern detection
+                if let Some((server, tool)) = parse_mcp_tool_name(other) {
+                    Ok(ToolInput::Mcp {
+                        server,
+                        tool,
+                        arguments: value.clone(),
+                    })
+                } else {
+                    Err(format!("unsupported tool in ANVIL_TOOL block: {other}"))
+                }
+            }
         }
     }
 
@@ -158,6 +271,16 @@ impl ToolInput {
                 path: extract_simple(block, "path")?,
                 content: extract_trailing(block, "content")?,
             }),
+            "file.edit" => {
+                let path = extract_simple(block, "path")?;
+                let old_string = extract_simple(block, "old_string")?;
+                let new_string = extract_trailing(block, "new_string").unwrap_or_default();
+                Some(ToolInput::FileEdit {
+                    path,
+                    old_string,
+                    new_string,
+                })
+            }
             "file.read" => Some(ToolInput::FileRead {
                 path: extract_simple(block, "path")?,
             }),
@@ -175,6 +298,14 @@ impl ToolInput {
             }),
             "web.search" => Some(ToolInput::WebSearch {
                 query: extract_simple(block, "query")?,
+            }),
+            "agent.explore" => Some(ToolInput::AgentExplore {
+                prompt: extract_simple(block, "prompt")?,
+                scope: extract_simple(block, "scope"),
+            }),
+            "agent.plan" => Some(ToolInput::AgentPlan {
+                prompt: extract_simple(block, "prompt")?,
+                scope: extract_simple(block, "scope"),
             }),
             _ => None,
         }
@@ -324,6 +455,10 @@ pub enum ToolExecutionPayload {
     None,
     Text(String),
     Paths(Vec<String>),
+    Image {
+        source_path: String,
+        mime_type: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -416,6 +551,19 @@ impl ToolRegistry {
         });
     }
 
+    pub fn register_file_edit(&mut self) {
+        self.register(ToolSpec {
+            version: 1,
+            name: "file.edit".to_string(),
+            kind: ToolKind::FileEdit,
+            execution_class: ExecutionClass::Mutating,
+            permission_class: PermissionClass::Confirm,
+            execution_mode: ExecutionMode::SequentialOnly,
+            plan_mode: PlanModePolicy::AllowedWithScope,
+            rollback_policy: RollbackPolicy::CheckpointBeforeWrite,
+        });
+    }
+
     pub fn register_file_search(&mut self) {
         self.register(ToolSpec {
             version: 1,
@@ -468,9 +616,49 @@ impl ToolRegistry {
         });
     }
 
+    pub fn register_agent_explore(&mut self) {
+        self.register(ToolSpec {
+            version: 1,
+            name: "agent.explore".to_string(),
+            kind: ToolKind::AgentExplore,
+            execution_class: ExecutionClass::ReadOnly,
+            permission_class: PermissionClass::Safe,
+            execution_mode: ExecutionMode::SequentialOnly,
+            plan_mode: PlanModePolicy::Allowed,
+            rollback_policy: RollbackPolicy::None,
+        });
+    }
+
+    pub fn register_agent_plan(&mut self) {
+        self.register(ToolSpec {
+            version: 1,
+            name: "agent.plan".to_string(),
+            kind: ToolKind::AgentPlan,
+            execution_class: ExecutionClass::ReadOnly,
+            permission_class: PermissionClass::Safe,
+            execution_mode: ExecutionMode::SequentialOnly,
+            plan_mode: PlanModePolicy::Allowed,
+            rollback_policy: RollbackPolicy::None,
+        });
+    }
+
+    /// Register the subset of tools available to the Explore sub-agent.
+    pub fn register_explore_tools(&mut self) {
+        self.register_file_read();
+        self.register_file_search();
+    }
+
+    /// Register the subset of tools available to the Plan sub-agent.
+    pub fn register_plan_tools(&mut self) {
+        self.register_file_read();
+        self.register_file_search();
+        self.register_web_fetch();
+    }
+
     pub fn register_standard_tools(&mut self) {
         self.register_file_read();
         self.register_file_write();
+        self.register_file_edit();
         self.register_file_search();
         self.register_shell_exec();
         self.register_web_fetch();
@@ -511,6 +699,7 @@ pub struct LocalToolExecutor {
     web_search_min_interval: Duration,
     web_search_provider: WebSearchProvider,
     serper_api_key: Option<String>,
+    shutdown_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 #[derive(Debug)]
@@ -542,6 +731,7 @@ impl LocalToolExecutor {
             web_search_min_interval: interval,
             web_search_provider: config.web_search_provider,
             serper_api_key: config.serper_api_key.clone(),
+            shutdown_flag: None,
         }
     }
 
@@ -553,20 +743,44 @@ impl LocalToolExecutor {
             web_search_min_interval: Duration::ZERO,
             web_search_provider: WebSearchProvider::DuckDuckGo,
             serper_api_key: None,
+            shutdown_flag: None,
         }
+    }
+
+    /// Set the shutdown flag for graceful shutdown support.
+    pub fn with_shutdown_flag(
+        mut self,
+        flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        self.shutdown_flag = Some(flag);
+        self
+    }
+
+    /// Check whether a shutdown has been requested via the shared flag.
+    fn is_shutdown(&self) -> bool {
+        self.shutdown_flag
+            .as_ref()
+            .is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     pub fn execute(
         &mut self,
         request: ToolExecutionRequest,
     ) -> Result<ToolExecutionResult, ToolRuntimeError> {
+        let tool_name = &request.spec.name;
+        tracing::info!(tool = %tool_name, "executing tool");
         let started = Instant::now();
-        match request.input {
+        let result = match request.input {
             ToolInput::FileRead { ref path } => self.execute_file_read(&request, path, started),
             ToolInput::FileWrite {
                 ref path,
                 ref content,
             } => self.execute_file_write(&request, path, content, started),
+            ToolInput::FileEdit {
+                ref path,
+                ref old_string,
+                ref new_string,
+            } => self.execute_file_edit(&request, path, old_string, new_string, started),
             ToolInput::FileSearch {
                 ref root,
                 ref pattern,
@@ -576,7 +790,17 @@ impl LocalToolExecutor {
                 self.execute_shell_exec(&request, command, started)
             }
             ToolInput::WebSearch { ref query } => self.execute_web_search(&request, query, started),
-        }
+            ToolInput::Mcp { .. } => unreachable!("MCP tools are dispatched in agentic.rs"),
+            ToolInput::AgentExplore { .. } | ToolInput::AgentPlan { .. } => {
+                unreachable!("agent tools are dispatched in agentic.rs")
+            }
+        };
+        tracing::info!(
+            tool = %tool_name,
+            elapsed_ms = %started.elapsed().as_millis(),
+            "tool execution completed"
+        );
+        result
     }
 
     fn execute_file_read(
@@ -586,20 +810,68 @@ impl LocalToolExecutor {
         started: Instant,
     ) -> Result<ToolExecutionResult, ToolRuntimeError> {
         let resolved = self.resolve_path(path)?;
-        let content = if resolved.is_dir() {
-            render_directory_listing(&resolved)?
-        } else {
-            fs::read_to_string(&resolved).map_err(|err| {
-                ToolRuntimeError::Io(format!(
-                    "file.read failed for {}: {err}",
-                    resolved.display()
-                ))
-            })?
-        };
+        if resolved.is_dir() {
+            let content = render_directory_listing(&resolved)?;
+            return Ok(build_completed_result(
+                request,
+                path.to_string(),
+                ToolExecutionPayload::Text(content),
+                vec![resolved.display().to_string()],
+                started,
+            ));
+        }
+        // Check if the file is an image based on extension
+        if let Some(mime_type) = detect_image_mime(&resolved) {
+            return self.execute_image_read(request, path, &resolved, mime_type, started);
+        }
+        let content = fs::read_to_string(&resolved).map_err(|err| {
+            ToolRuntimeError::Io(format!(
+                "file.read failed for {}: {err}",
+                resolved.display()
+            ))
+        })?;
         Ok(build_completed_result(
             request,
             path.to_string(),
             ToolExecutionPayload::Text(content),
+            vec![resolved.display().to_string()],
+            started,
+        ))
+    }
+
+    fn execute_image_read(
+        &self,
+        request: &ToolExecutionRequest,
+        path: &str,
+        resolved: &Path,
+        mime_type: &str,
+        started: Instant,
+    ) -> Result<ToolExecutionResult, ToolRuntimeError> {
+        let metadata = fs::metadata(resolved).map_err(|err| {
+            ToolRuntimeError::Io(format!(
+                "file.read failed for {}: {err}",
+                resolved.display()
+            ))
+        })?;
+        if metadata.len() > IMAGE_SIZE_LIMIT {
+            return Ok(build_completed_result(
+                request,
+                path.to_string(),
+                ToolExecutionPayload::Text(format!(
+                    "ファイルサイズが上限(20MB)を超えています: {} bytes",
+                    metadata.len()
+                )),
+                vec![resolved.display().to_string()],
+                started,
+            ));
+        }
+        Ok(build_completed_result(
+            request,
+            path.to_string(),
+            ToolExecutionPayload::Image {
+                source_path: resolved.display().to_string(),
+                mime_type: mime_type.to_string(),
+            },
             vec![resolved.display().to_string()],
             started,
         ))
@@ -624,6 +896,60 @@ impl LocalToolExecutor {
         fs::write(&resolved, content).map_err(|err| {
             ToolRuntimeError::Io(format!(
                 "file.write failed for {}: {err}",
+                resolved.display()
+            ))
+        })?;
+        Ok(build_completed_result(
+            request,
+            path.to_string(),
+            ToolExecutionPayload::None,
+            vec![resolved.display().to_string()],
+            started,
+        ))
+    }
+
+    fn execute_file_edit(
+        &self,
+        request: &ToolExecutionRequest,
+        path: &str,
+        old_string: &str,
+        new_string: &str,
+        started: Instant,
+    ) -> Result<ToolExecutionResult, ToolRuntimeError> {
+        let resolved = self.resolve_path(path)?;
+        let content = fs::read_to_string(&resolved).map_err(|err| {
+            ToolRuntimeError::Io(format!(
+                "file.edit failed to read {}: {err}",
+                resolved.display()
+            ))
+        })?;
+        if old_string == new_string {
+            return Ok(build_completed_result(
+                request,
+                format!("{path} (no changes)"),
+                ToolExecutionPayload::None,
+                vec![],
+                started,
+            ));
+        }
+        let count = content.matches(old_string).count();
+        if count == 0 {
+            return Err(ToolRuntimeError::Io(format!(
+                "file.edit: old_string not found in {path}. \
+                 Ensure the string exactly matches the file content, \
+                 including whitespace and indentation."
+            )));
+        }
+        if count > 1 {
+            return Err(ToolRuntimeError::Io(format!(
+                "file.edit: old_string found {count} times in {path}. \
+                 Include more surrounding context to make the match unique."
+            )));
+        }
+        let new_content = content.replacen(old_string, new_string, 1);
+        fs::write(&resolved, &new_content).map_err(|err| {
+            ToolRuntimeError::Io(format!(
+                "file.edit failed to write {}: {err}",
                 resolved.display()
             ))
         })?;
@@ -747,17 +1073,36 @@ impl LocalToolExecutor {
             captured
         });
 
-        let exit_status = child.wait().ok();
+        // Poll child process with shutdown flag check
+        let exit_status = loop {
+            if self.is_shutdown() {
+                if let Err(e) = child.kill() {
+                    tracing::warn!("failed to kill child process: {e}");
+                }
+                let stdout_buf = stdout_thread.join().unwrap_or_default();
+                let stderr_buf = stderr_thread.join().unwrap_or_default();
+                let _ = child.wait();
+                let combined = combine_process_output(stdout_buf, stderr_buf);
+                return Ok(ToolExecutionResult {
+                    tool_call_id: request.tool_call_id.clone(),
+                    tool_name: request.spec.name.clone(),
+                    status: ToolExecutionStatus::Interrupted,
+                    summary: format!("shell.exec interrupted: {command}"),
+                    payload: ToolExecutionPayload::Text(combined),
+                    artifacts: Vec::new(),
+                    elapsed_ms: started.elapsed().as_millis(),
+                });
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                Err(_) => break None,
+            }
+        };
         let stdout_buf = stdout_thread.join().unwrap_or_default();
         let stderr_buf = stderr_thread.join().unwrap_or_default();
 
-        let combined = if stderr_buf.trim().is_empty() {
-            stdout_buf
-        } else if stdout_buf.trim().is_empty() {
-            stderr_buf
-        } else {
-            format!("{stdout_buf}--- stderr ---\n{stderr_buf}")
-        };
+        let combined = combine_process_output(stdout_buf, stderr_buf);
 
         let success = exit_status.is_some_and(|s| s.success());
         let status = if success {
@@ -954,35 +1299,45 @@ impl LocalToolExecutor {
     }
 
     fn resolve_path(&self, raw: &str) -> Result<PathBuf, ToolRuntimeError> {
-        let candidate = Path::new(raw);
-        if candidate.is_absolute() {
-            return Err(ToolRuntimeError::InvalidPath(raw.to_string()));
-        }
-        if candidate
-            .components()
-            .any(|component| matches!(component, Component::ParentDir))
-        {
-            return Err(ToolRuntimeError::InvalidPath(raw.to_string()));
-        }
-        let joined = self.root.join(candidate);
-        // If the path exists, canonicalize to resolve symlinks and verify
-        // the result is still within the sandbox root.
-        if joined.exists() {
-            let canonical = fs::canonicalize(&joined).map_err(|err| {
-                ToolRuntimeError::Io(format!(
-                    "failed to resolve path {}: {err}",
-                    joined.display()
-                ))
-            })?;
-            let root_canonical = fs::canonicalize(&self.root).unwrap_or_else(|_| self.root.clone());
-            if !canonical.starts_with(&root_canonical) {
-                return Err(ToolRuntimeError::InvalidPath(format!(
-                    "{raw} resolves outside sandbox"
-                )));
-            }
-        }
-        Ok(joined)
+        resolve_sandbox_path(&self.root, raw)
     }
+}
+
+/// Resolve a relative path within a sandbox root directory.
+///
+/// Rejects absolute paths, parent-directory traversal (`..`), and symlinks
+/// that resolve outside the sandbox root.  This is the same logic used by
+/// [`LocalToolExecutor::resolve_path`], extracted as a pure function for
+/// reuse in diff preview generation.
+pub(crate) fn resolve_sandbox_path(root: &Path, raw: &str) -> Result<PathBuf, ToolRuntimeError> {
+    let candidate = Path::new(raw);
+    if candidate.is_absolute() {
+        return Err(ToolRuntimeError::InvalidPath(raw.to_string()));
+    }
+    if candidate
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(ToolRuntimeError::InvalidPath(raw.to_string()));
+    }
+    let joined = root.join(candidate);
+    // If the path exists, canonicalize to resolve symlinks and verify
+    // the result is still within the sandbox root.
+    if joined.exists() {
+        let canonical = fs::canonicalize(&joined).map_err(|err| {
+            ToolRuntimeError::Io(format!(
+                "failed to resolve path {}: {err}",
+                joined.display()
+            ))
+        })?;
+        let root_canonical = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        if !canonical.starts_with(&root_canonical) {
+            return Err(ToolRuntimeError::InvalidPath(format!(
+                "{raw} resolves outside sandbox"
+            )));
+        }
+    }
+    Ok(joined)
 }
 
 /// Build a [`ToolExecutionResult`] with `Completed` status.
@@ -1064,6 +1419,20 @@ fn validate_required_fields(input: &ToolInput) -> Result<(), ToolValidationError
                 ));
             }
         }
+        ToolInput::FileEdit {
+            path, old_string, ..
+        } => {
+            if path.trim().is_empty() {
+                return Err(ToolValidationError::MissingRequiredField(
+                    "path".to_string(),
+                ));
+            }
+            if old_string.is_empty() {
+                return Err(ToolValidationError::MissingRequiredField(
+                    "old_string".to_string(),
+                ));
+            }
+        }
         ToolInput::FileSearch { root, pattern } => {
             if root.trim().is_empty() {
                 return Err(ToolValidationError::MissingRequiredField(
@@ -1113,6 +1482,26 @@ fn validate_required_fields(input: &ToolInput) -> Result<(), ToolValidationError
                 });
             }
         }
+        ToolInput::AgentExplore { prompt, .. } | ToolInput::AgentPlan { prompt, .. } => {
+            if prompt.trim().is_empty() {
+                return Err(ToolValidationError::MissingRequiredField(
+                    "prompt".to_string(),
+                ));
+            }
+            const MAX_PROMPT_LENGTH: usize = 10000;
+            if prompt.len() > MAX_PROMPT_LENGTH {
+                return Err(ToolValidationError::InvalidFieldValue {
+                    field: "prompt".to_string(),
+                    reason: format!(
+                        "prompt length {} exceeds maximum of {} characters",
+                        prompt.len(),
+                        MAX_PROMPT_LENGTH
+                    ),
+                });
+            }
+        }
+        // [D3-001] MCP tool input validation is handled by the MCP server side
+        ToolInput::Mcp { .. } => {}
     }
 
     Ok(())
@@ -1123,7 +1512,8 @@ fn validate_required_fields(input: &ToolInput) -> Result<(), ToolValidationError
 /// This is a defence-in-depth measure.  The primary protection is the
 /// `Restricted` permission class which blocks `shell.exec` by default.
 fn validate_shell_command_safety(command: &str) -> Result<(), ToolValidationError> {
-    const BLOCKED: &[(&str, &str)] = &[
+    /// Patterns that are unconditionally blocked regardless of context.
+    const BLOCKED_PATTERNS: &[(&str, &str)] = &[
         ("rm -rf /", "recursive deletion of root filesystem"),
         ("rm -rf ~", "recursive deletion of home directory"),
         (
@@ -1141,13 +1531,43 @@ fn validate_shell_command_safety(command: &str) -> Result<(), ToolValidationErro
         ),
     ];
 
+    /// Git sub-commands where --no-verify / -n is blocked.
+    const GIT_NO_VERIFY_BLOCKED: &[&str] = &["commit", "push", "merge"];
+
     let lower = command.to_ascii_lowercase();
-    for (pattern, reason) in BLOCKED {
+
+    for (pattern, reason) in BLOCKED_PATTERNS {
         if lower.contains(pattern) {
             return Err(ToolValidationError::DangerousCommand {
                 command: command.to_string(),
                 reason: reason.to_string(),
             });
+        }
+    }
+
+    // Block --no-verify / -n on git commands that support hook bypass.
+    if lower.starts_with("git ") {
+        let tokens: Vec<&str> = lower.split_whitespace().collect();
+        let is_blocked_subcommand = tokens
+            .get(1)
+            .is_some_and(|sub| GIT_NO_VERIFY_BLOCKED.contains(sub));
+        if is_blocked_subcommand {
+            let has_no_verify = tokens.contains(&"--no-verify");
+            let has_short_n = tokens.contains(&"-n");
+            if has_no_verify {
+                return Err(ToolValidationError::DangerousCommand {
+                    command: command.to_string(),
+                    reason: "skipping git hooks can bypass safety checks".to_string(),
+                });
+            }
+            if has_short_n {
+                return Err(ToolValidationError::DangerousCommand {
+                    command: command.to_string(),
+                    reason:
+                        "skipping git hooks can bypass safety checks (-n is short for --no-verify)"
+                            .to_string(),
+                });
+            }
         }
     }
 
@@ -1168,6 +1588,9 @@ pub fn is_safe_shell_command(command: &str) -> bool {
         || trimmed.contains("$(")
         || trimmed.contains("${")
         || trimmed.contains('\n')
+        || trimmed.contains("&&")
+        || trimmed.contains('>')
+        || trimmed.contains('<')
     {
         return false;
     }
@@ -1175,16 +1598,12 @@ pub fn is_safe_shell_command(command: &str) -> bool {
     // gh api: GET-only is safe (token-split based flag detection)
     if trimmed.starts_with("gh api ") {
         let tokens: Vec<&str> = trimmed.split_whitespace().collect();
-        let mutation_flags = [
-            "--method",
-            "-X",
-            "--input",
-            "-f",
-            "--field",
-            "-F",
-            "--raw-field",
-        ];
-        let mutation_combined = [
+
+        // Flags that imply a mutating request by their mere presence.
+        const BODY_FLAGS: &[&str] = &["-f", "--field", "-F", "--raw-field", "--input"];
+
+        // Combined flag=value forms that imply mutation.
+        const MUTATION_COMBINED: &[&str] = &[
             "-XPOST",
             "-XPUT",
             "-XPATCH",
@@ -1201,35 +1620,81 @@ pub fn is_safe_shell_command(command: &str) -> bool {
         ];
 
         for (i, token) in tokens.iter().enumerate() {
-            // Check flag + next-token patterns (e.g. --method POST)
-            if mutation_flags.iter().any(|f| token == f) {
-                if let Some(next) = tokens.get(i + 1) {
-                    let upper = next.to_uppercase();
-                    if ["POST", "PUT", "PATCH", "DELETE"].contains(&upper.as_str()) {
-                        return false;
-                    }
-                }
-                // -f, --field, -F, --raw-field, --input are mutation flags by themselves
-                if ["-f", "--field", "-F", "--raw-field", "--input"].contains(token) {
+            // Body/field flags always imply mutation (POST is the gh default).
+            if BODY_FLAGS.iter().any(|f| token == f) {
+                return false;
+            }
+
+            // --method / -X followed by a mutating HTTP verb.
+            if (*token == "--method" || *token == "-X")
+                && let Some(next) = tokens.get(i + 1)
+            {
+                let upper = next.to_uppercase();
+                if ["POST", "PUT", "PATCH", "DELETE"].contains(&upper.as_str()) {
                     return false;
                 }
             }
-            // Check combined forms (e.g. -XPOST, --method=POST, --input=file)
-            if mutation_combined.iter().any(|f| token.starts_with(f)) {
+
+            // Combined forms (e.g. -XPOST, --method=POST, --input=file)
+            if MUTATION_COMBINED.iter().any(|f| token.starts_with(f)) {
                 return false;
             }
         }
         return true;
     }
 
+    // Auto-approved command prefixes, grouped by category for readability.
     const SAFE_PREFIXES: &[&str] = &[
-        "gh repo view",
-        "gh pr list",
-        "gh issue list",
+        // Git read-only
         "git log",
         "git status",
         "git diff",
+        "git branch",
+        "git show ", // trailing space requires an argument (ref)
+        "git remote -v",
+        "git rev-parse",
+        // GitHub CLI read-only
+        "gh repo view",
+        "gh pr list",
+        "gh issue list",
+        "gh pr view",
+        "gh issue view",
+        "gh auth status",
+        // Rust build/test/lint
+        "cargo clippy",
+        "cargo fmt --check",
+        "cargo test",
+        "cargo check",
+        "cargo build",
+        // Node.js build/test/lint
+        "npm test",
+        "npx jest ",
+        "npx eslint ",
+        "npx prettier --check",
+        // Python test/lint
+        "pytest",
+        "ruff check ",
+        "flake8",
+        // Go build/test/lint
+        "go test",
+        "go vet",
+        "golangci-lint",
+        // Make build/test
+        "make test",
+        "make check",
+        // Environment inspection
+        "which ",
+        "uname",
+        "node -v",
+        "node --version",
+        "rustc --version",
+        "cargo --version",
+        "python --version",
+        "go version",
+        // Process inspection
+        "lsof -i",
     ];
+
     if !SAFE_PREFIXES
         .iter()
         .any(|prefix| trimmed.starts_with(prefix))
@@ -1252,10 +1717,23 @@ pub fn is_safe_shell_command(command: &str) -> bool {
 ///
 /// Safe shell commands (as determined by [`is_safe_shell_command`]) are
 /// promoted from `Confirm` to `Safe`, skipping the approval prompt.
+/// All other tools (including MCP) use their spec's permission class directly.
 pub fn effective_permission_class(input: &ToolInput, spec: &ToolSpec) -> PermissionClass {
     match input {
         ToolInput::ShellExec { command } if is_safe_shell_command(command) => PermissionClass::Safe,
         _ => spec.permission_class,
+    }
+}
+
+/// Parse an MCP tool name: "mcp__github__create_issue" → ("github", "create_issue").
+///
+/// Returns `None` if the name does not follow the `mcp__<server>__<tool>` convention.
+pub fn parse_mcp_tool_name(name: &str) -> Option<(String, String)> {
+    let parts: Vec<&str> = name.splitn(3, "__").collect();
+    if parts.len() == 3 && parts[0] == "mcp" && !parts[1].is_empty() && !parts[2].is_empty() {
+        Some((parts[1].to_string(), parts[2].to_string()))
+    } else {
+        None
     }
 }
 
@@ -1390,6 +1868,20 @@ fn format_search_results(results: &[SearchResult]) -> String {
         lines.push(String::new());
     }
     lines.join("\n")
+}
+
+/// Combine stdout and stderr into a single output string.
+///
+/// If only one stream has content, returns just that stream.
+/// If both have content, joins them with a `--- stderr ---` separator.
+fn combine_process_output(stdout: String, stderr: String) -> String {
+    if stderr.trim().is_empty() {
+        stdout
+    } else if stdout.trim().is_empty() {
+        stderr
+    } else {
+        format!("{stdout}--- stderr ---\n{stderr}")
+    }
 }
 
 /// Percent-encode a query string for use in URLs.

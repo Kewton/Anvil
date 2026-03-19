@@ -33,15 +33,10 @@ struct MockHttpTransport {
     seen_bodies: Rc<RefCell<Vec<Vec<u8>>>>,
     seen_headers: HeaderLog,
     response: HttpResponse,
+    get_response: Option<HttpResponse>,
 }
 
 impl HttpTransport for MockHttpTransport {
-    fn post_json(&self, url: &str, body: &[u8]) -> Result<HttpResponse, ProviderTurnError> {
-        self.seen_urls.borrow_mut().push(url.to_string());
-        self.seen_bodies.borrow_mut().push(body.to_vec());
-        Ok(self.response.clone())
-    }
-
     fn post_json_with_headers(
         &self,
         url: &str,
@@ -57,6 +52,24 @@ impl HttpTransport for MockHttpTransport {
                 .collect(),
         );
         Ok(self.response.clone())
+    }
+
+    fn get_with_headers(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<HttpResponse, ProviderTurnError> {
+        self.seen_urls.borrow_mut().push(url.to_string());
+        self.seen_headers.borrow_mut().push(
+            headers
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+        );
+        Ok(self
+            .get_response
+            .clone()
+            .unwrap_or_else(|| self.response.clone()))
     }
 }
 
@@ -168,7 +181,12 @@ fn live_turn_executes_structured_file_write_response_without_approval() {
     config.mode.approval_required = false;
     let provider_ctx =
         anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
-    let mut app = anvil::app::App::new(config, provider_ctx).expect("app should initialize");
+    let mut app = anvil::app::App::new(
+        config,
+        provider_ctx,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("app should initialize");
     let tui = Tui::new();
     let provider = RecordingProvider {
         seen_requests: Rc::new(RefCell::new(Vec::new())),
@@ -236,7 +254,12 @@ fn live_turn_executes_complete_structured_response_from_token_stream() {
     config.mode.approval_required = false;
     let provider_ctx =
         anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
-    let mut app = anvil::app::App::new(config, provider_ctx).expect("app should initialize");
+    let mut app = anvil::app::App::new(
+        config,
+        provider_ctx,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("app should initialize");
     let tui = Tui::new();
     let provider = RecordingProvider {
         seen_requests: Rc::new(RefCell::new(Vec::new())),
@@ -304,7 +327,12 @@ fn live_turn_executes_malformed_structured_file_write_response() {
     config.mode.approval_required = false;
     let provider_ctx =
         anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
-    let mut app = anvil::app::App::new(config, provider_ctx).expect("app should initialize");
+    let mut app = anvil::app::App::new(
+        config,
+        provider_ctx,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("app should initialize");
     let tui = Tui::new();
     let provider = RecordingProvider {
         seen_requests: Rc::new(RefCell::new(Vec::new())),
@@ -395,6 +423,7 @@ fn ollama_provider_builds_chat_request_shape() {
         vec![OllamaChatMessage {
             role: "user".to_string(),
             content: "inspect src/provider".to_string(),
+            images: None,
         }]
     );
 }
@@ -420,6 +449,7 @@ fn openai_compatible_provider_maps_response_into_done_event() {
             body: br#"{"choices":[{"message":{"role":"assistant","content":"openai-compatible answer"}}]}"#
                 .to_vec(),
         },
+        get_response: None,
     };
     let client = anvil::provider::openai::OpenAiCompatibleProviderClient::with_transport(
         "http://localhost:1234",
@@ -468,6 +498,7 @@ fn openai_compatible_provider_parses_sse_streams() {
             .as_bytes()
             .to_vec(),
         },
+        get_response: None,
     };
     let client = anvil::provider::openai::OpenAiCompatibleProviderClient::with_transport(
         "http://localhost:1234",
@@ -508,6 +539,7 @@ fn openai_compatible_provider_normalizes_error_message() {
             status_code: 401,
             body: br#"{"error":{"message":"invalid api key"}}"#.to_vec(),
         },
+        get_response: None,
     };
     let client = anvil::provider::openai::OpenAiCompatibleProviderClient::with_transport(
         "http://localhost:1234",
@@ -540,6 +572,7 @@ fn openai_compatible_provider_forwards_authorization_header() {
             status_code: 200,
             body: br#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#.to_vec(),
         },
+        get_response: None,
     };
     let client = anvil::provider::openai::OpenAiCompatibleProviderClient::with_transport(
         "http://localhost:1234",
@@ -568,7 +601,12 @@ fn live_turn_executes_structured_response_from_openai_compatible_provider() {
     config.runtime.provider_url = "http://localhost:1234".to_string();
     let provider_ctx =
         anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
-    let mut app = anvil::app::App::new(config, provider_ctx).expect("app should initialize");
+    let mut app = anvil::app::App::new(
+        config,
+        provider_ctx,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("app should initialize");
     let tui = Tui::new();
 
     let transport = MockHttpTransport {
@@ -579,6 +617,7 @@ fn live_turn_executes_structured_response_from_openai_compatible_provider() {
             status_code: 200,
             body: br#"{"choices":[{"message":{"role":"assistant","content":"```ANVIL_TOOL\n{\"id\":\"call_write_001\",\"tool\":\"file.write\",\"path\":\"./sandbox/openai/index.html\",\"content\":\"<html><body>openai parity</body></html>\"}\n```\n```ANVIL_FINAL\nOpenAI-compatible backend created the file and reviewed the output.\n```"}}]}"#.to_vec(),
         },
+        get_response: None,
     };
     let client = anvil::provider::openai::OpenAiCompatibleProviderClient::with_transport(
         "http://localhost:1234",
@@ -610,16 +649,23 @@ fn basic_agent_loop_applies_context_shaping_limit() {
         .expect("persist");
     app.record_user_input("msg_005", "u3").expect("persist");
 
+    let system_prompt = anvil::agent::tool_protocol_system_prompt(&[], None);
     let request = anvil::agent::BasicAgentLoop::build_turn_request_with_limit(
         "local-default",
         app.session(),
         true,
         3,
+        &system_prompt,
     );
 
-    assert_eq!(request.messages.len(), 3);
-    assert_eq!(request.messages[0].content, "u2");
-    assert_eq!(request.messages[2].content, "u3");
+    // System prompt is now injected as messages[0]
+    assert_eq!(request.messages.len(), 4);
+    assert_eq!(
+        request.messages[0].role,
+        anvil::provider::ProviderMessageRole::System
+    );
+    assert_eq!(request.messages[1].content, "u2");
+    assert_eq!(request.messages[3].content, "u3");
 }
 
 #[test]
@@ -630,17 +676,20 @@ fn basic_agent_loop_derives_context_budget_from_context_window() {
             .expect("persist");
     }
 
+    let system_prompt = anvil::agent::tool_protocol_system_prompt(&[], None);
     let small = anvil::agent::BasicAgentLoop::build_turn_request(
         "local-default",
         app.session(),
         true,
-        1_000,
+        8_000,
+        &system_prompt,
     );
     let large = anvil::agent::BasicAgentLoop::build_turn_request(
         "local-default",
         app.session(),
         true,
         200_000,
+        &system_prompt,
     );
 
     assert!(small.messages.len() < large.messages.len());
@@ -863,6 +912,7 @@ fn ollama_provider_stream_turn_posts_chat_request_and_normalizes_response() {
                 status_code: 200,
                 body: body.as_bytes().to_vec(),
             },
+            get_response: None,
         },
     );
     let request = ProviderTurnRequest::new(
@@ -916,6 +966,7 @@ fn ollama_provider_surfaces_non_success_status_as_backend_error() {
                 status_code: 500,
                 body: b"ollama down".to_vec(),
             },
+            get_response: None,
         },
     );
     let request = ProviderTurnRequest::new(
@@ -930,8 +981,139 @@ fn ollama_provider_surfaces_non_success_status_as_backend_error() {
         .stream_turn(&request, &mut |_event| {})
         .expect_err("non-success status should fail");
 
-    assert!(err.to_string().contains("request failed"));
-    assert!(err.to_string().contains("500"));
+    assert!(
+        matches!(
+            err,
+            ProviderTurnError::ServerError {
+                status_code: 500,
+                ..
+            }
+        ),
+        "500 status should be classified as ServerError, got: {err:?}"
+    );
+}
+
+// --- HttpTransport GET and header validation tests ---
+
+#[test]
+fn mock_transport_get_returns_configured_response() {
+    let transport = MockHttpTransport {
+        seen_urls: Rc::new(RefCell::new(Vec::new())),
+        seen_bodies: Rc::new(RefCell::new(Vec::new())),
+        seen_headers: Rc::new(RefCell::new(Vec::new())),
+        response: HttpResponse {
+            status_code: 200,
+            body: b"post response".to_vec(),
+        },
+        get_response: Some(HttpResponse {
+            status_code: 200,
+            body: b"get response".to_vec(),
+        }),
+    };
+
+    let result = transport.get("http://localhost/api/tags").unwrap();
+    assert_eq!(result.status_code, 200);
+    assert_eq!(result.body, b"get response");
+
+    // Verify the URL was recorded
+    let urls = transport.seen_urls.borrow();
+    assert_eq!(urls.len(), 1);
+    assert_eq!(urls[0], "http://localhost/api/tags");
+}
+
+#[test]
+fn mock_transport_get_with_headers_records_headers() {
+    let seen_headers: HeaderLog = Rc::new(RefCell::new(Vec::new()));
+    let transport = MockHttpTransport {
+        seen_urls: Rc::new(RefCell::new(Vec::new())),
+        seen_bodies: Rc::new(RefCell::new(Vec::new())),
+        seen_headers: seen_headers.clone(),
+        response: HttpResponse {
+            status_code: 200,
+            body: b"ok".to_vec(),
+        },
+        get_response: None,
+    };
+
+    let result = transport
+        .get_with_headers(
+            "http://localhost/v1/models",
+            &[("Authorization", "Bearer sk-test")],
+        )
+        .unwrap();
+    assert_eq!(result.status_code, 200);
+
+    let headers = seen_headers.borrow();
+    assert_eq!(headers.len(), 1);
+    assert_eq!(headers[0].len(), 1);
+    assert_eq!(headers[0][0].0, "Authorization");
+    assert_eq!(headers[0][0].1, "Bearer sk-test");
+}
+
+#[test]
+fn mock_transport_get_falls_back_to_post_response_when_get_response_is_none() {
+    let transport = MockHttpTransport {
+        seen_urls: Rc::new(RefCell::new(Vec::new())),
+        seen_bodies: Rc::new(RefCell::new(Vec::new())),
+        seen_headers: Rc::new(RefCell::new(Vec::new())),
+        response: HttpResponse {
+            status_code: 200,
+            body: b"fallback response".to_vec(),
+        },
+        get_response: None,
+    };
+
+    let result = transport.get("http://localhost/api/tags").unwrap();
+    assert_eq!(result.body, b"fallback response");
+}
+
+#[test]
+fn post_json_default_delegates_to_post_json_with_headers() {
+    let seen_headers: HeaderLog = Rc::new(RefCell::new(Vec::new()));
+    let transport = MockHttpTransport {
+        seen_urls: Rc::new(RefCell::new(Vec::new())),
+        seen_bodies: Rc::new(RefCell::new(Vec::new())),
+        seen_headers: seen_headers.clone(),
+        response: HttpResponse {
+            status_code: 200,
+            body: b"ok".to_vec(),
+        },
+        get_response: None,
+    };
+
+    // post_json should delegate to post_json_with_headers with empty headers
+    let result = transport
+        .post_json("http://localhost/api/chat", b"{}")
+        .unwrap();
+    assert_eq!(result.status_code, 200);
+
+    let headers = seen_headers.borrow();
+    assert_eq!(headers.len(), 1);
+    // Default impl passes empty headers slice
+    assert!(headers[0].is_empty());
+}
+
+#[test]
+fn get_default_delegates_to_get_with_headers() {
+    let seen_headers: HeaderLog = Rc::new(RefCell::new(Vec::new()));
+    let transport = MockHttpTransport {
+        seen_urls: Rc::new(RefCell::new(Vec::new())),
+        seen_bodies: Rc::new(RefCell::new(Vec::new())),
+        seen_headers: seen_headers.clone(),
+        response: HttpResponse {
+            status_code: 200,
+            body: b"ok".to_vec(),
+        },
+        get_response: None,
+    };
+
+    // get() should delegate to get_with_headers with empty headers
+    let result = transport.get("http://localhost/api/tags").unwrap();
+    assert_eq!(result.status_code, 200);
+
+    let headers = seen_headers.borrow();
+    assert_eq!(headers.len(), 1);
+    assert!(headers[0].is_empty());
 }
 
 // --- Agentic loop unit tests ---
@@ -943,7 +1125,12 @@ fn agentic_loop_multi_iteration_tool_calls_then_final_answer() {
     config.mode.approval_required = false;
     let provider_ctx =
         anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
-    let mut app = anvil::app::App::new(config, provider_ctx).expect("app should initialize");
+    let mut app = anvil::app::App::new(
+        config,
+        provider_ctx,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("app should initialize");
     let tui = Tui::new();
 
     // Create files that the tool calls will read
@@ -1042,7 +1229,12 @@ fn agentic_loop_tool_result_payload_included_in_session_messages() {
     config.mode.approval_required = false;
     let provider_ctx =
         anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
-    let mut app = anvil::app::App::new(config, provider_ctx).expect("app should initialize");
+    let mut app = anvil::app::App::new(
+        config,
+        provider_ctx,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("app should initialize");
     let tui = Tui::new();
 
     // Write a test file so file.read has something to return
@@ -1105,7 +1297,12 @@ fn agentic_loop_respects_max_iteration_limit() {
     config.mode.approval_required = false;
     let provider_ctx =
         anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
-    let mut app = anvil::app::App::new(config, provider_ctx).expect("app should initialize");
+    let mut app = anvil::app::App::new(
+        config,
+        provider_ctx,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("app should initialize");
     let tui = Tui::new();
 
     // Create file so file.read succeeds
@@ -1176,7 +1373,12 @@ fn agentic_loop_error_during_followup_propagates() {
     config.mode.approval_required = false;
     let provider_ctx =
         anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
-    let mut app = anvil::app::App::new(config, provider_ctx).expect("app should initialize");
+    let mut app = anvil::app::App::new(
+        config,
+        provider_ctx,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("app should initialize");
     let tui = Tui::new();
 
     // Create file so file.read succeeds on the first iteration
@@ -1292,8 +1494,14 @@ fn structured_response_parser_repairs_web_fetch_block() {
 #[test]
 fn system_prompt_includes_web_fetch_tool() {
     let session = anvil::session::SessionRecord::new(std::path::PathBuf::from("/tmp"));
-    let request =
-        anvil::agent::BasicAgentLoop::build_turn_request("test-model", &session, false, 4096);
+    let system_prompt = anvil::agent::tool_protocol_system_prompt(&[], None);
+    let request = anvil::agent::BasicAgentLoop::build_turn_request(
+        "test-model",
+        &session,
+        false,
+        4096,
+        &system_prompt,
+    );
     assert!(
         request.messages[0].content.contains("web.fetch"),
         "system prompt should mention web.fetch"
@@ -1368,8 +1576,14 @@ fn structured_response_parser_repairs_web_search_block() {
 #[test]
 fn system_prompt_includes_web_search_tool() {
     let session = anvil::session::SessionRecord::new(std::path::PathBuf::from("/tmp"));
-    let request =
-        anvil::agent::BasicAgentLoop::build_turn_request("test-model", &session, false, 4096);
+    let system_prompt = anvil::agent::tool_protocol_system_prompt(&[], None);
+    let request = anvil::agent::BasicAgentLoop::build_turn_request(
+        "test-model",
+        &session,
+        false,
+        4096,
+        &system_prompt,
+    );
     assert!(
         request.messages[0].content.contains("web.search"),
         "system prompt should mention web.search"
@@ -1379,8 +1593,14 @@ fn system_prompt_includes_web_search_tool() {
 #[test]
 fn system_prompt_includes_github_insights() {
     let session = anvil::session::SessionRecord::new(std::path::PathBuf::from("/tmp"));
-    let request =
-        anvil::agent::BasicAgentLoop::build_turn_request("test-model", &session, false, 4096);
+    let system_prompt = anvil::agent::tool_protocol_system_prompt(&[], None);
+    let request = anvil::agent::BasicAgentLoop::build_turn_request(
+        "test-model",
+        &session,
+        false,
+        4096,
+        &system_prompt,
+    );
     assert!(
         request.messages[0].content.contains("GitHub Insights"),
         "system prompt should mention GitHub Insights"
@@ -1388,5 +1608,987 @@ fn system_prompt_includes_github_insights() {
     assert!(
         request.messages[0].content.contains("gh api"),
         "system prompt should mention gh api"
+    );
+}
+
+// --- Phase 3: detect_project_languages tests ---
+
+#[test]
+fn detect_rust_project() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    std::fs::write(tmp.path().join("Cargo.toml"), "[package]\nname = \"test\"").expect("write");
+    let languages = anvil::app::detect_project_languages(tmp.path());
+    assert_eq!(languages, vec![anvil::agent::ProjectLanguage::Rust]);
+}
+
+#[test]
+fn detect_nodejs_project() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    std::fs::write(tmp.path().join("package.json"), "{}").expect("write");
+    let languages = anvil::app::detect_project_languages(tmp.path());
+    assert_eq!(languages, vec![anvil::agent::ProjectLanguage::NodeJs]);
+}
+
+#[test]
+fn detect_empty_project() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    let languages = anvil::app::detect_project_languages(tmp.path());
+    assert!(languages.is_empty());
+}
+
+#[test]
+fn detect_both_rust_and_nodejs() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    std::fs::write(tmp.path().join("Cargo.toml"), "[package]").expect("write");
+    std::fs::write(tmp.path().join("package.json"), "{}").expect("write");
+    let languages = anvil::app::detect_project_languages(tmp.path());
+    assert_eq!(
+        languages,
+        vec![
+            anvil::agent::ProjectLanguage::Rust,
+            anvil::agent::ProjectLanguage::NodeJs,
+        ]
+    );
+}
+
+// --- Phase 3: tool_protocol_system_prompt dynamic guide tests ---
+
+#[test]
+fn system_prompt_rust_includes_git_and_cargo() {
+    use anvil::agent::ProjectLanguage;
+    let prompt = anvil::agent::tool_protocol_system_prompt(&[ProjectLanguage::Rust], None);
+    assert!(
+        prompt.contains("Git operations"),
+        "should contain Git operations guide"
+    );
+    assert!(
+        prompt.contains("cargo build"),
+        "should contain cargo build guide"
+    );
+}
+
+#[test]
+fn system_prompt_nodejs_includes_git_and_npm_but_not_cargo() {
+    use anvil::agent::ProjectLanguage;
+    let prompt = anvil::agent::tool_protocol_system_prompt(&[ProjectLanguage::NodeJs], None);
+    assert!(
+        prompt.contains("Git operations"),
+        "should contain Git operations guide"
+    );
+    assert!(prompt.contains("npm"), "should contain npm guide");
+    assert!(
+        !prompt.contains("cargo build"),
+        "should not contain cargo build guide"
+    );
+}
+
+#[test]
+fn system_prompt_empty_has_git_only() {
+    let prompt = anvil::agent::tool_protocol_system_prompt(&[], None);
+    assert!(
+        prompt.contains("Git operations"),
+        "should contain Git operations guide"
+    );
+    assert!(
+        !prompt.contains("cargo build"),
+        "should not contain cargo build guide"
+    );
+    assert!(!prompt.contains("npm test"), "should not contain npm guide");
+}
+
+#[test]
+fn system_prompt_both_languages_includes_both() {
+    use anvil::agent::ProjectLanguage;
+    let prompt = anvil::agent::tool_protocol_system_prompt(
+        &[ProjectLanguage::Rust, ProjectLanguage::NodeJs],
+        None,
+    );
+    assert!(prompt.contains("cargo build"), "should contain cargo guide");
+    assert!(prompt.contains("npm"), "should contain npm guide");
+}
+
+#[test]
+fn system_prompt_includes_never_guide() {
+    use anvil::agent::ProjectLanguage;
+    let prompt = anvil::agent::tool_protocol_system_prompt(&[ProjectLanguage::Rust], None);
+    assert!(
+        prompt.contains("NEVER"),
+        "should contain NEVER guide for dangerous operations"
+    );
+}
+
+// --- file.edit agent protocol tests ---
+
+#[test]
+fn file_edit_anvil_tool_block_parses() {
+    let response = anvil::agent::BasicAgentLoop::parse_structured_response(concat!(
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_edit_001\",\"tool\":\"file.edit\",\"path\":\"./src/main.rs\",\"old_string\":\"fn main()\",\"new_string\":\"fn main() -> Result<()>\"}\n",
+        "```\n",
+        "```ANVIL_FINAL\n",
+        "Edited the file.\n",
+        "```\n"
+    ))
+    .expect("parser should handle file.edit block");
+
+    assert_eq!(response.tool_calls.len(), 1);
+    assert_eq!(response.tool_calls[0].tool_name, "file.edit");
+    match &response.tool_calls[0].input {
+        anvil::tooling::ToolInput::FileEdit {
+            path,
+            old_string,
+            new_string,
+        } => {
+            assert_eq!(path, "./src/main.rs");
+            assert_eq!(old_string, "fn main()");
+            assert_eq!(new_string, "fn main() -> Result<()>");
+        }
+        other => panic!("unexpected tool input: {other:?}"),
+    }
+}
+
+#[test]
+fn system_prompt_includes_file_edit_tool() {
+    let session = anvil::session::SessionRecord::new(std::path::PathBuf::from("/tmp"));
+    let system_prompt = anvil::agent::tool_protocol_system_prompt(&[], None);
+    let request = anvil::agent::BasicAgentLoop::build_turn_request(
+        "test-model",
+        &session,
+        false,
+        4096,
+        &system_prompt,
+    );
+    assert!(
+        request.messages[0].content.contains("file.edit"),
+        "system prompt should mention file.edit"
+    );
+}
+
+// --- ANVIL.md project instructions tests ---
+
+#[test]
+fn system_prompt_includes_project_instructions() {
+    let session = anvil::session::SessionRecord::new(std::path::PathBuf::from("/tmp"));
+    let instructions = "Always use snake_case for function names.";
+    let base_prompt = anvil::agent::tool_protocol_system_prompt(&[], None);
+    let system_prompt = format!(
+        "{}\n\n## Project instructions (from ANVIL.md)\n{}",
+        base_prompt, instructions
+    );
+    let request = anvil::agent::BasicAgentLoop::build_turn_request(
+        "test-model",
+        &session,
+        false,
+        4096,
+        &system_prompt,
+    );
+
+    assert!(
+        request.messages[0]
+            .content
+            .contains("Project instructions (from ANVIL.md)"),
+        "system prompt should contain ANVIL.md header"
+    );
+    assert!(
+        request.messages[0].content.contains(instructions),
+        "system prompt should contain the project instructions"
+    );
+    assert!(
+        request.messages[0].content.contains("You are Anvil"),
+        "system prompt should still contain base prompt"
+    );
+}
+
+#[test]
+fn system_prompt_without_project_instructions() {
+    let session = anvil::session::SessionRecord::new(std::path::PathBuf::from("/tmp"));
+    let system_prompt = anvil::agent::tool_protocol_system_prompt(&[], None);
+    let request = anvil::agent::BasicAgentLoop::build_turn_request(
+        "test-model",
+        &session,
+        false,
+        4096,
+        &system_prompt,
+    );
+
+    assert!(
+        !request.messages[0]
+            .content
+            .contains("Project instructions (from ANVIL.md)"),
+        "system prompt should NOT contain ANVIL.md header when None"
+    );
+    assert!(
+        request.messages[0].content.contains("You are Anvil"),
+        "system prompt should contain base prompt"
+    );
+}
+
+#[test]
+fn build_turn_request_with_limit_includes_system_prompt() {
+    let mut app = common::build_app();
+    app.record_user_input("msg_001", "u1").expect("persist");
+    app.record_assistant_output("msg_002", "a1")
+        .expect("persist");
+    app.record_user_input("msg_003", "u2").expect("persist");
+
+    let instructions = "Test project instructions.";
+    let base_prompt = anvil::agent::tool_protocol_system_prompt(&[], None);
+    let system_prompt = format!(
+        "{}\n\n## Project instructions (from ANVIL.md)\n{}",
+        base_prompt, instructions
+    );
+    let request = anvil::agent::BasicAgentLoop::build_turn_request_with_limit(
+        "local-default",
+        app.session(),
+        true,
+        3,
+        &system_prompt,
+    );
+
+    assert_eq!(request.messages.len(), 4);
+    assert_eq!(
+        request.messages[0].role,
+        anvil::provider::ProviderMessageRole::System
+    );
+    assert!(
+        request.messages[0].content.contains(instructions),
+        "system prompt should contain project instructions"
+    );
+    assert!(
+        request.messages[0].content.contains("You are Anvil"),
+        "system prompt should contain base prompt"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1: ProviderTurnError expansion tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn provider_turn_error_is_retryable_network() {
+    let err = ProviderTurnError::Network("connection refused".to_string());
+    assert!(err.is_retryable());
+}
+
+#[test]
+fn provider_turn_error_is_retryable_server_error() {
+    let err = ProviderTurnError::ServerError {
+        status_code: 500,
+        message: "internal server error".to_string(),
+    };
+    assert!(err.is_retryable());
+}
+
+#[test]
+fn provider_turn_error_is_retryable_timeout() {
+    let err = ProviderTurnError::Timeout("request timed out".to_string());
+    assert!(err.is_retryable());
+}
+
+#[test]
+fn provider_turn_error_not_retryable_cancelled() {
+    let err = ProviderTurnError::Cancelled;
+    assert!(!err.is_retryable());
+}
+
+#[test]
+fn provider_turn_error_not_retryable_client_error() {
+    let err = ProviderTurnError::ClientError {
+        status_code: 401,
+        message: "unauthorized".to_string(),
+    };
+    assert!(!err.is_retryable());
+}
+
+#[test]
+fn provider_turn_error_not_retryable_parse() {
+    let err = ProviderTurnError::Parse("invalid JSON".to_string());
+    assert!(!err.is_retryable());
+}
+
+#[test]
+fn provider_turn_error_not_retryable_backend() {
+    let err = ProviderTurnError::Backend("unknown error".to_string());
+    assert!(!err.is_retryable());
+}
+
+#[test]
+fn provider_turn_error_display_network() {
+    let err = ProviderTurnError::Network("connection refused".to_string());
+    assert_eq!(err.to_string(), "network error: connection refused");
+}
+
+#[test]
+fn provider_turn_error_display_server_error() {
+    let err = ProviderTurnError::ServerError {
+        status_code: 502,
+        message: "bad gateway".to_string(),
+    };
+    assert_eq!(err.to_string(), "server error (502): bad gateway");
+}
+
+#[test]
+fn provider_turn_error_display_client_error() {
+    let err = ProviderTurnError::ClientError {
+        status_code: 403,
+        message: "forbidden".to_string(),
+    };
+    assert_eq!(err.to_string(), "client error (403): forbidden");
+}
+
+#[test]
+fn provider_turn_error_display_timeout() {
+    let err = ProviderTurnError::Timeout("timed out after 30s".to_string());
+    assert_eq!(err.to_string(), "timeout: timed out after 30s");
+}
+
+#[test]
+fn provider_turn_error_display_parse() {
+    let err = ProviderTurnError::Parse("expected '{'".to_string());
+    assert_eq!(err.to_string(), "parse error: expected '{'");
+}
+
+#[test]
+fn provider_turn_error_display_cancelled() {
+    let err = ProviderTurnError::Cancelled;
+    assert_eq!(err.to_string(), "provider turn cancelled");
+}
+
+#[test]
+fn provider_turn_error_display_backend() {
+    let err = ProviderTurnError::Backend("something went wrong".to_string());
+    assert_eq!(
+        err.to_string(),
+        "provider backend error: something went wrong"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1: ProviderErrorKind serde tests
+// ---------------------------------------------------------------------------
+
+use anvil::provider::ProviderErrorKind;
+
+#[test]
+fn provider_error_kind_serde_roundtrip_known_variants() {
+    let variants = vec![
+        ProviderErrorKind::Cancelled,
+        ProviderErrorKind::Network,
+        ProviderErrorKind::ServerError,
+        ProviderErrorKind::ClientError,
+        ProviderErrorKind::Timeout,
+        ProviderErrorKind::Parse,
+        ProviderErrorKind::Backend,
+    ];
+    for variant in variants {
+        let json = serde_json::to_string(&variant).unwrap();
+        let deserialized: ProviderErrorKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(variant, deserialized);
+    }
+}
+
+#[test]
+fn provider_error_kind_unknown_variant_fallback() {
+    // A future variant name that doesn't exist should deserialize to Unknown.
+    let json = r#""RateLimit""#;
+    let deserialized: ProviderErrorKind = serde_json::from_str(json).unwrap();
+    assert_eq!(deserialized, ProviderErrorKind::Unknown);
+}
+
+#[test]
+fn provider_error_kind_unknown_variant_arbitrary_string() {
+    let json = r#""SomethingCompletelyNew""#;
+    let deserialized: ProviderErrorKind = serde_json::from_str(json).unwrap();
+    assert_eq!(deserialized, ProviderErrorKind::Unknown);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: Error classification tests
+// ---------------------------------------------------------------------------
+
+use anvil::provider::{
+    classify_curl_error, classify_http_error, redact_secrets, sanitize_error_message,
+};
+
+#[test]
+fn classify_http_error_500_returns_server_error() {
+    let err = classify_http_error(500, "internal server error");
+    assert!(matches!(
+        err,
+        ProviderTurnError::ServerError {
+            status_code: 500,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn classify_http_error_502_returns_server_error() {
+    let err = classify_http_error(502, "bad gateway");
+    assert!(matches!(
+        err,
+        ProviderTurnError::ServerError {
+            status_code: 502,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn classify_http_error_401_returns_client_error() {
+    let err = classify_http_error(401, "unauthorized");
+    assert!(matches!(
+        err,
+        ProviderTurnError::ClientError {
+            status_code: 401,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn classify_http_error_404_returns_client_error() {
+    let err = classify_http_error(404, "not found");
+    assert!(matches!(
+        err,
+        ProviderTurnError::ClientError {
+            status_code: 404,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn classify_http_error_299_returns_backend() {
+    let err = classify_http_error(299, "unexpected");
+    assert!(matches!(err, ProviderTurnError::Backend(_)));
+}
+
+#[test]
+fn classify_curl_error_exit_28_returns_timeout() {
+    let err = classify_curl_error(28, "operation timed out");
+    assert!(matches!(err, ProviderTurnError::Timeout(_)));
+}
+
+#[test]
+fn classify_curl_error_exit_7_returns_network() {
+    let err = classify_curl_error(7, "failed to connect");
+    assert!(matches!(err, ProviderTurnError::Network(_)));
+}
+
+#[test]
+fn classify_curl_error_exit_6_returns_network() {
+    let err = classify_curl_error(6, "could not resolve host");
+    assert!(matches!(err, ProviderTurnError::Network(_)));
+}
+
+#[test]
+fn classify_curl_error_exit_other_returns_network() {
+    let err = classify_curl_error(56, "recv failure");
+    assert!(matches!(err, ProviderTurnError::Network(_)));
+}
+
+#[test]
+fn sanitize_error_message_truncates_to_500_chars() {
+    let long_message = "a".repeat(600);
+    let sanitized = sanitize_error_message(&long_message);
+    assert!(sanitized.contains("... [truncated, 600 bytes total]"));
+    assert!(sanitized.len() < 600);
+}
+
+#[test]
+fn sanitize_error_message_short_message_unchanged() {
+    let msg = "short error";
+    let sanitized = sanitize_error_message(msg);
+    assert_eq!(sanitized, "short error");
+}
+
+#[test]
+fn redact_secrets_authorization_header() {
+    let msg = "Authorization: Bearer sk-1234567890abcdef";
+    let redacted = redact_secrets(msg);
+    assert!(redacted.contains("[REDACTED]"));
+    assert!(!redacted.contains("sk-1234567890abcdef"));
+}
+
+#[test]
+fn redact_secrets_bearer_token() {
+    let msg = "error with Bearer my-secret-token in message";
+    let redacted = redact_secrets(msg);
+    assert!(redacted.contains("[REDACTED]"));
+    assert!(!redacted.contains("my-secret-token"));
+}
+
+#[test]
+fn redact_secrets_api_key() {
+    let msg = "api_key: my-secret-key";
+    let redacted = redact_secrets(msg);
+    assert!(redacted.contains("[REDACTED]"));
+    assert!(!redacted.contains("my-secret-key"));
+}
+
+#[test]
+fn redact_secrets_no_secrets_unchanged() {
+    let msg = "normal error message";
+    let redacted = redact_secrets(msg);
+    assert_eq!(redacted, "normal error message");
+}
+
+#[test]
+fn classify_http_error_sanitizes_body_with_secrets() {
+    let err = classify_http_error(500, "error with Authorization: Bearer sk-secret");
+    if let ProviderTurnError::ServerError { message, .. } = err {
+        assert!(message.contains("[REDACTED]"));
+        assert!(!message.contains("sk-secret"));
+    } else {
+        panic!("expected ServerError");
+    }
+}
+
+#[test]
+fn classify_http_error_is_retryable_for_server_errors() {
+    let err = classify_http_error(500, "internal error");
+    assert!(err.is_retryable());
+}
+
+#[test]
+fn classify_http_error_not_retryable_for_client_errors() {
+    let err = classify_http_error(401, "unauthorized");
+    assert!(!err.is_retryable());
+}
+
+#[test]
+fn classify_curl_error_timeout_is_retryable() {
+    let err = classify_curl_error(28, "timed out");
+    assert!(err.is_retryable());
+}
+
+#[test]
+fn classify_curl_error_network_is_retryable() {
+    let err = classify_curl_error(7, "connection refused");
+    assert!(err.is_retryable());
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: RetryTransport tests
+// ---------------------------------------------------------------------------
+
+use anvil::provider::{RetryConfig, RetryTransport};
+
+/// Mock transport that fails a configurable number of times before succeeding.
+#[derive(Clone)]
+struct RetryMockTransport {
+    call_count: Rc<RefCell<usize>>,
+    fail_count: usize,
+    error: ProviderTurnError,
+    response: HttpResponse,
+    /// If set, stream_lines will invoke the callback before failing.
+    invoke_callback_before_error: bool,
+}
+
+impl RetryMockTransport {
+    fn new(fail_count: usize, error: ProviderTurnError) -> Self {
+        Self {
+            call_count: Rc::new(RefCell::new(0)),
+            fail_count,
+            error,
+            response: HttpResponse {
+                status_code: 200,
+                body: b"ok".to_vec(),
+            },
+            invoke_callback_before_error: false,
+        }
+    }
+}
+
+impl HttpTransport for RetryMockTransport {
+    fn post_json_with_headers(
+        &self,
+        _url: &str,
+        _body: &[u8],
+        _headers: &[(&str, &str)],
+    ) -> Result<HttpResponse, ProviderTurnError> {
+        let mut count = self.call_count.borrow_mut();
+        *count += 1;
+        if *count <= self.fail_count {
+            Err(self.error.clone())
+        } else {
+            Ok(self.response.clone())
+        }
+    }
+
+    fn get_with_headers(
+        &self,
+        _url: &str,
+        _headers: &[(&str, &str)],
+    ) -> Result<HttpResponse, ProviderTurnError> {
+        let mut count = self.call_count.borrow_mut();
+        *count += 1;
+        if *count <= self.fail_count {
+            Err(self.error.clone())
+        } else {
+            Ok(self.response.clone())
+        }
+    }
+
+    fn stream_lines(
+        &self,
+        _url: &str,
+        _body: &[u8],
+        _headers: &[(&str, &str)],
+        on_line: &mut dyn FnMut(&str),
+    ) -> Result<(), ProviderTurnError> {
+        let mut count = self.call_count.borrow_mut();
+        *count += 1;
+        if *count <= self.fail_count {
+            if self.invoke_callback_before_error {
+                on_line("partial data");
+            }
+            Err(self.error.clone())
+        } else {
+            on_line("success line");
+            Ok(())
+        }
+    }
+}
+
+fn fast_retry_config(max_retries: u32) -> RetryConfig {
+    RetryConfig {
+        max_retries,
+        base_delay_ms: 0,
+        backoff_factor: 2,
+        max_delay_ms: 0,
+    }
+}
+
+#[test]
+fn retry_transport_succeeds_on_second_attempt() {
+    let mock = RetryMockTransport::new(1, ProviderTurnError::Network("fail".into()));
+    let call_count = mock.call_count.clone();
+    let transport = RetryTransport::with_config(mock, fast_retry_config(3));
+
+    let result = transport.post_json_with_headers("http://test", b"body", &[]);
+    assert!(result.is_ok());
+    assert_eq!(*call_count.borrow(), 2);
+}
+
+#[test]
+fn retry_transport_exhausts_max_retries() {
+    // max_retries=3 means 4 total attempts (initial + 3 retries)
+    let mock = RetryMockTransport::new(10, ProviderTurnError::Network("fail".into()));
+    let call_count = mock.call_count.clone();
+    let transport = RetryTransport::with_config(mock, fast_retry_config(3));
+
+    let result = transport.post_json_with_headers("http://test", b"body", &[]);
+    assert!(result.is_err());
+    assert_eq!(*call_count.borrow(), 4);
+}
+
+#[test]
+fn retry_transport_no_retry_on_client_error() {
+    let mock = RetryMockTransport::new(
+        10,
+        ProviderTurnError::ClientError {
+            status_code: 401,
+            message: "unauthorized".into(),
+        },
+    );
+    let call_count = mock.call_count.clone();
+    let transport = RetryTransport::with_config(mock, fast_retry_config(3));
+
+    let result = transport.post_json_with_headers("http://test", b"body", &[]);
+    assert!(result.is_err());
+    assert_eq!(*call_count.borrow(), 1);
+}
+
+#[test]
+fn retry_transport_no_retry_on_parse_error() {
+    let mock = RetryMockTransport::new(10, ProviderTurnError::Parse("bad json".into()));
+    let call_count = mock.call_count.clone();
+    let transport = RetryTransport::with_config(mock, fast_retry_config(3));
+
+    let result = transport.get_with_headers("http://test", &[]);
+    assert!(result.is_err());
+    assert_eq!(*call_count.borrow(), 1);
+}
+
+#[test]
+fn retry_transport_get_succeeds_on_second_attempt() {
+    let mock = RetryMockTransport::new(1, ProviderTurnError::Timeout("slow".into()));
+    let call_count = mock.call_count.clone();
+    let transport = RetryTransport::with_config(mock, fast_retry_config(3));
+
+    let result = transport.get_with_headers("http://test", &[]);
+    assert!(result.is_ok());
+    assert_eq!(*call_count.borrow(), 2);
+}
+
+#[test]
+fn retry_transport_stream_lines_retries_on_connection_error() {
+    let mock = RetryMockTransport::new(1, ProviderTurnError::Network("refused".into()));
+    let call_count = mock.call_count.clone();
+    let transport = RetryTransport::with_config(mock, fast_retry_config(3));
+
+    let mut lines = Vec::new();
+    let result = transport.stream_lines("http://test", b"body", &[], &mut |line| {
+        lines.push(line.to_string());
+    });
+    assert!(result.is_ok());
+    assert_eq!(*call_count.borrow(), 2);
+    assert!(lines.contains(&"success line".to_string()));
+}
+
+#[test]
+fn retry_transport_server_error_retries() {
+    let mock = RetryMockTransport::new(
+        2,
+        ProviderTurnError::ServerError {
+            status_code: 503,
+            message: "service unavailable".into(),
+        },
+    );
+    let call_count = mock.call_count.clone();
+    let transport = RetryTransport::with_config(mock, fast_retry_config(3));
+
+    let result = transport.get_with_headers("http://test", &[]);
+    assert!(result.is_ok());
+    assert_eq!(*call_count.borrow(), 3);
+}
+
+#[test]
+fn retry_transport_stream_lines_no_retry_after_callback_invoked() {
+    let mut mock = RetryMockTransport::new(10, ProviderTurnError::Network("mid-stream".into()));
+    mock.invoke_callback_before_error = true;
+    let call_count = mock.call_count.clone();
+    let transport = RetryTransport::with_config(mock, fast_retry_config(3));
+
+    let mut lines = Vec::new();
+    let result = transport.stream_lines("http://test", b"body", &[], &mut |line| {
+        lines.push(line.to_string());
+    });
+    assert!(result.is_err());
+    // Only 1 call because callback was invoked, so guard prevents retry
+    assert_eq!(*call_count.borrow(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6: Health check tests
+// ---------------------------------------------------------------------------
+
+use anvil::provider::openai::OpenAiCompatibleProviderClient;
+
+#[test]
+fn ollama_health_check_success() {
+    let mock = MockHttpTransport {
+        seen_urls: Rc::new(RefCell::new(Vec::new())),
+        seen_bodies: Rc::new(RefCell::new(Vec::new())),
+        seen_headers: Rc::new(RefCell::new(Vec::new())),
+        response: HttpResponse {
+            status_code: 200,
+            body: br#"{"models":[]}"#.to_vec(),
+        },
+        get_response: Some(HttpResponse {
+            status_code: 200,
+            body: br#"{"models":[]}"#.to_vec(),
+        }),
+    };
+    let urls = mock.seen_urls.clone();
+    let client = OllamaProviderClient::with_transport("http://localhost:11434", mock);
+    let result = client.health_check();
+    assert!(result.is_ok());
+    let seen = urls.borrow();
+    assert!(
+        seen.iter().any(|u| u.contains("/api/tags")),
+        "health check should hit /api/tags"
+    );
+}
+
+#[test]
+fn ollama_health_check_failure() {
+    /// Mock transport that always fails with a network error.
+    #[derive(Clone)]
+    struct FailingTransport;
+
+    impl HttpTransport for FailingTransport {
+        fn post_json_with_headers(
+            &self,
+            _url: &str,
+            _body: &[u8],
+            _headers: &[(&str, &str)],
+        ) -> Result<HttpResponse, ProviderTurnError> {
+            Err(ProviderTurnError::Network("connection refused".into()))
+        }
+
+        fn get_with_headers(
+            &self,
+            _url: &str,
+            _headers: &[(&str, &str)],
+        ) -> Result<HttpResponse, ProviderTurnError> {
+            Err(ProviderTurnError::Network("connection refused".into()))
+        }
+    }
+
+    let client = OllamaProviderClient::with_transport("http://localhost:11434", FailingTransport);
+    let result = client.health_check();
+    assert!(result.is_err());
+    let err_msg = result.unwrap_err();
+    assert!(err_msg.contains("Ollamaに接続できません"));
+    assert!(err_msg.contains("localhost:11434"));
+}
+
+#[test]
+fn openai_health_check_success_with_auth() {
+    let mock = MockHttpTransport {
+        seen_urls: Rc::new(RefCell::new(Vec::new())),
+        seen_bodies: Rc::new(RefCell::new(Vec::new())),
+        seen_headers: Rc::new(RefCell::new(Vec::new())),
+        response: HttpResponse {
+            status_code: 200,
+            body: br#"{"data":[]}"#.to_vec(),
+        },
+        get_response: Some(HttpResponse {
+            status_code: 200,
+            body: br#"{"data":[]}"#.to_vec(),
+        }),
+    };
+    let urls = mock.seen_urls.clone();
+    let headers = mock.seen_headers.clone();
+    let client = OpenAiCompatibleProviderClient::with_transport("http://localhost:8080", mock)
+        .with_api_key("test-key-123");
+    let result = client.health_check();
+    assert!(result.is_ok());
+    let seen_urls = urls.borrow();
+    assert!(
+        seen_urls.iter().any(|u| u.contains("/v1/models")),
+        "health check should hit /v1/models"
+    );
+    let seen_headers = headers.borrow();
+    let last_headers = seen_headers.last().expect("should have headers");
+    assert!(
+        last_headers
+            .iter()
+            .any(|(k, v)| k == "Authorization" && v == "test-key-123"),
+        "should send Authorization header with api_key"
+    );
+}
+
+#[test]
+fn openai_health_check_failure_with_auth_guidance() {
+    #[derive(Clone)]
+    struct FailingTransport;
+
+    impl HttpTransport for FailingTransport {
+        fn post_json_with_headers(
+            &self,
+            _url: &str,
+            _body: &[u8],
+            _headers: &[(&str, &str)],
+        ) -> Result<HttpResponse, ProviderTurnError> {
+            Err(ProviderTurnError::Network("connection refused".into()))
+        }
+
+        fn get_with_headers(
+            &self,
+            _url: &str,
+            _headers: &[(&str, &str)],
+        ) -> Result<HttpResponse, ProviderTurnError> {
+            Err(ProviderTurnError::ClientError {
+                status_code: 401,
+                message: "unauthorized".into(),
+            })
+        }
+    }
+
+    let client =
+        OpenAiCompatibleProviderClient::with_transport("http://localhost:8080", FailingTransport)
+            .with_api_key("bad-key");
+    let result = client.health_check();
+    assert!(result.is_err());
+    let err_msg = result.unwrap_err();
+    assert!(err_msg.contains("OpenAI互換プロバイダーに接続できません"));
+    assert!(err_msg.contains("認証情報の形式を確認してください"));
+}
+
+#[test]
+fn openai_health_check_no_auth_no_guidance() {
+    #[derive(Clone)]
+    struct FailingTransport;
+
+    impl HttpTransport for FailingTransport {
+        fn post_json_with_headers(
+            &self,
+            _url: &str,
+            _body: &[u8],
+            _headers: &[(&str, &str)],
+        ) -> Result<HttpResponse, ProviderTurnError> {
+            Err(ProviderTurnError::Network("refused".into()))
+        }
+
+        fn get_with_headers(
+            &self,
+            _url: &str,
+            _headers: &[(&str, &str)],
+        ) -> Result<HttpResponse, ProviderTurnError> {
+            Err(ProviderTurnError::Network("refused".into()))
+        }
+    }
+
+    let client =
+        OpenAiCompatibleProviderClient::with_transport("http://localhost:8080", FailingTransport);
+    let result = client.health_check();
+    assert!(result.is_err());
+    let err_msg = result.unwrap_err();
+    assert!(err_msg.contains("OpenAI互換プロバイダーに接続できません"));
+    // No auth guidance when no api_key is set
+    assert!(!err_msg.contains("認証情報の形式を確認してください"));
+}
+
+// -----------------------------------------------------------------------
+// Phase 5.1: Ollama image serialization tests
+// -----------------------------------------------------------------------
+
+#[test]
+fn ollama_chat_message_with_images_serializes_correctly() {
+    let msg = OllamaChatMessage {
+        role: "user".to_string(),
+        content: "describe this image".to_string(),
+        images: Some(vec!["aGVsbG8=".to_string()]),
+    };
+    let json = serde_json::to_value(&msg).unwrap();
+    assert_eq!(json["role"], "user");
+    assert_eq!(json["content"], "describe this image");
+    assert_eq!(json["images"][0], "aGVsbG8=");
+}
+
+#[test]
+fn ollama_chat_message_without_images_omits_images_key() {
+    let msg = OllamaChatMessage {
+        role: "user".to_string(),
+        content: "hello".to_string(),
+        images: None,
+    };
+    let json = serde_json::to_value(&msg).unwrap();
+    assert!(json.get("images").is_none());
+}
+
+#[test]
+fn ollama_build_chat_request_maps_provider_images() {
+    use anvil::provider::{ImageContent, ProviderMessage, ProviderTurnRequest};
+
+    let images = vec![ImageContent {
+        base64: "dGVzdA==".to_string(),
+        mime_type: "image/png".to_string(),
+    }];
+    let request = ProviderTurnRequest::new(
+        "llava".to_string(),
+        vec![ProviderMessage::new(ProviderMessageRole::User, "describe").with_images(images)],
+        false,
+    );
+    let ollama_req =
+        OllamaProviderClient::<anvil::provider::TcpHttpTransport>::build_chat_request(&request);
+    let first = &ollama_req.messages[0];
+    assert_eq!(
+        first.images.as_ref().unwrap(),
+        &vec!["dGVzdA==".to_string()]
     );
 }

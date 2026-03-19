@@ -491,3 +491,95 @@ fn pending_approval_survives_app_reload() {
         "assistant message should be in session history"
     );
 }
+
+// -----------------------------------------------------------------------
+// Phase 4.3: System prompt includes image support
+// -----------------------------------------------------------------------
+
+#[test]
+fn system_prompt_mentions_image_support_for_file_read() {
+    use anvil::agent::{ProjectLanguage, tool_protocol_system_prompt};
+    let prompt = tool_protocol_system_prompt(&[ProjectLanguage::Rust], None);
+    assert!(
+        prompt.contains("image files"),
+        "system prompt should mention image support in file.read"
+    );
+    assert!(
+        prompt.contains("PNG"),
+        "system prompt should list supported formats"
+    );
+    assert!(
+        prompt.contains("20MB"),
+        "system prompt should mention size limit"
+    );
+}
+
+// -----------------------------------------------------------------------
+// Phase 2-3: Sub-agent system prompt and tool descriptions
+// -----------------------------------------------------------------------
+
+#[test]
+fn system_prompt_includes_agent_explore_and_plan_descriptions() {
+    use anvil::agent::{ProjectLanguage, tool_protocol_system_prompt};
+    let prompt = tool_protocol_system_prompt(&[ProjectLanguage::Rust], None);
+    assert!(
+        prompt.contains("agent.explore"),
+        "system prompt should describe agent.explore tool"
+    );
+    assert!(
+        prompt.contains("agent.plan"),
+        "system prompt should describe agent.plan tool"
+    );
+}
+
+#[test]
+fn build_subagent_system_prompt_explore_contains_expected_tools() {
+    use anvil::agent::subagent::{SubAgentKind, build_subagent_system_prompt};
+    let prompt = build_subagent_system_prompt(&SubAgentKind::Explore);
+    assert!(
+        prompt.contains("file.read"),
+        "Explore prompt should include file.read"
+    );
+    assert!(
+        prompt.contains("file.search"),
+        "Explore prompt should include file.search"
+    );
+    assert!(
+        !prompt.contains("web.fetch"),
+        "Explore prompt should NOT include web.fetch"
+    );
+    assert!(
+        prompt.contains("ANVIL_FINAL"),
+        "Explore prompt should mention ANVIL_FINAL"
+    );
+    assert!(
+        prompt.contains("Explore"),
+        "Explore prompt should mention Explore role"
+    );
+}
+
+#[test]
+fn build_subagent_system_prompt_plan_contains_expected_tools() {
+    use anvil::agent::subagent::{SubAgentKind, build_subagent_system_prompt};
+    let prompt = build_subagent_system_prompt(&SubAgentKind::Plan);
+    assert!(
+        prompt.contains("file.read"),
+        "Plan prompt should include file.read"
+    );
+    assert!(
+        prompt.contains("file.search"),
+        "Plan prompt should include file.search"
+    );
+    assert!(
+        prompt.contains("web.fetch"),
+        "Plan prompt should include web.fetch"
+    );
+    assert!(
+        prompt.contains("ANVIL_FINAL"),
+        "Plan prompt should mention ANVIL_FINAL"
+    );
+    assert!(
+        prompt.contains("Plan"),
+        "Plan prompt should mention Plan role"
+    );
+}

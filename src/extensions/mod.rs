@@ -1,6 +1,9 @@
+pub mod skills;
+
 use serde::Deserialize;
+use skills::SkillScope;
 use std::fmt::{Display, Formatter};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Action to perform when a slash command is invoked.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,6 +25,12 @@ pub enum SlashCommandAction {
     Reset,
     Exit,
     Prompt(String),
+    Skill {
+        name: String,
+        args: String,
+        content: String,
+        skill_dir: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +38,7 @@ pub struct SlashCommandSpec {
     pub name: String,
     pub description: String,
     pub action: SlashCommandAction,
+    pub scope: Option<SkillScope>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,30 +95,35 @@ impl ExtensionRegistry {
         }
     }
 
-    pub fn load(cwd: &Path) -> Result<Self, ExtensionLoadError> {
+    pub fn load(cwd: &Path, home_dir: Option<&Path>) -> Result<Self, ExtensionLoadError> {
         let mut registry = Self::new();
+
+        // Load custom slash commands from .anvil/slash-commands.json
         let custom_path = cwd.join(".anvil").join("slash-commands.json");
-        if !custom_path.exists() {
-            return Ok(registry);
-        }
+        if custom_path.exists() {
+            let contents =
+                std::fs::read_to_string(&custom_path).map_err(ExtensionLoadError::Unreadable)?;
+            let parsed: CustomSlashCommandFile =
+                serde_json::from_str(&contents).map_err(ExtensionLoadError::InvalidJson)?;
 
-        let contents =
-            std::fs::read_to_string(&custom_path).map_err(ExtensionLoadError::Unreadable)?;
-        let parsed: CustomSlashCommandFile =
-            serde_json::from_str(&contents).map_err(ExtensionLoadError::InvalidJson)?;
-
-        for command in parsed.commands {
-            let name = normalize_command_name(&command.name)
-                .ok_or_else(|| ExtensionLoadError::InvalidCommandName(command.name.clone()))?;
-            if registry.commands.iter().any(|spec| spec.name == name) {
-                return Err(ExtensionLoadError::DuplicateCommand(name));
+            for command in parsed.commands {
+                let name = normalize_command_name(&command.name)
+                    .ok_or_else(|| ExtensionLoadError::InvalidCommandName(command.name.clone()))?;
+                if registry.commands.iter().any(|spec| spec.name == name) {
+                    return Err(ExtensionLoadError::DuplicateCommand(name));
+                }
+                registry.commands.push(SlashCommandSpec {
+                    name,
+                    description: command.description,
+                    action: SlashCommandAction::Prompt(command.prompt),
+                    scope: None,
+                });
             }
-            registry.commands.push(SlashCommandSpec {
-                name,
-                description: command.description,
-                action: SlashCommandAction::Prompt(command.prompt),
-            });
         }
+
+        // Load skills from user and project scopes
+        let skill_commands = skills::discover_and_load(cwd, home_dir, &registry.commands);
+        registry.commands.extend(skill_commands);
 
         Ok(registry)
     }
@@ -124,10 +139,19 @@ impl ExtensionRegistry {
         if let Some(parsed) = parse_repo_command(command) {
             return Some(parsed);
         }
-        self.commands
+        if let found @ Some(_) = self
+            .commands
             .iter()
             .find(|spec| spec.name == command || (spec.name == "/exit" && command == "/quit"))
             .cloned()
+        {
+            return found;
+        }
+        // Try skill command with argument separation
+        if let Some(spec) = skills::parse_skill_command(command, &self.commands) {
+            return Some(spec);
+        }
+        None
     }
 
     /// Suggest the closest matching command name for typo correction.
@@ -148,86 +172,102 @@ pub fn builtin_slash_commands() -> Vec<SlashCommandSpec> {
             name: "/help".to_string(),
             description: "show available commands".to_string(),
             action: SlashCommandAction::Help,
+            scope: None,
         },
         SlashCommandSpec {
             name: "/status".to_string(),
             description: "show the current console state".to_string(),
             action: SlashCommandAction::Status,
+            scope: None,
         },
         SlashCommandSpec {
             name: "/plan".to_string(),
             description: "show the current plan and active step".to_string(),
             action: SlashCommandAction::Plan,
+            scope: None,
         },
         SlashCommandSpec {
             name: "/plan-add".to_string(),
             description: "append a new item to the current plan".to_string(),
             action: SlashCommandAction::PlanAdd(String::new()),
+            scope: None,
         },
         SlashCommandSpec {
             name: "/plan-focus".to_string(),
             description: "set the active plan step by 1-based index".to_string(),
             action: SlashCommandAction::PlanFocus(0),
+            scope: None,
         },
         SlashCommandSpec {
             name: "/plan-clear".to_string(),
             description: "clear the current plan".to_string(),
             action: SlashCommandAction::PlanClear,
+            scope: None,
         },
         SlashCommandSpec {
             name: "/checkpoint".to_string(),
             description: "save a planning checkpoint note".to_string(),
             action: SlashCommandAction::Checkpoint(String::new()),
+            scope: None,
         },
         SlashCommandSpec {
             name: "/repo-find".to_string(),
             description: "search the repo by path and content".to_string(),
             action: SlashCommandAction::RepoFind(String::new()),
+            scope: None,
         },
         SlashCommandSpec {
             name: "/timeline".to_string(),
             description: "show the recent session timeline".to_string(),
             action: SlashCommandAction::Timeline,
+            scope: None,
         },
         SlashCommandSpec {
             name: "/compact".to_string(),
             description: "compact older session history into a summary".to_string(),
             action: SlashCommandAction::Compact,
+            scope: None,
         },
         SlashCommandSpec {
             name: "/model".to_string(),
             description: "show the current model context".to_string(),
             action: SlashCommandAction::Model,
+            scope: None,
         },
         SlashCommandSpec {
             name: "/provider".to_string(),
             description: "show provider backend and capability diagnostics".to_string(),
             action: SlashCommandAction::Provider,
+            scope: None,
         },
         SlashCommandSpec {
             name: "/approve".to_string(),
             description: "continue the pending approved tool call".to_string(),
             action: SlashCommandAction::Approve,
+            scope: None,
         },
         SlashCommandSpec {
             name: "/deny".to_string(),
             description: "reject the pending tool call".to_string(),
             action: SlashCommandAction::Deny,
+            scope: None,
         },
         SlashCommandSpec {
             name: "/reset".to_string(),
             description: "return to Ready".to_string(),
             action: SlashCommandAction::Reset,
+            scope: None,
         },
         SlashCommandSpec {
             name: "/exit".to_string(),
             description: "exit the session".to_string(),
             action: SlashCommandAction::Exit,
+            scope: None,
         },
     ]
 }
 
-fn normalize_command_name(name: &str) -> Option<String> {
+pub(crate) fn normalize_command_name(name: &str) -> Option<String> {
     let trimmed = name.trim();
     if !trimmed.starts_with('/') || trimmed.len() <= 1 {
         return None;
@@ -252,6 +292,7 @@ fn parse_plan_command(command: &str) -> Option<SlashCommandSpec> {
             name: "/plan-add".to_string(),
             description: "append a new item to the current plan".to_string(),
             action: SlashCommandAction::PlanAdd(item.to_string()),
+            scope: None,
         });
     }
 
@@ -264,6 +305,7 @@ fn parse_plan_command(command: &str) -> Option<SlashCommandSpec> {
             name: "/plan-focus".to_string(),
             description: "set the active plan step by 1-based index".to_string(),
             action: SlashCommandAction::PlanFocus(one_based - 1),
+            scope: None,
         });
     }
 
@@ -272,6 +314,7 @@ fn parse_plan_command(command: &str) -> Option<SlashCommandSpec> {
             name: "/plan-clear".to_string(),
             description: "clear the current plan".to_string(),
             action: SlashCommandAction::PlanClear,
+            scope: None,
         });
     }
 
@@ -284,6 +327,7 @@ fn parse_plan_command(command: &str) -> Option<SlashCommandSpec> {
             name: "/checkpoint".to_string(),
             description: "save a planning checkpoint note".to_string(),
             action: SlashCommandAction::Checkpoint(note.to_string()),
+            scope: None,
         });
     }
 
@@ -317,5 +361,6 @@ fn parse_repo_command(command: &str) -> Option<SlashCommandSpec> {
         name: "/repo-find".to_string(),
         description: "search the repo by path and content".to_string(),
         action: SlashCommandAction::RepoFind(query.to_string()),
+        scope: None,
     })
 }
