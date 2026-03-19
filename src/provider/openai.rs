@@ -3,7 +3,9 @@
 //! Works with the standard `/v1/chat/completions` endpoint used by
 //! OpenAI, Azure OpenAI, LM Studio, and other compatible servers.
 
-use super::transport::{CurlHttpTransport, HttpTransport, RetryTransport, sanitize_error_message};
+use super::transport::{
+    HttpTransport, ReqwestHttpTransport, RetryTransport, sanitize_error_message,
+};
 use super::{
     AgentEvent, ImageContent, ProviderClient, ProviderEvent, ProviderTurnError, ProviderTurnRequest,
 };
@@ -15,7 +17,7 @@ use serde_json::Value;
 /// Client for OpenAI-compatible chat completion APIs.
 ///
 /// Generic over [`HttpTransport`] for testability.
-pub struct OpenAiCompatibleProviderClient<T = RetryTransport<CurlHttpTransport>> {
+pub struct OpenAiCompatibleProviderClient<T = RetryTransport<ReqwestHttpTransport>> {
     base_url: String,
     api_key: Option<String>,
     transport: T,
@@ -154,7 +156,7 @@ impl OpenAiCompatibleProviderClient {
         Self {
             base_url: base_url.into(),
             api_key: None,
-            transport: RetryTransport::new(CurlHttpTransport::new()),
+            transport: RetryTransport::new(ReqwestHttpTransport::new()),
         }
     }
 
@@ -162,7 +164,7 @@ impl OpenAiCompatibleProviderClient {
         Self {
             base_url: config.runtime.provider_url.clone(),
             api_key: config.runtime.api_key.clone(),
-            transport: RetryTransport::new(CurlHttpTransport::new()),
+            transport: RetryTransport::new(ReqwestHttpTransport::new()),
         }
     }
 }

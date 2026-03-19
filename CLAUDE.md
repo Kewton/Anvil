@@ -17,7 +17,7 @@
 | **言語** | Rust (Edition 2024) |
 | **ビルド** | Cargo |
 | **LLMバックエンド** | Ollama, OpenAI互換API |
-| **HTTP** | curl subprocess |
+| **HTTP** | reqwest (blocking, rustls-tls) |
 | **テスト** | cargo test (統合テスト中心) |
 | **CI入力** | rustyline |
 
