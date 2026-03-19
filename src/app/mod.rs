@@ -405,6 +405,18 @@ impl App {
             .any(|result| result.is_error)
     }
 
+    /// Check whether a provider error was recorded during this session.
+    /// Used by non-interactive mode to detect errors that `run_live_turn`
+    /// converted to `AgentEvent::Failed` (returning `Ok` instead of `Err`).
+    pub fn has_provider_error(&self) -> bool {
+        !self.session.provider_errors.is_empty()
+    }
+
+    /// Return the last recorded provider error, if any.
+    pub fn last_provider_error(&self) -> Option<&crate::provider::ProviderErrorRecord> {
+        self.session.provider_errors.last()
+    }
+
     /// Save the session on exit (wrapper for flush_session).
     pub(crate) fn save_session_on_exit(&mut self) {
         let _ = self.flush_session();
