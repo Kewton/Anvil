@@ -2,6 +2,35 @@
 
 ## [Unreleased]
 
+## [0.0.3] - 2026-03-19
+
+### Added
+- Sub-agent mechanism for parallel task execution (#24)
+- Lifecycle hooks system (#25)
+- Model Context Protocol (MCP) support with STDIO transport (#23)
+- SKILL.md-based skills system - Phase 1 (#22)
+- Non-interactive exec mode for CI/CD integration (#27)
+- Multimodal image support for Vision APIs (#26)
+- Diff preview for file.write/file.edit approval prompts (#21)
+- --help and --version flags via clap crate (#20)
+- Context overflow warning with /compact suggestion (#19)
+- Parallel tool execution for ParallelSafe tools (#18)
+- Security warnings for API keys in config file (#17)
+- Graceful shutdown via signal handling (#14)
+- Health check and retry mechanism for providers (#13)
+- Startup configuration validation (#16)
+- Atomic write for session persistence (#15)
+- Token count accuracy improvement with CJK support (#11)
+- Structured logging with tracing crate (#12)
+- ANVIL.md project instructions file support (#10)
+- file.edit tool for partial file editing (#9)
+- shell.exec guide and command permission policy (#8)
+- /uat command for user acceptance testing
+- Orchestration commands (orchestrate, pr-merge-pipeline, uat-fix-loop)
+
+### Fixed
+- Test ETXTBSY issues on CI with create_test_script helper
+
 ## [0.0.2] - 2026-03-16
 
 ### Added

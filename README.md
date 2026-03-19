@@ -10,7 +10,7 @@
 
 ```bash
 # macOS (Apple Silicon)
-curl -L https://github.com/Kewton/Anvil/releases/download/v0.0.2/anvil-darwin-arm64.gz -o anvil.gz
+curl -L https://github.com/Kewton/Anvil/releases/download/v0.0.3/anvil-darwin-arm64.gz -o anvil.gz
 gunzip anvil.gz
 chmod +x anvil
 sudo mv anvil /usr/local/bin/
