@@ -1,10 +1,10 @@
 use anvil::app::agentic::{ExecutionGroup, group_by_execution_mode};
 use anvil::tooling::{
-    ExecutionClass, ExecutionMode, LocalToolExecutor, ParallelExecutionPlan,
-    ParallelExecutionPlanError, PermissionClass, PlanModePolicy, RollbackPolicy, ToolCallRequest,
-    ToolExecutionError, ToolExecutionPayload, ToolExecutionPolicy, ToolExecutionRequest,
-    ToolExecutionResult, ToolExecutionStatus, ToolInput, ToolKind, ToolRegistry,
-    ToolValidationError, detect_image_mime,
+    CheckpointEntry, CheckpointStack, ExecutionClass, ExecutionMode, LocalToolExecutor,
+    ParallelExecutionPlan, ParallelExecutionPlanError, PermissionClass, PlanModePolicy,
+    RollbackPolicy, ToolCallRequest, ToolExecutionError, ToolExecutionPayload, ToolExecutionPolicy,
+    ToolExecutionRequest, ToolExecutionResult, ToolExecutionStatus, ToolInput, ToolKind,
+    ToolRegistry, ToolValidationError, detect_image_mime,
 };
 use std::fs;
 use std::path::Path;
@@ -2629,4 +2629,189 @@ fn check_offline_blocked_blocks_web_search_in_offline_mode() {
     let result = check_offline_blocked(&config, &call);
     assert!(result.is_some());
     assert!(result.unwrap().contains("web.search"));
+}
+
+// ---------------------------------------------------------------------------
+// CheckpointStack tests (Issue #68)
+// ---------------------------------------------------------------------------
+
+fn make_checkpoint_entry(path: &str, content: Option<&str>) -> CheckpointEntry {
+    let byte_size = content.map_or(0, |c| c.len());
+    CheckpointEntry {
+        path: std::path::PathBuf::from(path),
+        previous_content: content.map(String::from),
+        byte_size,
+    }
+}
+
+#[test]
+fn checkpoint_stack_new_initial_state() {
+    let stack = CheckpointStack::new();
+    assert_eq!(stack.len(), 0);
+    assert!(stack.is_empty());
+}
+
+#[test]
+fn checkpoint_stack_push_pop_basic() {
+    let mut stack = CheckpointStack::new();
+    let entry = make_checkpoint_entry("/tmp/a.rs", Some("hello"));
+    stack.push(entry);
+    assert_eq!(stack.len(), 1);
+    assert!(!stack.is_empty());
+
+    let popped = stack.pop().expect("should pop");
+    assert_eq!(popped.path, std::path::PathBuf::from("/tmp/a.rs"));
+    assert_eq!(popped.previous_content.as_deref(), Some("hello"));
+    assert!(stack.is_empty());
+}
+
+#[test]
+fn checkpoint_stack_push_returns_index_and_remove_works() {
+    let mut stack = CheckpointStack::new();
+    let idx0 = stack.push(make_checkpoint_entry("/tmp/a.rs", Some("a")));
+    let idx1 = stack.push(make_checkpoint_entry("/tmp/b.rs", Some("b")));
+    assert_eq!(idx0, 0);
+    assert_eq!(idx1, 1);
+
+    let removed = stack.remove(0).expect("should remove");
+    assert_eq!(removed.path, std::path::PathBuf::from("/tmp/a.rs"));
+    assert_eq!(stack.len(), 1);
+
+    let remaining = stack.pop().expect("should pop remaining");
+    assert_eq!(remaining.path, std::path::PathBuf::from("/tmp/b.rs"));
+}
+
+#[test]
+fn checkpoint_stack_pop_n_partial() {
+    let mut stack = CheckpointStack::new();
+    stack.push(make_checkpoint_entry("/tmp/a.rs", Some("a")));
+    stack.push(make_checkpoint_entry("/tmp/b.rs", Some("b")));
+    stack.push(make_checkpoint_entry("/tmp/c.rs", Some("c")));
+
+    let popped = stack.pop_n(2);
+    assert_eq!(popped.len(), 2);
+    // Newest first
+    assert_eq!(popped[0].path, std::path::PathBuf::from("/tmp/c.rs"));
+    assert_eq!(popped[1].path, std::path::PathBuf::from("/tmp/b.rs"));
+    assert_eq!(stack.len(), 1);
+}
+
+#[test]
+fn checkpoint_stack_pop_n_exceeds_depth() {
+    let mut stack = CheckpointStack::new();
+    stack.push(make_checkpoint_entry("/tmp/a.rs", Some("a")));
+    stack.push(make_checkpoint_entry("/tmp/b.rs", Some("b")));
+
+    let popped = stack.pop_n(10);
+    assert_eq!(popped.len(), 2);
+    assert!(stack.is_empty());
+}
+
+#[test]
+fn checkpoint_stack_pop_n_deduplicates_same_file() {
+    let mut stack = CheckpointStack::new();
+    stack.push(make_checkpoint_entry("/tmp/a.rs", Some("original")));
+    stack.push(make_checkpoint_entry("/tmp/b.rs", Some("b")));
+    stack.push(make_checkpoint_entry("/tmp/a.rs", Some("modified")));
+
+    let popped = stack.pop_n(3);
+    // Same file /tmp/a.rs appeared twice; only the oldest ("original") should be kept
+    assert_eq!(popped.len(), 2);
+    let a_entry = popped
+        .iter()
+        .find(|e| e.path == Path::new("/tmp/a.rs"))
+        .expect("a.rs should exist");
+    assert_eq!(a_entry.previous_content.as_deref(), Some("original"));
+}
+
+#[test]
+fn checkpoint_stack_depth_limit_evicts_oldest() {
+    let mut stack = CheckpointStack::new();
+    for i in 0..25 {
+        stack.push(make_checkpoint_entry(&format!("/tmp/{i}.rs"), Some("x")));
+    }
+    // max_depth = 20
+    assert_eq!(stack.len(), 20);
+    // The first 5 should have been evicted; entry at index 0 should be /tmp/5.rs
+    let first = stack.pop().expect("should pop");
+    assert_eq!(first.path, std::path::PathBuf::from("/tmp/24.rs"));
+}
+
+#[test]
+fn checkpoint_stack_byte_limit_evicts_oldest() {
+    let mut stack = CheckpointStack::new();
+    // Each entry is ~1MB (1_048_576 bytes). Push 12 to exceed 10MB limit.
+    let big_content = "x".repeat(1_048_576);
+    for i in 0..12 {
+        stack.push(make_checkpoint_entry(
+            &format!("/tmp/{i}.rs"),
+            Some(&big_content),
+        ));
+    }
+    // Should have evicted enough to stay under 10MB
+    assert!(stack.len() < 12);
+    assert!(stack.len() >= 9); // floor(10MB / 1MB) = 10, but some eviction margin
+}
+
+#[test]
+fn checkpoint_stack_new_file_entry_has_none_content() {
+    let mut stack = CheckpointStack::new();
+    stack.push(make_checkpoint_entry("/tmp/new.rs", None));
+    let popped = stack.pop().expect("should pop");
+    assert!(popped.previous_content.is_none());
+    assert_eq!(popped.byte_size, 0);
+}
+
+#[test]
+fn checkpoint_entry_generate_restore_preview_for_existing_file() {
+    let dir = std::env::temp_dir().join(format!(
+        "anvil_test_restore_preview_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    let file_path = dir.join("test.rs");
+    fs::write(&file_path, "modified content").unwrap();
+
+    let entry = CheckpointEntry {
+        path: file_path.clone(),
+        previous_content: Some("original content".to_string()),
+        byte_size: 16,
+    };
+
+    let preview = entry.generate_restore_preview();
+    assert!(preview.is_some());
+    let text = preview.unwrap();
+    // Should contain diff information
+    assert!(text.contains("current") || text.contains("restored") || text.contains("-"));
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn checkpoint_entry_generate_restore_preview_no_changes() {
+    let dir = std::env::temp_dir().join(format!(
+        "anvil_test_no_change_preview_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    let file_path = dir.join("test.rs");
+    fs::write(&file_path, "same content").unwrap();
+
+    let entry = CheckpointEntry {
+        path: file_path.clone(),
+        previous_content: Some("same content".to_string()),
+        byte_size: 12,
+    };
+
+    let preview = entry.generate_restore_preview();
+    assert!(preview.is_some());
+    assert!(preview.unwrap().contains("no changes to undo"));
+
+    fs::remove_dir_all(&dir).ok();
 }
