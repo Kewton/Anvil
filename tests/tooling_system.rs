@@ -2014,6 +2014,78 @@ fn format_tool_result_message_image_payload() {
     assert!(msg.contains("画像"));
 }
 
+// -----------------------------------------------------------------------
+// Phase 3: format_tool_result_message — UTF-8 safe truncation (Issue #94)
+// -----------------------------------------------------------------------
+
+#[test]
+fn format_tool_result_message_truncates_multibyte_safely() {
+    use anvil::app::agentic::format_tool_result_message;
+
+    // Create a string of 3000 CJK characters (each 3 bytes in UTF-8 = 9000 bytes).
+    // With max_chars = 100 (characters), truncation must land on a char boundary.
+    let cjk_content: String = "競".repeat(3000);
+    let result = ToolExecutionResult {
+        tool_call_id: "call_utf8".to_string(),
+        tool_name: "file.read".to_string(),
+        status: ToolExecutionStatus::Completed,
+        summary: "read CJK file".to_string(),
+        payload: ToolExecutionPayload::Text(cjk_content),
+        artifacts: Vec::new(),
+        elapsed_ms: 5,
+    };
+
+    // Must not panic — the old byte-slicing implementation would panic here.
+    let msg = format_tool_result_message(&result, 100);
+    assert!(msg.contains("truncated"));
+    assert!(msg.contains("file.read"));
+}
+
+#[test]
+fn format_tool_result_message_ascii_truncation_still_works() {
+    use anvil::app::agentic::format_tool_result_message;
+
+    let ascii_content = "a".repeat(500);
+    let result = ToolExecutionResult {
+        tool_call_id: "call_ascii".to_string(),
+        tool_name: "file.read".to_string(),
+        status: ToolExecutionStatus::Completed,
+        summary: "read file".to_string(),
+        payload: ToolExecutionPayload::Text(ascii_content),
+        artifacts: Vec::new(),
+        elapsed_ms: 5,
+    };
+
+    let msg = format_tool_result_message(&result, 100);
+    assert!(msg.contains("truncated"));
+}
+
+#[test]
+fn format_tool_result_message_boundary_char_3byte() {
+    use anvil::app::agentic::format_tool_result_message;
+
+    // 99 ASCII chars + one 3-byte CJK char = 100 chars.
+    // Truncation at exactly 100 chars must not split the CJK char.
+    let mut content = "a".repeat(99);
+    content.push('競');
+    content.push_str(&"b".repeat(200)); // push past the limit
+
+    let result = ToolExecutionResult {
+        tool_call_id: "call_boundary".to_string(),
+        tool_name: "file.read".to_string(),
+        status: ToolExecutionStatus::Completed,
+        summary: "boundary test".to_string(),
+        payload: ToolExecutionPayload::Text(content),
+        artifacts: Vec::new(),
+        elapsed_ms: 5,
+    };
+
+    let msg = format_tool_result_message(&result, 100);
+    assert!(msg.contains("truncated"));
+    // The truncated portion should contain the CJK char (it's at position 100, within limit)
+    assert!(msg.contains("競"));
+}
+
 // ============================================================
 // Sub-agent tool tests (Issue #24 Phase 1)
 // ============================================================
