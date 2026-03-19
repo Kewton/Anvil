@@ -197,7 +197,7 @@ impl BasicAgentLoop {
 
         for message in session.messages.iter().rev() {
             let kind = ContentKind::from_message_role(message.role);
-            let estimated = estimate_tokens(&message.content, kind);
+            let estimated = estimate_tokens(message.effective_content(), kind);
             if !selected.is_empty() && used_tokens + estimated > budget_for_messages {
                 break;
             }
@@ -402,7 +402,7 @@ fn to_provider_message_with_images(
         MessageRole::Assistant => ProviderMessageRole::Assistant,
         MessageRole::Tool => ProviderMessageRole::Tool,
     };
-    let mut msg = ProviderMessage::new(role, message.content.clone());
+    let mut msg = ProviderMessage::new(role, message.effective_content().to_string());
     if let Some(ref paths) = message.image_paths
         && let Some(root) = sandbox_root
     {

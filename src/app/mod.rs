@@ -5,6 +5,7 @@
 /// executor.
 pub mod agentic;
 pub mod cli;
+mod context;
 pub mod mock;
 pub mod plan;
 pub mod policy;
@@ -587,6 +588,40 @@ impl App {
         Ok(())
     }
 
+    /// Record user input with optional @file expanded content.
+    ///
+    /// Like `record_user_input` but sets `expanded_content` on the message
+    /// before pushing, so that `push_message` uses `effective_content()` for
+    /// accurate token estimation (IC-006).
+    fn record_user_input_with_expansion(
+        &mut self,
+        msg_id: &str,
+        user_input: &str,
+        expanded_content: Option<String>,
+    ) -> Result<(), AppError> {
+        let mut message = new_user_message(msg_id, user_input);
+        message.expanded_content = expanded_content;
+        self.session.push_message(message);
+        self.persist_session(AppEvent::SessionSaved)?;
+        Ok(())
+    }
+
+    /// Expand @file references in user input (DR1-002: separated from run_live_turn).
+    ///
+    /// Returns `Some(expanded_text)` when at least one reference was expanded,
+    /// or `None` when no @file references are present or all failed.
+    fn prepare_expanded_content(&self, user_input: &str) -> Option<String> {
+        let (expanded, errors) = context::expand_at_references(
+            user_input,
+            &self.config.paths.cwd,
+            102_400, // 100KB
+        );
+        for err in &errors {
+            eprintln!("@file展開エラー: {}", err);
+        }
+        expanded
+    }
+
     pub fn record_assistant_output(
         &mut self,
         message_id: impl Into<String>,
@@ -626,7 +661,15 @@ impl App {
         }
 
         let user_input = user_input.into();
-        self.record_user_input(self.next_message_id("user"), user_input)?;
+
+        // @file expansion: expand before recording so push_message gets
+        // accurate token estimation via effective_content() (DR1-004).
+        let expanded_content = self.prepare_expanded_content(&user_input);
+        self.record_user_input_with_expansion(
+            &self.next_message_id("user"),
+            &user_input,
+            expanded_content,
+        )?;
         self.begin_live_turn_state()?;
 
         let request = BasicAgentLoop::build_turn_request(

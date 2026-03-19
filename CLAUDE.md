@@ -105,6 +105,7 @@ src/
 │   ├── mod.rs           # アプリケーションオーケストレータ
 │   ├── agentic.rs       # agenticツール実行ループ
 │   ├── cli.rs           # CLI入力ループ
+│   ├── context.rs       # コンテキスト注入（@file展開・サンドボックス検証）
 │   ├── plan.rs          # プラン管理
 │   ├── policy.rs        # offlineポリシーチェック（共通ヘルパー）
 │   ├── render.rs        # コンソール描画
@@ -146,7 +147,8 @@ tests/
 ├── mcp_integration.rs   # MCP統合テスト
 ├── tui_console.rs       # TUIテスト
 ├── skills_system.rs     # スキルシステムテスト
-└── hooks_system.rs      # フックシステムテスト
+├── hooks_system.rs      # フックシステムテスト
+└── context_inject.rs    # コンテキスト注入テスト
 ```
 
 ---
