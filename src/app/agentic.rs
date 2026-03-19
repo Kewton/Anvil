@@ -950,6 +950,22 @@ pub(crate) fn infer_plan_from_structured_response(
                 let truncated = truncate_chars(prompt, 50);
                 format!("plan: {truncated}")
             }
+            crate::tooling::ToolInput::GitStatus {} => "git status".to_string(),
+            crate::tooling::ToolInput::GitDiff { path, .. } => {
+                if let Some(p) = path {
+                    format!("git diff {p}")
+                } else {
+                    "git diff".to_string()
+                }
+            }
+            crate::tooling::ToolInput::GitLog { count, path } => {
+                let count_str = count.map_or("10".to_string(), |c| c.to_string());
+                if let Some(p) = path {
+                    format!("git log -{count_str} {p}")
+                } else {
+                    format!("git log -{count_str}")
+                }
+            }
         };
         plan.push(item);
     }

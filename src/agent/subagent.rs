@@ -68,6 +68,27 @@ const TOOL_DESC_WEB_FETCH: &str = r#"- web.fetch — fetch the contents of a URL
 
 "#;
 
+const TOOL_DESC_GIT_STATUS: &str = r#"- git.status — show working tree status:
+```ANVIL_TOOL
+{"id":"call_010","tool":"git.status"}
+```
+
+"#;
+
+const TOOL_DESC_GIT_DIFF: &str = r#"- git.diff — show changes in working tree or between commits:
+```ANVIL_TOOL
+{"id":"call_011","tool":"git.diff","path":"src/main.rs","staged":true}
+```
+
+"#;
+
+const TOOL_DESC_GIT_LOG: &str = r#"- git.log — show commit log (oneline format):
+```ANVIL_TOOL
+{"id":"call_012","tool":"git.log","count":20}
+```
+
+"#;
+
 const EXPLORE_ROLE_PROMPT: &str = r#"## Your role
 You are an Explore sub-agent. Your task is to investigate the codebase and gather information.
 - Read files and search for patterns to understand the code structure.
@@ -102,6 +123,9 @@ pub fn build_subagent_system_prompt(kind: &SubAgentKind, offline: bool) -> Strin
         SubAgentKind::Explore => {
             prompt.push_str(TOOL_DESC_FILE_READ);
             prompt.push_str(TOOL_DESC_FILE_SEARCH);
+            prompt.push_str(TOOL_DESC_GIT_STATUS);
+            prompt.push_str(TOOL_DESC_GIT_DIFF);
+            prompt.push_str(TOOL_DESC_GIT_LOG);
             prompt.push_str(EXPLORE_ROLE_PROMPT);
         }
         SubAgentKind::Plan => {
@@ -110,6 +134,7 @@ pub fn build_subagent_system_prompt(kind: &SubAgentKind, offline: bool) -> Strin
             if !offline {
                 prompt.push_str(TOOL_DESC_WEB_FETCH);
             }
+            prompt.push_str(TOOL_DESC_GIT_STATUS);
             prompt.push_str(if offline {
                 PLAN_ROLE_PROMPT_OFFLINE
             } else {
