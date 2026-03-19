@@ -379,6 +379,7 @@ fn tool_execution_result_can_bridge_into_console_tool_log_view() {
     assert_eq!(log.tool_name, "file.read");
     assert_eq!(log.action, "completed");
     assert_eq!(log.target, "Read src/app/mod.rs");
+    assert_eq!(log.elapsed_ms, Some(12));
 }
 
 #[test]

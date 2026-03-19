@@ -88,6 +88,17 @@ pub enum ToolKind {
     GitLog,
 }
 
+impl ToolKind {
+    /// Returns `true` if the tool may produce stderr output that would
+    /// conflict with the spinner display (e.g. shell commands, git operations).
+    pub fn produces_stderr(&self) -> bool {
+        matches!(
+            self,
+            ToolKind::ShellExec | ToolKind::GitStatus | ToolKind::GitDiff | ToolKind::GitLog
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolInput {
     FileRead {
@@ -556,6 +567,7 @@ impl ToolExecutionResult {
             tool_name: self.tool_name.clone(),
             action: action.to_string(),
             target: self.summary.clone(),
+            elapsed_ms: Some(self.elapsed_ms.min(u64::MAX as u128) as u64),
         }
     }
 }
