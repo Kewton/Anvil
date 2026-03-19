@@ -433,169 +433,277 @@ fn derive_context_budget(context_window: u32) -> usize {
     budget
 }
 
-pub fn tool_protocol_system_prompt(
+// --- Basic tool constants (always included) ---
+
+const TOOL_DESC_FILE_READ: &str = concat!(
+    "1. file.read — read a file or list a directory (also supports image files: PNG/JPG/JPEG/GIF/WebP, max 20MB):\n",
+    "```ANVIL_TOOL\n",
+    "{\"id\":\"call_001\",\"tool\":\"file.read\",\"path\":\"./relative/path\"}\n",
+    "```\n",
+    "\n",
+);
+
+const TOOL_DESC_FILE_WRITE: &str = concat!(
+    "2. file.write — create or overwrite a file:\n",
+    "```ANVIL_TOOL\n",
+    "{\"id\":\"call_002\",\"tool\":\"file.write\",\"path\":\"./relative/path\",\"content\":\"file content here\"}\n",
+    "```\n",
+    "\n",
+);
+
+const TOOL_DESC_FILE_EDIT: &str = concat!(
+    "3. file.edit — edit a file by replacing a specific string:\n",
+    "```ANVIL_TOOL\n",
+    "{\"id\":\"call_007\",\"tool\":\"file.edit\",\"path\":\"./relative/path\",\"old_string\":\"text to find\",\"new_string\":\"replacement text\"}\n",
+    "```\n",
+    "\n",
+);
+
+const TOOL_DESC_FILE_SEARCH: &str = concat!(
+    "4. file.search — search for files by name or content:\n",
+    "```ANVIL_TOOL\n",
+    "{\"id\":\"call_003\",\"tool\":\"file.search\",\"root\":\".\",\"pattern\":\"search term\"}\n",
+    "```\n",
+    "\n",
+);
+
+const TOOL_DESC_SHELL_EXEC: &str = concat!(
+    "5. shell.exec — run a shell command and capture its output:\n",
+    "```ANVIL_TOOL\n",
+    "{\"id\":\"call_004\",\"tool\":\"shell.exec\",\"command\":\"ls -la\"}\n",
+    "```\n",
+    "\n",
+);
+
+// --- Optional tool constants (included when used) ---
+
+const TOOL_DESC_WEB_FETCH: &str = concat!(
+    "6. web.fetch — fetch the contents of a URL:\n",
+    "```ANVIL_TOOL\n",
+    "{\"id\":\"call_005\",\"tool\":\"web.fetch\",\"url\":\"https://example.com\"}\n",
+    "```\n",
+    "\n",
+);
+
+const TOOL_DESC_WEB_SEARCH: &str = concat!(
+    "7. web.search — search the web by keyword:\n",
+    "```ANVIL_TOOL\n",
+    "{\"id\":\"call_006\",\"tool\":\"web.search\",\"query\":\"search keywords here\"}\n",
+    "```\n",
+    "Use web.search when you need to look up error messages, library usage, or any information not available locally.\n",
+    "\n",
+);
+
+const TOOL_DESC_AGENT_EXPLORE: &str = concat!(
+    "8. agent.explore — launch a read-only sub-agent to explore the codebase:\n",
+    "```ANVIL_TOOL\n",
+    "{\"id\":\"call_008\",\"tool\":\"agent.explore\",\"prompt\":\"Investigate the module structure under src/\",\"scope\":\"./src\"}\n",
+    "```\n",
+    "The sub-agent can only use file.read and file.search within the given scope directory.\n",
+    "\n",
+);
+
+const TOOL_DESC_AGENT_PLAN: &str = concat!(
+    "9. agent.plan — launch a read-only sub-agent to create an implementation plan:\n",
+    "```ANVIL_TOOL\n",
+    "{\"id\":\"call_009\",\"tool\":\"agent.plan\",\"prompt\":\"Create a plan to add error handling\",\"scope\":\"./src\"}\n",
+    "```\n",
+    "The sub-agent can use file.read, file.search, and web.fetch within the given scope directory.\n",
+    "\n",
+);
+
+/// Data-driven definition of optional tools: (tool_name, tool_description).
+const OPTIONAL_TOOLS: &[(&str, &str)] = &[
+    ("web.fetch", TOOL_DESC_WEB_FETCH),
+    ("web.search", TOOL_DESC_WEB_SEARCH),
+    ("agent.explore", TOOL_DESC_AGENT_EXPLORE),
+    ("agent.plan", TOOL_DESC_AGENT_PLAN),
+];
+
+/// Names of all optional tools, derived from [`OPTIONAL_TOOLS`].
+fn optional_tool_names() -> impl Iterator<Item = &'static str> {
+    OPTIONAL_TOOLS.iter().map(|(name, _)| *name)
+}
+
+// --- Static section constants ---
+
+const PROMPT_WORK_APPROACH: &str = concat!(
+    "You are Anvil, a local coding agent for serious terminal work.\n",
+    "\n",
+    "## Work approach\n",
+    "When given a task, follow this approach:\n",
+    "1. Start by understanding the current state: list directories (file.read on \".\") or search (file.search) before assuming files exist.\n",
+    "2. Plan your work: break complex tasks into steps. State your plan before executing.\n",
+    "3. Execute iteratively: use tools to gather information, then act on what you learned. Do NOT guess file paths — discover them first.\n",
+    "4. If a tool call fails (e.g. file not found), adapt your plan based on the error rather than stopping.\n",
+    "5. Summarize what you accomplished and what remains.\n",
+    "\n",
+    "## Tool protocol\n",
+    "When a task requires file operations, respond using fenced blocks.\n",
+    "\n",
+    "Available tools:\n",
+    "\n",
+);
+
+const PROMPT_TOOL_RULES: &str = concat!(
+    "After ALL tool blocks, include exactly one final block with your summary:\n",
+    "```ANVIL_FINAL\n",
+    "User-facing summary and code review notes.\n",
+    "```\n",
+    "\n",
+    "Rules:\n",
+    "- All paths must be relative (start with ./ or a directory name).\n",
+    "- Do not use any other tool syntax.\n",
+    "- Always include ANVIL_FINAL after your tool blocks.\n",
+    "- If no file operations are needed, just respond normally without tool blocks.\n",
+    "- Start exploration with file.read on \".\" to list the project root before reading specific files.\n",
+    "- Do not assume files like README.md exist — verify first.\n",
+    "- For dev servers and watch processes (npm run dev, cargo watch, etc.), use background execution with '&' so the command returns immediately.\n",
+    "- shell.exec output is streamed to the terminal in real-time. The user can press Ctrl+C to cancel.\n",
+    "\n",
+    "## GitHub Insights\n",
+    "When asked about repository statistics, use shell.exec with gh api:\n",
+    "- Contributors: gh api repos/{owner}/{repo}/stats/contributors\n",
+    "- Commit activity: gh api repos/{owner}/{repo}/stats/commit_activity\n",
+    "- Code frequency: gh api repos/{owner}/{repo}/stats/code_frequency\n",
+    "- Detect repo: gh repo view --json owner,name\n",
+    "- GitHub stats endpoints (contributors, commit_activity) may return {} on first request. If you get an empty response, wait 3 seconds with shell.exec sleep 3 and retry the same API call.",
+);
+
+const PROMPT_GIT_GUIDE: &str = concat!(
+    "\n\n## Git operations\n",
+    "When working with Git, follow these safety categories:\n",
+    "\n",
+    "**Safe (auto-approved):**\n",
+    "- git status, git log, git diff, git branch, git show <ref>, git remote -v, git rev-parse\n",
+    "\n",
+    "**Change (requires confirmation):**\n",
+    "- git add, git commit, git push, git checkout, git merge, git rebase, git stash\n",
+    "\n",
+    "**NEVER use these without explicit user request:**\n",
+    "- git reset --hard — destroys uncommitted changes irreversibly\n",
+    "- git clean -fd — deletes untracked files permanently\n",
+    "- git push --force — rewrites remote history, can lose team members' work\n",
+    "- git rebase on shared branches — rewrites history others depend on\n",
+    "- --no-verify flag — skips safety hooks, always blocked by the system\n",
+);
+
+const PROMPT_ENV_GUIDE: &str = concat!(
+    "\n## Environment inspection\n",
+    "Use these to check the development environment:\n",
+    "- which <tool> — check if a tool is installed\n",
+    "- uname — identify the operating system\n",
+    "- node -v, rustc --version, python --version, go version — check language versions\n",
+);
+
+const PROMPT_PROCESS_GUIDE: &str = concat!(
+    "\n## Process management\n",
+    "- lsof -i — check network port usage\n",
+    "- For dev servers (npm run dev, cargo watch), use background execution with '&'\n",
+);
+
+const PROMPT_RUST_GUIDE: &str = concat!(
+    "\n## Rust development\n",
+    "Build, test, and lint commands (auto-approved):\n",
+    "- cargo build — compile the project\n",
+    "- cargo test — run all tests\n",
+    "- cargo clippy --all-targets — run linter (aim for zero warnings)\n",
+    "- cargo fmt --check — check formatting\n",
+    "- cargo check — type-check without building\n",
+    "When fixing issues, iterate: make changes, then cargo build, cargo test, cargo clippy.\n",
+);
+
+const PROMPT_NODEJS_GUIDE: &str = concat!(
+    "\n## Node.js development\n",
+    "Build, test, and lint commands (auto-approved):\n",
+    "- npm test — run test suite\n",
+    "- npx jest <path> — run specific tests\n",
+    "- npx eslint <path> — run linter\n",
+    "- npx prettier --check <path> — check formatting\n",
+    "When fixing issues, iterate: make changes, then npm test, npx eslint.\n",
+);
+
+/// Generate the system prompt with dynamic tool selection based on used_tools.
+///
+/// Basic tools (file.read, file.write, file.edit, file.search, shell.exec)
+/// are always included. Optional tools (web.fetch, web.search, agent.explore,
+/// agent.plan) are only included when present in used_tools.
+pub(crate) fn tool_protocol_system_prompt(
     languages: &[ProjectLanguage],
     mcp_tool_descriptions: Option<&str>,
+    used_tools: &std::collections::HashSet<String>,
 ) -> String {
-    let base = concat!(
-        "You are Anvil, a local coding agent for serious terminal work.\n",
-        "\n",
-        "## Work approach\n",
-        "When given a task, follow this approach:\n",
-        "1. Start by understanding the current state: list directories (file.read on \".\") or search (file.search) before assuming files exist.\n",
-        "2. Plan your work: break complex tasks into steps. State your plan before executing.\n",
-        "3. Execute iteratively: use tools to gather information, then act on what you learned. Do NOT guess file paths — discover them first.\n",
-        "4. If a tool call fails (e.g. file not found), adapt your plan based on the error rather than stopping.\n",
-        "5. Summarize what you accomplished and what remains.\n",
-        "\n",
-        "## Tool protocol\n",
-        "When a task requires file operations, respond using fenced blocks.\n",
-        "\n",
-        "Available tools:\n",
-        "\n",
-        "1. file.read — read a file or list a directory (also supports image files: PNG/JPG/JPEG/GIF/WebP, max 20MB):\n",
-        "```ANVIL_TOOL\n",
-        "{\"id\":\"call_001\",\"tool\":\"file.read\",\"path\":\"./relative/path\"}\n",
-        "```\n",
-        "\n",
-        "2. file.write — create or overwrite a file:\n",
-        "```ANVIL_TOOL\n",
-        "{\"id\":\"call_002\",\"tool\":\"file.write\",\"path\":\"./relative/path\",\"content\":\"file content here\"}\n",
-        "```\n",
-        "\n",
-        "3. file.edit — edit a file by replacing a specific string:\n",
-        "```ANVIL_TOOL\n",
-        "{\"id\":\"call_007\",\"tool\":\"file.edit\",\"path\":\"./relative/path\",\"old_string\":\"text to find\",\"new_string\":\"replacement text\"}\n",
-        "```\n",
-        "\n",
-        "4. file.search — search for files by name or content:\n",
-        "```ANVIL_TOOL\n",
-        "{\"id\":\"call_003\",\"tool\":\"file.search\",\"root\":\".\",\"pattern\":\"search term\"}\n",
-        "```\n",
-        "\n",
-        "5. shell.exec — run a shell command and capture its output:\n",
-        "```ANVIL_TOOL\n",
-        "{\"id\":\"call_004\",\"tool\":\"shell.exec\",\"command\":\"ls -la\"}\n",
-        "```\n",
-        "\n",
-        "6. web.fetch — fetch the contents of a URL:\n",
-        "```ANVIL_TOOL\n",
-        "{\"id\":\"call_005\",\"tool\":\"web.fetch\",\"url\":\"https://example.com\"}\n",
-        "```\n",
-        "\n",
-        "7. web.search — search the web by keyword:\n",
-        "```ANVIL_TOOL\n",
-        "{\"id\":\"call_006\",\"tool\":\"web.search\",\"query\":\"search keywords here\"}\n",
-        "```\n",
-        "Use web.search when you need to look up error messages, library usage, or any information not available locally.\n",
-        "\n",
-        "8. agent.explore — launch a read-only sub-agent to explore the codebase:\n",
-        "```ANVIL_TOOL\n",
-        "{\"id\":\"call_008\",\"tool\":\"agent.explore\",\"prompt\":\"Investigate the module structure under src/\",\"scope\":\"./src\"}\n",
-        "```\n",
-        "The sub-agent can only use file.read and file.search within the given scope directory.\n",
-        "\n",
-        "9. agent.plan — launch a read-only sub-agent to create an implementation plan:\n",
-        "```ANVIL_TOOL\n",
-        "{\"id\":\"call_009\",\"tool\":\"agent.plan\",\"prompt\":\"Create a plan to add error handling\",\"scope\":\"./src\"}\n",
-        "```\n",
-        "The sub-agent can use file.read, file.search, and web.fetch within the given scope directory.\n",
-        "\n",
-        "After ALL tool blocks, include exactly one final block with your summary:\n",
-        "```ANVIL_FINAL\n",
-        "User-facing summary and code review notes.\n",
-        "```\n",
-        "\n",
-        "Rules:\n",
-        "- All paths must be relative (start with ./ or a directory name).\n",
-        "- Do not use any other tool syntax.\n",
-        "- Always include ANVIL_FINAL after your tool blocks.\n",
-        "- If no file operations are needed, just respond normally without tool blocks.\n",
-        "- Start exploration with file.read on \".\" to list the project root before reading specific files.\n",
-        "- Do not assume files like README.md exist — verify first.\n",
-        "- For dev servers and watch processes (npm run dev, cargo watch, etc.), use background execution with '&' so the command returns immediately.\n",
-        "- shell.exec output is streamed to the terminal in real-time. The user can press Ctrl+C to cancel.\n",
-        "\n",
-        "## GitHub Insights\n",
-        "When asked about repository statistics, use shell.exec with gh api:\n",
-        "- Contributors: gh api repos/{owner}/{repo}/stats/contributors\n",
-        "- Commit activity: gh api repos/{owner}/{repo}/stats/commit_activity\n",
-        "- Code frequency: gh api repos/{owner}/{repo}/stats/code_frequency\n",
-        "- Detect repo: gh repo view --json owner,name\n",
-        "- GitHub stats endpoints (contributors, commit_activity) may return {} on first request. If you get an empty response, wait 3 seconds with shell.exec sleep 3 and retry the same API call."
-    );
-    let mut prompt = base.to_string();
+    let mut prompt = String::with_capacity(8192);
 
-    // MCPツール説明を動的追加
+    // Work approach (static)
+    prompt.push_str(PROMPT_WORK_APPROACH);
+
+    // Basic tools (always included)
+    prompt.push_str(TOOL_DESC_FILE_READ);
+    prompt.push_str(TOOL_DESC_FILE_WRITE);
+    prompt.push_str(TOOL_DESC_FILE_EDIT);
+    prompt.push_str(TOOL_DESC_FILE_SEARCH);
+    prompt.push_str(TOOL_DESC_SHELL_EXEC);
+
+    // Optional tools (data-driven: included only when present in used_tools)
+    for (tool_name, tool_desc) in OPTIONAL_TOOLS {
+        if used_tools.contains(*tool_name) {
+            prompt.push_str(tool_desc);
+        }
+    }
+
+    // Tool rules and GitHub Insights (static)
+    prompt.push_str(PROMPT_TOOL_RULES);
+
+    // Append MCP tool descriptions dynamically
     // [D4-010] mcp_tool_descriptions is sanitized by generate_mcp_tool_descriptions()
     if let Some(mcp_desc) = mcp_tool_descriptions {
         prompt.push_str("\n\n## MCP External Tools\n\n");
         prompt.push_str(mcp_desc);
     }
 
-    // Always include: Git operations guide
-    prompt.push_str(concat!(
-        "\n\n## Git operations\n",
-        "When working with Git, follow these safety categories:\n",
-        "\n",
-        "**Safe (auto-approved):**\n",
-        "- git status, git log, git diff, git branch, git show <ref>, git remote -v, git rev-parse\n",
-        "\n",
-        "**Change (requires confirmation):**\n",
-        "- git add, git commit, git push, git checkout, git merge, git rebase, git stash\n",
-        "\n",
-        "**NEVER use these without explicit user request:**\n",
-        "- git reset --hard — destroys uncommitted changes irreversibly\n",
-        "- git clean -fd — deletes untracked files permanently\n",
-        "- git push --force — rewrites remote history, can lose team members' work\n",
-        "- git rebase on shared branches — rewrites history others depend on\n",
-        "- --no-verify flag — skips safety hooks, always blocked by the system\n",
-    ));
+    // Git operations guide (static)
+    prompt.push_str(PROMPT_GIT_GUIDE);
 
-    // Always include: Environment inspection guide
-    prompt.push_str(concat!(
-        "\n## Environment inspection\n",
-        "Use these to check the development environment:\n",
-        "- which <tool> — check if a tool is installed\n",
-        "- uname — identify the operating system\n",
-        "- node -v, rustc --version, python --version, go version — check language versions\n",
-    ));
+    // Environment inspection guide (static)
+    prompt.push_str(PROMPT_ENV_GUIDE);
 
-    // Always include: Process management guide
-    prompt.push_str(concat!(
-        "\n## Process management\n",
-        "- lsof -i — check network port usage\n",
-        "- For dev servers (npm run dev, cargo watch), use background execution with '&'\n",
-    ));
+    // Process management guide (static)
+    prompt.push_str(PROMPT_PROCESS_GUIDE);
 
     // Rust-specific guide (only when Rust detected)
     if languages.contains(&ProjectLanguage::Rust) {
-        prompt.push_str(concat!(
-            "\n## Rust development\n",
-            "Build, test, and lint commands (auto-approved):\n",
-            "- cargo build — compile the project\n",
-            "- cargo test — run all tests\n",
-            "- cargo clippy --all-targets — run linter (aim for zero warnings)\n",
-            "- cargo fmt --check — check formatting\n",
-            "- cargo check — type-check without building\n",
-            "When fixing issues, iterate: make changes, then cargo build, cargo test, cargo clippy.\n",
-        ));
+        prompt.push_str(PROMPT_RUST_GUIDE);
     }
 
     // Node.js-specific guide (only when NodeJs detected)
     if languages.contains(&ProjectLanguage::NodeJs) {
-        prompt.push_str(concat!(
-            "\n## Node.js development\n",
-            "Build, test, and lint commands (auto-approved):\n",
-            "- npm test — run test suite\n",
-            "- npx jest <path> — run specific tests\n",
-            "- npx eslint <path> — run linter\n",
-            "- npx prettier --check <path> — check formatting\n",
-            "When fixing issues, iterate: make changes, then npm test, npx eslint.\n",
-        ));
+        prompt.push_str(PROMPT_NODEJS_GUIDE);
     }
 
     prompt
+}
+
+/// Generate a system prompt with no optional tools (basic tools only).
+///
+/// Useful for testing that optional tools are excluded when unused.
+pub fn tool_protocol_system_prompt_basic_only(
+    languages: &[ProjectLanguage],
+    mcp_tool_descriptions: Option<&str>,
+) -> String {
+    let empty = std::collections::HashSet::new();
+    tool_protocol_system_prompt(languages, mcp_tool_descriptions, &empty)
+}
+
+/// Generate a system prompt with all tools included (for test compatibility
+/// and contexts where all tools should be available).
+pub fn tool_protocol_system_prompt_all_tools(
+    languages: &[ProjectLanguage],
+    mcp_tool_descriptions: Option<&str>,
+) -> String {
+    let all_tools: std::collections::HashSet<String> =
+        optional_tool_names().map(|s| s.to_string()).collect();
+    tool_protocol_system_prompt(languages, mcp_tool_descriptions, &all_tools)
 }
 
 fn extract_fenced_blocks(content: &str, label: &str) -> Vec<String> {

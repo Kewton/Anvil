@@ -503,8 +503,8 @@ fn pending_approval_survives_app_reload() {
 
 #[test]
 fn system_prompt_mentions_image_support_for_file_read() {
-    use anvil::agent::{ProjectLanguage, tool_protocol_system_prompt};
-    let prompt = tool_protocol_system_prompt(&[ProjectLanguage::Rust], None);
+    use anvil::agent::{ProjectLanguage, tool_protocol_system_prompt_all_tools};
+    let prompt = tool_protocol_system_prompt_all_tools(&[ProjectLanguage::Rust], None);
     assert!(
         prompt.contains("image files"),
         "system prompt should mention image support in file.read"
@@ -525,8 +525,8 @@ fn system_prompt_mentions_image_support_for_file_read() {
 
 #[test]
 fn system_prompt_includes_agent_explore_and_plan_descriptions() {
-    use anvil::agent::{ProjectLanguage, tool_protocol_system_prompt};
-    let prompt = tool_protocol_system_prompt(&[ProjectLanguage::Rust], None);
+    use anvil::agent::{ProjectLanguage, tool_protocol_system_prompt_all_tools};
+    let prompt = tool_protocol_system_prompt_all_tools(&[ProjectLanguage::Rust], None);
     assert!(
         prompt.contains("agent.explore"),
         "system prompt should describe agent.explore tool"

@@ -344,12 +344,13 @@ impl App {
                 self.config.mode.interactive,
             );
 
+            let system_prompt = self.build_dynamic_system_prompt();
             let request = BasicAgentLoop::build_turn_request(
                 self.config.runtime.model.clone(),
                 &self.session,
                 self.provider.capabilities.streaming && self.config.runtime.stream,
                 self.config.runtime.context_window,
-                &self.system_prompt,
+                &system_prompt,
             );
 
             let mut next_token_buffer = String::new();
@@ -866,6 +867,9 @@ impl App {
 
     /// Push a tool execution result into the session as a tool message.
     fn record_tool_result(&mut self, result: &ToolExecutionResult) {
+        // Track tool usage for dynamic system prompt generation (Issue #73)
+        self.session.used_tools.insert(result.tool_name.clone());
+
         let is_error = result.status == ToolExecutionStatus::Failed;
         let mut msg = SessionMessage::new(
             MessageRole::Tool,
