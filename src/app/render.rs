@@ -86,10 +86,11 @@ pub fn render_provider_frame(
     )
 }
 
-pub fn render_resume_header(config: &EffectiveConfig) -> String {
+pub fn render_resume_header(config: &EffectiveConfig, session_name: &str) -> String {
     let mut lines = vec![
         "  --------------------------------------------------------------".to_string(),
         "  Resuming existing session".to_string(),
+        format!("  Session : {session_name}"),
         format!("  Model   : {}", config.runtime.model),
         format!("  Context : {}k", config.runtime.context_window / 1_000),
         format!("  Project : {}", config.paths.cwd.display()),

@@ -120,6 +120,8 @@ pub struct App {
     /// MCP server manager. `None` when mcp.json is absent or initialization failed.
     /// [D2-010] Declared last so it is dropped last (Drop order = declaration order).
     mcp_manager: Option<crate::mcp::McpManager>,
+    /// Current session name (derived from session file stem).
+    current_session_name: String,
 }
 
 /// Whether the session loop should continue or exit.
@@ -335,6 +337,14 @@ impl App {
             );
         }
 
+        let current_session_name = config
+            .paths
+            .session_file
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("default")
+            .to_string();
+
         Ok(Self {
             tools,
             config,
@@ -348,6 +358,7 @@ impl App {
             warning_tracker: ContextWarningTracker::new(),
             hooks_engine,
             mcp_manager,
+            current_session_name,
         })
     }
 
@@ -472,6 +483,50 @@ impl App {
         &mut self.session
     }
 
+    pub fn current_session_name(&self) -> &str {
+        &self.current_session_name
+    }
+
+    /// Switch to a different named session.
+    ///
+    /// Validates the name, saves the current session, builds a new
+    /// `SessionStore`, loads or creates the target session, and resets
+    /// internal state.
+    fn switch_session(&mut self, name: &str) -> Result<Vec<String>, AppError> {
+        crate::session::validate_session_name(name)?;
+
+        if self.session.has_pending_turn() {
+            return Err(AppError::PendingApprovalRequired);
+        }
+
+        // Save current session
+        self.flush_session()?;
+
+        // Build new SessionStore
+        let new_path = self.config.paths.session_dir.join(format!("{name}.json"));
+        let new_store = SessionStore::new(new_path.clone(), self.config.paths.session_dir.clone());
+
+        // Load or create
+        let new_session = if new_path.exists() {
+            new_store.load()?
+        } else {
+            SessionRecord::new_named(name, self.config.paths.cwd.clone())?
+        };
+
+        // Reset fields
+        self.session_store = new_store;
+        self.session = new_session;
+        self.session.auto_compact_threshold = self.config.runtime.auto_compact_threshold;
+        self.state_machine =
+            StateMachine::from_snapshot(AppStateSnapshot::new(RuntimeState::Ready));
+        self.warning_tracker = ContextWarningTracker::new();
+        self.current_session_name = name.to_string();
+
+        tracing::info!(session_name = name, "Session switched");
+
+        Ok(vec![format!("Switched to session: {name}")])
+    }
+
     pub fn render_console(&self, tui: &Tui) -> Result<String, AppError> {
         Ok(tui.render_console(&self.build_console_render_context()))
     }
@@ -484,7 +539,7 @@ impl App {
 
         Ok(format!(
             "{}\n{}",
-            render::render_resume_header(&self.config),
+            render::render_resume_header(&self.config, &self.current_session_name),
             tui.render_console(&self.build_startup_render_context())
         ))
     }
@@ -1289,6 +1344,61 @@ impl App {
                     crate::extensions::skills::expand_variables(&content, &args, &skill_dir);
                 self.run_turn_to_output(prompt, provider_client, tui)?
             }
+            Some(SlashCommandAction::SessionList) => {
+                let sessions = self.session_store.list_sessions()?;
+                let output = if sessions.is_empty() {
+                    "[A] anvil > no sessions found".to_string()
+                } else {
+                    let mut lines = vec![format!("[A] anvil > {} session(s)", sessions.len())];
+                    for info in &sessions {
+                        let marker = if info.name == self.current_session_name {
+                            " *"
+                        } else {
+                            ""
+                        };
+                        lines.push(format!(
+                            "  {}{} ({} messages)",
+                            info.name, marker, info.message_count
+                        ));
+                    }
+                    lines.join("\n")
+                };
+                CliTurnOutput {
+                    frames: vec![output],
+                    control: SessionControl::Continue,
+                }
+            }
+            Some(SlashCommandAction::SessionDelete(name)) => {
+                if name == self.current_session_name {
+                    CliTurnOutput {
+                        frames: vec![format!(
+                            "[A] anvil > cannot delete the active session: {name}"
+                        )],
+                        control: SessionControl::Continue,
+                    }
+                } else {
+                    match self.session_store.delete_session(&name) {
+                        Ok(()) => CliTurnOutput {
+                            frames: vec![format!("[A] anvil > deleted session: {name}")],
+                            control: SessionControl::Continue,
+                        },
+                        Err(e) => CliTurnOutput {
+                            frames: vec![format!("[A] anvil > {e}")],
+                            control: SessionControl::Continue,
+                        },
+                    }
+                }
+            }
+            Some(SlashCommandAction::SessionSwitch(name)) => match self.switch_session(&name) {
+                Ok(frames) => CliTurnOutput {
+                    frames,
+                    control: SessionControl::Continue,
+                },
+                Err(e) => CliTurnOutput {
+                    frames: vec![format!("[A] anvil > {e}")],
+                    control: SessionControl::Continue,
+                },
+            },
             _ => {
                 let suggestion = self.extensions.suggest_command(command);
                 let msg = if let Some(suggested) = suggestion {

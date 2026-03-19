@@ -9,8 +9,6 @@ pub use cli_args::CliArgs;
 
 use clap::Parser;
 use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::{
     error::Error,
@@ -186,7 +184,7 @@ impl EffectiveConfig {
     fn default_for_paths(cwd: PathBuf, workspace_dir: PathBuf, config_file: PathBuf) -> Self {
         let state_dir = cwd.join(".anvil").join("state");
         let session_dir = cwd.join(".anvil").join("sessions");
-        let session_file = session_dir.join(format!("{}.json", session_key_for_cwd(&cwd)));
+        let session_file = session_dir.join("default.json");
         let logs_dir = cwd.join(".anvil").join("logs");
         Self {
             runtime: RuntimeConfig {
@@ -374,6 +372,13 @@ impl EffectiveConfig {
 
         if cli.offline {
             self.mode.offline = true;
+        }
+
+        // --session flag: override session file path
+        if let Some(ref name) = cli.session {
+            crate::session::validate_session_name(name)
+                .map_err(|e| ConfigError::ValidationError(e.to_string()))?;
+            self.paths.session_file = self.paths.session_dir.join(format!("{name}.json"));
         }
 
         Ok(())
@@ -772,10 +777,11 @@ pub fn sanitize_markers(content: &str) -> (String, bool) {
     (sanitized, found)
 }
 
+/// Wrapper around `session::session_id_for_cwd()` kept for backward compatibility.
+/// Used by `session_key()` for log file naming. May be removed in a future refactor.
+#[allow(dead_code)]
 fn session_key_for_cwd(cwd: &std::path::Path) -> String {
-    let mut hasher = DefaultHasher::new();
-    cwd.hash(&mut hasher);
-    format!("session_{:x}", hasher.finish())
+    crate::session::session_id_for_cwd(cwd)
 }
 
 fn parse_bool(value: &str) -> bool {

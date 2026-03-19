@@ -72,4 +72,8 @@ pub struct CliArgs {
     /// Run in offline mode (disable web tools and MCP)
     #[arg(long)]
     pub offline: bool,
+
+    /// Named session to use
+    #[arg(long)]
+    pub session: Option<String>,
 }
