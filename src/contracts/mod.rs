@@ -70,6 +70,8 @@ pub struct ToolLogView {
     pub tool_name: String,
     pub action: String,
     pub target: String,
+    #[serde(default)]
+    pub elapsed_ms: Option<u64>,
 }
 
 /// Context usage warning level based on threshold evaluation.
@@ -565,6 +567,41 @@ mod tests {
         }"#;
         let snapshot: AppStateSnapshot = serde_json::from_str(json).expect("deserialize");
         assert!(snapshot.inference_performance.is_none());
+    }
+
+    #[test]
+    fn tool_log_view_elapsed_ms_default_none() {
+        let json = r#"{"tool_name":"Read","action":"open","target":"src/main.rs"}"#;
+        let view: ToolLogView = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(view.elapsed_ms, None);
+    }
+
+    #[test]
+    fn tool_log_view_elapsed_ms_round_trip() {
+        let view = ToolLogView {
+            tool_name: "Read".to_string(),
+            action: "open".to_string(),
+            target: "src/main.rs".to_string(),
+            elapsed_ms: Some(1234),
+        };
+        let json = serde_json::to_string(&view).expect("serialize");
+        let back: ToolLogView = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.elapsed_ms, Some(1234));
+    }
+
+    #[test]
+    fn app_state_snapshot_backward_compat_without_elapsed_ms() {
+        // Old JSON with tool_logs that lack elapsed_ms should still deserialize
+        let json = r#"{
+            "state": "Working",
+            "status": {"line": "Working..."},
+            "reasoning_summary": [],
+            "tool_logs": [{"tool_name":"Read","action":"open","target":"src/main.rs"}],
+            "recommended_actions": []
+        }"#;
+        let snapshot: AppStateSnapshot = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(snapshot.tool_logs.len(), 1);
+        assert_eq!(snapshot.tool_logs[0].elapsed_ms, None);
     }
 
     #[test]

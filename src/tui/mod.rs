@@ -147,9 +147,13 @@ impl Tui {
                 "  completed:{completed} failed:{failed} interrupted:{interrupted}"
             ));
             for log in &snapshot.tool_logs {
+                let elapsed_suffix = log
+                    .elapsed_ms
+                    .map(|ms| format!(" ({})", crate::spinner::format_elapsed_ms(ms)))
+                    .unwrap_or_default();
                 lines.push(format!(
-                    "[T] tool  > {:<6} {} {}",
-                    log.tool_name, log.action, log.target
+                    "[T] tool  > {:<6} {} {}{}",
+                    log.tool_name, log.action, log.target, elapsed_suffix
                 ));
             }
         }
@@ -192,9 +196,9 @@ impl Tui {
         lines.push(render_hint_line(snapshot));
         lines.push(status_divider());
 
-        if matches!(snapshot.state, RuntimeState::Done | RuntimeState::Ready) {
-            lines.push("[U] you >".to_string());
-        } else if matches!(
+        // Done/Ready: do NOT emit "[U] you >" here — the interactive
+        // readline prompt already displays it (Issue #96).
+        if matches!(
             snapshot.state,
             RuntimeState::Thinking | RuntimeState::Working | RuntimeState::AwaitingApproval
         ) {

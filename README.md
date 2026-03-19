@@ -206,7 +206,7 @@ ANVIL_PROVIDER_URL=http://...     # プロバイダーURL
 ANVIL_CONTEXT_WINDOW=200000       # コンテキストウィンドウサイズ
 ANVIL_CONTEXT_BUDGET=50000        # トークンバジェット明示指定
 ANVIL_MAX_AGENT_ITERATIONS=10     # agenticループの最大反復数
-ANVIL_CURL_TIMEOUT=300            # LLMリクエストタイムアウト（秒）
+ANVIL_HTTP_TIMEOUT=300            # LLMリクエストタイムアウト（秒）（旧ANVIL_CURL_TIMEOUTもフォールバックとして有効）
 ANVIL_API_KEY=sk-...              # OpenAI互換APIキー
 ```
 

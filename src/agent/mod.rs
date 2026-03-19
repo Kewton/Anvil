@@ -629,6 +629,19 @@ const PROMPT_TOOL_RULES: &str = concat!(
     "- GitHub stats endpoints (contributors, commit_activity) may return {} on first request. If you get an empty response, wait 3 seconds with shell.exec sleep 3 and retry the same API call.",
 );
 
+/// Guidance for LLMs on confirm-class tool behavior.
+///
+/// Prevents models from asking for permission in natural language
+/// when a tool requires user approval. Anvil handles approval inline.
+const PROMPT_CONFIRM_CLASS_GUIDANCE: &str = concat!(
+    "\n## Tool approval\n",
+    "Some tools require user approval before execution.\n",
+    "Anvil automatically shows an approval prompt when you call these tools.\n",
+    "Do NOT ask the user for permission in natural language.\n",
+    "Always emit the tool call directly using ANVIL_TOOL blocks — Anvil handles the rest.\n",
+    "If a tool call is denied, you will receive \"denied by user\" as the result.\n",
+);
+
 const PROMPT_GIT_GUIDE: &str = concat!(
     "\n\n## Git operations\n",
     "When working with Git, follow these safety categories:\n",
@@ -713,6 +726,9 @@ pub(crate) fn tool_protocol_system_prompt(
 
     // Tool rules and GitHub Insights (static)
     prompt.push_str(PROMPT_TOOL_RULES);
+
+    // Confirm-class tool approval guidance (static)
+    prompt.push_str(PROMPT_CONFIRM_CLASS_GUIDANCE);
 
     // Append MCP tool descriptions dynamically
     // [D4-010] mcp_tool_descriptions is sanitized by generate_mcp_tool_descriptions()

@@ -18,7 +18,9 @@ fn tui_renders_status_line() {
     assert!(rendered.contains("Ready."));
     assert!(rendered.contains("provider=ollama"));
     assert!(rendered.contains("Enter to send"));
-    assert!(rendered.contains("[U] you >"));
+    // Issue #96: [U] you > is no longer rendered by render_console()
+    // for Ready/Done states — the interactive readline prompt handles it.
+    assert!(!rendered.contains("[U] you >"));
     assert!(rendered.contains("model:local-default"));
 }
 
@@ -490,6 +492,51 @@ fn busy_prompt_hints_include_slash_commands() {
     assert!(rendered.contains("[U] you > /status /help /plan"));
 }
 
+/// Issue #96: render_console() must NOT include `[U] you >` when state is
+/// Done or Ready, because the interactive readline prompt already displays it.
+#[test]
+fn done_frame_omits_user_prompt_to_avoid_duplicate() {
+    let mut app = common::build_app();
+    let tui = Tui::new();
+
+    app.record_user_input("msg_001", "hello")
+        .expect("user input should persist");
+    let _ = app
+        .mock_thinking_snapshot()
+        .expect("thinking snapshot should build");
+    let _ = app
+        .mock_working_snapshot()
+        .expect("working snapshot should build");
+    let _ = app
+        .mock_done_snapshot()
+        .expect("done snapshot should build");
+
+    let rendered = app.render_console(&tui).expect("render should succeed");
+
+    assert!(
+        !rendered.contains("[U] you >"),
+        "Done frame should not contain [U] you > (readline handles it). Got:\n{rendered}"
+    );
+}
+
+/// Issue #96: render_console() must NOT include `[U] you >` when state is
+/// Ready (initial state), because the interactive readline prompt handles it.
+#[test]
+fn ready_frame_omits_user_prompt_to_avoid_duplicate() {
+    let mut app = common::build_app();
+    let tui = Tui::new();
+
+    let _ = app
+        .initial_snapshot()
+        .expect("initial snapshot should build");
+    let rendered = app.render_console(&tui).expect("render should succeed");
+
+    assert!(
+        !rendered.contains("[U] you >"),
+        "Ready frame should not contain [U] you > (readline handles it). Got:\n{rendered}"
+    );
+}
+
 #[test]
 fn test_approval_view_serialize_skips_diff_preview() {
     let view = anvil::contracts::ApprovalView {
@@ -546,6 +593,59 @@ fn test_approval_view_without_diff_preview() {
 
     let approval = snapshot.approval.as_ref().expect("approval present");
     assert!(approval.diff_preview.is_none());
+}
+
+#[test]
+fn tool_log_displays_elapsed_ms() {
+    let tui = Tui::new();
+    let snapshot = anvil::contracts::AppStateSnapshot::new(anvil::contracts::RuntimeState::Working)
+        .with_status("Working.".to_string())
+        .with_tool_logs(vec![anvil::contracts::ToolLogView {
+            tool_name: "file.read".to_string(),
+            action: "completed".to_string(),
+            target: "src/main.rs".to_string(),
+            elapsed_ms: Some(1234),
+        }]);
+
+    let context = anvil::contracts::ConsoleRenderContext {
+        snapshot,
+        model_name: "test-model".to_string(),
+        messages: vec![],
+        history_summary: None,
+    };
+
+    let rendered = tui.render_console(&context);
+    assert!(
+        rendered.contains("(1.2s)"),
+        "tool log should display elapsed time as (1.2s), got:\n{rendered}"
+    );
+}
+
+#[test]
+fn tool_log_omits_elapsed_ms_when_none() {
+    let tui = Tui::new();
+    let snapshot = anvil::contracts::AppStateSnapshot::new(anvil::contracts::RuntimeState::Working)
+        .with_status("Working.".to_string())
+        .with_tool_logs(vec![anvil::contracts::ToolLogView {
+            tool_name: "file.read".to_string(),
+            action: "completed".to_string(),
+            target: "src/main.rs".to_string(),
+            elapsed_ms: None,
+        }]);
+
+    let context = anvil::contracts::ConsoleRenderContext {
+        snapshot,
+        model_name: "test-model".to_string(),
+        messages: vec![],
+        history_summary: None,
+    };
+
+    let rendered = tui.render_console(&context);
+    // Should not contain any time display like "(X.Xs)"
+    assert!(
+        !rendered.contains("(0.0s)"),
+        "tool log should not display elapsed time when None"
+    );
 }
 
 #[test]

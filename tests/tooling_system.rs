@@ -379,6 +379,7 @@ fn tool_execution_result_can_bridge_into_console_tool_log_view() {
     assert_eq!(log.tool_name, "file.read");
     assert_eq!(log.action, "completed");
     assert_eq!(log.target, "Read src/app/mod.rs");
+    assert_eq!(log.elapsed_ms, Some(12));
 }
 
 #[test]
@@ -2012,6 +2013,78 @@ fn format_tool_result_message_image_payload() {
     assert!(msg.contains("file.read"));
     assert!(msg.contains("/tmp/photo.png"));
     assert!(msg.contains("画像"));
+}
+
+// -----------------------------------------------------------------------
+// Phase 3: format_tool_result_message — UTF-8 safe truncation (Issue #94)
+// -----------------------------------------------------------------------
+
+#[test]
+fn format_tool_result_message_truncates_multibyte_safely() {
+    use anvil::app::agentic::format_tool_result_message;
+
+    // Create a string of 3000 CJK characters (each 3 bytes in UTF-8 = 9000 bytes).
+    // With max_chars = 100 (characters), truncation must land on a char boundary.
+    let cjk_content: String = "競".repeat(3000);
+    let result = ToolExecutionResult {
+        tool_call_id: "call_utf8".to_string(),
+        tool_name: "file.read".to_string(),
+        status: ToolExecutionStatus::Completed,
+        summary: "read CJK file".to_string(),
+        payload: ToolExecutionPayload::Text(cjk_content),
+        artifacts: Vec::new(),
+        elapsed_ms: 5,
+    };
+
+    // Must not panic — the old byte-slicing implementation would panic here.
+    let msg = format_tool_result_message(&result, 100);
+    assert!(msg.contains("truncated"));
+    assert!(msg.contains("file.read"));
+}
+
+#[test]
+fn format_tool_result_message_ascii_truncation_still_works() {
+    use anvil::app::agentic::format_tool_result_message;
+
+    let ascii_content = "a".repeat(500);
+    let result = ToolExecutionResult {
+        tool_call_id: "call_ascii".to_string(),
+        tool_name: "file.read".to_string(),
+        status: ToolExecutionStatus::Completed,
+        summary: "read file".to_string(),
+        payload: ToolExecutionPayload::Text(ascii_content),
+        artifacts: Vec::new(),
+        elapsed_ms: 5,
+    };
+
+    let msg = format_tool_result_message(&result, 100);
+    assert!(msg.contains("truncated"));
+}
+
+#[test]
+fn format_tool_result_message_boundary_char_3byte() {
+    use anvil::app::agentic::format_tool_result_message;
+
+    // 99 ASCII chars + one 3-byte CJK char = 100 chars.
+    // Truncation at exactly 100 chars must not split the CJK char.
+    let mut content = "a".repeat(99);
+    content.push('競');
+    content.push_str(&"b".repeat(200)); // push past the limit
+
+    let result = ToolExecutionResult {
+        tool_call_id: "call_boundary".to_string(),
+        tool_name: "file.read".to_string(),
+        status: ToolExecutionStatus::Completed,
+        summary: "boundary test".to_string(),
+        payload: ToolExecutionPayload::Text(content),
+        artifacts: Vec::new(),
+        elapsed_ms: 5,
+    };
+
+    let msg = format_tool_result_message(&result, 100);
+    assert!(msg.contains("truncated"));
+    // The truncated portion should contain the CJK char (it's at position 100, within limit)
+    assert!(msg.contains("競"));
 }
 
 // ============================================================
@@ -3884,5 +3957,145 @@ fn file_search_zero_matches_with_context_returns_empty_text() {
             assert!(text.is_empty(), "no matches should produce empty text");
         }
         other => panic!("expected empty Text, got {other:?}"),
+    }
+}
+
+// --- resolve_locale_params tests ---
+
+mod locale_params {
+    use anvil::tooling::resolve_locale_params;
+
+    #[test]
+    fn resolve_locale_params_japanese() {
+        let result = resolve_locale_params("ja_JP.UTF-8");
+        let params = result.expect("should return Some for Japanese locale");
+        assert_eq!(params.kl, "jp-ja");
+        assert_eq!(params.accept_language, "ja,en;q=0.9");
+    }
+
+    #[test]
+    fn resolve_locale_params_chinese() {
+        let result = resolve_locale_params("zh_CN.UTF-8");
+        let params = result.expect("should return Some for Chinese locale");
+        assert_eq!(params.kl, "cn-zh");
+        assert_eq!(params.accept_language, "zh,en;q=0.9");
+    }
+
+    #[test]
+    fn resolve_locale_params_korean() {
+        let result = resolve_locale_params("ko_KR.UTF-8");
+        let params = result.expect("should return Some for Korean locale");
+        assert_eq!(params.kl, "kr-kr");
+        assert_eq!(params.accept_language, "ko,en;q=0.9");
+    }
+
+    #[test]
+    fn resolve_locale_params_english() {
+        let result = resolve_locale_params("en_US.UTF-8");
+        assert!(result.is_none(), "English locale should return None");
+    }
+
+    #[test]
+    fn resolve_locale_params_c_locale() {
+        let result = resolve_locale_params("C");
+        assert!(result.is_none(), "C locale should return None");
+    }
+
+    #[test]
+    fn resolve_locale_params_posix() {
+        let result = resolve_locale_params("POSIX");
+        assert!(result.is_none(), "POSIX locale should return None");
+    }
+
+    #[test]
+    fn resolve_locale_params_c_utf8() {
+        let result = resolve_locale_params("C.UTF-8");
+        assert!(result.is_none(), "C.UTF-8 locale should return None");
+    }
+
+    #[test]
+    fn resolve_locale_params_bare_ja() {
+        let result = resolve_locale_params("ja");
+        let params = result.expect("should return Some for bare 'ja'");
+        assert_eq!(params.kl, "jp-ja");
+    }
+
+    #[test]
+    fn resolve_locale_params_zh_tw() {
+        let result = resolve_locale_params("zh_TW.UTF-8");
+        let params = result.expect("should return Some for zh_TW locale");
+        assert_eq!(params.kl, "cn-zh");
+    }
+}
+
+// --- is_captcha_response tests ---
+
+mod captcha_detection {
+    use anvil::tooling::is_captcha_response;
+
+    #[test]
+    fn is_captcha_response_ddg_specific() {
+        let body = "<html><body>Unfortunately, bots use DuckDuckGo too.</body></html>";
+        assert!(
+            is_captcha_response(body, 0),
+            "DDG-specific CAPTCHA string should be detected"
+        );
+    }
+
+    #[test]
+    fn is_captcha_response_generic_captcha() {
+        let body = "<html><body>Please solve this CAPTCHA to continue.</body></html>";
+        assert!(
+            is_captcha_response(body, 0),
+            "Generic 'captcha' keyword should be detected"
+        );
+    }
+
+    #[test]
+    fn is_captcha_response_not_triggered_with_results() {
+        let body = "<html><body>Unfortunately, bots use DuckDuckGo too.</body></html>";
+        assert!(
+            !is_captcha_response(body, 3),
+            "Should not trigger CAPTCHA when results_count > 0"
+        );
+    }
+
+    #[test]
+    fn is_captcha_response_no_false_positive_bot_query() {
+        let body = "<html><body>Learn about chatbot development and bot frameworks.</body></html>";
+        assert!(
+            !is_captcha_response(body, 0),
+            "Should not false-positive on 'bot' keyword without 'captcha'"
+        );
+    }
+}
+
+// --- CaptchaBlocked error tests ---
+
+mod captcha_blocked_error {
+    use anvil::tooling::ToolRuntimeError;
+
+    #[test]
+    fn captcha_blocked_error_display() {
+        let err = ToolRuntimeError::CaptchaBlocked {
+            query: "test query".to_string(),
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("SERPER_API_KEY"),
+            "CaptchaBlocked message should mention SERPER_API_KEY, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn captcha_blocked_error_display_includes_web_fetch() {
+        let err = ToolRuntimeError::CaptchaBlocked {
+            query: "test query".to_string(),
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("web.fetch"),
+            "CaptchaBlocked message should mention web.fetch, got: {msg}"
+        );
     }
 }

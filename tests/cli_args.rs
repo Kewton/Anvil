@@ -537,7 +537,7 @@ fn session_message_is_error_deserialize_compat() {
     assert!(!msg.is_error, "is_error should default to false");
 }
 
-// --- Spinner no-op test ---
+// --- Spinner no-op tests ---
 
 #[test]
 fn spinner_noop_in_non_interactive() {
@@ -545,4 +545,27 @@ fn spinner_noop_in_non_interactive() {
     // and can be stopped immediately.
     let spinner = anvil::spinner::Spinner::start("test message", false);
     spinner.stop(); // should be a no-op, no panic
+}
+
+#[test]
+fn spinner_start_tool_noop_when_disabled() {
+    let spinner = anvil::spinner::Spinner::start_tool("file.read", 3, 1, false);
+    spinner.stop(); // should be a no-op, no panic
+}
+
+#[test]
+fn spinner_start_parallel_noop_when_disabled() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    let completed = Arc::new(AtomicUsize::new(0));
+    let spinner = anvil::spinner::Spinner::start_parallel(4, completed, false);
+    spinner.stop(); // should be a no-op, no panic
+}
+
+#[test]
+fn spinner_pause_resume_noop_when_disabled() {
+    let spinner = anvil::spinner::Spinner::start("test", false);
+    spinner.pause();
+    spinner.resume();
+    spinner.stop(); // should not panic
 }

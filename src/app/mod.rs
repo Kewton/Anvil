@@ -482,6 +482,9 @@ impl App {
             effective_used_tools,
         );
 
+        // Current date and timezone (dynamic, re-evaluated per turn)
+        prompt.push_str(&context::format_date_prompt());
+
         // Project instructions (from ANVIL.md)
         if let Some(ref instructions) = self.project_instructions {
             prompt.push_str("\n\n## Project instructions (from ANVIL.md)\n");

@@ -17,7 +17,8 @@ use crate::tooling::{
     diff::generate_diff_preview, resolve_sandbox_path,
 };
 use crate::tui::Tui;
-use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::tooling::PermissionClass;
 use std::collections::HashSet;
@@ -77,6 +78,7 @@ fn execute_parallel_group_standalone(
     config: &crate::config::EffectiveConfig,
     shutdown_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
     requests: Vec<(usize, ToolExecutionRequest)>,
+    completed: Arc<AtomicUsize>,
 ) -> Vec<(usize, ToolExecutionResult)> {
     let cwd = config.paths.cwd.clone();
     let runtime = &config.runtime;
@@ -90,6 +92,7 @@ fn execute_parallel_group_standalone(
                     let cwd = cwd.clone();
                     let shutdown = shutdown_flag.clone();
                     let idx = *idx;
+                    let completed = completed.clone();
                     s.spawn(move || {
                         let mut executor =
                             LocalToolExecutor::new(cwd, runtime).with_shutdown_flag(shutdown);
@@ -106,6 +109,7 @@ fn execute_parallel_group_standalone(
                                 elapsed_ms: 0,
                             }
                         });
+                        completed.fetch_add(1, Ordering::Relaxed);
                         (idx, result)
                     })
                 })
@@ -743,26 +747,53 @@ impl App {
             .collect();
 
         // Phase 3: Execution
+        let total_tools = validated_requests.len();
+        let interactive = self.config.mode.interactive;
         let mut indexed_results: Vec<(usize, ToolExecutionResult)> = failed_results;
+        let mut seq_counter = 0usize;
         for group in groups {
             match group {
                 ExecutionGroup::Parallel(requests) if requests.len() >= 2 => {
+                    let completed = Arc::new(AtomicUsize::new(0));
+                    let spinner =
+                        Spinner::start_parallel(requests.len(), completed.clone(), interactive);
                     let parallel_results = execute_parallel_group_standalone(
                         &self.config,
                         self.shutdown_flag(),
                         requests,
+                        completed,
                     );
+                    spinner.stop();
+                    seq_counter += parallel_results.len();
                     indexed_results.extend(parallel_results);
                 }
                 ExecutionGroup::Parallel(requests) => {
                     // Single ParallelSafe item — execute sequentially
                     for (idx, req) in requests {
+                        seq_counter += 1;
+                        let spinner = Spinner::start_tool(
+                            &req.spec.name,
+                            total_tools,
+                            seq_counter,
+                            interactive,
+                        );
+                        if req.spec.kind.produces_stderr() {
+                            spinner.pause();
+                        }
                         let result = self.execute_single(req);
+                        spinner.stop();
                         indexed_results.push((idx, result));
                     }
                 }
                 ExecutionGroup::Sequential(idx, req) => {
+                    seq_counter += 1;
+                    let spinner =
+                        Spinner::start_tool(&req.spec.name, total_tools, seq_counter, interactive);
+                    if req.spec.kind.produces_stderr() {
+                        spinner.pause();
+                    }
                     let result = self.execute_single(req);
+                    spinner.stop();
                     indexed_results.push((idx, result));
                 }
             }
@@ -835,6 +866,23 @@ impl App {
         let mut results: Vec<ToolExecutionResult> = Vec::with_capacity(indexed_results.len());
         for (_, result) in indexed_results {
             self.record_tool_result(&result);
+
+            // Emit folded tool result to stderr for interactive sessions
+            if interactive {
+                let output_text = match &result.payload {
+                    ToolExecutionPayload::Text(content) => content.as_str(),
+                    ToolExecutionPayload::Paths(_) => "",
+                    _ => "",
+                };
+                let display = crate::app::render::format_tool_result_for_display(
+                    &result.tool_name,
+                    &result.summary,
+                    output_text,
+                    result.elapsed_ms.min(u64::MAX as u128) as u64,
+                );
+                let _ =
+                    std::io::Write::write_fmt(&mut std::io::stderr(), format_args!("{display}\n"));
+            }
 
             // PostToolUse hook (soft-fail) — skip for rolled-back results
             if rolled_back_ids.contains(&result.tool_call_id) {
@@ -996,11 +1044,12 @@ pub fn format_tool_result_message(result: &ToolExecutionResult, max_chars: usize
             format!("[tool result: {}] {}", result.tool_name, result.summary)
         }
         ToolExecutionPayload::Text(content) => {
-            let truncated = if content.len() > max_chars {
+            let truncated = if content.chars().count() > max_chars {
+                let cut: String = content.chars().take(max_chars).collect();
                 format!(
-                    "{}...\n[truncated, {} bytes total]",
-                    &content[..max_chars],
-                    content.len()
+                    "{}...\n[truncated, {} chars total]",
+                    cut,
+                    content.chars().count()
                 )
             } else {
                 content.clone()
