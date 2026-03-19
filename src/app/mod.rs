@@ -5,6 +5,7 @@
 /// executor.
 pub mod agentic;
 pub mod cli;
+mod context;
 pub mod mock;
 pub mod plan;
 pub mod policy;
@@ -129,6 +130,10 @@ pub struct App {
     trust_all: bool,
     /// Individually trusted tool names (including MCP tools).
     trusted_tools: HashSet<String>,
+    /// Session-scoped model override (Issue #77).
+    active_model: Option<String>,
+    /// Session-scoped context window override (Issue #77).
+    active_context_window: Option<u32>,
 }
 
 /// Whether the session loop should continue or exit.
@@ -371,6 +376,8 @@ impl App {
             current_session_name,
             trust_all,
             trusted_tools: HashSet::new(),
+            active_model: None,
+            active_context_window: None,
         })
     }
 
@@ -383,7 +390,7 @@ impl App {
         let mut status = format!(
             "Ready. provider={} model={} stream={} tools={}",
             self.config.runtime.provider,
-            self.config.runtime.model,
+            self.effective_model(),
             self.provider.capabilities.streaming,
             self.provider.capabilities.tool_calling
         );
@@ -395,7 +402,7 @@ impl App {
             .with_status(status)
             .with_context_usage(
                 self.session.estimated_token_count(),
-                self.config.runtime.context_window,
+                self.effective_context_window(),
             )
     }
 
@@ -511,6 +518,25 @@ impl App {
         &self.current_session_name
     }
 
+    /// Return the effective model name for this session.
+    ///
+    /// Returns the session-scoped override if set, otherwise falls back to
+    /// the config default.
+    pub fn effective_model(&self) -> &str {
+        self.active_model
+            .as_deref()
+            .unwrap_or(&self.config.runtime.model)
+    }
+
+    /// Return the effective context window for this session.
+    ///
+    /// Returns the session-scoped override if set, otherwise falls back to
+    /// the config default.
+    pub fn effective_context_window(&self) -> u32 {
+        self.active_context_window
+            .unwrap_or(self.config.runtime.context_window)
+    }
+
     /// Switch to a different named session.
     ///
     /// Validates the name, saves the current session, builds a new
@@ -545,6 +571,8 @@ impl App {
             StateMachine::from_snapshot(AppStateSnapshot::new(RuntimeState::Ready));
         self.warning_tracker = ContextWarningTracker::new();
         self.current_session_name = name.to_string();
+        self.active_model = None;
+        self.active_context_window = None;
 
         tracing::info!(session_name = name, "Session switched");
 
@@ -558,12 +586,22 @@ impl App {
     pub fn startup_console(&mut self, tui: &Tui) -> Result<String, AppError> {
         if self.session.message_count() == 0 && self.session.last_snapshot.is_none() {
             let snapshot = self.initial_snapshot()?;
-            return Ok(tui.render_startup(&self.config, &snapshot));
+            return Ok(tui.render_startup(
+                &self.config,
+                &snapshot,
+                self.effective_model(),
+                self.effective_context_window(),
+            ));
         }
 
         Ok(format!(
             "{}\n{}",
-            render::render_resume_header(&self.config, &self.current_session_name),
+            render::render_resume_header(
+                self.effective_model(),
+                self.effective_context_window(),
+                &self.config,
+                &self.current_session_name,
+            ),
             tui.render_console(&self.build_startup_render_context())
         ))
     }
@@ -585,6 +623,40 @@ impl App {
             .push_message(new_user_message(message_id, content));
         self.persist_session(AppEvent::SessionSaved)?;
         Ok(())
+    }
+
+    /// Record user input with optional @file expanded content.
+    ///
+    /// Like `record_user_input` but sets `expanded_content` on the message
+    /// before pushing, so that `push_message` uses `effective_content()` for
+    /// accurate token estimation (IC-006).
+    fn record_user_input_with_expansion(
+        &mut self,
+        msg_id: &str,
+        user_input: &str,
+        expanded_content: Option<String>,
+    ) -> Result<(), AppError> {
+        let mut message = new_user_message(msg_id, user_input);
+        message.expanded_content = expanded_content;
+        self.session.push_message(message);
+        self.persist_session(AppEvent::SessionSaved)?;
+        Ok(())
+    }
+
+    /// Expand @file references in user input (DR1-002: separated from run_live_turn).
+    ///
+    /// Returns `Some(expanded_text)` when at least one reference was expanded,
+    /// or `None` when no @file references are present or all failed.
+    fn prepare_expanded_content(&self, user_input: &str) -> Option<String> {
+        let (expanded, errors) = context::expand_at_references(
+            user_input,
+            &self.config.paths.cwd,
+            102_400, // 100KB
+        );
+        for err in &errors {
+            eprintln!("@file展開エラー: {}", err);
+        }
+        expanded
     }
 
     pub fn record_assistant_output(
@@ -626,20 +698,28 @@ impl App {
         }
 
         let user_input = user_input.into();
-        self.record_user_input(self.next_message_id("user"), user_input)?;
+
+        // @file expansion: expand before recording so push_message gets
+        // accurate token estimation via effective_content() (DR1-004).
+        let expanded_content = self.prepare_expanded_content(&user_input);
+        self.record_user_input_with_expansion(
+            &self.next_message_id("user"),
+            &user_input,
+            expanded_content,
+        )?;
         self.begin_live_turn_state()?;
 
         let request = BasicAgentLoop::build_turn_request(
-            self.config.runtime.model.clone(),
+            self.effective_model().to_string(),
             &self.session,
             self.provider.capabilities.streaming && self.config.runtime.stream,
-            self.config.runtime.context_window,
+            self.effective_context_window(),
             &self.system_prompt,
         );
 
         // Phase 1: Collect events from provider with spinner + streaming output.
         let mut spinner_opt = Some(Spinner::start(
-            format!("Thinking. model={}", self.config.runtime.model),
+            format!("Thinking. model={}", self.effective_model()),
             self.config.mode.interactive,
         ));
 
@@ -941,7 +1021,7 @@ impl App {
     ) -> Result<AppStateSnapshot, AppError> {
         let snapshot = snapshot.with_context_usage(
             self.session.estimated_token_count(),
-            self.config.runtime.context_window,
+            self.effective_context_window(),
         );
         self.apply_transition(snapshot, transition)
     }
@@ -1164,7 +1244,7 @@ impl App {
         // tool execution output (Issue #1).
         self.session.console_render_context(
             self.state_machine.snapshot(),
-            &self.config.runtime.model,
+            self.effective_model(),
             self.config.runtime.max_console_messages,
             true,
         )
@@ -1175,7 +1255,7 @@ impl App {
         // the conversation history from the previous session.
         self.session.console_render_context(
             self.state_machine.snapshot(),
-            &self.config.runtime.model,
+            self.effective_model(),
             self.config.runtime.max_console_messages,
             false,
         )
@@ -1187,7 +1267,7 @@ impl App {
 
     fn begin_live_turn_state(&mut self) -> Result<(), AppError> {
         let snapshot = AppStateSnapshot::new(RuntimeState::Thinking)
-            .with_status(format!("Thinking. model={}", self.config.runtime.model))
+            .with_status(format!("Thinking. model={}", self.effective_model()))
             .with_elapsed_ms(0);
         self.transition_with_context(snapshot, StateTransition::StartThinking)?;
         Ok(())
@@ -1328,12 +1408,77 @@ impl App {
                 frames: vec![self.compact_session_history()?],
                 control: SessionControl::Continue,
             },
-            Some(SlashCommandAction::Model) => CliTurnOutput {
-                frames: vec![render::render_model_frame(&self.config)],
-                control: SessionControl::Continue,
-            },
+            Some(SlashCommandAction::ModelInfo) => {
+                let model = self.effective_model().to_string();
+                if self.provider.backend == crate::provider::ProviderBackend::Ollama {
+                    if let Some(info) = crate::provider::fetch_model_info_from_ollama(
+                        &self.config.runtime.provider_url,
+                        &model,
+                    ) {
+                        CliTurnOutput {
+                            frames: vec![render::render_model_info_frame(
+                                &model,
+                                &info,
+                                self.effective_context_window(),
+                            )],
+                            control: SessionControl::Continue,
+                        }
+                    } else {
+                        CliTurnOutput {
+                            frames: vec![render::render_model_frame(
+                                &model,
+                                &self.config.runtime.provider,
+                                self.effective_context_window(),
+                            )],
+                            control: SessionControl::Continue,
+                        }
+                    }
+                } else {
+                    CliTurnOutput {
+                        frames: vec![render::render_model_frame(
+                            &model,
+                            &self.config.runtime.provider,
+                            self.effective_context_window(),
+                        )],
+                        control: SessionControl::Continue,
+                    }
+                }
+            }
+            Some(SlashCommandAction::ModelList) => {
+                if self.provider.backend == crate::provider::ProviderBackend::Ollama {
+                    if let Some(models) = crate::provider::fetch_model_list_from_ollama(
+                        &self.config.runtime.provider_url,
+                    ) {
+                        let model = self.effective_model().to_string();
+                        CliTurnOutput {
+                            frames: vec![render::render_model_list_frame(&models, &model)],
+                            control: SessionControl::Continue,
+                        }
+                    } else {
+                        CliTurnOutput {
+                            frames: vec![
+                                "[A] anvil > failed to fetch model list from Ollama".to_string(),
+                            ],
+                            control: SessionControl::Continue,
+                        }
+                    }
+                } else {
+                    CliTurnOutput {
+                        frames: vec![
+                            "[A] anvil > model list is only available for Ollama provider"
+                                .to_string(),
+                        ],
+                        control: SessionControl::Continue,
+                    }
+                }
+            }
+            Some(SlashCommandAction::ModelSwitch(name)) => self.switch_model(&name),
             Some(SlashCommandAction::Provider) => CliTurnOutput {
-                frames: vec![render::render_provider_frame(&self.config, &self.provider)],
+                frames: vec![render::render_provider_frame(
+                    self.effective_model(),
+                    &self.config,
+                    &self.provider,
+                )],
                 control: SessionControl::Continue,
             },
             Some(SlashCommandAction::Approve) => CliTurnOutput {
@@ -1623,13 +1768,53 @@ impl App {
         Ok(lines.join("\n"))
     }
 
+    /// Apply a model switch: validate the model and update active overrides.
+    fn apply_model_switch(&mut self, model_name: &str) -> Result<u32, String> {
+        if self.provider.backend == crate::provider::ProviderBackend::Ollama {
+            match crate::provider::fetch_model_info_from_ollama(
+                &self.config.runtime.provider_url,
+                model_name,
+            ) {
+                Some(info) => {
+                    self.active_model = Some(model_name.to_string());
+                    if let Some(ctx) = info.context_length {
+                        self.active_context_window = Some(ctx);
+                    }
+                    Ok(self.effective_context_window())
+                }
+                None => Err(format!(
+                    "model '{}' not found. Use /model list to see available models.",
+                    model_name
+                )),
+            }
+        } else {
+            // OpenAI-compatible: set model name only (no API validation)
+            self.active_model = Some(model_name.to_string());
+            Ok(self.effective_context_window())
+        }
+    }
+
+    /// Handle /model switch command dispatch.
+    fn switch_model(&mut self, model_name: &str) -> CliTurnOutput {
+        match self.apply_model_switch(model_name) {
+            Ok(ctx_window) => CliTurnOutput {
+                frames: vec![render::render_model_switch_success(model_name, ctx_window)],
+                control: SessionControl::Continue,
+            },
+            Err(msg) => CliTurnOutput {
+                frames: vec![format!("[A] anvil > {}", msg)],
+                control: SessionControl::Continue,
+            },
+        }
+    }
+
     fn compact_session_history(&mut self) -> Result<String, AppError> {
         let changed = self.compact_with_hooks("manual");
         if changed {
             self.persist_session(AppEvent::SessionSaved)?;
             let usage = ContextUsageView {
                 estimated_tokens: self.session.estimated_token_count(),
-                max_tokens: self.config.runtime.context_window,
+                max_tokens: self.effective_context_window(),
             };
             self.warning_tracker.reset_if_below_threshold(&usage);
             Ok("[A] anvil > compacted older session history".to_string())

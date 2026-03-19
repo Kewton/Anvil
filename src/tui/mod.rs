@@ -23,7 +23,13 @@ impl Tui {
         Self
     }
 
-    pub fn render_startup(&self, config: &EffectiveConfig, snapshot: &AppStateSnapshot) -> String {
+    pub fn render_startup(
+        &self,
+        config: &EffectiveConfig,
+        snapshot: &AppStateSnapshot,
+        effective_model: &str,
+        effective_context_window: u32,
+    ) -> String {
         let mode = if !config.mode.approval_required {
             "local / auto"
         } else if config.mode.trust_all {
@@ -41,8 +47,8 @@ impl Tui {
             String::new(),
             "  local coding agent for serious terminal work".to_string(),
             String::new(),
-            format!("  Model   : {}", config.runtime.model),
-            format!("  Context : {}k", config.runtime.context_window / 1_000),
+            format!("  Model   : {}", effective_model),
+            format!("  Context : {}k", effective_context_window / 1_000),
             format!("  Mode    : {mode}"),
             format!("  Project : {}", config.paths.cwd.display()),
         ];

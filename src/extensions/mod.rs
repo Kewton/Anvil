@@ -27,7 +27,9 @@ pub enum SlashCommandAction {
     RepoFind(String),
     Timeline,
     Compact,
-    Model,
+    ModelList,
+    ModelSwitch(String),
+    ModelInfo,
     Provider,
     Approve,
     Deny,
@@ -159,6 +161,9 @@ impl ExtensionRegistry {
         if let Some(parsed) = parse_session_command(command) {
             return Some(parsed);
         }
+        if let Some(parsed) = parse_model_command(command) {
+            return Some(parsed);
+        }
         if let Some(parsed) = parse_trust_command(command) {
             return Some(parsed);
         }
@@ -253,8 +258,8 @@ pub fn builtin_slash_commands() -> Vec<SlashCommandSpec> {
         },
         SlashCommandSpec {
             name: "/model".to_string(),
-            description: "show the current model context".to_string(),
-            action: SlashCommandAction::Model,
+            description: "model management (list/switch/info)".to_string(),
+            action: SlashCommandAction::ModelInfo,
             scope: None,
         },
         SlashCommandSpec {
@@ -455,6 +460,51 @@ fn parse_repo_command(command: &str) -> Option<SlashCommandSpec> {
         name: "/repo-find".to_string(),
         description: "search the repo by path and content".to_string(),
         action: SlashCommandAction::RepoFind(query.to_string()),
+        scope: None,
+    })
+}
+
+fn is_valid_model_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 128 {
+        return false;
+    }
+    // '/' is not allowed (path traversal '../' prevention)
+    name.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == ':' || c == '.')
+}
+
+fn parse_model_command(command: &str) -> Option<SlashCommandSpec> {
+    let trimmed = command.trim();
+    if !trimmed.starts_with("/model") {
+        return None;
+    }
+    let rest = trimmed.strip_prefix("/model")?.trim();
+
+    let action = if rest.is_empty() {
+        SlashCommandAction::ModelInfo // /model (no args) = info
+    } else if rest == "list" {
+        SlashCommandAction::ModelList
+    } else if rest == "info" {
+        SlashCommandAction::ModelInfo
+    } else if let Some(name) = rest.strip_prefix("switch ") {
+        let name = name.trim();
+        if name.is_empty() {
+            return None;
+        }
+        if !is_valid_model_name(name) {
+            return None;
+        }
+        SlashCommandAction::ModelSwitch(name.to_string())
+    } else if rest == "switch" {
+        return None; // /model switch without arg → None
+    } else {
+        return None;
+    };
+
+    Some(SlashCommandSpec {
+        name: trimmed.to_string(),
+        description: String::new(),
+        action,
         scope: None,
     })
 }

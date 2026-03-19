@@ -65,14 +65,15 @@ pub fn render_plan_frame(snapshot: &AppStateSnapshot) -> String {
     lines.join("\n")
 }
 
-pub fn render_model_frame(config: &EffectiveConfig) -> String {
+pub fn render_model_frame(effective_model: &str, provider: &str, context_window: u32) -> String {
     format!(
         "[A] anvil > current model: {}\n  provider: {}\n  context window: {}",
-        config.runtime.model, config.runtime.provider, config.runtime.context_window
+        effective_model, provider, context_window
     )
 }
 
 pub fn render_provider_frame(
+    effective_model: &str,
     config: &EffectiveConfig,
     provider: &crate::provider::ProviderRuntimeContext,
 ) -> String {
@@ -80,19 +81,70 @@ pub fn render_provider_frame(
         "[A] anvil > provider: {}\n  url: {}\n  model: {}\n  streaming: {}\n  tool-calling: {}",
         config.runtime.provider,
         config.runtime.provider_url,
-        config.runtime.model,
+        effective_model,
         provider.capabilities.streaming,
         provider.capabilities.tool_calling
     )
 }
 
-pub fn render_resume_header(config: &EffectiveConfig, session_name: &str) -> String {
+/// Render the model list from Ollama.
+pub fn render_model_list_frame(
+    models: &[crate::provider::OllamaModelEntry],
+    current_model: &str,
+) -> String {
+    let mut lines = vec![format!("[A] anvil > {} model(s) available", models.len())];
+    for entry in models {
+        let marker = if entry.name == current_model {
+            " *"
+        } else {
+            ""
+        };
+        let size_mb = entry.size / 1_048_576;
+        lines.push(format!("  {}{} ({}MB)", entry.name, marker, size_mb));
+    }
+    lines.join("\n")
+}
+
+/// Render detailed model information from Ollama.
+pub fn render_model_info_frame(
+    model: &str,
+    info: &crate::provider::OllamaModelInfo,
+    context_window: u32,
+) -> String {
+    let mut lines = vec![format!("[A] anvil > model info: {model}")];
+    if let Some(ref param_size) = info.parameter_size {
+        lines.push(format!("  parameters: {param_size}"));
+    }
+    if let Some(ref quant) = info.quantization_level {
+        lines.push(format!("  quantization: {quant}"));
+    }
+    if let Some(ctx) = info.context_length {
+        lines.push(format!("  context length: {ctx}"));
+    }
+    lines.push(format!("  effective context window: {context_window}"));
+    lines.join("\n")
+}
+
+/// Render a successful model switch message.
+pub fn render_model_switch_success(model_name: &str, context_window: u32) -> String {
+    format!(
+        "[A] anvil > switched to model: {} (context window: {})\n  note: this change is for the current session only",
+        model_name, context_window
+    )
+}
+
+pub fn render_resume_header(
+    effective_model: &str,
+    effective_context_window: u32,
+    config: &EffectiveConfig,
+    session_name: &str,
+) -> String {
     let mut lines = vec![
         "  --------------------------------------------------------------".to_string(),
         "  Resuming existing session".to_string(),
         format!("  Session : {session_name}"),
-        format!("  Model   : {}", config.runtime.model),
-        format!("  Context : {}k", config.runtime.context_window / 1_000),
+        format!("  Model   : {}", effective_model),
+        format!("  Context : {}k", effective_context_window / 1_000),
         format!("  Project : {}", config.paths.cwd.display()),
     ];
 

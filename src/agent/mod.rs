@@ -3,7 +3,11 @@
 //! Defines the [`AgentEvent`] lifecycle and the [`BasicAgentLoop`] that
 //! bridges provider responses into structured tool calls.
 
+pub mod model_classifier;
 pub mod subagent;
+pub mod tag_spec;
+
+pub use model_classifier::ToolProtocolMode;
 
 use crate::contracts::InferencePerformanceView;
 use crate::contracts::tokens::{ContentKind, estimate_tokens};
@@ -197,7 +201,7 @@ impl BasicAgentLoop {
 
         for message in session.messages.iter().rev() {
             let kind = ContentKind::from_message_role(message.role);
-            let estimated = estimate_tokens(&message.content, kind);
+            let estimated = estimate_tokens(message.effective_content(), kind);
             if !selected.is_empty() && used_tokens + estimated > budget_for_messages {
                 break;
             }
@@ -402,7 +406,7 @@ fn to_provider_message_with_images(
         MessageRole::Assistant => ProviderMessageRole::Assistant,
         MessageRole::Tool => ProviderMessageRole::Tool,
     };
-    let mut msg = ProviderMessage::new(role, message.content.clone());
+    let mut msg = ProviderMessage::new(role, message.effective_content().to_string());
     if let Some(ref paths) = message.image_paths
         && let Some(root) = sandbox_root
     {
@@ -468,10 +472,12 @@ pub fn tool_protocol_system_prompt(
         "{\"id\":\"call_007\",\"tool\":\"file.edit\",\"path\":\"./relative/path\",\"old_string\":\"text to find\",\"new_string\":\"replacement text\"}\n",
         "```\n",
         "\n",
-        "4. file.search — search for files by name or content:\n",
+        "4. file.search — search for files by name or content (supports regex and context lines):\n",
         "```ANVIL_TOOL\n",
         "{\"id\":\"call_003\",\"tool\":\"file.search\",\"root\":\".\",\"pattern\":\"search term\"}\n",
         "```\n",
+        "   Optional: \"regex\":true to use regex pattern, \"context_lines\":N (max 10) to show surrounding lines.\n",
+        "   Example: {\"id\":\"call_010\",\"tool\":\"file.search\",\"root\":\".\",\"pattern\":\"fn\\\\s+main\",\"regex\":true,\"context_lines\":3}\n",
         "\n",
         "5. shell.exec — run a shell command and capture its output:\n",
         "```ANVIL_TOOL\n",
