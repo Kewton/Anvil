@@ -390,11 +390,15 @@ pub fn classify_http_error(status_code: u16, body: &str) -> ProviderTurnError {
 
 /// Classify a curl exit code into a typed [`ProviderTurnError`].
 ///
+/// - exit 6  → `DnsFailure`
+/// - exit 7  → `ConnectionRefused`
 /// - exit 28 → `Timeout`
-/// - other   → `Network` (includes DNS failure (6), connection refused (7), etc.)
+/// - other   → `Network`
 pub fn classify_curl_error(exit_code: i32, stderr: &str) -> ProviderTurnError {
     let sanitized_stderr = sanitize_error_message(stderr);
     match exit_code {
+        6 => ProviderTurnError::DnsFailure(sanitized_stderr),
+        7 => ProviderTurnError::ConnectionRefused(sanitized_stderr),
         28 => ProviderTurnError::Timeout(sanitized_stderr),
         _ => ProviderTurnError::Network(sanitized_stderr),
     }

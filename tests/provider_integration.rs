@@ -2071,15 +2071,15 @@ fn classify_curl_error_exit_28_returns_timeout() {
 }
 
 #[test]
-fn classify_curl_error_exit_7_returns_network() {
+fn classify_curl_error_exit_7_returns_connection_refused() {
     let err = classify_curl_error(7, "failed to connect");
-    assert!(matches!(err, ProviderTurnError::Network(_)));
+    assert!(matches!(err, ProviderTurnError::ConnectionRefused(_)));
 }
 
 #[test]
-fn classify_curl_error_exit_6_returns_network() {
+fn classify_curl_error_exit_6_returns_dns_failure() {
     let err = classify_curl_error(6, "could not resolve host");
-    assert!(matches!(err, ProviderTurnError::Network(_)));
+    assert!(matches!(err, ProviderTurnError::DnsFailure(_)));
 }
 
 #[test]
@@ -2164,9 +2164,15 @@ fn classify_curl_error_timeout_is_retryable() {
 }
 
 #[test]
-fn classify_curl_error_network_is_retryable() {
+fn classify_curl_error_connection_refused_is_not_retryable() {
     let err = classify_curl_error(7, "connection refused");
-    assert!(err.is_retryable());
+    assert!(!err.is_retryable());
+}
+
+#[test]
+fn classify_curl_error_dns_failure_is_not_retryable() {
+    let err = classify_curl_error(6, "dns failure");
+    assert!(!err.is_retryable());
 }
 
 // ---------------------------------------------------------------------------
@@ -2405,7 +2411,7 @@ fn ollama_health_check_success() {
 
 #[test]
 fn ollama_health_check_failure() {
-    /// Mock transport that always fails with a network error.
+    /// Mock transport that always fails with a connection refused error.
     #[derive(Clone)]
     struct FailingTransport;
 
@@ -2416,7 +2422,9 @@ fn ollama_health_check_failure() {
             _body: &[u8],
             _headers: &[(&str, &str)],
         ) -> Result<HttpResponse, ProviderTurnError> {
-            Err(ProviderTurnError::Network("connection refused".into()))
+            Err(ProviderTurnError::ConnectionRefused(
+                "connection refused".into(),
+            ))
         }
 
         fn get_with_headers(
@@ -2424,16 +2432,17 @@ fn ollama_health_check_failure() {
             _url: &str,
             _headers: &[(&str, &str)],
         ) -> Result<HttpResponse, ProviderTurnError> {
-            Err(ProviderTurnError::Network("connection refused".into()))
+            Err(ProviderTurnError::ConnectionRefused(
+                "connection refused".into(),
+            ))
         }
     }
 
     let client = OllamaProviderClient::with_transport("http://localhost:11434", FailingTransport);
     let result = client.health_check();
     assert!(result.is_err());
-    let err_msg = result.unwrap_err();
-    assert!(err_msg.contains("Ollamaに接続できません"));
-    assert!(err_msg.contains("localhost:11434"));
+    let err = result.unwrap_err();
+    assert!(matches!(err, ProviderTurnError::ConnectionRefused(_)));
 }
 
 #[test]
@@ -2473,18 +2482,22 @@ fn openai_health_check_success_with_auth() {
 }
 
 #[test]
-fn openai_health_check_failure_with_auth_guidance() {
+fn openai_health_check_failure_with_auth_returns_authentication_failed() {
+    /// Mock transport that returns HTTP 401 for GET requests.
     #[derive(Clone)]
-    struct FailingTransport;
+    struct AuthFailTransport;
 
-    impl HttpTransport for FailingTransport {
+    impl HttpTransport for AuthFailTransport {
         fn post_json_with_headers(
             &self,
             _url: &str,
             _body: &[u8],
             _headers: &[(&str, &str)],
         ) -> Result<HttpResponse, ProviderTurnError> {
-            Err(ProviderTurnError::Network("connection refused".into()))
+            Ok(HttpResponse {
+                status_code: 401,
+                body: b"unauthorized".to_vec(),
+            })
         }
 
         fn get_with_headers(
@@ -2492,25 +2505,30 @@ fn openai_health_check_failure_with_auth_guidance() {
             _url: &str,
             _headers: &[(&str, &str)],
         ) -> Result<HttpResponse, ProviderTurnError> {
-            Err(ProviderTurnError::ClientError {
+            Ok(HttpResponse {
                 status_code: 401,
-                message: "unauthorized".into(),
+                body: b"unauthorized".to_vec(),
             })
         }
     }
 
     let client =
-        OpenAiCompatibleProviderClient::with_transport("http://localhost:8080", FailingTransport)
+        OpenAiCompatibleProviderClient::with_transport("http://localhost:8080", AuthFailTransport)
             .with_api_key("bad-key");
     let result = client.health_check();
     assert!(result.is_err());
-    let err_msg = result.unwrap_err();
-    assert!(err_msg.contains("OpenAI互換プロバイダーに接続できません"));
-    assert!(err_msg.contains("認証情報の形式を確認してください"));
+    let err = result.unwrap_err();
+    assert!(matches!(
+        err,
+        ProviderTurnError::AuthenticationFailed {
+            status_code: 401,
+            ..
+        }
+    ));
 }
 
 #[test]
-fn openai_health_check_no_auth_no_guidance() {
+fn openai_health_check_no_auth_returns_transport_error() {
     #[derive(Clone)]
     struct FailingTransport;
 
@@ -2521,7 +2539,7 @@ fn openai_health_check_no_auth_no_guidance() {
             _body: &[u8],
             _headers: &[(&str, &str)],
         ) -> Result<HttpResponse, ProviderTurnError> {
-            Err(ProviderTurnError::Network("refused".into()))
+            Err(ProviderTurnError::ConnectionRefused("refused".into()))
         }
 
         fn get_with_headers(
@@ -2529,7 +2547,7 @@ fn openai_health_check_no_auth_no_guidance() {
             _url: &str,
             _headers: &[(&str, &str)],
         ) -> Result<HttpResponse, ProviderTurnError> {
-            Err(ProviderTurnError::Network("refused".into()))
+            Err(ProviderTurnError::ConnectionRefused("refused".into()))
         }
     }
 
@@ -2537,10 +2555,99 @@ fn openai_health_check_no_auth_no_guidance() {
         OpenAiCompatibleProviderClient::with_transport("http://localhost:8080", FailingTransport);
     let result = client.health_check();
     assert!(result.is_err());
-    let err_msg = result.unwrap_err();
-    assert!(err_msg.contains("OpenAI互換プロバイダーに接続できません"));
-    // No auth guidance when no api_key is set
-    assert!(!err_msg.contains("認証情報の形式を確認してください"));
+    let err = result.unwrap_err();
+    assert!(matches!(err, ProviderTurnError::ConnectionRefused(_)));
+}
+
+#[test]
+fn openai_health_check_403_returns_authentication_failed() {
+    #[derive(Clone)]
+    struct ForbiddenTransport;
+
+    impl HttpTransport for ForbiddenTransport {
+        fn post_json_with_headers(
+            &self,
+            _url: &str,
+            _body: &[u8],
+            _headers: &[(&str, &str)],
+        ) -> Result<HttpResponse, ProviderTurnError> {
+            Ok(HttpResponse {
+                status_code: 403,
+                body: b"forbidden".to_vec(),
+            })
+        }
+
+        fn get_with_headers(
+            &self,
+            _url: &str,
+            _headers: &[(&str, &str)],
+        ) -> Result<HttpResponse, ProviderTurnError> {
+            Ok(HttpResponse {
+                status_code: 403,
+                body: b"forbidden".to_vec(),
+            })
+        }
+    }
+
+    let client =
+        OpenAiCompatibleProviderClient::with_transport("http://localhost:8080", ForbiddenTransport)
+            .with_api_key("some-key");
+    let result = client.health_check();
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(matches!(
+        err,
+        ProviderTurnError::AuthenticationFailed {
+            status_code: 403,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn openai_health_check_500_returns_server_error() {
+    #[derive(Clone)]
+    struct ServerErrorTransport;
+
+    impl HttpTransport for ServerErrorTransport {
+        fn post_json_with_headers(
+            &self,
+            _url: &str,
+            _body: &[u8],
+            _headers: &[(&str, &str)],
+        ) -> Result<HttpResponse, ProviderTurnError> {
+            Ok(HttpResponse {
+                status_code: 500,
+                body: b"internal server error".to_vec(),
+            })
+        }
+
+        fn get_with_headers(
+            &self,
+            _url: &str,
+            _headers: &[(&str, &str)],
+        ) -> Result<HttpResponse, ProviderTurnError> {
+            Ok(HttpResponse {
+                status_code: 500,
+                body: b"internal server error".to_vec(),
+            })
+        }
+    }
+
+    let client = OpenAiCompatibleProviderClient::with_transport(
+        "http://localhost:8080",
+        ServerErrorTransport,
+    );
+    let result = client.health_check();
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(matches!(
+        err,
+        ProviderTurnError::ServerError {
+            status_code: 500,
+            ..
+        }
+    ));
 }
 
 // -----------------------------------------------------------------------
@@ -2591,4 +2698,247 @@ fn ollama_build_chat_request_maps_provider_images() {
         first.images.as_ref().unwrap(),
         &vec!["dGVzdA==".to_string()]
     );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 7: New error variant tests (Issue #64)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn connection_refused_display_contains_message() {
+    let err = ProviderTurnError::ConnectionRefused("Failed to connect".into());
+    let display = err.to_string();
+    assert!(display.contains("connection refused"));
+    assert!(display.contains("Failed to connect"));
+}
+
+#[test]
+fn dns_failure_display_contains_message() {
+    let err = ProviderTurnError::DnsFailure("Could not resolve host".into());
+    let display = err.to_string();
+    assert!(display.contains("DNS resolution failed"));
+    assert!(display.contains("Could not resolve host"));
+}
+
+#[test]
+fn model_not_found_display_contains_model_name() {
+    let err = ProviderTurnError::ModelNotFound {
+        model: "llama3:8b".into(),
+        message: "not found".into(),
+    };
+    let display = err.to_string();
+    assert!(display.contains("llama3:8b"));
+    assert!(display.contains("not found"));
+}
+
+#[test]
+fn authentication_failed_display_contains_status() {
+    let err = ProviderTurnError::AuthenticationFailed {
+        status_code: 401,
+        message: "unauthorized".into(),
+    };
+    let display = err.to_string();
+    assert!(display.contains("authentication failed"));
+    assert!(display.contains("401"));
+}
+
+#[test]
+fn connection_refused_is_not_retryable() {
+    let err = ProviderTurnError::ConnectionRefused("refused".into());
+    assert!(!err.is_retryable());
+}
+
+#[test]
+fn dns_failure_is_not_retryable() {
+    let err = ProviderTurnError::DnsFailure("dns fail".into());
+    assert!(!err.is_retryable());
+}
+
+#[test]
+fn model_not_found_is_not_retryable() {
+    let err = ProviderTurnError::ModelNotFound {
+        model: "x".into(),
+        message: "not found".into(),
+    };
+    assert!(!err.is_retryable());
+}
+
+#[test]
+fn authentication_failed_is_not_retryable() {
+    let err = ProviderTurnError::AuthenticationFailed {
+        status_code: 401,
+        message: "unauthorized".into(),
+    };
+    assert!(!err.is_retryable());
+}
+
+#[test]
+fn connection_refused_from_converts_to_provider_error_kind() {
+    let err = ProviderTurnError::ConnectionRefused("refused".into());
+    let kind = ProviderErrorKind::from(&err);
+    assert_eq!(kind, ProviderErrorKind::ConnectionRefused);
+}
+
+#[test]
+fn dns_failure_from_converts_to_provider_error_kind() {
+    let err = ProviderTurnError::DnsFailure("dns".into());
+    let kind = ProviderErrorKind::from(&err);
+    assert_eq!(kind, ProviderErrorKind::DnsFailure);
+}
+
+#[test]
+fn model_not_found_from_converts_to_provider_error_kind() {
+    let err = ProviderTurnError::ModelNotFound {
+        model: "x".into(),
+        message: "not found".into(),
+    };
+    let kind = ProviderErrorKind::from(&err);
+    assert_eq!(kind, ProviderErrorKind::ModelNotFound);
+}
+
+#[test]
+fn authentication_failed_from_converts_to_provider_error_kind() {
+    let err = ProviderTurnError::AuthenticationFailed {
+        status_code: 403,
+        message: "forbidden".into(),
+    };
+    let kind = ProviderErrorKind::from(&err);
+    assert_eq!(kind, ProviderErrorKind::AuthenticationFailed);
+}
+
+#[test]
+fn display_redacts_secrets_in_connection_refused() {
+    let err =
+        ProviderTurnError::ConnectionRefused("Authorization: Bearer sk-secret-key-123".into());
+    let display = err.to_string();
+    assert!(display.contains("[REDACTED]"));
+    assert!(!display.contains("sk-secret-key-123"));
+}
+
+#[test]
+fn display_redacts_secrets_in_authentication_failed() {
+    let err = ProviderTurnError::AuthenticationFailed {
+        status_code: 401,
+        message: "Bearer my-secret-token was rejected".into(),
+    };
+    let display = err.to_string();
+    assert!(display.contains("[REDACTED]"));
+    assert!(!display.contains("my-secret-token"));
+}
+
+#[test]
+fn provider_error_kind_serde_roundtrip_new_variants() {
+    let variants = vec![
+        ProviderErrorKind::ConnectionRefused,
+        ProviderErrorKind::DnsFailure,
+        ProviderErrorKind::ModelNotFound,
+        ProviderErrorKind::AuthenticationFailed,
+    ];
+    for variant in variants {
+        let json = serde_json::to_string(&variant).unwrap();
+        let deserialized: ProviderErrorKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(variant, deserialized);
+    }
+}
+
+#[test]
+fn provider_error_kind_unknown_fallback() {
+    let json = r#""SomeNewFutureVariant""#;
+    let deserialized: ProviderErrorKind = serde_json::from_str(json).unwrap();
+    assert_eq!(deserialized, ProviderErrorKind::Unknown);
+}
+
+#[test]
+fn retry_transport_no_retry_on_connection_refused() {
+    let mock = RetryMockTransport::new(10, ProviderTurnError::ConnectionRefused("refused".into()));
+    let call_count = mock.call_count.clone();
+    let transport = RetryTransport::with_config(mock, fast_retry_config(3));
+
+    let result = transport.post_json_with_headers("http://test", b"body", &[]);
+    assert!(result.is_err());
+    assert_eq!(
+        *call_count.borrow(),
+        1,
+        "ConnectionRefused should not retry"
+    );
+}
+
+#[test]
+fn retry_transport_no_retry_on_dns_failure() {
+    let mock = RetryMockTransport::new(10, ProviderTurnError::DnsFailure("dns fail".into()));
+    let call_count = mock.call_count.clone();
+    let transport = RetryTransport::with_config(mock, fast_retry_config(3));
+
+    let result = transport.get_with_headers("http://test", &[]);
+    assert!(result.is_err());
+    assert_eq!(*call_count.borrow(), 1, "DnsFailure should not retry");
+}
+
+#[test]
+fn retry_transport_no_retry_on_authentication_failed() {
+    let mock = RetryMockTransport::new(
+        10,
+        ProviderTurnError::AuthenticationFailed {
+            status_code: 401,
+            message: "unauthorized".into(),
+        },
+    );
+    let call_count = mock.call_count.clone();
+    let transport = RetryTransport::with_config(mock, fast_retry_config(3));
+
+    let result = transport.post_json_with_headers("http://test", b"body", &[]);
+    assert!(result.is_err());
+    assert_eq!(
+        *call_count.borrow(),
+        1,
+        "AuthenticationFailed should not retry"
+    );
+}
+
+#[test]
+fn error_guidance_connection_refused() {
+    let err =
+        anvil::app::AppError::ProviderTurn(ProviderTurnError::ConnectionRefused("refused".into()));
+    let guidance = anvil::app::error_guidance(&err);
+    assert!(guidance.contains("Connection refused"));
+    assert!(guidance.contains("ollama serve"));
+}
+
+#[test]
+fn error_guidance_dns_failure() {
+    let err = anvil::app::AppError::ProviderTurn(ProviderTurnError::DnsFailure("dns fail".into()));
+    let guidance = anvil::app::error_guidance(&err);
+    assert!(guidance.contains("DNS resolution failed"));
+    assert!(guidance.contains("typos"));
+}
+
+#[test]
+fn error_guidance_model_not_found() {
+    let err = anvil::app::AppError::ProviderTurn(ProviderTurnError::ModelNotFound {
+        model: "llama3:8b".into(),
+        message: "not found".into(),
+    });
+    let guidance = anvil::app::error_guidance(&err);
+    assert!(guidance.contains("llama3:8b"));
+    assert!(guidance.contains("ollama pull"));
+}
+
+#[test]
+fn error_guidance_authentication_failed() {
+    let err = anvil::app::AppError::ProviderTurn(ProviderTurnError::AuthenticationFailed {
+        status_code: 401,
+        message: "unauthorized".into(),
+    });
+    let guidance = anvil::app::error_guidance(&err);
+    assert!(guidance.contains("Authentication failed"));
+    assert!(guidance.contains("ANVIL_API_KEY"));
+    assert!(guidance.contains("Never share your API key"));
+}
+
+#[test]
+fn error_guidance_timeout() {
+    let err = anvil::app::AppError::ProviderTurn(ProviderTurnError::Timeout("timed out".into()));
+    let guidance = anvil::app::error_guidance(&err);
+    assert!(guidance.contains("timed out"));
+    assert!(guidance.contains("smaller model"));
 }

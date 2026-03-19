@@ -3,11 +3,18 @@
 //! Implements the [`ProviderClient`] trait for the Ollama local inference
 //! server via its `/api/chat` endpoint.
 
-use super::transport::{CurlHttpTransport, HttpTransport, RetryTransport};
+use super::transport::{CurlHttpTransport, HttpTransport, RetryTransport, sanitize_error_message};
 use super::{
     AgentEvent, ProviderClient, ProviderEvent, ProviderMessageRole, ProviderTurnError,
     ProviderTurnRequest,
 };
+
+/// Patterns in Ollama error messages that indicate a model is not found.
+///
+/// Ollama error response examples (v0.5.x verified):
+/// {"error":"model 'nonexistent' not found, try pulling it first"}
+/// {"error":"no such model 'invalid-name'"}
+const MODEL_NOT_FOUND_PATTERNS: &[&str] = &["not found", "no such model"];
 use crate::config::EffectiveConfig;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -166,12 +173,9 @@ impl<T: HttpTransport> OllamaProviderClient<T> {
     /// Returns `Ok(())` if the server responds, or an error message string
     /// on failure.  The health check uses the client's configured transport
     /// (which includes [`RetryTransport`] for automatic retry).
-    pub fn health_check(&self) -> Result<(), String> {
+    pub fn health_check(&self) -> Result<(), ProviderTurnError> {
         let url = format!("{}/api/tags", self.base_url.trim_end_matches('/'));
-        match self.transport.get(&url) {
-            Ok(_) => Ok(()),
-            Err(e) => Err(format!("Ollamaに接続できません ({}): {}", self.base_url, e)),
-        }
+        self.transport.get(&url).map(|_| ())
     }
 }
 
@@ -229,7 +233,15 @@ impl<T: HttpTransport> ProviderClient for OllamaProviderClient<T> {
                         if let Ok(value) = serde_json::from_str::<serde_json::Value>(line)
                             && let Some(error) = value.get("error").and_then(|v| v.as_str())
                         {
-                            had_error = Some(ProviderTurnError::Backend(error.to_string()));
+                            if MODEL_NOT_FOUND_PATTERNS.iter().any(|p| error.contains(p)) {
+                                let model = resolved_request.model.clone();
+                                had_error = Some(ProviderTurnError::ModelNotFound {
+                                    model,
+                                    message: sanitize_error_message(error),
+                                });
+                            } else {
+                                had_error = Some(ProviderTurnError::Backend(error.to_string()));
+                            }
                             return;
                         }
                         had_error = Some(ProviderTurnError::Backend(format!(

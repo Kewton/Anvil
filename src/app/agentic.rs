@@ -378,6 +378,14 @@ impl App {
                 {
                     break;
                 }
+                Err(
+                    ref err @ crate::provider::ProviderTurnError::ConnectionRefused(_)
+                    | ref err @ crate::provider::ProviderTurnError::DnsFailure(_)
+                    | ref err @ crate::provider::ProviderTurnError::AuthenticationFailed { .. }
+                    | ref err @ crate::provider::ProviderTurnError::ModelNotFound { .. },
+                ) => {
+                    return Err(AppError::ProviderTurn(err.clone()));
+                }
                 other => {
                     other.map_err(|err| match err {
                         crate::provider::ProviderTurnError::Cancelled => {

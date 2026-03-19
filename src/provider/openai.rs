@@ -3,7 +3,7 @@
 //! Works with the standard `/v1/chat/completions` endpoint used by
 //! OpenAI, Azure OpenAI, LM Studio, and other compatible servers.
 
-use super::transport::{CurlHttpTransport, HttpTransport, RetryTransport};
+use super::transport::{CurlHttpTransport, HttpTransport, RetryTransport, sanitize_error_message};
 use super::{
     AgentEvent, ImageContent, ProviderClient, ProviderEvent, ProviderTurnError, ProviderTurnRequest,
 };
@@ -147,7 +147,7 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
     /// If an API key is configured, it is sent as an `Authorization` header
     /// (without `Bearer` prefix, matching the existing code pattern in
     /// `send_chat_request`).
-    pub fn health_check(&self) -> Result<(), String> {
+    pub fn health_check(&self) -> Result<(), ProviderTurnError> {
         let url = format!("{}/v1/models", self.base_url.trim_end_matches('/'));
         let headers: Vec<(&str, &str)> = self
             .api_key
@@ -155,18 +155,27 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
             .map(|key| vec![("Authorization", key)])
             .unwrap_or_default();
         match self.transport.get_with_headers(&url, &headers) {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                let guidance = if self.api_key.is_some() {
-                    " (認証情報の形式を確認してください。'Bearer <api-key>' 形式が必要な場合があります)"
-                } else {
-                    ""
-                };
-                Err(format!(
-                    "OpenAI互換プロバイダーに接続できません ({}): {}{}",
-                    self.base_url, e, guidance
-                ))
+            Ok(response) => {
+                let status_code = response.status_code;
+                match status_code {
+                    401 | 403 => Err(ProviderTurnError::AuthenticationFailed {
+                        status_code,
+                        message: sanitize_error_message(&format!(
+                            "HTTP {} from {}",
+                            status_code, self.base_url
+                        )),
+                    }),
+                    s if s >= 500 => Err(ProviderTurnError::ServerError {
+                        status_code: s,
+                        message: sanitize_error_message(&format!(
+                            "HTTP {} from {}",
+                            s, self.base_url
+                        )),
+                    }),
+                    _ => Ok(()),
+                }
             }
+            Err(e) => Err(e),
         }
     }
 
@@ -209,11 +218,18 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
             .post_json_with_headers(&url, &request_body, &headers)?;
         if response.status_code != 200 {
             let body_text = normalize_openai_error(&response.body);
-            return Err(ProviderTurnError::Backend(format!(
+            let message = sanitize_error_message(&format!(
                 "openai request failed with status {}: {}",
                 response.status_code,
                 body_text.trim()
-            )));
+            ));
+            return Err(match response.status_code {
+                401 | 403 => ProviderTurnError::AuthenticationFailed {
+                    status_code: response.status_code,
+                    message,
+                },
+                _ => ProviderTurnError::Backend(message),
+            });
         }
 
         if request.stream && looks_like_sse_stream(&response.body) {
