@@ -161,11 +161,13 @@ fn pre_compact_event_serializes_correctly() {
         session_id: "session_abc".to_string(),
         trigger: "auto".to_string(),
         message_count: 100,
+        estimated_tokens: 5000,
     };
     let json = serde_json::to_string(&event).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed["trigger"], "auto");
     assert_eq!(parsed["message_count"], 100);
+    assert_eq!(parsed["estimated_tokens"], 5000);
 }
 
 #[test]
@@ -475,6 +477,7 @@ fn hooks_engine_pre_compact_soft_fail() {
         session_id: "session_1".to_string(),
         trigger: "auto".to_string(),
         message_count: 100,
+        estimated_tokens: 5000,
     };
 
     let result = engine.run_pre_compact(event);

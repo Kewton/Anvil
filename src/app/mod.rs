@@ -239,6 +239,37 @@ impl From<crate::state::StateTransitionError> for AppError {
     }
 }
 
+/// Parameters for auto-compaction (token-based and/or message-based).
+struct CompactParams {
+    keep_recent: usize,
+}
+
+/// Compute compaction parameters from session state and context window.
+/// Returns None if neither token-based nor message-based threshold is exceeded.
+fn compute_compact_params(session: &SessionRecord, context_window: u32) -> Option<CompactParams> {
+    let token_triggered = session.should_smart_compact(context_window);
+    let msg_triggered = session.should_compact();
+
+    if !token_triggered && !msg_triggered {
+        return None;
+    }
+
+    let token_based = if token_triggered {
+        let target_tokens = (context_window as f64 * crate::session::TARGET_TOKEN_RATIO) as usize;
+        crate::session::compute_token_based_keep_recent(&session.messages, target_tokens)
+    } else {
+        usize::MAX
+    };
+    let msg_based = if msg_triggered {
+        session.auto_compact_threshold / 2
+    } else {
+        usize::MAX
+    };
+    let keep_recent = std::cmp::min(token_based, msg_based);
+
+    Some(CompactParams { keep_recent })
+}
+
 impl App {
     pub fn new(
         config: EffectiveConfig,
@@ -258,6 +289,7 @@ impl App {
         let home_dir = std::env::var("HOME").ok().map(std::path::PathBuf::from);
         let extensions = ExtensionRegistry::load(&config.paths.cwd, home_dir.as_deref())?;
         session.auto_compact_threshold = config.runtime.auto_compact_threshold;
+        session.smart_compact_threshold_ratio = config.runtime.smart_compact_threshold_ratio;
 
         // --- MCP initialization (Task 3.2) ---
         // [D1-007] shutdown_flag is managed by App side (YAGNI)
@@ -521,12 +553,19 @@ impl App {
     /// Run PreCompact hook + compact_history (DR1-005 wrapper, DR2-003).
     ///
     /// trigger: "auto" or "manual"
-    /// For auto: checks should_compact() first, keep_recent = threshold/2
+    /// For auto: checks both token-based and message-count thresholds
     /// For manual: unconditional, keep_recent = 8
     fn compact_with_hooks(&mut self, trigger: &str) -> bool {
-        if trigger == "auto" && !self.session.should_compact() {
-            return false;
-        }
+        let keep_recent = if trigger == "auto" {
+            let context_window = self.effective_context_window();
+            let params = match compute_compact_params(&self.session, context_window) {
+                Some(p) => p,
+                None => return false,
+            };
+            params.keep_recent
+        } else {
+            8
+        };
 
         // Run PreCompact hook (soft-fail)
         if let Some(ref engine) = self.hooks_engine {
@@ -535,18 +574,25 @@ impl App {
                 session_id: self.session.metadata.session_id.clone(),
                 trigger: trigger.to_string(),
                 message_count: self.session.messages.len(),
+                estimated_tokens: self.session.estimated_token_count(),
             };
             if let Err(err) = engine.run_pre_compact(event) {
                 tracing::warn!("PreCompact hook error: {err}");
             }
         }
 
-        let keep_recent = if trigger == "auto" {
-            self.session.auto_compact_threshold / 2
-        } else {
-            8
-        };
-        self.session.compact_history(keep_recent)
+        let compacted = self.session.compact_history(keep_recent);
+
+        // Reset context warning tracker after successful compaction (auto/manual)
+        if compacted {
+            let usage = ContextUsageView {
+                estimated_tokens: self.session.estimated_token_count(),
+                max_tokens: self.effective_context_window(),
+            };
+            self.warning_tracker.reset_if_below_threshold(&usage);
+        }
+
+        compacted
     }
 
     /// Get a clone of the shutdown flag for injection into sub-components.
@@ -611,6 +657,8 @@ impl App {
         self.session_store = new_store;
         self.session = new_session;
         self.session.auto_compact_threshold = self.config.runtime.auto_compact_threshold;
+        self.session.smart_compact_threshold_ratio =
+            self.config.runtime.smart_compact_threshold_ratio;
         self.state_machine =
             StateMachine::from_snapshot(AppStateSnapshot::new(RuntimeState::Ready));
         self.warning_tracker = ContextWarningTracker::new();
@@ -1870,11 +1918,7 @@ impl App {
         let changed = self.compact_with_hooks("manual");
         if changed {
             self.persist_session(AppEvent::SessionSaved)?;
-            let usage = ContextUsageView {
-                estimated_tokens: self.session.estimated_token_count(),
-                max_tokens: self.effective_context_window(),
-            };
-            self.warning_tracker.reset_if_below_threshold(&usage);
+            // ContextWarningTracker reset is handled by compact_with_hooks()
             Ok("[A] anvil > compacted older session history".to_string())
         } else {
             Ok("[A] anvil > nothing to compact".to_string())

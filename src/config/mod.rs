@@ -66,6 +66,9 @@ pub struct RuntimeConfig {
     /// Tag-based tool protocol mode override.
     /// `Some(true)` = force tag-based, `Some(false)` = force JSON, `None` = auto-detect from model name.
     pub tag_protocol: Option<bool>,
+    /// Smart compact threshold ratio (0.1..=0.95, default 0.75).
+    /// When estimated tokens exceed context_window * ratio, token-based compaction triggers.
+    pub smart_compact_threshold_ratio: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -213,6 +216,7 @@ impl EffectiveConfig {
                 serper_api_key: None,
                 context_window_explicitly_set: false,
                 tag_protocol: None,
+                smart_compact_threshold_ratio: 0.75,
             },
             mode: ModeConfig {
                 prompt_source: PromptSource::Interactive,
@@ -306,6 +310,7 @@ impl EffectiveConfig {
             "ANVIL_LOG",
             "ANVIL_OFFLINE",
             "ANVIL_TAG_PROTOCOL",
+            "ANVIL_SMART_COMPACT_THRESHOLD_RATIO",
         ] {
             if let Ok(value) = std::env::var(key) {
                 map.insert(key.to_string(), value);
@@ -498,6 +503,11 @@ impl EffectiveConfig {
                 "tag_protocol" | "ANVIL_TAG_PROTOCOL" => {
                     self.runtime.tag_protocol = Some(parse_bool(value));
                 }
+                "smart_compact_threshold_ratio" | "ANVIL_SMART_COMPACT_THRESHOLD_RATIO" => {
+                    self.runtime.smart_compact_threshold_ratio = value
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                }
                 _ => {}
             }
         }
@@ -522,7 +532,19 @@ impl EffectiveConfig {
         self.clamp_context_window();
         self.clamp_context_budget();
         self.clamp_agent_iterations();
+        self.clamp_smart_compact_ratio();
         Ok(())
+    }
+
+    /// Clamp smart_compact_threshold_ratio to [0.1, 0.95].
+    /// NaN/Infinity are not handled correctly by clamp(), so check is_finite() first
+    /// and fall back to the default value (0.75) if the value is non-finite.
+    pub fn clamp_smart_compact_ratio(&mut self) {
+        if !self.runtime.smart_compact_threshold_ratio.is_finite() {
+            self.runtime.smart_compact_threshold_ratio = 0.75;
+        }
+        self.runtime.smart_compact_threshold_ratio =
+            self.runtime.smart_compact_threshold_ratio.clamp(0.1, 0.95);
     }
 
     fn check_provider_url(&self) -> Result<(), ConfigError> {
@@ -800,13 +822,6 @@ pub fn sanitize_markers(content: &str) -> (String, bool) {
     (sanitized, found)
 }
 
-/// Wrapper around `session::session_id_for_cwd()` kept for backward compatibility.
-/// Used by `session_key()` for log file naming. May be removed in a future refactor.
-#[allow(dead_code)]
-fn session_key_for_cwd(cwd: &std::path::Path) -> String {
-    crate::session::session_id_for_cwd(cwd)
-}
-
 fn parse_bool(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
@@ -844,6 +859,10 @@ impl std::fmt::Debug for RuntimeConfig {
                 &self.context_window_explicitly_set,
             )
             .field("tag_protocol", &self.tag_protocol)
+            .field(
+                "smart_compact_threshold_ratio",
+                &self.smart_compact_threshold_ratio,
+            )
             .finish()
     }
 }
@@ -919,7 +938,8 @@ fn expand_env_vars(
 }
 
 /// Known prefixes that indicate an API key or token.
-const KNOWN_SECRET_PREFIXES: &[&str] = &["ghp_", "sk-", "xoxb-", "xoxp-", "ghu_", "ghs_"];
+pub(crate) const KNOWN_SECRET_PREFIXES: &[&str] =
+    &["ghp_", "sk-", "xoxb-", "xoxp-", "ghu_", "ghs_"];
 
 /// [D4-008] Check MCP config env fields for plaintext API keys.
 ///

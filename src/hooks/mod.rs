@@ -116,6 +116,7 @@ pub struct PreCompactEvent {
     pub session_id: String,
     pub trigger: String,
     pub message_count: usize,
+    pub estimated_tokens: usize,
 }
 
 /// PostSession event data sent to hook via stdin (DR1-007, DR2-011).

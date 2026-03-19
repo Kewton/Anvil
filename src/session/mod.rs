@@ -105,7 +105,7 @@ pub struct SessionMetadata {
     pub updated_at_ms: u128,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionRecord {
     pub metadata: SessionMetadata,
     #[serde(default)]
@@ -136,6 +136,10 @@ pub struct SessionRecord {
     /// Auto-compaction threshold (configurable, default 64).
     #[serde(skip)]
     pub auto_compact_threshold: usize,
+    /// Smart compact threshold ratio (configurable, default 0.75).
+    /// When estimated tokens exceed context_window * ratio, token-based compaction triggers.
+    #[serde(skip)]
+    pub smart_compact_threshold_ratio: f64,
 }
 
 impl SessionRecord {
@@ -170,6 +174,7 @@ impl SessionRecord {
             dirty: false,
             cached_token_count: std::cell::Cell::new(None),
             auto_compact_threshold: 64,
+            smart_compact_threshold_ratio: 0.75,
         }
     }
 
@@ -194,8 +199,17 @@ impl SessionRecord {
         self.auto_compact_threshold > 0 && self.messages.len() > self.auto_compact_threshold
     }
 
+    /// Token-based compaction check.
+    /// Returns true when estimated tokens exceed context_window * ratio.
+    pub fn should_smart_compact(&self, context_window: u32) -> bool {
+        self.smart_compact_threshold_ratio > 0.0
+            && self.estimated_token_count()
+                > (context_window as f64 * self.smart_compact_threshold_ratio) as usize
+    }
+
     /// Run auto-compaction if message count exceeds the threshold.
     /// Called at turn boundaries (before flush) to avoid per-message overhead.
+    #[deprecated(note = "Use App::compact_with_hooks() instead")]
     pub fn compact_if_needed(&mut self) -> bool {
         if self.auto_compact_threshold > 0 && self.messages.len() > self.auto_compact_threshold {
             self.compact_history(self.auto_compact_threshold / 2)
@@ -332,16 +346,23 @@ impl SessionRecord {
             return false;
         }
 
-        let messages_to_compact = self.messages.len() - keep_recent;
+        let split_at = self.messages.len() - keep_recent;
         tracing::debug!(
-            compacted = messages_to_compact,
+            compacted = split_at,
             kept = keep_recent,
             "compacting session history"
         );
 
-        let split_at = self.messages.len() - keep_recent;
-        let compacted = &self.messages[..split_at];
-        let summary = summarize_messages(compacted);
+        // Step 1: Replace large tool results with summaries
+        replace_tool_results_with_summaries(&mut self.messages[..split_at]);
+
+        // Step 2: Compute importance scores
+        let scores = compute_importance_scores(&self.messages, split_at);
+
+        // Step 3: Generate summary using scores
+        let summary = generate_compact_summary(&self.messages[..split_at], &scores);
+
+        // Step 4: Drain old messages and insert summary
         self.messages.drain(..split_at);
         self.cached_token_count.set(None); // Invalidate cache after drain
         self.messages.insert(
@@ -741,37 +762,199 @@ pub fn validate_session_name(name: &str) -> Result<(), SessionError> {
     Ok(())
 }
 
-fn compact_preview(content: &str, max_chars: usize) -> String {
-    let trimmed = content.trim().replace('\n', " ");
-    let chars: Vec<char> = trimmed.chars().collect();
-    if chars.len() <= max_chars {
-        trimmed
+// ── Smart compact constants and functions ─────────────────────────────
+
+/// Importance score constants (Issue #80).
+const SCORE_SYSTEM_PROMPT: i32 = 10;
+const SCORE_ERROR_BONUS: i32 = 5;
+const SCORE_USER_INPUT: i32 = 3;
+const SCORE_TOOL_RESULT_PENALTY: i32 = -2;
+const SCORE_RECENCY_MAX: i32 = 10;
+
+/// Compaction target: after compaction, aim for context_window * TARGET_TOKEN_RATIO tokens.
+pub(crate) const TARGET_TOKEN_RATIO: f64 = 0.5;
+
+/// Tool results above this estimated token count are replaced with summaries.
+const TOOL_SUMMARY_THRESHOLD: usize = 500;
+
+/// Sensitive keyword patterns for bash command masking.
+const SENSITIVE_KEYWORDS: &[&str] = &[
+    "authorization",
+    "bearer",
+    "api_key",
+    "password",
+    "token",
+    "secret",
+];
+
+/// Compute importance scores for messages in the compaction range.
+/// Returns a Vec<i32> with one score per message in messages[..compact_end].
+pub fn compute_importance_scores(messages: &[SessionMessage], compact_end: usize) -> Vec<i32> {
+    let mut scores = vec![0i32; compact_end];
+    for (index, msg) in messages[..compact_end].iter().enumerate() {
+        let mut score: i32 = 0;
+        // Recency: linear interpolation within compact range
+        if compact_end > 1 {
+            score += (SCORE_RECENCY_MAX * index as i32) / (compact_end as i32 - 1);
+        }
+        if msg.is_error {
+            score += SCORE_ERROR_BONUS;
+        }
+        match msg.role {
+            MessageRole::User => score += SCORE_USER_INPUT,
+            MessageRole::Tool => score += SCORE_TOOL_RESULT_PENALTY,
+            MessageRole::System => score += SCORE_SYSTEM_PROMPT,
+            MessageRole::Assistant => {}
+        }
+        scores[index] = score;
+    }
+    scores
+}
+
+/// Compute how many messages to keep from the end to fit within target_tokens.
+pub fn compute_token_based_keep_recent(messages: &[SessionMessage], target_tokens: usize) -> usize {
+    let mut cumulative = 0usize;
+    let mut keep = 0usize;
+    for msg in messages.iter().rev() {
+        let kind = ContentKind::from_message_role(msg.role);
+        cumulative += contracts_estimate_tokens(msg.effective_content(), kind);
+        keep += 1;
+        if cumulative >= target_tokens {
+            break;
+        }
+    }
+    keep
+}
+
+/// Generate a summary template for a tool result message.
+/// Returns None if the message is not a Tool role or below the threshold.
+pub fn summarize_tool_result(msg: &SessionMessage) -> Option<String> {
+    if msg.role != MessageRole::Tool {
+        return None;
+    }
+    let kind = ContentKind::from_message_role(msg.role);
+    let tokens = contracts_estimate_tokens(msg.effective_content(), kind);
+    if tokens < TOOL_SUMMARY_THRESHOLD {
+        return None;
+    }
+
+    let tool_name = &msg.author;
+    let sanitized_name = if !tool_name.is_empty()
+        && tool_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+    {
+        tool_name.as_str()
     } else {
-        let preview: String = chars[..max_chars.saturating_sub(3)].iter().collect();
-        format!("{preview}...")
+        "unknown_tool"
+    };
+    Some(format!("[要約] {sanitized_name}: ({tokens}トークンの結果)"))
+}
+
+/// Replace tool results exceeding the threshold with summary templates.
+pub fn replace_tool_results_with_summaries(messages: &mut [SessionMessage]) {
+    for msg in messages.iter_mut() {
+        if let Some(summary) = summarize_tool_result(msg) {
+            msg.content = summary;
+        }
     }
 }
 
-fn summarize_messages(messages: &[SessionMessage]) -> String {
+/// Mask sensitive patterns in a bash command string.
+pub fn mask_sensitive_in_command(cmd: &str) -> String {
+    let mut result = cmd.to_string();
+    // Mask known secret prefixes
+    for prefix in crate::config::KNOWN_SECRET_PREFIXES {
+        if let Some(pos) = result.find(prefix) {
+            // Find the end of the token (whitespace or end of string)
+            let start = pos;
+            let end = result[pos..]
+                .find(char::is_whitespace)
+                .map(|i| pos + i)
+                .unwrap_or(result.len());
+            result.replace_range(start..end, "***");
+        }
+    }
+    // Mask sensitive keyword values
+    let lower = result.to_ascii_lowercase();
+    for keyword in SENSITIVE_KEYWORDS {
+        if let Some(kw_pos) = lower.find(keyword) {
+            // Find the value after the keyword (skip keyword + optional separator)
+            let after_kw = kw_pos + keyword.len();
+            if after_kw < result.len() {
+                // Skip separators like '=', ':', ' '
+                let value_start = result[after_kw..]
+                    .find(|c: char| !matches!(c, '=' | ':' | ' ' | '"' | '\''))
+                    .map(|i| after_kw + i);
+                if let Some(vs) = value_start {
+                    let value_end = result[vs..]
+                        .find(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+                        .map(|i| vs + i)
+                        .unwrap_or(result.len());
+                    if value_end > vs {
+                        result.replace_range(vs..value_end, "***");
+                    }
+                }
+            }
+        }
+    }
+    result
+}
+
+/// Convert an absolute path to a relative path based on cwd.
+pub fn to_relative_path(absolute_path: &str, cwd: &str) -> String {
+    absolute_path
+        .strip_prefix(cwd)
+        .map(|p| p.trim_start_matches('/').to_string())
+        .unwrap_or_else(|| absolute_path.to_string())
+}
+
+/// Generate a compact summary from messages and their importance scores.
+/// High-score messages get more detail; low-score ones are condensed.
+pub(crate) fn generate_compact_summary(messages: &[SessionMessage], scores: &[i32]) -> String {
     let mut lines = vec!["[compacted session summary]".to_string()];
     let mut references = Vec::new();
-    for message in messages.iter().take(8) {
-        let role = match message.role {
+
+    // Determine the score threshold for "high importance"
+    let max_score = scores.iter().copied().max().unwrap_or(0);
+    let high_threshold = max_score / 2;
+
+    for (index, msg) in messages.iter().enumerate() {
+        let score = scores.get(index).copied().unwrap_or(0);
+        let role = match msg.role {
             MessageRole::System => "system",
             MessageRole::User => "you",
             MessageRole::Assistant => "anvil",
             MessageRole::Tool => "tool",
         };
-        references.extend(extract_reference_like_tokens(&message.content));
-        lines.push(format!(
-            "- {}: {}",
-            role,
-            compact_preview(&message.content, 96)
-        ));
+        references.extend(extract_reference_like_tokens(&msg.content));
+
+        if score >= high_threshold {
+            // High importance: include more detail
+            lines.push(format!(
+                "- {}: {}",
+                role,
+                compact_preview(&msg.content, 120)
+            ));
+        } else if index < 12 {
+            // Low importance but within first 12: brief summary
+            lines.push(format!("- {}: {}", role, compact_preview(&msg.content, 60)));
+        }
+        // Beyond 12 low-importance messages: omitted
     }
-    if messages.len() > 8 {
-        lines.push(format!("- ... {} more message(s)", messages.len() - 8));
+
+    let omitted = messages
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| {
+            let score = scores.get(*i).copied().unwrap_or(0);
+            score < high_threshold && *i >= 12
+        })
+        .count();
+    if omitted > 0 {
+        lines.push(format!("- ... {omitted} more message(s)"));
     }
+
     references.sort();
     references.dedup();
     if !references.is_empty() {
@@ -781,6 +964,17 @@ fn summarize_messages(messages: &[SessionMessage]) -> String {
         }
     }
     lines.join("\n")
+}
+
+fn compact_preview(content: &str, max_chars: usize) -> String {
+    let trimmed = content.trim().replace('\n', " ");
+    let chars: Vec<char> = trimmed.chars().collect();
+    if chars.len() <= max_chars {
+        trimmed
+    } else {
+        let preview: String = chars[..max_chars.saturating_sub(3)].iter().collect();
+        format!("{preview}...")
+    }
 }
 
 fn extract_reference_like_tokens(content: &str) -> Vec<String> {

@@ -878,7 +878,7 @@ impl App {
         let is_error = result.status == ToolExecutionStatus::Failed;
         let mut msg = SessionMessage::new(
             MessageRole::Tool,
-            "tool",
+            &result.tool_name,
             format_tool_result_message(result, self.config.runtime.tool_result_max_chars),
         )
         .with_id(self.next_message_id("tool"));
