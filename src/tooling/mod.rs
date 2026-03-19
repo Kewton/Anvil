@@ -1383,9 +1383,7 @@ impl LocalToolExecutor {
 
         let response = request_builder
             .send()
-            .map_err(|err| {
-                ToolRuntimeError::Io(format!("web.search failed: {err}"))
-            })?;
+            .map_err(|err| ToolRuntimeError::Io(format!("web.search failed: {err}")))?;
 
         if !response.status().is_success() {
             return Err(ToolRuntimeError::CaptchaBlocked {

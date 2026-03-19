@@ -1126,3 +1126,335 @@ fn session_list_shows_updated_at_ms() {
         "updated_at_ms should be non-zero"
     );
 }
+
+// ── Issue #80: Smart Compact tests ──────────────────────────────────────
+
+#[test]
+fn should_smart_compact_below_threshold() {
+    let mut session = SessionRecord::new(PathBuf::from("/tmp/test"));
+    session.smart_compact_threshold_ratio = 0.75;
+    session.push_message(new_user_message("m1", "hello"));
+    // 1 message, far below any threshold
+    assert!(!session.should_smart_compact(200_000));
+}
+
+#[test]
+fn should_smart_compact_above_threshold() {
+    let mut session = SessionRecord::new(PathBuf::from("/tmp/test"));
+    session.smart_compact_threshold_ratio = 0.75;
+    // Fill with enough messages to exceed threshold for a small context window
+    for i in 0..100 {
+        session.push_message(new_user_message(
+            format!("m{i}"),
+            "a".repeat(200), // ~50 tokens each
+        ));
+    }
+    // With context_window=1000, threshold = 750 tokens
+    // 100 messages * ~50 tokens = ~5000 tokens > 750
+    assert!(session.should_smart_compact(1000));
+}
+
+#[test]
+fn should_smart_compact_ratio_zero_disabled() {
+    let mut session = SessionRecord::new(PathBuf::from("/tmp/test"));
+    session.smart_compact_threshold_ratio = 0.0;
+    for i in 0..100 {
+        session.push_message(new_user_message(format!("m{i}"), "a".repeat(200)));
+    }
+    // ratio=0.0 means smart compact is disabled
+    assert!(!session.should_smart_compact(1000));
+}
+
+#[test]
+fn should_smart_compact_small_context_window() {
+    let mut session = SessionRecord::new(PathBuf::from("/tmp/test"));
+    session.smart_compact_threshold_ratio = 0.75;
+    // MIN_CONTEXT_WINDOW = 1000, threshold = 750
+    session.push_message(new_user_message("m1", "a".repeat(400)));
+    // ~100 tokens, below 750
+    assert!(!session.should_smart_compact(1000));
+}
+
+#[test]
+fn compute_importance_scores_system_role() {
+    use anvil::session::compute_importance_scores;
+    let messages = vec![SessionMessage::new(
+        MessageRole::System,
+        "anvil",
+        "system prompt",
+    )];
+    let scores = compute_importance_scores(&messages, 1);
+    assert_eq!(scores.len(), 1);
+    // System gets SCORE_SYSTEM_PROMPT (10), no recency bonus when compact_end=1
+    assert_eq!(scores[0], 10);
+}
+
+#[test]
+fn compute_importance_scores_user_role() {
+    use anvil::session::compute_importance_scores;
+    let messages = vec![SessionMessage::new(MessageRole::User, "you", "hello")];
+    let scores = compute_importance_scores(&messages, 1);
+    assert_eq!(scores[0], 3); // SCORE_USER_INPUT
+}
+
+#[test]
+fn compute_importance_scores_tool_role() {
+    use anvil::session::compute_importance_scores;
+    let messages = vec![SessionMessage::new(MessageRole::Tool, "tool", "result")];
+    let scores = compute_importance_scores(&messages, 1);
+    assert_eq!(scores[0], -2); // SCORE_TOOL_RESULT_PENALTY
+}
+
+#[test]
+fn compute_importance_scores_error_bonus() {
+    use anvil::session::compute_importance_scores;
+    let mut msg = SessionMessage::new(MessageRole::Tool, "tool", "error result");
+    msg.is_error = true;
+    let messages = vec![msg];
+    let scores = compute_importance_scores(&messages, 1);
+    // SCORE_TOOL_RESULT_PENALTY(-2) + SCORE_ERROR_BONUS(5) = 3
+    assert_eq!(scores[0], 3);
+}
+
+#[test]
+fn compute_importance_scores_recency_bonus() {
+    use anvil::session::compute_importance_scores;
+    let messages: Vec<_> = (0..5)
+        .map(|i| SessionMessage::new(MessageRole::Assistant, "anvil", format!("msg {i}")))
+        .collect();
+    let scores = compute_importance_scores(&messages, 5);
+    // First message: recency = 10*0/4 = 0
+    // Last message: recency = 10*4/4 = 10
+    assert!(
+        scores[4] > scores[0],
+        "later messages should have higher recency bonus"
+    );
+}
+
+#[test]
+fn compute_importance_scores_compact_end_zero() {
+    use anvil::session::compute_importance_scores;
+    let messages = vec![SessionMessage::new(MessageRole::User, "you", "hello")];
+    let scores = compute_importance_scores(&messages, 0);
+    assert!(scores.is_empty());
+}
+
+#[test]
+fn compute_importance_scores_compact_end_one() {
+    use anvil::session::compute_importance_scores;
+    let messages = vec![SessionMessage::new(MessageRole::User, "you", "hello")];
+    let scores = compute_importance_scores(&messages, 1);
+    assert_eq!(scores.len(), 1);
+    // Only SCORE_USER_INPUT(3), no recency bonus when compact_end=1
+    assert_eq!(scores[0], 3);
+}
+
+#[test]
+fn compute_token_based_keep_recent_all_messages() {
+    use anvil::session::compute_token_based_keep_recent;
+    let messages: Vec<_> = (0..3)
+        .map(|i| SessionMessage::new(MessageRole::User, "you", format!("msg {i}")))
+        .collect();
+    // Very high target: should keep all messages
+    let keep = compute_token_based_keep_recent(&messages, 1_000_000);
+    assert_eq!(keep, 3);
+}
+
+#[test]
+fn compute_token_based_keep_recent_partial() {
+    use anvil::session::compute_token_based_keep_recent;
+    let mut messages = Vec::new();
+    for i in 0..10 {
+        messages.push(SessionMessage::new(
+            MessageRole::User,
+            "you",
+            format!("message content number {i} with some text"),
+        ));
+    }
+    // Small target: should keep fewer than all messages
+    let keep = compute_token_based_keep_recent(&messages, 10);
+    assert!(keep < 10, "should keep fewer than all messages");
+    assert!(keep >= 1, "should keep at least 1 message");
+}
+
+#[test]
+fn summarize_tool_result_above_threshold() {
+    use anvil::session::summarize_tool_result;
+    let msg = SessionMessage::new(MessageRole::Tool, "file.read", "x".repeat(3000));
+    let result = summarize_tool_result(&msg);
+    assert!(result.is_some());
+    let summary = result.unwrap();
+    assert!(summary.contains("[要約]"));
+    assert!(summary.contains("file.read"));
+}
+
+#[test]
+fn summarize_tool_result_below_threshold() {
+    use anvil::session::summarize_tool_result;
+    let msg = SessionMessage::new(MessageRole::Tool, "file.read", "short result");
+    let result = summarize_tool_result(&msg);
+    assert!(result.is_none());
+}
+
+#[test]
+fn summarize_tool_result_non_tool_role() {
+    use anvil::session::summarize_tool_result;
+    let msg = SessionMessage::new(MessageRole::User, "you", "x".repeat(3000));
+    let result = summarize_tool_result(&msg);
+    assert!(result.is_none());
+}
+
+#[test]
+fn summarize_tool_result_invalid_tool_name() {
+    use anvil::session::summarize_tool_result;
+    let msg = SessionMessage::new(
+        MessageRole::Tool,
+        "<script>alert</script>",
+        "x".repeat(3000),
+    );
+    let result = summarize_tool_result(&msg);
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("unknown_tool"));
+}
+
+#[test]
+fn summarize_tool_result_empty_tool_name() {
+    use anvil::session::summarize_tool_result;
+    let msg = SessionMessage::new(MessageRole::Tool, "", "x".repeat(3000));
+    let result = summarize_tool_result(&msg);
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("unknown_tool"));
+}
+
+#[test]
+fn replace_tool_results_with_summaries_mixed() {
+    use anvil::session::replace_tool_results_with_summaries;
+    let mut messages = vec![
+        SessionMessage::new(MessageRole::User, "you", "hello"),
+        SessionMessage::new(MessageRole::Tool, "file.read", "x".repeat(3000)),
+        SessionMessage::new(MessageRole::Tool, "file.read", "short"),
+        SessionMessage::new(MessageRole::Assistant, "anvil", "response"),
+    ];
+    replace_tool_results_with_summaries(&mut messages);
+    // First tool message (large): should be summarized
+    assert!(messages[1].content.contains("[要約]"));
+    // Second tool message (short): should remain unchanged
+    assert_eq!(messages[2].content, "short");
+    // Non-tool messages: unchanged
+    assert_eq!(messages[0].content, "hello");
+    assert_eq!(messages[3].content, "response");
+}
+
+#[test]
+fn mask_sensitive_in_command_api_key() {
+    use anvil::session::mask_sensitive_in_command;
+    let cmd = "curl -H 'Authorization: Bearer sk-abc123def' https://api.example.com";
+    let masked = mask_sensitive_in_command(cmd);
+    assert!(!masked.contains("sk-abc123def"));
+    assert!(masked.contains("***"));
+}
+
+#[test]
+fn mask_sensitive_in_command_no_sensitive() {
+    use anvil::session::mask_sensitive_in_command;
+    let cmd = "ls -la /tmp";
+    let masked = mask_sensitive_in_command(cmd);
+    assert_eq!(masked, "ls -la /tmp");
+}
+
+#[test]
+fn mask_sensitive_in_command_ghp_prefix() {
+    use anvil::session::mask_sensitive_in_command;
+    let cmd = "git clone https://ghp_abcdef123456@github.com/user/repo";
+    let masked = mask_sensitive_in_command(cmd);
+    assert!(!masked.contains("ghp_abcdef123456"));
+    assert!(masked.contains("***"));
+}
+
+#[test]
+fn to_relative_path_matching_prefix() {
+    use anvil::session::to_relative_path;
+    let result = to_relative_path("/home/user/project/src/main.rs", "/home/user/project");
+    assert_eq!(result, "src/main.rs");
+}
+
+#[test]
+fn to_relative_path_no_matching_prefix() {
+    use anvil::session::to_relative_path;
+    let result = to_relative_path("/other/path/file.rs", "/home/user/project");
+    assert_eq!(result, "/other/path/file.rs");
+}
+
+#[test]
+fn clamp_smart_compact_ratio_nan() {
+    let mut config = anvil::config::EffectiveConfig::default_for_test().expect("config");
+    config.runtime.smart_compact_threshold_ratio = f64::NAN;
+    config.clamp_smart_compact_ratio();
+    assert!((config.runtime.smart_compact_threshold_ratio - 0.75).abs() < f64::EPSILON);
+}
+
+#[test]
+fn clamp_smart_compact_ratio_infinity() {
+    let mut config = anvil::config::EffectiveConfig::default_for_test().expect("config");
+    config.runtime.smart_compact_threshold_ratio = f64::INFINITY;
+    config.clamp_smart_compact_ratio();
+    assert!((config.runtime.smart_compact_threshold_ratio - 0.75).abs() < f64::EPSILON);
+}
+
+#[test]
+fn clamp_smart_compact_ratio_neg_infinity() {
+    let mut config = anvil::config::EffectiveConfig::default_for_test().expect("config");
+    config.runtime.smart_compact_threshold_ratio = f64::NEG_INFINITY;
+    config.clamp_smart_compact_ratio();
+    assert!((config.runtime.smart_compact_threshold_ratio - 0.75).abs() < f64::EPSILON);
+}
+
+#[test]
+fn clamp_smart_compact_ratio_normal_value() {
+    let mut config = anvil::config::EffectiveConfig::default_for_test().expect("config");
+    config.runtime.smart_compact_threshold_ratio = 0.5;
+    config.clamp_smart_compact_ratio();
+    assert!((config.runtime.smart_compact_threshold_ratio - 0.5).abs() < f64::EPSILON);
+}
+
+#[test]
+fn clamp_smart_compact_ratio_below_min() {
+    let mut config = anvil::config::EffectiveConfig::default_for_test().expect("config");
+    config.runtime.smart_compact_threshold_ratio = 0.01;
+    config.clamp_smart_compact_ratio();
+    assert!((config.runtime.smart_compact_threshold_ratio - 0.1).abs() < f64::EPSILON);
+}
+
+#[test]
+fn clamp_smart_compact_ratio_above_max() {
+    let mut config = anvil::config::EffectiveConfig::default_for_test().expect("config");
+    config.runtime.smart_compact_threshold_ratio = 0.99;
+    config.clamp_smart_compact_ratio();
+    assert!((config.runtime.smart_compact_threshold_ratio - 0.95).abs() < f64::EPSILON);
+}
+
+#[test]
+fn compact_history_with_smart_compact_generates_scored_summary() {
+    let mut session = SessionRecord::new(PathBuf::from("/tmp/test"));
+    // Add a system message (high score)
+    session.push_message(
+        SessionMessage::new(MessageRole::System, "anvil", "You are a helpful assistant")
+            .with_id("sys_1"),
+    );
+    // Add user messages
+    for i in 0..10 {
+        session.push_message(new_user_message(format!("m{i}"), format!("question {i}")));
+    }
+    // Add a large tool result that should be summarized
+    session.push_message(
+        SessionMessage::new(MessageRole::Tool, "file.read", "x".repeat(3000)).with_id("tool_1"),
+    );
+
+    let changed = session.compact_history(4);
+    assert!(changed);
+    assert!(
+        session.messages[0]
+            .content
+            .contains("[compacted session summary]")
+    );
+}
