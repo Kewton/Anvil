@@ -7,6 +7,7 @@ pub mod agentic;
 pub mod cli;
 pub mod mock;
 pub mod plan;
+pub mod policy;
 pub mod render;
 
 use crate::agent::BasicAgentLoop;
@@ -238,20 +239,25 @@ impl App {
 
         // --- MCP initialization (Task 3.2) ---
         // [D1-007] shutdown_flag is managed by App side (YAGNI)
-        let mcp_manager = match crate::config::load_mcp_config(&config.paths) {
-            Ok(Some(mcp_configs)) => {
-                match crate::mcp::McpManager::start_all(mcp_configs) {
-                    Ok(manager) => Some(manager),
-                    Err(e) => {
-                        eprintln!("Warning: MCP initialization failed: {e}");
-                        None // graceful degradation
+        // Offline mode: skip MCP initialization entirely (load_mcp_config included)
+        let mcp_manager = if config.mode.offline {
+            None
+        } else {
+            match crate::config::load_mcp_config(&config.paths) {
+                Ok(Some(mcp_configs)) => {
+                    match crate::mcp::McpManager::start_all(mcp_configs) {
+                        Ok(manager) => Some(manager),
+                        Err(e) => {
+                            eprintln!("Warning: MCP initialization failed: {e}");
+                            None // graceful degradation
+                        }
                     }
                 }
-            }
-            Ok(None) => None, // mcp.json not found → skip completely
-            Err(e) => {
-                eprintln!("Warning: MCP config parse error: {e}");
-                None // graceful degradation
+                Ok(None) => None, // mcp.json not found → skip completely
+                Err(e) => {
+                    eprintln!("Warning: MCP config parse error: {e}");
+                    None // graceful degradation
+                }
             }
         };
 
@@ -311,13 +317,23 @@ impl App {
             &detected_languages,
             mcp_descriptions.as_deref(),
         );
-        let system_prompt = match config.project_instructions() {
+        let mut system_prompt = match config.project_instructions() {
             Some(instructions) => format!(
                 "{}\n\n## Project instructions (from ANVIL.md)\n{}",
                 base_prompt, instructions
             ),
             None => base_prompt,
         };
+
+        // Offline mode: append note to system prompt and warn about shell.exec
+        if config.mode.offline {
+            system_prompt.push_str(
+                "\n\nNote: Offline mode is active. web.fetch and web.search are unavailable. Do not use shell.exec to make network requests (curl, wget, etc.). Use local tools only."
+            );
+            eprintln!(
+                "Warning: shell.exec can still access the network in offline mode. For full network isolation, use OS/firewall-level controls."
+            );
+        }
 
         Ok(Self {
             tools,
@@ -341,15 +357,19 @@ impl App {
     }
 
     fn build_initial_snapshot(&self) -> AppStateSnapshot {
+        let mut status = format!(
+            "Ready. provider={} model={} stream={} tools={}",
+            self.config.runtime.provider,
+            self.config.runtime.model,
+            self.provider.capabilities.streaming,
+            self.provider.capabilities.tool_calling
+        );
+        if self.config.mode.offline {
+            status.push_str(" offline=true");
+        }
         AppStateSnapshot::new(RuntimeState::Ready)
             .with_event(AppEvent::StartupCompleted)
-            .with_status(format!(
-                "Ready. provider={} model={} stream={} tools={}",
-                self.config.runtime.provider,
-                self.config.runtime.model,
-                self.provider.capabilities.streaming,
-                self.provider.capabilities.tool_calling
-            ))
+            .with_status(status)
             .with_context_usage(
                 self.session.estimated_token_count(),
                 self.config.runtime.context_window,
@@ -622,6 +642,7 @@ impl App {
                                     "Done. session saved",
                                     "session saved",
                                     0,
+                                    None,
                                     tui,
                                     provider_client,
                                 )?);
@@ -640,6 +661,66 @@ impl App {
                         interrupted_what: "provider turn".to_string(),
                         saved_status: "session preserved".to_string(),
                         next_actions: vec!["resume work".to_string(), "inspect status".to_string()],
+                        elapsed_ms: 0,
+                    }],
+                    tui,
+                )
+            }
+            Err(ref err @ ProviderTurnError::ConnectionRefused(ref msg)) => {
+                self.record_provider_error(err.clone())?;
+                self.execute_runtime_events(
+                    &[AgentEvent::Failed {
+                        status: "Error. connection refused".to_string(),
+                        error_summary: msg.clone(),
+                        recommended_actions: vec![
+                            "check provider is running (e.g. ollama serve)".to_string(),
+                            "verify provider URL".to_string(),
+                        ],
+                        elapsed_ms: 0,
+                    }],
+                    tui,
+                )
+            }
+            Err(ref err @ ProviderTurnError::DnsFailure(ref msg)) => {
+                self.record_provider_error(err.clone())?;
+                self.execute_runtime_events(
+                    &[AgentEvent::Failed {
+                        status: "Error. DNS resolution failed".to_string(),
+                        error_summary: msg.clone(),
+                        recommended_actions: vec![
+                            "check provider URL for typos".to_string(),
+                            "verify DNS settings and network connectivity".to_string(),
+                        ],
+                        elapsed_ms: 0,
+                    }],
+                    tui,
+                )
+            }
+            Err(ref err @ ProviderTurnError::ModelNotFound { ref model, .. }) => {
+                self.record_provider_error(err.clone())?;
+                self.execute_runtime_events(
+                    &[AgentEvent::Failed {
+                        status: "Error. model not found".to_string(),
+                        error_summary: format!("model '{}' not found", model),
+                        recommended_actions: vec![
+                            format!("download model: ollama pull {}", model),
+                            "list available models: ollama list".to_string(),
+                        ],
+                        elapsed_ms: 0,
+                    }],
+                    tui,
+                )
+            }
+            Err(ref err @ ProviderTurnError::AuthenticationFailed { ref message, .. }) => {
+                self.record_provider_error(err.clone())?;
+                self.execute_runtime_events(
+                    &[AgentEvent::Failed {
+                        status: "Error. authentication failed".to_string(),
+                        error_summary: message.clone(),
+                        recommended_actions: vec![
+                            "check API key: export ANVIL_API_KEY=<key>".to_string(),
+                            "verify provider credentials".to_string(),
+                        ],
                         elapsed_ms: 0,
                     }],
                     tui,
@@ -947,13 +1028,17 @@ impl App {
                 saved_status,
                 tool_logs,
                 elapsed_ms,
+                inference_performance,
             } => {
                 self.record_assistant_output(self.next_message_id("assistant"), assistant_message)?;
-                let snapshot = AppStateSnapshot::new(RuntimeState::Done)
+                let mut snapshot = AppStateSnapshot::new(RuntimeState::Done)
                     .with_status(status.clone())
                     .with_tool_logs(render::build_tool_logs(tool_logs))
                     .with_completion_summary(completion_summary.clone(), saved_status.clone())
                     .with_elapsed_ms(*elapsed_ms);
+                if let Some(perf) = inference_performance {
+                    snapshot = snapshot.with_inference_performance(perf.clone());
+                }
                 let mut snapshot =
                     self.transition_with_context(snapshot, StateTransition::Finish)?;
                 self.evaluate_context_warning(&mut snapshot);
@@ -1306,17 +1391,48 @@ pub fn error_guidance(err: &AppError) -> String {
             "  - Each entry needs: name, description, prompt"
         )
         .to_string(),
-        AppError::ProviderTurn(turn_err) => {
-            let detail = turn_err.to_string();
-            if detail.contains("timeout") || detail.contains("max-time") {
-                "Hint: the request timed out\n  - Increase timeout: ANVIL_CURL_TIMEOUT=600\n  - Check if the model is responding: ollama ps".to_string()
-            } else if detail.contains("401") || detail.contains("403") || detail.contains("api key")
-            {
-                "Hint: authentication failed\n  - Set your API key: ANVIL_API_KEY=<key>\n  - Check the key format (some providers require 'Bearer ' prefix)".to_string()
-            } else {
-                "Hint: the provider turn failed\n  - Check if the model is available: ollama list\n  - Network issues may cause transient failures — try again".to_string()
+        AppError::ProviderTurn(turn_err) => match turn_err {
+            ProviderTurnError::ConnectionRefused(_) => concat!(
+                "Hint: Connection refused\n",
+                "  - Is the provider running? Try: ollama serve\n",
+                "  - Check URL: --provider-url http://127.0.0.1:11434\n",
+            )
+            .to_string(),
+            ProviderTurnError::DnsFailure(_) => concat!(
+                "Hint: DNS resolution failed\n",
+                "  - Check the provider URL for typos\n",
+                "  - Verify network connectivity\n",
+            )
+            .to_string(),
+            ProviderTurnError::ModelNotFound { model, .. } => format!(
+                "Hint: Model '{}' not found\n\
+                 \x20 - Download it: ollama pull {}\n\
+                 \x20 - List available models: ollama list\n",
+                model, model
+            ),
+            ProviderTurnError::AuthenticationFailed { .. } => concat!(
+                "Hint: Authentication failed\n",
+                "  - Check your API key or server configuration\n",
+                "  - Set API key: export ANVIL_API_KEY=<your-key>\n",
+                "  - API key format: some providers require 'Bearer <key>' prefix\n",
+                "  - IMPORTANT: Never share your API key in error reports or forums\n",
+            )
+            .to_string(),
+            ProviderTurnError::Timeout(_) => concat!(
+                "Hint: Request timed out\n",
+                "  - The provider may be overloaded\n",
+                "  - Try again or use a smaller model\n",
+            )
+            .to_string(),
+            _ => {
+                let detail = turn_err.to_string();
+                if detail.contains("401") || detail.contains("403") || detail.contains("api key") {
+                    "Hint: authentication failed\n  - Set your API key: ANVIL_API_KEY=<key>\n  - Check the key format (some providers require 'Bearer ' prefix)".to_string()
+                } else {
+                    "Hint: the provider turn failed\n  - Check if the model is available: ollama list\n  - Network issues may cause transient failures — try again".to_string()
+                }
             }
-        }
+        },
         _ => String::new(),
     }
 }

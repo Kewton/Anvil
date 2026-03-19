@@ -3,12 +3,20 @@
 //! Implements the [`ProviderClient`] trait for the Ollama local inference
 //! server via its `/api/chat` endpoint.
 
-use super::transport::{CurlHttpTransport, HttpTransport, RetryTransport};
+use super::transport::{CurlHttpTransport, HttpTransport, RetryTransport, sanitize_error_message};
 use super::{
     AgentEvent, ProviderClient, ProviderEvent, ProviderMessageRole, ProviderTurnError,
     ProviderTurnRequest,
 };
+
+/// Patterns in Ollama error messages that indicate a model is not found.
+///
+/// Ollama error response examples (v0.5.x verified):
+/// {"error":"model 'nonexistent' not found, try pulling it first"}
+/// {"error":"no such model 'invalid-name'"}
+const MODEL_NOT_FOUND_PATTERNS: &[&str] = &["not found", "no such model"];
 use crate::config::EffectiveConfig;
+use crate::contracts::InferencePerformanceView;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::process::Command;
@@ -38,6 +46,52 @@ struct OllamaChatChunk {
     message: Option<OllamaChatMessage>,
     #[serde(default)]
     done: bool,
+    #[serde(default)]
+    eval_count: Option<u64>,
+    #[serde(default)]
+    eval_duration: Option<u64>,
+    #[serde(default)]
+    prompt_eval_count: Option<u64>,
+    #[serde(default)]
+    prompt_eval_duration: Option<u64>,
+}
+
+/// Extract InferencePerformanceView from Ollama eval metrics.
+fn extract_inference_performance(
+    eval_count: Option<u64>,
+    eval_duration: Option<u64>,
+) -> Option<InferencePerformanceView> {
+    let eval_count = eval_count?;
+    let eval_duration = eval_duration?;
+    let eval_duration_ms = eval_duration / 1_000_000;
+    let tokens_per_sec_tenths = if eval_duration > 0 {
+        eval_count
+            .checked_mul(10_000_000_000)
+            .map(|v| v / eval_duration)
+    } else {
+        None
+    };
+    Some(InferencePerformanceView {
+        tokens_per_sec_tenths,
+        eval_tokens: Some(eval_count),
+        eval_duration_ms: Some(eval_duration_ms),
+    })
+}
+
+/// Build a Done AgentEvent (shared by stream_turn and normalize_stream_chunks).
+fn build_done_event(
+    assistant_output: &str,
+    inference_performance: Option<InferencePerformanceView>,
+) -> AgentEvent {
+    AgentEvent::Done {
+        status: "Done. session saved".to_string(),
+        assistant_message: assistant_output.to_string(),
+        completion_summary: "Provider turn finished successfully.".to_string(),
+        saved_status: "session saved".to_string(),
+        tool_logs: Vec::new(),
+        elapsed_ms: 0,
+        inference_performance,
+    }
 }
 
 /// Client for the Ollama local inference server.
@@ -108,6 +162,9 @@ impl<T> OllamaProviderClient<T> {
                 ProviderTurnError::Backend(format!("invalid ollama response: {err}"))
             })?;
 
+            let eval_count = parsed.eval_count;
+            let eval_duration = parsed.eval_duration;
+
             if let Some(message) = parsed.message
                 && !message.content.is_empty()
             {
@@ -116,14 +173,11 @@ impl<T> OllamaProviderClient<T> {
             }
 
             if parsed.done {
-                events.push(ProviderEvent::Agent(AgentEvent::Done {
-                    status: "Done. session saved".to_string(),
-                    assistant_message: assistant_output.clone(),
-                    completion_summary: "Provider turn finished successfully.".to_string(),
-                    saved_status: "session saved".to_string(),
-                    tool_logs: Vec::new(),
-                    elapsed_ms: 0,
-                }));
+                let perf = extract_inference_performance(eval_count, eval_duration);
+                events.push(ProviderEvent::Agent(build_done_event(
+                    &assistant_output,
+                    perf,
+                )));
             }
         }
 
@@ -166,12 +220,9 @@ impl<T: HttpTransport> OllamaProviderClient<T> {
     /// Returns `Ok(())` if the server responds, or an error message string
     /// on failure.  The health check uses the client's configured transport
     /// (which includes [`RetryTransport`] for automatic retry).
-    pub fn health_check(&self) -> Result<(), String> {
+    pub fn health_check(&self) -> Result<(), ProviderTurnError> {
         let url = format!("{}/api/tags", self.base_url.trim_end_matches('/'));
-        match self.transport.get(&url) {
-            Ok(_) => Ok(()),
-            Err(e) => Err(format!("Ollamaに接続できません ({}): {}", self.base_url, e)),
-        }
+        self.transport.get(&url).map(|_| ())
     }
 }
 
@@ -207,6 +258,8 @@ impl<T: HttpTransport> ProviderClient for OllamaProviderClient<T> {
                 }
                 match serde_json::from_str::<OllamaChatChunk>(line) {
                     Ok(chunk) => {
+                        let eval_count = chunk.eval_count;
+                        let eval_duration = chunk.eval_duration;
                         if let Some(message) = chunk.message
                             && !message.content.is_empty()
                         {
@@ -214,22 +267,26 @@ impl<T: HttpTransport> ProviderClient for OllamaProviderClient<T> {
                             emit(ProviderEvent::TokenDelta(message.content));
                         }
                         if chunk.done {
-                            emit(ProviderEvent::Agent(AgentEvent::Done {
-                                status: "Done. session saved".to_string(),
-                                assistant_message: assistant_output.clone(),
-                                completion_summary: "Provider turn finished successfully."
-                                    .to_string(),
-                                saved_status: "session saved".to_string(),
-                                tool_logs: Vec::new(),
-                                elapsed_ms: 0,
-                            }));
+                            let perf = extract_inference_performance(eval_count, eval_duration);
+                            emit(ProviderEvent::Agent(build_done_event(
+                                &assistant_output,
+                                perf,
+                            )));
                         }
                     }
                     Err(err) => {
                         if let Ok(value) = serde_json::from_str::<serde_json::Value>(line)
                             && let Some(error) = value.get("error").and_then(|v| v.as_str())
                         {
-                            had_error = Some(ProviderTurnError::Backend(error.to_string()));
+                            if MODEL_NOT_FOUND_PATTERNS.iter().any(|p| error.contains(p)) {
+                                let model = resolved_request.model.clone();
+                                had_error = Some(ProviderTurnError::ModelNotFound {
+                                    model,
+                                    message: sanitize_error_message(error),
+                                });
+                            } else {
+                                had_error = Some(ProviderTurnError::Backend(error.to_string()));
+                            }
                             return;
                         }
                         had_error = Some(ProviderTurnError::Backend(format!(

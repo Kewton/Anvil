@@ -52,6 +52,7 @@ fn runtime_turn_pauses_for_single_tool_call_approval_and_resumes_to_done() {
                 "src/session/mod.rs".to_string(),
             )],
             elapsed_ms: 920,
+            inference_performance: None,
         },
     ]));
 
@@ -181,6 +182,7 @@ fn runtime_turn_can_deny_approval_and_return_to_ready() {
             saved_status: "session saved".to_string(),
             tool_logs: Vec::new(),
             elapsed_ms: 400,
+            inference_performance: None,
         },
     ]));
 
@@ -282,6 +284,7 @@ fn runtime_turn_supports_multiple_approvals_in_one_turn() {
                 "src/session/mod.rs".to_string(),
             )],
             elapsed_ms: 640,
+            inference_performance: None,
         },
     ]));
 
@@ -368,6 +371,7 @@ fn runtime_turn_supports_working_back_to_thinking_before_done() {
             saved_status: "session saved".to_string(),
             tool_logs: Vec::new(),
             elapsed_ms: 360,
+            inference_performance: None,
         },
     ]));
 
@@ -455,6 +459,7 @@ fn pending_approval_survives_app_reload() {
             saved_status: "session saved".to_string(),
             tool_logs: Vec::new(),
             elapsed_ms: 320,
+            inference_performance: None,
         },
     ]));
 
@@ -535,7 +540,7 @@ fn system_prompt_includes_agent_explore_and_plan_descriptions() {
 #[test]
 fn build_subagent_system_prompt_explore_contains_expected_tools() {
     use anvil::agent::subagent::{SubAgentKind, build_subagent_system_prompt};
-    let prompt = build_subagent_system_prompt(&SubAgentKind::Explore);
+    let prompt = build_subagent_system_prompt(&SubAgentKind::Explore, false);
     assert!(
         prompt.contains("file.read"),
         "Explore prompt should include file.read"
@@ -561,7 +566,7 @@ fn build_subagent_system_prompt_explore_contains_expected_tools() {
 #[test]
 fn build_subagent_system_prompt_plan_contains_expected_tools() {
     use anvil::agent::subagent::{SubAgentKind, build_subagent_system_prompt};
-    let prompt = build_subagent_system_prompt(&SubAgentKind::Plan);
+    let prompt = build_subagent_system_prompt(&SubAgentKind::Plan, false);
     assert!(
         prompt.contains("file.read"),
         "Plan prompt should include file.read"

@@ -535,3 +535,75 @@ fn test_approval_view_without_diff_preview() {
     let approval = snapshot.approval.as_ref().expect("approval present");
     assert!(approval.diff_preview.is_none());
 }
+
+#[test]
+fn footer_shows_perf_with_metrics() {
+    let tui = Tui::new();
+    let snapshot = anvil::contracts::AppStateSnapshot::new(anvil::contracts::RuntimeState::Done)
+        .with_status("Done. session saved".to_string())
+        .with_completion_summary("completed task", "session saved")
+        .with_context_usage(5000, 10000)
+        .with_inference_performance(anvil::contracts::InferencePerformanceView {
+            tokens_per_sec_tenths: Some(325),
+            eval_tokens: Some(100),
+            eval_duration_ms: Some(3077),
+        });
+
+    let context = anvil::contracts::ConsoleRenderContext {
+        snapshot,
+        model_name: "test-model".to_string(),
+        messages: vec![],
+        history_summary: None,
+    };
+
+    let rendered = tui.render_console(&context);
+    assert!(
+        rendered.contains("perf:32.5tok/s"),
+        "footer should display perf:32.5tok/s when metrics are present"
+    );
+}
+
+#[test]
+fn footer_shows_perf_dash_without_metrics() {
+    let tui = Tui::new();
+    let snapshot = anvil::contracts::AppStateSnapshot::new(anvil::contracts::RuntimeState::Done)
+        .with_status("Done. session saved".to_string())
+        .with_completion_summary("completed task", "session saved")
+        .with_context_usage(5000, 10000);
+
+    let context = anvil::contracts::ConsoleRenderContext {
+        snapshot,
+        model_name: "test-model".to_string(),
+        messages: vec![],
+        history_summary: None,
+    };
+
+    let rendered = tui.render_console(&context);
+    assert!(
+        rendered.contains("perf:-"),
+        "footer should display perf:- when no metrics are present"
+    );
+}
+
+#[test]
+fn mock_done_snapshot_has_perf_in_footer() {
+    let mut app = common::build_app();
+    let tui = Tui::new();
+
+    app.record_user_input("msg_001", "test perf display")
+        .expect("user input should persist");
+    let _ = app
+        .mock_thinking_snapshot()
+        .expect("thinking snapshot should build");
+    let _ = app
+        .mock_done_snapshot()
+        .expect("done snapshot should build");
+
+    let rendered = app
+        .render_console(&tui)
+        .expect("done render should succeed");
+    assert!(
+        rendered.contains("perf:32.5tok/s"),
+        "mock done snapshot should show perf:32.5tok/s in footer"
+    );
+}

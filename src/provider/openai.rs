@@ -3,11 +3,12 @@
 //! Works with the standard `/v1/chat/completions` endpoint used by
 //! OpenAI, Azure OpenAI, LM Studio, and other compatible servers.
 
-use super::transport::{CurlHttpTransport, HttpTransport, RetryTransport};
+use super::transport::{CurlHttpTransport, HttpTransport, RetryTransport, sanitize_error_message};
 use super::{
     AgentEvent, ImageContent, ProviderClient, ProviderEvent, ProviderTurnError, ProviderTurnRequest,
 };
 use crate::config::EffectiveConfig;
+use crate::contracts::InferencePerformanceView;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -44,8 +45,22 @@ struct OpenAiResponseMessage {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct OpenAiUsage {
+    #[serde(default)]
+    #[allow(dead_code)]
+    prompt_tokens: Option<u64>,
+    #[serde(default)]
+    completion_tokens: Option<u64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    total_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct OpenAiChatResponse {
     choices: Vec<OpenAiChoice>,
+    #[serde(default)]
+    usage: Option<OpenAiUsage>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -108,6 +123,32 @@ fn build_openai_content(text: &str, images: Option<&[ImageContent]>) -> Value {
     }
 }
 
+/// Extract InferencePerformanceView from OpenAI usage.
+fn extract_openai_performance(usage: &Option<OpenAiUsage>) -> Option<InferencePerformanceView> {
+    let usage = usage.as_ref()?;
+    Some(InferencePerformanceView {
+        tokens_per_sec_tenths: None,
+        eval_tokens: usage.completion_tokens,
+        eval_duration_ms: None,
+    })
+}
+
+/// Build a Done AgentEvent for OpenAI (shared helper).
+fn build_openai_done_event(
+    content: &str,
+    inference_performance: Option<InferencePerformanceView>,
+) -> AgentEvent {
+    AgentEvent::Done {
+        status: "Done. session saved".to_string(),
+        assistant_message: content.to_string(),
+        completion_summary: "Provider turn finished successfully.".to_string(),
+        saved_status: "session saved".to_string(),
+        tool_logs: Vec::new(),
+        elapsed_ms: 0,
+        inference_performance,
+    }
+}
+
 impl OpenAiCompatibleProviderClient {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
@@ -147,7 +188,7 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
     /// If an API key is configured, it is sent as an `Authorization` header
     /// (without `Bearer` prefix, matching the existing code pattern in
     /// `send_chat_request`).
-    pub fn health_check(&self) -> Result<(), String> {
+    pub fn health_check(&self) -> Result<(), ProviderTurnError> {
         let url = format!("{}/v1/models", self.base_url.trim_end_matches('/'));
         let headers: Vec<(&str, &str)> = self
             .api_key
@@ -155,18 +196,27 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
             .map(|key| vec![("Authorization", key)])
             .unwrap_or_default();
         match self.transport.get_with_headers(&url, &headers) {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                let guidance = if self.api_key.is_some() {
-                    " (認証情報の形式を確認してください。'Bearer <api-key>' 形式が必要な場合があります)"
-                } else {
-                    ""
-                };
-                Err(format!(
-                    "OpenAI互換プロバイダーに接続できません ({}): {}{}",
-                    self.base_url, e, guidance
-                ))
+            Ok(response) => {
+                let status_code = response.status_code;
+                match status_code {
+                    401 | 403 => Err(ProviderTurnError::AuthenticationFailed {
+                        status_code,
+                        message: sanitize_error_message(&format!(
+                            "HTTP {} from {}",
+                            status_code, self.base_url
+                        )),
+                    }),
+                    s if s >= 500 => Err(ProviderTurnError::ServerError {
+                        status_code: s,
+                        message: sanitize_error_message(&format!(
+                            "HTTP {} from {}",
+                            s, self.base_url
+                        )),
+                    }),
+                    _ => Ok(()),
+                }
             }
+            Err(e) => Err(e),
         }
     }
 
@@ -209,11 +259,18 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
             .post_json_with_headers(&url, &request_body, &headers)?;
         if response.status_code != 200 {
             let body_text = normalize_openai_error(&response.body);
-            return Err(ProviderTurnError::Backend(format!(
+            let message = sanitize_error_message(&format!(
                 "openai request failed with status {}: {}",
                 response.status_code,
                 body_text.trim()
-            )));
+            ));
+            return Err(match response.status_code {
+                401 | 403 => ProviderTurnError::AuthenticationFailed {
+                    status_code: response.status_code,
+                    message,
+                },
+                _ => ProviderTurnError::Backend(message),
+            });
         }
 
         if request.stream && looks_like_sse_stream(&response.body) {
@@ -223,6 +280,7 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
         let parsed: OpenAiChatResponse = serde_json::from_slice(&response.body)
             .map_err(|err| ProviderTurnError::Backend(format!("invalid openai response: {err}")))?;
 
+        let perf = extract_openai_performance(&parsed.usage);
         let content = parsed
             .choices
             .first()
@@ -233,14 +291,7 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
 
         Ok(vec![
             ProviderEvent::TokenDelta(content.clone()),
-            ProviderEvent::Agent(AgentEvent::Done {
-                status: "Done. session saved".to_string(),
-                assistant_message: content,
-                completion_summary: "Provider turn finished successfully.".to_string(),
-                saved_status: "session saved".to_string(),
-                tool_logs: Vec::new(),
-                elapsed_ms: 0,
-            }),
+            ProviderEvent::Agent(build_openai_done_event(&content, perf)),
         ])
     }
 }
@@ -321,18 +372,13 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
                     // Not SSE — try as a regular OpenAI JSON response (fallback)
                     if let Ok(parsed) = serde_json::from_str::<OpenAiChatResponse>(trimmed) {
                         if let Some(choice) = parsed.choices.first() {
+                            let perf = extract_openai_performance(&parsed.usage);
                             let msg_content = choice.message.content.clone().unwrap_or_default();
                             content.push_str(&msg_content);
                             emit(ProviderEvent::TokenDelta(msg_content));
-                            emit(ProviderEvent::Agent(AgentEvent::Done {
-                                status: "Done. session saved".to_string(),
-                                assistant_message: content.clone(),
-                                completion_summary: "Provider turn finished successfully."
-                                    .to_string(),
-                                saved_status: "session saved".to_string(),
-                                tool_logs: Vec::new(),
-                                elapsed_ms: 0,
-                            }));
+                            emit(ProviderEvent::Agent(build_openai_done_event(
+                                &content, perf,
+                            )));
                             emitted_done = true;
                         }
                         return;
@@ -346,14 +392,9 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
                 let payload = &trimmed[6..];
                 if payload == "[DONE]" {
                     if !emitted_done {
-                        emit(ProviderEvent::Agent(AgentEvent::Done {
-                            status: "Done. session saved".to_string(),
-                            assistant_message: content.clone(),
-                            completion_summary: "Provider turn finished successfully.".to_string(),
-                            saved_status: "session saved".to_string(),
-                            tool_logs: Vec::new(),
-                            elapsed_ms: 0,
-                        }));
+                        emit(ProviderEvent::Agent(build_openai_done_event(
+                            &content, None,
+                        )));
                         emitted_done = true;
                     }
                     return;
@@ -367,15 +408,9 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
                                 emit(ProviderEvent::TokenDelta(delta));
                             }
                             if choice.finish_reason.is_some() && !emitted_done {
-                                emit(ProviderEvent::Agent(AgentEvent::Done {
-                                    status: "Done. session saved".to_string(),
-                                    assistant_message: content.clone(),
-                                    completion_summary: "Provider turn finished successfully."
-                                        .to_string(),
-                                    saved_status: "session saved".to_string(),
-                                    tool_logs: Vec::new(),
-                                    elapsed_ms: 0,
-                                }));
+                                emit(ProviderEvent::Agent(build_openai_done_event(
+                                    &content, None,
+                                )));
                                 emitted_done = true;
                             }
                         }
@@ -393,14 +428,9 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
             return Err(err);
         }
         if !emitted_done {
-            emit(ProviderEvent::Agent(AgentEvent::Done {
-                status: "Done. session saved".to_string(),
-                assistant_message: content,
-                completion_summary: "Provider turn finished successfully.".to_string(),
-                saved_status: "session saved".to_string(),
-                tool_logs: Vec::new(),
-                elapsed_ms: 0,
-            }));
+            emit(ProviderEvent::Agent(build_openai_done_event(
+                &content, None,
+            )));
         }
         Ok(())
     }
@@ -431,14 +461,9 @@ fn parse_openai_sse_response(body: &[u8]) -> Result<Vec<ProviderEvent>, Provider
                 events.push(ProviderEvent::TokenDelta(delta));
             }
             if choice.finish_reason.is_some() {
-                events.push(ProviderEvent::Agent(AgentEvent::Done {
-                    status: "Done. session saved".to_string(),
-                    assistant_message: content.clone(),
-                    completion_summary: "Provider turn finished successfully.".to_string(),
-                    saved_status: "session saved".to_string(),
-                    tool_logs: Vec::new(),
-                    elapsed_ms: 0,
-                }));
+                events.push(ProviderEvent::Agent(build_openai_done_event(
+                    &content, None,
+                )));
             }
         }
     }
@@ -447,14 +472,9 @@ fn parse_openai_sse_response(body: &[u8]) -> Result<Vec<ProviderEvent>, Provider
         .iter()
         .all(|event| !matches!(event, ProviderEvent::Agent(AgentEvent::Done { .. })))
     {
-        events.push(ProviderEvent::Agent(AgentEvent::Done {
-            status: "Done. session saved".to_string(),
-            assistant_message: content.clone(),
-            completion_summary: "Provider turn finished successfully.".to_string(),
-            saved_status: "session saved".to_string(),
-            tool_logs: Vec::new(),
-            elapsed_ms: 0,
-        }));
+        events.push(ProviderEvent::Agent(build_openai_done_event(
+            &content, None,
+        )));
     }
 
     Ok(events)

@@ -19,6 +19,7 @@ use crate::tooling::{
 use crate::tui::Tui;
 use std::sync::atomic::Ordering;
 
+use super::policy::{OFFLINE_BLOCK_PAYLOAD, check_offline_blocked};
 use super::{App, AppError};
 
 /// Maximum number of parallel threads for tool execution.
@@ -243,12 +244,14 @@ impl App {
     /// 3. Send updated session back to the LLM
     /// 4. If the LLM responds with more tool calls, repeat (up to MAX_AGENT_ITERATIONS)
     /// 5. When the LLM responds without tool calls, record as final answer
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn complete_structured_response<C: ProviderClient>(
         &mut self,
         structured: StructuredAssistantResponse,
         status: &str,
         saved_status: &str,
         elapsed_ms: u128,
+        inference_performance: Option<crate::contracts::InferencePerformanceView>,
         tui: &Tui,
         provider_client: &C,
     ) -> Result<Vec<String>, AppError> {
@@ -378,6 +381,14 @@ impl App {
                 {
                     break;
                 }
+                Err(
+                    ref err @ crate::provider::ProviderTurnError::ConnectionRefused(_)
+                    | ref err @ crate::provider::ProviderTurnError::DnsFailure(_)
+                    | ref err @ crate::provider::ProviderTurnError::AuthenticationFailed { .. }
+                    | ref err @ crate::provider::ProviderTurnError::ModelNotFound { .. },
+                ) => {
+                    return Err(AppError::ProviderTurn(err.clone()));
+                }
                 other => {
                     other.map_err(|err| match err {
                         crate::provider::ProviderTurnError::Cancelled => {
@@ -424,7 +435,7 @@ impl App {
         }
 
         // Transition to Done
-        let done = AppStateSnapshot::new(RuntimeState::Done)
+        let mut done = AppStateSnapshot::new(RuntimeState::Done)
             .with_status(status.to_string())
             .with_tool_logs(all_tool_log_views)
             .with_completion_summary(
@@ -435,6 +446,9 @@ impl App {
                 saved_status.to_string(),
             )
             .with_elapsed_ms(elapsed_ms);
+        if let Some(perf) = inference_performance {
+            done = done.with_inference_performance(perf);
+        }
         let mut done_snapshot = self.transition_with_context(done, StateTransition::Finish)?;
         self.evaluate_context_warning(&mut done_snapshot);
         frames.push(self.render_console(tui)?);
@@ -466,6 +480,24 @@ impl App {
                     continue;
                 }
             };
+
+            // Offline policy check: block network tools before approval
+            if let Some(summary) = check_offline_blocked(&self.config, call) {
+                failed_results.push((
+                    idx,
+                    ToolExecutionResult {
+                        tool_call_id: call.tool_call_id.clone(),
+                        tool_name: call.tool_name.clone(),
+                        status: ToolExecutionStatus::Failed,
+                        summary,
+                        payload: ToolExecutionPayload::Text(OFFLINE_BLOCK_PAYLOAD.to_string()),
+                        artifacts: Vec::new(),
+                        elapsed_ms: 0,
+                    },
+                ));
+                continue;
+            }
+
             if self.config.mode.approval_required && validated.approval_required(true).is_some() {
                 let summary = tool_call_approval_summary(call);
                 let diff_preview = generate_diff_preview(&self.config.paths.cwd, &call.input);
@@ -755,6 +787,7 @@ impl App {
             saved_status,
             tool_logs: _,
             elapsed_ms,
+            inference_performance,
         } = event
         else {
             return Ok(None);
@@ -771,6 +804,7 @@ impl App {
             status,
             saved_status,
             *elapsed_ms,
+            inference_performance.clone(),
             tui,
             provider_client,
         )?))

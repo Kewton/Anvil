@@ -68,4 +68,8 @@ pub struct CliArgs {
     /// Reasoning visibility level (hidden|summary)
     #[arg(long = "reasoning-visibility")]
     pub reasoning_visibility: Option<String>,
+
+    /// Run in offline mode (disable web tools and MCP)
+    #[arg(long)]
+    pub offline: bool,
 }

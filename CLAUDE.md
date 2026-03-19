@@ -106,6 +106,7 @@ src/
 │   ├── agentic.rs       # agenticツール実行ループ
 │   ├── cli.rs           # CLI入力ループ
 │   ├── plan.rs          # プラン管理
+│   ├── policy.rs        # offlineポリシーチェック（共通ヘルパー）
 │   ├── render.rs        # コンソール描画
 │   └── mock.rs          # テスト用モック
 ├── config/mod.rs        # 設定管理

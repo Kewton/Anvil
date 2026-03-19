@@ -122,11 +122,15 @@ pub enum ProviderEvent {
 pub enum ProviderTurnError {
     Cancelled,
     Network(String),
+    ConnectionRefused(String),
+    DnsFailure(String),
     ServerError { status_code: u16, message: String },
     ClientError { status_code: u16, message: String },
     Timeout(String),
     Parse(String),
     Backend(String),
+    ModelNotFound { model: String, message: String },
+    AuthenticationFailed { status_code: u16, message: String },
 }
 
 impl ProviderTurnError {
@@ -141,6 +145,16 @@ impl ProviderTurnError {
             Self::Network(_) | Self::ServerError { .. } | Self::Timeout(_)
         )
     }
+
+    /// Returns `true` if this error represents a connection refused condition.
+    pub fn is_connection_refused(&self) -> bool {
+        matches!(self, Self::ConnectionRefused(_))
+    }
+
+    /// Returns `true` if this error represents a DNS failure condition.
+    pub fn is_dns_failure(&self) -> bool {
+        matches!(self, Self::DnsFailure(_))
+    }
 }
 
 /// Classification of provider errors for persistence.
@@ -153,6 +167,10 @@ pub enum ProviderErrorKind {
     Timeout,
     Parse,
     Backend,
+    ConnectionRefused,
+    DnsFailure,
+    ModelNotFound,
+    AuthenticationFailed,
     #[serde(other)]
     Unknown,
 }
@@ -169,6 +187,14 @@ impl std::fmt::Display for ProviderTurnError {
         match self {
             Self::Cancelled => write!(f, "provider turn cancelled"),
             Self::Network(msg) => write!(f, "network error: {msg}"),
+            Self::ConnectionRefused(msg) => {
+                let redacted = redact_secrets(msg);
+                write!(f, "connection refused: {redacted}")
+            }
+            Self::DnsFailure(msg) => {
+                let redacted = redact_secrets(msg);
+                write!(f, "DNS resolution failed: {redacted}")
+            }
             Self::ServerError {
                 status_code,
                 message,
@@ -180,6 +206,17 @@ impl std::fmt::Display for ProviderTurnError {
             Self::Timeout(msg) => write!(f, "timeout: {msg}"),
             Self::Parse(msg) => write!(f, "parse error: {msg}"),
             Self::Backend(message) => write!(f, "provider backend error: {message}"),
+            Self::ModelNotFound { model, message } => {
+                let redacted = redact_secrets(message);
+                write!(f, "model '{model}' not found: {redacted}")
+            }
+            Self::AuthenticationFailed {
+                status_code,
+                message,
+            } => {
+                let redacted = redact_secrets(message);
+                write!(f, "authentication failed ({status_code}): {redacted}")
+            }
         }
     }
 }
@@ -191,11 +228,15 @@ impl From<&ProviderTurnError> for ProviderErrorKind {
         match err {
             ProviderTurnError::Cancelled => Self::Cancelled,
             ProviderTurnError::Network(_) => Self::Network,
+            ProviderTurnError::ConnectionRefused(_) => Self::ConnectionRefused,
+            ProviderTurnError::DnsFailure(_) => Self::DnsFailure,
             ProviderTurnError::ServerError { .. } => Self::ServerError,
             ProviderTurnError::ClientError { .. } => Self::ClientError,
             ProviderTurnError::Timeout(_) => Self::Timeout,
             ProviderTurnError::Parse(_) => Self::Parse,
             ProviderTurnError::Backend(_) => Self::Backend,
+            ProviderTurnError::ModelNotFound { .. } => Self::ModelNotFound,
+            ProviderTurnError::AuthenticationFailed { .. } => Self::AuthenticationFailed,
         }
     }
 }
@@ -269,7 +310,7 @@ impl LocalProviderClient {
     ///
     /// Dispatches to the inner client's `health_check` method.
     /// Returns `Ok(())` on success or a human-readable error message on failure.
-    pub fn health_check(&self) -> Result<(), String> {
+    pub fn health_check(&self) -> Result<(), ProviderTurnError> {
         match self {
             Self::Ollama(client) => client.health_check(),
             Self::OpenAi(client) => client.health_check(),
