@@ -818,6 +818,16 @@ pub struct LocalToolExecutor {
     web_search_provider: WebSearchProvider,
     serper_api_key: Option<String>,
     shutdown_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    http_client: reqwest::blocking::Client,
+}
+
+/// Build the shared HTTP client used by tooling (web.fetch / web.search).
+fn build_tooling_http_client() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("Failed to build HTTP client for tooling")
 }
 
 #[derive(Debug)]
@@ -857,6 +867,7 @@ impl LocalToolExecutor {
             web_search_provider: config.web_search_provider,
             serper_api_key: config.serper_api_key.clone(),
             shutdown_flag: None,
+            http_client: build_tooling_http_client(),
         }
     }
 
@@ -869,6 +880,7 @@ impl LocalToolExecutor {
             web_search_provider: WebSearchProvider::DuckDuckGo,
             serper_api_key: None,
             shutdown_flag: None,
+            http_client: build_tooling_http_client(),
         }
     }
 
@@ -1155,40 +1167,44 @@ impl LocalToolExecutor {
         url: &str,
         started: Instant,
     ) -> Result<ToolExecutionResult, ToolRuntimeError> {
-        let output = std::process::Command::new("curl")
-            .args([
-                "-s",
-                "-L",
-                "--fail",
-                "--max-time",
-                "30",
-                "--max-filesize",
-                "1048576",
-                "--max-redirs",
-                "5",
-                "--",
-                url,
-            ])
-            .output()
-            .map_err(|err| {
-                ToolRuntimeError::Io(format!("web.fetch failed to spawn curl: {err}"))
-            })?;
-
-        if output.status.success() {
-            let body = String::from_utf8_lossy(&output.stdout).to_string();
-            Ok(build_completed_result(
-                request,
-                url.to_string(),
-                ToolExecutionPayload::Text(body),
-                Vec::new(),
-                started,
-            ))
-        } else {
-            let stderr_msg = String::from_utf8_lossy(&output.stderr).to_string();
-            Err(ToolRuntimeError::Io(format!(
-                "web.fetch failed for {url}: {stderr_msg}"
-            )))
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            return Err(ToolRuntimeError::Io(
+                "Only http/https URLs allowed".to_string(),
+            ));
         }
+        let response = self
+            .http_client
+            .get(url)
+            .send()
+            .map_err(|err| ToolRuntimeError::Io(format!("web.fetch failed: {err}")))?;
+        if !response.status().is_success() {
+            return Err(ToolRuntimeError::Io(format!(
+                "web.fetch failed for {url}: HTTP {}",
+                response.status()
+            )));
+        }
+        if let Some(len) = response.content_length()
+            && len > 1_048_576
+        {
+            return Err(ToolRuntimeError::Io(
+                "Response too large (>1MB)".to_string(),
+            ));
+        }
+        let max_size: u64 = 1_048_576;
+        let mut body_bytes = Vec::new();
+        use std::io::Read;
+        response
+            .take(max_size)
+            .read_to_end(&mut body_bytes)
+            .map_err(|err| ToolRuntimeError::Io(format!("web.fetch read error: {err}")))?;
+        let body = String::from_utf8_lossy(&body_bytes).to_string();
+        Ok(build_completed_result(
+            request,
+            url.to_string(),
+            ToolExecutionPayload::Text(body),
+            Vec::new(),
+            started,
+        ))
     }
 
     fn execute_shell_exec(
@@ -1340,36 +1356,34 @@ impl LocalToolExecutor {
             format!("https://html.duckduckgo.com/html/?q={encoded_query}")
         };
 
-        let mut cmd = std::process::Command::new("curl");
-        cmd.args([
-            "-s",
-            "-L",
-            "--fail",
-            "--max-time",
-            "15",
-            "-H",
-            "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        ]);
+        let mut request_builder = self
+            .http_client
+            .get(&url)
+            .header(
+                "User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            );
 
         // Add Accept-Language header for CJK locales
         if let Some(ref lp) = locale_params {
-            cmd.args(["-H", &format!("Accept-Language: {}", lp.accept_language)]);
+            request_builder = request_builder.header("Accept-Language", &lp.accept_language);
         }
 
-        cmd.arg("--").arg(&url);
+        let response = request_builder
+            .send()
+            .map_err(|err| {
+                ToolRuntimeError::Io(format!("web.search failed: {err}"))
+            })?;
 
-        let output = cmd.output().map_err(|err| {
-            ToolRuntimeError::Io(format!("web.search failed to spawn curl: {err}"))
-        })?;
-
-        // HTTP failure → CaptchaBlocked (enables fallback)
-        if !output.status.success() {
+        if !response.status().is_success() {
             return Err(ToolRuntimeError::CaptchaBlocked {
                 query: query.to_string(),
             });
         }
 
-        let body = String::from_utf8_lossy(&output.stdout).to_string();
+        let body = response
+            .text()
+            .map_err(|err| ToolRuntimeError::Io(format!("web.search read error: {err}")))?;
 
         // Parse results using regex
         let results = parse_duckduckgo_results(&body);
@@ -1403,55 +1417,29 @@ impl LocalToolExecutor {
         })?;
 
         let body = serde_json::json!({"q": query}).to_string();
-        let header_value = format!("X-API-KEY: {api_key}");
 
-        let output = std::process::Command::new("curl")
-            .args([
-                "-s",
-                "-o",
-                "-",
-                "-w",
-                "\n%{http_code}",
-                "--max-time",
-                "10",
-                "-H",
-                &header_value,
-                "-H",
-                "Content-Type: application/json",
-                "-d",
-                &body,
-                "--",
-                "https://google.serper.dev/search",
-            ])
-            .output()
+        let response = self
+            .http_client
+            .post("https://google.serper.dev/search")
+            .header("X-API-KEY", api_key)
+            .header("Content-Type", "application/json")
+            .body(body)
+            .send()
             .map_err(|err| {
                 ToolRuntimeError::Io(format!(
-                    "web.search (SerperAPI) failed to spawn curl: {err}"
+                    "Failed to reach SerperAPI. Check your network connection. {err}"
                 ))
             })?;
 
-        if !output.status.success() {
-            let stderr_msg = String::from_utf8_lossy(&output.stderr).to_string();
-            return Err(ToolRuntimeError::Io(format!(
-                "Failed to reach SerperAPI. Check your network connection. {stderr_msg}"
-            )));
-        }
-
-        let raw_output = String::from_utf8_lossy(&output.stdout).to_string();
-        // Extract HTTP status code from the last line (appended by -w '\n%{http_code}')
-        let (response_body, http_code) = match raw_output.rsplit_once('\n') {
-            Some((body, code)) => (body.to_string(), code.trim().to_string()),
-            None => (raw_output, String::new()),
-        };
-
-        match http_code.as_str() {
-            "200" => {} // success
-            "401" | "403" => {
+        let status = response.status().as_u16();
+        match status {
+            200 => {} // success
+            401 | 403 => {
                 return Err(ToolRuntimeError::Io(
                     "Invalid or expired SerperAPI key.".to_string(),
                 ));
             }
-            "429" => {
+            429 => {
                 return Err(ToolRuntimeError::Io(
                     "SerperAPI rate limit exceeded. Please wait and retry.".to_string(),
                 ));
@@ -1462,6 +1450,10 @@ impl LocalToolExecutor {
                 )));
             }
         }
+
+        let response_body = response
+            .text()
+            .map_err(|err| ToolRuntimeError::Io(format!("SerperAPI read error: {err}")))?;
         let results = parse_serper_results(&response_body);
         let formatted = format_search_results(&results);
 

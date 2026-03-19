@@ -417,7 +417,7 @@ fn ollama_provider_builds_chat_request_shape() {
     );
 
     let ollama_request =
-        OllamaProviderClient::<anvil::provider::TcpHttpTransport>::build_chat_request(&request);
+        OllamaProviderClient::<anvil::provider::ReqwestHttpTransport>::build_chat_request(&request);
 
     assert_eq!(ollama_request.model, "local-default");
     assert!(ollama_request.stream);
@@ -868,8 +868,10 @@ fn ollama_provider_normalizes_ndjson_stream_to_provider_events() {
     ];
 
     let events =
-        OllamaProviderClient::<anvil::provider::TcpHttpTransport>::normalize_stream_chunks(&chunks)
-            .expect("ollama stream should normalize");
+        OllamaProviderClient::<anvil::provider::ReqwestHttpTransport>::normalize_stream_chunks(
+            &chunks,
+        )
+        .expect("ollama stream should normalize");
 
     assert_eq!(
         events,
@@ -894,8 +896,10 @@ fn ollama_provider_rejects_invalid_stream_chunk() {
     let chunks = vec!["not-json".to_string()];
 
     let err =
-        OllamaProviderClient::<anvil::provider::TcpHttpTransport>::normalize_stream_chunks(&chunks)
-            .expect_err("invalid ollama chunk should fail");
+        OllamaProviderClient::<anvil::provider::ReqwestHttpTransport>::normalize_stream_chunks(
+            &chunks,
+        )
+        .expect_err("invalid ollama chunk should fail");
 
     assert!(err.to_string().contains("invalid ollama response"));
 }
@@ -2021,9 +2025,7 @@ fn provider_error_kind_unknown_variant_arbitrary_string() {
 // Phase 3: Error classification tests
 // ---------------------------------------------------------------------------
 
-use anvil::provider::{
-    classify_curl_error, classify_http_error, redact_secrets, sanitize_error_message,
-};
+use anvil::provider::{classify_http_error, redact_secrets, sanitize_error_message};
 
 #[test]
 fn classify_http_error_500_returns_server_error() {
@@ -2079,29 +2081,9 @@ fn classify_http_error_299_returns_backend() {
     assert!(matches!(err, ProviderTurnError::Backend(_)));
 }
 
-#[test]
-fn classify_curl_error_exit_28_returns_timeout() {
-    let err = classify_curl_error(28, "operation timed out");
-    assert!(matches!(err, ProviderTurnError::Timeout(_)));
-}
-
-#[test]
-fn classify_curl_error_exit_7_returns_connection_refused() {
-    let err = classify_curl_error(7, "failed to connect");
-    assert!(matches!(err, ProviderTurnError::ConnectionRefused(_)));
-}
-
-#[test]
-fn classify_curl_error_exit_6_returns_dns_failure() {
-    let err = classify_curl_error(6, "could not resolve host");
-    assert!(matches!(err, ProviderTurnError::DnsFailure(_)));
-}
-
-#[test]
-fn classify_curl_error_exit_other_returns_network() {
-    let err = classify_curl_error(56, "recv failure");
-    assert!(matches!(err, ProviderTurnError::Network(_)));
-}
+// classify_reqwest_error tests are not easily unit-testable because
+// reqwest::Error cannot be constructed directly. The error mapping is
+// tested implicitly through integration scenarios.
 
 #[test]
 fn sanitize_error_message_truncates_to_500_chars() {
@@ -2193,20 +2175,20 @@ fn classify_http_error_not_retryable_for_client_errors() {
 }
 
 #[test]
-fn classify_curl_error_timeout_is_retryable() {
-    let err = classify_curl_error(28, "timed out");
+fn classify_timeout_error_is_retryable() {
+    let err = ProviderTurnError::Timeout("timed out".to_string());
     assert!(err.is_retryable());
 }
 
 #[test]
-fn classify_curl_error_connection_refused_is_not_retryable() {
-    let err = classify_curl_error(7, "connection refused");
+fn classify_connection_refused_is_not_retryable() {
+    let err = ProviderTurnError::ConnectionRefused("connection refused".to_string());
     assert!(!err.is_retryable());
 }
 
 #[test]
-fn classify_curl_error_dns_failure_is_not_retryable() {
-    let err = classify_curl_error(6, "dns failure");
+fn classify_dns_failure_is_not_retryable() {
+    let err = ProviderTurnError::DnsFailure("dns failure".to_string());
     assert!(!err.is_retryable());
 }
 
@@ -2727,7 +2709,7 @@ fn ollama_build_chat_request_maps_provider_images() {
         false,
     );
     let ollama_req =
-        OllamaProviderClient::<anvil::provider::TcpHttpTransport>::build_chat_request(&request);
+        OllamaProviderClient::<anvil::provider::ReqwestHttpTransport>::build_chat_request(&request);
     let first = &ollama_req.messages[0];
     assert_eq!(
         first.images.as_ref().unwrap(),

@@ -3,7 +3,9 @@
 //! Implements the [`ProviderClient`] trait for the Ollama local inference
 //! server via its `/api/chat` endpoint.
 
-use super::transport::{CurlHttpTransport, HttpTransport, RetryTransport, sanitize_error_message};
+use super::transport::{
+    HttpTransport, ReqwestHttpTransport, RetryTransport, sanitize_error_message,
+};
 use super::{
     ProviderClient, ProviderEvent, ProviderMessageRole, ProviderTurnError, ProviderTurnRequest,
     build_provider_done_event,
@@ -19,7 +21,7 @@ use crate::config::EffectiveConfig;
 use crate::contracts::InferencePerformanceView;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::process::Command;
+use std::time::Duration;
 
 /// Wire format for Ollama chat messages.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,7 +85,7 @@ fn extract_inference_performance(
 /// Client for the Ollama local inference server.
 ///
 /// Generic over [`HttpTransport`] so tests can inject a mock.
-pub struct OllamaProviderClient<T = RetryTransport<CurlHttpTransport>> {
+pub struct OllamaProviderClient<T = RetryTransport<ReqwestHttpTransport>> {
     base_url: String,
     transport: T,
 }
@@ -92,7 +94,7 @@ impl OllamaProviderClient {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into(),
-            transport: RetryTransport::new(CurlHttpTransport::new()),
+            transport: RetryTransport::new(ReqwestHttpTransport::new()),
         }
     }
 
@@ -197,7 +199,7 @@ impl Default for OllamaProviderClient {
     fn default() -> Self {
         Self {
             base_url: "http://127.0.0.1:11434".to_string(),
-            transport: RetryTransport::new(CurlHttpTransport::new()),
+            transport: RetryTransport::new(ReqwestHttpTransport::new()),
         }
     }
 }
@@ -297,17 +299,22 @@ impl<T: HttpTransport> ProviderClient for OllamaProviderClient<T> {
     }
 }
 
-/// Request body for the Ollama `/api/show` endpoint.
-#[derive(Serialize)]
-struct ShowRequest {
-    model: String,
-}
-
 /// Maximum allowed response size from `/api/show` (1 MiB).
 const MAX_SHOW_RESPONSE_SIZE: usize = 1_048_576;
 
 /// Upper bound for a sane `context_length` value (10 million tokens).
 const MAX_CONTEXT_LENGTH: u32 = 10_000_000;
+
+/// Shared HTTP client for Ollama metadata requests (timeout 5s).
+fn ollama_metadata_client() -> &'static reqwest::blocking::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::blocking::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("Failed to build Ollama metadata HTTP client")
+    })
+}
 
 /// Query the Ollama `/api/show` endpoint and extract the model's
 /// `context_length` from `model_info`.
@@ -315,41 +322,22 @@ const MAX_CONTEXT_LENGTH: u32 = 10_000_000;
 /// Returns `None` on any failure (network, parse, missing key).
 pub fn fetch_context_length_from_ollama(provider_url: &str, model: &str) -> Option<u32> {
     let url = format!("{}/api/show", provider_url.trim_end_matches('/'));
-    let body = serde_json::to_vec(&ShowRequest {
-        model: model.to_string(),
-    })
-    .ok()?;
-
-    let output = Command::new("curl")
-        .arg("-sS")
-        .arg("--max-time")
-        .arg("5")
-        .arg("--proto")
-        .arg("=http,https")
-        .arg("--max-filesize")
-        .arg(MAX_SHOW_RESPONSE_SIZE.to_string())
-        .arg("--data-binary")
-        .arg("@-")
-        .arg("--")
-        .arg(&url)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .ok()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                let _ = stdin.write_all(&body);
-            }
-            child.wait_with_output().ok()
-        })?;
-
-    if !output.status.success() {
+    let body = serde_json::json!({"model": model});
+    let client = ollama_metadata_client();
+    let response = client.post(&url).json(&body).send().ok()?;
+    if !response.status().is_success() {
         return None;
     }
-
-    parse_context_length_from_show_response(&output.stdout)
+    let bytes = {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        response
+            .take(MAX_SHOW_RESPONSE_SIZE as u64)
+            .read_to_end(&mut buf)
+            .ok()?;
+        buf
+    };
+    parse_context_length_from_show_response(&bytes)
 }
 
 /// Parse an Ollama `/api/show` JSON response body and extract context_length.
@@ -459,25 +447,21 @@ pub fn parse_model_info_from_show_response(json_bytes: &[u8]) -> Option<OllamaMo
 /// Returns `None` on any failure (network, parse, missing key).
 pub fn fetch_model_list_from_ollama(provider_url: &str) -> Option<Vec<OllamaModelEntry>> {
     let url = format!("{}/api/tags", provider_url.trim_end_matches('/'));
-
-    let output = Command::new("curl")
-        .arg("-sS")
-        .arg("--max-time")
-        .arg("5")
-        .arg("--proto")
-        .arg("=http,https")
-        .arg("--max-filesize")
-        .arg(MAX_TAGS_RESPONSE_SIZE.to_string())
-        .arg("--")
-        .arg(&url)
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
+    let client = ollama_metadata_client();
+    let response = client.get(&url).send().ok()?;
+    if !response.status().is_success() {
         return None;
     }
-
-    parse_model_list_from_tags_response(&output.stdout)
+    let bytes = {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        response
+            .take(MAX_TAGS_RESPONSE_SIZE as u64)
+            .read_to_end(&mut buf)
+            .ok()?;
+        buf
+    };
+    parse_model_list_from_tags_response(&bytes)
 }
 
 /// Fetch detailed model information from Ollama `/api/show`.
@@ -485,41 +469,22 @@ pub fn fetch_model_list_from_ollama(provider_url: &str) -> Option<Vec<OllamaMode
 /// Returns `None` on any failure (network, parse, missing key).
 pub fn fetch_model_info_from_ollama(provider_url: &str, model: &str) -> Option<OllamaModelInfo> {
     let url = format!("{}/api/show", provider_url.trim_end_matches('/'));
-    let body = serde_json::to_vec(&ShowRequest {
-        model: model.to_string(),
-    })
-    .ok()?;
-
-    let output = Command::new("curl")
-        .arg("-sS")
-        .arg("--max-time")
-        .arg("5")
-        .arg("--proto")
-        .arg("=http,https")
-        .arg("--max-filesize")
-        .arg(MAX_SHOW_RESPONSE_SIZE.to_string())
-        .arg("--data-binary")
-        .arg("@-")
-        .arg("--")
-        .arg(&url)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .ok()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                let _ = stdin.write_all(&body);
-            }
-            child.wait_with_output().ok()
-        })?;
-
-    if !output.status.success() {
+    let body = serde_json::json!({"model": model});
+    let client = ollama_metadata_client();
+    let response = client.post(&url).json(&body).send().ok()?;
+    if !response.status().is_success() {
         return None;
     }
-
-    parse_model_info_from_show_response(&output.stdout)
+    let bytes = {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        response
+            .take(MAX_SHOW_RESPONSE_SIZE as u64)
+            .read_to_end(&mut buf)
+            .ok()?;
+        buf
+    };
+    parse_model_info_from_show_response(&bytes)
 }
 
 // TODO: fetch_context_length_from_ollama, fetch_model_list_from_ollama,
@@ -528,21 +493,19 @@ pub fn fetch_model_info_from_ollama(provider_url: &str, model: &str) -> Option<O
 
 fn resolve_model_with_ollama_tags(base_url: &str, requested: &str) -> String {
     let url = format!("{}/api/tags", base_url.trim_end_matches('/'));
-    let output = Command::new("curl")
-        .arg("-sS")
-        .arg("--max-time")
-        .arg("5")
-        .arg(url)
-        .output();
-
-    let Ok(output) = output else {
-        return requested.to_string();
+    let client = ollama_metadata_client();
+    let response = match client.get(&url).send() {
+        Ok(r) => r,
+        Err(_) => return requested.to_string(),
     };
-    if !output.status.success() {
+    if !response.status().is_success() {
         return requested.to_string();
     }
-
-    let Ok(value) = serde_json::from_slice::<Value>(&output.stdout) else {
+    let bytes = match response.bytes() {
+        Ok(b) => b,
+        Err(_) => return requested.to_string(),
+    };
+    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
         return requested.to_string();
     };
     let Some(models) = value.get("models").and_then(Value::as_array) else {
