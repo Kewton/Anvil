@@ -2187,6 +2187,8 @@ pub struct CheckpointStack {
     total_bytes: usize,
     max_depth: usize,
     max_bytes: usize,
+    /// Active transaction mark position (`None` = no active transaction).
+    active_mark: Option<usize>,
 }
 
 impl CheckpointStack {
@@ -2197,41 +2199,103 @@ impl CheckpointStack {
             total_bytes: 0,
             max_depth: 20,
             max_bytes: 10 * 1024 * 1024,
+            active_mark: None,
         }
     }
 
     /// Push a checkpoint entry. Returns the index at which it was stored.
     ///
     /// When the stack exceeds depth or byte limits, the oldest entries are
-    /// discarded automatically.
+    /// discarded automatically. During an active transaction, only entries
+    /// before the mark are eligible for eviction.
     pub fn push(&mut self, entry: CheckpointEntry) -> usize {
         self.total_bytes += entry.byte_size;
         self.entries.push(entry);
-
-        // Evict oldest entries if depth exceeded
-        while self.entries.len() > self.max_depth {
-            let removed = self.entries.remove(0);
-            self.total_bytes = self.total_bytes.saturating_sub(removed.byte_size);
-        }
-
-        // Evict oldest entries if byte limit exceeded
-        while self.total_bytes > self.max_bytes && !self.entries.is_empty() {
-            let removed = self.entries.remove(0);
-            self.total_bytes = self.total_bytes.saturating_sub(removed.byte_size);
-        }
-
+        self.evict_oldest_while(|s| s.entries.len() > s.max_depth);
+        self.evict_oldest_while(|s| s.total_bytes > s.max_bytes);
         self.entries.len() - 1
     }
 
-    /// Remove the entry at the given index (for rollback on tool failure).
-    pub fn remove(&mut self, index: usize) -> Option<CheckpointEntry> {
-        if index < self.entries.len() {
-            let removed = self.entries.remove(index);
-            self.total_bytes = self.total_bytes.saturating_sub(removed.byte_size);
-            Some(removed)
-        } else {
-            None
+    /// Eviction helper (DRY for depth/byte limits).
+    ///
+    /// When `active_mark` is set, only entries before the mark position are
+    /// evicted, and the mark value is decremented accordingly.
+    ///
+    /// Note: `Vec::remove(0)` is O(n) per call, but acceptable here since
+    /// `max_depth` is small (default 20) and eviction runs infrequently.
+    fn evict_oldest_while(&mut self, should_evict: impl Fn(&Self) -> bool) {
+        while should_evict(self) && !self.entries.is_empty() {
+            // During a transaction, refuse to evict entries at or after the mark.
+            if self.active_mark == Some(0) {
+                break;
+            }
+            self.total_bytes = self.total_bytes.saturating_sub(self.entries[0].byte_size);
+            self.entries.remove(0);
+            if let Some(ref mut mark) = self.active_mark {
+                *mark = mark.saturating_sub(1);
+            }
         }
+    }
+
+    /// Remove the entry at the given index (for rollback on tool failure).
+    ///
+    /// When an active transaction mark exists, the mark is adjusted if the
+    /// removed entry was before the mark position.
+    pub fn remove(&mut self, index: usize) -> Option<CheckpointEntry> {
+        if index >= self.entries.len() {
+            return None;
+        }
+        let entry = self.entries.remove(index);
+        self.total_bytes = self.total_bytes.saturating_sub(entry.byte_size);
+        if let Some(ref mut mark) = self.active_mark
+            && index < *mark
+        {
+            *mark = mark.saturating_sub(1);
+        }
+        Some(entry)
+    }
+
+    /// Record the current stack position as a transaction mark.
+    ///
+    /// Returns the mark value (current `entries.len()`). Use with
+    /// `rollback_to_mark()` or `commit_mark()` to end the transaction.
+    pub fn mark(&mut self) -> usize {
+        let pos = self.entries.len();
+        self.active_mark = Some(pos);
+        pos
+    }
+
+    /// Clear the transaction mark without removing any entries.
+    ///
+    /// Called on successful transaction completion; checkpoints are kept
+    /// for `/undo`.
+    pub fn commit_mark(&mut self) {
+        self.active_mark = None;
+    }
+
+    /// Whether a transaction is currently active.
+    pub fn is_in_transaction(&self) -> bool {
+        self.active_mark.is_some()
+    }
+
+    /// Pop all entries added since the transaction mark and return them
+    /// (newest-first, deduplicated by path keeping the oldest checkpoint
+    /// per file).
+    ///
+    /// The `_mark` parameter is accepted for call-site clarity but ignored
+    /// internally; the actual mark position is tracked by [`mark()`] and
+    /// may have been adjusted by eviction.  The transaction is always
+    /// cleared after this call.
+    pub fn rollback_to_mark(&mut self, _mark: usize) -> Vec<CheckpointEntry> {
+        let effective_mark = match self.active_mark.take() {
+            Some(m) => m,
+            None => return Vec::new(),
+        };
+        if effective_mark >= self.entries.len() {
+            return Vec::new();
+        }
+        let n = self.entries.len() - effective_mark;
+        self.pop_n(n)
     }
 
     /// Pop the most recent entry.
