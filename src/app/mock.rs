@@ -87,11 +87,13 @@ impl MockAppExt for App {
                     tool_name: "Read".to_string(),
                     action: "open".to_string(),
                     target: "src/app/mod.rs".to_string(),
+                    elapsed_ms: None,
                 },
                 ToolLogView {
                     tool_name: "Grep".to_string(),
                     action: "search".to_string(),
                     target: "StateTransition".to_string(),
+                    elapsed_ms: None,
                 },
             ])
             .with_elapsed_ms(1_240)
@@ -114,11 +116,13 @@ impl MockAppExt for App {
                     tool_name: "Read".to_string(),
                     action: "open".to_string(),
                     target: "src/app/mod.rs".to_string(),
+                    elapsed_ms: None,
                 },
                 ToolLogView {
                     tool_name: "Write".to_string(),
                     action: "update".to_string(),
                     target: "workspace/work-plan.md".to_string(),
+                    elapsed_ms: None,
                 },
             ])
             .with_completion_summary(
@@ -126,6 +130,12 @@ impl MockAppExt for App {
                 "session saved",
             )
             .with_elapsed_ms(3_120)
+            .with_inference_performance(crate::contracts::InferencePerformanceView {
+                tokens_per_sec_tenths: Some(325),
+                eval_tokens: Some(150),
+                eval_duration_ms: Some(4615),
+                ..Default::default()
+            })
             .with_context_usage(
                 self.session().estimated_token_count(),
                 self.config().runtime.context_window,

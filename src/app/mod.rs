@@ -5,18 +5,21 @@
 /// executor.
 pub mod agentic;
 pub mod cli;
+mod context;
 pub mod mock;
 pub mod plan;
+pub mod policy;
 pub mod render;
 
 use crate::agent::BasicAgentLoop;
 use crate::agent::{AgentEvent, AgentRuntime, PendingTurnState, ProjectLanguage};
 use crate::config::EffectiveConfig;
+use crate::contracts::tokens::TokenCalibrationStore;
 use crate::contracts::{
     AppEvent, AppStateSnapshot, ConsoleRenderContext, ContextUsageView, ContextWarningLevel,
     RuntimeState,
 };
-use crate::extensions::{ExtensionLoadError, ExtensionRegistry, SlashCommandAction};
+use crate::extensions::{ExtensionLoadError, ExtensionRegistry, SlashCommandAction, TrustAction};
 use crate::provider::{
     ProviderBootstrapError, ProviderClient, ProviderErrorKind, ProviderErrorRecord, ProviderEvent,
     ProviderRuntimeContext, ProviderTurnError,
@@ -29,10 +32,11 @@ use crate::session::{
 use crate::spinner::Spinner;
 use crate::state::{StateMachine, StateTransition};
 use crate::tooling::{
-    ExecutionClass, ExecutionMode, PermissionClass, PlanModePolicy, RollbackPolicy, ToolKind,
-    ToolRegistry, ToolSpec,
+    CheckpointStack, ExecutionClass, ExecutionMode, PermissionClass, PlanModePolicy,
+    RollbackPolicy, ToolKind, ToolRegistry, ToolSpec,
 };
 use crate::tui::Tui;
+use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -110,15 +114,34 @@ pub struct App {
     session: SessionRecord,
     extensions: ExtensionRegistry,
     tools: ToolRegistry,
-    system_prompt: String,
+    detected_languages: Vec<ProjectLanguage>,
+    mcp_descriptions: Option<String>,
+    project_instructions: Option<String>,
     shutdown_flag: Arc<AtomicBool>,
     warning_tracker: ContextWarningTracker,
+    /// Undo checkpoint stack. In-memory only, discarded on session exit.
+    checkpoint_stack: CheckpointStack,
     /// Hooks engine. `None` when hooks.json is absent or initialization failed.
     /// Declared before mcp_manager to maintain Drop order (DR3-007).
     hooks_engine: Option<crate::hooks::HooksEngine>,
     /// MCP server manager. `None` when mcp.json is absent or initialization failed.
     /// [D2-010] Declared last so it is dropped last (Drop order = declaration order).
     mcp_manager: Option<crate::mcp::McpManager>,
+    /// Current session name (derived from session file stem).
+    current_session_name: String,
+    /// Trust mode: auto-approve built-in (non-MCP) tool execution.
+    trust_all: bool,
+    /// Individually trusted tool names (including MCP tools).
+    trusted_tools: HashSet<String>,
+    /// Session-scoped model override (Issue #77).
+    active_model: Option<String>,
+    /// Session-scoped context window override (Issue #77).
+    active_context_window: Option<u32>,
+    /// Token calibration store: accumulates actual vs estimated ratios per model.
+    calibration_store: TokenCalibrationStore,
+    /// Last estimated prompt tokens from build_turn_request_calibrated.
+    /// Consumed by apply_agent_event Done handler via Option::take.
+    last_estimated_prompt_tokens: Option<usize>,
 }
 
 /// Whether the session loop should continue or exit.
@@ -216,6 +239,37 @@ impl From<crate::state::StateTransitionError> for AppError {
     }
 }
 
+/// Parameters for auto-compaction (token-based and/or message-based).
+struct CompactParams {
+    keep_recent: usize,
+}
+
+/// Compute compaction parameters from session state and context window.
+/// Returns None if neither token-based nor message-based threshold is exceeded.
+fn compute_compact_params(session: &SessionRecord, context_window: u32) -> Option<CompactParams> {
+    let token_triggered = session.should_smart_compact(context_window);
+    let msg_triggered = session.should_compact();
+
+    if !token_triggered && !msg_triggered {
+        return None;
+    }
+
+    let token_based = if token_triggered {
+        let target_tokens = (context_window as f64 * crate::session::TARGET_TOKEN_RATIO) as usize;
+        crate::session::compute_token_based_keep_recent(&session.messages, target_tokens)
+    } else {
+        usize::MAX
+    };
+    let msg_based = if msg_triggered {
+        session.auto_compact_threshold / 2
+    } else {
+        usize::MAX
+    };
+    let keep_recent = std::cmp::min(token_based, msg_based);
+
+    Some(CompactParams { keep_recent })
+}
+
 impl App {
     pub fn new(
         config: EffectiveConfig,
@@ -235,23 +289,29 @@ impl App {
         let home_dir = std::env::var("HOME").ok().map(std::path::PathBuf::from);
         let extensions = ExtensionRegistry::load(&config.paths.cwd, home_dir.as_deref())?;
         session.auto_compact_threshold = config.runtime.auto_compact_threshold;
+        session.smart_compact_threshold_ratio = config.runtime.smart_compact_threshold_ratio;
 
         // --- MCP initialization (Task 3.2) ---
         // [D1-007] shutdown_flag is managed by App side (YAGNI)
-        let mcp_manager = match crate::config::load_mcp_config(&config.paths) {
-            Ok(Some(mcp_configs)) => {
-                match crate::mcp::McpManager::start_all(mcp_configs) {
-                    Ok(manager) => Some(manager),
-                    Err(e) => {
-                        eprintln!("Warning: MCP initialization failed: {e}");
-                        None // graceful degradation
+        // Offline mode: skip MCP initialization entirely (load_mcp_config included)
+        let mcp_manager = if config.mode.offline {
+            None
+        } else {
+            match crate::config::load_mcp_config(&config.paths) {
+                Ok(Some(mcp_configs)) => {
+                    match crate::mcp::McpManager::start_all(mcp_configs) {
+                        Ok(manager) => Some(manager),
+                        Err(e) => {
+                            eprintln!("Warning: MCP initialization failed: {e}");
+                            None // graceful degradation
+                        }
                     }
                 }
-            }
-            Ok(None) => None, // mcp.json not found → skip completely
-            Err(e) => {
-                eprintln!("Warning: MCP config parse error: {e}");
-                None // graceful degradation
+                Ok(None) => None, // mcp.json not found → skip completely
+                Err(e) => {
+                    eprintln!("Warning: MCP config parse error: {e}");
+                    None // graceful degradation
+                }
             }
         };
 
@@ -307,17 +367,24 @@ impl App {
         });
 
         let detected_languages = detect_project_languages(&config.paths.cwd);
-        let base_prompt = crate::agent::tool_protocol_system_prompt(
-            &detected_languages,
-            mcp_descriptions.as_deref(),
-        );
-        let system_prompt = match config.project_instructions() {
-            Some(instructions) => format!(
-                "{}\n\n## Project instructions (from ANVIL.md)\n{}",
-                base_prompt, instructions
-            ),
-            None => base_prompt,
-        };
+        let project_instructions = config.project_instructions().map(|s| s.to_string());
+
+        // Offline mode: warn about shell.exec network access
+        if config.mode.offline {
+            eprintln!(
+                "Warning: shell.exec can still access the network in offline mode. For full network isolation, use OS/firewall-level controls."
+            );
+        }
+
+        let current_session_name = config
+            .paths
+            .session_file
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("default")
+            .to_string();
+
+        let trust_all = config.mode.trust_all;
 
         Ok(Self {
             tools,
@@ -327,11 +394,21 @@ impl App {
             session_store,
             session,
             extensions,
-            system_prompt,
+            detected_languages,
+            mcp_descriptions,
+            project_instructions,
             shutdown_flag,
             warning_tracker: ContextWarningTracker::new(),
+            checkpoint_stack: CheckpointStack::new(),
             hooks_engine,
             mcp_manager,
+            current_session_name,
+            trust_all,
+            trusted_tools: HashSet::new(),
+            active_model: None,
+            active_context_window: None,
+            calibration_store: TokenCalibrationStore::new(),
+            last_estimated_prompt_tokens: None,
         })
     }
 
@@ -341,18 +418,22 @@ impl App {
     }
 
     fn build_initial_snapshot(&self) -> AppStateSnapshot {
+        let mut status = format!(
+            "Ready. provider={} model={} stream={} tools={}",
+            self.config.runtime.provider,
+            self.effective_model(),
+            self.provider.capabilities.streaming,
+            self.provider.capabilities.tool_calling
+        );
+        if self.config.mode.offline {
+            status.push_str(" offline=true");
+        }
         AppStateSnapshot::new(RuntimeState::Ready)
             .with_event(AppEvent::StartupCompleted)
-            .with_status(format!(
-                "Ready. provider={} model={} stream={} tools={}",
-                self.config.runtime.provider,
-                self.config.runtime.model,
-                self.provider.capabilities.streaming,
-                self.provider.capabilities.tool_calling
-            ))
+            .with_status(status)
             .with_context_usage(
                 self.session.estimated_token_count(),
-                self.config.runtime.context_window,
+                self.effective_context_window(),
             )
     }
 
@@ -372,6 +453,54 @@ impl App {
         &self.config
     }
 
+    /// Build a dynamic system prompt based on current session state.
+    ///
+    /// Called each turn to include only relevant tool descriptions.
+    /// Offline mode filters out web.* tools from the effective used_tools set.
+    fn build_dynamic_system_prompt(&self) -> String {
+        use crate::agent::tool_protocol_system_prompt;
+
+        // Offline mode: exclude web.* tools from used_tools.
+        // Non-offline: pass a reference directly to avoid cloning.
+        let filtered_tools;
+        let effective_used_tools = if self.config.mode.offline {
+            filtered_tools = self
+                .session
+                .used_tools
+                .iter()
+                .filter(|t| !t.starts_with("web."))
+                .cloned()
+                .collect();
+            &filtered_tools
+        } else {
+            &self.session.used_tools
+        };
+
+        let mut prompt = tool_protocol_system_prompt(
+            &self.detected_languages,
+            self.mcp_descriptions.as_deref(),
+            effective_used_tools,
+        );
+
+        // Current date and timezone (dynamic, re-evaluated per turn)
+        prompt.push_str(&context::format_date_prompt());
+
+        // Project instructions (from ANVIL.md)
+        if let Some(ref instructions) = self.project_instructions {
+            prompt.push_str("\n\n## Project instructions (from ANVIL.md)\n");
+            prompt.push_str(instructions);
+        }
+
+        // Offline mode annotation
+        if self.config.mode.offline {
+            prompt.push_str(
+                "\n\nNote: Offline mode is active. web.fetch and web.search are unavailable. Do not use shell.exec to make network requests (curl, wget, etc.). Use local tools only."
+            );
+        }
+
+        prompt
+    }
+
     /// Check whether a shutdown has been requested via the shared flag.
     pub fn is_shutdown_requested(&self) -> bool {
         self.shutdown_flag.load(Ordering::Relaxed)
@@ -383,6 +512,18 @@ impl App {
         self.session
             .last_turn_tool_results()
             .any(|result| result.is_error)
+    }
+
+    /// Check whether a provider error was recorded during this session.
+    /// Used by non-interactive mode to detect errors that `run_live_turn`
+    /// converted to `AgentEvent::Failed` (returning `Ok` instead of `Err`).
+    pub fn has_provider_error(&self) -> bool {
+        !self.session.provider_errors.is_empty()
+    }
+
+    /// Return the last recorded provider error, if any.
+    pub fn last_provider_error(&self) -> Option<&crate::provider::ProviderErrorRecord> {
+        self.session.provider_errors.last()
     }
 
     /// Save the session on exit (wrapper for flush_session).
@@ -415,12 +556,19 @@ impl App {
     /// Run PreCompact hook + compact_history (DR1-005 wrapper, DR2-003).
     ///
     /// trigger: "auto" or "manual"
-    /// For auto: checks should_compact() first, keep_recent = threshold/2
+    /// For auto: checks both token-based and message-count thresholds
     /// For manual: unconditional, keep_recent = 8
     fn compact_with_hooks(&mut self, trigger: &str) -> bool {
-        if trigger == "auto" && !self.session.should_compact() {
-            return false;
-        }
+        let keep_recent = if trigger == "auto" {
+            let context_window = self.effective_context_window();
+            let params = match compute_compact_params(&self.session, context_window) {
+                Some(p) => p,
+                None => return false,
+            };
+            params.keep_recent
+        } else {
+            8
+        };
 
         // Run PreCompact hook (soft-fail)
         if let Some(ref engine) = self.hooks_engine {
@@ -429,18 +577,25 @@ impl App {
                 session_id: self.session.metadata.session_id.clone(),
                 trigger: trigger.to_string(),
                 message_count: self.session.messages.len(),
+                estimated_tokens: self.session.estimated_token_count(),
             };
             if let Err(err) = engine.run_pre_compact(event) {
                 tracing::warn!("PreCompact hook error: {err}");
             }
         }
 
-        let keep_recent = if trigger == "auto" {
-            self.session.auto_compact_threshold / 2
-        } else {
-            8
-        };
-        self.session.compact_history(keep_recent)
+        let compacted = self.session.compact_history(keep_recent);
+
+        // Reset context warning tracker after successful compaction (auto/manual)
+        if compacted {
+            let usage = ContextUsageView {
+                estimated_tokens: self.session.estimated_token_count(),
+                max_tokens: self.effective_context_window(),
+            };
+            self.warning_tracker.reset_if_below_threshold(&usage);
+        }
+
+        compacted
     }
 
     /// Get a clone of the shutdown flag for injection into sub-components.
@@ -452,6 +607,73 @@ impl App {
         &mut self.session
     }
 
+    pub fn current_session_name(&self) -> &str {
+        &self.current_session_name
+    }
+
+    /// Return the effective model name for this session.
+    ///
+    /// Returns the session-scoped override if set, otherwise falls back to
+    /// the config default.
+    pub fn effective_model(&self) -> &str {
+        self.active_model
+            .as_deref()
+            .unwrap_or(&self.config.runtime.model)
+    }
+
+    /// Return the effective context window for this session.
+    ///
+    /// Returns the session-scoped override if set, otherwise falls back to
+    /// the config default.
+    pub fn effective_context_window(&self) -> u32 {
+        self.active_context_window
+            .unwrap_or(self.config.runtime.context_window)
+    }
+
+    /// Switch to a different named session.
+    ///
+    /// Validates the name, saves the current session, builds a new
+    /// `SessionStore`, loads or creates the target session, and resets
+    /// internal state.
+    fn switch_session(&mut self, name: &str) -> Result<Vec<String>, AppError> {
+        crate::session::validate_session_name(name)?;
+
+        if self.session.has_pending_turn() {
+            return Err(AppError::PendingApprovalRequired);
+        }
+
+        // Save current session
+        self.flush_session()?;
+
+        // Build new SessionStore
+        let new_path = self.config.paths.session_dir.join(format!("{name}.json"));
+        let new_store = SessionStore::new(new_path.clone(), self.config.paths.session_dir.clone());
+
+        // Load or create
+        let new_session = if new_path.exists() {
+            new_store.load()?
+        } else {
+            SessionRecord::new_named(name, self.config.paths.cwd.clone())?
+        };
+
+        // Reset fields
+        self.session_store = new_store;
+        self.session = new_session;
+        self.session.auto_compact_threshold = self.config.runtime.auto_compact_threshold;
+        self.session.smart_compact_threshold_ratio =
+            self.config.runtime.smart_compact_threshold_ratio;
+        self.state_machine =
+            StateMachine::from_snapshot(AppStateSnapshot::new(RuntimeState::Ready));
+        self.warning_tracker = ContextWarningTracker::new();
+        self.current_session_name = name.to_string();
+        self.active_model = None;
+        self.active_context_window = None;
+
+        tracing::info!(session_name = name, "Session switched");
+
+        Ok(vec![format!("Switched to session: {name}")])
+    }
+
     pub fn render_console(&self, tui: &Tui) -> Result<String, AppError> {
         Ok(tui.render_console(&self.build_console_render_context()))
     }
@@ -459,12 +681,22 @@ impl App {
     pub fn startup_console(&mut self, tui: &Tui) -> Result<String, AppError> {
         if self.session.message_count() == 0 && self.session.last_snapshot.is_none() {
             let snapshot = self.initial_snapshot()?;
-            return Ok(tui.render_startup(&self.config, &snapshot));
+            return Ok(tui.render_startup(
+                &self.config,
+                &snapshot,
+                self.effective_model(),
+                self.effective_context_window(),
+            ));
         }
 
         Ok(format!(
             "{}\n{}",
-            render::render_resume_header(&self.config),
+            render::render_resume_header(
+                self.effective_model(),
+                self.effective_context_window(),
+                &self.config,
+                &self.current_session_name,
+            ),
             tui.render_console(&self.build_startup_render_context())
         ))
     }
@@ -486,6 +718,40 @@ impl App {
             .push_message(new_user_message(message_id, content));
         self.persist_session(AppEvent::SessionSaved)?;
         Ok(())
+    }
+
+    /// Record user input with optional @file expanded content.
+    ///
+    /// Like `record_user_input` but sets `expanded_content` on the message
+    /// before pushing, so that `push_message` uses `effective_content()` for
+    /// accurate token estimation (IC-006).
+    fn record_user_input_with_expansion(
+        &mut self,
+        msg_id: &str,
+        user_input: &str,
+        expanded_content: Option<String>,
+    ) -> Result<(), AppError> {
+        let mut message = new_user_message(msg_id, user_input);
+        message.expanded_content = expanded_content;
+        self.session.push_message(message);
+        self.persist_session(AppEvent::SessionSaved)?;
+        Ok(())
+    }
+
+    /// Expand @file references in user input (DR1-002: separated from run_live_turn).
+    ///
+    /// Returns `Some(expanded_text)` when at least one reference was expanded,
+    /// or `None` when no @file references are present or all failed.
+    fn prepare_expanded_content(&self, user_input: &str) -> Option<String> {
+        let (expanded, errors) = context::expand_at_references(
+            user_input,
+            &self.config.paths.cwd,
+            102_400, // 100KB
+        );
+        for err in &errors {
+            eprintln!("@file展開エラー: {}", err);
+        }
+        expanded
     }
 
     pub fn record_assistant_output(
@@ -527,20 +793,32 @@ impl App {
         }
 
         let user_input = user_input.into();
-        self.record_user_input(self.next_message_id("user"), user_input)?;
+
+        // @file expansion: expand before recording so push_message gets
+        // accurate token estimation via effective_content() (DR1-004).
+        let expanded_content = self.prepare_expanded_content(&user_input);
+        self.record_user_input_with_expansion(
+            &self.next_message_id("user"),
+            &user_input,
+            expanded_content,
+        )?;
         self.begin_live_turn_state()?;
 
-        let request = BasicAgentLoop::build_turn_request(
-            self.config.runtime.model.clone(),
+        let system_prompt = self.build_dynamic_system_prompt();
+        let calibration_ratio = self.calibration_store.get_ratio(self.effective_model());
+        let (request, estimated_prompt_tokens) = BasicAgentLoop::build_turn_request_calibrated(
+            self.effective_model().to_string(),
             &self.session,
             self.provider.capabilities.streaming && self.config.runtime.stream,
-            self.config.runtime.context_window,
-            &self.system_prompt,
+            self.effective_context_window(),
+            &system_prompt,
+            calibration_ratio,
         );
+        self.last_estimated_prompt_tokens = Some(estimated_prompt_tokens);
 
         // Phase 1: Collect events from provider with spinner + streaming output.
         let mut spinner_opt = Some(Spinner::start(
-            format!("Thinking. model={}", self.config.runtime.model),
+            format!("Thinking. model={}", self.effective_model()),
             self.config.mode.interactive,
         ));
 
@@ -622,6 +900,7 @@ impl App {
                                     "Done. session saved",
                                     "session saved",
                                     0,
+                                    None,
                                     tui,
                                     provider_client,
                                 )?);
@@ -640,6 +919,66 @@ impl App {
                         interrupted_what: "provider turn".to_string(),
                         saved_status: "session preserved".to_string(),
                         next_actions: vec!["resume work".to_string(), "inspect status".to_string()],
+                        elapsed_ms: 0,
+                    }],
+                    tui,
+                )
+            }
+            Err(ref err @ ProviderTurnError::ConnectionRefused(ref msg)) => {
+                self.record_provider_error(err.clone())?;
+                self.execute_runtime_events(
+                    &[AgentEvent::Failed {
+                        status: "Error. connection refused".to_string(),
+                        error_summary: msg.clone(),
+                        recommended_actions: vec![
+                            "check provider is running (e.g. ollama serve)".to_string(),
+                            "verify provider URL".to_string(),
+                        ],
+                        elapsed_ms: 0,
+                    }],
+                    tui,
+                )
+            }
+            Err(ref err @ ProviderTurnError::DnsFailure(ref msg)) => {
+                self.record_provider_error(err.clone())?;
+                self.execute_runtime_events(
+                    &[AgentEvent::Failed {
+                        status: "Error. DNS resolution failed".to_string(),
+                        error_summary: msg.clone(),
+                        recommended_actions: vec![
+                            "check provider URL for typos".to_string(),
+                            "verify DNS settings and network connectivity".to_string(),
+                        ],
+                        elapsed_ms: 0,
+                    }],
+                    tui,
+                )
+            }
+            Err(ref err @ ProviderTurnError::ModelNotFound { ref model, .. }) => {
+                self.record_provider_error(err.clone())?;
+                self.execute_runtime_events(
+                    &[AgentEvent::Failed {
+                        status: "Error. model not found".to_string(),
+                        error_summary: format!("model '{}' not found", model),
+                        recommended_actions: vec![
+                            format!("download model: ollama pull {}", model),
+                            "list available models: ollama list".to_string(),
+                        ],
+                        elapsed_ms: 0,
+                    }],
+                    tui,
+                )
+            }
+            Err(ref err @ ProviderTurnError::AuthenticationFailed { ref message, .. }) => {
+                self.record_provider_error(err.clone())?;
+                self.execute_runtime_events(
+                    &[AgentEvent::Failed {
+                        status: "Error. authentication failed".to_string(),
+                        error_summary: message.clone(),
+                        recommended_actions: vec![
+                            "check API key: export ANVIL_API_KEY=<key>".to_string(),
+                            "verify provider credentials".to_string(),
+                        ],
                         elapsed_ms: 0,
                     }],
                     tui,
@@ -781,7 +1120,7 @@ impl App {
     ) -> Result<AppStateSnapshot, AppError> {
         let snapshot = snapshot.with_context_usage(
             self.session.estimated_token_count(),
-            self.config.runtime.context_window,
+            self.effective_context_window(),
         );
         self.apply_transition(snapshot, transition)
     }
@@ -947,13 +1286,27 @@ impl App {
                 saved_status,
                 tool_logs,
                 elapsed_ms,
+                inference_performance,
             } => {
                 self.record_assistant_output(self.next_message_id("assistant"), assistant_message)?;
-                let snapshot = AppStateSnapshot::new(RuntimeState::Done)
+
+                // Update calibration store with actual vs estimated prompt tokens.
+                let estimated = self.last_estimated_prompt_tokens.take();
+                if let Some(perf) = inference_performance
+                    && let (Some(actual_prompt), Some(est)) = (perf.prompt_tokens, estimated)
+                {
+                    let model = self.effective_model().to_string();
+                    self.calibration_store.update(&model, actual_prompt, est);
+                }
+
+                let mut snapshot = AppStateSnapshot::new(RuntimeState::Done)
                     .with_status(status.clone())
                     .with_tool_logs(render::build_tool_logs(tool_logs))
                     .with_completion_summary(completion_summary.clone(), saved_status.clone())
                     .with_elapsed_ms(*elapsed_ms);
+                if let Some(perf) = inference_performance {
+                    snapshot = snapshot.with_inference_performance(perf.clone());
+                }
                 let mut snapshot =
                     self.transition_with_context(snapshot, StateTransition::Finish)?;
                 self.evaluate_context_warning(&mut snapshot);
@@ -1000,7 +1353,7 @@ impl App {
         // tool execution output (Issue #1).
         self.session.console_render_context(
             self.state_machine.snapshot(),
-            &self.config.runtime.model,
+            self.effective_model(),
             self.config.runtime.max_console_messages,
             true,
         )
@@ -1011,7 +1364,7 @@ impl App {
         // the conversation history from the previous session.
         self.session.console_render_context(
             self.state_machine.snapshot(),
-            &self.config.runtime.model,
+            self.effective_model(),
             self.config.runtime.max_console_messages,
             false,
         )
@@ -1023,7 +1376,7 @@ impl App {
 
     fn begin_live_turn_state(&mut self) -> Result<(), AppError> {
         let snapshot = AppStateSnapshot::new(RuntimeState::Thinking)
-            .with_status(format!("Thinking. model={}", self.config.runtime.model))
+            .with_status(format!("Thinking. model={}", self.effective_model()))
             .with_elapsed_ms(0);
         self.transition_with_context(snapshot, StateTransition::StartThinking)?;
         Ok(())
@@ -1164,12 +1517,77 @@ impl App {
                 frames: vec![self.compact_session_history()?],
                 control: SessionControl::Continue,
             },
-            Some(SlashCommandAction::Model) => CliTurnOutput {
-                frames: vec![render::render_model_frame(&self.config)],
-                control: SessionControl::Continue,
-            },
+            Some(SlashCommandAction::ModelInfo) => {
+                let model = self.effective_model().to_string();
+                if self.provider.backend == crate::provider::ProviderBackend::Ollama {
+                    if let Some(info) = crate::provider::fetch_model_info_from_ollama(
+                        &self.config.runtime.provider_url,
+                        &model,
+                    ) {
+                        CliTurnOutput {
+                            frames: vec![render::render_model_info_frame(
+                                &model,
+                                &info,
+                                self.effective_context_window(),
+                            )],
+                            control: SessionControl::Continue,
+                        }
+                    } else {
+                        CliTurnOutput {
+                            frames: vec![render::render_model_frame(
+                                &model,
+                                &self.config.runtime.provider,
+                                self.effective_context_window(),
+                            )],
+                            control: SessionControl::Continue,
+                        }
+                    }
+                } else {
+                    CliTurnOutput {
+                        frames: vec![render::render_model_frame(
+                            &model,
+                            &self.config.runtime.provider,
+                            self.effective_context_window(),
+                        )],
+                        control: SessionControl::Continue,
+                    }
+                }
+            }
+            Some(SlashCommandAction::ModelList) => {
+                if self.provider.backend == crate::provider::ProviderBackend::Ollama {
+                    if let Some(models) = crate::provider::fetch_model_list_from_ollama(
+                        &self.config.runtime.provider_url,
+                    ) {
+                        let model = self.effective_model().to_string();
+                        CliTurnOutput {
+                            frames: vec![render::render_model_list_frame(&models, &model)],
+                            control: SessionControl::Continue,
+                        }
+                    } else {
+                        CliTurnOutput {
+                            frames: vec![
+                                "[A] anvil > failed to fetch model list from Ollama".to_string(),
+                            ],
+                            control: SessionControl::Continue,
+                        }
+                    }
+                } else {
+                    CliTurnOutput {
+                        frames: vec![
+                            "[A] anvil > model list is only available for Ollama provider"
+                                .to_string(),
+                        ],
+                        control: SessionControl::Continue,
+                    }
+                }
+            }
+            Some(SlashCommandAction::ModelSwitch(name)) => self.switch_model(&name),
             Some(SlashCommandAction::Provider) => CliTurnOutput {
-                frames: vec![render::render_provider_frame(&self.config, &self.provider)],
+                frames: vec![render::render_provider_frame(
+                    self.effective_model(),
+                    &self.config,
+                    &self.provider,
+                )],
                 control: SessionControl::Continue,
             },
             Some(SlashCommandAction::Approve) => CliTurnOutput {
@@ -1180,6 +1598,57 @@ impl App {
                 frames: self.deny_and_abort(tui)?,
                 control: SessionControl::Continue,
             },
+            Some(SlashCommandAction::Trust(action)) => {
+                let msg = match action {
+                    TrustAction::Show => {
+                        if self.trust_all {
+                            let mut lines = vec![
+                                "Trust mode: ON (all)".to_string(),
+                                "  Trusted tools: (all non-MCP tools)".to_string(),
+                            ];
+                            if !self.trusted_tools.is_empty() {
+                                let mut tools: Vec<_> =
+                                    self.trusted_tools.iter().cloned().collect();
+                                tools.sort();
+                                lines.push(format!("  Individually trusted: {}", tools.join(", ")));
+                            }
+                            lines.join("\n")
+                        } else if !self.trusted_tools.is_empty() {
+                            let mut tools: Vec<_> = self.trusted_tools.iter().cloned().collect();
+                            tools.sort();
+                            let mut lines = vec!["Trust mode: ON (selective)".to_string()];
+                            lines.push("  Trusted tools:".to_string());
+                            for tool in &tools {
+                                lines.push(format!("    - {tool}"));
+                            }
+                            lines.join("\n")
+                        } else {
+                            "Trust mode: OFF\n  No tools are trusted. Use /trust <tool> or /trust all.".to_string()
+                        }
+                    }
+                    TrustAction::Tool(name) => {
+                        if self.tools.get(&name).is_some() {
+                            self.trusted_tools.insert(name.clone());
+                            format!("Trusted: {name}")
+                        } else {
+                            format!("Unknown tool: {name}. Use /trust to see trusted tools.")
+                        }
+                    }
+                    TrustAction::All => {
+                        self.trust_all = true;
+                        "Trust mode: ON (all non-MCP tools auto-approved)".to_string()
+                    }
+                    TrustAction::Off => {
+                        self.trust_all = false;
+                        self.trusted_tools.clear();
+                        "Trust mode: OFF".to_string()
+                    }
+                };
+                CliTurnOutput {
+                    frames: vec![msg],
+                    control: SessionControl::Continue,
+                }
+            }
             Some(SlashCommandAction::Reset) => {
                 let _ = self.reset_to_ready()?;
                 CliTurnOutput {
@@ -1191,6 +1660,13 @@ impl App {
                 frames: vec!["Exiting Anvil.".to_string()],
                 control: SessionControl::Exit,
             },
+            Some(SlashCommandAction::Undo(n)) => {
+                let msg = self.execute_undo(n)?;
+                CliTurnOutput {
+                    frames: vec![msg],
+                    control: SessionControl::Continue,
+                }
+            }
             Some(SlashCommandAction::Prompt(prompt)) => {
                 self.run_turn_to_output(prompt, provider_client, tui)?
             }
@@ -1204,6 +1680,61 @@ impl App {
                     crate::extensions::skills::expand_variables(&content, &args, &skill_dir);
                 self.run_turn_to_output(prompt, provider_client, tui)?
             }
+            Some(SlashCommandAction::SessionList) => {
+                let sessions = self.session_store.list_sessions()?;
+                let output = if sessions.is_empty() {
+                    "[A] anvil > no sessions found".to_string()
+                } else {
+                    let mut lines = vec![format!("[A] anvil > {} session(s)", sessions.len())];
+                    for info in &sessions {
+                        let marker = if info.name == self.current_session_name {
+                            " *"
+                        } else {
+                            ""
+                        };
+                        lines.push(format!(
+                            "  {}{} ({} messages)",
+                            info.name, marker, info.message_count
+                        ));
+                    }
+                    lines.join("\n")
+                };
+                CliTurnOutput {
+                    frames: vec![output],
+                    control: SessionControl::Continue,
+                }
+            }
+            Some(SlashCommandAction::SessionDelete(name)) => {
+                if name == self.current_session_name {
+                    CliTurnOutput {
+                        frames: vec![format!(
+                            "[A] anvil > cannot delete the active session: {name}"
+                        )],
+                        control: SessionControl::Continue,
+                    }
+                } else {
+                    match self.session_store.delete_session(&name) {
+                        Ok(()) => CliTurnOutput {
+                            frames: vec![format!("[A] anvil > deleted session: {name}")],
+                            control: SessionControl::Continue,
+                        },
+                        Err(e) => CliTurnOutput {
+                            frames: vec![format!("[A] anvil > {e}")],
+                            control: SessionControl::Continue,
+                        },
+                    }
+                }
+            }
+            Some(SlashCommandAction::SessionSwitch(name)) => match self.switch_session(&name) {
+                Ok(frames) => CliTurnOutput {
+                    frames,
+                    control: SessionControl::Continue,
+                },
+                Err(e) => CliTurnOutput {
+                    frames: vec![format!("[A] anvil > {e}")],
+                    control: SessionControl::Continue,
+                },
+            },
             _ => {
                 let suggestion = self.extensions.suggest_command(command);
                 let msg = if let Some(suggested) = suggestion {
@@ -1249,15 +1780,148 @@ impl App {
         Ok(render_retrieval_result(&result))
     }
 
+    /// Capture a checkpoint for file-mutating tools before execution.
+    ///
+    /// Returns `Some(CheckpointEntry)` when the tool has
+    /// `RollbackPolicy::CheckpointBeforeWrite` and the file can be read.
+    pub(crate) fn capture_checkpoint_if_needed(
+        &self,
+        request: &crate::tooling::ToolExecutionRequest,
+        cwd: &std::path::Path,
+    ) -> Option<crate::tooling::CheckpointEntry> {
+        use crate::tooling::{
+            CHECKPOINT_FILE_SIZE_LIMIT, RollbackPolicy, ToolInput, diff::is_binary_content,
+        };
+
+        if request.spec.rollback_policy != RollbackPolicy::CheckpointBeforeWrite {
+            return None;
+        }
+
+        let rel_path = match &request.input {
+            ToolInput::FileWrite { path, .. } | ToolInput::FileEdit { path, .. } => path,
+            _ => return None,
+        };
+
+        let resolved = crate::tooling::resolve_sandbox_path(cwd, rel_path).ok()?;
+
+        match std::fs::read(&resolved) {
+            Ok(bytes) => {
+                if is_binary_content(&bytes) || bytes.len() as u64 > CHECKPOINT_FILE_SIZE_LIMIT {
+                    return None;
+                }
+                let content = String::from_utf8(bytes).ok()?;
+                let byte_size = content.len();
+                Some(crate::tooling::CheckpointEntry {
+                    path: resolved,
+                    previous_content: Some(content),
+                    byte_size,
+                })
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                // New file -- record None so undo can delete it
+                Some(crate::tooling::CheckpointEntry {
+                    path: resolved,
+                    previous_content: None,
+                    byte_size: 0,
+                })
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// Execute an undo operation, restoring up to `n` checkpoint entries.
+    fn execute_undo(&mut self, n: usize) -> Result<String, AppError> {
+        if self.checkpoint_stack.is_empty() {
+            return Ok("No changes to undo.".to_string());
+        }
+
+        let entries = self.checkpoint_stack.pop_n(n);
+        let results: Vec<crate::tooling::RestoreResult> =
+            entries.iter().map(|entry| entry.restore()).collect();
+
+        let restored_count = results
+            .iter()
+            .filter(|r| r.action != crate::tooling::RestoreAction::Skipped)
+            .count();
+
+        // Build result message
+        let mut lines = Vec::new();
+        for result in &results {
+            let action_str = match result.action {
+                crate::tooling::RestoreAction::ContentRestored => "restored",
+                crate::tooling::RestoreAction::FileRemoved => "removed",
+                crate::tooling::RestoreAction::Skipped => "skipped",
+            };
+            lines.push(format!("  {} {}", action_str, result.path.display()));
+            if let Some(ref preview) = result.diff_preview {
+                for diff_line in preview.lines().take(10) {
+                    lines.push(format!("    {diff_line}"));
+                }
+            }
+        }
+
+        let summary = if restored_count == entries.len() {
+            format!("Undid {} change(s).", restored_count)
+        } else {
+            format!("Undid {} of {} requested change(s).", restored_count, n)
+        };
+        lines.insert(0, summary.clone());
+
+        // Record in session
+        self.session.push_message(
+            SessionMessage::new(MessageRole::System, "anvil", format!("[undo] {summary}"))
+                .with_id(self.next_message_id("undo")),
+        );
+        self.persist_session(AppEvent::UndoExecuted)?;
+
+        Ok(lines.join("\n"))
+    }
+
+    /// Apply a model switch: validate the model and update active overrides.
+    fn apply_model_switch(&mut self, model_name: &str) -> Result<u32, String> {
+        if self.provider.backend == crate::provider::ProviderBackend::Ollama {
+            match crate::provider::fetch_model_info_from_ollama(
+                &self.config.runtime.provider_url,
+                model_name,
+            ) {
+                Some(info) => {
+                    self.active_model = Some(model_name.to_string());
+                    if let Some(ctx) = info.context_length {
+                        self.active_context_window = Some(ctx);
+                    }
+                    Ok(self.effective_context_window())
+                }
+                None => Err(format!(
+                    "model '{}' not found. Use /model list to see available models.",
+                    model_name
+                )),
+            }
+        } else {
+            // OpenAI-compatible: set model name only (no API validation)
+            self.active_model = Some(model_name.to_string());
+            Ok(self.effective_context_window())
+        }
+    }
+
+    /// Handle /model switch command dispatch.
+    fn switch_model(&mut self, model_name: &str) -> CliTurnOutput {
+        match self.apply_model_switch(model_name) {
+            Ok(ctx_window) => CliTurnOutput {
+                frames: vec![render::render_model_switch_success(model_name, ctx_window)],
+                control: SessionControl::Continue,
+            },
+            Err(msg) => CliTurnOutput {
+                frames: vec![format!("[A] anvil > {}", msg)],
+                control: SessionControl::Continue,
+            },
+        }
+    }
+
     fn compact_session_history(&mut self) -> Result<String, AppError> {
         let changed = self.compact_with_hooks("manual");
         if changed {
             self.persist_session(AppEvent::SessionSaved)?;
-            let usage = ContextUsageView {
-                estimated_tokens: self.session.estimated_token_count(),
-                max_tokens: self.config.runtime.context_window,
-            };
-            self.warning_tracker.reset_if_below_threshold(&usage);
+            // ContextWarningTracker reset is handled by compact_with_hooks()
             Ok("[A] anvil > compacted older session history".to_string())
         } else {
             Ok("[A] anvil > nothing to compact".to_string())
@@ -1306,17 +1970,48 @@ pub fn error_guidance(err: &AppError) -> String {
             "  - Each entry needs: name, description, prompt"
         )
         .to_string(),
-        AppError::ProviderTurn(turn_err) => {
-            let detail = turn_err.to_string();
-            if detail.contains("timeout") || detail.contains("max-time") {
-                "Hint: the request timed out\n  - Increase timeout: ANVIL_CURL_TIMEOUT=600\n  - Check if the model is responding: ollama ps".to_string()
-            } else if detail.contains("401") || detail.contains("403") || detail.contains("api key")
-            {
-                "Hint: authentication failed\n  - Set your API key: ANVIL_API_KEY=<key>\n  - Check the key format (some providers require 'Bearer ' prefix)".to_string()
-            } else {
-                "Hint: the provider turn failed\n  - Check if the model is available: ollama list\n  - Network issues may cause transient failures — try again".to_string()
+        AppError::ProviderTurn(turn_err) => match turn_err {
+            ProviderTurnError::ConnectionRefused(_) => concat!(
+                "Hint: Connection refused\n",
+                "  - Is the provider running? Try: ollama serve\n",
+                "  - Check URL: --provider-url http://127.0.0.1:11434\n",
+            )
+            .to_string(),
+            ProviderTurnError::DnsFailure(_) => concat!(
+                "Hint: DNS resolution failed\n",
+                "  - Check the provider URL for typos\n",
+                "  - Verify network connectivity\n",
+            )
+            .to_string(),
+            ProviderTurnError::ModelNotFound { model, .. } => format!(
+                "Hint: Model '{}' not found\n\
+                 \x20 - Download it: ollama pull {}\n\
+                 \x20 - List available models: ollama list\n",
+                model, model
+            ),
+            ProviderTurnError::AuthenticationFailed { .. } => concat!(
+                "Hint: Authentication failed\n",
+                "  - Check your API key or server configuration\n",
+                "  - Set API key: export ANVIL_API_KEY=<your-key>\n",
+                "  - API key format: some providers require 'Bearer <key>' prefix\n",
+                "  - IMPORTANT: Never share your API key in error reports or forums\n",
+            )
+            .to_string(),
+            ProviderTurnError::Timeout(_) => concat!(
+                "Hint: Request timed out\n",
+                "  - The provider may be overloaded\n",
+                "  - Try again or use a smaller model\n",
+            )
+            .to_string(),
+            _ => {
+                let detail = turn_err.to_string();
+                if detail.contains("401") || detail.contains("403") || detail.contains("api key") {
+                    "Hint: authentication failed\n  - Set your API key: ANVIL_API_KEY=<key>\n  - Check the key format (some providers require 'Bearer ' prefix)".to_string()
+                } else {
+                    "Hint: the provider turn failed\n  - Check if the model is available: ollama list\n  - Network issues may cause transient failures — try again".to_string()
+                }
             }
-        }
+        },
         _ => String::new(),
     }
 }

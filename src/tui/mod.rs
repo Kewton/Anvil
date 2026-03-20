@@ -23,11 +23,19 @@ impl Tui {
         Self
     }
 
-    pub fn render_startup(&self, config: &EffectiveConfig, snapshot: &AppStateSnapshot) -> String {
-        let mode = if config.mode.approval_required {
-            "local / confirm"
-        } else {
+    pub fn render_startup(
+        &self,
+        config: &EffectiveConfig,
+        snapshot: &AppStateSnapshot,
+        effective_model: &str,
+        effective_context_window: u32,
+    ) -> String {
+        let mode = if !config.mode.approval_required {
             "local / auto"
+        } else if config.mode.trust_all {
+            "local / trust"
+        } else {
+            "local / confirm"
         };
 
         let mut lines = vec![
@@ -39,8 +47,8 @@ impl Tui {
             String::new(),
             "  local coding agent for serious terminal work".to_string(),
             String::new(),
-            format!("  Model   : {}", config.runtime.model),
-            format!("  Context : {}k", config.runtime.context_window / 1_000),
+            format!("  Model   : {}", effective_model),
+            format!("  Context : {}k", effective_context_window / 1_000),
             format!("  Mode    : {mode}"),
             format!("  Project : {}", config.paths.cwd.display()),
         ];
@@ -139,9 +147,13 @@ impl Tui {
                 "  completed:{completed} failed:{failed} interrupted:{interrupted}"
             ));
             for log in &snapshot.tool_logs {
+                let elapsed_suffix = log
+                    .elapsed_ms
+                    .map(|ms| format!(" ({})", crate::spinner::format_elapsed_ms(ms)))
+                    .unwrap_or_default();
                 lines.push(format!(
-                    "[T] tool  > {:<6} {} {}",
-                    log.tool_name, log.action, log.target
+                    "[T] tool  > {:<6} {} {}{}",
+                    log.tool_name, log.action, log.target, elapsed_suffix
                 ));
             }
         }
@@ -184,9 +196,9 @@ impl Tui {
         lines.push(render_hint_line(snapshot));
         lines.push(status_divider());
 
-        if matches!(snapshot.state, RuntimeState::Done | RuntimeState::Ready) {
-            lines.push("[U] you >".to_string());
-        } else if matches!(
+        // Done/Ready: do NOT emit "[U] you >" here — the interactive
+        // readline prompt already displays it (Issue #96).
+        if matches!(
             snapshot.state,
             RuntimeState::Thinking | RuntimeState::Working | RuntimeState::AwaitingApproval
         ) {
@@ -227,12 +239,19 @@ impl Tui {
             })
             .unwrap_or_else(|| "active:-".to_string());
 
+        let perf = snapshot
+            .inference_performance
+            .as_ref()
+            .and_then(|p| p.formatted_tokens_per_sec())
+            .map(|s| format!("perf:{s}"))
+            .unwrap_or_else(|| "perf:-".to_string());
+
         let event = snapshot
             .last_event
             .map(|event| format!("event:{event:?}"))
             .unwrap_or_else(|| "event:-".to_string());
 
-        format!("{state}. {elapsed}   model:{model_name}   {ctx}   {active}   {event}")
+        format!("{state}. {elapsed}   model:{model_name}   {ctx}   {perf}   {active}   {event}")
     }
 }
 

@@ -4,7 +4,7 @@
 //! helpers.  These are `impl App` methods in a separate file for
 //! maintainability — the same pattern used by `mock.rs`.
 
-use crate::agent::subagent::{SubAgentError, SubAgentKind, SubAgentSession};
+use crate::agent::subagent::{SubAgentError, SubAgentKind, SubAgentOverrides, SubAgentSession};
 use crate::agent::{BasicAgentLoop, StructuredAssistantResponse};
 use crate::contracts::{AppStateSnapshot, RuntimeState, ToolLogView};
 use crate::provider::{ProviderClient, ProviderEvent};
@@ -13,12 +13,17 @@ use crate::spinner::Spinner;
 use crate::state::StateTransition;
 use crate::tooling::{
     ExecutionMode, LocalToolExecutor, ToolCallRequest, ToolExecutionPayload, ToolExecutionPolicy,
-    ToolExecutionRequest, ToolExecutionResult, ToolExecutionStatus, ToolInput,
+    ToolExecutionRequest, ToolExecutionResult, ToolExecutionStatus, ToolInput, ToolKind,
     diff::generate_diff_preview, resolve_sandbox_path,
 };
 use crate::tui::Tui;
-use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::tooling::PermissionClass;
+use std::collections::HashSet;
+
+use super::policy::{OFFLINE_BLOCK_PAYLOAD, check_offline_blocked};
 use super::{App, AppError};
 
 /// Maximum number of parallel threads for tool execution.
@@ -73,6 +78,7 @@ fn execute_parallel_group_standalone(
     config: &crate::config::EffectiveConfig,
     shutdown_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
     requests: Vec<(usize, ToolExecutionRequest)>,
+    completed: Arc<AtomicUsize>,
 ) -> Vec<(usize, ToolExecutionResult)> {
     let cwd = config.paths.cwd.clone();
     let runtime = &config.runtime;
@@ -86,6 +92,7 @@ fn execute_parallel_group_standalone(
                     let cwd = cwd.clone();
                     let shutdown = shutdown_flag.clone();
                     let idx = *idx;
+                    let completed = completed.clone();
                     s.spawn(move || {
                         let mut executor =
                             LocalToolExecutor::new(cwd, runtime).with_shutdown_flag(shutdown);
@@ -102,6 +109,7 @@ fn execute_parallel_group_standalone(
                                 elapsed_ms: 0,
                             }
                         });
+                        completed.fetch_add(1, Ordering::Relaxed);
                         (idx, result)
                     })
                 })
@@ -217,6 +225,10 @@ impl App {
                 self.config.paths.cwd.clone()
             };
 
+            let overrides = SubAgentOverrides {
+                model: self.active_model.clone(),
+                context_window: self.active_context_window,
+            };
             let session = SubAgentSession::new(
                 kind,
                 prompt,
@@ -224,6 +236,7 @@ impl App {
                 provider_client,
                 &self.config,
                 self.shutdown_flag(),
+                overrides,
             );
             let result = session.run();
             agent_results.push(match result {
@@ -243,12 +256,14 @@ impl App {
     /// 3. Send updated session back to the LLM
     /// 4. If the LLM responds with more tool calls, repeat (up to MAX_AGENT_ITERATIONS)
     /// 5. When the LLM responds without tool calls, record as final answer
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn complete_structured_response<C: ProviderClient>(
         &mut self,
         structured: StructuredAssistantResponse,
         status: &str,
         saved_status: &str,
         elapsed_ms: u128,
+        inference_performance: Option<crate::contracts::InferencePerformanceView>,
         tui: &Tui,
         provider_client: &C,
     ) -> Result<Vec<String>, AppError> {
@@ -332,18 +347,19 @@ impl App {
             let spinner = Spinner::start(
                 format!(
                     "Analyzing results. model={} (iteration {})",
-                    self.config.runtime.model,
+                    self.effective_model(),
                     iteration + 2
                 ),
                 self.config.mode.interactive,
             );
 
+            let system_prompt = self.build_dynamic_system_prompt();
             let request = BasicAgentLoop::build_turn_request(
-                self.config.runtime.model.clone(),
+                self.effective_model().to_string(),
                 &self.session,
                 self.provider.capabilities.streaming && self.config.runtime.stream,
-                self.config.runtime.context_window,
-                &self.system_prompt,
+                self.effective_context_window(),
+                &system_prompt,
             );
 
             let mut next_token_buffer = String::new();
@@ -377,6 +393,14 @@ impl App {
                     if self.is_shutdown_requested() =>
                 {
                     break;
+                }
+                Err(
+                    ref err @ crate::provider::ProviderTurnError::ConnectionRefused(_)
+                    | ref err @ crate::provider::ProviderTurnError::DnsFailure(_)
+                    | ref err @ crate::provider::ProviderTurnError::AuthenticationFailed { .. }
+                    | ref err @ crate::provider::ProviderTurnError::ModelNotFound { .. },
+                ) => {
+                    return Err(AppError::ProviderTurn(err.clone()));
                 }
                 other => {
                     other.map_err(|err| match err {
@@ -424,7 +448,7 @@ impl App {
         }
 
         // Transition to Done
-        let done = AppStateSnapshot::new(RuntimeState::Done)
+        let mut done = AppStateSnapshot::new(RuntimeState::Done)
             .with_status(status.to_string())
             .with_tool_logs(all_tool_log_views)
             .with_completion_summary(
@@ -435,6 +459,9 @@ impl App {
                 saved_status.to_string(),
             )
             .with_elapsed_ms(elapsed_ms);
+        if let Some(perf) = inference_performance {
+            done = done.with_inference_performance(perf);
+        }
         let mut done_snapshot = self.transition_with_context(done, StateTransition::Finish)?;
         self.evaluate_context_warning(&mut done_snapshot);
         frames.push(self.render_console(tui)?);
@@ -466,14 +493,46 @@ impl App {
                     continue;
                 }
             };
+
+            // Offline policy check: block network tools before approval
+            if let Some(summary) = check_offline_blocked(&self.config, call) {
+                failed_results.push((
+                    idx,
+                    ToolExecutionResult {
+                        tool_call_id: call.tool_call_id.clone(),
+                        tool_name: call.tool_name.clone(),
+                        status: ToolExecutionStatus::Failed,
+                        summary,
+                        payload: ToolExecutionPayload::Text(OFFLINE_BLOCK_PAYLOAD.to_string()),
+                        artifacts: Vec::new(),
+                        elapsed_ms: 0,
+                    },
+                ));
+                continue;
+            }
+
             if self.config.mode.approval_required && validated.approval_required(true).is_some() {
-                let summary = tool_call_approval_summary(call);
-                let diff_preview = generate_diff_preview(&self.config.paths.cwd, &call.input);
-                let approved = prompt_inline_approval(&summary, diff_preview.as_deref());
-                if !approved {
-                    failed_results
-                        .push((idx, build_failed_result(call, "denied by user".to_string())));
-                    continue;
+                if is_trusted(
+                    &call.tool_name,
+                    validated.spec.kind,
+                    validated.spec.permission_class,
+                    self.trust_all,
+                    &self.trusted_tools,
+                ) {
+                    let summary = tool_call_approval_summary(call);
+                    let _ = std::io::Write::write_fmt(
+                        &mut std::io::stderr(),
+                        format_args!("\n  [trusted] {summary}\n"),
+                    );
+                } else {
+                    let summary = tool_call_approval_summary(call);
+                    let diff_preview = generate_diff_preview(&self.config.paths.cwd, &call.input);
+                    let approved = prompt_inline_approval(&summary, diff_preview.as_deref());
+                    if !approved {
+                        failed_results
+                            .push((idx, build_failed_result(call, "denied by user".to_string())));
+                        continue;
+                    }
                 }
             }
             match validated
@@ -516,12 +575,17 @@ impl App {
             );
         }
 
-        // Built-in tools: delegate to LocalToolExecutor
-        let mut executor =
-            LocalToolExecutor::new(self.config.paths.cwd.clone(), &self.config.runtime)
-                .with_shutdown_flag(self.shutdown_flag());
+        // Capture checkpoint before file-mutating tools (Issue #68)
+        let cwd = self.config.paths.cwd.clone();
+        let checkpoint_idx = self
+            .capture_checkpoint_if_needed(&request, &cwd)
+            .map(|entry| self.checkpoint_stack.push(entry));
 
-        executor
+        // Built-in tools: delegate to LocalToolExecutor
+        let mut executor = LocalToolExecutor::new(cwd, &self.config.runtime)
+            .with_shutdown_flag(self.shutdown_flag());
+
+        let result = executor
             .execute(request)
             .unwrap_or_else(|err| ToolExecutionResult {
                 tool_call_id: String::new(),
@@ -531,7 +595,19 @@ impl App {
                 payload: ToolExecutionPayload::Text(err.to_string()),
                 artifacts: Vec::new(),
                 elapsed_ms: 0,
-            })
+            });
+
+        // Remove checkpoint if tool execution failed.
+        // During a transaction, skip individual removal — rollback_to_mark()
+        // will handle bulk cleanup.
+        if result.status == ToolExecutionStatus::Failed
+            && let Some(idx) = checkpoint_idx
+            && !self.checkpoint_stack.is_in_transaction()
+        {
+            self.checkpoint_stack.remove(idx);
+        }
+
+        result
     }
 
     /// Execute an MCP tool call via the McpManager.
@@ -661,31 +737,129 @@ impl App {
         // Phase 2: Grouping
         let groups = group_by_execution_mode(&validated_requests);
 
+        // Transaction begin: mark the checkpoint stack position before execution.
+        let mark = self.checkpoint_stack.mark();
+
+        // Build tool_call_id → ToolKind map for rollback judgment.
+        let tool_kind_map: std::collections::HashMap<String, ToolKind> = validated_requests
+            .iter()
+            .map(|(_, req)| (req.tool_call_id.clone(), req.spec.kind))
+            .collect();
+
         // Phase 3: Execution
+        let total_tools = validated_requests.len();
+        let interactive = self.config.mode.interactive;
         let mut indexed_results: Vec<(usize, ToolExecutionResult)> = failed_results;
+        let mut seq_counter = 0usize;
         for group in groups {
             match group {
                 ExecutionGroup::Parallel(requests) if requests.len() >= 2 => {
+                    let completed = Arc::new(AtomicUsize::new(0));
+                    let spinner =
+                        Spinner::start_parallel(requests.len(), completed.clone(), interactive);
                     let parallel_results = execute_parallel_group_standalone(
                         &self.config,
                         self.shutdown_flag(),
                         requests,
+                        completed,
                     );
+                    spinner.stop();
+                    seq_counter += parallel_results.len();
                     indexed_results.extend(parallel_results);
                 }
                 ExecutionGroup::Parallel(requests) => {
                     // Single ParallelSafe item — execute sequentially
                     for (idx, req) in requests {
+                        seq_counter += 1;
+                        let spinner = Spinner::start_tool(
+                            &req.spec.name,
+                            total_tools,
+                            seq_counter,
+                            interactive,
+                        );
+                        if req.spec.kind.produces_stderr() {
+                            spinner.pause();
+                        }
                         let result = self.execute_single(req);
+                        spinner.stop();
                         indexed_results.push((idx, result));
                     }
                 }
                 ExecutionGroup::Sequential(idx, req) => {
+                    seq_counter += 1;
+                    let spinner =
+                        Spinner::start_tool(&req.spec.name, total_tools, seq_counter, interactive);
+                    if req.spec.kind.produces_stderr() {
+                        spinner.pause();
+                    }
                     let result = self.execute_single(req);
+                    spinner.stop();
                     indexed_results.push((idx, result));
                 }
             }
         }
+
+        // Helper: check whether a tool_call_id refers to a file-mutating tool.
+        let is_file_mutation = |tool_call_id: &str| -> bool {
+            tool_kind_map
+                .get(tool_call_id)
+                .is_some_and(|kind| matches!(kind, ToolKind::FileWrite | ToolKind::FileEdit))
+        };
+
+        // Transaction check: determine if any file-mutating tool failed.
+        let has_file_mutation_failure = indexed_results.iter().any(|(_, r)| {
+            r.status == ToolExecutionStatus::Failed && is_file_mutation(&r.tool_call_id)
+        });
+
+        let rolled_back_ids: std::collections::HashSet<String> = if has_file_mutation_failure {
+            let entries = self.checkpoint_stack.rollback_to_mark(mark);
+            let restore_results: Vec<_> = entries.iter().map(|e| e.restore()).collect();
+            let restored_count = restore_results
+                .iter()
+                .filter(|r| r.action != crate::tooling::RestoreAction::Skipped)
+                .count();
+            let failed_restore_count = restore_results.len() - restored_count;
+
+            // Count failed file-mutating tools for the notification message
+            let failed_count = indexed_results
+                .iter()
+                .filter(|(_, r)| {
+                    r.status == ToolExecutionStatus::Failed && is_file_mutation(&r.tool_call_id)
+                })
+                .count();
+
+            // Build set of tool_call_ids that were involved in file mutations
+            // (both successful and failed) -- all are rolled back
+            let rb_ids: std::collections::HashSet<String> = indexed_results
+                .iter()
+                .filter(|(_, r)| is_file_mutation(&r.tool_call_id))
+                .map(|(_, r)| r.tool_call_id.clone())
+                .collect();
+
+            // Annotate successful file-mutating results with rollback info
+            for (_, r) in &mut indexed_results {
+                if r.status == ToolExecutionStatus::Completed && rb_ids.contains(&r.tool_call_id) {
+                    r.summary = format!("{} [rolled back: atomic transaction failed]", r.summary);
+                }
+            }
+
+            // Record system message for LLM awareness
+            let rollback_msg = format!(
+                "[System] Atomic transaction rolled back. {} file(s) restored to pre-transaction state \
+                 ({} restore failures). Reason: {} file tool(s) failed. \
+                 All file changes in this turn have been reverted.",
+                restored_count, failed_restore_count, failed_count
+            );
+            self.session.push_message(
+                SessionMessage::new(MessageRole::System, "system", rollback_msg)
+                    .with_id(self.next_message_id("system")),
+            );
+
+            rb_ids
+        } else {
+            self.checkpoint_stack.commit_mark();
+            std::collections::HashSet::new()
+        };
 
         // Phase 4: Sort by index, record results, run PostToolUse hooks (DR2-004)
         indexed_results.sort_by_key(|(idx, _)| *idx);
@@ -693,7 +867,28 @@ impl App {
         for (_, result) in indexed_results {
             self.record_tool_result(&result);
 
-            // PostToolUse hook (soft-fail)
+            // Emit folded tool result to stderr for interactive sessions
+            if interactive {
+                let output_text = match &result.payload {
+                    ToolExecutionPayload::Text(content) => content.as_str(),
+                    ToolExecutionPayload::Paths(_) => "",
+                    _ => "",
+                };
+                let display = crate::app::render::format_tool_result_for_display(
+                    &result.tool_name,
+                    &result.summary,
+                    output_text,
+                    result.elapsed_ms.min(u64::MAX as u128) as u64,
+                );
+                let _ =
+                    std::io::Write::write_fmt(&mut std::io::stderr(), format_args!("{display}\n"));
+            }
+
+            // PostToolUse hook (soft-fail) — skip for rolled-back results
+            if rolled_back_ids.contains(&result.tool_call_id) {
+                results.push(result);
+                continue;
+            }
             if let Some(ref engine) = self.hooks_engine
                 && let Some((tool_name, tool_input)) = tool_input_map.get(&result.tool_call_id)
             {
@@ -725,10 +920,13 @@ impl App {
 
     /// Push a tool execution result into the session as a tool message.
     fn record_tool_result(&mut self, result: &ToolExecutionResult) {
+        // Track tool usage for dynamic system prompt generation (Issue #73)
+        self.session.used_tools.insert(result.tool_name.clone());
+
         let is_error = result.status == ToolExecutionStatus::Failed;
         let mut msg = SessionMessage::new(
             MessageRole::Tool,
-            "tool",
+            &result.tool_name,
             format_tool_result_message(result, self.config.runtime.tool_result_max_chars),
         )
         .with_id(self.next_message_id("tool"));
@@ -755,6 +953,7 @@ impl App {
             saved_status,
             tool_logs: _,
             elapsed_ms,
+            inference_performance,
         } = event
         else {
             return Ok(None);
@@ -771,6 +970,7 @@ impl App {
             status,
             saved_status,
             *elapsed_ms,
+            inference_performance.clone(),
             tui,
             provider_client,
         )?))
@@ -786,8 +986,12 @@ pub(crate) fn infer_plan_from_structured_response(
             crate::tooling::ToolInput::FileWrite { path, .. } => format!("write {path}"),
             crate::tooling::ToolInput::FileEdit { path, .. } => format!("edit {path}"),
             crate::tooling::ToolInput::FileRead { path } => format!("read {path}"),
-            crate::tooling::ToolInput::FileSearch { pattern, .. } => {
-                format!("search for {pattern}")
+            crate::tooling::ToolInput::FileSearch { pattern, regex, .. } => {
+                if *regex {
+                    format!("regex search for {pattern}")
+                } else {
+                    format!("search for {pattern}")
+                }
             }
             crate::tooling::ToolInput::ShellExec { command } => {
                 format!("run shell command: {command}")
@@ -807,6 +1011,22 @@ pub(crate) fn infer_plan_from_structured_response(
                 let truncated = truncate_chars(prompt, 50);
                 format!("plan: {truncated}")
             }
+            crate::tooling::ToolInput::GitStatus {} => "git status".to_string(),
+            crate::tooling::ToolInput::GitDiff { path, .. } => {
+                if let Some(p) = path {
+                    format!("git diff {p}")
+                } else {
+                    "git diff".to_string()
+                }
+            }
+            crate::tooling::ToolInput::GitLog { count, path } => {
+                let count_str = count.map_or("10".to_string(), |c| c.to_string());
+                if let Some(p) = path {
+                    format!("git log -{count_str} {p}")
+                } else {
+                    format!("git log -{count_str}")
+                }
+            }
         };
         plan.push(item);
     }
@@ -824,11 +1044,12 @@ pub fn format_tool_result_message(result: &ToolExecutionResult, max_chars: usize
             format!("[tool result: {}] {}", result.tool_name, result.summary)
         }
         ToolExecutionPayload::Text(content) => {
-            let truncated = if content.len() > max_chars {
+            let truncated = if content.chars().count() > max_chars {
+                let cut: String = content.chars().take(max_chars).collect();
                 format!(
-                    "{}...\n[truncated, {} bytes total]",
-                    &content[..max_chars],
-                    content.len()
+                    "{}...\n[truncated, {} chars total]",
+                    cut,
+                    content.chars().count()
                 )
             } else {
                 content.clone()
@@ -944,5 +1165,103 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
     } else {
         let truncated: String = s.chars().take(max_chars).collect();
         format!("{truncated}...")
+    }
+}
+
+/// Determine whether a tool call should be auto-approved based on trust settings.
+///
+/// This is a pure function for testability; it does not access `App` state directly.
+pub(crate) fn is_trusted(
+    tool_name: &str,
+    kind: ToolKind,
+    permission_class: PermissionClass,
+    trust_all: bool,
+    trusted_tools: &HashSet<String>,
+) -> bool {
+    if permission_class == PermissionClass::Restricted {
+        return false;
+    }
+    if trust_all && kind != ToolKind::Mcp {
+        return true;
+    }
+    trusted_tools.contains(tool_name)
+}
+
+#[cfg(test)]
+mod trust_tests {
+    use super::*;
+
+    #[test]
+    fn trust_all_auto_approves_confirm_tools() {
+        let trusted_tools = HashSet::new();
+        assert!(is_trusted(
+            "shell.exec",
+            ToolKind::ShellExec,
+            PermissionClass::Confirm,
+            true,
+            &trusted_tools,
+        ));
+    }
+
+    #[test]
+    fn trust_all_blocks_restricted_tools() {
+        let trusted_tools = HashSet::new();
+        assert!(!is_trusted(
+            "some.restricted",
+            ToolKind::ShellExec,
+            PermissionClass::Restricted,
+            true,
+            &trusted_tools,
+        ));
+    }
+
+    #[test]
+    fn trust_all_blocks_mcp_tools() {
+        let trusted_tools = HashSet::new();
+        assert!(!is_trusted(
+            "mcp__github__create_issue",
+            ToolKind::Mcp,
+            PermissionClass::Confirm,
+            true,
+            &trusted_tools,
+        ));
+    }
+
+    #[test]
+    fn individual_trust_approves_specific_tool() {
+        let mut trusted_tools = HashSet::new();
+        trusted_tools.insert("file.edit".to_string());
+        assert!(is_trusted(
+            "file.edit",
+            ToolKind::FileEdit,
+            PermissionClass::Confirm,
+            false,
+            &trusted_tools,
+        ));
+    }
+
+    #[test]
+    fn individual_trust_allows_mcp() {
+        let mut trusted_tools = HashSet::new();
+        trusted_tools.insert("mcp__github__create_issue".to_string());
+        assert!(is_trusted(
+            "mcp__github__create_issue",
+            ToolKind::Mcp,
+            PermissionClass::Confirm,
+            false,
+            &trusted_tools,
+        ));
+    }
+
+    #[test]
+    fn untrusted_tool_returns_false() {
+        let trusted_tools = HashSet::new();
+        assert!(!is_trusted(
+            "file.edit",
+            ToolKind::FileEdit,
+            PermissionClass::Confirm,
+            false,
+            &trusted_tools,
+        ));
     }
 }

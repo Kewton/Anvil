@@ -5,6 +5,15 @@ use skills::SkillScope;
 use std::fmt::{Display, Formatter};
 use std::path::{Path, PathBuf};
 
+/// Sub-actions for the /trust slash command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrustAction {
+    Show,
+    Tool(String),
+    All,
+    Off,
+}
+
 /// Action to perform when a slash command is invoked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlashCommandAction {
@@ -18,7 +27,9 @@ pub enum SlashCommandAction {
     RepoFind(String),
     Timeline,
     Compact,
-    Model,
+    ModelList,
+    ModelSwitch(String),
+    ModelInfo,
     Provider,
     Approve,
     Deny,
@@ -31,6 +42,11 @@ pub enum SlashCommandAction {
         content: String,
         skill_dir: PathBuf,
     },
+    SessionList,
+    SessionSwitch(String),
+    SessionDelete(String),
+    Trust(TrustAction),
+    Undo(usize),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,10 +149,22 @@ impl ExtensionRegistry {
     }
 
     pub fn find_slash_command(&self, command: &str) -> Option<SlashCommandSpec> {
+        if let Some(parsed) = parse_undo_command(command) {
+            return Some(parsed);
+        }
         if let Some(parsed) = parse_plan_command(command) {
             return Some(parsed);
         }
         if let Some(parsed) = parse_repo_command(command) {
+            return Some(parsed);
+        }
+        if let Some(parsed) = parse_session_command(command) {
+            return Some(parsed);
+        }
+        if let Some(parsed) = parse_model_command(command) {
+            return Some(parsed);
+        }
+        if let Some(parsed) = parse_trust_command(command) {
             return Some(parsed);
         }
         if let found @ Some(_) = self
@@ -230,8 +258,8 @@ pub fn builtin_slash_commands() -> Vec<SlashCommandSpec> {
         },
         SlashCommandSpec {
             name: "/model".to_string(),
-            description: "show the current model context".to_string(),
-            action: SlashCommandAction::Model,
+            description: "model management (list/switch/info)".to_string(),
+            action: SlashCommandAction::ModelInfo,
             scope: None,
         },
         SlashCommandSpec {
@@ -259,9 +287,27 @@ pub fn builtin_slash_commands() -> Vec<SlashCommandSpec> {
             scope: None,
         },
         SlashCommandSpec {
+            name: "/trust".to_string(),
+            description: "show or manage trust settings (/trust [all|off|<tool>])".to_string(),
+            action: SlashCommandAction::Trust(TrustAction::Show),
+            scope: None,
+        },
+        SlashCommandSpec {
+            name: "/undo".to_string(),
+            description: "undo the last file change(s)".to_string(),
+            action: SlashCommandAction::Undo(1),
+            scope: None,
+        },
+        SlashCommandSpec {
             name: "/exit".to_string(),
             description: "exit the session".to_string(),
             action: SlashCommandAction::Exit,
+            scope: None,
+        },
+        SlashCommandSpec {
+            name: "/session".to_string(),
+            description: "manage sessions (list/switch/delete)".to_string(),
+            action: SlashCommandAction::SessionList,
             scope: None,
         },
     ]
@@ -351,6 +397,59 @@ fn edit_distance(a: &str, b: &str) -> usize {
     prev[n]
 }
 
+fn parse_session_command(command: &str) -> Option<SlashCommandSpec> {
+    let rest = command.strip_prefix("/session")?.trim();
+
+    let action = if rest.is_empty() || rest == "list" {
+        SlashCommandAction::SessionList
+    } else if let Some(name) = rest.strip_prefix("switch ") {
+        let name = name.trim();
+        if name.is_empty() {
+            return None;
+        }
+        SlashCommandAction::SessionSwitch(name.to_string())
+    } else if let Some(name) = rest.strip_prefix("delete ") {
+        let name = name.trim();
+        if name.is_empty() {
+            return None;
+        }
+        SlashCommandAction::SessionDelete(name.to_string())
+    } else {
+        return None;
+    };
+
+    Some(SlashCommandSpec {
+        name: "/session".to_string(),
+        description: "manage sessions (list/switch/delete)".to_string(),
+        action,
+        scope: None,
+    })
+}
+
+/// Maximum number of undo steps allowed in a single `/undo N` command.
+const MAX_UNDO_STEPS: usize = 20;
+
+fn parse_undo_command(command: &str) -> Option<SlashCommandSpec> {
+    let n = if command == "/undo" {
+        1
+    } else if let Some(rest) = command.strip_prefix("/undo ") {
+        let parsed = rest.trim().parse::<usize>().ok()?;
+        if parsed == 0 {
+            return None;
+        }
+        parsed.min(MAX_UNDO_STEPS)
+    } else {
+        return None;
+    };
+
+    Some(SlashCommandSpec {
+        name: "/undo".to_string(),
+        description: "undo the last file change(s)".to_string(),
+        action: SlashCommandAction::Undo(n),
+        scope: None,
+    })
+}
+
 fn parse_repo_command(command: &str) -> Option<SlashCommandSpec> {
     let rest = command.strip_prefix("/repo-find ")?;
     let query = rest.trim();
@@ -363,4 +462,135 @@ fn parse_repo_command(command: &str) -> Option<SlashCommandSpec> {
         action: SlashCommandAction::RepoFind(query.to_string()),
         scope: None,
     })
+}
+
+fn is_valid_model_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 128 {
+        return false;
+    }
+    // '/' is not allowed (path traversal '../' prevention)
+    name.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == ':' || c == '.')
+}
+
+fn parse_model_command(command: &str) -> Option<SlashCommandSpec> {
+    let trimmed = command.trim();
+    if !trimmed.starts_with("/model") {
+        return None;
+    }
+    let rest = trimmed.strip_prefix("/model")?.trim();
+
+    let action = if rest.is_empty() {
+        SlashCommandAction::ModelInfo // /model (no args) = info
+    } else if rest == "list" {
+        SlashCommandAction::ModelList
+    } else if rest == "info" {
+        SlashCommandAction::ModelInfo
+    } else if let Some(name) = rest.strip_prefix("switch ") {
+        let name = name.trim();
+        if name.is_empty() {
+            return None;
+        }
+        if !is_valid_model_name(name) {
+            return None;
+        }
+        SlashCommandAction::ModelSwitch(name.to_string())
+    } else if rest == "switch" {
+        return None; // /model switch without arg → None
+    } else {
+        return None;
+    };
+
+    Some(SlashCommandSpec {
+        name: trimmed.to_string(),
+        description: String::new(),
+        action,
+        scope: None,
+    })
+}
+
+fn parse_trust_command(command: &str) -> Option<SlashCommandSpec> {
+    if command == "/trust" {
+        return Some(SlashCommandSpec {
+            name: "/trust".to_string(),
+            description: "show current trust settings".to_string(),
+            action: SlashCommandAction::Trust(TrustAction::Show),
+            scope: None,
+        });
+    }
+
+    let rest = command.strip_prefix("/trust ")?.trim();
+    if rest.is_empty() {
+        return Some(SlashCommandSpec {
+            name: "/trust".to_string(),
+            description: "show current trust settings".to_string(),
+            action: SlashCommandAction::Trust(TrustAction::Show),
+            scope: None,
+        });
+    }
+
+    let action = match rest {
+        "all" => TrustAction::All,
+        "off" => TrustAction::Off,
+        tool_name => TrustAction::Tool(tool_name.to_string()),
+    };
+
+    Some(SlashCommandSpec {
+        name: "/trust".to_string(),
+        description: "manage trust settings".to_string(),
+        action: SlashCommandAction::Trust(action),
+        scope: None,
+    })
+}
+
+#[cfg(test)]
+mod trust_parse_tests {
+    use super::*;
+
+    #[test]
+    fn parse_trust_show() {
+        let result = parse_trust_command("/trust").unwrap();
+        assert_eq!(result.action, SlashCommandAction::Trust(TrustAction::Show));
+    }
+
+    #[test]
+    fn parse_trust_show_with_trailing_space() {
+        let result = parse_trust_command("/trust ").unwrap();
+        assert_eq!(result.action, SlashCommandAction::Trust(TrustAction::Show));
+    }
+
+    #[test]
+    fn parse_trust_all() {
+        let result = parse_trust_command("/trust all").unwrap();
+        assert_eq!(result.action, SlashCommandAction::Trust(TrustAction::All));
+    }
+
+    #[test]
+    fn parse_trust_off() {
+        let result = parse_trust_command("/trust off").unwrap();
+        assert_eq!(result.action, SlashCommandAction::Trust(TrustAction::Off));
+    }
+
+    #[test]
+    fn parse_trust_tool() {
+        let result = parse_trust_command("/trust file.edit").unwrap();
+        assert_eq!(
+            result.action,
+            SlashCommandAction::Trust(TrustAction::Tool("file.edit".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_trust_mcp_tool() {
+        let result = parse_trust_command("/trust mcp__github__create_issue").unwrap();
+        assert_eq!(
+            result.action,
+            SlashCommandAction::Trust(TrustAction::Tool("mcp__github__create_issue".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_non_trust_command_returns_none() {
+        assert!(parse_trust_command("/help").is_none());
+    }
 }

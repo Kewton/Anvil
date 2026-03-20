@@ -18,6 +18,12 @@ use std::time::{Duration, Instant};
 /// Maximum image file size in bytes (20 MB).
 const IMAGE_SIZE_LIMIT: u64 = 20 * 1024 * 1024;
 
+/// Maximum number of context lines around a match (file.search).
+const MAX_CONTEXT_LINES: u32 = 10;
+
+/// Maximum number of matched files returned by file.search.
+const MAX_SEARCH_RESULTS: usize = 100;
+
 /// Detect the MIME type of an image file based on its extension.
 ///
 /// Returns `None` for non-image extensions.
@@ -77,6 +83,20 @@ pub enum ToolKind {
     Mcp,
     AgentExplore,
     AgentPlan,
+    GitStatus,
+    GitDiff,
+    GitLog,
+}
+
+impl ToolKind {
+    /// Returns `true` if the tool may produce stderr output that would
+    /// conflict with the spinner display (e.g. shell commands, git operations).
+    pub fn produces_stderr(&self) -> bool {
+        matches!(
+            self,
+            ToolKind::ShellExec | ToolKind::GitStatus | ToolKind::GitDiff | ToolKind::GitLog
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,6 +116,10 @@ pub enum ToolInput {
     FileSearch {
         root: String,
         pattern: String,
+        #[serde(default)]
+        regex: bool,
+        #[serde(default)]
+        context_lines: u32,
     },
     ShellExec {
         command: String,
@@ -119,6 +143,16 @@ pub enum ToolInput {
         prompt: String,
         scope: Option<String>,
     },
+    GitStatus {},
+    GitDiff {
+        path: Option<String>,
+        staged: Option<bool>,
+        commit: Option<String>,
+    },
+    GitLog {
+        count: Option<u32>,
+        path: Option<String>,
+    },
 }
 
 impl ToolInput {
@@ -134,6 +168,9 @@ impl ToolInput {
             Self::Mcp { .. } => ToolKind::Mcp,
             Self::AgentExplore { .. } => ToolKind::AgentExplore,
             Self::AgentPlan { .. } => ToolKind::AgentPlan,
+            Self::GitStatus { .. } => ToolKind::GitStatus,
+            Self::GitDiff { .. } => ToolKind::GitDiff,
+            Self::GitLog { .. } => ToolKind::GitLog,
         }
     }
 
@@ -198,6 +235,14 @@ impl ToolInput {
                     .and_then(serde_json::Value::as_str)
                     .ok_or_else(|| "missing pattern in file.search tool block".to_string())?
                     .to_string(),
+                regex: value
+                    .get("regex")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                context_lines: value
+                    .get("context_lines")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as u32,
             }),
             "shell.exec" | "shell" => Ok(ToolInput::ShellExec {
                 command: value
@@ -239,6 +284,28 @@ impl ToolInput {
                     .to_string(),
                 scope: value
                     .get("scope")
+                    .and_then(serde_json::Value::as_str)
+                    .map(String::from),
+            }),
+            "git.status" => Ok(ToolInput::GitStatus {}),
+            "git.diff" => Ok(ToolInput::GitDiff {
+                path: value
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .map(String::from),
+                staged: value.get("staged").and_then(serde_json::Value::as_bool),
+                commit: value
+                    .get("commit")
+                    .and_then(serde_json::Value::as_str)
+                    .map(String::from),
+            }),
+            "git.log" => Ok(ToolInput::GitLog {
+                count: value
+                    .get("count")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|v| v as u32),
+                path: value
+                    .get("path")
                     .and_then(serde_json::Value::as_str)
                     .map(String::from),
             }),
@@ -289,6 +356,12 @@ impl ToolInput {
                 pattern: extract_simple(block, "pattern")
                     .or_else(|| extract_simple(block, "content"))
                     .or_else(|| extract_simple(block, "query"))?,
+                regex: extract_simple(block, "regex")
+                    .map(|v| v == "true")
+                    .unwrap_or(false),
+                context_lines: extract_simple(block, "context_lines")
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .unwrap_or(0),
             }),
             "shell.exec" | "shell" => Some(ToolInput::ShellExec {
                 command: extract_simple(block, "command")?,
@@ -306,6 +379,16 @@ impl ToolInput {
             "agent.plan" => Some(ToolInput::AgentPlan {
                 prompt: extract_simple(block, "prompt")?,
                 scope: extract_simple(block, "scope"),
+            }),
+            "git.status" => Some(ToolInput::GitStatus {}),
+            "git.diff" => Some(ToolInput::GitDiff {
+                path: extract_simple(block, "path"),
+                staged: extract_simple(block, "staged").and_then(|s| s.parse::<bool>().ok()),
+                commit: extract_simple(block, "commit"),
+            }),
+            "git.log" => Some(ToolInput::GitLog {
+                count: extract_simple(block, "count").and_then(|s| s.parse::<u32>().ok()),
+                path: extract_simple(block, "path"),
             }),
             _ => None,
         }
@@ -484,6 +567,7 @@ impl ToolExecutionResult {
             tool_name: self.tool_name.clone(),
             action: action.to_string(),
             target: self.summary.clone(),
+            elapsed_ms: Some(self.elapsed_ms.min(u64::MAX as u128) as u64),
         }
     }
 }
@@ -642,10 +726,52 @@ impl ToolRegistry {
         });
     }
 
+    pub fn register_git_status(&mut self) {
+        self.register(ToolSpec {
+            version: 1,
+            name: "git.status".to_string(),
+            kind: ToolKind::GitStatus,
+            execution_class: ExecutionClass::ReadOnly,
+            permission_class: PermissionClass::Safe,
+            execution_mode: ExecutionMode::ParallelSafe,
+            plan_mode: PlanModePolicy::Allowed,
+            rollback_policy: RollbackPolicy::None,
+        });
+    }
+
+    pub fn register_git_diff(&mut self) {
+        self.register(ToolSpec {
+            version: 1,
+            name: "git.diff".to_string(),
+            kind: ToolKind::GitDiff,
+            execution_class: ExecutionClass::ReadOnly,
+            permission_class: PermissionClass::Safe,
+            execution_mode: ExecutionMode::ParallelSafe,
+            plan_mode: PlanModePolicy::Allowed,
+            rollback_policy: RollbackPolicy::None,
+        });
+    }
+
+    pub fn register_git_log(&mut self) {
+        self.register(ToolSpec {
+            version: 1,
+            name: "git.log".to_string(),
+            kind: ToolKind::GitLog,
+            execution_class: ExecutionClass::ReadOnly,
+            permission_class: PermissionClass::Safe,
+            execution_mode: ExecutionMode::ParallelSafe,
+            plan_mode: PlanModePolicy::Allowed,
+            rollback_policy: RollbackPolicy::None,
+        });
+    }
+
     /// Register the subset of tools available to the Explore sub-agent.
     pub fn register_explore_tools(&mut self) {
         self.register_file_read();
         self.register_file_search();
+        self.register_git_status();
+        self.register_git_diff();
+        self.register_git_log();
     }
 
     /// Register the subset of tools available to the Plan sub-agent.
@@ -653,6 +779,7 @@ impl ToolRegistry {
         self.register_file_read();
         self.register_file_search();
         self.register_web_fetch();
+        self.register_git_status();
     }
 
     pub fn register_standard_tools(&mut self) {
@@ -663,6 +790,9 @@ impl ToolRegistry {
         self.register_shell_exec();
         self.register_web_fetch();
         self.register_web_search();
+        self.register_git_status();
+        self.register_git_diff();
+        self.register_git_log();
     }
 
     pub fn validate(
@@ -700,12 +830,23 @@ pub struct LocalToolExecutor {
     web_search_provider: WebSearchProvider,
     serper_api_key: Option<String>,
     shutdown_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    http_client: reqwest::blocking::Client,
+}
+
+/// Build the shared HTTP client used by tooling (web.fetch / web.search).
+fn build_tooling_http_client() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("Failed to build HTTP client for tooling")
 }
 
 #[derive(Debug)]
 pub enum ToolRuntimeError {
     InvalidPath(String),
     Io(String),
+    CaptchaBlocked { query: String },
 }
 
 impl Display for ToolRuntimeError {
@@ -713,6 +854,12 @@ impl Display for ToolRuntimeError {
         match self {
             Self::InvalidPath(path) => write!(f, "invalid tool path: {path}"),
             Self::Io(message) => write!(f, "{message}"),
+            Self::CaptchaBlocked { query } => write!(
+                f,
+                "DuckDuckGo search for '{query}' blocked by CAPTCHA. \
+                 Consider setting SERPER_API_KEY for automatic fallback, \
+                 or use web.fetch to access specific URLs directly."
+            ),
         }
     }
 }
@@ -732,6 +879,7 @@ impl LocalToolExecutor {
             web_search_provider: config.web_search_provider,
             serper_api_key: config.serper_api_key.clone(),
             shutdown_flag: None,
+            http_client: build_tooling_http_client(),
         }
     }
 
@@ -744,7 +892,15 @@ impl LocalToolExecutor {
             web_search_provider: WebSearchProvider::DuckDuckGo,
             serper_api_key: None,
             shutdown_flag: None,
+            http_client: build_tooling_http_client(),
         }
+    }
+
+    /// Create an executor with a Serper API key set (for testing fallback).
+    pub fn new_test_with_serper_key(root: impl Into<PathBuf>, key: String) -> Self {
+        let mut executor = Self::new_without_rate_limit(root);
+        executor.serper_api_key = Some(key);
+        executor
     }
 
     /// Set the shutdown flag for graceful shutdown support.
@@ -784,12 +940,24 @@ impl LocalToolExecutor {
             ToolInput::FileSearch {
                 ref root,
                 ref pattern,
-            } => self.execute_file_search(&request, root, pattern, started),
+                regex,
+                context_lines,
+            } => self.execute_file_search(&request, root, pattern, regex, context_lines, started),
             ToolInput::WebFetch { ref url } => self.execute_web_fetch(&request, url, started),
             ToolInput::ShellExec { ref command } => {
                 self.execute_shell_exec(&request, command, started)
             }
             ToolInput::WebSearch { ref query } => self.execute_web_search(&request, query, started),
+            ToolInput::GitStatus {} => self.execute_git_status(&request, started),
+            ToolInput::GitDiff {
+                ref path,
+                ref staged,
+                ref commit,
+            } => self.execute_git_diff(&request, path, staged, commit, started),
+            ToolInput::GitLog {
+                ref count,
+                ref path,
+            } => self.execute_git_log(&request, count, path, started),
             ToolInput::Mcp { .. } => unreachable!("MCP tools are dispatched in agentic.rs"),
             ToolInput::AgentExplore { .. } | ToolInput::AgentPlan { .. } => {
                 unreachable!("agent tools are dispatched in agentic.rs")
@@ -967,16 +1135,40 @@ impl LocalToolExecutor {
         request: &ToolExecutionRequest,
         root: &str,
         pattern: &str,
+        regex: bool,
+        context_lines: u32,
         started: Instant,
     ) -> Result<ToolExecutionResult, ToolRuntimeError> {
         let resolved_root = self.resolve_path(root)?;
-        let mut matches = Vec::new();
-        collect_search_matches(&resolved_root, pattern, &mut matches)?;
+
+        let search_pattern = if regex {
+            let re = regex::RegexBuilder::new(pattern)
+                .size_limit(1 << 20)
+                .build()
+                .map_err(|err| ToolRuntimeError::Io(format!("invalid regex pattern: {err}")))?;
+            SearchPattern::Regex(re)
+        } else {
+            SearchPattern::Literal(pattern.to_string())
+        };
+
+        let mut file_matches: Vec<FileMatchResult> = Vec::new();
+        let mut total_count: usize = 0;
+        collect_search_matches_v2(
+            &resolved_root,
+            &search_pattern,
+            context_lines,
+            &mut file_matches,
+            &mut total_count,
+        )?;
+
+        let (payload, artifacts) =
+            format_file_search_results(&file_matches, context_lines, total_count);
+
         Ok(build_completed_result(
             request,
             format!("{root} :: {pattern}"),
-            ToolExecutionPayload::Paths(matches.clone()),
-            matches,
+            payload,
+            artifacts,
             started,
         ))
     }
@@ -987,40 +1179,44 @@ impl LocalToolExecutor {
         url: &str,
         started: Instant,
     ) -> Result<ToolExecutionResult, ToolRuntimeError> {
-        let output = std::process::Command::new("curl")
-            .args([
-                "-s",
-                "-L",
-                "--fail",
-                "--max-time",
-                "30",
-                "--max-filesize",
-                "1048576",
-                "--max-redirs",
-                "5",
-                "--",
-                url,
-            ])
-            .output()
-            .map_err(|err| {
-                ToolRuntimeError::Io(format!("web.fetch failed to spawn curl: {err}"))
-            })?;
-
-        if output.status.success() {
-            let body = String::from_utf8_lossy(&output.stdout).to_string();
-            Ok(build_completed_result(
-                request,
-                url.to_string(),
-                ToolExecutionPayload::Text(body),
-                Vec::new(),
-                started,
-            ))
-        } else {
-            let stderr_msg = String::from_utf8_lossy(&output.stderr).to_string();
-            Err(ToolRuntimeError::Io(format!(
-                "web.fetch failed for {url}: {stderr_msg}"
-            )))
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            return Err(ToolRuntimeError::Io(
+                "Only http/https URLs allowed".to_string(),
+            ));
         }
+        let response = self
+            .http_client
+            .get(url)
+            .send()
+            .map_err(|err| ToolRuntimeError::Io(format!("web.fetch failed: {err}")))?;
+        if !response.status().is_success() {
+            return Err(ToolRuntimeError::Io(format!(
+                "web.fetch failed for {url}: HTTP {}",
+                response.status()
+            )));
+        }
+        if let Some(len) = response.content_length()
+            && len > 1_048_576
+        {
+            return Err(ToolRuntimeError::Io(
+                "Response too large (>1MB)".to_string(),
+            ));
+        }
+        let max_size: u64 = 1_048_576;
+        let mut body_bytes = Vec::new();
+        use std::io::Read;
+        response
+            .take(max_size)
+            .read_to_end(&mut body_bytes)
+            .map_err(|err| ToolRuntimeError::Io(format!("web.fetch read error: {err}")))?;
+        let body = String::from_utf8_lossy(&body_bytes).to_string();
+        Ok(build_completed_result(
+            request,
+            url.to_string(),
+            ToolExecutionPayload::Text(body),
+            Vec::new(),
+            started,
+        ))
     }
 
     fn execute_shell_exec(
@@ -1139,7 +1335,14 @@ impl LocalToolExecutor {
 
         match self.web_search_provider {
             WebSearchProvider::DuckDuckGo => {
-                self.execute_web_search_duckduckgo(request, query, started)
+                match self.execute_web_search_duckduckgo(request, query, started) {
+                    Err(ToolRuntimeError::CaptchaBlocked { .. })
+                        if self.serper_api_key.is_some() =>
+                    {
+                        self.execute_web_search_serper(request, query, started)
+                    }
+                    other => other,
+                }
             }
             WebSearchProvider::SerperApi => self.execute_web_search_serper(request, query, started),
         }
@@ -1152,47 +1355,54 @@ impl LocalToolExecutor {
         started: Instant,
     ) -> Result<ToolExecutionResult, ToolRuntimeError> {
         let encoded_query = percent_encode(query);
-        let url = format!("https://html.duckduckgo.com/html/?q={encoded_query}");
 
-        let output = std::process::Command::new("curl")
-            .args([
-                "-s",
-                "-L",
-                "--fail",
-                "--max-time",
-                "15",
-                "-H",
-                "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "--",
-            ])
-            .arg(&url)
-            .output()
-            .map_err(|err| {
-                ToolRuntimeError::Io(format!("web.search failed to spawn curl: {err}"))
-            })?;
+        // Resolve locale parameters for CJK languages
+        let locale_params = detect_system_locale().and_then(|lang| resolve_locale_params(&lang));
 
-        if !output.status.success() {
-            return Err(ToolRuntimeError::Io(
-                "DuckDuckGo search failed. CAPTCHA/rate limit may be active. Please wait and retry."
-                    .to_string(),
-            ));
+        let url = if let Some(ref lp) = locale_params {
+            format!(
+                "https://html.duckduckgo.com/html/?q={encoded_query}&kl={}",
+                lp.kl
+            )
+        } else {
+            format!("https://html.duckduckgo.com/html/?q={encoded_query}")
+        };
+
+        let mut request_builder = self
+            .http_client
+            .get(&url)
+            .header(
+                "User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            );
+
+        // Add Accept-Language header for CJK locales
+        if let Some(ref lp) = locale_params {
+            request_builder = request_builder.header("Accept-Language", &lp.accept_language);
         }
 
-        let body = String::from_utf8_lossy(&output.stdout).to_string();
+        let response = request_builder
+            .send()
+            .map_err(|err| ToolRuntimeError::Io(format!("web.search failed: {err}")))?;
+
+        if !response.status().is_success() {
+            return Err(ToolRuntimeError::CaptchaBlocked {
+                query: query.to_string(),
+            });
+        }
+
+        let body = response
+            .text()
+            .map_err(|err| ToolRuntimeError::Io(format!("web.search read error: {err}")))?;
 
         // Parse results using regex
         let results = parse_duckduckgo_results(&body);
 
-        // CAPTCHA / bot detection
-        if results.is_empty() {
-            let lower = body.to_ascii_lowercase();
-            let has_result_elements = lower.contains("result__a");
-            if !has_result_elements && (lower.contains("captcha") || lower.contains("bot")) {
-                return Err(ToolRuntimeError::Io(
-                    "DuckDuckGo search blocked by CAPTCHA/rate limit. Please wait and retry."
-                        .to_string(),
-                ));
-            }
+        // CAPTCHA detection using pure function
+        if is_captcha_response(&body, results.len()) {
+            return Err(ToolRuntimeError::CaptchaBlocked {
+                query: query.to_string(),
+            });
         }
 
         let formatted = format_search_results(&results);
@@ -1217,55 +1427,29 @@ impl LocalToolExecutor {
         })?;
 
         let body = serde_json::json!({"q": query}).to_string();
-        let header_value = format!("X-API-KEY: {api_key}");
 
-        let output = std::process::Command::new("curl")
-            .args([
-                "-s",
-                "-o",
-                "-",
-                "-w",
-                "\n%{http_code}",
-                "--max-time",
-                "10",
-                "-H",
-                &header_value,
-                "-H",
-                "Content-Type: application/json",
-                "-d",
-                &body,
-                "--",
-                "https://google.serper.dev/search",
-            ])
-            .output()
+        let response = self
+            .http_client
+            .post("https://google.serper.dev/search")
+            .header("X-API-KEY", api_key)
+            .header("Content-Type", "application/json")
+            .body(body)
+            .send()
             .map_err(|err| {
                 ToolRuntimeError::Io(format!(
-                    "web.search (SerperAPI) failed to spawn curl: {err}"
+                    "Failed to reach SerperAPI. Check your network connection. {err}"
                 ))
             })?;
 
-        if !output.status.success() {
-            let stderr_msg = String::from_utf8_lossy(&output.stderr).to_string();
-            return Err(ToolRuntimeError::Io(format!(
-                "Failed to reach SerperAPI. Check your network connection. {stderr_msg}"
-            )));
-        }
-
-        let raw_output = String::from_utf8_lossy(&output.stdout).to_string();
-        // Extract HTTP status code from the last line (appended by -w '\n%{http_code}')
-        let (response_body, http_code) = match raw_output.rsplit_once('\n') {
-            Some((body, code)) => (body.to_string(), code.trim().to_string()),
-            None => (raw_output, String::new()),
-        };
-
-        match http_code.as_str() {
-            "200" => {} // success
-            "401" | "403" => {
+        let status = response.status().as_u16();
+        match status {
+            200 => {} // success
+            401 | 403 => {
                 return Err(ToolRuntimeError::Io(
                     "Invalid or expired SerperAPI key.".to_string(),
                 ));
             }
-            "429" => {
+            429 => {
                 return Err(ToolRuntimeError::Io(
                     "SerperAPI rate limit exceeded. Please wait and retry.".to_string(),
                 ));
@@ -1276,6 +1460,10 @@ impl LocalToolExecutor {
                 )));
             }
         }
+
+        let response_body = response
+            .text()
+            .map_err(|err| ToolRuntimeError::Io(format!("SerperAPI read error: {err}")))?;
         let results = parse_serper_results(&response_body);
         let formatted = format_search_results(&results);
 
@@ -1286,6 +1474,102 @@ impl LocalToolExecutor {
             Vec::new(),
             started,
         ))
+    }
+
+    /// Shared helper: execute a git command and return a [`ToolExecutionResult`].
+    fn run_git_command(
+        &self,
+        args: &[&str],
+        request: &ToolExecutionRequest,
+        started: Instant,
+    ) -> Result<ToolExecutionResult, ToolRuntimeError> {
+        let mut cmd = std::process::Command::new("git");
+        for arg in args {
+            cmd.arg(arg);
+        }
+        cmd.current_dir(&self.root);
+        let output = cmd
+            .output()
+            .map_err(|e| ToolRuntimeError::Io(format!("failed to execute git: {e}")))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+        if !output.status.success() {
+            let exit_code = output.status.code().unwrap_or(-1);
+            let error_msg = if exit_code == 128 {
+                format!("not a git repository: {stderr}")
+            } else {
+                format!("git command failed (exit {exit_code}): {stderr}")
+            };
+            return Ok(ToolExecutionResult {
+                tool_call_id: request.tool_call_id.clone(),
+                tool_name: request.spec.name.clone(),
+                status: ToolExecutionStatus::Failed,
+                summary: error_msg.clone(),
+                payload: ToolExecutionPayload::Text(error_msg),
+                artifacts: Vec::new(),
+                elapsed_ms: started.elapsed().as_millis(),
+            });
+        }
+
+        let combined = combine_process_output(stdout, stderr);
+        Ok(build_completed_result(
+            request,
+            format!("{} completed", request.spec.name),
+            ToolExecutionPayload::Text(combined),
+            Vec::new(),
+            started,
+        ))
+    }
+
+    fn execute_git_status(
+        &self,
+        request: &ToolExecutionRequest,
+        started: Instant,
+    ) -> Result<ToolExecutionResult, ToolRuntimeError> {
+        self.run_git_command(&["status", "--porcelain"], request, started)
+    }
+
+    fn execute_git_diff(
+        &self,
+        request: &ToolExecutionRequest,
+        path: &Option<String>,
+        staged: &Option<bool>,
+        commit: &Option<String>,
+        started: Instant,
+    ) -> Result<ToolExecutionResult, ToolRuntimeError> {
+        let mut args: Vec<String> = vec!["diff".to_string()];
+        if staged.unwrap_or(false) {
+            args.push("--staged".to_string());
+        } else if let Some(c) = commit {
+            args.push(c.clone());
+        }
+        if let Some(p) = path {
+            args.push("--".to_string());
+            args.push(p.clone());
+        }
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        self.run_git_command(&arg_refs, request, started)
+    }
+
+    fn execute_git_log(
+        &self,
+        request: &ToolExecutionRequest,
+        count: &Option<u32>,
+        path: &Option<String>,
+        started: Instant,
+    ) -> Result<ToolExecutionResult, ToolRuntimeError> {
+        let count_val = count.unwrap_or(10);
+        let count_str = count_val.to_string();
+        let mut args: Vec<&str> = vec!["log", "--oneline", "-n", &count_str];
+        let path_owned;
+        if let Some(p) = path {
+            path_owned = p.clone();
+            args.push("--");
+            args.push(&path_owned);
+        }
+        self.run_git_command(&args, request, started)
     }
 
     fn enforce_rate_limit(&mut self) {
@@ -1433,7 +1717,12 @@ fn validate_required_fields(input: &ToolInput) -> Result<(), ToolValidationError
                 ));
             }
         }
-        ToolInput::FileSearch { root, pattern } => {
+        ToolInput::FileSearch {
+            root,
+            pattern,
+            regex,
+            context_lines,
+        } => {
             if root.trim().is_empty() {
                 return Err(ToolValidationError::MissingRequiredField(
                     "root".to_string(),
@@ -1443,6 +1732,21 @@ fn validate_required_fields(input: &ToolInput) -> Result<(), ToolValidationError
                 return Err(ToolValidationError::MissingRequiredField(
                     "pattern".to_string(),
                 ));
+            }
+            if *context_lines > MAX_CONTEXT_LINES {
+                return Err(ToolValidationError::InvalidFieldValue {
+                    field: "context_lines".to_string(),
+                    reason: format!(
+                        "context_lines {} exceeds maximum of {}",
+                        context_lines, MAX_CONTEXT_LINES
+                    ),
+                });
+            }
+            if *regex && let Err(err) = regex::Regex::new(pattern) {
+                return Err(ToolValidationError::InvalidFieldValue {
+                    field: "pattern".to_string(),
+                    reason: format!("invalid regex pattern: {err}"),
+                });
             }
         }
         ToolInput::ShellExec { command } => {
@@ -1502,8 +1806,66 @@ fn validate_required_fields(input: &ToolInput) -> Result<(), ToolValidationError
         }
         // [D3-001] MCP tool input validation is handled by the MCP server side
         ToolInput::Mcp { .. } => {}
+        ToolInput::GitStatus {} => {}
+        ToolInput::GitDiff { commit, path, .. } => {
+            if let Some(c) = commit {
+                validate_git_ref(c)?;
+            }
+            if let Some(p) = path {
+                validate_git_path(p)?;
+            }
+        }
+        ToolInput::GitLog { count, path } => {
+            if let Some(c) = count
+                && (*c == 0 || *c > 100)
+            {
+                return Err(ToolValidationError::InvalidFieldValue {
+                    field: "count".to_string(),
+                    reason: "count must be between 1 and 100".to_string(),
+                });
+            }
+            if let Some(p) = path {
+                validate_git_path(p)?;
+            }
+        }
     }
 
+    Ok(())
+}
+
+/// Validate a git ref value (commit, branch name, etc.).
+///
+/// Rejects values starting with `-` (flag injection) and values not matching
+/// `^[a-zA-Z0-9_.~^/-]+$`.
+fn validate_git_ref(value: &str) -> Result<(), ToolValidationError> {
+    if value.starts_with('-') {
+        return Err(ToolValidationError::InvalidFieldValue {
+            field: "commit".to_string(),
+            reason: "commit must not start with '-' (flag injection prevention)".to_string(),
+        });
+    }
+    if !value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '~' | '^' | '/' | '-'))
+    {
+        return Err(ToolValidationError::InvalidFieldValue {
+            field: "commit".to_string(),
+            reason: format!("commit contains invalid characters: {value}"),
+        });
+    }
+    Ok(())
+}
+
+/// Validate a git path parameter.
+///
+/// Rejects paths containing `..` as a defence-in-depth measure.
+fn validate_git_path(path: &str) -> Result<(), ToolValidationError> {
+    if path.contains("..") {
+        return Err(ToolValidationError::InvalidFieldValue {
+            field: "path".to_string(),
+            reason: "path must not contain '..' (path traversal prevention)".to_string(),
+        });
+    }
     Ok(())
 }
 
@@ -1884,6 +2246,61 @@ fn combine_process_output(stdout: String, stderr: String) -> String {
     }
 }
 
+/// Locale parameters for DuckDuckGo search (CJK locale support).
+pub struct LocaleParams {
+    pub kl: String,
+    pub accept_language: String,
+}
+
+/// Resolve a LANG/LC_ALL string into DuckDuckGo locale parameters.
+/// Returns `None` for non-CJK locales (English, C, POSIX, etc.).
+pub fn resolve_locale_params(lang: &str) -> Option<LocaleParams> {
+    let prefix = lang
+        .split(['_', '.', '-'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match prefix.as_str() {
+        "ja" => Some(LocaleParams {
+            kl: "jp-ja".into(),
+            accept_language: "ja,en;q=0.9".into(),
+        }),
+        "zh" => Some(LocaleParams {
+            kl: "cn-zh".into(),
+            accept_language: "zh,en;q=0.9".into(),
+        }),
+        "ko" => Some(LocaleParams {
+            kl: "kr-kr".into(),
+            accept_language: "ko,en;q=0.9".into(),
+        }),
+        _ => None,
+    }
+}
+
+/// Detect the system locale from environment variables.
+fn detect_system_locale() -> Option<String> {
+    std::env::var("LC_ALL")
+        .or_else(|_| std::env::var("LANG"))
+        .ok()
+        .filter(|v| !v.is_empty())
+}
+
+/// Detect whether a DuckDuckGo response body indicates a CAPTCHA block.
+/// Returns `false` when search results are present (`results_count > 0`)
+/// or when result elements are found in the HTML.
+pub fn is_captcha_response(body: &str, results_count: usize) -> bool {
+    if results_count > 0 {
+        return false;
+    }
+    let lower = body.to_ascii_lowercase();
+    if lower.contains("result__a") {
+        return false;
+    }
+    let ddg_captcha = body.contains("Unfortunately, bots use DuckDuckGo too.");
+    let generic_captcha = lower.contains("captcha");
+    ddg_captcha || generic_captcha
+}
+
 /// Percent-encode a query string for use in URLs.
 fn percent_encode(input: &str) -> String {
     use std::fmt::Write;
@@ -1961,13 +2378,95 @@ fn strip_html_tags(input: &str) -> String {
         .replace("&#39;", "'")
 }
 
-fn collect_search_matches(
+// ---------------------------------------------------------------------------
+// file.search v2: regex support, context lines, result limits
+// ---------------------------------------------------------------------------
+
+/// Internal search pattern representation.
+enum SearchPattern {
+    Literal(String),
+    Regex(regex::Regex),
+}
+
+impl SearchPattern {
+    /// Check whether `text` matches this pattern.
+    fn is_match(&self, text: &str) -> bool {
+        match self {
+            SearchPattern::Literal(lit) => text.contains(lit.as_str()),
+            SearchPattern::Regex(re) => re.is_match(text),
+        }
+    }
+}
+
+/// A single matched line with surrounding context.
+struct MatchedLine {
+    line_number: usize,
+    content: String,
+    context_before: Vec<String>,
+    context_after: Vec<String>,
+}
+
+/// Intermediate search result for a single file.
+struct FileMatchResult {
+    path: String,
+    matched_lines: Vec<MatchedLine>,
+}
+
+/// Maximum number of matches collected per file.
+const MAX_MATCHES_PER_FILE: usize = 50;
+
+/// Collect context lines around matches in a single file.
+fn collect_context_lines(
+    path: &Path,
+    pattern: &SearchPattern,
+    context_lines: u32,
+) -> Vec<MatchedLine> {
+    use std::io::BufRead;
+
+    let Ok(file) = fs::File::open(path) else {
+        return Vec::new();
+    };
+    let reader = std::io::BufReader::new(file);
+    let all_lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
+    let ctx = context_lines as usize;
+
+    let mut results = Vec::new();
+    for (idx, line) in all_lines.iter().enumerate() {
+        if results.len() >= MAX_MATCHES_PER_FILE {
+            break;
+        }
+        if pattern.is_match(line) {
+            let start = idx.saturating_sub(ctx);
+            let end = (idx + ctx + 1).min(all_lines.len());
+
+            let context_before: Vec<String> = all_lines[start..idx].to_vec();
+            let context_after: Vec<String> = if idx + 1 < end {
+                all_lines[idx + 1..end].to_vec()
+            } else {
+                Vec::new()
+            };
+
+            results.push(MatchedLine {
+                line_number: idx + 1, // 1-based
+                content: line.clone(),
+                context_before,
+                context_after,
+            });
+        }
+    }
+    results
+}
+
+/// Recursively collect file matches with search pattern support and result limits.
+fn collect_search_matches_v2(
     root: &Path,
-    pattern: &str,
-    matches: &mut Vec<String>,
+    pattern: &SearchPattern,
+    context_lines: u32,
+    results: &mut Vec<FileMatchResult>,
+    total_count: &mut usize,
 ) -> Result<(), ToolRuntimeError> {
     if root.is_file() {
-        check_file_match(root, pattern, matches);
+        check_file_match_v2(root, pattern, context_lines, results, total_count);
         return Ok(());
     }
 
@@ -1975,6 +2474,9 @@ fn collect_search_matches(
         ToolRuntimeError::Io(format!("file.search failed for {}: {err}", root.display()))
     })?;
     for entry in entries {
+        if results.len() >= MAX_SEARCH_RESULTS {
+            break;
+        }
         let entry = entry.map_err(|err| {
             ToolRuntimeError::Io(format!(
                 "file.search failed while reading {}: {err}",
@@ -1993,36 +2495,158 @@ fn collect_search_matches(
             ) {
                 continue;
             }
-            collect_search_matches(&path, pattern, matches)?;
+            collect_search_matches_v2(&path, pattern, context_lines, results, total_count)?;
         } else {
-            check_file_match(&path, pattern, matches);
+            check_file_match_v2(&path, pattern, context_lines, results, total_count);
         }
     }
-
     Ok(())
 }
 
-/// Check whether a single file matches `pattern` by path name or content.
-fn check_file_match(path: &Path, pattern: &str, matches: &mut Vec<String>) {
+/// Check whether a single file matches the pattern. Collects context if requested.
+fn check_file_match_v2(
+    path: &Path,
+    pattern: &SearchPattern,
+    context_lines: u32,
+    results: &mut Vec<FileMatchResult>,
+    total_count: &mut usize,
+) {
     use std::io::BufRead;
 
     let path_str = path.display().to_string();
-    if path_str.contains(pattern) {
-        matches.push(path_str);
+
+    // Path name match is always literal contains (even for regex mode).
+    let pattern_str = match pattern {
+        SearchPattern::Literal(lit) => lit.as_str(),
+        SearchPattern::Regex(re) => re.as_str(),
+    };
+    if path_str.contains(pattern_str) {
+        *total_count += 1;
+        if results.len() < MAX_SEARCH_RESULTS {
+            results.push(FileMatchResult {
+                path: path_str,
+                matched_lines: Vec::new(), // path-only match
+            });
+        }
         return;
     }
+
     if !is_searchable_file(path) {
         return;
     }
-    if let Ok(file) = fs::File::open(path) {
-        let reader = std::io::BufReader::new(file);
-        for line in reader.lines() {
-            let Ok(line) = line else { break };
-            if line.contains(pattern) {
-                matches.push(path_str);
-                break;
+
+    // Content search
+    if context_lines > 0 {
+        let matched = collect_context_lines(path, pattern, context_lines);
+        if !matched.is_empty() {
+            *total_count += 1;
+            if results.len() < MAX_SEARCH_RESULTS {
+                results.push(FileMatchResult {
+                    path: path_str,
+                    matched_lines: matched,
+                });
             }
         }
+    } else {
+        // Fast path: just check if any line matches
+        if let Ok(file) = fs::File::open(path) {
+            let reader = std::io::BufReader::new(file);
+            for line in reader.lines() {
+                let Ok(line) = line else { break };
+                if pattern.is_match(&line) {
+                    *total_count += 1;
+                    if results.len() < MAX_SEARCH_RESULTS {
+                        results.push(FileMatchResult {
+                            path: path_str,
+                            matched_lines: Vec::new(),
+                        });
+                    }
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Format file search results into a `ToolExecutionPayload`.
+///
+/// Returns `(payload, artifacts)`.
+fn format_file_search_results(
+    results: &[FileMatchResult],
+    context_lines: u32,
+    total_count: usize,
+) -> (ToolExecutionPayload, Vec<String>) {
+    let truncated = total_count > MAX_SEARCH_RESULTS;
+
+    if context_lines == 0 {
+        // Paths mode (backward compatible)
+        let paths: Vec<String> = results.iter().map(|r| r.path.clone()).collect();
+        let artifacts = paths.clone();
+        let mut payload = ToolExecutionPayload::Paths(paths);
+        if truncated {
+            // Wrap in Text with notification
+            if let ToolExecutionPayload::Paths(ref p) = payload {
+                let mut text = p.join("\n");
+                text.push_str(&format!(
+                    "\n\n({total_count}件中{MAX_SEARCH_RESULTS}件を表示しています。パターンを絞り込んでください。)"
+                ));
+                payload = ToolExecutionPayload::Text(text);
+            }
+        }
+        (payload, artifacts)
+    } else {
+        // Text mode with context lines
+        let mut output = String::new();
+        let artifacts: Vec<String> = results.iter().map(|r| r.path.clone()).collect();
+
+        for (file_idx, result) in results.iter().enumerate() {
+            if file_idx > 0 {
+                output.push_str("--\n");
+            }
+
+            if result.matched_lines.is_empty() {
+                // Path-only match
+                output.push_str(&result.path);
+                output.push('\n');
+            } else {
+                for matched in &result.matched_lines {
+                    // Context before
+                    let start_line = matched
+                        .line_number
+                        .saturating_sub(matched.context_before.len());
+                    for (i, ctx_line) in matched.context_before.iter().enumerate() {
+                        output.push_str(&format!(
+                            "{}:{}: {}\n",
+                            result.path,
+                            start_line + i,
+                            ctx_line
+                        ));
+                    }
+                    // Match line
+                    output.push_str(&format!(
+                        "{}:{}: {}\n",
+                        result.path, matched.line_number, matched.content
+                    ));
+                    // Context after
+                    for (i, ctx_line) in matched.context_after.iter().enumerate() {
+                        output.push_str(&format!(
+                            "{}:{}: {}\n",
+                            result.path,
+                            matched.line_number + 1 + i,
+                            ctx_line
+                        ));
+                    }
+                }
+            }
+        }
+
+        if truncated {
+            output.push_str(&format!(
+                "\n({total_count}件中{MAX_SEARCH_RESULTS}件を表示しています。パターンを絞り込んでください。)"
+            ));
+        }
+
+        (ToolExecutionPayload::Text(output), artifacts)
     }
 }
 
@@ -2053,6 +2677,304 @@ fn is_searchable_file(path: &Path) -> bool {
                 | "lock"
         )
     )
+}
+
+// ---------------------------------------------------------------------------
+// Checkpoint / Undo types (Issue #68)
+// ---------------------------------------------------------------------------
+
+/// Maximum file size for checkpoint capture (1 MB).
+pub const CHECKPOINT_FILE_SIZE_LIMIT: u64 = 1_048_576;
+
+/// Checkpoint entry representing a single file state before a tool write.
+#[derive(Debug, Clone)]
+pub struct CheckpointEntry {
+    /// Sandbox-resolved absolute path.
+    pub path: PathBuf,
+    /// File content before the write (`None` = file did not exist).
+    pub previous_content: Option<String>,
+    /// Byte size of the stored content (for capacity tracking).
+    pub byte_size: usize,
+}
+
+impl CheckpointEntry {
+    /// Generate a diff preview showing current file state vs. the checkpoint.
+    ///
+    /// Returns `None` when the file cannot be read (e.g. already deleted).
+    pub fn generate_restore_preview(&self) -> Option<String> {
+        let current = match std::fs::read_to_string(&self.path) {
+            Ok(content) => content,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                if self.previous_content.is_none() {
+                    return Some("(file does not exist, nothing to restore)".to_string());
+                }
+                return Some("(file was deleted externally, will recreate)".to_string());
+            }
+            Err(_) => return None,
+        };
+
+        let previous = self.previous_content.as_deref().unwrap_or("");
+        if current == previous {
+            return Some("(no changes to undo)".to_string());
+        }
+
+        let diff = similar::TextDiff::from_lines(current.as_str(), previous);
+        let diff_text = diff
+            .unified_diff()
+            .context_radius(3)
+            .header("a (current)", "b (restored)")
+            .to_string();
+
+        if diff_text.trim().is_empty() {
+            Some("(no changes to undo)".to_string())
+        } else {
+            Some(diff_text)
+        }
+    }
+
+    /// Restore this checkpoint entry to disk.
+    ///
+    /// Returns a [`RestoreResult`] describing the outcome.
+    pub fn restore(&self) -> RestoreResult {
+        let diff_preview = self.generate_restore_preview();
+        match &self.previous_content {
+            None => match std::fs::remove_file(&self.path) {
+                Ok(()) => RestoreResult {
+                    path: self.path.clone(),
+                    action: RestoreAction::FileRemoved,
+                    diff_preview,
+                },
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => RestoreResult {
+                    path: self.path.clone(),
+                    action: RestoreAction::Skipped,
+                    diff_preview: Some("(file already removed)".to_string()),
+                },
+                Err(err) => {
+                    tracing::warn!(
+                        path = %self.path.display(),
+                        "undo: failed to remove file: {err}"
+                    );
+                    RestoreResult {
+                        path: self.path.clone(),
+                        action: RestoreAction::Skipped,
+                        diff_preview: Some(format!("(IO error: {err})")),
+                    }
+                }
+            },
+            Some(content) => match std::fs::write(&self.path, content) {
+                Ok(()) => RestoreResult {
+                    path: self.path.clone(),
+                    action: RestoreAction::ContentRestored,
+                    diff_preview,
+                },
+                Err(err) => {
+                    tracing::warn!(
+                        path = %self.path.display(),
+                        "undo: failed to restore file: {err}"
+                    );
+                    RestoreResult {
+                        path: self.path.clone(),
+                        action: RestoreAction::Skipped,
+                        diff_preview: Some(format!("(IO error: {err})")),
+                    }
+                }
+            },
+        }
+    }
+}
+
+/// Result of restoring a single checkpoint entry.
+#[derive(Debug, Clone)]
+pub struct RestoreResult {
+    /// Path of the restored file.
+    pub path: PathBuf,
+    /// What kind of restoration was performed.
+    pub action: RestoreAction,
+    /// Diff preview (for display).
+    pub diff_preview: Option<String>,
+}
+
+/// Describes the type of restore action taken.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestoreAction {
+    /// File content was restored to its previous state.
+    ContentRestored,
+    /// A newly created file was removed.
+    FileRemoved,
+    /// The entry was skipped (e.g. IO error).
+    Skipped,
+}
+
+/// Stack-based checkpoint store for undo functionality.
+pub struct CheckpointStack {
+    entries: Vec<CheckpointEntry>,
+    total_bytes: usize,
+    max_depth: usize,
+    max_bytes: usize,
+    /// Active transaction mark position (`None` = no active transaction).
+    active_mark: Option<usize>,
+}
+
+impl CheckpointStack {
+    /// Default max depth = 20, max bytes = 10 MB.
+    pub fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            total_bytes: 0,
+            max_depth: 20,
+            max_bytes: 10 * 1024 * 1024,
+            active_mark: None,
+        }
+    }
+
+    /// Push a checkpoint entry. Returns the index at which it was stored.
+    ///
+    /// When the stack exceeds depth or byte limits, the oldest entries are
+    /// discarded automatically. During an active transaction, only entries
+    /// before the mark are eligible for eviction.
+    pub fn push(&mut self, entry: CheckpointEntry) -> usize {
+        self.total_bytes += entry.byte_size;
+        self.entries.push(entry);
+        self.evict_oldest_while(|s| s.entries.len() > s.max_depth);
+        self.evict_oldest_while(|s| s.total_bytes > s.max_bytes);
+        self.entries.len() - 1
+    }
+
+    /// Eviction helper (DRY for depth/byte limits).
+    ///
+    /// When `active_mark` is set, only entries before the mark position are
+    /// evicted, and the mark value is decremented accordingly.
+    ///
+    /// Note: `Vec::remove(0)` is O(n) per call, but acceptable here since
+    /// `max_depth` is small (default 20) and eviction runs infrequently.
+    fn evict_oldest_while(&mut self, should_evict: impl Fn(&Self) -> bool) {
+        while should_evict(self) && !self.entries.is_empty() {
+            // During a transaction, refuse to evict entries at or after the mark.
+            if self.active_mark == Some(0) {
+                break;
+            }
+            self.total_bytes = self.total_bytes.saturating_sub(self.entries[0].byte_size);
+            self.entries.remove(0);
+            if let Some(ref mut mark) = self.active_mark {
+                *mark = mark.saturating_sub(1);
+            }
+        }
+    }
+
+    /// Remove the entry at the given index (for rollback on tool failure).
+    ///
+    /// When an active transaction mark exists, the mark is adjusted if the
+    /// removed entry was before the mark position.
+    pub fn remove(&mut self, index: usize) -> Option<CheckpointEntry> {
+        if index >= self.entries.len() {
+            return None;
+        }
+        let entry = self.entries.remove(index);
+        self.total_bytes = self.total_bytes.saturating_sub(entry.byte_size);
+        if let Some(ref mut mark) = self.active_mark
+            && index < *mark
+        {
+            *mark = mark.saturating_sub(1);
+        }
+        Some(entry)
+    }
+
+    /// Record the current stack position as a transaction mark.
+    ///
+    /// Returns the mark value (current `entries.len()`). Use with
+    /// `rollback_to_mark()` or `commit_mark()` to end the transaction.
+    pub fn mark(&mut self) -> usize {
+        let pos = self.entries.len();
+        self.active_mark = Some(pos);
+        pos
+    }
+
+    /// Clear the transaction mark without removing any entries.
+    ///
+    /// Called on successful transaction completion; checkpoints are kept
+    /// for `/undo`.
+    pub fn commit_mark(&mut self) {
+        self.active_mark = None;
+    }
+
+    /// Whether a transaction is currently active.
+    pub fn is_in_transaction(&self) -> bool {
+        self.active_mark.is_some()
+    }
+
+    /// Pop all entries added since the transaction mark and return them
+    /// (newest-first, deduplicated by path keeping the oldest checkpoint
+    /// per file).
+    ///
+    /// The `_mark` parameter is accepted for call-site clarity but ignored
+    /// internally; the actual mark position is tracked by [`mark()`] and
+    /// may have been adjusted by eviction.  The transaction is always
+    /// cleared after this call.
+    pub fn rollback_to_mark(&mut self, _mark: usize) -> Vec<CheckpointEntry> {
+        let effective_mark = match self.active_mark.take() {
+            Some(m) => m,
+            None => return Vec::new(),
+        };
+        if effective_mark >= self.entries.len() {
+            return Vec::new();
+        }
+        let n = self.entries.len() - effective_mark;
+        self.pop_n(n)
+    }
+
+    /// Pop the most recent entry.
+    pub fn pop(&mut self) -> Option<CheckpointEntry> {
+        let entry = self.entries.pop()?;
+        self.total_bytes = self.total_bytes.saturating_sub(entry.byte_size);
+        Some(entry)
+    }
+
+    /// Pop up to `n` entries from the stack (newest first).
+    ///
+    /// When the same file path appears multiple times, only the oldest
+    /// entry (earliest checkpoint) is kept so that undo restores the file
+    /// to its state before the first change.
+    pub fn pop_n(&mut self, n: usize) -> Vec<CheckpointEntry> {
+        let actual = n.min(self.entries.len());
+        let mut popped = Vec::with_capacity(actual);
+        for _ in 0..actual {
+            if let Some(entry) = self.pop() {
+                popped.push(entry);
+            }
+        }
+
+        // Deduplicate by path: keep the oldest entry for each path.
+        // Since we pop newest-first, the last occurrence in `popped` is the
+        // oldest checkpoint. We iterate in reverse (oldest-first) and keep the
+        // first occurrence we see for each path.
+        let mut seen = std::collections::HashSet::new();
+        let mut deduped = Vec::new();
+        for entry in popped.into_iter().rev() {
+            if !seen.insert(entry.path.clone()) {
+                continue;
+            }
+            deduped.push(entry);
+        }
+        // Reverse back to newest-first order
+        deduped.reverse();
+        deduped
+    }
+
+    /// Number of entries currently in the stack.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the stack is empty.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+impl Default for CheckpointStack {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn render_directory_listing(path: &Path) -> Result<String, ToolRuntimeError> {

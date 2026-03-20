@@ -52,6 +52,7 @@ fn runtime_turn_pauses_for_single_tool_call_approval_and_resumes_to_done() {
                 "src/session/mod.rs".to_string(),
             )],
             elapsed_ms: 920,
+            inference_performance: None,
         },
     ]));
 
@@ -181,6 +182,7 @@ fn runtime_turn_can_deny_approval_and_return_to_ready() {
             saved_status: "session saved".to_string(),
             tool_logs: Vec::new(),
             elapsed_ms: 400,
+            inference_performance: None,
         },
     ]));
 
@@ -282,6 +284,7 @@ fn runtime_turn_supports_multiple_approvals_in_one_turn() {
                 "src/session/mod.rs".to_string(),
             )],
             elapsed_ms: 640,
+            inference_performance: None,
         },
     ]));
 
@@ -368,6 +371,7 @@ fn runtime_turn_supports_working_back_to_thinking_before_done() {
             saved_status: "session saved".to_string(),
             tool_logs: Vec::new(),
             elapsed_ms: 360,
+            inference_performance: None,
         },
     ]));
 
@@ -455,6 +459,7 @@ fn pending_approval_survives_app_reload() {
             saved_status: "session saved".to_string(),
             tool_logs: Vec::new(),
             elapsed_ms: 320,
+            inference_performance: None,
         },
     ]));
 
@@ -498,8 +503,8 @@ fn pending_approval_survives_app_reload() {
 
 #[test]
 fn system_prompt_mentions_image_support_for_file_read() {
-    use anvil::agent::{ProjectLanguage, tool_protocol_system_prompt};
-    let prompt = tool_protocol_system_prompt(&[ProjectLanguage::Rust], None);
+    use anvil::agent::{ProjectLanguage, tool_protocol_system_prompt_all_tools};
+    let prompt = tool_protocol_system_prompt_all_tools(&[ProjectLanguage::Rust], None);
     assert!(
         prompt.contains("image files"),
         "system prompt should mention image support in file.read"
@@ -520,8 +525,8 @@ fn system_prompt_mentions_image_support_for_file_read() {
 
 #[test]
 fn system_prompt_includes_agent_explore_and_plan_descriptions() {
-    use anvil::agent::{ProjectLanguage, tool_protocol_system_prompt};
-    let prompt = tool_protocol_system_prompt(&[ProjectLanguage::Rust], None);
+    use anvil::agent::{ProjectLanguage, tool_protocol_system_prompt_all_tools};
+    let prompt = tool_protocol_system_prompt_all_tools(&[ProjectLanguage::Rust], None);
     assert!(
         prompt.contains("agent.explore"),
         "system prompt should describe agent.explore tool"
@@ -533,9 +538,27 @@ fn system_prompt_includes_agent_explore_and_plan_descriptions() {
 }
 
 #[test]
+fn system_prompt_includes_confirm_class_guidance() {
+    use anvil::agent::{ProjectLanguage, tool_protocol_system_prompt_all_tools};
+    let prompt = tool_protocol_system_prompt_all_tools(&[ProjectLanguage::Rust], None);
+    assert!(
+        prompt.contains("Tool approval"),
+        "system prompt must include confirm-class guidance section"
+    );
+    assert!(
+        prompt.contains("Do NOT ask the user for permission in natural language"),
+        "system prompt must instruct LLM not to double-confirm"
+    );
+    assert!(
+        prompt.contains("denied by user"),
+        "system prompt must explain denial handling"
+    );
+}
+
+#[test]
 fn build_subagent_system_prompt_explore_contains_expected_tools() {
     use anvil::agent::subagent::{SubAgentKind, build_subagent_system_prompt};
-    let prompt = build_subagent_system_prompt(&SubAgentKind::Explore);
+    let prompt = build_subagent_system_prompt(&SubAgentKind::Explore, false);
     assert!(
         prompt.contains("file.read"),
         "Explore prompt should include file.read"
@@ -561,7 +584,7 @@ fn build_subagent_system_prompt_explore_contains_expected_tools() {
 #[test]
 fn build_subagent_system_prompt_plan_contains_expected_tools() {
     use anvil::agent::subagent::{SubAgentKind, build_subagent_system_prompt};
-    let prompt = build_subagent_system_prompt(&SubAgentKind::Plan);
+    let prompt = build_subagent_system_prompt(&SubAgentKind::Plan, false);
     assert!(
         prompt.contains("file.read"),
         "Plan prompt should include file.read"

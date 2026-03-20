@@ -9,21 +9,26 @@ pub mod transport;
 
 use crate::agent::AgentEvent;
 use crate::config::EffectiveConfig;
+use crate::contracts::InferencePerformanceView;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 // Re-export key types so existing `use crate::provider::*` continues to work.
 pub use ollama::{
-    OllamaChatMessage, OllamaChatRequest, OllamaProviderClient, resolve_ollama_model_alias,
+    OllamaChatMessage, OllamaChatRequest, OllamaModelEntry, OllamaModelInfo, OllamaProviderClient,
+    fetch_context_length_from_ollama, fetch_model_info_from_ollama, fetch_model_list_from_ollama,
+    parse_context_length_from_show_response, parse_model_info_from_show_response,
+    parse_model_list_from_tags_response, resolve_ollama_model_alias,
 };
 pub use transport::{
-    CurlHttpTransport, HttpResponse, HttpTransport, RetryConfig, RetryTransport, TcpHttpTransport,
-    classify_curl_error, classify_http_error, redact_secrets, sanitize_error_message,
+    HttpResponse, HttpTransport, ReqwestHttpTransport, RetryConfig, RetryTransport,
+    classify_http_error, classify_reqwest_error, http_timeout, redact_secrets,
+    sanitize_error_message,
 };
 
-/// Default transport used by provider clients: curl with retry wrapper.
-pub type DefaultTransport = RetryTransport<CurlHttpTransport>;
+/// Default transport used by provider clients: reqwest with retry wrapper.
+pub type DefaultTransport = RetryTransport<ReqwestHttpTransport>;
 
 /// Supported LLM provider backends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,11 +126,15 @@ pub enum ProviderEvent {
 pub enum ProviderTurnError {
     Cancelled,
     Network(String),
+    ConnectionRefused(String),
+    DnsFailure(String),
     ServerError { status_code: u16, message: String },
     ClientError { status_code: u16, message: String },
     Timeout(String),
     Parse(String),
     Backend(String),
+    ModelNotFound { model: String, message: String },
+    AuthenticationFailed { status_code: u16, message: String },
 }
 
 impl ProviderTurnError {
@@ -140,6 +149,16 @@ impl ProviderTurnError {
             Self::Network(_) | Self::ServerError { .. } | Self::Timeout(_)
         )
     }
+
+    /// Returns `true` if this error represents a connection refused condition.
+    pub fn is_connection_refused(&self) -> bool {
+        matches!(self, Self::ConnectionRefused(_))
+    }
+
+    /// Returns `true` if this error represents a DNS failure condition.
+    pub fn is_dns_failure(&self) -> bool {
+        matches!(self, Self::DnsFailure(_))
+    }
 }
 
 /// Classification of provider errors for persistence.
@@ -152,6 +171,10 @@ pub enum ProviderErrorKind {
     Timeout,
     Parse,
     Backend,
+    ConnectionRefused,
+    DnsFailure,
+    ModelNotFound,
+    AuthenticationFailed,
     #[serde(other)]
     Unknown,
 }
@@ -168,6 +191,14 @@ impl std::fmt::Display for ProviderTurnError {
         match self {
             Self::Cancelled => write!(f, "provider turn cancelled"),
             Self::Network(msg) => write!(f, "network error: {msg}"),
+            Self::ConnectionRefused(msg) => {
+                let redacted = redact_secrets(msg);
+                write!(f, "connection refused: {redacted}")
+            }
+            Self::DnsFailure(msg) => {
+                let redacted = redact_secrets(msg);
+                write!(f, "DNS resolution failed: {redacted}")
+            }
             Self::ServerError {
                 status_code,
                 message,
@@ -179,23 +210,98 @@ impl std::fmt::Display for ProviderTurnError {
             Self::Timeout(msg) => write!(f, "timeout: {msg}"),
             Self::Parse(msg) => write!(f, "parse error: {msg}"),
             Self::Backend(message) => write!(f, "provider backend error: {message}"),
+            Self::ModelNotFound { model, message } => {
+                let redacted = redact_secrets(message);
+                write!(f, "model '{model}' not found: {redacted}")
+            }
+            Self::AuthenticationFailed {
+                status_code,
+                message,
+            } => {
+                let redacted = redact_secrets(message);
+                write!(f, "authentication failed ({status_code}): {redacted}")
+            }
         }
     }
 }
 
 impl std::error::Error for ProviderTurnError {}
 
+/// Extract a model name from a `ProviderTurnError::ModelNotFound` Display string.
+/// Expected format: `"model '<name>' not found: <detail>"`.
+fn extract_model_from_message(message: &str) -> String {
+    if let Some(start) = message.find("model '") {
+        let rest = &message[start + 7..];
+        if let Some(end) = rest.find('\'') {
+            return rest[..end].to_string();
+        }
+    }
+    "unknown".to_string()
+}
+
+impl ProviderTurnError {
+    /// Reconstruct a `ProviderTurnError` from a persisted `ProviderErrorRecord`.
+    pub fn from_error_record(record: &ProviderErrorRecord) -> Self {
+        match record.kind {
+            ProviderErrorKind::Cancelled => Self::Cancelled,
+            ProviderErrorKind::Network => Self::Network(record.message.clone()),
+            ProviderErrorKind::ConnectionRefused => Self::ConnectionRefused(record.message.clone()),
+            ProviderErrorKind::DnsFailure => Self::DnsFailure(record.message.clone()),
+            ProviderErrorKind::ServerError => Self::ServerError {
+                status_code: 500,
+                message: record.message.clone(),
+            },
+            ProviderErrorKind::ClientError => Self::ClientError {
+                status_code: 400,
+                message: record.message.clone(),
+            },
+            ProviderErrorKind::Timeout => Self::Timeout(record.message.clone()),
+            ProviderErrorKind::Parse => Self::Parse(record.message.clone()),
+            ProviderErrorKind::Backend => Self::Backend(record.message.clone()),
+            ProviderErrorKind::ModelNotFound => Self::ModelNotFound {
+                model: extract_model_from_message(&record.message),
+                message: record.message.clone(),
+            },
+            ProviderErrorKind::AuthenticationFailed => Self::AuthenticationFailed {
+                status_code: 401,
+                message: record.message.clone(),
+            },
+            ProviderErrorKind::Unknown => Self::Backend(record.message.clone()),
+        }
+    }
+}
+
 impl From<&ProviderTurnError> for ProviderErrorKind {
     fn from(err: &ProviderTurnError) -> Self {
         match err {
             ProviderTurnError::Cancelled => Self::Cancelled,
             ProviderTurnError::Network(_) => Self::Network,
+            ProviderTurnError::ConnectionRefused(_) => Self::ConnectionRefused,
+            ProviderTurnError::DnsFailure(_) => Self::DnsFailure,
             ProviderTurnError::ServerError { .. } => Self::ServerError,
             ProviderTurnError::ClientError { .. } => Self::ClientError,
             ProviderTurnError::Timeout(_) => Self::Timeout,
             ProviderTurnError::Parse(_) => Self::Parse,
             ProviderTurnError::Backend(_) => Self::Backend,
+            ProviderTurnError::ModelNotFound { .. } => Self::ModelNotFound,
+            ProviderTurnError::AuthenticationFailed { .. } => Self::AuthenticationFailed,
         }
+    }
+}
+
+/// Build a Done AgentEvent from provider response (shared by ollama and openai).
+pub(crate) fn build_provider_done_event(
+    assistant_output: &str,
+    inference_performance: Option<InferencePerformanceView>,
+) -> AgentEvent {
+    AgentEvent::Done {
+        status: "Done. session saved".to_string(),
+        assistant_message: assistant_output.to_string(),
+        completion_summary: "Provider turn finished successfully.".to_string(),
+        saved_status: "session saved".to_string(),
+        tool_logs: Vec::new(),
+        elapsed_ms: 0,
+        inference_performance,
     }
 }
 
@@ -268,7 +374,7 @@ impl LocalProviderClient {
     ///
     /// Dispatches to the inner client's `health_check` method.
     /// Returns `Ok(())` on success or a human-readable error message on failure.
-    pub fn health_check(&self) -> Result<(), String> {
+    pub fn health_check(&self) -> Result<(), ProviderTurnError> {
         match self {
             Self::Ollama(client) => client.health_check(),
             Self::OpenAi(client) => client.health_check(),
@@ -298,9 +404,12 @@ pub fn build_local_provider_client(
     config: &EffectiveConfig,
     shutdown_flag: Arc<AtomicBool>,
 ) -> Result<LocalProviderClient, ProviderBootstrapError> {
-    let curl_transport = CurlHttpTransport::with_shutdown_flag(Arc::clone(&shutdown_flag));
-    let transport =
-        RetryTransport::with_shutdown_flag(curl_transport, RetryConfig::default(), shutdown_flag);
+    let reqwest_transport = ReqwestHttpTransport::with_shutdown_flag(Arc::clone(&shutdown_flag));
+    let transport = RetryTransport::with_shutdown_flag(
+        reqwest_transport,
+        RetryConfig::default(),
+        shutdown_flag,
+    );
     match config.runtime.provider.as_str() {
         "ollama" => {
             let client = OllamaProviderClient::with_transport(

@@ -9,8 +9,6 @@ pub use cli_args::CliArgs;
 
 use clap::Parser;
 use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::{
     error::Error,
@@ -61,6 +59,16 @@ pub struct RuntimeConfig {
     pub stream: bool,
     pub web_search_provider: WebSearchProvider,
     pub serper_api_key: Option<String>,
+    /// `true` when the user explicitly set `context_window` via config file,
+    /// environment variable, or CLI flag.  When `false`, the auto-detect
+    /// logic in `cli.rs` may override `context_window` from the provider.
+    pub context_window_explicitly_set: bool,
+    /// Tag-based tool protocol mode override.
+    /// `Some(true)` = force tag-based, `Some(false)` = force JSON, `None` = auto-detect from model name.
+    pub tag_protocol: Option<bool>,
+    /// Smart compact threshold ratio (0.1..=0.95, default 0.75).
+    /// When estimated tokens exceed context_window * ratio, token-based compaction triggers.
+    pub smart_compact_threshold_ratio: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -72,6 +80,10 @@ pub struct ModeConfig {
     pub reasoning_visibility: ReasoningVisibility,
     pub debug_logging: bool,
     pub log_filter: Option<String>,
+    pub offline: bool,
+    /// Trust mode: auto-approve built-in tool execution.
+    /// Set only via `--trust` CLI flag (not from config file deserialization).
+    pub trust_all: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,7 +164,10 @@ impl EffectiveConfig {
     /// `CliArgs::default()` when parsing fails (e.g. cargo-test harness args).
     pub fn load() -> Result<Self, ConfigError> {
         match CliArgs::try_parse_from(std::env::args()) {
-            Ok(cli) => Self::load_with_args(&cli),
+            Ok(mut cli) => {
+                cli.resolve_tag_protocol();
+                Self::load_with_args(&cli)
+            }
             Err(_) => Self::load_with_args(&CliArgs::default()),
         }
     }
@@ -181,7 +196,7 @@ impl EffectiveConfig {
     fn default_for_paths(cwd: PathBuf, workspace_dir: PathBuf, config_file: PathBuf) -> Self {
         let state_dir = cwd.join(".anvil").join("state");
         let session_dir = cwd.join(".anvil").join("sessions");
-        let session_file = session_dir.join(format!("{}.json", session_key_for_cwd(&cwd)));
+        let session_file = session_dir.join("default.json");
         let logs_dir = cwd.join(".anvil").join("logs");
         Self {
             runtime: RuntimeConfig {
@@ -199,6 +214,9 @@ impl EffectiveConfig {
                 stream: true,
                 web_search_provider: WebSearchProvider::default(),
                 serper_api_key: None,
+                context_window_explicitly_set: false,
+                tag_protocol: None,
+                smart_compact_threshold_ratio: 0.75,
             },
             mode: ModeConfig {
                 prompt_source: PromptSource::Interactive,
@@ -208,6 +226,8 @@ impl EffectiveConfig {
                 reasoning_visibility: ReasoningVisibility::Summary,
                 debug_logging: false,
                 log_filter: None,
+                offline: false,
+                trust_all: false,
             },
             paths: PathConfig {
                 mcp_config_file: cwd.join(".anvil").join("mcp.json"),
@@ -222,6 +242,12 @@ impl EffectiveConfig {
             },
             project_instructions: None,
         }
+    }
+
+    /// Set `context_window` and mark it as explicitly set by the user.
+    fn set_context_window(&mut self, value: u32) {
+        self.runtime.context_window = value;
+        self.runtime.context_window_explicitly_set = true;
     }
 
     fn apply_file_and_env_overrides(&mut self) -> Result<(), ConfigError> {
@@ -282,6 +308,9 @@ impl EffectiveConfig {
             "ANVIL_WEB_SEARCH_PROVIDER",
             "SERPER_API_KEY",
             "ANVIL_LOG",
+            "ANVIL_OFFLINE",
+            "ANVIL_TAG_PROTOCOL",
+            "ANVIL_SMART_COMPACT_THRESHOLD_RATIO",
         ] {
             if let Ok(value) = std::env::var(key) {
                 map.insert(key.to_string(), value);
@@ -327,7 +356,7 @@ impl EffectiveConfig {
 
         // Numeric fields (already parsed by clap)
         if let Some(v) = cli.context_window {
-            self.runtime.context_window = v;
+            self.set_context_window(v);
         }
         if let Some(v) = cli.context_budget {
             self.runtime.context_budget = Some(v);
@@ -358,6 +387,25 @@ impl EffectiveConfig {
             self.mode.reasoning_visibility = parse_reasoning_visibility(v)?;
         }
 
+        if cli.offline {
+            self.mode.offline = true;
+        }
+        if cli.trust {
+            self.mode.trust_all = true;
+        }
+
+        // Tag protocol flag
+        if let Some(v) = cli.tag_protocol {
+            self.runtime.tag_protocol = Some(v);
+        }
+
+        // --session flag: override session file path
+        if let Some(ref name) = cli.session {
+            crate::session::validate_session_name(name)
+                .map_err(|e| ConfigError::ValidationError(e.to_string()))?;
+            self.paths.session_file = self.paths.session_dir.join(format!("{name}.json"));
+        }
+
         Ok(())
     }
 
@@ -382,9 +430,10 @@ impl EffectiveConfig {
                     };
                 }
                 "context_window" | "ANVIL_CONTEXT_WINDOW" => {
-                    self.runtime.context_window = value
+                    let v: u32 = value
                         .parse()
                         .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                    self.set_context_window(v);
                 }
                 "context_budget" | "ANVIL_CONTEXT_BUDGET" => {
                     self.runtime.context_budget = if value.is_empty() {
@@ -448,6 +497,17 @@ impl EffectiveConfig {
                 "log_filter" | "ANVIL_LOG" => {
                     self.mode.log_filter = Some(value.clone());
                 }
+                "offline" | "ANVIL_OFFLINE" => {
+                    self.mode.offline = parse_bool(value);
+                }
+                "tag_protocol" | "ANVIL_TAG_PROTOCOL" => {
+                    self.runtime.tag_protocol = Some(parse_bool(value));
+                }
+                "smart_compact_threshold_ratio" | "ANVIL_SMART_COMPACT_THRESHOLD_RATIO" => {
+                    self.runtime.smart_compact_threshold_ratio = value
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                }
                 _ => {}
             }
         }
@@ -472,7 +532,19 @@ impl EffectiveConfig {
         self.clamp_context_window();
         self.clamp_context_budget();
         self.clamp_agent_iterations();
+        self.clamp_smart_compact_ratio();
         Ok(())
+    }
+
+    /// Clamp smart_compact_threshold_ratio to [0.1, 0.95].
+    /// NaN/Infinity are not handled correctly by clamp(), so check is_finite() first
+    /// and fall back to the default value (0.75) if the value is non-finite.
+    pub fn clamp_smart_compact_ratio(&mut self) {
+        if !self.runtime.smart_compact_threshold_ratio.is_finite() {
+            self.runtime.smart_compact_threshold_ratio = 0.75;
+        }
+        self.runtime.smart_compact_threshold_ratio =
+            self.runtime.smart_compact_threshold_ratio.clamp(0.1, 0.95);
     }
 
     fn check_provider_url(&self) -> Result<(), ConfigError> {
@@ -502,7 +574,7 @@ impl EffectiveConfig {
         Ok(())
     }
 
-    fn clamp_context_window(&mut self) {
+    pub(crate) fn clamp_context_window(&mut self) {
         if self.runtime.context_window < MIN_CONTEXT_WINDOW {
             let old = self.runtime.context_window;
             self.runtime.context_window = MIN_CONTEXT_WINDOW;
@@ -512,7 +584,7 @@ impl EffectiveConfig {
         }
     }
 
-    fn clamp_context_budget(&mut self) {
+    pub(crate) fn clamp_context_budget(&mut self) {
         if let Some(budget) = self.runtime.context_budget
             && budget >= self.runtime.context_window
         {
@@ -750,12 +822,6 @@ pub fn sanitize_markers(content: &str) -> (String, bool) {
     (sanitized, found)
 }
 
-fn session_key_for_cwd(cwd: &std::path::Path) -> String {
-    let mut hasher = DefaultHasher::new();
-    cwd.hash(&mut hasher);
-    format!("session_{:x}", hasher.finish())
-}
-
 fn parse_bool(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
@@ -788,6 +854,15 @@ impl std::fmt::Debug for RuntimeConfig {
             .field("stream", &self.stream)
             .field("web_search_provider", &self.web_search_provider)
             .field("serper_api_key", &"[REDACTED]")
+            .field(
+                "context_window_explicitly_set",
+                &self.context_window_explicitly_set,
+            )
+            .field("tag_protocol", &self.tag_protocol)
+            .field(
+                "smart_compact_threshold_ratio",
+                &self.smart_compact_threshold_ratio,
+            )
             .finish()
     }
 }
@@ -863,7 +938,8 @@ fn expand_env_vars(
 }
 
 /// Known prefixes that indicate an API key or token.
-const KNOWN_SECRET_PREFIXES: &[&str] = &["ghp_", "sk-", "xoxb-", "xoxp-", "ghu_", "ghs_"];
+pub(crate) const KNOWN_SECRET_PREFIXES: &[&str] =
+    &["ghp_", "sk-", "xoxb-", "xoxp-", "ghu_", "ghs_"];
 
 /// [D4-008] Check MCP config env fields for plaintext API keys.
 ///

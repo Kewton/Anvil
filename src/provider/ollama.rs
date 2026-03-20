@@ -3,15 +3,25 @@
 //! Implements the [`ProviderClient`] trait for the Ollama local inference
 //! server via its `/api/chat` endpoint.
 
-use super::transport::{CurlHttpTransport, HttpTransport, RetryTransport};
-use super::{
-    AgentEvent, ProviderClient, ProviderEvent, ProviderMessageRole, ProviderTurnError,
-    ProviderTurnRequest,
+use super::transport::{
+    HttpTransport, ReqwestHttpTransport, RetryTransport, sanitize_error_message,
 };
+use super::{
+    ProviderClient, ProviderEvent, ProviderMessageRole, ProviderTurnError, ProviderTurnRequest,
+    build_provider_done_event,
+};
+
+/// Patterns in Ollama error messages that indicate a model is not found.
+///
+/// Ollama error response examples (v0.5.x verified):
+/// {"error":"model 'nonexistent' not found, try pulling it first"}
+/// {"error":"no such model 'invalid-name'"}
+const MODEL_NOT_FOUND_PATTERNS: &[&str] = &["not found", "no such model"];
 use crate::config::EffectiveConfig;
+use crate::contracts::InferencePerformanceView;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::process::Command;
+use std::time::Duration;
 
 /// Wire format for Ollama chat messages.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,12 +48,44 @@ struct OllamaChatChunk {
     message: Option<OllamaChatMessage>,
     #[serde(default)]
     done: bool,
+    #[serde(default)]
+    eval_count: Option<u64>,
+    #[serde(default)]
+    eval_duration: Option<u64>,
+    #[serde(default)]
+    prompt_eval_count: Option<u64>,
+    #[serde(default)]
+    prompt_eval_duration: Option<u64>,
+}
+
+/// Extract InferencePerformanceView from Ollama eval metrics.
+fn extract_inference_performance(
+    eval_count: Option<u64>,
+    eval_duration: Option<u64>,
+    prompt_eval_count: Option<u64>,
+) -> Option<InferencePerformanceView> {
+    let eval_count = eval_count?;
+    let eval_duration = eval_duration?;
+    let eval_duration_ms = eval_duration / 1_000_000;
+    let tokens_per_sec_tenths = if eval_duration > 0 {
+        eval_count
+            .checked_mul(10_000_000_000)
+            .map(|v| v / eval_duration)
+    } else {
+        None
+    };
+    Some(InferencePerformanceView {
+        tokens_per_sec_tenths,
+        eval_tokens: Some(eval_count),
+        eval_duration_ms: Some(eval_duration_ms),
+        prompt_tokens: prompt_eval_count,
+    })
 }
 
 /// Client for the Ollama local inference server.
 ///
 /// Generic over [`HttpTransport`] so tests can inject a mock.
-pub struct OllamaProviderClient<T = RetryTransport<CurlHttpTransport>> {
+pub struct OllamaProviderClient<T = RetryTransport<ReqwestHttpTransport>> {
     base_url: String,
     transport: T,
 }
@@ -52,7 +94,7 @@ impl OllamaProviderClient {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into(),
-            transport: RetryTransport::new(CurlHttpTransport::new()),
+            transport: RetryTransport::new(ReqwestHttpTransport::new()),
         }
     }
 
@@ -108,6 +150,10 @@ impl<T> OllamaProviderClient<T> {
                 ProviderTurnError::Backend(format!("invalid ollama response: {err}"))
             })?;
 
+            let eval_count = parsed.eval_count;
+            let eval_duration = parsed.eval_duration;
+            let prompt_eval_count = parsed.prompt_eval_count;
+
             if let Some(message) = parsed.message
                 && !message.content.is_empty()
             {
@@ -116,14 +162,12 @@ impl<T> OllamaProviderClient<T> {
             }
 
             if parsed.done {
-                events.push(ProviderEvent::Agent(AgentEvent::Done {
-                    status: "Done. session saved".to_string(),
-                    assistant_message: assistant_output.clone(),
-                    completion_summary: "Provider turn finished successfully.".to_string(),
-                    saved_status: "session saved".to_string(),
-                    tool_logs: Vec::new(),
-                    elapsed_ms: 0,
-                }));
+                let perf =
+                    extract_inference_performance(eval_count, eval_duration, prompt_eval_count);
+                events.push(ProviderEvent::Agent(build_provider_done_event(
+                    &assistant_output,
+                    perf,
+                )));
             }
         }
 
@@ -155,7 +199,7 @@ impl Default for OllamaProviderClient {
     fn default() -> Self {
         Self {
             base_url: "http://127.0.0.1:11434".to_string(),
-            transport: RetryTransport::new(CurlHttpTransport::new()),
+            transport: RetryTransport::new(ReqwestHttpTransport::new()),
         }
     }
 }
@@ -166,12 +210,9 @@ impl<T: HttpTransport> OllamaProviderClient<T> {
     /// Returns `Ok(())` if the server responds, or an error message string
     /// on failure.  The health check uses the client's configured transport
     /// (which includes [`RetryTransport`] for automatic retry).
-    pub fn health_check(&self) -> Result<(), String> {
+    pub fn health_check(&self) -> Result<(), ProviderTurnError> {
         let url = format!("{}/api/tags", self.base_url.trim_end_matches('/'));
-        match self.transport.get(&url) {
-            Ok(_) => Ok(()),
-            Err(e) => Err(format!("Ollamaに接続できません ({}): {}", self.base_url, e)),
-        }
+        self.transport.get(&url).map(|_| ())
     }
 }
 
@@ -207,6 +248,9 @@ impl<T: HttpTransport> ProviderClient for OllamaProviderClient<T> {
                 }
                 match serde_json::from_str::<OllamaChatChunk>(line) {
                     Ok(chunk) => {
+                        let eval_count = chunk.eval_count;
+                        let eval_duration = chunk.eval_duration;
+                        let prompt_eval_count = chunk.prompt_eval_count;
                         if let Some(message) = chunk.message
                             && !message.content.is_empty()
                         {
@@ -214,22 +258,30 @@ impl<T: HttpTransport> ProviderClient for OllamaProviderClient<T> {
                             emit(ProviderEvent::TokenDelta(message.content));
                         }
                         if chunk.done {
-                            emit(ProviderEvent::Agent(AgentEvent::Done {
-                                status: "Done. session saved".to_string(),
-                                assistant_message: assistant_output.clone(),
-                                completion_summary: "Provider turn finished successfully."
-                                    .to_string(),
-                                saved_status: "session saved".to_string(),
-                                tool_logs: Vec::new(),
-                                elapsed_ms: 0,
-                            }));
+                            let perf = extract_inference_performance(
+                                eval_count,
+                                eval_duration,
+                                prompt_eval_count,
+                            );
+                            emit(ProviderEvent::Agent(build_provider_done_event(
+                                &assistant_output,
+                                perf,
+                            )));
                         }
                     }
                     Err(err) => {
                         if let Ok(value) = serde_json::from_str::<serde_json::Value>(line)
                             && let Some(error) = value.get("error").and_then(|v| v.as_str())
                         {
-                            had_error = Some(ProviderTurnError::Backend(error.to_string()));
+                            if MODEL_NOT_FOUND_PATTERNS.iter().any(|p| error.contains(p)) {
+                                let model = resolved_request.model.clone();
+                                had_error = Some(ProviderTurnError::ModelNotFound {
+                                    model,
+                                    message: sanitize_error_message(error),
+                                });
+                            } else {
+                                had_error = Some(ProviderTurnError::Backend(error.to_string()));
+                            }
                             return;
                         }
                         had_error = Some(ProviderTurnError::Backend(format!(
@@ -247,23 +299,213 @@ impl<T: HttpTransport> ProviderClient for OllamaProviderClient<T> {
     }
 }
 
+/// Maximum allowed response size from `/api/show` (1 MiB).
+const MAX_SHOW_RESPONSE_SIZE: usize = 1_048_576;
+
+/// Upper bound for a sane `context_length` value (10 million tokens).
+const MAX_CONTEXT_LENGTH: u32 = 10_000_000;
+
+/// Shared HTTP client for Ollama metadata requests (timeout 5s).
+fn ollama_metadata_client() -> &'static reqwest::blocking::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::blocking::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("Failed to build Ollama metadata HTTP client")
+    })
+}
+
+/// Query the Ollama `/api/show` endpoint and extract the model's
+/// `context_length` from `model_info`.
+///
+/// Returns `None` on any failure (network, parse, missing key).
+pub fn fetch_context_length_from_ollama(provider_url: &str, model: &str) -> Option<u32> {
+    let url = format!("{}/api/show", provider_url.trim_end_matches('/'));
+    let body = serde_json::json!({"model": model});
+    let client = ollama_metadata_client();
+    let response = client.post(&url).json(&body).send().ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let bytes = {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        response
+            .take(MAX_SHOW_RESPONSE_SIZE as u64)
+            .read_to_end(&mut buf)
+            .ok()?;
+        buf
+    };
+    parse_context_length_from_show_response(&bytes)
+}
+
+/// Parse an Ollama `/api/show` JSON response body and extract context_length.
+///
+/// This is the pure-logic core of [`fetch_context_length_from_ollama`],
+/// extracted for unit testing without network access.
+pub fn parse_context_length_from_show_response(json_bytes: &[u8]) -> Option<u32> {
+    let value: Value = serde_json::from_slice(json_bytes).ok()?;
+    let model_info = value.get("model_info")?.as_object()?;
+
+    for (key, val) in model_info {
+        if key.ends_with(".context_length") {
+            let ctx_len = val.as_u64()?;
+            let clamped = u32::try_from(ctx_len.min(u64::from(MAX_CONTEXT_LENGTH))).ok()?;
+            if clamped > 0 {
+                return Some(clamped);
+            }
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Model list / info types and parse functions (Issue #77)
+// ---------------------------------------------------------------------------
+
+/// An entry from the Ollama `/api/tags` model list.
+#[derive(Debug)]
+pub struct OllamaModelEntry {
+    pub name: String,
+    pub size: u64,
+}
+
+/// Detailed model information from the Ollama `/api/show` endpoint.
+#[derive(Debug)]
+pub struct OllamaModelInfo {
+    pub parameter_size: Option<String>,
+    pub quantization_level: Option<String>,
+    pub context_length: Option<u32>,
+}
+
+/// Maximum allowed response size from `/api/tags` (5 MiB).
+const MAX_TAGS_RESPONSE_SIZE: usize = 5_242_880;
+
+/// Parse an Ollama `/api/tags` JSON response body and extract the model list.
+///
+/// Pure-logic function for unit testing without network access.
+pub fn parse_model_list_from_tags_response(json_bytes: &[u8]) -> Option<Vec<OllamaModelEntry>> {
+    let value: Value = serde_json::from_slice(json_bytes).ok()?;
+    let models = value.get("models")?.as_array()?;
+    let mut entries = Vec::new();
+    for model in models {
+        let name = model.get("name")?.as_str()?.to_string();
+        let size = model.get("size").and_then(Value::as_u64).unwrap_or(0);
+        entries.push(OllamaModelEntry { name, size });
+    }
+    Some(entries)
+}
+
+/// Parse an Ollama `/api/show` JSON response body and extract model info.
+///
+/// Pure-logic function for unit testing without network access.
+/// Extends the existing `parse_context_length_from_show_response` pattern.
+pub fn parse_model_info_from_show_response(json_bytes: &[u8]) -> Option<OllamaModelInfo> {
+    let value: Value = serde_json::from_slice(json_bytes).ok()?;
+
+    // Extract parameter_size and quantization_level from details
+    let details = value.get("details");
+    let parameter_size = details
+        .and_then(|d| d.get("parameter_size"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let quantization_level = details
+        .and_then(|d| d.get("quantization_level"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+
+    // Extract context_length from model_info (same logic as parse_context_length_from_show_response)
+    let context_length =
+        value
+            .get("model_info")
+            .and_then(Value::as_object)
+            .and_then(|model_info| {
+                for (key, val) in model_info {
+                    if key.ends_with(".context_length")
+                        && let Some(ctx_len) = val.as_u64()
+                    {
+                        let clamped =
+                            u32::try_from(ctx_len.min(u64::from(MAX_CONTEXT_LENGTH))).ok()?;
+                        if clamped > 0 {
+                            return Some(clamped);
+                        }
+                    }
+                }
+                None
+            });
+
+    Some(OllamaModelInfo {
+        parameter_size,
+        quantization_level,
+        context_length,
+    })
+}
+
+/// Fetch the list of available models from Ollama `/api/tags`.
+///
+/// Returns `None` on any failure (network, parse, missing key).
+pub fn fetch_model_list_from_ollama(provider_url: &str) -> Option<Vec<OllamaModelEntry>> {
+    let url = format!("{}/api/tags", provider_url.trim_end_matches('/'));
+    let client = ollama_metadata_client();
+    let response = client.get(&url).send().ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let bytes = {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        response
+            .take(MAX_TAGS_RESPONSE_SIZE as u64)
+            .read_to_end(&mut buf)
+            .ok()?;
+        buf
+    };
+    parse_model_list_from_tags_response(&bytes)
+}
+
+/// Fetch detailed model information from Ollama `/api/show`.
+///
+/// Returns `None` on any failure (network, parse, missing key).
+pub fn fetch_model_info_from_ollama(provider_url: &str, model: &str) -> Option<OllamaModelInfo> {
+    let url = format!("{}/api/show", provider_url.trim_end_matches('/'));
+    let body = serde_json::json!({"model": model});
+    let client = ollama_metadata_client();
+    let response = client.post(&url).json(&body).send().ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let bytes = {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        response
+            .take(MAX_SHOW_RESPONSE_SIZE as u64)
+            .read_to_end(&mut buf)
+            .ok()?;
+        buf
+    };
+    parse_model_info_from_show_response(&bytes)
+}
+
+// TODO: fetch_context_length_from_ollama, fetch_model_list_from_ollama,
+// fetch_model_info_from_ollamaをOllamaProviderClient::メソッドに統合し、
+// HttpTransport経由で実装するリファクタリング（別Issue）
+
 fn resolve_model_with_ollama_tags(base_url: &str, requested: &str) -> String {
     let url = format!("{}/api/tags", base_url.trim_end_matches('/'));
-    let output = Command::new("curl")
-        .arg("-sS")
-        .arg("--max-time")
-        .arg("5")
-        .arg(url)
-        .output();
-
-    let Ok(output) = output else {
-        return requested.to_string();
+    let client = ollama_metadata_client();
+    let response = match client.get(&url).send() {
+        Ok(r) => r,
+        Err(_) => return requested.to_string(),
     };
-    if !output.status.success() {
+    if !response.status().is_success() {
         return requested.to_string();
     }
-
-    let Ok(value) = serde_json::from_slice::<Value>(&output.stdout) else {
+    let bytes = match response.bytes() {
+        Ok(b) => b,
+        Err(_) => return requested.to_string(),
+    };
+    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
         return requested.to_string();
     };
     let Some(models) = value.get("models").and_then(Value::as_array) else {

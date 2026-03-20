@@ -34,6 +34,7 @@ impl ProviderClient for RecordingProvider {
                 saved_status: "session saved".to_string(),
                 tool_logs: Vec::new(),
                 elapsed_ms: 0,
+                inference_performance: None,
             }));
             return Ok(());
         }
@@ -162,12 +163,10 @@ fn slash_commands_support_help_status_reset_and_exit() {
             .expect("checkpoint frame")
             .contains("checkpoint saved")
     );
+    let model_frame = model.frames.last().expect("model frame");
     assert!(
-        model
-            .frames
-            .last()
-            .expect("model frame")
-            .contains("current model: local-default")
+        model_frame.contains("local-default"),
+        "model frame should contain the model name 'local-default', got: {model_frame}"
     );
     assert!(
         provider_status
@@ -202,6 +201,7 @@ fn regular_input_runs_live_turn_and_supports_follow_up_in_same_session() {
             saved_status: "session saved".to_string(),
             tool_logs: Vec::new(),
             elapsed_ms: 120,
+            inference_performance: None,
         })],
     };
 
@@ -268,6 +268,7 @@ fn slash_approve_and_deny_resolve_pending_tool_approval() {
                 saved_status: "session saved".to_string(),
                 tool_logs: Vec::new(),
                 elapsed_ms: 240,
+                inference_performance: None,
             }),
         ],
     };
@@ -362,6 +363,7 @@ fn startup_console_resumes_existing_session_history() {
             saved_status: "session saved".to_string(),
             tool_logs: Vec::new(),
             elapsed_ms: 100,
+            inference_performance: None,
         })],
     };
     let mut first = common::build_app_in(root.clone());
@@ -437,6 +439,7 @@ fn regular_input_surfaces_tool_execution_logs_in_console() {
                     "src/app/mod.rs".to_string(),
                 )],
                 elapsed_ms: 140,
+                inference_performance: None,
             }),
         ],
     };
@@ -527,6 +530,7 @@ fn custom_slash_commands_load_from_extension_file_and_run_live_turn() {
             saved_status: "session saved".to_string(),
             tool_logs: Vec::new(),
             elapsed_ms: 90,
+            inference_performance: None,
         })],
     };
 
@@ -654,6 +658,7 @@ fn repo_find_adds_retrieval_context_to_following_provider_turn() {
             saved_status: "session saved".to_string(),
             tool_logs: Vec::new(),
             elapsed_ms: 120,
+            inference_performance: None,
         })],
     };
 
@@ -670,4 +675,83 @@ fn repo_find_adds_retrieval_context_to_following_provider_turn() {
         message.content.contains("[retrieval context]")
             && message.content.contains("src/provider_notes.rs")
     }));
+}
+
+// ---------------------------------------------------------------------------
+// /undo command tests (Issue #68)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn undo_command_is_recognized() {
+    let mut app = common::build_app();
+    let tui = Tui::new();
+    let provider = RecordingProvider {
+        seen_requests: Rc::new(RefCell::new(Vec::new())),
+        events: Vec::new(),
+    };
+
+    let result = app
+        .handle_cli_line("/undo", &provider, &tui)
+        .expect("undo should be recognized");
+    assert_eq!(result.control, SessionControl::Continue);
+    assert!(
+        result
+            .frames
+            .last()
+            .expect("undo frame")
+            .contains("No changes to undo"),
+        "empty undo stack should show appropriate message"
+    );
+}
+
+#[test]
+fn undo_command_parses_numeric_argument() {
+    let mut app = common::build_app();
+    let tui = Tui::new();
+    let provider = RecordingProvider {
+        seen_requests: Rc::new(RefCell::new(Vec::new())),
+        events: Vec::new(),
+    };
+
+    let result = app
+        .handle_cli_line("/undo 3", &provider, &tui)
+        .expect("undo with argument should be recognized");
+    assert_eq!(result.control, SessionControl::Continue);
+    assert!(
+        result
+            .frames
+            .last()
+            .expect("undo frame")
+            .contains("No changes to undo"),
+        "empty undo stack should show appropriate message even with N argument"
+    );
+}
+
+#[test]
+fn undo_command_no_target_shows_message() {
+    let mut app = common::build_app();
+    let tui = Tui::new();
+    let provider = RecordingProvider {
+        seen_requests: Rc::new(RefCell::new(Vec::new())),
+        events: Vec::new(),
+    };
+
+    let result = app
+        .handle_cli_line("/undo", &provider, &tui)
+        .expect("undo should work");
+    let frame = result.frames.last().expect("frame");
+    assert!(
+        frame.contains("No changes to undo"),
+        "should indicate nothing to undo"
+    );
+}
+
+#[test]
+fn help_frame_includes_undo_command() {
+    let help = anvil::app::render_help_frame();
+    assert!(help.contains("/undo"), "help should list /undo command");
+    assert!(
+        help.contains("undo the last file change"),
+        "help should show undo description"
+    );
 }

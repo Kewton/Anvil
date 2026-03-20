@@ -3,6 +3,7 @@
 //! Provides [`SubAgentSession`] which runs an independent LLM loop with a
 //! restricted tool set (read-only) within a sandboxed scope directory.
 
+use crate::app::policy::{OFFLINE_BLOCK_PAYLOAD, check_offline_blocked};
 use crate::config::EffectiveConfig;
 use crate::provider::{ProviderClient, ProviderEvent, ProviderTurnError};
 use crate::session::{MessageRole, SessionMessage, SessionRecord};
@@ -53,9 +54,16 @@ const TOOL_DESC_FILE_READ: &str = r#"- file.read — read a file or list a direc
 
 "#;
 
-const TOOL_DESC_FILE_SEARCH: &str = r#"- file.search — search for files by name or content:
+pub(crate) const TOOL_DESC_FILE_SEARCH: &str = r#"- file.search — search for files by name or content (supports regex and context lines):
 ```ANVIL_TOOL
 {"id":"call_002","tool":"file.search","root":".","pattern":"search term"}
+```
+  Optional parameters:
+  - "regex": true — interpret pattern as a regular expression (default: false)
+  - "context_lines": N — show N lines before/after each match, max 10 (default: 0)
+  Example with regex and context:
+```ANVIL_TOOL
+{"id":"call_010","tool":"file.search","root":".","pattern":"fn\\s+main","regex":true,"context_lines":3}
 ```
 
 "#;
@@ -63,6 +71,27 @@ const TOOL_DESC_FILE_SEARCH: &str = r#"- file.search — search for files by nam
 const TOOL_DESC_WEB_FETCH: &str = r#"- web.fetch — fetch the contents of a URL:
 ```ANVIL_TOOL
 {"id":"call_003","tool":"web.fetch","url":"https://example.com"}
+```
+
+"#;
+
+const TOOL_DESC_GIT_STATUS: &str = r#"- git.status — show working tree status:
+```ANVIL_TOOL
+{"id":"call_010","tool":"git.status"}
+```
+
+"#;
+
+const TOOL_DESC_GIT_DIFF: &str = r#"- git.diff — show changes in working tree or between commits:
+```ANVIL_TOOL
+{"id":"call_011","tool":"git.diff","path":"src/main.rs","staged":true}
+```
+
+"#;
+
+const TOOL_DESC_GIT_LOG: &str = r#"- git.log — show commit log (oneline format):
+```ANVIL_TOOL
+{"id":"call_012","tool":"git.log","count":20}
 ```
 
 "#;
@@ -82,21 +111,42 @@ You are a Plan sub-agent. Your task is to create an implementation plan.
 - You only have read-only access: file.read, file.search, and web.fetch.
 "#;
 
+const PLAN_ROLE_PROMPT_OFFLINE: &str = r#"## Your role
+You are a Plan sub-agent. Your task is to create an implementation plan.
+- Read files and search the codebase to understand existing patterns.
+- Produce a detailed, actionable plan in ANVIL_FINAL.
+- You only have read-only access: file.read and file.search.
+- Note: Offline mode is active. Web access is unavailable.
+"#;
+
 /// Build a system prompt for a sub-agent of the given kind.
-pub fn build_subagent_system_prompt(kind: &SubAgentKind) -> String {
+///
+/// When `offline` is `true`, web-related tool descriptions and prompts
+/// are excluded from the Plan sub-agent prompt.
+pub fn build_subagent_system_prompt(kind: &SubAgentKind, offline: bool) -> String {
     let mut prompt = String::new();
     prompt.push_str(SUBAGENT_PROTOCOL_BASE);
     match kind {
         SubAgentKind::Explore => {
             prompt.push_str(TOOL_DESC_FILE_READ);
             prompt.push_str(TOOL_DESC_FILE_SEARCH);
+            prompt.push_str(TOOL_DESC_GIT_STATUS);
+            prompt.push_str(TOOL_DESC_GIT_DIFF);
+            prompt.push_str(TOOL_DESC_GIT_LOG);
             prompt.push_str(EXPLORE_ROLE_PROMPT);
         }
         SubAgentKind::Plan => {
             prompt.push_str(TOOL_DESC_FILE_READ);
             prompt.push_str(TOOL_DESC_FILE_SEARCH);
-            prompt.push_str(TOOL_DESC_WEB_FETCH);
-            prompt.push_str(PLAN_ROLE_PROMPT);
+            if !offline {
+                prompt.push_str(TOOL_DESC_WEB_FETCH);
+            }
+            prompt.push_str(TOOL_DESC_GIT_STATUS);
+            prompt.push_str(if offline {
+                PLAN_ROLE_PROMPT_OFFLINE
+            } else {
+                PLAN_ROLE_PROMPT
+            });
         }
     }
     prompt
@@ -228,6 +278,13 @@ enum TurnOutcome {
 // SubAgentSession
 // ---------------------------------------------------------------------------
 
+/// Override settings for sub-agent model/context_window (Issue #77).
+#[derive(Debug, Clone, Default)]
+pub struct SubAgentOverrides {
+    pub model: Option<String>,
+    pub context_window: Option<u32>,
+}
+
 /// An independent sub-agent session that runs within a restricted scope.
 ///
 /// Responsibilities:
@@ -246,6 +303,8 @@ pub struct SubAgentSession<'a, C: ProviderClient> {
     scope_path: std::path::PathBuf,
     /// Running count of iterations used (for result reporting).
     iterations_used: u32,
+    /// Model/context_window overrides from the parent App (Issue #77).
+    overrides: SubAgentOverrides,
 }
 
 impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
@@ -260,6 +319,7 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
         provider_client: &'a C,
         config: &'a EffectiveConfig,
         shutdown_flag: Arc<AtomicBool>,
+        overrides: SubAgentOverrides,
     ) -> Self {
         // 1. Independent session with scope as cwd
         let mut session = SessionRecord::new(scope.to_path_buf());
@@ -273,7 +333,7 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
         }
 
         // 3. Dedicated system prompt
-        let system_prompt = build_subagent_system_prompt(&kind);
+        let system_prompt = build_subagent_system_prompt(&kind, config.mode.offline);
 
         SubAgentSession {
             kind,
@@ -285,17 +345,33 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
             shutdown_flag,
             scope_path: scope.to_path_buf(),
             iterations_used: 0,
+            overrides,
         }
+    }
+
+    /// Return the effective model for this sub-agent session.
+    fn effective_model(&self) -> &str {
+        self.overrides
+            .model
+            .as_deref()
+            .unwrap_or(&self.config.runtime.model)
+    }
+
+    /// Return the effective context window for this sub-agent session.
+    fn effective_context_window(&self) -> u32 {
+        self.overrides
+            .context_window
+            .unwrap_or(self.config.runtime.context_window)
     }
 
     /// Execute one LLM turn: request -> stream -> parse -> validate -> execute -> record.
     fn run_turn(&mut self) -> Result<TurnOutcome, SubAgentError> {
         // Build the provider request
         let request = BasicAgentLoop::build_turn_request(
-            &self.config.runtime.model,
+            self.effective_model(),
             &self.session,
             true,
-            self.config.runtime.context_window,
+            self.effective_context_window(),
             &self.system_prompt,
         );
 
@@ -360,6 +436,19 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
                     continue;
                 }
             };
+
+            // Offline policy check (validate succeeded, check before approve)
+            if let Some(summary) = check_offline_blocked(self.config, call) {
+                self.session.push_message(SessionMessage::new(
+                    MessageRole::Tool,
+                    "tool",
+                    format!(
+                        "[tool result: {}] {}\n{}",
+                        call.tool_name, summary, OFFLINE_BLOCK_PAYLOAD
+                    ),
+                ));
+                continue;
+            }
 
             // Auto-approve (sub-agent tools are all Safe)
             let approved = validated.approve();

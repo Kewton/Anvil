@@ -13,6 +13,7 @@ use crate::contracts::{
 };
 use crate::provider::ProviderErrorRecord;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::fmt::{Display, Formatter};
 use std::hash::{Hash, Hasher};
@@ -48,6 +49,10 @@ pub struct SessionMessage {
     pub is_error: bool,
     #[serde(default)]
     pub image_paths: Option<Vec<String>>,
+    /// Expanded content after @file reference resolution.
+    /// Not serialized — only exists in memory during the live session.
+    #[serde(skip)]
+    pub expanded_content: Option<String>,
 }
 
 impl SessionMessage {
@@ -61,6 +66,7 @@ impl SessionMessage {
             tool_call_id: None,
             is_error: false,
             image_paths: None,
+            expanded_content: None,
         }
     }
 
@@ -83,6 +89,12 @@ impl SessionMessage {
         self.image_paths = Some(paths);
         self
     }
+
+    /// Return expanded_content if set, otherwise fall back to content.
+    /// Used for token estimation and LLM message construction (DRY).
+    pub fn effective_content(&self) -> &str {
+        self.expanded_content.as_deref().unwrap_or(&self.content)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,7 +105,7 @@ pub struct SessionMetadata {
     pub updated_at_ms: u128,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionRecord {
     pub metadata: SessionMetadata,
     #[serde(default)]
@@ -108,6 +120,10 @@ pub struct SessionRecord {
     pub pending_turn: Option<PendingTurnState>,
     #[serde(default)]
     pub provider_errors: Vec<ProviderErrorRecord>,
+    /// Set of tool names that have been used in this session.
+    /// Used for dynamic system prompt generation (Issue #73).
+    #[serde(default)]
+    pub used_tools: HashSet<String>,
     /// Tracks whether in-memory state has diverged from disk.
     /// Not serialized — always starts as `false` after deserialization.
     #[serde(skip)]
@@ -120,14 +136,30 @@ pub struct SessionRecord {
     /// Auto-compaction threshold (configurable, default 64).
     #[serde(skip)]
     pub auto_compact_threshold: usize,
+    /// Smart compact threshold ratio (configurable, default 0.75).
+    /// When estimated tokens exceed context_window * ratio, token-based compaction triggers.
+    #[serde(skip)]
+    pub smart_compact_threshold_ratio: f64,
 }
 
 impl SessionRecord {
+    /// Create a new session with a hash-based ID derived from the working directory.
     pub fn new(cwd: PathBuf) -> Self {
+        Self::with_id(session_id_for_cwd(&cwd), cwd)
+    }
+
+    /// Create a new session with an explicit name after validation.
+    pub fn new_named(name: &str, cwd: PathBuf) -> Result<Self, SessionError> {
+        validate_session_name(name)?;
+        Ok(Self::with_id(name.to_string(), cwd))
+    }
+
+    /// Internal constructor shared by `new` and `new_named`.
+    fn with_id(session_id: String, cwd: PathBuf) -> Self {
         let now = now_ms();
         Self {
             metadata: SessionMetadata {
-                session_id: session_id_for_cwd(&cwd),
+                session_id,
                 cwd,
                 created_at_ms: now,
                 updated_at_ms: now,
@@ -138,16 +170,18 @@ impl SessionRecord {
             event_log: Vec::new(),
             pending_turn: None,
             provider_errors: Vec::new(),
+            used_tools: HashSet::new(),
             dirty: false,
             cached_token_count: std::cell::Cell::new(None),
             auto_compact_threshold: 64,
+            smart_compact_threshold_ratio: 0.75,
         }
     }
 
     pub fn push_message(&mut self, message: SessionMessage) {
         // Update cached token count incrementally
         let kind = ContentKind::from_message_role(message.role);
-        let mut msg_tokens = contracts_estimate_tokens(&message.content, kind);
+        let mut msg_tokens = contracts_estimate_tokens(message.effective_content(), kind);
         // Add fixed 300 tokens per image
         if let Some(ref paths) = message.image_paths {
             msg_tokens += IMAGE_TOKENS * paths.len();
@@ -165,8 +199,17 @@ impl SessionRecord {
         self.auto_compact_threshold > 0 && self.messages.len() > self.auto_compact_threshold
     }
 
+    /// Token-based compaction check.
+    /// Returns true when estimated tokens exceed context_window * ratio.
+    pub fn should_smart_compact(&self, context_window: u32) -> bool {
+        self.smart_compact_threshold_ratio > 0.0
+            && self.estimated_token_count()
+                > (context_window as f64 * self.smart_compact_threshold_ratio) as usize
+    }
+
     /// Run auto-compaction if message count exceeds the threshold.
     /// Called at turn boundaries (before flush) to avoid per-message overhead.
+    #[deprecated(note = "Use App::compact_with_hooks() instead")]
     pub fn compact_if_needed(&mut self) -> bool {
         if self.auto_compact_threshold > 0 && self.messages.len() > self.auto_compact_threshold {
             self.compact_history(self.auto_compact_threshold / 2)
@@ -287,7 +330,7 @@ impl SessionRecord {
             .iter()
             .map(|message| {
                 let kind = ContentKind::from_message_role(message.role);
-                let mut tokens = contracts_estimate_tokens(&message.content, kind);
+                let mut tokens = contracts_estimate_tokens(message.effective_content(), kind);
                 if let Some(ref paths) = message.image_paths {
                     tokens += IMAGE_TOKENS * paths.len();
                 }
@@ -303,16 +346,23 @@ impl SessionRecord {
             return false;
         }
 
-        let messages_to_compact = self.messages.len() - keep_recent;
+        let split_at = self.messages.len() - keep_recent;
         tracing::debug!(
-            compacted = messages_to_compact,
+            compacted = split_at,
             kept = keep_recent,
             "compacting session history"
         );
 
-        let split_at = self.messages.len() - keep_recent;
-        let compacted = &self.messages[..split_at];
-        let summary = summarize_messages(compacted);
+        // Step 1: Replace large tool results with summaries
+        replace_tool_results_with_summaries(&mut self.messages[..split_at]);
+
+        // Step 2: Compute importance scores
+        let scores = compute_importance_scores(&self.messages, split_at);
+
+        // Step 3: Generate summary using scores
+        let summary = generate_compact_summary(&self.messages[..split_at], &scores);
+
+        // Step 4: Drain old messages and insert summary
         self.messages.drain(..split_at);
         self.cached_token_count.set(None); // Invalidate cache after drain
         self.messages.insert(
@@ -419,22 +469,49 @@ impl SessionRecord {
     }
 }
 
+/// Information about a session for listing purposes.
+#[derive(Debug, Clone)]
+pub struct SessionInfo {
+    pub name: String,
+    pub updated_at_ms: u128,
+    pub message_count: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionStore {
     file_path: PathBuf,
+    session_dir: PathBuf,
 }
 
 impl SessionStore {
-    pub fn new(file_path: PathBuf) -> Self {
-        Self { file_path }
+    pub fn new(file_path: PathBuf, session_dir: PathBuf) -> Self {
+        Self {
+            file_path,
+            session_dir,
+        }
     }
 
     pub fn from_config(config: &EffectiveConfig) -> Self {
-        Self::new(config.paths.session_file.clone())
+        Self::new(
+            config.paths.session_file.clone(),
+            config.paths.session_dir.clone(),
+        )
     }
 
     pub fn file_path(&self) -> &Path {
         &self.file_path
+    }
+
+    pub fn session_dir(&self) -> &Path {
+        &self.session_dir
+    }
+
+    /// Extract the session name from the file path stem (e.g. "default" from "default.json").
+    fn session_name(&self) -> &str {
+        self.file_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("default")
     }
 
     pub fn load_or_create(&self, cwd: &Path) -> Result<SessionRecord, SessionError> {
@@ -456,11 +533,98 @@ impl SessionStore {
             }
         }
 
+        // Migration: look for old hash-based session file
+        let old_key = session_id_for_cwd(cwd);
+        let old_path = self.session_dir.join(format!("{old_key}.json"));
+        let session_name = self.session_name();
+        if old_path.exists() {
+            tracing::debug!(old = %old_path.display(), new = %self.file_path.display(), "migrating old session file");
+            std::fs::rename(&old_path, &self.file_path)
+                .map_err(SessionError::SessionWriteFailed)?;
+            let mut session = self.load()?;
+            session.metadata.session_id = session_name.to_string();
+            session.record_event(AppEvent::SessionLoaded);
+            self.save(&session)?;
+            return Ok(session);
+        }
+
+        // New session creation using named constructor
         tracing::debug!("creating new session");
-        let mut record = SessionRecord::new(cwd.to_path_buf());
+        let mut record = if validate_session_name(session_name).is_ok() {
+            SessionRecord::new_named(session_name, cwd.to_path_buf())?
+        } else {
+            // Fallback for non-conforming file names (e.g. hash-based)
+            SessionRecord::new(cwd.to_path_buf())
+        };
         record.record_event(AppEvent::SessionLoaded);
         self.save(&record)?;
         Ok(record)
+    }
+
+    /// List all sessions in the session directory.
+    /// Skips symlinks and non-JSON files.
+    pub fn list_sessions(&self) -> Result<Vec<SessionInfo>, SessionError> {
+        let entries = match std::fs::read_dir(&self.session_dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Vec::new());
+            }
+            Err(err) => return Err(SessionError::SessionReadFailed(err)),
+        };
+
+        let mut sessions = Vec::new();
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            let path = entry.path();
+
+            // Skip symlinks
+            if path.symlink_metadata().map_or(true, |m| m.is_symlink()) {
+                continue;
+            }
+
+            // Only process .json files (skip .json.tmp and others)
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+
+            let name = match path.file_stem().and_then(|s| s.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+
+            // Try to read and deserialize the session
+            let contents = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let record: SessionRecord = match serde_json::from_str(&contents) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+
+            sessions.push(SessionInfo {
+                name,
+                updated_at_ms: record.metadata.updated_at_ms,
+                message_count: record.messages.len(),
+            });
+        }
+
+        Ok(sessions)
+    }
+
+    /// Delete a session by name. Validates the name and checks existence.
+    pub fn delete_session(&self, name: &str) -> Result<(), SessionError> {
+        validate_session_name(name)?;
+        let path = self.session_dir.join(format!("{name}.json"));
+        if !path.exists() {
+            return Err(SessionError::SessionNotFound(name.to_string()));
+        }
+        std::fs::remove_file(&path).map_err(SessionError::SessionWriteFailed)?;
+        Ok(())
     }
 
     pub fn load(&self) -> Result<SessionRecord, SessionError> {
@@ -517,6 +681,9 @@ pub enum SessionError {
     SessionWriteFailed(std::io::Error),
     SessionSerializeFailed(serde_json::Error),
     SessionDeserializeFailed(serde_json::Error),
+    InvalidSessionName(String),
+    SessionNotFound(String),
+    ActiveSessionCannotBeDeleted,
 }
 
 impl Display for SessionError {
@@ -532,6 +699,18 @@ impl Display for SessionError {
             }
             Self::SessionDeserializeFailed(err) => {
                 write!(f, "failed to deserialize session: {err}")
+            }
+            Self::InvalidSessionName(name) => {
+                write!(
+                    f,
+                    "invalid session name: '{name}' (allowed: alphanumeric, hyphen, underscore, 1-64 chars)"
+                )
+            }
+            Self::SessionNotFound(name) => {
+                write!(f, "session not found: '{name}'")
+            }
+            Self::ActiveSessionCannotBeDeleted => {
+                write!(f, "cannot delete the active session")
             }
         }
     }
@@ -560,10 +739,231 @@ fn now_ms() -> u128 {
         .as_millis()
 }
 
-fn session_id_for_cwd(cwd: &Path) -> String {
+pub(crate) fn session_id_for_cwd(cwd: &Path) -> String {
     let mut hasher = DefaultHasher::new();
     cwd.hash(&mut hasher);
     format!("session_{:x}", hasher.finish())
+}
+
+/// Validate a session name: alphanumeric, hyphen, underscore only, 1-64 chars.
+/// Rejects `.`, `..`, NUL bytes, and any other special characters.
+pub fn validate_session_name(name: &str) -> Result<(), SessionError> {
+    // The alphanumeric + hyphen + underscore check below already rejects
+    // '.', '..', NUL bytes, and all other special characters, so no
+    // separate guards are needed.
+    let valid = !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    if !valid {
+        return Err(SessionError::InvalidSessionName(name.to_string()));
+    }
+    Ok(())
+}
+
+// ── Smart compact constants and functions ─────────────────────────────
+
+/// Importance score constants (Issue #80).
+const SCORE_SYSTEM_PROMPT: i32 = 10;
+const SCORE_ERROR_BONUS: i32 = 5;
+const SCORE_USER_INPUT: i32 = 3;
+const SCORE_TOOL_RESULT_PENALTY: i32 = -2;
+const SCORE_RECENCY_MAX: i32 = 10;
+
+/// Compaction target: after compaction, aim for context_window * TARGET_TOKEN_RATIO tokens.
+pub(crate) const TARGET_TOKEN_RATIO: f64 = 0.5;
+
+/// Tool results above this estimated token count are replaced with summaries.
+const TOOL_SUMMARY_THRESHOLD: usize = 500;
+
+/// Sensitive keyword patterns for bash command masking.
+const SENSITIVE_KEYWORDS: &[&str] = &[
+    "authorization",
+    "bearer",
+    "api_key",
+    "password",
+    "token",
+    "secret",
+];
+
+/// Compute importance scores for messages in the compaction range.
+/// Returns a Vec<i32> with one score per message in messages[..compact_end].
+pub fn compute_importance_scores(messages: &[SessionMessage], compact_end: usize) -> Vec<i32> {
+    let mut scores = vec![0i32; compact_end];
+    for (index, msg) in messages[..compact_end].iter().enumerate() {
+        let mut score: i32 = 0;
+        // Recency: linear interpolation within compact range
+        if compact_end > 1 {
+            score += (SCORE_RECENCY_MAX * index as i32) / (compact_end as i32 - 1);
+        }
+        if msg.is_error {
+            score += SCORE_ERROR_BONUS;
+        }
+        match msg.role {
+            MessageRole::User => score += SCORE_USER_INPUT,
+            MessageRole::Tool => score += SCORE_TOOL_RESULT_PENALTY,
+            MessageRole::System => score += SCORE_SYSTEM_PROMPT,
+            MessageRole::Assistant => {}
+        }
+        scores[index] = score;
+    }
+    scores
+}
+
+/// Compute how many messages to keep from the end to fit within target_tokens.
+pub fn compute_token_based_keep_recent(messages: &[SessionMessage], target_tokens: usize) -> usize {
+    let mut cumulative = 0usize;
+    let mut keep = 0usize;
+    for msg in messages.iter().rev() {
+        let kind = ContentKind::from_message_role(msg.role);
+        cumulative += contracts_estimate_tokens(msg.effective_content(), kind);
+        keep += 1;
+        if cumulative >= target_tokens {
+            break;
+        }
+    }
+    keep
+}
+
+/// Generate a summary template for a tool result message.
+/// Returns None if the message is not a Tool role or below the threshold.
+pub fn summarize_tool_result(msg: &SessionMessage) -> Option<String> {
+    if msg.role != MessageRole::Tool {
+        return None;
+    }
+    let kind = ContentKind::from_message_role(msg.role);
+    let tokens = contracts_estimate_tokens(msg.effective_content(), kind);
+    if tokens < TOOL_SUMMARY_THRESHOLD {
+        return None;
+    }
+
+    let tool_name = &msg.author;
+    let sanitized_name = if !tool_name.is_empty()
+        && tool_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+    {
+        tool_name.as_str()
+    } else {
+        "unknown_tool"
+    };
+    Some(format!("[要約] {sanitized_name}: ({tokens}トークンの結果)"))
+}
+
+/// Replace tool results exceeding the threshold with summary templates.
+pub fn replace_tool_results_with_summaries(messages: &mut [SessionMessage]) {
+    for msg in messages.iter_mut() {
+        if let Some(summary) = summarize_tool_result(msg) {
+            msg.content = summary;
+        }
+    }
+}
+
+/// Mask sensitive patterns in a bash command string.
+pub fn mask_sensitive_in_command(cmd: &str) -> String {
+    let mut result = cmd.to_string();
+    // Mask known secret prefixes
+    for prefix in crate::config::KNOWN_SECRET_PREFIXES {
+        if let Some(pos) = result.find(prefix) {
+            // Find the end of the token (whitespace or end of string)
+            let start = pos;
+            let end = result[pos..]
+                .find(char::is_whitespace)
+                .map(|i| pos + i)
+                .unwrap_or(result.len());
+            result.replace_range(start..end, "***");
+        }
+    }
+    // Mask sensitive keyword values
+    let lower = result.to_ascii_lowercase();
+    for keyword in SENSITIVE_KEYWORDS {
+        if let Some(kw_pos) = lower.find(keyword) {
+            // Find the value after the keyword (skip keyword + optional separator)
+            let after_kw = kw_pos + keyword.len();
+            if after_kw < result.len() {
+                // Skip separators like '=', ':', ' '
+                let value_start = result[after_kw..]
+                    .find(|c: char| !matches!(c, '=' | ':' | ' ' | '"' | '\''))
+                    .map(|i| after_kw + i);
+                if let Some(vs) = value_start {
+                    let value_end = result[vs..]
+                        .find(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+                        .map(|i| vs + i)
+                        .unwrap_or(result.len());
+                    if value_end > vs {
+                        result.replace_range(vs..value_end, "***");
+                    }
+                }
+            }
+        }
+    }
+    result
+}
+
+/// Convert an absolute path to a relative path based on cwd.
+pub fn to_relative_path(absolute_path: &str, cwd: &str) -> String {
+    absolute_path
+        .strip_prefix(cwd)
+        .map(|p| p.trim_start_matches('/').to_string())
+        .unwrap_or_else(|| absolute_path.to_string())
+}
+
+/// Generate a compact summary from messages and their importance scores.
+/// High-score messages get more detail; low-score ones are condensed.
+pub(crate) fn generate_compact_summary(messages: &[SessionMessage], scores: &[i32]) -> String {
+    let mut lines = vec!["[compacted session summary]".to_string()];
+    let mut references = Vec::new();
+
+    // Determine the score threshold for "high importance"
+    let max_score = scores.iter().copied().max().unwrap_or(0);
+    let high_threshold = max_score / 2;
+
+    for (index, msg) in messages.iter().enumerate() {
+        let score = scores.get(index).copied().unwrap_or(0);
+        let role = match msg.role {
+            MessageRole::System => "system",
+            MessageRole::User => "you",
+            MessageRole::Assistant => "anvil",
+            MessageRole::Tool => "tool",
+        };
+        references.extend(extract_reference_like_tokens(&msg.content));
+
+        if score >= high_threshold {
+            // High importance: include more detail
+            lines.push(format!(
+                "- {}: {}",
+                role,
+                compact_preview(&msg.content, 120)
+            ));
+        } else if index < 12 {
+            // Low importance but within first 12: brief summary
+            lines.push(format!("- {}: {}", role, compact_preview(&msg.content, 60)));
+        }
+        // Beyond 12 low-importance messages: omitted
+    }
+
+    let omitted = messages
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| {
+            let score = scores.get(*i).copied().unwrap_or(0);
+            score < high_threshold && *i >= 12
+        })
+        .count();
+    if omitted > 0 {
+        lines.push(format!("- ... {omitted} more message(s)"));
+    }
+
+    references.sort();
+    references.dedup();
+    if !references.is_empty() {
+        lines.push("- refs:".to_string());
+        for reference in references.into_iter().take(5) {
+            lines.push(format!("  - {reference}"));
+        }
+    }
+    lines.join("\n")
 }
 
 fn compact_preview(content: &str, max_chars: usize) -> String {
@@ -575,37 +975,6 @@ fn compact_preview(content: &str, max_chars: usize) -> String {
         let preview: String = chars[..max_chars.saturating_sub(3)].iter().collect();
         format!("{preview}...")
     }
-}
-
-fn summarize_messages(messages: &[SessionMessage]) -> String {
-    let mut lines = vec!["[compacted session summary]".to_string()];
-    let mut references = Vec::new();
-    for message in messages.iter().take(8) {
-        let role = match message.role {
-            MessageRole::System => "system",
-            MessageRole::User => "you",
-            MessageRole::Assistant => "anvil",
-            MessageRole::Tool => "tool",
-        };
-        references.extend(extract_reference_like_tokens(&message.content));
-        lines.push(format!(
-            "- {}: {}",
-            role,
-            compact_preview(&message.content, 96)
-        ));
-    }
-    if messages.len() > 8 {
-        lines.push(format!("- ... {} more message(s)", messages.len() - 8));
-    }
-    references.sort();
-    references.dedup();
-    if !references.is_empty() {
-        lines.push("- refs:".to_string());
-        for reference in references.into_iter().take(5) {
-            lines.push(format!("  - {reference}"));
-        }
-    }
-    lines.join("\n")
 }
 
 fn extract_reference_like_tokens(content: &str) -> Vec<String> {

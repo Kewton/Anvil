@@ -24,6 +24,7 @@ fn cli_args_default_has_all_none_and_false() {
     assert!(args.exec.is_none());
     assert!(args.exec_file.is_none());
     assert!(args.reasoning_visibility.is_none());
+    assert!(!args.offline);
 }
 
 #[test]
@@ -109,6 +110,18 @@ fn cli_args_parse_bool_flags() {
     assert!(args.no_approval);
     assert!(args.fresh_session);
     assert!(args.oneshot);
+}
+
+#[test]
+fn cli_args_parse_offline_flag() {
+    let args = CliArgs::try_parse_from(["anvil", "--offline"]).unwrap();
+    assert!(args.offline);
+}
+
+#[test]
+fn cli_args_offline_default_is_false() {
+    let args = CliArgs::try_parse_from(["anvil"]).unwrap();
+    assert!(!args.offline);
 }
 
 #[test]
@@ -285,6 +298,32 @@ fn apply_cli_args_invalid_reasoning_visibility_errors() {
 
     let result = config.apply_cli_args(&args);
     assert!(result.is_err());
+}
+
+#[test]
+fn apply_cli_args_offline_sets_mode_offline() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    assert!(!config.mode.offline);
+    let args = CliArgs {
+        offline: true,
+        ..CliArgs::default()
+    };
+    config.apply_cli_args(&args).unwrap();
+    assert!(
+        config.mode.offline,
+        "offline flag should set mode.offline=true"
+    );
+}
+
+#[test]
+fn apply_cli_args_offline_false_preserves_default() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let args = CliArgs {
+        offline: false,
+        ..CliArgs::default()
+    };
+    config.apply_cli_args(&args).unwrap();
+    assert!(!config.mode.offline);
 }
 
 // --- --exec / --exec-file CLI args parsing tests ---
@@ -498,7 +537,7 @@ fn session_message_is_error_deserialize_compat() {
     assert!(!msg.is_error, "is_error should default to false");
 }
 
-// --- Spinner no-op test ---
+// --- Spinner no-op tests ---
 
 #[test]
 fn spinner_noop_in_non_interactive() {
@@ -506,4 +545,27 @@ fn spinner_noop_in_non_interactive() {
     // and can be stopped immediately.
     let spinner = anvil::spinner::Spinner::start("test message", false);
     spinner.stop(); // should be a no-op, no panic
+}
+
+#[test]
+fn spinner_start_tool_noop_when_disabled() {
+    let spinner = anvil::spinner::Spinner::start_tool("file.read", 3, 1, false);
+    spinner.stop(); // should be a no-op, no panic
+}
+
+#[test]
+fn spinner_start_parallel_noop_when_disabled() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    let completed = Arc::new(AtomicUsize::new(0));
+    let spinner = anvil::spinner::Spinner::start_parallel(4, completed, false);
+    spinner.stop(); // should be a no-op, no panic
+}
+
+#[test]
+fn spinner_pause_resume_noop_when_disabled() {
+    let spinner = anvil::spinner::Spinner::start("test", false);
+    spinner.pause();
+    spinner.resume();
+    spinner.stop(); // should not panic
 }

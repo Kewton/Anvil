@@ -68,4 +68,45 @@ pub struct CliArgs {
     /// Reasoning visibility level (hidden|summary)
     #[arg(long = "reasoning-visibility")]
     pub reasoning_visibility: Option<String>,
+
+    /// Run in offline mode (disable web tools and MCP)
+    #[arg(long)]
+    pub offline: bool,
+
+    /// Named session to use
+    #[arg(long)]
+    pub session: Option<String>,
+
+    /// Auto-approve built-in tool execution (MCP tools require individual trust)
+    #[arg(long)]
+    pub trust: bool,
+
+    /// Enable tag-based tool protocol (--tag-protocol).
+    #[doc(hidden)]
+    #[arg(long = "tag-protocol")]
+    pub tag_protocol_flag: bool,
+
+    /// Force JSON tool protocol (--no-tag-protocol).
+    #[doc(hidden)]
+    #[arg(long = "no-tag-protocol")]
+    pub no_tag_protocol_flag: bool,
+
+    /// Computed tag_protocol value: Some(true) for --tag-protocol,
+    /// Some(false) for --no-tag-protocol, None when neither is specified.
+    /// Not parsed from CLI args directly.
+    #[arg(skip)]
+    pub tag_protocol: Option<bool>,
+}
+
+impl CliArgs {
+    /// Resolve the `tag_protocol` field from the raw CLI flags.
+    /// Call this after `clap::Parser::parse()` to compute the final value.
+    pub fn resolve_tag_protocol(&mut self) {
+        if self.tag_protocol_flag {
+            self.tag_protocol = Some(true);
+        } else if self.no_tag_protocol_flag {
+            self.tag_protocol = Some(false);
+        }
+        // Otherwise remains None (auto-detect)
+    }
 }

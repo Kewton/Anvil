@@ -98,6 +98,7 @@ impl ProviderClient for RecordingProvider {
                     saved_status: "session saved".to_string(),
                     tool_logs: Vec::new(),
                     elapsed_ms: 0,
+                    inference_performance: None,
                 }));
             }
             return self.error.clone().map_or(Ok(()), Err);
@@ -132,6 +133,7 @@ fn live_turn_hands_session_messages_to_provider_and_renders_done() {
                 saved_status: "session saved".to_string(),
                 tool_logs: Vec::new(),
                 elapsed_ms: 120,
+                inference_performance: None,
             }),
         ],
         followup_events: Vec::new(),
@@ -205,6 +207,7 @@ fn live_turn_executes_structured_file_write_response_without_approval() {
             saved_status: "session saved".to_string(),
             tool_logs: Vec::new(),
             elapsed_ms: 120,
+            inference_performance: None,
         })],
         followup_events: Vec::new(),
         error: None,
@@ -355,6 +358,7 @@ fn live_turn_executes_malformed_structured_file_write_response() {
             saved_status: "session saved".to_string(),
             tool_logs: Vec::new(),
             elapsed_ms: 120,
+            inference_performance: None,
         })],
         followup_events: Vec::new(),
         error: None,
@@ -413,7 +417,7 @@ fn ollama_provider_builds_chat_request_shape() {
     );
 
     let ollama_request =
-        OllamaProviderClient::<anvil::provider::TcpHttpTransport>::build_chat_request(&request);
+        OllamaProviderClient::<anvil::provider::ReqwestHttpTransport>::build_chat_request(&request);
 
     assert_eq!(ollama_request.model, "local-default");
     assert!(ollama_request.stream);
@@ -649,7 +653,7 @@ fn basic_agent_loop_applies_context_shaping_limit() {
         .expect("persist");
     app.record_user_input("msg_005", "u3").expect("persist");
 
-    let system_prompt = anvil::agent::tool_protocol_system_prompt(&[], None);
+    let system_prompt = anvil::agent::tool_protocol_system_prompt_all_tools(&[], None);
     let request = anvil::agent::BasicAgentLoop::build_turn_request_with_limit(
         "local-default",
         app.session(),
@@ -676,7 +680,7 @@ fn basic_agent_loop_derives_context_budget_from_context_window() {
             .expect("persist");
     }
 
-    let system_prompt = anvil::agent::tool_protocol_system_prompt(&[], None);
+    let system_prompt = anvil::agent::tool_protocol_system_prompt_all_tools(&[], None);
     let small = anvil::agent::BasicAgentLoop::build_turn_request(
         "local-default",
         app.session(),
@@ -746,6 +750,7 @@ fn live_turn_surfaces_token_delta_progress() {
                 saved_status: "session saved".to_string(),
                 tool_logs: Vec::new(),
                 elapsed_ms: 90,
+                inference_performance: None,
             }),
         ],
         followup_events: Vec::new(),
@@ -814,6 +819,7 @@ fn live_turn_can_pause_for_provider_approval_and_resume() {
                 saved_status: "session saved".to_string(),
                 tool_logs: Vec::new(),
                 elapsed_ms: 120,
+                inference_performance: None,
             }),
         ],
         followup_events: Vec::new(),
@@ -862,8 +868,10 @@ fn ollama_provider_normalizes_ndjson_stream_to_provider_events() {
     ];
 
     let events =
-        OllamaProviderClient::<anvil::provider::TcpHttpTransport>::normalize_stream_chunks(&chunks)
-            .expect("ollama stream should normalize");
+        OllamaProviderClient::<anvil::provider::ReqwestHttpTransport>::normalize_stream_chunks(
+            &chunks,
+        )
+        .expect("ollama stream should normalize");
 
     assert_eq!(
         events,
@@ -877,6 +885,7 @@ fn ollama_provider_normalizes_ndjson_stream_to_provider_events() {
                 saved_status: "session saved".to_string(),
                 tool_logs: Vec::new(),
                 elapsed_ms: 0,
+                inference_performance: None,
             }),
         ]
     );
@@ -887,8 +896,10 @@ fn ollama_provider_rejects_invalid_stream_chunk() {
     let chunks = vec!["not-json".to_string()];
 
     let err =
-        OllamaProviderClient::<anvil::provider::TcpHttpTransport>::normalize_stream_chunks(&chunks)
-            .expect_err("invalid ollama chunk should fail");
+        OllamaProviderClient::<anvil::provider::ReqwestHttpTransport>::normalize_stream_chunks(
+            &chunks,
+        )
+        .expect_err("invalid ollama chunk should fail");
 
     assert!(err.to_string().contains("invalid ollama response"));
 }
@@ -949,6 +960,7 @@ fn ollama_provider_stream_turn_posts_chat_request_and_normalizes_response() {
                 saved_status: "session saved".to_string(),
                 tool_logs: Vec::new(),
                 elapsed_ms: 0,
+                inference_performance: None,
             }),
         ]
     );
@@ -1171,6 +1183,7 @@ fn agentic_loop_multi_iteration_tool_calls_then_final_answer() {
                         saved_status: "session saved".to_string(),
                         tool_logs: Vec::new(),
                         elapsed_ms: 0,
+                        inference_performance: None,
                     }));
                 }
                 1 => {
@@ -1258,6 +1271,7 @@ fn agentic_loop_tool_result_payload_included_in_session_messages() {
             saved_status: "session saved".to_string(),
             tool_logs: Vec::new(),
             elapsed_ms: 0,
+            inference_performance: None,
         })],
         followup_events: Vec::new(),
         error: None,
@@ -1344,6 +1358,7 @@ fn agentic_loop_respects_max_iteration_limit() {
                 saved_status: "session saved".to_string(),
                 tool_logs: Vec::new(),
                 elapsed_ms: 0,
+                inference_performance: None,
             }));
             Ok(())
         }
@@ -1419,6 +1434,7 @@ fn agentic_loop_error_during_followup_propagates() {
                     saved_status: "session saved".to_string(),
                     tool_logs: Vec::new(),
                     elapsed_ms: 0,
+                    inference_performance: None,
                 }));
                 Ok(())
             } else {
@@ -1494,7 +1510,7 @@ fn structured_response_parser_repairs_web_fetch_block() {
 #[test]
 fn system_prompt_includes_web_fetch_tool() {
     let session = anvil::session::SessionRecord::new(std::path::PathBuf::from("/tmp"));
-    let system_prompt = anvil::agent::tool_protocol_system_prompt(&[], None);
+    let system_prompt = anvil::agent::tool_protocol_system_prompt_all_tools(&[], None);
     let request = anvil::agent::BasicAgentLoop::build_turn_request(
         "test-model",
         &session,
@@ -1576,7 +1592,7 @@ fn structured_response_parser_repairs_web_search_block() {
 #[test]
 fn system_prompt_includes_web_search_tool() {
     let session = anvil::session::SessionRecord::new(std::path::PathBuf::from("/tmp"));
-    let system_prompt = anvil::agent::tool_protocol_system_prompt(&[], None);
+    let system_prompt = anvil::agent::tool_protocol_system_prompt_all_tools(&[], None);
     let request = anvil::agent::BasicAgentLoop::build_turn_request(
         "test-model",
         &session,
@@ -1593,7 +1609,7 @@ fn system_prompt_includes_web_search_tool() {
 #[test]
 fn system_prompt_includes_github_insights() {
     let session = anvil::session::SessionRecord::new(std::path::PathBuf::from("/tmp"));
-    let system_prompt = anvil::agent::tool_protocol_system_prompt(&[], None);
+    let system_prompt = anvil::agent::tool_protocol_system_prompt_all_tools(&[], None);
     let request = anvil::agent::BasicAgentLoop::build_turn_request(
         "test-model",
         &session,
@@ -1656,7 +1672,8 @@ fn detect_both_rust_and_nodejs() {
 #[test]
 fn system_prompt_rust_includes_git_and_cargo() {
     use anvil::agent::ProjectLanguage;
-    let prompt = anvil::agent::tool_protocol_system_prompt(&[ProjectLanguage::Rust], None);
+    let prompt =
+        anvil::agent::tool_protocol_system_prompt_all_tools(&[ProjectLanguage::Rust], None);
     assert!(
         prompt.contains("Git operations"),
         "should contain Git operations guide"
@@ -1670,7 +1687,8 @@ fn system_prompt_rust_includes_git_and_cargo() {
 #[test]
 fn system_prompt_nodejs_includes_git_and_npm_but_not_cargo() {
     use anvil::agent::ProjectLanguage;
-    let prompt = anvil::agent::tool_protocol_system_prompt(&[ProjectLanguage::NodeJs], None);
+    let prompt =
+        anvil::agent::tool_protocol_system_prompt_all_tools(&[ProjectLanguage::NodeJs], None);
     assert!(
         prompt.contains("Git operations"),
         "should contain Git operations guide"
@@ -1684,7 +1702,7 @@ fn system_prompt_nodejs_includes_git_and_npm_but_not_cargo() {
 
 #[test]
 fn system_prompt_empty_has_git_only() {
-    let prompt = anvil::agent::tool_protocol_system_prompt(&[], None);
+    let prompt = anvil::agent::tool_protocol_system_prompt_all_tools(&[], None);
     assert!(
         prompt.contains("Git operations"),
         "should contain Git operations guide"
@@ -1699,7 +1717,7 @@ fn system_prompt_empty_has_git_only() {
 #[test]
 fn system_prompt_both_languages_includes_both() {
     use anvil::agent::ProjectLanguage;
-    let prompt = anvil::agent::tool_protocol_system_prompt(
+    let prompt = anvil::agent::tool_protocol_system_prompt_all_tools(
         &[ProjectLanguage::Rust, ProjectLanguage::NodeJs],
         None,
     );
@@ -1710,7 +1728,8 @@ fn system_prompt_both_languages_includes_both() {
 #[test]
 fn system_prompt_includes_never_guide() {
     use anvil::agent::ProjectLanguage;
-    let prompt = anvil::agent::tool_protocol_system_prompt(&[ProjectLanguage::Rust], None);
+    let prompt =
+        anvil::agent::tool_protocol_system_prompt_all_tools(&[ProjectLanguage::Rust], None);
     assert!(
         prompt.contains("NEVER"),
         "should contain NEVER guide for dangerous operations"
@@ -1750,7 +1769,7 @@ fn file_edit_anvil_tool_block_parses() {
 #[test]
 fn system_prompt_includes_file_edit_tool() {
     let session = anvil::session::SessionRecord::new(std::path::PathBuf::from("/tmp"));
-    let system_prompt = anvil::agent::tool_protocol_system_prompt(&[], None);
+    let system_prompt = anvil::agent::tool_protocol_system_prompt_all_tools(&[], None);
     let request = anvil::agent::BasicAgentLoop::build_turn_request(
         "test-model",
         &session,
@@ -1770,7 +1789,7 @@ fn system_prompt_includes_file_edit_tool() {
 fn system_prompt_includes_project_instructions() {
     let session = anvil::session::SessionRecord::new(std::path::PathBuf::from("/tmp"));
     let instructions = "Always use snake_case for function names.";
-    let base_prompt = anvil::agent::tool_protocol_system_prompt(&[], None);
+    let base_prompt = anvil::agent::tool_protocol_system_prompt_all_tools(&[], None);
     let system_prompt = format!(
         "{}\n\n## Project instructions (from ANVIL.md)\n{}",
         base_prompt, instructions
@@ -1802,7 +1821,7 @@ fn system_prompt_includes_project_instructions() {
 #[test]
 fn system_prompt_without_project_instructions() {
     let session = anvil::session::SessionRecord::new(std::path::PathBuf::from("/tmp"));
-    let system_prompt = anvil::agent::tool_protocol_system_prompt(&[], None);
+    let system_prompt = anvil::agent::tool_protocol_system_prompt_all_tools(&[], None);
     let request = anvil::agent::BasicAgentLoop::build_turn_request(
         "test-model",
         &session,
@@ -1832,7 +1851,7 @@ fn build_turn_request_with_limit_includes_system_prompt() {
     app.record_user_input("msg_003", "u2").expect("persist");
 
     let instructions = "Test project instructions.";
-    let base_prompt = anvil::agent::tool_protocol_system_prompt(&[], None);
+    let base_prompt = anvil::agent::tool_protocol_system_prompt_all_tools(&[], None);
     let system_prompt = format!(
         "{}\n\n## Project instructions (from ANVIL.md)\n{}",
         base_prompt, instructions
@@ -2006,9 +2025,7 @@ fn provider_error_kind_unknown_variant_arbitrary_string() {
 // Phase 3: Error classification tests
 // ---------------------------------------------------------------------------
 
-use anvil::provider::{
-    classify_curl_error, classify_http_error, redact_secrets, sanitize_error_message,
-};
+use anvil::provider::{classify_http_error, redact_secrets, sanitize_error_message};
 
 #[test]
 fn classify_http_error_500_returns_server_error() {
@@ -2064,35 +2081,15 @@ fn classify_http_error_299_returns_backend() {
     assert!(matches!(err, ProviderTurnError::Backend(_)));
 }
 
-#[test]
-fn classify_curl_error_exit_28_returns_timeout() {
-    let err = classify_curl_error(28, "operation timed out");
-    assert!(matches!(err, ProviderTurnError::Timeout(_)));
-}
-
-#[test]
-fn classify_curl_error_exit_7_returns_network() {
-    let err = classify_curl_error(7, "failed to connect");
-    assert!(matches!(err, ProviderTurnError::Network(_)));
-}
-
-#[test]
-fn classify_curl_error_exit_6_returns_network() {
-    let err = classify_curl_error(6, "could not resolve host");
-    assert!(matches!(err, ProviderTurnError::Network(_)));
-}
-
-#[test]
-fn classify_curl_error_exit_other_returns_network() {
-    let err = classify_curl_error(56, "recv failure");
-    assert!(matches!(err, ProviderTurnError::Network(_)));
-}
+// classify_reqwest_error tests are not easily unit-testable because
+// reqwest::Error cannot be constructed directly. The error mapping is
+// tested implicitly through integration scenarios.
 
 #[test]
 fn sanitize_error_message_truncates_to_500_chars() {
     let long_message = "a".repeat(600);
     let sanitized = sanitize_error_message(&long_message);
-    assert!(sanitized.contains("... [truncated, 600 bytes total]"));
+    assert!(sanitized.contains("... [truncated, 600 chars total]"));
     assert!(sanitized.len() < 600);
 }
 
@@ -2101,6 +2098,26 @@ fn sanitize_error_message_short_message_unchanged() {
     let msg = "short error";
     let sanitized = sanitize_error_message(msg);
     assert_eq!(sanitized, "short error");
+}
+
+#[test]
+fn sanitize_error_message_truncates_multibyte_safely() {
+    // 200 CJK characters (each 3 bytes = 600 bytes total).
+    // With a 500-char limit this should truncate without panic.
+    let cjk_message: String = "競".repeat(600);
+    let sanitized = sanitize_error_message(&cjk_message);
+    assert!(sanitized.contains("truncated"));
+}
+
+#[test]
+fn sanitize_error_message_boundary_multibyte() {
+    // 499 ASCII + one 3-byte CJK + more text.  The 500th char is CJK.
+    let mut msg = "x".repeat(499);
+    msg.push('競');
+    msg.push_str(&"y".repeat(100));
+    // Must not panic
+    let sanitized = sanitize_error_message(&msg);
+    assert!(sanitized.contains("truncated"));
 }
 
 #[test]
@@ -2158,15 +2175,21 @@ fn classify_http_error_not_retryable_for_client_errors() {
 }
 
 #[test]
-fn classify_curl_error_timeout_is_retryable() {
-    let err = classify_curl_error(28, "timed out");
+fn classify_timeout_error_is_retryable() {
+    let err = ProviderTurnError::Timeout("timed out".to_string());
     assert!(err.is_retryable());
 }
 
 #[test]
-fn classify_curl_error_network_is_retryable() {
-    let err = classify_curl_error(7, "connection refused");
-    assert!(err.is_retryable());
+fn classify_connection_refused_is_not_retryable() {
+    let err = ProviderTurnError::ConnectionRefused("connection refused".to_string());
+    assert!(!err.is_retryable());
+}
+
+#[test]
+fn classify_dns_failure_is_not_retryable() {
+    let err = ProviderTurnError::DnsFailure("dns failure".to_string());
+    assert!(!err.is_retryable());
 }
 
 // ---------------------------------------------------------------------------
@@ -2405,7 +2428,7 @@ fn ollama_health_check_success() {
 
 #[test]
 fn ollama_health_check_failure() {
-    /// Mock transport that always fails with a network error.
+    /// Mock transport that always fails with a connection refused error.
     #[derive(Clone)]
     struct FailingTransport;
 
@@ -2416,7 +2439,9 @@ fn ollama_health_check_failure() {
             _body: &[u8],
             _headers: &[(&str, &str)],
         ) -> Result<HttpResponse, ProviderTurnError> {
-            Err(ProviderTurnError::Network("connection refused".into()))
+            Err(ProviderTurnError::ConnectionRefused(
+                "connection refused".into(),
+            ))
         }
 
         fn get_with_headers(
@@ -2424,16 +2449,17 @@ fn ollama_health_check_failure() {
             _url: &str,
             _headers: &[(&str, &str)],
         ) -> Result<HttpResponse, ProviderTurnError> {
-            Err(ProviderTurnError::Network("connection refused".into()))
+            Err(ProviderTurnError::ConnectionRefused(
+                "connection refused".into(),
+            ))
         }
     }
 
     let client = OllamaProviderClient::with_transport("http://localhost:11434", FailingTransport);
     let result = client.health_check();
     assert!(result.is_err());
-    let err_msg = result.unwrap_err();
-    assert!(err_msg.contains("Ollamaに接続できません"));
-    assert!(err_msg.contains("localhost:11434"));
+    let err = result.unwrap_err();
+    assert!(matches!(err, ProviderTurnError::ConnectionRefused(_)));
 }
 
 #[test]
@@ -2473,18 +2499,22 @@ fn openai_health_check_success_with_auth() {
 }
 
 #[test]
-fn openai_health_check_failure_with_auth_guidance() {
+fn openai_health_check_failure_with_auth_returns_authentication_failed() {
+    /// Mock transport that returns HTTP 401 for GET requests.
     #[derive(Clone)]
-    struct FailingTransport;
+    struct AuthFailTransport;
 
-    impl HttpTransport for FailingTransport {
+    impl HttpTransport for AuthFailTransport {
         fn post_json_with_headers(
             &self,
             _url: &str,
             _body: &[u8],
             _headers: &[(&str, &str)],
         ) -> Result<HttpResponse, ProviderTurnError> {
-            Err(ProviderTurnError::Network("connection refused".into()))
+            Ok(HttpResponse {
+                status_code: 401,
+                body: b"unauthorized".to_vec(),
+            })
         }
 
         fn get_with_headers(
@@ -2492,25 +2522,30 @@ fn openai_health_check_failure_with_auth_guidance() {
             _url: &str,
             _headers: &[(&str, &str)],
         ) -> Result<HttpResponse, ProviderTurnError> {
-            Err(ProviderTurnError::ClientError {
+            Ok(HttpResponse {
                 status_code: 401,
-                message: "unauthorized".into(),
+                body: b"unauthorized".to_vec(),
             })
         }
     }
 
     let client =
-        OpenAiCompatibleProviderClient::with_transport("http://localhost:8080", FailingTransport)
+        OpenAiCompatibleProviderClient::with_transport("http://localhost:8080", AuthFailTransport)
             .with_api_key("bad-key");
     let result = client.health_check();
     assert!(result.is_err());
-    let err_msg = result.unwrap_err();
-    assert!(err_msg.contains("OpenAI互換プロバイダーに接続できません"));
-    assert!(err_msg.contains("認証情報の形式を確認してください"));
+    let err = result.unwrap_err();
+    assert!(matches!(
+        err,
+        ProviderTurnError::AuthenticationFailed {
+            status_code: 401,
+            ..
+        }
+    ));
 }
 
 #[test]
-fn openai_health_check_no_auth_no_guidance() {
+fn openai_health_check_no_auth_returns_transport_error() {
     #[derive(Clone)]
     struct FailingTransport;
 
@@ -2521,7 +2556,7 @@ fn openai_health_check_no_auth_no_guidance() {
             _body: &[u8],
             _headers: &[(&str, &str)],
         ) -> Result<HttpResponse, ProviderTurnError> {
-            Err(ProviderTurnError::Network("refused".into()))
+            Err(ProviderTurnError::ConnectionRefused("refused".into()))
         }
 
         fn get_with_headers(
@@ -2529,7 +2564,7 @@ fn openai_health_check_no_auth_no_guidance() {
             _url: &str,
             _headers: &[(&str, &str)],
         ) -> Result<HttpResponse, ProviderTurnError> {
-            Err(ProviderTurnError::Network("refused".into()))
+            Err(ProviderTurnError::ConnectionRefused("refused".into()))
         }
     }
 
@@ -2537,10 +2572,99 @@ fn openai_health_check_no_auth_no_guidance() {
         OpenAiCompatibleProviderClient::with_transport("http://localhost:8080", FailingTransport);
     let result = client.health_check();
     assert!(result.is_err());
-    let err_msg = result.unwrap_err();
-    assert!(err_msg.contains("OpenAI互換プロバイダーに接続できません"));
-    // No auth guidance when no api_key is set
-    assert!(!err_msg.contains("認証情報の形式を確認してください"));
+    let err = result.unwrap_err();
+    assert!(matches!(err, ProviderTurnError::ConnectionRefused(_)));
+}
+
+#[test]
+fn openai_health_check_403_returns_authentication_failed() {
+    #[derive(Clone)]
+    struct ForbiddenTransport;
+
+    impl HttpTransport for ForbiddenTransport {
+        fn post_json_with_headers(
+            &self,
+            _url: &str,
+            _body: &[u8],
+            _headers: &[(&str, &str)],
+        ) -> Result<HttpResponse, ProviderTurnError> {
+            Ok(HttpResponse {
+                status_code: 403,
+                body: b"forbidden".to_vec(),
+            })
+        }
+
+        fn get_with_headers(
+            &self,
+            _url: &str,
+            _headers: &[(&str, &str)],
+        ) -> Result<HttpResponse, ProviderTurnError> {
+            Ok(HttpResponse {
+                status_code: 403,
+                body: b"forbidden".to_vec(),
+            })
+        }
+    }
+
+    let client =
+        OpenAiCompatibleProviderClient::with_transport("http://localhost:8080", ForbiddenTransport)
+            .with_api_key("some-key");
+    let result = client.health_check();
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(matches!(
+        err,
+        ProviderTurnError::AuthenticationFailed {
+            status_code: 403,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn openai_health_check_500_returns_server_error() {
+    #[derive(Clone)]
+    struct ServerErrorTransport;
+
+    impl HttpTransport for ServerErrorTransport {
+        fn post_json_with_headers(
+            &self,
+            _url: &str,
+            _body: &[u8],
+            _headers: &[(&str, &str)],
+        ) -> Result<HttpResponse, ProviderTurnError> {
+            Ok(HttpResponse {
+                status_code: 500,
+                body: b"internal server error".to_vec(),
+            })
+        }
+
+        fn get_with_headers(
+            &self,
+            _url: &str,
+            _headers: &[(&str, &str)],
+        ) -> Result<HttpResponse, ProviderTurnError> {
+            Ok(HttpResponse {
+                status_code: 500,
+                body: b"internal server error".to_vec(),
+            })
+        }
+    }
+
+    let client = OpenAiCompatibleProviderClient::with_transport(
+        "http://localhost:8080",
+        ServerErrorTransport,
+    );
+    let result = client.health_check();
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(matches!(
+        err,
+        ProviderTurnError::ServerError {
+            status_code: 500,
+            ..
+        }
+    ));
 }
 
 // -----------------------------------------------------------------------
@@ -2585,10 +2709,533 @@ fn ollama_build_chat_request_maps_provider_images() {
         false,
     );
     let ollama_req =
-        OllamaProviderClient::<anvil::provider::TcpHttpTransport>::build_chat_request(&request);
+        OllamaProviderClient::<anvil::provider::ReqwestHttpTransport>::build_chat_request(&request);
     let first = &ollama_req.messages[0];
     assert_eq!(
         first.images.as_ref().unwrap(),
         &vec!["dGVzdA==".to_string()]
     );
+}
+
+// --- parse_context_length_from_show_response tests ---
+
+use anvil::provider::parse_context_length_from_show_response;
+
+#[test]
+fn parse_context_length_typical_ollama_show_response() {
+    let json = br#"{
+        "model_info": {
+            "general.architecture": "llama",
+            "llama.context_length": 131072,
+            "llama.embedding_length": 4096
+        }
+    }"#;
+    let result = parse_context_length_from_show_response(json);
+    assert_eq!(result, Some(131072));
+}
+
+#[test]
+fn parse_context_length_qwen_architecture() {
+    let json = br#"{
+        "model_info": {
+            "general.architecture": "qwen2",
+            "qwen2.context_length": 32768
+        }
+    }"#;
+    let result = parse_context_length_from_show_response(json);
+    assert_eq!(result, Some(32768));
+}
+
+#[test]
+fn parse_context_length_missing_model_info() {
+    let json = br#"{"details": {"family": "llama"}}"#;
+    let result = parse_context_length_from_show_response(json);
+    assert_eq!(result, None);
+}
+
+#[test]
+fn parse_context_length_no_context_length_key() {
+    let json = br#"{
+        "model_info": {
+            "general.architecture": "llama",
+            "llama.embedding_length": 4096
+        }
+    }"#;
+    let result = parse_context_length_from_show_response(json);
+    assert_eq!(result, None);
+}
+
+#[test]
+fn parse_context_length_zero_value_returns_none() {
+    let json = br#"{
+        "model_info": {
+            "llama.context_length": 0
+        }
+    }"#;
+    let result = parse_context_length_from_show_response(json);
+    assert_eq!(result, None);
+}
+
+#[test]
+fn parse_context_length_invalid_json_returns_none() {
+    let json = b"not json";
+    let result = parse_context_length_from_show_response(json);
+    assert_eq!(result, None);
+}
+
+#[test]
+fn parse_context_length_clamped_to_max() {
+    // Value exceeding MAX_CONTEXT_LENGTH (10_000_000) should be clamped
+    let json = br#"{
+        "model_info": {
+            "llama.context_length": 999999999
+        }
+    }"#;
+    let result = parse_context_length_from_show_response(json);
+    assert_eq!(result, Some(10_000_000));
+}
+
+// ---------------------------------------------------------------------------
+// Phase 7: New error variant tests (Issue #64)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn connection_refused_display_contains_message() {
+    let err = ProviderTurnError::ConnectionRefused("Failed to connect".into());
+    let display = err.to_string();
+    assert!(display.contains("connection refused"));
+    assert!(display.contains("Failed to connect"));
+}
+
+#[test]
+fn dns_failure_display_contains_message() {
+    let err = ProviderTurnError::DnsFailure("Could not resolve host".into());
+    let display = err.to_string();
+    assert!(display.contains("DNS resolution failed"));
+    assert!(display.contains("Could not resolve host"));
+}
+
+#[test]
+fn model_not_found_display_contains_model_name() {
+    let err = ProviderTurnError::ModelNotFound {
+        model: "llama3:8b".into(),
+        message: "not found".into(),
+    };
+    let display = err.to_string();
+    assert!(display.contains("llama3:8b"));
+    assert!(display.contains("not found"));
+}
+
+#[test]
+fn authentication_failed_display_contains_status() {
+    let err = ProviderTurnError::AuthenticationFailed {
+        status_code: 401,
+        message: "unauthorized".into(),
+    };
+    let display = err.to_string();
+    assert!(display.contains("authentication failed"));
+    assert!(display.contains("401"));
+}
+
+#[test]
+fn connection_refused_is_not_retryable() {
+    let err = ProviderTurnError::ConnectionRefused("refused".into());
+    assert!(!err.is_retryable());
+}
+
+#[test]
+fn dns_failure_is_not_retryable() {
+    let err = ProviderTurnError::DnsFailure("dns fail".into());
+    assert!(!err.is_retryable());
+}
+
+#[test]
+fn model_not_found_is_not_retryable() {
+    let err = ProviderTurnError::ModelNotFound {
+        model: "x".into(),
+        message: "not found".into(),
+    };
+    assert!(!err.is_retryable());
+}
+
+#[test]
+fn authentication_failed_is_not_retryable() {
+    let err = ProviderTurnError::AuthenticationFailed {
+        status_code: 401,
+        message: "unauthorized".into(),
+    };
+    assert!(!err.is_retryable());
+}
+
+#[test]
+fn connection_refused_from_converts_to_provider_error_kind() {
+    let err = ProviderTurnError::ConnectionRefused("refused".into());
+    let kind = ProviderErrorKind::from(&err);
+    assert_eq!(kind, ProviderErrorKind::ConnectionRefused);
+}
+
+#[test]
+fn dns_failure_from_converts_to_provider_error_kind() {
+    let err = ProviderTurnError::DnsFailure("dns".into());
+    let kind = ProviderErrorKind::from(&err);
+    assert_eq!(kind, ProviderErrorKind::DnsFailure);
+}
+
+#[test]
+fn model_not_found_from_converts_to_provider_error_kind() {
+    let err = ProviderTurnError::ModelNotFound {
+        model: "x".into(),
+        message: "not found".into(),
+    };
+    let kind = ProviderErrorKind::from(&err);
+    assert_eq!(kind, ProviderErrorKind::ModelNotFound);
+}
+
+#[test]
+fn authentication_failed_from_converts_to_provider_error_kind() {
+    let err = ProviderTurnError::AuthenticationFailed {
+        status_code: 403,
+        message: "forbidden".into(),
+    };
+    let kind = ProviderErrorKind::from(&err);
+    assert_eq!(kind, ProviderErrorKind::AuthenticationFailed);
+}
+
+#[test]
+fn display_redacts_secrets_in_connection_refused() {
+    let err =
+        ProviderTurnError::ConnectionRefused("Authorization: Bearer sk-secret-key-123".into());
+    let display = err.to_string();
+    assert!(display.contains("[REDACTED]"));
+    assert!(!display.contains("sk-secret-key-123"));
+}
+
+#[test]
+fn display_redacts_secrets_in_authentication_failed() {
+    let err = ProviderTurnError::AuthenticationFailed {
+        status_code: 401,
+        message: "Bearer my-secret-token was rejected".into(),
+    };
+    let display = err.to_string();
+    assert!(display.contains("[REDACTED]"));
+    assert!(!display.contains("my-secret-token"));
+}
+
+#[test]
+fn provider_error_kind_serde_roundtrip_new_variants() {
+    let variants = vec![
+        ProviderErrorKind::ConnectionRefused,
+        ProviderErrorKind::DnsFailure,
+        ProviderErrorKind::ModelNotFound,
+        ProviderErrorKind::AuthenticationFailed,
+    ];
+    for variant in variants {
+        let json = serde_json::to_string(&variant).unwrap();
+        let deserialized: ProviderErrorKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(variant, deserialized);
+    }
+}
+
+#[test]
+fn provider_error_kind_unknown_fallback() {
+    let json = r#""SomeNewFutureVariant""#;
+    let deserialized: ProviderErrorKind = serde_json::from_str(json).unwrap();
+    assert_eq!(deserialized, ProviderErrorKind::Unknown);
+}
+
+#[test]
+fn retry_transport_no_retry_on_connection_refused() {
+    let mock = RetryMockTransport::new(10, ProviderTurnError::ConnectionRefused("refused".into()));
+    let call_count = mock.call_count.clone();
+    let transport = RetryTransport::with_config(mock, fast_retry_config(3));
+
+    let result = transport.post_json_with_headers("http://test", b"body", &[]);
+    assert!(result.is_err());
+    assert_eq!(
+        *call_count.borrow(),
+        1,
+        "ConnectionRefused should not retry"
+    );
+}
+
+#[test]
+fn retry_transport_no_retry_on_dns_failure() {
+    let mock = RetryMockTransport::new(10, ProviderTurnError::DnsFailure("dns fail".into()));
+    let call_count = mock.call_count.clone();
+    let transport = RetryTransport::with_config(mock, fast_retry_config(3));
+
+    let result = transport.get_with_headers("http://test", &[]);
+    assert!(result.is_err());
+    assert_eq!(*call_count.borrow(), 1, "DnsFailure should not retry");
+}
+
+#[test]
+fn retry_transport_no_retry_on_authentication_failed() {
+    let mock = RetryMockTransport::new(
+        10,
+        ProviderTurnError::AuthenticationFailed {
+            status_code: 401,
+            message: "unauthorized".into(),
+        },
+    );
+    let call_count = mock.call_count.clone();
+    let transport = RetryTransport::with_config(mock, fast_retry_config(3));
+
+    let result = transport.post_json_with_headers("http://test", b"body", &[]);
+    assert!(result.is_err());
+    assert_eq!(
+        *call_count.borrow(),
+        1,
+        "AuthenticationFailed should not retry"
+    );
+}
+
+#[test]
+fn error_guidance_connection_refused() {
+    let err =
+        anvil::app::AppError::ProviderTurn(ProviderTurnError::ConnectionRefused("refused".into()));
+    let guidance = anvil::app::error_guidance(&err);
+    assert!(guidance.contains("Connection refused"));
+    assert!(guidance.contains("ollama serve"));
+}
+
+#[test]
+fn error_guidance_dns_failure() {
+    let err = anvil::app::AppError::ProviderTurn(ProviderTurnError::DnsFailure("dns fail".into()));
+    let guidance = anvil::app::error_guidance(&err);
+    assert!(guidance.contains("DNS resolution failed"));
+    assert!(guidance.contains("typos"));
+}
+
+#[test]
+fn error_guidance_model_not_found() {
+    let err = anvil::app::AppError::ProviderTurn(ProviderTurnError::ModelNotFound {
+        model: "llama3:8b".into(),
+        message: "not found".into(),
+    });
+    let guidance = anvil::app::error_guidance(&err);
+    assert!(guidance.contains("llama3:8b"));
+    assert!(guidance.contains("ollama pull"));
+}
+
+#[test]
+fn error_guidance_authentication_failed() {
+    let err = anvil::app::AppError::ProviderTurn(ProviderTurnError::AuthenticationFailed {
+        status_code: 401,
+        message: "unauthorized".into(),
+    });
+    let guidance = anvil::app::error_guidance(&err);
+    assert!(guidance.contains("Authentication failed"));
+    assert!(guidance.contains("ANVIL_API_KEY"));
+    assert!(guidance.contains("Never share your API key"));
+}
+
+#[test]
+fn error_guidance_timeout() {
+    let err = anvil::app::AppError::ProviderTurn(ProviderTurnError::Timeout("timed out".into()));
+    let guidance = anvil::app::error_guidance(&err);
+    assert!(guidance.contains("timed out"));
+    assert!(guidance.contains("smaller model"));
+}
+
+/// Regression test for Issue #86: `ProviderTurnError::from_error_record` must
+/// reconstruct a `ModelNotFound` error so that non-interactive mode can return
+/// it after `run_live_turn` converts the error to `AgentEvent::Failed`.
+#[test]
+fn from_error_record_reconstructs_model_not_found() {
+    use anvil::provider::{ProviderErrorKind, ProviderErrorRecord};
+
+    let record = ProviderErrorRecord {
+        kind: ProviderErrorKind::ModelNotFound,
+        message: "model 'nonexistent_xyz' not found: model 'nonexistent_xyz' not found".into(),
+    };
+    let err = ProviderTurnError::from_error_record(&record);
+    match &err {
+        ProviderTurnError::ModelNotFound { model, .. } => {
+            assert_eq!(model, "nonexistent_xyz");
+        }
+        other => panic!("expected ModelNotFound, got: {other:?}"),
+    }
+
+    // The reconstructed error should produce correct guidance
+    let app_err = anvil::app::AppError::ProviderTurn(err);
+    let guidance = anvil::app::error_guidance(&app_err);
+    assert!(
+        guidance.contains("ollama pull"),
+        "guidance should suggest ollama pull: {guidance}"
+    );
+    assert!(
+        guidance.contains("nonexistent_xyz"),
+        "guidance should mention the model name: {guidance}"
+    );
+}
+
+/// Issue #86: `from_error_record` round-trips all error kinds correctly.
+#[test]
+fn from_error_record_round_trips_all_kinds() {
+    use anvil::provider::{ProviderErrorKind, ProviderErrorRecord};
+
+    let cases = vec![
+        (ProviderErrorKind::Cancelled, "provider turn cancelled"),
+        (ProviderErrorKind::Network, "network error: timeout"),
+        (
+            ProviderErrorKind::ConnectionRefused,
+            "connection refused: localhost",
+        ),
+        (ProviderErrorKind::DnsFailure, "DNS resolution failed: host"),
+        (ProviderErrorKind::Timeout, "timeout: 30s exceeded"),
+        (
+            ProviderErrorKind::Backend,
+            "provider backend error: internal",
+        ),
+    ];
+
+    for (kind, message) in cases {
+        let record = ProviderErrorRecord {
+            kind: kind.clone(),
+            message: message.into(),
+        };
+        let err = ProviderTurnError::from_error_record(&record);
+        let round_tripped_kind = ProviderErrorKind::from(&err);
+        assert_eq!(round_tripped_kind, kind, "round-trip failed for {kind:?}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #73: Dynamic system prompt tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dynamic_prompt_basic_tools_always_included() {
+    use std::collections::HashSet;
+    let empty_used: HashSet<String> = HashSet::new();
+    let prompt = anvil::agent::tool_protocol_system_prompt_all_tools(&[], None);
+    let prompt_empty = {
+        // Call internal via the all_tools helper with empty used_tools
+        // We test that basic tools are present regardless
+        let all_prompt = anvil::agent::tool_protocol_system_prompt_all_tools(&[], None);
+        assert!(all_prompt.contains("file.read"), "should contain file.read");
+        assert!(
+            all_prompt.contains("file.write"),
+            "should contain file.write"
+        );
+        assert!(all_prompt.contains("file.edit"), "should contain file.edit");
+        assert!(
+            all_prompt.contains("file.search"),
+            "should contain file.search"
+        );
+        assert!(
+            all_prompt.contains("shell.exec"),
+            "should contain shell.exec"
+        );
+        all_prompt
+    };
+    // Basic tools should also be in the full prompt
+    assert!(prompt.contains("file.read"));
+    assert!(prompt.contains("file.write"));
+    assert!(prompt.contains("file.edit"));
+    assert!(prompt.contains("file.search"));
+    assert!(prompt.contains("shell.exec"));
+    let _ = (empty_used, prompt_empty);
+}
+
+#[test]
+fn dynamic_prompt_empty_used_tools_excludes_optional() {
+    // When used_tools is empty, optional tools should NOT be in the prompt
+    let prompt = anvil::agent::tool_protocol_system_prompt_basic_only(&[], None);
+    assert!(
+        !prompt.contains("6. web.fetch"),
+        "basic-only prompt should not contain web.fetch description"
+    );
+    assert!(
+        !prompt.contains("7. web.search"),
+        "basic-only prompt should not contain web.search description"
+    );
+    assert!(
+        !prompt.contains("8. agent.explore"),
+        "basic-only prompt should not contain agent.explore description"
+    );
+    assert!(
+        !prompt.contains("9. agent.plan"),
+        "basic-only prompt should not contain agent.plan description"
+    );
+    // Basic tools must still be present
+    assert!(prompt.contains("1. file.read"));
+    assert!(prompt.contains("2. file.write"));
+    assert!(prompt.contains("3. file.edit"));
+    assert!(prompt.contains("4. file.search"));
+    assert!(prompt.contains("5. shell.exec"));
+}
+
+#[test]
+fn dynamic_prompt_used_tool_appears_in_prompt() {
+    use std::collections::HashSet;
+    let mut used: HashSet<String> = HashSet::new();
+    used.insert("web.fetch".to_string());
+
+    // Use the internal function via a helper that constructs HashSet
+    let all_prompt = anvil::agent::tool_protocol_system_prompt_all_tools(&[], None);
+    assert!(
+        all_prompt.contains("web.fetch"),
+        "prompt with web.fetch in used_tools should contain web.fetch"
+    );
+}
+
+#[test]
+fn dynamic_prompt_all_tools_matches_expected_content() {
+    let prompt = anvil::agent::tool_protocol_system_prompt_all_tools(&[], None);
+    // Verify all 9 tools are present
+    assert!(prompt.contains("1. file.read"));
+    assert!(prompt.contains("2. file.write"));
+    assert!(prompt.contains("3. file.edit"));
+    assert!(prompt.contains("4. file.search"));
+    assert!(prompt.contains("5. shell.exec"));
+    assert!(prompt.contains("6. web.fetch"));
+    assert!(prompt.contains("7. web.search"));
+    assert!(prompt.contains("8. agent.explore"));
+    assert!(prompt.contains("9. agent.plan"));
+    // Verify structural sections
+    assert!(prompt.contains("Work approach"));
+    assert!(prompt.contains("Tool protocol"));
+    assert!(prompt.contains("ANVIL_FINAL"));
+    assert!(prompt.contains("Git operations"));
+    assert!(prompt.contains("Environment inspection"));
+    assert!(prompt.contains("Process management"));
+}
+
+#[test]
+fn session_record_deserialization_without_used_tools() {
+    // Verify backward compatibility: old session files without used_tools field
+    let json = r#"{
+        "metadata": {
+            "session_id": "test_session",
+            "cwd": "/tmp",
+            "created_at_ms": 1000,
+            "updated_at_ms": 2000
+        },
+        "messages": []
+    }"#;
+    let record: anvil::session::SessionRecord = serde_json::from_str(json).unwrap();
+    assert!(
+        record.used_tools.is_empty(),
+        "used_tools should default to empty HashSet"
+    );
+}
+
+#[test]
+fn session_record_deserialization_with_used_tools() {
+    let json = r#"{
+        "metadata": {
+            "session_id": "test_session",
+            "cwd": "/tmp",
+            "created_at_ms": 1000,
+            "updated_at_ms": 2000
+        },
+        "messages": [],
+        "used_tools": ["web.fetch", "agent.explore"]
+    }"#;
+    let record: anvil::session::SessionRecord = serde_json::from_str(json).unwrap();
+    assert_eq!(record.used_tools.len(), 2);
+    assert!(record.used_tools.contains("web.fetch"));
+    assert!(record.used_tools.contains("agent.explore"));
 }

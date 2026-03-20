@@ -1,10 +1,10 @@
 use anvil::app::agentic::{ExecutionGroup, group_by_execution_mode};
 use anvil::tooling::{
-    ExecutionClass, ExecutionMode, LocalToolExecutor, ParallelExecutionPlan,
-    ParallelExecutionPlanError, PermissionClass, PlanModePolicy, RollbackPolicy, ToolCallRequest,
-    ToolExecutionError, ToolExecutionPayload, ToolExecutionPolicy, ToolExecutionRequest,
-    ToolExecutionResult, ToolExecutionStatus, ToolInput, ToolKind, ToolRegistry,
-    ToolValidationError, detect_image_mime,
+    CheckpointEntry, CheckpointStack, ExecutionClass, ExecutionMode, LocalToolExecutor,
+    ParallelExecutionPlan, ParallelExecutionPlanError, PermissionClass, PlanModePolicy,
+    RollbackPolicy, ToolCallRequest, ToolExecutionError, ToolExecutionPayload, ToolExecutionPolicy,
+    ToolExecutionRequest, ToolExecutionResult, ToolExecutionStatus, ToolInput, ToolKind,
+    ToolRegistry, ToolValidationError, detect_image_mime,
 };
 use std::fs;
 use std::path::Path;
@@ -115,6 +115,8 @@ fn parallel_execution_plan_only_accepts_parallel_safe_and_approved_calls() {
             ToolInput::FileSearch {
                 root: "src".to_string(),
                 pattern: "ProviderClient".to_string(),
+                regex: false,
+                context_lines: 0,
             },
         ))
         .expect("search should validate");
@@ -345,6 +347,8 @@ fn validation_reports_missing_required_field_details() {
             ToolInput::FileSearch {
                 root: "src".to_string(),
                 pattern: " ".to_string(),
+                regex: false,
+                context_lines: 0,
             },
         ))
         .expect_err("empty pattern should be rejected");
@@ -375,6 +379,7 @@ fn tool_execution_result_can_bridge_into_console_tool_log_view() {
     assert_eq!(log.tool_name, "file.read");
     assert_eq!(log.action, "completed");
     assert_eq!(log.target, "Read src/app/mod.rs");
+    assert_eq!(log.elapsed_ms, Some(12));
 }
 
 #[test]
@@ -2010,6 +2015,78 @@ fn format_tool_result_message_image_payload() {
     assert!(msg.contains("画像"));
 }
 
+// -----------------------------------------------------------------------
+// Phase 3: format_tool_result_message — UTF-8 safe truncation (Issue #94)
+// -----------------------------------------------------------------------
+
+#[test]
+fn format_tool_result_message_truncates_multibyte_safely() {
+    use anvil::app::agentic::format_tool_result_message;
+
+    // Create a string of 3000 CJK characters (each 3 bytes in UTF-8 = 9000 bytes).
+    // With max_chars = 100 (characters), truncation must land on a char boundary.
+    let cjk_content: String = "競".repeat(3000);
+    let result = ToolExecutionResult {
+        tool_call_id: "call_utf8".to_string(),
+        tool_name: "file.read".to_string(),
+        status: ToolExecutionStatus::Completed,
+        summary: "read CJK file".to_string(),
+        payload: ToolExecutionPayload::Text(cjk_content),
+        artifacts: Vec::new(),
+        elapsed_ms: 5,
+    };
+
+    // Must not panic — the old byte-slicing implementation would panic here.
+    let msg = format_tool_result_message(&result, 100);
+    assert!(msg.contains("truncated"));
+    assert!(msg.contains("file.read"));
+}
+
+#[test]
+fn format_tool_result_message_ascii_truncation_still_works() {
+    use anvil::app::agentic::format_tool_result_message;
+
+    let ascii_content = "a".repeat(500);
+    let result = ToolExecutionResult {
+        tool_call_id: "call_ascii".to_string(),
+        tool_name: "file.read".to_string(),
+        status: ToolExecutionStatus::Completed,
+        summary: "read file".to_string(),
+        payload: ToolExecutionPayload::Text(ascii_content),
+        artifacts: Vec::new(),
+        elapsed_ms: 5,
+    };
+
+    let msg = format_tool_result_message(&result, 100);
+    assert!(msg.contains("truncated"));
+}
+
+#[test]
+fn format_tool_result_message_boundary_char_3byte() {
+    use anvil::app::agentic::format_tool_result_message;
+
+    // 99 ASCII chars + one 3-byte CJK char = 100 chars.
+    // Truncation at exactly 100 chars must not split the CJK char.
+    let mut content = "a".repeat(99);
+    content.push('競');
+    content.push_str(&"b".repeat(200)); // push past the limit
+
+    let result = ToolExecutionResult {
+        tool_call_id: "call_boundary".to_string(),
+        tool_name: "file.read".to_string(),
+        status: ToolExecutionStatus::Completed,
+        summary: "boundary test".to_string(),
+        payload: ToolExecutionPayload::Text(content),
+        artifacts: Vec::new(),
+        elapsed_ms: 5,
+    };
+
+    let msg = format_tool_result_message(&result, 100);
+    assert!(msg.contains("truncated"));
+    // The truncated portion should contain the CJK char (it's at position 100, within limit)
+    assert!(msg.contains("競"));
+}
+
 // ============================================================
 // Sub-agent tool tests (Issue #24 Phase 1)
 // ============================================================
@@ -2495,4 +2572,1530 @@ fn subagent_error_into_tool_execution_result_status_mapping() {
     // ToolExecution -> Failed
     let result = SubAgentError::ToolExecution("err".to_string()).into_tool_execution_result(&call);
     assert_eq!(result.status, ToolExecutionStatus::Failed);
+}
+
+// ============================================================
+// Offline mode tests (Issue #67)
+// ============================================================
+
+#[test]
+fn build_subagent_system_prompt_plan_offline_excludes_web_fetch() {
+    use anvil::agent::subagent::{SubAgentKind, build_subagent_system_prompt};
+    let prompt = build_subagent_system_prompt(&SubAgentKind::Plan, true);
+    assert!(
+        !prompt.contains("web.fetch"),
+        "offline Plan prompt should not contain web.fetch tool description"
+    );
+    assert!(
+        prompt.contains("Offline mode is active"),
+        "offline Plan prompt should contain offline note"
+    );
+    assert!(
+        !prompt.contains("You may fetch web URLs"),
+        "offline Plan prompt should not contain web URL permission"
+    );
+}
+
+#[test]
+fn build_subagent_system_prompt_plan_online_includes_web_fetch() {
+    use anvil::agent::subagent::{SubAgentKind, build_subagent_system_prompt};
+    let prompt = build_subagent_system_prompt(&SubAgentKind::Plan, false);
+    assert!(
+        prompt.contains("web.fetch"),
+        "online Plan prompt should contain web.fetch tool description"
+    );
+    assert!(
+        prompt.contains("You may fetch web URLs"),
+        "online Plan prompt should contain web URL permission"
+    );
+    assert!(
+        !prompt.contains("Offline mode is active"),
+        "online Plan prompt should not contain offline note"
+    );
+}
+
+#[test]
+fn build_subagent_system_prompt_explore_unaffected_by_offline() {
+    use anvil::agent::subagent::{SubAgentKind, build_subagent_system_prompt};
+    let online_prompt = build_subagent_system_prompt(&SubAgentKind::Explore, false);
+    let offline_prompt = build_subagent_system_prompt(&SubAgentKind::Explore, true);
+    assert_eq!(
+        online_prompt, offline_prompt,
+        "Explore prompt should be identical regardless of offline flag"
+    );
+}
+
+#[test]
+fn check_offline_blocked_blocks_web_fetch_in_offline_mode() {
+    use anvil::app::policy::check_offline_blocked;
+    let mut config = anvil::config::EffectiveConfig::default_for_test().unwrap();
+    config.mode.offline = true;
+    let call = ToolCallRequest::new(
+        "call_001",
+        "web.fetch",
+        ToolInput::WebFetch {
+            url: "https://example.com".to_string(),
+        },
+    );
+    let result = check_offline_blocked(&config, &call);
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("is unavailable in offline mode"));
+}
+
+#[test]
+fn check_offline_blocked_allows_file_read_in_offline_mode() {
+    use anvil::app::policy::check_offline_blocked;
+    let mut config = anvil::config::EffectiveConfig::default_for_test().unwrap();
+    config.mode.offline = true;
+    let call = ToolCallRequest::new(
+        "call_002",
+        "file.read",
+        ToolInput::FileRead {
+            path: "./test.rs".to_string(),
+        },
+    );
+    assert!(check_offline_blocked(&config, &call).is_none());
+}
+
+#[test]
+fn check_offline_blocked_allows_web_fetch_when_not_offline() {
+    use anvil::app::policy::check_offline_blocked;
+    let config = anvil::config::EffectiveConfig::default_for_test().unwrap();
+    assert!(!config.mode.offline);
+    let call = ToolCallRequest::new(
+        "call_003",
+        "web.fetch",
+        ToolInput::WebFetch {
+            url: "https://example.com".to_string(),
+        },
+    );
+    assert!(check_offline_blocked(&config, &call).is_none());
+}
+
+#[test]
+fn check_offline_blocked_blocks_mcp_in_offline_mode() {
+    use anvil::app::policy::check_offline_blocked;
+    let mut config = anvil::config::EffectiveConfig::default_for_test().unwrap();
+    config.mode.offline = true;
+    let call = ToolCallRequest::new(
+        "call_004",
+        "mcp__server__tool",
+        ToolInput::Mcp {
+            server: "server".to_string(),
+            tool: "tool".to_string(),
+            arguments: serde_json::Value::Null,
+        },
+    );
+    let result = check_offline_blocked(&config, &call);
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("is unavailable in offline mode"));
+}
+
+#[test]
+fn check_offline_blocked_blocks_web_search_in_offline_mode() {
+    use anvil::app::policy::check_offline_blocked;
+    let mut config = anvil::config::EffectiveConfig::default_for_test().unwrap();
+    config.mode.offline = true;
+    let call = ToolCallRequest::new(
+        "call_005",
+        "web.search",
+        ToolInput::WebSearch {
+            query: "test".to_string(),
+        },
+    );
+    let result = check_offline_blocked(&config, &call);
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("web.search"));
+}
+
+// ---------------------------------------------------------------------------
+// CheckpointStack tests (Issue #68)
+// ---------------------------------------------------------------------------
+
+fn make_checkpoint_entry(path: &str, content: Option<&str>) -> CheckpointEntry {
+    let byte_size = content.map_or(0, |c| c.len());
+    CheckpointEntry {
+        path: std::path::PathBuf::from(path),
+        previous_content: content.map(String::from),
+        byte_size,
+    }
+}
+
+#[test]
+fn checkpoint_stack_new_initial_state() {
+    let stack = CheckpointStack::new();
+    assert_eq!(stack.len(), 0);
+    assert!(stack.is_empty());
+}
+
+#[test]
+fn checkpoint_stack_push_pop_basic() {
+    let mut stack = CheckpointStack::new();
+    let entry = make_checkpoint_entry("/tmp/a.rs", Some("hello"));
+    stack.push(entry);
+    assert_eq!(stack.len(), 1);
+    assert!(!stack.is_empty());
+
+    let popped = stack.pop().expect("should pop");
+    assert_eq!(popped.path, std::path::PathBuf::from("/tmp/a.rs"));
+    assert_eq!(popped.previous_content.as_deref(), Some("hello"));
+    assert!(stack.is_empty());
+}
+
+#[test]
+fn checkpoint_stack_push_returns_index_and_remove_works() {
+    let mut stack = CheckpointStack::new();
+    let idx0 = stack.push(make_checkpoint_entry("/tmp/a.rs", Some("a")));
+    let idx1 = stack.push(make_checkpoint_entry("/tmp/b.rs", Some("b")));
+    assert_eq!(idx0, 0);
+    assert_eq!(idx1, 1);
+
+    let removed = stack.remove(0).expect("should remove");
+    assert_eq!(removed.path, std::path::PathBuf::from("/tmp/a.rs"));
+    assert_eq!(stack.len(), 1);
+
+    let remaining = stack.pop().expect("should pop remaining");
+    assert_eq!(remaining.path, std::path::PathBuf::from("/tmp/b.rs"));
+}
+
+#[test]
+fn checkpoint_stack_pop_n_partial() {
+    let mut stack = CheckpointStack::new();
+    stack.push(make_checkpoint_entry("/tmp/a.rs", Some("a")));
+    stack.push(make_checkpoint_entry("/tmp/b.rs", Some("b")));
+    stack.push(make_checkpoint_entry("/tmp/c.rs", Some("c")));
+
+    let popped = stack.pop_n(2);
+    assert_eq!(popped.len(), 2);
+    // Newest first
+    assert_eq!(popped[0].path, std::path::PathBuf::from("/tmp/c.rs"));
+    assert_eq!(popped[1].path, std::path::PathBuf::from("/tmp/b.rs"));
+    assert_eq!(stack.len(), 1);
+}
+
+#[test]
+fn checkpoint_stack_pop_n_exceeds_depth() {
+    let mut stack = CheckpointStack::new();
+    stack.push(make_checkpoint_entry("/tmp/a.rs", Some("a")));
+    stack.push(make_checkpoint_entry("/tmp/b.rs", Some("b")));
+
+    let popped = stack.pop_n(10);
+    assert_eq!(popped.len(), 2);
+    assert!(stack.is_empty());
+}
+
+#[test]
+fn checkpoint_stack_pop_n_deduplicates_same_file() {
+    let mut stack = CheckpointStack::new();
+    stack.push(make_checkpoint_entry("/tmp/a.rs", Some("original")));
+    stack.push(make_checkpoint_entry("/tmp/b.rs", Some("b")));
+    stack.push(make_checkpoint_entry("/tmp/a.rs", Some("modified")));
+
+    let popped = stack.pop_n(3);
+    // Same file /tmp/a.rs appeared twice; only the oldest ("original") should be kept
+    assert_eq!(popped.len(), 2);
+    let a_entry = popped
+        .iter()
+        .find(|e| e.path == Path::new("/tmp/a.rs"))
+        .expect("a.rs should exist");
+    assert_eq!(a_entry.previous_content.as_deref(), Some("original"));
+}
+
+#[test]
+fn checkpoint_stack_depth_limit_evicts_oldest() {
+    let mut stack = CheckpointStack::new();
+    for i in 0..25 {
+        stack.push(make_checkpoint_entry(&format!("/tmp/{i}.rs"), Some("x")));
+    }
+    // max_depth = 20
+    assert_eq!(stack.len(), 20);
+    // The first 5 should have been evicted; entry at index 0 should be /tmp/5.rs
+    let first = stack.pop().expect("should pop");
+    assert_eq!(first.path, std::path::PathBuf::from("/tmp/24.rs"));
+}
+
+#[test]
+fn checkpoint_stack_byte_limit_evicts_oldest() {
+    let mut stack = CheckpointStack::new();
+    // Each entry is ~1MB (1_048_576 bytes). Push 12 to exceed 10MB limit.
+    let big_content = "x".repeat(1_048_576);
+    for i in 0..12 {
+        stack.push(make_checkpoint_entry(
+            &format!("/tmp/{i}.rs"),
+            Some(&big_content),
+        ));
+    }
+    // Should have evicted enough to stay under 10MB
+    assert!(stack.len() < 12);
+    assert!(stack.len() >= 9); // floor(10MB / 1MB) = 10, but some eviction margin
+}
+
+#[test]
+fn checkpoint_stack_new_file_entry_has_none_content() {
+    let mut stack = CheckpointStack::new();
+    stack.push(make_checkpoint_entry("/tmp/new.rs", None));
+    let popped = stack.pop().expect("should pop");
+    assert!(popped.previous_content.is_none());
+    assert_eq!(popped.byte_size, 0);
+}
+
+#[test]
+fn checkpoint_entry_generate_restore_preview_for_existing_file() {
+    let dir = std::env::temp_dir().join(format!(
+        "anvil_test_restore_preview_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    let file_path = dir.join("test.rs");
+    fs::write(&file_path, "modified content").unwrap();
+
+    let entry = CheckpointEntry {
+        path: file_path.clone(),
+        previous_content: Some("original content".to_string()),
+        byte_size: 16,
+    };
+
+    let preview = entry.generate_restore_preview();
+    assert!(preview.is_some());
+    let text = preview.unwrap();
+    // Should contain diff information
+    assert!(text.contains("current") || text.contains("restored") || text.contains("-"));
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn checkpoint_entry_generate_restore_preview_no_changes() {
+    let dir = std::env::temp_dir().join(format!(
+        "anvil_test_no_change_preview_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    let file_path = dir.join("test.rs");
+    fs::write(&file_path, "same content").unwrap();
+
+    let entry = CheckpointEntry {
+        path: file_path.clone(),
+        previous_content: Some("same content".to_string()),
+        byte_size: 12,
+    };
+
+    let preview = entry.generate_restore_preview();
+    assert!(preview.is_some());
+    assert!(preview.unwrap().contains("no changes to undo"));
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// CheckpointStack transaction (mark/rollback/commit) tests (Issue #69)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_mark_and_rollback_basic() {
+    let mut stack = CheckpointStack::new();
+    // Push a pre-existing entry before the mark
+    stack.push(make_checkpoint_entry("/tmp/pre.rs", Some("pre")));
+
+    // Start transaction
+    let mark = stack.mark();
+    assert_eq!(mark, 1); // mark is at position 1 (after the pre-existing entry)
+    assert!(stack.is_in_transaction());
+
+    // Push 2 entries within the transaction
+    stack.push(make_checkpoint_entry("/tmp/a.rs", Some("a")));
+    stack.push(make_checkpoint_entry("/tmp/b.rs", Some("b")));
+    assert_eq!(stack.len(), 3);
+
+    // Rollback to mark: should return the 2 transaction entries
+    let rolled_back = stack.rollback_to_mark(mark);
+    assert_eq!(rolled_back.len(), 2);
+    assert!(!stack.is_in_transaction()); // mark cleared
+    assert_eq!(stack.len(), 1); // pre-existing entry remains
+    // Verify newest-first ordering from pop_n
+    assert_eq!(rolled_back[0].path, Path::new("/tmp/b.rs"));
+    assert_eq!(rolled_back[1].path, Path::new("/tmp/a.rs"));
+}
+
+#[test]
+fn test_mark_and_commit() {
+    let mut stack = CheckpointStack::new();
+    let mark = stack.mark();
+    assert_eq!(mark, 0);
+    assert!(stack.is_in_transaction());
+
+    stack.push(make_checkpoint_entry("/tmp/a.rs", Some("a")));
+    stack.push(make_checkpoint_entry("/tmp/b.rs", Some("b")));
+
+    // Commit: entries remain, mark is cleared
+    stack.commit_mark();
+    assert!(!stack.is_in_transaction());
+    assert_eq!(stack.len(), 2); // entries preserved for /undo
+}
+
+#[test]
+fn test_rollback_empty() {
+    let mut stack = CheckpointStack::new();
+    let mark = stack.mark();
+
+    // Rollback immediately without pushing anything
+    let rolled_back = stack.rollback_to_mark(mark);
+    assert!(rolled_back.is_empty());
+    assert!(!stack.is_in_transaction());
+}
+
+#[test]
+fn test_mark_rollback_deduplication() {
+    let mut stack = CheckpointStack::new();
+    let mark = stack.mark();
+
+    // Same file edited twice within transaction
+    stack.push(make_checkpoint_entry("/tmp/a.rs", Some("original")));
+    stack.push(make_checkpoint_entry("/tmp/b.rs", Some("b")));
+    stack.push(make_checkpoint_entry("/tmp/a.rs", Some("after_first_edit")));
+
+    let rolled_back = stack.rollback_to_mark(mark);
+    // Deduplication: /tmp/a.rs should keep "original" (the oldest checkpoint)
+    assert_eq!(rolled_back.len(), 2);
+    let a_entry = rolled_back
+        .iter()
+        .find(|e| e.path == Path::new("/tmp/a.rs"))
+        .expect("a.rs should exist");
+    assert_eq!(a_entry.previous_content.as_deref(), Some("original"));
+    assert!(stack.is_empty());
+}
+
+#[test]
+fn test_mark_with_remove_interaction() {
+    let mut stack = CheckpointStack::new();
+    let mark = stack.mark();
+    assert_eq!(mark, 0);
+
+    // Push A (tool succeeds, kept) at index 0
+    let idx_a = stack.push(make_checkpoint_entry("/tmp/a.rs", Some("a")));
+    assert_eq!(idx_a, 0);
+
+    // Push B (tool fails, removed individually) at index 1
+    let idx_b = stack.push(make_checkpoint_entry("/tmp/b.rs", Some("b")));
+    assert_eq!(idx_b, 1);
+
+    // Remove B (index 1, which is >= mark=0 so mark stays at 0)
+    stack.remove(idx_b);
+    assert_eq!(stack.len(), 1);
+
+    // Rollback to mark: only A should be returned
+    let rolled_back = stack.rollback_to_mark(mark);
+    assert_eq!(rolled_back.len(), 1);
+    assert_eq!(rolled_back[0].path, Path::new("/tmp/a.rs"));
+}
+
+#[test]
+fn test_eviction_with_active_mark() {
+    let mut stack = CheckpointStack::new();
+    // Push 18 entries before mark (max_depth=20)
+    for i in 0..18 {
+        stack.push(make_checkpoint_entry(&format!("/tmp/pre{i}.rs"), Some("x")));
+    }
+    assert_eq!(stack.len(), 18);
+
+    // Mark at position 18
+    let mark = stack.mark();
+    assert_eq!(mark, 18);
+
+    // Push 5 entries within transaction (total would be 23, exceeding max_depth=20)
+    for i in 0..5 {
+        stack.push(make_checkpoint_entry(&format!("/tmp/tx{i}.rs"), Some("t")));
+    }
+
+    // Eviction should only remove pre-mark entries, preserving all 5 transaction entries
+    // max_depth=20, so eviction removes 3 oldest pre-mark entries (18+5=23, need to drop 3)
+    assert_eq!(stack.len(), 20);
+
+    // All 5 transaction entries should still be present after rollback
+    // active_mark was adjusted from 18 to 15 by eviction
+    let rolled_back = stack.rollback_to_mark(mark);
+    assert_eq!(rolled_back.len(), 5);
+    assert!(!stack.is_in_transaction());
+}
+
+#[test]
+fn test_eviction_mark_adjustment() {
+    let mut stack = CheckpointStack::new();
+    // Push 19 entries before mark
+    for i in 0..19 {
+        stack.push(make_checkpoint_entry(&format!("/tmp/pre{i}.rs"), Some("x")));
+    }
+
+    let mark = stack.mark();
+    assert_eq!(mark, 19);
+    assert!(stack.is_in_transaction());
+
+    // Push 3 entries within transaction (total 22 > max_depth=20)
+    // This should evict 2 pre-mark entries, adjusting active_mark from 19 to 17
+    for i in 0..3 {
+        stack.push(make_checkpoint_entry(&format!("/tmp/tx{i}.rs"), Some("t")));
+    }
+
+    assert_eq!(stack.len(), 20);
+
+    // Rollback should still correctly return all 3 transaction entries
+    // because active_mark was adjusted to 17 internally
+    let rolled_back = stack.rollback_to_mark(mark);
+    assert_eq!(rolled_back.len(), 3);
+    // Pre-mark entries: 19 - 2 evicted = 17 remaining
+    assert_eq!(stack.len(), 17);
+}
+
+// ===================================================================
+// Git tools tests (Issue #75)
+// ===================================================================
+
+#[test]
+fn git_tools_registered_in_standard_tools() {
+    let registry = build_registry();
+    assert!(registry.get("git.status").is_some());
+    assert!(registry.get("git.diff").is_some());
+    assert!(registry.get("git.log").is_some());
+
+    let status_spec = registry.get("git.status").unwrap();
+    assert_eq!(status_spec.kind, ToolKind::GitStatus);
+    assert_eq!(status_spec.execution_class, ExecutionClass::ReadOnly);
+    assert_eq!(status_spec.permission_class, PermissionClass::Safe);
+    assert_eq!(status_spec.execution_mode, ExecutionMode::ParallelSafe);
+    assert_eq!(status_spec.plan_mode, PlanModePolicy::Allowed);
+    assert_eq!(status_spec.rollback_policy, RollbackPolicy::None);
+}
+
+#[test]
+fn git_tools_registered_in_explore_tools() {
+    let mut registry = ToolRegistry::new();
+    registry.register_explore_tools();
+    assert!(registry.get("git.status").is_some());
+    assert!(registry.get("git.diff").is_some());
+    assert!(registry.get("git.log").is_some());
+}
+
+#[test]
+fn git_status_registered_in_plan_tools() {
+    let mut registry = ToolRegistry::new();
+    registry.register_plan_tools();
+    assert!(registry.get("git.status").is_some());
+    assert!(registry.get("git.diff").is_none());
+    assert!(registry.get("git.log").is_none());
+}
+
+#[test]
+fn from_json_parses_git_status() {
+    let value = serde_json::json!({"tool": "git.status"});
+    let input = ToolInput::from_json("git.status", &value).unwrap();
+    assert_eq!(input, ToolInput::GitStatus {});
+    assert_eq!(input.kind(), ToolKind::GitStatus);
+}
+
+#[test]
+fn from_json_parses_git_diff_with_all_params() {
+    let value = serde_json::json!({
+        "tool": "git.diff",
+        "path": "src/main.rs",
+        "staged": true,
+        "commit": "HEAD~3"
+    });
+    let input = ToolInput::from_json("git.diff", &value).unwrap();
+    assert_eq!(
+        input,
+        ToolInput::GitDiff {
+            path: Some("src/main.rs".to_string()),
+            staged: Some(true),
+            commit: Some("HEAD~3".to_string()),
+        }
+    );
+    assert_eq!(input.kind(), ToolKind::GitDiff);
+}
+
+#[test]
+fn from_json_parses_git_diff_without_params() {
+    let value = serde_json::json!({"tool": "git.diff"});
+    let input = ToolInput::from_json("git.diff", &value).unwrap();
+    assert_eq!(
+        input,
+        ToolInput::GitDiff {
+            path: None,
+            staged: None,
+            commit: None,
+        }
+    );
+}
+
+#[test]
+fn from_json_parses_git_log_with_params() {
+    let value = serde_json::json!({
+        "tool": "git.log",
+        "count": 20,
+        "path": "src/"
+    });
+    let input = ToolInput::from_json("git.log", &value).unwrap();
+    assert_eq!(
+        input,
+        ToolInput::GitLog {
+            count: Some(20),
+            path: Some("src/".to_string()),
+        }
+    );
+    assert_eq!(input.kind(), ToolKind::GitLog);
+}
+
+#[test]
+fn from_json_parses_git_log_without_params() {
+    let value = serde_json::json!({"tool": "git.log"});
+    let input = ToolInput::from_json("git.log", &value).unwrap();
+    assert_eq!(
+        input,
+        ToolInput::GitLog {
+            count: None,
+            path: None,
+        }
+    );
+}
+
+#[test]
+fn git_diff_commit_injection_rejected() {
+    let registry = build_registry();
+    // Reject commit starting with -
+    let result = registry.validate(ToolCallRequest::new(
+        "call_001",
+        "git.diff",
+        ToolInput::GitDiff {
+            path: None,
+            staged: None,
+            commit: Some("-c".to_string()),
+        },
+    ));
+    assert!(result.is_err());
+    assert!(matches!(
+        result.unwrap_err(),
+        ToolValidationError::InvalidFieldValue { .. }
+    ));
+}
+
+#[test]
+fn git_diff_commit_flag_injection_rejected() {
+    let registry = build_registry();
+    let result = registry.validate(ToolCallRequest::new(
+        "call_001",
+        "git.diff",
+        ToolInput::GitDiff {
+            path: None,
+            staged: None,
+            commit: Some("--exec".to_string()),
+        },
+    ));
+    assert!(result.is_err());
+}
+
+#[test]
+fn git_diff_valid_commit_accepted() {
+    let registry = build_registry();
+    // HEAD~3 should be accepted
+    let result = registry.validate(ToolCallRequest::new(
+        "call_001",
+        "git.diff",
+        ToolInput::GitDiff {
+            path: None,
+            staged: None,
+            commit: Some("HEAD~3".to_string()),
+        },
+    ));
+    assert!(result.is_ok());
+
+    // main should be accepted
+    let result = registry.validate(ToolCallRequest::new(
+        "call_002",
+        "git.diff",
+        ToolInput::GitDiff {
+            path: None,
+            staged: None,
+            commit: Some("main".to_string()),
+        },
+    ));
+    assert!(result.is_ok());
+}
+
+#[test]
+fn git_diff_path_traversal_rejected() {
+    let registry = build_registry();
+    let result = registry.validate(ToolCallRequest::new(
+        "call_001",
+        "git.diff",
+        ToolInput::GitDiff {
+            path: Some("../secret".to_string()),
+            staged: None,
+            commit: None,
+        },
+    ));
+    assert!(result.is_err());
+    assert!(matches!(
+        result.unwrap_err(),
+        ToolValidationError::InvalidFieldValue { .. }
+    ));
+}
+
+#[test]
+fn git_diff_valid_path_accepted() {
+    let registry = build_registry();
+    let result = registry.validate(ToolCallRequest::new(
+        "call_001",
+        "git.diff",
+        ToolInput::GitDiff {
+            path: Some("src/main.rs".to_string()),
+            staged: None,
+            commit: None,
+        },
+    ));
+    assert!(result.is_ok());
+}
+
+#[test]
+fn git_log_count_zero_rejected() {
+    let registry = build_registry();
+    let result = registry.validate(ToolCallRequest::new(
+        "call_001",
+        "git.log",
+        ToolInput::GitLog {
+            count: Some(0),
+            path: None,
+        },
+    ));
+    assert!(result.is_err());
+    assert!(matches!(
+        result.unwrap_err(),
+        ToolValidationError::InvalidFieldValue { .. }
+    ));
+}
+
+#[test]
+fn git_log_count_over_100_rejected() {
+    let registry = build_registry();
+    let result = registry.validate(ToolCallRequest::new(
+        "call_001",
+        "git.log",
+        ToolInput::GitLog {
+            count: Some(101),
+            path: None,
+        },
+    ));
+    assert!(result.is_err());
+}
+
+#[test]
+fn git_log_valid_count_accepted() {
+    let registry = build_registry();
+    // count=10 should be accepted
+    let result = registry.validate(ToolCallRequest::new(
+        "call_001",
+        "git.log",
+        ToolInput::GitLog {
+            count: Some(10),
+            path: None,
+        },
+    ));
+    assert!(result.is_ok());
+
+    // count=100 should be accepted
+    let result = registry.validate(ToolCallRequest::new(
+        "call_002",
+        "git.log",
+        ToolInput::GitLog {
+            count: Some(100),
+            path: None,
+        },
+    ));
+    assert!(result.is_ok());
+
+    // count=1 should be accepted
+    let result = registry.validate(ToolCallRequest::new(
+        "call_003",
+        "git.log",
+        ToolInput::GitLog {
+            count: Some(1),
+            path: None,
+        },
+    ));
+    assert!(result.is_ok());
+}
+
+#[test]
+fn git_log_path_traversal_rejected() {
+    let registry = build_registry();
+    let result = registry.validate(ToolCallRequest::new(
+        "call_001",
+        "git.log",
+        ToolInput::GitLog {
+            count: None,
+            path: Some("../secret".to_string()),
+        },
+    ));
+    assert!(result.is_err());
+}
+
+#[test]
+fn git_status_execution_in_git_repo() {
+    // This test runs in the project root which is a git repo
+    let root = std::env::current_dir().expect("should get current dir");
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root);
+    let registry = build_registry();
+
+    let result = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_git_status".to_string(),
+            spec: registry.get("git.status").unwrap().clone(),
+            input: ToolInput::GitStatus {},
+        })
+        .expect("git.status should succeed in git repo");
+
+    assert_eq!(result.status, ToolExecutionStatus::Completed);
+    // Porcelain output is valid (may be empty if clean)
+    assert!(matches!(result.payload, ToolExecutionPayload::Text(_)));
+}
+
+#[test]
+fn git_diff_execution_in_git_repo() {
+    let root = std::env::current_dir().expect("should get current dir");
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root);
+    let registry = build_registry();
+
+    let result = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_git_diff".to_string(),
+            spec: registry.get("git.diff").unwrap().clone(),
+            input: ToolInput::GitDiff {
+                path: None,
+                staged: None,
+                commit: None,
+            },
+        })
+        .expect("git.diff should succeed in git repo");
+
+    assert_eq!(result.status, ToolExecutionStatus::Completed);
+}
+
+#[test]
+fn git_log_execution_in_git_repo() {
+    let root = std::env::current_dir().expect("should get current dir");
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root);
+    let registry = build_registry();
+
+    let result = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_git_log".to_string(),
+            spec: registry.get("git.log").unwrap().clone(),
+            input: ToolInput::GitLog {
+                count: Some(5),
+                path: None,
+            },
+        })
+        .expect("git.log should succeed in git repo");
+
+    assert_eq!(result.status, ToolExecutionStatus::Completed);
+    if let ToolExecutionPayload::Text(output) = &result.payload {
+        // Should have at most 5 lines of output
+        let lines: Vec<&str> = output.trim().lines().collect();
+        assert!(
+            lines.len() <= 5,
+            "expected at most 5 lines, got {}",
+            lines.len()
+        );
+    } else {
+        panic!("expected Text payload");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #74: file.search regex + context_lines tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn file_search_serde_backward_compat_missing_regex_and_context_lines() {
+    // JSON without regex/context_lines should deserialize with defaults
+    let json_str = r#"{"FileSearch":{"root":".","pattern":"hello"}}"#;
+    let input: ToolInput = serde_json::from_str(json_str).expect("should deserialize");
+    match input {
+        ToolInput::FileSearch {
+            root,
+            pattern,
+            regex,
+            context_lines,
+        } => {
+            assert_eq!(root, ".");
+            assert_eq!(pattern, "hello");
+            assert!(!regex);
+            assert_eq!(context_lines, 0);
+        }
+        _ => panic!("expected FileSearch"),
+    }
+}
+
+#[test]
+fn git_status_fails_in_non_git_repo() {
+    let tmp = std::env::temp_dir().join("anvil_git_non_repo_test");
+    let _ = fs::remove_dir_all(&tmp);
+    fs::create_dir_all(&tmp).expect("should create temp dir");
+    let mut executor = LocalToolExecutor::new_without_rate_limit(tmp.clone());
+    let registry = build_registry();
+
+    let result = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_git_status_fail".to_string(),
+            spec: registry.get("git.status").unwrap().clone(),
+            input: ToolInput::GitStatus {},
+        })
+        .expect("execute should return result, not runtime error");
+
+    assert_eq!(result.status, ToolExecutionStatus::Failed);
+    if let ToolExecutionPayload::Text(msg) = &result.payload {
+        assert!(
+            msg.contains("not a git repository") || msg.contains("fatal"),
+            "expected git repo error message, got: {msg}"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn git_status_no_approval_required() {
+    let registry = build_registry();
+    let validated = registry
+        .validate(ToolCallRequest::new(
+            "call_git_001",
+            "git.status",
+            ToolInput::GitStatus {},
+        ))
+        .expect("git.status should validate");
+
+    // Safe tools don't require approval
+    assert!(validated.approval_required(true).is_none());
+}
+
+#[test]
+fn git_diff_staged_priority_over_commit() {
+    // When both staged=true and commit are provided, staged takes priority
+    let root = std::env::current_dir().expect("should get current dir");
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root);
+    let registry = build_registry();
+
+    let result = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_git_diff_staged".to_string(),
+            spec: registry.get("git.diff").unwrap().clone(),
+            input: ToolInput::GitDiff {
+                path: None,
+                staged: Some(true),
+                commit: Some("HEAD~1".to_string()),
+            },
+        })
+        .expect("git.diff with staged should succeed");
+
+    // Should complete without error (staged takes priority, commit ignored)
+    assert_eq!(result.status, ToolExecutionStatus::Completed);
+}
+
+#[test]
+fn file_search_serde_with_new_fields() {
+    let json_str =
+        r#"{"FileSearch":{"root":"src","pattern":"fn\\s+main","regex":true,"context_lines":3}}"#;
+    let input: ToolInput = serde_json::from_str(json_str).expect("should deserialize");
+    match input {
+        ToolInput::FileSearch {
+            regex,
+            context_lines,
+            ..
+        } => {
+            assert!(regex);
+            assert_eq!(context_lines, 3);
+        }
+        _ => panic!("expected FileSearch"),
+    }
+}
+
+#[test]
+fn file_search_from_json_with_regex_and_context_lines() {
+    let value = serde_json::json!({
+        "root": ".",
+        "pattern": "fn\\s+main",
+        "regex": true,
+        "context_lines": 5
+    });
+    let input = ToolInput::from_json("file.search", &value).expect("should parse");
+    match input {
+        ToolInput::FileSearch {
+            regex,
+            context_lines,
+            ..
+        } => {
+            assert!(regex);
+            assert_eq!(context_lines, 5);
+        }
+        _ => panic!("expected FileSearch"),
+    }
+}
+
+#[test]
+fn file_search_from_json_defaults_when_omitted() {
+    let value = serde_json::json!({
+        "root": ".",
+        "pattern": "hello"
+    });
+    let input = ToolInput::from_json("file.search", &value).expect("should parse");
+    match input {
+        ToolInput::FileSearch {
+            regex,
+            context_lines,
+            ..
+        } => {
+            assert!(!regex);
+            assert_eq!(context_lines, 0);
+        }
+        _ => panic!("expected FileSearch"),
+    }
+}
+
+#[test]
+fn file_search_validation_rejects_excessive_context_lines() {
+    let registry = build_registry();
+    let result = registry.validate(ToolCallRequest::new(
+        "call_001",
+        "file.search",
+        ToolInput::FileSearch {
+            root: ".".to_string(),
+            pattern: "test".to_string(),
+            regex: false,
+            context_lines: 11,
+        },
+    ));
+    match result {
+        Err(ToolValidationError::InvalidFieldValue { field, .. }) => {
+            assert_eq!(field, "context_lines");
+        }
+        other => panic!("expected InvalidFieldValue, got {other:?}"),
+    }
+}
+
+#[test]
+fn file_search_validation_accepts_max_context_lines() {
+    let registry = build_registry();
+    let result = registry.validate(ToolCallRequest::new(
+        "call_001",
+        "file.search",
+        ToolInput::FileSearch {
+            root: ".".to_string(),
+            pattern: "test".to_string(),
+            regex: false,
+            context_lines: 10,
+        },
+    ));
+    assert!(result.is_ok());
+}
+
+#[test]
+fn file_search_validation_rejects_invalid_regex() {
+    let registry = build_registry();
+    let result = registry.validate(ToolCallRequest::new(
+        "call_001",
+        "file.search",
+        ToolInput::FileSearch {
+            root: ".".to_string(),
+            pattern: "[invalid".to_string(),
+            regex: true,
+            context_lines: 0,
+        },
+    ));
+    match result {
+        Err(ToolValidationError::InvalidFieldValue { field, .. }) => {
+            assert_eq!(field, "pattern");
+        }
+        other => panic!("expected InvalidFieldValue for pattern, got {other:?}"),
+    }
+}
+
+#[test]
+fn file_search_validation_accepts_valid_regex() {
+    let registry = build_registry();
+    let result = registry.validate(ToolCallRequest::new(
+        "call_001",
+        "file.search",
+        ToolInput::FileSearch {
+            root: ".".to_string(),
+            pattern: r"fn\s+\w+".to_string(),
+            regex: true,
+            context_lines: 0,
+        },
+    ));
+    assert!(result.is_ok());
+}
+
+#[test]
+fn file_search_literal_backward_compatible() {
+    // Ensure default (regex=false, context_lines=0) still returns Paths
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("hello.txt");
+    fs::write(&file_path, "hello world\nfoo bar\n").unwrap();
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(dir.path());
+    let mut registry = ToolRegistry::new();
+    registry.register_file_search();
+    let validated = registry
+        .validate(ToolCallRequest::new(
+            "call_001",
+            "file.search",
+            ToolInput::FileSearch {
+                root: ".".to_string(),
+                pattern: "hello".to_string(),
+                regex: false,
+                context_lines: 0,
+            },
+        ))
+        .unwrap();
+    let exec_req = validated
+        .approve()
+        .into_execution_request(ToolExecutionPolicy {
+            approval_required: false,
+            ..Default::default()
+        })
+        .unwrap();
+    let result = executor.execute(exec_req).unwrap();
+    match &result.payload {
+        ToolExecutionPayload::Paths(paths) => {
+            assert!(!paths.is_empty());
+            assert!(paths[0].contains("hello.txt"));
+        }
+        other => panic!("expected Paths, got {other:?}"),
+    }
+}
+
+#[test]
+fn file_search_regex_matches_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("code.rs");
+    fs::write(&file_path, "fn main() {\n    println!(\"hello\");\n}\n").unwrap();
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(dir.path());
+    let mut registry = ToolRegistry::new();
+    registry.register_file_search();
+    let validated = registry
+        .validate(ToolCallRequest::new(
+            "call_001",
+            "file.search",
+            ToolInput::FileSearch {
+                root: ".".to_string(),
+                pattern: r"fn\s+main".to_string(),
+                regex: true,
+                context_lines: 0,
+            },
+        ))
+        .unwrap();
+    let exec_req = validated
+        .approve()
+        .into_execution_request(ToolExecutionPolicy {
+            approval_required: false,
+            ..Default::default()
+        })
+        .unwrap();
+    let result = executor.execute(exec_req).unwrap();
+    match &result.payload {
+        ToolExecutionPayload::Paths(paths) => {
+            assert!(!paths.is_empty());
+            assert!(paths[0].contains("code.rs"));
+        }
+        other => panic!("expected Paths, got {other:?}"),
+    }
+}
+
+#[test]
+fn file_search_regex_no_match() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("code.rs");
+    fs::write(&file_path, "fn main() {}\n").unwrap();
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(dir.path());
+    let mut registry = ToolRegistry::new();
+    registry.register_file_search();
+    let validated = registry
+        .validate(ToolCallRequest::new(
+            "call_001",
+            "file.search",
+            ToolInput::FileSearch {
+                root: ".".to_string(),
+                pattern: r"class\s+Foo".to_string(),
+                regex: true,
+                context_lines: 0,
+            },
+        ))
+        .unwrap();
+    let exec_req = validated
+        .approve()
+        .into_execution_request(ToolExecutionPolicy {
+            approval_required: false,
+            ..Default::default()
+        })
+        .unwrap();
+    let result = executor.execute(exec_req).unwrap();
+    match &result.payload {
+        ToolExecutionPayload::Paths(paths) => {
+            assert!(paths.is_empty());
+        }
+        other => panic!("expected empty Paths, got {other:?}"),
+    }
+}
+
+#[test]
+fn file_search_context_lines_returns_text_payload() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("test.txt");
+    fs::write(
+        &file_path,
+        "line1\nline2\nMATCH_HERE\nline4\nline5\nline6\n",
+    )
+    .unwrap();
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(dir.path());
+    let mut registry = ToolRegistry::new();
+    registry.register_file_search();
+    let validated = registry
+        .validate(ToolCallRequest::new(
+            "call_001",
+            "file.search",
+            ToolInput::FileSearch {
+                root: ".".to_string(),
+                pattern: "MATCH_HERE".to_string(),
+                regex: false,
+                context_lines: 2,
+            },
+        ))
+        .unwrap();
+    let exec_req = validated
+        .approve()
+        .into_execution_request(ToolExecutionPolicy {
+            approval_required: false,
+            ..Default::default()
+        })
+        .unwrap();
+    let result = executor.execute(exec_req).unwrap();
+    match &result.payload {
+        ToolExecutionPayload::Text(text) => {
+            // Should contain the match line and context
+            assert!(text.contains("MATCH_HERE"), "should contain match line");
+            assert!(text.contains("line2"), "should contain before context");
+            assert!(text.contains("line4"), "should contain after context");
+            assert!(text.contains(":3:"), "should contain line number 3");
+        }
+        other => panic!("expected Text with context, got {other:?}"),
+    }
+}
+
+#[test]
+fn file_search_context_lines_at_file_boundaries() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("test.txt");
+    fs::write(&file_path, "MATCH_FIRST\nline2\nline3\n").unwrap();
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(dir.path());
+    let mut registry = ToolRegistry::new();
+    registry.register_file_search();
+    let validated = registry
+        .validate(ToolCallRequest::new(
+            "call_001",
+            "file.search",
+            ToolInput::FileSearch {
+                root: ".".to_string(),
+                pattern: "MATCH_FIRST".to_string(),
+                regex: false,
+                context_lines: 5,
+            },
+        ))
+        .unwrap();
+    let exec_req = validated
+        .approve()
+        .into_execution_request(ToolExecutionPolicy {
+            approval_required: false,
+            ..Default::default()
+        })
+        .unwrap();
+    let result = executor.execute(exec_req).unwrap();
+    match &result.payload {
+        ToolExecutionPayload::Text(text) => {
+            assert!(text.contains("MATCH_FIRST"));
+            assert!(text.contains(":1:"), "match at line 1");
+            // Should have after context but no before context
+            assert!(text.contains("line2"));
+        }
+        other => panic!("expected Text, got {other:?}"),
+    }
+}
+
+#[test]
+fn file_search_regex_with_context_lines() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("code.rs");
+    fs::write(
+        &file_path,
+        "// header\nfn main() {\n    println!(\"hello\");\n}\n// footer\n",
+    )
+    .unwrap();
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(dir.path());
+    let mut registry = ToolRegistry::new();
+    registry.register_file_search();
+    let validated = registry
+        .validate(ToolCallRequest::new(
+            "call_001",
+            "file.search",
+            ToolInput::FileSearch {
+                root: ".".to_string(),
+                pattern: r"fn\s+main".to_string(),
+                regex: true,
+                context_lines: 1,
+            },
+        ))
+        .unwrap();
+    let exec_req = validated
+        .approve()
+        .into_execution_request(ToolExecutionPolicy {
+            approval_required: false,
+            ..Default::default()
+        })
+        .unwrap();
+    let result = executor.execute(exec_req).unwrap();
+    match &result.payload {
+        ToolExecutionPayload::Text(text) => {
+            assert!(text.contains("fn main()"));
+            assert!(text.contains("// header"), "before context");
+            assert!(text.contains("println!"), "after context");
+        }
+        other => panic!("expected Text, got {other:?}"),
+    }
+}
+
+#[test]
+fn file_search_path_only_match_with_context_returns_path_in_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("searchable_dir");
+    fs::create_dir(&sub).unwrap();
+    let file_path = sub.join("target_file.rs");
+    fs::write(&file_path, "no match content\n").unwrap();
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(dir.path());
+    let mut registry = ToolRegistry::new();
+    registry.register_file_search();
+    let validated = registry
+        .validate(ToolCallRequest::new(
+            "call_001",
+            "file.search",
+            ToolInput::FileSearch {
+                root: ".".to_string(),
+                pattern: "target_file".to_string(),
+                regex: false,
+                context_lines: 2,
+            },
+        ))
+        .unwrap();
+    let exec_req = validated
+        .approve()
+        .into_execution_request(ToolExecutionPolicy {
+            approval_required: false,
+            ..Default::default()
+        })
+        .unwrap();
+    let result = executor.execute(exec_req).unwrap();
+    match &result.payload {
+        ToolExecutionPayload::Text(text) => {
+            assert!(
+                text.contains("target_file.rs"),
+                "path-only match should appear in text"
+            );
+        }
+        other => panic!("expected Text, got {other:?}"),
+    }
+}
+
+#[test]
+fn file_search_zero_matches_with_context_returns_empty_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("nothing.txt");
+    fs::write(&file_path, "no match here\n").unwrap();
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(dir.path());
+    let mut registry = ToolRegistry::new();
+    registry.register_file_search();
+    let validated = registry
+        .validate(ToolCallRequest::new(
+            "call_001",
+            "file.search",
+            ToolInput::FileSearch {
+                root: ".".to_string(),
+                pattern: "NONEXISTENT_PATTERN_XYZ".to_string(),
+                regex: false,
+                context_lines: 3,
+            },
+        ))
+        .unwrap();
+    let exec_req = validated
+        .approve()
+        .into_execution_request(ToolExecutionPolicy {
+            approval_required: false,
+            ..Default::default()
+        })
+        .unwrap();
+    let result = executor.execute(exec_req).unwrap();
+    match &result.payload {
+        ToolExecutionPayload::Text(text) => {
+            assert!(text.is_empty(), "no matches should produce empty text");
+        }
+        other => panic!("expected empty Text, got {other:?}"),
+    }
+}
+
+// --- resolve_locale_params tests ---
+
+mod locale_params {
+    use anvil::tooling::resolve_locale_params;
+
+    #[test]
+    fn resolve_locale_params_japanese() {
+        let result = resolve_locale_params("ja_JP.UTF-8");
+        let params = result.expect("should return Some for Japanese locale");
+        assert_eq!(params.kl, "jp-ja");
+        assert_eq!(params.accept_language, "ja,en;q=0.9");
+    }
+
+    #[test]
+    fn resolve_locale_params_chinese() {
+        let result = resolve_locale_params("zh_CN.UTF-8");
+        let params = result.expect("should return Some for Chinese locale");
+        assert_eq!(params.kl, "cn-zh");
+        assert_eq!(params.accept_language, "zh,en;q=0.9");
+    }
+
+    #[test]
+    fn resolve_locale_params_korean() {
+        let result = resolve_locale_params("ko_KR.UTF-8");
+        let params = result.expect("should return Some for Korean locale");
+        assert_eq!(params.kl, "kr-kr");
+        assert_eq!(params.accept_language, "ko,en;q=0.9");
+    }
+
+    #[test]
+    fn resolve_locale_params_english() {
+        let result = resolve_locale_params("en_US.UTF-8");
+        assert!(result.is_none(), "English locale should return None");
+    }
+
+    #[test]
+    fn resolve_locale_params_c_locale() {
+        let result = resolve_locale_params("C");
+        assert!(result.is_none(), "C locale should return None");
+    }
+
+    #[test]
+    fn resolve_locale_params_posix() {
+        let result = resolve_locale_params("POSIX");
+        assert!(result.is_none(), "POSIX locale should return None");
+    }
+
+    #[test]
+    fn resolve_locale_params_c_utf8() {
+        let result = resolve_locale_params("C.UTF-8");
+        assert!(result.is_none(), "C.UTF-8 locale should return None");
+    }
+
+    #[test]
+    fn resolve_locale_params_bare_ja() {
+        let result = resolve_locale_params("ja");
+        let params = result.expect("should return Some for bare 'ja'");
+        assert_eq!(params.kl, "jp-ja");
+    }
+
+    #[test]
+    fn resolve_locale_params_zh_tw() {
+        let result = resolve_locale_params("zh_TW.UTF-8");
+        let params = result.expect("should return Some for zh_TW locale");
+        assert_eq!(params.kl, "cn-zh");
+    }
+}
+
+// --- is_captcha_response tests ---
+
+mod captcha_detection {
+    use anvil::tooling::is_captcha_response;
+
+    #[test]
+    fn is_captcha_response_ddg_specific() {
+        let body = "<html><body>Unfortunately, bots use DuckDuckGo too.</body></html>";
+        assert!(
+            is_captcha_response(body, 0),
+            "DDG-specific CAPTCHA string should be detected"
+        );
+    }
+
+    #[test]
+    fn is_captcha_response_generic_captcha() {
+        let body = "<html><body>Please solve this CAPTCHA to continue.</body></html>";
+        assert!(
+            is_captcha_response(body, 0),
+            "Generic 'captcha' keyword should be detected"
+        );
+    }
+
+    #[test]
+    fn is_captcha_response_not_triggered_with_results() {
+        let body = "<html><body>Unfortunately, bots use DuckDuckGo too.</body></html>";
+        assert!(
+            !is_captcha_response(body, 3),
+            "Should not trigger CAPTCHA when results_count > 0"
+        );
+    }
+
+    #[test]
+    fn is_captcha_response_no_false_positive_bot_query() {
+        let body = "<html><body>Learn about chatbot development and bot frameworks.</body></html>";
+        assert!(
+            !is_captcha_response(body, 0),
+            "Should not false-positive on 'bot' keyword without 'captcha'"
+        );
+    }
+}
+
+// --- CaptchaBlocked error tests ---
+
+mod captcha_blocked_error {
+    use anvil::tooling::ToolRuntimeError;
+
+    #[test]
+    fn captcha_blocked_error_display() {
+        let err = ToolRuntimeError::CaptchaBlocked {
+            query: "test query".to_string(),
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("SERPER_API_KEY"),
+            "CaptchaBlocked message should mention SERPER_API_KEY, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn captcha_blocked_error_display_includes_web_fetch() {
+        let err = ToolRuntimeError::CaptchaBlocked {
+            query: "test query".to_string(),
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("web.fetch"),
+            "CaptchaBlocked message should mention web.fetch, got: {msg}"
+        );
+    }
 }

@@ -17,7 +17,7 @@
 | **言語** | Rust (Edition 2024) |
 | **ビルド** | Cargo |
 | **LLMバックエンド** | Ollama, OpenAI互換API |
-| **HTTP** | curl subprocess |
+| **HTTP** | reqwest (blocking, rustls-tls) |
 | **テスト** | cargo test (統合テスト中心) |
 | **CI入力** | rustyline |
 
@@ -105,13 +105,15 @@ src/
 │   ├── mod.rs           # アプリケーションオーケストレータ
 │   ├── agentic.rs       # agenticツール実行ループ
 │   ├── cli.rs           # CLI入力ループ
+│   ├── context.rs       # コンテキスト注入（@file展開・サンドボックス検証）
 │   ├── plan.rs          # プラン管理
+│   ├── policy.rs        # offlineポリシーチェック（共通ヘルパー）
 │   ├── render.rs        # コンソール描画
 │   └── mock.rs          # テスト用モック
 ├── config/mod.rs        # 設定管理
 ├── contracts/
 │   ├── mod.rs           # 共通型定義
-│   └── tokens.rs        # トークン推定（CJK対応ヒューリスティック）
+│   └── tokens.rs        # トークン推定（CJK対応ヒューリスティック・モデル実測値ベースEMA補正）
 ├── extensions/
 │   ├── mod.rs           # スラッシュコマンド・拡張
 │   └── skills.rs        # SKILL.mdベースのスキルシステム
@@ -128,11 +130,11 @@ src/
 │   ├── openai.rs        # OpenAI互換クライアント
 │   └── transport.rs     # HTTPトランスポート
 ├── retrieval/mod.rs     # リポジトリ検索
-├── session/mod.rs       # セッション永続化
+├── session/mod.rs       # セッション永続化（名前付きセッション・一覧・切替・削除・マイグレーション）
 ├── spinner.rs           # スピナーUI
 ├── state/mod.rs         # 状態マシン
 ├── tooling/
-│   ├── mod.rs           # ツール実行・検証
+│   ├── mod.rs           # ツール実行・検証・CheckpointStack（undo用チェックポイント管理）
 │   └── diff.rs          # 差分プレビュー生成（file.write/file.edit承認時）
 └── tui/mod.rs           # TUI描画
 tests/
@@ -145,7 +147,8 @@ tests/
 ├── mcp_integration.rs   # MCP統合テスト
 ├── tui_console.rs       # TUIテスト
 ├── skills_system.rs     # スキルシステムテスト
-└── hooks_system.rs      # フックシステムテスト
+├── hooks_system.rs      # フックシステムテスト
+└── context_inject.rs    # コンテキスト注入テスト
 ```
 
 ---
