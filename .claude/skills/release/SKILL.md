@@ -8,7 +8,7 @@ argument-hint: "[version-type] (major|minor|patch) or [version] (e.g., 1.2.3)"
 
 # リリーススキル
 
-新しいバージョンをリリースします。リリースブランチ経由でPRを作成し、mainへマージ後にタグ・GitHub Releasesを作成します。
+新しいバージョンをリリースします。git worktree + commandmatedev でリリースブランチを作成・操作し、PRを作成します。mainへマージ後にタグ・GitHub Releasesを作成します。
 
 ## 使用方法
 
@@ -19,19 +19,31 @@ argument-hint: "[version-type] (major|minor|patch) or [version] (e.g., 1.2.3)"
 /release 1.0.0      # 直接バージョン指定
 ```
 
+## 前提条件
+
+- `commandmatedev start --daemon` が起動済みであること
+- commandmatedev にAnvilリポジトリが登録済みであること
+
 ## ブランチフロー
 
 ```
-main ← PR ← release/v0.2.0 ← main (リリースブランチ作成)
-  ↓
-タグ v0.2.0 作成 → GitHub Actions が自動でバイナリビルド・GitHub Release作成
+main (メインworktree) ─── git worktree add ──→ ../Anvil-release-v{version} (リリースworktree)
+                                                  ↓
+                                          commandmatedev send でリリース作業を委譲
+                                          (バージョン更新・ビルド・テスト・コミット・PR作成)
+                                                  ↓
+                                          PR ──→ main マージ
+                                                  ↓
+                                          メインworktreeでタグ作成 → GitHub Actions 自動ビルド
+                                                  ↓
+                                          worktreeクリーンアップ
 ```
 
 CLAUDE.mdの「mainへはPRマージのみ」ルールに準拠しています。
 
-## 実行手順
+## Phase 1: PR作成まで
 
-### 1. 事前チェック
+### 1. 事前チェック（メインworktreeで実行）
 
 以下を確認してください：
 
@@ -82,106 +94,97 @@ if git rev-parse "v$new_version" >/dev/null 2>&1; then
 fi
 ```
 
-### 5. リリースブランチ作成
+### 5. リリース用worktree作成（メインworktreeで実行）
 
 ```bash
-git checkout -b "release/v$new_version"
+WORKTREE_DIR="../Anvil-release-v$new_version"
+git worktree add -b "release/v$new_version" "$WORKTREE_DIR" main
 ```
 
-### 6. Cargo.toml更新
+### 6. commandmatedevでworktree同期
 
-Editツールを使用して `Cargo.toml` の `version = "x.y.z"` を新バージョンに変更します。
-
-```toml
-# 変更前
-version = "0.1.0"
-
-# 変更後
-version = "0.1.1"
-```
-
-### 7. Cargo.lock更新
+新しく作成したworktreeをcommandmatedevに認識させます：
 
 ```bash
-cargo generate-lockfile
+curl -s -X POST http://localhost:3000/api/repositories/sync
 ```
 
-### 8. README.md更新
-
-README.md内のバージョン番号をすべて新バージョンに更新します。
-
-対象箇所:
-- ダウンロードURL内のバージョン（例: `/download/v0.1.0/` → `/download/v0.1.1/`）
-
-Editツールで以下のパターンを置換：
-```
-/releases/download/v{旧バージョン}/ → /releases/download/v{新バージョン}/
-```
-
-### 9. ビルド・テスト検証
+### 7. worktree IDの取得
 
 ```bash
-# ビルドが通ることを確認
-cargo build
-
-# テストが通ることを確認
-cargo test
-
-# Clippyが通ることを確認
-cargo clippy --all-targets
+RELEASE_WT=$(commandmatedev ls --branch "release/v$new_version" --quiet)
+echo "Worktree ID: $RELEASE_WT"
 ```
 
-ビルドまたはテストが失敗した場合はリリースを中断します。
+IDが取得できない場合は、同期が完了していない可能性があります。数秒待って再試行してください。
 
-### 10. CHANGELOG.md更新
+### 8. commandmatedevでリリース作業を実行
 
-1. CHANGELOG.mdが存在しない場合は新規作成
-2. `[Unreleased]`セクションが空でないことを確認
-3. `[Unreleased]`の内容を新バージョンセクションとして追加
-4. 日付を`YYYY-MM-DD`形式で追記
-5. 空の`[Unreleased]`セクションを残す
-
-**注意:** `[Unreleased]`セクションが空の場合は警告を表示し、続行するか確認します。
-
-### 11. コミット作成
+リリースworktreeのエージェントに以下の作業を委譲します：
 
 ```bash
+commandmatedev send "$RELEASE_WT" "以下のリリース作業をすべて実行してください。
+
+## リリースバージョン情報
+- 旧バージョン: $current_version
+- 新バージョン: $new_version
+
+## 作業手順
+
+### 1. Cargo.toml更新
+Cargo.toml の version を \"$new_version\" に変更してください。
+
+### 2. Cargo.lock更新
+cargo generate-lockfile を実行してください。
+
+### 3. README.md更新
+README.md内のダウンロードURLのバージョンを更新してください：
+/releases/download/v$current_version/ → /releases/download/v$new_version/
+
+### 4. CHANGELOG.md更新
+- git log v$current_version..HEAD --oneline でv$current_version以降の変更を確認
+- [Unreleased]セクションの下に [${new_version}] - $(date +%Y-%m-%d) セクションを追加
+- 変更内容をAdded/Fixed/Changedに分類して記載
+- 空の[Unreleased]セクションを残す
+
+### 5. 品質チェック
+以下をすべて実行し、全パスすることを確認：
+- cargo build
+- cargo test
+- cargo clippy --all-targets
+
+### 6. コミット・プッシュ
 git add Cargo.toml Cargo.lock CHANGELOG.md README.md
-git commit -m "chore: release v$new_version"
+git commit -m 'chore: release v$new_version'
+git push origin release/v$new_version
+
+### 7. PR作成
+gh pr create --base main --head release/v$new_version --title 'chore: release v$new_version' で作成。
+bodyにはCHANGELOG.mdの該当セクションとチェックリストを含めてください。
+
+品質チェックが失敗した場合はリリースを中断し、エラー内容を報告してください。" --auto-yes --duration 1h
 ```
 
-### 12. リリースブランチをプッシュ・PR作成
+### 9. 完了待ち・結果確認
 
 ```bash
-git push origin "release/v$new_version"
+# エージェントの完了を待つ（最大10分）
+commandmatedev wait "$RELEASE_WT" --timeout 600
 
-gh pr create \
-  --base main \
-  --head "release/v$new_version" \
-  --title "chore: release v$new_version" \
-  --body "## Release v$new_version
-
-### 変更内容
-（CHANGELOG.mdの該当バージョンセクションの内容を記載）
-
-### チェックリスト
-- [ ] Cargo.toml バージョン更新済み
-- [ ] Cargo.lock 更新済み
-- [ ] README.md バージョン更新済み
-- [ ] CHANGELOG.md 更新済み
-- [ ] cargo build 成功
-- [ ] cargo test 全パス
-- [ ] cargo clippy 警告ゼロ
-"
+# 結果を確認
+commandmatedev capture "$RELEASE_WT"
 ```
 
-### 13. PRマージ後: タグ作成・プッシュ
+エージェントからの出力でPR URLを確認してください。
 
-**PRがマージされた後に以下を実行します：**
+## Phase 2: PRマージ後
+
+**ユーザーがPRをマージしたことを確認してから以下を実行します。**
+
+### 10. タグ作成・プッシュ（メインworktreeで実行）
 
 ```bash
-# mainに切り替え
-git checkout main
+# メインworktreeでmainを最新化
 git pull origin main
 
 # タグ作成・プッシュ
@@ -193,20 +196,34 @@ git push origin "v$new_version"
 - 4プラットフォーム向けバイナリビルド（linux-amd64, linux-arm64, darwin-amd64, darwin-arm64）
 - GitHub Release作成とバイナリアップロード
 
-### 14. リリースブランチの削除
+### 11. リリースworktreeのクリーンアップ
 
 ```bash
+# worktree削除
+git worktree remove "../Anvil-release-v$new_version"
+
+# ブランチ削除（ローカル・リモート）
 git branch -d "release/v$new_version"
 git push origin --delete "release/v$new_version"
 ```
 
-### 15. developへの反映
+### 12. developへの反映（commandmatedev経由）
+
+developブランチのworktree IDを取得し、反映を委譲します：
 
 ```bash
-git checkout develop
-git pull origin develop
-git merge main
-git push origin develop
+DEVELOP_WT=$(commandmatedev ls --branch develop --quiet)
+commandmatedev send "$DEVELOP_WT" "git pull origin develop && git merge main && git push origin develop" --auto-yes
+commandmatedev wait "$DEVELOP_WT" --timeout 120
+```
+
+developのworktreeがcommandmatedevに登録されていない場合は、メインworktreeから直接実行します：
+
+```bash
+# developのworktreeパスを確認
+git worktree list | grep develop
+# 該当パスで実行
+cd <develop-worktree-path> && git pull origin develop && git merge main && git push origin develop
 ```
 
 ## 完了確認
@@ -234,16 +251,22 @@ gh run list --limit 3
 | 未コミットの変更がある | エラー表示し、コミットまたはスタッシュを促す |
 | リモートとの差分がある | `git pull`を促す |
 | タグが既に存在する | エラー表示し、別バージョンの指定を促す |
+| worktree作成失敗 | 同名ディレクトリが存在しないか確認 |
+| commandmatedevサーバー未起動 | `commandmatedev start --daemon` を促す |
+| worktree ID取得失敗 | `curl -s -X POST http://localhost:3000/api/repositories/sync` で同期を促す |
+| commandmatedev send/waitタイムアウト | `commandmatedev capture` で状況確認 |
 | CHANGELOG.mdが存在しない | 新規作成するか確認 |
 | [Unreleased]セクションが空 | 警告を表示し、続行するか確認 |
-| `cargo build` が失敗 | エラー修正を促し、リリースを中断 |
-| `cargo test` が失敗 | テスト修正を促し、リリースを中断 |
-| `cargo clippy` に警告がある | 警告修正を促し、リリースを中断 |
-| PRのCIが失敗 | CI修正後にリリースブランチに追加コミット |
+| `cargo build` が失敗 | エラー修正を促し、リリースを中断。worktreeを削除 |
+| `cargo test` が失敗 | テスト修正を促し、リリースを中断。worktreeを削除 |
+| `cargo clippy` に警告がある | 警告修正を促し、リリースを中断。worktreeを削除 |
+| PRのCIが失敗 | commandmatedev send で修正コミットを追加 |
 | GitHub Actionsのビルド失敗 | ワークフロー修正後にタグを削除して再作成 |
+| リリース中断時のクリーンアップ | `git worktree remove` → `git branch -D` → `git push origin --delete` |
 
 ## 参考
 
 - [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/)
 - [Semantic Versioning](https://semver.org/lang/ja/)
 - [GitHub Actions Release Workflow](../../.github/workflows/release.yml)
+- [CommandMate Agent Operations](commandmatedev docs --section agent-operations)
