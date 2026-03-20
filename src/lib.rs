@@ -14,3 +14,4 @@ pub mod spinner;
 pub mod state;
 pub mod tooling;
 pub mod tui;
+pub mod walk;

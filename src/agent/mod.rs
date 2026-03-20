@@ -519,7 +519,7 @@ const TOOL_DESC_FILE_EDIT: &str = concat!(
 );
 
 const TOOL_DESC_FILE_SEARCH: &str = concat!(
-    "4. file.search — search for files by name or content:\n",
+    "4. file.search — search for files by name or content (respects .gitignore):\n",
     "```ANVIL_TOOL\n",
     "{\"id\":\"call_003\",\"tool\":\"file.search\",\"root\":\".\",\"pattern\":\"search term\"}\n",
     "```\n",
@@ -571,17 +571,25 @@ const TOOL_DESC_AGENT_PLAN: &str = concat!(
     "\n",
 );
 
-/// Data-driven definition of optional tools: (tool_name, tool_description).
-const OPTIONAL_TOOLS: &[(&str, &str)] = &[
-    ("web.fetch", TOOL_DESC_WEB_FETCH),
-    ("web.search", TOOL_DESC_WEB_SEARCH),
-    ("agent.explore", TOOL_DESC_AGENT_EXPLORE),
-    ("agent.plan", TOOL_DESC_AGENT_PLAN),
+/// Data-driven definition of optional tools: (tool_name, tool_description, catalog_one_liner).
+/// Note: web.fetch and web.search were moved to basic tools (always included)
+/// because LLMs cannot discover them without prompt descriptions. See Issue #114.
+const OPTIONAL_TOOLS: &[(&str, &str, &str)] = &[
+    (
+        "agent.explore",
+        TOOL_DESC_AGENT_EXPLORE,
+        "agent.explore: launch a read-only sub-agent to explore the codebase",
+    ),
+    (
+        "agent.plan",
+        TOOL_DESC_AGENT_PLAN,
+        "agent.plan: launch a read-only sub-agent to create an implementation plan",
+    ),
 ];
 
 /// Names of all optional tools, derived from [`OPTIONAL_TOOLS`].
 fn optional_tool_names() -> impl Iterator<Item = &'static str> {
-    OPTIONAL_TOOLS.iter().map(|(name, _)| *name)
+    OPTIONAL_TOOLS.iter().map(|(name, _, _)| *name)
 }
 
 // --- Static section constants ---
@@ -603,6 +611,9 @@ const PROMPT_WORK_APPROACH: &str = concat!(
     "Available tools:\n",
     "\n",
 );
+
+const PROMPT_OPTIONAL_CATALOG_HEADER: &str =
+    "\nAdditional tools (use ANVIL_TOOL block format shown above):\n";
 
 const PROMPT_TOOL_RULES: &str = concat!(
     "After ALL tool blocks, include exactly one final block with your summary:\n",
@@ -704,6 +715,7 @@ pub(crate) fn tool_protocol_system_prompt(
     languages: &[ProjectLanguage],
     mcp_tool_descriptions: Option<&str>,
     used_tools: &std::collections::HashSet<String>,
+    offline: bool,
 ) -> String {
     let mut prompt = String::with_capacity(8192);
 
@@ -716,10 +728,32 @@ pub(crate) fn tool_protocol_system_prompt(
     prompt.push_str(TOOL_DESC_FILE_EDIT);
     prompt.push_str(TOOL_DESC_FILE_SEARCH);
     prompt.push_str(TOOL_DESC_SHELL_EXEC);
+    prompt.push_str(TOOL_DESC_WEB_FETCH);
+    prompt.push_str(TOOL_DESC_WEB_SEARCH);
 
-    // Optional tools (data-driven: included only when present in used_tools)
-    for (tool_name, tool_desc) in OPTIONAL_TOOLS {
+    // Compact catalog: always show one-liner for each optional tool
+    // (filtered by offline mode for web.* tools)
+    let catalog_entries: Vec<&str> = OPTIONAL_TOOLS
+        .iter()
+        .filter(|(name, _, _)| !(offline && name.starts_with("web.")))
+        .map(|(_, _, one_liner)| *one_liner)
+        .collect();
+    if !catalog_entries.is_empty() {
+        prompt.push_str(PROMPT_OPTIONAL_CATALOG_HEADER);
+        for entry in &catalog_entries {
+            prompt.push_str("- ");
+            prompt.push_str(entry);
+            prompt.push('\n');
+        }
+        prompt.push('\n');
+    }
+
+    // Detailed descriptions for used optional tools
+    for (tool_name, tool_desc, _) in OPTIONAL_TOOLS {
         if used_tools.contains(*tool_name) {
+            if offline && tool_name.starts_with("web.") {
+                continue;
+            }
             prompt.push_str(tool_desc);
         }
     }
@@ -767,7 +801,7 @@ pub fn tool_protocol_system_prompt_basic_only(
     mcp_tool_descriptions: Option<&str>,
 ) -> String {
     let empty = std::collections::HashSet::new();
-    tool_protocol_system_prompt(languages, mcp_tool_descriptions, &empty)
+    tool_protocol_system_prompt(languages, mcp_tool_descriptions, &empty, false)
 }
 
 /// Generate a system prompt with all tools included (for test compatibility
@@ -778,7 +812,7 @@ pub fn tool_protocol_system_prompt_all_tools(
 ) -> String {
     let all_tools: std::collections::HashSet<String> =
         optional_tool_names().map(|s| s.to_string()).collect();
-    tool_protocol_system_prompt(languages, mcp_tool_descriptions, &all_tools)
+    tool_protocol_system_prompt(languages, mcp_tool_descriptions, &all_tools, false)
 }
 
 fn extract_fenced_blocks(content: &str, label: &str) -> Vec<String> {
@@ -884,4 +918,65 @@ pub fn generate_mcp_tool_descriptions(tools: &HashMap<String, Vec<McpToolInfo>>)
     }
 
     full_descriptions
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn catalog_hides_web_tools_offline() {
+        let prompt = tool_protocol_system_prompt(&[], None, &HashSet::new(), true);
+        assert!(
+            !prompt.contains("- web.fetch:"),
+            "offline prompt should not contain web.fetch catalog entry"
+        );
+        assert!(
+            !prompt.contains("- web.search:"),
+            "offline prompt should not contain web.search catalog entry"
+        );
+        assert!(
+            prompt.contains("- agent.explore:"),
+            "offline prompt should contain agent.explore catalog entry"
+        );
+        assert!(
+            prompt.contains("- agent.plan:"),
+            "offline prompt should contain agent.plan catalog entry"
+        );
+    }
+
+    #[test]
+    fn catalog_offline_with_restored_session() {
+        let mut used_tools = HashSet::new();
+        used_tools.insert("web.fetch".to_string());
+        let prompt = tool_protocol_system_prompt(&[], None, &used_tools, true);
+        // web.fetch is now a basic tool (always included per Issue #114),
+        // so the catalog entry should not exist but the basic description should.
+        assert!(
+            !prompt.contains("- web.fetch:"),
+            "offline prompt with restored session should not show web.fetch catalog entry"
+        );
+        // web.fetch basic tool description IS present because it's always included
+        assert!(
+            prompt.contains("6. web.fetch"),
+            "web.fetch should be present as a basic tool even in offline mode"
+        );
+    }
+
+    #[test]
+    fn catalog_strings_no_anvil_markers() {
+        for (_, _, one_liner) in OPTIONAL_TOOLS {
+            assert!(
+                !one_liner.contains("ANVIL_TOOL"),
+                "catalog one-liner should not contain ANVIL_TOOL: {}",
+                one_liner
+            );
+            assert!(
+                !one_liner.contains("ANVIL_FINAL"),
+                "catalog one-liner should not contain ANVIL_FINAL: {}",
+                one_liner
+            );
+        }
+    }
 }
