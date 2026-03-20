@@ -2039,6 +2039,7 @@ fn format_tool_result_message_truncates_multibyte_safely() {
     // Must not panic — the old byte-slicing implementation would panic here.
     let msg = format_tool_result_message(&result, 100);
     assert!(msg.contains("truncated"));
+    assert!(msg.contains("chars total"));
     assert!(msg.contains("file.read"));
 }
 
@@ -2059,6 +2060,7 @@ fn format_tool_result_message_ascii_truncation_still_works() {
 
     let msg = format_tool_result_message(&result, 100);
     assert!(msg.contains("truncated"));
+    assert!(msg.contains("chars total"));
 }
 
 #[test]
@@ -2083,8 +2085,141 @@ fn format_tool_result_message_boundary_char_3byte() {
 
     let msg = format_tool_result_message(&result, 100);
     assert!(msg.contains("truncated"));
-    // The truncated portion should contain the CJK char (it's at position 100, within limit)
-    assert!(msg.contains("競"));
+    // Head is 80% of 100 = 80 chars. The CJK char is at position 99 (0-indexed),
+    // so it falls in the omitted middle section. Tail contains trailing 'b's.
+    assert!(msg.contains("chars total"));
+}
+
+// -----------------------------------------------------------------------
+// Issue #117: truncate_with_head_tail unit tests
+// -----------------------------------------------------------------------
+
+#[test]
+fn truncate_with_head_tail_basic() {
+    use anvil::app::agentic::truncate_with_head_tail;
+
+    // 200 chars, max 100, head_pct 80 => head=80, tail=20
+    let content = "a".repeat(200);
+    let result = truncate_with_head_tail(&content, 100, 80);
+
+    // Head: 80 'a's
+    assert!(result.starts_with(&"a".repeat(80)));
+    // Marker present
+    assert!(result.contains("chars truncated"));
+    assert!(result.contains("200 chars total"));
+    // Tail: 20 'a's at the end
+    assert!(result.ends_with(&"a".repeat(20)));
+}
+
+#[test]
+fn truncate_with_head_tail_short_content() {
+    use anvil::app::agentic::truncate_with_head_tail;
+
+    let content = "hello world";
+    let result = truncate_with_head_tail(content, 100, 80);
+    assert_eq!(result, "hello world");
+}
+
+#[test]
+fn truncate_with_head_tail_max_chars_zero() {
+    use anvil::app::agentic::truncate_with_head_tail;
+
+    let content = "a".repeat(500);
+    let result = truncate_with_head_tail(&content, 0, 80);
+    assert!(result.contains("500 chars total"));
+    assert!(result.contains("all truncated"));
+}
+
+#[test]
+fn truncate_with_head_tail_cjk_safety() {
+    use anvil::app::agentic::truncate_with_head_tail;
+
+    // 300 CJK chars, max 100, head_pct 50 => head=50, tail=50
+    let content: String = "漢".repeat(300);
+    let result = truncate_with_head_tail(&content, 100, 50);
+
+    // Should not panic, head = 50 CJK chars, tail = 50 CJK chars
+    assert!(result.contains("chars truncated"));
+    assert!(result.contains("300 chars total"));
+    // Head: 50 CJK chars
+    let head_part: String = "漢".repeat(50);
+    assert!(result.starts_with(&head_part));
+    // Tail: 50 CJK chars
+    let tail_part: String = "漢".repeat(50);
+    assert!(result.ends_with(&tail_part));
+}
+
+#[test]
+fn format_tool_result_message_success_head_priority() {
+    use anvil::app::agentic::format_tool_result_message;
+
+    // 200 distinct chars: 'H' * 100 + 'T' * 100
+    let content = format!("{}{}", "H".repeat(100), "T".repeat(100));
+    let result = ToolExecutionResult {
+        tool_call_id: "call_success".to_string(),
+        tool_name: "shell.exec".to_string(),
+        status: ToolExecutionStatus::Completed,
+        summary: "ok".to_string(),
+        payload: ToolExecutionPayload::Text(content),
+        artifacts: Vec::new(),
+        elapsed_ms: 5,
+    };
+
+    let msg = format_tool_result_message(&result, 100);
+    // Completed => head_pct=80 => head=80, tail=20
+    // Head should have 80 H's
+    assert!(msg.contains(&"H".repeat(80)));
+    // Tail should have 20 T's
+    assert!(msg.contains(&"T".repeat(20)));
+    assert!(msg.contains("truncated"));
+}
+
+#[test]
+fn format_tool_result_message_failure_tail_priority() {
+    use anvil::app::agentic::format_tool_result_message;
+
+    // 200 distinct chars: 'H' * 100 + 'T' * 100
+    let content = format!("{}{}", "H".repeat(100), "T".repeat(100));
+    let result = ToolExecutionResult {
+        tool_call_id: "call_fail".to_string(),
+        tool_name: "shell.exec".to_string(),
+        status: ToolExecutionStatus::Failed,
+        summary: "error".to_string(),
+        payload: ToolExecutionPayload::Text(content),
+        artifacts: Vec::new(),
+        elapsed_ms: 5,
+    };
+
+    let msg = format_tool_result_message(&result, 100);
+    // Failed => head_pct=20 => head=20, tail=80
+    // Head should have 20 H's
+    assert!(msg.contains(&"H".repeat(20)));
+    // Tail should have 80 T's
+    assert!(msg.contains(&"T".repeat(80)));
+    assert!(msg.contains("truncated"));
+}
+
+#[test]
+fn format_tool_result_message_interrupted_tail_priority() {
+    use anvil::app::agentic::format_tool_result_message;
+
+    // 200 distinct chars: 'H' * 100 + 'T' * 100
+    let content = format!("{}{}", "H".repeat(100), "T".repeat(100));
+    let result = ToolExecutionResult {
+        tool_call_id: "call_int".to_string(),
+        tool_name: "shell.exec".to_string(),
+        status: ToolExecutionStatus::Interrupted,
+        summary: "interrupted".to_string(),
+        payload: ToolExecutionPayload::Text(content),
+        artifacts: Vec::new(),
+        elapsed_ms: 5,
+    };
+
+    let msg = format_tool_result_message(&result, 100);
+    // Interrupted => head_pct=20 => head=20, tail=80
+    assert!(msg.contains(&"H".repeat(20)));
+    assert!(msg.contains(&"T".repeat(80)));
+    assert!(msg.contains("truncated"));
 }
 
 // ============================================================
