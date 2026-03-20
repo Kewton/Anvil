@@ -2,6 +2,37 @@
 
 ## [Unreleased]
 
+## [0.0.4] - 2026-03-20
+
+### Added
+- Smart context compression with token-based eviction (#80)
+- TUI elapsed_ms display and tool execution status improvement (#81)
+- Model-based token estimation calibration (#79)
+- Native reqwest HTTP client replacing curl subprocess (#78)
+- DuckDuckGo web.search robustness improvement (#93)
+- Current date/timezone injection into system prompt (#92)
+- Confirm-class tool approval guidance in system prompt
+- Dynamic system prompt generation (#73)
+- @file context injection (#76)
+- Tag-based tool call protocol for small LLMs (#72)
+- Model management UI: /model list, switch, info (#77)
+- Git tools: git.status, git.diff, git.log (#75)
+- Regex search and ripgrep integration for file.search (#74)
+- Named session management (#71)
+- Batch approval with --trust mode (#70)
+- Multi-file atomic edit with transaction rollback (#69)
+- Undo/rollback with checkpoint stack (#68)
+- Auto-detect context window from Ollama /api/show (#65)
+- Inference performance metrics display (#66)
+- Offline mode for complete local operation (#67)
+- User-friendly error UX with guidance (#64)
+
+### Fixed
+- Duplicate [U] you > prompt in interactive CLI (#96)
+- UTF-8 boundary panic with chars-based truncation (#94)
+- ModelNotFound error propagation with user guidance (#86)
+- No-double-confirm for already-approved tools (#95)
+
 ## [0.0.3] - 2026-03-19
 
 ### Added
