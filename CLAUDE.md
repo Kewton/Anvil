@@ -129,14 +129,15 @@ src/
 │   ├── ollama.rs        # Ollamaクライアント
 │   ├── openai.rs        # OpenAI互換クライアント
 │   └── transport.rs     # HTTPトランスポート
-├── retrieval/mod.rs     # リポジトリ検索
+├── retrieval/mod.rs     # リポジトリ検索（オンデマンドコンテンツ読込・軽量キャッシュ）
 ├── session/mod.rs       # セッション永続化（名前付きセッション・一覧・切替・削除・マイグレーション）
 ├── spinner.rs           # スピナーUI
 ├── state/mod.rs         # 状態マシン
 ├── tooling/
 │   ├── mod.rs           # ツール実行・検証・CheckpointStack（undo用チェックポイント管理）
 │   └── diff.rs          # 差分プレビュー生成（file.write/file.edit承認時）
-└── tui/mod.rs           # TUI描画
+├── tui/mod.rs           # TUI描画
+└── walk.rs              # 共通ディレクトリウォーカー（.gitignore対応・統一スキップ/バイナリ除外）
 tests/
 ├── cli_session.rs       # CLIセッションテスト
 ├── config_bootstrap.rs  # 設定テスト
@@ -148,7 +149,8 @@ tests/
 ├── tui_console.rs       # TUIテスト
 ├── skills_system.rs     # スキルシステムテスト
 ├── hooks_system.rs      # フックシステムテスト
-└── context_inject.rs    # コンテキスト注入テスト
+├── context_inject.rs    # コンテキスト注入テスト
+└── walk_system.rs       # ディレクトリウォーカーテスト
 ```
 
 ---
