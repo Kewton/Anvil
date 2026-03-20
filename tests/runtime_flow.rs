@@ -606,3 +606,22 @@ fn build_subagent_system_prompt_plan_contains_expected_tools() {
         "Plan prompt should mention Plan role"
     );
 }
+
+// -----------------------------------------------------------------------
+// Issue #114: web.search/web.fetch must be in system prompt for fresh sessions
+// -----------------------------------------------------------------------
+
+#[test]
+fn system_prompt_includes_web_tools_even_with_empty_used_tools() {
+    use anvil::agent::{ProjectLanguage, tool_protocol_system_prompt_basic_only};
+    // Simulate a fresh session where no tools have been used yet
+    let prompt = tool_protocol_system_prompt_basic_only(&[ProjectLanguage::Rust], None);
+    assert!(
+        prompt.contains("web.search"),
+        "fresh session system prompt must include web.search description (Issue #114)"
+    );
+    assert!(
+        prompt.contains("web.fetch"),
+        "fresh session system prompt must include web.fetch description (Issue #114)"
+    );
+}

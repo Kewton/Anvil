@@ -480,6 +480,7 @@ impl App {
             &self.detected_languages,
             self.mcp_descriptions.as_deref(),
             effective_used_tools,
+            self.config.mode.offline,
         );
 
         // Current date and timezone (dynamic, re-evaluated per turn)

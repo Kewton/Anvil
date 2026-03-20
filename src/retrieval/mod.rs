@@ -255,6 +255,7 @@ fn score_file(root: &Path, file: &IndexedFile, needle: &str) -> Option<Retrieval
 
 fn compute_manifest_hash(files: &[IndexedFile]) -> u64 {
     let mut hasher = DefaultHasher::new();
+<<<<<<< HEAD
     files.len().hash(&mut hasher);
     let mut total_size: u64 = 0;
     let mut max_mtime: u128 = 0;
@@ -263,9 +264,14 @@ fn compute_manifest_hash(files: &[IndexedFile]) -> u64 {
         if entry.modified_ms > max_mtime {
             max_mtime = entry.modified_ms;
         }
+=======
+    manifest.len().hash(&mut hasher);
+    for entry in manifest {
+        entry.relative_path.hash(&mut hasher);
+        entry.size_bytes.hash(&mut hasher);
+        entry.modified_ms.hash(&mut hasher);
+>>>>>>> origin/develop
     }
-    total_size.hash(&mut hasher);
-    max_mtime.hash(&mut hasher);
     hasher.finish()
 }
 
