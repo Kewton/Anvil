@@ -2470,35 +2470,11 @@ fn collect_search_matches_v2(
         return Ok(());
     }
 
-    let entries = fs::read_dir(root).map_err(|err| {
-        ToolRuntimeError::Io(format!("file.search failed for {}: {err}", root.display()))
-    })?;
-    for entry in entries {
+    for path in crate::walk::walk(root) {
         if results.len() >= MAX_SEARCH_RESULTS {
             break;
         }
-        let entry = entry.map_err(|err| {
-            ToolRuntimeError::Io(format!(
-                "file.search failed while reading {}: {err}",
-                root.display()
-            ))
-        })?;
-        let path = entry.path();
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-
-        // Skip common non-project directories
-        if path.is_dir() {
-            if matches!(
-                name_str.as_ref(),
-                ".git" | "target" | ".anvil" | "node_modules" | ".DS_Store"
-            ) {
-                continue;
-            }
-            collect_search_matches_v2(&path, pattern, context_lines, results, total_count)?;
-        } else {
-            check_file_match_v2(&path, pattern, context_lines, results, total_count);
-        }
+        check_file_match_v2(&path, pattern, context_lines, results, total_count);
     }
     Ok(())
 }
@@ -2528,10 +2504,6 @@ fn check_file_match_v2(
                 matched_lines: Vec::new(), // path-only match
             });
         }
-        return;
-    }
-
-    if !is_searchable_file(path) {
         return;
     }
 
@@ -2648,35 +2620,6 @@ fn format_file_search_results(
 
         (ToolExecutionPayload::Text(output), artifacts)
     }
-}
-
-/// Check if a file is likely to be text and worth searching.
-fn is_searchable_file(path: &Path) -> bool {
-    !matches!(
-        path.extension().and_then(|ext| ext.to_str()),
-        Some(
-            "png"
-                | "jpg"
-                | "jpeg"
-                | "gif"
-                | "pdf"
-                | "zip"
-                | "gz"
-                | "tar"
-                | "wasm"
-                | "ico"
-                | "exe"
-                | "dll"
-                | "so"
-                | "dylib"
-                | "o"
-                | "a"
-                | "class"
-                | "pyc"
-                | "pyo"
-                | "lock"
-        )
-    )
 }
 
 // ---------------------------------------------------------------------------

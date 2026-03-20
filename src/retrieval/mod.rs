@@ -68,7 +68,7 @@ impl RepositoryIndex {
     pub fn build(root: &Path) -> Result<Self, RetrievalError> {
         let mut files = Vec::new();
         let mut manifest = Vec::new();
-        collect_files(root, root, &mut files, &mut manifest)?;
+        collect_files(root, &mut files, &mut manifest);
         manifest.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
         let manifest_hash = compute_manifest_hash(&manifest);
         Ok(Self {
@@ -131,7 +131,7 @@ impl RepositoryIndex {
 
     fn is_current_for(&self, root: &Path) -> Result<bool, RetrievalError> {
         let mut current = Vec::new();
-        collect_manifest(root, root, &mut current)?;
+        collect_manifest(root, &mut current);
         current.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
         let current_hash = compute_manifest_hash(&current);
         if current_hash != self.manifest_hash {
@@ -158,32 +158,8 @@ pub fn render_retrieval_result(result: &RetrievalResult) -> String {
     lines.join("\n")
 }
 
-fn collect_files(
-    root: &Path,
-    current: &Path,
-    files: &mut Vec<IndexedFile>,
-    manifest: &mut Vec<IndexedFileMeta>,
-) -> Result<(), RetrievalError> {
-    let entries = fs::read_dir(current).map_err(RetrievalError::Walk)?;
-    for entry in entries {
-        let entry = entry.map_err(RetrievalError::Walk)?;
-        let path = entry.path();
-        let file_name = entry.file_name();
-        let file_name = file_name.to_string_lossy();
-
-        if should_skip(&file_name, &path) {
-            continue;
-        }
-
-        if path.is_dir() {
-            collect_files(root, &path, files, manifest)?;
-            continue;
-        }
-
-        if !path.is_file() || is_binary_path(&path) {
-            continue;
-        }
-
+fn collect_files(root: &Path, files: &mut Vec<IndexedFile>, manifest: &mut Vec<IndexedFileMeta>) {
+    for path in crate::walk::walk(root) {
         let relative = path
             .strip_prefix(root)
             .unwrap_or(&path)
@@ -201,33 +177,10 @@ fn collect_files(
             content,
         });
     }
-
-    Ok(())
 }
 
-fn collect_manifest(
-    root: &Path,
-    current: &Path,
-    manifest: &mut Vec<IndexedFileMeta>,
-) -> Result<(), RetrievalError> {
-    let entries = fs::read_dir(current).map_err(RetrievalError::Walk)?;
-    for entry in entries {
-        let entry = entry.map_err(RetrievalError::Walk)?;
-        let path = entry.path();
-        let file_name = entry.file_name();
-        let file_name = file_name.to_string_lossy();
-
-        if should_skip(&file_name, &path) {
-            continue;
-        }
-        if path.is_dir() {
-            collect_manifest(root, &path, manifest)?;
-            continue;
-        }
-        if !path.is_file() || is_binary_path(&path) {
-            continue;
-        }
-
+fn collect_manifest(root: &Path, manifest: &mut Vec<IndexedFileMeta>) {
+    for path in crate::walk::walk(root) {
         let relative = path
             .strip_prefix(root)
             .unwrap_or(&path)
@@ -237,29 +190,10 @@ fn collect_manifest(
             manifest.push(meta);
         }
     }
-    Ok(())
 }
 
 pub fn default_cache_path(state_dir: &Path) -> PathBuf {
     state_dir.join("retrieval-index.json")
-}
-
-fn should_skip(file_name: &str, path: &Path) -> bool {
-    file_name == ".git"
-        || file_name == "target"
-        || file_name == ".anvil"
-        || file_name == ".DS_Store"
-        || path.components().any(|component| {
-            let text = component.as_os_str().to_string_lossy();
-            text == ".git" || text == "target" || text == ".anvil"
-        })
-}
-
-fn is_binary_path(path: &Path) -> bool {
-    matches!(
-        path.extension().and_then(|ext| ext.to_str()),
-        Some("png" | "jpg" | "jpeg" | "gif" | "pdf" | "zip" | "gz" | "wasm" | "ico")
-    )
 }
 
 fn score_file(file: &IndexedFile, needle: &str) -> Option<RetrievalMatch> {
