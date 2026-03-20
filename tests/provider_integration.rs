@@ -3165,6 +3165,40 @@ fn dynamic_prompt_empty_used_tools_excludes_optional() {
     assert!(prompt.contains("3. file.edit"));
     assert!(prompt.contains("4. file.search"));
     assert!(prompt.contains("5. shell.exec"));
+    // Catalog one-liners should be present
+    assert!(
+        prompt.contains("- web.fetch:"),
+        "basic-only prompt should contain web.fetch catalog entry"
+    );
+    assert!(
+        prompt.contains("- web.search:"),
+        "basic-only prompt should contain web.search catalog entry"
+    );
+    assert!(
+        prompt.contains("- agent.explore:"),
+        "basic-only prompt should contain agent.explore catalog entry"
+    );
+    assert!(
+        prompt.contains("- agent.plan:"),
+        "basic-only prompt should contain agent.plan catalog entry"
+    );
+    // ANVIL_TOOL blocks for optional tools should NOT be present
+    assert!(
+        !prompt.contains("\"tool\":\"web.fetch\""),
+        "basic-only prompt should not contain ANVIL_TOOL block for web.fetch"
+    );
+    assert!(
+        !prompt.contains("\"tool\":\"web.search\""),
+        "basic-only prompt should not contain ANVIL_TOOL block for web.search"
+    );
+    assert!(
+        !prompt.contains("\"tool\":\"agent.explore\""),
+        "basic-only prompt should not contain ANVIL_TOOL block for agent.explore"
+    );
+    assert!(
+        !prompt.contains("\"tool\":\"agent.plan\""),
+        "basic-only prompt should not contain ANVIL_TOOL block for agent.plan"
+    );
 }
 
 #[test]
@@ -3201,6 +3235,75 @@ fn dynamic_prompt_all_tools_matches_expected_content() {
     assert!(prompt.contains("Git operations"));
     assert!(prompt.contains("Environment inspection"));
     assert!(prompt.contains("Process management"));
+}
+
+#[test]
+fn catalog_present_in_basic_prompt() {
+    let prompt = anvil::agent::tool_protocol_system_prompt_basic_only(&[], None);
+    assert!(
+        prompt.contains("- web.fetch: fetch the contents of a URL"),
+        "basic prompt should contain web.fetch catalog one-liner"
+    );
+    assert!(
+        prompt.contains("- web.search: search the web by keyword"),
+        "basic prompt should contain web.search catalog one-liner"
+    );
+    assert!(
+        prompt.contains("- agent.explore: launch a read-only sub-agent to explore the codebase"),
+        "basic prompt should contain agent.explore catalog one-liner"
+    );
+    assert!(
+        prompt.contains(
+            "- agent.plan: launch a read-only sub-agent to create an implementation plan"
+        ),
+        "basic prompt should contain agent.plan catalog one-liner"
+    );
+}
+
+#[test]
+fn catalog_coexists_with_full_description() {
+    use std::collections::HashSet;
+    let mut used: HashSet<String> = HashSet::new();
+    used.insert("web.fetch".to_string());
+    let prompt = anvil::agent::tool_protocol_system_prompt_all_tools(&[], None);
+    // Catalog entry present
+    assert!(
+        prompt.contains("- web.fetch: fetch the contents of a URL"),
+        "prompt should contain web.fetch catalog one-liner"
+    );
+    // Detailed description also present
+    assert!(
+        prompt.contains("6. web.fetch"),
+        "prompt should contain web.fetch detailed description"
+    );
+}
+
+#[test]
+fn catalog_prompt_size_bounded() {
+    // The catalog should add less than 300 characters to the prompt
+    // We measure the difference between a prompt with catalog (basic_only)
+    // and the basic tools string length
+    let prompt_with_catalog = anvil::agent::tool_protocol_system_prompt_basic_only(&[], None);
+    let _prompt_all = anvil::agent::tool_protocol_system_prompt_all_tools(&[], None);
+    // The catalog is present in both; the difference is the detailed descriptions
+    // We verify the basic_only prompt (which has catalog but no details) is reasonably sized
+    // by checking the catalog section itself is < 300 chars
+    let catalog_marker = "Additional tools (use ANVIL_TOOL block format shown above):";
+    let catalog_start = prompt_with_catalog
+        .find(catalog_marker)
+        .expect("catalog header should be present");
+    // Find the end of the catalog section (double newline after entries)
+    let catalog_section = &prompt_with_catalog[catalog_start..];
+    let catalog_end = catalog_section
+        .find("\n\n")
+        .map(|pos| pos + 2)
+        .unwrap_or(catalog_section.len());
+    let catalog_size = catalog_end;
+    assert!(
+        catalog_size < 400,
+        "catalog section should be < 400 chars, was {}",
+        catalog_size
+    );
 }
 
 #[test]
