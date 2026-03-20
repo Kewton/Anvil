@@ -572,9 +572,9 @@ const TOOL_DESC_AGENT_PLAN: &str = concat!(
 );
 
 /// Data-driven definition of optional tools: (tool_name, tool_description).
+/// Note: web.fetch and web.search were moved to basic tools (always included)
+/// because LLMs cannot discover them without prompt descriptions. See Issue #114.
 const OPTIONAL_TOOLS: &[(&str, &str)] = &[
-    ("web.fetch", TOOL_DESC_WEB_FETCH),
-    ("web.search", TOOL_DESC_WEB_SEARCH),
     ("agent.explore", TOOL_DESC_AGENT_EXPLORE),
     ("agent.plan", TOOL_DESC_AGENT_PLAN),
 ];
@@ -716,6 +716,8 @@ pub(crate) fn tool_protocol_system_prompt(
     prompt.push_str(TOOL_DESC_FILE_EDIT);
     prompt.push_str(TOOL_DESC_FILE_SEARCH);
     prompt.push_str(TOOL_DESC_SHELL_EXEC);
+    prompt.push_str(TOOL_DESC_WEB_FETCH);
+    prompt.push_str(TOOL_DESC_WEB_SEARCH);
 
     // Optional tools (data-driven: included only when present in used_tools)
     for (tool_name, tool_desc) in OPTIONAL_TOOLS {

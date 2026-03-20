@@ -3141,22 +3141,23 @@ fn dynamic_prompt_basic_tools_always_included() {
 
 #[test]
 fn dynamic_prompt_empty_used_tools_excludes_optional() {
-    // When used_tools is empty, optional tools should NOT be in the prompt
+    // When used_tools is empty, only agent.explore/agent.plan should be excluded.
+    // web.fetch and web.search are now basic tools (always included) per Issue #114.
     let prompt = anvil::agent::tool_protocol_system_prompt_basic_only(&[], None);
     assert!(
-        !prompt.contains("6. web.fetch"),
-        "basic-only prompt should not contain web.fetch description"
+        prompt.contains("web.fetch"),
+        "basic-only prompt should contain web.fetch (now a basic tool, Issue #114)"
     );
     assert!(
-        !prompt.contains("7. web.search"),
-        "basic-only prompt should not contain web.search description"
+        prompt.contains("web.search"),
+        "basic-only prompt should contain web.search (now a basic tool, Issue #114)"
     );
     assert!(
-        !prompt.contains("8. agent.explore"),
+        !prompt.contains("agent.explore"),
         "basic-only prompt should not contain agent.explore description"
     );
     assert!(
-        !prompt.contains("9. agent.plan"),
+        !prompt.contains("agent.plan"),
         "basic-only prompt should not contain agent.plan description"
     );
     // Basic tools must still be present
