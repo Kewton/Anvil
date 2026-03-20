@@ -54,7 +54,7 @@ const TOOL_DESC_FILE_READ: &str = r#"- file.read — read a file or list a direc
 
 "#;
 
-pub(crate) const TOOL_DESC_FILE_SEARCH: &str = r#"- file.search — search for files by name or content (supports regex and context lines):
+pub(crate) const TOOL_DESC_FILE_SEARCH: &str = r#"- file.search — search for files by name or content (respects .gitignore, supports regex and context lines):
 ```ANVIL_TOOL
 {"id":"call_002","tool":"file.search","root":".","pattern":"search term"}
 ```

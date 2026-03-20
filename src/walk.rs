@@ -41,16 +41,16 @@ pub fn walk(root: &Path) -> impl Iterator<Item = PathBuf> {
         .max_depth(Some(20))
         .filter_entry(|entry| {
             // For directories, check if they should be skipped
-            if entry.file_type().map_or(false, |ft| ft.is_dir()) {
-                if let Some(name) = entry.file_name().to_str() {
-                    return !should_skip_dir(name);
-                }
+            if entry.file_type().is_some_and(|ft| ft.is_dir())
+                && let Some(name) = entry.file_name().to_str()
+            {
+                return !should_skip_dir(name);
             }
             true
         })
         .build()
         .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_type().map_or(false, |ft| ft.is_file()))
+        .filter(|entry| entry.file_type().is_some_and(|ft| ft.is_file()))
         .filter(|entry| !is_binary(entry.path()))
         .map(|entry| entry.into_path())
 }

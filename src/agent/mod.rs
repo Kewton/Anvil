@@ -519,7 +519,7 @@ const TOOL_DESC_FILE_EDIT: &str = concat!(
 );
 
 const TOOL_DESC_FILE_SEARCH: &str = concat!(
-    "4. file.search — search for files by name or content:\n",
+    "4. file.search — search for files by name or content (respects .gitignore):\n",
     "```ANVIL_TOOL\n",
     "{\"id\":\"call_003\",\"tool\":\"file.search\",\"root\":\".\",\"pattern\":\"search term\"}\n",
     "```\n",
