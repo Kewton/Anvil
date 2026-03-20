@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+## [0.0.5] - 2026-03-21
+
+### Added
+- Repository search improvement with gitignore support and ranking (#116)
+- Tool result handling improvement for long outputs (#117)
+- Optional tools exposure in system prompt before first use (#115)
+- Cache invalidation strengthening with per-entry manifest hashing (#118)
+- Release skill update to use git worktree + commandmatedev
+
+### Fixed
+- Web search/fetch inclusion in system prompt for fresh sessions (#114)
+- Clippy map_or → is_some_and style fix
+
 ## [0.0.4] - 2026-03-20
 
 ### Added
