@@ -316,16 +316,11 @@ fn compact_line(line: &str) -> String {
 fn compute_manifest_hash(manifest: &[IndexedFileMeta]) -> u64 {
     let mut hasher = DefaultHasher::new();
     manifest.len().hash(&mut hasher);
-    let mut total_size: u64 = 0;
-    let mut max_mtime: u128 = 0;
     for entry in manifest {
-        total_size += entry.size_bytes;
-        if entry.modified_ms > max_mtime {
-            max_mtime = entry.modified_ms;
-        }
+        entry.relative_path.hash(&mut hasher);
+        entry.size_bytes.hash(&mut hasher);
+        entry.modified_ms.hash(&mut hasher);
     }
-    total_size.hash(&mut hasher);
-    max_mtime.hash(&mut hasher);
     hasher.finish()
 }
 

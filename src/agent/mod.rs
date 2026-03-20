@@ -572,17 +572,9 @@ const TOOL_DESC_AGENT_PLAN: &str = concat!(
 );
 
 /// Data-driven definition of optional tools: (tool_name, tool_description, catalog_one_liner).
+/// Note: web.fetch and web.search were moved to basic tools (always included)
+/// because LLMs cannot discover them without prompt descriptions. See Issue #114.
 const OPTIONAL_TOOLS: &[(&str, &str, &str)] = &[
-    (
-        "web.fetch",
-        TOOL_DESC_WEB_FETCH,
-        "web.fetch: fetch the contents of a URL",
-    ),
-    (
-        "web.search",
-        TOOL_DESC_WEB_SEARCH,
-        "web.search: search the web by keyword",
-    ),
     (
         "agent.explore",
         TOOL_DESC_AGENT_EXPLORE,
@@ -736,6 +728,8 @@ pub(crate) fn tool_protocol_system_prompt(
     prompt.push_str(TOOL_DESC_FILE_EDIT);
     prompt.push_str(TOOL_DESC_FILE_SEARCH);
     prompt.push_str(TOOL_DESC_SHELL_EXEC);
+    prompt.push_str(TOOL_DESC_WEB_FETCH);
+    prompt.push_str(TOOL_DESC_WEB_SEARCH);
 
     // Compact catalog: always show one-liner for each optional tool
     // (filtered by offline mode for web.* tools)
@@ -957,15 +951,16 @@ mod tests {
         let mut used_tools = HashSet::new();
         used_tools.insert("web.fetch".to_string());
         let prompt = tool_protocol_system_prompt(&[], None, &used_tools, true);
-        // Catalog should not show web.fetch
+        // web.fetch is now a basic tool (always included per Issue #114),
+        // so the catalog entry should not exist but the basic description should.
         assert!(
             !prompt.contains("- web.fetch:"),
-            "offline prompt with restored session should not show web.fetch catalog"
+            "offline prompt with restored session should not show web.fetch catalog entry"
         );
-        // Detailed web.fetch description should also be absent
+        // web.fetch basic tool description IS present because it's always included
         assert!(
-            !prompt.contains("6. web.fetch"),
-            "offline prompt with restored session should not show web.fetch detail"
+            prompt.contains("6. web.fetch"),
+            "web.fetch should be present as a basic tool even in offline mode"
         );
     }
 

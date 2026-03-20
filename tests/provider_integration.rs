@@ -3141,23 +3141,17 @@ fn dynamic_prompt_basic_tools_always_included() {
 
 #[test]
 fn dynamic_prompt_empty_used_tools_excludes_optional() {
-    // When used_tools is empty, optional tools should NOT be in the prompt
+    // When used_tools is empty, optional tool detailed descriptions (agent.explore,
+    // agent.plan) should be excluded. web.fetch and web.search are basic tools
+    // (always included) per Issue #114.
     let prompt = anvil::agent::tool_protocol_system_prompt_basic_only(&[], None);
     assert!(
-        !prompt.contains("6. web.fetch"),
-        "basic-only prompt should not contain web.fetch description"
+        prompt.contains("web.fetch"),
+        "basic-only prompt should contain web.fetch (now a basic tool, Issue #114)"
     );
     assert!(
-        !prompt.contains("7. web.search"),
-        "basic-only prompt should not contain web.search description"
-    );
-    assert!(
-        !prompt.contains("8. agent.explore"),
-        "basic-only prompt should not contain agent.explore description"
-    );
-    assert!(
-        !prompt.contains("9. agent.plan"),
-        "basic-only prompt should not contain agent.plan description"
+        prompt.contains("web.search"),
+        "basic-only prompt should contain web.search (now a basic tool, Issue #114)"
     );
     // Basic tools must still be present
     assert!(prompt.contains("1. file.read"));
@@ -3165,15 +3159,7 @@ fn dynamic_prompt_empty_used_tools_excludes_optional() {
     assert!(prompt.contains("3. file.edit"));
     assert!(prompt.contains("4. file.search"));
     assert!(prompt.contains("5. shell.exec"));
-    // Catalog one-liners should be present
-    assert!(
-        prompt.contains("- web.fetch:"),
-        "basic-only prompt should contain web.fetch catalog entry"
-    );
-    assert!(
-        prompt.contains("- web.search:"),
-        "basic-only prompt should contain web.search catalog entry"
-    );
+    // Catalog one-liners for remaining optional tools should be present
     assert!(
         prompt.contains("- agent.explore:"),
         "basic-only prompt should contain agent.explore catalog entry"
@@ -3182,15 +3168,16 @@ fn dynamic_prompt_empty_used_tools_excludes_optional() {
         prompt.contains("- agent.plan:"),
         "basic-only prompt should contain agent.plan catalog entry"
     );
-    // ANVIL_TOOL blocks for optional tools should NOT be present
+    // web.fetch/web.search are no longer in OPTIONAL_TOOLS catalog (they are basic tools)
     assert!(
-        !prompt.contains("\"tool\":\"web.fetch\""),
-        "basic-only prompt should not contain ANVIL_TOOL block for web.fetch"
+        !prompt.contains("- web.fetch:"),
+        "basic-only prompt should not contain web.fetch catalog entry (now basic tool)"
     );
     assert!(
-        !prompt.contains("\"tool\":\"web.search\""),
-        "basic-only prompt should not contain ANVIL_TOOL block for web.search"
+        !prompt.contains("- web.search:"),
+        "basic-only prompt should not contain web.search catalog entry (now basic tool)"
     );
+    // ANVIL_TOOL blocks for optional tools should NOT be present in basic-only mode
     assert!(
         !prompt.contains("\"tool\":\"agent.explore\""),
         "basic-only prompt should not contain ANVIL_TOOL block for agent.explore"
@@ -3240,14 +3227,16 @@ fn dynamic_prompt_all_tools_matches_expected_content() {
 #[test]
 fn catalog_present_in_basic_prompt() {
     let prompt = anvil::agent::tool_protocol_system_prompt_basic_only(&[], None);
+    // web.fetch and web.search are now basic tools (Issue #114), not in catalog
     assert!(
-        prompt.contains("- web.fetch: fetch the contents of a URL"),
-        "basic prompt should contain web.fetch catalog one-liner"
+        !prompt.contains("- web.fetch: fetch the contents of a URL"),
+        "basic prompt should not contain web.fetch catalog one-liner (now basic tool)"
     );
     assert!(
-        prompt.contains("- web.search: search the web by keyword"),
-        "basic prompt should contain web.search catalog one-liner"
+        !prompt.contains("- web.search: search the web by keyword"),
+        "basic prompt should not contain web.search catalog one-liner (now basic tool)"
     );
+    // agent.explore and agent.plan remain as optional tools in catalog
     assert!(
         prompt.contains("- agent.explore: launch a read-only sub-agent to explore the codebase"),
         "basic prompt should contain agent.explore catalog one-liner"
@@ -3262,19 +3251,21 @@ fn catalog_present_in_basic_prompt() {
 
 #[test]
 fn catalog_coexists_with_full_description() {
-    use std::collections::HashSet;
-    let mut used: HashSet<String> = HashSet::new();
-    used.insert("web.fetch".to_string());
     let prompt = anvil::agent::tool_protocol_system_prompt_all_tools(&[], None);
-    // Catalog entry present
+    // agent.explore catalog entry present
     assert!(
-        prompt.contains("- web.fetch: fetch the contents of a URL"),
-        "prompt should contain web.fetch catalog one-liner"
+        prompt.contains("- agent.explore: launch a read-only sub-agent to explore the codebase"),
+        "prompt should contain agent.explore catalog one-liner"
     );
-    // Detailed description also present
+    // Detailed description also present (when in used_tools via all_tools)
+    assert!(
+        prompt.contains("8. agent.explore"),
+        "prompt should contain agent.explore detailed description"
+    );
+    // web.fetch is now a basic tool, always present as detailed description
     assert!(
         prompt.contains("6. web.fetch"),
-        "prompt should contain web.fetch detailed description"
+        "prompt should contain web.fetch as basic tool description"
     );
 }
 
