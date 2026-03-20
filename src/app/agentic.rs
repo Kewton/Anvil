@@ -1034,6 +1034,39 @@ pub(crate) fn infer_plan_from_structured_response(
     plan
 }
 
+/// Head+Tail truncation: 先頭と末尾を保持し、中間を省略する。
+/// head_pct: headに割り当てるパーセンテージ (0〜100)
+/// max_chars: コンテンツの文字数予算（marker文字列は含まない）
+/// 最終出力長: max_chars + marker文字列長（約60文字）
+pub fn truncate_with_head_tail(content: &str, max_chars: usize, head_pct: usize) -> String {
+    let total_chars = content.chars().count(); // O(n), 1回だけ呼ぶ
+    if total_chars <= max_chars {
+        return content.to_string();
+    }
+    if max_chars == 0 {
+        return format!("... [{} chars total, all truncated] ...", total_chars);
+    }
+
+    let head_pct = head_pct.min(100); // clamp to prevent underflow
+    let head_chars = max_chars / 100 * head_pct + (max_chars % 100) * head_pct / 100; // overflow-safe
+    let tail_chars = max_chars - head_chars;
+    let omitted = total_chars - head_chars - tail_chars;
+
+    // head: 先頭 head_chars 文字（UTF-8安全）
+    let head: String = content.chars().take(head_chars).collect();
+
+    // tail: 末尾 tail_chars 文字（UTF-8安全）
+    let tail: String = {
+        let skip_count = total_chars - tail_chars;
+        content.chars().skip(skip_count).collect()
+    };
+
+    format!(
+        "{}\n\n... [{} chars truncated, {} chars total] ...\n\n{}",
+        head, omitted, total_chars, tail
+    )
+}
+
 /// Format a tool execution result into a message that the LLM can interpret.
 ///
 /// Includes the actual payload (file content, search matches) so the LLM
@@ -1044,16 +1077,11 @@ pub fn format_tool_result_message(result: &ToolExecutionResult, max_chars: usize
             format!("[tool result: {}] {}", result.tool_name, result.summary)
         }
         ToolExecutionPayload::Text(content) => {
-            let truncated = if content.chars().count() > max_chars {
-                let cut: String = content.chars().take(max_chars).collect();
-                format!(
-                    "{}...\n[truncated, {} chars total]",
-                    cut,
-                    content.chars().count()
-                )
-            } else {
-                content.clone()
+            let head_pct = match &result.status {
+                ToolExecutionStatus::Completed => 80,
+                ToolExecutionStatus::Failed | ToolExecutionStatus::Interrupted => 20,
             };
+            let truncated = truncate_with_head_tail(content, max_chars, head_pct);
             format!(
                 "[tool result: {}] {}\n{}",
                 result.tool_name, result.summary, truncated
