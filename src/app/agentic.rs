@@ -20,7 +20,7 @@ use crate::tui::Tui;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::tooling::PermissionClass;
+use crate::tooling::{PermissionClass, effective_permission_class};
 use std::collections::HashSet;
 
 use super::policy::{OFFLINE_BLOCK_PAYLOAD, check_offline_blocked};
@@ -512,10 +512,11 @@ impl App {
             }
 
             if self.config.mode.approval_required && validated.approval_required(true).is_some() {
+                let effective_perm = effective_permission_class(&call.input, &validated.spec);
                 if is_trusted(
                     &call.tool_name,
                     validated.spec.kind,
-                    validated.spec.permission_class,
+                    effective_perm,
                     self.trust_all,
                     &self.trusted_tools,
                 ) {

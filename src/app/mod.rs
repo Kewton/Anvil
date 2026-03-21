@@ -374,7 +374,7 @@ impl App {
         // Offline mode: warn about shell.exec network access
         if config.mode.offline {
             eprintln!(
-                "Warning: shell.exec can still access the network in offline mode. For full network isolation, use OS/firewall-level controls."
+                "Warning: shell.exec のネットワークコマンド（curl, wget等）は offline mode でブロックされます。エイリアスやスクリプト経由のアクセスは検出されない場合があります。完全なネットワーク遮断には OS/ファイアウォールレベルの制御を使用してください。"
             );
         }
 
