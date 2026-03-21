@@ -100,7 +100,10 @@ src/
 ├── lib.rs               # モジュール宣言
 ├── agent/
 │   ├── mod.rs           # エージェントループ・プロトコル
-│   └── subagent.rs      # サブエージェント実行ループ（Explore/Plan）
+│   ├── model_classifier.rs # モデル分類・ToolProtocolMode判定
+│   ├── subagent.rs      # サブエージェント実行ループ（Explore/Plan）
+│   ├── tag_parser.rs    # タグベースツール呼び出しパーサー（多層プロトコル対応）
+│   └── tag_spec.rs      # ツールタグ仕様テーブル（TOOL_TAG_SPECS）
 ├── app/
 │   ├── mod.rs           # アプリケーションオーケストレータ
 │   ├── agentic.rs       # agenticツール実行ループ

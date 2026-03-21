@@ -4234,3 +4234,186 @@ mod captcha_blocked_error {
         );
     }
 }
+
+// --- Issue #128: file.edit_anchor and fallback tests ---
+
+use anvil::tooling::AnchorEditParams;
+
+#[test]
+fn file_edit_anchor_registered_in_registry() {
+    let registry = build_registry();
+    let spec = registry
+        .get("file.edit_anchor")
+        .expect("file.edit_anchor should be registered");
+    assert_eq!(spec.kind, ToolKind::FileEditAnchor);
+    assert_eq!(spec.execution_class, ExecutionClass::Mutating);
+    assert_eq!(spec.permission_class, PermissionClass::Confirm);
+    assert_eq!(spec.execution_mode, ExecutionMode::SequentialOnly);
+    assert_eq!(spec.plan_mode, PlanModePolicy::Allowed);
+    assert_eq!(spec.rollback_policy, RollbackPolicy::CheckpointBeforeWrite);
+}
+
+#[test]
+fn file_edit_anchor_validates_typed_tool_input() {
+    let registry = build_registry();
+    let valid = ToolCallRequest::new(
+        "call_anchor_001",
+        "file.edit_anchor",
+        ToolInput::FileEditAnchor {
+            path: "./src/main.rs".to_string(),
+            params: AnchorEditParams {
+                old_content: "fn old()".to_string(),
+                new_content: "fn new()".to_string(),
+            },
+        },
+    );
+    assert!(registry.validate(valid).is_ok());
+}
+
+#[test]
+fn file_edit_anchor_execution_indent_normalized_match() {
+    let root = std::env::temp_dir().join("anvil_anchor_indent_match");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("dir should exist");
+    // File has 4-space indentation
+    let file_content = "fn main() {\n    let x = 1;\n    let y = 2;\n}\n";
+    fs::write(root.join("test.rs"), file_content).expect("write should succeed");
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
+    // Pattern has no indentation — should match via normalization
+    let result = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_anchor_exec_001".to_string(),
+            spec: build_registry()
+                .get("file.edit_anchor")
+                .expect("file.edit_anchor spec")
+                .clone(),
+            input: ToolInput::FileEditAnchor {
+                path: "./test.rs".to_string(),
+                params: AnchorEditParams {
+                    old_content: "let x = 1;\nlet y = 2;".to_string(),
+                    new_content: "let x = 10;\nlet y = 20;".to_string(),
+                },
+            },
+        })
+        .expect("anchor edit should succeed");
+
+    assert_eq!(result.status, ToolExecutionStatus::Completed);
+    let content = fs::read_to_string(root.join("test.rs")).expect("read should succeed");
+    assert!(
+        content.contains("let x = 10;"),
+        "edited content should contain new values, got: {content}"
+    );
+    assert!(
+        content.contains("let y = 20;"),
+        "edited content should contain new values, got: {content}"
+    );
+}
+
+#[test]
+fn file_edit_anchor_execution_no_match_error() {
+    let root = std::env::temp_dir().join("anvil_anchor_no_match");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("dir should exist");
+    fs::write(root.join("test.rs"), "fn main() {}\n").expect("write should succeed");
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
+    let err = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_anchor_nm_001".to_string(),
+            spec: build_registry()
+                .get("file.edit_anchor")
+                .expect("file.edit_anchor spec")
+                .clone(),
+            input: ToolInput::FileEditAnchor {
+                path: "./test.rs".to_string(),
+                params: AnchorEditParams {
+                    old_content: "nonexistent code".to_string(),
+                    new_content: "replacement".to_string(),
+                },
+            },
+        })
+        .expect_err("should fail when old_content not found");
+
+    assert!(err.to_string().contains("not found"));
+}
+
+#[test]
+fn file_edit_anchor_execution_multiple_matches_error() {
+    let root = std::env::temp_dir().join("anvil_anchor_multi_match");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("dir should exist");
+    let file_content = "let x = 1;\nlet x = 1;\n";
+    fs::write(root.join("test.rs"), file_content).expect("write should succeed");
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
+    let err = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_anchor_mm_001".to_string(),
+            spec: build_registry()
+                .get("file.edit_anchor")
+                .expect("file.edit_anchor spec")
+                .clone(),
+            input: ToolInput::FileEditAnchor {
+                path: "./test.rs".to_string(),
+                params: AnchorEditParams {
+                    old_content: "let x = 1;".to_string(),
+                    new_content: "let x = 2;".to_string(),
+                },
+            },
+        })
+        .expect_err("should fail when old_content matches multiple times");
+
+    assert!(
+        err.to_string().contains("matched 2 locations"),
+        "error should mention multiple matches, got: {}",
+        err
+    );
+}
+
+#[test]
+fn file_edit_fallback_indent_mismatch() {
+    let root = std::env::temp_dir().join("anvil_fallback_indent");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("dir should exist");
+    // File has 4-space indentation
+    let file_content = "fn main() {\n    let x = 1;\n}\n";
+    fs::write(root.join("test.rs"), file_content).expect("write should succeed");
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
+    // Use file.edit with 8-space indent instead of 4-space — cannot be a substring match
+    let result = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_fallback_001".to_string(),
+            spec: build_registry()
+                .get("file.edit")
+                .expect("file.edit spec")
+                .clone(),
+            input: ToolInput::FileEdit {
+                path: "./test.rs".to_string(),
+                old_string: "        let x = 1;".to_string(), // 8-space indent
+                new_string: "        let x = 2;".to_string(),
+            },
+        })
+        .expect("fallback should succeed");
+
+    assert_eq!(result.status, ToolExecutionStatus::Completed);
+    assert!(
+        result.summary.contains("anchor fallback"),
+        "summary should mention anchor fallback, got: {}",
+        result.summary
+    );
+    let content = fs::read_to_string(root.join("test.rs")).expect("read should succeed");
+    assert!(
+        content.contains("let x = 2;"),
+        "content should be edited, got: {content}"
+    );
+}
+
+#[test]
+fn edit_not_found_error_is_distinguishable() {
+    let err = anvil::tooling::ToolRuntimeError::EditNotFound("test".to_string());
+    assert!(err.is_edit_not_found());
+    let io_err = anvil::tooling::ToolRuntimeError::Io("test".to_string());
+    assert!(!io_err.is_edit_not_found());
+}

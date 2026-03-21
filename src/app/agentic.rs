@@ -801,9 +801,12 @@ impl App {
 
         // Helper: check whether a tool_call_id refers to a file-mutating tool.
         let is_file_mutation = |tool_call_id: &str| -> bool {
-            tool_kind_map
-                .get(tool_call_id)
-                .is_some_and(|kind| matches!(kind, ToolKind::FileWrite | ToolKind::FileEdit))
+            tool_kind_map.get(tool_call_id).is_some_and(|kind| {
+                matches!(
+                    kind,
+                    ToolKind::FileWrite | ToolKind::FileEdit | ToolKind::FileEditAnchor
+                )
+            })
         };
 
         // Transaction check: determine if any file-mutating tool failed.
@@ -1026,6 +1029,9 @@ pub(crate) fn infer_plan_from_structured_response(
                 } else {
                     format!("git log -{count_str}")
                 }
+            }
+            crate::tooling::ToolInput::FileEditAnchor { path, .. } => {
+                format!("edit (anchor) {path}")
             }
         };
         plan.push(item);
