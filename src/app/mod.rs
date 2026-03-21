@@ -12,7 +12,7 @@ pub mod policy;
 pub mod render;
 
 use crate::agent::BasicAgentLoop;
-use crate::agent::{AgentEvent, AgentRuntime, PendingTurnState, ProjectLanguage};
+use crate::agent::{AgentEvent, AgentRuntime, PendingTurnState, ProjectLanguage, PromptTier};
 use crate::config::EffectiveConfig;
 use crate::contracts::tokens::TokenCalibrationStore;
 use crate::contracts::{
@@ -142,6 +142,8 @@ pub struct App {
     /// Last estimated prompt tokens from build_turn_request_calibrated.
     /// Consumed by apply_agent_event Done handler via Option::take.
     last_estimated_prompt_tokens: Option<usize>,
+    /// System prompt verbosity tier, determined at session start.
+    prompt_tier: PromptTier,
 }
 
 /// Whether the session loop should continue or exit.
@@ -386,6 +388,17 @@ impl App {
 
         let trust_all = config.mode.trust_all;
 
+        // Determine prompt tier from config override or model name heuristic
+        let prompt_tier = {
+            use crate::agent::model_classifier::classify_model_capability;
+            let capability = classify_model_capability(
+                &config.runtime.model,
+                config.runtime.tag_protocol,
+                config.runtime.prompt_tier.as_deref(),
+            );
+            capability.prompt_tier
+        };
+
         Ok(Self {
             tools,
             config,
@@ -409,6 +422,7 @@ impl App {
             active_context_window: None,
             calibration_store: TokenCalibrationStore::new(),
             last_estimated_prompt_tokens: None,
+            prompt_tier,
         })
     }
 
@@ -481,6 +495,7 @@ impl App {
             self.mcp_descriptions.as_deref(),
             effective_used_tools,
             self.config.mode.offline,
+            self.prompt_tier,
         );
 
         // Current date and timezone (dynamic, re-evaluated per turn)
