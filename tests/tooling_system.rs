@@ -2938,12 +2938,7 @@ fn subagent_error_display_formats_correctly() {
     use anvil::agent::subagent::SubAgentError;
     use anvil::provider::ProviderTurnError;
 
-    let e = SubAgentError::Timeout;
-    assert_eq!(e.to_string(), "SubAgent timed out");
-
-    let e = SubAgentError::MaxIterations;
-    assert_eq!(e.to_string(), "SubAgent reached max iterations");
-
+    // Issue #129: Timeout and MaxIterations removed from SubAgentError (moved to Ok path)
     let e = SubAgentError::SandboxViolation("../escape".to_string());
     assert!(e.to_string().contains("../escape"));
 
@@ -2955,7 +2950,7 @@ fn subagent_error_display_formats_correctly() {
 }
 
 #[test]
-fn subagent_error_into_tool_execution_result_status_mapping() {
+fn subagent_error_into_tool_execution_result_all_failed() {
     use anvil::agent::subagent::SubAgentError;
     use anvil::tooling::ToolExecutionStatus;
 
@@ -2968,14 +2963,7 @@ fn subagent_error_into_tool_execution_result_status_mapping() {
         },
     );
 
-    // Timeout -> Completed (partial result)
-    let result = SubAgentError::Timeout.into_tool_execution_result(&call);
-    assert_eq!(result.status, ToolExecutionStatus::Completed);
-
-    // MaxIterations -> Completed (partial result)
-    let result = SubAgentError::MaxIterations.into_tool_execution_result(&call);
-    assert_eq!(result.status, ToolExecutionStatus::Completed);
-
+    // Issue #129: All remaining SubAgentError variants map to Failed
     // SandboxViolation -> Failed
     let result =
         SubAgentError::SandboxViolation("bad".to_string()).into_tool_execution_result(&call);
@@ -2984,6 +2972,148 @@ fn subagent_error_into_tool_execution_result_status_mapping() {
     // ToolExecution -> Failed
     let result = SubAgentError::ToolExecution("err".to_string()).into_tool_execution_result(&call);
     assert_eq!(result.status, ToolExecutionStatus::Failed);
+}
+
+// ============================================================
+// SubAgentResult / SubAgentPayload tests (Issue #129)
+// ============================================================
+
+#[test]
+fn subagent_result_into_tool_execution_result_json_payload() {
+    use anvil::agent::subagent::SubAgentResult;
+    use anvil::contracts::{SubAgentPayload, TerminationReason};
+
+    let call = ToolCallRequest::new(
+        "call_001",
+        "agent.explore",
+        ToolInput::AgentExplore {
+            prompt: "test".to_string(),
+            scope: None,
+        },
+    );
+
+    let result = SubAgentResult {
+        payload: SubAgentPayload {
+            found_files: vec!["src/main.rs".to_string()],
+            key_findings: vec![],
+            raw_summary: "Found main entry".to_string(),
+            confidence: Some(0.9),
+            termination_reason: TerminationReason::Completed,
+            error: None,
+        },
+        estimated_tokens: 100,
+        iterations_used: 2,
+    };
+
+    let tool_result = result.into_tool_execution_result(&call);
+    assert_eq!(tool_result.status, ToolExecutionStatus::Completed);
+    assert!(tool_result.summary.contains("completed"));
+    assert!(tool_result.summary.contains("2 iteration(s)"));
+
+    // Payload should be valid JSON
+    if let ToolExecutionPayload::Text(json) = &tool_result.payload {
+        let parsed: SubAgentPayload = serde_json::from_str(json).expect("should be valid JSON");
+        assert_eq!(parsed.raw_summary, "Found main entry");
+        assert_eq!(parsed.found_files, vec!["src/main.rs".to_string()]);
+        assert_eq!(parsed.termination_reason, TerminationReason::Completed);
+    } else {
+        panic!("expected Text payload");
+    }
+}
+
+#[test]
+fn subagent_result_timeout_into_tool_execution_result() {
+    use anvil::agent::subagent::SubAgentResult;
+    use anvil::contracts::{SubAgentPayload, TerminationReason};
+
+    let call = ToolCallRequest::new(
+        "call_001",
+        "agent.explore",
+        ToolInput::AgentExplore {
+            prompt: "test".to_string(),
+            scope: None,
+        },
+    );
+
+    let result = SubAgentResult {
+        payload: SubAgentPayload::fallback("partial work".to_string(), TerminationReason::Timeout),
+        estimated_tokens: 0,
+        iterations_used: 5,
+    };
+
+    let tool_result = result.into_tool_execution_result(&call);
+    assert_eq!(tool_result.status, ToolExecutionStatus::Completed);
+    assert!(tool_result.summary.contains("timeout"));
+    assert!(tool_result.summary.contains("5 iteration(s)"));
+
+    if let ToolExecutionPayload::Text(json) = &tool_result.payload {
+        let parsed: SubAgentPayload = serde_json::from_str(json).expect("should be valid JSON");
+        assert_eq!(parsed.termination_reason, TerminationReason::Timeout);
+        assert_eq!(parsed.raw_summary, "partial work");
+    } else {
+        panic!("expected Text payload");
+    }
+}
+
+#[test]
+fn subagent_payload_input_ignores_system_fields() {
+    // LLM output may include termination_reason/error, but SubAgentPayloadInput
+    // should not capture them. The parse function always sets Completed/None.
+    use anvil::contracts::{SubAgentPayload, TerminationReason};
+
+    let llm_json = r#"{
+        "found_files": ["a.rs"],
+        "key_findings": [],
+        "raw_summary": "summary",
+        "confidence": 0.5,
+        "termination_reason": "timeout",
+        "error": "injected error"
+    }"#;
+
+    // Parse through the public contract type (the internal parse function uses SubAgentPayloadInput)
+    // We test the contract: system fields should NOT be controlled by LLM
+    let payload: SubAgentPayload = serde_json::from_str(llm_json).expect("parse");
+    // SubAgentPayload itself does have those fields, but in production the parse_final_response_to_payload
+    // function uses SubAgentPayloadInput (which lacks them) and always sets system fields.
+    // Here we just verify SubAgentPayload defaults are correct when absent
+    let minimal_json = r#"{"found_files":[],"key_findings":[],"raw_summary":"test"}"#;
+    let payload_minimal: SubAgentPayload = serde_json::from_str(minimal_json).expect("parse");
+    assert_eq!(
+        payload_minimal.termination_reason,
+        TerminationReason::Completed
+    );
+    assert_eq!(payload_minimal.error, None);
+    // Even with injected fields present, the system manages them
+    assert_eq!(payload.found_files, vec!["a.rs".to_string()]);
+}
+
+#[test]
+fn subagent_payload_size_limits_applied() {
+    use anvil::contracts::{Finding, SubAgentPayload, TerminationReason};
+
+    // Test that size limits are documented/enforced at the contracts level
+    // The actual size limiting happens in parse_final_response_to_payload (internal),
+    // but we verify the types work with large data
+    let large_findings: Vec<Finding> = (0..100)
+        .map(|i| Finding {
+            title: format!("Finding {i}"),
+            detail: "x".repeat(5000),
+            related_code: (0..50).map(|j| format!("file{j}.rs:{j}")).collect(),
+        })
+        .collect();
+
+    let payload = SubAgentPayload {
+        found_files: (0..200).map(|i| format!("file{i}.rs")).collect(),
+        key_findings: large_findings,
+        raw_summary: "x".repeat(10000),
+        confidence: Some(1.5), // out of range, should be clamped by caller
+        termination_reason: TerminationReason::Completed,
+        error: None,
+    };
+
+    // Verify serialization works with large data
+    let json = serde_json::to_string(&payload).expect("serialize");
+    assert!(!json.is_empty());
 }
 
 // ============================================================

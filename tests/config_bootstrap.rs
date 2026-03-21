@@ -719,3 +719,71 @@ fn tag_protocol_cli_args_unset_leaves_none() {
         "unset CLI arg should leave tag_protocol as None"
     );
 }
+
+// ============================================================
+// Sub-agent config tests (Issue #129, Task 2.1)
+// ============================================================
+
+#[test]
+fn subagent_config_defaults() {
+    let config = EffectiveConfig::default_for_test().unwrap();
+    assert_eq!(config.runtime.subagent_max_iterations, 10);
+    assert_eq!(config.runtime.subagent_timeout_secs, 120);
+}
+
+#[test]
+fn subagent_config_apply_map() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let mut map = HashMap::new();
+    map.insert("subagent_max_iterations".to_string(), "20".to_string());
+    map.insert("subagent_timeout_secs".to_string(), "300".to_string());
+    config
+        .apply_overrides_for_test(&map, &HashMap::new(), &HashMap::new())
+        .expect("should apply");
+    assert_eq!(config.runtime.subagent_max_iterations, 20);
+    assert_eq!(config.runtime.subagent_timeout_secs, 300);
+}
+
+#[test]
+fn subagent_config_env_override_keys() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let mut map = HashMap::new();
+    map.insert(
+        "ANVIL_SUBAGENT_MAX_ITERATIONS".to_string(),
+        "15".to_string(),
+    );
+    map.insert("ANVIL_SUBAGENT_TIMEOUT".to_string(), "60".to_string());
+    config
+        .apply_overrides_for_test(&HashMap::new(), &map, &HashMap::new())
+        .expect("should apply");
+    assert_eq!(config.runtime.subagent_max_iterations, 15);
+    assert_eq!(config.runtime.subagent_timeout_secs, 60);
+}
+
+#[test]
+fn subagent_config_zero_restored_to_defaults() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    config.runtime.subagent_max_iterations = 0;
+    config.runtime.subagent_timeout_secs = 0;
+    config.validate_for_test().expect("validation should pass");
+    assert_eq!(
+        config.runtime.subagent_max_iterations, 10,
+        "zero subagent_max_iterations should be restored to default"
+    );
+    assert_eq!(
+        config.runtime.subagent_timeout_secs, 120,
+        "zero subagent_timeout_secs should be restored to default"
+    );
+}
+
+#[test]
+fn subagent_config_invalid_numeric_value() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let mut map = HashMap::new();
+    map.insert(
+        "subagent_max_iterations".to_string(),
+        "not_a_number".to_string(),
+    );
+    let result = config.apply_overrides_for_test(&map, &HashMap::new(), &HashMap::new());
+    assert!(result.is_err(), "non-numeric value should fail");
+}

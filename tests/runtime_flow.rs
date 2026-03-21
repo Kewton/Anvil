@@ -608,6 +608,47 @@ fn build_subagent_system_prompt_plan_contains_expected_tools() {
 }
 
 // -----------------------------------------------------------------------
+// Issue #129: Sub-agent system prompts include JSON format instructions
+// -----------------------------------------------------------------------
+
+#[test]
+fn build_subagent_system_prompt_includes_json_format() {
+    use anvil::agent::subagent::{SubAgentKind, build_subagent_system_prompt};
+
+    let explore = build_subagent_system_prompt(&SubAgentKind::Explore, false);
+    assert!(
+        explore.contains("found_files"),
+        "Explore prompt should mention found_files JSON field"
+    );
+    assert!(
+        explore.contains("key_findings"),
+        "Explore prompt should mention key_findings JSON field"
+    );
+    assert!(
+        explore.contains("raw_summary"),
+        "Explore prompt should mention raw_summary JSON field"
+    );
+    assert!(
+        explore.contains("confidence"),
+        "Explore prompt should mention confidence JSON field"
+    );
+
+    let plan = build_subagent_system_prompt(&SubAgentKind::Plan, false);
+    assert!(
+        plan.contains("found_files"),
+        "Plan prompt should mention found_files JSON field"
+    );
+    assert!(
+        plan.contains("key_findings"),
+        "Plan prompt should mention key_findings JSON field"
+    );
+    assert!(
+        plan.contains("raw_summary"),
+        "Plan prompt should mention raw_summary JSON field"
+    );
+}
+
+// -----------------------------------------------------------------------
 // Issue #114: web.search/web.fetch must be in system prompt for fresh sessions
 // -----------------------------------------------------------------------
 

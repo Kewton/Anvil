@@ -101,7 +101,7 @@ src/
 ├── agent/
 │   ├── mod.rs           # エージェントループ・プロトコル
 │   ├── model_classifier.rs # モデル分類・ToolProtocolMode判定
-│   ├── subagent.rs      # サブエージェント実行ループ（Explore/Plan）
+│   ├── subagent.rs      # サブエージェント実行ループ（Explore/Plan、構造化payload・JSON ANVIL_FINAL対応）
 │   ├── tag_parser.rs    # タグベースツール呼び出しパーサー（多層プロトコル対応）
 │   └── tag_spec.rs      # ツールタグ仕様テーブル（TOOL_TAG_SPECS）
 ├── app/
@@ -115,7 +115,7 @@ src/
 │   └── mock.rs          # テスト用モック
 ├── config/mod.rs        # 設定管理
 ├── contracts/
-│   ├── mod.rs           # 共通型定義
+│   ├── mod.rs           # 共通型定義（TerminationReason, Finding, SubAgentPayload含む）
 │   └── tokens.rs        # トークン推定（CJK対応ヒューリスティック・モデル実測値ベースEMA補正）
 ├── extensions/
 │   ├── mod.rs           # スラッシュコマンド・拡張
