@@ -24,7 +24,9 @@ use crate::provider::{
     ProviderBootstrapError, ProviderClient, ProviderErrorKind, ProviderErrorRecord, ProviderEvent,
     ProviderRuntimeContext, ProviderTurnError,
 };
-use crate::retrieval::{RepositoryIndex, default_cache_path, render_retrieval_result};
+use crate::retrieval::{
+    DEFAULT_SEARCH_LIMIT, RepositoryIndex, default_cache_path, render_retrieval_result,
+};
 use crate::session::{
     MessageRole, MessageStatus, SessionError, SessionMessage, SessionRecord, SessionStore,
     new_assistant_message, new_user_message,
@@ -372,7 +374,7 @@ impl App {
         // Offline mode: warn about shell.exec network access
         if config.mode.offline {
             eprintln!(
-                "Warning: shell.exec can still access the network in offline mode. For full network isolation, use OS/firewall-level controls."
+                "Warning: shell.exec のネットワークコマンド（curl, wget等）は offline mode でブロックされます。エイリアスやスクリプト経由のアクセスは検出されない場合があります。完全なネットワーク遮断には OS/ファイアウォールレベルの制御を使用してください。"
             );
         }
 
@@ -458,7 +460,7 @@ impl App {
     /// Called each turn to include only relevant tool descriptions.
     /// Offline mode filters out web.* tools from the effective used_tools set.
     fn build_dynamic_system_prompt(&self) -> String {
-        use crate::agent::tool_protocol_system_prompt;
+        use crate::agent::tool_protocol_system_prompt_with_mode;
 
         // Offline mode: exclude web.* tools from used_tools.
         // Non-offline: pass a reference directly to avoid cloning.
@@ -476,11 +478,14 @@ impl App {
             &self.session.used_tools
         };
 
-        let mut prompt = tool_protocol_system_prompt(
+        let protocol = self.provider.capabilities.tool_protocol;
+
+        let mut prompt = tool_protocol_system_prompt_with_mode(
             &self.detected_languages,
             self.mcp_descriptions.as_deref(),
             effective_used_tools,
             self.config.mode.offline,
+            protocol,
         );
 
         // Current date and timezone (dynamic, re-evaluated per turn)
@@ -499,7 +504,24 @@ impl App {
             );
         }
 
+        // Working memory injection (Issue #130)
+        if let Some(wm_prompt) = self.session.working_memory.format_for_prompt() {
+            prompt.push_str("\n\n");
+            prompt.push_str(&wm_prompt);
+        }
+
         prompt
+    }
+
+    /// Convert an absolute path to a cwd-relative string for working memory.
+    ///
+    /// Returns `None` if the path is not under the session cwd.
+    fn relative_path_for_working_memory(&self, abs_path: &std::path::Path) -> Option<String> {
+        let cwd = std::path::Path::new(&self.session.metadata.cwd);
+        abs_path
+            .strip_prefix(cwd)
+            .ok()
+            .map(|rel| rel.to_string_lossy().into_owned())
     }
 
     /// Check whether a shutdown has been requested via the shared flag.
@@ -1760,7 +1782,7 @@ impl App {
         let cache_path = default_cache_path(&self.config.paths.state_dir);
         let index = RepositoryIndex::load_or_build(&self.config.paths.cwd, &cache_path)
             .map_err(|err| AppError::ToolExecution(err.to_string()))?;
-        let result = index.search(query, 5);
+        let result = index.search(query, DEFAULT_SEARCH_LIMIT);
         if !result.matches.is_empty() {
             let summary = result
                 .matches
@@ -1799,7 +1821,9 @@ impl App {
         }
 
         let rel_path = match &request.input {
-            ToolInput::FileWrite { path, .. } | ToolInput::FileEdit { path, .. } => path,
+            ToolInput::FileWrite { path, .. }
+            | ToolInput::FileEdit { path, .. }
+            | ToolInput::FileEditAnchor { path, .. } => path,
             _ => return None,
         };
 
@@ -1867,6 +1891,15 @@ impl App {
             format!("Undid {} of {} requested change(s).", restored_count, n)
         };
         lines.insert(0, summary.clone());
+
+        // Sync working memory: remove undone files from touched_files (Issue #130)
+        for result in &results {
+            if result.action != crate::tooling::RestoreAction::Skipped
+                && let Some(rel) = self.relative_path_for_working_memory(&result.path)
+            {
+                self.session.working_memory.remove_touched_file(&rel);
+            }
+        }
 
         // Record in session
         self.session.push_message(

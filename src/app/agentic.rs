@@ -20,7 +20,7 @@ use crate::tui::Tui;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::tooling::PermissionClass;
+use crate::tooling::{PermissionClass, effective_permission_class};
 use std::collections::HashSet;
 
 use super::policy::{OFFLINE_BLOCK_PAYLOAD, check_offline_blocked};
@@ -512,10 +512,11 @@ impl App {
             }
 
             if self.config.mode.approval_required && validated.approval_required(true).is_some() {
+                let effective_perm = effective_permission_class(&call.input, &validated.spec);
                 if is_trusted(
                     &call.tool_name,
                     validated.spec.kind,
-                    validated.spec.permission_class,
+                    effective_perm,
                     self.trust_all,
                     &self.trusted_tools,
                 ) {
@@ -801,9 +802,12 @@ impl App {
 
         // Helper: check whether a tool_call_id refers to a file-mutating tool.
         let is_file_mutation = |tool_call_id: &str| -> bool {
-            tool_kind_map
-                .get(tool_call_id)
-                .is_some_and(|kind| matches!(kind, ToolKind::FileWrite | ToolKind::FileEdit))
+            tool_kind_map.get(tool_call_id).is_some_and(|kind| {
+                matches!(
+                    kind,
+                    ToolKind::FileWrite | ToolKind::FileEdit | ToolKind::FileEditAnchor
+                )
+            })
         };
 
         // Transaction check: determine if any file-mutating tool failed.
@@ -923,6 +927,36 @@ impl App {
         // Track tool usage for dynamic system prompt generation (Issue #73)
         self.session.used_tools.insert(result.tool_name.clone());
 
+        // Working memory: track touched files (file-mutating tools only) (Issue #130)
+        let is_file_tool = matches!(result.tool_name.as_str(), "file.write" | "file.edit");
+        if is_file_tool
+            && result.status == ToolExecutionStatus::Completed
+            && !result.summary.contains("[rolled back]")
+        {
+            for artifact in &result.artifacts {
+                let path = std::path::Path::new(artifact);
+                if let Some(rel) = self.relative_path_for_working_memory(path) {
+                    self.session.working_memory.update_touched_files(&rel);
+                } else {
+                    tracing::warn!("skip touched_files update for non-relative artifact");
+                }
+            }
+        }
+
+        // Working memory: track errors (Issue #130)
+        if result.status == ToolExecutionStatus::Failed {
+            let sanitized_error = if result.tool_name == "shell.exec" {
+                "shell.exec: command failed (details redacted)".to_string()
+            } else {
+                format!(
+                    "{}: {}",
+                    result.tool_name,
+                    crate::session::sanitize_for_prompt_entry(&result.summary)
+                )
+            };
+            self.session.working_memory.add_error(sanitized_error);
+        }
+
         let is_error = result.status == ToolExecutionStatus::Failed;
         let mut msg = SessionMessage::new(
             MessageRole::Tool,
@@ -1026,6 +1060,9 @@ pub(crate) fn infer_plan_from_structured_response(
                 } else {
                     format!("git log -{count_str}")
                 }
+            }
+            crate::tooling::ToolInput::FileEditAnchor { path, .. } => {
+                format!("edit (anchor) {path}")
             }
         };
         plan.push(item);

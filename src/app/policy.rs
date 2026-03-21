@@ -5,7 +5,7 @@
 //! to enforce offline mode restrictions.
 
 use crate::config::EffectiveConfig;
-use crate::tooling::{ToolCallRequest, ToolInput};
+use crate::tooling::{ToolCallRequest, ToolInput, is_network_command};
 
 /// Suffix appended to tool name when generating block summary messages.
 pub const OFFLINE_BLOCK_SUMMARY_SUFFIX: &str = "is unavailable in offline mode";
@@ -23,12 +23,17 @@ pub fn check_offline_blocked(config: &EffectiveConfig, call: &ToolCallRequest) -
     if !config.mode.offline {
         return None;
     }
-    match call.input {
+    match &call.input {
         ToolInput::WebFetch { .. }
         | ToolInput::WebSearch { .. }
         // Defense in Depth: MCP tools are normally unreachable in offline mode
         // (MCP initialization is skipped), but block explicitly as a safety net.
         | ToolInput::Mcp { .. } => Some(format!(
+            "{} {}",
+            call.tool_name, OFFLINE_BLOCK_SUMMARY_SUFFIX
+        )),
+        // Block shell commands that perform network access
+        ToolInput::ShellExec { command } if is_network_command(command) => Some(format!(
             "{} {}",
             call.tool_name, OFFLINE_BLOCK_SUMMARY_SUFFIX
         )),
@@ -149,6 +154,47 @@ mod tests {
             },
         );
         assert!(check_offline_blocked(&config, &call).is_none());
+    }
+
+    #[test]
+    fn offline_blocks_network_shell_commands() {
+        let config = make_config(true);
+        for cmd in &[
+            "curl https://example.com",
+            "wget https://example.com",
+            "ssh user@host",
+            "ping 8.8.8.8",
+        ] {
+            let call = make_call(
+                "shell.exec",
+                ToolInput::ShellExec {
+                    command: cmd.to_string(),
+                },
+            );
+            let result = check_offline_blocked(&config, &call);
+            assert!(
+                result.is_some(),
+                "Expected {cmd} to be blocked in offline mode"
+            );
+            assert!(result.unwrap().contains("shell.exec"));
+        }
+    }
+
+    #[test]
+    fn offline_allows_non_network_shell() {
+        let config = make_config(true);
+        for cmd in &["ls -la", "git log", "cargo test", "cat file.txt"] {
+            let call = make_call(
+                "shell.exec",
+                ToolInput::ShellExec {
+                    command: cmd.to_string(),
+                },
+            );
+            assert!(
+                check_offline_blocked(&config, &call).is_none(),
+                "Expected {cmd} to be allowed in offline mode"
+            );
+        }
     }
 
     #[test]

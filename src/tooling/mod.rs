@@ -5,6 +5,9 @@
 //! [`LocalToolExecutor`] within a sandboxed workspace root.
 
 pub mod diff;
+pub mod shell_policy;
+
+pub use shell_policy::{ShellPolicy, classify_shell_policy, is_network_command};
 
 use crate::config::{RuntimeConfig, WebSearchProvider};
 use crate::contracts::ToolLogView;
@@ -76,6 +79,7 @@ pub enum ToolKind {
     FileRead,
     FileWrite,
     FileEdit,
+    FileEditAnchor,
     FileSearch,
     ShellExec,
     WebFetch,
@@ -97,6 +101,13 @@ impl ToolKind {
             ToolKind::ShellExec | ToolKind::GitStatus | ToolKind::GitDiff | ToolKind::GitLog
         )
     }
+}
+
+/// Anchor-based edit parameters (Wave 1: indent normalization only).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AnchorEditParams {
+    pub old_content: String,
+    pub new_content: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,6 +164,10 @@ pub enum ToolInput {
         count: Option<u32>,
         path: Option<String>,
     },
+    FileEditAnchor {
+        path: String,
+        params: AnchorEditParams,
+    },
 }
 
 impl ToolInput {
@@ -171,6 +186,7 @@ impl ToolInput {
             Self::GitStatus { .. } => ToolKind::GitStatus,
             Self::GitDiff { .. } => ToolKind::GitDiff,
             Self::GitLog { .. } => ToolKind::GitLog,
+            Self::FileEditAnchor { .. } => ToolKind::FileEditAnchor,
         }
     }
 
@@ -309,6 +325,32 @@ impl ToolInput {
                     .and_then(serde_json::Value::as_str)
                     .map(String::from),
             }),
+            "file.edit_anchor" => {
+                let path = value
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .map(String::from)
+                    .ok_or_else(|| "missing path in file.edit_anchor tool block".to_string())?;
+                let old_content = value
+                    .get("old_content")
+                    .and_then(serde_json::Value::as_str)
+                    .map(String::from)
+                    .ok_or_else(|| {
+                        "missing old_content in file.edit_anchor tool block".to_string()
+                    })?;
+                let new_content = value
+                    .get("new_content")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                Ok(ToolInput::FileEditAnchor {
+                    path,
+                    params: AnchorEditParams {
+                        old_content,
+                        new_content,
+                    },
+                })
+            }
             other => {
                 // mcp__<server>__<tool> pattern detection
                 if let Some((server, tool)) = parse_mcp_tool_name(other) {
@@ -390,6 +432,18 @@ impl ToolInput {
                 count: extract_simple(block, "count").and_then(|s| s.parse::<u32>().ok()),
                 path: extract_simple(block, "path"),
             }),
+            "file.edit_anchor" => {
+                let path = extract_simple(block, "path")?;
+                let old_content = extract_simple(block, "old_content")?;
+                let new_content = extract_trailing(block, "new_content").unwrap_or_default();
+                Some(ToolInput::FileEditAnchor {
+                    path,
+                    params: AnchorEditParams {
+                        old_content,
+                        new_content,
+                    },
+                })
+            }
             _ => None,
         }
     }
@@ -648,6 +702,19 @@ impl ToolRegistry {
         });
     }
 
+    pub fn register_file_edit_anchor(&mut self) {
+        self.register(ToolSpec {
+            version: 1,
+            name: "file.edit_anchor".to_string(),
+            kind: ToolKind::FileEditAnchor,
+            execution_class: ExecutionClass::Mutating,
+            permission_class: PermissionClass::Confirm,
+            execution_mode: ExecutionMode::SequentialOnly,
+            plan_mode: PlanModePolicy::Allowed,
+            rollback_policy: RollbackPolicy::CheckpointBeforeWrite,
+        });
+    }
+
     pub fn register_file_search(&mut self) {
         self.register(ToolSpec {
             version: 1,
@@ -786,6 +853,7 @@ impl ToolRegistry {
         self.register_file_read();
         self.register_file_write();
         self.register_file_edit();
+        self.register_file_edit_anchor();
         self.register_file_search();
         self.register_shell_exec();
         self.register_web_fetch();
@@ -847,6 +915,13 @@ pub enum ToolRuntimeError {
     InvalidPath(String),
     Io(String),
     CaptchaBlocked { query: String },
+    EditNotFound(String),
+}
+
+impl ToolRuntimeError {
+    pub fn is_edit_not_found(&self) -> bool {
+        matches!(self, Self::EditNotFound(_))
+    }
 }
 
 impl Display for ToolRuntimeError {
@@ -860,6 +935,7 @@ impl Display for ToolRuntimeError {
                  Consider setting SERPER_API_KEY for automatic fallback, \
                  or use web.fetch to access specific URLs directly."
             ),
+            Self::EditNotFound(message) => write!(f, "{message}"),
         }
     }
 }
@@ -936,7 +1012,8 @@ impl LocalToolExecutor {
                 ref path,
                 ref old_string,
                 ref new_string,
-            } => self.execute_file_edit(&request, path, old_string, new_string, started),
+            } => self
+                .execute_file_edit_with_fallback(&request, path, old_string, new_string, started),
             ToolInput::FileSearch {
                 ref root,
                 ref pattern,
@@ -958,6 +1035,10 @@ impl LocalToolExecutor {
                 ref count,
                 ref path,
             } => self.execute_git_log(&request, count, path, started),
+            ToolInput::FileEditAnchor {
+                ref path,
+                ref params,
+            } => self.execute_file_edit_anchor(&request, path, params, started),
             ToolInput::Mcp { .. } => unreachable!("MCP tools are dispatched in agentic.rs"),
             ToolInput::AgentExplore { .. } | ToolInput::AgentPlan { .. } => {
                 unreachable!("agent tools are dispatched in agentic.rs")
@@ -1102,14 +1183,14 @@ impl LocalToolExecutor {
         }
         let count = content.matches(old_string).count();
         if count == 0 {
-            return Err(ToolRuntimeError::Io(format!(
+            return Err(ToolRuntimeError::EditNotFound(format!(
                 "file.edit: old_string not found in {path}. \
                  Ensure the string exactly matches the file content, \
                  including whitespace and indentation."
             )));
         }
         if count > 1 {
-            return Err(ToolRuntimeError::Io(format!(
+            return Err(ToolRuntimeError::EditNotFound(format!(
                 "file.edit: old_string found {count} times in {path}. \
                  Include more surrounding context to make the match unique."
             )));
@@ -1128,6 +1209,89 @@ impl LocalToolExecutor {
             vec![resolved.display().to_string()],
             started,
         ))
+    }
+
+    fn execute_file_edit_anchor(
+        &self,
+        request: &ToolExecutionRequest,
+        path: &str,
+        params: &AnchorEditParams,
+        started: Instant,
+    ) -> Result<ToolExecutionResult, ToolRuntimeError> {
+        let resolved = self.resolve_path(path)?;
+        let content = fs::read_to_string(&resolved).map_err(|err| {
+            ToolRuntimeError::Io(format!(
+                "file.edit_anchor failed to read {}: {err}",
+                resolved.display()
+            ))
+        })?;
+
+        if params.old_content == params.new_content {
+            return Ok(build_completed_result(
+                request,
+                format!("{path} (no changes)"),
+                ToolExecutionPayload::None,
+                vec![],
+                started,
+            ));
+        }
+
+        let normalized_matches = find_indent_normalized_matches(&content, &params.old_content);
+
+        match normalized_matches.len() {
+            1 => {
+                let new_content =
+                    apply_normalized_edit(&content, &normalized_matches[0], &params.new_content);
+                fs::write(&resolved, &new_content).map_err(|err| {
+                    ToolRuntimeError::Io(format!(
+                        "file.edit_anchor failed to write {}: {err}",
+                        resolved.display()
+                    ))
+                })?;
+                Ok(build_completed_result(
+                    request,
+                    path.to_string(),
+                    ToolExecutionPayload::None,
+                    vec![resolved.display().to_string()],
+                    started,
+                ))
+            }
+            0 => Err(ToolRuntimeError::EditNotFound(format!(
+                "anchor: normalized old_content not found in {path}"
+            ))),
+            n => Err(ToolRuntimeError::EditNotFound(format!(
+                "anchor: old_content matched {n} locations in {path}, need unique match"
+            ))),
+        }
+    }
+
+    /// Try file.edit first, fall back to anchor-based edit on EditNotFound.
+    fn execute_file_edit_with_fallback(
+        &self,
+        request: &ToolExecutionRequest,
+        path: &str,
+        old_string: &str,
+        new_string: &str,
+        started: Instant,
+    ) -> Result<ToolExecutionResult, ToolRuntimeError> {
+        match self.execute_file_edit(request, path, old_string, new_string, started) {
+            Ok(result) => Ok(result),
+            Err(original_err) if original_err.is_edit_not_found() => {
+                let params = AnchorEditParams {
+                    old_content: old_string.to_string(),
+                    new_content: new_string.to_string(),
+                };
+                match self.execute_file_edit_anchor(request, path, &params, started) {
+                    Ok(mut result) => {
+                        result.summary = format!("{} (anchor fallback)", result.summary);
+                        Ok(result)
+                    }
+                    // Anchor also failed — return the original error for better diagnostics
+                    Err(_) => Err(original_err),
+                }
+            }
+            Err(err) => Err(err),
+        }
     }
 
     fn execute_file_search(
@@ -1587,6 +1751,137 @@ impl LocalToolExecutor {
     }
 }
 
+/// A matched region in file content for indent-normalized editing.
+#[derive(Debug, Clone)]
+struct NormalizedMatch {
+    /// Byte offset of the matched region start in the original file content.
+    start: usize,
+    /// Byte offset of the matched region end in the original file content.
+    end: usize,
+    /// The leading whitespace prefix of the first line of the matched region.
+    indent_prefix: String,
+}
+
+/// Compute the byte offset of the start of `line_idx` in `content`.
+fn byte_offset_of_line(content: &str, lines: &[&str], line_idx: usize) -> usize {
+    let mut pos = 0;
+    for (idx, line) in lines.iter().enumerate() {
+        if idx == line_idx {
+            return pos;
+        }
+        pos += line.len();
+        pos += line_terminator_len(&content[pos..]);
+    }
+    pos
+}
+
+/// Compute the byte offset just after the end of `line_idx` in `content`
+/// (i.e., after the line's text but before its terminator).
+fn byte_offset_after_line(content: &str, lines: &[&str], line_idx: usize) -> usize {
+    let mut pos = 0;
+    for (idx, line) in lines.iter().enumerate() {
+        pos += line.len();
+        if idx == line_idx {
+            return pos;
+        }
+        pos += line_terminator_len(&content[pos..]);
+    }
+    pos
+}
+
+/// Return the byte length of the line terminator at the start of `s` (0, 1, or 2).
+fn line_terminator_len(s: &str) -> usize {
+    if s.starts_with("\r\n") {
+        2
+    } else if s.starts_with('\n') {
+        1
+    } else {
+        0
+    }
+}
+
+/// Find regions in `content` that match `pattern` after stripping leading whitespace
+/// from each line of both pattern and content.
+fn find_indent_normalized_matches(content: &str, pattern: &str) -> Vec<NormalizedMatch> {
+    let pattern_lines: Vec<&str> = pattern.lines().collect();
+    if pattern_lines.is_empty() {
+        return Vec::new();
+    }
+
+    let normalized_pattern: Vec<String> = pattern_lines
+        .iter()
+        .map(|line| line.trim_start().to_string())
+        .collect();
+
+    // Skip all-empty patterns
+    if normalized_pattern.iter().all(|l| l.is_empty()) {
+        return Vec::new();
+    }
+
+    let content_lines: Vec<&str> = content.lines().collect();
+    let mut matches = Vec::new();
+
+    'outer: for i in 0..content_lines.len() {
+        if i + pattern_lines.len() > content_lines.len() {
+            break;
+        }
+
+        // Check if lines match after trimming leading whitespace
+        for (j, norm_pat) in normalized_pattern.iter().enumerate() {
+            let content_line_trimmed = content_lines[i + j].trim_start();
+            if content_line_trimmed != norm_pat.as_str() {
+                continue 'outer;
+            }
+        }
+
+        // Compute byte offsets using actual content positions
+        // (handles CRLF and missing trailing newline).
+        let start_byte = byte_offset_of_line(content, &content_lines, i);
+        let end_line = i + pattern_lines.len() - 1;
+        let end_byte = byte_offset_after_line(content, &content_lines, end_line);
+
+        // Extract indent prefix from first matched line
+        let first_line = content_lines[i];
+        let trimmed_len = first_line.trim_start().len();
+        let indent_prefix = first_line[..first_line.len() - trimmed_len].to_string();
+
+        matches.push(NormalizedMatch {
+            start: start_byte,
+            end: end_byte,
+            indent_prefix,
+        });
+    }
+
+    matches
+}
+
+/// Apply a normalized edit by replacing the matched region with new content,
+/// preserving the original indentation.
+fn apply_normalized_edit(content: &str, matched: &NormalizedMatch, new_content: &str) -> String {
+    // Re-indent new_content to match the indentation of the matched region.
+    // Wave 1: all non-empty lines use the same indent prefix as the first matched line.
+    let new_lines: Vec<&str> = new_content.lines().collect();
+    let reindented: Vec<String> = new_lines
+        .iter()
+        .map(|line| {
+            if line.trim().is_empty() {
+                String::new()
+            } else {
+                format!("{}{}", matched.indent_prefix, line.trim_start())
+            }
+        })
+        .collect();
+
+    let replacement = reindented.join("\n");
+
+    format!(
+        "{}{}{}",
+        &content[..matched.start],
+        replacement,
+        &content[matched.end..]
+    )
+}
+
 /// Resolve a relative path within a sandbox root directory.
 ///
 /// Rejects absolute paths, parent-directory traversal (`..`), and symlinks
@@ -1662,10 +1957,12 @@ impl ParallelExecutionPlan {
         policy: ToolExecutionPolicy,
     ) -> Result<Self, ParallelExecutionPlanError> {
         for call in &calls {
-            if policy.approval_required
-                && call.spec.permission_class != PermissionClass::Safe
-                && !call.approved
-            {
+            // Use effective_permission_class (not spec.permission_class) so that
+            // safe shell commands (e.g. git log) are correctly recognised as Safe.
+            // Currently shell.exec is SequentialOnly so it never reaches this path,
+            // but we use the effective class defensively for future-proofing.
+            let effective = effective_permission_class(&call.request.input, &call.spec);
+            if policy.approval_required && effective != PermissionClass::Safe && !call.approved {
                 return Err(ParallelExecutionPlanError::ApprovalRequired(
                     call.request.tool_call_id.clone(),
                 ));
@@ -1804,6 +2101,18 @@ fn validate_required_fields(input: &ToolInput) -> Result<(), ToolValidationError
                 });
             }
         }
+        ToolInput::FileEditAnchor { path, params } => {
+            if path.trim().is_empty() {
+                return Err(ToolValidationError::MissingRequiredField(
+                    "path".to_string(),
+                ));
+            }
+            if params.old_content.is_empty() {
+                return Err(ToolValidationError::MissingRequiredField(
+                    "old_content".to_string(),
+                ));
+            }
+        }
         // [D3-001] MCP tool input validation is handled by the MCP server side
         ToolInput::Mcp { .. } => {}
         ToolInput::GitStatus {} => {}
@@ -1940,149 +2249,25 @@ fn validate_shell_command_safety(command: &str) -> Result<(), ToolValidationErro
 ///
 /// Commands that pass this check are promoted from `Confirm` to `Safe`
 /// by [`effective_permission_class`], skipping the approval prompt.
+///
+/// This is a backward-compatible wrapper around [`classify_shell_policy`].
 pub fn is_safe_shell_command(command: &str) -> bool {
-    let trimmed = command.trim();
-
-    // Reject command chaining / injection vectors
-    if trimmed.contains('|')
-        || trimmed.contains(';')
-        || trimmed.contains('`')
-        || trimmed.contains("$(")
-        || trimmed.contains("${")
-        || trimmed.contains('\n')
-        || trimmed.contains("&&")
-        || trimmed.contains('>')
-        || trimmed.contains('<')
-    {
-        return false;
-    }
-
-    // gh api: GET-only is safe (token-split based flag detection)
-    if trimmed.starts_with("gh api ") {
-        let tokens: Vec<&str> = trimmed.split_whitespace().collect();
-
-        // Flags that imply a mutating request by their mere presence.
-        const BODY_FLAGS: &[&str] = &["-f", "--field", "-F", "--raw-field", "--input"];
-
-        // Combined flag=value forms that imply mutation.
-        const MUTATION_COMBINED: &[&str] = &[
-            "-XPOST",
-            "-XPUT",
-            "-XPATCH",
-            "-XDELETE",
-            "--method=POST",
-            "--method=PUT",
-            "--method=PATCH",
-            "--method=DELETE",
-            "--input=",
-            "-f=",
-            "--field=",
-            "-F=",
-            "--raw-field=",
-        ];
-
-        for (i, token) in tokens.iter().enumerate() {
-            // Body/field flags always imply mutation (POST is the gh default).
-            if BODY_FLAGS.iter().any(|f| token == f) {
-                return false;
-            }
-
-            // --method / -X followed by a mutating HTTP verb.
-            if (*token == "--method" || *token == "-X")
-                && let Some(next) = tokens.get(i + 1)
-            {
-                let upper = next.to_uppercase();
-                if ["POST", "PUT", "PATCH", "DELETE"].contains(&upper.as_str()) {
-                    return false;
-                }
-            }
-
-            // Combined forms (e.g. -XPOST, --method=POST, --input=file)
-            if MUTATION_COMBINED.iter().any(|f| token.starts_with(f)) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    // Auto-approved command prefixes, grouped by category for readability.
-    const SAFE_PREFIXES: &[&str] = &[
-        // Git read-only
-        "git log",
-        "git status",
-        "git diff",
-        "git branch",
-        "git show ", // trailing space requires an argument (ref)
-        "git remote -v",
-        "git rev-parse",
-        // GitHub CLI read-only
-        "gh repo view",
-        "gh pr list",
-        "gh issue list",
-        "gh pr view",
-        "gh issue view",
-        "gh auth status",
-        // Rust build/test/lint
-        "cargo clippy",
-        "cargo fmt --check",
-        "cargo test",
-        "cargo check",
-        "cargo build",
-        // Node.js build/test/lint
-        "npm test",
-        "npx jest ",
-        "npx eslint ",
-        "npx prettier --check",
-        // Python test/lint
-        "pytest",
-        "ruff check ",
-        "flake8",
-        // Go build/test/lint
-        "go test",
-        "go vet",
-        "golangci-lint",
-        // Make build/test
-        "make test",
-        "make check",
-        // Environment inspection
-        "which ",
-        "uname",
-        "node -v",
-        "node --version",
-        "rustc --version",
-        "cargo --version",
-        "python --version",
-        "go version",
-        // Process inspection
-        "lsof -i",
-    ];
-
-    if !SAFE_PREFIXES
-        .iter()
-        .any(|prefix| trimmed.starts_with(prefix))
-    {
-        return false;
-    }
-
-    // Block dangerous options that may launch external processes
-    let dangerous_options = ["--web", "--browse"];
-    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
-    for token in &tokens {
-        if dangerous_options.iter().any(|opt| token == opt) {
-            return false;
-        }
-    }
-    true
+    classify_shell_policy(command) != ShellPolicy::General
 }
 
 /// Compute the effective permission class for a tool call.
 ///
-/// Safe shell commands (as determined by [`is_safe_shell_command`]) are
-/// promoted from `Confirm` to `Safe`, skipping the approval prompt.
+/// Shell commands are classified via [`classify_shell_policy`]:
+/// - `ReadOnly` / `BuildTest` → `Safe` (auto-approved)
+/// - `General` → uses spec's permission class (typically `Confirm`)
+///
 /// All other tools (including MCP) use their spec's permission class directly.
 pub fn effective_permission_class(input: &ToolInput, spec: &ToolSpec) -> PermissionClass {
     match input {
-        ToolInput::ShellExec { command } if is_safe_shell_command(command) => PermissionClass::Safe,
+        ToolInput::ShellExec { command } => match classify_shell_policy(command) {
+            ShellPolicy::ReadOnly | ShellPolicy::BuildTest => PermissionClass::Safe,
+            ShellPolicy::General => spec.permission_class,
+        },
         _ => spec.permission_class,
     }
 }

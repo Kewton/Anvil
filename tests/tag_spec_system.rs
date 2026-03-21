@@ -3,8 +3,8 @@
 use anvil::agent::tag_spec::{TOOL_TAG_SPECS, find_spec};
 
 #[test]
-fn tool_tag_specs_has_nine_entries() {
-    assert_eq!(TOOL_TAG_SPECS.len(), 9);
+fn tool_tag_specs_has_ten_entries() {
+    assert_eq!(TOOL_TAG_SPECS.len(), 10);
 }
 
 #[test]
@@ -72,6 +72,15 @@ fn find_spec_agent_plan() {
     let spec = find_spec("agent.plan").expect("agent.plan should exist");
     assert_eq!(spec.attributes, &["scope"]);
     assert_eq!(spec.child_elements, &["prompt"]);
+}
+
+#[test]
+fn find_spec_file_edit_anchor() {
+    let spec = find_spec("file.edit_anchor").expect("file.edit_anchor should exist");
+    assert_eq!(spec.name, "file.edit_anchor");
+    assert_eq!(spec.attributes, &["path"]);
+    assert_eq!(spec.child_elements, &["old_content", "new_content"]);
+    assert!(!spec.example.is_empty());
 }
 
 #[test]
