@@ -5,6 +5,9 @@
 //! [`LocalToolExecutor`] within a sandboxed workspace root.
 
 pub mod diff;
+pub mod shell_policy;
+
+pub use shell_policy::{ShellPolicy, classify_shell_policy, is_network_command};
 
 use crate::config::{RuntimeConfig, WebSearchProvider};
 use crate::contracts::ToolLogView;
@@ -1662,10 +1665,12 @@ impl ParallelExecutionPlan {
         policy: ToolExecutionPolicy,
     ) -> Result<Self, ParallelExecutionPlanError> {
         for call in &calls {
-            if policy.approval_required
-                && call.spec.permission_class != PermissionClass::Safe
-                && !call.approved
-            {
+            // Use effective_permission_class (not spec.permission_class) so that
+            // safe shell commands (e.g. git log) are correctly recognised as Safe.
+            // Currently shell.exec is SequentialOnly so it never reaches this path,
+            // but we use the effective class defensively for future-proofing.
+            let effective = effective_permission_class(&call.request.input, &call.spec);
+            if policy.approval_required && effective != PermissionClass::Safe && !call.approved {
                 return Err(ParallelExecutionPlanError::ApprovalRequired(
                     call.request.tool_call_id.clone(),
                 ));
@@ -1940,149 +1945,25 @@ fn validate_shell_command_safety(command: &str) -> Result<(), ToolValidationErro
 ///
 /// Commands that pass this check are promoted from `Confirm` to `Safe`
 /// by [`effective_permission_class`], skipping the approval prompt.
+///
+/// This is a backward-compatible wrapper around [`classify_shell_policy`].
 pub fn is_safe_shell_command(command: &str) -> bool {
-    let trimmed = command.trim();
-
-    // Reject command chaining / injection vectors
-    if trimmed.contains('|')
-        || trimmed.contains(';')
-        || trimmed.contains('`')
-        || trimmed.contains("$(")
-        || trimmed.contains("${")
-        || trimmed.contains('\n')
-        || trimmed.contains("&&")
-        || trimmed.contains('>')
-        || trimmed.contains('<')
-    {
-        return false;
-    }
-
-    // gh api: GET-only is safe (token-split based flag detection)
-    if trimmed.starts_with("gh api ") {
-        let tokens: Vec<&str> = trimmed.split_whitespace().collect();
-
-        // Flags that imply a mutating request by their mere presence.
-        const BODY_FLAGS: &[&str] = &["-f", "--field", "-F", "--raw-field", "--input"];
-
-        // Combined flag=value forms that imply mutation.
-        const MUTATION_COMBINED: &[&str] = &[
-            "-XPOST",
-            "-XPUT",
-            "-XPATCH",
-            "-XDELETE",
-            "--method=POST",
-            "--method=PUT",
-            "--method=PATCH",
-            "--method=DELETE",
-            "--input=",
-            "-f=",
-            "--field=",
-            "-F=",
-            "--raw-field=",
-        ];
-
-        for (i, token) in tokens.iter().enumerate() {
-            // Body/field flags always imply mutation (POST is the gh default).
-            if BODY_FLAGS.iter().any(|f| token == f) {
-                return false;
-            }
-
-            // --method / -X followed by a mutating HTTP verb.
-            if (*token == "--method" || *token == "-X")
-                && let Some(next) = tokens.get(i + 1)
-            {
-                let upper = next.to_uppercase();
-                if ["POST", "PUT", "PATCH", "DELETE"].contains(&upper.as_str()) {
-                    return false;
-                }
-            }
-
-            // Combined forms (e.g. -XPOST, --method=POST, --input=file)
-            if MUTATION_COMBINED.iter().any(|f| token.starts_with(f)) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    // Auto-approved command prefixes, grouped by category for readability.
-    const SAFE_PREFIXES: &[&str] = &[
-        // Git read-only
-        "git log",
-        "git status",
-        "git diff",
-        "git branch",
-        "git show ", // trailing space requires an argument (ref)
-        "git remote -v",
-        "git rev-parse",
-        // GitHub CLI read-only
-        "gh repo view",
-        "gh pr list",
-        "gh issue list",
-        "gh pr view",
-        "gh issue view",
-        "gh auth status",
-        // Rust build/test/lint
-        "cargo clippy",
-        "cargo fmt --check",
-        "cargo test",
-        "cargo check",
-        "cargo build",
-        // Node.js build/test/lint
-        "npm test",
-        "npx jest ",
-        "npx eslint ",
-        "npx prettier --check",
-        // Python test/lint
-        "pytest",
-        "ruff check ",
-        "flake8",
-        // Go build/test/lint
-        "go test",
-        "go vet",
-        "golangci-lint",
-        // Make build/test
-        "make test",
-        "make check",
-        // Environment inspection
-        "which ",
-        "uname",
-        "node -v",
-        "node --version",
-        "rustc --version",
-        "cargo --version",
-        "python --version",
-        "go version",
-        // Process inspection
-        "lsof -i",
-    ];
-
-    if !SAFE_PREFIXES
-        .iter()
-        .any(|prefix| trimmed.starts_with(prefix))
-    {
-        return false;
-    }
-
-    // Block dangerous options that may launch external processes
-    let dangerous_options = ["--web", "--browse"];
-    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
-    for token in &tokens {
-        if dangerous_options.iter().any(|opt| token == opt) {
-            return false;
-        }
-    }
-    true
+    classify_shell_policy(command) != ShellPolicy::General
 }
 
 /// Compute the effective permission class for a tool call.
 ///
-/// Safe shell commands (as determined by [`is_safe_shell_command`]) are
-/// promoted from `Confirm` to `Safe`, skipping the approval prompt.
+/// Shell commands are classified via [`classify_shell_policy`]:
+/// - `ReadOnly` / `BuildTest` → `Safe` (auto-approved)
+/// - `General` → uses spec's permission class (typically `Confirm`)
+///
 /// All other tools (including MCP) use their spec's permission class directly.
 pub fn effective_permission_class(input: &ToolInput, spec: &ToolSpec) -> PermissionClass {
     match input {
-        ToolInput::ShellExec { command } if is_safe_shell_command(command) => PermissionClass::Safe,
+        ToolInput::ShellExec { command } => match classify_shell_policy(command) {
+            ShellPolicy::ReadOnly | ShellPolicy::BuildTest => PermissionClass::Safe,
+            ShellPolicy::General => spec.permission_class,
+        },
         _ => spec.permission_class,
     }
 }

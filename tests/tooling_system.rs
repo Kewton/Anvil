@@ -667,6 +667,283 @@ fn web_search_serde_round_trip() {
     assert_eq!(input, deserialized);
 }
 
+// --- classify_shell_policy tests ---
+
+mod classify_shell_policy_tests {
+    use anvil::tooling::{ShellPolicy, classify_shell_policy};
+
+    #[test]
+    fn read_only_git_log() {
+        assert_eq!(
+            classify_shell_policy("git log --oneline"),
+            ShellPolicy::ReadOnly
+        );
+    }
+
+    #[test]
+    fn read_only_git_status() {
+        assert_eq!(classify_shell_policy("git status"), ShellPolicy::ReadOnly);
+    }
+
+    #[test]
+    fn read_only_git_diff() {
+        assert_eq!(classify_shell_policy("git diff"), ShellPolicy::ReadOnly);
+    }
+
+    #[test]
+    fn read_only_git_branch() {
+        assert_eq!(classify_shell_policy("git branch"), ShellPolicy::ReadOnly);
+    }
+
+    #[test]
+    fn read_only_git_show_with_ref() {
+        assert_eq!(
+            classify_shell_policy("git show HEAD"),
+            ShellPolicy::ReadOnly
+        );
+    }
+
+    #[test]
+    fn read_only_gh_api_get() {
+        assert_eq!(
+            classify_shell_policy("gh api repos/o/r/stats"),
+            ShellPolicy::ReadOnly
+        );
+    }
+
+    #[test]
+    fn read_only_which() {
+        assert_eq!(classify_shell_policy("which rustc"), ShellPolicy::ReadOnly);
+    }
+
+    #[test]
+    fn read_only_uname() {
+        assert_eq!(classify_shell_policy("uname"), ShellPolicy::ReadOnly);
+    }
+
+    #[test]
+    fn read_only_lsof_i() {
+        assert_eq!(classify_shell_policy("lsof -i"), ShellPolicy::ReadOnly);
+    }
+
+    #[test]
+    fn build_test_cargo_test() {
+        assert_eq!(classify_shell_policy("cargo test"), ShellPolicy::BuildTest);
+    }
+
+    #[test]
+    fn build_test_cargo_build() {
+        assert_eq!(classify_shell_policy("cargo build"), ShellPolicy::BuildTest);
+    }
+
+    #[test]
+    fn build_test_cargo_clippy() {
+        assert_eq!(
+            classify_shell_policy("cargo clippy --all-targets"),
+            ShellPolicy::BuildTest
+        );
+    }
+
+    #[test]
+    fn build_test_npm_test() {
+        assert_eq!(classify_shell_policy("npm test"), ShellPolicy::BuildTest);
+    }
+
+    #[test]
+    fn build_test_pytest() {
+        assert_eq!(
+            classify_shell_policy("pytest tests/"),
+            ShellPolicy::BuildTest
+        );
+    }
+
+    #[test]
+    fn build_test_go_test() {
+        assert_eq!(
+            classify_shell_policy("go test ./..."),
+            ShellPolicy::BuildTest
+        );
+    }
+
+    #[test]
+    fn build_test_make_test() {
+        assert_eq!(classify_shell_policy("make test"), ShellPolicy::BuildTest);
+    }
+
+    #[test]
+    fn general_curl() {
+        assert_eq!(
+            classify_shell_policy("curl https://example.com"),
+            ShellPolicy::General
+        );
+    }
+
+    #[test]
+    fn general_unknown_command() {
+        assert_eq!(
+            classify_shell_policy("some-unknown-command"),
+            ShellPolicy::General
+        );
+    }
+
+    #[test]
+    fn pipe_fallback_to_general() {
+        assert_eq!(
+            classify_shell_policy("git log | head -5"),
+            ShellPolicy::General
+        );
+    }
+
+    #[test]
+    fn chain_fallback_to_general() {
+        assert_eq!(
+            classify_shell_policy("cargo test && rm -rf /"),
+            ShellPolicy::General
+        );
+    }
+
+    #[test]
+    fn case_insensitive_git_log() {
+        assert_eq!(
+            classify_shell_policy("GIT LOG --oneline"),
+            ShellPolicy::ReadOnly
+        );
+    }
+
+    #[test]
+    fn case_insensitive_cargo_test() {
+        assert_eq!(classify_shell_policy("Cargo Test"), ShellPolicy::BuildTest);
+    }
+
+    #[test]
+    fn dangerous_options_web_general() {
+        assert_eq!(
+            classify_shell_policy("gh repo view --web"),
+            ShellPolicy::General
+        );
+    }
+
+    #[test]
+    fn dangerous_options_browse_general() {
+        assert_eq!(
+            classify_shell_policy("gh issue list --browse"),
+            ShellPolicy::General
+        );
+    }
+
+    #[test]
+    fn gh_api_post_is_general() {
+        assert_eq!(
+            classify_shell_policy("gh api --method POST repos/o/r/issues"),
+            ShellPolicy::General
+        );
+    }
+
+    #[test]
+    fn gh_api_xdelete_is_general() {
+        assert_eq!(
+            classify_shell_policy("gh api -XDELETE repos/o/r/issues/1"),
+            ShellPolicy::General
+        );
+    }
+
+    #[test]
+    fn gh_api_field_flag_is_general() {
+        assert_eq!(
+            classify_shell_policy("gh api -f title=hacked repos/o/r/issues"),
+            ShellPolicy::General
+        );
+    }
+}
+
+// --- is_network_command tests ---
+
+mod is_network_command_tests {
+    use anvil::tooling::is_network_command;
+
+    #[test]
+    fn curl_is_network() {
+        assert!(is_network_command("curl https://example.com"));
+    }
+
+    #[test]
+    fn wget_is_network() {
+        assert!(is_network_command("wget https://example.com"));
+    }
+
+    #[test]
+    fn ssh_is_network() {
+        assert!(is_network_command("ssh user@host"));
+    }
+
+    #[test]
+    fn ping_is_network() {
+        assert!(is_network_command("ping 8.8.8.8"));
+    }
+
+    #[test]
+    fn scp_is_network() {
+        assert!(is_network_command("scp file user@host:/tmp/"));
+    }
+
+    #[test]
+    fn dig_is_network() {
+        assert!(is_network_command("dig example.com"));
+    }
+
+    #[test]
+    fn ls_is_not_network() {
+        assert!(!is_network_command("ls -la"));
+    }
+
+    #[test]
+    fn git_is_not_network() {
+        assert!(!is_network_command("git log"));
+    }
+
+    #[test]
+    fn cargo_is_not_network() {
+        assert!(!is_network_command("cargo test"));
+    }
+
+    #[test]
+    fn case_insensitive_curl() {
+        assert!(is_network_command("CURL https://example.com"));
+    }
+
+    #[test]
+    fn case_insensitive_wget() {
+        assert!(is_network_command("Wget https://example.com"));
+    }
+
+    #[test]
+    fn sudo_curl_is_network() {
+        assert!(is_network_command("sudo curl https://example.com"));
+    }
+
+    #[test]
+    fn env_wget_is_network() {
+        assert!(is_network_command("env wget https://example.com"));
+    }
+
+    #[test]
+    fn absolute_path_curl_is_network() {
+        assert!(is_network_command("/usr/bin/curl https://example.com"));
+    }
+
+    #[test]
+    fn env_var_prefix_curl_is_network() {
+        assert!(is_network_command(
+            "HTTPS_PROXY=proxy curl https://example.com"
+        ));
+    }
+
+    #[test]
+    fn env_i_curl_is_network() {
+        assert!(is_network_command("env -i curl https://example.com"));
+    }
+}
+
 // --- is_safe_shell_command: gh api tests ---
 
 mod safe_shell_gh_api {
