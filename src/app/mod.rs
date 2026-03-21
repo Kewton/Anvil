@@ -458,7 +458,7 @@ impl App {
     /// Called each turn to include only relevant tool descriptions.
     /// Offline mode filters out web.* tools from the effective used_tools set.
     fn build_dynamic_system_prompt(&self) -> String {
-        use crate::agent::tool_protocol_system_prompt;
+        use crate::agent::tool_protocol_system_prompt_with_mode;
 
         // Offline mode: exclude web.* tools from used_tools.
         // Non-offline: pass a reference directly to avoid cloning.
@@ -476,11 +476,14 @@ impl App {
             &self.session.used_tools
         };
 
-        let mut prompt = tool_protocol_system_prompt(
+        let protocol = self.provider.capabilities.tool_protocol;
+
+        let mut prompt = tool_protocol_system_prompt_with_mode(
             &self.detected_languages,
             self.mcp_descriptions.as_deref(),
             effective_used_tools,
             self.config.mode.offline,
+            protocol,
         );
 
         // Current date and timezone (dynamic, re-evaluated per turn)
@@ -1799,7 +1802,9 @@ impl App {
         }
 
         let rel_path = match &request.input {
-            ToolInput::FileWrite { path, .. } | ToolInput::FileEdit { path, .. } => path,
+            ToolInput::FileWrite { path, .. }
+            | ToolInput::FileEdit { path, .. }
+            | ToolInput::FileEditAnchor { path, .. } => path,
             _ => return None,
         };
 
