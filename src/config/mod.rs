@@ -69,6 +69,10 @@ pub struct RuntimeConfig {
     /// Smart compact threshold ratio (0.1..=0.95, default 0.75).
     /// When estimated tokens exceed context_window * ratio, token-based compaction triggers.
     pub smart_compact_threshold_ratio: f64,
+    /// Maximum number of LLM turns a sub-agent may perform (Issue #129).
+    pub subagent_max_iterations: u32,
+    /// Wall-clock timeout in seconds for the entire sub-agent run (Issue #129).
+    pub subagent_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -217,6 +221,8 @@ impl EffectiveConfig {
                 context_window_explicitly_set: false,
                 tag_protocol: None,
                 smart_compact_threshold_ratio: 0.75,
+                subagent_max_iterations: 10,
+                subagent_timeout_secs: 120,
             },
             mode: ModeConfig {
                 prompt_source: PromptSource::Interactive,
@@ -311,6 +317,8 @@ impl EffectiveConfig {
             "ANVIL_OFFLINE",
             "ANVIL_TAG_PROTOCOL",
             "ANVIL_SMART_COMPACT_THRESHOLD_RATIO",
+            "ANVIL_SUBAGENT_MAX_ITERATIONS",
+            "ANVIL_SUBAGENT_TIMEOUT",
         ] {
             if let Ok(value) = std::env::var(key) {
                 map.insert(key.to_string(), value);
@@ -508,6 +516,16 @@ impl EffectiveConfig {
                         .parse()
                         .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
                 }
+                "subagent_max_iterations" | "ANVIL_SUBAGENT_MAX_ITERATIONS" => {
+                    self.runtime.subagent_max_iterations = value
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                }
+                "subagent_timeout_secs" | "ANVIL_SUBAGENT_TIMEOUT" => {
+                    self.runtime.subagent_timeout_secs = value
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                }
                 _ => {}
             }
         }
@@ -533,6 +551,7 @@ impl EffectiveConfig {
         self.clamp_context_budget();
         self.clamp_agent_iterations();
         self.clamp_smart_compact_ratio();
+        self.clamp_subagent_settings();
         Ok(())
     }
 
@@ -610,6 +629,32 @@ impl EffectiveConfig {
             self.runtime.max_agent_iterations = MAX_AGENT_ITERATIONS;
             eprintln!(
                 "Warning: max_agent_iterations={old} exceeds maximum ({MAX_AGENT_ITERATIONS}), adjusted to {MAX_AGENT_ITERATIONS}"
+            );
+        }
+    }
+
+    /// Clamp sub-agent iteration/timeout settings.
+    /// If 0, restore to default values. Enforce upper bounds.
+    fn clamp_subagent_settings(&mut self) {
+        const MAX_SUBAGENT_ITERATIONS: u32 = 100;
+        const MAX_SUBAGENT_TIMEOUT_SECS: u64 = 3600;
+
+        if self.runtime.subagent_max_iterations == 0 {
+            self.runtime.subagent_max_iterations = 10;
+        } else if self.runtime.subagent_max_iterations > MAX_SUBAGENT_ITERATIONS {
+            let old = self.runtime.subagent_max_iterations;
+            self.runtime.subagent_max_iterations = MAX_SUBAGENT_ITERATIONS;
+            eprintln!(
+                "Warning: subagent_max_iterations={old} exceeds maximum ({MAX_SUBAGENT_ITERATIONS}), adjusted to {MAX_SUBAGENT_ITERATIONS}"
+            );
+        }
+        if self.runtime.subagent_timeout_secs == 0 {
+            self.runtime.subagent_timeout_secs = 120;
+        } else if self.runtime.subagent_timeout_secs > MAX_SUBAGENT_TIMEOUT_SECS {
+            let old = self.runtime.subagent_timeout_secs;
+            self.runtime.subagent_timeout_secs = MAX_SUBAGENT_TIMEOUT_SECS;
+            eprintln!(
+                "Warning: subagent_timeout_secs={old} exceeds maximum ({MAX_SUBAGENT_TIMEOUT_SECS}), adjusted to {MAX_SUBAGENT_TIMEOUT_SECS}"
             );
         }
     }

@@ -100,7 +100,7 @@ src/
 ├── lib.rs               # モジュール宣言
 ├── agent/
 │   ├── mod.rs           # エージェントループ・プロトコル
-│   └── subagent.rs      # サブエージェント実行ループ（Explore/Plan）
+│   └── subagent.rs      # サブエージェント実行ループ（Explore/Plan、構造化payload・JSON ANVIL_FINAL対応）
 ├── app/
 │   ├── mod.rs           # アプリケーションオーケストレータ
 │   ├── agentic.rs       # agenticツール実行ループ
@@ -112,7 +112,7 @@ src/
 │   └── mock.rs          # テスト用モック
 ├── config/mod.rs        # 設定管理
 ├── contracts/
-│   ├── mod.rs           # 共通型定義
+│   ├── mod.rs           # 共通型定義（TerminationReason, Finding, SubAgentPayload含む）
 │   └── tokens.rs        # トークン推定（CJK対応ヒューリスティック・モデル実測値ベースEMA補正）
 ├── extensions/
 │   ├── mod.rs           # スラッシュコマンド・拡張

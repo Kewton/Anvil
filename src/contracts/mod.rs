@@ -8,6 +8,82 @@ pub mod tokens;
 
 use serde::{Deserialize, Serialize};
 
+// ---------------------------------------------------------------------------
+// Sub-agent payload types (Issue #129)
+// ---------------------------------------------------------------------------
+
+/// Sub-agent の実行終了理由。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminationReason {
+    #[default]
+    Completed,
+    Timeout,
+    MaxIterations,
+}
+
+impl std::fmt::Display for TerminationReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Completed => write!(f, "completed"),
+            Self::Timeout => write!(f, "timeout"),
+            Self::MaxIterations => write!(f, "max_iterations"),
+        }
+    }
+}
+
+/// Sub-agent が探索で発見した個別の知見。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Finding {
+    /// 発見事項の短いタイトル
+    pub title: String,
+    /// 根拠を含む詳細説明
+    pub detail: String,
+    /// 関連するファイルパス、シンボル名、行参照など
+    pub related_code: Vec<String>,
+}
+
+/// Sub-agent の構造化返却 payload。
+/// 成功時もエラー時も同一構造で返す。
+/// termination_reason / error はシステムが設定するフィールドであり、LLM出力からは設定されない。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubAgentPayload {
+    /// 探索で発見した関連ファイルパス
+    pub found_files: Vec<String>,
+    /// 主要な発見事項
+    pub key_findings: Vec<Finding>,
+    /// LLMが生成したフリーテキストのサマリー
+    pub raw_summary: String,
+    /// 結果の信頼度（0.0-1.0、clamp適用）
+    /// 現在は情報提供目的のみ。将来的に親エージェントが低信頼度時の再探索判断に使用可能。
+    #[serde(default)]
+    pub confidence: Option<f32>,
+    /// 実行終了理由（システムが設定、LLM出力には含まない）
+    #[serde(default)]
+    pub termination_reason: TerminationReason,
+    /// エラー時のメッセージ（成功時はNone）
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+impl SubAgentPayload {
+    /// フォールバック用コンストラクタ（JSON パース失敗時や部分結果構築時に使用）
+    pub fn fallback(raw_summary: String, reason: TerminationReason) -> Self {
+        Self {
+            found_files: vec![],
+            key_findings: vec![],
+            raw_summary,
+            confidence: None,
+            termination_reason: reason,
+            error: None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Application lifecycle types
+// ---------------------------------------------------------------------------
+
 /// The runtime lifecycle states of the application.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RuntimeState {
@@ -638,5 +714,140 @@ mod tests {
         let snapshot =
             AppStateSnapshot::new(RuntimeState::Done).with_inference_performance(perf.clone());
         assert_eq!(snapshot.inference_performance, Some(perf));
+    }
+
+    // ============================================================
+    // TerminationReason tests (Issue #129, Task 1.1)
+    // ============================================================
+
+    #[test]
+    fn termination_reason_default_is_completed() {
+        assert_eq!(TerminationReason::default(), TerminationReason::Completed);
+    }
+
+    #[test]
+    fn termination_reason_display() {
+        assert_eq!(TerminationReason::Completed.to_string(), "completed");
+        assert_eq!(TerminationReason::Timeout.to_string(), "timeout");
+        assert_eq!(
+            TerminationReason::MaxIterations.to_string(),
+            "max_iterations"
+        );
+    }
+
+    #[test]
+    fn termination_reason_serde_roundtrip() {
+        for reason in [
+            TerminationReason::Completed,
+            TerminationReason::Timeout,
+            TerminationReason::MaxIterations,
+        ] {
+            let json = serde_json::to_string(&reason).expect("serialize");
+            let back: TerminationReason = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(reason, back);
+        }
+    }
+
+    #[test]
+    fn termination_reason_serde_snake_case() {
+        let json = serde_json::to_string(&TerminationReason::MaxIterations).expect("serialize");
+        assert_eq!(json, r#""max_iterations""#);
+        let back: TerminationReason =
+            serde_json::from_str(r#""max_iterations""#).expect("deserialize");
+        assert_eq!(back, TerminationReason::MaxIterations);
+    }
+
+    // ============================================================
+    // Finding tests (Issue #129, Task 1.2)
+    // ============================================================
+
+    #[test]
+    fn finding_serde_roundtrip() {
+        let finding = Finding {
+            title: "Found pattern".to_string(),
+            detail: "The module uses X pattern".to_string(),
+            related_code: vec!["src/main.rs:10".to_string(), "src/lib.rs:20".to_string()],
+        };
+        let json = serde_json::to_string(&finding).expect("serialize");
+        let back: Finding = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(finding, back);
+    }
+
+    #[test]
+    fn finding_empty_related_code() {
+        let finding = Finding {
+            title: "Simple finding".to_string(),
+            detail: "No code refs".to_string(),
+            related_code: vec![],
+        };
+        let json = serde_json::to_string(&finding).expect("serialize");
+        let back: Finding = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(finding, back);
+    }
+
+    // ============================================================
+    // SubAgentPayload tests (Issue #129, Task 1.3)
+    // ============================================================
+
+    #[test]
+    fn subagent_payload_full_roundtrip() {
+        let payload = SubAgentPayload {
+            found_files: vec!["src/main.rs".to_string()],
+            key_findings: vec![Finding {
+                title: "Entry point".to_string(),
+                detail: "Main function found".to_string(),
+                related_code: vec!["src/main.rs:1".to_string()],
+            }],
+            raw_summary: "Found the entry point".to_string(),
+            confidence: Some(0.9),
+            termination_reason: TerminationReason::Completed,
+            error: None,
+        };
+        let json = serde_json::to_string(&payload).expect("serialize");
+        let back: SubAgentPayload = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.found_files, payload.found_files);
+        assert_eq!(back.key_findings, payload.key_findings);
+        assert_eq!(back.raw_summary, payload.raw_summary);
+        assert_eq!(back.confidence, payload.confidence);
+        assert_eq!(back.termination_reason, payload.termination_reason);
+        assert_eq!(back.error, payload.error);
+    }
+
+    #[test]
+    fn subagent_payload_defaults_for_optional_fields() {
+        // JSON without optional fields should deserialize with defaults
+        let json = r#"{"found_files":[],"key_findings":[],"raw_summary":"hello"}"#;
+        let payload: SubAgentPayload = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(payload.confidence, None);
+        assert_eq!(payload.termination_reason, TerminationReason::Completed);
+        assert_eq!(payload.error, None);
+    }
+
+    #[test]
+    fn subagent_payload_fallback_constructor() {
+        let payload =
+            SubAgentPayload::fallback("partial result".to_string(), TerminationReason::Timeout);
+        assert!(payload.found_files.is_empty());
+        assert!(payload.key_findings.is_empty());
+        assert_eq!(payload.raw_summary, "partial result");
+        assert_eq!(payload.confidence, None);
+        assert_eq!(payload.termination_reason, TerminationReason::Timeout);
+        assert_eq!(payload.error, None);
+    }
+
+    #[test]
+    fn subagent_payload_with_error() {
+        let payload = SubAgentPayload {
+            found_files: vec![],
+            key_findings: vec![],
+            raw_summary: String::new(),
+            confidence: None,
+            termination_reason: TerminationReason::Timeout,
+            error: Some("timed out during exploration".to_string()),
+        };
+        let json = serde_json::to_string(&payload).expect("serialize");
+        let back: SubAgentPayload = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.error, Some("timed out during exploration".to_string()));
+        assert_eq!(back.termination_reason, TerminationReason::Timeout);
     }
 }

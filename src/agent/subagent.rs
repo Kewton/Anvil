@@ -5,6 +5,7 @@
 
 use crate::app::policy::{OFFLINE_BLOCK_PAYLOAD, check_offline_blocked};
 use crate::config::EffectiveConfig;
+use crate::contracts::{Finding, SubAgentPayload, TerminationReason};
 use crate::provider::{ProviderClient, ProviderEvent, ProviderTurnError};
 use crate::session::{MessageRole, SessionMessage, SessionRecord};
 use crate::tooling::{
@@ -12,18 +13,14 @@ use crate::tooling::{
     ToolExecutionStatus, ToolInput, ToolRegistry,
 };
 
+use serde::Deserialize;
+
 use super::BasicAgentLoop;
 
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-
-/// Maximum number of LLM turns a sub-agent may perform.
-const MAX_SUBAGENT_ITERATIONS: u32 = 10;
-
-/// Wall-clock timeout for the entire sub-agent run.
-const SUBAGENT_TIMEOUT: Duration = Duration::from_secs(120);
 
 // ---------------------------------------------------------------------------
 // Sub-agent system prompt constants
@@ -34,9 +31,20 @@ const SUBAGENT_PROTOCOL_BASE: &str = r#"You are a sub-agent of Anvil, a local co
 ## Tool protocol
 When you need to read files or search, respond using fenced blocks.
 
-After you have gathered enough information, output your final answer inside:
+After you have gathered enough information, output your final answer as JSON inside:
 ```ANVIL_FINAL
-Your summary here.
+{
+  "found_files": ["path/to/file1.rs", "path/to/file2.rs"],
+  "key_findings": [
+    {
+      "title": "Short title of finding",
+      "detail": "Detailed explanation with evidence",
+      "related_code": ["src/main.rs:10", "src/lib.rs:20"]
+    }
+  ],
+  "raw_summary": "A concise overall summary of what you found.",
+  "confidence": 0.8
+}
 ```
 
 Rules:
@@ -44,6 +52,7 @@ Rules:
 - Do not use any other tool syntax.
 - Always include ANVIL_FINAL when you are done.
 - You MUST output ANVIL_FINAL to signal completion.
+- Output valid JSON in ANVIL_FINAL. If you cannot produce JSON, plain text is acceptable as fallback.
 
 "#;
 
@@ -97,24 +106,33 @@ const TOOL_DESC_GIT_LOG: &str = r#"- git.log — show commit log (oneline format
 "#;
 
 const EXPLORE_ROLE_PROMPT: &str = r#"## Your role
-You are an Explore sub-agent. Your task is to investigate the codebase and gather information.
+You are an Explore sub-agent specializing in codebase investigation and information gathering.
 - Read files and search for patterns to understand the code structure.
-- Summarize your findings clearly in ANVIL_FINAL.
+- List discovered file paths in "found_files".
+- Describe each significant finding in "key_findings" with title, detail, and related_code.
+- Provide a concise overall summary in "raw_summary".
+- Set "confidence" (0.0-1.0) based on how thoroughly you explored the topic.
 - You only have read-only access: file.read and file.search.
 "#;
 
 const PLAN_ROLE_PROMPT: &str = r#"## Your role
-You are a Plan sub-agent. Your task is to create an implementation plan.
+You are a Plan sub-agent specializing in implementation planning.
 - Read files and search the codebase to understand existing patterns.
 - You may fetch web URLs for reference documentation.
-- Produce a detailed, actionable plan in ANVIL_FINAL.
+- List relevant file paths in "found_files".
+- Describe plan steps as "key_findings" with actionable details.
+- Provide the overall plan summary in "raw_summary".
+- Produce a detailed, actionable plan in ANVIL_FINAL as JSON.
 - You only have read-only access: file.read, file.search, and web.fetch.
 "#;
 
 const PLAN_ROLE_PROMPT_OFFLINE: &str = r#"## Your role
-You are a Plan sub-agent. Your task is to create an implementation plan.
+You are a Plan sub-agent specializing in implementation planning.
 - Read files and search the codebase to understand existing patterns.
-- Produce a detailed, actionable plan in ANVIL_FINAL.
+- List relevant file paths in "found_files".
+- Describe plan steps as "key_findings" with actionable details.
+- Provide the overall plan summary in "raw_summary".
+- Produce a detailed, actionable plan in ANVIL_FINAL as JSON.
 - You only have read-only access: file.read and file.search.
 - Note: Offline mode is active. Web access is unavailable.
 "#;
@@ -176,28 +194,30 @@ impl SubAgentKind {
 
 /// Result returned by a successful sub-agent run.
 pub struct SubAgentResult {
-    pub summary: String,
+    /// 構造化ペイロード
+    pub payload: SubAgentPayload,
+    /// 推定トークン数
     pub estimated_tokens: usize,
+    /// 使用したイテレーション数
     pub iterations_used: u32,
-    pub timed_out: bool,
 }
 
 impl SubAgentResult {
     /// Convert into a [`ToolExecutionResult`] for integration with the main
     /// agent's tool result recording flow.
     pub fn into_tool_execution_result(self, call: &ToolCallRequest) -> ToolExecutionResult {
-        // Both timed_out and normal completion are Completed status;
-        // timed_out flag is preserved in the SubAgentResult for reporting.
-        let status = ToolExecutionStatus::Completed;
+        let reason = self.payload.termination_reason;
+        let iterations = self.iterations_used;
+        let summary = format!("sub-agent {reason} in {iterations} iteration(s)");
+        let json = serde_json::to_string(&self.payload)
+            .unwrap_or_else(|e| format!("{{\"error\": \"serialize failed: {e}\"}}"));
+
         ToolExecutionResult {
             tool_call_id: call.tool_call_id.clone(),
             tool_name: call.tool_name.clone(),
-            status,
-            summary: format!(
-                "sub-agent completed in {} iteration(s)",
-                self.iterations_used
-            ),
-            payload: ToolExecutionPayload::Text(self.summary),
+            status: ToolExecutionStatus::Completed,
+            summary,
+            payload: ToolExecutionPayload::Text(json),
             artifacts: Vec::new(),
             elapsed_ms: 0,
         }
@@ -205,16 +225,16 @@ impl SubAgentResult {
 }
 
 /// Errors that can occur during sub-agent execution.
+///
+/// Note: Timeout and MaxIterations have been moved to the Ok path (Issue #129).
+/// They are now represented as `SubAgentResult` with `TerminationReason::Timeout`
+/// or `TerminationReason::MaxIterations`.
 #[derive(Debug)]
 pub enum SubAgentError {
     /// LLM communication error.
     Provider(ProviderTurnError),
     /// Tool execution error within the sub-agent.
     ToolExecution(String),
-    /// Wall-clock timeout exceeded.
-    Timeout,
-    /// Iteration limit reached.
-    MaxIterations,
     /// Scope path failed sandbox validation.
     SandboxViolation(String),
 }
@@ -226,8 +246,6 @@ impl std::fmt::Display for SubAgentError {
             SubAgentError::ToolExecution(msg) => {
                 write!(f, "SubAgent tool execution error: {msg}")
             }
-            SubAgentError::Timeout => write!(f, "SubAgent timed out"),
-            SubAgentError::MaxIterations => write!(f, "SubAgent reached max iterations"),
             SubAgentError::SandboxViolation(path) => {
                 write!(f, "SubAgent sandbox violation: {path}")
             }
@@ -240,20 +258,13 @@ impl std::error::Error for SubAgentError {}
 impl SubAgentError {
     /// Convert this error into a [`ToolExecutionResult`].
     ///
-    /// Conversion policy:
-    /// - Timeout / MaxIterations -> Completed (partial result may exist)
-    /// - Provider / ToolExecution / SandboxViolation -> Failed
+    /// All remaining error variants map to Failed status (Issue #129).
     pub fn into_tool_execution_result(self, call: &ToolCallRequest) -> ToolExecutionResult {
-        let (status, output) = match &self {
-            SubAgentError::Timeout | SubAgentError::MaxIterations => {
-                (ToolExecutionStatus::Completed, self.to_string())
-            }
-            _ => (ToolExecutionStatus::Failed, self.to_string()),
-        };
+        let output = self.to_string();
         ToolExecutionResult {
             tool_call_id: call.tool_call_id.clone(),
             tool_name: call.tool_name.clone(),
-            status,
+            status: ToolExecutionStatus::Failed,
             summary: output.clone(),
             payload: ToolExecutionPayload::Text(output),
             artifacts: Vec::new(),
@@ -272,6 +283,83 @@ enum TurnOutcome {
     Finished(SubAgentResult),
     /// The sub-agent wants to continue (tool calls were executed).
     Continue,
+}
+
+/// LLM出力専用DTO。システム管理フィールド (termination_reason, error) は含めない。
+#[derive(Debug, Deserialize)]
+struct SubAgentPayloadInput {
+    #[serde(default)]
+    found_files: Vec<String>,
+    #[serde(default)]
+    key_findings: Vec<Finding>,
+    #[serde(default)]
+    raw_summary: String,
+    #[serde(default)]
+    confidence: Option<f32>,
+}
+
+/// Size limit constants for sub-agent payload fields.
+const MAX_FOUND_FILES: usize = 50;
+const MAX_KEY_FINDINGS: usize = 20;
+const MAX_RELATED_CODE_PER_FINDING: usize = 20;
+const MAX_FINDING_TITLE_CHARS: usize = 200;
+const MAX_FINDING_DETAIL_CHARS: usize = 2000;
+const MAX_RAW_SUMMARY_CHARS: usize = 4000;
+
+/// Parse ANVIL_FINAL content as JSON into a SubAgentPayload.
+/// Falls back to plain text in raw_summary on parse failure.
+fn parse_final_response_to_payload(final_response: &str) -> SubAgentPayload {
+    match serde_json::from_str::<SubAgentPayloadInput>(final_response) {
+        Ok(input) => {
+            let found_files: Vec<String> = input
+                .found_files
+                .into_iter()
+                .take(MAX_FOUND_FILES)
+                .collect();
+            let key_findings: Vec<Finding> = input
+                .key_findings
+                .into_iter()
+                .take(MAX_KEY_FINDINGS)
+                .map(|finding| Finding {
+                    title: finding
+                        .title
+                        .chars()
+                        .take(MAX_FINDING_TITLE_CHARS)
+                        .collect(),
+                    detail: finding
+                        .detail
+                        .chars()
+                        .take(MAX_FINDING_DETAIL_CHARS)
+                        .collect(),
+                    related_code: finding
+                        .related_code
+                        .into_iter()
+                        .take(MAX_RELATED_CODE_PER_FINDING)
+                        .collect(),
+                })
+                .collect();
+
+            SubAgentPayload {
+                found_files,
+                key_findings,
+                raw_summary: input
+                    .raw_summary
+                    .chars()
+                    .take(MAX_RAW_SUMMARY_CHARS)
+                    .collect(),
+                confidence: input.confidence.map(|c| c.clamp(0.0, 1.0)),
+                termination_reason: TerminationReason::Completed,
+                error: None,
+            }
+        }
+        Err(_) => {
+            // Fallback: plain text to raw_summary
+            SubAgentPayload::fallback(
+                final_response.chars().take(MAX_RAW_SUMMARY_CHARS).collect(),
+                TerminationReason::Completed,
+            )
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -408,11 +496,11 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
                 &token_buffer,
                 crate::contracts::tokens::ContentKind::Text,
             );
+            let payload = parse_final_response_to_payload(&structured.final_response);
             return Ok(TurnOutcome::Finished(SubAgentResult {
-                summary: structured.final_response,
+                payload,
                 estimated_tokens: tokens,
-                iterations_used: self.iterations_used + 1,
-                timed_out: false,
+                iterations_used: self.iterations_used,
             }));
         }
 
@@ -500,6 +588,7 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
     /// Run the sub-agent loop to completion.
     ///
     /// Enforces iteration limit, wall-clock timeout, and shutdown flag.
+    /// Timeout and MaxIterations are returned as Ok with partial results (Issue #129).
     pub fn run(mut self) -> Result<SubAgentResult, SubAgentError> {
         let kind_label = match self.kind {
             SubAgentKind::Explore => "explore",
@@ -507,20 +596,29 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
         };
         eprintln!("[subagent:{kind_label}] Starting...");
         let start = Instant::now();
+        let max_iterations = self.config.runtime.subagent_max_iterations;
+        let timeout = Duration::from_secs(self.config.runtime.subagent_timeout_secs);
 
-        for iteration in 0..MAX_SUBAGENT_ITERATIONS {
-            if start.elapsed() > SUBAGENT_TIMEOUT {
-                return Err(SubAgentError::Timeout);
+        for iteration in 0..max_iterations {
+            // Wall-clock timeout -> partial result with Ok
+            if start.elapsed() > timeout {
+                eprintln!(
+                    "[subagent:{kind_label}] Timed out after {:?}",
+                    start.elapsed()
+                );
+                return Ok(self.build_partial_result(TerminationReason::Timeout, iteration + 1));
             }
+            // Shutdown flag -> partial result with Ok
             if self.shutdown_flag.load(Ordering::Relaxed) {
-                return Err(SubAgentError::Timeout);
+                eprintln!("[subagent:{kind_label}] Shutdown requested");
+                return Ok(self.build_partial_result(TerminationReason::Timeout, iteration + 1));
             }
 
             self.iterations_used = iteration + 1;
             eprintln!(
                 "[subagent:{kind_label}] iteration {}/{}...",
                 iteration + 1,
-                MAX_SUBAGENT_ITERATIONS
+                max_iterations
             );
 
             match self.run_turn()? {
@@ -529,6 +627,35 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
             }
         }
 
-        Err(SubAgentError::MaxIterations)
+        // MaxIterations -> partial result with Ok
+        eprintln!("[subagent:{kind_label}] Reached max iterations ({max_iterations})");
+        Ok(self.build_partial_result(TerminationReason::MaxIterations, max_iterations))
+    }
+
+    /// Build a partial result from the session history when interrupted by
+    /// timeout or max iterations.
+    fn build_partial_result(&self, reason: TerminationReason, iterations: u32) -> SubAgentResult {
+        // Extract the last assistant message as raw_summary
+        let raw_summary = self
+            .session
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == MessageRole::Assistant)
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
+
+        SubAgentResult {
+            payload: SubAgentPayload {
+                found_files: vec![],
+                key_findings: vec![],
+                raw_summary,
+                confidence: None,
+                termination_reason: reason,
+                error: None,
+            },
+            estimated_tokens: 0,
+            iterations_used: iterations,
+        }
     }
 }
