@@ -66,6 +66,9 @@ pub struct RuntimeConfig {
     /// Tag-based tool protocol mode override.
     /// `Some(true)` = force tag-based, `Some(false)` = force JSON, `None` = auto-detect from model name.
     pub tag_protocol: Option<bool>,
+    /// Prompt tier override: "full", "compact", or "tiny".
+    /// `None` = auto-detect from model name.
+    pub prompt_tier: Option<String>,
     /// Smart compact threshold ratio (0.1..=0.95, default 0.75).
     /// When estimated tokens exceed context_window * ratio, token-based compaction triggers.
     pub smart_compact_threshold_ratio: f64,
@@ -220,6 +223,7 @@ impl EffectiveConfig {
                 serper_api_key: None,
                 context_window_explicitly_set: false,
                 tag_protocol: None,
+                prompt_tier: None,
                 smart_compact_threshold_ratio: 0.75,
                 subagent_max_iterations: 10,
                 subagent_timeout_secs: 120,
@@ -316,6 +320,7 @@ impl EffectiveConfig {
             "ANVIL_LOG",
             "ANVIL_OFFLINE",
             "ANVIL_TAG_PROTOCOL",
+            "ANVIL_PROMPT_TIER",
             "ANVIL_SMART_COMPACT_THRESHOLD_RATIO",
             "ANVIL_SUBAGENT_MAX_ITERATIONS",
             "ANVIL_SUBAGENT_TIMEOUT",
@@ -405,6 +410,11 @@ impl EffectiveConfig {
         // Tag protocol flag
         if let Some(v) = cli.tag_protocol {
             self.runtime.tag_protocol = Some(v);
+        }
+
+        // Prompt tier override
+        if let Some(ref v) = cli.prompt_tier {
+            self.runtime.prompt_tier = Some(v.clone());
         }
 
         // --session flag: override session file path
@@ -510,6 +520,13 @@ impl EffectiveConfig {
                 }
                 "tag_protocol" | "ANVIL_TAG_PROTOCOL" => {
                     self.runtime.tag_protocol = Some(parse_bool(value));
+                }
+                "prompt_tier" | "ANVIL_PROMPT_TIER" => {
+                    self.runtime.prompt_tier = if value.is_empty() {
+                        None
+                    } else {
+                        Some(value.clone())
+                    };
                 }
                 "smart_compact_threshold_ratio" | "ANVIL_SMART_COMPACT_THRESHOLD_RATIO" => {
                     self.runtime.smart_compact_threshold_ratio = value

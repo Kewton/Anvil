@@ -8,7 +8,7 @@ pub mod subagent;
 pub mod tag_parser;
 pub mod tag_spec;
 
-pub use model_classifier::ToolProtocolMode;
+pub use model_classifier::{ModelCapability, ModelSizeClass, PromptTier, ToolProtocolMode};
 
 use crate::contracts::InferencePerformanceView;
 use crate::contracts::tokens::{ContentKind, NO_CALIBRATION, estimate_tokens_calibrated};
@@ -742,14 +742,19 @@ pub(crate) fn tool_protocol_system_prompt(
     mcp_tool_descriptions: Option<&str>,
     used_tools: &std::collections::HashSet<String>,
     offline: bool,
+    tier: PromptTier,
 ) -> String {
-    tool_protocol_system_prompt_with_mode(
-        languages,
-        mcp_tool_descriptions,
-        used_tools,
-        offline,
-        ToolProtocolMode::Json,
-    )
+    match tier {
+        PromptTier::Full => {
+            // Full tier delegates to the protocol-aware builder (Json format).
+            // TagBased protocol dispatch happens via tool_protocol_system_prompt_with_mode.
+            build_json_protocol_prompt(languages, mcp_tool_descriptions, used_tools, offline)
+        }
+        PromptTier::Compact => {
+            tool_protocol_system_prompt_compact(mcp_tool_descriptions, used_tools, offline)
+        }
+        PromptTier::Tiny => tool_protocol_system_prompt_tiny(),
+    }
 }
 
 /// Generate the system prompt with dynamic tool selection and protocol mode.
@@ -894,26 +899,111 @@ fn append_common_prompt_sections(
     }
 }
 
+/// Compact tier: basic tools + rules, guides omitted.
+fn tool_protocol_system_prompt_compact(
+    mcp_tool_descriptions: Option<&str>,
+    used_tools: &std::collections::HashSet<String>,
+    offline: bool,
+) -> String {
+    let mut prompt = String::with_capacity(4096);
+
+    // Work approach (static)
+    prompt.push_str(PROMPT_WORK_APPROACH);
+
+    // All basic tools
+    prompt.push_str(TOOL_DESC_FILE_READ);
+    prompt.push_str(TOOL_DESC_FILE_WRITE);
+    prompt.push_str(TOOL_DESC_FILE_EDIT);
+    prompt.push_str(TOOL_DESC_FILE_SEARCH);
+    prompt.push_str(TOOL_DESC_SHELL_EXEC);
+    prompt.push_str(TOOL_DESC_WEB_FETCH);
+    prompt.push_str(TOOL_DESC_WEB_SEARCH);
+
+    // Detailed descriptions for used optional tools (no catalog header)
+    for (tool_name, tool_desc, _) in OPTIONAL_TOOLS {
+        if used_tools.contains(*tool_name) {
+            if offline && tool_name.starts_with("web.") {
+                continue;
+            }
+            prompt.push_str(tool_desc);
+        }
+    }
+
+    // Tool rules (static)
+    prompt.push_str(PROMPT_TOOL_RULES);
+
+    // MCP tool descriptions (with reduced limit)
+    if let Some(mcp_desc) = mcp_tool_descriptions {
+        let truncated = if mcp_desc.len() > 4000 {
+            &mcp_desc[..4000]
+        } else {
+            mcp_desc
+        };
+        prompt.push_str("\n\n## MCP External Tools\n\n");
+        prompt.push_str(truncated);
+    }
+
+    // Omitted: CONFIRM_CLASS_GUIDANCE, GIT_GUIDE, ENV_GUIDE, PROCESS_GUIDE, language guides
+
+    prompt
+}
+
+/// Tiny tier: minimal tool syntax for very small models (<7B).
+fn tool_protocol_system_prompt_tiny() -> String {
+    let mut prompt = String::with_capacity(2048);
+
+    prompt.push_str("You are Anvil, a coding agent.\n\n");
+    prompt.push_str("Use ANVIL_TOOL blocks for tool calls. Available tools:\n\n");
+
+    // Only core 4 tools + shell
+    prompt.push_str(TOOL_DESC_FILE_READ);
+    prompt.push_str(TOOL_DESC_FILE_WRITE);
+    prompt.push_str(TOOL_DESC_FILE_EDIT);
+    prompt.push_str(TOOL_DESC_SHELL_EXEC);
+
+    prompt.push_str(concat!(
+        "Rules:\n",
+        "- All paths must be relative.\n",
+        "- Include ANVIL_FINAL block after tool blocks.\n",
+    ));
+
+    prompt
+}
+
 /// Generate a system prompt with no optional tools (basic tools only).
 ///
 /// Useful for testing that optional tools are excluded when unused.
+/// Always uses [`PromptTier::Full`] for backward compatibility.
 pub fn tool_protocol_system_prompt_basic_only(
     languages: &[ProjectLanguage],
     mcp_tool_descriptions: Option<&str>,
 ) -> String {
     let empty = std::collections::HashSet::new();
-    tool_protocol_system_prompt(languages, mcp_tool_descriptions, &empty, false)
+    tool_protocol_system_prompt(
+        languages,
+        mcp_tool_descriptions,
+        &empty,
+        false,
+        PromptTier::Full,
+    )
 }
 
 /// Generate a system prompt with all tools included (for test compatibility
 /// and contexts where all tools should be available).
+/// Always uses [`PromptTier::Full`] for backward compatibility.
 pub fn tool_protocol_system_prompt_all_tools(
     languages: &[ProjectLanguage],
     mcp_tool_descriptions: Option<&str>,
 ) -> String {
     let all_tools: std::collections::HashSet<String> =
         optional_tool_names().map(|s| s.to_string()).collect();
-    tool_protocol_system_prompt(languages, mcp_tool_descriptions, &all_tools, false)
+    tool_protocol_system_prompt(
+        languages,
+        mcp_tool_descriptions,
+        &all_tools,
+        false,
+        PromptTier::Full,
+    )
 }
 
 /// Generate a system prompt with tag-based protocol (for small model testing).
@@ -1043,7 +1133,8 @@ mod tests {
 
     #[test]
     fn catalog_hides_web_tools_offline() {
-        let prompt = tool_protocol_system_prompt(&[], None, &HashSet::new(), true);
+        let prompt =
+            tool_protocol_system_prompt(&[], None, &HashSet::new(), true, PromptTier::Full);
         assert!(
             !prompt.contains("- web.fetch:"),
             "offline prompt should not contain web.fetch catalog entry"
@@ -1066,7 +1157,7 @@ mod tests {
     fn catalog_offline_with_restored_session() {
         let mut used_tools = HashSet::new();
         used_tools.insert("web.fetch".to_string());
-        let prompt = tool_protocol_system_prompt(&[], None, &used_tools, true);
+        let prompt = tool_protocol_system_prompt(&[], None, &used_tools, true, PromptTier::Full);
         // web.fetch is now a basic tool (always included per Issue #114),
         // so the catalog entry should not exist but the basic description should.
         assert!(

@@ -81,6 +81,10 @@ pub struct CliArgs {
     #[arg(long)]
     pub trust: bool,
 
+    /// Prompt tier override (full|compact|tiny)
+    #[arg(long = "prompt-tier")]
+    pub prompt_tier: Option<String>,
+
     /// Enable tag-based tool protocol (--tag-protocol).
     #[doc(hidden)]
     #[arg(long = "tag-protocol")]
