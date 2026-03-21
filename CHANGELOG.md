@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+## [0.0.6] - 2026-03-21
+
+### Added
+- Prompt tiering and model capability classification (#132)
+- Multi-tier tool protocol and resilient editing (#128)
+- Structured working memory for long-session context retention (#130)
+- Sub-agent redesign for structured exploration payload (#129)
+- ShellPolicy classification and offline network command blocking (#131)
+- Retrieval scoring upgrade with 2-pass, keyword split, and boost for large repos (#133)
+
+### Changed
+- Codex code review phase added between TDD and acceptance test
+- Delegate 2nd-round reviews to Codex via commandmatedev
+
 ## [0.0.5] - 2026-03-21
 
 ### Added
