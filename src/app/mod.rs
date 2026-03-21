@@ -24,7 +24,9 @@ use crate::provider::{
     ProviderBootstrapError, ProviderClient, ProviderErrorKind, ProviderErrorRecord, ProviderEvent,
     ProviderRuntimeContext, ProviderTurnError,
 };
-use crate::retrieval::{RepositoryIndex, default_cache_path, render_retrieval_result};
+use crate::retrieval::{
+    DEFAULT_SEARCH_LIMIT, RepositoryIndex, default_cache_path, render_retrieval_result,
+};
 use crate::session::{
     MessageRole, MessageStatus, SessionError, SessionMessage, SessionRecord, SessionStore,
     new_assistant_message, new_user_message,
@@ -1780,7 +1782,7 @@ impl App {
         let cache_path = default_cache_path(&self.config.paths.state_dir);
         let index = RepositoryIndex::load_or_build(&self.config.paths.cwd, &cache_path)
             .map_err(|err| AppError::ToolExecution(err.to_string()))?;
-        let result = index.search(query, 5);
+        let result = index.search(query, DEFAULT_SEARCH_LIMIT);
         if !result.matches.is_empty() {
             let summary = result
                 .matches
