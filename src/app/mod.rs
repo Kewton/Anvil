@@ -499,7 +499,24 @@ impl App {
             );
         }
 
+        // Working memory injection (Issue #130)
+        if let Some(wm_prompt) = self.session.working_memory.format_for_prompt() {
+            prompt.push_str("\n\n");
+            prompt.push_str(&wm_prompt);
+        }
+
         prompt
+    }
+
+    /// Convert an absolute path to a cwd-relative string for working memory.
+    ///
+    /// Returns `None` if the path is not under the session cwd.
+    fn relative_path_for_working_memory(&self, abs_path: &std::path::Path) -> Option<String> {
+        let cwd = std::path::Path::new(&self.session.metadata.cwd);
+        abs_path
+            .strip_prefix(cwd)
+            .ok()
+            .map(|rel| rel.to_string_lossy().into_owned())
     }
 
     /// Check whether a shutdown has been requested via the shared flag.
@@ -1867,6 +1884,15 @@ impl App {
             format!("Undid {} of {} requested change(s).", restored_count, n)
         };
         lines.insert(0, summary.clone());
+
+        // Sync working memory: remove undone files from touched_files (Issue #130)
+        for result in &results {
+            if result.action != crate::tooling::RestoreAction::Skipped
+                && let Some(rel) = self.relative_path_for_working_memory(&result.path)
+            {
+                self.session.working_memory.remove_touched_file(&rel);
+            }
+        }
 
         // Record in session
         self.session.push_message(
