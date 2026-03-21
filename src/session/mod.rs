@@ -20,6 +20,183 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+// ── Working Memory ────────────────────────────────────────────────────
+
+/// Structured working memory that persists across compaction.
+///
+/// Captures the agent's current operational context so that it survives
+/// history compaction and session resume.  Injected into the system prompt
+/// on every turn via `build_dynamic_system_prompt()`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct WorkingMemory {
+    /// Current high-level task description (e.g., "Implement issue #130").
+    #[serde(default)]
+    pub active_task: Option<String>,
+
+    /// Active constraints or invariants the agent should respect.
+    #[serde(default)]
+    pub constraints: Vec<String>,
+
+    /// Recently touched file paths (relative to cwd). Capped at 20 entries.
+    #[serde(default)]
+    pub touched_files: Vec<String>,
+
+    /// Unresolved errors or issues. Capped at 10 entries.
+    #[serde(default)]
+    pub unresolved_errors: Vec<String>,
+
+    /// Recent diff summary. Capped at ~500 tokens.
+    #[serde(default)]
+    pub recent_diffs: Option<String>,
+}
+
+impl WorkingMemory {
+    /// Maximum number of tracked files.
+    const MAX_TOUCHED_FILES: usize = 20;
+    /// Maximum number of tracked errors.
+    const MAX_UNRESOLVED_ERRORS: usize = 10;
+    /// Approximate token limit for recent_diffs.
+    const MAX_DIFF_TOKENS: usize = 500;
+
+    /// Add a file path to touched_files (dedup, FIFO eviction).
+    pub fn update_touched_files(&mut self, path: &str) {
+        // Remove existing entry to move it to the end (most recent)
+        self.touched_files.retain(|p| p != path);
+        self.touched_files.push(path.to_string());
+        // Evict oldest if over capacity (only one add, so at most one eviction)
+        if self.touched_files.len() > Self::MAX_TOUCHED_FILES {
+            self.touched_files.remove(0);
+        }
+    }
+
+    /// Remove a file path from touched_files (for rollback).
+    pub fn remove_touched_file(&mut self, path: &str) {
+        self.touched_files.retain(|p| p != path);
+    }
+
+    /// Add an unresolved error (FIFO eviction at capacity).
+    pub fn add_error(&mut self, error: impl Into<String>) {
+        self.unresolved_errors.push(error.into());
+        // Only one add, so at most one eviction needed
+        if self.unresolved_errors.len() > Self::MAX_UNRESOLVED_ERRORS {
+            self.unresolved_errors.remove(0);
+        }
+    }
+
+    /// Clear a specific error by content match.
+    pub fn clear_error(&mut self, error: &str) {
+        self.unresolved_errors.retain(|e| e != error);
+    }
+
+    /// Clear all unresolved errors.
+    pub fn clear_all_errors(&mut self) {
+        self.unresolved_errors.clear();
+    }
+
+    /// Set or clear the active task.
+    pub fn set_active_task(&mut self, task: Option<String>) {
+        self.active_task = task;
+    }
+
+    /// Update recent_diffs, truncating to approximate token limit.
+    pub fn set_recent_diffs(&mut self, diffs: Option<String>) {
+        self.recent_diffs = diffs.map(|d| truncate_to_token_limit(&d, Self::MAX_DIFF_TOKENS));
+    }
+
+    /// Add a constraint string.
+    pub fn add_constraint(&mut self, constraint: impl Into<String>) {
+        self.constraints.push(constraint.into());
+    }
+
+    /// Returns true if all fields are empty/None.
+    pub fn is_empty(&self) -> bool {
+        self.active_task.is_none()
+            && self.constraints.is_empty()
+            && self.touched_files.is_empty()
+            && self.unresolved_errors.is_empty()
+            && self.recent_diffs.is_none()
+    }
+
+    /// Serialize working memory into a human-readable format for system prompt injection.
+    /// Returns None if the working memory is empty.
+    pub fn format_for_prompt(&self) -> Option<String> {
+        if self.is_empty() {
+            return None;
+        }
+        let mut sections = Vec::new();
+        sections.push("## Working Memory (auto-maintained)".to_string());
+
+        if let Some(ref task) = self.active_task {
+            sections.push(format!(
+                "**Active task:** {}",
+                sanitize_for_prompt_entry(task)
+            ));
+        }
+
+        // Helper: append a labelled bullet list if non-empty
+        let mut push_list = |label: &str, items: &[String]| {
+            if !items.is_empty() {
+                sections.push(format!("**{label}:**"));
+                for item in items {
+                    sections.push(format!("- {}", sanitize_for_prompt_entry(item)));
+                }
+            }
+        };
+        push_list("Constraints", &self.constraints);
+        push_list("Touched files", &self.touched_files);
+        push_list("Unresolved errors", &self.unresolved_errors);
+
+        if let Some(ref diffs) = self.recent_diffs {
+            sections.push(format!(
+                "**Recent diffs:**\n```\n{}\n```",
+                sanitize_for_prompt_entry(diffs)
+            ));
+        }
+
+        Some(sections.join("\n"))
+    }
+}
+
+/// Sanitize a string before embedding it in the system prompt.
+///
+/// Removes protocol markers (`ANVIL_TOOL`, `ANVIL_FINAL`), triple backticks,
+/// all control characters (including newline and tab to prevent prompt structure
+/// injection), and truncates extremely long strings using char count for UTF-8
+/// safety.
+pub(crate) fn sanitize_for_prompt_entry(input: &str) -> String {
+    const REMOVALS: &[&str] = &["ANVIL_TOOL", "ANVIL_FINAL", "```"];
+    let mut s = input.to_string();
+    for pattern in REMOVALS {
+        s = s.replace(pattern, "");
+    }
+    // Remove control characters including newline and tab to prevent prompt structure injection
+    s = s.chars().filter(|&c| !c.is_control()).collect();
+    // Truncate extremely long strings (> 500 chars) — use char count for UTF-8 safety
+    let char_count = s.chars().count();
+    if char_count > 500 {
+        s = format!("{}...[truncated]", s.chars().take(497).collect::<String>());
+    }
+    s
+}
+
+/// Truncate a string to approximately `max_tokens` tokens.
+///
+/// Uses `contracts::tokens::estimate_tokens` with `ContentKind::Text` to
+/// estimate the token count and performs a binary-search-like trim by
+/// character count.
+fn truncate_to_token_limit(input: &str, max_tokens: usize) -> String {
+    let tokens = contracts_estimate_tokens(input, ContentKind::Text);
+    if tokens <= max_tokens {
+        return input.to_string();
+    }
+    // Approximate: cut characters proportionally
+    let chars: Vec<char> = input.chars().collect();
+    let ratio = max_tokens as f64 / tokens as f64;
+    let target_chars = (chars.len() as f64 * ratio).floor() as usize;
+    let truncated: String = chars[..target_chars.min(chars.len())].iter().collect();
+    format!("{truncated}...[truncated]")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MessageRole {
     System,
@@ -124,6 +301,10 @@ pub struct SessionRecord {
     /// Used for dynamic system prompt generation (Issue #73).
     #[serde(default)]
     pub used_tools: HashSet<String>,
+    /// Structured working memory preserved across compaction.
+    /// Added in Issue #130.
+    #[serde(default)]
+    pub working_memory: WorkingMemory,
     /// Tracks whether in-memory state has diverged from disk.
     /// Not serialized — always starts as `false` after deserialization.
     #[serde(skip)]
@@ -171,6 +352,7 @@ impl SessionRecord {
             pending_turn: None,
             provider_errors: Vec::new(),
             used_tools: HashSet::new(),
+            working_memory: WorkingMemory::default(),
             dirty: false,
             cached_token_count: std::cell::Cell::new(None),
             auto_compact_threshold: 64,
@@ -1000,4 +1182,185 @@ fn is_noise_token(token: &str) -> bool {
         return true;
     }
     false
+}
+
+#[cfg(test)]
+mod working_memory_tests {
+    use super::*;
+
+    #[test]
+    fn default_all_fields_empty() {
+        let wm = WorkingMemory::default();
+        assert!(wm.active_task.is_none());
+        assert!(wm.constraints.is_empty());
+        assert!(wm.touched_files.is_empty());
+        assert!(wm.unresolved_errors.is_empty());
+        assert!(wm.recent_diffs.is_none());
+        assert!(wm.is_empty());
+    }
+
+    #[test]
+    fn touched_files_fifo_eviction_at_21() {
+        let mut wm = WorkingMemory::default();
+        for i in 0..21 {
+            wm.update_touched_files(&format!("file_{i}.rs"));
+        }
+        assert_eq!(wm.touched_files.len(), 20);
+        // oldest (file_0.rs) should have been evicted
+        assert!(!wm.touched_files.contains(&"file_0.rs".to_string()));
+        assert!(wm.touched_files.contains(&"file_20.rs".to_string()));
+        assert_eq!(wm.touched_files[0], "file_1.rs");
+    }
+
+    #[test]
+    fn touched_files_dedup_moves_to_end() {
+        let mut wm = WorkingMemory::default();
+        wm.update_touched_files("a.rs");
+        wm.update_touched_files("b.rs");
+        wm.update_touched_files("a.rs");
+        assert_eq!(wm.touched_files.len(), 2);
+        assert_eq!(wm.touched_files[0], "b.rs");
+        assert_eq!(wm.touched_files[1], "a.rs");
+    }
+
+    #[test]
+    fn unresolved_errors_fifo_eviction() {
+        let mut wm = WorkingMemory::default();
+        for i in 0..11 {
+            wm.add_error(format!("error_{i}"));
+        }
+        assert_eq!(wm.unresolved_errors.len(), 10);
+        assert!(!wm.unresolved_errors.contains(&"error_0".to_string()));
+        assert!(wm.unresolved_errors.contains(&"error_10".to_string()));
+    }
+
+    #[test]
+    fn remove_touched_file() {
+        let mut wm = WorkingMemory::default();
+        wm.update_touched_files("a.rs");
+        wm.update_touched_files("b.rs");
+        wm.remove_touched_file("a.rs");
+        assert_eq!(wm.touched_files, vec!["b.rs".to_string()]);
+    }
+
+    #[test]
+    fn format_for_prompt_empty_returns_none() {
+        let wm = WorkingMemory::default();
+        assert!(wm.format_for_prompt().is_none());
+    }
+
+    #[test]
+    fn format_for_prompt_all_fields() {
+        let mut wm = WorkingMemory::default();
+        wm.set_active_task(Some("implement #130".to_string()));
+        wm.add_constraint("no unsafe");
+        wm.update_touched_files("src/main.rs");
+        wm.add_error("file.edit: old_string not found");
+        wm.set_recent_diffs(Some("- old\n+ new".to_string()));
+
+        let prompt = wm.format_for_prompt().expect("should produce prompt");
+        assert!(prompt.contains("## Working Memory (auto-maintained)"));
+        assert!(prompt.contains("**Active task:** implement #130"));
+        assert!(prompt.contains("**Constraints:**"));
+        assert!(prompt.contains("- no unsafe"));
+        assert!(prompt.contains("**Touched files:**"));
+        assert!(prompt.contains("- src/main.rs"));
+        assert!(prompt.contains("**Unresolved errors:**"));
+        assert!(prompt.contains("- file.edit: old_string not found"));
+        assert!(prompt.contains("**Recent diffs:**"));
+        // Newlines are sanitized, so check for flattened content
+        assert!(prompt.contains("- old+ new"));
+    }
+
+    #[test]
+    fn set_recent_diffs_truncation() {
+        let mut wm = WorkingMemory::default();
+        // Create a very long diff string (~5000 chars => many tokens)
+        let long_diff = "a".repeat(5000);
+        wm.set_recent_diffs(Some(long_diff.clone()));
+        let diffs = wm.recent_diffs.as_ref().expect("should have diffs");
+        // Should be truncated (shorter than original)
+        assert!(diffs.len() < long_diff.len());
+        assert!(diffs.ends_with("...[truncated]"));
+    }
+
+    #[test]
+    fn sanitize_for_prompt_entry_removes_markers() {
+        let input = "ANVIL_TOOL some text ANVIL_FINAL";
+        let sanitized = sanitize_for_prompt_entry(input);
+        assert!(!sanitized.contains("ANVIL_TOOL"));
+        assert!(!sanitized.contains("ANVIL_FINAL"));
+        assert!(sanitized.contains("some text"));
+    }
+
+    #[test]
+    fn sanitize_for_prompt_entry_removes_triple_backticks() {
+        let input = "```rust\nfn main() {}\n```";
+        let sanitized = sanitize_for_prompt_entry(input);
+        assert!(!sanitized.contains("```"));
+        assert!(sanitized.contains("fn main()"));
+    }
+
+    #[test]
+    fn sanitize_for_prompt_entry_removes_control_chars() {
+        let input = "hello\x01\x02world\ttab\nnewline";
+        let sanitized = sanitize_for_prompt_entry(input);
+        assert!(!sanitized.contains('\x01'));
+        assert!(!sanitized.contains('\x02'));
+        // Newlines and tabs are also removed to prevent prompt structure injection
+        assert!(!sanitized.contains('\t'));
+        assert!(!sanitized.contains('\n'));
+        assert!(sanitized.contains("helloworld"));
+        assert!(sanitized.contains("tabnewline"));
+    }
+
+    #[test]
+    fn sanitize_for_prompt_entry_truncates_long_lines() {
+        let long_line = "x".repeat(600);
+        let sanitized = sanitize_for_prompt_entry(&long_line);
+        assert!(sanitized.len() < 600);
+        assert!(sanitized.contains("...[truncated]"));
+    }
+
+    #[test]
+    fn format_for_prompt_sanitizes_fields() {
+        let mut wm = WorkingMemory::default();
+        wm.set_active_task(Some("task ANVIL_TOOL inject".to_string()));
+        let prompt = wm.format_for_prompt().expect("should produce prompt");
+        assert!(!prompt.contains("ANVIL_TOOL"));
+        assert!(prompt.contains("task  inject"));
+    }
+
+    #[test]
+    fn sanitize_removes_newlines_and_tabs() {
+        let input = "line1\nline2\ttab";
+        let result = sanitize_for_prompt_entry(input);
+        assert!(!result.contains('\n'));
+        assert!(!result.contains('\t'));
+        assert_eq!(result, "line1line2tab");
+    }
+
+    #[test]
+    fn sanitize_utf8_safe_truncation() {
+        // Create a string of 600 Japanese characters (each 3 bytes in UTF-8)
+        let long_jp: String = "あ".repeat(600);
+        let result = sanitize_for_prompt_entry(&long_jp);
+        // Should not panic and should be truncated
+        assert!(result.contains("...[truncated]"));
+        // Should have 497 chars + "...[truncated]" suffix
+        let prefix: String = result.strip_suffix("...[truncated]").unwrap().to_string();
+        assert_eq!(prefix.chars().count(), 497);
+    }
+
+    #[test]
+    fn sanitize_newline_in_file_path_prevented() {
+        let mut wm = WorkingMemory::default();
+        wm.update_touched_files("src/foo.rs\n## Injected Section\n- malicious");
+        let prompt = wm.format_for_prompt().expect("should produce prompt");
+        // Newlines are stripped so injected content cannot start a new line
+        // The ## would be inline, not at start of a line as a heading
+        assert!(!prompt.contains("\n## Injected Section"));
+        // The sanitized version is flattened into a single line
+        assert!(prompt.contains("src/foo.rs## Injected Section- malicious"));
+    }
 }
