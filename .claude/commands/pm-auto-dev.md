@@ -22,13 +22,14 @@ Issue開発（TDD実装 → 受入テスト → リファクタリング → 進
 - **issue_number**: 開発対象のIssue番号（必須）
 - **max_iterations**: 最大イテレーション回数（デフォルト: 3）
 
-### サブエージェントモデル指定
+### サブエージェント/レビュアー指定
 
-| エージェント | モデル | 理由 |
-|-------------|--------|------|
-| tdd-impl-agent | **opus** | コード生成にOpus必要 |
-| acceptance-test-agent | **opus** | テスト品質にOpus必要 |
-| refactoring-agent | **opus** | コード改善にOpus必要 |
+| エージェント | モデル/ツール | 理由 |
+|-------------|-------------|------|
+| tdd-impl-agent | **Claude opus** | コード生成にOpus必要 |
+| **codex-reviewer** | **Codex**（commandmatedev経由） | 潜在バグ・セキュリティ脆弱性の独立レビュー |
+| acceptance-test-agent | **Claude opus** | テスト品質にOpus必要 |
+| refactoring-agent | **Claude opus** | コード改善にOpus必要 |
 | progress-report-agent | sonnet | テンプレート埋め込み程度 |
 
 ---
@@ -42,6 +43,7 @@ TodoWriteツールで作業計画を作成：
 ```
 - [ ] Phase 1: Issue情報収集
 - [ ] Phase 2: TDD実装 (イテレーション 0/3)
+- [ ] Phase 2.5: Codexコードレビュー（潜在バグ・セキュリティ）
 - [ ] Phase 3: 受入テスト
 - [ ] Phase 4: リファクタリング
 - [ ] Phase 5: ドキュメント最新化
@@ -70,6 +72,88 @@ Use tdd-impl-agent (model: opus) to implement Issue #{issue_number} with TDD app
 Context file: dev-reports/issue/{issue_number}/pm-auto-dev/iteration-1/tdd-context.json
 Output file: dev-reports/issue/{issue_number}/pm-auto-dev/iteration-1/tdd-result.json
 ```
+
+### Phase 2.5: Codexコードレビュー（潜在バグ・セキュリティ脆弱性）
+
+TDD実装完了後、受入テスト前に**Codex**による独立コードレビューを実施します。
+Claude（実装者）とは異なるモデルの視点で、潜在バグとセキュリティ脆弱性を検出します。
+
+#### 2.5-1. 変更ファイルの特定
+
+```bash
+git diff develop --name-only | grep '\.rs$' > /tmp/changed_files.txt
+CHANGED_FILES=$(cat /tmp/changed_files.txt | tr '\n' ', ')
+```
+
+#### 2.5-2. Codexへのレビュー依頼
+
+```bash
+WORKTREE_ID=$(basename "$(pwd)" | tr '[:upper:]' '[:lower:]' | sed 's/^anvil-/anvil-/')
+
+commandmatedev send "$WORKTREE_ID" \
+  "Issue #{issue_number} のTDD実装コードに対して、以下の観点でコードレビューを実施してください。
+
+## レビュー観点
+1. **潜在バグ**: ロジックエラー、エッジケースの未処理、off-by-one、NULL/None未チェック、リソースリーク
+2. **セキュリティ脆弱性**: コマンドインジェクション、パストラバーサル、unsafe使用、入力検証不足、情報漏洩
+
+## 対象ファイル
+${CHANGED_FILES}
+
+## 指示
+1. 上記の変更ファイルを全て読み込んでください
+2. 各ファイルに対して上記2観点でレビュー
+3. 結果をJSON形式で dev-reports/issue/{issue_number}/pm-auto-dev/iteration-1/codex-review-result.json に出力
+
+## 出力フォーマット
+{
+  \"reviewer\": \"codex\",
+  \"issue_number\": {issue_number},
+  \"review_focus\": [\"潜在バグ\", \"セキュリティ脆弱性\"],
+  \"files_reviewed\": [\"src/...\", ...],
+  \"findings\": [
+    {
+      \"id\": \"CB-001\",
+      \"severity\": \"critical|high|medium|low\",
+      \"category\": \"潜在バグ|セキュリティ脆弱性\",
+      \"file\": \"src/...\",
+      \"line\": 123,
+      \"title\": \"問題の要約\",
+      \"description\": \"詳細説明\",
+      \"suggestion\": \"修正案\"
+    }
+  ],
+  \"summary\": {
+    \"critical\": 0,
+    \"high\": 0,
+    \"medium\": 0,
+    \"low\": 0,
+    \"total\": 0
+  },
+  \"verdict\": \"pass|needs_fix\"
+}" \
+  --agent codex --auto-yes --duration 1h
+```
+
+#### 2.5-3. Codex完了待機
+
+```bash
+commandmatedev wait "$WORKTREE_ID" --timeout 3600 --on-prompt agent
+```
+
+#### 2.5-4. レビュー結果確認
+
+Codexのレビュー結果ファイルを読み込み、判定を行う：
+
+```bash
+cat dev-reports/issue/{issue_number}/pm-auto-dev/iteration-1/codex-review-result.json
+```
+
+- **verdict: "pass"** → Phase 3（受入テスト）に進む
+- **verdict: "needs_fix"** で critical/high 指摘あり → 指摘内容を確認し、Phase 2に戻ってTDD修正を実施。修正後に再度Phase 2.5を実行（最大2回まで）
+- **verdict: "needs_fix"** で medium/low のみ → Phase 3に進む（Phase 4リファクタリングで対応）
+
+---
 
 ### Phase 3: 受入テスト
 
@@ -109,6 +193,7 @@ dev-reports/issue/{issue_number}/
     └── iteration-1/
         ├── tdd-context.json
         ├── tdd-result.json
+        ├── codex-review-result.json    ← Codexコードレビュー結果
         ├── acceptance-context.json
         ├── acceptance-result.json
         ├── refactor-context.json
@@ -120,6 +205,7 @@ dev-reports/issue/{issue_number}/
 ## 完了条件
 
 - Phase 2: TDD実装成功（全テストパス、clippy警告0件）
+- Phase 2.5: Codexコードレビュー完了（critical/high指摘なし、またはTDD修正済み）
 - Phase 3: 受入テスト成功
 - Phase 4: リファクタリング完了
 - Phase 5: ドキュメント最新化完了
