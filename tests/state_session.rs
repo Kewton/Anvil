@@ -2,8 +2,8 @@ mod common;
 
 use anvil::contracts::{AppEvent, AppStateSnapshot, RuntimeState};
 use anvil::session::{
-    MessageRole, MessageStatus, SessionMessage, SessionRecord, SessionStore, new_assistant_message,
-    new_user_message, validate_session_name,
+    MessageRole, MessageStatus, SessionMessage, SessionRecord, SessionStore, WorkingMemory,
+    new_assistant_message, new_user_message, validate_session_name,
 };
 use anvil::state::{StateMachine, StateTransition};
 use std::path::PathBuf;
@@ -1457,4 +1457,75 @@ fn compact_history_with_smart_compact_generates_scored_summary() {
             .content
             .contains("[compacted session summary]")
     );
+}
+
+// ── Working Memory integration tests (Issue #130) ─────────────────────
+
+#[test]
+fn working_memory_serialize_roundtrip() {
+    let mut session = SessionRecord::new(PathBuf::from("/tmp/wm_test"));
+    session
+        .working_memory
+        .set_active_task(Some("implement #130".to_string()));
+    session.working_memory.update_touched_files("src/main.rs");
+    session.working_memory.add_error("file.edit: not found");
+    session
+        .working_memory
+        .add_constraint("no unsafe".to_string());
+    session
+        .working_memory
+        .set_recent_diffs(Some("diff content".to_string()));
+
+    let json = serde_json::to_string(&session).expect("serialize");
+    let restored: SessionRecord = serde_json::from_str(&json).expect("deserialize");
+
+    assert_eq!(session.working_memory, restored.working_memory);
+}
+
+#[test]
+fn working_memory_backward_compat_old_json() {
+    // Simulate a JSON from before Issue #130 — no working_memory field
+    let old_json = r#"{
+        "metadata": {
+            "session_id": "test",
+            "cwd": "/tmp",
+            "created_at_ms": 0,
+            "updated_at_ms": 0
+        },
+        "messages": [],
+        "used_tools": []
+    }"#;
+
+    let record: SessionRecord = serde_json::from_str(old_json).expect("should deserialize");
+    assert_eq!(record.working_memory, WorkingMemory::default());
+    assert!(record.working_memory.is_empty());
+}
+
+#[test]
+fn compact_history_preserves_working_memory() {
+    let mut session = SessionRecord::new(PathBuf::from("/tmp/wm_compact"));
+    session
+        .working_memory
+        .set_active_task(Some("task A".to_string()));
+    session.working_memory.update_touched_files("a.rs");
+    session.working_memory.add_error("some error");
+
+    // Add enough messages to trigger compaction
+    for i in 0..20 {
+        session.push_message(
+            SessionMessage::new(MessageRole::User, "you", format!("msg {i}"))
+                .with_id(format!("u_{i}")),
+        );
+        session.push_message(
+            SessionMessage::new(MessageRole::Assistant, "anvil", format!("reply {i}"))
+                .with_id(format!("a_{i}")),
+        );
+    }
+
+    let wm_before = session.working_memory.clone();
+    let compacted = session.compact_history(10);
+    assert!(compacted);
+
+    // Working memory should be unchanged after compaction
+    assert_eq!(session.working_memory, wm_before);
 }
