@@ -667,6 +667,283 @@ fn web_search_serde_round_trip() {
     assert_eq!(input, deserialized);
 }
 
+// --- classify_shell_policy tests ---
+
+mod classify_shell_policy_tests {
+    use anvil::tooling::{ShellPolicy, classify_shell_policy};
+
+    #[test]
+    fn read_only_git_log() {
+        assert_eq!(
+            classify_shell_policy("git log --oneline"),
+            ShellPolicy::ReadOnly
+        );
+    }
+
+    #[test]
+    fn read_only_git_status() {
+        assert_eq!(classify_shell_policy("git status"), ShellPolicy::ReadOnly);
+    }
+
+    #[test]
+    fn read_only_git_diff() {
+        assert_eq!(classify_shell_policy("git diff"), ShellPolicy::ReadOnly);
+    }
+
+    #[test]
+    fn read_only_git_branch() {
+        assert_eq!(classify_shell_policy("git branch"), ShellPolicy::ReadOnly);
+    }
+
+    #[test]
+    fn read_only_git_show_with_ref() {
+        assert_eq!(
+            classify_shell_policy("git show HEAD"),
+            ShellPolicy::ReadOnly
+        );
+    }
+
+    #[test]
+    fn read_only_gh_api_get() {
+        assert_eq!(
+            classify_shell_policy("gh api repos/o/r/stats"),
+            ShellPolicy::ReadOnly
+        );
+    }
+
+    #[test]
+    fn read_only_which() {
+        assert_eq!(classify_shell_policy("which rustc"), ShellPolicy::ReadOnly);
+    }
+
+    #[test]
+    fn read_only_uname() {
+        assert_eq!(classify_shell_policy("uname"), ShellPolicy::ReadOnly);
+    }
+
+    #[test]
+    fn read_only_lsof_i() {
+        assert_eq!(classify_shell_policy("lsof -i"), ShellPolicy::ReadOnly);
+    }
+
+    #[test]
+    fn build_test_cargo_test() {
+        assert_eq!(classify_shell_policy("cargo test"), ShellPolicy::BuildTest);
+    }
+
+    #[test]
+    fn build_test_cargo_build() {
+        assert_eq!(classify_shell_policy("cargo build"), ShellPolicy::BuildTest);
+    }
+
+    #[test]
+    fn build_test_cargo_clippy() {
+        assert_eq!(
+            classify_shell_policy("cargo clippy --all-targets"),
+            ShellPolicy::BuildTest
+        );
+    }
+
+    #[test]
+    fn build_test_npm_test() {
+        assert_eq!(classify_shell_policy("npm test"), ShellPolicy::BuildTest);
+    }
+
+    #[test]
+    fn build_test_pytest() {
+        assert_eq!(
+            classify_shell_policy("pytest tests/"),
+            ShellPolicy::BuildTest
+        );
+    }
+
+    #[test]
+    fn build_test_go_test() {
+        assert_eq!(
+            classify_shell_policy("go test ./..."),
+            ShellPolicy::BuildTest
+        );
+    }
+
+    #[test]
+    fn build_test_make_test() {
+        assert_eq!(classify_shell_policy("make test"), ShellPolicy::BuildTest);
+    }
+
+    #[test]
+    fn general_curl() {
+        assert_eq!(
+            classify_shell_policy("curl https://example.com"),
+            ShellPolicy::General
+        );
+    }
+
+    #[test]
+    fn general_unknown_command() {
+        assert_eq!(
+            classify_shell_policy("some-unknown-command"),
+            ShellPolicy::General
+        );
+    }
+
+    #[test]
+    fn pipe_fallback_to_general() {
+        assert_eq!(
+            classify_shell_policy("git log | head -5"),
+            ShellPolicy::General
+        );
+    }
+
+    #[test]
+    fn chain_fallback_to_general() {
+        assert_eq!(
+            classify_shell_policy("cargo test && rm -rf /"),
+            ShellPolicy::General
+        );
+    }
+
+    #[test]
+    fn case_insensitive_git_log() {
+        assert_eq!(
+            classify_shell_policy("GIT LOG --oneline"),
+            ShellPolicy::ReadOnly
+        );
+    }
+
+    #[test]
+    fn case_insensitive_cargo_test() {
+        assert_eq!(classify_shell_policy("Cargo Test"), ShellPolicy::BuildTest);
+    }
+
+    #[test]
+    fn dangerous_options_web_general() {
+        assert_eq!(
+            classify_shell_policy("gh repo view --web"),
+            ShellPolicy::General
+        );
+    }
+
+    #[test]
+    fn dangerous_options_browse_general() {
+        assert_eq!(
+            classify_shell_policy("gh issue list --browse"),
+            ShellPolicy::General
+        );
+    }
+
+    #[test]
+    fn gh_api_post_is_general() {
+        assert_eq!(
+            classify_shell_policy("gh api --method POST repos/o/r/issues"),
+            ShellPolicy::General
+        );
+    }
+
+    #[test]
+    fn gh_api_xdelete_is_general() {
+        assert_eq!(
+            classify_shell_policy("gh api -XDELETE repos/o/r/issues/1"),
+            ShellPolicy::General
+        );
+    }
+
+    #[test]
+    fn gh_api_field_flag_is_general() {
+        assert_eq!(
+            classify_shell_policy("gh api -f title=hacked repos/o/r/issues"),
+            ShellPolicy::General
+        );
+    }
+}
+
+// --- is_network_command tests ---
+
+mod is_network_command_tests {
+    use anvil::tooling::is_network_command;
+
+    #[test]
+    fn curl_is_network() {
+        assert!(is_network_command("curl https://example.com"));
+    }
+
+    #[test]
+    fn wget_is_network() {
+        assert!(is_network_command("wget https://example.com"));
+    }
+
+    #[test]
+    fn ssh_is_network() {
+        assert!(is_network_command("ssh user@host"));
+    }
+
+    #[test]
+    fn ping_is_network() {
+        assert!(is_network_command("ping 8.8.8.8"));
+    }
+
+    #[test]
+    fn scp_is_network() {
+        assert!(is_network_command("scp file user@host:/tmp/"));
+    }
+
+    #[test]
+    fn dig_is_network() {
+        assert!(is_network_command("dig example.com"));
+    }
+
+    #[test]
+    fn ls_is_not_network() {
+        assert!(!is_network_command("ls -la"));
+    }
+
+    #[test]
+    fn git_is_not_network() {
+        assert!(!is_network_command("git log"));
+    }
+
+    #[test]
+    fn cargo_is_not_network() {
+        assert!(!is_network_command("cargo test"));
+    }
+
+    #[test]
+    fn case_insensitive_curl() {
+        assert!(is_network_command("CURL https://example.com"));
+    }
+
+    #[test]
+    fn case_insensitive_wget() {
+        assert!(is_network_command("Wget https://example.com"));
+    }
+
+    #[test]
+    fn sudo_curl_is_network() {
+        assert!(is_network_command("sudo curl https://example.com"));
+    }
+
+    #[test]
+    fn env_wget_is_network() {
+        assert!(is_network_command("env wget https://example.com"));
+    }
+
+    #[test]
+    fn absolute_path_curl_is_network() {
+        assert!(is_network_command("/usr/bin/curl https://example.com"));
+    }
+
+    #[test]
+    fn env_var_prefix_curl_is_network() {
+        assert!(is_network_command(
+            "HTTPS_PROXY=proxy curl https://example.com"
+        ));
+    }
+
+    #[test]
+    fn env_i_curl_is_network() {
+        assert!(is_network_command("env -i curl https://example.com"));
+    }
+}
+
 // --- is_safe_shell_command: gh api tests ---
 
 mod safe_shell_gh_api {
@@ -4233,4 +4510,187 @@ mod captcha_blocked_error {
             "CaptchaBlocked message should mention web.fetch, got: {msg}"
         );
     }
+}
+
+// --- Issue #128: file.edit_anchor and fallback tests ---
+
+use anvil::tooling::AnchorEditParams;
+
+#[test]
+fn file_edit_anchor_registered_in_registry() {
+    let registry = build_registry();
+    let spec = registry
+        .get("file.edit_anchor")
+        .expect("file.edit_anchor should be registered");
+    assert_eq!(spec.kind, ToolKind::FileEditAnchor);
+    assert_eq!(spec.execution_class, ExecutionClass::Mutating);
+    assert_eq!(spec.permission_class, PermissionClass::Confirm);
+    assert_eq!(spec.execution_mode, ExecutionMode::SequentialOnly);
+    assert_eq!(spec.plan_mode, PlanModePolicy::Allowed);
+    assert_eq!(spec.rollback_policy, RollbackPolicy::CheckpointBeforeWrite);
+}
+
+#[test]
+fn file_edit_anchor_validates_typed_tool_input() {
+    let registry = build_registry();
+    let valid = ToolCallRequest::new(
+        "call_anchor_001",
+        "file.edit_anchor",
+        ToolInput::FileEditAnchor {
+            path: "./src/main.rs".to_string(),
+            params: AnchorEditParams {
+                old_content: "fn old()".to_string(),
+                new_content: "fn new()".to_string(),
+            },
+        },
+    );
+    assert!(registry.validate(valid).is_ok());
+}
+
+#[test]
+fn file_edit_anchor_execution_indent_normalized_match() {
+    let root = std::env::temp_dir().join("anvil_anchor_indent_match");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("dir should exist");
+    // File has 4-space indentation
+    let file_content = "fn main() {\n    let x = 1;\n    let y = 2;\n}\n";
+    fs::write(root.join("test.rs"), file_content).expect("write should succeed");
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
+    // Pattern has no indentation — should match via normalization
+    let result = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_anchor_exec_001".to_string(),
+            spec: build_registry()
+                .get("file.edit_anchor")
+                .expect("file.edit_anchor spec")
+                .clone(),
+            input: ToolInput::FileEditAnchor {
+                path: "./test.rs".to_string(),
+                params: AnchorEditParams {
+                    old_content: "let x = 1;\nlet y = 2;".to_string(),
+                    new_content: "let x = 10;\nlet y = 20;".to_string(),
+                },
+            },
+        })
+        .expect("anchor edit should succeed");
+
+    assert_eq!(result.status, ToolExecutionStatus::Completed);
+    let content = fs::read_to_string(root.join("test.rs")).expect("read should succeed");
+    assert!(
+        content.contains("let x = 10;"),
+        "edited content should contain new values, got: {content}"
+    );
+    assert!(
+        content.contains("let y = 20;"),
+        "edited content should contain new values, got: {content}"
+    );
+}
+
+#[test]
+fn file_edit_anchor_execution_no_match_error() {
+    let root = std::env::temp_dir().join("anvil_anchor_no_match");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("dir should exist");
+    fs::write(root.join("test.rs"), "fn main() {}\n").expect("write should succeed");
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
+    let err = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_anchor_nm_001".to_string(),
+            spec: build_registry()
+                .get("file.edit_anchor")
+                .expect("file.edit_anchor spec")
+                .clone(),
+            input: ToolInput::FileEditAnchor {
+                path: "./test.rs".to_string(),
+                params: AnchorEditParams {
+                    old_content: "nonexistent code".to_string(),
+                    new_content: "replacement".to_string(),
+                },
+            },
+        })
+        .expect_err("should fail when old_content not found");
+
+    assert!(err.to_string().contains("not found"));
+}
+
+#[test]
+fn file_edit_anchor_execution_multiple_matches_error() {
+    let root = std::env::temp_dir().join("anvil_anchor_multi_match");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("dir should exist");
+    let file_content = "let x = 1;\nlet x = 1;\n";
+    fs::write(root.join("test.rs"), file_content).expect("write should succeed");
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
+    let err = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_anchor_mm_001".to_string(),
+            spec: build_registry()
+                .get("file.edit_anchor")
+                .expect("file.edit_anchor spec")
+                .clone(),
+            input: ToolInput::FileEditAnchor {
+                path: "./test.rs".to_string(),
+                params: AnchorEditParams {
+                    old_content: "let x = 1;".to_string(),
+                    new_content: "let x = 2;".to_string(),
+                },
+            },
+        })
+        .expect_err("should fail when old_content matches multiple times");
+
+    assert!(
+        err.to_string().contains("matched 2 locations"),
+        "error should mention multiple matches, got: {}",
+        err
+    );
+}
+
+#[test]
+fn file_edit_fallback_indent_mismatch() {
+    let root = std::env::temp_dir().join("anvil_fallback_indent");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("dir should exist");
+    // File has 4-space indentation
+    let file_content = "fn main() {\n    let x = 1;\n}\n";
+    fs::write(root.join("test.rs"), file_content).expect("write should succeed");
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
+    // Use file.edit with 8-space indent instead of 4-space — cannot be a substring match
+    let result = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_fallback_001".to_string(),
+            spec: build_registry()
+                .get("file.edit")
+                .expect("file.edit spec")
+                .clone(),
+            input: ToolInput::FileEdit {
+                path: "./test.rs".to_string(),
+                old_string: "        let x = 1;".to_string(), // 8-space indent
+                new_string: "        let x = 2;".to_string(),
+            },
+        })
+        .expect("fallback should succeed");
+
+    assert_eq!(result.status, ToolExecutionStatus::Completed);
+    assert!(
+        result.summary.contains("anchor fallback"),
+        "summary should mention anchor fallback, got: {}",
+        result.summary
+    );
+    let content = fs::read_to_string(root.join("test.rs")).expect("read should succeed");
+    assert!(
+        content.contains("let x = 2;"),
+        "content should be edited, got: {content}"
+    );
+}
+
+#[test]
+fn edit_not_found_error_is_distinguishable() {
+    let err = anvil::tooling::ToolRuntimeError::EditNotFound("test".to_string());
+    assert!(err.is_edit_not_found());
+    let io_err = anvil::tooling::ToolRuntimeError::Io("test".to_string());
+    assert!(!io_err.is_edit_not_found());
 }

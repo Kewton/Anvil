@@ -60,6 +60,12 @@ pub const TOOL_TAG_SPECS: &[ToolTagSpec] = &[
         example: r#"<tool name="web.search" query="search keywords"/>"#,
     },
     ToolTagSpec {
+        name: "file.edit_anchor",
+        attributes: &["path"],
+        child_elements: &["old_content", "new_content"],
+        example: r#"<tool name="file.edit_anchor" path="./src/main.rs"><old_content>fn old_code()</old_content><new_content>fn new_code()</new_content></tool>"#,
+    },
+    ToolTagSpec {
         name: "agent.explore",
         attributes: &["scope"],
         child_elements: &["prompt"],

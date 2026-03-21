@@ -100,7 +100,10 @@ src/
 ├── lib.rs               # モジュール宣言
 ├── agent/
 │   ├── mod.rs           # エージェントループ・プロトコル
-│   └── subagent.rs      # サブエージェント実行ループ（Explore/Plan）
+│   ├── model_classifier.rs # モデル分類・ToolProtocolMode判定
+│   ├── subagent.rs      # サブエージェント実行ループ（Explore/Plan）
+│   ├── tag_parser.rs    # タグベースツール呼び出しパーサー（多層プロトコル対応）
+│   └── tag_spec.rs      # ツールタグ仕様テーブル（TOOL_TAG_SPECS）
 ├── app/
 │   ├── mod.rs           # アプリケーションオーケストレータ
 │   ├── agentic.rs       # agenticツール実行ループ
@@ -130,12 +133,13 @@ src/
 │   ├── openai.rs        # OpenAI互換クライアント
 │   └── transport.rs     # HTTPトランスポート
 ├── retrieval/mod.rs     # リポジトリ検索（オンデマンドコンテンツ読込・軽量キャッシュ）
-├── session/mod.rs       # セッション永続化（名前付きセッション・一覧・切替・削除・マイグレーション）
+├── session/mod.rs       # セッション永続化（名前付きセッション・一覧・切替・削除・マイグレーション・構造化WorkingMemory）
 ├── spinner.rs           # スピナーUI
 ├── state/mod.rs         # 状態マシン
 ├── tooling/
 │   ├── mod.rs           # ツール実行・検証・CheckpointStack（undo用チェックポイント管理）
-│   └── diff.rs          # 差分プレビュー生成（file.write/file.edit承認時）
+│   ├── diff.rs          # 差分プレビュー生成（file.write/file.edit承認時）
+│   └── shell_policy.rs  # ShellPolicy分類（ReadOnly/BuildTest/General）・offline用ネットワークコマンド検出
 ├── tui/mod.rs           # TUI描画
 └── walk.rs              # 共通ディレクトリウォーカー（.gitignore対応・統一スキップ/バイナリ除外）
 tests/

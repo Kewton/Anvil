@@ -625,3 +625,104 @@ fn system_prompt_includes_web_tools_even_with_empty_used_tools() {
         "fresh session system prompt must include web.fetch description (Issue #114)"
     );
 }
+
+// --- Issue #128: Multi-tier parsing tests ---
+
+#[test]
+fn parse_json_tool_call_unchanged() {
+    let response = anvil::agent::BasicAgentLoop::parse_structured_response(concat!(
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_001\",\"tool\":\"file.read\",\"path\":\"./src/main.rs\"}\n",
+        "```\n",
+        "```ANVIL_FINAL\n",
+        "Read the file.\n",
+        "```\n"
+    ))
+    .expect("JSON parsing should work");
+
+    assert_eq!(response.tool_calls.len(), 1);
+    assert_eq!(response.tool_calls[0].tool_name, "file.read");
+}
+
+#[test]
+fn parse_tag_based_tool_call() {
+    let response = anvil::agent::BasicAgentLoop::parse_structured_response(concat!(
+        "```ANVIL_TOOL\n",
+        "<tool name=\"file.read\" path=\"./src/main.rs\"/>\n",
+        "```\n",
+        "```ANVIL_FINAL\n",
+        "Read the file.\n",
+        "```\n"
+    ))
+    .expect("Tag-based parsing should work");
+
+    assert_eq!(response.tool_calls.len(), 1);
+    assert_eq!(response.tool_calls[0].tool_name, "file.read");
+    assert_eq!(
+        response.tool_calls[0].tool_call_id, "tag_file_read",
+        "tag-based tool calls should have tag_ prefixed id"
+    );
+}
+
+#[test]
+fn parse_tag_based_file_edit() {
+    let response = anvil::agent::BasicAgentLoop::parse_structured_response(concat!(
+        "```ANVIL_TOOL\n",
+        "<tool name=\"file.edit\" path=\"./src/main.rs\"><old_string>fn old()</old_string><new_string>fn new()</new_string></tool>\n",
+        "```\n",
+        "```ANVIL_FINAL\n",
+        "Edited the file.\n",
+        "```\n"
+    ))
+    .expect("Tag-based file.edit parsing should work");
+
+    assert_eq!(response.tool_calls.len(), 1);
+    assert_eq!(response.tool_calls[0].tool_name, "file.edit");
+}
+
+#[test]
+fn parse_tag_based_file_edit_anchor() {
+    let response = anvil::agent::BasicAgentLoop::parse_structured_response(concat!(
+        "```ANVIL_TOOL\n",
+        "<tool name=\"file.edit_anchor\" path=\"./src/main.rs\"><old_content>fn old()</old_content><new_content>fn new()</new_content></tool>\n",
+        "```\n",
+        "```ANVIL_FINAL\n",
+        "Edited the file with anchor.\n",
+        "```\n"
+    ))
+    .expect("Tag-based file.edit_anchor parsing should work");
+
+    assert_eq!(response.tool_calls.len(), 1);
+    assert_eq!(response.tool_calls[0].tool_name, "file.edit_anchor");
+}
+
+#[test]
+fn parse_malformed_rejected() {
+    let result = anvil::agent::BasicAgentLoop::parse_structured_response(concat!(
+        "```ANVIL_TOOL\n",
+        "this is not valid json or tag format\n",
+        "```\n",
+        "```ANVIL_FINAL\n",
+        "Done.\n",
+        "```\n"
+    ));
+
+    assert!(result.is_err(), "malformed tool block should be rejected");
+}
+
+#[test]
+fn tag_protocol_prompt_contains_tag_examples() {
+    let prompt = anvil::agent::tool_protocol_system_prompt_tag_based(&[], None);
+    assert!(
+        prompt.contains("<tool name="),
+        "tag-based prompt should contain tag examples"
+    );
+    assert!(
+        prompt.contains("file.read"),
+        "tag-based prompt should mention file.read"
+    );
+    assert!(
+        prompt.contains("file.edit_anchor"),
+        "tag-based prompt should mention file.edit_anchor"
+    );
+}

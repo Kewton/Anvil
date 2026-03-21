@@ -8,6 +8,7 @@ pub mod openai;
 pub mod transport;
 
 use crate::agent::AgentEvent;
+use crate::agent::model_classifier::{ToolProtocolMode, determine_protocol_mode};
 use crate::config::EffectiveConfig;
 use crate::contracts::InferencePerformanceView;
 use serde::{Deserialize, Serialize};
@@ -48,6 +49,7 @@ pub enum LocalProviderClient {
 pub struct ProviderCapabilities {
     pub streaming: bool,
     pub tool_calling: bool,
+    pub tool_protocol: ToolProtocolMode,
 }
 
 /// Bootstrapped provider context available for the lifetime of a session.
@@ -351,15 +353,14 @@ impl ProviderRuntimeContext {
             }
         };
 
-        let capabilities = match backend {
-            ProviderBackend::Ollama => ProviderCapabilities {
-                streaming: true,
-                tool_calling: true,
-            },
-            ProviderBackend::OpenAi => ProviderCapabilities {
-                streaming: true,
-                tool_calling: true,
-            },
+        let tool_protocol =
+            determine_protocol_mode(&config.runtime.model, config.runtime.tag_protocol);
+
+        // Both backends currently share identical capability defaults.
+        let capabilities = ProviderCapabilities {
+            streaming: true,
+            tool_calling: true,
+            tool_protocol,
         };
 
         Ok(Self {

@@ -7,9 +7,10 @@
 use regex::Regex;
 
 /// Tool protocol mode for agent-model communication.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ToolProtocolMode {
     /// JSON format (default, for large models).
+    #[default]
     Json,
     /// Tag-based format (for small models, <= 13B).
     TagBased,

@@ -5,6 +5,7 @@
 
 pub mod model_classifier;
 pub mod subagent;
+pub mod tag_parser;
 pub mod tag_spec;
 
 pub use model_classifier::{ModelCapability, ModelSizeClass, PromptTier, ToolProtocolMode};
@@ -242,7 +243,7 @@ impl BasicAgentLoop {
 
         let mut tool_calls = Vec::new();
         for block in tool_blocks {
-            tool_calls.push(parse_tool_call_block(&block)?);
+            tool_calls.push(parse_tool_call_block_multi_tier(&block)?);
         }
 
         let final_response = final_block
@@ -260,13 +261,38 @@ impl BasicAgentLoop {
     }
 }
 
-fn parse_tool_call_block(block: &str) -> Result<ToolCallRequest, String> {
-    match serde_json::from_str::<Value>(block) {
-        Ok(value) => parse_tool_call_value(&value),
-        Err(err) => {
-            repair_tool_call_block(block).ok_or_else(|| format!("invalid ANVIL_TOOL JSON: {err}"))
+/// Multi-tier tool call parser.
+///
+/// Tier 1: Strict JSON (existing parse path)
+/// Tier 2: Tag-based (XML-like) format via tag_parser
+/// Tier 3: Repair fallback (existing repair path)
+fn parse_tool_call_block_multi_tier(block: &str) -> Result<ToolCallRequest, String> {
+    // Tier 1: strict JSON
+    if let Ok(value) = serde_json::from_str::<Value>(block) {
+        match parse_tool_call_value(&value) {
+            Ok(call) => return Ok(call),
+            Err(json_err) => {
+                // JSON parsed but field extraction failed — this is a definitive error
+                // (the tool name was recognized but required fields are missing).
+                // Only fall through if the JSON didn't even have a "tool" field.
+                if value.get("tool").and_then(Value::as_str).is_some() {
+                    return Err(json_err);
+                }
+            }
         }
     }
+
+    // Tier 2: tag-based
+    if tag_parser::is_tag_format(block)
+        && let Ok((tool_name, input)) = tag_parser::parse_tag_tool_block(block)
+    {
+        let id = format!("tag_{}", tool_name.replace('.', "_"));
+        return Ok(ToolCallRequest::new(id, tool_name, input));
+    }
+
+    // Tier 3: repair fallback
+    repair_tool_call_block(block)
+        .ok_or_else(|| "Failed to parse tool call in any format".to_string())
 }
 
 fn parse_tool_call_value(value: &Value) -> Result<ToolCallRequest, String> {
@@ -720,7 +746,9 @@ pub(crate) fn tool_protocol_system_prompt(
 ) -> String {
     match tier {
         PromptTier::Full => {
-            tool_protocol_system_prompt_full(languages, mcp_tool_descriptions, used_tools, offline)
+            // Full tier delegates to the protocol-aware builder (Json format).
+            // TagBased protocol dispatch happens via tool_protocol_system_prompt_with_mode.
+            build_json_protocol_prompt(languages, mcp_tool_descriptions, used_tools, offline)
         }
         PromptTier::Compact => {
             tool_protocol_system_prompt_compact(mcp_tool_descriptions, used_tools, offline)
@@ -729,8 +757,26 @@ pub(crate) fn tool_protocol_system_prompt(
     }
 }
 
-/// Full tier: all sections included (original behaviour).
-fn tool_protocol_system_prompt_full(
+/// Generate the system prompt with dynamic tool selection and protocol mode.
+pub(crate) fn tool_protocol_system_prompt_with_mode(
+    languages: &[ProjectLanguage],
+    mcp_tool_descriptions: Option<&str>,
+    used_tools: &std::collections::HashSet<String>,
+    offline: bool,
+    protocol: ToolProtocolMode,
+) -> String {
+    match protocol {
+        ToolProtocolMode::Json => {
+            build_json_protocol_prompt(languages, mcp_tool_descriptions, used_tools, offline)
+        }
+        ToolProtocolMode::TagBased => {
+            build_tag_protocol_prompt(languages, mcp_tool_descriptions, used_tools, offline)
+        }
+    }
+}
+
+/// JSON format system prompt (existing behavior).
+fn build_json_protocol_prompt(
     languages: &[ProjectLanguage],
     mcp_tool_descriptions: Option<&str>,
     used_tools: &std::collections::HashSet<String>,
@@ -783,6 +829,49 @@ fn tool_protocol_system_prompt_full(
     // Confirm-class tool approval guidance (static)
     prompt.push_str(PROMPT_CONFIRM_CLASS_GUIDANCE);
 
+    append_common_prompt_sections(&mut prompt, languages, mcp_tool_descriptions);
+
+    prompt
+}
+
+/// Tag-based format system prompt (for smaller models).
+fn build_tag_protocol_prompt(
+    languages: &[ProjectLanguage],
+    mcp_tool_descriptions: Option<&str>,
+    _used_tools: &std::collections::HashSet<String>,
+    _offline: bool,
+) -> String {
+    use crate::agent::tag_spec::TOOL_TAG_SPECS;
+
+    let mut prompt = String::with_capacity(8192);
+
+    prompt.push_str(PROMPT_WORK_APPROACH);
+
+    // Generate tag-based tool descriptions from TOOL_TAG_SPECS
+    for (i, spec) in TOOL_TAG_SPECS.iter().enumerate() {
+        prompt.push_str(&format!(
+            "{}. {} — use tag format:\n```ANVIL_TOOL\n{}\n```\n\n",
+            i + 1,
+            spec.name,
+            spec.example
+        ));
+    }
+
+    // Tool rules (same as JSON but with tag format note)
+    prompt.push_str(PROMPT_TOOL_RULES);
+    prompt.push_str(PROMPT_CONFIRM_CLASS_GUIDANCE);
+
+    append_common_prompt_sections(&mut prompt, languages, mcp_tool_descriptions);
+
+    prompt
+}
+
+/// Append sections common to both JSON and tag-based prompts.
+fn append_common_prompt_sections(
+    prompt: &mut String,
+    languages: &[ProjectLanguage],
+    mcp_tool_descriptions: Option<&str>,
+) {
     // Append MCP tool descriptions dynamically
     // [D4-010] mcp_tool_descriptions is sanitized by generate_mcp_tool_descriptions()
     if let Some(mcp_desc) = mcp_tool_descriptions {
@@ -808,8 +897,6 @@ fn tool_protocol_system_prompt_full(
     if languages.contains(&ProjectLanguage::NodeJs) {
         prompt.push_str(PROMPT_NODEJS_GUIDE);
     }
-
-    prompt
 }
 
 /// Compact tier: basic tools + rules, guides omitted.
@@ -916,6 +1003,21 @@ pub fn tool_protocol_system_prompt_all_tools(
         &all_tools,
         false,
         PromptTier::Full,
+    )
+}
+
+/// Generate a system prompt with tag-based protocol (for small model testing).
+pub fn tool_protocol_system_prompt_tag_based(
+    languages: &[ProjectLanguage],
+    mcp_tool_descriptions: Option<&str>,
+) -> String {
+    let empty = std::collections::HashSet::new();
+    tool_protocol_system_prompt_with_mode(
+        languages,
+        mcp_tool_descriptions,
+        &empty,
+        false,
+        ToolProtocolMode::TagBased,
     )
 }
 
