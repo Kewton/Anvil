@@ -491,6 +491,9 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
         ));
 
         // If no tool calls, this is the final response
+        // Note: ANVIL_FINAL file-modification guard is NOT applied to sub-agents.
+        // Sub-agents (Explore/Plan) are read-only and not expected to modify files.
+        // The guard is only enforced in the main agent loop (src/app/agentic.rs).
         if structured.tool_calls.is_empty() {
             let tokens = crate::contracts::tokens::estimate_tokens(
                 &token_buffer,

@@ -148,6 +148,14 @@ fn execute_parallel_group_standalone(
     all_results
 }
 
+/// Maximum number of ANVIL_FINAL guard retries (no-file-modification detection).
+const MAX_FINAL_GUARD_RETRIES: u8 = 1;
+
+/// Message sent to LLM when ANVIL_FINAL fires without file modifications.
+const FINAL_GUARD_RETRY_MESSAGE: &str = "No file modifications detected (file.write/file.edit not called). \
+     Please implement the changes rather than just planning them. \
+     Use file.write or file.edit to make the necessary code changes.";
+
 /// Maximum number of sub-agent calls allowed in a single turn (SR4-006).
 const MAX_SUBAGENT_CALLS_PER_TURN: usize = 3;
 
@@ -248,6 +256,25 @@ impl App {
         (agent_results, normal_calls)
     }
 
+    /// Check if the ANVIL_FINAL guard should activate.
+    /// Returns true if no file modifications were detected and retries remain.
+    fn should_activate_final_guard(&self, retries: u8) -> bool {
+        retries < MAX_FINAL_GUARD_RETRIES && self.session.working_memory.touched_files.is_empty()
+    }
+
+    /// Inject a retry message into the session to prompt the LLM for actual implementation.
+    /// See also: PROMPT_TOOL_RULES in src/agent/mod.rs for preventive guidance.
+    fn inject_final_guard_retry(&mut self) {
+        tracing::warn!("ANVIL_FINAL guard: no file modifications detected, retrying");
+        let retry_msg = SessionMessage::new(
+            MessageRole::Tool,
+            "system",
+            FINAL_GUARD_RETRY_MESSAGE.to_string(),
+        )
+        .with_id(self.next_message_id("tool"));
+        self.session.push_message(retry_msg);
+    }
+
     /// Execute tool calls and feed results back to the LLM in a loop.
     ///
     /// This implements the agentic tool-use loop:
@@ -272,6 +299,7 @@ impl App {
         let mut frames = Vec::new();
         let mut total_tool_count = 0usize;
         let mut all_tool_log_views: Vec<ToolLogView> = Vec::new();
+        let mut final_guard_retries: u8 = 0;
 
         for iteration in 0..max_iterations {
             // Check shutdown flag before tool execution
@@ -435,6 +463,13 @@ impl App {
                 };
 
             if next_structured.tool_calls.is_empty() {
+                // ANVIL_FINAL guard: check if any file modifications were made
+                if self.should_activate_final_guard(final_guard_retries) {
+                    self.inject_final_guard_retry();
+                    final_guard_retries += 1;
+                    current = next_structured;
+                    continue;
+                }
                 // No more tool calls — this is the final answer
                 self.record_assistant_output(
                     self.next_message_id("assistant"),
@@ -974,6 +1009,123 @@ impl App {
         self.session.push_message(msg);
     }
 
+    /// Execute a single retry LLM turn after ANVIL_FINAL guard activation.
+    /// This is a simplified version of the agentic loop that processes exactly one LLM response.
+    /// After the retry, the response is accepted unconditionally (no further guard check).
+    ///
+    /// CB-005: The stream callback only processes `TokenDelta` events, consistent
+    /// with `complete_structured_response`. `ProviderEvent::Agent(Done)` is not
+    /// handled here because the retry response is parsed from the accumulated
+    /// token buffer directly (the same pattern used by the main agentic loop).
+    #[allow(clippy::too_many_arguments)]
+    fn run_guarded_retry_turn<C: ProviderClient>(
+        &mut self,
+        status: &str,
+        saved_status: &str,
+        elapsed_ms: u128,
+        inference_performance: Option<crate::contracts::InferencePerformanceView>,
+        tui: &Tui,
+        provider_client: &C,
+    ) -> Result<Vec<String>, AppError> {
+        // Build request and call LLM for one more turn
+        let system_prompt = self.build_dynamic_system_prompt();
+        let request = BasicAgentLoop::build_turn_request(
+            self.effective_model().to_string(),
+            &self.session,
+            self.provider.capabilities.streaming && self.config.runtime.stream,
+            self.effective_context_window(),
+            &system_prompt,
+        );
+
+        let spinner = Spinner::start(
+            format!("ANVIL_FINAL guard retry. model={}", self.effective_model()),
+            self.config.mode.interactive,
+        );
+
+        let mut token_buffer = String::new();
+        let mut first_token = true;
+        let mut spinner_opt = Some(spinner);
+
+        let stream_result = provider_client.stream_turn(&request, &mut |event| {
+            if let Some(s) = spinner_opt.take() {
+                s.stop();
+            }
+            if let ProviderEvent::TokenDelta(delta) = &event {
+                token_buffer.push_str(delta);
+                if first_token {
+                    first_token = false;
+                }
+                let _ = std::io::Write::write_fmt(&mut std::io::stderr(), format_args!("{delta}"));
+                let _ = std::io::Write::flush(&mut std::io::stderr());
+            }
+        });
+
+        if let Some(s) = spinner_opt.take() {
+            s.stop();
+        }
+        if !first_token {
+            let _ = std::io::Write::write_fmt(&mut std::io::stderr(), format_args!("\n"));
+        }
+
+        stream_result.map_err(|err| match err {
+            crate::provider::ProviderTurnError::Cancelled => {
+                AppError::ToolExecution("guarded retry cancelled".to_string())
+            }
+            other => AppError::ToolExecution(format!("guarded retry failed: {other}")),
+        })?;
+
+        // Parse the retry response
+        let retry_structured = match BasicAgentLoop::parse_structured_response(&token_buffer) {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                let trimmed = token_buffer.trim();
+                StructuredAssistantResponse {
+                    tool_calls: Vec::new(),
+                    final_response: if trimmed.is_empty() {
+                        "Guard retry produced empty response.".to_string()
+                    } else {
+                        trimmed.to_string()
+                    },
+                }
+            }
+        };
+
+        // If response has tool_calls, delegate to complete_structured_response
+        if !retry_structured.tool_calls.is_empty() {
+            return self.complete_structured_response(
+                retry_structured,
+                status,
+                saved_status,
+                elapsed_ms,
+                inference_performance,
+                tui,
+                provider_client,
+            );
+        }
+
+        // No tool calls — accept as final answer (no further guard check)
+        self.record_assistant_output(
+            self.next_message_id("assistant"),
+            retry_structured.final_response,
+        )?;
+
+        // Transition to Done
+        let mut done = AppStateSnapshot::new(RuntimeState::Done)
+            .with_status(status.to_string())
+            .with_completion_summary(
+                format!("Guard retry completed. {saved_status}"),
+                saved_status.to_string(),
+            )
+            .with_elapsed_ms(elapsed_ms);
+        if let Some(perf) = inference_performance {
+            done = done.with_inference_performance(perf);
+        }
+        let mut done_snapshot = self.transition_with_context(done, StateTransition::Finish)?;
+        self.evaluate_context_warning(&mut done_snapshot);
+        let frames = vec![self.render_console(tui)?];
+        Ok(frames)
+    }
+
     pub(crate) fn handle_structured_done<C: ProviderClient>(
         &mut self,
         event: &crate::agent::AgentEvent,
@@ -996,6 +1148,32 @@ impl App {
         let structured = BasicAgentLoop::parse_structured_response(assistant_message)
             .map_err(AppError::ToolExecution)?;
         if structured.tool_calls.is_empty() {
+            // ANVIL_FINAL guard: only activate when the message contains a
+            // structured ANVIL_FINAL block (not plain-text Done messages).
+            // Inject retry message and re-invoke LLM directly (not via
+            // complete_structured_response, which would wastefully execute the
+            // empty tool_calls pipeline).
+            //
+            // CB-002: Retry count is always 0 here because this path handles
+            // the first-turn Done event (before any agentic loop iteration).
+            // MAX_FINAL_GUARD_RETRIES = 1 ensures at most one retry, so the
+            // hardcoded 0 is correct and sufficient for the current design.
+            if BasicAgentLoop::is_complete_structured_response(assistant_message)
+                && self.should_activate_final_guard(0)
+            {
+                self.inject_final_guard_retry();
+                // Record the assistant message that triggered the guard
+                self.record_assistant_output(self.next_message_id("assistant"), assistant_message)?;
+                // Re-invoke LLM and process the response
+                return Ok(Some(self.run_guarded_retry_turn(
+                    status,
+                    saved_status,
+                    *elapsed_ms,
+                    inference_performance.clone(),
+                    tui,
+                    provider_client,
+                )?));
+            }
             return Ok(None);
         }
 

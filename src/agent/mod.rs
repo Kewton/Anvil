@@ -652,6 +652,9 @@ const PROMPT_TOOL_RULES: &str = concat!(
     "- Do not use any other tool syntax.\n",
     "- Always include ANVIL_FINAL after your tool blocks.\n",
     "- If no file operations are needed, just respond normally without tool blocks.\n",
+    "- When the user's request requires file changes (implement, fix, create, modify, etc.), \
+       you must complete the actual file modifications using file.write/file.edit, \
+       not just output a plan or description.\n",
     "- Start exploration with file.read on \".\" to list the project root before reading specific files.\n",
     "- Do not assume files like README.md exist — verify first.\n",
     "- For dev servers and watch processes (npm run dev, cargo watch, etc.), use background execution with '&' so the command returns immediately.\n",
