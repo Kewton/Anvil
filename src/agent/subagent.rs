@@ -220,6 +220,7 @@ impl SubAgentResult {
             payload: ToolExecutionPayload::Text(json),
             artifacts: Vec::new(),
             elapsed_ms: 0,
+            diff_summary: None,
         }
     }
 }
@@ -269,6 +270,7 @@ impl SubAgentError {
             payload: ToolExecutionPayload::Text(output),
             artifacts: Vec::new(),
             elapsed_ms: 0,
+            diff_summary: None,
         }
     }
 }
@@ -574,6 +576,7 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
                     payload: ToolExecutionPayload::Text(err.to_string()),
                     artifacts: Vec::new(),
                     elapsed_ms: 0,
+                    diff_summary: None,
                 });
 
             // Record tool result in the sub-agent session

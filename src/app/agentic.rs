@@ -131,6 +131,7 @@ fn execute_parallel_group_standalone(
                                 payload,
                                 artifacts: Vec::new(),
                                 elapsed_ms: 0,
+                                diff_summary: None,
                             }
                         });
                         completed.fetch_add(1, Ordering::Relaxed);
@@ -160,6 +161,7 @@ fn execute_parallel_group_standalone(
                                 payload: ToolExecutionPayload::None,
                                 artifacts: Vec::new(),
                                 elapsed_ms: 0,
+                                diff_summary: None,
                             },
                         ));
                     }
@@ -210,6 +212,7 @@ impl App {
                     ),
                     artifacts: Vec::new(),
                     elapsed_ms: 0,
+                    diff_summary: None,
                 });
                 continue;
             }
@@ -415,13 +418,14 @@ impl App {
                 self.config.mode.interactive,
             );
 
-            let system_prompt = self.build_dynamic_system_prompt();
-            let request = BasicAgentLoop::build_turn_request(
+            let (system_prompt, calibration_ratio) = self.prepare_turn_context();
+            let (request, _) = BasicAgentLoop::build_turn_request_calibrated(
                 self.effective_model().to_string(),
                 &self.session,
                 self.provider.capabilities.streaming && self.config.runtime.stream,
                 self.effective_context_window(),
                 &system_prompt,
+                calibration_ratio,
             );
 
             let mut next_token_buffer = String::new();
@@ -575,6 +579,7 @@ impl App {
                         payload: ToolExecutionPayload::Text(OFFLINE_BLOCK_PAYLOAD.to_string()),
                         artifacts: Vec::new(),
                         elapsed_ms: 0,
+                        diff_summary: None,
                     },
                 ));
                 continue;
@@ -596,7 +601,10 @@ impl App {
                     );
                 } else {
                     let summary = tool_call_approval_summary(call);
-                    let diff_preview = generate_diff_preview(&self.config.paths.cwd, &call.input);
+                    let diff_options =
+                        crate::tooling::diff::DiffOptions::from_runtime(&self.config.runtime);
+                    let diff_preview =
+                        generate_diff_preview(&self.config.paths.cwd, &call.input, &diff_options);
                     let approved = prompt_inline_approval(&summary, diff_preview.as_deref());
                     if !approved {
                         failed_results
@@ -669,6 +677,7 @@ impl App {
                 payload: ToolExecutionPayload::Text(err.to_string()),
                 artifacts: Vec::new(),
                 elapsed_ms: 0,
+                diff_summary: None,
             });
 
         // Remove checkpoint if tool execution failed.
@@ -702,6 +711,7 @@ impl App {
                 payload: ToolExecutionPayload::None,
                 artifacts: Vec::new(),
                 elapsed_ms: 0,
+                diff_summary: None,
             };
         };
 
@@ -727,6 +737,7 @@ impl App {
             payload,
             artifacts: Vec::new(),
             elapsed_ms: started.elapsed().as_millis(),
+            diff_summary: None,
         }
     }
 
@@ -791,6 +802,7 @@ impl App {
                                     payload: crate::tooling::ToolExecutionPayload::None,
                                     artifacts: Vec::new(),
                                     elapsed_ms: 0,
+                                    diff_summary: None,
                                 },
                             ));
                         }
@@ -861,6 +873,7 @@ impl App {
                     payload: ToolExecutionPayload::Text(msg.clone()),
                     artifacts: vec![],
                     elapsed_ms: 0,
+                    diff_summary: None,
                 })
             }
             _ => None,
@@ -1065,8 +1078,11 @@ impl App {
         // Track tool usage for dynamic system prompt generation (Issue #73)
         self.session.used_tools.insert(result.tool_name.clone());
 
-        // Working memory: track touched files (file-mutating tools only) (Issue #130)
-        let is_file_tool = matches!(result.tool_name.as_str(), "file.write" | "file.edit");
+        // Working memory: track touched files (file-mutating tools only) (Issue #130, #157)
+        let is_file_tool = matches!(
+            result.tool_name.as_str(),
+            "file.write" | "file.edit" | "file.edit_anchor"
+        );
         if is_file_tool
             && result.status == ToolExecutionStatus::Completed
             && !result.summary.contains("[rolled back]")
@@ -1078,6 +1094,22 @@ impl App {
                 } else {
                     tracing::warn!("skip touched_files update for non-relative artifact");
                 }
+            }
+
+            // Update recent_diffs with diff_summary (Issue #157)
+            if let Some(ref diff) = result.diff_summary {
+                let current = self
+                    .session
+                    .working_memory
+                    .recent_diffs
+                    .clone()
+                    .unwrap_or_default();
+                let updated = if current.is_empty() {
+                    diff.clone()
+                } else {
+                    format!("{}\n{}", current, diff)
+                };
+                self.session.working_memory.set_recent_diffs(Some(updated));
             }
         }
 
@@ -1108,6 +1140,9 @@ impl App {
             }
         }
 
+        // Write fail tracker: track consecutive file.write failures (Issue #161)
+        let write_hint = self.update_write_tracker(result);
+
         // Working memory: track errors (Issue #130)
         if result.status == ToolExecutionStatus::Failed {
             let sanitized_error = if result.tool_name == "shell.exec" {
@@ -1129,6 +1164,10 @@ impl App {
         if let Some(hint) = edit_hint {
             formatted.push_str(&hint);
         }
+        // Append write recovery hint if consecutive failures detected
+        if let Some(hint) = write_hint {
+            formatted.push_str(&hint);
+        }
         let mut msg = SessionMessage::new(MessageRole::Tool, &result.tool_name, formatted)
             .with_id(self.next_message_id("tool"));
         msg.is_error = is_error;
@@ -1139,6 +1178,33 @@ impl App {
             msg = msg.with_image_paths(vec![source_path.clone()]);
         }
         self.session.push_message(msg);
+    }
+
+    /// Track consecutive file.write failures and return a hint if threshold reached.
+    fn update_write_tracker(&mut self, result: &ToolExecutionResult) -> Option<String> {
+        if result.tool_name != "file.write" {
+            return None;
+        }
+        if result.status == ToolExecutionStatus::Failed {
+            if let Some(path) = extract_write_path_from_summary(&result.summary)
+                .filter(|p| self.write_fail_tracker.record_failure(p))
+            {
+                let count = self.write_fail_tracker.failure_count(&path);
+                let safe_path = crate::session::sanitize_for_prompt_entry(&path);
+                return Some(format!(
+                    "\n\n[Anvil hint] file.write has failed {count} consecutive \
+                     times for '{safe_path}'. Please check the error message carefully. \
+                     Consider: (1) verifying the file path is correct, \
+                     (2) splitting the content into smaller files, \
+                     (3) using file.edit for partial modifications instead."
+                ));
+            }
+        } else if result.status == ToolExecutionStatus::Completed
+            && let Some(artifact) = result.artifacts.first()
+        {
+            self.write_fail_tracker.record_success(artifact);
+        }
+        None
     }
 
     /// Execute a single retry LLM turn after ANVIL_FINAL guard activation.
@@ -1160,13 +1226,14 @@ impl App {
         provider_client: &C,
     ) -> Result<Vec<String>, AppError> {
         // Build request and call LLM for one more turn
-        let system_prompt = self.build_dynamic_system_prompt();
-        let request = BasicAgentLoop::build_turn_request(
+        let (system_prompt, calibration_ratio) = self.prepare_turn_context();
+        let (request, _) = BasicAgentLoop::build_turn_request_calibrated(
             self.effective_model().to_string(),
             &self.session,
             self.provider.capabilities.streaming && self.config.runtime.stream,
             self.effective_context_window(),
             &system_prompt,
+            calibration_ratio,
         );
 
         let spinner = Spinner::start(
@@ -1432,6 +1499,25 @@ fn extract_edit_path_from_summary(summary: &str) -> Option<String> {
     Some(path.to_string())
 }
 
+/// Extract the file path from a file.write error summary.
+/// Looks for patterns like "file.write failed for {path}: {err}"
+/// or "file.write failed for {path} (parent creation failed for {parent}): {err}"
+fn extract_write_path_from_summary(summary: &str) -> Option<String> {
+    let prefix = "file.write failed for ";
+    let rest = summary.strip_prefix(prefix)?;
+
+    // Priority 1: check for the parent-creation fixed marker first
+    let parent_marker = " (parent creation failed for ";
+    if let Some(marker_pos) = rest.find(parent_marker) {
+        return Some(rest[..marker_pos].to_string());
+    }
+
+    // Priority 2: normal format — use rsplit_once to find the LAST ": " boundary,
+    // which avoids mis-splitting on paths containing ": " (rare but legal on Unix).
+    // The error portion after the last ": " is the OS I/O error message.
+    rest.rsplit_once(": ").map(|(path, _err)| path.to_string())
+}
+
 /// Format a tool execution result into a message that the LLM can interpret.
 ///
 /// Includes the actual payload (file content, search matches) so the LLM
@@ -1484,6 +1570,7 @@ fn build_failed_result(
         payload: crate::tooling::ToolExecutionPayload::None,
         artifacts: Vec::new(),
         elapsed_ms: 0,
+        diff_summary: None,
     }
 }
 
@@ -1656,5 +1743,32 @@ mod trust_tests {
             false,
             &trusted_tools,
         ));
+    }
+
+    #[test]
+    fn test_extract_write_path_from_summary() {
+        let summary = "file.write failed for /tmp/foo.rs: Permission denied";
+        assert_eq!(
+            extract_write_path_from_summary(summary),
+            Some("/tmp/foo.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_write_path_parent_fail() {
+        let summary = "file.write failed for /tmp/dir/foo.rs (parent creation failed for /tmp/dir): No such file or directory";
+        assert_eq!(
+            extract_write_path_from_summary(summary),
+            Some("/tmp/dir/foo.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_write_path_invalid() {
+        assert_eq!(extract_write_path_from_summary("some random error"), None);
+        assert_eq!(
+            extract_write_path_from_summary("file.edit: something in foo.rs. blah"),
+            None
+        );
     }
 }

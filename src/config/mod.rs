@@ -117,6 +117,10 @@ pub struct RuntimeConfig {
     pub loop_detection_threshold: usize,
     /// HTTP request timeout in seconds (Issue #146).
     pub http_timeout_secs: u64,
+    /// Maximum line count for file.write on existing files (0 = disabled, Issue #156).
+    pub safe_write_max_lines: usize,
+    /// Deletion ratio threshold for diff warning (0.0-1.0, Issue #156).
+    pub safe_write_deletion_ratio: f64,
     /// UI language for LLM responses (Issue #162).
     /// `None` means "use default language via effective_ui_language_code()".
     /// Supported: "ja", "en".
@@ -274,6 +278,8 @@ impl EffectiveConfig {
                 subagent_timeout_secs: DEFAULT_SUBAGENT_TIMEOUT_SECS,
                 loop_detection_threshold: 3,
                 http_timeout_secs: DEFAULT_HTTP_TIMEOUT_SECS,
+                safe_write_max_lines: 500,
+                safe_write_deletion_ratio: 0.5,
                 ui_language: None,
             },
             mode: ModeConfig {
@@ -375,6 +381,8 @@ impl EffectiveConfig {
             "ANVIL_LOOP_DETECTION_THRESHOLD",
             "ANVIL_HTTP_TIMEOUT",
             "ANVIL_CURL_TIMEOUT",
+            "ANVIL_SAFE_WRITE_MAX_LINES",
+            "ANVIL_SAFE_WRITE_DELETION_RATIO",
         ] {
             if let Ok(value) = std::env::var(key) {
                 map.insert(key.to_string(), value);
@@ -471,6 +479,19 @@ impl EffectiveConfig {
         // Prompt tier override
         if let Some(ref v) = cli.prompt_tier {
             self.runtime.prompt_tier = Some(v.clone());
+        }
+
+        // Safe write settings
+        if let Some(v) = cli.safe_write_max_lines {
+            self.runtime.safe_write_max_lines = v;
+        }
+        if let Some(v) = cli.safe_write_deletion_ratio {
+            if !is_valid_deletion_ratio(v) {
+                return Err(ConfigError::InvalidNumericValue(format!(
+                    "safe_write_deletion_ratio must be between 0.0 and 1.0, got {v}"
+                )));
+            }
+            self.runtime.safe_write_deletion_ratio = v;
         }
 
         // --session flag: override session file path
@@ -612,6 +633,20 @@ impl EffectiveConfig {
                     self.runtime.http_timeout_secs = value
                         .parse()
                         .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                }
+                "safe_write_max_lines" | "ANVIL_SAFE_WRITE_MAX_LINES" => {
+                    self.runtime.safe_write_max_lines = value
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                }
+                "safe_write_deletion_ratio" | "ANVIL_SAFE_WRITE_DELETION_RATIO" => {
+                    let v: f64 = value
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                    if !is_valid_deletion_ratio(v) {
+                        return Err(ConfigError::InvalidNumericValue(value.clone()));
+                    }
+                    self.runtime.safe_write_deletion_ratio = v;
                 }
                 _ => {}
             }
@@ -788,6 +823,11 @@ const DEFAULT_SUBAGENT_TIMEOUT_SECS: u64 = 120;
 const MAX_SUBAGENT_ITERATIONS: u32 = 100;
 const MAX_SUBAGENT_TIMEOUT_SECS: u64 = 3600;
 const MIN_AGENT_ITERATIONS: usize = 1;
+
+/// Validate that a deletion ratio value is finite and within [0.0, 1.0].
+fn is_valid_deletion_ratio(v: f64) -> bool {
+    v.is_finite() && (0.0..=1.0).contains(&v)
+}
 const MAX_AGENT_ITERATIONS: usize = 100;
 
 /// Sensitive keys and their recommended environment variable names.
@@ -1013,6 +1053,8 @@ impl std::fmt::Debug for RuntimeConfig {
                 &self.smart_compact_threshold_ratio,
             )
             .field("http_timeout_secs", &self.http_timeout_secs)
+            .field("safe_write_max_lines", &self.safe_write_max_lines)
+            .field("safe_write_deletion_ratio", &self.safe_write_deletion_ratio)
             .finish()
     }
 }

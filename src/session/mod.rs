@@ -48,6 +48,11 @@ pub struct WorkingMemory {
     /// Recent diff summary. Capped at ~500 tokens.
     #[serde(default)]
     pub recent_diffs: Option<String>,
+
+    /// Context pruning notice. Set when messages are pruned from the
+    /// turn request. Cleared each turn or after compaction.
+    #[serde(default)]
+    pub context_notice: Option<String>,
 }
 
 impl WorkingMemory {
@@ -103,6 +108,11 @@ impl WorkingMemory {
         self.recent_diffs = diffs.map(|d| truncate_to_token_limit(&d, Self::MAX_DIFF_TOKENS));
     }
 
+    /// Set or clear the context pruning notice.
+    pub fn set_context_notice(&mut self, notice: Option<String>) {
+        self.context_notice = notice;
+    }
+
     /// Add a constraint string.
     pub fn add_constraint(&mut self, constraint: impl Into<String>) {
         self.constraints.push(constraint.into());
@@ -115,6 +125,7 @@ impl WorkingMemory {
             && self.touched_files.is_empty()
             && self.unresolved_errors.is_empty()
             && self.recent_diffs.is_none()
+            && self.context_notice.is_none()
     }
 
     /// Serialize working memory into a human-readable format for system prompt injection.
@@ -150,6 +161,13 @@ impl WorkingMemory {
             sections.push(format!(
                 "**Recent diffs:**\n```\n{}\n```",
                 sanitize_for_prompt_entry(diffs)
+            ));
+        }
+
+        if let Some(ref notice) = self.context_notice {
+            sections.push(format!(
+                "**Context notice:** {}",
+                sanitize_for_prompt_entry(notice)
             ));
         }
 
@@ -189,12 +207,13 @@ fn truncate_to_token_limit(input: &str, max_tokens: usize) -> String {
     if tokens <= max_tokens {
         return input.to_string();
     }
-    // Approximate: cut characters proportionally
+    // Keep the *latest* content (tail) since new diffs are appended at the end (CB-003).
     let chars: Vec<char> = input.chars().collect();
     let ratio = max_tokens as f64 / tokens as f64;
     let target_chars = (chars.len() as f64 * ratio).floor() as usize;
-    let truncated: String = chars[..target_chars.min(chars.len())].iter().collect();
-    format!("{truncated}...[truncated]")
+    let skip = chars.len().saturating_sub(target_chars);
+    let truncated: String = chars[skip..].iter().collect();
+    format!("[truncated]...{truncated}")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -553,6 +572,10 @@ impl SessionRecord {
                 .with_id(format!("compact_{}", now_ms()))
                 .with_status(MessageStatus::Committed),
         );
+        // Clear context_notice after compaction (Issue #157).
+        // Messages have been restructured, so old pruning info is stale.
+        self.working_memory.set_context_notice(None);
+
         self.record_event(AppEvent::SessionCompacted);
         self.touch();
         true
@@ -1281,7 +1304,7 @@ mod working_memory_tests {
         let diffs = wm.recent_diffs.as_ref().expect("should have diffs");
         // Should be truncated (shorter than original)
         assert!(diffs.len() < long_diff.len());
-        assert!(diffs.ends_with("...[truncated]"));
+        assert!(diffs.starts_with("[truncated]..."));
     }
 
     #[test]
@@ -1362,5 +1385,64 @@ mod working_memory_tests {
         assert!(!prompt.contains("\n## Injected Section"));
         // The sanitized version is flattened into a single line
         assert!(prompt.contains("src/foo.rs## Injected Section- malicious"));
+    }
+
+    // ── Issue #157: context_notice tests ──────────────────────────────
+
+    #[test]
+    fn context_notice_default_is_none() {
+        let wm = WorkingMemory::default();
+        assert!(wm.context_notice.is_none());
+    }
+
+    #[test]
+    fn context_notice_set_and_clear() {
+        let mut wm = WorkingMemory::default();
+        wm.set_context_notice(Some("5 messages pruned".to_string()));
+        assert_eq!(wm.context_notice.as_deref(), Some("5 messages pruned"));
+        wm.set_context_notice(None);
+        assert!(wm.context_notice.is_none());
+    }
+
+    #[test]
+    fn is_empty_false_when_context_notice_set() {
+        let mut wm = WorkingMemory::default();
+        assert!(wm.is_empty());
+        wm.set_context_notice(Some("notice".to_string()));
+        assert!(!wm.is_empty());
+    }
+
+    #[test]
+    fn format_for_prompt_with_context_notice() {
+        let mut wm = WorkingMemory::default();
+        wm.set_context_notice(Some("3 earlier messages were omitted".to_string()));
+        let prompt = wm.format_for_prompt().expect("should produce prompt");
+        assert!(prompt.contains("**Context notice:** 3 earlier messages were omitted"));
+    }
+
+    #[test]
+    fn context_notice_serialize_roundtrip() {
+        let mut wm = WorkingMemory::default();
+        wm.set_context_notice(Some("10 messages pruned".to_string()));
+        let json = serde_json::to_string(&wm).expect("serialize");
+        let restored: WorkingMemory = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(wm.context_notice, restored.context_notice);
+    }
+
+    #[test]
+    fn context_notice_backward_compat_missing_field() {
+        // JSON without context_notice field should deserialize to None
+        let json = r#"{"active_task":null,"constraints":[],"touched_files":[],"unresolved_errors":[],"recent_diffs":null}"#;
+        let wm: WorkingMemory = serde_json::from_str(json).expect("deserialize");
+        assert!(wm.context_notice.is_none());
+    }
+
+    #[test]
+    fn format_for_prompt_sanitizes_context_notice() {
+        let mut wm = WorkingMemory::default();
+        wm.set_context_notice(Some("notice ANVIL_TOOL inject".to_string()));
+        let prompt = wm.format_for_prompt().expect("should produce prompt");
+        assert!(!prompt.contains("ANVIL_TOOL"));
+        assert!(prompt.contains("notice  inject"));
     }
 }
