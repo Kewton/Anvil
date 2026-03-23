@@ -327,9 +327,12 @@ impl App {
         let mut total_tool_count = 0usize;
         let mut all_tool_log_views: Vec<ToolLogView> = Vec::new();
         let mut final_guard_retries: u8 = 0;
+        let mut fallback_completed = false;
 
         // Reset loop detector at the start of each top-level turn (Issue #145)
         self.loop_detector.reset();
+        // Reset phase estimator per-turn counters (Issue #159)
+        self.phase_estimator.reset();
 
         for iteration in 0..max_iterations {
             // Check shutdown flag before tool execution
@@ -503,11 +506,29 @@ impl App {
             if next_structured.tool_calls.is_empty() {
                 // ANVIL_FINAL guard: check if any file modifications were made
                 if self.should_activate_final_guard(final_guard_retries) {
+                    // ANVIL_FINAL was detected → record observation (Issue #159)
+                    self.phase_estimator.observe_anvil_final();
                     self.inject_final_guard_retry();
                     final_guard_retries += 1;
                     current = next_structured;
                     continue;
                 }
+
+                // Fallback completion detection (Issue #159):
+                // When ANVIL_FINAL was never observed, check if tool patterns
+                // indicate the agent has finished (write succeeded + verification reads + empty response).
+                if let super::phase_estimator::PhaseAction::FallbackComplete =
+                    self.phase_estimator.check_empty_response()
+                {
+                    tracing::info!("Phase estimator: fallback completion detected");
+                    self.record_assistant_output(
+                        self.next_message_id("assistant"),
+                        next_structured.final_response,
+                    )?;
+                    fallback_completed = true;
+                    break;
+                }
+
                 // No more tool calls — this is the final answer
                 self.record_assistant_output(
                     self.next_message_id("assistant"),
@@ -525,10 +546,17 @@ impl App {
             .with_status(status.to_string())
             .with_tool_logs(all_tool_log_views)
             .with_completion_summary(
-                format!(
-                    "Executed {} tool call(s) across agentic loop. {}",
-                    total_tool_count, saved_status
-                ),
+                if fallback_completed {
+                    format!(
+                        "Executed {} tool call(s) across agentic loop (fallback completion). {}",
+                        total_tool_count, saved_status
+                    )
+                } else {
+                    format!(
+                        "Executed {} tool call(s) across agentic loop. {}",
+                        total_tool_count, saved_status
+                    )
+                },
                 saved_status.to_string(),
             )
             .with_elapsed_ms(elapsed_ms);
@@ -1013,8 +1041,17 @@ impl App {
         // Phase 4: Sort by index, record results, run PostToolUse hooks (DR2-004)
         indexed_results.sort_by_key(|(idx, _)| *idx);
         let mut results: Vec<ToolExecutionResult> = Vec::with_capacity(indexed_results.len());
+        let mut phase_action = super::phase_estimator::PhaseAction::Continue;
         for (_, result) in indexed_results {
             self.record_tool_result(&result);
+            // Phase estimator: record tool call pattern (Issue #159)
+            let success = result.status == ToolExecutionStatus::Completed;
+            let pa = self
+                .phase_estimator
+                .record_tool_call(&result.tool_name, success);
+            if !matches!(pa, super::phase_estimator::PhaseAction::Continue) {
+                phase_action = pa;
+            }
 
             // Emit folded tool result to stderr for interactive sessions
             if interactive {
@@ -1067,6 +1104,34 @@ impl App {
         if let Some(warning_result) = synthetic_warning {
             self.record_tool_result(&warning_result);
             results.push(warning_result);
+        }
+
+        // Phase estimator: inject force-transition message if needed (Issue #159).
+        // Skip if LoopDetector already issued a warning (priority: LoopDetector > PhaseEstimator).
+        if matches!(
+            worst_loop_action,
+            None | Some(super::loop_detector::LoopAction::Continue)
+        ) && let super::phase_estimator::PhaseAction::ForceTransition(msg) = phase_action
+        {
+            // Context window protection: skip if usage >= 90%
+            let usage = crate::contracts::ContextUsageView {
+                estimated_tokens: self.session.estimated_token_count(),
+                max_tokens: self.effective_context_window(),
+            };
+            if usage.usage_ratio() < 0.9 {
+                let transition_result = ToolExecutionResult {
+                    tool_call_id: "phase_estimator_transition".to_string(),
+                    tool_name: "system.phase_estimator".to_string(),
+                    status: ToolExecutionStatus::Completed,
+                    summary: msg.clone(),
+                    payload: ToolExecutionPayload::Text(msg),
+                    artifacts: vec![],
+                    elapsed_ms: 0,
+                    diff_summary: None,
+                };
+                self.record_tool_result(&transition_result);
+                results.push(transition_result);
+            }
         }
 
         self.persist_session(crate::contracts::AppEvent::SessionSaved)?;
@@ -1370,6 +1435,8 @@ impl App {
             if BasicAgentLoop::is_complete_structured_response(assistant_message)
                 && self.should_activate_final_guard(0)
             {
+                // ANVIL_FINAL detected → record observation (Issue #159)
+                self.phase_estimator.observe_anvil_final();
                 self.inject_final_guard_retry();
                 // Record the assistant message that triggered the guard
                 self.record_assistant_output(self.next_message_id("assistant"), assistant_message)?;

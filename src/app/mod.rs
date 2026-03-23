@@ -9,6 +9,7 @@ mod context;
 pub(crate) mod edit_fail_tracker;
 pub mod loop_detector;
 pub mod mock;
+pub mod phase_estimator;
 pub mod plan;
 pub mod policy;
 pub mod render;
@@ -153,6 +154,8 @@ pub struct App {
     prompt_tier: PromptTier,
     /// Tracks consecutive file.edit failures per path for recovery hints.
     edit_fail_tracker: edit_fail_tracker::EditFailTracker,
+    /// Phase estimator for fallback phase control (Issue #159).
+    phase_estimator: phase_estimator::PhaseEstimator,
     /// Tracks consecutive file.write failures per path for recovery hints.
     write_fail_tracker: write_fail_tracker::WriteFailTracker,
     /// File read cache: reduces redundant file.read calls within a session.
@@ -417,6 +420,9 @@ impl App {
         };
 
         let loop_detection_threshold = config.runtime.loop_detection_threshold;
+        let phase_explore = config.runtime.phase_explore_threshold;
+        let phase_force = config.runtime.phase_force_transition_threshold;
+        let phase_completion = config.runtime.phase_completion_read_threshold;
         let edit_reread_threshold = config.runtime.edit_reread_threshold;
         let edit_write_fallback_threshold = config.runtime.edit_write_fallback_threshold;
 
@@ -448,6 +454,11 @@ impl App {
             edit_fail_tracker: edit_fail_tracker::EditFailTracker::new(
                 edit_reread_threshold,
                 edit_write_fallback_threshold,
+            ),
+            phase_estimator: phase_estimator::PhaseEstimator::new(
+                phase_explore,
+                phase_force,
+                phase_completion,
             ),
             write_fail_tracker: write_fail_tracker::WriteFailTracker::new(2),
             file_read_cache,
