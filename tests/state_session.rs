@@ -1502,13 +1502,16 @@ fn working_memory_backward_compat_old_json() {
 }
 
 #[test]
-fn compact_history_preserves_working_memory() {
+fn compact_history_preserves_working_memory_except_context_notice() {
     let mut session = SessionRecord::new(PathBuf::from("/tmp/wm_compact"));
     session
         .working_memory
         .set_active_task(Some("task A".to_string()));
     session.working_memory.update_touched_files("a.rs");
     session.working_memory.add_error("some error");
+    session
+        .working_memory
+        .set_context_notice(Some("5 messages pruned".to_string()));
 
     // Add enough messages to trigger compaction
     for i in 0..20 {
@@ -1522,10 +1525,127 @@ fn compact_history_preserves_working_memory() {
         );
     }
 
-    let wm_before = session.working_memory.clone();
     let compacted = session.compact_history(10);
     assert!(compacted);
 
-    // Working memory should be unchanged after compaction
-    assert_eq!(session.working_memory, wm_before);
+    // Core working memory fields should be preserved after compaction
+    assert_eq!(
+        session.working_memory.active_task,
+        Some("task A".to_string())
+    );
+    assert!(
+        session
+            .working_memory
+            .touched_files
+            .contains(&"a.rs".to_string())
+    );
+    assert!(
+        session
+            .working_memory
+            .unresolved_errors
+            .contains(&"some error".to_string())
+    );
+
+    // context_notice should be cleared after compaction (Issue #157)
+    assert!(
+        session.working_memory.context_notice.is_none(),
+        "context_notice should be cleared after compact_history"
+    );
+}
+
+#[test]
+fn working_memory_context_notice_serialize_roundtrip() {
+    let mut session = SessionRecord::new(PathBuf::from("/tmp/wm_notice_test"));
+    session
+        .working_memory
+        .set_context_notice(Some("10 earlier messages pruned".to_string()));
+
+    let json = serde_json::to_string(&session).expect("serialize");
+    let restored: SessionRecord = serde_json::from_str(&json).expect("deserialize");
+
+    assert_eq!(
+        session.working_memory.context_notice,
+        restored.working_memory.context_notice
+    );
+}
+
+// ── WorkingMemory record_tool_result behavior tests (Issue #157) ────────────
+
+#[test]
+fn working_memory_recent_diffs_accumulates_entries() {
+    let mut wm = WorkingMemory::default();
+    // Simulate record_tool_result accumulation logic
+    let diff1 = "wrote 100 bytes to src/main.rs".to_string();
+    wm.set_recent_diffs(Some(diff1.clone()));
+    assert_eq!(
+        wm.recent_diffs.as_deref(),
+        Some("wrote 100 bytes to src/main.rs")
+    );
+
+    // Second diff appended
+    let diff2 = "src/lib.rs: replaced 10 chars with 20 chars".to_string();
+    let current = wm.recent_diffs.clone().unwrap_or_default();
+    let updated = format!("{}\n{}", current, diff2);
+    wm.set_recent_diffs(Some(updated));
+    let diffs = wm.recent_diffs.as_ref().expect("should have diffs");
+    assert!(diffs.contains(&diff1), "should still contain first diff");
+    assert!(diffs.contains(&diff2), "should contain second diff");
+}
+
+#[test]
+fn working_memory_recent_diffs_truncation_keeps_latest() {
+    let mut wm = WorkingMemory::default();
+    // Create old + new diffs where total exceeds limit
+    let old_diff = "a".repeat(3000);
+    let new_diff = "b".repeat(3000);
+    let combined = format!("{}\n{}", old_diff, new_diff);
+    wm.set_recent_diffs(Some(combined));
+    let diffs = wm.recent_diffs.as_ref().expect("should have diffs");
+    // After CB-003 fix, truncation keeps the tail (latest content)
+    assert!(
+        diffs.starts_with("[truncated]..."),
+        "should have truncation prefix"
+    );
+    // The latest content (b's) should be preserved more than old content (a's)
+    let b_count = diffs.chars().filter(|c| *c == 'b').count();
+    let a_count = diffs.chars().filter(|c| *c == 'a').count();
+    assert!(
+        b_count > a_count,
+        "latest diffs (b's) should be preserved over old diffs (a's): b={b_count}, a={a_count}"
+    );
+}
+
+#[test]
+fn working_memory_touched_files_updated_for_file_edit_anchor_pattern() {
+    let mut wm = WorkingMemory::default();
+    // Simulate what record_tool_result does for file.edit_anchor
+    // The artifacts contain the resolved path; update_touched_files takes relative path
+    wm.update_touched_files("src/tooling/mod.rs");
+    assert!(
+        wm.touched_files.contains(&"src/tooling/mod.rs".to_string()),
+        "touched_files should contain the edited file"
+    );
+    // Verify deduplication
+    wm.update_touched_files("src/tooling/mod.rs");
+    let count = wm
+        .touched_files
+        .iter()
+        .filter(|f| *f == "src/tooling/mod.rs")
+        .count();
+    assert_eq!(count, 1, "touched_files should deduplicate entries");
+}
+
+#[test]
+fn working_memory_format_includes_recent_diffs_section() {
+    let mut wm = WorkingMemory::default();
+    wm.set_recent_diffs(Some("wrote 50 bytes to test.txt".to_string()));
+    let prompt = wm.format_for_prompt().expect("should produce prompt");
+    assert!(
+        prompt.contains("**Recent diffs:**"),
+        "prompt should include recent diffs section"
+    );
+    assert!(
+        prompt.contains("wrote 50 bytes to test.txt"),
+        "prompt should include the diff content"
+    );
 }

@@ -87,6 +87,10 @@ pub struct RuntimeConfig {
     pub edit_reread_threshold: u32,
     /// Consecutive edit failures before write fallback hint (Issue #158).
     pub edit_write_fallback_threshold: u32,
+    /// Maximum line count for file.write on existing files (0 = disabled, Issue #156).
+    pub safe_write_max_lines: usize,
+    /// Deletion ratio threshold for diff warning (0.0-1.0, Issue #156).
+    pub safe_write_deletion_ratio: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -243,6 +247,8 @@ impl EffectiveConfig {
                 edit_strategy: crate::app::edit_fail_tracker::EditStrategy::EditFirst,
                 edit_reread_threshold: 3,
                 edit_write_fallback_threshold: 5,
+                safe_write_max_lines: 500,
+                safe_write_deletion_ratio: 0.5,
             },
             mode: ModeConfig {
                 prompt_source: PromptSource::Interactive,
@@ -346,6 +352,8 @@ impl EffectiveConfig {
             "ANVIL_EDIT_STRATEGY",
             "ANVIL_EDIT_REREAD_THRESHOLD",
             "ANVIL_EDIT_WRITE_FALLBACK_THRESHOLD",
+            "ANVIL_SAFE_WRITE_MAX_LINES",
+            "ANVIL_SAFE_WRITE_DELETION_RATIO",
         ] {
             if let Ok(value) = std::env::var(key) {
                 map.insert(key.to_string(), value);
@@ -449,6 +457,19 @@ impl EffectiveConfig {
             self.runtime.edit_strategy = v
                 .parse::<crate::app::edit_fail_tracker::EditStrategy>()
                 .map_err(ConfigError::ValidationError)?;
+        }
+
+        // Safe write settings
+        if let Some(v) = cli.safe_write_max_lines {
+            self.runtime.safe_write_max_lines = v;
+        }
+        if let Some(v) = cli.safe_write_deletion_ratio {
+            if !is_valid_deletion_ratio(v) {
+                return Err(ConfigError::InvalidNumericValue(format!(
+                    "safe_write_deletion_ratio must be between 0.0 and 1.0, got {v}"
+                )));
+            }
+            self.runtime.safe_write_deletion_ratio = v;
         }
 
         // --session flag: override session file path
@@ -613,6 +634,20 @@ impl EffectiveConfig {
                         return Err(ConfigError::InvalidNumericValue(value.clone()));
                     }
                     self.runtime.edit_write_fallback_threshold = v;
+                }
+                "safe_write_max_lines" | "ANVIL_SAFE_WRITE_MAX_LINES" => {
+                    self.runtime.safe_write_max_lines = value
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                }
+                "safe_write_deletion_ratio" | "ANVIL_SAFE_WRITE_DELETION_RATIO" => {
+                    let v: f64 = value
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                    if !is_valid_deletion_ratio(v) {
+                        return Err(ConfigError::InvalidNumericValue(value.clone()));
+                    }
+                    self.runtime.safe_write_deletion_ratio = v;
                 }
                 _ => {}
             }
@@ -800,6 +835,11 @@ const DEFAULT_SUBAGENT_TIMEOUT_SECS: u64 = 120;
 const MAX_SUBAGENT_ITERATIONS: u32 = 100;
 const MAX_SUBAGENT_TIMEOUT_SECS: u64 = 3600;
 const MIN_AGENT_ITERATIONS: usize = 1;
+
+/// Validate that a deletion ratio value is finite and within [0.0, 1.0].
+fn is_valid_deletion_ratio(v: f64) -> bool {
+    v.is_finite() && (0.0..=1.0).contains(&v)
+}
 const MAX_AGENT_ITERATIONS: usize = 100;
 
 /// Sensitive keys and their recommended environment variable names.
@@ -1031,6 +1071,8 @@ impl std::fmt::Debug for RuntimeConfig {
                 "edit_write_fallback_threshold",
                 &self.edit_write_fallback_threshold,
             )
+            .field("safe_write_max_lines", &self.safe_write_max_lines)
+            .field("safe_write_deletion_ratio", &self.safe_write_deletion_ratio)
             .finish()
     }
 }
