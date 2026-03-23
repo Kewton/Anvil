@@ -787,3 +787,115 @@ fn subagent_config_invalid_numeric_value() {
     let result = config.apply_overrides_for_test(&map, &HashMap::new(), &HashMap::new());
     assert!(result.is_err(), "non-numeric value should fail");
 }
+
+// ============================================================
+// HTTP timeout config tests (Issue #146)
+// ============================================================
+
+#[test]
+fn http_timeout_default() {
+    let config = EffectiveConfig::default_for_test().unwrap();
+    assert_eq!(config.runtime.http_timeout_secs, 300);
+}
+
+#[test]
+fn http_timeout_from_map_config_key() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let mut map = HashMap::new();
+    map.insert("http_timeout_secs".to_string(), "60".to_string());
+    config
+        .apply_overrides_for_test(&map, &HashMap::new(), &HashMap::new())
+        .expect("should apply");
+    assert_eq!(config.runtime.http_timeout_secs, 60);
+}
+
+#[test]
+fn http_timeout_from_map_anvil_http_timeout() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let mut map = HashMap::new();
+    map.insert("ANVIL_HTTP_TIMEOUT".to_string(), "120".to_string());
+    config
+        .apply_overrides_for_test(&HashMap::new(), &map, &HashMap::new())
+        .expect("should apply");
+    assert_eq!(config.runtime.http_timeout_secs, 120);
+}
+
+#[test]
+fn http_timeout_from_map_anvil_curl_timeout() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let mut map = HashMap::new();
+    map.insert("ANVIL_CURL_TIMEOUT".to_string(), "90".to_string());
+    config
+        .apply_overrides_for_test(&HashMap::new(), &map, &HashMap::new())
+        .expect("should apply");
+    assert_eq!(config.runtime.http_timeout_secs, 90);
+}
+
+#[test]
+fn http_timeout_clamp_zero_restored_to_default() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    config.runtime.http_timeout_secs = 0;
+    config.validate_for_test().expect("validation should pass");
+    assert_eq!(
+        config.runtime.http_timeout_secs, 300,
+        "zero http_timeout_secs should be restored to default (300)"
+    );
+}
+
+#[test]
+fn http_timeout_clamp_below_minimum() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    config.runtime.http_timeout_secs = 5;
+    config.validate_for_test().expect("validation should pass");
+    assert_eq!(
+        config.runtime.http_timeout_secs, 10,
+        "http_timeout_secs below 10 should be clamped to 10"
+    );
+}
+
+#[test]
+fn http_timeout_clamp_above_maximum() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    config.runtime.http_timeout_secs = 7200;
+    config.validate_for_test().expect("validation should pass");
+    assert_eq!(
+        config.runtime.http_timeout_secs, 3600,
+        "http_timeout_secs above 3600 should be clamped to 3600"
+    );
+}
+
+#[test]
+fn http_timeout_normal_value_unchanged() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    config.runtime.http_timeout_secs = 600;
+    config.validate_for_test().expect("validation should pass");
+    assert_eq!(config.runtime.http_timeout_secs, 600);
+}
+
+#[test]
+fn http_timeout_invalid_numeric_value() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let mut map = HashMap::new();
+    map.insert("http_timeout_secs".to_string(), "not_a_number".to_string());
+    let result = config.apply_overrides_for_test(&map, &HashMap::new(), &HashMap::new());
+    assert!(result.is_err(), "non-numeric http_timeout_secs should fail");
+}
+
+#[test]
+fn http_timeout_cli_args_overrides_runtime() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let cli = anvil::config::CliArgs {
+        timeout: Some(180),
+        ..Default::default()
+    };
+    config.apply_cli_args(&cli).expect("should apply");
+    assert_eq!(config.runtime.http_timeout_secs, 180);
+}
+
+#[test]
+fn http_timeout_cli_args_none_leaves_default() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let cli = anvil::config::CliArgs::default();
+    config.apply_cli_args(&cli).expect("should apply");
+    assert_eq!(config.runtime.http_timeout_secs, 300);
+}
