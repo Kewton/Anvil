@@ -5309,3 +5309,75 @@ fn file_cache_update_existing_entry() {
     assert_eq!(cache.total_bytes(), 15); // "version2_longer".len()
     assert_eq!(cache.try_get(&file), Some("version2_longer".to_string()));
 }
+
+#[test]
+fn file_edit_success_payload_contains_diff() {
+    let root = std::env::temp_dir().join("anvil_file_edit_payload_diff");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("dir should exist");
+    let file_path = root.join("test.txt");
+    fs::write(&file_path, "hello world").expect("write should succeed");
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
+    let result = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_edit_payload_001".to_string(),
+            spec: build_registry()
+                .get("file.edit")
+                .expect("file.edit spec")
+                .clone(),
+            input: ToolInput::FileEdit {
+                path: "./test.txt".to_string(),
+                old_string: "hello".to_string(),
+                new_string: "goodbye".to_string(),
+            },
+        })
+        .expect("edit should succeed");
+
+    assert_eq!(result.status, ToolExecutionStatus::Completed);
+    match &result.payload {
+        ToolExecutionPayload::Text(diff_text) => {
+            assert!(
+                diff_text.contains("-hello"),
+                "diff should contain removed line: {diff_text}"
+            );
+            assert!(
+                diff_text.contains("+goodbye"),
+                "diff should contain added line: {diff_text}"
+            );
+        }
+        other => panic!("expected ToolExecutionPayload::Text, got: {other:?}"),
+    }
+}
+
+#[test]
+fn file_edit_no_changes_payload_is_none() {
+    let root = std::env::temp_dir().join("anvil_file_edit_no_changes_payload");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("dir should exist");
+    let file_path = root.join("test.txt");
+    fs::write(&file_path, "hello world").expect("write should succeed");
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
+    let result = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_edit_nochange_001".to_string(),
+            spec: build_registry()
+                .get("file.edit")
+                .expect("file.edit spec")
+                .clone(),
+            input: ToolInput::FileEdit {
+                path: "./test.txt".to_string(),
+                old_string: "hello".to_string(),
+                new_string: "hello".to_string(),
+            },
+        })
+        .expect("edit should succeed");
+
+    assert_eq!(result.status, ToolExecutionStatus::Completed);
+    assert_eq!(
+        result.payload,
+        ToolExecutionPayload::None,
+        "no-changes path should return Payload::None"
+    );
+}
