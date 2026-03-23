@@ -383,6 +383,7 @@ impl EffectiveConfig {
             "ANVIL_CURL_TIMEOUT",
             "ANVIL_SAFE_WRITE_MAX_LINES",
             "ANVIL_SAFE_WRITE_DELETION_RATIO",
+            "ANVIL_UI_LANGUAGE",
         ] {
             if let Ok(value) = std::env::var(key) {
                 map.insert(key.to_string(), value);
@@ -648,6 +649,13 @@ impl EffectiveConfig {
                     }
                     self.runtime.safe_write_deletion_ratio = v;
                 }
+                "ui_language" | "ANVIL_UI_LANGUAGE" => {
+                    self.runtime.ui_language = if value.is_empty() {
+                        None
+                    } else {
+                        Some(value.clone())
+                    };
+                }
                 _ => {}
             }
         }
@@ -676,7 +684,25 @@ impl EffectiveConfig {
         self.clamp_subagent_settings();
         self.clamp_loop_detection_threshold();
         self.clamp_http_timeout();
+        self.sanitize_ui_language();
         Ok(())
+    }
+
+    /// Validate `ui_language`: keep `None` and supported values, reset invalid to `None`.
+    fn sanitize_ui_language(&mut self) {
+        let is_supported = |code: &str| SUPPORTED_LANGUAGES.iter().any(|(c, _)| *c == code);
+        match self.runtime.ui_language.as_deref() {
+            None => {}
+            Some(code) if is_supported(code) => {}
+            Some(invalid) => {
+                eprintln!(
+                    "Warning: ui_language=\"{}\" is not supported, falling back to \"{}\"",
+                    invalid.escape_debug(),
+                    DEFAULT_UI_LANGUAGE
+                );
+                self.runtime.ui_language = None;
+            }
+        }
     }
 
     fn clamp_http_timeout(&mut self) {
