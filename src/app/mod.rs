@@ -12,6 +12,7 @@ pub mod mock;
 pub mod plan;
 pub mod policy;
 pub mod render;
+pub(crate) mod write_fail_tracker;
 
 use crate::agent::BasicAgentLoop;
 use crate::agent::{AgentEvent, AgentRuntime, PendingTurnState, ProjectLanguage, PromptTier};
@@ -152,6 +153,8 @@ pub struct App {
     prompt_tier: PromptTier,
     /// Tracks consecutive file.edit failures per path for recovery hints.
     edit_fail_tracker: edit_fail_tracker::EditFailTracker,
+    /// Tracks consecutive file.write failures per path for recovery hints.
+    write_fail_tracker: write_fail_tracker::WriteFailTracker,
     /// File read cache: reduces redundant file.read calls within a session.
     file_read_cache: Arc<Mutex<crate::tooling::file_cache::FileReadCache>>,
 }
@@ -441,6 +444,7 @@ impl App {
             last_estimated_prompt_tokens: None,
             prompt_tier,
             edit_fail_tracker: edit_fail_tracker::EditFailTracker::new(3),
+            write_fail_tracker: write_fail_tracker::WriteFailTracker::new(2),
             file_read_cache,
         })
     }
