@@ -667,6 +667,121 @@ fn system_prompt_includes_web_tools_even_with_empty_used_tools() {
     );
 }
 
+// --- Issue #160: ANVIL_FINAL後のツール呼び出し除外テスト ---
+
+#[test]
+fn post_final_tool_excluded() {
+    // TC1: ANVIL_TOOL → ANVIL_FINAL → ANVIL_TOOL — only the first tool should be included
+    let response = anvil::agent::BasicAgentLoop::parse_structured_response(concat!(
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_001\",\"tool\":\"file.read\",\"path\":\"./src/main.rs\"}\n",
+        "```\n",
+        "```ANVIL_FINAL\n",
+        "Read the file.\n",
+        "```\n",
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_002\",\"tool\":\"file.read\",\"path\":\"./src/lib.rs\"}\n",
+        "```\n"
+    ))
+    .expect("parsing should succeed");
+
+    assert_eq!(
+        response.tool_calls.len(),
+        1,
+        "only pre-FINAL tool should remain"
+    );
+    assert_eq!(response.tool_calls[0].tool_call_id, "call_001");
+}
+
+#[test]
+fn pre_final_tools_preserved() {
+    // TC2: ANVIL_TOOL → ANVIL_TOOL → ANVIL_FINAL — both tools should be included
+    let response = anvil::agent::BasicAgentLoop::parse_structured_response(concat!(
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_001\",\"tool\":\"file.read\",\"path\":\"./src/main.rs\"}\n",
+        "```\n",
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_002\",\"tool\":\"file.read\",\"path\":\"./src/lib.rs\"}\n",
+        "```\n",
+        "```ANVIL_FINAL\n",
+        "Read both files.\n",
+        "```\n"
+    ))
+    .expect("parsing should succeed");
+
+    assert_eq!(
+        response.tool_calls.len(),
+        2,
+        "both pre-FINAL tools should remain"
+    );
+    assert_eq!(response.tool_calls[0].tool_call_id, "call_001");
+    assert_eq!(response.tool_calls[1].tool_call_id, "call_002");
+}
+
+#[test]
+fn no_final_existing_compat() {
+    // TC3: ANVIL_TOOL → ANVIL_TOOL, no ANVIL_FINAL — both tools should be included
+    let response = anvil::agent::BasicAgentLoop::parse_structured_response(concat!(
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_001\",\"tool\":\"file.read\",\"path\":\"./src/main.rs\"}\n",
+        "```\n",
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_002\",\"tool\":\"file.read\",\"path\":\"./src/lib.rs\"}\n",
+        "```\n"
+    ))
+    .expect("parsing should succeed");
+
+    assert_eq!(
+        response.tool_calls.len(),
+        2,
+        "all tools should remain without ANVIL_FINAL"
+    );
+    assert_eq!(response.tool_calls[0].tool_call_id, "call_001");
+    assert_eq!(response.tool_calls[1].tool_call_id, "call_002");
+}
+
+#[test]
+fn unclosed_final_filters() {
+    // TC4: ANVIL_TOOL → ANVIL_FINAL (unclosed) → ANVIL_TOOL — only the first tool
+    let response = anvil::agent::BasicAgentLoop::parse_structured_response(concat!(
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_001\",\"tool\":\"file.read\",\"path\":\"./src/main.rs\"}\n",
+        "```\n",
+        "```ANVIL_FINAL\n",
+        "Read the file.\n",
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_002\",\"tool\":\"file.read\",\"path\":\"./src/lib.rs\"}\n",
+        "```\n"
+    ))
+    .expect("parsing should succeed");
+
+    assert_eq!(
+        response.tool_calls.len(),
+        1,
+        "only pre-FINAL tool should remain with unclosed FINAL"
+    );
+    assert_eq!(response.tool_calls[0].tool_call_id, "call_001");
+}
+
+#[test]
+fn all_tools_after_final() {
+    // TC5: ANVIL_FINAL → ANVIL_TOOL — tool_calls should be empty
+    let response = anvil::agent::BasicAgentLoop::parse_structured_response(concat!(
+        "```ANVIL_FINAL\n",
+        "Done with everything.\n",
+        "```\n",
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_001\",\"tool\":\"file.read\",\"path\":\"./src/main.rs\"}\n",
+        "```\n"
+    ))
+    .expect("parsing should succeed");
+
+    assert!(
+        response.tool_calls.is_empty(),
+        "all post-FINAL tools should be excluded"
+    );
+}
+
 // --- Issue #128: Multi-tier parsing tests ---
 
 #[test]
