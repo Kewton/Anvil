@@ -7,6 +7,7 @@
 pub mod cli_args;
 pub use cli_args::CliArgs;
 
+use crate::provider::transport::{DEFAULT_HTTP_TIMEOUT_SECS, normalize_http_timeout};
 use clap::Parser;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -76,6 +77,8 @@ pub struct RuntimeConfig {
     pub subagent_max_iterations: u32,
     /// Wall-clock timeout in seconds for the entire sub-agent run (Issue #129).
     pub subagent_timeout_secs: u64,
+    /// HTTP request timeout in seconds (Issue #146).
+    pub http_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -227,6 +230,7 @@ impl EffectiveConfig {
                 smart_compact_threshold_ratio: 0.75,
                 subagent_max_iterations: 10,
                 subagent_timeout_secs: 120,
+                http_timeout_secs: DEFAULT_HTTP_TIMEOUT_SECS,
             },
             mode: ModeConfig {
                 prompt_source: PromptSource::Interactive,
@@ -324,6 +328,8 @@ impl EffectiveConfig {
             "ANVIL_SMART_COMPACT_THRESHOLD_RATIO",
             "ANVIL_SUBAGENT_MAX_ITERATIONS",
             "ANVIL_SUBAGENT_TIMEOUT",
+            "ANVIL_HTTP_TIMEOUT",
+            "ANVIL_CURL_TIMEOUT",
         ] {
             if let Ok(value) = std::env::var(key) {
                 map.insert(key.to_string(), value);
@@ -410,6 +416,11 @@ impl EffectiveConfig {
         // Tag protocol flag
         if let Some(v) = cli.tag_protocol {
             self.runtime.tag_protocol = Some(v);
+        }
+
+        // HTTP timeout
+        if let Some(timeout) = cli.timeout {
+            self.runtime.http_timeout_secs = timeout;
         }
 
         // Prompt tier override
@@ -543,6 +554,11 @@ impl EffectiveConfig {
                         .parse()
                         .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
                 }
+                "http_timeout_secs" | "ANVIL_HTTP_TIMEOUT" | "ANVIL_CURL_TIMEOUT" => {
+                    self.runtime.http_timeout_secs = value
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                }
                 _ => {}
             }
         }
@@ -569,7 +585,17 @@ impl EffectiveConfig {
         self.clamp_agent_iterations();
         self.clamp_smart_compact_ratio();
         self.clamp_subagent_settings();
+        self.clamp_http_timeout();
         Ok(())
+    }
+
+    fn clamp_http_timeout(&mut self) {
+        let old = self.runtime.http_timeout_secs;
+        let normalized = normalize_http_timeout(old);
+        if normalized != old {
+            self.runtime.http_timeout_secs = normalized;
+            eprintln!("Warning: http_timeout_secs={old} adjusted to {normalized}");
+        }
     }
 
     /// Clamp smart_compact_threshold_ratio to [0.1, 0.95].
@@ -925,6 +951,7 @@ impl std::fmt::Debug for RuntimeConfig {
                 "smart_compact_threshold_ratio",
                 &self.smart_compact_threshold_ratio,
             )
+            .field("http_timeout_secs", &self.http_timeout_secs)
             .finish()
     }
 }

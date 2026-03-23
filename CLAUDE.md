@@ -139,6 +139,7 @@ src/
 ├── tooling/
 │   ├── mod.rs           # ツール実行・検証・CheckpointStack（undo用チェックポイント管理）
 │   ├── diff.rs          # 差分プレビュー生成（file.write/file.edit承認時）
+│   ├── file_cache.rs    # ファイル読み取りキャッシュ（FileReadCache: LRUエビクション・sandbox境界検証）
 │   └── shell_policy.rs  # ShellPolicy分類（ReadOnly/BuildTest/General）・offline用ネットワークコマンド検出
 ├── tui/mod.rs           # TUI描画
 └── walk.rs              # 共通ディレクトリウォーカー（.gitignore対応・統一スキップ/バイナリ除外）
