@@ -16,6 +16,42 @@ use std::{
     fmt::{Display, Formatter},
 };
 
+// ---------------------------------------------------------------------------
+// Language constants and helpers (Issue #162)
+// ---------------------------------------------------------------------------
+
+/// Default UI language fallback.
+pub const DEFAULT_UI_LANGUAGE: &str = "ja";
+
+/// Supported languages: (code, display_name).
+pub const SUPPORTED_LANGUAGES: &[(&str, &str)] = &[("ja", "Japanese"), ("en", "English")];
+
+/// Look up display name for a language code using SUPPORTED_LANGUAGES table.
+/// Returns the display name, or DEFAULT_UI_LANGUAGE's display name as fallback.
+pub fn lang_display_name(code: &str) -> &'static str {
+    SUPPORTED_LANGUAGES
+        .iter()
+        .find(|(c, _)| *c == code)
+        .map(|(_, name)| *name)
+        .unwrap_or("Japanese")
+}
+
+/// Return the effective UI language code.
+/// `None` or unsupported values fall back to [`DEFAULT_UI_LANGUAGE`].
+pub fn effective_ui_language_code(configured: Option<&str>) -> &str {
+    configured.unwrap_or(DEFAULT_UI_LANGUAGE)
+}
+
+/// Shared language constraint prompt for main/sub-agent.
+pub fn language_constraint_prompt(ui_language: &str) -> String {
+    let lang_name = lang_display_name(ui_language);
+    format!(
+        "\n\n## Language constraint\nYou MUST respond in {lang_name}. \
+         All explanations, comments, plans, and summaries must be written in {lang_name}. \
+         Do NOT switch to any other language during your response."
+    )
+}
+
 /// Determines where the user prompt originates from.
 #[derive(Debug, Clone)]
 pub enum PromptSource {
@@ -91,6 +127,10 @@ pub struct RuntimeConfig {
     pub safe_write_max_lines: usize,
     /// Deletion ratio threshold for diff warning (0.0-1.0, Issue #156).
     pub safe_write_deletion_ratio: f64,
+    /// UI language for LLM responses (Issue #162).
+    /// `None` means "use default language via effective_ui_language_code()".
+    /// Supported: "ja", "en".
+    pub ui_language: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -249,6 +289,7 @@ impl EffectiveConfig {
                 edit_write_fallback_threshold: 5,
                 safe_write_max_lines: 500,
                 safe_write_deletion_ratio: 0.5,
+                ui_language: None,
             },
             mode: ModeConfig {
                 prompt_source: PromptSource::Interactive,
@@ -354,6 +395,7 @@ impl EffectiveConfig {
             "ANVIL_EDIT_WRITE_FALLBACK_THRESHOLD",
             "ANVIL_SAFE_WRITE_MAX_LINES",
             "ANVIL_SAFE_WRITE_DELETION_RATIO",
+            "ANVIL_UI_LANGUAGE",
         ] {
             if let Ok(value) = std::env::var(key) {
                 map.insert(key.to_string(), value);
@@ -649,6 +691,13 @@ impl EffectiveConfig {
                     }
                     self.runtime.safe_write_deletion_ratio = v;
                 }
+                "ui_language" | "ANVIL_UI_LANGUAGE" => {
+                    self.runtime.ui_language = if value.is_empty() {
+                        None
+                    } else {
+                        Some(value.clone())
+                    };
+                }
                 _ => {}
             }
         }
@@ -678,7 +727,25 @@ impl EffectiveConfig {
         self.clamp_loop_detection_threshold();
         self.clamp_edit_thresholds();
         self.clamp_http_timeout();
+        self.sanitize_ui_language();
         Ok(())
+    }
+
+    /// Validate `ui_language`: keep `None` and supported values, reset invalid to `None`.
+    fn sanitize_ui_language(&mut self) {
+        let is_supported = |code: &str| SUPPORTED_LANGUAGES.iter().any(|(c, _)| *c == code);
+        match self.runtime.ui_language.as_deref() {
+            None => {}
+            Some(code) if is_supported(code) => {}
+            Some(invalid) => {
+                eprintln!(
+                    "Warning: ui_language=\"{}\" is not supported, falling back to \"{}\"",
+                    invalid.escape_debug(),
+                    DEFAULT_UI_LANGUAGE
+                );
+                self.runtime.ui_language = None;
+            }
+        }
     }
 
     fn clamp_http_timeout(&mut self) {

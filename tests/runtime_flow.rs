@@ -557,8 +557,14 @@ fn system_prompt_includes_confirm_class_guidance() {
 
 #[test]
 fn build_subagent_system_prompt_explore_contains_expected_tools() {
-    use anvil::agent::subagent::{SubAgentKind, build_subagent_system_prompt};
-    let prompt = build_subagent_system_prompt(&SubAgentKind::Explore, false);
+    use anvil::agent::subagent::{
+        SubAgentKind, SubAgentPromptOptions, build_subagent_system_prompt,
+    };
+    let opts = SubAgentPromptOptions {
+        offline: false,
+        ui_language: None,
+    };
+    let prompt = build_subagent_system_prompt(&SubAgentKind::Explore, &opts);
     assert!(
         prompt.contains("file.read"),
         "Explore prompt should include file.read"
@@ -583,8 +589,14 @@ fn build_subagent_system_prompt_explore_contains_expected_tools() {
 
 #[test]
 fn build_subagent_system_prompt_plan_contains_expected_tools() {
-    use anvil::agent::subagent::{SubAgentKind, build_subagent_system_prompt};
-    let prompt = build_subagent_system_prompt(&SubAgentKind::Plan, false);
+    use anvil::agent::subagent::{
+        SubAgentKind, SubAgentPromptOptions, build_subagent_system_prompt,
+    };
+    let opts = SubAgentPromptOptions {
+        offline: false,
+        ui_language: None,
+    };
+    let prompt = build_subagent_system_prompt(&SubAgentKind::Plan, &opts);
     assert!(
         prompt.contains("file.read"),
         "Plan prompt should include file.read"
@@ -613,9 +625,15 @@ fn build_subagent_system_prompt_plan_contains_expected_tools() {
 
 #[test]
 fn build_subagent_system_prompt_includes_json_format() {
-    use anvil::agent::subagent::{SubAgentKind, build_subagent_system_prompt};
+    use anvil::agent::subagent::{
+        SubAgentKind, SubAgentPromptOptions, build_subagent_system_prompt,
+    };
 
-    let explore = build_subagent_system_prompt(&SubAgentKind::Explore, false);
+    let opts = SubAgentPromptOptions {
+        offline: false,
+        ui_language: None,
+    };
+    let explore = build_subagent_system_prompt(&SubAgentKind::Explore, &opts);
     assert!(
         explore.contains("found_files"),
         "Explore prompt should mention found_files JSON field"
@@ -633,7 +651,7 @@ fn build_subagent_system_prompt_includes_json_format() {
         "Explore prompt should mention confidence JSON field"
     );
 
-    let plan = build_subagent_system_prompt(&SubAgentKind::Plan, false);
+    let plan = build_subagent_system_prompt(&SubAgentKind::Plan, &opts);
     assert!(
         plan.contains("found_files"),
         "Plan prompt should mention found_files JSON field"

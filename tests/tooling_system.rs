@@ -3132,8 +3132,14 @@ fn subagent_payload_size_limits_applied() {
 
 #[test]
 fn build_subagent_system_prompt_plan_offline_excludes_web_fetch() {
-    use anvil::agent::subagent::{SubAgentKind, build_subagent_system_prompt};
-    let prompt = build_subagent_system_prompt(&SubAgentKind::Plan, true);
+    use anvil::agent::subagent::{
+        SubAgentKind, SubAgentPromptOptions, build_subagent_system_prompt,
+    };
+    let opts = SubAgentPromptOptions {
+        offline: true,
+        ui_language: None,
+    };
+    let prompt = build_subagent_system_prompt(&SubAgentKind::Plan, &opts);
     assert!(
         !prompt.contains("web.fetch"),
         "offline Plan prompt should not contain web.fetch tool description"
@@ -3150,8 +3156,14 @@ fn build_subagent_system_prompt_plan_offline_excludes_web_fetch() {
 
 #[test]
 fn build_subagent_system_prompt_plan_online_includes_web_fetch() {
-    use anvil::agent::subagent::{SubAgentKind, build_subagent_system_prompt};
-    let prompt = build_subagent_system_prompt(&SubAgentKind::Plan, false);
+    use anvil::agent::subagent::{
+        SubAgentKind, SubAgentPromptOptions, build_subagent_system_prompt,
+    };
+    let opts = SubAgentPromptOptions {
+        offline: false,
+        ui_language: None,
+    };
+    let prompt = build_subagent_system_prompt(&SubAgentKind::Plan, &opts);
     assert!(
         prompt.contains("web.fetch"),
         "online Plan prompt should contain web.fetch tool description"
@@ -3168,9 +3180,19 @@ fn build_subagent_system_prompt_plan_online_includes_web_fetch() {
 
 #[test]
 fn build_subagent_system_prompt_explore_unaffected_by_offline() {
-    use anvil::agent::subagent::{SubAgentKind, build_subagent_system_prompt};
-    let online_prompt = build_subagent_system_prompt(&SubAgentKind::Explore, false);
-    let offline_prompt = build_subagent_system_prompt(&SubAgentKind::Explore, true);
+    use anvil::agent::subagent::{
+        SubAgentKind, SubAgentPromptOptions, build_subagent_system_prompt,
+    };
+    let online_opts = SubAgentPromptOptions {
+        offline: false,
+        ui_language: None,
+    };
+    let offline_opts = SubAgentPromptOptions {
+        offline: true,
+        ui_language: None,
+    };
+    let online_prompt = build_subagent_system_prompt(&SubAgentKind::Explore, &online_opts);
+    let offline_prompt = build_subagent_system_prompt(&SubAgentKind::Explore, &offline_opts);
     assert_eq!(
         online_prompt, offline_prompt,
         "Explore prompt should be identical regardless of offline flag"

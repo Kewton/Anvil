@@ -604,6 +604,13 @@ impl App {
             );
         }
 
+        // Language constraint (Issue #162)
+        {
+            use crate::config::{effective_ui_language_code, language_constraint_prompt};
+            let lang = effective_ui_language_code(self.config.runtime.ui_language.as_deref());
+            prompt.push_str(&language_constraint_prompt(lang));
+        }
+
         // Working memory injection (Issue #130)
         if let Some(wm_prompt) = self.session.working_memory.format_for_prompt() {
             prompt.push_str("\n\n");
