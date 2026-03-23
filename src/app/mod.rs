@@ -9,6 +9,7 @@ mod context;
 pub(crate) mod edit_fail_tracker;
 pub mod loop_detector;
 pub mod mock;
+pub mod phase_estimator;
 pub mod plan;
 pub mod policy;
 pub mod render;
@@ -152,6 +153,8 @@ pub struct App {
     prompt_tier: PromptTier,
     /// Tracks consecutive file.edit failures per path for recovery hints.
     edit_fail_tracker: edit_fail_tracker::EditFailTracker,
+    /// Phase estimator for fallback phase control (Issue #159).
+    phase_estimator: phase_estimator::PhaseEstimator,
     /// File read cache: reduces redundant file.read calls within a session.
     file_read_cache: Arc<Mutex<crate::tooling::file_cache::FileReadCache>>,
 }
@@ -414,6 +417,9 @@ impl App {
         };
 
         let loop_detection_threshold = config.runtime.loop_detection_threshold;
+        let phase_explore = config.runtime.phase_explore_threshold;
+        let phase_force = config.runtime.phase_force_transition_threshold;
+        let phase_completion = config.runtime.phase_completion_read_threshold;
 
         Ok(Self {
             tools,
@@ -441,6 +447,11 @@ impl App {
             last_estimated_prompt_tokens: None,
             prompt_tier,
             edit_fail_tracker: edit_fail_tracker::EditFailTracker::new(3),
+            phase_estimator: phase_estimator::PhaseEstimator::new(
+                phase_explore,
+                phase_force,
+                phase_completion,
+            ),
             file_read_cache,
         })
     }

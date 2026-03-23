@@ -16,11 +16,15 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TerminationReason {
-    #[default]
-    Completed,
+    /// ANVIL_FINAL未発火時のフォールバック完了検出 (Issue #159).
+    FallbackCompleted,
     Timeout,
     MaxIterations,
     LoopDetected,
+    /// Normal completion. Also serves as fallback for unknown variants via `#[serde(other)]`.
+    #[default]
+    #[serde(other)]
+    Completed,
 }
 
 impl std::fmt::Display for TerminationReason {
@@ -30,6 +34,7 @@ impl std::fmt::Display for TerminationReason {
             Self::Timeout => write!(f, "timeout"),
             Self::MaxIterations => write!(f, "max_iterations"),
             Self::LoopDetected => write!(f, "loop_detected"),
+            Self::FallbackCompleted => write!(f, "fallback_completed"),
         }
     }
 }

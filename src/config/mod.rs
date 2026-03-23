@@ -81,6 +81,12 @@ pub struct RuntimeConfig {
     pub loop_detection_threshold: usize,
     /// HTTP request timeout in seconds (Issue #146).
     pub http_timeout_secs: u64,
+    /// Phase estimator: consecutive read calls to enter "exploring" phase (Issue #159).
+    pub phase_explore_threshold: usize,
+    /// Phase estimator: consecutive read calls to force transition to implementation (Issue #159).
+    pub phase_force_transition_threshold: usize,
+    /// Phase estimator: consecutive reads after last write for fallback completion (Issue #159).
+    pub phase_completion_read_threshold: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -234,6 +240,9 @@ impl EffectiveConfig {
                 subagent_timeout_secs: DEFAULT_SUBAGENT_TIMEOUT_SECS,
                 loop_detection_threshold: 3,
                 http_timeout_secs: DEFAULT_HTTP_TIMEOUT_SECS,
+                phase_explore_threshold: 5,
+                phase_force_transition_threshold: 10,
+                phase_completion_read_threshold: 5,
             },
             mode: ModeConfig {
                 prompt_source: PromptSource::Interactive,
@@ -572,6 +581,33 @@ impl EffectiveConfig {
                         .parse()
                         .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
                 }
+                "phase_explore_threshold" | "ANVIL_PHASE_EXPLORE_THRESHOLD" => {
+                    let v: usize = value
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                    if !(2..=20).contains(&v) {
+                        return Err(ConfigError::InvalidNumericValue(value.clone()));
+                    }
+                    self.runtime.phase_explore_threshold = v;
+                }
+                "phase_force_transition_threshold" | "ANVIL_PHASE_FORCE_TRANSITION_THRESHOLD" => {
+                    let v: usize = value
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                    if !(3..=30).contains(&v) {
+                        return Err(ConfigError::InvalidNumericValue(value.clone()));
+                    }
+                    self.runtime.phase_force_transition_threshold = v;
+                }
+                "phase_completion_read_threshold" | "ANVIL_PHASE_COMPLETION_READ_THRESHOLD" => {
+                    let v: usize = value
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                    if !(2..=20).contains(&v) {
+                        return Err(ConfigError::InvalidNumericValue(value.clone()));
+                    }
+                    self.runtime.phase_completion_read_threshold = v;
+                }
                 _ => {}
             }
         }
@@ -599,6 +635,7 @@ impl EffectiveConfig {
         self.clamp_smart_compact_ratio();
         self.clamp_subagent_settings();
         self.clamp_loop_detection_threshold();
+        self.clamp_phase_thresholds();
         self.clamp_http_timeout();
         Ok(())
     }
@@ -715,6 +752,20 @@ impl EffectiveConfig {
 
     fn clamp_loop_detection_threshold(&mut self) {
         self.runtime.loop_detection_threshold = self.runtime.loop_detection_threshold.clamp(2, 20);
+    }
+
+    /// Clamp phase estimator thresholds and enforce N < M constraint (Issue #159).
+    fn clamp_phase_thresholds(&mut self) {
+        self.runtime.phase_explore_threshold = self.runtime.phase_explore_threshold.clamp(2, 20);
+        self.runtime.phase_force_transition_threshold =
+            self.runtime.phase_force_transition_threshold.clamp(3, 30);
+        self.runtime.phase_completion_read_threshold =
+            self.runtime.phase_completion_read_threshold.clamp(2, 20);
+        // Enforce N < M: if explore >= force_transition, adjust force_transition.
+        if self.runtime.phase_explore_threshold >= self.runtime.phase_force_transition_threshold {
+            self.runtime.phase_force_transition_threshold =
+                (self.runtime.phase_explore_threshold + 5).min(30);
+        }
     }
 
     pub fn validate_for_test(&mut self) -> Result<(), ConfigError> {
