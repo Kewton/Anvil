@@ -1113,29 +1113,39 @@ impl App {
             }
         }
 
-        // Edit fail tracker: track consecutive file.edit failures (Issue #143)
+        // Edit fail tracker: track consecutive file.edit/file.edit_anchor failures (Issue #143, #158)
         let mut edit_hint: Option<String> = None;
-        if result.tool_name == "file.edit" {
+        if result.tool_name == "file.edit" || result.tool_name == "file.edit_anchor" {
             if result.status == ToolExecutionStatus::Failed {
-                // Extract path from summary (format: "file.edit: ... in {path}. ...")
-                if let Some(path) = extract_edit_path_from_summary(&result.summary)
-                    .filter(|p| self.edit_fail_tracker.record_failure(p))
-                {
+                if let Some(raw_path) = extract_edit_path_from_summary(&result.summary) {
+                    let path = resolve_edit_tracker_path(&raw_path);
+                    let action = self.edit_fail_tracker.record_failure(&path);
                     let count = self.edit_fail_tracker.failure_count(&path);
-                    edit_hint = Some(format!(
-                        "\n\n[Anvil hint] file.edit has failed {count} consecutive \
-                         times for '{path}'. Consider using file.read to get the \
-                         current content, then file.write to replace the entire file."
-                    ));
+                    match action {
+                        crate::app::edit_fail_tracker::EditFallbackAction::Continue => {}
+                        crate::app::edit_fail_tracker::EditFallbackAction::ReRead => {
+                            edit_hint = Some(format!(
+                                "\n\n[Anvil hint] file.edit has failed {count} consecutive \
+                                 times for '{path}'. Use file.read to get the current file \
+                                 content, then retry file.edit with the correct old_string."
+                            ));
+                        }
+                        crate::app::edit_fail_tracker::EditFallbackAction::WriteFallback => {
+                            self.prepare_write_fallback();
+                            edit_hint = Some(format!(
+                                "\n\n[Anvil hint] file.edit has failed {count} consecutive \
+                                 times for '{path}'. Consider using file.read to get the \
+                                 current content, then file.write to replace the entire file \
+                                 with the corrected version."
+                            ));
+                        }
+                    }
                 }
             } else if result.status == ToolExecutionStatus::Completed {
-                // Reset on success — extract path from artifacts
+                // Reset on success — use consistent path resolution
                 if let Some(artifact) = result.artifacts.first() {
-                    let path_str = std::path::Path::new(artifact)
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or(artifact);
-                    self.edit_fail_tracker.record_success(path_str);
+                    let path_str = resolve_edit_tracker_path(artifact);
+                    self.edit_fail_tracker.record_success(&path_str);
                 }
             }
         }
@@ -1483,6 +1493,12 @@ pub fn truncate_with_head_tail(content: &str, max_chars: usize, head_pct: usize)
 
 /// Extract the file path from a file.edit error summary.
 /// Looks for patterns like "... in {path}. ..." or "... in {path},"
+/// Normalize a file path for consistent EditFailTracker key usage (Issue #158).
+/// Used by both failure (from summary) and success (from artifact) paths.
+fn resolve_edit_tracker_path(raw_path: &str) -> String {
+    raw_path.trim_start_matches("./").to_string()
+}
+
 fn extract_edit_path_from_summary(summary: &str) -> Option<String> {
     // Pattern: "file.edit: ... in {path}. ..."
     // or "file.edit: ... in {path}, ..."
