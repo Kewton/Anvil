@@ -273,6 +273,9 @@ impl App {
         let mut total_tool_count = 0usize;
         let mut all_tool_log_views: Vec<ToolLogView> = Vec::new();
 
+        // Reset loop detector at the start of each top-level turn (Issue #145)
+        self.loop_detector.reset();
+
         for iteration in 0..max_iterations {
             // Check shutdown flag before tool execution
             if self.is_shutdown_requested() {
@@ -318,7 +321,7 @@ impl App {
             // live streaming output on stderr (Issue #1).
 
             // Execute normal tool calls and record results WITH payload
-            let results = self.execute_structured_tool_calls(&current_normal)?;
+            let (results, loop_action) = self.execute_structured_tool_calls(&current_normal)?;
             total_tool_count += results.len();
 
             let tool_log_views: Vec<ToolLogView> = results
@@ -337,6 +340,13 @@ impl App {
             let _ = self.transition_with_context(working, StateTransition::StartWorking)?;
             // Skip intermediate Working frames — tool execution output
             // is already shown on stderr (Issue #1).
+
+            // Handle loop detection Break action (Issue #145)
+            // Results are already recorded and visible above; now terminate the loop.
+            if let Some(super::loop_detector::LoopAction::Break(ref msg)) = loop_action {
+                tracing::warn!(reason = "loop_detected", message = %msg, "agentic loop terminated by loop detector");
+                break;
+            }
 
             // Check shutdown flag before LLM call
             if self.is_shutdown_requested() {
@@ -660,7 +670,13 @@ impl App {
     pub(crate) fn execute_structured_tool_calls(
         &mut self,
         structured: &StructuredAssistantResponse,
-    ) -> Result<Vec<ToolExecutionResult>, AppError> {
+    ) -> Result<
+        (
+            Vec<ToolExecutionResult>,
+            Option<super::loop_detector::LoopAction>,
+        ),
+        AppError,
+    > {
         // Phase 1: Validation + Approval
         let (validated_requests, mut failed_results) =
             self.validate_and_approve_all(&structured.tool_calls);
@@ -733,6 +749,58 @@ impl App {
             remaining
         } else {
             validated_requests
+        };
+
+        // Loop detection: record each validated tool call and check for repetition (Issue #145)
+        let mut worst_loop_action: Option<super::loop_detector::LoopAction> = None;
+        for (_, req) in &validated_requests {
+            if let Some((tool_name, tool_input)) = tool_input_map.get(&req.tool_call_id) {
+                let action = self.loop_detector.record_and_check(tool_name, tool_input);
+                worst_loop_action = match (&worst_loop_action, &action) {
+                    (_, super::loop_detector::LoopAction::Continue) => worst_loop_action,
+                    (None, _) => Some(action),
+                    (Some(super::loop_detector::LoopAction::Continue), _) => Some(action),
+                    (
+                        Some(super::loop_detector::LoopAction::Warn(_)),
+                        super::loop_detector::LoopAction::StrongWarn(_)
+                        | super::loop_detector::LoopAction::Break(_),
+                    ) => Some(action),
+                    (
+                        Some(super::loop_detector::LoopAction::StrongWarn(_)),
+                        super::loop_detector::LoopAction::Break(_),
+                    ) => Some(action),
+                    _ => worst_loop_action,
+                };
+            }
+        }
+
+        // If Break: skip tool execution entirely
+        if matches!(
+            worst_loop_action,
+            Some(super::loop_detector::LoopAction::Break(_))
+        ) {
+            // Return failed results with the Break action
+            failed_results.sort_by_key(|(idx, _)| *idx);
+            let results: Vec<ToolExecutionResult> =
+                failed_results.into_iter().map(|(_, r)| r).collect();
+            return Ok((results, worst_loop_action));
+        }
+
+        // For Warn/StrongWarn: create synthetic tool result to include in results
+        let synthetic_warning = match &worst_loop_action {
+            Some(super::loop_detector::LoopAction::Warn(msg))
+            | Some(super::loop_detector::LoopAction::StrongWarn(msg)) => {
+                Some(ToolExecutionResult {
+                    tool_call_id: "loop_detector_warning".to_string(),
+                    tool_name: "system.loop_detector".to_string(),
+                    status: ToolExecutionStatus::Completed,
+                    summary: msg.clone(),
+                    payload: ToolExecutionPayload::Text(msg.clone()),
+                    artifacts: vec![],
+                    elapsed_ms: 0,
+                })
+            }
+            _ => None,
         };
 
         // Phase 2: Grouping
@@ -918,8 +986,14 @@ impl App {
             results.push(result);
         }
 
+        // Append synthetic loop detection warning if present
+        if let Some(warning_result) = synthetic_warning {
+            self.record_tool_result(&warning_result);
+            results.push(warning_result);
+        }
+
         self.persist_session(crate::contracts::AppEvent::SessionSaved)?;
-        Ok(results)
+        Ok((results, worst_loop_action))
     }
 
     /// Push a tool execution result into the session as a tool message.

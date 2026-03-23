@@ -6,6 +6,7 @@
 pub mod agentic;
 pub mod cli;
 mod context;
+pub mod loop_detector;
 pub mod mock;
 pub mod plan;
 pub mod policy;
@@ -123,6 +124,8 @@ pub struct App {
     warning_tracker: ContextWarningTracker,
     /// Undo checkpoint stack. In-memory only, discarded on session exit.
     checkpoint_stack: CheckpointStack,
+    /// Loop detector for preventing infinite tool call repetitions (Issue #145).
+    loop_detector: loop_detector::LoopDetector,
     /// Hooks engine. `None` when hooks.json is absent or initialization failed.
     /// Declared before mcp_manager to maintain Drop order (DR3-007).
     hooks_engine: Option<crate::hooks::HooksEngine>,
@@ -401,6 +404,8 @@ impl App {
             capability.prompt_tier
         };
 
+        let loop_detection_threshold = config.runtime.loop_detection_threshold;
+
         Ok(Self {
             tools,
             config,
@@ -415,6 +420,7 @@ impl App {
             shutdown_flag,
             warning_tracker: ContextWarningTracker::new(),
             checkpoint_stack: CheckpointStack::new(),
+            loop_detector: loop_detector::LoopDetector::new(loop_detection_threshold),
             hooks_engine,
             mcp_manager,
             current_session_name,

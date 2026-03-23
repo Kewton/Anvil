@@ -109,6 +109,7 @@ src/
 │   ├── agentic.rs       # agenticツール実行ループ
 │   ├── cli.rs           # CLI入力ループ
 │   ├── context.rs       # コンテキスト注入（@file展開・サンドボックス検証）
+│   ├── loop_detector.rs # ループ検出（リングバッファ・段階的対応）
 │   ├── plan.rs          # プラン管理
 │   ├── policy.rs        # offlineポリシーチェック（共通ヘルパー）
 │   ├── render.rs        # コンソール描画
@@ -153,6 +154,7 @@ tests/
 ├── tui_console.rs       # TUIテスト
 ├── skills_system.rs     # スキルシステムテスト
 ├── hooks_system.rs      # フックシステムテスト
+├── loop_detection.rs    # ループ検出テスト
 ├── context_inject.rs    # コンテキスト注入テスト
 └── walk_system.rs       # ディレクトリウォーカーテスト
 ```

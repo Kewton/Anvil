@@ -76,6 +76,8 @@ pub struct RuntimeConfig {
     pub subagent_max_iterations: u32,
     /// Wall-clock timeout in seconds for the entire sub-agent run (Issue #129).
     pub subagent_timeout_secs: u64,
+    /// Loop detection threshold: number of identical tool calls before detection triggers (Issue #145).
+    pub loop_detection_threshold: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -227,6 +229,7 @@ impl EffectiveConfig {
                 smart_compact_threshold_ratio: 0.75,
                 subagent_max_iterations: 10,
                 subagent_timeout_secs: 120,
+                loop_detection_threshold: 3,
             },
             mode: ModeConfig {
                 prompt_source: PromptSource::Interactive,
@@ -324,6 +327,7 @@ impl EffectiveConfig {
             "ANVIL_SMART_COMPACT_THRESHOLD_RATIO",
             "ANVIL_SUBAGENT_MAX_ITERATIONS",
             "ANVIL_SUBAGENT_TIMEOUT",
+            "ANVIL_LOOP_DETECTION_THRESHOLD",
         ] {
             if let Ok(value) = std::env::var(key) {
                 map.insert(key.to_string(), value);
@@ -543,6 +547,15 @@ impl EffectiveConfig {
                         .parse()
                         .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
                 }
+                "loop_detection_threshold" | "ANVIL_LOOP_DETECTION_THRESHOLD" => {
+                    let v: usize = value
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                    if !(2..=20).contains(&v) {
+                        return Err(ConfigError::InvalidNumericValue(value.clone()));
+                    }
+                    self.runtime.loop_detection_threshold = v;
+                }
                 _ => {}
             }
         }
@@ -569,6 +582,7 @@ impl EffectiveConfig {
         self.clamp_agent_iterations();
         self.clamp_smart_compact_ratio();
         self.clamp_subagent_settings();
+        self.clamp_loop_detection_threshold();
         Ok(())
     }
 
@@ -674,6 +688,10 @@ impl EffectiveConfig {
                 "Warning: subagent_timeout_secs={old} exceeds maximum ({MAX_SUBAGENT_TIMEOUT_SECS}), adjusted to {MAX_SUBAGENT_TIMEOUT_SECS}"
             );
         }
+    }
+
+    fn clamp_loop_detection_threshold(&mut self) {
+        self.runtime.loop_detection_threshold = self.runtime.loop_detection_threshold.clamp(2, 20);
     }
 
     pub fn validate_for_test(&mut self) -> Result<(), ConfigError> {
