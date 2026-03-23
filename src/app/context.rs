@@ -53,73 +53,7 @@ pub(crate) fn parse_at_references(input: &str) -> Vec<AtReference> {
     refs
 }
 
-/// Sensitive file patterns that should never be expanded via @file.
-/// Prevents accidental leakage of secrets to LLM backends.
-const SENSITIVE_FILE_PATTERNS: &[&str] = &[
-    ".env",
-    ".env.*",
-    "*.pem",
-    "*.key",
-    "*.p12",
-    "*.pfx",
-    "id_rsa",
-    "id_ed25519",
-    "id_ecdsa",
-    "id_dsa",
-    "credentials.json",
-    "secrets.*",
-    "*.secret",
-    "*.secrets",
-    ".netrc",
-    ".npmrc",
-    ".pypirc",
-    "token.json",
-    "service-account*.json",
-];
-
-/// Check whether a file path matches the sensitive file blocklist.
-///
-/// Matching is performed against the file name (basename) only, using
-/// simple string operations: exact match, prefix (`starts_with`),
-/// suffix (`ends_with`), and prefix+suffix for patterns like `service-account*.json`.
-fn is_sensitive_file(path: &str) -> bool {
-    let file_name = Path::new(path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
-    if file_name.is_empty() {
-        return false;
-    }
-    for pattern in SENSITIVE_FILE_PATTERNS {
-        if let Some(suffix) = pattern.strip_prefix('*') {
-            // e.g. "*.pem" → ends_with(".pem")
-            if file_name.ends_with(suffix) {
-                return true;
-            }
-        } else if let Some(prefix) = pattern.strip_suffix('*') {
-            // e.g. ".env.*" → starts_with(".env.")
-            if file_name.starts_with(prefix) {
-                return true;
-            }
-        } else if pattern.contains('*') {
-            // e.g. "service-account*.json" → starts_with("service-account") && ends_with(".json")
-            let parts: Vec<&str> = pattern.splitn(2, '*').collect();
-            if parts.len() == 2
-                && file_name.starts_with(parts[0])
-                && file_name.ends_with(parts[1])
-                && file_name.len() >= parts[0].len() + parts[1].len()
-            {
-                return true;
-            }
-        } else {
-            // exact match
-            if file_name == *pattern {
-                return true;
-            }
-        }
-    }
-    false
-}
+use crate::tooling::is_sensitive_file;
 
 /// Resolve a single @file reference, returning the file content as text.
 ///

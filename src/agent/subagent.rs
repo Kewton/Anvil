@@ -491,6 +491,9 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
         ));
 
         // If no tool calls, this is the final response
+        // Note: ANVIL_FINAL file-modification guard is NOT applied to sub-agents.
+        // Sub-agents (Explore/Plan) are read-only and not expected to modify files.
+        // The guard is only enforced in the main agent loop (src/app/agentic.rs).
         if structured.tool_calls.is_empty() {
             let tokens = crate::contracts::tokens::estimate_tokens(
                 &token_buffer,
@@ -506,8 +509,9 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
 
         // Validate and execute tool calls
         // SR4-003: validate() is mandatory before execution
-        let mut executor = LocalToolExecutor::new(self.scope_path.clone(), &self.config.runtime)
-            .with_shutdown_flag(self.shutdown_flag.clone());
+        let mut executor =
+            LocalToolExecutor::new(self.scope_path.clone(), &self.config.runtime, None)
+                .with_shutdown_flag(self.shutdown_flag.clone());
 
         for call in &structured.tool_calls {
             // Validate against restricted registry

@@ -106,9 +106,10 @@ src/
 │   └── tag_spec.rs      # ツールタグ仕様テーブル（TOOL_TAG_SPECS）
 ├── app/
 │   ├── mod.rs           # アプリケーションオーケストレータ
-│   ├── agentic.rs       # agenticツール実行ループ
+│   ├── agentic.rs       # agenticツール実行ループ（ANVIL_FINALガード・再試行ロジック含む）
 │   ├── cli.rs           # CLI入力ループ
 │   ├── context.rs       # コンテキスト注入（@file展開・サンドボックス検証）
+│   ├── loop_detector.rs # ループ検出（リングバッファ・段階的対応）
 │   ├── plan.rs          # プラン管理
 │   ├── policy.rs        # offlineポリシーチェック（共通ヘルパー）
 │   ├── render.rs        # コンソール描画
@@ -139,6 +140,7 @@ src/
 ├── tooling/
 │   ├── mod.rs           # ツール実行・検証・CheckpointStack（undo用チェックポイント管理）
 │   ├── diff.rs          # 差分プレビュー生成（file.write/file.edit承認時）
+│   ├── file_cache.rs    # ファイル読み取りキャッシュ（FileReadCache: LRUエビクション・sandbox境界検証）
 │   └── shell_policy.rs  # ShellPolicy分類（ReadOnly/BuildTest/General）・offline用ネットワークコマンド検出
 ├── tui/mod.rs           # TUI描画
 └── walk.rs              # 共通ディレクトリウォーカー（.gitignore対応・統一スキップ/バイナリ除外）
@@ -153,6 +155,7 @@ tests/
 ├── tui_console.rs       # TUIテスト
 ├── skills_system.rs     # スキルシステムテスト
 ├── hooks_system.rs      # フックシステムテスト
+├── loop_detection.rs    # ループ検出テスト
 ├── context_inject.rs    # コンテキスト注入テスト
 └── walk_system.rs       # ディレクトリウォーカーテスト
 ```

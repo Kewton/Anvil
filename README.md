@@ -205,7 +205,7 @@ ANVIL_MODEL=qwen3.5:35b           # モデル名
 ANVIL_PROVIDER_URL=http://...     # プロバイダーURL
 ANVIL_CONTEXT_WINDOW=200000       # コンテキストウィンドウサイズ
 ANVIL_CONTEXT_BUDGET=50000        # トークンバジェット明示指定
-ANVIL_MAX_AGENT_ITERATIONS=10     # agenticループの最大反復数
+ANVIL_MAX_AGENT_ITERATIONS=30     # agenticループの最大反復数（default: 30）
 ANVIL_HTTP_TIMEOUT=300            # LLMリクエストタイムアウト（秒）（旧ANVIL_CURL_TIMEOUTもフォールバックとして有効）
 ANVIL_API_KEY=sk-...              # OpenAI互換APIキー
 ```
@@ -221,7 +221,7 @@ anvil [OPTIONS]
       --sidecar-model <MODEL>            サイドカーモデル名
       --context-window <SIZE>            コンテキストウィンドウサイズ
       --context-budget <TOKENS>          トークンバジェット明示指定
-      --max-iterations <N>               agenticループ最大反復数
+      --max-iterations <N>               agenticループ最大反復数（default: 30）
       --no-stream                        ストリーミング無効
       --debug                            デバッグログ有効
       --no-approval                      全ツール自動承認

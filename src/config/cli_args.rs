@@ -33,7 +33,7 @@ pub struct CliArgs {
     #[arg(long = "context-budget")]
     pub context_budget: Option<u32>,
 
-    /// Max agent iterations
+    /// Max agent iterations [default: 30]
     #[arg(long = "max-iterations")]
     pub max_iterations: Option<usize>,
 
@@ -80,6 +80,10 @@ pub struct CliArgs {
     /// Auto-approve built-in tool execution (MCP tools require individual trust)
     #[arg(long)]
     pub trust: bool,
+
+    /// HTTP request timeout in seconds (default: 300)
+    #[arg(long = "timeout")]
+    pub timeout: Option<u64>,
 
     /// Prompt tier override (full|compact|tiny)
     #[arg(long = "prompt-tier")]

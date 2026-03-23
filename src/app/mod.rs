@@ -6,6 +6,8 @@
 pub mod agentic;
 pub mod cli;
 mod context;
+pub(crate) mod edit_fail_tracker;
+pub mod loop_detector;
 pub mod mock;
 pub mod plan;
 pub mod policy;
@@ -41,8 +43,8 @@ use crate::tui::Tui;
 use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
 use std::io::{self, Write};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 // Re-export render helpers that form the public API.
 pub use render::{cli_prompt, render_help_frame, slash_commands};
@@ -123,6 +125,8 @@ pub struct App {
     warning_tracker: ContextWarningTracker,
     /// Undo checkpoint stack. In-memory only, discarded on session exit.
     checkpoint_stack: CheckpointStack,
+    /// Loop detector for preventing infinite tool call repetitions (Issue #145).
+    loop_detector: loop_detector::LoopDetector,
     /// Hooks engine. `None` when hooks.json is absent or initialization failed.
     /// Declared before mcp_manager to maintain Drop order (DR3-007).
     hooks_engine: Option<crate::hooks::HooksEngine>,
@@ -146,6 +150,10 @@ pub struct App {
     last_estimated_prompt_tokens: Option<usize>,
     /// System prompt verbosity tier, determined at session start.
     prompt_tier: PromptTier,
+    /// Tracks consecutive file.edit failures per path for recovery hints.
+    edit_fail_tracker: edit_fail_tracker::EditFailTracker,
+    /// File read cache: reduces redundant file.read calls within a session.
+    file_read_cache: Arc<Mutex<crate::tooling::file_cache::FileReadCache>>,
 }
 
 /// Whether the session loop should continue or exit.
@@ -390,6 +398,10 @@ impl App {
 
         let trust_all = config.mode.trust_all;
 
+        let file_read_cache = Arc::new(Mutex::new(crate::tooling::file_cache::FileReadCache::new(
+            config.paths.cwd.clone(),
+        )));
+
         // Determine prompt tier from config override or model name heuristic
         let prompt_tier = {
             use crate::agent::model_classifier::classify_model_capability;
@@ -400,6 +412,8 @@ impl App {
             );
             capability.prompt_tier
         };
+
+        let loop_detection_threshold = config.runtime.loop_detection_threshold;
 
         Ok(Self {
             tools,
@@ -415,6 +429,7 @@ impl App {
             shutdown_flag,
             warning_tracker: ContextWarningTracker::new(),
             checkpoint_stack: CheckpointStack::new(),
+            loop_detector: loop_detector::LoopDetector::new(loop_detection_threshold),
             hooks_engine,
             mcp_manager,
             current_session_name,
@@ -425,6 +440,8 @@ impl App {
             calibration_store: TokenCalibrationStore::new(),
             last_estimated_prompt_tokens: None,
             prompt_tier,
+            edit_fail_tracker: edit_fail_tracker::EditFailTracker::new(3),
+            file_read_cache,
         })
     }
 
@@ -703,6 +720,11 @@ impl App {
         self.current_session_name = name.to_string();
         self.active_model = None;
         self.active_context_window = None;
+
+        // Clear file read cache on session switch (DR2-004)
+        if let Ok(mut cache) = self.file_read_cache.lock() {
+            cache.clear();
+        }
 
         tracing::info!(session_name = name, "Session switched");
 
@@ -1903,6 +1925,13 @@ impl App {
             format!("Undid {} of {} requested change(s).", restored_count, n)
         };
         lines.insert(0, summary.clone());
+
+        // Invalidate file read cache for restored paths
+        if let Ok(mut cache) = self.file_read_cache.lock() {
+            for entry in &entries {
+                cache.invalidate(&entry.path);
+            }
+        }
 
         // Sync working memory: remove undone files from touched_files (Issue #130)
         for result in &results {

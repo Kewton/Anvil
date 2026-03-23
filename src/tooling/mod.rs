@@ -5,6 +5,7 @@
 //! [`LocalToolExecutor`] within a sandboxed workspace root.
 
 pub mod diff;
+pub mod file_cache;
 pub mod shell_policy;
 
 pub use shell_policy::{ShellPolicy, classify_shell_policy, is_network_command};
@@ -899,6 +900,7 @@ pub struct LocalToolExecutor {
     serper_api_key: Option<String>,
     shutdown_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     http_client: reqwest::blocking::Client,
+    file_cache: Option<std::sync::Arc<std::sync::Mutex<file_cache::FileReadCache>>>,
 }
 
 /// Build the shared HTTP client used by tooling (web.fetch / web.search).
@@ -914,13 +916,34 @@ fn build_tooling_http_client() -> reqwest::blocking::Client {
 pub enum ToolRuntimeError {
     InvalidPath(String),
     Io(String),
-    CaptchaBlocked { query: String },
-    EditNotFound(String),
+    CaptchaBlocked {
+        query: String,
+    },
+    EditNotFound {
+        message: String,
+        context_snippet: Option<String>,
+    },
 }
 
 impl ToolRuntimeError {
+    /// Create an EditNotFound error without context snippet.
+    pub fn edit_not_found(message: impl Into<String>) -> Self {
+        Self::EditNotFound {
+            message: message.into(),
+            context_snippet: None,
+        }
+    }
+
+    /// Create an EditNotFound error with a file context snippet.
+    pub fn edit_not_found_with_context(message: impl Into<String>, context: String) -> Self {
+        Self::EditNotFound {
+            message: message.into(),
+            context_snippet: Some(context),
+        }
+    }
+
     pub fn is_edit_not_found(&self) -> bool {
-        matches!(self, Self::EditNotFound(_))
+        matches!(self, Self::EditNotFound { .. })
     }
 }
 
@@ -935,15 +958,114 @@ impl Display for ToolRuntimeError {
                  Consider setting SERPER_API_KEY for automatic fallback, \
                  or use web.fetch to access specific URLs directly."
             ),
-            Self::EditNotFound(message) => write!(f, "{message}"),
+            Self::EditNotFound { message, .. } => write!(f, "{message}"),
         }
     }
 }
 
 impl std::error::Error for ToolRuntimeError {}
 
+/// Sensitive file patterns that should never have their content included
+/// in error responses to prevent accidental leakage of secrets.
+const SENSITIVE_FILE_PATTERNS: &[&str] = &[
+    ".env",
+    ".env.*",
+    "*.pem",
+    "*.key",
+    "*.p12",
+    "*.pfx",
+    "id_rsa",
+    "id_ed25519",
+    "id_ecdsa",
+    "id_dsa",
+    "credentials.json",
+    "secrets.*",
+    "*.secret",
+    "*.secrets",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    "token.json",
+    "service-account*.json",
+];
+
+/// Check whether a file path matches the sensitive file blocklist.
+///
+/// Matching is performed against the file name (basename) only, using
+/// simple string operations: exact match, prefix (`starts_with`),
+/// suffix (`ends_with`), and prefix+suffix for patterns like `service-account*.json`.
+pub fn is_sensitive_file(path: &str) -> bool {
+    let file_name = std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    if file_name.is_empty() {
+        return false;
+    }
+    for pattern in SENSITIVE_FILE_PATTERNS {
+        if let Some(suffix) = pattern.strip_prefix('*') {
+            if file_name.ends_with(suffix) {
+                return true;
+            }
+        } else if let Some(prefix) = pattern.strip_suffix('*') {
+            if file_name.starts_with(prefix) {
+                return true;
+            }
+        } else if pattern.contains('*') {
+            let parts: Vec<&str> = pattern.splitn(2, '*').collect();
+            if parts.len() == 2
+                && file_name.starts_with(parts[0])
+                && file_name.ends_with(parts[1])
+                && file_name.len() >= parts[0].len() + parts[1].len()
+            {
+                return true;
+            }
+        } else if file_name == *pattern {
+            return true;
+        }
+    }
+    false
+}
+
+/// Extract context lines around the best matching location for `old_string`
+/// in `content`. Searches for the first line of `old_string` (trimmed) and
+/// returns surrounding lines with line numbers.
+pub fn extract_edit_context(
+    content: &str,
+    old_string: &str,
+    context_lines: usize,
+) -> Option<String> {
+    let first_line = old_string.lines().next()?.trim();
+    if first_line.is_empty() {
+        return None;
+    }
+
+    let lines: Vec<&str> = content.lines().collect();
+    let match_idx = lines
+        .iter()
+        .enumerate()
+        .find(|(_, line)| line.trim().contains(first_line))?
+        .0;
+
+    let start = match_idx.saturating_sub(context_lines);
+    let end = (match_idx + context_lines + 1).min(lines.len());
+
+    let context: String = lines[start..end]
+        .iter()
+        .enumerate()
+        .map(|(i, line)| format!("{:4} | {}", start + i + 1, line))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    Some(context)
+}
+
 impl LocalToolExecutor {
-    pub fn new(root: impl Into<PathBuf>, config: &RuntimeConfig) -> Self {
+    pub fn new(
+        root: impl Into<PathBuf>,
+        config: &RuntimeConfig,
+        file_cache: Option<std::sync::Arc<std::sync::Mutex<file_cache::FileReadCache>>>,
+    ) -> Self {
         let interval = match config.web_search_provider {
             WebSearchProvider::DuckDuckGo => RATE_LIMIT_DUCKDUCKGO,
             WebSearchProvider::SerperApi => RATE_LIMIT_SERPER_API,
@@ -956,6 +1078,7 @@ impl LocalToolExecutor {
             serper_api_key: config.serper_api_key.clone(),
             shutdown_flag: None,
             http_client: build_tooling_http_client(),
+            file_cache,
         }
     }
 
@@ -969,6 +1092,7 @@ impl LocalToolExecutor {
             serper_api_key: None,
             shutdown_flag: None,
             http_client: build_tooling_http_client(),
+            file_cache: None,
         }
     }
 
@@ -1073,12 +1197,51 @@ impl LocalToolExecutor {
         if let Some(mime_type) = detect_image_mime(&resolved) {
             return self.execute_image_read(request, path, &resolved, mime_type, started);
         }
-        let content = fs::read_to_string(&resolved).map_err(|err| {
+
+        // TOCTOU defense (DR4-002): resolve canonical path ONCE and use it for both
+        // cache lookup and file read, preventing symlink swap between check and read.
+        let canonical_for_read = self
+            .file_cache
+            .as_ref()
+            .and_then(|c| c.lock().ok())
+            .and_then(|c| c.validate_canonical_path(&resolved));
+
+        // Cache check (high-level API: canonicalize + mtime internal)
+        if let Some(ref cache_arc) = self.file_cache
+            && let Ok(mut cache) = cache_arc.lock()
+            && let Some(cached) = cache.try_get(&resolved)
+        {
+            tracing::debug!(path = %path, "file.read cache hit");
+            let msg = format!(
+                "[cached] File previously read (content unchanged, {} bytes)",
+                cached.len()
+            );
+            return Ok(build_completed_result(
+                request,
+                path.to_string(),
+                ToolExecutionPayload::Text(msg),
+                vec![resolved.display().to_string()],
+                started,
+            ));
+        }
+        // Mutex poison → fall through to normal read (best-effort)
+
+        // Read from canonical path when available (TOCTOU defense), fallback to resolved
+        let read_path = canonical_for_read.as_deref().unwrap_or(&resolved);
+        let content = fs::read_to_string(read_path).map_err(|err| {
             ToolRuntimeError::Io(format!(
                 "file.read failed for {}: {err}",
                 resolved.display()
             ))
         })?;
+
+        // Cache record (high-level API: canonicalize + LRU eviction internal)
+        if let Some(ref cache_arc) = self.file_cache
+            && let Ok(mut cache) = cache_arc.lock()
+        {
+            cache.record(&resolved, content.clone());
+        }
+
         Ok(build_completed_result(
             request,
             path.to_string(),
@@ -1148,6 +1311,12 @@ impl LocalToolExecutor {
                 resolved.display()
             ))
         })?;
+        // Invalidate cache after write
+        if let Some(ref cache_arc) = self.file_cache
+            && let Ok(mut cache) = cache_arc.lock()
+        {
+            cache.invalidate(&resolved);
+        }
         Ok(build_completed_result(
             request,
             path.to_string(),
@@ -1183,14 +1352,14 @@ impl LocalToolExecutor {
         }
         let count = content.matches(old_string).count();
         if count == 0 {
-            return Err(ToolRuntimeError::EditNotFound(format!(
+            return Err(ToolRuntimeError::edit_not_found(format!(
                 "file.edit: old_string not found in {path}. \
                  Ensure the string exactly matches the file content, \
                  including whitespace and indentation."
             )));
         }
         if count > 1 {
-            return Err(ToolRuntimeError::EditNotFound(format!(
+            return Err(ToolRuntimeError::edit_not_found(format!(
                 "file.edit: old_string found {count} times in {path}. \
                  Include more surrounding context to make the match unique."
             )));
@@ -1202,6 +1371,12 @@ impl LocalToolExecutor {
                 resolved.display()
             ))
         })?;
+        // Invalidate cache after edit
+        if let Some(ref cache_arc) = self.file_cache
+            && let Ok(mut cache) = cache_arc.lock()
+        {
+            cache.invalidate(&resolved);
+        }
         Ok(build_completed_result(
             request,
             path.to_string(),
@@ -1248,6 +1423,12 @@ impl LocalToolExecutor {
                         resolved.display()
                     ))
                 })?;
+                // Invalidate cache after anchor edit
+                if let Some(ref cache_arc) = self.file_cache
+                    && let Ok(mut cache) = cache_arc.lock()
+                {
+                    cache.invalidate(&resolved);
+                }
                 Ok(build_completed_result(
                     request,
                     path.to_string(),
@@ -1256,16 +1437,17 @@ impl LocalToolExecutor {
                     started,
                 ))
             }
-            0 => Err(ToolRuntimeError::EditNotFound(format!(
+            0 => Err(ToolRuntimeError::edit_not_found(format!(
                 "anchor: normalized old_content not found in {path}"
             ))),
-            n => Err(ToolRuntimeError::EditNotFound(format!(
+            n => Err(ToolRuntimeError::edit_not_found(format!(
                 "anchor: old_content matched {n} locations in {path}, need unique match"
             ))),
         }
     }
 
-    /// Try file.edit first, fall back to anchor-based edit on EditNotFound.
+    /// Try file.edit with 3-level fallback: strict → trailing-ws → anchor.
+    /// On final failure, includes file context snippet in the error for LLM recovery.
     fn execute_file_edit_with_fallback(
         &self,
         request: &ToolExecutionRequest,
@@ -1274,23 +1456,152 @@ impl LocalToolExecutor {
         new_string: &str,
         started: Instant,
     ) -> Result<ToolExecutionResult, ToolRuntimeError> {
-        match self.execute_file_edit(request, path, old_string, new_string, started) {
-            Ok(result) => Ok(result),
-            Err(original_err) if original_err.is_edit_not_found() => {
-                let params = AnchorEditParams {
-                    old_content: old_string.to_string(),
-                    new_content: new_string.to_string(),
-                };
-                match self.execute_file_edit_anchor(request, path, &params, started) {
-                    Ok(mut result) => {
-                        result.summary = format!("{} (anchor fallback)", result.summary);
-                        Ok(result)
-                    }
-                    // Anchor also failed — return the original error for better diagnostics
-                    Err(_) => Err(original_err),
-                }
+        // Level 1: strict replace
+        let original_err =
+            match self.execute_file_edit(request, path, old_string, new_string, started) {
+                Ok(result) => return Ok(result),
+                Err(err) if !err.is_edit_not_found() => return Err(err),
+                Err(err) => err,
+            };
+
+        // Level 2: trailing whitespace normalized
+        if let Ok(mut result) =
+            self.execute_file_edit_trailing_ws(request, path, old_string, new_string, started)
+        {
+            result.summary = format!("{} (trailing-ws fallback)", result.summary);
+            return Ok(result);
+        }
+
+        // Level 3: anchor-based (indent-normalized)
+        let params = AnchorEditParams {
+            old_content: old_string.to_string(),
+            new_content: new_string.to_string(),
+        };
+        match self.execute_file_edit_anchor(request, path, &params, started) {
+            Ok(mut result) => {
+                result.summary = format!("{} (anchor fallback)", result.summary);
+                Ok(result)
             }
-            Err(err) => Err(err),
+            // All levels failed — enrich error with file context
+            Err(_) => Err(self.build_edit_not_found_with_context(path, old_string, &original_err)),
+        }
+    }
+
+    /// Level 2 fallback: match after stripping trailing whitespace from each line.
+    fn execute_file_edit_trailing_ws(
+        &self,
+        request: &ToolExecutionRequest,
+        path: &str,
+        old_string: &str,
+        new_string: &str,
+        started: Instant,
+    ) -> Result<ToolExecutionResult, ToolRuntimeError> {
+        let resolved = self.resolve_path(path)?;
+        let content = fs::read_to_string(&resolved).map_err(|err| {
+            ToolRuntimeError::Io(format!(
+                "file.edit failed to read {}: {err}",
+                resolved.display()
+            ))
+        })?;
+
+        let normalize_lines = |s: &str| -> Vec<String> {
+            s.lines().map(|line| line.trim_end().to_string()).collect()
+        };
+
+        let content_lines = normalize_lines(&content);
+        let old_lines = normalize_lines(old_string);
+
+        if old_lines.is_empty() {
+            return Err(ToolRuntimeError::edit_not_found(
+                "file.edit: empty old_string",
+            ));
+        }
+
+        // Find matching line range using trailing-ws-normalized comparison
+        let mut match_positions = Vec::new();
+        for i in 0..content_lines.len() {
+            if i + old_lines.len() > content_lines.len() {
+                break;
+            }
+            if content_lines[i..i + old_lines.len()] == old_lines[..] {
+                match_positions.push(i);
+            }
+        }
+
+        if match_positions.len() != 1 {
+            return Err(ToolRuntimeError::edit_not_found(format!(
+                "file.edit: trailing-ws-normalized old_string {} in {path}",
+                if match_positions.is_empty() {
+                    "not found".to_string()
+                } else {
+                    format!("found {} times", match_positions.len())
+                }
+            )));
+        }
+
+        let match_start = match_positions[0];
+        let match_end = match_start + old_lines.len();
+
+        // Replace the matched line range with new_string
+        let original_lines: Vec<&str> = content.lines().collect();
+        let mut result_parts: Vec<&str> = Vec::new();
+        for (i, line) in original_lines.iter().enumerate() {
+            if i < match_start || i >= match_end {
+                result_parts.push(line);
+            } else if i == match_start {
+                // Insert new_string at match position
+                result_parts.push(new_string);
+            }
+        }
+
+        // Handle trailing newline from original content
+        let new_content = if content.ends_with('\n') {
+            format!("{}\n", result_parts.join("\n"))
+        } else {
+            result_parts.join("\n")
+        };
+
+        fs::write(&resolved, &new_content).map_err(|err| {
+            ToolRuntimeError::Io(format!(
+                "file.edit failed to write {}: {err}",
+                resolved.display()
+            ))
+        })?;
+
+        Ok(build_completed_result(
+            request,
+            path.to_string(),
+            ToolExecutionPayload::None,
+            vec![resolved.display().to_string()],
+            started,
+        ))
+    }
+
+    /// Build an EditNotFound error enriched with file context snippet.
+    /// Skips context for sensitive files (e.g., .env, credentials).
+    fn build_edit_not_found_with_context(
+        &self,
+        path: &str,
+        old_string: &str,
+        original_err: &ToolRuntimeError,
+    ) -> ToolRuntimeError {
+        let message = original_err.to_string();
+
+        // Don't include context for sensitive files
+        if is_sensitive_file(path) {
+            return ToolRuntimeError::edit_not_found(message);
+        }
+
+        // Try to read file content for context extraction
+        let context_snippet = self
+            .resolve_path(path)
+            .ok()
+            .and_then(|resolved| fs::read_to_string(resolved).ok())
+            .and_then(|content| extract_edit_context(&content, old_string, 5));
+
+        match context_snippet {
+            Some(ctx) => ToolRuntimeError::edit_not_found_with_context(message, ctx),
+            None => ToolRuntimeError::edit_not_found(message),
         }
     }
 

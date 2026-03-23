@@ -23,9 +23,9 @@ pub use ollama::{
     parse_model_list_from_tags_response, resolve_ollama_model_alias,
 };
 pub use transport::{
-    HttpResponse, HttpTransport, ReqwestHttpTransport, RetryConfig, RetryTransport,
-    classify_http_error, classify_reqwest_error, http_timeout, redact_secrets,
-    sanitize_error_message,
+    DEFAULT_HTTP_TIMEOUT_SECS, HttpResponse, HttpTransport, ReqwestHttpTransport, RetryConfig,
+    RetryTransport, classify_http_error, classify_reqwest_error, http_timeout,
+    normalize_http_timeout, redact_secrets, sanitize_error_message,
 };
 
 /// Default transport used by provider clients: reqwest with retry wrapper.
@@ -405,7 +405,10 @@ pub fn build_local_provider_client(
     config: &EffectiveConfig,
     shutdown_flag: Arc<AtomicBool>,
 ) -> Result<LocalProviderClient, ProviderBootstrapError> {
-    let reqwest_transport = ReqwestHttpTransport::with_shutdown_flag(Arc::clone(&shutdown_flag));
+    let reqwest_transport = ReqwestHttpTransport::with_timeout_and_shutdown_flag(
+        config.runtime.http_timeout_secs,
+        Arc::clone(&shutdown_flag),
+    );
     let transport = RetryTransport::with_shutdown_flag(
         reqwest_transport,
         RetryConfig::default(),

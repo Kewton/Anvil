@@ -7,6 +7,7 @@
 pub mod cli_args;
 pub use cli_args::CliArgs;
 
+use crate::provider::transport::{DEFAULT_HTTP_TIMEOUT_SECS, normalize_http_timeout};
 use clap::Parser;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -76,6 +77,10 @@ pub struct RuntimeConfig {
     pub subagent_max_iterations: u32,
     /// Wall-clock timeout in seconds for the entire sub-agent run (Issue #129).
     pub subagent_timeout_secs: u64,
+    /// Loop detection threshold: number of identical tool calls before detection triggers (Issue #145).
+    pub loop_detection_threshold: usize,
+    /// HTTP request timeout in seconds (Issue #146).
+    pub http_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -214,7 +219,7 @@ impl EffectiveConfig {
                 api_key: None,
                 context_window: 200_000,
                 context_budget: None,
-                max_agent_iterations: 10,
+                max_agent_iterations: DEFAULT_MAX_AGENT_ITERATIONS,
                 max_console_messages: 5,
                 auto_compact_threshold: 64,
                 tool_result_max_chars: 8000,
@@ -225,8 +230,10 @@ impl EffectiveConfig {
                 tag_protocol: None,
                 prompt_tier: None,
                 smart_compact_threshold_ratio: 0.75,
-                subagent_max_iterations: 10,
-                subagent_timeout_secs: 120,
+                subagent_max_iterations: DEFAULT_SUBAGENT_MAX_ITERATIONS,
+                subagent_timeout_secs: DEFAULT_SUBAGENT_TIMEOUT_SECS,
+                loop_detection_threshold: 3,
+                http_timeout_secs: DEFAULT_HTTP_TIMEOUT_SECS,
             },
             mode: ModeConfig {
                 prompt_source: PromptSource::Interactive,
@@ -324,6 +331,9 @@ impl EffectiveConfig {
             "ANVIL_SMART_COMPACT_THRESHOLD_RATIO",
             "ANVIL_SUBAGENT_MAX_ITERATIONS",
             "ANVIL_SUBAGENT_TIMEOUT",
+            "ANVIL_LOOP_DETECTION_THRESHOLD",
+            "ANVIL_HTTP_TIMEOUT",
+            "ANVIL_CURL_TIMEOUT",
         ] {
             if let Ok(value) = std::env::var(key) {
                 map.insert(key.to_string(), value);
@@ -410,6 +420,11 @@ impl EffectiveConfig {
         // Tag protocol flag
         if let Some(v) = cli.tag_protocol {
             self.runtime.tag_protocol = Some(v);
+        }
+
+        // HTTP timeout
+        if let Some(timeout) = cli.timeout {
+            self.runtime.http_timeout_secs = timeout;
         }
 
         // Prompt tier override
@@ -543,6 +558,20 @@ impl EffectiveConfig {
                         .parse()
                         .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
                 }
+                "loop_detection_threshold" | "ANVIL_LOOP_DETECTION_THRESHOLD" => {
+                    let v: usize = value
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                    if !(2..=20).contains(&v) {
+                        return Err(ConfigError::InvalidNumericValue(value.clone()));
+                    }
+                    self.runtime.loop_detection_threshold = v;
+                }
+                "http_timeout_secs" | "ANVIL_HTTP_TIMEOUT" | "ANVIL_CURL_TIMEOUT" => {
+                    self.runtime.http_timeout_secs = value
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                }
                 _ => {}
             }
         }
@@ -569,7 +598,18 @@ impl EffectiveConfig {
         self.clamp_agent_iterations();
         self.clamp_smart_compact_ratio();
         self.clamp_subagent_settings();
+        self.clamp_loop_detection_threshold();
+        self.clamp_http_timeout();
         Ok(())
+    }
+
+    fn clamp_http_timeout(&mut self) {
+        let old = self.runtime.http_timeout_secs;
+        let normalized = normalize_http_timeout(old);
+        if normalized != old {
+            self.runtime.http_timeout_secs = normalized;
+            eprintln!("Warning: http_timeout_secs={old} adjusted to {normalized}");
+        }
     }
 
     /// Clamp smart_compact_threshold_ratio to [0.1, 0.95].
@@ -653,11 +693,8 @@ impl EffectiveConfig {
     /// Clamp sub-agent iteration/timeout settings.
     /// If 0, restore to default values. Enforce upper bounds.
     fn clamp_subagent_settings(&mut self) {
-        const MAX_SUBAGENT_ITERATIONS: u32 = 100;
-        const MAX_SUBAGENT_TIMEOUT_SECS: u64 = 3600;
-
         if self.runtime.subagent_max_iterations == 0 {
-            self.runtime.subagent_max_iterations = 10;
+            self.runtime.subagent_max_iterations = DEFAULT_SUBAGENT_MAX_ITERATIONS;
         } else if self.runtime.subagent_max_iterations > MAX_SUBAGENT_ITERATIONS {
             let old = self.runtime.subagent_max_iterations;
             self.runtime.subagent_max_iterations = MAX_SUBAGENT_ITERATIONS;
@@ -666,7 +703,7 @@ impl EffectiveConfig {
             );
         }
         if self.runtime.subagent_timeout_secs == 0 {
-            self.runtime.subagent_timeout_secs = 120;
+            self.runtime.subagent_timeout_secs = DEFAULT_SUBAGENT_TIMEOUT_SECS;
         } else if self.runtime.subagent_timeout_secs > MAX_SUBAGENT_TIMEOUT_SECS {
             let old = self.runtime.subagent_timeout_secs;
             self.runtime.subagent_timeout_secs = MAX_SUBAGENT_TIMEOUT_SECS;
@@ -674,6 +711,10 @@ impl EffectiveConfig {
                 "Warning: subagent_timeout_secs={old} exceeds maximum ({MAX_SUBAGENT_TIMEOUT_SECS}), adjusted to {MAX_SUBAGENT_TIMEOUT_SECS}"
             );
         }
+    }
+
+    fn clamp_loop_detection_threshold(&mut self) {
+        self.runtime.loop_detection_threshold = self.runtime.loop_detection_threshold.clamp(2, 20);
     }
 
     pub fn validate_for_test(&mut self) -> Result<(), ConfigError> {
@@ -700,6 +741,11 @@ impl EffectiveConfig {
 
 const MAX_PROJECT_INSTRUCTIONS_CHARS: usize = 4000;
 const MIN_CONTEXT_WINDOW: u32 = 1000;
+const DEFAULT_MAX_AGENT_ITERATIONS: usize = 30;
+const DEFAULT_SUBAGENT_MAX_ITERATIONS: u32 = 20;
+const DEFAULT_SUBAGENT_TIMEOUT_SECS: u64 = 120;
+const MAX_SUBAGENT_ITERATIONS: u32 = 100;
+const MAX_SUBAGENT_TIMEOUT_SECS: u64 = 3600;
 const MIN_AGENT_ITERATIONS: usize = 1;
 const MAX_AGENT_ITERATIONS: usize = 100;
 
@@ -925,6 +971,7 @@ impl std::fmt::Debug for RuntimeConfig {
                 "smart_compact_threshold_ratio",
                 &self.smart_compact_threshold_ratio,
             )
+            .field("http_timeout_secs", &self.http_timeout_secs)
             .finish()
     }
 }
