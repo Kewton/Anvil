@@ -655,6 +655,7 @@ const PROMPT_TOOL_RULES: &str = concat!(
     "- When the user's request requires file changes (implement, fix, create, modify, etc.), \
        you must complete the actual file modifications using file.write/file.edit, \
        not just output a plan or description.\n",
+    "- For large existing files, file.write may be blocked. Use file.edit or file.edit_anchor for targeted modifications instead of rewriting entire files.\n",
     "- Start exploration with file.read on \".\" to list the project root before reading specific files.\n",
     "- Do not assume files like README.md exist — verify first.\n",
     "- For dev servers and watch processes (npm run dev, cargo watch, etc.), use background execution with '&' so the command returns immediately.\n",

@@ -899,3 +899,181 @@ fn http_timeout_cli_args_none_leaves_default() {
     config.apply_cli_args(&cli).expect("should apply");
     assert_eq!(config.runtime.http_timeout_secs, 300);
 }
+
+// ============================================================
+// safe_write_max_lines / safe_write_deletion_ratio tests (Issue #156)
+// ============================================================
+
+#[test]
+fn safe_write_max_lines_default() {
+    let config = EffectiveConfig::default_for_test().unwrap();
+    assert_eq!(config.runtime.safe_write_max_lines, 500);
+}
+
+#[test]
+fn safe_write_deletion_ratio_default() {
+    let config = EffectiveConfig::default_for_test().unwrap();
+    assert!((config.runtime.safe_write_deletion_ratio - 0.5).abs() < f64::EPSILON);
+}
+
+#[test]
+fn safe_write_max_lines_from_config_key() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let mut map = HashMap::new();
+    map.insert("safe_write_max_lines".to_string(), "100".to_string());
+    config
+        .apply_overrides_for_test(&map, &HashMap::new(), &HashMap::new())
+        .expect("should apply");
+    assert_eq!(config.runtime.safe_write_max_lines, 100);
+}
+
+#[test]
+fn safe_write_max_lines_from_env_key() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let mut map = HashMap::new();
+    map.insert("ANVIL_SAFE_WRITE_MAX_LINES".to_string(), "200".to_string());
+    config
+        .apply_overrides_for_test(&HashMap::new(), &map, &HashMap::new())
+        .expect("should apply");
+    assert_eq!(config.runtime.safe_write_max_lines, 200);
+}
+
+#[test]
+fn safe_write_max_lines_zero_disables() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let mut map = HashMap::new();
+    map.insert("safe_write_max_lines".to_string(), "0".to_string());
+    config
+        .apply_overrides_for_test(&map, &HashMap::new(), &HashMap::new())
+        .expect("should apply");
+    assert_eq!(config.runtime.safe_write_max_lines, 0);
+}
+
+#[test]
+fn safe_write_deletion_ratio_from_config_key() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let mut map = HashMap::new();
+    map.insert("safe_write_deletion_ratio".to_string(), "0.25".to_string());
+    config
+        .apply_overrides_for_test(&map, &HashMap::new(), &HashMap::new())
+        .expect("should apply");
+    assert!((config.runtime.safe_write_deletion_ratio - 0.25).abs() < f64::EPSILON);
+}
+
+#[test]
+fn safe_write_deletion_ratio_from_env_key() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let mut map = HashMap::new();
+    map.insert(
+        "ANVIL_SAFE_WRITE_DELETION_RATIO".to_string(),
+        "0.75".to_string(),
+    );
+    config
+        .apply_overrides_for_test(&HashMap::new(), &map, &HashMap::new())
+        .expect("should apply");
+    assert!((config.runtime.safe_write_deletion_ratio - 0.75).abs() < f64::EPSILON);
+}
+
+#[test]
+fn safe_write_deletion_ratio_rejects_negative() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let mut map = HashMap::new();
+    map.insert("safe_write_deletion_ratio".to_string(), "-0.1".to_string());
+    let result = config.apply_overrides_for_test(&map, &HashMap::new(), &HashMap::new());
+    assert!(result.is_err(), "negative deletion_ratio should fail");
+}
+
+#[test]
+fn safe_write_deletion_ratio_rejects_above_one() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let mut map = HashMap::new();
+    map.insert("safe_write_deletion_ratio".to_string(), "1.5".to_string());
+    let result = config.apply_overrides_for_test(&map, &HashMap::new(), &HashMap::new());
+    assert!(result.is_err(), "deletion_ratio > 1.0 should fail");
+}
+
+#[test]
+fn safe_write_deletion_ratio_rejects_nan() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let mut map = HashMap::new();
+    map.insert("safe_write_deletion_ratio".to_string(), "NaN".to_string());
+    let result = config.apply_overrides_for_test(&map, &HashMap::new(), &HashMap::new());
+    assert!(result.is_err(), "NaN deletion_ratio should fail");
+}
+
+#[test]
+fn safe_write_deletion_ratio_rejects_infinity() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let mut map = HashMap::new();
+    map.insert("safe_write_deletion_ratio".to_string(), "inf".to_string());
+    let result = config.apply_overrides_for_test(&map, &HashMap::new(), &HashMap::new());
+    assert!(result.is_err(), "infinity deletion_ratio should fail");
+}
+
+#[test]
+fn safe_write_deletion_ratio_accepts_zero() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let mut map = HashMap::new();
+    map.insert("safe_write_deletion_ratio".to_string(), "0.0".to_string());
+    config
+        .apply_overrides_for_test(&map, &HashMap::new(), &HashMap::new())
+        .expect("should apply");
+    assert!((config.runtime.safe_write_deletion_ratio - 0.0).abs() < f64::EPSILON);
+}
+
+#[test]
+fn safe_write_deletion_ratio_accepts_one() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let mut map = HashMap::new();
+    map.insert("safe_write_deletion_ratio".to_string(), "1.0".to_string());
+    config
+        .apply_overrides_for_test(&map, &HashMap::new(), &HashMap::new())
+        .expect("should apply");
+    assert!((config.runtime.safe_write_deletion_ratio - 1.0).abs() < f64::EPSILON);
+}
+
+#[test]
+fn safe_write_max_lines_invalid_numeric() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let mut map = HashMap::new();
+    map.insert(
+        "safe_write_max_lines".to_string(),
+        "not_a_number".to_string(),
+    );
+    let result = config.apply_overrides_for_test(&map, &HashMap::new(), &HashMap::new());
+    assert!(
+        result.is_err(),
+        "non-numeric safe_write_max_lines should fail"
+    );
+}
+
+#[test]
+fn safe_write_cli_args_max_lines() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let cli = anvil::config::CliArgs {
+        safe_write_max_lines: Some(100),
+        ..Default::default()
+    };
+    config.apply_cli_args(&cli).expect("should apply");
+    assert_eq!(config.runtime.safe_write_max_lines, 100);
+}
+
+#[test]
+fn safe_write_cli_args_deletion_ratio() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let cli = anvil::config::CliArgs {
+        safe_write_deletion_ratio: Some(0.3),
+        ..Default::default()
+    };
+    config.apply_cli_args(&cli).expect("should apply");
+    assert!((config.runtime.safe_write_deletion_ratio - 0.3).abs() < f64::EPSILON);
+}
+
+#[test]
+fn safe_write_cli_args_none_leaves_default() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let cli = anvil::config::CliArgs::default();
+    config.apply_cli_args(&cli).expect("should apply");
+    assert_eq!(config.runtime.safe_write_max_lines, 500);
+    assert!((config.runtime.safe_write_deletion_ratio - 0.5).abs() < f64::EPSILON);
+}

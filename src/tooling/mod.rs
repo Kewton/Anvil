@@ -28,6 +28,10 @@ const MAX_CONTEXT_LINES: u32 = 10;
 /// Maximum number of matched files returned by file.search.
 const MAX_SEARCH_RESULTS: usize = 100;
 
+/// Files larger than this are blocked by the safe-write guard without reading
+/// their full contents, to avoid memory pressure (10 MB).
+const MAX_SAFE_WRITE_GUARD_READ_BYTES: u64 = 10 * 1024 * 1024;
+
 /// Detect the MIME type of an image file based on its extension.
 ///
 /// Returns `None` for non-image extensions.
@@ -901,6 +905,7 @@ pub struct LocalToolExecutor {
     shutdown_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     http_client: reqwest::blocking::Client,
     file_cache: Option<std::sync::Arc<std::sync::Mutex<file_cache::FileReadCache>>>,
+    safe_write_max_lines: usize,
 }
 
 /// Build the shared HTTP client used by tooling (web.fetch / web.search).
@@ -922,6 +927,11 @@ pub enum ToolRuntimeError {
     EditNotFound {
         message: String,
         context_snippet: Option<String>,
+    },
+    LargeFileBlocked {
+        path: String,
+        line_count: usize,
+        threshold: usize,
     },
 }
 
@@ -959,8 +969,26 @@ impl Display for ToolRuntimeError {
                  or use web.fetch to access specific URLs directly."
             ),
             Self::EditNotFound { message, .. } => write!(f, "{message}"),
+            Self::LargeFileBlocked {
+                path,
+                line_count,
+                threshold,
+            } => write!(
+                f,
+                "File '{}' has {} lines (threshold: {}).\n\
+                 Large existing files cannot be overwritten with file.write.\n\
+                 Use file.edit or file.edit_anchor to make targeted changes instead.",
+                sanitize_path_for_display(path),
+                line_count,
+                threshold
+            ),
         }
     }
+}
+
+/// Sanitize a path string for display by removing control characters.
+fn sanitize_path_for_display(path: &str) -> String {
+    path.chars().filter(|c| !c.is_control()).collect()
 }
 
 impl std::error::Error for ToolRuntimeError {}
@@ -1079,6 +1107,7 @@ impl LocalToolExecutor {
             shutdown_flag: None,
             http_client: build_tooling_http_client(),
             file_cache,
+            safe_write_max_lines: config.safe_write_max_lines,
         }
     }
 
@@ -1093,7 +1122,13 @@ impl LocalToolExecutor {
             shutdown_flag: None,
             http_client: build_tooling_http_client(),
             file_cache: None,
+            safe_write_max_lines: 0,
         }
+    }
+
+    /// Set the safe_write_max_lines threshold (for tests).
+    pub fn set_safe_write_max_lines(&mut self, value: usize) {
+        self.safe_write_max_lines = value;
     }
 
     /// Create an executor with a Serper API key set (for testing fallback).
@@ -1297,6 +1332,44 @@ impl LocalToolExecutor {
         started: Instant,
     ) -> Result<ToolExecutionResult, ToolRuntimeError> {
         let resolved = self.resolve_path(path)?;
+
+        // Large file write guard (safe_write_max_lines > 0 = enabled)
+        if self.safe_write_max_lines > 0 {
+            match std::fs::metadata(&resolved) {
+                Ok(meta) => {
+                    // Extremely large files: block without full read to avoid memory pressure
+                    if meta.len() > MAX_SAFE_WRITE_GUARD_READ_BYTES {
+                        return Err(ToolRuntimeError::LargeFileBlocked {
+                            path: path.to_string(),
+                            line_count: 0,
+                            threshold: self.safe_write_max_lines,
+                        });
+                    }
+                    if let Ok(existing) = std::fs::read(&resolved) {
+                        let newline_count = existing.iter().filter(|&&b| b == b'\n').count();
+                        let line_count = if existing.is_empty() {
+                            0
+                        } else {
+                            newline_count + usize::from(!existing.ends_with(b"\n"))
+                        };
+                        if line_count > self.safe_write_max_lines {
+                            return Err(ToolRuntimeError::LargeFileBlocked {
+                                path: path.to_string(),
+                                line_count,
+                                threshold: self.safe_write_max_lines,
+                            });
+                        }
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    // New file creation — not subject to the guard
+                }
+                Err(_) => {
+                    // Other metadata errors — proceed to let fs::write handle it
+                }
+            }
+        }
+
         if let Some(parent) = resolved.parent() {
             fs::create_dir_all(parent).map_err(|err| {
                 ToolRuntimeError::Io(format!(

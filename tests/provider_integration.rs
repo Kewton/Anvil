@@ -3685,3 +3685,43 @@ fn transport_with_timeout_and_shutdown_flag_constructs_successfully() {
     let flag = Arc::new(AtomicBool::new(false));
     let _transport = ReqwestHttpTransport::with_timeout_and_shutdown_flag(120, flag);
 }
+
+#[test]
+fn prompt_tool_rules_contains_large_file_guidance() {
+    let app = common::build_app();
+    let tui = Tui::new();
+    let seen_requests = Rc::new(RefCell::new(Vec::new()));
+    let provider = RecordingProvider {
+        seen_requests: seen_requests.clone(),
+        events: vec![
+            ProviderEvent::Agent(AgentEvent::Thinking {
+                status: "Thinking".to_string(),
+                plan_items: vec![],
+                active_index: None,
+                reasoning_summary: vec![],
+                elapsed_ms: 0,
+            }),
+            ProviderEvent::Agent(AgentEvent::Done {
+                status: "Done. session saved".to_string(),
+                assistant_message: "ok".to_string(),
+                completion_summary: "done".to_string(),
+                saved_status: "session saved".to_string(),
+                tool_logs: Vec::new(),
+                elapsed_ms: 0,
+                inference_performance: None,
+            }),
+        ],
+        followup_events: Vec::new(),
+        error: None,
+    };
+
+    let mut app = app;
+    let _ = app.run_live_turn("test", &provider, &tui);
+
+    let requests = seen_requests.borrow();
+    let system_prompt = &requests[0].messages[0].content;
+    assert!(
+        system_prompt.contains("file.write may be blocked"),
+        "system prompt should contain large file write guidance from PROMPT_TOOL_RULES"
+    );
+}
