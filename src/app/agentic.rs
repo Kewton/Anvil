@@ -596,7 +596,10 @@ impl App {
                     );
                 } else {
                     let summary = tool_call_approval_summary(call);
-                    let diff_preview = generate_diff_preview(&self.config.paths.cwd, &call.input);
+                    let diff_options =
+                        crate::tooling::diff::DiffOptions::from_runtime(&self.config.runtime);
+                    let diff_preview =
+                        generate_diff_preview(&self.config.paths.cwd, &call.input, &diff_options);
                     let approved = prompt_inline_approval(&summary, diff_preview.as_deref());
                     if !approved {
                         failed_results

@@ -1305,9 +1305,12 @@ impl App {
                             .find(|tc| tc.tool_call_id == *tool_call_id)
                     })
                     .and_then(|tc| {
+                        let diff_options =
+                            crate::tooling::diff::DiffOptions::from_runtime(&self.config.runtime);
                         crate::tooling::diff::generate_diff_preview(
                             &self.config.paths.cwd,
                             &tc.input,
+                            &diff_options,
                         )
                     });
                 let snapshot = AppStateSnapshot::new(RuntimeState::AwaitingApproval)
