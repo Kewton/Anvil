@@ -142,9 +142,9 @@ fn override_precedence_is_file_then_env_then_cli() {
 }
 
 #[test]
-fn max_agent_iterations_defaults_to_ten() {
+fn max_agent_iterations_defaults_to_thirty() {
     let config = EffectiveConfig::default_for_test().expect("config should load");
-    assert_eq!(config.runtime.max_agent_iterations, 10);
+    assert_eq!(config.runtime.max_agent_iterations, 30);
 }
 
 #[test]
@@ -727,7 +727,7 @@ fn tag_protocol_cli_args_unset_leaves_none() {
 #[test]
 fn subagent_config_defaults() {
     let config = EffectiveConfig::default_for_test().unwrap();
-    assert_eq!(config.runtime.subagent_max_iterations, 10);
+    assert_eq!(config.runtime.subagent_max_iterations, 20);
     assert_eq!(config.runtime.subagent_timeout_secs, 120);
 }
 
@@ -735,12 +735,12 @@ fn subagent_config_defaults() {
 fn subagent_config_apply_map() {
     let mut config = EffectiveConfig::default_for_test().unwrap();
     let mut map = HashMap::new();
-    map.insert("subagent_max_iterations".to_string(), "20".to_string());
+    map.insert("subagent_max_iterations".to_string(), "25".to_string());
     map.insert("subagent_timeout_secs".to_string(), "300".to_string());
     config
         .apply_overrides_for_test(&map, &HashMap::new(), &HashMap::new())
         .expect("should apply");
-    assert_eq!(config.runtime.subagent_max_iterations, 20);
+    assert_eq!(config.runtime.subagent_max_iterations, 25);
     assert_eq!(config.runtime.subagent_timeout_secs, 300);
 }
 
@@ -767,8 +767,8 @@ fn subagent_config_zero_restored_to_defaults() {
     config.runtime.subagent_timeout_secs = 0;
     config.validate_for_test().expect("validation should pass");
     assert_eq!(
-        config.runtime.subagent_max_iterations, 10,
-        "zero subagent_max_iterations should be restored to default"
+        config.runtime.subagent_max_iterations, 20,
+        "zero subagent_max_iterations should be restored to default (20)"
     );
     assert_eq!(
         config.runtime.subagent_timeout_secs, 120,

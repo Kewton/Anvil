@@ -33,7 +33,7 @@ pub struct CliArgs {
     #[arg(long = "context-budget")]
     pub context_budget: Option<u32>,
 
-    /// Max agent iterations
+    /// Max agent iterations [default: 30]
     #[arg(long = "max-iterations")]
     pub max_iterations: Option<usize>,
 
