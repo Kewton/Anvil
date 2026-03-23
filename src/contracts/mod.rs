@@ -20,6 +20,7 @@ pub enum TerminationReason {
     Completed,
     Timeout,
     MaxIterations,
+    LoopDetected,
 }
 
 impl std::fmt::Display for TerminationReason {
@@ -28,6 +29,7 @@ impl std::fmt::Display for TerminationReason {
             Self::Completed => write!(f, "completed"),
             Self::Timeout => write!(f, "timeout"),
             Self::MaxIterations => write!(f, "max_iterations"),
+            Self::LoopDetected => write!(f, "loop_detected"),
         }
     }
 }
@@ -733,6 +735,7 @@ mod tests {
             TerminationReason::MaxIterations.to_string(),
             "max_iterations"
         );
+        assert_eq!(TerminationReason::LoopDetected.to_string(), "loop_detected");
     }
 
     #[test]
@@ -741,6 +744,7 @@ mod tests {
             TerminationReason::Completed,
             TerminationReason::Timeout,
             TerminationReason::MaxIterations,
+            TerminationReason::LoopDetected,
         ] {
             let json = serde_json::to_string(&reason).expect("serialize");
             let back: TerminationReason = serde_json::from_str(&json).expect("deserialize");
