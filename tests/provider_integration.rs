@@ -3639,6 +3639,234 @@ fn anvil_final_guard_prompt_tool_rules_contains_implementation_guidance() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Issue #160: ANVIL_FINAL後のツール呼び出し除外 — 統合テスト
+// ---------------------------------------------------------------------------
+
+#[test]
+fn done_event_post_final() {
+    // TC6: Done-event path filters post-FINAL tools.
+    // LLM outputs ANVIL_TOOL(call_001) + ANVIL_FINAL + ANVIL_TOOL(call_002).
+    // Only call_001 should be executed; call_002 should be excluded by the parser.
+    let root = common::unique_test_dir("done_post_final");
+    let mut config = common::build_config_in(root.clone());
+    config.mode.approval_required = false;
+    let provider_ctx =
+        anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
+    let mut app = anvil::app::App::new(
+        config,
+        provider_ctx,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("app should initialize");
+    let tui = Tui::new();
+
+    std::fs::create_dir_all(root.join("src")).expect("create src dir");
+    std::fs::write(root.join("src/main.rs"), "fn main() {}").expect("write main.rs");
+
+    let seen_requests = Rc::new(RefCell::new(Vec::new()));
+
+    struct DonePostFinalProvider {
+        seen_requests: Rc<RefCell<Vec<ProviderTurnRequest>>>,
+    }
+
+    impl ProviderClient for DonePostFinalProvider {
+        fn stream_turn(
+            &self,
+            request: &ProviderTurnRequest,
+            emit: &mut dyn FnMut(ProviderEvent),
+        ) -> Result<(), ProviderTurnError> {
+            let call_index = self.seen_requests.borrow().len();
+            self.seen_requests.borrow_mut().push(request.clone());
+
+            match call_index {
+                0 => {
+                    // Done event: ANVIL_TOOL + ANVIL_FINAL + post-FINAL ANVIL_TOOL
+                    emit(ProviderEvent::Agent(AgentEvent::Done {
+                        status: "Done. session saved".to_string(),
+                        assistant_message: concat!(
+                            "```ANVIL_TOOL\n",
+                            "{\"id\":\"call_001\",\"tool\":\"file.read\",\"path\":\"./src/main.rs\"}\n",
+                            "```\n",
+                            "```ANVIL_FINAL\n",
+                            "Read the source file.\n",
+                            "```\n",
+                            "```ANVIL_TOOL\n",
+                            "{\"id\":\"call_002\",\"tool\":\"file.read\",\"path\":\"./src/lib.rs\"}\n",
+                            "```\n"
+                        )
+                        .to_string(),
+                        completion_summary: "turn 1".to_string(),
+                        saved_status: "session saved".to_string(),
+                        tool_logs: Vec::new(),
+                        elapsed_ms: 0,
+                        inference_performance: None,
+                    }));
+                }
+                1 => {
+                    // Agentic follow-up after file.read (only call_001 executed)
+                    emit(ProviderEvent::TokenDelta(
+                        "Here is the source code analysis.".to_string(),
+                    ));
+                }
+                _ => {
+                    // Guard retry: accept
+                    emit(ProviderEvent::TokenDelta(
+                        "No further changes needed.".to_string(),
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    let provider = DonePostFinalProvider {
+        seen_requests: seen_requests.clone(),
+    };
+
+    let _frames = app
+        .run_live_turn("read the source", &provider, &tui)
+        .expect("done_event_post_final should succeed");
+
+    // Verify call_001 WAS executed: main.rs tool result should appear in session
+    let has_main_rs_result = app
+        .session()
+        .messages
+        .iter()
+        .any(|m| m.content.contains("fn main()") || m.content.contains("main.rs"));
+    assert!(
+        has_main_rs_result,
+        "pre-FINAL tool call_001 (main.rs) should have been executed"
+    );
+
+    // Verify call_002 was NOT executed: lib.rs content should NOT appear
+    let has_lib_rs_result = app
+        .session()
+        .messages
+        .iter()
+        .any(|m| m.content.contains("lib.rs"));
+    assert!(
+        !has_lib_rs_result,
+        "post-FINAL tool call_002 (lib.rs) should NOT appear in session messages"
+    );
+}
+
+#[test]
+fn guard_retry_post_final() {
+    // TC7: Guard retry path filters post-FINAL tools.
+    // First response: plan-only ANVIL_FINAL (triggers guard).
+    // Guard retry response: ANVIL_TOOL(call_001) + ANVIL_FINAL + ANVIL_TOOL(call_002).
+    // Only call_001 should be executed from the retry response.
+    let root = common::unique_test_dir("guard_retry_post_final");
+    let mut config = common::build_config_in(root.clone());
+    config.mode.approval_required = false;
+    let provider_ctx =
+        anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
+    let mut app = anvil::app::App::new(
+        config,
+        provider_ctx,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("app should initialize");
+    let tui = Tui::new();
+
+    std::fs::create_dir_all(root.join("src")).expect("create src dir");
+    std::fs::write(root.join("src/main.rs"), "fn main() {}").expect("write main.rs");
+
+    let seen_requests = Rc::new(RefCell::new(Vec::new()));
+
+    struct GuardRetryPostFinalProvider {
+        seen_requests: Rc<RefCell<Vec<ProviderTurnRequest>>>,
+    }
+
+    impl ProviderClient for GuardRetryPostFinalProvider {
+        fn stream_turn(
+            &self,
+            request: &ProviderTurnRequest,
+            emit: &mut dyn FnMut(ProviderEvent),
+        ) -> Result<(), ProviderTurnError> {
+            let call_index = self.seen_requests.borrow().len();
+            self.seen_requests.borrow_mut().push(request.clone());
+
+            match call_index {
+                0 => {
+                    // Plan-only ANVIL_FINAL (no tool calls → guard fires)
+                    emit(ProviderEvent::Agent(AgentEvent::Done {
+                        status: "Done. session saved".to_string(),
+                        assistant_message: concat!(
+                            "```ANVIL_FINAL\n",
+                            "Here is my plan:\n1. Read the file\n2. Analyze it\n",
+                            "```\n"
+                        )
+                        .to_string(),
+                        completion_summary: "plan only".to_string(),
+                        saved_status: "session saved".to_string(),
+                        tool_logs: Vec::new(),
+                        elapsed_ms: 100,
+                        inference_performance: None,
+                    }));
+                }
+                1 => {
+                    // Guard retry response with post-FINAL tool
+                    emit(ProviderEvent::Agent(AgentEvent::Done {
+                        status: "Done. session saved".to_string(),
+                        assistant_message: concat!(
+                            "```ANVIL_TOOL\n",
+                            "{\"id\":\"call_001\",\"tool\":\"file.read\",\"path\":\"./src/main.rs\"}\n",
+                            "```\n",
+                            "```ANVIL_FINAL\n",
+                            "Reading the file now.\n",
+                            "```\n",
+                            "```ANVIL_TOOL\n",
+                            "{\"id\":\"call_002\",\"tool\":\"file.read\",\"path\":\"./src/lib.rs\"}\n",
+                            "```\n"
+                        )
+                        .to_string(),
+                        completion_summary: "retry turn".to_string(),
+                        saved_status: "session saved".to_string(),
+                        tool_logs: Vec::new(),
+                        elapsed_ms: 200,
+                        inference_performance: None,
+                    }));
+                }
+                _ => {
+                    // Follow-up after file.read (only call_001)
+                    emit(ProviderEvent::TokenDelta("Analysis complete.".to_string()));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    let provider = GuardRetryPostFinalProvider {
+        seen_requests: seen_requests.clone(),
+    };
+
+    let _frames = app
+        .run_live_turn("analyze the code", &provider, &tui)
+        .expect("guard_retry_post_final should succeed");
+
+    // Verify call_002 was NOT executed: lib.rs should NOT appear in any session message
+    let has_lib_rs_result = app
+        .session()
+        .messages
+        .iter()
+        .any(|m| m.content.contains("lib.rs"));
+    assert!(
+        !has_lib_rs_result,
+        "post-FINAL tool call_002 (lib.rs) should NOT appear in session messages after guard retry"
+    );
+
+    // Verify guard DID fire (guard retry message present)
+    assert!(
+        app.session()
+            .messages
+            .iter()
+            .any(|m| m.content.contains("No file modifications detected")),
+        "guard retry message should be in session"
+    );
+}
+
 // ============================================================
 // normalize_http_timeout tests (Issue #146)
 // ============================================================

@@ -237,12 +237,23 @@ impl BasicAgentLoop {
 
     pub fn parse_structured_response(content: &str) -> Result<StructuredAssistantResponse, String> {
         let tool_blocks = extract_fenced_blocks(content, "ANVIL_TOOL");
+
+        // ANVIL_FINALの位置を取得（カットオフポイント）
+        let final_cutoff = content.find("```ANVIL_FINAL\n");
+
         // Try strict extraction first, fall back to lenient for unclosed blocks.
         let final_block = extract_final_block(content, "ANVIL_FINAL")
             .or_else(|| extract_final_block_lenient(content, "ANVIL_FINAL"));
 
         let mut tool_calls = Vec::new();
-        for block in tool_blocks {
+        for (offset, block) in tool_blocks {
+            // ANVIL_TOOLブロックの開始マーカー位置(offset)が
+            // ANVIL_FINALの開始マーカー位置(cutoff)と同じかそれ以降にある場合に除外
+            if let Some(cutoff) = final_cutoff
+                && offset >= cutoff
+            {
+                continue;
+            }
             tool_calls.push(parse_tool_call_block_multi_tier(&block)?);
         }
 
@@ -1024,17 +1035,18 @@ pub fn tool_protocol_system_prompt_tag_based(
     )
 }
 
-fn extract_fenced_blocks(content: &str, label: &str) -> Vec<String> {
+fn extract_fenced_blocks(content: &str, label: &str) -> Vec<(usize, String)> {
     let mut blocks = Vec::new();
     let start_marker = format!("```{label}\n");
     let end_marker = "\n```";
     let mut cursor = 0usize;
 
     while let Some(start) = content[cursor..].find(&start_marker) {
-        let block_start = cursor + start + start_marker.len();
+        let abs_start = cursor + start; // マーカーの絶対位置
+        let block_start = abs_start + start_marker.len();
         if let Some(end) = content[block_start..].find(end_marker) {
             let block_end = block_start + end;
-            blocks.push(content[block_start..block_end].to_string());
+            blocks.push((abs_start, content[block_start..block_end].to_string()));
             cursor = block_end + end_marker.len();
         } else {
             break;
