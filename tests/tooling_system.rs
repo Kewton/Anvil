@@ -4820,10 +4820,61 @@ fn file_edit_fallback_indent_mismatch() {
 
 #[test]
 fn edit_not_found_error_is_distinguishable() {
-    let err = anvil::tooling::ToolRuntimeError::EditNotFound("test".to_string());
+    let err = anvil::tooling::ToolRuntimeError::edit_not_found("test");
     assert!(err.is_edit_not_found());
+    assert_eq!(err.to_string(), "test");
+
     let io_err = anvil::tooling::ToolRuntimeError::Io("test".to_string());
     assert!(!io_err.is_edit_not_found());
+}
+
+#[test]
+fn edit_not_found_with_context_snippet() {
+    let err = anvil::tooling::ToolRuntimeError::edit_not_found_with_context(
+        "old_string not found in foo.rs",
+        "   5 | fn main() {\n   6 |     println!(\"hello\");\n   7 | }".to_string(),
+    );
+    assert!(err.is_edit_not_found());
+    // Display should only show message, not context
+    assert_eq!(err.to_string(), "old_string not found in foo.rs");
+    // context_snippet should be accessible
+    match &err {
+        anvil::tooling::ToolRuntimeError::EditNotFound {
+            context_snippet, ..
+        } => {
+            assert!(context_snippet.is_some());
+            assert!(context_snippet.as_ref().unwrap().contains("fn main()"));
+        }
+        _ => panic!("expected EditNotFound"),
+    }
+}
+
+#[test]
+fn extract_edit_context_finds_matching_line() {
+    let content = "line 1\nline 2\nfn hello() {\n    println!(\"hi\");\n}\nline 6\nline 7\nline 8\nline 9\nline 10\nline 11";
+    let old_string = "fn hello() {\n    println!(\"world\");\n}";
+    let result = anvil::tooling::extract_edit_context(content, old_string, 2);
+    assert!(
+        result.is_some(),
+        "should find context for partial first-line match"
+    );
+    let ctx = result.unwrap();
+    assert!(
+        ctx.contains("fn hello()"),
+        "context should contain matching line"
+    );
+    assert!(
+        ctx.contains("println!"),
+        "context should contain nearby lines"
+    );
+}
+
+#[test]
+fn extract_edit_context_returns_none_for_no_match() {
+    let content = "line 1\nline 2\nline 3";
+    let old_string = "nonexistent function";
+    let result = anvil::tooling::extract_edit_context(content, old_string, 5);
+    assert!(result.is_none());
 }
 
 // ===== FileReadCache unit tests =====
@@ -4851,6 +4902,195 @@ fn file_cache_miss_unknown_path() {
     let mut cache = FileReadCache::new(root);
     let result = cache.try_get(&file);
     assert!(result.is_none());
+}
+
+#[test]
+fn extract_edit_context_returns_none_for_empty_old_string() {
+    let content = "line 1\nline 2";
+    let result = anvil::tooling::extract_edit_context(content, "", 5);
+    assert!(result.is_none());
+}
+
+#[test]
+fn extract_edit_context_respects_line_count() {
+    let content = (1..=20)
+        .map(|i| format!("line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let old_string = "line 10";
+    let result = anvil::tooling::extract_edit_context(&content, old_string, 2);
+    let ctx = result.unwrap();
+    let lines: Vec<&str> = ctx.lines().collect();
+    // Should have at most 5 lines (2 before + match + 2 after)
+    assert!(
+        lines.len() <= 5,
+        "context should be limited, got {} lines",
+        lines.len()
+    );
+}
+
+#[test]
+fn edit_fallback_includes_context_on_failure() {
+    let root = std::env::temp_dir().join("anvil_edit_ctx_test");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("test.rs"),
+        "fn main() {\n    println!(\"hello\");\n}\n\nfn other() {\n    return 42;\n}\n",
+    )
+    .unwrap();
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
+    let err = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "ctx_001".to_string(),
+            spec: build_registry()
+                .get("file.edit")
+                .expect("file.edit spec")
+                .clone(),
+            input: ToolInput::FileEdit {
+                path: "./test.rs".to_string(),
+                // First line matches "fn main()" but second line differs
+                old_string: "fn main() {\n    let x = wrong;\n}".to_string(),
+                new_string: "fn main() {\n    let x = correct;\n}".to_string(),
+            },
+        })
+        .unwrap_err();
+    assert!(err.is_edit_not_found());
+    match &err {
+        anvil::tooling::ToolRuntimeError::EditNotFound {
+            context_snippet, ..
+        } => {
+            assert!(
+                context_snippet.is_some(),
+                "should include context for non-sensitive file"
+            );
+            let ctx = context_snippet.as_ref().unwrap();
+            assert!(ctx.contains("println!"), "context should show nearby code");
+        }
+        _ => panic!("expected EditNotFound"),
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn edit_fallback_no_context_for_sensitive_file() {
+    let root = std::env::temp_dir().join("anvil_edit_sensitive_test");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join(".env"),
+        "SECRET_KEY=abc123\nDB_PASSWORD=hunter2\n",
+    )
+    .unwrap();
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
+    let err = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "ctx_002".to_string(),
+            spec: build_registry()
+                .get("file.edit")
+                .expect("file.edit spec")
+                .clone(),
+            input: ToolInput::FileEdit {
+                path: "./.env".to_string(),
+                old_string: "NONEXISTENT=value".to_string(),
+                new_string: "REPLACED=value".to_string(),
+            },
+        })
+        .unwrap_err();
+    match &err {
+        anvil::tooling::ToolRuntimeError::EditNotFound {
+            context_snippet, ..
+        } => {
+            assert!(
+                context_snippet.is_none(),
+                "should NOT include context for sensitive file"
+            );
+        }
+        _ => panic!("expected EditNotFound"),
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn trailing_ws_normalized_match_succeeds() {
+    let root = std::env::temp_dir().join("anvil_trailing_ws_test");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    // File has trailing spaces on some lines
+    fs::write(root.join("test.txt"), "fn hello() {  \n    world()  \n}\n").unwrap();
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
+    let result = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "tw_001".to_string(),
+            spec: build_registry()
+                .get("file.edit")
+                .expect("file.edit spec")
+                .clone(),
+            input: ToolInput::FileEdit {
+                path: "./test.txt".to_string(),
+                // old_string without trailing spaces — should still match
+                old_string: "fn hello() {\n    world()\n}".to_string(),
+                new_string: "fn hello() {\n    universe()\n}".to_string(),
+            },
+        })
+        .expect("trailing-ws normalized edit should succeed");
+
+    assert_eq!(result.status, ToolExecutionStatus::Completed);
+    assert!(
+        result.summary.contains("trailing-ws"),
+        "summary should indicate trailing-ws fallback: {}",
+        result.summary
+    );
+    let content = fs::read_to_string(root.join("test.txt")).unwrap();
+    assert!(
+        content.contains("universe()"),
+        "content should be edited: {content}"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn edit_not_found_error_payload_contains_context_but_summary_does_not() {
+    // Verify that when EditNotFound has context_snippet,
+    // the Display (used for summary) does NOT include it
+    let err = anvil::tooling::ToolRuntimeError::edit_not_found_with_context(
+        "file.edit: old_string not found in foo.rs",
+        "   3 | fn main() {".to_string(),
+    );
+    let display = err.to_string();
+    assert!(
+        !display.contains("fn main()"),
+        "Display should NOT contain context"
+    );
+    assert!(
+        display.contains("old_string not found"),
+        "Display should contain the error message"
+    );
+}
+
+#[test]
+fn is_sensitive_file_from_tooling() {
+    assert!(anvil::tooling::is_sensitive_file(".env"));
+    assert!(anvil::tooling::is_sensitive_file("secrets.yaml"));
+    assert!(!anvil::tooling::is_sensitive_file("src/main.rs"));
+}
+
+#[test]
+fn edit_not_found_factory_without_context() {
+    let err = anvil::tooling::ToolRuntimeError::edit_not_found("no match");
+    match &err {
+        anvil::tooling::ToolRuntimeError::EditNotFound {
+            message,
+            context_snippet,
+        } => {
+            assert_eq!(message, "no match");
+            assert!(context_snippet.is_none());
+        }
+        _ => panic!("expected EditNotFound"),
+    }
 }
 
 #[test]
