@@ -1218,11 +1218,13 @@ fn agentic_loop_multi_iteration_tool_calls_then_final_answer() {
         .expect("multi-iteration agentic loop should succeed");
 
     let requests = seen_requests.borrow();
-    // Should have made 3 calls: initial + 2 follow-ups
+    // Should have made 4 calls: initial + 2 follow-ups + 1 ANVIL_FINAL guard retry
+    // (file.read only, no file.write/file.edit => guard fires once on the plain-text
+    // final answer, then accepts the retry response unconditionally)
     assert_eq!(
         requests.len(),
-        3,
-        "expected 3 provider calls for multi-iteration loop"
+        4,
+        "expected 4 provider calls for multi-iteration loop (includes guard retry)"
     );
 
     // Final frame should show Done state
@@ -3332,6 +3334,309 @@ fn session_record_deserialization_with_used_tools() {
     assert_eq!(record.used_tools.len(), 2);
     assert!(record.used_tools.contains("web.fetch"));
     assert!(record.used_tools.contains("agent.explore"));
+}
+
+// ---------------------------------------------------------------------------
+// ANVIL_FINAL guard tests (Issue #144)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn anvil_final_guard_fires_when_no_file_modifications_detected() {
+    // Scenario: LLM outputs ANVIL_FINAL with file.read only (no file.write/edit).
+    // Guard should fire once, causing an extra LLM call, then accept.
+    let root = common::unique_test_dir("guard_fire");
+    let mut config = common::build_config_in(root.clone());
+    config.mode.approval_required = false;
+    let provider_ctx =
+        anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
+    let mut app = anvil::app::App::new(
+        config,
+        provider_ctx,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("app should initialize");
+    let tui = Tui::new();
+
+    std::fs::create_dir_all(root.join("src")).expect("create src dir");
+    std::fs::write(root.join("src/main.rs"), "fn main() {}").expect("write main.rs");
+
+    let seen_requests = Rc::new(RefCell::new(Vec::new()));
+
+    struct GuardFireProvider {
+        seen_requests: Rc<RefCell<Vec<ProviderTurnRequest>>>,
+    }
+
+    impl ProviderClient for GuardFireProvider {
+        fn stream_turn(
+            &self,
+            request: &ProviderTurnRequest,
+            emit: &mut dyn FnMut(ProviderEvent),
+        ) -> Result<(), ProviderTurnError> {
+            let call_index = self.seen_requests.borrow().len();
+            self.seen_requests.borrow_mut().push(request.clone());
+
+            match call_index {
+                0 => {
+                    // Initial: file.read only + ANVIL_FINAL
+                    emit(ProviderEvent::Agent(AgentEvent::Done {
+                        status: "Done. session saved".to_string(),
+                        assistant_message: concat!(
+                            "```ANVIL_TOOL\n",
+                            "{\"id\":\"call_001\",\"tool\":\"file.read\",\"path\":\"./src/main.rs\"}\n",
+                            "```\n",
+                            "```ANVIL_FINAL\n",
+                            "Read the source file.\n",
+                            "```\n"
+                        )
+                        .to_string(),
+                        completion_summary: "turn 1".to_string(),
+                        saved_status: "session saved".to_string(),
+                        tool_logs: Vec::new(),
+                        elapsed_ms: 0,
+                        inference_performance: None,
+                    }));
+                }
+                1 => {
+                    // Agentic follow-up after file.read: plain text final answer
+                    // (no more tool calls, guard will fire)
+                    emit(ProviderEvent::TokenDelta(
+                        "Here is my plan to improve the code.".to_string(),
+                    ));
+                }
+                _ => {
+                    // Guard retry: accept unconditionally
+                    emit(ProviderEvent::TokenDelta(
+                        "Actually, no changes needed.".to_string(),
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    let provider = GuardFireProvider {
+        seen_requests: seen_requests.clone(),
+    };
+
+    let _frames = app
+        .run_live_turn("improve the code", &provider, &tui)
+        .expect("guard fire scenario should succeed");
+
+    let requests = seen_requests.borrow();
+    // Initial call + agentic follow-up + guard retry = 3 calls
+    assert_eq!(
+        requests.len(),
+        3,
+        "expected 3 provider calls: initial + follow-up + guard retry"
+    );
+
+    // Verify the guard retry message was injected into the session
+    assert!(
+        app.session()
+            .messages
+            .iter()
+            .any(|m| m.content.contains("No file modifications detected")),
+        "guard retry message should be in session"
+    );
+}
+
+#[test]
+fn anvil_final_guard_does_not_fire_when_file_write_was_executed() {
+    // Scenario: LLM writes a file, then outputs ANVIL_FINAL.
+    // Guard should NOT fire because touched_files is non-empty.
+    let root = common::unique_test_dir("guard_skip");
+    let mut config = common::build_config_in(root.clone());
+    config.mode.approval_required = false;
+    let provider_ctx =
+        anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
+    let mut app = anvil::app::App::new(
+        config,
+        provider_ctx,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("app should initialize");
+    let tui = Tui::new();
+
+    let seen_requests = Rc::new(RefCell::new(Vec::new()));
+
+    let provider = RecordingProvider {
+        seen_requests: seen_requests.clone(),
+        events: vec![ProviderEvent::Agent(AgentEvent::Done {
+            status: "Done. session saved".to_string(),
+            assistant_message: concat!(
+                "```ANVIL_TOOL\n",
+                "{\"id\":\"call_001\",\"tool\":\"file.write\",\"path\":\"./output.txt\",\"content\":\"hello world\"}\n",
+                "```\n",
+                "```ANVIL_FINAL\n",
+                "Created output.txt with the requested content.\n",
+                "```\n"
+            )
+            .to_string(),
+            completion_summary: "turn 1".to_string(),
+            saved_status: "session saved".to_string(),
+            tool_logs: Vec::new(),
+            elapsed_ms: 0,
+            inference_performance: None,
+        })],
+        followup_events: vec![ProviderEvent::TokenDelta(
+            "All done.".to_string(),
+        )],
+        error: None,
+    };
+
+    let _frames = app
+        .run_live_turn("create a file", &provider, &tui)
+        .expect("file write scenario should succeed");
+
+    let requests = seen_requests.borrow();
+    // Initial call + 1 follow-up (no guard retry since file was written)
+    assert_eq!(
+        requests.len(),
+        2,
+        "expected 2 provider calls: initial + follow-up (no guard retry)"
+    );
+
+    // Verify guard retry message was NOT injected
+    assert!(
+        !app.session()
+            .messages
+            .iter()
+            .any(|m| m.content.contains("No file modifications detected")),
+        "guard retry message should NOT be in session when file was written"
+    );
+
+    // Verify the file was actually written
+    let content =
+        std::fs::read_to_string(root.join("output.txt")).expect("output.txt should exist");
+    assert!(content.contains("hello world"));
+}
+
+#[test]
+fn anvil_final_guard_handle_structured_done_fires_for_plan_only_response() {
+    // Scenario: Done event with ANVIL_FINAL but no tool calls (plan only).
+    // Guard should fire via handle_structured_done path.
+    let root = common::unique_test_dir("guard_done_path");
+    let mut config = common::build_config_in(root.clone());
+    config.mode.approval_required = false;
+    let provider_ctx =
+        anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
+    let mut app = anvil::app::App::new(
+        config,
+        provider_ctx,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("app should initialize");
+    let tui = Tui::new();
+
+    let seen_requests = Rc::new(RefCell::new(Vec::new()));
+
+    struct GuardDoneProvider {
+        seen_requests: Rc<RefCell<Vec<ProviderTurnRequest>>>,
+    }
+
+    impl ProviderClient for GuardDoneProvider {
+        fn stream_turn(
+            &self,
+            request: &ProviderTurnRequest,
+            emit: &mut dyn FnMut(ProviderEvent),
+        ) -> Result<(), ProviderTurnError> {
+            let call_index = self.seen_requests.borrow().len();
+            self.seen_requests.borrow_mut().push(request.clone());
+
+            match call_index {
+                0 => {
+                    // Done event with ANVIL_FINAL but NO tool calls (plan-only)
+                    emit(ProviderEvent::Agent(AgentEvent::Done {
+                        status: "Done. session saved".to_string(),
+                        assistant_message: concat!(
+                            "```ANVIL_FINAL\n",
+                            "Here is my plan:\n1. Create a new module\n2. Add tests\n",
+                            "```\n"
+                        )
+                        .to_string(),
+                        completion_summary: "plan only".to_string(),
+                        saved_status: "session saved".to_string(),
+                        tool_logs: Vec::new(),
+                        elapsed_ms: 100,
+                        inference_performance: None,
+                    }));
+                }
+                _ => {
+                    // Guard retry: LLM responds with plain text
+                    emit(ProviderEvent::TokenDelta(
+                        "I apologize, let me implement the changes now.".to_string(),
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    let provider = GuardDoneProvider {
+        seen_requests: seen_requests.clone(),
+    };
+
+    let _frames = app
+        .run_live_turn("implement the feature", &provider, &tui)
+        .expect("guard done path should succeed");
+
+    let requests = seen_requests.borrow();
+    // Initial call + guard retry = 2 calls
+    assert_eq!(
+        requests.len(),
+        2,
+        "expected 2 provider calls: initial + guard retry via handle_structured_done"
+    );
+
+    // Verify the guard retry message was injected
+    assert!(
+        app.session()
+            .messages
+            .iter()
+            .any(|m| m.content.contains("No file modifications detected")),
+        "guard retry message should be in session"
+    );
+}
+
+#[test]
+fn anvil_final_guard_prompt_tool_rules_contains_implementation_guidance() {
+    // Verify that the system prompt includes the implementation guidance text
+    let app = common::build_app();
+    let tui = Tui::new();
+    let seen_requests = Rc::new(RefCell::new(Vec::new()));
+    let provider = RecordingProvider {
+        seen_requests: seen_requests.clone(),
+        events: vec![
+            ProviderEvent::Agent(AgentEvent::Thinking {
+                status: "Thinking".to_string(),
+                plan_items: vec![],
+                active_index: None,
+                reasoning_summary: vec![],
+                elapsed_ms: 0,
+            }),
+            ProviderEvent::Agent(AgentEvent::Done {
+                status: "Done. session saved".to_string(),
+                assistant_message: "ok".to_string(),
+                completion_summary: "done".to_string(),
+                saved_status: "session saved".to_string(),
+                tool_logs: Vec::new(),
+                elapsed_ms: 0,
+                inference_performance: None,
+            }),
+        ],
+        followup_events: Vec::new(),
+        error: None,
+    };
+
+    let mut app = app;
+    let _ = app.run_live_turn("test", &provider, &tui);
+
+    let requests = seen_requests.borrow();
+    let system_prompt = &requests[0].messages[0].content;
+    assert!(
+        system_prompt.contains("you must complete the actual file modifications"),
+        "system prompt should contain implementation guidance from PROMPT_TOOL_RULES"
+    );
 }
 
 // ============================================================

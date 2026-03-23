@@ -6,6 +6,7 @@
 pub mod agentic;
 pub mod cli;
 mod context;
+pub(crate) mod edit_fail_tracker;
 pub mod loop_detector;
 pub mod mock;
 pub mod plan;
@@ -149,6 +150,8 @@ pub struct App {
     last_estimated_prompt_tokens: Option<usize>,
     /// System prompt verbosity tier, determined at session start.
     prompt_tier: PromptTier,
+    /// Tracks consecutive file.edit failures per path for recovery hints.
+    edit_fail_tracker: edit_fail_tracker::EditFailTracker,
     /// File read cache: reduces redundant file.read calls within a session.
     file_read_cache: Arc<Mutex<crate::tooling::file_cache::FileReadCache>>,
 }
@@ -437,6 +440,7 @@ impl App {
             calibration_store: TokenCalibrationStore::new(),
             last_estimated_prompt_tokens: None,
             prompt_tier,
+            edit_fail_tracker: edit_fail_tracker::EditFailTracker::new(3),
             file_read_cache,
         })
     }

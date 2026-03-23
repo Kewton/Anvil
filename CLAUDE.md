@@ -106,7 +106,7 @@ src/
 │   └── tag_spec.rs      # ツールタグ仕様テーブル（TOOL_TAG_SPECS）
 ├── app/
 │   ├── mod.rs           # アプリケーションオーケストレータ
-│   ├── agentic.rs       # agenticツール実行ループ
+│   ├── agentic.rs       # agenticツール実行ループ（ANVIL_FINALガード・再試行ロジック含む）
 │   ├── cli.rs           # CLI入力ループ
 │   ├── context.rs       # コンテキスト注入（@file展開・サンドボックス検証）
 │   ├── loop_detector.rs # ループ検出（リングバッファ・段階的対応）
