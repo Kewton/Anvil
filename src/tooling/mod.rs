@@ -1300,7 +1300,8 @@ impl LocalToolExecutor {
         if let Some(parent) = resolved.parent() {
             fs::create_dir_all(parent).map_err(|err| {
                 ToolRuntimeError::Io(format!(
-                    "file.write failed to create parent {}: {err}",
+                    "file.write failed for {} (parent creation failed for {}): {err}",
+                    resolved.display(),
                     parent.display()
                 ))
             })?;
