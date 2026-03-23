@@ -3638,3 +3638,50 @@ fn anvil_final_guard_prompt_tool_rules_contains_implementation_guidance() {
         "system prompt should contain implementation guidance from PROMPT_TOOL_RULES"
     );
 }
+
+// ============================================================
+// normalize_http_timeout tests (Issue #146)
+// ============================================================
+
+#[test]
+fn normalize_http_timeout_zero_returns_default() {
+    use anvil::provider::{DEFAULT_HTTP_TIMEOUT_SECS, normalize_http_timeout};
+    assert_eq!(normalize_http_timeout(0), DEFAULT_HTTP_TIMEOUT_SECS);
+}
+
+#[test]
+fn normalize_http_timeout_below_min_returns_min() {
+    use anvil::provider::normalize_http_timeout;
+    assert_eq!(normalize_http_timeout(1), 10);
+    assert_eq!(normalize_http_timeout(9), 10);
+}
+
+#[test]
+fn normalize_http_timeout_above_max_returns_max() {
+    use anvil::provider::normalize_http_timeout;
+    assert_eq!(normalize_http_timeout(3601), 3600);
+    assert_eq!(normalize_http_timeout(u64::MAX), 3600);
+}
+
+#[test]
+fn normalize_http_timeout_normal_values_unchanged() {
+    use anvil::provider::normalize_http_timeout;
+    assert_eq!(normalize_http_timeout(10), 10);
+    assert_eq!(normalize_http_timeout(300), 300);
+    assert_eq!(normalize_http_timeout(3600), 3600);
+}
+
+#[test]
+fn transport_with_timeout_constructs_successfully() {
+    use anvil::provider::ReqwestHttpTransport;
+    let _transport = ReqwestHttpTransport::with_timeout(60);
+}
+
+#[test]
+fn transport_with_timeout_and_shutdown_flag_constructs_successfully() {
+    use anvil::provider::ReqwestHttpTransport;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    let flag = Arc::new(AtomicBool::new(false));
+    let _transport = ReqwestHttpTransport::with_timeout_and_shutdown_flag(120, flag);
+}
