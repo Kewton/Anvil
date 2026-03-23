@@ -217,7 +217,7 @@ impl EffectiveConfig {
                 api_key: None,
                 context_window: 200_000,
                 context_budget: None,
-                max_agent_iterations: 10,
+                max_agent_iterations: DEFAULT_MAX_AGENT_ITERATIONS,
                 max_console_messages: 5,
                 auto_compact_threshold: 64,
                 tool_result_max_chars: 8000,
@@ -228,8 +228,8 @@ impl EffectiveConfig {
                 tag_protocol: None,
                 prompt_tier: None,
                 smart_compact_threshold_ratio: 0.75,
-                subagent_max_iterations: 10,
-                subagent_timeout_secs: 120,
+                subagent_max_iterations: DEFAULT_SUBAGENT_MAX_ITERATIONS,
+                subagent_timeout_secs: DEFAULT_SUBAGENT_TIMEOUT_SECS,
                 http_timeout_secs: DEFAULT_HTTP_TIMEOUT_SECS,
             },
             mode: ModeConfig {
@@ -679,11 +679,8 @@ impl EffectiveConfig {
     /// Clamp sub-agent iteration/timeout settings.
     /// If 0, restore to default values. Enforce upper bounds.
     fn clamp_subagent_settings(&mut self) {
-        const MAX_SUBAGENT_ITERATIONS: u32 = 100;
-        const MAX_SUBAGENT_TIMEOUT_SECS: u64 = 3600;
-
         if self.runtime.subagent_max_iterations == 0 {
-            self.runtime.subagent_max_iterations = 10;
+            self.runtime.subagent_max_iterations = DEFAULT_SUBAGENT_MAX_ITERATIONS;
         } else if self.runtime.subagent_max_iterations > MAX_SUBAGENT_ITERATIONS {
             let old = self.runtime.subagent_max_iterations;
             self.runtime.subagent_max_iterations = MAX_SUBAGENT_ITERATIONS;
@@ -692,7 +689,7 @@ impl EffectiveConfig {
             );
         }
         if self.runtime.subagent_timeout_secs == 0 {
-            self.runtime.subagent_timeout_secs = 120;
+            self.runtime.subagent_timeout_secs = DEFAULT_SUBAGENT_TIMEOUT_SECS;
         } else if self.runtime.subagent_timeout_secs > MAX_SUBAGENT_TIMEOUT_SECS {
             let old = self.runtime.subagent_timeout_secs;
             self.runtime.subagent_timeout_secs = MAX_SUBAGENT_TIMEOUT_SECS;
@@ -726,6 +723,11 @@ impl EffectiveConfig {
 
 const MAX_PROJECT_INSTRUCTIONS_CHARS: usize = 4000;
 const MIN_CONTEXT_WINDOW: u32 = 1000;
+const DEFAULT_MAX_AGENT_ITERATIONS: usize = 30;
+const DEFAULT_SUBAGENT_MAX_ITERATIONS: u32 = 20;
+const DEFAULT_SUBAGENT_TIMEOUT_SECS: u64 = 120;
+const MAX_SUBAGENT_ITERATIONS: u32 = 100;
+const MAX_SUBAGENT_TIMEOUT_SECS: u64 = 3600;
 const MIN_AGENT_ITERATIONS: usize = 1;
 const MAX_AGENT_ITERATIONS: usize = 100;
 
