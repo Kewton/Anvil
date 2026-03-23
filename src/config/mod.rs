@@ -81,6 +81,12 @@ pub struct RuntimeConfig {
     pub loop_detection_threshold: usize,
     /// HTTP request timeout in seconds (Issue #146).
     pub http_timeout_secs: u64,
+    /// Edit/write fallback strategy: edit-first or write-first (Issue #158).
+    pub edit_strategy: crate::app::edit_fail_tracker::EditStrategy,
+    /// Consecutive edit failures before re-read hint (Issue #158).
+    pub edit_reread_threshold: u32,
+    /// Consecutive edit failures before write fallback hint (Issue #158).
+    pub edit_write_fallback_threshold: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -234,6 +240,9 @@ impl EffectiveConfig {
                 subagent_timeout_secs: DEFAULT_SUBAGENT_TIMEOUT_SECS,
                 loop_detection_threshold: 3,
                 http_timeout_secs: DEFAULT_HTTP_TIMEOUT_SECS,
+                edit_strategy: crate::app::edit_fail_tracker::EditStrategy::EditFirst,
+                edit_reread_threshold: 3,
+                edit_write_fallback_threshold: 5,
             },
             mode: ModeConfig {
                 prompt_source: PromptSource::Interactive,
@@ -334,6 +343,9 @@ impl EffectiveConfig {
             "ANVIL_LOOP_DETECTION_THRESHOLD",
             "ANVIL_HTTP_TIMEOUT",
             "ANVIL_CURL_TIMEOUT",
+            "ANVIL_EDIT_STRATEGY",
+            "ANVIL_EDIT_REREAD_THRESHOLD",
+            "ANVIL_EDIT_WRITE_FALLBACK_THRESHOLD",
         ] {
             if let Ok(value) = std::env::var(key) {
                 map.insert(key.to_string(), value);
@@ -430,6 +442,13 @@ impl EffectiveConfig {
         // Prompt tier override
         if let Some(ref v) = cli.prompt_tier {
             self.runtime.prompt_tier = Some(v.clone());
+        }
+
+        // Edit strategy override (Issue #158)
+        if let Some(ref v) = cli.edit_strategy {
+            self.runtime.edit_strategy = v
+                .parse::<crate::app::edit_fail_tracker::EditStrategy>()
+                .map_err(ConfigError::ValidationError)?;
         }
 
         // --session flag: override session file path
@@ -572,6 +591,29 @@ impl EffectiveConfig {
                         .parse()
                         .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
                 }
+                "edit_strategy" | "ANVIL_EDIT_STRATEGY" => {
+                    self.runtime.edit_strategy = value
+                        .parse::<crate::app::edit_fail_tracker::EditStrategy>()
+                        .map_err(ConfigError::ValidationError)?;
+                }
+                "edit_reread_threshold" | "ANVIL_EDIT_REREAD_THRESHOLD" => {
+                    let v: u32 = value
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                    if !(1..=20).contains(&v) {
+                        return Err(ConfigError::InvalidNumericValue(value.clone()));
+                    }
+                    self.runtime.edit_reread_threshold = v;
+                }
+                "edit_write_fallback_threshold" | "ANVIL_EDIT_WRITE_FALLBACK_THRESHOLD" => {
+                    let v: u32 = value
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                    if !(1..=20).contains(&v) {
+                        return Err(ConfigError::InvalidNumericValue(value.clone()));
+                    }
+                    self.runtime.edit_write_fallback_threshold = v;
+                }
                 _ => {}
             }
         }
@@ -599,6 +641,7 @@ impl EffectiveConfig {
         self.clamp_smart_compact_ratio();
         self.clamp_subagent_settings();
         self.clamp_loop_detection_threshold();
+        self.clamp_edit_thresholds();
         self.clamp_http_timeout();
         Ok(())
     }
@@ -715,6 +758,16 @@ impl EffectiveConfig {
 
     fn clamp_loop_detection_threshold(&mut self) {
         self.runtime.loop_detection_threshold = self.runtime.loop_detection_threshold.clamp(2, 20);
+    }
+
+    fn clamp_edit_thresholds(&mut self) {
+        self.runtime.edit_reread_threshold = self.runtime.edit_reread_threshold.clamp(1, 20);
+        self.runtime.edit_write_fallback_threshold =
+            self.runtime.edit_write_fallback_threshold.clamp(1, 20);
+        // Ensure write_fallback > reread
+        if self.runtime.edit_write_fallback_threshold <= self.runtime.edit_reread_threshold {
+            self.runtime.edit_write_fallback_threshold = self.runtime.edit_reread_threshold + 2;
+        }
     }
 
     pub fn validate_for_test(&mut self) -> Result<(), ConfigError> {
@@ -972,6 +1025,12 @@ impl std::fmt::Debug for RuntimeConfig {
                 &self.smart_compact_threshold_ratio,
             )
             .field("http_timeout_secs", &self.http_timeout_secs)
+            .field("edit_strategy", &self.edit_strategy)
+            .field("edit_reread_threshold", &self.edit_reread_threshold)
+            .field(
+                "edit_write_fallback_threshold",
+                &self.edit_write_fallback_threshold,
+            )
             .finish()
     }
 }

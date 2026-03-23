@@ -85,6 +85,10 @@ pub struct CliArgs {
     #[arg(long = "timeout")]
     pub timeout: Option<u64>,
 
+    /// Edit/write fallback strategy (edit-first|write-first)
+    #[arg(long = "edit-strategy")]
+    pub edit_strategy: Option<String>,
+
     /// Prompt tier override (full|compact|tiny)
     #[arg(long = "prompt-tier")]
     pub prompt_tier: Option<String>,
