@@ -155,7 +155,7 @@ fn generate_file_write_diff(
 ///
 /// This does not require any file I/O — it works purely on the provided
 /// strings.
-fn generate_file_edit_diff(old_string: &str, new_string: &str) -> Option<String> {
+pub(crate) fn generate_file_edit_diff(old_string: &str, new_string: &str) -> Option<String> {
     if old_string == new_string {
         return Some("(no changes)".to_string());
     }

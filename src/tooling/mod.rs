@@ -1157,6 +1157,15 @@ impl LocalToolExecutor {
             .is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed))
     }
 
+    /// Invalidate the file cache entry for the given path (best-effort).
+    fn invalidate_cache(&self, resolved: &Path) {
+        if let Some(ref cache_arc) = self.file_cache
+            && let Ok(mut cache) = cache_arc.lock()
+        {
+            cache.invalidate(resolved);
+        }
+    }
+
     pub fn execute(
         &mut self,
         request: ToolExecutionRequest,
@@ -1388,12 +1397,7 @@ impl LocalToolExecutor {
                 resolved.display()
             ))
         })?;
-        // Invalidate cache after write
-        if let Some(ref cache_arc) = self.file_cache
-            && let Ok(mut cache) = cache_arc.lock()
-        {
-            cache.invalidate(&resolved);
-        }
+        self.invalidate_cache(&resolved);
         let diff = format!("wrote {} bytes to {}", content.len(), path);
         Ok(build_completed_result_with_diff(
             request,
@@ -1403,6 +1407,13 @@ impl LocalToolExecutor {
             started,
             Some(diff),
         ))
+    }
+
+    /// file.edit成功時のdiffフィードバック用Payloadを生成
+    fn build_edit_diff_payload(old_string: &str, new_string: &str) -> ToolExecutionPayload {
+        diff::generate_file_edit_diff(old_string, new_string)
+            .map(ToolExecutionPayload::Text)
+            .unwrap_or(ToolExecutionPayload::None)
     }
 
     fn execute_file_edit(
@@ -1450,25 +1461,15 @@ impl LocalToolExecutor {
                 resolved.display()
             ))
         })?;
-        // Invalidate cache after edit
-        if let Some(ref cache_arc) = self.file_cache
-            && let Ok(mut cache) = cache_arc.lock()
-        {
-            cache.invalidate(&resolved);
-        }
-        let diff = format!(
-            "{}: replaced {} chars with {} chars",
-            path,
-            old_string.len(),
-            new_string.len()
-        );
+        self.invalidate_cache(&resolved);
+        let diff = diff::generate_file_edit_diff(old_string, new_string);
         Ok(build_completed_result_with_diff(
             request,
             path.to_string(),
-            ToolExecutionPayload::None,
+            Self::build_edit_diff_payload(old_string, new_string),
             vec![resolved.display().to_string()],
             started,
-            Some(diff),
+            diff,
         ))
     }
 
@@ -1509,25 +1510,15 @@ impl LocalToolExecutor {
                         resolved.display()
                     ))
                 })?;
-                // Invalidate cache after anchor edit
-                if let Some(ref cache_arc) = self.file_cache
-                    && let Ok(mut cache) = cache_arc.lock()
-                {
-                    cache.invalidate(&resolved);
-                }
-                let diff = format!(
-                    "{}: replaced {} chars with {} chars",
-                    path,
-                    params.old_content.len(),
-                    params.new_content.len()
-                );
+                self.invalidate_cache(&resolved);
+                let diff = diff::generate_file_edit_diff(&params.old_content, &params.new_content);
                 Ok(build_completed_result_with_diff(
                     request,
                     path.to_string(),
-                    ToolExecutionPayload::None,
+                    Self::build_edit_diff_payload(&params.old_content, &params.new_content),
                     vec![resolved.display().to_string()],
                     started,
-                    Some(diff),
+                    diff,
                 ))
             }
             0 => Err(ToolRuntimeError::edit_not_found(format!(
@@ -1660,13 +1651,16 @@ impl LocalToolExecutor {
                 resolved.display()
             ))
         })?;
+        self.invalidate_cache(&resolved);
+        let diff = diff::generate_file_edit_diff(old_string, new_string);
 
-        Ok(build_completed_result(
+        Ok(build_completed_result_with_diff(
             request,
             path.to_string(),
-            ToolExecutionPayload::None,
+            Self::build_edit_diff_payload(old_string, new_string),
             vec![resolved.display().to_string()],
             started,
+            diff,
         ))
     }
 

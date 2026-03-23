@@ -423,6 +423,8 @@ impl App {
         let phase_explore = config.runtime.phase_explore_threshold;
         let phase_force = config.runtime.phase_force_transition_threshold;
         let phase_completion = config.runtime.phase_completion_read_threshold;
+        let edit_reread_threshold = config.runtime.edit_reread_threshold;
+        let edit_write_fallback_threshold = config.runtime.edit_write_fallback_threshold;
 
         Ok(Self {
             tools,
@@ -449,7 +451,10 @@ impl App {
             calibration_store: TokenCalibrationStore::new(),
             last_estimated_prompt_tokens: None,
             prompt_tier,
-            edit_fail_tracker: edit_fail_tracker::EditFailTracker::new(3),
+            edit_fail_tracker: edit_fail_tracker::EditFailTracker::new(
+                edit_reread_threshold,
+                edit_write_fallback_threshold,
+            ),
             phase_estimator: phase_estimator::PhaseEstimator::new(
                 phase_explore,
                 phase_force,
@@ -628,6 +633,11 @@ impl App {
             .strip_prefix(cwd)
             .ok()
             .map(|rel| rel.to_string_lossy().into_owned())
+    }
+
+    /// Prepare for write fallback: take checkpoint snapshot (Issue #158, DR4-007).
+    fn prepare_write_fallback(&mut self) {
+        self.checkpoint_stack.mark();
     }
 
     /// Check whether a shutdown has been requested via the shared flag.
