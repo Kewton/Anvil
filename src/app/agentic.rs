@@ -99,12 +99,34 @@ fn execute_parallel_group_standalone(
                         let tool_call_id = request.tool_call_id.clone();
                         let tool_name = request.spec.name.clone();
                         let result = executor.execute(request.clone()).unwrap_or_else(|err| {
+                            let (summary, payload) = match &err {
+                                crate::tooling::ToolRuntimeError::EditNotFound {
+                                    message,
+                                    context_snippet,
+                                } => {
+                                    let payload_text = if let Some(ctx) = context_snippet {
+                                        format!(
+                                            "{message}\n\n--- File context (nearby lines) ---\n{ctx}"
+                                        )
+                                    } else {
+                                        message.clone()
+                                    };
+                                    (
+                                        message.clone(),
+                                        ToolExecutionPayload::Text(payload_text),
+                                    )
+                                }
+                                other => {
+                                    let msg = other.to_string();
+                                    (msg.clone(), ToolExecutionPayload::Text(msg))
+                                }
+                            };
                             ToolExecutionResult {
                                 tool_call_id,
                                 tool_name,
                                 status: ToolExecutionStatus::Failed,
-                                summary: err.to_string(),
-                                payload: ToolExecutionPayload::Text(err.to_string()),
+                                summary,
+                                payload,
                                 artifacts: Vec::new(),
                                 elapsed_ms: 0,
                             }
@@ -943,6 +965,33 @@ impl App {
             }
         }
 
+        // Edit fail tracker: track consecutive file.edit failures (Issue #143)
+        let mut edit_hint: Option<String> = None;
+        if result.tool_name == "file.edit" {
+            if result.status == ToolExecutionStatus::Failed {
+                // Extract path from summary (format: "file.edit: ... in {path}. ...")
+                if let Some(path) = extract_edit_path_from_summary(&result.summary)
+                    .filter(|p| self.edit_fail_tracker.record_failure(p))
+                {
+                    let count = self.edit_fail_tracker.failure_count(&path);
+                    edit_hint = Some(format!(
+                        "\n\n[Anvil hint] file.edit has failed {count} consecutive \
+                         times for '{path}'. Consider using file.read to get the \
+                         current content, then file.write to replace the entire file."
+                    ));
+                }
+            } else if result.status == ToolExecutionStatus::Completed {
+                // Reset on success — extract path from artifacts
+                if let Some(artifact) = result.artifacts.first() {
+                    let path_str = std::path::Path::new(artifact)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(artifact);
+                    self.edit_fail_tracker.record_success(path_str);
+                }
+            }
+        }
+
         // Working memory: track errors (Issue #130)
         if result.status == ToolExecutionStatus::Failed {
             let sanitized_error = if result.tool_name == "shell.exec" {
@@ -958,12 +1007,14 @@ impl App {
         }
 
         let is_error = result.status == ToolExecutionStatus::Failed;
-        let mut msg = SessionMessage::new(
-            MessageRole::Tool,
-            &result.tool_name,
-            format_tool_result_message(result, self.config.runtime.tool_result_max_chars),
-        )
-        .with_id(self.next_message_id("tool"));
+        let mut formatted =
+            format_tool_result_message(result, self.config.runtime.tool_result_max_chars);
+        // Append edit recovery hint if consecutive failures detected
+        if let Some(hint) = edit_hint {
+            formatted.push_str(&hint);
+        }
+        let mut msg = SessionMessage::new(MessageRole::Tool, &result.tool_name, formatted)
+            .with_id(self.next_message_id("tool"));
         msg.is_error = is_error;
 
         // Attach image paths for Image payloads so the agent layer can
@@ -1102,6 +1153,24 @@ pub fn truncate_with_head_tail(content: &str, max_chars: usize, head_pct: usize)
         "{}\n\n... [{} chars truncated, {} chars total] ...\n\n{}",
         head, omitted, total_chars, tail
     )
+}
+
+/// Extract the file path from a file.edit error summary.
+/// Looks for patterns like "... in {path}. ..." or "... in {path},"
+fn extract_edit_path_from_summary(summary: &str) -> Option<String> {
+    // Pattern: "file.edit: ... in {path}. ..."
+    // or "file.edit: ... in {path}, ..."
+    let in_idx = summary.find(" in ")?;
+    let after_in = &summary[in_idx + 4..];
+    let end = after_in
+        .find(". ")
+        .or_else(|| after_in.find(", "))
+        .unwrap_or(after_in.len());
+    let path = after_in[..end].trim();
+    if path.is_empty() {
+        return None;
+    }
+    Some(path.to_string())
 }
 
 /// Format a tool execution result into a message that the LLM can interpret.
