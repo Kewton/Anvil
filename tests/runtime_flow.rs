@@ -557,8 +557,14 @@ fn system_prompt_includes_confirm_class_guidance() {
 
 #[test]
 fn build_subagent_system_prompt_explore_contains_expected_tools() {
-    use anvil::agent::subagent::{SubAgentKind, build_subagent_system_prompt};
-    let prompt = build_subagent_system_prompt(&SubAgentKind::Explore, false);
+    use anvil::agent::subagent::{
+        SubAgentKind, SubAgentPromptOptions, build_subagent_system_prompt,
+    };
+    let opts = SubAgentPromptOptions {
+        offline: false,
+        ui_language: None,
+    };
+    let prompt = build_subagent_system_prompt(&SubAgentKind::Explore, &opts);
     assert!(
         prompt.contains("file.read"),
         "Explore prompt should include file.read"
@@ -583,8 +589,14 @@ fn build_subagent_system_prompt_explore_contains_expected_tools() {
 
 #[test]
 fn build_subagent_system_prompt_plan_contains_expected_tools() {
-    use anvil::agent::subagent::{SubAgentKind, build_subagent_system_prompt};
-    let prompt = build_subagent_system_prompt(&SubAgentKind::Plan, false);
+    use anvil::agent::subagent::{
+        SubAgentKind, SubAgentPromptOptions, build_subagent_system_prompt,
+    };
+    let opts = SubAgentPromptOptions {
+        offline: false,
+        ui_language: None,
+    };
+    let prompt = build_subagent_system_prompt(&SubAgentKind::Plan, &opts);
     assert!(
         prompt.contains("file.read"),
         "Plan prompt should include file.read"
@@ -613,9 +625,15 @@ fn build_subagent_system_prompt_plan_contains_expected_tools() {
 
 #[test]
 fn build_subagent_system_prompt_includes_json_format() {
-    use anvil::agent::subagent::{SubAgentKind, build_subagent_system_prompt};
+    use anvil::agent::subagent::{
+        SubAgentKind, SubAgentPromptOptions, build_subagent_system_prompt,
+    };
 
-    let explore = build_subagent_system_prompt(&SubAgentKind::Explore, false);
+    let opts = SubAgentPromptOptions {
+        offline: false,
+        ui_language: None,
+    };
+    let explore = build_subagent_system_prompt(&SubAgentKind::Explore, &opts);
     assert!(
         explore.contains("found_files"),
         "Explore prompt should mention found_files JSON field"
@@ -633,7 +651,7 @@ fn build_subagent_system_prompt_includes_json_format() {
         "Explore prompt should mention confidence JSON field"
     );
 
-    let plan = build_subagent_system_prompt(&SubAgentKind::Plan, false);
+    let plan = build_subagent_system_prompt(&SubAgentKind::Plan, &opts);
     assert!(
         plan.contains("found_files"),
         "Plan prompt should mention found_files JSON field"
@@ -664,6 +682,121 @@ fn system_prompt_includes_web_tools_even_with_empty_used_tools() {
     assert!(
         prompt.contains("web.fetch"),
         "fresh session system prompt must include web.fetch description (Issue #114)"
+    );
+}
+
+// --- Issue #160: ANVIL_FINAL後のツール呼び出し除外テスト ---
+
+#[test]
+fn post_final_tool_excluded() {
+    // TC1: ANVIL_TOOL → ANVIL_FINAL → ANVIL_TOOL — only the first tool should be included
+    let response = anvil::agent::BasicAgentLoop::parse_structured_response(concat!(
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_001\",\"tool\":\"file.read\",\"path\":\"./src/main.rs\"}\n",
+        "```\n",
+        "```ANVIL_FINAL\n",
+        "Read the file.\n",
+        "```\n",
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_002\",\"tool\":\"file.read\",\"path\":\"./src/lib.rs\"}\n",
+        "```\n"
+    ))
+    .expect("parsing should succeed");
+
+    assert_eq!(
+        response.tool_calls.len(),
+        1,
+        "only pre-FINAL tool should remain"
+    );
+    assert_eq!(response.tool_calls[0].tool_call_id, "call_001");
+}
+
+#[test]
+fn pre_final_tools_preserved() {
+    // TC2: ANVIL_TOOL → ANVIL_TOOL → ANVIL_FINAL — both tools should be included
+    let response = anvil::agent::BasicAgentLoop::parse_structured_response(concat!(
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_001\",\"tool\":\"file.read\",\"path\":\"./src/main.rs\"}\n",
+        "```\n",
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_002\",\"tool\":\"file.read\",\"path\":\"./src/lib.rs\"}\n",
+        "```\n",
+        "```ANVIL_FINAL\n",
+        "Read both files.\n",
+        "```\n"
+    ))
+    .expect("parsing should succeed");
+
+    assert_eq!(
+        response.tool_calls.len(),
+        2,
+        "both pre-FINAL tools should remain"
+    );
+    assert_eq!(response.tool_calls[0].tool_call_id, "call_001");
+    assert_eq!(response.tool_calls[1].tool_call_id, "call_002");
+}
+
+#[test]
+fn no_final_existing_compat() {
+    // TC3: ANVIL_TOOL → ANVIL_TOOL, no ANVIL_FINAL — both tools should be included
+    let response = anvil::agent::BasicAgentLoop::parse_structured_response(concat!(
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_001\",\"tool\":\"file.read\",\"path\":\"./src/main.rs\"}\n",
+        "```\n",
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_002\",\"tool\":\"file.read\",\"path\":\"./src/lib.rs\"}\n",
+        "```\n"
+    ))
+    .expect("parsing should succeed");
+
+    assert_eq!(
+        response.tool_calls.len(),
+        2,
+        "all tools should remain without ANVIL_FINAL"
+    );
+    assert_eq!(response.tool_calls[0].tool_call_id, "call_001");
+    assert_eq!(response.tool_calls[1].tool_call_id, "call_002");
+}
+
+#[test]
+fn unclosed_final_filters() {
+    // TC4: ANVIL_TOOL → ANVIL_FINAL (unclosed) → ANVIL_TOOL — only the first tool
+    let response = anvil::agent::BasicAgentLoop::parse_structured_response(concat!(
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_001\",\"tool\":\"file.read\",\"path\":\"./src/main.rs\"}\n",
+        "```\n",
+        "```ANVIL_FINAL\n",
+        "Read the file.\n",
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_002\",\"tool\":\"file.read\",\"path\":\"./src/lib.rs\"}\n",
+        "```\n"
+    ))
+    .expect("parsing should succeed");
+
+    assert_eq!(
+        response.tool_calls.len(),
+        1,
+        "only pre-FINAL tool should remain with unclosed FINAL"
+    );
+    assert_eq!(response.tool_calls[0].tool_call_id, "call_001");
+}
+
+#[test]
+fn all_tools_after_final() {
+    // TC5: ANVIL_FINAL → ANVIL_TOOL — tool_calls should be empty
+    let response = anvil::agent::BasicAgentLoop::parse_structured_response(concat!(
+        "```ANVIL_FINAL\n",
+        "Done with everything.\n",
+        "```\n",
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_001\",\"tool\":\"file.read\",\"path\":\"./src/main.rs\"}\n",
+        "```\n"
+    ))
+    .expect("parsing should succeed");
+
+    assert!(
+        response.tool_calls.is_empty(),
+        "all post-FINAL tools should be excluded"
     );
 }
 

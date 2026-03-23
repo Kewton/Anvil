@@ -131,6 +131,7 @@ fn execute_parallel_group_standalone(
                                 payload,
                                 artifacts: Vec::new(),
                                 elapsed_ms: 0,
+                                diff_summary: None,
                             }
                         });
                         completed.fetch_add(1, Ordering::Relaxed);
@@ -160,6 +161,7 @@ fn execute_parallel_group_standalone(
                                 payload: ToolExecutionPayload::None,
                                 artifacts: Vec::new(),
                                 elapsed_ms: 0,
+                                diff_summary: None,
                             },
                         ));
                     }
@@ -210,6 +212,7 @@ impl App {
                     ),
                     artifacts: Vec::new(),
                     elapsed_ms: 0,
+                    diff_summary: None,
                 });
                 continue;
             }
@@ -324,9 +327,12 @@ impl App {
         let mut total_tool_count = 0usize;
         let mut all_tool_log_views: Vec<ToolLogView> = Vec::new();
         let mut final_guard_retries: u8 = 0;
+        let mut fallback_completed = false;
 
         // Reset loop detector at the start of each top-level turn (Issue #145)
         self.loop_detector.reset();
+        // Reset phase estimator per-turn counters (Issue #159)
+        self.phase_estimator.reset();
 
         for iteration in 0..max_iterations {
             // Check shutdown flag before tool execution
@@ -415,13 +421,14 @@ impl App {
                 self.config.mode.interactive,
             );
 
-            let system_prompt = self.build_dynamic_system_prompt();
-            let request = BasicAgentLoop::build_turn_request(
+            let (system_prompt, calibration_ratio) = self.prepare_turn_context();
+            let (request, _) = BasicAgentLoop::build_turn_request_calibrated(
                 self.effective_model().to_string(),
                 &self.session,
                 self.provider.capabilities.streaming && self.config.runtime.stream,
                 self.effective_context_window(),
                 &system_prompt,
+                calibration_ratio,
             );
 
             let mut next_token_buffer = String::new();
@@ -499,11 +506,29 @@ impl App {
             if next_structured.tool_calls.is_empty() {
                 // ANVIL_FINAL guard: check if any file modifications were made
                 if self.should_activate_final_guard(final_guard_retries) {
+                    // ANVIL_FINAL was detected → record observation (Issue #159)
+                    self.phase_estimator.observe_anvil_final();
                     self.inject_final_guard_retry();
                     final_guard_retries += 1;
                     current = next_structured;
                     continue;
                 }
+
+                // Fallback completion detection (Issue #159):
+                // When ANVIL_FINAL was never observed, check if tool patterns
+                // indicate the agent has finished (write succeeded + verification reads + empty response).
+                if let super::phase_estimator::PhaseAction::FallbackComplete =
+                    self.phase_estimator.check_empty_response()
+                {
+                    tracing::info!("Phase estimator: fallback completion detected");
+                    self.record_assistant_output(
+                        self.next_message_id("assistant"),
+                        next_structured.final_response,
+                    )?;
+                    fallback_completed = true;
+                    break;
+                }
+
                 // No more tool calls — this is the final answer
                 self.record_assistant_output(
                     self.next_message_id("assistant"),
@@ -521,10 +546,17 @@ impl App {
             .with_status(status.to_string())
             .with_tool_logs(all_tool_log_views)
             .with_completion_summary(
-                format!(
-                    "Executed {} tool call(s) across agentic loop. {}",
-                    total_tool_count, saved_status
-                ),
+                if fallback_completed {
+                    format!(
+                        "Executed {} tool call(s) across agentic loop (fallback completion). {}",
+                        total_tool_count, saved_status
+                    )
+                } else {
+                    format!(
+                        "Executed {} tool call(s) across agentic loop. {}",
+                        total_tool_count, saved_status
+                    )
+                },
                 saved_status.to_string(),
             )
             .with_elapsed_ms(elapsed_ms);
@@ -575,6 +607,7 @@ impl App {
                         payload: ToolExecutionPayload::Text(OFFLINE_BLOCK_PAYLOAD.to_string()),
                         artifacts: Vec::new(),
                         elapsed_ms: 0,
+                        diff_summary: None,
                     },
                 ));
                 continue;
@@ -596,7 +629,10 @@ impl App {
                     );
                 } else {
                     let summary = tool_call_approval_summary(call);
-                    let diff_preview = generate_diff_preview(&self.config.paths.cwd, &call.input);
+                    let diff_options =
+                        crate::tooling::diff::DiffOptions::from_runtime(&self.config.runtime);
+                    let diff_preview =
+                        generate_diff_preview(&self.config.paths.cwd, &call.input, &diff_options);
                     let approved = prompt_inline_approval(&summary, diff_preview.as_deref());
                     if !approved {
                         failed_results
@@ -669,6 +705,7 @@ impl App {
                 payload: ToolExecutionPayload::Text(err.to_string()),
                 artifacts: Vec::new(),
                 elapsed_ms: 0,
+                diff_summary: None,
             });
 
         // Remove checkpoint if tool execution failed.
@@ -702,6 +739,7 @@ impl App {
                 payload: ToolExecutionPayload::None,
                 artifacts: Vec::new(),
                 elapsed_ms: 0,
+                diff_summary: None,
             };
         };
 
@@ -727,6 +765,7 @@ impl App {
             payload,
             artifacts: Vec::new(),
             elapsed_ms: started.elapsed().as_millis(),
+            diff_summary: None,
         }
     }
 
@@ -791,6 +830,7 @@ impl App {
                                     payload: crate::tooling::ToolExecutionPayload::None,
                                     artifacts: Vec::new(),
                                     elapsed_ms: 0,
+                                    diff_summary: None,
                                 },
                             ));
                         }
@@ -861,6 +901,7 @@ impl App {
                     payload: ToolExecutionPayload::Text(msg.clone()),
                     artifacts: vec![],
                     elapsed_ms: 0,
+                    diff_summary: None,
                 })
             }
             _ => None,
@@ -1000,8 +1041,17 @@ impl App {
         // Phase 4: Sort by index, record results, run PostToolUse hooks (DR2-004)
         indexed_results.sort_by_key(|(idx, _)| *idx);
         let mut results: Vec<ToolExecutionResult> = Vec::with_capacity(indexed_results.len());
+        let mut phase_action = super::phase_estimator::PhaseAction::Continue;
         for (_, result) in indexed_results {
             self.record_tool_result(&result);
+            // Phase estimator: record tool call pattern (Issue #159)
+            let success = result.status == ToolExecutionStatus::Completed;
+            let pa = self
+                .phase_estimator
+                .record_tool_call(&result.tool_name, success);
+            if !matches!(pa, super::phase_estimator::PhaseAction::Continue) {
+                phase_action = pa;
+            }
 
             // Emit folded tool result to stderr for interactive sessions
             if interactive {
@@ -1056,6 +1106,34 @@ impl App {
             results.push(warning_result);
         }
 
+        // Phase estimator: inject force-transition message if needed (Issue #159).
+        // Skip if LoopDetector already issued a warning (priority: LoopDetector > PhaseEstimator).
+        if matches!(
+            worst_loop_action,
+            None | Some(super::loop_detector::LoopAction::Continue)
+        ) && let super::phase_estimator::PhaseAction::ForceTransition(msg) = phase_action
+        {
+            // Context window protection: skip if usage >= 90%
+            let usage = crate::contracts::ContextUsageView {
+                estimated_tokens: self.session.estimated_token_count(),
+                max_tokens: self.effective_context_window(),
+            };
+            if usage.usage_ratio() < 0.9 {
+                let transition_result = ToolExecutionResult {
+                    tool_call_id: "phase_estimator_transition".to_string(),
+                    tool_name: "system.phase_estimator".to_string(),
+                    status: ToolExecutionStatus::Completed,
+                    summary: msg.clone(),
+                    payload: ToolExecutionPayload::Text(msg),
+                    artifacts: vec![],
+                    elapsed_ms: 0,
+                    diff_summary: None,
+                };
+                self.record_tool_result(&transition_result);
+                results.push(transition_result);
+            }
+        }
+
         self.persist_session(crate::contracts::AppEvent::SessionSaved)?;
         Ok((results, worst_loop_action))
     }
@@ -1065,8 +1143,11 @@ impl App {
         // Track tool usage for dynamic system prompt generation (Issue #73)
         self.session.used_tools.insert(result.tool_name.clone());
 
-        // Working memory: track touched files (file-mutating tools only) (Issue #130)
-        let is_file_tool = matches!(result.tool_name.as_str(), "file.write" | "file.edit");
+        // Working memory: track touched files (file-mutating tools only) (Issue #130, #157)
+        let is_file_tool = matches!(
+            result.tool_name.as_str(),
+            "file.write" | "file.edit" | "file.edit_anchor"
+        );
         if is_file_tool
             && result.status == ToolExecutionStatus::Completed
             && !result.summary.contains("[rolled back]")
@@ -1079,34 +1160,63 @@ impl App {
                     tracing::warn!("skip touched_files update for non-relative artifact");
                 }
             }
+
+            // Update recent_diffs with diff_summary (Issue #157)
+            if let Some(ref diff) = result.diff_summary {
+                let current = self
+                    .session
+                    .working_memory
+                    .recent_diffs
+                    .clone()
+                    .unwrap_or_default();
+                let updated = if current.is_empty() {
+                    diff.clone()
+                } else {
+                    format!("{}\n{}", current, diff)
+                };
+                self.session.working_memory.set_recent_diffs(Some(updated));
+            }
         }
 
-        // Edit fail tracker: track consecutive file.edit failures (Issue #143)
+        // Edit fail tracker: track consecutive file.edit/file.edit_anchor failures (Issue #143, #158)
         let mut edit_hint: Option<String> = None;
-        if result.tool_name == "file.edit" {
+        if result.tool_name == "file.edit" || result.tool_name == "file.edit_anchor" {
             if result.status == ToolExecutionStatus::Failed {
-                // Extract path from summary (format: "file.edit: ... in {path}. ...")
-                if let Some(path) = extract_edit_path_from_summary(&result.summary)
-                    .filter(|p| self.edit_fail_tracker.record_failure(p))
-                {
+                if let Some(raw_path) = extract_edit_path_from_summary(&result.summary) {
+                    let path = resolve_edit_tracker_path(&raw_path);
+                    let action = self.edit_fail_tracker.record_failure(&path);
                     let count = self.edit_fail_tracker.failure_count(&path);
-                    edit_hint = Some(format!(
-                        "\n\n[Anvil hint] file.edit has failed {count} consecutive \
-                         times for '{path}'. Consider using file.read to get the \
-                         current content, then file.write to replace the entire file."
-                    ));
+                    match action {
+                        crate::app::edit_fail_tracker::EditFallbackAction::Continue => {}
+                        crate::app::edit_fail_tracker::EditFallbackAction::ReRead => {
+                            edit_hint = Some(format!(
+                                "\n\n[Anvil hint] file.edit has failed {count} consecutive \
+                                 times for '{path}'. Use file.read to get the current file \
+                                 content, then retry file.edit with the correct old_string."
+                            ));
+                        }
+                        crate::app::edit_fail_tracker::EditFallbackAction::WriteFallback => {
+                            self.prepare_write_fallback();
+                            edit_hint = Some(format!(
+                                "\n\n[Anvil hint] file.edit has failed {count} consecutive \
+                                 times for '{path}'. Consider using file.read to get the \
+                                 current content, then file.write to replace the entire file \
+                                 with the corrected version."
+                            ));
+                        }
+                    }
                 }
             } else if result.status == ToolExecutionStatus::Completed {
-                // Reset on success — extract path from artifacts
+                // Reset on success — use consistent path resolution
                 if let Some(artifact) = result.artifacts.first() {
-                    let path_str = std::path::Path::new(artifact)
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or(artifact);
-                    self.edit_fail_tracker.record_success(path_str);
+                    let path_str = resolve_edit_tracker_path(artifact);
+                    self.edit_fail_tracker.record_success(&path_str);
                 }
             }
         }
+
+        // Write fail tracker: track consecutive file.write failures (Issue #161)
+        let write_hint = self.update_write_tracker(result);
 
         // Working memory: track errors (Issue #130)
         if result.status == ToolExecutionStatus::Failed {
@@ -1129,6 +1239,10 @@ impl App {
         if let Some(hint) = edit_hint {
             formatted.push_str(&hint);
         }
+        // Append write recovery hint if consecutive failures detected
+        if let Some(hint) = write_hint {
+            formatted.push_str(&hint);
+        }
         let mut msg = SessionMessage::new(MessageRole::Tool, &result.tool_name, formatted)
             .with_id(self.next_message_id("tool"));
         msg.is_error = is_error;
@@ -1139,6 +1253,33 @@ impl App {
             msg = msg.with_image_paths(vec![source_path.clone()]);
         }
         self.session.push_message(msg);
+    }
+
+    /// Track consecutive file.write failures and return a hint if threshold reached.
+    fn update_write_tracker(&mut self, result: &ToolExecutionResult) -> Option<String> {
+        if result.tool_name != "file.write" {
+            return None;
+        }
+        if result.status == ToolExecutionStatus::Failed {
+            if let Some(path) = extract_write_path_from_summary(&result.summary)
+                .filter(|p| self.write_fail_tracker.record_failure(p))
+            {
+                let count = self.write_fail_tracker.failure_count(&path);
+                let safe_path = crate::session::sanitize_for_prompt_entry(&path);
+                return Some(format!(
+                    "\n\n[Anvil hint] file.write has failed {count} consecutive \
+                     times for '{safe_path}'. Please check the error message carefully. \
+                     Consider: (1) verifying the file path is correct, \
+                     (2) splitting the content into smaller files, \
+                     (3) using file.edit for partial modifications instead."
+                ));
+            }
+        } else if result.status == ToolExecutionStatus::Completed
+            && let Some(artifact) = result.artifacts.first()
+        {
+            self.write_fail_tracker.record_success(artifact);
+        }
+        None
     }
 
     /// Execute a single retry LLM turn after ANVIL_FINAL guard activation.
@@ -1160,13 +1301,14 @@ impl App {
         provider_client: &C,
     ) -> Result<Vec<String>, AppError> {
         // Build request and call LLM for one more turn
-        let system_prompt = self.build_dynamic_system_prompt();
-        let request = BasicAgentLoop::build_turn_request(
+        let (system_prompt, calibration_ratio) = self.prepare_turn_context();
+        let (request, _) = BasicAgentLoop::build_turn_request_calibrated(
             self.effective_model().to_string(),
             &self.session,
             self.provider.capabilities.streaming && self.config.runtime.stream,
             self.effective_context_window(),
             &system_prompt,
+            calibration_ratio,
         );
 
         let spinner = Spinner::start(
@@ -1293,6 +1435,8 @@ impl App {
             if BasicAgentLoop::is_complete_structured_response(assistant_message)
                 && self.should_activate_final_guard(0)
             {
+                // ANVIL_FINAL detected → record observation (Issue #159)
+                self.phase_estimator.observe_anvil_final();
                 self.inject_final_guard_retry();
                 // Record the assistant message that triggered the guard
                 self.record_assistant_output(self.next_message_id("assistant"), assistant_message)?;
@@ -1416,6 +1560,12 @@ pub fn truncate_with_head_tail(content: &str, max_chars: usize, head_pct: usize)
 
 /// Extract the file path from a file.edit error summary.
 /// Looks for patterns like "... in {path}. ..." or "... in {path},"
+/// Normalize a file path for consistent EditFailTracker key usage (Issue #158).
+/// Used by both failure (from summary) and success (from artifact) paths.
+fn resolve_edit_tracker_path(raw_path: &str) -> String {
+    raw_path.trim_start_matches("./").to_string()
+}
+
 fn extract_edit_path_from_summary(summary: &str) -> Option<String> {
     // Pattern: "file.edit: ... in {path}. ..."
     // or "file.edit: ... in {path}, ..."
@@ -1430,6 +1580,25 @@ fn extract_edit_path_from_summary(summary: &str) -> Option<String> {
         return None;
     }
     Some(path.to_string())
+}
+
+/// Extract the file path from a file.write error summary.
+/// Looks for patterns like "file.write failed for {path}: {err}"
+/// or "file.write failed for {path} (parent creation failed for {parent}): {err}"
+fn extract_write_path_from_summary(summary: &str) -> Option<String> {
+    let prefix = "file.write failed for ";
+    let rest = summary.strip_prefix(prefix)?;
+
+    // Priority 1: check for the parent-creation fixed marker first
+    let parent_marker = " (parent creation failed for ";
+    if let Some(marker_pos) = rest.find(parent_marker) {
+        return Some(rest[..marker_pos].to_string());
+    }
+
+    // Priority 2: normal format — use rsplit_once to find the LAST ": " boundary,
+    // which avoids mis-splitting on paths containing ": " (rare but legal on Unix).
+    // The error portion after the last ": " is the OS I/O error message.
+    rest.rsplit_once(": ").map(|(path, _err)| path.to_string())
 }
 
 /// Format a tool execution result into a message that the LLM can interpret.
@@ -1484,6 +1653,7 @@ fn build_failed_result(
         payload: crate::tooling::ToolExecutionPayload::None,
         artifacts: Vec::new(),
         elapsed_ms: 0,
+        diff_summary: None,
     }
 }
 
@@ -1656,5 +1826,32 @@ mod trust_tests {
             false,
             &trusted_tools,
         ));
+    }
+
+    #[test]
+    fn test_extract_write_path_from_summary() {
+        let summary = "file.write failed for /tmp/foo.rs: Permission denied";
+        assert_eq!(
+            extract_write_path_from_summary(summary),
+            Some("/tmp/foo.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_write_path_parent_fail() {
+        let summary = "file.write failed for /tmp/dir/foo.rs (parent creation failed for /tmp/dir): No such file or directory";
+        assert_eq!(
+            extract_write_path_from_summary(summary),
+            Some("/tmp/dir/foo.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_write_path_invalid() {
+        assert_eq!(extract_write_path_from_summary("some random error"), None);
+        assert_eq!(
+            extract_write_path_from_summary("file.edit: something in foo.rs. blah"),
+            None
+        );
     }
 }

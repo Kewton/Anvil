@@ -9,9 +9,11 @@ mod context;
 pub(crate) mod edit_fail_tracker;
 pub mod loop_detector;
 pub mod mock;
+pub mod phase_estimator;
 pub mod plan;
 pub mod policy;
 pub mod render;
+pub(crate) mod write_fail_tracker;
 
 use crate::agent::BasicAgentLoop;
 use crate::agent::{AgentEvent, AgentRuntime, PendingTurnState, ProjectLanguage, PromptTier};
@@ -152,6 +154,10 @@ pub struct App {
     prompt_tier: PromptTier,
     /// Tracks consecutive file.edit failures per path for recovery hints.
     edit_fail_tracker: edit_fail_tracker::EditFailTracker,
+    /// Phase estimator for fallback phase control (Issue #159).
+    phase_estimator: phase_estimator::PhaseEstimator,
+    /// Tracks consecutive file.write failures per path for recovery hints.
+    write_fail_tracker: write_fail_tracker::WriteFailTracker,
     /// File read cache: reduces redundant file.read calls within a session.
     file_read_cache: Arc<Mutex<crate::tooling::file_cache::FileReadCache>>,
 }
@@ -414,6 +420,11 @@ impl App {
         };
 
         let loop_detection_threshold = config.runtime.loop_detection_threshold;
+        let phase_explore = config.runtime.phase_explore_threshold;
+        let phase_force = config.runtime.phase_force_transition_threshold;
+        let phase_completion = config.runtime.phase_completion_read_threshold;
+        let edit_reread_threshold = config.runtime.edit_reread_threshold;
+        let edit_write_fallback_threshold = config.runtime.edit_write_fallback_threshold;
 
         Ok(Self {
             tools,
@@ -440,7 +451,16 @@ impl App {
             calibration_store: TokenCalibrationStore::new(),
             last_estimated_prompt_tokens: None,
             prompt_tier,
-            edit_fail_tracker: edit_fail_tracker::EditFailTracker::new(3),
+            edit_fail_tracker: edit_fail_tracker::EditFailTracker::new(
+                edit_reread_threshold,
+                edit_write_fallback_threshold,
+            ),
+            phase_estimator: phase_estimator::PhaseEstimator::new(
+                phase_explore,
+                phase_force,
+                phase_completion,
+            ),
+            write_fail_tracker: write_fail_tracker::WriteFailTracker::new(2),
             file_read_cache,
         })
     }
@@ -484,6 +504,68 @@ impl App {
 
     pub(crate) fn config(&self) -> &EffectiveConfig {
         &self.config
+    }
+
+    /// Prepare turn context: system prompt generation, pruning pre-check,
+    /// context_notice update, and Critical-level warning injection.
+    /// Returns (system_prompt, calibration_ratio).
+    fn prepare_turn_context(&mut self) -> (String, f64) {
+        use crate::contracts::tokens::{ContentKind, estimate_tokens_calibrated};
+
+        let calibration_ratio = self.calibration_store.get_ratio(self.effective_model());
+
+        // 1. Preliminary system prompt (context_notice may be from previous turn)
+        let preliminary_prompt = self.build_dynamic_system_prompt();
+        let system_prompt_tokens =
+            estimate_tokens_calibrated(&preliminary_prompt, ContentKind::Text, calibration_ratio);
+
+        // 2. Pruning pre-check
+        let context_window = self.effective_context_window();
+        let (pruned_count, selected_tokens) = BasicAgentLoop::estimate_pruned_message_count(
+            &self.session,
+            context_window,
+            system_prompt_tokens,
+            calibration_ratio,
+        );
+
+        // 3. Update context_notice
+        let old_notice = self.session.working_memory.context_notice.clone();
+        if pruned_count > 0 {
+            let notice = format!(
+                "{} earlier messages were omitted due to context limits. \
+                 Files listed in 'Touched files' have already been modified. \
+                 Do not re-read or re-edit them unless necessary.",
+                pruned_count
+            );
+            self.session.working_memory.set_context_notice(Some(notice));
+        } else {
+            self.session.working_memory.set_context_notice(None);
+        }
+
+        // 4. Regenerate prompt if context_notice changed
+        let system_prompt = if self.session.working_memory.context_notice != old_notice {
+            self.build_dynamic_system_prompt()
+        } else {
+            preliminary_prompt
+        };
+
+        // 5. Critical-level warning injection
+        let estimated_total = system_prompt_tokens + selected_tokens;
+        let usage = ContextUsageView {
+            estimated_tokens: estimated_total,
+            max_tokens: context_window,
+        };
+        let mut final_prompt = system_prompt;
+        if usage.warning_level() == Some(ContextWarningLevel::Critical) {
+            final_prompt.push_str(
+                "\n\n## CRITICAL: Context limit approaching\n\
+                 Context usage exceeds 90%. Prioritize completing pending file \
+                 changes and report progress via ANVIL_FINAL. Avoid reading \
+                 files already listed in Touched files above.",
+            );
+        }
+
+        (final_prompt, calibration_ratio)
     }
 
     /// Build a dynamic system prompt based on current session state.
@@ -533,6 +615,13 @@ impl App {
             );
         }
 
+        // Language constraint (Issue #162)
+        {
+            use crate::config::{effective_ui_language_code, language_constraint_prompt};
+            let lang = effective_ui_language_code(self.config.runtime.ui_language.as_deref());
+            prompt.push_str(&language_constraint_prompt(lang));
+        }
+
         // Working memory injection (Issue #130)
         if let Some(wm_prompt) = self.session.working_memory.format_for_prompt() {
             prompt.push_str("\n\n");
@@ -551,6 +640,11 @@ impl App {
             .strip_prefix(cwd)
             .ok()
             .map(|rel| rel.to_string_lossy().into_owned())
+    }
+
+    /// Prepare for write fallback: take checkpoint snapshot (Issue #158, DR4-007).
+    fn prepare_write_fallback(&mut self) {
+        self.checkpoint_stack.mark();
     }
 
     /// Check whether a shutdown has been requested via the shared flag.
@@ -861,8 +955,7 @@ impl App {
         )?;
         self.begin_live_turn_state()?;
 
-        let system_prompt = self.build_dynamic_system_prompt();
-        let calibration_ratio = self.calibration_store.get_ratio(self.effective_model());
+        let (system_prompt, calibration_ratio) = self.prepare_turn_context();
         let (request, estimated_prompt_tokens) = BasicAgentLoop::build_turn_request_calibrated(
             self.effective_model().to_string(),
             &self.session,
@@ -1305,9 +1398,12 @@ impl App {
                             .find(|tc| tc.tool_call_id == *tool_call_id)
                     })
                     .and_then(|tc| {
+                        let diff_options =
+                            crate::tooling::diff::DiffOptions::from_runtime(&self.config.runtime);
                         crate::tooling::diff::generate_diff_preview(
                             &self.config.paths.cwd,
                             &tc.input,
+                            &diff_options,
                         )
                     });
                 let snapshot = AppStateSnapshot::new(RuntimeState::AwaitingApproval)

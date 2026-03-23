@@ -85,6 +85,10 @@ pub struct CliArgs {
     #[arg(long = "timeout")]
     pub timeout: Option<u64>,
 
+    /// Edit/write fallback strategy (edit-first|write-first)
+    #[arg(long = "edit-strategy")]
+    pub edit_strategy: Option<String>,
+
     /// Prompt tier override (full|compact|tiny)
     #[arg(long = "prompt-tier")]
     pub prompt_tier: Option<String>,
@@ -104,6 +108,14 @@ pub struct CliArgs {
     /// Not parsed from CLI args directly.
     #[arg(skip)]
     pub tag_protocol: Option<bool>,
+
+    /// Maximum line count for file.write on existing files (0 = disabled)
+    #[arg(long = "safe-write-max-lines")]
+    pub safe_write_max_lines: Option<usize>,
+
+    /// Deletion ratio threshold for diff warning (0.0-1.0)
+    #[arg(long = "safe-write-deletion-ratio")]
+    pub safe_write_deletion_ratio: Option<f64>,
 }
 
 impl CliArgs {

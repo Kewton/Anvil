@@ -137,11 +137,22 @@ You are a Plan sub-agent specializing in implementation planning.
 - Note: Offline mode is active. Web access is unavailable.
 "#;
 
+/// Options for sub-agent system prompt generation (Issue #162).
+pub struct SubAgentPromptOptions<'a> {
+    pub offline: bool,
+    pub ui_language: Option<&'a str>,
+}
+
 /// Build a system prompt for a sub-agent of the given kind.
 ///
-/// When `offline` is `true`, web-related tool descriptions and prompts
+/// When `opts.offline` is `true`, web-related tool descriptions and prompts
 /// are excluded from the Plan sub-agent prompt.
-pub fn build_subagent_system_prompt(kind: &SubAgentKind, offline: bool) -> String {
+pub fn build_subagent_system_prompt(
+    kind: &SubAgentKind,
+    opts: &SubAgentPromptOptions<'_>,
+) -> String {
+    use crate::config::{effective_ui_language_code, language_constraint_prompt};
+
     let mut prompt = String::new();
     prompt.push_str(SUBAGENT_PROTOCOL_BASE);
     match kind {
@@ -156,17 +167,22 @@ pub fn build_subagent_system_prompt(kind: &SubAgentKind, offline: bool) -> Strin
         SubAgentKind::Plan => {
             prompt.push_str(TOOL_DESC_FILE_READ);
             prompt.push_str(TOOL_DESC_FILE_SEARCH);
-            if !offline {
+            if !opts.offline {
                 prompt.push_str(TOOL_DESC_WEB_FETCH);
             }
             prompt.push_str(TOOL_DESC_GIT_STATUS);
-            prompt.push_str(if offline {
+            prompt.push_str(if opts.offline {
                 PLAN_ROLE_PROMPT_OFFLINE
             } else {
                 PLAN_ROLE_PROMPT
             });
         }
     }
+
+    // Language constraint (Issue #162)
+    let lang = effective_ui_language_code(opts.ui_language);
+    prompt.push_str(&language_constraint_prompt(lang));
+
     prompt
 }
 
@@ -220,6 +236,7 @@ impl SubAgentResult {
             payload: ToolExecutionPayload::Text(json),
             artifacts: Vec::new(),
             elapsed_ms: 0,
+            diff_summary: None,
         }
     }
 }
@@ -269,6 +286,7 @@ impl SubAgentError {
             payload: ToolExecutionPayload::Text(output),
             artifacts: Vec::new(),
             elapsed_ms: 0,
+            diff_summary: None,
         }
     }
 }
@@ -421,7 +439,11 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
         }
 
         // 3. Dedicated system prompt
-        let system_prompt = build_subagent_system_prompt(&kind, config.mode.offline);
+        let prompt_opts = SubAgentPromptOptions {
+            offline: config.mode.offline,
+            ui_language: config.runtime.ui_language.as_deref(),
+        };
+        let system_prompt = build_subagent_system_prompt(&kind, &prompt_opts);
 
         SubAgentSession {
             kind,
@@ -574,6 +596,7 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
                     payload: ToolExecutionPayload::Text(err.to_string()),
                     artifacts: Vec::new(),
                     elapsed_ms: 0,
+                    diff_summary: None,
                 });
 
             // Record tool result in the sub-agent session

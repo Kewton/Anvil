@@ -16,6 +16,42 @@ use std::{
     fmt::{Display, Formatter},
 };
 
+// ---------------------------------------------------------------------------
+// Language constants and helpers (Issue #162)
+// ---------------------------------------------------------------------------
+
+/// Default UI language fallback.
+pub const DEFAULT_UI_LANGUAGE: &str = "ja";
+
+/// Supported languages: (code, display_name).
+pub const SUPPORTED_LANGUAGES: &[(&str, &str)] = &[("ja", "Japanese"), ("en", "English")];
+
+/// Look up display name for a language code using SUPPORTED_LANGUAGES table.
+/// Returns the display name, or DEFAULT_UI_LANGUAGE's display name as fallback.
+pub fn lang_display_name(code: &str) -> &'static str {
+    SUPPORTED_LANGUAGES
+        .iter()
+        .find(|(c, _)| *c == code)
+        .map(|(_, name)| *name)
+        .unwrap_or("Japanese")
+}
+
+/// Return the effective UI language code.
+/// `None` or unsupported values fall back to [`DEFAULT_UI_LANGUAGE`].
+pub fn effective_ui_language_code(configured: Option<&str>) -> &str {
+    configured.unwrap_or(DEFAULT_UI_LANGUAGE)
+}
+
+/// Shared language constraint prompt for main/sub-agent.
+pub fn language_constraint_prompt(ui_language: &str) -> String {
+    let lang_name = lang_display_name(ui_language);
+    format!(
+        "\n\n## Language constraint\nYou MUST respond in {lang_name}. \
+         All explanations, comments, plans, and summaries must be written in {lang_name}. \
+         Do NOT switch to any other language during your response."
+    )
+}
+
 /// Determines where the user prompt originates from.
 #[derive(Debug, Clone)]
 pub enum PromptSource {
@@ -81,6 +117,26 @@ pub struct RuntimeConfig {
     pub loop_detection_threshold: usize,
     /// HTTP request timeout in seconds (Issue #146).
     pub http_timeout_secs: u64,
+    /// Phase estimator: consecutive read calls to enter "exploring" phase (Issue #159).
+    pub phase_explore_threshold: usize,
+    /// Phase estimator: consecutive read calls to force transition to implementation (Issue #159).
+    pub phase_force_transition_threshold: usize,
+    /// Phase estimator: consecutive reads after last write for fallback completion (Issue #159).
+    pub phase_completion_read_threshold: usize,
+    /// Edit/write fallback strategy: edit-first or write-first (Issue #158).
+    pub edit_strategy: crate::app::edit_fail_tracker::EditStrategy,
+    /// Consecutive edit failures before re-read hint (Issue #158).
+    pub edit_reread_threshold: u32,
+    /// Consecutive edit failures before write fallback hint (Issue #158).
+    pub edit_write_fallback_threshold: u32,
+    /// Maximum line count for file.write on existing files (0 = disabled, Issue #156).
+    pub safe_write_max_lines: usize,
+    /// Deletion ratio threshold for diff warning (0.0-1.0, Issue #156).
+    pub safe_write_deletion_ratio: f64,
+    /// UI language for LLM responses (Issue #162).
+    /// `None` means "use default language via effective_ui_language_code()".
+    /// Supported: "ja", "en".
+    pub ui_language: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -234,6 +290,15 @@ impl EffectiveConfig {
                 subagent_timeout_secs: DEFAULT_SUBAGENT_TIMEOUT_SECS,
                 loop_detection_threshold: 3,
                 http_timeout_secs: DEFAULT_HTTP_TIMEOUT_SECS,
+                phase_explore_threshold: 5,
+                phase_force_transition_threshold: 10,
+                phase_completion_read_threshold: 5,
+                edit_strategy: crate::app::edit_fail_tracker::EditStrategy::EditFirst,
+                edit_reread_threshold: 3,
+                edit_write_fallback_threshold: 5,
+                safe_write_max_lines: 500,
+                safe_write_deletion_ratio: 0.5,
+                ui_language: None,
             },
             mode: ModeConfig {
                 prompt_source: PromptSource::Interactive,
@@ -334,6 +399,12 @@ impl EffectiveConfig {
             "ANVIL_LOOP_DETECTION_THRESHOLD",
             "ANVIL_HTTP_TIMEOUT",
             "ANVIL_CURL_TIMEOUT",
+            "ANVIL_EDIT_STRATEGY",
+            "ANVIL_EDIT_REREAD_THRESHOLD",
+            "ANVIL_EDIT_WRITE_FALLBACK_THRESHOLD",
+            "ANVIL_SAFE_WRITE_MAX_LINES",
+            "ANVIL_SAFE_WRITE_DELETION_RATIO",
+            "ANVIL_UI_LANGUAGE",
         ] {
             if let Ok(value) = std::env::var(key) {
                 map.insert(key.to_string(), value);
@@ -430,6 +501,26 @@ impl EffectiveConfig {
         // Prompt tier override
         if let Some(ref v) = cli.prompt_tier {
             self.runtime.prompt_tier = Some(v.clone());
+        }
+
+        // Edit strategy override (Issue #158)
+        if let Some(ref v) = cli.edit_strategy {
+            self.runtime.edit_strategy = v
+                .parse::<crate::app::edit_fail_tracker::EditStrategy>()
+                .map_err(ConfigError::ValidationError)?;
+        }
+
+        // Safe write settings
+        if let Some(v) = cli.safe_write_max_lines {
+            self.runtime.safe_write_max_lines = v;
+        }
+        if let Some(v) = cli.safe_write_deletion_ratio {
+            if !is_valid_deletion_ratio(v) {
+                return Err(ConfigError::InvalidNumericValue(format!(
+                    "safe_write_deletion_ratio must be between 0.0 and 1.0, got {v}"
+                )));
+            }
+            self.runtime.safe_write_deletion_ratio = v;
         }
 
         // --session flag: override session file path
@@ -572,6 +663,77 @@ impl EffectiveConfig {
                         .parse()
                         .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
                 }
+                "phase_explore_threshold" | "ANVIL_PHASE_EXPLORE_THRESHOLD" => {
+                    let v: usize = value
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                    if !(2..=20).contains(&v) {
+                        return Err(ConfigError::InvalidNumericValue(value.clone()));
+                    }
+                    self.runtime.phase_explore_threshold = v;
+                }
+                "phase_force_transition_threshold" | "ANVIL_PHASE_FORCE_TRANSITION_THRESHOLD" => {
+                    let v: usize = value
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                    if !(3..=30).contains(&v) {
+                        return Err(ConfigError::InvalidNumericValue(value.clone()));
+                    }
+                    self.runtime.phase_force_transition_threshold = v;
+                }
+                "phase_completion_read_threshold" | "ANVIL_PHASE_COMPLETION_READ_THRESHOLD" => {
+                    let v: usize = value
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                    if !(2..=20).contains(&v) {
+                        return Err(ConfigError::InvalidNumericValue(value.clone()));
+                    }
+                    self.runtime.phase_completion_read_threshold = v;
+                }
+                "edit_strategy" | "ANVIL_EDIT_STRATEGY" => {
+                    self.runtime.edit_strategy = value
+                        .parse::<crate::app::edit_fail_tracker::EditStrategy>()
+                        .map_err(ConfigError::ValidationError)?;
+                }
+                "edit_reread_threshold" | "ANVIL_EDIT_REREAD_THRESHOLD" => {
+                    let v: u32 = value
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                    if !(1..=20).contains(&v) {
+                        return Err(ConfigError::InvalidNumericValue(value.clone()));
+                    }
+                    self.runtime.edit_reread_threshold = v;
+                }
+                "edit_write_fallback_threshold" | "ANVIL_EDIT_WRITE_FALLBACK_THRESHOLD" => {
+                    let v: u32 = value
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                    if !(1..=20).contains(&v) {
+                        return Err(ConfigError::InvalidNumericValue(value.clone()));
+                    }
+                    self.runtime.edit_write_fallback_threshold = v;
+                }
+                "safe_write_max_lines" | "ANVIL_SAFE_WRITE_MAX_LINES" => {
+                    self.runtime.safe_write_max_lines = value
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                }
+                "safe_write_deletion_ratio" | "ANVIL_SAFE_WRITE_DELETION_RATIO" => {
+                    let v: f64 = value
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                    if !is_valid_deletion_ratio(v) {
+                        return Err(ConfigError::InvalidNumericValue(value.clone()));
+                    }
+                    self.runtime.safe_write_deletion_ratio = v;
+                }
+                "ui_language" | "ANVIL_UI_LANGUAGE" => {
+                    self.runtime.ui_language = if value.is_empty() {
+                        None
+                    } else {
+                        Some(value.clone())
+                    };
+                }
                 _ => {}
             }
         }
@@ -599,8 +761,28 @@ impl EffectiveConfig {
         self.clamp_smart_compact_ratio();
         self.clamp_subagent_settings();
         self.clamp_loop_detection_threshold();
+        self.clamp_phase_thresholds();
+        self.clamp_edit_thresholds();
         self.clamp_http_timeout();
+        self.sanitize_ui_language();
         Ok(())
+    }
+
+    /// Validate `ui_language`: keep `None` and supported values, reset invalid to `None`.
+    fn sanitize_ui_language(&mut self) {
+        let is_supported = |code: &str| SUPPORTED_LANGUAGES.iter().any(|(c, _)| *c == code);
+        match self.runtime.ui_language.as_deref() {
+            None => {}
+            Some(code) if is_supported(code) => {}
+            Some(invalid) => {
+                eprintln!(
+                    "Warning: ui_language=\"{}\" is not supported, falling back to \"{}\"",
+                    invalid.escape_debug(),
+                    DEFAULT_UI_LANGUAGE
+                );
+                self.runtime.ui_language = None;
+            }
+        }
     }
 
     fn clamp_http_timeout(&mut self) {
@@ -717,6 +899,30 @@ impl EffectiveConfig {
         self.runtime.loop_detection_threshold = self.runtime.loop_detection_threshold.clamp(2, 20);
     }
 
+    /// Clamp phase estimator thresholds and enforce N < M constraint (Issue #159).
+    fn clamp_phase_thresholds(&mut self) {
+        self.runtime.phase_explore_threshold = self.runtime.phase_explore_threshold.clamp(2, 20);
+        self.runtime.phase_force_transition_threshold =
+            self.runtime.phase_force_transition_threshold.clamp(3, 30);
+        self.runtime.phase_completion_read_threshold =
+            self.runtime.phase_completion_read_threshold.clamp(2, 20);
+        // Enforce N < M: if explore >= force_transition, adjust force_transition.
+        if self.runtime.phase_explore_threshold >= self.runtime.phase_force_transition_threshold {
+            self.runtime.phase_force_transition_threshold =
+                (self.runtime.phase_explore_threshold + 5).min(30);
+        }
+    }
+
+    fn clamp_edit_thresholds(&mut self) {
+        self.runtime.edit_reread_threshold = self.runtime.edit_reread_threshold.clamp(1, 20);
+        self.runtime.edit_write_fallback_threshold =
+            self.runtime.edit_write_fallback_threshold.clamp(1, 20);
+        // Ensure write_fallback > reread
+        if self.runtime.edit_write_fallback_threshold <= self.runtime.edit_reread_threshold {
+            self.runtime.edit_write_fallback_threshold = self.runtime.edit_reread_threshold + 2;
+        }
+    }
+
     pub fn validate_for_test(&mut self) -> Result<(), ConfigError> {
         self.validate()
     }
@@ -747,6 +953,11 @@ const DEFAULT_SUBAGENT_TIMEOUT_SECS: u64 = 120;
 const MAX_SUBAGENT_ITERATIONS: u32 = 100;
 const MAX_SUBAGENT_TIMEOUT_SECS: u64 = 3600;
 const MIN_AGENT_ITERATIONS: usize = 1;
+
+/// Validate that a deletion ratio value is finite and within [0.0, 1.0].
+fn is_valid_deletion_ratio(v: f64) -> bool {
+    v.is_finite() && (0.0..=1.0).contains(&v)
+}
 const MAX_AGENT_ITERATIONS: usize = 100;
 
 /// Sensitive keys and their recommended environment variable names.
@@ -972,6 +1183,14 @@ impl std::fmt::Debug for RuntimeConfig {
                 &self.smart_compact_threshold_ratio,
             )
             .field("http_timeout_secs", &self.http_timeout_secs)
+            .field("edit_strategy", &self.edit_strategy)
+            .field("edit_reread_threshold", &self.edit_reread_threshold)
+            .field(
+                "edit_write_fallback_threshold",
+                &self.edit_write_fallback_threshold,
+            )
+            .field("safe_write_max_lines", &self.safe_write_max_lines)
+            .field("safe_write_deletion_ratio", &self.safe_write_deletion_ratio)
             .finish()
     }
 }
