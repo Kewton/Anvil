@@ -112,19 +112,37 @@ pub fn classify_reqwest_error(err: reqwest::Error) -> ProviderTurnError {
     }
 }
 
+/// Default HTTP request timeout in seconds.
+pub const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 300;
+
+/// Normalize timeout values shared by config validation and env fallback.
+///
+/// - 0 → `DEFAULT_HTTP_TIMEOUT_SECS` (restore default)
+/// - <10 → 10
+/// - >3600 → 3600
+/// - otherwise → unchanged
+pub fn normalize_http_timeout(timeout_secs: u64) -> u64 {
+    const MIN_HTTP_TIMEOUT_SECS: u64 = 10;
+    const MAX_HTTP_TIMEOUT_SECS: u64 = 3600;
+
+    if timeout_secs == 0 {
+        DEFAULT_HTTP_TIMEOUT_SECS
+    } else {
+        timeout_secs.clamp(MIN_HTTP_TIMEOUT_SECS, MAX_HTTP_TIMEOUT_SECS)
+    }
+}
+
 /// Read the HTTP timeout from the environment.
 ///
 /// Checks `ANVIL_HTTP_TIMEOUT` first, then falls back to `ANVIL_CURL_TIMEOUT`
-/// for backward compatibility, defaulting to 300 seconds.
+/// for backward compatibility, defaulting to `DEFAULT_HTTP_TIMEOUT_SECS`.
 pub fn http_timeout() -> u64 {
-    static TIMEOUT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *TIMEOUT.get_or_init(|| {
-        std::env::var("ANVIL_HTTP_TIMEOUT")
-            .or_else(|_| std::env::var("ANVIL_CURL_TIMEOUT"))
-            .unwrap_or_else(|_| "300".to_string())
-            .parse::<u64>()
-            .unwrap_or(300)
-    })
+    let parsed = std::env::var("ANVIL_HTTP_TIMEOUT")
+        .or_else(|_| std::env::var("ANVIL_CURL_TIMEOUT"))
+        .unwrap_or_else(|_| DEFAULT_HTTP_TIMEOUT_SECS.to_string())
+        .parse::<u64>()
+        .unwrap_or(DEFAULT_HTTP_TIMEOUT_SECS);
+    normalize_http_timeout(parsed)
 }
 
 /// HTTP transport backed by `reqwest::blocking::Client`.
@@ -144,11 +162,10 @@ impl Default for ReqwestHttpTransport {
 }
 
 impl ReqwestHttpTransport {
-    /// Create a new transport without a shutdown flag.
-    pub fn new() -> Self {
-        let timeout = http_timeout();
+    /// Create a new transport with explicit timeout.
+    pub fn with_timeout(timeout_secs: u64) -> Self {
         let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(timeout))
+            .timeout(Duration::from_secs(timeout_secs))
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("Failed to build HTTP client");
@@ -164,7 +181,22 @@ impl ReqwestHttpTransport {
         }
     }
 
-    /// Create a new transport with a shutdown flag for graceful shutdown.
+    /// Create a new transport (reads timeout from environment).
+    pub fn new() -> Self {
+        Self::with_timeout(http_timeout())
+    }
+
+    /// Create a new transport with explicit timeout and shutdown flag.
+    pub fn with_timeout_and_shutdown_flag(
+        timeout_secs: u64,
+        shutdown_flag: Arc<AtomicBool>,
+    ) -> Self {
+        let mut transport = Self::with_timeout(timeout_secs);
+        transport.shutdown_flag = Some(shutdown_flag);
+        transport
+    }
+
+    /// Create a new transport with a shutdown flag for graceful shutdown (reads timeout from environment).
     pub fn with_shutdown_flag(shutdown_flag: Arc<AtomicBool>) -> Self {
         let mut transport = Self::new();
         transport.shutdown_flag = Some(shutdown_flag);
