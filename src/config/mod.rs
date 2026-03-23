@@ -7,6 +7,7 @@
 pub mod cli_args;
 pub use cli_args::CliArgs;
 
+use crate::provider::transport::{DEFAULT_HTTP_TIMEOUT_SECS, normalize_http_timeout};
 use clap::Parser;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -78,6 +79,8 @@ pub struct RuntimeConfig {
     pub subagent_timeout_secs: u64,
     /// Loop detection threshold: number of identical tool calls before detection triggers (Issue #145).
     pub loop_detection_threshold: usize,
+    /// HTTP request timeout in seconds (Issue #146).
+    pub http_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -230,6 +233,7 @@ impl EffectiveConfig {
                 subagent_max_iterations: 10,
                 subagent_timeout_secs: 120,
                 loop_detection_threshold: 3,
+                http_timeout_secs: DEFAULT_HTTP_TIMEOUT_SECS,
             },
             mode: ModeConfig {
                 prompt_source: PromptSource::Interactive,
@@ -328,6 +332,8 @@ impl EffectiveConfig {
             "ANVIL_SUBAGENT_MAX_ITERATIONS",
             "ANVIL_SUBAGENT_TIMEOUT",
             "ANVIL_LOOP_DETECTION_THRESHOLD",
+            "ANVIL_HTTP_TIMEOUT",
+            "ANVIL_CURL_TIMEOUT",
         ] {
             if let Ok(value) = std::env::var(key) {
                 map.insert(key.to_string(), value);
@@ -414,6 +420,11 @@ impl EffectiveConfig {
         // Tag protocol flag
         if let Some(v) = cli.tag_protocol {
             self.runtime.tag_protocol = Some(v);
+        }
+
+        // HTTP timeout
+        if let Some(timeout) = cli.timeout {
+            self.runtime.http_timeout_secs = timeout;
         }
 
         // Prompt tier override
@@ -556,6 +567,11 @@ impl EffectiveConfig {
                     }
                     self.runtime.loop_detection_threshold = v;
                 }
+                "http_timeout_secs" | "ANVIL_HTTP_TIMEOUT" | "ANVIL_CURL_TIMEOUT" => {
+                    self.runtime.http_timeout_secs = value
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                }
                 _ => {}
             }
         }
@@ -583,7 +599,17 @@ impl EffectiveConfig {
         self.clamp_smart_compact_ratio();
         self.clamp_subagent_settings();
         self.clamp_loop_detection_threshold();
+        self.clamp_http_timeout();
         Ok(())
+    }
+
+    fn clamp_http_timeout(&mut self) {
+        let old = self.runtime.http_timeout_secs;
+        let normalized = normalize_http_timeout(old);
+        if normalized != old {
+            self.runtime.http_timeout_secs = normalized;
+            eprintln!("Warning: http_timeout_secs={old} adjusted to {normalized}");
+        }
     }
 
     /// Clamp smart_compact_threshold_ratio to [0.1, 0.95].
@@ -943,6 +969,7 @@ impl std::fmt::Debug for RuntimeConfig {
                 "smart_compact_threshold_ratio",
                 &self.smart_compact_threshold_ratio,
             )
+            .field("http_timeout_secs", &self.http_timeout_secs)
             .finish()
     }
 }

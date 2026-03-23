@@ -5,6 +5,7 @@
 //! [`LocalToolExecutor`] within a sandboxed workspace root.
 
 pub mod diff;
+pub mod file_cache;
 pub mod shell_policy;
 
 pub use shell_policy::{ShellPolicy, classify_shell_policy, is_network_command};
@@ -899,6 +900,7 @@ pub struct LocalToolExecutor {
     serper_api_key: Option<String>,
     shutdown_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     http_client: reqwest::blocking::Client,
+    file_cache: Option<std::sync::Arc<std::sync::Mutex<file_cache::FileReadCache>>>,
 }
 
 /// Build the shared HTTP client used by tooling (web.fetch / web.search).
@@ -943,7 +945,11 @@ impl Display for ToolRuntimeError {
 impl std::error::Error for ToolRuntimeError {}
 
 impl LocalToolExecutor {
-    pub fn new(root: impl Into<PathBuf>, config: &RuntimeConfig) -> Self {
+    pub fn new(
+        root: impl Into<PathBuf>,
+        config: &RuntimeConfig,
+        file_cache: Option<std::sync::Arc<std::sync::Mutex<file_cache::FileReadCache>>>,
+    ) -> Self {
         let interval = match config.web_search_provider {
             WebSearchProvider::DuckDuckGo => RATE_LIMIT_DUCKDUCKGO,
             WebSearchProvider::SerperApi => RATE_LIMIT_SERPER_API,
@@ -956,6 +962,7 @@ impl LocalToolExecutor {
             serper_api_key: config.serper_api_key.clone(),
             shutdown_flag: None,
             http_client: build_tooling_http_client(),
+            file_cache,
         }
     }
 
@@ -969,6 +976,7 @@ impl LocalToolExecutor {
             serper_api_key: None,
             shutdown_flag: None,
             http_client: build_tooling_http_client(),
+            file_cache: None,
         }
     }
 
@@ -1073,12 +1081,51 @@ impl LocalToolExecutor {
         if let Some(mime_type) = detect_image_mime(&resolved) {
             return self.execute_image_read(request, path, &resolved, mime_type, started);
         }
-        let content = fs::read_to_string(&resolved).map_err(|err| {
+
+        // TOCTOU defense (DR4-002): resolve canonical path ONCE and use it for both
+        // cache lookup and file read, preventing symlink swap between check and read.
+        let canonical_for_read = self
+            .file_cache
+            .as_ref()
+            .and_then(|c| c.lock().ok())
+            .and_then(|c| c.validate_canonical_path(&resolved));
+
+        // Cache check (high-level API: canonicalize + mtime internal)
+        if let Some(ref cache_arc) = self.file_cache
+            && let Ok(mut cache) = cache_arc.lock()
+            && let Some(cached) = cache.try_get(&resolved)
+        {
+            tracing::debug!(path = %path, "file.read cache hit");
+            let msg = format!(
+                "[cached] File previously read (content unchanged, {} bytes)",
+                cached.len()
+            );
+            return Ok(build_completed_result(
+                request,
+                path.to_string(),
+                ToolExecutionPayload::Text(msg),
+                vec![resolved.display().to_string()],
+                started,
+            ));
+        }
+        // Mutex poison → fall through to normal read (best-effort)
+
+        // Read from canonical path when available (TOCTOU defense), fallback to resolved
+        let read_path = canonical_for_read.as_deref().unwrap_or(&resolved);
+        let content = fs::read_to_string(read_path).map_err(|err| {
             ToolRuntimeError::Io(format!(
                 "file.read failed for {}: {err}",
                 resolved.display()
             ))
         })?;
+
+        // Cache record (high-level API: canonicalize + LRU eviction internal)
+        if let Some(ref cache_arc) = self.file_cache
+            && let Ok(mut cache) = cache_arc.lock()
+        {
+            cache.record(&resolved, content.clone());
+        }
+
         Ok(build_completed_result(
             request,
             path.to_string(),
@@ -1148,6 +1195,12 @@ impl LocalToolExecutor {
                 resolved.display()
             ))
         })?;
+        // Invalidate cache after write
+        if let Some(ref cache_arc) = self.file_cache
+            && let Ok(mut cache) = cache_arc.lock()
+        {
+            cache.invalidate(&resolved);
+        }
         Ok(build_completed_result(
             request,
             path.to_string(),
@@ -1202,6 +1255,12 @@ impl LocalToolExecutor {
                 resolved.display()
             ))
         })?;
+        // Invalidate cache after edit
+        if let Some(ref cache_arc) = self.file_cache
+            && let Ok(mut cache) = cache_arc.lock()
+        {
+            cache.invalidate(&resolved);
+        }
         Ok(build_completed_result(
             request,
             path.to_string(),
@@ -1248,6 +1307,12 @@ impl LocalToolExecutor {
                         resolved.display()
                     ))
                 })?;
+                // Invalidate cache after anchor edit
+                if let Some(ref cache_arc) = self.file_cache
+                    && let Ok(mut cache) = cache_arc.lock()
+                {
+                    cache.invalidate(&resolved);
+                }
                 Ok(build_completed_result(
                     request,
                     path.to_string(),
