@@ -16,6 +16,42 @@ use std::{
     fmt::{Display, Formatter},
 };
 
+// ---------------------------------------------------------------------------
+// Language constants and helpers (Issue #162)
+// ---------------------------------------------------------------------------
+
+/// Default UI language fallback.
+pub const DEFAULT_UI_LANGUAGE: &str = "ja";
+
+/// Supported languages: (code, display_name).
+pub const SUPPORTED_LANGUAGES: &[(&str, &str)] = &[("ja", "Japanese"), ("en", "English")];
+
+/// Look up display name for a language code using SUPPORTED_LANGUAGES table.
+/// Returns the display name, or DEFAULT_UI_LANGUAGE's display name as fallback.
+pub fn lang_display_name(code: &str) -> &'static str {
+    SUPPORTED_LANGUAGES
+        .iter()
+        .find(|(c, _)| *c == code)
+        .map(|(_, name)| *name)
+        .unwrap_or("Japanese")
+}
+
+/// Return the effective UI language code.
+/// `None` or unsupported values fall back to [`DEFAULT_UI_LANGUAGE`].
+pub fn effective_ui_language_code(configured: Option<&str>) -> &str {
+    configured.unwrap_or(DEFAULT_UI_LANGUAGE)
+}
+
+/// Shared language constraint prompt for main/sub-agent.
+pub fn language_constraint_prompt(ui_language: &str) -> String {
+    let lang_name = lang_display_name(ui_language);
+    format!(
+        "\n\n## Language constraint\nYou MUST respond in {lang_name}. \
+         All explanations, comments, plans, and summaries must be written in {lang_name}. \
+         Do NOT switch to any other language during your response."
+    )
+}
+
 /// Determines where the user prompt originates from.
 #[derive(Debug, Clone)]
 pub enum PromptSource {
@@ -81,6 +117,10 @@ pub struct RuntimeConfig {
     pub loop_detection_threshold: usize,
     /// HTTP request timeout in seconds (Issue #146).
     pub http_timeout_secs: u64,
+    /// UI language for LLM responses (Issue #162).
+    /// `None` means "use default language via effective_ui_language_code()".
+    /// Supported: "ja", "en".
+    pub ui_language: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -234,6 +274,7 @@ impl EffectiveConfig {
                 subagent_timeout_secs: DEFAULT_SUBAGENT_TIMEOUT_SECS,
                 loop_detection_threshold: 3,
                 http_timeout_secs: DEFAULT_HTTP_TIMEOUT_SECS,
+                ui_language: None,
             },
             mode: ModeConfig {
                 prompt_source: PromptSource::Interactive,
