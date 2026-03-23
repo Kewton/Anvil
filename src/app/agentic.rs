@@ -79,6 +79,7 @@ fn execute_parallel_group_standalone(
     shutdown_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
     requests: Vec<(usize, ToolExecutionRequest)>,
     completed: Arc<AtomicUsize>,
+    file_cache: Option<std::sync::Arc<std::sync::Mutex<crate::tooling::file_cache::FileReadCache>>>,
 ) -> Vec<(usize, ToolExecutionResult)> {
     let cwd = config.paths.cwd.clone();
     let runtime = &config.runtime;
@@ -93,9 +94,10 @@ fn execute_parallel_group_standalone(
                     let shutdown = shutdown_flag.clone();
                     let idx = *idx;
                     let completed = completed.clone();
+                    let file_cache = file_cache.clone();
                     s.spawn(move || {
-                        let mut executor =
-                            LocalToolExecutor::new(cwd, runtime).with_shutdown_flag(shutdown);
+                        let mut executor = LocalToolExecutor::new(cwd, runtime, file_cache)
+                            .with_shutdown_flag(shutdown);
                         let tool_call_id = request.tool_call_id.clone();
                         let tool_name = request.spec.name.clone();
                         let result = executor.execute(request.clone()).unwrap_or_else(|err| {
@@ -583,8 +585,12 @@ impl App {
             .map(|entry| self.checkpoint_stack.push(entry));
 
         // Built-in tools: delegate to LocalToolExecutor
-        let mut executor = LocalToolExecutor::new(cwd, &self.config.runtime)
-            .with_shutdown_flag(self.shutdown_flag());
+        let mut executor = LocalToolExecutor::new(
+            cwd,
+            &self.config.runtime,
+            Some(self.file_read_cache.clone()),
+        )
+        .with_shutdown_flag(self.shutdown_flag());
 
         let result = executor
             .execute(request)
@@ -763,6 +769,7 @@ impl App {
                         self.shutdown_flag(),
                         requests,
                         completed,
+                        Some(self.file_read_cache.clone()),
                     );
                     spinner.stop();
                     seq_counter += parallel_results.len();
