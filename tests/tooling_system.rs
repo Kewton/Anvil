@@ -1,4 +1,5 @@
 use anvil::app::agentic::{ExecutionGroup, group_by_execution_mode};
+use anvil::tooling::file_cache::FileReadCache;
 use anvil::tooling::{
     CheckpointEntry, CheckpointStack, ExecutionClass, ExecutionMode, LocalToolExecutor,
     ParallelExecutionPlan, ParallelExecutionPlanError, PermissionClass, PlanModePolicy,
@@ -4823,4 +4824,248 @@ fn edit_not_found_error_is_distinguishable() {
     assert!(err.is_edit_not_found());
     let io_err = anvil::tooling::ToolRuntimeError::Io("test".to_string());
     assert!(!io_err.is_edit_not_found());
+}
+
+// ===== FileReadCache unit tests =====
+
+#[test]
+fn file_cache_hit_same_path_same_mtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let file = root.join("test.txt");
+    fs::write(&file, "hello world").unwrap();
+
+    let mut cache = FileReadCache::new(root);
+    cache.record(&file, "hello world".to_string());
+
+    let result = cache.try_get(&file);
+    assert_eq!(result, Some("hello world".to_string()));
+}
+
+#[test]
+fn file_cache_miss_unknown_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let file = root.join("nonexistent.txt");
+
+    let mut cache = FileReadCache::new(root);
+    let result = cache.try_get(&file);
+    assert!(result.is_none());
+}
+
+#[test]
+fn file_cache_miss_mtime_changed() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let file = root.join("test.txt");
+    fs::write(&file, "version1").unwrap();
+
+    let mut cache = FileReadCache::new(root);
+    cache.record(&file, "version1".to_string());
+
+    // Modify the file to change mtime
+    // Use filetime crate logic via std: set mtime to future
+    let future = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
+    let ft = filetime::FileTime::from_system_time(future);
+    filetime::set_file_mtime(&file, ft).unwrap();
+
+    let result = cache.try_get(&file);
+    assert!(result.is_none(), "should miss after mtime change");
+    // Entry should be removed on stale mtime
+    assert!(cache.is_empty(), "stale entry should be evicted");
+}
+
+#[test]
+fn file_cache_invalidate_removes_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let file = root.join("test.txt");
+    fs::write(&file, "content").unwrap();
+
+    let mut cache = FileReadCache::new(root);
+    cache.record(&file, "content".to_string());
+    assert_eq!(cache.len(), 1);
+
+    cache.invalidate(&file);
+    assert!(cache.is_empty());
+    assert_eq!(cache.total_bytes(), 0);
+}
+
+#[test]
+fn file_cache_clear_removes_all() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let f1 = root.join("a.txt");
+    let f2 = root.join("b.txt");
+    fs::write(&f1, "aaa").unwrap();
+    fs::write(&f2, "bbb").unwrap();
+
+    let mut cache = FileReadCache::new(root);
+    cache.record(&f1, "aaa".to_string());
+    cache.record(&f2, "bbb".to_string());
+    assert_eq!(cache.len(), 2);
+
+    cache.clear();
+    assert!(cache.is_empty());
+    assert_eq!(cache.total_bytes(), 0);
+}
+
+#[test]
+fn file_cache_lru_eviction_by_entry_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+
+    // Create cache with max 3 entries
+    let mut cache = FileReadCache::with_limits(root.clone(), 3, 10_485_760);
+
+    // Create and record 4 files
+    for i in 0..4 {
+        let file = root.join(format!("file{i}.txt"));
+        fs::write(&file, format!("content{i}")).unwrap();
+        cache.record(&file, format!("content{i}"));
+        // Small sleep to ensure different Instant values for LRU ordering
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    // Should have evicted the oldest (file0)
+    assert_eq!(cache.len(), 3);
+    let file0 = root.join("file0.txt");
+    assert!(
+        cache.try_get(&file0).is_none(),
+        "oldest entry should be evicted"
+    );
+    // file3 should still be present
+    let file3 = root.join("file3.txt");
+    assert_eq!(cache.try_get(&file3), Some("content3".to_string()));
+}
+
+#[test]
+fn file_cache_lru_eviction_by_byte_size() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+
+    // Max 20 bytes total
+    let mut cache = FileReadCache::with_limits(root.clone(), 100, 20);
+
+    let f1 = root.join("f1.txt");
+    let f2 = root.join("f2.txt");
+    let f3 = root.join("f3.txt");
+    fs::write(&f1, "aaaaaaaaaa").unwrap(); // 10 bytes
+    fs::write(&f2, "bbbbbbbbbb").unwrap(); // 10 bytes
+    fs::write(&f3, "cccccccccc").unwrap(); // 10 bytes
+
+    cache.record(&f1, "aaaaaaaaaa".to_string());
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    cache.record(&f2, "bbbbbbbbbb".to_string());
+    assert_eq!(cache.len(), 2);
+    assert_eq!(cache.total_bytes(), 20);
+
+    // Adding f3 should evict f1 (oldest)
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    cache.record(&f3, "cccccccccc".to_string());
+    assert!(cache.total_bytes() <= 20);
+    assert!(
+        cache.try_get(&f1).is_none(),
+        "oldest entry should be evicted by byte limit"
+    );
+}
+
+#[test]
+fn file_cache_rejects_path_outside_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let outside = tempfile::tempdir().unwrap();
+    let outside_file = outside.path().join("secret.txt");
+    fs::write(&outside_file, "secret").unwrap();
+
+    let mut cache = FileReadCache::new(root);
+    // record should be no-op for outside path
+    cache.record(&outside_file, "secret".to_string());
+    assert!(cache.is_empty(), "should not cache files outside root");
+
+    // try_get should return None
+    assert!(cache.try_get(&outside_file).is_none());
+}
+
+#[test]
+fn file_cache_canonicalize_failure_graceful_degrade() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let nonexistent = root.join("does_not_exist.txt");
+
+    let mut cache = FileReadCache::new(root);
+    // record for nonexistent path should be no-op
+    cache.record(&nonexistent, "content".to_string());
+    assert!(cache.is_empty());
+
+    // try_get for nonexistent path should return None
+    assert!(cache.try_get(&nonexistent).is_none());
+}
+
+#[test]
+fn file_cache_parallel_access_no_panic() {
+    use std::sync::{Arc, Mutex};
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+
+    // Create some files
+    for i in 0..10 {
+        let file = root.join(format!("file{i}.txt"));
+        fs::write(&file, format!("content{i}")).unwrap();
+    }
+
+    let cache = Arc::new(Mutex::new(FileReadCache::new(root.clone())));
+
+    // Record from multiple threads
+    std::thread::scope(|s| {
+        for i in 0..10 {
+            let cache = Arc::clone(&cache);
+            let root = root.clone();
+            s.spawn(move || {
+                let file = root.join(format!("file{i}.txt"));
+                if let Ok(mut c) = cache.lock() {
+                    c.record(&file, format!("content{i}"));
+                }
+            });
+        }
+    });
+
+    // Read from multiple threads
+    std::thread::scope(|s| {
+        for i in 0..10 {
+            let cache = Arc::clone(&cache);
+            let root = root.clone();
+            s.spawn(move || {
+                let file = root.join(format!("file{i}.txt"));
+                if let Ok(mut c) = cache.lock() {
+                    let _ = c.try_get(&file);
+                }
+            });
+        }
+    });
+
+    // No panic means success
+    let c = cache.lock().unwrap();
+    assert_eq!(c.len(), 10);
+}
+
+#[test]
+fn file_cache_update_existing_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let file = root.join("test.txt");
+    fs::write(&file, "v1").unwrap();
+
+    let mut cache = FileReadCache::new(root);
+    cache.record(&file, "v1".to_string());
+    assert_eq!(cache.total_bytes(), 2);
+
+    // Update with new content (simulate re-read after external change)
+    fs::write(&file, "version2_longer").unwrap();
+    cache.record(&file, "version2_longer".to_string());
+
+    assert_eq!(cache.len(), 1);
+    assert_eq!(cache.total_bytes(), 15); // "version2_longer".len()
+    assert_eq!(cache.try_get(&file), Some("version2_longer".to_string()));
 }

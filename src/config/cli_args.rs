@@ -81,6 +81,10 @@ pub struct CliArgs {
     #[arg(long)]
     pub trust: bool,
 
+    /// HTTP request timeout in seconds (default: 300)
+    #[arg(long = "timeout")]
+    pub timeout: Option<u64>,
+
     /// Prompt tier override (full|compact|tiny)
     #[arg(long = "prompt-tier")]
     pub prompt_tier: Option<String>,
