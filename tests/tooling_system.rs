@@ -202,6 +202,7 @@ fn validated_tool_call_builds_typed_execution_request_and_result() {
         payload: ToolExecutionPayload::Text("mod app".to_string()),
         artifacts: vec!["src/app/mod.rs".to_string()],
         elapsed_ms: 12,
+        diff_summary: None,
     };
 
     assert_eq!(execution.spec.kind, ToolKind::FileRead);
@@ -374,6 +375,7 @@ fn tool_execution_result_can_bridge_into_console_tool_log_view() {
         payload: ToolExecutionPayload::Text("mod app".to_string()),
         artifacts: vec!["src/app/mod.rs".to_string()],
         elapsed_ms: 12,
+        diff_summary: None,
     };
     let log = result.to_tool_log_view();
 
@@ -2286,6 +2288,7 @@ fn format_tool_result_message_image_payload() {
         },
         artifacts: Vec::new(),
         elapsed_ms: 10,
+        diff_summary: None,
     };
     let msg = format_tool_result_message(&result, 10000);
     assert!(msg.contains("file.read"));
@@ -2312,6 +2315,7 @@ fn format_tool_result_message_truncates_multibyte_safely() {
         payload: ToolExecutionPayload::Text(cjk_content),
         artifacts: Vec::new(),
         elapsed_ms: 5,
+        diff_summary: None,
     };
 
     // Must not panic — the old byte-slicing implementation would panic here.
@@ -2334,6 +2338,7 @@ fn format_tool_result_message_ascii_truncation_still_works() {
         payload: ToolExecutionPayload::Text(ascii_content),
         artifacts: Vec::new(),
         elapsed_ms: 5,
+        diff_summary: None,
     };
 
     let msg = format_tool_result_message(&result, 100);
@@ -2359,6 +2364,7 @@ fn format_tool_result_message_boundary_char_3byte() {
         payload: ToolExecutionPayload::Text(content),
         artifacts: Vec::new(),
         elapsed_ms: 5,
+        diff_summary: None,
     };
 
     let msg = format_tool_result_message(&result, 100);
@@ -2441,6 +2447,7 @@ fn format_tool_result_message_success_head_priority() {
         payload: ToolExecutionPayload::Text(content),
         artifacts: Vec::new(),
         elapsed_ms: 5,
+        diff_summary: None,
     };
 
     let msg = format_tool_result_message(&result, 100);
@@ -2466,6 +2473,7 @@ fn format_tool_result_message_failure_tail_priority() {
         payload: ToolExecutionPayload::Text(content),
         artifacts: Vec::new(),
         elapsed_ms: 5,
+        diff_summary: None,
     };
 
     let msg = format_tool_result_message(&result, 100);
@@ -2491,6 +2499,7 @@ fn format_tool_result_message_interrupted_tail_priority() {
         payload: ToolExecutionPayload::Text(content),
         artifacts: Vec::new(),
         elapsed_ms: 5,
+        diff_summary: None,
     };
 
     let msg = format_tool_result_message(&result, 100);
@@ -4646,6 +4655,142 @@ mod captcha_blocked_error {
 // --- Issue #128: file.edit_anchor and fallback tests ---
 
 use anvil::tooling::AnchorEditParams;
+
+// ── diff_summary generation tests (Issue #157) ──────────────────────────────
+
+#[test]
+fn file_write_produces_diff_summary() {
+    let root = std::env::temp_dir().join("anvil_diff_summary_write");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("dir should exist");
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
+    let result = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_ds_write_001".to_string(),
+            spec: build_registry()
+                .get("file.write")
+                .expect("file.write spec")
+                .clone(),
+            input: ToolInput::FileWrite {
+                path: "./new_file.txt".to_string(),
+                content: "hello world".to_string(),
+            },
+        })
+        .expect("write should succeed");
+
+    assert_eq!(result.status, ToolExecutionStatus::Completed);
+    assert!(
+        result.diff_summary.is_some(),
+        "file.write should produce a diff_summary"
+    );
+    let diff = result.diff_summary.unwrap();
+    assert!(
+        diff.contains("wrote") && diff.contains("bytes"),
+        "diff_summary should describe the write, got: {diff}"
+    );
+}
+
+#[test]
+fn file_edit_produces_diff_summary() {
+    let root = std::env::temp_dir().join("anvil_diff_summary_edit");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("dir should exist");
+    fs::write(root.join("target.txt"), "hello world").expect("write should succeed");
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
+    let result = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_ds_edit_001".to_string(),
+            spec: build_registry()
+                .get("file.edit")
+                .expect("file.edit spec")
+                .clone(),
+            input: ToolInput::FileEdit {
+                path: "./target.txt".to_string(),
+                old_string: "hello".to_string(),
+                new_string: "goodbye".to_string(),
+            },
+        })
+        .expect("edit should succeed");
+
+    assert_eq!(result.status, ToolExecutionStatus::Completed);
+    assert!(
+        result.diff_summary.is_some(),
+        "file.edit should produce a diff_summary"
+    );
+    let diff = result.diff_summary.unwrap();
+    assert!(
+        diff.contains("replaced") && diff.contains("chars"),
+        "diff_summary should describe the edit, got: {diff}"
+    );
+}
+
+#[test]
+fn file_edit_anchor_produces_diff_summary() {
+    let root = std::env::temp_dir().join("anvil_diff_summary_anchor");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("dir should exist");
+    fs::write(root.join("test.rs"), "fn main() {\n    let x = 1;\n}\n")
+        .expect("write should succeed");
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
+    let result = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_ds_anchor_001".to_string(),
+            spec: build_registry()
+                .get("file.edit_anchor")
+                .expect("file.edit_anchor spec")
+                .clone(),
+            input: ToolInput::FileEditAnchor {
+                path: "./test.rs".to_string(),
+                params: AnchorEditParams {
+                    old_content: "let x = 1;".to_string(),
+                    new_content: "let x = 42;".to_string(),
+                },
+            },
+        })
+        .expect("anchor edit should succeed");
+
+    assert_eq!(result.status, ToolExecutionStatus::Completed);
+    assert!(
+        result.diff_summary.is_some(),
+        "file.edit_anchor should produce a diff_summary"
+    );
+    let diff = result.diff_summary.unwrap();
+    assert!(
+        diff.contains("replaced") && diff.contains("chars"),
+        "diff_summary should describe the anchor edit, got: {diff}"
+    );
+}
+
+#[test]
+fn file_read_has_no_diff_summary() {
+    let root = std::env::temp_dir().join("anvil_diff_summary_read");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("dir should exist");
+    fs::write(root.join("test.txt"), "content").expect("write should succeed");
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
+    let result = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_ds_read_001".to_string(),
+            spec: build_registry()
+                .get("file.read")
+                .expect("file.read spec")
+                .clone(),
+            input: ToolInput::FileRead {
+                path: "./test.txt".to_string(),
+            },
+        })
+        .expect("read should succeed");
+
+    assert_eq!(result.status, ToolExecutionStatus::Completed);
+    assert!(
+        result.diff_summary.is_none(),
+        "file.read should NOT produce a diff_summary"
+    );
+}
 
 #[test]
 fn file_edit_anchor_registered_in_registry() {

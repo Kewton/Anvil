@@ -612,6 +612,9 @@ pub struct ToolExecutionResult {
     pub payload: ToolExecutionPayload,
     pub artifacts: Vec<String>,
     pub elapsed_ms: u128,
+    /// Compact diff summary for file-mutating tools (file.write/file.edit/file.edit_anchor).
+    /// `None` for non-mutating tools, MCP tools, and subagent results.
+    pub diff_summary: Option<String>,
 }
 
 impl ToolExecutionResult {
@@ -1391,12 +1394,14 @@ impl LocalToolExecutor {
         {
             cache.invalidate(&resolved);
         }
-        Ok(build_completed_result(
+        let diff = format!("wrote {} bytes to {}", content.len(), path);
+        Ok(build_completed_result_with_diff(
             request,
             path.to_string(),
             ToolExecutionPayload::None,
             vec![resolved.display().to_string()],
             started,
+            Some(diff),
         ))
     }
 
@@ -1451,12 +1456,19 @@ impl LocalToolExecutor {
         {
             cache.invalidate(&resolved);
         }
-        Ok(build_completed_result(
+        let diff = format!(
+            "{}: replaced {} chars with {} chars",
+            path,
+            old_string.len(),
+            new_string.len()
+        );
+        Ok(build_completed_result_with_diff(
             request,
             path.to_string(),
             ToolExecutionPayload::None,
             vec![resolved.display().to_string()],
             started,
+            Some(diff),
         ))
     }
 
@@ -1503,12 +1515,19 @@ impl LocalToolExecutor {
                 {
                     cache.invalidate(&resolved);
                 }
-                Ok(build_completed_result(
+                let diff = format!(
+                    "{}: replaced {} chars with {} chars",
+                    path,
+                    params.old_content.len(),
+                    params.new_content.len()
+                );
+                Ok(build_completed_result_with_diff(
                     request,
                     path.to_string(),
                     ToolExecutionPayload::None,
                     vec![resolved.display().to_string()],
                     started,
+                    Some(diff),
                 ))
             }
             0 => Err(ToolRuntimeError::edit_not_found(format!(
@@ -1836,6 +1855,7 @@ impl LocalToolExecutor {
                     payload: ToolExecutionPayload::Text(combined),
                     artifacts: Vec::new(),
                     elapsed_ms: started.elapsed().as_millis(),
+                    diff_summary: None,
                 });
             }
             match child.try_wait() {
@@ -1871,6 +1891,7 @@ impl LocalToolExecutor {
             payload: ToolExecutionPayload::Text(combined),
             artifacts: Vec::new(),
             elapsed_ms: started.elapsed().as_millis(),
+            diff_summary: None,
         })
     }
 
@@ -2059,6 +2080,7 @@ impl LocalToolExecutor {
                 payload: ToolExecutionPayload::Text(error_msg),
                 artifacts: Vec::new(),
                 elapsed_ms: started.elapsed().as_millis(),
+                diff_summary: None,
             });
         }
 
@@ -2314,6 +2336,17 @@ fn build_completed_result(
     artifacts: Vec<String>,
     started: Instant,
 ) -> ToolExecutionResult {
+    build_completed_result_with_diff(request, summary, payload, artifacts, started, None)
+}
+
+fn build_completed_result_with_diff(
+    request: &ToolExecutionRequest,
+    summary: String,
+    payload: ToolExecutionPayload,
+    artifacts: Vec<String>,
+    started: Instant,
+    diff_summary: Option<String>,
+) -> ToolExecutionResult {
     ToolExecutionResult {
         tool_call_id: request.tool_call_id.clone(),
         tool_name: request.spec.name.clone(),
@@ -2322,6 +2355,7 @@ fn build_completed_result(
         payload,
         artifacts,
         elapsed_ms: started.elapsed().as_millis(),
+        diff_summary,
     }
 }
 

@@ -131,6 +131,7 @@ fn execute_parallel_group_standalone(
                                 payload,
                                 artifacts: Vec::new(),
                                 elapsed_ms: 0,
+                                diff_summary: None,
                             }
                         });
                         completed.fetch_add(1, Ordering::Relaxed);
@@ -160,6 +161,7 @@ fn execute_parallel_group_standalone(
                                 payload: ToolExecutionPayload::None,
                                 artifacts: Vec::new(),
                                 elapsed_ms: 0,
+                                diff_summary: None,
                             },
                         ));
                     }
@@ -210,6 +212,7 @@ impl App {
                     ),
                     artifacts: Vec::new(),
                     elapsed_ms: 0,
+                    diff_summary: None,
                 });
                 continue;
             }
@@ -415,13 +418,14 @@ impl App {
                 self.config.mode.interactive,
             );
 
-            let system_prompt = self.build_dynamic_system_prompt();
-            let request = BasicAgentLoop::build_turn_request(
+            let (system_prompt, calibration_ratio) = self.prepare_turn_context();
+            let (request, _) = BasicAgentLoop::build_turn_request_calibrated(
                 self.effective_model().to_string(),
                 &self.session,
                 self.provider.capabilities.streaming && self.config.runtime.stream,
                 self.effective_context_window(),
                 &system_prompt,
+                calibration_ratio,
             );
 
             let mut next_token_buffer = String::new();
@@ -575,6 +579,7 @@ impl App {
                         payload: ToolExecutionPayload::Text(OFFLINE_BLOCK_PAYLOAD.to_string()),
                         artifacts: Vec::new(),
                         elapsed_ms: 0,
+                        diff_summary: None,
                     },
                 ));
                 continue;
@@ -672,6 +677,7 @@ impl App {
                 payload: ToolExecutionPayload::Text(err.to_string()),
                 artifacts: Vec::new(),
                 elapsed_ms: 0,
+                diff_summary: None,
             });
 
         // Remove checkpoint if tool execution failed.
@@ -705,6 +711,7 @@ impl App {
                 payload: ToolExecutionPayload::None,
                 artifacts: Vec::new(),
                 elapsed_ms: 0,
+                diff_summary: None,
             };
         };
 
@@ -730,6 +737,7 @@ impl App {
             payload,
             artifacts: Vec::new(),
             elapsed_ms: started.elapsed().as_millis(),
+            diff_summary: None,
         }
     }
 
@@ -794,6 +802,7 @@ impl App {
                                     payload: crate::tooling::ToolExecutionPayload::None,
                                     artifacts: Vec::new(),
                                     elapsed_ms: 0,
+                                    diff_summary: None,
                                 },
                             ));
                         }
@@ -864,6 +873,7 @@ impl App {
                     payload: ToolExecutionPayload::Text(msg.clone()),
                     artifacts: vec![],
                     elapsed_ms: 0,
+                    diff_summary: None,
                 })
             }
             _ => None,
@@ -1068,8 +1078,11 @@ impl App {
         // Track tool usage for dynamic system prompt generation (Issue #73)
         self.session.used_tools.insert(result.tool_name.clone());
 
-        // Working memory: track touched files (file-mutating tools only) (Issue #130)
-        let is_file_tool = matches!(result.tool_name.as_str(), "file.write" | "file.edit");
+        // Working memory: track touched files (file-mutating tools only) (Issue #130, #157)
+        let is_file_tool = matches!(
+            result.tool_name.as_str(),
+            "file.write" | "file.edit" | "file.edit_anchor"
+        );
         if is_file_tool
             && result.status == ToolExecutionStatus::Completed
             && !result.summary.contains("[rolled back]")
@@ -1081,6 +1094,22 @@ impl App {
                 } else {
                     tracing::warn!("skip touched_files update for non-relative artifact");
                 }
+            }
+
+            // Update recent_diffs with diff_summary (Issue #157)
+            if let Some(ref diff) = result.diff_summary {
+                let current = self
+                    .session
+                    .working_memory
+                    .recent_diffs
+                    .clone()
+                    .unwrap_or_default();
+                let updated = if current.is_empty() {
+                    diff.clone()
+                } else {
+                    format!("{}\n{}", current, diff)
+                };
+                self.session.working_memory.set_recent_diffs(Some(updated));
             }
         }
 
@@ -1197,13 +1226,14 @@ impl App {
         provider_client: &C,
     ) -> Result<Vec<String>, AppError> {
         // Build request and call LLM for one more turn
-        let system_prompt = self.build_dynamic_system_prompt();
-        let request = BasicAgentLoop::build_turn_request(
+        let (system_prompt, calibration_ratio) = self.prepare_turn_context();
+        let (request, _) = BasicAgentLoop::build_turn_request_calibrated(
             self.effective_model().to_string(),
             &self.session,
             self.provider.capabilities.streaming && self.config.runtime.stream,
             self.effective_context_window(),
             &system_prompt,
+            calibration_ratio,
         );
 
         let spinner = Spinner::start(
@@ -1540,6 +1570,7 @@ fn build_failed_result(
         payload: crate::tooling::ToolExecutionPayload::None,
         artifacts: Vec::new(),
         elapsed_ms: 0,
+        diff_summary: None,
     }
 }
 
