@@ -110,6 +110,7 @@ src/
 │   ├── cli.rs           # CLI入力ループ
 │   ├── context.rs       # コンテキスト注入（@file展開・サンドボックス検証）
 │   ├── loop_detector.rs # ループ検出（リングバッファ・段階的対応）
+│   ├── write_fail_tracker.rs # file.write連続失敗トラッキング（ヒント提供・閾値2）
 │   ├── plan.rs          # プラン管理
 │   ├── policy.rs        # offlineポリシーチェック（共通ヘルパー）
 │   ├── render.rs        # コンソール描画

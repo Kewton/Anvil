@@ -16,7 +16,7 @@ use crate::provider::{
     ImageContent, ProviderClient, ProviderEvent, ProviderMessage, ProviderMessageRole,
     ProviderTurnError, ProviderTurnRequest,
 };
-use crate::session::{MessageRole, SessionRecord};
+use crate::session::{MessageRole, SessionMessage, SessionRecord};
 use crate::tooling::{ToolCallRequest, ToolInput, detect_image_mime};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -226,6 +226,30 @@ impl BasicAgentLoop {
         )
     }
 
+    /// Estimate the number of session messages that would be pruned.
+    /// Uses the same shared selection logic as `build_turn_request_with_calibration()`.
+    /// Returns `(pruned_count, selected_tokens)`.
+    pub fn estimate_pruned_message_count(
+        session: &SessionRecord,
+        context_window: u32,
+        system_prompt_tokens: usize,
+        calibration_ratio: f64,
+    ) -> (usize, usize) {
+        let token_budget = derive_context_budget(context_window);
+        let budget_for_messages = token_budget
+            .saturating_sub(system_prompt_tokens)
+            .max(MINIMUM_MESSAGE_BUDGET);
+
+        let (selected, selected_tokens) = select_messages_within_budget(
+            session.messages.iter(),
+            budget_for_messages,
+            calibration_ratio,
+        );
+
+        let pruned_count = session.messages.len().saturating_sub(selected.len());
+        (pruned_count, selected_tokens)
+    }
+
     pub fn run_turn<C: ProviderClient>(
         provider: &C,
         request: &ProviderTurnRequest,
@@ -237,12 +261,23 @@ impl BasicAgentLoop {
 
     pub fn parse_structured_response(content: &str) -> Result<StructuredAssistantResponse, String> {
         let tool_blocks = extract_fenced_blocks(content, "ANVIL_TOOL");
+
+        // ANVIL_FINALの位置を取得（カットオフポイント）
+        let final_cutoff = content.find("```ANVIL_FINAL\n");
+
         // Try strict extraction first, fall back to lenient for unclosed blocks.
         let final_block = extract_final_block(content, "ANVIL_FINAL")
             .or_else(|| extract_final_block_lenient(content, "ANVIL_FINAL"));
 
         let mut tool_calls = Vec::new();
-        for block in tool_blocks {
+        for (offset, block) in tool_blocks {
+            // ANVIL_TOOLブロックの開始マーカー位置(offset)が
+            // ANVIL_FINALの開始マーカー位置(cutoff)と同じかそれ以降にある場合に除外
+            if let Some(cutoff) = final_cutoff
+                && offset >= cutoff
+            {
+                continue;
+            }
             tool_calls.push(parse_tool_call_block_multi_tier(&block)?);
         }
 
@@ -435,6 +470,30 @@ fn to_provider_message_with_images(
     msg
 }
 
+/// Shared message selection within token budget.
+/// Returns (selected messages in reverse order, used_tokens).
+fn select_messages_within_budget<'a>(
+    messages: impl DoubleEndedIterator<Item = &'a SessionMessage>,
+    budget_for_messages: usize,
+    calibration_ratio: f64,
+) -> (Vec<&'a SessionMessage>, usize) {
+    let mut selected = Vec::new();
+    let mut used_tokens = 0usize;
+
+    for message in messages.rev() {
+        let kind = ContentKind::from_message_role(message.role);
+        let estimated =
+            estimate_tokens_calibrated(message.effective_content(), kind, calibration_ratio);
+        if !selected.is_empty() && used_tokens + estimated > budget_for_messages {
+            break;
+        }
+        used_tokens += estimated;
+        selected.push(message);
+    }
+
+    (selected, used_tokens)
+}
+
 /// Internal helper: build a turn request with calibration ratio applied.
 ///
 /// Both `build_turn_request_with_token_budget` (ratio=NO_CALIBRATION) and
@@ -453,19 +512,11 @@ fn build_turn_request_with_calibration(
         .saturating_sub(system_prompt_tokens)
         .max(MINIMUM_MESSAGE_BUDGET);
 
-    let mut selected = Vec::new();
-    let mut used_tokens = 0usize;
-
-    for message in session.messages.iter().rev() {
-        let kind = ContentKind::from_message_role(message.role);
-        let estimated =
-            estimate_tokens_calibrated(message.effective_content(), kind, calibration_ratio);
-        if !selected.is_empty() && used_tokens + estimated > budget_for_messages {
-            break;
-        }
-        used_tokens += estimated;
-        selected.push(message);
-    }
+    let (mut selected, used_tokens) = select_messages_within_budget(
+        session.messages.iter(),
+        budget_for_messages,
+        calibration_ratio,
+    );
 
     selected.reverse();
 
@@ -655,6 +706,7 @@ const PROMPT_TOOL_RULES: &str = concat!(
     "- When the user's request requires file changes (implement, fix, create, modify, etc.), \
        you must complete the actual file modifications using file.write/file.edit, \
        not just output a plan or description.\n",
+    "- For large existing files, file.write may be blocked. Use file.edit or file.edit_anchor for targeted modifications instead of rewriting entire files.\n",
     "- Start exploration with file.read on \".\" to list the project root before reading specific files.\n",
     "- Do not assume files like README.md exist — verify first.\n",
     "- For dev servers and watch processes (npm run dev, cargo watch, etc.), use background execution with '&' so the command returns immediately.\n",
@@ -1024,17 +1076,18 @@ pub fn tool_protocol_system_prompt_tag_based(
     )
 }
 
-fn extract_fenced_blocks(content: &str, label: &str) -> Vec<String> {
+fn extract_fenced_blocks(content: &str, label: &str) -> Vec<(usize, String)> {
     let mut blocks = Vec::new();
     let start_marker = format!("```{label}\n");
     let end_marker = "\n```";
     let mut cursor = 0usize;
 
     while let Some(start) = content[cursor..].find(&start_marker) {
-        let block_start = cursor + start + start_marker.len();
+        let abs_start = cursor + start; // マーカーの絶対位置
+        let block_start = abs_start + start_marker.len();
         if let Some(end) = content[block_start..].find(end_marker) {
             let block_end = block_start + end;
-            blocks.push(content[block_start..block_end].to_string());
+            blocks.push((abs_start, content[block_start..block_end].to_string()));
             cursor = block_end + end_marker.len();
         } else {
             break;
@@ -1188,5 +1241,53 @@ mod tests {
                 one_liner
             );
         }
+    }
+
+    // ── Issue #157: estimate_pruned_message_count tests ───────────────
+
+    #[test]
+    fn estimate_pruned_zero_when_messages_fit() {
+        let mut session = SessionRecord::new(std::path::PathBuf::from("/tmp/test"));
+        for i in 0..3 {
+            session.push_message(SessionMessage::new(
+                MessageRole::User,
+                "you",
+                format!("msg {i}"),
+            ));
+        }
+        // Large context window, small messages => no pruning
+        let (pruned, _tokens) =
+            BasicAgentLoop::estimate_pruned_message_count(&session, 128_000, 100, 1.0);
+        assert_eq!(pruned, 0);
+    }
+
+    #[test]
+    fn estimate_pruned_count_with_many_messages() {
+        let mut session = SessionRecord::new(std::path::PathBuf::from("/tmp/test"));
+        // Add many large messages to exceed a small budget
+        for i in 0..50 {
+            session.push_message(SessionMessage::new(
+                MessageRole::User,
+                "you",
+                format!(
+                    "message content that is somewhat long to consume tokens #{i} {}",
+                    "x".repeat(200)
+                ),
+            ));
+        }
+        // Very small context window to force pruning
+        let (pruned, _tokens) =
+            BasicAgentLoop::estimate_pruned_message_count(&session, 512, 50, 1.0);
+        assert!(pruned > 0, "should prune some messages with tiny budget");
+        assert!(pruned < 50, "should keep at least one message");
+    }
+
+    #[test]
+    fn estimate_pruned_zero_for_empty_session() {
+        let session = SessionRecord::new(std::path::PathBuf::from("/tmp/test"));
+        let (pruned, tokens) =
+            BasicAgentLoop::estimate_pruned_message_count(&session, 128_000, 100, 1.0);
+        assert_eq!(pruned, 0);
+        assert_eq!(tokens, 0);
     }
 }

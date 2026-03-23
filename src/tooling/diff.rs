@@ -20,14 +20,42 @@ const BINARY_CHECK_BYTES: usize = 8192;
 /// `new_content` strings larger than this are skipped for diff generation.
 const MAX_NEW_CONTENT_SIZE: usize = 1_048_576; // 1 MB
 
+/// Options for diff preview generation (Open/Closed principle).
+#[derive(Debug, Clone)]
+pub struct DiffOptions {
+    /// Deletion ratio threshold for warning (0.0 = disabled, default 0.5).
+    pub deletion_ratio_threshold: f64,
+}
+
+impl Default for DiffOptions {
+    fn default() -> Self {
+        Self {
+            deletion_ratio_threshold: 0.5,
+        }
+    }
+}
+
+impl DiffOptions {
+    /// Create from a `RuntimeConfig`, pulling the configured deletion ratio.
+    pub fn from_runtime(config: &crate::config::RuntimeConfig) -> Self {
+        Self {
+            deletion_ratio_threshold: config.safe_write_deletion_ratio,
+        }
+    }
+}
+
 /// Generate a diff preview string for a tool input, if applicable.
 ///
 /// Returns `Some(diff_text)` for `FileWrite` and `FileEdit` inputs, and
 /// `None` for all other tool input variants.
-pub fn generate_diff_preview(workspace_root: &Path, tool_input: &ToolInput) -> Option<String> {
+pub fn generate_diff_preview(
+    workspace_root: &Path,
+    tool_input: &ToolInput,
+    options: &DiffOptions,
+) -> Option<String> {
     match tool_input {
         ToolInput::FileWrite { path, content } => {
-            generate_file_write_diff(workspace_root, path, content)
+            generate_file_write_diff(workspace_root, path, content, options)
         }
         ToolInput::FileEdit {
             old_string,
@@ -57,6 +85,7 @@ fn generate_file_write_diff(
     workspace_root: &Path,
     path: &str,
     new_content: &str,
+    options: &DiffOptions,
 ) -> Option<String> {
     // Guard: new_content size
     if new_content.len() > MAX_NEW_CONTENT_SIZE {
@@ -101,6 +130,8 @@ fn generate_file_write_diff(
         Err(_) => return None,
     };
 
+    let original_line_count = existing_content.lines().count();
+
     // Generate unified diff
     let diff = similar::TextDiff::from_lines(existing_content.as_str(), new_content);
     let diff_text = diff
@@ -113,7 +144,11 @@ fn generate_file_write_diff(
         return Some("(no changes)".to_string());
     }
 
-    Some(truncate_diff(&diff_text))
+    Some(truncate_diff(
+        &diff_text,
+        Some(original_line_count),
+        options.deletion_ratio_threshold,
+    ))
 }
 
 /// Generate a diff preview for `file.edit` (old_string -> new_string).
@@ -136,11 +171,18 @@ pub(crate) fn generate_file_edit_diff(old_string: &str, new_string: &str) -> Opt
         return Some("(no changes)".to_string());
     }
 
-    Some(truncate_diff(&diff_text))
+    Some(truncate_diff(&diff_text, None, 0.0))
 }
 
 /// Truncate a diff if the number of added/deleted lines exceeds the threshold.
-fn truncate_diff(diff_text: &str) -> String {
+///
+/// When `original_line_count` is provided and `deletion_ratio_threshold > 0.0`,
+/// appends a warning if the deletion ratio exceeds the threshold.
+fn truncate_diff(
+    diff_text: &str,
+    original_line_count: Option<usize>,
+    deletion_ratio_threshold: f64,
+) -> String {
     let mut additions = 0usize;
     let mut deletions = 0usize;
 
@@ -152,29 +194,46 @@ fn truncate_diff(diff_text: &str) -> String {
         }
     }
 
-    if additions + deletions <= DIFF_TRUNCATE_THRESHOLD {
-        return diff_text.to_string();
+    let mut result = if additions + deletions <= DIFF_TRUNCATE_THRESHOLD {
+        diff_text.to_string()
+    } else {
+        // Keep the header and first few lines, then add a truncation notice
+        let mut buf = String::new();
+        let mut change_count = 0usize;
+        for line in diff_text.lines() {
+            let is_change = (line.starts_with('+') && !line.starts_with("+++"))
+                || (line.starts_with('-') && !line.starts_with("---"));
+            if is_change {
+                change_count += 1;
+            }
+            if change_count > DIFF_TRUNCATE_THRESHOLD {
+                break;
+            }
+            buf.push_str(line);
+            buf.push('\n');
+        }
+        buf.push_str(&format!(
+            "... (+{} lines added, -{} lines deleted)\n",
+            additions, deletions
+        ));
+        buf
+    };
+
+    // Deletion ratio warning
+    if deletion_ratio_threshold > 0.0
+        && let Some(orig) = original_line_count
+        && orig > 0
+    {
+        let ratio = deletions as f64 / orig as f64;
+        if ratio > deletion_ratio_threshold {
+            let pct = (ratio * 100.0).round() as u64;
+            result.push_str(&format!(
+                "[WARNING: {}/{} lines deleted ({}%) — consider using file.edit for targeted changes]\n",
+                deletions, orig, pct
+            ));
+        }
     }
 
-    // Keep the header and first few lines, then add a truncation notice
-    let mut result = String::new();
-    let mut change_count = 0usize;
-    for line in diff_text.lines() {
-        let is_change = (line.starts_with('+') && !line.starts_with("+++"))
-            || (line.starts_with('-') && !line.starts_with("---"));
-        if is_change {
-            change_count += 1;
-        }
-        if change_count > DIFF_TRUNCATE_THRESHOLD {
-            break;
-        }
-        result.push_str(line);
-        result.push('\n');
-    }
-    result.push_str(&format!(
-        "... (+{} lines added, -{} lines deleted)\n",
-        additions, deletions
-    ));
     result
 }
 

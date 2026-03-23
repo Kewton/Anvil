@@ -28,6 +28,10 @@ const MAX_CONTEXT_LINES: u32 = 10;
 /// Maximum number of matched files returned by file.search.
 const MAX_SEARCH_RESULTS: usize = 100;
 
+/// Files larger than this are blocked by the safe-write guard without reading
+/// their full contents, to avoid memory pressure (10 MB).
+const MAX_SAFE_WRITE_GUARD_READ_BYTES: u64 = 10 * 1024 * 1024;
+
 /// Detect the MIME type of an image file based on its extension.
 ///
 /// Returns `None` for non-image extensions.
@@ -608,6 +612,9 @@ pub struct ToolExecutionResult {
     pub payload: ToolExecutionPayload,
     pub artifacts: Vec<String>,
     pub elapsed_ms: u128,
+    /// Compact diff summary for file-mutating tools (file.write/file.edit/file.edit_anchor).
+    /// `None` for non-mutating tools, MCP tools, and subagent results.
+    pub diff_summary: Option<String>,
 }
 
 impl ToolExecutionResult {
@@ -901,6 +908,7 @@ pub struct LocalToolExecutor {
     shutdown_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     http_client: reqwest::blocking::Client,
     file_cache: Option<std::sync::Arc<std::sync::Mutex<file_cache::FileReadCache>>>,
+    safe_write_max_lines: usize,
 }
 
 /// Build the shared HTTP client used by tooling (web.fetch / web.search).
@@ -922,6 +930,11 @@ pub enum ToolRuntimeError {
     EditNotFound {
         message: String,
         context_snippet: Option<String>,
+    },
+    LargeFileBlocked {
+        path: String,
+        line_count: usize,
+        threshold: usize,
     },
 }
 
@@ -959,8 +972,26 @@ impl Display for ToolRuntimeError {
                  or use web.fetch to access specific URLs directly."
             ),
             Self::EditNotFound { message, .. } => write!(f, "{message}"),
+            Self::LargeFileBlocked {
+                path,
+                line_count,
+                threshold,
+            } => write!(
+                f,
+                "File '{}' has {} lines (threshold: {}).\n\
+                 Large existing files cannot be overwritten with file.write.\n\
+                 Use file.edit or file.edit_anchor to make targeted changes instead.",
+                sanitize_path_for_display(path),
+                line_count,
+                threshold
+            ),
         }
     }
+}
+
+/// Sanitize a path string for display by removing control characters.
+fn sanitize_path_for_display(path: &str) -> String {
+    path.chars().filter(|c| !c.is_control()).collect()
 }
 
 impl std::error::Error for ToolRuntimeError {}
@@ -1079,6 +1110,7 @@ impl LocalToolExecutor {
             shutdown_flag: None,
             http_client: build_tooling_http_client(),
             file_cache,
+            safe_write_max_lines: config.safe_write_max_lines,
         }
     }
 
@@ -1093,7 +1125,13 @@ impl LocalToolExecutor {
             shutdown_flag: None,
             http_client: build_tooling_http_client(),
             file_cache: None,
+            safe_write_max_lines: 0,
         }
+    }
+
+    /// Set the safe_write_max_lines threshold (for tests).
+    pub fn set_safe_write_max_lines(&mut self, value: usize) {
+        self.safe_write_max_lines = value;
     }
 
     /// Create an executor with a Serper API key set (for testing fallback).
@@ -1306,10 +1344,49 @@ impl LocalToolExecutor {
         started: Instant,
     ) -> Result<ToolExecutionResult, ToolRuntimeError> {
         let resolved = self.resolve_path(path)?;
+
+        // Large file write guard (safe_write_max_lines > 0 = enabled)
+        if self.safe_write_max_lines > 0 {
+            match std::fs::metadata(&resolved) {
+                Ok(meta) => {
+                    // Extremely large files: block without full read to avoid memory pressure
+                    if meta.len() > MAX_SAFE_WRITE_GUARD_READ_BYTES {
+                        return Err(ToolRuntimeError::LargeFileBlocked {
+                            path: path.to_string(),
+                            line_count: 0,
+                            threshold: self.safe_write_max_lines,
+                        });
+                    }
+                    if let Ok(existing) = std::fs::read(&resolved) {
+                        let newline_count = existing.iter().filter(|&&b| b == b'\n').count();
+                        let line_count = if existing.is_empty() {
+                            0
+                        } else {
+                            newline_count + usize::from(!existing.ends_with(b"\n"))
+                        };
+                        if line_count > self.safe_write_max_lines {
+                            return Err(ToolRuntimeError::LargeFileBlocked {
+                                path: path.to_string(),
+                                line_count,
+                                threshold: self.safe_write_max_lines,
+                            });
+                        }
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    // New file creation — not subject to the guard
+                }
+                Err(_) => {
+                    // Other metadata errors — proceed to let fs::write handle it
+                }
+            }
+        }
+
         if let Some(parent) = resolved.parent() {
             fs::create_dir_all(parent).map_err(|err| {
                 ToolRuntimeError::Io(format!(
-                    "file.write failed to create parent {}: {err}",
+                    "file.write failed for {} (parent creation failed for {}): {err}",
+                    resolved.display(),
                     parent.display()
                 ))
             })?;
@@ -1321,12 +1398,14 @@ impl LocalToolExecutor {
             ))
         })?;
         self.invalidate_cache(&resolved);
-        Ok(build_completed_result(
+        let diff = format!("wrote {} bytes to {}", content.len(), path);
+        Ok(build_completed_result_with_diff(
             request,
             path.to_string(),
             ToolExecutionPayload::None,
             vec![resolved.display().to_string()],
             started,
+            Some(diff),
         ))
     }
 
@@ -1383,12 +1462,14 @@ impl LocalToolExecutor {
             ))
         })?;
         self.invalidate_cache(&resolved);
-        Ok(build_completed_result(
+        let diff = diff::generate_file_edit_diff(old_string, new_string);
+        Ok(build_completed_result_with_diff(
             request,
             path.to_string(),
             Self::build_edit_diff_payload(old_string, new_string),
             vec![resolved.display().to_string()],
             started,
+            diff,
         ))
     }
 
@@ -1430,12 +1511,14 @@ impl LocalToolExecutor {
                     ))
                 })?;
                 self.invalidate_cache(&resolved);
-                Ok(build_completed_result(
+                let diff = diff::generate_file_edit_diff(&params.old_content, &params.new_content);
+                Ok(build_completed_result_with_diff(
                     request,
                     path.to_string(),
                     Self::build_edit_diff_payload(&params.old_content, &params.new_content),
                     vec![resolved.display().to_string()],
                     started,
+                    diff,
                 ))
             }
             0 => Err(ToolRuntimeError::edit_not_found(format!(
@@ -1569,13 +1652,15 @@ impl LocalToolExecutor {
             ))
         })?;
         self.invalidate_cache(&resolved);
+        let diff = diff::generate_file_edit_diff(old_string, new_string);
 
-        Ok(build_completed_result(
+        Ok(build_completed_result_with_diff(
             request,
             path.to_string(),
             Self::build_edit_diff_payload(old_string, new_string),
             vec![resolved.display().to_string()],
             started,
+            diff,
         ))
     }
 
@@ -1764,6 +1849,7 @@ impl LocalToolExecutor {
                     payload: ToolExecutionPayload::Text(combined),
                     artifacts: Vec::new(),
                     elapsed_ms: started.elapsed().as_millis(),
+                    diff_summary: None,
                 });
             }
             match child.try_wait() {
@@ -1799,6 +1885,7 @@ impl LocalToolExecutor {
             payload: ToolExecutionPayload::Text(combined),
             artifacts: Vec::new(),
             elapsed_ms: started.elapsed().as_millis(),
+            diff_summary: None,
         })
     }
 
@@ -1987,6 +2074,7 @@ impl LocalToolExecutor {
                 payload: ToolExecutionPayload::Text(error_msg),
                 artifacts: Vec::new(),
                 elapsed_ms: started.elapsed().as_millis(),
+                diff_summary: None,
             });
         }
 
@@ -2242,6 +2330,17 @@ fn build_completed_result(
     artifacts: Vec<String>,
     started: Instant,
 ) -> ToolExecutionResult {
+    build_completed_result_with_diff(request, summary, payload, artifacts, started, None)
+}
+
+fn build_completed_result_with_diff(
+    request: &ToolExecutionRequest,
+    summary: String,
+    payload: ToolExecutionPayload,
+    artifacts: Vec<String>,
+    started: Instant,
+    diff_summary: Option<String>,
+) -> ToolExecutionResult {
     ToolExecutionResult {
         tool_call_id: request.tool_call_id.clone(),
         tool_name: request.spec.name.clone(),
@@ -2250,6 +2349,7 @@ fn build_completed_result(
         payload,
         artifacts,
         elapsed_ms: started.elapsed().as_millis(),
+        diff_summary,
     }
 }
 

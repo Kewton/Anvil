@@ -202,6 +202,7 @@ fn validated_tool_call_builds_typed_execution_request_and_result() {
         payload: ToolExecutionPayload::Text("mod app".to_string()),
         artifacts: vec!["src/app/mod.rs".to_string()],
         elapsed_ms: 12,
+        diff_summary: None,
     };
 
     assert_eq!(execution.spec.kind, ToolKind::FileRead);
@@ -374,6 +375,7 @@ fn tool_execution_result_can_bridge_into_console_tool_log_view() {
         payload: ToolExecutionPayload::Text("mod app".to_string()),
         artifacts: vec!["src/app/mod.rs".to_string()],
         elapsed_ms: 12,
+        diff_summary: None,
     };
     let log = result.to_tool_log_view();
 
@@ -1802,7 +1804,7 @@ fn file_edit_sandbox_escape_rejected() {
 
 // ---- Diff preview tests ----
 
-use anvil::tooling::diff::{generate_diff_preview, is_binary_content};
+use anvil::tooling::diff::{DiffOptions, generate_diff_preview, is_binary_content};
 
 #[test]
 fn test_diff_preview_existing_file() {
@@ -1814,7 +1816,7 @@ fn test_diff_preview_existing_file() {
         path: "hello.txt".to_string(),
         content: "line1\nline2 modified\nline3\nline4\n".to_string(),
     };
-    let result = generate_diff_preview(dir.path(), &input);
+    let result = generate_diff_preview(dir.path(), &input, &DiffOptions::default());
     assert!(result.is_some());
     let diff = result.unwrap();
     assert!(diff.contains("-line2"));
@@ -1829,7 +1831,7 @@ fn test_diff_preview_new_file() {
         path: "brand_new.txt".to_string(),
         content: "first line\nsecond line\n".to_string(),
     };
-    let result = generate_diff_preview(dir.path(), &input);
+    let result = generate_diff_preview(dir.path(), &input, &DiffOptions::default());
     assert!(result.is_some());
     let preview = result.unwrap();
     assert!(preview.contains("(new file)"));
@@ -1849,7 +1851,7 @@ fn test_diff_preview_binary_file() {
         path: "binary.bin".to_string(),
         content: "new content".to_string(),
     };
-    let result = generate_diff_preview(dir.path(), &input);
+    let result = generate_diff_preview(dir.path(), &input, &DiffOptions::default());
     assert!(result.is_some());
     assert!(result.unwrap().contains("binary file"));
 }
@@ -1866,7 +1868,7 @@ fn test_diff_preview_large_file() {
         path: "big.txt".to_string(),
         content: "replacement".to_string(),
     };
-    let result = generate_diff_preview(dir.path(), &input);
+    let result = generate_diff_preview(dir.path(), &input, &DiffOptions::default());
     assert!(result.is_some());
     assert!(result.unwrap().contains("file too large"));
 }
@@ -1884,7 +1886,7 @@ fn test_diff_preview_large_diff() {
         path: "many_lines.txt".to_string(),
         content: new_lines.join("\n"),
     };
-    let result = generate_diff_preview(dir.path(), &input);
+    let result = generate_diff_preview(dir.path(), &input, &DiffOptions::default());
     assert!(result.is_some());
     let diff = result.unwrap();
     // Should be truncated
@@ -1901,7 +1903,7 @@ fn test_diff_preview_file_edit() {
         old_string: "fn old_function() {}".to_string(),
         new_string: "fn new_function() {\n    println!(\"hello\");\n}".to_string(),
     };
-    let result = generate_diff_preview(dir.path(), &input);
+    let result = generate_diff_preview(dir.path(), &input, &DiffOptions::default());
     assert!(result.is_some());
     let diff = result.unwrap();
     assert!(diff.contains("-fn old_function() {}"));
@@ -1915,7 +1917,7 @@ fn test_diff_preview_nonexistent_file() {
         path: "does_not_exist.txt".to_string(),
         content: "hello world\n".to_string(),
     };
-    let result = generate_diff_preview(dir.path(), &input);
+    let result = generate_diff_preview(dir.path(), &input, &DiffOptions::default());
     assert!(result.is_some());
     let preview = result.unwrap();
     assert!(preview.contains("(new file)"));
@@ -1931,7 +1933,7 @@ fn test_diff_preview_line_truncation() {
         path: "long_line.txt".to_string(),
         content: format!("{long_line}\nshort\n"),
     };
-    let result = generate_diff_preview(dir.path(), &input);
+    let result = generate_diff_preview(dir.path(), &input, &DiffOptions::default());
     assert!(result.is_some());
     let preview = result.unwrap();
     assert!(preview.contains("(new file)"));
@@ -1964,7 +1966,7 @@ fn test_file_edit_diff_no_file_access() {
         old_string: "old code".to_string(),
         new_string: "new code".to_string(),
     };
-    let result = generate_diff_preview(dir.path(), &input);
+    let result = generate_diff_preview(dir.path(), &input, &DiffOptions::default());
     assert!(result.is_some());
     let diff = result.unwrap();
     assert!(diff.contains("-old code"));
@@ -1977,12 +1979,12 @@ fn test_diff_preview_other_tool_input_returns_none() {
     let input = ToolInput::FileRead {
         path: "foo.txt".to_string(),
     };
-    assert!(generate_diff_preview(dir.path(), &input).is_none());
+    assert!(generate_diff_preview(dir.path(), &input, &DiffOptions::default()).is_none());
 
     let input = ToolInput::ShellExec {
         command: "ls".to_string(),
     };
-    assert!(generate_diff_preview(dir.path(), &input).is_none());
+    assert!(generate_diff_preview(dir.path(), &input, &DiffOptions::default()).is_none());
 }
 
 // --- Parallel execution grouping tests ---
@@ -2286,6 +2288,7 @@ fn format_tool_result_message_image_payload() {
         },
         artifacts: Vec::new(),
         elapsed_ms: 10,
+        diff_summary: None,
     };
     let msg = format_tool_result_message(&result, 10000);
     assert!(msg.contains("file.read"));
@@ -2312,6 +2315,7 @@ fn format_tool_result_message_truncates_multibyte_safely() {
         payload: ToolExecutionPayload::Text(cjk_content),
         artifacts: Vec::new(),
         elapsed_ms: 5,
+        diff_summary: None,
     };
 
     // Must not panic — the old byte-slicing implementation would panic here.
@@ -2334,6 +2338,7 @@ fn format_tool_result_message_ascii_truncation_still_works() {
         payload: ToolExecutionPayload::Text(ascii_content),
         artifacts: Vec::new(),
         elapsed_ms: 5,
+        diff_summary: None,
     };
 
     let msg = format_tool_result_message(&result, 100);
@@ -2359,6 +2364,7 @@ fn format_tool_result_message_boundary_char_3byte() {
         payload: ToolExecutionPayload::Text(content),
         artifacts: Vec::new(),
         elapsed_ms: 5,
+        diff_summary: None,
     };
 
     let msg = format_tool_result_message(&result, 100);
@@ -2441,6 +2447,7 @@ fn format_tool_result_message_success_head_priority() {
         payload: ToolExecutionPayload::Text(content),
         artifacts: Vec::new(),
         elapsed_ms: 5,
+        diff_summary: None,
     };
 
     let msg = format_tool_result_message(&result, 100);
@@ -2466,6 +2473,7 @@ fn format_tool_result_message_failure_tail_priority() {
         payload: ToolExecutionPayload::Text(content),
         artifacts: Vec::new(),
         elapsed_ms: 5,
+        diff_summary: None,
     };
 
     let msg = format_tool_result_message(&result, 100);
@@ -2491,6 +2499,7 @@ fn format_tool_result_message_interrupted_tail_priority() {
         payload: ToolExecutionPayload::Text(content),
         artifacts: Vec::new(),
         elapsed_ms: 5,
+        diff_summary: None,
     };
 
     let msg = format_tool_result_message(&result, 100);
@@ -4647,6 +4656,142 @@ mod captcha_blocked_error {
 
 use anvil::tooling::AnchorEditParams;
 
+// ── diff_summary generation tests (Issue #157) ──────────────────────────────
+
+#[test]
+fn file_write_produces_diff_summary() {
+    let root = std::env::temp_dir().join("anvil_diff_summary_write");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("dir should exist");
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
+    let result = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_ds_write_001".to_string(),
+            spec: build_registry()
+                .get("file.write")
+                .expect("file.write spec")
+                .clone(),
+            input: ToolInput::FileWrite {
+                path: "./new_file.txt".to_string(),
+                content: "hello world".to_string(),
+            },
+        })
+        .expect("write should succeed");
+
+    assert_eq!(result.status, ToolExecutionStatus::Completed);
+    assert!(
+        result.diff_summary.is_some(),
+        "file.write should produce a diff_summary"
+    );
+    let diff = result.diff_summary.unwrap();
+    assert!(
+        diff.contains("wrote") && diff.contains("bytes"),
+        "diff_summary should describe the write, got: {diff}"
+    );
+}
+
+#[test]
+fn file_edit_produces_diff_summary() {
+    let root = std::env::temp_dir().join("anvil_diff_summary_edit");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("dir should exist");
+    fs::write(root.join("target.txt"), "hello world").expect("write should succeed");
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
+    let result = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_ds_edit_001".to_string(),
+            spec: build_registry()
+                .get("file.edit")
+                .expect("file.edit spec")
+                .clone(),
+            input: ToolInput::FileEdit {
+                path: "./target.txt".to_string(),
+                old_string: "hello".to_string(),
+                new_string: "goodbye".to_string(),
+            },
+        })
+        .expect("edit should succeed");
+
+    assert_eq!(result.status, ToolExecutionStatus::Completed);
+    assert!(
+        result.diff_summary.is_some(),
+        "file.edit should produce a diff_summary"
+    );
+    let diff = result.diff_summary.unwrap();
+    assert!(
+        diff.contains("-hello") && diff.contains("+goodbye"),
+        "diff_summary should contain the actual diff, got: {diff}"
+    );
+}
+
+#[test]
+fn file_edit_anchor_produces_diff_summary() {
+    let root = std::env::temp_dir().join("anvil_diff_summary_anchor");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("dir should exist");
+    fs::write(root.join("test.rs"), "fn main() {\n    let x = 1;\n}\n")
+        .expect("write should succeed");
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
+    let result = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_ds_anchor_001".to_string(),
+            spec: build_registry()
+                .get("file.edit_anchor")
+                .expect("file.edit_anchor spec")
+                .clone(),
+            input: ToolInput::FileEditAnchor {
+                path: "./test.rs".to_string(),
+                params: AnchorEditParams {
+                    old_content: "let x = 1;".to_string(),
+                    new_content: "let x = 42;".to_string(),
+                },
+            },
+        })
+        .expect("anchor edit should succeed");
+
+    assert_eq!(result.status, ToolExecutionStatus::Completed);
+    assert!(
+        result.diff_summary.is_some(),
+        "file.edit_anchor should produce a diff_summary"
+    );
+    let diff = result.diff_summary.unwrap();
+    assert!(
+        diff.contains("-let x = 1;") && diff.contains("+let x = 42;"),
+        "diff_summary should contain the actual diff, got: {diff}"
+    );
+}
+
+#[test]
+fn file_read_has_no_diff_summary() {
+    let root = std::env::temp_dir().join("anvil_diff_summary_read");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("dir should exist");
+    fs::write(root.join("test.txt"), "content").expect("write should succeed");
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
+    let result = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_ds_read_001".to_string(),
+            spec: build_registry()
+                .get("file.read")
+                .expect("file.read spec")
+                .clone(),
+            input: ToolInput::FileRead {
+                path: "./test.txt".to_string(),
+            },
+        })
+        .expect("read should succeed");
+
+    assert_eq!(result.status, ToolExecutionStatus::Completed);
+    assert!(
+        result.diff_summary.is_none(),
+        "file.read should NOT produce a diff_summary"
+    );
+}
+
 #[test]
 fn file_edit_anchor_registered_in_registry() {
     let registry = build_registry();
@@ -5380,4 +5525,281 @@ fn file_edit_no_changes_payload_is_none() {
         ToolExecutionPayload::None,
         "no-changes path should return Payload::None"
     );
+}
+
+// ============================================================
+// Large file write block tests (Issue #156)
+// ============================================================
+
+/// Helper to build a file.write ToolExecutionRequest.
+fn build_file_write_request(
+    registry: &ToolRegistry,
+    path: &str,
+    content: &str,
+) -> ToolExecutionRequest {
+    registry
+        .validate(ToolCallRequest::new(
+            "call_write_large",
+            "file.write",
+            ToolInput::FileWrite {
+                path: path.to_string(),
+                content: content.to_string(),
+            },
+        ))
+        .expect("should validate")
+        .approve()
+        .into_execution_request(ToolExecutionPolicy {
+            approval_required: false,
+            ..Default::default()
+        })
+        .expect("policy should allow")
+}
+
+#[test]
+fn large_file_write_blocked_over_threshold() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let file = root.join("big.txt");
+    // Create a 501-line file (exceeds default 500)
+    let lines: Vec<String> = (0..501).map(|i| format!("line {i}")).collect();
+    fs::write(&file, lines.join("\n")).unwrap();
+
+    let registry = build_registry();
+    let mut executor = LocalToolExecutor::new_without_rate_limit(&root);
+    executor.set_safe_write_max_lines(500);
+    let request = build_file_write_request(&registry, "big.txt", "replacement");
+    let result = executor.execute(request);
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Large existing files cannot be overwritten"),
+        "error: {msg}"
+    );
+    assert!(msg.contains("file.edit"), "should suggest file.edit: {msg}");
+}
+
+#[test]
+fn small_file_write_allowed_under_threshold() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let file = root.join("small.txt");
+    // Create a 100-line file (under 500)
+    let lines: Vec<String> = (0..100).map(|i| format!("line {i}")).collect();
+    fs::write(&file, lines.join("\n")).unwrap();
+
+    let registry = build_registry();
+    let mut executor = LocalToolExecutor::new_without_rate_limit(&root);
+    executor.set_safe_write_max_lines(500);
+    let request = build_file_write_request(&registry, "small.txt", "replacement");
+    let result = executor.execute(request);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn new_file_write_allowed_regardless_of_threshold() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+
+    let registry = build_registry();
+    let mut executor = LocalToolExecutor::new_without_rate_limit(&root);
+    executor.set_safe_write_max_lines(500);
+    // Write a new file with 600 lines
+    let lines: Vec<String> = (0..600).map(|i| format!("line {i}")).collect();
+    let request = build_file_write_request(&registry, "new_file.txt", &lines.join("\n"));
+    let result = executor.execute(request);
+    assert!(result.is_ok(), "new file creation should not be blocked");
+}
+
+#[test]
+fn large_file_write_allowed_when_disabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let file = root.join("big.txt");
+    let lines: Vec<String> = (0..501).map(|i| format!("line {i}")).collect();
+    fs::write(&file, lines.join("\n")).unwrap();
+
+    let registry = build_registry();
+    // safe_write_max_lines = 0 (disabled, default for new_without_rate_limit)
+    let mut executor = LocalToolExecutor::new_without_rate_limit(&root);
+    let request = build_file_write_request(&registry, "big.txt", "replacement");
+    let result = executor.execute(request);
+    assert!(result.is_ok(), "should succeed when safe_write_max_lines=0");
+}
+
+#[test]
+fn large_file_write_custom_threshold() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let file = root.join("medium.txt");
+    // Create a 101-line file
+    let lines: Vec<String> = (0..101).map(|i| format!("line {i}")).collect();
+    fs::write(&file, lines.join("\n")).unwrap();
+
+    let registry = build_registry();
+    let mut executor = LocalToolExecutor::new_without_rate_limit(&root);
+    executor.set_safe_write_max_lines(100);
+    let request = build_file_write_request(&registry, "medium.txt", "replacement");
+    let result = executor.execute(request);
+    assert!(result.is_err(), "should block with custom threshold of 100");
+}
+
+#[test]
+fn large_file_write_exactly_at_threshold_allowed() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let file = root.join("exact.txt");
+    // Create a file with exactly 500 lines (500 newlines = 500+1=501? No, 499 newlines + content = 500 lines)
+    // line_count = newlines + 1, so we need 499 newlines for 500 lines
+    let lines: Vec<String> = (0..500).map(|i| format!("line {i}")).collect();
+    let content = lines.join("\n"); // 499 newlines = 500 lines
+    fs::write(&file, &content).unwrap();
+
+    let registry = build_registry();
+    let mut executor = LocalToolExecutor::new_without_rate_limit(&root);
+    executor.set_safe_write_max_lines(500);
+    let request = build_file_write_request(&registry, "exact.txt", "replacement");
+    let result = executor.execute(request);
+    assert!(
+        result.is_ok(),
+        "file with exactly 500 lines should be allowed"
+    );
+}
+
+#[test]
+fn large_file_blocked_error_display_format() {
+    use anvil::tooling::ToolRuntimeError;
+    let err = ToolRuntimeError::LargeFileBlocked {
+        path: "src/main.rs".to_string(),
+        line_count: 600,
+        threshold: 500,
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("600 lines"));
+    assert!(msg.contains("threshold: 500"));
+    assert!(msg.contains("file.edit"));
+    assert!(msg.contains("file.edit_anchor"));
+}
+
+#[test]
+fn large_file_blocked_error_sanitizes_control_chars() {
+    use anvil::tooling::ToolRuntimeError;
+    let err = ToolRuntimeError::LargeFileBlocked {
+        path: "src/\nmain\x00.rs".to_string(),
+        line_count: 600,
+        threshold: 500,
+    };
+    let msg = err.to_string();
+    assert!(!msg.contains('\n') || msg.starts_with("File"));
+    assert!(!msg.contains('\x00'));
+    assert!(msg.contains("src/main.rs"));
+}
+
+// ============================================================
+// Diff deletion warning tests (Issue #156)
+// ============================================================
+
+#[test]
+fn diff_preview_deletion_warning_when_threshold_exceeded() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("original.txt");
+    // Create a file with 100 lines
+    let original_lines: Vec<String> = (0..100).map(|i| format!("line {i}")).collect();
+    fs::write(&file_path, original_lines.join("\n")).unwrap();
+
+    // New content replaces most lines (high deletion ratio)
+    let input = ToolInput::FileWrite {
+        path: "original.txt".to_string(),
+        content: "only one line\n".to_string(),
+    };
+    let options = DiffOptions {
+        deletion_ratio_threshold: 0.5,
+    };
+    let result = generate_diff_preview(dir.path(), &input, &options);
+    assert!(result.is_some());
+    let diff = result.unwrap();
+    assert!(
+        diff.contains("WARNING"),
+        "should contain deletion warning: {diff}"
+    );
+    assert!(
+        diff.contains("lines deleted"),
+        "should mention lines deleted: {diff}"
+    );
+}
+
+#[test]
+fn diff_preview_no_warning_when_below_threshold() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("small_change.txt");
+    // Create a file with 10 lines
+    let original_lines: Vec<String> = (0..10).map(|i| format!("line {i}")).collect();
+    fs::write(&file_path, original_lines.join("\n")).unwrap();
+
+    // Change only 2 lines (low deletion ratio)
+    let mut new_lines = original_lines.clone();
+    new_lines[0] = "modified line 0".to_string();
+    new_lines[1] = "modified line 1".to_string();
+    let input = ToolInput::FileWrite {
+        path: "small_change.txt".to_string(),
+        content: new_lines.join("\n"),
+    };
+    let options = DiffOptions {
+        deletion_ratio_threshold: 0.5,
+    };
+    let result = generate_diff_preview(dir.path(), &input, &options);
+    assert!(result.is_some());
+    let diff = result.unwrap();
+    assert!(
+        !diff.contains("WARNING"),
+        "should not contain deletion warning for small change: {diff}"
+    );
+}
+
+#[test]
+fn diff_preview_no_warning_when_disabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("delete_all.txt");
+    let original_lines: Vec<String> = (0..100).map(|i| format!("line {i}")).collect();
+    fs::write(&file_path, original_lines.join("\n")).unwrap();
+
+    let input = ToolInput::FileWrite {
+        path: "delete_all.txt".to_string(),
+        content: "replacement\n".to_string(),
+    };
+    let options = DiffOptions {
+        deletion_ratio_threshold: 0.0, // disabled
+    };
+    let result = generate_diff_preview(dir.path(), &input, &options);
+    assert!(result.is_some());
+    let diff = result.unwrap();
+    assert!(
+        !diff.contains("WARNING"),
+        "should not contain warning when disabled: {diff}"
+    );
+}
+
+#[test]
+fn diff_preview_no_warning_for_new_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = ToolInput::FileWrite {
+        path: "brand_new.txt".to_string(),
+        content: "new content\n".to_string(),
+    };
+    let options = DiffOptions {
+        deletion_ratio_threshold: 0.5,
+    };
+    let result = generate_diff_preview(dir.path(), &input, &options);
+    assert!(result.is_some());
+    let diff = result.unwrap();
+    assert!(
+        !diff.contains("WARNING"),
+        "new file should not have deletion warning: {diff}"
+    );
+}
+
+#[test]
+fn diff_options_default_values() {
+    let opts = DiffOptions::default();
+    assert!((opts.deletion_ratio_threshold - 0.5).abs() < f64::EPSILON);
 }
