@@ -15,12 +15,23 @@ const DEFAULT_MAX_ENTRIES: usize = 100;
 /// Default maximum total bytes across all cached entries (10 MB).
 const DEFAULT_MAX_BYTES: usize = 10_485_760;
 
+/// Result returned by [`FileReadCache::try_get`] on cache hit.
+pub struct CacheHit {
+    /// The cached file content.
+    pub content: String,
+    /// Cumulative read count for this entry (1 = initial record, 2+ = cache hits).
+    pub hit_count: usize,
+}
+
 /// A single cached file entry.
 pub struct CacheEntry {
     pub content: String,
     pub mtime: SystemTime,
     pub byte_size: usize,
     pub last_access: Instant,
+    /// Cumulative read count. Initialised to 1 on `record()` (first read),
+    /// incremented on each `try_get()` hit.
+    pub hit_count: usize,
 }
 
 /// In-memory file read cache with LRU eviction and sandbox boundary enforcement.
@@ -66,7 +77,7 @@ impl FileReadCache {
     /// Internally performs canonicalize + mtime check + sandbox boundary validation.
     /// Returns `None` on miss, canonicalize failure, or sandbox violation.
     /// Updates `last_access` on hit (DR1-005).
-    pub fn try_get(&mut self, resolved_path: &Path) -> Option<String> {
+    pub fn try_get(&mut self, resolved_path: &Path) -> Option<CacheHit> {
         let canonical = self.validate_canonical_path(resolved_path)?;
         let mtime = fs::metadata(&canonical).ok()?.modified().ok()?;
 
@@ -80,7 +91,11 @@ impl FileReadCache {
         }
 
         entry.last_access = Instant::now();
-        Some(entry.content.clone())
+        entry.hit_count += 1;
+        Some(CacheHit {
+            content: entry.content.clone(),
+            hit_count: entry.hit_count,
+        })
     }
 
     /// High-level API: record a file's content in the cache.
@@ -104,7 +119,7 @@ impl FileReadCache {
             self.total_bytes = self.total_bytes.saturating_sub(old.byte_size);
         }
 
-        // Insert new entry
+        // Insert new entry (hit_count=1: initial read via record)
         self.entries.insert(
             canonical,
             CacheEntry {
@@ -112,6 +127,7 @@ impl FileReadCache {
                 mtime,
                 byte_size,
                 last_access: Instant::now(),
+                hit_count: 1,
             },
         );
         self.total_bytes += byte_size;
