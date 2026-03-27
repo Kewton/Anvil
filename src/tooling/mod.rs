@@ -28,6 +28,9 @@ const MAX_CONTEXT_LINES: u32 = 10;
 /// Maximum number of matched files returned by file.search.
 const MAX_SEARCH_RESULTS: usize = 100;
 
+/// Default root directory for file.search when the LLM omits the root parameter.
+pub(crate) const DEFAULT_SEARCH_ROOT: &str = ".";
+
 /// Files larger than this are blocked by the safe-write guard without reading
 /// their full contents, to avoid memory pressure (10 MB).
 const MAX_SAFE_WRITE_GUARD_READ_BYTES: u64 = 10 * 1024 * 1024;
@@ -243,12 +246,16 @@ impl ToolInput {
                     .to_string(),
             }),
             "file.search" => Ok(ToolInput::FileSearch {
-                root: value
-                    .get("root")
-                    .or_else(|| value.get("path"))
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| "missing root in file.search tool block".to_string())?
-                    .to_string(),
+                root: {
+                    let raw = value.get("root").or_else(|| value.get("path"));
+                    match raw {
+                        Some(v) => v
+                            .as_str()
+                            .ok_or_else(|| "root in file.search must be a string".to_string())?
+                            .to_string(),
+                        None => DEFAULT_SEARCH_ROOT.to_string(),
+                    }
+                },
                 pattern: value
                     .get("pattern")
                     .or_else(|| value.get("content"))
@@ -399,7 +406,9 @@ impl ToolInput {
                 path: extract_simple(block, "path")?,
             }),
             "file.search" => Some(ToolInput::FileSearch {
-                root: extract_simple(block, "root").or_else(|| extract_simple(block, "path"))?,
+                root: extract_simple(block, "root")
+                    .or_else(|| extract_simple(block, "path"))
+                    .unwrap_or_else(|| DEFAULT_SEARCH_ROOT.to_string()),
                 pattern: extract_simple(block, "pattern")
                     .or_else(|| extract_simple(block, "content"))
                     .or_else(|| extract_simple(block, "query"))?,

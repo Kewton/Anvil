@@ -258,7 +258,7 @@ fn build_tool_input(
         }
         "file.search" => ToolInput::FileSearch {
             root: get_attr("root")
-                .ok_or_else(|| "missing root attribute for file.search".to_string())?,
+                .unwrap_or_else(|| crate::tooling::DEFAULT_SEARCH_ROOT.to_string()),
             pattern: get_attr("pattern")
                 .ok_or_else(|| "missing pattern attribute for file.search".to_string())?,
             regex: false,
