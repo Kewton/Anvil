@@ -2,6 +2,29 @@
 
 ## [Unreleased]
 
+## [0.0.7] - 2026-03-27
+
+### Added
+- File read cache with mtime-based invalidation and LRU eviction (#142, #174)
+- Loop detection and self-correction with ring buffer and staged response (#145)
+- ANVIL_FINAL early-fire guard to prevent plan-only outputs (#144)
+- File.edit error recovery with 3-level fallback and context hints (#143)
+- `--timeout` option for external timeout configuration (#146)
+- Large file write protection with configurable threshold (#156)
+- File.write consecutive failure retry limit (#161)
+- Context reset state carry-over with working memory injection (#157)
+- Unified edit/write fallback strategy with configurable thresholds (#158)
+- File.edit diff feedback to LLM after successful edits (#155)
+- Model-independent phase control with fallback completion detection (#159)
+- UI language stability with configurable language code (#162)
+- File.search loop detection and max tool calls limit (#172)
+- File.search root path handling improvement (#175)
+- Large file edit fallback with size-aware thresholds (#176)
+- Post-ANVIL_FINAL tool call filtering to prevent continuation (#160, #173)
+
+### Changed
+- `max_agent_iterations` / `subagent_max_iterations` default values increased (#147)
+
 ## [0.0.6] - 2026-03-21
 
 ### Added
