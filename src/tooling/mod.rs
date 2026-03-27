@@ -2297,23 +2297,28 @@ pub(crate) fn count_file_lines(path: &std::path::Path) -> std::io::Result<usize>
     }
 }
 
-/// Normalize a single line for Level 2 edit matching: trim trailing whitespace
-/// and convert tabs to spaces. This is intentionally conservative to avoid
-/// collapsing meaningful whitespace differences in string literals, comments,
-/// or Markdown content (CB-001).
-fn normalize_line_whitespace(line: &str) -> String {
-    line.trim_end().replace('\t', "    ")
+/// Normalize internal whitespace in a single line: preserve leading indent,
+/// collapse runs of internal whitespace (spaces/tabs) to a single space.
+fn normalize_internal_whitespace(line: &str) -> String {
+    if line.is_empty() {
+        return String::new();
+    }
+    // Measure leading whitespace
+    let indent_len = line.len() - line.trim_start().len();
+    let (indent, rest) = line.split_at(indent_len);
+    if rest.is_empty() {
+        return indent.to_string();
+    }
+    let collapsed: String = rest.split_whitespace().collect::<Vec<_>>().join(" ");
+    format!("{indent}{collapsed}")
 }
 
-/// Normalize lines for Level 2 (trailing-ws) edit matching.
-///
-/// Each line is trimmed of trailing whitespace and tabs are converted to
-/// 4 spaces. This handles the common LLM mistake of confusing tabs and
-/// spaces while keeping the normalization conservative enough to avoid
-/// false matches in string literals or other semantically-significant
-/// whitespace contexts.
+/// Normalize lines for edit matching: trim trailing whitespace and collapse
+/// internal whitespace runs to a single space while preserving leading indent.
 fn normalize_lines(text: &str) -> Vec<String> {
-    text.lines().map(normalize_line_whitespace).collect()
+    text.lines()
+        .map(|line| normalize_internal_whitespace(line.trim_end()))
+        .collect()
 }
 
 /// Resolve a relative path within a sandbox root directory.

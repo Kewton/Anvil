@@ -320,6 +320,7 @@ impl App {
         inference_performance: Option<crate::contracts::InferencePerformanceView>,
         tui: &Tui,
         provider_client: &C,
+        anvil_final_already: bool,
     ) -> Result<Vec<String>, AppError> {
         let max_iterations = self.config.runtime.max_agent_iterations;
         let mut current = structured;
@@ -328,6 +329,10 @@ impl App {
         let mut all_tool_log_views: Vec<ToolLogView> = Vec::new();
         let mut final_guard_retries: u8 = 0;
         let mut fallback_completed = false;
+        // Issue #173: Track whether ANVIL_FINAL has been seen in this session.
+        // When true, the loop will terminate after executing the current batch
+        // of tool calls (no further LLM round-trips).
+        let mut anvil_final_seen = anvil_final_already || current.anvil_final_detected;
 
         // Reset loop detector at the start of each top-level turn (Issue #145)
         self.loop_detector.reset();
@@ -356,6 +361,7 @@ impl App {
             let current_normal = StructuredAssistantResponse {
                 tool_calls: normal_calls,
                 final_response: current.final_response.clone(),
+                anvil_final_detected: current.anvil_final_detected,
             };
 
             // Show plan for this iteration
@@ -405,6 +411,13 @@ impl App {
             // Results are already recorded and visible above; now terminate the loop.
             if let super::loop_detector::LoopAction::Break(ref msg) = loop_action {
                 tracing::warn!(reason = "loop_detected", message = %msg, "agentic loop terminated by loop detector");
+                break;
+            }
+
+            // Issue #173: If ANVIL_FINAL was already seen, terminate after
+            // executing the current tool batch (no further LLM round-trips).
+            if anvil_final_seen {
+                tracing::info!("ANVIL_FINAL detected; terminating after tool execution");
                 break;
             }
 
@@ -505,21 +518,26 @@ impl App {
                         // entire turn.
                         let trimmed = next_token_buffer.trim();
                         if !trimmed.is_empty() {
-                            StructuredAssistantResponse {
-                                tool_calls: Vec::new(),
-                                final_response: trimmed.to_string(),
-                            }
+                            StructuredAssistantResponse::empty(trimmed.to_string())
                         } else {
                             return Err(AppError::ToolExecution(first_err));
                         }
                     }
                 };
 
+            // Issue #173: Update ANVIL_FINAL tracking from the new response
+            if next_structured.anvil_final_detected {
+                anvil_final_seen = true;
+                self.phase_estimator.observe_anvil_final();
+            }
+
             if next_structured.tool_calls.is_empty() {
                 // ANVIL_FINAL guard: check if any file modifications were made
                 if self.should_activate_final_guard(final_guard_retries) {
                     // ANVIL_FINAL was detected → record observation (Issue #159)
-                    self.phase_estimator.observe_anvil_final();
+                    if !next_structured.anvil_final_detected {
+                        self.phase_estimator.observe_anvil_final();
+                    }
                     self.inject_final_guard_retry();
                     final_guard_retries += 1;
                     current = next_structured;
@@ -1371,18 +1389,17 @@ impl App {
             Ok(parsed) => parsed,
             Err(_) => {
                 let trimmed = token_buffer.trim();
-                StructuredAssistantResponse {
-                    tool_calls: Vec::new(),
-                    final_response: if trimmed.is_empty() {
-                        "Guard retry produced empty response.".to_string()
-                    } else {
-                        trimmed.to_string()
-                    },
-                }
+                StructuredAssistantResponse::empty(if trimmed.is_empty() {
+                    "Guard retry produced empty response.".to_string()
+                } else {
+                    trimmed.to_string()
+                })
             }
         };
 
-        // If response has tool_calls, delegate to complete_structured_response
+        // If response has tool_calls, delegate to complete_structured_response.
+        // Issue #173: Pass anvil_final_already=true since Guard Retry was triggered
+        // by ANVIL_FINAL detection.
         if !retry_structured.tool_calls.is_empty() {
             return self.complete_structured_response(
                 retry_structured,
@@ -1392,6 +1409,7 @@ impl App {
                 inference_performance,
                 tui,
                 provider_client,
+                true, // anvil_final_already: Guard Retry origin was ANVIL_FINAL
             );
         }
 
@@ -1450,7 +1468,8 @@ impl App {
             // the first-turn Done event (before any agentic loop iteration).
             // MAX_FINAL_GUARD_RETRIES = 1 ensures at most one retry, so the
             // hardcoded 0 is correct and sufficient for the current design.
-            if BasicAgentLoop::is_complete_structured_response(assistant_message)
+            // Issue #173: Use lenient detection for Done path (response is complete)
+            if BasicAgentLoop::is_complete_structured_response_lenient(assistant_message)
                 && self.should_activate_final_guard(0)
             {
                 // ANVIL_FINAL detected → record observation (Issue #159)
@@ -1471,6 +1490,8 @@ impl App {
             return Ok(None);
         }
 
+        // Issue #173: Pass anvil_final_detected flag from the parsed response
+        let anvil_final = structured.anvil_final_detected;
         Ok(Some(self.complete_structured_response(
             structured,
             status,
@@ -1479,6 +1500,7 @@ impl App {
             inference_performance.clone(),
             tui,
             provider_client,
+            anvil_final,
         )?))
     }
 }

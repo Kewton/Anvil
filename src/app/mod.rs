@@ -1051,6 +1051,8 @@ impl App {
                                 let structured =
                                     BasicAgentLoop::parse_structured_response(&token_buffer)
                                         .map_err(AppError::ToolExecution)?;
+                                // Issue #173: Pass anvil_final_detected from parsed response
+                                let anvil_final = structured.anvil_final_detected;
                                 frames.extend(self.complete_structured_response(
                                     structured,
                                     "Done. session saved",
@@ -1059,6 +1061,7 @@ impl App {
                                     None,
                                     tui,
                                     provider_client,
+                                    anvil_final,
                                 )?);
                                 break;
                             }
