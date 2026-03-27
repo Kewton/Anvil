@@ -110,6 +110,7 @@ src/
 │   ├── cli.rs           # CLI入力ループ
 │   ├── context.rs       # コンテキスト注入（@file展開・サンドボックス検証）
 │   ├── edit_fail_tracker.rs # 連続file.edit失敗の検出・回復ヒント注入
+│   ├── alternating_loop_detector.rs # AlternatingLoopDetector（交互/循環パターン検出）
 │   ├── loop_detector.rs # ループ検出（リングバッファ・段階的対応）
 │   ├── phase_estimator.rs # フェーズ推定（ツール呼び出しパターンベース・フォールバック完了検出）
 │   ├── write_fail_tracker.rs # file.write連続失敗トラッキング（ヒント提供・閾値2）
@@ -158,6 +159,7 @@ tests/
 ├── tui_console.rs       # TUIテスト
 ├── skills_system.rs     # スキルシステムテスト
 ├── hooks_system.rs      # フックシステムテスト
+├── alternating_loop_detection.rs # 交互ループ検出テスト
 ├── loop_detection.rs    # ループ検出テスト
 ├── phase_estimation.rs  # フェーズ推定テスト
 ├── context_inject.rs    # コンテキスト注入テスト

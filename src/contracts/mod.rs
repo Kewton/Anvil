@@ -21,6 +21,8 @@ pub enum TerminationReason {
     Timeout,
     MaxIterations,
     LoopDetected,
+    /// Tool call count limit reached (Issue #172).
+    MaxToolCalls,
     /// Normal completion. Also serves as fallback for unknown variants via `#[serde(other)]`.
     #[default]
     #[serde(other)]
@@ -34,6 +36,7 @@ impl std::fmt::Display for TerminationReason {
             Self::Timeout => write!(f, "timeout"),
             Self::MaxIterations => write!(f, "max_iterations"),
             Self::LoopDetected => write!(f, "loop_detected"),
+            Self::MaxToolCalls => write!(f, "max_tool_calls"),
             Self::FallbackCompleted => write!(f, "fallback_completed"),
         }
     }
@@ -741,6 +744,10 @@ mod tests {
             "max_iterations"
         );
         assert_eq!(TerminationReason::LoopDetected.to_string(), "loop_detected");
+        assert_eq!(
+            TerminationReason::MaxToolCalls.to_string(),
+            "max_tool_calls"
+        );
     }
 
     #[test]
@@ -750,6 +757,7 @@ mod tests {
             TerminationReason::Timeout,
             TerminationReason::MaxIterations,
             TerminationReason::LoopDetected,
+            TerminationReason::MaxToolCalls,
         ] {
             let json = serde_json::to_string(&reason).expect("serialize");
             let back: TerminationReason = serde_json::from_str(&json).expect("deserialize");
