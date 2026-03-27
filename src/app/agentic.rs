@@ -14,7 +14,7 @@ use crate::state::StateTransition;
 use crate::tooling::{
     ExecutionMode, LocalToolExecutor, ToolCallRequest, ToolExecutionPayload, ToolExecutionPolicy,
     ToolExecutionRequest, ToolExecutionResult, ToolExecutionStatus, ToolInput, ToolKind,
-    diff::generate_diff_preview, resolve_sandbox_path,
+    count_file_lines, diff::generate_diff_preview, resolve_sandbox_path,
 };
 use crate::tui::Tui;
 use std::sync::Arc;
@@ -336,6 +336,8 @@ impl App {
 
         // Reset loop detector at the start of each top-level turn (Issue #145)
         self.loop_detector.reset();
+        // Reset alternating loop detector per-turn (Issue #172)
+        self.alternating_loop_detector.reset();
         // Reset phase estimator per-turn counters (Issue #159)
         self.phase_estimator.reset();
 
@@ -407,7 +409,7 @@ impl App {
 
             // Handle loop detection Break action (Issue #145)
             // Results are already recorded and visible above; now terminate the loop.
-            if let Some(super::loop_detector::LoopAction::Break(ref msg)) = loop_action {
+            if let super::loop_detector::LoopAction::Break(ref msg) = loop_action {
                 tracing::warn!(reason = "loop_detected", message = %msg, "agentic loop terminated by loop detector");
                 break;
             }
@@ -416,6 +418,16 @@ impl App {
             // executing the current tool batch (no further LLM round-trips).
             if anvil_final_seen {
                 tracing::info!("ANVIL_FINAL detected; terminating after tool execution");
+                break;
+            }
+
+            // Max tool calls check (Issue #172)
+            if total_tool_count >= self.config.runtime.max_tool_calls {
+                tracing::warn!(
+                    "Max tool calls reached ({}/{}). Terminating agentic loop.",
+                    total_tool_count,
+                    self.config.runtime.max_tool_calls
+                );
                 break;
             }
 
@@ -790,13 +802,7 @@ impl App {
     pub(crate) fn execute_structured_tool_calls(
         &mut self,
         structured: &StructuredAssistantResponse,
-    ) -> Result<
-        (
-            Vec<ToolExecutionResult>,
-            Option<super::loop_detector::LoopAction>,
-        ),
-        AppError,
-    > {
+    ) -> Result<(Vec<ToolExecutionResult>, super::loop_detector::LoopAction), AppError> {
         // Phase 1: Validation + Approval
         let (validated_requests, mut failed_results) =
             self.validate_and_approve_all(&structured.tool_calls);
@@ -872,33 +878,25 @@ impl App {
             validated_requests
         };
 
-        // Loop detection: record each validated tool call and check for repetition (Issue #145)
-        let mut worst_loop_action: Option<super::loop_detector::LoopAction> = None;
+        // Loop detection: record each validated tool call and check for repetition (Issue #145, #172)
+        let mut worst_loop_action = super::loop_detector::LoopAction::Continue;
         for (_, req) in &validated_requests {
             if let Some((tool_name, tool_input)) = tool_input_map.get(&req.tool_call_id) {
+                // LoopDetector: same-call repetition
                 let action = self.loop_detector.record_and_check(tool_name, tool_input);
-                worst_loop_action = match (&worst_loop_action, &action) {
-                    (_, super::loop_detector::LoopAction::Continue) => worst_loop_action,
-                    (None, _) => Some(action),
-                    (Some(super::loop_detector::LoopAction::Continue), _) => Some(action),
-                    (
-                        Some(super::loop_detector::LoopAction::Warn(_)),
-                        super::loop_detector::LoopAction::StrongWarn(_)
-                        | super::loop_detector::LoopAction::Break(_),
-                    ) => Some(action),
-                    (
-                        Some(super::loop_detector::LoopAction::StrongWarn(_)),
-                        super::loop_detector::LoopAction::Break(_),
-                    ) => Some(action),
-                    _ => worst_loop_action,
-                };
+                worst_loop_action = worst_loop_action.merge(action);
+                // AlternatingLoopDetector: cyclic pattern detection (Issue #172)
+                let alt_action = self
+                    .alternating_loop_detector
+                    .record_and_check(tool_name, tool_input);
+                worst_loop_action = worst_loop_action.merge(alt_action);
             }
         }
 
         // If Break: skip tool execution entirely
         if matches!(
             worst_loop_action,
-            Some(super::loop_detector::LoopAction::Break(_))
+            super::loop_detector::LoopAction::Break(_)
         ) {
             // Return failed results with the Break action
             failed_results.sort_by_key(|(idx, _)| *idx);
@@ -909,19 +907,17 @@ impl App {
 
         // For Warn/StrongWarn: create synthetic tool result to include in results
         let synthetic_warning = match &worst_loop_action {
-            Some(super::loop_detector::LoopAction::Warn(msg))
-            | Some(super::loop_detector::LoopAction::StrongWarn(msg)) => {
-                Some(ToolExecutionResult {
-                    tool_call_id: "loop_detector_warning".to_string(),
-                    tool_name: "system.loop_detector".to_string(),
-                    status: ToolExecutionStatus::Completed,
-                    summary: msg.clone(),
-                    payload: ToolExecutionPayload::Text(msg.clone()),
-                    artifacts: vec![],
-                    elapsed_ms: 0,
-                    diff_summary: None,
-                })
-            }
+            super::loop_detector::LoopAction::Warn(msg)
+            | super::loop_detector::LoopAction::StrongWarn(msg) => Some(ToolExecutionResult {
+                tool_call_id: "loop_detector_warning".to_string(),
+                tool_name: "system.loop_detector".to_string(),
+                status: ToolExecutionStatus::Completed,
+                summary: msg.clone(),
+                payload: ToolExecutionPayload::Text(msg.clone()),
+                artifacts: vec![],
+                elapsed_ms: 0,
+                diff_summary: None,
+            }),
             _ => None,
         };
 
@@ -1128,7 +1124,7 @@ impl App {
         // Skip if LoopDetector already issued a warning (priority: LoopDetector > PhaseEstimator).
         if matches!(
             worst_loop_action,
-            None | Some(super::loop_detector::LoopAction::Continue)
+            super::loop_detector::LoopAction::Continue
         ) && let super::phase_estimator::PhaseAction::ForceTransition(msg) = phase_action
         {
             // Context window protection: skip if usage >= 90%
@@ -1215,12 +1211,34 @@ impl App {
                         }
                         crate::app::edit_fail_tracker::EditFallbackAction::WriteFallback => {
                             self.prepare_write_fallback();
-                            edit_hint = Some(format!(
-                                "\n\n[Anvil hint] file.edit has failed {count} consecutive \
-                                 times for '{path}'. Consider using file.read to get the \
-                                 current content, then file.write to replace the entire file \
-                                 with the corrected version."
-                            ));
+                            let max_lines = self.config.runtime.safe_write_max_lines;
+                            let line_count = if max_lines > 0 {
+                                resolve_sandbox_path(&self.config.paths.cwd, &path)
+                                    .ok()
+                                    .and_then(|resolved| count_file_lines(&resolved).ok())
+                            } else {
+                                None
+                            };
+                            let is_large = line_count.is_some_and(|lines| lines > max_lines);
+                            let line_count_check_failed = max_lines > 0 && line_count.is_none();
+
+                            if is_large || line_count_check_failed {
+                                edit_hint = Some(format!(
+                                    "\n\n[Anvil hint] file.edit has failed {count} consecutive \
+                                     times for '{path}'. file.write is not available or could not be \
+                                     safely validated for this path. Instead: \
+                                     (1) Use file.read to get the current content. \
+                                     (2) Identify the exact section to change. \
+                                     (3) Retry file.edit with a smaller, precise old_string."
+                                ));
+                            } else {
+                                edit_hint = Some(format!(
+                                    "\n\n[Anvil hint] file.edit has failed {count} consecutive \
+                                     times for '{path}'. Consider using file.read to get the \
+                                     current content, then file.write to replace the entire file \
+                                     with the corrected version."
+                                ));
+                            }
                         }
                     }
                 }

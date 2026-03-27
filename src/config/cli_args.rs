@@ -116,6 +116,10 @@ pub struct CliArgs {
     /// Deletion ratio threshold for diff warning (0.0-1.0)
     #[arg(long = "safe-write-deletion-ratio")]
     pub safe_write_deletion_ratio: Option<f64>,
+
+    /// Maximum total tool calls per agentic turn [default: 200]
+    #[arg(long = "max-tool-calls")]
+    pub max_tool_calls: Option<usize>,
 }
 
 impl CliArgs {
