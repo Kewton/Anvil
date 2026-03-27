@@ -5056,8 +5056,9 @@ fn file_cache_hit_same_path_same_mtime() {
     let mut cache = FileReadCache::new(root);
     cache.record(&file, "hello world".to_string());
 
-    let result = cache.try_get(&file);
-    assert_eq!(result, Some("hello world".to_string()));
+    let hit = cache.try_get(&file).expect("cache hit");
+    assert_eq!(hit.content, "hello world");
+    assert_eq!(hit.hit_count, 2);
 }
 
 #[test]
@@ -5343,7 +5344,8 @@ fn file_cache_lru_eviction_by_entry_count() {
     );
     // file3 should still be present
     let file3 = root.join("file3.txt");
-    assert_eq!(cache.try_get(&file3), Some("content3".to_string()));
+    let hit = cache.try_get(&file3).expect("file3 should be cached");
+    assert_eq!(hit.content, "content3");
 }
 
 #[test]
@@ -5474,7 +5476,11 @@ fn file_cache_update_existing_entry() {
 
     assert_eq!(cache.len(), 1);
     assert_eq!(cache.total_bytes(), 15); // "version2_longer".len()
-    assert_eq!(cache.try_get(&file), Some("version2_longer".to_string()));
+    let hit = cache
+        .try_get(&file)
+        .expect("updated entry should be cached");
+    assert_eq!(hit.content, "version2_longer");
+    assert_eq!(hit.hit_count, 2); // record resets to 1, try_get increments to 2
 }
 
 #[test]
@@ -5824,6 +5830,162 @@ fn diff_preview_no_warning_for_new_file() {
 fn diff_options_default_values() {
     let opts = DiffOptions::default();
     assert!((opts.deletion_ratio_threshold - 0.5).abs() < f64::EPSILON);
+}
+
+// ===== Issue #174: CacheHit / hit_count tests =====
+
+#[test]
+fn file_cache_hit_count_increments() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let file = root.join("test.txt");
+    fs::write(&file, "content").unwrap();
+
+    let mut cache = FileReadCache::new(root);
+    cache.record(&file, "content".to_string()); // hit_count = 1
+
+    let hit1 = cache.try_get(&file).expect("hit 1");
+    assert_eq!(hit1.hit_count, 2);
+    assert_eq!(hit1.content, "content");
+
+    let hit2 = cache.try_get(&file).expect("hit 2");
+    assert_eq!(hit2.hit_count, 3);
+
+    let hit3 = cache.try_get(&file).expect("hit 3");
+    assert_eq!(hit3.hit_count, 4);
+}
+
+#[test]
+fn file_cache_hit_count_resets_on_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let file = root.join("test.txt");
+    fs::write(&file, "v1").unwrap();
+
+    let mut cache = FileReadCache::new(root);
+    cache.record(&file, "v1".to_string());
+
+    // Increment hit_count via try_get
+    let hit = cache.try_get(&file).expect("hit");
+    assert_eq!(hit.hit_count, 2);
+    let hit = cache.try_get(&file).expect("hit");
+    assert_eq!(hit.hit_count, 3);
+
+    // Re-record (e.g. after file edit) should reset hit_count to 1
+    fs::write(&file, "v2").unwrap();
+    cache.record(&file, "v2".to_string());
+
+    let hit = cache.try_get(&file).expect("hit after re-record");
+    assert_eq!(hit.hit_count, 2); // 1 (record) + 1 (try_get) = 2
+    assert_eq!(hit.content, "v2");
+}
+
+#[test]
+fn file_cache_hit_returns_content_with_header() {
+    use std::sync::{Arc, Mutex};
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let file = root.join("hello.txt");
+    fs::write(&file, "Hello, World!").unwrap();
+
+    let cache = Arc::new(Mutex::new(FileReadCache::new(root.clone())));
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
+    executor.set_file_cache(cache);
+
+    let registry = build_registry();
+    let spec = registry.get("file.read").expect("file.read spec").clone();
+
+    let make_request = || ToolExecutionRequest {
+        tool_call_id: "call_cache_header".to_string(),
+        spec: spec.clone(),
+        input: ToolInput::FileRead {
+            path: "hello.txt".to_string(),
+        },
+    };
+
+    // First read: populates cache, returns raw content without header
+    let result1 = executor
+        .execute(make_request())
+        .expect("first read should succeed");
+    let text1 = match &result1.payload {
+        ToolExecutionPayload::Text(t) => t.clone(),
+        other => panic!("expected Text payload on first read, got: {other:?}"),
+    };
+    assert!(
+        !text1.starts_with("[cached:"),
+        "first read should not have cache header: {text1}"
+    );
+    assert!(text1.contains("Hello, World!"));
+
+    // Second read: should hit cache and include header
+    let result2 = executor
+        .execute(make_request())
+        .expect("second read should succeed");
+    let text2 = match &result2.payload {
+        ToolExecutionPayload::Text(t) => t.clone(),
+        other => panic!("expected Text payload on cache hit, got: {other:?}"),
+    };
+    assert!(
+        text2.starts_with("[cached: read #2"),
+        "cache hit payload should start with header: {text2}"
+    );
+    assert!(
+        text2.contains("Hello, World!"),
+        "cache hit payload should contain file content: {text2}"
+    );
+    assert!(
+        text2.contains("13 bytes"),
+        "header should contain byte size: {text2}"
+    );
+}
+
+#[test]
+fn file_cache_parallel_hit_count_consistent() {
+    use std::sync::{Arc, Mutex};
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let file = root.join("shared.txt");
+    fs::write(&file, "shared content").unwrap();
+
+    let cache = Arc::new(Mutex::new(FileReadCache::new(root.clone())));
+
+    // Record initial entry
+    {
+        let mut c = cache.lock().unwrap();
+        c.record(&file, "shared content".to_string());
+    }
+
+    let num_threads = 10;
+
+    // Each thread calls try_get once
+    std::thread::scope(|s| {
+        for _ in 0..num_threads {
+            let cache = Arc::clone(&cache);
+            let file = file.clone();
+            s.spawn(move || {
+                let mut c = cache.lock().unwrap();
+                let hit = c.try_get(&file).expect("should hit");
+                // hit_count should be >= 2 (1 from record + at least 1 from this try_get)
+                assert!(
+                    hit.hit_count >= 2,
+                    "hit_count should be >= 2, got {}",
+                    hit.hit_count
+                );
+            });
+        }
+    });
+
+    // After all threads, hit_count should be 1 (record) + num_threads (try_gets)
+    let mut c = cache.lock().unwrap();
+    let final_hit = c.try_get(&file).expect("final hit");
+    // 1 (record) + 10 (parallel try_gets) + 1 (this try_get) = 12
+    assert_eq!(
+        final_hit.hit_count,
+        1 + num_threads + 1,
+        "hit_count should reflect all accesses"
+    );
 }
 
 // --- Issue #175: file.search root default tests ---

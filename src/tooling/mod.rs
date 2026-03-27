@@ -1143,6 +1143,14 @@ impl LocalToolExecutor {
         self.safe_write_max_lines = value;
     }
 
+    /// Inject a file read cache (for tests).
+    pub fn set_file_cache(
+        &mut self,
+        cache: std::sync::Arc<std::sync::Mutex<file_cache::FileReadCache>>,
+    ) {
+        self.file_cache = Some(cache);
+    }
+
     /// Create an executor with a Serper API key set (for testing fallback).
     pub fn new_test_with_serper_key(root: impl Into<PathBuf>, key: String) -> Self {
         let mut executor = Self::new_without_rate_limit(root);
@@ -1254,33 +1262,37 @@ impl LocalToolExecutor {
             return self.execute_image_read(request, path, &resolved, mime_type, started);
         }
 
-        // TOCTOU defense (DR4-002): resolve canonical path ONCE and use it for both
-        // cache lookup and file read, preventing symlink swap between check and read.
-        let canonical_for_read = self
-            .file_cache
-            .as_ref()
-            .and_then(|c| c.lock().ok())
-            .and_then(|c| c.validate_canonical_path(&resolved));
-
-        // Cache check (high-level API: canonicalize + mtime internal)
+        // Cache check (high-level API: canonicalize + mtime + sandbox validation internal)
+        // DR-005: canonical_for_read is deferred to cache-miss path below to avoid
+        // redundant canonicalize on cache hits. try_get performs its own sandbox check.
         if let Some(ref cache_arc) = self.file_cache
             && let Ok(mut cache) = cache_arc.lock()
-            && let Some(cached) = cache.try_get(&resolved)
+            && let Some(hit) = cache.try_get(&resolved)
         {
-            tracing::debug!(path = %path, "file.read cache hit");
-            let msg = format!(
-                "[cached] File previously read (content unchanged, {} bytes)",
-                cached.len()
+            tracing::debug!(path = %path, hit_count = hit.hit_count, "file.read cache hit");
+            let header = format!(
+                "[cached: read #{} — content unchanged, {} bytes]\n",
+                hit.hit_count,
+                hit.content.len()
             );
+            let payload = format!("{}{}", header, hit.content);
             return Ok(build_completed_result(
                 request,
                 path.to_string(),
-                ToolExecutionPayload::Text(msg),
+                ToolExecutionPayload::Text(payload),
                 vec![resolved.display().to_string()],
                 started,
             ));
         }
         // Mutex poison → fall through to normal read (best-effort)
+
+        // TOCTOU defense (DR4-002): resolve canonical path ONCE for disk read,
+        // preventing symlink swap between check and read. Deferred here per DR-005.
+        let canonical_for_read = self
+            .file_cache
+            .as_ref()
+            .and_then(|c| c.lock().ok())
+            .and_then(|c| c.validate_canonical_path(&resolved));
 
         // Read from canonical path when available (TOCTOU defense), fallback to resolved
         let read_path = canonical_for_read.as_deref().unwrap_or(&resolved);
