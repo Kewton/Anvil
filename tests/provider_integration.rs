@@ -1218,13 +1218,13 @@ fn agentic_loop_multi_iteration_tool_calls_then_final_answer() {
         .expect("multi-iteration agentic loop should succeed");
 
     let requests = seen_requests.borrow();
-    // Should have made 4 calls: initial + 2 follow-ups + 1 ANVIL_FINAL guard retry
-    // (file.read only, no file.write/file.edit => guard fires once on the plain-text
-    // final answer, then accepts the retry response unconditionally)
+    // Issue #173: First response contains ANVIL_TOOL + ANVIL_FINAL.
+    // With the fix, the tool executes and then the loop terminates immediately
+    // (no further LLM round-trips after ANVIL_FINAL is detected).
     assert_eq!(
         requests.len(),
-        4,
-        "expected 4 provider calls for multi-iteration loop (includes guard retry)"
+        1,
+        "expected 1 provider call: initial Done event with ANVIL_FINAL terminates after tool execution"
     );
 
     // Final frame should show Done state
@@ -1421,14 +1421,12 @@ fn agentic_loop_error_during_followup_propagates() {
             };
 
             if count == 0 {
+                // No ANVIL_FINAL so the agentic loop continues with a follow-up call
                 emit(ProviderEvent::Agent(AgentEvent::Done {
                     status: "Done. session saved".to_string(),
                     assistant_message: concat!(
                         "```ANVIL_TOOL\n",
                         "{\"id\":\"call_001\",\"tool\":\"file.read\",\"path\":\"./Cargo.toml\"}\n",
-                        "```\n",
-                        "```ANVIL_FINAL\n",
-                        "Reading Cargo.toml.\n",
                         "```\n"
                     )
                     .to_string(),
@@ -3423,20 +3421,13 @@ fn anvil_final_guard_fires_when_no_file_modifications_detected() {
         .expect("guard fire scenario should succeed");
 
     let requests = seen_requests.borrow();
-    // Initial call + agentic follow-up + guard retry = 3 calls
+    // Issue #173: First response has ANVIL_TOOL(file.read) + ANVIL_FINAL.
+    // The tool executes, then anvil_final_seen=true causes immediate loop termination.
+    // No follow-up LLM call and no guard retry.
     assert_eq!(
         requests.len(),
-        3,
-        "expected 3 provider calls: initial + follow-up + guard retry"
-    );
-
-    // Verify the guard retry message was injected into the session
-    assert!(
-        app.session()
-            .messages
-            .iter()
-            .any(|m| m.content.contains("No file modifications detected")),
-        "guard retry message should be in session"
+        1,
+        "expected 1 provider call: ANVIL_FINAL terminates after tool execution (Issue #173)"
     );
 }
 
@@ -3489,11 +3480,13 @@ fn anvil_final_guard_does_not_fire_when_file_write_was_executed() {
         .expect("file write scenario should succeed");
 
     let requests = seen_requests.borrow();
-    // Initial call + 1 follow-up (no guard retry since file was written)
+    // Issue #173: First response has ANVIL_TOOL(file.write) + ANVIL_FINAL.
+    // The tool executes (file is written), then anvil_final_seen=true causes
+    // immediate loop termination. No follow-up LLM call.
     assert_eq!(
         requests.len(),
-        2,
-        "expected 2 provider calls: initial + follow-up (no guard retry)"
+        1,
+        "expected 1 provider call: ANVIL_FINAL terminates after tool execution (Issue #173)"
     );
 
     // Verify guard retry message was NOT injected
