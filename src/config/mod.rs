@@ -137,6 +137,8 @@ pub struct RuntimeConfig {
     /// `None` means "use default language via effective_ui_language_code()".
     /// Supported: "ja", "en".
     pub ui_language: Option<String>,
+    /// Maximum total tool calls per agentic turn (Issue #172).
+    pub max_tool_calls: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -299,6 +301,7 @@ impl EffectiveConfig {
                 safe_write_max_lines: 500,
                 safe_write_deletion_ratio: 0.5,
                 ui_language: None,
+                max_tool_calls: DEFAULT_MAX_TOOL_CALLS,
             },
             mode: ModeConfig {
                 prompt_source: PromptSource::Interactive,
@@ -405,6 +408,7 @@ impl EffectiveConfig {
             "ANVIL_SAFE_WRITE_MAX_LINES",
             "ANVIL_SAFE_WRITE_DELETION_RATIO",
             "ANVIL_UI_LANGUAGE",
+            "ANVIL_MAX_TOOL_CALLS",
         ] {
             if let Ok(value) = std::env::var(key) {
                 map.insert(key.to_string(), value);
@@ -521,6 +525,11 @@ impl EffectiveConfig {
                 )));
             }
             self.runtime.safe_write_deletion_ratio = v;
+        }
+
+        // Max tool calls (Issue #172)
+        if let Some(v) = cli.max_tool_calls {
+            self.runtime.max_tool_calls = v;
         }
 
         // --session flag: override session file path
@@ -734,6 +743,11 @@ impl EffectiveConfig {
                         Some(value.clone())
                     };
                 }
+                "max_tool_calls" | "ANVIL_MAX_TOOL_CALLS" => {
+                    self.runtime.max_tool_calls = value
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                }
                 _ => {}
             }
         }
@@ -764,6 +778,7 @@ impl EffectiveConfig {
         self.clamp_phase_thresholds();
         self.clamp_edit_thresholds();
         self.clamp_http_timeout();
+        self.clamp_max_tool_calls();
         self.sanitize_ui_language();
         Ok(())
     }
@@ -791,6 +806,18 @@ impl EffectiveConfig {
         if normalized != old {
             self.runtime.http_timeout_secs = normalized;
             eprintln!("Warning: http_timeout_secs={old} adjusted to {normalized}");
+        }
+    }
+
+    /// Clamp max_tool_calls to [1, MAX_TOOL_CALLS_LIMIT] (Issue #172).
+    fn clamp_max_tool_calls(&mut self) {
+        let old = self.runtime.max_tool_calls;
+        self.runtime.max_tool_calls = old.clamp(1, MAX_TOOL_CALLS_LIMIT);
+        if self.runtime.max_tool_calls != old {
+            eprintln!(
+                "Warning: max_tool_calls={old} adjusted to {}",
+                self.runtime.max_tool_calls
+            );
         }
     }
 
@@ -959,6 +986,10 @@ fn is_valid_deletion_ratio(v: f64) -> bool {
     v.is_finite() && (0.0..=1.0).contains(&v)
 }
 const MAX_AGENT_ITERATIONS: usize = 100;
+/// Default maximum total tool calls per agentic turn (Issue #172).
+pub const DEFAULT_MAX_TOOL_CALLS: usize = 200;
+/// Hard upper limit for max_tool_calls (Issue #172).
+pub const MAX_TOOL_CALLS_LIMIT: usize = 10000;
 
 /// Sensitive keys and their recommended environment variable names.
 /// To add a new sensitive key, simply add an entry to this array.

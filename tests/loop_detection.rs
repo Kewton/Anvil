@@ -2,6 +2,85 @@
 
 use anvil::app::loop_detector::{DEFAULT_MAX_HISTORY, LoopAction, LoopDetector, fingerprint};
 
+// ============================================================
+// LoopAction::merge() tests (Issue #172)
+// ============================================================
+
+#[test]
+fn loop_action_merge_priority() {
+    // Continue merges: other wins
+    assert_eq!(
+        LoopAction::Continue.merge(LoopAction::Continue),
+        LoopAction::Continue
+    );
+    assert!(matches!(
+        LoopAction::Continue.merge(LoopAction::Warn("w".into())),
+        LoopAction::Warn(_)
+    ));
+    assert!(matches!(
+        LoopAction::Continue.merge(LoopAction::StrongWarn("s".into())),
+        LoopAction::StrongWarn(_)
+    ));
+    assert!(matches!(
+        LoopAction::Continue.merge(LoopAction::Break("b".into())),
+        LoopAction::Break(_)
+    ));
+
+    // Warn merges
+    assert!(matches!(
+        LoopAction::Warn("w".into()).merge(LoopAction::Continue),
+        LoopAction::Warn(_)
+    ));
+    assert!(matches!(
+        LoopAction::Warn("w1".into()).merge(LoopAction::Warn("w2".into())),
+        LoopAction::Warn(_)
+    )); // first wins
+    assert!(matches!(
+        LoopAction::Warn("w".into()).merge(LoopAction::StrongWarn("s".into())),
+        LoopAction::StrongWarn(_)
+    ));
+    assert!(matches!(
+        LoopAction::Warn("w".into()).merge(LoopAction::Break("b".into())),
+        LoopAction::Break(_)
+    ));
+
+    // StrongWarn merges
+    assert!(matches!(
+        LoopAction::StrongWarn("s".into()).merge(LoopAction::Continue),
+        LoopAction::StrongWarn(_)
+    ));
+    assert!(matches!(
+        LoopAction::StrongWarn("s".into()).merge(LoopAction::Warn("w".into())),
+        LoopAction::StrongWarn(_)
+    ));
+    assert!(matches!(
+        LoopAction::StrongWarn("s1".into()).merge(LoopAction::StrongWarn("s2".into())),
+        LoopAction::StrongWarn(_)
+    ));
+    assert!(matches!(
+        LoopAction::StrongWarn("s".into()).merge(LoopAction::Break("b".into())),
+        LoopAction::Break(_)
+    ));
+
+    // Break merges: always Break
+    assert!(matches!(
+        LoopAction::Break("b".into()).merge(LoopAction::Continue),
+        LoopAction::Break(_)
+    ));
+    assert!(matches!(
+        LoopAction::Break("b".into()).merge(LoopAction::Warn("w".into())),
+        LoopAction::Break(_)
+    ));
+    assert!(matches!(
+        LoopAction::Break("b".into()).merge(LoopAction::StrongWarn("s".into())),
+        LoopAction::Break(_)
+    ));
+    assert!(matches!(
+        LoopAction::Break("b1".into()).merge(LoopAction::Break("b2".into())),
+        LoopAction::Break(_)
+    ));
+}
+
 fn same_input() -> serde_json::Value {
     serde_json::json!({"path": "src/main.rs"})
 }

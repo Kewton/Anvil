@@ -28,6 +28,9 @@ const MAX_CONTEXT_LINES: u32 = 10;
 /// Maximum number of matched files returned by file.search.
 const MAX_SEARCH_RESULTS: usize = 100;
 
+/// Default root directory for file.search when the LLM omits the root parameter.
+pub(crate) const DEFAULT_SEARCH_ROOT: &str = ".";
+
 /// Files larger than this are blocked by the safe-write guard without reading
 /// their full contents, to avoid memory pressure (10 MB).
 const MAX_SAFE_WRITE_GUARD_READ_BYTES: u64 = 10 * 1024 * 1024;
@@ -243,12 +246,16 @@ impl ToolInput {
                     .to_string(),
             }),
             "file.search" => Ok(ToolInput::FileSearch {
-                root: value
-                    .get("root")
-                    .or_else(|| value.get("path"))
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| "missing root in file.search tool block".to_string())?
-                    .to_string(),
+                root: {
+                    let raw = value.get("root").or_else(|| value.get("path"));
+                    match raw {
+                        Some(v) => v
+                            .as_str()
+                            .ok_or_else(|| "root in file.search must be a string".to_string())?
+                            .to_string(),
+                        None => DEFAULT_SEARCH_ROOT.to_string(),
+                    }
+                },
                 pattern: value
                     .get("pattern")
                     .or_else(|| value.get("content"))
@@ -399,7 +406,9 @@ impl ToolInput {
                 path: extract_simple(block, "path")?,
             }),
             "file.search" => Some(ToolInput::FileSearch {
-                root: extract_simple(block, "root").or_else(|| extract_simple(block, "path"))?,
+                root: extract_simple(block, "root")
+                    .or_else(|| extract_simple(block, "path"))
+                    .unwrap_or_else(|| DEFAULT_SEARCH_ROOT.to_string()),
                 pattern: extract_simple(block, "pattern")
                     .or_else(|| extract_simple(block, "content"))
                     .or_else(|| extract_simple(block, "query"))?,
@@ -1134,6 +1143,14 @@ impl LocalToolExecutor {
         self.safe_write_max_lines = value;
     }
 
+    /// Inject a file read cache (for tests).
+    pub fn set_file_cache(
+        &mut self,
+        cache: std::sync::Arc<std::sync::Mutex<file_cache::FileReadCache>>,
+    ) {
+        self.file_cache = Some(cache);
+    }
+
     /// Create an executor with a Serper API key set (for testing fallback).
     pub fn new_test_with_serper_key(root: impl Into<PathBuf>, key: String) -> Self {
         let mut executor = Self::new_without_rate_limit(root);
@@ -1245,33 +1262,37 @@ impl LocalToolExecutor {
             return self.execute_image_read(request, path, &resolved, mime_type, started);
         }
 
-        // TOCTOU defense (DR4-002): resolve canonical path ONCE and use it for both
-        // cache lookup and file read, preventing symlink swap between check and read.
-        let canonical_for_read = self
-            .file_cache
-            .as_ref()
-            .and_then(|c| c.lock().ok())
-            .and_then(|c| c.validate_canonical_path(&resolved));
-
-        // Cache check (high-level API: canonicalize + mtime internal)
+        // Cache check (high-level API: canonicalize + mtime + sandbox validation internal)
+        // DR-005: canonical_for_read is deferred to cache-miss path below to avoid
+        // redundant canonicalize on cache hits. try_get performs its own sandbox check.
         if let Some(ref cache_arc) = self.file_cache
             && let Ok(mut cache) = cache_arc.lock()
-            && let Some(cached) = cache.try_get(&resolved)
+            && let Some(hit) = cache.try_get(&resolved)
         {
-            tracing::debug!(path = %path, "file.read cache hit");
-            let msg = format!(
-                "[cached] File previously read (content unchanged, {} bytes)",
-                cached.len()
+            tracing::debug!(path = %path, hit_count = hit.hit_count, "file.read cache hit");
+            let header = format!(
+                "[cached: read #{} — content unchanged, {} bytes]\n",
+                hit.hit_count,
+                hit.content.len()
             );
+            let payload = format!("{}{}", header, hit.content);
             return Ok(build_completed_result(
                 request,
                 path.to_string(),
-                ToolExecutionPayload::Text(msg),
+                ToolExecutionPayload::Text(payload),
                 vec![resolved.display().to_string()],
                 started,
             ));
         }
         // Mutex poison → fall through to normal read (best-effort)
+
+        // TOCTOU defense (DR4-002): resolve canonical path ONCE for disk read,
+        // preventing symlink swap between check and read. Deferred here per DR-005.
+        let canonical_for_read = self
+            .file_cache
+            .as_ref()
+            .and_then(|c| c.lock().ok())
+            .and_then(|c| c.validate_canonical_path(&resolved));
 
         // Read from canonical path when available (TOCTOU defense), fallback to resolved
         let read_path = canonical_for_read.as_deref().unwrap_or(&resolved);
@@ -1357,20 +1378,14 @@ impl LocalToolExecutor {
                             threshold: self.safe_write_max_lines,
                         });
                     }
-                    if let Ok(existing) = std::fs::read(&resolved) {
-                        let newline_count = existing.iter().filter(|&&b| b == b'\n').count();
-                        let line_count = if existing.is_empty() {
-                            0
-                        } else {
-                            newline_count + usize::from(!existing.ends_with(b"\n"))
-                        };
-                        if line_count > self.safe_write_max_lines {
-                            return Err(ToolRuntimeError::LargeFileBlocked {
-                                path: path.to_string(),
-                                line_count,
-                                threshold: self.safe_write_max_lines,
-                            });
-                        }
+                    if let Ok(line_count) = count_file_lines(&resolved)
+                        && line_count > self.safe_write_max_lines
+                    {
+                        return Err(ToolRuntimeError::LargeFileBlocked {
+                            path: path.to_string(),
+                            line_count,
+                            threshold: self.safe_write_max_lines,
+                        });
                     }
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -1587,10 +1602,6 @@ impl LocalToolExecutor {
                 resolved.display()
             ))
         })?;
-
-        let normalize_lines = |s: &str| -> Vec<String> {
-            s.lines().map(|line| line.trim_end().to_string()).collect()
-        };
 
         let content_lines = normalize_lines(&content);
         let old_lines = normalize_lines(old_string);
@@ -2281,6 +2292,45 @@ fn apply_normalized_edit(content: &str, matched: &NormalizedMatch, new_content: 
         replacement,
         &content[matched.end..]
     )
+}
+
+/// Count the number of lines in a file.
+///
+/// Logic matches the inline line counting in `execute_file_write()`:
+/// - empty file → 0
+/// - otherwise: newline_count + 1 if no trailing newline
+pub(crate) fn count_file_lines(path: &std::path::Path) -> std::io::Result<usize> {
+    let content = std::fs::read(path)?;
+    if content.is_empty() {
+        Ok(0)
+    } else {
+        let newline_count = content.iter().filter(|&&b| b == b'\n').count();
+        Ok(newline_count + usize::from(!content.ends_with(b"\n")))
+    }
+}
+
+/// Normalize internal whitespace in a single line: preserve leading indent,
+/// collapse runs of internal whitespace (spaces/tabs) to a single space.
+fn normalize_internal_whitespace(line: &str) -> String {
+    if line.is_empty() {
+        return String::new();
+    }
+    // Measure leading whitespace
+    let indent_len = line.len() - line.trim_start().len();
+    let (indent, rest) = line.split_at(indent_len);
+    if rest.is_empty() {
+        return indent.to_string();
+    }
+    let collapsed: String = rest.split_whitespace().collect::<Vec<_>>().join(" ");
+    format!("{indent}{collapsed}")
+}
+
+/// Normalize lines for edit matching: trim trailing whitespace and collapse
+/// internal whitespace runs to a single space while preserving leading indent.
+fn normalize_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .map(|line| normalize_internal_whitespace(line.trim_end()))
+        .collect()
 }
 
 /// Resolve a relative path within a sandbox root directory.
@@ -3538,4 +3588,107 @@ fn render_directory_listing(path: &Path) -> Result<String, ToolRuntimeError> {
 
     lines.sort();
     Ok(lines.join("\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn count_file_lines_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.txt");
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(count_file_lines(&path).unwrap(), 0);
+    }
+
+    #[test]
+    fn count_file_lines_with_trailing_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trailing.txt");
+        std::fs::write(&path, "line1\nline2\nline3\n").unwrap();
+        assert_eq!(count_file_lines(&path).unwrap(), 3);
+    }
+
+    #[test]
+    fn count_file_lines_without_trailing_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no_trailing.txt");
+        std::fs::write(&path, "line1\nline2\nline3").unwrap();
+        assert_eq!(count_file_lines(&path).unwrap(), 3);
+    }
+
+    #[test]
+    fn count_file_lines_single_line_no_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("single.txt");
+        std::fs::write(&path, "hello").unwrap();
+        assert_eq!(count_file_lines(&path).unwrap(), 1);
+    }
+
+    #[test]
+    fn count_file_lines_nonexistent_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nonexistent.txt");
+        assert!(count_file_lines(&path).is_err());
+    }
+
+    #[test]
+    fn normalize_internal_whitespace_basic() {
+        assert_eq!(normalize_internal_whitespace("hello  world"), "hello world");
+    }
+
+    #[test]
+    fn normalize_internal_whitespace_preserves_indent() {
+        assert_eq!(
+            normalize_internal_whitespace("    hello  world"),
+            "    hello world"
+        );
+    }
+
+    #[test]
+    fn normalize_internal_whitespace_tabs() {
+        assert_eq!(
+            normalize_internal_whitespace("\thello\t\tworld"),
+            "\thello world"
+        );
+    }
+
+    #[test]
+    fn normalize_internal_whitespace_mixed_indent() {
+        assert_eq!(
+            normalize_internal_whitespace("  \thello   world  foo"),
+            "  \thello world foo"
+        );
+    }
+
+    #[test]
+    fn normalize_internal_whitespace_empty_line() {
+        assert_eq!(normalize_internal_whitespace(""), "");
+    }
+
+    #[test]
+    fn normalize_internal_whitespace_indent_only() {
+        assert_eq!(normalize_internal_whitespace("   "), "   ");
+    }
+
+    #[test]
+    fn normalize_lines_trims_trailing_and_collapses_internal() {
+        let input = "  hello  world  \n\tfoo\t\tbar\t\n";
+        let result = normalize_lines(input);
+        assert_eq!(result, vec!["  hello world", "\tfoo bar"]);
+    }
+
+    #[test]
+    fn normalize_lines_empty_input() {
+        let result = normalize_lines("");
+        assert_eq!(result, Vec::<String>::new());
+    }
+
+    #[test]
+    fn normalize_lines_preserves_single_spaces() {
+        let input = "fn main() {\n    println!(\"hello\");\n}\n";
+        let result = normalize_lines(input);
+        assert_eq!(result, vec!["fn main() {", "    println!(\"hello\");", "}"]);
+    }
 }

@@ -4,6 +4,7 @@
 /// coordinating turns between the user, the LLM provider, and the tool
 /// executor.
 pub mod agentic;
+pub mod alternating_loop_detector;
 pub mod cli;
 mod context;
 pub(crate) mod edit_fail_tracker;
@@ -129,6 +130,8 @@ pub struct App {
     checkpoint_stack: CheckpointStack,
     /// Loop detector for preventing infinite tool call repetitions (Issue #145).
     loop_detector: loop_detector::LoopDetector,
+    /// Alternating/cyclic loop detector (Issue #172).
+    alternating_loop_detector: alternating_loop_detector::AlternatingLoopDetector,
     /// Hooks engine. `None` when hooks.json is absent or initialization failed.
     /// Declared before mcp_manager to maintain Drop order (DR3-007).
     hooks_engine: Option<crate::hooks::HooksEngine>,
@@ -441,6 +444,9 @@ impl App {
             warning_tracker: ContextWarningTracker::new(),
             checkpoint_stack: CheckpointStack::new(),
             loop_detector: loop_detector::LoopDetector::new(loop_detection_threshold),
+            alternating_loop_detector: alternating_loop_detector::AlternatingLoopDetector::new(
+                alternating_loop_detector::DEFAULT_CYCLE_THRESHOLD,
+            ),
             hooks_engine,
             mcp_manager,
             current_session_name,
@@ -1045,6 +1051,8 @@ impl App {
                                 let structured =
                                     BasicAgentLoop::parse_structured_response(&token_buffer)
                                         .map_err(AppError::ToolExecution)?;
+                                // Issue #173: Pass anvil_final_detected from parsed response
+                                let anvil_final = structured.anvil_final_detected;
                                 frames.extend(self.complete_structured_response(
                                     structured,
                                     "Done. session saved",
@@ -1053,6 +1061,7 @@ impl App {
                                     None,
                                     tui,
                                     provider_client,
+                                    anvil_final,
                                 )?);
                                 break;
                             }
