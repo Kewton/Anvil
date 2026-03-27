@@ -1366,20 +1366,14 @@ impl LocalToolExecutor {
                             threshold: self.safe_write_max_lines,
                         });
                     }
-                    if let Ok(existing) = std::fs::read(&resolved) {
-                        let newline_count = existing.iter().filter(|&&b| b == b'\n').count();
-                        let line_count = if existing.is_empty() {
-                            0
-                        } else {
-                            newline_count + usize::from(!existing.ends_with(b"\n"))
-                        };
-                        if line_count > self.safe_write_max_lines {
-                            return Err(ToolRuntimeError::LargeFileBlocked {
-                                path: path.to_string(),
-                                line_count,
-                                threshold: self.safe_write_max_lines,
-                            });
-                        }
+                    if let Ok(line_count) = count_file_lines(&resolved)
+                        && line_count > self.safe_write_max_lines
+                    {
+                        return Err(ToolRuntimeError::LargeFileBlocked {
+                            path: path.to_string(),
+                            line_count,
+                            threshold: self.safe_write_max_lines,
+                        });
                     }
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -1596,10 +1590,6 @@ impl LocalToolExecutor {
                 resolved.display()
             ))
         })?;
-
-        let normalize_lines = |s: &str| -> Vec<String> {
-            s.lines().map(|line| line.trim_end().to_string()).collect()
-        };
 
         let content_lines = normalize_lines(&content);
         let old_lines = normalize_lines(old_string);
@@ -2290,6 +2280,40 @@ fn apply_normalized_edit(content: &str, matched: &NormalizedMatch, new_content: 
         replacement,
         &content[matched.end..]
     )
+}
+
+/// Count the number of lines in a file.
+///
+/// Logic matches the inline line counting in `execute_file_write()`:
+/// - empty file → 0
+/// - otherwise: newline_count + 1 if no trailing newline
+pub(crate) fn count_file_lines(path: &std::path::Path) -> std::io::Result<usize> {
+    let content = std::fs::read(path)?;
+    if content.is_empty() {
+        Ok(0)
+    } else {
+        let newline_count = content.iter().filter(|&&b| b == b'\n').count();
+        Ok(newline_count + usize::from(!content.ends_with(b"\n")))
+    }
+}
+
+/// Normalize a single line for Level 2 edit matching: trim trailing whitespace
+/// and convert tabs to spaces. This is intentionally conservative to avoid
+/// collapsing meaningful whitespace differences in string literals, comments,
+/// or Markdown content (CB-001).
+fn normalize_line_whitespace(line: &str) -> String {
+    line.trim_end().replace('\t', "    ")
+}
+
+/// Normalize lines for Level 2 (trailing-ws) edit matching.
+///
+/// Each line is trimmed of trailing whitespace and tabs are converted to
+/// 4 spaces. This handles the common LLM mistake of confusing tabs and
+/// spaces while keeping the normalization conservative enough to avoid
+/// false matches in string literals or other semantically-significant
+/// whitespace contexts.
+fn normalize_lines(text: &str) -> Vec<String> {
+    text.lines().map(normalize_line_whitespace).collect()
 }
 
 /// Resolve a relative path within a sandbox root directory.
@@ -3547,4 +3571,107 @@ fn render_directory_listing(path: &Path) -> Result<String, ToolRuntimeError> {
 
     lines.sort();
     Ok(lines.join("\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn count_file_lines_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.txt");
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(count_file_lines(&path).unwrap(), 0);
+    }
+
+    #[test]
+    fn count_file_lines_with_trailing_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trailing.txt");
+        std::fs::write(&path, "line1\nline2\nline3\n").unwrap();
+        assert_eq!(count_file_lines(&path).unwrap(), 3);
+    }
+
+    #[test]
+    fn count_file_lines_without_trailing_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no_trailing.txt");
+        std::fs::write(&path, "line1\nline2\nline3").unwrap();
+        assert_eq!(count_file_lines(&path).unwrap(), 3);
+    }
+
+    #[test]
+    fn count_file_lines_single_line_no_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("single.txt");
+        std::fs::write(&path, "hello").unwrap();
+        assert_eq!(count_file_lines(&path).unwrap(), 1);
+    }
+
+    #[test]
+    fn count_file_lines_nonexistent_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nonexistent.txt");
+        assert!(count_file_lines(&path).is_err());
+    }
+
+    #[test]
+    fn normalize_internal_whitespace_basic() {
+        assert_eq!(normalize_internal_whitespace("hello  world"), "hello world");
+    }
+
+    #[test]
+    fn normalize_internal_whitespace_preserves_indent() {
+        assert_eq!(
+            normalize_internal_whitespace("    hello  world"),
+            "    hello world"
+        );
+    }
+
+    #[test]
+    fn normalize_internal_whitespace_tabs() {
+        assert_eq!(
+            normalize_internal_whitespace("\thello\t\tworld"),
+            "\thello world"
+        );
+    }
+
+    #[test]
+    fn normalize_internal_whitespace_mixed_indent() {
+        assert_eq!(
+            normalize_internal_whitespace("  \thello   world  foo"),
+            "  \thello world foo"
+        );
+    }
+
+    #[test]
+    fn normalize_internal_whitespace_empty_line() {
+        assert_eq!(normalize_internal_whitespace(""), "");
+    }
+
+    #[test]
+    fn normalize_internal_whitespace_indent_only() {
+        assert_eq!(normalize_internal_whitespace("   "), "   ");
+    }
+
+    #[test]
+    fn normalize_lines_trims_trailing_and_collapses_internal() {
+        let input = "  hello  world  \n\tfoo\t\tbar\t\n";
+        let result = normalize_lines(input);
+        assert_eq!(result, vec!["  hello world", "\tfoo bar"]);
+    }
+
+    #[test]
+    fn normalize_lines_empty_input() {
+        let result = normalize_lines("");
+        assert_eq!(result, Vec::<String>::new());
+    }
+
+    #[test]
+    fn normalize_lines_preserves_single_spaces() {
+        let input = "fn main() {\n    println!(\"hello\");\n}\n";
+        let result = normalize_lines(input);
+        assert_eq!(result, vec!["fn main() {", "    println!(\"hello\");", "}"]);
+    }
 }

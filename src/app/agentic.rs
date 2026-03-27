@@ -14,7 +14,7 @@ use crate::state::StateTransition;
 use crate::tooling::{
     ExecutionMode, LocalToolExecutor, ToolCallRequest, ToolExecutionPayload, ToolExecutionPolicy,
     ToolExecutionRequest, ToolExecutionResult, ToolExecutionStatus, ToolInput, ToolKind,
-    diff::generate_diff_preview, resolve_sandbox_path,
+    count_file_lines, diff::generate_diff_preview, resolve_sandbox_path,
 };
 use crate::tui::Tui;
 use std::sync::Arc;
@@ -1193,12 +1193,34 @@ impl App {
                         }
                         crate::app::edit_fail_tracker::EditFallbackAction::WriteFallback => {
                             self.prepare_write_fallback();
-                            edit_hint = Some(format!(
-                                "\n\n[Anvil hint] file.edit has failed {count} consecutive \
-                                 times for '{path}'. Consider using file.read to get the \
-                                 current content, then file.write to replace the entire file \
-                                 with the corrected version."
-                            ));
+                            let max_lines = self.config.runtime.safe_write_max_lines;
+                            let line_count = if max_lines > 0 {
+                                resolve_sandbox_path(&self.config.paths.cwd, &path)
+                                    .ok()
+                                    .and_then(|resolved| count_file_lines(&resolved).ok())
+                            } else {
+                                None
+                            };
+                            let is_large = line_count.is_some_and(|lines| lines > max_lines);
+                            let line_count_check_failed = max_lines > 0 && line_count.is_none();
+
+                            if is_large || line_count_check_failed {
+                                edit_hint = Some(format!(
+                                    "\n\n[Anvil hint] file.edit has failed {count} consecutive \
+                                     times for '{path}'. file.write is not available or could not be \
+                                     safely validated for this path. Instead: \
+                                     (1) Use file.read to get the current content. \
+                                     (2) Identify the exact section to change. \
+                                     (3) Retry file.edit with a smaller, precise old_string."
+                                ));
+                            } else {
+                                edit_hint = Some(format!(
+                                    "\n\n[Anvil hint] file.edit has failed {count} consecutive \
+                                     times for '{path}'. Consider using file.read to get the \
+                                     current content, then file.write to replace the entire file \
+                                     with the corrected version."
+                                ));
+                            }
                         }
                     }
                 }
