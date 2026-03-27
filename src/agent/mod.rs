@@ -140,6 +140,19 @@ pub struct BasicAgentLoop;
 pub struct StructuredAssistantResponse {
     pub tool_calls: Vec<ToolCallRequest>,
     pub final_response: String,
+    /// Whether an ANVIL_FINAL block was detected in this response (Issue #173).
+    pub anvil_final_detected: bool,
+}
+
+impl StructuredAssistantResponse {
+    /// Fallback factory for cases that bypass `parse_structured_response`.
+    pub fn empty(final_response: String) -> Self {
+        Self {
+            tool_calls: Vec::new(),
+            final_response,
+            anvil_final_detected: false,
+        }
+    }
 }
 
 impl BasicAgentLoop {
@@ -264,6 +277,7 @@ impl BasicAgentLoop {
 
         // ANVIL_FINALの位置を取得（カットオフポイント）
         let final_cutoff = content.find("```ANVIL_FINAL\n");
+        let anvil_final_detected = final_cutoff.is_some();
 
         // Try strict extraction first, fall back to lenient for unclosed blocks.
         let final_block = extract_final_block(content, "ANVIL_FINAL")
@@ -288,11 +302,19 @@ impl BasicAgentLoop {
         Ok(StructuredAssistantResponse {
             tool_calls,
             final_response,
+            anvil_final_detected,
         })
     }
 
+    /// Strict ANVIL_FINAL detection (closed block only). Used during streaming.
     pub fn is_complete_structured_response(content: &str) -> bool {
         extract_final_block(content, "ANVIL_FINAL").is_some()
+    }
+
+    /// Lenient ANVIL_FINAL detection (accepts unclosed blocks). Used after response completion.
+    pub fn is_complete_structured_response_lenient(content: &str) -> bool {
+        extract_final_block(content, "ANVIL_FINAL").is_some()
+            || extract_final_block_lenient(content, "ANVIL_FINAL").is_some()
     }
 }
 

@@ -2309,45 +2309,28 @@ pub(crate) fn count_file_lines(path: &std::path::Path) -> std::io::Result<usize>
     }
 }
 
-/// Normalize lines for Level 2 (trailing-ws) edit matching.
-///
-/// Each line has trailing whitespace trimmed and internal runs of
-/// whitespace collapsed to a single space, while preserving leading
-/// indentation.
-fn normalize_lines(text: &str) -> Vec<String> {
-    text.lines().map(normalize_internal_whitespace).collect()
+/// Normalize internal whitespace in a single line: preserve leading indent,
+/// collapse runs of internal whitespace (spaces/tabs) to a single space.
+fn normalize_internal_whitespace(line: &str) -> String {
+    if line.is_empty() {
+        return String::new();
+    }
+    // Measure leading whitespace
+    let indent_len = line.len() - line.trim_start().len();
+    let (indent, rest) = line.split_at(indent_len);
+    if rest.is_empty() {
+        return indent.to_string();
+    }
+    let collapsed: String = rest.split_whitespace().collect::<Vec<_>>().join(" ");
+    format!("{indent}{collapsed}")
 }
 
-/// Normalize internal whitespace in a single line: preserve leading indent,
-/// then collapse runs of whitespace (spaces/tabs) into a single space,
-/// and trim trailing whitespace.
-fn normalize_internal_whitespace(line: &str) -> String {
-    let trimmed = line.trim_end();
-    if trimmed.is_empty() {
-        return line.to_string();
-    }
-    // Find end of leading indent (spaces and tabs)
-    let indent_end = trimmed
-        .find(|c: char| c != ' ' && c != '\t')
-        .unwrap_or(trimmed.len());
-    let indent = &trimmed[..indent_end];
-    let rest = &trimmed[indent_end..];
-    // Collapse runs of whitespace in the non-indent portion
-    let mut result = String::with_capacity(trimmed.len());
-    result.push_str(indent);
-    let mut prev_ws = false;
-    for c in rest.chars() {
-        if c.is_whitespace() {
-            if !prev_ws {
-                result.push(' ');
-            }
-            prev_ws = true;
-        } else {
-            result.push(c);
-            prev_ws = false;
-        }
-    }
-    result
+/// Normalize lines for edit matching: trim trailing whitespace and collapse
+/// internal whitespace runs to a single space while preserving leading indent.
+fn normalize_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .map(|line| normalize_internal_whitespace(line.trim_end()))
+        .collect()
 }
 
 /// Resolve a relative path within a sandbox root directory.

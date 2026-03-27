@@ -800,6 +800,119 @@ fn all_tools_after_final() {
     );
 }
 
+// --- Issue #173: anvil_final_detected flag tests ---
+
+#[test]
+fn anvil_final_detected_with_tool_and_final() {
+    // ANVIL_TOOL + ANVIL_FINAL → anvil_final_detected should be true
+    let response = anvil::agent::BasicAgentLoop::parse_structured_response(concat!(
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_001\",\"tool\":\"file.read\",\"path\":\"./src/main.rs\"}\n",
+        "```\n",
+        "```ANVIL_FINAL\n",
+        "Done.\n",
+        "```\n"
+    ))
+    .expect("parsing should succeed");
+
+    assert!(
+        response.anvil_final_detected,
+        "anvil_final_detected should be true when ANVIL_FINAL is present"
+    );
+    assert_eq!(
+        response.tool_calls.len(),
+        1,
+        "pre-FINAL tool should be included"
+    );
+}
+
+#[test]
+fn anvil_final_detected_without_final() {
+    // ANVIL_TOOL only → anvil_final_detected should be false
+    let response = anvil::agent::BasicAgentLoop::parse_structured_response(concat!(
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_001\",\"tool\":\"file.read\",\"path\":\"./src/main.rs\"}\n",
+        "```\n"
+    ))
+    .expect("parsing should succeed");
+
+    assert!(
+        !response.anvil_final_detected,
+        "anvil_final_detected should be false without ANVIL_FINAL"
+    );
+}
+
+#[test]
+fn anvil_final_detected_final_only() {
+    // ANVIL_FINAL only (no tools) → anvil_final_detected should be true, tool_calls empty
+    let response = anvil::agent::BasicAgentLoop::parse_structured_response(concat!(
+        "```ANVIL_FINAL\n",
+        "All done.\n",
+        "```\n"
+    ))
+    .expect("parsing should succeed");
+
+    assert!(
+        response.anvil_final_detected,
+        "anvil_final_detected should be true for ANVIL_FINAL only"
+    );
+    assert!(response.tool_calls.is_empty());
+}
+
+#[test]
+fn anvil_final_detected_unclosed_final() {
+    // Unclosed ANVIL_FINAL → anvil_final_detected should be true (cutoff marker found)
+    let response = anvil::agent::BasicAgentLoop::parse_structured_response(concat!(
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_001\",\"tool\":\"file.read\",\"path\":\"./src/main.rs\"}\n",
+        "```\n",
+        "```ANVIL_FINAL\n",
+        "Done but unclosed"
+    ))
+    .expect("parsing should succeed");
+
+    assert!(
+        response.anvil_final_detected,
+        "anvil_final_detected should be true even with unclosed ANVIL_FINAL"
+    );
+}
+
+#[test]
+fn is_complete_structured_response_lenient_unclosed() {
+    // Lenient should detect unclosed ANVIL_FINAL
+    let content = concat!("```ANVIL_FINAL\n", "Done but no closing tag");
+    assert!(
+        !anvil::agent::BasicAgentLoop::is_complete_structured_response(content),
+        "strict should NOT detect unclosed ANVIL_FINAL"
+    );
+    assert!(
+        anvil::agent::BasicAgentLoop::is_complete_structured_response_lenient(content),
+        "lenient should detect unclosed ANVIL_FINAL"
+    );
+}
+
+#[test]
+fn is_complete_structured_response_lenient_closed() {
+    // Lenient should also detect closed ANVIL_FINAL
+    let content = concat!("```ANVIL_FINAL\n", "Done.\n", "```\n");
+    assert!(
+        anvil::agent::BasicAgentLoop::is_complete_structured_response(content),
+        "strict should detect closed ANVIL_FINAL"
+    );
+    assert!(
+        anvil::agent::BasicAgentLoop::is_complete_structured_response_lenient(content),
+        "lenient should also detect closed ANVIL_FINAL"
+    );
+}
+
+#[test]
+fn structured_response_empty_factory() {
+    let response = anvil::agent::StructuredAssistantResponse::empty("test response".to_string());
+    assert!(response.tool_calls.is_empty());
+    assert_eq!(response.final_response, "test response");
+    assert!(!response.anvil_final_detected);
+}
+
 // --- Issue #128: Multi-tier parsing tests ---
 
 #[test]
