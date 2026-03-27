@@ -23,6 +23,21 @@ pub enum LoopAction {
     Break(String),
 }
 
+impl LoopAction {
+    /// Return the more severe of two `LoopAction` values.
+    ///
+    /// Priority: Break > StrongWarn > Warn > Continue.
+    pub fn merge(self, other: LoopAction) -> LoopAction {
+        match (&self, &other) {
+            (LoopAction::Break(_), _) | (_, LoopAction::Continue) => self,
+            (_, LoopAction::Break(_)) | (LoopAction::Continue, _) => other,
+            (LoopAction::StrongWarn(_), _) => self,
+            (_, LoopAction::StrongWarn(_)) => other,
+            _ => self, // Both Warn: keep the first
+        }
+    }
+}
+
 /// Detects repeated identical tool calls within the agentic loop.
 pub struct LoopDetector {
     /// Recent tool call fingerprints: (tool_name, input_hash).
