@@ -28,6 +28,9 @@ const MAX_CONTEXT_LINES: u32 = 10;
 /// Maximum number of matched files returned by file.search.
 const MAX_SEARCH_RESULTS: usize = 100;
 
+/// Default root directory for file.search when the LLM omits the root parameter.
+pub(crate) const DEFAULT_SEARCH_ROOT: &str = ".";
+
 /// Files larger than this are blocked by the safe-write guard without reading
 /// their full contents, to avoid memory pressure (10 MB).
 const MAX_SAFE_WRITE_GUARD_READ_BYTES: u64 = 10 * 1024 * 1024;
@@ -243,12 +246,16 @@ impl ToolInput {
                     .to_string(),
             }),
             "file.search" => Ok(ToolInput::FileSearch {
-                root: value
-                    .get("root")
-                    .or_else(|| value.get("path"))
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| "missing root in file.search tool block".to_string())?
-                    .to_string(),
+                root: {
+                    let raw = value.get("root").or_else(|| value.get("path"));
+                    match raw {
+                        Some(v) => v
+                            .as_str()
+                            .ok_or_else(|| "root in file.search must be a string".to_string())?
+                            .to_string(),
+                        None => DEFAULT_SEARCH_ROOT.to_string(),
+                    }
+                },
                 pattern: value
                     .get("pattern")
                     .or_else(|| value.get("content"))
@@ -399,7 +406,9 @@ impl ToolInput {
                 path: extract_simple(block, "path")?,
             }),
             "file.search" => Some(ToolInput::FileSearch {
-                root: extract_simple(block, "root").or_else(|| extract_simple(block, "path"))?,
+                root: extract_simple(block, "root")
+                    .or_else(|| extract_simple(block, "path"))
+                    .unwrap_or_else(|| DEFAULT_SEARCH_ROOT.to_string()),
                 pattern: extract_simple(block, "pattern")
                     .or_else(|| extract_simple(block, "content"))
                     .or_else(|| extract_simple(block, "query"))?,
@@ -1369,20 +1378,14 @@ impl LocalToolExecutor {
                             threshold: self.safe_write_max_lines,
                         });
                     }
-                    if let Ok(existing) = std::fs::read(&resolved) {
-                        let newline_count = existing.iter().filter(|&&b| b == b'\n').count();
-                        let line_count = if existing.is_empty() {
-                            0
-                        } else {
-                            newline_count + usize::from(!existing.ends_with(b"\n"))
-                        };
-                        if line_count > self.safe_write_max_lines {
-                            return Err(ToolRuntimeError::LargeFileBlocked {
-                                path: path.to_string(),
-                                line_count,
-                                threshold: self.safe_write_max_lines,
-                            });
-                        }
+                    if let Ok(line_count) = count_file_lines(&resolved)
+                        && line_count > self.safe_write_max_lines
+                    {
+                        return Err(ToolRuntimeError::LargeFileBlocked {
+                            path: path.to_string(),
+                            line_count,
+                            threshold: self.safe_write_max_lines,
+                        });
                     }
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -1599,10 +1602,6 @@ impl LocalToolExecutor {
                 resolved.display()
             ))
         })?;
-
-        let normalize_lines = |s: &str| -> Vec<String> {
-            s.lines().map(|line| line.trim_end().to_string()).collect()
-        };
 
         let content_lines = normalize_lines(&content);
         let old_lines = normalize_lines(old_string);
@@ -2293,6 +2292,62 @@ fn apply_normalized_edit(content: &str, matched: &NormalizedMatch, new_content: 
         replacement,
         &content[matched.end..]
     )
+}
+
+/// Count the number of lines in a file.
+///
+/// Logic matches the inline line counting in `execute_file_write()`:
+/// - empty file → 0
+/// - otherwise: newline_count + 1 if no trailing newline
+pub(crate) fn count_file_lines(path: &std::path::Path) -> std::io::Result<usize> {
+    let content = std::fs::read(path)?;
+    if content.is_empty() {
+        Ok(0)
+    } else {
+        let newline_count = content.iter().filter(|&&b| b == b'\n').count();
+        Ok(newline_count + usize::from(!content.ends_with(b"\n")))
+    }
+}
+
+/// Normalize lines for Level 2 (trailing-ws) edit matching.
+///
+/// Each line has trailing whitespace trimmed and internal runs of
+/// whitespace collapsed to a single space, while preserving leading
+/// indentation.
+fn normalize_lines(text: &str) -> Vec<String> {
+    text.lines().map(normalize_internal_whitespace).collect()
+}
+
+/// Normalize internal whitespace in a single line: preserve leading indent,
+/// then collapse runs of whitespace (spaces/tabs) into a single space,
+/// and trim trailing whitespace.
+fn normalize_internal_whitespace(line: &str) -> String {
+    let trimmed = line.trim_end();
+    if trimmed.is_empty() {
+        return line.to_string();
+    }
+    // Find end of leading indent (spaces and tabs)
+    let indent_end = trimmed
+        .find(|c: char| c != ' ' && c != '\t')
+        .unwrap_or(trimmed.len());
+    let indent = &trimmed[..indent_end];
+    let rest = &trimmed[indent_end..];
+    // Collapse runs of whitespace in the non-indent portion
+    let mut result = String::with_capacity(trimmed.len());
+    result.push_str(indent);
+    let mut prev_ws = false;
+    for c in rest.chars() {
+        if c.is_whitespace() {
+            if !prev_ws {
+                result.push(' ');
+            }
+            prev_ws = true;
+        } else {
+            result.push(c);
+            prev_ws = false;
+        }
+    }
+    result
 }
 
 /// Resolve a relative path within a sandbox root directory.
@@ -3550,4 +3605,107 @@ fn render_directory_listing(path: &Path) -> Result<String, ToolRuntimeError> {
 
     lines.sort();
     Ok(lines.join("\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn count_file_lines_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.txt");
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(count_file_lines(&path).unwrap(), 0);
+    }
+
+    #[test]
+    fn count_file_lines_with_trailing_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trailing.txt");
+        std::fs::write(&path, "line1\nline2\nline3\n").unwrap();
+        assert_eq!(count_file_lines(&path).unwrap(), 3);
+    }
+
+    #[test]
+    fn count_file_lines_without_trailing_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no_trailing.txt");
+        std::fs::write(&path, "line1\nline2\nline3").unwrap();
+        assert_eq!(count_file_lines(&path).unwrap(), 3);
+    }
+
+    #[test]
+    fn count_file_lines_single_line_no_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("single.txt");
+        std::fs::write(&path, "hello").unwrap();
+        assert_eq!(count_file_lines(&path).unwrap(), 1);
+    }
+
+    #[test]
+    fn count_file_lines_nonexistent_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nonexistent.txt");
+        assert!(count_file_lines(&path).is_err());
+    }
+
+    #[test]
+    fn normalize_internal_whitespace_basic() {
+        assert_eq!(normalize_internal_whitespace("hello  world"), "hello world");
+    }
+
+    #[test]
+    fn normalize_internal_whitespace_preserves_indent() {
+        assert_eq!(
+            normalize_internal_whitespace("    hello  world"),
+            "    hello world"
+        );
+    }
+
+    #[test]
+    fn normalize_internal_whitespace_tabs() {
+        assert_eq!(
+            normalize_internal_whitespace("\thello\t\tworld"),
+            "\thello world"
+        );
+    }
+
+    #[test]
+    fn normalize_internal_whitespace_mixed_indent() {
+        assert_eq!(
+            normalize_internal_whitespace("  \thello   world  foo"),
+            "  \thello world foo"
+        );
+    }
+
+    #[test]
+    fn normalize_internal_whitespace_empty_line() {
+        assert_eq!(normalize_internal_whitespace(""), "");
+    }
+
+    #[test]
+    fn normalize_internal_whitespace_indent_only() {
+        assert_eq!(normalize_internal_whitespace("   "), "   ");
+    }
+
+    #[test]
+    fn normalize_lines_trims_trailing_and_collapses_internal() {
+        let input = "  hello  world  \n\tfoo\t\tbar\t\n";
+        let result = normalize_lines(input);
+        assert_eq!(result, vec!["  hello world", "\tfoo bar"]);
+    }
+
+    #[test]
+    fn normalize_lines_empty_input() {
+        let result = normalize_lines("");
+        assert_eq!(result, Vec::<String>::new());
+    }
+
+    #[test]
+    fn normalize_lines_preserves_single_spaces() {
+        let input = "fn main() {\n    println!(\"hello\");\n}\n";
+        let result = normalize_lines(input);
+        assert_eq!(result, vec!["fn main() {", "    println!(\"hello\");", "}"]);
+    }
 }

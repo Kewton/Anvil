@@ -5987,3 +5987,161 @@ fn file_cache_parallel_hit_count_consistent() {
         "hit_count should reflect all accesses"
     );
 }
+
+// --- Issue #175: file.search root default tests ---
+
+#[test]
+fn file_search_json_root_default() {
+    let value = serde_json::json!({
+        "pattern": "hello"
+    });
+    let input = ToolInput::from_json("file.search", &value).expect("should parse without root");
+    match input {
+        ToolInput::FileSearch { root, pattern, .. } => {
+            assert_eq!(root, ".");
+            assert_eq!(pattern, "hello");
+        }
+        _ => panic!("expected FileSearch"),
+    }
+}
+
+#[test]
+fn file_search_json_root_explicit() {
+    let value = serde_json::json!({
+        "root": "src",
+        "pattern": "hello"
+    });
+    let input = ToolInput::from_json("file.search", &value).expect("should parse");
+    match input {
+        ToolInput::FileSearch { root, .. } => {
+            assert_eq!(root, "src");
+        }
+        _ => panic!("expected FileSearch"),
+    }
+}
+
+#[test]
+fn file_search_json_path_fallback() {
+    let value = serde_json::json!({
+        "path": "lib",
+        "pattern": "hello"
+    });
+    let input =
+        ToolInput::from_json("file.search", &value).expect("should parse with path fallback");
+    match input {
+        ToolInput::FileSearch { root, .. } => {
+            assert_eq!(root, "lib");
+        }
+        _ => panic!("expected FileSearch"),
+    }
+}
+
+#[test]
+fn file_search_tag_root_default() {
+    let response = anvil::agent::BasicAgentLoop::parse_structured_response(concat!(
+        "```ANVIL_TOOL\n",
+        "<tool name=\"file.search\" pattern=\"hello\"/>\n",
+        "```\n",
+        "```ANVIL_FINAL\n",
+        "Searched.\n",
+        "```\n"
+    ))
+    .expect("Tag-based file.search without root should work");
+
+    assert_eq!(response.tool_calls.len(), 1);
+    match &response.tool_calls[0].input {
+        ToolInput::FileSearch { root, pattern, .. } => {
+            assert_eq!(root, ".");
+            assert_eq!(pattern, "hello");
+        }
+        _ => panic!("expected FileSearch"),
+    }
+}
+
+#[test]
+fn file_search_tag_root_explicit() {
+    let response = anvil::agent::BasicAgentLoop::parse_structured_response(concat!(
+        "```ANVIL_TOOL\n",
+        "<tool name=\"file.search\" root=\"src\" pattern=\"hello\"/>\n",
+        "```\n",
+        "```ANVIL_FINAL\n",
+        "Searched.\n",
+        "```\n"
+    ))
+    .expect("Tag-based file.search with root should work");
+
+    assert_eq!(response.tool_calls.len(), 1);
+    match &response.tool_calls[0].input {
+        ToolInput::FileSearch { root, .. } => {
+            assert_eq!(root, "src");
+        }
+        _ => panic!("expected FileSearch"),
+    }
+}
+
+#[test]
+fn file_search_json_root_invalid_type_rejected() {
+    let value = serde_json::json!({
+        "root": 123,
+        "pattern": "hello"
+    });
+    let result = ToolInput::from_json("file.search", &value);
+    assert!(result.is_err(), "non-string root should be rejected");
+}
+
+fn test_extract_simple(block: &str, key: &str) -> Option<String> {
+    for line in block.lines() {
+        if let Some(rest) = line.strip_prefix(&format!("{key}: ")) {
+            return Some(rest.to_string());
+        }
+        // Also handle JSON-like "key":"value"
+        let marker = format!("\"{key}\":\"");
+        if let Some(start) = line.find(&marker) {
+            let val_start = start + marker.len();
+            let tail = &line[val_start..];
+            if let Some(end) = tail.find('"') {
+                return Some(tail[..end].to_string());
+            }
+        }
+    }
+    None
+}
+
+fn test_extract_trailing(block: &str, key: &str) -> Option<String> {
+    test_extract_simple(block, key)
+}
+
+#[test]
+fn file_search_repair_root_default() {
+    let input = ToolInput::repair_from_block(
+        "file.search",
+        "pattern: hello\n",
+        test_extract_simple,
+        test_extract_trailing,
+    );
+    assert!(input.is_some(), "repair should succeed without root");
+    match input.unwrap() {
+        ToolInput::FileSearch { root, pattern, .. } => {
+            assert_eq!(root, ".");
+            assert_eq!(pattern, "hello");
+        }
+        _ => panic!("expected FileSearch"),
+    }
+}
+
+#[test]
+fn file_search_repair_root_explicit() {
+    let input = ToolInput::repair_from_block(
+        "file.search",
+        "root: src\npattern: hello\n",
+        test_extract_simple,
+        test_extract_trailing,
+    );
+    assert!(input.is_some(), "repair should succeed with root");
+    match input.unwrap() {
+        ToolInput::FileSearch { root, .. } => {
+            assert_eq!(root, "src");
+        }
+        _ => panic!("expected FileSearch"),
+    }
+}
