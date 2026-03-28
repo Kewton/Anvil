@@ -113,6 +113,7 @@ src/
 │   ├── alternating_loop_detector.rs # AlternatingLoopDetector（交互/循環パターン検出）
 │   ├── loop_detector.rs # ループ検出（リングバッファ・段階的対応）
 │   ├── phase_estimator.rs # フェーズ推定（ツール呼び出しパターンベース・フォールバック完了検出）
+│   ├── read_repeat_tracker.rs # file.read繰り返し検出・ヒント注入（セッション横断型・閾値2/4）
 │   ├── write_fail_tracker.rs # file.write連続失敗トラッキング（ヒント提供・閾値2）
 │   ├── plan.rs          # プラン管理
 │   ├── policy.rs        # offlineポリシーチェック（共通ヘルパー）

@@ -24,6 +24,7 @@ use crate::tooling::{PermissionClass, effective_permission_class};
 use std::collections::HashSet;
 
 use super::policy::{OFFLINE_BLOCK_PAYLOAD, check_offline_blocked};
+use super::read_repeat_tracker::ReadRepeatAction;
 use super::{App, AppError};
 
 /// Maximum number of parallel threads for tool execution.
@@ -1254,6 +1255,52 @@ impl App {
         // Write fail tracker: track consecutive file.write failures (Issue #161)
         let write_hint = self.update_write_tracker(result);
 
+        // Read repeat tracker: track repeated file.read calls (Issue #185)
+        let mut read_hint: Option<String> = None;
+        if result.tool_name == "file.read"
+            && result.status == ToolExecutionStatus::Completed
+            && let Some(path) = result.artifacts.first()
+        {
+            let action = self.read_repeat_tracker.record_read(path);
+            match action {
+                ReadRepeatAction::Warn(count) => {
+                    read_hint = Some(format!(
+                        "\n\n[Anvil hint] You have read {} {} times. \
+                         The file content is cached and unchanged — \
+                         refer to the content already in your context \
+                         instead of re-reading.",
+                        path, count
+                    ));
+                }
+                ReadRepeatAction::StrongWarn(count) => {
+                    read_hint = Some(format!(
+                        "\n\n[Anvil hint] You have read {} {} times, \
+                         wasting iterations. Refer to the content \
+                         already in your context instead of re-reading.",
+                        path, count
+                    ));
+                }
+                ReadRepeatAction::Continue => {}
+            }
+        }
+
+        // Reset read repeat tracker on file.edit/file.edit_anchor success (Issue #185)
+        if (result.tool_name == "file.edit" || result.tool_name == "file.edit_anchor")
+            && result.status == ToolExecutionStatus::Completed
+            && let Some(raw_path) = result.artifacts.first()
+        {
+            let path = resolve_edit_tracker_path(raw_path);
+            self.read_repeat_tracker.reset(&path);
+        }
+
+        // Reset read repeat tracker on file.write success (Issue #185)
+        if result.tool_name == "file.write"
+            && result.status == ToolExecutionStatus::Completed
+            && let Some(path) = result.artifacts.first()
+        {
+            self.read_repeat_tracker.reset(path);
+        }
+
         // Working memory: track errors (Issue #130)
         if result.status == ToolExecutionStatus::Failed {
             let sanitized_error = if result.tool_name == "shell.exec" {
@@ -1277,6 +1324,10 @@ impl App {
         }
         // Append write recovery hint if consecutive failures detected
         if let Some(hint) = write_hint {
+            formatted.push_str(&hint);
+        }
+        // Append read repeat hint if repeated reads detected (Issue #185)
+        if let Some(hint) = read_hint {
             formatted.push_str(&hint);
         }
         let mut msg = SessionMessage::new(MessageRole::Tool, &result.tool_name, formatted)

@@ -13,6 +13,7 @@ pub mod mock;
 pub mod phase_estimator;
 pub mod plan;
 pub mod policy;
+pub(crate) mod read_repeat_tracker;
 pub mod render;
 pub(crate) mod write_fail_tracker;
 
@@ -161,6 +162,8 @@ pub struct App {
     phase_estimator: phase_estimator::PhaseEstimator,
     /// Tracks consecutive file.write failures per path for recovery hints.
     write_fail_tracker: write_fail_tracker::WriteFailTracker,
+    /// Tracks repeated file.read calls per path for hint injection (Issue #185).
+    read_repeat_tracker: read_repeat_tracker::ReadRepeatTracker,
     /// File read cache: reduces redundant file.read calls within a session.
     file_read_cache: Arc<Mutex<crate::tooling::file_cache::FileReadCache>>,
 }
@@ -467,6 +470,7 @@ impl App {
                 phase_completion,
             ),
             write_fail_tracker: write_fail_tracker::WriteFailTracker::new(2),
+            read_repeat_tracker: read_repeat_tracker::ReadRepeatTracker::new(2, 4),
             file_read_cache,
         })
     }
