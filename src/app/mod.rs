@@ -16,6 +16,7 @@ pub mod policy;
 pub(crate) mod read_repeat_tracker;
 pub mod render;
 pub(crate) mod write_fail_tracker;
+pub(crate) mod write_repeat_tracker;
 
 use crate::agent::BasicAgentLoop;
 use crate::agent::{AgentEvent, AgentRuntime, PendingTurnState, ProjectLanguage, PromptTier};
@@ -164,6 +165,8 @@ pub struct App {
     write_fail_tracker: write_fail_tracker::WriteFailTracker,
     /// Tracks repeated file.read calls per path for hint injection (Issue #185).
     read_repeat_tracker: read_repeat_tracker::ReadRepeatTracker,
+    /// Tracks repeated successful file.write calls per path for warning hints.
+    write_repeat_tracker: write_repeat_tracker::WriteRepeatTracker,
     /// File read cache: reduces redundant file.read calls within a session.
     file_read_cache: Arc<Mutex<crate::tooling::file_cache::FileReadCache>>,
 }
@@ -471,6 +474,7 @@ impl App {
             ),
             write_fail_tracker: write_fail_tracker::WriteFailTracker::new(2),
             read_repeat_tracker: read_repeat_tracker::ReadRepeatTracker::new(2, 4),
+            write_repeat_tracker: write_repeat_tracker::WriteRepeatTracker::new(3, 4),
             file_read_cache,
         })
     }

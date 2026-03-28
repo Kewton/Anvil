@@ -25,6 +25,7 @@ use std::collections::HashSet;
 
 use super::policy::{OFFLINE_BLOCK_PAYLOAD, check_offline_blocked};
 use super::read_repeat_tracker::ReadRepeatAction;
+use super::write_repeat_tracker::WriteRepeatAction;
 use super::{App, AppError};
 
 /// Maximum number of parallel threads for tool execution.
@@ -1248,12 +1249,22 @@ impl App {
                 if let Some(artifact) = result.artifacts.first() {
                     let path_str = resolve_edit_tracker_path(artifact);
                     self.edit_fail_tracker.record_success(&path_str);
+                    self.write_repeat_tracker.reset_for_path(&path_str);
                 }
             }
         }
 
+        // Write repeat tracker: reset on file.read success for the same path
+        if result.tool_name == "file.read"
+            && result.status == ToolExecutionStatus::Completed
+            && let Some(artifact) = result.artifacts.first()
+        {
+            let path = resolve_edit_tracker_path(artifact);
+            self.write_repeat_tracker.reset_for_path(&path);
+        }
+
         // Write fail tracker: track consecutive file.write failures (Issue #161)
-        let write_hint = self.update_write_tracker(result);
+        let write_hint = self.update_write_trackers(result);
 
         // Read repeat tracker: track repeated file.read calls (Issue #185)
         let mut read_hint: Option<String> = None;
@@ -1342,8 +1353,9 @@ impl App {
         self.session.push_message(msg);
     }
 
-    /// Track consecutive file.write failures and return a hint if threshold reached.
-    fn update_write_tracker(&mut self, result: &ToolExecutionResult) -> Option<String> {
+    /// Track consecutive file.write failures and repeated successful writes,
+    /// returning a hint if either threshold is reached.
+    fn update_write_trackers(&mut self, result: &ToolExecutionResult) -> Option<String> {
         if result.tool_name != "file.write" {
             return None;
         }
@@ -1364,7 +1376,32 @@ impl App {
         } else if result.status == ToolExecutionStatus::Completed
             && let Some(artifact) = result.artifacts.first()
         {
-            self.write_fail_tracker.record_success(artifact);
+            let path = resolve_edit_tracker_path(artifact);
+            self.write_fail_tracker.record_success(&path);
+            let repeat_action = self.write_repeat_tracker.record_write(&path);
+            if matches!(
+                repeat_action,
+                WriteRepeatAction::Warn | WriteRepeatAction::StrongWarn
+            ) {
+                let count = self.write_repeat_tracker.write_count(&path);
+                let safe_path = crate::session::sanitize_for_prompt_entry(&path);
+                let detail = if repeat_action == WriteRepeatAction::StrongWarn {
+                    ". This appears to be a loop. Consider: \
+                     (1) Stop rewriting this file entirely, \
+                     (2) Use file.read to verify the current state, \
+                     (3) Use file.edit for targeted changes to specific sections."
+                } else {
+                    ". Consider: \
+                     (1) Use file.read to review the current content, \
+                     (2) Use file.edit to modify only the specific section \
+                     that needs changing, \
+                     (3) Avoid rewriting the entire file repeatedly."
+                };
+                return Some(format!(
+                    "\n\n[Anvil hint] file.write has been called {count} times \
+                     for '{safe_path}'{detail}"
+                ));
+            }
         }
         None
     }

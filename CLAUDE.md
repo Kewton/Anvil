@@ -115,6 +115,7 @@ src/
 │   ├── phase_estimator.rs # フェーズ推定（ツール呼び出しパターンベース・フォールバック完了検出）
 │   ├── read_repeat_tracker.rs # file.read繰り返し検出・ヒント注入（セッション横断型・閾値2/4）
 │   ├── write_fail_tracker.rs # file.write連続失敗トラッキング（ヒント提供・閾値2）
+│   ├── write_repeat_tracker.rs # file.write成功繰り返しトラッキング（同一ファイルへのwrite検出・Warn閾値3/StrongWarn閾値4）
 │   ├── plan.rs          # プラン管理
 │   ├── policy.rs        # offlineポリシーチェック（共通ヘルパー）
 │   ├── render.rs        # コンソール描画
