@@ -114,6 +114,7 @@ src/
 │   ├── loop_detector.rs # ループ検出（リングバッファ・段階的対応）
 │   ├── phase_estimator.rs # フェーズ推定（ツール呼び出しパターンベース・フォールバック完了検出）
 │   ├── write_fail_tracker.rs # file.write連続失敗トラッキング（ヒント提供・閾値2）
+│   ├── write_repeat_tracker.rs # file.write成功繰り返しトラッキング（同一ファイルへのwrite検出・Warn閾値3/StrongWarn閾値4）
 │   ├── plan.rs          # プラン管理
 │   ├── policy.rs        # offlineポリシーチェック（共通ヘルパー）
 │   ├── render.rs        # コンソール描画
