@@ -21,6 +21,8 @@ use crate::tooling::{ToolCallRequest, ToolInput, detect_image_mime};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::{HashMap, HashSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -295,6 +297,9 @@ impl BasicAgentLoop {
             tool_calls.push(parse_tool_call_block_multi_tier(&block)?);
         }
 
+        // Issue #186: 同一ターン内の重複ツール呼び出しを排除し、ID衝突を解消
+        let tool_calls = dedup_tool_calls(tool_calls);
+
         let final_response = final_block
             .map(|block| block.trim().to_string())
             .unwrap_or_else(|| content.trim().to_string());
@@ -316,6 +321,45 @@ impl BasicAgentLoop {
         extract_final_block(content, "ANVIL_FINAL").is_some()
             || extract_final_block_lenient(content, "ANVIL_FINAL").is_some()
     }
+}
+
+/// Issue #186: 同一ターン内の重複ツール呼び出しを排除し、ID衝突を解消する。
+///
+/// 1. セマンティック重複排除: (tool_name, input) が同一のツール呼び出しは最初の出現のみ保持
+/// 2. ID衝突解消: 同一IDが複数存在する場合、2番目以降にサフィックスを付与
+fn dedup_tool_calls(tool_calls: Vec<ToolCallRequest>) -> Vec<ToolCallRequest> {
+    // Step 1: セマンティック重複排除
+    let mut seen_fingerprints: HashSet<u64> = HashSet::new();
+    let mut deduped: Vec<ToolCallRequest> = Vec::new();
+
+    for call in tool_calls {
+        let fp = tool_call_fingerprint(&call);
+        if seen_fingerprints.insert(fp) {
+            deduped.push(call);
+        }
+    }
+
+    // Step 2: ID衝突解消 — 同一IDが複数ある場合にリナンバリング
+    let mut id_counts: HashMap<String, usize> = HashMap::new();
+    for call in &mut deduped {
+        let count = id_counts.entry(call.tool_call_id.clone()).or_insert(0);
+        if *count > 0 {
+            call.tool_call_id = format!("{}_{}", call.tool_call_id, count);
+        }
+        *count += 1;
+    }
+
+    deduped
+}
+
+/// (tool_name, serialized input) のハッシュでセマンティック一致を判定
+fn tool_call_fingerprint(call: &ToolCallRequest) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    call.tool_name.hash(&mut hasher);
+    if let Ok(s) = serde_json::to_string(&call.input) {
+        s.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 /// Multi-tier tool call parser.
@@ -1148,7 +1192,6 @@ fn extract_final_block_lenient(content: &str, label: &str) -> Option<String> {
 // --- MCP tool description generation ---
 
 use crate::mcp::McpToolInfo;
-use std::collections::HashMap;
 
 /// Maximum characters for MCP tool descriptions in the system prompt.
 /// [D3-009] Prevents system prompt bloat that compresses message budget.
