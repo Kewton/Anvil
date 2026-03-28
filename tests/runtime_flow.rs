@@ -1013,3 +1013,138 @@ fn tag_protocol_prompt_contains_tag_examples() {
         "tag-based prompt should mention file.edit_anchor"
     );
 }
+
+// --- Issue #186: 同一ターン内の重複ツール呼び出し排除テスト ---
+
+#[test]
+fn dedup_identical_tool_calls_in_single_turn() {
+    // 同一ID・同一内容のツール呼び出しが2回出現 → 1回に削減
+    let response = anvil::agent::BasicAgentLoop::parse_structured_response(concat!(
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_001\",\"tool\":\"file.edit\",\"path\":\"./src/main.rs\",\"old_string\":\"old\",\"new_string\":\"new\"}\n",
+        "```\n",
+        "Now I'll implement the next step...\n",
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_001\",\"tool\":\"file.edit\",\"path\":\"./src/main.rs\",\"old_string\":\"old\",\"new_string\":\"new\"}\n",
+        "```\n"
+    ))
+    .expect("parsing should succeed");
+
+    assert_eq!(
+        response.tool_calls.len(),
+        1,
+        "duplicate tool call should be removed"
+    );
+}
+
+#[test]
+fn dedup_preserves_different_tools() {
+    // 異なるツール呼び出しは保持される
+    let response = anvil::agent::BasicAgentLoop::parse_structured_response(concat!(
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_001\",\"tool\":\"file.read\",\"path\":\"./src/main.rs\"}\n",
+        "```\n",
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_002\",\"tool\":\"file.read\",\"path\":\"./src/lib.rs\"}\n",
+        "```\n"
+    ))
+    .expect("parsing should succeed");
+
+    assert_eq!(
+        response.tool_calls.len(),
+        2,
+        "different tool calls should be preserved"
+    );
+}
+
+#[test]
+fn dedup_same_tool_different_input_preserved() {
+    // 同一ツール名でもinputが異なれば保持
+    let response = anvil::agent::BasicAgentLoop::parse_structured_response(concat!(
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_001\",\"tool\":\"file.read\",\"path\":\"./src/main.rs\"}\n",
+        "```\n",
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_001\",\"tool\":\"file.read\",\"path\":\"./src/lib.rs\"}\n",
+        "```\n"
+    ))
+    .expect("parsing should succeed");
+
+    assert_eq!(
+        response.tool_calls.len(),
+        2,
+        "same tool with different input should be preserved"
+    );
+}
+
+#[test]
+fn dedup_renumbers_duplicate_ids() {
+    // 同一IDが異なるツール呼び出しに使用されている場合、リナンバリング
+    let response = anvil::agent::BasicAgentLoop::parse_structured_response(concat!(
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_001\",\"tool\":\"file.read\",\"path\":\"./src/main.rs\"}\n",
+        "```\n",
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_001\",\"tool\":\"file.read\",\"path\":\"./src/lib.rs\"}\n",
+        "```\n"
+    ))
+    .expect("parsing should succeed");
+
+    assert_eq!(response.tool_calls.len(), 2);
+    assert_eq!(response.tool_calls[0].tool_call_id, "call_001");
+    assert_ne!(
+        response.tool_calls[1].tool_call_id, "call_001",
+        "duplicate ID should be renumbered"
+    );
+}
+
+#[test]
+fn dedup_issue_186_reproduction() {
+    // Issue #186の再現ケース: z-index.ts edit → TerminalDisplay.tsx edit → 計画テキスト → TerminalDisplay.tsx edit(重複)
+    let response = anvil::agent::BasicAgentLoop::parse_structured_response(concat!(
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_001\",\"tool\":\"file.edit\",\"path\":\"./src/config/z-index.ts\",\"old_string\":\"a\",\"new_string\":\"b\"}\n",
+        "```\n",
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_001\",\"tool\":\"file.edit\",\"path\":\"./src/components/TerminalDisplay.tsx\",\"old_string\":\"c\",\"new_string\":\"d\"}\n",
+        "```\n",
+        "Now I'll implement the fullscreen functionality...\n",
+        "1. I've added MAXIMIZED_TERMINAL: 56 to z-index.ts\n",
+        "2. I need to add fullscreen button\n",
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_001\",\"tool\":\"file.edit\",\"path\":\"./src/components/TerminalDisplay.tsx\",\"old_string\":\"c\",\"new_string\":\"d\"}\n",
+        "```\n"
+    ))
+    .expect("parsing should succeed");
+
+    // z-index.ts edit + TerminalDisplay.tsx edit = 2 (3番目は重複なので除去)
+    assert_eq!(
+        response.tool_calls.len(),
+        2,
+        "duplicate TerminalDisplay.tsx edit should be removed"
+    );
+}
+
+#[test]
+fn dedup_with_anvil_final_combined() {
+    // 重複排除とANVIL_FINALカットオフが正しく組み合わさる
+    let response = anvil::agent::BasicAgentLoop::parse_structured_response(concat!(
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_001\",\"tool\":\"file.read\",\"path\":\"./src/main.rs\"}\n",
+        "```\n",
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_001\",\"tool\":\"file.read\",\"path\":\"./src/main.rs\"}\n",
+        "```\n",
+        "```ANVIL_FINAL\n",
+        "Done.\n",
+        "```\n",
+        "```ANVIL_TOOL\n",
+        "{\"id\":\"call_003\",\"tool\":\"file.read\",\"path\":\"./src/lib.rs\"}\n",
+        "```\n"
+    ))
+    .expect("parsing should succeed");
+
+    // 1st call kept, 2nd is duplicate (removed), 3rd is post-FINAL (excluded)
+    assert_eq!(response.tool_calls.len(), 1);
+    assert_eq!(response.tool_calls[0].tool_call_id, "call_001");
+}
