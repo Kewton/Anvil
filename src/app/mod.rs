@@ -15,6 +15,7 @@ pub mod plan;
 pub mod policy;
 pub mod render;
 pub(crate) mod write_fail_tracker;
+pub(crate) mod write_repeat_tracker;
 
 use crate::agent::BasicAgentLoop;
 use crate::agent::{AgentEvent, AgentRuntime, PendingTurnState, ProjectLanguage, PromptTier};
@@ -161,6 +162,8 @@ pub struct App {
     phase_estimator: phase_estimator::PhaseEstimator,
     /// Tracks consecutive file.write failures per path for recovery hints.
     write_fail_tracker: write_fail_tracker::WriteFailTracker,
+    /// Tracks repeated successful file.write calls per path for warning hints.
+    write_repeat_tracker: write_repeat_tracker::WriteRepeatTracker,
     /// File read cache: reduces redundant file.read calls within a session.
     file_read_cache: Arc<Mutex<crate::tooling::file_cache::FileReadCache>>,
 }
@@ -467,6 +470,7 @@ impl App {
                 phase_completion,
             ),
             write_fail_tracker: write_fail_tracker::WriteFailTracker::new(2),
+            write_repeat_tracker: write_repeat_tracker::WriteRepeatTracker::new(3, 4),
             file_read_cache,
         })
     }
