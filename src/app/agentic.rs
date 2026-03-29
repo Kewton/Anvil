@@ -511,21 +511,23 @@ impl App {
             }
 
             // Parse the follow-up response (retry once on parse failure)
-            let next_structured =
-                match BasicAgentLoop::parse_structured_response(&next_token_buffer) {
-                    Ok(parsed) => parsed,
-                    Err(first_err) => {
-                        // LLMs occasionally produce malformed output; treat the
-                        // raw text as a plain final answer rather than failing the
-                        // entire turn.
-                        let trimmed = next_token_buffer.trim();
-                        if !trimmed.is_empty() {
-                            StructuredAssistantResponse::empty(trimmed.to_string())
-                        } else {
-                            return Err(AppError::ToolExecution(first_err));
-                        }
+            let next_structured = match BasicAgentLoop::parse_structured_response_with_registry(
+                &next_token_buffer,
+                &self.tools,
+            ) {
+                Ok(parsed) => parsed,
+                Err(first_err) => {
+                    // LLMs occasionally produce malformed output; treat the
+                    // raw text as a plain final answer rather than failing the
+                    // entire turn.
+                    let trimmed = next_token_buffer.trim();
+                    if !trimmed.is_empty() {
+                        StructuredAssistantResponse::empty(trimmed.to_string())
+                    } else {
+                        return Err(AppError::ToolExecution(first_err));
                     }
-                };
+                }
+            };
 
             // Issue #173: Update ANVIL_FINAL tracking from the new response
             if next_structured.anvil_final_detected {
@@ -1473,7 +1475,10 @@ impl App {
         })?;
 
         // Parse the retry response
-        let retry_structured = match BasicAgentLoop::parse_structured_response(&token_buffer) {
+        let retry_structured = match BasicAgentLoop::parse_structured_response_with_registry(
+            &token_buffer,
+            &self.tools,
+        ) {
             Ok(parsed) => parsed,
             Err(_) => {
                 let trimmed = token_buffer.trim();
@@ -1543,8 +1548,9 @@ impl App {
             return Ok(None);
         };
 
-        let structured = BasicAgentLoop::parse_structured_response(assistant_message)
-            .map_err(AppError::ToolExecution)?;
+        let structured =
+            BasicAgentLoop::parse_structured_response_with_registry(assistant_message, &self.tools)
+                .map_err(AppError::ToolExecution)?;
         if structured.tool_calls.is_empty() {
             // ANVIL_FINAL guard: only activate when the message contains a
             // structured ANVIL_FINAL block (not plain-text Done messages).

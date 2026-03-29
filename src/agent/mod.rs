@@ -275,6 +275,14 @@ impl BasicAgentLoop {
     }
 
     pub fn parse_structured_response(content: &str) -> Result<StructuredAssistantResponse, String> {
+        let empty = crate::tooling::ToolRegistry::new();
+        Self::parse_structured_response_with_registry(content, &empty)
+    }
+
+    pub fn parse_structured_response_with_registry(
+        content: &str,
+        registry: &crate::tooling::ToolRegistry,
+    ) -> Result<StructuredAssistantResponse, String> {
         let tool_blocks = extract_fenced_blocks(content, "ANVIL_TOOL");
 
         // ANVIL_FINALの位置を取得（カットオフポイント）
@@ -294,7 +302,7 @@ impl BasicAgentLoop {
             {
                 continue;
             }
-            tool_calls.push(parse_tool_call_block_multi_tier(&block)?);
+            tool_calls.push(parse_tool_call_block_multi_tier(&block, registry)?);
         }
 
         // Issue #186: 同一ターン内の重複ツール呼び出しを排除し、ID衝突を解消
@@ -367,10 +375,13 @@ fn tool_call_fingerprint(call: &ToolCallRequest) -> u64 {
 /// Tier 1: Strict JSON (existing parse path)
 /// Tier 2: Tag-based (XML-like) format via tag_parser
 /// Tier 3: Repair fallback (existing repair path)
-fn parse_tool_call_block_multi_tier(block: &str) -> Result<ToolCallRequest, String> {
+fn parse_tool_call_block_multi_tier(
+    block: &str,
+    registry: &crate::tooling::ToolRegistry,
+) -> Result<ToolCallRequest, String> {
     // Tier 1: strict JSON
     if let Ok(value) = serde_json::from_str::<Value>(block) {
-        match parse_tool_call_value(&value) {
+        match parse_tool_call_value(&value, registry) {
             Ok(call) => return Ok(call),
             Err(json_err) => {
                 // JSON parsed but field extraction failed — this is a definitive error
@@ -396,7 +407,10 @@ fn parse_tool_call_block_multi_tier(block: &str) -> Result<ToolCallRequest, Stri
         .ok_or_else(|| "Failed to parse tool call in any format".to_string())
 }
 
-fn parse_tool_call_value(value: &Value) -> Result<ToolCallRequest, String> {
+fn parse_tool_call_value(
+    value: &Value,
+    registry: &crate::tooling::ToolRegistry,
+) -> Result<ToolCallRequest, String> {
     let tool_name = value
         .get("tool")
         .and_then(Value::as_str)
@@ -405,11 +419,24 @@ fn parse_tool_call_value(value: &Value) -> Result<ToolCallRequest, String> {
         .get("id")
         .and_then(Value::as_str)
         .unwrap_or("call_generated_001");
-    let input = ToolInput::from_json(tool_name, value)?;
+
+    // Try built-in tools first, then fall back to custom tools.
+    let (resolved_name, input) = match ToolInput::from_json(tool_name, value) {
+        Ok(input) => (tool_name.to_string(), input),
+        Err(e) => {
+            if let Some(tool_def) = registry.find_custom_tool(tool_name) {
+                let input = ToolInput::from_custom_tool(tool_def, value)?;
+                let display_name = crate::config::custom_tool_display_name(&tool_def.name);
+                (display_name, input)
+            } else {
+                return Err(e);
+            }
+        }
+    };
 
     Ok(ToolCallRequest::new(
         tool_call_id.to_string(),
-        tool_name.to_string(),
+        resolved_name,
         input,
     ))
 }

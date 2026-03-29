@@ -10,7 +10,10 @@ pub mod shell_policy;
 
 pub use shell_policy::{ShellPolicy, classify_shell_policy, is_network_command};
 
-use crate::config::{RuntimeConfig, WebSearchProvider};
+use crate::config::{
+    CustomToolDef, RuntimeConfig, WebSearchProvider, custom_tool_display_name,
+    expand_command_template, json_value_to_params, strip_custom_prefix,
+};
 use crate::contracts::ToolLogView;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -196,6 +199,16 @@ impl ToolInput {
             Self::GitLog { .. } => ToolKind::GitLog,
             Self::FileEditAnchor { .. } => ToolKind::FileEditAnchor,
         }
+    }
+
+    /// Build a `ToolInput::ShellExec` from a custom tool definition and JSON args.
+    pub fn from_custom_tool(
+        tool_def: &CustomToolDef,
+        value: &serde_json::Value,
+    ) -> Result<Self, String> {
+        let params = json_value_to_params(value)?;
+        let command = expand_command_template(&tool_def.command, &params)?;
+        Ok(ToolInput::ShellExec { command })
     }
 
     /// Parse a JSON value into a `ToolInput` given a tool name.
@@ -663,12 +676,14 @@ pub enum ToolValidationError {
 #[derive(Debug, Default)]
 pub struct ToolRegistry {
     specs: HashMap<String, ToolSpec>,
+    custom_tools: Vec<CustomToolDef>,
 }
 
 impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             specs: HashMap::new(),
+            custom_tools: Vec::new(),
         }
     }
 
@@ -878,6 +893,35 @@ impl ToolRegistry {
         self.register_git_status();
         self.register_git_diff();
         self.register_git_log();
+    }
+
+    /// Register custom tool definitions from ANVIL.md and store them for lookup.
+    pub fn register_custom_tools(&mut self, custom_tools: Vec<CustomToolDef>) {
+        for tool in &custom_tools {
+            let spec = ToolSpec {
+                version: 1,
+                name: custom_tool_display_name(&tool.name),
+                kind: ToolKind::ShellExec,
+                execution_class: ExecutionClass::Mutating,
+                permission_class: PermissionClass::Confirm,
+                execution_mode: ExecutionMode::SequentialOnly,
+                plan_mode: PlanModePolicy::Allowed,
+                rollback_policy: RollbackPolicy::None,
+            };
+            self.register(spec);
+        }
+        self.custom_tools = custom_tools;
+    }
+
+    /// Access the custom tool definitions.
+    pub fn custom_tools(&self) -> &[CustomToolDef] {
+        &self.custom_tools
+    }
+
+    /// Look up a custom tool definition by its LLM-facing name.
+    pub fn find_custom_tool(&self, tool_name: &str) -> Option<&CustomToolDef> {
+        let base_name = strip_custom_prefix(tool_name).unwrap_or(tool_name);
+        self.custom_tools.iter().find(|t| t.name == base_name)
     }
 
     pub fn validate(
