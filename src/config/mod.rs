@@ -5,7 +5,13 @@
 //! immutable for the lifetime of the session.
 
 pub mod cli_args;
+pub mod custom_tools;
 pub use cli_args::CliArgs;
+pub use custom_tools::{
+    CUSTOM_TOOL_PREFIX, CustomToolDef, MAX_CUSTOM_TOOLS, custom_tool_display_name,
+    expand_command_template, json_value_to_params, parse_tools_section, shell_escape,
+    strip_custom_prefix,
+};
 
 use crate::provider::transport::{DEFAULT_HTTP_TIMEOUT_SECS, normalize_http_timeout};
 use clap::Parser;
@@ -185,6 +191,7 @@ pub struct EffectiveConfig {
     pub mode: ModeConfig,
     pub paths: PathConfig,
     project_instructions: Option<String>,
+    custom_tools: Vec<CustomToolDef>,
 }
 
 #[derive(Debug)]
@@ -225,6 +232,11 @@ impl EffectiveConfig {
         self.project_instructions.as_deref()
     }
 
+    /// Custom tool definitions parsed from ANVIL.md `## tools` section.
+    pub fn custom_tools(&self) -> &[CustomToolDef] {
+        &self.custom_tools
+    }
+
     /// Test-only setter for project_instructions.
     /// In production code, this field is set only via `load()`.
     pub fn set_project_instructions_for_test(&mut self, instructions: Option<String>) {
@@ -263,7 +275,9 @@ impl EffectiveConfig {
         }
 
         config.validate()?;
-        config.project_instructions = config.paths.load_project_instructions();
+        let (instructions, custom_tools) = config.paths.load_project_instructions();
+        config.project_instructions = instructions;
+        config.custom_tools = custom_tools;
         Ok(config)
     }
 
@@ -332,6 +346,7 @@ impl EffectiveConfig {
                 logs_dir,
             },
             project_instructions: None,
+            custom_tools: Vec::new(),
         }
     }
 
@@ -1095,14 +1110,20 @@ pub fn check_gitignore_anvil_dir(repo_root: &Path) -> Option<String> {
 impl PathConfig {
     /// Load project instructions from ANVIL.md files.
     /// Delegates to `load_project_instructions_from()` for testability.
-    pub fn load_project_instructions(&self) -> Option<String> {
+    pub fn load_project_instructions(&self) -> (Option<String>, Vec<CustomToolDef>) {
         let home_dir = std::env::var("HOME").ok().map(PathBuf::from);
         Self::load_project_instructions_from(&self.cwd, home_dir.as_deref())
     }
 
     /// Internal method: accepts cwd and home_dir as arguments so tests can
     /// pass temp directories without depending on the HOME environment variable.
-    pub fn load_project_instructions_from(cwd: &Path, home_dir: Option<&Path>) -> Option<String> {
+    ///
+    /// Returns `(project_instructions, custom_tool_defs)`.
+    /// The `## tools` section is extracted from instructions and returned separately.
+    pub fn load_project_instructions_from(
+        cwd: &Path,
+        home_dir: Option<&Path>,
+    ) -> (Option<String>, Vec<CustomToolDef>) {
         let mut parts: Vec<String> = Vec::new();
         let mut sources: Vec<String> = Vec::new();
         let mut has_user_scope = false;
@@ -1149,7 +1170,7 @@ impl PathConfig {
         }
 
         if parts.is_empty() {
-            return None;
+            return (None, Vec::new());
         }
 
         eprintln!("ANVIL.md loaded from: {}", sources.join(", "));
@@ -1192,7 +1213,20 @@ impl PathConfig {
             };
         }
 
-        Some(combined)
+        // Parse and extract ## tools section before returning.
+        let (instructions, custom_tools) = parse_tools_section(&combined);
+        let instructions = if instructions.trim().is_empty() {
+            None
+        } else {
+            Some(instructions)
+        };
+        if !custom_tools.is_empty() {
+            eprintln!(
+                "Custom tools registered from ANVIL.md: {} tool(s)",
+                custom_tools.len()
+            );
+        }
+        (instructions, custom_tools)
     }
 }
 

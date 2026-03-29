@@ -363,7 +363,7 @@ impl App {
 
         // [D1-009] ToolSpec conversion and ToolRegistry registration done by App side (SRP)
         // [D2-003] standard_tool_registry() is a free function
-        let mut tools = standard_tool_registry();
+        let mut tools = standard_tool_registry(config.custom_tools().to_vec());
         // Register sub-agent tools separately (design decision #6, DR1-008)
         tools.register_agent_explore();
         tools.register_agent_plan();
@@ -620,6 +620,22 @@ impl App {
 
         // Current date and timezone (dynamic, re-evaluated per turn)
         prompt.push_str(&context::format_date_prompt());
+
+        // Custom tools prompt (from ANVIL.md ## tools section)
+        let custom_tools = self.tools.custom_tools();
+        if !custom_tools.is_empty() {
+            prompt.push_str("\n\n## Custom tools (from ANVIL.md)\n\n");
+            prompt.push_str("The following project-specific tools are available. Use them like built-in tools.\n\n");
+            for tool in custom_tools {
+                let display_name = crate::config::custom_tool_display_name(&tool.name);
+                prompt.push_str(&format!("### {display_name}\n"));
+                prompt.push_str(&format!("Description: {}\n", tool.description));
+                if !tool.attributes.is_empty() {
+                    prompt.push_str(&format!("Attributes: {}\n", tool.attributes.join(", ")));
+                }
+                prompt.push('\n');
+            }
+        }
 
         // Project instructions (from ANVIL.md)
         if let Some(ref instructions) = self.project_instructions {
@@ -1062,8 +1078,11 @@ impl App {
                             // Already streamed to stderr. Check for structured response.
                             if BasicAgentLoop::is_complete_structured_response(&token_buffer) {
                                 let structured =
-                                    BasicAgentLoop::parse_structured_response(&token_buffer)
-                                        .map_err(AppError::ToolExecution)?;
+                                    BasicAgentLoop::parse_structured_response_with_registry(
+                                        &token_buffer,
+                                        &self.tools,
+                                    )
+                                    .map_err(AppError::ToolExecution)?;
                                 // Issue #173: Pass anvil_final_detected from parsed response
                                 let anvil_final = structured.anvil_final_detected;
                                 frames.extend(self.complete_structured_response(
@@ -2209,9 +2228,12 @@ pub fn error_guidance(err: &AppError) -> String {
     }
 }
 
-fn standard_tool_registry() -> ToolRegistry {
+fn standard_tool_registry(custom_tools: Vec<crate::config::CustomToolDef>) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.register_standard_tools();
+    if !custom_tools.is_empty() {
+        registry.register_custom_tools(custom_tools);
+    }
     registry
 }
 
