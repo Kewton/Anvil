@@ -133,6 +133,10 @@ pub struct RuntimeConfig {
     pub safe_write_max_lines: usize,
     /// Deletion ratio threshold for diff warning (0.0-1.0, Issue #156).
     pub safe_write_deletion_ratio: f64,
+    /// ReadRepeatTracker: per-path read count to trigger warn hint (Issue #187).
+    pub read_repeat_warn_threshold: u32,
+    /// ReadRepeatTracker: per-path read count to trigger strong-warn hint (Issue #187).
+    pub read_repeat_strong_warn_threshold: u32,
     /// UI language for LLM responses (Issue #162).
     /// `None` means "use default language via effective_ui_language_code()".
     /// Supported: "ja", "en".
@@ -293,13 +297,15 @@ impl EffectiveConfig {
                 loop_detection_threshold: 3,
                 http_timeout_secs: DEFAULT_HTTP_TIMEOUT_SECS,
                 phase_explore_threshold: 5,
-                phase_force_transition_threshold: 10,
+                phase_force_transition_threshold: 15,
                 phase_completion_read_threshold: 5,
                 edit_strategy: crate::app::edit_fail_tracker::EditStrategy::EditFirst,
                 edit_reread_threshold: 3,
                 edit_write_fallback_threshold: 5,
                 safe_write_max_lines: 500,
                 safe_write_deletion_ratio: 0.5,
+                read_repeat_warn_threshold: 3,
+                read_repeat_strong_warn_threshold: 6,
                 ui_language: None,
                 max_tool_calls: DEFAULT_MAX_TOOL_CALLS,
             },
@@ -722,6 +728,24 @@ impl EffectiveConfig {
                     }
                     self.runtime.edit_write_fallback_threshold = v;
                 }
+                "read_repeat_warn_threshold" | "ANVIL_READ_REPEAT_WARN_THRESHOLD" => {
+                    let v: u32 = value
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                    if !(1..=20).contains(&v) {
+                        return Err(ConfigError::InvalidNumericValue(value.clone()));
+                    }
+                    self.runtime.read_repeat_warn_threshold = v;
+                }
+                "read_repeat_strong_warn_threshold" | "ANVIL_READ_REPEAT_STRONG_WARN_THRESHOLD" => {
+                    let v: u32 = value
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                    if !(2..=40).contains(&v) {
+                        return Err(ConfigError::InvalidNumericValue(value.clone()));
+                    }
+                    self.runtime.read_repeat_strong_warn_threshold = v;
+                }
                 "safe_write_max_lines" | "ANVIL_SAFE_WRITE_MAX_LINES" => {
                     self.runtime.safe_write_max_lines = value
                         .parse()
@@ -777,6 +801,7 @@ impl EffectiveConfig {
         self.clamp_loop_detection_threshold();
         self.clamp_phase_thresholds();
         self.clamp_edit_thresholds();
+        self.clamp_read_repeat_thresholds();
         self.clamp_http_timeout();
         self.clamp_max_tool_calls();
         self.sanitize_ui_language();
@@ -937,6 +962,20 @@ impl EffectiveConfig {
         if self.runtime.phase_explore_threshold >= self.runtime.phase_force_transition_threshold {
             self.runtime.phase_force_transition_threshold =
                 (self.runtime.phase_explore_threshold + 5).min(30);
+        }
+    }
+
+    /// Clamp read-repeat tracker thresholds and enforce warn < strong_warn (Issue #187).
+    fn clamp_read_repeat_thresholds(&mut self) {
+        self.runtime.read_repeat_warn_threshold =
+            self.runtime.read_repeat_warn_threshold.clamp(1, 20);
+        self.runtime.read_repeat_strong_warn_threshold =
+            self.runtime.read_repeat_strong_warn_threshold.clamp(2, 40);
+        // Enforce warn < strong_warn
+        if self.runtime.read_repeat_warn_threshold >= self.runtime.read_repeat_strong_warn_threshold
+        {
+            self.runtime.read_repeat_strong_warn_threshold =
+                self.runtime.read_repeat_warn_threshold + 3;
         }
     }
 
