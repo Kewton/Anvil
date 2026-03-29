@@ -434,6 +434,8 @@ impl App {
         let phase_completion = config.runtime.phase_completion_read_threshold;
         let edit_reread_threshold = config.runtime.edit_reread_threshold;
         let edit_write_fallback_threshold = config.runtime.edit_write_fallback_threshold;
+        let read_repeat_warn = config.runtime.read_repeat_warn_threshold;
+        let read_repeat_strong_warn = config.runtime.read_repeat_strong_warn_threshold;
 
         Ok(Self {
             tools,
@@ -473,7 +475,10 @@ impl App {
                 phase_completion,
             ),
             write_fail_tracker: write_fail_tracker::WriteFailTracker::new(2),
-            read_repeat_tracker: read_repeat_tracker::ReadRepeatTracker::new(2, 4),
+            read_repeat_tracker: read_repeat_tracker::ReadRepeatTracker::new(
+                read_repeat_warn,
+                read_repeat_strong_warn,
+            ),
             write_repeat_tracker: write_repeat_tracker::WriteRepeatTracker::new(3, 4),
             file_read_cache,
         })

@@ -1077,3 +1077,78 @@ fn safe_write_cli_args_none_leaves_default() {
     assert_eq!(config.runtime.safe_write_max_lines, 500);
     assert!((config.runtime.safe_write_deletion_ratio - 0.5).abs() < f64::EPSILON);
 }
+
+// --- Issue #187: CI implementation reduction fixes ---
+
+#[test]
+fn issue187_read_repeat_default_thresholds_raised() {
+    let config = EffectiveConfig::default_for_test().unwrap();
+    // Issue #187: warn=2 was too aggressive, raised to 3
+    assert_eq!(config.runtime.read_repeat_warn_threshold, 3);
+    // Issue #187: strong_warn raised from 4 to 6
+    assert_eq!(config.runtime.read_repeat_strong_warn_threshold, 6);
+}
+
+#[test]
+fn issue187_phase_force_transition_default_raised() {
+    let config = EffectiveConfig::default_for_test().unwrap();
+    // Issue #187: force_transition_threshold raised from 10 to 15
+    assert_eq!(config.runtime.phase_force_transition_threshold, 15);
+}
+
+#[test]
+fn issue187_read_repeat_thresholds_configurable_via_file() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let mut file_values = HashMap::new();
+    file_values.insert("read_repeat_warn_threshold".to_string(), "5".to_string());
+    file_values.insert(
+        "read_repeat_strong_warn_threshold".to_string(),
+        "10".to_string(),
+    );
+    config
+        .apply_overrides_for_test(&file_values, &HashMap::new(), &HashMap::new())
+        .expect("should apply");
+    assert_eq!(config.runtime.read_repeat_warn_threshold, 5);
+    assert_eq!(config.runtime.read_repeat_strong_warn_threshold, 10);
+}
+
+#[test]
+fn issue187_read_repeat_thresholds_configurable_via_env() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let mut env_values = HashMap::new();
+    env_values.insert(
+        "ANVIL_READ_REPEAT_WARN_THRESHOLD".to_string(),
+        "4".to_string(),
+    );
+    env_values.insert(
+        "ANVIL_READ_REPEAT_STRONG_WARN_THRESHOLD".to_string(),
+        "8".to_string(),
+    );
+    config
+        .apply_overrides_for_test(&HashMap::new(), &env_values, &HashMap::new())
+        .expect("should apply");
+    assert_eq!(config.runtime.read_repeat_warn_threshold, 4);
+    assert_eq!(config.runtime.read_repeat_strong_warn_threshold, 8);
+}
+
+#[test]
+fn issue187_read_repeat_clamp_enforces_warn_less_than_strong_warn() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    config.runtime.read_repeat_warn_threshold = 10;
+    config.runtime.read_repeat_strong_warn_threshold = 10;
+    config.validate_for_test().expect("should validate");
+    // warn < strong_warn enforced
+    assert!(
+        config.runtime.read_repeat_warn_threshold
+            < config.runtime.read_repeat_strong_warn_threshold
+    );
+}
+
+#[test]
+fn issue187_read_repeat_invalid_value_rejected() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let mut file_values = HashMap::new();
+    file_values.insert("read_repeat_warn_threshold".to_string(), "0".to_string());
+    let result = config.apply_overrides_for_test(&file_values, &HashMap::new(), &HashMap::new());
+    assert!(result.is_err());
+}
