@@ -945,9 +945,14 @@ impl App {
         /// Maximum number of recent messages to include in sidecar summarization input.
         const SIDECAR_SUMMARY_MAX_MESSAGES: usize = 50;
         /// Maximum characters per message in sidecar summarization input.
-        const SIDECAR_SUMMARY_MAX_CHARS_PER_MSG: usize = 500;
+        /// Increased from 500 to 1000 to preserve function/type signatures
+        /// in file.read results (Issue #209).
+        const SIDECAR_SUMMARY_MAX_CHARS_PER_MSG: usize = 1000;
         /// Maximum total characters for sidecar summarization input.
-        const SIDECAR_SUMMARY_MAX_TOTAL_CHARS: usize = 8000;
+        /// Increased from 8000 to 12000 to compensate for the per-message
+        /// limit increase while staying well within sidecar model context
+        /// windows (Issue #209).
+        const SIDECAR_SUMMARY_MAX_TOTAL_CHARS: usize = 12000;
 
         let model = self.config.runtime.sidecar_model.as_ref()?;
         let sidecar_url = self

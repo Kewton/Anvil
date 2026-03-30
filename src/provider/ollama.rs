@@ -223,10 +223,20 @@ const SIDECAR_TIMEOUT_SECS: u64 = 30;
 const MAX_SIDECAR_RESPONSE_SIZE: usize = 65_536;
 
 /// Summarization prompt sent to the sidecar model.
+/// Code-aware prompt that preserves function signatures, change plans,
+/// and key constraints for better post-compact file.edit accuracy.
 const SIDECAR_SUMMARIZE_PROMPT: &str = "\
-You are a concise summarizer. Respond ONLY with bullet points.
-Summarize this conversation so far in 3-5 bullet points, focusing on:
-what was discussed, what files were modified, what decisions were made.";
+You are a code-aware summarizer for a coding agent session.
+
+Summarize the conversation preserving:
+1. FILE SIGNATURES: For each file read, list key function/type signatures \
+(e.g., \"fn detect_prompt(output: &str) -> PromptResult\")
+2. CHANGE PLAN: What modifications are planned and which files need editing
+3. COMPLETED CHANGES: What file.edit operations succeeded or failed, with file paths
+4. KEY CONSTRAINTS: Design rules or security requirements discovered
+
+Format as structured bullet points. Preserve exact function names and type names.
+Do NOT include file contents - only signatures and structure.";
 
 impl<T: HttpTransport> OllamaProviderClient<T> {
     /// Check connectivity to the Ollama server by requesting `/api/tags`.
@@ -658,4 +668,29 @@ fn resolve_model_with_ollama_tags(base_url: &str, requested: &str) -> String {
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();
     resolve_ollama_model_alias(requested, &names)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sidecar_summarize_prompt_contains_required_sections() {
+        assert!(
+            SIDECAR_SUMMARIZE_PROMPT.contains("FILE SIGNATURES"),
+            "prompt must contain FILE SIGNATURES section"
+        );
+        assert!(
+            SIDECAR_SUMMARIZE_PROMPT.contains("CHANGE PLAN"),
+            "prompt must contain CHANGE PLAN section"
+        );
+        assert!(
+            SIDECAR_SUMMARIZE_PROMPT.contains("COMPLETED CHANGES"),
+            "prompt must contain COMPLETED CHANGES section"
+        );
+        assert!(
+            SIDECAR_SUMMARIZE_PROMPT.contains("KEY CONSTRAINTS"),
+            "prompt must contain KEY CONSTRAINTS section"
+        );
+    }
 }
