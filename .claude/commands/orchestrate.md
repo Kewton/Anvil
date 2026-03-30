@@ -230,17 +230,22 @@ fi
 
 #### ワーカーが処理しない場合のリカバリー
 
-1. **セッションクリア**: ユーザーに CommandMate UI からセッション削除を依頼
-2. **再送信**: クリア後、idle 状態から Step 1 を再実行
-3. **直接指示への切り替え**: スラッシュコマンド（`/pm-auto-issue2dev`, `/bug-fix`）が処理されない場合、日本語の直接指示に切り替える
+> **⚠ 重要**: リカバリー時も必ずスラッシュコマンド（`/pm-auto-issue2dev`, `/bug-fix`）を再送信すること。
+> 日本語の直接指示に切り替えると、Issueレビュー・設計・設計レビュー・作業計画のフェーズがスキップされ、品質が低下する。
+
+1. **"a" 送信**: まず "a" を送信してプロンプト応答で再開を試みる
+2. **スラッシュコマンド再送信**: "a" で再開しない場合、同じスラッシュコマンドを再送信する
+3. **セッションクリア→再送信**: それでも処理しない場合、ユーザーに CommandMate UI からセッション削除を依頼し、idle 状態から Step 1 を再実行してスラッシュコマンドを再送信する
 
 ```bash
-# スラッシュコマンドが処理されない場合の代替
-commandmatedev send <worktree-id> "Issue #${N} の開発を行ってください。
-1. gh issue view ${N} --repo Kewton/Anvil でIssue内容を確認
-2. TDD（テスト先行）でRustコードを実装
-3. cargo fmt && cargo clippy --all-targets && cargo test で品質チェック
-4. 全変更を git add -A && git commit" --auto-yes --duration 3h
+# リカバリー Step 1: "a" で再開を試みる
+commandmatedev send <worktree-id> "a"
+sleep 15
+
+# リカバリー Step 2: スラッシュコマンドを再送信（直接指示に切り替えない）
+commandmatedev send <worktree-id> "/pm-auto-issue2dev ${N}" --auto-yes --duration 3h
+# または
+commandmatedev send <worktree-id> "/bug-fix ${N}" --auto-yes --duration 3h
 ```
 
 ### 3-1. 各ワーカーにタスク送信
