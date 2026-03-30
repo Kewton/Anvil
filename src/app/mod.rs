@@ -765,15 +765,7 @@ impl App {
             }
         }
 
-        // Try LLM-based summarization via sidecar model (Issue #195)
-        let llm_summary = self.try_sidecar_summarize(keep_recent);
-
-        let compacted = if let Some(summary) = llm_summary {
-            self.session
-                .compact_history_with_llm_summary(keep_recent, summary)
-        } else {
-            self.session.compact_history(keep_recent)
-        };
+        let compacted = self.session.compact_history(keep_recent);
 
         // Reset context warning tracker after successful compaction (auto/manual)
         if compacted {
@@ -785,62 +777,6 @@ impl App {
         }
 
         compacted
-    }
-
-    /// Attempt LLM-based summarization via the sidecar model (Issue #195).
-    ///
-    /// Returns `Some(summary)` if the sidecar model is available and produces
-    /// a non-empty summary.  Returns `None` on any failure, signalling the
-    /// caller to fall back to rule-based summarization.
-    fn try_sidecar_summarize(&self, keep_recent: usize) -> Option<String> {
-        use crate::provider::ollama::{
-            DEFAULT_SIDECAR_MODEL, OllamaChatMessage, build_conversation_text_for_summary,
-            sidecar_summarize,
-        };
-
-        let sidecar_model = self
-            .config
-            .runtime
-            .sidecar_model
-            .as_deref()
-            .unwrap_or(DEFAULT_SIDECAR_MODEL);
-
-        // Only attempt if provider is Ollama
-        if self.config.runtime.provider != "ollama" {
-            return None;
-        }
-
-        let msg_count = self.session.messages.len();
-        if msg_count <= keep_recent {
-            return None;
-        }
-        let split_at = msg_count - keep_recent;
-
-        // Convert session messages to OllamaChatMessage for the helper
-        let ollama_msgs: Vec<OllamaChatMessage> = self.session.messages[..split_at]
-            .iter()
-            .map(|m| OllamaChatMessage {
-                role: match m.role {
-                    crate::session::MessageRole::System => "system".to_string(),
-                    crate::session::MessageRole::User => "user".to_string(),
-                    crate::session::MessageRole::Assistant => "assistant".to_string(),
-                    crate::session::MessageRole::Tool => "tool".to_string(),
-                },
-                content: m.content.clone(),
-                images: None,
-            })
-            .collect();
-
-        let conversation_text = build_conversation_text_for_summary(&ollama_msgs);
-        if conversation_text.trim().is_empty() {
-            return None;
-        }
-
-        sidecar_summarize(
-            &self.config.runtime.provider_url,
-            sidecar_model,
-            &conversation_text,
-        )
     }
 
     /// Get a clone of the shutdown flag for injection into sub-components.
