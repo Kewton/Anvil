@@ -477,7 +477,7 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
     /// Execute one LLM turn: request -> stream -> parse -> validate -> execute -> record.
     fn run_turn(&mut self) -> Result<TurnOutcome, SubAgentError> {
         // Build the provider request
-        let request = BasicAgentLoop::build_turn_request(
+        let mut request = BasicAgentLoop::build_turn_request(
             self.effective_model(),
             &self.session,
             true,
@@ -485,6 +485,7 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
             &self.system_prompt,
             self.config.runtime.context_budget,
         );
+        request.max_output_tokens = self.config.runtime.max_output_tokens;
 
         // Stream the LLM response, collecting token deltas
         let mut token_buffer = String::new();

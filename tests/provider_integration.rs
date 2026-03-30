@@ -3989,6 +3989,7 @@ fn sidecar_summarize_success_with_mock_server() {
         ],
         stream: false,
         think: false,
+        options: None,
     };
     let json = serde_json::to_string(&request).expect("should serialize");
     assert!(json.contains("qwen2.5:3b"));
@@ -4007,5 +4008,154 @@ fn error_guidance_mentions_sidecar_keys() {
     assert!(
         guidance.contains("sidecar_provider_url"),
         "error guidance should mention sidecar_provider_url: {guidance}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #204: max_output_tokens / infinite stream guard
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ollama_request_includes_num_predict_when_max_output_tokens_set() {
+    let mut request = ProviderTurnRequest::new(
+        "test-model".to_string(),
+        vec![anvil::provider::ProviderMessage::new(
+            ProviderMessageRole::User,
+            "hello",
+        )],
+        true,
+    );
+    request.max_output_tokens = Some(16384);
+
+    let ollama_request =
+        OllamaProviderClient::<anvil::provider::ReqwestHttpTransport>::build_chat_request(&request);
+
+    let options = ollama_request
+        .options
+        .expect("options should be set when max_output_tokens is Some");
+    assert_eq!(options.num_predict, Some(16384));
+}
+
+#[test]
+fn ollama_request_omits_options_when_max_output_tokens_none() {
+    let request = ProviderTurnRequest::new(
+        "test-model".to_string(),
+        vec![anvil::provider::ProviderMessage::new(
+            ProviderMessageRole::User,
+            "hello",
+        )],
+        true,
+    );
+
+    let ollama_request =
+        OllamaProviderClient::<anvil::provider::ReqwestHttpTransport>::build_chat_request(&request);
+
+    assert!(
+        ollama_request.options.is_none(),
+        "options should be None when max_output_tokens is not set"
+    );
+}
+
+#[test]
+fn ollama_request_serializes_num_predict_correctly() {
+    let mut request = ProviderTurnRequest::new(
+        "test-model".to_string(),
+        vec![anvil::provider::ProviderMessage::new(
+            ProviderMessageRole::User,
+            "hello",
+        )],
+        true,
+    );
+    request.max_output_tokens = Some(8192);
+
+    let ollama_request =
+        OllamaProviderClient::<anvil::provider::ReqwestHttpTransport>::build_chat_request(&request);
+    let json = serde_json::to_string(&ollama_request).expect("should serialize");
+    assert!(
+        json.contains("\"num_predict\":8192"),
+        "serialized request should contain num_predict: {json}"
+    );
+}
+
+#[test]
+fn openai_request_includes_max_tokens_when_set() {
+    let mut request = ProviderTurnRequest::new(
+        "test-model".to_string(),
+        vec![anvil::provider::ProviderMessage::new(
+            ProviderMessageRole::User,
+            "hello",
+        )],
+        false,
+    );
+    request.max_output_tokens = Some(16384);
+
+    // Use mock transport to capture the serialized request body
+    let seen_bodies = Rc::new(RefCell::new(Vec::new()));
+    let transport = MockHttpTransport {
+        seen_urls: Rc::new(RefCell::new(Vec::new())),
+        seen_bodies: seen_bodies.clone(),
+        seen_headers: Rc::new(RefCell::new(Vec::new())),
+        response: HttpResponse {
+            status_code: 200,
+            body: br#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#.to_vec(),
+        },
+        get_response: None,
+    };
+    let client = anvil::provider::openai::OpenAiCompatibleProviderClient::with_transport(
+        "http://localhost:1234",
+        transport,
+    );
+
+    let mut events = Vec::new();
+    client
+        .stream_turn(&request, &mut |event| events.push(event))
+        .expect("should succeed");
+
+    let bodies = seen_bodies.borrow();
+    assert!(!bodies.is_empty(), "should have sent a request");
+    let body_str = String::from_utf8_lossy(&bodies[0]);
+    assert!(
+        body_str.contains("\"max_tokens\":16384"),
+        "request body should contain max_tokens: {body_str}"
+    );
+}
+
+#[test]
+fn openai_request_omits_max_tokens_when_none() {
+    let request = ProviderTurnRequest::new(
+        "test-model".to_string(),
+        vec![anvil::provider::ProviderMessage::new(
+            ProviderMessageRole::User,
+            "hello",
+        )],
+        false,
+    );
+
+    let seen_bodies = Rc::new(RefCell::new(Vec::new()));
+    let transport = MockHttpTransport {
+        seen_urls: Rc::new(RefCell::new(Vec::new())),
+        seen_bodies: seen_bodies.clone(),
+        seen_headers: Rc::new(RefCell::new(Vec::new())),
+        response: HttpResponse {
+            status_code: 200,
+            body: br#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#.to_vec(),
+        },
+        get_response: None,
+    };
+    let client = anvil::provider::openai::OpenAiCompatibleProviderClient::with_transport(
+        "http://localhost:1234",
+        transport,
+    );
+
+    let mut events = Vec::new();
+    client
+        .stream_turn(&request, &mut |event| events.push(event))
+        .expect("should succeed");
+
+    let bodies = seen_bodies.borrow();
+    let body_str = String::from_utf8_lossy(&bodies[0]);
+    assert!(
+        !body_str.contains("max_tokens"),
+        "request body should NOT contain max_tokens when None: {body_str}"
     );
 }
