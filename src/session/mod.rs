@@ -543,6 +543,21 @@ impl SessionRecord {
     }
 
     pub fn compact_history(&mut self, keep_recent: usize) -> bool {
+        self.compact_history_impl(keep_recent, None)
+    }
+
+    /// Compact history using an externally-provided LLM summary instead of
+    /// the rule-based summarizer.  Falls back to rule-based if `llm_summary`
+    /// is `None`.
+    pub fn compact_history_with_llm_summary(
+        &mut self,
+        keep_recent: usize,
+        llm_summary: String,
+    ) -> bool {
+        self.compact_history_impl(keep_recent, Some(llm_summary))
+    }
+
+    fn compact_history_impl(&mut self, keep_recent: usize, llm_summary: Option<String>) -> bool {
         if self.messages.len() <= keep_recent {
             return false;
         }
@@ -551,17 +566,23 @@ impl SessionRecord {
         tracing::debug!(
             compacted = split_at,
             kept = keep_recent,
+            llm_summary = llm_summary.is_some(),
             "compacting session history"
         );
 
-        // Step 1: Replace large tool results with summaries
-        replace_tool_results_with_summaries(&mut self.messages[..split_at]);
+        let summary = if let Some(llm_text) = llm_summary {
+            format!("[compacted session summary (LLM)]\n{llm_text}")
+        } else {
+            // Rule-based fallback
+            // Step 1: Replace large tool results with summaries
+            replace_tool_results_with_summaries(&mut self.messages[..split_at]);
 
-        // Step 2: Compute importance scores
-        let scores = compute_importance_scores(&self.messages, split_at);
+            // Step 2: Compute importance scores
+            let scores = compute_importance_scores(&self.messages, split_at);
 
-        // Step 3: Generate summary using scores
-        let summary = generate_compact_summary(&self.messages[..split_at], &scores);
+            // Step 3: Generate summary using scores
+            generate_compact_summary(&self.messages[..split_at], &scores)
+        };
 
         // Step 4: Drain old messages and insert summary
         self.messages.drain(..split_at);
