@@ -1649,3 +1649,136 @@ fn working_memory_format_includes_recent_diffs_section() {
         "prompt should include the diff content"
     );
 }
+
+// ── Sidecar model / LLM summary compaction tests (Issue #195) ────────
+
+#[test]
+fn compact_history_with_llm_summary_uses_provided_text() {
+    let mut session = SessionRecord::new(PathBuf::from("/tmp/sidecar-test"));
+    for i in 0..20 {
+        session.push_message(
+            SessionMessage::new(MessageRole::User, "you", format!("msg {i}"))
+                .with_id(format!("u_{i}")),
+        );
+        session.push_message(
+            SessionMessage::new(MessageRole::Assistant, "anvil", format!("reply {i}"))
+                .with_id(format!("a_{i}")),
+        );
+    }
+
+    let llm_summary =
+        "- Discussed project architecture\n- Modified src/main.rs\n- Decided to use TDD approach"
+            .to_string();
+    let changed = session.compact_history_with_llm_summary(8, llm_summary.clone());
+
+    assert!(changed);
+    assert!(
+        session.messages[0]
+            .content
+            .contains("[compacted session summary (LLM)]"),
+        "summary should contain LLM marker"
+    );
+    assert!(
+        session.messages[0]
+            .content
+            .contains("Discussed project architecture"),
+        "summary should contain the LLM-provided text"
+    );
+    // Recent messages should be preserved
+    assert!(session.messages.len() <= 9, "should keep recent + summary");
+}
+
+#[test]
+fn compact_history_with_llm_summary_preserves_working_memory() {
+    let mut session = SessionRecord::new(PathBuf::from("/tmp/sidecar-wm"));
+    session
+        .working_memory
+        .set_active_task(Some("implement feature".to_string()));
+    session
+        .working_memory
+        .set_context_notice(Some("old notice".to_string()));
+
+    for i in 0..20 {
+        session.push_message(
+            SessionMessage::new(MessageRole::User, "you", format!("msg {i}"))
+                .with_id(format!("u_{i}")),
+        );
+        session.push_message(
+            SessionMessage::new(MessageRole::Assistant, "anvil", format!("reply {i}"))
+                .with_id(format!("a_{i}")),
+        );
+    }
+
+    session.compact_history_with_llm_summary(8, "- summary".to_string());
+
+    assert_eq!(
+        session.working_memory.active_task,
+        Some("implement feature".to_string()),
+        "active_task should be preserved"
+    );
+    assert!(
+        session.working_memory.context_notice.is_none(),
+        "context_notice should be cleared after compaction"
+    );
+}
+
+#[test]
+fn compact_history_with_llm_summary_no_op_when_too_few_messages() {
+    let mut session = SessionRecord::new(PathBuf::from("/tmp/sidecar-noop"));
+    session.push_message(
+        SessionMessage::new(MessageRole::User, "you", "hello".to_string()).with_id("u_1"),
+    );
+
+    let changed = session.compact_history_with_llm_summary(8, "- summary".to_string());
+    assert!(!changed, "should not compact when messages <= keep_recent");
+}
+
+#[test]
+fn build_conversation_text_for_summary_truncates_long_messages() {
+    use anvil::provider::ollama::{OllamaChatMessage, build_conversation_text_for_summary};
+
+    let msgs = vec![
+        OllamaChatMessage {
+            role: "user".to_string(),
+            content: "x".repeat(1000),
+            images: None,
+        },
+        OllamaChatMessage {
+            role: "assistant".to_string(),
+            content: "short reply".to_string(),
+            images: None,
+        },
+    ];
+
+    let text = build_conversation_text_for_summary(&msgs);
+    assert!(text.contains("user: "));
+    assert!(text.contains("assistant: short reply"));
+    // First message should be truncated (500 chars + "...")
+    assert!(text.len() < 1200, "total text should be bounded");
+}
+
+#[test]
+fn build_conversation_text_for_summary_respects_total_limit() {
+    use anvil::provider::ollama::{OllamaChatMessage, build_conversation_text_for_summary};
+
+    let msgs: Vec<OllamaChatMessage> = (0..100)
+        .map(|i| OllamaChatMessage {
+            role: "user".to_string(),
+            content: format!("message number {i} with some padding text to fill space"),
+            images: None,
+        })
+        .collect();
+
+    let text = build_conversation_text_for_summary(&msgs);
+    assert!(
+        text.len() <= 8200,
+        "should respect MAX_TOTAL_CHARS limit, got {}",
+        text.len()
+    );
+}
+
+#[test]
+fn default_sidecar_model_constant() {
+    use anvil::provider::ollama::DEFAULT_SIDECAR_MODEL;
+    assert_eq!(DEFAULT_SIDECAR_MODEL, "qwen3.5:9b");
+}
