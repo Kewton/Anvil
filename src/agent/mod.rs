@@ -164,8 +164,9 @@ impl BasicAgentLoop {
         stream: bool,
         context_window: u32,
         system_prompt: &str,
+        context_budget_override: Option<u32>,
     ) -> ProviderTurnRequest {
-        let token_budget = derive_context_budget(context_window);
+        let token_budget = derive_context_budget(context_window, context_budget_override);
         Self::build_turn_request_with_token_budget(
             model,
             session,
@@ -229,8 +230,9 @@ impl BasicAgentLoop {
         context_window: u32,
         system_prompt: &str,
         calibration_ratio: f64,
+        context_budget_override: Option<u32>,
     ) -> (ProviderTurnRequest, usize) {
-        let token_budget = derive_context_budget(context_window);
+        let token_budget = derive_context_budget(context_window, context_budget_override);
         build_turn_request_with_calibration(
             model,
             session,
@@ -249,8 +251,9 @@ impl BasicAgentLoop {
         context_window: u32,
         system_prompt_tokens: usize,
         calibration_ratio: f64,
+        context_budget_override: Option<u32>,
     ) -> (usize, usize) {
-        let token_budget = derive_context_budget(context_window);
+        let token_budget = derive_context_budget(context_window, context_budget_override);
         let budget_for_messages = token_budget
             .saturating_sub(system_prompt_tokens)
             .max(MINIMUM_MESSAGE_BUDGET);
@@ -645,11 +648,14 @@ fn build_turn_request_with_calibration(
     )
 }
 
-fn derive_context_budget(context_window: u32) -> usize {
-    if let Ok(override_val) = std::env::var("ANVIL_CONTEXT_BUDGET")
-        && let Ok(budget) = override_val.parse::<usize>()
-    {
-        return budget;
+fn derive_context_budget(context_window: u32, context_budget_override: Option<u32>) -> usize {
+    if let Some(budget) = context_budget_override {
+        tracing::debug!(
+            budget = budget,
+            context_window = context_window,
+            "context budget from config override"
+        );
+        return budget as usize;
     }
     let quarter = (context_window / 4) as usize;
     let half = (context_window / 2) as usize;
@@ -1349,7 +1355,7 @@ mod tests {
         }
         // Large context window, small messages => no pruning
         let (pruned, _tokens) =
-            BasicAgentLoop::estimate_pruned_message_count(&session, 128_000, 100, 1.0);
+            BasicAgentLoop::estimate_pruned_message_count(&session, 128_000, 100, 1.0, None);
         assert_eq!(pruned, 0);
     }
 
@@ -1369,7 +1375,7 @@ mod tests {
         }
         // Very small context window to force pruning
         let (pruned, _tokens) =
-            BasicAgentLoop::estimate_pruned_message_count(&session, 512, 50, 1.0);
+            BasicAgentLoop::estimate_pruned_message_count(&session, 512, 50, 1.0, None);
         assert!(pruned > 0, "should prune some messages with tiny budget");
         assert!(pruned < 50, "should keep at least one message");
     }
@@ -1378,8 +1384,34 @@ mod tests {
     fn estimate_pruned_zero_for_empty_session() {
         let session = SessionRecord::new(std::path::PathBuf::from("/tmp/test"));
         let (pruned, tokens) =
-            BasicAgentLoop::estimate_pruned_message_count(&session, 128_000, 100, 1.0);
+            BasicAgentLoop::estimate_pruned_message_count(&session, 128_000, 100, 1.0, None);
         assert_eq!(pruned, 0);
         assert_eq!(tokens, 0);
+    }
+
+    #[test]
+    fn derive_context_budget_uses_override() {
+        // When context_budget_override is Some, it should be used directly
+        let budget = derive_context_budget(128_000, Some(4096));
+        assert_eq!(budget, 4096);
+    }
+
+    #[test]
+    fn derive_context_budget_falls_back_to_default() {
+        // When context_budget_override is None, derive from context_window
+        let budget = derive_context_budget(128_000, None);
+        let expected = (128_000u32 / 4) as usize; // quarter of context_window
+        assert_eq!(budget, expected);
+    }
+
+    #[test]
+    fn derive_context_budget_default_clamps_minimum() {
+        // context_window=2048: quarter=512, half=1024, clamp(256,1024) => 512
+        let budget = derive_context_budget(2048, None);
+        assert_eq!(budget, 512);
+
+        // context_window=512: quarter=128, half=256, clamp(256,256) => 256
+        let budget = derive_context_budget(512, None);
+        assert_eq!(budget, 256);
     }
 }

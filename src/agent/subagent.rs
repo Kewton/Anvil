@@ -483,6 +483,7 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
             true,
             self.effective_context_window(),
             &self.system_prompt,
+            self.config.runtime.context_budget,
         );
 
         // Stream the LLM response, collecting token deltas

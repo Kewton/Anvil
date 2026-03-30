@@ -545,6 +545,7 @@ impl App {
             context_window,
             system_prompt_tokens,
             calibration_ratio,
+            self.config.runtime.context_budget,
         );
 
         // 3. Update context_notice
@@ -1039,6 +1040,7 @@ impl App {
             self.effective_context_window(),
             &system_prompt,
             calibration_ratio,
+            self.config.runtime.context_budget,
         );
         self.last_estimated_prompt_tokens = Some(estimated_prompt_tokens);
 

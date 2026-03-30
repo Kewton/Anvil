@@ -456,6 +456,7 @@ impl App {
                 self.effective_context_window(),
                 &system_prompt,
                 calibration_ratio,
+                self.config.runtime.context_budget,
             );
 
             let mut next_token_buffer = String::new();
@@ -1435,6 +1436,7 @@ impl App {
             self.effective_context_window(),
             &system_prompt,
             calibration_ratio,
+            self.config.runtime.context_budget,
         );
 
         let spinner = Spinner::start(

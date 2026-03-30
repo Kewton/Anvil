@@ -687,6 +687,7 @@ fn basic_agent_loop_derives_context_budget_from_context_window() {
         true,
         8_000,
         &system_prompt,
+        None,
     );
     let large = anvil::agent::BasicAgentLoop::build_turn_request(
         "local-default",
@@ -694,6 +695,7 @@ fn basic_agent_loop_derives_context_budget_from_context_window() {
         true,
         200_000,
         &system_prompt,
+        None,
     );
 
     assert!(small.messages.len() < large.messages.len());
@@ -1517,6 +1519,7 @@ fn system_prompt_includes_web_fetch_tool() {
         false,
         4096,
         &system_prompt,
+        None,
     );
     assert!(
         request.messages[0].content.contains("web.fetch"),
@@ -1599,6 +1602,7 @@ fn system_prompt_includes_web_search_tool() {
         false,
         4096,
         &system_prompt,
+        None,
     );
     assert!(
         request.messages[0].content.contains("web.search"),
@@ -1616,6 +1620,7 @@ fn system_prompt_includes_github_insights() {
         false,
         4096,
         &system_prompt,
+        None,
     );
     assert!(
         request.messages[0].content.contains("GitHub Insights"),
@@ -1776,6 +1781,7 @@ fn system_prompt_includes_file_edit_tool() {
         false,
         4096,
         &system_prompt,
+        None,
     );
     assert!(
         request.messages[0].content.contains("file.edit"),
@@ -1800,6 +1806,7 @@ fn system_prompt_includes_project_instructions() {
         false,
         4096,
         &system_prompt,
+        None,
     );
 
     assert!(
@@ -1828,6 +1835,7 @@ fn system_prompt_without_project_instructions() {
         false,
         4096,
         &system_prompt,
+        None,
     );
 
     assert!(
