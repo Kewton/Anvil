@@ -7,8 +7,8 @@ use anvil::app::phase_estimator::{Phase, PhaseAction, PhaseEstimator};
 
 #[test]
 fn phase_estimator_default_config_values() {
-    // Default thresholds from config: N=5, M=10, K=5
-    let est = PhaseEstimator::new(5, 10, 5);
+    // Default thresholds from config: N=5, M=15, K=5 (Issue #187: M raised from 10 to 15)
+    let est = PhaseEstimator::new(5, 15, 5);
     assert_eq!(est.current_phase(), Phase::Unknown);
 }
 

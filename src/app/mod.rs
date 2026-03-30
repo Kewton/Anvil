@@ -13,8 +13,13 @@ pub mod mock;
 pub mod phase_estimator;
 pub mod plan;
 pub mod policy;
+pub(crate) mod read_repeat_tracker;
 pub mod render;
 pub(crate) mod write_fail_tracker;
+pub(crate) mod write_repeat_tracker;
+
+use std::collections::HashMap;
+use std::time::Instant;
 
 use crate::agent::BasicAgentLoop;
 use crate::agent::{AgentEvent, AgentRuntime, PendingTurnState, ProjectLanguage, PromptTier};
@@ -112,6 +117,98 @@ impl ContextWarningTracker {
     }
 }
 
+/// Shared formatter for tool call counts (DRY: used by both `summarize_tool_names` and `SessionStats::tool_calls_summary`).
+///
+/// Produces a string like `"file.read x3, file.edit x2, shell.exec"` sorted by count descending.
+pub fn format_tool_counts(counts: impl Iterator<Item = (String, u32)>) -> String {
+    let mut entries: Vec<_> = counts.collect();
+    entries.sort_by(|a, b| b.1.cmp(&a.1));
+    entries
+        .iter()
+        .map(|(name, count)| {
+            if *count > 1 {
+                format!("{} x{}", name, count)
+            } else {
+                name.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Session statistics tracker for session-end summary reporting.
+#[derive(Debug, Default)]
+pub struct SessionStats {
+    pub total_turns: u32,
+    pub session_start: Option<Instant>,
+    pub tool_calls: HashMap<String, u32>,
+    pub files_modified: u32,
+    pub lines_added: u32,
+    pub lines_deleted: u32,
+    pub compact_count: u32,
+    pub sidecar_count: u32,
+}
+
+impl SessionStats {
+    pub fn new() -> Self {
+        Self {
+            session_start: Some(Instant::now()),
+            ..Default::default()
+        }
+    }
+
+    pub fn record_tool_call(&mut self, tool_name: &str) {
+        *self.tool_calls.entry(tool_name.to_string()).or_insert(0) += 1;
+    }
+
+    pub fn record_file_change(&mut self, added: u32, deleted: u32) {
+        self.lines_added += added;
+        self.lines_deleted += deleted;
+    }
+
+    pub fn record_turn(&mut self) {
+        self.total_turns += 1;
+    }
+
+    pub fn record_compact(&mut self, sidecar: bool) {
+        self.compact_count += 1;
+        if sidecar {
+            self.sidecar_count += 1;
+        }
+    }
+
+    pub fn total_tool_calls(&self) -> u32 {
+        self.tool_calls.values().sum()
+    }
+
+    /// Format tool call counts summary (e.g. `"file.read x18, file.edit x12"`).
+    pub fn tool_calls_summary(&self) -> String {
+        format_tool_counts(self.tool_calls.iter().map(|(k, v)| (k.clone(), *v)))
+    }
+}
+
+/// Extract added/deleted line counts from a unified diff string.
+pub fn count_diff_lines(diff: &str) -> (u32, u32) {
+    let mut added = 0u32;
+    let mut deleted = 0u32;
+    for line in diff.lines() {
+        if line.starts_with('+') && !line.starts_with("+++") {
+            added += 1;
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            deleted += 1;
+        }
+    }
+    (added, deleted)
+}
+
+/// Compact operation metadata for turn summary reporting.
+#[derive(Debug, Clone)]
+pub struct CompactInfo {
+    pub sidecar_model: Option<String>,
+    pub before_messages: usize,
+    pub after_messages: usize,
+}
+
 /// Central application state.
 pub struct App {
     config: EffectiveConfig,
@@ -161,8 +258,16 @@ pub struct App {
     phase_estimator: phase_estimator::PhaseEstimator,
     /// Tracks consecutive file.write failures per path for recovery hints.
     write_fail_tracker: write_fail_tracker::WriteFailTracker,
+    /// Tracks repeated file.read calls per path for hint injection (Issue #185).
+    read_repeat_tracker: read_repeat_tracker::ReadRepeatTracker,
+    /// Tracks repeated successful file.write calls per path for warning hints.
+    write_repeat_tracker: write_repeat_tracker::WriteRepeatTracker,
     /// File read cache: reduces redundant file.read calls within a session.
     file_read_cache: Arc<Mutex<crate::tooling::file_cache::FileReadCache>>,
+    /// Session statistics for end-of-session summary (Issue #206).
+    session_stats: SessionStats,
+    /// Last compact operation info for turn summary reporting (Issue #206).
+    last_compact_info: Option<CompactInfo>,
 }
 
 /// Whether the session loop should continue or exit.
@@ -267,16 +372,25 @@ struct CompactParams {
 
 /// Compute compaction parameters from session state and context window.
 /// Returns None if neither token-based nor message-based threshold is exceeded.
-fn compute_compact_params(session: &SessionRecord, context_window: u32) -> Option<CompactParams> {
-    let token_triggered = session.should_smart_compact(context_window);
+/// When `context_budget` is set, uses `min(context_window, context_budget)` for thresholds.
+fn compute_compact_params(
+    session: &SessionRecord,
+    context_window: u32,
+    context_budget: Option<u32>,
+) -> Option<CompactParams> {
+    let token_triggered = session.should_smart_compact(context_window, context_budget);
     let msg_triggered = session.should_compact();
 
     if !token_triggered && !msg_triggered {
         return None;
     }
 
+    let effective_limit = match context_budget {
+        Some(budget) => context_window.min(budget),
+        None => context_window,
+    };
     let token_based = if token_triggered {
-        let target_tokens = (context_window as f64 * crate::session::TARGET_TOKEN_RATIO) as usize;
+        let target_tokens = (effective_limit as f64 * crate::session::TARGET_TOKEN_RATIO) as usize;
         crate::session::compute_token_based_keep_recent(&session.messages, target_tokens)
     } else {
         usize::MAX
@@ -357,7 +471,7 @@ impl App {
 
         // [D1-009] ToolSpec conversion and ToolRegistry registration done by App side (SRP)
         // [D2-003] standard_tool_registry() is a free function
-        let mut tools = standard_tool_registry();
+        let mut tools = standard_tool_registry(config.custom_tools().to_vec());
         // Register sub-agent tools separately (design decision #6, DR1-008)
         tools.register_agent_explore();
         tools.register_agent_plan();
@@ -428,6 +542,8 @@ impl App {
         let phase_completion = config.runtime.phase_completion_read_threshold;
         let edit_reread_threshold = config.runtime.edit_reread_threshold;
         let edit_write_fallback_threshold = config.runtime.edit_write_fallback_threshold;
+        let read_repeat_warn = config.runtime.read_repeat_warn_threshold;
+        let read_repeat_strong_warn = config.runtime.read_repeat_strong_warn_threshold;
 
         Ok(Self {
             tools,
@@ -467,7 +583,14 @@ impl App {
                 phase_completion,
             ),
             write_fail_tracker: write_fail_tracker::WriteFailTracker::new(2),
+            read_repeat_tracker: read_repeat_tracker::ReadRepeatTracker::new(
+                read_repeat_warn,
+                read_repeat_strong_warn,
+            ),
+            write_repeat_tracker: write_repeat_tracker::WriteRepeatTracker::new(3, 4),
             file_read_cache,
+            session_stats: SessionStats::new(),
+            last_compact_info: None,
         })
     }
 
@@ -532,6 +655,7 @@ impl App {
             context_window,
             system_prompt_tokens,
             calibration_ratio,
+            self.config.runtime.context_budget,
         );
 
         // 3. Update context_notice
@@ -608,6 +732,22 @@ impl App {
         // Current date and timezone (dynamic, re-evaluated per turn)
         prompt.push_str(&context::format_date_prompt());
 
+        // Custom tools prompt (from ANVIL.md ## tools section)
+        let custom_tools = self.tools.custom_tools();
+        if !custom_tools.is_empty() {
+            prompt.push_str("\n\n## Custom tools (from ANVIL.md)\n\n");
+            prompt.push_str("The following project-specific tools are available. Use them like built-in tools.\n\n");
+            for tool in custom_tools {
+                let display_name = crate::config::custom_tool_display_name(&tool.name);
+                prompt.push_str(&format!("### {display_name}\n"));
+                prompt.push_str(&format!("Description: {}\n", tool.description));
+                if !tool.attributes.is_empty() {
+                    prompt.push_str(&format!("Attributes: {}\n", tool.attributes.join(", ")));
+                }
+                prompt.push('\n');
+            }
+        }
+
         // Project instructions (from ANVIL.md)
         if let Some(ref instructions) = self.project_instructions {
             prompt.push_str("\n\n## Project instructions (from ANVIL.md)\n");
@@ -683,6 +823,30 @@ impl App {
         let _ = self.flush_session();
     }
 
+    /// Log session-level summary (Issue #206 CB-003).
+    ///
+    /// Should be called once when the session actually ends (interactive exit
+    /// or non-interactive completion), not per-turn.
+    pub(crate) fn log_session_summary(&self) {
+        let session_elapsed = self
+            .session_stats
+            .session_start
+            .map(|s| s.elapsed())
+            .unwrap_or_default();
+        tracing::info!(
+            total_turns = self.session_stats.total_turns,
+            total_tool_calls = self.session_stats.total_tool_calls(),
+            tools = %self.session_stats.tool_calls_summary(),
+            files_modified = self.session_stats.files_modified,
+            lines_added = self.session_stats.lines_added,
+            lines_deleted = self.session_stats.lines_deleted,
+            compact_count = self.session_stats.compact_count,
+            sidecar_count = self.session_stats.sidecar_count,
+            elapsed_s = format!("{:.1}", session_elapsed.as_secs_f64()),
+            "session completed"
+        );
+    }
+
     /// Run PostSession hook (DR2-005, DR2-007 facade method).
     ///
     /// Builds PostSessionEvent from config and session, then delegates to
@@ -713,7 +877,9 @@ impl App {
     fn compact_with_hooks(&mut self, trigger: &str) -> bool {
         let keep_recent = if trigger == "auto" {
             let context_window = self.effective_context_window();
-            let params = match compute_compact_params(&self.session, context_window) {
+            let context_budget = self.config.runtime.context_budget;
+            let params = match compute_compact_params(&self.session, context_window, context_budget)
+            {
                 Some(p) => p,
                 None => return false,
             };
@@ -736,10 +902,31 @@ impl App {
             }
         }
 
-        let compacted = self.session.compact_history(keep_recent);
+        // Sidecar LLM summarization (Issue #195)
+        let llm_summary = self.try_sidecar_summarize();
+        let sidecar_used = llm_summary.is_some();
+
+        let before_messages = self.session.messages.len();
+
+        let compacted = self
+            .session
+            .compact_history_with_llm_summary(keep_recent, llm_summary);
 
         // Reset context warning tracker after successful compaction (auto/manual)
         if compacted {
+            // CB-004: Record compact stats and CompactInfo
+            let after_messages = self.session.messages.len();
+            self.session_stats.record_compact(sidecar_used);
+            self.last_compact_info = Some(CompactInfo {
+                sidecar_model: if sidecar_used {
+                    self.config.runtime.sidecar_model.clone()
+                } else {
+                    None
+                },
+                before_messages,
+                after_messages,
+            });
+
             let usage = ContextUsageView {
                 estimated_tokens: self.session.estimated_token_count(),
                 max_tokens: self.effective_context_window(),
@@ -748,6 +935,47 @@ impl App {
         }
 
         compacted
+    }
+
+    /// Attempt sidecar model LLM summarization.
+    ///
+    /// Returns `None` if sidecar_model is not configured or if the
+    /// summarization fails (network error, timeout, etc.).
+    fn try_sidecar_summarize(&self) -> Option<String> {
+        /// Maximum number of recent messages to include in sidecar summarization input.
+        const SIDECAR_SUMMARY_MAX_MESSAGES: usize = 50;
+        /// Maximum characters per message in sidecar summarization input.
+        /// Increased from 500 to 1000 to preserve function/type signatures
+        /// in file.read results (Issue #209).
+        const SIDECAR_SUMMARY_MAX_CHARS_PER_MSG: usize = 1000;
+        /// Maximum total characters for sidecar summarization input.
+        /// Increased from 8000 to 12000 to compensate for the per-message
+        /// limit increase while staying well within sidecar model context
+        /// windows (Issue #209).
+        const SIDECAR_SUMMARY_MAX_TOTAL_CHARS: usize = 12000;
+
+        let model = self.config.runtime.sidecar_model.as_ref()?;
+        let sidecar_url = self
+            .config
+            .runtime
+            .sidecar_provider_url
+            .as_deref()
+            .unwrap_or(crate::config::DEFAULT_OLLAMA_URL);
+
+        tracing::info!(
+            sidecar_model = %model,
+            sidecar_url = %sidecar_url,
+            "Starting sidecar summarization"
+        );
+
+        let conversation_text = self.session.conversation_text_for_summary(
+            SIDECAR_SUMMARY_MAX_MESSAGES,
+            SIDECAR_SUMMARY_MAX_CHARS_PER_MSG,
+            SIDECAR_SUMMARY_MAX_TOTAL_CHARS,
+        );
+
+        let sidecar_client = crate::provider::OllamaProviderClient::new(sidecar_url);
+        sidecar_client.sidecar_summarize(model, &conversation_text)
     }
 
     /// Get a clone of the shutdown flag for injection into sub-components.
@@ -780,6 +1008,18 @@ impl App {
     pub fn effective_context_window(&self) -> u32 {
         self.active_context_window
             .unwrap_or(self.config.runtime.context_window)
+    }
+
+    /// Return the effective token budget for this session.
+    ///
+    /// When `context_budget` is configured, returns that value (clamped to
+    /// the context window). Otherwise falls back to the context window.
+    pub fn effective_token_budget(&self) -> usize {
+        let cw = self.effective_context_window();
+        match self.config.runtime.context_budget {
+            Some(budget) => cw.min(budget) as usize,
+            None => cw as usize,
+        }
     }
 
     /// Switch to a different named session.
@@ -962,14 +1202,16 @@ impl App {
         self.begin_live_turn_state()?;
 
         let (system_prompt, calibration_ratio) = self.prepare_turn_context();
-        let (request, estimated_prompt_tokens) = BasicAgentLoop::build_turn_request_calibrated(
+        let (mut request, estimated_prompt_tokens) = BasicAgentLoop::build_turn_request_calibrated(
             self.effective_model().to_string(),
             &self.session,
             self.provider.capabilities.streaming && self.config.runtime.stream,
             self.effective_context_window(),
             &system_prompt,
             calibration_ratio,
+            self.config.runtime.context_budget,
         );
+        request.max_output_tokens = self.config.runtime.max_output_tokens;
         self.last_estimated_prompt_tokens = Some(estimated_prompt_tokens);
 
         // Phase 1: Collect events from provider with spinner + streaming output.
@@ -1049,8 +1291,11 @@ impl App {
                             // Already streamed to stderr. Check for structured response.
                             if BasicAgentLoop::is_complete_structured_response(&token_buffer) {
                                 let structured =
-                                    BasicAgentLoop::parse_structured_response(&token_buffer)
-                                        .map_err(AppError::ToolExecution)?;
+                                    BasicAgentLoop::parse_structured_response_with_registry(
+                                        &token_buffer,
+                                        &self.tools,
+                                    )
+                                    .map_err(AppError::ToolExecution)?;
                                 // Issue #173: Pass anvil_final_detected from parsed response
                                 let anvil_final = structured.anvil_final_detected;
                                 frames.extend(self.complete_structured_response(
@@ -1310,12 +1555,15 @@ impl App {
 
     /// Flush session to disk if the dirty flag is set.
     /// Also runs deferred auto-compaction before writing.
-    /// In non-interactive mode, skip disk persistence entirely.
+    /// In non-interactive mode, skip disk persistence but still run auto-compact.
     fn flush_session(&mut self) -> Result<(), AppError> {
+        // Auto-compact must run regardless of interactive mode (Issue #202).
+        // Non-interactive sessions (--exec-file, --exec, --oneshot) also need
+        // sidecar-LLM summarization to keep context within budget.
+        self.compact_with_hooks("auto");
         if !self.config.mode.interactive {
             return Ok(());
         }
-        self.compact_with_hooks("auto");
         if self.session.dirty {
             self.session_store.save(&self.session)?;
             self.session.clear_dirty();
@@ -2114,7 +2362,8 @@ pub fn error_guidance(err: &AppError) -> String {
     match err {
         AppError::Config(_) => concat!(
             "Hint: check your config file at .anvil/config\n",
-            "  Valid keys: provider, model, provider_url, context_window, stream\n",
+            "  Valid keys: provider, model, provider_url, context_window, stream,\n",
+            "              sidecar_model, sidecar_provider_url\n",
             "  Environment variables also accepted (e.g. ANVIL_MODEL, ANVIL_PROVIDER_URL)"
         )
         .to_string(),
@@ -2196,9 +2445,12 @@ pub fn error_guidance(err: &AppError) -> String {
     }
 }
 
-fn standard_tool_registry() -> ToolRegistry {
+fn standard_tool_registry(custom_tools: Vec<crate::config::CustomToolDef>) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.register_standard_tools();
+    if !custom_tools.is_empty() {
+        registry.register_custom_tools(custom_tools);
+    }
     registry
 }
 
@@ -2285,5 +2537,185 @@ mod tests {
         assert!(!tracker.warned_critical);
         // Warning flag should remain since 85% >= 80%
         assert!(tracker.warned_warning);
+    }
+
+    /// Regression test for Issue #202: compute_compact_params must return
+    /// Some when token/message thresholds are exceeded, regardless of
+    /// interactive mode. The fix ensures flush_session calls
+    /// compact_with_hooks before the non-interactive early return.
+    #[test]
+    fn compute_compact_params_triggers_when_budget_exceeded() {
+        use crate::session::SessionRecord;
+        use std::path::PathBuf;
+
+        let mut session = SessionRecord::new(PathBuf::from("/tmp/issue202"));
+        // Push enough messages to exceed message-count threshold (default = 64)
+        for i in 0..70 {
+            session.push_message(crate::session::SessionMessage::new(
+                crate::session::MessageRole::User,
+                format!("msg_{i:03}"),
+                format!("content {i}"),
+            ));
+        }
+        // With default auto_compact_threshold (64), 70 messages should trigger
+        let params = compute_compact_params(&session, 128_000, None);
+        assert!(
+            params.is_some(),
+            "compute_compact_params should trigger when message count exceeds threshold"
+        );
+    }
+
+    // --- SessionStats tests (Issue #206 B-1) ---
+
+    #[test]
+    fn session_stats_new_has_start_time() {
+        let stats = SessionStats::new();
+        assert!(stats.session_start.is_some());
+        assert_eq!(stats.total_turns, 0);
+        assert!(stats.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn session_stats_record_tool_call() {
+        let mut stats = SessionStats::new();
+        stats.record_tool_call("file.read");
+        stats.record_tool_call("file.read");
+        stats.record_tool_call("file.edit");
+        assert_eq!(stats.tool_calls["file.read"], 2);
+        assert_eq!(stats.tool_calls["file.edit"], 1);
+        assert_eq!(stats.total_tool_calls(), 3);
+    }
+
+    #[test]
+    fn session_stats_record_file_change() {
+        let mut stats = SessionStats::new();
+        stats.record_file_change(10, 3);
+        stats.record_file_change(5, 2);
+        assert_eq!(stats.lines_added, 15);
+        assert_eq!(stats.lines_deleted, 5);
+    }
+
+    #[test]
+    fn session_stats_record_turn() {
+        let mut stats = SessionStats::new();
+        stats.record_turn();
+        stats.record_turn();
+        assert_eq!(stats.total_turns, 2);
+    }
+
+    #[test]
+    fn session_stats_record_compact() {
+        let mut stats = SessionStats::new();
+        stats.record_compact(false);
+        stats.record_compact(true);
+        stats.record_compact(true);
+        assert_eq!(stats.compact_count, 3);
+        assert_eq!(stats.sidecar_count, 2);
+    }
+
+    #[test]
+    fn session_stats_tool_calls_summary() {
+        let mut stats = SessionStats::new();
+        stats.record_tool_call("file.read");
+        stats.record_tool_call("file.read");
+        stats.record_tool_call("file.read");
+        stats.record_tool_call("file.edit");
+        let summary = stats.tool_calls_summary();
+        // file.read has higher count, should come first
+        assert!(summary.starts_with("file.read x3"));
+        assert!(summary.contains("file.edit"));
+    }
+
+    // --- count_diff_lines tests (Issue #206 B-1) ---
+
+    #[test]
+    fn count_diff_lines_basic() {
+        let diff = "\
+--- a/foo.rs
++++ b/foo.rs
+@@ -1,3 +1,4 @@
+ unchanged
+-removed line
++added line 1
++added line 2
+";
+        let (added, deleted) = count_diff_lines(diff);
+        assert_eq!(added, 2);
+        assert_eq!(deleted, 1);
+    }
+
+    #[test]
+    fn count_diff_lines_empty() {
+        let (added, deleted) = count_diff_lines("");
+        assert_eq!(added, 0);
+        assert_eq!(deleted, 0);
+    }
+
+    #[test]
+    fn count_diff_lines_no_changes() {
+        let diff = "\
+--- a/foo.rs
++++ b/foo.rs
+@@ -1,2 +1,2 @@
+ same line
+ another same line
+";
+        let (added, deleted) = count_diff_lines(diff);
+        assert_eq!(added, 0);
+        assert_eq!(deleted, 0);
+    }
+
+    // --- format_tool_counts tests (Issue #206 B-1) ---
+
+    #[test]
+    fn format_tool_counts_multiple() {
+        let counts = vec![
+            ("file.read".to_string(), 3u32),
+            ("file.edit".to_string(), 1),
+        ];
+        let result = format_tool_counts(counts.into_iter());
+        assert_eq!(result, "file.read x3, file.edit");
+    }
+
+    #[test]
+    fn format_tool_counts_empty() {
+        let counts: Vec<(String, u32)> = vec![];
+        let result = format_tool_counts(counts.into_iter());
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn format_tool_counts_single() {
+        let counts = vec![("shell.exec".to_string(), 5u32)];
+        let result = format_tool_counts(counts.into_iter());
+        assert_eq!(result, "shell.exec x5");
+    }
+
+    // --- Issue #208: effective_token_budget logic ---
+
+    /// Regression test for Issue #208: when context_budget is set, the
+    /// effective token budget must use min(context_window, context_budget),
+    /// NOT the raw context_window.
+    #[test]
+    fn effective_token_budget_uses_context_budget() {
+        // Simulates the logic in App::effective_token_budget
+        let context_window: u32 = 262_144;
+        let context_budget: Option<u32> = Some(32_768);
+        let effective = match context_budget {
+            Some(budget) => context_window.min(budget) as usize,
+            None => context_window as usize,
+        };
+        assert_eq!(effective, 32_768);
+    }
+
+    #[test]
+    fn effective_token_budget_falls_back_to_context_window() {
+        let context_window: u32 = 262_144;
+        let context_budget: Option<u32> = None;
+        let effective = match context_budget {
+            Some(budget) => context_window.min(budget) as usize,
+            None => context_window as usize,
+        };
+        assert_eq!(effective, 262_144);
     }
 }

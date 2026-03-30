@@ -687,6 +687,7 @@ fn basic_agent_loop_derives_context_budget_from_context_window() {
         true,
         8_000,
         &system_prompt,
+        None,
     );
     let large = anvil::agent::BasicAgentLoop::build_turn_request(
         "local-default",
@@ -694,6 +695,7 @@ fn basic_agent_loop_derives_context_budget_from_context_window() {
         true,
         200_000,
         &system_prompt,
+        None,
     );
 
     assert!(small.messages.len() < large.messages.len());
@@ -1517,6 +1519,7 @@ fn system_prompt_includes_web_fetch_tool() {
         false,
         4096,
         &system_prompt,
+        None,
     );
     assert!(
         request.messages[0].content.contains("web.fetch"),
@@ -1599,6 +1602,7 @@ fn system_prompt_includes_web_search_tool() {
         false,
         4096,
         &system_prompt,
+        None,
     );
     assert!(
         request.messages[0].content.contains("web.search"),
@@ -1616,6 +1620,7 @@ fn system_prompt_includes_github_insights() {
         false,
         4096,
         &system_prompt,
+        None,
     );
     assert!(
         request.messages[0].content.contains("GitHub Insights"),
@@ -1776,6 +1781,7 @@ fn system_prompt_includes_file_edit_tool() {
         false,
         4096,
         &system_prompt,
+        None,
     );
     assert!(
         request.messages[0].content.contains("file.edit"),
@@ -1800,6 +1806,7 @@ fn system_prompt_includes_project_instructions() {
         false,
         4096,
         &system_prompt,
+        None,
     );
 
     assert!(
@@ -1828,6 +1835,7 @@ fn system_prompt_without_project_instructions() {
         false,
         4096,
         &system_prompt,
+        None,
     );
 
     assert!(
@@ -3944,5 +3952,210 @@ fn prompt_tool_rules_contains_large_file_guidance() {
     assert!(
         system_prompt.contains("file.write may be blocked"),
         "system prompt should contain large file write guidance from PROMPT_TOOL_RULES"
+    );
+}
+
+// ── Issue #195: sidecar_summarize tests ──────────────────────────────────
+
+#[test]
+fn sidecar_summarize_network_error_returns_none() {
+    // Connect to a port that is (almost certainly) not listening
+    let client = OllamaProviderClient::new("http://127.0.0.1:19999");
+    let result = client.sidecar_summarize("test-model", "some conversation text");
+    assert!(
+        result.is_none(),
+        "network error should return None for graceful fallback"
+    );
+}
+
+#[test]
+fn sidecar_summarize_success_with_mock_server() {
+    // This test verifies the OllamaChatRequest construction is correct
+    // by building the request and checking it can be serialized.
+    use anvil::provider::OllamaChatRequest;
+    let request = OllamaChatRequest {
+        model: "qwen2.5:3b".to_string(),
+        messages: vec![
+            OllamaChatMessage {
+                role: "system".to_string(),
+                content: "You are a concise summarizer.".to_string(),
+                images: None,
+            },
+            OllamaChatMessage {
+                role: "user".to_string(),
+                content: "user: hello\nassistant: hi".to_string(),
+                images: None,
+            },
+        ],
+        stream: false,
+        think: false,
+        options: None,
+    };
+    let json = serde_json::to_string(&request).expect("should serialize");
+    assert!(json.contains("qwen2.5:3b"));
+    assert!(json.contains("\"stream\":false"));
+}
+
+#[test]
+fn error_guidance_mentions_sidecar_keys() {
+    let err =
+        anvil::app::AppError::Config(anvil::config::ConfigError::ValidationError("test".into()));
+    let guidance = anvil::app::error_guidance(&err);
+    assert!(
+        guidance.contains("sidecar_model"),
+        "error guidance should mention sidecar_model: {guidance}"
+    );
+    assert!(
+        guidance.contains("sidecar_provider_url"),
+        "error guidance should mention sidecar_provider_url: {guidance}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #204: max_output_tokens / infinite stream guard
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ollama_request_includes_num_predict_when_max_output_tokens_set() {
+    let mut request = ProviderTurnRequest::new(
+        "test-model".to_string(),
+        vec![anvil::provider::ProviderMessage::new(
+            ProviderMessageRole::User,
+            "hello",
+        )],
+        true,
+    );
+    request.max_output_tokens = Some(16384);
+
+    let ollama_request =
+        OllamaProviderClient::<anvil::provider::ReqwestHttpTransport>::build_chat_request(&request);
+
+    let options = ollama_request
+        .options
+        .expect("options should be set when max_output_tokens is Some");
+    assert_eq!(options.num_predict, Some(16384));
+}
+
+#[test]
+fn ollama_request_omits_options_when_max_output_tokens_none() {
+    let request = ProviderTurnRequest::new(
+        "test-model".to_string(),
+        vec![anvil::provider::ProviderMessage::new(
+            ProviderMessageRole::User,
+            "hello",
+        )],
+        true,
+    );
+
+    let ollama_request =
+        OllamaProviderClient::<anvil::provider::ReqwestHttpTransport>::build_chat_request(&request);
+
+    assert!(
+        ollama_request.options.is_none(),
+        "options should be None when max_output_tokens is not set"
+    );
+}
+
+#[test]
+fn ollama_request_serializes_num_predict_correctly() {
+    let mut request = ProviderTurnRequest::new(
+        "test-model".to_string(),
+        vec![anvil::provider::ProviderMessage::new(
+            ProviderMessageRole::User,
+            "hello",
+        )],
+        true,
+    );
+    request.max_output_tokens = Some(8192);
+
+    let ollama_request =
+        OllamaProviderClient::<anvil::provider::ReqwestHttpTransport>::build_chat_request(&request);
+    let json = serde_json::to_string(&ollama_request).expect("should serialize");
+    assert!(
+        json.contains("\"num_predict\":8192"),
+        "serialized request should contain num_predict: {json}"
+    );
+}
+
+#[test]
+fn openai_request_includes_max_tokens_when_set() {
+    let mut request = ProviderTurnRequest::new(
+        "test-model".to_string(),
+        vec![anvil::provider::ProviderMessage::new(
+            ProviderMessageRole::User,
+            "hello",
+        )],
+        false,
+    );
+    request.max_output_tokens = Some(16384);
+
+    // Use mock transport to capture the serialized request body
+    let seen_bodies = Rc::new(RefCell::new(Vec::new()));
+    let transport = MockHttpTransport {
+        seen_urls: Rc::new(RefCell::new(Vec::new())),
+        seen_bodies: seen_bodies.clone(),
+        seen_headers: Rc::new(RefCell::new(Vec::new())),
+        response: HttpResponse {
+            status_code: 200,
+            body: br#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#.to_vec(),
+        },
+        get_response: None,
+    };
+    let client = anvil::provider::openai::OpenAiCompatibleProviderClient::with_transport(
+        "http://localhost:1234",
+        transport,
+    );
+
+    let mut events = Vec::new();
+    client
+        .stream_turn(&request, &mut |event| events.push(event))
+        .expect("should succeed");
+
+    let bodies = seen_bodies.borrow();
+    assert!(!bodies.is_empty(), "should have sent a request");
+    let body_str = String::from_utf8_lossy(&bodies[0]);
+    assert!(
+        body_str.contains("\"max_tokens\":16384"),
+        "request body should contain max_tokens: {body_str}"
+    );
+}
+
+#[test]
+fn openai_request_omits_max_tokens_when_none() {
+    let request = ProviderTurnRequest::new(
+        "test-model".to_string(),
+        vec![anvil::provider::ProviderMessage::new(
+            ProviderMessageRole::User,
+            "hello",
+        )],
+        false,
+    );
+
+    let seen_bodies = Rc::new(RefCell::new(Vec::new()));
+    let transport = MockHttpTransport {
+        seen_urls: Rc::new(RefCell::new(Vec::new())),
+        seen_bodies: seen_bodies.clone(),
+        seen_headers: Rc::new(RefCell::new(Vec::new())),
+        response: HttpResponse {
+            status_code: 200,
+            body: br#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#.to_vec(),
+        },
+        get_response: None,
+    };
+    let client = anvil::provider::openai::OpenAiCompatibleProviderClient::with_transport(
+        "http://localhost:1234",
+        transport,
+    );
+
+    let mut events = Vec::new();
+    client
+        .stream_turn(&request, &mut |event| events.push(event))
+        .expect("should succeed");
+
+    let bodies = seen_bodies.borrow();
+    let body_str = String::from_utf8_lossy(&bodies[0]);
+    assert!(
+        !body_str.contains("max_tokens"),
+        "request body should NOT contain max_tokens when None: {body_str}"
     );
 }

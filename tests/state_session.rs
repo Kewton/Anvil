@@ -3,7 +3,8 @@ mod common;
 use anvil::contracts::{AppEvent, AppStateSnapshot, RuntimeState};
 use anvil::session::{
     MessageRole, MessageStatus, SessionMessage, SessionRecord, SessionStore, WorkingMemory,
-    new_assistant_message, new_user_message, validate_session_name,
+    build_conversation_text_for_summary, extract_file_targets, new_assistant_message,
+    new_user_message, validate_session_name,
 };
 use anvil::state::{StateMachine, StateTransition};
 use std::path::PathBuf;
@@ -1135,7 +1136,7 @@ fn should_smart_compact_below_threshold() {
     session.smart_compact_threshold_ratio = 0.75;
     session.push_message(new_user_message("m1", "hello"));
     // 1 message, far below any threshold
-    assert!(!session.should_smart_compact(200_000));
+    assert!(!session.should_smart_compact(200_000, None));
 }
 
 #[test]
@@ -1151,7 +1152,7 @@ fn should_smart_compact_above_threshold() {
     }
     // With context_window=1000, threshold = 750 tokens
     // 100 messages * ~50 tokens = ~5000 tokens > 750
-    assert!(session.should_smart_compact(1000));
+    assert!(session.should_smart_compact(1000, None));
 }
 
 #[test]
@@ -1162,7 +1163,7 @@ fn should_smart_compact_ratio_zero_disabled() {
         session.push_message(new_user_message(format!("m{i}"), "a".repeat(200)));
     }
     // ratio=0.0 means smart compact is disabled
-    assert!(!session.should_smart_compact(1000));
+    assert!(!session.should_smart_compact(1000, None));
 }
 
 #[test]
@@ -1172,7 +1173,27 @@ fn should_smart_compact_small_context_window() {
     // MIN_CONTEXT_WINDOW = 1000, threshold = 750
     session.push_message(new_user_message("m1", "a".repeat(400)));
     // ~100 tokens, below 750
-    assert!(!session.should_smart_compact(1000));
+    assert!(!session.should_smart_compact(1000, None));
+}
+
+/// Issue #200: should_smart_compact respects context_budget
+#[test]
+fn should_smart_compact_respects_context_budget() {
+    let mut session = SessionRecord::new(PathBuf::from("/tmp/test"));
+    session.smart_compact_threshold_ratio = 0.75;
+    // Fill with messages to get ~5000 tokens
+    for i in 0..100 {
+        session.push_message(new_user_message(
+            format!("m{i}"),
+            "a".repeat(200), // ~50 tokens each
+        ));
+    }
+    // context_window=262144 alone → threshold=196608, won't trigger
+    assert!(!session.should_smart_compact(262_144, None));
+    // With context_budget=4000 → effective=4000, threshold=3000 → 5000>3000 triggers
+    assert!(session.should_smart_compact(262_144, Some(4000)));
+    // context_budget larger than context_window → effective=context_window, no change
+    assert!(!session.should_smart_compact(262_144, Some(300_000)));
 }
 
 #[test]
@@ -1648,4 +1669,266 @@ fn working_memory_format_includes_recent_diffs_section() {
         prompt.contains("wrote 50 bytes to test.txt"),
         "prompt should include the diff content"
     );
+}
+
+// ── Task 2.1: build_conversation_text_for_summary tests ──────────────────
+
+#[test]
+fn build_conversation_text_for_summary_basic() {
+    let messages = vec![
+        SessionMessage::new(MessageRole::User, "you", "Hello, please help me"),
+        SessionMessage::new(MessageRole::Assistant, "anvil", "Sure, I can help"),
+    ];
+    let text = build_conversation_text_for_summary(&messages, 50, 500, 8000);
+    assert!(text.contains("user: Hello, please help me"));
+    assert!(text.contains("assistant: Sure, I can help"));
+}
+
+#[test]
+fn build_conversation_text_for_summary_cjk_safe() {
+    // CJK characters: each is a single char but multi-byte in UTF-8
+    let cjk_content = "日本語のテスト文字列です。これは長い文章で切り詰めをテストします。";
+    let messages = vec![SessionMessage::new(MessageRole::User, "you", cjk_content)];
+    // max_chars_per_msg = 10: should safely truncate CJK at char boundary
+    let text = build_conversation_text_for_summary(&messages, 50, 10, 8000);
+    assert!(!text.is_empty());
+    // Should not panic on UTF-8 boundary
+    let char_count: usize = text.lines().map(|l| l.chars().count()).sum();
+    assert!(char_count > 0);
+}
+
+#[test]
+fn build_conversation_text_for_summary_max_limits() {
+    let mut messages = Vec::new();
+    for i in 0..100 {
+        messages.push(SessionMessage::new(
+            MessageRole::User,
+            "you",
+            format!("Message number {i} with some content"),
+        ));
+    }
+    // max_messages = 5: should only include last 5
+    let text = build_conversation_text_for_summary(&messages, 5, 500, 8000);
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(lines.len() <= 5, "should respect max_messages limit");
+
+    // max_total_chars: should respect total character limit
+    let text2 = build_conversation_text_for_summary(&messages, 50, 500, 100);
+    assert!(
+        text2.chars().count() <= 200,
+        "should approximately respect max_total_chars"
+    );
+}
+
+#[test]
+fn conversation_text_for_summary_delegates() {
+    let mut session = SessionRecord::new(PathBuf::from("/tmp/conv-text-delegate"));
+    session.push_message(SessionMessage::new(
+        MessageRole::User,
+        "you",
+        "test message",
+    ));
+    let text = session.conversation_text_for_summary(50, 500, 8000);
+    assert!(text.contains("user: test message"));
+}
+
+#[test]
+fn build_conversation_text_for_summary_with_increased_limits() {
+    // Simulate a file.read result containing code with function signatures
+    let code_content = r#"use std::collections::HashMap;
+
+pub struct PromptDetectionResult {
+    pub detected: bool,
+    pub confidence: f64,
+}
+
+pub fn detect_prompt(output: &str, options: Option<&DetectPromptOptions>) -> PromptDetectionResult {
+    // implementation details...
+    PromptDetectionResult { detected: false, confidence: 0.0 }
+}
+
+pub fn process_tokens(input: &[u8], max_length: usize) -> Result<Vec<Token>, TokenError> {
+    // implementation details...
+    Ok(vec![])
+}
+
+impl TokenProcessor {
+    pub fn new(config: &Config) -> Self {
+        Self { config: config.clone() }
+    }
+
+    pub fn validate(&self, tokens: &[Token]) -> bool {
+        tokens.iter().all(|t| t.is_valid())
+    }
+}"#;
+
+    let messages = vec![
+        SessionMessage::new(MessageRole::User, "you", "Read src/detection.rs"),
+        SessionMessage::new(MessageRole::Tool, "tool", code_content),
+        SessionMessage::new(
+            MessageRole::Assistant,
+            "anvil",
+            "I'll modify the detect_prompt function to add logging.",
+        ),
+    ];
+
+    // With increased limits: max_chars_per_msg=1000, max_total_chars=12000
+    let text = build_conversation_text_for_summary(&messages, 50, 1000, 12000);
+
+    // Function signatures should be preserved within 1000 chars
+    assert!(
+        text.contains("detect_prompt"),
+        "function signature detect_prompt should be preserved with 1000 char limit"
+    );
+    assert!(
+        text.contains("PromptDetectionResult"),
+        "type name PromptDetectionResult should be preserved with 1000 char limit"
+    );
+    assert!(
+        text.contains("process_tokens"),
+        "function signature process_tokens should be preserved with 1000 char limit"
+    );
+
+    // Verify the old limit (500) loses later signatures while new limit preserves them.
+    // The code_content is ~680 chars, so at 500 chars the `validate` method near
+    // the end should be truncated, while at 1000 chars it should be preserved.
+    let text_old = build_conversation_text_for_summary(&messages, 50, 500, 8000);
+    assert!(
+        !text_old.contains("validate"),
+        "with 500 char limit, the validate method near end of code should be truncated"
+    );
+    assert!(
+        text.contains("validate"),
+        "with 1000 char limit, the validate method should be preserved"
+    );
+}
+
+// ── Task 2.2: extract_file_targets tests ─────────────────────────────────
+
+#[test]
+fn extract_file_targets_finds_paths() {
+    let messages = vec![
+        SessionMessage::new(
+            MessageRole::User,
+            "you",
+            "Please review src/provider/openai.rs and fix the bug",
+        ),
+        SessionMessage::new(
+            MessageRole::Tool,
+            "tool",
+            "file.write wrote ./sandbox/demo/test.html",
+        ),
+    ];
+    let targets = extract_file_targets(&messages);
+    assert!(
+        targets.iter().any(|t| t.contains("src/provider/openai.rs")),
+        "should find src/provider/openai.rs in targets: {:?}",
+        targets
+    );
+}
+
+#[test]
+fn extract_file_targets_empty_messages() {
+    let messages: Vec<SessionMessage> = Vec::new();
+    let targets = extract_file_targets(&messages);
+    assert!(targets.is_empty());
+}
+
+// ── Task 2.3: compact_history_with_llm_summary tests ─────────────────────
+
+#[test]
+fn compact_history_with_llm_summary_uses_llm_text() {
+    let mut session = SessionRecord::new(PathBuf::from("/tmp/llm-summary-test"));
+    // Add enough messages to allow compaction
+    for i in 0..15 {
+        session.push_message(new_user_message(
+            format!("msg_{i:03}"),
+            format!("discuss topic {i}"),
+        ));
+    }
+
+    let llm_summary = Some("LLM generated bullet points summary here".to_string());
+    let changed = session.compact_history_with_llm_summary(5, llm_summary);
+
+    assert!(changed);
+    assert!(
+        session.messages[0]
+            .content
+            .contains("LLM generated bullet points summary here"),
+        "summary should contain LLM text, got: {}",
+        session.messages[0].content
+    );
+}
+
+#[test]
+fn compact_history_with_llm_summary_preserves_file_targets() {
+    let mut session = SessionRecord::new(PathBuf::from("/tmp/llm-file-targets"));
+    session.push_message(new_user_message("msg_001", "edit src/main.rs"));
+    session.push_message(
+        SessionMessage::new(
+            MessageRole::Tool,
+            "tool",
+            "file.write wrote ./src/config/mod.rs",
+        )
+        .with_id("tool_001"),
+    );
+    for i in 2..15 {
+        session.push_message(new_user_message(
+            format!("msg_{i:03}"),
+            format!("follow up {i}"),
+        ));
+    }
+
+    let llm_summary = Some("Bullet point summary".to_string());
+    let changed = session.compact_history_with_llm_summary(5, llm_summary);
+
+    assert!(changed);
+    // Should contain file references even with LLM summary
+    let content = &session.messages[0].content;
+    assert!(
+        content.contains("src/main.rs") || content.contains("src/config/mod.rs"),
+        "should preserve file targets in summary, got: {}",
+        content
+    );
+}
+
+#[test]
+fn compact_history_with_llm_summary_none_falls_back() {
+    let mut session = SessionRecord::new(PathBuf::from("/tmp/llm-none-fallback"));
+    session.push_message(new_user_message(
+        "msg_001",
+        "inspect src/provider/openai.rs",
+    ));
+    for i in 1..15 {
+        session.push_message(new_user_message(
+            format!("msg_{i:03}"),
+            format!("follow up {i}"),
+        ));
+    }
+
+    let changed = session.compact_history_with_llm_summary(5, None);
+
+    assert!(changed);
+    // Should use rule-based summary (contains [compacted session summary])
+    assert!(
+        session.messages[0]
+            .content
+            .contains("[compacted session summary]"),
+        "None should fall back to rule-based summary"
+    );
+}
+
+#[test]
+fn compact_history_public_signature_unchanged() {
+    let mut session = SessionRecord::new(PathBuf::from("/tmp/sig-check"));
+    for i in 0..15 {
+        session.push_message(new_user_message(
+            format!("msg_{i:03}"),
+            format!("message {i}"),
+        ));
+    }
+
+    // Verify compact_history() still works with original signature (keep_recent: usize) -> bool
+    let changed: bool = session.compact_history(5);
+    assert!(changed);
 }

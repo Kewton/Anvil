@@ -32,6 +32,14 @@ pub struct OllamaChatMessage {
     pub images: Option<Vec<String>>,
 }
 
+/// Ollama request options (e.g. `num_predict` for output token limit).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct OllamaRequestOptions {
+    /// Maximum number of tokens to generate (maps to Ollama `num_predict`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num_predict: Option<u32>,
+}
+
 /// Wire format for an Ollama `/api/chat` request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OllamaChatRequest {
@@ -40,6 +48,8 @@ pub struct OllamaChatRequest {
     pub stream: bool,
     #[serde(default)]
     pub think: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub options: Option<OllamaRequestOptions>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,6 +146,9 @@ impl<T> OllamaProviderClient<T> {
                 .collect(),
             stream: request.stream,
             think: false,
+            options: request.max_output_tokens.map(|n| OllamaRequestOptions {
+                num_predict: Some(n),
+            }),
         }
     }
 
@@ -198,11 +211,32 @@ pub fn resolve_ollama_model_alias(requested: &str, available: &[String]) -> Stri
 impl Default for OllamaProviderClient {
     fn default() -> Self {
         Self {
-            base_url: "http://127.0.0.1:11434".to_string(),
+            base_url: crate::config::DEFAULT_OLLAMA_URL.to_string(),
             transport: RetryTransport::new(ReqwestHttpTransport::new()),
         }
     }
 }
+
+/// Timeout in seconds for sidecar LLM summarization requests.
+const SIDECAR_TIMEOUT_SECS: u64 = 30;
+/// Maximum response body size for sidecar summarization (64 KiB).
+const MAX_SIDECAR_RESPONSE_SIZE: usize = 65_536;
+
+/// Summarization prompt sent to the sidecar model.
+/// Code-aware prompt that preserves function signatures, change plans,
+/// and key constraints for better post-compact file.edit accuracy.
+const SIDECAR_SUMMARIZE_PROMPT: &str = "\
+You are a code-aware summarizer for a coding agent session.
+
+Summarize the conversation preserving:
+1. FILE SIGNATURES: For each file read, list key function/type signatures \
+(e.g., \"fn detect_prompt(output: &str) -> PromptResult\")
+2. CHANGE PLAN: What modifications are planned and which files need editing
+3. COMPLETED CHANGES: What file.edit operations succeeded or failed, with file paths
+4. KEY CONSTRAINTS: Design rules or security requirements discovered
+
+Format as structured bullet points. Preserve exact function names and type names.
+Do NOT include file contents - only signatures and structure.";
 
 impl<T: HttpTransport> OllamaProviderClient<T> {
     /// Check connectivity to the Ollama server by requesting `/api/tags`.
@@ -213,6 +247,123 @@ impl<T: HttpTransport> OllamaProviderClient<T> {
     pub fn health_check(&self) -> Result<(), ProviderTurnError> {
         let url = format!("{}/api/tags", self.base_url.trim_end_matches('/'));
         self.transport.get(&url).map(|_| ())
+    }
+
+    /// Generate a conversation summary using a sidecar model.
+    ///
+    /// Sends the conversation text to the Ollama `/api/chat` endpoint with
+    /// a dedicated 30-second timeout. Returns `None` on any failure (timeout,
+    /// network error, parse error) so callers can fall back to rule-based
+    /// summarization.
+    pub fn sidecar_summarize(&self, model: &str, conversation_text: &str) -> Option<String> {
+        let url = format!("{}/api/chat", self.base_url.trim_end_matches('/'));
+        let request = OllamaChatRequest {
+            model: model.to_string(),
+            messages: vec![
+                OllamaChatMessage {
+                    role: "system".to_string(),
+                    content: SIDECAR_SUMMARIZE_PROMPT.to_string(),
+                    images: None,
+                },
+                OllamaChatMessage {
+                    role: "user".to_string(),
+                    content: conversation_text.to_string(),
+                    images: None,
+                },
+            ],
+            stream: false,
+            think: false,
+            options: None,
+        };
+
+        let body = serde_json::to_vec(&request).ok()?;
+
+        // Use a dedicated HTTP client with 30s timeout (not self.transport).
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(SIDECAR_TIMEOUT_SECS))
+            .build()
+            .ok()?;
+
+        let response = match client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .body(body)
+            .send()
+        {
+            Ok(resp) => resp,
+            Err(err) => {
+                tracing::warn!(
+                    "sidecar_summarize request failed: {}",
+                    sanitize_error_message(&err.to_string())
+                );
+                return None;
+            }
+        };
+
+        if !response.status().is_success() {
+            tracing::warn!(
+                status = %response.status(),
+                "sidecar_summarize received non-success status"
+            );
+            return None;
+        }
+
+        // Read response body with size limit using take() to avoid
+        // allocating memory for oversized responses (CB-001).
+        let body_bytes = {
+            use std::io::Read;
+            let limit = MAX_SIDECAR_RESPONSE_SIZE as u64;
+            // Read up to limit + 1 bytes so we can detect overflow.
+            let mut buf = Vec::new();
+            match response.take(limit + 1).read_to_end(&mut buf) {
+                Ok(_) => {
+                    if buf.len() > MAX_SIDECAR_RESPONSE_SIZE {
+                        tracing::warn!(
+                            limit = MAX_SIDECAR_RESPONSE_SIZE,
+                            "sidecar_summarize response exceeds size limit"
+                        );
+                        return None;
+                    }
+                    buf
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "sidecar_summarize failed to read response: {}",
+                        sanitize_error_message(&err.to_string())
+                    );
+                    return None;
+                }
+            }
+        };
+
+        let parsed: Value = match serde_json::from_slice(&body_bytes) {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::warn!("sidecar_summarize failed to parse response JSON: {err}");
+                return None;
+            }
+        };
+
+        let content = parsed
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .map(|s| s.to_string());
+
+        if content.is_none() {
+            tracing::warn!("sidecar_summarize response missing message.content");
+        }
+
+        // Log sidecar success with model and summary length (Issue #206 D-1)
+        if let Some(ref text) = content {
+            tracing::info!(
+                model = %model,
+                summary_len = text.len(),
+                "sidecar_summarize success"
+            );
+        }
+
+        content
     }
 }
 
@@ -517,4 +668,29 @@ fn resolve_model_with_ollama_tags(base_url: &str, requested: &str) -> String {
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();
     resolve_ollama_model_alias(requested, &names)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sidecar_summarize_prompt_contains_required_sections() {
+        assert!(
+            SIDECAR_SUMMARIZE_PROMPT.contains("FILE SIGNATURES"),
+            "prompt must contain FILE SIGNATURES section"
+        );
+        assert!(
+            SIDECAR_SUMMARIZE_PROMPT.contains("CHANGE PLAN"),
+            "prompt must contain CHANGE PLAN section"
+        );
+        assert!(
+            SIDECAR_SUMMARIZE_PROMPT.contains("COMPLETED CHANGES"),
+            "prompt must contain COMPLETED CHANGES section"
+        );
+        assert!(
+            SIDECAR_SUMMARIZE_PROMPT.contains("KEY CONSTRAINTS"),
+            "prompt must contain KEY CONSTRAINTS section"
+        );
+    }
 }

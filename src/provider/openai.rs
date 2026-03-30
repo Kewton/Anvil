@@ -31,6 +31,8 @@ struct OpenAiChatRequest {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
 }
 
 /// Request message: content is `Value` to support both plain text and
@@ -193,6 +195,7 @@ impl<T> OpenAiCompatibleProviderClient<T> {
                 .collect(),
             stream: request.stream,
             stream_options,
+            max_tokens: request.max_output_tokens,
         }
     }
 }

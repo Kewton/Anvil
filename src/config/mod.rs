@@ -5,7 +5,13 @@
 //! immutable for the lifetime of the session.
 
 pub mod cli_args;
+pub mod custom_tools;
 pub use cli_args::CliArgs;
+pub use custom_tools::{
+    CUSTOM_TOOL_PREFIX, CustomToolDef, MAX_CUSTOM_TOOLS, custom_tool_display_name,
+    expand_command_template, json_value_to_params, parse_tools_section, shell_escape,
+    strip_custom_prefix,
+};
 
 use crate::provider::transport::{DEFAULT_HTTP_TIMEOUT_SECS, normalize_http_timeout};
 use clap::Parser;
@@ -86,6 +92,7 @@ pub struct RuntimeConfig {
     pub provider_url: String,
     pub model: String,
     pub sidecar_model: Option<String>,
+    pub sidecar_provider_url: Option<String>,
     pub api_key: Option<String>,
     pub context_window: u32,
     pub context_budget: Option<u32>,
@@ -133,12 +140,19 @@ pub struct RuntimeConfig {
     pub safe_write_max_lines: usize,
     /// Deletion ratio threshold for diff warning (0.0-1.0, Issue #156).
     pub safe_write_deletion_ratio: f64,
+    /// ReadRepeatTracker: per-path read count to trigger warn hint (Issue #187).
+    pub read_repeat_warn_threshold: u32,
+    /// ReadRepeatTracker: per-path read count to trigger strong-warn hint (Issue #187).
+    pub read_repeat_strong_warn_threshold: u32,
     /// UI language for LLM responses (Issue #162).
     /// `None` means "use default language via effective_ui_language_code()".
     /// Supported: "ja", "en".
     pub ui_language: Option<String>,
     /// Maximum total tool calls per agentic turn (Issue #172).
     pub max_tool_calls: usize,
+    /// Maximum output tokens per LLM turn (Issue #204).
+    /// Translated to provider-specific limits (Ollama `num_predict`, OpenAI `max_tokens`).
+    pub max_output_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -154,6 +168,8 @@ pub struct ModeConfig {
     /// Trust mode: auto-approve built-in tool execution.
     /// Set only via `--trust` CLI flag (not from config file deserialization).
     pub trust_all: bool,
+    /// Log format for the file layer (Issue #206).
+    pub log_format: crate::logging::LogFormat,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,6 +197,7 @@ pub struct EffectiveConfig {
     pub mode: ModeConfig,
     pub paths: PathConfig,
     project_instructions: Option<String>,
+    custom_tools: Vec<CustomToolDef>,
 }
 
 #[derive(Debug)]
@@ -221,6 +238,11 @@ impl EffectiveConfig {
         self.project_instructions.as_deref()
     }
 
+    /// Custom tool definitions parsed from ANVIL.md `## tools` section.
+    pub fn custom_tools(&self) -> &[CustomToolDef] {
+        &self.custom_tools
+    }
+
     /// Test-only setter for project_instructions.
     /// In production code, this field is set only via `load()`.
     pub fn set_project_instructions_for_test(&mut self, instructions: Option<String>) {
@@ -259,7 +281,9 @@ impl EffectiveConfig {
         }
 
         config.validate()?;
-        config.project_instructions = config.paths.load_project_instructions();
+        let (instructions, custom_tools) = config.paths.load_project_instructions();
+        config.project_instructions = instructions;
+        config.custom_tools = custom_tools;
         Ok(config)
     }
 
@@ -271,9 +295,10 @@ impl EffectiveConfig {
         Self {
             runtime: RuntimeConfig {
                 provider: "ollama".to_string(),
-                provider_url: "http://127.0.0.1:11434".to_string(),
+                provider_url: DEFAULT_OLLAMA_URL.to_string(),
                 model: "local-default".to_string(),
                 sidecar_model: None,
+                sidecar_provider_url: None,
                 api_key: None,
                 context_window: 200_000,
                 context_budget: None,
@@ -293,15 +318,18 @@ impl EffectiveConfig {
                 loop_detection_threshold: 3,
                 http_timeout_secs: DEFAULT_HTTP_TIMEOUT_SECS,
                 phase_explore_threshold: 5,
-                phase_force_transition_threshold: 10,
+                phase_force_transition_threshold: 15,
                 phase_completion_read_threshold: 5,
                 edit_strategy: crate::app::edit_fail_tracker::EditStrategy::EditFirst,
                 edit_reread_threshold: 3,
                 edit_write_fallback_threshold: 5,
                 safe_write_max_lines: 500,
                 safe_write_deletion_ratio: 0.5,
+                read_repeat_warn_threshold: 3,
+                read_repeat_strong_warn_threshold: 6,
                 ui_language: None,
                 max_tool_calls: DEFAULT_MAX_TOOL_CALLS,
+                max_output_tokens: Some(DEFAULT_MAX_OUTPUT_TOKENS),
             },
             mode: ModeConfig {
                 prompt_source: PromptSource::Interactive,
@@ -313,6 +341,7 @@ impl EffectiveConfig {
                 log_filter: None,
                 offline: false,
                 trust_all: false,
+                log_format: crate::logging::LogFormat::default(),
             },
             paths: PathConfig {
                 mcp_config_file: cwd.join(".anvil").join("mcp.json"),
@@ -326,6 +355,7 @@ impl EffectiveConfig {
                 logs_dir,
             },
             project_instructions: None,
+            custom_tools: Vec::new(),
         }
     }
 
@@ -377,6 +407,7 @@ impl EffectiveConfig {
             "ANVIL_MODEL",
             "ANVIL_PROVIDER_URL",
             "ANVIL_SIDECAR_MODEL",
+            "ANVIL_SIDECAR_PROVIDER_URL",
             "ANVIL_API_KEY",
             "ANVIL_CONTEXT_WINDOW",
             "ANVIL_CONTEXT_BUDGET",
@@ -449,6 +480,7 @@ impl EffectiveConfig {
             self.runtime.provider_url = v.clone();
         }
         if let Some(ref v) = cli.sidecar_model {
+            validate_sidecar_model(v)?;
             self.runtime.sidecar_model = Some(v.clone());
         }
 
@@ -532,6 +564,16 @@ impl EffectiveConfig {
             self.runtime.max_tool_calls = v;
         }
 
+        // Max output tokens (Issue #204)
+        if let Some(v) = cli.max_output_tokens {
+            self.runtime.max_output_tokens = if v == 0 { None } else { Some(v) };
+        }
+
+        // Log format (Issue #206)
+        if let Some(ref v) = cli.log_format {
+            self.mode.log_format = parse_log_format(v)?;
+        }
+
         // --session flag: override session file path
         if let Some(ref name) = cli.session {
             crate::session::validate_session_name(name)
@@ -549,11 +591,20 @@ impl EffectiveConfig {
                 "provider_url" | "ANVIL_PROVIDER_URL" => self.runtime.provider_url = value.clone(),
                 "model" | "ANVIL_MODEL" => self.runtime.model = value.clone(),
                 "sidecar_model" | "ANVIL_SIDECAR_MODEL" => {
-                    self.runtime.sidecar_model = if value.is_empty() {
-                        None
+                    if value.is_empty() {
+                        self.runtime.sidecar_model = None;
                     } else {
-                        Some(value.clone())
-                    };
+                        validate_sidecar_model(value)?;
+                        self.runtime.sidecar_model = Some(value.clone());
+                    }
+                }
+                "sidecar_provider_url" | "ANVIL_SIDECAR_PROVIDER_URL" => {
+                    if value.is_empty() {
+                        self.runtime.sidecar_provider_url = None;
+                    } else {
+                        validate_sidecar_provider_url(value)?;
+                        self.runtime.sidecar_provider_url = Some(value.clone());
+                    }
                 }
                 "api_key" | "ANVIL_API_KEY" => {
                     self.runtime.api_key = if value.is_empty() {
@@ -722,6 +773,24 @@ impl EffectiveConfig {
                     }
                     self.runtime.edit_write_fallback_threshold = v;
                 }
+                "read_repeat_warn_threshold" | "ANVIL_READ_REPEAT_WARN_THRESHOLD" => {
+                    let v: u32 = value
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                    if !(1..=20).contains(&v) {
+                        return Err(ConfigError::InvalidNumericValue(value.clone()));
+                    }
+                    self.runtime.read_repeat_warn_threshold = v;
+                }
+                "read_repeat_strong_warn_threshold" | "ANVIL_READ_REPEAT_STRONG_WARN_THRESHOLD" => {
+                    let v: u32 = value
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                    if !(2..=40).contains(&v) {
+                        return Err(ConfigError::InvalidNumericValue(value.clone()));
+                    }
+                    self.runtime.read_repeat_strong_warn_threshold = v;
+                }
                 "safe_write_max_lines" | "ANVIL_SAFE_WRITE_MAX_LINES" => {
                     self.runtime.safe_write_max_lines = value
                         .parse()
@@ -747,6 +816,12 @@ impl EffectiveConfig {
                     self.runtime.max_tool_calls = value
                         .parse()
                         .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                }
+                "max_output_tokens" | "ANVIL_MAX_OUTPUT_TOKENS" => {
+                    let v: u32 = value
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                    self.runtime.max_output_tokens = if v == 0 { None } else { Some(v) };
                 }
                 _ => {}
             }
@@ -777,6 +852,7 @@ impl EffectiveConfig {
         self.clamp_loop_detection_threshold();
         self.clamp_phase_thresholds();
         self.clamp_edit_thresholds();
+        self.clamp_read_repeat_thresholds();
         self.clamp_http_timeout();
         self.clamp_max_tool_calls();
         self.sanitize_ui_language();
@@ -940,6 +1016,20 @@ impl EffectiveConfig {
         }
     }
 
+    /// Clamp read-repeat tracker thresholds and enforce warn < strong_warn (Issue #187).
+    fn clamp_read_repeat_thresholds(&mut self) {
+        self.runtime.read_repeat_warn_threshold =
+            self.runtime.read_repeat_warn_threshold.clamp(1, 20);
+        self.runtime.read_repeat_strong_warn_threshold =
+            self.runtime.read_repeat_strong_warn_threshold.clamp(2, 40);
+        // Enforce warn < strong_warn
+        if self.runtime.read_repeat_warn_threshold >= self.runtime.read_repeat_strong_warn_threshold
+        {
+            self.runtime.read_repeat_strong_warn_threshold =
+                self.runtime.read_repeat_warn_threshold + 3;
+        }
+    }
+
     fn clamp_edit_thresholds(&mut self) {
         self.runtime.edit_reread_threshold = self.runtime.edit_reread_threshold.clamp(1, 20);
         self.runtime.edit_write_fallback_threshold =
@@ -974,6 +1064,9 @@ impl EffectiveConfig {
 
 const MAX_PROJECT_INSTRUCTIONS_CHARS: usize = 4000;
 const MIN_CONTEXT_WINDOW: u32 = 1000;
+
+/// Default Ollama server URL used as fallback for sidecar provider.
+pub const DEFAULT_OLLAMA_URL: &str = "http://127.0.0.1:11434";
 const DEFAULT_MAX_AGENT_ITERATIONS: usize = 30;
 const DEFAULT_SUBAGENT_MAX_ITERATIONS: u32 = 20;
 const DEFAULT_SUBAGENT_TIMEOUT_SECS: u64 = 120;
@@ -985,11 +1078,49 @@ const MIN_AGENT_ITERATIONS: usize = 1;
 fn is_valid_deletion_ratio(v: f64) -> bool {
     v.is_finite() && (0.0..=1.0).contains(&v)
 }
+
+/// Validate sidecar_provider_url: must start with http:// or https://.
+fn validate_sidecar_provider_url(url: &str) -> Result<(), ConfigError> {
+    if url.starts_with("http://") || url.starts_with("https://") {
+        Ok(())
+    } else {
+        Err(ConfigError::ValidationError(format!(
+            "sidecar_provider_url must start with http:// or https://, got: {url}"
+        )))
+    }
+}
+
+/// Maximum length for sidecar model names (DR4-002).
+const MAX_SIDECAR_MODEL_NAME_LEN: usize = 256;
+
+/// Validate sidecar model name (DR4-002).
+///
+/// Length limit: 256 characters.
+/// Allowed characters: alphanumeric, `-`, `_`, `.`, `:`, `/`, space.
+fn validate_sidecar_model(model: &str) -> Result<(), ConfigError> {
+    if model.len() > MAX_SIDECAR_MODEL_NAME_LEN {
+        return Err(ConfigError::ValidationError(format!(
+            "sidecar_model must be {MAX_SIDECAR_MODEL_NAME_LEN} characters or less, got: {} chars",
+            model.len()
+        )));
+    }
+    if !model
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "-_.:/ ".contains(c))
+    {
+        return Err(ConfigError::ValidationError(format!(
+            "sidecar_model contains invalid characters: {model}"
+        )));
+    }
+    Ok(())
+}
 const MAX_AGENT_ITERATIONS: usize = 100;
 /// Default maximum total tool calls per agentic turn (Issue #172).
 pub const DEFAULT_MAX_TOOL_CALLS: usize = 200;
 /// Hard upper limit for max_tool_calls (Issue #172).
 pub const MAX_TOOL_CALLS_LIMIT: usize = 10000;
+/// Default maximum output tokens per LLM turn (Issue #204).
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 16384;
 
 /// Sensitive keys and their recommended environment variable names.
 /// To add a new sensitive key, simply add an entry to this array.
@@ -1056,14 +1187,20 @@ pub fn check_gitignore_anvil_dir(repo_root: &Path) -> Option<String> {
 impl PathConfig {
     /// Load project instructions from ANVIL.md files.
     /// Delegates to `load_project_instructions_from()` for testability.
-    pub fn load_project_instructions(&self) -> Option<String> {
+    pub fn load_project_instructions(&self) -> (Option<String>, Vec<CustomToolDef>) {
         let home_dir = std::env::var("HOME").ok().map(PathBuf::from);
         Self::load_project_instructions_from(&self.cwd, home_dir.as_deref())
     }
 
     /// Internal method: accepts cwd and home_dir as arguments so tests can
     /// pass temp directories without depending on the HOME environment variable.
-    pub fn load_project_instructions_from(cwd: &Path, home_dir: Option<&Path>) -> Option<String> {
+    ///
+    /// Returns `(project_instructions, custom_tool_defs)`.
+    /// The `## tools` section is extracted from instructions and returned separately.
+    pub fn load_project_instructions_from(
+        cwd: &Path,
+        home_dir: Option<&Path>,
+    ) -> (Option<String>, Vec<CustomToolDef>) {
         let mut parts: Vec<String> = Vec::new();
         let mut sources: Vec<String> = Vec::new();
         let mut has_user_scope = false;
@@ -1110,7 +1247,7 @@ impl PathConfig {
         }
 
         if parts.is_empty() {
-            return None;
+            return (None, Vec::new());
         }
 
         eprintln!("ANVIL.md loaded from: {}", sources.join(", "));
@@ -1153,7 +1290,20 @@ impl PathConfig {
             };
         }
 
-        Some(combined)
+        // Parse and extract ## tools section before returning.
+        let (instructions, custom_tools) = parse_tools_section(&combined);
+        let instructions = if instructions.trim().is_empty() {
+            None
+        } else {
+            Some(instructions)
+        };
+        if !custom_tools.is_empty() {
+            eprintln!(
+                "Custom tools registered from ANVIL.md: {} tool(s)",
+                custom_tools.len()
+            );
+        }
+        (instructions, custom_tools)
     }
 }
 
@@ -1179,6 +1329,16 @@ fn parse_bool(value: &str) -> bool {
     )
 }
 
+fn parse_log_format(value: &str) -> Result<crate::logging::LogFormat, ConfigError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "text" => Ok(crate::logging::LogFormat::Text),
+        "json" => Ok(crate::logging::LogFormat::Json),
+        other => Err(ConfigError::ValidationError(format!(
+            "invalid log format: '{other}' (expected 'text' or 'json')"
+        ))),
+    }
+}
+
 fn parse_reasoning_visibility(value: &str) -> Result<ReasoningVisibility, ConfigError> {
     match value.trim().to_ascii_lowercase().as_str() {
         "hidden" => Ok(ReasoningVisibility::Hidden),
@@ -1194,6 +1354,7 @@ impl std::fmt::Debug for RuntimeConfig {
             .field("provider_url", &self.provider_url)
             .field("model", &self.model)
             .field("sidecar_model", &self.sidecar_model)
+            .field("sidecar_provider_url", &self.sidecar_provider_url)
             .field("api_key", &"[REDACTED]")
             .field("context_window", &self.context_window)
             .field("context_budget", &self.context_budget)

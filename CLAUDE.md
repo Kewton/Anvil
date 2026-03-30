@@ -105,15 +105,17 @@ src/
 │   ├── tag_parser.rs    # タグベースツール呼び出しパーサー（多層プロトコル対応）
 │   └── tag_spec.rs      # ツールタグ仕様テーブル（TOOL_TAG_SPECS）
 ├── app/
-│   ├── mod.rs           # アプリケーションオーケストレータ
-│   ├── agentic.rs       # agenticツール実行ループ（ANVIL_FINALガード・再試行ロジック含む）
+│   ├── mod.rs           # アプリケーションオーケストレータ（SessionStats・CompactInfo・セッションサマリー含む）
+│   ├── agentic.rs       # agenticツール実行ループ（ANVIL_FINALガード・再試行ロジック・ターンサマリー・異常検出WARN含む）
 │   ├── cli.rs           # CLI入力ループ
 │   ├── context.rs       # コンテキスト注入（@file展開・サンドボックス検証）
 │   ├── edit_fail_tracker.rs # 連続file.edit失敗の検出・回復ヒント注入
 │   ├── alternating_loop_detector.rs # AlternatingLoopDetector（交互/循環パターン検出）
 │   ├── loop_detector.rs # ループ検出（リングバッファ・段階的対応）
 │   ├── phase_estimator.rs # フェーズ推定（ツール呼び出しパターンベース・フォールバック完了検出）
+│   ├── read_repeat_tracker.rs # file.read繰り返し検出・ヒント注入（セッション横断型・閾値2/4）
 │   ├── write_fail_tracker.rs # file.write連続失敗トラッキング（ヒント提供・閾値2）
+│   ├── write_repeat_tracker.rs # file.write成功繰り返しトラッキング（同一ファイルへのwrite検出・Warn閾値3/StrongWarn閾値4）
 │   ├── plan.rs          # プラン管理
 │   ├── policy.rs        # offlineポリシーチェック（共通ヘルパー）
 │   ├── render.rs        # コンソール描画
@@ -127,22 +129,22 @@ src/
 │   └── skills.rs        # SKILL.mdベースのスキルシステム
 ├── hooks/
 │   └── mod.rs           # ライフサイクルフック（HooksConfig, HookRunner, HooksEngine）
-├── logging.rs           # 構造化ロギング（tracing初期化）
+├── logging.rs           # 構造化ロギング（tracing初期化・LogFormat対応・デフォルトフィルタ anvil=info,warn）
 ├── mcp/
 │   ├── mod.rs           # MCPクライアント（McpManager, McpConnection, McpError）
 │   └── transport.rs     # STDIOトランスポート（McpTransport trait, StdioTransport）
 ├── metrics/mod.rs       # ベンチマーク
 ├── provider/
 │   ├── mod.rs           # プロバイダー抽象化
-│   ├── ollama.rs        # Ollamaクライアント
+│   ├── ollama.rs        # Ollamaクライアント（sidecar_summarize: サイドカーモデルによるLLM要約生成）
 │   ├── openai.rs        # OpenAI互換クライアント
 │   └── transport.rs     # HTTPトランスポート
 ├── retrieval/mod.rs     # リポジトリ検索（オンデマンドコンテンツ読込・軽量キャッシュ）
-├── session/mod.rs       # セッション永続化（名前付きセッション・一覧・切替・削除・マイグレーション・構造化WorkingMemory）
+├── session/mod.rs       # セッション永続化（名前付きセッション・一覧・切替・削除・マイグレーション・構造化WorkingMemory・LLM要約コンパクション）
 ├── spinner.rs           # スピナーUI
 ├── state/mod.rs         # 状態マシン
 ├── tooling/
-│   ├── mod.rs           # ツール実行・検証・CheckpointStack（undo用チェックポイント管理）
+│   ├── mod.rs           # ツール実行・検証・CheckpointStack（undo用チェックポイント管理）・EditFallbackStage・file.edit詳細ログ
 │   ├── diff.rs          # 差分プレビュー生成（file.write/file.edit承認時）
 │   ├── file_cache.rs    # ファイル読み取りキャッシュ（FileReadCache: LRUエビクション・sandbox境界検証）
 │   └── shell_policy.rs  # ShellPolicy分類（ReadOnly/BuildTest/General）・offline用ネットワークコマンド検出

@@ -17,14 +17,69 @@ use crate::tooling::{
     count_file_lines, diff::generate_diff_preview, resolve_sandbox_path,
 };
 use crate::tui::Tui;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::tooling::{PermissionClass, effective_permission_class};
-use std::collections::HashSet;
 
 use super::policy::{OFFLINE_BLOCK_PAYLOAD, check_offline_blocked};
-use super::{App, AppError};
+use super::read_repeat_tracker::ReadRepeatAction;
+use super::write_repeat_tracker::WriteRepeatAction;
+use super::{App, AppError, CompactInfo, format_tool_counts};
+
+/// Turn summary information for structured logging (Issue #206).
+#[derive(Debug)]
+pub struct TurnSummary<'a> {
+    pub turn: u32,
+    pub max_turns: u32,
+    pub elapsed: std::time::Duration,
+    pub tokens_used: usize,
+    pub token_budget: usize,
+    pub tool_calls: usize,
+    pub tool_names: &'a [String],
+    pub files_modified: usize,
+    pub compact_info: Option<&'a CompactInfo>,
+}
+
+/// Log a turn summary using structured tracing.
+pub fn log_turn_summary(summary: &TurnSummary<'_>) {
+    let compact_str = match summary.compact_info {
+        None => "no".to_string(),
+        Some(info) => match &info.sidecar_model {
+            Some(model) => format!(
+                "sidecar({}, {}->{}msgs)",
+                model, info.before_messages, info.after_messages
+            ),
+            None => format!(
+                "rule-based({}->{}msgs)",
+                info.before_messages, info.after_messages
+            ),
+        },
+    };
+    let tool_summary = summarize_tool_names(summary.tool_names);
+    tracing::info!(
+        turn = summary.turn,
+        max_turns = summary.max_turns,
+        elapsed_s = format!("{:.1}", summary.elapsed.as_secs_f64()),
+        tokens = summary.tokens_used,
+        budget = summary.token_budget,
+        tool_calls = summary.tool_calls,
+        tools = %tool_summary,
+        files_modified = summary.files_modified,
+        compact = %compact_str,
+        "turn completed"
+    );
+}
+
+/// Summarize tool names by counting duplicates (e.g. `"file.read x3, file.edit"`).
+pub fn summarize_tool_names(names: &[String]) -> String {
+    let mut counts: HashMap<String, u32> = HashMap::new();
+    for name in names {
+        *counts.entry(name.clone()).or_insert(0) += 1;
+    }
+    format_tool_counts(counts.into_iter())
+}
 
 /// Maximum number of parallel threads for tool execution.
 const MAX_PARALLEL_THREADS: usize = 8;
@@ -132,6 +187,7 @@ fn execute_parallel_group_standalone(
                                 artifacts: Vec::new(),
                                 elapsed_ms: 0,
                                 diff_summary: None,
+                                edit_detail: None,
                             }
                         });
                         completed.fetch_add(1, Ordering::Relaxed);
@@ -162,6 +218,7 @@ fn execute_parallel_group_standalone(
                                 artifacts: Vec::new(),
                                 elapsed_ms: 0,
                                 diff_summary: None,
+                                edit_detail: None,
                             },
                         ));
                     }
@@ -213,6 +270,7 @@ impl App {
                     artifacts: Vec::new(),
                     elapsed_ms: 0,
                     diff_summary: None,
+                    edit_detail: None,
                 });
                 continue;
             }
@@ -342,6 +400,8 @@ impl App {
         self.phase_estimator.reset();
 
         for iteration in 0..max_iterations {
+            let iteration_started = std::time::Instant::now();
+
             // Check shutdown flag before tool execution
             if self.is_shutdown_requested() {
                 break;
@@ -447,14 +507,36 @@ impl App {
             );
 
             let (system_prompt, calibration_ratio) = self.prepare_turn_context();
-            let (request, _) = BasicAgentLoop::build_turn_request_calibrated(
+            let (mut request, used_tokens) = BasicAgentLoop::build_turn_request_calibrated(
                 self.effective_model().to_string(),
                 &self.session,
                 self.provider.capabilities.streaming && self.config.runtime.stream,
                 self.effective_context_window(),
                 &system_prompt,
                 calibration_ratio,
+                self.config.runtime.context_budget,
             );
+            request.max_output_tokens = self.config.runtime.max_output_tokens;
+
+            // Budget pressure WARN (Issue #206 D-2)
+            let token_budget = self.effective_token_budget();
+            if token_budget > 0 {
+                let usage_ratio = used_tokens as f64 / token_budget as f64;
+                if usage_ratio >= 0.9 {
+                    tracing::warn!(
+                        used = used_tokens,
+                        budget = token_budget,
+                        ratio = format!("{:.1}%", usage_ratio * 100.0),
+                        "budget pressure"
+                    );
+                }
+            }
+
+            // Collect tool names for this iteration's turn summary (before LLM call)
+            let turn_tool_names: Vec<String> =
+                results.iter().map(|r| r.tool_name.clone()).collect();
+            let turn_files_modified = results.iter().filter(|r| r.diff_summary.is_some()).count();
+            let turn_tool_count = results.len() + agent_results.len();
 
             let mut next_token_buffer = String::new();
             let mut first_token = true;
@@ -509,21 +591,39 @@ impl App {
             }
 
             // Parse the follow-up response (retry once on parse failure)
-            let next_structured =
-                match BasicAgentLoop::parse_structured_response(&next_token_buffer) {
-                    Ok(parsed) => parsed,
-                    Err(first_err) => {
-                        // LLMs occasionally produce malformed output; treat the
-                        // raw text as a plain final answer rather than failing the
-                        // entire turn.
-                        let trimmed = next_token_buffer.trim();
-                        if !trimmed.is_empty() {
-                            StructuredAssistantResponse::empty(trimmed.to_string())
-                        } else {
-                            return Err(AppError::ToolExecution(first_err));
-                        }
+            let next_structured = match BasicAgentLoop::parse_structured_response_with_registry(
+                &next_token_buffer,
+                &self.tools,
+            ) {
+                Ok(parsed) => parsed,
+                Err(first_err) => {
+                    // LLMs occasionally produce malformed output; treat the
+                    // raw text as a plain final answer rather than failing the
+                    // entire turn.
+                    let trimmed = next_token_buffer.trim();
+                    if !trimmed.is_empty() {
+                        StructuredAssistantResponse::empty(trimmed.to_string())
+                    } else {
+                        return Err(AppError::ToolExecution(first_err));
                     }
-                };
+                }
+            };
+
+            // Record turn stats AFTER the full iteration completes (Issue #206 CB-001)
+            self.session_stats.record_turn();
+            log_turn_summary(&TurnSummary {
+                turn: self.session_stats.total_turns,
+                max_turns: max_iterations as u32,
+                elapsed: iteration_started.elapsed(),
+                tokens_used: used_tokens,
+                token_budget,
+                tool_calls: turn_tool_count,
+                tool_names: &turn_tool_names,
+                files_modified: turn_files_modified,
+                compact_info: self.last_compact_info.as_ref(),
+            });
+            // Reset last_compact_info after it's been consumed by the turn summary
+            self.last_compact_info = None;
 
             // Issue #173: Update ANVIL_FINAL tracking from the new response
             if next_structured.anvil_final_detected {
@@ -638,6 +738,7 @@ impl App {
                         artifacts: Vec::new(),
                         elapsed_ms: 0,
                         diff_summary: None,
+                        edit_detail: None,
                     },
                 ));
                 continue;
@@ -736,6 +837,7 @@ impl App {
                 artifacts: Vec::new(),
                 elapsed_ms: 0,
                 diff_summary: None,
+                edit_detail: None,
             });
 
         // Remove checkpoint if tool execution failed.
@@ -770,6 +872,7 @@ impl App {
                 artifacts: Vec::new(),
                 elapsed_ms: 0,
                 diff_summary: None,
+                edit_detail: None,
             };
         };
 
@@ -796,6 +899,7 @@ impl App {
             artifacts: Vec::new(),
             elapsed_ms: started.elapsed().as_millis(),
             diff_summary: None,
+            edit_detail: None,
         }
     }
 
@@ -855,6 +959,7 @@ impl App {
                                     artifacts: Vec::new(),
                                     elapsed_ms: 0,
                                     diff_summary: None,
+                                    edit_detail: None,
                                 },
                             ));
                         }
@@ -917,6 +1022,7 @@ impl App {
                 artifacts: vec![],
                 elapsed_ms: 0,
                 diff_summary: None,
+                edit_detail: None,
             }),
             _ => None,
         };
@@ -1142,6 +1248,7 @@ impl App {
                     artifacts: vec![],
                     elapsed_ms: 0,
                     diff_summary: None,
+                    edit_detail: None,
                 };
                 self.record_tool_result(&transition_result);
                 results.push(transition_result);
@@ -1154,6 +1261,16 @@ impl App {
 
     /// Push a tool execution result into the session as a tool message.
     fn record_tool_result(&mut self, result: &ToolExecutionResult) {
+        // Session stats: record tool call (Issue #206 C-3)
+        self.session_stats.record_tool_call(&result.tool_name);
+
+        // Session stats: record file change line counts from diff_summary (Issue #206 C-3)
+        if let Some(ref diff) = result.diff_summary {
+            let (added, deleted) = super::count_diff_lines(diff);
+            self.session_stats.record_file_change(added, deleted);
+            self.session_stats.files_modified += 1;
+        }
+
         // Track tool usage for dynamic system prompt generation (Issue #73)
         self.session.used_tools.insert(result.tool_name.clone());
 
@@ -1203,6 +1320,12 @@ impl App {
                     match action {
                         crate::app::edit_fail_tracker::EditFallbackAction::Continue => {}
                         crate::app::edit_fail_tracker::EditFallbackAction::ReRead => {
+                            tracing::warn!(
+                                tool = "file.edit",
+                                path = %path,
+                                count = count,
+                                "repeated tool failure"
+                            );
                             edit_hint = Some(format!(
                                 "\n\n[Anvil hint] file.edit has failed {count} consecutive \
                                  times for '{path}'. Use file.read to get the current file \
@@ -1210,6 +1333,12 @@ impl App {
                             ));
                         }
                         crate::app::edit_fail_tracker::EditFallbackAction::WriteFallback => {
+                            tracing::warn!(
+                                tool = "file.edit",
+                                path = %path,
+                                count = count,
+                                "repeated tool failure - suggesting write fallback"
+                            );
                             self.prepare_write_fallback();
                             let max_lines = self.config.runtime.safe_write_max_lines;
                             let line_count = if max_lines > 0 {
@@ -1247,12 +1376,70 @@ impl App {
                 if let Some(artifact) = result.artifacts.first() {
                     let path_str = resolve_edit_tracker_path(artifact);
                     self.edit_fail_tracker.record_success(&path_str);
+                    self.write_repeat_tracker.reset_for_path(&path_str);
                 }
             }
         }
 
+        // Write repeat tracker: reset on file.read success for the same path
+        if result.tool_name == "file.read"
+            && result.status == ToolExecutionStatus::Completed
+            && let Some(artifact) = result.artifacts.first()
+        {
+            let path = resolve_edit_tracker_path(artifact);
+            self.write_repeat_tracker.reset_for_path(&path);
+        }
+
         // Write fail tracker: track consecutive file.write failures (Issue #161)
-        let write_hint = self.update_write_tracker(result);
+        let write_hint = self.update_write_trackers(result);
+
+        // Read repeat tracker: track repeated file.read calls (Issue #185)
+        let mut read_hint: Option<String> = None;
+        if result.tool_name == "file.read"
+            && result.status == ToolExecutionStatus::Completed
+            && let Some(path) = result.artifacts.first()
+        {
+            let action = self.read_repeat_tracker.record_read(path);
+            match action {
+                ReadRepeatAction::Warn(count) => {
+                    tracing::warn!(
+                        path = %path,
+                        count = count,
+                        "same file read repeatedly"
+                    );
+                    read_hint = Some(format!(
+                        "\n\n[Anvil hint] You have read {} {} times. \
+                         The file content is cached and unchanged — \
+                         refer to the content already in your context \
+                         instead of re-reading.",
+                        path, count
+                    ));
+                }
+                ReadRepeatAction::StrongWarn(count) => {
+                    tracing::warn!(
+                        path = %path,
+                        count = count,
+                        "same file read repeatedly (strong)"
+                    );
+                    read_hint = Some(format!(
+                        "\n\n[Anvil hint] You have read {} {} times, \
+                         wasting iterations. Refer to the content \
+                         already in your context instead of re-reading.",
+                        path, count
+                    ));
+                }
+                ReadRepeatAction::Continue => {}
+            }
+        }
+
+        // Reset read repeat tracker on any file-mutation success (Issue #185)
+        if is_file_tool
+            && result.status == ToolExecutionStatus::Completed
+            && let Some(raw_path) = result.artifacts.first()
+        {
+            let path = resolve_edit_tracker_path(raw_path);
+            self.read_repeat_tracker.reset(&path);
+        }
 
         // Working memory: track errors (Issue #130)
         if result.status == ToolExecutionStatus::Failed {
@@ -1279,6 +1466,10 @@ impl App {
         if let Some(hint) = write_hint {
             formatted.push_str(&hint);
         }
+        // Append read repeat hint if repeated reads detected (Issue #185)
+        if let Some(hint) = read_hint {
+            formatted.push_str(&hint);
+        }
         let mut msg = SessionMessage::new(MessageRole::Tool, &result.tool_name, formatted)
             .with_id(self.next_message_id("tool"));
         msg.is_error = is_error;
@@ -1291,8 +1482,9 @@ impl App {
         self.session.push_message(msg);
     }
 
-    /// Track consecutive file.write failures and return a hint if threshold reached.
-    fn update_write_tracker(&mut self, result: &ToolExecutionResult) -> Option<String> {
+    /// Track consecutive file.write failures and repeated successful writes,
+    /// returning a hint if either threshold is reached.
+    fn update_write_trackers(&mut self, result: &ToolExecutionResult) -> Option<String> {
         if result.tool_name != "file.write" {
             return None;
         }
@@ -1301,6 +1493,12 @@ impl App {
                 .filter(|p| self.write_fail_tracker.record_failure(p))
             {
                 let count = self.write_fail_tracker.failure_count(&path);
+                tracing::warn!(
+                    tool = "file.write",
+                    path = %path,
+                    count = count,
+                    "repeated write failure"
+                );
                 let safe_path = crate::session::sanitize_for_prompt_entry(&path);
                 return Some(format!(
                     "\n\n[Anvil hint] file.write has failed {count} consecutive \
@@ -1313,7 +1511,37 @@ impl App {
         } else if result.status == ToolExecutionStatus::Completed
             && let Some(artifact) = result.artifacts.first()
         {
-            self.write_fail_tracker.record_success(artifact);
+            let path = resolve_edit_tracker_path(artifact);
+            self.write_fail_tracker.record_success(&path);
+            let repeat_action = self.write_repeat_tracker.record_write(&path);
+            if matches!(
+                repeat_action,
+                WriteRepeatAction::Warn | WriteRepeatAction::StrongWarn
+            ) {
+                let count = self.write_repeat_tracker.write_count(&path);
+                tracing::warn!(
+                    path = %path,
+                    count = count,
+                    "same file written repeatedly"
+                );
+                let safe_path = crate::session::sanitize_for_prompt_entry(&path);
+                let detail = if repeat_action == WriteRepeatAction::StrongWarn {
+                    ". This appears to be a loop. Consider: \
+                     (1) Stop rewriting this file entirely, \
+                     (2) Use file.read to verify the current state, \
+                     (3) Use file.edit for targeted changes to specific sections."
+                } else {
+                    ". Consider: \
+                     (1) Use file.read to review the current content, \
+                     (2) Use file.edit to modify only the specific section \
+                     that needs changing, \
+                     (3) Avoid rewriting the entire file repeatedly."
+                };
+                return Some(format!(
+                    "\n\n[Anvil hint] file.write has been called {count} times \
+                     for '{safe_path}'{detail}"
+                ));
+            }
         }
         None
     }
@@ -1338,14 +1566,16 @@ impl App {
     ) -> Result<Vec<String>, AppError> {
         // Build request and call LLM for one more turn
         let (system_prompt, calibration_ratio) = self.prepare_turn_context();
-        let (request, _) = BasicAgentLoop::build_turn_request_calibrated(
+        let (mut request, _) = BasicAgentLoop::build_turn_request_calibrated(
             self.effective_model().to_string(),
             &self.session,
             self.provider.capabilities.streaming && self.config.runtime.stream,
             self.effective_context_window(),
             &system_prompt,
             calibration_ratio,
+            self.config.runtime.context_budget,
         );
+        request.max_output_tokens = self.config.runtime.max_output_tokens;
 
         let spinner = Spinner::start(
             format!("ANVIL_FINAL guard retry. model={}", self.effective_model()),
@@ -1385,7 +1615,10 @@ impl App {
         })?;
 
         // Parse the retry response
-        let retry_structured = match BasicAgentLoop::parse_structured_response(&token_buffer) {
+        let retry_structured = match BasicAgentLoop::parse_structured_response_with_registry(
+            &token_buffer,
+            &self.tools,
+        ) {
             Ok(parsed) => parsed,
             Err(_) => {
                 let trimmed = token_buffer.trim();
@@ -1455,8 +1688,9 @@ impl App {
             return Ok(None);
         };
 
-        let structured = BasicAgentLoop::parse_structured_response(assistant_message)
-            .map_err(AppError::ToolExecution)?;
+        let structured =
+            BasicAgentLoop::parse_structured_response_with_registry(assistant_message, &self.tools)
+                .map_err(AppError::ToolExecution)?;
         if structured.tool_calls.is_empty() {
             // ANVIL_FINAL guard: only activate when the message contains a
             // structured ANVIL_FINAL block (not plain-text Done messages).
@@ -1487,6 +1721,20 @@ impl App {
                     provider_client,
                 )?));
             }
+            // CB-002: Record turn stats for non-tool turns
+            self.session_stats.record_turn();
+            let token_budget = self.effective_token_budget();
+            log_turn_summary(&TurnSummary {
+                turn: self.session_stats.total_turns,
+                max_turns: self.config.runtime.max_agent_iterations as u32,
+                elapsed: std::time::Duration::from_millis(*elapsed_ms as u64),
+                tokens_used: 0,
+                token_budget,
+                tool_calls: 0,
+                tool_names: &[],
+                files_modified: 0,
+                compact_info: None,
+            });
             return Ok(None);
         }
 
@@ -1694,6 +1942,7 @@ fn build_failed_result(
         artifacts: Vec::new(),
         elapsed_ms: 0,
         diff_summary: None,
+        edit_detail: None,
     }
 }
 
@@ -1893,5 +2142,48 @@ mod trust_tests {
             extract_write_path_from_summary("file.edit: something in foo.rs. blah"),
             None
         );
+    }
+
+    // --- summarize_tool_names tests (Issue #206 B-3) ---
+
+    #[test]
+    fn summarize_tool_names_empty() {
+        let names: Vec<String> = vec![];
+        assert_eq!(summarize_tool_names(&names), "");
+    }
+
+    #[test]
+    fn summarize_tool_names_single() {
+        let names = vec!["file.read".to_string()];
+        assert_eq!(summarize_tool_names(&names), "file.read");
+    }
+
+    #[test]
+    fn summarize_tool_names_duplicates() {
+        let names = vec![
+            "file.read".to_string(),
+            "file.read".to_string(),
+            "file.edit".to_string(),
+            "file.read".to_string(),
+        ];
+        let result = summarize_tool_names(&names);
+        // file.read x3 should come first (higher count)
+        assert!(result.starts_with("file.read x3"));
+        assert!(result.contains("file.edit"));
+    }
+
+    #[test]
+    fn summarize_tool_names_all_unique() {
+        let names = vec![
+            "file.read".to_string(),
+            "file.edit".to_string(),
+            "shell.exec".to_string(),
+        ];
+        let result = summarize_tool_names(&names);
+        // All have count 1, no "x" suffix
+        assert!(!result.contains(" x"));
+        assert!(result.contains("file.read"));
+        assert!(result.contains("file.edit"));
+        assert!(result.contains("shell.exec"));
     }
 }

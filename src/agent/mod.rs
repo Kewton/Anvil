@@ -21,6 +21,8 @@ use crate::tooling::{ToolCallRequest, ToolInput, detect_image_mime};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::{HashMap, HashSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,8 +164,9 @@ impl BasicAgentLoop {
         stream: bool,
         context_window: u32,
         system_prompt: &str,
+        context_budget_override: Option<u32>,
     ) -> ProviderTurnRequest {
-        let token_budget = derive_context_budget(context_window);
+        let token_budget = derive_context_budget(context_window, context_budget_override);
         Self::build_turn_request_with_token_budget(
             model,
             session,
@@ -227,8 +230,9 @@ impl BasicAgentLoop {
         context_window: u32,
         system_prompt: &str,
         calibration_ratio: f64,
+        context_budget_override: Option<u32>,
     ) -> (ProviderTurnRequest, usize) {
-        let token_budget = derive_context_budget(context_window);
+        let token_budget = derive_context_budget(context_window, context_budget_override);
         build_turn_request_with_calibration(
             model,
             session,
@@ -247,8 +251,9 @@ impl BasicAgentLoop {
         context_window: u32,
         system_prompt_tokens: usize,
         calibration_ratio: f64,
+        context_budget_override: Option<u32>,
     ) -> (usize, usize) {
-        let token_budget = derive_context_budget(context_window);
+        let token_budget = derive_context_budget(context_window, context_budget_override);
         let budget_for_messages = token_budget
             .saturating_sub(system_prompt_tokens)
             .max(MINIMUM_MESSAGE_BUDGET);
@@ -273,6 +278,14 @@ impl BasicAgentLoop {
     }
 
     pub fn parse_structured_response(content: &str) -> Result<StructuredAssistantResponse, String> {
+        let empty = crate::tooling::ToolRegistry::new();
+        Self::parse_structured_response_with_registry(content, &empty)
+    }
+
+    pub fn parse_structured_response_with_registry(
+        content: &str,
+        registry: &crate::tooling::ToolRegistry,
+    ) -> Result<StructuredAssistantResponse, String> {
         let tool_blocks = extract_fenced_blocks(content, "ANVIL_TOOL");
 
         // ANVIL_FINALの位置を取得（カットオフポイント）
@@ -292,8 +305,11 @@ impl BasicAgentLoop {
             {
                 continue;
             }
-            tool_calls.push(parse_tool_call_block_multi_tier(&block)?);
+            tool_calls.push(parse_tool_call_block_multi_tier(&block, registry)?);
         }
+
+        // Issue #186: 同一ターン内の重複ツール呼び出しを排除し、ID衝突を解消
+        let tool_calls = dedup_tool_calls(tool_calls);
 
         let final_response = final_block
             .map(|block| block.trim().to_string())
@@ -318,15 +334,57 @@ impl BasicAgentLoop {
     }
 }
 
+/// Issue #186: 同一ターン内の重複ツール呼び出しを排除し、ID衝突を解消する。
+///
+/// 1. セマンティック重複排除: (tool_name, input) が同一のツール呼び出しは最初の出現のみ保持
+/// 2. ID衝突解消: 同一IDが複数存在する場合、2番目以降にサフィックスを付与
+fn dedup_tool_calls(tool_calls: Vec<ToolCallRequest>) -> Vec<ToolCallRequest> {
+    // Step 1: セマンティック重複排除
+    let mut seen_fingerprints: HashSet<u64> = HashSet::new();
+    let mut deduped: Vec<ToolCallRequest> = Vec::new();
+
+    for call in tool_calls {
+        let fp = tool_call_fingerprint(&call);
+        if seen_fingerprints.insert(fp) {
+            deduped.push(call);
+        }
+    }
+
+    // Step 2: ID衝突解消 — 同一IDが複数ある場合にリナンバリング
+    let mut id_counts: HashMap<String, usize> = HashMap::new();
+    for call in &mut deduped {
+        let count = id_counts.entry(call.tool_call_id.clone()).or_insert(0);
+        if *count > 0 {
+            call.tool_call_id = format!("{}_{}", call.tool_call_id, count);
+        }
+        *count += 1;
+    }
+
+    deduped
+}
+
+/// (tool_name, serialized input) のハッシュでセマンティック一致を判定
+fn tool_call_fingerprint(call: &ToolCallRequest) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    call.tool_name.hash(&mut hasher);
+    if let Ok(s) = serde_json::to_string(&call.input) {
+        s.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 /// Multi-tier tool call parser.
 ///
 /// Tier 1: Strict JSON (existing parse path)
 /// Tier 2: Tag-based (XML-like) format via tag_parser
 /// Tier 3: Repair fallback (existing repair path)
-fn parse_tool_call_block_multi_tier(block: &str) -> Result<ToolCallRequest, String> {
+fn parse_tool_call_block_multi_tier(
+    block: &str,
+    registry: &crate::tooling::ToolRegistry,
+) -> Result<ToolCallRequest, String> {
     // Tier 1: strict JSON
     if let Ok(value) = serde_json::from_str::<Value>(block) {
-        match parse_tool_call_value(&value) {
+        match parse_tool_call_value(&value, registry) {
             Ok(call) => return Ok(call),
             Err(json_err) => {
                 // JSON parsed but field extraction failed — this is a definitive error
@@ -352,7 +410,10 @@ fn parse_tool_call_block_multi_tier(block: &str) -> Result<ToolCallRequest, Stri
         .ok_or_else(|| "Failed to parse tool call in any format".to_string())
 }
 
-fn parse_tool_call_value(value: &Value) -> Result<ToolCallRequest, String> {
+fn parse_tool_call_value(
+    value: &Value,
+    registry: &crate::tooling::ToolRegistry,
+) -> Result<ToolCallRequest, String> {
     let tool_name = value
         .get("tool")
         .and_then(Value::as_str)
@@ -361,11 +422,24 @@ fn parse_tool_call_value(value: &Value) -> Result<ToolCallRequest, String> {
         .get("id")
         .and_then(Value::as_str)
         .unwrap_or("call_generated_001");
-    let input = ToolInput::from_json(tool_name, value)?;
+
+    // Try built-in tools first, then fall back to custom tools.
+    let (resolved_name, input) = match ToolInput::from_json(tool_name, value) {
+        Ok(input) => (tool_name.to_string(), input),
+        Err(e) => {
+            if let Some(tool_def) = registry.find_custom_tool(tool_name) {
+                let input = ToolInput::from_custom_tool(tool_def, value)?;
+                let display_name = crate::config::custom_tool_display_name(&tool_def.name);
+                (display_name, input)
+            } else {
+                return Err(e);
+            }
+        }
+    };
 
     Ok(ToolCallRequest::new(
         tool_call_id.to_string(),
-        tool_name.to_string(),
+        resolved_name,
         input,
     ))
 }
@@ -574,11 +648,14 @@ fn build_turn_request_with_calibration(
     )
 }
 
-fn derive_context_budget(context_window: u32) -> usize {
-    if let Ok(override_val) = std::env::var("ANVIL_CONTEXT_BUDGET")
-        && let Ok(budget) = override_val.parse::<usize>()
-    {
-        return budget;
+fn derive_context_budget(context_window: u32, context_budget_override: Option<u32>) -> usize {
+    if let Some(budget) = context_budget_override {
+        tracing::debug!(
+            budget = budget,
+            context_window = context_window,
+            "context budget from config override"
+        );
+        return budget as usize;
     }
     let quarter = (context_window / 4) as usize;
     let half = (context_window / 2) as usize;
@@ -1148,7 +1225,6 @@ fn extract_final_block_lenient(content: &str, label: &str) -> Option<String> {
 // --- MCP tool description generation ---
 
 use crate::mcp::McpToolInfo;
-use std::collections::HashMap;
 
 /// Maximum characters for MCP tool descriptions in the system prompt.
 /// [D3-009] Prevents system prompt bloat that compresses message budget.
@@ -1279,7 +1355,7 @@ mod tests {
         }
         // Large context window, small messages => no pruning
         let (pruned, _tokens) =
-            BasicAgentLoop::estimate_pruned_message_count(&session, 128_000, 100, 1.0);
+            BasicAgentLoop::estimate_pruned_message_count(&session, 128_000, 100, 1.0, None);
         assert_eq!(pruned, 0);
     }
 
@@ -1299,7 +1375,7 @@ mod tests {
         }
         // Very small context window to force pruning
         let (pruned, _tokens) =
-            BasicAgentLoop::estimate_pruned_message_count(&session, 512, 50, 1.0);
+            BasicAgentLoop::estimate_pruned_message_count(&session, 512, 50, 1.0, None);
         assert!(pruned > 0, "should prune some messages with tiny budget");
         assert!(pruned < 50, "should keep at least one message");
     }
@@ -1308,8 +1384,34 @@ mod tests {
     fn estimate_pruned_zero_for_empty_session() {
         let session = SessionRecord::new(std::path::PathBuf::from("/tmp/test"));
         let (pruned, tokens) =
-            BasicAgentLoop::estimate_pruned_message_count(&session, 128_000, 100, 1.0);
+            BasicAgentLoop::estimate_pruned_message_count(&session, 128_000, 100, 1.0, None);
         assert_eq!(pruned, 0);
         assert_eq!(tokens, 0);
+    }
+
+    #[test]
+    fn derive_context_budget_uses_override() {
+        // When context_budget_override is Some, it should be used directly
+        let budget = derive_context_budget(128_000, Some(4096));
+        assert_eq!(budget, 4096);
+    }
+
+    #[test]
+    fn derive_context_budget_falls_back_to_default() {
+        // When context_budget_override is None, derive from context_window
+        let budget = derive_context_budget(128_000, None);
+        let expected = (128_000u32 / 4) as usize; // quarter of context_window
+        assert_eq!(budget, expected);
+    }
+
+    #[test]
+    fn derive_context_budget_default_clamps_minimum() {
+        // context_window=2048: quarter=512, half=1024, clamp(256,1024) => 512
+        let budget = derive_context_budget(2048, None);
+        assert_eq!(budget, 512);
+
+        // context_window=512: quarter=128, half=256, clamp(256,256) => 256
+        let budget = derive_context_budget(512, None);
+        assert_eq!(budget, 256);
     }
 }

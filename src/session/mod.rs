@@ -401,11 +401,17 @@ impl SessionRecord {
     }
 
     /// Token-based compaction check.
-    /// Returns true when estimated tokens exceed context_window * ratio.
-    pub fn should_smart_compact(&self, context_window: u32) -> bool {
+    /// Returns true when estimated tokens exceed effective_limit * ratio.
+    /// When `context_budget` is set, uses `min(context_window, context_budget)`
+    /// as the effective limit so that compact triggers within the budget.
+    pub fn should_smart_compact(&self, context_window: u32, context_budget: Option<u32>) -> bool {
+        let effective_limit = match context_budget {
+            Some(budget) => context_window.min(budget),
+            None => context_window,
+        };
         self.smart_compact_threshold_ratio > 0.0
             && self.estimated_token_count()
-                > (context_window as f64 * self.smart_compact_threshold_ratio) as usize
+                > (effective_limit as f64 * self.smart_compact_threshold_ratio) as usize
     }
 
     /// Run auto-compaction if message count exceeds the threshold.
@@ -543,25 +549,96 @@ impl SessionRecord {
     }
 
     pub fn compact_history(&mut self, keep_recent: usize) -> bool {
+        self.compact_history_impl(keep_recent, None)
+    }
+
+    /// Compact history with an optional LLM-generated summary.
+    ///
+    /// When `llm_summary` is `Some`, the LLM text is used as the summary body
+    /// combined with extracted file targets. When `None`, falls back to the
+    /// existing rule-based summarization.
+    pub fn compact_history_with_llm_summary(
+        &mut self,
+        keep_recent: usize,
+        llm_summary: Option<String>,
+    ) -> bool {
+        self.compact_history_impl(keep_recent, llm_summary)
+    }
+
+    /// Generate summary text for the given messages using conversation context.
+    ///
+    /// Delegates to [`build_conversation_text_for_summary()`].
+    pub fn conversation_text_for_summary(
+        &self,
+        max_messages: usize,
+        max_chars_per_msg: usize,
+        max_total_chars: usize,
+    ) -> String {
+        build_conversation_text_for_summary(
+            &self.messages,
+            max_messages,
+            max_chars_per_msg,
+            max_total_chars,
+        )
+    }
+
+    fn compact_history_impl(&mut self, keep_recent: usize, llm_summary: Option<String>) -> bool {
         if self.messages.len() <= keep_recent {
             return false;
         }
 
-        let split_at = self.messages.len() - keep_recent;
+        let before_messages = self.messages.len();
+        let split_at = before_messages - keep_recent;
         tracing::debug!(
             compacted = split_at,
             kept = keep_recent,
+            before_messages = before_messages,
+            after_messages = keep_recent + 1, // +1 for the summary message
             "compacting session history"
         );
 
-        // Step 1: Replace large tool results with summaries
-        replace_tool_results_with_summaries(&mut self.messages[..split_at]);
+        // Extract file targets from compacted messages (used for both paths)
+        let file_targets = extract_file_targets(&self.messages[..split_at]);
 
-        // Step 2: Compute importance scores
-        let scores = compute_importance_scores(&self.messages, split_at);
+        /// Maximum number of file references to include in LLM summary.
+        const MAX_FILE_REFS_IN_SUMMARY: usize = 5;
 
-        // Step 3: Generate summary using scores
-        let summary = generate_compact_summary(&self.messages[..split_at], &scores);
+        /// Maximum character length for LLM-generated summary text (CB-003).
+        const MAX_LLM_SUMMARY_CHARS: usize = 2000;
+
+        let summary = if let Some(llm_text) = llm_summary {
+            // LLM summary path: combine LLM text with file references
+            // Truncate to MAX_LLM_SUMMARY_CHARS to bound memory usage (CB-003).
+            let truncated = if llm_text.len() > MAX_LLM_SUMMARY_CHARS {
+                let mut end = MAX_LLM_SUMMARY_CHARS;
+                // Avoid splitting a multi-byte character
+                while !llm_text.is_char_boundary(end) && end > 0 {
+                    end -= 1;
+                }
+                format!("{}...(truncated)", &llm_text[..end])
+            } else {
+                llm_text
+            };
+            let mut lines = vec!["[compacted session summary]".to_string()];
+            lines.push(truncated);
+            if !file_targets.is_empty() {
+                lines.push("- refs:".to_string());
+                for reference in file_targets.iter().take(MAX_FILE_REFS_IN_SUMMARY) {
+                    lines.push(format!("  - {reference}"));
+                }
+            }
+            lines.join("\n")
+        } else {
+            // Rule-based path: existing logic
+            // Step 1: Replace large tool results with summaries
+            replace_tool_results_with_summaries(&mut self.messages[..split_at]);
+
+            // Step 2: Compute importance scores
+            let scores = compute_importance_scores(&self.messages, split_at);
+
+            // Step 3: Generate summary using scores
+            generate_compact_summary(&self.messages[..split_at], &scores)
+        };
 
         // Step 4: Drain old messages and insert summary
         self.messages.drain(..split_at);
@@ -1180,6 +1257,51 @@ fn compact_preview(content: &str, max_chars: usize) -> String {
         let preview: String = chars[..max_chars.saturating_sub(3)].iter().collect();
         format!("{preview}...")
     }
+}
+
+/// Build a plain-text representation of session messages for LLM summarization.
+///
+/// Applies three limits to keep output bounded:
+/// - `max_messages`: only the most recent N messages are included
+/// - `max_chars_per_msg`: each message content is truncated (CJK-safe via `chars().take()`)
+/// - `max_total_chars`: the total output is capped at this character count
+pub fn build_conversation_text_for_summary(
+    messages: &[SessionMessage],
+    max_messages: usize,
+    max_chars_per_msg: usize,
+    max_total_chars: usize,
+) -> String {
+    let start = messages.len().saturating_sub(max_messages);
+    let mut result = String::new();
+    for msg in &messages[start..] {
+        let role = match msg.role {
+            MessageRole::System => "system",
+            MessageRole::User => "user",
+            MessageRole::Assistant => "assistant",
+            MessageRole::Tool => "tool",
+        };
+        let truncated: String = msg.content.chars().take(max_chars_per_msg).collect();
+        let line = format!("{role}: {truncated}\n");
+        if result.chars().count() + line.chars().count() > max_total_chars {
+            break;
+        }
+        result.push_str(&line);
+    }
+    result
+}
+
+/// Extract file-path-like references from compact target messages.
+///
+/// Uses `extract_reference_like_tokens()` on each message to find path-like
+/// tokens. Deduplicates and sorts the results.
+pub fn extract_file_targets(messages: &[SessionMessage]) -> Vec<String> {
+    let mut refs = Vec::new();
+    for msg in messages {
+        refs.extend(extract_reference_like_tokens(&msg.content));
+    }
+    refs.sort();
+    refs.dedup();
+    refs
 }
 
 fn extract_reference_like_tokens(content: &str) -> Vec<String> {

@@ -18,9 +18,10 @@ use std::sync::atomic::AtomicBool;
 // Re-export key types so existing `use crate::provider::*` continues to work.
 pub use ollama::{
     OllamaChatMessage, OllamaChatRequest, OllamaModelEntry, OllamaModelInfo, OllamaProviderClient,
-    fetch_context_length_from_ollama, fetch_model_info_from_ollama, fetch_model_list_from_ollama,
-    parse_context_length_from_show_response, parse_model_info_from_show_response,
-    parse_model_list_from_tags_response, resolve_ollama_model_alias,
+    OllamaRequestOptions, fetch_context_length_from_ollama, fetch_model_info_from_ollama,
+    fetch_model_list_from_ollama, parse_context_length_from_show_response,
+    parse_model_info_from_show_response, parse_model_list_from_tags_response,
+    resolve_ollama_model_alias,
 };
 pub use transport::{
     DEFAULT_HTTP_TIMEOUT_SECS, HttpResponse, HttpTransport, ReqwestHttpTransport, RetryConfig,
@@ -104,6 +105,10 @@ pub struct ProviderTurnRequest {
     pub model: String,
     pub messages: Vec<ProviderMessage>,
     pub stream: bool,
+    /// Maximum number of tokens the LLM may generate in this turn.
+    /// When set, providers translate this to their native limit parameter
+    /// (e.g. Ollama `num_predict`, OpenAI `max_tokens`).
+    pub max_output_tokens: Option<u32>,
 }
 
 impl ProviderTurnRequest {
@@ -112,6 +117,7 @@ impl ProviderTurnRequest {
             model,
             messages,
             stream,
+            max_output_tokens: None,
         }
     }
 }

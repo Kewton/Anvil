@@ -6,6 +6,16 @@
 use std::path::Path;
 use tracing_subscriber::Layer;
 
+/// Log output format for the file layer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LogFormat {
+    /// Human-readable text format (default).
+    #[default]
+    Text,
+    /// Machine-readable JSON format (for `jq` processing).
+    Json,
+}
+
 /// Opaque wrapper around the file-appender worker guard.
 ///
 /// Prevents callers from depending on `tracing-appender` directly.
@@ -18,7 +28,7 @@ pub struct LogGuard(#[allow(dead_code)] Option<tracing_appender::non_blocking::W
 /// Filter resolution:
 /// 1. `log_filter` is `Some` -> use that value as the `EnvFilter` directive
 /// 2. `debug_logging` is `true` -> use `"debug"`
-/// 3. Otherwise -> use `"warn"`
+/// 3. Otherwise -> use `"anvil=info,warn"`
 ///
 /// File layer: always writes to `logs_dir/anvil-{session_id}.log`.
 /// Stderr layer: enabled only when `debug_logging` is `true`.
@@ -30,6 +40,7 @@ pub fn init_tracing(
     debug_logging: bool,
     logs_dir: &Path,
     session_id: &str,
+    log_format: LogFormat,
 ) -> Option<LogGuard> {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
@@ -40,10 +51,22 @@ pub fn init_tracing(
 
     let file_filter = tracing_subscriber::EnvFilter::try_new(&directive)
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
-    let file_layer = tracing_subscriber::fmt::layer()
-        .with_writer(non_blocking)
-        .with_ansi(false)
-        .with_filter(file_filter);
+
+    // File layer: JSON or text format based on log_format (Issue #206 E-1)
+    let file_layer: Box<dyn Layer<_> + Send + Sync> = match log_format {
+        LogFormat::Text => Box::new(
+            tracing_subscriber::fmt::layer()
+                .with_writer(non_blocking)
+                .with_ansi(false)
+                .with_filter(file_filter),
+        ),
+        LogFormat::Json => Box::new(
+            tracing_subscriber::fmt::layer()
+                .with_writer(non_blocking)
+                .json()
+                .with_filter(file_filter),
+        ),
+    };
 
     let registry = tracing_subscriber::registry().with(file_layer);
 
@@ -68,7 +91,7 @@ fn resolve_filter_directive(log_filter: Option<&str>, debug_logging: bool) -> St
     } else if debug_logging {
         "debug".to_string()
     } else {
-        "warn".to_string()
+        "anvil=info,warn".to_string()
     }
 }
 
@@ -111,4 +134,49 @@ fn build_file_writer(
     }
 
     Some((non_blocking, guard))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_filter_directive_default_is_anvil_info_warn() {
+        let result = resolve_filter_directive(None, false);
+        assert_eq!(result, "anvil=info,warn");
+    }
+
+    #[test]
+    fn resolve_filter_directive_debug_mode() {
+        let result = resolve_filter_directive(None, true);
+        assert_eq!(result, "debug");
+    }
+
+    #[test]
+    fn resolve_filter_directive_explicit_filter() {
+        let result = resolve_filter_directive(Some("trace"), false);
+        assert_eq!(result, "trace");
+    }
+
+    #[test]
+    fn resolve_filter_directive_explicit_filter_overrides_debug() {
+        let result = resolve_filter_directive(Some("error"), true);
+        assert_eq!(result, "error");
+    }
+
+    #[test]
+    fn log_format_default_is_text() {
+        assert_eq!(LogFormat::default(), LogFormat::Text);
+    }
+
+    #[test]
+    fn log_format_variants_are_distinct() {
+        assert_ne!(LogFormat::Text, LogFormat::Json);
+    }
+
+    #[test]
+    fn log_format_debug_display() {
+        assert_eq!(format!("{:?}", LogFormat::Text), "Text");
+        assert_eq!(format!("{:?}", LogFormat::Json), "Json");
+    }
 }

@@ -82,14 +82,27 @@ pub fn render_provider_frame(
     config: &EffectiveConfig,
     provider: &crate::provider::ProviderRuntimeContext,
 ) -> String {
-    format!(
+    let mut output = format!(
         "[A] anvil > provider: {}\n  url: {}\n  model: {}\n  streaming: {}\n  tool-calling: {}",
         config.runtime.provider,
         config.runtime.provider_url,
         effective_model,
         provider.capabilities.streaming,
         provider.capabilities.tool_calling
-    )
+    );
+    // Show sidecar configuration when sidecar_model is set
+    if let Some(ref sidecar_model) = config.runtime.sidecar_model {
+        let sidecar_url = config
+            .runtime
+            .sidecar_provider_url
+            .as_deref()
+            .unwrap_or(crate::config::DEFAULT_OLLAMA_URL);
+        output.push_str(&format!(
+            "\n  sidecar model: {}\n  sidecar url: {}",
+            sidecar_model, sidecar_url
+        ));
+    }
+    output
 }
 
 /// Render the model list from Ollama.
