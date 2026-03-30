@@ -449,7 +449,7 @@ impl App {
             );
 
             let (system_prompt, calibration_ratio) = self.prepare_turn_context();
-            let (request, _) = BasicAgentLoop::build_turn_request_calibrated(
+            let (mut request, _) = BasicAgentLoop::build_turn_request_calibrated(
                 self.effective_model().to_string(),
                 &self.session,
                 self.provider.capabilities.streaming && self.config.runtime.stream,
@@ -458,6 +458,7 @@ impl App {
                 calibration_ratio,
                 self.config.runtime.context_budget,
             );
+            request.max_output_tokens = self.config.runtime.max_output_tokens;
 
             let mut next_token_buffer = String::new();
             let mut first_token = true;
@@ -1429,7 +1430,7 @@ impl App {
     ) -> Result<Vec<String>, AppError> {
         // Build request and call LLM for one more turn
         let (system_prompt, calibration_ratio) = self.prepare_turn_context();
-        let (request, _) = BasicAgentLoop::build_turn_request_calibrated(
+        let (mut request, _) = BasicAgentLoop::build_turn_request_calibrated(
             self.effective_model().to_string(),
             &self.session,
             self.provider.capabilities.streaming && self.config.runtime.stream,
@@ -1438,6 +1439,7 @@ impl App {
             calibration_ratio,
             self.config.runtime.context_budget,
         );
+        request.max_output_tokens = self.config.runtime.max_output_tokens;
 
         let spinner = Spinner::start(
             format!("ANVIL_FINAL guard retry. model={}", self.effective_model()),

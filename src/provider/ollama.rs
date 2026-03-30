@@ -32,6 +32,14 @@ pub struct OllamaChatMessage {
     pub images: Option<Vec<String>>,
 }
 
+/// Ollama request options (e.g. `num_predict` for output token limit).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct OllamaRequestOptions {
+    /// Maximum number of tokens to generate (maps to Ollama `num_predict`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num_predict: Option<u32>,
+}
+
 /// Wire format for an Ollama `/api/chat` request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OllamaChatRequest {
@@ -40,6 +48,8 @@ pub struct OllamaChatRequest {
     pub stream: bool,
     #[serde(default)]
     pub think: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub options: Option<OllamaRequestOptions>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,6 +146,9 @@ impl<T> OllamaProviderClient<T> {
                 .collect(),
             stream: request.stream,
             think: false,
+            options: request.max_output_tokens.map(|n| OllamaRequestOptions {
+                num_predict: Some(n),
+            }),
         }
     }
 
@@ -250,6 +263,7 @@ impl<T: HttpTransport> OllamaProviderClient<T> {
             ],
             stream: false,
             think: false,
+            options: None,
         };
 
         let body = serde_json::to_vec(&request).ok()?;

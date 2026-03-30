@@ -150,6 +150,9 @@ pub struct RuntimeConfig {
     pub ui_language: Option<String>,
     /// Maximum total tool calls per agentic turn (Issue #172).
     pub max_tool_calls: usize,
+    /// Maximum output tokens per LLM turn (Issue #204).
+    /// Translated to provider-specific limits (Ollama `num_predict`, OpenAI `max_tokens`).
+    pub max_output_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -324,6 +327,7 @@ impl EffectiveConfig {
                 read_repeat_strong_warn_threshold: 6,
                 ui_language: None,
                 max_tool_calls: DEFAULT_MAX_TOOL_CALLS,
+                max_output_tokens: Some(DEFAULT_MAX_OUTPUT_TOKENS),
             },
             mode: ModeConfig {
                 prompt_source: PromptSource::Interactive,
@@ -555,6 +559,11 @@ impl EffectiveConfig {
         // Max tool calls (Issue #172)
         if let Some(v) = cli.max_tool_calls {
             self.runtime.max_tool_calls = v;
+        }
+
+        // Max output tokens (Issue #204)
+        if let Some(v) = cli.max_output_tokens {
+            self.runtime.max_output_tokens = if v == 0 { None } else { Some(v) };
         }
 
         // --session flag: override session file path
@@ -799,6 +808,12 @@ impl EffectiveConfig {
                     self.runtime.max_tool_calls = value
                         .parse()
                         .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                }
+                "max_output_tokens" | "ANVIL_MAX_OUTPUT_TOKENS" => {
+                    let v: u32 = value
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                    self.runtime.max_output_tokens = if v == 0 { None } else { Some(v) };
                 }
                 _ => {}
             }
@@ -1096,6 +1111,8 @@ const MAX_AGENT_ITERATIONS: usize = 100;
 pub const DEFAULT_MAX_TOOL_CALLS: usize = 200;
 /// Hard upper limit for max_tool_calls (Issue #172).
 pub const MAX_TOOL_CALLS_LIMIT: usize = 10000;
+/// Default maximum output tokens per LLM turn (Issue #204).
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 16384;
 
 /// Sensitive keys and their recommended environment variable names.
 /// To add a new sensitive key, simply add an entry to this array.

@@ -120,6 +120,10 @@ pub struct CliArgs {
     /// Maximum total tool calls per agentic turn [default: 200]
     #[arg(long = "max-tool-calls")]
     pub max_tool_calls: Option<usize>,
+
+    /// Maximum output tokens per LLM turn [default: 16384]
+    #[arg(long = "max-output-tokens")]
+    pub max_output_tokens: Option<u32>,
 }
 
 impl CliArgs {

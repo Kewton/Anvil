@@ -1044,7 +1044,7 @@ impl App {
         self.begin_live_turn_state()?;
 
         let (system_prompt, calibration_ratio) = self.prepare_turn_context();
-        let (request, estimated_prompt_tokens) = BasicAgentLoop::build_turn_request_calibrated(
+        let (mut request, estimated_prompt_tokens) = BasicAgentLoop::build_turn_request_calibrated(
             self.effective_model().to_string(),
             &self.session,
             self.provider.capabilities.streaming && self.config.runtime.stream,
@@ -1053,6 +1053,7 @@ impl App {
             calibration_ratio,
             self.config.runtime.context_budget,
         );
+        request.max_output_tokens = self.config.runtime.max_output_tokens;
         self.last_estimated_prompt_tokens = Some(estimated_prompt_tokens);
 
         // Phase 1: Collect events from provider with spinner + streaming output.
