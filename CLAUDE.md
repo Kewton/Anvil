@@ -105,8 +105,8 @@ src/
 │   ├── tag_parser.rs    # タグベースツール呼び出しパーサー（多層プロトコル対応）
 │   └── tag_spec.rs      # ツールタグ仕様テーブル（TOOL_TAG_SPECS）
 ├── app/
-│   ├── mod.rs           # アプリケーションオーケストレータ
-│   ├── agentic.rs       # agenticツール実行ループ（ANVIL_FINALガード・再試行ロジック含む）
+│   ├── mod.rs           # アプリケーションオーケストレータ（SessionStats・CompactInfo・セッションサマリー含む）
+│   ├── agentic.rs       # agenticツール実行ループ（ANVIL_FINALガード・再試行ロジック・ターンサマリー・異常検出WARN含む）
 │   ├── cli.rs           # CLI入力ループ
 │   ├── context.rs       # コンテキスト注入（@file展開・サンドボックス検証）
 │   ├── edit_fail_tracker.rs # 連続file.edit失敗の検出・回復ヒント注入
@@ -129,7 +129,7 @@ src/
 │   └── skills.rs        # SKILL.mdベースのスキルシステム
 ├── hooks/
 │   └── mod.rs           # ライフサイクルフック（HooksConfig, HookRunner, HooksEngine）
-├── logging.rs           # 構造化ロギング（tracing初期化）
+├── logging.rs           # 構造化ロギング（tracing初期化・LogFormat対応・デフォルトフィルタ anvil=info,warn）
 ├── mcp/
 │   ├── mod.rs           # MCPクライアント（McpManager, McpConnection, McpError）
 │   └── transport.rs     # STDIOトランスポート（McpTransport trait, StdioTransport）
@@ -144,7 +144,7 @@ src/
 ├── spinner.rs           # スピナーUI
 ├── state/mod.rs         # 状態マシン
 ├── tooling/
-│   ├── mod.rs           # ツール実行・検証・CheckpointStack（undo用チェックポイント管理）
+│   ├── mod.rs           # ツール実行・検証・CheckpointStack（undo用チェックポイント管理）・EditFallbackStage・file.edit詳細ログ
 │   ├── diff.rs          # 差分プレビュー生成（file.write/file.edit承認時）
 │   ├── file_cache.rs    # ファイル読み取りキャッシュ（FileReadCache: LRUエビクション・sandbox境界検証）
 │   └── shell_policy.rs  # ShellPolicy分類（ReadOnly/BuildTest/General）・offline用ネットワークコマンド検出

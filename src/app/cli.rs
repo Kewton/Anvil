@@ -53,6 +53,9 @@ pub fn run_session_loop<C: ProviderClient, R: BufRead, W: Write>(
         }
     }
 
+    // Log session summary (Issue #206 CB-003)
+    app.log_session_summary();
+
     Ok(())
 }
 
@@ -130,6 +133,7 @@ fn run_with_config(mut config: EffectiveConfig) -> Result<(), AppError> {
         config.mode.debug_logging,
         &config.paths.logs_dir,
         config.session_key(),
+        config.mode.log_format,
     );
 
     tracing::info!(
@@ -231,6 +235,9 @@ fn run_non_interactive<C: ProviderClient>(
                 print!("{}", response);
             }
 
+            // Log session summary (Issue #206 CB-003)
+            app.log_session_summary();
+
             // Run PostSession hook (DR3-004: after run_live_turn success)
             app.run_post_session_hook();
 
@@ -250,6 +257,8 @@ fn run_non_interactive<C: ProviderClient>(
             Ok(())
         }
         Err(err) => {
+            // Log session summary (Issue #206 CB-003)
+            app.log_session_summary();
             // DR3-004: Run PostSession hook on error paths after run_live_turn
             app.run_post_session_hook();
             Err(err)
@@ -311,6 +320,9 @@ fn run_interactive_loop<C: ProviderClient>(
             }
         }
     }
+
+    // Log session summary (Issue #206 CB-003)
+    app.log_session_summary();
 
     // Run PostSession hook before saving
     app.run_post_session_hook();

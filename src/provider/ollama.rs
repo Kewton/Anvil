@@ -224,8 +224,8 @@ const MAX_SIDECAR_RESPONSE_SIZE: usize = 65_536;
 
 /// Summarization prompt sent to the sidecar model.
 const SIDECAR_SUMMARIZE_PROMPT: &str = "\
-You are a concise summarizer. Respond ONLY with bullet points.\n\
-Summarize this conversation so far in 3-5 bullet points, focusing on:\n\
+You are a concise summarizer. Respond ONLY with bullet points.
+Summarize this conversation so far in 3-5 bullet points, focusing on:
 what was discussed, what files were modified, what decisions were made.";
 
 impl<T: HttpTransport> OllamaProviderClient<T> {
@@ -342,6 +342,15 @@ impl<T: HttpTransport> OllamaProviderClient<T> {
 
         if content.is_none() {
             tracing::warn!("sidecar_summarize response missing message.content");
+        }
+
+        // Log sidecar success with model and summary length (Issue #206 D-1)
+        if let Some(ref text) = content {
+            tracing::info!(
+                model = %model,
+                summary_len = text.len(),
+                "sidecar_summarize success"
+            );
         }
 
         content

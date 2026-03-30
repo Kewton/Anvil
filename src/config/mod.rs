@@ -168,6 +168,8 @@ pub struct ModeConfig {
     /// Trust mode: auto-approve built-in tool execution.
     /// Set only via `--trust` CLI flag (not from config file deserialization).
     pub trust_all: bool,
+    /// Log format for the file layer (Issue #206).
+    pub log_format: crate::logging::LogFormat,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -339,6 +341,7 @@ impl EffectiveConfig {
                 log_filter: None,
                 offline: false,
                 trust_all: false,
+                log_format: crate::logging::LogFormat::default(),
             },
             paths: PathConfig {
                 mcp_config_file: cwd.join(".anvil").join("mcp.json"),
@@ -564,6 +567,11 @@ impl EffectiveConfig {
         // Max output tokens (Issue #204)
         if let Some(v) = cli.max_output_tokens {
             self.runtime.max_output_tokens = if v == 0 { None } else { Some(v) };
+        }
+
+        // Log format (Issue #206)
+        if let Some(ref v) = cli.log_format {
+            self.mode.log_format = parse_log_format(v)?;
         }
 
         // --session flag: override session file path
@@ -1319,6 +1327,16 @@ fn parse_bool(value: &str) -> bool {
         value.trim().to_ascii_lowercase().as_str(),
         "1" | "true" | "yes" | "on"
     )
+}
+
+fn parse_log_format(value: &str) -> Result<crate::logging::LogFormat, ConfigError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "text" => Ok(crate::logging::LogFormat::Text),
+        "json" => Ok(crate::logging::LogFormat::Json),
+        other => Err(ConfigError::ValidationError(format!(
+            "invalid log format: '{other}' (expected 'text' or 'json')"
+        ))),
+    }
 }
 
 fn parse_reasoning_visibility(value: &str) -> Result<ReasoningVisibility, ConfigError> {

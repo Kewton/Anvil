@@ -203,6 +203,7 @@ fn validated_tool_call_builds_typed_execution_request_and_result() {
         artifacts: vec!["src/app/mod.rs".to_string()],
         elapsed_ms: 12,
         diff_summary: None,
+        edit_detail: None,
     };
 
     assert_eq!(execution.spec.kind, ToolKind::FileRead);
@@ -376,6 +377,7 @@ fn tool_execution_result_can_bridge_into_console_tool_log_view() {
         artifacts: vec!["src/app/mod.rs".to_string()],
         elapsed_ms: 12,
         diff_summary: None,
+        edit_detail: None,
     };
     let log = result.to_tool_log_view();
 
@@ -2289,6 +2291,7 @@ fn format_tool_result_message_image_payload() {
         artifacts: Vec::new(),
         elapsed_ms: 10,
         diff_summary: None,
+        edit_detail: None,
     };
     let msg = format_tool_result_message(&result, 10000);
     assert!(msg.contains("file.read"));
@@ -2316,6 +2319,7 @@ fn format_tool_result_message_truncates_multibyte_safely() {
         artifacts: Vec::new(),
         elapsed_ms: 5,
         diff_summary: None,
+        edit_detail: None,
     };
 
     // Must not panic — the old byte-slicing implementation would panic here.
@@ -2339,6 +2343,7 @@ fn format_tool_result_message_ascii_truncation_still_works() {
         artifacts: Vec::new(),
         elapsed_ms: 5,
         diff_summary: None,
+        edit_detail: None,
     };
 
     let msg = format_tool_result_message(&result, 100);
@@ -2365,6 +2370,7 @@ fn format_tool_result_message_boundary_char_3byte() {
         artifacts: Vec::new(),
         elapsed_ms: 5,
         diff_summary: None,
+        edit_detail: None,
     };
 
     let msg = format_tool_result_message(&result, 100);
@@ -2448,6 +2454,7 @@ fn format_tool_result_message_success_head_priority() {
         artifacts: Vec::new(),
         elapsed_ms: 5,
         diff_summary: None,
+        edit_detail: None,
     };
 
     let msg = format_tool_result_message(&result, 100);
@@ -2474,6 +2481,7 @@ fn format_tool_result_message_failure_tail_priority() {
         artifacts: Vec::new(),
         elapsed_ms: 5,
         diff_summary: None,
+        edit_detail: None,
     };
 
     let msg = format_tool_result_message(&result, 100);
@@ -2500,6 +2508,7 @@ fn format_tool_result_message_interrupted_tail_priority() {
         artifacts: Vec::new(),
         elapsed_ms: 5,
         diff_summary: None,
+        edit_detail: None,
     };
 
     let msg = format_tool_result_message(&result, 100);
@@ -6144,4 +6153,68 @@ fn file_search_repair_root_explicit() {
         }
         _ => panic!("expected FileSearch"),
     }
+}
+
+// =============================================================================
+// Issue #206: EditFallbackStage / EditResultDetail tests
+// =============================================================================
+
+#[test]
+fn edit_fallback_stage_debug_and_clone() {
+    use anvil::tooling::{EditFallbackStage, EditResultDetail};
+
+    let stage = EditFallbackStage::Strict;
+    let cloned = stage.clone();
+    assert_eq!(stage, cloned);
+    assert_eq!(format!("{:?}", stage), "Strict");
+
+    let detail = EditResultDetail {
+        fallback_stage: EditFallbackStage::TrailingWs,
+    };
+    let cloned_detail = detail.clone();
+    assert_eq!(detail.fallback_stage, cloned_detail.fallback_stage);
+    assert_eq!(format!("{:?}", detail.fallback_stage), "TrailingWs");
+
+    let anchor = EditFallbackStage::Anchor;
+    assert_eq!(format!("{:?}", anchor), "Anchor");
+}
+
+#[test]
+fn tool_execution_result_edit_detail_default_none() {
+    let result = ToolExecutionResult {
+        tool_call_id: "test".to_string(),
+        tool_name: "file.read".to_string(),
+        status: ToolExecutionStatus::Completed,
+        summary: "read ok".to_string(),
+        payload: ToolExecutionPayload::Text("content".to_string()),
+        artifacts: vec![],
+        elapsed_ms: 0,
+        diff_summary: None,
+        edit_detail: None,
+    };
+    assert!(result.edit_detail.is_none());
+}
+
+#[test]
+fn tool_execution_result_edit_detail_with_stage() {
+    use anvil::tooling::{EditFallbackStage, EditResultDetail};
+
+    let result = ToolExecutionResult {
+        tool_call_id: "edit1".to_string(),
+        tool_name: "file.edit".to_string(),
+        status: ToolExecutionStatus::Completed,
+        summary: "edited ok".to_string(),
+        payload: ToolExecutionPayload::Text("done".to_string()),
+        artifacts: vec!["/tmp/test.rs".to_string()],
+        elapsed_ms: 10,
+        diff_summary: Some("+added\n-removed".to_string()),
+        edit_detail: Some(EditResultDetail {
+            fallback_stage: EditFallbackStage::Anchor,
+        }),
+    };
+    assert!(result.edit_detail.is_some());
+    assert_eq!(
+        result.edit_detail.unwrap().fallback_stage,
+        EditFallbackStage::Anchor
+    );
 }

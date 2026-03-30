@@ -625,6 +625,23 @@ pub enum ToolExecutionPayload {
     },
 }
 
+/// file.edit fallback stage indicating which matching strategy succeeded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditFallbackStage {
+    /// Level 1: exact string match.
+    Strict,
+    /// Level 2: trailing whitespace normalized match.
+    TrailingWs,
+    /// Level 3: anchor-based (indent-normalized) match.
+    Anchor,
+}
+
+/// file.edit-specific result detail (ISP: single field).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditResultDetail {
+    pub fallback_stage: EditFallbackStage,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolExecutionResult {
     pub tool_call_id: String,
@@ -637,6 +654,8 @@ pub struct ToolExecutionResult {
     /// Compact diff summary for file-mutating tools (file.write/file.edit/file.edit_anchor).
     /// `None` for non-mutating tools, MCP tools, and subagent results.
     pub diff_summary: Option<String>,
+    /// file.edit fallback stage detail (Issue #206). `None` for non-edit tools.
+    pub edit_detail: Option<EditResultDetail>,
 }
 
 impl ToolExecutionResult {
@@ -1232,6 +1251,7 @@ impl LocalToolExecutor {
         request: ToolExecutionRequest,
     ) -> Result<ToolExecutionResult, ToolRuntimeError> {
         let tool_name = &request.spec.name;
+        let is_file_edit = tool_name == "file.edit";
         tracing::info!(tool = %tool_name, "executing tool");
         let started = Instant::now();
         let result = match request.input {
@@ -1276,6 +1296,10 @@ impl LocalToolExecutor {
                 unreachable!("agent tools are dispatched in agentic.rs")
             }
         };
+        // file.edit-specific detail log (Issue #206)
+        if is_file_edit && let Ok(ref res) = result {
+            log_file_edit_detail(res);
+        }
         tracing::info!(
             tool = %tool_name,
             elapsed_ms = %started.elapsed().as_millis(),
@@ -1602,7 +1626,12 @@ impl LocalToolExecutor {
         // Level 1: strict replace
         let original_err =
             match self.execute_file_edit(request, path, old_string, new_string, started) {
-                Ok(result) => return Ok(result),
+                Ok(mut result) => {
+                    result.edit_detail = Some(EditResultDetail {
+                        fallback_stage: EditFallbackStage::Strict,
+                    });
+                    return Ok(result);
+                }
                 Err(err) if !err.is_edit_not_found() => return Err(err),
                 Err(err) => err,
             };
@@ -1611,6 +1640,9 @@ impl LocalToolExecutor {
         if let Ok(mut result) =
             self.execute_file_edit_trailing_ws(request, path, old_string, new_string, started)
         {
+            result.edit_detail = Some(EditResultDetail {
+                fallback_stage: EditFallbackStage::TrailingWs,
+            });
             result.summary = format!("{} (trailing-ws fallback)", result.summary);
             return Ok(result);
         }
@@ -1622,6 +1654,9 @@ impl LocalToolExecutor {
         };
         match self.execute_file_edit_anchor(request, path, &params, started) {
             Ok(mut result) => {
+                result.edit_detail = Some(EditResultDetail {
+                    fallback_stage: EditFallbackStage::Anchor,
+                });
                 result.summary = format!("{} (anchor fallback)", result.summary);
                 Ok(result)
             }
@@ -1905,6 +1940,7 @@ impl LocalToolExecutor {
                     artifacts: Vec::new(),
                     elapsed_ms: started.elapsed().as_millis(),
                     diff_summary: None,
+                    edit_detail: None,
                 });
             }
             match child.try_wait() {
@@ -1941,6 +1977,7 @@ impl LocalToolExecutor {
             artifacts: Vec::new(),
             elapsed_ms: started.elapsed().as_millis(),
             diff_summary: None,
+            edit_detail: None,
         })
     }
 
@@ -2130,6 +2167,7 @@ impl LocalToolExecutor {
                 artifacts: Vec::new(),
                 elapsed_ms: started.elapsed().as_millis(),
                 diff_summary: None,
+                edit_detail: None,
             });
         }
 
@@ -2414,6 +2452,40 @@ pub(crate) fn resolve_sandbox_path(root: &Path, raw: &str) -> Result<PathBuf, To
     Ok(joined)
 }
 
+/// Log file.edit success detail using structured tracing (Issue #206).
+///
+/// Only called on the `Ok` path from `execute_tool`, so the result is always
+/// a successful execution. The `edit_detail` field may still be `None` for
+/// `file.edit_anchor` (direct anchor path, not via fallback chain).
+fn log_file_edit_detail(result: &ToolExecutionResult) {
+    let Some(ref detail) = result.edit_detail else {
+        return;
+    };
+    let raw_path = result
+        .artifacts
+        .first()
+        .map(|s| s.as_str())
+        .unwrap_or("unknown");
+    let path = sanitize_path_for_display(raw_path);
+    let stage_str = match detail.fallback_stage {
+        EditFallbackStage::Strict => "strict",
+        EditFallbackStage::TrailingWs => "trailing-ws fallback",
+        EditFallbackStage::Anchor => "anchor fallback",
+    };
+    let (added, deleted) = result
+        .diff_summary
+        .as_deref()
+        .map(crate::app::count_diff_lines)
+        .unwrap_or((0, 0));
+    tracing::info!(
+        path = %path,
+        lines_added = added,
+        lines_deleted = deleted,
+        fallback = stage_str,
+        "file.edit success"
+    );
+}
+
 /// Build a [`ToolExecutionResult`] with `Completed` status.
 ///
 /// Centralises the boilerplate shared by every successful execution path.
@@ -2444,6 +2516,7 @@ fn build_completed_result_with_diff(
         artifacts,
         elapsed_ms: started.elapsed().as_millis(),
         diff_summary,
+        edit_detail: None,
     }
 }
 
