@@ -519,7 +519,7 @@ impl App {
             request.max_output_tokens = self.config.runtime.max_output_tokens;
 
             // Budget pressure WARN (Issue #206 D-2)
-            let token_budget = self.effective_context_window() as usize;
+            let token_budget = self.effective_token_budget();
             if token_budget > 0 {
                 let usage_ratio = used_tokens as f64 / token_budget as f64;
                 if usage_ratio >= 0.9 {
@@ -1723,7 +1723,7 @@ impl App {
             }
             // CB-002: Record turn stats for non-tool turns
             self.session_stats.record_turn();
-            let token_budget = self.effective_context_window() as usize;
+            let token_budget = self.effective_token_budget();
             log_turn_summary(&TurnSummary {
                 turn: self.session_stats.total_turns,
                 max_turns: self.config.runtime.max_agent_iterations as u32,
