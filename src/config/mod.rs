@@ -92,6 +92,7 @@ pub struct RuntimeConfig {
     pub provider_url: String,
     pub model: String,
     pub sidecar_model: Option<String>,
+    pub sidecar_provider_url: Option<String>,
     pub api_key: Option<String>,
     pub context_window: u32,
     pub context_budget: Option<u32>,
@@ -289,9 +290,10 @@ impl EffectiveConfig {
         Self {
             runtime: RuntimeConfig {
                 provider: "ollama".to_string(),
-                provider_url: "http://127.0.0.1:11434".to_string(),
+                provider_url: DEFAULT_OLLAMA_URL.to_string(),
                 model: "local-default".to_string(),
                 sidecar_model: None,
+                sidecar_provider_url: None,
                 api_key: None,
                 context_window: 200_000,
                 context_budget: None,
@@ -398,6 +400,7 @@ impl EffectiveConfig {
             "ANVIL_MODEL",
             "ANVIL_PROVIDER_URL",
             "ANVIL_SIDECAR_MODEL",
+            "ANVIL_SIDECAR_PROVIDER_URL",
             "ANVIL_API_KEY",
             "ANVIL_CONTEXT_WINDOW",
             "ANVIL_CONTEXT_BUDGET",
@@ -470,6 +473,7 @@ impl EffectiveConfig {
             self.runtime.provider_url = v.clone();
         }
         if let Some(ref v) = cli.sidecar_model {
+            validate_sidecar_model(v)?;
             self.runtime.sidecar_model = Some(v.clone());
         }
 
@@ -570,11 +574,20 @@ impl EffectiveConfig {
                 "provider_url" | "ANVIL_PROVIDER_URL" => self.runtime.provider_url = value.clone(),
                 "model" | "ANVIL_MODEL" => self.runtime.model = value.clone(),
                 "sidecar_model" | "ANVIL_SIDECAR_MODEL" => {
-                    self.runtime.sidecar_model = if value.is_empty() {
-                        None
+                    if value.is_empty() {
+                        self.runtime.sidecar_model = None;
                     } else {
-                        Some(value.clone())
-                    };
+                        validate_sidecar_model(value)?;
+                        self.runtime.sidecar_model = Some(value.clone());
+                    }
+                }
+                "sidecar_provider_url" | "ANVIL_SIDECAR_PROVIDER_URL" => {
+                    if value.is_empty() {
+                        self.runtime.sidecar_provider_url = None;
+                    } else {
+                        validate_sidecar_provider_url(value)?;
+                        self.runtime.sidecar_provider_url = Some(value.clone());
+                    }
                 }
                 "api_key" | "ANVIL_API_KEY" => {
                     self.runtime.api_key = if value.is_empty() {
@@ -1028,6 +1041,9 @@ impl EffectiveConfig {
 
 const MAX_PROJECT_INSTRUCTIONS_CHARS: usize = 4000;
 const MIN_CONTEXT_WINDOW: u32 = 1000;
+
+/// Default Ollama server URL used as fallback for sidecar provider.
+pub const DEFAULT_OLLAMA_URL: &str = "http://127.0.0.1:11434";
 const DEFAULT_MAX_AGENT_ITERATIONS: usize = 30;
 const DEFAULT_SUBAGENT_MAX_ITERATIONS: u32 = 20;
 const DEFAULT_SUBAGENT_TIMEOUT_SECS: u64 = 120;
@@ -1038,6 +1054,42 @@ const MIN_AGENT_ITERATIONS: usize = 1;
 /// Validate that a deletion ratio value is finite and within [0.0, 1.0].
 fn is_valid_deletion_ratio(v: f64) -> bool {
     v.is_finite() && (0.0..=1.0).contains(&v)
+}
+
+/// Validate sidecar_provider_url: must start with http:// or https://.
+fn validate_sidecar_provider_url(url: &str) -> Result<(), ConfigError> {
+    if url.starts_with("http://") || url.starts_with("https://") {
+        Ok(())
+    } else {
+        Err(ConfigError::ValidationError(format!(
+            "sidecar_provider_url must start with http:// or https://, got: {url}"
+        )))
+    }
+}
+
+/// Maximum length for sidecar model names (DR4-002).
+const MAX_SIDECAR_MODEL_NAME_LEN: usize = 256;
+
+/// Validate sidecar model name (DR4-002).
+///
+/// Length limit: 256 characters.
+/// Allowed characters: alphanumeric, `-`, `_`, `.`, `:`, `/`, space.
+fn validate_sidecar_model(model: &str) -> Result<(), ConfigError> {
+    if model.len() > MAX_SIDECAR_MODEL_NAME_LEN {
+        return Err(ConfigError::ValidationError(format!(
+            "sidecar_model must be {MAX_SIDECAR_MODEL_NAME_LEN} characters or less, got: {} chars",
+            model.len()
+        )));
+    }
+    if !model
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "-_.:/ ".contains(c))
+    {
+        return Err(ConfigError::ValidationError(format!(
+            "sidecar_model contains invalid characters: {model}"
+        )));
+    }
+    Ok(())
 }
 const MAX_AGENT_ITERATIONS: usize = 100;
 /// Default maximum total tool calls per agentic turn (Issue #172).
@@ -1267,6 +1319,7 @@ impl std::fmt::Debug for RuntimeConfig {
             .field("provider_url", &self.provider_url)
             .field("model", &self.model)
             .field("sidecar_model", &self.sidecar_model)
+            .field("sidecar_provider_url", &self.sidecar_provider_url)
             .field("api_key", &"[REDACTED]")
             .field("context_window", &self.context_window)
             .field("context_budget", &self.context_budget)

@@ -198,11 +198,22 @@ pub fn resolve_ollama_model_alias(requested: &str, available: &[String]) -> Stri
 impl Default for OllamaProviderClient {
     fn default() -> Self {
         Self {
-            base_url: "http://127.0.0.1:11434".to_string(),
+            base_url: crate::config::DEFAULT_OLLAMA_URL.to_string(),
             transport: RetryTransport::new(ReqwestHttpTransport::new()),
         }
     }
 }
+
+/// Timeout in seconds for sidecar LLM summarization requests.
+const SIDECAR_TIMEOUT_SECS: u64 = 30;
+/// Maximum response body size for sidecar summarization (64 KiB).
+const MAX_SIDECAR_RESPONSE_SIZE: usize = 65_536;
+
+/// Summarization prompt sent to the sidecar model.
+const SIDECAR_SUMMARIZE_PROMPT: &str = "\
+You are a concise summarizer. Respond ONLY with bullet points.\n\
+Summarize this conversation so far in 3-5 bullet points, focusing on:\n\
+what was discussed, what files were modified, what decisions were made.";
 
 impl<T: HttpTransport> OllamaProviderClient<T> {
     /// Check connectivity to the Ollama server by requesting `/api/tags`.
@@ -213,6 +224,113 @@ impl<T: HttpTransport> OllamaProviderClient<T> {
     pub fn health_check(&self) -> Result<(), ProviderTurnError> {
         let url = format!("{}/api/tags", self.base_url.trim_end_matches('/'));
         self.transport.get(&url).map(|_| ())
+    }
+
+    /// Generate a conversation summary using a sidecar model.
+    ///
+    /// Sends the conversation text to the Ollama `/api/chat` endpoint with
+    /// a dedicated 30-second timeout. Returns `None` on any failure (timeout,
+    /// network error, parse error) so callers can fall back to rule-based
+    /// summarization.
+    pub fn sidecar_summarize(&self, model: &str, conversation_text: &str) -> Option<String> {
+        let url = format!("{}/api/chat", self.base_url.trim_end_matches('/'));
+        let request = OllamaChatRequest {
+            model: model.to_string(),
+            messages: vec![
+                OllamaChatMessage {
+                    role: "system".to_string(),
+                    content: SIDECAR_SUMMARIZE_PROMPT.to_string(),
+                    images: None,
+                },
+                OllamaChatMessage {
+                    role: "user".to_string(),
+                    content: conversation_text.to_string(),
+                    images: None,
+                },
+            ],
+            stream: false,
+            think: false,
+        };
+
+        let body = serde_json::to_vec(&request).ok()?;
+
+        // Use a dedicated HTTP client with 30s timeout (not self.transport).
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(SIDECAR_TIMEOUT_SECS))
+            .build()
+            .ok()?;
+
+        let response = match client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .body(body)
+            .send()
+        {
+            Ok(resp) => resp,
+            Err(err) => {
+                tracing::warn!(
+                    "sidecar_summarize request failed: {}",
+                    sanitize_error_message(&err.to_string())
+                );
+                return None;
+            }
+        };
+
+        if !response.status().is_success() {
+            tracing::warn!(
+                status = %response.status(),
+                "sidecar_summarize received non-success status"
+            );
+            return None;
+        }
+
+        // Read response body with size limit using take() to avoid
+        // allocating memory for oversized responses (CB-001).
+        let body_bytes = {
+            use std::io::Read;
+            let limit = MAX_SIDECAR_RESPONSE_SIZE as u64;
+            // Read up to limit + 1 bytes so we can detect overflow.
+            let mut buf = Vec::new();
+            match response.take(limit + 1).read_to_end(&mut buf) {
+                Ok(_) => {
+                    if buf.len() > MAX_SIDECAR_RESPONSE_SIZE {
+                        tracing::warn!(
+                            limit = MAX_SIDECAR_RESPONSE_SIZE,
+                            "sidecar_summarize response exceeds size limit"
+                        );
+                        return None;
+                    }
+                    buf
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "sidecar_summarize failed to read response: {}",
+                        sanitize_error_message(&err.to_string())
+                    );
+                    return None;
+                }
+            }
+        };
+
+        let parsed: Value = match serde_json::from_slice(&body_bytes) {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::warn!("sidecar_summarize failed to parse response JSON: {err}");
+                return None;
+            }
+        };
+
+        let content = parsed
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .map(|s| s.to_string());
+
+        if content.is_none() {
+            tracing::warn!("sidecar_summarize response missing message.content");
+        }
+
+        content
     }
 }
 
