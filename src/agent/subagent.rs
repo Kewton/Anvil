@@ -237,6 +237,7 @@ impl SubAgentResult {
             artifacts: Vec::new(),
             elapsed_ms: 0,
             diff_summary: None,
+            edit_detail: None,
         }
     }
 }
@@ -287,6 +288,7 @@ impl SubAgentError {
             artifacts: Vec::new(),
             elapsed_ms: 0,
             diff_summary: None,
+            edit_detail: None,
         }
     }
 }
@@ -599,6 +601,7 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
                     artifacts: Vec::new(),
                     elapsed_ms: 0,
                     diff_summary: None,
+                    edit_detail: None,
                 });
 
             // Record tool result in the sub-agent session

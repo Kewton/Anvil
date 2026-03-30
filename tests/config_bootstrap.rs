@@ -1252,3 +1252,21 @@ fn config_sidecar_model_validation_invalid_chars() {
         "sidecar_model with invalid chars should be rejected"
     );
 }
+
+// =============================================================================
+// Issue #206: LogFormat / --log-format tests
+// =============================================================================
+
+#[test]
+fn log_format_default_is_text() {
+    use anvil::logging::LogFormat;
+    let format: LogFormat = LogFormat::default();
+    assert_eq!(format, LogFormat::Text);
+}
+
+#[test]
+fn mode_config_default_log_format_is_text() {
+    use anvil::logging::LogFormat;
+    let config = EffectiveConfig::load().expect("config should load");
+    assert_eq!(config.mode.log_format, LogFormat::Text);
+}

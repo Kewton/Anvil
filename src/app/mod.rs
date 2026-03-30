@@ -18,6 +18,9 @@ pub mod render;
 pub(crate) mod write_fail_tracker;
 pub(crate) mod write_repeat_tracker;
 
+use std::collections::HashMap;
+use std::time::Instant;
+
 use crate::agent::BasicAgentLoop;
 use crate::agent::{AgentEvent, AgentRuntime, PendingTurnState, ProjectLanguage, PromptTier};
 use crate::config::EffectiveConfig;
@@ -114,6 +117,98 @@ impl ContextWarningTracker {
     }
 }
 
+/// Shared formatter for tool call counts (DRY: used by both `summarize_tool_names` and `SessionStats::tool_calls_summary`).
+///
+/// Produces a string like `"file.read x3, file.edit x2, shell.exec"` sorted by count descending.
+pub fn format_tool_counts(counts: impl Iterator<Item = (String, u32)>) -> String {
+    let mut entries: Vec<_> = counts.collect();
+    entries.sort_by(|a, b| b.1.cmp(&a.1));
+    entries
+        .iter()
+        .map(|(name, count)| {
+            if *count > 1 {
+                format!("{} x{}", name, count)
+            } else {
+                name.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Session statistics tracker for session-end summary reporting.
+#[derive(Debug, Default)]
+pub struct SessionStats {
+    pub total_turns: u32,
+    pub session_start: Option<Instant>,
+    pub tool_calls: HashMap<String, u32>,
+    pub files_modified: u32,
+    pub lines_added: u32,
+    pub lines_deleted: u32,
+    pub compact_count: u32,
+    pub sidecar_count: u32,
+}
+
+impl SessionStats {
+    pub fn new() -> Self {
+        Self {
+            session_start: Some(Instant::now()),
+            ..Default::default()
+        }
+    }
+
+    pub fn record_tool_call(&mut self, tool_name: &str) {
+        *self.tool_calls.entry(tool_name.to_string()).or_insert(0) += 1;
+    }
+
+    pub fn record_file_change(&mut self, added: u32, deleted: u32) {
+        self.lines_added += added;
+        self.lines_deleted += deleted;
+    }
+
+    pub fn record_turn(&mut self) {
+        self.total_turns += 1;
+    }
+
+    pub fn record_compact(&mut self, sidecar: bool) {
+        self.compact_count += 1;
+        if sidecar {
+            self.sidecar_count += 1;
+        }
+    }
+
+    pub fn total_tool_calls(&self) -> u32 {
+        self.tool_calls.values().sum()
+    }
+
+    /// Format tool call counts summary (e.g. `"file.read x18, file.edit x12"`).
+    pub fn tool_calls_summary(&self) -> String {
+        format_tool_counts(self.tool_calls.iter().map(|(k, v)| (k.clone(), *v)))
+    }
+}
+
+/// Extract added/deleted line counts from a unified diff string.
+pub fn count_diff_lines(diff: &str) -> (u32, u32) {
+    let mut added = 0u32;
+    let mut deleted = 0u32;
+    for line in diff.lines() {
+        if line.starts_with('+') && !line.starts_with("+++") {
+            added += 1;
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            deleted += 1;
+        }
+    }
+    (added, deleted)
+}
+
+/// Compact operation metadata for turn summary reporting.
+#[derive(Debug, Clone)]
+pub struct CompactInfo {
+    pub sidecar_model: Option<String>,
+    pub before_messages: usize,
+    pub after_messages: usize,
+}
+
 /// Central application state.
 pub struct App {
     config: EffectiveConfig,
@@ -169,6 +264,10 @@ pub struct App {
     write_repeat_tracker: write_repeat_tracker::WriteRepeatTracker,
     /// File read cache: reduces redundant file.read calls within a session.
     file_read_cache: Arc<Mutex<crate::tooling::file_cache::FileReadCache>>,
+    /// Session statistics for end-of-session summary (Issue #206).
+    session_stats: SessionStats,
+    /// Last compact operation info for turn summary reporting (Issue #206).
+    last_compact_info: Option<CompactInfo>,
 }
 
 /// Whether the session loop should continue or exit.
@@ -490,6 +589,8 @@ impl App {
             ),
             write_repeat_tracker: write_repeat_tracker::WriteRepeatTracker::new(3, 4),
             file_read_cache,
+            session_stats: SessionStats::new(),
+            last_compact_info: None,
         })
     }
 
@@ -722,6 +823,30 @@ impl App {
         let _ = self.flush_session();
     }
 
+    /// Log session-level summary (Issue #206 CB-003).
+    ///
+    /// Should be called once when the session actually ends (interactive exit
+    /// or non-interactive completion), not per-turn.
+    pub(crate) fn log_session_summary(&self) {
+        let session_elapsed = self
+            .session_stats
+            .session_start
+            .map(|s| s.elapsed())
+            .unwrap_or_default();
+        tracing::info!(
+            total_turns = self.session_stats.total_turns,
+            total_tool_calls = self.session_stats.total_tool_calls(),
+            tools = %self.session_stats.tool_calls_summary(),
+            files_modified = self.session_stats.files_modified,
+            lines_added = self.session_stats.lines_added,
+            lines_deleted = self.session_stats.lines_deleted,
+            compact_count = self.session_stats.compact_count,
+            sidecar_count = self.session_stats.sidecar_count,
+            elapsed_s = format!("{:.1}", session_elapsed.as_secs_f64()),
+            "session completed"
+        );
+    }
+
     /// Run PostSession hook (DR2-005, DR2-007 facade method).
     ///
     /// Builds PostSessionEvent from config and session, then delegates to
@@ -779,6 +904,9 @@ impl App {
 
         // Sidecar LLM summarization (Issue #195)
         let llm_summary = self.try_sidecar_summarize();
+        let sidecar_used = llm_summary.is_some();
+
+        let before_messages = self.session.messages.len();
 
         let compacted = self
             .session
@@ -786,6 +914,19 @@ impl App {
 
         // Reset context warning tracker after successful compaction (auto/manual)
         if compacted {
+            // CB-004: Record compact stats and CompactInfo
+            let after_messages = self.session.messages.len();
+            self.session_stats.record_compact(sidecar_used);
+            self.last_compact_info = Some(CompactInfo {
+                sidecar_model: if sidecar_used {
+                    self.config.runtime.sidecar_model.clone()
+                } else {
+                    None
+                },
+                before_messages,
+                after_messages,
+            });
+
             let usage = ContextUsageView {
                 estimated_tokens: self.session.estimated_token_count(),
                 max_tokens: self.effective_context_window(),
@@ -2405,5 +2546,131 @@ mod tests {
             params.is_some(),
             "compute_compact_params should trigger when message count exceeds threshold"
         );
+    }
+
+    // --- SessionStats tests (Issue #206 B-1) ---
+
+    #[test]
+    fn session_stats_new_has_start_time() {
+        let stats = SessionStats::new();
+        assert!(stats.session_start.is_some());
+        assert_eq!(stats.total_turns, 0);
+        assert!(stats.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn session_stats_record_tool_call() {
+        let mut stats = SessionStats::new();
+        stats.record_tool_call("file.read");
+        stats.record_tool_call("file.read");
+        stats.record_tool_call("file.edit");
+        assert_eq!(stats.tool_calls["file.read"], 2);
+        assert_eq!(stats.tool_calls["file.edit"], 1);
+        assert_eq!(stats.total_tool_calls(), 3);
+    }
+
+    #[test]
+    fn session_stats_record_file_change() {
+        let mut stats = SessionStats::new();
+        stats.record_file_change(10, 3);
+        stats.record_file_change(5, 2);
+        assert_eq!(stats.lines_added, 15);
+        assert_eq!(stats.lines_deleted, 5);
+    }
+
+    #[test]
+    fn session_stats_record_turn() {
+        let mut stats = SessionStats::new();
+        stats.record_turn();
+        stats.record_turn();
+        assert_eq!(stats.total_turns, 2);
+    }
+
+    #[test]
+    fn session_stats_record_compact() {
+        let mut stats = SessionStats::new();
+        stats.record_compact(false);
+        stats.record_compact(true);
+        stats.record_compact(true);
+        assert_eq!(stats.compact_count, 3);
+        assert_eq!(stats.sidecar_count, 2);
+    }
+
+    #[test]
+    fn session_stats_tool_calls_summary() {
+        let mut stats = SessionStats::new();
+        stats.record_tool_call("file.read");
+        stats.record_tool_call("file.read");
+        stats.record_tool_call("file.read");
+        stats.record_tool_call("file.edit");
+        let summary = stats.tool_calls_summary();
+        // file.read has higher count, should come first
+        assert!(summary.starts_with("file.read x3"));
+        assert!(summary.contains("file.edit"));
+    }
+
+    // --- count_diff_lines tests (Issue #206 B-1) ---
+
+    #[test]
+    fn count_diff_lines_basic() {
+        let diff = "\
+--- a/foo.rs
++++ b/foo.rs
+@@ -1,3 +1,4 @@
+ unchanged
+-removed line
++added line 1
++added line 2
+";
+        let (added, deleted) = count_diff_lines(diff);
+        assert_eq!(added, 2);
+        assert_eq!(deleted, 1);
+    }
+
+    #[test]
+    fn count_diff_lines_empty() {
+        let (added, deleted) = count_diff_lines("");
+        assert_eq!(added, 0);
+        assert_eq!(deleted, 0);
+    }
+
+    #[test]
+    fn count_diff_lines_no_changes() {
+        let diff = "\
+--- a/foo.rs
++++ b/foo.rs
+@@ -1,2 +1,2 @@
+ same line
+ another same line
+";
+        let (added, deleted) = count_diff_lines(diff);
+        assert_eq!(added, 0);
+        assert_eq!(deleted, 0);
+    }
+
+    // --- format_tool_counts tests (Issue #206 B-1) ---
+
+    #[test]
+    fn format_tool_counts_multiple() {
+        let counts = vec![
+            ("file.read".to_string(), 3u32),
+            ("file.edit".to_string(), 1),
+        ];
+        let result = format_tool_counts(counts.into_iter());
+        assert_eq!(result, "file.read x3, file.edit");
+    }
+
+    #[test]
+    fn format_tool_counts_empty() {
+        let counts: Vec<(String, u32)> = vec![];
+        let result = format_tool_counts(counts.into_iter());
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn format_tool_counts_single() {
+        let counts = vec![("shell.exec".to_string(), 5u32)];
+        let result = format_tool_counts(counts.into_iter());
+        assert_eq!(result, "shell.exec x5");
     }
 }

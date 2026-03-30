@@ -587,10 +587,13 @@ impl SessionRecord {
             return false;
         }
 
-        let split_at = self.messages.len() - keep_recent;
+        let before_messages = self.messages.len();
+        let split_at = before_messages - keep_recent;
         tracing::debug!(
             compacted = split_at,
             kept = keep_recent,
+            before_messages = before_messages,
+            after_messages = keep_recent + 1, // +1 for the summary message
             "compacting session history"
         );
 
