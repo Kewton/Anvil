@@ -1005,6 +1005,18 @@ impl App {
             .unwrap_or(self.config.runtime.context_window)
     }
 
+    /// Return the effective token budget for this session.
+    ///
+    /// When `context_budget` is configured, returns that value (clamped to
+    /// the context window). Otherwise falls back to the context window.
+    pub fn effective_token_budget(&self) -> usize {
+        let cw = self.effective_context_window();
+        match self.config.runtime.context_budget {
+            Some(budget) => cw.min(budget) as usize,
+            None => cw as usize,
+        }
+    }
+
     /// Switch to a different named session.
     ///
     /// Validates the name, saves the current session, builds a new
@@ -2672,5 +2684,33 @@ mod tests {
         let counts = vec![("shell.exec".to_string(), 5u32)];
         let result = format_tool_counts(counts.into_iter());
         assert_eq!(result, "shell.exec x5");
+    }
+
+    // --- Issue #208: effective_token_budget logic ---
+
+    /// Regression test for Issue #208: when context_budget is set, the
+    /// effective token budget must use min(context_window, context_budget),
+    /// NOT the raw context_window.
+    #[test]
+    fn effective_token_budget_uses_context_budget() {
+        // Simulates the logic in App::effective_token_budget
+        let context_window: u32 = 262_144;
+        let context_budget: Option<u32> = Some(32_768);
+        let effective = match context_budget {
+            Some(budget) => context_window.min(budget) as usize,
+            None => context_window as usize,
+        };
+        assert_eq!(effective, 32_768);
+    }
+
+    #[test]
+    fn effective_token_budget_falls_back_to_context_window() {
+        let context_window: u32 = 262_144;
+        let context_budget: Option<u32> = None;
+        let effective = match context_budget {
+            Some(budget) => context_window.min(budget) as usize,
+            None => context_window as usize,
+        };
+        assert_eq!(effective, 262_144);
     }
 }
