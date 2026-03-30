@@ -401,11 +401,17 @@ impl SessionRecord {
     }
 
     /// Token-based compaction check.
-    /// Returns true when estimated tokens exceed context_window * ratio.
-    pub fn should_smart_compact(&self, context_window: u32) -> bool {
+    /// Returns true when estimated tokens exceed effective_limit * ratio.
+    /// When `context_budget` is set, uses `min(context_window, context_budget)`
+    /// as the effective limit so that compact triggers within the budget.
+    pub fn should_smart_compact(&self, context_window: u32, context_budget: Option<u32>) -> bool {
+        let effective_limit = match context_budget {
+            Some(budget) => context_window.min(budget),
+            None => context_window,
+        };
         self.smart_compact_threshold_ratio > 0.0
             && self.estimated_token_count()
-                > (context_window as f64 * self.smart_compact_threshold_ratio) as usize
+                > (effective_limit as f64 * self.smart_compact_threshold_ratio) as usize
     }
 
     /// Run auto-compaction if message count exceeds the threshold.
