@@ -755,3 +755,67 @@ fn help_frame_includes_undo_command() {
         "help should show undo description"
     );
 }
+
+/// Regression test for Issue #202: non-interactive mode (--exec-file, --exec,
+/// --oneshot) must still run auto-compact via flush_session so that sidecar
+/// LLM summarization can keep context within budget.
+#[test]
+fn non_interactive_mode_runs_auto_compact_on_flush() {
+    let root = common::unique_test_dir("cli_noninteractive_compact");
+    let mut config = common::build_config_in(root);
+    // Simulate non-interactive mode (e.g. --exec-file)
+    config.mode.interactive = false;
+    // Set a very low compact threshold so compaction triggers with few messages
+    let compact_threshold = 10;
+    config.runtime.auto_compact_threshold = compact_threshold;
+
+    let provider_ctx = anvil::provider::ProviderRuntimeContext::bootstrap(&config)
+        .expect("provider should bootstrap");
+    let mut app = anvil::app::App::new(
+        config,
+        provider_ctx,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("app should init");
+
+    let tui = Tui::new();
+
+    // Add enough messages to exceed the threshold
+    for i in 0..(compact_threshold + 5) {
+        app.record_user_input(format!("msg_u_{i:03}"), format!("user content {i}"))
+            .expect("record user");
+        app.record_assistant_output(format!("msg_a_{i:03}"), format!("assistant content {i}"))
+            .expect("record assistant");
+    }
+
+    let msg_count_before = app.session().messages.len();
+    assert!(
+        msg_count_before > compact_threshold,
+        "messages should exceed compact threshold before flush"
+    );
+
+    // Run a live turn which triggers flush_session internally
+    let provider = RecordingProvider {
+        seen_requests: Rc::new(RefCell::new(Vec::new())),
+        events: vec![ProviderEvent::Agent(AgentEvent::Done {
+            status: "Done".to_string(),
+            assistant_message: "done".to_string(),
+            completion_summary: "done".to_string(),
+            saved_status: "saved".to_string(),
+            tool_logs: Vec::new(),
+            elapsed_ms: 0,
+            inference_performance: None,
+        })],
+    };
+
+    let _output = app
+        .handle_cli_line("trigger compact", &provider, &tui)
+        .expect("turn should complete");
+
+    let msg_count_after = app.session().messages.len();
+    assert!(
+        msg_count_after < msg_count_before,
+        "auto-compact should have reduced message count in non-interactive mode \
+         (before={msg_count_before}, after={msg_count_after})"
+    );
+}

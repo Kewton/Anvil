@@ -1396,12 +1396,15 @@ impl App {
 
     /// Flush session to disk if the dirty flag is set.
     /// Also runs deferred auto-compaction before writing.
-    /// In non-interactive mode, skip disk persistence entirely.
+    /// In non-interactive mode, skip disk persistence but still run auto-compact.
     fn flush_session(&mut self) -> Result<(), AppError> {
+        // Auto-compact must run regardless of interactive mode (Issue #202).
+        // Non-interactive sessions (--exec-file, --exec, --oneshot) also need
+        // sidecar-LLM summarization to keep context within budget.
+        self.compact_with_hooks("auto");
         if !self.config.mode.interactive {
             return Ok(());
         }
-        self.compact_with_hooks("auto");
         if self.session.dirty {
             self.session_store.save(&self.session)?;
             self.session.clear_dirty();
@@ -2375,5 +2378,31 @@ mod tests {
         assert!(!tracker.warned_critical);
         // Warning flag should remain since 85% >= 80%
         assert!(tracker.warned_warning);
+    }
+
+    /// Regression test for Issue #202: compute_compact_params must return
+    /// Some when token/message thresholds are exceeded, regardless of
+    /// interactive mode. The fix ensures flush_session calls
+    /// compact_with_hooks before the non-interactive early return.
+    #[test]
+    fn compute_compact_params_triggers_when_budget_exceeded() {
+        use crate::session::SessionRecord;
+        use std::path::PathBuf;
+
+        let mut session = SessionRecord::new(PathBuf::from("/tmp/issue202"));
+        // Push enough messages to exceed message-count threshold (default = 64)
+        for i in 0..70 {
+            session.push_message(crate::session::SessionMessage::new(
+                crate::session::MessageRole::User,
+                format!("msg_{i:03}"),
+                format!("content {i}"),
+            ));
+        }
+        // With default auto_compact_threshold (64), 70 messages should trigger
+        let params = compute_compact_params(&session, 128_000, None);
+        assert!(
+            params.is_some(),
+            "compute_compact_params should trigger when message count exceeds threshold"
+        );
     }
 }
