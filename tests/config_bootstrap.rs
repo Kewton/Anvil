@@ -1152,3 +1152,103 @@ fn issue187_read_repeat_invalid_value_rejected() {
     let result = config.apply_overrides_for_test(&file_values, &HashMap::new(), &HashMap::new());
     assert!(result.is_err());
 }
+
+// ── Issue #195: sidecar_provider_url config tests ────────────────────────
+
+#[test]
+fn config_sidecar_provider_url_default() {
+    let config = EffectiveConfig::default_for_test().unwrap();
+    assert!(
+        config.runtime.sidecar_provider_url.is_none(),
+        "sidecar_provider_url should default to None"
+    );
+}
+
+#[test]
+fn config_sidecar_provider_url_env_override() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let mut env_values = HashMap::new();
+    env_values.insert(
+        "ANVIL_SIDECAR_PROVIDER_URL".to_string(),
+        "http://192.168.1.100:11434".to_string(),
+    );
+    config
+        .apply_overrides_for_test(&HashMap::new(), &env_values, &HashMap::new())
+        .expect("should apply env override");
+    assert_eq!(
+        config.runtime.sidecar_provider_url.as_deref(),
+        Some("http://192.168.1.100:11434")
+    );
+}
+
+#[test]
+fn config_sidecar_provider_url_file_override() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let mut file_values = HashMap::new();
+    file_values.insert(
+        "sidecar_provider_url".to_string(),
+        "https://sidecar.example.com".to_string(),
+    );
+    config
+        .apply_overrides_for_test(&file_values, &HashMap::new(), &HashMap::new())
+        .expect("should apply file override");
+    assert_eq!(
+        config.runtime.sidecar_provider_url.as_deref(),
+        Some("https://sidecar.example.com")
+    );
+}
+
+#[test]
+fn config_sidecar_provider_url_validation() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let mut env_values = HashMap::new();
+    // Invalid URL (no http/https prefix) should be rejected
+    env_values.insert(
+        "ANVIL_SIDECAR_PROVIDER_URL".to_string(),
+        "ftp://invalid.com".to_string(),
+    );
+    let result = config.apply_overrides_for_test(&HashMap::new(), &env_values, &HashMap::new());
+    assert!(
+        result.is_err(),
+        "sidecar_provider_url without http/https should be rejected"
+    );
+}
+
+#[test]
+fn config_sidecar_model_validation_valid() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let mut env_values = HashMap::new();
+    env_values.insert("ANVIL_SIDECAR_MODEL".to_string(), "qwen2.5:3b".to_string());
+    config
+        .apply_overrides_for_test(&HashMap::new(), &env_values, &HashMap::new())
+        .expect("valid sidecar_model should be accepted");
+    assert_eq!(config.runtime.sidecar_model.as_deref(), Some("qwen2.5:3b"));
+}
+
+#[test]
+fn config_sidecar_model_validation_too_long() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let mut env_values = HashMap::new();
+    let long_name = "a".repeat(257);
+    env_values.insert("ANVIL_SIDECAR_MODEL".to_string(), long_name);
+    let result = config.apply_overrides_for_test(&HashMap::new(), &env_values, &HashMap::new());
+    assert!(
+        result.is_err(),
+        "sidecar_model exceeding 256 chars should be rejected"
+    );
+}
+
+#[test]
+fn config_sidecar_model_validation_invalid_chars() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let mut env_values = HashMap::new();
+    env_values.insert(
+        "ANVIL_SIDECAR_MODEL".to_string(),
+        "model;drop table".to_string(),
+    );
+    let result = config.apply_overrides_for_test(&HashMap::new(), &env_values, &HashMap::new());
+    assert!(
+        result.is_err(),
+        "sidecar_model with invalid chars should be rejected"
+    );
+}

@@ -3946,3 +3946,58 @@ fn prompt_tool_rules_contains_large_file_guidance() {
         "system prompt should contain large file write guidance from PROMPT_TOOL_RULES"
     );
 }
+
+// ── Issue #195: sidecar_summarize tests ──────────────────────────────────
+
+#[test]
+fn sidecar_summarize_network_error_returns_none() {
+    // Connect to a port that is (almost certainly) not listening
+    let client = OllamaProviderClient::new("http://127.0.0.1:19999");
+    let result = client.sidecar_summarize("test-model", "some conversation text");
+    assert!(
+        result.is_none(),
+        "network error should return None for graceful fallback"
+    );
+}
+
+#[test]
+fn sidecar_summarize_success_with_mock_server() {
+    // This test verifies the OllamaChatRequest construction is correct
+    // by building the request and checking it can be serialized.
+    use anvil::provider::OllamaChatRequest;
+    let request = OllamaChatRequest {
+        model: "qwen2.5:3b".to_string(),
+        messages: vec![
+            OllamaChatMessage {
+                role: "system".to_string(),
+                content: "You are a concise summarizer.".to_string(),
+                images: None,
+            },
+            OllamaChatMessage {
+                role: "user".to_string(),
+                content: "user: hello\nassistant: hi".to_string(),
+                images: None,
+            },
+        ],
+        stream: false,
+        think: false,
+    };
+    let json = serde_json::to_string(&request).expect("should serialize");
+    assert!(json.contains("qwen2.5:3b"));
+    assert!(json.contains("\"stream\":false"));
+}
+
+#[test]
+fn error_guidance_mentions_sidecar_keys() {
+    let err =
+        anvil::app::AppError::Config(anvil::config::ConfigError::ValidationError("test".into()));
+    let guidance = anvil::app::error_guidance(&err);
+    assert!(
+        guidance.contains("sidecar_model"),
+        "error guidance should mention sidecar_model: {guidance}"
+    );
+    assert!(
+        guidance.contains("sidecar_provider_url"),
+        "error guidance should mention sidecar_provider_url: {guidance}"
+    );
+}

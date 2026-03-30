@@ -765,7 +765,12 @@ impl App {
             }
         }
 
-        let compacted = self.session.compact_history(keep_recent);
+        // Sidecar LLM summarization (Issue #195)
+        let llm_summary = self.try_sidecar_summarize();
+
+        let compacted = self
+            .session
+            .compact_history_with_llm_summary(keep_recent, llm_summary);
 
         // Reset context warning tracker after successful compaction (auto/manual)
         if compacted {
@@ -777,6 +782,42 @@ impl App {
         }
 
         compacted
+    }
+
+    /// Attempt sidecar model LLM summarization.
+    ///
+    /// Returns `None` if sidecar_model is not configured or if the
+    /// summarization fails (network error, timeout, etc.).
+    fn try_sidecar_summarize(&self) -> Option<String> {
+        /// Maximum number of recent messages to include in sidecar summarization input.
+        const SIDECAR_SUMMARY_MAX_MESSAGES: usize = 50;
+        /// Maximum characters per message in sidecar summarization input.
+        const SIDECAR_SUMMARY_MAX_CHARS_PER_MSG: usize = 500;
+        /// Maximum total characters for sidecar summarization input.
+        const SIDECAR_SUMMARY_MAX_TOTAL_CHARS: usize = 8000;
+
+        let model = self.config.runtime.sidecar_model.as_ref()?;
+        let sidecar_url = self
+            .config
+            .runtime
+            .sidecar_provider_url
+            .as_deref()
+            .unwrap_or(crate::config::DEFAULT_OLLAMA_URL);
+
+        tracing::info!(
+            sidecar_model = %model,
+            sidecar_url = %sidecar_url,
+            "Starting sidecar summarization"
+        );
+
+        let conversation_text = self.session.conversation_text_for_summary(
+            SIDECAR_SUMMARY_MAX_MESSAGES,
+            SIDECAR_SUMMARY_MAX_CHARS_PER_MSG,
+            SIDECAR_SUMMARY_MAX_TOTAL_CHARS,
+        );
+
+        let sidecar_client = crate::provider::OllamaProviderClient::new(sidecar_url);
+        sidecar_client.sidecar_summarize(model, &conversation_text)
     }
 
     /// Get a clone of the shutdown flag for injection into sub-components.
@@ -2146,7 +2187,8 @@ pub fn error_guidance(err: &AppError) -> String {
     match err {
         AppError::Config(_) => concat!(
             "Hint: check your config file at .anvil/config\n",
-            "  Valid keys: provider, model, provider_url, context_window, stream\n",
+            "  Valid keys: provider, model, provider_url, context_window, stream,\n",
+            "              sidecar_model, sidecar_provider_url\n",
             "  Environment variables also accepted (e.g. ANVIL_MODEL, ANVIL_PROVIDER_URL)"
         )
         .to_string(),
