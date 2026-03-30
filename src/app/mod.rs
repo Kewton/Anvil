@@ -273,16 +273,25 @@ struct CompactParams {
 
 /// Compute compaction parameters from session state and context window.
 /// Returns None if neither token-based nor message-based threshold is exceeded.
-fn compute_compact_params(session: &SessionRecord, context_window: u32) -> Option<CompactParams> {
-    let token_triggered = session.should_smart_compact(context_window);
+/// When `context_budget` is set, uses `min(context_window, context_budget)` for thresholds.
+fn compute_compact_params(
+    session: &SessionRecord,
+    context_window: u32,
+    context_budget: Option<u32>,
+) -> Option<CompactParams> {
+    let token_triggered = session.should_smart_compact(context_window, context_budget);
     let msg_triggered = session.should_compact();
 
     if !token_triggered && !msg_triggered {
         return None;
     }
 
+    let effective_limit = match context_budget {
+        Some(budget) => context_window.min(budget),
+        None => context_window,
+    };
     let token_based = if token_triggered {
-        let target_tokens = (context_window as f64 * crate::session::TARGET_TOKEN_RATIO) as usize;
+        let target_tokens = (effective_limit as f64 * crate::session::TARGET_TOKEN_RATIO) as usize;
         crate::session::compute_token_based_keep_recent(&session.messages, target_tokens)
     } else {
         usize::MAX
@@ -743,7 +752,9 @@ impl App {
     fn compact_with_hooks(&mut self, trigger: &str) -> bool {
         let keep_recent = if trigger == "auto" {
             let context_window = self.effective_context_window();
-            let params = match compute_compact_params(&self.session, context_window) {
+            let context_budget = self.config.runtime.context_budget;
+            let params = match compute_compact_params(&self.session, context_window, context_budget)
+            {
                 Some(p) => p,
                 None => return false,
             };

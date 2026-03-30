@@ -1136,7 +1136,7 @@ fn should_smart_compact_below_threshold() {
     session.smart_compact_threshold_ratio = 0.75;
     session.push_message(new_user_message("m1", "hello"));
     // 1 message, far below any threshold
-    assert!(!session.should_smart_compact(200_000));
+    assert!(!session.should_smart_compact(200_000, None));
 }
 
 #[test]
@@ -1152,7 +1152,7 @@ fn should_smart_compact_above_threshold() {
     }
     // With context_window=1000, threshold = 750 tokens
     // 100 messages * ~50 tokens = ~5000 tokens > 750
-    assert!(session.should_smart_compact(1000));
+    assert!(session.should_smart_compact(1000, None));
 }
 
 #[test]
@@ -1163,7 +1163,7 @@ fn should_smart_compact_ratio_zero_disabled() {
         session.push_message(new_user_message(format!("m{i}"), "a".repeat(200)));
     }
     // ratio=0.0 means smart compact is disabled
-    assert!(!session.should_smart_compact(1000));
+    assert!(!session.should_smart_compact(1000, None));
 }
 
 #[test]
@@ -1173,7 +1173,27 @@ fn should_smart_compact_small_context_window() {
     // MIN_CONTEXT_WINDOW = 1000, threshold = 750
     session.push_message(new_user_message("m1", "a".repeat(400)));
     // ~100 tokens, below 750
-    assert!(!session.should_smart_compact(1000));
+    assert!(!session.should_smart_compact(1000, None));
+}
+
+/// Issue #200: should_smart_compact respects context_budget
+#[test]
+fn should_smart_compact_respects_context_budget() {
+    let mut session = SessionRecord::new(PathBuf::from("/tmp/test"));
+    session.smart_compact_threshold_ratio = 0.75;
+    // Fill with messages to get ~5000 tokens
+    for i in 0..100 {
+        session.push_message(new_user_message(
+            format!("m{i}"),
+            "a".repeat(200), // ~50 tokens each
+        ));
+    }
+    // context_window=262144 alone → threshold=196608, won't trigger
+    assert!(!session.should_smart_compact(262_144, None));
+    // With context_budget=4000 → effective=4000, threshold=3000 → 5000>3000 triggers
+    assert!(session.should_smart_compact(262_144, Some(4000)));
+    // context_budget larger than context_window → effective=context_window, no change
+    assert!(!session.should_smart_compact(262_144, Some(300_000)));
 }
 
 #[test]
