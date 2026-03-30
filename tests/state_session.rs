@@ -1732,6 +1732,77 @@ fn conversation_text_for_summary_delegates() {
     assert!(text.contains("user: test message"));
 }
 
+#[test]
+fn build_conversation_text_for_summary_with_increased_limits() {
+    // Simulate a file.read result containing code with function signatures
+    let code_content = r#"use std::collections::HashMap;
+
+pub struct PromptDetectionResult {
+    pub detected: bool,
+    pub confidence: f64,
+}
+
+pub fn detect_prompt(output: &str, options: Option<&DetectPromptOptions>) -> PromptDetectionResult {
+    // implementation details...
+    PromptDetectionResult { detected: false, confidence: 0.0 }
+}
+
+pub fn process_tokens(input: &[u8], max_length: usize) -> Result<Vec<Token>, TokenError> {
+    // implementation details...
+    Ok(vec![])
+}
+
+impl TokenProcessor {
+    pub fn new(config: &Config) -> Self {
+        Self { config: config.clone() }
+    }
+
+    pub fn validate(&self, tokens: &[Token]) -> bool {
+        tokens.iter().all(|t| t.is_valid())
+    }
+}"#;
+
+    let messages = vec![
+        SessionMessage::new(MessageRole::User, "you", "Read src/detection.rs"),
+        SessionMessage::new(MessageRole::Tool, "tool", code_content),
+        SessionMessage::new(
+            MessageRole::Assistant,
+            "anvil",
+            "I'll modify the detect_prompt function to add logging.",
+        ),
+    ];
+
+    // With increased limits: max_chars_per_msg=1000, max_total_chars=12000
+    let text = build_conversation_text_for_summary(&messages, 50, 1000, 12000);
+
+    // Function signatures should be preserved within 1000 chars
+    assert!(
+        text.contains("detect_prompt"),
+        "function signature detect_prompt should be preserved with 1000 char limit"
+    );
+    assert!(
+        text.contains("PromptDetectionResult"),
+        "type name PromptDetectionResult should be preserved with 1000 char limit"
+    );
+    assert!(
+        text.contains("process_tokens"),
+        "function signature process_tokens should be preserved with 1000 char limit"
+    );
+
+    // Verify the old limit (500) loses later signatures while new limit preserves them.
+    // The code_content is ~680 chars, so at 500 chars the `validate` method near
+    // the end should be truncated, while at 1000 chars it should be preserved.
+    let text_old = build_conversation_text_for_summary(&messages, 50, 500, 8000);
+    assert!(
+        !text_old.contains("validate"),
+        "with 500 char limit, the validate method near end of code should be truncated"
+    );
+    assert!(
+        text.contains("validate"),
+        "with 1000 char limit, the validate method should be preserved"
+    );
+}
+
 // ── Task 2.2: extract_file_targets tests ─────────────────────────────────
 
 #[test]
