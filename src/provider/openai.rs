@@ -14,6 +14,7 @@ use crate::config::EffectiveConfig;
 use crate::contracts::InferencePerformanceView;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 /// Client for OpenAI-compatible chat completion APIs.
 ///
@@ -48,7 +49,10 @@ struct OpenAiChatMessage {
 struct OpenAiResponseMessage {
     #[allow(dead_code)]
     role: String,
+    #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<OpenAiToolCall>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -88,6 +92,46 @@ struct OpenAiDeltaChoice {
 struct OpenAiDeltaMessage {
     #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<OpenAiDeltaToolCall>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OpenAiToolCall {
+    #[serde(default)]
+    id: String,
+    function: OpenAiToolFunction,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OpenAiToolFunction {
+    name: String,
+    arguments: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct OpenAiDeltaToolCall {
+    #[serde(default)]
+    index: usize,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<OpenAiDeltaToolFunction>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct OpenAiDeltaToolFunction {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct StreamingToolCallAccumulator {
+    id: String,
+    name: String,
+    arguments: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -139,6 +183,144 @@ fn extract_openai_performance(usage: &Option<OpenAiUsage>) -> Option<InferencePe
         prompt_tokens: usage.prompt_tokens,
         ..Default::default()
     })
+}
+
+fn normalize_openai_tool_name(name: &str) -> String {
+    match name {
+        "file_read" => "file.read".to_string(),
+        "file_write" => "file.write".to_string(),
+        "file_edit" => "file.edit".to_string(),
+        "file_search" => "file.search".to_string(),
+        "file_edit_anchor" => "file.edit_anchor".to_string(),
+        "shell_exec" => "shell.exec".to_string(),
+        "web_fetch" => "web.fetch".to_string(),
+        "web_search" => "web.search".to_string(),
+        "agent_explore" => "agent.explore".to_string(),
+        "agent_plan" => "agent.plan".to_string(),
+        "git_status" => "git.status".to_string(),
+        "git_diff" => "git.diff".to_string(),
+        "git_log" => "git.log".to_string(),
+        _ => name.to_string(),
+    }
+}
+
+fn default_tool_call_id(tool_name: &str, index: usize) -> String {
+    format!("call_{}_{}", tool_name.replace('.', "_"), index)
+}
+
+fn openai_tool_call_to_anvil_block(
+    tool_call: &OpenAiToolCall,
+    index: usize,
+) -> Result<String, ProviderTurnError> {
+    let raw_name = tool_call.function.name.trim();
+    if raw_name.is_empty() {
+        return Err(ProviderTurnError::Backend(format!(
+            "openai tool_call at index {index} is missing function.name"
+        )));
+    }
+
+    let tool_name = normalize_openai_tool_name(raw_name);
+    let args_value: Value = serde_json::from_str(&tool_call.function.arguments).map_err(|err| {
+        ProviderTurnError::Backend(format!(
+            "invalid openai tool_call arguments for '{tool_name}': {err}"
+        ))
+    })?;
+
+    let Some(args_object) = args_value.as_object() else {
+        return Err(ProviderTurnError::Backend(format!(
+            "openai tool_call arguments for '{tool_name}' must be a JSON object"
+        )));
+    };
+
+    let mut payload = serde_json::Map::new();
+    let tool_call_id = if tool_call.id.trim().is_empty() {
+        default_tool_call_id(&tool_name, index)
+    } else {
+        tool_call.id.clone()
+    };
+
+    payload.insert("id".to_string(), Value::String(tool_call_id));
+    payload.insert("tool".to_string(), Value::String(tool_name));
+    for (key, value) in args_object {
+        payload.insert(key.clone(), value.clone());
+    }
+
+    let json = serde_json::to_string(&Value::Object(payload)).map_err(|err| {
+        ProviderTurnError::Backend(format!(
+            "failed to encode synthetic ANVIL_TOOL block: {err}"
+        ))
+    })?;
+
+    Ok(format!("```ANVIL_TOOL\n{json}\n```"))
+}
+
+fn build_native_tool_calls_content(
+    content: Option<&str>,
+    tool_calls: &[OpenAiToolCall],
+) -> Result<String, ProviderTurnError> {
+    let mut parts = Vec::new();
+    if let Some(content) = content
+        && !content.trim().is_empty()
+    {
+        parts.push(content.to_string());
+    }
+
+    for (index, tool_call) in tool_calls.iter().enumerate() {
+        parts.push(openai_tool_call_to_anvil_block(tool_call, index)?);
+    }
+
+    Ok(parts.join("\n"))
+}
+
+fn merge_delta_tool_calls(
+    accumulators: &mut BTreeMap<usize, StreamingToolCallAccumulator>,
+    delta_tool_calls: &[OpenAiDeltaToolCall],
+) {
+    for delta_tool_call in delta_tool_calls {
+        let accumulator = accumulators.entry(delta_tool_call.index).or_default();
+        if let Some(id) = &delta_tool_call.id {
+            accumulator.id.push_str(id);
+        }
+        if let Some(function) = &delta_tool_call.function {
+            if let Some(name) = &function.name {
+                accumulator.name.push_str(name);
+            }
+            if let Some(arguments) = &function.arguments {
+                accumulator.arguments.push_str(arguments);
+            }
+        }
+    }
+}
+
+fn finalize_streaming_tool_calls(
+    accumulators: BTreeMap<usize, StreamingToolCallAccumulator>,
+) -> Result<Vec<OpenAiToolCall>, ProviderTurnError> {
+    let mut finalized = Vec::with_capacity(accumulators.len());
+    for (index, accumulator) in accumulators {
+        if accumulator.name.trim().is_empty() {
+            return Err(ProviderTurnError::Backend(format!(
+                "openai streaming tool_call at index {index} is missing function.name"
+            )));
+        }
+        finalized.push(OpenAiToolCall {
+            id: accumulator.id,
+            function: OpenAiToolFunction {
+                name: accumulator.name,
+                arguments: accumulator.arguments,
+            },
+        });
+    }
+    Ok(finalized)
+}
+
+fn build_openai_api_url(base_url: &str, endpoint: &str) -> String {
+    let normalized_base = base_url.trim_end_matches('/');
+    let normalized_endpoint = endpoint.trim_start_matches('/');
+    if normalized_base.ends_with("/v1") {
+        format!("{normalized_base}/{normalized_endpoint}")
+    } else {
+        format!("{normalized_base}/v1/{normalized_endpoint}")
+    }
 }
 
 impl OpenAiCompatibleProviderClient {
@@ -207,7 +389,7 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
     /// (without `Bearer` prefix, matching the existing code pattern in
     /// `send_chat_request`).
     pub fn health_check(&self) -> Result<(), ProviderTurnError> {
-        let url = format!("{}/v1/models", self.base_url.trim_end_matches('/'));
+        let url = build_openai_api_url(&self.base_url, "models");
         let headers: Vec<(&str, &str)> = self
             .api_key
             .as_deref()
@@ -247,10 +429,7 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
         let request_body = serde_json::to_vec(&chat_request).map_err(|err| {
             ProviderTurnError::Backend(format!("failed to encode openai request: {err}"))
         })?;
-        let url = format!(
-            "{}/v1/chat/completions",
-            self.base_url.trim_end_matches('/')
-        );
+        let url = build_openai_api_url(&self.base_url, "chat/completions");
 
         let mut headers = Vec::new();
         if let Some(api_key) = &self.api_key {
@@ -283,13 +462,18 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
             .map_err(|err| ProviderTurnError::Backend(format!("invalid openai response: {err}")))?;
 
         let perf = extract_openai_performance(&parsed.usage);
-        let content = parsed
-            .choices
-            .first()
-            .and_then(|choice| choice.message.content.clone())
-            .ok_or_else(|| {
-                ProviderTurnError::Backend("openai response contained no choices".to_string())
-            })?;
+        let choice = parsed.choices.first().ok_or_else(|| {
+            ProviderTurnError::Backend("openai response contained no choices".to_string())
+        })?;
+        let content = choice.message.content.clone().unwrap_or_default();
+        if !choice.message.tool_calls.is_empty() {
+            let assistant_message =
+                build_native_tool_calls_content(Some(&content), &choice.message.tool_calls)?;
+            return Ok(vec![ProviderEvent::Agent(build_provider_done_event(
+                &assistant_message,
+                perf,
+            ))]);
+        }
 
         Ok(vec![
             ProviderEvent::TokenDelta(content.clone()),
@@ -326,10 +510,7 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
         let request_body = serde_json::to_vec(&chat_request).map_err(|err| {
             ProviderTurnError::Backend(format!("failed to encode openai request: {err}"))
         })?;
-        let url = format!(
-            "{}/v1/chat/completions",
-            self.base_url.trim_end_matches('/')
-        );
+        let url = build_openai_api_url(&self.base_url, "chat/completions");
         tracing::debug!(
             model = %request.model,
             messages = request.messages.len(),
@@ -346,6 +527,8 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
         let mut emitted_done = false;
         let mut had_error: Option<ProviderTurnError> = None;
         let mut stream_usage: Option<OpenAiUsage> = None;
+        let mut streaming_tool_calls = BTreeMap::new();
+        let mut saw_native_tool_calls = false;
 
         self.transport
             .stream_lines(&url, &request_body, &headers, &mut |line| {
@@ -362,10 +545,28 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
                         if let Some(choice) = parsed.choices.first() {
                             let perf = extract_openai_performance(&parsed.usage);
                             let msg_content = choice.message.content.clone().unwrap_or_default();
-                            content.push_str(&msg_content);
-                            emit(ProviderEvent::TokenDelta(msg_content));
+                            let assistant_message = if !choice.message.tool_calls.is_empty() {
+                                match build_native_tool_calls_content(
+                                    Some(&msg_content),
+                                    &choice.message.tool_calls,
+                                ) {
+                                    Ok(message) => {
+                                        saw_native_tool_calls = true;
+                                        message
+                                    }
+                                    Err(err) => {
+                                        had_error = Some(err);
+                                        return;
+                                    }
+                                }
+                            } else {
+                                content.push_str(&msg_content);
+                                emit(ProviderEvent::TokenDelta(msg_content));
+                                content.clone()
+                            };
                             emit(ProviderEvent::Agent(build_provider_done_event(
-                                &content, perf,
+                                &assistant_message,
+                                perf,
                             )));
                             emitted_done = true;
                         }
@@ -381,8 +582,25 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
                 if payload == "[DONE]" {
                     if !emitted_done {
                         let perf = extract_openai_performance(&stream_usage);
+                        let assistant_message = if saw_native_tool_calls {
+                            match finalize_streaming_tool_calls(std::mem::take(
+                                &mut streaming_tool_calls,
+                            ))
+                            .and_then(|finalized| {
+                                build_native_tool_calls_content(Some(&content), &finalized)
+                            }) {
+                                Ok(message) => message,
+                                Err(err) => {
+                                    had_error = Some(err);
+                                    return;
+                                }
+                            }
+                        } else {
+                            content.clone()
+                        };
                         emit(ProviderEvent::Agent(build_provider_done_event(
-                            &content, perf,
+                            &assistant_message,
+                            perf,
                         )));
                         emitted_done = true;
                     }
@@ -400,10 +618,34 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
                                 content.push_str(&delta);
                                 emit(ProviderEvent::TokenDelta(delta));
                             }
+                            if !choice.delta.tool_calls.is_empty() {
+                                saw_native_tool_calls = true;
+                                merge_delta_tool_calls(
+                                    &mut streaming_tool_calls,
+                                    &choice.delta.tool_calls,
+                                );
+                            }
                             if choice.finish_reason.is_some() && !emitted_done {
                                 let perf = extract_openai_performance(&stream_usage);
+                                let assistant_message = if saw_native_tool_calls {
+                                    match finalize_streaming_tool_calls(std::mem::take(
+                                        &mut streaming_tool_calls,
+                                    ))
+                                    .and_then(|finalized| {
+                                        build_native_tool_calls_content(Some(&content), &finalized)
+                                    }) {
+                                        Ok(message) => message,
+                                        Err(err) => {
+                                            had_error = Some(err);
+                                            return;
+                                        }
+                                    }
+                                } else {
+                                    content.clone()
+                                };
                                 emit(ProviderEvent::Agent(build_provider_done_event(
-                                    &content, perf,
+                                    &assistant_message,
+                                    perf,
                                 )));
                                 emitted_done = true;
                             }
@@ -423,8 +665,15 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
         }
         if !emitted_done {
             let perf = extract_openai_performance(&stream_usage);
+            let assistant_message = if saw_native_tool_calls {
+                let finalized = finalize_streaming_tool_calls(streaming_tool_calls)?;
+                build_native_tool_calls_content(Some(&content), &finalized)?
+            } else {
+                content.clone()
+            };
             emit(ProviderEvent::Agent(build_provider_done_event(
-                &content, perf,
+                &assistant_message,
+                perf,
             )));
         }
         Ok(())
@@ -435,6 +684,8 @@ fn parse_openai_sse_response(body: &[u8]) -> Result<Vec<ProviderEvent>, Provider
     let text = String::from_utf8_lossy(body);
     let mut content = String::new();
     let mut events = Vec::new();
+    let mut streaming_tool_calls = BTreeMap::new();
+    let mut saw_native_tool_calls = false;
 
     for line in text.lines() {
         let trimmed = line.trim();
@@ -455,9 +706,21 @@ fn parse_openai_sse_response(body: &[u8]) -> Result<Vec<ProviderEvent>, Provider
                 content.push_str(&delta);
                 events.push(ProviderEvent::TokenDelta(delta));
             }
+            if !choice.delta.tool_calls.is_empty() {
+                saw_native_tool_calls = true;
+                merge_delta_tool_calls(&mut streaming_tool_calls, &choice.delta.tool_calls);
+            }
             if choice.finish_reason.is_some() {
+                let assistant_message = if saw_native_tool_calls {
+                    let finalized =
+                        finalize_streaming_tool_calls(std::mem::take(&mut streaming_tool_calls))?;
+                    build_native_tool_calls_content(Some(&content), &finalized)?
+                } else {
+                    content.clone()
+                };
                 events.push(ProviderEvent::Agent(build_provider_done_event(
-                    &content, None,
+                    &assistant_message,
+                    None,
                 )));
             }
         }
@@ -467,8 +730,15 @@ fn parse_openai_sse_response(body: &[u8]) -> Result<Vec<ProviderEvent>, Provider
         .iter()
         .all(|event| !matches!(event, ProviderEvent::Agent(AgentEvent::Done { .. })))
     {
+        let assistant_message = if saw_native_tool_calls {
+            let finalized = finalize_streaming_tool_calls(streaming_tool_calls)?;
+            build_native_tool_calls_content(Some(&content), &finalized)?
+        } else {
+            content
+        };
         events.push(ProviderEvent::Agent(build_provider_done_event(
-            &content, None,
+            &assistant_message,
+            None,
         )));
     }
 

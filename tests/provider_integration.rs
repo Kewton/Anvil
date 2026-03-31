@@ -597,6 +597,68 @@ fn openai_compatible_provider_forwards_authorization_header() {
 }
 
 #[test]
+fn openai_compatible_provider_accepts_base_url_with_v1_suffix() {
+    let request = ProviderTurnRequest::new(
+        "local-openai".to_string(),
+        vec![anvil::provider::ProviderMessage::new(
+            ProviderMessageRole::User,
+            "inspect src/provider",
+        )],
+        false,
+    );
+
+    let seen_urls = Rc::new(RefCell::new(Vec::new()));
+    let transport = MockHttpTransport {
+        seen_urls: seen_urls.clone(),
+        seen_bodies: Rc::new(RefCell::new(Vec::new())),
+        seen_headers: Rc::new(RefCell::new(Vec::new())),
+        response: HttpResponse {
+            status_code: 200,
+            body: br#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#.to_vec(),
+        },
+        get_response: None,
+    };
+    let client = anvil::provider::openai::OpenAiCompatibleProviderClient::with_transport(
+        "http://localhost:1234/v1",
+        transport,
+    );
+
+    client
+        .stream_turn(&request, &mut |_event| {})
+        .expect("request with /v1 base url should succeed");
+
+    assert_eq!(
+        seen_urls.borrow()[0],
+        "http://localhost:1234/v1/chat/completions"
+    );
+}
+
+#[test]
+fn openai_health_check_accepts_base_url_with_v1_suffix() {
+    let seen_urls = Rc::new(RefCell::new(Vec::new()));
+    let transport = MockHttpTransport {
+        seen_urls: seen_urls.clone(),
+        seen_bodies: Rc::new(RefCell::new(Vec::new())),
+        seen_headers: Rc::new(RefCell::new(Vec::new())),
+        response: HttpResponse {
+            status_code: 200,
+            body: br#"{"data":[]}"#.to_vec(),
+        },
+        get_response: None,
+    };
+    let client = anvil::provider::openai::OpenAiCompatibleProviderClient::with_transport(
+        "http://localhost:1234/v1",
+        transport,
+    );
+
+    client
+        .health_check()
+        .expect("health check with /v1 base url should succeed");
+
+    assert_eq!(seen_urls.borrow()[0], "http://localhost:1234/v1/models");
+}
+
+#[test]
 fn live_turn_executes_structured_response_from_openai_compatible_provider() {
     let root = common::unique_test_dir("openai_structured_write");
     let mut config = common::build_config_in(root.clone());
@@ -639,6 +701,144 @@ fn live_turn_executes_structured_response_from_openai_compatible_provider() {
         frames
             .iter()
             .any(|frame| frame.contains("file.write completed ./sandbox/openai/index.html"))
+    );
+}
+
+#[test]
+fn live_turn_executes_native_tool_calls_response_from_openai_compatible_provider() {
+    let root = common::unique_test_dir("openai_native_tool_calls_write");
+    fs::create_dir_all(&root).expect("test root should be created");
+    let mut config = common::build_config_in(root.clone());
+    config.mode.approval_required = false;
+    config.runtime.provider = "openai".to_string();
+    config.runtime.provider_url = "http://localhost:1234".to_string();
+    config.runtime.stream = false;
+    let provider_ctx =
+        anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
+    let mut app = anvil::app::App::new(
+        config,
+        provider_ctx,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("app should initialize");
+    let tui = Tui::new();
+
+    let transport = MockHttpTransport {
+        seen_urls: Rc::new(RefCell::new(Vec::new())),
+        seen_bodies: Rc::new(RefCell::new(Vec::new())),
+        seen_headers: Rc::new(RefCell::new(Vec::new())),
+        response: HttpResponse {
+            status_code: 200,
+            body: br#"{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_native_write_001","type":"function","function":{"name":"file_write","arguments":"{\"path\":\"./sandbox/native/nonstream.html\",\"content\":\"<html><body>native non-stream</body></html>\"}"}}]}}],"stats":{},"system_fingerprint":"qwen3.5"}"#.to_vec(),
+        },
+        get_response: None,
+    };
+    let client = anvil::provider::openai::OpenAiCompatibleProviderClient::with_transport(
+        "http://localhost:1234",
+        transport,
+    );
+
+    let frames = app
+        .run_live_turn("build via native tool_calls", &client, &tui)
+        .expect("native tool_calls response should execute");
+
+    let written = fs::read_to_string(root.join("sandbox/native/nonstream.html"))
+        .expect("file should be written from native tool_calls");
+    assert!(written.contains("native non-stream"));
+    assert!(
+        frames
+            .iter()
+            .any(|frame| frame.contains("file.write completed ./sandbox/native/nonstream.html"))
+    );
+}
+
+#[test]
+fn live_turn_executes_streaming_native_tool_calls_response_from_openai_compatible_provider() {
+    let root = common::unique_test_dir("openai_streaming_native_tool_calls_write");
+    fs::create_dir_all(&root).expect("test root should be created");
+    let mut config = common::build_config_in(root.clone());
+    config.mode.approval_required = false;
+    config.runtime.provider = "openai".to_string();
+    config.runtime.provider_url = "http://localhost:1234".to_string();
+    config.runtime.stream = true;
+    let provider_ctx =
+        anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
+    let mut app = anvil::app::App::new(
+        config,
+        provider_ctx,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("app should initialize");
+    let tui = Tui::new();
+
+    let transport = MockHttpTransport {
+        seen_urls: Rc::new(RefCell::new(Vec::new())),
+        seen_bodies: Rc::new(RefCell::new(Vec::new())),
+        seen_headers: Rc::new(RefCell::new(Vec::new())),
+        response: HttpResponse {
+            status_code: 200,
+            body: concat!(
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_stream_write_001\",\"type\":\"function\",\"function\":{\"name\":\"file_write\",\"arguments\":\"{\\\"path\\\":\\\"./sandbox/native/stream.html\\\",\"}}]},\"finish_reason\":null}]}\n",
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"content\\\":\\\"<html><body>native stream</body></html>\\\"}\"}}]},\"finish_reason\":null}]}\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n",
+                "data: [DONE]\n"
+            )
+            .as_bytes()
+            .to_vec(),
+        },
+        get_response: None,
+    };
+    let client = anvil::provider::openai::OpenAiCompatibleProviderClient::with_transport(
+        "http://localhost:1234",
+        transport,
+    );
+
+    let frames = app
+        .run_live_turn("build via streaming native tool_calls", &client, &tui)
+        .expect("streaming native tool_calls response should execute");
+
+    let written = fs::read_to_string(root.join("sandbox/native/stream.html"))
+        .expect("file should be written from streaming native tool_calls");
+    assert!(written.contains("native stream"));
+    assert!(
+        frames
+            .iter()
+            .any(|frame| frame.contains("file.write completed ./sandbox/native/stream.html"))
+    );
+}
+
+#[test]
+fn openai_compatible_provider_surfaces_invalid_native_tool_call_arguments() {
+    let request = ProviderTurnRequest::new(
+        "local-openai".to_string(),
+        vec![anvil::provider::ProviderMessage::new(
+            ProviderMessageRole::User,
+            "inspect src/provider",
+        )],
+        false,
+    );
+
+    let transport = MockHttpTransport {
+        seen_urls: Rc::new(RefCell::new(Vec::new())),
+        seen_bodies: Rc::new(RefCell::new(Vec::new())),
+        seen_headers: Rc::new(RefCell::new(Vec::new())),
+        response: HttpResponse {
+            status_code: 200,
+            body: br#"{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_invalid_args_001","type":"function","function":{"name":"file_write","arguments":"{not json}"}}]}}]}"#.to_vec(),
+        },
+        get_response: None,
+    };
+    let client = anvil::provider::openai::OpenAiCompatibleProviderClient::with_transport(
+        "http://localhost:1234",
+        transport,
+    );
+
+    let err = client
+        .stream_turn(&request, &mut |_| {})
+        .expect_err("invalid native tool call arguments should surface");
+    assert!(
+        err.to_string()
+            .contains("invalid openai tool_call arguments")
     );
 }
 
