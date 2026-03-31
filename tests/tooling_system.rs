@@ -1,11 +1,14 @@
-use anvil::app::agentic::{ExecutionGroup, group_by_execution_mode};
+use anvil::app::agentic::{
+    ExecutionGroup, build_panic_result, group_by_execution_mode, sanitize_panic_reason,
+    update_progress,
+};
 use anvil::tooling::file_cache::FileReadCache;
 use anvil::tooling::{
     CheckpointEntry, CheckpointStack, ExecutionClass, ExecutionMode, LocalToolExecutor,
     ParallelExecutionPlan, ParallelExecutionPlanError, PermissionClass, PlanModePolicy,
     RollbackPolicy, ToolCallRequest, ToolExecutionError, ToolExecutionPayload, ToolExecutionPolicy,
     ToolExecutionRequest, ToolExecutionResult, ToolExecutionStatus, ToolInput, ToolKind,
-    ToolRegistry, ToolValidationError, detect_image_mime,
+    ToolProgressEntry, ToolProgressStatus, ToolRegistry, ToolValidationError, detect_image_mime,
 };
 use std::fs;
 use std::path::Path;
@@ -6217,4 +6220,212 @@ fn tool_execution_result_edit_detail_with_stage() {
         result.edit_detail.unwrap().fallback_stage,
         EditFallbackStage::Anchor
     );
+}
+
+// ==========================================
+// Issue #220: Parallel Progress Tracking Tests
+// ==========================================
+
+#[test]
+fn tool_progress_status_state_transitions() {
+    // Pending -> Running -> Completed
+    let mut entry = ToolProgressEntry {
+        tool_call_id: "c1".to_string(),
+        tool_name: "file.read".to_string(),
+        status: ToolProgressStatus::Pending,
+        started_at: None,
+        elapsed_ms: None,
+    };
+    assert_eq!(entry.status, ToolProgressStatus::Pending);
+
+    entry.status = ToolProgressStatus::Running;
+    entry.started_at = Some(std::time::Instant::now());
+    assert_eq!(entry.status, ToolProgressStatus::Running);
+
+    entry.status = ToolProgressStatus::Completed;
+    entry.elapsed_ms = Some(500);
+    assert_eq!(entry.status, ToolProgressStatus::Completed);
+}
+
+#[test]
+fn tool_progress_status_failed_transition() {
+    let mut entry = ToolProgressEntry {
+        tool_call_id: "c1".to_string(),
+        tool_name: "web.fetch".to_string(),
+        status: ToolProgressStatus::Running,
+        started_at: Some(std::time::Instant::now()),
+        elapsed_ms: None,
+    };
+    entry.status = ToolProgressStatus::Failed("timeout".to_string());
+    entry.elapsed_ms = Some(3000);
+    assert!(matches!(entry.status, ToolProgressStatus::Failed(ref r) if r == "timeout"));
+}
+
+#[test]
+fn tool_progress_status_to_execution_status_completed() {
+    let status = ToolProgressStatus::Completed;
+    let exec_status: ToolExecutionStatus = (&status).into();
+    assert_eq!(exec_status, ToolExecutionStatus::Completed);
+}
+
+#[test]
+fn tool_progress_status_to_execution_status_failed() {
+    let status = ToolProgressStatus::Failed("error".to_string());
+    let exec_status: ToolExecutionStatus = (&status).into();
+    assert_eq!(exec_status, ToolExecutionStatus::Failed);
+}
+
+#[test]
+fn tool_progress_status_to_execution_status_pending_is_interrupted() {
+    let status = ToolProgressStatus::Pending;
+    let exec_status: ToolExecutionStatus = (&status).into();
+    assert_eq!(exec_status, ToolExecutionStatus::Interrupted);
+}
+
+#[test]
+fn tool_progress_status_to_execution_status_running_is_interrupted() {
+    let status = ToolProgressStatus::Running;
+    let exec_status: ToolExecutionStatus = (&status).into();
+    assert_eq!(exec_status, ToolExecutionStatus::Interrupted);
+}
+
+#[test]
+fn tool_progress_entry_elapsed_ms_u64_none() {
+    let entry = ToolProgressEntry {
+        tool_call_id: "c1".to_string(),
+        tool_name: "file.read".to_string(),
+        status: ToolProgressStatus::Pending,
+        started_at: None,
+        elapsed_ms: None,
+    };
+    assert_eq!(entry.elapsed_ms_u64(), None);
+}
+
+#[test]
+fn tool_progress_entry_elapsed_ms_u64_normal() {
+    let entry = ToolProgressEntry {
+        tool_call_id: "c1".to_string(),
+        tool_name: "file.read".to_string(),
+        status: ToolProgressStatus::Completed,
+        started_at: None,
+        elapsed_ms: Some(1234),
+    };
+    assert_eq!(entry.elapsed_ms_u64(), Some(1234u64));
+}
+
+#[test]
+fn tool_progress_entry_elapsed_ms_u64_saturates() {
+    let entry = ToolProgressEntry {
+        tool_call_id: "c1".to_string(),
+        tool_name: "file.read".to_string(),
+        status: ToolProgressStatus::Completed,
+        started_at: None,
+        elapsed_ms: Some(u128::MAX),
+    };
+    assert_eq!(entry.elapsed_ms_u64(), Some(u64::MAX));
+}
+
+#[test]
+fn update_progress_sets_status_and_started_at() {
+    let mut entries = vec![
+        ToolProgressEntry {
+            tool_call_id: "c1".to_string(),
+            tool_name: "file.read".to_string(),
+            status: ToolProgressStatus::Pending,
+            started_at: None,
+            elapsed_ms: None,
+        },
+        ToolProgressEntry {
+            tool_call_id: "c2".to_string(),
+            tool_name: "git.status".to_string(),
+            status: ToolProgressStatus::Pending,
+            started_at: None,
+            elapsed_ms: None,
+        },
+    ];
+
+    let now = std::time::Instant::now();
+    update_progress(&mut entries, 0, ToolProgressStatus::Running, Some(now));
+    assert_eq!(entries[0].status, ToolProgressStatus::Running);
+    assert!(entries[0].started_at.is_some());
+    // Second entry should be unchanged
+    assert_eq!(entries[1].status, ToolProgressStatus::Pending);
+}
+
+#[test]
+fn update_progress_out_of_bounds_is_noop() {
+    let mut entries = vec![ToolProgressEntry {
+        tool_call_id: "c1".to_string(),
+        tool_name: "file.read".to_string(),
+        status: ToolProgressStatus::Pending,
+        started_at: None,
+        elapsed_ms: None,
+    }];
+    // Should not panic
+    update_progress(&mut entries, 99, ToolProgressStatus::Running, None);
+    assert_eq!(entries[0].status, ToolProgressStatus::Pending);
+}
+
+#[test]
+fn build_panic_result_creates_failed_result() {
+    let registry = build_registry();
+    let spec = registry.get("file.read").unwrap().clone();
+    let request = ToolExecutionRequest {
+        tool_call_id: "call_001".to_string(),
+        spec,
+        input: ToolInput::FileRead {
+            path: "test.rs".to_string(),
+        },
+    };
+    let result = build_panic_result(&request, "thread panicked".to_string());
+    assert_eq!(result.tool_call_id, "call_001");
+    assert_eq!(result.tool_name, "file.read");
+    assert_eq!(result.status, ToolExecutionStatus::Failed);
+    // Summary contains generic message with tool name, not raw panic reason (security)
+    assert!(result.summary.contains("file.read"));
+    assert!(result.summary.contains("internal error"));
+    // Payload should be generic, not exposing panic details
+    if let ToolExecutionPayload::Text(text) = &result.payload {
+        assert!(!text.contains("thread panicked"));
+    }
+}
+
+#[test]
+fn sanitize_panic_reason_extracts_string() {
+    let reason: Box<dyn std::any::Any + Send> = Box::new("test panic".to_string());
+    let result = sanitize_panic_reason(&*reason);
+    assert_eq!(result, "test panic");
+}
+
+#[test]
+fn sanitize_panic_reason_extracts_str() {
+    let reason: Box<dyn std::any::Any + Send> = Box::new("test panic");
+    let result = sanitize_panic_reason(&*reason);
+    assert_eq!(result, "test panic");
+}
+
+#[test]
+fn sanitize_panic_reason_unknown_type() {
+    let reason: Box<dyn std::any::Any + Send> = Box::new(42i32);
+    let result = sanitize_panic_reason(&*reason);
+    assert_eq!(result, "unknown panic");
+}
+
+#[test]
+fn sanitize_panic_reason_strips_control_chars() {
+    let reason: Box<dyn std::any::Any + Send> =
+        Box::new("bad\x00chars\x01here\x1b[31mred".to_string());
+    let result = sanitize_panic_reason(&*reason);
+    assert!(!result.contains('\x00'));
+    assert!(!result.contains('\x01'));
+    // Control char \x1b is replaced
+    assert!(!result.contains('\x1b'));
+}
+
+#[test]
+fn sanitize_panic_reason_truncates_long_input() {
+    let long_input: Box<dyn std::any::Any + Send> = Box::new("a".repeat(500));
+    let result = sanitize_panic_reason(&*long_input);
+    assert!(result.len() <= 260); // 256 + "..."
+    assert!(result.ends_with("..."));
 }

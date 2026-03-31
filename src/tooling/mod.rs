@@ -6,7 +6,10 @@
 
 pub mod diff;
 pub mod file_cache;
+pub mod progress;
 pub mod shell_policy;
+
+pub use progress::*;
 
 pub use shell_policy::{ShellPolicy, classify_shell_policy, is_network_command};
 
