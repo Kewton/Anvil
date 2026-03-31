@@ -1148,3 +1148,118 @@ fn dedup_with_anvil_final_combined() {
     assert_eq!(response.tool_calls.len(), 1);
     assert_eq!(response.tool_calls[0].tool_call_id, "call_001");
 }
+
+// ==========================================
+// Issue #220: Parallel Progress Integration Tests
+// ==========================================
+
+#[test]
+fn parallel_progress_entry_thread_safe_sharing() {
+    use anvil::tooling::{ToolProgressEntry, ToolProgressStatus};
+    use std::sync::{Arc, Mutex};
+
+    let progress = Arc::new(Mutex::new(vec![
+        ToolProgressEntry {
+            tool_call_id: "c1".to_string(),
+            tool_name: "file.read".to_string(),
+            status: ToolProgressStatus::Pending,
+            started_at: None,
+            elapsed_ms: None,
+        },
+        ToolProgressEntry {
+            tool_call_id: "c2".to_string(),
+            tool_name: "git.status".to_string(),
+            status: ToolProgressStatus::Pending,
+            started_at: None,
+            elapsed_ms: None,
+        },
+    ]));
+
+    // Simulate concurrent writes from multiple threads
+    let handles: Vec<_> = (0..2)
+        .map(|i| {
+            let progress = progress.clone();
+            std::thread::spawn(move || {
+                let started = std::time::Instant::now();
+                {
+                    let mut entries = progress.lock().unwrap();
+                    entries[i].status = ToolProgressStatus::Running;
+                    entries[i].started_at = Some(started);
+                }
+                // Simulate some work
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                {
+                    let mut entries = progress.lock().unwrap();
+                    entries[i].status = ToolProgressStatus::Completed;
+                    entries[i].elapsed_ms = Some(started.elapsed().as_millis());
+                }
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let entries = progress.lock().unwrap();
+    assert_eq!(entries[0].status, ToolProgressStatus::Completed);
+    assert_eq!(entries[1].status, ToolProgressStatus::Completed);
+    assert!(entries[0].elapsed_ms.is_some());
+    assert!(entries[1].elapsed_ms.is_some());
+}
+
+#[test]
+fn parallel_progress_failure_does_not_block_others() {
+    use anvil::tooling::{ToolProgressEntry, ToolProgressStatus};
+    use std::sync::{Arc, Mutex};
+
+    let progress = Arc::new(Mutex::new(vec![
+        ToolProgressEntry {
+            tool_call_id: "c1".to_string(),
+            tool_name: "file.read".to_string(),
+            status: ToolProgressStatus::Pending,
+            started_at: None,
+            elapsed_ms: None,
+        },
+        ToolProgressEntry {
+            tool_call_id: "c2".to_string(),
+            tool_name: "git.status".to_string(),
+            status: ToolProgressStatus::Pending,
+            started_at: None,
+            elapsed_ms: None,
+        },
+    ]));
+
+    let handles: Vec<_> = (0..2)
+        .map(|i| {
+            let progress = progress.clone();
+            std::thread::spawn(move || {
+                {
+                    let mut entries = progress.lock().unwrap();
+                    entries[i].status = ToolProgressStatus::Running;
+                    entries[i].started_at = Some(std::time::Instant::now());
+                }
+                if i == 0 {
+                    // Simulate failure
+                    let mut entries = progress.lock().unwrap();
+                    entries[i].status = ToolProgressStatus::Failed("simulated error".to_string());
+                    entries[i].elapsed_ms = Some(100);
+                } else {
+                    // Simulate success
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    let mut entries = progress.lock().unwrap();
+                    entries[i].status = ToolProgressStatus::Completed;
+                    entries[i].elapsed_ms = Some(50);
+                }
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let entries = progress.lock().unwrap();
+    assert!(matches!(entries[0].status, ToolProgressStatus::Failed(_)));
+    assert_eq!(entries[1].status, ToolProgressStatus::Completed);
+}

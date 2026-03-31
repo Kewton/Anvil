@@ -7,6 +7,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::app::render::sanitize_display_string;
+use crate::tooling::progress::{ToolProgressEntry, ToolProgressStatus};
 
 const FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const FRAME_MS: u64 = 80;
@@ -27,6 +28,8 @@ pub enum SpinnerMode {
         total: usize,
         completed: Arc<AtomicUsize>,
     },
+    /// Parallel-detailed spinner: `⠋ [2/4] ✓file.read(0.3s) ⟳git.status(1.2s)`
+    ParallelDetailed,
 }
 
 /// A terminal spinner that runs in a background thread.
@@ -210,6 +213,61 @@ impl Spinner {
         }
     }
 
+    /// Start a parallel-detailed spinner that displays individual tool status.
+    ///
+    /// Displays: `⠋ [2/4] ✓file.read(0.3s) ⟳git.status(1.2s)`
+    ///
+    /// When `enabled` is false, returns a no-op spinner.
+    pub fn start_parallel_detailed(
+        progress: Arc<Mutex<Vec<ToolProgressEntry>>>,
+        enabled: bool,
+    ) -> Self {
+        if !enabled {
+            return Self::noop();
+        }
+        let running = Arc::new(AtomicBool::new(true));
+        let paused = Arc::new(AtomicBool::new(false));
+
+        let flag = running.clone();
+        let pause_flag = paused.clone();
+
+        let handle = thread::spawn(move || {
+            let mut stderr = std::io::stderr();
+            let mut i = 0usize;
+            let mut prev_len = 0usize;
+            while flag.load(Ordering::Relaxed) {
+                if pause_flag.load(Ordering::Relaxed) {
+                    thread::sleep(Duration::from_millis(FRAME_MS));
+                    continue;
+                }
+                let line = match progress.try_lock() {
+                    Ok(entries) => format_progress_line(&entries, i),
+                    Err(_) => {
+                        // Mutex contended or poisoned — skip this frame
+                        thread::sleep(Duration::from_millis(FRAME_MS));
+                        i += 1;
+                        continue;
+                    }
+                };
+                let clear_width = prev_len.max(line.len());
+                let _ = write!(stderr, "\r{:width$}\r{line}", "", width = clear_width);
+                let _ = stderr.flush();
+                prev_len = line.len();
+                thread::sleep(Duration::from_millis(FRAME_MS));
+                i += 1;
+            }
+            let _ = write!(stderr, "\r{:width$}\r", "", width = prev_len + 2);
+            let _ = stderr.flush();
+        });
+
+        Self {
+            running,
+            paused,
+            handle: Some(handle),
+            mode: SpinnerMode::ParallelDetailed,
+        }
+    }
+
     /// Pause the spinner rendering. The background thread keeps running
     /// but skips drawing until [`resume`] is called.
     pub fn pause(&self) {
@@ -258,6 +316,66 @@ impl Drop for Spinner {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+/// Pure function: build a spinner display line from parallel progress entries.
+///
+/// Format: `⠋ [2/4] ✓file.read(0.3s) ⟳git.status(1.2s) ✗web.fetch`
+///
+/// Status symbols:
+/// - `⟳` Running
+/// - `✓` Completed
+/// - `✗` Failed
+/// - (no symbol for Pending, shown as tool name only)
+pub(crate) fn format_progress_line(entries: &[ToolProgressEntry], frame_idx: usize) -> String {
+    if entries.is_empty() {
+        let frame = FRAMES[frame_idx % FRAMES.len()];
+        return format!("{frame} [0/0]");
+    }
+
+    let total = entries.len();
+    let done = entries
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.status,
+                ToolProgressStatus::Completed | ToolProgressStatus::Failed(_)
+            )
+        })
+        .count();
+
+    let frame = FRAMES[frame_idx % FRAMES.len()];
+    let mut parts = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let name = sanitize_display_string(&entry.tool_name, 30);
+        let elapsed_str = match &entry.status {
+            ToolProgressStatus::Running => {
+                if let Some(started) = entry.started_at {
+                    let ms = started.elapsed().as_millis() as u64;
+                    format!("({})", format_elapsed_ms(ms))
+                } else {
+                    String::new()
+                }
+            }
+            ToolProgressStatus::Completed | ToolProgressStatus::Failed(_) => {
+                if let Some(ms) = entry.elapsed_ms {
+                    format!("({})", format_elapsed_ms(ms.min(u64::MAX as u128) as u64))
+                } else {
+                    String::new()
+                }
+            }
+            ToolProgressStatus::Pending => String::new(),
+        };
+        let symbol = match &entry.status {
+            ToolProgressStatus::Pending => "",
+            ToolProgressStatus::Running => "\u{27F3}",
+            ToolProgressStatus::Completed => "\u{2713}",
+            ToolProgressStatus::Failed(_) => "\u{2717}",
+        };
+        parts.push(format!("{symbol}{name}{elapsed_str}"));
+    }
+
+    format!("{frame} [{done}/{total}] {}", parts.join(" "))
 }
 
 /// Format a duration in milliseconds as a human-readable string.
@@ -368,5 +486,130 @@ mod tests {
         let spinner = Spinner::start("test", false);
         // Should not panic for Simple mode
         spinner.set_tool_progress(1, "anything");
+    }
+
+    // --- Issue #220: format_progress_line tests ---
+
+    #[test]
+    fn format_progress_line_empty_entries() {
+        let result = format_progress_line(&[], 0);
+        assert!(result.contains("[0/0]"));
+    }
+
+    #[test]
+    fn format_progress_line_all_pending() {
+        let entries = vec![
+            ToolProgressEntry {
+                tool_call_id: "c1".to_string(),
+                tool_name: "file.read".to_string(),
+                status: ToolProgressStatus::Pending,
+                started_at: None,
+                elapsed_ms: None,
+            },
+            ToolProgressEntry {
+                tool_call_id: "c2".to_string(),
+                tool_name: "git.status".to_string(),
+                status: ToolProgressStatus::Pending,
+                started_at: None,
+                elapsed_ms: None,
+            },
+        ];
+        let result = format_progress_line(&entries, 0);
+        assert!(result.contains("[0/2]"));
+        assert!(result.contains("file.read"));
+        assert!(result.contains("git.status"));
+    }
+
+    #[test]
+    fn format_progress_line_mixed_states() {
+        let entries = vec![
+            ToolProgressEntry {
+                tool_call_id: "c1".to_string(),
+                tool_name: "file.read".to_string(),
+                status: ToolProgressStatus::Completed,
+                started_at: None,
+                elapsed_ms: Some(300),
+            },
+            ToolProgressEntry {
+                tool_call_id: "c2".to_string(),
+                tool_name: "git.status".to_string(),
+                status: ToolProgressStatus::Running,
+                started_at: Some(Instant::now()),
+                elapsed_ms: None,
+            },
+            ToolProgressEntry {
+                tool_call_id: "c3".to_string(),
+                tool_name: "web.fetch".to_string(),
+                status: ToolProgressStatus::Failed("timeout".to_string()),
+                started_at: None,
+                elapsed_ms: Some(5000),
+            },
+        ];
+        let result = format_progress_line(&entries, 0);
+        // 2 done (Completed + Failed)
+        assert!(result.contains("[2/3]"));
+        // Completed symbol
+        assert!(result.contains("\u{2713}file.read"));
+        // Running symbol
+        assert!(result.contains("\u{27F3}git.status"));
+        // Failed symbol
+        assert!(result.contains("\u{2717}web.fetch"));
+    }
+
+    #[test]
+    fn format_progress_line_all_completed_with_elapsed() {
+        let entries = vec![
+            ToolProgressEntry {
+                tool_call_id: "c1".to_string(),
+                tool_name: "file.read".to_string(),
+                status: ToolProgressStatus::Completed,
+                started_at: None,
+                elapsed_ms: Some(1234),
+            },
+            ToolProgressEntry {
+                tool_call_id: "c2".to_string(),
+                tool_name: "git.diff".to_string(),
+                status: ToolProgressStatus::Completed,
+                started_at: None,
+                elapsed_ms: Some(500),
+            },
+        ];
+        let result = format_progress_line(&entries, 0);
+        assert!(result.contains("[2/2]"));
+        assert!(result.contains("(1.2s)"));
+        assert!(result.contains("(0.5s)"));
+    }
+
+    // --- Issue #220: start_parallel_detailed tests ---
+
+    #[test]
+    fn spinner_start_parallel_detailed_noop_when_disabled() {
+        let progress = Arc::new(Mutex::new(vec![ToolProgressEntry {
+            tool_call_id: "c1".to_string(),
+            tool_name: "file.read".to_string(),
+            status: ToolProgressStatus::Pending,
+            started_at: None,
+            elapsed_ms: None,
+        }]));
+        let spinner = Spinner::start_parallel_detailed(progress, false);
+        assert!(!spinner.running.load(Ordering::Relaxed));
+        assert!(spinner.handle.is_none());
+        spinner.stop();
+    }
+
+    #[test]
+    fn spinner_start_parallel_detailed_starts_and_stops() {
+        let progress = Arc::new(Mutex::new(vec![ToolProgressEntry {
+            tool_call_id: "c1".to_string(),
+            tool_name: "file.read".to_string(),
+            status: ToolProgressStatus::Running,
+            started_at: Some(Instant::now()),
+            elapsed_ms: None,
+        }]));
+        let spinner = Spinner::start_parallel_detailed(progress, true);
+        assert!(spinner.running.load(Ordering::Relaxed));
+        // Let it run for a frame
+        std::thread::sleep(Duration::from_millis(100));
+        spinner.stop();
     }
 }

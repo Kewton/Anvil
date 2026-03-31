@@ -14,12 +14,15 @@ use crate::state::StateTransition;
 use crate::tooling::{
     ExecutionMode, LocalToolExecutor, ToolCallRequest, ToolExecutionPayload, ToolExecutionPolicy,
     ToolExecutionRequest, ToolExecutionResult, ToolExecutionStatus, ToolInput, ToolKind,
-    count_file_lines, diff::generate_diff_preview, resolve_sandbox_path,
+    ToolProgressEntry, ToolProgressStatus, count_file_lines, diff::generate_diff_preview,
+    resolve_sandbox_path,
 };
 use crate::tui::Tui;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use crate::tooling::{PermissionClass, effective_permission_class};
 
@@ -125,6 +128,87 @@ pub fn group_by_execution_mode(requests: &[(usize, ToolExecutionRequest)]) -> Ve
     groups
 }
 
+/// Update a progress entry in the shared vector.
+///
+/// This is a pure function operating on `&mut Vec` for testability.
+pub fn update_progress(
+    entries: &mut [ToolProgressEntry],
+    idx: usize,
+    status: ToolProgressStatus,
+    started_at: Option<Instant>,
+) {
+    if let Some(entry) = entries.get_mut(idx) {
+        entry.status = status;
+        if let Some(at) = started_at {
+            entry.started_at = Some(at);
+        }
+    }
+}
+
+/// Build a `ToolExecutionResult` from a panic payload.
+///
+/// Security: The detailed `reason` is logged locally but NOT exposed in the
+/// payload returned to the model. The payload only contains a generic message.
+pub fn build_panic_result(request: &ToolExecutionRequest, reason: String) -> ToolExecutionResult {
+    tracing::error!(
+        tool = %request.spec.name,
+        tool_call_id = %request.tool_call_id,
+        reason = %reason,
+        "tool execution panicked"
+    );
+    ToolExecutionResult {
+        tool_call_id: request.tool_call_id.clone(),
+        tool_name: request.spec.name.clone(),
+        status: ToolExecutionStatus::Failed,
+        summary: format!(
+            "internal error: {} execution failed unexpectedly",
+            request.spec.name
+        ),
+        payload: ToolExecutionPayload::Text(
+            "Tool execution failed due to an internal error.".to_string(),
+        ),
+        artifacts: Vec::new(),
+        elapsed_ms: 0,
+        diff_summary: None,
+        edit_detail: None,
+    }
+}
+
+/// Sanitize a panic reason: extract string message, strip control characters,
+/// and limit length.
+pub fn sanitize_panic_reason(panic_info: &(dyn std::any::Any + Send)) -> String {
+    let raw = panic_info
+        .downcast_ref::<String>()
+        .map(|s| s.as_str())
+        .or_else(|| panic_info.downcast_ref::<&str>().copied())
+        .unwrap_or("unknown panic");
+
+    // Strip control characters (keep printable + whitespace)
+    let clean: String = raw
+        .chars()
+        .map(|c| if c.is_control() && c != ' ' { ' ' } else { c })
+        .collect();
+
+    // Limit length to 256 characters (Unicode-safe)
+    const MAX_REASON_CHARS: usize = 256;
+    let truncated: String = clean.chars().take(MAX_REASON_CHARS).collect();
+    if truncated.len() < clean.len() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
+}
+
+/// Lock the progress mutex, recovering from poisoning if necessary.
+fn lock_progress(
+    progress: &Mutex<Vec<ToolProgressEntry>>,
+) -> std::sync::MutexGuard<'_, Vec<ToolProgressEntry>> {
+    match progress.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 /// Execute a group of tool requests in parallel using scoped threads.
 ///
 /// This is a standalone function (not an `App` method) to avoid borrow
@@ -134,7 +218,7 @@ fn execute_parallel_group_standalone(
     config: &crate::config::EffectiveConfig,
     shutdown_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
     requests: Vec<(usize, ToolExecutionRequest)>,
-    completed: Arc<AtomicUsize>,
+    progress: Arc<Mutex<Vec<ToolProgressEntry>>>,
     file_cache: Option<std::sync::Arc<std::sync::Mutex<crate::tooling::file_cache::FileReadCache>>>,
 ) -> Vec<(usize, ToolExecutionResult)> {
     let cwd = config.paths.cwd.clone();
@@ -149,50 +233,117 @@ fn execute_parallel_group_standalone(
                     let cwd = cwd.clone();
                     let shutdown = shutdown_flag.clone();
                     let idx = *idx;
-                    let completed = completed.clone();
+                    let progress = progress.clone();
                     let file_cache = file_cache.clone();
+                    let request_clone = request.clone();
                     s.spawn(move || {
-                        let mut executor = LocalToolExecutor::new(cwd, runtime, file_cache)
-                            .with_shutdown_flag(shutdown);
-                        let tool_call_id = request.tool_call_id.clone();
-                        let tool_name = request.spec.name.clone();
-                        let result = executor.execute(request.clone()).unwrap_or_else(|err| {
-                            let (summary, payload) = match &err {
-                                crate::tooling::ToolRuntimeError::EditNotFound {
-                                    message,
-                                    context_snippet,
-                                } => {
-                                    let payload_text = if let Some(ctx) = context_snippet {
-                                        format!(
-                                            "{message}\n\n--- File context (nearby lines) ---\n{ctx}"
-                                        )
-                                    } else {
-                                        message.clone()
-                                    };
-                                    (
-                                        message.clone(),
-                                        ToolExecutionPayload::Text(payload_text),
-                                    )
+                        // Fail-fast if shutdown was requested before we start
+                        if shutdown.load(Ordering::Relaxed) {
+                            let mut entries = lock_progress(&progress);
+                            update_progress(
+                                &mut entries,
+                                idx,
+                                ToolProgressStatus::Failed("shutdown".to_string()),
+                                None,
+                            );
+                            return (idx, build_panic_result(&request_clone, "shutdown requested".to_string()));
+                        }
+
+                        // Mark as Running
+                        let started = Instant::now();
+                        {
+                            let mut entries = lock_progress(&progress);
+                            update_progress(
+                                &mut entries,
+                                idx,
+                                ToolProgressStatus::Running,
+                                Some(started),
+                            );
+                        }
+
+                        let result = std::panic::catch_unwind(
+                            std::panic::AssertUnwindSafe(|| {
+                                let mut executor =
+                                    LocalToolExecutor::new(cwd, runtime, file_cache)
+                                        .with_shutdown_flag(shutdown);
+                                let tool_call_id = request_clone.tool_call_id.clone();
+                                let tool_name = request_clone.spec.name.clone();
+                                executor.execute(request_clone.clone()).unwrap_or_else(
+                                    |err| {
+                                        let (summary, payload) = match &err {
+                                            crate::tooling::ToolRuntimeError::EditNotFound {
+                                                message,
+                                                context_snippet,
+                                            } => {
+                                                let payload_text =
+                                                    if let Some(ctx) = context_snippet {
+                                                        format!(
+                                                        "{message}\n\n--- File context (nearby lines) ---\n{ctx}"
+                                                    )
+                                                    } else {
+                                                        message.clone()
+                                                    };
+                                                (
+                                                    message.clone(),
+                                                    ToolExecutionPayload::Text(payload_text),
+                                                )
+                                            }
+                                            other => {
+                                                let msg = other.to_string();
+                                                (msg.clone(), ToolExecutionPayload::Text(msg))
+                                            }
+                                        };
+                                        ToolExecutionResult {
+                                            tool_call_id,
+                                            tool_name,
+                                            status: ToolExecutionStatus::Failed,
+                                            summary,
+                                            payload,
+                                            artifacts: Vec::new(),
+                                            elapsed_ms: 0,
+                                            diff_summary: None,
+                                            edit_detail: None,
+                                        }
+                                    },
+                                )
+                            }),
+                        );
+
+                        match result {
+                            Ok(mut exec_result) => {
+                                let elapsed = started.elapsed().as_millis();
+                                if exec_result.elapsed_ms == 0 {
+                                    exec_result.elapsed_ms = elapsed;
                                 }
-                                other => {
-                                    let msg = other.to_string();
-                                    (msg.clone(), ToolExecutionPayload::Text(msg))
+                                let status = if exec_result.status == ToolExecutionStatus::Failed {
+                                    ToolProgressStatus::Failed(exec_result.summary.clone())
+                                } else {
+                                    ToolProgressStatus::Completed
+                                };
+                                {
+                                    let mut entries = lock_progress(&progress);
+                                    if let Some(entry) = entries.get_mut(idx) {
+                                        entry.status = status;
+                                        entry.elapsed_ms = Some(elapsed);
+                                    }
                                 }
-                            };
-                            ToolExecutionResult {
-                                tool_call_id,
-                                tool_name,
-                                status: ToolExecutionStatus::Failed,
-                                summary,
-                                payload,
-                                artifacts: Vec::new(),
-                                elapsed_ms: 0,
-                                diff_summary: None,
-                                edit_detail: None,
+                                (idx, exec_result)
                             }
-                        });
-                        completed.fetch_add(1, Ordering::Relaxed);
-                        (idx, result)
+                            Err(panic_info) => {
+                                let reason = sanitize_panic_reason(&*panic_info);
+                                tracing::error!("parallel tool thread panicked: {reason}");
+                                {
+                                    let mut entries = lock_progress(&progress);
+                                    if let Some(entry) = entries.get_mut(idx) {
+                                        entry.status =
+                                            ToolProgressStatus::Failed(reason.clone());
+                                        entry.elapsed_ms =
+                                            Some(started.elapsed().as_millis());
+                                    }
+                                }
+                                (idx, build_panic_result(request, reason))
+                            }
+                        }
                     })
                 })
                 .collect();
@@ -202,12 +353,14 @@ fn execute_parallel_group_standalone(
                 match handle.join() {
                     Ok(indexed_result) => results.push(indexed_result),
                     Err(panic_payload) => {
+                        // This should not happen since we use catch_unwind inside,
+                        // but handle it defensively.
                         let detail = panic_payload
                             .downcast_ref::<String>()
                             .map(|s| s.as_str())
                             .or_else(|| panic_payload.downcast_ref::<&str>().copied())
                             .unwrap_or("unknown");
-                        tracing::error!("parallel tool thread panicked: {detail}");
+                        tracing::error!("parallel tool thread panicked (outer): {detail}");
                         results.push((
                             usize::MAX,
                             ToolExecutionResult {
@@ -1108,20 +1261,43 @@ impl App {
         let mut seq_counter = 0usize;
         for group in groups {
             match group {
-                ExecutionGroup::Parallel(requests) if requests.len() >= 2 => {
-                    let completed = Arc::new(AtomicUsize::new(0));
-                    let spinner =
-                        Spinner::start_parallel(requests.len(), completed.clone(), interactive);
+                ExecutionGroup::Parallel(ref requests) if requests.len() >= 2 => {
+                    let progress = Arc::new(Mutex::new(
+                        requests
+                            .iter()
+                            .map(|(_, req)| ToolProgressEntry {
+                                tool_call_id: req.tool_call_id.clone(),
+                                tool_name: req.spec.name.clone(),
+                                status: ToolProgressStatus::Pending,
+                                started_at: None,
+                                elapsed_ms: None,
+                            })
+                            .collect::<Vec<_>>(),
+                    ));
+                    // Re-index requests to match progress entry indices (0-based)
+                    let reindexed: Vec<(usize, ToolExecutionRequest)> = requests
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (_, req))| (i, req.clone()))
+                        .collect();
+                    // Keep original indices for result mapping
+                    let original_indices: Vec<usize> =
+                        requests.iter().map(|(idx, _)| *idx).collect();
+                    let spinner = Spinner::start_parallel_detailed(progress.clone(), interactive);
                     let parallel_results = execute_parallel_group_standalone(
                         &self.config,
                         self.shutdown_flag(),
-                        requests,
-                        completed,
+                        reindexed,
+                        progress,
                         Some(self.file_read_cache.clone()),
                     );
                     spinner.stop();
                     seq_counter += parallel_results.len();
-                    indexed_results.extend(parallel_results);
+                    // Map back to original indices
+                    indexed_results.extend(parallel_results.into_iter().map(|(i, r)| {
+                        let orig_idx = original_indices.get(i).copied().unwrap_or(i);
+                        (orig_idx, r)
+                    }));
                 }
                 ExecutionGroup::Parallel(requests) => {
                     // Single ParallelSafe item — execute sequentially
