@@ -235,9 +235,17 @@ fn execute_parallel_group_standalone(
 const MAX_FINAL_GUARD_RETRIES: u8 = 1;
 
 /// Message sent to LLM when ANVIL_FINAL fires without file modifications.
+///
+/// Issue #217: Extended with explicit protocol format reminder to fix
+/// qwen3.5 / LM Studio models that output JSON tool calls instead of
+/// ANVIL_TOOL blocks, or emit ANVIL_FINAL before tool blocks.
 const FINAL_GUARD_RETRY_MESSAGE: &str = "No file modifications detected (file.write/file.edit not called). \
      Please implement the changes rather than just planning them. \
-     Use file.write or file.edit to make the necessary code changes.";
+     Use file.write or file.edit to make the necessary code changes.\n\
+     IMPORTANT: You MUST use ANVIL_TOOL block format for ALL tool calls — \
+     do NOT output raw JSON (e.g. {\"tool\":\"file.read\",...}) outside ANVIL_TOOL blocks; \
+     such calls are silently ignored. \
+     Always output ANVIL_FINAL only AFTER all ANVIL_TOOL blocks are complete.";
 
 /// Maximum number of sub-agent calls allowed in a single turn (SR4-006).
 const MAX_SUBAGENT_CALLS_PER_TURN: usize = 3;
@@ -350,13 +358,28 @@ impl App {
     /// Inject a retry message into the session to prompt the LLM for actual implementation.
     /// See also: PROMPT_TOOL_RULES in src/agent/mod.rs for preventive guidance.
     fn inject_final_guard_retry(&mut self) {
+        self.inject_final_guard_retry_with_context("");
+    }
+
+    /// Inject a retry message with optional context from the triggering assistant message.
+    ///
+    /// Issue #217: When the assistant response contains raw JSON tool calls outside
+    /// ANVIL_TOOL blocks (a pattern observed with qwen3.5 / LM Studio using custom
+    /// ANVIL.md with JSON tool examples), append a specific format correction hint.
+    fn inject_final_guard_retry_with_context(&mut self, assistant_message: &str) {
         tracing::warn!("ANVIL_FINAL guard: no file modifications detected, retrying");
-        let retry_msg = SessionMessage::new(
-            MessageRole::Tool,
-            "system",
-            FINAL_GUARD_RETRY_MESSAGE.to_string(),
-        )
-        .with_id(self.next_message_id("tool"));
+        let extra = if has_json_tool_calls_outside_blocks(assistant_message) {
+            tracing::warn!(
+                "ANVIL_FINAL guard: detected raw JSON tool calls outside ANVIL_TOOL blocks"
+            );
+            "\nDetected raw JSON tool calls outside ANVIL_TOOL blocks — these are ignored. \
+             Wrap every tool call in ```ANVIL_TOOL ... ``` blocks."
+        } else {
+            ""
+        };
+        let message = format!("{}{}", FINAL_GUARD_RETRY_MESSAGE, extra);
+        let retry_msg = SessionMessage::new(MessageRole::Tool, "system", message)
+            .with_id(self.next_message_id("tool"));
         self.session.push_message(retry_msg);
     }
 
@@ -1708,7 +1731,8 @@ impl App {
             {
                 // ANVIL_FINAL detected → record observation (Issue #159)
                 self.phase_estimator.observe_anvil_final();
-                self.inject_final_guard_retry();
+                // Issue #217: Pass assistant_message for JSON tool call detection
+                self.inject_final_guard_retry_with_context(assistant_message);
                 // Record the assistant message that triggered the guard
                 self.record_assistant_output(self.next_message_id("assistant"), assistant_message)?;
                 // Re-invoke LLM and process the response
@@ -2039,6 +2063,34 @@ pub(crate) fn is_trusted(
     trusted_tools.contains(tool_name)
 }
 
+/// Issue #217: Detect raw JSON tool calls that appear outside ANVIL_TOOL blocks.
+///
+/// Some LLMs (qwen3.5 with custom ANVIL.md JSON examples) output tool calls
+/// as plain JSON objects instead of ```ANVIL_TOOL blocks, causing them to be
+/// silently ignored by the parser.
+fn has_json_tool_calls_outside_blocks(content: &str) -> bool {
+    if content.is_empty() {
+        return false;
+    }
+    // Strip text inside ANVIL_TOOL blocks to avoid false positives on valid tool calls.
+    let mut outside = String::new();
+    let mut remaining = content;
+    while let Some(start) = remaining.find("```ANVIL_TOOL") {
+        outside.push_str(&remaining[..start]);
+        let after = &remaining[start..];
+        if let Some(end) = after.find("\n```") {
+            remaining = &after[end + 4..];
+        } else {
+            // Unclosed block — treat rest as inside block (no false positive)
+            remaining = "";
+            break;
+        }
+    }
+    outside.push_str(remaining);
+    // Look for JSON-format tool call patterns outside blocks
+    outside.contains("\"tool\":\"") || outside.contains("\"tool\": \"")
+}
+
 #[cfg(test)]
 mod trust_tests {
     use super::*;
@@ -2185,5 +2237,63 @@ mod trust_tests {
         assert!(result.contains("file.read"));
         assert!(result.contains("file.edit"));
         assert!(result.contains("shell.exec"));
+    }
+}
+
+#[cfg(test)]
+mod json_tool_detection_tests {
+    use super::*;
+
+    // --- has_json_tool_calls_outside_blocks ---
+
+    #[test]
+    fn detects_json_tool_call_outside_blocks() {
+        let content = r#"Here is my plan.
+{"tool":"file.read","path":"."}
+```ANVIL_FINAL
+Done.
+```"#;
+        assert!(has_json_tool_calls_outside_blocks(content));
+    }
+
+    #[test]
+    fn ignores_json_inside_anvil_tool_block() {
+        let content = r#"```ANVIL_TOOL
+{"tool":"file.read","path":"."}
+```
+```ANVIL_FINAL
+Done.
+```"#;
+        assert!(!has_json_tool_calls_outside_blocks(content));
+    }
+
+    #[test]
+    fn empty_content_returns_false() {
+        assert!(!has_json_tool_calls_outside_blocks(""));
+    }
+
+    #[test]
+    fn plain_text_no_json_returns_false() {
+        let content = "I will implement the changes using file.write and file.edit.";
+        assert!(!has_json_tool_calls_outside_blocks(content));
+    }
+
+    #[test]
+    fn detects_json_with_space_after_colon() {
+        let content = r#"{"tool": "shell.exec","command":"cargo build"}"#;
+        assert!(has_json_tool_calls_outside_blocks(content));
+    }
+
+    #[test]
+    fn mixed_valid_and_raw_json_detects_raw() {
+        // Valid tool call inside block, PLUS raw JSON outside
+        let content = r#"```ANVIL_TOOL
+{"tool":"file.read","path":"."}
+```
+But also this: {"tool":"file.write","path":"a.txt","content":"x"}
+```ANVIL_FINAL
+Done.
+```"#;
+        assert!(has_json_tool_calls_outside_blocks(content));
     }
 }

@@ -1319,7 +1319,29 @@ pub fn sanitize_markers(content: &str) -> (String, bool) {
                 sanitized.replace(marker, &marker.replace("```", "\u{FF40}\u{FF40}\u{FF40}"));
         }
     }
+
+    // Issue #217: Warn when ANVIL.md contains JSON-format tool call examples
+    // (e.g. {"tool":"shell.exec","command":"..."}).  Such examples cause some
+    // LLMs (qwen3.5 / LM Studio) to output tool calls in JSON format rather
+    // than ANVIL_TOOL blocks, leading to 0-turn termination.
+    if has_json_tool_examples(&sanitized) {
+        eprintln!(
+            "Warning: ANVIL.md contains JSON-format tool call examples \
+             (e.g. {{\"tool\":\"...\",\"command\":\"...\"}}). \
+             This may cause LLMs to use the wrong tool call format instead of \
+             ANVIL_TOOL blocks, leading to immediate session termination. \
+             Consider removing such examples or wrapping them in plain code blocks \
+             (``` without an ANVIL_TOOL label)."
+        );
+    }
+
     (sanitized, found)
+}
+
+/// Returns true when `content` appears to contain JSON-format tool call examples
+/// that could confuse LLMs into using the wrong protocol format (Issue #217).
+fn has_json_tool_examples(content: &str) -> bool {
+    content.contains("\"tool\":\"") || content.contains("\"tool\": \"")
 }
 
 fn parse_bool(value: &str) -> bool {

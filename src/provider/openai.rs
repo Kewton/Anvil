@@ -75,6 +75,9 @@ struct OpenAiChatResponse {
 
 #[derive(Debug, Clone, Deserialize)]
 struct OpenAiStreamChunk {
+    // #[serde(default)]: LM Studio sends warm-up chunks without `choices`
+    // during initial model load. Treat missing field as empty vec and skip.
+    #[serde(default)]
     choices: Vec<OpenAiDeltaChoice>,
     #[serde(default)]
     usage: Option<OpenAiUsage>,
@@ -652,9 +655,16 @@ impl<T: HttpTransport> OpenAiCompatibleProviderClient<T> {
                         }
                     }
                     Err(err) => {
-                        had_error = Some(ProviderTurnError::Backend(format!(
-                            "invalid openai stream chunk: {err}"
-                        )));
+                        // Issue #217: Skip non-parseable chunks (e.g. LM Studio
+                        // warm-up metadata without `choices`) instead of treating
+                        // them as fatal errors. Modification of #[serde(default)]
+                        // on OpenAiStreamChunk.choices handles the most common
+                        // case; this catch-all covers any remaining edge cases.
+                        tracing::debug!(
+                            chunk = %payload,
+                            error = %err,
+                            "skipping unrecognized openai stream chunk"
+                        );
                     }
                 }
             })?;

@@ -1270,3 +1270,28 @@ fn mode_config_default_log_format_is_text() {
     let config = EffectiveConfig::load().expect("config should load");
     assert_eq!(config.mode.log_format, LogFormat::Text);
 }
+
+// =============================================================================
+// Issue #217: JSON tool example detection in ANVIL.md
+// =============================================================================
+
+#[test]
+fn sanitize_markers_warns_on_json_tool_examples() {
+    // Content with JSON format tool call example (like commandindexdev ANVIL.md)
+    let content_with_json = r#"## Rules
+1. Before changes, run:
+   {"tool":"shell.exec","command":"commandindexdev before-change src/lib/detection --format llm"}
+"#;
+    // sanitize_markers should complete without panic; warning is printed to stderr
+    let (sanitized, found) = sanitize_markers(content_with_json);
+    assert!(!found); // No ANVIL_TOOL/ANVIL_FINAL backtick markers
+    assert_eq!(sanitized, content_with_json); // Content unchanged (only warning emitted)
+}
+
+#[test]
+fn sanitize_markers_no_warn_for_clean_anvil_md() {
+    let clean_content = "## Rules\n1. Use file.edit for incremental changes.\n2. Always verify before editing.\n";
+    let (sanitized, found) = sanitize_markers(clean_content);
+    assert!(!found);
+    assert_eq!(sanitized, clean_content);
+}
