@@ -16,6 +16,7 @@ pub mod policy;
 pub(crate) mod read_repeat_tracker;
 pub(crate) mod read_transition_guard;
 pub mod render;
+pub mod suggestion;
 pub(crate) mod write_fail_tracker;
 pub(crate) mod write_repeat_tracker;
 
@@ -271,6 +272,8 @@ pub struct App {
     session_stats: SessionStats,
     /// Last compact operation info for turn summary reporting (Issue #206).
     last_compact_info: Option<CompactInfo>,
+    /// Last slash command executed (volatile, for suggestion heuristics Issue #221).
+    last_slash_command: Option<String>,
 }
 
 /// Whether the session loop should continue or exit.
@@ -600,6 +603,7 @@ impl App {
             file_read_cache,
             session_stats: SessionStats::new(),
             last_compact_info: None,
+            last_slash_command: None,
         })
     }
 
@@ -1069,6 +1073,7 @@ impl App {
         self.current_session_name = name.to_string();
         self.active_model = None;
         self.active_context_window = None;
+        self.clear_transient_state();
 
         // Clear file read cache on session switch (DR2-004)
         if let Ok(mut cache) = self.file_read_cache.lock() {
@@ -1830,12 +1835,17 @@ impl App {
         // Exclude all messages from frame rendering because they were
         // already shown during the live turn — streaming to stderr and
         // tool execution output (Issue #1).
-        self.session.console_render_context(
+        let mut ctx = self.session.console_render_context(
             self.state_machine.snapshot(),
             self.effective_model(),
             self.config.runtime.max_console_messages,
             true,
-        )
+        );
+        // Config guard: inject suggestion only when enabled and interactive (Issue #221).
+        if self.config.runtime.suggestion_enabled && self.config.mode.interactive {
+            ctx.suggestion = self.suggest_next_input(&ctx.snapshot);
+        }
+        ctx
     }
 
     fn build_startup_render_context(&self) -> ConsoleRenderContext {
@@ -1847,6 +1857,27 @@ impl App {
             self.config.runtime.max_console_messages,
             false,
         )
+    }
+
+    /// Generate a prompt suggestion based on current session state (Issue #221).
+    ///
+    /// Pure generation logic; config guards are applied by the caller.
+    fn suggest_next_input(&self, snapshot: &AppStateSnapshot) -> Option<String> {
+        let recent = self.session.last_n_messages(5);
+        let ctx = suggestion::SuggestionContext {
+            state: &snapshot.state,
+            tool_logs: &snapshot.tool_logs,
+            working_memory: &self.session.working_memory,
+            recent_messages: recent,
+            last_slash_command: self.last_slash_command.as_deref(),
+            message_count: self.session.messages.len(),
+        };
+        suggestion::suggest(&ctx)
+    }
+
+    /// Clear volatile transient state (called on /reset, session switch, non-slash turn completion).
+    fn clear_transient_state(&mut self) {
+        self.last_slash_command = None;
     }
 
     fn next_message_id(&self, prefix: &str) -> String {
@@ -1901,6 +1932,8 @@ impl App {
             return self.handle_slash_command(trimmed, provider_client, tui);
         }
 
+        // Clear transient state after non-slash live turn (Issue #221).
+        self.clear_transient_state();
         self.run_turn_to_output(trimmed, provider_client, tui)
     }
 
@@ -1945,6 +1978,9 @@ impl App {
         provider_client: &impl ProviderClient,
         tui: &Tui,
     ) -> Result<CliTurnOutput, AppError> {
+        // Track last slash command for suggestion heuristics (Issue #221).
+        self.last_slash_command = Some(command.to_string());
+
         let output = match self
             .extensions
             .find_slash_command(command)
@@ -2130,6 +2166,7 @@ impl App {
             }
             Some(SlashCommandAction::Reset) => {
                 let _ = self.reset_to_ready()?;
+                self.clear_transient_state();
                 CliTurnOutput {
                     frames: vec![self.render_console(tui)?],
                     control: SessionControl::Continue,

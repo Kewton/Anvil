@@ -654,6 +654,15 @@ impl SessionRecord {
         self.messages.len()
     }
 
+    /// Return the last `limit` messages in chronological order (oldest first).
+    ///
+    /// Used by suggestion heuristics to detect recent conversation patterns.
+    pub fn last_n_messages(&self, limit: usize) -> Vec<&SessionMessage> {
+        let len = self.messages.len();
+        let start = len.saturating_sub(limit);
+        self.messages[start..].iter().collect()
+    }
+
     pub fn recent_message_views(
         &self,
         limit: usize,
@@ -745,6 +754,7 @@ impl SessionRecord {
             model_name: model_name.to_string(),
             messages,
             history_summary,
+            suggestion: None,
         }
     }
 

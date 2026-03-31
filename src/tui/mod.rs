@@ -3,6 +3,7 @@
 //! [`Tui`] is a stateless renderer that converts [`ConsoleRenderContext`]
 //! snapshots into plain-text frames for the terminal.
 
+use crate::app::render::sanitize_output_line;
 use crate::config::EffectiveConfig;
 use crate::contracts::{
     AppStateSnapshot, ConsoleMessageRole, ConsoleMessageView, ConsoleRenderContext,
@@ -194,6 +195,19 @@ impl Tui {
         lines.push(status_divider());
         lines.push(self.render_footer(snapshot, &view.model_name));
         lines.push(render_hint_line(snapshot));
+
+        // Suggestion line (Issue #221): shown unconditionally when Some.
+        // Done-state check is performed by suggest() — render just displays.
+        if let Some(ref suggestion) = view.suggestion {
+            // Reuse the existing sanitize helper (CB-002): strips ANSI escapes,
+            // collapses control chars, trims, and truncates with ellipsis.
+            const SUGGESTION_MAX_CHARS: usize = 120;
+            let sanitized = sanitize_output_line(suggestion, SUGGESTION_MAX_CHARS);
+            if !sanitized.is_empty() {
+                lines.push(format!("  [suggestion] {sanitized}"));
+            }
+        }
+
         lines.push(status_divider());
 
         // Done/Ready: do NOT emit "[U] you >" here — the interactive
@@ -311,10 +325,12 @@ fn summarize_tool_logs(logs: &[crate::contracts::ToolLogView]) -> (usize, usize,
     let mut interrupted = 0;
 
     for log in logs {
-        match log.action.as_str() {
-            "failed" => failed += 1,
-            "interrupted" => interrupted += 1,
-            _ => completed += 1,
+        if log.is_completed() {
+            completed += 1;
+        } else if log.action == "interrupted" {
+            interrupted += 1;
+        } else {
+            failed += 1;
         }
     }
 

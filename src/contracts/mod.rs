@@ -160,6 +160,15 @@ pub struct ToolLogView {
     pub elapsed_ms: Option<u64>,
 }
 
+impl ToolLogView {
+    /// Whether the tool execution completed (i.e. was not "failed" or "interrupted").
+    ///
+    /// DRY: used by both `summarize_tool_logs` and suggestion heuristics.
+    pub fn is_completed(&self) -> bool {
+        !matches!(self.action.as_str(), "failed" | "interrupted")
+    }
+}
+
 /// Context usage warning level based on threshold evaluation.
 ///
 /// Used as `Option<ContextWarningLevel>` where `None` means no warning.
@@ -247,6 +256,9 @@ pub struct ConsoleRenderContext {
     pub model_name: String,
     pub messages: Vec<ConsoleMessageView>,
     pub history_summary: Option<String>,
+    /// Prompt suggestion for the next likely user input. Display-only, not persisted.
+    #[serde(default)]
+    pub suggestion: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
