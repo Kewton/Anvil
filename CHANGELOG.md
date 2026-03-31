@@ -2,6 +2,29 @@
 
 ## [Unreleased]
 
+## [0.0.8] - 2026-03-31
+
+### Added
+- ANVIL.md custom tool registration with `## tools` section (#193)
+- Sidecar model LLM-based context summarization (#195)
+- Read repeat tracker to detect and warn repeated file.read (#185)
+- Write repeat tracker to prevent file.edit→file.write loop (#184)
+- Duplicate tool call deduplication in single turn (#186)
+- Debug observability with turn summaries, file.edit details, and session metrics (#206)
+- Cause-analysis and current-situation slash commands
+
+### Fixed
+- Raise thresholds to reduce CI-induced implementation suppression (#187)
+- Use `min(context_window, context_budget)` for auto-compact threshold (#200)
+- Use `config.runtime.context_budget` in `derive_context_budget()` (#198)
+- Run auto-compact in non-interactive mode (`--exec-file`/`--exec`/`--oneshot`) (#202)
+- Add `max_output_tokens` to prevent infinite LLM stream (#204)
+- Use `context_budget` instead of `context_window` in turn summary budget display (#208)
+
+### Changed
+- Improve sidecar summarization prompt for coding tasks (#209)
+- Enforce Codex reviewer via `--agent codex` in multi-stage review commands
+
 ## [0.0.7] - 2026-03-27
 
 ### Added
