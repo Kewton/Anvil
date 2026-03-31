@@ -597,6 +597,68 @@ fn openai_compatible_provider_forwards_authorization_header() {
 }
 
 #[test]
+fn openai_compatible_provider_accepts_base_url_with_v1_suffix() {
+    let request = ProviderTurnRequest::new(
+        "local-openai".to_string(),
+        vec![anvil::provider::ProviderMessage::new(
+            ProviderMessageRole::User,
+            "inspect src/provider",
+        )],
+        false,
+    );
+
+    let seen_urls = Rc::new(RefCell::new(Vec::new()));
+    let transport = MockHttpTransport {
+        seen_urls: seen_urls.clone(),
+        seen_bodies: Rc::new(RefCell::new(Vec::new())),
+        seen_headers: Rc::new(RefCell::new(Vec::new())),
+        response: HttpResponse {
+            status_code: 200,
+            body: br#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#.to_vec(),
+        },
+        get_response: None,
+    };
+    let client = anvil::provider::openai::OpenAiCompatibleProviderClient::with_transport(
+        "http://localhost:1234/v1",
+        transport,
+    );
+
+    client
+        .stream_turn(&request, &mut |_event| {})
+        .expect("request with /v1 base url should succeed");
+
+    assert_eq!(
+        seen_urls.borrow()[0],
+        "http://localhost:1234/v1/chat/completions"
+    );
+}
+
+#[test]
+fn openai_health_check_accepts_base_url_with_v1_suffix() {
+    let seen_urls = Rc::new(RefCell::new(Vec::new()));
+    let transport = MockHttpTransport {
+        seen_urls: seen_urls.clone(),
+        seen_bodies: Rc::new(RefCell::new(Vec::new())),
+        seen_headers: Rc::new(RefCell::new(Vec::new())),
+        response: HttpResponse {
+            status_code: 200,
+            body: br#"{"data":[]}"#.to_vec(),
+        },
+        get_response: None,
+    };
+    let client = anvil::provider::openai::OpenAiCompatibleProviderClient::with_transport(
+        "http://localhost:1234/v1",
+        transport,
+    );
+
+    client
+        .health_check()
+        .expect("health check with /v1 base url should succeed");
+
+    assert_eq!(seen_urls.borrow()[0], "http://localhost:1234/v1/models");
+}
+
+#[test]
 fn live_turn_executes_structured_response_from_openai_compatible_provider() {
     let root = common::unique_test_dir("openai_structured_write");
     let mut config = common::build_config_in(root.clone());
@@ -639,6 +701,144 @@ fn live_turn_executes_structured_response_from_openai_compatible_provider() {
         frames
             .iter()
             .any(|frame| frame.contains("file.write completed ./sandbox/openai/index.html"))
+    );
+}
+
+#[test]
+fn live_turn_executes_native_tool_calls_response_from_openai_compatible_provider() {
+    let root = common::unique_test_dir("openai_native_tool_calls_write");
+    fs::create_dir_all(&root).expect("test root should be created");
+    let mut config = common::build_config_in(root.clone());
+    config.mode.approval_required = false;
+    config.runtime.provider = "openai".to_string();
+    config.runtime.provider_url = "http://localhost:1234".to_string();
+    config.runtime.stream = false;
+    let provider_ctx =
+        anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
+    let mut app = anvil::app::App::new(
+        config,
+        provider_ctx,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("app should initialize");
+    let tui = Tui::new();
+
+    let transport = MockHttpTransport {
+        seen_urls: Rc::new(RefCell::new(Vec::new())),
+        seen_bodies: Rc::new(RefCell::new(Vec::new())),
+        seen_headers: Rc::new(RefCell::new(Vec::new())),
+        response: HttpResponse {
+            status_code: 200,
+            body: br#"{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_native_write_001","type":"function","function":{"name":"file_write","arguments":"{\"path\":\"./sandbox/native/nonstream.html\",\"content\":\"<html><body>native non-stream</body></html>\"}"}}]}}],"stats":{},"system_fingerprint":"qwen3.5"}"#.to_vec(),
+        },
+        get_response: None,
+    };
+    let client = anvil::provider::openai::OpenAiCompatibleProviderClient::with_transport(
+        "http://localhost:1234",
+        transport,
+    );
+
+    let frames = app
+        .run_live_turn("build via native tool_calls", &client, &tui)
+        .expect("native tool_calls response should execute");
+
+    let written = fs::read_to_string(root.join("sandbox/native/nonstream.html"))
+        .expect("file should be written from native tool_calls");
+    assert!(written.contains("native non-stream"));
+    assert!(
+        frames
+            .iter()
+            .any(|frame| frame.contains("file.write completed ./sandbox/native/nonstream.html"))
+    );
+}
+
+#[test]
+fn live_turn_executes_streaming_native_tool_calls_response_from_openai_compatible_provider() {
+    let root = common::unique_test_dir("openai_streaming_native_tool_calls_write");
+    fs::create_dir_all(&root).expect("test root should be created");
+    let mut config = common::build_config_in(root.clone());
+    config.mode.approval_required = false;
+    config.runtime.provider = "openai".to_string();
+    config.runtime.provider_url = "http://localhost:1234".to_string();
+    config.runtime.stream = true;
+    let provider_ctx =
+        anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
+    let mut app = anvil::app::App::new(
+        config,
+        provider_ctx,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("app should initialize");
+    let tui = Tui::new();
+
+    let transport = MockHttpTransport {
+        seen_urls: Rc::new(RefCell::new(Vec::new())),
+        seen_bodies: Rc::new(RefCell::new(Vec::new())),
+        seen_headers: Rc::new(RefCell::new(Vec::new())),
+        response: HttpResponse {
+            status_code: 200,
+            body: concat!(
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_stream_write_001\",\"type\":\"function\",\"function\":{\"name\":\"file_write\",\"arguments\":\"{\\\"path\\\":\\\"./sandbox/native/stream.html\\\",\"}}]},\"finish_reason\":null}]}\n",
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"content\\\":\\\"<html><body>native stream</body></html>\\\"}\"}}]},\"finish_reason\":null}]}\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n",
+                "data: [DONE]\n"
+            )
+            .as_bytes()
+            .to_vec(),
+        },
+        get_response: None,
+    };
+    let client = anvil::provider::openai::OpenAiCompatibleProviderClient::with_transport(
+        "http://localhost:1234",
+        transport,
+    );
+
+    let frames = app
+        .run_live_turn("build via streaming native tool_calls", &client, &tui)
+        .expect("streaming native tool_calls response should execute");
+
+    let written = fs::read_to_string(root.join("sandbox/native/stream.html"))
+        .expect("file should be written from streaming native tool_calls");
+    assert!(written.contains("native stream"));
+    assert!(
+        frames
+            .iter()
+            .any(|frame| frame.contains("file.write completed ./sandbox/native/stream.html"))
+    );
+}
+
+#[test]
+fn openai_compatible_provider_surfaces_invalid_native_tool_call_arguments() {
+    let request = ProviderTurnRequest::new(
+        "local-openai".to_string(),
+        vec![anvil::provider::ProviderMessage::new(
+            ProviderMessageRole::User,
+            "inspect src/provider",
+        )],
+        false,
+    );
+
+    let transport = MockHttpTransport {
+        seen_urls: Rc::new(RefCell::new(Vec::new())),
+        seen_bodies: Rc::new(RefCell::new(Vec::new())),
+        seen_headers: Rc::new(RefCell::new(Vec::new())),
+        response: HttpResponse {
+            status_code: 200,
+            body: br#"{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_invalid_args_001","type":"function","function":{"name":"file_write","arguments":"{not json}"}}]}}]}"#.to_vec(),
+        },
+        get_response: None,
+    };
+    let client = anvil::provider::openai::OpenAiCompatibleProviderClient::with_transport(
+        "http://localhost:1234",
+        transport,
+    );
+
+    let err = client
+        .stream_turn(&request, &mut |_| {})
+        .expect_err("invalid native tool call arguments should surface");
+    assert!(
+        err.to_string()
+            .contains("invalid openai tool_call arguments")
     );
 }
 
@@ -3510,6 +3710,147 @@ fn anvil_final_guard_does_not_fire_when_file_write_was_executed() {
     let content =
         std::fs::read_to_string(root.join("output.txt")).expect("output.txt should exist");
     assert!(content.contains("hello world"));
+}
+
+#[test]
+fn synthetic_guidance_followup_without_edits_triggers_final_guard_retry() {
+    let root = common::unique_test_dir("guidance_retry");
+    let mut config = common::build_config_in(root.clone());
+    config.mode.approval_required = false;
+    let provider_ctx =
+        anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
+    let mut app = anvil::app::App::new(
+        config,
+        provider_ctx,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("app should initialize");
+    let tui = Tui::new();
+
+    std::fs::create_dir_all(root.join("src")).expect("create src dir");
+    for i in 0..8 {
+        std::fs::write(
+            root.join(format!("src/file_{i}.rs")),
+            format!("fn f{i}() {{}}\n"),
+        )
+        .expect("write fixture file");
+    }
+
+    let seen_requests = Rc::new(RefCell::new(Vec::new()));
+
+    struct GuidanceRetryProvider {
+        seen_requests: Rc<RefCell<Vec<ProviderTurnRequest>>>,
+    }
+
+    impl ProviderClient for GuidanceRetryProvider {
+        fn stream_turn(
+            &self,
+            request: &ProviderTurnRequest,
+            emit: &mut dyn FnMut(ProviderEvent),
+        ) -> Result<(), ProviderTurnError> {
+            let call_index = self.seen_requests.borrow().len();
+            self.seen_requests.borrow_mut().push(request.clone());
+
+            match call_index {
+                0 => {
+                    let mut assistant_message = String::new();
+                    for i in 0..8 {
+                        assistant_message.push_str("```ANVIL_TOOL\n");
+                        assistant_message.push_str(&format!(
+                            "{{\"id\":\"call_{i:03}\",\"tool\":\"file.read\",\"path\":\"./src/file_{i}.rs\"}}\n"
+                        ));
+                        assistant_message.push_str("```\n");
+                    }
+                    assistant_message.push_str("```ANVIL_FINAL\n");
+                    assistant_message.push_str("Finished reading the repository.\n");
+                    assistant_message.push_str("```\n");
+
+                    emit(ProviderEvent::Agent(AgentEvent::Done {
+                        status: "Done. session saved".to_string(),
+                        assistant_message,
+                        completion_summary: "turn 1".to_string(),
+                        saved_status: "session saved".to_string(),
+                        tool_logs: Vec::new(),
+                        elapsed_ms: 0,
+                        inference_performance: None,
+                    }));
+                }
+                _ => {
+                    emit(ProviderEvent::TokenDelta(
+                        "I will now implement the change.".to_string(),
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    let provider = GuidanceRetryProvider {
+        seen_requests: seen_requests.clone(),
+    };
+
+    let _frames = app
+        .run_live_turn("implement the feature", &provider, &tui)
+        .expect("guidance retry scenario should succeed");
+
+    let requests = seen_requests.borrow();
+    assert_eq!(
+        requests.len(),
+        3,
+        "expected 3 provider calls: initial turn + guidance follow-up + final guard retry"
+    );
+    assert!(
+        app.session()
+            .messages
+            .iter()
+            .any(|m| m.role == anvil::session::MessageRole::Tool && m.author == "system.read_guard"),
+        "system.read_guard should be recorded in the session"
+    );
+    assert!(
+        app.session()
+            .messages
+            .iter()
+            .any(|m| m.content.contains("No file modifications detected")),
+        "guidance follow-up with no edits should escalate to the final guard retry"
+    );
+}
+
+#[test]
+fn live_turn_pins_latest_user_task_into_working_memory_prompt() {
+    let mut app = common::build_app();
+    let tui = Tui::new();
+    let seen_requests = Rc::new(RefCell::new(Vec::new()));
+    let provider = RecordingProvider {
+        seen_requests: seen_requests.clone(),
+        events: vec![ProviderEvent::Agent(AgentEvent::Done {
+            status: "Done. session saved".to_string(),
+            assistant_message: "done".to_string(),
+            completion_summary: "done".to_string(),
+            saved_status: "session saved".to_string(),
+            tool_logs: Vec::new(),
+            elapsed_ms: 0,
+            inference_performance: None,
+        })],
+        followup_events: Vec::new(),
+        error: None,
+    };
+
+    let task = "fix the read-to-edit transition";
+    let _ = app
+        .run_live_turn(task, &provider, &tui)
+        .expect("turn should succeed");
+
+    assert_eq!(
+        app.session().working_memory.active_task.as_deref(),
+        Some(task)
+    );
+
+    let requests = seen_requests.borrow();
+    let system_prompt = &requests[0].messages[0].content;
+    assert!(
+        system_prompt.contains("**Active task:** fix the read-to-edit transition"),
+        "system prompt should pin the latest user task for follow-up turns"
+    );
 }
 
 #[test]

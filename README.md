@@ -35,7 +35,11 @@ ollama pull qwen3.5:latest       # モデル取得（例）
 
 ```bash
 # LM Studio 等でサーバーを起動し、URL とモデル名を指定
+# provider-url は http://localhost:1234 と http://localhost:1234/v1 のどちらでも利用できます
 anvil --provider openai --provider-url http://localhost:1234 --model your-model
+
+# LM Studio を使うだけなら lmstudio エイリアスも利用できます
+anvil --provider lmstudio --model your-model
 ```
 
 ### 3. 起動
@@ -215,7 +219,7 @@ ANVIL_API_KEY=sk-...              # OpenAI互換APIキー
 ```
 anvil [OPTIONS]
 
-  -p, --provider <PROVIDER>              プロバイダー (ollama|openai)
+  -p, --provider <PROVIDER>              プロバイダー (ollama|openai|lmstudio)
   -m, --model <MODEL>                    モデル名
   -u, --provider-url <URL>               プロバイダーURL
       --sidecar-model <MODEL>            サイドカーモデル名
@@ -273,7 +277,8 @@ export SERPER_API_KEY=...          # Serper Web検索APIキー
 | プロバイダー | 設定例 |
 |-------------|--------|
 | Ollama | `anvil --model qwen3.5:35b` (デフォルト) |
-| OpenAI互換 | `anvil --provider openai --provider-url http://localhost:1234 --model your-model` |
+| LM Studio | `anvil --provider lmstudio --model your-model` |
+| OpenAI互換 | `anvil --provider openai --provider-url http://localhost:1234 --model your-model` (`/v1` 付きURLも可) |
 | API キー認証 | `ANVIL_API_KEY=Bearer sk-...` を環境変数に設定 |
 
 ---
