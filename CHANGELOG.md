@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [0.0.9] - 2026-03-31
+
+### Added
+- OpenAI native `tool_calls` support and LM Studio compatibility (#215)
+- Read transition guard to detect read-phase stalling
+
+### Fixed
+- Support `/v1` base URLs for OpenAI-compatible providers
+- OpenAI native tool calls parsing and response handling
+
 ## [0.0.8] - 2026-03-31
 
 ### Added
