@@ -161,6 +161,8 @@ pub struct RuntimeConfig {
     /// Maximum output tokens per LLM turn (Issue #204).
     /// Translated to provider-specific limits (Ollama `num_predict`, OpenAI `max_tokens`).
     pub max_output_tokens: Option<u32>,
+    /// Enable prompt suggestion UX (Issue #221). Default: true.
+    pub suggestion_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -341,6 +343,7 @@ impl EffectiveConfig {
                 ui_language: None,
                 max_tool_calls: DEFAULT_MAX_TOOL_CALLS,
                 max_output_tokens: Some(DEFAULT_MAX_OUTPUT_TOKENS),
+                suggestion_enabled: true,
             },
             mode: ModeConfig {
                 prompt_source: PromptSource::Interactive,
@@ -463,6 +466,7 @@ impl EffectiveConfig {
             "ANVIL_SAFE_WRITE_DELETION_RATIO",
             "ANVIL_UI_LANGUAGE",
             "ANVIL_MAX_TOOL_CALLS",
+            "ANVIL_SUGGESTION_ENABLED",
         ] {
             if let Ok(value) = std::env::var(key) {
                 map.insert(key.to_string(), value);
@@ -863,6 +867,9 @@ impl EffectiveConfig {
                         .parse()
                         .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
                     self.runtime.max_output_tokens = if v == 0 { None } else { Some(v) };
+                }
+                "suggestion_enabled" | "ANVIL_SUGGESTION_ENABLED" => {
+                    self.runtime.suggestion_enabled = parse_bool(value);
                 }
                 _ => {}
             }
@@ -1456,6 +1463,7 @@ impl std::fmt::Debug for RuntimeConfig {
             )
             .field("safe_write_max_lines", &self.safe_write_max_lines)
             .field("safe_write_deletion_ratio", &self.safe_write_deletion_ratio)
+            .field("suggestion_enabled", &self.suggestion_enabled)
             .finish()
     }
 }

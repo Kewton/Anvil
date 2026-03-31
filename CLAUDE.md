@@ -119,6 +119,7 @@ src/
 │   ├── plan.rs          # プラン管理
 │   ├── policy.rs        # offlineポリシーチェック（共通ヘルパー）
 │   ├── render.rs        # コンソール描画
+│   ├── suggestion.rs    # prompt suggestion エンジン（ヒューリスティックベース・Done ステート候補提示）
 │   └── mock.rs          # テスト用モック
 ├── config/mod.rs        # 設定管理
 ├── contracts/

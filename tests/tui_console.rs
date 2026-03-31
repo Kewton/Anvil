@@ -380,6 +380,7 @@ fn context_warning_bar_displayed_for_warning_level() {
         model_name: "test-model".to_string(),
         messages: vec![],
         history_summary: None,
+        suggestion: None,
     };
 
     let rendered = tui.render_console(&context);
@@ -407,6 +408,7 @@ fn context_warning_bar_displayed_for_critical_level() {
         model_name: "test-model".to_string(),
         messages: vec![],
         history_summary: None,
+        suggestion: None,
     };
 
     let rendered = tui.render_console(&context);
@@ -433,6 +435,7 @@ fn context_warning_bar_absent_when_no_warning() {
         model_name: "test-model".to_string(),
         messages: vec![],
         history_summary: None,
+        suggestion: None,
     };
 
     let rendered = tui.render_console(&context);
@@ -455,6 +458,7 @@ fn done_hint_line_includes_compact() {
         model_name: "test-model".to_string(),
         messages: vec![],
         history_summary: None,
+        suggestion: None,
     };
 
     let rendered = tui.render_console(&context);
@@ -612,6 +616,7 @@ fn tool_log_displays_elapsed_ms() {
         model_name: "test-model".to_string(),
         messages: vec![],
         history_summary: None,
+        suggestion: None,
     };
 
     let rendered = tui.render_console(&context);
@@ -638,6 +643,7 @@ fn tool_log_omits_elapsed_ms_when_none() {
         model_name: "test-model".to_string(),
         messages: vec![],
         history_summary: None,
+        suggestion: None,
     };
 
     let rendered = tui.render_console(&context);
@@ -667,6 +673,7 @@ fn footer_shows_perf_with_metrics() {
         model_name: "test-model".to_string(),
         messages: vec![],
         history_summary: None,
+        suggestion: None,
     };
 
     let rendered = tui.render_console(&context);
@@ -689,6 +696,7 @@ fn footer_shows_perf_dash_without_metrics() {
         model_name: "test-model".to_string(),
         messages: vec![],
         history_summary: None,
+        suggestion: None,
     };
 
     let rendered = tui.render_console(&context);
