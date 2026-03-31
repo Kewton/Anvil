@@ -2,9 +2,9 @@ mod common;
 
 use anvil::contracts::{AppEvent, AppStateSnapshot, RuntimeState};
 use anvil::session::{
-    MessageRole, MessageStatus, SessionMessage, SessionRecord, SessionStore, WorkingMemory,
-    build_conversation_text_for_summary, extract_file_targets, new_assistant_message,
-    new_user_message, validate_session_name,
+    MessageRole, MessageStatus, NoteCategory, SessionMessage, SessionNote, SessionRecord,
+    SessionStore, WorkingMemory, build_conversation_text_for_summary, extract_file_targets,
+    extract_session_notes, new_assistant_message, new_user_message, validate_session_name,
 };
 use anvil::state::{StateMachine, StateTransition};
 use std::path::PathBuf;
@@ -1931,4 +1931,420 @@ fn compact_history_public_signature_unchanged() {
     // Verify compact_history() still works with original signature (keep_recent: usize) -> bool
     let changed: bool = session.compact_history(5);
     assert!(changed);
+}
+
+// ── Issue #219: Session Note tests ──────────────────────────────────
+
+#[test]
+fn test_session_note_serde_roundtrip() {
+    let note = SessionNote {
+        source_index: 5,
+        category: NoteCategory::TaskProgress,
+        content: "Implement feature #219".to_string(),
+    };
+    let json = serde_json::to_string(&note).expect("serialize");
+    let restored: SessionNote = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(note, restored);
+
+    // Also test Constraint category
+    let constraint_note = SessionNote {
+        source_index: 10,
+        category: NoteCategory::Constraint,
+        content: "Build failed: missing dependency".to_string(),
+    };
+    let json2 = serde_json::to_string(&constraint_note).expect("serialize");
+    let restored2: SessionNote = serde_json::from_str(&json2).expect("deserialize");
+    assert_eq!(constraint_note, restored2);
+}
+
+#[test]
+fn test_working_memory_backward_compat() {
+    // JSON without session_notes or last_note_message_index should deserialize fine
+    let json = r#"{"active_task":null,"constraints":[],"touched_files":[],"unresolved_errors":[],"recent_diffs":null,"context_notice":null}"#;
+    let wm: WorkingMemory = serde_json::from_str(json).expect("deserialize");
+    assert!(wm.session_notes.is_empty());
+    assert_eq!(wm.last_note_message_index, 0);
+}
+
+#[test]
+fn test_last_note_message_index_backward_compat() {
+    // JSON without last_note_message_index field should default to 0
+    let json = r#"{"active_task":null,"constraints":[],"touched_files":[],"unresolved_errors":[],"recent_diffs":null,"context_notice":null,"session_notes":[]}"#;
+    let wm: WorkingMemory = serde_json::from_str(json).expect("deserialize");
+    assert_eq!(wm.last_note_message_index, 0);
+}
+
+#[test]
+fn test_is_empty_with_session_notes() {
+    let mut wm = WorkingMemory::default();
+    assert!(wm.is_empty());
+
+    wm.session_notes.push(SessionNote {
+        source_index: 0,
+        category: NoteCategory::TaskProgress,
+        content: "test".to_string(),
+    });
+    assert!(!wm.is_empty());
+}
+
+#[test]
+fn test_add_session_note_normalizes_and_redacts() {
+    let mut wm = WorkingMemory::default();
+
+    // Normal note should be added
+    wm.add_session_note(SessionNote {
+        source_index: 0,
+        category: NoteCategory::TaskProgress,
+        content: "Implement feature".to_string(),
+    });
+    assert_eq!(wm.session_notes.len(), 1);
+    assert_eq!(wm.session_notes[0].content, "Implement feature");
+
+    // Note with sensitive content should be redacted entirely
+    wm.add_session_note(SessionNote {
+        source_index: 1,
+        category: NoteCategory::Constraint,
+        content: "Bearer sk-1234567890abcdef".to_string(),
+    });
+    assert_eq!(wm.session_notes.len(), 2);
+    assert_eq!(wm.session_notes[1].content, "[redacted sensitive value]");
+
+    // Empty note should be rejected
+    wm.add_session_note(SessionNote {
+        source_index: 2,
+        category: NoteCategory::TaskProgress,
+        content: "   ".to_string(),
+    });
+    assert_eq!(wm.session_notes.len(), 2); // no new note added
+
+    // Note with ANVIL_TOOL markers should be sanitized
+    wm.add_session_note(SessionNote {
+        source_index: 3,
+        category: NoteCategory::TaskProgress,
+        content: "ANVIL_TOOL some task".to_string(),
+    });
+    assert_eq!(wm.session_notes.len(), 3);
+    assert!(!wm.session_notes[2].content.contains("ANVIL_TOOL"));
+
+    // Long note should be truncated to 200 chars
+    let long_content = "x".repeat(300);
+    wm.add_session_note(SessionNote {
+        source_index: 4,
+        category: NoteCategory::TaskProgress,
+        content: long_content,
+    });
+    assert_eq!(wm.session_notes.len(), 4);
+    assert!(wm.session_notes[3].content.chars().count() <= 200);
+}
+
+#[test]
+fn test_add_session_note_fifo_eviction() {
+    let mut wm = WorkingMemory::default();
+    for i in 0..25 {
+        wm.add_session_note(SessionNote {
+            source_index: i,
+            category: NoteCategory::TaskProgress,
+            content: format!("note {i}"),
+        });
+    }
+    assert_eq!(wm.session_notes.len(), WorkingMemory::MAX_SESSION_NOTES);
+    // Oldest notes (0..5) should have been evicted
+    assert_eq!(wm.session_notes[0].source_index, 5);
+    assert_eq!(wm.session_notes.last().unwrap().source_index, 24);
+}
+
+#[test]
+fn test_add_session_note_dedup() {
+    let mut wm = WorkingMemory::default();
+    wm.add_session_note(SessionNote {
+        source_index: 5,
+        category: NoteCategory::TaskProgress,
+        content: "first version".to_string(),
+    });
+    wm.add_session_note(SessionNote {
+        source_index: 5,
+        category: NoteCategory::TaskProgress,
+        content: "updated version".to_string(),
+    });
+    // Should have replaced, not added
+    assert_eq!(wm.session_notes.len(), 1);
+    assert_eq!(wm.session_notes[0].content, "updated version");
+
+    // Different category at same index should coexist
+    wm.add_session_note(SessionNote {
+        source_index: 5,
+        category: NoteCategory::Constraint,
+        content: "some constraint".to_string(),
+    });
+    assert_eq!(wm.session_notes.len(), 2);
+}
+
+#[test]
+fn test_format_for_prompt_includes_notes() {
+    let mut wm = WorkingMemory::default();
+    wm.add_session_note(SessionNote {
+        source_index: 0,
+        category: NoteCategory::TaskProgress,
+        content: "Implement issue #219".to_string(),
+    });
+    wm.add_session_note(SessionNote {
+        source_index: 3,
+        category: NoteCategory::Constraint,
+        content: "cargo build requires nightly".to_string(),
+    });
+
+    let prompt = wm.format_for_prompt().expect("should produce prompt");
+    assert!(prompt.contains("Session notes:"));
+    assert!(prompt.contains("[progress] Implement issue #219"));
+    assert!(prompt.contains("[constraint] cargo build requires nightly"));
+}
+
+#[test]
+fn test_note_category_label() {
+    assert_eq!(NoteCategory::TaskProgress.label(), "progress");
+    assert_eq!(NoteCategory::Constraint.label(), "constraint");
+}
+
+#[test]
+fn test_extract_task_progress() {
+    let messages = vec![
+        new_user_message("u1", "Please implement the session memory feature"),
+        SessionMessage::new(MessageRole::Assistant, "anvil", "I will implement it now"),
+    ];
+    let notes = extract_session_notes(&messages, 0, &[]);
+    let progress_notes: Vec<_> = notes
+        .iter()
+        .filter(|n| n.category == NoteCategory::TaskProgress)
+        .collect();
+    assert_eq!(progress_notes.len(), 1);
+    assert!(
+        progress_notes[0]
+            .content
+            .contains("implement the session memory")
+    );
+}
+
+#[test]
+fn test_extract_constraints_no_dup() {
+    let mut error_msg = SessionMessage::new(
+        MessageRole::Tool,
+        "bash",
+        "error: missing dependency libssl",
+    );
+    error_msg.is_error = true;
+
+    let messages = vec![new_user_message("u1", "run the build"), error_msg];
+
+    // Without matching unresolved_errors: should extract
+    let notes = extract_session_notes(&messages, 0, &[]);
+    let constraint_notes: Vec<_> = notes
+        .iter()
+        .filter(|n| n.category == NoteCategory::Constraint)
+        .collect();
+    assert_eq!(constraint_notes.len(), 1);
+
+    // With matching unresolved_errors: should NOT extract (dedup)
+    let unresolved = vec!["error: missing dependency libssl".to_string()];
+    let notes2 = extract_session_notes(&messages, 0, &unresolved);
+    let constraint_notes2: Vec<_> = notes2
+        .iter()
+        .filter(|n| n.category == NoteCategory::Constraint)
+        .collect();
+    assert_eq!(constraint_notes2.len(), 0);
+}
+
+#[test]
+fn test_extract_from_index_window() {
+    let messages = vec![
+        new_user_message("u1", "first task"),
+        SessionMessage::new(MessageRole::Assistant, "anvil", "done with first"),
+        new_user_message("u2", "second task"),
+        SessionMessage::new(MessageRole::Assistant, "anvil", "done with second"),
+    ];
+
+    // Extract from index 2: should only see "second task"
+    let notes = extract_session_notes(&messages, 2, &[]);
+    let progress: Vec<_> = notes
+        .iter()
+        .filter(|n| n.category == NoteCategory::TaskProgress)
+        .collect();
+    assert_eq!(progress.len(), 1);
+    assert!(progress[0].content.contains("second task"));
+    assert_eq!(progress[0].source_index, 2);
+}
+
+#[test]
+fn test_extract_from_beyond_messages_returns_empty() {
+    let messages = vec![new_user_message("u1", "hello")];
+    let notes = extract_session_notes(&messages, 100, &[]);
+    assert!(notes.is_empty());
+}
+
+#[test]
+fn test_compact_adjusts_last_note_index() {
+    let mut session = SessionRecord::new(PathBuf::from("/tmp/compact-note-idx"));
+    for i in 0..20 {
+        session.push_message(new_user_message(
+            format!("msg_{i:03}"),
+            format!("message {i}"),
+        ));
+    }
+
+    // Case A: last_note_message_index within compacted range
+    session.working_memory.last_note_message_index = 5;
+    session.compact_history(10); // split_at = 10
+    // Should be set to 1 (skip summary at index 0)
+    assert_eq!(session.working_memory.last_note_message_index, 1);
+
+    // Reset for Case B
+    let mut session2 = SessionRecord::new(PathBuf::from("/tmp/compact-note-idx2"));
+    for i in 0..20 {
+        session2.push_message(new_user_message(
+            format!("msg_{i:03}"),
+            format!("message {i}"),
+        ));
+    }
+    // Case B: last_note_message_index beyond compacted range
+    session2.working_memory.last_note_message_index = 15;
+    session2.compact_history(10); // split_at = 10
+    // Should be 15 - 10 + 1 = 6
+    assert_eq!(session2.working_memory.last_note_message_index, 6);
+}
+
+#[test]
+fn test_session_store_load_clamps_session_notes() {
+    let dir = common::unique_test_dir("clamp_notes");
+    std::fs::create_dir_all(&dir).unwrap();
+    let session_dir = dir.join("sessions");
+    std::fs::create_dir_all(&session_dir).unwrap();
+
+    // Create a session with too many notes
+    let mut session = SessionRecord::new(dir.clone());
+    for i in 0..30 {
+        session.working_memory.session_notes.push(SessionNote {
+            source_index: i,
+            category: NoteCategory::TaskProgress,
+            content: format!("note {i}"),
+        });
+    }
+
+    let store = SessionStore::new(session_dir.join("default.json"), session_dir.clone());
+    store.save(&session).unwrap();
+
+    let loaded = store.load().unwrap();
+    assert_eq!(
+        loaded.working_memory.session_notes.len(),
+        WorkingMemory::MAX_SESSION_NOTES
+    );
+    // Should have kept the last 20 (FIFO: first 10 drained)
+    assert_eq!(loaded.working_memory.session_notes[0].source_index, 10);
+}
+
+#[test]
+fn test_session_store_load_clamps_last_note_index() {
+    let dir = common::unique_test_dir("clamp_idx");
+    std::fs::create_dir_all(&dir).unwrap();
+    let session_dir = dir.join("sessions");
+    std::fs::create_dir_all(&session_dir).unwrap();
+
+    let mut session = SessionRecord::new(dir.clone());
+    session.push_message(new_user_message("u1", "hello"));
+    // Set index beyond messages.len()
+    session.working_memory.last_note_message_index = 999;
+
+    let store = SessionStore::new(session_dir.join("default.json"), session_dir.clone());
+    store.save(&session).unwrap();
+
+    let loaded = store.load().unwrap();
+    assert_eq!(
+        loaded.working_memory.last_note_message_index,
+        loaded.messages.len()
+    );
+}
+
+#[test]
+fn test_notes_survive_compaction() {
+    let mut session = SessionRecord::new(PathBuf::from("/tmp/notes-survive"));
+    for i in 0..20 {
+        session.push_message(new_user_message(
+            format!("msg_{i:03}"),
+            format!("message {i}"),
+        ));
+    }
+    session.working_memory.add_session_note(SessionNote {
+        source_index: 3,
+        category: NoteCategory::TaskProgress,
+        content: "important note".to_string(),
+    });
+
+    session.compact_history(10);
+
+    // Session notes should survive compaction
+    assert_eq!(session.working_memory.session_notes.len(), 1);
+    assert_eq!(
+        session.working_memory.session_notes[0].content,
+        "important note"
+    );
+}
+
+#[test]
+fn test_notes_in_system_prompt() {
+    let mut wm = WorkingMemory::default();
+    wm.add_session_note(SessionNote {
+        source_index: 0,
+        category: NoteCategory::TaskProgress,
+        content: "Working on issue #219".to_string(),
+    });
+    let prompt = wm.format_for_prompt().unwrap();
+    assert!(prompt.contains("Session notes:"));
+    assert!(prompt.contains("[progress] Working on issue #219"));
+}
+
+#[test]
+fn test_resume_preserves_notes() {
+    let dir = common::unique_test_dir("resume_notes");
+    std::fs::create_dir_all(&dir).unwrap();
+    let session_dir = dir.join("sessions");
+    std::fs::create_dir_all(&session_dir).unwrap();
+
+    let mut session = SessionRecord::new(dir.clone());
+    session.working_memory.add_session_note(SessionNote {
+        source_index: 5,
+        category: NoteCategory::TaskProgress,
+        content: "ongoing work".to_string(),
+    });
+    session.working_memory.last_note_message_index = 10;
+
+    let store = SessionStore::new(session_dir.join("default.json"), session_dir.clone());
+    store.save(&session).unwrap();
+
+    let loaded = store.load().unwrap();
+    assert_eq!(loaded.working_memory.session_notes.len(), 1);
+    assert_eq!(
+        loaded.working_memory.session_notes[0].content,
+        "ongoing work"
+    );
+    // last_note_message_index was 10, but messages.len() is 0, so clamped
+    assert_eq!(loaded.working_memory.last_note_message_index, 0);
+}
+
+#[test]
+fn test_sensitive_tool_error_is_redacted_or_dropped() {
+    let mut wm = WorkingMemory::default();
+
+    // Bearer token should be redacted
+    wm.add_session_note(SessionNote {
+        source_index: 0,
+        category: NoteCategory::Constraint,
+        content: "Authorization: Bearer abc123def456".to_string(),
+    });
+    assert_eq!(wm.session_notes[0].content, "[redacted sensitive value]");
+
+    // API key pattern should be redacted
+    wm.add_session_note(SessionNote {
+        source_index: 1,
+        category: NoteCategory::Constraint,
+        content: "api_key=sk_live_12345678".to_string(),
+    });
+    assert_eq!(wm.session_notes[1].content, "[redacted sensitive value]");
 }

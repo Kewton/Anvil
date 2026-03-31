@@ -20,6 +20,38 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+// ── Session Notes (Issue #219) ────────────────────────────────────────
+
+/// A single extracted session note from deterministic analysis.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionNote {
+    /// Approximate source message index for this note.
+    pub source_index: usize,
+    /// Category of the extracted note.
+    pub category: NoteCategory,
+    /// Extracted content (sanitized, max 200 chars).
+    pub content: String,
+}
+
+/// Category of a session note.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NoteCategory {
+    /// Task progress or completion (summary of user instructions).
+    TaskProgress,
+    /// Discovered errors or constraints not in unresolved_errors.
+    Constraint,
+}
+
+impl NoteCategory {
+    /// Human-readable label for prompt injection.
+    pub fn label(&self) -> &'static str {
+        match self {
+            NoteCategory::TaskProgress => "progress",
+            NoteCategory::Constraint => "constraint",
+        }
+    }
+}
+
 // ── Working Memory ────────────────────────────────────────────────────
 
 /// Structured working memory that persists across compaction.
@@ -53,6 +85,16 @@ pub struct WorkingMemory {
     /// turn request. Cleared each turn or after compaction.
     #[serde(default)]
     pub context_notice: Option<String>,
+
+    /// Session notes: extracted key points from completed turns (Issue #219).
+    /// FIFO eviction at MAX_SESSION_NOTES.
+    #[serde(default)]
+    pub session_notes: Vec<SessionNote>,
+
+    /// Last message index at which note extraction was performed.
+    /// Used to determine the extraction window for the next turn.
+    #[serde(default)]
+    pub last_note_message_index: usize,
 }
 
 impl WorkingMemory {
@@ -60,6 +102,8 @@ impl WorkingMemory {
     const MAX_TOUCHED_FILES: usize = 20;
     /// Maximum number of tracked errors.
     const MAX_UNRESOLVED_ERRORS: usize = 10;
+    /// Maximum number of session notes (Issue #219).
+    pub const MAX_SESSION_NOTES: usize = 20;
     /// Approximate token limit for recent_diffs.
     const MAX_DIFF_TOKENS: usize = 500;
 
@@ -118,6 +162,22 @@ impl WorkingMemory {
         self.constraints.push(constraint.into());
     }
 
+    /// Add a session note with normalization, dedup, and FIFO eviction (Issue #219).
+    pub fn add_session_note(&mut self, note: SessionNote) {
+        let note = match normalize_session_note(note) {
+            Some(n) => n,
+            None => return, // empty after sanitize/redact
+        };
+        // Dedup: remove existing note with same source_index + category
+        self.session_notes
+            .retain(|n| !(n.source_index == note.source_index && n.category == note.category));
+        self.session_notes.push(note);
+        // FIFO eviction
+        if self.session_notes.len() > Self::MAX_SESSION_NOTES {
+            self.session_notes.remove(0);
+        }
+    }
+
     /// Returns true if all fields are empty/None.
     pub fn is_empty(&self) -> bool {
         self.active_task.is_none()
@@ -126,6 +186,7 @@ impl WorkingMemory {
             && self.unresolved_errors.is_empty()
             && self.recent_diffs.is_none()
             && self.context_notice.is_none()
+            && self.session_notes.is_empty()
     }
 
     /// Serialize working memory into a human-readable format for system prompt injection.
@@ -164,6 +225,17 @@ impl WorkingMemory {
             ));
         }
 
+        // Session notes (Issue #219): injected before context_notice
+        if !self.session_notes.is_empty() {
+            let mut notes_section = String::new();
+            for note in &self.session_notes {
+                let entry = format!("- [{}] {}", note.category.label(), note.content);
+                notes_section.push_str(&sanitize_for_prompt_entry(&entry));
+                notes_section.push('\n');
+            }
+            sections.push(format!("Session notes:\n{}", notes_section));
+        }
+
         if let Some(ref notice) = self.context_notice {
             sections.push(format!(
                 "**Context notice:** {}",
@@ -195,6 +267,154 @@ pub(crate) fn sanitize_for_prompt_entry(input: &str) -> String {
         s = format!("{}...[truncated]", s.chars().take(497).collect::<String>());
     }
     s
+}
+
+/// Normalize a session note: sanitize, redact sensitive fragments,
+/// enforce 200-char limit, and reject empty content (Issue #219, DR4-001).
+fn normalize_session_note(mut note: SessionNote) -> Option<SessionNote> {
+    note.content = sanitize_for_prompt_entry(&note.content);
+    note.content = redact_sensitive_fragments(&note.content);
+    note.content = note.content.chars().take(200).collect();
+    if note.content.trim().is_empty() {
+        return None;
+    }
+    Some(note)
+}
+
+/// Redact sensitive patterns from a string (Issue #219, DR4-003).
+///
+/// Detects API keys, Bearer tokens, Cookies, Authorization headers,
+/// URL query credentials, and .env-style values, replacing them with
+/// `[redacted]`.
+fn redact_sensitive_fragments(input: &str) -> String {
+    /// Patterns that indicate sensitive content.
+    const SENSITIVE_PATTERNS: &[&str] = &[
+        "bearer ",
+        "authorization:",
+        "authorization ",
+        "api_key=",
+        "api_key:",
+        "apikey=",
+        "apikey:",
+        "api-key=",
+        "api-key:",
+        "token=",
+        "secret=",
+        "password=",
+        "password:",
+        "cookie:",
+        "set-cookie:",
+        "aws_secret",
+        "aws_access",
+        "private_key",
+    ];
+
+    let lower = input.to_ascii_lowercase();
+    for pattern in SENSITIVE_PATTERNS {
+        if lower.contains(pattern) {
+            return "[redacted sensitive value]".to_string();
+        }
+    }
+
+    // Check for long hex/base64-like tokens (potential API keys)
+    // Pattern: 32+ consecutive alphanumeric chars that look like keys
+    let mut consecutive_alnum = 0usize;
+    for ch in input.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '+' || ch == '/' || ch == '=' {
+            consecutive_alnum += 1;
+            if consecutive_alnum >= 40 {
+                return "[redacted sensitive value]".to_string();
+            }
+        } else {
+            consecutive_alnum = 0;
+        }
+    }
+
+    input.to_string()
+}
+
+// ── Session Note Extraction (Issue #219) ─────────────────────────────
+
+/// Extract session notes from messages starting at `from_index` (Issue #219).
+///
+/// This is a pure in-memory function that only reads existing session messages.
+/// It does NOT perform shell execution, web access, or provider calls (DR4-003).
+pub fn extract_session_notes(
+    messages: &[SessionMessage],
+    from_index: usize,
+    unresolved_errors: &[String],
+) -> Vec<SessionNote> {
+    if from_index >= messages.len() {
+        return Vec::new();
+    }
+    let window = &messages[from_index..];
+    let mut notes = Vec::new();
+    notes.extend(extract_task_progress_notes(window, from_index));
+    notes.extend(extract_constraint_notes(
+        window,
+        from_index,
+        unresolved_errors,
+    ));
+    notes
+}
+
+/// Extract a TaskProgress note from the last user message in the window.
+/// At most 1 note per window (the last user message).
+fn extract_task_progress_notes(window: &[SessionMessage], base_index: usize) -> Vec<SessionNote> {
+    // Find the last user message in the window
+    let mut last_user: Option<(usize, &SessionMessage)> = None;
+    for (offset, msg) in window.iter().enumerate() {
+        if msg.role == MessageRole::User {
+            last_user = Some((offset, msg));
+        }
+    }
+
+    match last_user {
+        Some((offset, msg)) => {
+            let content: String = msg.content.chars().take(150).collect();
+            if content.trim().is_empty() {
+                return Vec::new();
+            }
+            vec![SessionNote {
+                source_index: base_index + offset,
+                category: NoteCategory::TaskProgress,
+                content,
+            }]
+        }
+        None => Vec::new(),
+    }
+}
+
+/// Extract Constraint notes from error messages that are not already in
+/// unresolved_errors (dedup via substring match).
+fn extract_constraint_notes(
+    window: &[SessionMessage],
+    base_index: usize,
+    unresolved_errors: &[String],
+) -> Vec<SessionNote> {
+    let mut notes = Vec::new();
+    for (offset, msg) in window.iter().enumerate() {
+        if !msg.is_error {
+            continue;
+        }
+        let content: String = msg.content.chars().take(100).collect();
+        if content.trim().is_empty() {
+            continue;
+        }
+        // Skip if this error is already tracked in unresolved_errors (substring match)
+        let is_duplicate = unresolved_errors
+            .iter()
+            .any(|ue| content.contains(ue.as_str()) || ue.contains(content.trim()));
+        if is_duplicate {
+            continue;
+        }
+        notes.push(SessionNote {
+            source_index: base_index + offset,
+            category: NoteCategory::Constraint,
+            content,
+        });
+    }
+    notes
 }
 
 /// Truncate a string to approximately `max_tokens` tokens.
@@ -653,6 +873,16 @@ impl SessionRecord {
         // Messages have been restructured, so old pruning info is stale.
         self.working_memory.set_context_notice(None);
 
+        // Adjust last_note_message_index after drain+insert (Issue #219).
+        // (A) idx < split_at: compacted range already extracted → set to 1 (skip summary)
+        // (B) idx >= split_at: adjust for drain(-split_at) + insert(+1)
+        let idx = self.working_memory.last_note_message_index;
+        if idx < split_at {
+            self.working_memory.last_note_message_index = 1;
+        } else {
+            self.working_memory.last_note_message_index = idx - split_at + 1;
+        }
+
         self.record_event(AppEvent::SessionCompacted);
         self.touch();
         true
@@ -912,7 +1142,29 @@ impl SessionStore {
     pub fn load(&self) -> Result<SessionRecord, SessionError> {
         let contents =
             std::fs::read_to_string(&self.file_path).map_err(SessionError::SessionReadFailed)?;
-        serde_json::from_str(&contents).map_err(SessionError::SessionDeserializeFailed)
+        let mut record: SessionRecord =
+            serde_json::from_str(&contents).map_err(SessionError::SessionDeserializeFailed)?;
+
+        // Issue #219: re-normalize session_notes on load (CB-003: defense against
+        // tampered/legacy session JSON with unsanitized content)
+        record.working_memory.session_notes = record
+            .working_memory
+            .session_notes
+            .drain(..)
+            .filter_map(normalize_session_note)
+            .collect();
+        // Clamp to MAX_SESSION_NOTES
+        let max = WorkingMemory::MAX_SESSION_NOTES;
+        if record.working_memory.session_notes.len() > max {
+            let drain_count = record.working_memory.session_notes.len() - max;
+            record.working_memory.session_notes.drain(..drain_count);
+        }
+        // Clamp last_note_message_index to messages.len()
+        if record.working_memory.last_note_message_index > record.messages.len() {
+            record.working_memory.last_note_message_index = record.messages.len();
+        }
+
+        Ok(record)
     }
 
     pub fn save(&self, record: &SessionRecord) -> Result<(), SessionError> {

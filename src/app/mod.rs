@@ -40,7 +40,7 @@ use crate::retrieval::{
 };
 use crate::session::{
     MessageRole, MessageStatus, SessionError, SessionMessage, SessionRecord, SessionStore,
-    new_assistant_message, new_user_message,
+    extract_session_notes, new_assistant_message, new_user_message,
 };
 use crate::spinner::Spinner;
 use crate::state::{StateMachine, StateTransition};
@@ -1469,6 +1469,7 @@ impl App {
             }
         };
 
+        self.maybe_extract_session_notes(); // Issue #219: extract before flush
         self.flush_session()?;
         result
     }
@@ -1485,6 +1486,7 @@ impl App {
             .ok_or(AppError::NoPendingApproval)?;
         self.persist_session(AppEvent::SessionSaved)?;
         let result = self.execute_runtime_events(&pending_turn.remaining_events, tui);
+        self.maybe_extract_session_notes(); // Issue #219: extract before flush
         self.flush_session()?;
         result
     }
@@ -1573,6 +1575,51 @@ impl App {
     fn persist_session(&mut self, event: AppEvent) -> Result<(), AppError> {
         self.session.record_event(event);
         Ok(())
+    }
+
+    /// Extract session notes if trigger conditions are met (Issue #219).
+    ///
+    /// Called BEFORE `flush_session()` in `run_live_turn()` and
+    /// `approve_and_continue()`. NOT called in `deny_and_abort()`.
+    fn maybe_extract_session_notes(&mut self) {
+        let from = self.session.working_memory.last_note_message_index;
+        let messages = &self.session.messages;
+
+        if from >= messages.len() {
+            return;
+        }
+
+        // Trigger condition 1: token increment >= 10% of context window
+        let token_threshold = (self.effective_context_window() as f64 * 0.10) as usize;
+        let new_messages = &messages[from..];
+        let new_tokens: usize = new_messages
+            .iter()
+            .map(|m| {
+                crate::contracts::tokens::estimate_tokens(
+                    m.effective_content(),
+                    crate::contracts::tokens::ContentKind::from_message_role(m.role),
+                )
+            })
+            .sum();
+
+        // Trigger condition 2: tool calls >= 5 in the new message window
+        // Count Tool-role messages in the window since last extraction (not session cumulative)
+        let tool_calls_in_window = new_messages
+            .iter()
+            .filter(|m| m.role == crate::session::MessageRole::Tool)
+            .count();
+
+        if new_tokens < token_threshold && (tool_calls_in_window < 5) {
+            return;
+        }
+
+        // Extract notes
+        let unresolved = self.session.working_memory.unresolved_errors.clone();
+        let notes = extract_session_notes(&self.session.messages, from, &unresolved);
+        for note in notes {
+            self.session.working_memory.add_session_note(note);
+        }
+        self.session.working_memory.last_note_message_index = self.session.messages.len();
     }
 
     /// Flush session to disk if the dirty flag is set.
