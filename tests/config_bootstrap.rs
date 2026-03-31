@@ -91,6 +91,27 @@ fn openai_provider_bootstraps_from_config() {
 }
 
 #[test]
+fn lmstudio_provider_bootstraps_from_config() {
+    let mut config = EffectiveConfig::load().expect("config should load");
+    config.runtime.provider = "lmstudio".to_string();
+    config.runtime.provider_url = "http://localhost:1234/v1".to_string();
+
+    let provider = ProviderRuntimeContext::bootstrap(&config).expect("lmstudio should bootstrap");
+    let client = build_local_provider_client(
+        &config,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("lmstudio client should build");
+
+    assert_eq!(provider.backend, anvil::provider::ProviderBackend::OpenAi);
+    assert!(provider.capabilities.streaming);
+    assert!(matches!(
+        client,
+        anvil::provider::LocalProviderClient::OpenAi(_)
+    ));
+}
+
+#[test]
 fn provider_bootstrap_rejects_unknown_backend() {
     let mut config = EffectiveConfig::load().expect("config should load");
     config.runtime.provider = "unknown".to_string();
@@ -142,9 +163,66 @@ fn override_precedence_is_file_then_env_then_cli() {
 }
 
 #[test]
+fn provider_defaults_switch_to_lmstudio_url_when_provider_changes() {
+    let mut config = EffectiveConfig::default_for_test().expect("config should load");
+    config.runtime.provider = "lmstudio".to_string();
+
+    config
+        .validate_for_test()
+        .expect("lmstudio default url should validate");
+
+    assert_eq!(config.runtime.provider_url, "http://localhost:1234/v1");
+    assert!(!config.runtime.provider_url_explicitly_set);
+}
+
+#[test]
+fn provider_defaults_switch_to_openai_url_when_provider_changes() {
+    let mut config = EffectiveConfig::default_for_test().expect("config should load");
+    config.runtime.provider = "openai".to_string();
+
+    config
+        .validate_for_test()
+        .expect("openai default url should validate");
+
+    assert_eq!(config.runtime.provider_url, "https://api.openai.com/v1");
+    assert!(!config.runtime.provider_url_explicitly_set);
+}
+
+#[test]
+fn explicit_provider_url_is_preserved_for_lmstudio() {
+    let mut config = EffectiveConfig::default_for_test().expect("config should load");
+    let mut cli_values = HashMap::new();
+    cli_values.insert("provider".to_string(), "lmstudio".to_string());
+    cli_values.insert(
+        "provider_url".to_string(),
+        "http://custom-lmstudio:9999/v1".to_string(),
+    );
+
+    config
+        .apply_overrides_for_test(&HashMap::new(), &HashMap::new(), &cli_values)
+        .expect("overrides should apply");
+    config
+        .validate_for_test()
+        .expect("explicit provider url should validate");
+
+    assert_eq!(
+        config.runtime.provider_url,
+        "http://custom-lmstudio:9999/v1"
+    );
+    assert!(config.runtime.provider_url_explicitly_set);
+}
+
+#[test]
 fn max_agent_iterations_defaults_to_thirty() {
     let config = EffectiveConfig::default_for_test().expect("config should load");
     assert_eq!(config.runtime.max_agent_iterations, 30);
+}
+
+#[test]
+fn read_transition_guard_defaults_are_configured() {
+    let config = EffectiveConfig::default_for_test().expect("config should load");
+    assert_eq!(config.runtime.read_transition_threshold, 8);
+    assert_eq!(config.runtime.read_transition_reinject_interval, 2);
 }
 
 #[test]
@@ -374,6 +452,7 @@ fn validate_default_config_passes() {
 fn validate_rejects_empty_provider_url() {
     let mut config = EffectiveConfig::default_for_test().unwrap();
     config.runtime.provider_url = String::new();
+    config.runtime.provider_url_explicitly_set = true;
     let result = config.validate_for_test();
     assert!(result.is_err());
     assert!(
@@ -388,6 +467,7 @@ fn validate_rejects_empty_provider_url() {
 fn validate_rejects_invalid_provider_url_scheme() {
     let mut config = EffectiveConfig::default_for_test().unwrap();
     config.runtime.provider_url = "ftp://example.com".to_string();
+    config.runtime.provider_url_explicitly_set = true;
     let result = config.validate_for_test();
     assert!(result.is_err());
     assert!(

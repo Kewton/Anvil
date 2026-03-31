@@ -9,7 +9,7 @@ use std::path::PathBuf;
 #[derive(Parser, Debug, Default)]
 #[command(name = "anvil", version, about = "Local coding agent powered by LLM")]
 pub struct CliArgs {
-    /// Provider (ollama|openai)
+    /// Provider (ollama|openai|lmstudio)
     #[arg(short = 'p', long)]
     pub provider: Option<String>,
 

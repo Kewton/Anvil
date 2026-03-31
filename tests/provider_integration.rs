@@ -3713,6 +3713,147 @@ fn anvil_final_guard_does_not_fire_when_file_write_was_executed() {
 }
 
 #[test]
+fn synthetic_guidance_followup_without_edits_triggers_final_guard_retry() {
+    let root = common::unique_test_dir("guidance_retry");
+    let mut config = common::build_config_in(root.clone());
+    config.mode.approval_required = false;
+    let provider_ctx =
+        anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
+    let mut app = anvil::app::App::new(
+        config,
+        provider_ctx,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("app should initialize");
+    let tui = Tui::new();
+
+    std::fs::create_dir_all(root.join("src")).expect("create src dir");
+    for i in 0..8 {
+        std::fs::write(
+            root.join(format!("src/file_{i}.rs")),
+            format!("fn f{i}() {{}}\n"),
+        )
+        .expect("write fixture file");
+    }
+
+    let seen_requests = Rc::new(RefCell::new(Vec::new()));
+
+    struct GuidanceRetryProvider {
+        seen_requests: Rc<RefCell<Vec<ProviderTurnRequest>>>,
+    }
+
+    impl ProviderClient for GuidanceRetryProvider {
+        fn stream_turn(
+            &self,
+            request: &ProviderTurnRequest,
+            emit: &mut dyn FnMut(ProviderEvent),
+        ) -> Result<(), ProviderTurnError> {
+            let call_index = self.seen_requests.borrow().len();
+            self.seen_requests.borrow_mut().push(request.clone());
+
+            match call_index {
+                0 => {
+                    let mut assistant_message = String::new();
+                    for i in 0..8 {
+                        assistant_message.push_str("```ANVIL_TOOL\n");
+                        assistant_message.push_str(&format!(
+                            "{{\"id\":\"call_{i:03}\",\"tool\":\"file.read\",\"path\":\"./src/file_{i}.rs\"}}\n"
+                        ));
+                        assistant_message.push_str("```\n");
+                    }
+                    assistant_message.push_str("```ANVIL_FINAL\n");
+                    assistant_message.push_str("Finished reading the repository.\n");
+                    assistant_message.push_str("```\n");
+
+                    emit(ProviderEvent::Agent(AgentEvent::Done {
+                        status: "Done. session saved".to_string(),
+                        assistant_message,
+                        completion_summary: "turn 1".to_string(),
+                        saved_status: "session saved".to_string(),
+                        tool_logs: Vec::new(),
+                        elapsed_ms: 0,
+                        inference_performance: None,
+                    }));
+                }
+                _ => {
+                    emit(ProviderEvent::TokenDelta(
+                        "I will now implement the change.".to_string(),
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    let provider = GuidanceRetryProvider {
+        seen_requests: seen_requests.clone(),
+    };
+
+    let _frames = app
+        .run_live_turn("implement the feature", &provider, &tui)
+        .expect("guidance retry scenario should succeed");
+
+    let requests = seen_requests.borrow();
+    assert_eq!(
+        requests.len(),
+        3,
+        "expected 3 provider calls: initial turn + guidance follow-up + final guard retry"
+    );
+    assert!(
+        app.session()
+            .messages
+            .iter()
+            .any(|m| m.role == anvil::session::MessageRole::Tool && m.author == "system.read_guard"),
+        "system.read_guard should be recorded in the session"
+    );
+    assert!(
+        app.session()
+            .messages
+            .iter()
+            .any(|m| m.content.contains("No file modifications detected")),
+        "guidance follow-up with no edits should escalate to the final guard retry"
+    );
+}
+
+#[test]
+fn live_turn_pins_latest_user_task_into_working_memory_prompt() {
+    let mut app = common::build_app();
+    let tui = Tui::new();
+    let seen_requests = Rc::new(RefCell::new(Vec::new()));
+    let provider = RecordingProvider {
+        seen_requests: seen_requests.clone(),
+        events: vec![ProviderEvent::Agent(AgentEvent::Done {
+            status: "Done. session saved".to_string(),
+            assistant_message: "done".to_string(),
+            completion_summary: "done".to_string(),
+            saved_status: "session saved".to_string(),
+            tool_logs: Vec::new(),
+            elapsed_ms: 0,
+            inference_performance: None,
+        })],
+        followup_events: Vec::new(),
+        error: None,
+    };
+
+    let task = "fix the read-to-edit transition";
+    let _ = app
+        .run_live_turn(task, &provider, &tui)
+        .expect("turn should succeed");
+
+    assert_eq!(
+        app.session().working_memory.active_task.as_deref(),
+        Some(task)
+    );
+
+    let requests = seen_requests.borrow();
+    let system_prompt = &requests[0].messages[0].content;
+    assert!(
+        system_prompt.contains("**Active task:** fix the read-to-edit transition"),
+        "system prompt should pin the latest user task for follow-up turns"
+    );
+}
+
+#[test]
 fn anvil_final_guard_handle_structured_done_fires_for_plan_only_response() {
     // Scenario: Done event with ANVIL_FINAL but no tool calls (plan only).
     // Guard should fire via handle_structured_done path.

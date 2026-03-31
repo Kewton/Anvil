@@ -25,6 +25,7 @@ use crate::tooling::{PermissionClass, effective_permission_class};
 
 use super::policy::{OFFLINE_BLOCK_PAYLOAD, check_offline_blocked};
 use super::read_repeat_tracker::ReadRepeatAction;
+use super::read_transition_guard::ReadTransitionAction;
 use super::write_repeat_tracker::WriteRepeatAction;
 use super::{App, AppError, CompactInfo, format_tool_counts};
 
@@ -233,11 +234,21 @@ fn execute_parallel_group_standalone(
 
 /// Maximum number of ANVIL_FINAL guard retries (no-file-modification detection).
 const MAX_FINAL_GUARD_RETRIES: u8 = 1;
+const FILE_READ_RESULT_MAX_CHARS: usize = 2_000;
+const SYNTHETIC_GUIDANCE_RESULT_MAX_CHARS: usize = 1_200;
 
 /// Message sent to LLM when ANVIL_FINAL fires without file modifications.
 const FINAL_GUARD_RETRY_MESSAGE: &str = "No file modifications detected (file.write/file.edit not called). \
      Please implement the changes rather than just planning them. \
      Use file.write or file.edit to make the necessary code changes.";
+
+/// Synthetic guidance tools that must be shown to the model before accepting
+/// an ANVIL_FINAL termination.
+const GUIDANCE_TOOL_NAMES: &[&str] = &[
+    "system.read_guard",
+    "system.loop_detector",
+    "system.phase_estimator",
+];
 
 /// Maximum number of sub-agent calls allowed in a single turn (SR4-006).
 const MAX_SUBAGENT_CALLS_PER_TURN: usize = 3;
@@ -347,6 +358,20 @@ impl App {
         retries < MAX_FINAL_GUARD_RETRIES && self.session.working_memory.touched_files.is_empty()
     }
 
+    /// Check whether synthetic guidance was injected in the current turn and
+    /// should be shown to the model before honoring ANVIL_FINAL.
+    fn should_activate_guidance_retry(
+        &self,
+        already_used: bool,
+        results: &[ToolExecutionResult],
+    ) -> bool {
+        !already_used
+            && self.session.working_memory.touched_files.is_empty()
+            && results
+                .iter()
+                .any(|r| GUIDANCE_TOOL_NAMES.contains(&r.tool_name.as_str()))
+    }
+
     /// Inject a retry message into the session to prompt the LLM for actual implementation.
     /// See also: PROMPT_TOOL_RULES in src/agent/mod.rs for preventive guidance.
     fn inject_final_guard_retry(&mut self) {
@@ -387,6 +412,8 @@ impl App {
         let mut all_tool_log_views: Vec<ToolLogView> = Vec::new();
         let mut final_guard_retries: u8 = 0;
         let mut fallback_completed = false;
+        let mut guidance_retry_used = false;
+        let mut awaiting_guidance_followup = false;
         // Issue #173: Track whether ANVIL_FINAL has been seen in this session.
         // When true, the loop will terminate after executing the current batch
         // of tool calls (no further LLM round-trips).
@@ -398,6 +425,8 @@ impl App {
         self.alternating_loop_detector.reset();
         // Reset phase estimator per-turn counters (Issue #159)
         self.phase_estimator.reset();
+        // Reset read transition guard per-turn counters (Issue #216)
+        self.read_transition_guard.reset();
 
         for iteration in 0..max_iterations {
             let iteration_started = std::time::Instant::now();
@@ -477,8 +506,17 @@ impl App {
             // Issue #173: If ANVIL_FINAL was already seen, terminate after
             // executing the current tool batch (no further LLM round-trips).
             if anvil_final_seen {
-                tracing::info!("ANVIL_FINAL detected; terminating after tool execution");
-                break;
+                if self.should_activate_guidance_retry(guidance_retry_used, &results) {
+                    tracing::info!(
+                        "ANVIL_FINAL delayed: synthetic guidance injected, sending one follow-up turn"
+                    );
+                    guidance_retry_used = true;
+                    awaiting_guidance_followup = true;
+                    anvil_final_seen = false;
+                } else {
+                    tracing::info!("ANVIL_FINAL detected; terminating after tool execution");
+                    break;
+                }
             }
 
             // Max tool calls check (Issue #172)
@@ -632,6 +670,27 @@ impl App {
             }
 
             if next_structured.tool_calls.is_empty() {
+                if awaiting_guidance_followup {
+                    awaiting_guidance_followup = false;
+                    if self.should_activate_final_guard(final_guard_retries) {
+                        tracing::info!(
+                            "Guidance follow-up ended without edits; escalating to final guard retry"
+                        );
+                        if !next_structured.anvil_final_detected {
+                            self.phase_estimator.observe_anvil_final();
+                        }
+                        self.inject_final_guard_retry();
+                        final_guard_retries += 1;
+                        current = next_structured;
+                        continue;
+                    }
+                    tracing::info!("Guidance follow-up completed; accepting response");
+                    self.record_assistant_output(
+                        self.next_message_id("assistant"),
+                        next_structured.final_response,
+                    )?;
+                    break;
+                }
                 // ANVIL_FINAL guard: check if any file modifications were made
                 if self.should_activate_final_guard(final_guard_retries) {
                     // ANVIL_FINAL was detected → record observation (Issue #159)
@@ -668,6 +727,9 @@ impl App {
             }
 
             // More tool calls — continue the loop
+            if awaiting_guidance_followup {
+                awaiting_guidance_followup = false;
+            }
             current = next_structured;
         }
 
@@ -1162,6 +1224,7 @@ impl App {
         indexed_results.sort_by_key(|(idx, _)| *idx);
         let mut results: Vec<ToolExecutionResult> = Vec::with_capacity(indexed_results.len());
         let mut phase_action = super::phase_estimator::PhaseAction::Continue;
+        let mut read_transition_message: Option<String> = None;
         for (_, result) in indexed_results {
             self.record_tool_result(&result);
             // Phase estimator: record tool call pattern (Issue #159)
@@ -1171,6 +1234,12 @@ impl App {
                 .record_tool_call(&result.tool_name, success);
             if !matches!(pa, super::phase_estimator::PhaseAction::Continue) {
                 phase_action = pa;
+            }
+            let transition_action = self
+                .read_transition_guard
+                .record_tool_call(&result.tool_name, success);
+            if let ReadTransitionAction::Inject(msg) = transition_action {
+                read_transition_message = Some(msg);
             }
 
             // Emit folded tool result to stderr for interactive sessions
@@ -1226,12 +1295,29 @@ impl App {
             results.push(warning_result);
         }
 
+        if let Some(ref msg) = read_transition_message {
+            let transition_result = ToolExecutionResult {
+                tool_call_id: "read_transition_guard".to_string(),
+                tool_name: "system.read_guard".to_string(),
+                status: ToolExecutionStatus::Completed,
+                summary: msg.clone(),
+                payload: ToolExecutionPayload::Text(msg.clone()),
+                artifacts: vec![],
+                elapsed_ms: 0,
+                diff_summary: None,
+                edit_detail: None,
+            };
+            self.record_tool_result(&transition_result);
+            results.push(transition_result);
+        }
+
         // Phase estimator: inject force-transition message if needed (Issue #159).
-        // Skip if LoopDetector already issued a warning (priority: LoopDetector > PhaseEstimator).
+        // Skip if LoopDetector or read transition guard already issued a warning.
         if matches!(
             worst_loop_action,
             super::loop_detector::LoopAction::Continue
-        ) && let super::phase_estimator::PhaseAction::ForceTransition(msg) = phase_action
+        ) && read_transition_message.is_none()
+            && let super::phase_estimator::PhaseAction::ForceTransition(msg) = phase_action
         {
             // Context window protection: skip if usage >= 90%
             let usage = crate::contracts::ContextUsageView {
@@ -1894,6 +1980,7 @@ fn extract_write_path_from_summary(summary: &str) -> Option<String> {
 /// Includes the actual payload (file content, search matches) so the LLM
 /// can reason about the results in subsequent turns.
 pub fn format_tool_result_message(result: &ToolExecutionResult, max_chars: usize) -> String {
+    let max_chars = effective_tool_result_max_chars(result.tool_name.as_str(), max_chars);
     match &result.payload {
         ToolExecutionPayload::None => {
             format!("[tool result: {}] {}", result.tool_name, result.summary)
@@ -1904,6 +1991,15 @@ pub fn format_tool_result_message(result: &ToolExecutionResult, max_chars: usize
                 ToolExecutionStatus::Failed | ToolExecutionStatus::Interrupted => 20,
             };
             let truncated = truncate_with_head_tail(content, max_chars, head_pct);
+            if result.tool_name == "file.read"
+                && result.status == ToolExecutionStatus::Completed
+                && let Some(path) = result.artifacts.first()
+            {
+                return format!(
+                    "[tool result: {}] {}\nPath: {}\n{}",
+                    result.tool_name, result.summary, path, truncated
+                );
+            }
             format!(
                 "[tool result: {}] {}\n{}",
                 result.tool_name, result.summary, truncated
@@ -1925,6 +2021,16 @@ pub fn format_tool_result_message(result: &ToolExecutionResult, max_chars: usize
                 result.tool_name, source_path
             )
         }
+    }
+}
+
+fn effective_tool_result_max_chars(tool_name: &str, default_max_chars: usize) -> usize {
+    match tool_name {
+        "file.read" => default_max_chars.min(FILE_READ_RESULT_MAX_CHARS),
+        name if name.starts_with("system.") => {
+            default_max_chars.min(SYNTHETIC_GUIDANCE_RESULT_MAX_CHARS)
+        }
+        _ => default_max_chars,
     }
 }
 
@@ -2185,5 +2291,29 @@ mod trust_tests {
         assert!(result.contains("file.read"));
         assert!(result.contains("file.edit"));
         assert!(result.contains("shell.exec"));
+    }
+
+    #[test]
+    fn format_tool_result_message_caps_file_read_payload_more_aggressively() {
+        let result = ToolExecutionResult {
+            tool_call_id: "call_001".to_string(),
+            tool_name: "file.read".to_string(),
+            status: ToolExecutionStatus::Completed,
+            summary: "read ok".to_string(),
+            payload: ToolExecutionPayload::Text("A".repeat(3_000)),
+            artifacts: vec!["./src/main.rs".to_string()],
+            elapsed_ms: 0,
+            diff_summary: None,
+            edit_detail: None,
+        };
+
+        let formatted = format_tool_result_message(&result, 8_000);
+
+        assert!(formatted.contains("Path: ./src/main.rs"));
+        assert!(formatted.contains("[1000 chars truncated, 3000 chars total]"));
+        assert!(
+            !formatted.contains("[0 chars truncated"),
+            "file.read should use the tighter per-tool cap"
+        );
     }
 }

@@ -351,7 +351,7 @@ impl ProviderRuntimeContext {
     pub fn bootstrap(config: &EffectiveConfig) -> Result<Self, ProviderBootstrapError> {
         let backend = match config.runtime.provider.as_str() {
             "ollama" => ProviderBackend::Ollama,
-            "openai" => ProviderBackend::OpenAi,
+            "openai" | "lmstudio" => ProviderBackend::OpenAi,
             other => {
                 return Err(ProviderBootstrapError::UnsupportedBackend(
                     other.to_string(),
@@ -438,6 +438,12 @@ pub fn build_local_provider_client(
             }
             Ok(LocalProviderClient::OpenAi(client))
         }
+        "lmstudio" => Ok(LocalProviderClient::OpenAi(
+            openai::OpenAiCompatibleProviderClient::with_transport(
+                config.runtime.provider_url.clone(),
+                transport,
+            ),
+        )),
         other => Err(ProviderBootstrapError::UnsupportedBackend(
             other.to_string(),
         )),

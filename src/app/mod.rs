@@ -14,6 +14,7 @@ pub mod phase_estimator;
 pub mod plan;
 pub mod policy;
 pub(crate) mod read_repeat_tracker;
+pub(crate) mod read_transition_guard;
 pub mod render;
 pub(crate) mod write_fail_tracker;
 pub(crate) mod write_repeat_tracker;
@@ -256,6 +257,8 @@ pub struct App {
     edit_fail_tracker: edit_fail_tracker::EditFailTracker,
     /// Phase estimator for fallback phase control (Issue #159).
     phase_estimator: phase_estimator::PhaseEstimator,
+    /// Guard that forces a transition from exploration to implementation.
+    read_transition_guard: read_transition_guard::ReadTransitionGuard,
     /// Tracks consecutive file.write failures per path for recovery hints.
     write_fail_tracker: write_fail_tracker::WriteFailTracker,
     /// Tracks repeated file.read calls per path for hint injection (Issue #185).
@@ -540,6 +543,8 @@ impl App {
         let phase_explore = config.runtime.phase_explore_threshold;
         let phase_force = config.runtime.phase_force_transition_threshold;
         let phase_completion = config.runtime.phase_completion_read_threshold;
+        let read_transition_threshold = config.runtime.read_transition_threshold;
+        let read_transition_reinject_interval = config.runtime.read_transition_reinject_interval;
         let edit_reread_threshold = config.runtime.edit_reread_threshold;
         let edit_write_fallback_threshold = config.runtime.edit_write_fallback_threshold;
         let read_repeat_warn = config.runtime.read_repeat_warn_threshold;
@@ -581,6 +586,10 @@ impl App {
                 phase_explore,
                 phase_force,
                 phase_completion,
+            ),
+            read_transition_guard: read_transition_guard::ReadTransitionGuard::new(
+                read_transition_threshold,
+                read_transition_reinject_interval,
             ),
             write_fail_tracker: write_fail_tracker::WriteFailTracker::new(2),
             read_repeat_tracker: read_repeat_tracker::ReadRepeatTracker::new(
@@ -1111,6 +1120,8 @@ impl App {
         message_id: impl Into<String>,
         content: impl Into<String>,
     ) -> Result<(), AppError> {
+        let content = content.into();
+        self.update_active_task_from_user_input(&content);
         self.session
             .push_message(new_user_message(message_id, content));
         self.persist_session(AppEvent::SessionSaved)?;
@@ -1128,6 +1139,7 @@ impl App {
         user_input: &str,
         expanded_content: Option<String>,
     ) -> Result<(), AppError> {
+        self.update_active_task_from_user_input(user_input);
         let mut message = new_user_message(msg_id, user_input);
         message.expanded_content = expanded_content;
         self.session.push_message(message);
@@ -1149,6 +1161,16 @@ impl App {
             eprintln!("@file展開エラー: {}", err);
         }
         expanded
+    }
+
+    fn update_active_task_from_user_input(&mut self, user_input: &str) {
+        let trimmed = user_input.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        self.session
+            .working_memory
+            .set_active_task(Some(trimmed.to_string()));
     }
 
     pub fn record_assistant_output(
@@ -2382,6 +2404,7 @@ pub fn error_guidance(err: &AppError) -> String {
                     "Hint: provider could not be reached\n",
                     "  - For Ollama: ensure `ollama serve` is running\n",
                     "  - For OpenAI-compatible: --provider openai --provider-url <url>\n",
+                    "  - For LM Studio: --provider lmstudio\n",
                     "  - Set API key with ANVIL_API_KEY if required"
                 )
                 .to_string()

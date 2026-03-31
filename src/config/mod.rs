@@ -90,6 +90,10 @@ pub enum WebSearchProvider {
 pub struct RuntimeConfig {
     pub provider: String,
     pub provider_url: String,
+    /// `true` when the user explicitly set `provider_url` via config file,
+    /// environment variable, or CLI flag. When `false`, provider-specific
+    /// default URL resolution may override `provider_url`.
+    pub provider_url_explicitly_set: bool,
     pub model: String,
     pub sidecar_model: Option<String>,
     pub sidecar_provider_url: Option<String>,
@@ -130,6 +134,10 @@ pub struct RuntimeConfig {
     pub phase_force_transition_threshold: usize,
     /// Phase estimator: consecutive reads after last write for fallback completion (Issue #159).
     pub phase_completion_read_threshold: usize,
+    /// Force transition guard: consecutive exploration calls before a strong message is injected.
+    pub read_transition_threshold: usize,
+    /// Force transition guard: reinject interval after the first forced transition.
+    pub read_transition_reinject_interval: usize,
     /// Edit/write fallback strategy: edit-first or write-first (Issue #158).
     pub edit_strategy: crate::app::edit_fail_tracker::EditStrategy,
     /// Consecutive edit failures before re-read hint (Issue #158).
@@ -296,6 +304,7 @@ impl EffectiveConfig {
             runtime: RuntimeConfig {
                 provider: "ollama".to_string(),
                 provider_url: DEFAULT_OLLAMA_URL.to_string(),
+                provider_url_explicitly_set: false,
                 model: "local-default".to_string(),
                 sidecar_model: None,
                 sidecar_provider_url: None,
@@ -320,6 +329,8 @@ impl EffectiveConfig {
                 phase_explore_threshold: 5,
                 phase_force_transition_threshold: 15,
                 phase_completion_read_threshold: 5,
+                read_transition_threshold: 8,
+                read_transition_reinject_interval: 2,
                 edit_strategy: crate::app::edit_fail_tracker::EditStrategy::EditFirst,
                 edit_reread_threshold: 3,
                 edit_write_fallback_threshold: 5,
@@ -363,6 +374,18 @@ impl EffectiveConfig {
     fn set_context_window(&mut self, value: u32) {
         self.runtime.context_window = value;
         self.runtime.context_window_explicitly_set = true;
+    }
+
+    fn set_provider_url(&mut self, value: impl Into<String>) {
+        self.runtime.provider_url = value.into();
+        self.runtime.provider_url_explicitly_set = true;
+    }
+
+    fn resolve_provider_url_default(&mut self) {
+        if self.runtime.provider_url_explicitly_set {
+            return;
+        }
+        self.runtime.provider_url = default_provider_url(&self.runtime.provider).to_string();
     }
 
     fn apply_file_and_env_overrides(&mut self) -> Result<(), ConfigError> {
@@ -477,7 +500,7 @@ impl EffectiveConfig {
             self.runtime.model = v.clone();
         }
         if let Some(ref v) = cli.provider_url {
-            self.runtime.provider_url = v.clone();
+            self.set_provider_url(v.clone());
         }
         if let Some(ref v) = cli.sidecar_model {
             validate_sidecar_model(v)?;
@@ -588,7 +611,7 @@ impl EffectiveConfig {
         for (key, value) in map {
             match key.as_str() {
                 "provider" | "ANVIL_PROVIDER" => self.runtime.provider = value.clone(),
-                "provider_url" | "ANVIL_PROVIDER_URL" => self.runtime.provider_url = value.clone(),
+                "provider_url" | "ANVIL_PROVIDER_URL" => self.set_provider_url(value.clone()),
                 "model" | "ANVIL_MODEL" => self.runtime.model = value.clone(),
                 "sidecar_model" | "ANVIL_SIDECAR_MODEL" => {
                     if value.is_empty() {
@@ -750,6 +773,24 @@ impl EffectiveConfig {
                     }
                     self.runtime.phase_completion_read_threshold = v;
                 }
+                "read_transition_threshold" | "ANVIL_READ_TRANSITION_THRESHOLD" => {
+                    let v: usize = value
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                    if !(3..=30).contains(&v) {
+                        return Err(ConfigError::InvalidNumericValue(value.clone()));
+                    }
+                    self.runtime.read_transition_threshold = v;
+                }
+                "read_transition_reinject_interval" | "ANVIL_READ_TRANSITION_REINJECT_INTERVAL" => {
+                    let v: usize = value
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                    if !(1..=10).contains(&v) {
+                        return Err(ConfigError::InvalidNumericValue(value.clone()));
+                    }
+                    self.runtime.read_transition_reinject_interval = v;
+                }
                 "edit_strategy" | "ANVIL_EDIT_STRATEGY" => {
                     self.runtime.edit_strategy = value
                         .parse::<crate::app::edit_fail_tracker::EditStrategy>()
@@ -842,6 +883,7 @@ impl EffectiveConfig {
     }
 
     fn validate(&mut self) -> Result<(), ConfigError> {
+        self.resolve_provider_url_default();
         self.check_provider_url()?;
         self.check_model()?;
         self.clamp_context_window();
@@ -851,6 +893,7 @@ impl EffectiveConfig {
         self.clamp_subagent_settings();
         self.clamp_loop_detection_threshold();
         self.clamp_phase_thresholds();
+        self.clamp_read_transition_thresholds();
         self.clamp_edit_thresholds();
         self.clamp_read_repeat_thresholds();
         self.clamp_http_timeout();
@@ -1030,6 +1073,21 @@ impl EffectiveConfig {
         }
     }
 
+    fn clamp_read_transition_thresholds(&mut self) {
+        self.runtime.read_transition_threshold =
+            self.runtime.read_transition_threshold.clamp(3, 30);
+        self.runtime.read_transition_reinject_interval =
+            self.runtime.read_transition_reinject_interval.clamp(1, 10);
+        if self.runtime.read_transition_reinject_interval >= self.runtime.read_transition_threshold
+        {
+            self.runtime.read_transition_reinject_interval = self
+                .runtime
+                .read_transition_threshold
+                .saturating_sub(1)
+                .max(1);
+        }
+    }
+
     fn clamp_edit_thresholds(&mut self) {
         self.runtime.edit_reread_threshold = self.runtime.edit_reread_threshold.clamp(1, 20);
         self.runtime.edit_write_fallback_threshold =
@@ -1067,6 +1125,8 @@ const MIN_CONTEXT_WINDOW: u32 = 1000;
 
 /// Default Ollama server URL used as fallback for sidecar provider.
 pub const DEFAULT_OLLAMA_URL: &str = "http://127.0.0.1:11434";
+pub const DEFAULT_OPENAI_URL: &str = "https://api.openai.com/v1";
+pub const DEFAULT_LMSTUDIO_URL: &str = "http://localhost:1234/v1";
 const DEFAULT_MAX_AGENT_ITERATIONS: usize = 30;
 const DEFAULT_SUBAGENT_MAX_ITERATIONS: u32 = 20;
 const DEFAULT_SUBAGENT_TIMEOUT_SECS: u64 = 120;
@@ -1347,11 +1407,24 @@ fn parse_reasoning_visibility(value: &str) -> Result<ReasoningVisibility, Config
     }
 }
 
+fn default_provider_url(provider: &str) -> &'static str {
+    match provider {
+        "ollama" => DEFAULT_OLLAMA_URL,
+        "openai" => DEFAULT_OPENAI_URL,
+        "lmstudio" => DEFAULT_LMSTUDIO_URL,
+        _ => DEFAULT_OLLAMA_URL,
+    }
+}
+
 impl std::fmt::Debug for RuntimeConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RuntimeConfig")
             .field("provider", &self.provider)
             .field("provider_url", &self.provider_url)
+            .field(
+                "provider_url_explicitly_set",
+                &self.provider_url_explicitly_set,
+            )
             .field("model", &self.model)
             .field("sidecar_model", &self.sidecar_model)
             .field("sidecar_provider_url", &self.sidecar_provider_url)

@@ -175,6 +175,34 @@ fn build_openai_content(text: &str, images: Option<&[ImageContent]>) -> Value {
     }
 }
 
+fn openai_message_role_and_content(message: &super::ProviderMessage) -> (String, Value) {
+    match message.role {
+        super::ProviderMessageRole::System => (
+            "system".to_string(),
+            build_openai_content(&message.content, message.images.as_deref()),
+        ),
+        super::ProviderMessageRole::User => (
+            "user".to_string(),
+            build_openai_content(&message.content, message.images.as_deref()),
+        ),
+        super::ProviderMessageRole::Assistant => (
+            "assistant".to_string(),
+            build_openai_content(&message.content, message.images.as_deref()),
+        ),
+        super::ProviderMessageRole::Tool => (
+            // We do not send native tool_call/tool_call_id pairs on follow-up
+            // turns, so OpenAI-compatible backends can underweight orphaned
+            // `tool` role messages. Flatten tool outputs into explicit user
+            // context instead.
+            "user".to_string(),
+            build_openai_content(
+                &format!("Tool result:\n{}", message.content),
+                message.images.as_deref(),
+            ),
+        ),
+    }
+}
+
 /// Extract InferencePerformanceView from OpenAI usage.
 fn extract_openai_performance(usage: &Option<OpenAiUsage>) -> Option<InferencePerformanceView> {
     let usage = usage.as_ref()?;
@@ -365,14 +393,9 @@ impl<T> OpenAiCompatibleProviderClient<T> {
             messages: request
                 .messages
                 .iter()
-                .map(|m| OpenAiChatMessage {
-                    role: match m.role {
-                        super::ProviderMessageRole::System => "system".to_string(),
-                        super::ProviderMessageRole::User => "user".to_string(),
-                        super::ProviderMessageRole::Assistant => "assistant".to_string(),
-                        super::ProviderMessageRole::Tool => "tool".to_string(),
-                    },
-                    content: build_openai_content(&m.content, m.images.as_deref()),
+                .map(|m| {
+                    let (role, content) = openai_message_role_and_content(m);
+                    OpenAiChatMessage { role, content }
                 })
                 .collect(),
             stream: request.stream,
@@ -755,4 +778,33 @@ fn looks_like_sse_stream(body: &[u8]) -> bool {
     String::from_utf8_lossy(body)
         .lines()
         .any(|line| line.trim_start().starts_with("data: "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::{ProviderMessage, ProviderMessageRole};
+
+    #[test]
+    fn build_chat_request_flattens_tool_messages_into_user_context() {
+        let request = ProviderTurnRequest::new(
+            "test-model".to_string(),
+            vec![
+                ProviderMessage::new(ProviderMessageRole::System, "system prompt"),
+                ProviderMessage::new(
+                    ProviderMessageRole::Tool,
+                    "[tool result: file.read] read ok",
+                ),
+            ],
+            false,
+        );
+
+        let chat_request = OpenAiCompatibleProviderClient::<()>::build_chat_request(&request, None);
+
+        assert_eq!(chat_request.messages[1].role, "user");
+        assert_eq!(
+            chat_request.messages[1].content,
+            Value::String("Tool result:\n[tool result: file.read] read ok".to_string())
+        );
+    }
 }

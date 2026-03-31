@@ -1,7 +1,7 @@
 mod common;
 
 use anvil::config::{CliArgs, EffectiveConfig, PromptSource, ReasoningVisibility};
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use std::path::PathBuf;
 
 // --- CliArgs parsing tests ---
@@ -43,6 +43,12 @@ fn cli_args_parse_model_short() {
 fn cli_args_parse_provider_long() {
     let args = CliArgs::try_parse_from(["anvil", "--provider", "openai"]).unwrap();
     assert_eq!(args.provider.as_deref(), Some("openai"));
+}
+
+#[test]
+fn cli_args_parse_lmstudio_provider() {
+    let args = CliArgs::try_parse_from(["anvil", "--provider", "lmstudio"]).unwrap();
+    assert_eq!(args.provider.as_deref(), Some("lmstudio"));
 }
 
 #[test]
@@ -155,6 +161,15 @@ fn cli_args_parse_multiple_options() {
     assert_eq!(args.provider_url.as_deref(), Some("https://api.openai.com"));
     assert!(args.no_stream);
     assert!(args.debug);
+}
+
+#[test]
+fn cli_help_mentions_lmstudio_provider() {
+    let mut command = CliArgs::command();
+    let mut help = Vec::new();
+    command.write_long_help(&mut help).unwrap();
+    let help = String::from_utf8(help).unwrap();
+    assert!(help.contains("ollama|openai|lmstudio"));
 }
 
 // --- apply_cli_args tests ---
