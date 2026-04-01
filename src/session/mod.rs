@@ -182,7 +182,13 @@ impl WorkingMemory {
 /// injection), and truncates extremely long strings using char count for UTF-8
 /// safety.
 pub(crate) fn sanitize_for_prompt_entry(input: &str) -> String {
-    const REMOVALS: &[&str] = &["ANVIL_TOOL", "ANVIL_FINAL", "```"];
+    const REMOVALS: &[&str] = &[
+        "ANVIL_TOOL",
+        "ANVIL_FINAL",
+        "ANVIL_PLAN_UPDATE",
+        "ANVIL_PLAN",
+        "```",
+    ];
     let mut s = input.to_string();
     for pattern in REMOVALS {
         s = s.replace(pattern, "");

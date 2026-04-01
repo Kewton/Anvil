@@ -458,6 +458,11 @@ impl App {
         self.phase_estimator.reset();
         // Reset read transition guard per-turn counters (Issue #216)
         self.read_transition_guard.reset();
+        // Reset execution plan per user-turn (Issue #249)
+        self.reset_execution_plan();
+
+        // Issue #249: Detect ANVIL_PLAN from initial response
+        self.try_register_plan(&current.final_response);
 
         // Session note extraction bookkeeping (Issue #241)
         let msg_count_before = self.session.messages.len();
@@ -514,6 +519,9 @@ impl App {
             let (results, loop_action) = self.execute_structured_tool_calls(&current_normal)?;
             total_tool_count += results.len();
 
+            // Issue #249: Update plan item status from tool results
+            self.update_plan_from_results(&results);
+
             let tool_log_views: Vec<ToolLogView> = results
                 .iter()
                 .map(ToolExecutionResult::to_tool_log_view)
@@ -541,7 +549,11 @@ impl App {
             // Issue #173: If ANVIL_FINAL was already seen, terminate after
             // executing the current tool batch (no further LLM round-trips).
             if anvil_final_seen {
-                if self.should_activate_guidance_retry(guidance_retry_used, &results) {
+                // Issue #249: Plan-aware ANVIL_FINAL gate — suppress if plan is incomplete
+                if self.check_plan_final_gate() {
+                    tracing::info!("ANVIL_FINAL suppressed by plan gate; continuing execution");
+                    anvil_final_seen = false;
+                } else if self.should_activate_guidance_retry(guidance_retry_used, &results) {
                     tracing::info!(
                         "ANVIL_FINAL delayed: synthetic guidance injected, sending one follow-up turn"
                     );
@@ -568,6 +580,9 @@ impl App {
             if self.is_shutdown_requested() {
                 break;
             }
+
+            // Issue #249: Inject plan turn guidance before follow-up LLM call
+            self.inject_plan_turn_guidance();
 
             // Send tool results back to LLM for the next turn
             let spinner = Spinner::start(
@@ -699,6 +714,11 @@ impl App {
             // Reset last_compact_info after it's been consumed by the turn summary
             self.last_compact_info = None;
 
+            // Issue #249: Detect ANVIL_PLAN / ANVIL_PLAN_UPDATE from follow-up responses.
+            // Scan the raw token buffer since ANVIL_PLAN may be outside the ANVIL_FINAL block.
+            self.try_register_plan(&next_token_buffer);
+            self.try_update_plan(&next_token_buffer);
+
             // Issue #173: Update ANVIL_FINAL tracking from the new response
             if next_structured.anvil_final_detected {
                 anvil_final_seen = true;
@@ -752,6 +772,13 @@ impl App {
                     )?;
                     fallback_completed = true;
                     break;
+                }
+
+                // Issue #249: Plan gate — suppress termination if plan is incomplete
+                if self.check_plan_final_gate() {
+                    tracing::info!("Plan gate: suppressing termination with empty tool calls");
+                    current = next_structured;
+                    continue;
                 }
 
                 // No more tool calls — this is the final answer

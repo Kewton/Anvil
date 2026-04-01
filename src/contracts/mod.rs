@@ -91,6 +91,205 @@ impl SubAgentPayload {
 }
 
 // ---------------------------------------------------------------------------
+// Execution Plan types (Issue #249: Plan → Execute mode)
+// ---------------------------------------------------------------------------
+
+/// Status of an individual plan item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanItemStatus {
+    /// Not yet started.
+    Pending,
+    /// Currently being executed.
+    InProgress,
+    /// Successfully completed.
+    Done,
+    /// Blocked due to repeated failures.
+    Blocked,
+}
+
+impl std::fmt::Display for PlanItemStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pending => write!(f, "pending"),
+            Self::InProgress => write!(f, "in_progress"),
+            Self::Done => write!(f, "done"),
+            Self::Blocked => write!(f, "blocked"),
+        }
+    }
+}
+
+/// A single item in the execution plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanItem {
+    /// Human-readable description of the work item.
+    pub description: String,
+    /// Target file paths (extracted from the description, if any).
+    pub target_files: Vec<String>,
+    /// Current status.
+    pub status: PlanItemStatus,
+    /// Number of consecutive execution failures for this item.
+    #[serde(default)]
+    pub retry_count: u8,
+}
+
+impl PlanItem {
+    /// Maximum consecutive failures before marking as Blocked.
+    pub const MAX_RETRIES: u8 = 3;
+
+    pub fn new(description: String, target_files: Vec<String>) -> Self {
+        Self {
+            description,
+            target_files,
+            status: PlanItemStatus::Pending,
+            retry_count: 0,
+        }
+    }
+
+    /// Whether this item is considered finished (Done or Blocked).
+    pub fn is_finished(&self) -> bool {
+        matches!(self.status, PlanItemStatus::Done | PlanItemStatus::Blocked)
+    }
+}
+
+/// The execution plan maintained by Anvil (Issue #249).
+///
+/// Parsed from `ANVIL_PLAN` / `ANVIL_PLAN_UPDATE` blocks emitted by the LLM.
+/// Controls ANVIL_FINAL acceptance: the loop cannot terminate until all items
+/// are finished (Done or Blocked).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ExecutionPlan {
+    pub items: Vec<PlanItem>,
+}
+
+/// Result of checking whether ANVIL_FINAL should be accepted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FinalGateDecision {
+    /// All items finished → allow ANVIL_FINAL.
+    Allow,
+    /// Plan not yet created → suppress and request plan creation.
+    NoPlan,
+    /// Unfinished items remain → suppress and guide to next item.
+    Incomplete {
+        next_description: String,
+        remaining: usize,
+        total: usize,
+    },
+}
+
+impl ExecutionPlan {
+    pub fn new(items: Vec<PlanItem>) -> Self {
+        Self { items }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Number of finished (Done or Blocked) items.
+    pub fn finished_count(&self) -> usize {
+        self.items.iter().filter(|i| i.is_finished()).count()
+    }
+
+    /// Whether all items are finished.
+    pub fn all_finished(&self) -> bool {
+        !self.items.is_empty() && self.items.iter().all(PlanItem::is_finished)
+    }
+
+    /// Get the index of the next pending or in-progress item.
+    pub fn next_actionable_index(&self) -> Option<usize> {
+        self.items.iter().position(|i| {
+            matches!(
+                i.status,
+                PlanItemStatus::Pending | PlanItemStatus::InProgress
+            )
+        })
+    }
+
+    /// Mark an item as Done by index.
+    pub fn mark_done(&mut self, index: usize) {
+        if let Some(item) = self.items.get_mut(index) {
+            item.status = PlanItemStatus::Done;
+        }
+    }
+
+    /// Mark an item as InProgress by index.
+    pub fn mark_in_progress(&mut self, index: usize) {
+        if let Some(item) = self.items.get_mut(index) {
+            item.status = PlanItemStatus::InProgress;
+        }
+    }
+
+    /// Record a failure for the current in-progress item.
+    /// Automatically transitions to Blocked after MAX_RETRIES.
+    pub fn record_failure(&mut self, index: usize) {
+        if let Some(item) = self.items.get_mut(index) {
+            item.retry_count += 1;
+            if item.retry_count >= PlanItem::MAX_RETRIES {
+                item.status = PlanItemStatus::Blocked;
+            }
+        }
+    }
+
+    /// Decide whether ANVIL_FINAL should be accepted.
+    pub fn check_final_gate(&self) -> FinalGateDecision {
+        if self.items.is_empty() {
+            return FinalGateDecision::NoPlan;
+        }
+        if self.all_finished() {
+            return FinalGateDecision::Allow;
+        }
+        let remaining = self.items.iter().filter(|i| !i.is_finished()).count();
+        let next_desc = self
+            .next_actionable_index()
+            .and_then(|i| self.items.get(i))
+            .map(|i| i.description.clone())
+            .unwrap_or_default();
+        FinalGateDecision::Incomplete {
+            next_description: next_desc,
+            remaining,
+            total: self.items.len(),
+        }
+    }
+
+    /// Append new items (used by ANVIL_PLAN_UPDATE).
+    pub fn append_items(&mut self, new_items: Vec<PlanItem>) {
+        self.items.extend(new_items);
+    }
+
+    /// Format the plan as a checklist string for display / system prompt injection.
+    pub fn format_checklist(&self) -> String {
+        let mut lines = Vec::new();
+        for (i, item) in self.items.iter().enumerate() {
+            let marker = match item.status {
+                PlanItemStatus::Done => "[x]",
+                PlanItemStatus::Blocked => "[!]",
+                PlanItemStatus::InProgress => "[>]",
+                PlanItemStatus::Pending => "[ ]",
+            };
+            lines.push(format!("  {}. {} {}", i + 1, marker, item.description));
+        }
+        lines.join("\n")
+    }
+
+    /// Build the system message to inject at the start of each execution turn.
+    pub fn build_turn_guidance(&self) -> Option<String> {
+        let idx = self.next_actionable_index()?;
+        let item = &self.items[idx];
+        let finished = self.finished_count();
+        let total = self.items.len();
+        Some(format!(
+            "[System] 計画の次の項目を実行してください:\n  {}. {}\n完了: {}/{} 項目\n\n現在の計画:\n{}\n\n1項目ずつ実行し、全項目完了時のみ ANVIL_FINAL を出力してください。",
+            idx + 1,
+            item.description,
+            finished,
+            total,
+            self.format_checklist()
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Application lifecycle types
 // ---------------------------------------------------------------------------
 
@@ -866,5 +1065,173 @@ mod tests {
         let back: SubAgentPayload = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.error, Some("timed out during exploration".to_string()));
         assert_eq!(back.termination_reason, TerminationReason::Timeout);
+    }
+
+    // ============================================================
+    // ExecutionPlan tests (Issue #249)
+    // ============================================================
+
+    #[test]
+    fn plan_item_new_defaults_to_pending() {
+        let item = PlanItem::new("do stuff".into(), vec!["src/main.rs".into()]);
+        assert_eq!(item.status, PlanItemStatus::Pending);
+        assert_eq!(item.retry_count, 0);
+        assert!(!item.is_finished());
+    }
+
+    #[test]
+    fn plan_item_is_finished() {
+        let mut item = PlanItem::new("x".into(), vec![]);
+        assert!(!item.is_finished());
+        item.status = PlanItemStatus::Done;
+        assert!(item.is_finished());
+        item.status = PlanItemStatus::Blocked;
+        assert!(item.is_finished());
+        item.status = PlanItemStatus::InProgress;
+        assert!(!item.is_finished());
+    }
+
+    #[test]
+    fn execution_plan_empty_default() {
+        let plan = ExecutionPlan::default();
+        assert!(plan.is_empty());
+        assert!(!plan.all_finished());
+        assert_eq!(plan.finished_count(), 0);
+        assert_eq!(plan.next_actionable_index(), None);
+    }
+
+    #[test]
+    fn execution_plan_mark_done_advances() {
+        let mut plan = ExecutionPlan::new(vec![
+            PlanItem::new("a".into(), vec![]),
+            PlanItem::new("b".into(), vec![]),
+            PlanItem::new("c".into(), vec![]),
+        ]);
+        plan.mark_in_progress(0);
+        assert_eq!(plan.next_actionable_index(), Some(0));
+
+        plan.mark_done(0);
+        assert_eq!(plan.finished_count(), 1);
+        assert!(!plan.all_finished());
+        assert_eq!(plan.next_actionable_index(), Some(1));
+
+        plan.mark_done(1);
+        plan.mark_done(2);
+        assert!(plan.all_finished());
+        assert_eq!(plan.next_actionable_index(), None);
+    }
+
+    #[test]
+    fn execution_plan_record_failure_blocks_after_max() {
+        let mut plan = ExecutionPlan::new(vec![PlanItem::new("x".into(), vec![])]);
+        plan.mark_in_progress(0);
+
+        for _ in 0..PlanItem::MAX_RETRIES - 1 {
+            plan.record_failure(0);
+            assert_eq!(plan.items[0].status, PlanItemStatus::InProgress);
+        }
+        plan.record_failure(0);
+        assert_eq!(plan.items[0].status, PlanItemStatus::Blocked);
+        assert!(plan.all_finished());
+    }
+
+    #[test]
+    fn execution_plan_check_final_gate_no_plan() {
+        let plan = ExecutionPlan::default();
+        assert_eq!(plan.check_final_gate(), FinalGateDecision::NoPlan);
+    }
+
+    #[test]
+    fn execution_plan_check_final_gate_incomplete() {
+        let mut plan = ExecutionPlan::new(vec![
+            PlanItem::new("first".into(), vec![]),
+            PlanItem::new("second".into(), vec![]),
+        ]);
+        plan.mark_in_progress(0);
+        match plan.check_final_gate() {
+            FinalGateDecision::Incomplete {
+                remaining, total, ..
+            } => {
+                assert_eq!(remaining, 2);
+                assert_eq!(total, 2);
+            }
+            other => panic!("expected Incomplete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execution_plan_check_final_gate_allow() {
+        let mut plan = ExecutionPlan::new(vec![PlanItem::new("only".into(), vec![])]);
+        plan.mark_done(0);
+        assert_eq!(plan.check_final_gate(), FinalGateDecision::Allow);
+    }
+
+    #[test]
+    fn execution_plan_append_items() {
+        let mut plan = ExecutionPlan::new(vec![PlanItem::new("a".into(), vec![])]);
+        plan.append_items(vec![PlanItem::new("b".into(), vec![])]);
+        assert_eq!(plan.items.len(), 2);
+    }
+
+    #[test]
+    fn execution_plan_format_checklist() {
+        let mut plan = ExecutionPlan::new(vec![
+            PlanItem::new("done item".into(), vec![]),
+            PlanItem::new("in progress".into(), vec![]),
+            PlanItem::new("pending item".into(), vec![]),
+        ]);
+        plan.mark_done(0);
+        plan.mark_in_progress(1);
+        let checklist = plan.format_checklist();
+        assert!(checklist.contains("[x]"));
+        assert!(checklist.contains("[>]"));
+        assert!(checklist.contains("[ ]"));
+    }
+
+    #[test]
+    fn execution_plan_build_turn_guidance() {
+        let mut plan = ExecutionPlan::new(vec![
+            PlanItem::new("first task".into(), vec![]),
+            PlanItem::new("second task".into(), vec![]),
+        ]);
+        plan.mark_done(0);
+        plan.mark_in_progress(1);
+        let guidance = plan.build_turn_guidance().expect("should have guidance");
+        assert!(guidance.contains("second task"));
+        assert!(guidance.contains("1/2"));
+    }
+
+    #[test]
+    fn execution_plan_build_turn_guidance_none_when_all_done() {
+        let mut plan = ExecutionPlan::new(vec![PlanItem::new("x".into(), vec![])]);
+        plan.mark_done(0);
+        assert!(plan.build_turn_guidance().is_none());
+    }
+
+    #[test]
+    fn plan_item_status_display() {
+        assert_eq!(PlanItemStatus::Pending.to_string(), "pending");
+        assert_eq!(PlanItemStatus::InProgress.to_string(), "in_progress");
+        assert_eq!(PlanItemStatus::Done.to_string(), "done");
+        assert_eq!(PlanItemStatus::Blocked.to_string(), "blocked");
+    }
+
+    #[test]
+    fn plan_item_serde_roundtrip() {
+        let item = PlanItem::new("desc".into(), vec!["src/lib.rs".into()]);
+        let json = serde_json::to_string(&item).expect("serialize");
+        let back: PlanItem = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(item, back);
+    }
+
+    #[test]
+    fn execution_plan_serde_roundtrip() {
+        let plan = ExecutionPlan::new(vec![
+            PlanItem::new("a".into(), vec!["f1.rs".into()]),
+            PlanItem::new("b".into(), vec![]),
+        ]);
+        let json = serde_json::to_string(&plan).expect("serialize");
+        let back: ExecutionPlan = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(plan, back);
     }
 }

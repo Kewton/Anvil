@@ -1222,6 +1222,78 @@ fn extract_final_block_lenient(content: &str, label: &str) -> Option<String> {
     Some(tail.to_string())
 }
 
+// ---------------------------------------------------------------------------
+// ANVIL_PLAN / ANVIL_PLAN_UPDATE parsing (Issue #249)
+// ---------------------------------------------------------------------------
+
+/// Extract an ANVIL_PLAN or ANVIL_PLAN_UPDATE block from LLM output.
+///
+/// Returns the raw content of the first matching block, or `None`.
+pub fn extract_plan_block(content: &str) -> Option<String> {
+    extract_final_block(content, "ANVIL_PLAN")
+        .or_else(|| extract_final_block_lenient(content, "ANVIL_PLAN"))
+}
+
+/// Extract an ANVIL_PLAN_UPDATE block from LLM output.
+pub fn extract_plan_update_block(content: &str) -> Option<String> {
+    extract_final_block(content, "ANVIL_PLAN_UPDATE")
+        .or_else(|| extract_final_block_lenient(content, "ANVIL_PLAN_UPDATE"))
+}
+
+/// Parse a plan block into a list of `PlanItem`s.
+///
+/// Accepts markdown checkbox format:
+/// ```text
+/// - [ ] src/foo.rs: description of change
+/// - [ ] src/bar.rs: another change
+/// ```
+///
+/// Each line starting with `- [ ]` or `- [x]` is treated as a plan item.
+/// The optional file path before `:` is extracted as a target file.
+pub fn parse_plan_items(block: &str) -> Vec<crate::contracts::PlanItem> {
+    let mut items = Vec::new();
+    for line in block.lines() {
+        let trimmed = line.trim();
+        // Accept both "- [ ]" and "- [x]" prefixes; strip the checkbox
+        let description = if let Some(rest) = trimmed
+            .strip_prefix("- [ ] ")
+            .or_else(|| trimmed.strip_prefix("- [x] "))
+            .or_else(|| trimmed.strip_prefix("- [X] "))
+        {
+            rest.to_string()
+        } else if trimmed.starts_with("- ") && !trimmed.is_empty() {
+            // Also accept plain "- item" lines
+            trimmed[2..].to_string()
+        } else {
+            continue;
+        };
+
+        if description.is_empty() {
+            continue;
+        }
+
+        // Extract target file path: text before the first ":"
+        let target_files = extract_target_file(&description).into_iter().collect();
+
+        items.push(crate::contracts::PlanItem::new(description, target_files));
+    }
+    items
+}
+
+/// Extract a file path from a plan item description.
+///
+/// Looks for a path-like prefix before the first `:` (e.g. `src/foo.rs: do stuff`).
+fn extract_target_file(description: &str) -> Option<String> {
+    let colon_pos = description.find(':')?;
+    let candidate = description[..colon_pos].trim();
+    // Heuristic: must contain a `/` or `.` to look like a file path
+    if candidate.contains('/') || candidate.contains('.') {
+        Some(candidate.to_string())
+    } else {
+        None
+    }
+}
+
 // --- MCP tool description generation ---
 
 use crate::mcp::McpToolInfo;
@@ -1413,5 +1485,85 @@ mod tests {
         // context_window=512: quarter=128, half=256, clamp(256,256) => 256
         let budget = derive_context_budget(512, None);
         assert_eq!(budget, 256);
+    }
+
+    // ============================================================
+    // ANVIL_PLAN parser tests (Issue #249)
+    // ============================================================
+
+    #[test]
+    fn extract_plan_block_basic() {
+        let content = "Some text\n```ANVIL_PLAN\n- [ ] src/foo.rs: add function\n- [ ] src/bar.rs: fix bug\n```\nMore text";
+        let block = extract_plan_block(content).expect("should extract");
+        assert!(block.contains("src/foo.rs"));
+        assert!(block.contains("src/bar.rs"));
+    }
+
+    #[test]
+    fn extract_plan_block_lenient() {
+        let content = "```ANVIL_PLAN\n- [ ] src/foo.rs: add function\n";
+        let block = extract_plan_block(content).expect("should extract lenient");
+        assert!(block.contains("src/foo.rs"));
+    }
+
+    #[test]
+    fn extract_plan_block_none_when_absent() {
+        let content = "Just regular text without any plan blocks.";
+        assert!(extract_plan_block(content).is_none());
+    }
+
+    #[test]
+    fn extract_plan_update_block_basic() {
+        let content = "```ANVIL_PLAN_UPDATE\n- [ ] tests/new_test.rs: add test\n```";
+        let block = extract_plan_update_block(content).expect("should extract");
+        assert!(block.contains("tests/new_test.rs"));
+    }
+
+    #[test]
+    fn parse_plan_items_checkbox_format() {
+        let block = "- [ ] src/lib.rs: add module declaration\n- [ ] src/app/mod.rs: add field\n- [ ] tests/test.rs: add integration test";
+        let items = parse_plan_items(block);
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].description, "src/lib.rs: add module declaration");
+        assert_eq!(items[0].target_files, vec!["src/lib.rs"]);
+        assert_eq!(items[1].target_files, vec!["src/app/mod.rs"]);
+    }
+
+    #[test]
+    fn parse_plan_items_plain_dash_format() {
+        let block = "- src/main.rs: entry point change\n- src/config.rs: add setting";
+        let items = parse_plan_items(block);
+        assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn parse_plan_items_no_file_path() {
+        let block = "- [ ] Add integration tests\n- [ ] Update documentation";
+        let items = parse_plan_items(block);
+        assert_eq!(items.len(), 2);
+        assert!(items[0].target_files.is_empty());
+    }
+
+    #[test]
+    fn parse_plan_items_ignores_non_items() {
+        let block =
+            "Plan:\n\n- [ ] src/foo.rs: change\n\nSome explanation\n\n- [ ] src/bar.rs: update";
+        let items = parse_plan_items(block);
+        assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn parse_plan_items_empty_block() {
+        let items = parse_plan_items("");
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn parse_plan_items_with_checked_items() {
+        let block = "- [x] src/done.rs: already done\n- [ ] src/todo.rs: still todo";
+        let items = parse_plan_items(block);
+        assert_eq!(items.len(), 2);
+        // All parsed items start as Pending regardless of [x] in the source
+        assert_eq!(items[0].status, crate::contracts::PlanItemStatus::Pending);
     }
 }

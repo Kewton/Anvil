@@ -8,6 +8,7 @@ pub mod alternating_loop_detector;
 pub mod cli;
 mod context;
 pub(crate) mod edit_fail_tracker;
+pub(crate) mod execution_plan;
 pub mod loop_detector;
 pub mod mock;
 pub mod phase_estimator;
@@ -271,6 +272,8 @@ pub struct App {
     session_stats: SessionStats,
     /// Last compact operation info for turn summary reporting (Issue #206).
     last_compact_info: Option<CompactInfo>,
+    /// Execution plan for Plan → Execute mode (Issue #249).
+    execution_plan: crate::contracts::ExecutionPlan,
 }
 
 /// Whether the session loop should continue or exit.
@@ -600,6 +603,7 @@ impl App {
             file_read_cache,
             session_stats: SessionStats::new(),
             last_compact_info: None,
+            execution_plan: crate::contracts::ExecutionPlan::default(),
         })
     }
 
