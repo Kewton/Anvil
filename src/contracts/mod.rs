@@ -257,6 +257,46 @@ impl ExecutionPlan {
         self.items.extend(new_items);
     }
 
+    /// Sync plan item completion from the set of files actually modified.
+    ///
+    /// When a file.write/file.edit succeeds but the result is not passed to
+    /// `update_plan_from_results` (e.g. because the tool call appeared after
+    /// `ANVIL_FINAL` in the LLM response — Issue #251), the plan item stays
+    /// Pending/InProgress even though the work is done.  This method fixes
+    /// that by matching `touched_files` against each item's `target_files`.
+    pub fn sync_from_touched_files(&mut self, touched_files: &[String]) {
+        if self.items.is_empty() || touched_files.is_empty() {
+            return;
+        }
+        let mut advanced = false;
+        for item in &mut self.items {
+            if item.is_finished() {
+                continue;
+            }
+            if item.target_files.is_empty() {
+                continue;
+            }
+            // Mark done if ANY target file has been touched.
+            let matched = item.target_files.iter().any(|tf| {
+                touched_files
+                    .iter()
+                    .any(|touched| touched.ends_with(tf) || tf.ends_with(touched))
+            });
+            if matched {
+                tracing::info!(
+                    description = %item.description,
+                    "plan item completed (synced from touched_files)"
+                );
+                item.status = PlanItemStatus::Done;
+                advanced = true;
+            }
+        }
+        // Auto-advance next pending item to InProgress
+        if advanced && let Some(next) = self.next_actionable_index() {
+            self.items[next].status = PlanItemStatus::InProgress;
+        }
+    }
+
     /// Format the plan as a checklist string for display / system prompt injection.
     pub fn format_checklist(&self) -> String {
         let mut lines = Vec::new();
@@ -1233,5 +1273,112 @@ mod tests {
         let json = serde_json::to_string(&plan).expect("serialize");
         let back: ExecutionPlan = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(plan, back);
+    }
+
+    // Issue #251: sync_from_touched_files tests
+
+    #[test]
+    fn sync_from_touched_files_marks_matching_items_done() {
+        let mut plan = ExecutionPlan::new(vec![
+            PlanItem::new("src/lib.rs: add docs".into(), vec!["src/lib.rs".into()]),
+            PlanItem::new("src/main.rs: add docs".into(), vec!["src/main.rs".into()]),
+        ]);
+        plan.mark_in_progress(0);
+
+        let touched = vec!["src/lib.rs".to_string()];
+        plan.sync_from_touched_files(&touched);
+
+        assert_eq!(plan.items[0].status, PlanItemStatus::Done);
+        assert_eq!(plan.items[1].status, PlanItemStatus::InProgress); // auto-advanced
+    }
+
+    #[test]
+    fn sync_from_touched_files_all_done_allows_final_gate() {
+        let mut plan = ExecutionPlan::new(vec![
+            PlanItem::new("src/lib.rs: add docs".into(), vec!["src/lib.rs".into()]),
+            PlanItem::new("src/main.rs: add docs".into(), vec!["src/main.rs".into()]),
+        ]);
+        plan.mark_in_progress(0);
+
+        let touched = vec!["src/lib.rs".to_string(), "src/main.rs".to_string()];
+        plan.sync_from_touched_files(&touched);
+
+        assert_eq!(plan.items[0].status, PlanItemStatus::Done);
+        assert_eq!(plan.items[1].status, PlanItemStatus::Done);
+        assert_eq!(plan.check_final_gate(), FinalGateDecision::Allow);
+    }
+
+    #[test]
+    fn sync_from_touched_files_no_match_leaves_incomplete() {
+        let mut plan = ExecutionPlan::new(vec![PlanItem::new(
+            "src/lib.rs: add docs".into(),
+            vec!["src/lib.rs".into()],
+        )]);
+        plan.mark_in_progress(0);
+
+        let touched = vec!["src/other.rs".to_string()];
+        plan.sync_from_touched_files(&touched);
+
+        assert_eq!(plan.items[0].status, PlanItemStatus::InProgress);
+    }
+
+    #[test]
+    fn sync_from_touched_files_empty_touched_is_noop() {
+        let mut plan = ExecutionPlan::new(vec![PlanItem::new(
+            "src/lib.rs: add docs".into(),
+            vec!["src/lib.rs".into()],
+        )]);
+        plan.mark_in_progress(0);
+
+        plan.sync_from_touched_files(&[]);
+        assert_eq!(plan.items[0].status, PlanItemStatus::InProgress);
+    }
+
+    #[test]
+    fn sync_from_touched_files_skips_already_done_items() {
+        let mut plan = ExecutionPlan::new(vec![
+            PlanItem::new("src/lib.rs: add docs".into(), vec!["src/lib.rs".into()]),
+            PlanItem::new("src/main.rs: add docs".into(), vec!["src/main.rs".into()]),
+        ]);
+        plan.mark_done(0);
+        plan.mark_in_progress(1);
+
+        let touched = vec!["src/lib.rs".to_string(), "src/main.rs".to_string()];
+        plan.sync_from_touched_files(&touched);
+
+        assert_eq!(plan.items[0].status, PlanItemStatus::Done);
+        assert_eq!(plan.items[1].status, PlanItemStatus::Done);
+    }
+
+    #[test]
+    fn sync_from_touched_files_suffix_matching() {
+        let mut plan = ExecutionPlan::new(vec![PlanItem::new(
+            "/tmp/test1.js: add comments".into(),
+            vec!["/tmp/test1.js".into()],
+        )]);
+        plan.mark_in_progress(0);
+
+        // touched_files uses relative paths; target_files may use absolute
+        let touched = vec!["test1.js".to_string()];
+        plan.sync_from_touched_files(&touched);
+
+        assert_eq!(plan.items[0].status, PlanItemStatus::Done);
+    }
+
+    #[test]
+    fn sync_from_touched_files_skips_items_without_target_files() {
+        let mut plan = ExecutionPlan::new(vec![
+            PlanItem::new("run cargo test".into(), vec![]),
+            PlanItem::new("src/lib.rs: add docs".into(), vec!["src/lib.rs".into()]),
+        ]);
+        plan.mark_in_progress(0);
+
+        let touched = vec!["src/lib.rs".to_string()];
+        plan.sync_from_touched_files(&touched);
+
+        // Item 0 has no target_files → stays InProgress
+        assert_eq!(plan.items[0].status, PlanItemStatus::InProgress);
+        // Item 1 matched → Done
+        assert_eq!(plan.items[1].status, PlanItemStatus::Done);
     }
 }
