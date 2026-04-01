@@ -2597,6 +2597,149 @@ fn from_json_parses_agent_plan_without_scope() {
     );
 }
 
+// --- Issue #232: query alias for prompt in agent.explore / agent.plan ---
+
+#[test]
+fn from_json_agent_explore_accepts_query_as_prompt_alias() {
+    let json: serde_json::Value = serde_json::json!({
+        "query": "investigate logging patterns"
+    });
+    let input =
+        ToolInput::from_json("agent.explore", &json).expect("should accept query as prompt alias");
+    assert_eq!(
+        input,
+        ToolInput::AgentExplore {
+            prompt: "investigate logging patterns".to_string(),
+            scope: None,
+        }
+    );
+}
+
+#[test]
+fn from_json_agent_explore_query_with_scope() {
+    let json: serde_json::Value = serde_json::json!({
+        "query": "investigate logging patterns",
+        "scope": "src/tooling"
+    });
+    let input =
+        ToolInput::from_json("agent.explore", &json).expect("should accept query with scope");
+    assert_eq!(
+        input,
+        ToolInput::AgentExplore {
+            prompt: "investigate logging patterns".to_string(),
+            scope: Some("src/tooling".to_string()),
+        }
+    );
+}
+
+#[test]
+fn from_json_agent_explore_prompt_takes_precedence_over_query() {
+    let json: serde_json::Value = serde_json::json!({
+        "prompt": "from prompt field",
+        "query": "from query field"
+    });
+    let input = ToolInput::from_json("agent.explore", &json).expect("should prefer prompt");
+    assert_eq!(
+        input,
+        ToolInput::AgentExplore {
+            prompt: "from prompt field".to_string(),
+            scope: None,
+        }
+    );
+}
+
+#[test]
+fn from_json_agent_plan_accepts_query_as_prompt_alias() {
+    let json: serde_json::Value = serde_json::json!({
+        "query": "plan the refactoring"
+    });
+    let input =
+        ToolInput::from_json("agent.plan", &json).expect("should accept query as prompt alias");
+    assert_eq!(
+        input,
+        ToolInput::AgentPlan {
+            prompt: "plan the refactoring".to_string(),
+            scope: None,
+        }
+    );
+}
+
+#[test]
+fn from_json_agent_plan_query_with_scope() {
+    let json: serde_json::Value = serde_json::json!({
+        "query": "plan the refactoring",
+        "scope": "src/app"
+    });
+    let input = ToolInput::from_json("agent.plan", &json).expect("should accept query with scope");
+    assert_eq!(
+        input,
+        ToolInput::AgentPlan {
+            prompt: "plan the refactoring".to_string(),
+            scope: Some("src/app".to_string()),
+        }
+    );
+}
+
+#[test]
+fn repair_from_block_agent_explore_accepts_query_as_prompt_alias() {
+    fn extract_simple(block: &str, key: &str) -> Option<String> {
+        let pattern = format!("\"{}\":", key);
+        let start = block.find(&pattern)? + pattern.len();
+        let rest = &block[start..];
+        let rest = rest.trim_start();
+        if let Some(inner) = rest.strip_prefix('"') {
+            let end = inner.find('"')?;
+            Some(inner[..end].to_string())
+        } else {
+            None
+        }
+    }
+    fn extract_trailing(block: &str, key: &str) -> Option<String> {
+        extract_simple(block, key)
+    }
+
+    let block = r#"{"query": "investigate logging", "scope": "src/tooling"}"#;
+    let result =
+        ToolInput::repair_from_block("agent.explore", block, extract_simple, extract_trailing);
+    assert_eq!(
+        result,
+        Some(ToolInput::AgentExplore {
+            prompt: "investigate logging".to_string(),
+            scope: Some("src/tooling".to_string()),
+        })
+    );
+}
+
+#[test]
+fn repair_from_block_agent_plan_accepts_query_as_prompt_alias() {
+    fn extract_simple(block: &str, key: &str) -> Option<String> {
+        let pattern = format!("\"{}\":", key);
+        let start = block.find(&pattern)? + pattern.len();
+        let rest = &block[start..];
+        let rest = rest.trim_start();
+        if let Some(inner) = rest.strip_prefix('"') {
+            let end = inner.find('"')?;
+            Some(inner[..end].to_string())
+        } else {
+            None
+        }
+    }
+    fn extract_trailing(block: &str, key: &str) -> Option<String> {
+        extract_simple(block, key)
+    }
+
+    let block = r#"{"query": "plan the implementation"}"#;
+    let result =
+        ToolInput::repair_from_block("agent.plan", block, extract_simple, extract_trailing);
+    assert_eq!(
+        result,
+        Some(ToolInput::AgentPlan {
+            prompt: "plan the implementation".to_string(),
+            scope: None,
+        })
+    );
+}
+
 #[test]
 fn from_json_agent_explore_missing_prompt_fails() {
     let json: serde_json::Value = serde_json::json!({

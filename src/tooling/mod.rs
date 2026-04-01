@@ -312,6 +312,7 @@ impl ToolInput {
             "agent.explore" => Ok(ToolInput::AgentExplore {
                 prompt: value
                     .get("prompt")
+                    .or_else(|| value.get("query"))
                     .and_then(serde_json::Value::as_str)
                     .ok_or_else(|| "missing prompt in agent.explore tool block".to_string())?
                     .to_string(),
@@ -323,6 +324,7 @@ impl ToolInput {
             "agent.plan" => Ok(ToolInput::AgentPlan {
                 prompt: value
                     .get("prompt")
+                    .or_else(|| value.get("query"))
                     .and_then(serde_json::Value::as_str)
                     .ok_or_else(|| "missing prompt in agent.plan tool block".to_string())?
                     .to_string(),
@@ -445,11 +447,13 @@ impl ToolInput {
                 query: extract_simple(block, "query")?,
             }),
             "agent.explore" => Some(ToolInput::AgentExplore {
-                prompt: extract_simple(block, "prompt")?,
+                prompt: extract_simple(block, "prompt")
+                    .or_else(|| extract_simple(block, "query"))?,
                 scope: extract_simple(block, "scope"),
             }),
             "agent.plan" => Some(ToolInput::AgentPlan {
-                prompt: extract_simple(block, "prompt")?,
+                prompt: extract_simple(block, "prompt")
+                    .or_else(|| extract_simple(block, "query"))?,
                 scope: extract_simple(block, "scope"),
             }),
             "git.status" => Some(ToolInput::GitStatus {}),

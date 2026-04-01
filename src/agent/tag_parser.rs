@@ -278,11 +278,13 @@ fn build_tool_input(
         },
         "agent.explore" => ToolInput::AgentExplore {
             prompt: get_child("prompt")
+                .or_else(|| get_child("query"))
                 .ok_or_else(|| "missing prompt element for agent.explore".to_string())?,
             scope: get_attr("scope"),
         },
         "agent.plan" => ToolInput::AgentPlan {
             prompt: get_child("prompt")
+                .or_else(|| get_child("query"))
                 .ok_or_else(|| "missing prompt element for agent.plan".to_string())?,
             scope: get_attr("scope"),
         },
