@@ -11,6 +11,7 @@ use crate::provider::{ProviderClient, ProviderEvent};
 use crate::session::{MessageRole, SessionMessage};
 use crate::spinner::Spinner;
 use crate::state::StateTransition;
+use crate::tooling::progress::{ToolProgressEntry, ToolProgressStatus};
 use crate::tooling::{
     ExecutionMode, LocalToolExecutor, ToolCallRequest, ToolExecutionPayload, ToolExecutionPolicy,
     ToolExecutionRequest, ToolExecutionResult, ToolExecutionStatus, ToolInput, ToolKind,
@@ -137,23 +138,35 @@ fn execute_parallel_group_standalone(
     shutdown_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
     requests: Vec<(usize, ToolExecutionRequest)>,
     completed: Arc<AtomicUsize>,
+    entries: Arc<std::sync::Mutex<Vec<ToolProgressEntry>>>,
     file_cache: Option<std::sync::Arc<std::sync::Mutex<crate::tooling::file_cache::FileReadCache>>>,
 ) -> Vec<(usize, ToolExecutionResult)> {
     let cwd = config.paths.cwd.clone();
     let runtime = &config.runtime;
     let mut all_results = Vec::new();
 
+    let mut chunk_offset = 0usize;
     for chunk in requests.chunks(MAX_PARALLEL_THREADS) {
+        let current_offset = chunk_offset;
         all_results.extend(std::thread::scope(|s| {
             let handles: Vec<_> = chunk
                 .iter()
-                .map(|(idx, request)| {
+                .enumerate()
+                .map(|(pos_in_chunk, (idx, request))| {
                     let cwd = cwd.clone();
                     let shutdown = shutdown_flag.clone();
                     let idx = *idx;
                     let completed = completed.clone();
+                    let entries = entries.clone();
+                    let entry_index = current_offset + pos_in_chunk;
                     let file_cache = file_cache.clone();
                     s.spawn(move || {
+                        // Update started_at to actual execution start time
+                        if let Ok(mut guard) = entries.lock()
+                            && let Some(entry) = guard.get_mut(entry_index)
+                        {
+                            entry.started_at = std::time::Instant::now();
+                        }
                         let mut executor = LocalToolExecutor::new(cwd, runtime, file_cache)
                             .with_shutdown_flag(shutdown);
                         let tool_call_id = request.tool_call_id.clone();
@@ -193,6 +206,21 @@ fn execute_parallel_group_standalone(
                                 edit_detail: None,
                             }
                         });
+                        // Update progress entry
+                        if let Ok(mut guard) = entries.lock()
+                            && let Some(entry) = guard.get_mut(entry_index)
+                        {
+                            let elapsed =
+                                entry.started_at.elapsed().as_millis().min(u64::MAX as u128)
+                                    as u64;
+                            entry.elapsed_ms = Some(elapsed);
+                            entry.status =
+                                if result.status == ToolExecutionStatus::Completed {
+                                    ToolProgressStatus::Completed
+                                } else {
+                                    ToolProgressStatus::Failed
+                                };
+                        }
                         completed.fetch_add(1, Ordering::Relaxed);
                         (idx, result)
                     })
@@ -229,6 +257,7 @@ fn execute_parallel_group_standalone(
             }
             results
         }));
+        chunk_offset += chunk.len();
     }
 
     all_results
@@ -1135,13 +1164,27 @@ impl App {
             match group {
                 ExecutionGroup::Parallel(requests) if requests.len() >= 2 => {
                     let completed = Arc::new(AtomicUsize::new(0));
-                    let spinner =
-                        Spinner::start_parallel(requests.len(), completed.clone(), interactive);
+                    let progress_entries: Vec<ToolProgressEntry> = requests
+                        .iter()
+                        .map(|(_, req)| ToolProgressEntry {
+                            tool_name: req.spec.name.clone(),
+                            status: ToolProgressStatus::Running,
+                            started_at: std::time::Instant::now(),
+                            elapsed_ms: None,
+                        })
+                        .collect();
+                    let entries = Arc::new(std::sync::Mutex::new(progress_entries));
+                    let spinner = Spinner::start_parallel_detailed(
+                        entries.clone(),
+                        completed.clone(),
+                        interactive,
+                    );
                     let parallel_results = execute_parallel_group_standalone(
                         &self.config,
                         self.shutdown_flag(),
                         requests,
                         completed,
+                        entries,
                         Some(self.file_read_cache.clone()),
                     );
                     spinner.stop();
