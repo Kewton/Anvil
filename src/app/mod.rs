@@ -144,6 +144,8 @@ pub struct SessionStats {
     pub total_turns: u32,
     pub session_start: Option<Instant>,
     pub tool_calls: HashMap<String, u32>,
+    /// Failed tool call counts, tracked separately from successful ones (Issue #233).
+    pub failed_tool_calls: HashMap<String, u32>,
     pub files_modified: u32,
     pub lines_added: u32,
     pub lines_deleted: u32,
@@ -161,6 +163,14 @@ impl SessionStats {
 
     pub fn record_tool_call(&mut self, tool_name: &str) {
         *self.tool_calls.entry(tool_name.to_string()).or_insert(0) += 1;
+    }
+
+    /// Record a failed tool call separately from successful ones (Issue #233).
+    pub fn record_tool_call_failed(&mut self, tool_name: &str) {
+        *self
+            .failed_tool_calls
+            .entry(tool_name.to_string())
+            .or_insert(0) += 1;
     }
 
     pub fn record_file_change(&mut self, added: u32, deleted: u32) {
@@ -183,9 +193,19 @@ impl SessionStats {
         self.tool_calls.values().sum()
     }
 
+    /// Total number of failed tool calls (Issue #233).
+    pub fn total_failed_tool_calls(&self) -> u32 {
+        self.failed_tool_calls.values().sum()
+    }
+
     /// Format tool call counts summary (e.g. `"file.read x18, file.edit x12"`).
     pub fn tool_calls_summary(&self) -> String {
         format_tool_counts(self.tool_calls.iter().map(|(k, v)| (k.clone(), *v)))
+    }
+
+    /// Format failed tool call counts summary (Issue #233).
+    pub fn failed_tool_calls_summary(&self) -> String {
+        format_tool_counts(self.failed_tool_calls.iter().map(|(k, v)| (k.clone(), *v)))
     }
 }
 
@@ -846,10 +866,13 @@ impl App {
             .session_start
             .map(|s| s.elapsed())
             .unwrap_or_default();
+        let failed_total = self.session_stats.total_failed_tool_calls();
         tracing::info!(
             total_turns = self.session_stats.total_turns,
             total_tool_calls = self.session_stats.total_tool_calls(),
+            failed_tool_calls = failed_total,
             tools = %self.session_stats.tool_calls_summary(),
+            failed_tools = %self.session_stats.failed_tool_calls_summary(),
             files_modified = self.session_stats.files_modified,
             lines_added = self.session_stats.lines_added,
             lines_deleted = self.session_stats.lines_deleted,
@@ -2824,5 +2847,54 @@ mod tests {
             None => context_window as usize,
         };
         assert_eq!(effective, 262_144);
+    }
+
+    // --- Issue #233: failed tool calls must be tracked separately ---
+
+    #[test]
+    fn session_stats_failed_tool_calls_tracked_separately() {
+        let mut stats = SessionStats::new();
+        stats.record_tool_call("file.write");
+        stats.record_tool_call_failed("file.write");
+        // 1 success + 1 failure
+        assert_eq!(
+            stats.total_tool_calls(),
+            1,
+            "total should count only successes"
+        );
+        assert_eq!(
+            stats.total_failed_tool_calls(),
+            1,
+            "failed should be tracked separately"
+        );
+    }
+
+    #[test]
+    fn session_stats_summary_includes_failed_counts() {
+        let mut stats = SessionStats::new();
+        stats.record_tool_call("file.read");
+        stats.record_tool_call("file.read");
+        stats.record_tool_call_failed("file.write");
+        let summary = stats.tool_calls_summary();
+        assert!(
+            summary.contains("file.read x2"),
+            "summary should show successful calls"
+        );
+        // failed_tool_calls_summary should mention file.write
+        let failed_summary = stats.failed_tool_calls_summary();
+        assert!(
+            failed_summary.contains("file.write"),
+            "failed summary should include failed tool name"
+        );
+    }
+
+    #[test]
+    fn session_stats_file_write_fail_does_not_inflate_total() {
+        let mut stats = SessionStats::new();
+        stats.record_tool_call_failed("file.write");
+        // No successful tool calls
+        assert_eq!(stats.total_tool_calls(), 0);
+        assert_eq!(stats.files_modified, 0);
+        assert_eq!(stats.total_failed_tool_calls(), 1);
     }
 }

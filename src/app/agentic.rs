@@ -638,11 +638,24 @@ impl App {
                 .collect();
             all_tool_log_views.extend(tool_log_views.clone());
 
-            let working = AppStateSnapshot::new(RuntimeState::Working)
-                .with_status(format!(
+            let failed_count = results
+                .iter()
+                .filter(|r| r.status == ToolExecutionStatus::Failed)
+                .count();
+            let status_msg = if failed_count > 0 {
+                format!(
+                    "Executed {} tool call(s) ({} failed). Sending results to model...",
+                    results.len(),
+                    failed_count
+                )
+            } else {
+                format!(
                     "Executed {} tool call(s). Sending results to model...",
                     results.len()
-                ))
+                )
+            };
+            let working = AppStateSnapshot::new(RuntimeState::Working)
+                .with_status(status_msg)
                 .with_tool_logs(tool_log_views)
                 .with_elapsed_ms(elapsed_ms);
             let _ = self.transition_with_context(working, StateTransition::StartWorking)?;
@@ -1523,8 +1536,13 @@ impl App {
 
     /// Push a tool execution result into the session as a tool message.
     fn record_tool_result(&mut self, result: &ToolExecutionResult) {
-        // Session stats: record tool call (Issue #206 C-3)
-        self.session_stats.record_tool_call(&result.tool_name);
+        // Session stats: record tool call, separating success/failure (Issue #206 C-3, Issue #233)
+        if result.status == ToolExecutionStatus::Failed {
+            self.session_stats
+                .record_tool_call_failed(&result.tool_name);
+        } else {
+            self.session_stats.record_tool_call(&result.tool_name);
+        }
 
         // Session stats: record file change line counts from diff_summary (Issue #206 C-3)
         if let Some(ref diff) = result.diff_summary {
@@ -1751,25 +1769,38 @@ impl App {
             return None;
         }
         if result.status == ToolExecutionStatus::Failed {
-            if let Some(path) = extract_write_path_from_summary(&result.summary)
-                .filter(|p| self.write_fail_tracker.record_failure(p))
-            {
+            // Always provide clear feedback that the file was NOT written (Issue #233).
+            // Additionally, track consecutive failures for escalated hints.
+            if let Some(path) = extract_write_path_from_summary(&result.summary) {
+                let threshold_hit = self.write_fail_tracker.record_failure(&path);
                 let count = self.write_fail_tracker.failure_count(&path);
-                tracing::warn!(
-                    tool = "file.write",
-                    path = %path,
-                    count = count,
-                    "repeated write failure"
-                );
                 let safe_path = crate::session::sanitize_for_prompt_entry(&path);
+                if threshold_hit {
+                    tracing::warn!(
+                        tool = "file.write",
+                        path = %path,
+                        count = count,
+                        "repeated write failure"
+                    );
+                    return Some(format!(
+                        "\n\n[Anvil warning] file.write was NOT written to disk for '{safe_path}' \
+                         ({count} consecutive failures). Please check the error message carefully. \
+                         Consider: (1) verifying the file path is correct, \
+                         (2) splitting the content into smaller files, \
+                         (3) using file.edit for partial modifications instead."
+                    ));
+                }
                 return Some(format!(
-                    "\n\n[Anvil hint] file.write has failed {count} consecutive \
-                     times for '{safe_path}'. Please check the error message carefully. \
-                     Consider: (1) verifying the file path is correct, \
-                     (2) splitting the content into smaller files, \
-                     (3) using file.edit for partial modifications instead."
+                    "\n\n[Anvil notice] file.write was NOT written to disk for '{safe_path}'. \
+                     The file on disk is unchanged. Check the error above and retry \
+                     or use file.edit for partial modifications."
                 ));
             }
+            // No path extracted — still provide generic notice
+            return Some(
+                "\n\n[Anvil notice] file.write failed — no changes were written to disk."
+                    .to_string(),
+            );
         } else if result.status == ToolExecutionStatus::Completed
             && let Some(artifact) = result.artifacts.first()
         {
