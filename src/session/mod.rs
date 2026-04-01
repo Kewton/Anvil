@@ -1329,6 +1329,164 @@ fn is_noise_token(token: &str) -> bool {
     false
 }
 
+// ── Session Notes (Issue #241) ───────────────────────────────────────
+
+/// Category of a session note — represents tool operation types only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NoteKind {
+    FileEdit,
+    FileRead,
+    ShellExec,
+    ErrorHit,
+}
+
+impl std::fmt::Display for NoteKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NoteKind::FileEdit => write!(f, "file_edit"),
+            NoteKind::FileRead => write!(f, "file_read"),
+            NoteKind::ShellExec => write!(f, "shell_exec"),
+            NoteKind::ErrorHit => write!(f, "error_hit"),
+        }
+    }
+}
+
+/// A deterministic note extracted from a turn's messages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionNote {
+    pub kind: NoteKind,
+    pub files: Vec<String>,
+    pub summary: String,
+}
+
+/// Truncate a string at the given byte limit, respecting UTF-8 char boundaries.
+/// Appends "..." when truncation occurs.
+fn truncate_at_boundary(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes;
+    while !s.is_char_boundary(end) && end > 0 {
+        end -= 1;
+    }
+    format!("{}...", &s[..end])
+}
+
+/// Extract session notes from a slice of messages.
+///
+/// Scans Tool-role messages, classifies by author, aggregates by kind,
+/// and produces summary strings. Unknown authors are ignored.
+pub fn extract_session_notes(messages: &[SessionMessage]) -> Vec<SessionNote> {
+    use std::collections::HashMap;
+
+    struct Accumulator {
+        files: Vec<String>,
+        count: usize,
+    }
+
+    impl Accumulator {
+        fn new() -> Self {
+            Self {
+                files: Vec::new(),
+                count: 0,
+            }
+        }
+
+        /// Merge unique file paths and bump the operation count.
+        fn record(&mut self, paths: &[String]) {
+            for f in paths {
+                if !self.files.contains(f) {
+                    self.files.push(f.clone());
+                }
+            }
+            self.count += 1;
+        }
+    }
+
+    let mut accumulators: HashMap<NoteKind, Accumulator> = HashMap::new();
+
+    for msg in messages {
+        if msg.role != MessageRole::Tool {
+            continue;
+        }
+
+        let kind = match msg.author.as_str() {
+            "file.edit" | "file.write" => Some(NoteKind::FileEdit),
+            "file.read" => Some(NoteKind::FileRead),
+            "shell.exec" => Some(NoteKind::ShellExec),
+            _ => None,
+        };
+
+        // Extract file paths from this single message
+        let file_targets = extract_file_targets(std::slice::from_ref(msg));
+        // Sanitize: strip control chars, limit path length (128 chars), limit count (20 files)
+        let sanitized: Vec<String> = file_targets
+            .into_iter()
+            .take(20)
+            .map(|f| {
+                let clean: String = f.chars().filter(|c| !c.is_control()).collect();
+                truncate_at_boundary(&clean, 128)
+            })
+            .collect();
+
+        // If is_error, always create an ErrorHit entry (regardless of known/unknown author)
+        if msg.is_error {
+            accumulators
+                .entry(NoteKind::ErrorHit)
+                .or_insert_with(Accumulator::new)
+                .record(&sanitized);
+        }
+
+        // For known tools, also create the tool-type note
+        let Some(k) = kind else { continue };
+
+        accumulators
+            .entry(k)
+            .or_insert_with(Accumulator::new)
+            .record(&sanitized);
+    }
+
+    // Build notes in a stable order
+    let order = [
+        NoteKind::FileEdit,
+        NoteKind::FileRead,
+        NoteKind::ShellExec,
+        NoteKind::ErrorHit,
+    ];
+
+    let mut notes = Vec::new();
+    for kind in order {
+        if let Some(acc) = accumulators.remove(&kind) {
+            let verb = match kind {
+                NoteKind::FileEdit => "Edited",
+                NoteKind::FileRead => "Read",
+                NoteKind::ShellExec => "Executed shell command",
+                NoteKind::ErrorHit => "Error in",
+            };
+
+            let summary = if acc.files.is_empty() {
+                format!("{verb} {count} operation(s)", count = acc.count)
+            } else {
+                let file_list = acc.files.join(", ");
+                format!(
+                    "{verb} {count} file(s): {file_list}",
+                    count = acc.files.len()
+                )
+            };
+
+            let summary = truncate_at_boundary(&summary, 200);
+
+            notes.push(SessionNote {
+                kind,
+                files: acc.files,
+                summary,
+            });
+        }
+    }
+
+    notes
+}
+
 #[cfg(test)]
 mod working_memory_tests {
     use super::*;
