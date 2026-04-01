@@ -3,6 +3,7 @@
 //! Tests cover the PhaseEstimator's interaction with Config settings
 //! and its overall behavior patterns.
 
+use anvil::app::agentic::{TurnSummary, log_turn_summary};
 use anvil::app::phase_estimator::{Phase, PhaseAction, PhaseEstimator};
 
 #[test]
@@ -129,4 +130,23 @@ fn phase_estimator_other_tools_ignored() {
     est.record_tool_call("shell.exec", true);
     est.record_tool_call("agent.plan", true);
     assert_eq!(est.current_phase(), Phase::Unknown);
+}
+
+#[test]
+fn turn_summary_includes_phase_field() {
+    let summary = TurnSummary {
+        turn: 1,
+        max_turns: 10,
+        elapsed: std::time::Duration::from_secs(1),
+        tokens_used: 100,
+        token_budget: 1000,
+        tool_calls: 2,
+        tool_names: &[],
+        files_modified: 0,
+        compact_info: None,
+        phase: Phase::Exploring,
+    };
+    // Verify phase field exists and log_turn_summary is callable
+    assert_eq!(format!("{}", summary.phase), "exploring");
+    log_turn_summary(&summary);
 }

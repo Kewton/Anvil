@@ -22,7 +22,6 @@ pub enum PhaseAction {
 
 /// Estimated agent phase (for logging/debugging).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum Phase {
     /// Not enough data to determine phase.
     Unknown,
@@ -30,6 +29,16 @@ pub enum Phase {
     Exploring,
     /// Has performed write operations.
     Implementing,
+}
+
+impl std::fmt::Display for Phase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Phase::Unknown => write!(f, "unknown"),
+            Phase::Exploring => write!(f, "exploring"),
+            Phase::Implementing => write!(f, "implementing"),
+        }
+    }
 }
 
 /// Tool category for phase estimation.
@@ -60,7 +69,6 @@ pub struct PhaseEstimator {
     /// Whether ANVIL_FINAL has been observed at least once in this session.
     anvil_final_observed: bool,
     /// Threshold N: consecutive reads to enter "exploring" phase.
-    #[allow(dead_code)]
     explore_threshold: usize,
     /// Threshold M: consecutive reads to trigger forced transition (M > N).
     force_transition_threshold: usize,
@@ -153,7 +161,6 @@ impl PhaseEstimator {
     }
 
     /// Return the estimated phase for logging/debugging.
-    #[allow(dead_code)]
     pub fn current_phase(&self) -> Phase {
         if self.has_written {
             Phase::Implementing
@@ -310,6 +317,13 @@ mod tests {
         est.record_tool_call("shell.exec", true);
         assert_eq!(est.consecutive_reads, 0);
         assert!(!est.has_written);
+    }
+
+    #[test]
+    fn phase_display() {
+        assert_eq!(Phase::Unknown.to_string(), "unknown");
+        assert_eq!(Phase::Exploring.to_string(), "exploring");
+        assert_eq!(Phase::Implementing.to_string(), "implementing");
     }
 
     #[test]

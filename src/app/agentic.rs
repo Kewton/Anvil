@@ -41,6 +41,7 @@ pub struct TurnSummary<'a> {
     pub tool_names: &'a [String],
     pub files_modified: usize,
     pub compact_info: Option<&'a CompactInfo>,
+    pub phase: super::phase_estimator::Phase,
 }
 
 /// Log a turn summary using structured tracing.
@@ -69,6 +70,7 @@ pub fn log_turn_summary(summary: &TurnSummary<'_>) {
         tools = %tool_summary,
         files_modified = summary.files_modified,
         compact = %compact_str,
+        phase = %summary.phase,
         "turn completed"
     );
 }
@@ -659,6 +661,7 @@ impl App {
                 tool_names: &turn_tool_names,
                 files_modified: turn_files_modified,
                 compact_info: self.last_compact_info.as_ref(),
+                phase: self.phase_estimator.current_phase(),
             });
             // Reset last_compact_info after it's been consumed by the turn summary
             self.last_compact_info = None;
@@ -1820,6 +1823,7 @@ impl App {
                 tool_names: &[],
                 files_modified: 0,
                 compact_info: None,
+                phase: self.phase_estimator.current_phase(),
             });
             return Ok(None);
         }
