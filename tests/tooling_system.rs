@@ -1753,6 +1753,20 @@ fn file_edit_noop_when_strings_equal() {
 
     assert_eq!(result.status, ToolExecutionStatus::Completed);
     assert!(result.summary.contains("no changes"));
+    assert!(
+        result
+            .summary
+            .contains("old_string and new_string are identical"),
+        "summary should tell LLM that old_string == new_string: {}",
+        result.summary,
+    );
+    // artifacts must contain the file path (not be empty / "unknown")
+    assert_eq!(result.artifacts, vec!["./test.txt".to_string()]);
+    // edit_detail must be set by the fallback wrapper
+    assert!(
+        result.edit_detail.is_some(),
+        "edit_detail should be Some for no-op edit",
+    );
     let content = fs::read_to_string(&file_path).expect("read should succeed");
     assert_eq!(content, "hello world");
 }

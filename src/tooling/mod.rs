@@ -1520,9 +1520,12 @@ impl LocalToolExecutor {
         if old_string == new_string {
             return Ok(build_completed_result(
                 request,
-                format!("{path} (no changes)"),
+                format!(
+                    "{path} (no changes: old_string and new_string are identical. \
+                     Review the content and provide a different new_string to make the intended edit.)"
+                ),
                 ToolExecutionPayload::None,
-                vec![],
+                vec![path.to_string()],
                 started,
             ));
         }
@@ -1577,9 +1580,12 @@ impl LocalToolExecutor {
         if params.old_content == params.new_content {
             return Ok(build_completed_result(
                 request,
-                format!("{path} (no changes)"),
+                format!(
+                    "{path} (no changes: old_content and new_content are identical. \
+                     Review the content and provide a different new_content to make the intended edit.)"
+                ),
                 ToolExecutionPayload::None,
-                vec![],
+                vec![path.to_string()],
                 started,
             ));
         }
