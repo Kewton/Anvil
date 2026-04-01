@@ -123,6 +123,13 @@ impl App {
             return false; // No plan → fall through to existing guard
         }
 
+        // Issue #251: Sync plan completion from touched_files before gate check.
+        // This ensures file modifications executed outside the normal
+        // execute_structured_tool_calls path (e.g. tool calls placed after
+        // ANVIL_FINAL in the LLM response) are reflected in plan status.
+        self.execution_plan
+            .sync_from_touched_files(&self.session.working_memory.touched_files);
+
         match self.execution_plan.check_final_gate() {
             FinalGateDecision::Allow => {
                 tracing::info!("plan-aware final gate: all items finished, allowing ANVIL_FINAL");
