@@ -428,6 +428,10 @@ impl App {
         // Reset read transition guard per-turn counters (Issue #216)
         self.read_transition_guard.reset();
 
+        // Session note extraction bookkeeping (Issue #241)
+        let msg_count_before = self.session.messages.len();
+        let tokens_before = self.session.estimated_token_count();
+
         for iteration in 0..max_iterations {
             let iteration_started = std::time::Instant::now();
 
@@ -758,6 +762,24 @@ impl App {
         let mut done_snapshot = self.transition_with_context(done, StateTransition::Finish)?;
         self.evaluate_context_warning(&mut done_snapshot);
         frames.push(self.render_console(tui)?);
+
+        // Session note extraction (Issue #241)
+        let tokens_after = self.session.estimated_token_count();
+        let context_window = self.effective_context_window() as usize;
+        let token_delta = tokens_after.saturating_sub(tokens_before);
+        if total_tool_count >= 5 || token_delta >= context_window / 10 {
+            let turn_messages = &self.session.messages[msg_count_before..];
+            let notes = crate::session::extract_session_notes(turn_messages);
+            for note in &notes {
+                tracing::info!(
+                    kind = %note.kind,
+                    files = ?note.files,
+                    "session_note: {}",
+                    note.summary
+                );
+            }
+        }
+
         Ok(frames)
     }
 
