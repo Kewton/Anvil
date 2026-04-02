@@ -274,6 +274,8 @@ pub struct App {
     last_compact_info: Option<CompactInfo>,
     /// Execution plan for Plan → Execute mode (Issue #249).
     execution_plan: crate::contracts::ExecutionPlan,
+    /// Agent telemetry for session-level metrics (Issue #255).
+    agent_telemetry: crate::contracts::AgentTelemetry,
 }
 
 /// Whether the session loop should continue or exit.
@@ -604,6 +606,7 @@ impl App {
             session_stats: SessionStats::new(),
             last_compact_info: None,
             execution_plan: crate::contracts::ExecutionPlan::default(),
+            agent_telemetry: crate::contracts::AgentTelemetry::new(),
         })
     }
 
@@ -858,6 +861,25 @@ impl App {
             elapsed_s = format!("{:.1}", session_elapsed.as_secs_f64()),
             "session completed"
         );
+
+        // Issue #255: Log agent telemetry (Stage 0 observability).
+        let tel = &self.agent_telemetry;
+        if tel.total_final_requests > 0 || tel.plan_registration_count > 0 {
+            let completion = tel
+                .completion_kind
+                .map(|k| k.to_string())
+                .unwrap_or_else(|| "none".to_string());
+            tracing::info!(
+                completion_kind = %completion,
+                premature_final_count = tel.premature_final_count,
+                total_final_requests = tel.total_final_requests,
+                pfrr = format!("{:.2}", tel.premature_final_request_rate()),
+                plan_registration_count = tel.plan_registration_count,
+                plan_update_count = tel.plan_update_count,
+                sync_from_touched_files_count = tel.sync_from_touched_files_count,
+                "agent telemetry"
+            );
+        }
     }
 
     /// Run PostSession hook (DR2-005, DR2-007 facade method).
