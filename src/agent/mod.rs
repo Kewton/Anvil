@@ -792,6 +792,17 @@ const PROMPT_OPTIONAL_CATALOG_HEADER: &str =
     "\nAdditional tools (use ANVIL_TOOL block format shown above):\n";
 
 const PROMPT_TOOL_RULES: &str = concat!(
+    "## ANVIL_PLAN — Change plan\n",
+    "Before modifying files, output a change plan using an ANVIL_PLAN block:\n",
+    "```ANVIL_PLAN\n",
+    "- [ ] src/foo.rs: Description of change\n",
+    "- [ ] src/bar.rs: Description of change\n",
+    "```\n",
+    "Rules for ANVIL_PLAN:\n",
+    "- Output ANVIL_PLAN once per user request, before any file.write/file.edit.\n",
+    "- Each item is a checklist entry: `- [ ] <path>: <description>`.\n",
+    "- Do NOT output ANVIL_FINAL until ALL plan items are completed.\n",
+    "\n",
     "After ALL tool blocks, include exactly one final block with your summary:\n",
     "```ANVIL_FINAL\n",
     "User-facing summary and code review notes.\n",

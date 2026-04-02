@@ -1889,6 +1889,22 @@ impl App {
             {
                 // ANVIL_FINAL detected → record observation (Issue #159)
                 self.phase_estimator.observe_anvil_final();
+                // Issue #253: Apply plan gate even on zero-tool-call Done path.
+                // Use require_plan variant so NoPlan also suppresses.
+                if self.check_plan_final_gate_require_plan() {
+                    self.record_assistant_output(
+                        self.next_message_id("assistant"),
+                        assistant_message,
+                    )?;
+                    return Ok(Some(self.run_guarded_retry_turn(
+                        status,
+                        saved_status,
+                        *elapsed_ms,
+                        inference_performance.clone(),
+                        tui,
+                        provider_client,
+                    )?));
+                }
                 self.inject_final_guard_retry();
                 // Record the assistant message that triggered the guard
                 self.record_assistant_output(self.next_message_id("assistant"), assistant_message)?;

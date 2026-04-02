@@ -3930,13 +3930,14 @@ fn anvil_final_guard_handle_structured_done_fires_for_plan_only_response() {
         "expected 2 provider calls: initial + guard retry via handle_structured_done"
     );
 
-    // Verify the guard retry message was injected
+    // Issue #253: Plan gate fires before final guard, injecting plan-required message
     assert!(
         app.session()
             .messages
             .iter()
-            .any(|m| m.content.contains("No file modifications detected")),
-        "guard retry message should be in session"
+            .any(|m| m.content.contains("ANVIL_PLAN")
+                || m.content.contains("No file modifications detected")),
+        "plan-required or guard retry message should be in session"
     );
 }
 
@@ -4199,13 +4200,14 @@ fn guard_retry_post_final() {
         "post-FINAL tool call_002 (lib.rs) should NOT appear in session messages after guard retry"
     );
 
-    // Verify guard DID fire (guard retry message present)
+    // Issue #253: Plan gate fires before final guard, injecting plan-required message
     assert!(
         app.session()
             .messages
             .iter()
-            .any(|m| m.content.contains("No file modifications detected")),
-        "guard retry message should be in session"
+            .any(|m| m.content.contains("ANVIL_PLAN")
+                || m.content.contains("No file modifications detected")),
+        "plan-required or guard retry message should be in session"
     );
 }
 
