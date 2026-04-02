@@ -31,6 +31,10 @@ impl App {
     ///
     /// Returns `true` if a new plan was registered.
     pub(crate) fn try_register_plan(&mut self, content: &str) -> bool {
+        // Guard: ignore re-registration when a plan is already active.
+        if !self.execution_plan.is_empty() {
+            return false;
+        }
         if let Some(block) = extract_plan_block(content) {
             let items = parse_plan_items(&block);
             if !items.is_empty() {
@@ -118,17 +122,29 @@ impl App {
     ///
     /// Returns `true` if ANVIL_FINAL should be suppressed (plan incomplete).
     /// When suppressed, injects a guidance message into the session.
+    /// Check the plan-aware ANVIL_FINAL gate.
+    ///
+    /// Returns `true` if ANVIL_FINAL should be suppressed (plan incomplete).
+    /// When suppressed, injects a guidance message into the session.
+    ///
+    /// When `require_plan` is true, the NoPlan branch also suppresses
+    /// ANVIL_FINAL and requests plan creation (Issue #253).
     pub(crate) fn check_plan_final_gate(&mut self) -> bool {
-        if self.execution_plan.is_empty() {
-            return false; // No plan → fall through to existing guard
-        }
+        self.check_plan_final_gate_inner(false)
+    }
 
+    /// Like [`check_plan_final_gate`] but also suppresses ANVIL_FINAL when
+    /// no plan has been registered yet (Issue #253: Done path guard).
+    pub(crate) fn check_plan_final_gate_require_plan(&mut self) -> bool {
+        self.check_plan_final_gate_inner(true)
+    }
+
+    fn check_plan_final_gate_inner(&mut self, require_plan: bool) -> bool {
         // Issue #251: Sync plan completion from touched_files before gate check.
-        // This ensures file modifications executed outside the normal
-        // execute_structured_tool_calls path (e.g. tool calls placed after
-        // ANVIL_FINAL in the LLM response) are reflected in plan status.
-        self.execution_plan
-            .sync_from_touched_files(&self.session.working_memory.touched_files);
+        if !self.execution_plan.is_empty() {
+            self.execution_plan
+                .sync_from_touched_files(&self.session.working_memory.touched_files);
+        }
 
         match self.execution_plan.check_final_gate() {
             FinalGateDecision::Allow => {
@@ -136,6 +152,9 @@ impl App {
                 false
             }
             FinalGateDecision::NoPlan => {
+                if !require_plan {
+                    return false; // No plan → fall through to existing guard
+                }
                 tracing::info!("plan-aware final gate: no plan, requesting plan creation");
                 let msg = SessionMessage::new(
                     MessageRole::Tool,
