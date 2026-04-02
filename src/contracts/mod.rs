@@ -91,6 +91,146 @@ impl SubAgentPayload {
 }
 
 // ---------------------------------------------------------------------------
+// Completion taxonomy (Issue #255: AgentPhase integration)
+// ---------------------------------------------------------------------------
+
+/// How the agentic session ended, classified by plan state and verification.
+///
+/// Priority order (highest first):
+/// 1. CompleteVerified
+/// 2. CompleteUnverified
+/// 3. Blocked
+/// 4. Exhausted
+/// 5. Partial
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionKind {
+    /// All actionable items completed + verify succeeded.
+    CompleteVerified,
+    /// All actionable items completed + verify unavailable/denied.
+    CompleteUnverified,
+    /// Some changes made but items remain unfinished.
+    #[default]
+    Partial,
+    /// Item(s) blocked due to repeated failures.
+    Blocked,
+    /// Budget / turn limit exhausted with unfinished items.
+    Exhausted,
+}
+
+impl std::fmt::Display for CompletionKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CompleteVerified => write!(f, "complete_verified"),
+            Self::CompleteUnverified => write!(f, "complete_unverified"),
+            Self::Partial => write!(f, "partial"),
+            Self::Blocked => write!(f, "blocked"),
+            Self::Exhausted => write!(f, "exhausted"),
+        }
+    }
+}
+
+impl CompletionKind {
+    /// Classify termination based on plan state, verify outcome, and budget.
+    ///
+    /// - `verify_pass`: `Some(true)` = verified, `Some(false)` = verify failed,
+    ///   `None` = unavailable/denied.
+    /// - `budget_exhausted`: whether budget/turn limit was reached.
+    pub fn classify(
+        plan: &ExecutionPlan,
+        verify_pass: Option<bool>,
+        budget_exhausted: bool,
+    ) -> Self {
+        let all_finished = plan.all_finished() && !plan.is_empty();
+        let has_blocked = plan
+            .items
+            .iter()
+            .any(|i| i.status == PlanItemStatus::Blocked);
+
+        // Priority 1-2: all items finished → complete_*
+        if all_finished {
+            return match verify_pass {
+                Some(true) => CompletionKind::CompleteVerified,
+                _ => CompletionKind::CompleteUnverified,
+            };
+        }
+
+        // Priority 3: blocked items exist
+        if has_blocked {
+            return CompletionKind::Blocked;
+        }
+
+        // Priority 4: budget exhausted
+        if budget_exhausted {
+            return CompletionKind::Exhausted;
+        }
+
+        // Priority 5: fallback
+        CompletionKind::Partial
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Agent telemetry (Issue #255: Stage 0 observability)
+// ---------------------------------------------------------------------------
+
+/// Telemetry counters for the agentic session.
+///
+/// Tracks key metrics for evaluating agent loop quality:
+/// - Premature ANVIL_FINAL requests (PFRR)
+/// - Plan registration / update counts
+/// - `sync_from_touched_files` rescue invocations
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentTelemetry {
+    /// Number of ANVIL_FINAL requests that were suppressed (plan incomplete).
+    pub premature_final_count: u32,
+    /// Total ANVIL_FINAL requests observed (both accepted and suppressed).
+    pub total_final_requests: u32,
+    /// Number of times a plan was registered via ANVIL_PLAN.
+    pub plan_registration_count: u32,
+    /// Number of times ANVIL_PLAN_UPDATE appended items.
+    pub plan_update_count: u32,
+    /// Number of times sync_from_touched_files actually advanced items.
+    pub sync_from_touched_files_count: u32,
+    /// Final completion classification.
+    pub completion_kind: Option<CompletionKind>,
+}
+
+impl AgentTelemetry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn record_premature_final(&mut self) {
+        self.premature_final_count += 1;
+    }
+
+    pub fn record_final_request(&mut self) {
+        self.total_final_requests += 1;
+    }
+
+    pub fn record_plan_registration(&mut self) {
+        self.plan_registration_count += 1;
+    }
+
+    pub fn record_plan_update(&mut self) {
+        self.plan_update_count += 1;
+    }
+
+    pub fn record_sync_from_touched_files(&mut self) {
+        self.sync_from_touched_files_count += 1;
+    }
+
+    /// Premature Final Request Rate: ratio of suppressed finals to total finals.
+    pub fn premature_final_request_rate(&self) -> f64 {
+        if self.total_final_requests == 0 {
+            return 0.0;
+        }
+        self.premature_final_count as f64 / self.total_final_requests as f64
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Execution Plan types (Issue #249: Plan → Execute mode)
 // ---------------------------------------------------------------------------
 
@@ -131,6 +271,10 @@ pub struct PlanItem {
     /// Number of consecutive execution failures for this item.
     #[serde(default)]
     pub retry_count: u8,
+    /// Files that have been successfully mutated for this item (Issue #255).
+    /// Used to track progress toward completing all `target_files`.
+    #[serde(default)]
+    pub mutated_files: Vec<String>,
 }
 
 impl PlanItem {
@@ -143,6 +287,7 @@ impl PlanItem {
             target_files,
             status: PlanItemStatus::Pending,
             retry_count: 0,
+            mutated_files: Vec::new(),
         }
     }
 
@@ -252,6 +397,41 @@ impl ExecutionPlan {
         }
     }
 
+    /// Record a successful mutation for a plan item (Issue #255).
+    ///
+    /// Tracks which files have been mutated. When all `target_files` are
+    /// covered (or item has no target_files), marks the item as Done.
+    /// Uses fuzzy path matching (ends_with) for path normalization.
+    pub fn record_mutation_success(&mut self, index: usize, file_path: &str) {
+        let item = match self.items.get_mut(index) {
+            Some(i) => i,
+            None => return,
+        };
+        if item.is_finished() {
+            return;
+        }
+
+        // Add to mutated_files if not already present
+        if !item.mutated_files.iter().any(|f| f == file_path) {
+            item.mutated_files.push(file_path.to_string());
+        }
+
+        // Check completion: all target_files must be covered
+        if item.target_files.is_empty() {
+            // No explicit targets → any mutation completes
+            item.status = PlanItemStatus::Done;
+        } else {
+            let all_covered = item.target_files.iter().all(|tf| {
+                item.mutated_files
+                    .iter()
+                    .any(|mf| mf.ends_with(tf) || tf.ends_with(mf))
+            });
+            if all_covered {
+                item.status = PlanItemStatus::Done;
+            }
+        }
+    }
+
     /// Append new items (used by ANVIL_PLAN_UPDATE).
     pub fn append_items(&mut self, new_items: Vec<PlanItem>) {
         self.items.extend(new_items);
@@ -264,6 +444,9 @@ impl ExecutionPlan {
     /// `ANVIL_FINAL` in the LLM response — Issue #251), the plan item stays
     /// Pending/InProgress even though the work is done.  This method fixes
     /// that by matching `touched_files` against each item's `target_files`.
+    ///
+    /// Issue #255: Changed from ANY to ALL target_files matching, consistent
+    /// with the strengthened item completion condition.
     pub fn sync_from_touched_files(&mut self, touched_files: &[String]) {
         if self.items.is_empty() || touched_files.is_empty() {
             return;
@@ -276,13 +459,13 @@ impl ExecutionPlan {
             if item.target_files.is_empty() {
                 continue;
             }
-            // Mark done if ANY target file has been touched.
-            let matched = item.target_files.iter().any(|tf| {
+            // Issue #255: Mark done only if ALL target files have been touched.
+            let all_matched = item.target_files.iter().all(|tf| {
                 touched_files
                     .iter()
                     .any(|touched| touched.ends_with(tf) || tf.ends_with(touched))
             });
-            if matched {
+            if all_matched {
                 tracing::info!(
                     description = %item.description,
                     "plan item completed (synced from touched_files)"

@@ -45,6 +45,7 @@ impl App {
                 self.execution_plan = ExecutionPlan::new(items);
                 // Mark first item as InProgress
                 self.execution_plan.mark_in_progress(0);
+                self.agent_telemetry.record_plan_registration();
                 return true;
             }
         }
@@ -63,6 +64,7 @@ impl App {
                     "ANVIL_PLAN_UPDATE detected; appending items"
                 );
                 self.execution_plan.append_items(new_items);
+                self.agent_telemetry.record_plan_update();
                 return true;
             }
         }
@@ -71,8 +73,9 @@ impl App {
 
     /// Update plan item status based on tool execution results.
     ///
-    /// When a file.write or file.edit succeeds for a target file in the current
-    /// plan item, advance the item to Done and move to the next.
+    /// Issue #255: Uses `record_mutation_success` to require ALL target_files
+    /// to be mutated before marking an item as Done. Each successful mutation
+    /// is tracked individually per file path.
     pub(crate) fn update_plan_from_results(
         &mut self,
         results: &[crate::tooling::ToolExecutionResult],
@@ -87,28 +90,40 @@ impl App {
         };
 
         let mutation_tools = ["file.write", "file.edit", "file.edit_anchor"];
-        let has_successful_mutation = results.iter().any(|r| {
-            mutation_tools.contains(&r.tool_name.as_str())
+
+        let was_done_before = self.execution_plan.items[idx].is_finished();
+
+        // Record each successful mutation individually (Issue #255)
+        for r in results {
+            if mutation_tools.contains(&r.tool_name.as_str())
                 && r.status == crate::tooling::ToolExecutionStatus::Completed
-        });
+            {
+                // summary contains the file path for mutation tools
+                if !r.summary.is_empty() {
+                    self.execution_plan.record_mutation_success(idx, &r.summary);
+                }
+            }
+        }
 
-        let has_failed_mutation = results.iter().any(|r| {
-            mutation_tools.contains(&r.tool_name.as_str())
-                && r.status == crate::tooling::ToolExecutionStatus::Failed
-        });
-
-        if has_successful_mutation {
+        // Check if item just transitioned to Done
+        if !was_done_before && self.execution_plan.items[idx].is_finished() {
             tracing::info!(
                 item = idx + 1,
                 description = %self.execution_plan.items[idx].description,
-                "plan item completed"
+                "plan item completed (all target_files mutated)"
             );
-            self.execution_plan.mark_done(idx);
             // Auto-advance next item to InProgress
             if let Some(next) = self.execution_plan.next_actionable_index() {
                 self.execution_plan.mark_in_progress(next);
             }
-        } else if has_failed_mutation {
+        }
+
+        // Record failures
+        let has_failed_mutation = results.iter().any(|r| {
+            mutation_tools.contains(&r.tool_name.as_str())
+                && r.status == crate::tooling::ToolExecutionStatus::Failed
+        });
+        if has_failed_mutation && !self.execution_plan.items[idx].is_finished() {
             self.execution_plan.record_failure(idx);
             tracing::warn!(
                 item = idx + 1,
@@ -140,10 +155,18 @@ impl App {
     }
 
     fn check_plan_final_gate_inner(&mut self, require_plan: bool) -> bool {
+        // Issue #255: Track every ANVIL_FINAL request.
+        self.agent_telemetry.record_final_request();
+
         // Issue #251: Sync plan completion from touched_files before gate check.
         if !self.execution_plan.is_empty() {
+            let before = self.execution_plan.finished_count();
             self.execution_plan
                 .sync_from_touched_files(&self.session.working_memory.touched_files);
+            let after = self.execution_plan.finished_count();
+            if after > before {
+                self.agent_telemetry.record_sync_from_touched_files();
+            }
         }
 
         match self.execution_plan.check_final_gate() {
@@ -155,6 +178,8 @@ impl App {
                 if !require_plan {
                     return false; // No plan → fall through to existing guard
                 }
+                // Issue #255: NoPlan suppression counts as premature
+                self.agent_telemetry.record_premature_final();
                 tracing::info!("plan-aware final gate: no plan, requesting plan creation");
                 let msg = SessionMessage::new(
                     MessageRole::Tool,
@@ -170,11 +195,14 @@ impl App {
                 remaining,
                 total,
             } => {
+                // Issue #255: Track premature final request (PFRR).
+                self.agent_telemetry.record_premature_final();
                 tracing::info!(
                     remaining,
                     total,
                     next = %next_description,
-                    "plan-aware final gate: suppressing ANVIL_FINAL"
+                    pfrr = %self.agent_telemetry.premature_final_request_rate(),
+                    "plan-aware final gate: suppressing ANVIL_FINAL (premature)"
                 );
                 let msg = SessionMessage::new(
                     MessageRole::Tool,

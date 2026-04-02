@@ -796,6 +796,23 @@ impl App {
             current = next_structured;
         }
 
+        // Issue #255: Classify completion kind based on plan state.
+        {
+            let budget_exhausted = total_tool_count >= self.config.runtime.max_tool_calls;
+            let completion_kind = crate::contracts::CompletionKind::classify(
+                &self.execution_plan,
+                None, // verify not yet implemented (Stage 3)
+                budget_exhausted,
+            );
+            self.agent_telemetry.completion_kind = Some(completion_kind);
+            tracing::info!(
+                completion_kind = %completion_kind,
+                plan_items = self.execution_plan.items.len(),
+                plan_finished = self.execution_plan.finished_count(),
+                "agentic loop completion classified"
+            );
+        }
+
         // Transition to Done
         let mut done = AppStateSnapshot::new(RuntimeState::Done)
             .with_status(status.to_string())
