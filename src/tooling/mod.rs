@@ -657,6 +657,8 @@ pub struct ToolExecutionResult {
     pub diff_summary: Option<String>,
     /// file.edit fallback stage detail (Issue #206). `None` for non-edit tools.
     pub edit_detail: Option<EditResultDetail>,
+    /// Whether this result was rolled back by atomic transaction failure (Issue #259).
+    pub rolled_back: bool,
 }
 
 impl ToolExecutionResult {
@@ -1466,6 +1468,19 @@ impl LocalToolExecutor {
             }
         }
 
+        // Issue #259: skip write and diff_summary when content is identical to existing file.
+        if let Ok(existing) = fs::read_to_string(&resolved)
+            && existing == content
+        {
+            return Ok(build_completed_result(
+                request,
+                format!("{path} (no changes)"),
+                ToolExecutionPayload::None,
+                vec![],
+                started,
+            ));
+        }
+
         if let Some(parent) = resolved.parent() {
             fs::create_dir_all(parent).map_err(|err| {
                 ToolRuntimeError::Io(format!(
@@ -1942,6 +1957,7 @@ impl LocalToolExecutor {
                     elapsed_ms: started.elapsed().as_millis(),
                     diff_summary: None,
                     edit_detail: None,
+                    rolled_back: false,
                 });
             }
             match child.try_wait() {
@@ -1979,6 +1995,7 @@ impl LocalToolExecutor {
             elapsed_ms: started.elapsed().as_millis(),
             diff_summary: None,
             edit_detail: None,
+            rolled_back: false,
         })
     }
 
@@ -2169,6 +2186,7 @@ impl LocalToolExecutor {
                 elapsed_ms: started.elapsed().as_millis(),
                 diff_summary: None,
                 edit_detail: None,
+                rolled_back: false,
             });
         }
 
@@ -2518,6 +2536,7 @@ fn build_completed_result_with_diff(
         elapsed_ms: started.elapsed().as_millis(),
         diff_summary,
         edit_detail: None,
+        rolled_back: false,
     }
 }
 

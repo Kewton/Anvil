@@ -144,7 +144,8 @@ pub struct SessionStats {
     pub total_turns: u32,
     pub session_start: Option<Instant>,
     pub tool_calls: HashMap<String, u32>,
-    pub files_modified: u32,
+    /// Unique file paths that were actually persisted to disk (Issue #259).
+    pub files_modified: std::collections::HashSet<String>,
     pub lines_added: u32,
     pub lines_deleted: u32,
     pub compact_count: u32,
@@ -853,7 +854,7 @@ impl App {
             total_turns = self.session_stats.total_turns,
             total_tool_calls = self.session_stats.total_tool_calls(),
             tools = %self.session_stats.tool_calls_summary(),
-            files_modified = self.session_stats.files_modified,
+            files_modified = self.session_stats.files_modified.len(),
             lines_added = self.session_stats.lines_added,
             lines_deleted = self.session_stats.lines_deleted,
             compact_count = self.session_stats.compact_count,

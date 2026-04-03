@@ -204,6 +204,7 @@ fn validated_tool_call_builds_typed_execution_request_and_result() {
         elapsed_ms: 12,
         diff_summary: None,
         edit_detail: None,
+        rolled_back: false,
     };
 
     assert_eq!(execution.spec.kind, ToolKind::FileRead);
@@ -378,6 +379,7 @@ fn tool_execution_result_can_bridge_into_console_tool_log_view() {
         elapsed_ms: 12,
         diff_summary: None,
         edit_detail: None,
+        rolled_back: false,
     };
     let log = result.to_tool_log_view();
 
@@ -2292,6 +2294,7 @@ fn format_tool_result_message_image_payload() {
         elapsed_ms: 10,
         diff_summary: None,
         edit_detail: None,
+        rolled_back: false,
     };
     let msg = format_tool_result_message(&result, 10000);
     assert!(msg.contains("file.read"));
@@ -2320,6 +2323,7 @@ fn format_tool_result_message_truncates_multibyte_safely() {
         elapsed_ms: 5,
         diff_summary: None,
         edit_detail: None,
+        rolled_back: false,
     };
 
     // Must not panic — the old byte-slicing implementation would panic here.
@@ -2344,6 +2348,7 @@ fn format_tool_result_message_ascii_truncation_still_works() {
         elapsed_ms: 5,
         diff_summary: None,
         edit_detail: None,
+        rolled_back: false,
     };
 
     let msg = format_tool_result_message(&result, 100);
@@ -2371,6 +2376,7 @@ fn format_tool_result_message_boundary_char_3byte() {
         elapsed_ms: 5,
         diff_summary: None,
         edit_detail: None,
+        rolled_back: false,
     };
 
     let msg = format_tool_result_message(&result, 100);
@@ -2455,6 +2461,7 @@ fn format_tool_result_message_success_head_priority() {
         elapsed_ms: 5,
         diff_summary: None,
         edit_detail: None,
+        rolled_back: false,
     };
 
     let msg = format_tool_result_message(&result, 100);
@@ -2482,6 +2489,7 @@ fn format_tool_result_message_failure_tail_priority() {
         elapsed_ms: 5,
         diff_summary: None,
         edit_detail: None,
+        rolled_back: false,
     };
 
     let msg = format_tool_result_message(&result, 100);
@@ -2509,6 +2517,7 @@ fn format_tool_result_message_interrupted_tail_priority() {
         elapsed_ms: 5,
         diff_summary: None,
         edit_detail: None,
+        rolled_back: false,
     };
 
     let msg = format_tool_result_message(&result, 100);
@@ -6191,6 +6200,7 @@ fn tool_execution_result_edit_detail_default_none() {
         elapsed_ms: 0,
         diff_summary: None,
         edit_detail: None,
+        rolled_back: false,
     };
     assert!(result.edit_detail.is_none());
 }
@@ -6211,10 +6221,122 @@ fn tool_execution_result_edit_detail_with_stage() {
         edit_detail: Some(EditResultDetail {
             fallback_stage: EditFallbackStage::Anchor,
         }),
+        rolled_back: false,
     };
     assert!(result.edit_detail.is_some());
     assert_eq!(
         result.edit_detail.unwrap().fallback_stage,
         EditFallbackStage::Anchor
+    );
+}
+
+// -----------------------------------------------------------------------
+// Issue #259: file.edit/write disk sync — files_modified accuracy
+// -----------------------------------------------------------------------
+
+#[test]
+fn session_stats_files_modified_tracks_unique_paths() {
+    use anvil::app::SessionStats;
+
+    let mut stats = SessionStats::new();
+    // Simulate two edits to the same file — should count as 1
+    stats.files_modified.insert("/tmp/a.rs".to_string());
+    stats.files_modified.insert("/tmp/a.rs".to_string());
+    assert_eq!(stats.files_modified.len(), 1);
+
+    // Different file adds to the count
+    stats.files_modified.insert("/tmp/b.rs".to_string());
+    assert_eq!(stats.files_modified.len(), 2);
+}
+
+#[test]
+fn rolled_back_result_has_flag_set() {
+    let mut result = ToolExecutionResult {
+        tool_call_id: "call_rb".to_string(),
+        tool_name: "file.edit".to_string(),
+        status: ToolExecutionStatus::Completed,
+        summary: "edit ok".to_string(),
+        payload: ToolExecutionPayload::None,
+        artifacts: vec!["/tmp/test.rs".to_string()],
+        elapsed_ms: 0,
+        diff_summary: Some("+line\n-old".to_string()),
+        edit_detail: None,
+        rolled_back: false,
+    };
+    assert!(!result.rolled_back);
+
+    // Simulate rollback annotation (as done in agentic.rs)
+    result.rolled_back = true;
+    result.summary = format!(
+        "{} [rolled back: atomic transaction failed]",
+        result.summary
+    );
+    assert!(result.rolled_back);
+    assert!(result.summary.contains("[rolled back"));
+}
+
+#[test]
+fn file_write_same_content_produces_no_diff() {
+    let root = std::env::temp_dir().join("anvil_issue259_write_same");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("dir");
+    let file_path = root.join("existing.txt");
+    fs::write(&file_path, "unchanged content").expect("seed file");
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
+    let result = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_same_001".to_string(),
+            spec: build_registry()
+                .get("file.write")
+                .expect("file.write spec")
+                .clone(),
+            input: ToolInput::FileWrite {
+                path: "./existing.txt".to_string(),
+                content: "unchanged content".to_string(),
+            },
+        })
+        .expect("write should succeed");
+
+    assert_eq!(result.status, ToolExecutionStatus::Completed);
+    assert!(
+        result.diff_summary.is_none(),
+        "same-content write should NOT produce diff_summary, got: {:?}",
+        result.diff_summary
+    );
+    assert!(
+        result.summary.contains("no changes"),
+        "summary should indicate no changes, got: {}",
+        result.summary
+    );
+}
+
+#[test]
+fn file_write_different_content_produces_diff() {
+    let root = std::env::temp_dir().join("anvil_issue259_write_diff");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("dir");
+    let file_path = root.join("target.txt");
+    fs::write(&file_path, "old content").expect("seed file");
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
+    let result = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_diff_001".to_string(),
+            spec: build_registry()
+                .get("file.write")
+                .expect("file.write spec")
+                .clone(),
+            input: ToolInput::FileWrite {
+                path: "./target.txt".to_string(),
+                content: "new content".to_string(),
+            },
+        })
+        .expect("write should succeed");
+
+    assert_eq!(result.status, ToolExecutionStatus::Completed);
+    assert!(
+        result.diff_summary.is_some(),
+        "different-content write should produce diff_summary"
     );
 }
