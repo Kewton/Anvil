@@ -43,6 +43,10 @@ pub struct TurnSummary<'a> {
     pub files_modified: usize,
     pub compact_info: Option<&'a CompactInfo>,
     pub phase: super::phase_estimator::Phase,
+    /// Mutations executed this turn.
+    pub mutations_this_turn: Option<u32>,
+    /// Items advanced this turn.
+    pub items_advanced_this_turn: Option<u32>,
 }
 
 /// Log a turn summary using structured tracing.
@@ -465,7 +469,7 @@ impl App {
         self.reset_execution_plan();
 
         // Issue #249: Detect ANVIL_PLAN from initial response
-        self.try_register_plan(&current.final_response);
+        self.try_register_plan(&current.raw_content);
 
         // Session note extraction bookkeeping (Issue #241)
         let msg_count_before = self.session.messages.len();
@@ -494,6 +498,7 @@ impl App {
                 tool_calls: normal_calls,
                 final_response: current.final_response.clone(),
                 anvil_final_detected: current.anvil_final_detected,
+                raw_content: current.raw_content.clone(),
             };
 
             // Show plan for this iteration
@@ -522,8 +527,8 @@ impl App {
             let (results, loop_action) = self.execute_structured_tool_calls(&current_normal)?;
             total_tool_count += results.len();
 
-            // Issue #249: Update plan item status from tool results
-            self.update_plan_from_results(&results);
+            // Update plan item status from tool results; capture telemetry.
+            let (turn_mutations, turn_items_advanced) = self.update_plan_from_results(&results);
 
             let tool_log_views: Vec<ToolLogView> = results
                 .iter()
@@ -565,6 +570,7 @@ impl App {
                     anvil_final_seen = false;
                 } else {
                     tracing::info!("ANVIL_FINAL detected; terminating after tool execution");
+                    self.phase_estimator.accept_anvil_final();
                     break;
                 }
             }
@@ -705,6 +711,8 @@ impl App {
 
             // Record turn stats AFTER the full iteration completes (Issue #206 CB-001)
             self.session_stats.record_turn();
+            self.agent_telemetry
+                .record_turn_metrics(turn_mutations, turn_items_advanced, 0, 0);
             log_turn_summary(&TurnSummary {
                 turn: self.session_stats.total_turns,
                 max_turns: max_iterations as u32,
@@ -716,6 +724,8 @@ impl App {
                 files_modified: turn_files_modified,
                 compact_info: self.last_compact_info.as_ref(),
                 phase: self.phase_estimator.current_phase(),
+                mutations_this_turn: Some(turn_mutations),
+                items_advanced_this_turn: Some(turn_items_advanced),
             });
             // Reset last_compact_info after it's been consumed by the turn summary
             self.last_compact_info = None;
@@ -738,9 +748,6 @@ impl App {
                         tracing::info!(
                             "Guidance follow-up ended without edits; escalating to final guard retry"
                         );
-                        if !next_structured.anvil_final_detected {
-                            self.phase_estimator.observe_anvil_final();
-                        }
                         self.inject_final_guard_retry();
                         final_guard_retries += 1;
                         current = next_structured;
@@ -755,10 +762,6 @@ impl App {
                 }
                 // ANVIL_FINAL guard: check if any file modifications were made
                 if self.should_activate_final_guard(final_guard_retries) {
-                    // ANVIL_FINAL was detected → record observation (Issue #159)
-                    if !next_structured.anvil_final_detected {
-                        self.phase_estimator.observe_anvil_final();
-                    }
                     self.inject_final_guard_retry();
                     final_guard_retries += 1;
                     current = next_structured;
@@ -788,6 +791,10 @@ impl App {
                 }
 
                 // No more tool calls — this is the final answer
+                // Issue #261 Task 0.4: Mark as accepted (not suppressed)
+                if anvil_final_seen {
+                    self.phase_estimator.accept_anvil_final();
+                }
                 self.record_assistant_output(
                     self.next_message_id("assistant"),
                     next_structured.final_response,
@@ -1969,6 +1976,8 @@ impl App {
                 files_modified: 0,
                 compact_info: None,
                 phase: self.phase_estimator.current_phase(),
+                mutations_this_turn: None,
+                items_advanced_this_turn: None,
             });
             return Ok(None);
         }

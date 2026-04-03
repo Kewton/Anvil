@@ -19,6 +19,7 @@ const PLAN_REQUIRED_MESSAGE: &str = "[System] まず変更計画を作成して�
      ```";
 
 /// Message injected when ANVIL_FINAL is suppressed because items remain.
+/// Backward-compatible wrapper for sequential mode.
 fn incomplete_plan_message(next_desc: &str, remaining: usize, total: usize) -> String {
     format!(
         "[System] まだ {remaining}/{total} 項目が未完了です。次の項目を実行してください:\n  {next_desc}\n\
@@ -73,70 +74,134 @@ impl App {
 
     /// Update plan item status based on tool execution results.
     ///
-    /// Issue #255: Uses `record_mutation_success` to require ALL target_files
-    /// to be mutated before marking an item as Done. Each successful mutation
-    /// is tracked individually per file path.
+    /// Filters out rolled-back and no-op mutations. Each valid mutation is
+    /// matched against all unfinished items' target_files (multi-item attribution).
+    ///
+    /// Returns `(mutations, items_advanced)` for per-turn telemetry.
     pub(crate) fn update_plan_from_results(
         &mut self,
         results: &[crate::tooling::ToolExecutionResult],
-    ) {
+    ) -> (u32, u32) {
+        use crate::contracts::PlanItemStatus;
+
         if self.execution_plan.is_empty() {
-            return;
+            return (0, 0);
         }
 
-        let idx = match self.execution_plan.next_actionable_index() {
-            Some(i) => i,
-            None => return,
-        };
+        let mut mutations_count: u32 = 0;
+        let current_idx = self.execution_plan.next_actionable_index();
 
         let mutation_tools = ["file.write", "file.edit", "file.edit_anchor"];
 
-        let was_done_before = self.execution_plan.items[idx].is_finished();
+        // Snapshot finished state before processing
+        let was_finished: Vec<bool> = self
+            .execution_plan
+            .items
+            .iter()
+            .map(|i| i.is_finished())
+            .collect();
 
-        // Record each successful mutation individually (Issue #255)
         for r in results {
-            if mutation_tools.contains(&r.tool_name.as_str())
-                && r.status == crate::tooling::ToolExecutionStatus::Completed
+            if !mutation_tools.contains(&r.tool_name.as_str())
+                || r.status != crate::tooling::ToolExecutionStatus::Completed
             {
-                // summary contains the file path for mutation tools
-                if !r.summary.is_empty() {
+                continue;
+            }
+
+            // Skip rolled_back mutations
+            if r.rolled_back {
+                self.agent_telemetry.record_rolled_back_mutation();
+                continue;
+            }
+            // Skip no-op mutations
+            if r.summary.contains("(no changes)") {
+                self.agent_telemetry.record_no_op_mutation();
+                continue;
+            }
+
+            if r.summary.is_empty() {
+                continue;
+            }
+
+            mutations_count += 1;
+
+            // Find matching unfinished items by target_files
+            let mut matches: Vec<usize> = Vec::new();
+            for (i, item) in self.execution_plan.items.iter().enumerate() {
+                if item.is_finished() || item.target_files.is_empty() {
+                    continue;
+                }
+                let file_matches = item
+                    .target_files
+                    .iter()
+                    .any(|tf| r.summary.ends_with(tf) || tf.ends_with(&r.summary));
+                if file_matches {
+                    matches.push(i);
+                }
+            }
+
+            if !matches.is_empty() {
+                // Prioritize InProgress items over Pending
+                let inprogress: Vec<usize> = matches
+                    .iter()
+                    .copied()
+                    .filter(|&i| self.execution_plan.items[i].status == PlanItemStatus::InProgress)
+                    .collect();
+                let targets = if inprogress.is_empty() {
+                    matches
+                } else {
+                    inprogress
+                };
+                for idx in targets {
+                    self.execution_plan.record_mutation_success(idx, &r.summary);
+                }
+            } else {
+                // Fallback: attribute to current item only (empty target_files or no match)
+                if let Some(idx) = current_idx {
                     self.execution_plan.record_mutation_success(idx, &r.summary);
                 }
             }
         }
 
-        // Check if item just transitioned to Done
-        if !was_done_before && self.execution_plan.items[idx].is_finished() {
-            tracing::info!(
-                item = idx + 1,
-                description = %self.execution_plan.items[idx].description,
-                "plan item completed (all target_files mutated)"
-            );
-            // Auto-advance next item to InProgress
-            if let Some(next) = self.execution_plan.next_actionable_index() {
-                self.execution_plan.mark_in_progress(next);
+        // Check which items just transitioned to Done and log; count advances
+        let mut items_advanced: u32 = 0;
+        for (i, &was) in was_finished.iter().enumerate() {
+            if !was && self.execution_plan.items[i].is_finished() {
+                items_advanced += 1;
+                tracing::info!(
+                    item = i + 1,
+                    description = %self.execution_plan.items[i].description,
+                    "plan item completed (all target_files mutated)"
+                );
             }
         }
 
-        // Record failures
-        let has_failed_mutation = results.iter().any(|r| {
-            mutation_tools.contains(&r.tool_name.as_str())
-                && r.status == crate::tooling::ToolExecutionStatus::Failed
-        });
-        if has_failed_mutation && !self.execution_plan.items[idx].is_finished() {
-            self.execution_plan.record_failure(idx);
-            tracing::warn!(
-                item = idx + 1,
-                retry_count = self.execution_plan.items[idx].retry_count,
-                "plan item mutation failed"
-            );
+        // Auto-advance next pending item to InProgress
+        if let Some(next) = self.execution_plan.next_actionable_index()
+            && self.execution_plan.items[next].status == PlanItemStatus::Pending
+        {
+            self.execution_plan.mark_in_progress(next);
         }
+
+        // Record failures (attributed to current item)
+        if let Some(idx) = current_idx {
+            let has_failed_mutation = results.iter().any(|r| {
+                mutation_tools.contains(&r.tool_name.as_str())
+                    && r.status == crate::tooling::ToolExecutionStatus::Failed
+            });
+            if has_failed_mutation && !self.execution_plan.items[idx].is_finished() {
+                self.execution_plan.record_failure(idx);
+                tracing::warn!(
+                    item = idx + 1,
+                    retry_count = self.execution_plan.items[idx].retry_count,
+                    "plan item mutation failed"
+                );
+            }
+        }
+
+        (mutations_count, items_advanced)
     }
 
-    /// Check the plan-aware ANVIL_FINAL gate.
-    ///
-    /// Returns `true` if ANVIL_FINAL should be suppressed (plan incomplete).
-    /// When suppressed, injects a guidance message into the session.
     /// Check the plan-aware ANVIL_FINAL gate.
     ///
     /// Returns `true` if ANVIL_FINAL should be suppressed (plan incomplete).
@@ -204,12 +269,15 @@ impl App {
                     pfrr = %self.agent_telemetry.premature_final_request_rate(),
                     "plan-aware final gate: suppressing ANVIL_FINAL (premature)"
                 );
-                let msg = SessionMessage::new(
-                    MessageRole::Tool,
-                    "system",
-                    incomplete_plan_message(&next_description, remaining, total),
-                )
-                .with_id(self.next_message_id("tool"));
+                let mode = self.config.runtime.guidance_mode;
+                let guidance_text = match mode {
+                    crate::config::GuidanceMode::Batch => self
+                        .execution_plan
+                        .build_incomplete_plan_message_with_mode(mode),
+                    _ => incomplete_plan_message(&next_description, remaining, total),
+                };
+                let msg = SessionMessage::new(MessageRole::Tool, "system", guidance_text)
+                    .with_id(self.next_message_id("tool"));
                 self.session.push_message(msg);
                 true
             }
@@ -219,8 +287,10 @@ impl App {
     /// Inject turn guidance for the current plan item.
     ///
     /// Called at the beginning of each follow-up turn to guide the LLM.
+    /// Uses the configured `guidance_mode` from runtime config.
     pub(crate) fn inject_plan_turn_guidance(&mut self) {
-        if let Some(guidance) = self.execution_plan.build_turn_guidance() {
+        let mode = self.config.runtime.guidance_mode;
+        if let Some(guidance) = self.execution_plan.build_turn_guidance_with_mode(mode) {
             let msg = SessionMessage::new(MessageRole::Tool, "system", guidance)
                 .with_id(self.next_message_id("tool"));
             self.session.push_message(msg);
