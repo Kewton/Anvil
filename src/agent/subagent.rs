@@ -238,6 +238,7 @@ impl SubAgentResult {
             elapsed_ms: 0,
             diff_summary: None,
             edit_detail: None,
+            rolled_back: false,
         }
     }
 }
@@ -289,6 +290,7 @@ impl SubAgentError {
             elapsed_ms: 0,
             diff_summary: None,
             edit_detail: None,
+            rolled_back: false,
         }
     }
 }
@@ -602,6 +604,7 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
                     elapsed_ms: 0,
                     diff_summary: None,
                     edit_detail: None,
+                    rolled_back: false,
                 });
 
             // Record tool result in the sub-agent session

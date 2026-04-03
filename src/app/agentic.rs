@@ -204,6 +204,7 @@ fn execute_parallel_group_standalone(
                                 elapsed_ms: 0,
                                 diff_summary: None,
                                 edit_detail: None,
+                                rolled_back: false,
                             }
                         });
                         // Update progress entry
@@ -250,6 +251,7 @@ fn execute_parallel_group_standalone(
                                 elapsed_ms: 0,
                                 diff_summary: None,
                                 edit_detail: None,
+                                rolled_back: false,
                             },
                         ));
                     }
@@ -313,6 +315,7 @@ impl App {
                     elapsed_ms: 0,
                     diff_summary: None,
                     edit_detail: None,
+                    rolled_back: false,
                 });
                 continue;
             }
@@ -623,7 +626,10 @@ impl App {
             // Collect tool names for this iteration's turn summary (before LLM call)
             let turn_tool_names: Vec<String> =
                 results.iter().map(|r| r.tool_name.clone()).collect();
-            let turn_files_modified = results.iter().filter(|r| r.diff_summary.is_some()).count();
+            let turn_files_modified = results
+                .iter()
+                .filter(|r| r.diff_summary.is_some() && !r.rolled_back)
+                .count();
             let turn_tool_count = results.len() + agent_results.len();
 
             let mut next_token_buffer = String::new();
@@ -899,6 +905,7 @@ impl App {
                         elapsed_ms: 0,
                         diff_summary: None,
                         edit_detail: None,
+                        rolled_back: false,
                     },
                 ));
                 continue;
@@ -998,6 +1005,7 @@ impl App {
                 elapsed_ms: 0,
                 diff_summary: None,
                 edit_detail: None,
+                rolled_back: false,
             });
 
         // Remove checkpoint if tool execution failed.
@@ -1033,6 +1041,7 @@ impl App {
                 elapsed_ms: 0,
                 diff_summary: None,
                 edit_detail: None,
+                rolled_back: false,
             };
         };
 
@@ -1060,6 +1069,7 @@ impl App {
             elapsed_ms: started.elapsed().as_millis(),
             diff_summary: None,
             edit_detail: None,
+            rolled_back: false,
         }
     }
 
@@ -1120,6 +1130,7 @@ impl App {
                                     elapsed_ms: 0,
                                     diff_summary: None,
                                     edit_detail: None,
+                                    rolled_back: false,
                                 },
                             ));
                         }
@@ -1183,6 +1194,7 @@ impl App {
                 elapsed_ms: 0,
                 diff_summary: None,
                 edit_detail: None,
+                rolled_back: false,
             }),
             _ => None,
         };
@@ -1307,10 +1319,11 @@ impl App {
                 .map(|(_, r)| r.tool_call_id.clone())
                 .collect();
 
-            // Annotate successful file-mutating results with rollback info
+            // Annotate successful file-mutating results with rollback info (Issue #259)
             for (_, r) in &mut indexed_results {
                 if r.status == ToolExecutionStatus::Completed && rb_ids.contains(&r.tool_call_id) {
                     r.summary = format!("{} [rolled back: atomic transaction failed]", r.summary);
+                    r.rolled_back = true;
                 }
             }
 
@@ -1418,6 +1431,7 @@ impl App {
                 elapsed_ms: 0,
                 diff_summary: None,
                 edit_detail: None,
+                rolled_back: false,
             };
             self.record_tool_result(&transition_result);
             results.push(transition_result);
@@ -1447,6 +1461,7 @@ impl App {
                     elapsed_ms: 0,
                     diff_summary: None,
                     edit_detail: None,
+                    rolled_back: false,
                 };
                 self.record_tool_result(&transition_result);
                 results.push(transition_result);
@@ -1462,11 +1477,16 @@ impl App {
         // Session stats: record tool call (Issue #206 C-3)
         self.session_stats.record_tool_call(&result.tool_name);
 
-        // Session stats: record file change line counts from diff_summary (Issue #206 C-3)
-        if let Some(ref diff) = result.diff_summary {
+        // Session stats: record file change line counts from diff_summary (Issue #206 C-3, #259)
+        // Skip rolled-back results to avoid counting reverted changes.
+        if !result.rolled_back
+            && let Some(ref diff) = result.diff_summary
+        {
             let (added, deleted) = super::count_diff_lines(diff);
             self.session_stats.record_file_change(added, deleted);
-            self.session_stats.files_modified += 1;
+            for artifact in &result.artifacts {
+                self.session_stats.files_modified.insert(artifact.clone());
+            }
         }
 
         // Track tool usage for dynamic system prompt generation (Issue #73)
@@ -2178,6 +2198,7 @@ fn build_failed_result(
         elapsed_ms: 0,
         diff_summary: None,
         edit_detail: None,
+        rolled_back: false,
     }
 }
 
@@ -2434,6 +2455,7 @@ mod trust_tests {
             elapsed_ms: 0,
             diff_summary: None,
             edit_detail: None,
+            rolled_back: false,
         };
 
         let formatted = format_tool_result_message(&result, 8_000);
