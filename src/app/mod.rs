@@ -878,6 +878,9 @@ impl App {
                 plan_registration_count = tel.plan_registration_count,
                 plan_update_count = tel.plan_update_count,
                 sync_from_touched_files_count = tel.sync_from_touched_files_count,
+                no_op_mutation_count = tel.no_op_mutation_count,
+                rolled_back_mutation_count = tel.rolled_back_mutation_count,
+                initial_plan_miss_count = tel.initial_plan_miss_count,
                 "agent telemetry"
             );
         }

@@ -144,6 +144,9 @@ pub struct StructuredAssistantResponse {
     pub final_response: String,
     /// Whether an ANVIL_FINAL block was detected in this response (Issue #173).
     pub anvil_final_detected: bool,
+    /// Provider の生レスポンス全文。ANVIL_PLAN 抽出専用。
+    /// ログ・永続化に使わないこと。
+    pub raw_content: String,
 }
 
 impl StructuredAssistantResponse {
@@ -151,6 +154,7 @@ impl StructuredAssistantResponse {
     pub fn empty(final_response: String) -> Self {
         Self {
             tool_calls: Vec::new(),
+            raw_content: final_response.clone(),
             final_response,
             anvil_final_detected: false,
         }
@@ -319,6 +323,7 @@ impl BasicAgentLoop {
             tool_calls,
             final_response,
             anvil_final_detected,
+            raw_content: content.to_string(),
         })
     }
 
@@ -1283,26 +1288,49 @@ pub fn parse_plan_items(block: &str) -> Vec<crate::contracts::PlanItem> {
             continue;
         }
 
-        // Extract target file path: text before the first ":"
-        let target_files = extract_target_file(&description).into_iter().collect();
+        // Extract target file path(s): text before the first ":"
+        let target_files = extract_target_files(&description);
 
         items.push(crate::contracts::PlanItem::new(description, target_files));
     }
     items
 }
 
-/// Extract a file path from a plan item description.
+/// Extract file path(s) from a plan item description.
 ///
-/// Looks for a path-like prefix before the first `:` (e.g. `src/foo.rs: do stuff`).
-fn extract_target_file(description: &str) -> Option<String> {
-    let colon_pos = description.find(':')?;
+/// Supports both single file (`src/foo.rs: do stuff`) and comma-separated
+/// multi-target (`src/a.rs, src/b.rs: update both`) formats.
+///
+/// Security: rejects paths containing `..` and absolute paths (starting with `/`).
+/// Empty elements and whitespace-only paths are also filtered out.
+fn extract_target_files(description: &str) -> Vec<String> {
+    let colon_pos = match description.find(':') {
+        Some(pos) => pos,
+        None => return Vec::new(),
+    };
     let candidate = description[..colon_pos].trim();
-    // Heuristic: must contain a `/` or `.` to look like a file path
-    if candidate.contains('/') || candidate.contains('.') {
-        Some(candidate.to_string())
-    } else {
-        None
+
+    // Split by comma for multi-target support
+    let mut files = Vec::new();
+    for part in candidate.split(',') {
+        let path = part.trim();
+        if path.is_empty() {
+            continue;
+        }
+        // Security: reject paths with ".." (traversal)
+        if path.contains("..") {
+            continue;
+        }
+        // Security: reject absolute paths
+        if path.starts_with('/') {
+            continue;
+        }
+        // Heuristic: must contain a `/` or `.` to look like a file path
+        if (path.contains('/') || path.contains('.')) && !files.contains(&path.to_string()) {
+            files.push(path.to_string());
+        }
     }
+    files
 }
 
 // --- MCP tool description generation ---
@@ -1576,5 +1604,53 @@ mod tests {
         assert_eq!(items.len(), 2);
         // All parsed items start as Pending regardless of [x] in the source
         assert_eq!(items[0].status, crate::contracts::PlanItemStatus::Pending);
+    }
+
+    #[test]
+    fn multi_target_parser_parses_comma_separated() {
+        let block = "- [ ] src/a.rs, src/b.rs: update both";
+        let items = parse_plan_items(block);
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].target_files,
+            vec!["src/a.rs".to_string(), "src/b.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn multi_target_parser_backward_compatible() {
+        // Single file format must still work
+        let block = "- [ ] src/main.rs: entry point change";
+        let items = parse_plan_items(block);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].target_files, vec!["src/main.rs".to_string()]);
+    }
+
+    #[test]
+    fn multi_target_parser_rejects_dotdot() {
+        let block = "- [ ] src/../etc/passwd, src/a.rs: malicious path";
+        let items = parse_plan_items(block);
+        assert_eq!(items.len(), 1);
+        // The .. path should be excluded, only src/a.rs should remain
+        assert_eq!(items[0].target_files, vec!["src/a.rs".to_string()]);
+    }
+
+    #[test]
+    fn multi_target_parser_rejects_absolute_path() {
+        let block = "- [ ] /etc/passwd, src/a.rs: absolute path test";
+        let items = parse_plan_items(block);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].target_files, vec!["src/a.rs".to_string()]);
+    }
+
+    #[test]
+    fn multi_target_parser_trims_whitespace() {
+        let block = "- [ ] src/a.rs , src/b.rs : update both";
+        let items = parse_plan_items(block);
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].target_files,
+            vec!["src/a.rs".to_string(), "src/b.rs".to_string()]
+        );
     }
 }

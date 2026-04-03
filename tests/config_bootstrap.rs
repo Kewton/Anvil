@@ -1350,3 +1350,50 @@ fn mode_config_default_log_format_is_text() {
     let config = EffectiveConfig::load().expect("config should load");
     assert_eq!(config.mode.log_format, LogFormat::Text);
 }
+
+// ---------------------------------------------------------------------------
+// Issue #261 Task 1.1: GuidanceMode config
+// ---------------------------------------------------------------------------
+
+#[test]
+fn guidance_mode_defaults_to_sequential() {
+    use anvil::config::GuidanceMode;
+    let config = EffectiveConfig::load().expect("config should load");
+    assert_eq!(config.runtime.guidance_mode, GuidanceMode::Sequential);
+}
+
+#[test]
+fn guidance_mode_batch_parses_correctly() {
+    use anvil::config::GuidanceMode;
+    let mut config = EffectiveConfig::load().expect("config should load");
+    let mut map = HashMap::new();
+    map.insert("guidance_mode".to_string(), "batch".to_string());
+    config
+        .apply_overrides_for_test(&map, &HashMap::new(), &HashMap::new())
+        .unwrap();
+    assert_eq!(config.runtime.guidance_mode, GuidanceMode::Batch);
+}
+
+#[test]
+fn guidance_mode_unknown_falls_back_to_sequential() {
+    use anvil::config::GuidanceMode;
+    let mut config = EffectiveConfig::load().expect("config should load");
+    let mut map = HashMap::new();
+    map.insert("guidance_mode".to_string(), "unknown_value".to_string());
+    config
+        .apply_overrides_for_test(&map, &HashMap::new(), &HashMap::new())
+        .unwrap();
+    assert_eq!(config.runtime.guidance_mode, GuidanceMode::Sequential);
+}
+
+#[test]
+fn guidance_mode_env_var_parses_batch() {
+    use anvil::config::GuidanceMode;
+    let mut config = EffectiveConfig::load().expect("config should load");
+    let mut env_map = HashMap::new();
+    env_map.insert("ANVIL_GUIDANCE_MODE".to_string(), "batch".to_string());
+    config
+        .apply_overrides_for_test(&HashMap::new(), &env_map, &HashMap::new())
+        .unwrap();
+    assert_eq!(config.runtime.guidance_mode, GuidanceMode::Batch);
+}

@@ -85,6 +85,40 @@ pub enum WebSearchProvider {
     SerperApi,
 }
 
+/// Guidance mode for plan-aware execution (Issue #261).
+///
+/// Controls whether the agent guidance encourages sequential (one item at a time)
+/// or batch (multiple items at once) execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuidanceMode {
+    /// Execute plan items one at a time (default, backward compatible).
+    #[default]
+    Sequential,
+    /// Execute multiple plan items in a single turn (batch mode).
+    Batch,
+}
+
+impl std::fmt::Display for GuidanceMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Sequential => write!(f, "sequential"),
+            Self::Batch => write!(f, "batch"),
+        }
+    }
+}
+
+impl std::str::FromStr for GuidanceMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "sequential" => Ok(GuidanceMode::Sequential),
+            "batch" => Ok(GuidanceMode::Batch),
+            _ => Ok(GuidanceMode::Sequential), // fail-closed: unknown values fall back to Sequential
+        }
+    }
+}
+
 #[derive(Clone)]
 /// Provider, model, and transport settings.
 pub struct RuntimeConfig {
@@ -161,6 +195,9 @@ pub struct RuntimeConfig {
     /// Maximum output tokens per LLM turn (Issue #204).
     /// Translated to provider-specific limits (Ollama `num_predict`, OpenAI `max_tokens`).
     pub max_output_tokens: Option<u32>,
+    /// Guidance mode for plan-aware execution (Issue #261).
+    /// Sequential = one item at a time (default), Batch = multiple items per turn.
+    pub guidance_mode: GuidanceMode,
 }
 
 #[derive(Debug, Clone)]
@@ -341,6 +378,7 @@ impl EffectiveConfig {
                 ui_language: None,
                 max_tool_calls: DEFAULT_MAX_TOOL_CALLS,
                 max_output_tokens: Some(DEFAULT_MAX_OUTPUT_TOKENS),
+                guidance_mode: GuidanceMode::default(),
             },
             mode: ModeConfig {
                 prompt_source: PromptSource::Interactive,
@@ -463,6 +501,7 @@ impl EffectiveConfig {
             "ANVIL_SAFE_WRITE_DELETION_RATIO",
             "ANVIL_UI_LANGUAGE",
             "ANVIL_MAX_TOOL_CALLS",
+            "ANVIL_GUIDANCE_MODE",
         ] {
             if let Ok(value) = std::env::var(key) {
                 map.insert(key.to_string(), value);
@@ -863,6 +902,12 @@ impl EffectiveConfig {
                         .parse()
                         .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
                     self.runtime.max_output_tokens = if v == 0 { None } else { Some(v) };
+                }
+                "guidance_mode" | "ANVIL_GUIDANCE_MODE" => {
+                    // fail-closed: unknown values fall back to Sequential
+                    self.runtime.guidance_mode = value
+                        .parse::<GuidanceMode>()
+                        .unwrap_or(GuidanceMode::Sequential);
                 }
                 _ => {}
             }

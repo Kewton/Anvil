@@ -97,9 +97,9 @@ impl SubAgentPayload {
 /// How the agentic session ended, classified by plan state and verification.
 ///
 /// Priority order (highest first):
-/// 1. CompleteVerified
-/// 2. CompleteUnverified
-/// 3. Blocked
+/// 1. Blocked (has_blocked items -> always Blocked)
+/// 2. CompleteVerified
+/// 3. CompleteUnverified
 /// 4. Exhausted
 /// 5. Partial
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -147,17 +147,17 @@ impl CompletionKind {
             .iter()
             .any(|i| i.status == PlanItemStatus::Blocked);
 
-        // Priority 1-2: all items finished → complete_*
+        // Priority 1: blocked items exist → always Blocked
+        if has_blocked {
+            return CompletionKind::Blocked;
+        }
+
+        // Priority 2-3: all items finished → complete_*
         if all_finished {
             return match verify_pass {
                 Some(true) => CompletionKind::CompleteVerified,
                 _ => CompletionKind::CompleteUnverified,
             };
-        }
-
-        // Priority 3: blocked items exist
-        if has_blocked {
-            return CompletionKind::Blocked;
         }
 
         // Priority 4: budget exhausted
@@ -194,6 +194,28 @@ pub struct AgentTelemetry {
     pub sync_from_touched_files_count: u32,
     /// Final completion classification.
     pub completion_kind: Option<CompletionKind>,
+
+    /// Number of times initial ANVIL_PLAN detection missed (raw_content fallback used).
+    #[serde(default)]
+    pub initial_plan_miss_count: u32,
+    /// Number of no-op mutations filtered (summary contains "(no changes)").
+    #[serde(default)]
+    pub no_op_mutation_count: u32,
+    /// Number of rolled_back mutations filtered.
+    #[serde(default)]
+    pub rolled_back_mutation_count: u32,
+    /// Mutations per turn (Phase 0: actual values).
+    #[serde(default)]
+    pub mutations_per_turn: Vec<u32>,
+    /// Items advanced per turn (Phase 0: actual values).
+    #[serde(default)]
+    pub items_advanced_per_turn: Vec<u32>,
+    /// Guidance characters per turn (Phase 0: 0, Phase 1: actual values).
+    #[serde(default)]
+    pub guidance_chars_per_turn: Vec<u32>,
+    /// Workset size per turn (Phase 0: always 1, Phase 1: actual values).
+    #[serde(default)]
+    pub workset_size_per_turn: Vec<u32>,
 }
 
 impl AgentTelemetry {
@@ -219,6 +241,35 @@ impl AgentTelemetry {
 
     pub fn record_sync_from_touched_files(&mut self) {
         self.sync_from_touched_files_count += 1;
+    }
+
+    /// Record an initial plan miss (raw_content fallback used).
+    pub fn record_initial_plan_miss(&mut self) {
+        self.initial_plan_miss_count += 1;
+    }
+
+    /// Record a no-op mutation (filtered out).
+    pub fn record_no_op_mutation(&mut self) {
+        self.no_op_mutation_count += 1;
+    }
+
+    /// Record a rolled_back mutation (filtered out).
+    pub fn record_rolled_back_mutation(&mut self) {
+        self.rolled_back_mutation_count += 1;
+    }
+
+    /// Record per-turn metrics for batch experiment telemetry.
+    pub fn record_turn_metrics(
+        &mut self,
+        mutations: u32,
+        items_advanced: u32,
+        guidance_chars: u32,
+        workset_size: u32,
+    ) {
+        self.mutations_per_turn.push(mutations);
+        self.items_advanced_per_turn.push(items_advanced);
+        self.guidance_chars_per_turn.push(guidance_chars);
+        self.workset_size_per_turn.push(workset_size);
     }
 
     /// Premature Final Request Rate: ratio of suppressed finals to total finals.
@@ -397,11 +448,18 @@ impl ExecutionPlan {
         }
     }
 
+    /// Fuzzy path match: true when either path is a suffix of the other.
+    ///
+    /// Used consistently across `record_mutation_success`, `sync_from_touched_files`,
+    /// and `update_plan_from_results` to avoid divergent matching behaviour.
+    pub fn path_matches(a: &str, b: &str) -> bool {
+        a.ends_with(b) || b.ends_with(a)
+    }
+
     /// Record a successful mutation for a plan item (Issue #255).
     ///
     /// Tracks which files have been mutated. When all `target_files` are
     /// covered (or item has no target_files), marks the item as Done.
-    /// Uses fuzzy path matching (ends_with) for path normalization.
     pub fn record_mutation_success(&mut self, index: usize, file_path: &str) {
         let item = match self.items.get_mut(index) {
             Some(i) => i,
@@ -424,12 +482,32 @@ impl ExecutionPlan {
             let all_covered = item.target_files.iter().all(|tf| {
                 item.mutated_files
                     .iter()
-                    .any(|mf| mf.ends_with(tf) || tf.ends_with(mf))
+                    .any(|mf| Self::path_matches(mf, tf))
             });
             if all_covered {
                 item.status = PlanItemStatus::Done;
             }
         }
+    }
+
+    /// Return indices of the current workset: up to 5 actionable (Pending or InProgress) items.
+    ///
+    /// Used by batch guidance mode to identify items that can be executed together in a single turn.
+    /// Returns empty Vec when all items are finished.
+    pub fn current_workset(&self) -> Vec<usize> {
+        const MAX_WORKSET_SIZE: usize = 5;
+        self.items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| {
+                matches!(
+                    item.status,
+                    PlanItemStatus::Pending | PlanItemStatus::InProgress
+                )
+            })
+            .take(MAX_WORKSET_SIZE)
+            .map(|(i, _)| i)
+            .collect()
     }
 
     /// Append new items (used by ANVIL_PLAN_UPDATE).
@@ -463,7 +541,7 @@ impl ExecutionPlan {
             let all_matched = item.target_files.iter().all(|tf| {
                 touched_files
                     .iter()
-                    .any(|touched| touched.ends_with(tf) || tf.ends_with(touched))
+                    .any(|touched| ExecutionPlan::path_matches(touched, tf))
             });
             if all_matched {
                 tracing::info!(
@@ -496,19 +574,120 @@ impl ExecutionPlan {
     }
 
     /// Build the system message to inject at the start of each execution turn.
+    ///
+    /// Uses Sequential mode (backward compatible). For mode-aware guidance,
+    /// use [`build_turn_guidance_with_mode`].
     pub fn build_turn_guidance(&self) -> Option<String> {
+        self.build_turn_guidance_with_mode(crate::config::GuidanceMode::Sequential)
+    }
+
+    /// Build the system message with explicit guidance mode.
+    ///
+    /// - `Sequential`: guides LLM to execute one item at a time (current behavior).
+    /// - `Batch`: guides LLM to execute the current workset (up to 5 items) at once.
+    pub fn build_turn_guidance_with_mode(
+        &self,
+        mode: crate::config::GuidanceMode,
+    ) -> Option<String> {
         let idx = self.next_actionable_index()?;
-        let item = &self.items[idx];
         let finished = self.finished_count();
         let total = self.items.len();
-        Some(format!(
-            "[System] 計画の次の項目を実行してください:\n  {}. {}\n完了: {}/{} 項目\n\n現在の計画:\n{}\n\n1項目ずつ実行し、全項目完了時のみ ANVIL_FINAL を出力してください。",
-            idx + 1,
-            item.description,
-            finished,
-            total,
-            self.format_checklist()
-        ))
+
+        match mode {
+            crate::config::GuidanceMode::Sequential => {
+                let item = &self.items[idx];
+                Some(format!(
+                    "[System] 計画の次の項目を実行してください:\n  {}. {}\n完了: {}/{} 項目\n\n現在の計画:\n{}\n\n1項目ずつ実行し、全項目完了時のみ ANVIL_FINAL を出力してください。",
+                    idx + 1,
+                    item.description,
+                    finished,
+                    total,
+                    self.format_checklist()
+                ))
+            }
+            crate::config::GuidanceMode::Batch => {
+                let workset = self.current_workset();
+                let remaining = total - finished;
+                let mut workset_lines = Vec::new();
+                for &wi in &workset {
+                    workset_lines.push(format!("  {}. {}", wi + 1, self.items[wi].description));
+                }
+                Some(format!(
+                    "[System] 以下の項目をまとめて実行してください:\n{}\n完了: {}/{} 項目 (残り {})\n\n現在の計画:\n{}\n\nこれらの項目をまとめて進めてください。全項目完了時のみ ANVIL_FINAL を出力してください。",
+                    workset_lines.join("\n"),
+                    finished,
+                    total,
+                    remaining,
+                    self.format_checklist()
+                ))
+            }
+        }
+    }
+
+    /// Build the incomplete plan message for ANVIL_FINAL suppression.
+    ///
+    /// - `Sequential`: simple "next item" message (backward compatible).
+    /// - `Batch`: includes completed items, pending items (workset), and batch instruction.
+    pub fn build_incomplete_plan_message_with_mode(
+        &self,
+        mode: crate::config::GuidanceMode,
+    ) -> String {
+        let finished = self.finished_count();
+        let total = self.items.len();
+        let remaining = total - finished;
+
+        match mode {
+            crate::config::GuidanceMode::Sequential => {
+                let next_desc = self
+                    .next_actionable_index()
+                    .and_then(|i| self.items.get(i))
+                    .map(|i| i.description.as_str())
+                    .unwrap_or("");
+                format!(
+                    "[System] まだ {remaining}/{total} 項目が未完了です。次の項目を実行してください:\n  {next_desc}\n\
+                     全項目完了後に ANVIL_FINAL を出力してください。"
+                )
+            }
+            crate::config::GuidanceMode::Batch => {
+                // Completed items
+                let completed_lines: Vec<String> = self
+                    .items
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, item)| item.status == PlanItemStatus::Done)
+                    .map(|(i, item)| format!("  {}. {}", i + 1, item.description))
+                    .collect();
+
+                // Workset (pending/in-progress items)
+                let workset = self.current_workset();
+                let workset_lines: Vec<String> = workset
+                    .iter()
+                    .map(|&i| format!("  {}. {}", i + 1, self.items[i].description))
+                    .collect();
+
+                let mut msg = format!("[System] まだ {remaining}/{total} 項目が未完了です。\n\n");
+
+                if !completed_lines.is_empty() {
+                    msg.push_str(&format!(
+                        "完了済み ({}/{total}):\n{}\n\n",
+                        completed_lines.len(),
+                        completed_lines.join("\n")
+                    ));
+                }
+
+                if !workset_lines.is_empty() {
+                    msg.push_str(&format!(
+                        "未完了 (次のworkset):\n{}\n\n",
+                        workset_lines.join("\n")
+                    ));
+                }
+
+                msg.push_str(
+                    "これらの項目をまとめて実行してください。全項目完了後に ANVIL_FINAL を出力してください。",
+                );
+                msg
+            }
+        }
     }
 }
 
