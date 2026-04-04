@@ -117,6 +117,7 @@ src/
 │   ├── read_repeat_tracker.rs # file.read繰り返し検出・ヒント注入（セッション横断型・閾値2/4）
 │   ├── write_fail_tracker.rs # file.write連続失敗トラッキング（ヒント提供・閾値2）
 │   ├── write_repeat_tracker.rs # file.write成功繰り返しトラッキング（同一ファイルへのwrite検出・Warn閾値3/StrongWarn閾値4）
+│   ├── stagnation_state.rs # 停滞検知・ワークセットステアリング・budget-aware閾値（Issue #263）
 │   ├── plan.rs          # プラン管理
 │   ├── policy.rs        # offlineポリシーチェック（共通ヘルパー）
 │   ├── render.rs        # コンソール描画
@@ -167,6 +168,7 @@ tests/
 ├── loop_detection.rs    # ループ検出テスト
 ├── phase_estimation.rs  # フェーズ推定テスト
 ├── context_inject.rs    # コンテキスト注入テスト
+├── stagnation_control.rs # 停滞制御テスト（Issue #263）
 └── walk_system.rs       # ディレクトリウォーカーテスト
 ```
 

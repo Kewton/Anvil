@@ -216,6 +216,12 @@ pub struct AgentTelemetry {
     /// Workset size per turn (Phase 0: always 1, Phase 1: actual values).
     #[serde(default)]
     pub workset_size_per_turn: Vec<u32>,
+    /// Number of forced workset transitions triggered by stagnation control (Issue #263).
+    #[serde(default)]
+    pub forced_workset_transition_count: u32,
+    /// Number of ANVIL_PLAN_UPDATE requests triggered by stagnation control (Issue #263).
+    #[serde(default)]
+    pub plan_repair_request_count: u32,
 }
 
 impl AgentTelemetry {
@@ -270,6 +276,16 @@ impl AgentTelemetry {
         self.items_advanced_per_turn.push(items_advanced);
         self.guidance_chars_per_turn.push(guidance_chars);
         self.workset_size_per_turn.push(workset_size);
+    }
+
+    /// Record a forced workset transition (Issue #263).
+    pub fn record_forced_workset_transition(&mut self) {
+        self.forced_workset_transition_count += 1;
+    }
+
+    /// Record a plan repair request (Issue #263).
+    pub fn record_plan_repair_request(&mut self) {
+        self.plan_repair_request_count += 1;
     }
 
     /// Premature Final Request Rate: ratio of suppressed finals to total finals.
@@ -688,6 +704,88 @@ impl ExecutionPlan {
                 msg
             }
         }
+    }
+
+    /// Build turn guidance with a precomputed workset and forced mode flag (Issue #263).
+    ///
+    /// When `forced_mode` is true, includes a stagnation warning in the guidance.
+    pub fn build_turn_guidance_with_workset(
+        &self,
+        mode: crate::config::GuidanceMode,
+        workset: &[usize],
+        forced_mode: bool,
+    ) -> Option<String> {
+        if workset.is_empty() {
+            return self.build_turn_guidance_with_mode(mode);
+        }
+
+        let finished = self.finished_count();
+        let total = self.items.len();
+        let remaining = total - finished;
+
+        let mut workset_lines = Vec::new();
+        for &wi in workset {
+            if let Some(item) = self.items.get(wi) {
+                let safe_desc =
+                    crate::app::stagnation_state::sanitize_for_prompt_entry(&item.description);
+                workset_lines.push(format!("  {}. {}", wi + 1, safe_desc));
+            }
+        }
+
+        let forced_prefix = if forced_mode {
+            "⚠ STAGNATION DETECTED — You MUST change your approach.\n\n"
+        } else {
+            ""
+        };
+
+        Some(format!(
+            "{forced_prefix}[System] 以下の項目をまとめて実行してください:\n{}\n完了: {}/{} 項目 (残り {})\n\n現在の計画:\n{}\n\nこれらの項目をまとめて進めてください。全項目完了時のみ ANVIL_FINAL を出力してください。",
+            workset_lines.join("\n"),
+            finished,
+            total,
+            remaining,
+            self.format_checklist()
+        ))
+    }
+
+    /// Build incomplete plan message with precomputed workset (Issue #263).
+    pub fn build_incomplete_plan_message_with_workset(
+        &self,
+        mode: crate::config::GuidanceMode,
+        workset: &[usize],
+        forced_mode: bool,
+    ) -> String {
+        if workset.is_empty() {
+            return self.build_incomplete_plan_message_with_mode(mode);
+        }
+
+        let finished = self.finished_count();
+        let total = self.items.len();
+        let remaining = total - finished;
+
+        let forced_prefix = if forced_mode {
+            "⚠ STAGNATION DETECTED — Forced workset transition active.\n\n"
+        } else {
+            ""
+        };
+
+        let workset_lines: Vec<String> = workset
+            .iter()
+            .filter_map(|&i| {
+                self.items.get(i).map(|item| {
+                    let safe_desc =
+                        crate::app::stagnation_state::sanitize_for_prompt_entry(&item.description);
+                    format!("  {}. {}", i + 1, safe_desc)
+                })
+            })
+            .collect();
+
+        format!(
+            "{forced_prefix}[System] まだ {remaining}/{total} 項目が未完了です。\n\n\
+             未完了 (次のworkset):\n{}\n\n\
+             これらの項目をまとめて実行してください。全項目完了後に ANVIL_FINAL を出力してください。",
+            workset_lines.join("\n")
+        )
     }
 }
 
