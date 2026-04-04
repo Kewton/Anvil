@@ -45,7 +45,31 @@ impl ReadTransitionGuard {
         self.last_injected_at = None;
     }
 
+    /// Record a tool call, optionally with the shell command string for
+    /// `shell.exec` file-reading detection (Issue #265).
+    ///
+    /// When `shell_command` is `Some`, and the command is a file-reading
+    /// operation (grep/sed/cat/…), it counts as an exploration call instead
+    /// of resetting the guard.
+    pub fn record_tool_call_ex(
+        &mut self,
+        tool_name: &str,
+        success: bool,
+        shell_command: Option<&str>,
+    ) -> ReadTransitionAction {
+        self.record_inner(tool_name, success, shell_command)
+    }
+
     pub fn record_tool_call(&mut self, tool_name: &str, success: bool) -> ReadTransitionAction {
+        self.record_inner(tool_name, success, None)
+    }
+
+    fn record_inner(
+        &mut self,
+        tool_name: &str,
+        success: bool,
+        shell_command: Option<&str>,
+    ) -> ReadTransitionAction {
         if !success {
             return ReadTransitionAction::Continue;
         }
@@ -61,6 +85,13 @@ impl ReadTransitionGuard {
             "file.edit" | "file.edit_anchor" | "file.write" => {
                 self.reset();
                 return ReadTransitionAction::Continue;
+            }
+            "shell.exec"
+                if shell_command
+                    .is_some_and(crate::tooling::shell_policy::is_file_read_shell_command) =>
+            {
+                // Issue #265: grep/sed/cat etc. count as exploration, not a reset
+                self.consecutive_exploration_calls += 1;
             }
             _ => {
                 self.consecutive_exploration_calls = 0;
@@ -89,8 +120,8 @@ impl ReadTransitionGuard {
             "[System] You have already spent {} consecutive tool calls exploring \
              (including {} file.read calls). You have enough context. \
              Start implementing now using file.edit, file.edit_anchor, or file.write. \
-             Do NOT call file.read again unless a previous edit failed and you need one \
-             targeted verification read.",
+             Do NOT call file.read or use shell.exec with grep/sed/cat to read files. \
+             Proceed to implementation immediately.",
             self.consecutive_exploration_calls, self.consecutive_file_reads
         ))
     }
@@ -148,8 +179,9 @@ mod tests {
         let mut guard = ReadTransitionGuard::new(3, 2);
         guard.record_tool_call("file.read", true);
         guard.record_tool_call("file.search", true);
+        // Non-file-reading shell.exec resets the streak
         assert_eq!(
-            guard.record_tool_call("shell.exec", true),
+            guard.record_tool_call_ex("shell.exec", true, Some("cargo test")),
             ReadTransitionAction::Continue
         );
         assert_eq!(
@@ -169,5 +201,77 @@ mod tests {
             guard.record_tool_call("file.read", true),
             ReadTransitionAction::Continue
         );
+    }
+
+    // --- Issue #265: shell.exec file-reading detection ---
+
+    #[test]
+    fn shell_exec_grep_counts_as_exploration() {
+        let mut guard = ReadTransitionGuard::new(3, 2);
+        guard.record_tool_call("file.read", true);
+        guard.record_tool_call("file.read", true);
+        // grep should count as exploration, not reset
+        let action =
+            guard.record_tool_call_ex("shell.exec", true, Some("grep -n pattern src/main.rs"));
+        assert!(matches!(action, ReadTransitionAction::Inject(_)));
+    }
+
+    #[test]
+    fn shell_exec_sed_counts_as_exploration() {
+        let mut guard = ReadTransitionGuard::new(3, 2);
+        guard.record_tool_call("file.read", true);
+        guard.record_tool_call("file.read", true);
+        let action =
+            guard.record_tool_call_ex("shell.exec", true, Some("sed -n '10,20p' src/main.rs"));
+        assert!(matches!(action, ReadTransitionAction::Inject(_)));
+    }
+
+    #[test]
+    fn shell_exec_cat_counts_as_exploration() {
+        let mut guard = ReadTransitionGuard::new(3, 2);
+        guard.record_tool_call("file.read", true);
+        guard.record_tool_call("file.read", true);
+        let action = guard.record_tool_call_ex("shell.exec", true, Some("cat src/main.rs"));
+        assert!(matches!(action, ReadTransitionAction::Inject(_)));
+    }
+
+    #[test]
+    fn shell_exec_non_read_resets_streak() {
+        let mut guard = ReadTransitionGuard::new(3, 2);
+        guard.record_tool_call("file.read", true);
+        guard.record_tool_call("file.read", true);
+        // cargo build is not a file-reading command → resets
+        assert_eq!(
+            guard.record_tool_call_ex("shell.exec", true, Some("cargo build")),
+            ReadTransitionAction::Continue
+        );
+        // After reset, need 3 more to trigger
+        assert_eq!(
+            guard.record_tool_call("file.read", true),
+            ReadTransitionAction::Continue
+        );
+    }
+
+    #[test]
+    fn shell_exec_without_command_resets_streak() {
+        let mut guard = ReadTransitionGuard::new(3, 2);
+        guard.record_tool_call("file.read", true);
+        guard.record_tool_call("file.read", true);
+        // No command provided → falls through to default reset
+        assert_eq!(
+            guard.record_tool_call_ex("shell.exec", true, None),
+            ReadTransitionAction::Continue
+        );
+    }
+
+    #[test]
+    fn mixed_file_read_and_shell_grep_triggers_guard() {
+        let mut guard = ReadTransitionGuard::new(4, 2);
+        guard.record_tool_call("file.read", true);
+        guard.record_tool_call_ex("shell.exec", true, Some("grep -rn TODO src/"));
+        guard.record_tool_call("file.read", true);
+        let action =
+            guard.record_tool_call_ex("shell.exec", true, Some("sed -n '1,50p' src/lib.rs"));
+        assert!(matches!(action, ReadTransitionAction::Inject(_)));
     }
 }

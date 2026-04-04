@@ -1367,9 +1367,20 @@ impl App {
             if !matches!(pa, super::phase_estimator::PhaseAction::Continue) {
                 phase_action = pa;
             }
-            let transition_action = self
-                .read_transition_guard
-                .record_tool_call(&result.tool_name, success);
+            // Issue #265: pass shell command to read_transition_guard so
+            // grep/sed/cat are counted as exploration calls.
+            let shell_cmd: Option<String> = if result.tool_name == "shell.exec" {
+                tool_input_map
+                    .get(&result.tool_call_id)
+                    .and_then(|(_, v)| v.get("command").and_then(|c| c.as_str()).map(String::from))
+            } else {
+                None
+            };
+            let transition_action = self.read_transition_guard.record_tool_call_ex(
+                &result.tool_name,
+                success,
+                shell_cmd.as_deref(),
+            );
             if let ReadTransitionAction::Inject(msg) = transition_action {
                 read_transition_message = Some(msg);
             }
@@ -1694,6 +1705,19 @@ impl App {
         // Append read repeat hint if repeated reads detected (Issue #185)
         if let Some(hint) = read_hint {
             formatted.push_str(&hint);
+        }
+        // Issue #265: Inject hint when shell.exec is used for file reading
+        // (grep/sed/cat), which bypasses the read transition guard.
+        if result.tool_name == "shell.exec"
+            && result.status == ToolExecutionStatus::Completed
+            && let Some(cmd) = result.summary.strip_prefix("shell.exec completed: ")
+            && crate::tooling::shell_policy::is_file_read_shell_command(cmd)
+        {
+            formatted.push_str(
+                "\n\n[Anvil hint] Using grep/sed/cat to read file contents counts as \
+                 exploration. You already have enough context — proceed to implement \
+                 changes using file.edit or file.write instead of reading more.",
+            );
         }
         let mut msg = SessionMessage::new(MessageRole::Tool, &result.tool_name, formatted)
             .with_id(self.next_message_id("tool"));
