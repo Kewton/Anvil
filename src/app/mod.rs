@@ -279,10 +279,8 @@ pub struct App {
     /// Agent telemetry for session-level metrics (Issue #255).
     agent_telemetry: crate::contracts::AgentTelemetry,
     /// Per-turn stagnation telemetry (Issue #263).
-    #[allow(dead_code)]
     stagnation_state: stagnation_state::StagnationState,
     /// Whether forced mode is active for the current turn (Issue #263).
-    #[allow(dead_code)]
     forced_mode_active: bool,
 }
 

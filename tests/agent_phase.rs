@@ -866,3 +866,46 @@ fn sequential_missing_set_guidance_uses_next_item() {
         "sequential missing-set guidance must contain next item, got: {msg}"
     );
 }
+
+#[test]
+fn minimal_guidance_is_short_and_has_progress() {
+    use anvil::config::GuidanceMode;
+    let plan = ExecutionPlan::new(vec![
+        PlanItem::new("src/a.rs: update module".into(), vec!["src/a.rs".into()]),
+        PlanItem::new("src/b.rs: add field".into(), vec!["src/b.rs".into()]),
+    ]);
+    let guidance = plan.build_turn_guidance_with_mode(GuidanceMode::Minimal);
+    assert!(guidance.is_some(), "Minimal mode should produce guidance");
+    let text = guidance.unwrap();
+    // Must contain "Proceed" and a done/total fraction
+    assert!(
+        text.contains("Proceed"),
+        "minimal guidance must say Proceed, got: {text}"
+    );
+    assert!(
+        text.contains("0/2"),
+        "minimal guidance must show 0/2 done, got: {text}"
+    );
+}
+
+#[test]
+fn minimal_incomplete_plan_message_contains_counts() {
+    use anvil::config::GuidanceMode;
+    let mut plan = ExecutionPlan::new(vec![
+        PlanItem::new("src/a.rs: update module".into(), vec!["src/a.rs".into()]),
+        PlanItem::new("src/b.rs: add field".into(), vec!["src/b.rs".into()]),
+        PlanItem::new("src/c.rs: add test".into(), vec!["src/c.rs".into()]),
+    ]);
+    plan.mark_done(0);
+
+    let msg = plan.build_incomplete_plan_message_with_mode(GuidanceMode::Minimal);
+    // "Plan incomplete: 2 of 3 items remain."
+    assert!(
+        msg.contains("2") && msg.contains("3"),
+        "minimal incomplete message must contain remaining/total counts, got: {msg}"
+    );
+    assert!(
+        !msg.contains("```"),
+        "minimal incomplete message must not contain verbose checklist, got: {msg}"
+    );
+}

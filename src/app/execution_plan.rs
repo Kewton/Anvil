@@ -18,14 +18,9 @@ const PLAN_REQUIRED_MESSAGE: &str = "[System] まず変更計画を作成して�
      - [ ] src/bar.rs: 変更内容の説明\n\
      ```";
 
-/// Message injected when ANVIL_FINAL is suppressed because items remain.
-/// Backward-compatible wrapper for sequential mode.
-fn incomplete_plan_message(next_desc: &str, remaining: usize, total: usize) -> String {
-    format!(
-        "[System] まだ {remaining}/{total} 項目が未完了です。次の項目を実行してください:\n  {next_desc}\n\
-         全項目完了後に ANVIL_FINAL を出力してください。"
-    )
-}
+// incomplete_plan_message() removed in Issue #269 Phase 1.
+// All modes now use ExecutionPlan::build_incomplete_plan_message_with_mode()
+// to avoid the DRY violation of maintaining two parallel message builders.
 
 impl App {
     /// Try to detect and register an `ANVIL_PLAN` block from the LLM response.
@@ -269,13 +264,12 @@ impl App {
                     pfrr = %self.agent_telemetry.premature_final_request_rate(),
                     "plan-aware final gate: suppressing ANVIL_FINAL (premature)"
                 );
+                // Issue #269 Phase 1: use build_incomplete_plan_message_with_mode for all
+                // modes (replaces the removed incomplete_plan_message() function).
                 let mode = self.config.runtime.guidance_mode;
-                let guidance_text = match mode {
-                    crate::config::GuidanceMode::Batch => self
-                        .execution_plan
-                        .build_incomplete_plan_message_with_mode(mode),
-                    _ => incomplete_plan_message(&next_description, remaining, total),
-                };
+                let guidance_text = self
+                    .execution_plan
+                    .build_incomplete_plan_message_with_mode(mode);
                 let msg = SessionMessage::new(MessageRole::Tool, "system", guidance_text)
                     .with_id(self.next_message_id("tool"));
                 self.session.push_message(msg);
@@ -288,12 +282,27 @@ impl App {
     ///
     /// Called at the beginning of each follow-up turn to guide the LLM.
     /// Uses the configured `guidance_mode` from runtime config.
-    pub(crate) fn inject_plan_turn_guidance(&mut self) {
+    ///
+    /// Returns the length (in characters) of the injected guidance text, or
+    /// `None` if no guidance was injected (e.g. no active plan).  Callers can
+    /// forward this value to `AgentTelemetry::record_turn_metrics` so that
+    /// `guidance_chars_per_turn` reflects the actual guidance size.
+    pub(crate) fn inject_plan_turn_guidance(&mut self) -> Option<usize> {
         let mode = self.config.runtime.guidance_mode;
-        if let Some(guidance) = self.execution_plan.build_turn_guidance_with_mode(mode) {
+        // Issue #269 Phase 3: use workset-aware guidance when stagnation is detected.
+        let workset = self.execution_plan.current_workset();
+        let forced = self.forced_mode_active;
+        if let Some(guidance) = self
+            .execution_plan
+            .build_turn_guidance_with_workset(mode, &workset, forced)
+        {
+            let len = guidance.len();
             let msg = SessionMessage::new(MessageRole::Tool, "system", guidance)
                 .with_id(self.next_message_id("tool"));
             self.session.push_message(msg);
+            Some(len)
+        } else {
+            None
         }
     }
 
