@@ -1,6 +1,6 @@
 /// Action recommended when exploration has continued for too long.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ReadTransitionAction {
+pub enum ReadTransitionAction {
     /// No action needed.
     Continue,
     /// Inject a system message urging the model to transition to implementation.
@@ -12,7 +12,7 @@ pub(crate) enum ReadTransitionAction {
 /// Unlike `LoopDetector`, this policy intentionally triggers even when the
 /// agent reads different files each time. The goal is to force the transition
 /// from exploration to implementation once enough context has been gathered.
-pub(crate) struct ReadTransitionGuard {
+pub struct ReadTransitionGuard {
     consecutive_exploration_calls: usize,
     consecutive_file_reads: usize,
     transition_threshold: usize,
@@ -21,7 +21,7 @@ pub(crate) struct ReadTransitionGuard {
 }
 
 impl ReadTransitionGuard {
-    pub(crate) fn new(transition_threshold: usize, reinject_interval: usize) -> Self {
+    pub fn new(transition_threshold: usize, reinject_interval: usize) -> Self {
         Self {
             consecutive_exploration_calls: 0,
             consecutive_file_reads: 0,
@@ -31,17 +31,21 @@ impl ReadTransitionGuard {
         }
     }
 
-    pub(crate) fn reset(&mut self) {
+    /// Override the transition_threshold with a runtime-effective value (Issue #263).
+    ///
+    /// Only `transition_threshold` is changed; `reinject_interval` remains
+    /// at its configured baseline.
+    pub fn set_effective_threshold(&mut self, threshold: usize) {
+        self.transition_threshold = threshold.max(3);
+    }
+
+    pub fn reset(&mut self) {
         self.consecutive_exploration_calls = 0;
         self.consecutive_file_reads = 0;
         self.last_injected_at = None;
     }
 
-    pub(crate) fn record_tool_call(
-        &mut self,
-        tool_name: &str,
-        success: bool,
-    ) -> ReadTransitionAction {
+    pub fn record_tool_call(&mut self, tool_name: &str, success: bool) -> ReadTransitionAction {
         if !success {
             return ReadTransitionAction::Continue;
         }

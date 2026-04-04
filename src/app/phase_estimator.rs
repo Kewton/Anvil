@@ -97,6 +97,14 @@ impl PhaseEstimator {
         }
     }
 
+    /// Override the force_transition_threshold with a runtime-effective value (Issue #263).
+    ///
+    /// Only `force_transition_threshold` is changed; `explore_threshold` and
+    /// `completion_read_threshold` remain at their configured baselines.
+    pub fn set_effective_threshold(&mut self, threshold: usize) {
+        self.force_transition_threshold = threshold.max(3);
+    }
+
     /// Reset per-turn counters. Called at the start of each
     /// `complete_structured_response()` turn.
     ///
