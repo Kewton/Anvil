@@ -1735,7 +1735,7 @@ fn file_edit_noop_when_strings_equal() {
     fs::write(&file_path, "hello world").expect("write should succeed");
 
     let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
-    let result = executor
+    let err = executor
         .execute(ToolExecutionRequest {
             tool_call_id: "call_edit_noop_001".to_string(),
             spec: build_registry()
@@ -1748,10 +1748,12 @@ fn file_edit_noop_when_strings_equal() {
                 new_string: "hello".to_string(),
             },
         })
-        .expect("noop edit should succeed");
+        .expect_err("noop edit should return error when old_string == new_string");
 
-    assert_eq!(result.status, ToolExecutionStatus::Completed);
-    assert!(result.summary.contains("no changes"));
+    assert!(
+        err.to_string().contains("identical"),
+        "error should mention identical strings: {err}"
+    );
     let content = fs::read_to_string(&file_path).expect("read should succeed");
     assert_eq!(content, "hello world");
 }
@@ -5542,7 +5544,7 @@ fn file_edit_success_payload_contains_diff() {
 }
 
 #[test]
-fn file_edit_no_changes_payload_is_none() {
+fn file_edit_no_changes_returns_error() {
     let root = std::env::temp_dir().join("anvil_file_edit_no_changes_payload");
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).expect("dir should exist");
@@ -5550,7 +5552,7 @@ fn file_edit_no_changes_payload_is_none() {
     fs::write(&file_path, "hello world").expect("write should succeed");
 
     let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
-    let result = executor
+    let err = executor
         .execute(ToolExecutionRequest {
             tool_call_id: "call_edit_nochange_001".to_string(),
             spec: build_registry()
@@ -5563,14 +5565,15 @@ fn file_edit_no_changes_payload_is_none() {
                 new_string: "hello".to_string(),
             },
         })
-        .expect("edit should succeed");
+        .expect_err("identical old_string/new_string should return error");
 
-    assert_eq!(result.status, ToolExecutionStatus::Completed);
-    assert_eq!(
-        result.payload,
-        ToolExecutionPayload::None,
-        "no-changes path should return Payload::None"
+    assert!(
+        err.to_string().contains("identical"),
+        "error should mention identical strings: {err}"
     );
+    // File should remain unchanged
+    let content = fs::read_to_string(&file_path).expect("read should succeed");
+    assert_eq!(content, "hello world");
 }
 
 // ============================================================
