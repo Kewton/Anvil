@@ -97,6 +97,9 @@ pub enum GuidanceMode {
     Sequential,
     /// Execute multiple plan items in a single turn (batch mode).
     Batch,
+    /// Minimal guidance: suppress verbose checklists and workset details.
+    /// Used for the baseline comparison arm (Issue #269 Phase 1).
+    Minimal,
 }
 
 impl std::fmt::Display for GuidanceMode {
@@ -104,6 +107,7 @@ impl std::fmt::Display for GuidanceMode {
         match self {
             Self::Sequential => write!(f, "sequential"),
             Self::Batch => write!(f, "batch"),
+            Self::Minimal => write!(f, "minimal"),
         }
     }
 }
@@ -114,6 +118,7 @@ impl std::str::FromStr for GuidanceMode {
         match s.to_lowercase().as_str() {
             "sequential" => Ok(GuidanceMode::Sequential),
             "batch" => Ok(GuidanceMode::Batch),
+            "minimal" => Ok(GuidanceMode::Minimal),
             _ => Ok(GuidanceMode::Sequential), // fail-closed: unknown values fall back to Sequential
         }
     }

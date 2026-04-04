@@ -1387,6 +1387,34 @@ fn guidance_mode_unknown_falls_back_to_sequential() {
 }
 
 #[test]
+fn guidance_mode_minimal_parses_correctly() {
+    use anvil::config::GuidanceMode;
+    let mut config = EffectiveConfig::load().expect("config should load");
+    let mut map = HashMap::new();
+    map.insert("guidance_mode".to_string(), "minimal".to_string());
+    config
+        .apply_overrides_for_test(&map, &HashMap::new(), &HashMap::new())
+        .unwrap();
+    assert_eq!(config.runtime.guidance_mode, GuidanceMode::Minimal);
+}
+
+#[test]
+fn guidance_mode_unknown_still_falls_back_to_sequential_not_minimal() {
+    use anvil::config::GuidanceMode;
+    let mut config = EffectiveConfig::load().expect("config should load");
+    let mut map = HashMap::new();
+    map.insert(
+        "guidance_mode".to_string(),
+        "completely_unknown".to_string(),
+    );
+    config
+        .apply_overrides_for_test(&map, &HashMap::new(), &HashMap::new())
+        .unwrap();
+    // fail-closed: unknown must map to Sequential, not Minimal
+    assert_eq!(config.runtime.guidance_mode, GuidanceMode::Sequential);
+}
+
+#[test]
 fn guidance_mode_env_var_parses_batch() {
     use anvil::config::GuidanceMode;
     let mut config = EffectiveConfig::load().expect("config should load");

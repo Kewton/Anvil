@@ -526,6 +526,14 @@ impl ExecutionPlan {
             .collect()
     }
 
+    /// Return the number of items in the current workset.
+    ///
+    /// Equivalent to `current_workset().len()` but avoids allocating the
+    /// index vector, and is convenient for passing to `record_turn_metrics`.
+    pub fn current_workset_size(&self) -> usize {
+        self.current_workset().len()
+    }
+
     /// Append new items (used by ANVIL_PLAN_UPDATE).
     pub fn append_items(&mut self, new_items: Vec<PlanItem>) {
         self.items.extend(new_items);
@@ -612,13 +620,37 @@ impl ExecutionPlan {
         match mode {
             crate::config::GuidanceMode::Sequential => {
                 let item = &self.items[idx];
+                let safe_desc =
+                    crate::app::stagnation_state::sanitize_for_prompt_entry(&item.description);
+                // Issue #269 Phase 2: show untouched target files instead of full checklist.
+                let untouched: Vec<String> = item
+                    .target_files
+                    .iter()
+                    .filter(|tf| {
+                        !item
+                            .mutated_files
+                            .iter()
+                            .any(|mf| Self::path_matches(mf, tf))
+                    })
+                    .map(|tf| {
+                        format!(
+                            "    - {}",
+                            crate::app::stagnation_state::sanitize_for_prompt_entry(tf)
+                        )
+                    })
+                    .collect();
+                let target_hint = if untouched.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n  未修正ファイル:\n{}", untouched.join("\n"))
+                };
                 Some(format!(
-                    "[System] 計画の次の項目を実行してください:\n  {}. {}\n完了: {}/{} 項目\n\n現在の計画:\n{}\n\n1項目ずつ実行し、全項目完了時のみ ANVIL_FINAL を出力してください。",
+                    "[System] 計画の次の項目を実行してください:\n  {}. {}{}\n完了: {}/{} 項目\n\n1項目ずつ実行し、全項目完了時のみ ANVIL_FINAL を出力してください。",
                     idx + 1,
-                    item.description,
+                    safe_desc,
+                    target_hint,
                     finished,
                     total,
-                    self.format_checklist()
                 ))
             }
             crate::config::GuidanceMode::Batch => {
@@ -628,13 +660,21 @@ impl ExecutionPlan {
                 for &wi in &workset {
                     workset_lines.push(format!("  {}. {}", wi + 1, self.items[wi].description));
                 }
+                // Issue #269 Phase 2: removed full checklist re-display.
                 Some(format!(
-                    "[System] 以下の項目をまとめて実行してください:\n{}\n完了: {}/{} 項目 (残り {})\n\n現在の計画:\n{}\n\nこれらの項目をまとめて進めてください。全項目完了時のみ ANVIL_FINAL を出力してください。",
+                    "[System] 以下の項目をまとめて実行してください:\n{}\n完了: {}/{} 項目 (残り {})\n\nこれらの項目をまとめて進めてください。全項目完了時のみ ANVIL_FINAL を出力してください。",
                     workset_lines.join("\n"),
                     finished,
                     total,
                     remaining,
-                    self.format_checklist()
+                ))
+            }
+            crate::config::GuidanceMode::Minimal => {
+                // Issue #269 Phase 1: minimal guidance for baseline comparison arm.
+                // Suppresses verbose checklists; only shows a terse reminder.
+                Some(format!(
+                    "[System] Proceed with next plan item. ({}/{} done)",
+                    finished, total
                 ))
             }
         }
@@ -654,13 +694,40 @@ impl ExecutionPlan {
 
         match mode {
             crate::config::GuidanceMode::Sequential => {
-                let next_desc = self
-                    .next_actionable_index()
-                    .and_then(|i| self.items.get(i))
-                    .map(|i| i.description.as_str())
-                    .unwrap_or("");
+                // Issue #269 Phase 2: show untouched target files of next item.
+                let next_item = self.next_actionable_index().and_then(|i| self.items.get(i));
+                let next_desc = next_item
+                    .map(|i| {
+                        crate::app::stagnation_state::sanitize_for_prompt_entry(&i.description)
+                    })
+                    .unwrap_or_default();
+                let target_hint = next_item
+                    .map(|item| {
+                        let untouched: Vec<String> = item
+                            .target_files
+                            .iter()
+                            .filter(|tf| {
+                                !item
+                                    .mutated_files
+                                    .iter()
+                                    .any(|mf| Self::path_matches(mf, tf))
+                            })
+                            .map(|tf| {
+                                format!(
+                                    "    - {}",
+                                    crate::app::stagnation_state::sanitize_for_prompt_entry(tf)
+                                )
+                            })
+                            .collect();
+                        if untouched.is_empty() {
+                            String::new()
+                        } else {
+                            format!("\n  未修正ファイル:\n{}", untouched.join("\n"))
+                        }
+                    })
+                    .unwrap_or_default();
                 format!(
-                    "[System] まだ {remaining}/{total} 項目が未完了です。次の項目を実行してください:\n  {next_desc}\n\
+                    "[System] まだ {remaining}/{total} 項目が未完了です。次の項目を実行してください:\n  {next_desc}{target_hint}\n\
                      全項目完了後に ANVIL_FINAL を出力してください。"
                 )
             }
@@ -703,6 +770,10 @@ impl ExecutionPlan {
                 );
                 msg
             }
+            crate::config::GuidanceMode::Minimal => {
+                // Issue #269 Phase 1: minimal incomplete message for baseline comparison arm.
+                format!("Plan incomplete: {remaining} of {total} items remain.")
+            }
         }
     }
 
@@ -738,13 +809,13 @@ impl ExecutionPlan {
             ""
         };
 
+        // Issue #269 Phase 2: removed full checklist re-display.
         Some(format!(
-            "{forced_prefix}[System] 以下の項目をまとめて実行してください:\n{}\n完了: {}/{} 項目 (残り {})\n\n現在の計画:\n{}\n\nこれらの項目をまとめて進めてください。全項目完了時のみ ANVIL_FINAL を出力してください。",
+            "{forced_prefix}[System] 以下の項目をまとめて実行してください:\n{}\n完了: {}/{} 項目 (残り {})\n\nこれらの項目をまとめて進めてください。全項目完了時のみ ANVIL_FINAL を出力してください。",
             workset_lines.join("\n"),
             finished,
             total,
             remaining,
-            self.format_checklist()
         ))
     }
 

@@ -483,6 +483,12 @@ impl App {
                 break;
             }
 
+            // Issue #269 Phase 3: stagnation begin_turn hook.
+            {
+                let workset = self.execution_plan.current_workset();
+                self.stagnation_state.begin_turn(&workset);
+            }
+
             // Step 1: Extract and run sub-agent calls (IR3-001)
             let (agent_results, normal_calls) =
                 self.extract_and_run_subagent_calls(&current.tool_calls, provider_client);
@@ -529,6 +535,21 @@ impl App {
 
             // Update plan item status from tool results; capture telemetry.
             let (turn_mutations, turn_items_advanced) = self.update_plan_from_results(&results);
+
+            // Issue #269 Phase 3: record each successful mutation for stagnation tracking.
+            {
+                let mutation_tools = ["file.write", "file.edit", "file.edit_anchor"];
+                for r in &results {
+                    if mutation_tools.contains(&r.tool_name.as_str())
+                        && r.status == crate::tooling::ToolExecutionStatus::Completed
+                        && !r.rolled_back
+                        && !r.summary.is_empty()
+                        && !r.summary.contains("(no changes)")
+                    {
+                        self.stagnation_state.record_mutation(&r.summary);
+                    }
+                }
+            }
 
             let tool_log_views: Vec<ToolLogView> = results
                 .iter()
@@ -590,8 +611,9 @@ impl App {
                 break;
             }
 
-            // Issue #249: Inject plan turn guidance before follow-up LLM call
-            self.inject_plan_turn_guidance();
+            // Issue #249: Inject plan turn guidance before follow-up LLM call.
+            // Returns the guidance char count for telemetry (Issue #269 Phase 0).
+            let guidance_chars_this_turn = self.inject_plan_turn_guidance().unwrap_or(0);
 
             // Send tool results back to LLM for the next turn
             let spinner = Spinner::start(
@@ -711,8 +733,26 @@ impl App {
 
             // Record turn stats AFTER the full iteration completes (Issue #206 CB-001)
             self.session_stats.record_turn();
-            self.agent_telemetry
-                .record_turn_metrics(turn_mutations, turn_items_advanced, 0, 0);
+            // Issue #269 Phase 0: pass actual guidance_chars and workset_size.
+            let workset_size_this_turn = self.execution_plan.current_workset_size();
+            self.agent_telemetry.record_turn_metrics(
+                turn_mutations,
+                turn_items_advanced,
+                guidance_chars_this_turn as u32,
+                workset_size_this_turn as u32,
+            );
+
+            // Issue #269 Phase 3: stagnation end_turn hook + forced mode update.
+            self.stagnation_state.end_turn(turn_mutations > 0);
+            let stagnation_score =
+                crate::app::stagnation_state::compute_stagnation_score(&self.stagnation_state);
+            self.forced_mode_active = stagnation_score >= 2;
+            if self.forced_mode_active {
+                tracing::warn!(
+                    score = stagnation_score,
+                    "stagnation detected; forced_mode_active=true"
+                );
+            }
             log_turn_summary(&TurnSummary {
                 turn: self.session_stats.total_turns,
                 max_turns: max_iterations as u32,
