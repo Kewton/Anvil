@@ -378,6 +378,10 @@ fn telemetry_serde_backward_compatible() {
     assert!(tel.items_advanced_per_turn.is_empty());
     assert!(tel.guidance_chars_per_turn.is_empty());
     assert!(tel.workset_size_per_turn.is_empty());
+    // Issue #271: new fields default to zero
+    assert_eq!(tel.anvil_plan_visible_count, 0);
+    assert_eq!(tel.last_mutation_turn, 0);
+    assert_eq!(tel.final_suppressed_with_remaining_targets_count, 0);
 }
 
 // ---------------------------------------------------------------------------

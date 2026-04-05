@@ -891,6 +891,14 @@ impl App {
                 "agent telemetry"
             );
         }
+
+        // Issue #271: Write telemetry artifact (opt-in via ANVIL_TELEMETRY_DIR).
+        if let Err(err) = self
+            .agent_telemetry
+            .write_artifact(&self.session.metadata.session_id)
+        {
+            tracing::warn!("telemetry artifact write failed: {err}");
+        }
     }
 
     /// Run PostSession hook (DR2-005, DR2-007 facade method).

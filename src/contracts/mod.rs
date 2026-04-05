@@ -222,6 +222,18 @@ pub struct AgentTelemetry {
     /// Number of ANVIL_PLAN_UPDATE requests triggered by stagnation control (Issue #263).
     #[serde(default)]
     pub plan_repair_request_count: u32,
+
+    /// Number of ANVIL_PLAN blocks observed (visible to external telemetry).
+    #[serde(default)]
+    pub anvil_plan_visible_count: u32,
+
+    /// Last turn on which a mutation (file change) occurred.
+    #[serde(default)]
+    pub last_mutation_turn: u32,
+
+    /// ANVIL_FINAL suppressed with remaining core targets > 0 (count).
+    #[serde(default)]
+    pub final_suppressed_with_remaining_targets_count: u32,
 }
 
 impl AgentTelemetry {
@@ -286,6 +298,139 @@ impl AgentTelemetry {
     /// Record a plan repair request (Issue #263).
     pub fn record_plan_repair_request(&mut self) {
         self.plan_repair_request_count += 1;
+    }
+
+    /// Record an ANVIL_PLAN block observed (visible to external telemetry).
+    pub fn record_anvil_plan_visible(&mut self) {
+        self.anvil_plan_visible_count += 1;
+    }
+
+    /// Record the turn on which a mutation occurred.
+    pub fn record_mutation_turn(&mut self, turn: u32) {
+        self.last_mutation_turn = turn;
+    }
+
+    /// Record an ANVIL_FINAL suppression with remaining core targets.
+    pub fn record_final_suppressed_with_remaining_targets(&mut self) {
+        self.final_suppressed_with_remaining_targets_count += 1;
+    }
+
+    /// Threshold: mutations after this turn are considered "late".
+    pub const LATE_MUTATION_THRESHOLD: u32 = 20;
+
+    /// Late mutation flag: last_mutation_turn exceeds the threshold.
+    pub fn is_late_mutation(&self) -> bool {
+        self.last_mutation_turn > Self::LATE_MUTATION_THRESHOLD
+    }
+
+    /// Accepted ANVIL_FINAL count: total minus premature (saturating).
+    pub fn accepted_final_count(&self) -> u32 {
+        self.total_final_requests
+            .saturating_sub(self.premature_final_count)
+    }
+
+    /// Write telemetry artifact to `$ANVIL_TELEMETRY_DIR/{session_id}_telemetry.json`.
+    ///
+    /// Returns `Ok(())` when `ANVIL_TELEMETRY_DIR` is unset (no-op) or when the
+    /// file was successfully written.  Returns `Err` on validation or I/O failure.
+    pub fn write_artifact(&self, session_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let dir_raw = match std::env::var("ANVIL_TELEMETRY_DIR") {
+            Ok(v) if !v.is_empty() => v,
+            _ => return Ok(()), // no-op when unset
+        };
+
+        self.write_artifact_to_dir(&dir_raw, session_id)
+    }
+
+    /// Write telemetry artifact to the given directory path.
+    ///
+    /// Validates that the path is absolute, not a symlink, and is an existing
+    /// directory.  Creates `{session_id}_telemetry.json` using `create_new`
+    /// (refuses to overwrite).
+    pub fn write_artifact_to_dir(
+        &self,
+        dir_raw: &str,
+        session_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let dir_path = std::path::Path::new(dir_raw);
+
+        // Reject relative paths.
+        if !dir_path.is_absolute() {
+            return Err("telemetry dir must be an absolute path".into());
+        }
+
+        // Reject symlinks on the directory itself.
+        let meta = std::fs::symlink_metadata(dir_path)
+            .map_err(|_| "telemetry dir does not exist or is inaccessible")?;
+        if meta.file_type().is_symlink() {
+            return Err("telemetry dir must not be a symlink".into());
+        }
+
+        // Canonicalize and verify it is a directory.
+        let canonical =
+            std::fs::canonicalize(dir_path).map_err(|_| "telemetry dir cannot be canonicalized")?;
+        if !canonical.is_dir() {
+            return Err("telemetry dir is not a directory".into());
+        }
+
+        // Sanitize session_id: reject any path separators or leading dots to prevent
+        // directory traversal (e.g. "../evil" or "/abs/path").
+        if session_id.contains('/') || session_id.contains('\\') || session_id.starts_with('.') {
+            return Err("session_id contains invalid characters for use in a filename".into());
+        }
+
+        let file_path = canonical.join(format!("{session_id}_telemetry.json"));
+
+        // Verify the resulting path is still inside the canonical directory.
+        if !file_path.starts_with(&canonical) {
+            return Err("telemetry file path escapes the target directory".into());
+        }
+
+        // Build the artifact payload with derived values.
+        let completion = self
+            .completion_kind
+            .map(|k| k.to_string())
+            .unwrap_or_else(|| "none".to_string());
+
+        let payload = serde_json::json!({
+            "schema_version": "1",
+            "session_id": session_id,
+            "completion_kind": completion,
+            "premature_final_count": self.premature_final_count,
+            "total_final_requests": self.total_final_requests,
+            "accepted_final_count": self.accepted_final_count(),
+            "plan_registration_count": self.plan_registration_count,
+            "plan_update_count": self.plan_update_count,
+            "anvil_plan_visible_count": self.anvil_plan_visible_count,
+            "last_mutation_turn": self.last_mutation_turn,
+            "late_mutation_flag": self.is_late_mutation(),
+            "final_suppressed_with_remaining_targets_count":
+                self.final_suppressed_with_remaining_targets_count,
+            "sync_from_touched_files_count": self.sync_from_touched_files_count,
+            "forced_workset_transition_count": self.forced_workset_transition_count,
+            "initial_plan_miss_count": self.initial_plan_miss_count,
+            "no_op_mutation_count": self.no_op_mutation_count,
+            "rolled_back_mutation_count": self.rolled_back_mutation_count,
+            "plan_repair_request_count": self.plan_repair_request_count,
+            "mutations_per_turn": self.mutations_per_turn,
+            "items_advanced_per_turn": self.items_advanced_per_turn,
+            "guidance_chars_per_turn": self.guidance_chars_per_turn,
+            "workset_size_per_turn": self.workset_size_per_turn,
+        });
+
+        let json_bytes = serde_json::to_vec_pretty(&payload)?;
+
+        // create_new: refuse to overwrite existing files.
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&file_path)
+            .map_err(|e| format!("failed to create telemetry file: {e}"))?;
+
+        use std::io::Write;
+        file.write_all(&json_bytes)?;
+
+        Ok(())
     }
 
     /// Premature Final Request Rate: ratio of suppressed finals to total finals.

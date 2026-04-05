@@ -512,4 +512,8 @@ fn telemetry_serde_backward_compatibility() {
     let telemetry: AgentTelemetry = serde_json::from_str(json).unwrap();
     assert_eq!(telemetry.forced_workset_transition_count, 0);
     assert_eq!(telemetry.plan_repair_request_count, 0);
+    // Issue #271: new fields default to zero
+    assert_eq!(telemetry.anvil_plan_visible_count, 0);
+    assert_eq!(telemetry.last_mutation_turn, 0);
+    assert_eq!(telemetry.final_suppressed_with_remaining_targets_count, 0);
 }
