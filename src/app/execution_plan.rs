@@ -42,6 +42,7 @@ impl App {
                 // Mark first item as InProgress
                 self.execution_plan.mark_in_progress(0);
                 self.agent_telemetry.record_plan_registration();
+                self.agent_telemetry.record_anvil_plan_visible();
                 return true;
             }
         }
@@ -257,6 +258,9 @@ impl App {
             } => {
                 // Issue #255: Track premature final request (PFRR).
                 self.agent_telemetry.record_premature_final();
+                // Issue #271: Track ANVIL_FINAL suppression with remaining targets.
+                self.agent_telemetry
+                    .record_final_suppressed_with_remaining_targets();
                 tracing::info!(
                     remaining,
                     total,

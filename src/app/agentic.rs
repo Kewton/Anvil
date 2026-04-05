@@ -741,6 +741,11 @@ impl App {
                 guidance_chars_this_turn as u32,
                 workset_size_this_turn as u32,
             );
+            // Issue #271: Track last mutation turn for late-mutation detection.
+            if turn_mutations > 0 {
+                self.agent_telemetry
+                    .record_mutation_turn(self.session_stats.total_turns);
+            }
 
             // Issue #269 Phase 3: stagnation end_turn hook + forced mode update.
             self.stagnation_state.end_turn(turn_mutations > 0);
