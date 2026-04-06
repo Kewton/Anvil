@@ -234,6 +234,21 @@ pub struct AgentTelemetry {
     /// ANVIL_FINAL suppressed with remaining core targets > 0 (count).
     #[serde(default)]
     pub final_suppressed_with_remaining_targets_count: u32,
+
+    /// First mutation event turn (Issue #273 Phase 1.5).
+    /// None if no mutation occurred during the session.
+    #[serde(default)]
+    pub first_mutation_event_turn: Option<u32>,
+
+    /// Elapsed seconds from session start to first mutation event (Issue #273 Phase 1.5).
+    /// None if no mutation occurred during the session.
+    #[serde(default)]
+    pub first_mutation_event_elapsed_s: Option<f64>,
+
+    /// Tool name that triggered the first mutation event (Issue #273 Phase 1.5).
+    /// None if no mutation occurred during the session.
+    #[serde(default)]
+    pub first_mutation_event_tool: Option<String>,
 }
 
 impl AgentTelemetry {
@@ -305,9 +320,18 @@ impl AgentTelemetry {
         self.anvil_plan_visible_count += 1;
     }
 
-    /// Record the turn on which a mutation occurred.
-    pub fn record_mutation_turn(&mut self, turn: u32) {
+    /// Record a mutation turn: updates `last_mutation_turn` and, on the first call only,
+    /// populates `first_mutation_event_*`.
+    ///
+    /// Callers must ensure `tool_name` is an allowlisted mutation tool
+    /// (i.e. from `crate::app::MUTATION_TOOLS`) to avoid storing arbitrary strings.
+    pub fn record_mutation_turn(&mut self, turn: u32, elapsed_s: Option<f64>, tool_name: &str) {
         self.last_mutation_turn = turn;
+        if self.first_mutation_event_turn.is_none() {
+            self.first_mutation_event_turn = Some(turn);
+            self.first_mutation_event_elapsed_s = elapsed_s;
+            self.first_mutation_event_tool = Some(tool_name.to_string());
+        }
     }
 
     /// Record an ANVIL_FINAL suppression with remaining core targets.
@@ -393,7 +417,7 @@ impl AgentTelemetry {
             .unwrap_or_else(|| "none".to_string());
 
         let payload = serde_json::json!({
-            "schema_version": "1",
+            "schema_version": "2",
             "session_id": session_id,
             "completion_kind": completion,
             "premature_final_count": self.premature_final_count,
@@ -416,6 +440,10 @@ impl AgentTelemetry {
             "items_advanced_per_turn": self.items_advanced_per_turn,
             "guidance_chars_per_turn": self.guidance_chars_per_turn,
             "workset_size_per_turn": self.workset_size_per_turn,
+            "first_mutation_event_turn": self.first_mutation_event_turn,
+            "first_mutation_event_elapsed_s": self.first_mutation_event_elapsed_s,
+            "first_mutation_event_tool": self.first_mutation_event_tool,
+            "first_mutation_event_semantic_basis": "runtime_lower_bound",
         });
 
         let json_bytes = serde_json::to_vec_pretty(&payload)?;

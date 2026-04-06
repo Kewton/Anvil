@@ -87,7 +87,7 @@ impl App {
         let mut mutations_count: u32 = 0;
         let current_idx = self.execution_plan.next_actionable_index();
 
-        let mutation_tools = ["file.write", "file.edit", "file.edit_anchor"];
+        let mutation_tools = super::MUTATION_TOOLS;
 
         // Snapshot finished state before processing
         let was_finished: Vec<bool> = self
