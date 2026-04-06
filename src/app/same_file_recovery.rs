@@ -7,6 +7,13 @@
 
 use crate::tooling::EditFailureKind;
 
+/// Immutable classification for a completed `file.read`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReadClassification {
+    NormalRead,
+    RecoveryRead,
+}
+
 /// file.edit failure recovery state machine.
 ///
 /// Owned by `App` and driven by `record_tool_result()` in agentic.rs.
@@ -37,6 +44,20 @@ pub(crate) enum SameFileRecoveryState {
     Abandoned,
 }
 
+/// Immutable disposition for a completed `file.read`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompletedReadDisposition {
+    pub normalized_path: String,
+    pub read_classification: ReadClassification,
+    pub next_state: SameFileRecoveryState,
+}
+
+impl CompletedReadDisposition {
+    pub fn is_recovery_read(&self) -> bool {
+        matches!(self.read_classification, ReadClassification::RecoveryRead)
+    }
+}
+
 impl SameFileRecoveryState {
     /// Transition on file.edit failure.
     ///
@@ -55,15 +76,23 @@ impl SameFileRecoveryState {
         }
     }
 
-    /// Transition on file.read completion (success).
+    /// Classify a successful file.read exactly once from the pre-transition state.
     ///
-    /// Only transitions if currently PendingRecoveryRead for the same path.
-    pub fn on_read_completed(self, read_path: &str) -> Self {
+    /// This decouples the immutable fact ("this read was a recovery read") from
+    /// the next mutable state so downstream consumers do not need to re-read
+    /// live state after a transition.
+    pub fn classify_completed_read(self, read_path: &str) -> CompletedReadDisposition {
         match self {
-            Self::PendingRecoveryRead(path) if path == read_path => {
-                Self::PendingRecoveryRetry(path)
-            }
-            other => other,
+            Self::PendingRecoveryRead(path) if path == read_path => CompletedReadDisposition {
+                normalized_path: read_path.to_string(),
+                read_classification: ReadClassification::RecoveryRead,
+                next_state: Self::PendingRecoveryRetry(path),
+            },
+            other => CompletedReadDisposition {
+                normalized_path: read_path.to_string(),
+                read_classification: ReadClassification::NormalRead,
+                next_state: other,
+            },
         }
     }
 
@@ -87,14 +116,6 @@ impl SameFileRecoveryState {
     pub fn should_reset(&self) -> bool {
         matches!(self, Self::Resolved | Self::Abandoned)
     }
-
-    /// Whether the given read_path is the recovery read target.
-    ///
-    /// Used to skip ReadTransitionGuard and ReadRepeatTracker for this
-    /// specific path only.
-    pub fn is_pending_recovery_read_for(&self, read_path: &str) -> bool {
-        matches!(self, Self::PendingRecoveryRead(path) if path == read_path)
-    }
 }
 
 #[cfg(test)]
@@ -114,7 +135,13 @@ mod recovery_state_tests {
         );
 
         // Recovery read succeeds
-        let state = state.on_read_completed("src/main.rs");
+        let disposition = state.classify_completed_read("src/main.rs");
+        assert_eq!(disposition.normalized_path, "src/main.rs");
+        assert_eq!(
+            disposition.read_classification,
+            ReadClassification::RecoveryRead
+        );
+        let state = disposition.next_state;
         assert_eq!(
             state,
             SameFileRecoveryState::PendingRecoveryRetry("src/main.rs".into())
@@ -184,7 +211,13 @@ mod recovery_state_tests {
     fn different_path_read_does_not_transition() {
         let state = SameFileRecoveryState::PendingRecoveryRead("src/main.rs".into());
         // Read a different file
-        let state = state.on_read_completed("src/other.rs");
+        let disposition = state.classify_completed_read("src/other.rs");
+        assert_eq!(disposition.normalized_path, "src/other.rs");
+        assert_eq!(
+            disposition.read_classification,
+            ReadClassification::NormalRead
+        );
+        let state = disposition.next_state;
         assert_eq!(
             state,
             SameFileRecoveryState::PendingRecoveryRead("src/main.rs".into())
@@ -192,14 +225,17 @@ mod recovery_state_tests {
     }
 
     #[test]
-    fn is_pending_recovery_read_for_path_awareness() {
-        let state = SameFileRecoveryState::PendingRecoveryRead("src/main.rs".into());
-        assert!(state.is_pending_recovery_read_for("src/main.rs"));
-        assert!(!state.is_pending_recovery_read_for("src/other.rs"));
-
-        // Normal state should never be pending
-        let normal = SameFileRecoveryState::Normal;
-        assert!(!normal.is_pending_recovery_read_for("src/main.rs"));
+    fn pending_retry_reads_are_normal_reads() {
+        let state = SameFileRecoveryState::PendingRecoveryRetry("src/main.rs".into());
+        let disposition = state.classify_completed_read("src/main.rs");
+        assert_eq!(
+            disposition.read_classification,
+            ReadClassification::NormalRead
+        );
+        assert_eq!(
+            disposition.next_state,
+            SameFileRecoveryState::PendingRecoveryRetry("src/main.rs".into())
+        );
     }
 
     #[test]
