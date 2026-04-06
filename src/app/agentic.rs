@@ -568,6 +568,23 @@ impl App {
                             elapsed_s,
                             &r.tool_name, // already validated by MUTATION_TOOLS.contains()
                         );
+
+                        // Issue #277: file-role telemetry
+                        {
+                            use crate::contracts::file_role::make_cwd_relative;
+                            let canonical_path = r
+                                .artifacts
+                                .first()
+                                .map(|abs_path| {
+                                    make_cwd_relative(
+                                        abs_path,
+                                        std::path::Path::new(&self.config.paths.cwd),
+                                    )
+                                })
+                                .unwrap_or_else(|| r.summary.clone());
+                            self.agent_telemetry
+                                .record_file_role_mutation(&canonical_path);
+                        }
                     }
                 }
             }

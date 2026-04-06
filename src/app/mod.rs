@@ -901,11 +901,18 @@ impl App {
             );
         }
 
+        // Issue #277: Calculate plan divergence before writing artifact.
+        let mut tel = self.agent_telemetry.clone();
+        if !self.execution_plan.is_empty() {
+            let divergence = crate::app::execution_plan::calculate_plan_divergence(
+                &self.execution_plan,
+                tel.mutation_path_attribution(),
+            );
+            tel.plan_order_vs_actual_mutation_divergence = Some(divergence);
+        }
+
         // Issue #271: Write telemetry artifact (opt-in via ANVIL_TELEMETRY_DIR).
-        if let Err(err) = self
-            .agent_telemetry
-            .write_artifact(&self.session.metadata.session_id)
-        {
+        if let Err(err) = tel.write_artifact(&self.session.metadata.session_id) {
             tracing::warn!("telemetry artifact write failed: {err}");
         }
     }
