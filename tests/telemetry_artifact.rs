@@ -65,7 +65,7 @@ fn telemetry_artifact_not_written_when_dir_unset() {
 #[test]
 fn telemetry_artifact_schema_version() {
     let json = write_and_parse(&AgentTelemetry::new(), "schema");
-    assert_eq!(json["schema_version"], "2");
+    assert_eq!(json["schema_version"], "3");
 }
 
 #[test]
@@ -138,6 +138,13 @@ fn telemetry_artifact_all_fields_present() {
         "first_mutation_event_elapsed_s",
         "first_mutation_event_tool",
         "first_mutation_event_semantic_basis",
+        "first_successful_mutation_file_role",
+        "first_non_test_mutation_file_role",
+        "mutation_role_sequence",
+        "peripheral_mutation_before_core_count",
+        "role_transition_rework_count",
+        "files_touched_before_first_core_mutation",
+        "plan_order_vs_actual_mutation_divergence",
     ];
 
     for key in &expected_keys {
@@ -186,6 +193,39 @@ fn first_mutation_event_in_artifact_payload() {
         json["first_mutation_event_semantic_basis"],
         "runtime_lower_bound"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #277: backward compatibility test
+// ---------------------------------------------------------------------------
+
+/// Deserializing schema_version 2 JSON (without Issue #277 fields) should
+/// produce default values for all new fields.
+#[test]
+fn backward_compat_schema_v2_deserializes_with_defaults() {
+    let v2_json = r#"{
+        "premature_final_count": 1,
+        "total_final_requests": 3,
+        "plan_registration_count": 1,
+        "plan_update_count": 0,
+        "sync_from_touched_files_count": 0,
+        "last_mutation_turn": 5,
+        "anvil_plan_visible_count": 1,
+        "final_suppressed_with_remaining_targets_count": 0,
+        "initial_plan_miss_count": 0,
+        "no_op_mutation_count": 0,
+        "rolled_back_mutation_count": 0
+    }"#;
+    let tel: AgentTelemetry = serde_json::from_str(v2_json).unwrap();
+
+    // All Issue #277 fields should have their default values
+    assert!(tel.first_successful_mutation_file_role.is_none());
+    assert!(tel.first_non_test_mutation_file_role.is_none());
+    assert!(tel.mutation_role_sequence.is_empty());
+    assert_eq!(tel.peripheral_mutation_before_core_count, 0);
+    assert_eq!(tel.role_transition_rework_count, 0);
+    assert_eq!(tel.files_touched_before_first_core_mutation, 0);
+    assert!(tel.plan_order_vs_actual_mutation_divergence.is_none());
 }
 
 /// (f) Artifact payload has null first_mutation_event_* when no mutations occurred.
