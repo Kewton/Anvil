@@ -138,6 +138,7 @@ fn telemetry_artifact_all_fields_present() {
         "first_mutation_event_elapsed_s",
         "first_mutation_event_tool",
         "first_mutation_event_semantic_basis",
+        "post_mutation",
     ];
 
     for key in &expected_keys {

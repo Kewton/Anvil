@@ -171,6 +171,70 @@ impl CompletionKind {
 }
 
 // ---------------------------------------------------------------------------
+// Post-mutation stall classification (Issue #275)
+// ---------------------------------------------------------------------------
+
+/// Dominant class of a post-mutation stall turn.
+///
+/// Priority order (highest first):
+/// 1. SameFileRepair
+/// 2. TouchedPathRepair
+/// 3. CacheHitReread
+/// 4. UntouchedExploration
+/// 5. PlanOnlyNoTool
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PostMutationDominantClass {
+    SameFileRepair,
+    TouchedPathRepair,
+    CacheHitReread,
+    UntouchedExploration,
+    #[default]
+    PlanOnlyNoTool,
+}
+
+/// Post-mutation stall classification / measurement telemetry (Issue #275).
+///
+/// Sub-struct of `AgentTelemetry` to avoid field proliferation.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct PostMutationTelemetry {
+    #[serde(default)]
+    pub stall_segment_count: u32,
+    #[serde(default)]
+    pub same_file_repair_turn_count: u32,
+    #[serde(default)]
+    pub touched_path_repair_turn_count: u32,
+    #[serde(default)]
+    pub untouched_exploration_turn_count: u32,
+    #[serde(default)]
+    pub plan_only_turn_count: u32,
+    #[serde(default)]
+    pub cache_hit_reread_count: u32,
+    #[serde(default)]
+    pub new_path_count: u32,
+    #[serde(default)]
+    pub dominant_class: Option<PostMutationDominantClass>,
+}
+
+impl PostMutationTelemetry {
+    /// Increment the counter for the given dominant class and update the latest class.
+    pub fn record_class(&mut self, class: PostMutationDominantClass) {
+        match class {
+            PostMutationDominantClass::SameFileRepair => self.same_file_repair_turn_count += 1,
+            PostMutationDominantClass::TouchedPathRepair => {
+                self.touched_path_repair_turn_count += 1;
+            }
+            PostMutationDominantClass::CacheHitReread => self.cache_hit_reread_count += 1,
+            PostMutationDominantClass::UntouchedExploration => {
+                self.untouched_exploration_turn_count += 1;
+            }
+            PostMutationDominantClass::PlanOnlyNoTool => self.plan_only_turn_count += 1,
+        }
+        self.dominant_class = Some(class);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Agent telemetry (Issue #255: Stage 0 observability)
 // ---------------------------------------------------------------------------
 
@@ -249,6 +313,10 @@ pub struct AgentTelemetry {
     /// None if no mutation occurred during the session.
     #[serde(default)]
     pub first_mutation_event_tool: Option<String>,
+
+    /// Post-mutation stall classification telemetry (Issue #275).
+    #[serde(default)]
+    pub post_mutation: PostMutationTelemetry,
 }
 
 impl AgentTelemetry {
@@ -444,6 +512,7 @@ impl AgentTelemetry {
             "first_mutation_event_elapsed_s": self.first_mutation_event_elapsed_s,
             "first_mutation_event_tool": self.first_mutation_event_tool,
             "first_mutation_event_semantic_basis": "runtime_lower_bound",
+            "post_mutation": self.post_mutation,
         });
 
         let json_bytes = serde_json::to_vec_pretty(&payload)?;

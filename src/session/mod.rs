@@ -330,6 +330,14 @@ pub struct SessionRecord {
     /// Added in Issue #130.
     #[serde(default)]
     pub working_memory: WorkingMemory,
+    /// Post-mutation touched paths (hidden state, not injected into prompt).
+    /// Used by post-mutation classifier to track new vs. previously-touched paths (Issue #275).
+    /// Capped at 1000 entries; `post_mutation_touched_paths_overflowed` signals cap reached.
+    #[serde(default)]
+    pub post_mutation_touched_paths: HashSet<String>,
+    /// Whether `post_mutation_touched_paths` reached its capacity limit (Issue #275).
+    #[serde(default)]
+    pub post_mutation_touched_paths_overflowed: bool,
     /// Tracks whether in-memory state has diverged from disk.
     /// Not serialized — always starts as `false` after deserialization.
     #[serde(skip)]
@@ -378,6 +386,8 @@ impl SessionRecord {
             provider_errors: Vec::new(),
             used_tools: HashSet::new(),
             working_memory: WorkingMemory::default(),
+            post_mutation_touched_paths: HashSet::new(),
+            post_mutation_touched_paths_overflowed: false,
             dirty: false,
             cached_token_count: std::cell::Cell::new(None),
             auto_compact_threshold: 64,

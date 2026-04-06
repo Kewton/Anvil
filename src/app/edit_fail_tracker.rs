@@ -68,6 +68,9 @@ pub(crate) struct EditFailTracker {
     consecutive_failures: HashMap<String, u32>,
     reread_threshold: u32,
     write_fallback_threshold: u32,
+    /// Last failed edit path, used by post-mutation classifier (Issue #275).
+    /// Cleared when the same path succeeds (stale marker prevention).
+    pub(crate) last_failed_path: Option<String>,
 }
 
 impl EditFailTracker {
@@ -76,12 +79,14 @@ impl EditFailTracker {
             consecutive_failures: HashMap::new(),
             reread_threshold,
             write_fallback_threshold,
+            last_failed_path: None,
         }
     }
 
     /// Record a file.edit failure for the given path.
     /// Returns the recommended fallback action based on the cumulative failure count.
     pub(crate) fn record_failure(&mut self, path: &str) -> EditFallbackAction {
+        self.last_failed_path = Some(path.to_string());
         let count = self
             .consecutive_failures
             .entry(path.to_string())
@@ -93,6 +98,10 @@ impl EditFailTracker {
     /// Record a successful file.edit, resetting the failure count for that path.
     pub(crate) fn record_success(&mut self, path: &str) {
         self.consecutive_failures.remove(path);
+        // Clear repair marker if the same path succeeded (stale marker prevention, Issue #275).
+        if self.last_failed_path.as_deref() == Some(path) {
+            self.last_failed_path = None;
+        }
     }
 
     /// Get the current failure count for a path.
@@ -271,5 +280,33 @@ mod tests {
             EditFallbackAction::WriteFallback
         );
         assert_eq!(tracker.failure_count("a.rs"), 7);
+    }
+
+    // --- Issue #275: last_failed_path tests ---
+
+    #[test]
+    fn test_last_failed_path_set_on_record_failure() {
+        let mut tracker = EditFailTracker::new(3, 5);
+        assert_eq!(tracker.last_failed_path, None);
+        tracker.record_failure("src/a.rs");
+        assert_eq!(tracker.last_failed_path.as_deref(), Some("src/a.rs"));
+    }
+
+    #[test]
+    fn test_last_failed_path_cleared_on_same_path_success() {
+        let mut tracker = EditFailTracker::new(3, 5);
+        tracker.record_failure("src/a.rs");
+        assert_eq!(tracker.last_failed_path.as_deref(), Some("src/a.rs"));
+        tracker.record_success("src/a.rs");
+        assert_eq!(tracker.last_failed_path, None);
+    }
+
+    #[test]
+    fn test_last_failed_path_preserved_on_other_path_success() {
+        let mut tracker = EditFailTracker::new(3, 5);
+        tracker.record_failure("src/b.rs");
+        assert_eq!(tracker.last_failed_path.as_deref(), Some("src/b.rs"));
+        tracker.record_success("src/c.rs");
+        assert_eq!(tracker.last_failed_path.as_deref(), Some("src/b.rs"));
     }
 }

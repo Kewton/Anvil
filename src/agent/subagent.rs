@@ -234,11 +234,7 @@ impl SubAgentResult {
             status: ToolExecutionStatus::Completed,
             summary,
             payload: ToolExecutionPayload::Text(json),
-            artifacts: Vec::new(),
-            elapsed_ms: 0,
-            diff_summary: None,
-            edit_detail: None,
-            rolled_back: false,
+            ..Default::default()
         }
     }
 }
@@ -286,11 +282,7 @@ impl SubAgentError {
             status: ToolExecutionStatus::Failed,
             summary: output.clone(),
             payload: ToolExecutionPayload::Text(output),
-            artifacts: Vec::new(),
-            elapsed_ms: 0,
-            diff_summary: None,
-            edit_detail: None,
-            rolled_back: false,
+            ..Default::default()
         }
     }
 }
@@ -600,11 +592,7 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
                     status: ToolExecutionStatus::Failed,
                     summary: err.to_string(),
                     payload: ToolExecutionPayload::Text(err.to_string()),
-                    artifacts: Vec::new(),
-                    elapsed_ms: 0,
-                    diff_summary: None,
-                    edit_detail: None,
-                    rolled_back: false,
+                    ..Default::default()
                 });
 
             // Record tool result in the sub-agent session
