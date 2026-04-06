@@ -438,9 +438,11 @@ fn make_mutation_result(
         status,
         summary: summary.to_string(),
         payload: anvil::tooling::ToolExecutionPayload::Text("ok".to_string()),
+        artifacts: vec![],
         elapsed_ms: 10,
+        diff_summary: None,
+        edit_detail: None,
         rolled_back,
-        ..Default::default()
     }
 }
 

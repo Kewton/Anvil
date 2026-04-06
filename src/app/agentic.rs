@@ -27,9 +27,6 @@ use crate::tooling::{PermissionClass, effective_permission_class};
 use super::policy::{OFFLINE_BLOCK_PAYLOAD, check_offline_blocked};
 use super::read_repeat_tracker::ReadRepeatAction;
 use super::read_transition_guard::ReadTransitionAction;
-use super::stagnation_state::{
-    PostMutationToolObservation, PostMutationTurnObservation, classify_post_mutation_turn,
-};
 use super::write_repeat_tracker::WriteRepeatAction;
 use super::{App, AppError, CompactInfo, format_tool_counts};
 
@@ -207,7 +204,11 @@ fn execute_parallel_group_standalone(
                                 status: ToolExecutionStatus::Failed,
                                 summary,
                                 payload,
-                                ..Default::default()
+                                artifacts: Vec::new(),
+                                elapsed_ms: 0,
+                                diff_summary: None,
+                                edit_detail: None,
+                                rolled_back: false,
                             }
                         });
                         // Update progress entry
@@ -245,9 +246,16 @@ fn execute_parallel_group_standalone(
                         results.push((
                             usize::MAX,
                             ToolExecutionResult {
+                                tool_call_id: String::new(),
+                                tool_name: String::new(),
                                 status: ToolExecutionStatus::Failed,
                                 summary: "parallel tool execution failed unexpectedly".to_string(),
-                                ..Default::default()
+                                payload: ToolExecutionPayload::None,
+                                artifacts: Vec::new(),
+                                elapsed_ms: 0,
+                                diff_summary: None,
+                                edit_detail: None,
+                                rolled_back: false,
                             },
                         ));
                     }
@@ -307,7 +315,11 @@ impl App {
                     payload: ToolExecutionPayload::Text(
                         "too many subagent calls in a single turn".to_string(),
                     ),
-                    ..Default::default()
+                    artifacts: Vec::new(),
+                    elapsed_ms: 0,
+                    diff_summary: None,
+                    edit_detail: None,
+                    rolled_back: false,
                 });
                 continue;
             }
@@ -477,16 +489,6 @@ impl App {
                 self.stagnation_state.begin_turn(&workset);
             }
 
-            // Issue #275 Task 2.2: Snapshot touched_files and edit_fail state before tool execution.
-            let pre_turn_touched_snapshot: HashSet<String> = self
-                .session
-                .working_memory
-                .touched_files
-                .iter()
-                .cloned()
-                .collect();
-            let pre_turn_last_failed_path = self.edit_fail_tracker.last_failed_path.clone();
-
             // Step 1: Extract and run sub-agent calls (IR3-001)
             let (agent_results, normal_calls) =
                 self.extract_and_run_subagent_calls(&current.tool_calls, provider_client);
@@ -560,91 +562,6 @@ impl App {
                     }
                 }
             }
-
-            // Issue #275 Task 2.2: Build PostMutationToolObservation list and turn_local_failed_paths.
-            let (post_mutation_tool_actions, turn_local_failed_paths) = {
-                let cwd = &self.config.paths.cwd;
-                let mut actions = Vec::new();
-                let mut failed_paths = Vec::new();
-
-                // File tools with single-path semantics (first artifact).
-                // CB-003: file.search uses multi-path (all artifacts) since it can match many files.
-                const SINGLE_PATH_TOOLS: &[&str] =
-                    &["file.read", "file.write", "file.edit", "file.edit_anchor"];
-                // File tools with multi-path semantics (all artifacts).
-                const MULTI_PATH_TOOLS: &[&str] = &["file.list", "file.search"];
-                // Tools whose target_paths should be empty (no file path).
-                const NO_PATH_TOOLS: &[&str] = &["web.fetch", "web.search", "shell.exec"];
-
-                // Helper: normalize an absolute artifact path to cwd-relative.
-                // CB-005: discard paths that are not under cwd (sandbox boundary).
-                let normalize_path = |a: &str| -> Option<String> {
-                    let p = std::path::Path::new(a);
-                    p.strip_prefix(cwd)
-                        .ok()
-                        .map(|rel| rel.to_string_lossy().into_owned())
-                };
-
-                for r in &results {
-                    let target_paths: Vec<String> =
-                        if SINGLE_PATH_TOOLS.contains(&r.tool_name.as_str()) {
-                            // CB-001: For file.edit/file.edit_anchor failures where artifacts
-                            // may be empty, fall back to edit_fail_tracker.last_failed_path
-                            // (already updated by record_tool_result before this point).
-                            let from_artifacts: Vec<String> = r
-                                .artifacts
-                                .first()
-                                .and_then(|a| normalize_path(a))
-                                .into_iter()
-                                .collect();
-                            if from_artifacts.is_empty()
-                                && r.status == ToolExecutionStatus::Failed
-                                && matches!(r.tool_name.as_str(), "file.edit" | "file.edit_anchor")
-                            {
-                                // record_tool_result() was called inside execute_structured_tool_calls,
-                                // so last_failed_path reflects this turn's failure.
-                                self.edit_fail_tracker
-                                    .last_failed_path
-                                    .as_deref()
-                                    .map(|p| vec![p.to_string()])
-                                    .unwrap_or_default()
-                            } else {
-                                from_artifacts
-                            }
-                        } else if MULTI_PATH_TOOLS.contains(&r.tool_name.as_str()) {
-                            r.artifacts
-                                .iter()
-                                .filter_map(|a| normalize_path(a))
-                                .collect()
-                        } else if NO_PATH_TOOLS.contains(&r.tool_name.as_str()) {
-                            vec![]
-                        } else {
-                            // Unknown tools: best-effort single-path from first artifact.
-                            r.artifacts
-                                .first()
-                                .and_then(|a| normalize_path(a))
-                                .into_iter()
-                                .collect()
-                        };
-
-                    // Collect turn-local failed paths for file tools.
-                    if r.status == ToolExecutionStatus::Failed
-                        && (SINGLE_PATH_TOOLS.contains(&r.tool_name.as_str())
-                            || MULTI_PATH_TOOLS.contains(&r.tool_name.as_str()))
-                    {
-                        failed_paths.extend(target_paths.iter().cloned());
-                    }
-
-                    actions.push(PostMutationToolObservation {
-                        tool_name: r.tool_name.clone(),
-                        target_paths,
-                        cache_hit_count: r.cache_hit_count,
-                        status: r.status.clone(),
-                    });
-                }
-
-                (actions, failed_paths)
-            };
 
             let tool_log_views: Vec<ToolLogView> = results
                 .iter()
@@ -847,45 +764,6 @@ impl App {
                     "stagnation detected; forced_mode_active=true"
                 );
             }
-
-            // Issue #275 Task 2.2: Post-mutation turn classification (telemetry only).
-            {
-                let is_post_first_mutation =
-                    self.agent_telemetry.first_mutation_event_turn.is_some();
-                if is_post_first_mutation {
-                    let obs = PostMutationTurnObservation {
-                        pre_turn_touched_snapshot,
-                        pre_turn_last_failed_path,
-                        turn_local_failed_paths,
-                        tool_actions: post_mutation_tool_actions,
-                        has_anvil_final: anvil_final_seen,
-                        tool_call_count: results.len(),
-                    };
-                    let dominant_class = classify_post_mutation_turn(&obs);
-                    self.agent_telemetry
-                        .post_mutation
-                        .record_class(dominant_class);
-
-                    // Update post_mutation_touched_paths on the session record
-                    // (capped at 1000 entries to bound memory).
-                    let paths = &mut self.session.post_mutation_touched_paths;
-                    for action in &obs.tool_actions {
-                        for path in &action.target_paths {
-                            if paths.contains(path) {
-                                continue;
-                            }
-                            if paths.len() < 1000 {
-                                paths.insert(path.clone());
-                            } else {
-                                self.session.post_mutation_touched_paths_overflowed = true;
-                            }
-                        }
-                    }
-                    self.agent_telemetry.post_mutation.new_path_count =
-                        self.session.post_mutation_touched_paths.len() as u32;
-                }
-            }
-
             log_turn_summary(&TurnSummary {
                 turn: self.session_stats.total_turns,
                 max_turns: max_iterations as u32,
@@ -1081,7 +959,11 @@ impl App {
                         status: ToolExecutionStatus::Failed,
                         summary,
                         payload: ToolExecutionPayload::Text(OFFLINE_BLOCK_PAYLOAD.to_string()),
-                        ..Default::default()
+                        artifacts: Vec::new(),
+                        elapsed_ms: 0,
+                        diff_summary: None,
+                        edit_detail: None,
+                        rolled_back: false,
                     },
                 ));
                 continue;
@@ -1172,10 +1054,16 @@ impl App {
         let result = executor
             .execute(request)
             .unwrap_or_else(|err| ToolExecutionResult {
+                tool_call_id: String::new(),
+                tool_name: String::new(),
                 status: ToolExecutionStatus::Failed,
                 summary: err.to_string(),
                 payload: ToolExecutionPayload::Text(err.to_string()),
-                ..Default::default()
+                artifacts: Vec::new(),
+                elapsed_ms: 0,
+                diff_summary: None,
+                edit_detail: None,
+                rolled_back: false,
             });
 
         // Remove checkpoint if tool execution failed.
@@ -1206,7 +1094,12 @@ impl App {
                 tool_name,
                 status: ToolExecutionStatus::Failed,
                 summary: "MCP manager not available".to_string(),
-                ..Default::default()
+                payload: ToolExecutionPayload::None,
+                artifacts: Vec::new(),
+                elapsed_ms: 0,
+                diff_summary: None,
+                edit_detail: None,
+                rolled_back: false,
             };
         };
 
@@ -1230,8 +1123,11 @@ impl App {
             status,
             summary,
             payload,
+            artifacts: Vec::new(),
             elapsed_ms: started.elapsed().as_millis(),
-            ..Default::default()
+            diff_summary: None,
+            edit_detail: None,
+            rolled_back: false,
         }
     }
 
@@ -1287,7 +1183,12 @@ impl App {
                                     tool_name: request.spec.name.clone(),
                                     status: ToolExecutionStatus::Failed,
                                     summary: format!("blocked by hook: {reason}"),
-                                    ..Default::default()
+                                    payload: crate::tooling::ToolExecutionPayload::None,
+                                    artifacts: Vec::new(),
+                                    elapsed_ms: 0,
+                                    diff_summary: None,
+                                    edit_detail: None,
+                                    rolled_back: false,
                                 },
                             ));
                         }
@@ -1344,9 +1245,14 @@ impl App {
             | super::loop_detector::LoopAction::StrongWarn(msg) => Some(ToolExecutionResult {
                 tool_call_id: "loop_detector_warning".to_string(),
                 tool_name: "system.loop_detector".to_string(),
+                status: ToolExecutionStatus::Completed,
                 summary: msg.clone(),
                 payload: ToolExecutionPayload::Text(msg.clone()),
-                ..Default::default()
+                artifacts: vec![],
+                elapsed_ms: 0,
+                diff_summary: None,
+                edit_detail: None,
+                rolled_back: false,
             }),
             _ => None,
         };
@@ -1521,24 +1427,13 @@ impl App {
             } else {
                 None
             };
-            // Issue #276: skip read guards for recovery reads
-            let is_recovery_read = result.tool_name == "file.read"
-                && result.status == ToolExecutionStatus::Completed
-                && result.artifacts.first().is_some_and(|art| {
-                    let normalized = normalize_for_recovery_compare(art, &self.config.paths.cwd);
-                    self.same_file_recovery_state
-                        .is_pending_recovery_read_for(&normalized)
-                });
-
-            if !is_recovery_read {
-                let transition_action = self.read_transition_guard.record_tool_call_ex(
-                    &result.tool_name,
-                    success,
-                    shell_cmd.as_deref(),
-                );
-                if let ReadTransitionAction::Inject(msg) = transition_action {
-                    read_transition_message = Some(msg);
-                }
+            let transition_action = self.read_transition_guard.record_tool_call_ex(
+                &result.tool_name,
+                success,
+                shell_cmd.as_deref(),
+            );
+            if let ReadTransitionAction::Inject(msg) = transition_action {
+                read_transition_message = Some(msg);
             }
 
             // Emit folded tool result to stderr for interactive sessions
@@ -1598,9 +1493,14 @@ impl App {
             let transition_result = ToolExecutionResult {
                 tool_call_id: "read_transition_guard".to_string(),
                 tool_name: "system.read_guard".to_string(),
+                status: ToolExecutionStatus::Completed,
                 summary: msg.clone(),
                 payload: ToolExecutionPayload::Text(msg.clone()),
-                ..Default::default()
+                artifacts: vec![],
+                elapsed_ms: 0,
+                diff_summary: None,
+                edit_detail: None,
+                rolled_back: false,
             };
             self.record_tool_result(&transition_result);
             results.push(transition_result);
@@ -1623,9 +1523,14 @@ impl App {
                 let transition_result = ToolExecutionResult {
                     tool_call_id: "phase_estimator_transition".to_string(),
                     tool_name: "system.phase_estimator".to_string(),
+                    status: ToolExecutionStatus::Completed,
                     summary: msg.clone(),
                     payload: ToolExecutionPayload::Text(msg),
-                    ..Default::default()
+                    artifacts: vec![],
+                    elapsed_ms: 0,
+                    diff_summary: None,
+                    edit_detail: None,
+                    rolled_back: false,
                 };
                 self.record_tool_result(&transition_result);
                 results.push(transition_result);
@@ -1691,121 +1596,11 @@ impl App {
             }
         }
 
-        // Issue #276: SameFileRecoveryState integration
-        if (result.tool_name == "file.edit" || result.tool_name == "file.edit_anchor")
-            && result.status == ToolExecutionStatus::Failed
-            && let Some(ref attempted) = result.attempted_path
-        {
-            let norm = attempted.trim_start_matches("./").to_string();
-            let kind = result
-                .edit_failure_kind
-                .unwrap_or(crate::tooling::EditFailureKind::FinalNotFound);
-            // Update recovery telemetry: failure-kind counters
-            match kind {
-                crate::tooling::EditFailureKind::FinalNotFound => {
-                    self.agent_telemetry
-                        .recovery_telemetry
-                        .edit_failed_final_not_found += 1;
-                }
-                crate::tooling::EditFailureKind::FinalMultipleMatches => {
-                    self.agent_telemetry
-                        .recovery_telemetry
-                        .edit_failed_final_multiple_matches += 1;
-                }
-                crate::tooling::EditFailureKind::IdenticalContent => {
-                    self.agent_telemetry
-                        .recovery_telemetry
-                        .edit_failed_identical_content += 1;
-                }
-                crate::tooling::EditFailureKind::IoFailure => {
-                    self.agent_telemetry
-                        .recovery_telemetry
-                        .edit_failed_io_failure += 1;
-                }
-            }
-            let new_state = self
-                .same_file_recovery_state
-                .clone()
-                .on_edit_failure(norm, kind);
-            // Issue #276: update outcome counters based on actual state transition,
-            // not just the failure kind. A FinalNotFound during PendingRecoveryRetry
-            // transitions to EscalatedToWriteFallback, not PendingRecoveryRead.
-            match &new_state {
-                crate::app::same_file_recovery::SameFileRecoveryState::PendingRecoveryRead(_) => {
-                    self.agent_telemetry
-                        .recovery_telemetry
-                        .recovery_read_triggered += 1;
-                }
-                crate::app::same_file_recovery::SameFileRecoveryState::EscalatedToWriteFallback(
-                    _,
-                ) => {
-                    self.agent_telemetry
-                        .recovery_telemetry
-                        .recovery_escalated_to_write += 1;
-                }
-                crate::app::same_file_recovery::SameFileRecoveryState::Abandoned => {
-                    self.agent_telemetry.recovery_telemetry.recovery_abandoned += 1;
-                }
-                _ => {}
-            }
-            self.same_file_recovery_state = new_state;
-        }
-        if (result.tool_name == "file.edit" || result.tool_name == "file.edit_anchor")
-            && result.status == ToolExecutionStatus::Completed
-            && let Some(ref attempted) = result.attempted_path
-        {
-            let norm = attempted.trim_start_matches("./").to_string();
-            let new_state = self.same_file_recovery_state.clone().on_edit_success(&norm);
-            if matches!(
-                new_state,
-                crate::app::same_file_recovery::SameFileRecoveryState::Resolved
-            ) {
-                self.agent_telemetry
-                    .recovery_telemetry
-                    .recovery_retry_succeeded += 1;
-            }
-            self.same_file_recovery_state = new_state;
-        }
-
-        // Issue #276: recovery read tracking
-        if result.tool_name == "file.read"
-            && result.status == ToolExecutionStatus::Completed
-            && let Some(artifact_path) = result.artifacts.first()
-        {
-            let normalized = normalize_for_recovery_compare(artifact_path, &self.config.paths.cwd);
-            if self
-                .same_file_recovery_state
-                .is_pending_recovery_read_for(&normalized)
-            {
-                self.agent_telemetry
-                    .recovery_telemetry
-                    .recovery_read_succeeded += 1;
-                self.same_file_recovery_state = self
-                    .same_file_recovery_state
-                    .clone()
-                    .on_read_completed(&normalized);
-            }
-        }
-        if result.tool_name == "file.read" && result.status == ToolExecutionStatus::Failed {
-            self.same_file_recovery_state = self.same_file_recovery_state.clone().on_read_failed();
-        }
-
-        // Issue #276: reset terminal states
-        if self.same_file_recovery_state.should_reset() {
-            self.same_file_recovery_state =
-                crate::app::same_file_recovery::SameFileRecoveryState::Normal;
-        }
-
         // Edit fail tracker: track consecutive file.edit/file.edit_anchor failures (Issue #143, #158)
         let mut edit_hint: Option<String> = None;
         if result.tool_name == "file.edit" || result.tool_name == "file.edit_anchor" {
             if result.status == ToolExecutionStatus::Failed {
-                // Issue #276: prefer attempted_path, fall back to extract_edit_path_from_summary
-                let raw_path_opt = result
-                    .attempted_path
-                    .clone()
-                    .or_else(|| extract_edit_path_from_summary(&result.summary));
-                if let Some(raw_path) = raw_path_opt {
+                if let Some(raw_path) = extract_edit_path_from_summary(&result.summary) {
                     let path = resolve_edit_tracker_path(&raw_path);
                     let action = self.edit_fail_tracker.record_failure(&path);
                     let count = self.edit_fail_tracker.failure_count(&path);
@@ -1886,18 +1681,9 @@ impl App {
         let write_hint = self.update_write_trackers(result);
 
         // Read repeat tracker: track repeated file.read calls (Issue #185)
-        // Issue #276: skip read repeat tracking for recovery reads
         let mut read_hint: Option<String> = None;
-        let is_recovery_read_for_tracker = result.tool_name == "file.read"
-            && result.status == ToolExecutionStatus::Completed
-            && result.artifacts.first().is_some_and(|art| {
-                let normalized = normalize_for_recovery_compare(art, &self.config.paths.cwd);
-                self.same_file_recovery_state
-                    .is_pending_recovery_read_for(&normalized)
-            });
         if result.tool_name == "file.read"
             && result.status == ToolExecutionStatus::Completed
-            && !is_recovery_read_for_tracker
             && let Some(path) = result.artifacts.first()
         {
             let action = self.read_repeat_tracker.record_read(path);
@@ -2491,21 +2277,13 @@ fn build_failed_result(
         tool_name: call.tool_name.clone(),
         status: crate::tooling::ToolExecutionStatus::Failed,
         summary,
-        ..Default::default()
+        payload: crate::tooling::ToolExecutionPayload::None,
+        artifacts: Vec::new(),
+        elapsed_ms: 0,
+        diff_summary: None,
+        edit_detail: None,
+        rolled_back: false,
     }
-}
-
-/// Normalize a path (possibly absolute) to a cwd-relative form for recovery state comparison.
-/// Issue #276: file.read artifacts are absolute paths; attempted_path is relative.
-/// Both must be normalized to the same form before comparing.
-fn normalize_for_recovery_compare(path: &str, cwd: &std::path::Path) -> String {
-    let p = std::path::Path::new(path);
-    if p.is_absolute()
-        && let Ok(rel) = p.strip_prefix(cwd)
-    {
-        return rel.to_string_lossy().into_owned();
-    }
-    path.trim_start_matches("./").to_string()
 }
 
 /// Produce a human-readable summary of a tool call for the approval prompt.
@@ -2754,10 +2532,14 @@ mod trust_tests {
         let result = ToolExecutionResult {
             tool_call_id: "call_001".to_string(),
             tool_name: "file.read".to_string(),
+            status: ToolExecutionStatus::Completed,
             summary: "read ok".to_string(),
             payload: ToolExecutionPayload::Text("A".repeat(3_000)),
             artifacts: vec!["./src/main.rs".to_string()],
-            ..Default::default()
+            elapsed_ms: 0,
+            diff_summary: None,
+            edit_detail: None,
+            rolled_back: false,
         };
 
         let formatted = format_tool_result_message(&result, 8_000);

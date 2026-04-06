@@ -110,7 +110,6 @@ src/
 │   ├── cli.rs           # CLI入力ループ
 │   ├── context.rs       # コンテキスト注入（@file展開・サンドボックス検証）
 │   ├── edit_fail_tracker.rs # 連続file.edit失敗の検出・回復ヒント注入
-│   ├── same_file_recovery.rs  # SameFileRecoveryState: 同一ファイル edit 失敗後の回復ステートマシン（Issue #276）
 │   ├── execution_plan.rs    # プラン→実行モード（ANVIL_PLAN検出・チェックリスト管理・ANVIL_FINAL抑制）
 │   ├── alternating_loop_detector.rs # AlternatingLoopDetector（交互/循環パターン検出）
 │   ├── loop_detector.rs # ループ検出（リングバッファ・段階的対応）
