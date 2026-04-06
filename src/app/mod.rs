@@ -17,6 +17,7 @@ pub mod policy;
 pub(crate) mod read_repeat_tracker;
 pub mod read_transition_guard;
 pub mod render;
+pub(crate) mod same_file_recovery;
 pub mod stagnation_state;
 pub(crate) mod write_fail_tracker;
 pub(crate) mod write_repeat_tracker;
@@ -283,6 +284,8 @@ pub struct App {
     execution_plan: crate::contracts::ExecutionPlan,
     /// Agent telemetry for session-level metrics (Issue #255).
     agent_telemetry: crate::contracts::AgentTelemetry,
+    /// Same-file recovery state machine (Issue #276).
+    pub(crate) same_file_recovery_state: same_file_recovery::SameFileRecoveryState,
     /// Per-turn stagnation telemetry (Issue #263).
     stagnation_state: stagnation_state::StagnationState,
     /// Whether forced mode is active for the current turn (Issue #263).
@@ -618,6 +621,7 @@ impl App {
             last_compact_info: None,
             execution_plan: crate::contracts::ExecutionPlan::default(),
             agent_telemetry: crate::contracts::AgentTelemetry::new(),
+            same_file_recovery_state: same_file_recovery::SameFileRecoveryState::Normal,
             stagnation_state: stagnation_state::StagnationState::new(),
             forced_mode_active: false,
         })
@@ -897,11 +901,18 @@ impl App {
             );
         }
 
+        // Issue #277: Calculate plan divergence before writing artifact.
+        let mut tel = self.agent_telemetry.clone();
+        if !self.execution_plan.is_empty() {
+            let divergence = crate::app::execution_plan::calculate_plan_divergence(
+                &self.execution_plan,
+                tel.mutation_path_attribution(),
+            );
+            tel.plan_order_vs_actual_mutation_divergence = Some(divergence);
+        }
+
         // Issue #271: Write telemetry artifact (opt-in via ANVIL_TELEMETRY_DIR).
-        if let Err(err) = self
-            .agent_telemetry
-            .write_artifact(&self.session.metadata.session_id)
-        {
+        if let Err(err) = tel.write_artifact(&self.session.metadata.session_id) {
             tracing::warn!("telemetry artifact write failed: {err}");
         }
     }

@@ -639,6 +639,26 @@ pub enum EditFallbackStage {
     Anchor,
 }
 
+/// Classifies the terminal failure kind of a file.edit operation.
+/// Used by SameFileRecoveryState to decide recovery strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditFailureKind {
+    /// All fallback stages exhausted; old_string not found in file.
+    FinalNotFound,
+    /// Old_string matches multiple positions; unsafe to edit.
+    FinalMultipleMatches,
+    /// old_string == new_string; no change needed.
+    IdenticalContent,
+    /// File I/O error.
+    IoFailure,
+}
+
+/// Detail from a file.read execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadResultDetail {
+    pub cache_hit: bool,
+}
+
 /// file.edit-specific result detail (ISP: single field).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EditResultDetail {
@@ -664,6 +684,12 @@ pub struct ToolExecutionResult {
     /// Cache hit count from FileReadCache (Issue #275).
     /// `None` for non-file.read tools or initial read. `Some(n)` where n >= 2 = true cache hit.
     pub cache_hit_count: Option<usize>,
+    /// Classified failure kind for file.edit operations (Issue #276).
+    pub edit_failure_kind: Option<EditFailureKind>,
+    /// The file path attempted by this tool (file.edit/file.read). Issue #276.
+    pub attempted_path: Option<String>,
+    /// Detail from file.read execution (Issue #276).
+    pub read_detail: Option<ReadResultDetail>,
 }
 
 impl ToolExecutionResult {
@@ -1016,6 +1042,10 @@ pub enum ToolRuntimeError {
         line_count: usize,
         threshold: usize,
     },
+    EditMultipleMatches {
+        message: String,
+        context_snippet: String,
+    },
 }
 
 impl ToolRuntimeError {
@@ -1035,8 +1065,24 @@ impl ToolRuntimeError {
         }
     }
 
+    /// Returns `true` for fallback-eligible edit errors: both `EditNotFound` and
+    /// `EditMultipleMatches`. These are the variants where the next fallback level
+    /// (trailing-ws, anchor) should be attempted.
     pub fn is_edit_not_found(&self) -> bool {
-        matches!(self, Self::EditNotFound { .. })
+        matches!(
+            self,
+            Self::EditNotFound { .. } | Self::EditMultipleMatches { .. }
+        )
+    }
+
+    /// Convert to `EditFailureKind` based on variant (structural, no string matching).
+    pub fn to_edit_failure_kind(&self) -> EditFailureKind {
+        match self {
+            Self::EditMultipleMatches { .. } => EditFailureKind::FinalMultipleMatches,
+            Self::EditNotFound { .. } => EditFailureKind::FinalNotFound,
+            Self::Io(_) => EditFailureKind::IoFailure,
+            _ => EditFailureKind::FinalNotFound,
+        }
     }
 }
 
@@ -1052,6 +1098,7 @@ impl Display for ToolRuntimeError {
                  or use web.fetch to access specific URLs directly."
             ),
             Self::EditNotFound { message, .. } => write!(f, "{message}"),
+            Self::EditMultipleMatches { message, .. } => write!(f, "{message}"),
             Self::LargeFileBlocked {
                 path,
                 line_count,
@@ -1352,15 +1399,17 @@ impl LocalToolExecutor {
                 hit.content.len()
             );
             let payload = format!("{}{}", header, hit.content);
-            let mut result = build_completed_result(
+            let mut res = build_completed_result(
                 request,
                 path.to_string(),
                 ToolExecutionPayload::Text(payload),
                 vec![resolved.display().to_string()],
                 started,
             );
-            result.cache_hit_count = Some(hit.hit_count);
-            return Ok(result);
+            res.cache_hit_count = Some(hit.hit_count);
+            res.read_detail = Some(ReadResultDetail { cache_hit: true });
+            res.attempted_path = Some(path.to_string());
+            return Ok(res);
         }
         // Mutex poison → fall through to normal read (best-effort)
 
@@ -1388,13 +1437,16 @@ impl LocalToolExecutor {
             cache.record(&resolved, content.clone());
         }
 
-        Ok(build_completed_result(
+        let mut res = build_completed_result(
             request,
             path.to_string(),
             ToolExecutionPayload::Text(content),
             vec![resolved.display().to_string()],
             started,
-        ))
+        );
+        res.read_detail = Some(ReadResultDetail { cache_hit: false });
+        res.attempted_path = Some(path.to_string());
+        Ok(res)
     }
 
     fn execute_image_read(
@@ -1552,10 +1604,14 @@ impl LocalToolExecutor {
             )));
         }
         if count > 1 {
-            return Err(ToolRuntimeError::edit_not_found(format!(
-                "file.edit: old_string found {count} times in {path}. \
-                 Include more surrounding context to make the match unique."
-            )));
+            return Err(ToolRuntimeError::EditMultipleMatches {
+                message: format!(
+                    "file.edit: old_string found {count} times in {path}. \
+                     Include more surrounding context to make the match unique."
+                ),
+                context_snippet: build_file_context_snippet(&content, old_string)
+                    .unwrap_or_default(),
+            });
         }
         let new_content = content.replacen(old_string, new_string, 1);
         fs::write(&resolved, &new_content).map_err(|err| {
@@ -1640,6 +1696,9 @@ impl LocalToolExecutor {
         new_string: &str,
         started: Instant,
     ) -> Result<ToolExecutionResult, ToolRuntimeError> {
+        // CB-003: path validation (resolve_path) happens inside execute_file_edit,
+        // so IdenticalContent check with attempted_path is safe after that point.
+
         // Level 1: strict replace
         let original_err =
             match self.execute_file_edit(request, path, old_string, new_string, started) {
@@ -1647,22 +1706,50 @@ impl LocalToolExecutor {
                     result.edit_detail = Some(EditResultDetail {
                         fallback_stage: EditFallbackStage::Strict,
                     });
+                    result.attempted_path = Some(path.to_string());
                     return Ok(result);
+                }
+                // IdenticalContent: resolve_path already validated inside execute_file_edit,
+                // so the Io error for identical content is safe to convert here.
+                Err(ToolRuntimeError::Io(ref msg))
+                    if msg.contains("old_string and new_string are identical") =>
+                {
+                    let normalized_path = path.trim_start_matches("./").to_string();
+                    return Ok(ToolExecutionResult {
+                        tool_call_id: request.tool_call_id.clone(),
+                        tool_name: request.spec.name.clone(),
+                        status: ToolExecutionStatus::Failed,
+                        summary: msg.clone(),
+                        payload: ToolExecutionPayload::Text(msg.clone()),
+                        artifacts: Vec::new(),
+                        elapsed_ms: started.elapsed().as_millis(),
+                        diff_summary: None,
+                        edit_detail: None,
+                        rolled_back: false,
+                        cache_hit_count: None,
+                        edit_failure_kind: Some(EditFailureKind::IdenticalContent),
+                        attempted_path: Some(normalized_path),
+                        read_detail: None,
+                    });
                 }
                 Err(err) if !err.is_edit_not_found() => return Err(err),
                 Err(err) => err,
             };
 
         // Level 2: trailing whitespace normalized
-        if let Ok(mut result) =
-            self.execute_file_edit_trailing_ws(request, path, old_string, new_string, started)
+        let trailing_err = match self
+            .execute_file_edit_trailing_ws(request, path, old_string, new_string, started)
         {
-            result.edit_detail = Some(EditResultDetail {
-                fallback_stage: EditFallbackStage::TrailingWs,
-            });
-            result.summary = format!("{} (trailing-ws fallback)", result.summary);
-            return Ok(result);
-        }
+            Ok(mut result) => {
+                result.edit_detail = Some(EditResultDetail {
+                    fallback_stage: EditFallbackStage::TrailingWs,
+                });
+                result.summary = format!("{} (trailing-ws fallback)", result.summary);
+                result.attempted_path = Some(path.to_string());
+                return Ok(result);
+            }
+            Err(err) => Some(err),
+        };
 
         // Level 3: anchor-based (indent-normalized)
         let params = AnchorEditParams {
@@ -1675,10 +1762,43 @@ impl LocalToolExecutor {
                     fallback_stage: EditFallbackStage::Anchor,
                 });
                 result.summary = format!("{} (anchor fallback)", result.summary);
+                result.attempted_path = Some(path.to_string());
                 Ok(result)
             }
-            // All levels failed — enrich error with file context
-            Err(_) => Err(self.build_edit_not_found_with_context(path, old_string, &original_err)),
+            // All levels failed — determine most specific failure kind (CB-002)
+            Err(anchor_err) => {
+                // Prefer EditMultipleMatches over EditNotFound
+                let most_specific_kind =
+                    if matches!(original_err, ToolRuntimeError::EditMultipleMatches { .. })
+                        || trailing_err.as_ref().is_some_and(|e| {
+                            matches!(e, ToolRuntimeError::EditMultipleMatches { .. })
+                        })
+                        || matches!(anchor_err, ToolRuntimeError::EditMultipleMatches { .. })
+                    {
+                        EditFailureKind::FinalMultipleMatches
+                    } else {
+                        original_err.to_edit_failure_kind()
+                    };
+                let enriched =
+                    self.build_edit_not_found_with_context(path, old_string, &original_err);
+                let msg = enriched.to_string();
+                Ok(ToolExecutionResult {
+                    tool_call_id: request.tool_call_id.clone(),
+                    tool_name: request.spec.name.clone(),
+                    status: ToolExecutionStatus::Failed,
+                    summary: msg.clone(),
+                    payload: ToolExecutionPayload::Text(msg),
+                    artifacts: Vec::new(),
+                    elapsed_ms: started.elapsed().as_millis(),
+                    diff_summary: None,
+                    edit_detail: None,
+                    rolled_back: false,
+                    cache_hit_count: None,
+                    edit_failure_kind: Some(most_specific_kind),
+                    attempted_path: Some(path.to_string()),
+                    read_detail: None,
+                })
+            }
         }
     }
 
@@ -1719,15 +1839,20 @@ impl LocalToolExecutor {
             }
         }
 
-        if match_positions.len() != 1 {
+        if match_positions.is_empty() {
             return Err(ToolRuntimeError::edit_not_found(format!(
-                "file.edit: trailing-ws-normalized old_string {} in {path}",
-                if match_positions.is_empty() {
-                    "not found".to_string()
-                } else {
-                    format!("found {} times", match_positions.len())
-                }
+                "file.edit: trailing-ws-normalized old_string not found in {path}"
             )));
+        }
+        if match_positions.len() > 1 {
+            return Err(ToolRuntimeError::EditMultipleMatches {
+                message: format!(
+                    "file.edit: trailing-ws-normalized old_string found {} times in {path}",
+                    match_positions.len()
+                ),
+                context_snippet: build_file_context_snippet(&content, old_string)
+                    .unwrap_or_default(),
+            });
         }
 
         let match_start = match_positions[0];
@@ -2506,6 +2631,11 @@ fn log_file_edit_detail(result: &ToolExecutionResult) {
             "file.edit success"
         );
     }
+}
+
+/// Build a context snippet from file content for EditMultipleMatches errors.
+fn build_file_context_snippet(content: &str, old_string: &str) -> Option<String> {
+    extract_edit_context(content, old_string, 5)
 }
 
 /// Build a [`ToolExecutionResult`] with `Completed` status.

@@ -4,9 +4,11 @@
 //! persistent session state.  They are intentionally plain data with
 //! `Serialize`/`Deserialize` support.
 
+pub(crate) mod file_role;
 pub mod tokens;
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 // ---------------------------------------------------------------------------
 // Sub-agent payload types (Issue #129)
@@ -238,6 +240,29 @@ impl PostMutationTelemetry {
 // Agent telemetry (Issue #255: Stage 0 observability)
 // ---------------------------------------------------------------------------
 
+/// Telemetry for same-file edit recovery (Issue #276).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RecoveryTelemetry {
+    #[serde(default)]
+    pub edit_failed_final_not_found: u32,
+    #[serde(default)]
+    pub edit_failed_final_multiple_matches: u32,
+    #[serde(default)]
+    pub edit_failed_identical_content: u32,
+    #[serde(default)]
+    pub edit_failed_io_failure: u32,
+    #[serde(default)]
+    pub recovery_read_triggered: u32,
+    #[serde(default)]
+    pub recovery_read_succeeded: u32,
+    #[serde(default)]
+    pub recovery_retry_succeeded: u32,
+    #[serde(default)]
+    pub recovery_escalated_to_write: u32,
+    #[serde(default)]
+    pub recovery_abandoned: u32,
+}
+
 /// Telemetry counters for the agentic session.
 ///
 /// Tracks key metrics for evaluating agent loop quality:
@@ -317,6 +342,45 @@ pub struct AgentTelemetry {
     /// Post-mutation stall classification telemetry (Issue #275).
     #[serde(default)]
     pub post_mutation: PostMutationTelemetry,
+
+    /// Same-file edit recovery telemetry (Issue #276).
+    #[serde(default)]
+    pub recovery_telemetry: RecoveryTelemetry,
+
+    // -----------------------------------------------------------------------
+    // Issue #277: file-role telemetry fields
+    // -----------------------------------------------------------------------
+    /// File role of the first successful mutation (any role).
+    #[serde(default)]
+    pub first_successful_mutation_file_role: Option<String>,
+    /// File role of the first non-test mutation.
+    #[serde(default)]
+    pub first_non_test_mutation_file_role: Option<String>,
+    /// Sequence of file roles for each mutation (capped at 200).
+    #[serde(default)]
+    pub mutation_role_sequence: Vec<String>,
+    /// Number of peripheral (non-core_impl) mutations before the first core_impl mutation.
+    #[serde(default)]
+    pub peripheral_mutation_before_core_count: u32,
+    /// Number of role transitions where the new role was already seen (rework indicator).
+    #[serde(default)]
+    pub role_transition_rework_count: u32,
+    /// Number of unique files touched before the first core_impl mutation.
+    #[serde(default)]
+    pub files_touched_before_first_core_mutation: u32,
+    /// Plan order vs actual mutation divergence (inversion count).
+    #[serde(default)]
+    pub plan_order_vs_actual_mutation_divergence: Option<u32>,
+
+    // Internal tracking (not serialized)
+    #[serde(skip)]
+    core_mutation_seen: bool,
+    #[serde(skip)]
+    pre_core_touched_files: HashSet<String>,
+    #[serde(skip)]
+    seen_roles: HashSet<&'static str>,
+    #[serde(skip)]
+    mutation_path_attribution: Vec<(String, Option<usize>)>,
 }
 
 impl AgentTelemetry {
@@ -402,6 +466,63 @@ impl AgentTelemetry {
         }
     }
 
+    /// Record a file-role mutation for telemetry (Issue #277).
+    ///
+    /// Classifies the given cwd-relative path into a role and updates all
+    /// file-role telemetry fields (first mutation role, sequence, rework, etc.).
+    pub fn record_file_role_mutation(&mut self, path: &str) {
+        use crate::contracts::file_role::classify_file_role;
+        let role = classify_file_role(path);
+
+        // Convert role to String once; clone only for conditional first-* fields.
+        let role_string = role.to_string();
+        if self.first_successful_mutation_file_role.is_none() {
+            self.first_successful_mutation_file_role = Some(role_string.clone());
+        }
+        if role != "test" && self.first_non_test_mutation_file_role.is_none() {
+            self.first_non_test_mutation_file_role = Some(role_string.clone());
+        }
+
+        // Sequence push with 200-cap (consumes role_string)
+        self.mutation_role_sequence.push(role_string);
+        if self.mutation_role_sequence.len() > 200 {
+            self.mutation_role_sequence.remove(0);
+        }
+
+        // Rework count: prev != current AND current has been seen before
+        let prev_role = self
+            .mutation_role_sequence
+            .iter()
+            .rev()
+            .nth(1)
+            .map(|s| s.as_str());
+        if prev_role != Some(role) && self.seen_roles.contains(role) {
+            self.role_transition_rework_count += 1;
+        }
+        // seen_roles uses &'static str (classify_file_role always returns &'static str)
+        self.seen_roles.insert(role);
+
+        // Peripheral / unique files before first core mutation
+        if !self.core_mutation_seen {
+            if role == "core_impl" {
+                self.core_mutation_seen = true;
+            } else {
+                self.peripheral_mutation_before_core_count += 1;
+                self.pre_core_touched_files.insert(path.to_string());
+                self.files_touched_before_first_core_mutation =
+                    self.pre_core_touched_files.len() as u32;
+            }
+        }
+
+        self.mutation_path_attribution
+            .push((path.to_string(), None));
+    }
+
+    /// Access the internal mutation path attribution list (for plan divergence calculation).
+    pub(crate) fn mutation_path_attribution(&self) -> &[(String, Option<usize>)] {
+        &self.mutation_path_attribution
+    }
+
     /// Record an ANVIL_FINAL suppression with remaining core targets.
     pub fn record_final_suppressed_with_remaining_targets(&mut self) {
         self.final_suppressed_with_remaining_targets_count += 1;
@@ -485,7 +606,7 @@ impl AgentTelemetry {
             .unwrap_or_else(|| "none".to_string());
 
         let payload = serde_json::json!({
-            "schema_version": "2",
+            "schema_version": "3",
             "session_id": session_id,
             "completion_kind": completion,
             "premature_final_count": self.premature_final_count,
@@ -513,6 +634,15 @@ impl AgentTelemetry {
             "first_mutation_event_tool": self.first_mutation_event_tool,
             "first_mutation_event_semantic_basis": "runtime_lower_bound",
             "post_mutation": self.post_mutation,
+            "recovery_telemetry": serde_json::to_value(&self.recovery_telemetry)
+                .unwrap_or(serde_json::Value::Null),
+            "first_successful_mutation_file_role": self.first_successful_mutation_file_role,
+            "first_non_test_mutation_file_role": self.first_non_test_mutation_file_role,
+            "mutation_role_sequence": self.mutation_role_sequence,
+            "peripheral_mutation_before_core_count": self.peripheral_mutation_before_core_count,
+            "role_transition_rework_count": self.role_transition_rework_count,
+            "files_touched_before_first_core_mutation": self.files_touched_before_first_core_mutation,
+            "plan_order_vs_actual_mutation_divergence": self.plan_order_vs_actual_mutation_divergence,
         });
 
         let json_bytes = serde_json::to_vec_pretty(&payload)?;
