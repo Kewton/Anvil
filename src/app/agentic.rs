@@ -537,16 +537,28 @@ impl App {
             let (turn_mutations, turn_items_advanced) = self.update_plan_from_results(&results);
 
             // Issue #269 Phase 3: record each successful mutation for stagnation tracking.
+            // Issue #273: Also record first mutation event telemetry here so plan-free runs
+            // (where update_plan_from_results returns 0) are also captured.
+            // tool_name is always from MUTATION_TOOLS (allowlisted) due to the .contains() guard.
             {
-                let mutation_tools = ["file.write", "file.edit", "file.edit_anchor"];
+                // Compute elapsed once per turn (same value for all mutations in this batch).
+                let elapsed_s = self
+                    .session_stats
+                    .session_start
+                    .map(|s| s.elapsed().as_secs_f64());
                 for r in &results {
-                    if mutation_tools.contains(&r.tool_name.as_str())
+                    if crate::app::MUTATION_TOOLS.contains(&r.tool_name.as_str())
                         && r.status == crate::tooling::ToolExecutionStatus::Completed
                         && !r.rolled_back
                         && !r.summary.is_empty()
                         && !r.summary.contains("(no changes)")
                     {
                         self.stagnation_state.record_mutation(&r.summary);
+                        self.agent_telemetry.record_mutation_turn(
+                            self.session_stats.total_turns,
+                            elapsed_s,
+                            &r.tool_name, // already validated by MUTATION_TOOLS.contains()
+                        );
                     }
                 }
             }
@@ -741,12 +753,6 @@ impl App {
                 guidance_chars_this_turn as u32,
                 workset_size_this_turn as u32,
             );
-            // Issue #271: Track last mutation turn for late-mutation detection.
-            if turn_mutations > 0 {
-                self.agent_telemetry
-                    .record_mutation_turn(self.session_stats.total_turns);
-            }
-
             // Issue #269 Phase 3: stagnation end_turn hook + forced mode update.
             self.stagnation_state.end_turn(turn_mutations > 0);
             let stagnation_score =

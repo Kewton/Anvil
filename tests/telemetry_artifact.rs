@@ -65,7 +65,7 @@ fn telemetry_artifact_not_written_when_dir_unset() {
 #[test]
 fn telemetry_artifact_schema_version() {
     let json = write_and_parse(&AgentTelemetry::new(), "schema");
-    assert_eq!(json["schema_version"], "1");
+    assert_eq!(json["schema_version"], "2");
 }
 
 #[test]
@@ -134,9 +134,71 @@ fn telemetry_artifact_all_fields_present() {
         "items_advanced_per_turn",
         "guidance_chars_per_turn",
         "workset_size_per_turn",
+        "first_mutation_event_turn",
+        "first_mutation_event_elapsed_s",
+        "first_mutation_event_tool",
+        "first_mutation_event_semantic_basis",
     ];
 
     for key in &expected_keys {
         assert!(obj.contains_key(*key), "telemetry JSON missing key: {key}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #273 Phase 1.5: first_mutation_event_* tests
+// ---------------------------------------------------------------------------
+
+/// (c) record_mutation_turn sets first_mutation_event_* on the first call.
+#[test]
+fn first_mutation_event_recorded_on_first_call() {
+    let mut tel = AgentTelemetry::new();
+    tel.record_mutation_turn(3, Some(1.5), "file.write");
+    assert_eq!(tel.first_mutation_event_turn, Some(3));
+    assert_eq!(tel.first_mutation_event_elapsed_s, Some(1.5));
+    assert_eq!(tel.first_mutation_event_tool.as_deref(), Some("file.write"));
+}
+
+/// (d) Subsequent calls do NOT overwrite first_mutation_event_*.
+#[test]
+fn first_mutation_event_not_overwritten_by_later_calls() {
+    let mut tel = AgentTelemetry::new();
+    tel.record_mutation_turn(3, Some(1.5), "file.write");
+    tel.record_mutation_turn(7, Some(5.0), "file.edit");
+    // first_mutation_event_* should still reflect the first call
+    assert_eq!(tel.first_mutation_event_turn, Some(3));
+    assert_eq!(tel.first_mutation_event_elapsed_s, Some(1.5));
+    assert_eq!(tel.first_mutation_event_tool.as_deref(), Some("file.write"));
+    // last_mutation_turn should reflect the latest call
+    assert_eq!(tel.last_mutation_turn, 7);
+}
+
+/// (e) Artifact payload includes first_mutation_event_* when mutations occurred.
+#[test]
+fn first_mutation_event_in_artifact_payload() {
+    let mut tel = sample_telemetry();
+    tel.record_mutation_turn(2, Some(0.8), "file.edit");
+    let json = write_and_parse(&tel, "first_mut_present");
+    assert_eq!(json["first_mutation_event_turn"], 2);
+    assert!((json["first_mutation_event_elapsed_s"].as_f64().unwrap() - 0.8).abs() < 1e-9);
+    assert_eq!(json["first_mutation_event_tool"], "file.edit");
+    assert_eq!(
+        json["first_mutation_event_semantic_basis"],
+        "runtime_lower_bound"
+    );
+}
+
+/// (f) Artifact payload has null first_mutation_event_* when no mutations occurred.
+#[test]
+fn first_mutation_event_null_when_no_mutations() {
+    let tel = AgentTelemetry::new();
+    let json = write_and_parse(&tel, "first_mut_null");
+    assert!(json["first_mutation_event_turn"].is_null());
+    assert!(json["first_mutation_event_elapsed_s"].is_null());
+    assert!(json["first_mutation_event_tool"].is_null());
+    // semantic_basis is always present as a constant string
+    assert_eq!(
+        json["first_mutation_event_semantic_basis"],
+        "runtime_lower_bound"
+    );
 }

@@ -60,6 +60,11 @@ use std::sync::{Arc, Mutex};
 // Re-export render helpers that form the public API.
 pub use render::{cli_prompt, render_help_frame, slash_commands};
 
+/// Mutation tools tracked for telemetry purposes.
+/// Note: shell.exec is intentionally excluded — see Issue #273 for rationale
+/// (first_mutation_event_* fields are runtime_lower_bound, not strict post-hoc values).
+pub(crate) const MUTATION_TOOLS: &[&str] = &["file.write", "file.edit", "file.edit_anchor"];
+
 /// Detect project languages from the project root directory.
 ///
 /// Checks for the presence of language-specific manifest files and returns

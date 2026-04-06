@@ -516,4 +516,8 @@ fn telemetry_serde_backward_compatibility() {
     assert_eq!(telemetry.anvil_plan_visible_count, 0);
     assert_eq!(telemetry.last_mutation_turn, 0);
     assert_eq!(telemetry.final_suppressed_with_remaining_targets_count, 0);
+    // Issue #273 Phase 1.5: new fields default to None
+    assert_eq!(telemetry.first_mutation_event_turn, None);
+    assert_eq!(telemetry.first_mutation_event_elapsed_s, None);
+    assert_eq!(telemetry.first_mutation_event_tool, None);
 }
