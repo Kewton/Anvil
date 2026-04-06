@@ -557,23 +557,6 @@ impl App {
                             elapsed_s,
                             &r.tool_name, // already validated by MUTATION_TOOLS.contains()
                         );
-
-                        // Issue #277: file-role telemetry
-                        {
-                            use crate::contracts::file_role::make_cwd_relative;
-                            let canonical_path = r
-                                .artifacts
-                                .first()
-                                .map(|abs_path| {
-                                    make_cwd_relative(
-                                        abs_path,
-                                        std::path::Path::new(&self.config.paths.cwd),
-                                    )
-                                })
-                                .unwrap_or_else(|| r.summary.clone());
-                            self.agent_telemetry
-                                .record_file_role_mutation(&canonical_path);
-                        }
                     }
                 }
             }
@@ -1520,11 +1503,7 @@ impl App {
         let mut phase_action = super::phase_estimator::PhaseAction::Continue;
         let mut read_transition_message: Option<String> = None;
         for (_, result) in indexed_results {
-            let completed_read_disposition = self.completed_read_disposition(&result);
-            self.record_tool_result_with_read_disposition(
-                &result,
-                completed_read_disposition.clone(),
-            );
+            self.record_tool_result(&result);
             // Phase estimator: record tool call pattern (Issue #159)
             let success = result.status == ToolExecutionStatus::Completed;
             let pa = self
@@ -1542,11 +1521,14 @@ impl App {
             } else {
                 None
             };
-            // Issue #282: classify completed reads once and share that
-            // immutable fact with all downstream consumers.
-            let is_recovery_read = completed_read_disposition
-                .as_ref()
-                .is_some_and(|disposition| disposition.is_recovery_read());
+            // Issue #276: skip read guards for recovery reads
+            let is_recovery_read = result.tool_name == "file.read"
+                && result.status == ToolExecutionStatus::Completed
+                && result.artifacts.first().is_some_and(|art| {
+                    let normalized = normalize_for_recovery_compare(art, &self.config.paths.cwd);
+                    self.same_file_recovery_state
+                        .is_pending_recovery_read_for(&normalized)
+                });
 
             if !is_recovery_read {
                 let transition_action = self.read_transition_guard.record_tool_call_ex(
@@ -1656,30 +1638,6 @@ impl App {
 
     /// Push a tool execution result into the session as a tool message.
     fn record_tool_result(&mut self, result: &ToolExecutionResult) {
-        self.record_tool_result_with_read_disposition(result, None);
-    }
-
-    fn completed_read_disposition(
-        &self,
-        result: &ToolExecutionResult,
-    ) -> Option<super::same_file_recovery::CompletedReadDisposition> {
-        if result.tool_name != "file.read" || result.status != ToolExecutionStatus::Completed {
-            return None;
-        }
-        let artifact_path = result.artifacts.first()?;
-        let normalized = normalize_for_recovery_compare(artifact_path, &self.config.paths.cwd);
-        Some(
-            self.same_file_recovery_state
-                .clone()
-                .classify_completed_read(&normalized),
-        )
-    }
-
-    fn record_tool_result_with_read_disposition(
-        &mut self,
-        result: &ToolExecutionResult,
-        completed_read_disposition: Option<super::same_file_recovery::CompletedReadDisposition>,
-    ) {
         // Session stats: record tool call (Issue #206 C-3)
         self.session_stats.record_tool_call(&result.tool_name);
 
@@ -1733,11 +1691,7 @@ impl App {
             }
         }
 
-        let is_recovery_read = completed_read_disposition
-            .as_ref()
-            .is_some_and(|disposition| disposition.is_recovery_read());
-
-        // Issue #276 / #282: SameFileRecoveryState integration
+        // Issue #276: SameFileRecoveryState integration
         if (result.tool_name == "file.edit" || result.tool_name == "file.edit_anchor")
             && result.status == ToolExecutionStatus::Failed
             && let Some(ref attempted) = result.attempted_path
@@ -1813,13 +1767,24 @@ impl App {
             self.same_file_recovery_state = new_state;
         }
 
-        if let Some(disposition) = completed_read_disposition {
-            if disposition.is_recovery_read() {
+        // Issue #276: recovery read tracking
+        if result.tool_name == "file.read"
+            && result.status == ToolExecutionStatus::Completed
+            && let Some(artifact_path) = result.artifacts.first()
+        {
+            let normalized = normalize_for_recovery_compare(artifact_path, &self.config.paths.cwd);
+            if self
+                .same_file_recovery_state
+                .is_pending_recovery_read_for(&normalized)
+            {
                 self.agent_telemetry
                     .recovery_telemetry
                     .recovery_read_succeeded += 1;
+                self.same_file_recovery_state = self
+                    .same_file_recovery_state
+                    .clone()
+                    .on_read_completed(&normalized);
             }
-            self.same_file_recovery_state = disposition.next_state;
         }
         if result.tool_name == "file.read" && result.status == ToolExecutionStatus::Failed {
             self.same_file_recovery_state = self.same_file_recovery_state.clone().on_read_failed();
@@ -1921,11 +1886,18 @@ impl App {
         let write_hint = self.update_write_trackers(result);
 
         // Read repeat tracker: track repeated file.read calls (Issue #185)
-        // Issue #282: use the same immutable read classification as telemetry/guard.
+        // Issue #276: skip read repeat tracking for recovery reads
         let mut read_hint: Option<String> = None;
+        let is_recovery_read_for_tracker = result.tool_name == "file.read"
+            && result.status == ToolExecutionStatus::Completed
+            && result.artifacts.first().is_some_and(|art| {
+                let normalized = normalize_for_recovery_compare(art, &self.config.paths.cwd);
+                self.same_file_recovery_state
+                    .is_pending_recovery_read_for(&normalized)
+            });
         if result.tool_name == "file.read"
             && result.status == ToolExecutionStatus::Completed
-            && !is_recovery_read
+            && !is_recovery_read_for_tracker
             && let Some(path) = result.artifacts.first()
         {
             let action = self.read_repeat_tracker.record_read(path);
@@ -2795,155 +2767,6 @@ mod trust_tests {
         assert!(
             !formatted.contains("[0 chars truncated"),
             "file.read should use the tighter per-tool cap"
-        );
-    }
-}
-
-#[cfg(test)]
-mod recovery_read_regression_tests {
-    use super::*;
-    use crate::agent::StructuredAssistantResponse;
-    use crate::config::EffectiveConfig;
-    use crate::provider::ProviderRuntimeContext;
-    use crate::tooling::{ToolCallRequest, ToolInput};
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
-
-    fn build_test_app(root: &std::path::Path) -> App {
-        let mut config = EffectiveConfig::default_for_test().expect("config should load");
-        config.paths.cwd = root.to_path_buf();
-        config.paths.workspace_dir = root.join("workspace");
-        config.paths.config_file = root.join(".anvil").join("config");
-        config.paths.state_dir = root.join(".anvil").join("state");
-        config.paths.session_dir = root.join(".anvil").join("sessions");
-        config.paths.session_file = config.paths.session_dir.join("default.json");
-        config.paths.logs_dir = root.join(".anvil").join("logs");
-        config.paths.mcp_config_file = root.join(".anvil").join("mcp.json");
-        config.paths.hooks_config_file = root.join(".anvil").join("hooks.json");
-        config.mode.approval_required = false;
-        config.runtime.read_transition_threshold = 3;
-        config.runtime.read_transition_reinject_interval = 1;
-        config.runtime.read_repeat_warn_threshold = 2;
-        config.runtime.read_repeat_strong_warn_threshold = 4;
-
-        let provider =
-            ProviderRuntimeContext::bootstrap(&config).expect("provider should bootstrap");
-        App::new(config, provider, Arc::new(AtomicBool::new(false))).expect("app should initialize")
-    }
-
-    fn structured(tool_calls: Vec<ToolCallRequest>) -> StructuredAssistantResponse {
-        StructuredAssistantResponse {
-            tool_calls,
-            final_response: String::new(),
-            anvil_final_detected: false,
-            raw_content: String::new(),
-        }
-    }
-
-    #[test]
-    fn recovery_read_telemetry_matches_guard_and_repeat_exemptions() {
-        let tempdir = tempfile::tempdir().expect("tempdir should be created");
-        let root = tempdir.path();
-        std::fs::create_dir_all(root.join("src")).expect("src dir should be created");
-        std::fs::write(root.join("src/main.rs"), "fn main() {}")
-            .expect("main.rs should be written");
-        std::fs::write(root.join("src/helper.rs"), "pub fn helper() {}")
-            .expect("helper.rs should be written");
-
-        let mut app = build_test_app(root);
-
-        let first_batch = structured(vec![
-            ToolCallRequest::new(
-                "call_read_main_001",
-                "file.read",
-                ToolInput::FileRead {
-                    path: "./src/main.rs".to_string(),
-                },
-            ),
-            ToolCallRequest::new(
-                "call_read_helper_001",
-                "file.read",
-                ToolInput::FileRead {
-                    path: "./src/helper.rs".to_string(),
-                },
-            ),
-            ToolCallRequest::new(
-                "call_edit_fail_001",
-                "file.edit",
-                ToolInput::FileEdit {
-                    path: "./src/main.rs".to_string(),
-                    old_string: "fn missing() {}".to_string(),
-                    new_string: "fn main() { println!(\"updated\"); }".to_string(),
-                },
-            ),
-        ]);
-
-        let (first_results, _) = app
-            .execute_structured_tool_calls(&first_batch)
-            .expect("first batch should execute");
-
-        assert!(
-            first_results
-                .iter()
-                .all(|result| result.tool_name != "system.read_guard"),
-            "pre-recovery reads should not trigger read guard"
-        );
-        assert_eq!(
-            app.same_file_recovery_state,
-            crate::app::same_file_recovery::SameFileRecoveryState::PendingRecoveryRead(
-                "src/main.rs".to_string()
-            )
-        );
-
-        let second_batch = structured(vec![
-            ToolCallRequest::new(
-                "call_recovery_read_001",
-                "file.read",
-                ToolInput::FileRead {
-                    path: "./src/main.rs".to_string(),
-                },
-            ),
-            ToolCallRequest::new(
-                "call_edit_retry_001",
-                "file.edit",
-                ToolInput::FileEdit {
-                    path: "./src/main.rs".to_string(),
-                    old_string: "fn main() {}".to_string(),
-                    new_string: "fn main() { println!(\"updated\"); }".to_string(),
-                },
-            ),
-        ]);
-
-        let (second_results, _) = app
-            .execute_structured_tool_calls(&second_batch)
-            .expect("second batch should execute");
-
-        assert!(
-            second_results
-                .iter()
-                .all(|result| result.tool_name != "system.read_guard"),
-            "recovery read should be exempt from read guard classification"
-        );
-        assert!(
-            !app.session().messages.iter().any(|message| message
-                .content
-                .contains("The file content is cached and unchanged")),
-            "recovery read should not advance read repeat tracking"
-        );
-
-        let recovery = &app.agent_telemetry.recovery_telemetry;
-        assert_eq!(recovery.edit_failed_final_not_found, 1);
-        assert_eq!(recovery.recovery_read_triggered, 1);
-        assert_eq!(recovery.recovery_read_succeeded, 1);
-        assert_eq!(recovery.recovery_retry_succeeded, 1);
-        assert_eq!(
-            std::fs::read_to_string(root.join("src/main.rs"))
-                .expect("main.rs should remain readable"),
-            "fn main() { println!(\"updated\"); }"
-        );
-        assert_eq!(
-            app.same_file_recovery_state,
-            crate::app::same_file_recovery::SameFileRecoveryState::Normal
         );
     }
 }

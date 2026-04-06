@@ -126,7 +126,6 @@ src/
 ├── config/mod.rs        # 設定管理
 ├── contracts/
 │   ├── mod.rs           # 共通型定義（TerminationReason, Finding, SubAgentPayload含む）
-│   ├── file_role.rs     # ファイルロール分類（classify_file_role・make_cwd_relative、Issue #277）
 │   └── tokens.rs        # トークン推定（CJK対応ヒューリスティック・モデル実測値ベースEMA補正）
 ├── extensions/
 │   ├── mod.rs           # スラッシュコマンド・拡張
