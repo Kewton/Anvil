@@ -205,6 +205,9 @@ fn validated_tool_call_builds_typed_execution_request_and_result() {
         diff_summary: None,
         edit_detail: None,
         rolled_back: false,
+        edit_failure_kind: None,
+        attempted_path: None,
+        read_detail: None,
     };
 
     assert_eq!(execution.spec.kind, ToolKind::FileRead);
@@ -380,6 +383,9 @@ fn tool_execution_result_can_bridge_into_console_tool_log_view() {
         diff_summary: None,
         edit_detail: None,
         rolled_back: false,
+        edit_failure_kind: None,
+        attempted_path: None,
+        read_detail: None,
     };
     let log = result.to_tool_log_view();
 
@@ -1653,7 +1659,7 @@ fn file_edit_old_string_not_found() {
     fs::write(root.join("test.txt"), "hello world").expect("write should succeed");
 
     let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
-    let err = executor
+    let result = executor
         .execute(ToolExecutionRequest {
             tool_call_id: "call_edit_nf_001".to_string(),
             spec: build_registry()
@@ -1666,9 +1672,10 @@ fn file_edit_old_string_not_found() {
                 new_string: "replacement".to_string(),
             },
         })
-        .expect_err("should fail when old_string not found");
+        .expect("file.edit should return Ok with Failed status");
 
-    assert!(err.to_string().contains("not found"));
+    assert_eq!(result.status, ToolExecutionStatus::Failed);
+    assert!(result.summary.contains("not found"));
 }
 
 #[test]
@@ -1679,7 +1686,7 @@ fn file_edit_old_string_multiple_matches() {
     fs::write(root.join("test.txt"), "aaa bbb aaa").expect("write should succeed");
 
     let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
-    let err = executor
+    let result = executor
         .execute(ToolExecutionRequest {
             tool_call_id: "call_edit_mm_001".to_string(),
             spec: build_registry()
@@ -1692,9 +1699,10 @@ fn file_edit_old_string_multiple_matches() {
                 new_string: "ccc".to_string(),
             },
         })
-        .expect_err("should fail when old_string matches multiple times");
+        .expect("file.edit should return Ok with Failed status");
 
-    assert!(err.to_string().contains("found 2 times"));
+    assert_eq!(result.status, ToolExecutionStatus::Failed);
+    assert!(result.summary.contains("found 2 times"));
 }
 
 #[test]
@@ -1735,7 +1743,7 @@ fn file_edit_noop_when_strings_equal() {
     fs::write(&file_path, "hello world").expect("write should succeed");
 
     let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
-    let err = executor
+    let result = executor
         .execute(ToolExecutionRequest {
             tool_call_id: "call_edit_noop_001".to_string(),
             spec: build_registry()
@@ -1748,11 +1756,13 @@ fn file_edit_noop_when_strings_equal() {
                 new_string: "hello".to_string(),
             },
         })
-        .expect_err("noop edit should return error when old_string == new_string");
+        .expect("noop edit should return Ok with Failed status");
 
+    assert_eq!(result.status, ToolExecutionStatus::Failed);
     assert!(
-        err.to_string().contains("identical"),
-        "error should mention identical strings: {err}"
+        result.summary.contains("identical"),
+        "summary should mention identical strings: {}",
+        result.summary
     );
     let content = fs::read_to_string(&file_path).expect("read should succeed");
     assert_eq!(content, "hello world");
@@ -2297,6 +2307,9 @@ fn format_tool_result_message_image_payload() {
         diff_summary: None,
         edit_detail: None,
         rolled_back: false,
+        edit_failure_kind: None,
+        attempted_path: None,
+        read_detail: None,
     };
     let msg = format_tool_result_message(&result, 10000);
     assert!(msg.contains("file.read"));
@@ -2326,6 +2339,9 @@ fn format_tool_result_message_truncates_multibyte_safely() {
         diff_summary: None,
         edit_detail: None,
         rolled_back: false,
+        edit_failure_kind: None,
+        attempted_path: None,
+        read_detail: None,
     };
 
     // Must not panic — the old byte-slicing implementation would panic here.
@@ -2351,6 +2367,9 @@ fn format_tool_result_message_ascii_truncation_still_works() {
         diff_summary: None,
         edit_detail: None,
         rolled_back: false,
+        edit_failure_kind: None,
+        attempted_path: None,
+        read_detail: None,
     };
 
     let msg = format_tool_result_message(&result, 100);
@@ -2379,6 +2398,9 @@ fn format_tool_result_message_boundary_char_3byte() {
         diff_summary: None,
         edit_detail: None,
         rolled_back: false,
+        edit_failure_kind: None,
+        attempted_path: None,
+        read_detail: None,
     };
 
     let msg = format_tool_result_message(&result, 100);
@@ -2464,6 +2486,9 @@ fn format_tool_result_message_success_head_priority() {
         diff_summary: None,
         edit_detail: None,
         rolled_back: false,
+        edit_failure_kind: None,
+        attempted_path: None,
+        read_detail: None,
     };
 
     let msg = format_tool_result_message(&result, 100);
@@ -2492,6 +2517,9 @@ fn format_tool_result_message_failure_tail_priority() {
         diff_summary: None,
         edit_detail: None,
         rolled_back: false,
+        edit_failure_kind: None,
+        attempted_path: None,
+        read_detail: None,
     };
 
     let msg = format_tool_result_message(&result, 100);
@@ -2520,6 +2548,9 @@ fn format_tool_result_message_interrupted_tail_priority() {
         diff_summary: None,
         edit_detail: None,
         rolled_back: false,
+        edit_failure_kind: None,
+        attempted_path: None,
+        read_detail: None,
     };
 
     let msg = format_tool_result_message(&result, 100);
@@ -5129,7 +5160,7 @@ fn edit_fallback_includes_context_on_failure() {
     .unwrap();
 
     let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
-    let err = executor
+    let result = executor
         .execute(ToolExecutionRequest {
             tool_call_id: "ctx_001".to_string(),
             spec: build_registry()
@@ -5143,21 +5174,17 @@ fn edit_fallback_includes_context_on_failure() {
                 new_string: "fn main() {\n    let x = correct;\n}".to_string(),
             },
         })
-        .unwrap_err();
-    assert!(err.is_edit_not_found());
-    match &err {
-        anvil::tooling::ToolRuntimeError::EditNotFound {
-            context_snippet, ..
-        } => {
-            assert!(
-                context_snippet.is_some(),
-                "should include context for non-sensitive file"
-            );
-            let ctx = context_snippet.as_ref().unwrap();
-            assert!(ctx.contains("println!"), "context should show nearby code");
-        }
-        _ => panic!("expected EditNotFound"),
-    }
+        .expect("file.edit should return Ok with Failed status");
+    assert_eq!(result.status, ToolExecutionStatus::Failed);
+    // Issue #276: failure returns Ok(Failed) with edit_failure_kind set
+    assert!(
+        result.edit_failure_kind.is_some(),
+        "should include edit_failure_kind for failed edit"
+    );
+    assert!(
+        result.summary.contains("not found"),
+        "summary should contain 'not found'"
+    );
     let _ = fs::remove_dir_all(&root);
 }
 
@@ -5173,7 +5200,7 @@ fn edit_fallback_no_context_for_sensitive_file() {
     .unwrap();
 
     let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
-    let err = executor
+    let result = executor
         .execute(ToolExecutionRequest {
             tool_call_id: "ctx_002".to_string(),
             spec: build_registry()
@@ -5186,18 +5213,18 @@ fn edit_fallback_no_context_for_sensitive_file() {
                 new_string: "REPLACED=value".to_string(),
             },
         })
-        .unwrap_err();
-    match &err {
-        anvil::tooling::ToolRuntimeError::EditNotFound {
-            context_snippet, ..
-        } => {
-            assert!(
-                context_snippet.is_none(),
-                "should NOT include context for sensitive file"
-            );
-        }
-        _ => panic!("expected EditNotFound"),
-    }
+        .expect("file.edit should return Ok with Failed status");
+    assert_eq!(result.status, ToolExecutionStatus::Failed);
+    // Issue #276: for sensitive files, the summary should NOT contain the file content
+    assert!(
+        result.edit_failure_kind.is_some(),
+        "should include edit_failure_kind for failed edit"
+    );
+    // The summary should not contain sensitive file content
+    assert!(
+        !result.summary.contains("abc123"),
+        "sensitive file content should not be in summary"
+    );
     let _ = fs::remove_dir_all(&root);
 }
 
@@ -5552,7 +5579,7 @@ fn file_edit_no_changes_returns_error() {
     fs::write(&file_path, "hello world").expect("write should succeed");
 
     let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
-    let err = executor
+    let result = executor
         .execute(ToolExecutionRequest {
             tool_call_id: "call_edit_nochange_001".to_string(),
             spec: build_registry()
@@ -5565,11 +5592,13 @@ fn file_edit_no_changes_returns_error() {
                 new_string: "hello".to_string(),
             },
         })
-        .expect_err("identical old_string/new_string should return error");
+        .expect("identical old_string/new_string should return Ok with Failed status");
 
+    assert_eq!(result.status, ToolExecutionStatus::Failed);
     assert!(
-        err.to_string().contains("identical"),
-        "error should mention identical strings: {err}"
+        result.summary.contains("identical"),
+        "summary should mention identical strings: {}",
+        result.summary
     );
     // File should remain unchanged
     let content = fs::read_to_string(&file_path).expect("read should succeed");
@@ -6204,6 +6233,9 @@ fn tool_execution_result_edit_detail_default_none() {
         diff_summary: None,
         edit_detail: None,
         rolled_back: false,
+        edit_failure_kind: None,
+        attempted_path: None,
+        read_detail: None,
     };
     assert!(result.edit_detail.is_none());
 }
@@ -6225,6 +6257,9 @@ fn tool_execution_result_edit_detail_with_stage() {
             fallback_stage: EditFallbackStage::Anchor,
         }),
         rolled_back: false,
+        edit_failure_kind: None,
+        attempted_path: None,
+        read_detail: None,
     };
     assert!(result.edit_detail.is_some());
     assert_eq!(
@@ -6265,6 +6300,9 @@ fn rolled_back_result_has_flag_set() {
         diff_summary: Some("+line\n-old".to_string()),
         edit_detail: None,
         rolled_back: false,
+        edit_failure_kind: None,
+        attempted_path: None,
+        read_detail: None,
     };
     assert!(!result.rolled_back);
 

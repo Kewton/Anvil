@@ -239,6 +239,9 @@ impl SubAgentResult {
             diff_summary: None,
             edit_detail: None,
             rolled_back: false,
+            edit_failure_kind: None,
+            attempted_path: None,
+            read_detail: None,
         }
     }
 }
@@ -291,6 +294,9 @@ impl SubAgentError {
             diff_summary: None,
             edit_detail: None,
             rolled_back: false,
+            edit_failure_kind: None,
+            attempted_path: None,
+            read_detail: None,
         }
     }
 }
@@ -605,6 +611,9 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
                     diff_summary: None,
                     edit_detail: None,
                     rolled_back: false,
+                    edit_failure_kind: None,
+                    attempted_path: None,
+                    read_detail: None,
                 });
 
             // Record tool result in the sub-agent session

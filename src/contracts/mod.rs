@@ -176,6 +176,29 @@ impl CompletionKind {
 // Agent telemetry (Issue #255: Stage 0 observability)
 // ---------------------------------------------------------------------------
 
+/// Telemetry for same-file edit recovery (Issue #276).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RecoveryTelemetry {
+    #[serde(default)]
+    pub edit_failed_final_not_found: u32,
+    #[serde(default)]
+    pub edit_failed_final_multiple_matches: u32,
+    #[serde(default)]
+    pub edit_failed_identical_content: u32,
+    #[serde(default)]
+    pub edit_failed_io_failure: u32,
+    #[serde(default)]
+    pub recovery_read_triggered: u32,
+    #[serde(default)]
+    pub recovery_read_succeeded: u32,
+    #[serde(default)]
+    pub recovery_retry_succeeded: u32,
+    #[serde(default)]
+    pub recovery_escalated_to_write: u32,
+    #[serde(default)]
+    pub recovery_abandoned: u32,
+}
+
 /// Telemetry counters for the agentic session.
 ///
 /// Tracks key metrics for evaluating agent loop quality:
@@ -251,6 +274,10 @@ pub struct AgentTelemetry {
     /// None if no mutation occurred during the session.
     #[serde(default)]
     pub first_mutation_event_tool: Option<String>,
+
+    /// Same-file edit recovery telemetry (Issue #276).
+    #[serde(default)]
+    pub recovery_telemetry: RecoveryTelemetry,
 
     // -----------------------------------------------------------------------
     // Issue #277: file-role telemetry fields
@@ -538,6 +565,8 @@ impl AgentTelemetry {
             "first_mutation_event_elapsed_s": self.first_mutation_event_elapsed_s,
             "first_mutation_event_tool": self.first_mutation_event_tool,
             "first_mutation_event_semantic_basis": "runtime_lower_bound",
+            "recovery_telemetry": serde_json::to_value(&self.recovery_telemetry)
+                .unwrap_or(serde_json::Value::Null),
             "first_successful_mutation_file_role": self.first_successful_mutation_file_role,
             "first_non_test_mutation_file_role": self.first_non_test_mutation_file_role,
             "mutation_role_sequence": self.mutation_role_sequence,
