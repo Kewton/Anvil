@@ -17,6 +17,7 @@ pub mod policy;
 pub(crate) mod read_repeat_tracker;
 pub mod read_transition_guard;
 pub mod render;
+pub(crate) mod same_file_recovery;
 pub mod stagnation_state;
 pub(crate) mod write_fail_tracker;
 pub(crate) mod write_repeat_tracker;
@@ -283,6 +284,8 @@ pub struct App {
     execution_plan: crate::contracts::ExecutionPlan,
     /// Agent telemetry for session-level metrics (Issue #255).
     agent_telemetry: crate::contracts::AgentTelemetry,
+    /// Same-file recovery state machine (Issue #276).
+    pub(crate) same_file_recovery_state: same_file_recovery::SameFileRecoveryState,
     /// Per-turn stagnation telemetry (Issue #263).
     stagnation_state: stagnation_state::StagnationState,
     /// Whether forced mode is active for the current turn (Issue #263).
@@ -618,6 +621,7 @@ impl App {
             last_compact_info: None,
             execution_plan: crate::contracts::ExecutionPlan::default(),
             agent_telemetry: crate::contracts::AgentTelemetry::new(),
+            same_file_recovery_state: same_file_recovery::SameFileRecoveryState::Normal,
             stagnation_state: stagnation_state::StagnationState::new(),
             forced_mode_active: false,
         })

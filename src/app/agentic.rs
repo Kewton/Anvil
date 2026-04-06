@@ -209,6 +209,9 @@ fn execute_parallel_group_standalone(
                                 diff_summary: None,
                                 edit_detail: None,
                                 rolled_back: false,
+                                edit_failure_kind: None,
+                                attempted_path: None,
+                                read_detail: None,
                             }
                         });
                         // Update progress entry
@@ -256,6 +259,9 @@ fn execute_parallel_group_standalone(
                                 diff_summary: None,
                                 edit_detail: None,
                                 rolled_back: false,
+                                edit_failure_kind: None,
+                                attempted_path: None,
+                                read_detail: None,
                             },
                         ));
                     }
@@ -320,6 +326,9 @@ impl App {
                     diff_summary: None,
                     edit_detail: None,
                     rolled_back: false,
+                    edit_failure_kind: None,
+                    attempted_path: None,
+                    read_detail: None,
                 });
                 continue;
             }
@@ -964,6 +973,9 @@ impl App {
                         diff_summary: None,
                         edit_detail: None,
                         rolled_back: false,
+                        edit_failure_kind: None,
+                        attempted_path: None,
+                        read_detail: None,
                     },
                 ));
                 continue;
@@ -1064,6 +1076,9 @@ impl App {
                 diff_summary: None,
                 edit_detail: None,
                 rolled_back: false,
+                edit_failure_kind: None,
+                attempted_path: None,
+                read_detail: None,
             });
 
         // Remove checkpoint if tool execution failed.
@@ -1100,6 +1115,9 @@ impl App {
                 diff_summary: None,
                 edit_detail: None,
                 rolled_back: false,
+                edit_failure_kind: None,
+                attempted_path: None,
+                read_detail: None,
             };
         };
 
@@ -1128,6 +1146,9 @@ impl App {
             diff_summary: None,
             edit_detail: None,
             rolled_back: false,
+            edit_failure_kind: None,
+            attempted_path: None,
+            read_detail: None,
         }
     }
 
@@ -1189,6 +1210,9 @@ impl App {
                                     diff_summary: None,
                                     edit_detail: None,
                                     rolled_back: false,
+                                    edit_failure_kind: None,
+                                    attempted_path: None,
+                                    read_detail: None,
                                 },
                             ));
                         }
@@ -1253,6 +1277,9 @@ impl App {
                 diff_summary: None,
                 edit_detail: None,
                 rolled_back: false,
+                edit_failure_kind: None,
+                attempted_path: None,
+                read_detail: None,
             }),
             _ => None,
         };
@@ -1427,13 +1454,24 @@ impl App {
             } else {
                 None
             };
-            let transition_action = self.read_transition_guard.record_tool_call_ex(
-                &result.tool_name,
-                success,
-                shell_cmd.as_deref(),
-            );
-            if let ReadTransitionAction::Inject(msg) = transition_action {
-                read_transition_message = Some(msg);
+            // Issue #276: skip read guards for recovery reads
+            let is_recovery_read = result.tool_name == "file.read"
+                && result.status == ToolExecutionStatus::Completed
+                && result.artifacts.first().is_some_and(|art| {
+                    let normalized = normalize_for_recovery_compare(art, &self.config.paths.cwd);
+                    self.same_file_recovery_state
+                        .is_pending_recovery_read_for(&normalized)
+                });
+
+            if !is_recovery_read {
+                let transition_action = self.read_transition_guard.record_tool_call_ex(
+                    &result.tool_name,
+                    success,
+                    shell_cmd.as_deref(),
+                );
+                if let ReadTransitionAction::Inject(msg) = transition_action {
+                    read_transition_message = Some(msg);
+                }
             }
 
             // Emit folded tool result to stderr for interactive sessions
@@ -1501,6 +1539,9 @@ impl App {
                 diff_summary: None,
                 edit_detail: None,
                 rolled_back: false,
+                edit_failure_kind: None,
+                attempted_path: None,
+                read_detail: None,
             };
             self.record_tool_result(&transition_result);
             results.push(transition_result);
@@ -1531,6 +1572,9 @@ impl App {
                     diff_summary: None,
                     edit_detail: None,
                     rolled_back: false,
+                    edit_failure_kind: None,
+                    attempted_path: None,
+                    read_detail: None,
                 };
                 self.record_tool_result(&transition_result);
                 results.push(transition_result);
@@ -1596,11 +1640,121 @@ impl App {
             }
         }
 
+        // Issue #276: SameFileRecoveryState integration
+        if (result.tool_name == "file.edit" || result.tool_name == "file.edit_anchor")
+            && result.status == ToolExecutionStatus::Failed
+            && let Some(ref attempted) = result.attempted_path
+        {
+            let norm = attempted.trim_start_matches("./").to_string();
+            let kind = result
+                .edit_failure_kind
+                .unwrap_or(crate::tooling::EditFailureKind::FinalNotFound);
+            // Update recovery telemetry: failure-kind counters
+            match kind {
+                crate::tooling::EditFailureKind::FinalNotFound => {
+                    self.agent_telemetry
+                        .recovery_telemetry
+                        .edit_failed_final_not_found += 1;
+                }
+                crate::tooling::EditFailureKind::FinalMultipleMatches => {
+                    self.agent_telemetry
+                        .recovery_telemetry
+                        .edit_failed_final_multiple_matches += 1;
+                }
+                crate::tooling::EditFailureKind::IdenticalContent => {
+                    self.agent_telemetry
+                        .recovery_telemetry
+                        .edit_failed_identical_content += 1;
+                }
+                crate::tooling::EditFailureKind::IoFailure => {
+                    self.agent_telemetry
+                        .recovery_telemetry
+                        .edit_failed_io_failure += 1;
+                }
+            }
+            let new_state = self
+                .same_file_recovery_state
+                .clone()
+                .on_edit_failure(norm, kind);
+            // Issue #276: update outcome counters based on actual state transition,
+            // not just the failure kind. A FinalNotFound during PendingRecoveryRetry
+            // transitions to EscalatedToWriteFallback, not PendingRecoveryRead.
+            match &new_state {
+                crate::app::same_file_recovery::SameFileRecoveryState::PendingRecoveryRead(_) => {
+                    self.agent_telemetry
+                        .recovery_telemetry
+                        .recovery_read_triggered += 1;
+                }
+                crate::app::same_file_recovery::SameFileRecoveryState::EscalatedToWriteFallback(
+                    _,
+                ) => {
+                    self.agent_telemetry
+                        .recovery_telemetry
+                        .recovery_escalated_to_write += 1;
+                }
+                crate::app::same_file_recovery::SameFileRecoveryState::Abandoned => {
+                    self.agent_telemetry.recovery_telemetry.recovery_abandoned += 1;
+                }
+                _ => {}
+            }
+            self.same_file_recovery_state = new_state;
+        }
+        if (result.tool_name == "file.edit" || result.tool_name == "file.edit_anchor")
+            && result.status == ToolExecutionStatus::Completed
+            && let Some(ref attempted) = result.attempted_path
+        {
+            let norm = attempted.trim_start_matches("./").to_string();
+            let new_state = self.same_file_recovery_state.clone().on_edit_success(&norm);
+            if matches!(
+                new_state,
+                crate::app::same_file_recovery::SameFileRecoveryState::Resolved
+            ) {
+                self.agent_telemetry
+                    .recovery_telemetry
+                    .recovery_retry_succeeded += 1;
+            }
+            self.same_file_recovery_state = new_state;
+        }
+
+        // Issue #276: recovery read tracking
+        if result.tool_name == "file.read"
+            && result.status == ToolExecutionStatus::Completed
+            && let Some(artifact_path) = result.artifacts.first()
+        {
+            let normalized = normalize_for_recovery_compare(artifact_path, &self.config.paths.cwd);
+            if self
+                .same_file_recovery_state
+                .is_pending_recovery_read_for(&normalized)
+            {
+                self.agent_telemetry
+                    .recovery_telemetry
+                    .recovery_read_succeeded += 1;
+                self.same_file_recovery_state = self
+                    .same_file_recovery_state
+                    .clone()
+                    .on_read_completed(&normalized);
+            }
+        }
+        if result.tool_name == "file.read" && result.status == ToolExecutionStatus::Failed {
+            self.same_file_recovery_state = self.same_file_recovery_state.clone().on_read_failed();
+        }
+
+        // Issue #276: reset terminal states
+        if self.same_file_recovery_state.should_reset() {
+            self.same_file_recovery_state =
+                crate::app::same_file_recovery::SameFileRecoveryState::Normal;
+        }
+
         // Edit fail tracker: track consecutive file.edit/file.edit_anchor failures (Issue #143, #158)
         let mut edit_hint: Option<String> = None;
         if result.tool_name == "file.edit" || result.tool_name == "file.edit_anchor" {
             if result.status == ToolExecutionStatus::Failed {
-                if let Some(raw_path) = extract_edit_path_from_summary(&result.summary) {
+                // Issue #276: prefer attempted_path, fall back to extract_edit_path_from_summary
+                let raw_path_opt = result
+                    .attempted_path
+                    .clone()
+                    .or_else(|| extract_edit_path_from_summary(&result.summary));
+                if let Some(raw_path) = raw_path_opt {
                     let path = resolve_edit_tracker_path(&raw_path);
                     let action = self.edit_fail_tracker.record_failure(&path);
                     let count = self.edit_fail_tracker.failure_count(&path);
@@ -1681,9 +1835,18 @@ impl App {
         let write_hint = self.update_write_trackers(result);
 
         // Read repeat tracker: track repeated file.read calls (Issue #185)
+        // Issue #276: skip read repeat tracking for recovery reads
         let mut read_hint: Option<String> = None;
+        let is_recovery_read_for_tracker = result.tool_name == "file.read"
+            && result.status == ToolExecutionStatus::Completed
+            && result.artifacts.first().is_some_and(|art| {
+                let normalized = normalize_for_recovery_compare(art, &self.config.paths.cwd);
+                self.same_file_recovery_state
+                    .is_pending_recovery_read_for(&normalized)
+            });
         if result.tool_name == "file.read"
             && result.status == ToolExecutionStatus::Completed
+            && !is_recovery_read_for_tracker
             && let Some(path) = result.artifacts.first()
         {
             let action = self.read_repeat_tracker.record_read(path);
@@ -2283,7 +2446,23 @@ fn build_failed_result(
         diff_summary: None,
         edit_detail: None,
         rolled_back: false,
+        edit_failure_kind: None,
+        attempted_path: None,
+        read_detail: None,
     }
+}
+
+/// Normalize a path (possibly absolute) to a cwd-relative form for recovery state comparison.
+/// Issue #276: file.read artifacts are absolute paths; attempted_path is relative.
+/// Both must be normalized to the same form before comparing.
+fn normalize_for_recovery_compare(path: &str, cwd: &std::path::Path) -> String {
+    let p = std::path::Path::new(path);
+    if p.is_absolute()
+        && let Ok(rel) = p.strip_prefix(cwd)
+    {
+        return rel.to_string_lossy().into_owned();
+    }
+    path.trim_start_matches("./").to_string()
 }
 
 /// Produce a human-readable summary of a tool call for the approval prompt.
@@ -2540,6 +2719,9 @@ mod trust_tests {
             diff_summary: None,
             edit_detail: None,
             rolled_back: false,
+            edit_failure_kind: None,
+            attempted_path: None,
+            read_detail: None,
         };
 
         let formatted = format_tool_result_message(&result, 8_000);
