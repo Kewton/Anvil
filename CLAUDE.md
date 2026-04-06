@@ -110,12 +110,14 @@ src/
 │   ├── cli.rs           # CLI入力ループ
 │   ├── context.rs       # コンテキスト注入（@file展開・サンドボックス検証）
 │   ├── edit_fail_tracker.rs # 連続file.edit失敗の検出・回復ヒント注入
+│   ├── execution_plan.rs    # プラン→実行モード（ANVIL_PLAN検出・チェックリスト管理・ANVIL_FINAL抑制）
 │   ├── alternating_loop_detector.rs # AlternatingLoopDetector（交互/循環パターン検出）
 │   ├── loop_detector.rs # ループ検出（リングバッファ・段階的対応）
 │   ├── phase_estimator.rs # フェーズ推定（ツール呼び出しパターンベース・フォールバック完了検出）
 │   ├── read_repeat_tracker.rs # file.read繰り返し検出・ヒント注入（セッション横断型・閾値2/4）
 │   ├── write_fail_tracker.rs # file.write連続失敗トラッキング（ヒント提供・閾値2）
 │   ├── write_repeat_tracker.rs # file.write成功繰り返しトラッキング（同一ファイルへのwrite検出・Warn閾値3/StrongWarn閾値4）
+│   ├── stagnation_state.rs # 停滞検知・ワークセットステアリング・budget-aware閾値（Issue #263）
 │   ├── plan.rs          # プラン管理
 │   ├── policy.rs        # offlineポリシーチェック（共通ヘルパー）
 │   ├── render.rs        # コンソール描画
@@ -140,13 +142,14 @@ src/
 │   ├── openai.rs        # OpenAI互換クライアント
 │   └── transport.rs     # HTTPトランスポート
 ├── retrieval/mod.rs     # リポジトリ検索（オンデマンドコンテンツ読込・軽量キャッシュ）
-├── session/mod.rs       # セッション永続化（名前付きセッション・一覧・切替・削除・マイグレーション・構造化WorkingMemory・LLM要約コンパクション）
-├── spinner.rs           # スピナーUI
+├── session/mod.rs       # セッション永続化（名前付きセッション・一覧・切替・削除・マイグレーション・構造化WorkingMemory・LLM要約コンパクション・SessionNote抽出）
+├── spinner.rs           # スピナーUI（並列詳細進捗表示・start_parallel_detailed・format_detailed_progress）
 ├── state/mod.rs         # 状態マシン
 ├── tooling/
 │   ├── mod.rs           # ツール実行・検証・CheckpointStack（undo用チェックポイント管理）・EditFallbackStage・file.edit詳細ログ
 │   ├── diff.rs          # 差分プレビュー生成（file.write/file.edit承認時）
 │   ├── file_cache.rs    # ファイル読み取りキャッシュ（FileReadCache: LRUエビクション・sandbox境界検証）
+│   ├── progress.rs      # 並列実行進捗型（ToolProgressStatus・ToolProgressEntry）
 │   └── shell_policy.rs  # ShellPolicy分類（ReadOnly/BuildTest/General）・offline用ネットワークコマンド検出
 ├── tui/mod.rs           # TUI描画
 └── walk.rs              # 共通ディレクトリウォーカー（.gitignore対応・統一スキップ/バイナリ除外）
@@ -165,6 +168,7 @@ tests/
 ├── loop_detection.rs    # ループ検出テスト
 ├── phase_estimation.rs  # フェーズ推定テスト
 ├── context_inject.rs    # コンテキスト注入テスト
+├── stagnation_control.rs # 停滞制御テスト（Issue #263）
 └── walk_system.rs       # ディレクトリウォーカーテスト
 ```
 

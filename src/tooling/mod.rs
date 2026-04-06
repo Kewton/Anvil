@@ -6,6 +6,7 @@
 
 pub mod diff;
 pub mod file_cache;
+pub mod progress;
 pub mod shell_policy;
 
 pub use shell_policy::{ShellPolicy, classify_shell_policy, is_network_command};
@@ -656,6 +657,8 @@ pub struct ToolExecutionResult {
     pub diff_summary: Option<String>,
     /// file.edit fallback stage detail (Issue #206). `None` for non-edit tools.
     pub edit_detail: Option<EditResultDetail>,
+    /// Whether this result was rolled back by atomic transaction failure (Issue #259).
+    pub rolled_back: bool,
 }
 
 impl ToolExecutionResult {
@@ -1465,6 +1468,19 @@ impl LocalToolExecutor {
             }
         }
 
+        // Issue #259: skip write and diff_summary when content is identical to existing file.
+        if let Ok(existing) = fs::read_to_string(&resolved)
+            && existing == content
+        {
+            return Ok(build_completed_result(
+                request,
+                format!("{path} (no changes)"),
+                ToolExecutionPayload::None,
+                vec![],
+                started,
+            ));
+        }
+
         if let Some(parent) = resolved.parent() {
             fs::create_dir_all(parent).map_err(|err| {
                 ToolRuntimeError::Io(format!(
@@ -1515,13 +1531,10 @@ impl LocalToolExecutor {
             ))
         })?;
         if old_string == new_string {
-            return Ok(build_completed_result(
-                request,
-                format!("{path} (no changes)"),
-                ToolExecutionPayload::None,
-                vec![],
-                started,
-            ));
+            return Err(ToolRuntimeError::Io(format!(
+                "file.edit: old_string and new_string are identical — no changes to apply in {path}. \
+                 Provide a new_string that differs from old_string."
+            )));
         }
         let count = content.matches(old_string).count();
         if count == 0 {
@@ -1572,13 +1585,10 @@ impl LocalToolExecutor {
         })?;
 
         if params.old_content == params.new_content {
-            return Ok(build_completed_result(
-                request,
-                format!("{path} (no changes)"),
-                ToolExecutionPayload::None,
-                vec![],
-                started,
-            ));
+            return Err(ToolRuntimeError::Io(format!(
+                "file.edit_anchor: old_content and new_content are identical — no changes to apply in {path}. \
+                 Provide a new_content that differs from old_content."
+            )));
         }
 
         let normalized_matches = find_indent_normalized_matches(&content, &params.old_content);
@@ -1941,6 +1951,7 @@ impl LocalToolExecutor {
                     elapsed_ms: started.elapsed().as_millis(),
                     diff_summary: None,
                     edit_detail: None,
+                    rolled_back: false,
                 });
             }
             match child.try_wait() {
@@ -1978,6 +1989,7 @@ impl LocalToolExecutor {
             elapsed_ms: started.elapsed().as_millis(),
             diff_summary: None,
             edit_detail: None,
+            rolled_back: false,
         })
     }
 
@@ -2168,6 +2180,7 @@ impl LocalToolExecutor {
                 elapsed_ms: started.elapsed().as_millis(),
                 diff_summary: None,
                 edit_detail: None,
+                rolled_back: false,
             });
         }
 
@@ -2477,13 +2490,21 @@ fn log_file_edit_detail(result: &ToolExecutionResult) {
         .as_deref()
         .map(crate::app::count_diff_lines)
         .unwrap_or((0, 0));
-    tracing::info!(
-        path = %path,
-        lines_added = added,
-        lines_deleted = deleted,
-        fallback = stage_str,
-        "file.edit success"
-    );
+    if added == 0 && deleted == 0 {
+        tracing::warn!(
+            path = %path,
+            fallback = stage_str,
+            "file.edit success but no lines changed (lines_added=0, lines_deleted=0)"
+        );
+    } else {
+        tracing::info!(
+            path = %path,
+            lines_added = added,
+            lines_deleted = deleted,
+            fallback = stage_str,
+            "file.edit success"
+        );
+    }
 }
 
 /// Build a [`ToolExecutionResult`] with `Completed` status.
@@ -2517,6 +2538,7 @@ fn build_completed_result_with_diff(
         elapsed_ms: started.elapsed().as_millis(),
         diff_summary,
         edit_detail: None,
+        rolled_back: false,
     }
 }
 

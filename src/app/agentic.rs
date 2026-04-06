@@ -11,6 +11,7 @@ use crate::provider::{ProviderClient, ProviderEvent};
 use crate::session::{MessageRole, SessionMessage};
 use crate::spinner::Spinner;
 use crate::state::StateTransition;
+use crate::tooling::progress::{ToolProgressEntry, ToolProgressStatus};
 use crate::tooling::{
     ExecutionMode, LocalToolExecutor, ToolCallRequest, ToolExecutionPayload, ToolExecutionPolicy,
     ToolExecutionRequest, ToolExecutionResult, ToolExecutionStatus, ToolInput, ToolKind,
@@ -41,6 +42,11 @@ pub struct TurnSummary<'a> {
     pub tool_names: &'a [String],
     pub files_modified: usize,
     pub compact_info: Option<&'a CompactInfo>,
+    pub phase: super::phase_estimator::Phase,
+    /// Mutations executed this turn.
+    pub mutations_this_turn: Option<u32>,
+    /// Items advanced this turn.
+    pub items_advanced_this_turn: Option<u32>,
 }
 
 /// Log a turn summary using structured tracing.
@@ -69,6 +75,7 @@ pub fn log_turn_summary(summary: &TurnSummary<'_>) {
         tools = %tool_summary,
         files_modified = summary.files_modified,
         compact = %compact_str,
+        phase = %summary.phase,
         "turn completed"
     );
 }
@@ -135,23 +142,35 @@ fn execute_parallel_group_standalone(
     shutdown_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
     requests: Vec<(usize, ToolExecutionRequest)>,
     completed: Arc<AtomicUsize>,
+    entries: Arc<std::sync::Mutex<Vec<ToolProgressEntry>>>,
     file_cache: Option<std::sync::Arc<std::sync::Mutex<crate::tooling::file_cache::FileReadCache>>>,
 ) -> Vec<(usize, ToolExecutionResult)> {
     let cwd = config.paths.cwd.clone();
     let runtime = &config.runtime;
     let mut all_results = Vec::new();
 
+    let mut chunk_offset = 0usize;
     for chunk in requests.chunks(MAX_PARALLEL_THREADS) {
+        let current_offset = chunk_offset;
         all_results.extend(std::thread::scope(|s| {
             let handles: Vec<_> = chunk
                 .iter()
-                .map(|(idx, request)| {
+                .enumerate()
+                .map(|(pos_in_chunk, (idx, request))| {
                     let cwd = cwd.clone();
                     let shutdown = shutdown_flag.clone();
                     let idx = *idx;
                     let completed = completed.clone();
+                    let entries = entries.clone();
+                    let entry_index = current_offset + pos_in_chunk;
                     let file_cache = file_cache.clone();
                     s.spawn(move || {
+                        // Update started_at to actual execution start time
+                        if let Ok(mut guard) = entries.lock()
+                            && let Some(entry) = guard.get_mut(entry_index)
+                        {
+                            entry.started_at = std::time::Instant::now();
+                        }
                         let mut executor = LocalToolExecutor::new(cwd, runtime, file_cache)
                             .with_shutdown_flag(shutdown);
                         let tool_call_id = request.tool_call_id.clone();
@@ -189,8 +208,24 @@ fn execute_parallel_group_standalone(
                                 elapsed_ms: 0,
                                 diff_summary: None,
                                 edit_detail: None,
+                                rolled_back: false,
                             }
                         });
+                        // Update progress entry
+                        if let Ok(mut guard) = entries.lock()
+                            && let Some(entry) = guard.get_mut(entry_index)
+                        {
+                            let elapsed =
+                                entry.started_at.elapsed().as_millis().min(u64::MAX as u128)
+                                    as u64;
+                            entry.elapsed_ms = Some(elapsed);
+                            entry.status =
+                                if result.status == ToolExecutionStatus::Completed {
+                                    ToolProgressStatus::Completed
+                                } else {
+                                    ToolProgressStatus::Failed
+                                };
+                        }
                         completed.fetch_add(1, Ordering::Relaxed);
                         (idx, result)
                     })
@@ -220,6 +255,7 @@ fn execute_parallel_group_standalone(
                                 elapsed_ms: 0,
                                 diff_summary: None,
                                 edit_detail: None,
+                                rolled_back: false,
                             },
                         ));
                     }
@@ -227,6 +263,7 @@ fn execute_parallel_group_standalone(
             }
             results
         }));
+        chunk_offset += chunk.len();
     }
 
     all_results
@@ -282,6 +319,7 @@ impl App {
                     elapsed_ms: 0,
                     diff_summary: None,
                     edit_detail: None,
+                    rolled_back: false,
                 });
                 continue;
             }
@@ -427,6 +465,15 @@ impl App {
         self.phase_estimator.reset();
         // Reset read transition guard per-turn counters (Issue #216)
         self.read_transition_guard.reset();
+        // Reset execution plan per user-turn (Issue #249)
+        self.reset_execution_plan();
+
+        // Issue #249: Detect ANVIL_PLAN from initial response
+        self.try_register_plan(&current.raw_content);
+
+        // Session note extraction bookkeeping (Issue #241)
+        let msg_count_before = self.session.messages.len();
+        let tokens_before = self.session.estimated_token_count();
 
         for iteration in 0..max_iterations {
             let iteration_started = std::time::Instant::now();
@@ -434,6 +481,12 @@ impl App {
             // Check shutdown flag before tool execution
             if self.is_shutdown_requested() {
                 break;
+            }
+
+            // Issue #269 Phase 3: stagnation begin_turn hook.
+            {
+                let workset = self.execution_plan.current_workset();
+                self.stagnation_state.begin_turn(&workset);
             }
 
             // Step 1: Extract and run sub-agent calls (IR3-001)
@@ -451,6 +504,7 @@ impl App {
                 tool_calls: normal_calls,
                 final_response: current.final_response.clone(),
                 anvil_final_detected: current.anvil_final_detected,
+                raw_content: current.raw_content.clone(),
             };
 
             // Show plan for this iteration
@@ -479,6 +533,36 @@ impl App {
             let (results, loop_action) = self.execute_structured_tool_calls(&current_normal)?;
             total_tool_count += results.len();
 
+            // Update plan item status from tool results; capture telemetry.
+            let (turn_mutations, turn_items_advanced) = self.update_plan_from_results(&results);
+
+            // Issue #269 Phase 3: record each successful mutation for stagnation tracking.
+            // Issue #273: Also record first mutation event telemetry here so plan-free runs
+            // (where update_plan_from_results returns 0) are also captured.
+            // tool_name is always from MUTATION_TOOLS (allowlisted) due to the .contains() guard.
+            {
+                // Compute elapsed once per turn (same value for all mutations in this batch).
+                let elapsed_s = self
+                    .session_stats
+                    .session_start
+                    .map(|s| s.elapsed().as_secs_f64());
+                for r in &results {
+                    if crate::app::MUTATION_TOOLS.contains(&r.tool_name.as_str())
+                        && r.status == crate::tooling::ToolExecutionStatus::Completed
+                        && !r.rolled_back
+                        && !r.summary.is_empty()
+                        && !r.summary.contains("(no changes)")
+                    {
+                        self.stagnation_state.record_mutation(&r.summary);
+                        self.agent_telemetry.record_mutation_turn(
+                            self.session_stats.total_turns,
+                            elapsed_s,
+                            &r.tool_name, // already validated by MUTATION_TOOLS.contains()
+                        );
+                    }
+                }
+            }
+
             let tool_log_views: Vec<ToolLogView> = results
                 .iter()
                 .map(ToolExecutionResult::to_tool_log_view)
@@ -506,7 +590,11 @@ impl App {
             // Issue #173: If ANVIL_FINAL was already seen, terminate after
             // executing the current tool batch (no further LLM round-trips).
             if anvil_final_seen {
-                if self.should_activate_guidance_retry(guidance_retry_used, &results) {
+                // Issue #249: Plan-aware ANVIL_FINAL gate — suppress if plan is incomplete
+                if self.check_plan_final_gate() {
+                    tracing::info!("ANVIL_FINAL suppressed by plan gate; continuing execution");
+                    anvil_final_seen = false;
+                } else if self.should_activate_guidance_retry(guidance_retry_used, &results) {
                     tracing::info!(
                         "ANVIL_FINAL delayed: synthetic guidance injected, sending one follow-up turn"
                     );
@@ -515,6 +603,7 @@ impl App {
                     anvil_final_seen = false;
                 } else {
                     tracing::info!("ANVIL_FINAL detected; terminating after tool execution");
+                    self.phase_estimator.accept_anvil_final();
                     break;
                 }
             }
@@ -533,6 +622,10 @@ impl App {
             if self.is_shutdown_requested() {
                 break;
             }
+
+            // Issue #249: Inject plan turn guidance before follow-up LLM call.
+            // Returns the guidance char count for telemetry (Issue #269 Phase 0).
+            let guidance_chars_this_turn = self.inject_plan_turn_guidance().unwrap_or(0);
 
             // Send tool results back to LLM for the next turn
             let spinner = Spinner::start(
@@ -573,7 +666,10 @@ impl App {
             // Collect tool names for this iteration's turn summary (before LLM call)
             let turn_tool_names: Vec<String> =
                 results.iter().map(|r| r.tool_name.clone()).collect();
-            let turn_files_modified = results.iter().filter(|r| r.diff_summary.is_some()).count();
+            let turn_files_modified = results
+                .iter()
+                .filter(|r| r.diff_summary.is_some() && !r.rolled_back)
+                .count();
             let turn_tool_count = results.len() + agent_results.len();
 
             let mut next_token_buffer = String::new();
@@ -649,6 +745,25 @@ impl App {
 
             // Record turn stats AFTER the full iteration completes (Issue #206 CB-001)
             self.session_stats.record_turn();
+            // Issue #269 Phase 0: pass actual guidance_chars and workset_size.
+            let workset_size_this_turn = self.execution_plan.current_workset_size();
+            self.agent_telemetry.record_turn_metrics(
+                turn_mutations,
+                turn_items_advanced,
+                guidance_chars_this_turn as u32,
+                workset_size_this_turn as u32,
+            );
+            // Issue #269 Phase 3: stagnation end_turn hook + forced mode update.
+            self.stagnation_state.end_turn(turn_mutations > 0);
+            let stagnation_score =
+                crate::app::stagnation_state::compute_stagnation_score(&self.stagnation_state);
+            self.forced_mode_active = stagnation_score >= 2;
+            if self.forced_mode_active {
+                tracing::warn!(
+                    score = stagnation_score,
+                    "stagnation detected; forced_mode_active=true"
+                );
+            }
             log_turn_summary(&TurnSummary {
                 turn: self.session_stats.total_turns,
                 max_turns: max_iterations as u32,
@@ -659,9 +774,17 @@ impl App {
                 tool_names: &turn_tool_names,
                 files_modified: turn_files_modified,
                 compact_info: self.last_compact_info.as_ref(),
+                phase: self.phase_estimator.current_phase(),
+                mutations_this_turn: Some(turn_mutations),
+                items_advanced_this_turn: Some(turn_items_advanced),
             });
             // Reset last_compact_info after it's been consumed by the turn summary
             self.last_compact_info = None;
+
+            // Issue #249: Detect ANVIL_PLAN / ANVIL_PLAN_UPDATE from follow-up responses.
+            // Scan the raw token buffer since ANVIL_PLAN may be outside the ANVIL_FINAL block.
+            self.try_register_plan(&next_token_buffer);
+            self.try_update_plan(&next_token_buffer);
 
             // Issue #173: Update ANVIL_FINAL tracking from the new response
             if next_structured.anvil_final_detected {
@@ -676,9 +799,6 @@ impl App {
                         tracing::info!(
                             "Guidance follow-up ended without edits; escalating to final guard retry"
                         );
-                        if !next_structured.anvil_final_detected {
-                            self.phase_estimator.observe_anvil_final();
-                        }
                         self.inject_final_guard_retry();
                         final_guard_retries += 1;
                         current = next_structured;
@@ -693,10 +813,6 @@ impl App {
                 }
                 // ANVIL_FINAL guard: check if any file modifications were made
                 if self.should_activate_final_guard(final_guard_retries) {
-                    // ANVIL_FINAL was detected → record observation (Issue #159)
-                    if !next_structured.anvil_final_detected {
-                        self.phase_estimator.observe_anvil_final();
-                    }
                     self.inject_final_guard_retry();
                     final_guard_retries += 1;
                     current = next_structured;
@@ -718,7 +834,18 @@ impl App {
                     break;
                 }
 
+                // Issue #249: Plan gate — suppress termination if plan is incomplete
+                if self.check_plan_final_gate() {
+                    tracing::info!("Plan gate: suppressing termination with empty tool calls");
+                    current = next_structured;
+                    continue;
+                }
+
                 // No more tool calls — this is the final answer
+                // Issue #261 Task 0.4: Mark as accepted (not suppressed)
+                if anvil_final_seen {
+                    self.phase_estimator.accept_anvil_final();
+                }
                 self.record_assistant_output(
                     self.next_message_id("assistant"),
                     next_structured.final_response,
@@ -731,6 +858,23 @@ impl App {
                 awaiting_guidance_followup = false;
             }
             current = next_structured;
+        }
+
+        // Issue #255: Classify completion kind based on plan state.
+        {
+            let budget_exhausted = total_tool_count >= self.config.runtime.max_tool_calls;
+            let completion_kind = crate::contracts::CompletionKind::classify(
+                &self.execution_plan,
+                None, // verify not yet implemented (Stage 3)
+                budget_exhausted,
+            );
+            self.agent_telemetry.completion_kind = Some(completion_kind);
+            tracing::info!(
+                completion_kind = %completion_kind,
+                plan_items = self.execution_plan.items.len(),
+                plan_finished = self.execution_plan.finished_count(),
+                "agentic loop completion classified"
+            );
         }
 
         // Transition to Done
@@ -758,6 +902,24 @@ impl App {
         let mut done_snapshot = self.transition_with_context(done, StateTransition::Finish)?;
         self.evaluate_context_warning(&mut done_snapshot);
         frames.push(self.render_console(tui)?);
+
+        // Session note extraction (Issue #241)
+        let tokens_after = self.session.estimated_token_count();
+        let context_window = self.effective_context_window() as usize;
+        let token_delta = tokens_after.saturating_sub(tokens_before);
+        if total_tool_count >= 5 || token_delta >= context_window / 10 {
+            let turn_messages = &self.session.messages[msg_count_before..];
+            let notes = crate::session::extract_session_notes(turn_messages);
+            for note in &notes {
+                tracing::info!(
+                    kind = %note.kind,
+                    files = ?note.files,
+                    "session_note: {}",
+                    note.summary
+                );
+            }
+        }
+
         Ok(frames)
     }
 
@@ -801,6 +963,7 @@ impl App {
                         elapsed_ms: 0,
                         diff_summary: None,
                         edit_detail: None,
+                        rolled_back: false,
                     },
                 ));
                 continue;
@@ -900,6 +1063,7 @@ impl App {
                 elapsed_ms: 0,
                 diff_summary: None,
                 edit_detail: None,
+                rolled_back: false,
             });
 
         // Remove checkpoint if tool execution failed.
@@ -935,6 +1099,7 @@ impl App {
                 elapsed_ms: 0,
                 diff_summary: None,
                 edit_detail: None,
+                rolled_back: false,
             };
         };
 
@@ -962,6 +1127,7 @@ impl App {
             elapsed_ms: started.elapsed().as_millis(),
             diff_summary: None,
             edit_detail: None,
+            rolled_back: false,
         }
     }
 
@@ -1022,6 +1188,7 @@ impl App {
                                     elapsed_ms: 0,
                                     diff_summary: None,
                                     edit_detail: None,
+                                    rolled_back: false,
                                 },
                             ));
                         }
@@ -1085,6 +1252,7 @@ impl App {
                 elapsed_ms: 0,
                 diff_summary: None,
                 edit_detail: None,
+                rolled_back: false,
             }),
             _ => None,
         };
@@ -1110,13 +1278,27 @@ impl App {
             match group {
                 ExecutionGroup::Parallel(requests) if requests.len() >= 2 => {
                     let completed = Arc::new(AtomicUsize::new(0));
-                    let spinner =
-                        Spinner::start_parallel(requests.len(), completed.clone(), interactive);
+                    let progress_entries: Vec<ToolProgressEntry> = requests
+                        .iter()
+                        .map(|(_, req)| ToolProgressEntry {
+                            tool_name: req.spec.name.clone(),
+                            status: ToolProgressStatus::Running,
+                            started_at: std::time::Instant::now(),
+                            elapsed_ms: None,
+                        })
+                        .collect();
+                    let entries = Arc::new(std::sync::Mutex::new(progress_entries));
+                    let spinner = Spinner::start_parallel_detailed(
+                        entries.clone(),
+                        completed.clone(),
+                        interactive,
+                    );
                     let parallel_results = execute_parallel_group_standalone(
                         &self.config,
                         self.shutdown_flag(),
                         requests,
                         completed,
+                        entries,
                         Some(self.file_read_cache.clone()),
                     );
                     spinner.stop();
@@ -1195,10 +1377,11 @@ impl App {
                 .map(|(_, r)| r.tool_call_id.clone())
                 .collect();
 
-            // Annotate successful file-mutating results with rollback info
+            // Annotate successful file-mutating results with rollback info (Issue #259)
             for (_, r) in &mut indexed_results {
                 if r.status == ToolExecutionStatus::Completed && rb_ids.contains(&r.tool_call_id) {
                     r.summary = format!("{} [rolled back: atomic transaction failed]", r.summary);
+                    r.rolled_back = true;
                 }
             }
 
@@ -1235,9 +1418,20 @@ impl App {
             if !matches!(pa, super::phase_estimator::PhaseAction::Continue) {
                 phase_action = pa;
             }
-            let transition_action = self
-                .read_transition_guard
-                .record_tool_call(&result.tool_name, success);
+            // Issue #265: pass shell command to read_transition_guard so
+            // grep/sed/cat are counted as exploration calls.
+            let shell_cmd: Option<String> = if result.tool_name == "shell.exec" {
+                tool_input_map
+                    .get(&result.tool_call_id)
+                    .and_then(|(_, v)| v.get("command").and_then(|c| c.as_str()).map(String::from))
+            } else {
+                None
+            };
+            let transition_action = self.read_transition_guard.record_tool_call_ex(
+                &result.tool_name,
+                success,
+                shell_cmd.as_deref(),
+            );
             if let ReadTransitionAction::Inject(msg) = transition_action {
                 read_transition_message = Some(msg);
             }
@@ -1306,6 +1500,7 @@ impl App {
                 elapsed_ms: 0,
                 diff_summary: None,
                 edit_detail: None,
+                rolled_back: false,
             };
             self.record_tool_result(&transition_result);
             results.push(transition_result);
@@ -1335,6 +1530,7 @@ impl App {
                     elapsed_ms: 0,
                     diff_summary: None,
                     edit_detail: None,
+                    rolled_back: false,
                 };
                 self.record_tool_result(&transition_result);
                 results.push(transition_result);
@@ -1350,11 +1546,16 @@ impl App {
         // Session stats: record tool call (Issue #206 C-3)
         self.session_stats.record_tool_call(&result.tool_name);
 
-        // Session stats: record file change line counts from diff_summary (Issue #206 C-3)
-        if let Some(ref diff) = result.diff_summary {
+        // Session stats: record file change line counts from diff_summary (Issue #206 C-3, #259)
+        // Skip rolled-back results to avoid counting reverted changes.
+        if !result.rolled_back
+            && let Some(ref diff) = result.diff_summary
+        {
             let (added, deleted) = super::count_diff_lines(diff);
             self.session_stats.record_file_change(added, deleted);
-            self.session_stats.files_modified += 1;
+            for artifact in &result.artifacts {
+                self.session_stats.files_modified.insert(artifact.clone());
+            }
         }
 
         // Track tool usage for dynamic system prompt generation (Issue #73)
@@ -1555,6 +1756,19 @@ impl App {
         // Append read repeat hint if repeated reads detected (Issue #185)
         if let Some(hint) = read_hint {
             formatted.push_str(&hint);
+        }
+        // Issue #265: Inject hint when shell.exec is used for file reading
+        // (grep/sed/cat), which bypasses the read transition guard.
+        if result.tool_name == "shell.exec"
+            && result.status == ToolExecutionStatus::Completed
+            && let Some(cmd) = result.summary.strip_prefix("shell.exec completed: ")
+            && crate::tooling::shell_policy::is_file_read_shell_command(cmd)
+        {
+            formatted.push_str(
+                "\n\n[Anvil hint] Using grep/sed/cat to read file contents counts as \
+                 exploration. You already have enough context — proceed to implement \
+                 changes using file.edit or file.write instead of reading more.",
+            );
         }
         let mut msg = SessionMessage::new(MessageRole::Tool, &result.tool_name, formatted)
             .with_id(self.next_message_id("tool"));
@@ -1794,6 +2008,22 @@ impl App {
             {
                 // ANVIL_FINAL detected → record observation (Issue #159)
                 self.phase_estimator.observe_anvil_final();
+                // Issue #253: Apply plan gate even on zero-tool-call Done path.
+                // Use require_plan variant so NoPlan also suppresses.
+                if self.check_plan_final_gate_require_plan() {
+                    self.record_assistant_output(
+                        self.next_message_id("assistant"),
+                        assistant_message,
+                    )?;
+                    return Ok(Some(self.run_guarded_retry_turn(
+                        status,
+                        saved_status,
+                        *elapsed_ms,
+                        inference_performance.clone(),
+                        tui,
+                        provider_client,
+                    )?));
+                }
                 self.inject_final_guard_retry();
                 // Record the assistant message that triggered the guard
                 self.record_assistant_output(self.next_message_id("assistant"), assistant_message)?;
@@ -1820,6 +2050,9 @@ impl App {
                 tool_names: &[],
                 files_modified: 0,
                 compact_info: None,
+                phase: self.phase_estimator.current_phase(),
+                mutations_this_turn: None,
+                items_advanced_this_turn: None,
             });
             return Ok(None);
         }
@@ -2049,6 +2282,7 @@ fn build_failed_result(
         elapsed_ms: 0,
         diff_summary: None,
         edit_detail: None,
+        rolled_back: false,
     }
 }
 
@@ -2305,6 +2539,7 @@ mod trust_tests {
             elapsed_ms: 0,
             diff_summary: None,
             edit_detail: None,
+            rolled_back: false,
         };
 
         let formatted = format_tool_result_message(&result, 8_000);

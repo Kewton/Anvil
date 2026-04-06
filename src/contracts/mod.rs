@@ -91,6 +91,949 @@ impl SubAgentPayload {
 }
 
 // ---------------------------------------------------------------------------
+// Completion taxonomy (Issue #255: AgentPhase integration)
+// ---------------------------------------------------------------------------
+
+/// How the agentic session ended, classified by plan state and verification.
+///
+/// Priority order (highest first):
+/// 1. Blocked (has_blocked items -> always Blocked)
+/// 2. CompleteVerified
+/// 3. CompleteUnverified
+/// 4. Exhausted
+/// 5. Partial
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionKind {
+    /// All actionable items completed + verify succeeded.
+    CompleteVerified,
+    /// All actionable items completed + verify unavailable/denied.
+    CompleteUnverified,
+    /// Some changes made but items remain unfinished.
+    #[default]
+    Partial,
+    /// Item(s) blocked due to repeated failures.
+    Blocked,
+    /// Budget / turn limit exhausted with unfinished items.
+    Exhausted,
+}
+
+impl std::fmt::Display for CompletionKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CompleteVerified => write!(f, "complete_verified"),
+            Self::CompleteUnverified => write!(f, "complete_unverified"),
+            Self::Partial => write!(f, "partial"),
+            Self::Blocked => write!(f, "blocked"),
+            Self::Exhausted => write!(f, "exhausted"),
+        }
+    }
+}
+
+impl CompletionKind {
+    /// Classify termination based on plan state, verify outcome, and budget.
+    ///
+    /// - `verify_pass`: `Some(true)` = verified, `Some(false)` = verify failed,
+    ///   `None` = unavailable/denied.
+    /// - `budget_exhausted`: whether budget/turn limit was reached.
+    pub fn classify(
+        plan: &ExecutionPlan,
+        verify_pass: Option<bool>,
+        budget_exhausted: bool,
+    ) -> Self {
+        let all_finished = plan.all_finished() && !plan.is_empty();
+        let has_blocked = plan
+            .items
+            .iter()
+            .any(|i| i.status == PlanItemStatus::Blocked);
+
+        // Priority 1: blocked items exist → always Blocked
+        if has_blocked {
+            return CompletionKind::Blocked;
+        }
+
+        // Priority 2-3: all items finished → complete_*
+        if all_finished {
+            return match verify_pass {
+                Some(true) => CompletionKind::CompleteVerified,
+                _ => CompletionKind::CompleteUnverified,
+            };
+        }
+
+        // Priority 4: budget exhausted
+        if budget_exhausted {
+            return CompletionKind::Exhausted;
+        }
+
+        // Priority 5: fallback
+        CompletionKind::Partial
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Agent telemetry (Issue #255: Stage 0 observability)
+// ---------------------------------------------------------------------------
+
+/// Telemetry counters for the agentic session.
+///
+/// Tracks key metrics for evaluating agent loop quality:
+/// - Premature ANVIL_FINAL requests (PFRR)
+/// - Plan registration / update counts
+/// - `sync_from_touched_files` rescue invocations
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentTelemetry {
+    /// Number of ANVIL_FINAL requests that were suppressed (plan incomplete).
+    pub premature_final_count: u32,
+    /// Total ANVIL_FINAL requests observed (both accepted and suppressed).
+    pub total_final_requests: u32,
+    /// Number of times a plan was registered via ANVIL_PLAN.
+    pub plan_registration_count: u32,
+    /// Number of times ANVIL_PLAN_UPDATE appended items.
+    pub plan_update_count: u32,
+    /// Number of times sync_from_touched_files actually advanced items.
+    pub sync_from_touched_files_count: u32,
+    /// Final completion classification.
+    pub completion_kind: Option<CompletionKind>,
+
+    /// Number of times initial ANVIL_PLAN detection missed (raw_content fallback used).
+    #[serde(default)]
+    pub initial_plan_miss_count: u32,
+    /// Number of no-op mutations filtered (summary contains "(no changes)").
+    #[serde(default)]
+    pub no_op_mutation_count: u32,
+    /// Number of rolled_back mutations filtered.
+    #[serde(default)]
+    pub rolled_back_mutation_count: u32,
+    /// Mutations per turn (Phase 0: actual values).
+    #[serde(default)]
+    pub mutations_per_turn: Vec<u32>,
+    /// Items advanced per turn (Phase 0: actual values).
+    #[serde(default)]
+    pub items_advanced_per_turn: Vec<u32>,
+    /// Guidance characters per turn (Phase 0: 0, Phase 1: actual values).
+    #[serde(default)]
+    pub guidance_chars_per_turn: Vec<u32>,
+    /// Workset size per turn (Phase 0: always 1, Phase 1: actual values).
+    #[serde(default)]
+    pub workset_size_per_turn: Vec<u32>,
+    /// Number of forced workset transitions triggered by stagnation control (Issue #263).
+    #[serde(default)]
+    pub forced_workset_transition_count: u32,
+    /// Number of ANVIL_PLAN_UPDATE requests triggered by stagnation control (Issue #263).
+    #[serde(default)]
+    pub plan_repair_request_count: u32,
+
+    /// Number of ANVIL_PLAN blocks observed (visible to external telemetry).
+    #[serde(default)]
+    pub anvil_plan_visible_count: u32,
+
+    /// Last turn on which a mutation (file change) occurred.
+    #[serde(default)]
+    pub last_mutation_turn: u32,
+
+    /// ANVIL_FINAL suppressed with remaining core targets > 0 (count).
+    #[serde(default)]
+    pub final_suppressed_with_remaining_targets_count: u32,
+
+    /// First mutation event turn (Issue #273 Phase 1.5).
+    /// None if no mutation occurred during the session.
+    #[serde(default)]
+    pub first_mutation_event_turn: Option<u32>,
+
+    /// Elapsed seconds from session start to first mutation event (Issue #273 Phase 1.5).
+    /// None if no mutation occurred during the session.
+    #[serde(default)]
+    pub first_mutation_event_elapsed_s: Option<f64>,
+
+    /// Tool name that triggered the first mutation event (Issue #273 Phase 1.5).
+    /// None if no mutation occurred during the session.
+    #[serde(default)]
+    pub first_mutation_event_tool: Option<String>,
+}
+
+impl AgentTelemetry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn record_premature_final(&mut self) {
+        self.premature_final_count += 1;
+    }
+
+    pub fn record_final_request(&mut self) {
+        self.total_final_requests += 1;
+    }
+
+    pub fn record_plan_registration(&mut self) {
+        self.plan_registration_count += 1;
+    }
+
+    pub fn record_plan_update(&mut self) {
+        self.plan_update_count += 1;
+    }
+
+    pub fn record_sync_from_touched_files(&mut self) {
+        self.sync_from_touched_files_count += 1;
+    }
+
+    /// Record an initial plan miss (raw_content fallback used).
+    pub fn record_initial_plan_miss(&mut self) {
+        self.initial_plan_miss_count += 1;
+    }
+
+    /// Record a no-op mutation (filtered out).
+    pub fn record_no_op_mutation(&mut self) {
+        self.no_op_mutation_count += 1;
+    }
+
+    /// Record a rolled_back mutation (filtered out).
+    pub fn record_rolled_back_mutation(&mut self) {
+        self.rolled_back_mutation_count += 1;
+    }
+
+    /// Record per-turn metrics for batch experiment telemetry.
+    pub fn record_turn_metrics(
+        &mut self,
+        mutations: u32,
+        items_advanced: u32,
+        guidance_chars: u32,
+        workset_size: u32,
+    ) {
+        self.mutations_per_turn.push(mutations);
+        self.items_advanced_per_turn.push(items_advanced);
+        self.guidance_chars_per_turn.push(guidance_chars);
+        self.workset_size_per_turn.push(workset_size);
+    }
+
+    /// Record a forced workset transition (Issue #263).
+    pub fn record_forced_workset_transition(&mut self) {
+        self.forced_workset_transition_count += 1;
+    }
+
+    /// Record a plan repair request (Issue #263).
+    pub fn record_plan_repair_request(&mut self) {
+        self.plan_repair_request_count += 1;
+    }
+
+    /// Record an ANVIL_PLAN block observed (visible to external telemetry).
+    pub fn record_anvil_plan_visible(&mut self) {
+        self.anvil_plan_visible_count += 1;
+    }
+
+    /// Record a mutation turn: updates `last_mutation_turn` and, on the first call only,
+    /// populates `first_mutation_event_*`.
+    ///
+    /// Callers must ensure `tool_name` is an allowlisted mutation tool
+    /// (i.e. from `crate::app::MUTATION_TOOLS`) to avoid storing arbitrary strings.
+    pub fn record_mutation_turn(&mut self, turn: u32, elapsed_s: Option<f64>, tool_name: &str) {
+        self.last_mutation_turn = turn;
+        if self.first_mutation_event_turn.is_none() {
+            self.first_mutation_event_turn = Some(turn);
+            self.first_mutation_event_elapsed_s = elapsed_s;
+            self.first_mutation_event_tool = Some(tool_name.to_string());
+        }
+    }
+
+    /// Record an ANVIL_FINAL suppression with remaining core targets.
+    pub fn record_final_suppressed_with_remaining_targets(&mut self) {
+        self.final_suppressed_with_remaining_targets_count += 1;
+    }
+
+    /// Threshold: mutations after this turn are considered "late".
+    pub const LATE_MUTATION_THRESHOLD: u32 = 20;
+
+    /// Late mutation flag: last_mutation_turn exceeds the threshold.
+    pub fn is_late_mutation(&self) -> bool {
+        self.last_mutation_turn > Self::LATE_MUTATION_THRESHOLD
+    }
+
+    /// Accepted ANVIL_FINAL count: total minus premature (saturating).
+    pub fn accepted_final_count(&self) -> u32 {
+        self.total_final_requests
+            .saturating_sub(self.premature_final_count)
+    }
+
+    /// Write telemetry artifact to `$ANVIL_TELEMETRY_DIR/{session_id}_telemetry.json`.
+    ///
+    /// Returns `Ok(())` when `ANVIL_TELEMETRY_DIR` is unset (no-op) or when the
+    /// file was successfully written.  Returns `Err` on validation or I/O failure.
+    pub fn write_artifact(&self, session_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let dir_raw = match std::env::var("ANVIL_TELEMETRY_DIR") {
+            Ok(v) if !v.is_empty() => v,
+            _ => return Ok(()), // no-op when unset
+        };
+
+        self.write_artifact_to_dir(&dir_raw, session_id)
+    }
+
+    /// Write telemetry artifact to the given directory path.
+    ///
+    /// Validates that the path is absolute, not a symlink, and is an existing
+    /// directory.  Creates `{session_id}_telemetry.json` using `create_new`
+    /// (refuses to overwrite).
+    pub fn write_artifact_to_dir(
+        &self,
+        dir_raw: &str,
+        session_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let dir_path = std::path::Path::new(dir_raw);
+
+        // Reject relative paths.
+        if !dir_path.is_absolute() {
+            return Err("telemetry dir must be an absolute path".into());
+        }
+
+        // Reject symlinks on the directory itself.
+        let meta = std::fs::symlink_metadata(dir_path)
+            .map_err(|_| "telemetry dir does not exist or is inaccessible")?;
+        if meta.file_type().is_symlink() {
+            return Err("telemetry dir must not be a symlink".into());
+        }
+
+        // Canonicalize and verify it is a directory.
+        let canonical =
+            std::fs::canonicalize(dir_path).map_err(|_| "telemetry dir cannot be canonicalized")?;
+        if !canonical.is_dir() {
+            return Err("telemetry dir is not a directory".into());
+        }
+
+        // Sanitize session_id: reject any path separators or leading dots to prevent
+        // directory traversal (e.g. "../evil" or "/abs/path").
+        if session_id.contains('/') || session_id.contains('\\') || session_id.starts_with('.') {
+            return Err("session_id contains invalid characters for use in a filename".into());
+        }
+
+        let file_path = canonical.join(format!("{session_id}_telemetry.json"));
+
+        // Verify the resulting path is still inside the canonical directory.
+        if !file_path.starts_with(&canonical) {
+            return Err("telemetry file path escapes the target directory".into());
+        }
+
+        // Build the artifact payload with derived values.
+        let completion = self
+            .completion_kind
+            .map(|k| k.to_string())
+            .unwrap_or_else(|| "none".to_string());
+
+        let payload = serde_json::json!({
+            "schema_version": "2",
+            "session_id": session_id,
+            "completion_kind": completion,
+            "premature_final_count": self.premature_final_count,
+            "total_final_requests": self.total_final_requests,
+            "accepted_final_count": self.accepted_final_count(),
+            "plan_registration_count": self.plan_registration_count,
+            "plan_update_count": self.plan_update_count,
+            "anvil_plan_visible_count": self.anvil_plan_visible_count,
+            "last_mutation_turn": self.last_mutation_turn,
+            "late_mutation_flag": self.is_late_mutation(),
+            "final_suppressed_with_remaining_targets_count":
+                self.final_suppressed_with_remaining_targets_count,
+            "sync_from_touched_files_count": self.sync_from_touched_files_count,
+            "forced_workset_transition_count": self.forced_workset_transition_count,
+            "initial_plan_miss_count": self.initial_plan_miss_count,
+            "no_op_mutation_count": self.no_op_mutation_count,
+            "rolled_back_mutation_count": self.rolled_back_mutation_count,
+            "plan_repair_request_count": self.plan_repair_request_count,
+            "mutations_per_turn": self.mutations_per_turn,
+            "items_advanced_per_turn": self.items_advanced_per_turn,
+            "guidance_chars_per_turn": self.guidance_chars_per_turn,
+            "workset_size_per_turn": self.workset_size_per_turn,
+            "first_mutation_event_turn": self.first_mutation_event_turn,
+            "first_mutation_event_elapsed_s": self.first_mutation_event_elapsed_s,
+            "first_mutation_event_tool": self.first_mutation_event_tool,
+            "first_mutation_event_semantic_basis": "runtime_lower_bound",
+        });
+
+        let json_bytes = serde_json::to_vec_pretty(&payload)?;
+
+        // create_new: refuse to overwrite existing files.
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&file_path)
+            .map_err(|e| format!("failed to create telemetry file: {e}"))?;
+
+        use std::io::Write;
+        file.write_all(&json_bytes)?;
+
+        Ok(())
+    }
+
+    /// Premature Final Request Rate: ratio of suppressed finals to total finals.
+    pub fn premature_final_request_rate(&self) -> f64 {
+        if self.total_final_requests == 0 {
+            return 0.0;
+        }
+        self.premature_final_count as f64 / self.total_final_requests as f64
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Execution Plan types (Issue #249: Plan → Execute mode)
+// ---------------------------------------------------------------------------
+
+/// Status of an individual plan item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanItemStatus {
+    /// Not yet started.
+    Pending,
+    /// Currently being executed.
+    InProgress,
+    /// Successfully completed.
+    Done,
+    /// Blocked due to repeated failures.
+    Blocked,
+}
+
+impl std::fmt::Display for PlanItemStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pending => write!(f, "pending"),
+            Self::InProgress => write!(f, "in_progress"),
+            Self::Done => write!(f, "done"),
+            Self::Blocked => write!(f, "blocked"),
+        }
+    }
+}
+
+/// A single item in the execution plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanItem {
+    /// Human-readable description of the work item.
+    pub description: String,
+    /// Target file paths (extracted from the description, if any).
+    pub target_files: Vec<String>,
+    /// Current status.
+    pub status: PlanItemStatus,
+    /// Number of consecutive execution failures for this item.
+    #[serde(default)]
+    pub retry_count: u8,
+    /// Files that have been successfully mutated for this item (Issue #255).
+    /// Used to track progress toward completing all `target_files`.
+    #[serde(default)]
+    pub mutated_files: Vec<String>,
+}
+
+impl PlanItem {
+    /// Maximum consecutive failures before marking as Blocked.
+    pub const MAX_RETRIES: u8 = 3;
+
+    pub fn new(description: String, target_files: Vec<String>) -> Self {
+        Self {
+            description,
+            target_files,
+            status: PlanItemStatus::Pending,
+            retry_count: 0,
+            mutated_files: Vec::new(),
+        }
+    }
+
+    /// Whether this item is considered finished (Done or Blocked).
+    pub fn is_finished(&self) -> bool {
+        matches!(self.status, PlanItemStatus::Done | PlanItemStatus::Blocked)
+    }
+}
+
+/// The execution plan maintained by Anvil (Issue #249).
+///
+/// Parsed from `ANVIL_PLAN` / `ANVIL_PLAN_UPDATE` blocks emitted by the LLM.
+/// Controls ANVIL_FINAL acceptance: the loop cannot terminate until all items
+/// are finished (Done or Blocked).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ExecutionPlan {
+    pub items: Vec<PlanItem>,
+}
+
+/// Result of checking whether ANVIL_FINAL should be accepted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FinalGateDecision {
+    /// All items finished → allow ANVIL_FINAL.
+    Allow,
+    /// Plan not yet created → suppress and request plan creation.
+    NoPlan,
+    /// Unfinished items remain → suppress and guide to next item.
+    Incomplete {
+        next_description: String,
+        remaining: usize,
+        total: usize,
+    },
+}
+
+impl ExecutionPlan {
+    pub fn new(items: Vec<PlanItem>) -> Self {
+        Self { items }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Number of finished (Done or Blocked) items.
+    pub fn finished_count(&self) -> usize {
+        self.items.iter().filter(|i| i.is_finished()).count()
+    }
+
+    /// Whether all items are finished.
+    pub fn all_finished(&self) -> bool {
+        !self.items.is_empty() && self.items.iter().all(PlanItem::is_finished)
+    }
+
+    /// Get the index of the next pending or in-progress item.
+    pub fn next_actionable_index(&self) -> Option<usize> {
+        self.items.iter().position(|i| {
+            matches!(
+                i.status,
+                PlanItemStatus::Pending | PlanItemStatus::InProgress
+            )
+        })
+    }
+
+    /// Mark an item as Done by index.
+    pub fn mark_done(&mut self, index: usize) {
+        if let Some(item) = self.items.get_mut(index) {
+            item.status = PlanItemStatus::Done;
+        }
+    }
+
+    /// Mark an item as InProgress by index.
+    pub fn mark_in_progress(&mut self, index: usize) {
+        if let Some(item) = self.items.get_mut(index) {
+            item.status = PlanItemStatus::InProgress;
+        }
+    }
+
+    /// Record a failure for the current in-progress item.
+    /// Automatically transitions to Blocked after MAX_RETRIES.
+    pub fn record_failure(&mut self, index: usize) {
+        if let Some(item) = self.items.get_mut(index) {
+            item.retry_count += 1;
+            if item.retry_count >= PlanItem::MAX_RETRIES {
+                item.status = PlanItemStatus::Blocked;
+            }
+        }
+    }
+
+    /// Decide whether ANVIL_FINAL should be accepted.
+    pub fn check_final_gate(&self) -> FinalGateDecision {
+        if self.items.is_empty() {
+            return FinalGateDecision::NoPlan;
+        }
+        if self.all_finished() {
+            return FinalGateDecision::Allow;
+        }
+        let remaining = self.items.iter().filter(|i| !i.is_finished()).count();
+        let next_desc = self
+            .next_actionable_index()
+            .and_then(|i| self.items.get(i))
+            .map(|i| i.description.clone())
+            .unwrap_or_default();
+        FinalGateDecision::Incomplete {
+            next_description: next_desc,
+            remaining,
+            total: self.items.len(),
+        }
+    }
+
+    /// Fuzzy path match: true when either path is a suffix of the other.
+    ///
+    /// Used consistently across `record_mutation_success`, `sync_from_touched_files`,
+    /// and `update_plan_from_results` to avoid divergent matching behaviour.
+    pub fn path_matches(a: &str, b: &str) -> bool {
+        a.ends_with(b) || b.ends_with(a)
+    }
+
+    /// Record a successful mutation for a plan item (Issue #255).
+    ///
+    /// Tracks which files have been mutated. When all `target_files` are
+    /// covered (or item has no target_files), marks the item as Done.
+    pub fn record_mutation_success(&mut self, index: usize, file_path: &str) {
+        let item = match self.items.get_mut(index) {
+            Some(i) => i,
+            None => return,
+        };
+        if item.is_finished() {
+            return;
+        }
+
+        // Add to mutated_files if not already present
+        if !item.mutated_files.iter().any(|f| f == file_path) {
+            item.mutated_files.push(file_path.to_string());
+        }
+
+        // Check completion: all target_files must be covered
+        if item.target_files.is_empty() {
+            // No explicit targets → any mutation completes
+            item.status = PlanItemStatus::Done;
+        } else {
+            let all_covered = item.target_files.iter().all(|tf| {
+                item.mutated_files
+                    .iter()
+                    .any(|mf| Self::path_matches(mf, tf))
+            });
+            if all_covered {
+                item.status = PlanItemStatus::Done;
+            }
+        }
+    }
+
+    /// Return indices of the current workset: up to 5 actionable (Pending or InProgress) items.
+    ///
+    /// Used by batch guidance mode to identify items that can be executed together in a single turn.
+    /// Returns empty Vec when all items are finished.
+    pub fn current_workset(&self) -> Vec<usize> {
+        const MAX_WORKSET_SIZE: usize = 5;
+        self.items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| {
+                matches!(
+                    item.status,
+                    PlanItemStatus::Pending | PlanItemStatus::InProgress
+                )
+            })
+            .take(MAX_WORKSET_SIZE)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Return the number of items in the current workset.
+    ///
+    /// Equivalent to `current_workset().len()` but avoids allocating the
+    /// index vector, and is convenient for passing to `record_turn_metrics`.
+    pub fn current_workset_size(&self) -> usize {
+        self.current_workset().len()
+    }
+
+    /// Append new items (used by ANVIL_PLAN_UPDATE).
+    pub fn append_items(&mut self, new_items: Vec<PlanItem>) {
+        self.items.extend(new_items);
+    }
+
+    /// Sync plan item completion from the set of files actually modified.
+    ///
+    /// When a file.write/file.edit succeeds but the result is not passed to
+    /// `update_plan_from_results` (e.g. because the tool call appeared after
+    /// `ANVIL_FINAL` in the LLM response — Issue #251), the plan item stays
+    /// Pending/InProgress even though the work is done.  This method fixes
+    /// that by matching `touched_files` against each item's `target_files`.
+    ///
+    /// Issue #255: Changed from ANY to ALL target_files matching, consistent
+    /// with the strengthened item completion condition.
+    pub fn sync_from_touched_files(&mut self, touched_files: &[String]) {
+        if self.items.is_empty() || touched_files.is_empty() {
+            return;
+        }
+        let mut advanced = false;
+        for item in &mut self.items {
+            if item.is_finished() {
+                continue;
+            }
+            if item.target_files.is_empty() {
+                continue;
+            }
+            // Issue #255: Mark done only if ALL target files have been touched.
+            let all_matched = item.target_files.iter().all(|tf| {
+                touched_files
+                    .iter()
+                    .any(|touched| ExecutionPlan::path_matches(touched, tf))
+            });
+            if all_matched {
+                tracing::info!(
+                    description = %item.description,
+                    "plan item completed (synced from touched_files)"
+                );
+                item.status = PlanItemStatus::Done;
+                advanced = true;
+            }
+        }
+        // Auto-advance next pending item to InProgress
+        if advanced && let Some(next) = self.next_actionable_index() {
+            self.items[next].status = PlanItemStatus::InProgress;
+        }
+    }
+
+    /// Format the plan as a checklist string for display / system prompt injection.
+    pub fn format_checklist(&self) -> String {
+        let mut lines = Vec::new();
+        for (i, item) in self.items.iter().enumerate() {
+            let marker = match item.status {
+                PlanItemStatus::Done => "[x]",
+                PlanItemStatus::Blocked => "[!]",
+                PlanItemStatus::InProgress => "[>]",
+                PlanItemStatus::Pending => "[ ]",
+            };
+            lines.push(format!("  {}. {} {}", i + 1, marker, item.description));
+        }
+        lines.join("\n")
+    }
+
+    /// Build the system message to inject at the start of each execution turn.
+    ///
+    /// Uses Sequential mode (backward compatible). For mode-aware guidance,
+    /// use [`build_turn_guidance_with_mode`].
+    pub fn build_turn_guidance(&self) -> Option<String> {
+        self.build_turn_guidance_with_mode(crate::config::GuidanceMode::Sequential)
+    }
+
+    /// Build the system message with explicit guidance mode.
+    ///
+    /// - `Sequential`: guides LLM to execute one item at a time (current behavior).
+    /// - `Batch`: guides LLM to execute the current workset (up to 5 items) at once.
+    pub fn build_turn_guidance_with_mode(
+        &self,
+        mode: crate::config::GuidanceMode,
+    ) -> Option<String> {
+        let idx = self.next_actionable_index()?;
+        let finished = self.finished_count();
+        let total = self.items.len();
+
+        match mode {
+            crate::config::GuidanceMode::Sequential => {
+                let item = &self.items[idx];
+                let safe_desc =
+                    crate::app::stagnation_state::sanitize_for_prompt_entry(&item.description);
+                // Issue #269 Phase 2: show untouched target files instead of full checklist.
+                let untouched: Vec<String> = item
+                    .target_files
+                    .iter()
+                    .filter(|tf| {
+                        !item
+                            .mutated_files
+                            .iter()
+                            .any(|mf| Self::path_matches(mf, tf))
+                    })
+                    .map(|tf| {
+                        format!(
+                            "    - {}",
+                            crate::app::stagnation_state::sanitize_for_prompt_entry(tf)
+                        )
+                    })
+                    .collect();
+                let target_hint = if untouched.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n  未修正ファイル:\n{}", untouched.join("\n"))
+                };
+                Some(format!(
+                    "[System] 計画の次の項目を実行してください:\n  {}. {}{}\n完了: {}/{} 項目\n\n1項目ずつ実行し、全項目完了時のみ ANVIL_FINAL を出力してください。",
+                    idx + 1,
+                    safe_desc,
+                    target_hint,
+                    finished,
+                    total,
+                ))
+            }
+            crate::config::GuidanceMode::Batch => {
+                let workset = self.current_workset();
+                let remaining = total - finished;
+                let mut workset_lines = Vec::new();
+                for &wi in &workset {
+                    workset_lines.push(format!("  {}. {}", wi + 1, self.items[wi].description));
+                }
+                // Issue #269 Phase 2: removed full checklist re-display.
+                Some(format!(
+                    "[System] 以下の項目をまとめて実行してください:\n{}\n完了: {}/{} 項目 (残り {})\n\nこれらの項目をまとめて進めてください。全項目完了時のみ ANVIL_FINAL を出力してください。",
+                    workset_lines.join("\n"),
+                    finished,
+                    total,
+                    remaining,
+                ))
+            }
+            crate::config::GuidanceMode::Minimal => {
+                // Issue #269 Phase 1: minimal guidance for baseline comparison arm.
+                // Suppresses verbose checklists; only shows a terse reminder.
+                Some(format!(
+                    "[System] Proceed with next plan item. ({}/{} done)",
+                    finished, total
+                ))
+            }
+        }
+    }
+
+    /// Build the incomplete plan message for ANVIL_FINAL suppression.
+    ///
+    /// - `Sequential`: simple "next item" message (backward compatible).
+    /// - `Batch`: includes completed items, pending items (workset), and batch instruction.
+    pub fn build_incomplete_plan_message_with_mode(
+        &self,
+        mode: crate::config::GuidanceMode,
+    ) -> String {
+        let finished = self.finished_count();
+        let total = self.items.len();
+        let remaining = total - finished;
+
+        match mode {
+            crate::config::GuidanceMode::Sequential => {
+                // Issue #269 Phase 2: show untouched target files of next item.
+                let next_item = self.next_actionable_index().and_then(|i| self.items.get(i));
+                let next_desc = next_item
+                    .map(|i| {
+                        crate::app::stagnation_state::sanitize_for_prompt_entry(&i.description)
+                    })
+                    .unwrap_or_default();
+                let target_hint = next_item
+                    .map(|item| {
+                        let untouched: Vec<String> = item
+                            .target_files
+                            .iter()
+                            .filter(|tf| {
+                                !item
+                                    .mutated_files
+                                    .iter()
+                                    .any(|mf| Self::path_matches(mf, tf))
+                            })
+                            .map(|tf| {
+                                format!(
+                                    "    - {}",
+                                    crate::app::stagnation_state::sanitize_for_prompt_entry(tf)
+                                )
+                            })
+                            .collect();
+                        if untouched.is_empty() {
+                            String::new()
+                        } else {
+                            format!("\n  未修正ファイル:\n{}", untouched.join("\n"))
+                        }
+                    })
+                    .unwrap_or_default();
+                format!(
+                    "[System] まだ {remaining}/{total} 項目が未完了です。次の項目を実行してください:\n  {next_desc}{target_hint}\n\
+                     全項目完了後に ANVIL_FINAL を出力してください。"
+                )
+            }
+            crate::config::GuidanceMode::Batch => {
+                // Completed items
+                let completed_lines: Vec<String> = self
+                    .items
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, item)| item.status == PlanItemStatus::Done)
+                    .map(|(i, item)| format!("  {}. {}", i + 1, item.description))
+                    .collect();
+
+                // Workset (pending/in-progress items)
+                let workset = self.current_workset();
+                let workset_lines: Vec<String> = workset
+                    .iter()
+                    .map(|&i| format!("  {}. {}", i + 1, self.items[i].description))
+                    .collect();
+
+                let mut msg = format!("[System] まだ {remaining}/{total} 項目が未完了です。\n\n");
+
+                if !completed_lines.is_empty() {
+                    msg.push_str(&format!(
+                        "完了済み ({}/{total}):\n{}\n\n",
+                        completed_lines.len(),
+                        completed_lines.join("\n")
+                    ));
+                }
+
+                if !workset_lines.is_empty() {
+                    msg.push_str(&format!(
+                        "未完了 (次のworkset):\n{}\n\n",
+                        workset_lines.join("\n")
+                    ));
+                }
+
+                msg.push_str(
+                    "これらの項目をまとめて実行してください。全項目完了後に ANVIL_FINAL を出力してください。",
+                );
+                msg
+            }
+            crate::config::GuidanceMode::Minimal => {
+                // Issue #269 Phase 1: minimal incomplete message for baseline comparison arm.
+                format!("Plan incomplete: {remaining} of {total} items remain.")
+            }
+        }
+    }
+
+    /// Build turn guidance with a precomputed workset and forced mode flag (Issue #263).
+    ///
+    /// When `forced_mode` is true, includes a stagnation warning in the guidance.
+    pub fn build_turn_guidance_with_workset(
+        &self,
+        mode: crate::config::GuidanceMode,
+        workset: &[usize],
+        forced_mode: bool,
+    ) -> Option<String> {
+        if workset.is_empty() {
+            return self.build_turn_guidance_with_mode(mode);
+        }
+
+        let finished = self.finished_count();
+        let total = self.items.len();
+        let remaining = total - finished;
+
+        let mut workset_lines = Vec::new();
+        for &wi in workset {
+            if let Some(item) = self.items.get(wi) {
+                let safe_desc =
+                    crate::app::stagnation_state::sanitize_for_prompt_entry(&item.description);
+                workset_lines.push(format!("  {}. {}", wi + 1, safe_desc));
+            }
+        }
+
+        let forced_prefix = if forced_mode {
+            "⚠ STAGNATION DETECTED — You MUST change your approach.\n\n"
+        } else {
+            ""
+        };
+
+        // Issue #269 Phase 2: removed full checklist re-display.
+        Some(format!(
+            "{forced_prefix}[System] 以下の項目をまとめて実行してください:\n{}\n完了: {}/{} 項目 (残り {})\n\nこれらの項目をまとめて進めてください。全項目完了時のみ ANVIL_FINAL を出力してください。",
+            workset_lines.join("\n"),
+            finished,
+            total,
+            remaining,
+        ))
+    }
+
+    /// Build incomplete plan message with precomputed workset (Issue #263).
+    pub fn build_incomplete_plan_message_with_workset(
+        &self,
+        mode: crate::config::GuidanceMode,
+        workset: &[usize],
+        forced_mode: bool,
+    ) -> String {
+        if workset.is_empty() {
+            return self.build_incomplete_plan_message_with_mode(mode);
+        }
+
+        let finished = self.finished_count();
+        let total = self.items.len();
+        let remaining = total - finished;
+
+        let forced_prefix = if forced_mode {
+            "⚠ STAGNATION DETECTED — Forced workset transition active.\n\n"
+        } else {
+            ""
+        };
+
+        let workset_lines: Vec<String> = workset
+            .iter()
+            .filter_map(|&i| {
+                self.items.get(i).map(|item| {
+                    let safe_desc =
+                        crate::app::stagnation_state::sanitize_for_prompt_entry(&item.description);
+                    format!("  {}. {}", i + 1, safe_desc)
+                })
+            })
+            .collect();
+
+        format!(
+            "{forced_prefix}[System] まだ {remaining}/{total} 項目が未完了です。\n\n\
+             未完了 (次のworkset):\n{}\n\n\
+             これらの項目をまとめて実行してください。全項目完了後に ANVIL_FINAL を出力してください。",
+            workset_lines.join("\n")
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Application lifecycle types
 // ---------------------------------------------------------------------------
 
@@ -866,5 +1809,280 @@ mod tests {
         let back: SubAgentPayload = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.error, Some("timed out during exploration".to_string()));
         assert_eq!(back.termination_reason, TerminationReason::Timeout);
+    }
+
+    // ============================================================
+    // ExecutionPlan tests (Issue #249)
+    // ============================================================
+
+    #[test]
+    fn plan_item_new_defaults_to_pending() {
+        let item = PlanItem::new("do stuff".into(), vec!["src/main.rs".into()]);
+        assert_eq!(item.status, PlanItemStatus::Pending);
+        assert_eq!(item.retry_count, 0);
+        assert!(!item.is_finished());
+    }
+
+    #[test]
+    fn plan_item_is_finished() {
+        let mut item = PlanItem::new("x".into(), vec![]);
+        assert!(!item.is_finished());
+        item.status = PlanItemStatus::Done;
+        assert!(item.is_finished());
+        item.status = PlanItemStatus::Blocked;
+        assert!(item.is_finished());
+        item.status = PlanItemStatus::InProgress;
+        assert!(!item.is_finished());
+    }
+
+    #[test]
+    fn execution_plan_empty_default() {
+        let plan = ExecutionPlan::default();
+        assert!(plan.is_empty());
+        assert!(!plan.all_finished());
+        assert_eq!(plan.finished_count(), 0);
+        assert_eq!(plan.next_actionable_index(), None);
+    }
+
+    #[test]
+    fn execution_plan_mark_done_advances() {
+        let mut plan = ExecutionPlan::new(vec![
+            PlanItem::new("a".into(), vec![]),
+            PlanItem::new("b".into(), vec![]),
+            PlanItem::new("c".into(), vec![]),
+        ]);
+        plan.mark_in_progress(0);
+        assert_eq!(plan.next_actionable_index(), Some(0));
+
+        plan.mark_done(0);
+        assert_eq!(plan.finished_count(), 1);
+        assert!(!plan.all_finished());
+        assert_eq!(plan.next_actionable_index(), Some(1));
+
+        plan.mark_done(1);
+        plan.mark_done(2);
+        assert!(plan.all_finished());
+        assert_eq!(plan.next_actionable_index(), None);
+    }
+
+    #[test]
+    fn execution_plan_record_failure_blocks_after_max() {
+        let mut plan = ExecutionPlan::new(vec![PlanItem::new("x".into(), vec![])]);
+        plan.mark_in_progress(0);
+
+        for _ in 0..PlanItem::MAX_RETRIES - 1 {
+            plan.record_failure(0);
+            assert_eq!(plan.items[0].status, PlanItemStatus::InProgress);
+        }
+        plan.record_failure(0);
+        assert_eq!(plan.items[0].status, PlanItemStatus::Blocked);
+        assert!(plan.all_finished());
+    }
+
+    #[test]
+    fn execution_plan_check_final_gate_no_plan() {
+        let plan = ExecutionPlan::default();
+        assert_eq!(plan.check_final_gate(), FinalGateDecision::NoPlan);
+    }
+
+    #[test]
+    fn execution_plan_check_final_gate_incomplete() {
+        let mut plan = ExecutionPlan::new(vec![
+            PlanItem::new("first".into(), vec![]),
+            PlanItem::new("second".into(), vec![]),
+        ]);
+        plan.mark_in_progress(0);
+        match plan.check_final_gate() {
+            FinalGateDecision::Incomplete {
+                remaining, total, ..
+            } => {
+                assert_eq!(remaining, 2);
+                assert_eq!(total, 2);
+            }
+            other => panic!("expected Incomplete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execution_plan_check_final_gate_allow() {
+        let mut plan = ExecutionPlan::new(vec![PlanItem::new("only".into(), vec![])]);
+        plan.mark_done(0);
+        assert_eq!(plan.check_final_gate(), FinalGateDecision::Allow);
+    }
+
+    #[test]
+    fn execution_plan_append_items() {
+        let mut plan = ExecutionPlan::new(vec![PlanItem::new("a".into(), vec![])]);
+        plan.append_items(vec![PlanItem::new("b".into(), vec![])]);
+        assert_eq!(plan.items.len(), 2);
+    }
+
+    #[test]
+    fn execution_plan_format_checklist() {
+        let mut plan = ExecutionPlan::new(vec![
+            PlanItem::new("done item".into(), vec![]),
+            PlanItem::new("in progress".into(), vec![]),
+            PlanItem::new("pending item".into(), vec![]),
+        ]);
+        plan.mark_done(0);
+        plan.mark_in_progress(1);
+        let checklist = plan.format_checklist();
+        assert!(checklist.contains("[x]"));
+        assert!(checklist.contains("[>]"));
+        assert!(checklist.contains("[ ]"));
+    }
+
+    #[test]
+    fn execution_plan_build_turn_guidance() {
+        let mut plan = ExecutionPlan::new(vec![
+            PlanItem::new("first task".into(), vec![]),
+            PlanItem::new("second task".into(), vec![]),
+        ]);
+        plan.mark_done(0);
+        plan.mark_in_progress(1);
+        let guidance = plan.build_turn_guidance().expect("should have guidance");
+        assert!(guidance.contains("second task"));
+        assert!(guidance.contains("1/2"));
+    }
+
+    #[test]
+    fn execution_plan_build_turn_guidance_none_when_all_done() {
+        let mut plan = ExecutionPlan::new(vec![PlanItem::new("x".into(), vec![])]);
+        plan.mark_done(0);
+        assert!(plan.build_turn_guidance().is_none());
+    }
+
+    #[test]
+    fn plan_item_status_display() {
+        assert_eq!(PlanItemStatus::Pending.to_string(), "pending");
+        assert_eq!(PlanItemStatus::InProgress.to_string(), "in_progress");
+        assert_eq!(PlanItemStatus::Done.to_string(), "done");
+        assert_eq!(PlanItemStatus::Blocked.to_string(), "blocked");
+    }
+
+    #[test]
+    fn plan_item_serde_roundtrip() {
+        let item = PlanItem::new("desc".into(), vec!["src/lib.rs".into()]);
+        let json = serde_json::to_string(&item).expect("serialize");
+        let back: PlanItem = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(item, back);
+    }
+
+    #[test]
+    fn execution_plan_serde_roundtrip() {
+        let plan = ExecutionPlan::new(vec![
+            PlanItem::new("a".into(), vec!["f1.rs".into()]),
+            PlanItem::new("b".into(), vec![]),
+        ]);
+        let json = serde_json::to_string(&plan).expect("serialize");
+        let back: ExecutionPlan = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(plan, back);
+    }
+
+    // Issue #251: sync_from_touched_files tests
+
+    #[test]
+    fn sync_from_touched_files_marks_matching_items_done() {
+        let mut plan = ExecutionPlan::new(vec![
+            PlanItem::new("src/lib.rs: add docs".into(), vec!["src/lib.rs".into()]),
+            PlanItem::new("src/main.rs: add docs".into(), vec!["src/main.rs".into()]),
+        ]);
+        plan.mark_in_progress(0);
+
+        let touched = vec!["src/lib.rs".to_string()];
+        plan.sync_from_touched_files(&touched);
+
+        assert_eq!(plan.items[0].status, PlanItemStatus::Done);
+        assert_eq!(plan.items[1].status, PlanItemStatus::InProgress); // auto-advanced
+    }
+
+    #[test]
+    fn sync_from_touched_files_all_done_allows_final_gate() {
+        let mut plan = ExecutionPlan::new(vec![
+            PlanItem::new("src/lib.rs: add docs".into(), vec!["src/lib.rs".into()]),
+            PlanItem::new("src/main.rs: add docs".into(), vec!["src/main.rs".into()]),
+        ]);
+        plan.mark_in_progress(0);
+
+        let touched = vec!["src/lib.rs".to_string(), "src/main.rs".to_string()];
+        plan.sync_from_touched_files(&touched);
+
+        assert_eq!(plan.items[0].status, PlanItemStatus::Done);
+        assert_eq!(plan.items[1].status, PlanItemStatus::Done);
+        assert_eq!(plan.check_final_gate(), FinalGateDecision::Allow);
+    }
+
+    #[test]
+    fn sync_from_touched_files_no_match_leaves_incomplete() {
+        let mut plan = ExecutionPlan::new(vec![PlanItem::new(
+            "src/lib.rs: add docs".into(),
+            vec!["src/lib.rs".into()],
+        )]);
+        plan.mark_in_progress(0);
+
+        let touched = vec!["src/other.rs".to_string()];
+        plan.sync_from_touched_files(&touched);
+
+        assert_eq!(plan.items[0].status, PlanItemStatus::InProgress);
+    }
+
+    #[test]
+    fn sync_from_touched_files_empty_touched_is_noop() {
+        let mut plan = ExecutionPlan::new(vec![PlanItem::new(
+            "src/lib.rs: add docs".into(),
+            vec!["src/lib.rs".into()],
+        )]);
+        plan.mark_in_progress(0);
+
+        plan.sync_from_touched_files(&[]);
+        assert_eq!(plan.items[0].status, PlanItemStatus::InProgress);
+    }
+
+    #[test]
+    fn sync_from_touched_files_skips_already_done_items() {
+        let mut plan = ExecutionPlan::new(vec![
+            PlanItem::new("src/lib.rs: add docs".into(), vec!["src/lib.rs".into()]),
+            PlanItem::new("src/main.rs: add docs".into(), vec!["src/main.rs".into()]),
+        ]);
+        plan.mark_done(0);
+        plan.mark_in_progress(1);
+
+        let touched = vec!["src/lib.rs".to_string(), "src/main.rs".to_string()];
+        plan.sync_from_touched_files(&touched);
+
+        assert_eq!(plan.items[0].status, PlanItemStatus::Done);
+        assert_eq!(plan.items[1].status, PlanItemStatus::Done);
+    }
+
+    #[test]
+    fn sync_from_touched_files_suffix_matching() {
+        let mut plan = ExecutionPlan::new(vec![PlanItem::new(
+            "/tmp/test1.js: add comments".into(),
+            vec!["/tmp/test1.js".into()],
+        )]);
+        plan.mark_in_progress(0);
+
+        // touched_files uses relative paths; target_files may use absolute
+        let touched = vec!["test1.js".to_string()];
+        plan.sync_from_touched_files(&touched);
+
+        assert_eq!(plan.items[0].status, PlanItemStatus::Done);
+    }
+
+    #[test]
+    fn sync_from_touched_files_skips_items_without_target_files() {
+        let mut plan = ExecutionPlan::new(vec![
+            PlanItem::new("run cargo test".into(), vec![]),
+            PlanItem::new("src/lib.rs: add docs".into(), vec!["src/lib.rs".into()]),
+        ]);
+        plan.mark_in_progress(0);
+
+        let touched = vec!["src/lib.rs".to_string()];
+        plan.sync_from_touched_files(&touched);
+
+        // Item 0 has no target_files → stays InProgress
+        assert_eq!(plan.items[0].status, PlanItemStatus::InProgress);
+        // Item 1 matched → Done
+        assert_eq!(plan.items[1].status, PlanItemStatus::Done);
     }
 }

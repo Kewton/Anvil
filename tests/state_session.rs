@@ -2,9 +2,9 @@ mod common;
 
 use anvil::contracts::{AppEvent, AppStateSnapshot, RuntimeState};
 use anvil::session::{
-    MessageRole, MessageStatus, SessionMessage, SessionRecord, SessionStore, WorkingMemory,
-    build_conversation_text_for_summary, extract_file_targets, new_assistant_message,
-    new_user_message, validate_session_name,
+    MessageRole, MessageStatus, NoteKind, SessionMessage, SessionNote, SessionRecord, SessionStore,
+    WorkingMemory, build_conversation_text_for_summary, extract_file_targets,
+    extract_session_notes, new_assistant_message, new_user_message, validate_session_name,
 };
 use anvil::state::{StateMachine, StateTransition};
 use std::path::PathBuf;
@@ -1931,4 +1931,91 @@ fn compact_history_public_signature_unchanged() {
     // Verify compact_history() still works with original signature (keep_recent: usize) -> bool
     let changed: bool = session.compact_history(5);
     assert!(changed);
+}
+
+// ── Session Note Tests (Issue #241) ──────────────────────────────────
+
+#[test]
+fn extract_session_notes_empty() {
+    let notes = extract_session_notes(&[]);
+    assert!(notes.is_empty());
+}
+
+#[test]
+fn extract_session_notes_file_edit() {
+    let msg = SessionMessage::new(MessageRole::Tool, "file.edit", "Updated src/main.rs");
+    let notes = extract_session_notes(&[msg]);
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0].kind, NoteKind::FileEdit);
+    assert!(!notes[0].summary.is_empty());
+}
+
+#[test]
+fn extract_session_notes_file_read() {
+    let msg = SessionMessage::new(MessageRole::Tool, "file.read", "Read src/lib.rs");
+    let notes = extract_session_notes(&[msg]);
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0].kind, NoteKind::FileRead);
+}
+
+#[test]
+fn extract_session_notes_shell_exec() {
+    let msg = SessionMessage::new(MessageRole::Tool, "shell.exec", "cargo test output");
+    let notes = extract_session_notes(&[msg]);
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0].kind, NoteKind::ShellExec);
+}
+
+#[test]
+fn extract_session_notes_error_hit() {
+    let mut msg = SessionMessage::new(
+        MessageRole::Tool,
+        "file.edit",
+        "Error: file not found src/missing.rs",
+    );
+    msg.is_error = true;
+    let notes = extract_session_notes(&[msg]);
+    // Should produce both ErrorHit and FileEdit notes
+    assert_eq!(notes.len(), 2);
+    let kinds: Vec<NoteKind> = notes.iter().map(|n| n.kind).collect();
+    assert!(kinds.contains(&NoteKind::ErrorHit));
+    assert!(kinds.contains(&NoteKind::FileEdit));
+}
+
+#[test]
+fn extract_session_notes_aggregation() {
+    let msg1 = SessionMessage::new(MessageRole::Tool, "file.edit", "Updated src/a.rs");
+    let msg2 = SessionMessage::new(MessageRole::Tool, "file.edit", "Updated src/b.rs");
+    let notes = extract_session_notes(&[msg1, msg2]);
+    // Should aggregate into a single FileEdit note
+    let edit_notes: Vec<&SessionNote> = notes
+        .iter()
+        .filter(|n| n.kind == NoteKind::FileEdit)
+        .collect();
+    assert_eq!(edit_notes.len(), 1);
+    assert!(edit_notes[0].summary.contains('2'));
+}
+
+#[test]
+fn extract_session_notes_unknown_author_ignored() {
+    let msg = SessionMessage::new(MessageRole::Tool, "unknown.tool", "some content");
+    let notes = extract_session_notes(&[msg]);
+    assert!(notes.is_empty());
+}
+
+#[test]
+fn extract_session_notes_unknown_author_error_still_captured() {
+    let mut msg = SessionMessage::new(MessageRole::Tool, "mcp.custom_tool", "Error: timeout");
+    msg.is_error = true;
+    let notes = extract_session_notes(&[msg]);
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0].kind, NoteKind::ErrorHit);
+}
+
+#[test]
+fn note_kind_display() {
+    assert_eq!(NoteKind::FileEdit.to_string(), "file_edit");
+    assert_eq!(NoteKind::FileRead.to_string(), "file_read");
+    assert_eq!(NoteKind::ShellExec.to_string(), "shell_exec");
+    assert_eq!(NoteKind::ErrorHit.to_string(), "error_hit");
 }

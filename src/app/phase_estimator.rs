@@ -22,7 +22,6 @@ pub enum PhaseAction {
 
 /// Estimated agent phase (for logging/debugging).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum Phase {
     /// Not enough data to determine phase.
     Unknown,
@@ -30,6 +29,16 @@ pub enum Phase {
     Exploring,
     /// Has performed write operations.
     Implementing,
+}
+
+impl std::fmt::Display for Phase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Phase::Unknown => write!(f, "unknown"),
+            Phase::Exploring => write!(f, "exploring"),
+            Phase::Implementing => write!(f, "implementing"),
+        }
+    }
 }
 
 /// Tool category for phase estimation.
@@ -59,8 +68,10 @@ pub struct PhaseEstimator {
     has_written: bool,
     /// Whether ANVIL_FINAL has been observed at least once in this session.
     anvil_final_observed: bool,
+    /// Whether ANVIL_FINAL has been accepted (not suppressed) at least once.
+    /// Only accepted finals disable fallback completion.
+    anvil_final_accepted: bool,
     /// Threshold N: consecutive reads to enter "exploring" phase.
-    #[allow(dead_code)]
     explore_threshold: usize,
     /// Threshold M: consecutive reads to trigger forced transition (M > N).
     force_transition_threshold: usize,
@@ -79,10 +90,19 @@ impl PhaseEstimator {
             consecutive_reads: 0,
             has_written: false,
             anvil_final_observed: false,
+            anvil_final_accepted: false,
             explore_threshold,
             force_transition_threshold,
             completion_read_threshold,
         }
+    }
+
+    /// Override the force_transition_threshold with a runtime-effective value (Issue #263).
+    ///
+    /// Only `force_transition_threshold` is changed; `explore_threshold` and
+    /// `completion_read_threshold` remain at their configured baselines.
+    pub fn set_effective_threshold(&mut self, threshold: usize) {
+        self.force_transition_threshold = threshold.max(3);
     }
 
     /// Reset per-turn counters. Called at the start of each
@@ -130,7 +150,7 @@ impl PhaseEstimator {
     ///
     /// Otherwise returns `Continue`.
     pub fn check_empty_response(&self) -> PhaseAction {
-        if self.anvil_final_observed {
+        if self.anvil_final_accepted {
             return PhaseAction::Continue;
         }
         if self.has_written && self.consecutive_reads >= self.completion_read_threshold {
@@ -139,21 +159,29 @@ impl PhaseEstimator {
         PhaseAction::Continue
     }
 
-    /// Record that ANVIL_FINAL was observed. Disables fallback completion
-    /// for the remainder of the session.
+    /// Record that ANVIL_FINAL was observed (including suppressed premature finals).
+    /// Does NOT disable fallback completion; use `accept_anvil_final()` for that.
     pub fn observe_anvil_final(&mut self) {
         self.anvil_final_observed = true;
     }
 
+    /// Record that ANVIL_FINAL was accepted (not suppressed).
+    /// Disables fallback completion for the remainder of the session.
+    pub fn accept_anvil_final(&mut self) {
+        self.anvil_final_accepted = true;
+        self.anvil_final_observed = true;
+    }
+
     /// Reset model-dependent state (called on `/model` switch).
-    /// Clears `anvil_final_observed` since a new model may not emit ANVIL_FINAL.
+    /// Clears `anvil_final_observed` and `anvil_final_accepted` since a new model
+    /// may not emit ANVIL_FINAL.
     #[allow(dead_code)]
     pub fn reset_model_state(&mut self) {
         self.anvil_final_observed = false;
+        self.anvil_final_accepted = false;
     }
 
     /// Return the estimated phase for logging/debugging.
-    #[allow(dead_code)]
     pub fn current_phase(&self) -> Phase {
         if self.has_written {
             Phase::Implementing
@@ -257,21 +285,33 @@ mod tests {
     }
 
     #[test]
-    fn anvil_final_observed_disables_fallback() {
+    fn anvil_final_accepted_disables_fallback() {
+        let mut est = default_estimator();
+        est.record_tool_call("file.write", true);
+        for _ in 0..5 {
+            est.record_tool_call("file.read", true);
+        }
+        est.accept_anvil_final();
+        assert_eq!(est.check_empty_response(), PhaseAction::Continue);
+    }
+
+    #[test]
+    fn anvil_final_observed_only_does_not_disable_fallback() {
         let mut est = default_estimator();
         est.record_tool_call("file.write", true);
         for _ in 0..5 {
             est.record_tool_call("file.read", true);
         }
         est.observe_anvil_final();
-        assert_eq!(est.check_empty_response(), PhaseAction::Continue);
+        // observe without accept should NOT disable fallback
+        assert_eq!(est.check_empty_response(), PhaseAction::FallbackComplete);
     }
 
     #[test]
     fn reset_preserves_has_written_and_anvil_final() {
         let mut est = default_estimator();
         est.record_tool_call("file.write", true);
-        est.observe_anvil_final();
+        est.accept_anvil_final();
         est.record_tool_call("file.read", true);
 
         est.reset();
@@ -279,16 +319,19 @@ mod tests {
         assert_eq!(est.consecutive_reads, 0);
         assert!(est.has_written);
         assert!(est.anvil_final_observed);
+        assert!(est.anvil_final_accepted);
     }
 
     #[test]
     fn reset_model_state_clears_anvil_final() {
         let mut est = default_estimator();
-        est.observe_anvil_final();
+        est.accept_anvil_final();
         assert!(est.anvil_final_observed);
+        assert!(est.anvil_final_accepted);
 
         est.reset_model_state();
         assert!(!est.anvil_final_observed);
+        assert!(!est.anvil_final_accepted);
     }
 
     #[test]
@@ -310,6 +353,13 @@ mod tests {
         est.record_tool_call("shell.exec", true);
         assert_eq!(est.consecutive_reads, 0);
         assert!(!est.has_written);
+    }
+
+    #[test]
+    fn phase_display() {
+        assert_eq!(Phase::Unknown.to_string(), "unknown");
+        assert_eq!(Phase::Exploring.to_string(), "exploring");
+        assert_eq!(Phase::Implementing.to_string(), "implementing");
     }
 
     #[test]

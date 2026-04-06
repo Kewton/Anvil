@@ -3,6 +3,7 @@
 //! Tests cover the PhaseEstimator's interaction with Config settings
 //! and its overall behavior patterns.
 
+use anvil::app::agentic::{TurnSummary, log_turn_summary};
 use anvil::app::phase_estimator::{Phase, PhaseAction, PhaseEstimator};
 
 #[test]
@@ -49,8 +50,8 @@ fn phase_estimator_anvil_final_disables_fallback() {
     // Before ANVIL_FINAL: fallback should trigger
     assert_eq!(est.check_empty_response(), PhaseAction::FallbackComplete);
 
-    // After ANVIL_FINAL: fallback disabled
-    est.observe_anvil_final();
+    // After ANVIL_FINAL accepted: fallback disabled
+    est.accept_anvil_final();
     assert_eq!(est.check_empty_response(), PhaseAction::Continue);
 }
 
@@ -94,12 +95,12 @@ fn phase_estimator_reset_preserves_cross_turn_state() {
 fn phase_estimator_model_switch_resets_anvil_final() {
     let mut est = PhaseEstimator::new(5, 10, 5);
 
-    est.observe_anvil_final();
+    est.accept_anvil_final();
     est.record_tool_call("file.write", true);
     for _ in 0..5 {
         est.record_tool_call("file.read", true);
     }
-    // ANVIL_FINAL observed → no fallback
+    // ANVIL_FINAL accepted → no fallback
     assert_eq!(est.check_empty_response(), PhaseAction::Continue);
 
     // Model switch
@@ -129,4 +130,46 @@ fn phase_estimator_other_tools_ignored() {
     est.record_tool_call("shell.exec", true);
     est.record_tool_call("agent.plan", true);
     assert_eq!(est.current_phase(), Phase::Unknown);
+}
+
+#[test]
+fn turn_summary_includes_phase_field() {
+    let summary = TurnSummary {
+        turn: 1,
+        max_turns: 10,
+        elapsed: std::time::Duration::from_secs(1),
+        tokens_used: 100,
+        token_budget: 1000,
+        tool_calls: 2,
+        tool_names: &[],
+        files_modified: 0,
+        compact_info: None,
+        phase: Phase::Exploring,
+        mutations_this_turn: None,
+        items_advanced_this_turn: None,
+    };
+    // Verify phase field exists and log_turn_summary is callable
+    assert_eq!(format!("{}", summary.phase), "exploring");
+    log_turn_summary(&summary);
+}
+
+// ---------------------------------------------------------------------------
+// Task 0.4: observed_final / accepted_final separation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn suppressed_final_does_not_disable_fallback() {
+    let mut est = PhaseEstimator::new(5, 10, 5);
+
+    // Write + K reads → conditions for fallback
+    est.record_tool_call("file.write", true);
+    for _ in 0..5 {
+        est.record_tool_call("file.read", true);
+    }
+
+    // Observe (but do NOT accept) ANVIL_FINAL → suppressed premature final
+    est.observe_anvil_final();
+
+    // Fallback should still work because accept_anvil_final() was not called
+    assert_eq!(est.check_empty_response(), PhaseAction::FallbackComplete);
 }

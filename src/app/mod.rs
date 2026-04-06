@@ -8,14 +8,16 @@ pub mod alternating_loop_detector;
 pub mod cli;
 mod context;
 pub(crate) mod edit_fail_tracker;
+pub(crate) mod execution_plan;
 pub mod loop_detector;
 pub mod mock;
 pub mod phase_estimator;
 pub mod plan;
 pub mod policy;
 pub(crate) mod read_repeat_tracker;
-pub(crate) mod read_transition_guard;
+pub mod read_transition_guard;
 pub mod render;
+pub mod stagnation_state;
 pub(crate) mod write_fail_tracker;
 pub(crate) mod write_repeat_tracker;
 
@@ -57,6 +59,11 @@ use std::sync::{Arc, Mutex};
 
 // Re-export render helpers that form the public API.
 pub use render::{cli_prompt, render_help_frame, slash_commands};
+
+/// Mutation tools tracked for telemetry purposes.
+/// Note: shell.exec is intentionally excluded — see Issue #273 for rationale
+/// (first_mutation_event_* fields are runtime_lower_bound, not strict post-hoc values).
+pub(crate) const MUTATION_TOOLS: &[&str] = &["file.write", "file.edit", "file.edit_anchor"];
 
 /// Detect project languages from the project root directory.
 ///
@@ -143,7 +150,8 @@ pub struct SessionStats {
     pub total_turns: u32,
     pub session_start: Option<Instant>,
     pub tool_calls: HashMap<String, u32>,
-    pub files_modified: u32,
+    /// Unique file paths that were actually persisted to disk (Issue #259).
+    pub files_modified: std::collections::HashSet<String>,
     pub lines_added: u32,
     pub lines_deleted: u32,
     pub compact_count: u32,
@@ -271,6 +279,14 @@ pub struct App {
     session_stats: SessionStats,
     /// Last compact operation info for turn summary reporting (Issue #206).
     last_compact_info: Option<CompactInfo>,
+    /// Execution plan for Plan → Execute mode (Issue #249).
+    execution_plan: crate::contracts::ExecutionPlan,
+    /// Agent telemetry for session-level metrics (Issue #255).
+    agent_telemetry: crate::contracts::AgentTelemetry,
+    /// Per-turn stagnation telemetry (Issue #263).
+    stagnation_state: stagnation_state::StagnationState,
+    /// Whether forced mode is active for the current turn (Issue #263).
+    forced_mode_active: bool,
 }
 
 /// Whether the session loop should continue or exit.
@@ -600,6 +616,10 @@ impl App {
             file_read_cache,
             session_stats: SessionStats::new(),
             last_compact_info: None,
+            execution_plan: crate::contracts::ExecutionPlan::default(),
+            agent_telemetry: crate::contracts::AgentTelemetry::new(),
+            stagnation_state: stagnation_state::StagnationState::new(),
+            forced_mode_active: false,
         })
     }
 
@@ -846,7 +866,7 @@ impl App {
             total_turns = self.session_stats.total_turns,
             total_tool_calls = self.session_stats.total_tool_calls(),
             tools = %self.session_stats.tool_calls_summary(),
-            files_modified = self.session_stats.files_modified,
+            files_modified = self.session_stats.files_modified.len(),
             lines_added = self.session_stats.lines_added,
             lines_deleted = self.session_stats.lines_deleted,
             compact_count = self.session_stats.compact_count,
@@ -854,6 +874,36 @@ impl App {
             elapsed_s = format!("{:.1}", session_elapsed.as_secs_f64()),
             "session completed"
         );
+
+        // Issue #255: Log agent telemetry (Stage 0 observability).
+        let tel = &self.agent_telemetry;
+        if tel.total_final_requests > 0 || tel.plan_registration_count > 0 {
+            let completion = tel
+                .completion_kind
+                .map(|k| k.to_string())
+                .unwrap_or_else(|| "none".to_string());
+            tracing::info!(
+                completion_kind = %completion,
+                premature_final_count = tel.premature_final_count,
+                total_final_requests = tel.total_final_requests,
+                pfrr = format!("{:.2}", tel.premature_final_request_rate()),
+                plan_registration_count = tel.plan_registration_count,
+                plan_update_count = tel.plan_update_count,
+                sync_from_touched_files_count = tel.sync_from_touched_files_count,
+                no_op_mutation_count = tel.no_op_mutation_count,
+                rolled_back_mutation_count = tel.rolled_back_mutation_count,
+                initial_plan_miss_count = tel.initial_plan_miss_count,
+                "agent telemetry"
+            );
+        }
+
+        // Issue #271: Write telemetry artifact (opt-in via ANVIL_TELEMETRY_DIR).
+        if let Err(err) = self
+            .agent_telemetry
+            .write_artifact(&self.session.metadata.session_id)
+        {
+            tracing::warn!("telemetry artifact write failed: {err}");
+        }
     }
 
     /// Run PostSession hook (DR2-005, DR2-007 facade method).

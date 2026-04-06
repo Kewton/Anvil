@@ -105,6 +105,30 @@ const NETWORK_COMMAND_PREFIXES: &[&str] = &[
     "ftp",
 ];
 
+/// File-reading command prefixes detected for read_guard integration (Issue #265).
+///
+/// When an LLM's `file.read` calls are restricted by the read transition guard,
+/// it may fall back to `shell.exec` with these commands to read file contents.
+/// Detecting them allows the guard to count these as exploration calls.
+const FILE_READ_COMMAND_PREFIXES: &[&str] =
+    &["grep", "sed", "cat", "head", "tail", "awk", "less", "more"];
+
+/// Returns `true` if the shell command is primarily a file-reading operation
+/// (e.g. `grep`, `sed -n`, `cat`) that could bypass the read transition guard.
+///
+/// Handles `sudo`/`env` prefixes and absolute paths via [`extract_first_command`].
+/// Pipe/chain commands are excluded (they fall to `General` via injection-vector
+/// detection anyway).
+pub fn is_file_read_shell_command(command: &str) -> bool {
+    let trimmed = command.trim();
+    if contains_injection_vectors(trimmed) {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let first_cmd = extract_first_command(&lower);
+    FILE_READ_COMMAND_PREFIXES.contains(&first_cmd)
+}
+
 /// Classify a shell command into a [`ShellPolicy`] category.
 ///
 /// DR4-002: Prefix matching is case-insensitive (uses `to_ascii_lowercase()`).
@@ -601,5 +625,72 @@ mod tests {
     #[test]
     fn network_absolute_path_curl() {
         assert!(is_network_command("/usr/bin/curl https://example.com"));
+    }
+
+    // --- is_file_read_shell_command tests (Issue #265) ---
+
+    #[test]
+    fn file_read_grep() {
+        assert!(is_file_read_shell_command(
+            "grep -n \"pattern\" src/main.rs"
+        ));
+    }
+
+    #[test]
+    fn file_read_sed() {
+        assert!(is_file_read_shell_command("sed -n '37,60p' src/main.rs"));
+    }
+
+    #[test]
+    fn file_read_cat() {
+        assert!(is_file_read_shell_command("cat src/main.rs"));
+    }
+
+    #[test]
+    fn file_read_head() {
+        assert!(is_file_read_shell_command("head -50 src/main.rs"));
+    }
+
+    #[test]
+    fn file_read_tail() {
+        assert!(is_file_read_shell_command("tail -20 src/main.rs"));
+    }
+
+    #[test]
+    fn file_read_awk() {
+        assert!(is_file_read_shell_command(
+            "awk '/pattern/ {print}' src/main.rs"
+        ));
+    }
+
+    #[test]
+    fn file_read_case_insensitive() {
+        assert!(is_file_read_shell_command("GREP -rn pattern src/"));
+    }
+
+    #[test]
+    fn not_file_read_cargo_test() {
+        assert!(!is_file_read_shell_command("cargo test"));
+    }
+
+    #[test]
+    fn not_file_read_git_log() {
+        assert!(!is_file_read_shell_command("git log --oneline"));
+    }
+
+    #[test]
+    fn not_file_read_pipe() {
+        // Pipe commands are excluded (injection vector)
+        assert!(!is_file_read_shell_command("grep pattern file | head -5"));
+    }
+
+    #[test]
+    fn file_read_sudo_grep() {
+        assert!(is_file_read_shell_command("sudo grep -rn pattern src/"));
+    }
+
+    #[test]
+    fn file_read_absolute_path_cat() {
+        assert!(is_file_read_shell_command("/usr/bin/cat src/main.rs"));
     }
 }
