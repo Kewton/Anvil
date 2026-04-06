@@ -4,10 +4,9 @@
 //! Policy decisions (scoring, plan repair, workset steering) are
 //! implemented as module-level pure functions to maintain SRP.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 
-use crate::contracts::{ExecutionPlan, PlanItem, PostMutationDominantClass};
-use crate::tooling::ToolExecutionStatus;
+use crate::contracts::{ExecutionPlan, PlanItem};
 
 /// Maximum number of recent read-only turn flags to keep.
 const RECENT_TURNS_CAP: usize = 5;
@@ -410,112 +409,4 @@ pub fn build_plan_repair_message(starved_target_files: &[String]) -> String {
          - Do NOT re-add completed items\n\
          - Add only concrete mutation actions (file.edit / file.write)"
     )
-}
-
-// ---------------------------------------------------------------------------
-// Post-mutation stall classifier (Issue #275)
-// ---------------------------------------------------------------------------
-
-/// Minimal tool-level observation for post-mutation classification.
-///
-/// App-local type: not serialized, not stored in contracts.
-pub struct PostMutationToolObservation {
-    /// Tool name (e.g. "file.read", "file.edit").
-    pub tool_name: String,
-    /// cwd-relative target paths (sandbox-validated). May be empty for web tools.
-    pub target_paths: Vec<String>,
-    /// FileReadCache hit count. `Some(n)` where n >= 2 = true cache hit.
-    pub cache_hit_count: Option<usize>,
-    /// Tool execution status.
-    pub status: ToolExecutionStatus,
-}
-
-/// Turn-level observation for post-mutation classification.
-///
-/// App-local type: not serialized, not stored in contracts.
-pub struct PostMutationTurnObservation {
-    /// Touched files snapshot taken at the start of this turn.
-    pub pre_turn_touched_snapshot: HashSet<String>,
-    /// Last failed edit path from EditFailTracker (pre-turn).
-    pub pre_turn_last_failed_path: Option<String>,
-    /// Failed edit paths that occurred during this turn.
-    pub turn_local_failed_paths: Vec<String>,
-    /// Tool observations for this turn.
-    pub tool_actions: Vec<PostMutationToolObservation>,
-    /// Whether ANVIL_FINAL was present in the response.
-    pub has_anvil_final: bool,
-    /// Number of tool calls in this turn.
-    pub tool_call_count: usize,
-}
-
-/// Classify a post-mutation turn into its dominant class.
-///
-/// **Precondition**: caller has verified `is_post_first_mutation == true`.
-/// This function does not perform pre-mutation guards (SRP).
-///
-/// Priority: SameFileRepair > TouchedPathRepair > CacheHitReread > UntouchedExploration > PlanOnlyNoTool
-pub fn classify_post_mutation_turn(obs: &PostMutationTurnObservation) -> PostMutationDominantClass {
-    let failed_paths: HashSet<&str> = obs
-        .pre_turn_last_failed_path
-        .iter()
-        .map(String::as_str)
-        .chain(obs.turn_local_failed_paths.iter().map(String::as_str))
-        .collect();
-
-    // 1. SameFileRepair (highest priority)
-    for action in &obs.tool_actions {
-        if matches!(
-            action.tool_name.as_str(),
-            "file.read" | "file.edit" | "file.edit_anchor"
-        ) && action
-            .target_paths
-            .iter()
-            .any(|path| failed_paths.contains(path.as_str()))
-        {
-            return PostMutationDominantClass::SameFileRepair;
-        }
-    }
-
-    // 2. TouchedPathRepair
-    for action in &obs.tool_actions {
-        if action
-            .target_paths
-            .iter()
-            .any(|path| obs.pre_turn_touched_snapshot.contains(path))
-        {
-            return PostMutationDominantClass::TouchedPathRepair;
-        }
-    }
-
-    // 3. CacheHitReread (n >= 2 = true cache hit)
-    if obs
-        .tool_actions
-        .iter()
-        .any(|a| a.cache_hit_count.is_some_and(|n| n >= 2))
-    {
-        return PostMutationDominantClass::CacheHitReread;
-    }
-
-    // 4. UntouchedExploration
-    let exploration_tools = [
-        "file.read",
-        "file.search",
-        "file.list",
-        "web.fetch",
-        "web.search",
-    ];
-    for action in &obs.tool_actions {
-        if exploration_tools.contains(&action.tool_name.as_str())
-            && (action.target_paths.is_empty()
-                || action
-                    .target_paths
-                    .iter()
-                    .any(|path| !obs.pre_turn_touched_snapshot.contains(path)))
-        {
-            return PostMutationDominantClass::UntouchedExploration;
-        }
-    }
-
-    // 5. PlanOnlyNoTool (default)
-    PostMutationDominantClass::PlanOnlyNoTool
 }
