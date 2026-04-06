@@ -138,6 +138,7 @@ fn telemetry_artifact_all_fields_present() {
         "first_mutation_event_elapsed_s",
         "first_mutation_event_tool",
         "first_mutation_event_semantic_basis",
+        "post_mutation",
         "recovery_telemetry",
         "first_successful_mutation_file_role",
         "first_non_test_mutation_file_role",

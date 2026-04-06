@@ -4,9 +4,15 @@
 //! workset steering, forced mode, plan repair, and budget-aware thresholds.
 
 use anvil::app::stagnation_state::{
-    StagnationState, compute_next_workset, compute_stagnation_score, should_request_plan_repair,
+    PostMutationToolObservation, PostMutationTurnObservation, StagnationState,
+    classify_post_mutation_turn, compute_next_workset, compute_stagnation_score,
+    should_request_plan_repair,
 };
-use anvil::contracts::{AgentTelemetry, ExecutionPlan, PlanItem, PlanItemStatus};
+use anvil::contracts::{
+    AgentTelemetry, ExecutionPlan, PlanItem, PlanItemStatus, PostMutationDominantClass,
+};
+use anvil::tooling::ToolExecutionStatus;
+use std::collections::HashSet;
 
 // ---------------------------------------------------------------------------
 // Phase 0: StagnationState struct + policy pure functions
@@ -520,4 +526,256 @@ fn telemetry_serde_backward_compatibility() {
     assert_eq!(telemetry.first_mutation_event_turn, None);
     assert_eq!(telemetry.first_mutation_event_elapsed_s, None);
     assert_eq!(telemetry.first_mutation_event_tool, None);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #275: Post-mutation classifier tests
+// ---------------------------------------------------------------------------
+
+/// Helper: build a minimal PostMutationTurnObservation with defaults.
+fn make_obs(
+    tool_actions: Vec<PostMutationToolObservation>,
+    pre_turn_touched: HashSet<String>,
+    pre_turn_last_failed_path: Option<String>,
+    turn_local_failed_paths: Vec<String>,
+) -> PostMutationTurnObservation {
+    let tool_call_count = tool_actions.len();
+    PostMutationTurnObservation {
+        pre_turn_touched_snapshot: pre_turn_touched,
+        pre_turn_last_failed_path,
+        turn_local_failed_paths,
+        tool_actions,
+        has_anvil_final: false,
+        tool_call_count,
+    }
+}
+
+fn make_tool_obs(
+    tool_name: &str,
+    target_paths: Vec<&str>,
+    cache_hit_count: Option<usize>,
+    status: ToolExecutionStatus,
+) -> PostMutationToolObservation {
+    PostMutationToolObservation {
+        tool_name: tool_name.to_string(),
+        target_paths: target_paths.into_iter().map(String::from).collect(),
+        cache_hit_count,
+        status,
+    }
+}
+
+#[test]
+fn test_classify_same_file_repair_dominant() {
+    // file.read on last_failed_path → SameFileRepair
+    let obs = make_obs(
+        vec![make_tool_obs(
+            "file.read",
+            vec!["src/a.rs"],
+            None,
+            ToolExecutionStatus::Completed,
+        )],
+        HashSet::new(),
+        Some("src/a.rs".to_string()),
+        vec![],
+    );
+    assert_eq!(
+        classify_post_mutation_turn(&obs),
+        PostMutationDominantClass::SameFileRepair
+    );
+}
+
+#[test]
+fn test_classify_touched_path_repair_dominant() {
+    // file.read on a touched path (not failed) → TouchedPathRepair
+    let mut touched = HashSet::new();
+    touched.insert("src/b.rs".to_string());
+    let obs = make_obs(
+        vec![make_tool_obs(
+            "file.read",
+            vec!["src/b.rs"],
+            None,
+            ToolExecutionStatus::Completed,
+        )],
+        touched,
+        None,
+        vec![],
+    );
+    assert_eq!(
+        classify_post_mutation_turn(&obs),
+        PostMutationDominantClass::TouchedPathRepair
+    );
+}
+
+#[test]
+fn test_classify_untouched_exploration_dominant() {
+    // file.read on an untouched path → UntouchedExploration
+    let obs = make_obs(
+        vec![make_tool_obs(
+            "file.read",
+            vec!["src/new.rs"],
+            None,
+            ToolExecutionStatus::Completed,
+        )],
+        HashSet::new(),
+        None,
+        vec![],
+    );
+    assert_eq!(
+        classify_post_mutation_turn(&obs),
+        PostMutationDominantClass::UntouchedExploration
+    );
+}
+
+#[test]
+fn test_classify_plan_only_no_tool() {
+    // No tools → PlanOnlyNoTool
+    let obs = PostMutationTurnObservation {
+        pre_turn_touched_snapshot: HashSet::new(),
+        pre_turn_last_failed_path: None,
+        turn_local_failed_paths: vec![],
+        tool_actions: vec![],
+        has_anvil_final: false,
+        tool_call_count: 0,
+    };
+    assert_eq!(
+        classify_post_mutation_turn(&obs),
+        PostMutationDominantClass::PlanOnlyNoTool
+    );
+}
+
+#[test]
+fn test_classify_cache_hit_reread() {
+    // file.read with cache_hit_count >= 2 on untouched path → CacheHitReread
+    // Note: cache hit check has lower priority than TouchedPathRepair,
+    // so use an untouched path that wouldn't trigger SameFileRepair or TouchedPathRepair
+    let obs = make_obs(
+        vec![make_tool_obs(
+            "file.read",
+            vec!["src/cached.rs"],
+            Some(3),
+            ToolExecutionStatus::Completed,
+        )],
+        HashSet::new(),
+        None,
+        vec![],
+    );
+    // untouched exploration triggers before cache_hit since we have target_paths
+    // that are not in touched_snapshot. But the design says CacheHitReread has
+    // priority 3 (lower than TouchedPathRepair but higher than UntouchedExploration).
+    // Wait - re-reading design: priority is SameFileRepair(1) > TouchedPathRepair(2) > CacheHitReread(3) > UntouchedExploration(4)
+    // So CacheHitReread wins over UntouchedExploration.
+    assert_eq!(
+        classify_post_mutation_turn(&obs),
+        PostMutationDominantClass::CacheHitReread
+    );
+}
+
+#[test]
+fn test_priority_same_file_over_touched() {
+    // Path is both failed and touched → SameFileRepair wins
+    let mut touched = HashSet::new();
+    touched.insert("src/a.rs".to_string());
+    let obs = make_obs(
+        vec![make_tool_obs(
+            "file.edit",
+            vec!["src/a.rs"],
+            None,
+            ToolExecutionStatus::Completed,
+        )],
+        touched,
+        Some("src/a.rs".to_string()),
+        vec![],
+    );
+    assert_eq!(
+        classify_post_mutation_turn(&obs),
+        PostMutationDominantClass::SameFileRepair
+    );
+}
+
+#[test]
+fn test_priority_touched_over_cache_hit() {
+    // Path is touched + has cache hit → TouchedPathRepair wins (priority 2 > 3)
+    let mut touched = HashSet::new();
+    touched.insert("src/b.rs".to_string());
+    let obs = make_obs(
+        vec![make_tool_obs(
+            "file.read",
+            vec!["src/b.rs"],
+            Some(5),
+            ToolExecutionStatus::Completed,
+        )],
+        touched,
+        None,
+        vec![],
+    );
+    assert_eq!(
+        classify_post_mutation_turn(&obs),
+        PostMutationDominantClass::TouchedPathRepair
+    );
+}
+
+#[test]
+fn test_same_turn_new_mutation_not_touched_path_repair() {
+    // Path NOT in pre_turn_touched_snapshot (even if mutated this turn)
+    // → should NOT be TouchedPathRepair (snapshot is pre-turn)
+    let obs = make_obs(
+        vec![make_tool_obs(
+            "file.read",
+            vec!["src/new_this_turn.rs"],
+            None,
+            ToolExecutionStatus::Completed,
+        )],
+        HashSet::new(), // empty pre-turn snapshot
+        None,
+        vec![],
+    );
+    assert_eq!(
+        classify_post_mutation_turn(&obs),
+        PostMutationDominantClass::UntouchedExploration
+    );
+}
+
+// test_stale_repair_marker_cleared_on_success is in src/app/edit_fail_tracker.rs inline tests
+// because EditFailTracker is pub(crate).
+
+#[test]
+fn test_same_turn_failure_then_success_is_same_file_repair() {
+    // Scenario: file.edit fails on src/a.rs in the same turn, then file.read on src/a.rs
+    // turn_local_failed_paths contains src/a.rs → SameFileRepair
+    let obs = make_obs(
+        vec![make_tool_obs(
+            "file.read",
+            vec!["src/a.rs"],
+            None,
+            ToolExecutionStatus::Completed,
+        )],
+        HashSet::new(),
+        None,
+        vec!["src/a.rs".to_string()], // turn-local failure
+    );
+    assert_eq!(
+        classify_post_mutation_turn(&obs),
+        PostMutationDominantClass::SameFileRepair
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #275: Telemetry backward compatibility
+// ---------------------------------------------------------------------------
+
+#[test]
+fn telemetry_post_mutation_backward_compatible() {
+    // Old JSON without post_mutation should deserialize with defaults
+    let json = r#"{
+        "premature_final_count": 1,
+        "total_final_requests": 2,
+        "plan_registration_count": 1,
+        "plan_update_count": 0,
+        "sync_from_touched_files_count": 0,
+        "completion_kind": null
+    }"#;
+    let telemetry: AgentTelemetry = serde_json::from_str(json).unwrap();
+    assert_eq!(telemetry.post_mutation.stall_segment_count, 0);
+    assert_eq!(telemetry.post_mutation.same_file_repair_turn_count, 0);
+    assert_eq!(telemetry.post_mutation.dominant_class, None);
 }

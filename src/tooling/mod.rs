@@ -608,15 +608,17 @@ pub struct ToolExecutionRequest {
     pub input: ToolInput,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ToolExecutionStatus {
+    #[default]
     Completed,
     Failed,
     Interrupted,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ToolExecutionPayload {
+    #[default]
     None,
     Text(String),
     Paths(Vec<String>),
@@ -663,7 +665,7 @@ pub struct EditResultDetail {
     pub fallback_stage: EditFallbackStage,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ToolExecutionResult {
     pub tool_call_id: String,
     pub tool_name: String,
@@ -679,6 +681,9 @@ pub struct ToolExecutionResult {
     pub edit_detail: Option<EditResultDetail>,
     /// Whether this result was rolled back by atomic transaction failure (Issue #259).
     pub rolled_back: bool,
+    /// Cache hit count from FileReadCache (Issue #275).
+    /// `None` for non-file.read tools or initial read. `Some(n)` where n >= 2 = true cache hit.
+    pub cache_hit_count: Option<usize>,
     /// Classified failure kind for file.edit operations (Issue #276).
     pub edit_failure_kind: Option<EditFailureKind>,
     /// The file path attempted by this tool (file.edit/file.read). Issue #276.
@@ -1401,6 +1406,7 @@ impl LocalToolExecutor {
                 vec![resolved.display().to_string()],
                 started,
             );
+            res.cache_hit_count = Some(hit.hit_count);
             res.read_detail = Some(ReadResultDetail { cache_hit: true });
             res.attempted_path = Some(path.to_string());
             return Ok(res);
@@ -1720,6 +1726,7 @@ impl LocalToolExecutor {
                         diff_summary: None,
                         edit_detail: None,
                         rolled_back: false,
+                        cache_hit_count: None,
                         edit_failure_kind: Some(EditFailureKind::IdenticalContent),
                         attempted_path: Some(normalized_path),
                         read_detail: None,
@@ -1786,6 +1793,7 @@ impl LocalToolExecutor {
                     diff_summary: None,
                     edit_detail: None,
                     rolled_back: false,
+                    cache_hit_count: None,
                     edit_failure_kind: Some(most_specific_kind),
                     attempted_path: Some(path.to_string()),
                     read_detail: None,
@@ -2073,12 +2081,7 @@ impl LocalToolExecutor {
                     payload: ToolExecutionPayload::Text(combined),
                     artifacts: Vec::new(),
                     elapsed_ms: started.elapsed().as_millis(),
-                    diff_summary: None,
-                    edit_detail: None,
-                    rolled_back: false,
-                    edit_failure_kind: None,
-                    attempted_path: None,
-                    read_detail: None,
+                    ..Default::default()
                 });
             }
             match child.try_wait() {
@@ -2114,12 +2117,7 @@ impl LocalToolExecutor {
             payload: ToolExecutionPayload::Text(combined),
             artifacts: Vec::new(),
             elapsed_ms: started.elapsed().as_millis(),
-            diff_summary: None,
-            edit_detail: None,
-            rolled_back: false,
-            edit_failure_kind: None,
-            attempted_path: None,
-            read_detail: None,
+            ..Default::default()
         })
     }
 
@@ -2308,12 +2306,7 @@ impl LocalToolExecutor {
                 payload: ToolExecutionPayload::Text(error_msg),
                 artifacts: Vec::new(),
                 elapsed_ms: started.elapsed().as_millis(),
-                diff_summary: None,
-                edit_detail: None,
-                rolled_back: false,
-                edit_failure_kind: None,
-                attempted_path: None,
-                read_detail: None,
+                ..Default::default()
             });
         }
 
@@ -2675,11 +2668,7 @@ fn build_completed_result_with_diff(
         artifacts,
         elapsed_ms: started.elapsed().as_millis(),
         diff_summary,
-        edit_detail: None,
-        rolled_back: false,
-        edit_failure_kind: None,
-        attempted_path: None,
-        read_detail: None,
+        ..Default::default()
     }
 }
 
