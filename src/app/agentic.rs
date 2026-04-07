@@ -89,6 +89,21 @@ pub fn summarize_tool_names(names: &[String]) -> String {
     format_tool_counts(counts.into_iter())
 }
 
+/// Mutation tool names used for the successful-mutation check (Issue #285).
+const MUTATION_TOOL_NAMES: &[&str] = &["file.write", "file.edit", "file.edit_anchor"];
+
+/// Check whether the tool results contain at least one successful mutation
+/// (file.write / file.edit / file.edit_anchor with Completed status,
+/// not rolled back, and with an actual diff). Issue #285 A2 fix.
+pub fn results_contain_successful_mutation(results: &[ToolExecutionResult]) -> bool {
+    results.iter().any(|r| {
+        MUTATION_TOOL_NAMES.contains(&r.tool_name.as_str())
+            && r.status == ToolExecutionStatus::Completed
+            && !r.rolled_back
+            && r.diff_summary.is_some()
+    })
+}
+
 /// Maximum number of parallel threads for tool execution.
 const MAX_PARALLEL_THREADS: usize = 8;
 
@@ -475,8 +490,16 @@ impl App {
         let msg_count_before = self.session.messages.len();
         let tokens_before = self.session.estimated_token_count();
 
+        // Issue #285: track forced_mode_active transitions for telemetry.
+        let mut prev_forced_mode_active = false;
+        // Issue #285 A2: limit NoPlan suppression at the post-tool ANVIL_FINAL gate.
+        // After one suppression, if the model still can't produce a plan, let it through.
+        let mut noplan_suppression_count: u8 = 0;
+
         for iteration in 0..max_iterations {
             let iteration_started = std::time::Instant::now();
+
+            // (prev_forced_mode_active is snapshotted from the previous iteration)
 
             // Check shutdown flag before tool execution
             if self.is_shutdown_requested() {
@@ -590,8 +613,23 @@ impl App {
             // Issue #173: If ANVIL_FINAL was already seen, terminate after
             // executing the current tool batch (no further LLM round-trips).
             if anvil_final_seen {
-                // Issue #249: Plan-aware ANVIL_FINAL gate — suppress if plan is incomplete
-                if self.check_plan_final_gate() {
+                // Issue #249/#285: Plan-aware ANVIL_FINAL gate — suppress if plan is incomplete.
+                // A2 fix: only require plan when session has no file changes AND
+                // the current batch contains no successful mutation.
+                // A2 fix: only suppress NoPlan when the batch contains mutation
+                // tool attempts (successful or not) but no actual persisted changes.
+                // Read-only batches (file.read only) should pass through NoPlan.
+                let batch_has_mutation_attempts = results
+                    .iter()
+                    .any(|r| MUTATION_TOOL_NAMES.contains(&r.tool_name.as_str()));
+                let is_effectively_mutation_task = batch_has_mutation_attempts
+                    && self.session_stats.files_modified.is_empty()
+                    && !results_contain_successful_mutation(&results)
+                    && noplan_suppression_count == 0;
+                if self.check_plan_final_gate_with_require(is_effectively_mutation_task) {
+                    if is_effectively_mutation_task {
+                        noplan_suppression_count += 1;
+                    }
                     tracing::info!("ANVIL_FINAL suppressed by plan gate; continuing execution");
                     anvil_final_seen = false;
                 } else if self.should_activate_guidance_retry(guidance_retry_used, &results) {
@@ -764,6 +802,48 @@ impl App {
                     "stagnation detected; forced_mode_active=true"
                 );
             }
+
+            // Issue #285: staged stagnation recovery.
+            let remaining_turns = max_iterations.saturating_sub(iteration + 1);
+            let plan_repair_count_before_this_turn =
+                self.agent_telemetry.plan_repair_request_count as usize;
+
+            // Workset transition telemetry: record only on first activation.
+            if self.forced_mode_active && !prev_forced_mode_active {
+                self.agent_telemetry.record_forced_workset_transition();
+            }
+
+            // Plan repair request.
+            if crate::app::stagnation_state::should_request_plan_repair(
+                &self.stagnation_state,
+                plan_repair_count_before_this_turn,
+                remaining_turns,
+            ) {
+                let msg_text = crate::app::stagnation_state::build_plan_repair_message(
+                    &self.stagnation_state.starved_target_files,
+                );
+                let msg = SessionMessage::new(MessageRole::Tool, "system", msg_text)
+                    .with_id(self.next_message_id("tool"));
+                self.session.push_message(msg);
+                self.agent_telemetry.record_plan_repair_request();
+            } else {
+                // Escape hatch: plan repair was already attempted but stagnation persists.
+                if crate::app::stagnation_state::should_allow_escape_hatch(
+                    &self.stagnation_state,
+                    plan_repair_count_before_this_turn,
+                    remaining_turns,
+                ) {
+                    tracing::warn!(
+                        score = stagnation_score,
+                        "stagnation escape hatch: terminating loop"
+                    );
+                    break;
+                }
+            }
+
+            // Update prev_forced_mode_active at turn end.
+            prev_forced_mode_active = self.forced_mode_active;
+
             log_turn_summary(&TurnSummary {
                 turn: self.session_stats.total_turns,
                 max_turns: max_iterations as u32,
@@ -834,8 +914,20 @@ impl App {
                     break;
                 }
 
-                // Issue #249: Plan gate — suppress termination if plan is incomplete
-                if self.check_plan_final_gate() {
+                // Issue #249/#285: Plan gate — suppress termination if plan is incomplete.
+                // B1 fix: require plan only when mutation tools were attempted
+                // but no files were actually modified, and we haven't already
+                // suppressed once (to avoid infinite loops for read-only tasks).
+                let session_has_mutation_attempts = MUTATION_TOOL_NAMES
+                    .iter()
+                    .any(|t| self.session_stats.tool_calls.contains_key(*t));
+                let require_plan_here = session_has_mutation_attempts
+                    && self.session_stats.files_modified.is_empty()
+                    && noplan_suppression_count == 0;
+                if self.check_plan_final_gate_with_require(require_plan_here) {
+                    if require_plan_here {
+                        noplan_suppression_count += 1;
+                    }
                     tracing::info!("Plan gate: suppressing termination with empty tool calls");
                     current = next_structured;
                     continue;

@@ -205,6 +205,7 @@ impl App {
     ///
     /// When `require_plan` is true, the NoPlan branch also suppresses
     /// ANVIL_FINAL and requests plan creation (Issue #253).
+    #[allow(dead_code)]
     pub(crate) fn check_plan_final_gate(&mut self) -> bool {
         self.check_plan_final_gate_inner(false)
     }
@@ -213,6 +214,12 @@ impl App {
     /// no plan has been registered yet (Issue #253: Done path guard).
     pub(crate) fn check_plan_final_gate_require_plan(&mut self) -> bool {
         self.check_plan_final_gate_inner(true)
+    }
+
+    /// require_plan を外部から指定できる汎用バリアント (Issue #285 A2 fix).
+    /// is_mutation_task=true の場合は NoPlan も suppress する。
+    pub(crate) fn check_plan_final_gate_with_require(&mut self, require_plan: bool) -> bool {
+        self.check_plan_final_gate_inner(require_plan)
     }
 
     fn check_plan_final_gate_inner(&mut self, require_plan: bool) -> bool {
