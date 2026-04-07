@@ -56,11 +56,17 @@ impl App {
         if let Some(block) = extract_plan_update_block(content) {
             let new_items = parse_plan_items(&block);
             if !new_items.is_empty() {
+                // Issue #287: deduplicate against existing items before appending
+                let deduped = self.execution_plan.deduplicate_new_items(new_items);
+                if deduped.is_empty() {
+                    tracing::info!("ANVIL_PLAN_UPDATE detected; all items deduplicated");
+                    return false;
+                }
                 tracing::info!(
-                    new_items = new_items.len(),
+                    new_items = deduped.len(),
                     "ANVIL_PLAN_UPDATE detected; appending items"
                 );
-                self.execution_plan.append_items(new_items);
+                self.execution_plan.append_items(deduped);
                 self.agent_telemetry.record_plan_update();
                 return true;
             }
@@ -130,7 +136,7 @@ impl App {
                 let file_matches = item
                     .target_files
                     .iter()
-                    .any(|tf| r.summary.ends_with(tf) || tf.ends_with(&r.summary));
+                    .any(|tf| ExecutionPlan::path_matches(tf, &r.summary));
                 if file_matches {
                     matches.push(i);
                 }

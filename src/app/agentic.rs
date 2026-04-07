@@ -484,7 +484,17 @@ impl App {
         self.reset_execution_plan();
 
         // Issue #249: Detect ANVIL_PLAN from initial response
-        self.try_register_plan(&current.raw_content);
+        // Issue #287: re-initialize stagnation_state on plan registration
+        if self.try_register_plan(&current.raw_content) {
+            let target_files: Vec<String> = self
+                .execution_plan
+                .items
+                .iter()
+                .flat_map(|i| i.target_files.iter().cloned())
+                .collect();
+            self.stagnation_state =
+                crate::app::stagnation_state::StagnationState::init_from_plan(&target_files);
+        }
 
         // Session note extraction bookkeeping (Issue #241)
         let msg_count_before = self.session.messages.len();
@@ -791,6 +801,11 @@ impl App {
                 guidance_chars_this_turn as u32,
                 workset_size_this_turn as u32,
             );
+            // Issue #287: record plan item completion before end_turn (for correct
+            // turns_since_plan_item_completion reset).
+            if turn_items_advanced > 0 {
+                self.stagnation_state.record_plan_item_completion();
+            }
             // Issue #269 Phase 3: stagnation end_turn hook + forced mode update.
             self.stagnation_state.end_turn(turn_mutations > 0);
             let stagnation_score =
@@ -863,8 +878,37 @@ impl App {
 
             // Issue #249: Detect ANVIL_PLAN / ANVIL_PLAN_UPDATE from follow-up responses.
             // Scan the raw token buffer since ANVIL_PLAN may be outside the ANVIL_FINAL block.
-            self.try_register_plan(&next_token_buffer);
-            self.try_update_plan(&next_token_buffer);
+            // Issue #287: re-initialize stagnation_state on plan registration
+            if self.try_register_plan(&next_token_buffer) {
+                let target_files: Vec<String> = self
+                    .execution_plan
+                    .items
+                    .iter()
+                    .flat_map(|i| i.target_files.iter().cloned())
+                    .collect();
+                self.stagnation_state =
+                    crate::app::stagnation_state::StagnationState::init_from_plan(&target_files);
+            }
+            // Issue #287: merge new target_files into starved_target_files on plan update
+            if self.try_update_plan(&next_token_buffer) {
+                let existing = &self.stagnation_state.starved_target_files;
+                // CB-003: only include unfinished items to avoid re-adding completed files
+                let new_targets: Vec<String> = self
+                    .execution_plan
+                    .items
+                    .iter()
+                    .filter(|i| !i.is_finished())
+                    .flat_map(|i| i.target_files.iter().cloned())
+                    .filter(|tf| {
+                        !existing
+                            .iter()
+                            .any(|sf| crate::contracts::ExecutionPlan::path_matches(sf, tf))
+                    })
+                    .collect();
+                self.stagnation_state
+                    .starved_target_files
+                    .extend(new_targets);
+            }
 
             // Issue #173: Update ANVIL_FINAL tracking from the new response
             if next_structured.anvil_final_detected {
