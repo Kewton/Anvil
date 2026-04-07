@@ -189,10 +189,21 @@ pub fn should_request_plan_repair(
     plan_repair_request_count: usize,
     remaining_turns: usize,
 ) -> bool {
-    compute_stagnation_score(state) >= 2
+    let score = compute_stagnation_score(state);
+
+    let normal_condition = score >= 2
         && state.starved_target_files.len() >= 2
         && plan_repair_request_count < 2
-        && remaining_turns >= 5
+        && remaining_turns >= 5;
+
+    // Issue #287: severe condition fires even at remaining=1 (final gate hang recovery)
+    let severe_condition = score >= 3
+        && state.turns_since_last_mutation >= 5
+        && !state.starved_target_files.is_empty()
+        && plan_repair_request_count < 2
+        && remaining_turns >= 1;
+
+    normal_condition || severe_condition
 }
 
 // ---------------------------------------------------------------------------
@@ -424,8 +435,13 @@ pub fn should_allow_escape_hatch(
     plan_repair_request_count: usize,
     remaining_turns: usize,
 ) -> bool {
-    compute_stagnation_score(state) >= 3
+    let base = compute_stagnation_score(state) >= 3
         && plan_repair_request_count >= 1
-        && state.turns_since_last_mutation >= 8
-        && remaining_turns <= 10
+        && remaining_turns <= 10;
+
+    let mutation_drought = state.turns_since_last_mutation >= 8;
+    // Issue #287: plan stall as alternative escape condition
+    let plan_stall = state.turns_since_plan_item_completion >= 10;
+
+    base && (mutation_drought || plan_stall)
 }

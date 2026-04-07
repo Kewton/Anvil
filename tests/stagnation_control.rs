@@ -172,8 +172,13 @@ fn plan_repair_request_conditions() {
     // Now should be true: score >= 2, starved >= 2, count < 2, remaining >= 5
     assert!(should_request_plan_repair(&state, 0, 10));
 
-    // remaining_turns < 5 → false
-    assert!(!should_request_plan_repair(&state, 0, 4));
+    // remaining_turns < 5 → normal_condition is false, but severe_condition fires
+    // (score=3 >= 3, turns_since_last_mutation=5 >= 5, starved non-empty, count < 2, remaining >= 1)
+    // Issue #287: severe_condition allows plan repair even at low remaining turns
+    assert!(should_request_plan_repair(&state, 0, 4));
+
+    // remaining_turns=0 → even severe_condition requires >= 1, so false
+    assert!(!should_request_plan_repair(&state, 0, 0));
 }
 
 #[test]
@@ -733,4 +738,174 @@ fn escape_hatch_boundary_turns_since_mutation_8() {
     let state = build_stagnation_state(8, true);
     assert!(state.turns_since_last_mutation >= 8);
     assert!(should_allow_escape_hatch(&state, 1, 10));
+}
+
+// ---------------------------------------------------------------------------
+// Issue #287: path_matches suffix normalization regression tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_path_matches_strips_trailing_ws_suffix() {
+    assert!(ExecutionPlan::path_matches(
+        "src/foo.rs (trailing-ws fallback)",
+        "src/foo.rs"
+    ));
+}
+
+#[test]
+fn test_path_matches_strips_anchor_suffix() {
+    assert!(ExecutionPlan::path_matches(
+        "src/bar.rs (anchor fallback)",
+        "src/bar.rs"
+    ));
+}
+
+#[test]
+fn test_path_matches_both_sides_suffix() {
+    // Both sides have suffix — should still match
+    assert!(ExecutionPlan::path_matches(
+        "src/foo.rs (trailing-ws fallback)",
+        "src/foo.rs (anchor fallback)"
+    ));
+}
+
+#[test]
+fn test_path_matches_no_suffix_still_works() {
+    assert!(ExecutionPlan::path_matches("src/foo.rs", "src/foo.rs"));
+    assert!(ExecutionPlan::path_matches("./src/foo.rs", "src/foo.rs"));
+}
+
+#[test]
+fn test_last_item_completes_with_fallback_suffix() {
+    // Issue #287 reproduction test: last plan item with fallback suffix should
+    // be marked Done when record_mutation_success is called with suffixed path.
+    let mut plan = ExecutionPlan::new(vec![PlanItem::new(
+        "edit foo.rs".to_string(),
+        vec!["src/foo.rs".to_string()],
+    )]);
+    plan.mark_in_progress(0);
+    plan.record_mutation_success(0, "src/foo.rs (trailing-ws fallback)");
+    assert!(plan.items[0].is_finished());
+    assert!(plan.all_finished());
+}
+
+#[test]
+fn test_last_item_completes_with_anchor_suffix() {
+    let mut plan = ExecutionPlan::new(vec![PlanItem::new(
+        "edit bar.rs".to_string(),
+        vec!["src/bar.rs".to_string()],
+    )]);
+    plan.mark_in_progress(0);
+    plan.record_mutation_success(0, "src/bar.rs (anchor fallback)");
+    assert!(plan.items[0].is_finished());
+    assert!(plan.all_finished());
+}
+
+#[test]
+fn test_record_mutation_success_dedup_with_path_matches() {
+    // Same file with different suffixes should not create duplicates
+    let mut plan = ExecutionPlan::new(vec![PlanItem::new(
+        "edit foo.rs".to_string(),
+        vec!["src/foo.rs".to_string()],
+    )]);
+    plan.mark_in_progress(0);
+    plan.record_mutation_success(0, "src/foo.rs");
+    plan.record_mutation_success(0, "src/foo.rs (trailing-ws fallback)");
+    // Should be deduplicated to 1 entry
+    assert_eq!(plan.items[0].mutated_files.len(), 1);
+}
+
+#[test]
+fn test_deduplicate_new_items_basic() {
+    let plan = ExecutionPlan::new(vec![PlanItem::new("task1".into(), vec!["src/a.rs".into()])]);
+    let new_items = vec![
+        PlanItem::new("task1 redo".into(), vec!["src/a.rs".into()]),
+        PlanItem::new("task2".into(), vec!["src/b.rs".into()]),
+    ];
+    let result = plan.deduplicate_new_items(new_items);
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].target_files, vec!["src/b.rs".to_string()]);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #287: stagnation recovery tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn plan_repair_severe_condition_fires_at_remaining_one() {
+    // Build a state with score >= 3, turns_since_last_mutation >= 5, starved non-empty
+    let mut state = StagnationState::new();
+    state.starved_target_files = vec!["src/a.rs".to_string()];
+    // 5 turns without mutation, same workset → score = 3
+    for _ in 0..5 {
+        state.begin_turn(&[0, 1]);
+        state.end_turn(false);
+    }
+    let score = compute_stagnation_score(&state);
+    assert!(score >= 3, "expected score >= 3, got {}", score);
+
+    // remaining_turns=1: normal_condition would require >= 5, but severe fires at >= 1
+    assert!(should_request_plan_repair(&state, 0, 1));
+    // remaining_turns=0: even severe requires >= 1
+    assert!(!should_request_plan_repair(&state, 0, 0));
+}
+
+#[test]
+fn plan_repair_severe_not_fire_with_empty_starved() {
+    let mut state = StagnationState::new();
+    // No starved files
+    for _ in 0..5 {
+        state.begin_turn(&[0, 1]);
+        state.end_turn(false);
+    }
+    assert!(compute_stagnation_score(&state) >= 3);
+    // severe requires !starved.is_empty()
+    assert!(!should_request_plan_repair(&state, 0, 1));
+}
+
+#[test]
+fn escape_hatch_fires_on_plan_stall() {
+    // Build a state with score >= 3, plan_repair >= 1, remaining <= 10,
+    // but turns_since_last_mutation < 8 (mutation drought NOT met).
+    // Instead, turns_since_plan_item_completion >= 10 (plan stall).
+    let mut state = StagnationState::new();
+
+    // 10 turns without plan item completion, same workset, no mutation for some
+    // but with occasional mutations to keep turns_since_last_mutation low
+    for i in 0..10 {
+        state.begin_turn(&[0, 1]);
+        // Mutate every 4th turn to keep turns_since_last_mutation < 8
+        let had_mutation = i % 4 == 0;
+        state.end_turn(had_mutation);
+    }
+
+    assert!(
+        state.turns_since_plan_item_completion >= 10,
+        "expected >= 10, got {}",
+        state.turns_since_plan_item_completion
+    );
+    // turns_since_last_mutation should be < 8 due to periodic mutations
+    assert!(
+        state.turns_since_last_mutation < 8,
+        "expected < 8, got {}",
+        state.turns_since_last_mutation
+    );
+    let score = compute_stagnation_score(&state);
+    assert!(score >= 3, "expected score >= 3, got {}", score);
+
+    // plan_stall should fire
+    assert!(should_allow_escape_hatch(&state, 1, 10));
+}
+
+#[test]
+fn escape_hatch_not_fire_on_plan_stall_without_repair() {
+    let mut state = StagnationState::new();
+    for i in 0..10 {
+        state.begin_turn(&[0, 1]);
+        let had_mutation = i % 4 == 0;
+        state.end_turn(had_mutation);
+    }
+    assert!(state.turns_since_plan_item_completion >= 10);
+    // plan_repair_request_count = 0 → base condition not met
+    assert!(!should_allow_escape_hatch(&state, 0, 10));
 }

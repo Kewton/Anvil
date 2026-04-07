@@ -562,6 +562,21 @@ pub enum FinalGateDecision {
     },
 }
 
+/// Known file.edit result suffixes stripped before path comparison.
+/// Mirrors `EditFallbackStage` variant suffixes without depending on the
+/// `tooling` crate (avoids circular dependency).
+const EDIT_FALLBACK_SUFFIXES: &[&str] = &[" (trailing-ws fallback)", " (anchor fallback)"];
+
+/// Strip a known edit-fallback suffix from the end of a string.
+fn strip_edit_fallback_suffix(s: &str) -> &str {
+    for suffix in EDIT_FALLBACK_SUFFIXES {
+        if let Some(stripped) = s.strip_suffix(suffix) {
+            return stripped;
+        }
+    }
+    s
+}
+
 impl ExecutionPlan {
     pub fn new(items: Vec<PlanItem>) -> Self {
         Self { items }
@@ -639,9 +654,17 @@ impl ExecutionPlan {
 
     /// Fuzzy path match: true when either path is a suffix of the other.
     ///
+    /// Strips known `EditFallbackStage` suffixes before comparison so that
+    /// results like `"src/foo.rs (trailing-ws fallback)"` match `"src/foo.rs"`.
+    ///
     /// Used consistently across `record_mutation_success`, `sync_from_touched_files`,
     /// and `update_plan_from_results` to avoid divergent matching behaviour.
     pub fn path_matches(a: &str, b: &str) -> bool {
+        let a = strip_edit_fallback_suffix(a);
+        let b = strip_edit_fallback_suffix(b);
+        if a.is_empty() || b.is_empty() {
+            return false;
+        }
         a.ends_with(b) || b.ends_with(a)
     }
 
@@ -658,8 +681,12 @@ impl ExecutionPlan {
             return;
         }
 
-        // Add to mutated_files if not already present
-        if !item.mutated_files.iter().any(|f| f == file_path) {
+        // Add to mutated_files if not already present (Issue #287: use path_matches for dedup)
+        if !item
+            .mutated_files
+            .iter()
+            .any(|f| Self::path_matches(f, file_path))
+        {
             item.mutated_files.push(file_path.to_string());
         }
 
@@ -704,12 +731,48 @@ impl ExecutionPlan {
     /// Equivalent to `current_workset().len()` but avoids allocating the
     /// index vector, and is convenient for passing to `record_turn_metrics`.
     pub fn current_workset_size(&self) -> usize {
-        self.current_workset().len()
+        const MAX_WORKSET_SIZE: usize = 5;
+        self.items
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item.status,
+                    PlanItemStatus::Pending | PlanItemStatus::InProgress
+                )
+            })
+            .take(MAX_WORKSET_SIZE)
+            .count()
     }
 
     /// Append new items (used by ANVIL_PLAN_UPDATE).
     pub fn append_items(&mut self, new_items: Vec<PlanItem>) {
         self.items.extend(new_items);
+    }
+
+    /// Deduplicate new plan items against existing items (Issue #287).
+    ///
+    /// Excludes new items whose `target_files` match an existing item
+    /// (using `path_matches` for fuzzy comparison).
+    pub fn deduplicate_new_items(&self, new_items: Vec<PlanItem>) -> Vec<PlanItem> {
+        new_items
+            .into_iter()
+            .filter(|new_item| {
+                let mut new_targets = new_item.target_files.clone();
+                new_targets.sort();
+
+                !self.items.iter().any(|existing| {
+                    let mut existing_targets = existing.target_files.clone();
+                    existing_targets.sort();
+                    if new_targets.len() != existing_targets.len() {
+                        return false;
+                    }
+                    new_targets
+                        .iter()
+                        .zip(existing_targets.iter())
+                        .all(|(a, b)| Self::path_matches(a, b))
+                })
+            })
+            .collect()
     }
 
     /// Sync plan item completion from the set of files actually modified.

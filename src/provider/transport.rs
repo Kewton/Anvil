@@ -171,6 +171,7 @@ impl ReqwestHttpTransport {
             .expect("Failed to build HTTP client");
         let streaming_client = reqwest::blocking::Client::builder()
             .connect_timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(timeout_secs.min(120)))
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("Failed to build streaming HTTP client");
