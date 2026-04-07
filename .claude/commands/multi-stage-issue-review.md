@@ -42,9 +42,11 @@ Issueの記載内容を多角的にレビューし、ブラッシュアップす
 | Stage 5-8（2回目） | **Codex**（commandmatedev `--agent codex` 経由） | 異なるモデルによるクロスレビュー |
 | 指摘反映（全ステージ） | sonnet（継承） | JSON→Issue更新のみ |
 
-> **⚠ 重要**: Stage 5-8 は必ず `commandmatedev send ... --agent codex` でCodexに委譲すること。
-> Claude サブエージェント（Agent tool）で代替実行してはならない。
-> commandmatedev が利用不可の場合はユーザーに報告して中断すること。
+> **⚠ 禁止事項（厳守）**:
+> 1. Stage 5-8 は必ず `commandmatedev send ... --agent codex` でCodexに委譲すること。Claude サブエージェント（Agent tool）で代替実行してはならない。
+> 2. Codexが生成した結果ファイルを Claude 側で再実行・上書きしないこと。Codex が findings 0件を返した場合も「問題なし」という正当な結果であり、件数が少ないことを理由に opus で再レビューすることを禁止する。
+> 3. 結果ファイルの `reviewer` フィールドが `"codex"` でない場合は、不正な上書きが発生しているため即座にユーザーに報告すること。
+> 4. commandmatedev が利用不可の場合はユーザーに報告して中断すること。
 
 ---
 
@@ -299,7 +301,12 @@ commandmatedev wait "$WORKTREE_ID" --timeout 3600 --on-prompt agent
 Stage 5-8完了後、以下を確認:
 - `stage5-review-result.json` が生成されている
 - `stage7-review-result.json` が生成されている
+- 両ファイルの `reviewer` フィールドが `"codex"` であることを確認する
 - GitHubのIssueが更新されている（Must Fix指摘があった場合）
+
+> **⚠ 上書き禁止**: Codexの結果ファイルが既に存在する場合、Claude側で再実行・上書きしてはならない。
+> Codexが findings 0件を返した場合も、それは「問題なし」という正当なレビュー結果である。
+> `reviewer` が `"codex"` でないファイルが見つかった場合、不正な上書きが発生しているためユーザーに報告すること。
 
 ---
 

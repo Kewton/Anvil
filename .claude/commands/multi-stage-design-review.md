@@ -173,8 +173,10 @@ IMPORTANT: Only update design policy documents. Do NOT modify source code.
 
 Stage 3（影響分析）とStage 4（セキュリティ）は**Codex**（`--agent codex`）に委譲し、異なるモデルによるクロスレビューで品質を向上させます。
 
-> **⚠ 禁止事項**: このステージをClaudeサブエージェント（Agent tool）で代替実行しないこと。
-> 必ず `commandmatedev send --agent codex` でCodexに送信すること。
+> **⚠ 禁止事項（厳守）**:
+> 1. このステージをClaudeサブエージェント（Agent tool）で代替実行しないこと。必ず `commandmatedev send --agent codex` でCodexに送信すること。
+> 2. Codexが生成した結果ファイルを Claude 側で再実行・上書きしないこと。Codex が findings 0件を返した場合も「問題なし」という正当な結果であり、件数が少ないことを理由に opus で再レビューすることを禁止する。
+> 3. 結果ファイルの `reviewer` フィールドが `"codex"` でない場合は、不正な上書きが発生しているため即座にユーザーに報告すること。
 
 #### 3-0. commandmatedev 利用可能性確認
 
@@ -234,7 +236,11 @@ commandmatedev wait "$WORKTREE_ID" --timeout 3600 --on-prompt agent
 #### 3-2. Stage 3完了確認
 
 - `stage3-review-result.json` が生成されている
-- 影響範囲が適切に分析されている
+- `reviewer` フィールドが `"codex"` であることを確認する
+
+> **⚠ 上書き禁止**: Codexの結果ファイルが既に存在する場合、Claude側で再実行・上書きしてはならない。
+> Codexが findings 0件を返した場合も、それは「問題なし」という正当なレビュー結果である。
+> findings の件数が少ないことを理由に Agent tool (opus) で再実行することを禁止する。
 
 ---
 
@@ -270,9 +276,12 @@ commandmatedev wait "$WORKTREE_ID" --timeout 3600 --on-prompt agent
 #### 4-1. Stage 4完了確認
 
 - `stage4-review-result.json` が生成されている
+- `reviewer` フィールドが `"codex"` であることを確認する
 - セキュリティ上の問題がすべて解消
 - unsafe使用の正当性確認
 - サンドボックス・コマンドインジェクション対策確認
+
+> **⚠ 上書き禁止**: Stage 3-2 と同様、Codexの結果を Claude 側で再実行・上書きしてはならない。
 
 ---
 
