@@ -235,22 +235,28 @@ fn run_non_interactive<C: ProviderClient>(
                 print!("{}", response);
             }
 
-            // Log session summary (Issue #206 CB-003)
+            // Issue #285 B2 fix: evaluate error conditions BEFORE logging
+            // the session summary so that "session completed" is not emitted
+            // for runs that actually failed.
+            let provider_err = app.last_provider_error().cloned();
+            let tool_err = app.has_tool_execution_failure();
+
+            // Log session summary (Issue #206 CB-003) — artifact is written here.
             app.log_session_summary();
 
-            // Run PostSession hook (DR3-004: after run_live_turn success)
+            // Run PostSession hook (DR3-004: after artifact write)
             app.run_post_session_hook();
 
             // 4. Check for provider errors (e.g. ModelNotFound) that
             //    run_live_turn converted to AgentEvent::Failed
-            if let Some(record) = app.last_provider_error() {
+            if let Some(record) = provider_err {
                 return Err(AppError::ProviderTurn(
-                    ProviderTurnError::from_error_record(record),
+                    ProviderTurnError::from_error_record(&record),
                 ));
             }
 
             // 5. Check for tool execution failures
-            if app.has_tool_execution_failure() {
+            if tool_err {
                 return Err(AppError::ToolExecution("tool execution failed".to_string()));
             }
 

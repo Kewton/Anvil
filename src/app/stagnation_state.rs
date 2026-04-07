@@ -410,3 +410,22 @@ pub fn build_plan_repair_message(starved_target_files: &[String]) -> String {
          - Add only concrete mutation actions (file.edit / file.write)"
     )
 }
+
+/// Escape hatch: allow forced loop termination when stagnation is severe
+/// and recovery attempts have been exhausted (Issue #285).
+///
+/// Returns `true` when ALL conditions are met:
+/// - stagnation score >= 3
+/// - at least one plan repair was already attempted
+/// - mutation drought is deep (turns_since_last_mutation >= 8)
+/// - remaining turns are low (<= 10)
+pub fn should_allow_escape_hatch(
+    state: &StagnationState,
+    plan_repair_request_count: usize,
+    remaining_turns: usize,
+) -> bool {
+    compute_stagnation_score(state) >= 3
+        && plan_repair_request_count >= 1
+        && state.turns_since_last_mutation >= 8
+        && remaining_turns <= 10
+}
