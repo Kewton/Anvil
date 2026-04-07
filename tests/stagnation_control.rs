@@ -909,3 +909,241 @@ fn escape_hatch_not_fire_on_plan_stall_without_repair() {
     // plan_repair_request_count = 0 → base condition not met
     assert!(!should_allow_escape_hatch(&state, 0, 10));
 }
+
+// ---------------------------------------------------------------------------
+// Issue #289: stale/alias plan item supersede tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn path_matches_strips_parenthesized_suffix() {
+    assert!(ExecutionPlan::path_matches(
+        "src/foo.ts (bar.ts)",
+        "src/foo.ts"
+    ));
+}
+
+#[test]
+fn path_matches_parenthesized_both_sides() {
+    assert!(ExecutionPlan::path_matches("src/a.ts (x)", "src/a.ts (y)"));
+}
+
+#[test]
+fn supersede_stale_item_on_plan_update() {
+    let mut plan = ExecutionPlan::new(vec![PlanItem::new(
+        "stale item".into(),
+        vec!["src/lib/polling/auto-yes-manager.ts".into()],
+    )]);
+    plan.mark_in_progress(0);
+
+    let new_items = vec![PlanItem::new(
+        "corrected item".into(),
+        vec!["src/lib/polling/auto-yes-manager.ts".into()],
+    )];
+    plan.supersede_stale_items(&new_items);
+    assert_eq!(plan.items[0].status, PlanItemStatus::Superseded);
+}
+
+#[test]
+fn supersede_skips_with_mutated_files() {
+    let mut plan = ExecutionPlan::new(vec![PlanItem::new(
+        "item with mutation".into(),
+        vec!["src/foo.ts".into()],
+    )]);
+    plan.mark_in_progress(0);
+    plan.record_mutation_success(0, "src/foo.ts");
+
+    let new_items = vec![PlanItem::new(
+        "corrected item".into(),
+        vec!["src/foo.ts".into()],
+    )];
+    plan.supersede_stale_items(&new_items);
+    // Should NOT be superseded because mutated_files is non-empty
+    assert_ne!(plan.items[0].status, PlanItemStatus::Superseded);
+}
+
+#[test]
+fn supersede_false_positive_prevention() {
+    // src/utils.ts should NOT be superseded by src/test-utils.ts
+    let mut plan = ExecutionPlan::new(vec![PlanItem::new(
+        "utils work".into(),
+        vec!["src/utils.ts".into()],
+    )]);
+    plan.mark_in_progress(0);
+
+    let new_items = vec![PlanItem::new(
+        "test utils work".into(),
+        vec!["src/test-utils.ts".into()],
+    )];
+    plan.supersede_stale_items(&new_items);
+    // path_matches("src/utils.ts", "src/test-utils.ts") → "src/test-utils.ts".ends_with("src/utils.ts")
+    // is true because of suffix matching — however this is the existing behavior.
+    // The design doc acknowledges this and relies on the mutated_files guard.
+    // For a strict false-positive test, use a non-suffix case:
+    assert_ne!(
+        plan.items[0].status,
+        PlanItemStatus::Superseded,
+        "src/utils.ts must NOT be superseded by src/test-utils.ts"
+    );
+}
+
+#[test]
+fn supersede_false_positive_prevention_strict() {
+    // Truly different file: src/app.ts should NOT be superseded by src/config.ts
+    let mut plan = ExecutionPlan::new(vec![PlanItem::new(
+        "app work".into(),
+        vec!["src/app.ts".into()],
+    )]);
+    plan.mark_in_progress(0);
+
+    let new_items = vec![PlanItem::new(
+        "config work".into(),
+        vec!["src/config.ts".into()],
+    )];
+    plan.supersede_stale_items(&new_items);
+    assert_ne!(plan.items[0].status, PlanItemStatus::Superseded);
+}
+
+#[test]
+fn completion_kind_with_superseded() {
+    use anvil::contracts::CompletionKind;
+
+    let mut plan = ExecutionPlan::new(vec![
+        PlanItem::new("item1".into(), vec!["src/a.ts".into()]),
+        PlanItem::new("item2".into(), vec!["src/b.ts".into()]),
+    ]);
+    // Mark item1 as Done, item2 as Superseded
+    plan.items[0].status = PlanItemStatus::Done;
+    plan.items[1].status = PlanItemStatus::Superseded;
+
+    // All items are finished, no Blocked → should be CompleteUnverified (not Blocked)
+    let kind = CompletionKind::classify(&plan, None, false);
+    assert_eq!(kind, CompletionKind::CompleteUnverified);
+}
+
+#[test]
+fn superseded_item_is_finished() {
+    let mut item = PlanItem::new("test".into(), vec!["src/x.ts".into()]);
+    item.status = PlanItemStatus::Superseded;
+    assert!(item.is_finished());
+}
+
+#[test]
+fn plan_item_status_display_superseded() {
+    assert_eq!(PlanItemStatus::Superseded.to_string(), "superseded");
+}
+
+#[test]
+fn format_checklist_superseded_marker() {
+    let mut plan = ExecutionPlan::new(vec![PlanItem::new(
+        "superseded task".into(),
+        vec!["src/x.ts".into()],
+    )]);
+    plan.items[0].status = PlanItemStatus::Superseded;
+    let checklist = plan.format_checklist();
+    assert!(
+        checklist.contains("[~]"),
+        "superseded items should use [~] marker"
+    );
+}
+
+// CB-001: After supersede, the stale item becomes Superseded (finished).
+// The corrected item should then be deduped against it and not appended
+// (it's effectively the same work). But the overall update returns true
+// because a supersede occurred.
+#[test]
+fn supersede_then_dedup_flow() {
+    // Existing plan has a stale item (Pending, no mutations).
+    let mut plan = ExecutionPlan::new(vec![PlanItem::new(
+        "src/lib/polling/auto-yes-manager.ts: change".into(),
+        vec!["src/lib/polling/auto-yes-manager.ts".into()],
+    )]);
+    // Corrected item has the same target.
+    let new_items = vec![PlanItem::new(
+        "src/lib/polling/auto-yes-manager.ts: corrected change".into(),
+        vec!["src/lib/polling/auto-yes-manager.ts".into()],
+    )];
+    // Step 1: supersede — stale item becomes Superseded
+    plan.supersede_stale_items(&new_items);
+    assert_eq!(plan.items[0].status, PlanItemStatus::Superseded);
+    // Step 2: dedup — corrected item is deduped against now-finished Superseded item
+    let deduped = plan.deduplicate_new_items(new_items);
+    assert_eq!(
+        deduped.len(),
+        0,
+        "corrected item should be deduped after stale item is superseded (same work)"
+    );
+    // Plan still has the superseded item, which is finished.
+    assert!(plan.all_finished());
+}
+
+// CB-001 variant: corrected item with DIFFERENT target (not matching stale)
+// should NOT be deduped and should be appended.
+#[test]
+fn supersede_with_different_target_keeps_corrected() {
+    let mut plan = ExecutionPlan::new(vec![PlanItem::new(
+        "src/lib/polling/auto-yes-manager.ts (auto-yes-poller.ts): change".into(),
+        vec!["src/lib/polling/auto-yes-manager.ts".into()],
+    )]);
+    // Corrected item targets a completely different file.
+    let new_items = vec![PlanItem::new(
+        "src/lib/auto-yes-poller.ts: corrected change".into(),
+        vec!["src/lib/auto-yes-poller.ts".into()],
+    )];
+    // Step 1: supersede — stale item NOT superseded (different paths even after normalization)
+    plan.supersede_stale_items(&new_items);
+    // auto-yes-manager.ts does NOT match auto-yes-poller.ts (different basenames)
+    assert_ne!(plan.items[0].status, PlanItemStatus::Superseded);
+    // Step 2: dedup — no match, so corrected item survives
+    let deduped = plan.deduplicate_new_items(new_items);
+    assert_eq!(
+        deduped.len(),
+        1,
+        "corrected item with different target should survive dedup"
+    );
+}
+
+// CB-001 corollary: dedup should still work against finished items.
+#[test]
+fn dedup_still_works_against_finished_items() {
+    let mut plan = ExecutionPlan::new(vec![PlanItem::new(
+        "src/foo.ts: task".into(),
+        vec!["src/foo.ts".into()],
+    )]);
+    plan.items[0].status = PlanItemStatus::Done;
+    let duplicate = vec![PlanItem::new(
+        "src/foo.ts: same task".into(),
+        vec!["src/foo.ts".into()],
+    )];
+    let deduped = plan.deduplicate_new_items(duplicate);
+    assert_eq!(
+        deduped.len(),
+        0,
+        "new item matching a Done item should be deduplicated"
+    );
+}
+
+// CB-002: same file different tasks should not both be superseded.
+#[test]
+fn supersede_respects_one_to_one_matching() {
+    let mut plan = ExecutionPlan::new(vec![
+        PlanItem::new("src/app.ts: refactor API".into(), vec!["src/app.ts".into()]),
+        PlanItem::new("src/app.ts: add tests".into(), vec!["src/app.ts".into()]),
+    ]);
+    plan.items[0].status = PlanItemStatus::InProgress;
+    // Only one corrected item targeting src/app.ts.
+    let new_items = vec![PlanItem::new(
+        "src/app.ts: corrected refactor".into(),
+        vec!["src/app.ts".into()],
+    )];
+    plan.supersede_stale_items(&new_items);
+    // Only one item should be superseded (1:1), not both.
+    let superseded_count = plan
+        .items
+        .iter()
+        .filter(|i| i.status == PlanItemStatus::Superseded)
+        .count();
+    assert_eq!(
+        superseded_count, 1,
+        "only one item should be superseded per corrected item (1:1 matching)"
+    );
+}

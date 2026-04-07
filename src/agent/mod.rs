@@ -1312,6 +1312,23 @@ fn extract_target_files(description: &str) -> Vec<String> {
         if path.is_empty() {
             continue;
         }
+        // Issue #289: Strip parenthesized annotation suffix, e.g.,
+        // "src/foo.ts (bar.ts)" → "src/foo.ts".
+        // Only strip when there is a space before the opening paren to preserve
+        // legitimate paths like "foo(1).ts".
+        let path = if let Some(pos) = path.find(" (") {
+            if path.ends_with(')') {
+                let stripped = path[..pos].trim_end();
+                if stripped.is_empty() {
+                    continue;
+                }
+                stripped
+            } else {
+                path
+            }
+        } else {
+            path
+        };
         // Security: reject paths with ".." (traversal)
         if path.contains("..") {
             continue;
@@ -1647,5 +1664,24 @@ mod tests {
             items[0].target_files,
             vec!["src/a.rs".to_string(), "src/b.rs".to_string()]
         );
+    }
+
+    // ── Issue #289: parenthesized annotation stripping ──────────────
+
+    #[test]
+    fn extract_target_files_strips_parenthesized() {
+        let desc = "src/lib/polling/auto-yes-manager.ts (auto-yes-poller.ts): change desc";
+        let files = extract_target_files(desc);
+        assert_eq!(
+            files,
+            vec!["src/lib/polling/auto-yes-manager.ts".to_string()]
+        );
+    }
+
+    #[test]
+    fn extract_target_files_preserves_non_spaced_parens() {
+        let desc = "src/foo(1).ts: change";
+        let files = extract_target_files(desc);
+        assert_eq!(files, vec!["src/foo(1).ts".to_string()]);
     }
 }
