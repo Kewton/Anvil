@@ -56,11 +56,25 @@ impl App {
         if let Some(block) = extract_plan_update_block(content) {
             let new_items = parse_plan_items(&block);
             if !new_items.is_empty() {
+                // Issue #289: supersede stale items BEFORE dedup.
+                // This ensures corrected items are not discarded as duplicates
+                // of the stale items they are replacing. After supersede, the
+                // stale items are finished (Superseded) and won't block dedup.
+                self.execution_plan.supersede_stale_items(&new_items);
                 // Issue #287: deduplicate against existing items before appending
                 let deduped = self.execution_plan.deduplicate_new_items(new_items);
                 if deduped.is_empty() {
                     tracing::info!("ANVIL_PLAN_UPDATE detected; all items deduplicated");
-                    return false;
+                    // Still return true if items were superseded
+                    let had_supersede = self
+                        .execution_plan
+                        .items
+                        .iter()
+                        .any(|i| i.status == crate::contracts::PlanItemStatus::Superseded);
+                    if had_supersede {
+                        self.agent_telemetry.record_plan_update();
+                    }
+                    return had_supersede;
                 }
                 tracing::info!(
                     new_items = deduped.len(),

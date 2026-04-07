@@ -486,6 +486,8 @@ pub enum PlanItemStatus {
     Done,
     /// Blocked due to repeated failures.
     Blocked,
+    /// Superseded by a corrected ANVIL_PLAN_UPDATE item (Issue #289).
+    Superseded,
 }
 
 impl std::fmt::Display for PlanItemStatus {
@@ -495,6 +497,7 @@ impl std::fmt::Display for PlanItemStatus {
             Self::InProgress => write!(f, "in_progress"),
             Self::Done => write!(f, "done"),
             Self::Blocked => write!(f, "blocked"),
+            Self::Superseded => write!(f, "superseded"),
         }
     }
 }
@@ -533,7 +536,10 @@ impl PlanItem {
 
     /// Whether this item is considered finished (Done or Blocked).
     pub fn is_finished(&self) -> bool {
-        matches!(self.status, PlanItemStatus::Done | PlanItemStatus::Blocked)
+        matches!(
+            self.status,
+            PlanItemStatus::Done | PlanItemStatus::Blocked | PlanItemStatus::Superseded
+        )
     }
 }
 
@@ -573,6 +579,20 @@ fn strip_edit_fallback_suffix(s: &str) -> &str {
         if let Some(stripped) = s.strip_suffix(suffix) {
             return stripped;
         }
+    }
+    s
+}
+
+/// Strip a parenthesized annotation suffix (e.g., `" (bar.ts)"`) from a path.
+///
+/// Only strips when there is a space before the opening paren (`" ("`) and the
+/// string ends with `")"`.  This preserves legitimate paths like `foo(1).ts`.
+/// Issue #289: prevents poisoned identity from bracket-annotated plan items.
+fn strip_parenthesized_suffix(s: &str) -> &str {
+    if let Some(pos) = s.find(" (")
+        && s.ends_with(')')
+    {
+        return s[..pos].trim_end();
     }
     s
 }
@@ -662,6 +682,8 @@ impl ExecutionPlan {
     pub fn path_matches(a: &str, b: &str) -> bool {
         let a = strip_edit_fallback_suffix(a);
         let b = strip_edit_fallback_suffix(b);
+        let a = strip_parenthesized_suffix(a);
+        let b = strip_parenthesized_suffix(b);
         if a.is_empty() || b.is_empty() {
             return false;
         }
@@ -775,6 +797,45 @@ impl ExecutionPlan {
             .collect()
     }
 
+    /// Supersede stale plan items that overlap with corrected new items (Issue #289).
+    ///
+    /// A stale item is one that is not yet finished, has no recorded mutations,
+    /// and has at least one `target_file` that matches (via `path_matches`) a
+    /// target in one of the `new_items`.  Such items are marked `Superseded` so
+    /// they no longer block plan completion.
+    ///
+    /// To avoid false positives (CB-002), each new item can supersede at most one
+    /// existing item, and each existing item can be superseded by at most one new
+    /// item (1:1 matching).  New items are consumed greedily in order.
+    pub fn supersede_stale_items(&mut self, new_items: &[PlanItem]) {
+        // Track which new items have already been consumed.
+        let mut new_consumed = vec![false; new_items.len()];
+        for existing in &mut self.items {
+            // Only supersede unfinished items with no mutations recorded yet.
+            if existing.is_finished() || !existing.mutated_files.is_empty() {
+                continue;
+            }
+            // Find the first unconsumed new item whose targets intersect.
+            let matched = new_items.iter().enumerate().find(|(j, new_item)| {
+                !new_consumed[*j]
+                    && existing.target_files.iter().any(|et| {
+                        new_item
+                            .target_files
+                            .iter()
+                            .any(|nt| Self::path_matches(et, nt))
+                    })
+            });
+            if let Some((j, _)) = matched {
+                new_consumed[j] = true;
+                tracing::info!(
+                    description = %existing.description,
+                    "plan item superseded by corrected ANVIL_PLAN_UPDATE"
+                );
+                existing.status = PlanItemStatus::Superseded;
+            }
+        }
+    }
+
     /// Sync plan item completion from the set of files actually modified.
     ///
     /// When a file.write/file.edit succeeds but the result is not passed to
@@ -825,6 +886,7 @@ impl ExecutionPlan {
             let marker = match item.status {
                 PlanItemStatus::Done => "[x]",
                 PlanItemStatus::Blocked => "[!]",
+                PlanItemStatus::Superseded => "[~]",
                 PlanItemStatus::InProgress => "[>]",
                 PlanItemStatus::Pending => "[ ]",
             };
@@ -2021,6 +2083,7 @@ mod tests {
         assert_eq!(PlanItemStatus::InProgress.to_string(), "in_progress");
         assert_eq!(PlanItemStatus::Done.to_string(), "done");
         assert_eq!(PlanItemStatus::Blocked.to_string(), "blocked");
+        assert_eq!(PlanItemStatus::Superseded.to_string(), "superseded");
     }
 
     #[test]
