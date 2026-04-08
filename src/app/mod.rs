@@ -18,6 +18,7 @@ pub(crate) mod read_repeat_tracker;
 pub mod read_transition_guard;
 pub mod render;
 pub mod stagnation_state;
+pub(crate) mod tool_recovery_budget;
 pub(crate) mod write_fail_tracker;
 pub(crate) mod write_repeat_tracker;
 
@@ -287,6 +288,8 @@ pub struct App {
     stagnation_state: stagnation_state::StagnationState,
     /// Whether forced mode is active for the current turn (Issue #263).
     forced_mode_active: bool,
+    /// Recovery read budget for file.edit failure recovery (Issue #299).
+    tool_recovery_budget: tool_recovery_budget::ToolRecoveryBudget,
 }
 
 /// Whether the session loop should continue or exit.
@@ -565,6 +568,7 @@ impl App {
         let edit_write_fallback_threshold = config.runtime.edit_write_fallback_threshold;
         let read_repeat_warn = config.runtime.read_repeat_warn_threshold;
         let read_repeat_strong_warn = config.runtime.read_repeat_strong_warn_threshold;
+        let edit_recovery_read_budget = config.runtime.edit_recovery_read_budget;
 
         Ok(Self {
             tools,
@@ -620,6 +624,9 @@ impl App {
             agent_telemetry: crate::contracts::AgentTelemetry::new(),
             stagnation_state: stagnation_state::StagnationState::new(),
             forced_mode_active: false,
+            tool_recovery_budget: tool_recovery_budget::ToolRecoveryBudget::new(
+                edit_recovery_read_budget,
+            ),
         })
     }
 

@@ -203,6 +203,9 @@ pub struct RuntimeConfig {
     /// Guidance mode for plan-aware execution (Issue #261).
     /// Sequential = one item at a time (default), Batch = multiple items per turn.
     pub guidance_mode: GuidanceMode,
+    /// Per-path recovery read budget after file.edit failure (Issue #299).
+    /// Controls how many file.read calls are suppressed from detector signals.
+    pub edit_recovery_read_budget: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -384,6 +387,7 @@ impl EffectiveConfig {
                 max_tool_calls: DEFAULT_MAX_TOOL_CALLS,
                 max_output_tokens: Some(DEFAULT_MAX_OUTPUT_TOKENS),
                 guidance_mode: GuidanceMode::default(),
+                edit_recovery_read_budget: 3,
             },
             mode: ModeConfig {
                 prompt_source: PromptSource::Interactive,
@@ -507,6 +511,7 @@ impl EffectiveConfig {
             "ANVIL_UI_LANGUAGE",
             "ANVIL_MAX_TOOL_CALLS",
             "ANVIL_GUIDANCE_MODE",
+            "ANVIL_EDIT_RECOVERY_READ_BUDGET",
         ] {
             if let Ok(value) = std::env::var(key) {
                 map.insert(key.to_string(), value);
@@ -858,6 +863,15 @@ impl EffectiveConfig {
                     }
                     self.runtime.edit_write_fallback_threshold = v;
                 }
+                "edit_recovery_read_budget" | "ANVIL_EDIT_RECOVERY_READ_BUDGET" => {
+                    let v: u32 = value
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                    if !(1..=10).contains(&v) {
+                        return Err(ConfigError::InvalidNumericValue(value.clone()));
+                    }
+                    self.runtime.edit_recovery_read_budget = v;
+                }
                 "read_repeat_warn_threshold" | "ANVIL_READ_REPEAT_WARN_THRESHOLD" => {
                     let v: u32 = value
                         .parse()
@@ -1146,6 +1160,8 @@ impl EffectiveConfig {
         if self.runtime.edit_write_fallback_threshold <= self.runtime.edit_reread_threshold {
             self.runtime.edit_write_fallback_threshold = self.runtime.edit_reread_threshold + 2;
         }
+        self.runtime.edit_recovery_read_budget =
+            self.runtime.edit_recovery_read_budget.clamp(1, 10);
     }
 
     pub fn validate_for_test(&mut self) -> Result<(), ConfigError> {
@@ -1506,6 +1522,7 @@ impl std::fmt::Debug for RuntimeConfig {
             )
             .field("safe_write_max_lines", &self.safe_write_max_lines)
             .field("safe_write_deletion_ratio", &self.safe_write_deletion_ratio)
+            .field("edit_recovery_read_budget", &self.edit_recovery_read_budget)
             .finish()
     }
 }

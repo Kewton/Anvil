@@ -528,7 +528,7 @@ impl App {
 
             // Record sub-agent results first (IR3-002)
             for result in &agent_results {
-                self.record_tool_result(result);
+                self.record_tool_result(result, false);
             }
             total_tool_count += agent_results.len();
 
@@ -563,11 +563,21 @@ impl App {
             // live streaming output on stderr (Issue #1).
 
             // Execute normal tool calls and record results WITH payload
-            let (results, loop_action) = self.execute_structured_tool_calls(&current_normal)?;
+            let (results, loop_action, recovery_read_count) =
+                self.execute_structured_tool_calls(&current_normal)?;
             total_tool_count += results.len();
 
             // Update plan item status from tool results; capture telemetry.
-            let (turn_mutations, turn_items_advanced) = self.update_plan_from_results(&results);
+            let (mut turn_mutations, turn_items_advanced) = self.update_plan_from_results(&results);
+            // Issue #299: count recovery reads as mutations so stagnation
+            // scoring does not inflate during recovery.
+            if recovery_read_count > 0 {
+                turn_mutations += recovery_read_count as u32;
+                tracing::debug!(
+                    recovery_read_count,
+                    "recovery reads counted as mutations for stagnation"
+                );
+            }
 
             // Issue #269 Phase 3: record each successful mutation for stagnation tracking.
             // Issue #273: Also record first mutation event telemetry here so plan-free runs
@@ -1267,10 +1277,22 @@ impl App {
         }
     }
 
+    /// Execute validated and approved tool calls from a structured response.
+    ///
+    /// Returns `(results, loop_action, recovery_read_count)` where
+    /// `recovery_read_count` is the number of recovery reads consumed
+    /// (Issue #299) for stagnation adjustment.
     pub(crate) fn execute_structured_tool_calls(
         &mut self,
         structured: &StructuredAssistantResponse,
-    ) -> Result<(Vec<ToolExecutionResult>, super::loop_detector::LoopAction), AppError> {
+    ) -> Result<
+        (
+            Vec<ToolExecutionResult>,
+            super::loop_detector::LoopAction,
+            usize,
+        ),
+        AppError,
+    > {
         // Phase 1: Validation + Approval
         let (validated_requests, mut failed_results) =
             self.validate_and_approve_all(&structured.tool_calls);
@@ -1349,13 +1371,36 @@ impl App {
         };
 
         // Loop detection: record each validated tool call and check for repetition (Issue #145, #172)
+        // Issue #299: recovery reads skip LoopDetector but not AlternatingLoopDetector.
         let mut worst_loop_action = super::loop_detector::LoopAction::Continue;
         for (_, req) in &validated_requests {
             if let Some((tool_name, tool_input)) = tool_input_map.get(&req.tool_call_id) {
-                // LoopDetector: same-call repetition
-                let action = self.loop_detector.record_and_check(tool_name, tool_input);
-                worst_loop_action = worst_loop_action.merge(action);
+                // Issue #299: Check if this is a recovery read (file.read with budget).
+                let recovery_path = if tool_name == "file.read" {
+                    tool_input
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                } else {
+                    None
+                };
+                let is_pre_recovery = recovery_path
+                    .as_deref()
+                    .is_some_and(|p| self.tool_recovery_budget.has_budget(p));
+
+                if is_pre_recovery {
+                    tracing::debug!(
+                        tool = %tool_name,
+                        path = ?recovery_path,
+                        "loop_detector skipped during recovery"
+                    );
+                } else {
+                    // LoopDetector: same-call repetition
+                    let action = self.loop_detector.record_and_check(tool_name, tool_input);
+                    worst_loop_action = worst_loop_action.merge(action);
+                }
                 // AlternatingLoopDetector: cyclic pattern detection (Issue #172)
+                // Always runs, even during recovery (design decision).
                 let alt_action = self
                     .alternating_loop_detector
                     .record_and_check(tool_name, tool_input);
@@ -1372,7 +1417,7 @@ impl App {
             failed_results.sort_by_key(|(idx, _)| *idx);
             let results: Vec<ToolExecutionResult> =
                 failed_results.into_iter().map(|(_, r)| r).collect();
-            return Ok((results, worst_loop_action));
+            return Ok((results, worst_loop_action, 0));
         }
 
         // For Warn/StrongWarn: create synthetic tool result to include in results
@@ -1544,32 +1589,73 @@ impl App {
         let mut results: Vec<ToolExecutionResult> = Vec::with_capacity(indexed_results.len());
         let mut phase_action = super::phase_estimator::PhaseAction::Continue;
         let mut read_transition_message: Option<String> = None;
+        let mut recovery_read_count: usize = 0;
         for (_, result) in indexed_results {
-            self.record_tool_result(&result);
-            // Phase estimator: record tool call pattern (Issue #159)
-            let success = result.status == ToolExecutionStatus::Completed;
-            let pa = self
-                .phase_estimator
-                .record_tool_call(&result.tool_name, success);
-            if !matches!(pa, super::phase_estimator::PhaseAction::Continue) {
-                phase_action = pa;
-            }
-            // Issue #265: pass shell command to read_transition_guard so
-            // grep/sed/cat are counted as exploration calls.
-            let shell_cmd: Option<String> = if result.tool_name == "shell.exec" {
+            // Issue #299: Check if this is a recovery read and consume budget.
+            // Use the raw input path (not the resolved artifact path) so that
+            // the key matches the grant-time path (which is also relative).
+            let recovery_path_for_result = if result.tool_name == "file.read" {
                 tool_input_map
                     .get(&result.tool_call_id)
-                    .and_then(|(_, v)| v.get("command").and_then(|c| c.as_str()).map(String::from))
+                    .and_then(|(_, v)| v.get("path").and_then(|p| p.as_str()))
             } else {
                 None
             };
-            let transition_action = self.read_transition_guard.record_tool_call_ex(
-                &result.tool_name,
-                success,
-                shell_cmd.as_deref(),
-            );
-            if let ReadTransitionAction::Inject(msg) = transition_action {
-                read_transition_message = Some(msg);
+            let is_recovery = recovery_path_for_result.is_some_and(|p| {
+                self.tool_recovery_budget
+                    .should_suppress_detectors(&result.tool_name, p)
+            });
+            if is_recovery {
+                recovery_read_count += 1;
+                let remaining_info = if let Some(p) = recovery_path_for_result {
+                    if self.tool_recovery_budget.has_budget(p) {
+                        "has_remaining"
+                    } else {
+                        "exhausted"
+                    }
+                } else {
+                    "unknown"
+                };
+                tracing::debug!(
+                    tool = %result.tool_name,
+                    path = ?recovery_path_for_result,
+                    budget_status = remaining_info,
+                    "recovery read consumed"
+                );
+            }
+
+            self.record_tool_result(&result, is_recovery);
+
+            // Phase estimator: record tool call pattern (Issue #159)
+            // Issue #299: skip during recovery reads.
+            let success = result.status == ToolExecutionStatus::Completed;
+            if !is_recovery {
+                let pa = self
+                    .phase_estimator
+                    .record_tool_call(&result.tool_name, success);
+                if !matches!(pa, super::phase_estimator::PhaseAction::Continue) {
+                    phase_action = pa;
+                }
+            }
+            // Issue #265: pass shell command to read_transition_guard so
+            // grep/sed/cat are counted as exploration calls.
+            // Issue #299: skip during recovery reads.
+            if !is_recovery {
+                let shell_cmd: Option<String> = if result.tool_name == "shell.exec" {
+                    tool_input_map.get(&result.tool_call_id).and_then(|(_, v)| {
+                        v.get("command").and_then(|c| c.as_str()).map(String::from)
+                    })
+                } else {
+                    None
+                };
+                let transition_action = self.read_transition_guard.record_tool_call_ex(
+                    &result.tool_name,
+                    success,
+                    shell_cmd.as_deref(),
+                );
+                if let ReadTransitionAction::Inject(msg) = transition_action {
+                    read_transition_message = Some(msg);
+                }
             }
 
             // Emit folded tool result to stderr for interactive sessions
@@ -1621,7 +1707,7 @@ impl App {
 
         // Append synthetic loop detection warning if present
         if let Some(warning_result) = synthetic_warning {
-            self.record_tool_result(&warning_result);
+            self.record_tool_result(&warning_result, false);
             results.push(warning_result);
         }
 
@@ -1638,7 +1724,7 @@ impl App {
                 edit_detail: None,
                 rolled_back: false,
             };
-            self.record_tool_result(&transition_result);
+            self.record_tool_result(&transition_result, false);
             results.push(transition_result);
         }
 
@@ -1668,17 +1754,17 @@ impl App {
                     edit_detail: None,
                     rolled_back: false,
                 };
-                self.record_tool_result(&transition_result);
+                self.record_tool_result(&transition_result, false);
                 results.push(transition_result);
             }
         }
 
         self.persist_session(crate::contracts::AppEvent::SessionSaved)?;
-        Ok((results, worst_loop_action))
+        Ok((results, worst_loop_action, recovery_read_count))
     }
 
     /// Push a tool execution result into the session as a tool message.
-    fn record_tool_result(&mut self, result: &ToolExecutionResult) {
+    fn record_tool_result(&mut self, result: &ToolExecutionResult, is_recovery: bool) {
         // Session stats: record tool call (Issue #206 C-3)
         self.session_stats.record_tool_call(&result.tool_name);
 
@@ -1740,6 +1826,18 @@ impl App {
                     let path = resolve_edit_tracker_path(&raw_path);
                     let action = self.edit_fail_tracker.record_failure(&path);
                     let count = self.edit_fail_tracker.failure_count(&path);
+                    // Issue #299: grant recovery budget only for exact-match
+                    // mismatch failures (old_string not found).  IO errors,
+                    // permission failures, etc. are not recoverable by re-reading.
+                    let is_exact_match_failure = result.summary.contains("not found");
+                    if is_exact_match_failure {
+                        self.tool_recovery_budget.grant(&path);
+                        tracing::info!(
+                            path = %path,
+                            budget = self.config.runtime.edit_recovery_read_budget,
+                            "recovery budget granted"
+                        );
+                    }
                     match action {
                         crate::app::edit_fail_tracker::EditFallbackAction::Continue => {}
                         crate::app::edit_fail_tracker::EditFallbackAction::ReRead => {
@@ -1800,6 +1898,12 @@ impl App {
                     let path_str = resolve_edit_tracker_path(artifact);
                     self.edit_fail_tracker.record_success(&path_str);
                     self.write_repeat_tracker.reset_for_path(&path_str);
+                    // Issue #299: clear recovery budget on edit success.
+                    self.tool_recovery_budget.clear(&path_str);
+                    tracing::info!(
+                        path = %path_str,
+                        "recovery budget cleared on success"
+                    );
                 }
             }
         }
@@ -1817,8 +1921,10 @@ impl App {
         let write_hint = self.update_write_trackers(result);
 
         // Read repeat tracker: track repeated file.read calls (Issue #185)
+        // Issue #299: skip during recovery reads to avoid false warnings.
         let mut read_hint: Option<String> = None;
-        if result.tool_name == "file.read"
+        if !is_recovery
+            && result.tool_name == "file.read"
             && result.status == ToolExecutionStatus::Completed
             && let Some(path) = result.artifacts.first()
         {
