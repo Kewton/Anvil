@@ -173,6 +173,7 @@ tests/
 ├── edit_recovery_loop.rs # file.edit recovery loop fix テスト（Issue #299）
 ├── plan_item_retire.rs  # stale plan item retire テスト（Issue #301）
 ├── followup_replan.rs   # follow-up ANVIL_PLAN replan テスト（Issue #305）
+├── prose_retire_fallback.rs # prose-only確認のplan retire変換テスト（Issue #307）
 └── walk_system.rs       # ディレクトリウォーカーテスト
 ```
 
