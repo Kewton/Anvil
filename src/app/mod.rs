@@ -830,6 +830,12 @@ impl App {
     /// Check whether the last turn had any tool execution failures.
     /// Used by non-interactive mode to determine exit code.
     pub fn has_tool_execution_failure(&self) -> bool {
+        // Plan完了ベース (Issue #296): plan が正常完了していれば
+        // 途中の tool failure は回復済みとみなし exit 0 へ.
+        // plan なし実行では従来の is_error チェックをフォールスルー.
+        if self.execution_plan.is_successfully_completed() {
+            return false;
+        }
         self.session
             .last_turn_tool_results()
             .any(|result| result.is_error)
@@ -862,6 +868,20 @@ impl App {
             .session_start
             .map(|s| s.elapsed())
             .unwrap_or_default();
+
+        // Issue #296: Count recovered vs unrecovered tool failures
+        let total_tool_errors = self
+            .session
+            .last_turn_tool_results()
+            .filter(|r| r.is_error)
+            .count();
+        let plan_recovered = self.execution_plan.is_successfully_completed();
+        let (recovered, unrecovered) = if plan_recovered {
+            (total_tool_errors, 0usize)
+        } else {
+            (0usize, total_tool_errors)
+        };
+
         tracing::info!(
             total_turns = self.session_stats.total_turns,
             total_tool_calls = self.session_stats.total_tool_calls(),
@@ -872,6 +892,8 @@ impl App {
             compact_count = self.session_stats.compact_count,
             sidecar_count = self.session_stats.sidecar_count,
             elapsed_s = format!("{:.1}", session_elapsed.as_secs_f64()),
+            recovered_tool_failures = recovered,
+            unrecovered_tool_failures = unrecovered,
             "session completed"
         );
 
@@ -2790,5 +2812,130 @@ mod tests {
             None => context_window as usize,
         };
         assert_eq!(effective, 262_144);
+    }
+
+    // --- Issue #296: has_tool_execution_failure tests ---
+
+    /// Helper to build an App instance for testing.
+    fn build_test_app() -> App {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "anvil_test_296_{:?}_{:?}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            std::thread::current().id()
+        ));
+        let mut config =
+            crate::config::EffectiveConfig::default_for_test().expect("config should load");
+        config.paths.cwd = tmp.clone();
+        config.paths.workspace_dir = tmp.join("workspace");
+        config.paths.config_file = tmp.join(".anvil").join("config");
+        config.paths.state_dir = tmp.join(".anvil").join("state");
+        config.paths.session_dir = tmp.join(".anvil").join("sessions");
+        config.paths.session_file = config.paths.session_dir.join("default.json");
+        config.paths.logs_dir = tmp.join(".anvil").join("logs");
+        config.paths.mcp_config_file = tmp.join(".anvil").join("mcp.json");
+        config.paths.hooks_config_file = tmp.join(".anvil").join("hooks.json");
+        let provider = crate::provider::ProviderRuntimeContext::bootstrap(&config)
+            .expect("provider should bootstrap");
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        App::new(config, provider, shutdown_flag).expect("app should initialize")
+    }
+
+    /// Push a tool result message with the given is_error flag.
+    fn push_tool_result(app: &mut App, is_error: bool) {
+        let mut msg = crate::session::SessionMessage::new(
+            crate::session::MessageRole::Tool,
+            "tool_result",
+            "result content",
+        );
+        msg.is_error = is_error;
+        app.session.push_message(msg);
+    }
+
+    #[test]
+    fn has_tool_execution_failure_plan_completed_no_error() {
+        let mut app = build_test_app();
+        // Set plan to all Done
+        app.execution_plan =
+            crate::contracts::ExecutionPlan::new(vec![crate::contracts::PlanItem::new(
+                "task1".into(),
+                vec![],
+            )]);
+        app.execution_plan.items[0].status = crate::contracts::PlanItemStatus::Done;
+        // No error tool results
+        push_tool_result(&mut app, false);
+        assert!(!app.has_tool_execution_failure());
+    }
+
+    #[test]
+    fn has_tool_execution_failure_plan_completed_with_error() {
+        let mut app = build_test_app();
+        // Set plan to all Done
+        app.execution_plan = crate::contracts::ExecutionPlan::new(vec![
+            crate::contracts::PlanItem::new("task1".into(), vec![]),
+            crate::contracts::PlanItem::new("task2".into(), vec![]),
+        ]);
+        app.execution_plan.items[0].status = crate::contracts::PlanItemStatus::Done;
+        app.execution_plan.items[1].status = crate::contracts::PlanItemStatus::Done;
+        // Push error tool result (should be recovered)
+        push_tool_result(&mut app, true);
+        assert!(!app.has_tool_execution_failure());
+    }
+
+    #[test]
+    fn has_tool_execution_failure_no_plan_with_error() {
+        let mut app = build_test_app();
+        // No plan (default empty)
+        push_tool_result(&mut app, true);
+        assert!(app.has_tool_execution_failure());
+    }
+
+    #[test]
+    fn has_tool_execution_failure_plan_incomplete_with_error() {
+        let mut app = build_test_app();
+        // Plan with InProgress item
+        app.execution_plan = crate::contracts::ExecutionPlan::new(vec![
+            crate::contracts::PlanItem::new("task1".into(), vec![]),
+            crate::contracts::PlanItem::new("task2".into(), vec![]),
+        ]);
+        app.execution_plan.items[0].status = crate::contracts::PlanItemStatus::Done;
+        app.execution_plan.items[1].status = crate::contracts::PlanItemStatus::InProgress;
+        push_tool_result(&mut app, true);
+        assert!(app.has_tool_execution_failure());
+    }
+
+    #[test]
+    fn has_tool_execution_failure_plan_with_superseded() {
+        let mut app = build_test_app();
+        // Plan with Done + Superseded (all finished, no Blocked)
+        app.execution_plan = crate::contracts::ExecutionPlan::new(vec![
+            crate::contracts::PlanItem::new("task1".into(), vec![]),
+            crate::contracts::PlanItem::new("task2".into(), vec![]),
+            crate::contracts::PlanItem::new("task3".into(), vec![]),
+        ]);
+        app.execution_plan.items[0].status = crate::contracts::PlanItemStatus::Done;
+        app.execution_plan.items[1].status = crate::contracts::PlanItemStatus::Superseded;
+        app.execution_plan.items[2].status = crate::contracts::PlanItemStatus::Done;
+        push_tool_result(&mut app, true);
+        assert!(!app.has_tool_execution_failure());
+    }
+
+    #[test]
+    fn has_tool_execution_failure_plan_with_blocked() {
+        let mut app = build_test_app();
+        // Plan with Blocked item (all finished but has Blocked)
+        app.execution_plan = crate::contracts::ExecutionPlan::new(vec![
+            crate::contracts::PlanItem::new("task1".into(), vec![]),
+            crate::contracts::PlanItem::new("task2".into(), vec![]),
+        ]);
+        app.execution_plan.items[0].status = crate::contracts::PlanItemStatus::Done;
+        app.execution_plan.items[1].status = crate::contracts::PlanItemStatus::Blocked;
+        push_tool_result(&mut app, true);
+        assert!(app.has_tool_execution_failure());
     }
 }
