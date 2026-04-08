@@ -407,6 +407,7 @@ fn local_tool_executor_reads_directory_as_listing() {
             input: ToolInput::FileRead {
                 path: "./sandbox/test1_001".to_string(),
             },
+            extra_field_warnings: vec![],
         })
         .expect("directory listing should succeed");
 
@@ -1637,6 +1638,7 @@ fn file_edit_execution_replaces_unique_match() {
                 old_string: "hello".to_string(),
                 new_string: "goodbye".to_string(),
             },
+            extra_field_warnings: vec![],
         })
         .expect("edit should succeed");
 
@@ -1665,6 +1667,7 @@ fn file_edit_old_string_not_found() {
                 old_string: "nonexistent".to_string(),
                 new_string: "replacement".to_string(),
             },
+            extra_field_warnings: vec![],
         })
         .expect_err("should fail when old_string not found");
 
@@ -1691,6 +1694,7 @@ fn file_edit_old_string_multiple_matches() {
                 old_string: "aaa".to_string(),
                 new_string: "ccc".to_string(),
             },
+            extra_field_warnings: vec![],
         })
         .expect_err("should fail when old_string matches multiple times");
 
@@ -1718,6 +1722,7 @@ fn file_edit_empty_new_string_deletes() {
                 old_string: " world".to_string(),
                 new_string: "".to_string(),
             },
+            extra_field_warnings: vec![],
         })
         .expect("edit should succeed");
 
@@ -1747,6 +1752,7 @@ fn file_edit_noop_when_strings_equal() {
                 old_string: "hello".to_string(),
                 new_string: "hello".to_string(),
             },
+            extra_field_warnings: vec![],
         })
         .expect_err("noop edit should return error when old_string == new_string");
 
@@ -1777,6 +1783,7 @@ fn file_edit_file_not_found() {
                 old_string: "hello".to_string(),
                 new_string: "world".to_string(),
             },
+            extra_field_warnings: vec![],
         })
         .expect_err("should fail for nonexistent file");
 
@@ -1802,6 +1809,7 @@ fn file_edit_sandbox_escape_rejected() {
                 old_string: "root".to_string(),
                 new_string: "hacked".to_string(),
             },
+            extra_field_warnings: vec![],
         })
         .expect_err("should reject sandbox escape");
 
@@ -2011,6 +2019,7 @@ fn build_exec_request(name: &str, mode: ExecutionMode) -> ToolExecutionRequest {
         input: ToolInput::FileRead {
             path: "dummy.txt".to_string(),
         },
+        extra_field_warnings: vec![],
     }
 }
 
@@ -2146,6 +2155,7 @@ fn parallel_execution_preserves_result_order() {
                     input: ToolInput::FileRead {
                         path: format!("./file_{i}.txt"),
                     },
+                    extra_field_warnings: vec![],
                 },
             )
         })
@@ -3949,6 +3959,7 @@ fn git_status_execution_in_git_repo() {
             tool_call_id: "call_git_status".to_string(),
             spec: registry.get("git.status").unwrap().clone(),
             input: ToolInput::GitStatus {},
+            extra_field_warnings: vec![],
         })
         .expect("git.status should succeed in git repo");
 
@@ -3972,6 +3983,7 @@ fn git_diff_execution_in_git_repo() {
                 staged: None,
                 commit: None,
             },
+            extra_field_warnings: vec![],
         })
         .expect("git.diff should succeed in git repo");
 
@@ -3992,6 +4004,7 @@ fn git_log_execution_in_git_repo() {
                 count: Some(5),
                 path: None,
             },
+            extra_field_warnings: vec![],
         })
         .expect("git.log should succeed in git repo");
 
@@ -4047,6 +4060,7 @@ fn git_status_fails_in_non_git_repo() {
             tool_call_id: "call_git_status_fail".to_string(),
             spec: registry.get("git.status").unwrap().clone(),
             input: ToolInput::GitStatus {},
+            extra_field_warnings: vec![],
         })
         .expect("execute should return result, not runtime error");
 
@@ -4092,6 +4106,7 @@ fn git_diff_staged_priority_over_commit() {
                 staged: Some(true),
                 commit: Some("HEAD~1".to_string()),
             },
+            extra_field_warnings: vec![],
         })
         .expect("git.diff with staged should succeed");
 
@@ -4718,6 +4733,7 @@ fn file_write_produces_diff_summary() {
                 path: "./new_file.txt".to_string(),
                 content: "hello world".to_string(),
             },
+            extra_field_warnings: vec![],
         })
         .expect("write should succeed");
 
@@ -4753,6 +4769,7 @@ fn file_edit_produces_diff_summary() {
                 old_string: "hello".to_string(),
                 new_string: "goodbye".to_string(),
             },
+            extra_field_warnings: vec![],
         })
         .expect("edit should succeed");
 
@@ -4791,6 +4808,7 @@ fn file_edit_anchor_produces_diff_summary() {
                     new_content: "let x = 42;".to_string(),
                 },
             },
+            extra_field_warnings: vec![],
         })
         .expect("anchor edit should succeed");
 
@@ -4824,6 +4842,7 @@ fn file_read_has_no_diff_summary() {
             input: ToolInput::FileRead {
                 path: "./test.txt".to_string(),
             },
+            extra_field_warnings: vec![],
         })
         .expect("read should succeed");
 
@@ -4890,6 +4909,7 @@ fn file_edit_anchor_execution_indent_normalized_match() {
                     new_content: "let x = 10;\nlet y = 20;".to_string(),
                 },
             },
+            extra_field_warnings: vec![],
         })
         .expect("anchor edit should succeed");
 
@@ -4927,6 +4947,7 @@ fn file_edit_anchor_execution_no_match_error() {
                     new_content: "replacement".to_string(),
                 },
             },
+            extra_field_warnings: vec![],
         })
         .expect_err("should fail when old_content not found");
 
@@ -4956,6 +4977,7 @@ fn file_edit_anchor_execution_multiple_matches_error() {
                     new_content: "let x = 2;".to_string(),
                 },
             },
+            extra_field_warnings: vec![],
         })
         .expect_err("should fail when old_content matches multiple times");
 
@@ -4989,6 +5011,7 @@ fn file_edit_fallback_indent_mismatch() {
                 old_string: "        let x = 1;".to_string(), // 8-space indent
                 new_string: "        let x = 2;".to_string(),
             },
+            extra_field_warnings: vec![],
         })
         .expect("fallback should succeed");
 
@@ -5142,6 +5165,7 @@ fn edit_fallback_includes_context_on_failure() {
                 old_string: "fn main() {\n    let x = wrong;\n}".to_string(),
                 new_string: "fn main() {\n    let x = correct;\n}".to_string(),
             },
+            extra_field_warnings: vec![],
         })
         .unwrap_err();
     assert!(err.is_edit_not_found());
@@ -5185,6 +5209,7 @@ fn edit_fallback_no_context_for_sensitive_file() {
                 old_string: "NONEXISTENT=value".to_string(),
                 new_string: "REPLACED=value".to_string(),
             },
+            extra_field_warnings: vec![],
         })
         .unwrap_err();
     match &err {
@@ -5223,6 +5248,7 @@ fn trailing_ws_normalized_match_succeeds() {
                 old_string: "fn hello() {\n    world()\n}".to_string(),
                 new_string: "fn hello() {\n    universe()\n}".to_string(),
             },
+            extra_field_warnings: vec![],
         })
         .expect("trailing-ws normalized edit should succeed");
 
@@ -5524,6 +5550,7 @@ fn file_edit_success_payload_contains_diff() {
                 old_string: "hello".to_string(),
                 new_string: "goodbye".to_string(),
             },
+            extra_field_warnings: vec![],
         })
         .expect("edit should succeed");
 
@@ -5564,6 +5591,7 @@ fn file_edit_no_changes_returns_error() {
                 old_string: "hello".to_string(),
                 new_string: "hello".to_string(),
             },
+            extra_field_warnings: vec![],
         })
         .expect_err("identical old_string/new_string should return error");
 
@@ -5923,6 +5951,7 @@ fn file_cache_hit_returns_content_with_header() {
         input: ToolInput::FileRead {
             path: "hello.txt".to_string(),
         },
+        extra_field_warnings: vec![],
     };
 
     // First read: populates cache, returns raw content without header
@@ -6298,6 +6327,7 @@ fn file_write_same_content_produces_no_diff() {
                 path: "./existing.txt".to_string(),
                 content: "unchanged content".to_string(),
             },
+            extra_field_warnings: vec![],
         })
         .expect("write should succeed");
 
@@ -6334,6 +6364,7 @@ fn file_write_different_content_produces_diff() {
                 path: "./target.txt".to_string(),
                 content: "new content".to_string(),
             },
+            extra_field_warnings: vec![],
         })
         .expect("write should succeed");
 

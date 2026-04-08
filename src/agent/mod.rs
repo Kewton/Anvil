@@ -442,11 +442,40 @@ fn parse_tool_call_value(
         }
     };
 
-    Ok(ToolCallRequest::new(
-        tool_call_id.to_string(),
-        resolved_name,
-        input,
-    ))
+    let mut request = ToolCallRequest::new(tool_call_id.to_string(), resolved_name, input);
+
+    // Issue #299: detect unsupported extra fields for file.read.
+    if tool_name == "file.read"
+        && let Some(obj) = value.as_object()
+    {
+        let known = ["tool", "id", "path"];
+        let max_warnings = 3;
+        let mut count = 0usize;
+        let mut extra_total = 0usize;
+        for key in obj.keys() {
+            if !known.contains(&key.as_str()) {
+                extra_total += 1;
+                if count < max_warnings {
+                    // Sanitize: truncate long names, remove control chars.
+                    let sanitized: String =
+                        key.chars().filter(|c| !c.is_control()).take(64).collect();
+                    request.extra_field_warnings.push(format!(
+                        "Note: '{}' field is not supported by file.read and was ignored",
+                        sanitized
+                    ));
+                    count += 1;
+                }
+            }
+        }
+        if extra_total > max_warnings {
+            request.extra_field_warnings.push(format!(
+                "and {} more unsupported field(s)",
+                extra_total - max_warnings
+            ));
+        }
+    }
+
+    Ok(request)
 }
 
 fn repair_tool_call_block(block: &str) -> Option<ToolCallRequest> {

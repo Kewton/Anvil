@@ -482,6 +482,8 @@ pub struct ToolCallRequest {
     pub tool_call_id: String,
     pub tool_name: String,
     pub input: ToolInput,
+    /// Warnings about unsupported extra fields in the tool input (Issue #299).
+    pub extra_field_warnings: Vec<String>,
 }
 
 impl ToolCallRequest {
@@ -494,6 +496,7 @@ impl ToolCallRequest {
             tool_call_id: tool_call_id.into(),
             tool_name: tool_name.into(),
             input,
+            extra_field_warnings: Vec::new(),
         }
     }
 }
@@ -596,6 +599,7 @@ impl ValidatedToolCall {
         Ok(ToolExecutionRequest {
             tool_call_id: self.request.tool_call_id.clone(),
             spec: self.spec,
+            extra_field_warnings: self.request.extra_field_warnings.clone(),
             input: self.request.input,
         })
     }
@@ -606,6 +610,8 @@ pub struct ToolExecutionRequest {
     pub tool_call_id: String,
     pub spec: ToolSpec,
     pub input: ToolInput,
+    /// Warnings about unsupported extra fields in the tool input (Issue #299).
+    pub extra_field_warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1347,13 +1353,19 @@ impl LocalToolExecutor {
                 hit.content.len()
             );
             let payload = format!("{}{}", header, hit.content);
-            return Ok(build_completed_result(
+            let mut result = build_completed_result(
                 request,
                 path.to_string(),
                 ToolExecutionPayload::Text(payload),
                 vec![resolved.display().to_string()],
                 started,
-            ));
+            );
+            // Issue #299: append extra field warnings to summary (not payload).
+            if !request.extra_field_warnings.is_empty() {
+                let warnings = request.extra_field_warnings.join("; ");
+                result.summary = format!("{} [{}]", result.summary, warnings);
+            }
+            return Ok(result);
         }
         // Mutex poison → fall through to normal read (best-effort)
 
@@ -1381,13 +1393,28 @@ impl LocalToolExecutor {
             cache.record(&resolved, content.clone());
         }
 
-        Ok(build_completed_result(
+        let mut result = build_completed_result(
             request,
             path.to_string(),
             ToolExecutionPayload::Text(content),
             vec![resolved.display().to_string()],
             started,
-        ))
+        );
+
+        // Issue #299: append extra field warnings to summary (not payload).
+        if !request.extra_field_warnings.is_empty() {
+            // Sink-side defense: cap total warning text to avoid oversized
+            // prompt/log entries from unexpected sources (CB-004).
+            let warnings = request.extra_field_warnings.join("; ");
+            let capped = if warnings.len() > 256 {
+                format!("{}...", &warnings[..256])
+            } else {
+                warnings
+            };
+            result.summary = format!("{} [{}]", result.summary, capped);
+        }
+
+        Ok(result)
     }
 
     fn execute_image_read(
