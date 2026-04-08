@@ -1147,3 +1147,117 @@ fn supersede_respects_one_to_one_matching() {
         "only one item should be superseded per corrected item (1:1 matching)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #287 follow-up: orphan mutation tests
+// ---------------------------------------------------------------------------
+
+/// Reproduce the Issue #287 follow-up scenario:
+/// LLM edits non-target files (e.g. renamed path) — mutations happen every turn
+/// but no plan item advances. The orphan_mutation_condition must fire.
+#[test]
+fn plan_repair_orphan_mutation_fires_when_mutations_happen_but_plan_stalls() {
+    let mut state = StagnationState::new();
+    state.starved_target_files = vec!["src/lib/polling/auto-yes-manager.ts".to_string()];
+
+    // 6 turns: mutation every turn (to a different file), same workset, no plan completion
+    for _ in 0..6 {
+        state.begin_turn(&[0]);
+        state.record_mutation("src/lib/auto-yes-poller.ts");
+        state.end_turn(true); // had_mutation = true
+    }
+
+    // Verify the orphan mutation pattern:
+    assert_eq!(
+        state.turns_since_last_mutation, 0,
+        "mutations are happening"
+    );
+    assert!(
+        state.turns_since_plan_item_completion >= 5,
+        "plan items not advancing: got {}",
+        state.turns_since_plan_item_completion
+    );
+    assert!(
+        state.same_workset_turns >= 3,
+        "same workset stuck: got {}",
+        state.same_workset_turns
+    );
+
+    // Stagnation score should be only 2 (workset staleness + plan no-progress),
+    // NOT 3, because mutations prevent mutation drought and read domination.
+    let score = compute_stagnation_score(&state);
+    assert!(
+        score < 3,
+        "score should be < 3 in orphan mutation case, got {}",
+        score
+    );
+
+    // normal_condition requires starved >= 2: fails (only 1 starved file)
+    // severe_condition requires turns_since_last_mutation >= 5: fails (it's 0)
+    // But orphan_mutation_condition should fire
+    assert!(should_request_plan_repair(&state, 0, 1));
+}
+
+#[test]
+fn plan_repair_orphan_mutation_not_fire_without_starved_files() {
+    let mut state = StagnationState::new();
+    // No starved files
+    for _ in 0..6 {
+        state.begin_turn(&[0]);
+        state.record_mutation("src/lib/auto-yes-poller.ts");
+        state.end_turn(true);
+    }
+    assert_eq!(state.turns_since_last_mutation, 0);
+    assert!(state.turns_since_plan_item_completion >= 5);
+    // orphan_mutation_condition requires !starved.is_empty()
+    assert!(!should_request_plan_repair(&state, 0, 1));
+}
+
+#[test]
+fn plan_repair_orphan_mutation_not_fire_at_max_repair_count() {
+    let mut state = StagnationState::new();
+    state.starved_target_files = vec!["src/a.ts".to_string()];
+    for _ in 0..6 {
+        state.begin_turn(&[0]);
+        state.record_mutation("src/b.ts");
+        state.end_turn(true);
+    }
+    // plan_repair_request_count = 2 (max) → orphan_mutation_condition should not fire
+    assert!(!should_request_plan_repair(&state, 2, 1));
+}
+
+#[test]
+fn escape_hatch_orphan_escape_fires_after_repair_attempt() {
+    let mut state = StagnationState::new();
+    state.starved_target_files = vec!["src/lib/polling/auto-yes-manager.ts".to_string()];
+
+    // 9 turns: mutation every turn, same workset, no plan completion
+    for _ in 0..9 {
+        state.begin_turn(&[0]);
+        state.record_mutation("src/lib/auto-yes-poller.ts");
+        state.end_turn(true);
+    }
+
+    assert_eq!(state.turns_since_last_mutation, 0);
+    assert!(state.turns_since_plan_item_completion >= 8);
+    let score = compute_stagnation_score(&state);
+    assert!(score >= 2, "expected score >= 2, got {}", score);
+
+    // Plan repair was attempted once, remaining <= 10
+    assert!(should_allow_escape_hatch(&state, 1, 10));
+}
+
+#[test]
+fn escape_hatch_orphan_escape_not_fire_without_repair_attempt() {
+    let mut state = StagnationState::new();
+    state.starved_target_files = vec!["src/a.ts".to_string()];
+
+    for _ in 0..9 {
+        state.begin_turn(&[0]);
+        state.record_mutation("src/b.ts");
+        state.end_turn(true);
+    }
+
+    // plan_repair_request_count = 0 → orphan_escape requires >= 1
+    assert!(!should_allow_escape_hatch(&state, 0, 10));
+}
