@@ -484,6 +484,8 @@ pub enum PlanItemStatus {
     Blocked,
     /// Superseded by a corrected ANVIL_PLAN_UPDATE item (Issue #289).
     Superseded,
+    /// Retired via `[x]` marker in ANVIL_PLAN_UPDATE without mutations (Issue #301).
+    AlreadySatisfied,
 }
 
 impl std::fmt::Display for PlanItemStatus {
@@ -494,6 +496,7 @@ impl std::fmt::Display for PlanItemStatus {
             Self::Done => write!(f, "done"),
             Self::Blocked => write!(f, "blocked"),
             Self::Superseded => write!(f, "superseded"),
+            Self::AlreadySatisfied => write!(f, "already_satisfied"),
         }
     }
 }
@@ -530,11 +533,14 @@ impl PlanItem {
         }
     }
 
-    /// Whether this item is considered finished (Done or Blocked).
+    /// Whether this item is considered finished (Done, Blocked, Superseded, or AlreadySatisfied).
     pub fn is_finished(&self) -> bool {
         matches!(
             self.status,
-            PlanItemStatus::Done | PlanItemStatus::Blocked | PlanItemStatus::Superseded
+            PlanItemStatus::Done
+                | PlanItemStatus::Blocked
+                | PlanItemStatus::Superseded
+                | PlanItemStatus::AlreadySatisfied
         )
     }
 }
@@ -658,10 +664,13 @@ impl ExecutionPlan {
     /// and at least one item is Done.
     /// Returns false for empty plans (via `all_finished()` internal guard).
     /// Superseded-only plans return false because no actual work was completed.
+    /// AlreadySatisfied counts as successful completion alongside Done (Issue #301).
     pub fn is_successfully_completed(&self) -> bool {
         self.all_finished()
             && !self.has_blocked_items()
-            && self.items.iter().any(|i| i.status == PlanItemStatus::Done)
+            && self.items.iter().any(|i| {
+                i.status == PlanItemStatus::Done || i.status == PlanItemStatus::AlreadySatisfied
+            })
     }
 
     /// Decide whether ANVIL_FINAL should be accepted.
@@ -849,6 +858,55 @@ impl ExecutionPlan {
         }
     }
 
+    /// Mark unfinished items whose `target_files` match the given list as `new_status` (Issue #301).
+    ///
+    /// Safety guard (DR4-001): only marks an item when:
+    ///   1. The item is not already finished.
+    ///   2. The item has non-empty `target_files`.
+    ///   3. The number of `target_files` in the item matches the number of matched
+    ///      entries in `target_files_to_retire` (1:1 target count match).
+    ///   4. Every target file in the item has a 1:1 match in `target_files_to_retire`.
+    ///
+    /// Returns the list of target file paths that were actually retired.
+    pub fn mark_unfinished_items_by_target(
+        &mut self,
+        target_files_to_retire: &[String],
+        new_status: PlanItemStatus,
+    ) -> Vec<String> {
+        let mut retired: Vec<String> = Vec::new();
+        for item in &mut self.items {
+            if item.is_finished() || item.target_files.is_empty() {
+                continue;
+            }
+            // Check 1:1 target count match: every item target must match exactly one
+            // retire target, and the counts must be equal.
+            let all_matched = item.target_files.iter().all(|tf| {
+                target_files_to_retire
+                    .iter()
+                    .any(|rt| Self::path_matches(tf, rt))
+            });
+            // Count how many retire targets match this item's targets
+            let matched_retire_count = target_files_to_retire
+                .iter()
+                .filter(|rt| {
+                    item.target_files
+                        .iter()
+                        .any(|tf| Self::path_matches(tf, rt))
+                })
+                .count();
+            if all_matched && matched_retire_count == item.target_files.len() {
+                tracing::info!(
+                    description = %item.description,
+                    status = %new_status,
+                    "plan item retired via checked marker (Issue #301)"
+                );
+                item.status = new_status;
+                retired.extend(item.target_files.clone());
+            }
+        }
+        retired
+    }
+
     /// Sync plan item completion from the set of files actually modified.
     ///
     /// When a file.write/file.edit succeeds but the result is not passed to
@@ -900,6 +958,7 @@ impl ExecutionPlan {
                 PlanItemStatus::Done => "[x]",
                 PlanItemStatus::Blocked => "[!]",
                 PlanItemStatus::Superseded => "[~]",
+                PlanItemStatus::AlreadySatisfied => "[=]",
                 PlanItemStatus::InProgress => "[>]",
                 PlanItemStatus::Pending => "[ ]",
             };
@@ -1043,13 +1102,21 @@ impl ExecutionPlan {
                 )
             }
             crate::config::GuidanceMode::Batch => {
-                // Completed items
+                // Completed items (Done or AlreadySatisfied — Issue #301)
                 let completed_lines: Vec<String> = self
                     .items
                     .iter()
                     .enumerate()
-                    .filter(|(_, item)| item.status == PlanItemStatus::Done)
-                    .map(|(i, item)| format!("  {}. {}", i + 1, item.description))
+                    .filter(|(_, item)| {
+                        item.status == PlanItemStatus::Done
+                            || item.status == PlanItemStatus::AlreadySatisfied
+                    })
+                    .map(|(i, item)| {
+                        let safe = crate::app::stagnation_state::sanitize_for_prompt_entry(
+                            &item.description,
+                        );
+                        format!("  {}. {}", i + 1, safe)
+                    })
                     .collect();
 
                 // Workset (pending/in-progress items)
@@ -2299,5 +2366,145 @@ mod tests {
         plan.items[0].status = PlanItemStatus::Superseded;
         plan.items[1].status = PlanItemStatus::Superseded;
         assert!(!plan.is_successfully_completed());
+    }
+
+    // ============================================================
+    // Issue #301: AlreadySatisfied status tests
+    // ============================================================
+
+    #[test]
+    fn already_satisfied_display() {
+        assert_eq!(
+            PlanItemStatus::AlreadySatisfied.to_string(),
+            "already_satisfied"
+        );
+    }
+
+    #[test]
+    fn already_satisfied_is_finished() {
+        let mut item = PlanItem::new("x".into(), vec![]);
+        item.status = PlanItemStatus::AlreadySatisfied;
+        assert!(item.is_finished());
+    }
+
+    #[test]
+    fn already_satisfied_format_checklist_marker() {
+        let mut plan = ExecutionPlan::new(vec![PlanItem::new("retired".into(), vec![])]);
+        plan.items[0].status = PlanItemStatus::AlreadySatisfied;
+        let checklist = plan.format_checklist();
+        assert!(checklist.contains("[=]"));
+    }
+
+    #[test]
+    fn already_satisfied_is_successfully_completed() {
+        let mut plan = ExecutionPlan::new(vec![
+            PlanItem::new("task1".into(), vec![]),
+            PlanItem::new("task2".into(), vec![]),
+        ]);
+        plan.items[0].status = PlanItemStatus::Done;
+        plan.items[1].status = PlanItemStatus::AlreadySatisfied;
+        assert!(plan.is_successfully_completed());
+    }
+
+    #[test]
+    fn already_satisfied_only_is_successfully_completed() {
+        let mut plan = ExecutionPlan::new(vec![PlanItem::new("task1".into(), vec![])]);
+        plan.items[0].status = PlanItemStatus::AlreadySatisfied;
+        assert!(plan.is_successfully_completed());
+    }
+
+    #[test]
+    fn already_satisfied_allows_final_gate() {
+        let mut plan = ExecutionPlan::new(vec![
+            PlanItem::new("task1".into(), vec!["src/a.rs".into()]),
+            PlanItem::new("task2".into(), vec!["src/b.rs".into()]),
+        ]);
+        plan.items[0].status = PlanItemStatus::Done;
+        plan.items[1].status = PlanItemStatus::AlreadySatisfied;
+        assert_eq!(plan.check_final_gate(), FinalGateDecision::Allow);
+    }
+
+    #[test]
+    fn already_satisfied_serde_roundtrip() {
+        let mut item = PlanItem::new("desc".into(), vec!["src/lib.rs".into()]);
+        item.status = PlanItemStatus::AlreadySatisfied;
+        let json = serde_json::to_string(&item).expect("serialize");
+        let back: PlanItem = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.status, PlanItemStatus::AlreadySatisfied);
+    }
+
+    // ============================================================
+    // Issue #301: mark_unfinished_items_by_target tests
+    // ============================================================
+
+    #[test]
+    fn mark_unfinished_items_by_target_retires_matching() {
+        let mut plan = ExecutionPlan::new(vec![
+            PlanItem::new("src/a.rs: update".into(), vec!["src/a.rs".into()]),
+            PlanItem::new("src/b.rs: update".into(), vec!["src/b.rs".into()]),
+        ]);
+        plan.mark_in_progress(0);
+        let retired = plan.mark_unfinished_items_by_target(
+            &["src/a.rs".to_string()],
+            PlanItemStatus::AlreadySatisfied,
+        );
+        assert_eq!(retired, vec!["src/a.rs".to_string()]);
+        assert_eq!(plan.items[0].status, PlanItemStatus::AlreadySatisfied);
+        assert_eq!(plan.items[1].status, PlanItemStatus::Pending);
+    }
+
+    #[test]
+    fn mark_unfinished_items_by_target_skips_finished() {
+        let mut plan = ExecutionPlan::new(vec![PlanItem::new(
+            "src/a.rs: update".into(),
+            vec!["src/a.rs".into()],
+        )]);
+        plan.mark_done(0);
+        let retired = plan.mark_unfinished_items_by_target(
+            &["src/a.rs".to_string()],
+            PlanItemStatus::AlreadySatisfied,
+        );
+        assert!(retired.is_empty());
+        assert_eq!(plan.items[0].status, PlanItemStatus::Done);
+    }
+
+    #[test]
+    fn mark_unfinished_items_by_target_skips_no_target_files() {
+        let mut plan = ExecutionPlan::new(vec![PlanItem::new("run tests".into(), vec![])]);
+        let retired = plan.mark_unfinished_items_by_target(
+            &["src/a.rs".to_string()],
+            PlanItemStatus::AlreadySatisfied,
+        );
+        assert!(retired.is_empty());
+    }
+
+    #[test]
+    fn mark_unfinished_items_by_target_multi_target_match() {
+        let mut plan = ExecutionPlan::new(vec![PlanItem::new(
+            "src/a.rs, src/b.rs: update".into(),
+            vec!["src/a.rs".into(), "src/b.rs".into()],
+        )]);
+        let retired = plan.mark_unfinished_items_by_target(
+            &["src/a.rs".to_string(), "src/b.rs".to_string()],
+            PlanItemStatus::AlreadySatisfied,
+        );
+        assert_eq!(retired.len(), 2);
+        assert_eq!(plan.items[0].status, PlanItemStatus::AlreadySatisfied);
+    }
+
+    #[test]
+    fn mark_unfinished_items_by_target_partial_match_rejected() {
+        // DR4-001: partial match should NOT retire (target count mismatch)
+        let mut plan = ExecutionPlan::new(vec![PlanItem::new(
+            "src/a.rs, src/b.rs: update".into(),
+            vec!["src/a.rs".into(), "src/b.rs".into()],
+        )]);
+        // Only one of two targets provided
+        let retired = plan.mark_unfinished_items_by_target(
+            &["src/a.rs".to_string()],
+            PlanItemStatus::AlreadySatisfied,
+        );
+        assert!(retired.is_empty());
+        assert_eq!(plan.items[0].status, PlanItemStatus::Pending);
     }
 }

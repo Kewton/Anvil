@@ -109,6 +109,18 @@ impl StagnationState {
         }
     }
 
+    /// Remove retired files from `starved_target_files` (Issue #301).
+    ///
+    /// SRP: this method only removes from the starved list.
+    /// The caller is responsible for invoking `record_plan_item_completion()` separately.
+    pub fn retire_target_files(&mut self, retired_files: &[String]) {
+        self.starved_target_files.retain(|f| {
+            !retired_files
+                .iter()
+                .any(|rf| ExecutionPlan::path_matches(f, rf))
+        });
+    }
+
     /// Record a plan item completion.
     pub fn record_plan_item_completion(&mut self) {
         self.had_plan_item_completion_this_turn = true;
