@@ -142,13 +142,9 @@ impl CompletionKind {
         budget_exhausted: bool,
     ) -> Self {
         let all_finished = plan.all_finished() && !plan.is_empty();
-        let has_blocked = plan
-            .items
-            .iter()
-            .any(|i| i.status == PlanItemStatus::Blocked);
 
         // Priority 1: blocked items exist → always Blocked
-        if has_blocked {
+        if plan.has_blocked_items() {
             return CompletionKind::Blocked;
         }
 
@@ -649,6 +645,23 @@ impl ExecutionPlan {
                 item.status = PlanItemStatus::Blocked;
             }
         }
+    }
+
+    /// Whether any item has Blocked status.
+    pub fn has_blocked_items(&self) -> bool {
+        self.items
+            .iter()
+            .any(|i| i.status == PlanItemStatus::Blocked)
+    }
+
+    /// Whether the plan completed successfully: all items finished, none Blocked,
+    /// and at least one item is Done.
+    /// Returns false for empty plans (via `all_finished()` internal guard).
+    /// Superseded-only plans return false because no actual work was completed.
+    pub fn is_successfully_completed(&self) -> bool {
+        self.all_finished()
+            && !self.has_blocked_items()
+            && self.items.iter().any(|i| i.status == PlanItemStatus::Done)
     }
 
     /// Decide whether ANVIL_FINAL should be accepted.
@@ -2210,5 +2223,81 @@ mod tests {
         assert_eq!(plan.items[0].status, PlanItemStatus::InProgress);
         // Item 1 matched → Done
         assert_eq!(plan.items[1].status, PlanItemStatus::Done);
+    }
+
+    // --- Issue #296: ExecutionPlan helper method tests ---
+
+    #[test]
+    fn execution_plan_has_blocked_items_true() {
+        let mut plan = ExecutionPlan::new(vec![
+            PlanItem::new("task1".into(), vec![]),
+            PlanItem::new("task2".into(), vec![]),
+        ]);
+        plan.items[0].status = PlanItemStatus::Done;
+        plan.items[1].status = PlanItemStatus::Blocked;
+        assert!(plan.has_blocked_items());
+    }
+
+    #[test]
+    fn execution_plan_has_blocked_items_false() {
+        let mut plan = ExecutionPlan::new(vec![
+            PlanItem::new("task1".into(), vec![]),
+            PlanItem::new("task2".into(), vec![]),
+        ]);
+        plan.items[0].status = PlanItemStatus::Done;
+        plan.items[1].status = PlanItemStatus::Done;
+        assert!(!plan.has_blocked_items());
+    }
+
+    #[test]
+    fn execution_plan_is_successfully_completed_all_done() {
+        let mut plan = ExecutionPlan::new(vec![
+            PlanItem::new("task1".into(), vec![]),
+            PlanItem::new("task2".into(), vec![]),
+        ]);
+        plan.items[0].status = PlanItemStatus::Done;
+        plan.items[1].status = PlanItemStatus::Done;
+        assert!(plan.is_successfully_completed());
+    }
+
+    #[test]
+    fn execution_plan_is_successfully_completed_with_blocked() {
+        let mut plan = ExecutionPlan::new(vec![
+            PlanItem::new("task1".into(), vec![]),
+            PlanItem::new("task2".into(), vec![]),
+        ]);
+        plan.items[0].status = PlanItemStatus::Done;
+        plan.items[1].status = PlanItemStatus::Blocked;
+        assert!(!plan.is_successfully_completed());
+    }
+
+    #[test]
+    fn execution_plan_is_successfully_completed_empty() {
+        let plan = ExecutionPlan::default();
+        assert!(!plan.is_successfully_completed());
+    }
+
+    #[test]
+    fn execution_plan_is_successfully_completed_with_superseded() {
+        let mut plan = ExecutionPlan::new(vec![
+            PlanItem::new("task1".into(), vec![]),
+            PlanItem::new("task2".into(), vec![]),
+            PlanItem::new("task3".into(), vec![]),
+        ]);
+        plan.items[0].status = PlanItemStatus::Done;
+        plan.items[1].status = PlanItemStatus::Superseded;
+        plan.items[2].status = PlanItemStatus::Done;
+        assert!(plan.is_successfully_completed());
+    }
+
+    #[test]
+    fn execution_plan_is_successfully_completed_superseded_only() {
+        let mut plan = ExecutionPlan::new(vec![
+            PlanItem::new("task1".into(), vec![]),
+            PlanItem::new("task2".into(), vec![]),
+        ]);
+        plan.items[0].status = PlanItemStatus::Superseded;
+        plan.items[1].status = PlanItemStatus::Superseded;
+        assert!(!plan.is_successfully_completed());
     }
 }
