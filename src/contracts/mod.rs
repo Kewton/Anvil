@@ -231,6 +231,10 @@ pub struct AgentTelemetry {
     #[serde(default)]
     pub final_suppressed_with_remaining_targets_count: u32,
 
+    /// Number of times pre-mutation barrier blocked mutation tools (Issue #303).
+    #[serde(default)]
+    pub mutation_barrier_block_count: u32,
+
     /// First mutation event turn (Issue #273 Phase 1.5).
     /// None if no mutation occurred during the session.
     #[serde(default)]
@@ -314,6 +318,11 @@ impl AgentTelemetry {
     /// Record an ANVIL_PLAN block observed (visible to external telemetry).
     pub fn record_anvil_plan_visible(&mut self) {
         self.anvil_plan_visible_count += 1;
+    }
+
+    /// Record a pre-mutation barrier block (Issue #303).
+    pub fn record_mutation_barrier_block(&mut self) {
+        self.mutation_barrier_block_count += 1;
     }
 
     /// Record a mutation turn: updates `last_mutation_turn` and, on the first call only,

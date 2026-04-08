@@ -215,6 +215,7 @@ pub fn map_tool_status(action: &str) -> ToolExecutionStatus {
     match action {
         "failed" => ToolExecutionStatus::Failed,
         "interrupted" => ToolExecutionStatus::Interrupted,
+        "blocked" => ToolExecutionStatus::Blocked,
         _ => ToolExecutionStatus::Completed,
     }
 }

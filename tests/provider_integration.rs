@@ -195,6 +195,9 @@ fn live_turn_executes_structured_file_write_response_without_approval() {
         events: vec![ProviderEvent::Agent(AgentEvent::Done {
             status: "Done. session saved".to_string(),
             assistant_message: concat!(
+                "```ANVIL_PLAN\n",
+                "- [ ] sandbox/test1_001/index.html: create game shell\n",
+                "```\n",
                 "```ANVIL_TOOL\n",
                 "{\"id\":\"call_write_001\",\"tool\":\"file.write\",\"path\":\"./sandbox/test1_001/index.html\",\"content\":\"<html><body>invaders</body></html>\"}\n",
                 "```\n",
@@ -268,6 +271,9 @@ fn live_turn_executes_complete_structured_response_from_token_stream() {
         seen_requests: Rc::new(RefCell::new(Vec::new())),
         events: vec![ProviderEvent::TokenDelta(
             concat!(
+                "```ANVIL_PLAN\n",
+                "- [ ] sandbox/test1_001/index.html: create game shell\n",
+                "```\n",
                 "```ANVIL_TOOL\n",
                 "{\"id\":\"call_write_001\",\"tool\":\"file.write\",\"path\":\"./sandbox/test1_001/index.html\",\"content\":\"<html><body>streamed invaders</body></html>\"}\n",
                 "```\n",
@@ -342,6 +348,9 @@ fn live_turn_executes_malformed_structured_file_write_response() {
         events: vec![ProviderEvent::Agent(AgentEvent::Done {
             status: "Done. session saved".to_string(),
             assistant_message: concat!(
+                "```ANVIL_PLAN\n",
+                "- [ ] sandbox/test1_002/Invader.html: create game\n",
+                "```\n",
                 "```ANVIL_TOOL\n",
                 "{\"id\":\"call_write_001\",\"tool\":\"file.write\",\"path\":\"./sandbox/test1_002/Invader.html\",\"content\":\"<html>\n",
                 "<body>\n",
@@ -681,7 +690,7 @@ fn live_turn_executes_structured_response_from_openai_compatible_provider() {
         seen_headers: Rc::new(RefCell::new(Vec::new())),
         response: HttpResponse {
             status_code: 200,
-            body: br#"{"choices":[{"message":{"role":"assistant","content":"```ANVIL_TOOL\n{\"id\":\"call_write_001\",\"tool\":\"file.write\",\"path\":\"./sandbox/openai/index.html\",\"content\":\"<html><body>openai parity</body></html>\"}\n```\n```ANVIL_FINAL\nOpenAI-compatible backend created the file and reviewed the output.\n```"}}]}"#.to_vec(),
+            body: br#"{"choices":[{"message":{"role":"assistant","content":"```ANVIL_PLAN\n- [ ] sandbox/openai/index.html: create file\n```\n```ANVIL_TOOL\n{\"id\":\"call_write_001\",\"tool\":\"file.write\",\"path\":\"./sandbox/openai/index.html\",\"content\":\"<html><body>openai parity</body></html>\"}\n```\n```ANVIL_FINAL\nOpenAI-compatible backend created the file and reviewed the output.\n```"}}]}"#.to_vec(),
         },
         get_response: None,
     };
@@ -729,7 +738,7 @@ fn live_turn_executes_native_tool_calls_response_from_openai_compatible_provider
         seen_headers: Rc::new(RefCell::new(Vec::new())),
         response: HttpResponse {
             status_code: 200,
-            body: br#"{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_native_write_001","type":"function","function":{"name":"file_write","arguments":"{\"path\":\"./sandbox/native/nonstream.html\",\"content\":\"<html><body>native non-stream</body></html>\"}"}}]}}],"stats":{},"system_fingerprint":"qwen3.5"}"#.to_vec(),
+            body: br#"{"choices":[{"message":{"role":"assistant","content":"```ANVIL_PLAN\n- [ ] sandbox/native/nonstream.html: create file\n```","tool_calls":[{"id":"call_native_write_001","type":"function","function":{"name":"file_write","arguments":"{\"path\":\"./sandbox/native/nonstream.html\",\"content\":\"<html><body>native non-stream</body></html>\"}"}}]}}],"stats":{},"system_fingerprint":"qwen3.5"}"#.to_vec(),
         },
         get_response: None,
     };
@@ -778,6 +787,7 @@ fn live_turn_executes_streaming_native_tool_calls_response_from_openai_compatibl
         response: HttpResponse {
             status_code: 200,
             body: concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"```ANVIL_PLAN\\n- [ ] sandbox/native/stream.html: create file\\n```\\n\"},\"finish_reason\":null}]}\n",
                 "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_stream_write_001\",\"type\":\"function\",\"function\":{\"name\":\"file_write\",\"arguments\":\"{\\\"path\\\":\\\"./sandbox/native/stream.html\\\",\"}}]},\"finish_reason\":null}]}\n",
                 "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"content\\\":\\\"<html><body>native stream</body></html>\\\"}\"}}]},\"finish_reason\":null}]}\n",
                 "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n",
@@ -3663,6 +3673,9 @@ fn anvil_final_guard_does_not_fire_when_file_write_was_executed() {
         events: vec![ProviderEvent::Agent(AgentEvent::Done {
             status: "Done. session saved".to_string(),
             assistant_message: concat!(
+                "```ANVIL_PLAN\n",
+                "- [ ] output.txt: create file\n",
+                "```\n",
                 "```ANVIL_TOOL\n",
                 "{\"id\":\"call_001\",\"tool\":\"file.write\",\"path\":\"./output.txt\",\"content\":\"hello world\"}\n",
                 "```\n",

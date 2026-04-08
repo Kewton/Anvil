@@ -838,6 +838,8 @@ const PROMPT_TOOL_RULES: &str = concat!(
     "```\n",
     "\n",
     "Rules:\n",
+    "- Implementation plans MUST use the ANVIL_PLAN block format, NOT the agent.plan tool. \
+       agent.plan is for read-only exploration/investigation only.\n",
     "- All paths must be relative (start with ./ or a directory name).\n",
     "- Do not use any other tool syntax.\n",
     "- Always include ANVIL_FINAL after your tool blocks.\n",
