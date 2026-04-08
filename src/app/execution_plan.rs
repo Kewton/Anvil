@@ -5,10 +5,49 @@
 //! status based on tool execution results, and injecting turn guidance.
 
 use crate::agent::{extract_plan_block, extract_plan_update_block, parse_plan_items};
-use crate::contracts::{ExecutionPlan, FinalGateDecision};
+use crate::contracts::{ExecutionPlan, FinalGateDecision, PlanItem};
 use crate::session::{MessageRole, SessionMessage};
 
 use super::App;
+
+// ---------------------------------------------------------------------------
+// Checked-line detection helpers (Issue #301)
+// ---------------------------------------------------------------------------
+
+/// Detect `[x]`/`[X]` lines in a plan block, returning their 0-based indices.
+///
+/// The index corresponds to the position among all parseable plan item lines
+/// (i.e. lines starting with `- [`, `- ` checkbox format).
+pub(crate) fn detect_checked_lines(block: &str) -> Vec<usize> {
+    let mut indices = Vec::new();
+    let mut item_idx = 0usize;
+    for line in block.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("- [x] ") || trimmed.starts_with("- [X] ") {
+            indices.push(item_idx);
+            item_idx += 1;
+        } else if trimmed.starts_with("- [ ] ") || trimmed.starts_with("- ") && trimmed.len() > 2 {
+            item_idx += 1;
+        }
+        // Non-item lines are ignored
+    }
+    indices
+}
+
+/// Filter out checked items from a `Vec<PlanItem>`, returning only unchecked ones.
+///
+/// `checked_indices` are 0-based indices into `items`.
+pub(crate) fn filter_unchecked_items(
+    items: Vec<PlanItem>,
+    checked_indices: &[usize],
+) -> Vec<PlanItem> {
+    items
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| !checked_indices.contains(i))
+        .map(|(_, item)| item)
+        .collect()
+}
 
 /// Message injected when ANVIL_FINAL is suppressed because no plan exists yet.
 const PLAN_REQUIRED_MESSAGE: &str = "[System] まず変更計画を作成してください。```ANVIL_PLAN ブロックで変更対象ファイルと作業内容を出力してください。\n\
@@ -51,41 +90,90 @@ impl App {
 
     /// Try to detect and apply an `ANVIL_PLAN_UPDATE` block.
     ///
+    /// Issue #301: checked-first processing. Before the standard flow:
+    ///   1. Detect `[x]` lines in the block.
+    ///   2. Mark matching existing plan items as `AlreadySatisfied`.
+    ///   3. Retire target files from stagnation state.
+    ///   4. Proceed with standard flow for unchecked items only.
+    ///
     /// Returns `true` if the plan was updated.
     pub(crate) fn try_update_plan(&mut self, content: &str) -> bool {
         if let Some(block) = extract_plan_update_block(content) {
-            let new_items = parse_plan_items(&block);
-            if !new_items.is_empty() {
-                // Issue #289: supersede stale items BEFORE dedup.
-                // This ensures corrected items are not discarded as duplicates
-                // of the stale items they are replacing. After supersede, the
-                // stale items are finished (Superseded) and won't block dedup.
-                self.execution_plan.supersede_stale_items(&new_items);
-                // Issue #287: deduplicate against existing items before appending
-                let deduped = self.execution_plan.deduplicate_new_items(new_items);
-                if deduped.is_empty() {
-                    tracing::info!("ANVIL_PLAN_UPDATE detected; all items deduplicated");
-                    // Still return true if items were superseded
-                    let had_supersede = self
-                        .execution_plan
-                        .items
-                        .iter()
-                        .any(|i| i.status == crate::contracts::PlanItemStatus::Superseded);
-                    if had_supersede {
-                        self.agent_telemetry.record_plan_update();
-                    }
-                    return had_supersede;
-                }
-                tracing::info!(
-                    new_items = deduped.len(),
-                    "ANVIL_PLAN_UPDATE detected; appending items"
-                );
-                self.execution_plan.append_items(deduped);
-                self.agent_telemetry.record_plan_update();
-                return true;
+            let all_items = parse_plan_items(&block);
+            if all_items.is_empty() {
+                return false;
             }
+
+            // --- Issue #301: checked-first retire ---
+            // CB-001 fix: process each checked item individually to prevent
+            // cross-item target combination from causing false retires.
+            let checked_indices = detect_checked_lines(&block);
+            let mut had_retire = false;
+            if !checked_indices.is_empty() {
+                let mut all_retired: Vec<String> = Vec::new();
+                for &idx in &checked_indices {
+                    if let Some(checked_item) = all_items.get(idx) {
+                        if checked_item.target_files.is_empty() {
+                            continue;
+                        }
+                        let retired = self.apply_checked_items(&checked_item.target_files);
+                        all_retired.extend(retired);
+                    }
+                }
+                if !all_retired.is_empty() {
+                    had_retire = true;
+                    // Sync stagnation: retire target files and record completion
+                    self.stagnation_state.retire_target_files(&all_retired);
+                    self.stagnation_state.record_plan_item_completion();
+                }
+            }
+
+            // If all items were checked, we're done (no unchecked items to process)
+            let new_items = filter_unchecked_items(all_items, &checked_indices);
+            if new_items.is_empty() {
+                if had_retire {
+                    tracing::info!("ANVIL_PLAN_UPDATE detected; all items checked → retired");
+                    self.agent_telemetry.record_plan_update();
+                }
+                return had_retire;
+            }
+
+            // --- Standard flow for unchecked items ---
+            // Issue #289: supersede stale items BEFORE dedup.
+            self.execution_plan.supersede_stale_items(&new_items);
+            // Issue #287: deduplicate against existing items before appending
+            let deduped = self.execution_plan.deduplicate_new_items(new_items);
+            if deduped.is_empty() {
+                tracing::info!("ANVIL_PLAN_UPDATE detected; all items deduplicated");
+                let had_supersede = self
+                    .execution_plan
+                    .items
+                    .iter()
+                    .any(|i| i.status == crate::contracts::PlanItemStatus::Superseded);
+                if had_supersede || had_retire {
+                    self.agent_telemetry.record_plan_update();
+                }
+                return had_supersede || had_retire;
+            }
+            tracing::info!(
+                new_items = deduped.len(),
+                "ANVIL_PLAN_UPDATE detected; appending items"
+            );
+            self.execution_plan.append_items(deduped);
+            self.agent_telemetry.record_plan_update();
+            return true;
         }
         false
+    }
+
+    /// Mark existing plan items as `AlreadySatisfied` based on checked target files (Issue #301).
+    ///
+    /// Returns the list of target file paths that were actually retired.
+    fn apply_checked_items(&mut self, checked_targets: &[String]) -> Vec<String> {
+        self.execution_plan.mark_unfinished_items_by_target(
+            checked_targets,
+            crate::contracts::PlanItemStatus::AlreadySatisfied,
+        )
     }
 
     /// Update plan item status based on tool execution results.
@@ -340,5 +428,78 @@ impl App {
     /// Reset the execution plan (e.g. at the start of a new user turn).
     pub(crate) fn reset_execution_plan(&mut self) {
         self.execution_plan = ExecutionPlan::default();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests (Issue #301)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- detect_checked_lines tests ---
+
+    #[test]
+    fn detect_checked_lines_mixed() {
+        let block = "- [x] src/done.rs: already done\n- [ ] src/todo.rs: still todo\n- [X] src/also_done.rs: also done";
+        let indices = detect_checked_lines(block);
+        assert_eq!(indices, vec![0, 2]);
+    }
+
+    #[test]
+    fn detect_checked_lines_none() {
+        let block = "- [ ] src/a.rs: task\n- [ ] src/b.rs: task";
+        let indices = detect_checked_lines(block);
+        assert!(indices.is_empty());
+    }
+
+    #[test]
+    fn detect_checked_lines_all_checked() {
+        let block = "- [x] src/a.rs: done\n- [x] src/b.rs: done";
+        let indices = detect_checked_lines(block);
+        assert_eq!(indices, vec![0, 1]);
+    }
+
+    #[test]
+    fn detect_checked_lines_ignores_non_item_lines() {
+        let block = "Plan update:\n\n- [x] src/a.rs: done\nSome text\n- [ ] src/b.rs: todo";
+        let indices = detect_checked_lines(block);
+        assert_eq!(indices, vec![0]);
+    }
+
+    // --- filter_unchecked_items tests ---
+
+    #[test]
+    fn filter_unchecked_items_removes_checked() {
+        let items = vec![
+            PlanItem::new("done".into(), vec!["src/a.rs".into()]),
+            PlanItem::new("todo".into(), vec!["src/b.rs".into()]),
+            PlanItem::new("also done".into(), vec!["src/c.rs".into()]),
+        ];
+        let result = filter_unchecked_items(items, &[0, 2]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].description, "todo");
+    }
+
+    #[test]
+    fn filter_unchecked_items_empty_checked() {
+        let items = vec![
+            PlanItem::new("a".into(), vec![]),
+            PlanItem::new("b".into(), vec![]),
+        ];
+        let result = filter_unchecked_items(items, &[]);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn filter_unchecked_items_all_checked() {
+        let items = vec![
+            PlanItem::new("a".into(), vec![]),
+            PlanItem::new("b".into(), vec![]),
+        ];
+        let result = filter_unchecked_items(items, &[0, 1]);
+        assert!(result.is_empty());
     }
 }

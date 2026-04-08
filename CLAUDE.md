@@ -111,7 +111,7 @@ src/
 │   ├── context.rs       # コンテキスト注入（@file展開・サンドボックス検証）
 │   ├── edit_fail_tracker.rs # 連続file.edit失敗の検出・回復ヒント注入
 │   ├── tool_recovery_budget.rs # ToolRecoveryBudget（file.edit失敗後のrecovery read budget管理・detector抑制）
-│   ├── execution_plan.rs    # プラン→実行モード（ANVIL_PLAN検出・チェックリスト管理・ANVIL_FINAL抑制）
+│   ├── execution_plan.rs    # プラン→実行モード（ANVIL_PLAN検出・チェックリスト管理・ANVIL_FINAL抑制・checked-first retire）
 │   ├── alternating_loop_detector.rs # AlternatingLoopDetector（交互/循環パターン検出）
 │   ├── loop_detector.rs # ループ検出（リングバッファ・段階的対応）
 │   ├── phase_estimator.rs # フェーズ推定（ツール呼び出しパターンベース・フォールバック完了検出）
@@ -171,6 +171,7 @@ tests/
 ├── context_inject.rs    # コンテキスト注入テスト
 ├── stagnation_control.rs # 停滞制御テスト（Issue #263）
 ├── edit_recovery_loop.rs # file.edit recovery loop fix テスト（Issue #299）
+├── plan_item_retire.rs  # stale plan item retire テスト（Issue #301）
 └── walk_system.rs       # ディレクトリウォーカーテスト
 ```
 
