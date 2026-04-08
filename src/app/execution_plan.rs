@@ -88,6 +88,22 @@ impl App {
         false
     }
 
+    /// Internal helper: register a plan from pre-parsed items (Issue #303).
+    ///
+    /// Used by `try_update_plan()` when an `ANVIL_PLAN_UPDATE` arrives but no
+    /// plan has been registered yet.  Shares the same registration logic as
+    /// `try_register_plan()` but skips block extraction and parsing.
+    fn register_plan_from_items(&mut self, items: Vec<PlanItem>) {
+        tracing::info!(
+            items = items.len(),
+            "ANVIL_PLAN_UPDATE on empty plan; registering as new plan (Issue #303)"
+        );
+        self.execution_plan = ExecutionPlan::new(items);
+        self.execution_plan.mark_in_progress(0);
+        self.agent_telemetry.record_plan_registration();
+        self.agent_telemetry.record_anvil_plan_visible();
+    }
+
     /// Try to detect and apply an `ANVIL_PLAN_UPDATE` block.
     ///
     /// Issue #301: checked-first processing. Before the standard flow:
@@ -102,6 +118,12 @@ impl App {
             let all_items = parse_plan_items(&block);
             if all_items.is_empty() {
                 return false;
+            }
+
+            // Issue #303: if plan is empty, treat ANVIL_PLAN_UPDATE as new plan registration.
+            if self.execution_plan.is_empty() {
+                self.register_plan_from_items(all_items);
+                return true;
             }
 
             // --- Issue #301: checked-first retire ---

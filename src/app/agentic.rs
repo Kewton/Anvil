@@ -505,6 +505,8 @@ impl App {
         // Issue #285 A2: limit NoPlan suppression at the post-tool ANVIL_FINAL gate.
         // After one suppression, if the model still can't produce a plan, let it through.
         let mut noplan_suppression_count: u8 = 0;
+        // Issue #303: pre-mutation plan barrier.
+        let mut mutation_barrier = super::mutation_barrier::MutationBarrier::new();
 
         for iteration in 0..max_iterations {
             let iteration_started = std::time::Instant::now();
@@ -564,7 +566,7 @@ impl App {
 
             // Execute normal tool calls and record results WITH payload
             let (results, loop_action, recovery_read_count) =
-                self.execute_structured_tool_calls(&current_normal)?;
+                self.execute_structured_tool_calls(&current_normal, &mut mutation_barrier)?;
             total_tool_count += results.len();
 
             // Update plan item status from tool results; capture telemetry.
@@ -1285,6 +1287,7 @@ impl App {
     pub(crate) fn execute_structured_tool_calls(
         &mut self,
         structured: &StructuredAssistantResponse,
+        mutation_barrier: &mut super::mutation_barrier::MutationBarrier,
     ) -> Result<
         (
             Vec<ToolExecutionResult>,
@@ -1369,6 +1372,16 @@ impl App {
         } else {
             validated_requests
         };
+
+        // Phase 1.75: Pre-mutation plan barrier (Issue #303).
+        // Block mutation tools when no execution plan is registered.
+        let barrier_result =
+            mutation_barrier.check_and_filter(validated_requests, self.execution_plan.is_empty());
+        let validated_requests = barrier_result.passed_requests;
+        failed_results.extend(barrier_result.blocked_results);
+        if barrier_result.blocked_count > 0 {
+            self.agent_telemetry.record_mutation_barrier_block();
+        }
 
         // Loop detection: record each validated tool call and check for repetition (Issue #145, #172)
         // Issue #299: recovery reads skip LoopDetector but not AlternatingLoopDetector.
@@ -1685,7 +1698,9 @@ impl App {
             {
                 let status_str = match result.status {
                     ToolExecutionStatus::Completed => "completed",
-                    ToolExecutionStatus::Failed | ToolExecutionStatus::Interrupted => "failed",
+                    ToolExecutionStatus::Failed
+                    | ToolExecutionStatus::Interrupted
+                    | ToolExecutionStatus::Blocked => "failed",
                 };
                 let event = crate::hooks::PostToolUseEvent {
                     hook_point: "PostToolUse",
@@ -1819,8 +1834,12 @@ impl App {
         }
 
         // Edit fail tracker: track consecutive file.edit/file.edit_anchor failures (Issue #143, #158)
+        // Issue #303: exclude barrier-blocked results from edit_fail_tracker.
         let mut edit_hint: Option<String> = None;
-        if result.tool_name == "file.edit" || result.tool_name == "file.edit_anchor" {
+        let is_barrier_blocked = result.summary.starts_with("[plan_barrier]");
+        if !is_barrier_blocked
+            && (result.tool_name == "file.edit" || result.tool_name == "file.edit_anchor")
+        {
             if result.status == ToolExecutionStatus::Failed {
                 if let Some(raw_path) = extract_edit_path_from_summary(&result.summary) {
                     let path = resolve_edit_tracker_path(&raw_path);
@@ -2463,7 +2482,9 @@ pub fn format_tool_result_message(result: &ToolExecutionResult, max_chars: usize
         ToolExecutionPayload::Text(content) => {
             let head_pct = match &result.status {
                 ToolExecutionStatus::Completed => 80,
-                ToolExecutionStatus::Failed | ToolExecutionStatus::Interrupted => 20,
+                ToolExecutionStatus::Failed
+                | ToolExecutionStatus::Interrupted
+                | ToolExecutionStatus::Blocked => 20,
             };
             let truncated = truncate_with_head_tail(content, max_chars, head_pct);
             if result.tool_name == "file.read"

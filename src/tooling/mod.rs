@@ -619,6 +619,8 @@ pub enum ToolExecutionStatus {
     Completed,
     Failed,
     Interrupted,
+    /// Policy-level block (e.g. mutation barrier when no plan is registered).
+    Blocked,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -673,6 +675,7 @@ impl ToolExecutionResult {
             ToolExecutionStatus::Completed => "completed",
             ToolExecutionStatus::Failed => "failed",
             ToolExecutionStatus::Interrupted => "interrupted",
+            ToolExecutionStatus::Blocked => "blocked",
         };
 
         ToolLogView {

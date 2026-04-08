@@ -11,6 +11,7 @@ pub(crate) mod edit_fail_tracker;
 pub(crate) mod execution_plan;
 pub mod loop_detector;
 pub mod mock;
+pub mod mutation_barrier;
 pub mod phase_estimator;
 pub mod plan;
 pub mod policy;

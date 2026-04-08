@@ -75,7 +75,7 @@ pub const TOOL_TAG_SPECS: &[ToolTagSpec] = &[
         name: "agent.plan",
         attributes: &["scope"],
         child_elements: &["prompt"],
-        example: r#"<tool name="agent.plan" scope="..."><prompt>...</prompt></tool>"#,
+        example: r#"<tool name="agent.plan" scope="..."><prompt>...</prompt></tool> (for exploration only, use ANVIL_PLAN for implementation plans)"#,
     },
 ];
 
