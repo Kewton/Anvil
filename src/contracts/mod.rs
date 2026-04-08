@@ -184,7 +184,10 @@ pub struct AgentTelemetry {
     pub total_final_requests: u32,
     /// Number of times a plan was registered via ANVIL_PLAN.
     pub plan_registration_count: u32,
-    /// Number of times ANVIL_PLAN_UPDATE appended items.
+    /// Number of times the plan was updated.
+    ///
+    /// Includes both explicit `ANVIL_PLAN_UPDATE` and follow-up `ANVIL_PLAN`
+    /// on an active plan (replan, Issue #305).
     pub plan_update_count: u32,
     /// Number of times sync_from_touched_files actually advanced items.
     pub sync_from_touched_files_count: u32,
@@ -219,7 +222,10 @@ pub struct AgentTelemetry {
     #[serde(default)]
     pub plan_repair_request_count: u32,
 
-    /// Number of ANVIL_PLAN blocks observed (visible to external telemetry).
+    /// Number of times the LLM emitted a visible ANVIL_PLAN block.
+    ///
+    /// Incremented for both initial registration and follow-up replan (Issue #305).
+    /// Note: this count may exceed plan_registration_count when replan occurs.
     #[serde(default)]
     pub anvil_plan_visible_count: u32,
 

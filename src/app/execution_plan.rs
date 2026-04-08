@@ -10,6 +10,17 @@ use crate::session::{MessageRole, SessionMessage};
 
 use super::App;
 
+/// Result of try_register_plan() indicating what happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlanRegistrationResult {
+    /// A new plan was registered (plan was empty).
+    Registered,
+    /// ANVIL_PLAN detected but plan already active → items extracted for replan.
+    Replan,
+    /// No ANVIL_PLAN block found in content.
+    NoBlock,
+}
+
 // ---------------------------------------------------------------------------
 // Checked-line detection helpers (Issue #301)
 // ---------------------------------------------------------------------------
@@ -64,15 +75,18 @@ const PLAN_REQUIRED_MESSAGE: &str = "[System] まず変更計画を作成して�
 impl App {
     /// Try to detect and register an `ANVIL_PLAN` block from the LLM response.
     ///
-    /// Returns `true` if a new plan was registered.
-    pub(crate) fn try_register_plan(&mut self, content: &str) -> bool {
-        // Guard: ignore re-registration when a plan is already active.
-        if !self.execution_plan.is_empty() {
-            return false;
-        }
+    /// Returns [`PlanRegistrationResult`] indicating what happened:
+    /// - `Registered`: a new plan was created (plan was empty).
+    /// - `Replan`: follow-up `ANVIL_PLAN` on an active plan was treated as update (Issue #305).
+    /// - `NoBlock`: no `ANVIL_PLAN` block found, or replan had no effect.
+    pub(crate) fn try_register_plan(&mut self, content: &str) -> PlanRegistrationResult {
         if let Some(block) = extract_plan_block(content) {
             let items = parse_plan_items(&block);
-            if !items.is_empty() {
+            if items.is_empty() {
+                return PlanRegistrationResult::NoBlock;
+            }
+            if self.execution_plan.is_empty() {
+                // New registration (original behavior)
                 tracing::info!(
                     items = items.len(),
                     "ANVIL_PLAN detected; registering execution plan"
@@ -82,10 +96,95 @@ impl App {
                 self.execution_plan.mark_in_progress(0);
                 self.agent_telemetry.record_plan_registration();
                 self.agent_telemetry.record_anvil_plan_visible();
-                return true;
+                return PlanRegistrationResult::Registered;
+            }
+            // Active plan: follow-up ANVIL_PLAN → replan (Issue #305)
+            tracing::info!(
+                items = items.len(),
+                "follow-up ANVIL_PLAN on active plan; treating as replan (Issue #305)"
+            );
+            self.agent_telemetry.record_anvil_plan_visible();
+            let changed = self.apply_replan_items(&block, items);
+            if changed {
+                return PlanRegistrationResult::Replan;
+            }
+            // Replan had no effect (all items deduped/already done) → treat as no-op
+            return PlanRegistrationResult::NoBlock;
+        }
+        PlanRegistrationResult::NoBlock
+    }
+
+    /// Shared pipeline for plan update operations (Issue #305 DRY fix).
+    ///
+    /// Executes: checked-first retire → supersede stale → dedup → append.
+    /// Returns `true` if any meaningful change occurred (retire, supersede, or append).
+    fn apply_plan_update_pipeline(&mut self, block: &str, all_items: Vec<PlanItem>) -> bool {
+        // --- checked-first retire (Issue #301) ---
+        let checked_indices = detect_checked_lines(block);
+        let mut had_retire = false;
+        if !checked_indices.is_empty() {
+            let mut all_retired: Vec<String> = Vec::new();
+            for &idx in &checked_indices {
+                if let Some(checked_item) = all_items.get(idx)
+                    && !checked_item.target_files.is_empty()
+                {
+                    let retired = self.apply_checked_items(&checked_item.target_files);
+                    all_retired.extend(retired);
+                }
+            }
+            if !all_retired.is_empty() {
+                had_retire = true;
+                self.stagnation_state.retire_target_files(&all_retired);
+                self.stagnation_state.record_plan_item_completion();
             }
         }
-        false
+
+        let new_items = filter_unchecked_items(all_items, &checked_indices);
+        if new_items.is_empty() {
+            if had_retire {
+                tracing::info!("plan update pipeline: all items checked → retired");
+                self.agent_telemetry.record_plan_update();
+            }
+            return had_retire;
+        }
+
+        // --- supersede → dedup → append ---
+        // CB-001 fix: count superseded items before/after to detect new supersedes only
+        let superseded_before = self
+            .execution_plan
+            .items
+            .iter()
+            .filter(|i| i.status == crate::contracts::PlanItemStatus::Superseded)
+            .count();
+        self.execution_plan.supersede_stale_items(&new_items);
+        let superseded_after = self
+            .execution_plan
+            .items
+            .iter()
+            .filter(|i| i.status == crate::contracts::PlanItemStatus::Superseded)
+            .count();
+        let had_supersede = superseded_after > superseded_before;
+        let deduped = self.execution_plan.deduplicate_new_items(new_items);
+        if deduped.is_empty() {
+            tracing::info!("plan update pipeline: all items deduplicated");
+            if had_supersede || had_retire {
+                self.agent_telemetry.record_plan_update();
+            }
+            return had_supersede || had_retire;
+        }
+        tracing::info!(
+            new_items = deduped.len(),
+            "plan update pipeline: appending items"
+        );
+        self.execution_plan.append_items(deduped);
+        self.agent_telemetry.record_plan_update();
+        true
+    }
+
+    /// Apply replan items from a follow-up ANVIL_PLAN on an active plan (Issue #305).
+    /// Delegates to shared pipeline. Returns whether any meaningful change occurred.
+    fn apply_replan_items(&mut self, block: &str, all_items: Vec<PlanItem>) -> bool {
+        self.apply_plan_update_pipeline(block, all_items)
     }
 
     /// Internal helper: register a plan from pre-parsed items (Issue #303).
@@ -112,6 +211,8 @@ impl App {
     ///   3. Retire target files from stagnation state.
     ///   4. Proceed with standard flow for unchecked items only.
     ///
+    /// Issue #305: refactored to use `apply_plan_update_pipeline()` shared helper.
+    ///
     /// Returns `true` if the plan was updated.
     pub(crate) fn try_update_plan(&mut self, content: &str) -> bool {
         if let Some(block) = extract_plan_update_block(content) {
@@ -126,64 +227,7 @@ impl App {
                 return true;
             }
 
-            // --- Issue #301: checked-first retire ---
-            // CB-001 fix: process each checked item individually to prevent
-            // cross-item target combination from causing false retires.
-            let checked_indices = detect_checked_lines(&block);
-            let mut had_retire = false;
-            if !checked_indices.is_empty() {
-                let mut all_retired: Vec<String> = Vec::new();
-                for &idx in &checked_indices {
-                    if let Some(checked_item) = all_items.get(idx) {
-                        if checked_item.target_files.is_empty() {
-                            continue;
-                        }
-                        let retired = self.apply_checked_items(&checked_item.target_files);
-                        all_retired.extend(retired);
-                    }
-                }
-                if !all_retired.is_empty() {
-                    had_retire = true;
-                    // Sync stagnation: retire target files and record completion
-                    self.stagnation_state.retire_target_files(&all_retired);
-                    self.stagnation_state.record_plan_item_completion();
-                }
-            }
-
-            // If all items were checked, we're done (no unchecked items to process)
-            let new_items = filter_unchecked_items(all_items, &checked_indices);
-            if new_items.is_empty() {
-                if had_retire {
-                    tracing::info!("ANVIL_PLAN_UPDATE detected; all items checked → retired");
-                    self.agent_telemetry.record_plan_update();
-                }
-                return had_retire;
-            }
-
-            // --- Standard flow for unchecked items ---
-            // Issue #289: supersede stale items BEFORE dedup.
-            self.execution_plan.supersede_stale_items(&new_items);
-            // Issue #287: deduplicate against existing items before appending
-            let deduped = self.execution_plan.deduplicate_new_items(new_items);
-            if deduped.is_empty() {
-                tracing::info!("ANVIL_PLAN_UPDATE detected; all items deduplicated");
-                let had_supersede = self
-                    .execution_plan
-                    .items
-                    .iter()
-                    .any(|i| i.status == crate::contracts::PlanItemStatus::Superseded);
-                if had_supersede || had_retire {
-                    self.agent_telemetry.record_plan_update();
-                }
-                return had_supersede || had_retire;
-            }
-            tracing::info!(
-                new_items = deduped.len(),
-                "ANVIL_PLAN_UPDATE detected; appending items"
-            );
-            self.execution_plan.append_items(deduped);
-            self.agent_telemetry.record_plan_update();
-            return true;
+            return self.apply_plan_update_pipeline(&block, all_items);
         }
         false
     }
@@ -523,5 +567,214 @@ mod tests {
         ];
         let result = filter_unchecked_items(items, &[0, 1]);
         assert!(result.is_empty());
+    }
+
+    // --- Issue #305: PlanRegistrationResult / replan tests ---
+
+    /// Build a minimal App for testing execution_plan methods.
+    fn build_test_app() -> App {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "anvil_test_305_{:?}_{:?}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            std::thread::current().id()
+        ));
+        let mut config =
+            crate::config::EffectiveConfig::default_for_test().expect("config should load");
+        config.paths.cwd = tmp.clone();
+        config.paths.workspace_dir = tmp.join("workspace");
+        config.paths.config_file = tmp.join(".anvil").join("config");
+        config.paths.state_dir = tmp.join(".anvil").join("state");
+        config.paths.session_dir = tmp.join(".anvil").join("sessions");
+        config.paths.session_file = config.paths.session_dir.join("default.json");
+        config.paths.logs_dir = tmp.join(".anvil").join("logs");
+        config.paths.mcp_config_file = tmp.join(".anvil").join("mcp.json");
+        config.paths.hooks_config_file = tmp.join(".anvil").join("hooks.json");
+        let provider = crate::provider::ProviderRuntimeContext::bootstrap(&config)
+            .expect("provider should bootstrap");
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        App::new(config, provider, shutdown_flag).expect("app should initialize")
+    }
+
+    #[test]
+    fn replan_basic_followup_anvil_plan_on_active_plan() {
+        let mut app = build_test_app();
+        // Initial registration
+        let content1 =
+            "```ANVIL_PLAN\n- [ ] src/a.rs: implement feature\n- [ ] src/b.rs: add tests\n```";
+        let result1 = app.try_register_plan(content1);
+        assert_eq!(result1, PlanRegistrationResult::Registered);
+        assert_eq!(app.execution_plan.items.len(), 2);
+
+        // Follow-up ANVIL_PLAN on active plan → should be treated as replan
+        let content2 = "```ANVIL_PLAN\n- [ ] src/c.rs: new task\n```";
+        let result2 = app.try_register_plan(content2);
+        assert_eq!(result2, PlanRegistrationResult::Replan);
+        // New item should be appended
+        assert_eq!(app.execution_plan.items.len(), 3);
+    }
+
+    #[test]
+    fn replan_telemetry_update_count_increases() {
+        let mut app = build_test_app();
+        let content1 = "```ANVIL_PLAN\n- [ ] src/a.rs: task\n```";
+        app.try_register_plan(content1);
+        assert_eq!(app.agent_telemetry.plan_registration_count, 1);
+        assert_eq!(app.agent_telemetry.plan_update_count, 0);
+        assert_eq!(app.agent_telemetry.anvil_plan_visible_count, 1);
+
+        // Replan
+        let content2 = "```ANVIL_PLAN\n- [ ] src/b.rs: new task\n```";
+        app.try_register_plan(content2);
+        // registration_count should NOT increase
+        assert_eq!(app.agent_telemetry.plan_registration_count, 1);
+        // update_count SHOULD increase
+        assert_eq!(app.agent_telemetry.plan_update_count, 1);
+        // anvil_plan_visible_count SHOULD increase
+        assert_eq!(app.agent_telemetry.anvil_plan_visible_count, 2);
+    }
+
+    #[test]
+    fn replan_supersede_stale_items() {
+        let mut app = build_test_app();
+        let content1 = "```ANVIL_PLAN\n- [ ] src/a.rs: old task\n```";
+        app.try_register_plan(content1);
+
+        // Replan with same file but different description → supersede
+        let content2 = "```ANVIL_PLAN\n- [ ] src/a.rs: new approach\n```";
+        let result = app.try_register_plan(content2);
+        assert_eq!(result, PlanRegistrationResult::Replan);
+        // Old item should be superseded, new one appended
+        assert!(
+            app.execution_plan
+                .items
+                .iter()
+                .any(|i| i.status == crate::contracts::PlanItemStatus::Superseded)
+        );
+    }
+
+    #[test]
+    fn replan_dedup_existing_items() {
+        let mut app = build_test_app();
+        let content1 = "```ANVIL_PLAN\n- [ ] src/a.rs: task\n```";
+        app.try_register_plan(content1);
+        // Simulate a mutation so the item won't be superseded
+        app.execution_plan.items[0]
+            .mutated_files
+            .push("src/a.rs".into());
+
+        // Replan with exact same item → should be deduped (target match)
+        let content2 = "```ANVIL_PLAN\n- [ ] src/a.rs: task\n```";
+        let result = app.try_register_plan(content2);
+        // All items deduped, no supersede → NoBlock
+        assert_eq!(result, PlanRegistrationResult::NoBlock);
+        // Item count unchanged
+        assert_eq!(app.execution_plan.items.len(), 1);
+    }
+
+    #[test]
+    fn replan_done_items_not_appended() {
+        let mut app = build_test_app();
+        let content1 = "```ANVIL_PLAN\n- [ ] src/a.rs: task\n- [ ] src/b.rs: task2\n```";
+        app.try_register_plan(content1);
+        // Mark first item as done
+        app.execution_plan.mark_done(0);
+
+        // Replan includes only a new item + the done item description
+        let content2 = "```ANVIL_PLAN\n- [ ] src/a.rs: task\n- [ ] src/c.rs: new task\n```";
+        let result = app.try_register_plan(content2);
+        assert_eq!(result, PlanRegistrationResult::Replan);
+        // src/c.rs should be added, src/a.rs should be deduped (already done)
+        let new_items: Vec<_> = app
+            .execution_plan
+            .items
+            .iter()
+            .filter(|i| i.target_files.iter().any(|f| f == "src/c.rs"))
+            .collect();
+        assert_eq!(new_items.len(), 1);
+    }
+
+    #[test]
+    fn replan_checked_first_retire() {
+        let mut app = build_test_app();
+        let content1 = "```ANVIL_PLAN\n- [ ] src/a.rs: task\n- [ ] src/b.rs: task2\n```";
+        app.try_register_plan(content1);
+
+        // Replan with [x] checked items → should retire
+        let content2 = "```ANVIL_PLAN\n- [x] src/a.rs: task\n- [ ] src/c.rs: new task\n```";
+        let result = app.try_register_plan(content2);
+        assert_eq!(result, PlanRegistrationResult::Replan);
+        // src/a.rs item should be AlreadySatisfied
+        let a_item = app
+            .execution_plan
+            .items
+            .iter()
+            .find(|i| i.target_files.iter().any(|f| f == "src/a.rs"))
+            .unwrap();
+        assert_eq!(
+            a_item.status,
+            crate::contracts::PlanItemStatus::AlreadySatisfied
+        );
+    }
+
+    #[test]
+    fn replan_subset_items() {
+        let mut app = build_test_app();
+        let content1 = "```ANVIL_PLAN\n- [ ] src/a.rs: task\n- [ ] src/b.rs: task2\n- [ ] src/c.rs: task3\n```";
+        app.try_register_plan(content1);
+        assert_eq!(app.execution_plan.items.len(), 3);
+
+        // Replan with only a subset of new items
+        let content2 = "```ANVIL_PLAN\n- [ ] src/d.rs: new task\n```";
+        let result = app.try_register_plan(content2);
+        assert_eq!(result, PlanRegistrationResult::Replan);
+        assert_eq!(app.execution_plan.items.len(), 4);
+    }
+
+    #[test]
+    fn replan_no_effect_returns_noblock() {
+        let mut app = build_test_app();
+        let content1 = "```ANVIL_PLAN\n- [ ] src/a.rs: task\n```";
+        app.try_register_plan(content1);
+        // Simulate a mutation so the item won't be superseded by replan
+        app.execution_plan.items[0]
+            .mutated_files
+            .push("src/a.rs".into());
+
+        // Replan with same item (deduped, not superseded) → no effect
+        let content2 = "```ANVIL_PLAN\n- [ ] src/a.rs: task\n```";
+        let result = app.try_register_plan(content2);
+        assert_eq!(result, PlanRegistrationResult::NoBlock);
+    }
+
+    #[test]
+    fn first_registration_unchanged() {
+        let mut app = build_test_app();
+        let content = "```ANVIL_PLAN\n- [ ] src/a.rs: implement feature\n```";
+        let result = app.try_register_plan(content);
+        assert_eq!(result, PlanRegistrationResult::Registered);
+        assert_eq!(app.execution_plan.items.len(), 1);
+        assert_eq!(app.agent_telemetry.plan_registration_count, 1);
+        assert_eq!(app.agent_telemetry.anvil_plan_visible_count, 1);
+    }
+
+    #[test]
+    fn plan_update_unchanged() {
+        let mut app = build_test_app();
+        // Register initial plan
+        let content1 = "```ANVIL_PLAN\n- [ ] src/a.rs: task\n```";
+        app.try_register_plan(content1);
+
+        // Update via ANVIL_PLAN_UPDATE (not ANVIL_PLAN)
+        let content2 = "```ANVIL_PLAN_UPDATE\n- [ ] src/b.rs: new task\n```";
+        let updated = app.try_update_plan(content2);
+        assert!(updated);
+        assert_eq!(app.execution_plan.items.len(), 2);
+        assert_eq!(app.agent_telemetry.plan_update_count, 1);
     }
 }
