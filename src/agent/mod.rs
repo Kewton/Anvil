@@ -831,6 +831,7 @@ const PROMPT_TOOL_RULES: &str = concat!(
     "```ANVIL_PLAN\n- [ ] src/foo.rs: description\n- [ ] src/bar.rs: description\n```\n",
     "Each item: `- [ ] <relative-path>: <description>`. Do NOT output ANVIL_FINAL until ALL items are done.\n",
     "To add items mid-task, output an ANVIL_PLAN_UPDATE block with the same format.\n",
+    "To mark items as already done (no changes needed), use [x] in ANVIL_PLAN_UPDATE: `- [x] path: reason`.\n",
     "\n",
     "After ALL tool blocks, include exactly one final block with your summary:\n",
     "```ANVIL_FINAL\n",

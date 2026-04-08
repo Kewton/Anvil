@@ -1013,13 +1013,23 @@ impl App {
                 if let super::phase_estimator::PhaseAction::FallbackComplete =
                     self.phase_estimator.check_empty_response()
                 {
-                    tracing::info!("Phase estimator: fallback completion detected");
-                    self.record_assistant_output(
-                        self.next_message_id("assistant"),
-                        next_structured.final_response,
-                    )?;
-                    fallback_completed = true;
-                    break;
+                    // Issue #307: plan に未完了 item がある場合は break せず
+                    // Plan Gate に fallthrough して既存のガイダンス注入・ループ防止を再利用
+                    if !self.execution_plan.is_empty() && !self.execution_plan.all_finished() {
+                        tracing::info!(
+                            "Phase estimator: fallback completion suppressed \
+                             (plan incomplete, falling through to plan gate; Issue #307)"
+                        );
+                        // break しない → 後続の Plan Gate に到達する
+                    } else {
+                        tracing::info!("Phase estimator: fallback completion detected");
+                        self.record_assistant_output(
+                            self.next_message_id("assistant"),
+                            next_structured.final_response,
+                        )?;
+                        fallback_completed = true;
+                        break;
+                    }
                 }
 
                 // Issue #249/#285: Plan gate — suppress termination if plan is incomplete.
