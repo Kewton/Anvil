@@ -220,6 +220,7 @@ fn normalize_openai_tool_name(name: &str) -> String {
         "file_edit" => "file.edit".to_string(),
         "file_search" => "file.search".to_string(),
         "file_edit_anchor" => "file.edit_anchor".to_string(),
+        "file_rewrite" => "file.rewrite".to_string(),
         "shell_exec" => "shell.exec".to_string(),
         "web_fetch" => "web.fetch".to_string(),
         "web_search" => "web.search".to_string(),

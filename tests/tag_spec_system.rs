@@ -3,8 +3,8 @@
 use anvil::agent::tag_spec::{TOOL_TAG_SPECS, find_spec};
 
 #[test]
-fn tool_tag_specs_has_ten_entries() {
-    assert_eq!(TOOL_TAG_SPECS.len(), 10);
+fn tool_tag_specs_has_eleven_entries() {
+    assert_eq!(TOOL_TAG_SPECS.len(), 11);
 }
 
 #[test]
@@ -80,6 +80,15 @@ fn find_spec_file_edit_anchor() {
     assert_eq!(spec.name, "file.edit_anchor");
     assert_eq!(spec.attributes, &["path"]);
     assert_eq!(spec.child_elements, &["old_content", "new_content"]);
+    assert!(!spec.example.is_empty());
+}
+
+#[test]
+fn find_spec_file_rewrite() {
+    let spec = find_spec("file.rewrite").expect("file.rewrite should exist");
+    assert_eq!(spec.name, "file.rewrite");
+    assert_eq!(spec.attributes, &["path", "start_line", "end_line"]);
+    assert_eq!(spec.child_elements, &["content"]);
     assert!(!spec.example.is_empty());
 }
 

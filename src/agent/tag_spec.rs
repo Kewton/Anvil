@@ -77,6 +77,12 @@ pub const TOOL_TAG_SPECS: &[ToolTagSpec] = &[
         child_elements: &["prompt"],
         example: r#"<tool name="agent.plan" scope="..."><prompt>...</prompt></tool> (for exploration only, use ANVIL_PLAN for implementation plans)"#,
     },
+    ToolTagSpec {
+        name: "file.rewrite",
+        attributes: &["path", "start_line", "end_line"],
+        child_elements: &["content"],
+        example: r#"<tool name="file.rewrite" path="./src/main.rs" start_line="10" end_line="15"><content>replacement lines here</content></tool>"#,
+    },
 ];
 
 /// ツール名からスペックを検索

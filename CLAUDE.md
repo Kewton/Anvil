@@ -147,8 +147,8 @@ src/
 ├── spinner.rs           # スピナーUI（並列詳細進捗表示・start_parallel_detailed・format_detailed_progress）
 ├── state/mod.rs         # 状態マシン
 ├── tooling/
-│   ├── mod.rs           # ツール実行・検証・CheckpointStack（undo用チェックポイント管理）・EditFallbackStage・file.edit詳細ログ
-│   ├── diff.rs          # 差分プレビュー生成（file.write/file.edit承認時）
+│   ├── mod.rs           # ツール実行・検証・CheckpointStack（undo用チェックポイント管理）・EditFallbackStage・file.edit詳細ログ・file.rewrite（行番号範囲ベースのブロック全置換）
+│   ├── diff.rs          # 差分プレビュー生成（file.write/file.edit/file.rewrite承認時）
 │   ├── file_cache.rs    # ファイル読み取りキャッシュ（FileReadCache: LRUエビクション・sandbox境界検証）
 │   ├── progress.rs      # 並列実行進捗型（ToolProgressStatus・ToolProgressEntry）
 │   └── shell_policy.rs  # ShellPolicy分類（ReadOnly/BuildTest/General）・offline用ネットワークコマンド検出

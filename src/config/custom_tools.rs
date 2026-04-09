@@ -12,6 +12,7 @@ const BUILTIN_TOOL_NAMES: &[&str] = &[
     "file.write",
     "file.edit",
     "file.edit_anchor",
+    "file.rewrite",
     "file.search",
     "shell.exec",
     "web.fetch",

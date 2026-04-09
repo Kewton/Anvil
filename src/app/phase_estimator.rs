@@ -7,7 +7,12 @@
 /// Read-category tool names.
 const READ_TOOLS: &[&str] = &["file.read", "file.search", "web.fetch"];
 /// Write-category tool names.
-const WRITE_TOOLS: &[&str] = &["file.edit", "file.edit_anchor", "file.write"];
+const WRITE_TOOLS: &[&str] = &[
+    "file.edit",
+    "file.edit_anchor",
+    "file.rewrite",
+    "file.write",
+];
 
 /// Action recommended by the phase estimator.
 #[derive(Debug, Clone, PartialEq, Eq)]
