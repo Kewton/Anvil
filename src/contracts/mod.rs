@@ -944,6 +944,78 @@ impl ExecutionPlan {
         retired
     }
 
+    /// Auto-retire plan items that have no `target_files` (Issue #315).
+    ///
+    /// No-path / summary-only items (e.g. `- [ ] 残っている gap があれば修正`)
+    /// violate the `<relative-path>: <description>` prompt contract and cannot
+    /// be retired by any existing file-based mechanism.  Marking them as
+    /// `AlreadySatisfied` on registration prevents them from blocking the
+    /// final gate indefinitely.
+    ///
+    /// Returns the number of items auto-retired.
+    pub fn auto_retire_no_path_items(&mut self) -> usize {
+        let mut count = 0;
+        for item in &mut self.items {
+            if !item.is_finished() && item.target_files.is_empty() {
+                tracing::info!(
+                    description = %item.description,
+                    "auto-retiring no-path plan item (Issue #315)"
+                );
+                item.status = PlanItemStatus::AlreadySatisfied;
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Retire unfinished no-path plan items whose description matches one of
+    /// the given descriptions (Issue #315).
+    ///
+    /// Used when a checked `[x]` item in `ANVIL_PLAN_UPDATE` has no
+    /// `target_files`.  Because file-based `mark_unfinished_items_by_target`
+    /// skips no-path items, this method provides a description-based fallback
+    /// to retire the corresponding existing no-path item.
+    ///
+    /// Matching is case-insensitive and whitespace-normalized.
+    ///
+    /// Returns the number of items retired.
+    pub fn retire_no_path_items_by_description(
+        &mut self,
+        descriptions: &[String],
+        new_status: PlanItemStatus,
+    ) -> usize {
+        let normalized_targets: Vec<String> = descriptions
+            .iter()
+            .map(|d| Self::normalize_description(d))
+            .collect();
+        let mut count = 0;
+        for item in &mut self.items {
+            if item.is_finished() || !item.target_files.is_empty() {
+                continue;
+            }
+            let normalized = Self::normalize_description(&item.description);
+            if normalized_targets.contains(&normalized) {
+                tracing::info!(
+                    description = %item.description,
+                    status = %new_status,
+                    "no-path plan item retired via description match (Issue #315)"
+                );
+                item.status = new_status;
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Normalize a description for fuzzy matching: trim, collapse whitespace,
+    /// lowercase.
+    fn normalize_description(desc: &str) -> String {
+        desc.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+    }
+
     /// Sync plan item completion from the set of files actually modified.
     ///
     /// When a file.write/file.edit succeeds but the result is not passed to
