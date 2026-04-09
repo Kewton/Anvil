@@ -3,8 +3,8 @@
 use anvil::agent::tag_spec::{TOOL_TAG_SPECS, find_spec};
 
 #[test]
-fn tool_tag_specs_has_eleven_entries() {
-    assert_eq!(TOOL_TAG_SPECS.len(), 11);
+fn tool_tag_specs_has_twelve_entries() {
+    assert_eq!(TOOL_TAG_SPECS.len(), 12);
 }
 
 #[test]

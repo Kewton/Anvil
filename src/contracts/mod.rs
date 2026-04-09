@@ -91,6 +91,29 @@ impl SubAgentPayload {
 }
 
 // ---------------------------------------------------------------------------
+// FixSlice proposal (Issue #291)
+// ---------------------------------------------------------------------------
+
+/// A structured proposal returned by the FixSlice sub-agent.
+///
+/// The sub-agent produces this as its ANVIL_FINAL output; the parent validates
+/// and applies it via the normal `file.rewrite` execution path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FixSliceProposal {
+    /// Target file path (relative, must match the parent-specified path).
+    pub target_path: String,
+    /// First line of the replacement range (1-based, inclusive).
+    pub start_line: u32,
+    /// Last line of the replacement range (1-based, inclusive).
+    pub end_line: u32,
+    /// The replacement content for the specified line range.
+    pub replacement_content: String,
+    /// Human-readable rationale for the change.
+    #[serde(default)]
+    pub rationale: String,
+}
+
+// ---------------------------------------------------------------------------
 // Completion taxonomy (Issue #255: AgentPhase integration)
 // ---------------------------------------------------------------------------
 

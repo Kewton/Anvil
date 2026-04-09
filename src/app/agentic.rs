@@ -350,9 +350,35 @@ impl App {
             }
 
             let kind = SubAgentKind::from_tool_input(&call.input).unwrap();
-            let (prompt, scope) = match &call.input {
-                ToolInput::AgentExplore { prompt, scope } => (prompt.as_str(), scope.as_deref()),
-                ToolInput::AgentPlan { prompt, scope } => (prompt.as_str(), scope.as_deref()),
+
+            // Extract prompt, scope, and optional FixSlice parameters.
+            // We pre-compute the FixSlice parent_dir so the borrow lives long enough.
+            let fixslice_parent_dir: Option<String> = match &call.input {
+                ToolInput::AgentFixSlice { target_path, .. } => {
+                    std::path::Path::new(target_path.as_str())
+                        .parent()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .filter(|s| !s.is_empty())
+                }
+                _ => None,
+            };
+            let (prompt, scope, fixslice_params) = match &call.input {
+                ToolInput::AgentExplore { prompt, scope } => {
+                    (prompt.as_str(), scope.as_deref(), None)
+                }
+                ToolInput::AgentPlan { prompt, scope } => (prompt.as_str(), scope.as_deref(), None),
+                ToolInput::AgentFixSlice {
+                    target_path,
+                    goal,
+                    max_lines,
+                } => {
+                    // DR2-010: goal → prompt, target_path parent dir → scope
+                    (
+                        goal.as_str(),
+                        fixslice_parent_dir.as_deref(),
+                        Some((target_path.clone(), *max_lines)),
+                    )
+                }
                 _ => unreachable!(),
             };
 
@@ -387,6 +413,31 @@ impl App {
                 self.config.paths.cwd.clone()
             };
 
+            // CB-002: FixSlice is PermissionClass::Confirm, so require approval
+            // before launching the sub-agent. Explore/Plan are Safe and skip this.
+            if kind == SubAgentKind::FixSlice && self.config.mode.approval_required {
+                let spec = self.tools.get("agent.fix_slice");
+                let effective_perm = spec
+                    .map(|s| effective_permission_class(&call.input, s))
+                    .unwrap_or(PermissionClass::Confirm);
+                let tool_kind = spec.map(|s| s.kind).unwrap_or(ToolKind::AgentFixSlice);
+                let trusted = is_trusted(
+                    &call.tool_name,
+                    tool_kind,
+                    effective_perm,
+                    self.trust_all,
+                    &self.trusted_tools,
+                );
+                if !trusted {
+                    let summary = tool_call_approval_summary(call);
+                    let approved = prompt_inline_approval(&summary, None);
+                    if !approved {
+                        agent_results.push(build_failed_result(call, "denied by user".to_string()));
+                        continue;
+                    }
+                }
+            }
+
             let overrides = SubAgentOverrides {
                 model: self.active_model.clone(),
                 context_window: self.active_context_window,
@@ -401,13 +452,99 @@ impl App {
                 overrides,
             );
             let result = session.run();
-            agent_results.push(match result {
-                Ok(r) => r.into_tool_execution_result(call),
-                Err(e) => e.into_tool_execution_result(call),
-            });
+
+            // FixSlice: validate proposal and apply via file.rewrite (Issue #291)
+            if let Some((ref original_target_path, max_lines)) = fixslice_params {
+                match result {
+                    Ok(sub_result) => {
+                        let fix_results = self.handle_fixslice_result(
+                            sub_result,
+                            call,
+                            original_target_path,
+                            max_lines,
+                        );
+                        agent_results.extend(fix_results);
+                    }
+                    Err(e) => {
+                        agent_results.push(e.into_tool_execution_result(call));
+                    }
+                }
+            } else {
+                agent_results.push(match result {
+                    Ok(r) => r.into_tool_execution_result(call),
+                    Err(e) => e.into_tool_execution_result(call),
+                });
+            }
         }
 
         (agent_results, normal_calls)
+    }
+
+    // -----------------------------------------------------------------------
+    // FixSlice result handling (Issue #291)
+    // -----------------------------------------------------------------------
+
+    /// Handle a FixSlice sub-agent result: validate proposal, apply via
+    /// file.rewrite, and return result(s).
+    ///
+    /// Returns up to 2 results: file.rewrite result (if applied) + agent.fix_slice summary.
+    fn handle_fixslice_result(
+        &mut self,
+        sub_result: crate::agent::subagent::SubAgentResult,
+        call: &ToolCallRequest,
+        original_target_path: &str,
+        max_lines: u32,
+    ) -> Vec<ToolExecutionResult> {
+        let proposal = match sub_result.fix_proposal {
+            Some(p) => p,
+            None => {
+                // Worker finished without a valid proposal
+                let reason = sub_result.payload.termination_reason;
+                let summary = format!("fix-slice worker {reason}: no valid proposal produced");
+                return vec![build_failed_result_with_text(call, summary)];
+            }
+        };
+
+        // Validate the proposal
+        if let Err(reason) = validate_fix_proposal(
+            &proposal,
+            original_target_path,
+            max_lines,
+            &self.config.paths.cwd,
+        ) {
+            let summary = format!("fix-slice validation failed: {reason}");
+            return vec![build_failed_result_with_text(call, summary)];
+        }
+
+        // Build file.rewrite execution request and actually execute it (CB-001).
+        let rewrite_request = build_rewrite_request(&proposal, &call.tool_call_id);
+        let rewrite_result = self.execute_single(rewrite_request);
+
+        // Build agent.fix_slice summary result
+        let rationale = sanitize_for_display(&proposal.rationale);
+        let fix_summary = ToolExecutionResult {
+            tool_call_id: call.tool_call_id.clone(),
+            tool_name: call.tool_name.clone(),
+            status: ToolExecutionStatus::Completed,
+            summary: format!("fix-slice applied: {rationale}"),
+            payload: ToolExecutionPayload::Text(
+                serde_json::json!({
+                    "target_path": proposal.target_path,
+                    "start_line": proposal.start_line,
+                    "end_line": proposal.end_line,
+                    "rationale": rationale,
+                })
+                .to_string(),
+            ),
+            artifacts: Vec::new(),
+            elapsed_ms: 0,
+            diff_summary: None,
+            edit_detail: None,
+            rolled_back: false,
+        };
+
+        // DR3-001: file.rewrite first, then agent.fix_slice summary
+        vec![rewrite_result, fix_summary]
     }
 
     /// Check if the ANVIL_FINAL guard should activate.
@@ -2508,6 +2645,12 @@ pub(crate) fn infer_plan_from_structured_response(
             } => {
                 format!("rewrite {path} (lines {start_line}-{end_line})")
             }
+            crate::tooling::ToolInput::AgentFixSlice {
+                target_path, goal, ..
+            } => {
+                let truncated = truncate_chars(goal, 50);
+                format!("fix_slice: {target_path} — {truncated}")
+            }
         };
         plan.push(item);
     }
@@ -2671,6 +2814,25 @@ fn build_failed_result(
     }
 }
 
+/// Build a failed [`ToolExecutionResult`] with the summary echoed as text payload.
+fn build_failed_result_with_text(
+    call: &crate::tooling::ToolCallRequest,
+    summary: String,
+) -> ToolExecutionResult {
+    ToolExecutionResult {
+        tool_call_id: call.tool_call_id.clone(),
+        tool_name: call.tool_name.clone(),
+        status: crate::tooling::ToolExecutionStatus::Failed,
+        summary: summary.clone(),
+        payload: crate::tooling::ToolExecutionPayload::Text(summary),
+        artifacts: Vec::new(),
+        elapsed_ms: 0,
+        diff_summary: None,
+        edit_detail: None,
+        rolled_back: false,
+    }
+}
+
 /// Produce a human-readable summary of a tool call for the approval prompt.
 fn tool_call_approval_summary(call: &crate::tooling::ToolCallRequest) -> String {
     match &call.input {
@@ -2719,6 +2881,12 @@ fn tool_call_approval_summary(call: &crate::tooling::ToolCallRequest) -> String 
             let truncated = truncate_chars(prompt, 100);
             format!("agent.plan [scope: {scope_info}]: {truncated}")
         }
+        crate::tooling::ToolInput::AgentFixSlice {
+            target_path, goal, ..
+        } => {
+            let truncated = truncate_chars(goal, 100);
+            format!("agent.fix_slice [target: {target_path}]: {truncated}")
+        }
         _ => call.tool_name.clone(),
     }
 }
@@ -2739,6 +2907,97 @@ fn prompt_inline_approval(summary: &str, diff_preview: Option<&str>) -> bool {
     } else {
         false
     }
+}
+
+// ---------------------------------------------------------------------------
+// FixSlice helpers (Issue #291)
+// ---------------------------------------------------------------------------
+
+/// Validate a FixSlice proposal from the sub-agent.
+///
+/// Checks:
+/// - `target_path` matches the parent-specified path
+/// - `replacement_content` is non-empty
+/// - Line range fits within `max_lines`
+/// - `target_path` resolves within the sandbox
+/// - No control characters in `target_path`
+pub fn validate_fix_proposal(
+    proposal: &crate::contracts::FixSliceProposal,
+    original_target_path: &str,
+    max_lines: u32,
+    sandbox_root: &std::path::Path,
+) -> Result<(), String> {
+    // Control character check
+    if proposal.target_path.chars().any(|c| c.is_control()) {
+        return Err("target_path contains control characters".to_string());
+    }
+
+    // Path match check
+    if proposal.target_path != original_target_path {
+        return Err(format!(
+            "target_path mismatch: proposal '{}' != original '{}'",
+            proposal.target_path, original_target_path
+        ));
+    }
+
+    // Sandbox check
+    if resolve_sandbox_path(sandbox_root, &proposal.target_path).is_err() {
+        return Err(format!(
+            "target_path sandbox violation: {}",
+            proposal.target_path
+        ));
+    }
+
+    // Non-empty replacement
+    if proposal.replacement_content.is_empty() {
+        return Err("replacement_content must not be empty".to_string());
+    }
+
+    // Line range within max_lines
+    let span = proposal.end_line.saturating_sub(proposal.start_line) + 1;
+    if span > max_lines {
+        return Err(format!(
+            "line range ({} lines) exceeds max_lines ({})",
+            span, max_lines
+        ));
+    }
+
+    Ok(())
+}
+
+/// Build a `ToolExecutionRequest` for applying a FixSlice proposal via file.rewrite.
+pub fn build_rewrite_request(
+    proposal: &crate::contracts::FixSliceProposal,
+    parent_call_id: &str,
+) -> ToolExecutionRequest {
+    use crate::tooling::{ExecutionClass, PlanModePolicy, RollbackPolicy, ToolSpec};
+    ToolExecutionRequest {
+        spec: ToolSpec {
+            version: 1,
+            name: "file.rewrite".to_string(),
+            kind: ToolKind::FileRewrite,
+            execution_class: ExecutionClass::Mutating,
+            permission_class: PermissionClass::Confirm,
+            execution_mode: ExecutionMode::SequentialOnly,
+            plan_mode: PlanModePolicy::Allowed,
+            rollback_policy: RollbackPolicy::CheckpointBeforeWrite,
+        },
+        input: ToolInput::FileRewrite {
+            path: proposal.target_path.clone(),
+            start_line: proposal.start_line,
+            end_line: proposal.end_line,
+            content: proposal.replacement_content.clone(),
+        },
+        tool_call_id: format!("{parent_call_id}_rewrite"),
+        extra_field_warnings: Vec::new(),
+    }
+}
+
+/// Remove control characters from a string for safe display in summaries.
+fn sanitize_for_display(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control() || *c == '\n')
+        .collect()
 }
 
 /// Truncate a string to at most `max_chars` Unicode characters, appending

@@ -5,7 +5,7 @@
 
 use crate::app::policy::{OFFLINE_BLOCK_PAYLOAD, check_offline_blocked};
 use crate::config::EffectiveConfig;
-use crate::contracts::{Finding, SubAgentPayload, TerminationReason};
+use crate::contracts::{Finding, FixSliceProposal, SubAgentPayload, TerminationReason};
 use crate::provider::{ProviderClient, ProviderEvent, ProviderTurnError};
 use crate::session::{MessageRole, SessionMessage, SessionRecord};
 use crate::tooling::{
@@ -25,6 +25,17 @@ use std::time::{Duration, Instant};
 // ---------------------------------------------------------------------------
 // Sub-agent system prompt constants
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// FixSlice budget constants (Issue #291, DR1-004: code-level const)
+// ---------------------------------------------------------------------------
+
+/// Maximum iterations for a FixSlice sub-agent run.
+pub const FIXSLICE_MAX_ITERATIONS: u32 = 3;
+/// Wall-clock timeout (seconds) for a FixSlice sub-agent run.
+pub const FIXSLICE_TIMEOUT_SECS: u64 = 60;
+/// Maximum allowed value for `max_lines` in agent.fix_slice input.
+pub const MAX_FIXSLICE_LINES: u32 = 200;
 
 const SUBAGENT_PROTOCOL_BASE: &str = r#"You are a sub-agent of Anvil, a local coding agent.
 
@@ -137,6 +148,46 @@ You are a Plan sub-agent specializing in implementation planning.
 - Note: Offline mode is active. Web access is unavailable.
 "#;
 
+// ---------------------------------------------------------------------------
+// FixSlice sub-agent prompts (Issue #291, DR2-007)
+// ---------------------------------------------------------------------------
+
+const FIXSLICE_PROTOCOL_BASE: &str = r#"You are a sub-agent of Anvil, a local coding agent.
+
+## Tool protocol
+When you need to read files, respond using fenced blocks.
+
+After you have analysed the target file, output your fix proposal as JSON inside:
+```ANVIL_FINAL
+{
+  "target_path": "relative/path/to/file.rs",
+  "start_line": 10,
+  "end_line": 15,
+  "replacement_content": "replacement lines here\n",
+  "rationale": "Short explanation of the fix"
+}
+```
+
+Rules:
+- All paths must be relative (start with ./ or a directory name).
+- Do not use any other tool syntax.
+- Always include ANVIL_FINAL when you are done.
+- You MUST output ANVIL_FINAL to signal completion.
+- Output valid JSON in ANVIL_FINAL. The JSON must contain target_path, start_line, end_line, and replacement_content.
+- start_line and end_line are 1-based, inclusive.
+- Keep the replacement scope minimal — only the lines that need to change.
+
+"#;
+
+const FIXSLICE_ROLE_PROMPT: &str = r#"## Your role
+You are a FixSlice sub-agent specializing in targeted, local code fixes.
+- Use file.read to read the target file and understand the context.
+- Identify the minimal set of lines that need to change.
+- Produce a FixSliceProposal in ANVIL_FINAL with the exact line range and replacement.
+- Keep the fix within the specified max_lines budget.
+- You only have read-only access: file.read.
+"#;
+
 /// Options for sub-agent system prompt generation (Issue #162).
 pub struct SubAgentPromptOptions<'a> {
     pub offline: bool,
@@ -153,10 +204,11 @@ pub fn build_subagent_system_prompt(
 ) -> String {
     use crate::config::{effective_ui_language_code, language_constraint_prompt};
 
+    // FixSlice uses its own protocol base; Explore/Plan share SUBAGENT_PROTOCOL_BASE.
     let mut prompt = String::new();
-    prompt.push_str(SUBAGENT_PROTOCOL_BASE);
     match kind {
         SubAgentKind::Explore => {
+            prompt.push_str(SUBAGENT_PROTOCOL_BASE);
             prompt.push_str(TOOL_DESC_FILE_READ);
             prompt.push_str(TOOL_DESC_FILE_SEARCH);
             prompt.push_str(TOOL_DESC_GIT_STATUS);
@@ -165,6 +217,7 @@ pub fn build_subagent_system_prompt(
             prompt.push_str(EXPLORE_ROLE_PROMPT);
         }
         SubAgentKind::Plan => {
+            prompt.push_str(SUBAGENT_PROTOCOL_BASE);
             prompt.push_str(TOOL_DESC_FILE_READ);
             prompt.push_str(TOOL_DESC_FILE_SEARCH);
             if !opts.offline {
@@ -176,6 +229,11 @@ pub fn build_subagent_system_prompt(
             } else {
                 PLAN_ROLE_PROMPT
             });
+        }
+        SubAgentKind::FixSlice => {
+            prompt.push_str(FIXSLICE_PROTOCOL_BASE);
+            prompt.push_str(TOOL_DESC_FILE_READ);
+            prompt.push_str(FIXSLICE_ROLE_PROMPT);
         }
     }
 
@@ -190,11 +248,13 @@ pub fn build_subagent_system_prompt(
 // Public types
 // ---------------------------------------------------------------------------
 
-/// Sub-agent kind (Explore or Plan).
+/// Sub-agent kind (Explore, Plan, or FixSlice).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubAgentKind {
     Explore,
     Plan,
+    /// Microtask fix-slice worker (Issue #291).
+    FixSlice,
 }
 
 impl SubAgentKind {
@@ -203,12 +263,15 @@ impl SubAgentKind {
         match input {
             ToolInput::AgentExplore { .. } => Some(SubAgentKind::Explore),
             ToolInput::AgentPlan { .. } => Some(SubAgentKind::Plan),
+            ToolInput::AgentFixSlice { .. } => Some(SubAgentKind::FixSlice),
             _ => None,
         }
     }
 }
 
 /// Result returned by a successful sub-agent run.
+// TODO(DR1-001): When a 4th sub-agent kind is added, refactor SubAgentResult
+// into an enum to avoid accumulating Option fields.
 pub struct SubAgentResult {
     /// 構造化ペイロード
     pub payload: SubAgentPayload,
@@ -216,6 +279,8 @@ pub struct SubAgentResult {
     pub estimated_tokens: usize,
     /// 使用したイテレーション数
     pub iterations_used: u32,
+    /// FixSlice proposal extracted from ANVIL_FINAL (Issue #291).
+    pub fix_proposal: Option<FixSliceProposal>,
 }
 
 impl SubAgentResult {
@@ -302,7 +367,7 @@ impl SubAgentError {
 /// Outcome of a single sub-agent turn.
 enum TurnOutcome {
     /// The sub-agent produced a final answer.
-    Finished(SubAgentResult),
+    Finished(Box<SubAgentResult>),
     /// The sub-agent wants to continue (tool calls were executed).
     Continue,
 }
@@ -440,6 +505,7 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
         match kind {
             SubAgentKind::Explore => registry.register_explore_tools(),
             SubAgentKind::Plan => registry.register_plan_tools(),
+            SubAgentKind::FixSlice => registry.register_fixslice_tools(),
         }
 
         // 3. Dedicated system prompt
@@ -527,12 +593,41 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
                 &token_buffer,
                 crate::contracts::tokens::ContentKind::Text,
             );
+
+            // FixSlice: parse ANVIL_FINAL as FixSliceProposal (Issue #291, DR1-007)
+            if self.kind == SubAgentKind::FixSlice {
+                let fix_proposal =
+                    serde_json::from_str::<FixSliceProposal>(&structured.final_response).ok();
+                let payload = SubAgentPayload::fallback(
+                    if fix_proposal.is_some() {
+                        "fix-slice proposal parsed successfully".to_string()
+                    } else {
+                        format!(
+                            "fix-slice proposal parse failed: {}",
+                            &structured
+                                .final_response
+                                .chars()
+                                .take(200)
+                                .collect::<String>()
+                        )
+                    },
+                    TerminationReason::Completed,
+                );
+                return Ok(TurnOutcome::Finished(Box::new(SubAgentResult {
+                    payload,
+                    estimated_tokens: tokens,
+                    iterations_used: self.iterations_used,
+                    fix_proposal,
+                })));
+            }
+
             let payload = parse_final_response_to_payload(&structured.final_response);
-            return Ok(TurnOutcome::Finished(SubAgentResult {
+            return Ok(TurnOutcome::Finished(Box::new(SubAgentResult {
                 payload,
                 estimated_tokens: tokens,
                 iterations_used: self.iterations_used,
-            }));
+                fix_proposal: None,
+            })));
         }
 
         // Validate and execute tool calls
@@ -628,11 +723,21 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
         let kind_label = match self.kind {
             SubAgentKind::Explore => "explore",
             SubAgentKind::Plan => "plan",
+            SubAgentKind::FixSlice => "fix_slice",
         };
         eprintln!("[subagent:{kind_label}] Starting...");
         let start = Instant::now();
-        let max_iterations = self.config.runtime.subagent_max_iterations;
-        let timeout = Duration::from_secs(self.config.runtime.subagent_timeout_secs);
+        let (max_iterations, timeout) = if self.kind == SubAgentKind::FixSlice {
+            (
+                FIXSLICE_MAX_ITERATIONS,
+                Duration::from_secs(FIXSLICE_TIMEOUT_SECS),
+            )
+        } else {
+            (
+                self.config.runtime.subagent_max_iterations,
+                Duration::from_secs(self.config.runtime.subagent_timeout_secs),
+            )
+        };
 
         for iteration in 0..max_iterations {
             // Wall-clock timeout -> partial result with Ok
@@ -657,7 +762,7 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
             );
 
             match self.run_turn()? {
-                TurnOutcome::Finished(result) => return Ok(result),
+                TurnOutcome::Finished(result) => return Ok(*result),
                 TurnOutcome::Continue => continue,
             }
         }
@@ -691,6 +796,7 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
             },
             estimated_tokens: 0,
             iterations_used: iterations,
+            fix_proposal: None,
         }
     }
 }

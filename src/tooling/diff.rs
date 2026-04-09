@@ -74,7 +74,9 @@ pub fn generate_diff_preview(
         // MCP tools do not have diff previews
         ToolInput::Mcp { .. } => None,
         // Agent tools do not have diff previews
-        ToolInput::AgentExplore { .. } | ToolInput::AgentPlan { .. } => None,
+        ToolInput::AgentExplore { .. }
+        | ToolInput::AgentPlan { .. }
+        | ToolInput::AgentFixSlice { .. } => None,
         _ => None,
     }
 }

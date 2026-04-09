@@ -226,6 +226,7 @@ fn normalize_openai_tool_name(name: &str) -> String {
         "web_search" => "web.search".to_string(),
         "agent_explore" => "agent.explore".to_string(),
         "agent_plan" => "agent.plan".to_string(),
+        "agent_fix_slice" => "agent.fix_slice".to_string(),
         "git_status" => "git.status".to_string(),
         "git_diff" => "git.diff".to_string(),
         "git_log" => "git.log".to_string(),

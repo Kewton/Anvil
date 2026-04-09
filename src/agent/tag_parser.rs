@@ -286,6 +286,20 @@ fn build_tool_input(
                 .ok_or_else(|| "missing prompt element for agent.plan".to_string())?,
             scope: get_attr("scope"),
         },
+        "agent.fix_slice" => {
+            let target_path = get_attr("target_path")
+                .ok_or_else(|| "missing target_path attribute for agent.fix_slice".to_string())?;
+            let goal = get_child("goal")
+                .ok_or_else(|| "missing goal element for agent.fix_slice".to_string())?;
+            let max_lines: u32 = get_attr("max_lines")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(50);
+            ToolInput::AgentFixSlice {
+                target_path,
+                goal,
+                max_lines,
+            }
+        }
         "file.rewrite" => {
             let path = get_attr("path")
                 .ok_or_else(|| "missing path attribute for file.rewrite".to_string())?;

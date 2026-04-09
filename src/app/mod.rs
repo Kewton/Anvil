@@ -503,6 +503,7 @@ impl App {
         // Register sub-agent tools separately (design decision #6, DR1-008)
         tools.register_agent_explore();
         tools.register_agent_plan();
+        tools.register_agent_fix_slice();
         if let Some(ref manager) = mcp_manager {
             let mcp_tools = manager.get_tools();
             for (server_name, tool_list) in &mcp_tools {

@@ -789,6 +789,16 @@ const TOOL_DESC_AGENT_PLAN: &str = concat!(
     "\n",
 );
 
+const TOOL_DESC_AGENT_FIX_SLICE: &str = concat!(
+    "10. agent.fix_slice — launch a microtask sub-agent to propose a targeted fix for a specific file:\n",
+    "```ANVIL_TOOL\n",
+    "{\"id\":\"call_010\",\"tool\":\"agent.fix_slice\",\"target_path\":\"./src/main.rs\",\"goal\":\"Fix the compilation error in function foo\",\"max_lines\":50}\n",
+    "```\n",
+    "The sub-agent reads the target file, proposes a minimal line-range replacement, and the parent applies it via file.rewrite.\n",
+    "Use this for small, focused fixes where you know the target file and the nature of the problem.\n",
+    "\n",
+);
+
 /// Data-driven definition of optional tools: (tool_name, tool_description, catalog_one_liner).
 /// Note: web.fetch and web.search were moved to basic tools (always included)
 /// because LLMs cannot discover them without prompt descriptions. See Issue #114.
@@ -802,6 +812,11 @@ const OPTIONAL_TOOLS: &[(&str, &str, &str)] = &[
         "agent.plan",
         TOOL_DESC_AGENT_PLAN,
         "agent.plan: launch a read-only sub-agent to create an implementation plan",
+    ),
+    (
+        "agent.fix_slice",
+        TOOL_DESC_AGENT_FIX_SLICE,
+        "agent.fix_slice: launch a microtask sub-agent to propose a targeted fix for a file",
     ),
 ];
 
