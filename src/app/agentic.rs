@@ -1935,6 +1935,14 @@ impl App {
                             "recovery budget granted"
                         );
                     }
+                    // Issue #313: detect whether the error payload already
+                    // contains mid-file context (from extract_edit_context).
+                    // If so, guide the model to use it instead of a generic
+                    // full-file read that truncates mid-file content.
+                    let has_inline_context = matches!(
+                        &result.payload,
+                        ToolExecutionPayload::Text(t) if t.contains("--- File context")
+                    );
                     match action {
                         crate::app::edit_fail_tracker::EditFallbackAction::Continue => {}
                         crate::app::edit_fail_tracker::EditFallbackAction::ReRead => {
@@ -1944,11 +1952,22 @@ impl App {
                                 count = count,
                                 "repeated tool failure"
                             );
-                            edit_hint = Some(format!(
-                                "\n\n[Anvil hint] file.edit has failed {count} consecutive \
-                                 times for '{path}'. Use file.read to get the current file \
-                                 content, then retry file.edit with the correct old_string."
-                            ));
+                            edit_hint = if has_inline_context {
+                                Some(format!(
+                                    "\n\n[Anvil hint] file.edit has failed {count} consecutive \
+                                     times for '{path}'. The file context above shows the actual \
+                                     content with line numbers — use it to correct your old_string. \
+                                     If you need more surrounding lines, use file.read with the \
+                                     offset shown in the context (e.g. file.read path offset=N \
+                                     limit=50)."
+                                ))
+                            } else {
+                                Some(format!(
+                                    "\n\n[Anvil hint] file.edit has failed {count} consecutive \
+                                     times for '{path}'. Use file.read to get the current file \
+                                     content, then retry file.edit with the correct old_string."
+                                ))
+                            };
                         }
                         crate::app::edit_fail_tracker::EditFallbackAction::WriteFallback => {
                             tracing::warn!(
@@ -1970,13 +1989,20 @@ impl App {
                             let line_count_check_failed = max_lines > 0 && line_count.is_none();
 
                             if is_large || line_count_check_failed {
-                                edit_hint = Some(format!(
-                                    "\n\n[Anvil hint] file.edit has failed {count} consecutive \
-                                     times for '{path}'. file.write is not available or could not be \
-                                     safely validated for this path. Instead: \
+                                let ctx_guidance = if has_inline_context {
+                                    "Check the file context above for actual line numbers. \
+                                     Use file.read with offset to get the target section, then \
+                                     retry file.edit with a smaller, precise old_string."
+                                } else {
+                                    "Instead: \
                                      (1) Use file.read to get the current content. \
                                      (2) Identify the exact section to change. \
                                      (3) Retry file.edit with a smaller, precise old_string."
+                                };
+                                edit_hint = Some(format!(
+                                    "\n\n[Anvil hint] file.edit has failed {count} consecutive \
+                                     times for '{path}'. file.write is not available or could not be \
+                                     safely validated for this path. {ctx_guidance}"
                                 ));
                             } else {
                                 edit_hint = Some(format!(
