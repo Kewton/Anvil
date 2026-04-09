@@ -688,6 +688,17 @@ impl ExecutionPlan {
             })
     }
 
+    /// Whether the plan reached a clean terminal state: all items finished with
+    /// no blocked items (Issue #311).
+    ///
+    /// Unlike `is_successfully_completed()` which requires positive evidence
+    /// (Done/AlreadySatisfied), this method also accepts superseded-only plans.
+    /// Used by exit/recovery logic to ensure consistency with
+    /// `check_final_gate` / `CompletionKind::classify`.
+    pub fn is_cleanly_finished(&self) -> bool {
+        self.all_finished() && !self.has_blocked_items()
+    }
+
     /// Decide whether ANVIL_FINAL should be accepted.
     pub fn check_final_gate(&self) -> FinalGateDecision {
         if self.items.is_empty() {
@@ -812,6 +823,12 @@ impl ExecutionPlan {
     ///
     /// Excludes new items whose `target_files` match an existing item
     /// (using `path_matches` for fuzzy comparison).
+    ///
+    /// Issue #311: `Superseded` items are excluded from dedup matching so that
+    /// corrected replacements survive and remain actionable in the plan.
+    /// Without this, a supersede→dedup pipeline can produce a superseded-only
+    /// terminal plan that diverges `check_final_gate` / `CompletionKind` from
+    /// `is_successfully_completed` / exit semantics.
     pub fn deduplicate_new_items(&self, new_items: Vec<PlanItem>) -> Vec<PlanItem> {
         new_items
             .into_iter()
@@ -820,6 +837,11 @@ impl ExecutionPlan {
                 new_targets.sort();
 
                 !self.items.iter().any(|existing| {
+                    // Issue #311: Skip Superseded items — corrected replacements
+                    // must not be deduped against the items they replaced.
+                    if existing.status == PlanItemStatus::Superseded {
+                        return false;
+                    }
                     let mut existing_targets = existing.target_files.clone();
                     existing_targets.sort();
                     if new_targets.len() != existing_targets.len() {

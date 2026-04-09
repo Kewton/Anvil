@@ -1046,10 +1046,9 @@ fn format_checklist_superseded_marker() {
     );
 }
 
-// CB-001: After supersede, the stale item becomes Superseded (finished).
-// The corrected item should then be deduped against it and not appended
-// (it's effectively the same work). But the overall update returns true
-// because a supersede occurred.
+// CB-001 / Issue #311: After supersede, the stale item becomes Superseded.
+// The corrected item must NOT be deduped against the Superseded item so it
+// remains actionable in the plan (prevents superseded-only terminal state).
 #[test]
 fn supersede_then_dedup_flow() {
     // Existing plan has a stale item (Pending, no mutations).
@@ -1065,15 +1064,19 @@ fn supersede_then_dedup_flow() {
     // Step 1: supersede — stale item becomes Superseded
     plan.supersede_stale_items(&new_items);
     assert_eq!(plan.items[0].status, PlanItemStatus::Superseded);
-    // Step 2: dedup — corrected item is deduped against now-finished Superseded item
+    // Step 2: dedup — corrected item survives (Superseded items excluded from dedup)
     let deduped = plan.deduplicate_new_items(new_items);
     assert_eq!(
         deduped.len(),
-        0,
-        "corrected item should be deduped after stale item is superseded (same work)"
+        1,
+        "corrected item must survive dedup after stale item is superseded (Issue #311)"
     );
-    // Plan still has the superseded item, which is finished.
-    assert!(plan.all_finished());
+    // After appending corrected item, plan has actionable work.
+    plan.append_items(deduped);
+    assert!(!plan.all_finished(), "plan has Pending corrected item");
+    assert_eq!(plan.items.len(), 2);
+    assert_eq!(plan.items[0].status, PlanItemStatus::Superseded);
+    assert_eq!(plan.items[1].status, PlanItemStatus::Pending);
 }
 
 // CB-001 variant: corrected item with DIFFERENT target (not matching stale)

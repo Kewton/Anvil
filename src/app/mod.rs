@@ -874,10 +874,11 @@ impl App {
     /// Check whether the last turn had any tool execution failures.
     /// Used by non-interactive mode to determine exit code.
     pub fn has_tool_execution_failure(&self) -> bool {
-        // Plan完了ベース (Issue #296): plan が正常完了していれば
-        // 途中の tool failure は回復済みとみなし exit 0 へ.
-        // plan なし実行では従来の is_error チェックをフォールスルー.
-        if self.execution_plan.is_successfully_completed() {
+        // Issue #311: Use is_cleanly_finished (same predicate as check_final_gate
+        // / CompletionKind) to prevent success/failure divergence on
+        // superseded-only plans.  Supersedes the Issue #296 is_successfully_completed
+        // check which excluded superseded-only plans from recovery.
+        if self.execution_plan.is_cleanly_finished() {
             return false;
         }
         self.session
@@ -913,13 +914,14 @@ impl App {
             .map(|s| s.elapsed())
             .unwrap_or_default();
 
-        // Issue #296: Count recovered vs unrecovered tool failures
+        // Issue #311: Use is_cleanly_finished to align recovery predicate with
+        // check_final_gate / CompletionKind (supersedes #296 is_successfully_completed).
         let total_tool_errors = self
             .session
             .last_turn_tool_results()
             .filter(|r| r.is_error)
             .count();
-        let plan_recovered = self.execution_plan.is_successfully_completed();
+        let plan_recovered = self.execution_plan.is_cleanly_finished();
         let (recovered, unrecovered) = if plan_recovered {
             (total_tool_errors, 0usize)
         } else {

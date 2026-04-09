@@ -101,7 +101,7 @@ fn replan_supersede_stale() {
     )]);
     plan.mark_in_progress(0);
 
-    // New item with same target → supersede old
+    // New item with same target → supersede old, corrected item appended
     let new_items = vec![PlanItem::new(
         "src/a.rs: new approach".into(),
         vec!["src/a.rs".into()],
@@ -110,15 +110,10 @@ fn replan_supersede_stale() {
 
     assert!(changed);
     assert_eq!(plan.items[0].status, PlanItemStatus::Superseded);
-    // New item appended (not deduped because old was superseded and dedup still finds target match)
-    // Actually, deduplicate_new_items checks ALL items including Superseded ones for target match.
-    // Since the superseded item still has same target, the new item IS deduped.
-    // But had_supersede=true, so changed=true.
-    assert!(
-        plan.items
-            .iter()
-            .any(|i| i.status == PlanItemStatus::Superseded)
-    );
+    // Issue #311: corrected item survives dedup (Superseded items excluded)
+    // and is appended as actionable Pending work.
+    assert_eq!(plan.items.len(), 2);
+    assert_eq!(plan.items[1].status, PlanItemStatus::Pending);
 }
 
 // ---------------------------------------------------------------------------
