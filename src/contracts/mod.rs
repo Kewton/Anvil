@@ -1251,6 +1251,49 @@ impl ExecutionPlan {
             workset_lines.join("\n")
         )
     }
+    /// Build a late-stage closure hint when only 1 actionable item remains (Issue #309).
+    ///
+    /// Returns `Some(message)` when exactly 1 unfinished item remains and
+    /// the plan has made substantial progress (>= 50% done). The message
+    /// strongly guides the agent to finish or structurally retire the last item
+    /// instead of drifting into shell-based inspection.
+    pub fn build_late_stage_closure_hint(&self) -> Option<String> {
+        if self.items.is_empty() {
+            return None;
+        }
+        let finished = self.finished_count();
+        let total = self.items.len();
+        let remaining = total - finished;
+
+        if remaining != 1 || finished == 0 {
+            return None;
+        }
+
+        // Find the remaining item
+        let next_item = self.next_actionable_index().and_then(|i| self.items.get(i));
+        let next_item = next_item?;
+        let safe_desc =
+            crate::app::stagnation_state::sanitize_for_prompt_entry(&next_item.description);
+        let target_files: Vec<String> = next_item
+            .target_files
+            .iter()
+            .map(|tf| crate::app::stagnation_state::sanitize_for_prompt_entry(tf))
+            .collect();
+        let files_hint = if target_files.is_empty() {
+            String::new()
+        } else {
+            format!("\n  対象ファイル: {}", target_files.join(", "))
+        };
+
+        Some(format!(
+            "[System] ⚠ CLOSURE MODE: 残り1項目です ({finished}/{total} 完了)。\n\
+             最後の項目: {safe_desc}{files_hint}\n\n\
+             この項目を完了させてください:\n\
+             - file.edit / file.write で対象ファイルを変更する\n\
+             - または変更不要なら ANVIL_PLAN_UPDATE で [x] マークして退役させる\n\
+             - shell.exec での追加調査は不要です。すぐに実装に進んでください。"
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------

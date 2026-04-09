@@ -835,6 +835,42 @@ impl App {
         self.shutdown_flag.load(Ordering::Relaxed)
     }
 
+    /// Build a structured repair message injected before escape hatch termination (Issue #309).
+    ///
+    /// Summarizes remaining unfinished items and failed tool calls, giving the
+    /// agent a narrow instruction to either mutate the target or retire it.
+    pub(crate) fn build_pre_exit_repair_message(&self) -> String {
+        let remaining_items: Vec<String> = self
+            .execution_plan
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| !item.is_finished())
+            .map(|(i, item)| {
+                let safe =
+                    crate::app::stagnation_state::sanitize_for_prompt_entry(&item.description);
+                let targets = item.target_files.join(", ");
+                format!("  {}. {} (files: {})", i + 1, safe, targets)
+            })
+            .collect();
+
+        let items_str = if remaining_items.is_empty() {
+            "  (none)".to_string()
+        } else {
+            remaining_items.join("\n")
+        };
+
+        format!(
+            "[System] ⚠ SESSION ENDING — 未完了項目が残っています。\n\n\
+             残りの項目:\n{items_str}\n\n\
+             最後の機会です。以下のいずれかを実行してください:\n\
+             1. file.edit / file.write で残りの対象ファイルを変更する\n\
+             2. 変更不要なら ANVIL_PLAN_UPDATE で [x] マークして退役させる\n\
+             3. 完了したら ANVIL_FINAL を出力する\n\n\
+             shell.exec での調査は不要です。すぐに行動してください。"
+        )
+    }
+
     /// Check whether the last turn had any tool execution failures.
     /// Used by non-interactive mode to determine exit code.
     pub fn has_tool_execution_failure(&self) -> bool {

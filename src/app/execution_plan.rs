@@ -468,11 +468,24 @@ impl App {
     /// Called at the beginning of each follow-up turn to guide the LLM.
     /// Uses the configured `guidance_mode` from runtime config.
     ///
+    /// Issue #309: When exactly 1 item remains, injects a closure-focused hint
+    /// that strongly biases toward finishing instead of shell inspection drift.
+    ///
     /// Returns the length (in characters) of the injected guidance text, or
     /// `None` if no guidance was injected (e.g. no active plan).  Callers can
     /// forward this value to `AgentTelemetry::record_turn_metrics` so that
     /// `guidance_chars_per_turn` reflects the actual guidance size.
     pub(crate) fn inject_plan_turn_guidance(&mut self) -> Option<usize> {
+        // Issue #309: late-stage closure mode takes precedence when remaining==1.
+        if let Some(closure_hint) = self.execution_plan.build_late_stage_closure_hint() {
+            let len = closure_hint.len();
+            tracing::info!("late-stage closure mode: remaining=1, injecting closure hint");
+            let msg = SessionMessage::new(MessageRole::Tool, "system", closure_hint)
+                .with_id(self.next_message_id("tool"));
+            self.session.push_message(msg);
+            return Some(len);
+        }
+
         let mode = self.config.runtime.guidance_mode;
         // Issue #269 Phase 3: use workset-aware guidance when stagnation is detected.
         let workset = self.execution_plan.current_workset();
