@@ -1006,65 +1006,11 @@ impl App {
                 self.agent_telemetry.record_forced_workset_transition();
             }
 
-            // Plan repair request.
-            if crate::app::stagnation_state::should_request_plan_repair(
-                &self.stagnation_state,
-                plan_repair_count_before_this_turn,
-                remaining_turns,
-            ) {
-                let msg_text = crate::app::stagnation_state::build_plan_repair_message(
-                    &self.stagnation_state.starved_target_files,
-                );
-                let msg = SessionMessage::new(MessageRole::Tool, "system", msg_text)
-                    .with_id(self.next_message_id("tool"));
-                self.session.push_message(msg);
-                self.agent_telemetry.record_plan_repair_request();
-            } else {
-                // Escape hatch: plan repair was already attempted but stagnation persists.
-                if crate::app::stagnation_state::should_allow_escape_hatch(
-                    &self.stagnation_state,
-                    plan_repair_count_before_this_turn,
-                    remaining_turns,
-                ) {
-                    // Issue #309: inject structured repair turn before termination.
-                    // Give the agent one last chance to close remaining items.
-                    if !self.execution_plan.is_empty()
-                        && !self.execution_plan.is_successfully_completed()
-                    {
-                        let repair_msg = self.build_pre_exit_repair_message();
-                        let msg = SessionMessage::new(MessageRole::Tool, "system", repair_msg)
-                            .with_id(self.next_message_id("tool"));
-                        self.session.push_message(msg);
-                        tracing::info!("pre-exit repair turn injected before escape hatch");
-                    }
-                    tracing::warn!(
-                        score = stagnation_score,
-                        "stagnation escape hatch: terminating loop"
-                    );
-                    break;
-                }
-            }
-
-            // Update prev_forced_mode_active at turn end.
-            prev_forced_mode_active = self.forced_mode_active;
-
-            log_turn_summary(&TurnSummary {
-                turn: self.session_stats.total_turns,
-                max_turns: max_iterations as u32,
-                elapsed: iteration_started.elapsed(),
-                tokens_used: used_tokens,
-                token_budget,
-                tool_calls: turn_tool_count,
-                tool_names: &turn_tool_names,
-                files_modified: turn_files_modified,
-                compact_info: self.last_compact_info.as_ref(),
-                phase: self.phase_estimator.current_phase(),
-                mutations_this_turn: Some(turn_mutations),
-                items_advanced_this_turn: Some(turn_items_advanced),
-            });
-            // Reset last_compact_info after it's been consumed by the turn summary
-            self.last_compact_info = None;
-
+            // Issue #323: Process ANVIL_PLAN / ANVIL_PLAN_UPDATE / ANVIL_FINAL from
+            // the current response BEFORE evaluating escape hatch. Without this,
+            // a late zero-tool-call response containing a corrective ANVIL_PLAN_UPDATE
+            // with checked [x] items gets dropped when the escape hatch breaks the loop.
+            //
             // Issue #249: Detect ANVIL_PLAN / ANVIL_PLAN_UPDATE from follow-up responses.
             // Scan the raw token buffer since ANVIL_PLAN may be outside the ANVIL_FINAL block.
             // Issue #287: re-initialize stagnation_state on plan registration
@@ -1132,6 +1078,65 @@ impl App {
                 anvil_final_seen = true;
                 self.phase_estimator.observe_anvil_final();
             }
+
+            // Plan repair request.
+            if crate::app::stagnation_state::should_request_plan_repair(
+                &self.stagnation_state,
+                plan_repair_count_before_this_turn,
+                remaining_turns,
+            ) {
+                let msg_text = crate::app::stagnation_state::build_plan_repair_message(
+                    &self.stagnation_state.starved_target_files,
+                );
+                let msg = SessionMessage::new(MessageRole::Tool, "system", msg_text)
+                    .with_id(self.next_message_id("tool"));
+                self.session.push_message(msg);
+                self.agent_telemetry.record_plan_repair_request();
+            } else {
+                // Escape hatch: plan repair was already attempted but stagnation persists.
+                if crate::app::stagnation_state::should_allow_escape_hatch(
+                    &self.stagnation_state,
+                    plan_repair_count_before_this_turn,
+                    remaining_turns,
+                ) {
+                    // Issue #309: inject structured repair turn before termination.
+                    // Give the agent one last chance to close remaining items.
+                    if !self.execution_plan.is_empty()
+                        && !self.execution_plan.is_successfully_completed()
+                    {
+                        let repair_msg = self.build_pre_exit_repair_message();
+                        let msg = SessionMessage::new(MessageRole::Tool, "system", repair_msg)
+                            .with_id(self.next_message_id("tool"));
+                        self.session.push_message(msg);
+                        tracing::info!("pre-exit repair turn injected before escape hatch");
+                    }
+                    tracing::warn!(
+                        score = stagnation_score,
+                        "stagnation escape hatch: terminating loop"
+                    );
+                    break;
+                }
+            }
+
+            // Update prev_forced_mode_active at turn end.
+            prev_forced_mode_active = self.forced_mode_active;
+
+            log_turn_summary(&TurnSummary {
+                turn: self.session_stats.total_turns,
+                max_turns: max_iterations as u32,
+                elapsed: iteration_started.elapsed(),
+                tokens_used: used_tokens,
+                token_budget,
+                tool_calls: turn_tool_count,
+                tool_names: &turn_tool_names,
+                files_modified: turn_files_modified,
+                compact_info: self.last_compact_info.as_ref(),
+                phase: self.phase_estimator.current_phase(),
+                mutations_this_turn: Some(turn_mutations),
+                items_advanced_this_turn: Some(turn_items_advanced),
+            });
+            // Reset last_compact_info after it's been consumed by the turn summary
+            self.last_compact_info = None;
 
             if next_structured.tool_calls.is_empty() {
                 if awaiting_guidance_followup {
