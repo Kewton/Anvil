@@ -9,7 +9,9 @@ pub mod file_cache;
 pub mod progress;
 pub mod shell_policy;
 
-pub use shell_policy::{ShellPolicy, classify_shell_policy, is_network_command};
+pub use shell_policy::{
+    ShellPolicy, classify_shell_policy, is_network_command, is_shell_inspection_command,
+};
 
 use crate::config::{
     CustomToolDef, RuntimeConfig, WebSearchProvider, custom_tool_display_name,
@@ -482,6 +484,8 @@ pub struct ToolCallRequest {
     pub tool_call_id: String,
     pub tool_name: String,
     pub input: ToolInput,
+    /// Warnings about unsupported extra fields in the tool input (Issue #299).
+    pub extra_field_warnings: Vec<String>,
 }
 
 impl ToolCallRequest {
@@ -494,6 +498,7 @@ impl ToolCallRequest {
             tool_call_id: tool_call_id.into(),
             tool_name: tool_name.into(),
             input,
+            extra_field_warnings: Vec::new(),
         }
     }
 }
@@ -596,6 +601,7 @@ impl ValidatedToolCall {
         Ok(ToolExecutionRequest {
             tool_call_id: self.request.tool_call_id.clone(),
             spec: self.spec,
+            extra_field_warnings: self.request.extra_field_warnings.clone(),
             input: self.request.input,
         })
     }
@@ -606,6 +612,8 @@ pub struct ToolExecutionRequest {
     pub tool_call_id: String,
     pub spec: ToolSpec,
     pub input: ToolInput,
+    /// Warnings about unsupported extra fields in the tool input (Issue #299).
+    pub extra_field_warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -613,6 +621,8 @@ pub enum ToolExecutionStatus {
     Completed,
     Failed,
     Interrupted,
+    /// Policy-level block (e.g. mutation barrier when no plan is registered).
+    Blocked,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -667,6 +677,7 @@ impl ToolExecutionResult {
             ToolExecutionStatus::Completed => "completed",
             ToolExecutionStatus::Failed => "failed",
             ToolExecutionStatus::Interrupted => "interrupted",
+            ToolExecutionStatus::Blocked => "blocked",
         };
 
         ToolLogView {
@@ -1136,6 +1147,12 @@ pub fn is_sensitive_file(path: &str) -> bool {
 /// Extract context lines around the best matching location for `old_string`
 /// in `content`. Searches for the first line of `old_string` (trimmed) and
 /// returns surrounding lines with line numbers.
+///
+/// When the exact first-line match fails, falls back to token-based scoring:
+/// extracts identifier-like tokens from `old_string` and finds the content
+/// line with the highest overlap. This handles "hypothesis drift" where the
+/// model's `old_string` diverges from reality but shares key identifiers
+/// (Issue #313).
 pub fn extract_edit_context(
     content: &str,
     old_string: &str,
@@ -1147,11 +1164,19 @@ pub fn extract_edit_context(
     }
 
     let lines: Vec<&str> = content.lines().collect();
+
+    // Primary: exact first-line substring match
     let match_idx = lines
         .iter()
         .enumerate()
-        .find(|(_, line)| line.trim().contains(first_line))?
-        .0;
+        .find(|(_, line)| line.trim().contains(first_line))
+        .map(|(idx, _)| idx);
+
+    // Fallback: token-based scoring (Issue #313)
+    let match_idx = match match_idx {
+        Some(idx) => idx,
+        None => token_fallback_match(&lines, old_string)?,
+    };
 
     let start = match_idx.saturating_sub(context_lines);
     let end = (match_idx + context_lines + 1).min(lines.len());
@@ -1164,6 +1189,54 @@ pub fn extract_edit_context(
         .join("\n");
 
     Some(context)
+}
+
+/// Minimum token length for fallback matching. Short tokens like "a", "fn",
+/// "if" are too common to be useful anchors.
+const TOKEN_MIN_LEN: usize = 4;
+
+/// Minimum token score to accept a fallback match.
+/// Set to 1 because even a single specific identifier (e.g. a function name)
+/// is a strong anchor when exact first-line matching has already failed.
+const TOKEN_MIN_SCORE: usize = 1;
+
+/// Token-based fallback: extract identifier-like tokens from `old_string`,
+/// score each content line by token overlap, and return the best match index.
+fn token_fallback_match(lines: &[&str], old_string: &str) -> Option<usize> {
+    let tokens = extract_tokens(old_string);
+    if tokens.is_empty() {
+        return None;
+    }
+
+    let mut best_idx = 0usize;
+    let mut best_score = 0usize;
+
+    for (i, line) in lines.iter().enumerate() {
+        let lower = line.to_lowercase();
+        let score = tokens.iter().filter(|t| lower.contains(t.as_str())).count();
+        if score > best_score {
+            best_score = score;
+            best_idx = i;
+        }
+    }
+
+    if best_score >= TOKEN_MIN_SCORE {
+        Some(best_idx)
+    } else {
+        None
+    }
+}
+
+/// Extract identifier-like tokens from a string.
+/// Splits on non-alphanumeric/underscore boundaries, lowercases, deduplicates,
+/// and filters out tokens shorter than `TOKEN_MIN_LEN`.
+fn extract_tokens(s: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    s.split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|t| t.len() >= TOKEN_MIN_LEN)
+        .map(|t| t.to_lowercase())
+        .filter(|t| seen.insert(t.clone()))
+        .collect()
 }
 
 impl LocalToolExecutor {
@@ -1347,13 +1420,19 @@ impl LocalToolExecutor {
                 hit.content.len()
             );
             let payload = format!("{}{}", header, hit.content);
-            return Ok(build_completed_result(
+            let mut result = build_completed_result(
                 request,
                 path.to_string(),
                 ToolExecutionPayload::Text(payload),
                 vec![resolved.display().to_string()],
                 started,
-            ));
+            );
+            // Issue #299: append extra field warnings to summary (not payload).
+            if !request.extra_field_warnings.is_empty() {
+                let warnings = request.extra_field_warnings.join("; ");
+                result.summary = format!("{} [{}]", result.summary, warnings);
+            }
+            return Ok(result);
         }
         // Mutex poison → fall through to normal read (best-effort)
 
@@ -1381,13 +1460,28 @@ impl LocalToolExecutor {
             cache.record(&resolved, content.clone());
         }
 
-        Ok(build_completed_result(
+        let mut result = build_completed_result(
             request,
             path.to_string(),
             ToolExecutionPayload::Text(content),
             vec![resolved.display().to_string()],
             started,
-        ))
+        );
+
+        // Issue #299: append extra field warnings to summary (not payload).
+        if !request.extra_field_warnings.is_empty() {
+            // Sink-side defense: cap total warning text to avoid oversized
+            // prompt/log entries from unexpected sources (CB-004).
+            let warnings = request.extra_field_warnings.join("; ");
+            let capped = if warnings.len() > 256 {
+                format!("{}...", &warnings[..256])
+            } else {
+                warnings
+            };
+            result.summary = format!("{} [{}]", result.summary, capped);
+        }
+
+        Ok(result)
     }
 
     fn execute_image_read(
@@ -1779,12 +1873,24 @@ impl LocalToolExecutor {
             return ToolRuntimeError::edit_not_found(message);
         }
 
-        // Try to read file content for context extraction
+        // Try to read file content for context extraction.
+        // Scale context_lines based on file size (Issue #313):
+        // large files need more surrounding context for mid-file targets.
         let context_snippet = self
             .resolve_path(path)
             .ok()
             .and_then(|resolved| fs::read_to_string(resolved).ok())
-            .and_then(|content| extract_edit_context(&content, old_string, 5));
+            .and_then(|content| {
+                let line_count = content.lines().count();
+                let ctx_lines = if line_count > 500 {
+                    12
+                } else if line_count > 100 {
+                    8
+                } else {
+                    5
+                };
+                extract_edit_context(&content, old_string, ctx_lines)
+            });
 
         match context_snippet {
             Some(ctx) => ToolRuntimeError::edit_not_found_with_context(message, ctx),

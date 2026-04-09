@@ -442,11 +442,40 @@ fn parse_tool_call_value(
         }
     };
 
-    Ok(ToolCallRequest::new(
-        tool_call_id.to_string(),
-        resolved_name,
-        input,
-    ))
+    let mut request = ToolCallRequest::new(tool_call_id.to_string(), resolved_name, input);
+
+    // Issue #299: detect unsupported extra fields for file.read.
+    if tool_name == "file.read"
+        && let Some(obj) = value.as_object()
+    {
+        let known = ["tool", "id", "path"];
+        let max_warnings = 3;
+        let mut count = 0usize;
+        let mut extra_total = 0usize;
+        for key in obj.keys() {
+            if !known.contains(&key.as_str()) {
+                extra_total += 1;
+                if count < max_warnings {
+                    // Sanitize: truncate long names, remove control chars.
+                    let sanitized: String =
+                        key.chars().filter(|c| !c.is_control()).take(64).collect();
+                    request.extra_field_warnings.push(format!(
+                        "Note: '{}' field is not supported by file.read and was ignored",
+                        sanitized
+                    ));
+                    count += 1;
+                }
+            }
+        }
+        if extra_total > max_warnings {
+            request.extra_field_warnings.push(format!(
+                "and {} more unsupported field(s)",
+                extra_total - max_warnings
+            ));
+        }
+    }
+
+    Ok(request)
 }
 
 fn repair_tool_call_block(block: &str) -> Option<ToolCallRequest> {
@@ -802,6 +831,7 @@ const PROMPT_TOOL_RULES: &str = concat!(
     "```ANVIL_PLAN\n- [ ] src/foo.rs: description\n- [ ] src/bar.rs: description\n```\n",
     "Each item: `- [ ] <relative-path>: <description>`. Do NOT output ANVIL_FINAL until ALL items are done.\n",
     "To add items mid-task, output an ANVIL_PLAN_UPDATE block with the same format.\n",
+    "To mark items as already done (no changes needed), use [x] in ANVIL_PLAN_UPDATE: `- [x] path: reason`.\n",
     "\n",
     "After ALL tool blocks, include exactly one final block with your summary:\n",
     "```ANVIL_FINAL\n",
@@ -809,6 +839,8 @@ const PROMPT_TOOL_RULES: &str = concat!(
     "```\n",
     "\n",
     "Rules:\n",
+    "- Implementation plans MUST use the ANVIL_PLAN block format, NOT the agent.plan tool. \
+       agent.plan is for read-only exploration/investigation only.\n",
     "- All paths must be relative (start with ./ or a directory name).\n",
     "- Do not use any other tool syntax.\n",
     "- Always include ANVIL_FINAL after your tool blocks.\n",
@@ -1312,6 +1344,23 @@ fn extract_target_files(description: &str) -> Vec<String> {
         if path.is_empty() {
             continue;
         }
+        // Issue #289: Strip parenthesized annotation suffix, e.g.,
+        // "src/foo.ts (bar.ts)" → "src/foo.ts".
+        // Only strip when there is a space before the opening paren to preserve
+        // legitimate paths like "foo(1).ts".
+        let path = if let Some(pos) = path.find(" (") {
+            if path.ends_with(')') {
+                let stripped = path[..pos].trim_end();
+                if stripped.is_empty() {
+                    continue;
+                }
+                stripped
+            } else {
+                path
+            }
+        } else {
+            path
+        };
         // Security: reject paths with ".." (traversal)
         if path.contains("..") {
             continue;
@@ -1647,5 +1696,24 @@ mod tests {
             items[0].target_files,
             vec!["src/a.rs".to_string(), "src/b.rs".to_string()]
         );
+    }
+
+    // ── Issue #289: parenthesized annotation stripping ──────────────
+
+    #[test]
+    fn extract_target_files_strips_parenthesized() {
+        let desc = "src/lib/polling/auto-yes-manager.ts (auto-yes-poller.ts): change desc";
+        let files = extract_target_files(desc);
+        assert_eq!(
+            files,
+            vec!["src/lib/polling/auto-yes-manager.ts".to_string()]
+        );
+    }
+
+    #[test]
+    fn extract_target_files_preserves_non_spaced_parens() {
+        let desc = "src/foo(1).ts: change";
+        let files = extract_target_files(desc);
+        assert_eq!(files, vec!["src/foo(1).ts".to_string()]);
     }
 }

@@ -89,6 +89,21 @@ pub fn summarize_tool_names(names: &[String]) -> String {
     format_tool_counts(counts.into_iter())
 }
 
+/// Mutation tool names used for the successful-mutation check (Issue #285).
+const MUTATION_TOOL_NAMES: &[&str] = &["file.write", "file.edit", "file.edit_anchor"];
+
+/// Check whether the tool results contain at least one successful mutation
+/// (file.write / file.edit / file.edit_anchor with Completed status,
+/// not rolled back, and with an actual diff). Issue #285 A2 fix.
+pub fn results_contain_successful_mutation(results: &[ToolExecutionResult]) -> bool {
+    results.iter().any(|r| {
+        MUTATION_TOOL_NAMES.contains(&r.tool_name.as_str())
+            && r.status == ToolExecutionStatus::Completed
+            && !r.rolled_back
+            && r.diff_summary.is_some()
+    })
+}
+
 /// Maximum number of parallel threads for tool execution.
 const MAX_PARALLEL_THREADS: usize = 8;
 
@@ -469,14 +484,58 @@ impl App {
         self.reset_execution_plan();
 
         // Issue #249: Detect ANVIL_PLAN from initial response
-        self.try_register_plan(&current.raw_content);
+        // Issue #287: re-initialize stagnation_state on plan registration
+        // Issue #305: match on PlanRegistrationResult
+        match self.try_register_plan(&current.raw_content) {
+            crate::app::execution_plan::PlanRegistrationResult::Registered => {
+                let target_files: Vec<String> = self
+                    .execution_plan
+                    .items
+                    .iter()
+                    .flat_map(|i| i.target_files.iter().cloned())
+                    .collect();
+                self.stagnation_state =
+                    crate::app::stagnation_state::StagnationState::init_from_plan(&target_files);
+            }
+            crate::app::execution_plan::PlanRegistrationResult::Replan => {
+                // Replan after reset_execution_plan() should not happen here,
+                // but handle for completeness: merge new targets.
+                let existing = &self.stagnation_state.starved_target_files;
+                let new_targets: Vec<String> = self
+                    .execution_plan
+                    .items
+                    .iter()
+                    .filter(|i| !i.is_finished())
+                    .flat_map(|i| i.target_files.iter().cloned())
+                    .filter(|tf| {
+                        !existing
+                            .iter()
+                            .any(|sf| crate::contracts::ExecutionPlan::path_matches(sf, tf))
+                    })
+                    .collect();
+                self.stagnation_state
+                    .starved_target_files
+                    .extend(new_targets);
+            }
+            crate::app::execution_plan::PlanRegistrationResult::NoBlock => {}
+        }
 
         // Session note extraction bookkeeping (Issue #241)
         let msg_count_before = self.session.messages.len();
         let tokens_before = self.session.estimated_token_count();
 
+        // Issue #285: track forced_mode_active transitions for telemetry.
+        let mut prev_forced_mode_active = false;
+        // Issue #285 A2: limit NoPlan suppression at the post-tool ANVIL_FINAL gate.
+        // After one suppression, if the model still can't produce a plan, let it through.
+        let mut noplan_suppression_count: u8 = 0;
+        // Issue #303: pre-mutation plan barrier.
+        let mut mutation_barrier = super::mutation_barrier::MutationBarrier::new();
+
         for iteration in 0..max_iterations {
             let iteration_started = std::time::Instant::now();
+
+            // (prev_forced_mode_active is snapshotted from the previous iteration)
 
             // Check shutdown flag before tool execution
             if self.is_shutdown_requested() {
@@ -495,7 +554,7 @@ impl App {
 
             // Record sub-agent results first (IR3-002)
             for result in &agent_results {
-                self.record_tool_result(result);
+                self.record_tool_result(result, false);
             }
             total_tool_count += agent_results.len();
 
@@ -530,11 +589,21 @@ impl App {
             // live streaming output on stderr (Issue #1).
 
             // Execute normal tool calls and record results WITH payload
-            let (results, loop_action) = self.execute_structured_tool_calls(&current_normal)?;
+            let (results, loop_action, recovery_read_count) =
+                self.execute_structured_tool_calls(&current_normal, &mut mutation_barrier)?;
             total_tool_count += results.len();
 
             // Update plan item status from tool results; capture telemetry.
-            let (turn_mutations, turn_items_advanced) = self.update_plan_from_results(&results);
+            let (mut turn_mutations, turn_items_advanced) = self.update_plan_from_results(&results);
+            // Issue #299: count recovery reads as mutations so stagnation
+            // scoring does not inflate during recovery.
+            if recovery_read_count > 0 {
+                turn_mutations += recovery_read_count as u32;
+                tracing::debug!(
+                    recovery_read_count,
+                    "recovery reads counted as mutations for stagnation"
+                );
+            }
 
             // Issue #269 Phase 3: record each successful mutation for stagnation tracking.
             // Issue #273: Also record first mutation event telemetry here so plan-free runs
@@ -590,8 +659,23 @@ impl App {
             // Issue #173: If ANVIL_FINAL was already seen, terminate after
             // executing the current tool batch (no further LLM round-trips).
             if anvil_final_seen {
-                // Issue #249: Plan-aware ANVIL_FINAL gate — suppress if plan is incomplete
-                if self.check_plan_final_gate() {
+                // Issue #249/#285: Plan-aware ANVIL_FINAL gate — suppress if plan is incomplete.
+                // A2 fix: only require plan when session has no file changes AND
+                // the current batch contains no successful mutation.
+                // A2 fix: only suppress NoPlan when the batch contains mutation
+                // tool attempts (successful or not) but no actual persisted changes.
+                // Read-only batches (file.read only) should pass through NoPlan.
+                let batch_has_mutation_attempts = results
+                    .iter()
+                    .any(|r| MUTATION_TOOL_NAMES.contains(&r.tool_name.as_str()));
+                let is_effectively_mutation_task = batch_has_mutation_attempts
+                    && self.session_stats.files_modified.is_empty()
+                    && !results_contain_successful_mutation(&results)
+                    && noplan_suppression_count == 0;
+                if self.check_plan_final_gate_with_require(is_effectively_mutation_task) {
+                    if is_effectively_mutation_task {
+                        noplan_suppression_count += 1;
+                    }
                     tracing::info!("ANVIL_FINAL suppressed by plan gate; continuing execution");
                     anvil_final_seen = false;
                 } else if self.should_activate_guidance_retry(guidance_retry_used, &results) {
@@ -753,6 +837,11 @@ impl App {
                 guidance_chars_this_turn as u32,
                 workset_size_this_turn as u32,
             );
+            // Issue #287: record plan item completion before end_turn (for correct
+            // turns_since_plan_item_completion reset).
+            if turn_items_advanced > 0 {
+                self.stagnation_state.record_plan_item_completion();
+            }
             // Issue #269 Phase 3: stagnation end_turn hook + forced mode update.
             self.stagnation_state.end_turn(turn_mutations > 0);
             let stagnation_score =
@@ -764,6 +853,59 @@ impl App {
                     "stagnation detected; forced_mode_active=true"
                 );
             }
+
+            // Issue #285: staged stagnation recovery.
+            let remaining_turns = max_iterations.saturating_sub(iteration + 1);
+            let plan_repair_count_before_this_turn =
+                self.agent_telemetry.plan_repair_request_count as usize;
+
+            // Workset transition telemetry: record only on first activation.
+            if self.forced_mode_active && !prev_forced_mode_active {
+                self.agent_telemetry.record_forced_workset_transition();
+            }
+
+            // Plan repair request.
+            if crate::app::stagnation_state::should_request_plan_repair(
+                &self.stagnation_state,
+                plan_repair_count_before_this_turn,
+                remaining_turns,
+            ) {
+                let msg_text = crate::app::stagnation_state::build_plan_repair_message(
+                    &self.stagnation_state.starved_target_files,
+                );
+                let msg = SessionMessage::new(MessageRole::Tool, "system", msg_text)
+                    .with_id(self.next_message_id("tool"));
+                self.session.push_message(msg);
+                self.agent_telemetry.record_plan_repair_request();
+            } else {
+                // Escape hatch: plan repair was already attempted but stagnation persists.
+                if crate::app::stagnation_state::should_allow_escape_hatch(
+                    &self.stagnation_state,
+                    plan_repair_count_before_this_turn,
+                    remaining_turns,
+                ) {
+                    // Issue #309: inject structured repair turn before termination.
+                    // Give the agent one last chance to close remaining items.
+                    if !self.execution_plan.is_empty()
+                        && !self.execution_plan.is_successfully_completed()
+                    {
+                        let repair_msg = self.build_pre_exit_repair_message();
+                        let msg = SessionMessage::new(MessageRole::Tool, "system", repair_msg)
+                            .with_id(self.next_message_id("tool"));
+                        self.session.push_message(msg);
+                        tracing::info!("pre-exit repair turn injected before escape hatch");
+                    }
+                    tracing::warn!(
+                        score = stagnation_score,
+                        "stagnation escape hatch: terminating loop"
+                    );
+                    break;
+                }
+            }
+
+            // Update prev_forced_mode_active at turn end.
+            prev_forced_mode_active = self.forced_mode_active;
+
             log_turn_summary(&TurnSummary {
                 turn: self.session_stats.total_turns,
                 max_turns: max_iterations as u32,
@@ -783,8 +925,65 @@ impl App {
 
             // Issue #249: Detect ANVIL_PLAN / ANVIL_PLAN_UPDATE from follow-up responses.
             // Scan the raw token buffer since ANVIL_PLAN may be outside the ANVIL_FINAL block.
-            self.try_register_plan(&next_token_buffer);
-            self.try_update_plan(&next_token_buffer);
+            // Issue #287: re-initialize stagnation_state on plan registration
+            // Issue #305: match on PlanRegistrationResult for replan support
+            match self.try_register_plan(&next_token_buffer) {
+                crate::app::execution_plan::PlanRegistrationResult::Registered => {
+                    let target_files: Vec<String> = self
+                        .execution_plan
+                        .items
+                        .iter()
+                        .flat_map(|i| i.target_files.iter().cloned())
+                        .collect();
+                    self.stagnation_state =
+                        crate::app::stagnation_state::StagnationState::init_from_plan(
+                            &target_files,
+                        );
+                }
+                crate::app::execution_plan::PlanRegistrationResult::Replan => {
+                    // Replan: stagnation_state を差分マージ (Issue #305)
+                    let existing = &self.stagnation_state.starved_target_files;
+                    let new_targets: Vec<String> = self
+                        .execution_plan
+                        .items
+                        .iter()
+                        .filter(|i| !i.is_finished())
+                        .flat_map(|i| i.target_files.iter().cloned())
+                        .filter(|tf| {
+                            !existing
+                                .iter()
+                                .any(|sf| crate::contracts::ExecutionPlan::path_matches(sf, tf))
+                        })
+                        .collect();
+                    self.stagnation_state
+                        .starved_target_files
+                        .extend(new_targets);
+                }
+                crate::app::execution_plan::PlanRegistrationResult::NoBlock => {
+                    // ANVIL_PLAN なし → ANVIL_PLAN_UPDATE を通常処理
+                    // DR2-005: Replan 時はスキップして二重処理を防ぐ
+                    // Issue #287: merge new target_files into starved_target_files on plan update
+                    if self.try_update_plan(&next_token_buffer) {
+                        let existing = &self.stagnation_state.starved_target_files;
+                        // CB-003: only include unfinished items to avoid re-adding completed files
+                        let new_targets: Vec<String> = self
+                            .execution_plan
+                            .items
+                            .iter()
+                            .filter(|i| !i.is_finished())
+                            .flat_map(|i| i.target_files.iter().cloned())
+                            .filter(|tf| {
+                                !existing
+                                    .iter()
+                                    .any(|sf| crate::contracts::ExecutionPlan::path_matches(sf, tf))
+                            })
+                            .collect();
+                        self.stagnation_state
+                            .starved_target_files
+                            .extend(new_targets);
+                    }
+                }
+            }
 
             // Issue #173: Update ANVIL_FINAL tracking from the new response
             if next_structured.anvil_final_detected {
@@ -825,17 +1024,39 @@ impl App {
                 if let super::phase_estimator::PhaseAction::FallbackComplete =
                     self.phase_estimator.check_empty_response()
                 {
-                    tracing::info!("Phase estimator: fallback completion detected");
-                    self.record_assistant_output(
-                        self.next_message_id("assistant"),
-                        next_structured.final_response,
-                    )?;
-                    fallback_completed = true;
-                    break;
+                    // Issue #307: plan に未完了 item がある場合は break せず
+                    // Plan Gate に fallthrough して既存のガイダンス注入・ループ防止を再利用
+                    if !self.execution_plan.is_empty() && !self.execution_plan.all_finished() {
+                        tracing::info!(
+                            "Phase estimator: fallback completion suppressed \
+                             (plan incomplete, falling through to plan gate; Issue #307)"
+                        );
+                        // break しない → 後続の Plan Gate に到達する
+                    } else {
+                        tracing::info!("Phase estimator: fallback completion detected");
+                        self.record_assistant_output(
+                            self.next_message_id("assistant"),
+                            next_structured.final_response,
+                        )?;
+                        fallback_completed = true;
+                        break;
+                    }
                 }
 
-                // Issue #249: Plan gate — suppress termination if plan is incomplete
-                if self.check_plan_final_gate() {
+                // Issue #249/#285: Plan gate — suppress termination if plan is incomplete.
+                // B1 fix: require plan only when mutation tools were attempted
+                // but no files were actually modified, and we haven't already
+                // suppressed once (to avoid infinite loops for read-only tasks).
+                let session_has_mutation_attempts = MUTATION_TOOL_NAMES
+                    .iter()
+                    .any(|t| self.session_stats.tool_calls.contains_key(*t));
+                let require_plan_here = session_has_mutation_attempts
+                    && self.session_stats.files_modified.is_empty()
+                    && noplan_suppression_count == 0;
+                if self.check_plan_final_gate_with_require(require_plan_here) {
+                    if require_plan_here {
+                        noplan_suppression_count += 1;
+                    }
                     tracing::info!("Plan gate: suppressing termination with empty tool calls");
                     current = next_structured;
                     continue;
@@ -1131,10 +1352,23 @@ impl App {
         }
     }
 
+    /// Execute validated and approved tool calls from a structured response.
+    ///
+    /// Returns `(results, loop_action, recovery_read_count)` where
+    /// `recovery_read_count` is the number of recovery reads consumed
+    /// (Issue #299) for stagnation adjustment.
     pub(crate) fn execute_structured_tool_calls(
         &mut self,
         structured: &StructuredAssistantResponse,
-    ) -> Result<(Vec<ToolExecutionResult>, super::loop_detector::LoopAction), AppError> {
+        mutation_barrier: &mut super::mutation_barrier::MutationBarrier,
+    ) -> Result<
+        (
+            Vec<ToolExecutionResult>,
+            super::loop_detector::LoopAction,
+            usize,
+        ),
+        AppError,
+    > {
         // Phase 1: Validation + Approval
         let (validated_requests, mut failed_results) =
             self.validate_and_approve_all(&structured.tool_calls);
@@ -1212,14 +1446,47 @@ impl App {
             validated_requests
         };
 
+        // Phase 1.75: Pre-mutation plan barrier (Issue #303).
+        // Block mutation tools when no execution plan is registered.
+        let barrier_result =
+            mutation_barrier.check_and_filter(validated_requests, self.execution_plan.is_empty());
+        let validated_requests = barrier_result.passed_requests;
+        failed_results.extend(barrier_result.blocked_results);
+        if barrier_result.blocked_count > 0 {
+            self.agent_telemetry.record_mutation_barrier_block();
+        }
+
         // Loop detection: record each validated tool call and check for repetition (Issue #145, #172)
+        // Issue #299: recovery reads skip LoopDetector but not AlternatingLoopDetector.
         let mut worst_loop_action = super::loop_detector::LoopAction::Continue;
         for (_, req) in &validated_requests {
             if let Some((tool_name, tool_input)) = tool_input_map.get(&req.tool_call_id) {
-                // LoopDetector: same-call repetition
-                let action = self.loop_detector.record_and_check(tool_name, tool_input);
-                worst_loop_action = worst_loop_action.merge(action);
+                // Issue #299: Check if this is a recovery read (file.read with budget).
+                let recovery_path = if tool_name == "file.read" {
+                    tool_input
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                } else {
+                    None
+                };
+                let is_pre_recovery = recovery_path
+                    .as_deref()
+                    .is_some_and(|p| self.tool_recovery_budget.has_budget(p));
+
+                if is_pre_recovery {
+                    tracing::debug!(
+                        tool = %tool_name,
+                        path = ?recovery_path,
+                        "loop_detector skipped during recovery"
+                    );
+                } else {
+                    // LoopDetector: same-call repetition
+                    let action = self.loop_detector.record_and_check(tool_name, tool_input);
+                    worst_loop_action = worst_loop_action.merge(action);
+                }
                 // AlternatingLoopDetector: cyclic pattern detection (Issue #172)
+                // Always runs, even during recovery (design decision).
                 let alt_action = self
                     .alternating_loop_detector
                     .record_and_check(tool_name, tool_input);
@@ -1236,7 +1503,7 @@ impl App {
             failed_results.sort_by_key(|(idx, _)| *idx);
             let results: Vec<ToolExecutionResult> =
                 failed_results.into_iter().map(|(_, r)| r).collect();
-            return Ok((results, worst_loop_action));
+            return Ok((results, worst_loop_action, 0));
         }
 
         // For Warn/StrongWarn: create synthetic tool result to include in results
@@ -1408,18 +1675,46 @@ impl App {
         let mut results: Vec<ToolExecutionResult> = Vec::with_capacity(indexed_results.len());
         let mut phase_action = super::phase_estimator::PhaseAction::Continue;
         let mut read_transition_message: Option<String> = None;
+        let mut recovery_read_count: usize = 0;
         for (_, result) in indexed_results {
-            self.record_tool_result(&result);
-            // Phase estimator: record tool call pattern (Issue #159)
-            let success = result.status == ToolExecutionStatus::Completed;
-            let pa = self
-                .phase_estimator
-                .record_tool_call(&result.tool_name, success);
-            if !matches!(pa, super::phase_estimator::PhaseAction::Continue) {
-                phase_action = pa;
+            // Issue #299: Check if this is a recovery read and consume budget.
+            // Use the raw input path (not the resolved artifact path) so that
+            // the key matches the grant-time path (which is also relative).
+            let recovery_path_for_result = if result.tool_name == "file.read" {
+                tool_input_map
+                    .get(&result.tool_call_id)
+                    .and_then(|(_, v)| v.get("path").and_then(|p| p.as_str()))
+            } else {
+                None
+            };
+            let is_recovery = recovery_path_for_result.is_some_and(|p| {
+                self.tool_recovery_budget
+                    .should_suppress_detectors(&result.tool_name, p)
+            });
+            if is_recovery {
+                recovery_read_count += 1;
+                let remaining_info = if let Some(p) = recovery_path_for_result {
+                    if self.tool_recovery_budget.has_budget(p) {
+                        "has_remaining"
+                    } else {
+                        "exhausted"
+                    }
+                } else {
+                    "unknown"
+                };
+                tracing::debug!(
+                    tool = %result.tool_name,
+                    path = ?recovery_path_for_result,
+                    budget_status = remaining_info,
+                    "recovery read consumed"
+                );
             }
-            // Issue #265: pass shell command to read_transition_guard so
-            // grep/sed/cat are counted as exploration calls.
+
+            self.record_tool_result(&result, is_recovery);
+
+            // Issue #265/#309: extract shell command once for both guards.
+            // Issue #299: skip during recovery reads.
+            let success = result.status == ToolExecutionStatus::Completed;
             let shell_cmd: Option<String> = if result.tool_name == "shell.exec" {
                 tool_input_map
                     .get(&result.tool_call_id)
@@ -1427,13 +1722,31 @@ impl App {
             } else {
                 None
             };
-            let transition_action = self.read_transition_guard.record_tool_call_ex(
-                &result.tool_name,
-                success,
-                shell_cmd.as_deref(),
-            );
-            if let ReadTransitionAction::Inject(msg) = transition_action {
-                read_transition_message = Some(msg);
+            // Phase estimator: record tool call pattern (Issue #159)
+            // Issue #309: pass shell command so inspection counts as Read.
+            // Issue #299: skip during recovery reads.
+            if !is_recovery {
+                let pa = self.phase_estimator.record_tool_call_ex(
+                    &result.tool_name,
+                    success,
+                    shell_cmd.as_deref(),
+                );
+                if !matches!(pa, super::phase_estimator::PhaseAction::Continue) {
+                    phase_action = pa;
+                }
+            }
+            // Issue #265: pass shell command to read_transition_guard so
+            // grep/sed/cat are counted as exploration calls.
+            // Issue #299: skip during recovery reads.
+            if !is_recovery {
+                let transition_action = self.read_transition_guard.record_tool_call_ex(
+                    &result.tool_name,
+                    success,
+                    shell_cmd.as_deref(),
+                );
+                if let ReadTransitionAction::Inject(msg) = transition_action {
+                    read_transition_message = Some(msg);
+                }
             }
 
             // Emit folded tool result to stderr for interactive sessions
@@ -1463,7 +1776,9 @@ impl App {
             {
                 let status_str = match result.status {
                     ToolExecutionStatus::Completed => "completed",
-                    ToolExecutionStatus::Failed | ToolExecutionStatus::Interrupted => "failed",
+                    ToolExecutionStatus::Failed
+                    | ToolExecutionStatus::Interrupted
+                    | ToolExecutionStatus::Blocked => "failed",
                 };
                 let event = crate::hooks::PostToolUseEvent {
                     hook_point: "PostToolUse",
@@ -1485,7 +1800,7 @@ impl App {
 
         // Append synthetic loop detection warning if present
         if let Some(warning_result) = synthetic_warning {
-            self.record_tool_result(&warning_result);
+            self.record_tool_result(&warning_result, false);
             results.push(warning_result);
         }
 
@@ -1502,7 +1817,7 @@ impl App {
                 edit_detail: None,
                 rolled_back: false,
             };
-            self.record_tool_result(&transition_result);
+            self.record_tool_result(&transition_result, false);
             results.push(transition_result);
         }
 
@@ -1532,17 +1847,17 @@ impl App {
                     edit_detail: None,
                     rolled_back: false,
                 };
-                self.record_tool_result(&transition_result);
+                self.record_tool_result(&transition_result, false);
                 results.push(transition_result);
             }
         }
 
         self.persist_session(crate::contracts::AppEvent::SessionSaved)?;
-        Ok((results, worst_loop_action))
+        Ok((results, worst_loop_action, recovery_read_count))
     }
 
     /// Push a tool execution result into the session as a tool message.
-    fn record_tool_result(&mut self, result: &ToolExecutionResult) {
+    fn record_tool_result(&mut self, result: &ToolExecutionResult, is_recovery: bool) {
         // Session stats: record tool call (Issue #206 C-3)
         self.session_stats.record_tool_call(&result.tool_name);
 
@@ -1597,13 +1912,37 @@ impl App {
         }
 
         // Edit fail tracker: track consecutive file.edit/file.edit_anchor failures (Issue #143, #158)
+        // Issue #303: exclude barrier-blocked results from edit_fail_tracker.
         let mut edit_hint: Option<String> = None;
-        if result.tool_name == "file.edit" || result.tool_name == "file.edit_anchor" {
+        let is_barrier_blocked = result.summary.starts_with("[plan_barrier]");
+        if !is_barrier_blocked
+            && (result.tool_name == "file.edit" || result.tool_name == "file.edit_anchor")
+        {
             if result.status == ToolExecutionStatus::Failed {
                 if let Some(raw_path) = extract_edit_path_from_summary(&result.summary) {
                     let path = resolve_edit_tracker_path(&raw_path);
                     let action = self.edit_fail_tracker.record_failure(&path);
                     let count = self.edit_fail_tracker.failure_count(&path);
+                    // Issue #299: grant recovery budget only for exact-match
+                    // mismatch failures (old_string not found).  IO errors,
+                    // permission failures, etc. are not recoverable by re-reading.
+                    let is_exact_match_failure = result.summary.contains("not found");
+                    if is_exact_match_failure {
+                        self.tool_recovery_budget.grant(&path);
+                        tracing::info!(
+                            path = %path,
+                            budget = self.config.runtime.edit_recovery_read_budget,
+                            "recovery budget granted"
+                        );
+                    }
+                    // Issue #313: detect whether the error payload already
+                    // contains mid-file context (from extract_edit_context).
+                    // If so, guide the model to use it instead of a generic
+                    // full-file read that truncates mid-file content.
+                    let has_inline_context = matches!(
+                        &result.payload,
+                        ToolExecutionPayload::Text(t) if t.contains("--- File context")
+                    );
                     match action {
                         crate::app::edit_fail_tracker::EditFallbackAction::Continue => {}
                         crate::app::edit_fail_tracker::EditFallbackAction::ReRead => {
@@ -1613,11 +1952,22 @@ impl App {
                                 count = count,
                                 "repeated tool failure"
                             );
-                            edit_hint = Some(format!(
-                                "\n\n[Anvil hint] file.edit has failed {count} consecutive \
-                                 times for '{path}'. Use file.read to get the current file \
-                                 content, then retry file.edit with the correct old_string."
-                            ));
+                            edit_hint = if has_inline_context {
+                                Some(format!(
+                                    "\n\n[Anvil hint] file.edit has failed {count} consecutive \
+                                     times for '{path}'. The file context above shows the actual \
+                                     content with line numbers — use it to correct your old_string. \
+                                     If you need more surrounding lines, use file.read with the \
+                                     offset shown in the context (e.g. file.read path offset=N \
+                                     limit=50)."
+                                ))
+                            } else {
+                                Some(format!(
+                                    "\n\n[Anvil hint] file.edit has failed {count} consecutive \
+                                     times for '{path}'. Use file.read to get the current file \
+                                     content, then retry file.edit with the correct old_string."
+                                ))
+                            };
                         }
                         crate::app::edit_fail_tracker::EditFallbackAction::WriteFallback => {
                             tracing::warn!(
@@ -1639,13 +1989,20 @@ impl App {
                             let line_count_check_failed = max_lines > 0 && line_count.is_none();
 
                             if is_large || line_count_check_failed {
-                                edit_hint = Some(format!(
-                                    "\n\n[Anvil hint] file.edit has failed {count} consecutive \
-                                     times for '{path}'. file.write is not available or could not be \
-                                     safely validated for this path. Instead: \
+                                let ctx_guidance = if has_inline_context {
+                                    "Check the file context above for actual line numbers. \
+                                     Use file.read with offset to get the target section, then \
+                                     retry file.edit with a smaller, precise old_string."
+                                } else {
+                                    "Instead: \
                                      (1) Use file.read to get the current content. \
                                      (2) Identify the exact section to change. \
                                      (3) Retry file.edit with a smaller, precise old_string."
+                                };
+                                edit_hint = Some(format!(
+                                    "\n\n[Anvil hint] file.edit has failed {count} consecutive \
+                                     times for '{path}'. file.write is not available or could not be \
+                                     safely validated for this path. {ctx_guidance}"
                                 ));
                             } else {
                                 edit_hint = Some(format!(
@@ -1664,6 +2021,12 @@ impl App {
                     let path_str = resolve_edit_tracker_path(artifact);
                     self.edit_fail_tracker.record_success(&path_str);
                     self.write_repeat_tracker.reset_for_path(&path_str);
+                    // Issue #299: clear recovery budget on edit success.
+                    self.tool_recovery_budget.clear(&path_str);
+                    tracing::info!(
+                        path = %path_str,
+                        "recovery budget cleared on success"
+                    );
                 }
             }
         }
@@ -1681,8 +2044,10 @@ impl App {
         let write_hint = self.update_write_trackers(result);
 
         // Read repeat tracker: track repeated file.read calls (Issue #185)
+        // Issue #299: skip during recovery reads to avoid false warnings.
         let mut read_hint: Option<String> = None;
-        if result.tool_name == "file.read"
+        if !is_recovery
+            && result.tool_name == "file.read"
             && result.status == ToolExecutionStatus::Completed
             && let Some(path) = result.artifacts.first()
         {
@@ -2221,7 +2586,9 @@ pub fn format_tool_result_message(result: &ToolExecutionResult, max_chars: usize
         ToolExecutionPayload::Text(content) => {
             let head_pct = match &result.status {
                 ToolExecutionStatus::Completed => 80,
-                ToolExecutionStatus::Failed | ToolExecutionStatus::Interrupted => 20,
+                ToolExecutionStatus::Failed
+                | ToolExecutionStatus::Interrupted
+                | ToolExecutionStatus::Blocked => 20,
             };
             let truncated = truncate_with_head_tail(content, max_chars, head_pct);
             if result.tool_name == "file.read"

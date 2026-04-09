@@ -109,6 +109,18 @@ impl StagnationState {
         }
     }
 
+    /// Remove retired files from `starved_target_files` (Issue #301).
+    ///
+    /// SRP: this method only removes from the starved list.
+    /// The caller is responsible for invoking `record_plan_item_completion()` separately.
+    pub fn retire_target_files(&mut self, retired_files: &[String]) {
+        self.starved_target_files.retain(|f| {
+            !retired_files
+                .iter()
+                .any(|rf| ExecutionPlan::path_matches(f, rf))
+        });
+    }
+
     /// Record a plan item completion.
     pub fn record_plan_item_completion(&mut self) {
         self.had_plan_item_completion_this_turn = true;
@@ -179,20 +191,44 @@ pub fn compute_stagnation_score(state: &StagnationState) -> usize {
 
 /// ANVIL_PLAN_UPDATE request conditions.
 ///
-/// Returns `true` when all four conditions are met:
-/// - stagnation score >= 2
-/// - starved target files >= 2
-/// - plan_repair_request_count < 2 (limit)
-/// - remaining_turns >= 5
+/// Fires on any of three paths:
+/// 1. **normal**: score >= 2, starved >= 2, count < 2, remaining >= 5
+/// 2. **severe** (Issue #287): score >= 3, mutation_drought >= 5, starved non-empty,
+///    count < 2, remaining >= 1
+/// 3. **orphan mutation** (Issue #287 follow-up): plan stalled >= 5 turns BUT mutations
+///    are recent (< 3 turns), workset stuck >= 3, starved non-empty — catches the case
+///    where LLM edits non-target files (e.g. relocated/renamed implementation path).
 pub fn should_request_plan_repair(
     state: &StagnationState,
     plan_repair_request_count: usize,
     remaining_turns: usize,
 ) -> bool {
-    compute_stagnation_score(state) >= 2
+    let score = compute_stagnation_score(state);
+
+    let normal_condition = score >= 2
         && state.starved_target_files.len() >= 2
         && plan_repair_request_count < 2
-        && remaining_turns >= 5
+        && remaining_turns >= 5;
+
+    // Issue #287: severe condition fires even at remaining=1 (final gate hang recovery)
+    let severe_condition = score >= 3
+        && state.turns_since_last_mutation >= 5
+        && !state.starved_target_files.is_empty()
+        && plan_repair_request_count < 2
+        && remaining_turns >= 1;
+
+    // Issue #287 follow-up: orphan mutation condition — mutations happen but plan items
+    // don't advance because LLM implemented to a different path than planned
+    // (e.g. plan targets "auto-yes-manager.ts" but edits go to "auto-yes-poller.ts").
+    // In this case turns_since_last_mutation stays low so severe_condition never fires.
+    let orphan_mutation_condition = state.turns_since_plan_item_completion >= 5
+        && state.turns_since_last_mutation < 3
+        && state.same_workset_turns >= 3
+        && !state.starved_target_files.is_empty()
+        && plan_repair_request_count < 2
+        && remaining_turns >= 1;
+
+    normal_condition || severe_condition || orphan_mutation_condition
 }
 
 // ---------------------------------------------------------------------------
@@ -409,4 +445,39 @@ pub fn build_plan_repair_message(starved_target_files: &[String]) -> String {
          - Do NOT re-add completed items\n\
          - Add only concrete mutation actions (file.edit / file.write)"
     )
+}
+
+/// Escape hatch: allow forced loop termination when stagnation is severe
+/// and recovery attempts have been exhausted (Issue #285).
+///
+/// Fires on either of two paths:
+/// 1. **base + drought/stall**: score >= 3, repair attempted, remaining <= 10,
+///    AND (mutation_drought >= 8 OR plan_stall >= 10)
+/// 2. **orphan escape**: score >= 2, repair attempted, remaining <= 10,
+///    plan_item_completion stalled >= 8, but mutations ARE recent (< 3 turns)
+///    — catches the case where LLM edits non-target files indefinitely.
+pub fn should_allow_escape_hatch(
+    state: &StagnationState,
+    plan_repair_request_count: usize,
+    remaining_turns: usize,
+) -> bool {
+    let score = compute_stagnation_score(state);
+
+    let base = score >= 3 && plan_repair_request_count >= 1 && remaining_turns <= 10;
+
+    let mutation_drought = state.turns_since_last_mutation >= 8;
+    // Issue #287: plan stall as alternative escape condition
+    let plan_stall = state.turns_since_plan_item_completion >= 10;
+
+    // Issue #287 follow-up: orphan mutation escape — plan repair was attempted but
+    // mutations still go to non-target files. Lower score threshold since mutations
+    // prevent the score from reaching 3 (mutation drought +1 never triggers).
+    let orphan_escape = score >= 2
+        && plan_repair_request_count >= 1
+        && state.turns_since_plan_item_completion >= 8
+        && state.turns_since_last_mutation < 3
+        && !state.starved_target_files.is_empty()
+        && remaining_turns <= 10;
+
+    (base && (mutation_drought || plan_stall)) || orphan_escape
 }

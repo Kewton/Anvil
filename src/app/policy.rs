@@ -60,6 +60,7 @@ mod tests {
             tool_call_id: "call_1".to_string(),
             tool_name: tool_name.to_string(),
             input,
+            extra_field_warnings: vec![],
         }
     }
 
