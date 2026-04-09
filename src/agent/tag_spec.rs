@@ -83,6 +83,12 @@ pub const TOOL_TAG_SPECS: &[ToolTagSpec] = &[
         child_elements: &["content"],
         example: r#"<tool name="file.rewrite" path="./src/main.rs" start_line="10" end_line="15"><content>replacement lines here</content></tool>"#,
     },
+    ToolTagSpec {
+        name: "agent.fix_slice",
+        attributes: &["target_path", "max_lines"],
+        child_elements: &["goal"],
+        example: r#"<tool name="agent.fix_slice" target_path="./src/main.rs" max_lines="50"><goal>Fix the compilation error in function foo</goal></tool>"#,
+    },
 ];
 
 /// ツール名からスペックを検索

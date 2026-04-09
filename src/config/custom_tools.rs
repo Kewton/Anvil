@@ -19,6 +19,7 @@ const BUILTIN_TOOL_NAMES: &[&str] = &[
     "web.search",
     "agent.explore",
     "agent.plan",
+    "agent.fix_slice",
     "git.status",
     "git.diff",
     "git.log",

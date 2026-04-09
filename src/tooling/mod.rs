@@ -102,6 +102,7 @@ pub enum ToolKind {
     Mcp,
     AgentExplore,
     AgentPlan,
+    AgentFixSlice,
     GitStatus,
     GitDiff,
     GitLog,
@@ -189,6 +190,12 @@ pub enum ToolInput {
         end_line: u32,
         content: String,
     },
+    /// Microtask fix-slice sub-agent (Issue #291).
+    AgentFixSlice {
+        target_path: String,
+        goal: String,
+        max_lines: u32,
+    },
 }
 
 impl ToolInput {
@@ -209,6 +216,7 @@ impl ToolInput {
             Self::GitLog { .. } => ToolKind::GitLog,
             Self::FileEditAnchor { .. } => ToolKind::FileEditAnchor,
             Self::FileRewrite { .. } => ToolKind::FileRewrite,
+            Self::AgentFixSlice { .. } => ToolKind::AgentFixSlice,
         }
     }
 
@@ -387,6 +395,31 @@ impl ToolInput {
                     },
                 })
             }
+            "agent.fix_slice" => {
+                let target_path = value
+                    .get("target_path")
+                    .and_then(serde_json::Value::as_str)
+                    .map(String::from)
+                    .ok_or_else(|| {
+                        "missing target_path in agent.fix_slice tool block".to_string()
+                    })?;
+                let goal = value
+                    .get("goal")
+                    .and_then(serde_json::Value::as_str)
+                    .map(String::from)
+                    .ok_or_else(|| "missing goal in agent.fix_slice tool block".to_string())?;
+                let max_lines = match value.get("max_lines").and_then(serde_json::Value::as_u64) {
+                    Some(v) => u32::try_from(v).map_err(|_| {
+                        format!("max_lines value {v} exceeds u32 range in agent.fix_slice")
+                    })?,
+                    None => 50,
+                };
+                Ok(ToolInput::AgentFixSlice {
+                    target_path,
+                    goal,
+                    max_lines,
+                })
+            }
             "file.rewrite" => {
                 let path = value
                     .get("path")
@@ -492,6 +525,18 @@ impl ToolInput {
                 prompt: extract_simple(block, "prompt")?,
                 scope: extract_simple(block, "scope"),
             }),
+            "agent.fix_slice" => {
+                let target_path = extract_simple(block, "target_path")?;
+                let goal = extract_simple(block, "goal")?;
+                let max_lines = extract_simple(block, "max_lines")
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .unwrap_or(50);
+                Some(ToolInput::AgentFixSlice {
+                    target_path,
+                    goal,
+                    max_lines,
+                })
+            }
             "git.status" => Some(ToolInput::GitStatus {}),
             "git.diff" => Some(ToolInput::GitDiff {
                 path: extract_simple(block, "path"),
@@ -979,6 +1024,25 @@ impl ToolRegistry {
         self.register_git_status();
     }
 
+    /// Register the agent.fix_slice tool (Issue #291).
+    pub fn register_agent_fix_slice(&mut self) {
+        self.register(ToolSpec {
+            version: 1,
+            name: "agent.fix_slice".to_string(),
+            kind: ToolKind::AgentFixSlice,
+            execution_class: ExecutionClass::Mutating,
+            permission_class: PermissionClass::Confirm,
+            execution_mode: ExecutionMode::SequentialOnly,
+            plan_mode: PlanModePolicy::Allowed,
+            rollback_policy: RollbackPolicy::None,
+        });
+    }
+
+    /// Register the subset of tools available to the FixSlice sub-agent (Issue #291).
+    pub fn register_fixslice_tools(&mut self) {
+        self.register_file_read();
+    }
+
     pub fn register_standard_tools(&mut self) {
         self.register_file_read();
         self.register_file_write();
@@ -1440,7 +1504,9 @@ impl LocalToolExecutor {
                 ref content,
             } => self.execute_file_rewrite(&request, path, start_line, end_line, content, started),
             ToolInput::Mcp { .. } => unreachable!("MCP tools are dispatched in agentic.rs"),
-            ToolInput::AgentExplore { .. } | ToolInput::AgentPlan { .. } => {
+            ToolInput::AgentExplore { .. }
+            | ToolInput::AgentPlan { .. }
+            | ToolInput::AgentFixSlice { .. } => {
                 unreachable!("agent tools are dispatched in agentic.rs")
             }
         };
@@ -2983,6 +3049,48 @@ fn validate_required_fields(input: &ToolInput) -> Result<(), ToolValidationError
                         "prompt length {} exceeds maximum of {} characters",
                         prompt.len(),
                         MAX_PROMPT_LENGTH
+                    ),
+                });
+            }
+        }
+        ToolInput::AgentFixSlice {
+            target_path,
+            goal,
+            max_lines,
+        } => {
+            if target_path.trim().is_empty() {
+                return Err(ToolValidationError::MissingRequiredField(
+                    "target_path".to_string(),
+                ));
+            }
+            if target_path.chars().any(|c| c.is_control()) {
+                return Err(ToolValidationError::InvalidFieldValue {
+                    field: "target_path".to_string(),
+                    reason: "target_path must not contain control characters".to_string(),
+                });
+            }
+            if goal.trim().is_empty() {
+                return Err(ToolValidationError::MissingRequiredField(
+                    "goal".to_string(),
+                ));
+            }
+            const MAX_GOAL_LENGTH: usize = 10000;
+            if goal.len() > MAX_GOAL_LENGTH {
+                return Err(ToolValidationError::InvalidFieldValue {
+                    field: "goal".to_string(),
+                    reason: format!(
+                        "goal length {} exceeds maximum of {} characters",
+                        goal.len(),
+                        MAX_GOAL_LENGTH
+                    ),
+                });
+            }
+            if *max_lines < 1 || *max_lines > crate::agent::subagent::MAX_FIXSLICE_LINES {
+                return Err(ToolValidationError::InvalidFieldValue {
+                    field: "max_lines".to_string(),
+                    reason: format!(
+                        "max_lines must be between 1 and {}",
+                        crate::agent::subagent::MAX_FIXSLICE_LINES
                     ),
                 });
             }
