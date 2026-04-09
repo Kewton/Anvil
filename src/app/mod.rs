@@ -7,7 +7,7 @@ pub mod agentic;
 pub mod alternating_loop_detector;
 pub mod cli;
 mod context;
-pub(crate) mod edit_fail_tracker;
+pub mod edit_fail_tracker;
 pub(crate) mod execution_plan;
 pub mod loop_detector;
 pub mod mock;
@@ -573,6 +573,7 @@ impl App {
         let read_transition_reinject_interval = config.runtime.read_transition_reinject_interval;
         let edit_reread_threshold = config.runtime.edit_reread_threshold;
         let edit_write_fallback_threshold = config.runtime.edit_write_fallback_threshold;
+        let edit_fixslice_threshold = config.runtime.edit_fixslice_threshold;
         let read_repeat_warn = config.runtime.read_repeat_warn_threshold;
         let read_repeat_strong_warn = config.runtime.read_repeat_strong_warn_threshold;
         let edit_recovery_read_budget = config.runtime.edit_recovery_read_budget;
@@ -608,6 +609,7 @@ impl App {
             edit_fail_tracker: edit_fail_tracker::EditFailTracker::new(
                 edit_reread_threshold,
                 edit_write_fallback_threshold,
+                edit_fixslice_threshold,
             ),
             phase_estimator: phase_estimator::PhaseEstimator::new(
                 phase_explore,
@@ -967,6 +969,7 @@ impl App {
                 no_op_mutation_count = tel.no_op_mutation_count,
                 rolled_back_mutation_count = tel.rolled_back_mutation_count,
                 initial_plan_miss_count = tel.initial_plan_miss_count,
+                fixslice_escalation_count = tel.fixslice_escalation_count,
                 "agent telemetry"
             );
         }

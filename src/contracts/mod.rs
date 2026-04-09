@@ -278,6 +278,10 @@ pub struct AgentTelemetry {
     /// None if no mutation occurred during the session.
     #[serde(default)]
     pub first_mutation_event_tool: Option<String>,
+
+    /// Number of times fix_slice escalation was triggered (Issue #321).
+    #[serde(default)]
+    pub fixslice_escalation_count: u32,
 }
 
 impl AgentTelemetry {
@@ -371,6 +375,11 @@ impl AgentTelemetry {
     /// Record an ANVIL_FINAL suppression with remaining core targets.
     pub fn record_final_suppressed_with_remaining_targets(&mut self) {
         self.final_suppressed_with_remaining_targets_count += 1;
+    }
+
+    /// Record a fix_slice escalation event (Issue #321).
+    pub fn record_fixslice_escalation(&mut self) {
+        self.fixslice_escalation_count += 1;
     }
 
     /// Threshold: mutations after this turn are considered "late".

@@ -2160,6 +2160,23 @@ impl App {
                                 ));
                             }
                         }
+                        crate::app::edit_fail_tracker::EditFallbackAction::FixSliceEscalation => {
+                            tracing::warn!(
+                                tool = "file.edit",
+                                path = %path,
+                                count = count,
+                                "fixslice_escalation_triggered"
+                            );
+                            self.agent_telemetry.record_fixslice_escalation();
+                            edit_hint = Some(format!(
+                                "\n\n[Anvil ESCALATION] file.edit has failed {count} consecutive \
+                                 times for '{path}'. You MUST use agent.fix_slice to repair this \
+                                 file. Call agent.fix_slice with target_path=\"{path}\" and a goal \
+                                 describing what needs to be changed. The fix_slice worker will \
+                                 read the file, produce a bounded replacement, and apply it. \
+                                 Do NOT retry file.edit on this path — use agent.fix_slice now."
+                            ));
+                        }
                     }
                 }
             } else if result.status == ToolExecutionStatus::Completed {
