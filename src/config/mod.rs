@@ -183,6 +183,9 @@ pub struct RuntimeConfig {
     pub edit_reread_threshold: u32,
     /// Consecutive edit failures before write fallback hint (Issue #158).
     pub edit_write_fallback_threshold: u32,
+    /// Consecutive edit failures before agent.fix_slice escalation (Issue #321).
+    /// 0 = disabled.
+    pub edit_fixslice_threshold: u32,
     /// Maximum line count for file.write on existing files (0 = disabled, Issue #156).
     pub safe_write_max_lines: usize,
     /// Deletion ratio threshold for diff warning (0.0-1.0, Issue #156).
@@ -379,6 +382,7 @@ impl EffectiveConfig {
                 edit_strategy: crate::app::edit_fail_tracker::EditStrategy::EditFirst,
                 edit_reread_threshold: 3,
                 edit_write_fallback_threshold: 5,
+                edit_fixslice_threshold: 7,
                 safe_write_max_lines: 500,
                 safe_write_deletion_ratio: 0.5,
                 read_repeat_warn_threshold: 3,
@@ -863,6 +867,15 @@ impl EffectiveConfig {
                     }
                     self.runtime.edit_write_fallback_threshold = v;
                 }
+                "edit_fixslice_threshold" | "ANVIL_EDIT_FIXSLICE_THRESHOLD" => {
+                    let v: u32 = value
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                    if v > 20 {
+                        return Err(ConfigError::InvalidNumericValue(value.clone()));
+                    }
+                    self.runtime.edit_fixslice_threshold = v;
+                }
                 "edit_recovery_read_budget" | "ANVIL_EDIT_RECOVERY_READ_BUDGET" => {
                     let v: u32 = value
                         .parse()
@@ -1159,6 +1172,15 @@ impl EffectiveConfig {
         // Ensure write_fallback > reread
         if self.runtime.edit_write_fallback_threshold <= self.runtime.edit_reread_threshold {
             self.runtime.edit_write_fallback_threshold = self.runtime.edit_reread_threshold + 2;
+        }
+        // Issue #321: clamp fixslice threshold (0 = disabled, otherwise must be > write_fallback)
+        if self.runtime.edit_fixslice_threshold > 0 {
+            self.runtime.edit_fixslice_threshold =
+                self.runtime.edit_fixslice_threshold.clamp(1, 20);
+            if self.runtime.edit_fixslice_threshold <= self.runtime.edit_write_fallback_threshold {
+                self.runtime.edit_fixslice_threshold =
+                    self.runtime.edit_write_fallback_threshold + 2;
+            }
         }
         self.runtime.edit_recovery_read_budget =
             self.runtime.edit_recovery_read_budget.clamp(1, 10);
@@ -1520,6 +1542,7 @@ impl std::fmt::Debug for RuntimeConfig {
                 "edit_write_fallback_threshold",
                 &self.edit_write_fallback_threshold,
             )
+            .field("edit_fixslice_threshold", &self.edit_fixslice_threshold)
             .field("safe_write_max_lines", &self.safe_write_max_lines)
             .field("safe_write_deletion_ratio", &self.safe_write_deletion_ratio)
             .field("edit_recovery_read_budget", &self.edit_recovery_read_budget)
