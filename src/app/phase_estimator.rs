@@ -118,7 +118,28 @@ impl PhaseEstimator {
     /// Returns `Continue` or `ForceTransition`. Never returns `FallbackComplete`
     /// (use [`check_empty_response`] for that).
     pub fn record_tool_call(&mut self, tool_name: &str, success: bool) -> PhaseAction {
-        match classify_tool(tool_name) {
+        self.record_tool_call_ex(tool_name, success, None)
+    }
+
+    /// Record a tool call with optional shell command context (Issue #309).
+    ///
+    /// When `shell_command` is `Some` and the command is an inspection operation
+    /// (grep/sed/cat/head/tail/commandindexdev/find/…), it counts as a `Read`
+    /// instead of `Other`, integrating shell-based inspection into phase guidance.
+    pub fn record_tool_call_ex(
+        &mut self,
+        tool_name: &str,
+        success: bool,
+        shell_command: Option<&str>,
+    ) -> PhaseAction {
+        let category = if tool_name == "shell.exec"
+            && shell_command.is_some_and(crate::tooling::shell_policy::is_shell_inspection_command)
+        {
+            ToolCategory::Read
+        } else {
+            classify_tool(tool_name)
+        };
+        match category {
             ToolCategory::Read => {
                 self.consecutive_reads += 1;
                 if self.consecutive_reads >= self.force_transition_threshold {
@@ -370,5 +391,40 @@ mod tests {
             let action = est.record_tool_call("file.read", true);
             assert_ne!(action, PhaseAction::FallbackComplete);
         }
+    }
+
+    // --- Issue #309: record_tool_call_ex shell inspection integration ---
+
+    #[test]
+    fn shell_exec_grep_counts_as_read_via_ex() {
+        let mut est = default_estimator();
+        est.record_tool_call_ex("shell.exec", true, Some("grep -n pattern src/main.rs"));
+        assert_eq!(est.consecutive_reads, 1);
+    }
+
+    #[test]
+    fn shell_exec_commandindexdev_counts_as_read_via_ex() {
+        let mut est = default_estimator();
+        est.record_tool_call_ex(
+            "shell.exec",
+            true,
+            Some("commandindexdev before-change src/lib.ts --format llm"),
+        );
+        assert_eq!(est.consecutive_reads, 1);
+    }
+
+    #[test]
+    fn shell_exec_non_inspection_stays_other_via_ex() {
+        let mut est = default_estimator();
+        est.record_tool_call_ex("shell.exec", true, Some("cargo build"));
+        assert_eq!(est.consecutive_reads, 0);
+        assert!(!est.has_written);
+    }
+
+    #[test]
+    fn shell_exec_without_command_stays_other_via_ex() {
+        let mut est = default_estimator();
+        est.record_tool_call_ex("shell.exec", true, None);
+        assert_eq!(est.consecutive_reads, 0);
     }
 }

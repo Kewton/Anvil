@@ -113,6 +113,25 @@ const NETWORK_COMMAND_PREFIXES: &[&str] = &[
 const FILE_READ_COMMAND_PREFIXES: &[&str] =
     &["grep", "sed", "cat", "head", "tail", "awk", "less", "more"];
 
+/// Repo-inspection command prefixes (Issue #309).
+///
+/// Commands that inspect repository state or file contents without modifying them.
+/// These are broader than `FILE_READ_COMMAND_PREFIXES` and include tool-specific
+/// commands like `commandindexdev before-change` that LLMs use for code inspection.
+const REPO_INSPECTION_COMMAND_PREFIXES: &[&str] = &[
+    "commandindexdev",
+    "find",
+    "wc",
+    "diff",
+    "file",
+    "stat",
+    "tree",
+    "rg",
+    "fd",
+    "ag",
+    "ack",
+];
+
 /// Returns `true` if the shell command is primarily a file-reading operation
 /// (e.g. `grep`, `sed -n`, `cat`) that could bypass the read transition guard.
 ///
@@ -127,6 +146,26 @@ pub fn is_file_read_shell_command(command: &str) -> bool {
     let lower = trimmed.to_ascii_lowercase();
     let first_cmd = extract_first_command(&lower);
     FILE_READ_COMMAND_PREFIXES.contains(&first_cmd)
+}
+
+/// Returns `true` if the shell command is an inspection/exploration operation
+/// (Issue #309).
+///
+/// This is a superset of [`is_file_read_shell_command`]: it additionally covers
+/// repo-inspection tools like `commandindexdev`, `find`, `rg`, `diff`, etc.
+/// Used by `PhaseEstimator` and stagnation scoring to prevent shell-based
+/// inspection from living in a guidance blind spot.
+pub fn is_shell_inspection_command(command: &str) -> bool {
+    if is_file_read_shell_command(command) {
+        return true;
+    }
+    let trimmed = command.trim();
+    if contains_injection_vectors(trimmed) {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let first_cmd = extract_first_command(&lower);
+    REPO_INSPECTION_COMMAND_PREFIXES.contains(&first_cmd)
 }
 
 /// Classify a shell command into a [`ShellPolicy`] category.
@@ -692,5 +731,73 @@ mod tests {
     #[test]
     fn file_read_absolute_path_cat() {
         assert!(is_file_read_shell_command("/usr/bin/cat src/main.rs"));
+    }
+
+    // --- is_shell_inspection_command tests (Issue #309) ---
+
+    #[test]
+    fn shell_inspection_includes_file_reads() {
+        // All file read commands are also inspection commands
+        assert!(is_shell_inspection_command("grep -n pattern src/main.rs"));
+        assert!(is_shell_inspection_command("cat src/main.rs"));
+        assert!(is_shell_inspection_command("head -50 src/main.rs"));
+    }
+
+    #[test]
+    fn shell_inspection_commandindexdev() {
+        assert!(is_shell_inspection_command(
+            "commandindexdev before-change src/lib.ts --format llm"
+        ));
+    }
+
+    #[test]
+    fn shell_inspection_find() {
+        assert!(is_shell_inspection_command("find . -name '*.rs'"));
+    }
+
+    #[test]
+    fn shell_inspection_wc() {
+        assert!(is_shell_inspection_command("wc -l src/main.rs"));
+    }
+
+    #[test]
+    fn shell_inspection_diff() {
+        assert!(is_shell_inspection_command("diff src/a.rs src/b.rs"));
+    }
+
+    #[test]
+    fn shell_inspection_rg() {
+        assert!(is_shell_inspection_command("rg TODO src/"));
+    }
+
+    #[test]
+    fn shell_inspection_fd() {
+        assert!(is_shell_inspection_command("fd --extension rs"));
+    }
+
+    #[test]
+    fn shell_inspection_tree() {
+        assert!(is_shell_inspection_command("tree src/"));
+    }
+
+    #[test]
+    fn shell_inspection_not_cargo() {
+        assert!(!is_shell_inspection_command("cargo test"));
+    }
+
+    #[test]
+    fn shell_inspection_not_npm() {
+        assert!(!is_shell_inspection_command("npm install"));
+    }
+
+    #[test]
+    fn shell_inspection_rejects_pipe() {
+        assert!(!is_shell_inspection_command("find . | grep pattern"));
+    }
+
+    #[test]
+    fn shell_inspection_case_insensitive() {
+        assert!(is_shell_inspection_command("FIND . -name '*.rs'"));
+        assert!(is_shell_inspection_command("RG TODO src/"));
     }
 }

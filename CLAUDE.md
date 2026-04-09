@@ -174,6 +174,7 @@ tests/
 ├── plan_item_retire.rs  # stale plan item retire テスト（Issue #301）
 ├── followup_replan.rs   # follow-up ANVIL_PLAN replan テスト（Issue #305）
 ├── prose_retire_fallback.rs # prose-only確認のplan retire変換テスト（Issue #307）
+├── shell_inspection_drift.rs # shell.exec inspection drift テスト（Issue #309）
 └── walk_system.rs       # ディレクトリウォーカーテスト
 ```
 

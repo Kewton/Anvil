@@ -9,7 +9,9 @@ pub mod file_cache;
 pub mod progress;
 pub mod shell_policy;
 
-pub use shell_policy::{ShellPolicy, classify_shell_policy, is_network_command};
+pub use shell_policy::{
+    ShellPolicy, classify_shell_policy, is_network_command, is_shell_inspection_command,
+};
 
 use crate::config::{
     CustomToolDef, RuntimeConfig, WebSearchProvider, custom_tool_display_name,

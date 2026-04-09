@@ -884,6 +884,17 @@ impl App {
                     plan_repair_count_before_this_turn,
                     remaining_turns,
                 ) {
+                    // Issue #309: inject structured repair turn before termination.
+                    // Give the agent one last chance to close remaining items.
+                    if !self.execution_plan.is_empty()
+                        && !self.execution_plan.is_successfully_completed()
+                    {
+                        let repair_msg = self.build_pre_exit_repair_message();
+                        let msg = SessionMessage::new(MessageRole::Tool, "system", repair_msg)
+                            .with_id(self.next_message_id("tool"));
+                        self.session.push_message(msg);
+                        tracing::info!("pre-exit repair turn injected before escape hatch");
+                    }
                     tracing::warn!(
                         score = stagnation_score,
                         "stagnation escape hatch: terminating loop"
@@ -1701,13 +1712,25 @@ impl App {
 
             self.record_tool_result(&result, is_recovery);
 
-            // Phase estimator: record tool call pattern (Issue #159)
+            // Issue #265/#309: extract shell command once for both guards.
             // Issue #299: skip during recovery reads.
             let success = result.status == ToolExecutionStatus::Completed;
+            let shell_cmd: Option<String> = if result.tool_name == "shell.exec" {
+                tool_input_map
+                    .get(&result.tool_call_id)
+                    .and_then(|(_, v)| v.get("command").and_then(|c| c.as_str()).map(String::from))
+            } else {
+                None
+            };
+            // Phase estimator: record tool call pattern (Issue #159)
+            // Issue #309: pass shell command so inspection counts as Read.
+            // Issue #299: skip during recovery reads.
             if !is_recovery {
-                let pa = self
-                    .phase_estimator
-                    .record_tool_call(&result.tool_name, success);
+                let pa = self.phase_estimator.record_tool_call_ex(
+                    &result.tool_name,
+                    success,
+                    shell_cmd.as_deref(),
+                );
                 if !matches!(pa, super::phase_estimator::PhaseAction::Continue) {
                     phase_action = pa;
                 }
@@ -1716,13 +1739,6 @@ impl App {
             // grep/sed/cat are counted as exploration calls.
             // Issue #299: skip during recovery reads.
             if !is_recovery {
-                let shell_cmd: Option<String> = if result.tool_name == "shell.exec" {
-                    tool_input_map.get(&result.tool_call_id).and_then(|(_, v)| {
-                        v.get("command").and_then(|c| c.as_str()).map(String::from)
-                    })
-                } else {
-                    None
-                };
                 let transition_action = self.read_transition_guard.record_tool_call_ex(
                     &result.tool_name,
                     success,
