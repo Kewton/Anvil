@@ -2,6 +2,43 @@
 
 ## [Unreleased]
 
+## [0.0.10] - 2026-04-09
+
+### Added
+- Plan-execute mode with `ANVIL_PLAN` and checklist-managed `ANVIL_FINAL` control (#249)
+- Plan-aware stagnation control for workset steering (#263)
+- Plan-aware batch guidance and correctness fixes (#261)
+- CompletionKind taxonomy, AgentTelemetry, and strengthened item completion (#255)
+- Telemetry artifact infrastructure for comparison baseline repair (#271)
+- First-mutation telemetry for pre-mutation transition diagnosis (#273)
+- Post-mutation stagnation decomposition telemetry (#275)
+- File-role telemetry and mutation order measurement (#277)
+- Parallel tool progress display (#240)
+- Session note extraction with logging (#241)
+- Phase estimation in turn summary logs (#242)
+- Baseline optimization — guidance lightening and metrics contract (#269)
+- Orphan mutation detection to prevent final gate hang (#287)
+
+### Fixed
+- Prevent plan mode from becoming permanent across turns (#253)
+- Sync plan completion from touched_files before ANVIL_FINAL gate check (#251)
+- Align files_modified with actual disk changes (#259)
+- Detect file-reading shell.exec commands in read_guard (#265)
+- Reject file.edit when old_string == new_string (#266)
+- Prevent no-plan/no-op completion with success-style logs in follow-up paths (#285)
+- Prevent final gate hang on last plan item and fix Ollama streaming timeout (#287)
+- Prevent stale/alias plan item remaining after ANVIL_PLAN_UPDATE (#289)
+- Prevent recovered tool failure from polluting non-interactive exit code (#296)
+- Prevent edit recovery from triggering loop detector termination (#299)
+- Retire already-satisfied/verification-only plan items to prevent stale target pollution (#301)
+- Prevent agent.plan and ANVIL_PLAN conflict allowing unplanned mutations (#303)
+- Allow follow-up ANVIL_PLAN to replace active plan during replan (#305)
+- Convert prose-only already-implemented confirmation to plan retire (#307)
+- Integrate shell.exec inspection into phase/stagnation guidance (#309)
+- Unify superseded-only terminal plan exit semantics (#311)
+- Add token-based fallback to extract_edit_context for mid-file recovery (#313)
+- Auto-retire no-path plan items to prevent final gate deadlock (#315)
+
 ## [0.0.9] - 2026-03-31
 
 ### Added
