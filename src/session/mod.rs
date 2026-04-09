@@ -1417,7 +1417,9 @@ pub fn extract_session_notes(messages: &[SessionMessage]) -> Vec<SessionNote> {
         }
 
         let kind = match msg.author.as_str() {
-            "file.edit" | "file.write" => Some(NoteKind::FileEdit),
+            "file.edit" | "file.edit_anchor" | "file.rewrite" | "file.write" => {
+                Some(NoteKind::FileEdit)
+            }
             "file.read" => Some(NoteKind::FileRead),
             "shell.exec" => Some(NoteKind::ShellExec),
             _ => None,

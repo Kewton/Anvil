@@ -173,3 +173,16 @@ fn suppressed_final_does_not_disable_fallback() {
     // Fallback should still work because accept_anvil_final() was not called
     assert_eq!(est.check_empty_response(), PhaseAction::FallbackComplete);
 }
+
+// ---------------------------------------------------------------------------
+// Issue #290: file.rewrite classified as Write tool
+// ---------------------------------------------------------------------------
+
+#[test]
+fn phase_estimator_file_rewrite_is_write_tool() {
+    let mut est = PhaseEstimator::new(5, 10, 5);
+
+    // file.rewrite should transition phase to Implementing
+    est.record_tool_call("file.rewrite", true);
+    assert_eq!(est.current_phase(), Phase::Implementing);
+}

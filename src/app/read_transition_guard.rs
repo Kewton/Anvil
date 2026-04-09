@@ -82,7 +82,7 @@ impl ReadTransitionGuard {
             "file.search" | "web.fetch" => {
                 self.consecutive_exploration_calls += 1;
             }
-            "file.edit" | "file.edit_anchor" | "file.write" => {
+            "file.edit" | "file.edit_anchor" | "file.rewrite" | "file.write" => {
                 self.reset();
                 return ReadTransitionAction::Continue;
             }
@@ -119,7 +119,7 @@ impl ReadTransitionGuard {
         ReadTransitionAction::Inject(format!(
             "[System] You have already spent {} consecutive tool calls exploring \
              (including {} file.read calls). You have enough context. \
-             Start implementing now using file.edit, file.edit_anchor, or file.write. \
+             Start implementing now using file.edit, file.edit_anchor, file.rewrite, or file.write. \
              Do NOT call file.read or use shell.exec with grep/sed/cat to read files. \
              Proceed to implementation immediately.",
             self.consecutive_exploration_calls, self.consecutive_file_reads

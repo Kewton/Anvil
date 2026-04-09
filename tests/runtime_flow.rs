@@ -1014,6 +1014,33 @@ fn tag_protocol_prompt_contains_tag_examples() {
     );
 }
 
+// --- Issue #290: file.rewrite tag parsing ---
+
+#[test]
+fn parse_tag_based_file_rewrite() {
+    let response = anvil::agent::BasicAgentLoop::parse_structured_response(concat!(
+        "```ANVIL_TOOL\n",
+        "<tool name=\"file.rewrite\" path=\"./src/main.rs\" start_line=\"10\" end_line=\"15\"><content>new code here</content></tool>\n",
+        "```\n",
+        "```ANVIL_FINAL\n",
+        "Rewrote lines 10-15.\n",
+        "```\n"
+    ))
+    .expect("Tag-based file.rewrite parsing should work");
+
+    assert_eq!(response.tool_calls.len(), 1);
+    assert_eq!(response.tool_calls[0].tool_name, "file.rewrite");
+    assert_eq!(
+        response.tool_calls[0].input,
+        anvil::tooling::ToolInput::FileRewrite {
+            path: "./src/main.rs".to_string(),
+            start_line: 10,
+            end_line: 15,
+            content: "new code here".to_string(),
+        }
+    );
+}
+
 // --- Issue #186: 同一ターン内の重複ツール呼び出し排除テスト ---
 
 #[test]

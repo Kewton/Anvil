@@ -90,7 +90,12 @@ pub fn summarize_tool_names(names: &[String]) -> String {
 }
 
 /// Mutation tool names used for the successful-mutation check (Issue #285).
-const MUTATION_TOOL_NAMES: &[&str] = &["file.write", "file.edit", "file.edit_anchor"];
+const MUTATION_TOOL_NAMES: &[&str] = &[
+    "file.write",
+    "file.edit",
+    "file.edit_anchor",
+    "file.rewrite",
+];
 
 /// Check whether the tool results contain at least one successful mutation
 /// (file.write / file.edit / file.edit_anchor with Completed status,
@@ -1609,7 +1614,10 @@ impl App {
             tool_kind_map.get(tool_call_id).is_some_and(|kind| {
                 matches!(
                     kind,
-                    ToolKind::FileWrite | ToolKind::FileEdit | ToolKind::FileEditAnchor
+                    ToolKind::FileWrite
+                        | ToolKind::FileEdit
+                        | ToolKind::FileEditAnchor
+                        | ToolKind::FileRewrite
                 )
             })
         };
@@ -1879,7 +1887,7 @@ impl App {
         // Working memory: track touched files (file-mutating tools only) (Issue #130, #157)
         let is_file_tool = matches!(
             result.tool_name.as_str(),
-            "file.write" | "file.edit" | "file.edit_anchor"
+            "file.write" | "file.edit" | "file.edit_anchor" | "file.rewrite"
         );
         if is_file_tool
             && result.status == ToolExecutionStatus::Completed
@@ -1916,7 +1924,9 @@ impl App {
         let mut edit_hint: Option<String> = None;
         let is_barrier_blocked = result.summary.starts_with("[plan_barrier]");
         if !is_barrier_blocked
-            && (result.tool_name == "file.edit" || result.tool_name == "file.edit_anchor")
+            && (result.tool_name == "file.edit"
+                || result.tool_name == "file.edit_anchor"
+                || result.tool_name == "file.rewrite")
         {
             if result.status == ToolExecutionStatus::Failed {
                 if let Some(raw_path) = extract_edit_path_from_summary(&result.summary) {
@@ -2150,7 +2160,7 @@ impl App {
     /// Track consecutive file.write failures and repeated successful writes,
     /// returning a hint if either threshold is reached.
     fn update_write_trackers(&mut self, result: &ToolExecutionResult) -> Option<String> {
-        if result.tool_name != "file.write" {
+        if result.tool_name != "file.write" && result.tool_name != "file.rewrite" {
             return None;
         }
         if result.status == ToolExecutionStatus::Failed {
@@ -2490,6 +2500,14 @@ pub(crate) fn infer_plan_from_structured_response(
             crate::tooling::ToolInput::FileEditAnchor { path, .. } => {
                 format!("edit (anchor) {path}")
             }
+            crate::tooling::ToolInput::FileRewrite {
+                path,
+                start_line,
+                end_line,
+                ..
+            } => {
+                format!("rewrite {path} (lines {start_line}-{end_line})")
+            }
         };
         plan.push(item);
     }
@@ -2664,6 +2682,14 @@ fn tool_call_approval_summary(call: &crate::tooling::ToolCallRequest) -> String 
         }
         crate::tooling::ToolInput::FileEdit { path, .. } => {
             format!("{}: {path}", call.tool_name)
+        }
+        crate::tooling::ToolInput::FileRewrite {
+            path,
+            start_line,
+            end_line,
+            ..
+        } => {
+            format!("file.rewrite: {path} (lines {start_line}-{end_line})")
         }
         crate::tooling::ToolInput::WebFetch { url } => {
             format!("{}: {url}", call.tool_name)
