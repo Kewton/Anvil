@@ -92,8 +92,12 @@ impl App {
                     "ANVIL_PLAN detected; registering execution plan"
                 );
                 self.execution_plan = ExecutionPlan::new(items);
-                // Mark first item as InProgress
-                self.execution_plan.mark_in_progress(0);
+                // Issue #315: auto-retire no-path / summary-only items
+                self.execution_plan.auto_retire_no_path_items();
+                // Mark first actionable item as InProgress
+                if let Some(first) = self.execution_plan.next_actionable_index() {
+                    self.execution_plan.mark_in_progress(first);
+                }
                 self.agent_telemetry.record_plan_registration();
                 self.agent_telemetry.record_anvil_plan_visible();
                 return PlanRegistrationResult::Registered;
@@ -119,17 +123,32 @@ impl App {
     /// Executes: checked-first retire → supersede stale → dedup → append.
     /// Returns `true` if any meaningful change occurred (retire, supersede, or append).
     fn apply_plan_update_pipeline(&mut self, block: &str, all_items: Vec<PlanItem>) -> bool {
-        // --- checked-first retire (Issue #301) ---
+        // --- checked-first retire (Issue #301 + Issue #315) ---
         let checked_indices = detect_checked_lines(block);
         let mut had_retire = false;
         if !checked_indices.is_empty() {
             let mut all_retired: Vec<String> = Vec::new();
+            let mut no_path_descriptions: Vec<String> = Vec::new();
             for &idx in &checked_indices {
-                if let Some(checked_item) = all_items.get(idx)
-                    && !checked_item.target_files.is_empty()
-                {
-                    let retired = self.apply_checked_items(&checked_item.target_files);
-                    all_retired.extend(retired);
+                if let Some(checked_item) = all_items.get(idx) {
+                    if !checked_item.target_files.is_empty() {
+                        let retired = self.apply_checked_items(&checked_item.target_files);
+                        all_retired.extend(retired);
+                    } else {
+                        // Issue #315: collect no-path checked items for description-based retire
+                        no_path_descriptions.push(checked_item.description.clone());
+                    }
+                }
+            }
+            // Issue #315: retire existing no-path items by description match
+            if !no_path_descriptions.is_empty() {
+                let count = self.execution_plan.retire_no_path_items_by_description(
+                    &no_path_descriptions,
+                    crate::contracts::PlanItemStatus::AlreadySatisfied,
+                );
+                if count > 0 {
+                    had_retire = true;
+                    self.stagnation_state.record_plan_item_completion();
                 }
             }
             if !all_retired.is_empty() {
@@ -177,6 +196,8 @@ impl App {
             "plan update pipeline: appending items"
         );
         self.execution_plan.append_items(deduped);
+        // Issue #315: auto-retire any newly appended no-path items
+        self.execution_plan.auto_retire_no_path_items();
         self.agent_telemetry.record_plan_update();
         true
     }
@@ -198,7 +219,11 @@ impl App {
             "ANVIL_PLAN_UPDATE on empty plan; registering as new plan (Issue #303)"
         );
         self.execution_plan = ExecutionPlan::new(items);
-        self.execution_plan.mark_in_progress(0);
+        // Issue #315: auto-retire no-path / summary-only items
+        self.execution_plan.auto_retire_no_path_items();
+        if let Some(first) = self.execution_plan.next_actionable_index() {
+            self.execution_plan.mark_in_progress(first);
+        }
         self.agent_telemetry.record_plan_registration();
         self.agent_telemetry.record_anvil_plan_visible();
     }
