@@ -633,7 +633,16 @@ impl App {
             session_stats: SessionStats::new(),
             last_compact_info: None,
             execution_plan: crate::contracts::ExecutionPlan::default(),
-            agent_telemetry: crate::contracts::AgentTelemetry::new(),
+            agent_telemetry: {
+                // Issue #343: cache the active pack expectation at session
+                // start so the agentic loop can consult it without re-reading
+                // env on every turn. `validate_pack_expectation` still
+                // re-resolves at session end, so this cache is only a
+                // read-side convenience.
+                let mut tel = crate::contracts::AgentTelemetry::new();
+                tel.pack_expectation = crate::contracts::PackExpectation::from_env();
+                tel
+            },
             stagnation_state: stagnation_state::StagnationState::new(),
             forced_mode_active: false,
             tool_recovery_budget: tool_recovery_budget::ToolRecoveryBudget::new(
@@ -983,6 +992,22 @@ impl App {
         // Issue #332: retrospectively classify repair-turn-only salvage
         // before pack validation/artifact emission so the counter is durable.
         self.agent_telemetry.classify_repair_salvage();
+
+        // Issue #343: surface an explicit runtime-summary warning when the
+        // session finished with a recorded fix_slice worker failure but no
+        // corresponding worker success. Makes the A1 shape visible in logs
+        // without waiting for the pack validation gate at the very end.
+        if self.agent_telemetry.has_fixslice_worker_failure()
+            && !self.agent_telemetry.worker_observed
+        {
+            tracing::warn!(
+                fixslice_worker_failure_count = self.agent_telemetry.fixslice_worker_failure_count,
+                fixslice_failure_reason = self.agent_telemetry.fixslice_failure_reason.as_deref(),
+                repair_turn_observed = self.agent_telemetry.repair_turn_observed,
+                mutation_observed = self.agent_telemetry.mutation_observed,
+                "fix_slice worker failed to reach success; session ended without worker observation"
+            );
+        }
 
         // Issue #329: Validate pack expectation gate before writing artifact.
         {
