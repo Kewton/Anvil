@@ -4,7 +4,9 @@ use anvil::agent::subagent::{
     FIXSLICE_MAX_ITERATIONS, FIXSLICE_TIMEOUT_SECS, MAX_FIXSLICE_LINES, SubAgentKind,
 };
 use anvil::agent::tag_spec::find_spec;
-use anvil::app::agentic::{build_rewrite_request, validate_fix_proposal};
+use anvil::app::agentic::{
+    build_fixslice_user_prompt, build_rewrite_request, validate_fix_proposal,
+};
 use anvil::contracts::FixSliceProposal;
 use anvil::tooling::{
     ExecutionClass, ExecutionMode, PermissionClass, ToolCallRequest, ToolInput, ToolKind,
@@ -541,6 +543,53 @@ fn test_fixslice_validation_control_char_in_target_path() {
 // ---------------------------------------------------------------------------
 // ToolInput::kind() mapping
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Issue #341: FixSlice worker must receive target_path and max_lines in its
+// user prompt, not only the free-form goal.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_fixslice_user_prompt_contains_target_and_budget() {
+    let prompt = build_fixslice_user_prompt(
+        "src/lib/auto-yes-manager.ts",
+        "remove stale branch and add regression test",
+        80,
+    );
+    assert!(
+        prompt.contains("src/lib/auto-yes-manager.ts"),
+        "prompt must embed the exact target_path: {prompt}"
+    );
+    assert!(
+        prompt.contains("80"),
+        "prompt must embed the max_lines budget: {prompt}"
+    );
+    assert!(
+        prompt.contains("remove stale branch and add regression test"),
+        "prompt must embed the goal verbatim: {prompt}"
+    );
+}
+
+#[test]
+fn test_fixslice_user_prompt_anchors_worker_to_target() {
+    let prompt =
+        build_fixslice_user_prompt("crates/foo/src/bar.rs", "fix panic on empty input", 40);
+    // The worker must be told to read the target first and to match the
+    // target_path in its proposal, otherwise exploration drifts (Issue #341).
+    assert!(
+        prompt.contains("file.read"),
+        "prompt should instruct the worker to read the target first"
+    );
+    assert!(
+        prompt.contains("ANVIL_FINAL"),
+        "prompt should reference the ANVIL_FINAL proposal format"
+    );
+    let target_occurrences = prompt.matches("crates/foo/src/bar.rs").count();
+    assert!(
+        target_occurrences >= 2,
+        "target_path should appear multiple times for redundancy, got {target_occurrences}: {prompt}"
+    );
+}
 
 #[test]
 fn test_fixslice_tool_kind_mapping() {
