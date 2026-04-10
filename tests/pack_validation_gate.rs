@@ -147,7 +147,7 @@ fn validate_requires_worker_observation_mismatch_when_nothing_observed() {
             reason,
         } => {
             assert_eq!(*expectation, PackExpectation::RequiresWorkerObservation);
-            assert!(reason.contains("no worker path"), "reason: {reason}");
+            assert!(reason.contains("worker"), "reason: {reason}");
         }
         other => panic!("expected Mismatch, got {other:?}"),
     }
@@ -161,18 +161,59 @@ fn validate_requires_worker_observation_satisfied_by_fixslice() {
     assert_eq!(result, PackValidationResult::Satisfied);
 }
 
+// Issue #334: repair-turn-only and mutation-only sessions must NOT satisfy
+// the worker-observation gate.  Runtime semantics must agree with the
+// benchmark runner's strict classification, otherwise salvage runs mask
+// missing worker-path evidence.
 #[test]
-fn validate_requires_worker_observation_satisfied_by_repair_turn() {
+fn validate_requires_worker_observation_mismatch_when_only_repair_turn() {
     let mut tel = AgentTelemetry::new();
     tel.record_pre_exit_repair_injected();
     let result = tel.validate_against(PackExpectation::RequiresWorkerObservation);
-    assert_eq!(result, PackValidationResult::Satisfied);
+    match &result {
+        PackValidationResult::Mismatch {
+            expectation,
+            reason,
+        } => {
+            assert_eq!(*expectation, PackExpectation::RequiresWorkerObservation);
+            assert!(reason.contains("worker"), "reason: {reason}");
+        }
+        other => panic!("expected Mismatch, got {other:?}"),
+    }
 }
 
 #[test]
-fn validate_requires_worker_observation_satisfied_by_mutation() {
+fn validate_requires_worker_observation_mismatch_when_only_mutation() {
     let mut tel = AgentTelemetry::new();
     tel.record_mutation_turn(2, Some(0.5), "file.write");
+    let result = tel.validate_against(PackExpectation::RequiresWorkerObservation);
+    match &result {
+        PackValidationResult::Mismatch {
+            expectation,
+            reason,
+        } => {
+            assert_eq!(*expectation, PackExpectation::RequiresWorkerObservation);
+            assert!(reason.contains("worker"), "reason: {reason}");
+        }
+        other => panic!("expected Mismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn validate_requires_worker_observation_mismatch_when_repair_plus_mutation() {
+    // Even repair + mutation together must not satisfy the gate — this is
+    // exactly the salvage pattern the benchmark runner rejects.
+    let mut tel = AgentTelemetry::new();
+    tel.record_pre_exit_repair_injected();
+    tel.record_mutation_turn(4, Some(1.0), "file.edit");
+    let result = tel.validate_against(PackExpectation::RequiresWorkerObservation);
+    assert!(matches!(result, PackValidationResult::Mismatch { .. }));
+}
+
+#[test]
+fn validate_requires_worker_observation_satisfied_only_by_worker_observed() {
+    let mut tel = AgentTelemetry::new();
+    tel.record_fixslice_escalation_stagnation();
     let result = tel.validate_against(PackExpectation::RequiresWorkerObservation);
     assert_eq!(result, PackValidationResult::Satisfied);
 }

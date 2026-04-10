@@ -1038,6 +1038,46 @@ impl App {
                 self.session.push_message(msg);
             }
 
+            // Issue #334: read-heavy drift escalation.
+            //
+            // Issue #332 still requires cumulative edit failures. A session
+            // dominated by reads / audits that never attempts an edit cannot
+            // cross that threshold, so it drifts through repeated reads,
+            // plan repair, and pre-exit repair without reaching the worker
+            // path. Fire escalation here when the stagnation score is high
+            // and no mutation has been observed at all.
+            if !self.agent_telemetry.worker_observed
+                && crate::app::edit_fail_tracker::should_escalate_for_read_heavy_drift(
+                    stagnation_score as u32,
+                    self.agent_telemetry.mutation_observed,
+                    self.stagnation_state.turns_since_last_mutation as u32,
+                    self.config.runtime.edit_fixslice_read_heavy_score_threshold,
+                    self.config
+                        .runtime
+                        .edit_fixslice_read_heavy_drought_threshold,
+                )
+            {
+                tracing::warn!(
+                    score = stagnation_score,
+                    drought = self.stagnation_state.turns_since_last_mutation,
+                    "fixslice_escalation_triggered (read_heavy)"
+                );
+                self.agent_telemetry.record_fixslice_escalation_stagnation();
+                let hint = format!(
+                    "\n\n[Anvil ESCALATION] The session has stagnated on reads / audits \
+                     (score={score}/4, {drought} turns without any mutation). You MUST stop \
+                     reading and call agent.fix_slice on the most relevant target file to \
+                     produce a concrete change. Pick a target_path from the active plan \
+                     and supply a goal describing the mutation you intend to make. Do NOT \
+                     read or search further before calling agent.fix_slice.",
+                    score = stagnation_score,
+                    drought = self.stagnation_state.turns_since_last_mutation,
+                );
+                let msg = SessionMessage::new(MessageRole::Tool, "system", hint)
+                    .with_id(self.next_message_id("tool"));
+                self.session.push_message(msg);
+            }
+
             // Issue #285: staged stagnation recovery.
             let remaining_turns = max_iterations.saturating_sub(iteration + 1);
             let plan_repair_count_before_this_turn =

@@ -129,8 +129,9 @@ pub enum PackExpectation {
     AuditOnly,
     /// The pack requires at least one real file mutation (`changed_files > 0`).
     RequiresMutation,
-    /// The pack requires observable worker-path evidence: fix_slice escalation,
-    /// pre-exit repair turn, *or* mutation.
+    /// The pack requires observable worker-path evidence: only a fix_slice
+    /// escalation (`worker_observed=true`) satisfies this gate. Repair-turn
+    /// or mutation-only salvage is explicitly rejected (Issue #334).
     RequiresWorkerObservation,
 }
 
@@ -768,11 +769,15 @@ impl AgentTelemetry {
             }
 
             PackExpectation::RequiresWorkerObservation => {
-                if self.worker_observed || self.repair_turn_observed || self.mutation_observed {
+                // Issue #334: repair-turn or mutation-only salvage must NOT
+                // satisfy this gate. Only actual worker-path observation
+                // (fix_slice escalation) counts, so runtime semantics agree
+                // with the strict benchmark runner classification.
+                if self.worker_observed {
                     PackValidationResult::Satisfied
                 } else {
-                    let reason = "pack requires worker observation but no worker path, \
-                                  repair turn, or mutation was observed"
+                    let reason = "pack requires worker path (fix_slice escalation) but \
+                                  worker was not observed"
                         .to_string();
                     self.expectation_mismatch_reason = Some(reason.clone());
                     PackValidationResult::Mismatch {

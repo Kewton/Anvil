@@ -85,6 +85,29 @@ pub fn should_escalate_for_stagnation(
         && stagnation_score >= score_threshold
 }
 
+/// Decide whether to escalate to the worker path due to read-heavy drift
+/// with no mutation observed (Issue #334).
+///
+/// The Issue #332 policy still requires cumulative edit failures. A session
+/// that never attempts an edit cannot cross that threshold, so read-heavy
+/// drift (repeated reads / searches, stagnation score high, zero mutation)
+/// never reaches the worker path. This trigger closes that gap by firing
+/// independently of `total_failures`.
+///
+/// `score_threshold == 0` disables the trigger.
+pub fn should_escalate_for_read_heavy_drift(
+    stagnation_score: u32,
+    mutation_observed: bool,
+    turns_since_last_mutation: u32,
+    score_threshold: u32,
+    drought_threshold: u32,
+) -> bool {
+    score_threshold > 0
+        && !mutation_observed
+        && stagnation_score >= score_threshold
+        && turns_since_last_mutation >= drought_threshold
+}
+
 /// Tracks consecutive file.edit failures per file path.
 /// Used to detect when the LLM is stuck retrying edits on the same file
 /// and should be prompted to try an alternative approach (Issue #158, #321).
