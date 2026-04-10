@@ -193,6 +193,14 @@ pub struct RuntimeConfig {
     /// Minimum stagnation score required for stagnation-driven fix_slice
     /// escalation (Issue #332).
     pub edit_fixslice_stagnation_score_threshold: u32,
+    /// Minimum stagnation score required for read-heavy fix_slice
+    /// escalation (Issue #334). Fires independently of cumulative edit
+    /// failures when a session is dominated by reads with no mutation.
+    /// 0 = disabled.
+    pub edit_fixslice_read_heavy_score_threshold: u32,
+    /// Minimum `turns_since_last_mutation` required to treat a session as
+    /// read-heavy drift and escalate to the worker path (Issue #334).
+    pub edit_fixslice_read_heavy_drought_threshold: u32,
     /// Maximum line count for file.write on existing files (0 = disabled, Issue #156).
     pub safe_write_max_lines: usize,
     /// Deletion ratio threshold for diff warning (0.0-1.0, Issue #156).
@@ -392,6 +400,8 @@ impl EffectiveConfig {
                 edit_fixslice_threshold: 7,
                 edit_fixslice_stagnation_total_threshold: 4,
                 edit_fixslice_stagnation_score_threshold: 2,
+                edit_fixslice_read_heavy_score_threshold: 2,
+                edit_fixslice_read_heavy_drought_threshold: 5,
                 safe_write_max_lines: 500,
                 safe_write_deletion_ratio: 0.5,
                 read_repeat_warn_threshold: 3,
@@ -905,6 +915,26 @@ impl EffectiveConfig {
                     }
                     self.runtime.edit_fixslice_stagnation_score_threshold = v;
                 }
+                "edit_fixslice_read_heavy_score_threshold"
+                | "ANVIL_EDIT_FIXSLICE_READ_HEAVY_SCORE_THRESHOLD" => {
+                    let v: u32 = value
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                    if v > 4 {
+                        return Err(ConfigError::InvalidNumericValue(value.clone()));
+                    }
+                    self.runtime.edit_fixslice_read_heavy_score_threshold = v;
+                }
+                "edit_fixslice_read_heavy_drought_threshold"
+                | "ANVIL_EDIT_FIXSLICE_READ_HEAVY_DROUGHT_THRESHOLD" => {
+                    let v: u32 = value
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                    if !(1..=40).contains(&v) {
+                        return Err(ConfigError::InvalidNumericValue(value.clone()));
+                    }
+                    self.runtime.edit_fixslice_read_heavy_drought_threshold = v;
+                }
                 "edit_recovery_read_budget" | "ANVIL_EDIT_RECOVERY_READ_BUDGET" => {
                     let v: u32 = value
                         .parse()
@@ -1223,6 +1253,18 @@ impl EffectiveConfig {
             .runtime
             .edit_fixslice_stagnation_score_threshold
             .clamp(1, 4);
+        // Issue #334: clamp read-heavy escalation thresholds.
+        // Score: 0 disables; otherwise bounded by score range [1, 4].
+        if self.runtime.edit_fixslice_read_heavy_score_threshold > 0 {
+            self.runtime.edit_fixslice_read_heavy_score_threshold = self
+                .runtime
+                .edit_fixslice_read_heavy_score_threshold
+                .clamp(1, 4);
+        }
+        self.runtime.edit_fixslice_read_heavy_drought_threshold = self
+            .runtime
+            .edit_fixslice_read_heavy_drought_threshold
+            .clamp(1, 40);
         self.runtime.edit_recovery_read_budget =
             self.runtime.edit_recovery_read_budget.clamp(1, 10);
     }
@@ -1591,6 +1633,14 @@ impl std::fmt::Debug for RuntimeConfig {
             .field(
                 "edit_fixslice_stagnation_score_threshold",
                 &self.edit_fixslice_stagnation_score_threshold,
+            )
+            .field(
+                "edit_fixslice_read_heavy_score_threshold",
+                &self.edit_fixslice_read_heavy_score_threshold,
+            )
+            .field(
+                "edit_fixslice_read_heavy_drought_threshold",
+                &self.edit_fixslice_read_heavy_drought_threshold,
             )
             .field("safe_write_max_lines", &self.safe_write_max_lines)
             .field("safe_write_deletion_ratio", &self.safe_write_deletion_ratio)
