@@ -352,7 +352,8 @@ impl App {
             let kind = SubAgentKind::from_tool_input(&call.input).unwrap();
 
             // Extract prompt, scope, and optional FixSlice parameters.
-            // We pre-compute the FixSlice parent_dir so the borrow lives long enough.
+            // We pre-compute the FixSlice parent_dir and the structured user
+            // prompt so the borrows live long enough for the match below.
             let fixslice_parent_dir: Option<String> = match &call.input {
                 ToolInput::AgentFixSlice { target_path, .. } => {
                     std::path::Path::new(target_path.as_str())
@@ -362,6 +363,17 @@ impl App {
                 }
                 _ => None,
             };
+            // Issue #341: embed target_path and max_lines in the worker's
+            // user prompt so it anchors to the correct file instead of
+            // drifting into unrelated reads.
+            let fixslice_user_prompt: Option<String> = match &call.input {
+                ToolInput::AgentFixSlice {
+                    target_path,
+                    goal,
+                    max_lines,
+                } => Some(build_fixslice_user_prompt(target_path, goal, *max_lines)),
+                _ => None,
+            };
             let (prompt, scope, fixslice_params) = match &call.input {
                 ToolInput::AgentExplore { prompt, scope } => {
                     (prompt.as_str(), scope.as_deref(), None)
@@ -369,12 +381,15 @@ impl App {
                 ToolInput::AgentPlan { prompt, scope } => (prompt.as_str(), scope.as_deref(), None),
                 ToolInput::AgentFixSlice {
                     target_path,
-                    goal,
                     max_lines,
+                    ..
                 } => {
-                    // DR2-010: goal → prompt, target_path parent dir → scope
+                    // DR2-010 + Issue #341: structured prompt (includes
+                    // target_path/max_lines) → prompt, target_path parent dir → scope.
                     (
-                        goal.as_str(),
+                        fixslice_user_prompt
+                            .as_deref()
+                            .expect("fixslice_user_prompt is built for AgentFixSlice"),
                         fixslice_parent_dir.as_deref(),
                         Some((target_path.clone(), *max_lines)),
                     )
@@ -3159,6 +3174,29 @@ pub fn build_rewrite_request(
         tool_call_id: format!("{parent_call_id}_rewrite"),
         extra_field_warnings: Vec::new(),
     }
+}
+
+/// Build the FixSlice sub-agent user prompt from structured parameters.
+///
+/// The worker's correctness depends on knowing exactly which file to edit
+/// and how many lines its proposal may span. Passing only the free-form
+/// `goal` leaves the worker to guess the target file (Issue #341), so we
+/// embed `target_path` and `max_lines` explicitly alongside the goal.
+pub fn build_fixslice_user_prompt(target_path: &str, goal: &str, max_lines: u32) -> String {
+    format!(
+        "FixSlice task — target file is fixed.\n\
+         \n\
+         target_path: {target_path}\n\
+         max_lines: {max_lines}\n\
+         \n\
+         goal:\n{goal}\n\
+         \n\
+         Procedure:\n\
+         1. Read `{target_path}` first with file.read to locate the exact lines to change.\n\
+         2. Return a single JSON proposal inside ANVIL_FINAL whose `target_path` equals `{target_path}` exactly.\n\
+         3. Keep the `end_line - start_line + 1` span within {max_lines} lines.\n\
+         4. Do not explore unrelated files; the edit must stay on the target."
+    )
 }
 
 /// Remove control characters from a string for safe display in summaries.
