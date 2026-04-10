@@ -114,6 +114,87 @@ pub struct FixSliceProposal {
 }
 
 // ---------------------------------------------------------------------------
+// Pack expectation / validation gate (Issue #329)
+// ---------------------------------------------------------------------------
+
+/// Declares what a benchmark pack expects from the session.
+///
+/// Read from `$ANVIL_PACK_EXPECTATION` at session start.
+/// When unset the harness applies no pack-level gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PackExpectation {
+    /// The prompt is a follow-up audit; a no-op / zero-mutation completion is
+    /// a valid success path.
+    AuditOnly,
+    /// The pack requires at least one real file mutation (`changed_files > 0`).
+    RequiresMutation,
+    /// The pack requires observable worker-path evidence: fix_slice escalation,
+    /// pre-exit repair turn, *or* mutation.
+    RequiresWorkerObservation,
+}
+
+impl PackExpectation {
+    /// Parse from the raw env-var value.  Returns `None` for unknown strings.
+    pub fn from_env_str(s: &str) -> Option<Self> {
+        match s {
+            "audit_only" => Some(Self::AuditOnly),
+            "requires_mutation" => Some(Self::RequiresMutation),
+            "requires_worker_observation" => Some(Self::RequiresWorkerObservation),
+            _ => None,
+        }
+    }
+
+    /// Read from `$ANVIL_PACK_EXPECTATION`.  Returns `None` when unset or empty.
+    pub fn from_env() -> Option<Self> {
+        let raw = std::env::var("ANVIL_PACK_EXPECTATION").ok()?;
+        if raw.is_empty() {
+            return None;
+        }
+        Self::from_env_str(&raw)
+    }
+}
+
+impl std::fmt::Display for PackExpectation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AuditOnly => write!(f, "audit_only"),
+            Self::RequiresMutation => write!(f, "requires_mutation"),
+            Self::RequiresWorkerObservation => write!(f, "requires_worker_observation"),
+        }
+    }
+}
+
+/// Result of validating telemetry against a pack expectation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PackValidationResult {
+    /// No pack expectation was set — nothing to validate.
+    NoExpectation,
+    /// Telemetry satisfies the expectation.
+    Satisfied,
+    /// Telemetry does NOT satisfy the expectation.
+    Mismatch {
+        expectation: PackExpectation,
+        reason: String,
+    },
+}
+
+impl std::fmt::Display for PackValidationResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoExpectation => write!(f, "no_expectation"),
+            Self::Satisfied => write!(f, "satisfied"),
+            Self::Mismatch {
+                expectation,
+                reason,
+            } => {
+                write!(f, "mismatch({expectation}): {reason}")
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Completion taxonomy (Issue #255: AgentPhase integration)
 // ---------------------------------------------------------------------------
 
@@ -306,6 +387,28 @@ pub struct AgentTelemetry {
     /// Number of pending plan items after repair turn (Issue #327).
     #[serde(default)]
     pub repair_turn_pending_after: Option<u32>,
+
+    // ---- Pack validation gate (Issue #329) ----
+    /// Whether at least one mutation (file change) was observed during the session.
+    #[serde(default)]
+    pub mutation_observed: bool,
+
+    /// Whether the worker path (fix_slice escalation) was observed.
+    #[serde(default)]
+    pub worker_observed: bool,
+
+    /// Whether a pre-exit repair turn was observed.
+    #[serde(default)]
+    pub repair_turn_observed: bool,
+
+    /// Pack expectation that was active for this session (from `$ANVIL_PACK_EXPECTATION`).
+    #[serde(default)]
+    pub pack_expectation: Option<PackExpectation>,
+
+    /// Mismatch reason when the session did not satisfy the pack expectation.
+    /// `None` when expectation is satisfied or unset.
+    #[serde(default)]
+    pub expectation_mismatch_reason: Option<String>,
 }
 
 impl AgentTelemetry {
@@ -380,11 +483,13 @@ impl AgentTelemetry {
     /// Record a pre-exit repair turn injection (Issue #325).
     pub fn record_pre_exit_repair_injected(&mut self) {
         self.pre_exit_repair_injected_count += 1;
+        self.repair_turn_observed = true;
     }
 
     /// Record a pre-exit repair turn consumed by LLM (Issue #325).
     pub fn record_pre_exit_repair_consumed(&mut self) {
         self.pre_exit_repair_consumed_count += 1;
+        self.repair_turn_observed = true;
     }
 
     /// Record unchecked items rejected during repair closure mode (Issue #327).
@@ -419,6 +524,7 @@ impl AgentTelemetry {
     /// (i.e. from `crate::app::MUTATION_TOOLS`) to avoid storing arbitrary strings.
     pub fn record_mutation_turn(&mut self, turn: u32, elapsed_s: Option<f64>, tool_name: &str) {
         self.last_mutation_turn = turn;
+        self.mutation_observed = true;
         if self.first_mutation_event_turn.is_none() {
             self.first_mutation_event_turn = Some(turn);
             self.first_mutation_event_elapsed_s = elapsed_s;
@@ -434,6 +540,7 @@ impl AgentTelemetry {
     /// Record a fix_slice escalation event (Issue #321).
     pub fn record_fixslice_escalation(&mut self) {
         self.fixslice_escalation_count += 1;
+        self.worker_observed = true;
     }
 
     /// Threshold: mutations after this turn are considered "late".
@@ -541,6 +648,12 @@ impl AgentTelemetry {
             "first_mutation_event_elapsed_s": self.first_mutation_event_elapsed_s,
             "first_mutation_event_tool": self.first_mutation_event_tool,
             "first_mutation_event_semantic_basis": "runtime_lower_bound",
+            // Issue #329: pack validation gate observability fields
+            "mutation_observed": self.mutation_observed,
+            "worker_observed": self.worker_observed,
+            "repair_turn_observed": self.repair_turn_observed,
+            "pack_expectation": self.pack_expectation.map(|e| e.to_string()),
+            "expectation_mismatch_reason": self.expectation_mismatch_reason,
         });
 
         let json_bytes = serde_json::to_vec_pretty(&payload)?;
@@ -556,6 +669,61 @@ impl AgentTelemetry {
         file.write_all(&json_bytes)?;
 
         Ok(())
+    }
+
+    /// Validate telemetry against the active pack expectation (Issue #329).
+    ///
+    /// Reads `$ANVIL_PACK_EXPECTATION` from the environment.
+    /// Call this after `completion_kind` is set.  Updates `pack_expectation`
+    /// and `expectation_mismatch_reason` fields.
+    pub fn validate_pack_expectation(&mut self) -> PackValidationResult {
+        let expectation = match PackExpectation::from_env() {
+            Some(exp) => exp,
+            None => return PackValidationResult::NoExpectation,
+        };
+        self.validate_against(expectation)
+    }
+
+    /// Validate telemetry against the given expectation (Issue #329).
+    ///
+    /// This is the testable core; `validate_pack_expectation` is the
+    /// env-reading convenience wrapper.
+    pub fn validate_against(&mut self, expectation: PackExpectation) -> PackValidationResult {
+        self.pack_expectation = Some(expectation);
+
+        match expectation {
+            PackExpectation::AuditOnly => PackValidationResult::Satisfied,
+
+            PackExpectation::RequiresMutation => {
+                if self.mutation_observed {
+                    PackValidationResult::Satisfied
+                } else {
+                    let reason =
+                        "pack requires mutation but session completed with zero file changes"
+                            .to_string();
+                    self.expectation_mismatch_reason = Some(reason.clone());
+                    PackValidationResult::Mismatch {
+                        expectation,
+                        reason,
+                    }
+                }
+            }
+
+            PackExpectation::RequiresWorkerObservation => {
+                if self.worker_observed || self.repair_turn_observed || self.mutation_observed {
+                    PackValidationResult::Satisfied
+                } else {
+                    let reason = "pack requires worker observation but no worker path, \
+                                  repair turn, or mutation was observed"
+                        .to_string();
+                    self.expectation_mismatch_reason = Some(reason.clone());
+                    PackValidationResult::Mismatch {
+                        expectation,
+                        reason,
+                    }
+                }
+            }
+        }
     }
 
     /// Premature Final Request Rate: ratio of suppressed finals to total finals.
