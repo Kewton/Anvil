@@ -296,6 +296,9 @@ pub struct App {
     forced_mode_active: bool,
     /// Recovery read budget for file.edit failure recovery (Issue #299).
     tool_recovery_budget: tool_recovery_budget::ToolRecoveryBudget,
+    /// Whether the session is in pre-exit repair closure mode (Issue #327).
+    /// When active, ANVIL_PLAN_UPDATE unchecked items are rejected.
+    repair_closure_active: bool,
 }
 
 /// Whether the session loop should continue or exit.
@@ -636,6 +639,7 @@ impl App {
             tool_recovery_budget: tool_recovery_budget::ToolRecoveryBudget::new(
                 edit_recovery_read_budget,
             ),
+            repair_closure_active: false,
         })
     }
 

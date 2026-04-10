@@ -126,6 +126,7 @@ impl App {
         // --- checked-first retire (Issue #301 + Issue #315) ---
         let checked_indices = detect_checked_lines(block);
         let mut had_retire = false;
+        let mut retire_count: u32 = 0;
         if !checked_indices.is_empty() {
             let mut all_retired: Vec<String> = Vec::new();
             let mut no_path_descriptions: Vec<String> = Vec::new();
@@ -148,20 +149,44 @@ impl App {
                 );
                 if count > 0 {
                     had_retire = true;
+                    retire_count += count as u32;
                     self.stagnation_state.record_plan_item_completion();
                 }
             }
             if !all_retired.is_empty() {
                 had_retire = true;
+                retire_count += all_retired.len() as u32;
                 self.stagnation_state.retire_target_files(&all_retired);
                 self.stagnation_state.record_plan_item_completion();
             }
+        }
+        // Issue #327: record retired item count during repair closure mode.
+        if self.repair_closure_active && retire_count > 0 {
+            self.agent_telemetry
+                .record_repair_turn_items_retired(retire_count);
         }
 
         let new_items = filter_unchecked_items(all_items, &checked_indices);
         if new_items.is_empty() {
             if had_retire {
                 tracing::info!("plan update pipeline: all items checked → retired");
+                self.agent_telemetry.record_plan_update();
+            }
+            return had_retire;
+        }
+
+        // Issue #327: During repair closure mode, reject unchecked items instead
+        // of appending them. The repair turn is for closing remaining work, not
+        // expanding it.
+        if self.repair_closure_active {
+            let rejected = new_items.len() as u32;
+            self.agent_telemetry
+                .record_repair_turn_items_rejected(rejected);
+            tracing::warn!(
+                rejected_items = rejected,
+                "plan update pipeline: rejected unchecked items during repair closure mode"
+            );
+            if had_retire {
                 self.agent_telemetry.record_plan_update();
             }
             return had_retire;

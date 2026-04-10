@@ -1083,12 +1083,33 @@ impl App {
                 self.phase_estimator.observe_anvil_final();
             }
 
-            // Issue #325: if the pre-exit repair turn was injected on the previous
-            // iteration, the LLM has now consumed it and responded. Terminate the
-            // loop — the repair turn has had its chance.
+            // Issue #325 + Issue #327: if the pre-exit repair turn was injected on
+            // the previous iteration, the LLM has now consumed it and responded.
+            // Decide termination based on the resulting plan state, not just the
+            // fact that one repair response was consumed.
             if pre_exit_repair_injected {
                 self.agent_telemetry.record_pre_exit_repair_consumed();
-                tracing::info!("pre-exit repair turn consumed; terminating loop");
+                let pending_after = self
+                    .execution_plan
+                    .items
+                    .iter()
+                    .filter(|i| !i.is_finished())
+                    .count() as u32;
+                self.agent_telemetry
+                    .record_repair_turn_pending_after(pending_after);
+
+                if self.execution_plan.is_cleanly_finished() {
+                    tracing::info!(
+                        pending_after,
+                        "pre-exit repair turn consumed; plan cleanly finished"
+                    );
+                } else {
+                    tracing::info!(
+                        pending_after,
+                        "pre-exit repair turn consumed; plan still incomplete, \
+                         terminating (unchecked expansion was rejected)"
+                    );
+                }
                 break;
             }
 
@@ -1119,12 +1140,25 @@ impl App {
                     if !self.execution_plan.is_empty()
                         && !self.execution_plan.is_successfully_completed()
                     {
+                        // Issue #327: record pending count before repair and activate
+                        // closure mode to reject unchecked plan expansion.
+                        let pending_before = self
+                            .execution_plan
+                            .items
+                            .iter()
+                            .filter(|i| !i.is_finished())
+                            .count() as u32;
+                        self.agent_telemetry
+                            .record_repair_turn_pending_before(pending_before);
+                        self.repair_closure_active = true;
+
                         let repair_msg = self.build_pre_exit_repair_message();
                         let msg = SessionMessage::new(MessageRole::Tool, "system", repair_msg)
                             .with_id(self.next_message_id("tool"));
                         self.session.push_message(msg);
                         self.agent_telemetry.record_pre_exit_repair_injected();
                         tracing::info!(
+                            pending_before,
                             "pre-exit repair turn injected; continuing for one more LLM turn"
                         );
                         pre_exit_repair_injected = true;
