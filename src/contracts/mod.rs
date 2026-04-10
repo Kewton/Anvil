@@ -282,6 +282,14 @@ pub struct AgentTelemetry {
     /// Number of times fix_slice escalation was triggered (Issue #321).
     #[serde(default)]
     pub fixslice_escalation_count: u32,
+
+    /// Number of pre-exit repair turns injected (Issue #325).
+    #[serde(default)]
+    pub pre_exit_repair_injected_count: u32,
+
+    /// Number of pre-exit repair turns actually consumed by the LLM (Issue #325).
+    #[serde(default)]
+    pub pre_exit_repair_consumed_count: u32,
 }
 
 impl AgentTelemetry {
@@ -351,6 +359,16 @@ impl AgentTelemetry {
     /// Record an ANVIL_PLAN block observed (visible to external telemetry).
     pub fn record_anvil_plan_visible(&mut self) {
         self.anvil_plan_visible_count += 1;
+    }
+
+    /// Record a pre-exit repair turn injection (Issue #325).
+    pub fn record_pre_exit_repair_injected(&mut self) {
+        self.pre_exit_repair_injected_count += 1;
+    }
+
+    /// Record a pre-exit repair turn consumed by LLM (Issue #325).
+    pub fn record_pre_exit_repair_consumed(&mut self) {
+        self.pre_exit_repair_consumed_count += 1;
     }
 
     /// Record a pre-mutation barrier block (Issue #303).

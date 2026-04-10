@@ -970,6 +970,8 @@ impl App {
                 rolled_back_mutation_count = tel.rolled_back_mutation_count,
                 initial_plan_miss_count = tel.initial_plan_miss_count,
                 fixslice_escalation_count = tel.fixslice_escalation_count,
+                pre_exit_repair_injected_count = tel.pre_exit_repair_injected_count,
+                pre_exit_repair_consumed_count = tel.pre_exit_repair_consumed_count,
                 "agent telemetry"
             );
         }
