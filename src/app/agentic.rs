@@ -513,9 +513,27 @@ impl App {
         let proposal = match sub_result.fix_proposal {
             Some(p) => p,
             None => {
-                // Worker finished without a valid proposal
-                let reason = sub_result.payload.termination_reason;
-                let summary = format!("fix-slice worker {reason}: no valid proposal produced");
+                // Worker finished without a valid proposal.
+                // Issue #343: classify *why* the worker didn't produce one so
+                // the runtime and telemetry can distinguish max-iterations
+                // exhaustion from ordinary "finished with no proposal" cases.
+                let termination = sub_result.payload.termination_reason;
+                let failure_reason = match termination {
+                    crate::contracts::TerminationReason::MaxIterations => {
+                        crate::contracts::FixSliceFailureReason::MaxIterationsReached
+                    }
+                    _ => crate::contracts::FixSliceFailureReason::NoProposal,
+                };
+                self.agent_telemetry
+                    .record_fixslice_worker_failure(failure_reason);
+                tracing::warn!(
+                    termination = %termination,
+                    failure_reason = %failure_reason,
+                    "fix_slice worker failed to produce proposal"
+                );
+                let summary = format!(
+                    "fix-slice worker {termination}: no valid proposal produced ({failure_reason})"
+                );
                 return vec![build_failed_result_with_text(call, summary)];
             }
         };
@@ -527,6 +545,14 @@ impl App {
             max_lines,
             &self.config.paths.cwd,
         ) {
+            // Issue #343: proposal produced but validation rejected it.
+            self.agent_telemetry.record_fixslice_worker_failure(
+                crate::contracts::FixSliceFailureReason::ProposalValidationFailed,
+            );
+            tracing::warn!(
+                reason = %reason,
+                "fix_slice worker proposal failed validation"
+            );
             let summary = format!("fix-slice validation failed: {reason}");
             return vec![build_failed_result_with_text(call, summary)];
         }
@@ -540,12 +566,23 @@ impl App {
         // and produce a non-empty / non-no-op summary — mirroring the
         // record_mutation_turn guard so the two telemetry flags stay
         // consistent.
-        if rewrite_result.status == ToolExecutionStatus::Completed
+        let rewrite_succeeded = rewrite_result.status == ToolExecutionStatus::Completed
             && !rewrite_result.rolled_back
             && !rewrite_result.summary.is_empty()
-            && !rewrite_result.summary.contains("(no changes)")
-        {
+            && !rewrite_result.summary.contains("(no changes)");
+        if rewrite_succeeded {
             self.agent_telemetry.record_worker_success();
+        } else {
+            // Issue #343: the worker produced a valid proposal but
+            // file.rewrite did not land a real mutation.
+            self.agent_telemetry.record_fixslice_worker_failure(
+                crate::contracts::FixSliceFailureReason::RewriteFailed,
+            );
+            tracing::warn!(
+                rewrite_status = ?rewrite_result.status,
+                rolled_back = rewrite_result.rolled_back,
+                "fix_slice worker rewrite failed or produced no-op"
+            );
         }
 
         // Build agent.fix_slice summary result
@@ -1246,6 +1283,28 @@ impl App {
                     if !self.execution_plan.is_empty()
                         && !self.execution_plan.is_successfully_completed()
                     {
+                        // Issue #343: under a `requires_worker_observation`
+                        // pack, skip the pre-exit repair turn once the worker
+                        // path has already failed. Otherwise the repair turn
+                        // flips `repair_turn_observed`, lets parent-side
+                        // `file.edit` salvage the session, and ends in
+                        // `completion_kind=partial` — exactly the A1 shape
+                        // the benchmark runner rejects.
+                        if self
+                            .agent_telemetry
+                            .should_skip_pre_exit_repair_for_worker_failure()
+                        {
+                            tracing::warn!(
+                                score = stagnation_score,
+                                failure_reason = ?self.agent_telemetry.fixslice_failure_reason,
+                                fixslice_worker_failure_count =
+                                    self.agent_telemetry.fixslice_worker_failure_count,
+                                "worker-required pack + fix_slice failure: \
+                                 skipping pre-exit repair turn (Issue #343)"
+                            );
+                            break;
+                        }
+
                         // Issue #327: record pending count before repair and activate
                         // closure mode to reject unchecked plan expansion.
                         let pending_before = self

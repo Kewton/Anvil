@@ -113,6 +113,38 @@ pub struct FixSliceProposal {
     pub rationale: String,
 }
 
+/// Why a FixSlice worker invocation failed to reach a successful worker
+/// mutation (Issue #343).
+///
+/// Emitted by `handle_fixslice_result` and recorded on `AgentTelemetry` via
+/// `record_fixslice_worker_failure`. The runtime uses the recorded failure
+/// to decide whether the pre-exit repair turn should still be injected under
+/// a `requires_worker_observation` pack — see
+/// `AgentTelemetry::should_skip_pre_exit_repair_for_worker_failure`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FixSliceFailureReason {
+    /// Worker finished (normal termination) without emitting a proposal.
+    NoProposal,
+    /// Worker emitted a proposal but `validate_fix_proposal` rejected it.
+    ProposalValidationFailed,
+    /// Proposal was valid, but the worker-owned `file.rewrite` did not
+    /// complete cleanly (failed / rolled back / produced a no-op diff).
+    RewriteFailed,
+    /// Worker hit its iteration cap before producing a proposal.
+    MaxIterationsReached,
+}
+
+impl std::fmt::Display for FixSliceFailureReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoProposal => write!(f, "no_proposal"),
+            Self::ProposalValidationFailed => write!(f, "proposal_validation_failed"),
+            Self::RewriteFailed => write!(f, "rewrite_failed"),
+            Self::MaxIterationsReached => write!(f, "max_iterations_reached"),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Pack expectation / validation gate (Issue #329)
 // ---------------------------------------------------------------------------
@@ -441,6 +473,23 @@ pub struct AgentTelemetry {
     /// `None` when expectation is satisfied or unset.
     #[serde(default)]
     pub expectation_mismatch_reason: Option<String>,
+
+    /// Number of times a FixSlice worker invocation failed to reach a
+    /// successful worker mutation (Issue #343).
+    ///
+    /// Counts every failure class (`no_proposal`, `proposal_validation_failed`,
+    /// `rewrite_failed`, `max_iterations_reached`). Independent of
+    /// `fixslice_escalation_count`, which tracks request-side escalation
+    /// emission.
+    #[serde(default)]
+    pub fixslice_worker_failure_count: u32,
+
+    /// Most recent FixSlice worker failure reason (Issue #343).
+    ///
+    /// Serialized as the snake_case form of `FixSliceFailureReason`.
+    /// `None` until the first failure is recorded.
+    #[serde(default)]
+    pub fixslice_failure_reason: Option<String>,
 }
 
 impl AgentTelemetry {
@@ -611,6 +660,43 @@ impl AgentTelemetry {
         self.worker_observed = true;
     }
 
+    /// Record a FixSlice worker failure (Issue #343).
+    ///
+    /// Called from `handle_fixslice_result` whenever an invocation of
+    /// `agent.fix_slice` does not reach a successful worker mutation. Bumps
+    /// the running count and stores the latest reason. Does NOT touch
+    /// `worker_observed`: success-side semantics are preserved from Issue #339.
+    pub fn record_fixslice_worker_failure(&mut self, reason: FixSliceFailureReason) {
+        self.fixslice_worker_failure_count += 1;
+        self.fixslice_failure_reason = Some(reason.to_string());
+    }
+
+    /// Whether any FixSlice worker failure has been recorded (Issue #343).
+    pub fn has_fixslice_worker_failure(&self) -> bool {
+        self.fixslice_worker_failure_count > 0
+    }
+
+    /// Whether the pre-exit repair turn should be skipped because the
+    /// worker path has already failed under a `requires_worker_observation`
+    /// pack (Issue #343).
+    ///
+    /// Returns true when all of the following hold:
+    /// - `pack_expectation` is `RequiresWorkerObservation`,
+    /// - at least one FixSlice worker failure has been recorded,
+    /// - `worker_observed` is still false.
+    ///
+    /// The agentic loop uses this to bail out cleanly instead of injecting
+    /// a repair turn that would only flip `repair_turn_observed` and
+    /// degrade `completion_kind` to `partial` without ever satisfying the
+    /// pack expectation.
+    pub fn should_skip_pre_exit_repair_for_worker_failure(&self) -> bool {
+        matches!(
+            self.pack_expectation,
+            Some(PackExpectation::RequiresWorkerObservation)
+        ) && self.has_fixslice_worker_failure()
+            && !self.worker_observed
+    }
+
     /// Retrospectively classify the session as a repair-turn-only salvage (Issue #332).
     ///
     /// Fires at most once per session. A salvage run is one where:
@@ -747,6 +833,9 @@ impl AgentTelemetry {
             "fixslice_escalation_stagnation_count": self.fixslice_escalation_stagnation_count,
             "fixslice_escalation_repair_salvage_count":
                 self.fixslice_escalation_repair_salvage_count,
+            // Issue #343: fix_slice worker failure taxonomy.
+            "fixslice_worker_failure_count": self.fixslice_worker_failure_count,
+            "fixslice_failure_reason": self.fixslice_failure_reason,
         });
 
         let json_bytes = serde_json::to_vec_pretty(&payload)?;
