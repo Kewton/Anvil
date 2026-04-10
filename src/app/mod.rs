@@ -919,7 +919,7 @@ impl App {
     ///
     /// Should be called once when the session actually ends (interactive exit
     /// or non-interactive completion), not per-turn.
-    pub(crate) fn log_session_summary(&self) {
+    pub(crate) fn log_session_summary(&mut self) {
         let session_elapsed = self
             .session_stats
             .session_start
@@ -978,6 +978,35 @@ impl App {
                 pre_exit_repair_consumed_count = tel.pre_exit_repair_consumed_count,
                 "agent telemetry"
             );
+        }
+
+        // Issue #329: Validate pack expectation gate before writing artifact.
+        {
+            let result = self.agent_telemetry.validate_pack_expectation();
+            match &result {
+                crate::contracts::PackValidationResult::NoExpectation => {}
+                crate::contracts::PackValidationResult::Satisfied => {
+                    tracing::info!(
+                        pack_expectation = %self.agent_telemetry.pack_expectation
+                            .map(|e| e.to_string())
+                            .unwrap_or_default(),
+                        "pack validation gate: satisfied"
+                    );
+                }
+                crate::contracts::PackValidationResult::Mismatch {
+                    expectation,
+                    reason,
+                } => {
+                    tracing::warn!(
+                        pack_expectation = %expectation,
+                        reason = %reason,
+                        mutation_observed = self.agent_telemetry.mutation_observed,
+                        worker_observed = self.agent_telemetry.worker_observed,
+                        repair_turn_observed = self.agent_telemetry.repair_turn_observed,
+                        "pack validation gate: expectation mismatch"
+                    );
+                }
+            }
         }
 
         // Issue #271: Write telemetry artifact (opt-in via ANVIL_TELEMETRY_DIR).
