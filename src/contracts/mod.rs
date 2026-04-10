@@ -290,6 +290,22 @@ pub struct AgentTelemetry {
     /// Number of pre-exit repair turns actually consumed by the LLM (Issue #325).
     #[serde(default)]
     pub pre_exit_repair_consumed_count: u32,
+
+    /// Number of unchecked plan items rejected during repair closure mode (Issue #327).
+    #[serde(default)]
+    pub repair_turn_items_rejected: u32,
+
+    /// Number of plan items retired during repair turn (Issue #327).
+    #[serde(default)]
+    pub repair_turn_items_retired: u32,
+
+    /// Number of pending plan items before repair turn (Issue #327).
+    #[serde(default)]
+    pub repair_turn_pending_before: Option<u32>,
+
+    /// Number of pending plan items after repair turn (Issue #327).
+    #[serde(default)]
+    pub repair_turn_pending_after: Option<u32>,
 }
 
 impl AgentTelemetry {
@@ -369,6 +385,26 @@ impl AgentTelemetry {
     /// Record a pre-exit repair turn consumed by LLM (Issue #325).
     pub fn record_pre_exit_repair_consumed(&mut self) {
         self.pre_exit_repair_consumed_count += 1;
+    }
+
+    /// Record unchecked items rejected during repair closure mode (Issue #327).
+    pub fn record_repair_turn_items_rejected(&mut self, count: u32) {
+        self.repair_turn_items_rejected += count;
+    }
+
+    /// Record items retired during repair turn (Issue #327).
+    pub fn record_repair_turn_items_retired(&mut self, count: u32) {
+        self.repair_turn_items_retired += count;
+    }
+
+    /// Snapshot pending item count before repair turn (Issue #327).
+    pub fn record_repair_turn_pending_before(&mut self, count: u32) {
+        self.repair_turn_pending_before = Some(count);
+    }
+
+    /// Snapshot pending item count after repair turn (Issue #327).
+    pub fn record_repair_turn_pending_after(&mut self, count: u32) {
+        self.repair_turn_pending_after = Some(count);
     }
 
     /// Record a pre-mutation barrier block (Issue #303).
