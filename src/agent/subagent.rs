@@ -30,8 +30,17 @@ use std::time::{Duration, Instant};
 // FixSlice budget constants (Issue #291, DR1-004: code-level const)
 // ---------------------------------------------------------------------------
 
-/// Maximum iterations for a FixSlice sub-agent run.
-pub const FIXSLICE_MAX_ITERATIONS: u32 = 3;
+/// Default value for the runtime `fixslice_max_iterations` knob (Issue #345).
+///
+/// Since Issue #345 the iteration cap is configurable. This const is kept so
+/// tests and config defaults can reference the historical value in a single
+/// place. Runtime callers should read
+/// `EffectiveConfig::runtime::fixslice_max_iterations` instead.
+pub const DEFAULT_FIXSLICE_MAX_ITERATIONS: u32 = 3;
+/// Back-compat alias for `DEFAULT_FIXSLICE_MAX_ITERATIONS` (Issue #291 /
+/// Issue #345). Kept so external callers that imported the old name continue
+/// to compile; prefer the runtime config at the call site.
+pub const FIXSLICE_MAX_ITERATIONS: u32 = DEFAULT_FIXSLICE_MAX_ITERATIONS;
 /// Wall-clock timeout (seconds) for a FixSlice sub-agent run.
 pub const FIXSLICE_TIMEOUT_SECS: u64 = 60;
 /// Maximum allowed value for `max_lines` in agent.fix_slice input.
@@ -269,6 +278,109 @@ impl SubAgentKind {
     }
 }
 
+/// Why a FixSlice sub-agent finished without a usable `FixSliceProposal`
+/// (Issue #345).
+///
+/// Surfaces the parse outcome to `handle_fixslice_result` so it can record a
+/// granular `FixSliceFailureReason` instead of lumping everything into
+/// `NoProposal`. `None` on `SubAgentResult::fix_proposal_failure` means the
+/// worker either produced a usable proposal (possibly salvaged) or the result
+/// came from a non-FixSlice kind where this field is irrelevant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FixProposalParseFailure {
+    /// Final response was empty (or whitespace-only) after trimming.
+    EmptyFinal,
+    /// Final response was non-empty but could not be parsed into a
+    /// `FixSliceProposal`, even after the salvage pass that extracts the
+    /// first embedded JSON object.
+    ParseFailed,
+    /// Worker terminated without emitting a final response of its own — the
+    /// result was built from a partial/max-iterations exit path. Treated as
+    /// distinct from `EmptyFinal` because it reflects loop exhaustion rather
+    /// than a blank model output.
+    NoFinal,
+}
+
+/// Outcome of `try_parse_fix_proposal` (Issue #345).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FixProposalParseOutcome {
+    /// The full `final_response` parsed as strict JSON.
+    Parsed(FixSliceProposal),
+    /// The first balanced `{...}` substring parsed as JSON after the strict
+    /// parse failed.
+    Salvaged(FixSliceProposal),
+    /// `final_response` was blank after trimming.
+    EmptyFinal,
+    /// `final_response` was non-empty but no JSON object could be extracted.
+    ParseFailed,
+}
+
+/// Extract a `FixSliceProposal` from a worker's final response (Issue #345).
+///
+/// Tries a strict parse first, then falls back to extracting the first
+/// balanced `{...}` substring from the text. The depth scanner tracks JSON
+/// string state so braces inside string literals (e.g. Rust code in
+/// `replacement_content`) don't throw off the bracket count.
+pub fn try_parse_fix_proposal(final_response: &str) -> FixProposalParseOutcome {
+    let trimmed = final_response.trim();
+    if trimmed.is_empty() {
+        return FixProposalParseOutcome::EmptyFinal;
+    }
+    if let Ok(parsed) = serde_json::from_str::<FixSliceProposal>(trimmed) {
+        return FixProposalParseOutcome::Parsed(parsed);
+    }
+    if let Some(slice) = extract_first_json_object(trimmed)
+        && let Ok(parsed) = serde_json::from_str::<FixSliceProposal>(slice)
+    {
+        return FixProposalParseOutcome::Salvaged(parsed);
+    }
+    FixProposalParseOutcome::ParseFailed
+}
+
+/// Return the first balanced `{...}` substring from `text`, respecting JSON
+/// string state so braces inside string literals don't unbalance the scan.
+fn extract_first_json_object(text: &str) -> Option<&str> {
+    let bytes = text.as_bytes();
+    let mut start: Option<usize> = None;
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut escape = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if in_string {
+            if escape {
+                escape = false;
+            } else if b == b'\\' {
+                escape = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => {
+                in_string = true;
+            }
+            b'{' => {
+                if start.is_none() {
+                    start = Some(i);
+                }
+                depth += 1;
+            }
+            b'}' => {
+                if depth > 0 {
+                    depth -= 1;
+                    if depth == 0 {
+                        let s = start?;
+                        return Some(&text[s..=i]);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Result returned by a successful sub-agent run.
 // TODO(DR1-001): When a 4th sub-agent kind is added, refactor SubAgentResult
 // into an enum to avoid accumulating Option fields.
@@ -281,6 +393,13 @@ pub struct SubAgentResult {
     pub iterations_used: u32,
     /// FixSlice proposal extracted from ANVIL_FINAL (Issue #291).
     pub fix_proposal: Option<FixSliceProposal>,
+    /// Why `fix_proposal` is `None` for FixSlice runs (Issue #345).
+    ///
+    /// `None` when the result produced a usable proposal or the run was not
+    /// a FixSlice sub-agent. Populated by `run_turn` / `build_partial_result`
+    /// for the FixSlice kind so `handle_fixslice_result` can pick a precise
+    /// `FixSliceFailureReason` classification.
+    pub fix_proposal_failure: Option<FixProposalParseFailure>,
 }
 
 impl SubAgentResult {
@@ -594,14 +713,31 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
                 crate::contracts::tokens::ContentKind::Text,
             );
 
-            // FixSlice: parse ANVIL_FINAL as FixSliceProposal (Issue #291, DR1-007)
+            // FixSlice: parse ANVIL_FINAL as FixSliceProposal.
+            // Issue #291, DR1-007: strict JSON parse.
+            // Issue #345: fall back to a salvage pass and report the parse
+            // outcome so the parent can classify `no_proposal` sub-classes.
             if self.kind == SubAgentKind::FixSlice {
-                let fix_proposal =
-                    serde_json::from_str::<FixSliceProposal>(&structured.final_response).ok();
-                let payload = SubAgentPayload::fallback(
-                    if fix_proposal.is_some() {
-                        "fix-slice proposal parsed successfully".to_string()
-                    } else {
+                let outcome = try_parse_fix_proposal(&structured.final_response);
+                let (fix_proposal, fix_proposal_failure, summary) = match outcome {
+                    FixProposalParseOutcome::Parsed(p) => (
+                        Some(p),
+                        None,
+                        "fix-slice proposal parsed successfully".to_string(),
+                    ),
+                    FixProposalParseOutcome::Salvaged(p) => (
+                        Some(p),
+                        None,
+                        "fix-slice proposal salvaged from embedded JSON".to_string(),
+                    ),
+                    FixProposalParseOutcome::EmptyFinal => (
+                        None,
+                        Some(FixProposalParseFailure::EmptyFinal),
+                        "fix-slice proposal missing: empty final response".to_string(),
+                    ),
+                    FixProposalParseOutcome::ParseFailed => (
+                        None,
+                        Some(FixProposalParseFailure::ParseFailed),
                         format!(
                             "fix-slice proposal parse failed: {}",
                             &structured
@@ -609,15 +745,16 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
                                 .chars()
                                 .take(200)
                                 .collect::<String>()
-                        )
-                    },
-                    TerminationReason::Completed,
-                );
+                        ),
+                    ),
+                };
+                let payload = SubAgentPayload::fallback(summary, TerminationReason::Completed);
                 return Ok(TurnOutcome::Finished(Box::new(SubAgentResult {
                     payload,
                     estimated_tokens: tokens,
                     iterations_used: self.iterations_used,
                     fix_proposal,
+                    fix_proposal_failure,
                 })));
             }
 
@@ -627,6 +764,7 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
                 estimated_tokens: tokens,
                 iterations_used: self.iterations_used,
                 fix_proposal: None,
+                fix_proposal_failure: None,
             })));
         }
 
@@ -728,8 +866,9 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
         eprintln!("[subagent:{kind_label}] Starting...");
         let start = Instant::now();
         let (max_iterations, timeout) = if self.kind == SubAgentKind::FixSlice {
+            // Issue #345: runtime-configurable iteration cap.
             (
-                FIXSLICE_MAX_ITERATIONS,
+                self.config.runtime.fixslice_max_iterations,
                 Duration::from_secs(FIXSLICE_TIMEOUT_SECS),
             )
         } else {
@@ -785,6 +924,26 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
             .map(|m| m.content.clone())
             .unwrap_or_default();
 
+        // Issue #345: attempt to salvage a proposal from the last assistant
+        // message even on a partial exit path. Timeout / max-iterations paths
+        // sometimes have a valid-looking ANVIL_FINAL in the last turn that
+        // the strict main path never got to parse.
+        let (fix_proposal, fix_proposal_failure) = if self.kind == SubAgentKind::FixSlice {
+            match try_parse_fix_proposal(&raw_summary) {
+                FixProposalParseOutcome::Parsed(p) | FixProposalParseOutcome::Salvaged(p) => {
+                    (Some(p), None)
+                }
+                FixProposalParseOutcome::EmptyFinal => {
+                    (None, Some(FixProposalParseFailure::NoFinal))
+                }
+                FixProposalParseOutcome::ParseFailed => {
+                    (None, Some(FixProposalParseFailure::ParseFailed))
+                }
+            }
+        } else {
+            (None, None)
+        };
+
         SubAgentResult {
             payload: SubAgentPayload {
                 found_files: vec![],
@@ -796,7 +955,8 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
             },
             estimated_tokens: 0,
             iterations_used: iterations,
-            fix_proposal: None,
+            fix_proposal,
+            fix_proposal_failure,
         }
     }
 }

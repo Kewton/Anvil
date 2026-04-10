@@ -201,6 +201,12 @@ pub struct RuntimeConfig {
     /// Minimum `turns_since_last_mutation` required to treat a session as
     /// read-heavy drift and escalate to the worker path (Issue #334).
     pub edit_fixslice_read_heavy_drought_threshold: u32,
+    /// Maximum iterations allowed inside a FixSlice sub-agent run (Issue #345).
+    ///
+    /// Previously hard-coded to 3 at `crate::agent::subagent::FIXSLICE_MAX_ITERATIONS`;
+    /// now configurable so brittle-model workloads can be granted more
+    /// attempts to produce a valid `FixSliceProposal`. Clamped to `[1, 10]`.
+    pub fixslice_max_iterations: u32,
     /// Maximum line count for file.write on existing files (0 = disabled, Issue #156).
     pub safe_write_max_lines: usize,
     /// Deletion ratio threshold for diff warning (0.0-1.0, Issue #156).
@@ -402,6 +408,7 @@ impl EffectiveConfig {
                 edit_fixslice_stagnation_score_threshold: 2,
                 edit_fixslice_read_heavy_score_threshold: 2,
                 edit_fixslice_read_heavy_drought_threshold: 5,
+                fixslice_max_iterations: crate::agent::subagent::DEFAULT_FIXSLICE_MAX_ITERATIONS,
                 safe_write_max_lines: 500,
                 safe_write_deletion_ratio: 0.5,
                 read_repeat_warn_threshold: 3,
@@ -935,6 +942,15 @@ impl EffectiveConfig {
                     }
                     self.runtime.edit_fixslice_read_heavy_drought_threshold = v;
                 }
+                "fixslice_max_iterations" | "ANVIL_FIXSLICE_MAX_ITERATIONS" => {
+                    let v: u32 = value
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                    if !(1..=10).contains(&v) {
+                        return Err(ConfigError::InvalidNumericValue(value.clone()));
+                    }
+                    self.runtime.fixslice_max_iterations = v;
+                }
                 "edit_recovery_read_budget" | "ANVIL_EDIT_RECOVERY_READ_BUDGET" => {
                     let v: u32 = value
                         .parse()
@@ -1267,6 +1283,8 @@ impl EffectiveConfig {
             .clamp(1, 40);
         self.runtime.edit_recovery_read_budget =
             self.runtime.edit_recovery_read_budget.clamp(1, 10);
+        // Issue #345: clamp fix_slice worker iteration cap to [1, 10].
+        self.runtime.fixslice_max_iterations = self.runtime.fixslice_max_iterations.clamp(1, 10);
     }
 
     pub fn validate_for_test(&mut self) -> Result<(), ConfigError> {
@@ -1642,6 +1660,7 @@ impl std::fmt::Debug for RuntimeConfig {
                 "edit_fixslice_read_heavy_drought_threshold",
                 &self.edit_fixslice_read_heavy_drought_threshold,
             )
+            .field("fixslice_max_iterations", &self.fixslice_max_iterations)
             .field("safe_write_max_lines", &self.safe_write_max_lines)
             .field("safe_write_deletion_ratio", &self.safe_write_deletion_ratio)
             .field("edit_recovery_read_budget", &self.edit_recovery_read_budget)

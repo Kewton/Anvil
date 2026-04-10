@@ -114,33 +114,54 @@ pub struct FixSliceProposal {
 }
 
 /// Why a FixSlice worker invocation failed to reach a successful worker
-/// mutation (Issue #343).
+/// mutation (Issue #343, extended in Issue #345).
 ///
-/// Emitted by `handle_fixslice_result` and recorded on `AgentTelemetry` via
-/// `record_fixslice_worker_failure`. The runtime uses the recorded failure
+/// Emitted by `handle_fixslice_result` (per-invocation) and by
+/// `AgentTelemetry::finalize_fixslice_outcome` (session wrap-up) and recorded
+/// via `record_fixslice_worker_failure`. The runtime uses the recorded failure
 /// to decide whether the pre-exit repair turn should still be injected under
 /// a `requires_worker_observation` pack — see
 /// `AgentTelemetry::should_skip_pre_exit_repair_for_worker_failure`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FixSliceFailureReason {
-    /// Worker finished (normal termination) without emitting a proposal.
+    /// Worker finished (normal termination) with a blank / tool-only final
+    /// response. Narrow sense after Issue #345 — parse failures and path
+    /// mismatches now get their own variants.
     NoProposal,
-    /// Worker emitted a proposal but `validate_fix_proposal` rejected it.
+    /// Worker produced a non-empty final response but it could not be parsed
+    /// into a `FixSliceProposal`, even after the salvage pass that extracts
+    /// embedded JSON (Issue #345).
+    ProposalParseFailed,
+    /// Worker returned a parseable proposal but its `target_path` did not
+    /// match the original target (Issue #345). Previously lumped into
+    /// `ProposalValidationFailed`; split out because it is the most actionable
+    /// subclass of the B1 shape.
+    PathMismatch,
+    /// Worker emitted a proposal but `validate_fix_proposal` rejected it for
+    /// a reason other than path mismatch (sandbox, control chars, empty
+    /// replacement, line range).
     ProposalValidationFailed,
     /// Proposal was valid, but the worker-owned `file.rewrite` did not
     /// complete cleanly (failed / rolled back / produced a no-op diff).
     RewriteFailed,
     /// Worker hit its iteration cap before producing a proposal.
     MaxIterationsReached,
+    /// An escalation hint fired, but `agent.fix_slice` was never invoked by
+    /// the LLM during the session (Issue #345, A1 shape). Recorded only at
+    /// session wrap-up via `finalize_fixslice_outcome`.
+    EscalatedNotInvoked,
 }
 
 impl std::fmt::Display for FixSliceFailureReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NoProposal => write!(f, "no_proposal"),
+            Self::ProposalParseFailed => write!(f, "proposal_parse_failed"),
+            Self::PathMismatch => write!(f, "path_mismatch"),
             Self::ProposalValidationFailed => write!(f, "proposal_validation_failed"),
             Self::RewriteFailed => write!(f, "rewrite_failed"),
             Self::MaxIterationsReached => write!(f, "max_iterations_reached"),
+            Self::EscalatedNotInvoked => write!(f, "escalated_not_invoked"),
         }
     }
 }
@@ -490,6 +511,18 @@ pub struct AgentTelemetry {
     /// `None` until the first failure is recorded.
     #[serde(default)]
     pub fixslice_failure_reason: Option<String>,
+
+    /// Number of times `agent.fix_slice` was actually invoked during the
+    /// session (Issue #345).
+    ///
+    /// Incremented before `handle_fixslice_result` runs, so the counter
+    /// reflects every invocation attempt regardless of whether the worker
+    /// reached a successful mutation. Used by `finalize_fixslice_outcome` to
+    /// distinguish the A1 shape (`fixslice_escalation_count > 0` but
+    /// `fixslice_worker_invocation_count == 0`) from a session where the
+    /// worker was invoked and failed for a concrete reason.
+    #[serde(default)]
+    pub fixslice_worker_invocation_count: u32,
 }
 
 impl AgentTelemetry {
@@ -671,6 +704,41 @@ impl AgentTelemetry {
         self.fixslice_failure_reason = Some(reason.to_string());
     }
 
+    /// Record an `agent.fix_slice` invocation attempt (Issue #345).
+    ///
+    /// Called from the agentic loop before `handle_fixslice_result` runs so
+    /// the counter reflects every attempted invocation, even ones that fail
+    /// before producing a proposal.
+    pub fn record_fixslice_worker_invocation(&mut self) {
+        self.fixslice_worker_invocation_count += 1;
+    }
+
+    /// Classify the session's FixSlice outcome at wrap-up time (Issue #345).
+    ///
+    /// When one or more escalations fired but `agent.fix_slice` was never
+    /// actually invoked and no worker success was recorded, the session is
+    /// the A1 shape from Issue #345: the LLM ignored the escalation hint and
+    /// the parent's own `file.edit` landed the mutation. This records an
+    /// `EscalatedNotInvoked` failure so telemetry and the pre-exit repair
+    /// guard can distinguish it from sessions that never escalated.
+    ///
+    /// Idempotent: calling this more than once will not double-record the
+    /// failure. Safe to invoke from multiple loop exit branches.
+    pub fn finalize_fixslice_outcome(&mut self) {
+        if self.fixslice_escalation_count == 0
+            || self.fixslice_worker_invocation_count > 0
+            || self.worker_observed
+        {
+            return;
+        }
+        if self.fixslice_failure_reason.as_deref()
+            == Some(&FixSliceFailureReason::EscalatedNotInvoked.to_string())
+        {
+            return;
+        }
+        self.record_fixslice_worker_failure(FixSliceFailureReason::EscalatedNotInvoked);
+    }
+
     /// Whether any FixSlice worker failure has been recorded (Issue #343).
     pub fn has_fixslice_worker_failure(&self) -> bool {
         self.fixslice_worker_failure_count > 0
@@ -836,6 +904,8 @@ impl AgentTelemetry {
             // Issue #343: fix_slice worker failure taxonomy.
             "fixslice_worker_failure_count": self.fixslice_worker_failure_count,
             "fixslice_failure_reason": self.fixslice_failure_reason,
+            // Issue #345: fix_slice worker invocation tracking.
+            "fixslice_worker_invocation_count": self.fixslice_worker_invocation_count,
         });
 
         let json_bytes = serde_json::to_vec_pretty(&payload)?;

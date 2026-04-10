@@ -3044,6 +3044,7 @@ fn subagent_result_into_tool_execution_result_json_payload() {
         estimated_tokens: 100,
         iterations_used: 2,
         fix_proposal: None,
+        fix_proposal_failure: None,
     };
 
     let tool_result = result.into_tool_execution_result(&call);
@@ -3081,6 +3082,7 @@ fn subagent_result_timeout_into_tool_execution_result() {
         estimated_tokens: 0,
         iterations_used: 5,
         fix_proposal: None,
+        fix_proposal_failure: None,
     };
 
     let tool_result = result.into_tool_execution_result(&call);
