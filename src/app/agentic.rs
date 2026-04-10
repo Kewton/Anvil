@@ -673,6 +673,10 @@ impl App {
         let mut noplan_suppression_count: u8 = 0;
         // Issue #303: pre-mutation plan barrier.
         let mut mutation_barrier = super::mutation_barrier::MutationBarrier::new();
+        // Issue #325: track whether a pre-exit repair turn was injected.
+        // When true, the next iteration processes the repair turn's LLM response
+        // before terminating the loop.
+        let mut pre_exit_repair_injected = false;
 
         for iteration in 0..max_iterations {
             let iteration_started = std::time::Instant::now();
@@ -1079,6 +1083,15 @@ impl App {
                 self.phase_estimator.observe_anvil_final();
             }
 
+            // Issue #325: if the pre-exit repair turn was injected on the previous
+            // iteration, the LLM has now consumed it and responded. Terminate the
+            // loop — the repair turn has had its chance.
+            if pre_exit_repair_injected {
+                self.agent_telemetry.record_pre_exit_repair_consumed();
+                tracing::info!("pre-exit repair turn consumed; terminating loop");
+                break;
+            }
+
             // Plan repair request.
             if crate::app::stagnation_state::should_request_plan_repair(
                 &self.stagnation_state,
@@ -1099,8 +1112,10 @@ impl App {
                     plan_repair_count_before_this_turn,
                     remaining_turns,
                 ) {
-                    // Issue #309: inject structured repair turn before termination.
-                    // Give the agent one last chance to close remaining items.
+                    // Issue #325: inject structured repair turn and continue for one
+                    // more LLM turn so the model actually sees the repair message.
+                    // Previously (Issue #309) the message was injected then immediately
+                    // discarded by the same-branch `break`.
                     if !self.execution_plan.is_empty()
                         && !self.execution_plan.is_successfully_completed()
                     {
@@ -1108,7 +1123,13 @@ impl App {
                         let msg = SessionMessage::new(MessageRole::Tool, "system", repair_msg)
                             .with_id(self.next_message_id("tool"));
                         self.session.push_message(msg);
-                        tracing::info!("pre-exit repair turn injected before escape hatch");
+                        self.agent_telemetry.record_pre_exit_repair_injected();
+                        tracing::info!(
+                            "pre-exit repair turn injected; continuing for one more LLM turn"
+                        );
+                        pre_exit_repair_injected = true;
+                        current = next_structured;
+                        continue;
                     }
                     tracing::warn!(
                         score = stagnation_score,
