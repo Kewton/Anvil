@@ -58,11 +58,26 @@ fn mutation_observed_set_by_record_mutation_turn() {
     assert!(tel.mutation_observed);
 }
 
+// Issue #339: escalation is a request-side signal and MUST NOT flip the
+// success-side `worker_observed` flag. Only `record_worker_success()` —
+// called after a real post-execution worker mutation — may set it.
 #[test]
-fn worker_observed_set_by_record_fixslice_escalation() {
+fn worker_observed_not_set_by_record_fixslice_escalation() {
     let mut tel = AgentTelemetry::new();
     assert!(!tel.worker_observed);
     tel.record_fixslice_escalation();
+    assert!(
+        !tel.worker_observed,
+        "escalation-emission must not flip worker_observed"
+    );
+    assert_eq!(tel.fixslice_escalation_count, 1);
+}
+
+#[test]
+fn worker_observed_set_by_record_worker_success() {
+    let mut tel = AgentTelemetry::new();
+    assert!(!tel.worker_observed);
+    tel.record_worker_success();
     assert!(tel.worker_observed);
 }
 
@@ -153,10 +168,26 @@ fn validate_requires_worker_observation_mismatch_when_nothing_observed() {
     }
 }
 
+// Issue #339: escalation alone must NOT satisfy the worker gate.
+// Only a real post-execution worker success does.
 #[test]
-fn validate_requires_worker_observation_satisfied_by_fixslice() {
+fn validate_requires_worker_observation_mismatch_when_only_escalation_emitted() {
     let mut tel = AgentTelemetry::new();
     tel.record_fixslice_escalation();
+    let result = tel.validate_against(PackExpectation::RequiresWorkerObservation);
+    match &result {
+        PackValidationResult::Mismatch { expectation, .. } => {
+            assert_eq!(*expectation, PackExpectation::RequiresWorkerObservation);
+        }
+        other => panic!("expected Mismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn validate_requires_worker_observation_satisfied_by_worker_success() {
+    let mut tel = AgentTelemetry::new();
+    tel.record_fixslice_escalation();
+    tel.record_worker_success();
     let result = tel.validate_against(PackExpectation::RequiresWorkerObservation);
     assert_eq!(result, PackValidationResult::Satisfied);
 }
@@ -210,10 +241,21 @@ fn validate_requires_worker_observation_mismatch_when_repair_plus_mutation() {
     assert!(matches!(result, PackValidationResult::Mismatch { .. }));
 }
 
+// Issue #339: stagnation-triggered escalation alone must also not satisfy
+// the gate. Worker success telemetry must come from record_worker_success().
 #[test]
-fn validate_requires_worker_observation_satisfied_only_by_worker_observed() {
+fn validate_requires_worker_observation_mismatch_when_only_stagnation_escalation() {
     let mut tel = AgentTelemetry::new();
     tel.record_fixslice_escalation_stagnation();
+    let result = tel.validate_against(PackExpectation::RequiresWorkerObservation);
+    assert!(matches!(result, PackValidationResult::Mismatch { .. }));
+}
+
+#[test]
+fn validate_requires_worker_observation_satisfied_only_by_worker_success() {
+    let mut tel = AgentTelemetry::new();
+    tel.record_fixslice_escalation_stagnation();
+    tel.record_worker_success();
     let result = tel.validate_against(PackExpectation::RequiresWorkerObservation);
     assert_eq!(result, PackValidationResult::Satisfied);
 }
@@ -231,6 +273,7 @@ fn telemetry_artifact_includes_pack_validation_fields() {
     let mut tel = AgentTelemetry::new();
     tel.record_mutation_turn(1, Some(0.3), "file.write");
     tel.record_fixslice_escalation();
+    tel.record_worker_success();
     tel.record_pre_exit_repair_injected();
     tel.pack_expectation = Some(PackExpectation::RequiresWorkerObservation);
 

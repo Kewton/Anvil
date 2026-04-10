@@ -520,6 +520,19 @@ impl App {
         let rewrite_request = build_rewrite_request(&proposal, &call.tool_call_id);
         let rewrite_result = self.execute_single(rewrite_request);
 
+        // Issue #339: flip worker_observed only after a real post-execution
+        // worker mutation. The rewrite must be completed, not rolled back,
+        // and produce a non-empty / non-no-op summary — mirroring the
+        // record_mutation_turn guard so the two telemetry flags stay
+        // consistent.
+        if rewrite_result.status == ToolExecutionStatus::Completed
+            && !rewrite_result.rolled_back
+            && !rewrite_result.summary.is_empty()
+            && !rewrite_result.summary.contains("(no changes)")
+        {
+            self.agent_telemetry.record_worker_success();
+        }
+
         // Build agent.fix_slice summary result
         let rationale = sanitize_for_display(&proposal.rationale);
         let fix_summary = ToolExecutionResult {

@@ -417,7 +417,15 @@ pub struct AgentTelemetry {
     #[serde(default)]
     pub mutation_observed: bool,
 
-    /// Whether the worker path (fix_slice escalation) was observed.
+    /// Whether the worker path produced a real post-execution mutation
+    /// (Issue #339).
+    ///
+    /// Set to true ONLY after a successful `agent.fix_slice` →
+    /// `file.rewrite` execution whose result survived rollback and no-op
+    /// filtering. Emitting a fix_slice escalation hint does NOT flip this
+    /// flag — escalation-emission is the request side and is tracked by
+    /// `fixslice_escalation_count` / `fixslice_escalation_same_path_count`
+    /// / `fixslice_escalation_stagnation_count`.
     #[serde(default)]
     pub worker_observed: bool,
 
@@ -570,22 +578,36 @@ impl AgentTelemetry {
     ///
     /// Triggered when consecutive edit failures on a single path reach the
     /// `edit_fixslice_threshold`. Bumps both the overall count and the
-    /// same-path counter and flips `worker_observed`.
+    /// same-path counter.
+    ///
+    /// Issue #339: this is a request-side signal (the runtime emitted the
+    /// escalation hint) and MUST NOT flip `worker_observed`. The success-
+    /// side flag is only set by [`record_worker_success`] after a real
+    /// post-execution worker mutation.
     pub fn record_fixslice_escalation(&mut self) {
         self.fixslice_escalation_count += 1;
         self.fixslice_escalation_same_path_count += 1;
-        self.worker_observed = true;
     }
 
     /// Record a stagnation-triggered fix_slice escalation (Issue #332).
     ///
     /// Triggered when the model scatters edit failures across multiple files
     /// so no same-path threshold is reached, but the session is clearly
-    /// stagnating. Bumps the overall count and the stagnation counter, and
-    /// flips `worker_observed`.
+    /// stagnating. Bumps the overall count and the stagnation counter.
+    ///
+    /// Issue #339: request-side only — does NOT flip `worker_observed`.
     pub fn record_fixslice_escalation_stagnation(&mut self) {
         self.fixslice_escalation_count += 1;
         self.fixslice_escalation_stagnation_count += 1;
+    }
+
+    /// Record a real post-execution worker event (Issue #339).
+    ///
+    /// Called only after the agent actually invoked `agent.fix_slice` and
+    /// its resulting `file.rewrite` completed without rollback and with a
+    /// non-empty, non-no-op summary. This is the success-side flag the
+    /// pack validation gate trusts.
+    pub fn record_worker_success(&mut self) {
         self.worker_observed = true;
     }
 
