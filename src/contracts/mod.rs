@@ -393,6 +393,13 @@ pub struct AgentTelemetry {
     #[serde(default)]
     pub repair_turn_items_rejected: u32,
 
+    /// Number of unchecked plan items rejected by the late-stage closure guard
+    /// (Issue #336).  Counts follow-up `ANVIL_PLAN` / `ANVIL_PLAN_UPDATE` items
+    /// that targeted the single remaining plan item while late-stage closure
+    /// mode was active, preventing endless supersede→append churn.
+    #[serde(default)]
+    pub late_stage_closure_items_rejected: u32,
+
     /// Number of plan items retired during repair turn (Issue #327).
     #[serde(default)]
     pub repair_turn_items_retired: u32,
@@ -512,6 +519,11 @@ impl AgentTelemetry {
     /// Record unchecked items rejected during repair closure mode (Issue #327).
     pub fn record_repair_turn_items_rejected(&mut self, count: u32) {
         self.repair_turn_items_rejected += count;
+    }
+
+    /// Record unchecked items rejected by the late-stage closure guard (Issue #336).
+    pub fn record_late_stage_closure_items_rejected(&mut self, count: u32) {
+        self.late_stage_closure_items_rejected += count;
     }
 
     /// Record items retired during repair turn (Issue #327).

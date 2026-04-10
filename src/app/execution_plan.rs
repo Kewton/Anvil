@@ -166,7 +166,7 @@ impl App {
                 .record_repair_turn_items_retired(retire_count);
         }
 
-        let new_items = filter_unchecked_items(all_items, &checked_indices);
+        let mut new_items = filter_unchecked_items(all_items, &checked_indices);
         if new_items.is_empty() {
             if had_retire {
                 tracing::info!("plan update pipeline: all items checked → retired");
@@ -186,6 +186,65 @@ impl App {
                 rejected_items = rejected,
                 "plan update pipeline: rejected unchecked items during repair closure mode"
             );
+            if had_retire {
+                self.agent_telemetry.record_plan_update();
+            }
+            return had_retire;
+        }
+
+        // Issue #336: late-stage closure guard.
+        //
+        // When `remaining==1 && finished>=1`, the late-stage closure hint is
+        // already asking the agent to close or retire the last item.  Before
+        // evaluating overlap, reconcile the plan against already-touched
+        // files so a last item whose target was already mutated flips to Done
+        // naturally — otherwise we'd reject legitimate updates that simply
+        // lagged the underlying file state.
+        //
+        // If closure mode is still active after reconciliation, any incoming
+        // unchecked item whose target files overlap the single remaining
+        // item's target files is rejected outright.  This stops the
+        // supersede→dedup→append churn that kept "refreshing" the last item
+        // indefinitely in Phase2 Issue334 follow-up runs.
+        let touched_snapshot = self.session.working_memory.touched_files.clone();
+        let finished_before_sync = self.execution_plan.finished_count();
+        self.execution_plan
+            .sync_from_touched_files(&touched_snapshot);
+        if self.execution_plan.finished_count() > finished_before_sync {
+            self.agent_telemetry.record_sync_from_touched_files();
+        }
+        if self
+            .execution_plan
+            .build_late_stage_closure_hint()
+            .is_some()
+            && let Some(remaining_targets) = self
+                .execution_plan
+                .next_actionable_index()
+                .and_then(|i| self.execution_plan.items.get(i))
+                .map(|item| item.target_files.clone())
+            && !remaining_targets.is_empty()
+        {
+            let initial_len = new_items.len();
+            new_items.retain(|new_item| {
+                !remaining_targets.iter().any(|rt| {
+                    new_item
+                        .target_files
+                        .iter()
+                        .any(|nt| crate::contracts::ExecutionPlan::path_matches(rt, nt))
+                })
+            });
+            let rejected = (initial_len - new_items.len()) as u32;
+            if rejected > 0 {
+                self.agent_telemetry
+                    .record_late_stage_closure_items_rejected(rejected);
+                tracing::warn!(
+                    rejected_items = rejected,
+                    "plan update pipeline: rejected unchecked items overlapping single remaining target during late-stage closure mode (Issue #336)"
+                );
+            }
+        }
+
+        if new_items.is_empty() {
             if had_retire {
                 self.agent_telemetry.record_plan_update();
             }
@@ -839,5 +898,136 @@ mod tests {
         assert!(updated);
         assert_eq!(app.execution_plan.items.len(), 2);
         assert_eq!(app.agent_telemetry.plan_update_count, 1);
+    }
+
+    // --- Issue #336: late-stage closure guard tests ---
+
+    /// Regression: when remaining==1 with finished>=1, a follow-up
+    /// ANVIL_PLAN_UPDATE that only restates the single remaining target must
+    /// be rejected rather than creating an endless supersede→append churn.
+    #[test]
+    fn late_stage_closure_rejects_same_target_replan() {
+        let mut app = build_test_app();
+        let content1 = "```ANVIL_PLAN\n- [ ] src/a.rs: item A\n- [ ] src/b.rs: item B\n```";
+        app.try_register_plan(content1);
+        // Simulate item A completed via mutation.
+        app.execution_plan.mark_done(0);
+        assert_eq!(app.execution_plan.finished_count(), 1);
+
+        // Follow-up restating item B's file with a "refined" description.
+        let update = "```ANVIL_PLAN_UPDATE\n- [ ] src/b.rs: refined item B\n```";
+        let updated = app.try_update_plan(update);
+
+        // No new item appended, existing item B stays actionable.
+        assert_eq!(
+            app.execution_plan.items.len(),
+            2,
+            "closure guard must not append a refreshed last item"
+        );
+        let b_item = &app.execution_plan.items[1];
+        assert!(
+            !b_item.is_finished(),
+            "existing remaining item must not be superseded by closure guard"
+        );
+        // Pipeline reports no meaningful change (nothing retired, nothing appended).
+        assert!(!updated);
+        assert_eq!(
+            app.agent_telemetry.late_stage_closure_items_rejected, 1,
+            "telemetry must count the rejected closure-mode item"
+        );
+        assert_eq!(app.agent_telemetry.plan_update_count, 0);
+    }
+
+    /// Closure guard must allow follow-up items targeting genuinely different
+    /// files, so the agent can still pivot to new work when remaining==1.
+    #[test]
+    fn late_stage_closure_allows_different_target_replan() {
+        let mut app = build_test_app();
+        let content1 = "```ANVIL_PLAN\n- [ ] src/a.rs: A\n- [ ] src/b.rs: B\n```";
+        app.try_register_plan(content1);
+        app.execution_plan.mark_done(0);
+
+        let update = "```ANVIL_PLAN_UPDATE\n- [ ] src/c.rs: genuinely new task\n```";
+        let updated = app.try_update_plan(update);
+
+        assert!(updated);
+        assert_eq!(app.execution_plan.items.len(), 3);
+        assert_eq!(app.agent_telemetry.late_stage_closure_items_rejected, 0);
+    }
+
+    /// Closure guard must not fire when remaining > 1: normal replan
+    /// supersede/dedup semantics must keep working for mid-plan churn.
+    #[test]
+    fn late_stage_closure_inactive_when_multiple_remaining() {
+        let mut app = build_test_app();
+        let content1 =
+            "```ANVIL_PLAN\n- [ ] src/a.rs: A\n- [ ] src/b.rs: B\n- [ ] src/c.rs: C\n```";
+        app.try_register_plan(content1);
+        app.execution_plan.mark_done(0);
+        // remaining == 2 → closure guard inactive.
+
+        let update = "```ANVIL_PLAN_UPDATE\n- [ ] src/b.rs: refined B\n```";
+        let updated = app.try_update_plan(update);
+
+        assert!(updated);
+        assert_eq!(app.agent_telemetry.late_stage_closure_items_rejected, 0);
+    }
+
+    /// The closure path must reconcile the plan against already-touched files
+    /// before rejecting: if the remaining target was already mutated, sync
+    /// should close the plan instead of indefinitely gating on an update.
+    #[test]
+    fn late_stage_closure_reconciles_touched_files_first() {
+        let mut app = build_test_app();
+        let content1 = "```ANVIL_PLAN\n- [ ] src/a.rs: A\n- [ ] src/b.rs: B\n```";
+        app.try_register_plan(content1);
+        app.execution_plan.mark_done(0);
+        // External evidence: src/b.rs was already touched.
+        app.session
+            .working_memory
+            .touched_files
+            .push("src/b.rs".into());
+
+        let update = "```ANVIL_PLAN_UPDATE\n- [ ] src/b.rs: refined B\n```";
+        let _ = app.try_update_plan(update);
+
+        assert!(
+            app.execution_plan.all_finished(),
+            "sync_from_touched_files should have closed the last item before guard"
+        );
+        // No rejection recorded — the guard condition no longer holds post-sync.
+        assert_eq!(app.agent_telemetry.late_stage_closure_items_rejected, 0);
+    }
+
+    /// Partial-overlap update: the portion targeting the single remaining item
+    /// is rejected, while unrelated new items are still appended.
+    #[test]
+    fn late_stage_closure_partial_overlap_rejects_only_overlapping() {
+        let mut app = build_test_app();
+        let content1 = "```ANVIL_PLAN\n- [ ] src/a.rs: A\n- [ ] src/b.rs: B\n```";
+        app.try_register_plan(content1);
+        app.execution_plan.mark_done(0);
+
+        let update =
+            "```ANVIL_PLAN_UPDATE\n- [ ] src/b.rs: refined B\n- [ ] src/d.rs: new work\n```";
+        let updated = app.try_update_plan(update);
+
+        assert!(updated);
+        // Original B stays, d.rs appended, refined B rejected.
+        assert_eq!(app.execution_plan.items.len(), 3);
+        assert_eq!(app.agent_telemetry.late_stage_closure_items_rejected, 1);
+        let has_d = app
+            .execution_plan
+            .items
+            .iter()
+            .any(|i| i.target_files.iter().any(|f| f == "src/d.rs"));
+        assert!(has_d, "non-overlapping item must still be appended");
+        let b_item = app
+            .execution_plan
+            .items
+            .iter()
+            .find(|i| i.target_files.iter().any(|f| f == "src/b.rs"))
+            .unwrap();
+        assert!(!b_item.is_finished());
     }
 }
