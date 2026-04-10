@@ -980,6 +980,10 @@ impl App {
             );
         }
 
+        // Issue #332: retrospectively classify repair-turn-only salvage
+        // before pack validation/artifact emission so the counter is durable.
+        self.agent_telemetry.classify_repair_salvage();
+
         // Issue #329: Validate pack expectation gate before writing artifact.
         {
             let result = self.agent_telemetry.validate_pack_expectation();

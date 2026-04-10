@@ -2,9 +2,13 @@
 //!
 //! Tests that repeated single-file edit failures escalate to
 //! agent.fix_slice via EditFallbackAction::FixSliceEscalation.
+//!
+//! Issue #332 extensions test the broadened escalation trigger that
+//! fires on stagnation + cumulative edit failures across multiple paths,
+//! not only on same-path consecutive failures.
 
 use anvil::app::edit_fail_tracker::{
-    EditFailTracker, EditFallbackAction, determine_fallback_action,
+    EditFailTracker, EditFallbackAction, determine_fallback_action, should_escalate_for_stagnation,
 };
 use anvil::app::stagnation_state::{StagnationState, compute_stagnation_score};
 use anvil::contracts::AgentTelemetry;
@@ -245,4 +249,181 @@ fn test_agent_telemetry_fixslice_default_zero() {
     let json = r#"{"premature_final_count":0,"total_final_requests":0,"plan_registration_count":0,"plan_update_count":0,"sync_from_touched_files_count":0,"completion_kind":null}"#;
     let tel: AgentTelemetry = serde_json::from_str(json).unwrap();
     assert_eq!(tel.fixslice_escalation_count, 0);
+}
+
+// ============================================================
+// Issue #332: broadened escalation (stagnation + cross-path failures)
+// ============================================================
+
+#[test]
+fn test_config_defaults_for_stagnation_escalation_thresholds() {
+    let config = anvil::config::EffectiveConfig::default_for_test().unwrap();
+    assert_eq!(
+        config.runtime.edit_fixslice_stagnation_total_threshold, 4,
+        "default total-failures threshold should be 4"
+    );
+    assert_eq!(
+        config.runtime.edit_fixslice_stagnation_score_threshold, 2,
+        "default stagnation-score threshold should be 2"
+    );
+}
+
+#[test]
+fn test_tracker_total_failures_accumulates_across_paths() {
+    let mut tracker = EditFailTracker::new(3, 5, 7);
+    assert_eq!(tracker.total_failures(), 0);
+
+    tracker.record_failure("a.ts");
+    tracker.record_failure("b.ts");
+    tracker.record_failure("c.ts");
+    assert_eq!(tracker.total_failures(), 3);
+
+    // Success on one path does not decrease the cumulative total.
+    tracker.record_success("a.ts");
+    assert_eq!(tracker.total_failures(), 3);
+
+    tracker.record_failure("a.ts");
+    assert_eq!(tracker.total_failures(), 4);
+}
+
+#[test]
+fn test_should_escalate_for_stagnation_pure_function() {
+    // Disabled threshold: never escalate.
+    assert!(!should_escalate_for_stagnation(10, 4, 0, 2));
+    // Below failure threshold: no escalation.
+    assert!(!should_escalate_for_stagnation(3, 4, 4, 2));
+    // Below stagnation score: no escalation.
+    assert!(!should_escalate_for_stagnation(4, 1, 4, 2));
+    // Both conditions met: escalate.
+    assert!(should_escalate_for_stagnation(4, 2, 4, 2));
+    assert!(should_escalate_for_stagnation(10, 4, 4, 2));
+}
+
+#[test]
+fn test_cross_path_drift_triggers_stagnation_escalation() {
+    // Issue #332: model spreads edits across multiple files and no path
+    // reaches the same-path threshold, but cumulative failures + stagnation
+    // are high enough to escalate.
+    let mut tracker = EditFailTracker::new(3, 5, 7);
+    // 4 failures across 4 different files — no single path hits 3 reread,
+    // so EditFallbackAction never returns FixSliceEscalation.
+    for path in ["a.ts", "b.ts", "c.ts", "d.ts"] {
+        let action = tracker.record_failure(path);
+        assert_eq!(action, EditFallbackAction::Continue);
+    }
+    assert_eq!(tracker.total_failures(), 4);
+
+    // Simulate stagnation score = 2 (mutation drought + workset staleness).
+    let mut stag = StagnationState::new();
+    let workset = vec![0usize];
+    for _ in 0..5 {
+        stag.begin_turn(&workset);
+        stag.end_turn(false);
+    }
+    let score = compute_stagnation_score(&stag);
+    assert!(score >= 2, "expected score >= 2, got {score}");
+
+    // Broadened policy: should fire even though no same-path count >= 7.
+    assert!(should_escalate_for_stagnation(
+        tracker.total_failures(),
+        score as u32,
+        4,
+        2,
+    ));
+}
+
+#[test]
+fn test_telemetry_same_path_counter_bumped_by_legacy_method() {
+    let mut tel = AgentTelemetry::new();
+    tel.record_fixslice_escalation();
+    assert_eq!(tel.fixslice_escalation_count, 1);
+    assert_eq!(tel.fixslice_escalation_same_path_count, 1);
+    assert_eq!(tel.fixslice_escalation_stagnation_count, 0);
+    assert_eq!(tel.fixslice_escalation_repair_salvage_count, 0);
+    assert!(tel.worker_observed);
+}
+
+#[test]
+fn test_telemetry_stagnation_escalation_distinct_from_same_path() {
+    let mut tel = AgentTelemetry::new();
+    tel.record_fixslice_escalation_stagnation();
+    assert_eq!(tel.fixslice_escalation_count, 1);
+    assert_eq!(tel.fixslice_escalation_stagnation_count, 1);
+    assert_eq!(tel.fixslice_escalation_same_path_count, 0);
+    assert!(tel.worker_observed);
+
+    // A subsequent same-path escalation bumps only the same-path counter.
+    tel.record_fixslice_escalation();
+    assert_eq!(tel.fixslice_escalation_count, 2);
+    assert_eq!(tel.fixslice_escalation_same_path_count, 1);
+    assert_eq!(tel.fixslice_escalation_stagnation_count, 1);
+}
+
+#[test]
+fn test_telemetry_repair_salvage_classification_does_not_flip_worker() {
+    // Salvage is a retrospective label — it means repair turn produced
+    // a mutation without ever reaching the worker path.
+    let mut tel = AgentTelemetry::new();
+    tel.record_mutation_turn(3, Some(1.0), "file.edit");
+    tel.record_pre_exit_repair_injected();
+    tel.record_pre_exit_repair_consumed();
+    assert!(!tel.worker_observed);
+
+    tel.classify_repair_salvage();
+    assert_eq!(tel.fixslice_escalation_repair_salvage_count, 1);
+    assert!(
+        !tel.worker_observed,
+        "salvage must not flip worker_observed — it is a distinct classification"
+    );
+    // Salvage classification is idempotent.
+    tel.classify_repair_salvage();
+    assert_eq!(tel.fixslice_escalation_repair_salvage_count, 1);
+}
+
+#[test]
+fn test_telemetry_no_salvage_when_worker_already_observed() {
+    let mut tel = AgentTelemetry::new();
+    tel.record_mutation_turn(3, Some(1.0), "file.edit");
+    tel.record_pre_exit_repair_injected();
+    tel.record_fixslice_escalation_stagnation();
+
+    tel.classify_repair_salvage();
+    assert_eq!(tel.fixslice_escalation_repair_salvage_count, 0);
+}
+
+#[test]
+fn test_telemetry_no_salvage_without_mutation() {
+    let mut tel = AgentTelemetry::new();
+    tel.record_pre_exit_repair_injected();
+    tel.record_pre_exit_repair_consumed();
+
+    tel.classify_repair_salvage();
+    assert_eq!(tel.fixslice_escalation_repair_salvage_count, 0);
+}
+
+#[test]
+fn test_telemetry_serializes_new_counters() {
+    let mut tel = AgentTelemetry::new();
+    tel.record_fixslice_escalation();
+    tel.record_fixslice_escalation_stagnation();
+
+    let json = serde_json::to_string(&tel).unwrap();
+    assert!(json.contains("\"fixslice_escalation_same_path_count\":1"));
+    assert!(json.contains("\"fixslice_escalation_stagnation_count\":1"));
+    assert!(json.contains("\"fixslice_escalation_repair_salvage_count\":0"));
+
+    let round_trip: AgentTelemetry = serde_json::from_str(&json).unwrap();
+    assert_eq!(round_trip.fixslice_escalation_same_path_count, 1);
+    assert_eq!(round_trip.fixslice_escalation_stagnation_count, 1);
+    assert_eq!(round_trip.fixslice_escalation_repair_salvage_count, 0);
+}
+
+#[test]
+fn test_telemetry_new_counters_backward_compat_default_zero() {
+    // Old artifacts missing the new fields should deserialize cleanly.
+    let json = r#"{"premature_final_count":0,"total_final_requests":0,"plan_registration_count":0,"plan_update_count":0,"sync_from_touched_files_count":0,"completion_kind":null}"#;
+    let tel: AgentTelemetry = serde_json::from_str(json).unwrap();
+    assert_eq!(tel.fixslice_escalation_same_path_count, 0);
+    assert_eq!(tel.fixslice_escalation_stagnation_count, 0);
+    assert_eq!(tel.fixslice_escalation_repair_salvage_count, 0);
 }
