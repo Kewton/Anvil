@@ -101,10 +101,23 @@ fn runtime_gate_rejects_repair_only_salvage_for_worker_required_pack() {
     }
 }
 
+// Issue #339: stagnation escalation alone is the request side and must NOT
+// satisfy the gate. The session must also record a real worker success.
 #[test]
-fn runtime_gate_accepts_stagnation_triggered_worker_escalation() {
+fn runtime_gate_rejects_stagnation_escalation_without_worker_success() {
     let mut tel = AgentTelemetry::new();
     tel.record_fixslice_escalation_stagnation();
+    assert!(!tel.worker_observed);
+
+    let result = tel.validate_against(PackExpectation::RequiresWorkerObservation);
+    assert!(matches!(result, PackValidationResult::Mismatch { .. }));
+}
+
+#[test]
+fn runtime_gate_accepts_stagnation_escalation_followed_by_worker_success() {
+    let mut tel = AgentTelemetry::new();
+    tel.record_fixslice_escalation_stagnation();
+    tel.record_worker_success();
     assert!(tel.worker_observed);
 
     let result = tel.validate_against(PackExpectation::RequiresWorkerObservation);

@@ -340,7 +340,12 @@ fn test_telemetry_same_path_counter_bumped_by_legacy_method() {
     assert_eq!(tel.fixslice_escalation_same_path_count, 1);
     assert_eq!(tel.fixslice_escalation_stagnation_count, 0);
     assert_eq!(tel.fixslice_escalation_repair_salvage_count, 0);
-    assert!(tel.worker_observed);
+    // Issue #339: escalation is request-side only and must not flip the
+    // success-side `worker_observed` flag.
+    assert!(
+        !tel.worker_observed,
+        "escalation-emission must not flip worker_observed"
+    );
 }
 
 #[test]
@@ -350,13 +355,15 @@ fn test_telemetry_stagnation_escalation_distinct_from_same_path() {
     assert_eq!(tel.fixslice_escalation_count, 1);
     assert_eq!(tel.fixslice_escalation_stagnation_count, 1);
     assert_eq!(tel.fixslice_escalation_same_path_count, 0);
-    assert!(tel.worker_observed);
+    // Issue #339: stagnation escalation is request-side only.
+    assert!(!tel.worker_observed);
 
     // A subsequent same-path escalation bumps only the same-path counter.
     tel.record_fixslice_escalation();
     assert_eq!(tel.fixslice_escalation_count, 2);
     assert_eq!(tel.fixslice_escalation_same_path_count, 1);
     assert_eq!(tel.fixslice_escalation_stagnation_count, 1);
+    assert!(!tel.worker_observed);
 }
 
 #[test]
@@ -385,7 +392,10 @@ fn test_telemetry_no_salvage_when_worker_already_observed() {
     let mut tel = AgentTelemetry::new();
     tel.record_mutation_turn(3, Some(1.0), "file.edit");
     tel.record_pre_exit_repair_injected();
+    // Issue #339: under the new semantics, salvage suppression requires
+    // real worker success, not merely an escalation request.
     tel.record_fixslice_escalation_stagnation();
+    tel.record_worker_success();
 
     tel.classify_repair_salvage();
     assert_eq!(tel.fixslice_escalation_repair_salvage_count, 0);
