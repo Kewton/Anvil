@@ -989,6 +989,13 @@ impl App {
             );
         }
 
+        // Issue #345: classify the A1 shape (escalation fired but the worker
+        // was never invoked) before the salvage / pack-validation steps so
+        // they see a consistent failure record. Runs unconditionally — the
+        // hook is a no-op when no escalation fired or when the worker was
+        // actually invoked.
+        self.agent_telemetry.finalize_fixslice_outcome();
+
         // Issue #332: retrospectively classify repair-turn-only salvage
         // before pack validation/artifact emission so the counter is durable.
         self.agent_telemetry.classify_repair_salvage();

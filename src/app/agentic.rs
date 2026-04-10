@@ -470,6 +470,13 @@ impl App {
 
             // FixSlice: validate proposal and apply via file.rewrite (Issue #291)
             if let Some((ref original_target_path, max_lines)) = fixslice_params {
+                // Issue #345: record the invocation *before* handing off to
+                // `handle_fixslice_result` so telemetry reflects every
+                // attempted call, even ones where the worker errors out
+                // before reaching a proposal. This is the signal the session
+                // wrap-up uses to distinguish A1 (escalation, no invocation)
+                // from sessions where the worker ran and failed concretely.
+                self.agent_telemetry.record_fixslice_worker_invocation();
                 match result {
                     Ok(sub_result) => {
                         let fix_results = self.handle_fixslice_result(
@@ -517,10 +524,17 @@ impl App {
                 // Issue #343: classify *why* the worker didn't produce one so
                 // the runtime and telemetry can distinguish max-iterations
                 // exhaustion from ordinary "finished with no proposal" cases.
+                // Issue #345: the subagent now reports a concrete parse
+                // failure detail (empty final vs parse failure vs no final
+                // on a partial exit). We combine that with the termination
+                // reason to pick the precise classification.
                 let termination = sub_result.payload.termination_reason;
-                let failure_reason = match termination {
-                    crate::contracts::TerminationReason::MaxIterations => {
+                let failure_reason = match (termination, sub_result.fix_proposal_failure) {
+                    (crate::contracts::TerminationReason::MaxIterations, _) => {
                         crate::contracts::FixSliceFailureReason::MaxIterationsReached
+                    }
+                    (_, Some(crate::agent::subagent::FixProposalParseFailure::ParseFailed)) => {
+                        crate::contracts::FixSliceFailureReason::ProposalParseFailed
                     }
                     _ => crate::contracts::FixSliceFailureReason::NoProposal,
                 };
@@ -537,6 +551,28 @@ impl App {
                 return vec![build_failed_result_with_text(call, summary)];
             }
         };
+
+        // Issue #345: detect path mismatch as its own failure class before
+        // falling into the generic validator. This is the single most
+        // actionable subclass of the B1 shape — the worker is active but
+        // drifted off the target file — and splitting it out lets telemetry
+        // steer recovery (e.g. re-grounding prompts) instead of hiding it
+        // under `proposal_validation_failed`.
+        if proposal.target_path != original_target_path {
+            self.agent_telemetry.record_fixslice_worker_failure(
+                crate::contracts::FixSliceFailureReason::PathMismatch,
+            );
+            tracing::warn!(
+                proposed = %proposal.target_path,
+                expected = %original_target_path,
+                "fix_slice worker proposal path mismatch"
+            );
+            let summary = format!(
+                "fix-slice validation failed: target_path mismatch: proposal '{}' != original '{}'",
+                proposal.target_path, original_target_path
+            );
+            return vec![build_failed_result_with_text(call, summary)];
+        }
 
         // Validate the proposal
         if let Err(reason) = validate_fix_proposal(
