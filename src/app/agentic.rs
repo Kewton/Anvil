@@ -1000,6 +1000,44 @@ impl App {
                 );
             }
 
+            // Issue #332: broadened fix_slice escalation.
+            //
+            // The original same-path escalation in EditFailTracker only fires
+            // when one path accumulates `edit_fixslice_threshold` consecutive
+            // failures. In the real drift pattern the model spreads failures
+            // across multiple files, so that threshold is never reached and
+            // the worker path is never observed. Trigger escalation here when
+            // cumulative failures + stagnation score cross the configured
+            // stagnation thresholds and fix_slice has not already escalated.
+            if !self.agent_telemetry.worker_observed
+                && crate::app::edit_fail_tracker::should_escalate_for_stagnation(
+                    self.edit_fail_tracker.total_failures(),
+                    stagnation_score as u32,
+                    self.config.runtime.edit_fixslice_stagnation_total_threshold,
+                    self.config.runtime.edit_fixslice_stagnation_score_threshold,
+                )
+            {
+                tracing::warn!(
+                    score = stagnation_score,
+                    total_failures = self.edit_fail_tracker.total_failures(),
+                    "fixslice_escalation_triggered (stagnation)"
+                );
+                self.agent_telemetry.record_fixslice_escalation_stagnation();
+                let hint = format!(
+                    "\n\n[Anvil ESCALATION] {n} file.edit failures have occurred across \
+                     multiple files and the session has stagnated (score={score}/4). \
+                     You MUST use agent.fix_slice to repair the most troubled file. \
+                     Call agent.fix_slice with target_path pointing at the file you have been \
+                     trying to modify, and a goal describing the intended change. Do NOT \
+                     retry file.edit on the same paths — use agent.fix_slice now.",
+                    n = self.edit_fail_tracker.total_failures(),
+                    score = stagnation_score,
+                );
+                let msg = SessionMessage::new(MessageRole::Tool, "system", hint)
+                    .with_id(self.next_message_id("tool"));
+                self.session.push_message(msg);
+            }
+
             // Issue #285: staged stagnation recovery.
             let remaining_turns = max_iterations.saturating_sub(iteration + 1);
             let plan_repair_count_before_this_turn =

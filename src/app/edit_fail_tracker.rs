@@ -66,6 +66,25 @@ pub fn determine_fallback_action(
     }
 }
 
+/// Decide whether to escalate to the worker path based on cumulative failures
+/// and stagnation score (Issue #332).
+///
+/// This is the broadened escalation policy: fires when the model spreads
+/// edit failures across multiple paths so no single path reaches
+/// `edit_fixslice_threshold`, but the session is clearly stagnating.
+///
+/// `failures_threshold == 0` disables the trigger.
+pub fn should_escalate_for_stagnation(
+    total_failures: u32,
+    stagnation_score: u32,
+    failures_threshold: u32,
+    score_threshold: u32,
+) -> bool {
+    failures_threshold > 0
+        && total_failures >= failures_threshold
+        && stagnation_score >= score_threshold
+}
+
 /// Tracks consecutive file.edit failures per file path.
 /// Used to detect when the LLM is stuck retrying edits on the same file
 /// and should be prompted to try an alternative approach (Issue #158, #321).
@@ -76,6 +95,13 @@ pub struct EditFailTracker {
     /// Threshold for escalating to agent.fix_slice (Issue #321).
     /// 0 = disabled.
     fixslice_threshold: u32,
+    /// Cumulative failure count across all paths (Issue #332).
+    ///
+    /// Not reset on `record_success`, because the broadened stagnation
+    /// escalation uses it to detect the drift pattern where the model
+    /// scatters failures across multiple files and no single path accumulates
+    /// enough to hit `fixslice_threshold`.
+    total_failures: u32,
 }
 
 impl EditFailTracker {
@@ -89,6 +115,7 @@ impl EditFailTracker {
             reread_threshold,
             write_fallback_threshold,
             fixslice_threshold,
+            total_failures: 0,
         }
     }
 
@@ -100,6 +127,7 @@ impl EditFailTracker {
             .entry(path.to_string())
             .or_insert(0);
         *count += 1;
+        self.total_failures = self.total_failures.saturating_add(1);
         determine_fallback_action(
             *count,
             self.reread_threshold,
@@ -116,6 +144,11 @@ impl EditFailTracker {
     /// Get the current failure count for a path.
     pub fn failure_count(&self, path: &str) -> u32 {
         self.consecutive_failures.get(path).copied().unwrap_or(0)
+    }
+
+    /// Cumulative failure count across all paths in this session (Issue #332).
+    pub fn total_failures(&self) -> u32 {
+        self.total_failures
     }
 }
 
@@ -361,5 +394,39 @@ mod tests {
         tracker.record_success("a.rs");
         assert_eq!(tracker.failure_count("a.rs"), 0);
         assert_eq!(tracker.record_failure("a.rs"), EditFallbackAction::Continue);
+    }
+
+    // --- Issue #332: cumulative total_failures & stagnation helper ---
+
+    #[test]
+    fn test_total_failures_accumulates_across_paths_and_survives_success() {
+        let mut tracker = EditFailTracker::new(3, 5, 7);
+        assert_eq!(tracker.total_failures(), 0);
+        tracker.record_failure("a.rs");
+        tracker.record_failure("b.rs");
+        tracker.record_failure("c.rs");
+        assert_eq!(tracker.total_failures(), 3);
+        tracker.record_success("a.rs");
+        assert_eq!(
+            tracker.total_failures(),
+            3,
+            "total_failures must not be reset by per-path success"
+        );
+        tracker.record_failure("a.rs");
+        assert_eq!(tracker.total_failures(), 4);
+    }
+
+    #[test]
+    fn test_should_escalate_for_stagnation_boundary() {
+        // disabled
+        assert!(!should_escalate_for_stagnation(100, 4, 0, 2));
+        // below failures
+        assert!(!should_escalate_for_stagnation(3, 4, 4, 2));
+        // below score
+        assert!(!should_escalate_for_stagnation(4, 1, 4, 2));
+        // exactly at thresholds
+        assert!(should_escalate_for_stagnation(4, 2, 4, 2));
+        // well above
+        assert!(should_escalate_for_stagnation(10, 4, 4, 2));
     }
 }

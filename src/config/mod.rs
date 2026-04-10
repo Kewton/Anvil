@@ -186,6 +186,13 @@ pub struct RuntimeConfig {
     /// Consecutive edit failures before agent.fix_slice escalation (Issue #321).
     /// 0 = disabled.
     pub edit_fixslice_threshold: u32,
+    /// Cumulative edit-failure count that triggers stagnation-driven
+    /// fix_slice escalation when combined with a high stagnation score (Issue #332).
+    /// 0 = disabled (same-path threshold is the only trigger).
+    pub edit_fixslice_stagnation_total_threshold: u32,
+    /// Minimum stagnation score required for stagnation-driven fix_slice
+    /// escalation (Issue #332).
+    pub edit_fixslice_stagnation_score_threshold: u32,
     /// Maximum line count for file.write on existing files (0 = disabled, Issue #156).
     pub safe_write_max_lines: usize,
     /// Deletion ratio threshold for diff warning (0.0-1.0, Issue #156).
@@ -383,6 +390,8 @@ impl EffectiveConfig {
                 edit_reread_threshold: 3,
                 edit_write_fallback_threshold: 5,
                 edit_fixslice_threshold: 7,
+                edit_fixslice_stagnation_total_threshold: 4,
+                edit_fixslice_stagnation_score_threshold: 2,
                 safe_write_max_lines: 500,
                 safe_write_deletion_ratio: 0.5,
                 read_repeat_warn_threshold: 3,
@@ -876,6 +885,26 @@ impl EffectiveConfig {
                     }
                     self.runtime.edit_fixslice_threshold = v;
                 }
+                "edit_fixslice_stagnation_total_threshold"
+                | "ANVIL_EDIT_FIXSLICE_STAGNATION_TOTAL_THRESHOLD" => {
+                    let v: u32 = value
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                    if v > 40 {
+                        return Err(ConfigError::InvalidNumericValue(value.clone()));
+                    }
+                    self.runtime.edit_fixslice_stagnation_total_threshold = v;
+                }
+                "edit_fixslice_stagnation_score_threshold"
+                | "ANVIL_EDIT_FIXSLICE_STAGNATION_SCORE_THRESHOLD" => {
+                    let v: u32 = value
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                    if !(1..=4).contains(&v) {
+                        return Err(ConfigError::InvalidNumericValue(value.clone()));
+                    }
+                    self.runtime.edit_fixslice_stagnation_score_threshold = v;
+                }
                 "edit_recovery_read_budget" | "ANVIL_EDIT_RECOVERY_READ_BUDGET" => {
                     let v: u32 = value
                         .parse()
@@ -1182,6 +1211,18 @@ impl EffectiveConfig {
                     self.runtime.edit_write_fallback_threshold + 2;
             }
         }
+        // Issue #332: clamp stagnation-escalation thresholds (0 = disabled).
+        if self.runtime.edit_fixslice_stagnation_total_threshold > 0 {
+            self.runtime.edit_fixslice_stagnation_total_threshold = self
+                .runtime
+                .edit_fixslice_stagnation_total_threshold
+                .clamp(1, 40);
+        }
+        // Score threshold is bounded by compute_stagnation_score() range [0, 4].
+        self.runtime.edit_fixslice_stagnation_score_threshold = self
+            .runtime
+            .edit_fixslice_stagnation_score_threshold
+            .clamp(1, 4);
         self.runtime.edit_recovery_read_budget =
             self.runtime.edit_recovery_read_budget.clamp(1, 10);
     }
@@ -1543,6 +1584,14 @@ impl std::fmt::Debug for RuntimeConfig {
                 &self.edit_write_fallback_threshold,
             )
             .field("edit_fixslice_threshold", &self.edit_fixslice_threshold)
+            .field(
+                "edit_fixslice_stagnation_total_threshold",
+                &self.edit_fixslice_stagnation_total_threshold,
+            )
+            .field(
+                "edit_fixslice_stagnation_score_threshold",
+                &self.edit_fixslice_stagnation_score_threshold,
+            )
             .field("safe_write_max_lines", &self.safe_write_max_lines)
             .field("safe_write_deletion_ratio", &self.safe_write_deletion_ratio)
             .field("edit_recovery_read_budget", &self.edit_recovery_read_budget)

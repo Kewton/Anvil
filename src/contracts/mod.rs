@@ -364,6 +364,22 @@ pub struct AgentTelemetry {
     #[serde(default)]
     pub fixslice_escalation_count: u32,
 
+    /// Fix_slice escalations triggered by consecutive same-path edit failures (Issue #332).
+    #[serde(default)]
+    pub fixslice_escalation_same_path_count: u32,
+
+    /// Fix_slice escalations triggered by stagnation + cross-path edit failures (Issue #332).
+    #[serde(default)]
+    pub fixslice_escalation_stagnation_count: u32,
+
+    /// Retrospective count of repair-turn-only salvage runs (Issue #332).
+    ///
+    /// Set by `classify_repair_salvage()` when a session produced a mutation
+    /// via the pre-exit repair turn but never reached the intended worker path.
+    /// Does NOT flip `worker_observed` — it is a distinct outcome classification.
+    #[serde(default)]
+    pub fixslice_escalation_repair_salvage_count: u32,
+
     /// Number of pre-exit repair turns injected (Issue #325).
     #[serde(default)]
     pub pre_exit_repair_injected_count: u32,
@@ -537,10 +553,46 @@ impl AgentTelemetry {
         self.final_suppressed_with_remaining_targets_count += 1;
     }
 
-    /// Record a fix_slice escalation event (Issue #321).
+    /// Record a same-path fix_slice escalation event (Issue #321, #332).
+    ///
+    /// Triggered when consecutive edit failures on a single path reach the
+    /// `edit_fixslice_threshold`. Bumps both the overall count and the
+    /// same-path counter and flips `worker_observed`.
     pub fn record_fixslice_escalation(&mut self) {
         self.fixslice_escalation_count += 1;
+        self.fixslice_escalation_same_path_count += 1;
         self.worker_observed = true;
+    }
+
+    /// Record a stagnation-triggered fix_slice escalation (Issue #332).
+    ///
+    /// Triggered when the model scatters edit failures across multiple files
+    /// so no same-path threshold is reached, but the session is clearly
+    /// stagnating. Bumps the overall count and the stagnation counter, and
+    /// flips `worker_observed`.
+    pub fn record_fixslice_escalation_stagnation(&mut self) {
+        self.fixslice_escalation_count += 1;
+        self.fixslice_escalation_stagnation_count += 1;
+        self.worker_observed = true;
+    }
+
+    /// Retrospectively classify the session as a repair-turn-only salvage (Issue #332).
+    ///
+    /// Fires at most once per session. A salvage run is one where:
+    /// - the pre-exit repair turn was observed, AND
+    /// - a mutation was observed, AND
+    /// - no worker path was reached.
+    ///
+    /// Does NOT flip `worker_observed`; it only increments the salvage counter
+    /// so pack validation and observability can distinguish a true worker run
+    /// from a late-repair salvage.
+    pub fn classify_repair_salvage(&mut self) {
+        if self.fixslice_escalation_repair_salvage_count > 0 {
+            return;
+        }
+        if self.repair_turn_observed && self.mutation_observed && !self.worker_observed {
+            self.fixslice_escalation_repair_salvage_count = 1;
+        }
     }
 
     /// Threshold: mutations after this turn are considered "late".
@@ -654,6 +706,12 @@ impl AgentTelemetry {
             "repair_turn_observed": self.repair_turn_observed,
             "pack_expectation": self.pack_expectation.map(|e| e.to_string()),
             "expectation_mismatch_reason": self.expectation_mismatch_reason,
+            // Issue #332: distinguishing fix_slice escalation reasons.
+            "fixslice_escalation_count": self.fixslice_escalation_count,
+            "fixslice_escalation_same_path_count": self.fixslice_escalation_same_path_count,
+            "fixslice_escalation_stagnation_count": self.fixslice_escalation_stagnation_count,
+            "fixslice_escalation_repair_salvage_count":
+                self.fixslice_escalation_repair_salvage_count,
         });
 
         let json_bytes = serde_json::to_vec_pretty(&payload)?;
