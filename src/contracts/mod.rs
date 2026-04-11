@@ -531,6 +531,21 @@ pub struct AgentTelemetry {
     /// worker was invoked and failed for a concrete reason.
     #[serde(default)]
     pub fixslice_worker_invocation_count: u32,
+
+    /// Number of times the post-escalation fix_slice routing barrier
+    /// blocked a parent-side mutation tool (Issue #355). Incremented every
+    /// time `EscalationBarrier` filters out a `file.edit` / `file.write` /
+    /// `file.edit_anchor` call because the pack is worker-required and
+    /// `agent.fix_slice` has not yet been invoked after an escalation.
+    #[serde(default)]
+    pub escalation_barrier_block_count: u32,
+
+    /// Number of times the worker-required early exit fired (Issue #355).
+    /// A positive value means the session terminated cleanly after
+    /// `pack_validation_result=satisfied` + `worker_observed=true`, without
+    /// waiting for the 600s runner timeout.
+    #[serde(default)]
+    pub worker_required_early_exit_count: u32,
 }
 
 impl AgentTelemetry {
@@ -773,6 +788,53 @@ impl AgentTelemetry {
             && !self.worker_observed
     }
 
+    /// Whether parent-side mutation tools should be suspended until
+    /// `agent.fix_slice` is invoked (Issue #355, Bug 1).
+    ///
+    /// Returns true iff all of the following hold:
+    /// - `pack_expectation` is `RequiresWorkerObservation`,
+    /// - at least one fix_slice escalation has been recorded,
+    /// - `agent.fix_slice` has not yet been invoked (`fixslice_worker_invocation_count == 0`),
+    /// - no worker success has been recorded.
+    ///
+    /// Pack-scoped on purpose: under other pack expectations parent-side
+    /// mutations are legitimate, so the barrier stays inactive.
+    pub fn should_force_fixslice_routing(&self) -> bool {
+        matches!(
+            self.pack_expectation,
+            Some(PackExpectation::RequiresWorkerObservation)
+        ) && self.fixslice_escalation_count > 0
+            && self.fixslice_worker_invocation_count == 0
+            && !self.worker_observed
+    }
+
+    /// Whether the session should terminate early because the pack
+    /// expectation has already been satisfied by worker-path evidence
+    /// (Issue #355, Bug 2).
+    ///
+    /// Returns true iff `pack_expectation == RequiresWorkerObservation`
+    /// and `worker_observed == true`. The agentic loop consults this just
+    /// before the follow-up LLM call and breaks when it flips true, which
+    /// keeps worker-satisfied sessions from burning the 600s runner
+    /// timeout.
+    pub fn should_early_exit_after_worker_success(&self) -> bool {
+        matches!(
+            self.pack_expectation,
+            Some(PackExpectation::RequiresWorkerObservation)
+        ) && self.worker_observed
+    }
+
+    /// Record that the post-escalation fix_slice routing barrier blocked a
+    /// parent-side mutation (Issue #355).
+    pub fn record_escalation_barrier_block(&mut self) {
+        self.escalation_barrier_block_count += 1;
+    }
+
+    /// Record that the worker-required early exit fired (Issue #355).
+    pub fn record_worker_required_early_exit(&mut self) {
+        self.worker_required_early_exit_count += 1;
+    }
+
     /// Retrospectively classify the session as a repair-turn-only salvage (Issue #332).
     ///
     /// Fires at most once per session. A salvage run is one where:
@@ -914,6 +976,9 @@ impl AgentTelemetry {
             "fixslice_failure_reason": self.fixslice_failure_reason,
             // Issue #345: fix_slice worker invocation tracking.
             "fixslice_worker_invocation_count": self.fixslice_worker_invocation_count,
+            // Issue #355: escalation routing barrier + early-exit counters.
+            "escalation_barrier_block_count": self.escalation_barrier_block_count,
+            "worker_required_early_exit_count": self.worker_required_early_exit_count,
         });
 
         let json_bytes = serde_json::to_vec_pretty(&payload)?;

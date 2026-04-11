@@ -785,6 +785,11 @@ impl App {
         let mut noplan_suppression_count: u8 = 0;
         // Issue #303: pre-mutation plan barrier.
         let mut mutation_barrier = super::mutation_barrier::MutationBarrier::new();
+        // Issue #355: post-escalation fix_slice routing barrier. Suspends
+        // parent-side mutation tools once `agent.fix_slice` escalation has
+        // fired under a `requires_worker_observation` pack and the worker
+        // path has not yet been invoked.
+        let mut escalation_barrier = super::escalation_barrier::EscalationBarrier::new();
         // Issue #325: track whether a pre-exit repair turn was injected.
         // When true, the next iteration processes the repair turn's LLM response
         // before terminating the loop.
@@ -847,8 +852,11 @@ impl App {
             // live streaming output on stderr (Issue #1).
 
             // Execute normal tool calls and record results WITH payload
-            let (results, loop_action, recovery_read_count) =
-                self.execute_structured_tool_calls(&current_normal, &mut mutation_barrier)?;
+            let (results, loop_action, recovery_read_count) = self.execute_structured_tool_calls(
+                &current_normal,
+                &mut mutation_barrier,
+                &mut escalation_barrier,
+            )?;
             total_tool_count += results.len();
 
             // Update plan item status from tool results; capture telemetry.
@@ -962,6 +970,25 @@ impl App {
 
             // Check shutdown flag before LLM call
             if self.is_shutdown_requested() {
+                break;
+            }
+
+            // Issue #355: Post-success early exit under a worker-required pack.
+            // Once `agent.fix_slice` has produced a real worker mutation the
+            // pack expectation is already satisfied; continuing would only
+            // burn LLM turns and eventually the 600s runner timeout without
+            // adding observable evidence. Break cleanly so the session
+            // terminates as `session_completed`.
+            if self
+                .agent_telemetry
+                .should_early_exit_after_worker_success()
+            {
+                self.agent_telemetry.record_worker_required_early_exit();
+                tracing::info!(
+                    worker_observed = self.agent_telemetry.worker_observed,
+                    pack_expectation = ?self.agent_telemetry.pack_expectation,
+                    "worker-required pack satisfied; terminating session early (Issue #355)"
+                );
                 break;
             }
 
@@ -1882,6 +1909,7 @@ impl App {
         &mut self,
         structured: &StructuredAssistantResponse,
         mutation_barrier: &mut super::mutation_barrier::MutationBarrier,
+        escalation_barrier: &mut super::escalation_barrier::EscalationBarrier,
     ) -> Result<
         (
             Vec<ToolExecutionResult>,
@@ -1975,6 +2003,30 @@ impl App {
         failed_results.extend(barrier_result.blocked_results);
         if barrier_result.blocked_count > 0 {
             self.agent_telemetry.record_mutation_barrier_block();
+        }
+
+        // Phase 1.85: Post-escalation fix_slice routing barrier (Issue #355).
+        // Once fix_slice escalation has fired under a `requires_worker_observation`
+        // pack and `agent.fix_slice` has not yet been invoked, parent-side
+        // mutation tools (file.edit / file.write / file.edit_anchor) are
+        // suspended so the LLM is forced onto the worker path.
+        let force_fixslice = self.agent_telemetry.should_force_fixslice_routing();
+        let escalation_result =
+            escalation_barrier.check_and_filter(validated_requests, force_fixslice);
+        let validated_requests = escalation_result.passed_requests;
+        let escalation_blocked = escalation_result.blocked_count;
+        failed_results.extend(escalation_result.blocked_results);
+        if escalation_blocked > 0 {
+            for _ in 0..escalation_blocked {
+                self.agent_telemetry.record_escalation_barrier_block();
+            }
+            tracing::warn!(
+                blocked = escalation_blocked,
+                fixslice_escalation_count = self.agent_telemetry.fixslice_escalation_count,
+                fixslice_worker_invocation_count =
+                    self.agent_telemetry.fixslice_worker_invocation_count,
+                "escalation_barrier: blocked parent-side mutation(s); forcing agent.fix_slice"
+            );
         }
 
         // Loop detection: record each validated tool call and check for repetition (Issue #145, #172)
