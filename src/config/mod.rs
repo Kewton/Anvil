@@ -310,6 +310,55 @@ impl Display for ConfigError {
 
 impl Error for ConfigError {}
 
+/// Environment variable whitelist consumed by [`EffectiveConfig::apply_env_overrides`].
+///
+/// Keys listed here are read from process env and forwarded to
+/// [`EffectiveConfig::apply_map`]. A new tunable that is parsed by `apply_map`
+/// but missing from this whitelist will silently fail to take effect from env
+/// — see Issue #347 for the `ANVIL_FIXSLICE_MAX_ITERATIONS` regression.
+pub const ENV_OVERRIDE_WHITELIST: &[&str] = &[
+    "ANVIL_PROVIDER",
+    "ANVIL_MODEL",
+    "ANVIL_PROVIDER_URL",
+    "ANVIL_SIDECAR_MODEL",
+    "ANVIL_SIDECAR_PROVIDER_URL",
+    "ANVIL_API_KEY",
+    "ANVIL_CONTEXT_WINDOW",
+    "ANVIL_CONTEXT_BUDGET",
+    "ANVIL_MAX_AGENT_ITERATIONS",
+    "ANVIL_MAX_CONSOLE_MESSAGES",
+    "ANVIL_AUTO_COMPACT_THRESHOLD",
+    "ANVIL_TOOL_RESULT_MAX_CHARS",
+    "ANVIL_STREAM",
+    "ANVIL_INTERACTIVE",
+    "ANVIL_APPROVAL_REQUIRED",
+    "ANVIL_FRESH_SESSION",
+    "ANVIL_REASONING_VISIBILITY",
+    "ANVIL_DEBUG",
+    "ANVIL_WEB_SEARCH_PROVIDER",
+    "SERPER_API_KEY",
+    "ANVIL_LOG",
+    "ANVIL_OFFLINE",
+    "ANVIL_TAG_PROTOCOL",
+    "ANVIL_PROMPT_TIER",
+    "ANVIL_SMART_COMPACT_THRESHOLD_RATIO",
+    "ANVIL_SUBAGENT_MAX_ITERATIONS",
+    "ANVIL_SUBAGENT_TIMEOUT",
+    "ANVIL_LOOP_DETECTION_THRESHOLD",
+    "ANVIL_HTTP_TIMEOUT",
+    "ANVIL_CURL_TIMEOUT",
+    "ANVIL_EDIT_STRATEGY",
+    "ANVIL_EDIT_REREAD_THRESHOLD",
+    "ANVIL_EDIT_WRITE_FALLBACK_THRESHOLD",
+    "ANVIL_FIXSLICE_MAX_ITERATIONS",
+    "ANVIL_SAFE_WRITE_MAX_LINES",
+    "ANVIL_SAFE_WRITE_DELETION_RATIO",
+    "ANVIL_UI_LANGUAGE",
+    "ANVIL_MAX_TOOL_CALLS",
+    "ANVIL_GUIDANCE_MODE",
+    "ANVIL_EDIT_RECOVERY_READ_BUDGET",
+];
+
 impl EffectiveConfig {
     pub fn project_instructions(&self) -> Option<&str> {
         self.project_instructions.as_deref()
@@ -502,49 +551,28 @@ impl EffectiveConfig {
 
     fn apply_env_overrides(&mut self) -> Result<(), ConfigError> {
         let mut map = HashMap::new();
-        for key in [
-            "ANVIL_PROVIDER",
-            "ANVIL_MODEL",
-            "ANVIL_PROVIDER_URL",
-            "ANVIL_SIDECAR_MODEL",
-            "ANVIL_SIDECAR_PROVIDER_URL",
-            "ANVIL_API_KEY",
-            "ANVIL_CONTEXT_WINDOW",
-            "ANVIL_CONTEXT_BUDGET",
-            "ANVIL_MAX_AGENT_ITERATIONS",
-            "ANVIL_MAX_CONSOLE_MESSAGES",
-            "ANVIL_AUTO_COMPACT_THRESHOLD",
-            "ANVIL_TOOL_RESULT_MAX_CHARS",
-            "ANVIL_STREAM",
-            "ANVIL_INTERACTIVE",
-            "ANVIL_APPROVAL_REQUIRED",
-            "ANVIL_FRESH_SESSION",
-            "ANVIL_REASONING_VISIBILITY",
-            "ANVIL_DEBUG",
-            "ANVIL_WEB_SEARCH_PROVIDER",
-            "SERPER_API_KEY",
-            "ANVIL_LOG",
-            "ANVIL_OFFLINE",
-            "ANVIL_TAG_PROTOCOL",
-            "ANVIL_PROMPT_TIER",
-            "ANVIL_SMART_COMPACT_THRESHOLD_RATIO",
-            "ANVIL_SUBAGENT_MAX_ITERATIONS",
-            "ANVIL_SUBAGENT_TIMEOUT",
-            "ANVIL_LOOP_DETECTION_THRESHOLD",
-            "ANVIL_HTTP_TIMEOUT",
-            "ANVIL_CURL_TIMEOUT",
-            "ANVIL_EDIT_STRATEGY",
-            "ANVIL_EDIT_REREAD_THRESHOLD",
-            "ANVIL_EDIT_WRITE_FALLBACK_THRESHOLD",
-            "ANVIL_SAFE_WRITE_MAX_LINES",
-            "ANVIL_SAFE_WRITE_DELETION_RATIO",
-            "ANVIL_UI_LANGUAGE",
-            "ANVIL_MAX_TOOL_CALLS",
-            "ANVIL_GUIDANCE_MODE",
-            "ANVIL_EDIT_RECOVERY_READ_BUDGET",
-        ] {
+        for key in ENV_OVERRIDE_WHITELIST {
             if let Ok(value) = std::env::var(key) {
-                map.insert(key.to_string(), value);
+                map.insert((*key).to_string(), value);
+            }
+        }
+        self.apply_map(&map)
+    }
+
+    /// Test-only helper that applies env overrides from a provided map using
+    /// the same [`ENV_OVERRIDE_WHITELIST`] filter as the real
+    /// [`Self::apply_env_overrides`]. Unlike [`Self::apply_overrides_for_test`],
+    /// this goes through the whitelist — so it can catch regressions where a
+    /// new tunable is parsed by `apply_map` but never reaches it because the
+    /// whitelist forgot the key (Issue #347).
+    pub fn apply_env_overrides_from_map_for_test(
+        &mut self,
+        env: &HashMap<String, String>,
+    ) -> Result<(), ConfigError> {
+        let mut map = HashMap::new();
+        for key in ENV_OVERRIDE_WHITELIST {
+            if let Some(value) = env.get(*key) {
+                map.insert((*key).to_string(), value.clone());
             }
         }
         self.apply_map(&map)
