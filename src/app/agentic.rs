@@ -530,6 +530,13 @@ impl App {
                 // reason to pick the precise classification.
                 let termination = sub_result.payload.termination_reason;
                 let failure_reason = match (termination, sub_result.fix_proposal_failure) {
+                    // Issue #351: subagent-side same-target read oscillation
+                    // guard — classify before the MaxIterations branch so
+                    // the more specific failure class wins.
+                    (
+                        _,
+                        Some(crate::agent::subagent::FixProposalParseFailure::RepeatedReadLoop),
+                    ) => crate::contracts::FixSliceFailureReason::RepeatedReadLoop,
                     (crate::contracts::TerminationReason::MaxIterations, _) => {
                         crate::contracts::FixSliceFailureReason::MaxIterationsReached
                     }
@@ -721,6 +728,8 @@ impl App {
         self.alternating_loop_detector.reset();
         // Reset closure-mode reasoning loop guard per top-level turn (Issue #349).
         self.closure_loop_detector.reset();
+        // Reset post-failure tool-active thrash guard per top-level turn (Issue #351).
+        self.post_failure_thrash_detector.reset();
         // Reset phase estimator per-turn counters (Issue #159)
         self.phase_estimator.reset();
         // Reset read transition guard per-turn counters (Issue #216)
@@ -1205,6 +1214,10 @@ impl App {
                     // Issue #349: a newly registered plan is a fresh course
                     // of action — clear any accumulated closure-loop state.
                     self.closure_loop_detector.reset();
+                    // Issue #351: same rationale for the post-failure thrash
+                    // counter — a freshly registered plan is real progress,
+                    // regardless of prior worker failures.
+                    self.post_failure_thrash_detector.reset();
                     let target_files: Vec<String> = self
                         .execution_plan
                         .items
@@ -1219,6 +1232,8 @@ impl App {
                 crate::app::execution_plan::PlanRegistrationResult::Replan => {
                     // Issue #349: replan is also a change of course.
                     self.closure_loop_detector.reset();
+                    // Issue #351: replan clears the thrash counter too.
+                    self.post_failure_thrash_detector.reset();
                     // Replan: stagnation_state を差分マージ (Issue #305)
                     let existing = &self.stagnation_state.starved_target_files;
                     let new_targets: Vec<String> = self
@@ -1314,6 +1329,55 @@ impl App {
                 }
             } else {
                 self.closure_loop_detector.reset();
+            }
+
+            // Issue #351: parent-side post-failure tool-active thrash guard.
+            //
+            // The closure_loop_detector above only fires on zero-tool-call
+            // reasoning responses. The complementary B2 shape from cycle 10
+            // is a tool-active thrash: the parent keeps calling file.read /
+            // file.search / shell.exec after a fix_slice worker failure but
+            // the execution plan never advances, so the runner times out at
+            // 600s. Track consecutive no-progress turns here and escalate
+            // through the Warn → StrongWarn → Break ladder.
+            let thrash_armed = !self.agent_telemetry.worker_observed
+                && self.agent_telemetry.fixslice_worker_failure_count > 0;
+            if thrash_armed {
+                let had_tool_calls = !results.is_empty();
+                let plan_advanced = turn_items_advanced > 0 || turn_mutations > 0;
+                let action = self
+                    .post_failure_thrash_detector
+                    .record_turn(had_tool_calls, plan_advanced);
+                match action {
+                    super::loop_detector::LoopAction::Continue => {}
+                    super::loop_detector::LoopAction::Warn(msg)
+                    | super::loop_detector::LoopAction::StrongWarn(msg) => {
+                        tracing::warn!(
+                            no_progress_turns =
+                                self.post_failure_thrash_detector.no_progress_turns(),
+                            fixslice_worker_failure_count =
+                                self.agent_telemetry.fixslice_worker_failure_count,
+                            "post_failure_thrash_guard: injecting escalation hint"
+                        );
+                        let hint_msg = SessionMessage::new(MessageRole::Tool, "system", msg)
+                            .with_id(self.next_message_id("tool"));
+                        self.session.push_message(hint_msg);
+                    }
+                    super::loop_detector::LoopAction::Break(msg) => {
+                        tracing::warn!(
+                            reason = "post_failure_thrash_guard",
+                            message = %msg,
+                            no_progress_turns =
+                                self.post_failure_thrash_detector.no_progress_turns(),
+                            fixslice_worker_failure_count =
+                                self.agent_telemetry.fixslice_worker_failure_count,
+                            "agentic loop terminated by post-failure thrash guard"
+                        );
+                        break;
+                    }
+                }
+            } else {
+                self.post_failure_thrash_detector.reset();
             }
 
             // Issue #325 + Issue #327: if the pre-exit repair turn was injected on

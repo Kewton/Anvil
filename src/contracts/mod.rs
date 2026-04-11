@@ -150,6 +150,13 @@ pub enum FixSliceFailureReason {
     /// the LLM during the session (Issue #345, A1 shape). Recorded only at
     /// session wrap-up via `finalize_fixslice_outcome`.
     EscalatedNotInvoked,
+    /// The FixSlice sub-agent aborted early because it kept issuing
+    /// `file.read` calls against the same target path without producing a
+    /// proposal (Issue #351, B1 shape). The subagent's `run_turn` loop
+    /// detects same-path read oscillation and terminates with this class
+    /// so the parent can classify the session as pack_gate_invalid
+    /// instead of letting it burn through the remaining iteration budget.
+    RepeatedReadLoop,
 }
 
 impl std::fmt::Display for FixSliceFailureReason {
@@ -162,6 +169,7 @@ impl std::fmt::Display for FixSliceFailureReason {
             Self::RewriteFailed => write!(f, "rewrite_failed"),
             Self::MaxIterationsReached => write!(f, "max_iterations_reached"),
             Self::EscalatedNotInvoked => write!(f, "escalated_not_invoked"),
+            Self::RepeatedReadLoop => write!(f, "repeated_read_loop"),
         }
     }
 }

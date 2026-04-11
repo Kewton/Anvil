@@ -1,13 +1,14 @@
 //! Integration tests for the FixSlice sub-agent (Issue #291).
 
 use anvil::agent::subagent::{
-    FIXSLICE_MAX_ITERATIONS, FIXSLICE_TIMEOUT_SECS, MAX_FIXSLICE_LINES, SubAgentKind,
+    FIXSLICE_MAX_ITERATIONS, FIXSLICE_REPEATED_READ_THRESHOLD, FIXSLICE_TIMEOUT_SECS,
+    MAX_FIXSLICE_LINES, SubAgentKind, first_file_read_target, is_repeated_read_loop,
 };
 use anvil::agent::tag_spec::find_spec;
 use anvil::app::agentic::{
     build_fixslice_user_prompt, build_rewrite_request, validate_fix_proposal,
 };
-use anvil::contracts::FixSliceProposal;
+use anvil::contracts::{FixSliceFailureReason, FixSliceProposal};
 use anvil::tooling::{
     ExecutionClass, ExecutionMode, PermissionClass, ToolCallRequest, ToolInput, ToolKind,
     ToolRegistry, ToolValidationError,
@@ -599,4 +600,177 @@ fn test_fixslice_tool_kind_mapping() {
         max_lines: 50,
     };
     assert_eq!(input.kind(), ToolKind::AgentFixSlice);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #351: same-target `file.read` oscillation guard
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_fixslice_repeated_read_threshold_default() {
+    // The default threshold is 2: two consecutive iterations re-reading the
+    // same target path trip the guard.
+    assert_eq!(FIXSLICE_REPEATED_READ_THRESHOLD, 2);
+}
+
+#[test]
+fn test_is_repeated_read_loop_first_read_never_triggers() {
+    // Prior count = 0, no last target: the first read should never trip
+    // the guard, regardless of threshold.
+    assert!(!is_repeated_read_loop(Some("src/main.rs"), None, 0, 2));
+}
+
+#[test]
+fn test_is_repeated_read_loop_different_paths_never_trigger() {
+    // Different target this iteration resets the chain.
+    assert!(!is_repeated_read_loop(
+        Some("src/other.rs"),
+        Some("src/main.rs"),
+        1,
+        2
+    ));
+    assert!(!is_repeated_read_loop(
+        Some("src/other.rs"),
+        Some("src/main.rs"),
+        5,
+        2
+    ));
+}
+
+#[test]
+fn test_is_repeated_read_loop_same_path_reaches_threshold() {
+    // Same target, prior count = 1, threshold = 2 -> next = 2 -> trip.
+    assert!(is_repeated_read_loop(
+        Some("src/main.rs"),
+        Some("src/main.rs"),
+        1,
+        2
+    ));
+}
+
+#[test]
+fn test_is_repeated_read_loop_same_path_below_threshold() {
+    // Same target but prior count = 0 -> next = 1 -> no trip at threshold 2.
+    assert!(!is_repeated_read_loop(
+        Some("src/main.rs"),
+        Some("src/main.rs"),
+        0,
+        2
+    ));
+}
+
+#[test]
+fn test_is_repeated_read_loop_no_current_read_is_safe() {
+    // Iteration with no file.read at all never trips the guard.
+    assert!(!is_repeated_read_loop(None, Some("src/main.rs"), 1, 2));
+}
+
+#[test]
+fn test_is_repeated_read_loop_custom_threshold() {
+    // Threshold = 3 — first two same-path iterations should not trip;
+    // the third should.
+    assert!(!is_repeated_read_loop(
+        Some("src/main.rs"),
+        Some("src/main.rs"),
+        0,
+        3
+    ));
+    assert!(!is_repeated_read_loop(
+        Some("src/main.rs"),
+        Some("src/main.rs"),
+        1,
+        3
+    ));
+    assert!(is_repeated_read_loop(
+        Some("src/main.rs"),
+        Some("src/main.rs"),
+        2,
+        3
+    ));
+}
+
+#[test]
+fn test_first_file_read_target_empty_calls() {
+    assert_eq!(first_file_read_target(&[]), None);
+}
+
+#[test]
+fn test_first_file_read_target_picks_file_read() {
+    let calls = vec![ToolCallRequest::new(
+        "call_001",
+        "file.read",
+        ToolInput::FileRead {
+            path: "src/main.rs".to_string(),
+        },
+    )];
+    assert_eq!(
+        first_file_read_target(&calls),
+        Some("src/main.rs".to_string())
+    );
+}
+
+#[test]
+fn test_first_file_read_target_picks_first_of_multiple() {
+    // When multiple file.read calls are present, the first one wins — it's
+    // the stable fingerprint for the iteration's dominant target.
+    let calls = vec![
+        ToolCallRequest::new(
+            "call_001",
+            "file.read",
+            ToolInput::FileRead {
+                path: "src/first.rs".to_string(),
+            },
+        ),
+        ToolCallRequest::new(
+            "call_002",
+            "file.read",
+            ToolInput::FileRead {
+                path: "src/second.rs".to_string(),
+            },
+        ),
+    ];
+    assert_eq!(
+        first_file_read_target(&calls),
+        Some("src/first.rs".to_string())
+    );
+}
+
+#[test]
+fn test_first_file_read_target_ignores_non_file_read() {
+    // Non-file.read tools in the batch are ignored.
+    let calls = vec![
+        ToolCallRequest::new(
+            "call_001",
+            "agent.fix_slice",
+            ToolInput::AgentFixSlice {
+                target_path: "src/main.rs".to_string(),
+                goal: "fix bug".to_string(),
+                max_lines: 50,
+            },
+        ),
+        ToolCallRequest::new(
+            "call_002",
+            "file.read",
+            ToolInput::FileRead {
+                path: "src/target.rs".to_string(),
+            },
+        ),
+    ];
+    assert_eq!(
+        first_file_read_target(&calls),
+        Some("src/target.rs".to_string())
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #351: FixSliceFailureReason::RepeatedReadLoop Display form
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_fixslice_failure_reason_repeated_read_loop_display() {
+    // The Display form is what gets stored in telemetry.
+    assert_eq!(
+        FixSliceFailureReason::RepeatedReadLoop.to_string(),
+        "repeated_read_loop"
+    );
 }

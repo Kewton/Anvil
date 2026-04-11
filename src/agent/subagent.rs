@@ -299,6 +299,12 @@ pub enum FixProposalParseFailure {
     /// distinct from `EmptyFinal` because it reflects loop exhaustion rather
     /// than a blank model output.
     NoFinal,
+    /// The sub-agent hit the same-target `file.read` oscillation guard and
+    /// aborted early (Issue #351, B1 shape). The worker kept re-reading the
+    /// same target path without producing a proposal; the runtime aborts
+    /// before the iteration budget is exhausted so the parent can classify
+    /// the session as pack_gate_invalid.
+    RepeatedReadLoop,
 }
 
 /// Outcome of `try_parse_fix_proposal` (Issue #345).
@@ -599,6 +605,51 @@ pub struct SubAgentSession<'a, C: ProviderClient> {
     iterations_used: u32,
     /// Model/context_window overrides from the parent App (Issue #77).
     overrides: SubAgentOverrides,
+    /// Most recent `file.read` target path observed in a FixSlice iteration
+    /// (Issue #351). Used together with `same_target_read_count` to detect
+    /// same-path read oscillation inside the sub-agent loop.
+    last_file_read_target: Option<String>,
+    /// Number of consecutive FixSlice iterations whose primary `file.read`
+    /// call targeted `last_file_read_target` (Issue #351).
+    same_target_read_count: u32,
+}
+
+/// Threshold (consecutive iterations) for the same-target `file.read`
+/// oscillation guard inside the FixSlice sub-agent loop (Issue #351).
+///
+/// Two iterations in a row re-reading the exact same target path without
+/// producing a `FixSliceProposal` is the B1 shape from phase-bench cycle
+/// 10: the worker is stuck and will exhaust the iteration budget if
+/// allowed to continue.
+pub const FIXSLICE_REPEATED_READ_THRESHOLD: u32 = 2;
+
+/// Pure helper for the same-target `file.read` oscillation guard (Issue
+/// #351). Returns `true` when `current_target` matches `last_target` and
+/// the resulting consecutive count reaches `threshold`.
+///
+/// Exposed as a pure function so the guard can be unit-tested without
+/// standing up a provider / tool-executor stack.
+pub fn is_repeated_read_loop(
+    current_target: Option<&str>,
+    last_target: Option<&str>,
+    prior_consecutive_count: u32,
+    threshold: u32,
+) -> bool {
+    match (current_target, last_target) {
+        (Some(c), Some(l)) if c == l => prior_consecutive_count + 1 >= threshold,
+        _ => false,
+    }
+}
+
+/// Return the first `file.read` target path from a slice of tool calls, if
+/// any (Issue #351). The FixSlice sub-agent is limited to `file.read`, so
+/// "first match" is the simplest stable fingerprint for the iteration's
+/// dominant target.
+pub fn first_file_read_target(tool_calls: &[ToolCallRequest]) -> Option<String> {
+    tool_calls.iter().find_map(|call| match &call.input {
+        ToolInput::FileRead { path } => Some(path.clone()),
+        _ => None,
+    })
 }
 
 impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
@@ -645,6 +696,8 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
             scope_path: scope.to_path_buf(),
             iterations_used: 0,
             overrides,
+            last_file_read_target: None,
+            same_target_read_count: 0,
         }
     }
 
@@ -766,6 +819,63 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
                 fix_proposal: None,
                 fix_proposal_failure: None,
             })));
+        }
+
+        // Issue #351: same-target `file.read` oscillation guard (FixSlice only).
+        //
+        // Cycle-10 traces showed FixSlice workers burning the full iteration
+        // budget while re-reading the exact same target path without ever
+        // producing a proposal. Detect that shape here, before the executor
+        // runs another round of IO against the same file, and abort with a
+        // dedicated `RepeatedReadLoop` classification so the parent can
+        // classify the session as pack_gate_invalid instead of waiting for
+        // the runner timeout.
+        if self.kind == SubAgentKind::FixSlice {
+            let current_target = first_file_read_target(&structured.tool_calls);
+            let triggered = is_repeated_read_loop(
+                current_target.as_deref(),
+                self.last_file_read_target.as_deref(),
+                self.same_target_read_count,
+                FIXSLICE_REPEATED_READ_THRESHOLD,
+            );
+            match current_target.as_deref() {
+                Some(path) if self.last_file_read_target.as_deref() == Some(path) => {
+                    self.same_target_read_count += 1;
+                }
+                Some(path) => {
+                    self.last_file_read_target = Some(path.to_string());
+                    self.same_target_read_count = 1;
+                }
+                None => {
+                    self.last_file_read_target = None;
+                    self.same_target_read_count = 0;
+                }
+            }
+            if triggered {
+                let tokens = crate::contracts::tokens::estimate_tokens(
+                    &token_buffer,
+                    crate::contracts::tokens::ContentKind::Text,
+                );
+                let target = self.last_file_read_target.clone().unwrap_or_default();
+                eprintln!(
+                    "[subagent:fix_slice] repeated-read loop detected (path={target}); \
+                     aborting after {} iteration(s)",
+                    self.iterations_used
+                );
+                let summary = format!(
+                    "fix-slice worker aborted: repeated-read loop on target '{target}' \
+                     after {} iteration(s)",
+                    self.iterations_used
+                );
+                let payload = SubAgentPayload::fallback(summary, TerminationReason::LoopDetected);
+                return Ok(TurnOutcome::Finished(Box::new(SubAgentResult {
+                    payload,
+                    estimated_tokens: tokens,
+                    iterations_used: self.iterations_used,
+                    fix_proposal: None,
+                    fix_proposal_failure: Some(FixProposalParseFailure::RepeatedReadLoop),
+                })));
+            }
         }
 
         // Validate and execute tool calls
