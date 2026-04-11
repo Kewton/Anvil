@@ -6,6 +6,7 @@
 pub mod agentic;
 pub mod alternating_loop_detector;
 pub mod cli;
+pub mod closure_loop_detector;
 mod context;
 pub mod edit_fail_tracker;
 pub(crate) mod execution_plan;
@@ -299,6 +300,10 @@ pub struct App {
     /// Whether the session is in pre-exit repair closure mode (Issue #327).
     /// When active, ANVIL_PLAN_UPDATE unchecked items are rejected.
     repair_closure_active: bool,
+    /// Detects closure-mode natural-language reasoning loops that reoccur
+    /// after a `fix_slice` worker failure with no tool-advancing output
+    /// (Issue #349).
+    closure_loop_detector: closure_loop_detector::ClosureLoopDetector,
 }
 
 /// Whether the session loop should continue or exit.
@@ -649,6 +654,7 @@ impl App {
                 edit_recovery_read_budget,
             ),
             repair_closure_active: false,
+            closure_loop_detector: closure_loop_detector::ClosureLoopDetector::new(),
         })
     }
 
