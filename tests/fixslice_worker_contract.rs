@@ -17,10 +17,12 @@
 //!    `ProposalValidationFailed`, plus the runtime-configurable
 //!    `fixslice_max_iterations` knob that replaces the hard-coded cap.
 
+use std::collections::HashMap;
+
 use anvil::agent::subagent::{
     DEFAULT_FIXSLICE_MAX_ITERATIONS, FixProposalParseOutcome, try_parse_fix_proposal,
 };
-use anvil::config::EffectiveConfig;
+use anvil::config::{ENV_OVERRIDE_WHITELIST, EffectiveConfig};
 use anvil::contracts::{AgentTelemetry, FixSliceFailureReason, FixSliceProposal};
 
 // ---------------------------------------------------------------------------
@@ -327,6 +329,55 @@ fn fixslice_max_iterations_clamped_lower_bound() {
     assert_eq!(
         config.runtime.fixslice_max_iterations, 1,
         "zero must be clamped up to 1 so the worker always gets one shot"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #347: env whitelist must carry ANVIL_FIXSLICE_MAX_ITERATIONS
+// ---------------------------------------------------------------------------
+//
+// Regression: PR #346 added the parse arm for `ANVIL_FIXSLICE_MAX_ITERATIONS`
+// to `apply_map` but forgot the matching entry in `apply_env_overrides`'s
+// whitelist, so process-env values were silently dropped before `apply_map`
+// ever saw them. These tests exercise the whitelist path via
+// `apply_env_overrides_from_map_for_test` — not `apply_overrides_for_test`,
+// which calls `apply_map` directly and bypasses the whitelist.
+
+#[test]
+fn env_whitelist_contains_fixslice_max_iterations() {
+    assert!(
+        ENV_OVERRIDE_WHITELIST.contains(&"ANVIL_FIXSLICE_MAX_ITERATIONS"),
+        "ANVIL_FIXSLICE_MAX_ITERATIONS must be in the env override whitelist \
+         so process env values reach apply_map (Issue #347)"
+    );
+}
+
+#[test]
+fn fixslice_max_iterations_reaches_runtime_via_env_whitelist() {
+    let mut config = EffectiveConfig::default_for_test().expect("config");
+    let mut env = HashMap::new();
+    env.insert("ANVIL_FIXSLICE_MAX_ITERATIONS".to_string(), "8".to_string());
+    config
+        .apply_env_overrides_from_map_for_test(&env)
+        .expect("env override should apply");
+    assert_eq!(
+        config.runtime.fixslice_max_iterations, 8,
+        "ANVIL_FIXSLICE_MAX_ITERATIONS=8 must be reflected in RuntimeConfig"
+    );
+}
+
+#[test]
+fn unknown_env_key_is_ignored_by_whitelist() {
+    let mut config = EffectiveConfig::default_for_test().expect("config");
+    let baseline = config.runtime.fixslice_max_iterations;
+    let mut env = HashMap::new();
+    env.insert("ANVIL_NOT_A_REAL_TUNABLE_KEY".to_string(), "99".to_string());
+    config
+        .apply_env_overrides_from_map_for_test(&env)
+        .expect("unknown keys must be silently ignored");
+    assert_eq!(
+        config.runtime.fixslice_max_iterations, baseline,
+        "unrelated env keys must not mutate runtime state"
     );
 }
 
