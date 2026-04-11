@@ -207,6 +207,20 @@ pub struct RuntimeConfig {
     /// now configurable so brittle-model workloads can be granted more
     /// attempts to produce a valid `FixSliceProposal`. Clamped to `[1, 10]`.
     pub fixslice_max_iterations: u32,
+    /// Same-target `file.read` oscillation threshold for the FixSlice
+    /// sub-agent no-progress detector (Issue #351 / Issue #353).
+    ///
+    /// `0` disables the guard entirely (B1 runaway workers will be caught
+    /// only by the runner wall-clock timeout). `>=1` sets the number of
+    /// consecutive iterations re-reading the same path that trip the
+    /// abort path. Clamped to `[0, 20]`.
+    ///
+    /// Cycle-11 regression showed the original hard-coded threshold of
+    /// `2` killed legitimate qwen3.5:122b exploration — the new default
+    /// is `5`, with env override `ANVIL_FIXSLICE_NO_PROGRESS_DETECTOR`
+    /// (accepts `on` / `off` / numeric value) and config key
+    /// `fixslice_no_progress_detector`.
+    pub fixslice_no_progress_detector: u32,
     /// Maximum line count for file.write on existing files (0 = disabled, Issue #156).
     pub safe_write_max_lines: usize,
     /// Deletion ratio threshold for diff warning (0.0-1.0, Issue #156).
@@ -351,6 +365,7 @@ pub const ENV_OVERRIDE_WHITELIST: &[&str] = &[
     "ANVIL_EDIT_REREAD_THRESHOLD",
     "ANVIL_EDIT_WRITE_FALLBACK_THRESHOLD",
     "ANVIL_FIXSLICE_MAX_ITERATIONS",
+    "ANVIL_FIXSLICE_NO_PROGRESS_DETECTOR",
     "ANVIL_SAFE_WRITE_MAX_LINES",
     "ANVIL_SAFE_WRITE_DELETION_RATIO",
     "ANVIL_UI_LANGUAGE",
@@ -458,6 +473,8 @@ impl EffectiveConfig {
                 edit_fixslice_read_heavy_score_threshold: 2,
                 edit_fixslice_read_heavy_drought_threshold: 5,
                 fixslice_max_iterations: crate::agent::subagent::DEFAULT_FIXSLICE_MAX_ITERATIONS,
+                fixslice_no_progress_detector:
+                    crate::agent::subagent::DEFAULT_FIXSLICE_REPEATED_READ_THRESHOLD,
                 safe_write_max_lines: 500,
                 safe_write_deletion_ratio: 0.5,
                 read_repeat_warn_threshold: 3,
@@ -979,6 +996,33 @@ impl EffectiveConfig {
                     }
                     self.runtime.fixslice_max_iterations = v;
                 }
+                "fixslice_no_progress_detector" | "ANVIL_FIXSLICE_NO_PROGRESS_DETECTOR" => {
+                    // Issue #353: accept `on` / `off` / numeric threshold.
+                    // `off` (alias: `disabled`, `false`, `0`) fully
+                    // disables the same-target read guard so brittle-model
+                    // workloads are caught only by the runner wall-clock
+                    // timeout. `on` (alias: `default`, `true`) restores the
+                    // default threshold. Any numeric value is used
+                    // directly and clamped later by `validate()`.
+                    let trimmed = value.trim();
+                    let parsed = match trimmed.to_ascii_lowercase().as_str() {
+                        "off" | "disabled" | "false" | "no" => Some(0u32),
+                        "on" | "true" | "yes" | "default" => {
+                            Some(crate::agent::subagent::DEFAULT_FIXSLICE_REPEATED_READ_THRESHOLD)
+                        }
+                        _ => None,
+                    };
+                    let v = match parsed {
+                        Some(v) => v,
+                        None => trimmed
+                            .parse::<u32>()
+                            .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?,
+                    };
+                    if v > 20 {
+                        return Err(ConfigError::InvalidNumericValue(value.clone()));
+                    }
+                    self.runtime.fixslice_no_progress_detector = v;
+                }
                 "edit_recovery_read_budget" | "ANVIL_EDIT_RECOVERY_READ_BUDGET" => {
                     let v: u32 = value
                         .parse()
@@ -1313,6 +1357,11 @@ impl EffectiveConfig {
             self.runtime.edit_recovery_read_budget.clamp(1, 10);
         // Issue #345: clamp fix_slice worker iteration cap to [1, 10].
         self.runtime.fixslice_max_iterations = self.runtime.fixslice_max_iterations.clamp(1, 10);
+        // Issue #353: clamp fix_slice no-progress detector threshold to
+        // [0, 20] — 0 disables the guard, values above 20 are treated as
+        // a misconfiguration (would exceed the FixSlice iteration cap).
+        self.runtime.fixslice_no_progress_detector =
+            self.runtime.fixslice_no_progress_detector.min(20);
     }
 
     pub fn validate_for_test(&mut self) -> Result<(), ConfigError> {
@@ -1689,6 +1738,10 @@ impl std::fmt::Debug for RuntimeConfig {
                 &self.edit_fixslice_read_heavy_drought_threshold,
             )
             .field("fixslice_max_iterations", &self.fixslice_max_iterations)
+            .field(
+                "fixslice_no_progress_detector",
+                &self.fixslice_no_progress_detector,
+            )
             .field("safe_write_max_lines", &self.safe_write_max_lines)
             .field("safe_write_deletion_ratio", &self.safe_write_deletion_ratio)
             .field("edit_recovery_read_budget", &self.edit_recovery_read_budget)

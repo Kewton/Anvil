@@ -1,18 +1,21 @@
 //! Integration tests for the FixSlice sub-agent (Issue #291).
 
 use anvil::agent::subagent::{
-    FIXSLICE_MAX_ITERATIONS, FIXSLICE_REPEATED_READ_THRESHOLD, FIXSLICE_TIMEOUT_SECS,
-    MAX_FIXSLICE_LINES, SubAgentKind, first_file_read_target, is_repeated_read_loop,
+    DEFAULT_FIXSLICE_REPEATED_READ_THRESHOLD, FIXSLICE_MAX_ITERATIONS,
+    FIXSLICE_REPEATED_READ_THRESHOLD, FIXSLICE_TIMEOUT_SECS, MAX_FIXSLICE_LINES, SubAgentKind,
+    first_file_read_target, is_repeated_read_loop,
 };
 use anvil::agent::tag_spec::find_spec;
 use anvil::app::agentic::{
     build_fixslice_user_prompt, build_rewrite_request, validate_fix_proposal,
 };
+use anvil::config::{ENV_OVERRIDE_WHITELIST, EffectiveConfig};
 use anvil::contracts::{FixSliceFailureReason, FixSliceProposal};
 use anvil::tooling::{
     ExecutionClass, ExecutionMode, PermissionClass, ToolCallRequest, ToolInput, ToolKind,
     ToolRegistry, ToolValidationError,
 };
+use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
 // Task 1.1: FixSliceProposal serde
@@ -608,9 +611,135 @@ fn test_fixslice_tool_kind_mapping() {
 
 #[test]
 fn test_fixslice_repeated_read_threshold_default() {
-    // The default threshold is 2: two consecutive iterations re-reading the
-    // same target path trip the guard.
-    assert_eq!(FIXSLICE_REPEATED_READ_THRESHOLD, 2);
+    // Issue #353: the default threshold is 5 — cycle-11 regressed on the
+    // previous value of 2, which killed legitimate qwen3.5:122b
+    // exploration. The back-compat alias tracks the default.
+    assert_eq!(DEFAULT_FIXSLICE_REPEATED_READ_THRESHOLD, 5);
+    assert_eq!(
+        FIXSLICE_REPEATED_READ_THRESHOLD,
+        DEFAULT_FIXSLICE_REPEATED_READ_THRESHOLD
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #353: no-progress detector tunable — runtime config, env, and file
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_fixslice_no_progress_detector_default_is_raised_threshold() {
+    // Issue #353: the baseline runtime config must ship with the new
+    // raised default so legitimate A1/A2 exploration is not aborted.
+    let config = EffectiveConfig::default_for_test().expect("default config");
+    assert_eq!(
+        config.runtime.fixslice_no_progress_detector,
+        DEFAULT_FIXSLICE_REPEATED_READ_THRESHOLD
+    );
+}
+
+#[test]
+fn test_fixslice_no_progress_detector_allows_five_reads_before_firing() {
+    // Issue #353: with the raised default, five same-path reads in a row
+    // are needed before the guard trips. Four are still fine.
+    let threshold = DEFAULT_FIXSLICE_REPEATED_READ_THRESHOLD;
+    for prior in 0..(threshold - 1) {
+        assert!(
+            !is_repeated_read_loop(Some("src/main.rs"), Some("src/main.rs"), prior, threshold,),
+            "prior={prior} must not trip at default threshold"
+        );
+    }
+    assert!(is_repeated_read_loop(
+        Some("src/main.rs"),
+        Some("src/main.rs"),
+        threshold - 1,
+        threshold,
+    ));
+}
+
+#[test]
+fn test_fixslice_no_progress_detector_env_off_disables_guard() {
+    // Issue #353: `ANVIL_FIXSLICE_NO_PROGRESS_DETECTOR=off` must route to
+    // threshold=0 in RuntimeConfig; the SubAgentSession treats `0` as
+    // "detector disabled" and never aborts on read repetition.
+    let mut config = EffectiveConfig::default_for_test().expect("default config");
+    let file_values: HashMap<String, String> = HashMap::new();
+    let mut env_values: HashMap<String, String> = HashMap::new();
+    env_values.insert(
+        "ANVIL_FIXSLICE_NO_PROGRESS_DETECTOR".to_string(),
+        "off".to_string(),
+    );
+    let cli_values: HashMap<String, String> = HashMap::new();
+    config
+        .apply_overrides_for_test(&file_values, &env_values, &cli_values)
+        .expect("env override applies");
+    assert_eq!(config.runtime.fixslice_no_progress_detector, 0);
+}
+
+#[test]
+fn test_fixslice_no_progress_detector_env_numeric_override() {
+    // Numeric env values are accepted and clamped to [0, 20] by validate.
+    let mut config = EffectiveConfig::default_for_test().expect("default config");
+    let mut env = HashMap::new();
+    env.insert(
+        "ANVIL_FIXSLICE_NO_PROGRESS_DETECTOR".to_string(),
+        "7".to_string(),
+    );
+    config
+        .apply_overrides_for_test(&HashMap::new(), &env, &HashMap::new())
+        .expect("numeric env override applies");
+    assert_eq!(config.runtime.fixslice_no_progress_detector, 7);
+}
+
+#[test]
+fn test_fixslice_no_progress_detector_env_on_restores_default() {
+    let mut config = EffectiveConfig::default_for_test().expect("default config");
+    // Force a non-default state first.
+    config.runtime.fixslice_no_progress_detector = 0;
+    let mut env = HashMap::new();
+    env.insert(
+        "ANVIL_FIXSLICE_NO_PROGRESS_DETECTOR".to_string(),
+        "on".to_string(),
+    );
+    config
+        .apply_overrides_for_test(&HashMap::new(), &env, &HashMap::new())
+        .expect("on override applies");
+    assert_eq!(
+        config.runtime.fixslice_no_progress_detector,
+        DEFAULT_FIXSLICE_REPEATED_READ_THRESHOLD
+    );
+}
+
+#[test]
+fn test_fixslice_no_progress_detector_file_config_key_honored() {
+    // Issue #353: the file-config key must match the env name so users
+    // can set it via `.anvil/config`.
+    let mut config = EffectiveConfig::default_for_test().expect("default config");
+    let mut file = HashMap::new();
+    file.insert("fixslice_no_progress_detector".to_string(), "3".to_string());
+    config
+        .apply_overrides_for_test(&file, &HashMap::new(), &HashMap::new())
+        .expect("file override applies");
+    assert_eq!(config.runtime.fixslice_no_progress_detector, 3);
+}
+
+#[test]
+fn test_fixslice_no_progress_detector_env_whitelisted() {
+    // Issue #347 regression guard: env vars must be in the whitelist, or
+    // `apply_env_overrides()` silently drops them.
+    assert!(
+        ENV_OVERRIDE_WHITELIST.contains(&"ANVIL_FIXSLICE_NO_PROGRESS_DETECTOR"),
+        "ANVIL_FIXSLICE_NO_PROGRESS_DETECTOR must be in the env override \
+         whitelist so it reaches RuntimeConfig via apply_env_overrides"
+    );
+}
+
+#[test]
+fn test_fixslice_no_progress_detector_validate_clamps_upper_bound() {
+    // Values above 20 are clamped (misconfig guard — would exceed the
+    // max FixSlice iteration cap anyway).
+    let mut config = EffectiveConfig::default_for_test().expect("default config");
+    config.runtime.fixslice_no_progress_detector = 999;
+    config.validate_for_test().expect("validate");
+    assert_eq!(config.runtime.fixslice_no_progress_detector, 20);
 }
 
 #[test]
