@@ -9,6 +9,7 @@ pub mod cli;
 pub mod closure_loop_detector;
 mod context;
 pub mod edit_fail_tracker;
+pub mod escalation_barrier;
 pub(crate) mod execution_plan;
 pub mod loop_detector;
 pub mod mock;
