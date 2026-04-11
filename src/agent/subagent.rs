@@ -614,14 +614,25 @@ pub struct SubAgentSession<'a, C: ProviderClient> {
     same_target_read_count: u32,
 }
 
-/// Threshold (consecutive iterations) for the same-target `file.read`
-/// oscillation guard inside the FixSlice sub-agent loop (Issue #351).
+/// Default threshold (consecutive iterations) for the same-target
+/// `file.read` oscillation guard inside the FixSlice sub-agent loop
+/// (Issue #351 / Issue #353).
 ///
-/// Two iterations in a row re-reading the exact same target path without
-/// producing a `FixSliceProposal` is the B1 shape from phase-bench cycle
-/// 10: the worker is stuck and will exhaust the iteration budget if
-/// allowed to continue.
-pub const FIXSLICE_REPEATED_READ_THRESHOLD: u32 = 2;
+/// Runtime callers should read
+/// `EffectiveConfig::runtime::fixslice_no_progress_detector` instead —
+/// this constant only pins the default used when nothing else is set.
+///
+/// Issue #353: cycle-11 traces showed the previous default (`2`) killed
+/// legitimate A1/A2 exploration — qwen3.5:122b frequently needs more than
+/// two same-path reads to reach a proposal. Raised to `5` so the guard
+/// still catches the B1 runaway shape but leaves normal exploration
+/// intact. A value of `0` disables the guard entirely.
+pub const DEFAULT_FIXSLICE_REPEATED_READ_THRESHOLD: u32 = 5;
+
+/// Back-compat alias for [`DEFAULT_FIXSLICE_REPEATED_READ_THRESHOLD`]
+/// (Issue #351 / Issue #353). Kept so existing test imports continue to
+/// compile; new code should read the runtime config at the call site.
+pub const FIXSLICE_REPEATED_READ_THRESHOLD: u32 = DEFAULT_FIXSLICE_REPEATED_READ_THRESHOLD;
 
 /// Pure helper for the same-target `file.read` oscillation guard (Issue
 /// #351). Returns `true` when `current_target` matches `last_target` and
@@ -822,6 +833,8 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
         }
 
         // Issue #351: same-target `file.read` oscillation guard (FixSlice only).
+        // Issue #353: threshold is now configurable via
+        // `runtime.fixslice_no_progress_detector` (0 = disabled).
         //
         // Cycle-10 traces showed FixSlice workers burning the full iteration
         // budget while re-reading the exact same target path without ever
@@ -831,13 +844,15 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
         // classify the session as pack_gate_invalid instead of waiting for
         // the runner timeout.
         if self.kind == SubAgentKind::FixSlice {
+            let detector_threshold = self.config.runtime.fixslice_no_progress_detector;
             let current_target = first_file_read_target(&structured.tool_calls);
-            let triggered = is_repeated_read_loop(
-                current_target.as_deref(),
-                self.last_file_read_target.as_deref(),
-                self.same_target_read_count,
-                FIXSLICE_REPEATED_READ_THRESHOLD,
-            );
+            let triggered = detector_threshold > 0
+                && is_repeated_read_loop(
+                    current_target.as_deref(),
+                    self.last_file_read_target.as_deref(),
+                    self.same_target_read_count,
+                    detector_threshold,
+                );
             match current_target.as_deref() {
                 Some(path) if self.last_file_read_target.as_deref() == Some(path) => {
                     self.same_target_read_count += 1;
