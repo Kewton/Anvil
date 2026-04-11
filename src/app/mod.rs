@@ -16,6 +16,7 @@ pub mod mutation_barrier;
 pub mod phase_estimator;
 pub mod plan;
 pub mod policy;
+pub mod post_failure_thrash_detector;
 pub(crate) mod read_repeat_tracker;
 pub mod read_transition_guard;
 pub mod render;
@@ -304,6 +305,10 @@ pub struct App {
     /// after a `fix_slice` worker failure with no tool-advancing output
     /// (Issue #349).
     closure_loop_detector: closure_loop_detector::ClosureLoopDetector,
+    /// Detects tool-active thrash loops after a `fix_slice` worker failure
+    /// where the parent keeps calling tools but the execution plan never
+    /// advances (Issue #351).
+    post_failure_thrash_detector: post_failure_thrash_detector::PostFailureThrashDetector,
 }
 
 /// Whether the session loop should continue or exit.
@@ -655,6 +660,8 @@ impl App {
             ),
             repair_closure_active: false,
             closure_loop_detector: closure_loop_detector::ClosureLoopDetector::new(),
+            post_failure_thrash_detector:
+                post_failure_thrash_detector::PostFailureThrashDetector::default(),
         })
     }
 
