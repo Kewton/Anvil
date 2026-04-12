@@ -2,6 +2,33 @@
 
 ## [Unreleased]
 
+## [0.0.11] - 2026-04-12
+
+### Added
+- `agent.fix_slice` microtask sub-agent for targeted slice-level repair (#291)
+- `file.rewrite` bounded rewrite primitive for line-range block replacement (#290)
+
+### Fixed
+- Add reactive fix_slice escalation from repeated edit failures (#321)
+- Process ANVIL_PLAN_UPDATE before escape hatch break (#323)
+- Continue loop after pre-exit repair turn injection (#325)
+- Reject unchecked plan expansion during repair closure mode (#327)
+- Add pack validation gate for benchmark expectation mismatch detection (#329)
+- Broaden fix_slice escalation to cover cross-path drift (#332)
+- Add read-heavy worker escalation and tighten worker-required gate (#334)
+- Add structural closure guard for late-stage remaining=1 (#336)
+- Only flip worker_observed after real post-execution worker success (#339)
+- Embed target_path and max_lines in FixSlice worker prompt (#341)
+- Suppress pre-exit repair salvage after fix_slice worker failure (#343)
+- Strengthen fix_slice worker contract brittleness (#345)
+- Add ANVIL_FIXSLICE_MAX_ITERATIONS to env whitelist (#347)
+- Add closure-mode reasoning loop guard after fix_slice failure (#349)
+- Add subagent and parent thrash detectors (#351)
+- Make fix_slice no-progress detector tunable (#353)
+- Force agent.fix_slice routing and early-exit on worker success (#355)
+- Enforce FixSliceProposal contract in fix_slice prompt (#357)
+- Balance fix_slice prompt to prevent proposal-avoidance under path ambiguity (#359)
+
 ## [0.0.10] - 2026-04-09
 
 ### Added
