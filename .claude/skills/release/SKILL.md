@@ -194,7 +194,8 @@ git push origin "v$new_version"
 
 タグのプッシュにより GitHub Actions（`.github/workflows/release.yml`）が自動で以下を実行します：
 - 4プラットフォーム向けバイナリビルド（linux-amd64, linux-arm64, darwin-amd64, darwin-arm64）
-- GitHub Release作成とバイナリアップロード
+- Anvil リポジトリの GitHub Release 作成とバイナリアップロード
+- AnvilBinary リポジトリ（`Kewton/AnvilBinary`）にも同じバイナリを GitHub Release として自動公開（`ANVILBINARY_TOKEN` Secret 使用）
 
 ### 11. リリースworktreeのクリーンアップ
 
@@ -262,6 +263,8 @@ gh run list --limit 3
 | `cargo clippy` に警告がある | 警告修正を促し、リリースを中断。worktreeを削除 |
 | PRのCIが失敗 | commandmatedev send で修正コミットを追加 |
 | GitHub Actionsのビルド失敗 | ワークフロー修正後にタグを削除して再作成 |
+| `ANVILBINARY_TOKEN` が未設定 | Anvil リポジトリの Settings → Secrets → Actions に `ANVILBINARY_TOKEN` を追加（`Kewton/AnvilBinary` への `contents: write` 権限を持つ PAT） |
+| AnvilBinary へのリリース失敗 | `gh release delete <tag> --repo Kewton/AnvilBinary` で削除後、`gh release create` を手動実行 |
 | リリース中断時のクリーンアップ | `git worktree remove` → `git branch -D` → `git push origin --delete` |
 
 ## 参考

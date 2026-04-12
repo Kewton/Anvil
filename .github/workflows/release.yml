@@ -82,3 +82,14 @@ jobs:
             --title "${{ github.ref_name }}" \
             --generate-notes \
             artifacts/*.gz
+
+      - name: Publish to AnvilBinary
+        env:
+          GH_TOKEN: ${{ secrets.ANVILBINARY_TOKEN }}
+        run: |
+          RELEASE_NOTES="Binary release of [Anvil ${{ github.ref_name }}](https://github.com/Kewton/Anvil/releases/tag/${{ github.ref_name }}). See [CHANGELOG](https://github.com/Kewton/Anvil/blob/main/CHANGELOG.md) for details."
+          gh release create "${{ github.ref_name }}" \
+            --repo Kewton/AnvilBinary \
+            --title "${{ github.ref_name }}" \
+            --notes "$RELEASE_NOTES" \
+            artifacts/*.gz
