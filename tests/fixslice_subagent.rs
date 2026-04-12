@@ -425,6 +425,73 @@ fn test_fixslice_system_prompt_contents() {
 }
 
 // ---------------------------------------------------------------------------
+// Issue #357: FixSlice system prompt must hard-code the worker contract so
+// B1 (basename drift) and B2 (markdown / tool-call JSON under ANVIL_FINAL)
+// failure modes stop sneaking past the model.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_fixslice_system_prompt_enforces_contract_issue_357() {
+    use anvil::agent::subagent::{SubAgentPromptOptions, build_subagent_system_prompt};
+
+    let opts = SubAgentPromptOptions {
+        offline: false,
+        ui_language: None,
+    };
+    let prompt = build_subagent_system_prompt(&SubAgentKind::FixSlice, &opts);
+
+    // Strict final-message contract stated up front.
+    assert!(
+        prompt.contains("Final-message contract"),
+        "prompt must lead with the final-message contract: {prompt}"
+    );
+    assert!(
+        prompt.contains("exactly one ANVIL_FINAL"),
+        "prompt must forbid more than one ANVIL_FINAL block: {prompt}"
+    );
+
+    // Markdown / tool-call JSON drift must be explicitly forbidden.
+    assert!(
+        prompt.contains("Markdown"),
+        "prompt must forbid Markdown in the final message: {prompt}"
+    );
+    assert!(
+        prompt.contains("ANVIL_TOOL"),
+        "prompt must forbid ANVIL_TOOL re-pastes in the final message: {prompt}"
+    );
+
+    // target_path exact-match requirement — the B1 failure mode.
+    assert!(
+        prompt.contains("byte-for-byte"),
+        "prompt must require byte-for-byte target_path match: {prompt}"
+    );
+    assert!(
+        prompt.contains("basename"),
+        "prompt must call out basename drift: {prompt}"
+    );
+
+    // Few-shot examples — both positive and negative must be present.
+    assert!(
+        prompt.contains("Correct"),
+        "prompt must include a positive few-shot example: {prompt}"
+    );
+    assert!(
+        prompt.contains("Incorrect"),
+        "prompt must include a negative few-shot example: {prompt}"
+    );
+
+    // The cycle-13 B1 drift must appear as an explicit negative example.
+    assert!(
+        prompt.contains(r#""target_path":"src/lib/auto-yes-manager.ts""#),
+        "prompt must include the positive auto-yes-manager example: {prompt}"
+    );
+    assert!(
+        prompt.contains(r#""target_path":"auto-yes-manager.ts""#),
+        "prompt must include the basename-drift negative example: {prompt}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Validation via ToolRegistry
 // ---------------------------------------------------------------------------
 
