@@ -3460,7 +3460,17 @@ pub fn build_fixslice_user_prompt(target_path: &str, goal: &str, max_lines: u32)
          1. Read `{target_path}` first with file.read to locate the exact lines to change.\n\
          2. Return a single JSON proposal inside ANVIL_FINAL whose `target_path` equals `{target_path}` exactly.\n\
          3. Keep the `end_line - start_line + 1` span within {max_lines} lines.\n\
-         4. Do not explore unrelated files; the edit must stay on the target."
+         4. Do not explore unrelated files; the edit must stay on the target.\n\
+         \n\
+         IMPORTANT GUIDANCE:\n\
+         - If file.read returns a slightly different path form (e.g., ./src/ vs src/), use \
+         the ORIGINAL target_path `{target_path}` from this prompt in your proposal. \
+         Do not block on resolving path ambiguity.\n\
+         - Partial file context is acceptable. You do not need to read the entire file \
+         before proposing a fix.\n\
+         - It is better to submit an imperfect proposal than to submit no proposal. \
+         Anvil will validate your proposal and retry if needed.\n\
+         - Focus on producing the FixSliceProposal JSON, not on explaining your reasoning."
     )
 }
 

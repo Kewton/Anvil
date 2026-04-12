@@ -217,16 +217,22 @@ Correct — request target_path was `src/agent/subagent.rs`:
 {"target_path":"src/agent/subagent.rs","start_line":100,"end_line":101,"replacement_content":"    let x = compute(&ctx);\n","rationale":"Pass ctx to compute to fix overflow"}
 ```
 
-Incorrect — `target_path` dropped the directory (basename drift, do NOT do this):
+Avoid — basename drift (dropped the directory prefix):
 ```ANVIL_FINAL
 {"target_path":"auto-yes-manager.ts","start_line":42,"end_line":44,"replacement_content":"...","rationale":"..."}
 ```
 
-Incorrect — markdown summary under ANVIL_FINAL (do NOT do this):
+Avoid — markdown summary under ANVIL_FINAL:
 ```ANVIL_FINAL
 ## Implementation overview
 I updated the handler so the multiple-choice prompt now returns true on yes...
 ```
+
+## Encouragement
+- Always produce a FixSliceProposal. It is better to submit an imperfect proposal
+  than no proposal — Anvil validates and will ask you to retry if needed.
+- If you are unsure about exact line numbers, make your best attempt.
+- Do not spend iterations reasoning about whether to propose — propose.
 
 "#;
 

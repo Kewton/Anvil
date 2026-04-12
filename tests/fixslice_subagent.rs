@@ -476,7 +476,7 @@ fn test_fixslice_system_prompt_enforces_contract_issue_357() {
         "prompt must include a positive few-shot example: {prompt}"
     );
     assert!(
-        prompt.contains("Incorrect"),
+        prompt.contains("Avoid"),
         "prompt must include a negative few-shot example: {prompt}"
     );
 
@@ -955,6 +955,75 @@ fn test_first_file_read_target_ignores_non_file_read() {
     assert_eq!(
         first_file_read_target(&calls),
         Some("src/target.rs".to_string())
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #359: balance fix_slice prompt — encouragement guidance + softened
+// negative examples to prevent proposal-avoidance under path ambiguity
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_fixslice_system_prompt_contains_encouragement_issue_359() {
+    use anvil::agent::subagent::{SubAgentPromptOptions, build_subagent_system_prompt};
+
+    let opts = SubAgentPromptOptions {
+        offline: false,
+        ui_language: None,
+    };
+    let prompt = build_subagent_system_prompt(&SubAgentKind::FixSlice, &opts);
+
+    // Encouragement section must exist to counterbalance strict contract.
+    assert!(
+        prompt.contains("imperfect proposal"),
+        "system prompt must encourage submitting imperfect proposals over no proposal: {prompt}"
+    );
+    assert!(
+        prompt.contains("retry"),
+        "system prompt must mention Anvil retry to reduce proposal-avoidance: {prompt}"
+    );
+}
+
+#[test]
+fn test_fixslice_system_prompt_softened_negative_examples_issue_359() {
+    use anvil::agent::subagent::{SubAgentPromptOptions, build_subagent_system_prompt};
+
+    let opts = SubAgentPromptOptions {
+        offline: false,
+        ui_language: None,
+    };
+    let prompt = build_subagent_system_prompt(&SubAgentKind::FixSlice, &opts);
+
+    // Negative examples must use "Avoid" instead of "Incorrect ... do NOT do this".
+    assert!(
+        prompt.contains("Avoid"),
+        "negative examples must use softened label 'Avoid': {prompt}"
+    );
+    assert!(
+        !prompt.contains("do NOT do this"),
+        "prompt must not contain 'do NOT do this' — softened in Issue #359: {prompt}"
+    );
+}
+
+#[test]
+fn test_fixslice_user_prompt_contains_guidance_issue_359() {
+    let prompt =
+        build_fixslice_user_prompt("src/lib/auto-yes-manager.ts", "fix path resolution bug", 80);
+
+    // IMPORTANT GUIDANCE must be present to counterbalance strict contract.
+    assert!(
+        prompt.contains("IMPORTANT GUIDANCE"),
+        "user prompt must contain IMPORTANT GUIDANCE section: {prompt}"
+    );
+    // Path ambiguity guidance — the primary regression trigger.
+    assert!(
+        prompt.contains("path ambiguity"),
+        "user prompt must address path ambiguity: {prompt}"
+    );
+    // Encourage proposal submission.
+    assert!(
+        prompt.contains("imperfect proposal"),
+        "user prompt must encourage imperfect proposals over no proposal: {prompt}"
     );
 }
 
