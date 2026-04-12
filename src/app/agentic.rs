@@ -54,9 +54,19 @@ pub fn log_turn_summary(summary: &TurnSummary<'_>) {
     let compact_str = match summary.compact_info {
         None => "no".to_string(),
         Some(info) => match &info.sidecar_model {
+            Some(model) if info.sidecar_rejected => format!(
+                "sidecar-rejected({}, len={}, {}->{}msgs)",
+                model,
+                info.sidecar_summary_length.unwrap_or(0),
+                info.before_messages,
+                info.after_messages
+            ),
             Some(model) => format!(
-                "sidecar({}, {}->{}msgs)",
-                model, info.before_messages, info.after_messages
+                "sidecar({}, len={}, {}->{}msgs)",
+                model,
+                info.sidecar_summary_length.unwrap_or(0),
+                info.before_messages,
+                info.after_messages
             ),
             None => format!(
                 "rule-based({}->{}msgs)",

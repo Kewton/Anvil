@@ -238,6 +238,41 @@ Summarize the conversation preserving:
 Format as structured bullet points. Preserve exact function names and type names.
 Do NOT include file contents - only signatures and structure.";
 
+/// Section headers expected in sidecar summaries.
+/// Must match the sections requested in SIDECAR_SUMMARIZE_PROMPT.
+/// When updating SIDECAR_SUMMARIZE_PROMPT, this array must also be updated.
+const SIDECAR_EXPECTED_SECTIONS: &[&str] = &[
+    "FILE SIGNATURES",
+    "CHANGE PLAN",
+    "COMPLETED CHANGES",
+    "KEY CONSTRAINTS",
+];
+
+/// Minimum character length for a valid sidecar summary.
+const MIN_SUMMARY_LENGTH: usize = 50;
+
+/// At least 3 of 4 sections must be present for a summary to be accepted.
+const MIN_REQUIRED_SECTIONS: usize = 3;
+
+/// Check whether a sidecar summary meets minimum quality requirements.
+///
+/// Returns `true` if the summary should be rejected (low quality).
+/// A summary is low-quality if:
+/// - It is empty or shorter than MIN_SUMMARY_LENGTH characters after trimming
+/// - Fewer than MIN_REQUIRED_SECTIONS (3 of 4) expected section headers are present
+pub fn is_low_quality_sidecar_summary(summary: &str) -> bool {
+    let trimmed = summary.trim();
+    if trimmed.is_empty() || trimmed.len() < MIN_SUMMARY_LENGTH {
+        return true;
+    }
+    let upper = trimmed.to_uppercase();
+    let section_count = SIDECAR_EXPECTED_SECTIONS
+        .iter()
+        .filter(|s| upper.contains(*s))
+        .count();
+    section_count < MIN_REQUIRED_SECTIONS
+}
+
 impl<T: HttpTransport> OllamaProviderClient<T> {
     /// Check connectivity to the Ollama server by requesting `/api/tags`.
     ///
@@ -691,6 +726,97 @@ mod tests {
         assert!(
             SIDECAR_SUMMARIZE_PROMPT.contains("KEY CONSTRAINTS"),
             "prompt must contain KEY CONSTRAINTS section"
+        );
+    }
+
+    // ── Issue #293: Quality gate tests ───────────────────────────────
+
+    #[test]
+    fn sidecar_prompt_sections_match_quality_gate() {
+        // Verify that every section in SIDECAR_EXPECTED_SECTIONS is present
+        // in the SIDECAR_SUMMARIZE_PROMPT. This catches drift between prompt
+        // and quality gate constants.
+        for section in SIDECAR_EXPECTED_SECTIONS {
+            assert!(
+                SIDECAR_SUMMARIZE_PROMPT.contains(section),
+                "SIDECAR_SUMMARIZE_PROMPT must contain section '{section}'"
+            );
+        }
+    }
+
+    #[test]
+    fn low_quality_sidecar_summary_rejects_short_text() {
+        assert!(
+            is_low_quality_sidecar_summary(""),
+            "empty should be low quality"
+        );
+        assert!(
+            is_low_quality_sidecar_summary("   "),
+            "whitespace should be low quality"
+        );
+        assert!(
+            is_low_quality_sidecar_summary("too short"),
+            "text under 50 chars should be low quality"
+        );
+        // Exactly 49 chars (under threshold)
+        let short = "a".repeat(49);
+        assert!(
+            is_low_quality_sidecar_summary(&short),
+            "49 chars without sections should be low quality"
+        );
+    }
+
+    #[test]
+    fn low_quality_sidecar_summary_rejects_missing_sections() {
+        // Long text with only 2 sections (below MIN_REQUIRED_SECTIONS=3)
+        let summary = format!(
+            "{}\n## FILE SIGNATURES\nfn foo() -> bool\n## CHANGE PLAN\nedit file.rs",
+            "x".repeat(100)
+        );
+        assert!(
+            is_low_quality_sidecar_summary(&summary),
+            "summary with only 2 of 4 sections should be low quality"
+        );
+    }
+
+    #[test]
+    fn low_quality_sidecar_summary_accepts_valid_summary() {
+        // Valid summary with all 4 sections
+        let summary = "\
+## FILE SIGNATURES
+- fn detect_prompt(output: &str) -> PromptResult
+
+## CHANGE PLAN
+- Edit src/session/mod.rs to add is_advisory field
+
+## COMPLETED CHANGES
+- Added is_advisory to SessionMessage
+
+## KEY CONSTRAINTS
+- Must maintain backward compatibility with serde(default)
+- No unsafe code allowed";
+        assert!(
+            !is_low_quality_sidecar_summary(summary),
+            "valid summary with all 4 sections should pass quality gate"
+        );
+    }
+
+    #[test]
+    fn low_quality_sidecar_summary_accepts_three_sections() {
+        // Valid summary with 3 of 4 sections (meets MIN_REQUIRED_SECTIONS)
+        let summary = "\
+## FILE SIGNATURES
+- fn detect_prompt(output: &str) -> PromptResult
+
+## CHANGE PLAN
+- Edit src/session/mod.rs to add is_advisory field
+
+## KEY CONSTRAINTS
+- Must maintain backward compatibility with serde(default)
+- No unsafe code allowed";
+        assert!(
+            !is_low_quality_sidecar_summary(summary),
+            "summary with 3 of 4 sections should pass quality gate"
         );
     }
 }

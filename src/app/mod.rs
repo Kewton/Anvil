@@ -226,6 +226,11 @@ pub struct CompactInfo {
     pub sidecar_model: Option<String>,
     pub before_messages: usize,
     pub after_messages: usize,
+    /// Sidecar summary character count before quality gate (None if sidecar not used).
+    /// Logged as indirect quality indicator. Retained even if summary was rejected.
+    pub sidecar_summary_length: Option<usize>,
+    /// Whether the sidecar summary was rejected by quality gate (Issue #293).
+    pub sidecar_rejected: bool,
 }
 
 /// Central application state.
@@ -1131,7 +1136,21 @@ impl App {
         }
 
         // Sidecar LLM summarization (Issue #195)
-        let llm_summary = self.try_sidecar_summarize();
+        let raw_summary = self.try_sidecar_summarize();
+
+        // Quality gate: reject low-quality sidecar summary (Issue #293)
+        let sidecar_summary_length = raw_summary.as_ref().map(|s| s.len());
+        let (llm_summary, sidecar_rejected) = match raw_summary {
+            Some(ref text) if crate::provider::is_low_quality_sidecar_summary(text) => {
+                tracing::warn!(
+                    summary_len = text.len(),
+                    "Sidecar summary rejected as low-quality; falling back to rule-based"
+                );
+                (None, true)
+            }
+            other => (other, false),
+        };
+
         let sidecar_used = llm_summary.is_some();
 
         let before_messages = self.session.messages.len();
@@ -1146,13 +1165,15 @@ impl App {
             let after_messages = self.session.messages.len();
             self.session_stats.record_compact(sidecar_used);
             self.last_compact_info = Some(CompactInfo {
-                sidecar_model: if sidecar_used {
+                sidecar_model: if sidecar_used || sidecar_rejected {
                     self.config.runtime.sidecar_model.clone()
                 } else {
                     None
                 },
                 before_messages,
                 after_messages,
+                sidecar_summary_length,
+                sidecar_rejected,
             });
 
             let usage = ContextUsageView {

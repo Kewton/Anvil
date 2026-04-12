@@ -105,7 +105,7 @@ src/
 │   ├── tag_parser.rs    # タグベースツール呼び出しパーサー（多層プロトコル対応）
 │   └── tag_spec.rs      # ツールタグ仕様テーブル（TOOL_TAG_SPECS）
 ├── app/
-│   ├── mod.rs           # アプリケーションオーケストレータ（SessionStats・CompactInfo・セッションサマリー含む）
+│   ├── mod.rs           # アプリケーションオーケストレータ（SessionStats・CompactInfo（sidecar_summary_length・sidecar_rejected含む）・セッションサマリー・sidecar quality gate適用含む）
 │   ├── agentic.rs       # agenticツール実行ループ（ANVIL_FINALガード・再試行ロジック・ターンサマリー・異常検出WARN・delegation_threshold・proactive branch含む）
 │   ├── cli.rs           # CLI入力ループ
 │   ├── context.rs       # コンテキスト注入（@file展開・サンドボックス検証）
@@ -139,11 +139,11 @@ src/
 ├── metrics/mod.rs       # ベンチマーク
 ├── provider/
 │   ├── mod.rs           # プロバイダー抽象化
-│   ├── ollama.rs        # Ollamaクライアント（sidecar_summarize: サイドカーモデルによるLLM要約生成）
+│   ├── ollama.rs        # Ollamaクライアント（sidecar_summarize: サイドカーモデルによるLLM要約生成・is_low_quality_sidecar_summary: サイドカー品質ゲート（Issue #293））
 │   ├── openai.rs        # OpenAI互換クライアント
 │   └── transport.rs     # HTTPトランスポート
 ├── retrieval/mod.rs     # リポジトリ検索（オンデマンドコンテンツ読込・軽量キャッシュ）
-├── session/mod.rs       # セッション永続化（名前付きセッション・一覧・切替・削除・マイグレーション・構造化WorkingMemory・LLM要約コンパクション・SessionNote抽出）
+├── session/mod.rs       # セッション永続化（名前付きセッション・一覧・切替・削除・マイグレーション・構造化WorkingMemory・LLM要約コンパクション・SessionNote抽出・advisory sidecar compaction（Issue #293））
 ├── spinner.rs           # スピナーUI（並列詳細進捗表示・start_parallel_detailed・format_detailed_progress）
 ├── state/mod.rs         # 状態マシン
 ├── tooling/

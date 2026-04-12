@@ -19,9 +19,9 @@ use std::sync::atomic::AtomicBool;
 pub use ollama::{
     OllamaChatMessage, OllamaChatRequest, OllamaModelEntry, OllamaModelInfo, OllamaProviderClient,
     OllamaRequestOptions, fetch_context_length_from_ollama, fetch_model_info_from_ollama,
-    fetch_model_list_from_ollama, parse_context_length_from_show_response,
-    parse_model_info_from_show_response, parse_model_list_from_tags_response,
-    resolve_ollama_model_alias,
+    fetch_model_list_from_ollama, is_low_quality_sidecar_summary,
+    parse_context_length_from_show_response, parse_model_info_from_show_response,
+    parse_model_list_from_tags_response, resolve_ollama_model_alias,
 };
 pub use transport::{
     DEFAULT_HTTP_TIMEOUT_SECS, HttpResponse, HttpTransport, ReqwestHttpTransport, RetryConfig,
