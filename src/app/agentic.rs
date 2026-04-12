@@ -615,6 +615,11 @@ impl App {
             && !rewrite_result.summary.contains("(no changes)");
         if rewrite_succeeded {
             self.agent_telemetry.record_worker_success();
+            // Issue #364: record mutation produced via model-aware delegation
+            if self.agent_telemetry.model_aware_delegation_count > 0 {
+                self.agent_telemetry
+                    .record_model_aware_delegation_mutation();
+            }
         } else {
             // Issue #343: the worker produced a valid proposal but
             // file.rewrite did not land a real mutation.
@@ -894,6 +899,13 @@ impl App {
                             elapsed_s,
                             &r.tool_name, // already validated by MUTATION_TOOLS.contains()
                         );
+
+                        // Issue #364: attribute mutation to proactive delegation if pending.
+                        if self.proactive_delegation_pending {
+                            self.agent_telemetry
+                                .record_model_aware_delegation_mutation();
+                            self.proactive_delegation_pending = false;
+                        }
                     }
                 }
             }
@@ -1192,6 +1204,7 @@ impl App {
                     self.session.push_message(msg);
 
                     self.agent_telemetry.record_model_aware_delegation();
+                    self.proactive_delegation_pending = true;
                     proactive_delegation_fired = true;
                 }
             }

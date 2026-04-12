@@ -381,6 +381,67 @@ fn telemetry_serde_default_backward_compat() {
 }
 
 // ---------------------------------------------------------------------------
+// Issue #364: classifier boundary regression tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn issue_364_35b_model_is_delegation_eligible() {
+    // qwen3.5:35b should be Medium, thus eligible for proactive delegation
+    let cap = anvil::agent::model_classifier::classify_model_capability("qwen3.5:35b", None, None);
+    assert_eq!(
+        cap.size_class,
+        ModelSizeClass::Medium,
+        "35B model must be Medium for delegation eligibility"
+    );
+}
+
+#[test]
+fn issue_364_31b_model_is_delegation_eligible() {
+    // gemma4:31b should be Medium, thus eligible for proactive delegation
+    let cap = anvil::agent::model_classifier::classify_model_capability("gemma4:31b", None, None);
+    assert_eq!(
+        cap.size_class,
+        ModelSizeClass::Medium,
+        "31B model must be Medium for delegation eligibility"
+    );
+}
+
+#[test]
+fn issue_364_122b_model_excluded_from_delegation() {
+    // qwen3.5:122b should remain Large, excluded from proactive delegation
+    let cap = anvil::agent::model_classifier::classify_model_capability("qwen3.5:122b", None, None);
+    assert_eq!(
+        cap.size_class,
+        ModelSizeClass::Large,
+        "122B model must remain Large"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #364: delegation mutation telemetry runtime connectivity
+// ---------------------------------------------------------------------------
+
+#[test]
+fn issue_364_delegation_mutation_telemetry_independent() {
+    // Verify that record_model_aware_delegation_mutation works independently
+    // and is callable from runtime code (not just tests).
+    let mut tel = AgentTelemetry::new();
+    assert_eq!(tel.model_aware_delegation_produced_mutation, 0);
+
+    // Simulate: delegation fires, then mutation detected
+    tel.record_model_aware_delegation();
+    assert_eq!(tel.model_aware_delegation_count, 1);
+    assert_eq!(tel.model_aware_delegation_produced_mutation, 0);
+
+    tel.record_model_aware_delegation_mutation();
+    assert_eq!(tel.model_aware_delegation_produced_mutation, 1);
+
+    // Multiple mutations after delegation
+    tel.record_model_aware_delegation_mutation();
+    assert_eq!(tel.model_aware_delegation_produced_mutation, 2);
+}
+
+// ---------------------------------------------------------------------------
 // ModelSizeClass Display
 // ---------------------------------------------------------------------------
 

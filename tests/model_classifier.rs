@@ -44,10 +44,11 @@ fn boundary_13b_returns_tag_based() {
 }
 
 #[test]
-fn boundary_14b_returns_json() {
+fn boundary_14b_returns_tag_based() {
+    // Issue #364: 14B is now Medium (11-50B), so TagBased
     assert_eq!(
         determine_protocol_mode("llama3:14b", None),
-        ToolProtocolMode::Json,
+        ToolProtocolMode::TagBased,
     );
 }
 
@@ -78,10 +79,11 @@ fn capability_small_model_3b_returns_tiny() {
 }
 
 #[test]
-fn capability_medium_model_8b_returns_compact() {
+fn capability_small_model_8b_returns_tiny() {
+    // Issue #364: 8B is now Small (≤10B)
     let cap = classify_model_capability("llama3:8b", None, None);
-    assert_eq!(cap.size_class, ModelSizeClass::Medium);
-    assert_eq!(cap.prompt_tier, PromptTier::Compact);
+    assert_eq!(cap.size_class, ModelSizeClass::Small);
+    assert_eq!(cap.prompt_tier, PromptTier::Tiny);
     assert_eq!(cap.protocol_mode, ToolProtocolMode::TagBased);
 }
 
@@ -124,16 +126,17 @@ fn capability_config_tier_full_on_small_model() {
 
 #[test]
 fn capability_invalid_tier_falls_back_to_auto() {
+    // Issue #364: 8B is now Small, auto-detect → Tiny
     let cap = classify_model_capability("llama3:8b", None, Some("invalid"));
-    // Should fall back to auto-detect (Medium -> Compact)
-    assert_eq!(cap.prompt_tier, PromptTier::Compact);
+    assert_eq!(cap.prompt_tier, PromptTier::Tiny);
 }
 
 #[test]
-fn capability_boundary_7b_is_medium() {
+fn capability_boundary_7b_is_small() {
+    // Issue #364: 7B is now Small (≤10B)
     let cap = classify_model_capability("model:7b", None, None);
-    assert_eq!(cap.size_class, ModelSizeClass::Medium);
-    assert_eq!(cap.prompt_tier, PromptTier::Compact);
+    assert_eq!(cap.size_class, ModelSizeClass::Small);
+    assert_eq!(cap.prompt_tier, PromptTier::Tiny);
 }
 
 #[test]
@@ -144,10 +147,11 @@ fn capability_boundary_13b_is_medium() {
 }
 
 #[test]
-fn capability_boundary_14b_is_large() {
+fn capability_boundary_14b_is_medium() {
+    // Issue #364: 14B is now Medium (11-50B)
     let cap = classify_model_capability("model:14b", None, None);
-    assert_eq!(cap.size_class, ModelSizeClass::Large);
-    assert_eq!(cap.prompt_tier, PromptTier::Full);
+    assert_eq!(cap.size_class, ModelSizeClass::Medium);
+    assert_eq!(cap.prompt_tier, PromptTier::Compact);
 }
 
 #[test]

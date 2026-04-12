@@ -299,6 +299,9 @@ pub struct App {
     stagnation_state: stagnation_state::StagnationState,
     /// Whether forced mode is active for the current turn (Issue #263).
     forced_mode_active: bool,
+    /// Whether a proactive delegation hint was injected and a subsequent
+    /// mutation should be attributed to that delegation (Issue #364).
+    proactive_delegation_pending: bool,
     /// Recovery read budget for file.edit failure recovery (Issue #299).
     tool_recovery_budget: tool_recovery_budget::ToolRecoveryBudget,
     /// Whether the session is in pre-exit repair closure mode (Issue #327).
@@ -659,6 +662,7 @@ impl App {
             },
             stagnation_state: stagnation_state::StagnationState::new(),
             forced_mode_active: false,
+            proactive_delegation_pending: false,
             tool_recovery_budget: tool_recovery_budget::ToolRecoveryBudget::new(
                 edit_recovery_read_budget,
             ),
