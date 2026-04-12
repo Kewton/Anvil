@@ -271,6 +271,8 @@ pub struct App {
     last_estimated_prompt_tokens: Option<usize>,
     /// System prompt verbosity tier, determined at session start.
     prompt_tier: PromptTier,
+    /// Model size classification for delegation policy (Issue #292).
+    size_class: crate::agent::model_classifier::ModelSizeClass,
     /// Tracks consecutive file.edit failures per path for recovery hints.
     edit_fail_tracker: edit_fail_tracker::EditFailTracker,
     /// Phase estimator for fallback phase control (Issue #159).
@@ -568,15 +570,15 @@ impl App {
             config.paths.cwd.clone(),
         )));
 
-        // Determine prompt tier from config override or model name heuristic
-        let prompt_tier = {
+        // Determine prompt tier and size class from config override or model name heuristic
+        let (prompt_tier, size_class) = {
             use crate::agent::model_classifier::classify_model_capability;
             let capability = classify_model_capability(
                 &config.runtime.model,
                 config.runtime.tag_protocol,
                 config.runtime.prompt_tier.as_deref(),
             );
-            capability.prompt_tier
+            (capability.prompt_tier, capability.size_class)
         };
 
         let loop_detection_threshold = config.runtime.loop_detection_threshold;
@@ -620,6 +622,7 @@ impl App {
             calibration_store: TokenCalibrationStore::new(),
             last_estimated_prompt_tokens: None,
             prompt_tier,
+            size_class,
             edit_fail_tracker: edit_fail_tracker::EditFailTracker::new(
                 edit_reread_threshold,
                 edit_write_fallback_threshold,

@@ -1131,12 +1131,69 @@ impl App {
             self.stagnation_state.end_turn(turn_mutations > 0);
             let stagnation_score =
                 crate::app::stagnation_state::compute_stagnation_score(&self.stagnation_state);
-            self.forced_mode_active = stagnation_score >= 2;
+            // Issue #292: parameterize threshold via model size class.
+            let stagnation_threshold = delegation_threshold(self.size_class);
+            self.forced_mode_active = stagnation_score >= stagnation_threshold;
             if self.forced_mode_active {
                 tracing::warn!(
                     score = stagnation_score,
+                    threshold = stagnation_threshold,
                     "stagnation detected; forced_mode_active=true"
                 );
+            }
+
+            // Issue #292: proactive model-aware delegation for Medium/Small models.
+            //
+            // When forced mode is active on a non-Large model, inject a
+            // slice-first hint before the failure-based escalation fires.
+            // The `proactive_delegation_fired` flag prevents both paths from
+            // firing in the same turn (same-turn exclusivity guard).
+            let mut proactive_delegation_fired = false;
+            if self.forced_mode_active
+                && matches!(
+                    self.size_class,
+                    crate::agent::model_classifier::ModelSizeClass::Medium
+                        | crate::agent::model_classifier::ModelSizeClass::Small
+                )
+                && let Some(raw_path) =
+                    estimate_target_path(&self.execution_plan, &self.stagnation_state)
+            {
+                // Sandbox boundary verification + retry budget check
+                if resolve_sandbox_path(&self.config.paths.cwd, &raw_path).is_ok()
+                    && self
+                        .stagnation_state
+                        .consume_proactive_retry_budget(&raw_path)
+                {
+                    // Goal: first unfinished plan item description or fallback
+                    let raw_goal = self
+                        .execution_plan
+                        .items
+                        .iter()
+                        .find(|i| !i.is_finished())
+                        .map(|i| i.description.as_str())
+                        .unwrap_or("Fix target file");
+                    let goal = sanitize_goal_for_hint(raw_goal);
+
+                    tracing::info!(
+                        size_class = %self.size_class,
+                        score = stagnation_score,
+                        threshold = stagnation_threshold,
+                        target = %raw_path,
+                        "proactive model-aware delegation triggered"
+                    );
+                    let hint = format!(
+                        "\n\n[Anvil PROACTIVE] model-aware delegation active \
+                         (size={}, score={}/{}). \
+                         Prefer agent.fix_slice for: {}. Goal: {}",
+                        self.size_class, stagnation_score, stagnation_threshold, raw_path, goal
+                    );
+                    let msg = SessionMessage::new(MessageRole::Tool, "system", hint)
+                        .with_id(self.next_message_id("tool"));
+                    self.session.push_message(msg);
+
+                    self.agent_telemetry.record_model_aware_delegation();
+                    proactive_delegation_fired = true;
+                }
             }
 
             // Issue #332: broadened fix_slice escalation.
@@ -1148,7 +1205,8 @@ impl App {
             // the worker path is never observed. Trigger escalation here when
             // cumulative failures + stagnation score cross the configured
             // stagnation thresholds and fix_slice has not already escalated.
-            if !self.agent_telemetry.worker_observed
+            if !proactive_delegation_fired
+                && !self.agent_telemetry.worker_observed
                 && crate::app::edit_fail_tracker::should_escalate_for_stagnation(
                     self.edit_fail_tracker.total_failures(),
                     stagnation_score as u32,
@@ -1185,7 +1243,8 @@ impl App {
             // plan repair, and pre-exit repair without reaching the worker
             // path. Fire escalation here when the stagnation score is high
             // and no mutation has been observed at all.
-            if !self.agent_telemetry.worker_observed
+            if !proactive_delegation_fired
+                && !self.agent_telemetry.worker_observed
                 && crate::app::edit_fail_tracker::should_escalate_for_read_heavy_drift(
                     stagnation_score as u32,
                     self.agent_telemetry.mutation_observed,
@@ -1261,6 +1320,10 @@ impl App {
                     self.closure_loop_detector.reset();
                     // Issue #351: replan clears the thrash counter too.
                     self.post_failure_thrash_detector.reset();
+                    // Issue #292: clear proactive delegation retry budget on replan.
+                    self.stagnation_state
+                        .proactive_delegation_retry_budget
+                        .clear();
                     // Replan: stagnation_state を差分マージ (Issue #305)
                     let existing = &self.stagnation_state.starved_target_files;
                     let new_targets: Vec<String> = self
@@ -3510,6 +3573,64 @@ pub(crate) fn is_trusted(
         return true;
     }
     trusted_tools.contains(tool_name)
+}
+
+// ---------------------------------------------------------------------------
+// Issue #292: Model-aware delegation helpers
+// ---------------------------------------------------------------------------
+
+/// Model-aware stagnation threshold for proactive delegation (Issue #292).
+///
+/// Large models retain the existing threshold (2) -- score >= 2 means at least
+/// 2 of the 4 stagnation factors are triggered.
+/// Medium/Small models use threshold 1 to trigger slice-first delegation as
+/// soon as any single stagnation factor is detected.
+pub fn delegation_threshold(size_class: crate::agent::model_classifier::ModelSizeClass) -> usize {
+    use crate::agent::model_classifier::ModelSizeClass;
+    match size_class {
+        ModelSizeClass::Large => 2,
+        ModelSizeClass::Medium => 1,
+        ModelSizeClass::Small => 1,
+    }
+}
+
+/// Estimate target_path for proactive slice-first delegation (Issue #292).
+///
+/// Returns `None` if no path can be determined (delegation should be skipped).
+pub fn estimate_target_path(
+    execution_plan: &crate::contracts::ExecutionPlan,
+    stagnation_state: &crate::app::stagnation_state::StagnationState,
+) -> Option<String> {
+    // 1. First unfinished plan item with target_files
+    if let Some(path) = execution_plan
+        .items
+        .iter()
+        .find(|i| !i.is_finished() && !i.target_files.is_empty())
+        .and_then(|i| i.target_files.first())
+    {
+        return Some(path.clone());
+    }
+    // 2. Starved target files
+    stagnation_state.starved_target_files.first().cloned()
+}
+
+/// Sanitize goal text before embedding in delegation hint prompt (Issue #292).
+///
+/// Removes control characters (except space), markdown fences, ANVIL_* markers,
+/// and truncates to 200 characters.
+pub fn sanitize_goal_for_hint(raw: &str) -> String {
+    let stripped: String = raw
+        .chars()
+        .filter(|c| !c.is_control() || *c == ' ')
+        .collect();
+    // Remove markdown code fences and ANVIL_ tags
+    let stripped = stripped.replace("```", "").replace("~~~", "");
+    let stripped = stripped.replace("ANVIL_FINAL", "");
+    let stripped = stripped.replace("ANVIL_PLAN_UPDATE", "");
+    let stripped = stripped.replace("ANVIL_PLAN", "");
+    let stripped = stripped.replace("ANVIL_DONE", "");
+    let stripped: String = stripped.chars().take(200).collect();
+    stripped.trim().to_string()
 }
 
 #[cfg(test)]

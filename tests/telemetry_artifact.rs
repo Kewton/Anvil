@@ -144,6 +144,9 @@ fn telemetry_artifact_all_fields_present() {
         "repair_turn_observed",
         "pack_expectation",
         "expectation_mismatch_reason",
+        // Issue #292: model-aware delegation
+        "model_aware_delegation_count",
+        "model_aware_delegation_produced_mutation",
     ];
 
     for key in &expected_keys {
