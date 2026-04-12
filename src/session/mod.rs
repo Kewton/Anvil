@@ -20,6 +20,11 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Content prefix for rule-based compacted summaries.
+const COMPACTED_SUMMARY_PREFIX: &str = "[compacted session summary]";
+/// Content prefix for advisory (sidecar LLM) compacted summaries (Issue #293).
+const ADVISORY_COMPACTED_SUMMARY_PREFIX: &str = "[advisory compacted session summary]";
+
 // ── Working Memory ────────────────────────────────────────────────────
 
 /// Structured working memory that persists across compaction.
@@ -129,6 +134,12 @@ impl WorkingMemory {
     }
 
     /// Serialize working memory into a human-readable format for system prompt injection.
+    ///
+    /// This is the **authoritative** state source for post-compaction context.
+    /// Unlike sidecar summary messages (which are advisory), the fields in
+    /// WorkingMemory are programmatically maintained and preserved across
+    /// compaction without LLM dependency.
+    ///
     /// Returns None if the working memory is empty.
     pub fn format_for_prompt(&self) -> Option<String> {
         if self.is_empty() {
@@ -203,6 +214,32 @@ pub(crate) fn sanitize_for_prompt_entry(input: &str) -> String {
     s
 }
 
+/// Sanitize sidecar LLM summary before embedding in session history.
+///
+/// Removes protocol markers (`ANVIL_TOOL`, `ANVIL_FINAL`, `ANVIL_PLAN`, etc.)
+/// and control characters to prevent prompt injection from untrusted sidecar
+/// output (CB-001, Issue #293).  Unlike [`sanitize_for_prompt_entry`], this
+/// preserves newlines (summaries are multi-line) and does **not** truncate to
+/// 500 chars (the caller applies its own MAX_LLM_SUMMARY_CHARS limit).
+fn sanitize_sidecar_summary(input: &str) -> String {
+    const REMOVALS: &[&str] = &[
+        "ANVIL_TOOL",
+        "ANVIL_FINAL",
+        "ANVIL_PLAN_UPDATE",
+        "ANVIL_PLAN",
+    ];
+    let mut s = input.to_string();
+    for pattern in REMOVALS {
+        s = s.replace(pattern, "");
+    }
+    // Remove control characters except newline/tab (preserve multi-line structure)
+    s = s
+        .chars()
+        .filter(|&c| !c.is_control() || c == '\n' || c == '\t')
+        .collect();
+    s
+}
+
 /// Truncate a string to approximately `max_tokens` tokens.
 ///
 /// Uses `contracts::tokens::estimate_tokens` with `ContentKind::Text` to
@@ -255,6 +292,11 @@ pub struct SessionMessage {
     /// Not serialized — only exists in memory during the live session.
     #[serde(skip)]
     pub expanded_content: Option<String>,
+    /// Whether this message is advisory (non-authoritative).
+    /// Used to mark sidecar LLM compaction summaries as hints
+    /// rather than authoritative state (Issue #293).
+    #[serde(default)]
+    pub is_advisory: bool,
 }
 
 impl SessionMessage {
@@ -269,7 +311,14 @@ impl SessionMessage {
             is_error: false,
             image_paths: None,
             expanded_content: None,
+            is_advisory: false,
         }
+    }
+
+    /// Mark this message as advisory (non-authoritative hint).
+    pub fn with_advisory(mut self, advisory: bool) -> Self {
+        self.is_advisory = advisory;
+        self
     }
 
     pub fn with_id(mut self, id: impl Into<String>) -> Self {
@@ -561,8 +610,14 @@ impl SessionRecord {
     /// Compact history with an optional LLM-generated summary.
     ///
     /// When `llm_summary` is `Some`, the LLM text is used as the summary body
-    /// combined with extracted file targets. When `None`, falls back to the
-    /// existing rule-based summarization.
+    /// combined with extracted file targets and marked as advisory
+    /// (`is_advisory=true`).  When `None`, falls back to the existing
+    /// rule-based summarization (`is_advisory=false`).
+    ///
+    /// **Caller contract** (CB-002): the caller must apply the quality gate
+    /// (`is_low_quality_sidecar_summary`) *before* passing a summary here.
+    /// Low-quality summaries should be converted to `None` so this method
+    /// falls back to the deterministic rule-based path.
     pub fn compact_history_with_llm_summary(
         &mut self,
         keep_recent: usize,
@@ -612,20 +667,23 @@ impl SessionRecord {
         /// Maximum character length for LLM-generated summary text (CB-003).
         const MAX_LLM_SUMMARY_CHARS: usize = 2000;
 
-        let summary = if let Some(llm_text) = llm_summary {
+        let (summary, is_advisory) = if let Some(llm_text) = llm_summary {
             // LLM summary path: combine LLM text with file references
+            // Sanitize sidecar output to remove protocol markers and control
+            // characters that could cause prompt injection (CB-001, Issue #293).
+            let sanitized = sanitize_sidecar_summary(&llm_text);
             // Truncate to MAX_LLM_SUMMARY_CHARS to bound memory usage (CB-003).
-            let truncated = if llm_text.len() > MAX_LLM_SUMMARY_CHARS {
+            let truncated = if sanitized.len() > MAX_LLM_SUMMARY_CHARS {
                 let mut end = MAX_LLM_SUMMARY_CHARS;
                 // Avoid splitting a multi-byte character
-                while !llm_text.is_char_boundary(end) && end > 0 {
+                while !sanitized.is_char_boundary(end) && end > 0 {
                     end -= 1;
                 }
-                format!("{}...(truncated)", &llm_text[..end])
+                format!("{}...(truncated)", &sanitized[..end])
             } else {
-                llm_text
+                sanitized
             };
-            let mut lines = vec!["[compacted session summary]".to_string()];
+            let mut lines = vec![ADVISORY_COMPACTED_SUMMARY_PREFIX.to_string()];
             lines.push(truncated);
             if !file_targets.is_empty() {
                 lines.push("- refs:".to_string());
@@ -633,7 +691,7 @@ impl SessionRecord {
                     lines.push(format!("  - {reference}"));
                 }
             }
-            lines.join("\n")
+            (lines.join("\n"), true)
         } else {
             // Rule-based path: existing logic
             // Step 1: Replace large tool results with summaries
@@ -643,7 +701,10 @@ impl SessionRecord {
             let scores = compute_importance_scores(&self.messages, split_at);
 
             // Step 3: Generate summary using scores
-            generate_compact_summary(&self.messages[..split_at], &scores)
+            (
+                generate_compact_summary(&self.messages[..split_at], &scores),
+                false,
+            )
         };
 
         // Step 4: Drain old messages and insert summary
@@ -653,7 +714,8 @@ impl SessionRecord {
             0,
             SessionMessage::new(MessageRole::System, "anvil", summary)
                 .with_id(format!("compact_{}", now_ms()))
-                .with_status(MessageStatus::Committed),
+                .with_status(MessageStatus::Committed)
+                .with_advisory(is_advisory),
         );
         // Clear context_notice after compaction (Issue #157).
         // Messages have been restructured, so old pruning info is stale.
@@ -1200,7 +1262,7 @@ pub fn to_relative_path(absolute_path: &str, cwd: &str) -> String {
 /// Generate a compact summary from messages and their importance scores.
 /// High-score messages get more detail; low-score ones are condensed.
 pub(crate) fn generate_compact_summary(messages: &[SessionMessage], scores: &[i32]) -> String {
-    let mut lines = vec!["[compacted session summary]".to_string()];
+    let mut lines = vec![COMPACTED_SUMMARY_PREFIX.to_string()];
     let mut references = Vec::new();
 
     // Determine the score threshold for "high importance"

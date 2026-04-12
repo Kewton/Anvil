@@ -2019,3 +2019,116 @@ fn note_kind_display() {
     assert_eq!(NoteKind::ShellExec.to_string(), "shell_exec");
     assert_eq!(NoteKind::ErrorHit.to_string(), "error_hit");
 }
+
+// ── Issue #293: Advisory sidecar compaction tests ────────────────────
+
+#[test]
+fn compact_history_with_llm_summary_sets_advisory() {
+    let mut session = SessionRecord::new(PathBuf::from("/tmp/test"));
+    // Populate enough messages to trigger compaction
+    for i in 0..20 {
+        session.push_message(SessionMessage::new(
+            MessageRole::User,
+            "you",
+            format!("msg {i}"),
+        ));
+        session.push_message(SessionMessage::new(
+            MessageRole::Assistant,
+            "anvil",
+            format!("reply {i}"),
+        ));
+    }
+    let llm_summary = "## FILE SIGNATURES\n- fn foo()\n## CHANGE PLAN\n- edit bar\n## COMPLETED CHANGES\n- done baz\n## KEY CONSTRAINTS\n- no unsafe".to_string();
+    let compacted = session.compact_history_with_llm_summary(5, Some(llm_summary));
+    assert!(compacted, "compaction should succeed");
+
+    let first = &session.messages[0];
+    assert!(first.is_advisory, "LLM summary message should be advisory");
+}
+
+#[test]
+fn compact_history_rule_based_not_advisory() {
+    let mut session = SessionRecord::new(PathBuf::from("/tmp/test"));
+    for i in 0..20 {
+        session.push_message(SessionMessage::new(
+            MessageRole::User,
+            "you",
+            format!("msg {i}"),
+        ));
+        session.push_message(SessionMessage::new(
+            MessageRole::Assistant,
+            "anvil",
+            format!("reply {i}"),
+        ));
+    }
+    let compacted = session.compact_history_with_llm_summary(5, None);
+    assert!(compacted, "compaction should succeed");
+
+    let first = &session.messages[0];
+    assert!(
+        !first.is_advisory,
+        "rule-based summary message should NOT be advisory"
+    );
+}
+
+#[test]
+fn advisory_content_prefix() {
+    let mut session = SessionRecord::new(PathBuf::from("/tmp/test"));
+    for i in 0..20 {
+        session.push_message(SessionMessage::new(
+            MessageRole::User,
+            "you",
+            format!("msg {i}"),
+        ));
+        session.push_message(SessionMessage::new(
+            MessageRole::Assistant,
+            "anvil",
+            format!("reply {i}"),
+        ));
+    }
+    let llm_summary = "## FILE SIGNATURES\n- fn foo()\n## CHANGE PLAN\n- edit bar\n## COMPLETED CHANGES\n- done baz\n## KEY CONSTRAINTS\n- no unsafe".to_string();
+    let compacted = session.compact_history_with_llm_summary(5, Some(llm_summary));
+    assert!(compacted);
+
+    let first = &session.messages[0];
+    assert!(
+        first
+            .content
+            .starts_with("[advisory compacted session summary]"),
+        "advisory message content should start with advisory prefix, got: {}",
+        &first.content[..first.content.len().min(60)]
+    );
+}
+
+#[test]
+fn session_message_advisory_serde_roundtrip() {
+    let msg = SessionMessage::new(MessageRole::System, "anvil", "summary").with_advisory(true);
+    assert!(msg.is_advisory);
+
+    let json = serde_json::to_string(&msg).expect("serialize");
+    let deserialized: SessionMessage = serde_json::from_str(&json).expect("deserialize");
+    assert!(
+        deserialized.is_advisory,
+        "is_advisory should survive roundtrip"
+    );
+}
+
+#[test]
+fn session_message_advisory_backward_compat() {
+    // JSON without is_advisory field (pre-#293 format)
+    let json = r#"{
+        "id": "test_1",
+        "role": "System",
+        "author": "anvil",
+        "content": "hello",
+        "status": "Committed",
+        "tool_call_id": null,
+        "is_error": false,
+        "image_paths": null
+    }"#;
+    let msg: SessionMessage = serde_json::from_str(json).expect("deserialize old format");
+    assert!(
+        !msg.is_advisory,
+        "is_advisory should default to false for old format"
+    );
+}
