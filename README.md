@@ -1,56 +1,73 @@
 # Anvil
 
-ローカルターミナルで動作するコーディングエージェント。Ollama や OpenAI 互換サーバーを LLM バックエンドとして使用し、ファイル操作やシェルコマンドの実行をエージェント的に行います。
+A local terminal coding agent powered by [Ollama](https://ollama.com) and OpenAI-compatible backends.
+Anvil runs entirely on your machine — no cloud dependency required.
 
-## クイックスタート
+---
 
-### 1. バイナリのインストール
+## Installation
 
-[GitHub Releases](https://github.com/Kewton/Anvil/releases) からビルド済みバイナリをダウンロード:
+Install with a single command. Choose the one that matches your platform:
 
+**macOS (Apple Silicon / ARM64)**
 ```bash
-# macOS (Apple Silicon)
-curl -L https://github.com/Kewton/Anvil/releases/download/v0.0.11/anvil-darwin-arm64.gz -o anvil.gz
-gunzip anvil.gz
-chmod +x anvil
-sudo mv anvil /usr/local/bin/
-
-# インストール確認
-anvil --help
+curl -sL https://github.com/Kewton/AnvilBinary/releases/latest/download/anvil-darwin-arm64.gz | gunzip -c > /usr/local/bin/anvil && chmod +x /usr/local/bin/anvil
 ```
 
-### 2. LLM バックエンドの準備
-
-Anvil は LLM の推論を外部サーバーに委託します。以下のいずれかを用意してください。
-
-#### Ollama（推奨・無料）
-
+**macOS (Intel / x86_64)**
 ```bash
-# インストール: https://ollama.com
-ollama serve                     # サーバー起動
-ollama pull qwen3.5:latest       # モデル取得（例）
+curl -sL https://github.com/Kewton/AnvilBinary/releases/latest/download/anvil-darwin-amd64.gz | gunzip -c > /usr/local/bin/anvil && chmod +x /usr/local/bin/anvil
 ```
 
-#### OpenAI 互換 API（LM Studio, vLLM 等）
-
+**Linux (x86_64)**
 ```bash
-# LM Studio 等でサーバーを起動し、URL とモデル名を指定
-# provider-url は http://localhost:1234 と http://localhost:1234/v1 のどちらでも利用できます
+curl -sL https://github.com/Kewton/AnvilBinary/releases/latest/download/anvil-linux-amd64.gz | gunzip -c > /usr/local/bin/anvil && chmod +x /usr/local/bin/anvil
+```
+
+**Linux (ARM64)**
+```bash
+curl -sL https://github.com/Kewton/AnvilBinary/releases/latest/download/anvil-linux-arm64.gz | gunzip -c > /usr/local/bin/anvil && chmod +x /usr/local/bin/anvil
+```
+
+> If `/usr/local/bin` requires root access, use `sudo`:
+> ```bash
+> curl -sL <URL> | gunzip -c | sudo tee /usr/local/bin/anvil > /dev/null && sudo chmod +x /usr/local/bin/anvil
+> ```
+
+Verify:
+```bash
+anvil --version
+```
+
+All binaries are published at [AnvilBinary Releases](https://github.com/Kewton/AnvilBinary/releases).
+
+---
+
+## Quick Start
+
+### 1. Start a local LLM backend
+
+**Ollama (recommended, free)**
+```bash
+# Install from https://ollama.com
+ollama serve
+ollama pull qwen2.5-coder:32b
+```
+
+**OpenAI-compatible API (LM Studio, vLLM, etc.)**
+```bash
+# Start your server, then point Anvil at it
 anvil --provider openai --provider-url http://localhost:1234 --model your-model
-
-# LM Studio を使うだけなら lmstudio エイリアスも利用できます
-anvil --provider lmstudio --model your-model
 ```
 
-### 3. 起動
+### 2. Run Anvil in your project
 
 ```bash
-# プロジェクトのディレクトリで起動
 cd /path/to/your/project
-anvil --model qwen3.5:35b
+anvil --model qwen2.5-coder:32b
 ```
 
-起動すると対話プロンプトが表示されます:
+You'll see an interactive prompt:
 
 ```
     ___              _ __
@@ -61,282 +78,235 @@ anvil --model qwen3.5:35b
 
   local coding agent for serious terminal work
 
-  Model   : qwen3.5:35b
+  Model   : qwen2.5-coder:32b
   Context : 200k
   Mode    : local / confirm
 
   [U] you >
 ```
 
-## 使い方
+---
 
-### 基本操作
+## Features
+
+### Tools
+
+Anvil exposes the following tools to the LLM:
+
+| Tool | Permission | Description |
+|------|-----------|-------------|
+| `file.read` | Auto | Read files and list directories |
+| `file.search` | Auto | Search by filename or content |
+| `file.write` | Confirm | Create or overwrite files |
+| `file.edit` | Confirm | Apply targeted in-place edits |
+| `file.rewrite` | Confirm | Replace a line-range block |
+| `shell.exec` | Confirm | Execute shell commands (output streamed live) |
+
+### Approval Flow
+
+In default mode, Anvil asks for confirmation before writing files or running commands:
+
+```
+  Allow shell.exec: cargo test? [y/n]
+```
+
+| Input | Behavior |
+|-------|----------|
+| `y` / `yes` | Execute the tool |
+| `n` / anything else | Deny (LLM is notified as "denied by user") |
+
+Use `--no-approval` to skip all prompts.
+
+### Slash Commands
+
+| Command | Description |
+|---------|-------------|
+| `/help` | Show available commands |
+| `/status` | Show current state |
+| `/plan` | Display active plan |
+| `/plan-add <item>` | Add item to plan |
+| `/plan-focus <n>` | Set active step |
+| `/plan-clear` | Clear plan |
+| `/checkpoint <memo>` | Save a checkpoint |
+| `/repo-find <query>` | Search repository |
+| `/timeline` | Show session timeline |
+| `/compact` | Compress old history |
+| `/model` | Show current model |
+| `/provider` | Show provider info |
+| `/reset` | Return to ready state |
+| `/exit` | End session |
+
+### Session Persistence
+
+Anvil automatically saves sessions per project directory (`.anvil/sessions/`).
+Restart in the same directory to resume where you left off.
 
 ```bash
-# 対話モードで起動（前回のセッションを自動復元）
-anvil --model qwen3.5:35b
-
-# 新しいセッションで開始（履歴をリセット）
-anvil --model qwen3.5:35b --fresh-session
-
-# 全ツール自動承認モード（承認プロンプトをスキップ）
-anvil --model qwen3.5:35b --no-approval
-
-# 非対話モード（パイプ入力・スクリプト向け）
-echo "src/main.rsを読んで要約して" | anvil --model qwen3.5:35b --no-approval --oneshot
+anvil --model qwen2.5-coder:32b          # resumes last session
+anvil --model qwen2.5-coder:32b --fresh-session   # start fresh
 ```
 
-### 対話例
+### Safety
 
-```
-[U] you > このプロジェクトの構造を教えて
-
-  $ ls -la                              ← shell.exec がリアルタイムで実行される
-  Cargo.toml  README.md  src/  tests/
-  ...
-
-[A] anvil > このプロジェクトは Rust で構築されており...
-
-[U] you > src/main.rs にエラーハンドリングを追加して
-
-  Allow file.write: src/main.rs? [y/n] y    ← ファイル変更前に承認を求める
-
-[A] anvil > エラーハンドリングを追加しました。変更内容は...
-
-[U] you > /exit
-```
-
-### 承認フロー
-
-通常モードでは、ファイル書き込み (`file.write`) とシェルコマンド (`shell.exec`) の実行前にインラインで確認を求めます:
-
-```
-  Allow shell.exec: npm test? [y/n]
-```
-
-| 入力 | 動作 |
-|------|------|
-| `y` / `yes` | ツールを実行 |
-| `n` / その他 | 拒否（LLMに「denied by user」として通知） |
-
-`--no-approval` で起動すると全ツールが承認なしで実行されます。
-
-### ツール一覧
-
-Anvil は LLM に以下のツールを提供します:
-
-| ツール | 権限 | 説明 |
-|--------|------|------|
-| `file.read` | Safe (自動実行) | ファイル読み取り・ディレクトリ一覧 |
-| `file.search` | Safe (自動実行) | ファイル名・内容で検索 |
-| `file.write` | Confirm (承認必要) | ファイル作成・上書き |
-| `shell.exec` | Confirm (承認必要) | シェルコマンド実行（出力はリアルタイム表示） |
-
-### スラッシュコマンド
-
-セッション中に `/` で始まるコマンドを入力できます:
-
-| コマンド | 説明 |
-|----------|------|
-| `/help` | コマンド一覧を表示 |
-| `/status` | 現在の状態を表示 |
-| `/plan` | 現在のプランを表示 |
-| `/plan-add <項目>` | プランに項目を追加 |
-| `/plan-focus <番号>` | アクティブなステップを変更 |
-| `/plan-clear` | プランをクリア |
-| `/checkpoint <メモ>` | チェックポイントを保存 |
-| `/repo-find <クエリ>` | リポジトリ内を検索 |
-| `/timeline` | セッションのタイムラインを表示 |
-| `/compact` | 古い履歴を圧縮 |
-| `/model` | 現在のモデル情報 |
-| `/provider` | プロバイダー情報 |
-| `/reset` | Ready 状態に戻す |
-| `/exit` | セッション終了 |
-
-### 安全性
-
-以下のコマンドは承認モードに関係なくブロックされます:
-- `rm -rf /` / `rm -rf ~` (再帰削除)
-- `mkfs` (フォーマット)
-- `dd if=` (rawディスク書き込み)
+The following commands are always blocked regardless of approval mode:
+- `rm -rf /` / `rm -rf ~` (recursive root/home deletion)
+- `mkfs` (disk format)
+- `dd if=` (raw disk write)
 - `:(){` (fork bomb)
 
-パスはサンドボックス内に制限され、絶対パス・`..`・シンボリックリンクによる脱出を防止します。
+File paths are sandboxed — absolute paths, `..` traversal, and symlink escapes are rejected.
 
-## セッションと履歴
+---
 
-### 自動保存・復元
+## Configuration
 
-Anvil はプロジェクトディレクトリごとにセッションファイル (`.anvil/sessions/`) を自動保存します。同じディレクトリで再起動すると前回の会話が自動復元されます。
+### Config File
 
-```bash
-# セッション復元（デフォルト）
-anvil --model qwen3.5:35b
-
-# 新しいセッションで開始
-anvil --model qwen3.5:35b --fresh-session
-```
-
-### コンテキストウィンドウ管理
-
-LLM に送信するメッセージは**トークンバジェット**で自動制御されます:
-
-- 最新のメッセージから優先的にバジェット内に収まる分だけ送信
-- メッセージ数が閾値（デフォルト64）を超えると古い履歴を自動要約
-- `/compact` コマンドで手動圧縮も可能
-
-長い会話でも最近のやり取りが常に優先され、古い会話は要約として保持されます。
-
-## 設定
-
-### 設定ファイル
-
-プロジェクトルートの `.anvil/config` に `key=value` 形式で記述:
+Create `.anvil/config` in your project root:
 
 ```ini
 provider = ollama
-model = qwen3.5:35b
+model = qwen2.5-coder:32b
 provider_url = http://127.0.0.1:11434
 context_window = 200000
 stream = true
 ```
 
-### 環境変数
+### Environment Variables
 
 ```bash
-ANVIL_PROVIDER=ollama             # プロバイダー (ollama / openai)
-ANVIL_MODEL=qwen3.5:35b           # モデル名
-ANVIL_PROVIDER_URL=http://...     # プロバイダーURL
-ANVIL_CONTEXT_WINDOW=200000       # コンテキストウィンドウサイズ
-ANVIL_CONTEXT_BUDGET=50000        # トークンバジェット明示指定
-ANVIL_MAX_AGENT_ITERATIONS=30     # agenticループの最大反復数（default: 30）
-ANVIL_HTTP_TIMEOUT=300            # LLMリクエストタイムアウト（秒）（旧ANVIL_CURL_TIMEOUTもフォールバックとして有効）
-ANVIL_API_KEY=sk-...              # OpenAI互換APIキー
+ANVIL_PROVIDER=ollama             # Provider: ollama | openai | lmstudio
+ANVIL_MODEL=qwen2.5-coder:32b     # Model name
+ANVIL_PROVIDER_URL=http://...     # Provider base URL
+ANVIL_CONTEXT_WINDOW=200000       # Context window size (tokens)
+ANVIL_CONTEXT_BUDGET=50000        # Explicit token budget
+ANVIL_MAX_AGENT_ITERATIONS=30     # Max agentic loop iterations (default: 30)
+ANVIL_HTTP_TIMEOUT=300            # LLM request timeout (seconds)
+ANVIL_API_KEY=sk-...              # API key for OpenAI-compatible backends
 ```
 
-### CLI オプション
+### CLI Options
 
 ```
 anvil [OPTIONS]
 
-  -p, --provider <PROVIDER>              プロバイダー (ollama|openai|lmstudio)
-  -m, --model <MODEL>                    モデル名
-  -u, --provider-url <URL>               プロバイダーURL
-      --sidecar-model <MODEL>            サイドカーモデル名
-      --context-window <SIZE>            コンテキストウィンドウサイズ
-      --context-budget <TOKENS>          トークンバジェット明示指定
-      --max-iterations <N>               agenticループ最大反復数（default: 30）
-      --no-stream                        ストリーミング無効
-      --debug                            デバッグログ有効
-      --no-approval                      全ツール自動承認
-      --fresh-session                    新規セッションで開始
-      --oneshot                          非対話モード
-      --reasoning-visibility <LEVEL>     推論表示レベル (hidden|summary)
-  -h, --help                             ヘルプ表示
-  -V, --version                          バージョン表示
+  -p, --provider <PROVIDER>              Provider (ollama|openai|lmstudio)
+  -m, --model <MODEL>                    Model name
+  -u, --provider-url <URL>               Provider base URL
+      --sidecar-model <MODEL>            Sidecar model for summarization
+      --context-window <SIZE>            Context window size
+      --context-budget <TOKENS>          Explicit token budget
+      --max-iterations <N>               Max agentic loop iterations (default: 30)
+      --no-stream                        Disable streaming
+      --debug                            Enable debug logging
+      --no-approval                      Auto-approve all tools
+      --fresh-session                    Start a new session
+      --oneshot                          Non-interactive mode (pipe-friendly)
+      --reasoning-visibility <LEVEL>     Reasoning display level (hidden|summary)
+  -h, --help                             Print help
+  -V, --version                          Print version
 ```
 
-優先順位: CLI > 環境変数 > 設定ファイル > デフォルト値
+Priority order: CLI > environment variables > config file > defaults
 
-### APIキーのセキュリティ
+### API Key Security
 
-APIキーは設定ファイルではなく**環境変数**で設定することを推奨します:
+Set API keys as environment variables, not in the config file:
 
 ```bash
-export ANVIL_API_KEY=sk-...        # OpenAI互換APIキー
-export SERPER_API_KEY=...          # Serper Web検索APIキー
+export ANVIL_API_KEY=sk-...
 ```
 
-設定ファイル（`.anvil/config`）にAPIキーが記載されている場合、起動時に警告メッセージが表示されます。また、`.anvil/` ディレクトリが `.gitignore` に登録されていない場合も警告が表示されます。
-
-設定ファイルの誤コミットによるAPIキー漏洩を防ぐため、`.gitignore` に `.anvil/` を追加してください:
+If an API key is found in `.anvil/config`, Anvil will display a warning at startup.
+Add `.anvil/` to your `.gitignore` to prevent accidental commits:
 
 ```
 # .gitignore
 .anvil/
 ```
 
-## カスタムコマンド
+### Custom Slash Commands
 
-`.anvil/slash-commands.json` で独自のスラッシュコマンドを定義できます:
+Define project-specific slash commands in `.anvil/slash-commands.json`:
 
 ```json
 {
   "commands": [
     {
       "name": "/review",
-      "description": "コードレビューを実行",
-      "prompt": "このリポジトリの最近の変更をレビューして、改善点を指摘してください。"
+      "description": "Run a code review",
+      "prompt": "Review the recent changes in this repository and point out areas for improvement."
     }
   ]
 }
 ```
 
-## プロバイダー対応
+---
 
-| プロバイダー | 設定例 |
-|-------------|--------|
-| Ollama | `anvil --model qwen3.5:35b` (デフォルト) |
+## Provider Support
+
+| Provider | Example |
+|----------|---------|
+| Ollama | `anvil --model qwen2.5-coder:32b` (default) |
 | LM Studio | `anvil --provider lmstudio --model your-model` |
-| OpenAI互換 | `anvil --provider openai --provider-url http://localhost:1234 --model your-model` (`/v1` 付きURLも可) |
-| API キー認証 | `ANVIL_API_KEY=Bearer sk-...` を環境変数に設定 |
+| OpenAI-compatible | `anvil --provider openai --provider-url http://localhost:1234 --model your-model` |
+| API key auth | Set `ANVIL_API_KEY=Bearer sk-...` as environment variable |
 
 ---
 
-## 開発者向け
+## Building from Source
 
-### ソースからビルド
+Requires Rust 1.85+ ([rustup.rs](https://rustup.rs)):
 
 ```bash
-# Rust toolchain (1.85+) が必要: https://rustup.rs
 git clone https://github.com/Kewton/Anvil.git
 cd Anvil
 cargo build --release
 ```
 
-### 開発コマンド
+Development commands:
 
 ```bash
-cargo build                       # デバッグビルド
-cargo test                        # 全テスト実行（108件）
-cargo clippy --all-targets        # 静的解析
-cargo fmt                         # フォーマット
-cargo run -- --model qwen3.5:35b  # デバッグ実行
+cargo build                       # Debug build
+cargo test                        # Run all tests
+cargo clippy --all-targets        # Lint
+cargo fmt                         # Format
+cargo run -- --model qwen2.5-coder:32b   # Run in debug mode
 ```
 
-### プロジェクト構造
+### Contributing
 
+1. Create an issue
+2. Create a branch: `feature/<issue>-<description>`
+3. Implement → test → ensure `cargo clippy` passes
+4. Open a pull request targeting the `develop` branch
+
+See [CLAUDE.md](CLAUDE.md) for full development guidelines.
+
+---
+
+## インストール（日本語）
+
+お使いのOSに合わせてコマンドをターミナルに貼り付けるだけでインストールできます。
+
+| OS | コマンド |
+|----|---------|
+| macOS (Apple Silicon) | `curl -sL https://github.com/Kewton/AnvilBinary/releases/latest/download/anvil-darwin-arm64.gz \| gunzip -c > /usr/local/bin/anvil && chmod +x /usr/local/bin/anvil` |
+| macOS (Intel) | `curl -sL https://github.com/Kewton/AnvilBinary/releases/latest/download/anvil-darwin-amd64.gz \| gunzip -c > /usr/local/bin/anvil && chmod +x /usr/local/bin/anvil` |
+| Linux (x86_64) | `curl -sL https://github.com/Kewton/AnvilBinary/releases/latest/download/anvil-linux-amd64.gz \| gunzip -c > /usr/local/bin/anvil && chmod +x /usr/local/bin/anvil` |
+| Linux (ARM64) | `curl -sL https://github.com/Kewton/AnvilBinary/releases/latest/download/anvil-linux-arm64.gz \| gunzip -c > /usr/local/bin/anvil && chmod +x /usr/local/bin/anvil` |
+
+インストール後、プロジェクトディレクトリで以下を実行：
+
+```bash
+cd /path/to/your/project
+anvil --model qwen2.5-coder:32b
 ```
-src/
-├── main.rs              # エントリポイント
-├── app/                 # アプリケーション層
-│   ├── mod.rs           # オーケストレータ
-│   ├── agentic.rs       # agenticツール実行ループ
-│   ├── cli.rs           # CLI入力ループ
-│   ├── plan.rs          # プラン管理
-│   └── render.rs        # コンソール描画
-├── agent/mod.rs         # LLMプロトコル・パーサー
-├── provider/            # LLMプロバイダー
-│   ├── ollama.rs        # Ollamaクライアント
-│   ├── openai.rs        # OpenAI互換クライアント
-│   └── transport.rs     # HTTPトランスポート（curl）
-├── tooling/mod.rs       # ツール実行・検証・サンドボックス
-├── session/mod.rs       # セッション永続化
-├── config/mod.rs        # 設定管理
-├── state/mod.rs         # 状態マシン
-└── extensions/mod.rs    # スラッシュコマンド拡張
-tests/                   # 統合テスト（108件）
-```
 
-### コントリビューション
+詳細な設定・使い方は上記英語セクションを参照してください。
 
-1. Issue を作成
-2. `feature/<issue>-<description>` ブランチを作成
-3. 実装 → テスト → clippy 通過を確認
-4. Pull Request を作成（develop ブランチ向け）
+---
 
-詳細は [CLAUDE.md](CLAUDE.md) を参照してください。
-
-## ライセンス
+## License
 
 [MIT](LICENSE)
