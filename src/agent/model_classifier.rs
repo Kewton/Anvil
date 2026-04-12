@@ -12,7 +12,7 @@ pub enum ToolProtocolMode {
     /// JSON format (default, for large models).
     #[default]
     Json,
-    /// Tag-based format (for small models, <= 13B).
+    /// Tag-based format (for small/medium models, <=50B).
     TagBased,
 }
 
@@ -22,23 +22,23 @@ pub enum ToolProtocolMode {
 /// models to receive a more concise prompt that fits their context window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PromptTier {
-    /// Full prompt with all sections (default, for large models >13B).
+    /// Full prompt with all sections (default, for large models >50B).
     #[default]
     Full,
-    /// Compact prompt: basic tools + rules, guides omitted (for 7B-13B models).
+    /// Compact prompt: basic tools + rules, guides omitted (for 11B-50B models).
     Compact,
-    /// Tiny prompt: minimal tool syntax only (for <7B models).
+    /// Tiny prompt: minimal tool syntax only (for <=10B models).
     Tiny,
 }
 
 /// Model size classification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelSizeClass {
-    /// Small model (<7B parameters).
+    /// Small model (≤10B parameters).
     Small,
-    /// Medium model (7B-13B parameters).
+    /// Medium model (11B-50B parameters).
     Medium,
-    /// Large model (>13B parameters or unknown).
+    /// Large model (>50B parameters or unknown).
     Large,
 }
 
@@ -151,8 +151,8 @@ fn classify_size_class(model_name: &str) -> ModelSizeClass {
         && let Ok(size) = caps[1].parse::<u64>()
     {
         return match size {
-            0..7 => ModelSizeClass::Small,
-            7..=13 => ModelSizeClass::Medium,
+            0..=10 => ModelSizeClass::Small,
+            11..=50 => ModelSizeClass::Medium,
             _ => ModelSizeClass::Large,
         };
     }
@@ -198,6 +198,70 @@ mod tests {
         assert_eq!(
             classify_model_size("qwen2-instruct"),
             ToolProtocolMode::TagBased
+        );
+    }
+
+    // Issue #364: verify classifier boundaries for delegation-relevant models
+    #[test]
+    fn issue_364_35b_is_medium() {
+        assert_eq!(
+            classify_size_class("qwen3.5:35b"),
+            ModelSizeClass::Medium,
+            "35B model should be Medium for delegation eligibility"
+        );
+    }
+
+    #[test]
+    fn issue_364_31b_is_medium() {
+        assert_eq!(
+            classify_size_class("gemma4:31b"),
+            ModelSizeClass::Medium,
+            "31B model should be Medium for delegation eligibility"
+        );
+    }
+
+    #[test]
+    fn issue_364_122b_remains_large() {
+        assert_eq!(
+            classify_size_class("qwen3.5:122b"),
+            ModelSizeClass::Large,
+            "122B model should remain Large"
+        );
+    }
+
+    #[test]
+    fn issue_364_boundary_10b_is_small() {
+        assert_eq!(
+            classify_size_class("model:10b"),
+            ModelSizeClass::Small,
+            "10B model should be Small"
+        );
+    }
+
+    #[test]
+    fn issue_364_boundary_11b_is_medium() {
+        assert_eq!(
+            classify_size_class("model:11b"),
+            ModelSizeClass::Medium,
+            "11B model should be Medium"
+        );
+    }
+
+    #[test]
+    fn issue_364_boundary_50b_is_medium() {
+        assert_eq!(
+            classify_size_class("model:50b"),
+            ModelSizeClass::Medium,
+            "50B model should be Medium"
+        );
+    }
+
+    #[test]
+    fn issue_364_boundary_51b_is_large() {
+        assert_eq!(
+            classify_size_class("model:51b"),
+            ModelSizeClass::Large,
+            "51B model should be Large"
         );
     }
 }
