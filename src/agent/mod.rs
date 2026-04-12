@@ -728,6 +728,14 @@ const TOOL_DESC_FILE_EDIT: &str = concat!(
     "\n",
 );
 
+const TOOL_DESC_FILE_REWRITE: &str = concat!(
+    "3b. file.rewrite — replace a line range with new content (use file.read first to confirm line numbers):\n",
+    "```ANVIL_TOOL\n",
+    "{\"id\":\"call_010\",\"tool\":\"file.rewrite\",\"path\":\"./relative/path\",\"start_line\":10,\"end_line\":15,\"content\":\"replacement lines here\"}\n",
+    "```\n",
+    "\n",
+);
+
 const TOOL_DESC_FILE_SEARCH: &str = concat!(
     "4. file.search — search for files by name or content (respects .gitignore):\n",
     "```ANVIL_TOOL\n",
@@ -781,6 +789,16 @@ const TOOL_DESC_AGENT_PLAN: &str = concat!(
     "\n",
 );
 
+const TOOL_DESC_AGENT_FIX_SLICE: &str = concat!(
+    "10. agent.fix_slice — launch a microtask sub-agent to propose a targeted fix for a specific file:\n",
+    "```ANVIL_TOOL\n",
+    "{\"id\":\"call_010\",\"tool\":\"agent.fix_slice\",\"target_path\":\"./src/main.rs\",\"goal\":\"Fix the compilation error in function foo\",\"max_lines\":50}\n",
+    "```\n",
+    "The sub-agent reads the target file, proposes a minimal line-range replacement, and the parent applies it via file.rewrite.\n",
+    "Use this for small, focused fixes where you know the target file and the nature of the problem.\n",
+    "\n",
+);
+
 /// Data-driven definition of optional tools: (tool_name, tool_description, catalog_one_liner).
 /// Note: web.fetch and web.search were moved to basic tools (always included)
 /// because LLMs cannot discover them without prompt descriptions. See Issue #114.
@@ -794,6 +812,11 @@ const OPTIONAL_TOOLS: &[(&str, &str, &str)] = &[
         "agent.plan",
         TOOL_DESC_AGENT_PLAN,
         "agent.plan: launch a read-only sub-agent to create an implementation plan",
+    ),
+    (
+        "agent.fix_slice",
+        TOOL_DESC_AGENT_FIX_SLICE,
+        "agent.fix_slice: launch a microtask sub-agent to propose a targeted fix for a file",
     ),
 ];
 
@@ -848,7 +871,7 @@ const PROMPT_TOOL_RULES: &str = concat!(
     "- When the user's request requires file changes (implement, fix, create, modify, etc.), \
        you must complete the actual file modifications using file.write/file.edit, \
        not just output a plan or description.\n",
-    "- For large existing files, file.write may be blocked. Use file.edit or file.edit_anchor for targeted modifications instead of rewriting entire files.\n",
+    "- For large existing files, file.write may be blocked. Use file.edit, file.edit_anchor, or file.rewrite for targeted modifications instead of rewriting entire files.\n",
     "- Start exploration with file.read on \".\" to list the project root before reading specific files.\n",
     "- Do not assume files like README.md exist — verify first.\n",
     "- For dev servers and watch processes (npm run dev, cargo watch, etc.), use background execution with '&' so the command returns immediately.\n",
@@ -988,6 +1011,7 @@ fn build_json_protocol_prompt(
     prompt.push_str(TOOL_DESC_FILE_READ);
     prompt.push_str(TOOL_DESC_FILE_WRITE);
     prompt.push_str(TOOL_DESC_FILE_EDIT);
+    prompt.push_str(TOOL_DESC_FILE_REWRITE);
     prompt.push_str(TOOL_DESC_FILE_SEARCH);
     prompt.push_str(TOOL_DESC_SHELL_EXEC);
     prompt.push_str(TOOL_DESC_WEB_FETCH);
@@ -1111,6 +1135,7 @@ fn tool_protocol_system_prompt_compact(
     prompt.push_str(TOOL_DESC_FILE_READ);
     prompt.push_str(TOOL_DESC_FILE_WRITE);
     prompt.push_str(TOOL_DESC_FILE_EDIT);
+    prompt.push_str(TOOL_DESC_FILE_REWRITE);
     prompt.push_str(TOOL_DESC_FILE_SEARCH);
     prompt.push_str(TOOL_DESC_SHELL_EXEC);
     prompt.push_str(TOOL_DESC_WEB_FETCH);
@@ -1152,10 +1177,11 @@ fn tool_protocol_system_prompt_tiny() -> String {
     prompt.push_str("You are Anvil, a coding agent.\n\n");
     prompt.push_str("Use ANVIL_TOOL blocks for tool calls. Available tools:\n\n");
 
-    // Only core 4 tools + shell
+    // Only core 4 tools + shell + rewrite
     prompt.push_str(TOOL_DESC_FILE_READ);
     prompt.push_str(TOOL_DESC_FILE_WRITE);
     prompt.push_str(TOOL_DESC_FILE_EDIT);
+    prompt.push_str(TOOL_DESC_FILE_REWRITE);
     prompt.push_str(TOOL_DESC_SHELL_EXEC);
 
     prompt.push_str(concat!(

@@ -65,10 +65,18 @@ pub fn generate_diff_preview(
         ToolInput::FileEditAnchor { params, .. } => {
             generate_file_edit_diff(&params.old_content, &params.new_content)
         }
+        ToolInput::FileRewrite {
+            path,
+            start_line,
+            end_line,
+            content,
+        } => generate_file_rewrite_diff(workspace_root, path, *start_line, *end_line, content),
         // MCP tools do not have diff previews
         ToolInput::Mcp { .. } => None,
         // Agent tools do not have diff previews
-        ToolInput::AgentExplore { .. } | ToolInput::AgentPlan { .. } => None,
+        ToolInput::AgentExplore { .. }
+        | ToolInput::AgentPlan { .. }
+        | ToolInput::AgentFixSlice { .. } => None,
         _ => None,
     }
 }
@@ -149,6 +157,65 @@ fn generate_file_write_diff(
         Some(original_line_count),
         options.deletion_ratio_threshold,
     ))
+}
+
+/// Generate a diff preview for `file.rewrite` (line range replacement).
+fn generate_file_rewrite_diff(
+    workspace_root: &Path,
+    path: &str,
+    start_line: u32,
+    end_line: u32,
+    content: &str,
+) -> Option<String> {
+    // Guard: content size
+    if content.len() > MAX_NEW_CONTENT_SIZE {
+        return None;
+    }
+
+    let resolved = match resolve_sandbox_path(workspace_root, path) {
+        Ok(p) => p,
+        Err(_) => return None,
+    };
+
+    // Check file size
+    match std::fs::metadata(&resolved) {
+        Ok(meta) => {
+            if meta.len() > MAX_FILE_SIZE {
+                return Some(format!(
+                    "(file too large for diff preview: {} bytes)",
+                    meta.len()
+                ));
+            }
+        }
+        Err(_) => return None,
+    }
+
+    let existing_bytes = match std::fs::read(&resolved) {
+        Ok(bytes) => bytes,
+        Err(_) => return None,
+    };
+
+    if is_binary_content(&existing_bytes) {
+        return Some("(binary file - diff not available)".to_string());
+    }
+
+    let existing_content = match String::from_utf8(existing_bytes) {
+        Ok(s) => s,
+        Err(_) => return None,
+    };
+
+    let lines: Vec<&str> = existing_content.lines().collect();
+    let total = lines.len() as u32;
+
+    if start_line < 1 || end_line < start_line || end_line > total {
+        return None;
+    }
+
+    let start_idx = (start_line - 1) as usize;
+    let end_idx = end_line as usize;
+    let old_text = lines[start_idx..end_idx].join("\n");
+
+    generate_file_edit_diff(&old_text, content)
 }
 
 /// Generate a diff preview for `file.edit` (old_string -> new_string).

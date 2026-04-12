@@ -91,6 +91,172 @@ impl SubAgentPayload {
 }
 
 // ---------------------------------------------------------------------------
+// FixSlice proposal (Issue #291)
+// ---------------------------------------------------------------------------
+
+/// A structured proposal returned by the FixSlice sub-agent.
+///
+/// The sub-agent produces this as its ANVIL_FINAL output; the parent validates
+/// and applies it via the normal `file.rewrite` execution path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FixSliceProposal {
+    /// Target file path (relative, must match the parent-specified path).
+    pub target_path: String,
+    /// First line of the replacement range (1-based, inclusive).
+    pub start_line: u32,
+    /// Last line of the replacement range (1-based, inclusive).
+    pub end_line: u32,
+    /// The replacement content for the specified line range.
+    pub replacement_content: String,
+    /// Human-readable rationale for the change.
+    #[serde(default)]
+    pub rationale: String,
+}
+
+/// Why a FixSlice worker invocation failed to reach a successful worker
+/// mutation (Issue #343, extended in Issue #345).
+///
+/// Emitted by `handle_fixslice_result` (per-invocation) and by
+/// `AgentTelemetry::finalize_fixslice_outcome` (session wrap-up) and recorded
+/// via `record_fixslice_worker_failure`. The runtime uses the recorded failure
+/// to decide whether the pre-exit repair turn should still be injected under
+/// a `requires_worker_observation` pack — see
+/// `AgentTelemetry::should_skip_pre_exit_repair_for_worker_failure`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FixSliceFailureReason {
+    /// Worker finished (normal termination) with a blank / tool-only final
+    /// response. Narrow sense after Issue #345 — parse failures and path
+    /// mismatches now get their own variants.
+    NoProposal,
+    /// Worker produced a non-empty final response but it could not be parsed
+    /// into a `FixSliceProposal`, even after the salvage pass that extracts
+    /// embedded JSON (Issue #345).
+    ProposalParseFailed,
+    /// Worker returned a parseable proposal but its `target_path` did not
+    /// match the original target (Issue #345). Previously lumped into
+    /// `ProposalValidationFailed`; split out because it is the most actionable
+    /// subclass of the B1 shape.
+    PathMismatch,
+    /// Worker emitted a proposal but `validate_fix_proposal` rejected it for
+    /// a reason other than path mismatch (sandbox, control chars, empty
+    /// replacement, line range).
+    ProposalValidationFailed,
+    /// Proposal was valid, but the worker-owned `file.rewrite` did not
+    /// complete cleanly (failed / rolled back / produced a no-op diff).
+    RewriteFailed,
+    /// Worker hit its iteration cap before producing a proposal.
+    MaxIterationsReached,
+    /// An escalation hint fired, but `agent.fix_slice` was never invoked by
+    /// the LLM during the session (Issue #345, A1 shape). Recorded only at
+    /// session wrap-up via `finalize_fixslice_outcome`.
+    EscalatedNotInvoked,
+    /// The FixSlice sub-agent aborted early because it kept issuing
+    /// `file.read` calls against the same target path without producing a
+    /// proposal (Issue #351, B1 shape). The subagent's `run_turn` loop
+    /// detects same-path read oscillation and terminates with this class
+    /// so the parent can classify the session as pack_gate_invalid
+    /// instead of letting it burn through the remaining iteration budget.
+    RepeatedReadLoop,
+}
+
+impl std::fmt::Display for FixSliceFailureReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoProposal => write!(f, "no_proposal"),
+            Self::ProposalParseFailed => write!(f, "proposal_parse_failed"),
+            Self::PathMismatch => write!(f, "path_mismatch"),
+            Self::ProposalValidationFailed => write!(f, "proposal_validation_failed"),
+            Self::RewriteFailed => write!(f, "rewrite_failed"),
+            Self::MaxIterationsReached => write!(f, "max_iterations_reached"),
+            Self::EscalatedNotInvoked => write!(f, "escalated_not_invoked"),
+            Self::RepeatedReadLoop => write!(f, "repeated_read_loop"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pack expectation / validation gate (Issue #329)
+// ---------------------------------------------------------------------------
+
+/// Declares what a benchmark pack expects from the session.
+///
+/// Read from `$ANVIL_PACK_EXPECTATION` at session start.
+/// When unset the harness applies no pack-level gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PackExpectation {
+    /// The prompt is a follow-up audit; a no-op / zero-mutation completion is
+    /// a valid success path.
+    AuditOnly,
+    /// The pack requires at least one real file mutation (`changed_files > 0`).
+    RequiresMutation,
+    /// The pack requires observable worker-path evidence: only a fix_slice
+    /// escalation (`worker_observed=true`) satisfies this gate. Repair-turn
+    /// or mutation-only salvage is explicitly rejected (Issue #334).
+    RequiresWorkerObservation,
+}
+
+impl PackExpectation {
+    /// Parse from the raw env-var value.  Returns `None` for unknown strings.
+    pub fn from_env_str(s: &str) -> Option<Self> {
+        match s {
+            "audit_only" => Some(Self::AuditOnly),
+            "requires_mutation" => Some(Self::RequiresMutation),
+            "requires_worker_observation" => Some(Self::RequiresWorkerObservation),
+            _ => None,
+        }
+    }
+
+    /// Read from `$ANVIL_PACK_EXPECTATION`.  Returns `None` when unset or empty.
+    pub fn from_env() -> Option<Self> {
+        let raw = std::env::var("ANVIL_PACK_EXPECTATION").ok()?;
+        if raw.is_empty() {
+            return None;
+        }
+        Self::from_env_str(&raw)
+    }
+}
+
+impl std::fmt::Display for PackExpectation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AuditOnly => write!(f, "audit_only"),
+            Self::RequiresMutation => write!(f, "requires_mutation"),
+            Self::RequiresWorkerObservation => write!(f, "requires_worker_observation"),
+        }
+    }
+}
+
+/// Result of validating telemetry against a pack expectation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PackValidationResult {
+    /// No pack expectation was set — nothing to validate.
+    NoExpectation,
+    /// Telemetry satisfies the expectation.
+    Satisfied,
+    /// Telemetry does NOT satisfy the expectation.
+    Mismatch {
+        expectation: PackExpectation,
+        reason: String,
+    },
+}
+
+impl std::fmt::Display for PackValidationResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoExpectation => write!(f, "no_expectation"),
+            Self::Satisfied => write!(f, "satisfied"),
+            Self::Mismatch {
+                expectation,
+                reason,
+            } => {
+                write!(f, "mismatch({expectation}): {reason}")
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Completion taxonomy (Issue #255: AgentPhase integration)
 // ---------------------------------------------------------------------------
 
@@ -255,6 +421,131 @@ pub struct AgentTelemetry {
     /// None if no mutation occurred during the session.
     #[serde(default)]
     pub first_mutation_event_tool: Option<String>,
+
+    /// Number of times fix_slice escalation was triggered (Issue #321).
+    #[serde(default)]
+    pub fixslice_escalation_count: u32,
+
+    /// Fix_slice escalations triggered by consecutive same-path edit failures (Issue #332).
+    #[serde(default)]
+    pub fixslice_escalation_same_path_count: u32,
+
+    /// Fix_slice escalations triggered by stagnation + cross-path edit failures (Issue #332).
+    #[serde(default)]
+    pub fixslice_escalation_stagnation_count: u32,
+
+    /// Retrospective count of repair-turn-only salvage runs (Issue #332).
+    ///
+    /// Set by `classify_repair_salvage()` when a session produced a mutation
+    /// via the pre-exit repair turn but never reached the intended worker path.
+    /// Does NOT flip `worker_observed` — it is a distinct outcome classification.
+    #[serde(default)]
+    pub fixslice_escalation_repair_salvage_count: u32,
+
+    /// Number of pre-exit repair turns injected (Issue #325).
+    #[serde(default)]
+    pub pre_exit_repair_injected_count: u32,
+
+    /// Number of pre-exit repair turns actually consumed by the LLM (Issue #325).
+    #[serde(default)]
+    pub pre_exit_repair_consumed_count: u32,
+
+    /// Number of unchecked plan items rejected during repair closure mode (Issue #327).
+    #[serde(default)]
+    pub repair_turn_items_rejected: u32,
+
+    /// Number of unchecked plan items rejected by the late-stage closure guard
+    /// (Issue #336).  Counts follow-up `ANVIL_PLAN` / `ANVIL_PLAN_UPDATE` items
+    /// that targeted the single remaining plan item while late-stage closure
+    /// mode was active, preventing endless supersede→append churn.
+    #[serde(default)]
+    pub late_stage_closure_items_rejected: u32,
+
+    /// Number of plan items retired during repair turn (Issue #327).
+    #[serde(default)]
+    pub repair_turn_items_retired: u32,
+
+    /// Number of pending plan items before repair turn (Issue #327).
+    #[serde(default)]
+    pub repair_turn_pending_before: Option<u32>,
+
+    /// Number of pending plan items after repair turn (Issue #327).
+    #[serde(default)]
+    pub repair_turn_pending_after: Option<u32>,
+
+    // ---- Pack validation gate (Issue #329) ----
+    /// Whether at least one mutation (file change) was observed during the session.
+    #[serde(default)]
+    pub mutation_observed: bool,
+
+    /// Whether the worker path produced a real post-execution mutation
+    /// (Issue #339).
+    ///
+    /// Set to true ONLY after a successful `agent.fix_slice` →
+    /// `file.rewrite` execution whose result survived rollback and no-op
+    /// filtering. Emitting a fix_slice escalation hint does NOT flip this
+    /// flag — escalation-emission is the request side and is tracked by
+    /// `fixslice_escalation_count` / `fixslice_escalation_same_path_count`
+    /// / `fixslice_escalation_stagnation_count`.
+    #[serde(default)]
+    pub worker_observed: bool,
+
+    /// Whether a pre-exit repair turn was observed.
+    #[serde(default)]
+    pub repair_turn_observed: bool,
+
+    /// Pack expectation that was active for this session (from `$ANVIL_PACK_EXPECTATION`).
+    #[serde(default)]
+    pub pack_expectation: Option<PackExpectation>,
+
+    /// Mismatch reason when the session did not satisfy the pack expectation.
+    /// `None` when expectation is satisfied or unset.
+    #[serde(default)]
+    pub expectation_mismatch_reason: Option<String>,
+
+    /// Number of times a FixSlice worker invocation failed to reach a
+    /// successful worker mutation (Issue #343).
+    ///
+    /// Counts every failure class (`no_proposal`, `proposal_validation_failed`,
+    /// `rewrite_failed`, `max_iterations_reached`). Independent of
+    /// `fixslice_escalation_count`, which tracks request-side escalation
+    /// emission.
+    #[serde(default)]
+    pub fixslice_worker_failure_count: u32,
+
+    /// Most recent FixSlice worker failure reason (Issue #343).
+    ///
+    /// Serialized as the snake_case form of `FixSliceFailureReason`.
+    /// `None` until the first failure is recorded.
+    #[serde(default)]
+    pub fixslice_failure_reason: Option<String>,
+
+    /// Number of times `agent.fix_slice` was actually invoked during the
+    /// session (Issue #345).
+    ///
+    /// Incremented before `handle_fixslice_result` runs, so the counter
+    /// reflects every invocation attempt regardless of whether the worker
+    /// reached a successful mutation. Used by `finalize_fixslice_outcome` to
+    /// distinguish the A1 shape (`fixslice_escalation_count > 0` but
+    /// `fixslice_worker_invocation_count == 0`) from a session where the
+    /// worker was invoked and failed for a concrete reason.
+    #[serde(default)]
+    pub fixslice_worker_invocation_count: u32,
+
+    /// Number of times the post-escalation fix_slice routing barrier
+    /// blocked a parent-side mutation tool (Issue #355). Incremented every
+    /// time `EscalationBarrier` filters out a `file.edit` / `file.write` /
+    /// `file.edit_anchor` call because the pack is worker-required and
+    /// `agent.fix_slice` has not yet been invoked after an escalation.
+    #[serde(default)]
+    pub escalation_barrier_block_count: u32,
+
+    /// Number of times the worker-required early exit fired (Issue #355).
+    /// A positive value means the session terminated cleanly after
+    /// `pack_validation_result=satisfied` + `worker_observed=true`, without
+    /// waiting for the 600s runner timeout.
+    #[serde(default)]
+    pub worker_required_early_exit_count: u32,
 }
 
 impl AgentTelemetry {
@@ -326,6 +617,43 @@ impl AgentTelemetry {
         self.anvil_plan_visible_count += 1;
     }
 
+    /// Record a pre-exit repair turn injection (Issue #325).
+    pub fn record_pre_exit_repair_injected(&mut self) {
+        self.pre_exit_repair_injected_count += 1;
+        self.repair_turn_observed = true;
+    }
+
+    /// Record a pre-exit repair turn consumed by LLM (Issue #325).
+    pub fn record_pre_exit_repair_consumed(&mut self) {
+        self.pre_exit_repair_consumed_count += 1;
+        self.repair_turn_observed = true;
+    }
+
+    /// Record unchecked items rejected during repair closure mode (Issue #327).
+    pub fn record_repair_turn_items_rejected(&mut self, count: u32) {
+        self.repair_turn_items_rejected += count;
+    }
+
+    /// Record unchecked items rejected by the late-stage closure guard (Issue #336).
+    pub fn record_late_stage_closure_items_rejected(&mut self, count: u32) {
+        self.late_stage_closure_items_rejected += count;
+    }
+
+    /// Record items retired during repair turn (Issue #327).
+    pub fn record_repair_turn_items_retired(&mut self, count: u32) {
+        self.repair_turn_items_retired += count;
+    }
+
+    /// Snapshot pending item count before repair turn (Issue #327).
+    pub fn record_repair_turn_pending_before(&mut self, count: u32) {
+        self.repair_turn_pending_before = Some(count);
+    }
+
+    /// Snapshot pending item count after repair turn (Issue #327).
+    pub fn record_repair_turn_pending_after(&mut self, count: u32) {
+        self.repair_turn_pending_after = Some(count);
+    }
+
     /// Record a pre-mutation barrier block (Issue #303).
     pub fn record_mutation_barrier_block(&mut self) {
         self.mutation_barrier_block_count += 1;
@@ -338,6 +666,7 @@ impl AgentTelemetry {
     /// (i.e. from `crate::app::MUTATION_TOOLS`) to avoid storing arbitrary strings.
     pub fn record_mutation_turn(&mut self, turn: u32, elapsed_s: Option<f64>, tool_name: &str) {
         self.last_mutation_turn = turn;
+        self.mutation_observed = true;
         if self.first_mutation_event_turn.is_none() {
             self.first_mutation_event_turn = Some(turn);
             self.first_mutation_event_elapsed_s = elapsed_s;
@@ -348,6 +677,181 @@ impl AgentTelemetry {
     /// Record an ANVIL_FINAL suppression with remaining core targets.
     pub fn record_final_suppressed_with_remaining_targets(&mut self) {
         self.final_suppressed_with_remaining_targets_count += 1;
+    }
+
+    /// Record a same-path fix_slice escalation event (Issue #321, #332).
+    ///
+    /// Triggered when consecutive edit failures on a single path reach the
+    /// `edit_fixslice_threshold`. Bumps both the overall count and the
+    /// same-path counter.
+    ///
+    /// Issue #339: this is a request-side signal (the runtime emitted the
+    /// escalation hint) and MUST NOT flip `worker_observed`. The success-
+    /// side flag is only set by [`record_worker_success`] after a real
+    /// post-execution worker mutation.
+    pub fn record_fixslice_escalation(&mut self) {
+        self.fixslice_escalation_count += 1;
+        self.fixslice_escalation_same_path_count += 1;
+    }
+
+    /// Record a stagnation-triggered fix_slice escalation (Issue #332).
+    ///
+    /// Triggered when the model scatters edit failures across multiple files
+    /// so no same-path threshold is reached, but the session is clearly
+    /// stagnating. Bumps the overall count and the stagnation counter.
+    ///
+    /// Issue #339: request-side only — does NOT flip `worker_observed`.
+    pub fn record_fixslice_escalation_stagnation(&mut self) {
+        self.fixslice_escalation_count += 1;
+        self.fixslice_escalation_stagnation_count += 1;
+    }
+
+    /// Record a real post-execution worker event (Issue #339).
+    ///
+    /// Called only after the agent actually invoked `agent.fix_slice` and
+    /// its resulting `file.rewrite` completed without rollback and with a
+    /// non-empty, non-no-op summary. This is the success-side flag the
+    /// pack validation gate trusts.
+    pub fn record_worker_success(&mut self) {
+        self.worker_observed = true;
+    }
+
+    /// Record a FixSlice worker failure (Issue #343).
+    ///
+    /// Called from `handle_fixslice_result` whenever an invocation of
+    /// `agent.fix_slice` does not reach a successful worker mutation. Bumps
+    /// the running count and stores the latest reason. Does NOT touch
+    /// `worker_observed`: success-side semantics are preserved from Issue #339.
+    pub fn record_fixslice_worker_failure(&mut self, reason: FixSliceFailureReason) {
+        self.fixslice_worker_failure_count += 1;
+        self.fixslice_failure_reason = Some(reason.to_string());
+    }
+
+    /// Record an `agent.fix_slice` invocation attempt (Issue #345).
+    ///
+    /// Called from the agentic loop before `handle_fixslice_result` runs so
+    /// the counter reflects every attempted invocation, even ones that fail
+    /// before producing a proposal.
+    pub fn record_fixslice_worker_invocation(&mut self) {
+        self.fixslice_worker_invocation_count += 1;
+    }
+
+    /// Classify the session's FixSlice outcome at wrap-up time (Issue #345).
+    ///
+    /// When one or more escalations fired but `agent.fix_slice` was never
+    /// actually invoked and no worker success was recorded, the session is
+    /// the A1 shape from Issue #345: the LLM ignored the escalation hint and
+    /// the parent's own `file.edit` landed the mutation. This records an
+    /// `EscalatedNotInvoked` failure so telemetry and the pre-exit repair
+    /// guard can distinguish it from sessions that never escalated.
+    ///
+    /// Idempotent: calling this more than once will not double-record the
+    /// failure. Safe to invoke from multiple loop exit branches.
+    pub fn finalize_fixslice_outcome(&mut self) {
+        if self.fixslice_escalation_count == 0
+            || self.fixslice_worker_invocation_count > 0
+            || self.worker_observed
+        {
+            return;
+        }
+        if self.fixslice_failure_reason.as_deref()
+            == Some(&FixSliceFailureReason::EscalatedNotInvoked.to_string())
+        {
+            return;
+        }
+        self.record_fixslice_worker_failure(FixSliceFailureReason::EscalatedNotInvoked);
+    }
+
+    /// Whether any FixSlice worker failure has been recorded (Issue #343).
+    pub fn has_fixslice_worker_failure(&self) -> bool {
+        self.fixslice_worker_failure_count > 0
+    }
+
+    /// Whether the pre-exit repair turn should be skipped because the
+    /// worker path has already failed under a `requires_worker_observation`
+    /// pack (Issue #343).
+    ///
+    /// Returns true when all of the following hold:
+    /// - `pack_expectation` is `RequiresWorkerObservation`,
+    /// - at least one FixSlice worker failure has been recorded,
+    /// - `worker_observed` is still false.
+    ///
+    /// The agentic loop uses this to bail out cleanly instead of injecting
+    /// a repair turn that would only flip `repair_turn_observed` and
+    /// degrade `completion_kind` to `partial` without ever satisfying the
+    /// pack expectation.
+    pub fn should_skip_pre_exit_repair_for_worker_failure(&self) -> bool {
+        matches!(
+            self.pack_expectation,
+            Some(PackExpectation::RequiresWorkerObservation)
+        ) && self.has_fixslice_worker_failure()
+            && !self.worker_observed
+    }
+
+    /// Whether parent-side mutation tools should be suspended until
+    /// `agent.fix_slice` is invoked (Issue #355, Bug 1).
+    ///
+    /// Returns true iff all of the following hold:
+    /// - `pack_expectation` is `RequiresWorkerObservation`,
+    /// - at least one fix_slice escalation has been recorded,
+    /// - `agent.fix_slice` has not yet been invoked (`fixslice_worker_invocation_count == 0`),
+    /// - no worker success has been recorded.
+    ///
+    /// Pack-scoped on purpose: under other pack expectations parent-side
+    /// mutations are legitimate, so the barrier stays inactive.
+    pub fn should_force_fixslice_routing(&self) -> bool {
+        matches!(
+            self.pack_expectation,
+            Some(PackExpectation::RequiresWorkerObservation)
+        ) && self.fixslice_escalation_count > 0
+            && self.fixslice_worker_invocation_count == 0
+            && !self.worker_observed
+    }
+
+    /// Whether the session should terminate early because the pack
+    /// expectation has already been satisfied by worker-path evidence
+    /// (Issue #355, Bug 2).
+    ///
+    /// Returns true iff `pack_expectation == RequiresWorkerObservation`
+    /// and `worker_observed == true`. The agentic loop consults this just
+    /// before the follow-up LLM call and breaks when it flips true, which
+    /// keeps worker-satisfied sessions from burning the 600s runner
+    /// timeout.
+    pub fn should_early_exit_after_worker_success(&self) -> bool {
+        matches!(
+            self.pack_expectation,
+            Some(PackExpectation::RequiresWorkerObservation)
+        ) && self.worker_observed
+    }
+
+    /// Record that the post-escalation fix_slice routing barrier blocked a
+    /// parent-side mutation (Issue #355).
+    pub fn record_escalation_barrier_block(&mut self) {
+        self.escalation_barrier_block_count += 1;
+    }
+
+    /// Record that the worker-required early exit fired (Issue #355).
+    pub fn record_worker_required_early_exit(&mut self) {
+        self.worker_required_early_exit_count += 1;
+    }
+
+    /// Retrospectively classify the session as a repair-turn-only salvage (Issue #332).
+    ///
+    /// Fires at most once per session. A salvage run is one where:
+    /// - the pre-exit repair turn was observed, AND
+    /// - a mutation was observed, AND
+    /// - no worker path was reached.
+    ///
+    /// Does NOT flip `worker_observed`; it only increments the salvage counter
+    /// so pack validation and observability can distinguish a true worker run
+    /// from a late-repair salvage.
+    pub fn classify_repair_salvage(&mut self) {
+        if self.fixslice_escalation_repair_salvage_count > 0 {
+            return;
+        }
+        if self.repair_turn_observed && self.mutation_observed && !self.worker_observed {
+            self.fixslice_escalation_repair_salvage_count = 1;
+        }
     }
 
     /// Threshold: mutations after this turn are considered "late".
@@ -455,6 +959,26 @@ impl AgentTelemetry {
             "first_mutation_event_elapsed_s": self.first_mutation_event_elapsed_s,
             "first_mutation_event_tool": self.first_mutation_event_tool,
             "first_mutation_event_semantic_basis": "runtime_lower_bound",
+            // Issue #329: pack validation gate observability fields
+            "mutation_observed": self.mutation_observed,
+            "worker_observed": self.worker_observed,
+            "repair_turn_observed": self.repair_turn_observed,
+            "pack_expectation": self.pack_expectation.map(|e| e.to_string()),
+            "expectation_mismatch_reason": self.expectation_mismatch_reason,
+            // Issue #332: distinguishing fix_slice escalation reasons.
+            "fixslice_escalation_count": self.fixslice_escalation_count,
+            "fixslice_escalation_same_path_count": self.fixslice_escalation_same_path_count,
+            "fixslice_escalation_stagnation_count": self.fixslice_escalation_stagnation_count,
+            "fixslice_escalation_repair_salvage_count":
+                self.fixslice_escalation_repair_salvage_count,
+            // Issue #343: fix_slice worker failure taxonomy.
+            "fixslice_worker_failure_count": self.fixslice_worker_failure_count,
+            "fixslice_failure_reason": self.fixslice_failure_reason,
+            // Issue #345: fix_slice worker invocation tracking.
+            "fixslice_worker_invocation_count": self.fixslice_worker_invocation_count,
+            // Issue #355: escalation routing barrier + early-exit counters.
+            "escalation_barrier_block_count": self.escalation_barrier_block_count,
+            "worker_required_early_exit_count": self.worker_required_early_exit_count,
         });
 
         let json_bytes = serde_json::to_vec_pretty(&payload)?;
@@ -470,6 +994,65 @@ impl AgentTelemetry {
         file.write_all(&json_bytes)?;
 
         Ok(())
+    }
+
+    /// Validate telemetry against the active pack expectation (Issue #329).
+    ///
+    /// Reads `$ANVIL_PACK_EXPECTATION` from the environment.
+    /// Call this after `completion_kind` is set.  Updates `pack_expectation`
+    /// and `expectation_mismatch_reason` fields.
+    pub fn validate_pack_expectation(&mut self) -> PackValidationResult {
+        let expectation = match PackExpectation::from_env() {
+            Some(exp) => exp,
+            None => return PackValidationResult::NoExpectation,
+        };
+        self.validate_against(expectation)
+    }
+
+    /// Validate telemetry against the given expectation (Issue #329).
+    ///
+    /// This is the testable core; `validate_pack_expectation` is the
+    /// env-reading convenience wrapper.
+    pub fn validate_against(&mut self, expectation: PackExpectation) -> PackValidationResult {
+        self.pack_expectation = Some(expectation);
+
+        match expectation {
+            PackExpectation::AuditOnly => PackValidationResult::Satisfied,
+
+            PackExpectation::RequiresMutation => {
+                if self.mutation_observed {
+                    PackValidationResult::Satisfied
+                } else {
+                    let reason =
+                        "pack requires mutation but session completed with zero file changes"
+                            .to_string();
+                    self.expectation_mismatch_reason = Some(reason.clone());
+                    PackValidationResult::Mismatch {
+                        expectation,
+                        reason,
+                    }
+                }
+            }
+
+            PackExpectation::RequiresWorkerObservation => {
+                // Issue #334: repair-turn or mutation-only salvage must NOT
+                // satisfy this gate. Only actual worker-path observation
+                // (fix_slice escalation) counts, so runtime semantics agree
+                // with the strict benchmark runner classification.
+                if self.worker_observed {
+                    PackValidationResult::Satisfied
+                } else {
+                    let reason = "pack requires worker path (fix_slice escalation) but \
+                                  worker was not observed"
+                        .to_string();
+                    self.expectation_mismatch_reason = Some(reason.clone());
+                    PackValidationResult::Mismatch {
+                        expectation,
+                        reason,
+                    }
+                }
+            }
+        }
     }
 
     /// Premature Final Request Rate: ratio of suppressed finals to total finals.

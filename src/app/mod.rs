@@ -6,8 +6,10 @@
 pub mod agentic;
 pub mod alternating_loop_detector;
 pub mod cli;
+pub mod closure_loop_detector;
 mod context;
-pub(crate) mod edit_fail_tracker;
+pub mod edit_fail_tracker;
+pub mod escalation_barrier;
 pub(crate) mod execution_plan;
 pub mod loop_detector;
 pub mod mock;
@@ -15,6 +17,7 @@ pub mod mutation_barrier;
 pub mod phase_estimator;
 pub mod plan;
 pub mod policy;
+pub mod post_failure_thrash_detector;
 pub(crate) mod read_repeat_tracker;
 pub mod read_transition_guard;
 pub mod render;
@@ -65,7 +68,12 @@ pub use render::{cli_prompt, render_help_frame, slash_commands};
 /// Mutation tools tracked for telemetry purposes.
 /// Note: shell.exec is intentionally excluded — see Issue #273 for rationale
 /// (first_mutation_event_* fields are runtime_lower_bound, not strict post-hoc values).
-pub(crate) const MUTATION_TOOLS: &[&str] = &["file.write", "file.edit", "file.edit_anchor"];
+pub(crate) const MUTATION_TOOLS: &[&str] = &[
+    "file.write",
+    "file.edit",
+    "file.edit_anchor",
+    "file.rewrite",
+];
 
 /// Detect project languages from the project root directory.
 ///
@@ -291,6 +299,17 @@ pub struct App {
     forced_mode_active: bool,
     /// Recovery read budget for file.edit failure recovery (Issue #299).
     tool_recovery_budget: tool_recovery_budget::ToolRecoveryBudget,
+    /// Whether the session is in pre-exit repair closure mode (Issue #327).
+    /// When active, ANVIL_PLAN_UPDATE unchecked items are rejected.
+    repair_closure_active: bool,
+    /// Detects closure-mode natural-language reasoning loops that reoccur
+    /// after a `fix_slice` worker failure with no tool-advancing output
+    /// (Issue #349).
+    closure_loop_detector: closure_loop_detector::ClosureLoopDetector,
+    /// Detects tool-active thrash loops after a `fix_slice` worker failure
+    /// where the parent keeps calling tools but the execution plan never
+    /// advances (Issue #351).
+    post_failure_thrash_detector: post_failure_thrash_detector::PostFailureThrashDetector,
 }
 
 /// Whether the session loop should continue or exit.
@@ -498,6 +517,7 @@ impl App {
         // Register sub-agent tools separately (design decision #6, DR1-008)
         tools.register_agent_explore();
         tools.register_agent_plan();
+        tools.register_agent_fix_slice();
         if let Some(ref manager) = mcp_manager {
             let mcp_tools = manager.get_tools();
             for (server_name, tool_list) in &mcp_tools {
@@ -567,6 +587,7 @@ impl App {
         let read_transition_reinject_interval = config.runtime.read_transition_reinject_interval;
         let edit_reread_threshold = config.runtime.edit_reread_threshold;
         let edit_write_fallback_threshold = config.runtime.edit_write_fallback_threshold;
+        let edit_fixslice_threshold = config.runtime.edit_fixslice_threshold;
         let read_repeat_warn = config.runtime.read_repeat_warn_threshold;
         let read_repeat_strong_warn = config.runtime.read_repeat_strong_warn_threshold;
         let edit_recovery_read_budget = config.runtime.edit_recovery_read_budget;
@@ -602,6 +623,7 @@ impl App {
             edit_fail_tracker: edit_fail_tracker::EditFailTracker::new(
                 edit_reread_threshold,
                 edit_write_fallback_threshold,
+                edit_fixslice_threshold,
             ),
             phase_estimator: phase_estimator::PhaseEstimator::new(
                 phase_explore,
@@ -622,12 +644,25 @@ impl App {
             session_stats: SessionStats::new(),
             last_compact_info: None,
             execution_plan: crate::contracts::ExecutionPlan::default(),
-            agent_telemetry: crate::contracts::AgentTelemetry::new(),
+            agent_telemetry: {
+                // Issue #343: cache the active pack expectation at session
+                // start so the agentic loop can consult it without re-reading
+                // env on every turn. `validate_pack_expectation` still
+                // re-resolves at session end, so this cache is only a
+                // read-side convenience.
+                let mut tel = crate::contracts::AgentTelemetry::new();
+                tel.pack_expectation = crate::contracts::PackExpectation::from_env();
+                tel
+            },
             stagnation_state: stagnation_state::StagnationState::new(),
             forced_mode_active: false,
             tool_recovery_budget: tool_recovery_budget::ToolRecoveryBudget::new(
                 edit_recovery_read_budget,
             ),
+            repair_closure_active: false,
+            closure_loop_detector: closure_loop_detector::ClosureLoopDetector::new(),
+            post_failure_thrash_detector:
+                post_failure_thrash_detector::PostFailureThrashDetector::default(),
         })
     }
 
@@ -907,7 +942,7 @@ impl App {
     ///
     /// Should be called once when the session actually ends (interactive exit
     /// or non-interactive completion), not per-turn.
-    pub(crate) fn log_session_summary(&self) {
+    pub(crate) fn log_session_summary(&mut self) {
         let session_elapsed = self
             .session_stats
             .session_start
@@ -961,8 +996,67 @@ impl App {
                 no_op_mutation_count = tel.no_op_mutation_count,
                 rolled_back_mutation_count = tel.rolled_back_mutation_count,
                 initial_plan_miss_count = tel.initial_plan_miss_count,
+                fixslice_escalation_count = tel.fixslice_escalation_count,
+                pre_exit_repair_injected_count = tel.pre_exit_repair_injected_count,
+                pre_exit_repair_consumed_count = tel.pre_exit_repair_consumed_count,
                 "agent telemetry"
             );
+        }
+
+        // Issue #345: classify the A1 shape (escalation fired but the worker
+        // was never invoked) before the salvage / pack-validation steps so
+        // they see a consistent failure record. Runs unconditionally — the
+        // hook is a no-op when no escalation fired or when the worker was
+        // actually invoked.
+        self.agent_telemetry.finalize_fixslice_outcome();
+
+        // Issue #332: retrospectively classify repair-turn-only salvage
+        // before pack validation/artifact emission so the counter is durable.
+        self.agent_telemetry.classify_repair_salvage();
+
+        // Issue #343: surface an explicit runtime-summary warning when the
+        // session finished with a recorded fix_slice worker failure but no
+        // corresponding worker success. Makes the A1 shape visible in logs
+        // without waiting for the pack validation gate at the very end.
+        if self.agent_telemetry.has_fixslice_worker_failure()
+            && !self.agent_telemetry.worker_observed
+        {
+            tracing::warn!(
+                fixslice_worker_failure_count = self.agent_telemetry.fixslice_worker_failure_count,
+                fixslice_failure_reason = self.agent_telemetry.fixslice_failure_reason.as_deref(),
+                repair_turn_observed = self.agent_telemetry.repair_turn_observed,
+                mutation_observed = self.agent_telemetry.mutation_observed,
+                "fix_slice worker failed to reach success; session ended without worker observation"
+            );
+        }
+
+        // Issue #329: Validate pack expectation gate before writing artifact.
+        {
+            let result = self.agent_telemetry.validate_pack_expectation();
+            match &result {
+                crate::contracts::PackValidationResult::NoExpectation => {}
+                crate::contracts::PackValidationResult::Satisfied => {
+                    tracing::info!(
+                        pack_expectation = %self.agent_telemetry.pack_expectation
+                            .map(|e| e.to_string())
+                            .unwrap_or_default(),
+                        "pack validation gate: satisfied"
+                    );
+                }
+                crate::contracts::PackValidationResult::Mismatch {
+                    expectation,
+                    reason,
+                } => {
+                    tracing::warn!(
+                        pack_expectation = %expectation,
+                        reason = %reason,
+                        mutation_observed = self.agent_telemetry.mutation_observed,
+                        worker_observed = self.agent_telemetry.worker_observed,
+                        repair_turn_observed = self.agent_telemetry.repair_turn_observed,
+                        "pack validation gate: expectation mismatch"
+                    );
+                }
+            }
         }
 
         // Issue #271: Write telemetry artifact (opt-in via ANVIL_TELEMETRY_DIR).
@@ -2350,7 +2444,8 @@ impl App {
         let rel_path = match &request.input {
             ToolInput::FileWrite { path, .. }
             | ToolInput::FileEdit { path, .. }
-            | ToolInput::FileEditAnchor { path, .. } => path,
+            | ToolInput::FileEditAnchor { path, .. }
+            | ToolInput::FileRewrite { path, .. } => path,
             _ => return None,
         };
 

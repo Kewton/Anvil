@@ -286,6 +286,39 @@ fn build_tool_input(
                 .ok_or_else(|| "missing prompt element for agent.plan".to_string())?,
             scope: get_attr("scope"),
         },
+        "agent.fix_slice" => {
+            let target_path = get_attr("target_path")
+                .ok_or_else(|| "missing target_path attribute for agent.fix_slice".to_string())?;
+            let goal = get_child("goal")
+                .ok_or_else(|| "missing goal element for agent.fix_slice".to_string())?;
+            let max_lines: u32 = get_attr("max_lines")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(50);
+            ToolInput::AgentFixSlice {
+                target_path,
+                goal,
+                max_lines,
+            }
+        }
+        "file.rewrite" => {
+            let path = get_attr("path")
+                .ok_or_else(|| "missing path attribute for file.rewrite".to_string())?;
+            let start_line: u32 = get_attr("start_line")
+                .ok_or_else(|| "missing start_line attribute for file.rewrite".to_string())?
+                .parse()
+                .map_err(|_| "invalid start_line value for file.rewrite".to_string())?;
+            let end_line: u32 = get_attr("end_line")
+                .ok_or_else(|| "missing end_line attribute for file.rewrite".to_string())?
+                .parse()
+                .map_err(|_| "invalid end_line value for file.rewrite".to_string())?;
+            let content = get_child("content").unwrap_or_default();
+            ToolInput::FileRewrite {
+                path,
+                start_line,
+                end_line,
+                content,
+            }
+        }
         _ => return Err(format!("unsupported tool in tag format: {tool_name}")),
     };
 

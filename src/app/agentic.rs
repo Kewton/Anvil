@@ -90,7 +90,12 @@ pub fn summarize_tool_names(names: &[String]) -> String {
 }
 
 /// Mutation tool names used for the successful-mutation check (Issue #285).
-const MUTATION_TOOL_NAMES: &[&str] = &["file.write", "file.edit", "file.edit_anchor"];
+const MUTATION_TOOL_NAMES: &[&str] = &[
+    "file.write",
+    "file.edit",
+    "file.edit_anchor",
+    "file.rewrite",
+];
 
 /// Check whether the tool results contain at least one successful mutation
 /// (file.write / file.edit / file.edit_anchor with Completed status,
@@ -345,9 +350,50 @@ impl App {
             }
 
             let kind = SubAgentKind::from_tool_input(&call.input).unwrap();
-            let (prompt, scope) = match &call.input {
-                ToolInput::AgentExplore { prompt, scope } => (prompt.as_str(), scope.as_deref()),
-                ToolInput::AgentPlan { prompt, scope } => (prompt.as_str(), scope.as_deref()),
+
+            // Extract prompt, scope, and optional FixSlice parameters.
+            // We pre-compute the FixSlice parent_dir and the structured user
+            // prompt so the borrows live long enough for the match below.
+            let fixslice_parent_dir: Option<String> = match &call.input {
+                ToolInput::AgentFixSlice { target_path, .. } => {
+                    std::path::Path::new(target_path.as_str())
+                        .parent()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .filter(|s| !s.is_empty())
+                }
+                _ => None,
+            };
+            // Issue #341: embed target_path and max_lines in the worker's
+            // user prompt so it anchors to the correct file instead of
+            // drifting into unrelated reads.
+            let fixslice_user_prompt: Option<String> = match &call.input {
+                ToolInput::AgentFixSlice {
+                    target_path,
+                    goal,
+                    max_lines,
+                } => Some(build_fixslice_user_prompt(target_path, goal, *max_lines)),
+                _ => None,
+            };
+            let (prompt, scope, fixslice_params) = match &call.input {
+                ToolInput::AgentExplore { prompt, scope } => {
+                    (prompt.as_str(), scope.as_deref(), None)
+                }
+                ToolInput::AgentPlan { prompt, scope } => (prompt.as_str(), scope.as_deref(), None),
+                ToolInput::AgentFixSlice {
+                    target_path,
+                    max_lines,
+                    ..
+                } => {
+                    // DR2-010 + Issue #341: structured prompt (includes
+                    // target_path/max_lines) → prompt, target_path parent dir → scope.
+                    (
+                        fixslice_user_prompt
+                            .as_deref()
+                            .expect("fixslice_user_prompt is built for AgentFixSlice"),
+                        fixslice_parent_dir.as_deref(),
+                        Some((target_path.clone(), *max_lines)),
+                    )
+                }
                 _ => unreachable!(),
             };
 
@@ -382,6 +428,31 @@ impl App {
                 self.config.paths.cwd.clone()
             };
 
+            // CB-002: FixSlice is PermissionClass::Confirm, so require approval
+            // before launching the sub-agent. Explore/Plan are Safe and skip this.
+            if kind == SubAgentKind::FixSlice && self.config.mode.approval_required {
+                let spec = self.tools.get("agent.fix_slice");
+                let effective_perm = spec
+                    .map(|s| effective_permission_class(&call.input, s))
+                    .unwrap_or(PermissionClass::Confirm);
+                let tool_kind = spec.map(|s| s.kind).unwrap_or(ToolKind::AgentFixSlice);
+                let trusted = is_trusted(
+                    &call.tool_name,
+                    tool_kind,
+                    effective_perm,
+                    self.trust_all,
+                    &self.trusted_tools,
+                );
+                if !trusted {
+                    let summary = tool_call_approval_summary(call);
+                    let approved = prompt_inline_approval(&summary, None);
+                    if !approved {
+                        agent_results.push(build_failed_result(call, "denied by user".to_string()));
+                        continue;
+                    }
+                }
+            }
+
             let overrides = SubAgentOverrides {
                 model: self.active_model.clone(),
                 context_window: self.active_context_window,
@@ -396,13 +467,192 @@ impl App {
                 overrides,
             );
             let result = session.run();
-            agent_results.push(match result {
-                Ok(r) => r.into_tool_execution_result(call),
-                Err(e) => e.into_tool_execution_result(call),
-            });
+
+            // FixSlice: validate proposal and apply via file.rewrite (Issue #291)
+            if let Some((ref original_target_path, max_lines)) = fixslice_params {
+                // Issue #345: record the invocation *before* handing off to
+                // `handle_fixslice_result` so telemetry reflects every
+                // attempted call, even ones where the worker errors out
+                // before reaching a proposal. This is the signal the session
+                // wrap-up uses to distinguish A1 (escalation, no invocation)
+                // from sessions where the worker ran and failed concretely.
+                self.agent_telemetry.record_fixslice_worker_invocation();
+                match result {
+                    Ok(sub_result) => {
+                        let fix_results = self.handle_fixslice_result(
+                            sub_result,
+                            call,
+                            original_target_path,
+                            max_lines,
+                        );
+                        agent_results.extend(fix_results);
+                    }
+                    Err(e) => {
+                        agent_results.push(e.into_tool_execution_result(call));
+                    }
+                }
+            } else {
+                agent_results.push(match result {
+                    Ok(r) => r.into_tool_execution_result(call),
+                    Err(e) => e.into_tool_execution_result(call),
+                });
+            }
         }
 
         (agent_results, normal_calls)
+    }
+
+    // -----------------------------------------------------------------------
+    // FixSlice result handling (Issue #291)
+    // -----------------------------------------------------------------------
+
+    /// Handle a FixSlice sub-agent result: validate proposal, apply via
+    /// file.rewrite, and return result(s).
+    ///
+    /// Returns up to 2 results: file.rewrite result (if applied) + agent.fix_slice summary.
+    fn handle_fixslice_result(
+        &mut self,
+        sub_result: crate::agent::subagent::SubAgentResult,
+        call: &ToolCallRequest,
+        original_target_path: &str,
+        max_lines: u32,
+    ) -> Vec<ToolExecutionResult> {
+        let proposal = match sub_result.fix_proposal {
+            Some(p) => p,
+            None => {
+                // Worker finished without a valid proposal.
+                // Issue #343: classify *why* the worker didn't produce one so
+                // the runtime and telemetry can distinguish max-iterations
+                // exhaustion from ordinary "finished with no proposal" cases.
+                // Issue #345: the subagent now reports a concrete parse
+                // failure detail (empty final vs parse failure vs no final
+                // on a partial exit). We combine that with the termination
+                // reason to pick the precise classification.
+                let termination = sub_result.payload.termination_reason;
+                let failure_reason = match (termination, sub_result.fix_proposal_failure) {
+                    // Issue #351: subagent-side same-target read oscillation
+                    // guard — classify before the MaxIterations branch so
+                    // the more specific failure class wins.
+                    (
+                        _,
+                        Some(crate::agent::subagent::FixProposalParseFailure::RepeatedReadLoop),
+                    ) => crate::contracts::FixSliceFailureReason::RepeatedReadLoop,
+                    (crate::contracts::TerminationReason::MaxIterations, _) => {
+                        crate::contracts::FixSliceFailureReason::MaxIterationsReached
+                    }
+                    (_, Some(crate::agent::subagent::FixProposalParseFailure::ParseFailed)) => {
+                        crate::contracts::FixSliceFailureReason::ProposalParseFailed
+                    }
+                    _ => crate::contracts::FixSliceFailureReason::NoProposal,
+                };
+                self.agent_telemetry
+                    .record_fixslice_worker_failure(failure_reason);
+                tracing::warn!(
+                    termination = %termination,
+                    failure_reason = %failure_reason,
+                    "fix_slice worker failed to produce proposal"
+                );
+                let summary = format!(
+                    "fix-slice worker {termination}: no valid proposal produced ({failure_reason})"
+                );
+                return vec![build_failed_result_with_text(call, summary)];
+            }
+        };
+
+        // Issue #345: detect path mismatch as its own failure class before
+        // falling into the generic validator. This is the single most
+        // actionable subclass of the B1 shape — the worker is active but
+        // drifted off the target file — and splitting it out lets telemetry
+        // steer recovery (e.g. re-grounding prompts) instead of hiding it
+        // under `proposal_validation_failed`.
+        if proposal.target_path != original_target_path {
+            self.agent_telemetry.record_fixslice_worker_failure(
+                crate::contracts::FixSliceFailureReason::PathMismatch,
+            );
+            tracing::warn!(
+                proposed = %proposal.target_path,
+                expected = %original_target_path,
+                "fix_slice worker proposal path mismatch"
+            );
+            let summary = format!(
+                "fix-slice validation failed: target_path mismatch: proposal '{}' != original '{}'",
+                proposal.target_path, original_target_path
+            );
+            return vec![build_failed_result_with_text(call, summary)];
+        }
+
+        // Validate the proposal
+        if let Err(reason) = validate_fix_proposal(
+            &proposal,
+            original_target_path,
+            max_lines,
+            &self.config.paths.cwd,
+        ) {
+            // Issue #343: proposal produced but validation rejected it.
+            self.agent_telemetry.record_fixslice_worker_failure(
+                crate::contracts::FixSliceFailureReason::ProposalValidationFailed,
+            );
+            tracing::warn!(
+                reason = %reason,
+                "fix_slice worker proposal failed validation"
+            );
+            let summary = format!("fix-slice validation failed: {reason}");
+            return vec![build_failed_result_with_text(call, summary)];
+        }
+
+        // Build file.rewrite execution request and actually execute it (CB-001).
+        let rewrite_request = build_rewrite_request(&proposal, &call.tool_call_id);
+        let rewrite_result = self.execute_single(rewrite_request);
+
+        // Issue #339: flip worker_observed only after a real post-execution
+        // worker mutation. The rewrite must be completed, not rolled back,
+        // and produce a non-empty / non-no-op summary — mirroring the
+        // record_mutation_turn guard so the two telemetry flags stay
+        // consistent.
+        let rewrite_succeeded = rewrite_result.status == ToolExecutionStatus::Completed
+            && !rewrite_result.rolled_back
+            && !rewrite_result.summary.is_empty()
+            && !rewrite_result.summary.contains("(no changes)");
+        if rewrite_succeeded {
+            self.agent_telemetry.record_worker_success();
+        } else {
+            // Issue #343: the worker produced a valid proposal but
+            // file.rewrite did not land a real mutation.
+            self.agent_telemetry.record_fixslice_worker_failure(
+                crate::contracts::FixSliceFailureReason::RewriteFailed,
+            );
+            tracing::warn!(
+                rewrite_status = ?rewrite_result.status,
+                rolled_back = rewrite_result.rolled_back,
+                "fix_slice worker rewrite failed or produced no-op"
+            );
+        }
+
+        // Build agent.fix_slice summary result
+        let rationale = sanitize_for_display(&proposal.rationale);
+        let fix_summary = ToolExecutionResult {
+            tool_call_id: call.tool_call_id.clone(),
+            tool_name: call.tool_name.clone(),
+            status: ToolExecutionStatus::Completed,
+            summary: format!("fix-slice applied: {rationale}"),
+            payload: ToolExecutionPayload::Text(
+                serde_json::json!({
+                    "target_path": proposal.target_path,
+                    "start_line": proposal.start_line,
+                    "end_line": proposal.end_line,
+                    "rationale": rationale,
+                })
+                .to_string(),
+            ),
+            artifacts: Vec::new(),
+            elapsed_ms: 0,
+            diff_summary: None,
+            edit_detail: None,
+            rolled_back: false,
+        };
+
+        // DR3-001: file.rewrite first, then agent.fix_slice summary
+        vec![rewrite_result, fix_summary]
     }
 
     /// Check if the ANVIL_FINAL guard should activate.
@@ -476,6 +726,10 @@ impl App {
         self.loop_detector.reset();
         // Reset alternating loop detector per-turn (Issue #172)
         self.alternating_loop_detector.reset();
+        // Reset closure-mode reasoning loop guard per top-level turn (Issue #349).
+        self.closure_loop_detector.reset();
+        // Reset post-failure tool-active thrash guard per top-level turn (Issue #351).
+        self.post_failure_thrash_detector.reset();
         // Reset phase estimator per-turn counters (Issue #159)
         self.phase_estimator.reset();
         // Reset read transition guard per-turn counters (Issue #216)
@@ -531,6 +785,15 @@ impl App {
         let mut noplan_suppression_count: u8 = 0;
         // Issue #303: pre-mutation plan barrier.
         let mut mutation_barrier = super::mutation_barrier::MutationBarrier::new();
+        // Issue #355: post-escalation fix_slice routing barrier. Suspends
+        // parent-side mutation tools once `agent.fix_slice` escalation has
+        // fired under a `requires_worker_observation` pack and the worker
+        // path has not yet been invoked.
+        let mut escalation_barrier = super::escalation_barrier::EscalationBarrier::new();
+        // Issue #325: track whether a pre-exit repair turn was injected.
+        // When true, the next iteration processes the repair turn's LLM response
+        // before terminating the loop.
+        let mut pre_exit_repair_injected = false;
 
         for iteration in 0..max_iterations {
             let iteration_started = std::time::Instant::now();
@@ -589,8 +852,11 @@ impl App {
             // live streaming output on stderr (Issue #1).
 
             // Execute normal tool calls and record results WITH payload
-            let (results, loop_action, recovery_read_count) =
-                self.execute_structured_tool_calls(&current_normal, &mut mutation_barrier)?;
+            let (results, loop_action, recovery_read_count) = self.execute_structured_tool_calls(
+                &current_normal,
+                &mut mutation_barrier,
+                &mut escalation_barrier,
+            )?;
             total_tool_count += results.len();
 
             // Update plan item status from tool results; capture telemetry.
@@ -704,6 +970,25 @@ impl App {
 
             // Check shutdown flag before LLM call
             if self.is_shutdown_requested() {
+                break;
+            }
+
+            // Issue #355: Post-success early exit under a worker-required pack.
+            // Once `agent.fix_slice` has produced a real worker mutation the
+            // pack expectation is already satisfied; continuing would only
+            // burn LLM turns and eventually the 600s runner timeout without
+            // adding observable evidence. Break cleanly so the session
+            // terminates as `session_completed`.
+            if self
+                .agent_telemetry
+                .should_early_exit_after_worker_success()
+            {
+                self.agent_telemetry.record_worker_required_early_exit();
+                tracing::info!(
+                    worker_observed = self.agent_telemetry.worker_observed,
+                    pack_expectation = ?self.agent_telemetry.pack_expectation,
+                    "worker-required pack satisfied; terminating session early (Issue #355)"
+                );
                 break;
             }
 
@@ -854,6 +1139,84 @@ impl App {
                 );
             }
 
+            // Issue #332: broadened fix_slice escalation.
+            //
+            // The original same-path escalation in EditFailTracker only fires
+            // when one path accumulates `edit_fixslice_threshold` consecutive
+            // failures. In the real drift pattern the model spreads failures
+            // across multiple files, so that threshold is never reached and
+            // the worker path is never observed. Trigger escalation here when
+            // cumulative failures + stagnation score cross the configured
+            // stagnation thresholds and fix_slice has not already escalated.
+            if !self.agent_telemetry.worker_observed
+                && crate::app::edit_fail_tracker::should_escalate_for_stagnation(
+                    self.edit_fail_tracker.total_failures(),
+                    stagnation_score as u32,
+                    self.config.runtime.edit_fixslice_stagnation_total_threshold,
+                    self.config.runtime.edit_fixslice_stagnation_score_threshold,
+                )
+            {
+                tracing::warn!(
+                    score = stagnation_score,
+                    total_failures = self.edit_fail_tracker.total_failures(),
+                    "fixslice_escalation_triggered (stagnation)"
+                );
+                self.agent_telemetry.record_fixslice_escalation_stagnation();
+                let hint = format!(
+                    "\n\n[Anvil ESCALATION] {n} file.edit failures have occurred across \
+                     multiple files and the session has stagnated (score={score}/4). \
+                     You MUST use agent.fix_slice to repair the most troubled file. \
+                     Call agent.fix_slice with target_path pointing at the file you have been \
+                     trying to modify, and a goal describing the intended change. Do NOT \
+                     retry file.edit on the same paths — use agent.fix_slice now.",
+                    n = self.edit_fail_tracker.total_failures(),
+                    score = stagnation_score,
+                );
+                let msg = SessionMessage::new(MessageRole::Tool, "system", hint)
+                    .with_id(self.next_message_id("tool"));
+                self.session.push_message(msg);
+            }
+
+            // Issue #334: read-heavy drift escalation.
+            //
+            // Issue #332 still requires cumulative edit failures. A session
+            // dominated by reads / audits that never attempts an edit cannot
+            // cross that threshold, so it drifts through repeated reads,
+            // plan repair, and pre-exit repair without reaching the worker
+            // path. Fire escalation here when the stagnation score is high
+            // and no mutation has been observed at all.
+            if !self.agent_telemetry.worker_observed
+                && crate::app::edit_fail_tracker::should_escalate_for_read_heavy_drift(
+                    stagnation_score as u32,
+                    self.agent_telemetry.mutation_observed,
+                    self.stagnation_state.turns_since_last_mutation as u32,
+                    self.config.runtime.edit_fixslice_read_heavy_score_threshold,
+                    self.config
+                        .runtime
+                        .edit_fixslice_read_heavy_drought_threshold,
+                )
+            {
+                tracing::warn!(
+                    score = stagnation_score,
+                    drought = self.stagnation_state.turns_since_last_mutation,
+                    "fixslice_escalation_triggered (read_heavy)"
+                );
+                self.agent_telemetry.record_fixslice_escalation_stagnation();
+                let hint = format!(
+                    "\n\n[Anvil ESCALATION] The session has stagnated on reads / audits \
+                     (score={score}/4, {drought} turns without any mutation). You MUST stop \
+                     reading and call agent.fix_slice on the most relevant target file to \
+                     produce a concrete change. Pick a target_path from the active plan \
+                     and supply a goal describing the mutation you intend to make. Do NOT \
+                     read or search further before calling agent.fix_slice.",
+                    score = stagnation_score,
+                    drought = self.stagnation_state.turns_since_last_mutation,
+                );
+                let msg = SessionMessage::new(MessageRole::Tool, "system", hint)
+                    .with_id(self.next_message_id("tool"));
+                self.session.push_message(msg);
+            }
+
             // Issue #285: staged stagnation recovery.
             let remaining_turns = max_iterations.saturating_sub(iteration + 1);
             let plan_repair_count_before_this_turn =
@@ -864,71 +1227,24 @@ impl App {
                 self.agent_telemetry.record_forced_workset_transition();
             }
 
-            // Plan repair request.
-            if crate::app::stagnation_state::should_request_plan_repair(
-                &self.stagnation_state,
-                plan_repair_count_before_this_turn,
-                remaining_turns,
-            ) {
-                let msg_text = crate::app::stagnation_state::build_plan_repair_message(
-                    &self.stagnation_state.starved_target_files,
-                );
-                let msg = SessionMessage::new(MessageRole::Tool, "system", msg_text)
-                    .with_id(self.next_message_id("tool"));
-                self.session.push_message(msg);
-                self.agent_telemetry.record_plan_repair_request();
-            } else {
-                // Escape hatch: plan repair was already attempted but stagnation persists.
-                if crate::app::stagnation_state::should_allow_escape_hatch(
-                    &self.stagnation_state,
-                    plan_repair_count_before_this_turn,
-                    remaining_turns,
-                ) {
-                    // Issue #309: inject structured repair turn before termination.
-                    // Give the agent one last chance to close remaining items.
-                    if !self.execution_plan.is_empty()
-                        && !self.execution_plan.is_successfully_completed()
-                    {
-                        let repair_msg = self.build_pre_exit_repair_message();
-                        let msg = SessionMessage::new(MessageRole::Tool, "system", repair_msg)
-                            .with_id(self.next_message_id("tool"));
-                        self.session.push_message(msg);
-                        tracing::info!("pre-exit repair turn injected before escape hatch");
-                    }
-                    tracing::warn!(
-                        score = stagnation_score,
-                        "stagnation escape hatch: terminating loop"
-                    );
-                    break;
-                }
-            }
-
-            // Update prev_forced_mode_active at turn end.
-            prev_forced_mode_active = self.forced_mode_active;
-
-            log_turn_summary(&TurnSummary {
-                turn: self.session_stats.total_turns,
-                max_turns: max_iterations as u32,
-                elapsed: iteration_started.elapsed(),
-                tokens_used: used_tokens,
-                token_budget,
-                tool_calls: turn_tool_count,
-                tool_names: &turn_tool_names,
-                files_modified: turn_files_modified,
-                compact_info: self.last_compact_info.as_ref(),
-                phase: self.phase_estimator.current_phase(),
-                mutations_this_turn: Some(turn_mutations),
-                items_advanced_this_turn: Some(turn_items_advanced),
-            });
-            // Reset last_compact_info after it's been consumed by the turn summary
-            self.last_compact_info = None;
-
+            // Issue #323: Process ANVIL_PLAN / ANVIL_PLAN_UPDATE / ANVIL_FINAL from
+            // the current response BEFORE evaluating escape hatch. Without this,
+            // a late zero-tool-call response containing a corrective ANVIL_PLAN_UPDATE
+            // with checked [x] items gets dropped when the escape hatch breaks the loop.
+            //
             // Issue #249: Detect ANVIL_PLAN / ANVIL_PLAN_UPDATE from follow-up responses.
             // Scan the raw token buffer since ANVIL_PLAN may be outside the ANVIL_FINAL block.
             // Issue #287: re-initialize stagnation_state on plan registration
             // Issue #305: match on PlanRegistrationResult for replan support
             match self.try_register_plan(&next_token_buffer) {
                 crate::app::execution_plan::PlanRegistrationResult::Registered => {
+                    // Issue #349: a newly registered plan is a fresh course
+                    // of action — clear any accumulated closure-loop state.
+                    self.closure_loop_detector.reset();
+                    // Issue #351: same rationale for the post-failure thrash
+                    // counter — a freshly registered plan is real progress,
+                    // regardless of prior worker failures.
+                    self.post_failure_thrash_detector.reset();
                     let target_files: Vec<String> = self
                         .execution_plan
                         .items
@@ -941,6 +1257,10 @@ impl App {
                         );
                 }
                 crate::app::execution_plan::PlanRegistrationResult::Replan => {
+                    // Issue #349: replan is also a change of course.
+                    self.closure_loop_detector.reset();
+                    // Issue #351: replan clears the thrash counter too.
+                    self.post_failure_thrash_detector.reset();
                     // Replan: stagnation_state を差分マージ (Issue #305)
                     let existing = &self.stagnation_state.starved_target_files;
                     let new_targets: Vec<String> = self
@@ -990,6 +1310,234 @@ impl App {
                 anvil_final_seen = true;
                 self.phase_estimator.observe_anvil_final();
             }
+
+            // Issue #349: closure-mode reasoning loop guard.
+            //
+            // After `agent.fix_slice` has failed at least once without a
+            // subsequent worker success, a zero-tool-call reasoning response
+            // from the parent agent is the shape that historically stalled
+            // phase-bench cycles 8 and 9 until the 600s runner timeout. We
+            // fingerprint such responses and escalate when the same cut
+            // point reappears (exact or paraphrased): Warn → StrongWarn →
+            // Break. Responses with tool calls, worker success, or without
+            // a prior fix_slice failure clear the accumulator — the
+            // detector only stays armed while the closure-loop preconditions
+            // actually hold.
+            let guard_armed = !self.agent_telemetry.worker_observed
+                && self.agent_telemetry.fixslice_worker_failure_count > 0
+                && next_structured.tool_calls.is_empty();
+            if guard_armed {
+                let action = self
+                    .closure_loop_detector
+                    .record_and_check(&next_structured.raw_content);
+                match action {
+                    super::loop_detector::LoopAction::Continue => {}
+                    super::loop_detector::LoopAction::Warn(msg)
+                    | super::loop_detector::LoopAction::StrongWarn(msg) => {
+                        tracing::warn!(
+                            fixslice_worker_failure_count =
+                                self.agent_telemetry.fixslice_worker_failure_count,
+                            "closure_loop_guard: injecting escalation hint"
+                        );
+                        let hint_msg = SessionMessage::new(MessageRole::Tool, "system", msg)
+                            .with_id(self.next_message_id("tool"));
+                        self.session.push_message(hint_msg);
+                    }
+                    super::loop_detector::LoopAction::Break(msg) => {
+                        tracing::warn!(
+                            reason = "closure_loop_guard",
+                            message = %msg,
+                            fixslice_worker_failure_count =
+                                self.agent_telemetry.fixslice_worker_failure_count,
+                            "agentic loop terminated by closure-mode reasoning guard"
+                        );
+                        break;
+                    }
+                }
+            } else {
+                self.closure_loop_detector.reset();
+            }
+
+            // Issue #351: parent-side post-failure tool-active thrash guard.
+            //
+            // The closure_loop_detector above only fires on zero-tool-call
+            // reasoning responses. The complementary B2 shape from cycle 10
+            // is a tool-active thrash: the parent keeps calling file.read /
+            // file.search / shell.exec after a fix_slice worker failure but
+            // the execution plan never advances, so the runner times out at
+            // 600s. Track consecutive no-progress turns here and escalate
+            // through the Warn → StrongWarn → Break ladder.
+            let thrash_armed = !self.agent_telemetry.worker_observed
+                && self.agent_telemetry.fixslice_worker_failure_count > 0;
+            if thrash_armed {
+                let had_tool_calls = !results.is_empty();
+                let plan_advanced = turn_items_advanced > 0 || turn_mutations > 0;
+                let action = self
+                    .post_failure_thrash_detector
+                    .record_turn(had_tool_calls, plan_advanced);
+                match action {
+                    super::loop_detector::LoopAction::Continue => {}
+                    super::loop_detector::LoopAction::Warn(msg)
+                    | super::loop_detector::LoopAction::StrongWarn(msg) => {
+                        tracing::warn!(
+                            no_progress_turns =
+                                self.post_failure_thrash_detector.no_progress_turns(),
+                            fixslice_worker_failure_count =
+                                self.agent_telemetry.fixslice_worker_failure_count,
+                            "post_failure_thrash_guard: injecting escalation hint"
+                        );
+                        let hint_msg = SessionMessage::new(MessageRole::Tool, "system", msg)
+                            .with_id(self.next_message_id("tool"));
+                        self.session.push_message(hint_msg);
+                    }
+                    super::loop_detector::LoopAction::Break(msg) => {
+                        tracing::warn!(
+                            reason = "post_failure_thrash_guard",
+                            message = %msg,
+                            no_progress_turns =
+                                self.post_failure_thrash_detector.no_progress_turns(),
+                            fixslice_worker_failure_count =
+                                self.agent_telemetry.fixslice_worker_failure_count,
+                            "agentic loop terminated by post-failure thrash guard"
+                        );
+                        break;
+                    }
+                }
+            } else {
+                self.post_failure_thrash_detector.reset();
+            }
+
+            // Issue #325 + Issue #327: if the pre-exit repair turn was injected on
+            // the previous iteration, the LLM has now consumed it and responded.
+            // Decide termination based on the resulting plan state, not just the
+            // fact that one repair response was consumed.
+            if pre_exit_repair_injected {
+                self.agent_telemetry.record_pre_exit_repair_consumed();
+                let pending_after = self
+                    .execution_plan
+                    .items
+                    .iter()
+                    .filter(|i| !i.is_finished())
+                    .count() as u32;
+                self.agent_telemetry
+                    .record_repair_turn_pending_after(pending_after);
+
+                if self.execution_plan.is_cleanly_finished() {
+                    tracing::info!(
+                        pending_after,
+                        "pre-exit repair turn consumed; plan cleanly finished"
+                    );
+                } else {
+                    tracing::info!(
+                        pending_after,
+                        "pre-exit repair turn consumed; plan still incomplete, \
+                         terminating (unchecked expansion was rejected)"
+                    );
+                }
+                break;
+            }
+
+            // Plan repair request.
+            if crate::app::stagnation_state::should_request_plan_repair(
+                &self.stagnation_state,
+                plan_repair_count_before_this_turn,
+                remaining_turns,
+            ) {
+                let msg_text = crate::app::stagnation_state::build_plan_repair_message(
+                    &self.stagnation_state.starved_target_files,
+                );
+                let msg = SessionMessage::new(MessageRole::Tool, "system", msg_text)
+                    .with_id(self.next_message_id("tool"));
+                self.session.push_message(msg);
+                self.agent_telemetry.record_plan_repair_request();
+            } else {
+                // Escape hatch: plan repair was already attempted but stagnation persists.
+                if crate::app::stagnation_state::should_allow_escape_hatch(
+                    &self.stagnation_state,
+                    plan_repair_count_before_this_turn,
+                    remaining_turns,
+                ) {
+                    // Issue #325: inject structured repair turn and continue for one
+                    // more LLM turn so the model actually sees the repair message.
+                    // Previously (Issue #309) the message was injected then immediately
+                    // discarded by the same-branch `break`.
+                    if !self.execution_plan.is_empty()
+                        && !self.execution_plan.is_successfully_completed()
+                    {
+                        // Issue #343: under a `requires_worker_observation`
+                        // pack, skip the pre-exit repair turn once the worker
+                        // path has already failed. Otherwise the repair turn
+                        // flips `repair_turn_observed`, lets parent-side
+                        // `file.edit` salvage the session, and ends in
+                        // `completion_kind=partial` — exactly the A1 shape
+                        // the benchmark runner rejects.
+                        if self
+                            .agent_telemetry
+                            .should_skip_pre_exit_repair_for_worker_failure()
+                        {
+                            tracing::warn!(
+                                score = stagnation_score,
+                                failure_reason = ?self.agent_telemetry.fixslice_failure_reason,
+                                fixslice_worker_failure_count =
+                                    self.agent_telemetry.fixslice_worker_failure_count,
+                                "worker-required pack + fix_slice failure: \
+                                 skipping pre-exit repair turn (Issue #343)"
+                            );
+                            break;
+                        }
+
+                        // Issue #327: record pending count before repair and activate
+                        // closure mode to reject unchecked plan expansion.
+                        let pending_before = self
+                            .execution_plan
+                            .items
+                            .iter()
+                            .filter(|i| !i.is_finished())
+                            .count() as u32;
+                        self.agent_telemetry
+                            .record_repair_turn_pending_before(pending_before);
+                        self.repair_closure_active = true;
+
+                        let repair_msg = self.build_pre_exit_repair_message();
+                        let msg = SessionMessage::new(MessageRole::Tool, "system", repair_msg)
+                            .with_id(self.next_message_id("tool"));
+                        self.session.push_message(msg);
+                        self.agent_telemetry.record_pre_exit_repair_injected();
+                        tracing::info!(
+                            pending_before,
+                            "pre-exit repair turn injected; continuing for one more LLM turn"
+                        );
+                        pre_exit_repair_injected = true;
+                        current = next_structured;
+                        continue;
+                    }
+                    tracing::warn!(
+                        score = stagnation_score,
+                        "stagnation escape hatch: terminating loop"
+                    );
+                    break;
+                }
+            }
+
+            // Update prev_forced_mode_active at turn end.
+            prev_forced_mode_active = self.forced_mode_active;
+
+            log_turn_summary(&TurnSummary {
+                turn: self.session_stats.total_turns,
+                max_turns: max_iterations as u32,
+                elapsed: iteration_started.elapsed(),
+                tokens_used: used_tokens,
+                token_budget,
+                tool_calls: turn_tool_count,
+                tool_names: &turn_tool_names,
+                files_modified: turn_files_modified,
+                compact_info: self.last_compact_info.as_ref(),
+                phase: self.phase_estimator.current_phase(),
+                mutations_this_turn: Some(turn_mutations),
+                items_advanced_this_turn: Some(turn_items_advanced),
+            });
+            // Reset last_compact_info after it's been consumed by the turn summary
+            self.last_compact_info = None;
 
             if next_structured.tool_calls.is_empty() {
                 if awaiting_guidance_followup {
@@ -1361,6 +1909,7 @@ impl App {
         &mut self,
         structured: &StructuredAssistantResponse,
         mutation_barrier: &mut super::mutation_barrier::MutationBarrier,
+        escalation_barrier: &mut super::escalation_barrier::EscalationBarrier,
     ) -> Result<
         (
             Vec<ToolExecutionResult>,
@@ -1454,6 +2003,30 @@ impl App {
         failed_results.extend(barrier_result.blocked_results);
         if barrier_result.blocked_count > 0 {
             self.agent_telemetry.record_mutation_barrier_block();
+        }
+
+        // Phase 1.85: Post-escalation fix_slice routing barrier (Issue #355).
+        // Once fix_slice escalation has fired under a `requires_worker_observation`
+        // pack and `agent.fix_slice` has not yet been invoked, parent-side
+        // mutation tools (file.edit / file.write / file.edit_anchor) are
+        // suspended so the LLM is forced onto the worker path.
+        let force_fixslice = self.agent_telemetry.should_force_fixslice_routing();
+        let escalation_result =
+            escalation_barrier.check_and_filter(validated_requests, force_fixslice);
+        let validated_requests = escalation_result.passed_requests;
+        let escalation_blocked = escalation_result.blocked_count;
+        failed_results.extend(escalation_result.blocked_results);
+        if escalation_blocked > 0 {
+            for _ in 0..escalation_blocked {
+                self.agent_telemetry.record_escalation_barrier_block();
+            }
+            tracing::warn!(
+                blocked = escalation_blocked,
+                fixslice_escalation_count = self.agent_telemetry.fixslice_escalation_count,
+                fixslice_worker_invocation_count =
+                    self.agent_telemetry.fixslice_worker_invocation_count,
+                "escalation_barrier: blocked parent-side mutation(s); forcing agent.fix_slice"
+            );
         }
 
         // Loop detection: record each validated tool call and check for repetition (Issue #145, #172)
@@ -1609,7 +2182,10 @@ impl App {
             tool_kind_map.get(tool_call_id).is_some_and(|kind| {
                 matches!(
                     kind,
-                    ToolKind::FileWrite | ToolKind::FileEdit | ToolKind::FileEditAnchor
+                    ToolKind::FileWrite
+                        | ToolKind::FileEdit
+                        | ToolKind::FileEditAnchor
+                        | ToolKind::FileRewrite
                 )
             })
         };
@@ -1879,7 +2455,7 @@ impl App {
         // Working memory: track touched files (file-mutating tools only) (Issue #130, #157)
         let is_file_tool = matches!(
             result.tool_name.as_str(),
-            "file.write" | "file.edit" | "file.edit_anchor"
+            "file.write" | "file.edit" | "file.edit_anchor" | "file.rewrite"
         );
         if is_file_tool
             && result.status == ToolExecutionStatus::Completed
@@ -1916,7 +2492,9 @@ impl App {
         let mut edit_hint: Option<String> = None;
         let is_barrier_blocked = result.summary.starts_with("[plan_barrier]");
         if !is_barrier_blocked
-            && (result.tool_name == "file.edit" || result.tool_name == "file.edit_anchor")
+            && (result.tool_name == "file.edit"
+                || result.tool_name == "file.edit_anchor"
+                || result.tool_name == "file.rewrite")
         {
             if result.status == ToolExecutionStatus::Failed {
                 if let Some(raw_path) = extract_edit_path_from_summary(&result.summary) {
@@ -2012,6 +2590,23 @@ impl App {
                                      with the corrected version."
                                 ));
                             }
+                        }
+                        crate::app::edit_fail_tracker::EditFallbackAction::FixSliceEscalation => {
+                            tracing::warn!(
+                                tool = "file.edit",
+                                path = %path,
+                                count = count,
+                                "fixslice_escalation_triggered"
+                            );
+                            self.agent_telemetry.record_fixslice_escalation();
+                            edit_hint = Some(format!(
+                                "\n\n[Anvil ESCALATION] file.edit has failed {count} consecutive \
+                                 times for '{path}'. You MUST use agent.fix_slice to repair this \
+                                 file. Call agent.fix_slice with target_path=\"{path}\" and a goal \
+                                 describing what needs to be changed. The fix_slice worker will \
+                                 read the file, produce a bounded replacement, and apply it. \
+                                 Do NOT retry file.edit on this path — use agent.fix_slice now."
+                            ));
                         }
                     }
                 }
@@ -2150,7 +2745,7 @@ impl App {
     /// Track consecutive file.write failures and repeated successful writes,
     /// returning a hint if either threshold is reached.
     fn update_write_trackers(&mut self, result: &ToolExecutionResult) -> Option<String> {
-        if result.tool_name != "file.write" {
+        if result.tool_name != "file.write" && result.tool_name != "file.rewrite" {
             return None;
         }
         if result.status == ToolExecutionStatus::Failed {
@@ -2490,6 +3085,20 @@ pub(crate) fn infer_plan_from_structured_response(
             crate::tooling::ToolInput::FileEditAnchor { path, .. } => {
                 format!("edit (anchor) {path}")
             }
+            crate::tooling::ToolInput::FileRewrite {
+                path,
+                start_line,
+                end_line,
+                ..
+            } => {
+                format!("rewrite {path} (lines {start_line}-{end_line})")
+            }
+            crate::tooling::ToolInput::AgentFixSlice {
+                target_path, goal, ..
+            } => {
+                let truncated = truncate_chars(goal, 50);
+                format!("fix_slice: {target_path} — {truncated}")
+            }
         };
         plan.push(item);
     }
@@ -2653,6 +3262,25 @@ fn build_failed_result(
     }
 }
 
+/// Build a failed [`ToolExecutionResult`] with the summary echoed as text payload.
+fn build_failed_result_with_text(
+    call: &crate::tooling::ToolCallRequest,
+    summary: String,
+) -> ToolExecutionResult {
+    ToolExecutionResult {
+        tool_call_id: call.tool_call_id.clone(),
+        tool_name: call.tool_name.clone(),
+        status: crate::tooling::ToolExecutionStatus::Failed,
+        summary: summary.clone(),
+        payload: crate::tooling::ToolExecutionPayload::Text(summary),
+        artifacts: Vec::new(),
+        elapsed_ms: 0,
+        diff_summary: None,
+        edit_detail: None,
+        rolled_back: false,
+    }
+}
+
 /// Produce a human-readable summary of a tool call for the approval prompt.
 fn tool_call_approval_summary(call: &crate::tooling::ToolCallRequest) -> String {
     match &call.input {
@@ -2664,6 +3292,14 @@ fn tool_call_approval_summary(call: &crate::tooling::ToolCallRequest) -> String 
         }
         crate::tooling::ToolInput::FileEdit { path, .. } => {
             format!("{}: {path}", call.tool_name)
+        }
+        crate::tooling::ToolInput::FileRewrite {
+            path,
+            start_line,
+            end_line,
+            ..
+        } => {
+            format!("file.rewrite: {path} (lines {start_line}-{end_line})")
         }
         crate::tooling::ToolInput::WebFetch { url } => {
             format!("{}: {url}", call.tool_name)
@@ -2693,6 +3329,12 @@ fn tool_call_approval_summary(call: &crate::tooling::ToolCallRequest) -> String 
             let truncated = truncate_chars(prompt, 100);
             format!("agent.plan [scope: {scope_info}]: {truncated}")
         }
+        crate::tooling::ToolInput::AgentFixSlice {
+            target_path, goal, ..
+        } => {
+            let truncated = truncate_chars(goal, 100);
+            format!("agent.fix_slice [target: {target_path}]: {truncated}")
+        }
         _ => call.tool_name.clone(),
     }
 }
@@ -2713,6 +3355,130 @@ fn prompt_inline_approval(summary: &str, diff_preview: Option<&str>) -> bool {
     } else {
         false
     }
+}
+
+// ---------------------------------------------------------------------------
+// FixSlice helpers (Issue #291)
+// ---------------------------------------------------------------------------
+
+/// Validate a FixSlice proposal from the sub-agent.
+///
+/// Checks:
+/// - `target_path` matches the parent-specified path
+/// - `replacement_content` is non-empty
+/// - Line range fits within `max_lines`
+/// - `target_path` resolves within the sandbox
+/// - No control characters in `target_path`
+pub fn validate_fix_proposal(
+    proposal: &crate::contracts::FixSliceProposal,
+    original_target_path: &str,
+    max_lines: u32,
+    sandbox_root: &std::path::Path,
+) -> Result<(), String> {
+    // Control character check
+    if proposal.target_path.chars().any(|c| c.is_control()) {
+        return Err("target_path contains control characters".to_string());
+    }
+
+    // Path match check
+    if proposal.target_path != original_target_path {
+        return Err(format!(
+            "target_path mismatch: proposal '{}' != original '{}'",
+            proposal.target_path, original_target_path
+        ));
+    }
+
+    // Sandbox check
+    if resolve_sandbox_path(sandbox_root, &proposal.target_path).is_err() {
+        return Err(format!(
+            "target_path sandbox violation: {}",
+            proposal.target_path
+        ));
+    }
+
+    // Non-empty replacement
+    if proposal.replacement_content.is_empty() {
+        return Err("replacement_content must not be empty".to_string());
+    }
+
+    // Line range within max_lines
+    let span = proposal.end_line.saturating_sub(proposal.start_line) + 1;
+    if span > max_lines {
+        return Err(format!(
+            "line range ({} lines) exceeds max_lines ({})",
+            span, max_lines
+        ));
+    }
+
+    Ok(())
+}
+
+/// Build a `ToolExecutionRequest` for applying a FixSlice proposal via file.rewrite.
+pub fn build_rewrite_request(
+    proposal: &crate::contracts::FixSliceProposal,
+    parent_call_id: &str,
+) -> ToolExecutionRequest {
+    use crate::tooling::{ExecutionClass, PlanModePolicy, RollbackPolicy, ToolSpec};
+    ToolExecutionRequest {
+        spec: ToolSpec {
+            version: 1,
+            name: "file.rewrite".to_string(),
+            kind: ToolKind::FileRewrite,
+            execution_class: ExecutionClass::Mutating,
+            permission_class: PermissionClass::Confirm,
+            execution_mode: ExecutionMode::SequentialOnly,
+            plan_mode: PlanModePolicy::Allowed,
+            rollback_policy: RollbackPolicy::CheckpointBeforeWrite,
+        },
+        input: ToolInput::FileRewrite {
+            path: proposal.target_path.clone(),
+            start_line: proposal.start_line,
+            end_line: proposal.end_line,
+            content: proposal.replacement_content.clone(),
+        },
+        tool_call_id: format!("{parent_call_id}_rewrite"),
+        extra_field_warnings: Vec::new(),
+    }
+}
+
+/// Build the FixSlice sub-agent user prompt from structured parameters.
+///
+/// The worker's correctness depends on knowing exactly which file to edit
+/// and how many lines its proposal may span. Passing only the free-form
+/// `goal` leaves the worker to guess the target file (Issue #341), so we
+/// embed `target_path` and `max_lines` explicitly alongside the goal.
+pub fn build_fixslice_user_prompt(target_path: &str, goal: &str, max_lines: u32) -> String {
+    format!(
+        "FixSlice task — target file is fixed.\n\
+         \n\
+         target_path: {target_path}\n\
+         max_lines: {max_lines}\n\
+         \n\
+         goal:\n{goal}\n\
+         \n\
+         Procedure:\n\
+         1. Read `{target_path}` first with file.read to locate the exact lines to change.\n\
+         2. Return a single JSON proposal inside ANVIL_FINAL whose `target_path` equals `{target_path}` exactly.\n\
+         3. Keep the `end_line - start_line + 1` span within {max_lines} lines.\n\
+         4. Do not explore unrelated files; the edit must stay on the target.\n\
+         \n\
+         IMPORTANT GUIDANCE:\n\
+         - If file.read returns a slightly different path form (e.g., ./src/ vs src/), use \
+         the ORIGINAL target_path `{target_path}` from this prompt in your proposal. \
+         Do not block on resolving path ambiguity.\n\
+         - Partial file context is acceptable. You do not need to read the entire file \
+         before proposing a fix.\n\
+         - It is better to submit an imperfect proposal than to submit no proposal. \
+         Anvil will validate your proposal and retry if needed.\n\
+         - Focus on producing the FixSliceProposal JSON, not on explaining your reasoning."
+    )
+}
+
+/// Remove control characters from a string for safe display in summaries.
+fn sanitize_for_display(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control() || *c == '\n')
+        .collect()
 }
 
 /// Truncate a string to at most `max_chars` Unicode characters, appending

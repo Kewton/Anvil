@@ -3043,6 +3043,8 @@ fn subagent_result_into_tool_execution_result_json_payload() {
         },
         estimated_tokens: 100,
         iterations_used: 2,
+        fix_proposal: None,
+        fix_proposal_failure: None,
     };
 
     let tool_result = result.into_tool_execution_result(&call);
@@ -3079,6 +3081,8 @@ fn subagent_result_timeout_into_tool_execution_result() {
         payload: SubAgentPayload::fallback("partial work".to_string(), TerminationReason::Timeout),
         estimated_tokens: 0,
         iterations_used: 5,
+        fix_proposal: None,
+        fix_proposal_failure: None,
     };
 
     let tool_result = result.into_tool_execution_result(&call);
@@ -6373,4 +6377,346 @@ fn file_write_different_content_produces_diff() {
         result.diff_summary.is_some(),
         "different-content write should produce diff_summary"
     );
+}
+
+// ============================================================
+// file.rewrite tests (Issue #290)
+// ============================================================
+
+#[test]
+fn file_rewrite_basic_success() {
+    let root = std::env::temp_dir().join("anvil_rewrite_basic");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("dir should exist");
+    fs::write(root.join("test.rs"), "line1\nline2\nline3\nline4\nline5\n")
+        .expect("write should succeed");
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
+    let result = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_rewrite_001".to_string(),
+            spec: build_registry()
+                .get("file.rewrite")
+                .expect("file.rewrite spec")
+                .clone(),
+            input: ToolInput::FileRewrite {
+                path: "./test.rs".to_string(),
+                start_line: 2,
+                end_line: 4,
+                content: "new2\nnew3\nnew4".to_string(),
+            },
+            extra_field_warnings: vec![],
+        })
+        .expect("rewrite should succeed");
+
+    assert_eq!(result.status, ToolExecutionStatus::Completed);
+    let content = fs::read_to_string(root.join("test.rs")).expect("read should succeed");
+    assert_eq!(content, "line1\nnew2\nnew3\nnew4\nline5\n");
+    assert!(!result.artifacts.is_empty());
+}
+
+#[test]
+fn file_rewrite_single_line() {
+    let root = std::env::temp_dir().join("anvil_rewrite_single");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("dir should exist");
+    fs::write(root.join("test.rs"), "aaa\nbbb\nccc\n").expect("write should succeed");
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
+    let result = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_rewrite_002".to_string(),
+            spec: build_registry()
+                .get("file.rewrite")
+                .expect("file.rewrite spec")
+                .clone(),
+            input: ToolInput::FileRewrite {
+                path: "./test.rs".to_string(),
+                start_line: 2,
+                end_line: 2,
+                content: "BBB".to_string(),
+            },
+            extra_field_warnings: vec![],
+        })
+        .expect("rewrite should succeed");
+
+    assert_eq!(result.status, ToolExecutionStatus::Completed);
+    let content = fs::read_to_string(root.join("test.rs")).expect("read should succeed");
+    assert_eq!(content, "aaa\nBBB\nccc\n");
+}
+
+#[test]
+fn file_rewrite_last_lines() {
+    let root = std::env::temp_dir().join("anvil_rewrite_last");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("dir should exist");
+    fs::write(root.join("test.rs"), "line1\nline2\nline3\n").expect("write should succeed");
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
+    let result = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_rewrite_003".to_string(),
+            spec: build_registry()
+                .get("file.rewrite")
+                .expect("file.rewrite spec")
+                .clone(),
+            input: ToolInput::FileRewrite {
+                path: "./test.rs".to_string(),
+                start_line: 2,
+                end_line: 3,
+                content: "replaced2\nreplaced3".to_string(),
+            },
+            extra_field_warnings: vec![],
+        })
+        .expect("rewrite should succeed");
+
+    assert_eq!(result.status, ToolExecutionStatus::Completed);
+    let content = fs::read_to_string(root.join("test.rs")).expect("read should succeed");
+    assert_eq!(content, "line1\nreplaced2\nreplaced3\n");
+}
+
+#[test]
+fn file_rewrite_invalid_range() {
+    // Validation catches end_line < start_line before execution
+    // This is caught by validate_required_fields
+    let registry = build_registry();
+    let err = registry.validate(ToolCallRequest::new(
+        "call_rewrite_invalid",
+        "file.rewrite",
+        ToolInput::FileRewrite {
+            path: "./test.rs".to_string(),
+            start_line: 3,
+            end_line: 1,
+            content: "x".to_string(),
+        },
+    ));
+    assert!(err.is_err(), "end_line < start_line should fail validation");
+}
+
+#[test]
+fn file_rewrite_out_of_bounds() {
+    let root = std::env::temp_dir().join("anvil_rewrite_oob");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("dir should exist");
+    fs::write(root.join("test.rs"), "line1\nline2\nline3\n").expect("write should succeed");
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
+    let result = executor.execute(ToolExecutionRequest {
+        tool_call_id: "call_rewrite_005".to_string(),
+        spec: build_registry()
+            .get("file.rewrite")
+            .expect("file.rewrite spec")
+            .clone(),
+        input: ToolInput::FileRewrite {
+            path: "./test.rs".to_string(),
+            start_line: 1,
+            end_line: 10,
+            content: "x".to_string(),
+        },
+        extra_field_warnings: vec![],
+    });
+
+    assert!(result.is_err(), "out of bounds should fail");
+    let err_str = result.unwrap_err().to_string();
+    assert!(
+        err_str.contains("invalid line range"),
+        "error should mention invalid line range, got: {err_str}"
+    );
+}
+
+#[test]
+fn file_rewrite_noop() {
+    let root = std::env::temp_dir().join("anvil_rewrite_noop");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("dir should exist");
+    fs::write(root.join("test.rs"), "line1\nline2\nline3\n").expect("write should succeed");
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
+    let result = executor.execute(ToolExecutionRequest {
+        tool_call_id: "call_rewrite_006".to_string(),
+        spec: build_registry()
+            .get("file.rewrite")
+            .expect("file.rewrite spec")
+            .clone(),
+        input: ToolInput::FileRewrite {
+            path: "./test.rs".to_string(),
+            start_line: 2,
+            end_line: 2,
+            content: "line2".to_string(),
+        },
+        extra_field_warnings: vec![],
+    });
+
+    assert!(result.is_err(), "no-op should fail");
+    let err_str = result.unwrap_err().to_string();
+    assert!(
+        err_str.contains("identical"),
+        "error should mention identical content, got: {err_str}"
+    );
+}
+
+#[test]
+fn file_rewrite_empty_content_deletes_lines() {
+    let root = std::env::temp_dir().join("anvil_rewrite_empty");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("dir should exist");
+    fs::write(root.join("test.rs"), "line1\nline2\nline3\nline4\n").expect("write should succeed");
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
+    let result = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_rewrite_007".to_string(),
+            spec: build_registry()
+                .get("file.rewrite")
+                .expect("file.rewrite spec")
+                .clone(),
+            input: ToolInput::FileRewrite {
+                path: "./test.rs".to_string(),
+                start_line: 2,
+                end_line: 3,
+                content: String::new(),
+            },
+            extra_field_warnings: vec![],
+        })
+        .expect("rewrite should succeed");
+
+    assert_eq!(result.status, ToolExecutionStatus::Completed);
+    let content = fs::read_to_string(root.join("test.rs")).expect("read should succeed");
+    assert_eq!(content, "line1\nline4\n");
+}
+
+#[test]
+fn file_rewrite_empty_path_fails_validation() {
+    let registry = build_registry();
+    let err = registry.validate(ToolCallRequest::new(
+        "call_rewrite_empty_path",
+        "file.rewrite",
+        ToolInput::FileRewrite {
+            path: String::new(),
+            start_line: 1,
+            end_line: 1,
+            content: "x".to_string(),
+        },
+    ));
+    assert!(matches!(
+        err,
+        Err(ToolValidationError::MissingRequiredField(ref f)) if f == "path"
+    ));
+}
+
+#[test]
+fn file_rewrite_from_json() {
+    let json = serde_json::json!({
+        "path": "./src/main.rs",
+        "start_line": 5,
+        "end_line": 10,
+        "content": "new code"
+    });
+    let input = ToolInput::from_json("file.rewrite", &json).expect("parse should succeed");
+    assert_eq!(
+        input,
+        ToolInput::FileRewrite {
+            path: "./src/main.rs".to_string(),
+            start_line: 5,
+            end_line: 10,
+            content: "new code".to_string(),
+        }
+    );
+}
+
+#[test]
+fn file_rewrite_from_json_missing_start_line() {
+    let json = serde_json::json!({
+        "path": "./src/main.rs",
+        "end_line": 10,
+        "content": "new code"
+    });
+    let result = ToolInput::from_json("file.rewrite", &json);
+    assert!(result.is_err(), "missing start_line should fail");
+}
+
+#[test]
+fn file_rewrite_diff_summary() {
+    let root = std::env::temp_dir().join("anvil_rewrite_diff");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("dir should exist");
+    fs::write(root.join("test.rs"), "aaa\nbbb\nccc\n").expect("write should succeed");
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
+    let result = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_rewrite_diff".to_string(),
+            spec: build_registry()
+                .get("file.rewrite")
+                .expect("file.rewrite spec")
+                .clone(),
+            input: ToolInput::FileRewrite {
+                path: "./test.rs".to_string(),
+                start_line: 2,
+                end_line: 2,
+                content: "BBB".to_string(),
+            },
+            extra_field_warnings: vec![],
+        })
+        .expect("rewrite should succeed");
+
+    assert!(
+        result.diff_summary.is_some(),
+        "file.rewrite should produce a diff_summary"
+    );
+    let diff = result.diff_summary.unwrap();
+    assert!(
+        diff.contains("-bbb") && diff.contains("+BBB"),
+        "diff should contain the actual changes, got: {diff}"
+    );
+}
+
+#[test]
+fn file_rewrite_artifacts() {
+    let root = std::env::temp_dir().join("anvil_rewrite_artifacts");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("dir should exist");
+    fs::write(root.join("test.rs"), "line1\nline2\n").expect("write should succeed");
+
+    let mut executor = LocalToolExecutor::new_without_rate_limit(root.clone());
+    let result = executor
+        .execute(ToolExecutionRequest {
+            tool_call_id: "call_rewrite_art".to_string(),
+            spec: build_registry()
+                .get("file.rewrite")
+                .expect("file.rewrite spec")
+                .clone(),
+            input: ToolInput::FileRewrite {
+                path: "./test.rs".to_string(),
+                start_line: 1,
+                end_line: 1,
+                content: "LINE1".to_string(),
+            },
+            extra_field_warnings: vec![],
+        })
+        .expect("rewrite should succeed");
+
+    assert_eq!(result.status, ToolExecutionStatus::Completed);
+    assert!(
+        !result.artifacts.is_empty(),
+        "artifacts should contain the file path"
+    );
+    assert!(
+        result.artifacts[0].contains("test.rs"),
+        "artifact should contain the file path"
+    );
+}
+
+#[test]
+fn file_rewrite_registered_in_registry() {
+    let registry = build_registry();
+    let spec = registry
+        .get("file.rewrite")
+        .expect("file.rewrite should be registered");
+    assert_eq!(spec.kind, ToolKind::FileRewrite);
+    assert_eq!(spec.execution_class, ExecutionClass::Mutating);
+    assert_eq!(spec.permission_class, PermissionClass::Confirm);
+    assert_eq!(spec.execution_mode, ExecutionMode::SequentialOnly);
+    assert_eq!(spec.plan_mode, PlanModePolicy::AllowedWithScope);
+    assert_eq!(spec.rollback_policy, RollbackPolicy::CheckpointBeforeWrite);
 }

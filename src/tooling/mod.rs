@@ -94,6 +94,7 @@ pub enum ToolKind {
     FileWrite,
     FileEdit,
     FileEditAnchor,
+    FileRewrite,
     FileSearch,
     ShellExec,
     WebFetch,
@@ -101,6 +102,7 @@ pub enum ToolKind {
     Mcp,
     AgentExplore,
     AgentPlan,
+    AgentFixSlice,
     GitStatus,
     GitDiff,
     GitLog,
@@ -182,6 +184,18 @@ pub enum ToolInput {
         path: String,
         params: AnchorEditParams,
     },
+    FileRewrite {
+        path: String,
+        start_line: u32,
+        end_line: u32,
+        content: String,
+    },
+    /// Microtask fix-slice sub-agent (Issue #291).
+    AgentFixSlice {
+        target_path: String,
+        goal: String,
+        max_lines: u32,
+    },
 }
 
 impl ToolInput {
@@ -201,6 +215,8 @@ impl ToolInput {
             Self::GitDiff { .. } => ToolKind::GitDiff,
             Self::GitLog { .. } => ToolKind::GitLog,
             Self::FileEditAnchor { .. } => ToolKind::FileEditAnchor,
+            Self::FileRewrite { .. } => ToolKind::FileRewrite,
+            Self::AgentFixSlice { .. } => ToolKind::AgentFixSlice,
         }
     }
 
@@ -379,6 +395,63 @@ impl ToolInput {
                     },
                 })
             }
+            "agent.fix_slice" => {
+                let target_path = value
+                    .get("target_path")
+                    .and_then(serde_json::Value::as_str)
+                    .map(String::from)
+                    .ok_or_else(|| {
+                        "missing target_path in agent.fix_slice tool block".to_string()
+                    })?;
+                let goal = value
+                    .get("goal")
+                    .and_then(serde_json::Value::as_str)
+                    .map(String::from)
+                    .ok_or_else(|| "missing goal in agent.fix_slice tool block".to_string())?;
+                let max_lines = match value.get("max_lines").and_then(serde_json::Value::as_u64) {
+                    Some(v) => u32::try_from(v).map_err(|_| {
+                        format!("max_lines value {v} exceeds u32 range in agent.fix_slice")
+                    })?,
+                    None => 50,
+                };
+                Ok(ToolInput::AgentFixSlice {
+                    target_path,
+                    goal,
+                    max_lines,
+                })
+            }
+            "file.rewrite" => {
+                let path = value
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .map(String::from)
+                    .ok_or_else(|| "missing path in file.rewrite tool block".to_string())?;
+                let start_line_u64 = value
+                    .get("start_line")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| "missing start_line in file.rewrite tool block".to_string())?;
+                let start_line = u32::try_from(start_line_u64).map_err(|_| {
+                    format!("start_line value {start_line_u64} exceeds u32 range in file.rewrite")
+                })?;
+                let end_line_u64 = value
+                    .get("end_line")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| "missing end_line in file.rewrite tool block".to_string())?;
+                let end_line = u32::try_from(end_line_u64).map_err(|_| {
+                    format!("end_line value {end_line_u64} exceeds u32 range in file.rewrite")
+                })?;
+                let content = value
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                Ok(ToolInput::FileRewrite {
+                    path,
+                    start_line,
+                    end_line,
+                    content,
+                })
+            }
             other => {
                 // mcp__<server>__<tool> pattern detection
                 if let Some((server, tool)) = parse_mcp_tool_name(other) {
@@ -452,6 +525,18 @@ impl ToolInput {
                 prompt: extract_simple(block, "prompt")?,
                 scope: extract_simple(block, "scope"),
             }),
+            "agent.fix_slice" => {
+                let target_path = extract_simple(block, "target_path")?;
+                let goal = extract_simple(block, "goal")?;
+                let max_lines = extract_simple(block, "max_lines")
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .unwrap_or(50);
+                Some(ToolInput::AgentFixSlice {
+                    target_path,
+                    goal,
+                    max_lines,
+                })
+            }
             "git.status" => Some(ToolInput::GitStatus {}),
             "git.diff" => Some(ToolInput::GitDiff {
                 path: extract_simple(block, "path"),
@@ -472,6 +557,18 @@ impl ToolInput {
                         old_content,
                         new_content,
                     },
+                })
+            }
+            "file.rewrite" => {
+                let path = extract_simple(block, "path")?;
+                let start_line = extract_simple(block, "start_line")?.parse::<u32>().ok()?;
+                let end_line = extract_simple(block, "end_line")?.parse::<u32>().ok()?;
+                let content = extract_trailing(block, "content").unwrap_or_default();
+                Some(ToolInput::FileRewrite {
+                    path,
+                    start_line,
+                    end_line,
+                    content,
                 })
             }
             _ => None,
@@ -780,6 +877,19 @@ impl ToolRegistry {
         });
     }
 
+    pub fn register_file_rewrite(&mut self) {
+        self.register(ToolSpec {
+            version: 1,
+            name: "file.rewrite".to_string(),
+            kind: ToolKind::FileRewrite,
+            execution_class: ExecutionClass::Mutating,
+            permission_class: PermissionClass::Confirm,
+            execution_mode: ExecutionMode::SequentialOnly,
+            plan_mode: PlanModePolicy::AllowedWithScope,
+            rollback_policy: RollbackPolicy::CheckpointBeforeWrite,
+        });
+    }
+
     pub fn register_file_search(&mut self) {
         self.register(ToolSpec {
             version: 1,
@@ -914,11 +1024,31 @@ impl ToolRegistry {
         self.register_git_status();
     }
 
+    /// Register the agent.fix_slice tool (Issue #291).
+    pub fn register_agent_fix_slice(&mut self) {
+        self.register(ToolSpec {
+            version: 1,
+            name: "agent.fix_slice".to_string(),
+            kind: ToolKind::AgentFixSlice,
+            execution_class: ExecutionClass::Mutating,
+            permission_class: PermissionClass::Confirm,
+            execution_mode: ExecutionMode::SequentialOnly,
+            plan_mode: PlanModePolicy::Allowed,
+            rollback_policy: RollbackPolicy::None,
+        });
+    }
+
+    /// Register the subset of tools available to the FixSlice sub-agent (Issue #291).
+    pub fn register_fixslice_tools(&mut self) {
+        self.register_file_read();
+    }
+
     pub fn register_standard_tools(&mut self) {
         self.register_file_read();
         self.register_file_write();
         self.register_file_edit();
         self.register_file_edit_anchor();
+        self.register_file_rewrite();
         self.register_file_search();
         self.register_shell_exec();
         self.register_web_fetch();
@@ -1367,8 +1497,16 @@ impl LocalToolExecutor {
                 ref path,
                 ref params,
             } => self.execute_file_edit_anchor(&request, path, params, started),
+            ToolInput::FileRewrite {
+                ref path,
+                start_line,
+                end_line,
+                ref content,
+            } => self.execute_file_rewrite(&request, path, start_line, end_line, content, started),
             ToolInput::Mcp { .. } => unreachable!("MCP tools are dispatched in agentic.rs"),
-            ToolInput::AgentExplore { .. } | ToolInput::AgentPlan { .. } => {
+            ToolInput::AgentExplore { .. }
+            | ToolInput::AgentPlan { .. }
+            | ToolInput::AgentFixSlice { .. } => {
                 unreachable!("agent tools are dispatched in agentic.rs")
             }
         };
@@ -1715,6 +1853,95 @@ impl LocalToolExecutor {
                 "anchor: old_content matched {n} locations in {path}, need unique match"
             ))),
         }
+    }
+
+    /// Execute `file.rewrite`: replace a line range with new content.
+    fn execute_file_rewrite(
+        &self,
+        request: &ToolExecutionRequest,
+        path: &str,
+        start_line: u32,
+        end_line: u32,
+        content: &str,
+        started: Instant,
+    ) -> Result<ToolExecutionResult, ToolRuntimeError> {
+        let resolved = self.resolve_path(path)?;
+        let file_content = fs::read_to_string(&resolved).map_err(|err| {
+            ToolRuntimeError::Io(format!(
+                "file.rewrite failed to read {}: {err}",
+                resolved.display()
+            ))
+        })?;
+
+        let lines: Vec<&str> = file_content.lines().collect();
+        let total = lines.len() as u32;
+
+        // Validate range: 1 <= start_line <= end_line <= total_lines
+        if start_line < 1 || end_line < start_line || end_line > total {
+            let nearby = if is_sensitive_file(path) {
+                String::new()
+            } else {
+                extract_nearby_context(&lines, start_line, end_line, total)
+            };
+            return Err(ToolRuntimeError::Io(format!(
+                "file.rewrite: invalid line range {start_line}-{end_line} \
+                 (file has {total} lines). {nearby}"
+            )));
+        }
+
+        // Extract old block (0-indexed)
+        let start_idx = (start_line - 1) as usize;
+        let end_idx = end_line as usize; // exclusive
+        let old_block: Vec<&str> = lines[start_idx..end_idx].to_vec();
+        let old_text = old_block.join("\n");
+
+        // No-op check: compare old block with replacement content
+        let new_text = content.trim_end_matches('\n');
+        if old_text == new_text {
+            return Err(ToolRuntimeError::Io(format!(
+                "file.rewrite: replacement content is identical to existing \
+                 lines {start_line}-{end_line} in {path}. No changes to apply."
+            )));
+        }
+
+        // Build new file content: before + replacement + after
+        let before = &lines[..start_idx];
+        let after = &lines[end_idx..];
+        let replacement_lines: Vec<&str> = if content.is_empty() {
+            Vec::new()
+        } else {
+            content.lines().collect()
+        };
+
+        let mut new_lines: Vec<&str> =
+            Vec::with_capacity(before.len() + replacement_lines.len() + after.len());
+        new_lines.extend_from_slice(before);
+        new_lines.extend_from_slice(&replacement_lines);
+        new_lines.extend_from_slice(after);
+
+        let mut new_content = new_lines.join("\n");
+        // Preserve trailing newline if original had one, but only if content remains
+        if file_content.ends_with('\n') && !new_content.is_empty() {
+            new_content.push('\n');
+        }
+
+        fs::write(&resolved, &new_content).map_err(|err| {
+            ToolRuntimeError::Io(format!(
+                "file.rewrite failed to write {}: {err}",
+                resolved.display()
+            ))
+        })?;
+        self.invalidate_cache(&resolved);
+
+        let diff = diff::generate_file_edit_diff(&old_text, new_text);
+        Ok(build_completed_result_with_diff(
+            request,
+            path.to_string(),
+            Self::build_edit_diff_payload(&old_text, new_text),
+            vec![resolved.display().to_string()],
+            started,
+            diff,
+        ))
     }
 
     /// Try file.edit with 3-level fallback: strict → trailing-ws → anchor.
@@ -2613,6 +2840,23 @@ fn log_file_edit_detail(result: &ToolExecutionResult) {
     }
 }
 
+/// Extract nearby context lines for file.rewrite range errors.
+///
+/// Shows up to 5 lines around the target range boundary for LLM recovery.
+fn extract_nearby_context(lines: &[&str], start_line: u32, _end_line: u32, total: u32) -> String {
+    if lines.is_empty() {
+        return String::new();
+    }
+    let center = (start_line.min(total).max(1) - 1) as usize;
+    let ctx_start = center.saturating_sub(5);
+    let ctx_end = (center + 6).min(lines.len());
+    let mut ctx = String::from("Nearby lines:\n");
+    for (i, line) in lines.iter().enumerate().take(ctx_end).skip(ctx_start) {
+        ctx.push_str(&format!("{:>4}: {}\n", i + 1, line));
+    }
+    ctx
+}
+
 /// Build a [`ToolExecutionResult`] with `Completed` status.
 ///
 /// Centralises the boilerplate shared by every successful execution path.
@@ -2809,6 +3053,48 @@ fn validate_required_fields(input: &ToolInput) -> Result<(), ToolValidationError
                 });
             }
         }
+        ToolInput::AgentFixSlice {
+            target_path,
+            goal,
+            max_lines,
+        } => {
+            if target_path.trim().is_empty() {
+                return Err(ToolValidationError::MissingRequiredField(
+                    "target_path".to_string(),
+                ));
+            }
+            if target_path.chars().any(|c| c.is_control()) {
+                return Err(ToolValidationError::InvalidFieldValue {
+                    field: "target_path".to_string(),
+                    reason: "target_path must not contain control characters".to_string(),
+                });
+            }
+            if goal.trim().is_empty() {
+                return Err(ToolValidationError::MissingRequiredField(
+                    "goal".to_string(),
+                ));
+            }
+            const MAX_GOAL_LENGTH: usize = 10000;
+            if goal.len() > MAX_GOAL_LENGTH {
+                return Err(ToolValidationError::InvalidFieldValue {
+                    field: "goal".to_string(),
+                    reason: format!(
+                        "goal length {} exceeds maximum of {} characters",
+                        goal.len(),
+                        MAX_GOAL_LENGTH
+                    ),
+                });
+            }
+            if *max_lines < 1 || *max_lines > crate::agent::subagent::MAX_FIXSLICE_LINES {
+                return Err(ToolValidationError::InvalidFieldValue {
+                    field: "max_lines".to_string(),
+                    reason: format!(
+                        "max_lines must be between 1 and {}",
+                        crate::agent::subagent::MAX_FIXSLICE_LINES
+                    ),
+                });
+            }
+        }
         ToolInput::FileEditAnchor { path, params } => {
             if path.trim().is_empty() {
                 return Err(ToolValidationError::MissingRequiredField(
@@ -2820,6 +3106,34 @@ fn validate_required_fields(input: &ToolInput) -> Result<(), ToolValidationError
                     "old_content".to_string(),
                 ));
             }
+        }
+        ToolInput::FileRewrite {
+            path,
+            start_line,
+            end_line,
+            ..
+        } => {
+            if path.trim().is_empty() {
+                return Err(ToolValidationError::MissingRequiredField(
+                    "path".to_string(),
+                ));
+            }
+            if *start_line < 1 {
+                return Err(ToolValidationError::InvalidFieldValue {
+                    field: "start_line".to_string(),
+                    reason: "start_line must be >= 1".to_string(),
+                });
+            }
+            if *end_line < *start_line {
+                return Err(ToolValidationError::InvalidFieldValue {
+                    field: "end_line".to_string(),
+                    reason: format!(
+                        "end_line ({}) must be >= start_line ({})",
+                        end_line, start_line
+                    ),
+                });
+            }
+            // content: empty is OK (line deletion use case)
         }
         // [D3-001] MCP tool input validation is handled by the MCP server side
         ToolInput::Mcp { .. } => {}

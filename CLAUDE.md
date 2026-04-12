@@ -101,7 +101,7 @@ src/
 ├── agent/
 │   ├── mod.rs           # エージェントループ・プロトコル
 │   ├── model_classifier.rs # モデル分類・ToolProtocolMode判定
-│   ├── subagent.rs      # サブエージェント実行ループ（Explore/Plan、構造化payload・JSON ANVIL_FINAL対応）
+│   ├── subagent.rs      # サブエージェント実行ループ（Explore/Plan/FixSlice、構造化payload・JSON ANVIL_FINAL対応・FixSliceProposalパース）
 │   ├── tag_parser.rs    # タグベースツール呼び出しパーサー（多層プロトコル対応）
 │   └── tag_spec.rs      # ツールタグ仕様テーブル（TOOL_TAG_SPECS）
 ├── app/
@@ -125,7 +125,7 @@ src/
 │   └── mock.rs          # テスト用モック
 ├── config/mod.rs        # 設定管理
 ├── contracts/
-│   ├── mod.rs           # 共通型定義（TerminationReason, Finding, SubAgentPayload含む）
+│   ├── mod.rs           # 共通型定義（TerminationReason, Finding, SubAgentPayload, FixSliceProposal含む）
 │   └── tokens.rs        # トークン推定（CJK対応ヒューリスティック・モデル実測値ベースEMA補正）
 ├── extensions/
 │   ├── mod.rs           # スラッシュコマンド・拡張
@@ -147,8 +147,8 @@ src/
 ├── spinner.rs           # スピナーUI（並列詳細進捗表示・start_parallel_detailed・format_detailed_progress）
 ├── state/mod.rs         # 状態マシン
 ├── tooling/
-│   ├── mod.rs           # ツール実行・検証・CheckpointStack（undo用チェックポイント管理）・EditFallbackStage・file.edit詳細ログ
-│   ├── diff.rs          # 差分プレビュー生成（file.write/file.edit承認時）
+│   ├── mod.rs           # ツール実行・検証・CheckpointStack（undo用チェックポイント管理）・EditFallbackStage・file.edit詳細ログ・file.rewrite（行番号範囲ベースのブロック全置換）
+│   ├── diff.rs          # 差分プレビュー生成（file.write/file.edit/file.rewrite承認時）
 │   ├── file_cache.rs    # ファイル読み取りキャッシュ（FileReadCache: LRUエビクション・sandbox境界検証）
 │   ├── progress.rs      # 並列実行進捗型（ToolProgressStatus・ToolProgressEntry）
 │   └── shell_policy.rs  # ShellPolicy分類（ReadOnly/BuildTest/General）・offline用ネットワークコマンド検出
@@ -175,6 +175,7 @@ tests/
 ├── followup_replan.rs   # follow-up ANVIL_PLAN replan テスト（Issue #305）
 ├── prose_retire_fallback.rs # prose-only確認のplan retire変換テスト（Issue #307）
 ├── shell_inspection_drift.rs # shell.exec inspection drift テスト（Issue #309）
+├── fixslice_subagent.rs # FixSliceサブエージェント統合テスト（Issue #291）
 └── walk_system.rs       # ディレクトリウォーカーテスト
 ```
 

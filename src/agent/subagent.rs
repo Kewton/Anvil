@@ -5,7 +5,7 @@
 
 use crate::app::policy::{OFFLINE_BLOCK_PAYLOAD, check_offline_blocked};
 use crate::config::EffectiveConfig;
-use crate::contracts::{Finding, SubAgentPayload, TerminationReason};
+use crate::contracts::{Finding, FixSliceProposal, SubAgentPayload, TerminationReason};
 use crate::provider::{ProviderClient, ProviderEvent, ProviderTurnError};
 use crate::session::{MessageRole, SessionMessage, SessionRecord};
 use crate::tooling::{
@@ -25,6 +25,26 @@ use std::time::{Duration, Instant};
 // ---------------------------------------------------------------------------
 // Sub-agent system prompt constants
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// FixSlice budget constants (Issue #291, DR1-004: code-level const)
+// ---------------------------------------------------------------------------
+
+/// Default value for the runtime `fixslice_max_iterations` knob (Issue #345).
+///
+/// Since Issue #345 the iteration cap is configurable. This const is kept so
+/// tests and config defaults can reference the historical value in a single
+/// place. Runtime callers should read
+/// `EffectiveConfig::runtime::fixslice_max_iterations` instead.
+pub const DEFAULT_FIXSLICE_MAX_ITERATIONS: u32 = 3;
+/// Back-compat alias for `DEFAULT_FIXSLICE_MAX_ITERATIONS` (Issue #291 /
+/// Issue #345). Kept so external callers that imported the old name continue
+/// to compile; prefer the runtime config at the call site.
+pub const FIXSLICE_MAX_ITERATIONS: u32 = DEFAULT_FIXSLICE_MAX_ITERATIONS;
+/// Wall-clock timeout (seconds) for a FixSlice sub-agent run.
+pub const FIXSLICE_TIMEOUT_SECS: u64 = 60;
+/// Maximum allowed value for `max_lines` in agent.fix_slice input.
+pub const MAX_FIXSLICE_LINES: u32 = 200;
 
 const SUBAGENT_PROTOCOL_BASE: &str = r#"You are a sub-agent of Anvil, a local coding agent.
 
@@ -137,6 +157,97 @@ You are a Plan sub-agent specializing in implementation planning.
 - Note: Offline mode is active. Web access is unavailable.
 "#;
 
+// ---------------------------------------------------------------------------
+// FixSlice sub-agent prompts (Issue #291, DR2-007)
+// ---------------------------------------------------------------------------
+
+const FIXSLICE_PROTOCOL_BASE: &str = r#"You are a FixSlice sub-agent of Anvil, a local coding agent.
+
+## Final-message contract (strict — read this first)
+Your FINAL turn MUST contain exactly one ANVIL_FINAL fenced block whose
+body is a single FixSliceProposal JSON object. Any of the following make
+the proposal fail to parse and the whole fix_slice call fail:
+- Markdown summaries, headings (`##`), bullet lists, or prose outside `rationale`.
+- Re-pasting `file.read` tool-call JSON or any `ANVIL_TOOL` block in the final turn.
+- More than one ANVIL_FINAL block, or any text before/after the block.
+- Missing any required field, or extra keys not in the schema below.
+
+## FixSliceProposal schema
+```ANVIL_FINAL
+{
+  "target_path": "<exact path from the user prompt>",
+  "start_line": <1-based inclusive integer>,
+  "end_line": <1-based inclusive integer>,
+  "replacement_content": "<new lines, \n-terminated>",
+  "rationale": "<short single-line explanation>"
+}
+```
+
+Field rules:
+- `target_path` MUST be byte-for-byte identical to the `target_path` given
+  in the user prompt. Do NOT shorten it to a basename, drop directory
+  prefixes, strip or add `./`, rewrite path separators, or resolve it to a
+  different directory. If the request says `src/lib/auto-yes-manager.ts`,
+  the proposal must say `src/lib/auto-yes-manager.ts` — never
+  `auto-yes-manager.ts`.
+- `start_line` / `end_line` are 1-based and inclusive, and must satisfy
+  `end_line - start_line + 1 <= max_lines` from the user prompt.
+- `replacement_content` must be a non-empty string containing the exact
+  replacement lines (keep the trailing newline if the original slice had one).
+- `rationale` is a short, single-line explanation — never a summary section.
+
+## Tool protocol (exploration turns only)
+While exploring the target you may call file.read via a fenced block:
+```ANVIL_TOOL
+{"id":"call_001","tool":"file.read","path":"./relative/path"}
+```
+`ANVIL_TOOL` blocks are valid ONLY in exploration turns. They must never
+appear in the final turn that emits ANVIL_FINAL. Do not use any other
+tool syntax.
+
+## Few-shot examples
+
+Correct — request target_path was `src/lib/auto-yes-manager.ts`:
+```ANVIL_FINAL
+{"target_path":"src/lib/auto-yes-manager.ts","start_line":42,"end_line":44,"replacement_content":"  if (choice === 'yes') {\n    return true;\n  }\n","rationale":"Return true on explicit yes"}
+```
+
+Correct — request target_path was `src/agent/subagent.rs`:
+```ANVIL_FINAL
+{"target_path":"src/agent/subagent.rs","start_line":100,"end_line":101,"replacement_content":"    let x = compute(&ctx);\n","rationale":"Pass ctx to compute to fix overflow"}
+```
+
+Avoid — basename drift (dropped the directory prefix):
+```ANVIL_FINAL
+{"target_path":"auto-yes-manager.ts","start_line":42,"end_line":44,"replacement_content":"...","rationale":"..."}
+```
+
+Avoid — markdown summary under ANVIL_FINAL:
+```ANVIL_FINAL
+## Implementation overview
+I updated the handler so the multiple-choice prompt now returns true on yes...
+```
+
+## Encouragement
+- Always produce a FixSliceProposal. It is better to submit an imperfect proposal
+  than no proposal — Anvil validates and will ask you to retry if needed.
+- If you are unsure about exact line numbers, make your best attempt.
+- Do not spend iterations reasoning about whether to propose — propose.
+
+"#;
+
+const FIXSLICE_ROLE_PROMPT: &str = r#"## Your role
+You are a FixSlice sub-agent specializing in targeted, local code fixes.
+- Use file.read to read the target file and understand the context.
+- Identify the minimal set of lines that need to change.
+- Produce a FixSliceProposal in ANVIL_FINAL whose `target_path` is
+  byte-for-byte identical to the target path given in the user prompt.
+- Keep `end_line - start_line + 1` within the max_lines budget.
+- You only have read-only access: file.read.
+- Never emit markdown, prose summaries, or copies of tool-call JSON as the
+  final message — the final message is a FixSliceProposal JSON object only.
+"#;
+
 /// Options for sub-agent system prompt generation (Issue #162).
 pub struct SubAgentPromptOptions<'a> {
     pub offline: bool,
@@ -153,10 +264,11 @@ pub fn build_subagent_system_prompt(
 ) -> String {
     use crate::config::{effective_ui_language_code, language_constraint_prompt};
 
+    // FixSlice uses its own protocol base; Explore/Plan share SUBAGENT_PROTOCOL_BASE.
     let mut prompt = String::new();
-    prompt.push_str(SUBAGENT_PROTOCOL_BASE);
     match kind {
         SubAgentKind::Explore => {
+            prompt.push_str(SUBAGENT_PROTOCOL_BASE);
             prompt.push_str(TOOL_DESC_FILE_READ);
             prompt.push_str(TOOL_DESC_FILE_SEARCH);
             prompt.push_str(TOOL_DESC_GIT_STATUS);
@@ -165,6 +277,7 @@ pub fn build_subagent_system_prompt(
             prompt.push_str(EXPLORE_ROLE_PROMPT);
         }
         SubAgentKind::Plan => {
+            prompt.push_str(SUBAGENT_PROTOCOL_BASE);
             prompt.push_str(TOOL_DESC_FILE_READ);
             prompt.push_str(TOOL_DESC_FILE_SEARCH);
             if !opts.offline {
@@ -176,6 +289,11 @@ pub fn build_subagent_system_prompt(
             } else {
                 PLAN_ROLE_PROMPT
             });
+        }
+        SubAgentKind::FixSlice => {
+            prompt.push_str(FIXSLICE_PROTOCOL_BASE);
+            prompt.push_str(TOOL_DESC_FILE_READ);
+            prompt.push_str(FIXSLICE_ROLE_PROMPT);
         }
     }
 
@@ -190,11 +308,13 @@ pub fn build_subagent_system_prompt(
 // Public types
 // ---------------------------------------------------------------------------
 
-/// Sub-agent kind (Explore or Plan).
+/// Sub-agent kind (Explore, Plan, or FixSlice).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubAgentKind {
     Explore,
     Plan,
+    /// Microtask fix-slice worker (Issue #291).
+    FixSlice,
 }
 
 impl SubAgentKind {
@@ -203,12 +323,124 @@ impl SubAgentKind {
         match input {
             ToolInput::AgentExplore { .. } => Some(SubAgentKind::Explore),
             ToolInput::AgentPlan { .. } => Some(SubAgentKind::Plan),
+            ToolInput::AgentFixSlice { .. } => Some(SubAgentKind::FixSlice),
             _ => None,
         }
     }
 }
 
+/// Why a FixSlice sub-agent finished without a usable `FixSliceProposal`
+/// (Issue #345).
+///
+/// Surfaces the parse outcome to `handle_fixslice_result` so it can record a
+/// granular `FixSliceFailureReason` instead of lumping everything into
+/// `NoProposal`. `None` on `SubAgentResult::fix_proposal_failure` means the
+/// worker either produced a usable proposal (possibly salvaged) or the result
+/// came from a non-FixSlice kind where this field is irrelevant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FixProposalParseFailure {
+    /// Final response was empty (or whitespace-only) after trimming.
+    EmptyFinal,
+    /// Final response was non-empty but could not be parsed into a
+    /// `FixSliceProposal`, even after the salvage pass that extracts the
+    /// first embedded JSON object.
+    ParseFailed,
+    /// Worker terminated without emitting a final response of its own — the
+    /// result was built from a partial/max-iterations exit path. Treated as
+    /// distinct from `EmptyFinal` because it reflects loop exhaustion rather
+    /// than a blank model output.
+    NoFinal,
+    /// The sub-agent hit the same-target `file.read` oscillation guard and
+    /// aborted early (Issue #351, B1 shape). The worker kept re-reading the
+    /// same target path without producing a proposal; the runtime aborts
+    /// before the iteration budget is exhausted so the parent can classify
+    /// the session as pack_gate_invalid.
+    RepeatedReadLoop,
+}
+
+/// Outcome of `try_parse_fix_proposal` (Issue #345).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FixProposalParseOutcome {
+    /// The full `final_response` parsed as strict JSON.
+    Parsed(FixSliceProposal),
+    /// The first balanced `{...}` substring parsed as JSON after the strict
+    /// parse failed.
+    Salvaged(FixSliceProposal),
+    /// `final_response` was blank after trimming.
+    EmptyFinal,
+    /// `final_response` was non-empty but no JSON object could be extracted.
+    ParseFailed,
+}
+
+/// Extract a `FixSliceProposal` from a worker's final response (Issue #345).
+///
+/// Tries a strict parse first, then falls back to extracting the first
+/// balanced `{...}` substring from the text. The depth scanner tracks JSON
+/// string state so braces inside string literals (e.g. Rust code in
+/// `replacement_content`) don't throw off the bracket count.
+pub fn try_parse_fix_proposal(final_response: &str) -> FixProposalParseOutcome {
+    let trimmed = final_response.trim();
+    if trimmed.is_empty() {
+        return FixProposalParseOutcome::EmptyFinal;
+    }
+    if let Ok(parsed) = serde_json::from_str::<FixSliceProposal>(trimmed) {
+        return FixProposalParseOutcome::Parsed(parsed);
+    }
+    if let Some(slice) = extract_first_json_object(trimmed)
+        && let Ok(parsed) = serde_json::from_str::<FixSliceProposal>(slice)
+    {
+        return FixProposalParseOutcome::Salvaged(parsed);
+    }
+    FixProposalParseOutcome::ParseFailed
+}
+
+/// Return the first balanced `{...}` substring from `text`, respecting JSON
+/// string state so braces inside string literals don't unbalance the scan.
+fn extract_first_json_object(text: &str) -> Option<&str> {
+    let bytes = text.as_bytes();
+    let mut start: Option<usize> = None;
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut escape = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if in_string {
+            if escape {
+                escape = false;
+            } else if b == b'\\' {
+                escape = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => {
+                in_string = true;
+            }
+            b'{' => {
+                if start.is_none() {
+                    start = Some(i);
+                }
+                depth += 1;
+            }
+            b'}' => {
+                if depth > 0 {
+                    depth -= 1;
+                    if depth == 0 {
+                        let s = start?;
+                        return Some(&text[s..=i]);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Result returned by a successful sub-agent run.
+// TODO(DR1-001): When a 4th sub-agent kind is added, refactor SubAgentResult
+// into an enum to avoid accumulating Option fields.
 pub struct SubAgentResult {
     /// 構造化ペイロード
     pub payload: SubAgentPayload,
@@ -216,6 +448,15 @@ pub struct SubAgentResult {
     pub estimated_tokens: usize,
     /// 使用したイテレーション数
     pub iterations_used: u32,
+    /// FixSlice proposal extracted from ANVIL_FINAL (Issue #291).
+    pub fix_proposal: Option<FixSliceProposal>,
+    /// Why `fix_proposal` is `None` for FixSlice runs (Issue #345).
+    ///
+    /// `None` when the result produced a usable proposal or the run was not
+    /// a FixSlice sub-agent. Populated by `run_turn` / `build_partial_result`
+    /// for the FixSlice kind so `handle_fixslice_result` can pick a precise
+    /// `FixSliceFailureReason` classification.
+    pub fix_proposal_failure: Option<FixProposalParseFailure>,
 }
 
 impl SubAgentResult {
@@ -302,7 +543,7 @@ impl SubAgentError {
 /// Outcome of a single sub-agent turn.
 enum TurnOutcome {
     /// The sub-agent produced a final answer.
-    Finished(SubAgentResult),
+    Finished(Box<SubAgentResult>),
     /// The sub-agent wants to continue (tool calls were executed).
     Continue,
 }
@@ -415,6 +656,62 @@ pub struct SubAgentSession<'a, C: ProviderClient> {
     iterations_used: u32,
     /// Model/context_window overrides from the parent App (Issue #77).
     overrides: SubAgentOverrides,
+    /// Most recent `file.read` target path observed in a FixSlice iteration
+    /// (Issue #351). Used together with `same_target_read_count` to detect
+    /// same-path read oscillation inside the sub-agent loop.
+    last_file_read_target: Option<String>,
+    /// Number of consecutive FixSlice iterations whose primary `file.read`
+    /// call targeted `last_file_read_target` (Issue #351).
+    same_target_read_count: u32,
+}
+
+/// Default threshold (consecutive iterations) for the same-target
+/// `file.read` oscillation guard inside the FixSlice sub-agent loop
+/// (Issue #351 / Issue #353).
+///
+/// Runtime callers should read
+/// `EffectiveConfig::runtime::fixslice_no_progress_detector` instead —
+/// this constant only pins the default used when nothing else is set.
+///
+/// Issue #353: cycle-11 traces showed the previous default (`2`) killed
+/// legitimate A1/A2 exploration — qwen3.5:122b frequently needs more than
+/// two same-path reads to reach a proposal. Raised to `5` so the guard
+/// still catches the B1 runaway shape but leaves normal exploration
+/// intact. A value of `0` disables the guard entirely.
+pub const DEFAULT_FIXSLICE_REPEATED_READ_THRESHOLD: u32 = 5;
+
+/// Back-compat alias for [`DEFAULT_FIXSLICE_REPEATED_READ_THRESHOLD`]
+/// (Issue #351 / Issue #353). Kept so existing test imports continue to
+/// compile; new code should read the runtime config at the call site.
+pub const FIXSLICE_REPEATED_READ_THRESHOLD: u32 = DEFAULT_FIXSLICE_REPEATED_READ_THRESHOLD;
+
+/// Pure helper for the same-target `file.read` oscillation guard (Issue
+/// #351). Returns `true` when `current_target` matches `last_target` and
+/// the resulting consecutive count reaches `threshold`.
+///
+/// Exposed as a pure function so the guard can be unit-tested without
+/// standing up a provider / tool-executor stack.
+pub fn is_repeated_read_loop(
+    current_target: Option<&str>,
+    last_target: Option<&str>,
+    prior_consecutive_count: u32,
+    threshold: u32,
+) -> bool {
+    match (current_target, last_target) {
+        (Some(c), Some(l)) if c == l => prior_consecutive_count + 1 >= threshold,
+        _ => false,
+    }
+}
+
+/// Return the first `file.read` target path from a slice of tool calls, if
+/// any (Issue #351). The FixSlice sub-agent is limited to `file.read`, so
+/// "first match" is the simplest stable fingerprint for the iteration's
+/// dominant target.
+pub fn first_file_read_target(tool_calls: &[ToolCallRequest]) -> Option<String> {
+    tool_calls.iter().find_map(|call| match &call.input {
+        ToolInput::FileRead { path } => Some(path.clone()),
+        _ => None,
+    })
 }
 
 impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
@@ -440,6 +737,7 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
         match kind {
             SubAgentKind::Explore => registry.register_explore_tools(),
             SubAgentKind::Plan => registry.register_plan_tools(),
+            SubAgentKind::FixSlice => registry.register_fixslice_tools(),
         }
 
         // 3. Dedicated system prompt
@@ -460,6 +758,8 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
             scope_path: scope.to_path_buf(),
             iterations_used: 0,
             overrides,
+            last_file_read_target: None,
+            same_target_read_count: 0,
         }
     }
 
@@ -527,12 +827,121 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
                 &token_buffer,
                 crate::contracts::tokens::ContentKind::Text,
             );
+
+            // FixSlice: parse ANVIL_FINAL as FixSliceProposal.
+            // Issue #291, DR1-007: strict JSON parse.
+            // Issue #345: fall back to a salvage pass and report the parse
+            // outcome so the parent can classify `no_proposal` sub-classes.
+            if self.kind == SubAgentKind::FixSlice {
+                let outcome = try_parse_fix_proposal(&structured.final_response);
+                let (fix_proposal, fix_proposal_failure, summary) = match outcome {
+                    FixProposalParseOutcome::Parsed(p) => (
+                        Some(p),
+                        None,
+                        "fix-slice proposal parsed successfully".to_string(),
+                    ),
+                    FixProposalParseOutcome::Salvaged(p) => (
+                        Some(p),
+                        None,
+                        "fix-slice proposal salvaged from embedded JSON".to_string(),
+                    ),
+                    FixProposalParseOutcome::EmptyFinal => (
+                        None,
+                        Some(FixProposalParseFailure::EmptyFinal),
+                        "fix-slice proposal missing: empty final response".to_string(),
+                    ),
+                    FixProposalParseOutcome::ParseFailed => (
+                        None,
+                        Some(FixProposalParseFailure::ParseFailed),
+                        format!(
+                            "fix-slice proposal parse failed: {}",
+                            &structured
+                                .final_response
+                                .chars()
+                                .take(200)
+                                .collect::<String>()
+                        ),
+                    ),
+                };
+                let payload = SubAgentPayload::fallback(summary, TerminationReason::Completed);
+                return Ok(TurnOutcome::Finished(Box::new(SubAgentResult {
+                    payload,
+                    estimated_tokens: tokens,
+                    iterations_used: self.iterations_used,
+                    fix_proposal,
+                    fix_proposal_failure,
+                })));
+            }
+
             let payload = parse_final_response_to_payload(&structured.final_response);
-            return Ok(TurnOutcome::Finished(SubAgentResult {
+            return Ok(TurnOutcome::Finished(Box::new(SubAgentResult {
                 payload,
                 estimated_tokens: tokens,
                 iterations_used: self.iterations_used,
-            }));
+                fix_proposal: None,
+                fix_proposal_failure: None,
+            })));
+        }
+
+        // Issue #351: same-target `file.read` oscillation guard (FixSlice only).
+        // Issue #353: threshold is now configurable via
+        // `runtime.fixslice_no_progress_detector` (0 = disabled).
+        //
+        // Cycle-10 traces showed FixSlice workers burning the full iteration
+        // budget while re-reading the exact same target path without ever
+        // producing a proposal. Detect that shape here, before the executor
+        // runs another round of IO against the same file, and abort with a
+        // dedicated `RepeatedReadLoop` classification so the parent can
+        // classify the session as pack_gate_invalid instead of waiting for
+        // the runner timeout.
+        if self.kind == SubAgentKind::FixSlice {
+            let detector_threshold = self.config.runtime.fixslice_no_progress_detector;
+            let current_target = first_file_read_target(&structured.tool_calls);
+            let triggered = detector_threshold > 0
+                && is_repeated_read_loop(
+                    current_target.as_deref(),
+                    self.last_file_read_target.as_deref(),
+                    self.same_target_read_count,
+                    detector_threshold,
+                );
+            match current_target.as_deref() {
+                Some(path) if self.last_file_read_target.as_deref() == Some(path) => {
+                    self.same_target_read_count += 1;
+                }
+                Some(path) => {
+                    self.last_file_read_target = Some(path.to_string());
+                    self.same_target_read_count = 1;
+                }
+                None => {
+                    self.last_file_read_target = None;
+                    self.same_target_read_count = 0;
+                }
+            }
+            if triggered {
+                let tokens = crate::contracts::tokens::estimate_tokens(
+                    &token_buffer,
+                    crate::contracts::tokens::ContentKind::Text,
+                );
+                let target = self.last_file_read_target.clone().unwrap_or_default();
+                eprintln!(
+                    "[subagent:fix_slice] repeated-read loop detected (path={target}); \
+                     aborting after {} iteration(s)",
+                    self.iterations_used
+                );
+                let summary = format!(
+                    "fix-slice worker aborted: repeated-read loop on target '{target}' \
+                     after {} iteration(s)",
+                    self.iterations_used
+                );
+                let payload = SubAgentPayload::fallback(summary, TerminationReason::LoopDetected);
+                return Ok(TurnOutcome::Finished(Box::new(SubAgentResult {
+                    payload,
+                    estimated_tokens: tokens,
+                    iterations_used: self.iterations_used,
+                    fix_proposal: None,
+                    fix_proposal_failure: Some(FixProposalParseFailure::RepeatedReadLoop),
+                })));
+            }
         }
 
         // Validate and execute tool calls
@@ -628,11 +1037,22 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
         let kind_label = match self.kind {
             SubAgentKind::Explore => "explore",
             SubAgentKind::Plan => "plan",
+            SubAgentKind::FixSlice => "fix_slice",
         };
         eprintln!("[subagent:{kind_label}] Starting...");
         let start = Instant::now();
-        let max_iterations = self.config.runtime.subagent_max_iterations;
-        let timeout = Duration::from_secs(self.config.runtime.subagent_timeout_secs);
+        let (max_iterations, timeout) = if self.kind == SubAgentKind::FixSlice {
+            // Issue #345: runtime-configurable iteration cap.
+            (
+                self.config.runtime.fixslice_max_iterations,
+                Duration::from_secs(FIXSLICE_TIMEOUT_SECS),
+            )
+        } else {
+            (
+                self.config.runtime.subagent_max_iterations,
+                Duration::from_secs(self.config.runtime.subagent_timeout_secs),
+            )
+        };
 
         for iteration in 0..max_iterations {
             // Wall-clock timeout -> partial result with Ok
@@ -657,7 +1077,7 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
             );
 
             match self.run_turn()? {
-                TurnOutcome::Finished(result) => return Ok(result),
+                TurnOutcome::Finished(result) => return Ok(*result),
                 TurnOutcome::Continue => continue,
             }
         }
@@ -680,6 +1100,26 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
             .map(|m| m.content.clone())
             .unwrap_or_default();
 
+        // Issue #345: attempt to salvage a proposal from the last assistant
+        // message even on a partial exit path. Timeout / max-iterations paths
+        // sometimes have a valid-looking ANVIL_FINAL in the last turn that
+        // the strict main path never got to parse.
+        let (fix_proposal, fix_proposal_failure) = if self.kind == SubAgentKind::FixSlice {
+            match try_parse_fix_proposal(&raw_summary) {
+                FixProposalParseOutcome::Parsed(p) | FixProposalParseOutcome::Salvaged(p) => {
+                    (Some(p), None)
+                }
+                FixProposalParseOutcome::EmptyFinal => {
+                    (None, Some(FixProposalParseFailure::NoFinal))
+                }
+                FixProposalParseOutcome::ParseFailed => {
+                    (None, Some(FixProposalParseFailure::ParseFailed))
+                }
+            }
+        } else {
+            (None, None)
+        };
+
         SubAgentResult {
             payload: SubAgentPayload {
                 found_files: vec![],
@@ -691,6 +1131,8 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
             },
             estimated_tokens: 0,
             iterations_used: iterations,
+            fix_proposal,
+            fix_proposal_failure,
         }
     }
 }

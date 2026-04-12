@@ -138,6 +138,12 @@ fn telemetry_artifact_all_fields_present() {
         "first_mutation_event_elapsed_s",
         "first_mutation_event_tool",
         "first_mutation_event_semantic_basis",
+        // Issue #329: pack validation gate
+        "mutation_observed",
+        "worker_observed",
+        "repair_turn_observed",
+        "pack_expectation",
+        "expectation_mismatch_reason",
     ];
 
     for key in &expected_keys {
