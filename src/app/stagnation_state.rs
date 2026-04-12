@@ -4,7 +4,7 @@
 //! Policy decisions (scoring, plan repair, workset steering) are
 //! implemented as module-level pure functions to maintain SRP.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use crate::contracts::{ExecutionPlan, PlanItem};
 
@@ -42,6 +42,9 @@ pub struct StagnationState {
     had_new_target_this_turn: bool,
     /// Flag: whether record_plan_item_completion was called this turn.
     had_plan_item_completion_this_turn: bool,
+    /// Retry budget for proactive model-aware delegation per target_path (Issue #292).
+    /// Key: sandbox-verified relative path, Value: attempt count (max 2).
+    pub proactive_delegation_retry_budget: HashMap<String, u8>,
 }
 
 impl Default for StagnationState {
@@ -63,6 +66,7 @@ impl StagnationState {
             turn_ended: true,
             had_new_target_this_turn: false,
             had_plan_item_completion_this_turn: false,
+            proactive_delegation_retry_budget: HashMap::new(),
         }
     }
 
@@ -119,6 +123,29 @@ impl StagnationState {
                 .iter()
                 .any(|rf| ExecutionPlan::path_matches(f, rf))
         });
+    }
+
+    /// Consume one retry budget unit for the given target path (Issue #292).
+    ///
+    /// Returns `true` if delegation can proceed, `false` if budget is exhausted.
+    /// Budget limit: 2 attempts per path. Silently skips insert when map is
+    /// full (>= 64 entries) to bound memory usage.
+    pub fn consume_proactive_retry_budget(&mut self, path: &str) -> bool {
+        // Refuse new entries when the map is full.
+        if !self.proactive_delegation_retry_budget.contains_key(path)
+            && self.proactive_delegation_retry_budget.len() >= 64
+        {
+            return false;
+        }
+        let count = self
+            .proactive_delegation_retry_budget
+            .entry(path.to_string())
+            .or_insert(0);
+        if *count >= 2 {
+            return false;
+        }
+        *count += 1;
+        true
     }
 
     /// Record a plan item completion.

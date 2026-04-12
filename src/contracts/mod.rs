@@ -546,6 +546,14 @@ pub struct AgentTelemetry {
     /// waiting for the 600s runner timeout.
     #[serde(default)]
     pub worker_required_early_exit_count: u32,
+
+    /// Model-aware delegation trigger count (Issue #292).
+    #[serde(default)]
+    pub model_aware_delegation_count: u32,
+
+    /// Model-aware delegation that produced a file mutation (Issue #292).
+    #[serde(default)]
+    pub model_aware_delegation_produced_mutation: u32,
 }
 
 impl AgentTelemetry {
@@ -657,6 +665,21 @@ impl AgentTelemetry {
     /// Record a pre-mutation barrier block (Issue #303).
     pub fn record_mutation_barrier_block(&mut self) {
         self.mutation_barrier_block_count += 1;
+    }
+
+    /// Record a model-aware proactive delegation trigger (Issue #292).
+    ///
+    /// Increments `model_aware_delegation_count` only (SRP).
+    /// Does NOT update `fixslice_escalation_count` (DR2-008).
+    pub fn record_model_aware_delegation(&mut self) {
+        self.model_aware_delegation_count += 1;
+    }
+
+    /// Record a model-aware delegation that produced a successful mutation (Issue #292).
+    ///
+    /// Called when the proactive delegation results in a file change.
+    pub fn record_model_aware_delegation_mutation(&mut self) {
+        self.model_aware_delegation_produced_mutation += 1;
     }
 
     /// Record a mutation turn: updates `last_mutation_turn` and, on the first call only,
@@ -979,6 +1002,9 @@ impl AgentTelemetry {
             // Issue #355: escalation routing barrier + early-exit counters.
             "escalation_barrier_block_count": self.escalation_barrier_block_count,
             "worker_required_early_exit_count": self.worker_required_early_exit_count,
+            // Issue #292: model-aware delegation counters.
+            "model_aware_delegation_count": self.model_aware_delegation_count,
+            "model_aware_delegation_produced_mutation": self.model_aware_delegation_produced_mutation,
         });
 
         let json_bytes = serde_json::to_vec_pretty(&payload)?;

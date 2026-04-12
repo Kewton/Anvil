@@ -100,13 +100,13 @@ src/
 ├── lib.rs               # モジュール宣言
 ├── agent/
 │   ├── mod.rs           # エージェントループ・プロトコル
-│   ├── model_classifier.rs # モデル分類・ToolProtocolMode判定
+│   ├── model_classifier.rs # モデル分類・ToolProtocolMode判定・ModelSizeClass Display（Issue #292）
 │   ├── subagent.rs      # サブエージェント実行ループ（Explore/Plan/FixSlice、構造化payload・JSON ANVIL_FINAL対応・FixSliceProposalパース）
 │   ├── tag_parser.rs    # タグベースツール呼び出しパーサー（多層プロトコル対応）
 │   └── tag_spec.rs      # ツールタグ仕様テーブル（TOOL_TAG_SPECS）
 ├── app/
 │   ├── mod.rs           # アプリケーションオーケストレータ（SessionStats・CompactInfo・セッションサマリー含む）
-│   ├── agentic.rs       # agenticツール実行ループ（ANVIL_FINALガード・再試行ロジック・ターンサマリー・異常検出WARN含む）
+│   ├── agentic.rs       # agenticツール実行ループ（ANVIL_FINALガード・再試行ロジック・ターンサマリー・異常検出WARN・delegation_threshold・proactive branch含む）
 │   ├── cli.rs           # CLI入力ループ
 │   ├── context.rs       # コンテキスト注入（@file展開・サンドボックス検証）
 │   ├── edit_fail_tracker.rs # 連続file.edit失敗の検出・回復ヒント注入
@@ -118,7 +118,7 @@ src/
 │   ├── read_repeat_tracker.rs # file.read繰り返し検出・ヒント注入（セッション横断型・閾値2/4）
 │   ├── write_fail_tracker.rs # file.write連続失敗トラッキング（ヒント提供・閾値2）
 │   ├── write_repeat_tracker.rs # file.write成功繰り返しトラッキング（同一ファイルへのwrite検出・Warn閾値3/StrongWarn閾値4）
-│   ├── stagnation_state.rs # 停滞検知・ワークセットステアリング・budget-aware閾値（Issue #263）
+│   ├── stagnation_state.rs # 停滞検知・ワークセットステアリング・budget-aware閾値（Issue #263）・proactive_delegation_retry_budget（Issue #292）
 │   ├── plan.rs          # プラン管理
 │   ├── policy.rs        # offlineポリシーチェック（共通ヘルパー）
 │   ├── render.rs        # コンソール描画
@@ -176,6 +176,7 @@ tests/
 ├── prose_retire_fallback.rs # prose-only確認のplan retire変換テスト（Issue #307）
 ├── shell_inspection_drift.rs # shell.exec inspection drift テスト（Issue #309）
 ├── fixslice_subagent.rs # FixSliceサブエージェント統合テスト（Issue #291）
+├── model_aware_delegation.rs # モデル対応委譲ポリシーテスト（Issue #292）
 └── walk_system.rs       # ディレクトリウォーカーテスト
 ```
 

@@ -42,6 +42,16 @@ pub enum ModelSizeClass {
     Large,
 }
 
+impl std::fmt::Display for ModelSizeClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Small => write!(f, "Small"),
+            Self::Medium => write!(f, "Medium"),
+            Self::Large => write!(f, "Large"),
+        }
+    }
+}
+
 /// Combined model capability assessment.
 ///
 /// Produced by [`classify_model_capability`] and used to drive prompt tier
