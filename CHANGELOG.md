@@ -2,6 +2,103 @@
 
 ## [Unreleased]
 
+## [0.0.11] - 2026-04-12
+
+### Added
+- `agent.fix_slice` microtask sub-agent for targeted slice-level repair (#291)
+- `file.rewrite` bounded rewrite primitive for line-range block replacement (#290)
+
+### Fixed
+- Add reactive fix_slice escalation from repeated edit failures (#321)
+- Process ANVIL_PLAN_UPDATE before escape hatch break (#323)
+- Continue loop after pre-exit repair turn injection (#325)
+- Reject unchecked plan expansion during repair closure mode (#327)
+- Add pack validation gate for benchmark expectation mismatch detection (#329)
+- Broaden fix_slice escalation to cover cross-path drift (#332)
+- Add read-heavy worker escalation and tighten worker-required gate (#334)
+- Add structural closure guard for late-stage remaining=1 (#336)
+- Only flip worker_observed after real post-execution worker success (#339)
+- Embed target_path and max_lines in FixSlice worker prompt (#341)
+- Suppress pre-exit repair salvage after fix_slice worker failure (#343)
+- Strengthen fix_slice worker contract brittleness (#345)
+- Add ANVIL_FIXSLICE_MAX_ITERATIONS to env whitelist (#347)
+- Add closure-mode reasoning loop guard after fix_slice failure (#349)
+- Add subagent and parent thrash detectors (#351)
+- Make fix_slice no-progress detector tunable (#353)
+- Force agent.fix_slice routing and early-exit on worker success (#355)
+- Enforce FixSliceProposal contract in fix_slice prompt (#357)
+- Balance fix_slice prompt to prevent proposal-avoidance under path ambiguity (#359)
+
+## [0.0.10] - 2026-04-09
+
+### Added
+- Plan-execute mode with `ANVIL_PLAN` and checklist-managed `ANVIL_FINAL` control (#249)
+- Plan-aware stagnation control for workset steering (#263)
+- Plan-aware batch guidance and correctness fixes (#261)
+- CompletionKind taxonomy, AgentTelemetry, and strengthened item completion (#255)
+- Telemetry artifact infrastructure for comparison baseline repair (#271)
+- First-mutation telemetry for pre-mutation transition diagnosis (#273)
+- Post-mutation stagnation decomposition telemetry (#275)
+- File-role telemetry and mutation order measurement (#277)
+- Parallel tool progress display (#240)
+- Session note extraction with logging (#241)
+- Phase estimation in turn summary logs (#242)
+- Baseline optimization — guidance lightening and metrics contract (#269)
+- Orphan mutation detection to prevent final gate hang (#287)
+
+### Fixed
+- Prevent plan mode from becoming permanent across turns (#253)
+- Sync plan completion from touched_files before ANVIL_FINAL gate check (#251)
+- Align files_modified with actual disk changes (#259)
+- Detect file-reading shell.exec commands in read_guard (#265)
+- Reject file.edit when old_string == new_string (#266)
+- Prevent no-plan/no-op completion with success-style logs in follow-up paths (#285)
+- Prevent final gate hang on last plan item and fix Ollama streaming timeout (#287)
+- Prevent stale/alias plan item remaining after ANVIL_PLAN_UPDATE (#289)
+- Prevent recovered tool failure from polluting non-interactive exit code (#296)
+- Prevent edit recovery from triggering loop detector termination (#299)
+- Retire already-satisfied/verification-only plan items to prevent stale target pollution (#301)
+- Prevent agent.plan and ANVIL_PLAN conflict allowing unplanned mutations (#303)
+- Allow follow-up ANVIL_PLAN to replace active plan during replan (#305)
+- Convert prose-only already-implemented confirmation to plan retire (#307)
+- Integrate shell.exec inspection into phase/stagnation guidance (#309)
+- Unify superseded-only terminal plan exit semantics (#311)
+- Add token-based fallback to extract_edit_context for mid-file recovery (#313)
+- Auto-retire no-path plan items to prevent final gate deadlock (#315)
+
+## [0.0.9] - 2026-03-31
+
+### Added
+- OpenAI native `tool_calls` support and LM Studio compatibility (#215)
+- Read transition guard to detect read-phase stalling
+
+### Fixed
+- Support `/v1` base URLs for OpenAI-compatible providers
+- OpenAI native tool calls parsing and response handling
+
+## [0.0.8] - 2026-03-31
+
+### Added
+- ANVIL.md custom tool registration with `## tools` section (#193)
+- Sidecar model LLM-based context summarization (#195)
+- Read repeat tracker to detect and warn repeated file.read (#185)
+- Write repeat tracker to prevent file.edit→file.write loop (#184)
+- Duplicate tool call deduplication in single turn (#186)
+- Debug observability with turn summaries, file.edit details, and session metrics (#206)
+- Cause-analysis and current-situation slash commands
+
+### Fixed
+- Raise thresholds to reduce CI-induced implementation suppression (#187)
+- Use `min(context_window, context_budget)` for auto-compact threshold (#200)
+- Use `config.runtime.context_budget` in `derive_context_budget()` (#198)
+- Run auto-compact in non-interactive mode (`--exec-file`/`--exec`/`--oneshot`) (#202)
+- Add `max_output_tokens` to prevent infinite LLM stream (#204)
+- Use `context_budget` instead of `context_window` in turn summary budget display (#208)
+
+### Changed
+- Improve sidecar summarization prompt for coding tasks (#209)
+- Enforce Codex reviewer via `--agent codex` in multi-stage review commands
+
 ## [0.0.7] - 2026-03-27
 
 ### Added
