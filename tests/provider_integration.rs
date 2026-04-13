@@ -3992,6 +3992,186 @@ fn anvil_final_guard_handle_structured_done_fires_for_plan_only_response() {
 }
 
 #[test]
+fn done_with_anvil_plan_only_continues_into_followup_execution() {
+    let root = common::unique_test_dir("done_plan_only_followup");
+    let mut config = common::build_config_in(root.clone());
+    config.mode.approval_required = false;
+    let provider_ctx =
+        anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
+    let mut app = anvil::app::App::new(
+        config,
+        provider_ctx,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("app should initialize");
+    let tui = Tui::new();
+
+    let seen_requests = Rc::new(RefCell::new(Vec::new()));
+
+    struct PlanOnlyDoneProvider {
+        seen_requests: Rc<RefCell<Vec<ProviderTurnRequest>>>,
+    }
+
+    impl ProviderClient for PlanOnlyDoneProvider {
+        fn stream_turn(
+            &self,
+            request: &ProviderTurnRequest,
+            emit: &mut dyn FnMut(ProviderEvent),
+        ) -> Result<(), ProviderTurnError> {
+            let call_index = self.seen_requests.borrow().len();
+            self.seen_requests.borrow_mut().push(request.clone());
+
+            match call_index {
+                0 => {
+                    emit(ProviderEvent::Agent(AgentEvent::Done {
+                        status: "Done. session saved".to_string(),
+                        assistant_message: concat!(
+                            "了解しました。まず計画を立てます。\n\n",
+                            "```ANVIL_PLAN\n",
+                            "- [ ] next.config.ts: basePath と assetPrefix を設定\n",
+                            "```\n\n",
+                            "まず `next.config.ts` を編集します。"
+                        )
+                        .to_string(),
+                        completion_summary: "plan only".to_string(),
+                        saved_status: "session saved".to_string(),
+                        tool_logs: Vec::new(),
+                        elapsed_ms: 100,
+                        inference_performance: None,
+                        tool_calls: None,
+                        assistant_tool_call_records: None,
+                    }));
+                }
+                _ => {
+                    emit(ProviderEvent::TokenDelta(
+                        concat!(
+                            "```ANVIL_TOOL\n",
+                            "{\"id\":\"call_001\",\"tool\":\"file.write\",\"path\":\"./next.config.ts\",\"content\":\"export default {}\\n\"}\n",
+                            "```\n",
+                            "```ANVIL_FINAL\n",
+                            "Updated next.config.ts.\n",
+                            "```\n"
+                        )
+                        .to_string(),
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    let provider = PlanOnlyDoneProvider {
+        seen_requests: seen_requests.clone(),
+    };
+
+    let _frames = app
+        .run_live_turn("localhost:3011 で起動したい", &provider, &tui)
+        .expect("plan-only done path should continue into execution");
+
+    let requests = seen_requests.borrow();
+    assert_eq!(
+        requests.len(),
+        2,
+        "expected initial plan-only Done + one follow-up execution request"
+    );
+    assert!(
+        root.join("next.config.ts").exists(),
+        "follow-up execution should write the planned file"
+    );
+}
+
+#[test]
+fn done_with_plan_and_anvil_final_continues_into_followup_execution() {
+    let root = common::unique_test_dir("done_plan_and_final_followup");
+    let mut config = common::build_config_in(root.clone());
+    config.mode.approval_required = false;
+    let provider_ctx =
+        anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
+    let mut app = anvil::app::App::new(
+        config,
+        provider_ctx,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("app should initialize");
+    let tui = Tui::new();
+
+    let seen_requests = Rc::new(RefCell::new(Vec::new()));
+
+    struct PlanAndFinalDoneProvider {
+        seen_requests: Rc<RefCell<Vec<ProviderTurnRequest>>>,
+    }
+
+    impl ProviderClient for PlanAndFinalDoneProvider {
+        fn stream_turn(
+            &self,
+            request: &ProviderTurnRequest,
+            emit: &mut dyn FnMut(ProviderEvent),
+        ) -> Result<(), ProviderTurnError> {
+            let call_index = self.seen_requests.borrow().len();
+            self.seen_requests.borrow_mut().push(request.clone());
+
+            match call_index {
+                0 => {
+                    emit(ProviderEvent::Agent(AgentEvent::Done {
+                        status: "Done. session saved".to_string(),
+                        assistant_message: concat!(
+                            "まず計画を示します。\n\n",
+                            "```ANVIL_PLAN\n",
+                            "- [ ] src/output.txt: create output file\n",
+                            "```\n\n",
+                            "```ANVIL_FINAL\n",
+                            "Plan prepared. Next I will edit the file.\n",
+                            "```\n"
+                        )
+                        .to_string(),
+                        completion_summary: "plan and final only".to_string(),
+                        saved_status: "session saved".to_string(),
+                        tool_logs: Vec::new(),
+                        elapsed_ms: 100,
+                        inference_performance: None,
+                        tool_calls: None,
+                        assistant_tool_call_records: None,
+                    }));
+                }
+                _ => {
+                    emit(ProviderEvent::TokenDelta(
+                        concat!(
+                            "```ANVIL_TOOL\n",
+                            "{\"id\":\"call_001\",\"tool\":\"file.write\",\"path\":\"./src/output.txt\",\"content\":\"ok\\n\"}\n",
+                            "```\n",
+                            "```ANVIL_FINAL\n",
+                            "Created src/output.txt.\n",
+                            "```\n"
+                        )
+                        .to_string(),
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    let provider = PlanAndFinalDoneProvider {
+        seen_requests: seen_requests.clone(),
+    };
+
+    let _frames = app
+        .run_live_turn("ファイルを作成して", &provider, &tui)
+        .expect("plan+final done path should continue into execution");
+
+    let requests = seen_requests.borrow();
+    assert_eq!(
+        requests.len(),
+        2,
+        "expected initial plan+final Done + one follow-up execution request"
+    );
+    assert!(
+        root.join("src/output.txt").exists(),
+        "follow-up execution should write the planned file"
+    );
+}
+
+#[test]
 fn anvil_final_guard_prompt_tool_rules_contains_implementation_guidance() {
     // Verify that the system prompt includes the implementation guidance text
     let app = common::build_app();

@@ -3158,6 +3158,23 @@ impl App {
                 .map_err(AppError::ToolExecution)?
         };
         if structured.tool_calls.is_empty() {
+            // Plan-only Done responses must still enter the agentic loop so the
+            // model can consume the registered plan and proceed to execution.
+            if crate::agent::extract_plan_block(assistant_message).is_some()
+                || crate::agent::extract_plan_update_block(assistant_message).is_some()
+            {
+                let anvil_final = structured.anvil_final_detected;
+                return Ok(Some(self.complete_structured_response(
+                    structured,
+                    status,
+                    saved_status,
+                    *elapsed_ms,
+                    inference_performance.clone(),
+                    tui,
+                    provider_client,
+                    anvil_final,
+                )?));
+            }
             // ANVIL_FINAL guard: only activate when the message contains a
             // structured ANVIL_FINAL block (not plain-text Done messages).
             // Inject retry message and re-invoke LLM directly (not via
