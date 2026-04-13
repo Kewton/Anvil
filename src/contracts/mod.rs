@@ -333,6 +333,102 @@ impl CompletionKind {
 }
 
 // ---------------------------------------------------------------------------
+// Retry telemetry (Issue #372)
+// ---------------------------------------------------------------------------
+
+/// Retry path telemetry (Issue #372).
+///
+/// Organized by category:
+///   - Retry: explicit re-attempts (guidance, final_guard, http)
+///   - Fallback: escalation to alternative strategies (edit_fallback, edit_write)
+///   - Suppression: termination signal suppression (plan_gate)
+///   - Delegation: proactive delegation hints
+///   - Parse Recovery: parse failure handling
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RetryTelemetry {
+    // --- Retry ---
+    #[serde(default)]
+    pub guidance_retry_attempted: u32,
+    #[serde(default)]
+    pub guidance_retry_succeeded: u32,
+    #[serde(default)]
+    pub final_guard_retry_attempted: u32,
+    #[serde(default)]
+    pub final_guard_retry_succeeded: u32,
+    #[serde(default)]
+    pub http_retry_attempted: u32,
+    #[serde(default)]
+    pub http_retry_final_failure: u32,
+    // --- Fallback ---
+    #[serde(default)]
+    pub edit_fallback_strict_count: u32,
+    #[serde(default)]
+    pub edit_fallback_trailing_ws_count: u32,
+    #[serde(default)]
+    pub edit_fallback_anchor_count: u32,
+    #[serde(default)]
+    pub edit_fallback_all_failed_count: u32,
+    #[serde(default)]
+    pub edit_write_fallback_attempted: u32,
+    #[serde(default)]
+    pub edit_write_fallback_succeeded: u32,
+    // --- Suppression ---
+    #[serde(default)]
+    pub plan_gate_suppression_attempted: u32,
+    #[serde(default)]
+    pub plan_gate_suppression_succeeded: u32,
+    // --- Delegation ---
+    #[serde(default)]
+    pub proactive_delegation_attempted: u32,
+    #[serde(default)]
+    pub proactive_delegation_succeeded: u32,
+    // --- Parse Recovery ---
+    #[serde(default)]
+    pub parse_failure_recovered: u32,
+    #[serde(default)]
+    pub parse_failure_empty_errored: u32,
+}
+
+impl RetryTelemetry {
+    /// Record a guidance retry attempt.
+    pub fn record_guidance_retry_attempted(&mut self) {
+        self.guidance_retry_attempted += 1;
+    }
+    /// Record a guidance retry success.
+    pub fn record_guidance_retry_succeeded(&mut self) {
+        self.guidance_retry_succeeded += 1;
+    }
+    /// Record a final guard retry attempt.
+    pub fn record_final_guard_retry_attempted(&mut self) {
+        self.final_guard_retry_attempted += 1;
+    }
+    /// Record a final guard retry success.
+    pub fn record_final_guard_retry_succeeded(&mut self) {
+        self.final_guard_retry_succeeded += 1;
+    }
+    /// Record a plan gate suppression attempt.
+    pub fn record_plan_gate_suppression_attempted(&mut self) {
+        self.plan_gate_suppression_attempted += 1;
+    }
+    /// Record a proactive delegation attempt.
+    pub fn record_proactive_delegation_attempted(&mut self) {
+        self.proactive_delegation_attempted += 1;
+    }
+    /// Record a parse failure recovery (non-empty output treated as plain text).
+    pub fn record_parse_failure_recovered(&mut self) {
+        self.parse_failure_recovered += 1;
+    }
+    /// Record a parse failure with empty output (fail-fast).
+    pub fn record_parse_failure_empty_errored(&mut self) {
+        self.parse_failure_empty_errored += 1;
+    }
+    /// Record an edit write fallback attempt.
+    pub fn record_edit_write_fallback_attempted(&mut self) {
+        self.edit_write_fallback_attempted += 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Agent telemetry (Issue #255: Stage 0 observability)
 // ---------------------------------------------------------------------------
 
@@ -554,6 +650,10 @@ pub struct AgentTelemetry {
     /// Model-aware delegation that produced a file mutation (Issue #292).
     #[serde(default)]
     pub model_aware_delegation_produced_mutation: u32,
+
+    /// Issue #372: retry path telemetry (flattened into artifact JSON).
+    #[serde(flatten, default)]
+    pub retry: RetryTelemetry,
 }
 
 impl AgentTelemetry {
@@ -948,64 +1048,42 @@ impl AgentTelemetry {
             return Err("telemetry file path escapes the target directory".into());
         }
 
-        // Build the artifact payload with derived values.
+        // Build the artifact payload from serde_json::to_value (DRY, Issue #372 DR1-001).
+        // Overlay artifact-specific derived fields that are not struct members.
+        let mut payload = serde_json::to_value(self)?;
+        let obj = payload
+            .as_object_mut()
+            .ok_or("telemetry serialization did not produce an object")?;
+        // Derived / external fields
+        obj.insert(
+            "schema_version".to_string(),
+            serde_json::Value::String("2".to_string()),
+        );
+        obj.insert(
+            "session_id".to_string(),
+            serde_json::Value::String(session_id.to_string()),
+        );
+        obj.insert(
+            "accepted_final_count".to_string(),
+            serde_json::json!(self.accepted_final_count()),
+        );
+        obj.insert(
+            "late_mutation_flag".to_string(),
+            serde_json::json!(self.is_late_mutation()),
+        );
+        obj.insert(
+            "first_mutation_event_semantic_basis".to_string(),
+            serde_json::Value::String("runtime_lower_bound".to_string()),
+        );
+        // completion_kind: None → "none" for backward compatibility
         let completion = self
             .completion_kind
             .map(|k| k.to_string())
             .unwrap_or_else(|| "none".to_string());
-
-        let payload = serde_json::json!({
-            "schema_version": "2",
-            "session_id": session_id,
-            "completion_kind": completion,
-            "premature_final_count": self.premature_final_count,
-            "total_final_requests": self.total_final_requests,
-            "accepted_final_count": self.accepted_final_count(),
-            "plan_registration_count": self.plan_registration_count,
-            "plan_update_count": self.plan_update_count,
-            "anvil_plan_visible_count": self.anvil_plan_visible_count,
-            "last_mutation_turn": self.last_mutation_turn,
-            "late_mutation_flag": self.is_late_mutation(),
-            "final_suppressed_with_remaining_targets_count":
-                self.final_suppressed_with_remaining_targets_count,
-            "sync_from_touched_files_count": self.sync_from_touched_files_count,
-            "forced_workset_transition_count": self.forced_workset_transition_count,
-            "initial_plan_miss_count": self.initial_plan_miss_count,
-            "no_op_mutation_count": self.no_op_mutation_count,
-            "rolled_back_mutation_count": self.rolled_back_mutation_count,
-            "plan_repair_request_count": self.plan_repair_request_count,
-            "mutations_per_turn": self.mutations_per_turn,
-            "items_advanced_per_turn": self.items_advanced_per_turn,
-            "guidance_chars_per_turn": self.guidance_chars_per_turn,
-            "workset_size_per_turn": self.workset_size_per_turn,
-            "first_mutation_event_turn": self.first_mutation_event_turn,
-            "first_mutation_event_elapsed_s": self.first_mutation_event_elapsed_s,
-            "first_mutation_event_tool": self.first_mutation_event_tool,
-            "first_mutation_event_semantic_basis": "runtime_lower_bound",
-            // Issue #329: pack validation gate observability fields
-            "mutation_observed": self.mutation_observed,
-            "worker_observed": self.worker_observed,
-            "repair_turn_observed": self.repair_turn_observed,
-            "pack_expectation": self.pack_expectation.map(|e| e.to_string()),
-            "expectation_mismatch_reason": self.expectation_mismatch_reason,
-            // Issue #332: distinguishing fix_slice escalation reasons.
-            "fixslice_escalation_count": self.fixslice_escalation_count,
-            "fixslice_escalation_same_path_count": self.fixslice_escalation_same_path_count,
-            "fixslice_escalation_stagnation_count": self.fixslice_escalation_stagnation_count,
-            "fixslice_escalation_repair_salvage_count":
-                self.fixslice_escalation_repair_salvage_count,
-            // Issue #343: fix_slice worker failure taxonomy.
-            "fixslice_worker_failure_count": self.fixslice_worker_failure_count,
-            "fixslice_failure_reason": self.fixslice_failure_reason,
-            // Issue #345: fix_slice worker invocation tracking.
-            "fixslice_worker_invocation_count": self.fixslice_worker_invocation_count,
-            // Issue #355: escalation routing barrier + early-exit counters.
-            "escalation_barrier_block_count": self.escalation_barrier_block_count,
-            "worker_required_early_exit_count": self.worker_required_early_exit_count,
-            // Issue #292: model-aware delegation counters.
-            "model_aware_delegation_count": self.model_aware_delegation_count,
-            "model_aware_delegation_produced_mutation": self.model_aware_delegation_produced_mutation,
-        });
+        obj.insert(
+            "completion_kind".to_string(),
+            serde_json::Value::String(completion),
+        );
 
         let json_bytes = serde_json::to_vec_pretty(&payload)?;
 

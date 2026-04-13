@@ -922,6 +922,28 @@ impl App {
                 }
             }
 
+            // Issue #372: collect file.edit fallback telemetry from EditResultDetail.
+            for r in &results {
+                if r.tool_name == "file.edit" || r.tool_name == "file.edit_anchor" {
+                    if let Some(ref detail) = r.edit_detail {
+                        match detail.fallback_stage {
+                            crate::tooling::EditFallbackStage::Strict => {
+                                self.agent_telemetry.retry.edit_fallback_strict_count += 1;
+                            }
+                            crate::tooling::EditFallbackStage::TrailingWs => {
+                                self.agent_telemetry.retry.edit_fallback_trailing_ws_count += 1;
+                            }
+                            crate::tooling::EditFallbackStage::Anchor => {
+                                self.agent_telemetry.retry.edit_fallback_anchor_count += 1;
+                            }
+                        }
+                    }
+                    if r.status == crate::tooling::ToolExecutionStatus::Failed {
+                        self.agent_telemetry.retry.edit_fallback_all_failed_count += 1;
+                    }
+                }
+            }
+
             let tool_log_views: Vec<ToolLogView> = results
                 .iter()
                 .map(ToolExecutionResult::to_tool_log_view)
@@ -972,6 +994,8 @@ impl App {
                     tracing::info!(
                         "ANVIL_FINAL delayed: synthetic guidance injected, sending one follow-up turn"
                     );
+                    // Issue #372: (A) guidance retry telemetry
+                    self.agent_telemetry.retry.record_guidance_retry_attempted();
                     guidance_retry_used = true;
                     awaiting_guidance_followup = true;
                     anvil_final_seen = false;
@@ -1129,15 +1153,29 @@ impl App {
                 &self.tools,
             ) {
                 Ok(parsed) => parsed,
-                Err(first_err) => {
+                Err(_first_err) => {
                     // LLMs occasionally produce malformed output; treat the
                     // raw text as a plain final answer rather than failing the
                     // entire turn.
                     let trimmed = next_token_buffer.trim();
                     if !trimmed.is_empty() {
+                        // Issue #372: graceful degradation — non-empty output
+                        // is treated as plain text.
+                        self.agent_telemetry.retry.record_parse_failure_recovered();
+                        tracing::warn!(
+                            "parse failure recovered: treating as plain text ({} chars)",
+                            trimmed.len()
+                        );
                         StructuredAssistantResponse::empty(trimmed.to_string())
                     } else {
-                        return Err(AppError::ToolExecution(first_err));
+                        // Issue #372: fail-fast — empty output is a complete
+                        // failure with no recoverable content.
+                        self.agent_telemetry
+                            .retry
+                            .record_parse_failure_empty_errored();
+                        return Err(AppError::ToolExecution(
+                            "assistant response parse failed after empty follow-up".to_string(),
+                        ));
                     }
                 }
             };
@@ -1222,6 +1260,10 @@ impl App {
                     self.session.push_message(msg);
 
                     self.agent_telemetry.record_model_aware_delegation();
+                    // Issue #372: (F) proactive delegation telemetry
+                    self.agent_telemetry
+                        .retry
+                        .record_proactive_delegation_attempted();
                     self.proactive_delegation_pending = true;
                     proactive_delegation_fired = true;
                 }
@@ -1640,6 +1682,10 @@ impl App {
                         tracing::info!(
                             "Guidance follow-up ended without edits; escalating to final guard retry"
                         );
+                        // Issue #372: (B) final guard retry telemetry (guidance escalation path)
+                        self.agent_telemetry
+                            .retry
+                            .record_final_guard_retry_attempted();
                         self.inject_final_guard_retry();
                         final_guard_retries += 1;
                         current = next_structured;
@@ -1654,6 +1700,10 @@ impl App {
                 }
                 // ANVIL_FINAL guard: check if any file modifications were made
                 if self.should_activate_final_guard(final_guard_retries) {
+                    // Issue #372: (B) final guard retry telemetry (loop path)
+                    self.agent_telemetry
+                        .retry
+                        .record_final_guard_retry_attempted();
                     self.inject_final_guard_retry();
                     final_guard_retries += 1;
                     current = next_structured;
@@ -1718,9 +1768,20 @@ impl App {
 
             // More tool calls — continue the loop
             if awaiting_guidance_followup {
+                // Issue #372: (A) guidance retry succeeded — follow-up turn
+                // produced tool calls.
+                self.agent_telemetry.retry.record_guidance_retry_succeeded();
                 awaiting_guidance_followup = false;
             }
             current = next_structured;
+        }
+
+        // Issue #372: (B) final guard retry success — retries fired and files
+        // were ultimately modified.
+        if final_guard_retries > 0 && !self.session.working_memory.touched_files.is_empty() {
+            self.agent_telemetry
+                .retry
+                .record_final_guard_retry_succeeded();
         }
 
         // Issue #255: Classify completion kind based on plan state.
@@ -2646,6 +2707,10 @@ impl App {
                                 count = count,
                                 "repeated tool failure - suggesting write fallback"
                             );
+                            // Issue #372: (D) edit→write fallback telemetry
+                            self.agent_telemetry
+                                .retry
+                                .record_edit_write_fallback_attempted();
                             self.prepare_write_fallback();
                             let max_lines = self.config.runtime.safe_write_max_lines;
                             let line_count = if max_lines > 0 {
@@ -3094,6 +3159,10 @@ impl App {
                         provider_client,
                     )?));
                 }
+                // Issue #372: (B) final guard retry telemetry (Done path)
+                self.agent_telemetry
+                    .retry
+                    .record_final_guard_retry_attempted();
                 self.inject_final_guard_retry();
                 // Record the assistant message that triggered the guard
                 self.record_assistant_output(self.next_message_id("assistant"), assistant_message)?;
