@@ -3992,6 +3992,106 @@ fn anvil_final_guard_handle_structured_done_fires_for_plan_only_response() {
 }
 
 #[test]
+fn implementation_task_with_read_only_followup_does_not_stop_without_plan() {
+    let root = common::unique_test_dir("read_only_followup_requires_plan");
+    let mut config = common::build_config_in(root.clone());
+    config.mode.approval_required = false;
+    let provider_ctx =
+        anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
+    let mut app = anvil::app::App::new(
+        config,
+        provider_ctx,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("app should initialize");
+    let tui = Tui::new();
+
+    let seen_requests = Rc::new(RefCell::new(Vec::new()));
+
+    struct ReadOnlyFollowupProvider {
+        seen_requests: Rc<RefCell<Vec<ProviderTurnRequest>>>,
+    }
+
+    impl ProviderClient for ReadOnlyFollowupProvider {
+        fn stream_turn(
+            &self,
+            request: &ProviderTurnRequest,
+            emit: &mut dyn FnMut(ProviderEvent),
+        ) -> Result<(), ProviderTurnError> {
+            let call_index = self.seen_requests.borrow().len();
+            self.seen_requests.borrow_mut().push(request.clone());
+
+            match call_index {
+                0 => {
+                    emit(ProviderEvent::Agent(AgentEvent::Done {
+                        status: "Done. session saved".to_string(),
+                        assistant_message: concat!(
+                            "```ANVIL_TOOL\n",
+                            "{\"id\":\"call_001\",\"tool\":\"file.read\",\"path\":\".\"}\n",
+                            "```\n"
+                        )
+                        .to_string(),
+                        completion_summary: "read root".to_string(),
+                        saved_status: "session saved".to_string(),
+                        tool_logs: Vec::new(),
+                        elapsed_ms: 0,
+                        inference_performance: None,
+                        tool_calls: None,
+                        assistant_tool_call_records: None,
+                    }));
+                }
+                1 => {
+                    emit(ProviderEvent::TokenDelta(
+                        "現在のディレクトリには .anvil だけがあります。新しい Next.js アプリを作成する必要があります。"
+                            .to_string(),
+                    ));
+                }
+                _ => {
+                    emit(ProviderEvent::TokenDelta(
+                        concat!(
+                            "```ANVIL_PLAN\n",
+                            "- [ ] next.config.ts: configure base path\n",
+                            "```\n",
+                            "```ANVIL_TOOL\n",
+                            "{\"id\":\"call_002\",\"tool\":\"file.write\",\"path\":\"./next.config.ts\",\"content\":\"export default {}\\n\"}\n",
+                            "```\n",
+                            "```ANVIL_FINAL\n",
+                            "Created the initial Next.js config.\n",
+                            "```\n"
+                        )
+                        .to_string(),
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    let provider = ReadOnlyFollowupProvider {
+        seen_requests: seen_requests.clone(),
+    };
+
+    let _frames = app
+        .run_live_turn(
+            "あなたが考える最高に面白くカッコ良いスペースインベーダーゲームをhttp://localhost:3012/proxy/localllmtest で利用可能なnext.jsアプリとして開発してください。",
+            &provider,
+            &tui,
+        )
+        .expect("read-only follow-up scenario should continue");
+
+    let requests = seen_requests.borrow();
+    assert_eq!(
+        requests.len(),
+        3,
+        "expected initial read, suppressed read-only follow-up, and implementation retry"
+    );
+    assert!(
+        root.join("next.config.ts").exists(),
+        "implementation retry should write a planned file"
+    );
+}
+
+#[test]
 fn done_with_anvil_plan_only_continues_into_followup_execution() {
     let root = common::unique_test_dir("done_plan_only_followup");
     let mut config = common::build_config_in(root.clone());

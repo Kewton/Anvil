@@ -299,10 +299,39 @@ fn execute_parallel_group_standalone(
     all_results
 }
 
+fn task_likely_requires_file_changes(task: &str) -> bool {
+    let lower = task.to_ascii_lowercase();
+    let english_markers = [
+        "implement",
+        "fix",
+        "create",
+        "modify",
+        "add",
+        "build",
+        "develop",
+        "refactor",
+        "update",
+    ];
+    let japanese_markers = [
+        "実装",
+        "修正",
+        "作成",
+        "変更",
+        "追加",
+        "開発",
+        "作って",
+        "作る",
+    ];
+
+    english_markers.iter().any(|m| lower.contains(m))
+        || japanese_markers.iter().any(|m| task.contains(m))
+}
+
 /// Maximum number of ANVIL_FINAL guard retries (no-file-modification detection).
 const MAX_FINAL_GUARD_RETRIES: u8 = 1;
 const FILE_READ_RESULT_MAX_CHARS: usize = 2_000;
 const SYNTHETIC_GUIDANCE_RESULT_MAX_CHARS: usize = 1_200;
+const EXPLORATION_TOOL_NAMES: &[&str] = &["file.read", "file.search", "web.fetch"];
 
 /// Message sent to LLM when ANVIL_FINAL fires without file modifications.
 const FINAL_GUARD_RETRY_MESSAGE: &str = "No file modifications detected (file.write/file.edit not called). \
@@ -688,6 +717,24 @@ impl App {
             && results
                 .iter()
                 .any(|r| GUIDANCE_TOOL_NAMES.contains(&r.tool_name.as_str()))
+    }
+
+    fn should_require_plan_for_implementation_task(&self, noplan_suppression_count: u8) -> bool {
+        if noplan_suppression_count > 0 || !self.session_stats.files_modified.is_empty() {
+            return false;
+        }
+
+        let Some(task) = self.session.working_memory.active_task.as_deref() else {
+            return false;
+        };
+        if !task_likely_requires_file_changes(task) {
+            return false;
+        }
+
+        self.session_stats
+            .tool_calls
+            .keys()
+            .any(|tool| EXPLORATION_TOOL_NAMES.contains(&tool.as_str()))
     }
 
     /// Inject a retry message into the session to prompt the LLM for actual implementation.
@@ -1744,8 +1791,11 @@ impl App {
                 let session_has_mutation_attempts = MUTATION_TOOL_NAMES
                     .iter()
                     .any(|t| self.session_stats.tool_calls.contains_key(*t));
-                let require_plan_here = session_has_mutation_attempts
-                    && self.session_stats.files_modified.is_empty()
+                let require_plan_here = ((session_has_mutation_attempts
+                    && self.session_stats.files_modified.is_empty())
+                    || self.should_require_plan_for_implementation_task(
+                        noplan_suppression_count,
+                    ))
                     && noplan_suppression_count == 0;
                 if self.check_plan_final_gate_with_require(require_plan_here) {
                     if require_plan_here {
