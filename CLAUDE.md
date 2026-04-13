@@ -138,16 +138,16 @@ src/
 │   └── transport.rs     # STDIOトランスポート（McpTransport trait, StdioTransport）
 ├── metrics/mod.rs       # ベンチマーク
 ├── provider/
-│   ├── mod.rs           # プロバイダー抽象化
-│   ├── ollama.rs        # Ollamaクライアント（sidecar_summarize: サイドカーモデルによるLLM要約生成・is_low_quality_sidecar_summary: サイドカー品質ゲート（Issue #293））
-│   ├── openai.rs        # OpenAI互換クライアント
+│   ├── mod.rs           # プロバイダー抽象化（NativeToolDef・AssistantToolCallRecord・ProviderCapabilities.native_tool_calling・ProviderTurnRequest.tools（Issue #373））
+│   ├── ollama.rs        # Ollamaクライアント（sidecar_summarize・ネイティブtool calling対応（Issue #373）・is_low_quality_sidecar_summary: サイドカー品質ゲート（Issue #293））
+│   ├── openai.rs        # OpenAI互換クライアント（ネイティブtool calling対応・ParsedToolCall共通ヘルパー・native/fallbackストリーミング分岐（Issue #373））
 │   └── transport.rs     # HTTPトランスポート
 ├── retrieval/mod.rs     # リポジトリ検索（オンデマンドコンテンツ読込・軽量キャッシュ）
 ├── session/mod.rs       # セッション永続化（名前付きセッション・一覧・切替・削除・マイグレーション・構造化WorkingMemory・LLM要約コンパクション・SessionNote抽出・advisory sidecar compaction（Issue #293））
 ├── spinner.rs           # スピナーUI（並列詳細進捗表示・start_parallel_detailed・format_detailed_progress）
 ├── state/mod.rs         # 状態マシン
 ├── tooling/
-│   ├── mod.rs           # ツール実行・検証・CheckpointStack（undo用チェックポイント管理）・EditFallbackStage・file.edit詳細ログ・file.rewrite（行番号範囲ベースのブロック全置換）
+│   ├── mod.rs           # ツール実行・検証・CheckpointStack（undo用チェックポイント管理）・EditFallbackStage・file.edit詳細ログ・file.rewrite（行番号範囲ベースのブロック全置換）・NativeToolDef・ToolSchemaCatalog（Issue #373）
 │   ├── diff.rs          # 差分プレビュー生成（file.write/file.edit/file.rewrite承認時）
 │   ├── file_cache.rs    # ファイル読み取りキャッシュ（FileReadCache: LRUエビクション・sandbox境界検証）
 │   ├── progress.rs      # 並列実行進捗型（ToolProgressStatus・ToolProgressEntry）

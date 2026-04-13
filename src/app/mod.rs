@@ -837,6 +837,12 @@ impl App {
     fn build_dynamic_system_prompt(&self) -> String {
         use crate::agent::tool_protocol_system_prompt;
 
+        // Issue #373: Native tool calling mode — use simplified prompt
+        // that omits ANVIL_TOOL format descriptions when native tool calling
+        // is active and no MCP tools are configured.
+        let use_native_prompt =
+            self.provider.capabilities.native_tool_calling && self.mcp_descriptions.is_none();
+
         // Offline mode: exclude web.* tools from used_tools.
         // Non-offline: pass a reference directly to avoid cloning.
         let filtered_tools;
@@ -853,13 +859,20 @@ impl App {
             &self.session.used_tools
         };
 
-        let mut prompt = tool_protocol_system_prompt(
-            &self.detected_languages,
-            self.mcp_descriptions.as_deref(),
-            effective_used_tools,
-            self.config.mode.offline,
-            self.prompt_tier,
-        );
+        let mut prompt = if use_native_prompt {
+            crate::agent::build_native_tool_calling_prompt(
+                &self.detected_languages,
+                None, // MCP descriptions already checked above
+            )
+        } else {
+            tool_protocol_system_prompt(
+                &self.detected_languages,
+                self.mcp_descriptions.as_deref(),
+                effective_used_tools,
+                self.config.mode.offline,
+                self.prompt_tier,
+            )
+        };
 
         // Current date and timezone (dynamic, re-evaluated per turn)
         prompt.push_str(&context::format_date_prompt());
@@ -1319,6 +1332,19 @@ impl App {
         }
     }
 
+    /// Build native tool definitions when native tool calling is active (Issue #373).
+    ///
+    /// Returns `Some(Vec<NativeToolDef>)` if native tool calling is enabled,
+    /// `None` otherwise.  The caller should attach the result to the
+    /// `ProviderTurnRequest` via `request.tools = ...`.
+    fn build_native_tools(&self) -> Option<Vec<crate::tooling::NativeToolDef>> {
+        if !self.provider.capabilities.native_tool_calling {
+            return None;
+        }
+        let catalog = crate::tooling::ToolSchemaCatalog::builtin();
+        Some(catalog.all().into_iter().cloned().collect())
+    }
+
     /// Switch to a different named session.
     ///
     /// Validates the name, saves the current session, builds a new
@@ -1475,6 +1501,24 @@ impl App {
         Ok(())
     }
 
+    /// Record assistant output with native tool call records for session replay.
+    ///
+    /// The `records` are attached to the `SessionMessage.assistant_tool_calls`
+    /// field so that `to_provider_message_with_images` can reconstruct
+    /// `ProviderMessage.assistant_tool_calls` in follow-up turns (Issue #373).
+    pub fn record_assistant_output_with_tool_calls(
+        &mut self,
+        message_id: impl Into<String>,
+        content: impl Into<String>,
+        records: Vec<crate::provider::AssistantToolCallRecord>,
+    ) -> Result<(), AppError> {
+        let mut msg = new_assistant_message(message_id, content, MessageStatus::Committed);
+        msg.assistant_tool_calls = Some(records);
+        self.session.push_message(msg);
+        self.persist_session(AppEvent::SessionSaved)?;
+        Ok(())
+    }
+
     pub fn run_runtime_turn(
         &mut self,
         user_input: impl Into<String>,
@@ -1528,6 +1572,8 @@ impl App {
         } else {
             None
         };
+        // Issue #373: Attach native tool definitions when enabled.
+        request.tools = self.build_native_tools();
         self.last_estimated_prompt_tokens = Some(estimated_prompt_tokens);
 
         // Phase 1: Collect events from provider with spinner + streaming output.
@@ -2013,6 +2059,8 @@ impl App {
                 tool_logs,
                 elapsed_ms,
                 inference_performance,
+                tool_calls: _,
+                assistant_tool_call_records: _,
             } => {
                 self.record_assistant_output(self.next_message_id("assistant"), assistant_message)?;
 

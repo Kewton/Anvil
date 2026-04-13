@@ -2,10 +2,10 @@ use anvil::app::agentic::{ExecutionGroup, group_by_execution_mode};
 use anvil::tooling::file_cache::FileReadCache;
 use anvil::tooling::{
     CheckpointEntry, CheckpointStack, ExecutionClass, ExecutionMode, LocalToolExecutor,
-    ParallelExecutionPlan, ParallelExecutionPlanError, PermissionClass, PlanModePolicy,
-    RollbackPolicy, ToolCallRequest, ToolExecutionError, ToolExecutionPayload, ToolExecutionPolicy,
-    ToolExecutionRequest, ToolExecutionResult, ToolExecutionStatus, ToolInput, ToolKind,
-    ToolRegistry, ToolValidationError, detect_image_mime,
+    NativeToolDef, ParallelExecutionPlan, ParallelExecutionPlanError, PermissionClass,
+    PlanModePolicy, RollbackPolicy, ToolCallRequest, ToolExecutionError, ToolExecutionPayload,
+    ToolExecutionPolicy, ToolExecutionRequest, ToolExecutionResult, ToolExecutionStatus, ToolInput,
+    ToolKind, ToolRegistry, ToolSchemaCatalog, ToolValidationError, detect_image_mime,
 };
 use std::fs;
 use std::path::Path;
@@ -6719,4 +6719,117 @@ fn file_rewrite_registered_in_registry() {
     assert_eq!(spec.execution_mode, ExecutionMode::SequentialOnly);
     assert_eq!(spec.plan_mode, PlanModePolicy::AllowedWithScope);
     assert_eq!(spec.rollback_policy, RollbackPolicy::CheckpointBeforeWrite);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #373: NativeToolDef / ToolSchemaCatalog tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tool_schema_catalog_builtin_contains_all_standard_tools() {
+    let catalog = ToolSchemaCatalog::builtin();
+    // 12 built-in tools registered in register_standard_tools
+    assert!(catalog.len() >= 12, "catalog should have at least 12 tools");
+    assert!(!catalog.is_empty());
+}
+
+#[test]
+fn tool_schema_catalog_builtin_contains_expected_tools() {
+    let catalog = ToolSchemaCatalog::builtin();
+
+    let expected_tools = [
+        "file.read",
+        "file.write",
+        "file.edit",
+        "file.edit_anchor",
+        "file.rewrite",
+        "file.search",
+        "shell.exec",
+        "web.fetch",
+        "web.search",
+        "git.status",
+        "git.diff",
+        "git.log",
+    ];
+
+    for tool_name in &expected_tools {
+        assert!(
+            catalog.get(tool_name).is_some(),
+            "catalog should contain {tool_name}"
+        );
+    }
+}
+
+#[test]
+fn tool_schema_catalog_names_use_underscore_format() {
+    let catalog = ToolSchemaCatalog::builtin();
+
+    for def in catalog.all() {
+        assert!(
+            !def.name.contains('.'),
+            "native tool name '{}' should use underscore not dot",
+            def.name
+        );
+    }
+}
+
+#[test]
+fn tool_schema_catalog_parameters_include_additional_properties_false() {
+    let catalog = ToolSchemaCatalog::builtin();
+
+    for def in catalog.all() {
+        let additional = def.parameters.get("additionalProperties");
+        assert_eq!(
+            additional,
+            Some(&serde_json::json!(false)),
+            "tool '{}' should have additionalProperties: false",
+            def.name
+        );
+    }
+}
+
+#[test]
+fn tool_schema_catalog_file_read_has_required_path() {
+    let catalog = ToolSchemaCatalog::builtin();
+    let def = catalog.get("file.read").expect("file.read should exist");
+
+    assert_eq!(def.name, "file_read");
+    assert!(!def.description.is_empty());
+
+    let required = def.parameters["required"].as_array().unwrap();
+    assert!(
+        required.contains(&serde_json::json!("path")),
+        "file_read should require 'path'"
+    );
+}
+
+#[test]
+fn native_tool_def_serde_round_trip() {
+    let def = NativeToolDef {
+        name: "file_read".to_string(),
+        description: "Read a file.".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" }
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        }),
+    };
+
+    let json = serde_json::to_string(&def).expect("serialize");
+    let restored: NativeToolDef = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(def, restored);
+}
+
+#[test]
+fn native_tool_def_clone_and_eq() {
+    let def = NativeToolDef {
+        name: "shell_exec".to_string(),
+        description: "Execute a shell command.".to_string(),
+        parameters: serde_json::json!({"type": "object"}),
+    };
+    let cloned = def.clone();
+    assert_eq!(def, cloned);
 }

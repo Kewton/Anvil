@@ -65,6 +65,16 @@ pub enum AgentEvent {
         elapsed_ms: u128,
         #[serde(default)]
         inference_performance: Option<InferencePerformanceView>,
+        /// Native tool calls parsed from the provider response (Issue #373).
+        /// `None` when the provider used text-based tool protocol.
+        #[serde(default)]
+        tool_calls: Option<Vec<ToolCallRequest>>,
+        /// Native assistant tool_call records for session replay (Issue #373).
+        /// Stored on the SessionMessage so that `to_provider_message_with_images`
+        /// can reconstruct `ProviderMessage.assistant_tool_calls` for follow-up
+        /// turns.
+        #[serde(default)]
+        assistant_tool_call_records: Option<Vec<crate::provider::AssistantToolCallRecord>>,
     },
     Interrupted {
         status: String,
@@ -157,6 +167,23 @@ impl StructuredAssistantResponse {
             raw_content: final_response.clone(),
             final_response,
             anvil_final_detected: false,
+        }
+    }
+
+    /// Construct from native tool calls received via the provider API (Issue #373).
+    ///
+    /// Used when the provider returns structured tool_calls instead of
+    /// text-based ANVIL_TOOL blocks.
+    pub fn from_native_tool_calls(
+        tool_calls: Vec<ToolCallRequest>,
+        assistant_text: String,
+        stop_reason_is_end_turn: bool,
+    ) -> Self {
+        Self {
+            tool_calls,
+            final_response: assistant_text.clone(),
+            anvil_final_detected: stop_reason_is_end_turn,
+            raw_content: assistant_text,
         }
     }
 }
@@ -597,6 +624,15 @@ fn to_provider_message_with_images(
             }
         }
     }
+    // Issue #373: Propagate native tool calling metadata from SessionMessage
+    // to ProviderMessage so that follow-up turns correctly replay assistant
+    // tool_calls and tool result tool_call_ids.
+    if let Some(ref tc_id) = message.tool_call_id {
+        msg.tool_call_id = Some(tc_id.clone());
+    }
+    if let Some(ref tc_records) = message.assistant_tool_calls {
+        msg.assistant_tool_calls = Some(tc_records.clone());
+    }
     msg
 }
 
@@ -675,6 +711,11 @@ fn build_turn_request_with_calibration(
             .map(|sm| to_provider_message_with_images(sm, sandbox_root.as_deref())),
     )
     .collect();
+
+    // Note: tools token estimation is added by the caller after attaching
+    // tools via `request.tools = ...`.  The `estimated_prompt_tokens` here
+    // does not include tool definitions.  Callers that need precise budget
+    // accounting should add `estimate_tokens(tools_json)` to the total.
 
     (
         ProviderTurnRequest::new(model.into(), messages, stream),
@@ -1081,6 +1122,51 @@ fn build_tag_protocol_prompt(
     // Tool rules (same as JSON but with tag format note)
     prompt.push_str(PROMPT_TOOL_RULES);
     prompt.push_str(PROMPT_CONFIRM_CLASS_GUIDANCE);
+
+    append_common_prompt_sections(&mut prompt, languages, mcp_tool_descriptions);
+
+    prompt
+}
+
+/// Native tool calling mode prompt (Issue #373).
+///
+/// When native tool calling is active, tool definitions are sent via the
+/// provider API's `tools` parameter.  The system prompt omits ANVIL_TOOL
+/// format descriptions but retains ANVIL_PLAN / ANVIL_FINAL plan management
+/// rules and all operational guides.
+pub(crate) fn build_native_tool_calling_prompt(
+    languages: &[ProjectLanguage],
+    mcp_tool_descriptions: Option<&str>,
+) -> String {
+    let mut prompt = String::with_capacity(4096);
+
+    prompt.push_str(
+        "You are Anvil, a local coding agent for serious terminal work.\n\
+         \n\
+         ## Work approach\n\
+         When given a task, follow this approach:\n\
+         1. Start by understanding the current state: list directories (file_read on \".\") or search (file_search) before assuming files exist.\n\
+         2. Plan your work: break complex tasks into steps. State your plan before executing.\n\
+         3. Execute iteratively: use tools to gather information, then act on what you learned. Do NOT guess file paths — discover them first.\n\
+         4. If a tool call fails (e.g. file not found), adapt your plan based on the error rather than stopping.\n\
+         5. Summarize what you accomplished and what remains.\n\
+         \n\
+         ## Tool protocol\n\
+         Tools are available via native function calling. Call them directly.\n\n",
+    );
+
+    // Keep ANVIL_PLAN / ANVIL_FINAL rules (these are text-block based, not tool calls)
+    prompt.push_str(PROMPT_TOOL_RULES);
+
+    // Tool approval guidance (protocol-agnostic version)
+    prompt.push_str(
+        "\n## Tool approval\n\
+         Some tools require user approval before execution.\n\
+         Anvil automatically shows an approval prompt when you call these tools.\n\
+         Do NOT ask the user for permission in natural language.\n\
+         Always call the tool directly — Anvil handles the rest.\n\
+         If a tool call is denied, you will receive \"denied by user\" as the result.\n",
+    );
 
     append_common_prompt_sections(&mut prompt, languages, mcp_tool_descriptions);
 

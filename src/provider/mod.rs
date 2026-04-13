@@ -11,6 +11,7 @@ use crate::agent::AgentEvent;
 use crate::agent::model_classifier::{ToolProtocolMode, determine_protocol_mode};
 use crate::config::EffectiveConfig;
 use crate::contracts::InferencePerformanceView;
+use crate::tooling::NativeToolDef;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -51,6 +52,10 @@ pub struct ProviderCapabilities {
     pub streaming: bool,
     pub tool_calling: bool,
     pub tool_protocol: ToolProtocolMode,
+    /// Whether this provider supports native tool calling (Issue #373).
+    /// When `true`, tool definitions are sent via the provider API's `tools`
+    /// parameter and tool results are sent as `tool` role messages.
+    pub native_tool_calling: bool,
 }
 
 /// Bootstrapped provider context available for the lifetime of a session.
@@ -65,6 +70,18 @@ pub struct ProviderRuntimeContext {
 pub struct ImageContent {
     pub base64: String,
     pub mime_type: String,
+}
+
+/// Record of a native tool call issued by the assistant.
+///
+/// Used to replay assistant tool_calls in follow-up turns and for session
+/// persistence.  The `arguments` field holds the raw JSON string as received
+/// from the provider.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssistantToolCallRecord {
+    pub id: String,
+    pub function_name: String,
+    pub arguments: String,
 }
 
 /// Message role used in provider requests.
@@ -82,6 +99,10 @@ pub struct ProviderMessage {
     pub role: ProviderMessageRole,
     pub content: String,
     pub images: Option<Vec<ImageContent>>,
+    /// Native tool calling: tool_call_id for tool-result messages.
+    pub tool_call_id: Option<String>,
+    /// Native tool calling: tool_calls record for assistant messages.
+    pub assistant_tool_calls: Option<Vec<AssistantToolCallRecord>>,
 }
 
 impl ProviderMessage {
@@ -90,12 +111,53 @@ impl ProviderMessage {
             role,
             content: content.into(),
             images: None,
+            tool_call_id: None,
+            assistant_tool_calls: None,
         }
     }
 
     pub fn with_images(mut self, images: Vec<ImageContent>) -> Self {
         self.images = Some(images);
         self
+    }
+
+    /// Construct a tool-result message for native tool calling.
+    ///
+    /// Role is automatically set to `Tool`.
+    pub fn new_tool_result(tool_call_id: String, content: String) -> Self {
+        Self {
+            role: ProviderMessageRole::Tool,
+            content,
+            images: None,
+            tool_call_id: Some(tool_call_id),
+            assistant_tool_calls: None,
+        }
+    }
+
+    /// Construct an assistant message that includes native tool_calls.
+    ///
+    /// Role is automatically set to `Assistant`.
+    pub fn new_assistant_with_tool_calls(
+        content: String,
+        tool_calls: Vec<AssistantToolCallRecord>,
+    ) -> Self {
+        Self {
+            role: ProviderMessageRole::Assistant,
+            content,
+            images: None,
+            tool_call_id: None,
+            assistant_tool_calls: Some(tool_calls),
+        }
+    }
+
+    /// Access the tool_call_id (for tool-result messages).
+    pub fn tool_call_id(&self) -> Option<&str> {
+        self.tool_call_id.as_deref()
+    }
+
+    /// Access the assistant tool_calls record.
+    pub fn assistant_tool_calls(&self) -> Option<&[AssistantToolCallRecord]> {
+        self.assistant_tool_calls.as_deref()
     }
 }
 
@@ -117,6 +179,9 @@ pub struct ProviderTurnRequest {
     /// Only set when the user explicitly specifies `--context-window` so that
     /// the default model context length is not overridden unintentionally.
     pub context_window: Option<u32>,
+    /// Native tool definitions to send with the request (Issue #373).
+    /// `None` means no native tool calling for this turn (fallback to text protocol).
+    pub tools: Option<Vec<NativeToolDef>>,
 }
 
 impl ProviderTurnRequest {
@@ -128,12 +193,25 @@ impl ProviderTurnRequest {
             max_output_tokens: None,
             temperature: None,
             context_window: None,
+            tools: None,
         }
+    }
+
+    /// Attach native tool definitions to this request.
+    pub fn with_tools(mut self, tools: Vec<NativeToolDef>) -> Self {
+        self.tools = Some(tools);
+        self
     }
 }
 
 /// Events emitted by a provider during a turn.
+///
+/// `Agent` carries a full `AgentEvent` which can be large (256+ bytes for Done
+/// with native tool call records).  Boxing is not worthwhile here because
+/// `ProviderEvent` is never stored in long-lived collections — it is emitted
+/// and immediately consumed by the `emit` callback.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum ProviderEvent {
     Agent(AgentEvent),
     TokenDelta(String),
@@ -320,6 +398,28 @@ pub(crate) fn build_provider_done_event(
         tool_logs: Vec::new(),
         elapsed_ms: 0,
         inference_performance,
+        tool_calls: None,
+        assistant_tool_call_records: None,
+    }
+}
+
+/// Build a Done AgentEvent with native tool calls (Issue #373).
+pub(crate) fn build_provider_done_event_with_tool_calls(
+    assistant_output: &str,
+    inference_performance: Option<InferencePerformanceView>,
+    tool_calls: Vec<crate::tooling::ToolCallRequest>,
+    records: Vec<AssistantToolCallRecord>,
+) -> AgentEvent {
+    AgentEvent::Done {
+        status: "Done. session saved".to_string(),
+        assistant_message: assistant_output.to_string(),
+        completion_summary: "Provider turn finished successfully.".to_string(),
+        saved_status: "session saved".to_string(),
+        tool_logs: Vec::new(),
+        elapsed_ms: 0,
+        inference_performance,
+        tool_calls: Some(tool_calls),
+        assistant_tool_call_records: Some(records),
     }
 }
 
@@ -372,11 +472,19 @@ impl ProviderRuntimeContext {
         let tool_protocol =
             determine_protocol_mode(&config.runtime.model, config.runtime.tag_protocol);
 
+        // Determine native tool calling capability (Issue #373).
+        let native_tool_calling = resolve_native_tool_calling(
+            backend,
+            &config.runtime.model,
+            config.runtime.native_tool_calling,
+        );
+
         // Both backends currently share identical capability defaults.
         let capabilities = ProviderCapabilities {
             streaming: true,
             tool_calling: true,
             tool_protocol,
+            native_tool_calling,
         };
 
         Ok(Self {
@@ -410,6 +518,75 @@ impl ProviderClient for LocalProviderClient {
             Self::OpenAi(client) => client.stream_turn(request, emit),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Native tool calling resolution (Issue #373)
+// ---------------------------------------------------------------------------
+
+/// Resolve whether native tool calling should be enabled.
+///
+/// Priority: explicit env/config override > backend default > model heuristic.
+fn resolve_native_tool_calling(
+    backend: ProviderBackend,
+    model_name: &str,
+    config_override: Option<bool>,
+) -> bool {
+    // Explicit override takes priority
+    if let Some(flag) = config_override {
+        return flag;
+    }
+
+    match backend {
+        // OpenAI / LmStudio backends: enabled by default
+        ProviderBackend::OpenAi => true,
+        // Ollama: depends on model capabilities
+        ProviderBackend::Ollama => is_native_tool_capable_model(model_name),
+    }
+}
+
+/// Heuristic to determine if an Ollama model supports native tool calling.
+///
+/// Models known to support function calling via Ollama's native API:
+/// - llama3.1+, llama3.2+, llama3.3+
+/// - qwen2.5+, qwen3+
+/// - mistral (latest), mistral-nemo
+/// - command-r, command-r-plus
+/// - gemma4 (with tool support)
+///
+/// Conservative: returns `false` for unknown models.
+pub fn is_native_tool_capable_model(model_name: &str) -> bool {
+    let lower = model_name.to_lowercase();
+
+    // llama3.1, llama3.2, llama3.3 (but not llama3 base which lacks tool support)
+    if lower.starts_with("llama3.1")
+        || lower.starts_with("llama3.2")
+        || lower.starts_with("llama3.3")
+    {
+        return true;
+    }
+
+    // qwen2.5, qwen3
+    if lower.starts_with("qwen2.5") || lower.starts_with("qwen3") {
+        return true;
+    }
+
+    // mistral variants with tool support
+    if lower.starts_with("mistral") && (lower.contains("nemo") || lower.contains("latest")) {
+        return true;
+    }
+
+    // command-r family
+    if lower.starts_with("command-r") {
+        return true;
+    }
+
+    // gemma4
+    if lower.starts_with("gemma4") {
+        return true;
+    }
+
+    false
 }
 
 /// Build a concrete provider client from the effective config.

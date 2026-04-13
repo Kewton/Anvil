@@ -99,6 +99,8 @@ impl ProviderClient for RecordingProvider {
                     tool_logs: Vec::new(),
                     elapsed_ms: 0,
                     inference_performance: None,
+                    tool_calls: None,
+                    assistant_tool_call_records: None,
                 }));
             }
             return self.error.clone().map_or(Ok(()), Err);
@@ -134,6 +136,8 @@ fn live_turn_hands_session_messages_to_provider_and_renders_done() {
                 tool_logs: Vec::new(),
                 elapsed_ms: 120,
                 inference_performance: None,
+                tool_calls: None,
+                assistant_tool_call_records: None,
             }),
         ],
         followup_events: Vec::new(),
@@ -211,6 +215,8 @@ fn live_turn_executes_structured_file_write_response_without_approval() {
             tool_logs: Vec::new(),
             elapsed_ms: 120,
             inference_performance: None,
+            tool_calls: None,
+            assistant_tool_call_records: None,
         })],
         followup_events: Vec::new(),
         error: None,
@@ -368,6 +374,8 @@ fn live_turn_executes_malformed_structured_file_write_response() {
             tool_logs: Vec::new(),
             elapsed_ms: 120,
             inference_performance: None,
+            tool_calls: None,
+            assistant_tool_call_records: None,
         })],
         followup_events: Vec::new(),
         error: None,
@@ -437,6 +445,7 @@ fn ollama_provider_builds_chat_request_shape() {
             role: "user".to_string(),
             content: "inspect src/provider".to_string(),
             images: None,
+            tool_calls: None,
         }]
     );
 }
@@ -963,6 +972,8 @@ fn live_turn_surfaces_token_delta_progress() {
                 tool_logs: Vec::new(),
                 elapsed_ms: 90,
                 inference_performance: None,
+                tool_calls: None,
+                assistant_tool_call_records: None,
             }),
         ],
         followup_events: Vec::new(),
@@ -1032,6 +1043,8 @@ fn live_turn_can_pause_for_provider_approval_and_resume() {
                 tool_logs: Vec::new(),
                 elapsed_ms: 120,
                 inference_performance: None,
+                tool_calls: None,
+                assistant_tool_call_records: None,
             }),
         ],
         followup_events: Vec::new(),
@@ -1098,6 +1111,8 @@ fn ollama_provider_normalizes_ndjson_stream_to_provider_events() {
                 tool_logs: Vec::new(),
                 elapsed_ms: 0,
                 inference_performance: None,
+                tool_calls: None,
+                assistant_tool_call_records: None,
             }),
         ]
     );
@@ -1173,6 +1188,8 @@ fn ollama_provider_stream_turn_posts_chat_request_and_normalizes_response() {
                 tool_logs: Vec::new(),
                 elapsed_ms: 0,
                 inference_performance: None,
+                tool_calls: None,
+                assistant_tool_call_records: None,
             }),
         ]
     );
@@ -1396,6 +1413,8 @@ fn agentic_loop_multi_iteration_tool_calls_then_final_answer() {
                         tool_logs: Vec::new(),
                         elapsed_ms: 0,
                         inference_performance: None,
+                        tool_calls: None,
+                        assistant_tool_call_records: None,
                     }));
                 }
                 1 => {
@@ -1486,6 +1505,8 @@ fn agentic_loop_tool_result_payload_included_in_session_messages() {
             tool_logs: Vec::new(),
             elapsed_ms: 0,
             inference_performance: None,
+            tool_calls: None,
+            assistant_tool_call_records: None,
         })],
         followup_events: Vec::new(),
         error: None,
@@ -1573,6 +1594,8 @@ fn agentic_loop_respects_max_iteration_limit() {
                 tool_logs: Vec::new(),
                 elapsed_ms: 0,
                 inference_performance: None,
+                tool_calls: None,
+                assistant_tool_call_records: None,
             }));
             Ok(())
         }
@@ -1647,6 +1670,8 @@ fn agentic_loop_error_during_followup_propagates() {
                     tool_logs: Vec::new(),
                     elapsed_ms: 0,
                     inference_performance: None,
+                    tool_calls: None,
+                    assistant_tool_call_records: None,
                 }));
                 Ok(())
             } else {
@@ -2895,6 +2920,7 @@ fn ollama_chat_message_with_images_serializes_correctly() {
         role: "user".to_string(),
         content: "describe this image".to_string(),
         images: Some(vec!["aGVsbG8=".to_string()]),
+        tool_calls: None,
     };
     let json = serde_json::to_value(&msg).unwrap();
     assert_eq!(json["role"], "user");
@@ -2908,6 +2934,7 @@ fn ollama_chat_message_without_images_omits_images_key() {
         role: "user".to_string(),
         content: "hello".to_string(),
         images: None,
+        tool_calls: None,
     };
     let json = serde_json::to_value(&msg).unwrap();
     assert!(json.get("images").is_none());
@@ -3610,6 +3637,8 @@ fn anvil_final_guard_fires_when_no_file_modifications_detected() {
                         tool_logs: Vec::new(),
                         elapsed_ms: 0,
                         inference_performance: None,
+                        tool_calls: None,
+                        assistant_tool_call_records: None,
                     }));
                 }
                 1 => {
@@ -3689,6 +3718,8 @@ fn anvil_final_guard_does_not_fire_when_file_write_was_executed() {
             tool_logs: Vec::new(),
             elapsed_ms: 0,
             inference_performance: None,
+            tool_calls: None,
+            assistant_tool_call_records: None,
         })],
         followup_events: vec![ProviderEvent::TokenDelta(
             "All done.".to_string(),
@@ -3786,6 +3817,8 @@ fn synthetic_guidance_followup_without_edits_triggers_final_guard_retry() {
                         tool_logs: Vec::new(),
                         elapsed_ms: 0,
                         inference_performance: None,
+                        tool_calls: None,
+                        assistant_tool_call_records: None,
                     }));
                 }
                 _ => {
@@ -3843,6 +3876,8 @@ fn live_turn_pins_latest_user_task_into_working_memory_prompt() {
             tool_logs: Vec::new(),
             elapsed_ms: 0,
             inference_performance: None,
+            tool_calls: None,
+            assistant_tool_call_records: None,
         })],
         followup_events: Vec::new(),
         error: None,
@@ -3914,6 +3949,8 @@ fn anvil_final_guard_handle_structured_done_fires_for_plan_only_response() {
                         tool_logs: Vec::new(),
                         elapsed_ms: 100,
                         inference_performance: None,
+                        tool_calls: None,
+                        assistant_tool_call_records: None,
                     }));
                 }
                 _ => {
@@ -3978,6 +4015,8 @@ fn anvil_final_guard_prompt_tool_rules_contains_implementation_guidance() {
                 tool_logs: Vec::new(),
                 elapsed_ms: 0,
                 inference_performance: None,
+                tool_calls: None,
+                assistant_tool_call_records: None,
             }),
         ],
         followup_events: Vec::new(),
@@ -4057,6 +4096,8 @@ fn done_event_post_final() {
                         tool_logs: Vec::new(),
                         elapsed_ms: 0,
                         inference_performance: None,
+                        tool_calls: None,
+                        assistant_tool_call_records: None,
                     }));
                 }
                 1 => {
@@ -4160,6 +4201,8 @@ fn guard_retry_post_final() {
                         tool_logs: Vec::new(),
                         elapsed_ms: 100,
                         inference_performance: None,
+                        tool_calls: None,
+                        assistant_tool_call_records: None,
                     }));
                 }
                 1 => {
@@ -4183,6 +4226,8 @@ fn guard_retry_post_final() {
                         tool_logs: Vec::new(),
                         elapsed_ms: 200,
                         inference_performance: None,
+                        tool_calls: None,
+                        assistant_tool_call_records: None,
                     }));
                 }
                 _ => {
@@ -4294,6 +4339,8 @@ fn prompt_tool_rules_contains_large_file_guidance() {
                 tool_logs: Vec::new(),
                 elapsed_ms: 0,
                 inference_performance: None,
+                tool_calls: None,
+                assistant_tool_call_records: None,
             }),
         ],
         followup_events: Vec::new(),
@@ -4336,16 +4383,19 @@ fn sidecar_summarize_success_with_mock_server() {
                 role: "system".to_string(),
                 content: "You are a concise summarizer.".to_string(),
                 images: None,
+                tool_calls: None,
             },
             OllamaChatMessage {
                 role: "user".to_string(),
                 content: "user: hello\nassistant: hi".to_string(),
                 images: None,
+                tool_calls: None,
             },
         ],
         stream: false,
         think: false,
         options: None,
+        tools: None,
     };
     let json = serde_json::to_string(&request).expect("should serialize");
     assert!(json.contains("qwen2.5:3b"));

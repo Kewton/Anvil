@@ -297,6 +297,11 @@ pub struct SessionMessage {
     /// rather than authoritative state (Issue #293).
     #[serde(default)]
     pub is_advisory: bool,
+    /// Native tool calls issued by the assistant in this message (Issue #373).
+    /// Persisted for session replay so that provider requests can reconstruct
+    /// the `assistant_tool_calls` field on assistant messages.
+    #[serde(default)]
+    pub assistant_tool_calls: Option<Vec<crate::provider::AssistantToolCallRecord>>,
 }
 
 impl SessionMessage {
@@ -312,6 +317,7 @@ impl SessionMessage {
             image_paths: None,
             expanded_content: None,
             is_advisory: false,
+            assistant_tool_calls: None,
         }
     }
 

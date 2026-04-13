@@ -1071,6 +1071,8 @@ impl App {
             } else {
                 None
             };
+            // Issue #373: Attach native tool definitions when enabled.
+            request.tools = self.build_native_tools();
 
             // Budget pressure WARN (Issue #206 D-2)
             let token_budget = self.effective_token_budget();
@@ -2898,6 +2900,13 @@ impl App {
             .with_id(self.next_message_id("tool"));
         msg.is_error = is_error;
 
+        // Issue #373: Attach tool_call_id for native tool calling session replay.
+        // The provider expects tool result messages to carry the matching
+        // tool_call_id from the assistant's tool_calls record.
+        if !result.tool_call_id.is_empty() {
+            msg = msg.with_tool_call_id(&result.tool_call_id);
+        }
+
         // Attach image paths for Image payloads so the agent layer can
         // resolve them to base64 when building the provider request.
         if let ToolExecutionPayload::Image { source_path, .. } = &result.payload {
@@ -3011,6 +3020,8 @@ impl App {
         } else {
             None
         };
+        // Issue #373: Attach native tool definitions when enabled.
+        request.tools = self.build_native_tools();
 
         let spinner = Spinner::start(
             format!("ANVIL_FINAL guard retry. model={}", self.effective_model()),
@@ -3118,14 +3129,34 @@ impl App {
             tool_logs: _,
             elapsed_ms,
             inference_performance,
+            tool_calls,
+            assistant_tool_call_records,
         } = event
         else {
             return Ok(None);
         };
 
-        let structured =
+        // Issue #373: Native tool calling path — when the provider returned
+        // structured tool_calls, bypass ANVIL_TOOL text parsing entirely.
+        let structured = if let Some(native_calls) = tool_calls.as_ref().filter(|c| !c.is_empty()) {
+            // Record the assistant message with tool_call_records so that
+            // session replay can reconstruct the provider's assistant tool_calls.
+            if let Some(records) = assistant_tool_call_records {
+                self.record_assistant_output_with_tool_calls(
+                    self.next_message_id("assistant"),
+                    assistant_message,
+                    records.clone(),
+                )?;
+            }
+            crate::agent::StructuredAssistantResponse::from_native_tool_calls(
+                native_calls.clone(),
+                assistant_message.clone(),
+                false,
+            )
+        } else {
             BasicAgentLoop::parse_structured_response_with_registry(assistant_message, &self.tools)
-                .map_err(AppError::ToolExecution)?;
+                .map_err(AppError::ToolExecution)?
+        };
         if structured.tool_calls.is_empty() {
             // ANVIL_FINAL guard: only activate when the message contains a
             // structured ANVIL_FINAL block (not plain-text Done messages).

@@ -7,9 +7,10 @@ use super::transport::{
     HttpTransport, ReqwestHttpTransport, RetryTransport, sanitize_error_message,
 };
 use super::{
-    ProviderClient, ProviderEvent, ProviderMessageRole, ProviderTurnError, ProviderTurnRequest,
-    build_provider_done_event,
+    AssistantToolCallRecord, ProviderClient, ProviderEvent, ProviderMessageRole, ProviderTurnError,
+    ProviderTurnRequest, build_provider_done_event, build_provider_done_event_with_tool_calls,
 };
+use crate::tooling::{ToolCallRequest, ToolInput};
 
 /// Patterns in Ollama error messages that indicate a model is not found.
 ///
@@ -30,6 +31,9 @@ pub struct OllamaChatMessage {
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub images: Option<Vec<String>>,
+    /// Tool calls returned by the assistant (Issue #373).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<serde_json::Value>>,
 }
 
 /// Ollama request options (e.g. `num_predict` for output token limit).
@@ -47,6 +51,28 @@ pub struct OllamaRequestOptions {
     pub num_ctx: Option<u32>,
 }
 
+// ---------------------------------------------------------------------------
+// Ollama native tool calling types (Issue #373)
+// ---------------------------------------------------------------------------
+
+/// Ollama tool definition for function calling.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[doc(hidden)]
+pub struct OllamaToolDef {
+    #[serde(rename = "type")]
+    pub tool_type: String,
+    pub function: OllamaToolFunctionDef,
+}
+
+/// Function definition within an Ollama tool definition.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[doc(hidden)]
+pub struct OllamaToolFunctionDef {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+}
+
 /// Wire format for an Ollama `/api/chat` request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OllamaChatRequest {
@@ -57,6 +83,10 @@ pub struct OllamaChatRequest {
     pub think: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub options: Option<OllamaRequestOptions>,
+    /// Native tool definitions for function calling (Issue #373).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[doc(hidden)]
+    pub tools: Option<Vec<OllamaToolDef>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,6 +178,7 @@ impl<T> OllamaProviderClient<T> {
                         },
                         content: message.content.clone(),
                         images,
+                        tool_calls: None,
                     }
                 })
                 .collect(),
@@ -165,6 +196,20 @@ impl<T> OllamaProviderClient<T> {
             } else {
                 None
             },
+            // Issue #373: Convert NativeToolDef to Ollama tool definitions.
+            tools: request.tools.as_ref().map(|tools| {
+                tools
+                    .iter()
+                    .map(|t| OllamaToolDef {
+                        tool_type: "function".to_string(),
+                        function: OllamaToolFunctionDef {
+                            name: t.name.clone(),
+                            description: t.description.clone(),
+                            parameters: t.parameters.clone(),
+                        },
+                    })
+                    .collect()
+            }),
         }
     }
 
@@ -173,6 +218,7 @@ impl<T> OllamaProviderClient<T> {
     ) -> Result<Vec<ProviderEvent>, ProviderTurnError> {
         let mut events = Vec::new();
         let mut assistant_output = String::new();
+        let mut collected_tool_calls: Vec<serde_json::Value> = Vec::new();
 
         for chunk in chunks {
             let parsed: OllamaChatChunk = serde_json::from_str(chunk).map_err(|err| {
@@ -183,25 +229,134 @@ impl<T> OllamaProviderClient<T> {
             let eval_duration = parsed.eval_duration;
             let prompt_eval_count = parsed.prompt_eval_count;
 
-            if let Some(message) = parsed.message
-                && !message.content.is_empty()
-            {
-                assistant_output.push_str(&message.content);
-                events.push(ProviderEvent::TokenDelta(message.content));
+            if let Some(ref message) = parsed.message {
+                if !message.content.is_empty() {
+                    assistant_output.push_str(&message.content);
+                    events.push(ProviderEvent::TokenDelta(message.content.clone()));
+                }
+                // Issue #373: Collect tool_calls from Ollama response
+                if let Some(ref tc) = message.tool_calls {
+                    collected_tool_calls.extend(tc.iter().cloned());
+                }
             }
 
             if parsed.done {
                 let perf =
                     extract_inference_performance(eval_count, eval_duration, prompt_eval_count);
-                events.push(ProviderEvent::Agent(build_provider_done_event(
-                    &assistant_output,
-                    perf,
-                )));
+
+                if !collected_tool_calls.is_empty() {
+                    // Issue #373: Convert Ollama tool_calls to ToolCallRequest
+                    let (requests, records) = parse_ollama_tool_calls(&collected_tool_calls)?;
+                    events.push(ProviderEvent::Agent(
+                        build_provider_done_event_with_tool_calls(
+                            &assistant_output,
+                            perf,
+                            requests,
+                            records,
+                        ),
+                    ));
+                } else {
+                    events.push(ProviderEvent::Agent(build_provider_done_event(
+                        &assistant_output,
+                        perf,
+                    )));
+                }
             }
         }
 
         Ok(events)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Ollama native tool call parsing (Issue #373)
+// ---------------------------------------------------------------------------
+
+/// Normalize an Ollama tool name (underscore-separated) back to dot-separated form.
+fn normalize_ollama_tool_name(name: &str) -> String {
+    match name {
+        "file_read" => "file.read".to_string(),
+        "file_write" => "file.write".to_string(),
+        "file_edit" => "file.edit".to_string(),
+        "file_search" => "file.search".to_string(),
+        "file_edit_anchor" => "file.edit_anchor".to_string(),
+        "file_rewrite" => "file.rewrite".to_string(),
+        "shell_exec" => "shell.exec".to_string(),
+        "web_fetch" => "web.fetch".to_string(),
+        "web_search" => "web.search".to_string(),
+        "agent_explore" => "agent.explore".to_string(),
+        "agent_plan" => "agent.plan".to_string(),
+        "agent_fix_slice" => "agent.fix_slice".to_string(),
+        "git_status" => "git.status".to_string(),
+        "git_diff" => "git.diff".to_string(),
+        "git_log" => "git.log".to_string(),
+        _ => name.to_string(),
+    }
+}
+
+/// Parse Ollama tool calls (serde_json::Value array) into ToolCallRequest objects
+/// and AssistantToolCallRecords for session replay.
+///
+/// Ollama returns tool_calls as:
+/// ```json
+/// [{"function": {"name": "file_read", "arguments": {"path": "src/main.rs"}}}]
+/// ```
+fn parse_ollama_tool_calls(
+    tool_calls: &[serde_json::Value],
+) -> Result<(Vec<ToolCallRequest>, Vec<AssistantToolCallRecord>), ProviderTurnError> {
+    let mut requests = Vec::with_capacity(tool_calls.len());
+    let mut records = Vec::with_capacity(tool_calls.len());
+
+    for (index, tc) in tool_calls.iter().enumerate() {
+        let function = tc.get("function").ok_or_else(|| {
+            ProviderTurnError::Backend(format!(
+                "ollama tool_call at index {index} missing 'function' field"
+            ))
+        })?;
+
+        let name = function
+            .get("name")
+            .and_then(|n| n.as_str())
+            .ok_or_else(|| {
+                ProviderTurnError::Backend(format!(
+                    "ollama tool_call at index {index} missing 'function.name'"
+                ))
+            })?;
+
+        let tool_name = normalize_ollama_tool_name(name);
+
+        let arguments = function
+            .get("arguments")
+            .cloned()
+            .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+
+        if !arguments.is_object() {
+            return Err(ProviderTurnError::Backend(format!(
+                "ollama tool_call arguments for '{tool_name}' must be a JSON object"
+            )));
+        }
+
+        let id = format!("call_{}_{}", tool_name.replace('.', "_"), index);
+
+        let input = ToolInput::from_json(&tool_name, &arguments).map_err(|err| {
+            ProviderTurnError::Backend(format!(
+                "failed to parse ollama tool_call '{}': {err}",
+                tool_name
+            ))
+        })?;
+
+        // Produce AssistantToolCallRecord for session replay.
+        let function_name = tool_name.replace('.', "_");
+        records.push(AssistantToolCallRecord {
+            id: id.clone(),
+            function_name,
+            arguments: arguments.to_string(),
+        });
+
+        requests.push(ToolCallRequest::new(id, tool_name, input));
+    }
+
+    Ok((requests, records))
 }
 
 pub fn resolve_ollama_model_alias(requested: &str, available: &[String]) -> String {
@@ -315,16 +470,19 @@ impl<T: HttpTransport> OllamaProviderClient<T> {
                     role: "system".to_string(),
                     content: SIDECAR_SUMMARIZE_PROMPT.to_string(),
                     images: None,
+                    tool_calls: None,
                 },
                 OllamaChatMessage {
                     role: "user".to_string(),
                     content: conversation_text.to_string(),
                     images: None,
+                    tool_calls: None,
                 },
             ],
             stream: false,
             think: false,
             options: None,
+            tools: None,
         };
 
         let body = serde_json::to_vec(&request).ok()?;
@@ -442,6 +600,8 @@ impl<T: HttpTransport> ProviderClient for OllamaProviderClient<T> {
 
         let mut assistant_output = String::new();
         let mut had_error: Option<ProviderTurnError> = None;
+        // Issue #373: Accumulate tool_calls across streaming chunks.
+        let mut collected_tool_calls: Vec<serde_json::Value> = Vec::new();
 
         self.transport
             .stream_lines(&url, &request_body, &[], &mut |line| {
@@ -453,11 +613,15 @@ impl<T: HttpTransport> ProviderClient for OllamaProviderClient<T> {
                         let eval_count = chunk.eval_count;
                         let eval_duration = chunk.eval_duration;
                         let prompt_eval_count = chunk.prompt_eval_count;
-                        if let Some(message) = chunk.message
-                            && !message.content.is_empty()
-                        {
-                            assistant_output.push_str(&message.content);
-                            emit(ProviderEvent::TokenDelta(message.content));
+                        if let Some(ref message) = chunk.message {
+                            if !message.content.is_empty() {
+                                assistant_output.push_str(&message.content);
+                                emit(ProviderEvent::TokenDelta(message.content.clone()));
+                            }
+                            // Issue #373: Collect tool_calls from streaming chunks
+                            if let Some(ref tc) = message.tool_calls {
+                                collected_tool_calls.extend(tc.iter().cloned());
+                            }
                         }
                         if chunk.done {
                             let perf = extract_inference_performance(
@@ -465,10 +629,28 @@ impl<T: HttpTransport> ProviderClient for OllamaProviderClient<T> {
                                 eval_duration,
                                 prompt_eval_count,
                             );
-                            emit(ProviderEvent::Agent(build_provider_done_event(
-                                &assistant_output,
-                                perf,
-                            )));
+                            if !collected_tool_calls.is_empty() {
+                                match parse_ollama_tool_calls(&collected_tool_calls) {
+                                    Ok((requests, records)) => {
+                                        emit(ProviderEvent::Agent(
+                                            build_provider_done_event_with_tool_calls(
+                                                &assistant_output,
+                                                perf,
+                                                requests,
+                                                records,
+                                            ),
+                                        ));
+                                    }
+                                    Err(err) => {
+                                        had_error = Some(err);
+                                    }
+                                }
+                            } else {
+                                emit(ProviderEvent::Agent(build_provider_done_event(
+                                    &assistant_output,
+                                    perf,
+                                )));
+                            }
                         }
                     }
                     Err(err) => {
