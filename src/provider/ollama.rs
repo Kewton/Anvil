@@ -41,6 +41,10 @@ pub struct OllamaRequestOptions {
     /// Sampling temperature (Issue #369).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
+    /// Context window size to use for this request (maps to Ollama `num_ctx`).
+    /// Only set when the user explicitly specifies `--context-window`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num_ctx: Option<u32>,
 }
 
 /// Wire format for an Ollama `/api/chat` request.
@@ -149,10 +153,11 @@ impl<T> OllamaProviderClient<T> {
                 .collect(),
             stream: request.stream,
             think: false,
-            options: if request.max_output_tokens.is_some() || request.temperature.is_some() {
+            options: if request.max_output_tokens.is_some() || request.temperature.is_some() || request.context_window.is_some() {
                 Some(OllamaRequestOptions {
                     num_predict: request.max_output_tokens,
                     temperature: request.temperature,
+                    num_ctx: request.context_window,
                 })
             } else {
                 None

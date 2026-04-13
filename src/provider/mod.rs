@@ -113,6 +113,10 @@ pub struct ProviderTurnRequest {
     /// `Some(v)` sets explicit temperature; `None` uses the model default.
     /// Agentic turns default to 0.3 for tool-output stability (Issue #369).
     pub temperature: Option<f64>,
+    /// Context window size to pass to the provider (e.g. Ollama `num_ctx`).
+    /// Only set when the user explicitly specifies `--context-window` so that
+    /// the default model context length is not overridden unintentionally.
+    pub context_window: Option<u32>,
 }
 
 impl ProviderTurnRequest {
@@ -123,6 +127,7 @@ impl ProviderTurnRequest {
             stream,
             max_output_tokens: None,
             temperature: None,
+            context_window: None,
         }
     }
 }

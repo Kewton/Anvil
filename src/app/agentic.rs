@@ -1040,6 +1040,11 @@ impl App {
             );
             request.max_output_tokens = self.config.runtime.max_output_tokens;
             request.temperature = self.config.runtime.tool_temperature;
+            request.context_window = if self.config.runtime.context_window_explicitly_set {
+                Some(self.effective_context_window())
+            } else {
+                None
+            };
 
             // Budget pressure WARN (Issue #206 D-2)
             let token_budget = self.effective_token_budget();
@@ -2924,6 +2929,11 @@ impl App {
         );
         request.max_output_tokens = self.config.runtime.max_output_tokens;
         request.temperature = self.config.runtime.tool_temperature;
+        request.context_window = if self.config.runtime.context_window_explicitly_set {
+            Some(self.effective_context_window())
+        } else {
+            None
+        };
 
         let spinner = Spinner::start(
             format!("ANVIL_FINAL guard retry. model={}", self.effective_model()),
