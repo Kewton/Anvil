@@ -93,6 +93,8 @@ impl Fingerprint {
 pub struct ClosureLoopDetector {
     history: VecDeque<Fingerprint>,
     escalation_count: usize,
+    /// Jaccard similarity threshold for near-duplicate detection (Issue #371).
+    jaccard_threshold: f64,
 }
 
 impl Default for ClosureLoopDetector {
@@ -106,6 +108,16 @@ impl ClosureLoopDetector {
         Self {
             history: VecDeque::with_capacity(HISTORY_CAPACITY),
             escalation_count: 0,
+            jaccard_threshold: JACCARD_MATCH_THRESHOLD,
+        }
+    }
+
+    /// Create with a custom Jaccard similarity threshold (Issue #371).
+    pub fn with_threshold(jaccard_threshold: f64) -> Self {
+        Self {
+            history: VecDeque::with_capacity(HISTORY_CAPACITY),
+            escalation_count: 0,
+            jaccard_threshold,
         }
     }
 
@@ -131,7 +143,7 @@ impl ClosureLoopDetector {
         let near_duplicate = self
             .history
             .iter()
-            .any(|prev| prev.jaccard(&fp) >= JACCARD_MATCH_THRESHOLD);
+            .any(|prev| prev.jaccard(&fp) >= self.jaccard_threshold);
 
         if self.history.len() >= HISTORY_CAPACITY {
             self.history.pop_front();

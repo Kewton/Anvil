@@ -748,7 +748,9 @@ impl App {
         // Reset phase estimator per-turn counters (Issue #159)
         self.phase_estimator.reset();
         // Reset read transition guard per-turn counters (Issue #216)
-        self.read_transition_guard.reset();
+        if let Some(ref mut guard) = self.read_transition_guard {
+            guard.reset();
+        }
         // Reset execution plan per user-turn (Issue #249)
         self.reset_execution_plan();
 
@@ -2406,12 +2408,10 @@ impl App {
             // Issue #265: pass shell command to read_transition_guard so
             // grep/sed/cat are counted as exploration calls.
             // Issue #299: skip during recovery reads.
-            if !is_recovery {
-                let transition_action = self.read_transition_guard.record_tool_call_ex(
-                    &result.tool_name,
-                    success,
-                    shell_cmd.as_deref(),
-                );
+            // Issue #371: guard is None when detector profile disables it.
+            if !is_recovery && let Some(ref mut guard) = self.read_transition_guard {
+                let transition_action =
+                    guard.record_tool_call_ex(&result.tool_name, success, shell_cmd.as_deref());
                 if let ReadTransitionAction::Inject(msg) = transition_action {
                     read_transition_message = Some(msg);
                 }
@@ -2707,7 +2707,9 @@ impl App {
                 if let Some(artifact) = result.artifacts.first() {
                     let path_str = resolve_edit_tracker_path(artifact);
                     self.edit_fail_tracker.record_success(&path_str);
-                    self.write_repeat_tracker.reset_for_path(&path_str);
+                    if let Some(ref mut tracker) = self.write_repeat_tracker {
+                        tracker.reset_for_path(&path_str);
+                    }
                     // Issue #299: clear recovery budget on edit success.
                     self.tool_recovery_budget.clear(&path_str);
                     tracing::info!(
@@ -2724,7 +2726,9 @@ impl App {
             && let Some(artifact) = result.artifacts.first()
         {
             let path = resolve_edit_tracker_path(artifact);
-            self.write_repeat_tracker.reset_for_path(&path);
+            if let Some(ref mut tracker) = self.write_repeat_tracker {
+                tracker.reset_for_path(&path);
+            }
         }
 
         // Write fail tracker: track consecutive file.write failures (Issue #161)
@@ -2737,8 +2741,9 @@ impl App {
             && result.tool_name == "file.read"
             && result.status == ToolExecutionStatus::Completed
             && let Some(path) = result.artifacts.first()
+            && let Some(ref mut tracker) = self.read_repeat_tracker
         {
-            let action = self.read_repeat_tracker.record_read(path);
+            let action = tracker.record_read(path);
             match action {
                 ReadRepeatAction::Warn(count) => {
                     tracing::warn!(
@@ -2777,7 +2782,9 @@ impl App {
             && let Some(raw_path) = result.artifacts.first()
         {
             let path = resolve_edit_tracker_path(raw_path);
-            self.read_repeat_tracker.reset(&path);
+            if let Some(ref mut tracker) = self.read_repeat_tracker {
+                tracker.reset(&path);
+            }
         }
 
         // Working memory: track errors (Issue #130)
@@ -2836,63 +2843,68 @@ impl App {
 
     /// Track consecutive file.write failures and repeated successful writes,
     /// returning a hint if either threshold is reached.
+    /// Issue #371: trackers are Option<T> — when None, the corresponding hint is skipped.
     fn update_write_trackers(&mut self, result: &ToolExecutionResult) -> Option<String> {
         if result.tool_name != "file.write" && result.tool_name != "file.rewrite" {
             return None;
         }
-        if result.status == ToolExecutionStatus::Failed {
-            if let Some(path) = extract_write_path_from_summary(&result.summary)
-                .filter(|p| self.write_fail_tracker.record_failure(p))
-            {
-                let count = self.write_fail_tracker.failure_count(&path);
-                tracing::warn!(
-                    tool = "file.write",
-                    path = %path,
-                    count = count,
-                    "repeated write failure"
-                );
-                let safe_path = crate::session::sanitize_for_prompt_entry(&path);
-                return Some(format!(
-                    "\n\n[Anvil hint] file.write has failed {count} consecutive \
-                     times for '{safe_path}'. Please check the error message carefully. \
-                     Consider: (1) verifying the file path is correct, \
-                     (2) splitting the content into smaller files, \
-                     (3) using file.edit for partial modifications instead."
-                ));
-            }
+        if result.status == ToolExecutionStatus::Failed
+            && let Some(ref mut tracker) = self.write_fail_tracker
+            && let Some(path) = extract_write_path_from_summary(&result.summary)
+                .filter(|p| tracker.record_failure(p))
+        {
+            let count = tracker.failure_count(&path);
+            tracing::warn!(
+                tool = "file.write",
+                path = %path,
+                count = count,
+                "repeated write failure"
+            );
+            let safe_path = crate::session::sanitize_for_prompt_entry(&path);
+            return Some(format!(
+                "\n\n[Anvil hint] file.write has failed {count} consecutive \
+                 times for '{safe_path}'. Please check the error message carefully. \
+                 Consider: (1) verifying the file path is correct, \
+                 (2) splitting the content into smaller files, \
+                 (3) using file.edit for partial modifications instead."
+            ));
         } else if result.status == ToolExecutionStatus::Completed
             && let Some(artifact) = result.artifacts.first()
         {
             let path = resolve_edit_tracker_path(artifact);
-            self.write_fail_tracker.record_success(&path);
-            let repeat_action = self.write_repeat_tracker.record_write(&path);
-            if matches!(
-                repeat_action,
-                WriteRepeatAction::Warn | WriteRepeatAction::StrongWarn
-            ) {
-                let count = self.write_repeat_tracker.write_count(&path);
-                tracing::warn!(
-                    path = %path,
-                    count = count,
-                    "same file written repeatedly"
-                );
-                let safe_path = crate::session::sanitize_for_prompt_entry(&path);
-                let detail = if repeat_action == WriteRepeatAction::StrongWarn {
-                    ". This appears to be a loop. Consider: \
-                     (1) Stop rewriting this file entirely, \
-                     (2) Use file.read to verify the current state, \
-                     (3) Use file.edit for targeted changes to specific sections."
-                } else {
-                    ". Consider: \
-                     (1) Use file.read to review the current content, \
-                     (2) Use file.edit to modify only the specific section \
-                     that needs changing, \
-                     (3) Avoid rewriting the entire file repeatedly."
-                };
-                return Some(format!(
-                    "\n\n[Anvil hint] file.write has been called {count} times \
-                     for '{safe_path}'{detail}"
-                ));
+            if let Some(ref mut fail_tracker) = self.write_fail_tracker {
+                fail_tracker.record_success(&path);
+            }
+            if let Some(ref mut repeat_tracker) = self.write_repeat_tracker {
+                let repeat_action = repeat_tracker.record_write(&path);
+                if matches!(
+                    repeat_action,
+                    WriteRepeatAction::Warn | WriteRepeatAction::StrongWarn
+                ) {
+                    let count = repeat_tracker.write_count(&path);
+                    tracing::warn!(
+                        path = %path,
+                        count = count,
+                        "same file written repeatedly"
+                    );
+                    let safe_path = crate::session::sanitize_for_prompt_entry(&path);
+                    let detail = if repeat_action == WriteRepeatAction::StrongWarn {
+                        ". This appears to be a loop. Consider: \
+                         (1) Stop rewriting this file entirely, \
+                         (2) Use file.read to verify the current state, \
+                         (3) Use file.edit for targeted changes to specific sections."
+                    } else {
+                        ". Consider: \
+                         (1) Use file.read to review the current content, \
+                         (2) Use file.edit to modify only the specific section \
+                         that needs changing, \
+                         (3) Avoid rewriting the entire file repeatedly."
+                    };
+                    return Some(format!(
+                        "\n\n[Anvil hint] file.write has been called {count} times \
+                         for '{safe_path}'{detail}"
+                    ));
+                }
             }
         }
         None

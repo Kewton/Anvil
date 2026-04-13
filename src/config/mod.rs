@@ -124,6 +124,45 @@ impl std::str::FromStr for GuidanceMode {
     }
 }
 
+/// Detector profile — controls detector/tracker thresholds and hint-system
+/// enabled state as a single preset (Issue #371).
+///
+/// Resolved once at startup from `ANVIL_DETECTOR_PROFILE` env var (or config
+/// file) and frozen for the session lifetime.  Only controls observation /
+/// guidance; does NOT affect sandbox, approval, or permission policies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DetectorProfile {
+    /// All detectors enabled, current default thresholds (backward compatible).
+    #[default]
+    Strict,
+    /// Safety-critical detectors preserved; hint-system thresholds widened.
+    Relaxed,
+    /// Break-class detectors + safety helpers only; hint systems disabled.
+    Minimal,
+}
+
+impl std::fmt::Display for DetectorProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Strict => write!(f, "strict"),
+            Self::Relaxed => write!(f, "relaxed"),
+            Self::Minimal => write!(f, "minimal"),
+        }
+    }
+}
+
+impl std::str::FromStr for DetectorProfile {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "strict" => Ok(Self::Strict),
+            "relaxed" => Ok(Self::Relaxed),
+            "minimal" => Ok(Self::Minimal),
+            _ => Ok(Self::Strict), // fail-closed: unknown values fall back to Strict
+        }
+    }
+}
+
 #[derive(Clone)]
 /// Provider, model, and transport settings.
 pub struct RuntimeConfig {
@@ -248,6 +287,139 @@ pub struct RuntimeConfig {
     /// `Some(v)` overrides the model default; `None` leaves it to the model.
     /// Default: `Some(0.3)` for tool-output stability.
     pub tool_temperature: Option<f64>,
+    /// Detector profile preset (Issue #371).
+    pub detector_profile: DetectorProfile,
+    /// Whether the ReadRepeatTracker hint system is enabled (Issue #371).
+    pub read_repeat_enabled: bool,
+    /// Whether the WriteRepeatTracker hint system is enabled (Issue #371).
+    pub write_repeat_enabled: bool,
+    /// Whether the WriteFailTracker hint system is enabled (Issue #371).
+    pub write_fail_enabled: bool,
+    /// Whether the ReadTransitionGuard hint system is enabled (Issue #371).
+    pub read_transition_enabled: bool,
+    /// Whether the PhaseEstimator ForceTransition hint is enabled (Issue #371).
+    pub phase_force_transition_enabled: bool,
+    /// AlternatingLoopDetector: cycle repetitions before detection triggers (Issue #371).
+    pub alternating_cycle_threshold: usize,
+    /// ClosureLoopDetector: Jaccard similarity threshold for near-duplicate detection (Issue #371).
+    pub closure_jaccard_threshold: f64,
+    /// PostFailureThrashDetector: warn threshold (Issue #371).
+    pub thrash_warn_threshold: u32,
+    /// PostFailureThrashDetector: strong-warn threshold (Issue #371).
+    pub thrash_strong_warn_threshold: u32,
+    /// PostFailureThrashDetector: break threshold (Issue #371).
+    pub thrash_break_threshold: u32,
+    /// WriteRepeatTracker: warn threshold (Issue #371).
+    pub write_repeat_warn_threshold: u32,
+    /// WriteRepeatTracker: strong-warn threshold (Issue #371).
+    pub write_repeat_strong_warn_threshold: u32,
+    /// WriteFailTracker: consecutive failures threshold (Issue #371).
+    pub write_fail_threshold: u32,
+}
+
+impl RuntimeConfig {
+    /// Apply detector profile preset to this config (Issue #371).
+    ///
+    /// Strict is a no-op (defaults already equal strict values).
+    /// Relaxed widens hint-system thresholds while keeping all detectors enabled.
+    /// Minimal disables hint-only systems entirely, preserving Break-class detectors.
+    pub fn apply_profile(&mut self, profile: DetectorProfile) {
+        self.detector_profile = profile;
+        match profile {
+            DetectorProfile::Strict => { /* defaults = strict — no-op */ }
+            DetectorProfile::Relaxed => {
+                self.loop_detection_threshold = 5;
+                self.alternating_cycle_threshold = 4;
+                self.closure_jaccard_threshold = 0.8;
+                self.thrash_warn_threshold = 4;
+                self.thrash_strong_warn_threshold = 5;
+                self.thrash_break_threshold = 6;
+                self.read_repeat_warn_threshold = 5;
+                self.read_repeat_strong_warn_threshold = 8;
+                self.write_repeat_warn_threshold = 5;
+                self.write_repeat_strong_warn_threshold = 6;
+                self.write_fail_threshold = 3;
+                self.phase_force_transition_threshold = 20;
+                self.read_transition_threshold = 12;
+            }
+            DetectorProfile::Minimal => {
+                self.read_repeat_enabled = false;
+                self.write_repeat_enabled = false;
+                self.write_fail_enabled = false;
+                self.read_transition_enabled = false;
+                self.phase_force_transition_enabled = false;
+            }
+        }
+    }
+
+    /// Validate detector threshold ordering invariants (Issue #371).
+    ///
+    /// Returns `Ok(())` if all threshold relationships are consistent,
+    /// otherwise returns an error describing the violation.
+    pub fn validate_detector_thresholds(&self) -> Result<(), String> {
+        if self.thrash_warn_threshold >= self.thrash_strong_warn_threshold {
+            return Err(format!(
+                "thrash_warn_threshold ({}) must be < thrash_strong_warn_threshold ({})",
+                self.thrash_warn_threshold, self.thrash_strong_warn_threshold
+            ));
+        }
+        if self.thrash_strong_warn_threshold >= self.thrash_break_threshold {
+            return Err(format!(
+                "thrash_strong_warn_threshold ({}) must be < thrash_break_threshold ({})",
+                self.thrash_strong_warn_threshold, self.thrash_break_threshold
+            ));
+        }
+        if self.write_repeat_warn_threshold >= self.write_repeat_strong_warn_threshold {
+            return Err(format!(
+                "write_repeat_warn_threshold ({}) must be < write_repeat_strong_warn_threshold ({})",
+                self.write_repeat_warn_threshold, self.write_repeat_strong_warn_threshold
+            ));
+        }
+        if self.read_repeat_warn_threshold >= self.read_repeat_strong_warn_threshold {
+            return Err(format!(
+                "read_repeat_warn_threshold ({}) must be < read_repeat_strong_warn_threshold ({})",
+                self.read_repeat_warn_threshold, self.read_repeat_strong_warn_threshold
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validate that safety-critical detectors cannot be disabled by env override
+    /// (Issue #371, DR4-001).
+    ///
+    /// Returns `Err` (startup rejection) if Break-class detectors, barriers,
+    /// or FallbackComplete would be rendered inoperative.
+    pub fn validate_detector_security_invariants(&self) -> Result<(), String> {
+        // Loop detection threshold must not be below security floor
+        if self.loop_detection_threshold < 2 {
+            return Err(format!(
+                "loop_detection_threshold ({}) is below security floor (2)",
+                self.loop_detection_threshold
+            ));
+        }
+        // Alternating cycle threshold must not be below security floor
+        if self.alternating_cycle_threshold < 2 {
+            return Err(format!(
+                "alternating_cycle_threshold ({}) is below security floor (2)",
+                self.alternating_cycle_threshold
+            ));
+        }
+        // Closure jaccard threshold must remain meaningful
+        if self.closure_jaccard_threshold < 0.3 || self.closure_jaccard_threshold > 1.0 {
+            return Err(format!(
+                "closure_jaccard_threshold ({}) is outside safe range [0.3, 1.0]",
+                self.closure_jaccard_threshold
+            ));
+        }
+        // PostFailureThrashDetector break threshold must exist
+        if self.thrash_break_threshold < 2 {
+            return Err(format!(
+                "thrash_break_threshold ({}) is below security floor (2)",
+                self.thrash_break_threshold
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -377,6 +549,7 @@ pub const ENV_OVERRIDE_WHITELIST: &[&str] = &[
     "ANVIL_GUIDANCE_MODE",
     "ANVIL_EDIT_RECOVERY_READ_BUDGET",
     "ANVIL_TOOL_TEMPERATURE",
+    "ANVIL_DETECTOR_PROFILE",
 ];
 
 impl EffectiveConfig {
@@ -490,6 +663,20 @@ impl EffectiveConfig {
                 guidance_mode: GuidanceMode::default(),
                 edit_recovery_read_budget: 3,
                 tool_temperature: Some(0.3),
+                detector_profile: DetectorProfile::default(),
+                read_repeat_enabled: true,
+                write_repeat_enabled: true,
+                write_fail_enabled: true,
+                read_transition_enabled: true,
+                phase_force_transition_enabled: true,
+                alternating_cycle_threshold: 3,
+                closure_jaccard_threshold: 0.7,
+                thrash_warn_threshold: 3,
+                thrash_strong_warn_threshold: 4,
+                thrash_break_threshold: 5,
+                write_repeat_warn_threshold: 3,
+                write_repeat_strong_warn_threshold: 4,
+                write_fail_threshold: 2,
             },
             mode: ModeConfig {
                 prompt_source: PromptSource::Interactive,
@@ -1112,6 +1299,13 @@ impl EffectiveConfig {
                         return Err(ConfigError::InvalidNumericValue(value.clone()));
                     }
                     self.runtime.tool_temperature = Some(v);
+                }
+                "detector_profile" | "ANVIL_DETECTOR_PROFILE" => {
+                    // fail-closed: unknown values fall back to Strict
+                    let profile = value
+                        .parse::<DetectorProfile>()
+                        .unwrap_or(DetectorProfile::Strict);
+                    self.runtime.apply_profile(profile);
                 }
                 _ => {}
             }
@@ -1776,6 +1970,35 @@ impl std::fmt::Debug for RuntimeConfig {
             .field("safe_write_deletion_ratio", &self.safe_write_deletion_ratio)
             .field("edit_recovery_read_budget", &self.edit_recovery_read_budget)
             .field("tool_temperature", &self.tool_temperature)
+            .field("detector_profile", &self.detector_profile)
+            .field("read_repeat_enabled", &self.read_repeat_enabled)
+            .field("write_repeat_enabled", &self.write_repeat_enabled)
+            .field("write_fail_enabled", &self.write_fail_enabled)
+            .field("read_transition_enabled", &self.read_transition_enabled)
+            .field(
+                "phase_force_transition_enabled",
+                &self.phase_force_transition_enabled,
+            )
+            .field(
+                "alternating_cycle_threshold",
+                &self.alternating_cycle_threshold,
+            )
+            .field("closure_jaccard_threshold", &self.closure_jaccard_threshold)
+            .field("thrash_warn_threshold", &self.thrash_warn_threshold)
+            .field(
+                "thrash_strong_warn_threshold",
+                &self.thrash_strong_warn_threshold,
+            )
+            .field("thrash_break_threshold", &self.thrash_break_threshold)
+            .field(
+                "write_repeat_warn_threshold",
+                &self.write_repeat_warn_threshold,
+            )
+            .field(
+                "write_repeat_strong_warn_threshold",
+                &self.write_repeat_strong_warn_threshold,
+            )
+            .field("write_fail_threshold", &self.write_fail_threshold)
             .finish()
     }
 }

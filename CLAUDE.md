@@ -105,7 +105,7 @@ src/
 │   ├── tag_parser.rs    # タグベースツール呼び出しパーサー（多層プロトコル対応）
 │   └── tag_spec.rs      # ツールタグ仕様テーブル（TOOL_TAG_SPECS）
 ├── app/
-│   ├── mod.rs           # アプリケーションオーケストレータ（SessionStats・CompactInfo（sidecar_summary_length・sidecar_rejected含む）・セッションサマリー・sidecar quality gate適用含む）
+│   ├── mod.rs           # アプリケーションオーケストレータ（SessionStats・CompactInfo（sidecar_summary_length・sidecar_rejected含む）・セッションサマリー・sidecar quality gate適用・DetectorProfile対応Option<Tracker> wiring（Issue #371）含む）
 │   ├── agentic.rs       # agenticツール実行ループ（ANVIL_FINALガード・再試行ロジック・ターンサマリー・異常検出WARN・delegation_threshold・proactive branch含む）
 │   ├── cli.rs           # CLI入力ループ
 │   ├── context.rs       # コンテキスト注入（@file展開・サンドボックス検証）
@@ -123,7 +123,7 @@ src/
 │   ├── policy.rs        # offlineポリシーチェック（共通ヘルパー）
 │   ├── render.rs        # コンソール描画
 │   └── mock.rs          # テスト用モック
-├── config/mod.rs        # 設定管理
+├── config/mod.rs        # 設定管理（DetectorProfile enum・apply_profile・validate_detector_thresholds・validate_detector_security_invariants含む（Issue #371））
 ├── contracts/
 │   ├── mod.rs           # 共通型定義（TerminationReason, Finding, SubAgentPayload, FixSliceProposal含む）
 │   └── tokens.rs        # トークン推定（CJK対応ヒューリスティック・モデル実測値ベースEMA補正）
@@ -177,6 +177,7 @@ tests/
 ├── shell_inspection_drift.rs # shell.exec inspection drift テスト（Issue #309）
 ├── fixslice_subagent.rs # FixSliceサブエージェント統合テスト（Issue #291）
 ├── model_aware_delegation.rs # モデル対応委譲ポリシーテスト（Issue #292）
+├── detector_profile.rs  # DetectorProfileシステムテスト（Issue #371）
 └── walk_system.rs       # ディレクトリウォーカーテスト
 ```
 
