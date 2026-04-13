@@ -283,13 +283,17 @@ pub struct App {
     /// Phase estimator for fallback phase control (Issue #159).
     phase_estimator: phase_estimator::PhaseEstimator,
     /// Guard that forces a transition from exploration to implementation.
-    read_transition_guard: read_transition_guard::ReadTransitionGuard,
+    /// `None` when disabled by detector profile (Issue #371).
+    read_transition_guard: Option<read_transition_guard::ReadTransitionGuard>,
     /// Tracks consecutive file.write failures per path for recovery hints.
-    write_fail_tracker: write_fail_tracker::WriteFailTracker,
+    /// `None` when disabled by detector profile (Issue #371).
+    write_fail_tracker: Option<write_fail_tracker::WriteFailTracker>,
     /// Tracks repeated file.read calls per path for hint injection (Issue #185).
-    read_repeat_tracker: read_repeat_tracker::ReadRepeatTracker,
+    /// `None` when disabled by detector profile (Issue #371).
+    read_repeat_tracker: Option<read_repeat_tracker::ReadRepeatTracker>,
     /// Tracks repeated successful file.write calls per path for warning hints.
-    write_repeat_tracker: write_repeat_tracker::WriteRepeatTracker,
+    /// `None` when disabled by detector profile (Issue #371).
+    write_repeat_tracker: Option<write_repeat_tracker::WriteRepeatTracker>,
     /// File read cache: reduces redundant file.read calls within a session.
     file_read_cache: Arc<Mutex<crate::tooling::file_cache::FileReadCache>>,
     /// Session statistics for end-of-session summary (Issue #206).
@@ -601,6 +605,19 @@ impl App {
         let read_repeat_warn = config.runtime.read_repeat_warn_threshold;
         let read_repeat_strong_warn = config.runtime.read_repeat_strong_warn_threshold;
         let edit_recovery_read_budget = config.runtime.edit_recovery_read_budget;
+        let alternating_cycle_threshold = config.runtime.alternating_cycle_threshold;
+        let closure_jaccard_threshold = config.runtime.closure_jaccard_threshold;
+        let thrash_warn = config.runtime.thrash_warn_threshold;
+        let thrash_strong_warn = config.runtime.thrash_strong_warn_threshold;
+        let thrash_break = config.runtime.thrash_break_threshold;
+        let write_repeat_warn = config.runtime.write_repeat_warn_threshold;
+        let write_repeat_strong_warn = config.runtime.write_repeat_strong_warn_threshold;
+        let write_fail_threshold = config.runtime.write_fail_threshold;
+        let read_repeat_enabled = config.runtime.read_repeat_enabled;
+        let write_repeat_enabled = config.runtime.write_repeat_enabled;
+        let write_fail_enabled = config.runtime.write_fail_enabled;
+        let read_transition_enabled = config.runtime.read_transition_enabled;
+        let phase_force_transition_enabled = config.runtime.phase_force_transition_enabled;
 
         Ok(Self {
             tools,
@@ -618,7 +635,7 @@ impl App {
             checkpoint_stack: CheckpointStack::new(),
             loop_detector: loop_detector::LoopDetector::new(loop_detection_threshold),
             alternating_loop_detector: alternating_loop_detector::AlternatingLoopDetector::new(
-                alternating_loop_detector::DEFAULT_CYCLE_THRESHOLD,
+                alternating_cycle_threshold,
             ),
             hooks_engine,
             mcp_manager,
@@ -636,21 +653,46 @@ impl App {
                 edit_write_fallback_threshold,
                 edit_fixslice_threshold,
             ),
-            phase_estimator: phase_estimator::PhaseEstimator::new(
-                phase_explore,
-                phase_force,
-                phase_completion,
-            ),
-            read_transition_guard: read_transition_guard::ReadTransitionGuard::new(
-                read_transition_threshold,
-                read_transition_reinject_interval,
-            ),
-            write_fail_tracker: write_fail_tracker::WriteFailTracker::new(2),
-            read_repeat_tracker: read_repeat_tracker::ReadRepeatTracker::new(
-                read_repeat_warn,
-                read_repeat_strong_warn,
-            ),
-            write_repeat_tracker: write_repeat_tracker::WriteRepeatTracker::new(3, 4),
+            phase_estimator: {
+                let mut pe = phase_estimator::PhaseEstimator::new(
+                    phase_explore,
+                    phase_force,
+                    phase_completion,
+                );
+                pe.set_force_transition_enabled(phase_force_transition_enabled);
+                pe
+            },
+            read_transition_guard: if read_transition_enabled {
+                Some(read_transition_guard::ReadTransitionGuard::new(
+                    read_transition_threshold,
+                    read_transition_reinject_interval,
+                ))
+            } else {
+                None
+            },
+            write_fail_tracker: if write_fail_enabled {
+                Some(write_fail_tracker::WriteFailTracker::new(
+                    write_fail_threshold,
+                ))
+            } else {
+                None
+            },
+            read_repeat_tracker: if read_repeat_enabled {
+                Some(read_repeat_tracker::ReadRepeatTracker::new(
+                    read_repeat_warn,
+                    read_repeat_strong_warn,
+                ))
+            } else {
+                None
+            },
+            write_repeat_tracker: if write_repeat_enabled {
+                Some(write_repeat_tracker::WriteRepeatTracker::new(
+                    write_repeat_warn,
+                    write_repeat_strong_warn,
+                ))
+            } else {
+                None
+            },
             file_read_cache,
             session_stats: SessionStats::new(),
             last_compact_info: None,
@@ -672,9 +714,15 @@ impl App {
                 edit_recovery_read_budget,
             ),
             repair_closure_active: false,
-            closure_loop_detector: closure_loop_detector::ClosureLoopDetector::new(),
+            closure_loop_detector: closure_loop_detector::ClosureLoopDetector::with_threshold(
+                closure_jaccard_threshold,
+            ),
             post_failure_thrash_detector:
-                post_failure_thrash_detector::PostFailureThrashDetector::default(),
+                post_failure_thrash_detector::PostFailureThrashDetector::new(
+                    thrash_warn,
+                    thrash_strong_warn,
+                    thrash_break,
+                ),
         })
     }
 

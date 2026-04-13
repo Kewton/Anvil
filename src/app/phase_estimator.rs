@@ -82,6 +82,10 @@ pub struct PhaseEstimator {
     force_transition_threshold: usize,
     /// Threshold K: consecutive reads after last write for fallback completion.
     completion_read_threshold: usize,
+    /// Whether ForceTransition is enabled (Issue #371).
+    /// When false, ForceTransition is suppressed (returns Continue instead).
+    /// FallbackComplete is always enabled regardless of this flag.
+    force_transition_enabled: bool,
 }
 
 impl PhaseEstimator {
@@ -99,6 +103,7 @@ impl PhaseEstimator {
             explore_threshold,
             force_transition_threshold,
             completion_read_threshold,
+            force_transition_enabled: true,
         }
     }
 
@@ -108,6 +113,15 @@ impl PhaseEstimator {
     /// `completion_read_threshold` remain at their configured baselines.
     pub fn set_effective_threshold(&mut self, threshold: usize) {
         self.force_transition_threshold = threshold.max(3);
+    }
+
+    /// Enable or disable `ForceTransition` output (Issue #371).
+    ///
+    /// When disabled, `record_tool_call_ex()` returns `Continue` instead of
+    /// `ForceTransition` even when `consecutive_reads >= force_transition_threshold`.
+    /// `FallbackComplete` from `check_empty_response()` is always enabled.
+    pub fn set_force_transition_enabled(&mut self, enabled: bool) {
+        self.force_transition_enabled = enabled;
     }
 
     /// Reset per-turn counters. Called at the start of each
@@ -148,11 +162,14 @@ impl PhaseEstimator {
             ToolCategory::Read => {
                 self.consecutive_reads += 1;
                 if self.consecutive_reads >= self.force_transition_threshold {
-                    return PhaseAction::ForceTransition(
-                        "You have been reading files extensively. \
-                         Please proceed to implementation using file.edit or file.write."
-                            .to_string(),
-                    );
+                    if self.force_transition_enabled {
+                        return PhaseAction::ForceTransition(
+                            "You have been reading files extensively. \
+                             Please proceed to implementation using file.edit or file.write."
+                                .to_string(),
+                        );
+                    }
+                    return PhaseAction::Continue;
                 }
                 PhaseAction::Continue
             }
