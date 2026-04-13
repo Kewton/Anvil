@@ -531,6 +531,10 @@ impl App {
                 }
                 // Issue #255: NoPlan suppression counts as premature
                 self.agent_telemetry.record_premature_final();
+                // Issue #372: (E) plan gate suppression telemetry
+                self.agent_telemetry
+                    .retry
+                    .record_plan_gate_suppression_attempted();
                 tracing::info!("plan-aware final gate: no plan, requesting plan creation");
                 let msg = SessionMessage::new(
                     MessageRole::Tool,
@@ -551,6 +555,10 @@ impl App {
                 // Issue #271: Track ANVIL_FINAL suppression with remaining targets.
                 self.agent_telemetry
                     .record_final_suppressed_with_remaining_targets();
+                // Issue #372: (E) plan gate suppression telemetry
+                self.agent_telemetry
+                    .retry
+                    .record_plan_gate_suppression_attempted();
                 tracing::info!(
                     remaining,
                     total,

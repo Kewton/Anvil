@@ -492,6 +492,12 @@ impl<T: HttpTransport> RetryTransport<T> {
             match operation() {
                 Ok(result) => return Ok(result),
                 Err(err) if err.is_retryable() && guard() && attempt < self.config.max_retries => {
+                    // Issue #372: (H) tracing event for HTTP retry attempt
+                    tracing::info!(
+                        attempt = attempt + 1,
+                        max = self.config.max_retries,
+                        "retry_telemetry: http_retry attempted"
+                    );
                     let delay = self
                         .config
                         .base_delay_ms
@@ -502,7 +508,16 @@ impl<T: HttpTransport> RetryTransport<T> {
                     }
                     last_error = Some(err);
                 }
-                Err(err) => return Err(err),
+                Err(err) => {
+                    // Issue #372: (H) tracing event for HTTP final failure
+                    if attempt > 0 {
+                        tracing::warn!(
+                            attempts = attempt,
+                            "retry_telemetry: http_retry final failure"
+                        );
+                    }
+                    return Err(err);
+                }
             }
         }
         Err(last_error.expect("retry loop executed at least once"))
