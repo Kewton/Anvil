@@ -99,6 +99,84 @@ pub fn summarize_tool_names(names: &[String]) -> String {
     format_tool_counts(counts.into_iter())
 }
 
+/// Result of a termination decision helper.
+/// Tells the main loop what control-flow action to take.
+enum TerminationDecision {
+    /// Exit the agentic loop.
+    Break,
+    /// Continue the loop (suppression applied or retry injected).
+    Continue,
+}
+
+/// Action returned by the Done-path ANVIL_FINAL guard.
+enum DonePathAction {
+    /// Plan gate triggered — invoke guarded retry turn.
+    PlanGateRetry,
+    /// Final guard triggered — inject retry and invoke guarded retry turn.
+    FinalGuardRetry,
+    /// Guard did not fire — no special action needed.
+    NotFired,
+}
+
+/// Loop-local state governing termination decisions in the agentic loop.
+///
+/// All fields are initialised at the start of `complete_structured_response`
+/// and consumed only within that method. App-level session state
+/// (forced_mode_active, repair_closure_active, proactive_delegation_pending)
+/// is intentionally excluded — see Issue #385 scope boundary.
+struct TerminationLoopState {
+    /// Whether an ANVIL_FINAL marker has been detected in the current or
+    /// a prior response within this turn.
+    anvil_final_seen: bool,
+    /// Number of "final guard" retries attempted (max: MAX_FINAL_GUARD_RETRIES).
+    final_guard_retries: u8,
+    /// Whether a synthetic guidance retry has been consumed in this turn.
+    guidance_retry_used: bool,
+    /// Set after guidance injection; cleared when the follow-up response arrives.
+    awaiting_guidance_followup: bool,
+    /// Number of times the plan gate has suppressed termination
+    /// (max 1 per Issue #285 A2).
+    noplan_suppression_count: u8,
+    /// Whether a pre-exit repair turn was injected (Issue #325).
+    pre_exit_repair_injected: bool,
+    /// Set when the phase estimator detects a fallback completion (Issue #159).
+    fallback_completed: bool,
+}
+
+impl TerminationLoopState {
+    fn new(anvil_final_already: bool, initial_anvil_final_detected: bool) -> Self {
+        Self {
+            anvil_final_seen: anvil_final_already || initial_anvil_final_detected,
+            final_guard_retries: 0,
+            guidance_retry_used: false,
+            awaiting_guidance_followup: false,
+            noplan_suppression_count: 0,
+            pre_exit_repair_injected: false,
+            fallback_completed: false,
+        }
+    }
+
+    /// Query: has ANVIL_FINAL been detected?
+    fn is_anvil_final_seen(&self) -> bool {
+        self.anvil_final_seen
+    }
+
+    /// Suppress the current ANVIL_FINAL detection (plan gate / guidance retry).
+    fn suppress_anvil_final(&mut self) {
+        self.anvil_final_seen = false;
+    }
+
+    /// Record that ANVIL_FINAL was newly detected in an LLM response.
+    fn observe_anvil_final(&mut self) {
+        self.anvil_final_seen = true;
+    }
+
+    /// Record a plan-gate suppression event.
+    fn record_plan_suppression(&mut self) {
+        self.noplan_suppression_count += 1;
+    }
+}
+
 /// Mutation tool names used for the successful-mutation check (Issue #285).
 const MUTATION_TOOL_NAMES: &[&str] = &[
     "file.write",
@@ -750,6 +828,190 @@ impl App {
         self.session.push_message(retry_msg);
     }
 
+    /// Evaluate the ANVIL_FINAL gate after tool execution.
+    ///
+    /// Returns `TerminationDecision::Break` if ANVIL_FINAL should be accepted,
+    /// or `TerminationDecision::Continue` if termination was suppressed
+    /// (by plan gate or guidance retry injection).
+    fn handle_post_tool_anvil_final_gate(
+        &mut self,
+        results: &[ToolExecutionResult],
+        term_state: &mut TerminationLoopState,
+    ) -> TerminationDecision {
+        // Issue #249/#285: Plan-aware ANVIL_FINAL gate — suppress if plan is incomplete.
+        // A2 fix: only require plan when session has no file changes AND
+        // the current batch contains no successful mutation.
+        // A2 fix: only suppress NoPlan when the batch contains mutation
+        // tool attempts (successful or not) but no actual persisted changes.
+        // Read-only batches (file.read only) should pass through NoPlan.
+        let batch_has_mutation_attempts = results
+            .iter()
+            .any(|r| MUTATION_TOOL_NAMES.contains(&r.tool_name.as_str()));
+        let is_effectively_mutation_task = batch_has_mutation_attempts
+            && self.session_stats.files_modified.is_empty()
+            && !results_contain_successful_mutation(results)
+            && term_state.noplan_suppression_count == 0;
+        if self.check_plan_final_gate_with_require(is_effectively_mutation_task) {
+            if is_effectively_mutation_task {
+                term_state.record_plan_suppression();
+            }
+            tracing::info!("ANVIL_FINAL suppressed by plan gate; continuing execution");
+            term_state.suppress_anvil_final();
+            TerminationDecision::Continue
+        } else if self.should_activate_guidance_retry(term_state.guidance_retry_used, results) {
+            tracing::info!(
+                "ANVIL_FINAL delayed: synthetic guidance injected, sending one follow-up turn"
+            );
+            // Issue #372: (A) guidance retry telemetry
+            self.agent_telemetry.retry.record_guidance_retry_attempted();
+            term_state.guidance_retry_used = true;
+            term_state.awaiting_guidance_followup = true;
+            term_state.suppress_anvil_final();
+            TerminationDecision::Continue
+        } else {
+            tracing::info!("ANVIL_FINAL detected; terminating after tool execution");
+            self.phase_estimator.accept_anvil_final();
+            TerminationDecision::Break
+        }
+    }
+
+    /// Handle an LLM response with no tool calls.
+    ///
+    /// Evaluates guidance follow-up, final guard, fallback completion,
+    /// plan gate paths. Returns the loop control decision.
+    fn handle_empty_tool_response(
+        &mut self,
+        next_structured: &mut StructuredAssistantResponse,
+        term_state: &mut TerminationLoopState,
+    ) -> Result<TerminationDecision, AppError> {
+        // Branch 1: guidance follow-up path
+        if term_state.awaiting_guidance_followup {
+            term_state.awaiting_guidance_followup = false;
+            if self.should_activate_final_guard(term_state.final_guard_retries) {
+                tracing::info!(
+                    "Guidance follow-up ended without edits; escalating to final guard retry"
+                );
+                // Issue #372: (B) final guard retry telemetry (guidance escalation path)
+                self.agent_telemetry
+                    .retry
+                    .record_final_guard_retry_attempted();
+                self.inject_final_guard_retry();
+                term_state.final_guard_retries += 1;
+                return Ok(TerminationDecision::Continue);
+            }
+            tracing::info!("Guidance follow-up completed; accepting response");
+            let message_id = self.next_message_id("assistant");
+            self.record_assistant_output(
+                message_id,
+                std::mem::take(&mut next_structured.final_response),
+            )?;
+            return Ok(TerminationDecision::Break);
+        }
+
+        // Branch 2: ANVIL_FINAL guard — check if any file modifications were made
+        if self.should_activate_final_guard(term_state.final_guard_retries) {
+            // Issue #372: (B) final guard retry telemetry (loop path)
+            self.agent_telemetry
+                .retry
+                .record_final_guard_retry_attempted();
+            self.inject_final_guard_retry();
+            term_state.final_guard_retries += 1;
+            return Ok(TerminationDecision::Continue);
+        }
+
+        // Branch 3: Fallback completion detection (Issue #159):
+        // When ANVIL_FINAL was never observed, check if tool patterns
+        // indicate the agent has finished (write succeeded + verification reads + empty response).
+        if let super::phase_estimator::PhaseAction::FallbackComplete =
+            self.phase_estimator.check_empty_response()
+        {
+            // Issue #307: plan に未完了 item がある場合は break せず
+            // Plan Gate に fallthrough して既存のガイダンス注入・ループ防止を再利用
+            if !self.execution_plan.is_empty() && !self.execution_plan.all_finished() {
+                tracing::info!(
+                    "Phase estimator: fallback completion suppressed \
+                     (plan incomplete, falling through to plan gate; Issue #307)"
+                );
+                // break しない → 後続の Plan Gate に到達する
+            } else {
+                tracing::info!("Phase estimator: fallback completion detected");
+                let message_id = self.next_message_id("assistant");
+                self.record_assistant_output(
+                    message_id,
+                    std::mem::take(&mut next_structured.final_response),
+                )?;
+                term_state.fallback_completed = true;
+                return Ok(TerminationDecision::Break);
+            }
+        }
+
+        // Branch 4: Issue #249/#285: Plan gate — suppress termination if plan is incomplete.
+        // B1 fix: require plan only when mutation tools were attempted
+        // but no files were actually modified, and we haven't already
+        // suppressed once (to avoid infinite loops for read-only tasks).
+        let session_has_mutation_attempts = MUTATION_TOOL_NAMES
+            .iter()
+            .any(|t| self.session_stats.tool_calls.contains_key(*t));
+        let require_plan_here = ((session_has_mutation_attempts
+            && self.session_stats.files_modified.is_empty())
+            || self
+                .should_require_plan_for_implementation_task(term_state.noplan_suppression_count))
+            && term_state.noplan_suppression_count == 0;
+        if self.check_plan_final_gate_with_require(require_plan_here) {
+            if require_plan_here {
+                term_state.record_plan_suppression();
+            }
+            tracing::info!("Plan gate: suppressing termination with empty tool calls");
+            return Ok(TerminationDecision::Continue);
+        }
+
+        // Branch 5: No more tool calls — this is the final answer
+        // Issue #261 Task 0.4: Mark as accepted (not suppressed)
+        if term_state.is_anvil_final_seen() {
+            self.phase_estimator.accept_anvil_final();
+        }
+        let message_id = self.next_message_id("assistant");
+        self.record_assistant_output(
+            message_id,
+            std::mem::take(&mut next_structured.final_response),
+        )?;
+        Ok(TerminationDecision::Break)
+    }
+
+    /// Evaluate the ANVIL_FINAL guard on the Done path (no agentic loop).
+    ///
+    /// The Done path runs outside `complete_structured_response` so there is
+    /// no `TerminationLoopState`. The final_guard_retries counter is
+    /// hardcoded to 0 (first-turn completion always gets one retry).
+    ///
+    /// The caller is responsible for `record_assistant_output` and
+    /// `run_guarded_retry_turn` based on the returned action.
+    fn handle_done_path_anvil_final_guard(&mut self, assistant_message: &str) -> DonePathAction {
+        // CB-002: Retry count is always 0 here because this path handles
+        // the first-turn Done event (before any agentic loop iteration).
+        // MAX_FINAL_GUARD_RETRIES = 1 ensures at most one retry, so the
+        // hardcoded 0 is correct and sufficient for the current design.
+        // Issue #173: Use lenient detection for Done path (response is complete)
+        if BasicAgentLoop::is_complete_structured_response_lenient(assistant_message)
+            && self.should_activate_final_guard(0)
+        {
+            // ANVIL_FINAL detected → record observation (Issue #159)
+            self.phase_estimator.observe_anvil_final();
+            // Issue #253: Apply plan gate even on zero-tool-call Done path.
+            // Use require_plan variant so NoPlan also suppresses.
+            if self.check_plan_final_gate_require_plan() {
+                return DonePathAction::PlanGateRetry;
+            }
+            // Issue #372: (B) final guard retry telemetry (Done path)
+            self.agent_telemetry
+                .retry
+                .record_final_guard_retry_attempted();
+            self.inject_final_guard_retry();
+            return DonePathAction::FinalGuardRetry;
+        }
+        DonePathAction::NotFired
+    }
+
     /// Execute tool calls and feed results back to the LLM in a loop.
     ///
     /// This implements the agentic tool-use loop:
@@ -775,14 +1037,9 @@ impl App {
         let mut frames = Vec::new();
         let mut total_tool_count = 0usize;
         let mut all_tool_log_views: Vec<ToolLogView> = Vec::new();
-        let mut final_guard_retries: u8 = 0;
-        let mut fallback_completed = false;
-        let mut guidance_retry_used = false;
-        let mut awaiting_guidance_followup = false;
-        // Issue #173: Track whether ANVIL_FINAL has been seen in this session.
-        // When true, the loop will terminate after executing the current batch
-        // of tool calls (no further LLM round-trips).
-        let mut anvil_final_seen = anvil_final_already || current.anvil_final_detected;
+        // Issue #385: Group termination-related loop-local state.
+        let mut term_state =
+            TerminationLoopState::new(anvil_final_already, current.anvil_final_detected);
 
         // Reset loop detector at the start of each top-level turn (Issue #145)
         self.loop_detector.reset();
@@ -844,9 +1101,6 @@ impl App {
 
         // Issue #285: track forced_mode_active transitions for telemetry.
         let mut prev_forced_mode_active = false;
-        // Issue #285 A2: limit NoPlan suppression at the post-tool ANVIL_FINAL gate.
-        // After one suppression, if the model still can't produce a plan, let it through.
-        let mut noplan_suppression_count: u8 = 0;
         // Issue #303: pre-mutation plan barrier.
         let mut mutation_barrier = super::mutation_barrier::MutationBarrier::new();
         // Issue #355: post-escalation fix_slice routing barrier. Suspends
@@ -854,10 +1108,6 @@ impl App {
         // fired under a `requires_worker_observation` pack and the worker
         // path has not yet been invoked.
         let mut escalation_barrier = super::escalation_barrier::EscalationBarrier::new();
-        // Issue #325: track whether a pre-exit repair turn was injected.
-        // When true, the next iteration processes the repair turn's LLM response
-        // before terminating the loop.
-        let mut pre_exit_repair_injected = false;
 
         for iteration in 0..max_iterations {
             let iteration_started = std::time::Instant::now();
@@ -1017,39 +1267,10 @@ impl App {
 
             // Issue #173: If ANVIL_FINAL was already seen, terminate after
             // executing the current tool batch (no further LLM round-trips).
-            if anvil_final_seen {
-                // Issue #249/#285: Plan-aware ANVIL_FINAL gate — suppress if plan is incomplete.
-                // A2 fix: only require plan when session has no file changes AND
-                // the current batch contains no successful mutation.
-                // A2 fix: only suppress NoPlan when the batch contains mutation
-                // tool attempts (successful or not) but no actual persisted changes.
-                // Read-only batches (file.read only) should pass through NoPlan.
-                let batch_has_mutation_attempts = results
-                    .iter()
-                    .any(|r| MUTATION_TOOL_NAMES.contains(&r.tool_name.as_str()));
-                let is_effectively_mutation_task = batch_has_mutation_attempts
-                    && self.session_stats.files_modified.is_empty()
-                    && !results_contain_successful_mutation(&results)
-                    && noplan_suppression_count == 0;
-                if self.check_plan_final_gate_with_require(is_effectively_mutation_task) {
-                    if is_effectively_mutation_task {
-                        noplan_suppression_count += 1;
-                    }
-                    tracing::info!("ANVIL_FINAL suppressed by plan gate; continuing execution");
-                    anvil_final_seen = false;
-                } else if self.should_activate_guidance_retry(guidance_retry_used, &results) {
-                    tracing::info!(
-                        "ANVIL_FINAL delayed: synthetic guidance injected, sending one follow-up turn"
-                    );
-                    // Issue #372: (A) guidance retry telemetry
-                    self.agent_telemetry.retry.record_guidance_retry_attempted();
-                    guidance_retry_used = true;
-                    awaiting_guidance_followup = true;
-                    anvil_final_seen = false;
-                } else {
-                    tracing::info!("ANVIL_FINAL detected; terminating after tool execution");
-                    self.phase_estimator.accept_anvil_final();
-                    break;
+            if term_state.is_anvil_final_seen() {
+                match self.handle_post_tool_anvil_final_gate(&results, &mut term_state) {
+                    TerminationDecision::Break => break,
+                    TerminationDecision::Continue => {}
                 }
             }
 
@@ -1197,7 +1418,7 @@ impl App {
             }
 
             // Parse the follow-up response (retry once on parse failure)
-            let next_structured = match BasicAgentLoop::parse_structured_response_with_registry(
+            let mut next_structured = match BasicAgentLoop::parse_structured_response_with_registry(
                 &next_token_buffer,
                 &self.tools,
             ) {
@@ -1492,7 +1713,7 @@ impl App {
 
             // Issue #173: Update ANVIL_FINAL tracking from the new response
             if next_structured.anvil_final_detected {
-                anvil_final_seen = true;
+                term_state.observe_anvil_final();
                 self.phase_estimator.observe_anvil_final();
             }
 
@@ -1596,7 +1817,7 @@ impl App {
             // the previous iteration, the LLM has now consumed it and responded.
             // Decide termination based on the resulting plan state, not just the
             // fact that one repair response was consumed.
-            if pre_exit_repair_injected {
+            if term_state.pre_exit_repair_injected {
                 self.agent_telemetry.record_pre_exit_repair_consumed();
                 let pending_after = self
                     .execution_plan
@@ -1692,7 +1913,7 @@ impl App {
                             pending_before,
                             "pre-exit repair turn injected; continuing for one more LLM turn"
                         );
-                        pre_exit_repair_injected = true;
+                        term_state.pre_exit_repair_injected = true;
                         current = next_structured;
                         continue;
                     }
@@ -1725,110 +1946,30 @@ impl App {
             self.last_compact_info = None;
 
             if next_structured.tool_calls.is_empty() {
-                if awaiting_guidance_followup {
-                    awaiting_guidance_followup = false;
-                    if self.should_activate_final_guard(final_guard_retries) {
-                        tracing::info!(
-                            "Guidance follow-up ended without edits; escalating to final guard retry"
-                        );
-                        // Issue #372: (B) final guard retry telemetry (guidance escalation path)
-                        self.agent_telemetry
-                            .retry
-                            .record_final_guard_retry_attempted();
-                        self.inject_final_guard_retry();
-                        final_guard_retries += 1;
+                match self.handle_empty_tool_response(&mut next_structured, &mut term_state)? {
+                    TerminationDecision::Break => break,
+                    TerminationDecision::Continue => {
                         current = next_structured;
                         continue;
                     }
-                    tracing::info!("Guidance follow-up completed; accepting response");
-                    self.record_assistant_output(
-                        self.next_message_id("assistant"),
-                        next_structured.final_response,
-                    )?;
-                    break;
                 }
-                // ANVIL_FINAL guard: check if any file modifications were made
-                if self.should_activate_final_guard(final_guard_retries) {
-                    // Issue #372: (B) final guard retry telemetry (loop path)
-                    self.agent_telemetry
-                        .retry
-                        .record_final_guard_retry_attempted();
-                    self.inject_final_guard_retry();
-                    final_guard_retries += 1;
-                    current = next_structured;
-                    continue;
-                }
-
-                // Fallback completion detection (Issue #159):
-                // When ANVIL_FINAL was never observed, check if tool patterns
-                // indicate the agent has finished (write succeeded + verification reads + empty response).
-                if let super::phase_estimator::PhaseAction::FallbackComplete =
-                    self.phase_estimator.check_empty_response()
-                {
-                    // Issue #307: plan に未完了 item がある場合は break せず
-                    // Plan Gate に fallthrough して既存のガイダンス注入・ループ防止を再利用
-                    if !self.execution_plan.is_empty() && !self.execution_plan.all_finished() {
-                        tracing::info!(
-                            "Phase estimator: fallback completion suppressed \
-                             (plan incomplete, falling through to plan gate; Issue #307)"
-                        );
-                        // break しない → 後続の Plan Gate に到達する
-                    } else {
-                        tracing::info!("Phase estimator: fallback completion detected");
-                        self.record_assistant_output(
-                            self.next_message_id("assistant"),
-                            next_structured.final_response,
-                        )?;
-                        fallback_completed = true;
-                        break;
-                    }
-                }
-
-                // Issue #249/#285: Plan gate — suppress termination if plan is incomplete.
-                // B1 fix: require plan only when mutation tools were attempted
-                // but no files were actually modified, and we haven't already
-                // suppressed once (to avoid infinite loops for read-only tasks).
-                let session_has_mutation_attempts = MUTATION_TOOL_NAMES
-                    .iter()
-                    .any(|t| self.session_stats.tool_calls.contains_key(*t));
-                let require_plan_here = ((session_has_mutation_attempts
-                    && self.session_stats.files_modified.is_empty())
-                    || self.should_require_plan_for_implementation_task(noplan_suppression_count))
-                    && noplan_suppression_count == 0;
-                if self.check_plan_final_gate_with_require(require_plan_here) {
-                    if require_plan_here {
-                        noplan_suppression_count += 1;
-                    }
-                    tracing::info!("Plan gate: suppressing termination with empty tool calls");
-                    current = next_structured;
-                    continue;
-                }
-
-                // No more tool calls — this is the final answer
-                // Issue #261 Task 0.4: Mark as accepted (not suppressed)
-                if anvil_final_seen {
-                    self.phase_estimator.accept_anvil_final();
-                }
-                self.record_assistant_output(
-                    self.next_message_id("assistant"),
-                    next_structured.final_response,
-                )?;
-                break;
             }
 
             // More tool calls — continue the loop
-            if awaiting_guidance_followup {
+            if term_state.awaiting_guidance_followup {
                 // Issue #372: (A) guidance retry succeeded — follow-up turn
                 // produced tool calls.
                 self.agent_telemetry.retry.record_guidance_retry_succeeded();
-                awaiting_guidance_followup = false;
+                term_state.awaiting_guidance_followup = false;
             }
             current = next_structured;
         }
 
         // Issue #372: (B) final guard retry success — retries fired and files
         // were ultimately modified.
-        if final_guard_retries > 0 && !self.session.working_memory.touched_files.is_empty() {
+        if term_state.final_guard_retries > 0
+            && !self.session.working_memory.touched_files.is_empty()
+        {
             self.agent_telemetry
                 .retry
                 .record_final_guard_retry_succeeded();
@@ -1856,7 +1997,7 @@ impl App {
             .with_status(status.to_string())
             .with_tool_logs(all_tool_log_views)
             .with_completion_summary(
-                if fallback_completed {
+                if term_state.fallback_completed {
                     format!(
                         "Executed {} tool call(s) across agentic loop (fallback completion). {}",
                         total_tool_count, saved_status
@@ -3228,20 +3369,8 @@ impl App {
             // Inject retry message and re-invoke LLM directly (not via
             // complete_structured_response, which would wastefully execute the
             // empty tool_calls pipeline).
-            //
-            // CB-002: Retry count is always 0 here because this path handles
-            // the first-turn Done event (before any agentic loop iteration).
-            // MAX_FINAL_GUARD_RETRIES = 1 ensures at most one retry, so the
-            // hardcoded 0 is correct and sufficient for the current design.
-            // Issue #173: Use lenient detection for Done path (response is complete)
-            if BasicAgentLoop::is_complete_structured_response_lenient(assistant_message)
-                && self.should_activate_final_guard(0)
-            {
-                // ANVIL_FINAL detected → record observation (Issue #159)
-                self.phase_estimator.observe_anvil_final();
-                // Issue #253: Apply plan gate even on zero-tool-call Done path.
-                // Use require_plan variant so NoPlan also suppresses.
-                if self.check_plan_final_gate_require_plan() {
+            match self.handle_done_path_anvil_final_guard(assistant_message) {
+                DonePathAction::PlanGateRetry => {
                     self.record_assistant_output(
                         self.next_message_id("assistant"),
                         assistant_message,
@@ -3255,22 +3384,23 @@ impl App {
                         provider_client,
                     )?));
                 }
-                // Issue #372: (B) final guard retry telemetry (Done path)
-                self.agent_telemetry
-                    .retry
-                    .record_final_guard_retry_attempted();
-                self.inject_final_guard_retry();
-                // Record the assistant message that triggered the guard
-                self.record_assistant_output(self.next_message_id("assistant"), assistant_message)?;
-                // Re-invoke LLM and process the response
-                return Ok(Some(self.run_guarded_retry_turn(
-                    status,
-                    saved_status,
-                    *elapsed_ms,
-                    inference_performance.clone(),
-                    tui,
-                    provider_client,
-                )?));
+                DonePathAction::FinalGuardRetry => {
+                    // Record the assistant message that triggered the guard
+                    self.record_assistant_output(
+                        self.next_message_id("assistant"),
+                        assistant_message,
+                    )?;
+                    // Re-invoke LLM and process the response
+                    return Ok(Some(self.run_guarded_retry_turn(
+                        status,
+                        saved_status,
+                        *elapsed_ms,
+                        inference_performance.clone(),
+                        tui,
+                        provider_client,
+                    )?));
+                }
+                DonePathAction::NotFired => {}
             }
             // CB-002: Record turn stats for non-tool turns
             self.session_stats.record_turn();
@@ -4016,5 +4146,51 @@ mod trust_tests {
             !formatted.contains("[0 chars truncated"),
             "file.read should use the tighter per-tool cap"
         );
+    }
+
+    // --- TerminationLoopState unit tests (Issue #385) ---
+
+    #[test]
+    fn termination_loop_state_new_both_false() {
+        let state = TerminationLoopState::new(false, false);
+        assert!(!state.is_anvil_final_seen());
+        assert_eq!(state.final_guard_retries, 0);
+        assert!(!state.guidance_retry_used);
+        assert!(!state.awaiting_guidance_followup);
+        assert_eq!(state.noplan_suppression_count, 0);
+        assert!(!state.pre_exit_repair_injected);
+        assert!(!state.fallback_completed);
+    }
+
+    #[test]
+    fn termination_loop_state_new_already_true() {
+        let state = TerminationLoopState::new(true, false);
+        assert!(state.is_anvil_final_seen());
+    }
+
+    #[test]
+    fn termination_loop_state_new_detected_true() {
+        let state = TerminationLoopState::new(false, true);
+        assert!(state.is_anvil_final_seen());
+    }
+
+    #[test]
+    fn termination_loop_state_suppress_and_observe() {
+        let mut state = TerminationLoopState::new(true, false);
+        assert!(state.is_anvil_final_seen());
+        state.suppress_anvil_final();
+        assert!(!state.is_anvil_final_seen());
+        state.observe_anvil_final();
+        assert!(state.is_anvil_final_seen());
+    }
+
+    #[test]
+    fn termination_loop_state_record_plan_suppression() {
+        let mut state = TerminationLoopState::new(false, false);
+        assert_eq!(state.noplan_suppression_count, 0);
+        state.record_plan_suppression();
+        assert_eq!(state.noplan_suppression_count, 1);
+        state.record_plan_suppression();
+        assert_eq!(state.noplan_suppression_count, 2);
     }
 }
