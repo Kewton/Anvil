@@ -387,6 +387,11 @@ pub struct RetryTelemetry {
     pub parse_failure_recovered: u32,
     #[serde(default)]
     pub parse_failure_empty_errored: u32,
+    // --- Task Semantics Gate (Issue #382) ---
+    #[serde(default)]
+    pub task_semantics_gate_attempted: u32,
+    #[serde(default)]
+    pub task_semantics_gate_succeeded: u32,
 }
 
 impl RetryTelemetry {
@@ -425,6 +430,14 @@ impl RetryTelemetry {
     /// Record an edit write fallback attempt.
     pub fn record_edit_write_fallback_attempted(&mut self) {
         self.edit_write_fallback_attempted += 1;
+    }
+    /// Record a task-semantics gate attempt (Issue #382).
+    pub fn record_task_semantics_gate_attempted(&mut self) {
+        self.task_semantics_gate_attempted += 1;
+    }
+    /// Record a task-semantics gate success (Issue #382).
+    pub fn record_task_semantics_gate_succeeded(&mut self) {
+        self.task_semantics_gate_succeeded += 1;
     }
 }
 

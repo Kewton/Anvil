@@ -3842,8 +3842,8 @@ fn synthetic_guidance_followup_without_edits_triggers_final_guard_retry() {
     let requests = seen_requests.borrow();
     assert_eq!(
         requests.len(),
-        4,
-        "expected 4 provider calls: initial turn + guidance follow-up + final guard retry + no-plan suppression retry"
+        5,
+        "expected 5 provider calls: initial turn + guidance follow-up + final guard retry + no-plan suppression retry + task-semantics gate retry (Issue #382)"
     );
     assert!(
         app.session()
