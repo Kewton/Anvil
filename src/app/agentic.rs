@@ -1793,9 +1793,7 @@ impl App {
                     .any(|t| self.session_stats.tool_calls.contains_key(*t));
                 let require_plan_here = ((session_has_mutation_attempts
                     && self.session_stats.files_modified.is_empty())
-                    || self.should_require_plan_for_implementation_task(
-                        noplan_suppression_count,
-                    ))
+                    || self.should_require_plan_for_implementation_task(noplan_suppression_count))
                     && noplan_suppression_count == 0;
                 if self.check_plan_final_gate_with_require(require_plan_here) {
                     if require_plan_here {
