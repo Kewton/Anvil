@@ -4697,3 +4697,112 @@ fn openai_request_omits_temperature_when_none() {
         "request body should NOT contain temperature when None: {body_str}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #370: num_ctx / context_window pass-through to Ollama
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ollama_request_includes_num_ctx_when_context_window_set() {
+    let mut request = ProviderTurnRequest::new(
+        "test-model".to_string(),
+        vec![anvil::provider::ProviderMessage::new(
+            ProviderMessageRole::User,
+            "hello",
+        )],
+        true,
+    );
+    request.context_window = Some(32768);
+
+    let ollama_request =
+        OllamaProviderClient::<anvil::provider::ReqwestHttpTransport>::build_chat_request(&request);
+
+    let options = ollama_request
+        .options
+        .expect("options should be set when context_window is Some");
+    assert_eq!(options.num_ctx, Some(32768));
+}
+
+#[test]
+fn ollama_request_omits_num_ctx_when_context_window_none() {
+    let mut request = ProviderTurnRequest::new(
+        "test-model".to_string(),
+        vec![anvil::provider::ProviderMessage::new(
+            ProviderMessageRole::User,
+            "hello",
+        )],
+        true,
+    );
+    request.max_output_tokens = Some(16384);
+
+    let ollama_request =
+        OllamaProviderClient::<anvil::provider::ReqwestHttpTransport>::build_chat_request(&request);
+
+    let options = ollama_request.options.expect("options should be set");
+    assert_eq!(options.num_ctx, None);
+}
+
+#[test]
+fn ollama_request_includes_both_num_predict_and_num_ctx() {
+    let mut request = ProviderTurnRequest::new(
+        "test-model".to_string(),
+        vec![anvil::provider::ProviderMessage::new(
+            ProviderMessageRole::User,
+            "hello",
+        )],
+        true,
+    );
+    request.max_output_tokens = Some(16384);
+    request.context_window = Some(32768);
+
+    let ollama_request =
+        OllamaProviderClient::<anvil::provider::ReqwestHttpTransport>::build_chat_request(&request);
+
+    let options = ollama_request.options.expect("options should be set");
+    assert_eq!(options.num_predict, Some(16384));
+    assert_eq!(options.num_ctx, Some(32768));
+}
+
+#[test]
+fn ollama_request_serializes_num_ctx_correctly() {
+    let mut request = ProviderTurnRequest::new(
+        "test-model".to_string(),
+        vec![anvil::provider::ProviderMessage::new(
+            ProviderMessageRole::User,
+            "hello",
+        )],
+        true,
+    );
+    request.context_window = Some(65536);
+
+    let ollama_request =
+        OllamaProviderClient::<anvil::provider::ReqwestHttpTransport>::build_chat_request(&request);
+    let json = serde_json::to_string(&ollama_request).expect("should serialize");
+    assert!(
+        json.contains("\"num_ctx\":65536"),
+        "should contain num_ctx: {json}"
+    );
+}
+
+#[test]
+fn ollama_request_includes_num_ctx_only_when_num_predict_none() {
+    let mut request = ProviderTurnRequest::new(
+        "test-model".to_string(),
+        vec![anvil::provider::ProviderMessage::new(
+            ProviderMessageRole::User,
+            "hello",
+        )],
+        true,
+    );
+    request.context_window = Some(8192);
+    // max_output_tokens is None (default)
+
+    let ollama_request =
+        OllamaProviderClient::<anvil::provider::ReqwestHttpTransport>::build_chat_request(&request);
+
+    let options = ollama_request
+        .options
+        .expect("options should be set when context_window is Some");
+    assert_eq!(options.num_predict, None);
+    assert_eq!(options.num_ctx, Some(8192));
+}

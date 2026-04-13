@@ -388,6 +388,10 @@ impl<T> OpenAiCompatibleProviderClient<T> {
     }
 
     /// Build an OpenAI chat request from a provider turn request.
+    ///
+    /// Note: `request.context_window` (Ollama `num_ctx`) is intentionally not
+    /// mapped here. The OpenAI chat completions API does not support a
+    /// per-request context window override.
     fn build_chat_request(
         request: &ProviderTurnRequest,
         stream_options: Option<serde_json::Value>,

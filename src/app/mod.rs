@@ -1475,6 +1475,11 @@ impl App {
         );
         request.max_output_tokens = self.config.runtime.max_output_tokens;
         // temperature intentionally left as None for non-agentic (conversational) turns
+        request.context_window = if self.config.runtime.context_window_explicitly_set {
+            Some(self.effective_context_window())
+        } else {
+            None
+        };
         self.last_estimated_prompt_tokens = Some(estimated_prompt_tokens);
 
         // Phase 1: Collect events from provider with spinner + streaming output.
