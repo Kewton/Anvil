@@ -25,6 +25,261 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
+// ---------------------------------------------------------------------------
+// Native tool calling types (Issue #373)
+// ---------------------------------------------------------------------------
+
+/// Provider-facing native tool definition.
+/// Compatible with OpenAI function calling schema.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeToolDef {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+}
+
+/// Catalog of native tool schemas for all built-in tools.
+///
+/// Owner of `NativeToolDef` instances that cannot be derived from `ToolSpec`
+/// (which lacks description and JSON Schema parameters).  Only allowlisted
+/// built-in tools are included; custom and MCP tools are excluded.
+pub struct ToolSchemaCatalog {
+    schemas: HashMap<String, NativeToolDef>,
+}
+
+impl ToolSchemaCatalog {
+    /// Build the catalog containing all built-in tool schemas.
+    ///
+    /// Tool names use underscore-separated form (e.g. `file_read`) for OpenAI
+    /// compatibility.  Each parameter schema includes `additionalProperties: false`.
+    pub fn builtin() -> Self {
+        let mut schemas = HashMap::new();
+
+        schemas.insert(
+            "file.read".to_string(),
+            NativeToolDef {
+                name: "file_read".to_string(),
+                description: "Read a file from the filesystem.".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "File path to read" }
+                    },
+                    "required": ["path"],
+                    "additionalProperties": false
+                }),
+            },
+        );
+
+        schemas.insert(
+            "file.write".to_string(),
+            NativeToolDef {
+                name: "file_write".to_string(),
+                description: "Write content to a file, creating it if necessary.".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "File path to write" },
+                        "content": { "type": "string", "description": "Content to write" }
+                    },
+                    "required": ["path", "content"],
+                    "additionalProperties": false
+                }),
+            },
+        );
+
+        schemas.insert(
+            "file.edit".to_string(),
+            NativeToolDef {
+                name: "file_edit".to_string(),
+                description: "Edit a file by replacing an exact string match.".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "File path to edit" },
+                        "old_string": { "type": "string", "description": "Exact string to find and replace" },
+                        "new_string": { "type": "string", "description": "Replacement string" }
+                    },
+                    "required": ["path", "old_string", "new_string"],
+                    "additionalProperties": false
+                }),
+            },
+        );
+
+        schemas.insert(
+            "file.edit_anchor".to_string(),
+            NativeToolDef {
+                name: "file_edit_anchor".to_string(),
+                description: "Edit a file using anchor-based matching. Finds old_content in the file and replaces it with new_content.".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "File path to edit" },
+                        "old_content": { "type": "string", "description": "Exact content to find in the file (anchor text to match)" },
+                        "new_content": { "type": "string", "description": "Replacement content" }
+                    },
+                    "required": ["path", "old_content", "new_content"],
+                    "additionalProperties": false
+                }),
+            },
+        );
+
+        schemas.insert(
+            "file.rewrite".to_string(),
+            NativeToolDef {
+                name: "file_rewrite".to_string(),
+                description: "Rewrite a range of lines in a file.".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "File path to rewrite" },
+                        "start_line": { "type": "integer", "description": "Start line number (1-based)" },
+                        "end_line": { "type": "integer", "description": "End line number (1-based, inclusive)" },
+                        "content": { "type": "string", "description": "Replacement content for the line range" }
+                    },
+                    "required": ["path", "start_line", "end_line", "content"],
+                    "additionalProperties": false
+                }),
+            },
+        );
+
+        schemas.insert(
+            "file.search".to_string(),
+            NativeToolDef {
+                name: "file_search".to_string(),
+                description: "Search for files and content matching a pattern.".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "root": { "type": "string", "description": "Root directory to search from" },
+                        "pattern": { "type": "string", "description": "Search pattern" },
+                        "regex": { "type": "boolean", "description": "Whether to use regex matching" },
+                        "context_lines": { "type": "integer", "description": "Number of context lines around matches" }
+                    },
+                    "required": ["pattern"],
+                    "additionalProperties": false
+                }),
+            },
+        );
+
+        schemas.insert(
+            "shell.exec".to_string(),
+            NativeToolDef {
+                name: "shell_exec".to_string(),
+                description: "Execute a shell command.".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "command": { "type": "string", "description": "Shell command to execute" }
+                    },
+                    "required": ["command"],
+                    "additionalProperties": false
+                }),
+            },
+        );
+
+        schemas.insert(
+            "web.fetch".to_string(),
+            NativeToolDef {
+                name: "web_fetch".to_string(),
+                description: "Fetch content from a URL.".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "url": { "type": "string", "description": "URL to fetch" }
+                    },
+                    "required": ["url"],
+                    "additionalProperties": false
+                }),
+            },
+        );
+
+        schemas.insert(
+            "web.search".to_string(),
+            NativeToolDef {
+                name: "web_search".to_string(),
+                description: "Search the web for information.".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "Search query" }
+                    },
+                    "required": ["query"],
+                    "additionalProperties": false
+                }),
+            },
+        );
+
+        schemas.insert(
+            "git.status".to_string(),
+            NativeToolDef {
+                name: "git_status".to_string(),
+                description: "Show the working tree status.".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }),
+            },
+        );
+
+        schemas.insert(
+            "git.diff".to_string(),
+            NativeToolDef {
+                name: "git_diff".to_string(),
+                description: "Show changes between commits, working tree, etc.".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "File path to diff" },
+                        "staged": { "type": "boolean", "description": "Show staged changes" },
+                        "commit": { "type": "string", "description": "Commit hash to diff against" }
+                    },
+                    "additionalProperties": false
+                }),
+            },
+        );
+
+        schemas.insert(
+            "git.log".to_string(),
+            NativeToolDef {
+                name: "git_log".to_string(),
+                description: "Show commit logs.".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "count": { "type": "integer", "description": "Number of commits to show" },
+                        "path": { "type": "string", "description": "File path to filter commits" }
+                    },
+                    "additionalProperties": false
+                }),
+            },
+        );
+
+        Self { schemas }
+    }
+
+    /// Look up a tool schema by its dot-separated name (e.g. `file.read`).
+    pub fn get(&self, tool_name: &str) -> Option<&NativeToolDef> {
+        self.schemas.get(tool_name)
+    }
+
+    /// Return all tool schemas as a vector.
+    pub fn all(&self) -> Vec<&NativeToolDef> {
+        self.schemas.values().collect()
+    }
+
+    /// Return the number of registered tool schemas.
+    pub fn len(&self) -> usize {
+        self.schemas.len()
+    }
+
+    /// Returns `true` if the catalog is empty.
+    pub fn is_empty(&self) -> bool {
+        self.schemas.is_empty()
+    }
+}
+
 /// Maximum image file size in bytes (20 MB).
 const IMAGE_SIZE_LIMIT: u64 = 20 * 1024 * 1024;
 

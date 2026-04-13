@@ -35,6 +35,8 @@ impl ProviderClient for RecordingProvider {
                 tool_logs: Vec::new(),
                 elapsed_ms: 0,
                 inference_performance: None,
+                tool_calls: None,
+                assistant_tool_call_records: None,
             }));
             return Ok(());
         }
@@ -202,6 +204,8 @@ fn regular_input_runs_live_turn_and_supports_follow_up_in_same_session() {
             tool_logs: Vec::new(),
             elapsed_ms: 120,
             inference_performance: None,
+            tool_calls: None,
+            assistant_tool_call_records: None,
         })],
     };
 
@@ -269,6 +273,8 @@ fn slash_approve_and_deny_resolve_pending_tool_approval() {
                 tool_logs: Vec::new(),
                 elapsed_ms: 240,
                 inference_performance: None,
+                tool_calls: None,
+                assistant_tool_call_records: None,
             }),
         ],
     };
@@ -364,6 +370,8 @@ fn startup_console_resumes_existing_session_history() {
             tool_logs: Vec::new(),
             elapsed_ms: 100,
             inference_performance: None,
+            tool_calls: None,
+            assistant_tool_call_records: None,
         })],
     };
     let mut first = common::build_app_in(root.clone());
@@ -440,6 +448,8 @@ fn regular_input_surfaces_tool_execution_logs_in_console() {
                 )],
                 elapsed_ms: 140,
                 inference_performance: None,
+                tool_calls: None,
+                assistant_tool_call_records: None,
             }),
         ],
     };
@@ -531,6 +541,8 @@ fn custom_slash_commands_load_from_extension_file_and_run_live_turn() {
             tool_logs: Vec::new(),
             elapsed_ms: 90,
             inference_performance: None,
+            tool_calls: None,
+            assistant_tool_call_records: None,
         })],
     };
 
@@ -659,6 +671,8 @@ fn repo_find_adds_retrieval_context_to_following_provider_turn() {
             tool_logs: Vec::new(),
             elapsed_ms: 120,
             inference_performance: None,
+            tool_calls: None,
+            assistant_tool_call_records: None,
         })],
     };
 
@@ -805,6 +819,8 @@ fn non_interactive_mode_runs_auto_compact_on_flush() {
             tool_logs: Vec::new(),
             elapsed_ms: 0,
             inference_performance: None,
+            tool_calls: None,
+            assistant_tool_call_records: None,
         })],
     };
 

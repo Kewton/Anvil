@@ -6,7 +6,9 @@ use anvil::config::{
     sanitize_markers,
 };
 use anvil::contracts::AppEvent;
-use anvil::provider::{ProviderRuntimeContext, build_local_provider_client};
+use anvil::provider::{
+    ProviderRuntimeContext, build_local_provider_client, is_native_tool_capable_model,
+};
 use std::collections::HashMap;
 
 #[test]
@@ -1509,4 +1511,84 @@ fn tool_temperature_env_whitelist_regression_test() {
         Some(0.5),
         "ANVIL_TOOL_TEMPERATURE must reach apply_map via ENV_OVERRIDE_WHITELIST (Issue #347)"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #373: native_tool_calling config / capability tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn native_tool_calling_default_is_none() {
+    let config = EffectiveConfig::load().expect("config should load");
+    assert_eq!(
+        config.runtime.native_tool_calling, None,
+        "native_tool_calling should default to None (auto-detect)"
+    );
+}
+
+#[test]
+fn native_tool_calling_env_override_false() {
+    let mut config = EffectiveConfig::load().expect("config should load");
+    let mut env_map = HashMap::new();
+    env_map.insert("ANVIL_NATIVE_TOOL_CALLING".to_string(), "false".to_string());
+    config
+        .apply_env_overrides_from_map_for_test(&env_map)
+        .unwrap();
+    assert_eq!(config.runtime.native_tool_calling, Some(false));
+}
+
+#[test]
+fn native_tool_calling_env_override_true() {
+    let mut config = EffectiveConfig::load().expect("config should load");
+    let mut env_map = HashMap::new();
+    env_map.insert("ANVIL_NATIVE_TOOL_CALLING".to_string(), "true".to_string());
+    config
+        .apply_env_overrides_from_map_for_test(&env_map)
+        .unwrap();
+    assert_eq!(config.runtime.native_tool_calling, Some(true));
+}
+
+#[test]
+fn is_native_tool_capable_model_llama3_1() {
+    assert!(is_native_tool_capable_model("llama3.1:8b"));
+    assert!(is_native_tool_capable_model("llama3.1"));
+    assert!(is_native_tool_capable_model("llama3.2:3b"));
+    assert!(is_native_tool_capable_model("llama3.3:70b"));
+}
+
+#[test]
+fn is_native_tool_capable_model_qwen() {
+    assert!(is_native_tool_capable_model("qwen2.5:7b"));
+    assert!(is_native_tool_capable_model("qwen2.5-coder"));
+    assert!(is_native_tool_capable_model("qwen3:32b"));
+}
+
+#[test]
+fn is_native_tool_capable_model_mistral() {
+    assert!(is_native_tool_capable_model("mistral-nemo"));
+    assert!(is_native_tool_capable_model("mistral:latest"));
+}
+
+#[test]
+fn is_native_tool_capable_model_command_r() {
+    assert!(is_native_tool_capable_model("command-r:35b"));
+    assert!(is_native_tool_capable_model("command-r-plus"));
+}
+
+#[test]
+fn is_native_tool_capable_model_gemma4() {
+    assert!(is_native_tool_capable_model("gemma4:12b"));
+}
+
+#[test]
+fn is_native_tool_capable_model_returns_false_for_unknown() {
+    assert!(!is_native_tool_capable_model("unknown-model"));
+    assert!(!is_native_tool_capable_model("phi3:mini"));
+    assert!(!is_native_tool_capable_model("gemma2:9b"));
+}
+
+#[test]
+fn provider_capabilities_native_tool_calling_defaults_false() {
+    let caps = anvil::provider::ProviderCapabilities::default();
+    assert!(!caps.native_tool_calling);
 }

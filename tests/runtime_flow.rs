@@ -53,6 +53,8 @@ fn runtime_turn_pauses_for_single_tool_call_approval_and_resumes_to_done() {
             )],
             elapsed_ms: 920,
             inference_performance: None,
+            tool_calls: None,
+            assistant_tool_call_records: None,
         },
     ]));
 
@@ -183,6 +185,8 @@ fn runtime_turn_can_deny_approval_and_return_to_ready() {
             tool_logs: Vec::new(),
             elapsed_ms: 400,
             inference_performance: None,
+            tool_calls: None,
+            assistant_tool_call_records: None,
         },
     ]));
 
@@ -285,6 +289,8 @@ fn runtime_turn_supports_multiple_approvals_in_one_turn() {
             )],
             elapsed_ms: 640,
             inference_performance: None,
+            tool_calls: None,
+            assistant_tool_call_records: None,
         },
     ]));
 
@@ -372,6 +378,8 @@ fn runtime_turn_supports_working_back_to_thinking_before_done() {
             tool_logs: Vec::new(),
             elapsed_ms: 360,
             inference_performance: None,
+            tool_calls: None,
+            assistant_tool_call_records: None,
         },
     ]));
 
@@ -460,6 +468,8 @@ fn pending_approval_survives_app_reload() {
             tool_logs: Vec::new(),
             elapsed_ms: 320,
             inference_performance: None,
+            tool_calls: None,
+            assistant_tool_call_records: None,
         },
     ]));
 
@@ -1174,4 +1184,96 @@ fn dedup_with_anvil_final_combined() {
     // 1st call kept, 2nd is duplicate (removed), 3rd is post-FINAL (excluded)
     assert_eq!(response.tool_calls.len(), 1);
     assert_eq!(response.tool_calls[0].tool_call_id, "call_001");
+}
+
+// ---------------------------------------------------------------------------
+// Issue #373: AgentEvent::Done.tool_calls field tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn agent_event_done_tool_calls_defaults_to_none() {
+    let event = AgentEvent::Done {
+        status: "done".to_string(),
+        assistant_message: "test".to_string(),
+        completion_summary: "test".to_string(),
+        saved_status: "saved".to_string(),
+        tool_logs: Vec::new(),
+        elapsed_ms: 0,
+        inference_performance: None,
+        tool_calls: None,
+        assistant_tool_call_records: None,
+    };
+
+    if let AgentEvent::Done { tool_calls, .. } = &event {
+        assert!(tool_calls.is_none());
+    } else {
+        panic!("expected Done variant");
+    }
+}
+
+#[test]
+fn agent_event_done_serde_backward_compat_missing_tool_calls() {
+    // Simulate deserializing old JSON without tool_calls field
+    let json = r#"{
+        "Done": {
+            "status": "done",
+            "assistant_message": "test",
+            "completion_summary": "test",
+            "saved_status": "saved",
+            "tool_logs": [],
+            "elapsed_ms": 0
+        }
+    }"#;
+
+    let event: AgentEvent =
+        serde_json::from_str(json).expect("should deserialize without tool_calls");
+    if let AgentEvent::Done { tool_calls, .. } = &event {
+        assert!(
+            tool_calls.is_none(),
+            "missing tool_calls should default to None"
+        );
+    } else {
+        panic!("expected Done variant");
+    }
+}
+
+// -----------------------------------------------------------------------
+// Issue #373: StructuredAssistantResponse::from_native_tool_calls
+// -----------------------------------------------------------------------
+
+#[test]
+fn structured_assistant_response_from_native_tool_calls_builds_correctly() {
+    use anvil::agent::StructuredAssistantResponse;
+    use anvil::tooling::{ToolCallRequest, ToolInput};
+
+    let tool_calls = vec![ToolCallRequest::new(
+        "call_001",
+        "file.read",
+        ToolInput::FileRead {
+            path: "./src/main.rs".to_string(),
+        },
+    )];
+
+    let response = StructuredAssistantResponse::from_native_tool_calls(
+        tool_calls.clone(),
+        "Reading the file...".to_string(),
+        false,
+    );
+
+    assert_eq!(response.tool_calls.len(), 1);
+    assert_eq!(response.tool_calls[0].tool_name, "file.read");
+    assert_eq!(response.final_response, "Reading the file...");
+    assert!(!response.anvil_final_detected);
+    assert_eq!(response.raw_content, "Reading the file...");
+}
+
+#[test]
+fn structured_assistant_response_from_native_tool_calls_with_end_turn() {
+    use anvil::agent::StructuredAssistantResponse;
+
+    let response =
+        StructuredAssistantResponse::from_native_tool_calls(Vec::new(), "Done!".to_string(), true);
+
+    assert!(response.tool_calls.is_empty());
+    assert!(response.anvil_final_detected);
 }

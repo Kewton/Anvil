@@ -2132,3 +2132,57 @@ fn session_message_advisory_backward_compat() {
         "is_advisory should default to false for old format"
     );
 }
+
+// -----------------------------------------------------------------------
+// Issue #373: SessionMessage.assistant_tool_calls persistence
+// -----------------------------------------------------------------------
+
+#[test]
+fn session_message_assistant_tool_calls_roundtrip() {
+    use anvil::provider::AssistantToolCallRecord;
+
+    let mut msg = SessionMessage::new(MessageRole::Assistant, "anvil", "Reading file...");
+    msg.assistant_tool_calls = Some(vec![AssistantToolCallRecord {
+        id: "call_001".to_string(),
+        function_name: "file_read".to_string(),
+        arguments: r#"{"path":"src/main.rs"}"#.to_string(),
+    }]);
+
+    let json = serde_json::to_string(&msg).expect("serialize");
+    let deserialized: SessionMessage = serde_json::from_str(&json).expect("deserialize");
+
+    assert!(deserialized.assistant_tool_calls.is_some());
+    let calls = deserialized.assistant_tool_calls.unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].id, "call_001");
+    assert_eq!(calls[0].function_name, "file_read");
+}
+
+#[test]
+fn session_message_assistant_tool_calls_backward_compat() {
+    // JSON without assistant_tool_calls field (pre-#373 format)
+    let json = r#"{
+        "id": "test_1",
+        "role": "Assistant",
+        "author": "anvil",
+        "content": "hello",
+        "status": "Committed",
+        "tool_call_id": null,
+        "is_error": false,
+        "image_paths": null
+    }"#;
+    let msg: SessionMessage = serde_json::from_str(json).expect("deserialize old format");
+    assert!(
+        msg.assistant_tool_calls.is_none(),
+        "assistant_tool_calls should default to None for old format"
+    );
+}
+
+#[test]
+fn session_message_assistant_tool_calls_none_omitted_from_json() {
+    let msg = SessionMessage::new(MessageRole::Assistant, "anvil", "hello");
+    let json = serde_json::to_string(&msg).expect("serialize");
+    // assistant_tool_calls is None, so #[serde(default)] will deserialize it from missing field
+    let deserialized: SessionMessage = serde_json::from_str(&json).expect("deserialize");
+    assert!(deserialized.assistant_tool_calls.is_none());
+}

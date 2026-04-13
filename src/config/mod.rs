@@ -315,6 +315,10 @@ pub struct RuntimeConfig {
     pub write_repeat_strong_warn_threshold: u32,
     /// WriteFailTracker: consecutive failures threshold (Issue #371).
     pub write_fail_threshold: u32,
+    /// Native tool calling override (Issue #373).
+    /// `Some(true)` = force enable, `Some(false)` = force disable,
+    /// `None` = auto-detect from provider/model.
+    pub native_tool_calling: Option<bool>,
 }
 
 impl RuntimeConfig {
@@ -550,6 +554,7 @@ pub const ENV_OVERRIDE_WHITELIST: &[&str] = &[
     "ANVIL_EDIT_RECOVERY_READ_BUDGET",
     "ANVIL_TOOL_TEMPERATURE",
     "ANVIL_DETECTOR_PROFILE",
+    "ANVIL_NATIVE_TOOL_CALLING",
 ];
 
 impl EffectiveConfig {
@@ -677,6 +682,7 @@ impl EffectiveConfig {
                 write_repeat_warn_threshold: 3,
                 write_repeat_strong_warn_threshold: 4,
                 write_fail_threshold: 2,
+                native_tool_calling: None,
             },
             mode: ModeConfig {
                 prompt_source: PromptSource::Interactive,
@@ -1306,6 +1312,9 @@ impl EffectiveConfig {
                         .parse::<DetectorProfile>()
                         .unwrap_or(DetectorProfile::Strict);
                     self.runtime.apply_profile(profile);
+                }
+                "native_tool_calling" | "ANVIL_NATIVE_TOOL_CALLING" => {
+                    self.runtime.native_tool_calling = Some(parse_bool(value));
                 }
                 _ => {}
             }
