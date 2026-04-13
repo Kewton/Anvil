@@ -319,6 +319,8 @@ pub struct RuntimeConfig {
     /// `Some(true)` = force enable, `Some(false)` = force disable,
     /// `None` = auto-detect from provider/model.
     pub native_tool_calling: Option<bool>,
+    /// Whether the task-semantics gate is enabled (hint-class, Issue #382).
+    pub task_semantics_gate_enabled: bool,
 }
 
 impl RuntimeConfig {
@@ -330,8 +332,23 @@ impl RuntimeConfig {
     pub fn apply_profile(&mut self, profile: DetectorProfile) {
         self.detector_profile = profile;
         match profile {
-            DetectorProfile::Strict => { /* defaults = strict — no-op */ }
+            DetectorProfile::Strict => {
+                // Reset hint-class flags that Minimal may have disabled.
+                self.read_repeat_enabled = true;
+                self.write_repeat_enabled = true;
+                self.write_fail_enabled = true;
+                self.read_transition_enabled = true;
+                self.phase_force_transition_enabled = true;
+                self.task_semantics_gate_enabled = true;
+            }
             DetectorProfile::Relaxed => {
+                // Re-enable hint-class flags (may have been disabled by Minimal).
+                self.read_repeat_enabled = true;
+                self.write_repeat_enabled = true;
+                self.write_fail_enabled = true;
+                self.read_transition_enabled = true;
+                self.phase_force_transition_enabled = true;
+                self.task_semantics_gate_enabled = true;
                 self.loop_detection_threshold = 5;
                 self.alternating_cycle_threshold = 4;
                 self.closure_jaccard_threshold = 0.8;
@@ -352,6 +369,7 @@ impl RuntimeConfig {
                 self.write_fail_enabled = false;
                 self.read_transition_enabled = false;
                 self.phase_force_transition_enabled = false;
+                self.task_semantics_gate_enabled = false;
             }
         }
     }
@@ -683,6 +701,7 @@ impl EffectiveConfig {
                 write_repeat_strong_warn_threshold: 4,
                 write_fail_threshold: 2,
                 native_tool_calling: None,
+                task_semantics_gate_enabled: true,
             },
             mode: ModeConfig {
                 prompt_source: PromptSource::Interactive,
@@ -2008,6 +2027,10 @@ impl std::fmt::Debug for RuntimeConfig {
                 &self.write_repeat_strong_warn_threshold,
             )
             .field("write_fail_threshold", &self.write_fail_threshold)
+            .field(
+                "task_semantics_gate_enabled",
+                &self.task_semantics_gate_enabled,
+            )
             .finish()
     }
 }

@@ -324,6 +324,8 @@ pub struct App {
     /// where the parent keeps calling tools but the execution plan never
     /// advances (Issue #351).
     post_failure_thrash_detector: post_failure_thrash_detector::PostFailureThrashDetector,
+    /// Done path task-semantics gate fired flag (prevents re-fire, Issue #382).
+    task_semantics_done_path_fired: bool,
 }
 
 /// Whether the session loop should continue or exit.
@@ -723,6 +725,7 @@ impl App {
                     thrash_strong_warn,
                     thrash_break,
                 ),
+            task_semantics_done_path_fired: false,
         })
     }
 

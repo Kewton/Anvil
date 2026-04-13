@@ -114,6 +114,8 @@ enum DonePathAction {
     PlanGateRetry,
     /// Final guard triggered — inject retry and invoke guarded retry turn.
     FinalGuardRetry,
+    /// Task-semantics gate triggered — inject retry for implementation (Issue #382).
+    TaskSemanticsRetry,
     /// Guard did not fire — no special action needed.
     NotFired,
 }
@@ -141,6 +143,8 @@ struct TerminationLoopState {
     pre_exit_repair_injected: bool,
     /// Set when the phase estimator detects a fallback completion (Issue #159).
     fallback_completed: bool,
+    /// Task-semantics gate suppression count (max 1, independent from noplan, Issue #382).
+    task_semantics_suppression_count: u8,
 }
 
 impl TerminationLoopState {
@@ -153,6 +157,7 @@ impl TerminationLoopState {
             noplan_suppression_count: 0,
             pre_exit_repair_injected: false,
             fallback_completed: false,
+            task_semantics_suppression_count: 0,
         }
     }
 
@@ -415,6 +420,58 @@ const EXPLORATION_TOOL_NAMES: &[&str] = &["file.read", "file.search", "web.fetch
 const FINAL_GUARD_RETRY_MESSAGE: &str = "No file modifications detected (file.write/file.edit not called). \
      Please implement the changes rather than just planning them. \
      Use file.write or file.edit to make the necessary code changes.";
+
+/// Maximum number of task-semantics gate retries (Issue #382).
+const MAX_TASK_SEMANTICS_GATE_RETRIES: u8 = 1;
+
+/// Sub-agent tool names for turn-level subagent detection (Issue #382).
+/// Used for documentation; runtime detection uses `!agent_results.is_empty()`.
+#[allow(dead_code)]
+const SUBAGENT_TOOL_NAMES: &[&str] = &["agent.explore", "agent.plan", "agent.fix_slice"];
+
+/// Message sent to LLM when task-semantics gate fires (Issue #382).
+const TASK_SEMANTICS_GATE_MESSAGE: &str = "The active task appears to require file modifications, \
+     but no changes have been made yet. \
+     Please proceed with the implementation using file.write or file.edit.";
+
+/// Task-semantics gate: detect implementation-required tasks (Issue #382).
+///
+/// Wraps `task_likely_requires_file_changes` with read-only intent exclusions.
+/// Returns `true` when the task likely requires file mutations and does NOT
+/// start with a read-only intent prefix.
+pub fn task_semantics_requires_implementation(task: &str) -> bool {
+    // Normalize: strip leading whitespace / control characters.
+    let normalized = task.trim_start_matches(|c: char| c.is_whitespace() || c.is_control());
+    if !task_likely_requires_file_changes(task) {
+        return false;
+    }
+    // Read-only intent exclusions: if the leading verb is read-only, skip.
+    let lower = normalized.to_ascii_lowercase();
+    let readonly_prefixes = [
+        "explain",
+        "describe",
+        "list",
+        "show",
+        "check",
+        "review",
+        "investigate",
+        "summarize",
+        "tell me",
+        "what is",
+        "what are",
+        "how does",
+        "how do",
+    ];
+    let jp_readonly = ["説明", "教えて", "確認", "調べ", "見せ", "表示"];
+
+    if readonly_prefixes.iter().any(|p| lower.starts_with(p)) {
+        return false;
+    }
+    if jp_readonly.iter().any(|p| normalized.starts_with(p)) {
+        return false;
+    }
+    true
+}
 
 /// Synthetic guidance tools that must be shown to the model before accepting
 /// an ANVIL_FINAL termination.
@@ -828,6 +885,67 @@ impl App {
         self.session.push_message(retry_msg);
     }
 
+    /// Common condition check for task-semantics gate (Done path / Branch 5, Issue #382).
+    fn should_fire_task_semantics_gate_common(&self) -> bool {
+        if !self.config.runtime.task_semantics_gate_enabled {
+            return false;
+        }
+        let Some(task) = self.session.working_memory.active_task.as_deref() else {
+            return false;
+        };
+        if !task_semantics_requires_implementation(task) {
+            return false;
+        }
+        if !self.session.working_memory.touched_files.is_empty() {
+            return false;
+        }
+        if !self.execution_plan.is_empty() && self.execution_plan.all_finished() {
+            return false;
+        }
+        true
+    }
+
+    /// Done path task-semantics gate check (Issue #382 AC-2a).
+    fn should_fire_task_semantics_gate_done_path(&self) -> bool {
+        if self.task_semantics_done_path_fired {
+            return false;
+        }
+        self.should_fire_task_semantics_gate_common()
+    }
+
+    /// Branch 5 task-semantics gate check (Issue #382 AC-2b).
+    fn should_fire_task_semantics_gate_branch5(
+        &self,
+        suppression_count: u8,
+        turn_has_subagent: bool,
+    ) -> bool {
+        if suppression_count >= MAX_TASK_SEMANTICS_GATE_RETRIES {
+            if suppression_count == MAX_TASK_SEMANTICS_GATE_RETRIES {
+                tracing::warn!("task-semantics gate: budget exhausted, accepting termination");
+            }
+            return false;
+        }
+        if turn_has_subagent {
+            return false;
+        }
+        self.should_fire_task_semantics_gate_common()
+    }
+
+    /// Inject a task-semantics gate retry message (Issue #382).
+    fn inject_task_semantics_gate_retry(&mut self) {
+        tracing::warn!("task-semantics gate: implementation task with no file changes, retrying");
+        let retry_msg = SessionMessage::new(
+            MessageRole::Tool,
+            "system",
+            TASK_SEMANTICS_GATE_MESSAGE.to_string(),
+        )
+        .with_id(self.next_message_id("tool"));
+        self.session.push_message(retry_msg);
+        self.agent_telemetry
+            .retry
+            .record_task_semantics_gate_attempted();
+    }
+
     /// Evaluate the ANVIL_FINAL gate after tool execution.
     ///
     /// Returns `TerminationDecision::Break` if ANVIL_FINAL should be accepted,
@@ -883,6 +1001,7 @@ impl App {
         &mut self,
         next_structured: &mut StructuredAssistantResponse,
         term_state: &mut TerminationLoopState,
+        turn_has_subagent: bool,
     ) -> Result<TerminationDecision, AppError> {
         // Branch 1: guidance follow-up path
         if term_state.awaiting_guidance_followup {
@@ -965,6 +1084,16 @@ impl App {
             return Ok(TerminationDecision::Continue);
         }
 
+        // Issue #382 AC-2b: Task-semantics gate on Branch 5.
+        if self.should_fire_task_semantics_gate_branch5(
+            term_state.task_semantics_suppression_count,
+            turn_has_subagent,
+        ) {
+            term_state.task_semantics_suppression_count += 1;
+            self.inject_task_semantics_gate_retry();
+            return Ok(TerminationDecision::Continue);
+        }
+
         // Branch 5: No more tool calls — this is the final answer
         // Issue #261 Task 0.4: Mark as accepted (not suppressed)
         if term_state.is_anvil_final_seen() {
@@ -1008,6 +1137,10 @@ impl App {
                 .record_final_guard_retry_attempted();
             self.inject_final_guard_retry();
             return DonePathAction::FinalGuardRetry;
+        }
+        // Issue #382 AC-2a: Task-semantics gate on Done path.
+        if self.should_fire_task_semantics_gate_done_path() {
+            return DonePathAction::TaskSemanticsRetry;
         }
         DonePathAction::NotFired
     }
@@ -1108,6 +1241,10 @@ impl App {
         // fired under a `requires_worker_observation` pack and the worker
         // path has not yet been invoked.
         let mut escalation_barrier = super::escalation_barrier::EscalationBarrier::new();
+        // Issue #382: turn-wide subagent flag — accumulated across iterations
+        // so that a subagent call in iteration N suppresses the task-semantics
+        // gate in all subsequent iterations of the same turn.
+        let mut turn_has_subagent = false;
 
         for iteration in 0..max_iterations {
             let iteration_started = std::time::Instant::now();
@@ -1128,6 +1265,9 @@ impl App {
             // Step 1: Extract and run sub-agent calls (IR3-001)
             let (agent_results, normal_calls) =
                 self.extract_and_run_subagent_calls(&current.tool_calls, provider_client);
+
+            // Issue #382: accumulate subagent presence across the entire turn.
+            turn_has_subagent |= !agent_results.is_empty();
 
             // Record sub-agent results first (IR3-002)
             for result in &agent_results {
@@ -1946,7 +2086,11 @@ impl App {
             self.last_compact_info = None;
 
             if next_structured.tool_calls.is_empty() {
-                match self.handle_empty_tool_response(&mut next_structured, &mut term_state)? {
+                match self.handle_empty_tool_response(
+                    &mut next_structured,
+                    &mut term_state,
+                    turn_has_subagent,
+                )? {
                     TerminationDecision::Break => break,
                     TerminationDecision::Continue => {
                         current = next_structured;
@@ -1973,6 +2117,17 @@ impl App {
             self.agent_telemetry
                 .retry
                 .record_final_guard_retry_succeeded();
+        }
+
+        // Issue #382: task-semantics gate succeeded — gate fired during
+        // THIS turn (Branch 5 path only; Done path is handled separately)
+        // and files were ultimately modified.
+        if term_state.task_semantics_suppression_count > 0
+            && !self.session.working_memory.touched_files.is_empty()
+        {
+            self.agent_telemetry
+                .retry
+                .record_task_semantics_gate_succeeded();
         }
 
         // Issue #255: Classify completion kind based on plan state.
@@ -3325,6 +3480,10 @@ impl App {
             return Ok(None);
         };
 
+        // Issue #382: Reset Done-path gate flag at the start of each user turn
+        // so the gate can fire again on a new request.
+        self.task_semantics_done_path_fired = false;
+
         // Issue #373: Native tool calling path — when the provider returned
         // structured tool_calls, bypass ANVIL_TOOL text parsing entirely.
         let structured = if let Some(native_calls) = tool_calls.as_ref().filter(|c| !c.is_empty()) {
@@ -3391,6 +3550,23 @@ impl App {
                         assistant_message,
                     )?;
                     // Re-invoke LLM and process the response
+                    return Ok(Some(self.run_guarded_retry_turn(
+                        status,
+                        saved_status,
+                        *elapsed_ms,
+                        inference_performance.clone(),
+                        tui,
+                        provider_client,
+                    )?));
+                }
+                DonePathAction::TaskSemanticsRetry => {
+                    // Issue #382 AC-2a: task-semantics gate fired on Done path.
+                    self.task_semantics_done_path_fired = true;
+                    self.inject_task_semantics_gate_retry();
+                    self.record_assistant_output(
+                        self.next_message_id("assistant"),
+                        assistant_message,
+                    )?;
                     return Ok(Some(self.run_guarded_retry_turn(
                         status,
                         saved_status,
@@ -4160,6 +4336,7 @@ mod trust_tests {
         assert_eq!(state.noplan_suppression_count, 0);
         assert!(!state.pre_exit_repair_injected);
         assert!(!state.fallback_completed);
+        assert_eq!(state.task_semantics_suppression_count, 0);
     }
 
     #[test]
