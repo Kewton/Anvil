@@ -153,7 +153,10 @@ impl<T> OllamaProviderClient<T> {
                 .collect(),
             stream: request.stream,
             think: false,
-            options: if request.max_output_tokens.is_some() || request.temperature.is_some() || request.context_window.is_some() {
+            options: if request.max_output_tokens.is_some()
+                || request.temperature.is_some()
+                || request.context_window.is_some()
+            {
                 Some(OllamaRequestOptions {
                     num_predict: request.max_output_tokens,
                     temperature: request.temperature,
