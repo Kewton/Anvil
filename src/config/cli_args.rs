@@ -128,6 +128,10 @@ pub struct CliArgs {
     /// Log file format (text|json) [default: text]
     #[arg(long = "log-format")]
     pub log_format: Option<String>,
+
+    /// LLM sampling temperature for agentic turns (0.0-2.0) [default: 0.3]
+    #[arg(long = "tool-temperature")]
+    pub tool_temperature: Option<f64>,
 }
 
 impl CliArgs {

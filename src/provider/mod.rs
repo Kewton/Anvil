@@ -100,7 +100,7 @@ impl ProviderMessage {
 }
 
 /// Request payload sent to a provider for one turn.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ProviderTurnRequest {
     pub model: String,
     pub messages: Vec<ProviderMessage>,
@@ -109,6 +109,10 @@ pub struct ProviderTurnRequest {
     /// When set, providers translate this to their native limit parameter
     /// (e.g. Ollama `num_predict`, OpenAI `max_tokens`).
     pub max_output_tokens: Option<u32>,
+    /// LLM sampling temperature for this turn.
+    /// `Some(v)` sets explicit temperature; `None` uses the model default.
+    /// Agentic turns default to 0.3 for tool-output stability (Issue #369).
+    pub temperature: Option<f64>,
 }
 
 impl ProviderTurnRequest {
@@ -118,6 +122,7 @@ impl ProviderTurnRequest {
             messages,
             stream,
             max_output_tokens: None,
+            temperature: None,
         }
     }
 }
