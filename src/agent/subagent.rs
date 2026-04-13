@@ -790,6 +790,7 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
             self.config.runtime.context_budget,
         );
         request.max_output_tokens = self.config.runtime.max_output_tokens;
+        request.temperature = self.config.runtime.tool_temperature;
 
         // Stream the LLM response, collecting token deltas
         let mut token_buffer = String::new();

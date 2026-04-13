@@ -33,15 +33,18 @@ pub struct OllamaChatMessage {
 }
 
 /// Ollama request options (e.g. `num_predict` for output token limit).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct OllamaRequestOptions {
     /// Maximum number of tokens to generate (maps to Ollama `num_predict`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub num_predict: Option<u32>,
+    /// Sampling temperature (Issue #369).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
 }
 
 /// Wire format for an Ollama `/api/chat` request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OllamaChatRequest {
     pub model: String,
     pub messages: Vec<OllamaChatMessage>,
@@ -146,9 +149,14 @@ impl<T> OllamaProviderClient<T> {
                 .collect(),
             stream: request.stream,
             think: false,
-            options: request.max_output_tokens.map(|n| OllamaRequestOptions {
-                num_predict: Some(n),
-            }),
+            options: if request.max_output_tokens.is_some() || request.temperature.is_some() {
+                Some(OllamaRequestOptions {
+                    num_predict: request.max_output_tokens,
+                    temperature: request.temperature,
+                })
+            } else {
+                None
+            },
         }
     }
 

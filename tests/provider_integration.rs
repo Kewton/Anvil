@@ -4515,3 +4515,185 @@ fn openai_request_omits_max_tokens_when_none() {
         "request body should NOT contain max_tokens when None: {body_str}"
     );
 }
+
+// ── Issue #369: tool temperature tests ──────────────────────────────────
+
+#[test]
+fn ollama_request_includes_temperature_in_options_when_set() {
+    let mut request = ProviderTurnRequest::new(
+        "test-model".to_string(),
+        vec![anvil::provider::ProviderMessage::new(
+            ProviderMessageRole::User,
+            "hello",
+        )],
+        true,
+    );
+    request.temperature = Some(0.3);
+
+    let ollama_request =
+        OllamaProviderClient::<anvil::provider::ReqwestHttpTransport>::build_chat_request(&request);
+
+    let options = ollama_request
+        .options
+        .expect("options should be set when temperature is Some");
+    assert_eq!(options.temperature, Some(0.3));
+    assert_eq!(options.num_predict, None);
+}
+
+#[test]
+fn ollama_request_includes_both_num_predict_and_temperature() {
+    let mut request = ProviderTurnRequest::new(
+        "test-model".to_string(),
+        vec![anvil::provider::ProviderMessage::new(
+            ProviderMessageRole::User,
+            "hello",
+        )],
+        true,
+    );
+    request.max_output_tokens = Some(8192);
+    request.temperature = Some(0.3);
+
+    let ollama_request =
+        OllamaProviderClient::<anvil::provider::ReqwestHttpTransport>::build_chat_request(&request);
+
+    let json = serde_json::to_string(&ollama_request).expect("should serialize");
+
+    let options = ollama_request
+        .options
+        .expect("options should be set when both fields are Some");
+    assert_eq!(options.num_predict, Some(8192));
+    assert_eq!(options.temperature, Some(0.3));
+    assert!(
+        json.contains("\"temperature\":0.3"),
+        "serialized request should contain temperature: {json}"
+    );
+    assert!(
+        json.contains("\"num_predict\":8192"),
+        "serialized request should contain num_predict: {json}"
+    );
+}
+
+#[test]
+fn ollama_request_omits_options_when_both_none() {
+    let request = ProviderTurnRequest::new(
+        "test-model".to_string(),
+        vec![anvil::provider::ProviderMessage::new(
+            ProviderMessageRole::User,
+            "hello",
+        )],
+        true,
+    );
+    // Both max_output_tokens and temperature are None by default
+
+    let ollama_request =
+        OllamaProviderClient::<anvil::provider::ReqwestHttpTransport>::build_chat_request(&request);
+
+    assert!(
+        ollama_request.options.is_none(),
+        "options should be None when both max_output_tokens and temperature are None"
+    );
+}
+
+#[test]
+fn ollama_request_omits_temperature_from_json_when_none() {
+    let mut request = ProviderTurnRequest::new(
+        "test-model".to_string(),
+        vec![anvil::provider::ProviderMessage::new(
+            ProviderMessageRole::User,
+            "hello",
+        )],
+        true,
+    );
+    request.max_output_tokens = Some(8192);
+    // temperature is None
+
+    let ollama_request =
+        OllamaProviderClient::<anvil::provider::ReqwestHttpTransport>::build_chat_request(&request);
+
+    let json = serde_json::to_string(&ollama_request).expect("should serialize");
+    assert!(
+        !json.contains("temperature"),
+        "serialized request should NOT contain temperature when None: {json}"
+    );
+}
+
+#[test]
+fn openai_request_includes_temperature_when_set() {
+    let mut request = ProviderTurnRequest::new(
+        "test-model".to_string(),
+        vec![anvil::provider::ProviderMessage::new(
+            ProviderMessageRole::User,
+            "hello",
+        )],
+        false,
+    );
+    request.temperature = Some(0.3);
+
+    let seen_bodies = Rc::new(RefCell::new(Vec::new()));
+    let transport = MockHttpTransport {
+        seen_urls: Rc::new(RefCell::new(Vec::new())),
+        seen_bodies: seen_bodies.clone(),
+        seen_headers: Rc::new(RefCell::new(Vec::new())),
+        response: HttpResponse {
+            status_code: 200,
+            body: br#"{"choices":[{"message":{"role":"assistant","content":"hi"}}]}"#.to_vec(),
+        },
+        get_response: None,
+    };
+    let client = anvil::provider::openai::OpenAiCompatibleProviderClient::with_transport(
+        "http://test",
+        transport,
+    );
+
+    let mut events = Vec::new();
+    client
+        .stream_turn(&request, &mut |event| events.push(event))
+        .expect("should succeed");
+
+    let bodies = seen_bodies.borrow();
+    let body_str = String::from_utf8_lossy(&bodies[0]);
+    assert!(
+        body_str.contains("\"temperature\":0.3"),
+        "request body should contain temperature: {body_str}"
+    );
+}
+
+#[test]
+fn openai_request_omits_temperature_when_none() {
+    let request = ProviderTurnRequest::new(
+        "test-model".to_string(),
+        vec![anvil::provider::ProviderMessage::new(
+            ProviderMessageRole::User,
+            "hello",
+        )],
+        false,
+    );
+
+    let seen_bodies = Rc::new(RefCell::new(Vec::new()));
+    let transport = MockHttpTransport {
+        seen_urls: Rc::new(RefCell::new(Vec::new())),
+        seen_bodies: seen_bodies.clone(),
+        seen_headers: Rc::new(RefCell::new(Vec::new())),
+        response: HttpResponse {
+            status_code: 200,
+            body: br#"{"choices":[{"message":{"role":"assistant","content":"hi"}}]}"#.to_vec(),
+        },
+        get_response: None,
+    };
+    let client = anvil::provider::openai::OpenAiCompatibleProviderClient::with_transport(
+        "http://test",
+        transport,
+    );
+
+    let mut events = Vec::new();
+    client
+        .stream_turn(&request, &mut |event| events.push(event))
+        .expect("should succeed");
+
+    let bodies = seen_bodies.borrow();
+    let body_str = String::from_utf8_lossy(&bodies[0]);
+    assert!(
+        !body_str.contains("temperature"),
+        "request body should NOT contain temperature when None: {body_str}"
+    );
+}

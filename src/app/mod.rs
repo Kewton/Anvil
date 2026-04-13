@@ -1474,6 +1474,7 @@ impl App {
             self.config.runtime.context_budget,
         );
         request.max_output_tokens = self.config.runtime.max_output_tokens;
+        // temperature intentionally left as None for non-agentic (conversational) turns
         self.last_estimated_prompt_tokens = Some(estimated_prompt_tokens);
 
         // Phase 1: Collect events from provider with spinner + streaming output.

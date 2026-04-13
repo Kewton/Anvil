@@ -244,6 +244,10 @@ pub struct RuntimeConfig {
     /// Per-path recovery read budget after file.edit failure (Issue #299).
     /// Controls how many file.read calls are suppressed from detector signals.
     pub edit_recovery_read_budget: u32,
+    /// LLM sampling temperature for agentic / sub-agent turns (Issue #369).
+    /// `Some(v)` overrides the model default; `None` leaves it to the model.
+    /// Default: `Some(0.3)` for tool-output stability.
+    pub tool_temperature: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -372,6 +376,7 @@ pub const ENV_OVERRIDE_WHITELIST: &[&str] = &[
     "ANVIL_MAX_TOOL_CALLS",
     "ANVIL_GUIDANCE_MODE",
     "ANVIL_EDIT_RECOVERY_READ_BUDGET",
+    "ANVIL_TOOL_TEMPERATURE",
 ];
 
 impl EffectiveConfig {
@@ -484,6 +489,7 @@ impl EffectiveConfig {
                 max_output_tokens: Some(DEFAULT_MAX_OUTPUT_TOKENS),
                 guidance_mode: GuidanceMode::default(),
                 edit_recovery_read_budget: 3,
+                tool_temperature: Some(0.3),
             },
             mode: ModeConfig {
                 prompt_source: PromptSource::Interactive,
@@ -714,6 +720,16 @@ impl EffectiveConfig {
         // Max output tokens (Issue #204)
         if let Some(v) = cli.max_output_tokens {
             self.runtime.max_output_tokens = if v == 0 { None } else { Some(v) };
+        }
+
+        // Tool temperature (Issue #369)
+        if let Some(v) = cli.tool_temperature {
+            if !is_valid_temperature(v) {
+                return Err(ConfigError::InvalidNumericValue(format!(
+                    "tool_temperature must be between 0.0 and 2.0, got {v}"
+                )));
+            }
+            self.runtime.tool_temperature = Some(v);
         }
 
         // Log format (Issue #206)
@@ -1088,6 +1104,15 @@ impl EffectiveConfig {
                         .parse::<GuidanceMode>()
                         .unwrap_or(GuidanceMode::Sequential);
                 }
+                "tool_temperature" | "ANVIL_TOOL_TEMPERATURE" => {
+                    let v: f64 = value
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidNumericValue(value.clone()))?;
+                    if !is_valid_temperature(v) {
+                        return Err(ConfigError::InvalidNumericValue(value.clone()));
+                    }
+                    self.runtime.tool_temperature = Some(v);
+                }
                 _ => {}
             }
         }
@@ -1403,6 +1428,11 @@ const MIN_AGENT_ITERATIONS: usize = 1;
 /// Validate that a deletion ratio value is finite and within [0.0, 1.0].
 fn is_valid_deletion_ratio(v: f64) -> bool {
     v.is_finite() && (0.0..=1.0).contains(&v)
+}
+
+/// Validate that a temperature value is finite and within [0.0, 2.0] (Issue #369).
+fn is_valid_temperature(v: f64) -> bool {
+    v.is_finite() && (0.0..=2.0).contains(&v)
 }
 
 /// Validate sidecar_provider_url: must start with http:// or https://.
@@ -1745,6 +1775,7 @@ impl std::fmt::Debug for RuntimeConfig {
             .field("safe_write_max_lines", &self.safe_write_max_lines)
             .field("safe_write_deletion_ratio", &self.safe_write_deletion_ratio)
             .field("edit_recovery_read_budget", &self.edit_recovery_read_budget)
+            .field("tool_temperature", &self.tool_temperature)
             .finish()
     }
 }

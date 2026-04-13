@@ -1425,3 +1425,88 @@ fn guidance_mode_env_var_parses_batch() {
         .unwrap();
     assert_eq!(config.runtime.guidance_mode, GuidanceMode::Batch);
 }
+
+// ── Issue #369: tool_temperature config tests ───────────────────────────
+
+#[test]
+fn tool_temperature_default_is_0_3() {
+    let config = EffectiveConfig::load().expect("config should load");
+    assert_eq!(config.runtime.tool_temperature, Some(0.3));
+}
+
+#[test]
+fn tool_temperature_set_via_config_file() {
+    let mut config = EffectiveConfig::load().expect("config should load");
+    let mut map = HashMap::new();
+    map.insert("tool_temperature".to_string(), "0.5".to_string());
+    config
+        .apply_overrides_for_test(&map, &HashMap::new(), &HashMap::new())
+        .unwrap();
+    assert_eq!(config.runtime.tool_temperature, Some(0.5));
+}
+
+#[test]
+fn tool_temperature_set_via_env_var() {
+    let mut config = EffectiveConfig::load().expect("config should load");
+    let mut env_map = HashMap::new();
+    env_map.insert("ANVIL_TOOL_TEMPERATURE".to_string(), "0.7".to_string());
+    config
+        .apply_overrides_for_test(&HashMap::new(), &env_map, &HashMap::new())
+        .unwrap();
+    assert_eq!(config.runtime.tool_temperature, Some(0.7));
+}
+
+#[test]
+fn tool_temperature_rejects_value_above_range() {
+    let mut config = EffectiveConfig::load().expect("config should load");
+    let mut map = HashMap::new();
+    map.insert("tool_temperature".to_string(), "2.1".to_string());
+    let result = config.apply_overrides_for_test(&map, &HashMap::new(), &HashMap::new());
+    assert!(result.is_err(), "value 2.1 should be rejected");
+}
+
+#[test]
+fn tool_temperature_rejects_value_below_range() {
+    let mut config = EffectiveConfig::load().expect("config should load");
+    let mut map = HashMap::new();
+    map.insert("tool_temperature".to_string(), "-0.1".to_string());
+    let result = config.apply_overrides_for_test(&map, &HashMap::new(), &HashMap::new());
+    assert!(result.is_err(), "value -0.1 should be rejected");
+}
+
+#[test]
+fn tool_temperature_rejects_nan() {
+    let mut config = EffectiveConfig::load().expect("config should load");
+    let mut map = HashMap::new();
+    map.insert("tool_temperature".to_string(), "NaN".to_string());
+    let result = config.apply_overrides_for_test(&map, &HashMap::new(), &HashMap::new());
+    assert!(result.is_err(), "NaN should be rejected");
+}
+
+#[test]
+fn tool_temperature_rejects_infinity() {
+    let mut config = EffectiveConfig::load().expect("config should load");
+    let mut map = HashMap::new();
+    map.insert("tool_temperature".to_string(), "inf".to_string());
+    let result = config.apply_overrides_for_test(&map, &HashMap::new(), &HashMap::new());
+    assert!(result.is_err(), "inf should be rejected");
+}
+
+/// Issue #347 regression prevention: ANVIL_TOOL_TEMPERATURE must be in
+/// ENV_OVERRIDE_WHITELIST so it reaches apply_map from env overrides.
+/// Uses `apply_env_overrides_from_map_for_test` which goes through the
+/// actual whitelist filter, unlike `apply_overrides_for_test`.
+#[test]
+fn tool_temperature_env_whitelist_regression_test() {
+    let mut config = EffectiveConfig::load().expect("config should load");
+    let mut env_map = HashMap::new();
+    env_map.insert("ANVIL_TOOL_TEMPERATURE".to_string(), "0.5".to_string());
+    config
+        .apply_env_overrides_from_map_for_test(&env_map)
+        .unwrap();
+    assert_eq!(
+        config.runtime.tool_temperature,
+        Some(0.5),
+        "ANVIL_TOOL_TEMPERATURE must reach apply_map via ENV_OVERRIDE_WHITELIST (Issue #347)"
+    );
+}
