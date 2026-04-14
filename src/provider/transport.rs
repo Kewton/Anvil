@@ -8,6 +8,7 @@ use super::ProviderTurnError;
 use std::io::Read as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::time::Duration;
 
 /// Parsed HTTP response returned by an [`HttpTransport`] implementation.
@@ -81,6 +82,7 @@ pub trait HttpTransport {
 
 /// Maximum response body size for provider requests (50 MB).
 const MAX_PROVIDER_RESPONSE_SIZE: u64 = 50 * 1024 * 1024;
+const INTERRUPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Validate that a URL uses only http or https scheme.
 fn validate_url_scheme(url: &str) -> Result<(), ProviderTurnError> {
@@ -203,6 +205,30 @@ impl ReqwestHttpTransport {
         transport.shutdown_flag = Some(shutdown_flag);
         transport
     }
+
+    fn is_shutdown_requested(flag: &Option<Arc<AtomicBool>>) -> bool {
+        flag.as_ref().is_some_and(|f| f.load(Ordering::Relaxed))
+    }
+
+    fn wait_for_worker_result<T: Send + 'static>(
+        shutdown_flag: Option<Arc<AtomicBool>>,
+        rx: mpsc::Receiver<Result<T, ProviderTurnError>>,
+    ) -> Result<T, ProviderTurnError> {
+        loop {
+            if Self::is_shutdown_requested(&shutdown_flag) {
+                return Err(ProviderTurnError::Cancelled);
+            }
+            match rx.recv_timeout(INTERRUPT_POLL_INTERVAL) {
+                Ok(result) => return result,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(ProviderTurnError::Network(
+                        "transport worker channel disconnected".to_string(),
+                    ));
+                }
+            }
+        }
+    }
 }
 
 impl HttpTransport for ReqwestHttpTransport {
@@ -213,26 +239,39 @@ impl HttpTransport for ReqwestHttpTransport {
         headers: &[(&str, &str)],
     ) -> Result<HttpResponse, ProviderTurnError> {
         validate_url_scheme(url)?;
-        let mut request = self
-            .client
-            .post(url)
-            .body(body.to_vec())
-            .header("Content-Type", "application/json");
-        for (key, value) in headers {
-            validate_header_value(key, value)?;
-            request = request.header(*key, *value);
-        }
-        let response = request.send().map_err(classify_reqwest_error)?;
-        let status_code = response.status().as_u16();
-        let mut response_body = Vec::new();
-        response
-            .take(MAX_PROVIDER_RESPONSE_SIZE)
-            .read_to_end(&mut response_body)
-            .map_err(|e| ProviderTurnError::Network(e.to_string()))?;
-        Ok(HttpResponse {
-            status_code,
-            body: response_body,
-        })
+        let client = self.client.clone();
+        let url = url.to_string();
+        let body = body.to_vec();
+        let headers_owned: Vec<(String, String)> = headers
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = (|| {
+                let mut request = client
+                    .post(&url)
+                    .body(body)
+                    .header("Content-Type", "application/json");
+                for (key, value) in &headers_owned {
+                    validate_header_value(key, value)?;
+                    request = request.header(key, value);
+                }
+                let response = request.send().map_err(classify_reqwest_error)?;
+                let status_code = response.status().as_u16();
+                let mut response_body = Vec::new();
+                response
+                    .take(MAX_PROVIDER_RESPONSE_SIZE)
+                    .read_to_end(&mut response_body)
+                    .map_err(|e| ProviderTurnError::Network(e.to_string()))?;
+                Ok(HttpResponse {
+                    status_code,
+                    body: response_body,
+                })
+            })();
+            let _ = tx.send(result);
+        });
+        Self::wait_for_worker_result(self.shutdown_flag.clone(), rx)
     }
 
     fn get_with_headers(
@@ -241,22 +280,35 @@ impl HttpTransport for ReqwestHttpTransport {
         headers: &[(&str, &str)],
     ) -> Result<HttpResponse, ProviderTurnError> {
         validate_url_scheme(url)?;
-        let mut request = self.client.get(url);
-        for (key, value) in headers {
-            validate_header_value(key, value)?;
-            request = request.header(*key, *value);
-        }
-        let response = request.send().map_err(classify_reqwest_error)?;
-        let status_code = response.status().as_u16();
-        let mut response_body = Vec::new();
-        response
-            .take(MAX_PROVIDER_RESPONSE_SIZE)
-            .read_to_end(&mut response_body)
-            .map_err(|e| ProviderTurnError::Network(e.to_string()))?;
-        Ok(HttpResponse {
-            status_code,
-            body: response_body,
-        })
+        let client = self.client.clone();
+        let url = url.to_string();
+        let headers_owned: Vec<(String, String)> = headers
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = (|| {
+                let mut request = client.get(&url);
+                for (key, value) in &headers_owned {
+                    validate_header_value(key, value)?;
+                    request = request.header(key, value);
+                }
+                let response = request.send().map_err(classify_reqwest_error)?;
+                let status_code = response.status().as_u16();
+                let mut response_body = Vec::new();
+                response
+                    .take(MAX_PROVIDER_RESPONSE_SIZE)
+                    .read_to_end(&mut response_body)
+                    .map_err(|e| ProviderTurnError::Network(e.to_string()))?;
+                Ok(HttpResponse {
+                    status_code,
+                    body: response_body,
+                })
+            })();
+            let _ = tx.send(result);
+        });
+        Self::wait_for_worker_result(self.shutdown_flag.clone(), rx)
     }
 
     fn stream_lines(
@@ -267,31 +319,77 @@ impl HttpTransport for ReqwestHttpTransport {
         on_line: &mut dyn FnMut(&str),
     ) -> Result<(), ProviderTurnError> {
         validate_url_scheme(url)?;
-        let mut request = self
-            .streaming_client
-            .post(url)
-            .body(body.to_vec())
-            .header("Content-Type", "application/json");
-        for (key, value) in headers {
-            validate_header_value(key, value)?;
-            request = request.header(*key, *value);
+        enum StreamWorkerMessage {
+            Line(String),
+            Done(Result<(), ProviderTurnError>),
         }
-        let response = request.send().map_err(classify_reqwest_error)?;
-        let reader = std::io::BufReader::new(response);
-        use std::io::BufRead;
-        for line in reader.lines() {
-            if let Some(flag) = &self.shutdown_flag
-                && flag.load(Ordering::Relaxed)
-            {
+
+        let client = self.streaming_client.clone();
+        let url = url.to_string();
+        let body = body.to_vec();
+        let headers_owned: Vec<(String, String)> = headers
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        let shutdown_flag = self.shutdown_flag.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = (|| {
+                let mut request = client
+                    .post(&url)
+                    .body(body)
+                    .header("Content-Type", "application/json");
+                for (key, value) in &headers_owned {
+                    validate_header_value(key, value)?;
+                    request = request.header(key, value);
+                }
+                let response = request.send().map_err(classify_reqwest_error)?;
+                let status_code = response.status().as_u16();
+                if status_code != 200 {
+                    let mut body_text = String::new();
+                    std::io::BufReader::new(response)
+                        .take(MAX_PROVIDER_RESPONSE_SIZE)
+                        .read_to_string(&mut body_text)
+                        .map_err(|e| ProviderTurnError::Network(e.to_string()))?;
+                    return Err(classify_http_error(status_code, body_text.trim()));
+                }
+
+                let reader = std::io::BufReader::new(response);
+                use std::io::BufRead;
+                for line in reader.lines() {
+                    if Self::is_shutdown_requested(&shutdown_flag) {
+                        return Err(ProviderTurnError::Cancelled);
+                    }
+                    let line = line.map_err(|e| ProviderTurnError::Network(e.to_string()))?;
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty()
+                        && tx
+                            .send(StreamWorkerMessage::Line(trimmed.to_string()))
+                            .is_err()
+                    {
+                        return Ok(());
+                    }
+                }
+                Ok(())
+            })();
+            let _ = tx.send(StreamWorkerMessage::Done(result));
+        });
+
+        loop {
+            if Self::is_shutdown_requested(&self.shutdown_flag) {
                 return Err(ProviderTurnError::Cancelled);
             }
-            let line = line.map_err(|e| ProviderTurnError::Network(e.to_string()))?;
-            let trimmed = line.trim();
-            if !trimmed.is_empty() {
-                on_line(trimmed);
+            match rx.recv_timeout(INTERRUPT_POLL_INTERVAL) {
+                Ok(StreamWorkerMessage::Line(line)) => on_line(&line),
+                Ok(StreamWorkerMessage::Done(result)) => return result,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(ProviderTurnError::Network(
+                        "transport stream worker channel disconnected".to_string(),
+                    ));
+                }
             }
         }
-        Ok(())
     }
 }
 
@@ -566,5 +664,41 @@ impl<T: HttpTransport> HttpTransport for RetryTransport<T> {
             },
             || !callback_invoked.get(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::thread;
+
+    #[test]
+    fn wait_for_worker_result_cancels_before_worker_finishes() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let flag_for_cancel = Arc::clone(&flag);
+
+        thread::spawn(move || {
+            thread::sleep(Duration::from_secs(2));
+            let _ = tx.send(Ok::<_, ProviderTurnError>(HttpResponse {
+                status_code: 200,
+                body: b"ok".to_vec(),
+            }));
+        });
+
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            flag_for_cancel.store(true, Ordering::Release);
+        });
+
+        let started = std::time::Instant::now();
+        let result = ReqwestHttpTransport::wait_for_worker_result(Some(flag), rx);
+        let elapsed = started.elapsed();
+
+        assert!(matches!(result, Err(ProviderTurnError::Cancelled)));
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "cancel should beat the delayed worker result"
+        );
     }
 }
