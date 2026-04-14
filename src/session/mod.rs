@@ -586,6 +586,10 @@ impl SessionRecord {
             model_name: model_name.to_string(),
             messages,
             history_summary,
+            // Callers that care about ANSI (e.g. `App::render_console`)
+            // override this via the dedicated helper. Default to `false`
+            // for back-compat with existing session serialisation (DR2-002).
+            ansi_enabled: false,
         }
     }
 

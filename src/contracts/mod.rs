@@ -2271,6 +2271,15 @@ pub struct ConsoleRenderContext {
     pub model_name: String,
     pub messages: Vec<ConsoleMessageView>,
     pub history_summary: Option<String>,
+    /// Enable ANSI colouring for roles / status decorations (Issue #379 D2).
+    ///
+    /// Set to `true` by callers that know stderr is a TTY and the user has
+    /// not opted out (e.g. `config.mode.interactive` and
+    /// `std::io::IsTerminal`). Defaults to `false` so that legacy session
+    /// JSON without this field continues to deserialize unchanged
+    /// (DR2-002).
+    #[serde(default)]
+    pub ansi_enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

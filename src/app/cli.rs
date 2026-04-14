@@ -9,11 +9,11 @@ use crate::provider::{
     ProviderClient, ProviderRuntimeContext, ProviderTurnError, build_local_provider_client,
 };
 use crate::session::SessionError;
-use crate::tui::Tui;
+use crate::tui::{KeyboardWatcher, Tui};
 
 use super::{App, AppError, SessionControl, cli_prompt, error_guidance};
 
-use std::io::{self, BufRead, Read as _, Write};
+use std::io::{self, BufRead, IsTerminal, Read as _, Write};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -308,7 +308,22 @@ fn run_interactive_loop<C: ProviderClient>(
                 if !line.trim().is_empty() {
                     let _ = rl.add_history_entry(&line);
                 }
-                let turn = app.handle_cli_line(&line, provider_client, tui)?;
+
+                // Issue #379 Phase 1: enable ESC-driven interrupt while the
+                // turn is executing. rustyline owns the terminal during
+                // readline(); we only take raw mode afterwards so the two
+                // never race (R6).
+                let watch_enabled = app.config.mode.interactive && io::stderr().is_terminal();
+                let watcher = KeyboardWatcher::spawn(app.shutdown_flag(), watch_enabled);
+
+                // Run the turn, then release raw mode before propagating any
+                // error so that `?`-bubbled failures cannot leave the
+                // terminal stuck in raw mode.
+                let turn_result = app.handle_cli_line(&line, provider_client, tui);
+                if let Some(w) = watcher {
+                    w.stop();
+                }
+                let turn = turn_result?;
                 for frame in &turn.frames {
                     println!("{frame}");
                 }
