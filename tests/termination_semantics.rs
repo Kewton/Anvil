@@ -1,9 +1,8 @@
 //! Integration tests for Issue #383: termination semantics — unify the meaning
 //! of no-tool-call responses.
 //!
-//! These tests verify the decision logic of `decide_no_tool_call` by mirroring
-//! its branching rules here (the function and its types are private to agentic.rs).
-//! The tests serve as a living specification for the expected semantics.
+//! These tests exercise the public FSM API from
+//! `src/app/termination_fsm.rs` (see Issue #381).
 //!
 //! Covers (7 scenarios):
 //! - T1: guidance follow-up escalates to final guard retry
@@ -13,83 +12,18 @@
 //! - T5: Task-semantics gate fires on Branch 5
 //! - T6: Clean final answer accepted
 //! - T7: Post-tool ANVIL_FINAL plan gate suppression
+//!
+//! Note: `decide_done_path` / `decide_agentic_loop` are `pub(crate)` (they
+//! return `TerminationTransition`, which is also `pub(crate)`), so they are
+//! not importable from integration tests.  Done-path / agentic-loop
+//! ordering tests live alongside the FSM in
+//! `src/app/termination_fsm.rs::tests`.
 
 use anvil::app::phase_estimator::{PhaseAction, PhaseEstimator};
+use anvil::app::termination_fsm::{
+    MAX_FINAL_GUARD_RETRIES, NoToolCallDecision, NoToolCallInput, decide_no_tool_call,
+};
 use anvil::contracts::{ExecutionPlan, PlanItem};
-
-// ---------------------------------------------------------------------------
-// Mirror types and logic from agentic.rs (decide_no_tool_call)
-// ---------------------------------------------------------------------------
-
-const MAX_FINAL_GUARD_RETRIES: u8 = 1;
-
-/// Mirrors `NoToolCallDecision` from `src/app/agentic.rs`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NoToolCallDecision {
-    GuidanceFollowupComplete,
-    FinalGuardRetry,
-    FallbackCompleted,
-    PlanGateSuppression,
-    TaskSemanticsSuppression,
-    FinalAnswer,
-}
-
-/// Mirrors `NoToolCallInput` from `src/app/agentic.rs`.
-struct NoToolCallInput {
-    anvil_final_detected: bool,
-    awaiting_guidance_followup: bool,
-    final_guard_retries: u8,
-    touched_files_empty: bool,
-    phase_action: PhaseAction,
-    plan_has_incomplete_items: bool,
-    plan_gate_fires: bool,
-    task_semantics_fires: bool,
-}
-
-/// Mirrors `decide_no_tool_call` from `src/app/agentic.rs`.
-///
-/// This is the single source of truth for no-tool-call decision semantics.
-/// Any change to branching in agentic.rs should be reflected here.
-fn decide_no_tool_call(input: NoToolCallInput) -> NoToolCallDecision {
-    // Branch 1: guidance follow-up
-    if input.awaiting_guidance_followup {
-        // Does NOT require anvil_final_detected — ANVIL_FINAL may have been
-        // suppressed when the guidance injection was posted.
-        if input.touched_files_empty && input.final_guard_retries < MAX_FINAL_GUARD_RETRIES {
-            return NoToolCallDecision::FinalGuardRetry;
-        }
-        return NoToolCallDecision::GuidanceFollowupComplete;
-    }
-
-    // Branch 2: ANVIL_FINAL guard (requires anvil_final_detected, DR2-003)
-    if input.anvil_final_detected
-        && input.touched_files_empty
-        && input.final_guard_retries < MAX_FINAL_GUARD_RETRIES
-    {
-        return NoToolCallDecision::FinalGuardRetry;
-    }
-
-    // Branch 3: fallback completion
-    // Issue #307: if plan has incomplete items, fallthrough to plan gate instead.
-    if matches!(input.phase_action, PhaseAction::FallbackComplete)
-        && !input.plan_has_incomplete_items
-    {
-        return NoToolCallDecision::FallbackCompleted;
-    }
-
-    // Branch 4: plan gate
-    if input.plan_gate_fires {
-        return NoToolCallDecision::PlanGateSuppression;
-    }
-
-    // Branch 5: task-semantics gate
-    if input.task_semantics_fires {
-        return NoToolCallDecision::TaskSemanticsSuppression;
-    }
-
-    // Final: accept as answer
-    NoToolCallDecision::FinalAnswer
-}
 
 // ---------------------------------------------------------------------------
 // T1: guidance follow-up escalates to final guard retry
@@ -101,16 +35,16 @@ fn decide_no_tool_call(input: NoToolCallInput) -> NoToolCallDecision {
 /// the guidance injection was posted.
 #[test]
 fn guidance_followup_escalates_to_final_guard_retry() {
-    let input = NoToolCallInput {
-        anvil_final_detected: false, // suppressed by guidance injection
-        awaiting_guidance_followup: true,
-        final_guard_retries: 0, // budget not yet consumed
-        touched_files_empty: true,
-        phase_action: PhaseAction::Continue,
-        plan_has_incomplete_items: false,
-        plan_gate_fires: false,
-        task_semantics_fires: false,
-    };
+    let input = NoToolCallInput::for_testing(
+        /*anvil_final_detected=*/ false, // suppressed by guidance injection
+        /*awaiting_guidance_followup=*/ true,
+        /*final_guard_retries=*/ 0, // budget not yet consumed
+        /*touched_files_empty=*/ true,
+        PhaseAction::Continue,
+        /*plan_has_incomplete_items=*/ false,
+        /*plan_gate_fires=*/ false,
+        /*task_semantics_fires=*/ false,
+    );
     assert_eq!(
         decide_no_tool_call(input),
         NoToolCallDecision::FinalGuardRetry,
@@ -121,16 +55,16 @@ fn guidance_followup_escalates_to_final_guard_retry() {
 /// When the retry budget is exhausted, guidance follow-up resolves as complete.
 #[test]
 fn guidance_followup_complete_when_budget_exhausted() {
-    let input = NoToolCallInput {
-        anvil_final_detected: false,
-        awaiting_guidance_followup: true,
-        final_guard_retries: MAX_FINAL_GUARD_RETRIES, // budget exhausted
-        touched_files_empty: true,
-        phase_action: PhaseAction::Continue,
-        plan_has_incomplete_items: false,
-        plan_gate_fires: false,
-        task_semantics_fires: false,
-    };
+    let input = NoToolCallInput::for_testing(
+        false,
+        true,
+        MAX_FINAL_GUARD_RETRIES, // budget exhausted
+        true,
+        PhaseAction::Continue,
+        false,
+        false,
+        false,
+    );
     assert_eq!(
         decide_no_tool_call(input),
         NoToolCallDecision::GuidanceFollowupComplete,
@@ -142,16 +76,16 @@ fn guidance_followup_complete_when_budget_exhausted() {
 /// regardless of retry budget.
 #[test]
 fn guidance_followup_complete_when_files_modified() {
-    let input = NoToolCallInput {
-        anvil_final_detected: false,
-        awaiting_guidance_followup: true,
-        final_guard_retries: 0,
-        touched_files_empty: false, // files were modified
-        phase_action: PhaseAction::Continue,
-        plan_has_incomplete_items: false,
-        plan_gate_fires: false,
-        task_semantics_fires: false,
-    };
+    let input = NoToolCallInput::for_testing(
+        false,
+        true,
+        0,
+        /*touched_files_empty=*/ false, // files were modified
+        PhaseAction::Continue,
+        false,
+        false,
+        false,
+    );
     assert_eq!(
         decide_no_tool_call(input),
         NoToolCallDecision::GuidanceFollowupComplete,
@@ -187,16 +121,16 @@ fn fallback_completed_suppressed_when_plan_incomplete() {
     let phase_action = estimator.check_empty_response();
     assert_eq!(phase_action, PhaseAction::FallbackComplete);
 
-    let input = NoToolCallInput {
-        anvil_final_detected: false,
-        awaiting_guidance_followup: false,
-        final_guard_retries: 0,
-        touched_files_empty: false,
+    let input = NoToolCallInput::for_testing(
+        false,
+        false,
+        0,
+        false,
         phase_action,
         plan_has_incomplete_items,
-        plan_gate_fires: true, // plan gate fires because plan has incomplete items
-        task_semantics_fires: false,
-    };
+        /*plan_gate_fires=*/ true, // plan gate fires because plan has incomplete items
+        false,
+    );
     assert_eq!(
         decide_no_tool_call(input),
         NoToolCallDecision::PlanGateSuppression,
@@ -224,16 +158,16 @@ fn fallback_completed_fires_when_plan_finished() {
     let phase_action = estimator.check_empty_response();
     assert_eq!(phase_action, PhaseAction::FallbackComplete);
 
-    let input = NoToolCallInput {
-        anvil_final_detected: false,
-        awaiting_guidance_followup: false,
-        final_guard_retries: 0,
-        touched_files_empty: false,
+    let input = NoToolCallInput::for_testing(
+        false,
+        false,
+        0,
+        false,
         phase_action,
         plan_has_incomplete_items,
-        plan_gate_fires: false,
-        task_semantics_fires: false,
-    };
+        false,
+        false,
+    );
     assert_eq!(
         decide_no_tool_call(input),
         NoToolCallDecision::FallbackCompleted,
@@ -250,16 +184,13 @@ fn fallback_completed_fires_when_plan_finished() {
 /// (Done path defaults: awaiting_guidance_followup=false, final_guard_retries=0)
 #[test]
 fn done_path_final_guard_retry() {
-    let input = NoToolCallInput {
-        anvil_final_detected: true,          // ANVIL_FINAL detected in response
-        awaiting_guidance_followup: false,   // Done path: always false
-        final_guard_retries: 0,              // Done path: first turn
-        touched_files_empty: true,           // no file modifications
-        phase_action: PhaseAction::Continue, // Done path: always Continue
-        plan_has_incomplete_items: false,
-        plan_gate_fires: false, // Done path: plan gate handled before calling this
-        task_semantics_fires: false,
-    };
+    let input = NoToolCallInput::for_done_path(
+        /*anvil_final_detected=*/ true, // ANVIL_FINAL detected in response
+        /*touched_files_empty=*/ true,                  // no file modifications
+        PhaseAction::Continue, // Done path: always Continue
+        /*plan_has_incomplete_items=*/ false,
+        /*task_semantics_fires=*/ false,
+    );
     assert_eq!(
         decide_no_tool_call(input),
         NoToolCallDecision::FinalGuardRetry,
@@ -271,16 +202,13 @@ fn done_path_final_guard_retry() {
 /// (Branch 2 requires anvil_final_detected=true — DR2-003)
 #[test]
 fn done_path_no_final_guard_retry_without_anvil_final() {
-    let input = NoToolCallInput {
-        anvil_final_detected: false, // no ANVIL_FINAL
-        awaiting_guidance_followup: false,
-        final_guard_retries: 0,
-        touched_files_empty: true,
-        phase_action: PhaseAction::Continue,
-        plan_has_incomplete_items: false,
-        plan_gate_fires: false,
-        task_semantics_fires: false,
-    };
+    let input = NoToolCallInput::for_done_path(
+        /*anvil_final_detected=*/ false, // no ANVIL_FINAL
+        true,
+        PhaseAction::Continue,
+        false,
+        false,
+    );
     // Without anvil_final_detected, Branch 2 does not fire.
     // All other branches are inactive → FinalAnswer.
     assert_eq!(
@@ -306,16 +234,16 @@ fn done_path_plan_gate_suppresses_before_final_guard_retry() {
     // Both conditions would fire if ordering weren't enforced:
     // - anvil_final_detected=true + touched_files_empty=true → would be FinalGuardRetry
     // - plan_gate_fires=true → PlanGateSuppression
-    let input = NoToolCallInput {
-        anvil_final_detected: true,
-        awaiting_guidance_followup: false,
-        final_guard_retries: 0,
-        touched_files_empty: true,
-        phase_action: PhaseAction::Continue,
-        plan_has_incomplete_items: true,
-        plan_gate_fires: true, // plan gate fires
-        task_semantics_fires: false,
-    };
+    let input = NoToolCallInput::for_testing(
+        true,
+        false,
+        0,
+        true,
+        PhaseAction::Continue,
+        true,
+        /*plan_gate_fires=*/ true,
+        false,
+    );
     // Branch 2 (FinalGuardRetry) fires BEFORE Branch 4 (PlanGateSuppression)
     // in the agentic loop ordering. So with both conditions active, FinalGuardRetry wins.
     assert_eq!(
@@ -331,16 +259,13 @@ fn done_path_plan_gate_suppresses_before_final_guard_retry() {
 fn done_path_plan_gate_handled_externally() {
     // Simulates what handle_done_path_anvil_final_guard passes after handling
     // the plan gate externally: plan_gate_fires=false.
-    let input = NoToolCallInput {
-        anvil_final_detected: true,
-        awaiting_guidance_followup: false,
-        final_guard_retries: 0,
-        touched_files_empty: true,
-        phase_action: PhaseAction::Continue,
-        plan_has_incomplete_items: true,
-        plan_gate_fires: false, // Done path: plan gate already handled by caller
-        task_semantics_fires: false,
-    };
+    let input = NoToolCallInput::for_done_path(
+        true,
+        true,
+        PhaseAction::Continue,
+        /*plan_has_incomplete_items=*/ true,
+        false,
+    );
     assert_eq!(
         decide_no_tool_call(input),
         NoToolCallDecision::FinalGuardRetry,
@@ -356,16 +281,16 @@ fn done_path_plan_gate_handled_externally() {
 /// the task-semantics gate fires (Branch 5).
 #[test]
 fn task_semantics_gate_fires_on_branch5() {
-    let input = NoToolCallInput {
-        anvil_final_detected: false, // no ANVIL_FINAL
-        awaiting_guidance_followup: false,
-        final_guard_retries: 0,
-        touched_files_empty: true,
-        phase_action: PhaseAction::Continue,
-        plan_has_incomplete_items: false,
-        plan_gate_fires: false,
-        task_semantics_fires: true, // task-semantics gate fires
-    };
+    let input = NoToolCallInput::for_testing(
+        false,
+        false,
+        0,
+        true,
+        PhaseAction::Continue,
+        false,
+        false,
+        /*task_semantics_fires=*/ true,
+    );
     assert_eq!(
         decide_no_tool_call(input),
         NoToolCallDecision::TaskSemanticsSuppression,
@@ -377,16 +302,16 @@ fn task_semantics_gate_fires_on_branch5() {
 /// Plan gate (Branch 4) takes priority over task-semantics gate (Branch 5).
 #[test]
 fn plan_gate_takes_priority_over_task_semantics() {
-    let input = NoToolCallInput {
-        anvil_final_detected: false,
-        awaiting_guidance_followup: false,
-        final_guard_retries: 0,
-        touched_files_empty: false,
-        phase_action: PhaseAction::Continue,
-        plan_has_incomplete_items: true,
-        plan_gate_fires: true,
-        task_semantics_fires: true, // both active
-    };
+    let input = NoToolCallInput::for_testing(
+        false,
+        false,
+        0,
+        false,
+        PhaseAction::Continue,
+        true,
+        /*plan_gate_fires=*/ true,
+        /*task_semantics_fires=*/ true, // both active
+    );
     assert_eq!(
         decide_no_tool_call(input),
         NoToolCallDecision::PlanGateSuppression,
@@ -402,16 +327,16 @@ fn plan_gate_takes_priority_over_task_semantics() {
 /// final answer (FinalAnswer path).
 #[test]
 fn clean_final_answer_accepted() {
-    let input = NoToolCallInput {
-        anvil_final_detected: false,
-        awaiting_guidance_followup: false,
-        final_guard_retries: 0,
-        touched_files_empty: false, // files were modified — guard does not fire
-        phase_action: PhaseAction::Continue, // no fallback completion
-        plan_has_incomplete_items: false,
-        plan_gate_fires: false,
-        task_semantics_fires: false,
-    };
+    let input = NoToolCallInput::for_testing(
+        false,
+        false,
+        0,
+        /*touched_files_empty=*/ false, // files were modified — guard does not fire
+        PhaseAction::Continue, // no fallback completion
+        false,
+        false,
+        false,
+    );
     assert_eq!(
         decide_no_tool_call(input),
         NoToolCallDecision::FinalAnswer,
@@ -423,16 +348,16 @@ fn clean_final_answer_accepted() {
 /// were made (the guard condition on touched_files_empty is not met).
 #[test]
 fn final_answer_accepted_when_files_modified_despite_anvil_final() {
-    let input = NoToolCallInput {
-        anvil_final_detected: true, // ANVIL_FINAL present
-        awaiting_guidance_followup: false,
-        final_guard_retries: 0,
-        touched_files_empty: false, // but files were modified → guard skipped
-        phase_action: PhaseAction::Continue,
-        plan_has_incomplete_items: false,
-        plan_gate_fires: false,
-        task_semantics_fires: false,
-    };
+    let input = NoToolCallInput::for_testing(
+        /*anvil_final_detected=*/ true, // ANVIL_FINAL present
+        false,
+        0,
+        /*touched_files_empty=*/ false, // but files were modified → guard skipped
+        PhaseAction::Continue,
+        false,
+        false,
+        false,
+    );
     assert_eq!(
         decide_no_tool_call(input),
         NoToolCallDecision::FinalAnswer,
@@ -444,16 +369,16 @@ fn final_answer_accepted_when_files_modified_despite_anvil_final() {
 /// conditions are otherwise met.
 #[test]
 fn final_guard_budget_exhausted_falls_through_to_final_answer() {
-    let input = NoToolCallInput {
-        anvil_final_detected: true,
-        awaiting_guidance_followup: false,
-        final_guard_retries: MAX_FINAL_GUARD_RETRIES, // budget exhausted
-        touched_files_empty: true,
-        phase_action: PhaseAction::Continue,
-        plan_has_incomplete_items: false,
-        plan_gate_fires: false,
-        task_semantics_fires: false,
-    };
+    let input = NoToolCallInput::for_testing(
+        true,
+        false,
+        MAX_FINAL_GUARD_RETRIES, // budget exhausted
+        true,
+        PhaseAction::Continue,
+        false,
+        false,
+        false,
+    );
     assert_eq!(
         decide_no_tool_call(input),
         NoToolCallDecision::FinalAnswer,
@@ -493,16 +418,16 @@ fn post_tool_anvil_final_plan_gate_suppression() {
     // require_plan_here is satisfied (plan is non-empty and has incomplete items).
     let plan_gate_fires = plan_has_incomplete_items; // simplified: fires when incomplete
 
-    let input = NoToolCallInput {
-        anvil_final_detected: true, // ANVIL_FINAL detected after tool execution
-        awaiting_guidance_followup: false,
-        final_guard_retries: 0,
-        touched_files_empty: true, // no file edits in this turn
-        phase_action: PhaseAction::Continue,
+    let input = NoToolCallInput::for_testing(
+        /*anvil_final_detected=*/ true, // ANVIL_FINAL detected after tool execution
+        false,
+        0,
+        /*touched_files_empty=*/ true, // no file edits in this turn
+        PhaseAction::Continue,
         plan_has_incomplete_items,
         plan_gate_fires,
-        task_semantics_fires: false,
-    };
+        false,
+    );
 
     // Branch 2 (FinalGuardRetry) fires first because anvil_final_detected=true.
     // This verifies the ordering: plan gate (Branch 4) only fires when Branch 2 is not active.
@@ -519,16 +444,16 @@ fn post_tool_anvil_final_plan_gate_suppression() {
 /// the plan gate fires and suppresses termination.
 #[test]
 fn post_tool_plan_gate_fires_when_guard_budget_exhausted() {
-    let input = NoToolCallInput {
-        anvil_final_detected: true,
-        awaiting_guidance_followup: false,
-        final_guard_retries: MAX_FINAL_GUARD_RETRIES, // guard budget exhausted
-        touched_files_empty: true,
-        phase_action: PhaseAction::Continue,
-        plan_has_incomplete_items: true,
-        plan_gate_fires: true, // plan gate fires
-        task_semantics_fires: false,
-    };
+    let input = NoToolCallInput::for_testing(
+        true,
+        false,
+        MAX_FINAL_GUARD_RETRIES, // guard budget exhausted
+        true,
+        PhaseAction::Continue,
+        true,
+        /*plan_gate_fires=*/ true, // plan gate fires
+        false,
+    );
     assert_eq!(
         decide_no_tool_call(input),
         NoToolCallDecision::PlanGateSuppression,

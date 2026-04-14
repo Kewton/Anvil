@@ -316,12 +316,15 @@ fn runtime_config_default_preserves_gate_enabled() {
 
 #[test]
 fn termination_loop_state_new_includes_task_semantics() {
-    // Verified via the unit test in agentic.rs; this test ensures the
-    // integration test can also reference the constant MAX_TASK_SEMANTICS_GATE_RETRIES
-    // indirectly by asserting the initial value is 0.
-    // Note: TerminationLoopState is private — this is tested via the unit
-    // tests in src/app/agentic.rs (termination_loop_state_new_both_false).
-    // Here we just verify the function and telemetry are accessible.
+    // Verified via the unit tests in src/app/termination_fsm.rs (Issue #381
+    // moved `TerminationLoopState` and its tests to that module).  This test
+    // ensures the integration test can also reference the constant
+    // MAX_TASK_SEMANTICS_GATE_RETRIES indirectly by asserting the initial
+    // value is 0.
+    // Note: `TerminationLoopState` is `pub(crate)` — the unit tests in
+    // src/app/termination_fsm.rs (`termination_loop_state_new_both_false`)
+    // cover state-level behaviour.  Here we just verify the telemetry is
+    // accessible.
     let tel = RetryTelemetry::default();
     assert_eq!(tel.task_semantics_gate_attempted, 0);
     assert_eq!(tel.task_semantics_gate_succeeded, 0);
