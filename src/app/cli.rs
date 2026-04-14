@@ -13,7 +13,7 @@ use crate::tui::{KeyboardWatcher, Tui};
 
 use super::{App, AppError, SessionControl, cli_prompt, error_guidance};
 
-use std::io::{self, BufRead, IsTerminal, Read as _, Write};
+use std::io::{self, BufRead, Read as _, Write};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -325,7 +325,7 @@ fn run_interactive_loop<C: ProviderClient>(
                 // turn is executing. rustyline owns the terminal during
                 // readline(); we only take raw mode afterwards so the two
                 // never race (R6).
-                let watch_enabled = app.config.mode.interactive && io::stderr().is_terminal();
+                let watch_enabled = app.config.mode.interactive;
                 let watcher = KeyboardWatcher::spawn(app.stop_flag(), watch_enabled);
 
                 // Run the turn, then release raw mode before propagating any

@@ -533,7 +533,7 @@ impl App {
                 } else {
                     Some(crate::hooks::HooksEngine::new(
                         hooks_config,
-                        Arc::clone(&shutdown_flag),
+                        Arc::clone(&stop_flag),
                     ))
                 }
             }
