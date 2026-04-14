@@ -66,6 +66,9 @@ use std::sync::{Arc, Mutex};
 // Re-export render helpers that form the public API.
 pub use render::{cli_prompt, render_help_frame, slash_commands};
 
+// Re-export AgenticMode / RepairReason for tests and external inspection (Issue #380).
+pub use agentic::{AgenticMode, RepairReason};
+
 /// Mutation tools tracked for telemetry purposes.
 /// Note: shell.exec is intentionally excluded — see Issue #273 for rationale
 /// (first_mutation_event_* fields are runtime_lower_bound, not strict post-hoc values).
@@ -314,9 +317,6 @@ pub struct App {
     proactive_delegation_pending: bool,
     /// Recovery read budget for file.edit failure recovery (Issue #299).
     tool_recovery_budget: tool_recovery_budget::ToolRecoveryBudget,
-    /// Whether the session is in pre-exit repair closure mode (Issue #327).
-    /// When active, ANVIL_PLAN_UPDATE unchecked items are rejected.
-    repair_closure_active: bool,
     /// Detects closure-mode natural-language reasoning loops that reoccur
     /// after a `fix_slice` worker failure with no tool-advancing output
     /// (Issue #349).
@@ -716,7 +716,6 @@ impl App {
             tool_recovery_budget: tool_recovery_budget::ToolRecoveryBudget::new(
                 edit_recovery_read_budget,
             ),
-            repair_closure_active: false,
             closure_loop_detector: closure_loop_detector::ClosureLoopDetector::with_threshold(
                 closure_jaccard_threshold,
             ),
