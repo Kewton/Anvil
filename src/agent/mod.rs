@@ -506,7 +506,9 @@ fn parse_tool_call_value(
 }
 
 fn repair_tool_call_block(block: &str) -> Option<ToolCallRequest> {
-    let tool_name = extract_simple_string_field(block, "tool")?;
+    let tool_name = extract_simple_string_field(block, "tool")
+        .or_else(|| extract_legacy_tool_name(block))
+        .map(|name| normalize_legacy_tool_name(&name))?;
     let tool_call_id = extract_simple_string_field(block, "id")
         .unwrap_or_else(|| "call_generated_001".to_string());
 
@@ -520,31 +522,63 @@ fn repair_tool_call_block(block: &str) -> Option<ToolCallRequest> {
     Some(ToolCallRequest::new(tool_call_id, tool_name, input))
 }
 
+fn extract_legacy_tool_name(block: &str) -> Option<String> {
+    let first_line = block
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('{') && !line.starts_with('"'))?;
+    if first_line.contains(':') {
+        return None;
+    }
+    Some(first_line.to_string())
+}
+
+fn normalize_legacy_tool_name(name: &str) -> String {
+    match name.trim() {
+        "file_write" => "file.write".to_string(),
+        "file_edit" => "file.edit".to_string(),
+        "file_read" => "file.read".to_string(),
+        "file_search" => "file.search".to_string(),
+        "shell_exec" => "shell.exec".to_string(),
+        other => other.to_string(),
+    }
+}
+
 fn extract_simple_string_field(block: &str, key: &str) -> Option<String> {
     let marker = format!("\"{key}\":\"");
-    let start = block.find(&marker)? + marker.len();
-    let tail = &block[start..];
-    let mut result = String::new();
-    let mut escaped = false;
+    if let Some(start) = block.find(&marker) {
+        let start = start + marker.len();
+        let tail = &block[start..];
+        let mut result = String::new();
+        let mut escaped = false;
 
-    for ch in tail.chars() {
-        if escaped {
-            result.push(match ch {
-                'n' => '\n',
-                'r' => '\r',
-                't' => '\t',
-                '"' => '"',
-                '\\' => '\\',
-                other => other,
-            });
-            escaped = false;
-            continue;
+        for ch in tail.chars() {
+            if escaped {
+                result.push(match ch {
+                    'n' => '\n',
+                    'r' => '\r',
+                    't' => '\t',
+                    '"' => '"',
+                    '\\' => '\\',
+                    other => other,
+                });
+                escaped = false;
+                continue;
+            }
+
+            match ch {
+                '\\' => escaped = true,
+                '"' => return Some(result),
+                other => result.push(other),
+            }
         }
+    }
 
-        match ch {
-            '\\' => escaped = true,
-            '"' => return Some(result),
-            other => result.push(other),
+    let legacy_prefix = format!("{key}:");
+    for line in block.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix(&legacy_prefix) {
+            return Some(rest.trim_start().to_string());
         }
     }
 
@@ -553,11 +587,33 @@ fn extract_simple_string_field(block: &str, key: &str) -> Option<String> {
 
 fn extract_trailing_string_field(block: &str, key: &str) -> Option<String> {
     let marker = format!("\"{key}\":\"");
-    let start = block.find(&marker)? + marker.len();
-    let closing_brace = block.rfind('}')?;
-    let before_brace = &block[..closing_brace];
-    let end = before_brace.rfind('"')?;
-    (end >= start).then(|| loose_unescape(&block[start..end]))
+    if let Some(start) = block.find(&marker) {
+        let start = start + marker.len();
+        let closing_brace = block.rfind('}')?;
+        let before_brace = &block[..closing_brace];
+        let end = before_brace.rfind('"')?;
+        return (end >= start).then(|| loose_unescape(&block[start..end]));
+    }
+
+    let legacy_prefix = format!("{key}:");
+    let mut lines = block.lines();
+    while let Some(line) = lines.next() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix(&legacy_prefix) {
+            let mut value = String::from(rest.trim_start());
+            for next in lines {
+                if value.is_empty() {
+                    value.push_str(next);
+                } else {
+                    value.push('\n');
+                    value.push_str(next);
+                }
+            }
+            return Some(value);
+        }
+    }
+
+    None
 }
 
 fn loose_unescape(value: &str) -> String {

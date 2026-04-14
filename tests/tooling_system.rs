@@ -6218,6 +6218,65 @@ fn file_search_repair_root_explicit() {
     }
 }
 
+#[test]
+fn legacy_file_write_tool_block_is_repaired() {
+    let response = anvil::agent::BasicAgentLoop::parse_structured_response(concat!(
+        "```ANVIL_TOOL\n",
+        "file_write\n",
+        "path: src/hooks/useGameLoop.ts\n",
+        "content: export const ready = true;\n",
+        "```\n"
+    ))
+    .expect("legacy file_write block should be repaired");
+
+    assert_eq!(response.tool_calls.len(), 1);
+    let call = &response.tool_calls[0];
+    assert_eq!(call.tool_name, "file.write");
+    match &call.input {
+        ToolInput::FileWrite { path, content } => {
+            assert_eq!(path, "src/hooks/useGameLoop.ts");
+            assert_eq!(content, "export const ready = true;");
+        }
+        _ => panic!("expected FileWrite"),
+    }
+}
+
+#[test]
+fn legacy_shell_exec_tool_block_is_repaired() {
+    let response = anvil::agent::BasicAgentLoop::parse_structured_response(concat!(
+        "```ANVIL_TOOL\n",
+        "shell_exec\n",
+        "command: npm install\n",
+        "```\n"
+    ))
+    .expect("legacy shell_exec block should be repaired");
+
+    assert_eq!(response.tool_calls.len(), 1);
+    let call = &response.tool_calls[0];
+    assert_eq!(call.tool_name, "shell.exec");
+    match &call.input {
+        ToolInput::ShellExec { command } => {
+            assert_eq!(command, "npm install");
+        }
+        _ => panic!("expected ShellExec"),
+    }
+}
+
+#[test]
+fn legacy_unknown_tool_block_is_still_rejected() {
+    let result = anvil::agent::BasicAgentLoop::parse_structured_response(concat!(
+        "```ANVIL_TOOL\n",
+        "unknown_tool\n",
+        "path: src/main.rs\n",
+        "```\n"
+    ));
+
+    assert!(
+        result.is_err(),
+        "unknown legacy tool name should stay rejected"
+    );
+}
+
 // =============================================================================
 // Issue #206: EditFallbackStage / EditResultDetail tests
 // =============================================================================
