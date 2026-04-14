@@ -206,6 +206,7 @@ fn validated_tool_call_builds_typed_execution_request_and_result() {
         edit_detail: None,
         rolled_back: false,
         observed_delta: None,
+        delta_observation_skipped: None,
     };
 
     assert_eq!(execution.spec.kind, ToolKind::FileRead);
@@ -382,6 +383,7 @@ fn tool_execution_result_can_bridge_into_console_tool_log_view() {
         edit_detail: None,
         rolled_back: false,
         observed_delta: None,
+        delta_observation_skipped: None,
     };
     let log = result.to_tool_log_view();
 
@@ -2310,6 +2312,7 @@ fn format_tool_result_message_image_payload() {
         edit_detail: None,
         rolled_back: false,
         observed_delta: None,
+        delta_observation_skipped: None,
     };
     let msg = format_tool_result_message(&result, 10000);
     assert!(msg.contains("file.read"));
@@ -2340,6 +2343,7 @@ fn format_tool_result_message_truncates_multibyte_safely() {
         edit_detail: None,
         rolled_back: false,
         observed_delta: None,
+        delta_observation_skipped: None,
     };
 
     // Must not panic — the old byte-slicing implementation would panic here.
@@ -2366,6 +2370,7 @@ fn format_tool_result_message_ascii_truncation_still_works() {
         edit_detail: None,
         rolled_back: false,
         observed_delta: None,
+        delta_observation_skipped: None,
     };
 
     let msg = format_tool_result_message(&result, 100);
@@ -2395,6 +2400,7 @@ fn format_tool_result_message_boundary_char_3byte() {
         edit_detail: None,
         rolled_back: false,
         observed_delta: None,
+        delta_observation_skipped: None,
     };
 
     let msg = format_tool_result_message(&result, 100);
@@ -2481,6 +2487,7 @@ fn format_tool_result_message_success_head_priority() {
         edit_detail: None,
         rolled_back: false,
         observed_delta: None,
+        delta_observation_skipped: None,
     };
 
     let msg = format_tool_result_message(&result, 100);
@@ -2510,6 +2517,7 @@ fn format_tool_result_message_failure_tail_priority() {
         edit_detail: None,
         rolled_back: false,
         observed_delta: None,
+        delta_observation_skipped: None,
     };
 
     let msg = format_tool_result_message(&result, 100);
@@ -2539,6 +2547,7 @@ fn format_tool_result_message_interrupted_tail_priority() {
         edit_detail: None,
         rolled_back: false,
         observed_delta: None,
+        delta_observation_skipped: None,
     };
 
     let msg = format_tool_result_message(&result, 100);
@@ -6247,6 +6256,7 @@ fn tool_execution_result_edit_detail_default_none() {
         edit_detail: None,
         rolled_back: false,
         observed_delta: None,
+        delta_observation_skipped: None,
     };
     assert!(result.edit_detail.is_none());
 }
@@ -6269,6 +6279,7 @@ fn tool_execution_result_edit_detail_with_stage() {
         }),
         rolled_back: false,
         observed_delta: None,
+        delta_observation_skipped: None,
     };
     assert!(result.edit_detail.is_some());
     assert_eq!(
@@ -6310,6 +6321,7 @@ fn rolled_back_result_has_flag_set() {
         edit_detail: None,
         rolled_back: false,
         observed_delta: None,
+        delta_observation_skipped: None,
     };
     assert!(!result.rolled_back);
 

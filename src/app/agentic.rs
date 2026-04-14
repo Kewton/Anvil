@@ -161,6 +161,7 @@ pub struct TurnSummary<'a> {
     pub tool_calls: usize,
     pub tool_names: &'a [String],
     pub files_modified: usize,
+    pub delta_observation_skips: usize,
     pub compact_info: Option<&'a CompactInfo>,
     pub phase: super::phase_estimator::Phase,
     /// Mutations executed this turn.
@@ -211,6 +212,7 @@ pub fn log_turn_summary(summary: &TurnSummary<'_>) {
         tool_calls = summary.tool_calls,
         tools = %tool_summary,
         files_modified = summary.files_modified,
+        delta_observation_skips = summary.delta_observation_skips,
         compact = %compact_str,
         phase = %summary.phase,
         agentic_mode = %agentic_mode_str,
@@ -365,6 +367,7 @@ fn execute_parallel_group_standalone(
                                 edit_detail: None,
                                 rolled_back: false,
                                 observed_delta: None,
+                                delta_observation_skipped: None,
                             }
                         });
                         // Update progress entry
@@ -413,6 +416,7 @@ fn execute_parallel_group_standalone(
                                 edit_detail: None,
                                 rolled_back: false,
                                 observed_delta: None,
+                                delta_observation_skipped: None,
                             },
                         ));
                     }
@@ -570,6 +574,7 @@ impl App {
                     edit_detail: None,
                     rolled_back: false,
                     observed_delta: None,
+                    delta_observation_skipped: None,
                 });
                 continue;
             }
@@ -885,6 +890,7 @@ impl App {
             edit_detail: None,
             rolled_back: false,
             observed_delta: None,
+            delta_observation_skipped: None,
         };
 
         // DR3-001: file.rewrite first, then agent.fix_slice summary
@@ -1758,6 +1764,10 @@ impl App {
             let turn_tool_names: Vec<String> =
                 results.iter().map(|r| r.tool_name.clone()).collect();
             let turn_files_modified = results.iter().filter(|r| r.mutation_observed()).count();
+            let turn_delta_observation_skips = results
+                .iter()
+                .filter(|r| r.delta_observation_skipped())
+                .count();
             let turn_tool_count = results.len() + agent_results.len();
 
             let mut next_token_buffer = String::new();
@@ -2401,6 +2411,7 @@ impl App {
                 tool_calls: turn_tool_count,
                 tool_names: &turn_tool_names,
                 files_modified: turn_files_modified,
+                delta_observation_skips: turn_delta_observation_skips,
                 compact_info: self.last_compact_info.as_ref(),
                 phase: self.phase_estimator.current_phase(),
                 mutations_this_turn: Some(turn_mutations),
@@ -2606,6 +2617,7 @@ impl App {
                         edit_detail: None,
                         rolled_back: false,
                         observed_delta: None,
+                        delta_observation_skipped: None,
                     },
                 ));
                 continue;
@@ -2707,6 +2719,7 @@ impl App {
                 edit_detail: None,
                 rolled_back: false,
                 observed_delta: None,
+                delta_observation_skipped: None,
             });
 
         // Remove checkpoint if tool execution failed.
@@ -2744,6 +2757,7 @@ impl App {
                 edit_detail: None,
                 rolled_back: false,
                 observed_delta: None,
+                delta_observation_skipped: None,
             };
         };
 
@@ -2773,6 +2787,7 @@ impl App {
             edit_detail: None,
             rolled_back: false,
             observed_delta: None,
+            delta_observation_skipped: None,
         }
     }
 
@@ -2849,6 +2864,7 @@ impl App {
                                     edit_detail: None,
                                     rolled_back: false,
                                     observed_delta: None,
+                                    delta_observation_skipped: None,
                                 },
                             ));
                         }
@@ -2971,6 +2987,7 @@ impl App {
                 edit_detail: None,
                 rolled_back: false,
                 observed_delta: None,
+                delta_observation_skipped: None,
             }),
             _ => None,
         };
@@ -3268,6 +3285,7 @@ impl App {
                 edit_detail: None,
                 rolled_back: false,
                 observed_delta: None,
+                delta_observation_skipped: None,
             };
             self.record_tool_result(&transition_result, false);
             results.push(transition_result);
@@ -3299,6 +3317,7 @@ impl App {
                     edit_detail: None,
                     rolled_back: false,
                     observed_delta: None,
+                    delta_observation_skipped: None,
                 };
                 self.record_tool_result(&transition_result, false);
                 results.push(transition_result);
@@ -3992,6 +4011,7 @@ impl App {
                 tool_calls: 0,
                 tool_names: &[],
                 files_modified: 0,
+                delta_observation_skips: 0,
                 compact_info: None,
                 phase: self.phase_estimator.current_phase(),
                 mutations_this_turn: None,
@@ -4244,6 +4264,7 @@ fn build_failed_result(
         edit_detail: None,
         rolled_back: false,
         observed_delta: None,
+        delta_observation_skipped: None,
     }
 }
 
@@ -4264,6 +4285,7 @@ fn build_failed_result_with_text(
         edit_detail: None,
         rolled_back: false,
         observed_delta: None,
+        delta_observation_skipped: None,
     }
 }
 
@@ -4718,6 +4740,7 @@ mod trust_tests {
             edit_detail: None,
             rolled_back: false,
             observed_delta: None,
+            delta_observation_skipped: None,
         };
 
         let formatted = format_tool_result_message(&result, 8_000);

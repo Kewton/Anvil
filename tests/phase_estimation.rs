@@ -143,6 +143,7 @@ fn turn_summary_includes_phase_field() {
         tool_calls: 2,
         tool_names: &[],
         files_modified: 0,
+        delta_observation_skips: 0,
         compact_info: None,
         phase: Phase::Exploring,
         mutations_this_turn: None,

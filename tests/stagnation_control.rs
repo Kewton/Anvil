@@ -562,6 +562,7 @@ fn make_result(
         edit_detail: None,
         rolled_back,
         observed_delta: None,
+        delta_observation_skipped: None,
     }
 }
 

@@ -1054,6 +1054,8 @@ pub struct ToolExecutionResult {
     pub rolled_back: bool,
     /// Fact-only observed workspace delta for tools like `shell.exec`.
     pub observed_delta: Option<ObservedWorkspaceDelta>,
+    /// Optional reason why workspace-delta observation was conservatively skipped.
+    pub delta_observation_skipped: Option<String>,
 }
 
 impl ToolExecutionResult {
@@ -1095,6 +1097,10 @@ impl ToolExecutionResult {
 
     pub fn mutation_observed(&self) -> bool {
         !self.observed_changed_paths().is_empty()
+    }
+
+    pub fn delta_observation_skipped(&self) -> bool {
+        self.delta_observation_skipped.is_some()
     }
 }
 
@@ -2733,6 +2739,7 @@ impl LocalToolExecutor {
                     edit_detail: None,
                     rolled_back: false,
                     observed_delta: None,
+                    delta_observation_skipped: None,
                 });
             }
             match child.try_wait() {
@@ -2804,6 +2811,7 @@ impl LocalToolExecutor {
             edit_detail: None,
             rolled_back: false,
             observed_delta,
+            delta_observation_skipped: delta_skip_reason.map(str::to_string),
         })
     }
 
@@ -2996,6 +3004,7 @@ impl LocalToolExecutor {
                 edit_detail: None,
                 rolled_back: false,
                 observed_delta: None,
+                delta_observation_skipped: None,
             });
         }
 
@@ -3372,6 +3381,7 @@ fn build_completed_result_with_diff(
         edit_detail: None,
         rolled_back: false,
         observed_delta: None,
+        delta_observation_skipped: None,
     }
 }
 
@@ -4829,6 +4839,10 @@ mod tests {
         assert_eq!(result.status, ToolExecutionStatus::Completed);
         assert!(!result.mutation_observed());
         assert!(result.observed_delta.is_none());
+        assert_eq!(
+            result.delta_observation_skipped.as_deref(),
+            Some("snapshot too large")
+        );
         assert!(
             result
                 .summary
@@ -4853,6 +4867,10 @@ mod tests {
         assert_eq!(result.status, ToolExecutionStatus::Completed);
         assert!(!result.mutation_observed());
         assert!(result.observed_delta.is_none());
+        assert_eq!(
+            result.delta_observation_skipped.as_deref(),
+            Some("too many changed paths")
+        );
         assert!(
             result
                 .summary

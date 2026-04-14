@@ -482,6 +482,7 @@ impl SubAgentResult {
             edit_detail: None,
             rolled_back: false,
             observed_delta: None,
+            delta_observation_skipped: None,
         }
     }
 }
@@ -535,6 +536,7 @@ impl SubAgentError {
             edit_detail: None,
             rolled_back: false,
             observed_delta: None,
+            delta_observation_skipped: None,
         }
     }
 }
@@ -1023,6 +1025,7 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
                     edit_detail: None,
                     rolled_back: false,
                     observed_delta: None,
+                    delta_observation_skipped: None,
                 });
 
             // Record tool result in the sub-agent session

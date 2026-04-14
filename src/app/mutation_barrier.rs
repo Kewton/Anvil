@@ -99,6 +99,7 @@ impl MutationBarrier {
                     edit_detail: None,
                     rolled_back: false,
                     observed_delta: None,
+                    delta_observation_skipped: None,
                 };
                 blocked.push((idx, result));
             } else {
