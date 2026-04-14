@@ -13,8 +13,14 @@ use crate::tooling::{
 pub const MUTATION_BARRIER_MAX: u8 = 2;
 
 /// Message returned to the LLM when the barrier blocks a mutation tool.
+///
+/// Issue #391: reiterate the ANVIL_PLAN single-emission constraint to stop
+/// local-model drift where the barrier repeatedly triggers ANVIL_PLAN
+/// restatements instead of the expected file.write / file.edit /
+/// file.edit_anchor / file.rewrite call.
 pub const MUTATION_BARRIER_MESSAGE: &str = "Before modifying files, you must output an ANVIL_PLAN block with your implementation plan. \
      Use the ANVIL_PLAN format (markdown checklist), NOT the agent.plan tool. \
+     Output ANVIL_PLAN exactly once; do not repeat it. After ANVIL_PLAN, your next action must be file.write, file.edit, file.edit_anchor, or file.rewrite. \
      Example:\n\
      ANVIL_PLAN\n\
      - [ ] path/to/file.rs: description of change\n\
