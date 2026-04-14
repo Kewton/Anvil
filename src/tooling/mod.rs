@@ -4739,4 +4739,27 @@ mod tests {
         assert!(!result.mutation_observed());
         assert!(result.observed_delta.is_none());
     }
+
+    #[test]
+    fn shell_exec_observed_delta_ignores_nested_git_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut executor = LocalToolExecutor::new_without_rate_limit(dir.path());
+        let request = shell_exec_request(
+            "mkdir -p app/.git app/src && printf 'ref: refs/heads/main\\n' > app/.git/HEAD && printf 'ok\\n' > app/package.json",
+        );
+
+        let result = executor
+            .execute(request)
+            .expect("shell.exec should succeed");
+
+        assert_eq!(result.status, ToolExecutionStatus::Completed);
+        let changed = result.observed_changed_paths();
+        assert!(changed.contains(&"app/package.json".to_string()));
+        assert!(
+            !changed
+                .iter()
+                .any(|path| path.contains("/.git/") || path.ends_with(".git/HEAD")),
+            "nested git metadata should be ignored by observed workspace delta"
+        );
+    }
 }
