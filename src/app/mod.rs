@@ -11,6 +11,7 @@ mod context;
 pub mod edit_fail_tracker;
 pub mod escalation_barrier;
 pub(crate) mod execution_plan;
+mod llm_transcript;
 pub mod loop_detector;
 pub mod mock;
 pub mod mutation_barrier;
@@ -33,7 +34,7 @@ use std::time::Instant;
 
 use crate::agent::BasicAgentLoop;
 use crate::agent::{AgentEvent, AgentRuntime, PendingTurnState, ProjectLanguage, PromptTier};
-use crate::config::EffectiveConfig;
+use crate::config::{EffectiveConfig, LlmTranscriptMode};
 use crate::contracts::tokens::TokenCalibrationStore;
 use crate::contracts::{
     AppEvent, AppStateSnapshot, ConsoleRenderContext, ContextUsageView, ContextWarningLevel,
@@ -784,6 +785,39 @@ impl App {
 
     pub(crate) fn config(&self) -> &EffectiveConfig {
         &self.config
+    }
+
+    pub(crate) fn llm_transcript_mode(&self) -> LlmTranscriptMode {
+        self.config.mode.llm_transcript
+    }
+
+    pub(crate) fn log_llm_transcript_exchange(
+        &self,
+        exchange_kind: &'static str,
+        request: &crate::provider::ProviderTurnRequest,
+        output_text: &str,
+        agent_events: &[crate::agent::AgentEvent],
+        result: &Result<(), crate::provider::ProviderTurnError>,
+    ) {
+        if self.llm_transcript_mode() == LlmTranscriptMode::Off {
+            return;
+        }
+        if let Err(err) = llm_transcript::append_provider_exchange(
+            &self.config,
+            &self.session,
+            &self.current_session_name,
+            exchange_kind,
+            request,
+            output_text,
+            agent_events,
+            result,
+        ) {
+            tracing::warn!(
+                exchange_kind,
+                error = %err,
+                "failed to write llm transcript"
+            );
+        }
     }
 
     /// Prepare turn context: system prompt generation, pruning pre-check,
@@ -1693,6 +1727,20 @@ impl App {
                 "debug_timing: top_level_stream_finished"
             );
         }
+        let transcript_agent_events: Vec<AgentEvent> = collected_events
+            .iter()
+            .filter_map(|event| match event {
+                ProviderEvent::Agent(agent_event) => Some(agent_event.clone()),
+                ProviderEvent::TokenDelta(_) => None,
+            })
+            .collect();
+        self.log_llm_transcript_exchange(
+            "top_level",
+            &request,
+            &token_buffer,
+            &transcript_agent_events,
+            &stream_result,
+        );
 
         // Phase 2: Process collected events for state management.
         let result = match stream_result {

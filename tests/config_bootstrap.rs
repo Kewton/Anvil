@@ -1353,6 +1353,21 @@ fn mode_config_default_log_format_is_text() {
     assert_eq!(config.mode.log_format, LogFormat::Text);
 }
 
+#[test]
+fn env_override_llm_transcript_mode_is_applied() {
+    use anvil::config::LlmTranscriptMode;
+
+    let mut config = EffectiveConfig::default_for_test().expect("config should load");
+    let mut env_values = HashMap::new();
+    env_values.insert("ANVIL_LLM_TRANSCRIPT".to_string(), "response".to_string());
+
+    config
+        .apply_env_overrides_from_map_for_test(&env_values)
+        .expect("env override should apply");
+
+    assert_eq!(config.mode.llm_transcript, LlmTranscriptMode::Response);
+}
+
 // ---------------------------------------------------------------------------
 // Issue #261 Task 1.1: GuidanceMode config
 // ---------------------------------------------------------------------------

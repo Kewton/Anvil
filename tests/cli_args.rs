@@ -304,6 +304,21 @@ fn apply_cli_args_reasoning_visibility() {
 }
 
 #[test]
+fn apply_cli_args_llm_transcript_mode() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    let args = CliArgs {
+        llm_transcript: Some("full".to_string()),
+        ..CliArgs::default()
+    };
+
+    config.apply_cli_args(&args).unwrap();
+    assert_eq!(
+        config.mode.llm_transcript,
+        anvil::config::LlmTranscriptMode::Full
+    );
+}
+
+#[test]
 fn apply_cli_args_invalid_reasoning_visibility_errors() {
     let mut config = EffectiveConfig::default_for_test().unwrap();
     let args = CliArgs {

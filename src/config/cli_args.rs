@@ -45,6 +45,10 @@ pub struct CliArgs {
     #[arg(long)]
     pub debug: bool,
 
+    /// Emit LLM request/response transcript JSONL (off|prompt|response|full)
+    #[arg(long = "llm-transcript")]
+    pub llm_transcript: Option<String>,
+
     /// Skip tool execution approval
     #[arg(long = "no-approval")]
     pub no_approval: bool,

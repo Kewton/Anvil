@@ -452,6 +452,7 @@ pub struct ModeConfig {
     pub fresh_session: bool,
     pub reasoning_visibility: ReasoningVisibility,
     pub debug_logging: bool,
+    pub llm_transcript: LlmTranscriptMode,
     pub log_filter: Option<String>,
     pub offline: bool,
     /// Trust mode: auto-approve built-in tool execution.
@@ -465,6 +466,53 @@ pub struct ModeConfig {
 pub enum ReasoningVisibility {
     Hidden,
     Summary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmTranscriptMode {
+    #[default]
+    Off,
+    Prompt,
+    Response,
+    Full,
+}
+
+impl LlmTranscriptMode {
+    pub fn includes_prompt(self) -> bool {
+        matches!(self, Self::Prompt | Self::Full)
+    }
+
+    pub fn includes_response(self) -> bool {
+        matches!(self, Self::Response | Self::Full)
+    }
+}
+
+impl std::fmt::Display for LlmTranscriptMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Off => write!(f, "off"),
+            Self::Prompt => write!(f, "prompt"),
+            Self::Response => write!(f, "response"),
+            Self::Full => write!(f, "full"),
+        }
+    }
+}
+
+impl std::str::FromStr for LlmTranscriptMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" => Ok(Self::Off),
+            "prompt" => Ok(Self::Prompt),
+            "response" => Ok(Self::Response),
+            "full" => Ok(Self::Full),
+            other => Err(format!(
+                "invalid llm transcript mode: '{other}' (expected 'off', 'prompt', 'response', or 'full')"
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -547,6 +595,7 @@ pub const ENV_OVERRIDE_WHITELIST: &[&str] = &[
     "ANVIL_FRESH_SESSION",
     "ANVIL_REASONING_VISIBILITY",
     "ANVIL_DEBUG",
+    "ANVIL_LLM_TRANSCRIPT",
     "ANVIL_WEB_SEARCH_PROVIDER",
     "SERPER_API_KEY",
     "ANVIL_LOG",
@@ -710,6 +759,7 @@ impl EffectiveConfig {
                 fresh_session: false,
                 reasoning_visibility: ReasoningVisibility::Summary,
                 debug_logging: false,
+                llm_transcript: LlmTranscriptMode::Off,
                 log_filter: None,
                 offline: false,
                 trust_all: false,
@@ -866,6 +916,9 @@ impl EffectiveConfig {
         }
         if cli.debug {
             self.mode.debug_logging = true;
+        }
+        if let Some(ref v) = cli.llm_transcript {
+            self.mode.llm_transcript = parse_llm_transcript_mode(v)?;
         }
         if cli.no_approval {
             self.mode.approval_required = false;
@@ -1039,6 +1092,9 @@ impl EffectiveConfig {
                 }
                 "debug" | "ANVIL_DEBUG" => {
                     self.mode.debug_logging = parse_bool(value);
+                }
+                "llm_transcript" | "ANVIL_LLM_TRANSCRIPT" => {
+                    self.mode.llm_transcript = parse_llm_transcript_mode(value)?;
                 }
                 "reasoning_visibility" | "ANVIL_REASONING_VISIBILITY" => {
                     self.mode.reasoning_visibility = parse_reasoning_visibility(value)?;
@@ -1915,6 +1971,12 @@ fn parse_log_format(value: &str) -> Result<crate::logging::LogFormat, ConfigErro
             "invalid log format: '{other}' (expected 'text' or 'json')"
         ))),
     }
+}
+
+fn parse_llm_transcript_mode(value: &str) -> Result<LlmTranscriptMode, ConfigError> {
+    value
+        .parse()
+        .map_err(|msg: String| ConfigError::ValidationError(msg))
 }
 
 fn parse_reasoning_visibility(value: &str) -> Result<ReasoningVisibility, ConfigError> {

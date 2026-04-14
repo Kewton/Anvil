@@ -5,7 +5,7 @@
 //! maintainability — the same pattern used by `mock.rs`.
 
 use crate::agent::subagent::{SubAgentError, SubAgentKind, SubAgentOverrides, SubAgentSession};
-use crate::agent::{BasicAgentLoop, StructuredAssistantResponse};
+use crate::agent::{AgentEvent, BasicAgentLoop, StructuredAssistantResponse};
 use crate::contracts::{AppStateSnapshot, RuntimeState, ToolLogView};
 use crate::provider::{ProviderClient, ProviderEvent};
 use crate::session::{MessageRole, SessionMessage};
@@ -1829,6 +1829,7 @@ impl App {
             let turn_tool_count = results.len() + agent_results.len();
 
             let mut next_token_buffer = String::new();
+            let mut transcript_agent_events: Vec<AgentEvent> = Vec::new();
             let mut first_token = true;
             let mut spinner_opt = Some(spinner);
             let stream_started = std::time::Instant::now();
@@ -1864,6 +1865,8 @@ impl App {
                     }
                     write_stderr(delta);
                     flush_stderr();
+                } else if let ProviderEvent::Agent(agent_event) = &event {
+                    transcript_agent_events.push(agent_event.clone());
                 }
             });
 
@@ -1880,6 +1883,13 @@ impl App {
                     "debug_timing: agentic_followup_stream_finished"
                 );
             }
+            self.log_llm_transcript_exchange(
+                "agentic_followup",
+                &request,
+                &next_token_buffer,
+                &transcript_agent_events,
+                &stream_result,
+            );
 
             match stream_result {
                 Err(crate::provider::ProviderTurnError::Cancelled)
@@ -3863,6 +3873,7 @@ impl App {
         );
 
         let mut token_buffer = String::new();
+        let mut transcript_agent_events: Vec<AgentEvent> = Vec::new();
         let mut first_token = true;
         let mut spinner_opt = Some(spinner);
         let stream_started = std::time::Instant::now();
@@ -3898,6 +3909,8 @@ impl App {
                 }
                 write_stderr(delta);
                 flush_stderr();
+            } else if let ProviderEvent::Agent(agent_event) = &event {
+                transcript_agent_events.push(agent_event.clone());
             }
         });
 
@@ -3914,6 +3927,13 @@ impl App {
                 "debug_timing: guarded_retry_stream_finished"
             );
         }
+        self.log_llm_transcript_exchange(
+            "guarded_retry",
+            &request,
+            &token_buffer,
+            &transcript_agent_events,
+            &stream_result,
+        );
 
         match stream_result {
             Err(crate::provider::ProviderTurnError::Cancelled) if self.is_shutdown_requested() => {
