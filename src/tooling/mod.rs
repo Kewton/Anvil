@@ -1099,6 +1099,8 @@ impl ToolExecutionResult {
 }
 
 const SHELL_DELTA_SKIP_DIRS: &[&str] = &[".git", ".anvil", "node_modules", ".next", "target"];
+const SHELL_DELTA_MAX_SNAPSHOT_FILES: usize = 4_000;
+const SHELL_DELTA_MAX_CHANGED_PATHS: usize = 512;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WorkspaceSnapshotEntry {
@@ -2540,7 +2542,7 @@ impl LocalToolExecutor {
 
     fn snapshot_workspace(
         &self,
-    ) -> Result<HashMap<String, WorkspaceSnapshotEntry>, ToolRuntimeError> {
+    ) -> Result<Option<HashMap<String, WorkspaceSnapshotEntry>>, ToolRuntimeError> {
         let mut snapshot = HashMap::new();
         let walker = ignore::WalkBuilder::new(&self.root)
             .hidden(false)
@@ -2577,6 +2579,14 @@ impl LocalToolExecutor {
                     path.display()
                 ))
             })?;
+            if snapshot.len() >= SHELL_DELTA_MAX_SNAPSHOT_FILES {
+                tracing::warn!(
+                    file_limit = SHELL_DELTA_MAX_SNAPSHOT_FILES,
+                    root = %self.root.display(),
+                    "shell.exec workspace delta observation skipped: snapshot too large"
+                );
+                return Ok(None);
+            }
             let modified = metadata
                 .modified()
                 .ok()
@@ -2592,14 +2602,16 @@ impl LocalToolExecutor {
             );
         }
 
-        Ok(snapshot)
+        Ok(Some(snapshot))
     }
 
     fn observe_shell_workspace_delta(
         &self,
         before: &HashMap<String, WorkspaceSnapshotEntry>,
-    ) -> Result<ObservedWorkspaceDelta, ToolRuntimeError> {
-        let after = self.snapshot_workspace()?;
+    ) -> Result<Option<ObservedWorkspaceDelta>, ToolRuntimeError> {
+        let Some(after) = self.snapshot_workspace()? else {
+            return Ok(None);
+        };
         let mut delta = ObservedWorkspaceDelta::default();
 
         for (path, before_entry) in before {
@@ -2621,7 +2633,15 @@ impl LocalToolExecutor {
         delta.created_paths.sort();
         delta.modified_paths.sort();
         delta.deleted_paths.sort();
-        Ok(delta)
+        if delta.changed_paths().len() > SHELL_DELTA_MAX_CHANGED_PATHS {
+            tracing::warn!(
+                changed_path_limit = SHELL_DELTA_MAX_CHANGED_PATHS,
+                root = %self.root.display(),
+                "shell.exec workspace delta observation skipped: too many changed paths"
+            );
+            return Ok(None);
+        }
+        Ok(Some(delta))
     }
 
     fn execute_shell_exec(
@@ -2634,7 +2654,7 @@ impl LocalToolExecutor {
 
         let observe_delta = Self::should_observe_shell_workspace_delta(command);
         let before_snapshot = if observe_delta {
-            Some(self.snapshot_workspace()?)
+            self.snapshot_workspace()?
         } else {
             None
         };
@@ -2727,6 +2747,7 @@ impl LocalToolExecutor {
                 .as_ref()
                 .map(|before| self.observe_shell_workspace_delta(before))
                 .transpose()?
+                .flatten()
                 .filter(|delta| !delta.is_empty())
         } else {
             None
@@ -4760,6 +4781,50 @@ mod tests {
                 .iter()
                 .any(|path| path.contains("/.git/") || path.ends_with(".git/HEAD")),
             "nested git metadata should be ignored by observed workspace delta"
+        );
+    }
+
+    #[test]
+    fn shell_exec_observed_delta_skips_when_snapshot_is_too_large() {
+        let dir = tempfile::tempdir().unwrap();
+        for idx in 0..=SHELL_DELTA_MAX_SNAPSHOT_FILES {
+            fs::write(dir.path().join(format!("seed-{idx}.txt")), "seed\n").unwrap();
+        }
+
+        let mut executor = LocalToolExecutor::new_without_rate_limit(dir.path());
+        let request = shell_exec_request("printf 'ok\\n' > app-package.json");
+
+        let result = executor
+            .execute(request)
+            .expect("shell.exec should still succeed when delta observation is skipped");
+
+        assert_eq!(result.status, ToolExecutionStatus::Completed);
+        assert!(!result.mutation_observed());
+        assert!(result.observed_delta.is_none());
+        assert!(dir.path().join("app-package.json").exists());
+    }
+
+    #[test]
+    fn shell_exec_observed_delta_skips_when_changed_paths_are_too_large() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut executor = LocalToolExecutor::new_without_rate_limit(dir.path());
+        let request = shell_exec_request(&format!(
+            "mkdir -p bulk && i=0; while [ $i -le {limit} ]; do printf 'x\\n' > bulk/file-$i.txt; i=$((i+1)); done",
+            limit = SHELL_DELTA_MAX_CHANGED_PATHS
+        ));
+
+        let result = executor
+            .execute(request)
+            .expect("shell.exec should still succeed when changed paths exceed the cap");
+
+        assert_eq!(result.status, ToolExecutionStatus::Completed);
+        assert!(!result.mutation_observed());
+        assert!(result.observed_delta.is_none());
+        assert!(dir.path().join("bulk/file-0.txt").exists());
+        assert!(
+            dir.path()
+                .join(format!("bulk/file-{}.txt", SHELL_DELTA_MAX_CHANGED_PATHS))
+                .exists()
         );
     }
 }
