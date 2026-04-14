@@ -79,7 +79,14 @@ impl App {
     /// - `Registered`: a new plan was created (plan was empty).
     /// - `Replan`: follow-up `ANVIL_PLAN` on an active plan was treated as update (Issue #305).
     /// - `NoBlock`: no `ANVIL_PLAN` block found, or replan had no effect.
-    pub(crate) fn try_register_plan(&mut self, content: &str) -> PlanRegistrationResult {
+    ///
+    /// Issue #380: `strict_closure_gate` forwards the Issue #327 closure
+    /// semantics (reject unchecked expansion) through the replan path.
+    pub(crate) fn try_register_plan(
+        &mut self,
+        content: &str,
+        strict_closure_gate: bool,
+    ) -> PlanRegistrationResult {
         if let Some(block) = extract_plan_block(content) {
             let items = parse_plan_items(&block);
             if items.is_empty() {
@@ -108,7 +115,7 @@ impl App {
                 "follow-up ANVIL_PLAN on active plan; treating as replan (Issue #305)"
             );
             self.agent_telemetry.record_anvil_plan_visible();
-            let changed = self.apply_replan_items(&block, items);
+            let changed = self.apply_replan_items(&block, items, strict_closure_gate);
             if changed {
                 return PlanRegistrationResult::Replan;
             }
@@ -122,7 +129,17 @@ impl App {
     ///
     /// Executes: checked-first retire → supersede stale → dedup → append.
     /// Returns `true` if any meaningful change occurred (retire, supersede, or append).
-    fn apply_plan_update_pipeline(&mut self, block: &str, all_items: Vec<PlanItem>) -> bool {
+    ///
+    /// Issue #380: the strict closure gate (Issue #327 — reject unchecked
+    /// expansion, record repair-turn telemetry) is passed in explicitly.
+    /// Callers translate the current [`crate::app::AgenticMode`] into this
+    /// bool (the old `repair_closure_active` boolean field has been removed).
+    fn apply_plan_update_pipeline(
+        &mut self,
+        block: &str,
+        all_items: Vec<PlanItem>,
+        strict_closure_gate: bool,
+    ) -> bool {
         // --- checked-first retire (Issue #301 + Issue #315) ---
         let checked_indices = detect_checked_lines(block);
         let mut had_retire = false;
@@ -161,7 +178,7 @@ impl App {
             }
         }
         // Issue #327: record retired item count during repair closure mode.
-        if self.repair_closure_active && retire_count > 0 {
+        if strict_closure_gate && retire_count > 0 {
             self.agent_telemetry
                 .record_repair_turn_items_retired(retire_count);
         }
@@ -178,7 +195,7 @@ impl App {
         // Issue #327: During repair closure mode, reject unchecked items instead
         // of appending them. The repair turn is for closing remaining work, not
         // expanding it.
-        if self.repair_closure_active {
+        if strict_closure_gate {
             let rejected = new_items.len() as u32;
             self.agent_telemetry
                 .record_repair_turn_items_rejected(rejected);
@@ -288,8 +305,15 @@ impl App {
 
     /// Apply replan items from a follow-up ANVIL_PLAN on an active plan (Issue #305).
     /// Delegates to shared pipeline. Returns whether any meaningful change occurred.
-    fn apply_replan_items(&mut self, block: &str, all_items: Vec<PlanItem>) -> bool {
-        self.apply_plan_update_pipeline(block, all_items)
+    ///
+    /// Issue #380: forwards the strict closure gate to the pipeline.
+    fn apply_replan_items(
+        &mut self,
+        block: &str,
+        all_items: Vec<PlanItem>,
+        strict_closure_gate: bool,
+    ) -> bool {
+        self.apply_plan_update_pipeline(block, all_items, strict_closure_gate)
     }
 
     /// Internal helper: register a plan from pre-parsed items (Issue #303).
@@ -323,7 +347,10 @@ impl App {
     /// Issue #305: refactored to use `apply_plan_update_pipeline()` shared helper.
     ///
     /// Returns `true` if the plan was updated.
-    pub(crate) fn try_update_plan(&mut self, content: &str) -> bool {
+    ///
+    /// Issue #380: `strict_closure_gate` forwards the Issue #327 closure
+    /// semantics (reject unchecked expansion) through the plan-update pipeline.
+    pub(crate) fn try_update_plan(&mut self, content: &str, strict_closure_gate: bool) -> bool {
         if let Some(block) = extract_plan_update_block(content) {
             let all_items = parse_plan_items(&block);
             if all_items.is_empty() {
@@ -336,7 +363,7 @@ impl App {
                 return true;
             }
 
-            return self.apply_plan_update_pipeline(&block, all_items);
+            return self.apply_plan_update_pipeline(&block, all_items, strict_closure_gate);
         }
         false
     }
@@ -737,13 +764,13 @@ mod tests {
         // Initial registration
         let content1 =
             "```ANVIL_PLAN\n- [ ] src/a.rs: implement feature\n- [ ] src/b.rs: add tests\n```";
-        let result1 = app.try_register_plan(content1);
+        let result1 = app.try_register_plan(content1, false);
         assert_eq!(result1, PlanRegistrationResult::Registered);
         assert_eq!(app.execution_plan.items.len(), 2);
 
         // Follow-up ANVIL_PLAN on active plan → should be treated as replan
         let content2 = "```ANVIL_PLAN\n- [ ] src/c.rs: new task\n```";
-        let result2 = app.try_register_plan(content2);
+        let result2 = app.try_register_plan(content2, false);
         assert_eq!(result2, PlanRegistrationResult::Replan);
         // New item should be appended
         assert_eq!(app.execution_plan.items.len(), 3);
@@ -753,14 +780,14 @@ mod tests {
     fn replan_telemetry_update_count_increases() {
         let mut app = build_test_app();
         let content1 = "```ANVIL_PLAN\n- [ ] src/a.rs: task\n```";
-        app.try_register_plan(content1);
+        app.try_register_plan(content1, false);
         assert_eq!(app.agent_telemetry.plan_registration_count, 1);
         assert_eq!(app.agent_telemetry.plan_update_count, 0);
         assert_eq!(app.agent_telemetry.anvil_plan_visible_count, 1);
 
         // Replan
         let content2 = "```ANVIL_PLAN\n- [ ] src/b.rs: new task\n```";
-        app.try_register_plan(content2);
+        app.try_register_plan(content2, false);
         // registration_count should NOT increase
         assert_eq!(app.agent_telemetry.plan_registration_count, 1);
         // update_count SHOULD increase
@@ -773,11 +800,11 @@ mod tests {
     fn replan_supersede_stale_items() {
         let mut app = build_test_app();
         let content1 = "```ANVIL_PLAN\n- [ ] src/a.rs: old task\n```";
-        app.try_register_plan(content1);
+        app.try_register_plan(content1, false);
 
         // Replan with same file but different description → supersede
         let content2 = "```ANVIL_PLAN\n- [ ] src/a.rs: new approach\n```";
-        let result = app.try_register_plan(content2);
+        let result = app.try_register_plan(content2, false);
         assert_eq!(result, PlanRegistrationResult::Replan);
         // Old item should be superseded, new one appended
         assert!(
@@ -792,7 +819,7 @@ mod tests {
     fn replan_dedup_existing_items() {
         let mut app = build_test_app();
         let content1 = "```ANVIL_PLAN\n- [ ] src/a.rs: task\n```";
-        app.try_register_plan(content1);
+        app.try_register_plan(content1, false);
         // Simulate a mutation so the item won't be superseded
         app.execution_plan.items[0]
             .mutated_files
@@ -800,7 +827,7 @@ mod tests {
 
         // Replan with exact same item → should be deduped (target match)
         let content2 = "```ANVIL_PLAN\n- [ ] src/a.rs: task\n```";
-        let result = app.try_register_plan(content2);
+        let result = app.try_register_plan(content2, false);
         // All items deduped, no supersede → NoBlock
         assert_eq!(result, PlanRegistrationResult::NoBlock);
         // Item count unchanged
@@ -811,13 +838,13 @@ mod tests {
     fn replan_done_items_not_appended() {
         let mut app = build_test_app();
         let content1 = "```ANVIL_PLAN\n- [ ] src/a.rs: task\n- [ ] src/b.rs: task2\n```";
-        app.try_register_plan(content1);
+        app.try_register_plan(content1, false);
         // Mark first item as done
         app.execution_plan.mark_done(0);
 
         // Replan includes only a new item + the done item description
         let content2 = "```ANVIL_PLAN\n- [ ] src/a.rs: task\n- [ ] src/c.rs: new task\n```";
-        let result = app.try_register_plan(content2);
+        let result = app.try_register_plan(content2, false);
         assert_eq!(result, PlanRegistrationResult::Replan);
         // src/c.rs should be added, src/a.rs should be deduped (already done)
         let new_items: Vec<_> = app
@@ -833,11 +860,11 @@ mod tests {
     fn replan_checked_first_retire() {
         let mut app = build_test_app();
         let content1 = "```ANVIL_PLAN\n- [ ] src/a.rs: task\n- [ ] src/b.rs: task2\n```";
-        app.try_register_plan(content1);
+        app.try_register_plan(content1, false);
 
         // Replan with [x] checked items → should retire
         let content2 = "```ANVIL_PLAN\n- [x] src/a.rs: task\n- [ ] src/c.rs: new task\n```";
-        let result = app.try_register_plan(content2);
+        let result = app.try_register_plan(content2, false);
         assert_eq!(result, PlanRegistrationResult::Replan);
         // src/a.rs item should be AlreadySatisfied
         let a_item = app
@@ -856,12 +883,12 @@ mod tests {
     fn replan_subset_items() {
         let mut app = build_test_app();
         let content1 = "```ANVIL_PLAN\n- [ ] src/a.rs: task\n- [ ] src/b.rs: task2\n- [ ] src/c.rs: task3\n```";
-        app.try_register_plan(content1);
+        app.try_register_plan(content1, false);
         assert_eq!(app.execution_plan.items.len(), 3);
 
         // Replan with only a subset of new items
         let content2 = "```ANVIL_PLAN\n- [ ] src/d.rs: new task\n```";
-        let result = app.try_register_plan(content2);
+        let result = app.try_register_plan(content2, false);
         assert_eq!(result, PlanRegistrationResult::Replan);
         assert_eq!(app.execution_plan.items.len(), 4);
     }
@@ -870,7 +897,7 @@ mod tests {
     fn replan_no_effect_returns_noblock() {
         let mut app = build_test_app();
         let content1 = "```ANVIL_PLAN\n- [ ] src/a.rs: task\n```";
-        app.try_register_plan(content1);
+        app.try_register_plan(content1, false);
         // Simulate a mutation so the item won't be superseded by replan
         app.execution_plan.items[0]
             .mutated_files
@@ -878,7 +905,7 @@ mod tests {
 
         // Replan with same item (deduped, not superseded) → no effect
         let content2 = "```ANVIL_PLAN\n- [ ] src/a.rs: task\n```";
-        let result = app.try_register_plan(content2);
+        let result = app.try_register_plan(content2, false);
         assert_eq!(result, PlanRegistrationResult::NoBlock);
     }
 
@@ -886,7 +913,7 @@ mod tests {
     fn first_registration_unchanged() {
         let mut app = build_test_app();
         let content = "```ANVIL_PLAN\n- [ ] src/a.rs: implement feature\n```";
-        let result = app.try_register_plan(content);
+        let result = app.try_register_plan(content, false);
         assert_eq!(result, PlanRegistrationResult::Registered);
         assert_eq!(app.execution_plan.items.len(), 1);
         assert_eq!(app.agent_telemetry.plan_registration_count, 1);
@@ -898,11 +925,11 @@ mod tests {
         let mut app = build_test_app();
         // Register initial plan
         let content1 = "```ANVIL_PLAN\n- [ ] src/a.rs: task\n```";
-        app.try_register_plan(content1);
+        app.try_register_plan(content1, false);
 
         // Update via ANVIL_PLAN_UPDATE (not ANVIL_PLAN)
         let content2 = "```ANVIL_PLAN_UPDATE\n- [ ] src/b.rs: new task\n```";
-        let updated = app.try_update_plan(content2);
+        let updated = app.try_update_plan(content2, false);
         assert!(updated);
         assert_eq!(app.execution_plan.items.len(), 2);
         assert_eq!(app.agent_telemetry.plan_update_count, 1);
@@ -917,14 +944,14 @@ mod tests {
     fn late_stage_closure_rejects_same_target_replan() {
         let mut app = build_test_app();
         let content1 = "```ANVIL_PLAN\n- [ ] src/a.rs: item A\n- [ ] src/b.rs: item B\n```";
-        app.try_register_plan(content1);
+        app.try_register_plan(content1, false);
         // Simulate item A completed via mutation.
         app.execution_plan.mark_done(0);
         assert_eq!(app.execution_plan.finished_count(), 1);
 
         // Follow-up restating item B's file with a "refined" description.
         let update = "```ANVIL_PLAN_UPDATE\n- [ ] src/b.rs: refined item B\n```";
-        let updated = app.try_update_plan(update);
+        let updated = app.try_update_plan(update, false);
 
         // No new item appended, existing item B stays actionable.
         assert_eq!(
@@ -952,11 +979,11 @@ mod tests {
     fn late_stage_closure_allows_different_target_replan() {
         let mut app = build_test_app();
         let content1 = "```ANVIL_PLAN\n- [ ] src/a.rs: A\n- [ ] src/b.rs: B\n```";
-        app.try_register_plan(content1);
+        app.try_register_plan(content1, false);
         app.execution_plan.mark_done(0);
 
         let update = "```ANVIL_PLAN_UPDATE\n- [ ] src/c.rs: genuinely new task\n```";
-        let updated = app.try_update_plan(update);
+        let updated = app.try_update_plan(update, false);
 
         assert!(updated);
         assert_eq!(app.execution_plan.items.len(), 3);
@@ -970,12 +997,12 @@ mod tests {
         let mut app = build_test_app();
         let content1 =
             "```ANVIL_PLAN\n- [ ] src/a.rs: A\n- [ ] src/b.rs: B\n- [ ] src/c.rs: C\n```";
-        app.try_register_plan(content1);
+        app.try_register_plan(content1, false);
         app.execution_plan.mark_done(0);
         // remaining == 2 → closure guard inactive.
 
         let update = "```ANVIL_PLAN_UPDATE\n- [ ] src/b.rs: refined B\n```";
-        let updated = app.try_update_plan(update);
+        let updated = app.try_update_plan(update, false);
 
         assert!(updated);
         assert_eq!(app.agent_telemetry.late_stage_closure_items_rejected, 0);
@@ -988,7 +1015,7 @@ mod tests {
     fn late_stage_closure_reconciles_touched_files_first() {
         let mut app = build_test_app();
         let content1 = "```ANVIL_PLAN\n- [ ] src/a.rs: A\n- [ ] src/b.rs: B\n```";
-        app.try_register_plan(content1);
+        app.try_register_plan(content1, false);
         app.execution_plan.mark_done(0);
         // External evidence: src/b.rs was already touched.
         app.session
@@ -997,7 +1024,7 @@ mod tests {
             .push("src/b.rs".into());
 
         let update = "```ANVIL_PLAN_UPDATE\n- [ ] src/b.rs: refined B\n```";
-        let _ = app.try_update_plan(update);
+        let _ = app.try_update_plan(update, false);
 
         assert!(
             app.execution_plan.all_finished(),
@@ -1013,12 +1040,12 @@ mod tests {
     fn late_stage_closure_partial_overlap_rejects_only_overlapping() {
         let mut app = build_test_app();
         let content1 = "```ANVIL_PLAN\n- [ ] src/a.rs: A\n- [ ] src/b.rs: B\n```";
-        app.try_register_plan(content1);
+        app.try_register_plan(content1, false);
         app.execution_plan.mark_done(0);
 
         let update =
             "```ANVIL_PLAN_UPDATE\n- [ ] src/b.rs: refined B\n- [ ] src/d.rs: new work\n```";
-        let updated = app.try_update_plan(update);
+        let updated = app.try_update_plan(update, false);
 
         assert!(updated);
         // Original B stays, d.rs appended, refined B rejected.

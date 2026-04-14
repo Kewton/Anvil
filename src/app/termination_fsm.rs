@@ -283,8 +283,9 @@ pub fn decide_no_tool_call(input: NoToolCallInput) -> NoToolCallDecision {
 /// and consumed only within that method (or within
 /// `handle_done_path_anvil_final_guard`, where a fresh instance is created
 /// each call).  App-level session state (`forced_mode_active`,
-/// `repair_closure_active`, `proactive_delegation_pending`) is intentionally
-/// excluded — see Issue #385 scope boundary.
+/// `proactive_delegation_pending`, plus the `AgenticMode` variable local to
+/// `complete_structured_response` that replaced `repair_closure_active` in
+/// Issue #380) is intentionally excluded — see Issue #385 scope boundary.
 #[derive(Debug)]
 pub(crate) struct TerminationLoopState {
     anvil_final_seen: bool,

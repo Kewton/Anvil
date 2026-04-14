@@ -34,6 +34,91 @@ use super::termination_fsm::{
 use super::write_repeat_tracker::WriteRepeatAction;
 use super::{App, AppError, CompactInfo, format_tool_counts};
 
+/// Explicit phase of the agentic loop within a single
+/// [`App::complete_structured_response`] call (Issue #380).
+///
+/// Orthogonal to [`crate::contracts::RuntimeState`] (App lifecycle) and
+/// [`crate::app::termination_fsm::TerminationLoopState`] (exit decision).
+/// Lives entirely within `complete_structured_response`: initialized to
+/// [`AgenticMode::Plan`] at the start of each user turn and discarded when the
+/// function returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgenticMode {
+    /// Runtime is awaiting or parsing an `ANVIL_PLAN` block.
+    Plan,
+    /// Runtime is executing plan items via tool calls.
+    Act,
+    /// Runtime is attempting to recover from stagnation or failure.
+    Repair(RepairReason),
+}
+
+/// Reason for entering [`AgenticMode::Repair`] (Issue #380).
+///
+/// Determines which recovery semantics apply. Only
+/// [`RepairReason::PreExit`] activates the strict
+/// `apply_plan_update_pipeline` gate (unchecked-item rejection,
+/// Issue #327).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepairReason {
+    /// Pre-exit repair heuristic fired (`should_allow_escape_hatch`).
+    /// Only this variant activates the strict `apply_plan_update_pipeline`
+    /// gate (unchecked-item rejection, Issue #327).
+    PreExit,
+    /// `edit_fail_tracker` consecutive-failure threshold exceeded
+    /// (FixSliceEscalation was emitted by [`determine_fallback_action`]).
+    EditFailRecovery,
+    /// Stagnation score OR read-heavy drift threshold exceeded.
+    StagnationRecovery,
+}
+
+impl RepairReason {
+    /// Determine whether a Repair→Act recovery signal has fired for this
+    /// reason (Issue #380).
+    ///
+    /// - [`RepairReason::PreExit`] recovers when `worker_observed` is true
+    ///   (fix_slice worker finished successfully OR a plan re-issue occurred).
+    /// - [`RepairReason::EditFailRecovery`] recovers when the edit fail
+    ///   tracker has fallen below the escalation threshold (caller passes
+    ///   `edit_fail_resolved`).
+    /// - [`RepairReason::StagnationRecovery`] recovers when the stagnation
+    ///   score drops (`stagnation_resolved`) or a worker mutation is
+    ///   observed.
+    pub fn is_recovery_signal(
+        &self,
+        worker_observed: bool,
+        edit_fail_resolved: bool,
+        stagnation_resolved: bool,
+    ) -> bool {
+        match self {
+            RepairReason::PreExit => worker_observed,
+            RepairReason::EditFailRecovery => edit_fail_resolved,
+            RepairReason::StagnationRecovery => stagnation_resolved || worker_observed,
+        }
+    }
+}
+
+/// Per-turn count of iterations spent in each [`AgenticMode`] (Issue #380).
+///
+/// Used to populate the `agentic_mode_turns_in_*` fields of
+/// [`crate::contracts::AgentTelemetry`] at the end of
+/// `complete_structured_response`.
+#[derive(Debug, Default)]
+struct ModeTurnCounts {
+    plan: u32,
+    act: u32,
+    repair: u32,
+}
+
+impl ModeTurnCounts {
+    fn increment(&mut self, mode: &AgenticMode) {
+        match mode {
+            AgenticMode::Plan => self.plan += 1,
+            AgenticMode::Act => self.act += 1,
+            AgenticMode::Repair(_) => self.repair += 1,
+        }
+    }
+}
+
 /// Turn summary information for structured logging (Issue #206).
 #[derive(Debug)]
 pub struct TurnSummary<'a> {
@@ -51,6 +136,8 @@ pub struct TurnSummary<'a> {
     pub mutations_this_turn: Option<u32>,
     /// Items advanced this turn.
     pub items_advanced_this_turn: Option<u32>,
+    /// Current agentic mode (Plan / Act / Repair) for this turn (Issue #380).
+    pub agentic_mode: Option<AgenticMode>,
 }
 
 /// Log a turn summary using structured tracing.
@@ -79,6 +166,11 @@ pub fn log_turn_summary(summary: &TurnSummary<'_>) {
         },
     };
     let tool_summary = summarize_tool_names(summary.tool_names);
+    let agentic_mode_str = summary
+        .agentic_mode
+        .as_ref()
+        .map(|m| format!("{:?}", m))
+        .unwrap_or_else(|| "none".to_string());
     tracing::info!(
         turn = summary.turn,
         max_turns = summary.max_turns,
@@ -90,6 +182,7 @@ pub fn log_turn_summary(summary: &TurnSummary<'_>) {
         files_modified = summary.files_modified,
         compact = %compact_str,
         phase = %summary.phase,
+        agentic_mode = %agentic_mode_str,
         "turn completed"
     );
 }
@@ -1179,7 +1272,11 @@ impl App {
         // Issue #249: Detect ANVIL_PLAN from initial response
         // Issue #287: re-initialize stagnation_state on plan registration
         // Issue #305: match on PlanRegistrationResult
-        match self.try_register_plan(&current.raw_content) {
+        // Issue #380: initial plan registration at turn start runs with the
+        // strict closure gate disabled (a new turn always begins in Plan /
+        // Act mode; the Repair(PreExit) variant is entered mid-turn by the
+        // pre-exit repair heuristic).
+        match self.try_register_plan(&current.raw_content, false) {
             crate::app::execution_plan::PlanRegistrationResult::Registered => {
                 let target_files: Vec<String> = self
                     .execution_plan
@@ -1231,10 +1328,26 @@ impl App {
         // gate in all subsequent iterations of the same turn.
         let mut turn_has_subagent = false;
 
+        // Issue #380: explicit agentic mode tracked across iterations.
+        // Start in Plan; transitions to Act when ANVIL_PLAN parses successfully.
+        let mut current_mode = AgenticMode::Plan;
+        let mut mode_turn_counts = ModeTurnCounts::default();
+
+        // Issue #380: if an initial ANVIL_PLAN block was already parsed above
+        // (try_register_plan → Registered / Replan), we are already in Act at
+        // the start of iteration 0.
+        if !self.execution_plan.is_empty() && matches!(current_mode, AgenticMode::Plan) {
+            current_mode = AgenticMode::Act;
+            self.agent_telemetry.agentic_mode_plan_to_act_count += 1;
+        }
+
         for iteration in 0..max_iterations {
             let iteration_started = std::time::Instant::now();
 
             // (prev_forced_mode_active is snapshotted from the previous iteration)
+
+            // Issue #380: count this iteration toward the current mode.
+            mode_turn_counts.increment(&current_mode);
 
             // Check shutdown flag before tool execution
             if self.is_shutdown_requested() {
@@ -1290,6 +1403,11 @@ impl App {
             // Skip intermediate Thinking frames — the user already sees
             // live streaming output on stderr (Issue #1).
 
+            // Issue #380: snapshot fixslice_escalation_count before tool
+            // execution so we can detect a FixSliceEscalation fired via
+            // `determine_fallback_action` inside `record_tool_result`.
+            let fixslice_escalation_before = self.agent_telemetry.fixslice_escalation_count;
+
             // Execute normal tool calls and record results WITH payload
             let (results, loop_action, recovery_read_count) = self.execute_structured_tool_calls(
                 &current_normal,
@@ -1297,6 +1415,16 @@ impl App {
                 &mut escalation_barrier,
             )?;
             total_tool_count += results.len();
+
+            // Issue #380: Act → Repair(EditFailRecovery) transition. If a
+            // FixSliceEscalation fired during this turn's tool execution, we
+            // are now in edit-fail recovery.
+            if self.agent_telemetry.fixslice_escalation_count > fixslice_escalation_before
+                && matches!(current_mode, AgenticMode::Act | AgenticMode::Plan)
+            {
+                current_mode = AgenticMode::Repair(RepairReason::EditFailRecovery);
+                self.agent_telemetry.agentic_mode_act_to_repair_count += 1;
+            }
 
             // Update plan item status from tool results; capture telemetry.
             let (mut turn_mutations, turn_items_advanced) = self.update_plan_from_results(&results);
@@ -1713,6 +1841,12 @@ impl App {
                 let msg = SessionMessage::new(MessageRole::Tool, "system", hint)
                     .with_id(self.next_message_id("tool"));
                 self.session.push_message(msg);
+
+                // Issue #380: Act → Repair(StagnationRecovery) transition.
+                if matches!(current_mode, AgenticMode::Act | AgenticMode::Plan) {
+                    current_mode = AgenticMode::Repair(RepairReason::StagnationRecovery);
+                    self.agent_telemetry.agentic_mode_act_to_repair_count += 1;
+                }
             }
 
             // Issue #334: read-heavy drift escalation.
@@ -1754,6 +1888,13 @@ impl App {
                 let msg = SessionMessage::new(MessageRole::Tool, "system", hint)
                     .with_id(self.next_message_id("tool"));
                 self.session.push_message(msg);
+
+                // Issue #380: Act → Repair(StagnationRecovery) transition
+                // (read-heavy drift).
+                if matches!(current_mode, AgenticMode::Act | AgenticMode::Plan) {
+                    current_mode = AgenticMode::Repair(RepairReason::StagnationRecovery);
+                    self.agent_telemetry.agentic_mode_act_to_repair_count += 1;
+                }
             }
 
             // Issue #285: staged stagnation recovery.
@@ -1775,7 +1916,10 @@ impl App {
             // Scan the raw token buffer since ANVIL_PLAN may be outside the ANVIL_FINAL block.
             // Issue #287: re-initialize stagnation_state on plan registration
             // Issue #305: match on PlanRegistrationResult for replan support
-            match self.try_register_plan(&next_token_buffer) {
+            // Issue #380: derive the strict closure gate from AgenticMode.
+            let strict_closure_gate =
+                matches!(current_mode, AgenticMode::Repair(RepairReason::PreExit));
+            match self.try_register_plan(&next_token_buffer, strict_closure_gate) {
                 crate::app::execution_plan::PlanRegistrationResult::Registered => {
                     // Issue #349: a newly registered plan is a fresh course
                     // of action — clear any accumulated closure-loop state.
@@ -1826,7 +1970,7 @@ impl App {
                     // ANVIL_PLAN なし → ANVIL_PLAN_UPDATE を通常処理
                     // DR2-005: Replan 時はスキップして二重処理を防ぐ
                     // Issue #287: merge new target_files into starved_target_files on plan update
-                    if self.try_update_plan(&next_token_buffer) {
+                    if self.try_update_plan(&next_token_buffer, strict_closure_gate) {
                         let existing = &self.stagnation_state.starved_target_files;
                         // CB-003: only include unfinished items to avoid re-adding completed files
                         let new_targets: Vec<String> = self
@@ -1846,6 +1990,15 @@ impl App {
                             .extend(new_targets);
                     }
                 }
+            }
+
+            // Issue #380: Plan→Act transition on successful plan registration /
+            // update. An execution plan now exists, so the agent has left the
+            // planning phase and is in the Act phase until escalation or
+            // completion.
+            if matches!(current_mode, AgenticMode::Plan) && !self.execution_plan.is_empty() {
+                current_mode = AgenticMode::Act;
+                self.agent_telemetry.agentic_mode_plan_to_act_count += 1;
             }
 
             // Issue #173: Update ANVIL_FINAL tracking from the new response
@@ -2039,7 +2192,21 @@ impl App {
                             .count() as u32;
                         self.agent_telemetry
                             .record_repair_turn_pending_before(pending_before);
-                        self.repair_closure_active = true;
+                        // Issue #380: Act/Plan → Repair(PreExit) transition.
+                        // This is the variant that activates the strict
+                        // `apply_plan_update_pipeline` closure gate — the
+                        // semantic replacement for the old
+                        // `repair_closure_active` boolean.
+                        if matches!(current_mode, AgenticMode::Act | AgenticMode::Plan) {
+                            current_mode = AgenticMode::Repair(RepairReason::PreExit);
+                            self.agent_telemetry.agentic_mode_act_to_repair_count += 1;
+                        } else {
+                            // Already in Repair (e.g. StagnationRecovery
+                            // escalated earlier this turn). Upgrade to
+                            // PreExit because the strict closure gate now
+                            // applies.
+                            current_mode = AgenticMode::Repair(RepairReason::PreExit);
+                        }
 
                         let repair_msg = self.build_pre_exit_repair_message();
                         let msg = SessionMessage::new(MessageRole::Tool, "system", repair_msg)
@@ -2065,6 +2232,28 @@ impl App {
             // Update prev_forced_mode_active at turn end.
             prev_forced_mode_active = self.forced_mode_active;
 
+            // Issue #380: evaluate Repair → Act recovery signals.
+            //
+            // - PreExit recovers once a worker mutation has been observed
+            //   (fix_slice success or plan re-issue).
+            // - EditFailRecovery recovers once the edit_fail_tracker has
+            //   drained back to zero outstanding consecutive failures.
+            // - StagnationRecovery recovers on stagnation score easing
+            //   (forced mode cleared) OR worker observation.
+            if let AgenticMode::Repair(ref reason) = current_mode {
+                let worker_observed = self.agent_telemetry.worker_observed;
+                let edit_fail_resolved = self.edit_fail_tracker.total_failures() == 0;
+                let stagnation_resolved = !self.forced_mode_active;
+                if reason.is_recovery_signal(
+                    worker_observed,
+                    edit_fail_resolved,
+                    stagnation_resolved,
+                ) {
+                    current_mode = AgenticMode::Act;
+                    self.agent_telemetry.agentic_mode_repair_to_act_count += 1;
+                }
+            }
+
             log_turn_summary(&TurnSummary {
                 turn: self.session_stats.total_turns,
                 max_turns: max_iterations as u32,
@@ -2078,6 +2267,7 @@ impl App {
                 phase: self.phase_estimator.current_phase(),
                 mutations_this_turn: Some(turn_mutations),
                 items_advanced_this_turn: Some(turn_items_advanced),
+                agentic_mode: Some(current_mode.clone()),
             });
             // Reset last_compact_info after it's been consumed by the turn summary
             self.last_compact_info = None;
@@ -2114,6 +2304,22 @@ impl App {
             }
             current = next_structured;
         }
+
+        // Issue #380: persist per-turn mode counts into telemetry. Each field
+        // aggregates across iterations of the single `complete_structured_response`
+        // call (session-scoped counters are incremented, never reset here).
+        self.agent_telemetry.agentic_mode_turns_in_plan = self
+            .agent_telemetry
+            .agentic_mode_turns_in_plan
+            .saturating_add(mode_turn_counts.plan);
+        self.agent_telemetry.agentic_mode_turns_in_act = self
+            .agent_telemetry
+            .agentic_mode_turns_in_act
+            .saturating_add(mode_turn_counts.act);
+        self.agent_telemetry.agentic_mode_turns_in_repair = self
+            .agent_telemetry
+            .agentic_mode_turns_in_repair
+            .saturating_add(mode_turn_counts.repair);
 
         // Issue #372: (B) final guard retry success — retries fired and files
         // were ultimately modified.
@@ -3616,6 +3822,7 @@ impl App {
                 phase: self.phase_estimator.current_phase(),
                 mutations_this_turn: None,
                 items_advanced_this_turn: None,
+                agentic_mode: None,
             });
             return Ok(None);
         }

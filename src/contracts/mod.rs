@@ -664,6 +664,30 @@ pub struct AgentTelemetry {
     #[serde(default)]
     pub model_aware_delegation_produced_mutation: u32,
 
+    /// Count of Plan→Act transitions observed in this session (Issue #380).
+    #[serde(default)]
+    pub agentic_mode_plan_to_act_count: u32,
+
+    /// Count of Act→Repair transitions observed in this session (Issue #380).
+    #[serde(default)]
+    pub agentic_mode_act_to_repair_count: u32,
+
+    /// Count of Repair→Act transitions observed in this session (Issue #380).
+    #[serde(default)]
+    pub agentic_mode_repair_to_act_count: u32,
+
+    /// Total iterations spent in [`AgenticMode::Plan`] (Issue #380).
+    #[serde(default)]
+    pub agentic_mode_turns_in_plan: u32,
+
+    /// Total iterations spent in [`AgenticMode::Act`] (Issue #380).
+    #[serde(default)]
+    pub agentic_mode_turns_in_act: u32,
+
+    /// Total iterations spent in [`AgenticMode::Repair`] (Issue #380).
+    #[serde(default)]
+    pub agentic_mode_turns_in_repair: u32,
+
     /// Issue #372: retry path telemetry (flattened into artifact JSON).
     #[serde(flatten, default)]
     pub retry: RetryTelemetry,

@@ -147,6 +147,7 @@ fn turn_summary_includes_phase_field() {
         phase: Phase::Exploring,
         mutations_this_turn: None,
         items_advanced_this_turn: None,
+        agentic_mode: None,
     };
     // Verify phase field exists and log_turn_summary is callable
     assert_eq!(format!("{}", summary.phase), "exploring");
