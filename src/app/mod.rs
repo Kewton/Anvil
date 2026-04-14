@@ -16,6 +16,7 @@ pub mod mock;
 pub mod mutation_barrier;
 pub mod phase_estimator;
 pub mod plan;
+pub mod plan_stall_tracker;
 pub mod policy;
 pub mod post_failure_thrash_detector;
 pub(crate) mod read_repeat_tracker;

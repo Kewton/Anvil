@@ -889,10 +889,18 @@ const PROMPT_WORK_APPROACH: &str = concat!(
 const PROMPT_OPTIONAL_CATALOG_HEADER: &str =
     "\nAdditional tools (use ANVIL_TOOL block format shown above):\n";
 
+/// Shared rule text for the ANVIL_PLAN single-emission constraint (Issue #391).
+///
+/// Used in [`PROMPT_TOOL_RULES`], [`tool_protocol_system_prompt_tiny`], and
+/// referenced from `MUTATION_BARRIER_MESSAGE` to keep the guidance consistent
+/// across prompt tiers and retry hints.
+pub const ANVIL_PLAN_ONCE_RULE: &str = "Output ANVIL_PLAN at most once per turn. After ANVIL_PLAN, the very next action MUST be a file.write, file.edit, file.edit_anchor, or file.rewrite ANVIL_TOOL block. Do NOT restate the plan, add more prose, or output ANVIL_PLAN again before the first tool call.";
+
 const PROMPT_TOOL_RULES: &str = concat!(
     "## ANVIL_PLAN — Change plan\n",
     "Before any file.write/file.edit, output one ANVIL_PLAN block using relative paths:\n",
     "```ANVIL_PLAN\n- [ ] src/foo.rs: description\n- [ ] src/bar.rs: description\n```\n",
+    "Output ANVIL_PLAN at most once per turn. After ANVIL_PLAN, the very next action MUST be a file.write, file.edit, file.edit_anchor, or file.rewrite ANVIL_TOOL block. Do NOT restate the plan, add more prose, or output ANVIL_PLAN again before the first tool call.\n",
     "Each item: `- [ ] <relative-path>: <description>`. Do NOT output ANVIL_FINAL until ALL items are done.\n",
     "To add items mid-task, output an ANVIL_PLAN_UPDATE block with the same format.\n",
     "To mark items as already done (no changes needed), use [x] in ANVIL_PLAN_UPDATE: `- [x] path: reason`.\n",
@@ -1270,8 +1278,11 @@ fn tool_protocol_system_prompt_tiny() -> String {
     prompt.push_str(TOOL_DESC_FILE_REWRITE);
     prompt.push_str(TOOL_DESC_SHELL_EXEC);
 
+    prompt.push_str("Rules:\n");
+    prompt.push_str("- ");
+    prompt.push_str(ANVIL_PLAN_ONCE_RULE);
+    prompt.push('\n');
     prompt.push_str(concat!(
-        "Rules:\n",
         "- All paths must be relative.\n",
         "- Include ANVIL_FINAL block after tool blocks.\n",
     ));
