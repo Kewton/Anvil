@@ -13,6 +13,9 @@ use crate::tooling::{AnchorEditParams, ToolInput};
 /// name tag (e.g., `<file.read`).
 pub fn is_tag_format(block: &str) -> bool {
     let trimmed = block.trim();
+    if trimmed.starts_with("<function=") {
+        return true;
+    }
     if trimmed.starts_with("<tool ") || trimmed.starts_with("<tool>") {
         return true;
     }
@@ -44,6 +47,10 @@ pub fn is_tag_format(block: &str) -> bool {
 pub fn parse_tag_tool_block(block: &str) -> Result<(String, ToolInput), String> {
     let trimmed = block.trim();
 
+    if trimmed.starts_with("<function=") {
+        return parse_function_style_tool_block(trimmed);
+    }
+
     // Determine tool name and the rest of the tag content
     let (tool_name, tag_body, children) = extract_tag_structure(trimmed)?;
 
@@ -59,6 +66,63 @@ pub fn parse_tag_tool_block(block: &str) -> Result<(String, ToolInput), String> 
 
     // Build ToolInput from attributes and children
     build_tool_input(&tool_name, &attrs, &child_contents)
+}
+
+fn parse_function_style_tool_block(block: &str) -> Result<(String, ToolInput), String> {
+    let first_line = block
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .ok_or_else(|| "empty function tag block".to_string())?;
+    let raw_name = first_line
+        .strip_prefix("<function=")
+        .and_then(|s| s.strip_suffix('>'))
+        .ok_or_else(|| "malformed <function=...> header".to_string())?;
+    let tool_name = normalize_function_tool_name(raw_name.trim());
+
+    let mut attrs = Vec::new();
+    let mut children = Vec::new();
+    let mut lines = block.lines().peekable();
+    while let Some(line) = lines.next() {
+        let trimmed = line.trim();
+        let Some(param_name) = trimmed
+            .strip_prefix("<parameter=")
+            .and_then(|s| s.strip_suffix('>'))
+        else {
+            continue;
+        };
+
+        let mut value_lines = Vec::new();
+        for next in lines.by_ref() {
+            if next.trim() == "</parameter>" {
+                break;
+            }
+            value_lines.push(next);
+        }
+        let value = value_lines.join("\n");
+        match param_name.trim() {
+            "path" | "root" | "pattern" | "query" | "url" | "command" | "scope" | "target_path"
+            | "max_lines" | "start_line" | "end_line" | "staged" | "commit" | "count" => {
+                attrs.push((param_name.trim().to_string(), value))
+            }
+            "content" | "old_string" | "new_string" | "old_content" | "new_content" | "prompt"
+            | "goal" => children.push((param_name.trim().to_string(), value)),
+            other => attrs.push((other.to_string(), value)),
+        }
+    }
+
+    build_tool_input(&tool_name, &attrs, &children)
+}
+
+fn normalize_function_tool_name(name: &str) -> String {
+    match name {
+        "file_write" => "file.write".to_string(),
+        "file_edit" => "file.edit".to_string(),
+        "file_read" => "file.read".to_string(),
+        "file_search" => "file.search".to_string(),
+        "shell_exec" => "shell.exec".to_string(),
+        other => other.to_string(),
+    }
 }
 
 /// Extract the tag structure: (tool_name, opening_tag_body, inner_content).
@@ -441,6 +505,44 @@ mod tests {
             ToolInput::FileWrite {
                 path: "./out.txt".to_string(),
                 content: "hello world".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_function_style_file_write() {
+        let block = r#"<function=file_write>
+<parameter=path>
+./out.txt
+</parameter>
+<parameter=content>
+hello world
+</parameter>
+</function>"#;
+        let (name, input) = parse_tag_tool_block(block).unwrap();
+        assert_eq!(name, "file.write");
+        assert_eq!(
+            input,
+            ToolInput::FileWrite {
+                path: "./out.txt".to_string(),
+                content: "hello world".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_function_style_shell_exec() {
+        let block = r#"<function=shell_exec>
+<parameter=command>
+ls -la
+</parameter>
+</function>"#;
+        let (name, input) = parse_tag_tool_block(block).unwrap();
+        assert_eq!(name, "shell.exec");
+        assert_eq!(
+            input,
+            ToolInput::ShellExec {
+                command: "ls -la".to_string(),
             }
         );
     }
