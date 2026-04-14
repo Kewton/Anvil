@@ -3,6 +3,12 @@
 //! [`Tui`] is a stateless renderer that converts [`ConsoleRenderContext`]
 //! snapshots into plain-text frames for the terminal.
 
+mod keyboard;
+mod stream;
+
+pub use keyboard::{KeyboardWatcher, RawModeGuard, install_raw_mode_panic_hook};
+pub use stream::{RenderCoordinator, RenderEvent, RenderSender, StatusLine};
+
 use crate::config::EffectiveConfig;
 use crate::contracts::{
     AppStateSnapshot, ConsoleMessageRole, ConsoleMessageView, ConsoleRenderContext,
@@ -19,10 +25,13 @@ impl Default for Tui {
 }
 
 impl Tui {
+    /// Create a new stateless renderer.
     pub fn new() -> Self {
         Self
     }
 
+    /// Render the one-shot startup banner shown immediately after `anvil`
+    /// boots into interactive mode.
     pub fn render_startup(
         &self,
         config: &EffectiveConfig,
@@ -70,6 +79,10 @@ impl Tui {
         lines.join("\n")
     }
 
+    /// Render a full console frame from a [`ConsoleRenderContext`] snapshot.
+    ///
+    /// The output is pure text (no escape sequences other than those injected
+    /// by [`colorize_diff`]) so callers can safely pipe it to non-TTY outputs.
     pub fn render_console(&self, view: &ConsoleRenderContext) -> String {
         let mut lines = Vec::new();
         let snapshot = &view.snapshot;
