@@ -6,7 +6,10 @@
 mod keyboard;
 mod stream;
 
-pub use keyboard::{KeyboardWatcher, RawModeGuard, install_raw_mode_panic_hook};
+pub use keyboard::{
+    KeyboardWatcher, RawModeGuard, flush_stderr, install_raw_mode_panic_hook, write_stderr,
+    writeln_stderr,
+};
 pub use stream::{RenderCoordinator, RenderEvent, RenderSender, StatusLine};
 
 use crate::config::EffectiveConfig;

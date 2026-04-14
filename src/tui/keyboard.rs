@@ -2,7 +2,7 @@
 //!
 //! While `run_live_turn` is executing, this module enables raw mode on
 //! stderr, spawns a short-lived watcher thread, and flips the shared
-//! `shutdown_flag` as soon as the user presses ESC. All other key events
+//! stop flag as soon as the user presses ESC. All other key events
 //! are discarded in-place per DR4-003 (no logging, no persistence, no
 //! telemetry).
 //!
@@ -10,7 +10,8 @@
 //! - `dev-reports/design/issue-379-tui-improvements-design-policy.md` D1 / P1 / DR4-003
 //! - `dev-reports/issue/379/work-plan.md` Task 1.1 / Task 1.2 / Task 1.3
 
-use std::io;
+use std::borrow::Cow;
+use std::io::{self, Write as _};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Once};
 use std::thread::{self, JoinHandle};
@@ -48,6 +49,59 @@ pub fn install_raw_mode_panic_hook() {
             previous(info);
         }));
     });
+}
+
+/// Normalize line endings while raw mode is active.
+///
+/// In raw mode the terminal no longer expands lone `\n` to `\r\n`, so any
+/// interactive output that prints plain line feeds drifts to the right instead
+/// of returning to column zero on the next line.
+pub fn normalize_output_for_raw_mode(text: &str) -> Cow<'_, str> {
+    if !RAW_MODE_ACTIVE.load(Ordering::Acquire) || !text.contains('\n') {
+        return Cow::Borrowed(text);
+    }
+
+    let mut normalized = String::with_capacity(text.len() + text.matches('\n').count());
+    let mut previous_was_cr = false;
+    for ch in text.chars() {
+        match ch {
+            '\n' => {
+                if !previous_was_cr {
+                    normalized.push('\r');
+                }
+                normalized.push('\n');
+                previous_was_cr = false;
+            }
+            '\r' => {
+                normalized.push('\r');
+                previous_was_cr = true;
+            }
+            other => {
+                normalized.push(other);
+                previous_was_cr = false;
+            }
+        }
+    }
+
+    Cow::Owned(normalized)
+}
+
+/// Write interactive text to stderr, normalizing line endings in raw mode.
+pub fn write_stderr(text: &str) {
+    let mut stderr = io::stderr();
+    let normalized = normalize_output_for_raw_mode(text);
+    let _ = stderr.write_all(normalized.as_bytes());
+}
+
+/// Write a full line to stderr, normalizing line endings in raw mode.
+pub fn writeln_stderr(text: &str) {
+    write_stderr(text);
+    write_stderr("\n");
+}
+
+/// Flush stderr after incremental interactive output.
+pub fn flush_stderr() {
+    let _ = io::stderr().flush();
 }
 
 /// RAII guard that enables raw mode on construction and disables it on
@@ -215,6 +269,29 @@ mod tests {
         let handle = KeyboardWatcher::spawn(Arc::clone(&flag), false);
         assert!(handle.is_none());
         assert!(!flag.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn normalize_output_leaves_lf_when_raw_mode_inactive() {
+        RAW_MODE_ACTIVE.store(false, Ordering::Release);
+        assert_eq!(normalize_output_for_raw_mode("a\nb"), "a\nb");
+    }
+
+    #[test]
+    fn normalize_output_converts_lf_to_crlf_when_raw_mode_active() {
+        RAW_MODE_ACTIVE.store(true, Ordering::Release);
+        assert_eq!(normalize_output_for_raw_mode("a\nb\n"), "a\r\nb\r\n");
+        RAW_MODE_ACTIVE.store(false, Ordering::Release);
+    }
+
+    #[test]
+    fn normalize_output_preserves_existing_crlf_pairs() {
+        RAW_MODE_ACTIVE.store(true, Ordering::Release);
+        assert_eq!(
+            normalize_output_for_raw_mode("a\r\nb\nc\r"),
+            "a\r\nb\r\nc\r"
+        );
+        RAW_MODE_ACTIVE.store(false, Ordering::Release);
     }
 
     #[test]

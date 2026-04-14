@@ -12,6 +12,7 @@ use crate::tooling::{
     LocalToolExecutor, ToolCallRequest, ToolExecutionPayload, ToolExecutionResult,
     ToolExecutionStatus, ToolInput, ToolRegistry,
 };
+use crate::tui::{flush_stderr, write_stderr, writeln_stderr};
 
 use serde::Deserialize;
 
@@ -804,14 +805,13 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
                 if let ProviderEvent::TokenDelta(delta) = &event {
                     token_buffer.push_str(delta);
                     // Progress output on stderr (IR3-004)
-                    let _ =
-                        std::io::Write::write_fmt(&mut std::io::stderr(), format_args!("{delta}"));
-                    let _ = std::io::Write::flush(&mut std::io::stderr());
+                    write_stderr(delta);
+                    flush_stderr();
                 }
             })
             .map_err(SubAgentError::Provider)?;
 
-        let _ = std::io::Write::write_fmt(&mut std::io::stderr(), format_args!("\n"));
+        writeln_stderr("");
 
         // Parse structured response
         let structured = BasicAgentLoop::parse_structured_response(&token_buffer)
@@ -929,11 +929,11 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
                     crate::contracts::tokens::ContentKind::Text,
                 );
                 let target = self.last_file_read_target.clone().unwrap_or_default();
-                eprintln!(
+                writeln_stderr(&format!(
                     "[subagent:fix_slice] repeated-read loop detected (path={target}); \
                      aborting after {} iteration(s)",
                     self.iterations_used
-                );
+                ));
                 let summary = format!(
                     "fix-slice worker aborted: repeated-read loop on target '{target}' \
                      after {} iteration(s)",
@@ -1045,7 +1045,7 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
             SubAgentKind::Plan => "plan",
             SubAgentKind::FixSlice => "fix_slice",
         };
-        eprintln!("[subagent:{kind_label}] Starting...");
+        writeln_stderr(&format!("[subagent:{kind_label}] Starting..."));
         let start = Instant::now();
         let (max_iterations, timeout) = if self.kind == SubAgentKind::FixSlice {
             // Issue #345: runtime-configurable iteration cap.
@@ -1063,24 +1063,24 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
         for iteration in 0..max_iterations {
             // Wall-clock timeout -> partial result with Ok
             if start.elapsed() > timeout {
-                eprintln!(
+                writeln_stderr(&format!(
                     "[subagent:{kind_label}] Timed out after {:?}",
                     start.elapsed()
-                );
+                ));
                 return Ok(self.build_partial_result(TerminationReason::Timeout, iteration + 1));
             }
             // Shutdown flag -> partial result with Ok
             if self.shutdown_flag.load(Ordering::Relaxed) {
-                eprintln!("[subagent:{kind_label}] Shutdown requested");
+                writeln_stderr(&format!("[subagent:{kind_label}] Shutdown requested"));
                 return Ok(self.build_partial_result(TerminationReason::Timeout, iteration + 1));
             }
 
             self.iterations_used = iteration + 1;
-            eprintln!(
+            writeln_stderr(&format!(
                 "[subagent:{kind_label}] iteration {}/{}...",
                 iteration + 1,
                 max_iterations
-            );
+            ));
 
             match self.run_turn()? {
                 TurnOutcome::Finished(result) => return Ok(*result),
@@ -1089,7 +1089,9 @@ impl<'a, C: ProviderClient> SubAgentSession<'a, C> {
         }
 
         // MaxIterations -> partial result with Ok
-        eprintln!("[subagent:{kind_label}] Reached max iterations ({max_iterations})");
+        writeln_stderr(&format!(
+            "[subagent:{kind_label}] Reached max iterations ({max_iterations})"
+        ));
         Ok(self.build_partial_result(TerminationReason::MaxIterations, max_iterations))
     }
 

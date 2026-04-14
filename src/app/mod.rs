@@ -57,10 +57,9 @@ use crate::tooling::{
     CheckpointStack, ExecutionClass, ExecutionMode, PermissionClass, PlanModePolicy,
     RollbackPolicy, ToolKind, ToolRegistry, ToolSpec,
 };
-use crate::tui::Tui;
+use crate::tui::{Tui, flush_stderr, write_stderr, writeln_stderr};
 use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
-use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -1519,7 +1518,7 @@ impl App {
             102_400, // 100KB
         );
         for err in &errors {
-            eprintln!("@file展開エラー: {}", err);
+            writeln_stderr(&format!("@file展開エラー: {err}"));
         }
         expanded
     }
@@ -1646,8 +1645,8 @@ impl App {
                     if first_token {
                         first_token = false;
                     }
-                    let _ = write!(io::stderr(), "{delta}");
-                    let _ = io::stderr().flush();
+                    write_stderr(delta);
+                    flush_stderr();
                 }
                 ProviderEvent::Agent(_) => {}
             }
@@ -1661,7 +1660,7 @@ impl App {
 
         // End streaming output with newline
         if !first_token {
-            let _ = writeln!(io::stderr());
+            writeln_stderr("");
         }
 
         // Phase 2: Process collected events for state management.

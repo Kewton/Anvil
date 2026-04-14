@@ -18,6 +18,7 @@ use crate::config::{
     expand_command_template, json_value_to_params, strip_custom_prefix,
 };
 use crate::contracts::ToolLogView;
+use crate::tui::writeln_stderr;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
@@ -2475,9 +2476,9 @@ impl LocalToolExecutor {
         command: &str,
         started: Instant,
     ) -> Result<ToolExecutionResult, ToolRuntimeError> {
-        use std::io::{BufRead, Write as _};
+        use std::io::BufRead;
 
-        let _ = writeln!(std::io::stderr(), "\n  $ {command}");
+        writeln_stderr(&format!("\n  $ {command}"));
 
         let mut child = std::process::Command::new("sh")
             .arg("-c")
@@ -2497,7 +2498,7 @@ impl LocalToolExecutor {
                 let reader = std::io::BufReader::new(out);
                 for line in reader.lines() {
                     let Ok(line) = line else { break };
-                    let _ = writeln!(std::io::stderr(), "  {line}");
+                    writeln_stderr(&format!("  {line}"));
                     captured.push_str(&line);
                     captured.push('\n');
                 }
@@ -2511,7 +2512,7 @@ impl LocalToolExecutor {
                 let reader = std::io::BufReader::new(err);
                 for line in reader.lines() {
                     let Ok(line) = line else { break };
-                    let _ = writeln!(std::io::stderr(), "  {line}");
+                    writeln_stderr(&format!("  {line}"));
                     captured.push_str(&line);
                     captured.push('\n');
                 }

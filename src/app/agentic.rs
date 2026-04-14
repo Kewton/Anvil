@@ -17,7 +17,7 @@ use crate::tooling::{
     ToolExecutionRequest, ToolExecutionResult, ToolExecutionStatus, ToolInput, ToolKind,
     count_file_lines, diff::generate_diff_preview, resolve_sandbox_path,
 };
-use crate::tui::Tui;
+use crate::tui::{Tui, flush_stderr, write_stderr, writeln_stderr};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1708,9 +1708,8 @@ impl App {
                     if first_token {
                         first_token = false;
                     }
-                    let _ =
-                        std::io::Write::write_fmt(&mut std::io::stderr(), format_args!("{delta}"));
-                    let _ = std::io::Write::flush(&mut std::io::stderr());
+                    write_stderr(delta);
+                    flush_stderr();
                 }
             });
 
@@ -1718,7 +1717,7 @@ impl App {
                 s.stop();
             }
             if !first_token {
-                let _ = std::io::Write::write_fmt(&mut std::io::stderr(), format_args!("\n"));
+                writeln_stderr("");
             }
 
             match stream_result {
@@ -3141,8 +3140,7 @@ impl App {
                     output_text,
                     result.elapsed_ms.min(u64::MAX as u128) as u64,
                 );
-                let _ =
-                    std::io::Write::write_fmt(&mut std::io::stderr(), format_args!("{display}\n"));
+                writeln_stderr(&display);
             }
 
             // PostToolUse hook (soft-fail) — skip for rolled-back results
@@ -3689,8 +3687,8 @@ impl App {
                 if first_token {
                     first_token = false;
                 }
-                let _ = std::io::Write::write_fmt(&mut std::io::stderr(), format_args!("{delta}"));
-                let _ = std::io::Write::flush(&mut std::io::stderr());
+                write_stderr(delta);
+                flush_stderr();
             }
         });
 
@@ -3698,7 +3696,7 @@ impl App {
             s.stop();
         }
         if !first_token {
-            let _ = std::io::Write::write_fmt(&mut std::io::stderr(), format_args!("\n"));
+            writeln_stderr("");
         }
 
         match stream_result {
@@ -4246,12 +4244,12 @@ fn tool_call_approval_summary(call: &crate::tooling::ToolCallRequest) -> String 
 /// Prompt the user for inline approval via stderr/stdin.
 /// Returns `true` if the user approves, `false` otherwise.
 fn prompt_inline_approval(summary: &str, diff_preview: Option<&str>) -> bool {
-    use std::io::{BufRead, Write};
+    use std::io::BufRead;
     if let Some(diff) = diff_preview {
-        let _ = write!(std::io::stderr(), "\n{}\n", crate::tui::colorize_diff(diff));
+        write_stderr(&format!("\n{}\n", crate::tui::colorize_diff(diff)));
     }
-    let _ = write!(std::io::stderr(), "\n  Allow {summary}? [y/n] ");
-    let _ = std::io::stderr().flush();
+    write_stderr(&format!("\n  Allow {summary}? [y/n] "));
+    flush_stderr();
     let mut input = String::new();
     if std::io::stdin().lock().read_line(&mut input).is_ok() {
         let answer = input.trim().to_ascii_lowercase();
