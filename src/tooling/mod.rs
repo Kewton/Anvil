@@ -1109,6 +1109,12 @@ struct WorkspaceSnapshotEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+enum ShellDeltaObservation<T> {
+    Observed(T),
+    Skipped(&'static str),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolExecutionError {
     ApprovalRequired(String),
     RestrictedTool(String),
@@ -2542,7 +2548,8 @@ impl LocalToolExecutor {
 
     fn snapshot_workspace(
         &self,
-    ) -> Result<Option<HashMap<String, WorkspaceSnapshotEntry>>, ToolRuntimeError> {
+    ) -> Result<ShellDeltaObservation<HashMap<String, WorkspaceSnapshotEntry>>, ToolRuntimeError>
+    {
         let mut snapshot = HashMap::new();
         let walker = ignore::WalkBuilder::new(&self.root)
             .hidden(false)
@@ -2585,7 +2592,7 @@ impl LocalToolExecutor {
                     root = %self.root.display(),
                     "shell.exec workspace delta observation skipped: snapshot too large"
                 );
-                return Ok(None);
+                return Ok(ShellDeltaObservation::Skipped("snapshot too large"));
             }
             let modified = metadata
                 .modified()
@@ -2602,15 +2609,18 @@ impl LocalToolExecutor {
             );
         }
 
-        Ok(Some(snapshot))
+        Ok(ShellDeltaObservation::Observed(snapshot))
     }
 
     fn observe_shell_workspace_delta(
         &self,
         before: &HashMap<String, WorkspaceSnapshotEntry>,
-    ) -> Result<Option<ObservedWorkspaceDelta>, ToolRuntimeError> {
-        let Some(after) = self.snapshot_workspace()? else {
-            return Ok(None);
+    ) -> Result<ShellDeltaObservation<ObservedWorkspaceDelta>, ToolRuntimeError> {
+        let after = match self.snapshot_workspace()? {
+            ShellDeltaObservation::Observed(after) => after,
+            ShellDeltaObservation::Skipped(reason) => {
+                return Ok(ShellDeltaObservation::Skipped(reason));
+            }
         };
         let mut delta = ObservedWorkspaceDelta::default();
 
@@ -2639,9 +2649,9 @@ impl LocalToolExecutor {
                 root = %self.root.display(),
                 "shell.exec workspace delta observation skipped: too many changed paths"
             );
-            return Ok(None);
+            return Ok(ShellDeltaObservation::Skipped("too many changed paths"));
         }
-        Ok(Some(delta))
+        Ok(ShellDeltaObservation::Observed(delta))
     }
 
     fn execute_shell_exec(
@@ -2654,7 +2664,7 @@ impl LocalToolExecutor {
 
         let observe_delta = Self::should_observe_shell_workspace_delta(command);
         let before_snapshot = if observe_delta {
-            self.snapshot_workspace()?
+            Some(self.snapshot_workspace()?)
         } else {
             None
         };
@@ -2742,13 +2752,25 @@ impl LocalToolExecutor {
         } else {
             ToolExecutionStatus::Failed
         };
+        let mut delta_skip_reason: Option<&'static str> = None;
         let observed_delta = if success {
-            before_snapshot
-                .as_ref()
-                .map(|before| self.observe_shell_workspace_delta(before))
-                .transpose()?
-                .flatten()
-                .filter(|delta| !delta.is_empty())
+            match before_snapshot.as_ref() {
+                Some(ShellDeltaObservation::Observed(before)) => {
+                    match self.observe_shell_workspace_delta(before)? {
+                        ShellDeltaObservation::Observed(delta) if !delta.is_empty() => Some(delta),
+                        ShellDeltaObservation::Observed(_) => None,
+                        ShellDeltaObservation::Skipped(reason) => {
+                            delta_skip_reason = Some(reason);
+                            None
+                        }
+                    }
+                }
+                Some(ShellDeltaObservation::Skipped(reason)) => {
+                    delta_skip_reason = Some(reason);
+                    None
+                }
+                None => None,
+            }
         } else {
             None
         };
@@ -2757,7 +2779,13 @@ impl LocalToolExecutor {
             .map(ObservedWorkspaceDelta::changed_paths)
             .unwrap_or_default();
         let summary = if success {
-            format!("shell.exec completed: {command}")
+            if let Some(reason) = delta_skip_reason {
+                format!(
+                    "shell.exec completed: {command} (workspace delta observation skipped: {reason})"
+                )
+            } else {
+                format!("shell.exec completed: {command}")
+            }
         } else {
             format!(
                 "shell.exec failed (exit {}): {command}",
@@ -4801,6 +4829,11 @@ mod tests {
         assert_eq!(result.status, ToolExecutionStatus::Completed);
         assert!(!result.mutation_observed());
         assert!(result.observed_delta.is_none());
+        assert!(
+            result
+                .summary
+                .contains("workspace delta observation skipped: snapshot too large")
+        );
         assert!(dir.path().join("app-package.json").exists());
     }
 
@@ -4820,6 +4853,11 @@ mod tests {
         assert_eq!(result.status, ToolExecutionStatus::Completed);
         assert!(!result.mutation_observed());
         assert!(result.observed_delta.is_none());
+        assert!(
+            result
+                .summary
+                .contains("workspace delta observation skipped: too many changed paths")
+        );
         assert!(dir.path().join("bulk/file-0.txt").exists());
         assert!(
             dir.path()
