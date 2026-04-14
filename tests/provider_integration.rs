@@ -4447,6 +4447,190 @@ fn shell_exec_mutation_followup_does_not_stop_after_partial_progress() {
 }
 
 #[test]
+fn file_write_followup_prose_retry_continues_to_next_planned_file() {
+    let root = common::unique_test_dir("file_write_followup_retry");
+    let mut config = common::build_config_in(root.clone());
+    config.mode.approval_required = false;
+    let provider_ctx =
+        anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
+    let mut app = anvil::app::App::new(
+        config,
+        provider_ctx,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("app should initialize");
+    let tui = Tui::new();
+
+    let seen_requests = Rc::new(RefCell::new(Vec::new()));
+
+    struct FileWriteFollowupProvider {
+        seen_requests: Rc<RefCell<Vec<ProviderTurnRequest>>>,
+    }
+
+    impl ProviderClient for FileWriteFollowupProvider {
+        fn stream_turn(
+            &self,
+            request: &ProviderTurnRequest,
+            emit: &mut dyn FnMut(ProviderEvent),
+        ) -> Result<(), ProviderTurnError> {
+            let call_index = self.seen_requests.borrow().len();
+            self.seen_requests.borrow_mut().push(request.clone());
+
+            match call_index {
+                0 => emit(ProviderEvent::Agent(AgentEvent::Done {
+                    status: "Done. session saved".to_string(),
+                    assistant_message: concat!(
+                        "```ANVIL_PLAN\n",
+                        "- [ ] package.json: bootstrap the project\n",
+                        "- [ ] tsconfig.json: add TypeScript configuration\n",
+                        "```\n",
+                        "```ANVIL_TOOL\n",
+                        "{\"id\":\"call_001\",\"tool\":\"file.write\",\"path\":\"./package.json\",\"content\":\"{\\n  \\\"name\\\": \\\"space-invaders\\\"\\n}\\n\"}\n",
+                        "```\n",
+                        "```ANVIL_FINAL\n",
+                        "Created package.json.\n",
+                        "```\n"
+                    )
+                    .to_string(),
+                    completion_summary: "write package".to_string(),
+                    saved_status: "session saved".to_string(),
+                    tool_logs: Vec::new(),
+                    elapsed_ms: 0,
+                    inference_performance: None,
+                    tool_calls: None,
+                    assistant_tool_call_records: None,
+                })),
+                1 => emit(ProviderEvent::TokenDelta(
+                    "package.json が作成されました。次に tsconfig.json を作成します。".to_string(),
+                )),
+                _ => emit(ProviderEvent::TokenDelta(
+                    concat!(
+                        "```ANVIL_TOOL\n",
+                        "{\"id\":\"call_002\",\"tool\":\"file.write\",\"path\":\"./tsconfig.json\",\"content\":\"{\\n  \\\"compilerOptions\\\": {\\n    \\\"target\\\": \\\"ES2020\\\"\\n  }\\n}\\n\"}\n",
+                        "```\n",
+                        "```ANVIL_FINAL\n",
+                        "Created tsconfig.json.\n",
+                        "```\n"
+                    )
+                    .to_string(),
+                )),
+            }
+            Ok(())
+        }
+    }
+
+    let provider = FileWriteFollowupProvider {
+        seen_requests: seen_requests.clone(),
+    };
+
+    let _frames = app
+        .run_live_turn(
+            "あなたが考える最高に面白くかっこいいスペースインベーダーゲームを3011ポートで起動可能なnext.jsアプリとして開発してください。",
+            &provider,
+            &tui,
+        )
+        .expect("file write follow-up scenario should continue");
+
+    let requests = seen_requests.borrow();
+    assert_eq!(
+        requests.len(),
+        3,
+        "expected initial write, suppressed prose-only follow-up, and next-file retry"
+    );
+    assert!(
+        root.join("package.json").exists(),
+        "initial planned file should be written"
+    );
+    assert!(
+        root.join("tsconfig.json").exists(),
+        "follow-up retry should continue to the next planned file"
+    );
+    assert!(
+        requests[2]
+            .messages
+            .iter()
+            .any(|m| m.content.contains("次の応答では file.write / file.edit / file.rewrite の ANVIL_TOOL を直接出力してください")),
+        "strong tool-first plan guidance should be present in the retry request"
+    );
+}
+
+#[test]
+fn first_mutation_without_anvil_plan_is_allowed_via_synthetic_plan_for_local_models() {
+    let root = common::unique_test_dir("synthetic_plan_from_first_mutation");
+    let mut config = common::build_config_in(root.clone());
+    config.mode.approval_required = false;
+    config.runtime.provider = "ollama".to_string();
+    let provider_ctx =
+        anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
+    let mut app = anvil::app::App::new(
+        config,
+        provider_ctx,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("app should initialize");
+    let tui = Tui::new();
+
+    let seen_requests = Rc::new(RefCell::new(Vec::new()));
+
+    struct SyntheticPlanProvider {
+        seen_requests: Rc<RefCell<Vec<ProviderTurnRequest>>>,
+    }
+
+    impl ProviderClient for SyntheticPlanProvider {
+        fn stream_turn(
+            &self,
+            request: &ProviderTurnRequest,
+            emit: &mut dyn FnMut(ProviderEvent),
+        ) -> Result<(), ProviderTurnError> {
+            self.seen_requests.borrow_mut().push(request.clone());
+            emit(ProviderEvent::Agent(AgentEvent::Done {
+                status: "Done. session saved".to_string(),
+                assistant_message: concat!(
+                    "```ANVIL_TOOL\n",
+                    "{\"id\":\"call_001\",\"tool\":\"file.write\",\"path\":\"./package.json\",\"content\":\"{\\n  \\\"name\\\": \\\"space-invaders\\\"\\n}\\n\"}\n",
+                    "```\n",
+                    "```ANVIL_FINAL\n",
+                    "Created package.json.\n",
+                    "```\n"
+                )
+                .to_string(),
+                completion_summary: "write package".to_string(),
+                saved_status: "session saved".to_string(),
+                tool_logs: Vec::new(),
+                elapsed_ms: 0,
+                inference_performance: None,
+                tool_calls: None,
+                assistant_tool_call_records: None,
+            }));
+            Ok(())
+        }
+    }
+
+    let provider = SyntheticPlanProvider {
+        seen_requests: seen_requests.clone(),
+    };
+
+    let _frames = app
+        .run_live_turn(
+            "あなたが考える最高に面白くかっこいいスペースインベーダーゲームを3011ポートで起動可能なnext.jsアプリとして開発してください。",
+            &provider,
+            &tui,
+        )
+        .expect("synthetic plan fallback should allow first mutation");
+
+    assert!(
+        root.join("package.json").exists(),
+        "first mutation should be executed even when ANVIL_PLAN was omitted"
+    );
+    assert!(
+        app.session().messages.iter().any(|m| m
+            .content
+            .contains("最初の変更対象から最小限の実行計画を自動補完しました")),
+        "synthetic plan note should be recorded in the session"
+    );
+}
+
+#[test]
 fn shell_exec_mutation_advances_plan_before_final_gate() {
     let root = common::unique_test_dir("shell_exec_plan_sync");
     let mut config = common::build_config_in(root.clone());

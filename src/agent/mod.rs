@@ -336,7 +336,9 @@ impl BasicAgentLoop {
             {
                 continue;
             }
-            tool_calls.push(parse_tool_call_block_multi_tier(&block, registry)?);
+            for subblock in split_multi_tool_block(&block) {
+                tool_calls.push(parse_tool_call_block_multi_tier(&subblock, registry)?);
+            }
         }
 
         // Issue #186: 同一ターン内の重複ツール呼び出しを排除し、ID衝突を解消
@@ -393,6 +395,45 @@ fn dedup_tool_calls(tool_calls: Vec<ToolCallRequest>) -> Vec<ToolCallRequest> {
     }
 
     deduped
+}
+
+fn split_multi_tool_block(block: &str) -> Vec<String> {
+    let trimmed = block.trim();
+    if !trimmed.contains("<function=") {
+        return vec![block.to_string()];
+    }
+
+    let mut blocks = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    let mut saw_function = false;
+
+    for line in block.lines() {
+        let trimmed_line = line.trim();
+        if trimmed_line.starts_with("<function=") {
+            if !current.is_empty() {
+                blocks.push(current.join("\n"));
+                current.clear();
+            }
+            saw_function = true;
+        }
+        if !saw_function {
+            continue;
+        }
+        if trimmed_line == "</tool_call>" {
+            continue;
+        }
+        current.push(line.to_string());
+    }
+
+    if !current.is_empty() {
+        blocks.push(current.join("\n"));
+    }
+
+    if blocks.is_empty() {
+        vec![block.to_string()]
+    } else {
+        blocks
+    }
 }
 
 /// (tool_name, serialized input) のハッシュでセマンティック一致を判定
@@ -1673,6 +1714,37 @@ mod tests {
                 one_liner
             );
         }
+    }
+
+    #[test]
+    fn parse_structured_response_splits_multiple_function_style_tools_in_one_fence() {
+        let response = BasicAgentLoop::parse_structured_response(
+            "```ANVIL_TOOL\n\
+<function=file_write>\n\
+<parameter=path>\n\
+package.json\n\
+</parameter>\n\
+<parameter=content>\n\
+{}\n\
+</parameter>\n\
+</function>\n\
+</tool_call>\n\
+<function=file_write>\n\
+<parameter=path>\n\
+tsconfig.json\n\
+</parameter>\n\
+<parameter=content>\n\
+{}\n\
+</parameter>\n\
+</function>\n\
+</tool_call>\n\
+```\n",
+        )
+        .expect("multiple function-style tool calls in one fence should parse");
+
+        assert_eq!(response.tool_calls.len(), 2);
+        assert_eq!(response.tool_calls[0].tool_name, "file.write");
+        assert_eq!(response.tool_calls[1].tool_name, "file.write");
     }
 
     // ── Issue #157: estimate_pruned_message_count tests ───────────────

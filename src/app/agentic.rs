@@ -544,6 +544,65 @@ const GUIDANCE_TOOL_NAMES: &[&str] = &[
 const MAX_SUBAGENT_CALLS_PER_TURN: usize = 3;
 
 impl App {
+    fn maybe_register_synthetic_plan_from_initial_mutations(
+        &mut self,
+        validated_requests: &[(usize, ToolExecutionRequest)],
+    ) {
+        if !self.execution_plan.is_empty() {
+            return;
+        }
+        if !matches!(self.config.runtime.provider.as_str(), "ollama" | "lmstudio") {
+            return;
+        }
+
+        let mut target_paths = Vec::new();
+        for (_, request) in validated_requests {
+            let path = match &request.input {
+                ToolInput::FileWrite { path, .. }
+                | ToolInput::FileEdit { path, .. }
+                | ToolInput::FileEditAnchor { path, .. }
+                | ToolInput::FileRewrite { path, .. } => Some(path.clone()),
+                _ => None,
+            };
+            if let Some(path) = path {
+                if !target_paths.contains(&path) {
+                    target_paths.push(path);
+                }
+            }
+        }
+
+        if target_paths.is_empty() {
+            return;
+        }
+
+        tracing::warn!(
+            items = target_paths.len(),
+            "local-model fallback: synthesizing minimal execution plan from initial mutation paths"
+        );
+        let items: Vec<crate::contracts::PlanItem> = target_paths
+            .iter()
+            .map(|path| {
+                crate::contracts::PlanItem::new(
+                    format!("{path}: implement requested change"),
+                    vec![path.clone()],
+                )
+            })
+            .collect();
+        self.execution_plan = crate::contracts::ExecutionPlan::new(items);
+        if let Some(first) = self.execution_plan.next_actionable_index() {
+            self.execution_plan.mark_in_progress(first);
+        }
+        self.agent_telemetry.record_plan_registration();
+        let note = SessionMessage::new(
+            MessageRole::Tool,
+            "system",
+            "[System] ANVIL_PLAN が省略されたため、最初の変更対象から最小限の実行計画を自動補完しました。以後は計画を言い直さず、ANVIL_TOOL で実装を続けてください。"
+                .to_string(),
+        )
+        .with_id(self.next_message_id("tool"));
+        self.session.push_message(note);
+    }
+
     /// Extract sub-agent tool calls, execute them, and return results along
     /// with the remaining normal tool calls (DR1-003).
     fn extract_and_run_subagent_calls<C: ProviderClient>(
@@ -1154,7 +1213,6 @@ impl App {
             term_state.task_semantics_suppression_count(),
             turn_has_subagent,
         );
-
         // Capture state flags before the FSM consumes `input`; these drive
         // the side-effect dispatch below.
         let was_awaiting_guidance = term_state.awaiting_guidance_followup();
@@ -2889,6 +2947,7 @@ impl App {
         };
 
         // Phase 1.75: Pre-mutation plan barrier (Issue #303).
+        self.maybe_register_synthetic_plan_from_initial_mutations(&validated_requests);
         // Block mutation tools when no execution plan is registered.
         let barrier_result =
             mutation_barrier.check_and_filter(validated_requests, self.execution_plan.is_empty());

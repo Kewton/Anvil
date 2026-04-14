@@ -1931,7 +1931,8 @@ impl ExecutionPlan {
                     .unwrap_or_default();
                 format!(
                     "[System] まだ {remaining}/{total} 項目が未完了です。次の項目を実行してください:\n  {next_desc}{target_hint}\n\
-                     全項目完了後に ANVIL_FINAL を出力してください。"
+                     全項目完了後に ANVIL_FINAL を出力してください。\n\
+                     完了済みの内容を説明するのではなく、次の応答では file.write / file.edit / file.rewrite の ANVIL_TOOL を直接出力してください。"
                 )
             }
             crate::config::GuidanceMode::Batch => {
@@ -1977,7 +1978,8 @@ impl ExecutionPlan {
                 }
 
                 msg.push_str(
-                    "これらの項目をまとめて実行してください。全項目完了後に ANVIL_FINAL を出力してください。",
+                    "これらの項目をまとめて実行してください。全項目完了後に ANVIL_FINAL を出力してください。\n\
+                     完了済みの内容を説明するのではなく、次の応答では file.write / file.edit / file.rewrite の ANVIL_TOOL を直接出力してください。",
                 );
                 msg
             }
@@ -2021,13 +2023,15 @@ impl ExecutionPlan {
         };
 
         // Issue #269 Phase 2: removed full checklist re-display.
-        Some(format!(
-            "{forced_prefix}[System] 以下の項目をまとめて実行してください:\n{}\n完了: {}/{} 項目 (残り {})\n\nこれらの項目をまとめて進めてください。全項目完了時のみ ANVIL_FINAL を出力してください。",
-            workset_lines.join("\n"),
-            finished,
-            total,
-            remaining,
-        ))
+        Some(
+            format!(
+                "{forced_prefix}[System] 以下の項目をまとめて実行してください:\n{}\n完了: {}/{} 項目 (残り {})\n\nこれらの項目をまとめて進めてください。全項目完了時のみ ANVIL_FINAL を出力してください。",
+                workset_lines.join("\n"),
+                finished,
+                total,
+                remaining,
+            ) + "\n完了済みの内容を説明するのではなく、次の応答では file.write / file.edit / file.rewrite の ANVIL_TOOL を直接出力してください。",
+        )
     }
 
     /// Build incomplete plan message with precomputed workset (Issue #263).
@@ -2065,7 +2069,8 @@ impl ExecutionPlan {
         format!(
             "{forced_prefix}[System] まだ {remaining}/{total} 項目が未完了です。\n\n\
              未完了 (次のworkset):\n{}\n\n\
-             これらの項目をまとめて実行してください。全項目完了後に ANVIL_FINAL を出力してください。",
+             これらの項目をまとめて実行してください。全項目完了後に ANVIL_FINAL を出力してください。\n\
+             完了済みの内容を説明するのではなく、次の応答では file.write / file.edit / file.rewrite の ANVIL_TOOL を直接出力してください。",
             workset_lines.join("\n")
         )
     }
@@ -2109,7 +2114,8 @@ impl ExecutionPlan {
              この項目を完了させてください:\n\
              - file.edit / file.write で対象ファイルを変更する\n\
              - または変更不要なら ANVIL_PLAN_UPDATE で [x] マークして退役させる\n\
-             - shell.exec での追加調査は不要です。すぐに実装に進んでください。"
+             - shell.exec での追加調査は不要です。すぐに実装に進んでください。\n\
+             次の応答では完了済みの説明ではなく、ANVIL_TOOL を直接出力してください。"
         ))
     }
 }
