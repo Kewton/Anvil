@@ -443,6 +443,7 @@ fn make_mutation_result(
         diff_summary: None,
         edit_detail: None,
         rolled_back,
+        observed_delta: None,
     }
 }
 

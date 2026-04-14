@@ -989,6 +989,36 @@ pub enum ToolExecutionPayload {
     },
 }
 
+/// Fact-only observed workspace delta for tools that mutate outside the
+/// native file-write pipeline (for example `shell.exec` scaffolding).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ObservedWorkspaceDelta {
+    pub created_paths: Vec<String>,
+    pub modified_paths: Vec<String>,
+    pub deleted_paths: Vec<String>,
+    pub ignored_paths: Vec<String>,
+}
+
+impl ObservedWorkspaceDelta {
+    pub fn is_empty(&self) -> bool {
+        self.created_paths.is_empty()
+            && self.modified_paths.is_empty()
+            && self.deleted_paths.is_empty()
+    }
+
+    pub fn changed_paths(&self) -> Vec<String> {
+        let mut paths = Vec::with_capacity(
+            self.created_paths.len() + self.modified_paths.len() + self.deleted_paths.len(),
+        );
+        paths.extend(self.created_paths.iter().cloned());
+        paths.extend(self.modified_paths.iter().cloned());
+        paths.extend(self.deleted_paths.iter().cloned());
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+}
+
 /// file.edit fallback stage indicating which matching strategy succeeded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditFallbackStage {
@@ -1022,6 +1052,8 @@ pub struct ToolExecutionResult {
     pub edit_detail: Option<EditResultDetail>,
     /// Whether this result was rolled back by atomic transaction failure (Issue #259).
     pub rolled_back: bool,
+    /// Fact-only observed workspace delta for tools like `shell.exec`.
+    pub observed_delta: Option<ObservedWorkspaceDelta>,
 }
 
 impl ToolExecutionResult {
@@ -1040,6 +1072,38 @@ impl ToolExecutionResult {
             elapsed_ms: Some(self.elapsed_ms.min(u64::MAX as u128) as u64),
         }
     }
+
+    pub fn observed_changed_paths(&self) -> Vec<String> {
+        if let Some(delta) = &self.observed_delta {
+            let paths = delta.changed_paths();
+            if !paths.is_empty() {
+                return paths;
+            }
+        }
+
+        if matches!(
+            self.tool_name.as_str(),
+            "file.write" | "file.edit" | "file.edit_anchor" | "file.rewrite"
+        ) && self.status == ToolExecutionStatus::Completed
+            && !self.rolled_back
+        {
+            return self.artifacts.clone();
+        }
+
+        Vec::new()
+    }
+
+    pub fn mutation_observed(&self) -> bool {
+        !self.observed_changed_paths().is_empty()
+    }
+}
+
+const SHELL_DELTA_SKIP_DIRS: &[&str] = &[".git", ".anvil", "node_modules", ".next", "target"];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkspaceSnapshotEntry {
+    len: u64,
+    modified_unix_nanos: u128,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2470,6 +2534,96 @@ impl LocalToolExecutor {
         ))
     }
 
+    fn should_observe_shell_workspace_delta(command: &str) -> bool {
+        !is_shell_inspection_command(command)
+    }
+
+    fn snapshot_workspace(
+        &self,
+    ) -> Result<HashMap<String, WorkspaceSnapshotEntry>, ToolRuntimeError> {
+        let mut snapshot = HashMap::new();
+        let walker = ignore::WalkBuilder::new(&self.root)
+            .hidden(false)
+            .follow_links(false)
+            .git_ignore(true)
+            .git_global(false)
+            .git_exclude(false)
+            .max_depth(Some(20))
+            .filter_entry(|entry| {
+                if entry.file_type().is_some_and(|ft| ft.is_dir())
+                    && let Some(name) = entry.file_name().to_str()
+                {
+                    return !SHELL_DELTA_SKIP_DIRS.contains(&name);
+                }
+                true
+            })
+            .build();
+
+        for entry in walker {
+            let entry = entry.map_err(|err| {
+                ToolRuntimeError::Io(format!("shell.exec snapshot walk error: {err}"))
+            })?;
+            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+                continue;
+            }
+            let path = entry.path();
+            let rel = path.strip_prefix(&self.root).map_err(|err| {
+                ToolRuntimeError::Io(format!("shell.exec snapshot strip_prefix error: {err}"))
+            })?;
+            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            let metadata = fs::metadata(path).map_err(|err| {
+                ToolRuntimeError::Io(format!(
+                    "shell.exec snapshot metadata error for {}: {err}",
+                    path.display()
+                ))
+            })?;
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            snapshot.insert(
+                rel_str,
+                WorkspaceSnapshotEntry {
+                    len: metadata.len(),
+                    modified_unix_nanos: modified,
+                },
+            );
+        }
+
+        Ok(snapshot)
+    }
+
+    fn observe_shell_workspace_delta(
+        &self,
+        before: &HashMap<String, WorkspaceSnapshotEntry>,
+    ) -> Result<ObservedWorkspaceDelta, ToolRuntimeError> {
+        let after = self.snapshot_workspace()?;
+        let mut delta = ObservedWorkspaceDelta::default();
+
+        for (path, before_entry) in before {
+            match after.get(path) {
+                None => delta.deleted_paths.push(path.clone()),
+                Some(after_entry) if after_entry != before_entry => {
+                    delta.modified_paths.push(path.clone());
+                }
+                Some(_) => {}
+            }
+        }
+
+        for path in after.keys() {
+            if !before.contains_key(path) {
+                delta.created_paths.push(path.clone());
+            }
+        }
+
+        delta.created_paths.sort();
+        delta.modified_paths.sort();
+        delta.deleted_paths.sort();
+        Ok(delta)
+    }
+
     fn execute_shell_exec(
         &self,
         request: &ToolExecutionRequest,
@@ -2477,6 +2631,13 @@ impl LocalToolExecutor {
         started: Instant,
     ) -> Result<ToolExecutionResult, ToolRuntimeError> {
         use std::io::BufRead;
+
+        let observe_delta = Self::should_observe_shell_workspace_delta(command);
+        let before_snapshot = if observe_delta {
+            Some(self.snapshot_workspace()?)
+        } else {
+            None
+        };
 
         writeln_stderr(&format!("\n  $ {command}"));
 
@@ -2541,6 +2702,7 @@ impl LocalToolExecutor {
                     diff_summary: None,
                     edit_detail: None,
                     rolled_back: false,
+                    observed_delta: None,
                 });
             }
             match child.try_wait() {
@@ -2560,6 +2722,19 @@ impl LocalToolExecutor {
         } else {
             ToolExecutionStatus::Failed
         };
+        let observed_delta = if success {
+            before_snapshot
+                .as_ref()
+                .map(|before| self.observe_shell_workspace_delta(before))
+                .transpose()?
+                .filter(|delta| !delta.is_empty())
+        } else {
+            None
+        };
+        let artifacts = observed_delta
+            .as_ref()
+            .map(ObservedWorkspaceDelta::changed_paths)
+            .unwrap_or_default();
         let summary = if success {
             format!("shell.exec completed: {command}")
         } else {
@@ -2574,11 +2749,12 @@ impl LocalToolExecutor {
             status,
             summary,
             payload: ToolExecutionPayload::Text(combined),
-            artifacts: Vec::new(),
+            artifacts,
             elapsed_ms: started.elapsed().as_millis(),
             diff_summary: None,
             edit_detail: None,
             rolled_back: false,
+            observed_delta,
         })
     }
 
@@ -2770,6 +2946,7 @@ impl LocalToolExecutor {
                 diff_summary: None,
                 edit_detail: None,
                 rolled_back: false,
+                observed_delta: None,
             });
         }
 
@@ -3145,6 +3322,7 @@ fn build_completed_result_with_diff(
         diff_summary,
         edit_detail: None,
         rolled_back: false,
+        observed_delta: None,
     }
 }
 
@@ -4505,5 +4683,60 @@ mod tests {
         let input = "fn main() {\n    println!(\"hello\");\n}\n";
         let result = normalize_lines(input);
         assert_eq!(result, vec!["fn main() {", "    println!(\"hello\");", "}"]);
+    }
+
+    fn shell_exec_request(command: &str) -> ToolExecutionRequest {
+        ToolExecutionRequest {
+            tool_call_id: "call_shell".to_string(),
+            spec: ToolSpec {
+                version: 1,
+                name: "shell.exec".to_string(),
+                kind: ToolKind::ShellExec,
+                execution_class: ExecutionClass::Interactive,
+                permission_class: PermissionClass::Confirm,
+                execution_mode: ExecutionMode::SequentialOnly,
+                plan_mode: PlanModePolicy::AllowedWithScope,
+                rollback_policy: RollbackPolicy::None,
+            },
+            input: ToolInput::ShellExec {
+                command: command.to_string(),
+            },
+            extra_field_warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn shell_exec_observes_workspace_delta_for_created_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut executor = LocalToolExecutor::new_without_rate_limit(dir.path());
+        let request = shell_exec_request(
+            "mkdir -p app/src && printf 'ok\\n' > app/package.json && printf 'hello\\n' > app/src/page.tsx",
+        );
+
+        let result = executor
+            .execute(request)
+            .expect("shell.exec should succeed");
+
+        assert_eq!(result.status, ToolExecutionStatus::Completed);
+        assert!(result.mutation_observed());
+        let changed = result.observed_changed_paths();
+        assert!(changed.contains(&"app/package.json".to_string()));
+        assert!(changed.contains(&"app/src/page.tsx".to_string()));
+    }
+
+    #[test]
+    fn shell_exec_read_only_command_has_no_observed_delta() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("file.txt"), "hello\n").unwrap();
+        let mut executor = LocalToolExecutor::new_without_rate_limit(dir.path());
+        let request = shell_exec_request("ls -la");
+
+        let result = executor
+            .execute(request)
+            .expect("shell.exec should succeed");
+
+        assert_eq!(result.status, ToolExecutionStatus::Completed);
+        assert!(!result.mutation_observed());
+        assert!(result.observed_delta.is_none());
     }
 }

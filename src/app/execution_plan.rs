@@ -397,8 +397,6 @@ impl App {
         let mut mutations_count: u32 = 0;
         let current_idx = self.execution_plan.next_actionable_index();
 
-        let mutation_tools = super::MUTATION_TOOLS;
-
         // Snapshot finished state before processing
         let was_finished: Vec<bool> = self
             .execution_plan
@@ -408,9 +406,7 @@ impl App {
             .collect();
 
         for r in results {
-            if !mutation_tools.contains(&r.tool_name.as_str())
-                || r.status != crate::tooling::ToolExecutionStatus::Completed
-            {
+            if r.status != crate::tooling::ToolExecutionStatus::Completed {
                 continue;
             }
 
@@ -419,52 +415,54 @@ impl App {
                 self.agent_telemetry.record_rolled_back_mutation();
                 continue;
             }
-            // Skip no-op mutations
-            if r.summary.contains("(no changes)") {
+            let changed_paths = r.observed_changed_paths();
+            if changed_paths.is_empty() {
                 self.agent_telemetry.record_no_op_mutation();
-                continue;
-            }
-
-            if r.summary.is_empty() {
                 continue;
             }
 
             mutations_count += 1;
 
-            // Find matching unfinished items by target_files
-            let mut matches: Vec<usize> = Vec::new();
-            for (i, item) in self.execution_plan.items.iter().enumerate() {
-                if item.is_finished() || item.target_files.is_empty() {
-                    continue;
+            for changed_path in changed_paths {
+                // Find matching unfinished items by target_files
+                let mut matches: Vec<usize> = Vec::new();
+                for (i, item) in self.execution_plan.items.iter().enumerate() {
+                    if item.is_finished() || item.target_files.is_empty() {
+                        continue;
+                    }
+                    let file_matches = item
+                        .target_files
+                        .iter()
+                        .any(|tf| ExecutionPlan::path_matches(tf, &changed_path));
+                    if file_matches {
+                        matches.push(i);
+                    }
                 }
-                let file_matches = item
-                    .target_files
-                    .iter()
-                    .any(|tf| ExecutionPlan::path_matches(tf, &r.summary));
-                if file_matches {
-                    matches.push(i);
-                }
-            }
 
-            if !matches.is_empty() {
-                // Prioritize InProgress items over Pending
-                let inprogress: Vec<usize> = matches
-                    .iter()
-                    .copied()
-                    .filter(|&i| self.execution_plan.items[i].status == PlanItemStatus::InProgress)
-                    .collect();
-                let targets = if inprogress.is_empty() {
-                    matches
+                if !matches.is_empty() {
+                    // Prioritize InProgress items over Pending
+                    let inprogress: Vec<usize> = matches
+                        .iter()
+                        .copied()
+                        .filter(|&i| {
+                            self.execution_plan.items[i].status == PlanItemStatus::InProgress
+                        })
+                        .collect();
+                    let targets = if inprogress.is_empty() {
+                        matches
+                    } else {
+                        inprogress
+                    };
+                    for idx in targets {
+                        self.execution_plan
+                            .record_mutation_success(idx, &changed_path);
+                    }
                 } else {
-                    inprogress
-                };
-                for idx in targets {
-                    self.execution_plan.record_mutation_success(idx, &r.summary);
-                }
-            } else {
-                // Fallback: attribute to current item only (empty target_files or no match)
-                if let Some(idx) = current_idx {
-                    self.execution_plan.record_mutation_success(idx, &r.summary);
+                    // Fallback: attribute to current item only (empty target_files or no match)
+                    if let Some(idx) = current_idx {
+                        self.execution_plan
+                            .record_mutation_success(idx, &changed_path);
+                    }
                 }
             }
         }
@@ -492,8 +490,9 @@ impl App {
         // Record failures (attributed to current item)
         if let Some(idx) = current_idx {
             let has_failed_mutation = results.iter().any(|r| {
-                mutation_tools.contains(&r.tool_name.as_str())
-                    && r.status == crate::tooling::ToolExecutionStatus::Failed
+                r.status == crate::tooling::ToolExecutionStatus::Failed
+                    && (!r.summary.contains("(no changes)")
+                        || !r.observed_changed_paths().is_empty())
             });
             if has_failed_mutation && !self.execution_plan.items[idx].is_finished() {
                 self.execution_plan.record_failure(idx);

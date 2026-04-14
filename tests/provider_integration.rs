@@ -4350,6 +4350,199 @@ fn implementation_task_with_read_only_followup_does_not_stop_without_plan() {
 }
 
 #[test]
+fn shell_exec_mutation_followup_does_not_stop_after_partial_progress() {
+    let root = common::unique_test_dir("shell_exec_partial_progress_retry");
+    let mut config = common::build_config_in(root.clone());
+    config.mode.approval_required = false;
+    let provider_ctx =
+        anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
+    let mut app = anvil::app::App::new(
+        config,
+        provider_ctx,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("app should initialize");
+    let tui = Tui::new();
+
+    let seen_requests = Rc::new(RefCell::new(Vec::new()));
+
+    struct ShellMutationFollowupProvider {
+        seen_requests: Rc<RefCell<Vec<ProviderTurnRequest>>>,
+    }
+
+    impl ProviderClient for ShellMutationFollowupProvider {
+        fn stream_turn(
+            &self,
+            request: &ProviderTurnRequest,
+            emit: &mut dyn FnMut(ProviderEvent),
+        ) -> Result<(), ProviderTurnError> {
+            let call_index = self.seen_requests.borrow().len();
+            self.seen_requests.borrow_mut().push(request.clone());
+
+            match call_index {
+                0 => emit(ProviderEvent::Agent(AgentEvent::Done {
+                    status: "Done. session saved".to_string(),
+                    assistant_message: concat!(
+                        "```ANVIL_TOOL\n",
+                        "{\"id\":\"call_001\",\"tool\":\"shell.exec\",\"command\":\"mkdir -p app/src && printf 'ok\\\\n' > app/package.json\"}\n",
+                        "```\n"
+                    )
+                    .to_string(),
+                    completion_summary: "bootstrap".to_string(),
+                    saved_status: "session saved".to_string(),
+                    tool_logs: Vec::new(),
+                    elapsed_ms: 0,
+                    inference_performance: None,
+                    tool_calls: None,
+                    assistant_tool_call_records: None,
+                })),
+                1 => emit(ProviderEvent::TokenDelta(
+                    "Next.js app scaffold is ready. 次にゲーム実装を進めます。".to_string(),
+                )),
+                _ => emit(ProviderEvent::TokenDelta(
+                    concat!(
+                        "```ANVIL_PLAN\n",
+                        "- [ ] app/src/game.ts: implement the first game module\n",
+                        "```\n",
+                        "```ANVIL_TOOL\n",
+                        "{\"id\":\"call_002\",\"tool\":\"file.write\",\"path\":\"./app/src/game.ts\",\"content\":\"export const ready = true;\\n\"}\n",
+                        "```\n",
+                        "```ANVIL_FINAL\n",
+                        "Implemented the first game module.\n",
+                        "```\n"
+                    )
+                    .to_string(),
+                )),
+            }
+            Ok(())
+        }
+    }
+
+    let provider = ShellMutationFollowupProvider {
+        seen_requests: seen_requests.clone(),
+    };
+
+    let _frames = app
+        .run_live_turn(
+            "あなたが考える最高に面白くかっこいいスペースインベーダーゲームを3011ポートで起動可能なnext.jsアプリとして開発してください。",
+            &provider,
+            &tui,
+        )
+        .expect("shell mutation partial progress scenario should continue");
+
+    let requests = seen_requests.borrow();
+    assert_eq!(
+        requests.len(),
+        3,
+        "expected initial shell mutation, suppressed prose-only follow-up, and implementation retry"
+    );
+    assert!(
+        root.join("app/package.json").exists(),
+        "shell.exec should create scaffold files"
+    );
+    assert!(
+        root.join("app/src/game.ts").exists(),
+        "follow-up retry should continue into file mutation"
+    );
+}
+
+#[test]
+fn shell_exec_mutation_advances_plan_before_final_gate() {
+    let root = common::unique_test_dir("shell_exec_plan_sync");
+    let mut config = common::build_config_in(root.clone());
+    config.mode.approval_required = false;
+    let provider_ctx =
+        anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
+    let mut app = anvil::app::App::new(
+        config,
+        provider_ctx,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("app should initialize");
+    let tui = Tui::new();
+
+    let seen_requests = Rc::new(RefCell::new(Vec::new()));
+
+    struct ShellPlanSyncProvider {
+        seen_requests: Rc<RefCell<Vec<ProviderTurnRequest>>>,
+    }
+
+    impl ProviderClient for ShellPlanSyncProvider {
+        fn stream_turn(
+            &self,
+            request: &ProviderTurnRequest,
+            emit: &mut dyn FnMut(ProviderEvent),
+        ) -> Result<(), ProviderTurnError> {
+            let call_index = self.seen_requests.borrow().len();
+            self.seen_requests.borrow_mut().push(request.clone());
+
+            match call_index {
+                0 => emit(ProviderEvent::Agent(AgentEvent::Done {
+                    status: "Done. session saved".to_string(),
+                    assistant_message: concat!(
+                        "```ANVIL_PLAN\n",
+                        "- [ ] app/package.json: bootstrap the Next.js app\n",
+                        "```\n",
+                        "```ANVIL_TOOL\n",
+                        "{\"id\":\"call_001\",\"tool\":\"shell.exec\",\"command\":\"mkdir -p app && printf 'ok\\\\n' > app/package.json\"}\n",
+                        "```\n"
+                    )
+                    .to_string(),
+                    completion_summary: "bootstrapped".to_string(),
+                    saved_status: "session saved".to_string(),
+                    tool_logs: Vec::new(),
+                    elapsed_ms: 0,
+                    inference_performance: None,
+                    tool_calls: None,
+                    assistant_tool_call_records: None,
+                })),
+                1 => emit(ProviderEvent::Agent(AgentEvent::Done {
+                    status: "Done. session saved".to_string(),
+                    assistant_message: concat!(
+                        "```ANVIL_FINAL\n",
+                        "Bootstrap completed.\n",
+                        "```\n"
+                    )
+                    .to_string(),
+                    completion_summary: "completed".to_string(),
+                    saved_status: "session saved".to_string(),
+                    tool_logs: Vec::new(),
+                    elapsed_ms: 0,
+                    inference_performance: None,
+                    tool_calls: None,
+                    assistant_tool_call_records: None,
+                })),
+                _ => panic!("provider should not need extra retries once shell mutation satisfies the plan"),
+            }
+            Ok(())
+        }
+    }
+
+    let provider = ShellPlanSyncProvider {
+        seen_requests: seen_requests.clone(),
+    };
+
+    let _frames = app
+        .run_live_turn(
+            "3011ポートで起動可能なnext.jsアプリを作ってください。",
+            &provider,
+            &tui,
+        )
+        .expect("shell mutation should satisfy the plan before final gate");
+
+    let requests = seen_requests.borrow();
+    assert_eq!(
+        requests.len(),
+        2,
+        "expected initial shell mutation and a final response without an extra suppression loop"
+    );
+    assert!(
+        root.join("app/package.json").exists(),
+        "shell.exec should create the target file that satisfies the plan"
+    );
+}
+
+#[test]
 fn done_with_anvil_plan_only_continues_into_followup_execution() {
     let root = common::unique_test_dir("done_plan_only_followup");
     let mut config = common::build_config_in(root.clone());

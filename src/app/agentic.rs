@@ -119,6 +119,37 @@ impl ModeTurnCounts {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct TurnProgressFacts {
+    mutation_observed: bool,
+    changed_paths_nonempty: bool,
+    plan_progress_observed: bool,
+    exploration_only: bool,
+}
+
+impl TurnProgressFacts {
+    fn from_results(results: &[ToolExecutionResult], plan_items_advanced: u32) -> Self {
+        let mutation_observed = results.iter().any(ToolExecutionResult::mutation_observed);
+        let changed_paths_nonempty = mutation_observed;
+        let plan_progress_observed = plan_items_advanced > 0;
+        let exploration_only = !results.is_empty()
+            && !mutation_observed
+            && results
+                .iter()
+                .all(|r| !MUTATION_TOOL_NAMES.contains(&r.tool_name.as_str()));
+        Self {
+            mutation_observed,
+            changed_paths_nonempty,
+            plan_progress_observed,
+            exploration_only,
+        }
+    }
+
+    fn partial_progress(self) -> bool {
+        self.mutation_observed && !self.plan_progress_observed
+    }
+}
+
 /// Turn summary information for structured logging (Issue #206).
 #[derive(Debug)]
 pub struct TurnSummary<'a> {
@@ -209,10 +240,7 @@ const MUTATION_TOOL_NAMES: &[&str] = &[
 /// not rolled back, and with an actual diff). Issue #285 A2 fix.
 pub fn results_contain_successful_mutation(results: &[ToolExecutionResult]) -> bool {
     results.iter().any(|r| {
-        MUTATION_TOOL_NAMES.contains(&r.tool_name.as_str())
-            && r.status == ToolExecutionStatus::Completed
-            && !r.rolled_back
-            && r.diff_summary.is_some()
+        r.status == ToolExecutionStatus::Completed && !r.rolled_back && r.mutation_observed()
     })
 }
 
@@ -336,6 +364,7 @@ fn execute_parallel_group_standalone(
                                 diff_summary: None,
                                 edit_detail: None,
                                 rolled_back: false,
+                                observed_delta: None,
                             }
                         });
                         // Update progress entry
@@ -383,6 +412,7 @@ fn execute_parallel_group_standalone(
                                 diff_summary: None,
                                 edit_detail: None,
                                 rolled_back: false,
+                                observed_delta: None,
                             },
                         ));
                     }
@@ -539,6 +569,7 @@ impl App {
                     diff_summary: None,
                     edit_detail: None,
                     rolled_back: false,
+                    observed_delta: None,
                 });
                 continue;
             }
@@ -853,6 +884,7 @@ impl App {
             diff_summary: None,
             edit_detail: None,
             rolled_back: false,
+            observed_delta: None,
         };
 
         // DR3-001: file.rewrite first, then agent.fix_slice summary
@@ -970,6 +1002,33 @@ impl App {
         self.should_fire_task_semantics_gate_common()
     }
 
+    fn should_retry_after_partial_progress(
+        &self,
+        turn_progress: TurnProgressFacts,
+        suppression_count: u8,
+        turn_has_subagent: bool,
+    ) -> bool {
+        if suppression_count >= MAX_TASK_SEMANTICS_GATE_RETRIES || turn_has_subagent {
+            return false;
+        }
+        if !turn_progress.partial_progress()
+            || !turn_progress.changed_paths_nonempty
+            || turn_progress.exploration_only
+        {
+            return false;
+        }
+        let Some(task) = self.session.working_memory.active_task.as_deref() else {
+            return false;
+        };
+        if !task_semantics_requires_implementation(task) {
+            return false;
+        }
+        if !self.execution_plan.is_empty() && self.execution_plan.all_finished() {
+            return false;
+        }
+        true
+    }
+
     /// Inject a task-semantics gate retry message (Issue #382).
     fn inject_task_semantics_gate_retry(&mut self) {
         tracing::warn!("task-semantics gate: implementation task with no file changes, retrying");
@@ -1040,6 +1099,7 @@ impl App {
         &mut self,
         next_structured: &mut StructuredAssistantResponse,
         term_state: &mut TerminationLoopState,
+        turn_progress: TurnProgressFacts,
         turn_has_subagent: bool,
     ) -> Result<TerminationTransition, AppError> {
         // Pre-compute all inputs for the FSM.
@@ -1083,6 +1143,11 @@ impl App {
             term_state.task_semantics_suppression_count(),
             turn_has_subagent,
         );
+        let partial_progress_retry = self.should_retry_after_partial_progress(
+            turn_progress,
+            term_state.task_semantics_suppression_count(),
+            turn_has_subagent,
+        );
 
         // Capture state flags before the FSM consumes `input`; these drive
         // the side-effect dispatch below.
@@ -1121,6 +1186,13 @@ impl App {
                 Ok(TerminationTransition::Continue)
             }
             TerminationTransition::Retry(RetryKind::TaskSemantics) => {
+                term_state.record_task_semantics_suppression();
+                self.inject_task_semantics_gate_retry();
+                Ok(TerminationTransition::Continue)
+            }
+            TerminationTransition::Break(EndOfTurnOutcome::FinalAnswer)
+                if partial_progress_retry =>
+            {
                 term_state.record_task_semantics_suppression();
                 self.inject_task_semantics_gate_retry();
                 Ok(TerminationTransition::Continue)
@@ -1479,6 +1551,10 @@ impl App {
 
             // Update plan item status from tool results; capture telemetry.
             let (mut turn_mutations, turn_items_advanced) = self.update_plan_from_results(&results);
+            let turn_progress = TurnProgressFacts::from_results(&results, turn_items_advanced);
+            if turn_progress.mutation_observed && turn_mutations == 0 {
+                turn_mutations = 1;
+            }
             // Issue #299: count recovery reads as mutations so stagnation
             // scoring does not inflate during recovery.
             if recovery_read_count > 0 {
@@ -1500,32 +1576,24 @@ impl App {
                     .session_start
                     .map(|s| s.elapsed().as_secs_f64());
                 for r in &results {
-                    if crate::app::MUTATION_TOOLS.contains(&r.tool_name.as_str())
-                        && r.status == crate::tooling::ToolExecutionStatus::Completed
+                    if r.status == crate::tooling::ToolExecutionStatus::Completed
                         && !r.rolled_back
-                        && !r.summary.is_empty()
-                        && !r.summary.contains("(no changes)")
+                        && r.mutation_observed()
                     {
-                        self.stagnation_state.record_mutation(&r.summary);
+                        for path in r.observed_changed_paths() {
+                            self.stagnation_state.record_mutation(&path);
+                        }
                         self.agent_telemetry.record_mutation_turn(
                             self.session_stats.total_turns,
                             elapsed_s,
-                            &r.tool_name, // already validated by MUTATION_TOOLS.contains()
+                            &r.tool_name,
                         );
 
                         // Issue #391: latch first mutation so follow-up
                         // ANVIL_PLAN blocks after real progress are treated
                         // as legitimate replan (Issue #305) rather than
-                        // stall restatements. All mutation tools
-                        // (file.write / file.edit / file.edit_anchor /
-                        // file.rewrite) indicate plan execution has started
-                        // and must release the stall latch.
-                        if matches!(
-                            r.tool_name.as_str(),
-                            "file.write" | "file.edit" | "file.edit_anchor" | "file.rewrite"
-                        ) {
-                            plan_stall_tracker.record_first_tool_call();
-                        }
+                        // stall restatements.
+                        plan_stall_tracker.record_first_tool_call();
 
                         // Issue #364: attribute mutation to proactive delegation if pending.
                         if self.proactive_delegation_pending {
@@ -1689,10 +1757,7 @@ impl App {
             // Collect tool names for this iteration's turn summary (before LLM call)
             let turn_tool_names: Vec<String> =
                 results.iter().map(|r| r.tool_name.clone()).collect();
-            let turn_files_modified = results
-                .iter()
-                .filter(|r| r.diff_summary.is_some() && !r.rolled_back)
-                .count();
+            let turn_files_modified = results.iter().filter(|r| r.mutation_observed()).count();
             let turn_tool_count = results.len() + agent_results.len();
 
             let mut next_token_buffer = String::new();
@@ -1795,7 +1860,8 @@ impl App {
                 self.stagnation_state.record_plan_item_completion();
             }
             // Issue #269 Phase 3: stagnation end_turn hook + forced mode update.
-            self.stagnation_state.end_turn(turn_mutations > 0);
+            self.stagnation_state
+                .end_turn(turn_progress.mutation_observed || turn_mutations > 0);
             let stagnation_score =
                 crate::app::stagnation_state::compute_stagnation_score(&self.stagnation_state);
             // Issue #292: parameterize threshold via model size class.
@@ -2138,7 +2204,8 @@ impl App {
                 && self.agent_telemetry.fixslice_worker_failure_count > 0;
             if thrash_armed {
                 let had_tool_calls = !results.is_empty();
-                let plan_advanced = turn_items_advanced > 0 || turn_mutations > 0;
+                let plan_advanced =
+                    turn_progress.plan_progress_observed || turn_progress.mutation_observed;
                 let action = self
                     .post_failure_thrash_detector
                     .record_turn(had_tool_calls, plan_advanced);
@@ -2359,6 +2426,7 @@ impl App {
                 match self.handle_empty_tool_response(
                     &mut next_structured,
                     &mut term_state,
+                    turn_progress,
                     turn_has_subagent,
                 )? {
                     TerminationTransition::Break(reason) => {
@@ -2537,6 +2605,7 @@ impl App {
                         diff_summary: None,
                         edit_detail: None,
                         rolled_back: false,
+                        observed_delta: None,
                     },
                 ));
                 continue;
@@ -2637,6 +2706,7 @@ impl App {
                 diff_summary: None,
                 edit_detail: None,
                 rolled_back: false,
+                observed_delta: None,
             });
 
         // Remove checkpoint if tool execution failed.
@@ -2673,6 +2743,7 @@ impl App {
                 diff_summary: None,
                 edit_detail: None,
                 rolled_back: false,
+                observed_delta: None,
             };
         };
 
@@ -2701,6 +2772,7 @@ impl App {
             diff_summary: None,
             edit_detail: None,
             rolled_back: false,
+            observed_delta: None,
         }
     }
 
@@ -2776,6 +2848,7 @@ impl App {
                                     diff_summary: None,
                                     edit_detail: None,
                                     rolled_back: false,
+                                    observed_delta: None,
                                 },
                             ));
                         }
@@ -2897,6 +2970,7 @@ impl App {
                 diff_summary: None,
                 edit_detail: None,
                 rolled_back: false,
+                observed_delta: None,
             }),
             _ => None,
         };
@@ -3193,6 +3267,7 @@ impl App {
                 diff_summary: None,
                 edit_detail: None,
                 rolled_back: false,
+                observed_delta: None,
             };
             self.record_tool_result(&transition_result, false);
             results.push(transition_result);
@@ -3223,6 +3298,7 @@ impl App {
                     diff_summary: None,
                     edit_detail: None,
                     rolled_back: false,
+                    observed_delta: None,
                 };
                 self.record_tool_result(&transition_result, false);
                 results.push(transition_result);
@@ -3237,6 +3313,7 @@ impl App {
     fn record_tool_result(&mut self, result: &ToolExecutionResult, is_recovery: bool) {
         // Session stats: record tool call (Issue #206 C-3)
         self.session_stats.record_tool_call(&result.tool_name);
+        let observed_changed_paths = result.observed_changed_paths();
 
         // Session stats: record file change line counts from diff_summary (Issue #206 C-3, #259)
         // Skip rolled-back results to avoid counting reverted changes.
@@ -3249,20 +3326,25 @@ impl App {
                 self.session_stats.files_modified.insert(artifact.clone());
             }
         }
+        if result.status == ToolExecutionStatus::Completed && !result.rolled_back {
+            for path in &observed_changed_paths {
+                self.session_stats.files_modified.insert(path.clone());
+            }
+        }
 
         // Track tool usage for dynamic system prompt generation (Issue #73)
         self.session.used_tools.insert(result.tool_name.clone());
 
-        // Working memory: track touched files (file-mutating tools only) (Issue #130, #157)
+        // Working memory: track touched files from any observed mutation source.
         let is_file_tool = matches!(
             result.tool_name.as_str(),
             "file.write" | "file.edit" | "file.edit_anchor" | "file.rewrite"
         );
-        if is_file_tool
-            && result.status == ToolExecutionStatus::Completed
+        if result.status == ToolExecutionStatus::Completed
             && !result.summary.contains("[rolled back]")
+            && !observed_changed_paths.is_empty()
         {
-            for artifact in &result.artifacts {
+            for artifact in &observed_changed_paths {
                 let path = std::path::Path::new(artifact);
                 if let Some(rel) = self.relative_path_for_working_memory(path) {
                     self.session.working_memory.update_touched_files(&rel);
@@ -4161,6 +4243,7 @@ fn build_failed_result(
         diff_summary: None,
         edit_detail: None,
         rolled_back: false,
+        observed_delta: None,
     }
 }
 
@@ -4180,6 +4263,7 @@ fn build_failed_result_with_text(
         diff_summary: None,
         edit_detail: None,
         rolled_back: false,
+        observed_delta: None,
     }
 }
 
@@ -4633,6 +4717,7 @@ mod trust_tests {
             diff_summary: None,
             edit_detail: None,
             rolled_back: false,
+            observed_delta: None,
         };
 
         let formatted = format_tool_result_message(&result, 8_000);

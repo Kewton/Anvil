@@ -561,6 +561,7 @@ fn make_result(
         diff_summary,
         edit_detail: None,
         rolled_back,
+        observed_delta: None,
     }
 }
 

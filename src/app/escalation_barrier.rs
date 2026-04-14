@@ -91,6 +91,7 @@ impl EscalationBarrier {
                     diff_summary: None,
                     edit_detail: None,
                     rolled_back: false,
+                    observed_delta: None,
                 };
                 blocked.push((idx, result));
             } else {
