@@ -1831,10 +1831,31 @@ impl App {
             let mut next_token_buffer = String::new();
             let mut first_token = true;
             let mut spinner_opt = Some(spinner);
+            let stream_started = std::time::Instant::now();
+            let mut first_event_logged = false;
+            if self.config.mode.debug_logging {
+                tracing::info!(
+                    provider = %self.config.runtime.provider,
+                    model = %self.config.runtime.model,
+                    "debug_timing: agentic_followup_stream_started"
+                );
+            }
 
             let stream_result = provider_client.stream_turn(&request, &mut |event| {
                 if let Some(s) = spinner_opt.take() {
                     s.stop();
+                }
+                if self.config.mode.debug_logging && !first_event_logged {
+                    let event_kind = match &event {
+                        ProviderEvent::TokenDelta(_) => "token",
+                        ProviderEvent::Agent(_) => "agent",
+                    };
+                    tracing::info!(
+                        event_kind,
+                        elapsed_ms = stream_started.elapsed().as_millis(),
+                        "debug_timing: agentic_followup_first_event"
+                    );
+                    first_event_logged = true;
                 }
                 if let ProviderEvent::TokenDelta(delta) = &event {
                     next_token_buffer.push_str(delta);
@@ -1851,6 +1872,13 @@ impl App {
             }
             if !first_token {
                 writeln_stderr("");
+            }
+            if self.config.mode.debug_logging {
+                tracing::info!(
+                    elapsed_ms = stream_started.elapsed().as_millis(),
+                    streamed_chars = next_token_buffer.len(),
+                    "debug_timing: agentic_followup_stream_finished"
+                );
             }
 
             match stream_result {
@@ -3837,10 +3865,31 @@ impl App {
         let mut token_buffer = String::new();
         let mut first_token = true;
         let mut spinner_opt = Some(spinner);
+        let stream_started = std::time::Instant::now();
+        let mut first_event_logged = false;
+        if self.config.mode.debug_logging {
+            tracing::info!(
+                provider = %self.config.runtime.provider,
+                model = %self.config.runtime.model,
+                "debug_timing: guarded_retry_stream_started"
+            );
+        }
 
         let stream_result = provider_client.stream_turn(&request, &mut |event| {
             if let Some(s) = spinner_opt.take() {
                 s.stop();
+            }
+            if self.config.mode.debug_logging && !first_event_logged {
+                let event_kind = match &event {
+                    ProviderEvent::TokenDelta(_) => "token",
+                    ProviderEvent::Agent(_) => "agent",
+                };
+                tracing::info!(
+                    event_kind,
+                    elapsed_ms = stream_started.elapsed().as_millis(),
+                    "debug_timing: guarded_retry_first_event"
+                );
+                first_event_logged = true;
             }
             if let ProviderEvent::TokenDelta(delta) = &event {
                 token_buffer.push_str(delta);
@@ -3857,6 +3906,13 @@ impl App {
         }
         if !first_token {
             writeln_stderr("");
+        }
+        if self.config.mode.debug_logging {
+            tracing::info!(
+                elapsed_ms = stream_started.elapsed().as_millis(),
+                streamed_chars = token_buffer.len(),
+                "debug_timing: guarded_retry_stream_finished"
+            );
         }
 
         match stream_result {

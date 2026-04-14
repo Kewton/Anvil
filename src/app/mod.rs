@@ -1632,11 +1632,34 @@ impl App {
         let mut token_buffer = String::new();
         let mut collected_events: Vec<ProviderEvent> = Vec::new();
         let mut first_token = true;
+        let stream_started = std::time::Instant::now();
+        let mut first_event_logged = false;
+        if self.config.mode.debug_logging {
+            tracing::info!(
+                provider = %self.config.runtime.provider,
+                model = %self.config.runtime.model,
+                prompt_chars = request.messages.last().map(|m| m.content.len()).unwrap_or(0),
+                "debug_timing: top_level_stream_started"
+            );
+        }
 
         let stream_result = provider_client.stream_turn(&request, &mut |event| {
             // Stop spinner completely before any output (joins the thread)
             if let Some(s) = spinner_opt.take() {
                 s.stop();
+            }
+
+            if self.config.mode.debug_logging && !first_event_logged {
+                let event_kind = match &event {
+                    ProviderEvent::TokenDelta(_) => "token",
+                    ProviderEvent::Agent(_) => "agent",
+                };
+                tracing::info!(
+                    event_kind,
+                    elapsed_ms = stream_started.elapsed().as_millis(),
+                    "debug_timing: top_level_first_event"
+                );
+                first_event_logged = true;
             }
 
             match &event {
@@ -1661,6 +1684,14 @@ impl App {
         // End streaming output with newline
         if !first_token {
             writeln_stderr("");
+        }
+        if self.config.mode.debug_logging {
+            tracing::info!(
+                elapsed_ms = stream_started.elapsed().as_millis(),
+                event_count = collected_events.len(),
+                streamed_chars = token_buffer.len(),
+                "debug_timing: top_level_stream_finished"
+            );
         }
 
         // Phase 2: Process collected events for state management.
