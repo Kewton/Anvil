@@ -251,6 +251,7 @@ pub struct App {
     mcp_descriptions: Option<String>,
     project_instructions: Option<String>,
     shutdown_flag: Arc<AtomicBool>,
+    stop_flag: Arc<AtomicBool>,
     warning_tracker: ContextWarningTracker,
     /// Undo checkpoint stack. In-memory only, discarded on session exit.
     checkpoint_stack: CheckpointStack,
@@ -471,6 +472,20 @@ impl App {
         provider: ProviderRuntimeContext,
         shutdown_flag: Arc<AtomicBool>,
     ) -> Result<Self, AppError> {
+        Self::new_with_flags(
+            config,
+            provider,
+            shutdown_flag,
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    pub fn new_with_flags(
+        config: EffectiveConfig,
+        provider: ProviderRuntimeContext,
+        shutdown_flag: Arc<AtomicBool>,
+        stop_flag: Arc<AtomicBool>,
+    ) -> Result<Self, AppError> {
         let session_store = SessionStore::from_config(&config);
         let mut session = if config.mode.fresh_session {
             SessionRecord::new(config.paths.cwd.clone())
@@ -635,6 +650,7 @@ impl App {
             mcp_descriptions,
             project_instructions,
             shutdown_flag,
+            stop_flag,
             warning_tracker: ContextWarningTracker::new(),
             checkpoint_stack: CheckpointStack::new(),
             loop_detector: loop_detector::LoopDetector::new(loop_detection_threshold),
@@ -944,7 +960,30 @@ impl App {
 
     /// Check whether a shutdown has been requested via the shared flag.
     pub fn is_shutdown_requested(&self) -> bool {
+        self.shutdown_flag.load(Ordering::Relaxed) || self.stop_flag.load(Ordering::Relaxed)
+    }
+
+    /// Check whether the whole interactive process should exit.
+    pub fn is_process_shutdown_requested(&self) -> bool {
         self.shutdown_flag.load(Ordering::Relaxed)
+    }
+
+    fn render_interrupted_turn(
+        &mut self,
+        tui: &Tui,
+        interrupted_what: &str,
+    ) -> Result<Vec<String>, AppError> {
+        self.record_provider_error(ProviderTurnError::Cancelled)?;
+        self.execute_runtime_events(
+            &[AgentEvent::Interrupted {
+                status: "Interrupted safely".to_string(),
+                interrupted_what: interrupted_what.to_string(),
+                saved_status: "session preserved".to_string(),
+                next_actions: vec!["resume work".to_string(), "inspect status".to_string()],
+                elapsed_ms: 0,
+            }],
+            tui,
+        )
     }
 
     /// Build a structured repair message injected before escape hatch termination (Issue #309).
@@ -1292,9 +1331,13 @@ impl App {
         sidecar_client.sidecar_summarize(model, &conversation_text)
     }
 
-    /// Get a clone of the shutdown flag for injection into sub-components.
-    pub(crate) fn shutdown_flag(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.shutdown_flag)
+    /// Get a clone of the turn stop flag for injection into sub-components.
+    pub(crate) fn stop_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.stop_flag)
+    }
+
+    fn clear_stop_request(&self) {
+        self.stop_flag.store(false, Ordering::Release);
     }
 
     pub(crate) fn session_mut(&mut self) -> &mut SessionRecord {
@@ -1546,6 +1589,7 @@ impl App {
         if self.session.has_pending_turn() {
             return Err(AppError::PendingApprovalRequired);
         }
+        self.clear_stop_request();
 
         let user_input = user_input.into();
 
@@ -1681,19 +1725,7 @@ impl App {
                 }
                 Ok(frames)
             }
-            Err(ProviderTurnError::Cancelled) => {
-                self.record_provider_error(ProviderTurnError::Cancelled)?;
-                self.execute_runtime_events(
-                    &[AgentEvent::Interrupted {
-                        status: "Interrupted safely".to_string(),
-                        interrupted_what: "provider turn".to_string(),
-                        saved_status: "session preserved".to_string(),
-                        next_actions: vec!["resume work".to_string(), "inspect status".to_string()],
-                        elapsed_ms: 0,
-                    }],
-                    tui,
-                )
-            }
+            Err(ProviderTurnError::Cancelled) => self.render_interrupted_turn(tui, "provider turn"),
             Err(ref err @ ProviderTurnError::ConnectionRefused(ref msg)) => {
                 self.record_provider_error(err.clone())?;
                 self.execute_runtime_events(
@@ -1853,6 +1885,7 @@ impl App {
 
     pub fn reset_to_ready(&mut self) -> Result<AppStateSnapshot, AppError> {
         self.clear_pending_turn()?;
+        self.clear_stop_request();
         let snapshot = AppStateSnapshot::new(RuntimeState::Ready)
             .with_status("Ready for the next task".to_string());
         self.transition_with_context(snapshot, StateTransition::ResetToReady)

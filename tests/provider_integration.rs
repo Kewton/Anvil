@@ -10,6 +10,8 @@ use anvil::tui::Tui;
 use std::cell::RefCell;
 use std::fs;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 type HeaderLog = Rc<RefCell<Vec<Vec<(String, String)>>>>;
 
@@ -419,6 +421,262 @@ fn live_turn_maps_provider_cancellation_to_interrupted_state() {
             .last()
             .expect("interrupted frame should exist")
             .contains("[A] anvil > interrupted")
+    );
+}
+
+#[test]
+fn agentic_followup_cancellation_maps_to_interrupted_state() {
+    let root = common::unique_test_dir("agentic_followup_interrupt");
+    fs::create_dir_all(root.join("src")).expect("create src");
+    fs::write(root.join("src/main.rs"), "fn main() {}\n").expect("write fixture");
+
+    let mut config = common::build_config_in(root.clone());
+    config.mode.approval_required = false;
+    let provider_ctx =
+        anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let mut app = anvil::app::App::new_with_flags(
+        config,
+        provider_ctx,
+        shutdown_flag,
+        Arc::clone(&stop_flag),
+    )
+    .expect("app should initialize");
+    let tui = Tui::new();
+
+    struct FollowupCancelProvider {
+        seen_requests: Rc<RefCell<Vec<ProviderTurnRequest>>>,
+        stop_flag: Arc<AtomicBool>,
+    }
+
+    impl ProviderClient for FollowupCancelProvider {
+        fn stream_turn(
+            &self,
+            request: &ProviderTurnRequest,
+            emit: &mut dyn FnMut(ProviderEvent),
+        ) -> Result<(), ProviderTurnError> {
+            let call_index = self.seen_requests.borrow().len();
+            self.seen_requests.borrow_mut().push(request.clone());
+            match call_index {
+                0 => {
+                    emit(ProviderEvent::Agent(AgentEvent::Done {
+                        status: "Done. session saved".to_string(),
+                        assistant_message: concat!(
+                            "```ANVIL_PLAN\n",
+                            "- [ ] ./src/main.rs: inspect before editing\n",
+                            "```\n",
+                            "```ANVIL_TOOL\n",
+                            "{\"id\":\"call_001\",\"tool\":\"file.read\",\"path\":\"./src/main.rs\"}\n",
+                            "```\n"
+                        )
+                        .to_string(),
+                        completion_summary: "read file".to_string(),
+                        saved_status: "session saved".to_string(),
+                        tool_logs: Vec::new(),
+                        elapsed_ms: 0,
+                        inference_performance: None,
+                        tool_calls: None,
+                        assistant_tool_call_records: None,
+                    }));
+                    Ok(())
+                }
+                _ => {
+                    self.stop_flag.store(true, Ordering::Release);
+                    Err(ProviderTurnError::Cancelled)
+                }
+            }
+        }
+    }
+
+    let provider = FollowupCancelProvider {
+        seen_requests: Rc::new(RefCell::new(Vec::new())),
+        stop_flag,
+    };
+
+    let frames = app
+        .run_live_turn("implement the feature", &provider, &tui)
+        .expect("follow-up cancellation should map to interrupted");
+
+    assert_eq!(
+        app.state_machine().snapshot().state,
+        anvil::contracts::RuntimeState::Interrupted
+    );
+    assert!(
+        frames
+            .last()
+            .expect("interrupted frame should exist")
+            .contains("[A] anvil > interrupted")
+    );
+}
+
+#[test]
+fn guarded_retry_cancellation_maps_to_interrupted_state() {
+    let root = common::unique_test_dir("guard_retry_interrupt");
+    fs::create_dir_all(root.join("src")).expect("create src");
+    fs::write(root.join("src/main.rs"), "fn main() {}\n").expect("write fixture");
+
+    let mut config = common::build_config_in(root.clone());
+    config.mode.approval_required = false;
+    let provider_ctx =
+        anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let mut app = anvil::app::App::new_with_flags(
+        config,
+        provider_ctx,
+        shutdown_flag,
+        Arc::clone(&stop_flag),
+    )
+    .expect("app should initialize");
+    let tui = Tui::new();
+
+    struct GuardRetryCancelProvider {
+        seen_requests: Rc<RefCell<Vec<ProviderTurnRequest>>>,
+        stop_flag: Arc<AtomicBool>,
+    }
+
+    impl ProviderClient for GuardRetryCancelProvider {
+        fn stream_turn(
+            &self,
+            request: &ProviderTurnRequest,
+            emit: &mut dyn FnMut(ProviderEvent),
+        ) -> Result<(), ProviderTurnError> {
+            let call_index = self.seen_requests.borrow().len();
+            self.seen_requests.borrow_mut().push(request.clone());
+            match call_index {
+                0 => {
+                    emit(ProviderEvent::Agent(AgentEvent::Done {
+                        status: "Done. session saved".to_string(),
+                        assistant_message: concat!(
+                            "```ANVIL_PLAN\n",
+                            "- [ ] ./src/main.rs: implement a change\n",
+                            "```\n",
+                            "```ANVIL_TOOL\n",
+                            "{\"id\":\"call_001\",\"tool\":\"file.read\",\"path\":\"./src/main.rs\"}\n",
+                            "```\n",
+                            "```ANVIL_FINAL\n",
+                            "Inspected the file.\n",
+                            "```\n"
+                        )
+                        .to_string(),
+                        completion_summary: "read file".to_string(),
+                        saved_status: "session saved".to_string(),
+                        tool_logs: Vec::new(),
+                        elapsed_ms: 0,
+                        inference_performance: None,
+                        tool_calls: None,
+                        assistant_tool_call_records: None,
+                    }));
+                    Ok(())
+                }
+                _ => {
+                    self.stop_flag.store(true, Ordering::Release);
+                    Err(ProviderTurnError::Cancelled)
+                }
+            }
+        }
+    }
+
+    let provider = GuardRetryCancelProvider {
+        seen_requests: Rc::new(RefCell::new(Vec::new())),
+        stop_flag,
+    };
+
+    let frames = app
+        .run_live_turn("implement the feature", &provider, &tui)
+        .expect("guard retry cancellation should map to interrupted");
+
+    assert_eq!(
+        app.state_machine().snapshot().state,
+        anvil::contracts::RuntimeState::Interrupted
+    );
+    assert!(
+        frames
+            .last()
+            .expect("interrupted frame should exist")
+            .contains("[A] anvil > interrupted")
+    );
+}
+
+#[test]
+fn stale_stop_flag_is_cleared_before_next_turn() {
+    let root = common::unique_test_dir("stale_stop_flag_cleared");
+    let mut config = common::build_config_in(root);
+    config.mode.approval_required = false;
+    let provider_ctx =
+        anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let mut app = anvil::app::App::new_with_flags(
+        config,
+        provider_ctx,
+        shutdown_flag,
+        Arc::clone(&stop_flag),
+    )
+    .expect("app should initialize");
+    let tui = Tui::new();
+    let seen_requests = Rc::new(RefCell::new(Vec::new()));
+
+    struct InterruptThenSucceedProvider {
+        seen_requests: Rc<RefCell<Vec<ProviderTurnRequest>>>,
+        stop_flag: Arc<AtomicBool>,
+    }
+
+    impl ProviderClient for InterruptThenSucceedProvider {
+        fn stream_turn(
+            &self,
+            request: &ProviderTurnRequest,
+            emit: &mut dyn FnMut(ProviderEvent),
+        ) -> Result<(), ProviderTurnError> {
+            let call_index = self.seen_requests.borrow().len();
+            self.seen_requests.borrow_mut().push(request.clone());
+            match call_index {
+                0 => {
+                    self.stop_flag.store(true, Ordering::Release);
+                    Err(ProviderTurnError::Cancelled)
+                }
+                _ => {
+                    emit(ProviderEvent::Agent(AgentEvent::Done {
+                        status: "Done. session saved".to_string(),
+                        assistant_message: "Turn completed after interrupt.".to_string(),
+                        completion_summary: "done".to_string(),
+                        saved_status: "session saved".to_string(),
+                        tool_logs: Vec::new(),
+                        elapsed_ms: 0,
+                        inference_performance: None,
+                        tool_calls: None,
+                        assistant_tool_call_records: None,
+                    }));
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    let provider = InterruptThenSucceedProvider {
+        seen_requests,
+        stop_flag,
+    };
+
+    let interrupted = app
+        .run_live_turn("cancel this turn", &provider, &tui)
+        .expect("first turn should interrupt");
+    assert!(
+        interrupted
+            .last()
+            .expect("interrupted frame should exist")
+            .contains("[A] anvil > interrupted")
+    );
+
+    let resumed = app
+        .run_live_turn("resume work", &provider, &tui)
+        .expect("next turn should clear stale stop flag and succeed");
+    assert!(
+        resumed
+            .last()
+            .expect("done frame should exist")
+            .contains("[A] anvil > result")
     );
 }
 

@@ -662,7 +662,7 @@ impl App {
                 &scope_path,
                 provider_client,
                 &self.config,
-                self.shutdown_flag(),
+                self.stop_flag(),
                 overrides,
             );
             let result = session.run();
@@ -1725,7 +1725,7 @@ impl App {
                 Err(crate::provider::ProviderTurnError::Cancelled)
                     if self.is_shutdown_requested() =>
                 {
-                    break;
+                    return self.render_interrupted_turn(tui, "provider turn");
                 }
                 Err(
                     ref err @ crate::provider::ProviderTurnError::ConnectionRefused(_)
@@ -1738,7 +1738,7 @@ impl App {
                 other => {
                     other.map_err(|err| match err {
                         crate::provider::ProviderTurnError::Cancelled => {
-                            AppError::ToolExecution("agentic follow-up cancelled".to_string())
+                            AppError::ProviderTurn(crate::provider::ProviderTurnError::Cancelled)
                         }
                         other => {
                             AppError::ToolExecution(format!("agentic follow-up failed: {other}"))
@@ -2623,7 +2623,7 @@ impl App {
             &self.config.runtime,
             Some(self.file_read_cache.clone()),
         )
-        .with_shutdown_flag(self.shutdown_flag());
+        .with_shutdown_flag(self.stop_flag());
 
         let result = executor
             .execute(request)
@@ -2940,7 +2940,7 @@ impl App {
                     );
                     let parallel_results = execute_parallel_group_standalone(
                         &self.config,
-                        self.shutdown_flag(),
+                        self.stop_flag(),
                         requests,
                         completed,
                         entries,
@@ -3701,12 +3701,22 @@ impl App {
             let _ = std::io::Write::write_fmt(&mut std::io::stderr(), format_args!("\n"));
         }
 
-        stream_result.map_err(|err| match err {
-            crate::provider::ProviderTurnError::Cancelled => {
-                AppError::ToolExecution("guarded retry cancelled".to_string())
+        match stream_result {
+            Err(crate::provider::ProviderTurnError::Cancelled) if self.is_shutdown_requested() => {
+                return self.render_interrupted_turn(tui, "provider turn");
             }
-            other => AppError::ToolExecution(format!("guarded retry failed: {other}")),
-        })?;
+            Err(crate::provider::ProviderTurnError::Cancelled) => {
+                return Err(AppError::ProviderTurn(
+                    crate::provider::ProviderTurnError::Cancelled,
+                ));
+            }
+            Err(other) => {
+                return Err(AppError::ToolExecution(format!(
+                    "guarded retry failed: {other}"
+                )));
+            }
+            Ok(()) => {}
+        }
 
         // Parse the retry response
         let retry_structured = match BasicAgentLoop::parse_structured_response_with_registry(

@@ -59,27 +59,34 @@ pub fn run_session_loop<C: ProviderClient, R: BufRead, W: Write>(
     Ok(())
 }
 
-/// Initialize signal handlers for graceful shutdown.
+/// Initialize signal handlers for graceful shutdown and cooperative stop.
 ///
 /// Registers SIGTERM (always) and SIGINT (non-interactive mode only).
 /// In interactive mode, SIGINT is handled by rustyline.
-fn setup_shutdown_handler(interactive: bool) -> Arc<AtomicBool> {
+fn setup_shutdown_handler(interactive: bool) -> (Arc<AtomicBool>, Arc<AtomicBool>) {
     use signal_hook::consts::{SIGINT, SIGTERM};
     use signal_hook::flag;
 
     let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let stop_flag = Arc::new(AtomicBool::new(false));
 
     // SIGTERM is always registered
     if let Err(e) = flag::register(SIGTERM, Arc::clone(&shutdown_flag)) {
         eprintln!("Warning: failed to register SIGTERM handler: {e}");
+    }
+    if let Err(e) = flag::register(SIGTERM, Arc::clone(&stop_flag)) {
+        eprintln!("Warning: failed to register SIGTERM stop handler: {e}");
     }
 
     // In non-interactive mode, also register SIGINT
     if !interactive && let Err(e) = flag::register(SIGINT, Arc::clone(&shutdown_flag)) {
         eprintln!("Warning: failed to register SIGINT handler: {e}");
     }
+    if !interactive && let Err(e) = flag::register(SIGINT, Arc::clone(&stop_flag)) {
+        eprintln!("Warning: failed to register SIGINT stop handler: {e}");
+    }
 
-    shutdown_flag
+    (shutdown_flag, stop_flag)
 }
 
 /// Production entry point: parse pre-built CLI args into config, then run.
@@ -145,14 +152,14 @@ fn run_with_config(mut config: EffectiveConfig) -> Result<(), AppError> {
     );
 
     // Setup shutdown handler before config is moved
-    let shutdown_flag = setup_shutdown_handler(config.mode.interactive);
+    let (shutdown_flag, stop_flag) = setup_shutdown_handler(config.mode.interactive);
 
     let provider = ProviderRuntimeContext::bootstrap(&config)?;
 
     // Auto-detect context_window from Ollama if not explicitly set.
     auto_detect_and_apply_context_window(&mut config, &provider);
 
-    let provider_client = build_local_provider_client(&config, Arc::clone(&shutdown_flag))?;
+    let provider_client = build_local_provider_client(&config, Arc::clone(&stop_flag))?;
 
     // Health check: staged error handling based on error type.
     match provider_client.health_check() {
@@ -182,7 +189,12 @@ fn run_with_config(mut config: EffectiveConfig) -> Result<(), AppError> {
         }
     }
 
-    let mut app = App::new(config, provider, Arc::clone(&shutdown_flag))?;
+    let mut app = App::new_with_flags(
+        config,
+        provider,
+        Arc::clone(&shutdown_flag),
+        Arc::clone(&stop_flag),
+    )?;
 
     match app.config.mode.prompt_source {
         PromptSource::Interactive => {
@@ -295,14 +307,14 @@ fn run_interactive_loop<C: ProviderClient>(
     let prompt = cli_prompt();
     loop {
         // Check shutdown flag before readline
-        if app.is_shutdown_requested() {
+        if app.is_process_shutdown_requested() {
             break;
         }
 
         match rl.readline(prompt) {
             Ok(line) => {
                 // Check shutdown flag after readline
-                if app.is_shutdown_requested() {
+                if app.is_process_shutdown_requested() {
                     break;
                 }
                 if !line.trim().is_empty() {
@@ -314,7 +326,7 @@ fn run_interactive_loop<C: ProviderClient>(
                 // readline(); we only take raw mode afterwards so the two
                 // never race (R6).
                 let watch_enabled = app.config.mode.interactive && io::stderr().is_terminal();
-                let watcher = KeyboardWatcher::spawn(app.shutdown_flag(), watch_enabled);
+                let watcher = KeyboardWatcher::spawn(app.stop_flag(), watch_enabled);
 
                 // Run the turn, then release raw mode before propagating any
                 // error so that `?`-bubbled failures cannot leave the
