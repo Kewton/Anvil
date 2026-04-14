@@ -22,6 +22,7 @@ pub(crate) mod read_repeat_tracker;
 pub mod read_transition_guard;
 pub mod render;
 pub mod stagnation_state;
+pub mod termination_fsm;
 pub(crate) mod tool_recovery_budget;
 pub(crate) mod write_fail_tracker;
 pub(crate) mod write_repeat_tracker;
