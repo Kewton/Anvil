@@ -433,6 +433,19 @@ const FINAL_GUARD_RETRY_MESSAGE: &str = "No file modifications detected (file.wr
      Please implement the changes rather than just planning them. \
      Use file.write or file.edit to make the necessary code changes.";
 
+/// Message sent to the LLM when `PlanStallTracker` detects repeated
+/// ANVIL_PLAN restatement without any file.write/file.edit call in the
+/// same turn (Issue #391).
+///
+/// This is the highest-priority retry message in the turn-end guard ladder
+/// — it preempts [`FINAL_GUARD_RETRY_MESSAGE`] and
+/// [`TASK_SEMANTICS_GATE_MESSAGE`] when the local model has drifted into
+/// repeated planning prose instead of implementing the change.
+pub const PLAN_RESTATEMENT_RETRY_MESSAGE: &str = "You already output ANVIL_PLAN. Do NOT output ANVIL_PLAN again. \
+     Do NOT restate the plan or add explanatory prose. \
+     Your next output MUST be a file.write, file.edit, file.edit_anchor, or file.rewrite ANVIL_TOOL block. \
+     Start implementing now.";
+
 /// Maximum number of task-semantics gate retries (Issue #382).
 const MAX_TASK_SEMANTICS_GATE_RETRIES: u8 = 1;
 
@@ -891,6 +904,26 @@ impl App {
         self.session.push_message(retry_msg);
     }
 
+    /// Inject a corrective hint when `PlanStallTracker::is_stalled()` fires
+    /// (Issue #391).
+    ///
+    /// This injects [`PLAN_RESTATEMENT_RETRY_MESSAGE`] and preempts the
+    /// existing FINAL_GUARD and TASK_SEMANTICS retry messages on turns
+    /// where ANVIL_PLAN has been restated without any `file.write` /
+    /// `file.edit` call landing. The mode is intentionally left on the
+    /// current track — if the stall persists, the existing
+    /// `StagnationState` machinery will still escalate via its own paths.
+    fn inject_plan_restatement_retry(&mut self) {
+        tracing::warn!("plan stall guard: ANVIL_PLAN restatement detected, injecting retry hint");
+        let retry_msg = SessionMessage::new(
+            MessageRole::Tool,
+            "system",
+            PLAN_RESTATEMENT_RETRY_MESSAGE.to_string(),
+        )
+        .with_id(self.next_message_id("tool"));
+        self.session.push_message(retry_msg);
+    }
+
     /// Common condition check for task-semantics gate (Done path / Branch 5, Issue #382).
     fn should_fire_task_semantics_gate_common(&self) -> bool {
         if !self.config.runtime.task_semantics_gate_enabled {
@@ -1269,6 +1302,18 @@ impl App {
         // Reset execution plan per user-turn (Issue #249)
         self.reset_execution_plan();
 
+        // Issue #391: turn-local ANVIL_PLAN stall detection. Counts
+        // ANVIL_PLAN blocks observed before the first successful file.write /
+        // file.edit call so the turn-end guard can inject
+        // `PLAN_RESTATEMENT_RETRY_MESSAGE` when the local model drifts into
+        // repeated planning prose without implementation.
+        let mut plan_stall_tracker = super::plan_stall_tracker::PlanStallTracker::new();
+        // Issue #391 (CB-002): limit the plan-stall retry injection to once
+        // per turn. Without this one-shot latch the guard would re-inject
+        // `PLAN_RESTATEMENT_RETRY_MESSAGE` on every iteration while the model
+        // keeps drifting, exhausting the turn budget with duplicate hints.
+        let mut plan_stall_retry_injected: bool = false;
+
         // Issue #249: Detect ANVIL_PLAN from initial response
         // Issue #287: re-initialize stagnation_state on plan registration
         // Issue #305: match on PlanRegistrationResult
@@ -1278,6 +1323,9 @@ impl App {
         // pre-exit repair heuristic).
         match self.try_register_plan(&current.raw_content, false) {
             crate::app::execution_plan::PlanRegistrationResult::Registered => {
+                // Issue #391: count the initial ANVIL_PLAN toward the
+                // turn-local stall tracker.
+                plan_stall_tracker.record_plan_block();
                 let target_files: Vec<String> = self
                     .execution_plan
                     .items
@@ -1288,6 +1336,9 @@ impl App {
                     crate::app::stagnation_state::StagnationState::init_from_plan(&target_files);
             }
             crate::app::execution_plan::PlanRegistrationResult::Replan => {
+                // Issue #391: count this block — it is an ANVIL_PLAN emission
+                // within the current turn even if it arrived as a replan.
+                plan_stall_tracker.record_plan_block();
                 // Replan after reset_execution_plan() should not happen here,
                 // but handle for completeness: merge new targets.
                 let existing = &self.stagnation_state.starved_target_files;
@@ -1461,6 +1512,20 @@ impl App {
                             elapsed_s,
                             &r.tool_name, // already validated by MUTATION_TOOLS.contains()
                         );
+
+                        // Issue #391: latch first mutation so follow-up
+                        // ANVIL_PLAN blocks after real progress are treated
+                        // as legitimate replan (Issue #305) rather than
+                        // stall restatements. All mutation tools
+                        // (file.write / file.edit / file.edit_anchor /
+                        // file.rewrite) indicate plan execution has started
+                        // and must release the stall latch.
+                        if matches!(
+                            r.tool_name.as_str(),
+                            "file.write" | "file.edit" | "file.edit_anchor" | "file.rewrite"
+                        ) {
+                            plan_stall_tracker.record_first_tool_call();
+                        }
 
                         // Issue #364: attribute mutation to proactive delegation if pending.
                         if self.proactive_delegation_pending {
@@ -1921,6 +1986,9 @@ impl App {
                 matches!(current_mode, AgenticMode::Repair(RepairReason::PreExit));
             match self.try_register_plan(&next_token_buffer, strict_closure_gate) {
                 crate::app::execution_plan::PlanRegistrationResult::Registered => {
+                    // Issue #391: count subsequent ANVIL_PLAN emissions in
+                    // the same turn for stall detection.
+                    plan_stall_tracker.record_plan_block();
                     // Issue #349: a newly registered plan is a fresh course
                     // of action — clear any accumulated closure-loop state.
                     self.closure_loop_detector.reset();
@@ -1940,6 +2008,10 @@ impl App {
                         );
                 }
                 crate::app::execution_plan::PlanRegistrationResult::Replan => {
+                    // Issue #391: record every ANVIL_PLAN block until the
+                    // first mutation tool lands — `record_plan_block` itself
+                    // guards against counting post-mutation replans.
+                    plan_stall_tracker.record_plan_block();
                     // Issue #349: replan is also a change of course.
                     self.closure_loop_detector.reset();
                     // Issue #351: replan clears the thrash counter too.
@@ -2273,6 +2345,18 @@ impl App {
             self.last_compact_info = None;
 
             if next_structured.tool_calls.is_empty() {
+                // Issue #391: preempt the existing FINAL_GUARD /
+                // TASK_SEMANTICS retry path when repeated ANVIL_PLAN
+                // restatement without any mutation tool call is the real
+                // drift shape. `PLAN_RESTATEMENT_RETRY_MESSAGE` targets the
+                // specific prose-restatement anti-pattern and would be
+                // diluted if stacked with the generic final-guard message.
+                if plan_stall_tracker.is_stalled() && !plan_stall_retry_injected {
+                    self.inject_plan_restatement_retry();
+                    plan_stall_retry_injected = true;
+                    current = next_structured;
+                    continue;
+                }
                 match self.handle_empty_tool_response(
                     &mut next_structured,
                     &mut term_state,
