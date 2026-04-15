@@ -990,9 +990,11 @@ const PROMPT_WORK_APPROACH_LOCAL_MODE: &str = concat!(
     "When given a task, follow this approach:\n",
     "1. Start with minimal discovery: list directories (file.read on \".\") or search (file.search) before assuming files exist.\n",
     "2. TOOL FIRST. Once you have enough context, call the next tool immediately instead of explaining your plan.\n",
-    "3. Execute iteratively: use tools to gather information, then act on what you learned. Do NOT guess file paths — discover them first.\n",
-    "4. If a tool call fails (e.g. file not found), adapt by calling the next useful tool rather than repeating meta-explanations.\n",
-    "5. Summarize only after real work has been completed or when the user explicitly asks for a plan/summary.\n",
+    "3. In local act mode, do NOT use git.status or agent.plan. Prefer file.read/file.search for minimal discovery and then move directly to file.write/file.edit.\n",
+    "4. After scaffolding or bootstrapping a project, read only the key files once, then immediately make a direct file mutation.\n",
+    "5. Execute iteratively: use tools to gather information, then act on what you learned. Do NOT guess file paths — discover them first.\n",
+    "6. If a tool call fails (e.g. file not found), adapt by calling the next useful tool rather than repeating meta-explanations.\n",
+    "7. Summarize only after real work has been completed or when the user explicitly asks for a plan/summary.\n",
     "\n",
     "## Tool protocol\n",
     "When a task requires file operations, respond using fenced blocks.\n",
@@ -1023,9 +1025,11 @@ const PROMPT_NATIVE_WORK_APPROACH_LOCAL_MODE: &str = concat!(
      When given a task, follow this approach:\n\
      1. Start with minimal discovery: list directories (file_read on \".\") or search (file_search) before assuming files exist.\n\
      2. TOOL FIRST. Once you have enough context, call the next tool immediately instead of explaining your plan.\n\
-     3. Execute iteratively: use tools to gather information, then act on what you learned. Do NOT guess file paths — discover them first.\n\
-     4. If a tool call fails (e.g. file not found), adapt by calling the next useful tool rather than repeating meta-explanations.\n\
-     5. Summarize only after real work has been completed or when the user explicitly asks for a plan/summary.\n\
+     3. In local act mode, do NOT use git_status or agent_plan. Prefer file_read/file_search for minimal discovery and then move directly to file_write/file_edit.\n\
+     4. After scaffolding or bootstrapping a project, read only the key files once, then immediately make a direct file mutation.\n\
+     5. Execute iteratively: use tools to gather information, then act on what you learned. Do NOT guess file paths — discover them first.\n\
+     6. If a tool call fails (e.g. file not found), adapt by calling the next useful tool rather than repeating meta-explanations.\n\
+     7. Summarize only after real work has been completed or when the user explicitly asks for a plan/summary.\n\
      \n\
      ## Tool protocol\n\
      Tools are available via native function calling. Call them directly.\n\n",
@@ -1095,6 +1099,9 @@ const PROMPT_TOOL_RULES_LOCAL_MODE: &str = concat!(
     "Do NOT require ANVIL_PLAN before file changes.\n",
     "Do NOT output ANVIL_PLAN, ANVIL_PLAN_UPDATE, or ANVIL_FINAL unless the user explicitly asks for them.\n",
     "For implementation tasks, prefer direct file.write/file.edit/file.edit_anchor/file.rewrite after minimal discovery.\n",
+    "Do NOT use git.status or agent.plan during implementation.\n",
+    "Do NOT use shell.exec for read-only inspection when file.read/file.search can provide the same context.\n",
+    "After scaffolding a project, use at most one read batch, then immediately mutate files directly.\n",
     "Avoid repeating plans or meta-explanations. Continue implementing with tools.\n",
     "All paths must be relative (start with ./ or a directory name).\n",
     "When the user's request requires file changes, complete the actual file modifications using file.write/file.edit rather than descriptions.\n",
@@ -1834,6 +1841,10 @@ mod tests {
             !prompt.contains("State your plan before executing."),
             "local mode prompt should not retain the generic plan-first work approach"
         );
+        assert!(
+            prompt.contains("Do NOT use git.status or agent.plan during implementation."),
+            "local mode prompt should make act-only tool discipline explicit"
+        );
     }
 
     #[test]
@@ -1846,6 +1857,11 @@ mod tests {
         assert!(
             !prompt.contains("State your plan before executing."),
             "local mode native prompt should not include the generic plan-first instruction"
+        );
+        assert!(
+            prompt.contains("do NOT use git_status or agent_plan")
+                || prompt.contains("Do NOT use git_status or agent_plan"),
+            "local mode native prompt should discourage plan/git tools during act"
         );
     }
 

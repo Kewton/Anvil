@@ -1224,6 +1224,74 @@ impl App {
             .is_empty()
     }
 
+    fn local_mode_tool_rejection_reason(
+        &self,
+        input: &crate::tooling::ToolInput,
+    ) -> Option<String> {
+        if !self.local_mode_active() {
+            return None;
+        }
+
+        if let Some(lock) = &self.local_bootstrap_lock
+            && lock.is_active()
+        {
+            return match input {
+                crate::tooling::ToolInput::FileWrite { .. }
+                | crate::tooling::ToolInput::FileEdit { .. }
+                | crate::tooling::ToolInput::FileEditAnchor { .. }
+                | crate::tooling::ToolInput::FileRewrite { .. } => None,
+                crate::tooling::ToolInput::FileRead { .. }
+                | crate::tooling::ToolInput::FileSearch { .. }
+                    if lock.exploration_turn_budget > 0 =>
+                {
+                    None
+                }
+                crate::tooling::ToolInput::FileRead { .. }
+                | crate::tooling::ToolInput::FileSearch { .. } => Some(
+                    "additional file.read/file.search is blocked during local bootstrap act mode; mutate a file now"
+                        .to_string(),
+                ),
+                crate::tooling::ToolInput::ShellExec { .. } => Some(
+                    "shell.exec is blocked during local bootstrap act mode; use file.read/file.search or a direct file mutation"
+                        .to_string(),
+                ),
+                crate::tooling::ToolInput::GitStatus {} => {
+                    Some("git.status is blocked in local act mode".to_string())
+                }
+                crate::tooling::ToolInput::AgentPlan { .. } => Some(
+                    "agent.plan is blocked in local act mode; use file.read/file.search or a direct file mutation"
+                        .to_string(),
+                ),
+                crate::tooling::ToolInput::AgentExplore { .. } => Some(
+                    "agent.explore is blocked during local bootstrap act mode; use direct file tools"
+                        .to_string(),
+                ),
+                crate::tooling::ToolInput::AgentFixSlice { .. } => Some(
+                    "agent.fix_slice is blocked during local bootstrap act mode; land a direct file mutation first"
+                        .to_string(),
+                ),
+                _ => None,
+            };
+        }
+
+        match input {
+            crate::tooling::ToolInput::GitStatus {} => {
+                Some("git.status is blocked in local act mode".to_string())
+            }
+            crate::tooling::ToolInput::AgentPlan { .. } => Some(
+                "agent.plan is blocked in local act mode; use file.read/file.search or a direct file mutation"
+                    .to_string(),
+            ),
+            crate::tooling::ToolInput::ShellExec { command }
+                if crate::tooling::shell_policy::is_shell_inspection_command(command)
+                    || Self::is_local_bootstrap_shell_exploration(command) =>
+            {
+                Some("read-only shell.exec is blocked in local act mode".to_string())
+            }
+            _ => None,
+        }
+    }
+
     fn is_real_mutation_tool_name(tool_name: &str) -> bool {
         matches!(
             tool_name,

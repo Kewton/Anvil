@@ -6,6 +6,7 @@ use anvil::provider::{
     ProviderClient, ProviderEvent, ProviderMessageRole, ProviderTurnError, ProviderTurnRequest,
     resolve_ollama_model_alias,
 };
+use anvil::session::MessageRole;
 use anvil::tooling::{ToolCallRequest, ToolInput};
 use anvil::tui::Tui;
 use std::cell::RefCell;
@@ -5598,6 +5599,322 @@ fn local_mode_task_semantics_retry_is_tool_first() {
                 && msg.content.contains("Emit exactly one")
         }),
         "local-mode task-semantics retry should be short and tool-first"
+    );
+}
+
+#[test]
+fn local_mode_blocks_git_status_during_act() {
+    let root = common::unique_test_dir("local_mode_blocks_git_status");
+    fs::create_dir_all(&root).expect("test root should be created");
+    let mut config = common::build_config_in(root.clone());
+    config.mode.approval_required = false;
+    config.runtime.provider = "ollama".to_string();
+    config.runtime.local_mode = true;
+    let provider_ctx =
+        anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
+    let mut app = anvil::app::App::new(config, provider_ctx, Arc::new(AtomicBool::new(false)))
+        .expect("app should initialize");
+    let tui = Tui::new();
+
+    #[derive(Clone)]
+    struct LocalModeGitStatusProvider;
+
+    impl ProviderClient for LocalModeGitStatusProvider {
+        fn stream_turn(
+            &self,
+            _request: &ProviderTurnRequest,
+            emit: &mut dyn FnMut(ProviderEvent),
+        ) -> Result<(), ProviderTurnError> {
+            emit(ProviderEvent::Agent(AgentEvent::Done {
+                status: "Done. session saved".to_string(),
+                assistant_message: "状態を確認します。".to_string(),
+                completion_summary: "turn 1".to_string(),
+                saved_status: "session saved".to_string(),
+                tool_logs: Vec::new(),
+                elapsed_ms: 0,
+                inference_performance: None,
+                tool_calls: Some(vec![ToolCallRequest {
+                    tool_call_id: "call_git_status".to_string(),
+                    tool_name: "git.status".to_string(),
+                    input: ToolInput::GitStatus {},
+                    extra_field_warnings: Vec::new(),
+                }]),
+                assistant_tool_call_records: Some(vec![AssistantToolCallRecord {
+                    id: "call_git_status".to_string(),
+                    function_name: "git_status".to_string(),
+                    arguments: "{}".to_string(),
+                }]),
+            }));
+            Ok(())
+        }
+    }
+
+    app.run_live_turn("create the project", &LocalModeGitStatusProvider, &tui)
+        .expect("local act discipline should reject git.status cleanly");
+
+    let tool_result = app
+        .session()
+        .messages
+        .iter()
+        .find(|msg| msg.role == MessageRole::Tool && msg.content.contains("git.status"))
+        .expect("a tool failure should be recorded");
+    assert!(
+        tool_result.content.contains("blocked in local act mode"),
+        "git.status should be blocked during local act mode"
+    );
+}
+
+#[test]
+fn local_mode_blocks_read_only_shell_exploration_during_act() {
+    let root = common::unique_test_dir("local_mode_blocks_shell_explore");
+    fs::create_dir_all(&root).expect("test root should be created");
+    let mut config = common::build_config_in(root.clone());
+    config.mode.approval_required = false;
+    config.runtime.provider = "ollama".to_string();
+    config.runtime.local_mode = true;
+    let provider_ctx =
+        anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
+    let mut app = anvil::app::App::new(config, provider_ctx, Arc::new(AtomicBool::new(false)))
+        .expect("app should initialize");
+    let tui = Tui::new();
+
+    #[derive(Clone)]
+    struct LocalModeShellExploreProvider;
+
+    impl ProviderClient for LocalModeShellExploreProvider {
+        fn stream_turn(
+            &self,
+            _request: &ProviderTurnRequest,
+            emit: &mut dyn FnMut(ProviderEvent),
+        ) -> Result<(), ProviderTurnError> {
+            emit(ProviderEvent::Agent(AgentEvent::Done {
+                status: "Done. session saved".to_string(),
+                assistant_message: "確認します。".to_string(),
+                completion_summary: "turn 1".to_string(),
+                saved_status: "session saved".to_string(),
+                tool_logs: Vec::new(),
+                elapsed_ms: 0,
+                inference_performance: None,
+                tool_calls: Some(vec![ToolCallRequest {
+                    tool_call_id: "call_shell_ls".to_string(),
+                    tool_name: "shell.exec".to_string(),
+                    input: ToolInput::ShellExec {
+                        command: "ls -la".to_string(),
+                    },
+                    extra_field_warnings: Vec::new(),
+                }]),
+                assistant_tool_call_records: Some(vec![AssistantToolCallRecord {
+                    id: "call_shell_ls".to_string(),
+                    function_name: "shell_exec".to_string(),
+                    arguments: "{\"command\":\"ls -la\"}".to_string(),
+                }]),
+            }));
+            Ok(())
+        }
+    }
+
+    app.run_live_turn("create the project", &LocalModeShellExploreProvider, &tui)
+        .expect("local act discipline should reject read-only shell exploration cleanly");
+
+    let tool_result = app
+        .session()
+        .messages
+        .iter()
+        .find(|msg| msg.role == MessageRole::Tool && msg.content.contains("shell.exec"))
+        .expect("a tool failure should be recorded");
+    assert!(
+        tool_result.content.contains("blocked in local act mode"),
+        "read-only shell exploration should be blocked during local act mode"
+    );
+}
+
+#[test]
+fn local_mode_blocks_agent_plan_during_act() {
+    let root = common::unique_test_dir("local_mode_blocks_agent_plan");
+    fs::create_dir_all(&root).expect("test root should be created");
+    let mut config = common::build_config_in(root.clone());
+    config.mode.approval_required = false;
+    config.runtime.provider = "ollama".to_string();
+    config.runtime.local_mode = true;
+    let provider_ctx =
+        anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
+    let mut app = anvil::app::App::new(config, provider_ctx, Arc::new(AtomicBool::new(false)))
+        .expect("app should initialize");
+    let tui = Tui::new();
+
+    #[derive(Clone)]
+    struct LocalModeAgentPlanProvider;
+
+    impl ProviderClient for LocalModeAgentPlanProvider {
+        fn stream_turn(
+            &self,
+            _request: &ProviderTurnRequest,
+            emit: &mut dyn FnMut(ProviderEvent),
+        ) -> Result<(), ProviderTurnError> {
+            emit(ProviderEvent::Agent(AgentEvent::Done {
+                status: "Done. session saved".to_string(),
+                assistant_message: "計画ツールを使います。".to_string(),
+                completion_summary: "turn 1".to_string(),
+                saved_status: "session saved".to_string(),
+                tool_logs: Vec::new(),
+                elapsed_ms: 0,
+                inference_performance: None,
+                tool_calls: Some(vec![ToolCallRequest {
+                    tool_call_id: "call_agent_plan".to_string(),
+                    tool_name: "agent.plan".to_string(),
+                    input: ToolInput::AgentPlan {
+                        prompt: "plan the implementation".to_string(),
+                        scope: None,
+                    },
+                    extra_field_warnings: Vec::new(),
+                }]),
+                assistant_tool_call_records: Some(vec![AssistantToolCallRecord {
+                    id: "call_agent_plan".to_string(),
+                    function_name: "agent_plan".to_string(),
+                    arguments: "{\"prompt\":\"plan the implementation\"}".to_string(),
+                }]),
+            }));
+            Ok(())
+        }
+    }
+
+    app.run_live_turn("create the project", &LocalModeAgentPlanProvider, &tui)
+        .expect("local act discipline should reject agent.plan cleanly");
+
+    let tool_result = app
+        .session()
+        .messages
+        .iter()
+        .find(|msg| msg.role == MessageRole::Tool && msg.content.contains("agent.plan"))
+        .expect("a tool failure should be recorded");
+    assert!(
+        tool_result.content.contains("blocked in local act mode"),
+        "agent.plan should be blocked during local act mode"
+    );
+}
+
+#[test]
+fn local_bootstrap_lock_blocks_shell_exec_after_scaffold() {
+    let root = common::unique_test_dir("local_bootstrap_blocks_shell");
+    fs::create_dir_all(&root).expect("test root should be created");
+    let mut config = common::build_config_in(root.clone());
+    config.mode.approval_required = false;
+    config.runtime.provider = "ollama".to_string();
+    config.runtime.local_mode = true;
+    let provider_ctx =
+        anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
+    let mut app = anvil::app::App::new(config, provider_ctx, Arc::new(AtomicBool::new(false)))
+        .expect("app should initialize");
+    let tui = Tui::new();
+
+    let seen_requests = Rc::new(RefCell::new(Vec::new()));
+
+    struct BootstrapShellProvider {
+        seen_requests: Rc<RefCell<Vec<ProviderTurnRequest>>>,
+    }
+
+    impl ProviderClient for BootstrapShellProvider {
+        fn stream_turn(
+            &self,
+            request: &ProviderTurnRequest,
+            emit: &mut dyn FnMut(ProviderEvent),
+        ) -> Result<(), ProviderTurnError> {
+            let turn = self.seen_requests.borrow().len();
+            self.seen_requests.borrow_mut().push(request.clone());
+
+            match turn {
+                0 => emit(ProviderEvent::Agent(AgentEvent::Done {
+                    status: "Done. session saved".to_string(),
+                    assistant_message: "まず Next.js プロジェクトを作成します。".to_string(),
+                    completion_summary: "turn 1".to_string(),
+                    saved_status: "session saved".to_string(),
+                    tool_logs: Vec::new(),
+                    elapsed_ms: 0,
+                    inference_performance: None,
+                    tool_calls: Some(vec![ToolCallRequest {
+                        tool_call_id: "call_scaffold".to_string(),
+                        tool_name: "shell.exec".to_string(),
+                        input: ToolInput::ShellExec {
+                            command: "mkdir -p space-invaders/src/app && printf '{}' > space-invaders/package.json && printf 'export default function Page() { return null; }\\n' > space-invaders/src/app/page.tsx && printf 'const nextConfig = {}\\nexport default nextConfig\\n' > space-invaders/next.config.ts".to_string(),
+                        },
+                        extra_field_warnings: Vec::new(),
+                    }]),
+                    assistant_tool_call_records: None,
+                })),
+                1 => emit(ProviderEvent::Agent(AgentEvent::Done {
+                    status: "Done. session saved".to_string(),
+                    assistant_message: "もう一度 shell で確認します。".to_string(),
+                    completion_summary: "turn 2".to_string(),
+                    saved_status: "session saved".to_string(),
+                    tool_logs: Vec::new(),
+                    elapsed_ms: 0,
+                    inference_performance: None,
+                    tool_calls: Some(vec![ToolCallRequest {
+                        tool_call_id: "call_shell_ls".to_string(),
+                        tool_name: "shell.exec".to_string(),
+                        input: ToolInput::ShellExec {
+                            command: "ls -la space-invaders/src/app".to_string(),
+                        },
+                        extra_field_warnings: Vec::new(),
+                    }]),
+                    assistant_tool_call_records: None,
+                })),
+                _ => emit(ProviderEvent::Agent(AgentEvent::Done {
+                    status: "Done. session saved".to_string(),
+                    assistant_message: "直接編集します。".to_string(),
+                    completion_summary: "turn 3".to_string(),
+                    saved_status: "session saved".to_string(),
+                    tool_logs: Vec::new(),
+                    elapsed_ms: 0,
+                    inference_performance: None,
+                    tool_calls: Some(vec![ToolCallRequest {
+                        tool_call_id: "call_edit_page".to_string(),
+                        tool_name: "file.edit".to_string(),
+                        input: ToolInput::FileEdit {
+                            path: "space-invaders/src/app/page.tsx".to_string(),
+                            old_string: "export default function Page() { return null; }\n"
+                                .to_string(),
+                            new_string: "export default function Page() { return <main>Ready</main>; }\n"
+                                .to_string(),
+                        },
+                        extra_field_warnings: Vec::new(),
+                    }]),
+                    assistant_tool_call_records: None,
+                })),
+            }
+            Ok(())
+        }
+    }
+
+    app.run_live_turn(
+        "create the project",
+        &BootstrapShellProvider {
+            seen_requests: seen_requests.clone(),
+        },
+        &tui,
+    )
+    .expect("bootstrap lock should reject shell drift and continue");
+
+    let tool_failure = app
+        .session()
+        .messages
+        .iter()
+        .find(|msg| {
+            msg.role == MessageRole::Tool
+                && msg
+                    .content
+                    .contains("shell.exec is blocked during local bootstrap act mode")
+        })
+        .expect("a blocked shell.exec should be recorded");
+    assert!(
+        tool_failure.content.contains("local bootstrap act mode"),
+        "post-scaffold shell.exec should be blocked"
+    );
+    assert!(
+        std::fs::read_to_string(root.join("space-invaders/src/app/page.tsx"))
+            .expect("page.tsx should exist")
+            .contains("Ready"),
+        "bootstrap lock should continue through to a direct mutation"
     );
 }
 

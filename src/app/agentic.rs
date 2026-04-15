@@ -624,6 +624,24 @@ impl App {
 
         let mut agent_results = Vec::new();
         for (index, call) in agent_calls.iter().enumerate() {
+            if let Some(reason) = self.local_mode_tool_rejection_reason(&call.input) {
+                agent_results.push(ToolExecutionResult {
+                    tool_call_id: call.tool_call_id.clone(),
+                    tool_name: call.tool_name.clone(),
+                    status: ToolExecutionStatus::Failed,
+                    summary: reason.clone(),
+                    payload: ToolExecutionPayload::Text(reason),
+                    artifacts: Vec::new(),
+                    elapsed_ms: 0,
+                    diff_summary: None,
+                    edit_detail: None,
+                    rolled_back: false,
+                    observed_delta: None,
+                    delta_observation_skipped: None,
+                });
+                continue;
+            }
+
             // SR4-006: limit sub-agent calls per turn
             if index >= MAX_SUBAGENT_CALLS_PER_TURN {
                 agent_results.push(ToolExecutionResult {
@@ -2754,6 +2772,27 @@ impl App {
                     continue;
                 }
             };
+
+            if let Some(reason) = self.local_mode_tool_rejection_reason(&call.input) {
+                failed_results.push((
+                    idx,
+                    ToolExecutionResult {
+                        tool_call_id: call.tool_call_id.clone(),
+                        tool_name: call.tool_name.clone(),
+                        status: ToolExecutionStatus::Failed,
+                        summary: reason.clone(),
+                        payload: ToolExecutionPayload::Text(reason),
+                        artifacts: Vec::new(),
+                        elapsed_ms: 0,
+                        diff_summary: None,
+                        edit_detail: None,
+                        rolled_back: false,
+                        observed_delta: None,
+                        delta_observation_skipped: None,
+                    },
+                ));
+                continue;
+            }
 
             // Offline policy check: block network tools before approval
             if let Some(summary) = check_offline_blocked(&self.config, call) {
