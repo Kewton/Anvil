@@ -1614,7 +1614,7 @@ impl App {
                     && message.author != BOOTSTRAP_LANE_RETRY_AUTHOR
                     && message.author != PREBOOTSTRAP_LANE_RETRY_AUTHOR
             })
-            .take(6)
+            .take(2)
             .collect();
         for message in tail.into_iter().rev() {
             if first_user_id.as_ref().is_some_and(|id| id == &message.id) {
@@ -4764,7 +4764,7 @@ mod tests {
             .expect("bootstrap lane should select messages");
 
         assert_eq!(selected.first().map(|m| m.id.as_str()), Some("user_1"));
-        assert_eq!(selected.len(), 7);
+        assert_eq!(selected.len(), 3);
         assert!(selected.iter().all(|m| m.role != MessageRole::Assistant));
         assert!(selected
             .iter()
@@ -4775,7 +4775,7 @@ mod tests {
         );
         assert_eq!(
             selected.get(1).map(|m| m.content.as_str()),
-            Some("tool note 4")
+            Some("tool note 8")
         );
     }
 
