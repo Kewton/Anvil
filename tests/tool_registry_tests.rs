@@ -1,0 +1,86 @@
+use std::fs;
+
+use anvil::modes::plan_act::ExecutionMode;
+use anvil::tools::registry::{ToolContext, ToolRegistry};
+use serde_json::json;
+use tempfile::tempdir;
+
+#[test]
+fn read_write_edit_glob_and_grep_work() {
+    let dir = tempdir().unwrap();
+    let registry = ToolRegistry::default();
+    let context = ToolContext {
+        root: dir.path().to_path_buf(),
+        mode: ExecutionMode::Act,
+        plan_path: None,
+        auto_approve: true,
+        interactive_approval: false,
+    };
+
+    registry
+        .execute(
+            "Write",
+            &json!({"path":"src/main.rs","content":"fn main() { println!(\"hi\"); }\n"}),
+            &context,
+        )
+        .unwrap();
+    let read = registry
+        .execute("Read", &json!({"path":"src/main.rs"}), &context)
+        .unwrap();
+    assert!(read.contains("println!"));
+
+    registry
+        .execute(
+            "Edit",
+            &json!({"path":"src/main.rs","old_string":"hi","new_string":"bye"}),
+            &context,
+        )
+        .unwrap();
+    assert!(
+        fs::read_to_string(dir.path().join("src/main.rs"))
+            .unwrap()
+            .contains("bye")
+    );
+
+    let globbed = registry
+        .execute("Glob", &json!({"pattern":"src/**/*.rs"}), &context)
+        .unwrap();
+    assert!(globbed.contains("src/main.rs"));
+
+    let grep = registry
+        .execute("Grep", &json!({"pattern":"bye"}), &context)
+        .unwrap();
+    assert!(grep.contains("src/main.rs:1"));
+}
+
+#[test]
+fn plan_mode_only_allows_plan_file_writes() {
+    let dir = tempdir().unwrap();
+    let plan_path = dir.path().join(".anvil/plans/plan.md");
+    std::fs::create_dir_all(plan_path.parent().unwrap()).unwrap();
+
+    let registry = ToolRegistry::default();
+    let context = ToolContext {
+        root: dir.path().to_path_buf(),
+        mode: ExecutionMode::Plan,
+        plan_path: Some(plan_path.clone()),
+        auto_approve: true,
+        interactive_approval: false,
+    };
+
+    registry
+        .execute(
+            "Write",
+            &json!({"path": plan_path.display().to_string(), "content":"# plan"}),
+            &context,
+        )
+        .unwrap();
+    let err = registry
+        .execute(
+            "Write",
+            &json!({"path":"src/lib.rs","content":"oops"}),
+            &context,
+        )
+        .unwrap_err();
+    assert!(err.contains("plan file"));
+}
