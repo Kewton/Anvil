@@ -969,7 +969,7 @@ impl App {
         results: &[ToolExecutionResult],
     ) -> bool {
         !already_used
-            && self.session.working_memory.touched_files.is_empty()
+            && self.touched_files_empty_for_completion()
             && results
                 .iter()
                 .any(|r| GUIDANCE_TOOL_NAMES.contains(&r.tool_name.as_str()))
@@ -1044,7 +1044,7 @@ impl App {
         if !task_semantics_requires_implementation(task) {
             return false;
         }
-        if !self.session.working_memory.touched_files.is_empty() {
+        if !self.touched_files_empty_for_completion() {
             return false;
         }
         if !self.execution_plan.is_empty() && self.execution_plan.all_finished() {
@@ -1185,7 +1185,7 @@ impl App {
         turn_has_subagent: bool,
     ) -> Result<TerminationTransition, AppError> {
         // Pre-compute all inputs for the FSM.
-        let touched_files_empty = self.session.working_memory.touched_files.is_empty();
+        let touched_files_empty = self.touched_files_empty_for_completion();
         let phase_action = self.phase_estimator.check_empty_response();
         let is_fallback_complete = matches!(
             phase_action,
@@ -1370,7 +1370,7 @@ impl App {
         // The ordering is enforced inside `decide_done_path`.
         let anvil_final_detected =
             BasicAgentLoop::is_complete_structured_response_lenient(assistant_message);
-        let touched_files_empty = self.session.working_memory.touched_files.is_empty();
+        let touched_files_empty = self.touched_files_empty_for_completion();
 
         if self.local_mode_active() && anvil_final_detected {
             self.phase_estimator.accept_anvil_final();
@@ -2166,6 +2166,15 @@ impl App {
                 self.should_suppress_followup_plan_while_locked(&next_token_buffer);
             let suppress_local_mode_plan_registration = self.local_mode_active()
                 && self.local_bootstrap_lock_has_followup_plan(&next_token_buffer);
+            let suppress_locked_exploration =
+                self.should_suppress_followup_exploration_while_locked(&next_structured);
+
+            if suppress_locked_exploration {
+                tracing::warn!(
+                    "local bootstrap lock: suppressing repeated exploration-only follow-up during post-scaffold stabilization"
+                );
+                next_structured.tool_calls.clear();
+            }
 
             if self.should_apply_local_bootstrap_lock_retry(&next_structured) {
                 if let Some(message) = self.consume_local_bootstrap_lock_retry() {

@@ -243,17 +243,20 @@ struct LocalBootstrapLock {
     active: bool,
     root_prefix: String,
     retry_budget: u8,
+    exploration_turn_budget: u8,
     scaffold_paths: Vec<String>,
 }
 
 impl LocalBootstrapLock {
     const DEFAULT_RETRY_BUDGET: u8 = 2;
+    const DEFAULT_EXPLORATION_TURN_BUDGET: u8 = 1;
 
     fn new(root_prefix: String, scaffold_paths: Vec<String>) -> Self {
         Self {
             active: true,
             root_prefix,
             retry_budget: Self::DEFAULT_RETRY_BUDGET,
+            exploration_turn_budget: Self::DEFAULT_EXPLORATION_TURN_BUDGET,
             scaffold_paths,
         }
     }
@@ -264,6 +267,10 @@ impl LocalBootstrapLock {
 
     fn contains_scaffold_path(&self, path: &str) -> bool {
         self.scaffold_paths.iter().any(|scaffold| scaffold == path)
+    }
+
+    fn consume_exploration_turn(&mut self) {
+        self.exploration_turn_budget = self.exploration_turn_budget.saturating_sub(1);
     }
 }
 
@@ -1123,6 +1130,14 @@ impl App {
             }
         }
 
+        if let Some(lock) = self.local_bootstrap_lock.as_mut()
+            && lock.is_active()
+            && Self::results_are_local_bootstrap_exploration_only(results)
+        {
+            lock.consume_exploration_turn();
+            return;
+        }
+
         if self.local_bootstrap_lock.is_none() {
             self.local_bootstrap_lock = self.detect_local_bootstrap_lock(results);
         }
@@ -1135,10 +1150,11 @@ impl App {
         let Some(lock) = &self.local_bootstrap_lock else {
             return false;
         };
-        if !lock.is_active() || lock.retry_budget == 0 || !structured.tool_calls.is_empty() {
+        if !lock.is_active() || lock.retry_budget == 0 {
             return false;
         }
-        true
+        structured.tool_calls.is_empty()
+            || self.should_suppress_followup_exploration_while_locked(structured)
     }
 
     fn local_bootstrap_lock_has_followup_plan(&self, content: &str) -> bool {
@@ -1151,6 +1167,18 @@ impl App {
             return false;
         };
         lock.is_active() && self.local_bootstrap_lock_has_followup_plan(content)
+    }
+
+    fn should_suppress_followup_exploration_while_locked(
+        &self,
+        structured: &crate::agent::StructuredAssistantResponse,
+    ) -> bool {
+        let Some(lock) = &self.local_bootstrap_lock else {
+            return false;
+        };
+        lock.is_active()
+            && lock.exploration_turn_budget == 0
+            && Self::structured_is_local_bootstrap_exploration_only(structured)
     }
 
     fn consume_local_bootstrap_lock_retry(&mut self) -> Option<String> {
@@ -1177,6 +1205,25 @@ impl App {
             .collect()
     }
 
+    fn filter_touched_files_for_completion(&self, touched_files: &[String]) -> Vec<String> {
+        let Some(lock) = &self.local_bootstrap_lock else {
+            return touched_files.to_vec();
+        };
+        if !lock.is_active() || lock.scaffold_paths.is_empty() {
+            return touched_files.to_vec();
+        }
+        touched_files
+            .iter()
+            .filter(|path| !lock.contains_scaffold_path(path))
+            .cloned()
+            .collect()
+    }
+
+    fn touched_files_empty_for_completion(&self) -> bool {
+        self.filter_touched_files_for_completion(&self.session.working_memory.touched_files)
+            .is_empty()
+    }
+
     fn is_real_mutation_tool_name(tool_name: &str) -> bool {
         matches!(
             tool_name,
@@ -1184,9 +1231,68 @@ impl App {
         )
     }
 
+    fn results_are_local_bootstrap_exploration_only(
+        results: &[crate::tooling::ToolExecutionResult],
+    ) -> bool {
+        !results.is_empty()
+            && results.iter().all(|result| {
+                if result.status != crate::tooling::ToolExecutionStatus::Completed
+                    || result.rolled_back
+                    || result.mutation_observed()
+                {
+                    return false;
+                }
+                match result.tool_name.as_str() {
+                    "file.read" | "file.search" | "web.fetch" | "web.search" => true,
+                    "shell.exec" => result.observed_changed_paths().is_empty(),
+                    _ => false,
+                }
+            })
+    }
+
+    fn structured_is_local_bootstrap_exploration_only(
+        structured: &crate::agent::StructuredAssistantResponse,
+    ) -> bool {
+        !structured.tool_calls.is_empty()
+            && structured.tool_calls.iter().all(|call| match &call.input {
+                crate::tooling::ToolInput::FileRead { .. }
+                | crate::tooling::ToolInput::FileSearch { .. }
+                | crate::tooling::ToolInput::WebFetch { .. }
+                | crate::tooling::ToolInput::WebSearch { .. } => true,
+                crate::tooling::ToolInput::ShellExec { command } => {
+                    Self::is_local_bootstrap_shell_exploration(command)
+                }
+                _ => false,
+            })
+    }
+
+    fn is_local_bootstrap_shell_exploration(command: &str) -> bool {
+        if crate::tooling::shell_policy::is_shell_inspection_command(command) {
+            return true;
+        }
+        let trimmed = command.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if lower == "ls" || lower.starts_with("ls ") || lower == "pwd" || lower.starts_with("pwd ")
+        {
+            return true;
+        }
+        if let Some((prefix, tail)) = trimmed.split_once("&&")
+            && prefix.trim_start().starts_with("cd ")
+        {
+            let tail = tail.trim();
+            let tail_lower = tail.to_ascii_lowercase();
+            return crate::tooling::shell_policy::is_shell_inspection_command(tail)
+                || tail_lower == "ls"
+                || tail_lower.starts_with("ls ")
+                || tail_lower == "pwd"
+                || tail_lower.starts_with("pwd ");
+        }
+        false
+    }
+
     fn local_bootstrap_lock_retry_message(root_prefix: &str) -> String {
         format!(
-            "Do not output another plan. Do not explain. Emit exactly one file.write, file.edit, file.edit_anchor, or file.rewrite tool call now for files under {}.",
+            "Do not output another plan. Do not explain. Do not read more files. Emit exactly one file.write, file.edit, file.edit_anchor, or file.rewrite tool call now for files under {}.",
             root_prefix
         )
     }
@@ -3590,6 +3696,7 @@ mod tests {
             active: true,
             root_prefix: "space-invaders".to_string(),
             retry_budget: 1,
+            exploration_turn_budget: 0,
             scaffold_paths: vec![
                 "space-invaders/src/app/page.tsx".to_string(),
                 "space-invaders/src/app/globals.css".to_string(),
@@ -3606,5 +3713,52 @@ mod tests {
             filtered,
             vec!["space-invaders/src/components/Game.tsx".to_string()]
         );
+    }
+
+    #[test]
+    fn filter_touched_files_for_completion_excludes_scaffold_paths_while_locked() {
+        let mut app = build_test_app();
+        app.local_bootstrap_lock = Some(LocalBootstrapLock {
+            active: true,
+            root_prefix: "space-invaders".to_string(),
+            retry_budget: 1,
+            exploration_turn_budget: 0,
+            scaffold_paths: vec![
+                "space-invaders/src/app/page.tsx".to_string(),
+                "space-invaders/src/app/globals.css".to_string(),
+            ],
+        });
+
+        let filtered = app.filter_touched_files_for_completion(&[
+            "space-invaders/src/app/page.tsx".to_string(),
+            "space-invaders/src/app/globals.css".to_string(),
+            "space-invaders/src/components/Game.tsx".to_string(),
+        ]);
+
+        assert_eq!(
+            filtered,
+            vec!["space-invaders/src/components/Game.tsx".to_string()]
+        );
+    }
+
+    #[test]
+    fn structured_local_bootstrap_exploration_detects_shell_ls() {
+        let structured = crate::agent::StructuredAssistantResponse {
+            tool_calls: vec![crate::tooling::ToolCallRequest {
+                tool_call_id: "call_shell_ls".to_string(),
+                tool_name: "shell.exec".to_string(),
+                input: crate::tooling::ToolInput::ShellExec {
+                    command: "cd space-invaders && ls -la src/app/".to_string(),
+                },
+                extra_field_warnings: Vec::new(),
+            }],
+            final_response: String::new(),
+            anvil_final_detected: false,
+            raw_content: String::new(),
+        };
+
+        assert!(App::structured_is_local_bootstrap_exploration_only(
+            &structured
+        ));
     }
 }

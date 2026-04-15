@@ -5105,6 +5105,376 @@ fn local_bootstrap_lock_retries_multiple_plan_restatements_before_mutation() {
 }
 
 #[test]
+fn local_bootstrap_lock_allows_one_read_batch_then_forces_mutation() {
+    let root = common::unique_test_dir("local_bootstrap_lock_read_drift");
+    fs::create_dir_all(&root).expect("test root should be created");
+    let mut config = common::build_config_in(root.clone());
+    config.mode.approval_required = false;
+    config.runtime.provider = "ollama".to_string();
+    let provider_ctx =
+        anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
+    let mut app = anvil::app::App::new(config, provider_ctx, Arc::new(AtomicBool::new(false)))
+        .expect("app should initialize");
+    let tui = Tui::new();
+
+    #[derive(Clone)]
+    struct BootstrapLockReadDriftProvider {
+        seen_requests: Rc<RefCell<Vec<ProviderTurnRequest>>>,
+    }
+
+    impl ProviderClient for BootstrapLockReadDriftProvider {
+        fn stream_turn(
+            &self,
+            request: &ProviderTurnRequest,
+            emit: &mut dyn FnMut(ProviderEvent),
+        ) -> Result<(), ProviderTurnError> {
+            let call_index = self.seen_requests.borrow().len();
+            self.seen_requests.borrow_mut().push(request.clone());
+
+            match call_index {
+                0 => emit(ProviderEvent::Agent(AgentEvent::Done {
+                    status: "Done. session saved".to_string(),
+                    assistant_message: "まず現在のディレクトリを確認します。".to_string(),
+                    completion_summary: "turn 1".to_string(),
+                    saved_status: "session saved".to_string(),
+                    tool_logs: Vec::new(),
+                    elapsed_ms: 0,
+                    inference_performance: None,
+                    tool_calls: Some(vec![ToolCallRequest {
+                        tool_call_id: "call_file_read_root".to_string(),
+                        tool_name: "file.read".to_string(),
+                        input: ToolInput::FileRead {
+                            path: ".".to_string(),
+                        },
+                        extra_field_warnings: Vec::new(),
+                    }]),
+                    assistant_tool_call_records: Some(vec![AssistantToolCallRecord {
+                        id: "call_file_read_root".to_string(),
+                        function_name: "file_read".to_string(),
+                        arguments: "{\"path\":\".\"}".to_string(),
+                    }]),
+                })),
+                1 => emit(ProviderEvent::Agent(AgentEvent::Done {
+                    status: "Done. session saved".to_string(),
+                    assistant_message: "土台を作成します。".to_string(),
+                    completion_summary: "turn 2".to_string(),
+                    saved_status: "session saved".to_string(),
+                    tool_logs: Vec::new(),
+                    elapsed_ms: 0,
+                    inference_performance: None,
+                    tool_calls: Some(vec![ToolCallRequest {
+                        tool_call_id: "call_shell_exec_scaffold".to_string(),
+                        tool_name: "shell.exec".to_string(),
+                        input: ToolInput::ShellExec {
+                            command: "mkdir -p ./space-invaders/src/app && printf '{\"name\":\"space-invaders\"}\\n' > ./space-invaders/package.json && printf 'export default function Home() { return null; }\\n' > ./space-invaders/src/app/page.tsx && printf '@import \"tailwindcss\";\\n' > ./space-invaders/src/app/globals.css && printf 'export default function Layout({ children }) { return children; }\\n' > ./space-invaders/src/app/layout.tsx".to_string(),
+                        },
+                        extra_field_warnings: Vec::new(),
+                    }]),
+                    assistant_tool_call_records: Some(vec![AssistantToolCallRecord {
+                        id: "call_shell_exec_scaffold".to_string(),
+                        function_name: "shell_exec".to_string(),
+                        arguments: "{\"command\":\"mkdir -p ./space-invaders/src/app && printf '{\\\"name\\\":\\\"space-invaders\\\"}\\\\n' > ./space-invaders/package.json && printf 'export default function Home() { return null; }\\\\n' > ./space-invaders/src/app/page.tsx && printf '@import \\\"tailwindcss\\\";\\\\n' > ./space-invaders/src/app/globals.css && printf 'export default function Layout({ children }) { return children; }\\\\n' > ./space-invaders/src/app/layout.tsx\"}".to_string(),
+                    }]),
+                })),
+                2 => emit(ProviderEvent::Agent(AgentEvent::Done {
+                    status: "Done. session saved".to_string(),
+                    assistant_message: "現在の雛形を確認します。".to_string(),
+                    completion_summary: "turn 3".to_string(),
+                    saved_status: "session saved".to_string(),
+                    tool_logs: Vec::new(),
+                    elapsed_ms: 0,
+                    inference_performance: None,
+                    tool_calls: Some(vec![
+                        ToolCallRequest {
+                            tool_call_id: "call_file_read_page".to_string(),
+                            tool_name: "file.read".to_string(),
+                            input: ToolInput::FileRead {
+                                path: "space-invaders/src/app/page.tsx".to_string(),
+                            },
+                            extra_field_warnings: Vec::new(),
+                        },
+                        ToolCallRequest {
+                            tool_call_id: "call_file_read_css".to_string(),
+                            tool_name: "file.read".to_string(),
+                            input: ToolInput::FileRead {
+                                path: "space-invaders/src/app/globals.css".to_string(),
+                            },
+                            extra_field_warnings: Vec::new(),
+                        },
+                    ]),
+                    assistant_tool_call_records: Some(vec![
+                        AssistantToolCallRecord {
+                            id: "call_file_read_page".to_string(),
+                            function_name: "file_read".to_string(),
+                            arguments: "{\"path\":\"space-invaders/src/app/page.tsx\"}"
+                                .to_string(),
+                        },
+                        AssistantToolCallRecord {
+                            id: "call_file_read_css".to_string(),
+                            function_name: "file_read".to_string(),
+                            arguments: "{\"path\":\"space-invaders/src/app/globals.css\"}"
+                                .to_string(),
+                        },
+                    ]),
+                })),
+                3 => emit(ProviderEvent::Agent(AgentEvent::Done {
+                    status: "Done. session saved".to_string(),
+                    assistant_message: "さらに確認します。".to_string(),
+                    completion_summary: "turn 4".to_string(),
+                    saved_status: "session saved".to_string(),
+                    tool_logs: Vec::new(),
+                    elapsed_ms: 0,
+                    inference_performance: None,
+                    tool_calls: Some(vec![ToolCallRequest {
+                        tool_call_id: "call_file_read_layout".to_string(),
+                        tool_name: "file.read".to_string(),
+                        input: ToolInput::FileRead {
+                            path: "space-invaders/src/app/layout.tsx".to_string(),
+                        },
+                        extra_field_warnings: Vec::new(),
+                    }]),
+                    assistant_tool_call_records: Some(vec![AssistantToolCallRecord {
+                        id: "call_file_read_layout".to_string(),
+                        function_name: "file_read".to_string(),
+                        arguments: "{\"path\":\"space-invaders/src/app/layout.tsx\"}"
+                            .to_string(),
+                    }]),
+                })),
+                4 => emit(ProviderEvent::Agent(AgentEvent::Done {
+                    status: "Done. session saved".to_string(),
+                    assistant_message: "実装に入ります。".to_string(),
+                    completion_summary: "turn 5".to_string(),
+                    saved_status: "session saved".to_string(),
+                    tool_logs: Vec::new(),
+                    elapsed_ms: 0,
+                    inference_performance: None,
+                    tool_calls: Some(vec![ToolCallRequest {
+                        tool_call_id: "call_file_write_page".to_string(),
+                        tool_name: "file.write".to_string(),
+                        input: ToolInput::FileWrite {
+                            path: "space-invaders/src/app/page.tsx".to_string(),
+                            content: "export default function Home() {\n  return <main>space invaders</main>;\n}\n".to_string(),
+                        },
+                        extra_field_warnings: Vec::new(),
+                    }]),
+                    assistant_tool_call_records: Some(vec![AssistantToolCallRecord {
+                        id: "call_file_write_page".to_string(),
+                        function_name: "file_write".to_string(),
+                        arguments: "{\"path\":\"space-invaders/src/app/page.tsx\",\"content\":\"export default function Home() {\\n  return <main>space invaders</main>;\\n}\\n\"}".to_string(),
+                    }]),
+                })),
+                _ => emit(ProviderEvent::Agent(AgentEvent::Done {
+                    status: "Done. session saved".to_string(),
+                    assistant_message: "完了しました。".to_string(),
+                    completion_summary: "turn 6".to_string(),
+                    saved_status: "session saved".to_string(),
+                    tool_logs: Vec::new(),
+                    elapsed_ms: 0,
+                    inference_performance: None,
+                    tool_calls: None,
+                    assistant_tool_call_records: None,
+                })),
+            }
+            Ok(())
+        }
+    }
+
+    let seen_requests = Rc::new(RefCell::new(Vec::new()));
+    let provider = BootstrapLockReadDriftProvider {
+        seen_requests: seen_requests.clone(),
+    };
+
+    app.run_live_turn("create the project", &provider, &tui)
+        .expect("bootstrap lock should force mutation after read drift");
+
+    let page = fs::read_to_string(root.join("space-invaders/src/app/page.tsx"))
+        .expect("page should be written after read drift suppression");
+    assert!(page.contains("space invaders"));
+
+    let requests = seen_requests.borrow();
+    assert!(
+        requests.len() >= 5,
+        "expected an extra retry request after repeated read drift"
+    );
+    let allowed_read_request = &requests[3];
+    assert!(
+        allowed_read_request.messages.iter().any(|msg| {
+            msg.role == ProviderMessageRole::Tool
+                && msg.content.contains("space-invaders/src/app/page.tsx")
+        }),
+        "the first read batch should be executed and returned to the model"
+    );
+    let retry_request = &requests[4];
+    assert!(
+        retry_request.messages.iter().any(|msg| {
+            msg.role == ProviderMessageRole::Tool
+                && msg.content.contains("Do not explain.")
+                && msg.content.contains("Do not read more files.")
+        }),
+        "repeated read drift should inject the short mutation-first retry"
+    );
+    assert!(
+        !retry_request.messages.iter().any(|msg| {
+            msg.role == ProviderMessageRole::Tool
+                && msg.content.contains("[tool result: file.read]")
+                && msg.content.contains("space-invaders/src/app/layout.tsx")
+        }),
+        "suppressed read drift should not execute the extra layout.tsx read"
+    );
+}
+
+#[test]
+fn local_bootstrap_lock_treats_scaffold_only_progress_as_incomplete_until_mutation() {
+    let root = common::unique_test_dir("local_bootstrap_lock_prose_drift");
+    fs::create_dir_all(&root).expect("test root should be created");
+    let mut config = common::build_config_in(root.clone());
+    config.mode.approval_required = false;
+    config.runtime.provider = "ollama".to_string();
+    let provider_ctx =
+        anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
+    let mut app = anvil::app::App::new(config, provider_ctx, Arc::new(AtomicBool::new(false)))
+        .expect("app should initialize");
+    let tui = Tui::new();
+
+    #[derive(Clone)]
+    struct BootstrapLockProseDriftProvider {
+        seen_requests: Rc<RefCell<Vec<ProviderTurnRequest>>>,
+    }
+
+    impl ProviderClient for BootstrapLockProseDriftProvider {
+        fn stream_turn(
+            &self,
+            request: &ProviderTurnRequest,
+            emit: &mut dyn FnMut(ProviderEvent),
+        ) -> Result<(), ProviderTurnError> {
+            let call_index = self.seen_requests.borrow().len();
+            self.seen_requests.borrow_mut().push(request.clone());
+
+            match call_index {
+                0 => emit(ProviderEvent::Agent(AgentEvent::Done {
+                    status: "Done. session saved".to_string(),
+                    assistant_message: "まず現在のディレクトリを確認します。".to_string(),
+                    completion_summary: "turn 1".to_string(),
+                    saved_status: "session saved".to_string(),
+                    tool_logs: Vec::new(),
+                    elapsed_ms: 0,
+                    inference_performance: None,
+                    tool_calls: Some(vec![ToolCallRequest {
+                        tool_call_id: "call_file_read_root".to_string(),
+                        tool_name: "file.read".to_string(),
+                        input: ToolInput::FileRead {
+                            path: ".".to_string(),
+                        },
+                        extra_field_warnings: Vec::new(),
+                    }]),
+                    assistant_tool_call_records: Some(vec![AssistantToolCallRecord {
+                        id: "call_file_read_root".to_string(),
+                        function_name: "file_read".to_string(),
+                        arguments: "{\"path\":\".\"}".to_string(),
+                    }]),
+                })),
+                1 => emit(ProviderEvent::Agent(AgentEvent::Done {
+                    status: "Done. session saved".to_string(),
+                    assistant_message: "土台を作成します。".to_string(),
+                    completion_summary: "turn 2".to_string(),
+                    saved_status: "session saved".to_string(),
+                    tool_logs: Vec::new(),
+                    elapsed_ms: 0,
+                    inference_performance: None,
+                    tool_calls: Some(vec![ToolCallRequest {
+                        tool_call_id: "call_shell_exec_scaffold".to_string(),
+                        tool_name: "shell.exec".to_string(),
+                        input: ToolInput::ShellExec {
+                            command: "mkdir -p ./space-invaders/src/app && printf '{\"name\":\"space-invaders\"}\\n' > ./space-invaders/package.json && printf 'export default function Home() { return null; }\\n' > ./space-invaders/src/app/page.tsx && printf '@import \"tailwindcss\";\\n' > ./space-invaders/src/app/globals.css".to_string(),
+                        },
+                        extra_field_warnings: Vec::new(),
+                    }]),
+                    assistant_tool_call_records: Some(vec![AssistantToolCallRecord {
+                        id: "call_shell_exec_scaffold".to_string(),
+                        function_name: "shell_exec".to_string(),
+                        arguments: "{\"command\":\"mkdir -p ./space-invaders/src/app && printf '{\\\"name\\\":\\\"space-invaders\\\"}\\\\n' > ./space-invaders/package.json && printf 'export default function Home() { return null; }\\\\n' > ./space-invaders/src/app/page.tsx && printf '@import \\\"tailwindcss\\\";\\\\n' > ./space-invaders/src/app/globals.css\"}".to_string(),
+                    }]),
+                })),
+                2 | 3 | 4 => emit(ProviderEvent::Agent(AgentEvent::Done {
+                    status: "Done. session saved".to_string(),
+                    assistant_message: "実装方針を整理しています。".to_string(),
+                    completion_summary: format!("turn {}", call_index + 1),
+                    saved_status: "session saved".to_string(),
+                    tool_logs: Vec::new(),
+                    elapsed_ms: 0,
+                    inference_performance: None,
+                    tool_calls: None,
+                    assistant_tool_call_records: None,
+                })),
+                5 => emit(ProviderEvent::Agent(AgentEvent::Done {
+                    status: "Done. session saved".to_string(),
+                    assistant_message: "実装に入ります。".to_string(),
+                    completion_summary: "turn 6".to_string(),
+                    saved_status: "session saved".to_string(),
+                    tool_logs: Vec::new(),
+                    elapsed_ms: 0,
+                    inference_performance: None,
+                    tool_calls: Some(vec![ToolCallRequest {
+                        tool_call_id: "call_file_write_page".to_string(),
+                        tool_name: "file.write".to_string(),
+                        input: ToolInput::FileWrite {
+                            path: "space-invaders/src/app/page.tsx".to_string(),
+                            content: "export default function Home() {\n  return <main>space invaders</main>;\n}\n".to_string(),
+                        },
+                        extra_field_warnings: Vec::new(),
+                    }]),
+                    assistant_tool_call_records: Some(vec![AssistantToolCallRecord {
+                        id: "call_file_write_page".to_string(),
+                        function_name: "file_write".to_string(),
+                        arguments: "{\"path\":\"space-invaders/src/app/page.tsx\",\"content\":\"export default function Home() {\\n  return <main>space invaders</main>;\\n}\\n\"}".to_string(),
+                    }]),
+                })),
+                _ => emit(ProviderEvent::Agent(AgentEvent::Done {
+                    status: "Done. session saved".to_string(),
+                    assistant_message: "完了しました。".to_string(),
+                    completion_summary: "turn 7".to_string(),
+                    saved_status: "session saved".to_string(),
+                    tool_logs: Vec::new(),
+                    elapsed_ms: 0,
+                    inference_performance: None,
+                    tool_calls: None,
+                    assistant_tool_call_records: None,
+                })),
+            }
+            Ok(())
+        }
+    }
+
+    let seen_requests = Rc::new(RefCell::new(Vec::new()));
+    let provider = BootstrapLockProseDriftProvider {
+        seen_requests: seen_requests.clone(),
+    };
+
+    app.run_live_turn("create the project", &provider, &tui)
+        .expect("scaffold-only progress should not allow prose-only completion");
+
+    let page = fs::read_to_string(root.join("space-invaders/src/app/page.tsx"))
+        .expect("page should be written after prose-only drift retries");
+    assert!(page.contains("space invaders"));
+
+    let requests = seen_requests.borrow();
+    assert!(
+        requests.len() >= 6,
+        "expected retries to continue until a real mutation lands"
+    );
+    let task_semantics_retry = &requests[5];
+    assert!(
+        task_semantics_retry.messages.iter().any(|msg| {
+            msg.role == ProviderMessageRole::Tool
+                && msg
+                    .content
+                    .contains("The active task appears to require file modifications")
+        }),
+        "after local bootstrap retries are exhausted, scaffold-only progress should still be treated as incomplete"
+    );
+}
+
+#[test]
 fn file_write_followup_prose_retry_continues_to_next_planned_file() {
     let root = common::unique_test_dir("file_write_followup_retry");
     let mut config = common::build_config_in(root.clone());
