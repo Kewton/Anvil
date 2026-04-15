@@ -1221,11 +1221,28 @@ impl App {
                 self.inject_local_bootstrap_lock_retry(message);
                 return Ok(TerminationTransition::Continue);
             }
-            if let Some(lock) = self.local_bootstrap_lock.as_mut() {
+            if self
+                .local_prebootstrap_lane
+                .as_ref()
+                .is_some_and(crate::app::LocalPreBootstrapLane::is_active)
+            {
                 tracing::warn!(
-                    "local bootstrap lock: retry budget exhausted, releasing deterministic target lane"
+                    "local pre-bootstrap lane: retry budget exhausted; preserving deterministic shell lane"
                 );
-                lock.active = false;
+                self.inject_local_bootstrap_lock_retry(App::local_prebootstrap_lane_retry_message());
+                return Ok(TerminationTransition::Continue);
+            }
+            if self.local_postbootstrap_lane_active() {
+                if let Some(message) = self.advance_local_bootstrap_target_on_exhaustion() {
+                    tracing::warn!(
+                        "local bootstrap lock: no-tool retry budget exhausted; advancing deterministic target lane"
+                    );
+                    self.inject_local_bootstrap_lock_retry(message);
+                    return Ok(TerminationTransition::Continue);
+                }
+                tracing::warn!(
+                    "local bootstrap lock: target queue exhausted without mutation; releasing deterministic target lane"
+                );
             }
         }
 

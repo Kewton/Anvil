@@ -356,9 +356,40 @@ impl LocalBootstrapLock {
     fn next_mutation_target(&self) -> Option<&str> {
         self.target_queue.first().map(|path| path.as_str())
     }
+
+    fn advance_target_without_mutation(&mut self) -> bool {
+        if !self.target_queue.is_empty() {
+            self.target_queue.remove(0);
+        }
+        self.retry_budget = Self::DEFAULT_RETRY_BUDGET;
+        self.active = !self.target_queue.is_empty();
+        self.active
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalPreBootstrapLane {
+    active: bool,
+    retry_budget: u8,
+}
+
+impl LocalPreBootstrapLane {
+    const DEFAULT_RETRY_BUDGET: u8 = 2;
+
+    fn new() -> Self {
+        Self {
+            active: true,
+            retry_budget: Self::DEFAULT_RETRY_BUDGET,
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        self.active
+    }
 }
 
 pub(crate) const BOOTSTRAP_LANE_RETRY_AUTHOR: &str = "bootstrap_lane_retry";
+pub(crate) const PREBOOTSTRAP_LANE_RETRY_AUTHOR: &str = "prebootstrap_lane_retry";
 
 /// Central application state.
 pub struct App {
@@ -451,6 +482,8 @@ pub struct App {
     post_failure_thrash_detector: post_failure_thrash_detector::PostFailureThrashDetector,
     /// Done path task-semantics gate fired flag (prevents re-fire, Issue #382).
     task_semantics_done_path_fired: bool,
+    /// Temporary local-model stabilization overlay for empty-directory bootstrap init.
+    local_prebootstrap_lane: Option<LocalPreBootstrapLane>,
     /// Temporary local-model stabilization overlay for post-scaffold drift.
     local_bootstrap_lock: Option<LocalBootstrapLock>,
 }
@@ -867,6 +900,7 @@ impl App {
                     thrash_break,
                 ),
             task_semantics_done_path_fired: false,
+            local_prebootstrap_lane: None,
             local_bootstrap_lock: None,
         })
     }
@@ -1015,6 +1049,9 @@ impl App {
     fn build_dynamic_system_prompt(&self) -> String {
         use crate::agent::tool_protocol_system_prompt;
 
+        if let Some(prompt) = self.build_local_prebootstrap_lane_system_prompt() {
+            return prompt;
+        }
         if let Some(prompt) = self.build_local_bootstrap_lane_system_prompt() {
             return prompt;
         }
@@ -1139,6 +1176,23 @@ impl App {
         Some(prompt)
     }
 
+    fn build_local_prebootstrap_lane_system_prompt(&self) -> Option<String> {
+        let lane = self.local_prebootstrap_lane.as_ref()?;
+        if !lane.is_active() {
+            return None;
+        }
+
+        let mut prompt = String::from(
+            "You are Anvil in local pre-bootstrap init mode.\n\n\
+             Emit exactly one shell.exec tool call now to bootstrap a project in one new subdirectory.\n\
+             Allowed tools: shell.exec.\n\
+             Forbidden: ANVIL_PLAN, ANVIL_PLAN_UPDATE, explanation, file.read, file.search, file.write, file.edit, file.edit_anchor, file.rewrite, git.status, agent.plan.\n\
+             Use shell.exec to initialize the project directly. Do not inspect further. Do not discuss what you will do.\n",
+        );
+        prompt.push_str(&context::format_date_prompt());
+        Some(prompt)
+    }
+
     /// Convert a path to a cwd-relative string for working memory.
     ///
     /// Absolute paths must be under the session cwd. Relative paths are
@@ -1235,6 +1289,59 @@ impl App {
         })
     }
 
+    fn detect_local_prebootstrap_lane(
+        &self,
+        results: &[crate::tooling::ToolExecutionResult],
+    ) -> Option<LocalPreBootstrapLane> {
+        if !self.local_mode_active() {
+            return None;
+        }
+
+        results.iter().find_map(|result| {
+            if result.tool_name != "file.read"
+                || result.status != crate::tooling::ToolExecutionStatus::Completed
+                || result.rolled_back
+            {
+                return None;
+            }
+
+            let crate::tooling::ToolExecutionPayload::Text(payload) = &result.payload else {
+                return None;
+            };
+            if !Self::is_empty_workspace_listing(payload) {
+                return None;
+            }
+
+            Some(LocalPreBootstrapLane::new())
+        })
+    }
+
+    fn detect_local_prebootstrap_lane_from_workspace(&self) -> Option<LocalPreBootstrapLane> {
+        if !self.local_mode_active() || self.local_prebootstrap_lane.is_some() {
+            return None;
+        }
+        if self.local_bootstrap_lock.is_some() {
+            return None;
+        }
+        let entries = std::fs::read_dir(&self.config.paths.cwd).ok()?;
+        let mut saw_any = false;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.is_empty() {
+                continue;
+            }
+            saw_any = true;
+            if !name.starts_with('.') {
+                return None;
+            }
+        }
+        if !saw_any {
+            return Some(LocalPreBootstrapLane::new());
+        }
+        Some(LocalPreBootstrapLane::new())
+    }
+
     fn detect_local_bootstrap_failure_lock(
         &self,
         results: &[crate::tooling::ToolExecutionResult],
@@ -1290,6 +1397,18 @@ impl App {
     }
 
     fn update_local_bootstrap_lock(&mut self, results: &[crate::tooling::ToolExecutionResult]) {
+        if let Some(lane) = &self.local_prebootstrap_lane {
+            let shell_attempted = results.iter().any(|result| result.tool_name == "shell.exec");
+            let mutation_landed = results.iter().any(|result| {
+                Self::is_real_mutation_tool_name(&result.tool_name)
+                    && result.status == crate::tooling::ToolExecutionStatus::Completed
+                    && !result.rolled_back
+            });
+            if shell_attempted || mutation_landed || !lane.is_active() {
+                self.local_prebootstrap_lane = None;
+            }
+        }
+
         if let Some(lock) = &self.local_bootstrap_lock {
             let mutated_paths: Vec<String> = results
                 .iter()
@@ -1319,6 +1438,10 @@ impl App {
             self.local_bootstrap_lock = self
                 .detect_local_bootstrap_lock(results)
                 .or_else(|| self.detect_local_bootstrap_failure_lock(results));
+        }
+
+        if self.local_prebootstrap_lane.is_none() && self.local_bootstrap_lock.is_none() {
+            self.local_prebootstrap_lane = self.detect_local_prebootstrap_lane(results);
         }
     }
 
@@ -1359,9 +1482,24 @@ impl App {
     }
 
     fn consume_local_bootstrap_lock_retry(&mut self) -> Option<String> {
+        if let Some(lane) = self.local_prebootstrap_lane.as_mut() {
+            if !lane.is_active() {
+                self.local_prebootstrap_lane = None;
+                return None;
+            }
+            if lane.retry_budget == 0 {
+                return None;
+            }
+            lane.retry_budget = lane.retry_budget.saturating_sub(1);
+            return Some(Self::local_prebootstrap_lane_retry_message());
+        }
+
         let lock = self.local_bootstrap_lock.as_mut()?;
-        if !lock.is_active() || lock.retry_budget == 0 {
+        if !lock.is_active() {
             self.local_bootstrap_lock = None;
+            return None;
+        }
+        if lock.retry_budget == 0 {
             return None;
         }
         lock.retry_budget = lock.retry_budget.saturating_sub(1);
@@ -1405,9 +1543,35 @@ impl App {
     }
 
     pub(crate) fn local_bootstrap_lane_active(&self) -> bool {
+        self.local_prebootstrap_lane
+            .as_ref()
+            .is_some_and(LocalPreBootstrapLane::is_active)
+            || self
+                .local_bootstrap_lock
+                .as_ref()
+                .is_some_and(LocalBootstrapLock::is_active)
+    }
+
+    pub(crate) fn local_postbootstrap_lane_active(&self) -> bool {
         self.local_bootstrap_lock
             .as_ref()
             .is_some_and(LocalBootstrapLock::is_active)
+    }
+
+    pub(crate) fn advance_local_bootstrap_target_on_exhaustion(&mut self) -> Option<String> {
+        let lock = self.local_bootstrap_lock.as_mut()?;
+        if !lock.is_active() {
+            self.local_bootstrap_lock = None;
+            return None;
+        }
+        if lock.advance_target_without_mutation() {
+            return Some(Self::local_bootstrap_lock_retry_message(
+                &lock.root_prefix,
+                lock.next_mutation_target(),
+            ));
+        }
+        self.local_bootstrap_lock = None;
+        None
     }
 
     pub(crate) fn local_bootstrap_lane_max_output_tokens(&self) -> Option<u32> {
@@ -1448,6 +1612,7 @@ impl App {
             .filter(|message| {
                 message.role == MessageRole::Tool
                     && message.author != BOOTSTRAP_LANE_RETRY_AUTHOR
+                    && message.author != PREBOOTSTRAP_LANE_RETRY_AUTHOR
             })
             .take(6)
             .collect();
@@ -1467,6 +1632,29 @@ impl App {
     ) -> Option<String> {
         if !self.local_mode_active() {
             return None;
+        }
+
+        if self
+            .local_prebootstrap_lane
+            .as_ref()
+            .is_some_and(LocalPreBootstrapLane::is_active)
+        {
+            return match input {
+                crate::tooling::ToolInput::ShellExec { command }
+                    if !crate::tooling::shell_policy::is_shell_inspection_command(command)
+                        && !Self::is_local_bootstrap_shell_exploration(command) =>
+                {
+                    None
+                }
+                crate::tooling::ToolInput::ShellExec { .. } => Some(
+                    "read-only shell.exec is blocked in local pre-bootstrap act mode"
+                        .to_string(),
+                ),
+                _ => Some(
+                    "only shell.exec is allowed during local pre-bootstrap act mode"
+                        .to_string(),
+                ),
+            };
         }
 
         if let Some(lock) = &self.local_bootstrap_lock
@@ -1618,6 +1806,23 @@ impl App {
                 || tail_lower.starts_with("pwd ");
         }
         false
+    }
+
+    fn is_empty_workspace_listing(payload: &str) -> bool {
+        let entries: Vec<&str> = payload
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect();
+        if entries.is_empty() {
+            return true;
+        }
+        entries.iter().all(|entry| entry.starts_with('.'))
+    }
+
+    fn local_prebootstrap_lane_retry_message() -> String {
+        "Do not explain. Do not read or search. Emit exactly one shell.exec tool call now to bootstrap the project in one new subdirectory."
+            .to_string()
     }
 
     fn local_bootstrap_lock_retry_message(root_prefix: &str, target: Option<&str>) -> String {
@@ -2068,7 +2273,13 @@ impl App {
         }
         let catalog = crate::tooling::ToolSchemaCatalog::builtin();
         let mut tools: Vec<_> = catalog.all().into_iter().cloned().collect();
-        if self.local_bootstrap_lane_active() {
+        if self
+            .local_prebootstrap_lane
+            .as_ref()
+            .is_some_and(LocalPreBootstrapLane::is_active)
+        {
+            tools.retain(|tool| tool.name == "shell_exec");
+        } else if self.local_postbootstrap_lane_active() {
             tools.retain(|tool| {
                 matches!(
                     tool.name.as_str(),
@@ -2289,6 +2500,9 @@ impl App {
             &user_input,
             expanded_content,
         )?;
+        if let Some(lane) = self.detect_local_prebootstrap_lane_from_workspace() {
+            self.local_prebootstrap_lane = Some(lane);
+        }
         self.begin_live_turn_state()?;
 
         let (system_prompt, calibration_ratio) = self.prepare_turn_context();
@@ -4237,6 +4451,97 @@ mod tests {
     }
 
     #[test]
+    fn local_bootstrap_lock_advances_target_without_mutation_and_resets_retry_budget() {
+        let mut lock = LocalBootstrapLock::new(
+            "space-invaders".to_string(),
+            vec![
+                "space-invaders/src/app/page.tsx".to_string(),
+                "space-invaders/src/app/globals.css".to_string(),
+            ],
+        );
+        lock.retry_budget = 0;
+
+        assert!(lock.advance_target_without_mutation());
+        assert_eq!(lock.retry_budget, LocalBootstrapLock::DEFAULT_RETRY_BUDGET);
+        assert_eq!(
+            lock.next_mutation_target(),
+            Some("space-invaders/src/app/globals.css")
+        );
+    }
+
+    #[test]
+    fn app_advances_postbootstrap_target_when_retry_budget_exhausts() {
+        let mut app = build_test_app();
+        app.local_bootstrap_lock = Some(LocalBootstrapLock {
+            kind: LocalBootstrapKind::Scaffolded,
+            active: true,
+            root_prefix: "space-invaders".to_string(),
+            retry_budget: 0,
+            scaffold_paths: vec![
+                "space-invaders/src/app/page.tsx".to_string(),
+                "space-invaders/src/app/globals.css".to_string(),
+            ],
+            target_queue: vec![
+                "space-invaders/src/app/page.tsx".to_string(),
+                "space-invaders/src/app/globals.css".to_string(),
+            ],
+        });
+
+        let message = app
+            .advance_local_bootstrap_target_on_exhaustion()
+            .expect("next target should be promoted");
+
+        assert!(message.contains("space-invaders/src/app/globals.css"));
+        assert_eq!(
+            app.local_bootstrap_lock
+                .as_ref()
+                .and_then(LocalBootstrapLock::next_mutation_target),
+            Some("space-invaders/src/app/globals.css")
+        );
+        assert_eq!(
+            app.local_bootstrap_lock.as_ref().map(|lock| lock.retry_budget),
+            Some(LocalBootstrapLock::DEFAULT_RETRY_BUDGET)
+        );
+    }
+
+    #[test]
+    fn consume_postbootstrap_retry_does_not_drop_lock_when_budget_is_zero() {
+        let mut app = build_test_app();
+        app.local_bootstrap_lock = Some(LocalBootstrapLock {
+            kind: LocalBootstrapKind::Scaffolded,
+            active: true,
+            root_prefix: "space-invaders".to_string(),
+            retry_budget: 0,
+            scaffold_paths: vec!["space-invaders/src/app/page.tsx".to_string()],
+            target_queue: vec!["space-invaders/src/app/page.tsx".to_string()],
+        });
+
+        assert!(app.consume_local_bootstrap_lock_retry().is_none());
+        assert_eq!(
+            app.local_bootstrap_lock
+                .as_ref()
+                .and_then(LocalBootstrapLock::next_mutation_target),
+            Some("space-invaders/src/app/page.tsx")
+        );
+    }
+
+    #[test]
+    fn consume_prebootstrap_retry_does_not_drop_lane_when_budget_is_zero() {
+        let mut app = build_test_app();
+        app.local_prebootstrap_lane = Some(LocalPreBootstrapLane {
+            active: true,
+            retry_budget: 0,
+        });
+
+        assert!(app.consume_local_bootstrap_lock_retry().is_none());
+        assert!(
+            app.local_prebootstrap_lane
+                .as_ref()
+                .is_some_and(LocalPreBootstrapLane::is_active)
+        );
+    }
+
+    #[test]
     fn manual_fallback_bootstrap_lock_prefers_package_before_page() {
         let lock = LocalBootstrapLock::manual_fallback(
             "space-invaders".to_string(),
@@ -4348,6 +4653,81 @@ mod tests {
 
         assert_eq!(app.local_bootstrap_lane_max_output_tokens(), Some(256));
         assert_eq!(app.local_bootstrap_lane_temperature(), Some(0.0));
+    }
+
+    #[test]
+    fn detect_local_prebootstrap_lane_from_empty_dir_listing() {
+        let app = build_test_app();
+        let result = crate::tooling::ToolExecutionResult {
+            tool_call_id: "call_file_read_root".to_string(),
+            tool_name: "file.read".to_string(),
+            status: crate::tooling::ToolExecutionStatus::Completed,
+            summary: "file.read completed: .".to_string(),
+            payload: crate::tooling::ToolExecutionPayload::Text(".anvil/\n".to_string()),
+            artifacts: vec![".".to_string()],
+            elapsed_ms: 0,
+            diff_summary: None,
+            edit_detail: None,
+            rolled_back: false,
+            observed_delta: None,
+            delta_observation_skipped: None,
+        };
+
+        let lane = app
+            .detect_local_prebootstrap_lane(std::slice::from_ref(&result))
+            .expect("empty directory listing should activate pre-bootstrap lane");
+        assert!(lane.is_active());
+    }
+
+    #[test]
+    fn detect_local_prebootstrap_lane_from_empty_workspace_before_first_turn() {
+        let temp = std::env::temp_dir().join(format!(
+            "anvil-prebootstrap-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp).expect("create temp dir");
+
+        let mut app = build_test_app();
+        app.config.runtime.provider = "ollama".to_string();
+        app.config.runtime.local_mode = true;
+        app.config.paths.cwd = temp.clone();
+
+        let lane = app
+            .detect_local_prebootstrap_lane_from_workspace()
+            .expect("empty workspace should activate pre-bootstrap lane");
+        assert!(lane.is_active());
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn local_prebootstrap_lane_prompt_is_minimal_and_targeted() {
+        let mut app = build_test_app();
+        app.config.runtime.provider = "ollama".to_string();
+        app.config.runtime.local_mode = true;
+        app.local_prebootstrap_lane = Some(LocalPreBootstrapLane::new());
+
+        let prompt = app.build_dynamic_system_prompt();
+        assert!(prompt.contains("You are Anvil in local pre-bootstrap init mode."));
+        assert!(prompt.contains("Allowed tools: shell.exec."));
+        assert!(prompt.contains("Forbidden: ANVIL_PLAN"));
+        assert!(!prompt.contains("## Working memory"));
+    }
+
+    #[test]
+    fn prebootstrap_lane_native_tools_are_limited_to_shell_exec() {
+        let mut app = build_test_app();
+        app.provider.capabilities.native_tool_calling = true;
+        app.local_prebootstrap_lane = Some(LocalPreBootstrapLane::new());
+
+        let tools = app
+            .build_native_tools()
+            .expect("native tool defs should be available");
+        let names: Vec<_> = tools.iter().map(|tool| tool.name.as_str()).collect();
+        assert_eq!(names, vec!["shell_exec"]);
     }
 
     #[test]
