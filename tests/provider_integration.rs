@@ -6075,7 +6075,29 @@ fn local_bootstrap_lock_persists_across_first_mutation_and_blocks_shell_exec_unt
                         }]),
                         assistant_tool_call_records: None,
                     })),
-                    _ => unreachable!("unexpected request shape before page mutation"),
+                    _ => emit(ProviderEvent::Agent(AgentEvent::Done {
+                        status: "Done. session saved".to_string(),
+                        assistant_message: "まず page を編集します。".to_string(),
+                        completion_summary: "turn 4".to_string(),
+                        saved_status: "session saved".to_string(),
+                        tool_logs: Vec::new(),
+                        elapsed_ms: 0,
+                        inference_performance: None,
+                        tool_calls: Some(vec![ToolCallRequest {
+                            tool_call_id: "call_edit_page".to_string(),
+                            tool_name: "file.edit".to_string(),
+                            input: ToolInput::FileEdit {
+                                path: "space-invaders/src/app/page.tsx".to_string(),
+                                old_string: "export default function Page() { return null; }\n"
+                                    .to_string(),
+                                new_string:
+                                    "export default function Page() { return <main>Ready</main>; }\n"
+                                        .to_string(),
+                            },
+                            extra_field_warnings: Vec::new(),
+                        }]),
+                        assistant_tool_call_records: None,
+                    })),
                 }
             }
             Ok(())
@@ -6109,6 +6131,334 @@ fn local_bootstrap_lock_persists_across_first_mutation_and_blocks_shell_exec_unt
         .expect("globals.css should exist");
     assert!(page.contains("Ready"));
     assert!(globals.contains("background: black"));
+}
+
+#[test]
+fn local_mode_failed_bootstrap_targets_package_json_directly() {
+    let root = common::unique_test_dir("local_failed_bootstrap_blocks_read");
+    fs::create_dir_all(&root).expect("test root should be created");
+    let mut config = common::build_config_in(root.clone());
+    config.mode.approval_required = false;
+    config.runtime.provider = "ollama".to_string();
+    config.runtime.local_mode = true;
+    let provider_ctx =
+        anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
+    let mut app = anvil::app::App::new(config, provider_ctx, Arc::new(AtomicBool::new(false)))
+        .expect("app should initialize");
+    let tui = Tui::new();
+    let seen_requests = Rc::new(RefCell::new(Vec::new()));
+
+    struct FailedBootstrapReadProvider {
+        step: AtomicUsize,
+        seen_requests: Rc<RefCell<Vec<ProviderTurnRequest>>>,
+    }
+
+    impl ProviderClient for FailedBootstrapReadProvider {
+        fn stream_turn(
+            &self,
+            request: &ProviderTurnRequest,
+            emit: &mut dyn FnMut(ProviderEvent),
+        ) -> Result<(), ProviderTurnError> {
+            self.seen_requests.borrow_mut().push(request.clone());
+            let blocked_read = request.messages.iter().any(|msg| {
+                msg.role == ProviderMessageRole::Tool
+                    && msg.content.contains(
+                        "file.read/file.search is blocked during local bootstrap act mode",
+                    )
+            });
+
+            if blocked_read {
+                emit(ProviderEvent::Agent(AgentEvent::Done {
+                    status: "Done. session saved".to_string(),
+                    assistant_message: "read はやめて package.json を直接書きます。".to_string(),
+                    completion_summary: "manual bootstrap".to_string(),
+                    saved_status: "session saved".to_string(),
+                    tool_logs: Vec::new(),
+                    elapsed_ms: 0,
+                    inference_performance: None,
+                    tool_calls: Some(vec![ToolCallRequest {
+                        tool_call_id: "call_write_package".to_string(),
+                        tool_name: "file.write".to_string(),
+                        input: ToolInput::FileWrite {
+                            path: "space-invaders/package.json".to_string(),
+                            content: "{\n  \"name\": \"space-invaders\",\n  \"private\": true\n}\n"
+                                .to_string(),
+                        },
+                        extra_field_warnings: Vec::new(),
+                    }]),
+                    assistant_tool_call_records: None,
+                }));
+                return Ok(());
+            }
+
+            match self.step.fetch_add(1, Ordering::SeqCst) {
+                0 => emit(ProviderEvent::Agent(AgentEvent::Done {
+                    status: "Done. session saved".to_string(),
+                    assistant_message: "まず状態を確認します。".to_string(),
+                    completion_summary: "turn 1".to_string(),
+                    saved_status: "session saved".to_string(),
+                    tool_logs: Vec::new(),
+                    elapsed_ms: 0,
+                    inference_performance: None,
+                    tool_calls: Some(vec![ToolCallRequest {
+                        tool_call_id: "call_file_read_root".to_string(),
+                        tool_name: "file.read".to_string(),
+                        input: ToolInput::FileRead {
+                            path: ".".to_string(),
+                        },
+                        extra_field_warnings: Vec::new(),
+                    }]),
+                    assistant_tool_call_records: None,
+                })),
+                1 => emit(ProviderEvent::Agent(AgentEvent::Done {
+                    status: "Done. session saved".to_string(),
+                    assistant_message: "Next.js を初期化します。".to_string(),
+                    completion_summary: "turn 2".to_string(),
+                    saved_status: "session saved".to_string(),
+                    tool_logs: Vec::new(),
+                    elapsed_ms: 0,
+                    inference_performance: None,
+                    tool_calls: Some(vec![ToolCallRequest {
+                        tool_call_id: "call_scaffold".to_string(),
+                        tool_name: "shell.exec".to_string(),
+                        input: ToolInput::ShellExec {
+                            command: "printf 'npm ERR! code ENOSPC\\nnpm ERR! no space left on device\\n' 1>&2; false # create-next-app@latest space-invaders".to_string(),
+                        },
+                        extra_field_warnings: Vec::new(),
+                    }]),
+                    assistant_tool_call_records: None,
+                })),
+                2 => emit(ProviderEvent::Agent(AgentEvent::Done {
+                    status: "Done. session saved".to_string(),
+                    assistant_message: "page.tsx を確認します。".to_string(),
+                    completion_summary: "turn 3".to_string(),
+                    saved_status: "session saved".to_string(),
+                    tool_logs: Vec::new(),
+                    elapsed_ms: 0,
+                    inference_performance: None,
+                    tool_calls: Some(vec![ToolCallRequest {
+                        tool_call_id: "call_read_page".to_string(),
+                        tool_name: "file.read".to_string(),
+                        input: ToolInput::FileRead {
+                            path: "space-invaders/src/app/page.tsx".to_string(),
+                        },
+                        extra_field_warnings: Vec::new(),
+                    }]),
+                    assistant_tool_call_records: None,
+                })),
+                _ => emit(ProviderEvent::Agent(AgentEvent::Done {
+                    status: "Done. session saved".to_string(),
+                    assistant_message: "read はやめて package.json を直接書きます。".to_string(),
+                    completion_summary: "manual bootstrap fallback".to_string(),
+                    saved_status: "session saved".to_string(),
+                    tool_logs: Vec::new(),
+                    elapsed_ms: 0,
+                    inference_performance: None,
+                    tool_calls: Some(vec![ToolCallRequest {
+                        tool_call_id: "call_write_package_fallback".to_string(),
+                        tool_name: "file.write".to_string(),
+                        input: ToolInput::FileWrite {
+                            path: "space-invaders/package.json".to_string(),
+                            content: "{\n  \"name\": \"space-invaders\",\n  \"private\": true\n}\n"
+                                .to_string(),
+                        },
+                        extra_field_warnings: Vec::new(),
+                    }]),
+                    assistant_tool_call_records: None,
+                })),
+            }
+            Ok(())
+        }
+    }
+
+    app.run_live_turn(
+        "create the project",
+        &FailedBootstrapReadProvider {
+            step: AtomicUsize::new(0),
+            seen_requests: seen_requests.clone(),
+        },
+        &tui,
+    )
+    .expect("failed bootstrap should switch to direct package mutation after blocked read");
+
+    let tool_messages: Vec<_> = app
+        .session()
+        .messages
+        .iter()
+        .filter(|msg| msg.role == MessageRole::Tool)
+        .collect();
+    assert!(
+        !seen_requests
+            .borrow()
+            .iter()
+            .any(|request| request.messages.iter().any(|msg| {
+                msg.role == ProviderMessageRole::Tool
+                    && msg
+                        .content
+                        .contains("shell.exec is blocked during local bootstrap act mode")
+            })),
+        "manual bootstrap fallback should bypass shell diagnostics and go straight to direct mutation"
+    );
+    assert!(
+        tool_messages
+            .iter()
+            .filter(|msg| msg.content.contains("[tool result: file.write]"))
+            .any(|msg| msg.content.contains("space-invaders/package.json")),
+        "manual bootstrap fallback should target package.json directly after failed scaffold"
+    );
+
+    let package = fs::read_to_string(root.join("space-invaders/package.json"))
+        .expect("manual bootstrap should create package.json");
+    assert!(package.contains("\"space-invaders\""));
+}
+
+#[test]
+fn local_mode_failed_bootstrap_blocks_wrong_mutation_path_before_targeting_package() {
+    let root = common::unique_test_dir("local_failed_bootstrap_blocks_wrong_mutation_path");
+    fs::create_dir_all(&root).expect("test root should be created");
+    let mut config = common::build_config_in(root.clone());
+    config.mode.approval_required = false;
+    config.runtime.provider = "ollama".to_string();
+    config.runtime.local_mode = true;
+    let provider_ctx =
+        anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
+    let mut app = anvil::app::App::new(config, provider_ctx, Arc::new(AtomicBool::new(false)))
+        .expect("app should initialize");
+    let tui = Tui::new();
+
+    struct FailedBootstrapWrongPathProvider {
+        step: AtomicUsize,
+    }
+
+    impl ProviderClient for FailedBootstrapWrongPathProvider {
+        fn stream_turn(
+            &self,
+            request: &ProviderTurnRequest,
+            emit: &mut dyn FnMut(ProviderEvent),
+        ) -> Result<(), ProviderTurnError> {
+            let blocked_wrong_path = request.messages.iter().any(|msg| {
+                msg.role == ProviderMessageRole::Tool
+                    && msg.content.contains(
+                        "direct mutation must target space-invaders/package.json during local manual bootstrap act mode",
+                    )
+            });
+
+            if blocked_wrong_path {
+                emit(ProviderEvent::Agent(AgentEvent::Done {
+                    status: "Done. session saved".to_string(),
+                    assistant_message: "対象 path に合わせて package.json を作成します。"
+                        .to_string(),
+                    completion_summary: "manual bootstrap corrected".to_string(),
+                    saved_status: "session saved".to_string(),
+                    tool_logs: Vec::new(),
+                    elapsed_ms: 0,
+                    inference_performance: None,
+                    tool_calls: Some(vec![ToolCallRequest {
+                        tool_call_id: "call_write_correct_package".to_string(),
+                        tool_name: "file.write".to_string(),
+                        input: ToolInput::FileWrite {
+                            path: "space-invaders/package.json".to_string(),
+                            content: "{\n  \"name\": \"space-invaders\",\n  \"private\": true\n}\n"
+                                .to_string(),
+                        },
+                        extra_field_warnings: Vec::new(),
+                    }]),
+                    assistant_tool_call_records: None,
+                }));
+                return Ok(());
+            }
+
+            match self.step.fetch_add(1, Ordering::SeqCst) {
+                0 => emit(ProviderEvent::Agent(AgentEvent::Done {
+                    status: "Done. session saved".to_string(),
+                    assistant_message: "まず状態を確認します。".to_string(),
+                    completion_summary: "turn 1".to_string(),
+                    saved_status: "session saved".to_string(),
+                    tool_logs: Vec::new(),
+                    elapsed_ms: 0,
+                    inference_performance: None,
+                    tool_calls: Some(vec![ToolCallRequest {
+                        tool_call_id: "call_file_read_root".to_string(),
+                        tool_name: "file.read".to_string(),
+                        input: ToolInput::FileRead {
+                            path: ".".to_string(),
+                        },
+                        extra_field_warnings: Vec::new(),
+                    }]),
+                    assistant_tool_call_records: None,
+                })),
+                1 => emit(ProviderEvent::Agent(AgentEvent::Done {
+                    status: "Done. session saved".to_string(),
+                    assistant_message: "Next.js を初期化します。".to_string(),
+                    completion_summary: "turn 2".to_string(),
+                    saved_status: "session saved".to_string(),
+                    tool_logs: Vec::new(),
+                    elapsed_ms: 0,
+                    inference_performance: None,
+                    tool_calls: Some(vec![ToolCallRequest {
+                        tool_call_id: "call_scaffold".to_string(),
+                        tool_name: "shell.exec".to_string(),
+                        input: ToolInput::ShellExec {
+                            command: "printf 'npm ERR! code ENOSPC\\nnpm ERR! no space left on device\\n' 1>&2; false # create-next-app@latest space-invaders".to_string(),
+                        },
+                        extra_field_warnings: Vec::new(),
+                    }]),
+                    assistant_tool_call_records: None,
+                })),
+                2 => emit(ProviderEvent::Agent(AgentEvent::Done {
+                    status: "Done. session saved".to_string(),
+                    assistant_message: "package.json を書きます。".to_string(),
+                    completion_summary: "turn 3".to_string(),
+                    saved_status: "session saved".to_string(),
+                    tool_logs: Vec::new(),
+                    elapsed_ms: 0,
+                    inference_performance: None,
+                    tool_calls: Some(vec![ToolCallRequest {
+                        tool_call_id: "call_write_wrong_package".to_string(),
+                        tool_name: "file.write".to_string(),
+                        input: ToolInput::FileWrite {
+                            path: "./package.json".to_string(),
+                            content: "{\n  \"name\": \"wrong-place\"\n}\n".to_string(),
+                        },
+                        extra_field_warnings: Vec::new(),
+                    }]),
+                    assistant_tool_call_records: None,
+                })),
+                _ => unreachable!("unexpected request shape before wrong-path rejection"),
+            }
+            Ok(())
+        }
+    }
+
+    app.run_live_turn(
+        "create the project",
+        &FailedBootstrapWrongPathProvider {
+            step: AtomicUsize::new(0),
+        },
+        &tui,
+    )
+    .expect("failed bootstrap should reject wrong mutation path and target package.json");
+
+    let tool_messages: Vec<_> = app
+        .session()
+        .messages
+        .iter()
+        .filter(|msg| msg.role == MessageRole::Tool)
+        .collect();
+    assert!(
+        tool_messages.iter().any(|msg| msg.content.contains(
+            "direct mutation must target space-invaders/package.json during local manual bootstrap act mode"
+        )),
+        "manual bootstrap fallback should reject wrong mutation paths"
+    );
+
+    assert!(
+        !root.join("package.json").exists(),
+        "wrong-path package.json should not be written at repo root"
+    );
+    let package = fs::read_to_string(root.join("space-invaders/package.json"))
+        .expect("manual bootstrap should create package.json under the target root");
+    assert!(package.contains("\"space-invaders\""));
 }
 
 #[test]

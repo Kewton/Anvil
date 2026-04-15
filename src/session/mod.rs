@@ -455,6 +455,18 @@ impl SessionRecord {
         self.touch();
     }
 
+    pub fn remove_messages_matching<F>(&mut self, mut predicate: F)
+    where
+        F: FnMut(&SessionMessage) -> bool,
+    {
+        let before_len = self.messages.len();
+        self.messages.retain(|message| !predicate(message));
+        if self.messages.len() != before_len {
+            self.cached_token_count.set(None);
+            self.touch();
+        }
+    }
+
     /// Check whether auto-compaction should run (DR3-001).
     /// Zero-guard: returns false if auto_compact_threshold == 0.
     pub fn should_compact(&self) -> bool {

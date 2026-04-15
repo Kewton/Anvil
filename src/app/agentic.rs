@@ -1048,7 +1048,15 @@ impl App {
 
     fn inject_local_bootstrap_lock_retry(&mut self, message: String) {
         tracing::warn!("{LOCAL_BOOTSTRAP_LOCK_RETRY_LOG}");
-        let retry_msg = SessionMessage::new(MessageRole::Tool, "system", message)
+        self.session.remove_messages_matching(|existing| {
+            existing.role == MessageRole::Tool
+                && existing.author == crate::app::BOOTSTRAP_LANE_RETRY_AUTHOR
+        });
+        let retry_msg = SessionMessage::new(
+            MessageRole::Tool,
+            crate::app::BOOTSTRAP_LANE_RETRY_AUTHOR,
+            message,
+        )
             .with_id(self.next_message_id("tool"));
         self.session.push_message(retry_msg);
     }
@@ -1056,6 +1064,9 @@ impl App {
     /// Common condition check for task-semantics gate (Done path / Branch 5, Issue #382).
     fn should_fire_task_semantics_gate_common(&self) -> bool {
         if !self.config.runtime.task_semantics_gate_enabled {
+            return false;
+        }
+        if self.local_bootstrap_lane_active() {
             return false;
         }
         let Some(task) = self.session.working_memory.active_task.as_deref() else {
@@ -1205,6 +1216,19 @@ impl App {
         turn_progress: TurnProgressFacts,
         turn_has_subagent: bool,
     ) -> Result<TerminationTransition, AppError> {
+        if self.local_bootstrap_lane_active() {
+            if let Some(message) = self.consume_local_bootstrap_lock_retry() {
+                self.inject_local_bootstrap_lock_retry(message);
+                return Ok(TerminationTransition::Continue);
+            }
+            if let Some(lock) = self.local_bootstrap_lock.as_mut() {
+                tracing::warn!(
+                    "local bootstrap lock: retry budget exhausted, releasing deterministic target lane"
+                );
+                lock.active = false;
+            }
+        }
+
         // Pre-compute all inputs for the FSM.
         let touched_files_empty = self.touched_files_empty_for_completion();
         let phase_action = self.phase_estimator.check_empty_response();
@@ -1851,17 +1875,40 @@ impl App {
             );
 
             let (system_prompt, calibration_ratio) = self.prepare_turn_context();
-            let (mut request, used_tokens) = BasicAgentLoop::build_turn_request_calibrated(
-                self.effective_model().to_string(),
-                &self.session,
-                self.provider.capabilities.streaming && self.config.runtime.stream,
-                self.effective_context_window(),
-                &system_prompt,
-                calibration_ratio,
-                self.config.runtime.context_budget,
-            );
+            let (mut request, used_tokens) =
+                if let Some(selected) = self.bootstrap_lane_followup_messages() {
+                    BasicAgentLoop::build_turn_request_from_explicit_messages(
+                        self.effective_model().to_string(),
+                        &self.session,
+                        self.provider.capabilities.streaming && self.config.runtime.stream,
+                        &system_prompt,
+                        &selected,
+                        calibration_ratio,
+                    )
+                } else {
+                    BasicAgentLoop::build_turn_request_calibrated(
+                        self.effective_model().to_string(),
+                        &self.session,
+                        self.provider.capabilities.streaming && self.config.runtime.stream,
+                        self.effective_context_window(),
+                        &system_prompt,
+                        calibration_ratio,
+                        self.config.runtime.context_budget,
+                    )
+                };
             request.max_output_tokens = self.config.runtime.max_output_tokens;
             request.temperature = self.config.runtime.tool_temperature;
+            if let Some(limit) = self.local_bootstrap_lane_max_output_tokens() {
+                request.max_output_tokens = Some(
+                    request
+                        .max_output_tokens
+                        .unwrap_or(limit)
+                        .min(limit),
+                );
+            }
+            if let Some(temp) = self.local_bootstrap_lane_temperature() {
+                request.temperature = Some(temp);
+            }
             request.context_window = if self.config.runtime.context_window_explicitly_set {
                 Some(self.effective_context_window())
             } else {
@@ -2012,7 +2059,9 @@ impl App {
                 crate::app::stagnation_state::compute_stagnation_score(&self.stagnation_state);
             // Issue #292: parameterize threshold via model size class.
             let stagnation_threshold = delegation_threshold(self.size_class);
-            self.forced_mode_active = stagnation_score >= stagnation_threshold;
+            let bootstrap_lane_active = self.local_bootstrap_lane_active();
+            self.forced_mode_active =
+                !bootstrap_lane_active && stagnation_score >= stagnation_threshold;
             if self.forced_mode_active {
                 tracing::warn!(
                     score = stagnation_score,
@@ -2028,7 +2077,8 @@ impl App {
             // The `proactive_delegation_fired` flag prevents both paths from
             // firing in the same turn (same-turn exclusivity guard).
             let mut proactive_delegation_fired = false;
-            if self.forced_mode_active
+            if !bootstrap_lane_active
+                && self.forced_mode_active
                 && matches!(
                     self.size_class,
                     crate::agent::model_classifier::ModelSizeClass::Medium
@@ -2089,7 +2139,8 @@ impl App {
             // the worker path is never observed. Trigger escalation here when
             // cumulative failures + stagnation score cross the configured
             // stagnation thresholds and fix_slice has not already escalated.
-            if !proactive_delegation_fired
+            if !bootstrap_lane_active
+                && !proactive_delegation_fired
                 && !self.agent_telemetry.worker_observed
                 && crate::app::edit_fail_tracker::should_escalate_for_stagnation(
                     self.edit_fail_tracker.total_failures(),
@@ -2133,7 +2184,8 @@ impl App {
             // plan repair, and pre-exit repair without reaching the worker
             // path. Fire escalation here when the stagnation score is high
             // and no mutation has been observed at all.
-            if !proactive_delegation_fired
+            if !bootstrap_lane_active
+                && !proactive_delegation_fired
                 && !self.agent_telemetry.worker_observed
                 && crate::app::edit_fail_tracker::should_escalate_for_read_heavy_drift(
                     stagnation_score as u32,
@@ -2179,7 +2231,7 @@ impl App {
                 self.agent_telemetry.plan_repair_request_count as usize;
 
             // Workset transition telemetry: record only on first activation.
-            if self.forced_mode_active && !prev_forced_mode_active {
+            if !bootstrap_lane_active && self.forced_mode_active && !prev_forced_mode_active {
                 self.agent_telemetry.record_forced_workset_transition();
             }
 
@@ -2384,7 +2436,9 @@ impl App {
             // through the Warn → StrongWarn → Break ladder.
             let thrash_armed = !self.agent_telemetry.worker_observed
                 && self.agent_telemetry.fixslice_worker_failure_count > 0;
-            if thrash_armed {
+            if bootstrap_lane_active {
+                self.post_failure_thrash_detector.reset();
+            } else if thrash_armed {
                 let had_tool_calls = !results.is_empty();
                 let plan_advanced =
                     turn_progress.plan_progress_observed || turn_progress.mutation_observed;
@@ -2454,11 +2508,13 @@ impl App {
             }
 
             // Plan repair request.
-            if crate::app::stagnation_state::should_request_plan_repair(
-                &self.stagnation_state,
-                plan_repair_count_before_this_turn,
-                remaining_turns,
-            ) {
+            if !bootstrap_lane_active
+                && crate::app::stagnation_state::should_request_plan_repair(
+                    &self.stagnation_state,
+                    plan_repair_count_before_this_turn,
+                    remaining_turns,
+                )
+            {
                 let msg_text = crate::app::stagnation_state::build_plan_repair_message(
                     &self.stagnation_state.starved_target_files,
                 );
@@ -2466,7 +2522,7 @@ impl App {
                     .with_id(self.next_message_id("tool"));
                 self.session.push_message(msg);
                 self.agent_telemetry.record_plan_repair_request();
-            } else {
+            } else if !bootstrap_lane_active {
                 // Escape hatch: plan repair was already attempted but stagnation persists.
                 if crate::app::stagnation_state::should_allow_escape_hatch(
                     &self.stagnation_state,

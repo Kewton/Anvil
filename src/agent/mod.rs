@@ -250,6 +250,53 @@ impl BasicAgentLoop {
         request
     }
 
+    pub fn build_turn_request_from_explicit_messages(
+        model: impl Into<String>,
+        session: &SessionRecord,
+        stream: bool,
+        system_prompt: &str,
+        selected: &[&SessionMessage],
+        calibration_ratio: f64,
+    ) -> (ProviderTurnRequest, usize) {
+        let system_prompt_tokens =
+            estimate_tokens_calibrated(system_prompt, ContentKind::Text, calibration_ratio);
+        let used_tokens: usize = selected
+            .iter()
+            .map(|message| {
+                let kind = ContentKind::from_message_role(message.role);
+                estimate_tokens_calibrated(message.effective_content(), kind, calibration_ratio)
+            })
+            .sum();
+
+        let estimated_prompt_tokens = system_prompt_tokens + used_tokens;
+
+        tracing::debug!(
+            selected_messages = selected.len(),
+            used_tokens = used_tokens,
+            system_prompt_tokens = system_prompt_tokens,
+            calibration_ratio = calibration_ratio,
+            estimated_prompt_tokens = estimated_prompt_tokens,
+            "built explicit turn request"
+        );
+
+        let sandbox_root = std::fs::canonicalize(&session.metadata.cwd).ok();
+        let messages: Vec<ProviderMessage> = std::iter::once(ProviderMessage::new(
+            ProviderMessageRole::System,
+            system_prompt,
+        ))
+        .chain(
+            selected
+                .iter()
+                .map(|sm| to_provider_message_with_images(sm, sandbox_root.as_deref())),
+        )
+        .collect();
+
+        (
+            ProviderTurnRequest::new(model.into(), messages, stream),
+            estimated_prompt_tokens,
+        )
+    }
+
     /// Build a provider turn request with calibration ratio applied.
     ///
     /// Returns `(ProviderTurnRequest, estimated_prompt_tokens)`.

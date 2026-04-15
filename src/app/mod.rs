@@ -238,29 +238,50 @@ pub struct CompactInfo {
     pub sidecar_rejected: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalBootstrapKind {
+    Scaffolded,
+    ManualFallback,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LocalBootstrapLock {
+    kind: LocalBootstrapKind,
     active: bool,
     root_prefix: String,
     retry_budget: u8,
-    exploration_turn_budget: u8,
-    mutation_turn_budget: u8,
     scaffold_paths: Vec<String>,
+    target_queue: Vec<String>,
 }
 
 impl LocalBootstrapLock {
     const DEFAULT_RETRY_BUDGET: u8 = 2;
-    const DEFAULT_EXPLORATION_TURN_BUDGET: u8 = 1;
-    const DEFAULT_MUTATION_TURN_BUDGET: u8 = 2;
 
     fn new(root_prefix: String, scaffold_paths: Vec<String>) -> Self {
+        Self::new_with_kind(LocalBootstrapKind::Scaffolded, root_prefix, scaffold_paths)
+    }
+
+    fn manual_fallback(root_prefix: String, scaffold_paths: Vec<String>) -> Self {
+        Self::new_with_kind(
+            LocalBootstrapKind::ManualFallback,
+            root_prefix,
+            scaffold_paths,
+        )
+    }
+
+    fn new_with_kind(
+        kind: LocalBootstrapKind,
+        root_prefix: String,
+        scaffold_paths: Vec<String>,
+    ) -> Self {
+        let target_queue = Self::build_target_queue(kind, &scaffold_paths);
         Self {
-            active: true,
+            kind,
+            active: !target_queue.is_empty(),
             root_prefix,
             retry_budget: Self::DEFAULT_RETRY_BUDGET,
-            exploration_turn_budget: Self::DEFAULT_EXPLORATION_TURN_BUDGET,
-            mutation_turn_budget: Self::DEFAULT_MUTATION_TURN_BUDGET,
             scaffold_paths,
+            target_queue,
         }
     }
 
@@ -272,26 +293,72 @@ impl LocalBootstrapLock {
         self.scaffold_paths.iter().any(|scaffold| scaffold == path)
     }
 
-    fn consume_exploration_turn(&mut self) {
-        self.exploration_turn_budget = self.exploration_turn_budget.saturating_sub(1);
+    fn build_target_queue(kind: LocalBootstrapKind, scaffold_paths: &[String]) -> Vec<String> {
+        const SCAFFOLDED_SUFFIXES: &[&str] = &[
+            "/src/app/page.tsx",
+            "/app/page.tsx",
+            "/src/app/globals.css",
+            "/app/globals.css",
+            "/src/app/layout.tsx",
+            "/app/layout.tsx",
+            "/next.config.ts",
+            "/next.config.js",
+            "/package.json",
+        ];
+        const MANUAL_FALLBACK_SUFFIXES: &[&str] = &[
+            "/package.json",
+            "/next.config.ts",
+            "/next.config.js",
+            "/src/app/layout.tsx",
+            "/app/layout.tsx",
+            "/src/app/page.tsx",
+            "/app/page.tsx",
+            "/src/app/globals.css",
+            "/app/globals.css",
+        ];
+
+        let preferred_suffixes = match kind {
+            LocalBootstrapKind::Scaffolded => SCAFFOLDED_SUFFIXES,
+            LocalBootstrapKind::ManualFallback => MANUAL_FALLBACK_SUFFIXES,
+        };
+
+        let mut queue = Vec::new();
+        for suffix in preferred_suffixes {
+            if let Some(path) = scaffold_paths
+                .iter()
+                .find(|path| path.ends_with(suffix))
+                .filter(|path| !queue.iter().any(|existing| existing == *path))
+            {
+                queue.push(path.clone());
+            }
+        }
+
+        for path in scaffold_paths {
+            if !queue.iter().any(|existing| existing == path) {
+                queue.push(path.clone());
+            }
+        }
+
+        queue
     }
 
     fn mark_mutated_paths(&mut self, paths: &[String]) {
-        if self.scaffold_paths.is_empty() || paths.is_empty() {
+        if paths.is_empty() {
             return;
         }
         self.scaffold_paths
             .retain(|scaffold| !paths.iter().any(|path| path == scaffold));
+        self.target_queue
+            .retain(|target| !paths.iter().any(|path| path == target));
+        self.active = !self.target_queue.is_empty();
     }
 
-    fn consume_mutation_turn(&mut self) {
-        self.mutation_turn_budget = self.mutation_turn_budget.saturating_sub(1);
-        self.exploration_turn_budget = 0;
-        if self.mutation_turn_budget == 0 {
-            self.active = false;
-        }
+    fn next_mutation_target(&self) -> Option<&str> {
+        self.target_queue.first().map(|path| path.as_str())
     }
 }
+
+pub(crate) const BOOTSTRAP_LANE_RETRY_AUTHOR: &str = "bootstrap_lane_retry";
 
 /// Central application state.
 pub struct App {
@@ -948,6 +1015,10 @@ impl App {
     fn build_dynamic_system_prompt(&self) -> String {
         use crate::agent::tool_protocol_system_prompt;
 
+        if let Some(prompt) = self.build_local_bootstrap_lane_system_prompt() {
+            return prompt;
+        }
+
         // Issue #373: Native tool calling mode — use simplified prompt
         // that omits ANVIL_TOOL format descriptions when native tool calling
         // is active and no MCP tools are configured.
@@ -1032,7 +1103,40 @@ impl App {
             prompt.push_str(&wm_prompt);
         }
 
+        if let Some(lock) = &self.local_bootstrap_lock
+            && lock.is_active()
+            && let Some(target) = lock.next_mutation_target()
+        {
+            prompt.push_str("\n\n## Local bootstrap lane\n");
+            prompt.push_str(&format!("Current bootstrap target: {target}\n"));
+            prompt.push_str(
+                "Do not explain, re-plan, search, or use shell.exec. Emit exactly one direct file mutation for the current bootstrap target.\n",
+            );
+        }
+
         prompt
+    }
+
+    fn build_local_bootstrap_lane_system_prompt(&self) -> Option<String> {
+        let lock = self.local_bootstrap_lock.as_ref()?;
+        if !lock.is_active() {
+            return None;
+        }
+
+        let target = lock.next_mutation_target()?;
+        let mut prompt = String::from(
+            "You are Anvil in local bootstrap act mode.\n\n\
+             Emit exactly one direct file mutation tool call now.\n\
+             Allowed tools: file.write, file.edit, file.edit_anchor, file.rewrite.\n\
+             Forbidden: ANVIL_PLAN, ANVIL_PLAN_UPDATE, explanation, file.read, file.search, shell.exec, git.status, agent.plan.\n",
+        );
+        prompt.push_str(&format!("Project root: {}\n", lock.root_prefix));
+        prompt.push_str(&format!("Current bootstrap target: {target}\n"));
+        prompt.push_str(
+            "Only mutate the current bootstrap target. Do not discuss what you will do. Do not inspect more files. Do not choose a different path.\n",
+        );
+        prompt.push_str(&context::format_date_prompt());
+        Some(prompt)
     }
 
     /// Convert a path to a cwd-relative string for working memory.
@@ -1131,9 +1235,62 @@ impl App {
         })
     }
 
+    fn detect_local_bootstrap_failure_lock(
+        &self,
+        results: &[crate::tooling::ToolExecutionResult],
+    ) -> Option<LocalBootstrapLock> {
+        if !self.local_mode_active() {
+            return None;
+        }
+
+        results.iter().find_map(|result| {
+            if result.tool_name != "shell.exec"
+                || result.status != crate::tooling::ToolExecutionStatus::Failed
+            {
+                return None;
+            }
+
+            let crate::tooling::ToolExecutionPayload::Text(payload) = &result.payload else {
+                return None;
+            };
+            let payload_lower = payload.to_ascii_lowercase();
+            if !payload_lower.contains("enospc") && !payload_lower.contains("no space left") {
+                return None;
+            }
+
+            let root_prefix = Self::extract_failed_bootstrap_root_prefix(&result.summary)?;
+            Some(LocalBootstrapLock::manual_fallback(
+                root_prefix.clone(),
+                vec![
+                    format!("{root_prefix}/package.json"),
+                    format!("{root_prefix}/next.config.ts"),
+                    format!("{root_prefix}/src/app/page.tsx"),
+                    format!("{root_prefix}/src/app/globals.css"),
+                    format!("{root_prefix}/src/app/layout.tsx"),
+                ],
+            ))
+        })
+    }
+
+    fn extract_failed_bootstrap_root_prefix(summary: &str) -> Option<String> {
+        let command = summary
+            .strip_prefix("shell.exec failed (exit 1): ")
+            .or_else(|| summary.strip_prefix("shell.exec failed (exit -1): "))?;
+        let tokens: Vec<&str> = command.split_whitespace().collect();
+
+        for (idx, token) in tokens.iter().enumerate() {
+            if token.contains("create-next-app")
+                && let Some(candidate) = tokens.get(idx + 1)
+                && !candidate.starts_with('-')
+            {
+                return Some(candidate.trim_matches('"').to_string());
+            }
+        }
+        None
+    }
+
     fn update_local_bootstrap_lock(&mut self, results: &[crate::tooling::ToolExecutionResult]) {
         if let Some(lock) = &self.local_bootstrap_lock {
-            let root_prefix = format!("{}/", lock.root_prefix);
             let mutated_paths: Vec<String> = results
                 .iter()
                 .filter(|result| {
@@ -1142,12 +1299,14 @@ impl App {
                         && !result.rolled_back
                 })
                 .flat_map(|result| result.observed_changed_paths().into_iter())
-                .filter(|path| path.starts_with(&root_prefix))
+                .filter_map(|path| {
+                    self.relative_path_for_working_memory(std::path::Path::new(&path))
+                })
+                .filter(|path| path.starts_with(&format!("{}/", lock.root_prefix)))
                 .collect();
             if !mutated_paths.is_empty() {
                 if let Some(lock) = self.local_bootstrap_lock.as_mut() {
                     lock.mark_mutated_paths(&mutated_paths);
-                    lock.consume_mutation_turn();
                     if !lock.is_active() {
                         self.local_bootstrap_lock = None;
                     }
@@ -1156,16 +1315,10 @@ impl App {
             }
         }
 
-        if let Some(lock) = self.local_bootstrap_lock.as_mut()
-            && lock.is_active()
-            && Self::results_are_local_bootstrap_exploration_only(results)
-        {
-            lock.consume_exploration_turn();
-            return;
-        }
-
         if self.local_bootstrap_lock.is_none() {
-            self.local_bootstrap_lock = self.detect_local_bootstrap_lock(results);
+            self.local_bootstrap_lock = self
+                .detect_local_bootstrap_lock(results)
+                .or_else(|| self.detect_local_bootstrap_failure_lock(results));
         }
     }
 
@@ -1202,9 +1355,7 @@ impl App {
         let Some(lock) = &self.local_bootstrap_lock else {
             return false;
         };
-        lock.is_active()
-            && lock.exploration_turn_budget == 0
-            && Self::structured_is_local_bootstrap_exploration_only(structured)
+        lock.is_active() && Self::structured_is_local_bootstrap_exploration_only(structured)
     }
 
     fn consume_local_bootstrap_lock_retry(&mut self) -> Option<String> {
@@ -1214,7 +1365,10 @@ impl App {
             return None;
         }
         lock.retry_budget = lock.retry_budget.saturating_sub(1);
-        Some(Self::local_bootstrap_lock_retry_message(&lock.root_prefix))
+        Some(Self::local_bootstrap_lock_retry_message(
+            &lock.root_prefix,
+            lock.next_mutation_target(),
+        ))
     }
 
     fn filter_touched_files_for_plan_sync(&self, touched_files: &[String]) -> Vec<String> {
@@ -1250,6 +1404,63 @@ impl App {
             .is_empty()
     }
 
+    pub(crate) fn local_bootstrap_lane_active(&self) -> bool {
+        self.local_bootstrap_lock
+            .as_ref()
+            .is_some_and(LocalBootstrapLock::is_active)
+    }
+
+    pub(crate) fn local_bootstrap_lane_max_output_tokens(&self) -> Option<u32> {
+        self.local_bootstrap_lane_active().then_some(256)
+    }
+
+    pub(crate) fn local_bootstrap_lane_temperature(&self) -> Option<f64> {
+        self.local_bootstrap_lane_active().then_some(0.0)
+    }
+
+    pub(crate) fn bootstrap_lane_followup_messages(&self) -> Option<Vec<&SessionMessage>> {
+        if !self.local_bootstrap_lane_active() {
+            return None;
+        }
+
+        let mut selected = Vec::new();
+        let first_user_id = self
+            .session
+            .messages
+            .iter()
+            .find(|message| message.role == MessageRole::User)
+            .map(|message| message.id.clone());
+
+        if let Some(first_user) = self
+            .session
+            .messages
+            .iter()
+            .find(|message| Some(&message.id) == first_user_id.as_ref())
+        {
+            selected.push(first_user);
+        }
+
+        let tail: Vec<&SessionMessage> = self
+            .session
+            .messages
+            .iter()
+            .rev()
+            .filter(|message| {
+                message.role == MessageRole::Tool
+                    && message.author != BOOTSTRAP_LANE_RETRY_AUTHOR
+            })
+            .take(6)
+            .collect();
+        for message in tail.into_iter().rev() {
+            if first_user_id.as_ref().is_some_and(|id| id == &message.id) {
+                continue;
+            }
+            selected.push(message);
+        }
+
+        Some(selected)
+    }
+
     fn local_mode_tool_rejection_reason(
         &self,
         input: &crate::tooling::ToolInput,
@@ -1261,22 +1472,44 @@ impl App {
         if let Some(lock) = &self.local_bootstrap_lock
             && lock.is_active()
         {
+            if let Some(path) = Self::tool_input_target_path(input) {
+                if let Some(expected) = lock.next_mutation_target()
+                    && Self::is_real_mutation_tool_input(input)
+                    && path != expected
+                {
+                    return Some(match lock.kind {
+                        LocalBootstrapKind::ManualFallback => format!(
+                            "direct mutation must target {expected} during local manual bootstrap act mode"
+                        ),
+                        LocalBootstrapKind::Scaffolded => format!(
+                            "direct mutation must target {expected} during local bootstrap act mode"
+                        ),
+                    });
+                }
+                if Self::is_real_mutation_tool_input(input)
+                    && !path.starts_with(&format!("{}/", lock.root_prefix))
+                {
+                    return Some(format!(
+                        "direct mutation must stay under {} during local bootstrap act mode",
+                        lock.root_prefix
+                    ));
+                }
+            }
             return match input {
                 crate::tooling::ToolInput::FileWrite { .. }
                 | crate::tooling::ToolInput::FileEdit { .. }
                 | crate::tooling::ToolInput::FileEditAnchor { .. }
                 | crate::tooling::ToolInput::FileRewrite { .. } => None,
                 crate::tooling::ToolInput::FileRead { .. }
-                | crate::tooling::ToolInput::FileSearch { .. }
-                    if lock.exploration_turn_budget > 0 =>
+                | crate::tooling::ToolInput::FileSearch { .. } => Some(match lock
+                    .next_mutation_target()
                 {
-                    None
-                }
-                crate::tooling::ToolInput::FileRead { .. }
-                | crate::tooling::ToolInput::FileSearch { .. } => Some(
-                    "additional file.read/file.search is blocked during local bootstrap act mode; mutate a file now"
+                    Some(target) => format!(
+                        "file.read/file.search is blocked during local bootstrap act mode; mutate {target} now"
+                    ),
+                    None => "file.read/file.search is blocked during local bootstrap act mode; mutate a file now"
                         .to_string(),
-                ),
+                }),
                 crate::tooling::ToolInput::ShellExec { .. } => Some(
                     "shell.exec is blocked during local bootstrap act mode; use file.read/file.search or a direct file mutation"
                         .to_string(),
@@ -1325,23 +1558,26 @@ impl App {
         )
     }
 
-    fn results_are_local_bootstrap_exploration_only(
-        results: &[crate::tooling::ToolExecutionResult],
-    ) -> bool {
-        !results.is_empty()
-            && results.iter().all(|result| {
-                if result.status != crate::tooling::ToolExecutionStatus::Completed
-                    || result.rolled_back
-                    || result.mutation_observed()
-                {
-                    return false;
-                }
-                match result.tool_name.as_str() {
-                    "file.read" | "file.search" | "web.fetch" | "web.search" => true,
-                    "shell.exec" => result.observed_changed_paths().is_empty(),
-                    _ => false,
-                }
-            })
+    fn is_real_mutation_tool_input(input: &crate::tooling::ToolInput) -> bool {
+        matches!(
+            input,
+            crate::tooling::ToolInput::FileWrite { .. }
+                | crate::tooling::ToolInput::FileEdit { .. }
+                | crate::tooling::ToolInput::FileEditAnchor { .. }
+                | crate::tooling::ToolInput::FileRewrite { .. }
+        )
+    }
+
+    fn tool_input_target_path(input: &crate::tooling::ToolInput) -> Option<&str> {
+        match input {
+            crate::tooling::ToolInput::FileWrite { path, .. }
+            | crate::tooling::ToolInput::FileEdit { path, .. }
+            | crate::tooling::ToolInput::FileEditAnchor { path, .. }
+            | crate::tooling::ToolInput::FileRewrite { path, .. }
+            | crate::tooling::ToolInput::FileRead { path }
+            | crate::tooling::ToolInput::FileSearch { root: path, .. } => Some(path.as_str()),
+            _ => None,
+        }
     }
 
     fn structured_is_local_bootstrap_exploration_only(
@@ -1384,11 +1620,15 @@ impl App {
         false
     }
 
-    fn local_bootstrap_lock_retry_message(root_prefix: &str) -> String {
-        format!(
-            "Do not output another plan. Do not explain. Do not read more files. Emit exactly one file.write, file.edit, file.edit_anchor, or file.rewrite tool call now for files under {}.",
-            root_prefix
-        )
+    fn local_bootstrap_lock_retry_message(root_prefix: &str, target: Option<&str>) -> String {
+        match target {
+            Some(target) => format!(
+                "Do not output another plan. Do not explain. Do not read more files. Emit exactly one file.write, file.edit, file.edit_anchor, or file.rewrite tool call now for {target}. Stay under {root_prefix}."
+            ),
+            None => format!(
+                "Do not output another plan. Do not explain. Do not read more files. Emit exactly one file.write, file.edit, file.edit_anchor, or file.rewrite tool call now for files under {root_prefix}."
+            ),
+        }
     }
 
     /// Prepare for write fallback: take checkpoint snapshot (Issue #158, DR4-007).
@@ -1827,7 +2067,17 @@ impl App {
             return None;
         }
         let catalog = crate::tooling::ToolSchemaCatalog::builtin();
-        Some(catalog.all().into_iter().cloned().collect())
+        let mut tools: Vec<_> = catalog.all().into_iter().cloned().collect();
+        if self.local_bootstrap_lane_active() {
+            tools.retain(|tool| {
+                matches!(
+                    tool.name.as_str(),
+                    "file_write" | "file_edit" | "file_edit_anchor" | "file_rewrite"
+                )
+            });
+        }
+        tools.sort_by(|a, b| a.name.cmp(&b.name));
+        Some(tools)
     }
 
     /// Switch to a different named session.
@@ -3784,18 +4034,57 @@ mod tests {
     }
 
     #[test]
+    fn detect_local_bootstrap_failure_lock_from_enospc_create_next_app() {
+        let mut app = build_test_app();
+        app.config.runtime.provider = "ollama".to_string();
+
+        let result = crate::tooling::ToolExecutionResult {
+            tool_call_id: "call_shell_exec_0".to_string(),
+            tool_name: "shell.exec".to_string(),
+            status: crate::tooling::ToolExecutionStatus::Failed,
+            summary:
+                "shell.exec failed (exit 1): npx create-next-app@latest space-invaders --typescript"
+                    .to_string(),
+            payload: crate::tooling::ToolExecutionPayload::Text(
+                "npm ERR! code ENOSPC\nnpm ERR! no space left on device".to_string(),
+            ),
+            artifacts: Vec::new(),
+            elapsed_ms: 0,
+            diff_summary: None,
+            edit_detail: None,
+            rolled_back: false,
+            observed_delta: None,
+            delta_observation_skipped: None,
+        };
+
+        let lock = app
+            .detect_local_bootstrap_failure_lock(std::slice::from_ref(&result))
+            .expect("failed bootstrap should activate manual bootstrap lock");
+        assert_eq!(lock.root_prefix, "space-invaders");
+        assert_eq!(lock.kind, LocalBootstrapKind::ManualFallback);
+        assert_eq!(
+            lock.next_mutation_target(),
+            Some("space-invaders/package.json")
+        );
+        assert!(
+            lock.contains_scaffold_path("space-invaders/src/app/page.tsx"),
+            "manual bootstrap lane should seed a direct mutation target"
+        );
+    }
+
+    #[test]
     fn filter_touched_files_for_plan_sync_excludes_scaffold_paths_while_locked() {
         let mut app = build_test_app();
         app.local_bootstrap_lock = Some(LocalBootstrapLock {
+            kind: LocalBootstrapKind::Scaffolded,
             active: true,
             root_prefix: "space-invaders".to_string(),
             retry_budget: 1,
-            exploration_turn_budget: 0,
-            mutation_turn_budget: 1,
             scaffold_paths: vec![
                 "space-invaders/src/app/page.tsx".to_string(),
                 "space-invaders/src/app/globals.css".to_string(),
             ],
+            target_queue: vec!["space-invaders/src/app/page.tsx".to_string()],
         });
 
         let filtered = app.filter_touched_files_for_plan_sync(&[
@@ -3814,15 +4103,15 @@ mod tests {
     fn filter_touched_files_for_completion_excludes_scaffold_paths_while_locked() {
         let mut app = build_test_app();
         app.local_bootstrap_lock = Some(LocalBootstrapLock {
+            kind: LocalBootstrapKind::Scaffolded,
             active: true,
             root_prefix: "space-invaders".to_string(),
             retry_budget: 1,
-            exploration_turn_budget: 0,
-            mutation_turn_budget: 1,
             scaffold_paths: vec![
                 "space-invaders/src/app/page.tsx".to_string(),
                 "space-invaders/src/app/globals.css".to_string(),
             ],
+            target_queue: vec!["space-invaders/src/app/page.tsx".to_string()],
         });
 
         let filtered = app.filter_touched_files_for_completion(&[
@@ -3838,44 +4127,52 @@ mod tests {
     }
 
     #[test]
-    fn local_bootstrap_lock_requires_multiple_mutation_turns_before_unlock() {
+    fn local_bootstrap_lock_advances_queue_until_targets_are_exhausted() {
         let mut lock = LocalBootstrapLock::new(
             "space-invaders".to_string(),
-            vec!["space-invaders/src/app/page.tsx".to_string()],
+            vec![
+                "space-invaders/src/app/page.tsx".to_string(),
+                "space-invaders/src/app/globals.css".to_string(),
+            ],
         );
 
         assert!(lock.is_active());
         assert_eq!(
-            lock.mutation_turn_budget,
-            LocalBootstrapLock::DEFAULT_MUTATION_TURN_BUDGET
+            lock.next_mutation_target(),
+            Some("space-invaders/src/app/page.tsx")
         );
 
-        lock.consume_mutation_turn();
-        assert!(lock.is_active(), "lock should persist after first mutation");
-        assert_eq!(lock.mutation_turn_budget, 1);
+        lock.mark_mutated_paths(&["space-invaders/src/app/page.tsx".to_string()]);
+        assert!(
+            lock.is_active(),
+            "lock should persist while more targets remain"
+        );
         assert_eq!(
-            lock.exploration_turn_budget, 0,
-            "direct mutation lane should disable further exploration"
+            lock.next_mutation_target(),
+            Some("space-invaders/src/app/globals.css")
         );
 
-        lock.consume_mutation_turn();
+        lock.mark_mutated_paths(&["space-invaders/src/app/globals.css".to_string()]);
         assert!(
             !lock.is_active(),
-            "lock should release after the configured mutation lane is completed"
+            "lock should release after the target queue is completed"
         );
-        assert_eq!(lock.mutation_turn_budget, 0);
+        assert_eq!(lock.next_mutation_target(), None);
     }
 
     #[test]
     fn local_bootstrap_lock_reclassifies_mutated_scaffold_paths_as_real_progress() {
         let mut app = build_test_app();
         app.local_bootstrap_lock = Some(LocalBootstrapLock {
+            kind: LocalBootstrapKind::Scaffolded,
             active: true,
             root_prefix: "space-invaders".to_string(),
             retry_budget: 1,
-            exploration_turn_budget: 0,
-            mutation_turn_budget: 2,
             scaffold_paths: vec![
+                "space-invaders/package.json".to_string(),
+                "space-invaders/src/app/page.tsx".to_string(),
+            ],
+            target_queue: vec![
                 "space-invaders/package.json".to_string(),
                 "space-invaders/src/app/page.tsx".to_string(),
             ],
@@ -3913,6 +4210,256 @@ mod tests {
                 .as_ref()
                 .expect("lock should remain active")
                 .contains_scaffold_path("space-invaders/src/app/page.tsx")
+        );
+    }
+
+    #[test]
+    fn local_bootstrap_lock_prefers_page_then_globals_as_mutation_targets() {
+        let mut lock = LocalBootstrapLock::new(
+            "space-invaders".to_string(),
+            vec![
+                "space-invaders/package.json".to_string(),
+                "space-invaders/src/app/page.tsx".to_string(),
+                "space-invaders/src/app/globals.css".to_string(),
+            ],
+        );
+
+        assert_eq!(
+            lock.next_mutation_target(),
+            Some("space-invaders/src/app/page.tsx")
+        );
+
+        lock.mark_mutated_paths(&["space-invaders/src/app/page.tsx".to_string()]);
+        assert_eq!(
+            lock.next_mutation_target(),
+            Some("space-invaders/src/app/globals.css")
+        );
+    }
+
+    #[test]
+    fn manual_fallback_bootstrap_lock_prefers_package_before_page() {
+        let lock = LocalBootstrapLock::manual_fallback(
+            "space-invaders".to_string(),
+            vec![
+                "space-invaders/package.json".to_string(),
+                "space-invaders/src/app/page.tsx".to_string(),
+                "space-invaders/src/app/globals.css".to_string(),
+            ],
+        );
+
+        assert_eq!(
+            lock.next_mutation_target(),
+            Some("space-invaders/package.json")
+        );
+    }
+
+    #[test]
+    fn manual_fallback_rejects_mutation_outside_expected_target() {
+        let mut app = build_test_app();
+        app.config.runtime.provider = "ollama".to_string();
+        app.local_bootstrap_lock = Some(LocalBootstrapLock::manual_fallback(
+            "space-invaders".to_string(),
+            vec![
+                "space-invaders/package.json".to_string(),
+                "space-invaders/src/app/page.tsx".to_string(),
+            ],
+        ));
+
+        let reason = app.local_mode_tool_rejection_reason(&crate::tooling::ToolInput::FileWrite {
+            path: "./package.json".to_string(),
+            content: "{}\n".to_string(),
+        });
+
+        assert_eq!(
+            reason.as_deref(),
+            Some(
+                "direct mutation must target space-invaders/package.json during local manual bootstrap act mode"
+            )
+        );
+    }
+
+    #[test]
+    fn scaffolded_lock_rejects_mutation_outside_current_target() {
+        let mut app = build_test_app();
+        app.config.runtime.provider = "ollama".to_string();
+        app.local_bootstrap_lock = Some(LocalBootstrapLock::new(
+            "space-invaders".to_string(),
+            vec![
+                "space-invaders/src/app/page.tsx".to_string(),
+                "space-invaders/src/app/globals.css".to_string(),
+            ],
+        ));
+
+        let reason = app.local_mode_tool_rejection_reason(&crate::tooling::ToolInput::FileEdit {
+            path: "space-invaders/src/app/globals.css".to_string(),
+            old_string: "@import \"tailwindcss\";\n".to_string(),
+            new_string: "body { background: black; }\n".to_string(),
+        });
+
+        assert_eq!(
+            reason.as_deref(),
+            Some(
+                "direct mutation must target space-invaders/src/app/page.tsx during local bootstrap act mode"
+            )
+        );
+    }
+
+    #[test]
+    fn local_bootstrap_lock_retry_message_targets_specific_file_when_available() {
+        let msg = App::local_bootstrap_lock_retry_message(
+            "space-invaders",
+            Some("space-invaders/src/app/page.tsx"),
+        );
+        assert!(msg.contains("space-invaders/src/app/page.tsx"));
+        assert!(msg.contains("Emit exactly one"));
+    }
+
+    #[test]
+    fn local_bootstrap_lane_prompt_is_minimal_and_targeted() {
+        let mut app = build_test_app();
+        app.config.runtime.provider = "ollama".to_string();
+        app.config.runtime.local_mode = true;
+        app.local_bootstrap_lock = Some(LocalBootstrapLock::new(
+            "space-invaders".to_string(),
+            vec![
+                "space-invaders/src/app/page.tsx".to_string(),
+                "space-invaders/src/app/globals.css".to_string(),
+            ],
+        ));
+
+        let prompt = app.build_dynamic_system_prompt();
+        assert!(prompt.contains("You are Anvil in local bootstrap act mode."));
+        assert!(prompt.contains("Current bootstrap target: space-invaders/src/app/page.tsx"));
+        assert!(prompt.contains("Emit exactly one direct file mutation tool call now."));
+        assert!(prompt.contains("Forbidden: ANVIL_PLAN, ANVIL_PLAN_UPDATE"));
+        assert!(!prompt.contains("## Working memory"));
+    }
+
+    #[test]
+    fn local_bootstrap_lane_caps_followup_sampling() {
+        let mut app = build_test_app();
+        assert_eq!(app.local_bootstrap_lane_max_output_tokens(), None);
+        assert_eq!(app.local_bootstrap_lane_temperature(), None);
+
+        app.local_bootstrap_lock = Some(LocalBootstrapLock::new(
+            "space-invaders".to_string(),
+            vec!["space-invaders/src/app/page.tsx".to_string()],
+        ));
+
+        assert_eq!(app.local_bootstrap_lane_max_output_tokens(), Some(256));
+        assert_eq!(app.local_bootstrap_lane_temperature(), Some(0.0));
+    }
+
+    #[test]
+    fn bootstrap_lane_followup_messages_keep_initial_user_and_recent_tail_only() {
+        let mut app = build_test_app();
+        app.local_bootstrap_lock = Some(LocalBootstrapLock::new(
+            "space-invaders".to_string(),
+            vec!["space-invaders/src/app/page.tsx".to_string()],
+        ));
+
+        app.session.messages.clear();
+        app.session
+            .push_message(new_user_message("user_1", "build a space invaders app"));
+        app.session.push_message(SessionMessage::new(
+            MessageRole::Assistant,
+            "assistant",
+            "I will explain first",
+        ));
+        app.session.push_message(SessionMessage::new(
+            MessageRole::Tool,
+            BOOTSTRAP_LANE_RETRY_AUTHOR,
+            "retry the current target",
+        ));
+        for i in 0..10 {
+            app.session.push_message(SessionMessage::new(
+                MessageRole::Tool,
+                "system",
+                format!("tool note {i}"),
+            ));
+        }
+
+        let selected = app
+            .bootstrap_lane_followup_messages()
+            .expect("bootstrap lane should select messages");
+
+        assert_eq!(selected.first().map(|m| m.id.as_str()), Some("user_1"));
+        assert_eq!(selected.len(), 7);
+        assert!(selected.iter().all(|m| m.role != MessageRole::Assistant));
+        assert!(selected
+            .iter()
+            .all(|m| m.author != BOOTSTRAP_LANE_RETRY_AUTHOR));
+        assert_eq!(
+            selected.last().map(|m| m.content.as_str()),
+            Some("tool note 9")
+        );
+        assert_eq!(
+            selected.get(1).map(|m| m.content.as_str()),
+            Some("tool note 4")
+        );
+    }
+
+    #[test]
+    fn bootstrap_lane_followup_messages_do_not_grow_from_retry_injections() {
+        let mut app = build_test_app();
+        app.local_bootstrap_lock = Some(LocalBootstrapLock::new(
+            "space-invaders".to_string(),
+            vec!["space-invaders/src/app/page.tsx".to_string()],
+        ));
+
+        app.session.messages.clear();
+        app.session
+            .push_message(new_user_message("user_1", "build a space invaders app"));
+        app.session.push_message(SessionMessage::new(
+            MessageRole::Tool,
+            "file.read",
+            "[tool result: file.read]\nPath: .",
+        ));
+        app.session.push_message(SessionMessage::new(
+            MessageRole::Tool,
+            "shell.exec",
+            "[tool result: shell.exec]\nSummary: scaffolded",
+        ));
+
+        let baseline = app
+            .bootstrap_lane_followup_messages()
+            .expect("bootstrap lane should select messages");
+        assert_eq!(baseline.len(), 3);
+
+        for idx in 0..3 {
+            app.session.push_message(SessionMessage::new(
+                MessageRole::Tool,
+                BOOTSTRAP_LANE_RETRY_AUTHOR,
+                format!("retry {idx}"),
+            ));
+        }
+
+        let selected = app
+            .bootstrap_lane_followup_messages()
+            .expect("bootstrap lane should select messages");
+        assert_eq!(selected.len(), 3);
+        assert!(selected
+            .iter()
+            .all(|message| message.author != BOOTSTRAP_LANE_RETRY_AUTHOR));
+    }
+
+    #[test]
+    fn bootstrap_lane_native_tools_are_limited_to_direct_mutations() {
+        let mut app = build_test_app();
+        app.provider.capabilities.native_tool_calling = true;
+        app.local_bootstrap_lock = Some(LocalBootstrapLock::new(
+            "space-invaders".to_string(),
+            vec!["space-invaders/src/app/page.tsx".to_string()],
+        ));
+
+        let tools = app
+            .build_native_tools()
+            .expect("native tool defs should be available");
+        let names: Vec<_> = tools.iter().map(|tool| tool.name.as_str()).collect();
+
+        assert_eq!(
+            names,
+            vec!["file_edit", "file_edit_anchor", "file_rewrite", "file_write"]
         );
     }
 
