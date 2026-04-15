@@ -206,7 +206,45 @@ impl IterationBudget {
 
 #[cfg(test)]
 mod tests {
-    use super::IterationBudget;
+    use super::{IterationBudget, TerminationTransition};
+    use crate::app::{App, LocalBootstrapKind, LocalBootstrapLock, LocalPhase};
+    use crate::config::EffectiveConfig;
+    use crate::provider::ProviderRuntimeContext;
+    use crate::tooling::{ToolExecutionPayload, ToolExecutionResult, ToolExecutionStatus};
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_test_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be monotonic")
+            .as_nanos();
+        let tid = std::thread::current().id();
+        std::env::temp_dir().join(format!("anvil_agentic_{label}_{nanos}_{tid:?}"))
+    }
+
+    fn build_test_app() -> App {
+        let root = unique_test_dir("local_phase");
+        let mut config = EffectiveConfig::default_for_test().expect("config should load");
+        config.paths.cwd = root.clone();
+        config.paths.workspace_dir = root.join("workspace");
+        config.paths.config_file = root.join(".anvil").join("config");
+        config.paths.state_dir = root.join(".anvil").join("state");
+        config.paths.session_dir = root.join(".anvil").join("sessions");
+        config.paths.session_file = config.paths.session_dir.join("default.json");
+        config.paths.logs_dir = root.join(".anvil").join("logs");
+        config.paths.mcp_config_file = root.join(".anvil").join("mcp.json");
+        config.paths.hooks_config_file = root.join(".anvil").join("hooks.json");
+        config.mode.approval_required = false;
+        config.runtime.provider = "ollama".to_string();
+        config.runtime.local_mode = true;
+        let provider =
+            ProviderRuntimeContext::bootstrap(&config).expect("provider should bootstrap");
+        App::new(config, provider, Arc::new(AtomicBool::new(false)))
+            .expect("app should initialize")
+    }
 
     #[test]
     fn iteration_budget_uses_separate_bootstrap_lane_allowance() {
@@ -239,6 +277,96 @@ mod tests {
         let _ = budget.begin_iteration(true);
         let _ = budget.begin_iteration(true);
         assert_eq!(budget.remaining_for_active_lane(true), 4);
+    }
+
+    #[test]
+    fn post_tool_anvil_final_stays_in_local_bootstrap_lane_until_required_targets_finish() {
+        let mut app = build_test_app();
+        app.local_phase = Some(LocalPhase::PostBootstrap(LocalBootstrapLock {
+            kind: LocalBootstrapKind::Scaffolded,
+            active: true,
+            root_prefix: "space-invaders".to_string(),
+            retry_budget: 1,
+            scaffold_paths: vec![
+                "space-invaders/src/app/page.tsx".to_string(),
+                "space-invaders/src/app/globals.css".to_string(),
+                "space-invaders/src/app/layout.tsx".to_string(),
+            ],
+            target_queue: vec![
+                "space-invaders/src/app/globals.css".to_string(),
+                "space-invaders/src/app/layout.tsx".to_string(),
+            ],
+            required_targets: vec![
+                "space-invaders/src/app/page.tsx".to_string(),
+                "space-invaders/src/app/globals.css".to_string(),
+                "space-invaders/src/app/layout.tsx".to_string(),
+            ],
+            completed_required_targets: vec!["space-invaders/src/app/page.tsx".to_string()],
+        }));
+
+        let result = ToolExecutionResult {
+            tool_call_id: "call_file_write_0".to_string(),
+            tool_name: "file.write".to_string(),
+            status: ToolExecutionStatus::Completed,
+            summary: "file.write wrote space-invaders/src/app/page.tsx".to_string(),
+            payload: ToolExecutionPayload::Text(String::new()),
+            artifacts: vec!["space-invaders/src/app/page.tsx".to_string()],
+            elapsed_ms: 0,
+            diff_summary: None,
+            edit_detail: None,
+            rolled_back: false,
+            observed_delta: None,
+            delta_observation_skipped: None,
+        };
+
+        let mut term_state =
+            crate::app::termination_fsm::TerminationLoopState::new(true, true);
+        let transition =
+            app.handle_post_tool_anvil_final_gate(std::slice::from_ref(&result), &mut term_state);
+
+        assert!(
+            matches!(transition, TerminationTransition::Continue),
+            "bootstrap lane should suppress post-tool ANVIL_FINAL until required targets are done"
+        );
+        assert!(
+            app.local_bootstrap_lane_active(),
+            "bootstrap lane should remain active after suppressing premature final"
+        );
+    }
+
+    #[test]
+    fn done_path_completion_retries_while_local_bootstrap_lane_is_active() {
+        let mut app = build_test_app();
+        app.local_phase = Some(LocalPhase::PostBootstrap(LocalBootstrapLock {
+            kind: LocalBootstrapKind::Scaffolded,
+            active: true,
+            root_prefix: "space-invaders".to_string(),
+            retry_budget: 1,
+            scaffold_paths: vec![
+                "space-invaders/src/app/page.tsx".to_string(),
+                "space-invaders/src/app/globals.css".to_string(),
+            ],
+            target_queue: vec!["space-invaders/src/app/globals.css".to_string()],
+            required_targets: vec![
+                "space-invaders/src/app/page.tsx".to_string(),
+                "space-invaders/src/app/globals.css".to_string(),
+            ],
+            completed_required_targets: vec!["space-invaders/src/app/page.tsx".to_string()],
+        }));
+
+        let transition = app.handle_done_path_anvil_final_guard("完了しました。");
+
+        assert!(
+            matches!(transition, TerminationTransition::Retry(_)),
+            "Done-path completion should retry while the bootstrap lane is active"
+        );
+        assert!(
+            app.session()
+                .messages
+                .last()
+                .is_some_and(|message| message.content.contains("space-invaders/src/app/globals.css")),
+            "retry message should keep the next required target explicit"
+        );
     }
 }
 
@@ -1145,19 +1273,88 @@ impl App {
         self.session.push_message(retry_msg);
     }
 
-    fn inject_local_bootstrap_lock_retry(&mut self, message: String) {
+    fn inject_local_phase_retry(&mut self, message: String) {
         tracing::warn!("{LOCAL_BOOTSTRAP_LOCK_RETRY_LOG}");
+        let retry_author = self
+            .active_local_phase()
+            .map(crate::app::LocalPhase::retry_author)
+            .unwrap_or(crate::app::BOOTSTRAP_LANE_RETRY_AUTHOR);
         self.session.remove_messages_matching(|existing| {
             existing.role == MessageRole::Tool
-                && existing.author == crate::app::BOOTSTRAP_LANE_RETRY_AUTHOR
+                && (existing.author == crate::app::BOOTSTRAP_LANE_RETRY_AUTHOR
+                    || existing.author == crate::app::PREBOOTSTRAP_LANE_RETRY_AUTHOR)
         });
         let retry_msg = SessionMessage::new(
             MessageRole::Tool,
-            crate::app::BOOTSTRAP_LANE_RETRY_AUTHOR,
+            retry_author,
             message,
         )
             .with_id(self.next_message_id("tool"));
         self.session.push_message(retry_msg);
+    }
+
+    fn retry_active_local_phase(
+        &mut self,
+        log_message: &str,
+        transition: TerminationTransition,
+    ) -> Option<TerminationTransition> {
+        let message = self.local_phase_retry_message()?;
+        tracing::warn!("{}", log_message);
+        self.inject_local_phase_retry(message);
+        Some(transition)
+    }
+
+    fn handle_empty_tool_response_for_local_phase(
+        &mut self,
+        next_structured: &StructuredAssistantResponse,
+    ) -> Option<TerminationTransition> {
+        if !self.local_bootstrap_lane_active() {
+            return None;
+        }
+
+        let empty_lane_response = next_structured.raw_content.trim().is_empty()
+            && next_structured.final_response.as_str().trim().is_empty();
+        if empty_lane_response
+            && self.local_postbootstrap_lane_active()
+            && let Some(message) = self.advance_local_bootstrap_target_on_exhaustion()
+        {
+            tracing::warn!(
+                "local bootstrap lock: empty no-tool response; advancing deterministic target lane"
+            );
+            self.inject_local_phase_retry(message);
+            return Some(TerminationTransition::Continue);
+        }
+
+        if let Some(message) = self.consume_local_bootstrap_lock_retry() {
+            self.inject_local_phase_retry(message);
+            return Some(TerminationTransition::Continue);
+        }
+
+        if self
+            .local_prebootstrap_lane()
+            .is_some_and(crate::app::LocalPreBootstrapLane::is_active)
+        {
+            tracing::warn!(
+                "local pre-bootstrap lane: retry budget exhausted; preserving deterministic shell lane"
+            );
+            self.inject_local_phase_retry(App::local_prebootstrap_lane_retry_message());
+            return Some(TerminationTransition::Continue);
+        }
+
+        if self.local_postbootstrap_lane_active() {
+            if let Some(message) = self.advance_local_bootstrap_target_on_exhaustion() {
+                tracing::warn!(
+                    "local bootstrap lock: no-tool retry budget exhausted; advancing deterministic target lane"
+                );
+                self.inject_local_phase_retry(message);
+                return Some(TerminationTransition::Continue);
+            }
+            tracing::warn!(
+                "local bootstrap lock: target queue exhausted without mutation; releasing deterministic target lane"
+            );
+        }
+
+        None
     }
 
     /// Common condition check for task-semantics gate (Done path / Branch 5, Issue #382).
@@ -1262,6 +1459,15 @@ impl App {
         results: &[ToolExecutionResult],
         term_state: &mut TerminationLoopState,
     ) -> TerminationTransition {
+        if self.local_bootstrap_lane_active() {
+            term_state.suppress_anvil_final();
+            if let Some(transition) = self.retry_active_local_phase(
+                "local bootstrap lane: suppressing post-tool ANVIL_FINAL until the active phase completes",
+                TerminationTransition::Continue,
+            ) {
+                return transition;
+            }
+        }
         if self.local_mode_active() {
             tracing::info!("local mode: accepting ANVIL_FINAL without plan/final gate");
             self.phase_estimator.accept_anvil_final();
@@ -1315,45 +1521,9 @@ impl App {
         turn_progress: TurnProgressFacts,
         turn_has_subagent: bool,
     ) -> Result<TerminationTransition, AppError> {
-        if self.local_bootstrap_lane_active() {
-            let empty_lane_response = next_structured.raw_content.trim().is_empty()
-                && next_structured.final_response.as_str().trim().is_empty();
-            if empty_lane_response && self.local_postbootstrap_lane_active() {
-                if let Some(message) = self.advance_local_bootstrap_target_on_exhaustion() {
-                    tracing::warn!(
-                        "local bootstrap lock: empty no-tool response; advancing deterministic target lane"
-                    );
-                    self.inject_local_bootstrap_lock_retry(message);
-                    return Ok(TerminationTransition::Continue);
-                }
-            }
-            if let Some(message) = self.consume_local_bootstrap_lock_retry() {
-                self.inject_local_bootstrap_lock_retry(message);
-                return Ok(TerminationTransition::Continue);
-            }
-            if self
-                .local_prebootstrap_lane
-                .as_ref()
-                .is_some_and(crate::app::LocalPreBootstrapLane::is_active)
-            {
-                tracing::warn!(
-                    "local pre-bootstrap lane: retry budget exhausted; preserving deterministic shell lane"
-                );
-                self.inject_local_bootstrap_lock_retry(App::local_prebootstrap_lane_retry_message());
-                return Ok(TerminationTransition::Continue);
-            }
-            if self.local_postbootstrap_lane_active() {
-                if let Some(message) = self.advance_local_bootstrap_target_on_exhaustion() {
-                    tracing::warn!(
-                        "local bootstrap lock: no-tool retry budget exhausted; advancing deterministic target lane"
-                    );
-                    self.inject_local_bootstrap_lock_retry(message);
-                    return Ok(TerminationTransition::Continue);
-                }
-                tracing::warn!(
-                    "local bootstrap lock: target queue exhausted without mutation; releasing deterministic target lane"
-                );
-            }
+        if let Some(transition) = self.handle_empty_tool_response_for_local_phase(next_structured)
+        {
+            return Ok(transition);
         }
 
         // Pre-compute all inputs for the FSM.
@@ -1532,6 +1702,12 @@ impl App {
         &mut self,
         assistant_message: &str,
     ) -> TerminationTransition {
+        if let Some(transition) = self.retry_active_local_phase(
+            "local bootstrap lane: suppressing tool-less completion on the Done path",
+            TerminationTransition::Retry(RetryKind::FinalGuard),
+        ) {
+            return transition;
+        }
         // CB-002: Retry count is always 0 here because this path handles
         // the first-turn Done event (before any agentic loop iteration).
         // MAX_FINAL_GUARD_RETRIES = 1 ensures at most one retry, so the
@@ -1991,7 +2167,7 @@ impl App {
             // Issue #249: Inject plan turn guidance before follow-up LLM call.
             // Returns the guidance char count for telemetry (Issue #269 Phase 0).
             let guidance_chars_this_turn =
-                if self.local_mode_active() || self.local_bootstrap_lock.is_some() {
+                if self.local_mode_active() || self.local_bootstrap_lock().is_some() {
                     0
                 } else {
                     self.inject_plan_turn_guidance().unwrap_or(0)
@@ -2009,26 +2185,7 @@ impl App {
 
             let (system_prompt, calibration_ratio) = self.prepare_turn_context();
             let (mut request, used_tokens) =
-                if let Some(selected) = self.bootstrap_lane_followup_messages() {
-                    BasicAgentLoop::build_turn_request_from_explicit_messages(
-                        self.effective_model().to_string(),
-                        &self.session,
-                        self.provider.capabilities.streaming && self.config.runtime.stream,
-                        &system_prompt,
-                        &selected,
-                        calibration_ratio,
-                    )
-                } else {
-                    BasicAgentLoop::build_turn_request_calibrated(
-                        self.effective_model().to_string(),
-                        &self.session,
-                        self.provider.capabilities.streaming && self.config.runtime.stream,
-                        self.effective_context_window(),
-                        &system_prompt,
-                        calibration_ratio,
-                        self.config.runtime.context_budget,
-                    )
-                };
+                self.build_phase_aware_turn_request(&system_prompt, calibration_ratio);
             request.max_output_tokens = self.config.runtime.max_output_tokens;
             request.temperature = self.config.runtime.tool_temperature;
             if let Some(limit) = self.local_bootstrap_lane_max_output_tokens() {
@@ -2390,7 +2547,7 @@ impl App {
                             "local bootstrap lock: ignoring follow-up ANVIL_PLAN during post-scaffold stabilization"
                         );
                     }
-                    self.inject_local_bootstrap_lock_retry(message);
+                    self.inject_local_phase_retry(message);
                     current = next_structured;
                     continue;
                 }
@@ -4141,15 +4298,7 @@ impl App {
     ) -> Result<Vec<String>, AppError> {
         // Build request and call LLM for one more turn
         let (system_prompt, calibration_ratio) = self.prepare_turn_context();
-        let (mut request, _) = BasicAgentLoop::build_turn_request_calibrated(
-            self.effective_model().to_string(),
-            &self.session,
-            self.provider.capabilities.streaming && self.config.runtime.stream,
-            self.effective_context_window(),
-            &system_prompt,
-            calibration_ratio,
-            self.config.runtime.context_budget,
-        );
+        let (mut request, _) = self.build_phase_aware_turn_request(&system_prompt, calibration_ratio);
         request.max_output_tokens = self.config.runtime.max_output_tokens;
         request.temperature = self.config.runtime.tool_temperature;
         request.context_window = if self.config.runtime.context_window_explicitly_set {

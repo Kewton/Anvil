@@ -5065,10 +5065,35 @@ fn local_bootstrap_lock_retries_multiple_plan_restatements_before_mutation() {
                         arguments: "{\"path\":\"space-invaders/src/app/page.tsx\",\"content\":\"export default function Home() {\\n  return <main>space invaders</main>;\\n}\\n\"}".to_string(),
                     }]),
                 })),
+                6 => emit(ProviderEvent::Agent(AgentEvent::Done {
+                    status: "Done. session saved".to_string(),
+                    assistant_message: "残りのスタイルも仕上げます。".to_string(),
+                    completion_summary: "turn 7".to_string(),
+                    saved_status: "session saved".to_string(),
+                    tool_logs: Vec::new(),
+                    elapsed_ms: 0,
+                    inference_performance: None,
+                    tool_calls: Some(vec![ToolCallRequest {
+                        tool_call_id: "call_file_write_1".to_string(),
+                        tool_name: "file.write".to_string(),
+                        input: ToolInput::FileWrite {
+                            path: "space-invaders/src/app/globals.css".to_string(),
+                            content: "body {\n  background: black;\n  color: cyan;\n}\n".to_string(),
+                        },
+                        extra_field_warnings: Vec::new(),
+                    }]),
+                    assistant_tool_call_records: Some(vec![AssistantToolCallRecord {
+                        id: "call_file_write_1".to_string(),
+                        function_name: "file_write".to_string(),
+                        arguments:
+                            "{\"path\":\"space-invaders/src/app/globals.css\",\"content\":\"body {\\n  background: black;\\n  color: cyan;\\n}\\n\"}"
+                                .to_string(),
+                    }]),
+                })),
                 _ => emit(ProviderEvent::Agent(AgentEvent::Done {
                     status: "Done. session saved".to_string(),
                     assistant_message: "完了しました。".to_string(),
-                    completion_summary: "turn 7".to_string(),
+                    completion_summary: "turn 8".to_string(),
                     saved_status: "session saved".to_string(),
                     tool_logs: Vec::new(),
                     elapsed_ms: 0,
@@ -5100,8 +5125,18 @@ fn local_bootstrap_lock_retries_multiple_plan_restatements_before_mutation() {
         })
         .count();
     assert_eq!(
-        retry_count, 2,
-        "bootstrap lock should inject the short mutation-first retry twice before unlocking"
+        retry_count, 3,
+        "bootstrap lock should inject mutation-first retries until the remaining required targets are addressed"
+    );
+    assert!(
+        fs::read_to_string(root.join("space-invaders/src/app/page.tsx"))
+            .expect("page.tsx should exist")
+            .contains("space invaders")
+    );
+    assert!(
+        fs::read_to_string(root.join("space-invaders/src/app/globals.css"))
+            .expect("globals.css should exist")
+            .contains("color: cyan")
     );
 }
 
@@ -5430,10 +5465,35 @@ fn local_bootstrap_lock_treats_scaffold_only_progress_as_incomplete_until_mutati
                         arguments: "{\"path\":\"space-invaders/src/app/page.tsx\",\"content\":\"export default function Home() {\\n  return <main>space invaders</main>;\\n}\\n\"}".to_string(),
                     }]),
                 })),
+                6 => emit(ProviderEvent::Agent(AgentEvent::Done {
+                    status: "Done. session saved".to_string(),
+                    assistant_message: "globals も直接仕上げます。".to_string(),
+                    completion_summary: "turn 7".to_string(),
+                    saved_status: "session saved".to_string(),
+                    tool_logs: Vec::new(),
+                    elapsed_ms: 0,
+                    inference_performance: None,
+                    tool_calls: Some(vec![ToolCallRequest {
+                        tool_call_id: "call_file_write_globals".to_string(),
+                        tool_name: "file.write".to_string(),
+                        input: ToolInput::FileWrite {
+                            path: "space-invaders/src/app/globals.css".to_string(),
+                            content: "body {\n  background: black;\n  color: white;\n}\n".to_string(),
+                        },
+                        extra_field_warnings: Vec::new(),
+                    }]),
+                    assistant_tool_call_records: Some(vec![AssistantToolCallRecord {
+                        id: "call_file_write_globals".to_string(),
+                        function_name: "file_write".to_string(),
+                        arguments:
+                            "{\"path\":\"space-invaders/src/app/globals.css\",\"content\":\"body {\\n  background: black;\\n  color: white;\\n}\\n\"}"
+                                .to_string(),
+                    }]),
+                })),
                 _ => emit(ProviderEvent::Agent(AgentEvent::Done {
                     status: "Done. session saved".to_string(),
                     assistant_message: "完了しました。".to_string(),
-                    completion_summary: "turn 7".to_string(),
+                    completion_summary: "turn 8".to_string(),
                     saved_status: "session saved".to_string(),
                     tool_logs: Vec::new(),
                     elapsed_ms: 0,
@@ -5457,20 +5517,22 @@ fn local_bootstrap_lock_treats_scaffold_only_progress_as_incomplete_until_mutati
     let page = fs::read_to_string(root.join("space-invaders/src/app/page.tsx"))
         .expect("page should be written after prose-only drift retries");
     assert!(page.contains("space invaders"));
+    let globals = fs::read_to_string(root.join("space-invaders/src/app/globals.css"))
+        .expect("globals should be written before completion");
+    assert!(globals.contains("color: white"));
 
     let requests = seen_requests.borrow();
     assert!(
-        requests.len() >= 6,
-        "expected retries to continue until a real mutation lands"
+        requests.len() >= 7,
+        "expected retries to continue until the required direct mutations land"
     );
-    let task_semantics_retry = &requests[5];
     assert!(
-        task_semantics_retry.messages.iter().any(|msg| {
+        requests.iter().any(|request| request.messages.iter().any(|msg| {
             msg.role == ProviderMessageRole::Tool
                 && msg.content.contains("TOOL FIRST")
                 && msg.content.contains("Do not explain.")
                 && msg.content.contains("Emit exactly one")
-        }),
+        })),
         "after local bootstrap retries are exhausted, scaffold-only progress should still be treated as incomplete"
     );
 }
@@ -5895,26 +5957,29 @@ fn local_bootstrap_lock_blocks_shell_exec_after_scaffold() {
     )
     .expect("bootstrap lock should reject shell drift and continue");
 
-    let tool_failure = app
-        .session()
-        .messages
-        .iter()
-        .find(|msg| {
-            msg.role == MessageRole::Tool
-                && msg
-                    .content
-                    .contains("shell.exec is blocked during local bootstrap act mode")
-        })
-        .expect("a blocked shell.exec should be recorded");
+    let requests = seen_requests.borrow();
     assert!(
-        tool_failure.content.contains("local bootstrap act mode"),
-        "post-scaffold shell.exec should be blocked"
+        requests.iter().any(|request| {
+            request.messages.last().is_some_and(|message| {
+                message.role == ProviderMessageRole::Tool
+                    && message.content.contains("Emit exactly one")
+                    && message.content.contains("space-invaders/src/app/page.tsx")
+            })
+        }),
+        "post-scaffold flow should inject a direct-mutation retry before accepting further drift"
+    );
+    assert!(
+        app.session()
+            .messages
+            .iter()
+            .all(|msg| !msg.content.contains("ls -la space-invaders/src/app")),
+        "read-only shell drift should not be executed after scaffold"
     );
     assert!(
         std::fs::read_to_string(root.join("space-invaders/src/app/page.tsx"))
             .expect("page.tsx should exist")
             .contains("Ready"),
-        "bootstrap lock should continue through to a direct mutation"
+        "bootstrap lock should continue through to the required direct mutation"
     );
 }
 
@@ -6424,6 +6489,96 @@ fn local_mode_failed_bootstrap_blocks_wrong_mutation_path_before_targeting_packa
                     }]),
                     assistant_tool_call_records: None,
                 })),
+                3 => emit(ProviderEvent::Agent(AgentEvent::Done {
+                    status: "Done. session saved".to_string(),
+                    assistant_message: "next.config.ts も作成します。".to_string(),
+                    completion_summary: "turn 4".to_string(),
+                    saved_status: "session saved".to_string(),
+                    tool_logs: Vec::new(),
+                    elapsed_ms: 0,
+                    inference_performance: None,
+                    tool_calls: Some(vec![ToolCallRequest {
+                        tool_call_id: "call_write_next_config".to_string(),
+                        tool_name: "file.write".to_string(),
+                        input: ToolInput::FileWrite {
+                            path: "space-invaders/next.config.ts".to_string(),
+                            content: "const nextConfig = {}\nexport default nextConfig\n"
+                                .to_string(),
+                        },
+                        extra_field_warnings: Vec::new(),
+                    }]),
+                    assistant_tool_call_records: None,
+                })),
+                4 => emit(ProviderEvent::Agent(AgentEvent::Done {
+                    status: "Done. session saved".to_string(),
+                    assistant_message: "layout.tsx を用意します。".to_string(),
+                    completion_summary: "turn 5".to_string(),
+                    saved_status: "session saved".to_string(),
+                    tool_logs: Vec::new(),
+                    elapsed_ms: 0,
+                    inference_performance: None,
+                    tool_calls: Some(vec![ToolCallRequest {
+                        tool_call_id: "call_write_layout".to_string(),
+                        tool_name: "file.write".to_string(),
+                        input: ToolInput::FileWrite {
+                            path: "space-invaders/src/app/layout.tsx".to_string(),
+                            content: "export default function Layout({ children }) {\n  return children;\n}\n"
+                                .to_string(),
+                        },
+                        extra_field_warnings: Vec::new(),
+                    }]),
+                    assistant_tool_call_records: None,
+                })),
+                5 => emit(ProviderEvent::Agent(AgentEvent::Done {
+                    status: "Done. session saved".to_string(),
+                    assistant_message: "page.tsx を実装します。".to_string(),
+                    completion_summary: "turn 6".to_string(),
+                    saved_status: "session saved".to_string(),
+                    tool_logs: Vec::new(),
+                    elapsed_ms: 0,
+                    inference_performance: None,
+                    tool_calls: Some(vec![ToolCallRequest {
+                        tool_call_id: "call_write_page".to_string(),
+                        tool_name: "file.write".to_string(),
+                        input: ToolInput::FileWrite {
+                            path: "space-invaders/src/app/page.tsx".to_string(),
+                            content: "export default function Page() {\n  return <main>Ready</main>;\n}\n"
+                                .to_string(),
+                        },
+                        extra_field_warnings: Vec::new(),
+                    }]),
+                    assistant_tool_call_records: None,
+                })),
+                6 => emit(ProviderEvent::Agent(AgentEvent::Done {
+                    status: "Done. session saved".to_string(),
+                    assistant_message: "globals.css を仕上げます。".to_string(),
+                    completion_summary: "turn 7".to_string(),
+                    saved_status: "session saved".to_string(),
+                    tool_logs: Vec::new(),
+                    elapsed_ms: 0,
+                    inference_performance: None,
+                    tool_calls: Some(vec![ToolCallRequest {
+                        tool_call_id: "call_write_globals".to_string(),
+                        tool_name: "file.write".to_string(),
+                        input: ToolInput::FileWrite {
+                            path: "space-invaders/src/app/globals.css".to_string(),
+                            content: "body {\n  background: black;\n  color: white;\n}\n".to_string(),
+                        },
+                        extra_field_warnings: Vec::new(),
+                    }]),
+                    assistant_tool_call_records: None,
+                })),
+                7 => emit(ProviderEvent::Agent(AgentEvent::Done {
+                    status: "Done. session saved".to_string(),
+                    assistant_message: "完了しました。".to_string(),
+                    completion_summary: "turn 8".to_string(),
+                    saved_status: "session saved".to_string(),
+                    tool_logs: Vec::new(),
+                    elapsed_ms: 0,
+                    inference_performance: None,
+                    tool_calls: None,
+                    assistant_tool_call_records: None,
+                })),
                 _ => unreachable!("unexpected request shape before wrong-path rejection"),
             }
             Ok(())
@@ -6459,6 +6614,16 @@ fn local_mode_failed_bootstrap_blocks_wrong_mutation_path_before_targeting_packa
     let package = fs::read_to_string(root.join("space-invaders/package.json"))
         .expect("manual bootstrap should create package.json under the target root");
     assert!(package.contains("\"space-invaders\""));
+    assert!(
+        fs::read_to_string(root.join("space-invaders/src/app/page.tsx"))
+            .expect("manual bootstrap should create page.tsx")
+            .contains("Ready")
+    );
+    assert!(
+        fs::read_to_string(root.join("space-invaders/src/app/globals.css"))
+            .expect("manual bootstrap should create globals.css")
+            .contains("color: white")
+    );
 }
 
 #[test]
