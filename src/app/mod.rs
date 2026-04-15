@@ -276,6 +276,14 @@ impl LocalBootstrapLock {
         self.exploration_turn_budget = self.exploration_turn_budget.saturating_sub(1);
     }
 
+    fn mark_mutated_paths(&mut self, paths: &[String]) {
+        if self.scaffold_paths.is_empty() || paths.is_empty() {
+            return;
+        }
+        self.scaffold_paths
+            .retain(|scaffold| !paths.iter().any(|path| path == scaffold));
+    }
+
     fn consume_mutation_turn(&mut self) {
         self.mutation_turn_budget = self.mutation_turn_budget.saturating_sub(1);
         self.exploration_turn_budget = 0;
@@ -1126,17 +1134,19 @@ impl App {
     fn update_local_bootstrap_lock(&mut self, results: &[crate::tooling::ToolExecutionResult]) {
         if let Some(lock) = &self.local_bootstrap_lock {
             let root_prefix = format!("{}/", lock.root_prefix);
-            let real_mutation_observed = results.iter().any(|result| {
-                Self::is_real_mutation_tool_name(&result.tool_name)
-                    && result.status == crate::tooling::ToolExecutionStatus::Completed
-                    && !result.rolled_back
-                    && result
-                        .observed_changed_paths()
-                        .iter()
-                        .any(|path| path.starts_with(&root_prefix))
-            });
-            if real_mutation_observed {
+            let mutated_paths: Vec<String> = results
+                .iter()
+                .filter(|result| {
+                    Self::is_real_mutation_tool_name(&result.tool_name)
+                        && result.status == crate::tooling::ToolExecutionStatus::Completed
+                        && !result.rolled_back
+                })
+                .flat_map(|result| result.observed_changed_paths().into_iter())
+                .filter(|path| path.starts_with(&root_prefix))
+                .collect();
+            if !mutated_paths.is_empty() {
                 if let Some(lock) = self.local_bootstrap_lock.as_mut() {
+                    lock.mark_mutated_paths(&mutated_paths);
                     lock.consume_mutation_turn();
                     if !lock.is_active() {
                         self.local_bootstrap_lock = None;
@@ -3854,6 +3864,56 @@ mod tests {
             "lock should release after the configured mutation lane is completed"
         );
         assert_eq!(lock.mutation_turn_budget, 0);
+    }
+
+    #[test]
+    fn local_bootstrap_lock_reclassifies_mutated_scaffold_paths_as_real_progress() {
+        let mut app = build_test_app();
+        app.local_bootstrap_lock = Some(LocalBootstrapLock {
+            active: true,
+            root_prefix: "space-invaders".to_string(),
+            retry_budget: 1,
+            exploration_turn_budget: 0,
+            mutation_turn_budget: 2,
+            scaffold_paths: vec![
+                "space-invaders/package.json".to_string(),
+                "space-invaders/src/app/page.tsx".to_string(),
+            ],
+        });
+
+        let result = crate::tooling::ToolExecutionResult {
+            tool_call_id: "call_file_edit_0".to_string(),
+            tool_name: "file.edit".to_string(),
+            status: crate::tooling::ToolExecutionStatus::Completed,
+            summary: "file.edit completed".to_string(),
+            payload: crate::tooling::ToolExecutionPayload::None,
+            artifacts: Vec::new(),
+            elapsed_ms: 0,
+            diff_summary: None,
+            edit_detail: None,
+            rolled_back: false,
+            observed_delta: Some(crate::tooling::ObservedWorkspaceDelta {
+                created_paths: Vec::new(),
+                modified_paths: vec!["space-invaders/package.json".to_string()],
+                deleted_paths: Vec::new(),
+                ignored_paths: Vec::new(),
+            }),
+            delta_observation_skipped: None,
+        };
+
+        app.update_local_bootstrap_lock(std::slice::from_ref(&result));
+        let filtered = app.filter_touched_files_for_completion(&[
+            "space-invaders/package.json".to_string(),
+            "space-invaders/src/app/page.tsx".to_string(),
+        ]);
+
+        assert_eq!(filtered, vec!["space-invaders/package.json".to_string()]);
+        assert!(
+            app.local_bootstrap_lock
+                .as_ref()
+                .expect("lock should remain active")
+                .contains_scaffold_path("space-invaders/src/app/page.tsx")
+        );
     }
 
     #[test]
