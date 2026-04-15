@@ -244,12 +244,14 @@ struct LocalBootstrapLock {
     root_prefix: String,
     retry_budget: u8,
     exploration_turn_budget: u8,
+    mutation_turn_budget: u8,
     scaffold_paths: Vec<String>,
 }
 
 impl LocalBootstrapLock {
     const DEFAULT_RETRY_BUDGET: u8 = 2;
     const DEFAULT_EXPLORATION_TURN_BUDGET: u8 = 1;
+    const DEFAULT_MUTATION_TURN_BUDGET: u8 = 2;
 
     fn new(root_prefix: String, scaffold_paths: Vec<String>) -> Self {
         Self {
@@ -257,6 +259,7 @@ impl LocalBootstrapLock {
             root_prefix,
             retry_budget: Self::DEFAULT_RETRY_BUDGET,
             exploration_turn_budget: Self::DEFAULT_EXPLORATION_TURN_BUDGET,
+            mutation_turn_budget: Self::DEFAULT_MUTATION_TURN_BUDGET,
             scaffold_paths,
         }
     }
@@ -271,6 +274,14 @@ impl LocalBootstrapLock {
 
     fn consume_exploration_turn(&mut self) {
         self.exploration_turn_budget = self.exploration_turn_budget.saturating_sub(1);
+    }
+
+    fn consume_mutation_turn(&mut self) {
+        self.mutation_turn_budget = self.mutation_turn_budget.saturating_sub(1);
+        self.exploration_turn_budget = 0;
+        if self.mutation_turn_budget == 0 {
+            self.active = false;
+        }
     }
 }
 
@@ -1125,7 +1136,12 @@ impl App {
                         .any(|path| path.starts_with(&root_prefix))
             });
             if real_mutation_observed {
-                self.local_bootstrap_lock = None;
+                if let Some(lock) = self.local_bootstrap_lock.as_mut() {
+                    lock.consume_mutation_turn();
+                    if !lock.is_active() {
+                        self.local_bootstrap_lock = None;
+                    }
+                }
                 return;
             }
         }
@@ -3765,6 +3781,7 @@ mod tests {
             root_prefix: "space-invaders".to_string(),
             retry_budget: 1,
             exploration_turn_budget: 0,
+            mutation_turn_budget: 1,
             scaffold_paths: vec![
                 "space-invaders/src/app/page.tsx".to_string(),
                 "space-invaders/src/app/globals.css".to_string(),
@@ -3791,6 +3808,7 @@ mod tests {
             root_prefix: "space-invaders".to_string(),
             retry_budget: 1,
             exploration_turn_budget: 0,
+            mutation_turn_budget: 1,
             scaffold_paths: vec![
                 "space-invaders/src/app/page.tsx".to_string(),
                 "space-invaders/src/app/globals.css".to_string(),
@@ -3807,6 +3825,35 @@ mod tests {
             filtered,
             vec!["space-invaders/src/components/Game.tsx".to_string()]
         );
+    }
+
+    #[test]
+    fn local_bootstrap_lock_requires_multiple_mutation_turns_before_unlock() {
+        let mut lock = LocalBootstrapLock::new(
+            "space-invaders".to_string(),
+            vec!["space-invaders/src/app/page.tsx".to_string()],
+        );
+
+        assert!(lock.is_active());
+        assert_eq!(
+            lock.mutation_turn_budget,
+            LocalBootstrapLock::DEFAULT_MUTATION_TURN_BUDGET
+        );
+
+        lock.consume_mutation_turn();
+        assert!(lock.is_active(), "lock should persist after first mutation");
+        assert_eq!(lock.mutation_turn_budget, 1);
+        assert_eq!(
+            lock.exploration_turn_budget, 0,
+            "direct mutation lane should disable further exploration"
+        );
+
+        lock.consume_mutation_turn();
+        assert!(
+            !lock.is_active(),
+            "lock should release after the configured mutation lane is completed"
+        );
+        assert_eq!(lock.mutation_turn_budget, 0);
     }
 
     #[test]

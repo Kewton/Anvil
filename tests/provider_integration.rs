@@ -13,7 +13,7 @@ use std::cell::RefCell;
 use std::fs;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 type HeaderLog = Rc<RefCell<Vec<Vec<(String, String)>>>>;
 
@@ -5916,6 +5916,199 @@ fn local_bootstrap_lock_blocks_shell_exec_after_scaffold() {
             .contains("Ready"),
         "bootstrap lock should continue through to a direct mutation"
     );
+}
+
+#[test]
+fn local_bootstrap_lock_persists_across_first_mutation_and_blocks_shell_exec_until_second_mutation()
+{
+    let root = common::unique_test_dir("local_bootstrap_mutation_lane");
+    fs::create_dir_all(&root).expect("test root should be created");
+    let mut config = common::build_config_in(root.clone());
+    config.mode.approval_required = false;
+    config.runtime.provider = "ollama".to_string();
+    config.runtime.local_mode = true;
+    let provider_ctx =
+        anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
+    let mut app = anvil::app::App::new(config, provider_ctx, Arc::new(AtomicBool::new(false)))
+        .expect("app should initialize");
+    let tui = Tui::new();
+
+    struct BootstrapMutationLaneProvider {
+        step: AtomicUsize,
+    }
+
+    impl ProviderClient for BootstrapMutationLaneProvider {
+        fn stream_turn(
+            &self,
+            request: &ProviderTurnRequest,
+            emit: &mut dyn FnMut(ProviderEvent),
+        ) -> Result<(), ProviderTurnError> {
+            let has_shell_block = request.messages.iter().any(|msg| {
+                msg.role == ProviderMessageRole::Tool
+                    && msg
+                        .content
+                        .contains("shell.exec is blocked during local bootstrap act mode")
+            });
+            let has_page_mutation = request.messages.iter().any(|msg| {
+                msg.role == ProviderMessageRole::Tool
+                    && msg.content.contains("[tool result: file.edit]")
+                    && msg.content.contains("space-invaders/src/app/page.tsx")
+            });
+
+            if has_shell_block {
+                emit(ProviderEvent::Agent(AgentEvent::Done {
+                    status: "Done. session saved".to_string(),
+                    assistant_message: "shell はやめて globals を直接編集します。".to_string(),
+                    completion_summary: "turn 6".to_string(),
+                    saved_status: "session saved".to_string(),
+                    tool_logs: Vec::new(),
+                    elapsed_ms: 0,
+                    inference_performance: None,
+                    tool_calls: Some(vec![ToolCallRequest {
+                        tool_call_id: "call_edit_globals".to_string(),
+                        tool_name: "file.edit".to_string(),
+                        input: ToolInput::FileEdit {
+                            path: "space-invaders/src/app/globals.css".to_string(),
+                            old_string: "@import \"tailwindcss\";\n".to_string(),
+                            new_string: "@import \"tailwindcss\";\nbody { background: black; color: white; }\n"
+                                .to_string(),
+                        },
+                        extra_field_warnings: Vec::new(),
+                    }]),
+                    assistant_tool_call_records: None,
+                }));
+            } else if has_page_mutation {
+                emit(ProviderEvent::Agent(AgentEvent::Done {
+                    status: "Done. session saved".to_string(),
+                    assistant_message: "shell で依存関係を入れます。".to_string(),
+                    completion_summary: "turn 5".to_string(),
+                    saved_status: "session saved".to_string(),
+                    tool_logs: Vec::new(),
+                    elapsed_ms: 0,
+                    inference_performance: None,
+                    tool_calls: Some(vec![ToolCallRequest {
+                        tool_call_id: "call_shell_install".to_string(),
+                        tool_name: "shell.exec".to_string(),
+                        input: ToolInput::ShellExec {
+                            command: "cd space-invaders && npm install".to_string(),
+                        },
+                        extra_field_warnings: Vec::new(),
+                    }]),
+                    assistant_tool_call_records: None,
+                }));
+            } else {
+                match self.step.fetch_add(1, Ordering::SeqCst) {
+                    0 => emit(ProviderEvent::Agent(AgentEvent::Done {
+                        status: "Done. session saved".to_string(),
+                        assistant_message: "まず現在の状態を確認します。".to_string(),
+                        completion_summary: "turn 1".to_string(),
+                        saved_status: "session saved".to_string(),
+                        tool_logs: Vec::new(),
+                        elapsed_ms: 0,
+                        inference_performance: None,
+                        tool_calls: Some(vec![ToolCallRequest {
+                            tool_call_id: "call_file_read_root".to_string(),
+                            tool_name: "file.read".to_string(),
+                            input: ToolInput::FileRead {
+                                path: ".".to_string(),
+                            },
+                            extra_field_warnings: Vec::new(),
+                        }]),
+                        assistant_tool_call_records: None,
+                    })),
+                    1 => emit(ProviderEvent::Agent(AgentEvent::Done {
+                        status: "Done. session saved".to_string(),
+                        assistant_message: "プロジェクトを作成します。".to_string(),
+                        completion_summary: "turn 2".to_string(),
+                        saved_status: "session saved".to_string(),
+                        tool_logs: Vec::new(),
+                        elapsed_ms: 0,
+                        inference_performance: None,
+                        tool_calls: Some(vec![ToolCallRequest {
+                            tool_call_id: "call_scaffold".to_string(),
+                            tool_name: "shell.exec".to_string(),
+                            input: ToolInput::ShellExec {
+                                command: "mkdir -p space-invaders/src/app && printf '{}' > space-invaders/package.json && printf 'export default function Page() { return null; }\\n' > space-invaders/src/app/page.tsx && printf '@import \"tailwindcss\";\\n' > space-invaders/src/app/globals.css && printf 'const nextConfig = {}\\nexport default nextConfig\\n' > space-invaders/next.config.ts".to_string(),
+                            },
+                            extra_field_warnings: Vec::new(),
+                        }]),
+                        assistant_tool_call_records: None,
+                    })),
+                    2 => emit(ProviderEvent::Agent(AgentEvent::Done {
+                        status: "Done. session saved".to_string(),
+                        assistant_message: "最小限の確認をします。".to_string(),
+                        completion_summary: "turn 3".to_string(),
+                        saved_status: "session saved".to_string(),
+                        tool_logs: Vec::new(),
+                        elapsed_ms: 0,
+                        inference_performance: None,
+                        tool_calls: Some(vec![ToolCallRequest {
+                            tool_call_id: "call_read_page".to_string(),
+                            tool_name: "file.read".to_string(),
+                            input: ToolInput::FileRead {
+                                path: "space-invaders/src/app/page.tsx".to_string(),
+                            },
+                            extra_field_warnings: Vec::new(),
+                        }]),
+                        assistant_tool_call_records: None,
+                    })),
+                    3 => emit(ProviderEvent::Agent(AgentEvent::Done {
+                        status: "Done. session saved".to_string(),
+                        assistant_message: "まず page を編集します。".to_string(),
+                        completion_summary: "turn 4".to_string(),
+                        saved_status: "session saved".to_string(),
+                        tool_logs: Vec::new(),
+                        elapsed_ms: 0,
+                        inference_performance: None,
+                        tool_calls: Some(vec![ToolCallRequest {
+                            tool_call_id: "call_edit_page".to_string(),
+                            tool_name: "file.edit".to_string(),
+                            input: ToolInput::FileEdit {
+                                path: "space-invaders/src/app/page.tsx".to_string(),
+                                old_string: "export default function Page() { return null; }\n"
+                                    .to_string(),
+                                new_string:
+                                    "export default function Page() { return <main>Ready</main>; }\n"
+                                        .to_string(),
+                            },
+                            extra_field_warnings: Vec::new(),
+                        }]),
+                        assistant_tool_call_records: None,
+                    })),
+                    _ => unreachable!("unexpected request shape before page mutation"),
+                }
+            }
+            Ok(())
+        }
+    }
+
+    app.run_live_turn(
+        "create the project",
+        &BootstrapMutationLaneProvider {
+            step: AtomicUsize::new(0),
+        },
+        &tui,
+    )
+    .expect("bootstrap direct mutation lane should persist across first mutation");
+
+    let tool_messages: Vec<_> = app
+        .session()
+        .messages
+        .iter()
+        .filter(|msg| msg.role == MessageRole::Tool)
+        .collect();
+    assert!(
+        tool_messages.iter().any(|msg| msg
+            .content
+            .contains("shell.exec is blocked during local bootstrap act mode")),
+        "shell.exec should remain blocked after the first direct mutation"
+    );
+    let page = fs::read_to_string(root.join("space-invaders/src/app/page.tsx"))
+        .expect("page.tsx should exist");
+    let globals = fs::read_to_string(root.join("space-invaders/src/app/globals.css"))
+        .expect("globals.css should exist");
+    assert!(page.contains("Ready"));
+    assert!(globals.contains("background: black"));
 }
 
 #[test]
