@@ -268,6 +268,17 @@ impl<T> OllamaProviderClient<T> {
     }
 }
 
+fn is_recoverable_ollama_stream_error(err: &ProviderTurnError) -> bool {
+    let ProviderTurnError::Network(message) = err else {
+        return false;
+    };
+    let lower = message.to_ascii_lowercase();
+    lower.contains("error decoding response body")
+        || lower.contains("error reading a body from connection")
+        || lower.contains("unexpected eof")
+        || lower.contains("unexpected end of file")
+}
+
 // ---------------------------------------------------------------------------
 // Ollama native tool call parsing (Issue #373)
 // ---------------------------------------------------------------------------
@@ -602,8 +613,10 @@ impl<T: HttpTransport> ProviderClient for OllamaProviderClient<T> {
         let mut had_error: Option<ProviderTurnError> = None;
         // Issue #373: Accumulate tool_calls across streaming chunks.
         let mut collected_tool_calls: Vec<serde_json::Value> = Vec::new();
+        let mut saw_done_chunk = false;
 
-        self.transport
+        let stream_result = self
+            .transport
             .stream_lines(&url, &request_body, &[], &mut |line| {
                 if had_error.is_some() {
                     return;
@@ -624,6 +637,7 @@ impl<T: HttpTransport> ProviderClient for OllamaProviderClient<T> {
                             }
                         }
                         if chunk.done {
+                            saw_done_chunk = true;
                             let perf = extract_inference_performance(
                                 eval_count,
                                 eval_duration,
@@ -673,11 +687,37 @@ impl<T: HttpTransport> ProviderClient for OllamaProviderClient<T> {
                         )));
                     }
                 }
-            })?;
+            });
 
         if let Some(err) = had_error {
             tracing::error!(error = %err, "ollama provider request failed");
             return Err(err);
+        }
+        if let Err(err) = stream_result {
+            if saw_done_chunk {
+                tracing::warn!(
+                    error = %err,
+                    "ollama stream ended with a recoverable transport error after done chunk"
+                );
+                return Ok(());
+            }
+            if assistant_output.is_empty()
+                || !collected_tool_calls.is_empty()
+                || !is_recoverable_ollama_stream_error(&err)
+            {
+                tracing::error!(error = %err, "ollama provider request failed");
+                return Err(err);
+            }
+            tracing::warn!(
+                error = %err,
+                chars = assistant_output.len(),
+                "ollama stream truncated after partial assistant text; emitting synthetic Done event"
+            );
+            emit(ProviderEvent::Agent(build_provider_done_event(
+                &assistant_output,
+                None,
+            )));
+            return Ok(());
         }
         Ok(())
     }

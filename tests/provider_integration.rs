@@ -39,6 +39,12 @@ struct MockHttpTransport {
     get_response: Option<HttpResponse>,
 }
 
+#[derive(Clone)]
+struct StreamingErrorTransport {
+    lines: Vec<String>,
+    error: ProviderTurnError,
+}
+
 impl HttpTransport for MockHttpTransport {
     fn post_json_with_headers(
         &self,
@@ -73,6 +79,38 @@ impl HttpTransport for MockHttpTransport {
             .get_response
             .clone()
             .unwrap_or_else(|| self.response.clone()))
+    }
+}
+
+impl HttpTransport for StreamingErrorTransport {
+    fn post_json_with_headers(
+        &self,
+        _url: &str,
+        _body: &[u8],
+        _headers: &[(&str, &str)],
+    ) -> Result<HttpResponse, ProviderTurnError> {
+        panic!("post_json_with_headers should not be called in stream test");
+    }
+
+    fn get_with_headers(
+        &self,
+        _url: &str,
+        _headers: &[(&str, &str)],
+    ) -> Result<HttpResponse, ProviderTurnError> {
+        panic!("get_with_headers should not be called in stream test");
+    }
+
+    fn stream_lines(
+        &self,
+        _url: &str,
+        _body: &[u8],
+        _headers: &[(&str, &str)],
+        on_line: &mut dyn FnMut(&str),
+    ) -> Result<(), ProviderTurnError> {
+        for line in &self.lines {
+            on_line(line);
+        }
+        Err(self.error.clone())
     }
 }
 
@@ -1577,6 +1615,125 @@ fn ollama_provider_stream_turn_posts_chat_request_and_normalizes_response() {
             }),
         ]
     );
+}
+
+#[test]
+fn ollama_provider_recovers_truncated_stream_after_partial_text() {
+    let provider = OllamaProviderClient::with_transport(
+        "http://127.0.0.1:11434",
+        StreamingErrorTransport {
+            lines: vec![
+                "{\"message\":{\"role\":\"assistant\",\"content\":\"draft \"},\"done\":false}"
+                    .to_string(),
+                "{\"message\":{\"role\":\"assistant\",\"content\":\"answer\"},\"done\":false}"
+                    .to_string(),
+            ],
+            error: ProviderTurnError::Network("error decoding response body".to_string()),
+        },
+    );
+    let request = ProviderTurnRequest::new(
+        "local-default".to_string(),
+        vec![anvil::provider::ProviderMessage::new(
+            ProviderMessageRole::User,
+            "inspect src/provider",
+        )],
+        true,
+    );
+    let mut events = Vec::new();
+
+    provider
+        .stream_turn(&request, &mut |event| events.push(event))
+        .expect("truncated stream should be recovered into a synthetic Done event");
+
+    assert_eq!(
+        events,
+        vec![
+            ProviderEvent::TokenDelta("draft ".to_string()),
+            ProviderEvent::TokenDelta("answer".to_string()),
+            ProviderEvent::Agent(AgentEvent::Done {
+                status: "Done. session saved".to_string(),
+                assistant_message: "draft answer".to_string(),
+                completion_summary: "Provider turn finished successfully.".to_string(),
+                saved_status: "session saved".to_string(),
+                tool_logs: Vec::new(),
+                elapsed_ms: 0,
+                inference_performance: None,
+                tool_calls: None,
+                assistant_tool_call_records: None,
+            }),
+        ]
+    );
+}
+
+#[test]
+fn ollama_provider_ignores_decode_error_after_done_chunk() {
+    let provider = OllamaProviderClient::with_transport(
+        "http://127.0.0.1:11434",
+        StreamingErrorTransport {
+            lines: vec![
+                "{\"message\":{\"role\":\"assistant\",\"content\":\"draft answer\"},\"done\":false}"
+                    .to_string(),
+                "{\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true}"
+                    .to_string(),
+            ],
+            error: ProviderTurnError::Network("error decoding response body".to_string()),
+        },
+    );
+    let request = ProviderTurnRequest::new(
+        "local-default".to_string(),
+        vec![anvil::provider::ProviderMessage::new(
+            ProviderMessageRole::User,
+            "inspect src/provider",
+        )],
+        true,
+    );
+    let mut events = Vec::new();
+
+    provider
+        .stream_turn(&request, &mut |event| events.push(event))
+        .expect("decode error after done chunk should be ignored");
+
+    assert_eq!(
+        events,
+        vec![
+            ProviderEvent::TokenDelta("draft answer".to_string()),
+            ProviderEvent::Agent(AgentEvent::Done {
+                status: "Done. session saved".to_string(),
+                assistant_message: "draft answer".to_string(),
+                completion_summary: "Provider turn finished successfully.".to_string(),
+                saved_status: "session saved".to_string(),
+                tool_logs: Vec::new(),
+                elapsed_ms: 0,
+                inference_performance: None,
+                tool_calls: None,
+                assistant_tool_call_records: None,
+            }),
+        ]
+    );
+}
+
+#[test]
+fn ollama_provider_keeps_decode_error_when_no_output_arrived() {
+    let provider = OllamaProviderClient::with_transport(
+        "http://127.0.0.1:11434",
+        StreamingErrorTransport {
+            lines: Vec::new(),
+            error: ProviderTurnError::Network("error decoding response body".to_string()),
+        },
+    );
+    let request = ProviderTurnRequest::new(
+        "local-default".to_string(),
+        vec![anvil::provider::ProviderMessage::new(
+            ProviderMessageRole::User,
+            "inspect src/provider",
+        )],
+        true,
+    );
+
+    let err = provider
+        .stream_turn(&request, &mut |_event| {})
+        .expect_err("empty truncated stream should still fail");
+    assert!(err.to_string().contains("error decoding response body"));
 }
 
 #[test]
