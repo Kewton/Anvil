@@ -975,15 +975,35 @@ impl App {
         prompt
     }
 
-    /// Convert an absolute path to a cwd-relative string for working memory.
+    /// Convert a path to a cwd-relative string for working memory.
     ///
-    /// Returns `None` if the path is not under the session cwd.
-    fn relative_path_for_working_memory(&self, abs_path: &std::path::Path) -> Option<String> {
+    /// Absolute paths must be under the session cwd. Relative paths are
+    /// accepted as-is after a conservative normalization pass.
+    fn relative_path_for_working_memory(&self, path: &std::path::Path) -> Option<String> {
         let cwd = std::path::Path::new(&self.session.metadata.cwd);
-        abs_path
-            .strip_prefix(cwd)
-            .ok()
-            .map(|rel| rel.to_string_lossy().into_owned())
+        if path.is_absolute() {
+            return path
+                .strip_prefix(cwd)
+                .ok()
+                .map(|rel| rel.to_string_lossy().into_owned());
+        }
+
+        let mut normalized = std::path::PathBuf::new();
+        for component in path.components() {
+            match component {
+                std::path::Component::CurDir => {}
+                std::path::Component::Normal(part) => normalized.push(part),
+                std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_) => return None,
+            }
+        }
+
+        if normalized.as_os_str().is_empty() {
+            None
+        } else {
+            Some(normalized.to_string_lossy().into_owned())
+        }
     }
 
     /// Prepare for write fallback: take checkpoint snapshot (Issue #158, DR4-007).
@@ -3323,5 +3343,14 @@ mod tests {
         app.execution_plan.items[1].status = crate::contracts::PlanItemStatus::Blocked;
         push_tool_result(&mut app, true);
         assert!(app.has_tool_execution_failure());
+    }
+
+    #[test]
+    fn relative_path_for_working_memory_accepts_relative_paths() {
+        let app = build_test_app();
+        let rel = app
+            .relative_path_for_working_memory(std::path::Path::new("./space-invaders/package.json"))
+            .expect("relative path should be accepted");
+        assert_eq!(rel, "space-invaders/package.json");
     }
 }

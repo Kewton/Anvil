@@ -2,10 +2,11 @@ mod common;
 
 use anvil::agent::{AgentEvent, AgentRuntime};
 use anvil::provider::{
-    HttpResponse, HttpTransport, OllamaChatMessage, OllamaProviderClient, ProviderClient,
-    ProviderEvent, ProviderMessageRole, ProviderTurnError, ProviderTurnRequest,
+    AssistantToolCallRecord, HttpResponse, HttpTransport, OllamaChatMessage, OllamaProviderClient,
+    ProviderClient, ProviderEvent, ProviderMessageRole, ProviderTurnError, ProviderTurnRequest,
     resolve_ollama_model_alias,
 };
+use anvil::tooling::{ToolCallRequest, ToolInput};
 use anvil::tui::Tui;
 use std::cell::RefCell;
 use std::fs;
@@ -1081,6 +1082,131 @@ fn live_turn_executes_streaming_native_tool_calls_response_from_openai_compatibl
         frames
             .iter()
             .any(|frame| frame.contains("file.write completed ./sandbox/native/stream.html"))
+    );
+}
+
+#[test]
+fn agentic_followup_executes_native_tool_calls_and_replays_tool_context() {
+    let root = common::unique_test_dir("agentic_followup_native_tool_calls");
+    fs::create_dir_all(&root).expect("test root should be created");
+    let mut config = common::build_config_in(root.clone());
+    config.mode.approval_required = false;
+    let provider_ctx =
+        anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
+    let mut app = anvil::app::App::new(
+        config,
+        provider_ctx,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("app should initialize");
+    let tui = Tui::new();
+
+    #[derive(Clone)]
+    struct FollowupNativeProvider {
+        seen_requests: Rc<RefCell<Vec<ProviderTurnRequest>>>,
+    }
+
+    impl ProviderClient for FollowupNativeProvider {
+        fn stream_turn(
+            &self,
+            request: &ProviderTurnRequest,
+            emit: &mut dyn FnMut(ProviderEvent),
+        ) -> Result<(), ProviderTurnError> {
+            let call_index = self.seen_requests.borrow().len();
+            self.seen_requests.borrow_mut().push(request.clone());
+
+            match call_index {
+                0 => emit(ProviderEvent::Agent(AgentEvent::Done {
+                    status: "Done. session saved".to_string(),
+                    assistant_message: "まず現在のディレクトリを確認します。".to_string(),
+                    completion_summary: "turn 1".to_string(),
+                    saved_status: "session saved".to_string(),
+                    tool_logs: Vec::new(),
+                    elapsed_ms: 0,
+                    inference_performance: None,
+                    tool_calls: Some(vec![ToolCallRequest {
+                        tool_call_id: "call_file_read_0".to_string(),
+                        tool_name: "file.read".to_string(),
+                        input: ToolInput::FileRead {
+                            path: ".".to_string(),
+                        },
+                        extra_field_warnings: Vec::new(),
+                    }]),
+                    assistant_tool_call_records: Some(vec![AssistantToolCallRecord {
+                        id: "call_file_read_0".to_string(),
+                        function_name: "file_read".to_string(),
+                        arguments: "{\"path\":\".\"}".to_string(),
+                    }]),
+                })),
+                1 => emit(ProviderEvent::Agent(AgentEvent::Done {
+                    status: "Done. session saved".to_string(),
+                    assistant_message: "Next.js の土台を作成します。".to_string(),
+                    completion_summary: "turn 2".to_string(),
+                    saved_status: "session saved".to_string(),
+                    tool_logs: Vec::new(),
+                    elapsed_ms: 0,
+                    inference_performance: None,
+                    tool_calls: Some(vec![ToolCallRequest {
+                        tool_call_id: "call_shell_exec_0".to_string(),
+                        tool_name: "shell.exec".to_string(),
+                        input: ToolInput::ShellExec {
+                            command: "mkdir -p ./space-invaders && printf '{\"name\":\"space-invaders\"}\\n' > ./space-invaders/package.json".to_string(),
+                        },
+                        extra_field_warnings: Vec::new(),
+                    }]),
+                    assistant_tool_call_records: Some(vec![AssistantToolCallRecord {
+                        id: "call_shell_exec_0".to_string(),
+                        function_name: "shell_exec".to_string(),
+                        arguments: "{\"command\":\"mkdir -p ./space-invaders && printf '{\\\"name\\\":\\\"space-invaders\\\"}\\\\n' > ./space-invaders/package.json\"}".to_string(),
+                    }]),
+                })),
+                _ => emit(ProviderEvent::Agent(AgentEvent::Done {
+                    status: "Done. session saved".to_string(),
+                    assistant_message: "初期化が完了しました。".to_string(),
+                    completion_summary: "turn 3".to_string(),
+                    saved_status: "session saved".to_string(),
+                    tool_logs: Vec::new(),
+                    elapsed_ms: 0,
+                    inference_performance: None,
+                    tool_calls: None,
+                    assistant_tool_call_records: None,
+                })),
+            }
+            Ok(())
+        }
+    }
+
+    let seen_requests = Rc::new(RefCell::new(Vec::new()));
+    let provider = FollowupNativeProvider {
+        seen_requests: seen_requests.clone(),
+    };
+
+    app.run_live_turn("create the project", &provider, &tui)
+        .expect("agentic followup native tool_calls should execute");
+
+    let written = fs::read_to_string(root.join("space-invaders/package.json"))
+        .expect("shell.exec from followup should create package.json");
+    assert!(written.contains("space-invaders"));
+
+    let requests = seen_requests.borrow();
+    assert!(
+        requests.len() >= 3,
+        "expected a replay request after followup native tool execution"
+    );
+    let replay_request = &requests[2];
+    assert!(
+        replay_request.messages.iter().any(|msg| {
+            msg.assistant_tool_calls()
+                .map(|calls| calls.iter().any(|call| call.function_name == "shell_exec"))
+                .unwrap_or(false)
+        }),
+        "assistant tool_call records should be preserved for replay"
+    );
+    assert!(
+        replay_request.messages.iter().any(|msg| {
+            msg.role == ProviderMessageRole::Tool && msg.tool_call_id() == Some("call_shell_exec_0")
+        }),
+        "tool result message should be attached to the native replay context"
     );
 }
 

@@ -1917,38 +1917,12 @@ impl App {
                 }
             }
 
-            // Parse the follow-up response (retry once on parse failure)
-            let mut next_structured = match BasicAgentLoop::parse_structured_response_with_registry(
+            // Parse the follow-up response (prefer native Done.tool_calls when present)
+            let mut next_structured = self.parse_stream_structured_response(
                 &next_token_buffer,
-                &self.tools,
-            ) {
-                Ok(parsed) => parsed,
-                Err(_first_err) => {
-                    // LLMs occasionally produce malformed output; treat the
-                    // raw text as a plain final answer rather than failing the
-                    // entire turn.
-                    let trimmed = next_token_buffer.trim();
-                    if !trimmed.is_empty() {
-                        // Issue #372: graceful degradation — non-empty output
-                        // is treated as plain text.
-                        self.agent_telemetry.retry.record_parse_failure_recovered();
-                        tracing::warn!(
-                            "parse failure recovered: treating as plain text ({} chars)",
-                            trimmed.len()
-                        );
-                        StructuredAssistantResponse::empty(trimmed.to_string())
-                    } else {
-                        // Issue #372: fail-fast — empty output is a complete
-                        // failure with no recoverable content.
-                        self.agent_telemetry
-                            .retry
-                            .record_parse_failure_empty_errored();
-                        return Err(AppError::ToolExecution(
-                            "assistant response parse failed after empty follow-up".to_string(),
-                        ));
-                    }
-                }
-            };
+                &transcript_agent_events,
+                true,
+            )?;
 
             // Record turn stats AFTER the full iteration completes (Issue #206 CB-001)
             self.session_stats.record_turn();
@@ -3952,21 +3926,9 @@ impl App {
             Ok(()) => {}
         }
 
-        // Parse the retry response
-        let retry_structured = match BasicAgentLoop::parse_structured_response_with_registry(
-            &token_buffer,
-            &self.tools,
-        ) {
-            Ok(parsed) => parsed,
-            Err(_) => {
-                let trimmed = token_buffer.trim();
-                StructuredAssistantResponse::empty(if trimmed.is_empty() {
-                    "Guard retry produced empty response.".to_string()
-                } else {
-                    trimmed.to_string()
-                })
-            }
-        };
+        // Parse the retry response (prefer native Done.tool_calls when present)
+        let retry_structured =
+            self.parse_stream_structured_response(&token_buffer, &transcript_agent_events, false)?;
 
         // If response has tool_calls, delegate to complete_structured_response.
         // Issue #173: Pass anvil_final_already=true since Guard Retry was triggered
@@ -4168,6 +4130,84 @@ impl App {
             provider_client,
             anvil_final,
         )?))
+    }
+
+    fn parse_stream_structured_response(
+        &mut self,
+        token_buffer: &str,
+        agent_events: &[AgentEvent],
+        strict_empty_failure: bool,
+    ) -> Result<StructuredAssistantResponse, AppError> {
+        if let Some((assistant_message, native_calls, assistant_tool_call_records)) =
+            agent_events.iter().rev().find_map(|event| match event {
+                AgentEvent::Done {
+                    assistant_message,
+                    tool_calls,
+                    assistant_tool_call_records,
+                    ..
+                } => Some((
+                    assistant_message,
+                    tool_calls.as_ref().filter(|calls| !calls.is_empty()),
+                    assistant_tool_call_records,
+                )),
+                _ => None,
+            })
+        {
+            if let Some(native_calls) = native_calls {
+                if let Some(records) = assistant_tool_call_records {
+                    self.record_assistant_output_with_tool_calls(
+                        self.next_message_id("assistant"),
+                        assistant_message,
+                        records.clone(),
+                    )?;
+                }
+                return Ok(StructuredAssistantResponse::from_native_tool_calls(
+                    native_calls.clone(),
+                    assistant_message.clone(),
+                    false,
+                ));
+            }
+            if token_buffer.trim().is_empty() && !assistant_message.trim().is_empty() {
+                return self
+                    .parse_text_structured_response(assistant_message, strict_empty_failure);
+            }
+        }
+
+        self.parse_text_structured_response(token_buffer, strict_empty_failure)
+    }
+
+    fn parse_text_structured_response(
+        &mut self,
+        text: &str,
+        strict_empty_failure: bool,
+    ) -> Result<StructuredAssistantResponse, AppError> {
+        match BasicAgentLoop::parse_structured_response_with_registry(text, &self.tools) {
+            Ok(parsed) => Ok(parsed),
+            Err(_) => {
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    if strict_empty_failure {
+                        self.agent_telemetry
+                            .retry
+                            .record_parse_failure_empty_errored();
+                        Err(AppError::ToolExecution(
+                            "assistant response parse failed after empty follow-up".to_string(),
+                        ))
+                    } else {
+                        Ok(StructuredAssistantResponse::empty(
+                            "Guard retry produced empty response.".to_string(),
+                        ))
+                    }
+                } else {
+                    self.agent_telemetry.retry.record_parse_failure_recovered();
+                    tracing::warn!(
+                        "parse failure recovered: treating as plain text ({} chars)",
+                        trimmed.len()
+                    );
+                    Ok(StructuredAssistantResponse::empty(trimmed.to_string()))
+                }
+            }
+        }
     }
 }
 
