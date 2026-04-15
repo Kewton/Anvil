@@ -255,7 +255,7 @@ struct LocalBootstrapLock {
 }
 
 impl LocalBootstrapLock {
-    const DEFAULT_RETRY_BUDGET: u8 = 2;
+    const DEFAULT_RETRY_BUDGET: u8 = 1;
 
     fn new(root_prefix: String, scaffold_paths: Vec<String>) -> Self {
         Self::new_with_kind(LocalBootstrapKind::Scaffolded, root_prefix, scaffold_paths)
@@ -333,12 +333,6 @@ impl LocalBootstrapLock {
             }
         }
 
-        for path in scaffold_paths {
-            if !queue.iter().any(|existing| existing == path) {
-                queue.push(path.clone());
-            }
-        }
-
         queue
     }
 
@@ -390,6 +384,7 @@ impl LocalPreBootstrapLane {
 
 pub(crate) const BOOTSTRAP_LANE_RETRY_AUTHOR: &str = "bootstrap_lane_retry";
 pub(crate) const PREBOOTSTRAP_LANE_RETRY_AUTHOR: &str = "prebootstrap_lane_retry";
+const LOCAL_BOOTSTRAP_TARGET_SNAPSHOT_CHAR_LIMIT: usize = 1600;
 
 /// Central application state.
 pub struct App {
@@ -1161,14 +1156,17 @@ impl App {
         }
 
         let target = lock.next_mutation_target()?;
-        let mut prompt = String::from(
-            "You are Anvil in local bootstrap act mode.\n\n\
-             Emit exactly one direct file mutation tool call now.\n\
-             Allowed tools: file.write, file.edit, file.edit_anchor, file.rewrite.\n\
-             Forbidden: ANVIL_PLAN, ANVIL_PLAN_UPDATE, explanation, file.read, file.search, shell.exec, git.status, agent.plan.\n",
+        let allowed_tools = Self::local_bootstrap_target_allowed_tool_names(target).join(", ");
+        let mut prompt = String::from("You are Anvil in local bootstrap act mode.\n\n");
+        prompt.push_str("Emit exactly one direct file mutation tool call now.\n");
+        prompt.push_str(&format!("Allowed tools: {allowed_tools}.\n"));
+        prompt.push_str(
+            "Forbidden: ANVIL_PLAN, ANVIL_PLAN_UPDATE, explanation, file.read, file.search, shell.exec, git.status, agent.plan.\n",
         );
         prompt.push_str(&format!("Project root: {}\n", lock.root_prefix));
         prompt.push_str(&format!("Current bootstrap target: {target}\n"));
+        prompt.push_str(&self.describe_local_bootstrap_target(target));
+        prompt.push_str(&Self::local_bootstrap_target_instruction(target));
         prompt.push_str(
             "Only mutate the current bootstrap target. Do not discuss what you will do. Do not inspect more files. Do not choose a different path.\n",
         );
@@ -1191,6 +1189,74 @@ impl App {
         );
         prompt.push_str(&context::format_date_prompt());
         Some(prompt)
+    }
+
+    fn describe_local_bootstrap_target(&self, target: &str) -> String {
+        let target_path = self.config.paths.cwd.join(target);
+        let target_bytes = match std::fs::read(&target_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return "Target status: file does not exist yet. Create it now at the exact target path.\n".to_string();
+            }
+            Err(_) => {
+                return "Target status: current file content could not be read. Mutate the exact target path directly.\n".to_string();
+            }
+        };
+
+        let mut snippet = String::from_utf8_lossy(&target_bytes).into_owned();
+        let mut truncated = false;
+        if snippet.chars().count() > LOCAL_BOOTSTRAP_TARGET_SNAPSHOT_CHAR_LIMIT {
+            snippet = snippet
+                .chars()
+                .take(LOCAL_BOOTSTRAP_TARGET_SNAPSHOT_CHAR_LIMIT)
+                .collect();
+            truncated = true;
+        }
+
+        let mut description =
+            String::from("Target status: existing file. Current content:\n```text\n");
+        description.push_str(&snippet.replace("```", "'''"));
+        if !snippet.ends_with('\n') {
+            description.push('\n');
+        }
+        description.push_str("```\n");
+        if truncated {
+            description.push_str("Note: content snapshot was truncated.\n");
+        }
+        description
+    }
+
+    fn local_bootstrap_target_instruction(target: &str) -> String {
+        if target.ends_with("package.json") {
+            return "Preferred mutation: rewrite or edit package.json directly in one tool call. Update scripts and package metadata in place. Do not use package-manager commands.\n".to_string();
+        }
+        if target.ends_with("next.config.ts") || target.ends_with("next.config.js") {
+            return "Preferred mutation: rewrite the Next.js config file directly in one tool call. Set only the needed config for this app.\n".to_string();
+        }
+        if target.ends_with("page.tsx") || target.ends_with("layout.tsx") {
+            return "Preferred mutation: rewrite the full file in one tool call instead of making small edits. Replace the starter template with the real app implementation.\n".to_string();
+        }
+        if target.ends_with("globals.css") {
+            return "Preferred mutation: rewrite the stylesheet in one tool call with the final visual system for the app.\n".to_string();
+        }
+        "Preferred mutation: mutate the current target directly in one tool call.\n"
+            .to_string()
+    }
+
+    fn local_bootstrap_target_allowed_tool_names(target: &str) -> Vec<&'static str> {
+        if target.ends_with("page.tsx")
+            || target.ends_with("layout.tsx")
+            || target.ends_with("globals.css")
+        {
+            return vec!["file.write", "file.rewrite"];
+        }
+        if target.ends_with("package.json")
+            || target.ends_with("next.config.ts")
+            || target.ends_with("next.config.js")
+        {
+            return vec!["file.edit", "file.write", "file.rewrite"];
+        }
+        vec!["file.write", "file.edit", "file.edit_anchor", "file.rewrite"]
     }
 
     /// Convert a path to a cwd-relative string for working memory.
@@ -1739,6 +1805,78 @@ impl App {
         }
     }
 
+    fn canonicalize_local_mode_tool_call(
+        &self,
+        call: &crate::tooling::ToolCallRequest,
+    ) -> crate::tooling::ToolCallRequest {
+        if !self
+            .local_prebootstrap_lane
+            .as_ref()
+            .is_some_and(LocalPreBootstrapLane::is_active)
+        {
+            return call.clone();
+        }
+
+        let crate::tooling::ToolInput::ShellExec { command } = &call.input else {
+            return call.clone();
+        };
+
+        let Some(canonical_command) = Self::canonicalize_local_prebootstrap_shell_command(command)
+        else {
+            return call.clone();
+        };
+
+        let mut normalized = call.clone();
+        normalized.input = crate::tooling::ToolInput::ShellExec {
+            command: canonical_command,
+        };
+        normalized
+    }
+
+    fn canonicalize_local_prebootstrap_shell_command(command: &str) -> Option<String> {
+        let segments: Vec<&str> = command
+            .split("&&")
+            .map(str::trim)
+            .filter(|segment| !segment.is_empty())
+            .collect();
+        if segments.is_empty() {
+            return None;
+        }
+
+        let mut bootstrap_segment = None;
+        let mut prefix = Vec::new();
+        for segment in segments {
+            let lower = segment.to_ascii_lowercase();
+            if lower.contains("create-next-app")
+                || lower.contains("npm create next-app")
+                || lower.contains("pnpm create next-app")
+                || lower.contains("yarn create next-app")
+                || lower.contains("bun create next-app")
+                || lower.contains("cargo new ")
+                || lower.contains("cargo init")
+            {
+                bootstrap_segment = Some(segment);
+                break;
+            }
+            if lower.starts_with("mkdir ") || lower.starts_with("cd ") {
+                prefix.push(segment);
+            }
+        }
+
+        let Some(bootstrap_segment) = bootstrap_segment else {
+            return None;
+        };
+
+        let mut kept = prefix;
+        kept.push(bootstrap_segment);
+        let canonical = kept.join(" && ");
+        if canonical == command.trim() {
+            None
+        } else {
+            Some(canonical)
+        }
+    }
+
     fn is_real_mutation_tool_name(tool_name: &str) -> bool {
         matches!(
             tool_name,
@@ -2280,11 +2418,24 @@ impl App {
         {
             tools.retain(|tool| tool.name == "shell_exec");
         } else if self.local_postbootstrap_lane_active() {
+            let allowed = self
+                .local_bootstrap_lock
+                .as_ref()
+                .and_then(LocalBootstrapLock::next_mutation_target)
+                .map(Self::local_bootstrap_target_allowed_tool_names)
+                .unwrap_or_else(|| {
+                    vec!["file.write", "file.edit", "file.edit_anchor", "file.rewrite"]
+                });
             tools.retain(|tool| {
-                matches!(
-                    tool.name.as_str(),
-                    "file_write" | "file_edit" | "file_edit_anchor" | "file_rewrite"
-                )
+                allowed.iter().any(|name| {
+                    matches!(
+                        (*name, tool.name.as_str()),
+                        ("file.write", "file_write")
+                            | ("file.edit", "file_edit")
+                            | ("file.edit_anchor", "file_edit_anchor")
+                            | ("file.rewrite", "file_rewrite")
+                    )
+                })
             });
         }
         tools.sort_by(|a, b| a.name.cmp(&b.name));
@@ -4451,6 +4602,30 @@ mod tests {
     }
 
     #[test]
+    fn local_bootstrap_lock_does_not_queue_low_value_scaffold_files() {
+        let lock = LocalBootstrapLock::new(
+            "space-invaders".to_string(),
+            vec![
+                "space-invaders/package.json".to_string(),
+                "space-invaders/src/app/page.tsx".to_string(),
+                "space-invaders/src/app/globals.css".to_string(),
+                "space-invaders/AGENTS.md".to_string(),
+                "space-invaders/CLAUDE.md".to_string(),
+                "space-invaders/.gitignore".to_string(),
+            ],
+        );
+
+        assert_eq!(
+            lock.target_queue,
+            vec![
+                "space-invaders/src/app/page.tsx".to_string(),
+                "space-invaders/src/app/globals.css".to_string(),
+                "space-invaders/package.json".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn local_bootstrap_lock_advances_target_without_mutation_and_resets_retry_budget() {
         let mut lock = LocalBootstrapLock::new(
             "space-invaders".to_string(),
@@ -4638,6 +4813,127 @@ mod tests {
         assert!(prompt.contains("Emit exactly one direct file mutation tool call now."));
         assert!(prompt.contains("Forbidden: ANVIL_PLAN, ANVIL_PLAN_UPDATE"));
         assert!(!prompt.contains("## Working memory"));
+    }
+
+    #[test]
+    fn local_bootstrap_lane_prompt_includes_existing_target_snapshot() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let root = tmp.path().join("space-invaders");
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::write(
+            root.join("package.json"),
+            "{\n  \"name\": \"space-invaders\",\n  \"private\": true\n}\n",
+        )
+        .expect("write package");
+
+        let mut app = build_test_app();
+        app.config.runtime.provider = "ollama".to_string();
+        app.config.runtime.local_mode = true;
+        app.config.paths.cwd = tmp.path().to_path_buf();
+        app.local_bootstrap_lock = Some(LocalBootstrapLock::new(
+            "space-invaders".to_string(),
+            vec!["space-invaders/package.json".to_string()],
+        ));
+
+        let prompt = app.build_dynamic_system_prompt();
+        assert!(prompt.contains("Target status: existing file."));
+        assert!(prompt.contains("\"name\": \"space-invaders\""));
+        assert!(prompt.contains("Current bootstrap target: space-invaders/package.json"));
+    }
+
+    #[test]
+    fn local_bootstrap_lane_prompt_marks_missing_target_file() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+
+        let mut app = build_test_app();
+        app.config.runtime.provider = "ollama".to_string();
+        app.config.runtime.local_mode = true;
+        app.config.paths.cwd = tmp.path().to_path_buf();
+        app.local_bootstrap_lock = Some(LocalBootstrapLock::new(
+            "space-invaders".to_string(),
+            vec!["space-invaders/src/app/page.tsx".to_string()],
+        ));
+
+        let prompt = app.build_dynamic_system_prompt();
+        assert!(prompt.contains("Target status: file does not exist yet."));
+        assert!(prompt.contains("Create it now at the exact target path."));
+    }
+
+    #[test]
+    fn local_prebootstrap_shell_command_is_canonicalized_to_scaffold_only() {
+        let command = "mkdir -p space-invaders-3011 && cd space-invaders-3011 && npx create-next-app@latest . --typescript --tailwind --eslint --app --src-dir --no-import-alias --use-npm && npx add canvas";
+        let canonical = App::canonicalize_local_prebootstrap_shell_command(command)
+            .expect("should strip trailing post-bootstrap commands");
+
+        assert_eq!(
+            canonical,
+            "mkdir -p space-invaders-3011 && cd space-invaders-3011 && npx create-next-app@latest . --typescript --tailwind --eslint --app --src-dir --no-import-alias --use-npm"
+        );
+    }
+
+    #[test]
+    fn local_mode_canonicalizes_prebootstrap_shell_tool_call() {
+        let mut app = build_test_app();
+        app.local_prebootstrap_lane = Some(LocalPreBootstrapLane::new());
+
+        let call = crate::tooling::ToolCallRequest {
+            tool_call_id: "call_shell_exec_0".to_string(),
+            tool_name: "shell.exec".to_string(),
+            input: crate::tooling::ToolInput::ShellExec {
+                command: "mkdir -p space-invaders-3011 && cd space-invaders-3011 && npx create-next-app@latest . --typescript --tailwind --eslint --app --src-dir --no-import-alias --use-npm && npx add canvas".to_string(),
+            },
+            extra_field_warnings: Vec::new(),
+        };
+
+        let normalized = app.canonicalize_local_mode_tool_call(&call);
+        let crate::tooling::ToolInput::ShellExec { command } = normalized.input else {
+            panic!("expected shell.exec");
+        };
+        assert!(!command.contains("npx add canvas"));
+        assert!(command.contains("create-next-app@latest"));
+    }
+
+    #[test]
+    fn local_prebootstrap_shell_command_drops_pre_scaffold_package_setup() {
+        let command = "mkdir -p space-invaders-3011 && cd space-invaders-3011 && npm init -y && npm install next react react-dom framer-motion && npx create-next-app@latest . --typescript --tailwind --eslint --app --src-dir --import-alias \"@/*\" --use-npm --no-turbopack && echo done";
+        let canonical = App::canonicalize_local_prebootstrap_shell_command(command)
+            .expect("should keep only mkdir/cd plus scaffold segment");
+
+        assert_eq!(
+            canonical,
+            "mkdir -p space-invaders-3011 && cd space-invaders-3011 && npx create-next-app@latest . --typescript --tailwind --eslint --app --src-dir --import-alias \"@/*\" --use-npm --no-turbopack"
+        );
+    }
+
+    #[test]
+    fn local_bootstrap_target_instruction_prefers_full_page_rewrite() {
+        let instruction =
+            App::local_bootstrap_target_instruction("space-invaders/src/app/page.tsx");
+        assert!(instruction.contains("rewrite the full file"));
+        assert!(instruction.contains("Replace the starter template"));
+    }
+
+    #[test]
+    fn local_bootstrap_target_instruction_blocks_package_manager_for_package_json() {
+        let instruction = App::local_bootstrap_target_instruction("space-invaders/package.json");
+        assert!(instruction.contains("package.json directly"));
+        assert!(instruction.contains("Do not use package-manager commands"));
+    }
+
+    #[test]
+    fn local_bootstrap_target_allowed_tools_prefer_rewrite_for_page() {
+        assert_eq!(
+            App::local_bootstrap_target_allowed_tool_names("space-invaders/src/app/page.tsx"),
+            vec!["file.write", "file.rewrite"]
+        );
+    }
+
+    #[test]
+    fn local_bootstrap_target_allowed_tools_allow_edit_for_package_json() {
+        assert_eq!(
+            App::local_bootstrap_target_allowed_tool_names("space-invaders/package.json"),
+            vec!["file.edit", "file.write", "file.rewrite"]
+        );
     }
 
     #[test]
@@ -4837,9 +5133,26 @@ mod tests {
             .expect("native tool defs should be available");
         let names: Vec<_> = tools.iter().map(|tool| tool.name.as_str()).collect();
 
+        assert_eq!(names, vec!["file_rewrite", "file_write"]);
+    }
+
+    #[test]
+    fn bootstrap_lane_native_tools_for_package_json_allow_edit() {
+        let mut app = build_test_app();
+        app.provider.capabilities.native_tool_calling = true;
+        app.local_bootstrap_lock = Some(LocalBootstrapLock::new(
+            "space-invaders".to_string(),
+            vec!["space-invaders/package.json".to_string()],
+        ));
+
+        let tools = app
+            .build_native_tools()
+            .expect("native tool defs should be available");
+        let names: Vec<_> = tools.iter().map(|tool| tool.name.as_str()).collect();
+
         assert_eq!(
             names,
-            vec!["file_edit", "file_edit_anchor", "file_rewrite", "file_write"]
+            vec!["file_edit", "file_rewrite", "file_write"]
         );
     }
 

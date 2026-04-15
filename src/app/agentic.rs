@@ -150,6 +150,98 @@ impl TurnProgressFacts {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct IterationBudget {
+    max_generic: usize,
+    max_bootstrap_lane: usize,
+    generic_used: usize,
+    bootstrap_lane_used: usize,
+}
+
+impl IterationBudget {
+    fn new(max_generic: usize, max_bootstrap_lane: usize) -> Self {
+        Self {
+            max_generic,
+            max_bootstrap_lane,
+            generic_used: 0,
+            bootstrap_lane_used: 0,
+        }
+    }
+
+    fn should_continue(&self, bootstrap_lane_active: bool) -> bool {
+        if bootstrap_lane_active {
+            self.bootstrap_lane_used < self.max_bootstrap_lane
+        } else {
+            self.generic_used < self.max_generic
+        }
+    }
+
+    fn begin_iteration(&mut self, bootstrap_lane_active: bool) -> usize {
+        if bootstrap_lane_active {
+            self.bootstrap_lane_used = self.bootstrap_lane_used.saturating_add(1);
+            self.bootstrap_lane_used
+        } else {
+            self.generic_used = self.generic_used.saturating_add(1);
+            self.generic_used
+        }
+    }
+
+    fn remaining_for_active_lane(&self, bootstrap_lane_active: bool) -> usize {
+        if bootstrap_lane_active {
+            self.max_bootstrap_lane
+                .saturating_sub(self.bootstrap_lane_used)
+        } else {
+            self.max_generic.saturating_sub(self.generic_used)
+        }
+    }
+
+    fn max_for_active_lane(&self, bootstrap_lane_active: bool) -> usize {
+        if bootstrap_lane_active {
+            self.max_bootstrap_lane
+        } else {
+            self.max_generic
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::IterationBudget;
+
+    #[test]
+    fn iteration_budget_uses_separate_bootstrap_lane_allowance() {
+        let mut budget = IterationBudget::new(3, 5);
+
+        assert!(budget.should_continue(false));
+        assert_eq!(budget.begin_iteration(false), 1);
+        assert_eq!(budget.begin_iteration(false), 2);
+        assert_eq!(budget.begin_iteration(false), 3);
+        assert!(!budget.should_continue(false));
+
+        assert!(budget.should_continue(true));
+        assert_eq!(budget.begin_iteration(true), 1);
+        assert_eq!(budget.begin_iteration(true), 2);
+        assert_eq!(budget.begin_iteration(true), 3);
+        assert_eq!(budget.begin_iteration(true), 4);
+        assert_eq!(budget.begin_iteration(true), 5);
+        assert!(!budget.should_continue(true));
+    }
+
+    #[test]
+    fn iteration_budget_reports_remaining_for_active_lane() {
+        let mut budget = IterationBudget::new(4, 6);
+
+        assert_eq!(budget.remaining_for_active_lane(false), 4);
+        let _ = budget.begin_iteration(false);
+        assert_eq!(budget.remaining_for_active_lane(false), 3);
+
+        assert_eq!(budget.remaining_for_active_lane(true), 6);
+        let _ = budget.begin_iteration(true);
+        let _ = budget.begin_iteration(true);
+        assert_eq!(budget.remaining_for_active_lane(true), 4);
+    }
+}
+
 /// Turn summary information for structured logging (Issue #206).
 #[derive(Debug)]
 pub struct TurnSummary<'a> {
@@ -484,6 +576,13 @@ pub const PLAN_RESTATEMENT_RETRY_MESSAGE: &str = "You already output ANVIL_PLAN.
 /// prose / plan restatement before the first real mutation lands.
 const LOCAL_BOOTSTRAP_LOCK_RETRY_LOG: &str =
     "local bootstrap lock: suppressing post-scaffold drift with mutation-first retry";
+
+/// Additional iterations reserved for deterministic local bootstrap lanes.
+///
+/// The generic loop budget is still honored outside bootstrap lanes, but once
+/// runtime has entered a deterministic lane we allow extra follow-up turns so
+/// the target queue can advance without being cut off by the generic cap.
+const LOCAL_BOOTSTRAP_LANE_EXTRA_ITERATIONS: usize = 24;
 
 /// Maximum number of task-semantics gate retries (Issue #382).
 const MAX_TASK_SEMANTICS_GATE_RETRIES: u8 = 1;
@@ -1217,6 +1316,17 @@ impl App {
         turn_has_subagent: bool,
     ) -> Result<TerminationTransition, AppError> {
         if self.local_bootstrap_lane_active() {
+            let empty_lane_response = next_structured.raw_content.trim().is_empty()
+                && next_structured.final_response.as_str().trim().is_empty();
+            if empty_lane_response && self.local_postbootstrap_lane_active() {
+                if let Some(message) = self.advance_local_bootstrap_target_on_exhaustion() {
+                    tracing::warn!(
+                        "local bootstrap lock: empty no-tool response; advancing deterministic target lane"
+                    );
+                    self.inject_local_bootstrap_lock_retry(message);
+                    return Ok(TerminationTransition::Continue);
+                }
+            }
             if let Some(message) = self.consume_local_bootstrap_lock_retry() {
                 self.inject_local_bootstrap_lock_retry(message);
                 return Ok(TerminationTransition::Continue);
@@ -1500,6 +1610,10 @@ impl App {
         anvil_final_already: bool,
     ) -> Result<Vec<String>, AppError> {
         let max_iterations = self.config.runtime.max_agent_iterations;
+        let mut iteration_budget = IterationBudget::new(
+            max_iterations,
+            max_iterations.saturating_add(LOCAL_BOOTSTRAP_LANE_EXTRA_ITERATIONS),
+        );
         let mut current = structured;
         let mut frames = Vec::new();
         let mut total_tool_count = 0usize;
@@ -1629,7 +1743,9 @@ impl App {
             self.agent_telemetry.agentic_mode_plan_to_act_count += 1;
         }
 
-        for iteration in 0..max_iterations {
+        while iteration_budget.should_continue(self.local_bootstrap_lane_active()) {
+            let bootstrap_lane_active_for_iteration = self.local_bootstrap_lane_active();
+            let iteration = iteration_budget.begin_iteration(bootstrap_lane_active_for_iteration);
             let iteration_started = std::time::Instant::now();
 
             // (prev_forced_mode_active is snapshotted from the previous iteration)
@@ -1674,7 +1790,7 @@ impl App {
             let thinking = AppStateSnapshot::new(RuntimeState::Thinking)
                 .with_status(format!(
                     "Prepared execution plan (iteration {})",
-                    iteration + 1
+                    iteration
                 ))
                 .with_plan(inferred_plan, Some(0))
                 .with_reasoning_summary(vec![
@@ -2243,7 +2359,8 @@ impl App {
             }
 
             // Issue #285: staged stagnation recovery.
-            let remaining_turns = max_iterations.saturating_sub(iteration + 1);
+            let remaining_turns =
+                iteration_budget.remaining_for_active_lane(bootstrap_lane_active);
             let plan_repair_count_before_this_turn =
                 self.agent_telemetry.plan_repair_request_count as usize;
 
@@ -2649,7 +2766,7 @@ impl App {
 
             log_turn_summary(&TurnSummary {
                 turn: self.session_stats.total_turns,
-                max_turns: max_iterations as u32,
+                max_turns: iteration_budget.max_for_active_lane(bootstrap_lane_active) as u32,
                 elapsed: iteration_started.elapsed(),
                 tokens_used: used_tokens,
                 token_budget,
@@ -2835,12 +2952,13 @@ impl App {
         let mut failed_results = Vec::new();
 
         for (idx, call) in tool_calls.iter().enumerate() {
+            let call = self.canonicalize_local_mode_tool_call(call);
             let validated = match self.tools.validate(call.clone()) {
                 Ok(v) => v,
                 Err(err) => {
                     failed_results.push((
                         idx,
-                        build_failed_result(call, format!("validation failed: {err:?}")),
+                        build_failed_result(&call, format!("validation failed: {err:?}")),
                     ));
                     continue;
                 }
@@ -2868,7 +2986,7 @@ impl App {
             }
 
             // Offline policy check: block network tools before approval
-            if let Some(summary) = check_offline_blocked(&self.config, call) {
+            if let Some(summary) = check_offline_blocked(&self.config, &call) {
                 failed_results.push((
                     idx,
                     ToolExecutionResult {
@@ -2898,13 +3016,13 @@ impl App {
                     self.trust_all,
                     &self.trusted_tools,
                 ) {
-                    let summary = tool_call_approval_summary(call);
+                    let summary = tool_call_approval_summary(&call);
                     let _ = std::io::Write::write_fmt(
                         &mut std::io::stderr(),
                         format_args!("\n  [trusted] {summary}\n"),
                     );
                 } else {
-                    let summary = tool_call_approval_summary(call);
+                    let summary = tool_call_approval_summary(&call);
                     let diff_options =
                         crate::tooling::diff::DiffOptions::from_runtime(&self.config.runtime);
                     let diff_preview =
@@ -2912,7 +3030,7 @@ impl App {
                     let approved = prompt_inline_approval(&summary, diff_preview.as_deref());
                     if !approved {
                         failed_results
-                            .push((idx, build_failed_result(call, "denied by user".to_string())));
+                            .push((idx, build_failed_result(&call, "denied by user".to_string())));
                         continue;
                     }
                 }
@@ -2927,7 +3045,7 @@ impl App {
                 }) {
                 Ok(request) => requests.push((idx, request)),
                 Err(err) => {
-                    failed_results.push((idx, build_failed_result(call, format!("{err:?}"))));
+                    failed_results.push((idx, build_failed_result(&call, format!("{err:?}"))));
                 }
             }
         }
