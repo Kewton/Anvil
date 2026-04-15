@@ -5466,11 +5466,138 @@ fn local_bootstrap_lock_treats_scaffold_only_progress_as_incomplete_until_mutati
     assert!(
         task_semantics_retry.messages.iter().any(|msg| {
             msg.role == ProviderMessageRole::Tool
-                && msg
-                    .content
-                    .contains("The active task appears to require file modifications")
+                && msg.content.contains("TOOL FIRST")
+                && msg.content.contains("Do not explain.")
+                && msg.content.contains("Emit exactly one")
         }),
         "after local bootstrap retries are exhausted, scaffold-only progress should still be treated as incomplete"
+    );
+}
+
+#[test]
+fn local_mode_task_semantics_retry_is_tool_first() {
+    let root = common::unique_test_dir("local_mode_task_semantics_retry");
+    fs::create_dir_all(&root).expect("test root should be created");
+    let mut config = common::build_config_in(root.clone());
+    config.mode.approval_required = false;
+    config.runtime.provider = "ollama".to_string();
+    config.runtime.local_mode = true;
+    let provider_ctx =
+        anvil::provider::ProviderRuntimeContext::bootstrap(&config).expect("provider bootstrap");
+    let mut app = anvil::app::App::new(config, provider_ctx, Arc::new(AtomicBool::new(false)))
+        .expect("app should initialize");
+    let tui = Tui::new();
+
+    #[derive(Clone)]
+    struct LocalModeTaskRetryProvider {
+        seen_requests: Rc<RefCell<Vec<ProviderTurnRequest>>>,
+    }
+
+    impl ProviderClient for LocalModeTaskRetryProvider {
+        fn stream_turn(
+            &self,
+            request: &ProviderTurnRequest,
+            emit: &mut dyn FnMut(ProviderEvent),
+        ) -> Result<(), ProviderTurnError> {
+            let call_index = self.seen_requests.borrow().len();
+            self.seen_requests.borrow_mut().push(request.clone());
+
+            match call_index {
+                0 => emit(ProviderEvent::Agent(AgentEvent::Done {
+                    status: "Done. session saved".to_string(),
+                    assistant_message: "現在の状態を確認します。".to_string(),
+                    completion_summary: "turn 1".to_string(),
+                    saved_status: "session saved".to_string(),
+                    tool_logs: Vec::new(),
+                    elapsed_ms: 0,
+                    inference_performance: None,
+                    tool_calls: Some(vec![ToolCallRequest {
+                        tool_call_id: "call_file_read_root".to_string(),
+                        tool_name: "file.read".to_string(),
+                        input: ToolInput::FileRead {
+                            path: ".".to_string(),
+                        },
+                        extra_field_warnings: Vec::new(),
+                    }]),
+                    assistant_tool_call_records: Some(vec![AssistantToolCallRecord {
+                        id: "call_file_read_root".to_string(),
+                        function_name: "file_read".to_string(),
+                        arguments: "{\"path\":\".\"}".to_string(),
+                    }]),
+                })),
+                1 => emit(ProviderEvent::Agent(AgentEvent::Done {
+                    status: "Done. session saved".to_string(),
+                    assistant_message: "実装方針を整理しています。".to_string(),
+                    completion_summary: "turn 2".to_string(),
+                    saved_status: "session saved".to_string(),
+                    tool_logs: Vec::new(),
+                    elapsed_ms: 0,
+                    inference_performance: None,
+                    tool_calls: None,
+                    assistant_tool_call_records: None,
+                })),
+                2 => emit(ProviderEvent::Agent(AgentEvent::Done {
+                    status: "Done. session saved".to_string(),
+                    assistant_message: "書き込みます。".to_string(),
+                    completion_summary: "turn 3".to_string(),
+                    saved_status: "session saved".to_string(),
+                    tool_logs: Vec::new(),
+                    elapsed_ms: 0,
+                    inference_performance: None,
+                    tool_calls: Some(vec![ToolCallRequest {
+                        tool_call_id: "call_file_write_page".to_string(),
+                        tool_name: "file.write".to_string(),
+                        input: ToolInput::FileWrite {
+                            path: "README.md".to_string(),
+                            content: "# local mode\n".to_string(),
+                        },
+                        extra_field_warnings: Vec::new(),
+                    }]),
+                    assistant_tool_call_records: Some(vec![AssistantToolCallRecord {
+                        id: "call_file_write_page".to_string(),
+                        function_name: "file_write".to_string(),
+                        arguments: "{\"path\":\"README.md\",\"content\":\"# local mode\\n\"}"
+                            .to_string(),
+                    }]),
+                })),
+                _ => emit(ProviderEvent::Agent(AgentEvent::Done {
+                    status: "Done. session saved".to_string(),
+                    assistant_message: "完了しました。".to_string(),
+                    completion_summary: "turn 4".to_string(),
+                    saved_status: "session saved".to_string(),
+                    tool_logs: Vec::new(),
+                    elapsed_ms: 0,
+                    inference_performance: None,
+                    tool_calls: None,
+                    assistant_tool_call_records: None,
+                })),
+            }
+            Ok(())
+        }
+    }
+
+    let seen_requests = Rc::new(RefCell::new(Vec::new()));
+    let provider = LocalModeTaskRetryProvider {
+        seen_requests: seen_requests.clone(),
+    };
+
+    app.run_live_turn("create a README file", &provider, &tui)
+        .expect("local mode should retry with tool-first wording");
+
+    let requests = seen_requests.borrow();
+    assert!(
+        requests.len() >= 3,
+        "expected a retry request before mutation"
+    );
+    let retry_request = &requests[2];
+    assert!(
+        retry_request.messages.iter().any(|msg| {
+            msg.role == ProviderMessageRole::Tool
+                && msg.content.contains("TOOL FIRST")
+                && msg.content.contains("Do not explain.")
+                && msg.content.contains("Emit exactly one")
+        }),
+        "local-mode task-semantics retry should be short and tool-first"
     );
 }
 

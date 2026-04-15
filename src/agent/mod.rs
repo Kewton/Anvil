@@ -983,6 +983,62 @@ const PROMPT_WORK_APPROACH: &str = concat!(
     "\n",
 );
 
+const PROMPT_WORK_APPROACH_LOCAL_MODE: &str = concat!(
+    "You are Anvil, a local coding agent for serious terminal work.\n",
+    "\n",
+    "## Work approach\n",
+    "When given a task, follow this approach:\n",
+    "1. Start with minimal discovery: list directories (file.read on \".\") or search (file.search) before assuming files exist.\n",
+    "2. TOOL FIRST. Once you have enough context, call the next tool immediately instead of explaining your plan.\n",
+    "3. Execute iteratively: use tools to gather information, then act on what you learned. Do NOT guess file paths — discover them first.\n",
+    "4. If a tool call fails (e.g. file not found), adapt by calling the next useful tool rather than repeating meta-explanations.\n",
+    "5. Summarize only after real work has been completed or when the user explicitly asks for a plan/summary.\n",
+    "\n",
+    "## Tool protocol\n",
+    "When a task requires file operations, respond using fenced blocks.\n",
+    "\n",
+    "Available tools:\n",
+    "\n",
+);
+
+const PROMPT_NATIVE_WORK_APPROACH: &str = concat!(
+    "You are Anvil, a local coding agent for serious terminal work.\n\
+     \n\
+     ## Work approach\n\
+     When given a task, follow this approach:\n\
+     1. Start by understanding the current state: list directories (file_read on \".\") or search (file_search) before assuming files exist.\n\
+     2. Plan your work: break complex tasks into steps. State your plan before executing.\n\
+     3. Execute iteratively: use tools to gather information, then act on what you learned. Do NOT guess file paths — discover them first.\n\
+     4. If a tool call fails (e.g. file not found), adapt your plan based on the error rather than stopping.\n\
+     5. Summarize what you accomplished and what remains.\n\
+     \n\
+     ## Tool protocol\n\
+     Tools are available via native function calling. Call them directly.\n\n",
+);
+
+const PROMPT_NATIVE_WORK_APPROACH_LOCAL_MODE: &str = concat!(
+    "You are Anvil, a local coding agent for serious terminal work.\n\
+     \n\
+     ## Work approach\n\
+     When given a task, follow this approach:\n\
+     1. Start with minimal discovery: list directories (file_read on \".\") or search (file_search) before assuming files exist.\n\
+     2. TOOL FIRST. Once you have enough context, call the next tool immediately instead of explaining your plan.\n\
+     3. Execute iteratively: use tools to gather information, then act on what you learned. Do NOT guess file paths — discover them first.\n\
+     4. If a tool call fails (e.g. file not found), adapt by calling the next useful tool rather than repeating meta-explanations.\n\
+     5. Summarize only after real work has been completed or when the user explicitly asks for a plan/summary.\n\
+     \n\
+     ## Tool protocol\n\
+     Tools are available via native function calling. Call them directly.\n\n",
+);
+
+fn prompt_work_approach(local_mode: bool) -> &'static str {
+    if local_mode {
+        PROMPT_WORK_APPROACH_LOCAL_MODE
+    } else {
+        PROMPT_WORK_APPROACH
+    }
+}
+
 const PROMPT_OPTIONAL_CATALOG_HEADER: &str =
     "\nAdditional tools (use ANVIL_TOOL block format shown above):\n";
 
@@ -1186,7 +1242,7 @@ fn build_json_protocol_prompt(
     let mut prompt = String::with_capacity(8192);
 
     // Work approach (static)
-    prompt.push_str(PROMPT_WORK_APPROACH);
+    prompt.push_str(prompt_work_approach(local_mode));
 
     // Basic tools (always included)
     prompt.push_str(TOOL_DESC_FILE_READ);
@@ -1252,7 +1308,7 @@ fn build_tag_protocol_prompt(
 
     let mut prompt = String::with_capacity(8192);
 
-    prompt.push_str(PROMPT_WORK_APPROACH);
+    prompt.push_str(prompt_work_approach(local_mode));
 
     // Generate tag-based tool descriptions from TOOL_TAG_SPECS
     for (i, spec) in TOOL_TAG_SPECS.iter().enumerate() {
@@ -1290,20 +1346,11 @@ pub(crate) fn build_native_tool_calling_prompt(
 ) -> String {
     let mut prompt = String::with_capacity(4096);
 
-    prompt.push_str(
-        "You are Anvil, a local coding agent for serious terminal work.\n\
-         \n\
-         ## Work approach\n\
-         When given a task, follow this approach:\n\
-         1. Start by understanding the current state: list directories (file_read on \".\") or search (file_search) before assuming files exist.\n\
-         2. Plan your work: break complex tasks into steps. State your plan before executing.\n\
-         3. Execute iteratively: use tools to gather information, then act on what you learned. Do NOT guess file paths — discover them first.\n\
-         4. If a tool call fails (e.g. file not found), adapt your plan based on the error rather than stopping.\n\
-         5. Summarize what you accomplished and what remains.\n\
-         \n\
-         ## Tool protocol\n\
-         Tools are available via native function calling. Call them directly.\n\n",
-    );
+    prompt.push_str(if local_mode {
+        PROMPT_NATIVE_WORK_APPROACH_LOCAL_MODE
+    } else {
+        PROMPT_NATIVE_WORK_APPROACH
+    });
 
     // Keep ANVIL_PLAN / ANVIL_FINAL rules (these are text-block based, not tool calls)
     prompt.push_str(if local_mode {
@@ -1370,7 +1417,7 @@ fn tool_protocol_system_prompt_compact(
     let mut prompt = String::with_capacity(4096);
 
     // Work approach (static)
-    prompt.push_str(PROMPT_WORK_APPROACH);
+    prompt.push_str(prompt_work_approach(local_mode));
 
     // All basic tools
     prompt.push_str(TOOL_DESC_FILE_READ);
@@ -1782,6 +1829,23 @@ mod tests {
         assert!(
             prompt.contains("Do NOT output ANVIL_PLAN, ANVIL_PLAN_UPDATE, or ANVIL_FINAL"),
             "local mode prompt should disable plan/final forcing"
+        );
+        assert!(
+            !prompt.contains("State your plan before executing."),
+            "local mode prompt should not retain the generic plan-first work approach"
+        );
+    }
+
+    #[test]
+    fn local_mode_native_prompt_uses_tool_first_work_approach() {
+        let prompt = build_native_tool_calling_prompt(&[], None, true);
+        assert!(
+            prompt.contains("TOOL FIRST"),
+            "local mode native prompt should emphasize tool-first execution"
+        );
+        assert!(
+            !prompt.contains("State your plan before executing."),
+            "local mode native prompt should not include the generic plan-first instruction"
         );
     }
 

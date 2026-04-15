@@ -498,6 +498,8 @@ const TASK_SEMANTICS_GATE_MESSAGE: &str = "The active task appears to require fi
      but no changes have been made yet. \
      Please proceed with the implementation using file.write or file.edit.";
 
+const TASK_SEMANTICS_GATE_MESSAGE_LOCAL_MODE: &str = "TOOL FIRST. The active task still requires file changes. Do not explain. Emit exactly one file.write, file.edit, file.edit_anchor, or file.rewrite tool call now.";
+
 /// Task-semantics gate: detect implementation-required tasks (Issue #382).
 ///
 /// Wraps `task_likely_requires_file_changes` with read-only intent exclusions.
@@ -1109,12 +1111,13 @@ impl App {
     /// Inject a task-semantics gate retry message (Issue #382).
     fn inject_task_semantics_gate_retry(&mut self) {
         tracing::warn!("task-semantics gate: implementation task with no file changes, retrying");
-        let retry_msg = SessionMessage::new(
-            MessageRole::Tool,
-            "system",
-            TASK_SEMANTICS_GATE_MESSAGE.to_string(),
-        )
-        .with_id(self.next_message_id("tool"));
+        let retry_message = if self.local_mode_active() {
+            TASK_SEMANTICS_GATE_MESSAGE_LOCAL_MODE
+        } else {
+            TASK_SEMANTICS_GATE_MESSAGE
+        };
+        let retry_msg = SessionMessage::new(MessageRole::Tool, "system", retry_message.to_string())
+            .with_id(self.next_message_id("tool"));
         self.session.push_message(retry_msg);
         self.agent_telemetry
             .retry
