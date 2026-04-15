@@ -1032,6 +1032,21 @@ const PROMPT_TOOL_RULES: &str = concat!(
     "- GitHub stats endpoints (contributors, commit_activity) may return {} on first request. If you get an empty response, wait 3 seconds with shell.exec sleep 3 and retry the same API call.",
 );
 
+const PROMPT_TOOL_RULES_LOCAL_MODE: &str = concat!(
+    "## Local mode\n",
+    "You are operating in local mode for a local LLM.\n",
+    "TOOL FIRST. Once you have enough context, call the next tool immediately with no extra explanation.\n",
+    "Do NOT require ANVIL_PLAN before file changes.\n",
+    "Do NOT output ANVIL_PLAN, ANVIL_PLAN_UPDATE, or ANVIL_FINAL unless the user explicitly asks for them.\n",
+    "For implementation tasks, prefer direct file.write/file.edit/file.edit_anchor/file.rewrite after minimal discovery.\n",
+    "Avoid repeating plans or meta-explanations. Continue implementing with tools.\n",
+    "All paths must be relative (start with ./ or a directory name).\n",
+    "When the user's request requires file changes, complete the actual file modifications using file.write/file.edit rather than descriptions.\n",
+    "Start exploration with file.read on \".\" or a minimal shell/file inspection before reading specific files.\n",
+    "For dev servers and watch processes (npm run dev, cargo watch, etc.), use background execution with '&' so the command returns immediately.\n",
+    "- shell.exec output is streamed to the terminal in real-time. The user can press Ctrl+C to cancel.\n",
+);
+
 /// Guidance for LLMs on confirm-class tool behavior.
 ///
 /// Prevents models from asking for permission in natural language
@@ -1109,17 +1124,27 @@ pub(crate) fn tool_protocol_system_prompt(
     used_tools: &std::collections::HashSet<String>,
     offline: bool,
     tier: PromptTier,
+    local_mode: bool,
 ) -> String {
     match tier {
         PromptTier::Full => {
             // Full tier delegates to the protocol-aware builder (Json format).
             // TagBased protocol dispatch happens via tool_protocol_system_prompt_with_mode.
-            build_json_protocol_prompt(languages, mcp_tool_descriptions, used_tools, offline)
+            build_json_protocol_prompt(
+                languages,
+                mcp_tool_descriptions,
+                used_tools,
+                offline,
+                local_mode,
+            )
         }
-        PromptTier::Compact => {
-            tool_protocol_system_prompt_compact(mcp_tool_descriptions, used_tools, offline)
-        }
-        PromptTier::Tiny => tool_protocol_system_prompt_tiny(),
+        PromptTier::Compact => tool_protocol_system_prompt_compact(
+            mcp_tool_descriptions,
+            used_tools,
+            offline,
+            local_mode,
+        ),
+        PromptTier::Tiny => tool_protocol_system_prompt_tiny(local_mode),
     }
 }
 
@@ -1130,14 +1155,23 @@ pub(crate) fn tool_protocol_system_prompt_with_mode(
     used_tools: &std::collections::HashSet<String>,
     offline: bool,
     protocol: ToolProtocolMode,
+    local_mode: bool,
 ) -> String {
     match protocol {
-        ToolProtocolMode::Json => {
-            build_json_protocol_prompt(languages, mcp_tool_descriptions, used_tools, offline)
-        }
-        ToolProtocolMode::TagBased => {
-            build_tag_protocol_prompt(languages, mcp_tool_descriptions, used_tools, offline)
-        }
+        ToolProtocolMode::Json => build_json_protocol_prompt(
+            languages,
+            mcp_tool_descriptions,
+            used_tools,
+            offline,
+            local_mode,
+        ),
+        ToolProtocolMode::TagBased => build_tag_protocol_prompt(
+            languages,
+            mcp_tool_descriptions,
+            used_tools,
+            offline,
+            local_mode,
+        ),
     }
 }
 
@@ -1147,6 +1181,7 @@ fn build_json_protocol_prompt(
     mcp_tool_descriptions: Option<&str>,
     used_tools: &std::collections::HashSet<String>,
     offline: bool,
+    local_mode: bool,
 ) -> String {
     let mut prompt = String::with_capacity(8192);
 
@@ -1191,7 +1226,11 @@ fn build_json_protocol_prompt(
     }
 
     // Tool rules and GitHub Insights (static)
-    prompt.push_str(PROMPT_TOOL_RULES);
+    prompt.push_str(if local_mode {
+        PROMPT_TOOL_RULES_LOCAL_MODE
+    } else {
+        PROMPT_TOOL_RULES
+    });
 
     // Confirm-class tool approval guidance (static)
     prompt.push_str(PROMPT_CONFIRM_CLASS_GUIDANCE);
@@ -1207,6 +1246,7 @@ fn build_tag_protocol_prompt(
     mcp_tool_descriptions: Option<&str>,
     _used_tools: &std::collections::HashSet<String>,
     _offline: bool,
+    local_mode: bool,
 ) -> String {
     use crate::agent::tag_spec::TOOL_TAG_SPECS;
 
@@ -1225,7 +1265,11 @@ fn build_tag_protocol_prompt(
     }
 
     // Tool rules (same as JSON but with tag format note)
-    prompt.push_str(PROMPT_TOOL_RULES);
+    prompt.push_str(if local_mode {
+        PROMPT_TOOL_RULES_LOCAL_MODE
+    } else {
+        PROMPT_TOOL_RULES
+    });
     prompt.push_str(PROMPT_CONFIRM_CLASS_GUIDANCE);
 
     append_common_prompt_sections(&mut prompt, languages, mcp_tool_descriptions);
@@ -1242,6 +1286,7 @@ fn build_tag_protocol_prompt(
 pub(crate) fn build_native_tool_calling_prompt(
     languages: &[ProjectLanguage],
     mcp_tool_descriptions: Option<&str>,
+    local_mode: bool,
 ) -> String {
     let mut prompt = String::with_capacity(4096);
 
@@ -1261,7 +1306,11 @@ pub(crate) fn build_native_tool_calling_prompt(
     );
 
     // Keep ANVIL_PLAN / ANVIL_FINAL rules (these are text-block based, not tool calls)
-    prompt.push_str(PROMPT_TOOL_RULES);
+    prompt.push_str(if local_mode {
+        PROMPT_TOOL_RULES_LOCAL_MODE
+    } else {
+        PROMPT_TOOL_RULES
+    });
 
     // Tool approval guidance (protocol-agnostic version)
     prompt.push_str(
@@ -1316,6 +1365,7 @@ fn tool_protocol_system_prompt_compact(
     mcp_tool_descriptions: Option<&str>,
     used_tools: &std::collections::HashSet<String>,
     offline: bool,
+    local_mode: bool,
 ) -> String {
     let mut prompt = String::with_capacity(4096);
 
@@ -1343,7 +1393,11 @@ fn tool_protocol_system_prompt_compact(
     }
 
     // Tool rules (static)
-    prompt.push_str(PROMPT_TOOL_RULES);
+    prompt.push_str(if local_mode {
+        PROMPT_TOOL_RULES_LOCAL_MODE
+    } else {
+        PROMPT_TOOL_RULES
+    });
 
     // MCP tool descriptions (with reduced limit)
     if let Some(mcp_desc) = mcp_tool_descriptions {
@@ -1362,7 +1416,7 @@ fn tool_protocol_system_prompt_compact(
 }
 
 /// Tiny tier: minimal tool syntax for very small models (<7B).
-fn tool_protocol_system_prompt_tiny() -> String {
+fn tool_protocol_system_prompt_tiny(local_mode: bool) -> String {
     let mut prompt = String::with_capacity(2048);
 
     prompt.push_str("You are Anvil, a coding agent.\n\n");
@@ -1376,13 +1430,22 @@ fn tool_protocol_system_prompt_tiny() -> String {
     prompt.push_str(TOOL_DESC_SHELL_EXEC);
 
     prompt.push_str("Rules:\n");
-    prompt.push_str("- ");
-    prompt.push_str(ANVIL_PLAN_ONCE_RULE);
-    prompt.push('\n');
-    prompt.push_str(concat!(
-        "- All paths must be relative.\n",
-        "- Include ANVIL_FINAL block after tool blocks.\n",
-    ));
+    if local_mode {
+        prompt.push_str(concat!(
+            "- TOOL FIRST.\n",
+            "- Do not require ANVIL_PLAN before writes.\n",
+            "- Do not require ANVIL_FINAL.\n",
+            "- All paths must be relative.\n",
+        ));
+    } else {
+        prompt.push_str("- ");
+        prompt.push_str(ANVIL_PLAN_ONCE_RULE);
+        prompt.push('\n');
+        prompt.push_str(concat!(
+            "- All paths must be relative.\n",
+            "- Include ANVIL_FINAL block after tool blocks.\n",
+        ));
+    }
 
     prompt
 }
@@ -1402,6 +1465,7 @@ pub fn tool_protocol_system_prompt_basic_only(
         &empty,
         false,
         PromptTier::Full,
+        false,
     )
 }
 
@@ -1420,6 +1484,7 @@ pub fn tool_protocol_system_prompt_all_tools(
         &all_tools,
         false,
         PromptTier::Full,
+        false,
     )
 }
 
@@ -1435,6 +1500,7 @@ pub fn tool_protocol_system_prompt_tag_based(
         &empty,
         false,
         ToolProtocolMode::TagBased,
+        false,
     )
 }
 
@@ -1663,7 +1729,7 @@ mod tests {
     #[test]
     fn catalog_hides_web_tools_offline() {
         let prompt =
-            tool_protocol_system_prompt(&[], None, &HashSet::new(), true, PromptTier::Full);
+            tool_protocol_system_prompt(&[], None, &HashSet::new(), true, PromptTier::Full, false);
         assert!(
             !prompt.contains("- web.fetch:"),
             "offline prompt should not contain web.fetch catalog entry"
@@ -1686,7 +1752,8 @@ mod tests {
     fn catalog_offline_with_restored_session() {
         let mut used_tools = HashSet::new();
         used_tools.insert("web.fetch".to_string());
-        let prompt = tool_protocol_system_prompt(&[], None, &used_tools, true, PromptTier::Full);
+        let prompt =
+            tool_protocol_system_prompt(&[], None, &used_tools, true, PromptTier::Full, false);
         // web.fetch is now a basic tool (always included per Issue #114),
         // so the catalog entry should not exist but the basic description should.
         assert!(
@@ -1697,6 +1764,24 @@ mod tests {
         assert!(
             prompt.contains("6. web.fetch"),
             "web.fetch should be present as a basic tool even in offline mode"
+        );
+    }
+
+    #[test]
+    fn local_mode_prompt_omits_plan_and_final_requirements() {
+        let prompt =
+            tool_protocol_system_prompt(&[], None, &HashSet::new(), false, PromptTier::Full, true);
+        assert!(
+            prompt.contains("TOOL FIRST"),
+            "local mode prompt should emphasize tool-first execution"
+        );
+        assert!(
+            prompt.contains("Do NOT require ANVIL_PLAN before file changes"),
+            "local mode prompt should remove plan prerequisite"
+        );
+        assert!(
+            prompt.contains("Do NOT output ANVIL_PLAN, ANVIL_PLAN_UPDATE, or ANVIL_FINAL"),
+            "local mode prompt should disable plan/final forcing"
         );
     }
 

@@ -44,6 +44,18 @@ fn effective_config_derives_workspace_and_session_paths() {
     assert!(config.paths.logs_dir.ends_with("logs"));
     assert!(config.mode.log_filter.is_none());
     assert!(!config.mode.offline);
+    assert!(config.runtime.local_mode);
+}
+
+#[test]
+fn local_mode_env_override_is_applied() {
+    let mut config = EffectiveConfig::default_for_test().expect("config should load");
+    let mut env = HashMap::new();
+    env.insert("ANVIL_LOCAL_MODE".to_string(), "false".to_string());
+    config
+        .apply_overrides_for_test(&HashMap::new(), &env, &HashMap::new())
+        .expect("env override should apply");
+    assert!(!config.runtime.local_mode);
 }
 
 #[test]

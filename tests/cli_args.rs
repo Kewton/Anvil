@@ -119,6 +119,17 @@ fn cli_args_parse_bool_flags() {
 }
 
 #[test]
+fn cli_args_parse_local_mode_flags() {
+    let mut args = CliArgs::try_parse_from(["anvil", "--no-local-mode"]).unwrap();
+    args.resolve_tag_protocol();
+    assert_eq!(args.local_mode, Some(false));
+
+    let mut args = CliArgs::try_parse_from(["anvil", "--local-mode"]).unwrap();
+    args.resolve_tag_protocol();
+    assert_eq!(args.local_mode, Some(true));
+}
+
+#[test]
 fn cli_args_parse_offline_flag() {
     let args = CliArgs::try_parse_from(["anvil", "--offline"]).unwrap();
     assert!(args.offline);
@@ -264,6 +275,20 @@ fn apply_cli_args_bool_flag_inversion() {
         config.mode.fresh_session,
         "fresh_session should set fresh_session=true"
     );
+}
+
+#[test]
+fn apply_cli_args_local_mode_override() {
+    let mut config = EffectiveConfig::default_for_test().unwrap();
+    assert!(config.runtime.local_mode);
+
+    let args = CliArgs {
+        local_mode: Some(false),
+        ..CliArgs::default()
+    };
+
+    config.apply_cli_args(&args).unwrap();
+    assert!(!config.runtime.local_mode);
 }
 
 #[test]

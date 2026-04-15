@@ -480,6 +480,11 @@ pub const PLAN_RESTATEMENT_RETRY_MESSAGE: &str = "You already output ANVIL_PLAN.
      Your next output MUST be a file.write, file.edit, file.edit_anchor, or file.rewrite ANVIL_TOOL block. \
      Start implementing now.";
 
+/// Message sent when the local post-bootstrap lock detects drift back into
+/// prose / plan restatement before the first real mutation lands.
+const LOCAL_BOOTSTRAP_LOCK_RETRY_LOG: &str =
+    "local bootstrap lock: suppressing post-scaffold drift with mutation-first retry";
+
 /// Maximum number of task-semantics gate retries (Issue #382).
 const MAX_TASK_SEMANTICS_GATE_RETRIES: u8 = 1;
 
@@ -1021,6 +1026,13 @@ impl App {
         self.session.push_message(retry_msg);
     }
 
+    fn inject_local_bootstrap_lock_retry(&mut self, message: String) {
+        tracing::warn!("{LOCAL_BOOTSTRAP_LOCK_RETRY_LOG}");
+        let retry_msg = SessionMessage::new(MessageRole::Tool, "system", message)
+            .with_id(self.next_message_id("tool"));
+        self.session.push_message(retry_msg);
+    }
+
     /// Common condition check for task-semantics gate (Done path / Branch 5, Issue #382).
     fn should_fire_task_semantics_gate_common(&self) -> bool {
         if !self.config.runtime.task_semantics_gate_enabled {
@@ -1119,6 +1131,11 @@ impl App {
         results: &[ToolExecutionResult],
         term_state: &mut TerminationLoopState,
     ) -> TerminationTransition {
+        if self.local_mode_active() {
+            tracing::info!("local mode: accepting ANVIL_FINAL without plan/final gate");
+            self.phase_estimator.accept_anvil_final();
+            return TerminationTransition::Break(EndOfTurnOutcome::PostToolAnvilFinalAccepted);
+        }
         // Issue #249/#285: Plan-aware ANVIL_FINAL gate — suppress if plan is incomplete.
         // A2 fix: only require plan when session has no file changes AND
         // the current batch contains no successful mutation.
@@ -1184,12 +1201,15 @@ impl App {
         let session_has_mutation_attempts = MUTATION_TOOL_NAMES
             .iter()
             .any(|t| self.session_stats.tool_calls.contains_key(*t));
-        let require_plan_here = ((session_has_mutation_attempts
-            && self.session_stats.files_modified.is_empty())
-            || self.should_require_plan_for_implementation_task(
-                term_state.noplan_suppression_count(),
-            ))
-            && term_state.noplan_suppression_count() == 0;
+        let require_plan_here = if self.local_mode_active() {
+            false
+        } else {
+            ((session_has_mutation_attempts && self.session_stats.files_modified.is_empty())
+                || self.should_require_plan_for_implementation_task(
+                    term_state.noplan_suppression_count(),
+                ))
+                && term_state.noplan_suppression_count() == 0
+        };
 
         // CB-001 fix: check_plan_final_gate_with_require has side effects
         // (record_final_request, record_premature_final, session message injection).
@@ -1200,8 +1220,11 @@ impl App {
                 && touched_files_empty
                 && term_state.final_guard_retries() < MAX_FINAL_GUARD_RETRIES)
             || (is_fallback_complete && !plan_has_incomplete_items);
-        let plan_gate_fires =
-            !branches_123_fire && self.check_plan_final_gate_with_require(require_plan_here);
+        let plan_gate_fires = if self.local_mode_active() {
+            false
+        } else {
+            !branches_123_fire && self.check_plan_final_gate_with_require(require_plan_here)
+        };
 
         // Branch 5 pre-computation: task-semantics gate (Issue #382).
         let task_semantics_fires = self.should_fire_task_semantics_gate_branch5(
@@ -1349,6 +1372,11 @@ impl App {
             BasicAgentLoop::is_complete_structured_response_lenient(assistant_message);
         let touched_files_empty = self.session.working_memory.touched_files.is_empty();
 
+        if self.local_mode_active() && anvil_final_detected {
+            self.phase_estimator.accept_anvil_final();
+            return TerminationTransition::Break(EndOfTurnOutcome::FinalAnswer);
+        }
+
         if anvil_final_detected && touched_files_empty {
             // ANVIL_FINAL detected → record observation (Issue #159)
             self.phase_estimator.observe_anvil_final();
@@ -1457,44 +1485,48 @@ impl App {
         // strict closure gate disabled (a new turn always begins in Plan /
         // Act mode; the Repair(PreExit) variant is entered mid-turn by the
         // pre-exit repair heuristic).
-        match self.try_register_plan(&current.raw_content, false) {
-            crate::app::execution_plan::PlanRegistrationResult::Registered => {
-                // Issue #391: count the initial ANVIL_PLAN toward the
-                // turn-local stall tracker.
-                plan_stall_tracker.record_plan_block();
-                let target_files: Vec<String> = self
-                    .execution_plan
-                    .items
-                    .iter()
-                    .flat_map(|i| i.target_files.iter().cloned())
-                    .collect();
-                self.stagnation_state =
-                    crate::app::stagnation_state::StagnationState::init_from_plan(&target_files);
+        if !self.local_mode_active() {
+            match self.try_register_plan(&current.raw_content, false) {
+                crate::app::execution_plan::PlanRegistrationResult::Registered => {
+                    // Issue #391: count the initial ANVIL_PLAN toward the
+                    // turn-local stall tracker.
+                    plan_stall_tracker.record_plan_block();
+                    let target_files: Vec<String> = self
+                        .execution_plan
+                        .items
+                        .iter()
+                        .flat_map(|i| i.target_files.iter().cloned())
+                        .collect();
+                    self.stagnation_state =
+                        crate::app::stagnation_state::StagnationState::init_from_plan(
+                            &target_files,
+                        );
+                }
+                crate::app::execution_plan::PlanRegistrationResult::Replan => {
+                    // Issue #391: count this block — it is an ANVIL_PLAN emission
+                    // within the current turn even if it arrived as a replan.
+                    plan_stall_tracker.record_plan_block();
+                    // Replan after reset_execution_plan() should not happen here,
+                    // but handle for completeness: merge new targets.
+                    let existing = &self.stagnation_state.starved_target_files;
+                    let new_targets: Vec<String> = self
+                        .execution_plan
+                        .items
+                        .iter()
+                        .filter(|i| !i.is_finished())
+                        .flat_map(|i| i.target_files.iter().cloned())
+                        .filter(|tf| {
+                            !existing
+                                .iter()
+                                .any(|sf| crate::contracts::ExecutionPlan::path_matches(sf, tf))
+                        })
+                        .collect();
+                    self.stagnation_state
+                        .starved_target_files
+                        .extend(new_targets);
+                }
+                crate::app::execution_plan::PlanRegistrationResult::NoBlock => {}
             }
-            crate::app::execution_plan::PlanRegistrationResult::Replan => {
-                // Issue #391: count this block — it is an ANVIL_PLAN emission
-                // within the current turn even if it arrived as a replan.
-                plan_stall_tracker.record_plan_block();
-                // Replan after reset_execution_plan() should not happen here,
-                // but handle for completeness: merge new targets.
-                let existing = &self.stagnation_state.starved_target_files;
-                let new_targets: Vec<String> = self
-                    .execution_plan
-                    .items
-                    .iter()
-                    .filter(|i| !i.is_finished())
-                    .flat_map(|i| i.target_files.iter().cloned())
-                    .filter(|tf| {
-                        !existing
-                            .iter()
-                            .any(|sf| crate::contracts::ExecutionPlan::path_matches(sf, tf))
-                    })
-                    .collect();
-                self.stagnation_state
-                    .starved_target_files
-                    .extend(new_targets);
-            }
-            crate::app::execution_plan::PlanRegistrationResult::NoBlock => {}
         }
 
         // Session note extraction bookkeeping (Issue #241)
@@ -1517,13 +1549,20 @@ impl App {
 
         // Issue #380: explicit agentic mode tracked across iterations.
         // Start in Plan; transitions to Act when ANVIL_PLAN parses successfully.
-        let mut current_mode = AgenticMode::Plan;
+        let mut current_mode = if self.local_mode_active() {
+            AgenticMode::Act
+        } else {
+            AgenticMode::Plan
+        };
         let mut mode_turn_counts = ModeTurnCounts::default();
 
         // Issue #380: if an initial ANVIL_PLAN block was already parsed above
         // (try_register_plan → Registered / Replan), we are already in Act at
         // the start of iteration 0.
-        if !self.execution_plan.is_empty() && matches!(current_mode, AgenticMode::Plan) {
+        if !self.local_mode_active()
+            && !self.execution_plan.is_empty()
+            && matches!(current_mode, AgenticMode::Plan)
+        {
             current_mode = AgenticMode::Act;
             self.agent_telemetry.agentic_mode_plan_to_act_count += 1;
         }
@@ -1616,6 +1655,7 @@ impl App {
             // Update plan item status from tool results; capture telemetry.
             let (mut turn_mutations, turn_items_advanced) = self.update_plan_from_results(&results);
             let turn_progress = TurnProgressFacts::from_results(&results, turn_items_advanced);
+            self.update_local_bootstrap_lock(&results);
             if turn_progress.mutation_observed && turn_mutations == 0 {
                 turn_mutations = 1;
             }
@@ -1772,7 +1812,12 @@ impl App {
 
             // Issue #249: Inject plan turn guidance before follow-up LLM call.
             // Returns the guidance char count for telemetry (Issue #269 Phase 0).
-            let guidance_chars_this_turn = self.inject_plan_turn_guidance().unwrap_or(0);
+            let guidance_chars_this_turn =
+                if self.local_mode_active() || self.local_bootstrap_lock.is_some() {
+                    0
+                } else {
+                    self.inject_plan_turn_guidance().unwrap_or(0)
+                };
 
             // Send tool results back to LLM for the next turn
             let spinner = Spinner::start(
@@ -2117,6 +2162,24 @@ impl App {
                 self.agent_telemetry.record_forced_workset_transition();
             }
 
+            let suppress_locked_plan_registration =
+                self.should_suppress_followup_plan_while_locked(&next_token_buffer);
+            let suppress_local_mode_plan_registration = self.local_mode_active()
+                && self.local_bootstrap_lock_has_followup_plan(&next_token_buffer);
+
+            if self.should_apply_local_bootstrap_lock_retry(&next_structured) {
+                if let Some(message) = self.consume_local_bootstrap_lock_retry() {
+                    if suppress_locked_plan_registration {
+                        tracing::warn!(
+                            "local bootstrap lock: ignoring follow-up ANVIL_PLAN during post-scaffold stabilization"
+                        );
+                    }
+                    self.inject_local_bootstrap_lock_retry(message);
+                    current = next_structured;
+                    continue;
+                }
+            }
+
             // Issue #323: Process ANVIL_PLAN / ANVIL_PLAN_UPDATE / ANVIL_FINAL from
             // the current response BEFORE evaluating escape hatch. Without this,
             // a late zero-tool-call response containing a corrective ANVIL_PLAN_UPDATE
@@ -2129,67 +2192,49 @@ impl App {
             // Issue #380: derive the strict closure gate from AgenticMode.
             let strict_closure_gate =
                 matches!(current_mode, AgenticMode::Repair(RepairReason::PreExit));
-            match self.try_register_plan(&next_token_buffer, strict_closure_gate) {
-                crate::app::execution_plan::PlanRegistrationResult::Registered => {
-                    // Issue #391: count subsequent ANVIL_PLAN emissions in
-                    // the same turn for stall detection.
-                    plan_stall_tracker.record_plan_block();
-                    // Issue #349: a newly registered plan is a fresh course
-                    // of action — clear any accumulated closure-loop state.
-                    self.closure_loop_detector.reset();
-                    // Issue #351: same rationale for the post-failure thrash
-                    // counter — a freshly registered plan is real progress,
-                    // regardless of prior worker failures.
-                    self.post_failure_thrash_detector.reset();
-                    let target_files: Vec<String> = self
-                        .execution_plan
-                        .items
-                        .iter()
-                        .flat_map(|i| i.target_files.iter().cloned())
-                        .collect();
-                    self.stagnation_state =
-                        crate::app::stagnation_state::StagnationState::init_from_plan(
-                            &target_files,
-                        );
-                }
-                crate::app::execution_plan::PlanRegistrationResult::Replan => {
-                    // Issue #391: record every ANVIL_PLAN block until the
-                    // first mutation tool lands — `record_plan_block` itself
-                    // guards against counting post-mutation replans.
-                    plan_stall_tracker.record_plan_block();
-                    // Issue #349: replan is also a change of course.
-                    self.closure_loop_detector.reset();
-                    // Issue #351: replan clears the thrash counter too.
-                    self.post_failure_thrash_detector.reset();
-                    // Issue #292: clear proactive delegation retry budget on replan.
-                    self.stagnation_state
-                        .proactive_delegation_retry_budget
-                        .clear();
-                    // Replan: stagnation_state を差分マージ (Issue #305)
-                    let existing = &self.stagnation_state.starved_target_files;
-                    let new_targets: Vec<String> = self
-                        .execution_plan
-                        .items
-                        .iter()
-                        .filter(|i| !i.is_finished())
-                        .flat_map(|i| i.target_files.iter().cloned())
-                        .filter(|tf| {
-                            !existing
-                                .iter()
-                                .any(|sf| crate::contracts::ExecutionPlan::path_matches(sf, tf))
-                        })
-                        .collect();
-                    self.stagnation_state
-                        .starved_target_files
-                        .extend(new_targets);
-                }
-                crate::app::execution_plan::PlanRegistrationResult::NoBlock => {
-                    // ANVIL_PLAN なし → ANVIL_PLAN_UPDATE を通常処理
-                    // DR2-005: Replan 時はスキップして二重処理を防ぐ
-                    // Issue #287: merge new target_files into starved_target_files on plan update
-                    if self.try_update_plan(&next_token_buffer, strict_closure_gate) {
+            if suppress_locked_plan_registration || suppress_local_mode_plan_registration {
+                tracing::warn!(
+                    "suppressing ANVIL_PLAN/ANVIL_PLAN_UPDATE registration for local-mode follow-up"
+                );
+            } else {
+                match self.try_register_plan(&next_token_buffer, strict_closure_gate) {
+                    crate::app::execution_plan::PlanRegistrationResult::Registered => {
+                        // Issue #391: count subsequent ANVIL_PLAN emissions in
+                        // the same turn for stall detection.
+                        plan_stall_tracker.record_plan_block();
+                        // Issue #349: a newly registered plan is a fresh course
+                        // of action — clear any accumulated closure-loop state.
+                        self.closure_loop_detector.reset();
+                        // Issue #351: same rationale for the post-failure thrash
+                        // counter — a freshly registered plan is real progress,
+                        // regardless of prior worker failures.
+                        self.post_failure_thrash_detector.reset();
+                        let target_files: Vec<String> = self
+                            .execution_plan
+                            .items
+                            .iter()
+                            .flat_map(|i| i.target_files.iter().cloned())
+                            .collect();
+                        self.stagnation_state =
+                            crate::app::stagnation_state::StagnationState::init_from_plan(
+                                &target_files,
+                            );
+                    }
+                    crate::app::execution_plan::PlanRegistrationResult::Replan => {
+                        // Issue #391: record every ANVIL_PLAN block until the
+                        // first mutation tool lands — `record_plan_block` itself
+                        // guards against counting post-mutation replans.
+                        plan_stall_tracker.record_plan_block();
+                        // Issue #349: replan is also a change of course.
+                        self.closure_loop_detector.reset();
+                        // Issue #351: replan clears the thrash counter too.
+                        self.post_failure_thrash_detector.reset();
+                        // Issue #292: clear proactive delegation retry budget on replan.
+                        self.stagnation_state
+                            .proactive_delegation_retry_budget
+                            .clear();
+                        // Replan: stagnation_state を差分マージ (Issue #305)
                         let existing = &self.stagnation_state.starved_target_files;
-                        // CB-003: only include unfinished items to avoid re-adding completed files
                         let new_targets: Vec<String> = self
                             .execution_plan
                             .items
@@ -2206,6 +2251,30 @@ impl App {
                             .starved_target_files
                             .extend(new_targets);
                     }
+                    crate::app::execution_plan::PlanRegistrationResult::NoBlock => {
+                        // ANVIL_PLAN なし → ANVIL_PLAN_UPDATE を通常処理
+                        // DR2-005: Replan 時はスキップして二重処理を防ぐ
+                        // Issue #287: merge new target_files into starved_target_files on plan update
+                        if self.try_update_plan(&next_token_buffer, strict_closure_gate) {
+                            let existing = &self.stagnation_state.starved_target_files;
+                            // CB-003: only include unfinished items to avoid re-adding completed files
+                            let new_targets: Vec<String> = self
+                                .execution_plan
+                                .items
+                                .iter()
+                                .filter(|i| !i.is_finished())
+                                .flat_map(|i| i.target_files.iter().cloned())
+                                .filter(|tf| {
+                                    !existing.iter().any(|sf| {
+                                        crate::contracts::ExecutionPlan::path_matches(sf, tf)
+                                    })
+                                })
+                                .collect();
+                            self.stagnation_state
+                                .starved_target_files
+                                .extend(new_targets);
+                        }
+                    }
                 }
             }
 
@@ -2213,7 +2282,10 @@ impl App {
             // update. An execution plan now exists, so the agent has left the
             // planning phase and is in the Act phase until escalation or
             // completion.
-            if matches!(current_mode, AgenticMode::Plan) && !self.execution_plan.is_empty() {
+            if !self.local_mode_active()
+                && matches!(current_mode, AgenticMode::Plan)
+                && !self.execution_plan.is_empty()
+            {
                 current_mode = AgenticMode::Act;
                 self.agent_telemetry.agentic_mode_plan_to_act_count += 1;
             }
@@ -2959,15 +3031,20 @@ impl App {
         };
 
         // Phase 1.75: Pre-mutation plan barrier (Issue #303).
-        self.maybe_register_synthetic_plan_from_initial_mutations(&validated_requests);
-        // Block mutation tools when no execution plan is registered.
-        let barrier_result =
-            mutation_barrier.check_and_filter(validated_requests, self.execution_plan.is_empty());
-        let validated_requests = barrier_result.passed_requests;
-        failed_results.extend(barrier_result.blocked_results);
-        if barrier_result.blocked_count > 0 {
-            self.agent_telemetry.record_mutation_barrier_block();
-        }
+        let validated_requests = if self.local_mode_active() {
+            validated_requests
+        } else {
+            self.maybe_register_synthetic_plan_from_initial_mutations(&validated_requests);
+            // Block mutation tools when no execution plan is registered.
+            let barrier_result = mutation_barrier
+                .check_and_filter(validated_requests, self.execution_plan.is_empty());
+            let validated_requests = barrier_result.passed_requests;
+            failed_results.extend(barrier_result.blocked_results);
+            if barrier_result.blocked_count > 0 {
+                self.agent_telemetry.record_mutation_barrier_block();
+            }
+            validated_requests
+        };
 
         // Phase 1.85: Post-escalation fix_slice routing barrier (Issue #355).
         // Once fix_slice escalation has fired under a `requires_worker_observation`

@@ -97,6 +97,19 @@ pub struct CliArgs {
     #[arg(long = "prompt-tier")]
     pub prompt_tier: Option<String>,
 
+    /// Enable local-mode orchestration simplifications.
+    #[arg(long = "local-mode")]
+    pub local_mode_flag: bool,
+
+    /// Disable local-mode orchestration simplifications.
+    #[arg(long = "no-local-mode")]
+    pub no_local_mode_flag: bool,
+
+    /// Computed local_mode value: Some(true) for --local-mode,
+    /// Some(false) for --no-local-mode, None when neither is specified.
+    #[arg(skip)]
+    pub local_mode: Option<bool>,
+
     /// Enable tag-based tool protocol (--tag-protocol).
     #[doc(hidden)]
     #[arg(long = "tag-protocol")]
@@ -148,5 +161,11 @@ impl CliArgs {
             self.tag_protocol = Some(false);
         }
         // Otherwise remains None (auto-detect)
+
+        if self.local_mode_flag {
+            self.local_mode = Some(true);
+        } else if self.no_local_mode_flag {
+            self.local_mode = Some(false);
+        }
     }
 }

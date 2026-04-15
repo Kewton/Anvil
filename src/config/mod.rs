@@ -195,6 +195,8 @@ pub struct RuntimeConfig {
     /// Prompt tier override: "full", "compact", or "tiny".
     /// `None` = auto-detect from model name.
     pub prompt_tier: Option<String>,
+    /// Local-mode orchestration simplifications for local LLMs.
+    pub local_mode: bool,
     /// Smart compact threshold ratio (0.1..=0.95, default 0.75).
     /// When estimated tokens exceed context_window * ratio, token-based compaction triggers.
     pub smart_compact_threshold_ratio: f64,
@@ -602,6 +604,7 @@ pub const ENV_OVERRIDE_WHITELIST: &[&str] = &[
     "ANVIL_OFFLINE",
     "ANVIL_TAG_PROTOCOL",
     "ANVIL_PROMPT_TIER",
+    "ANVIL_LOCAL_MODE",
     "ANVIL_SMART_COMPACT_THRESHOLD_RATIO",
     "ANVIL_SUBAGENT_MAX_ITERATIONS",
     "ANVIL_SUBAGENT_TIMEOUT",
@@ -704,6 +707,7 @@ impl EffectiveConfig {
                 context_window_explicitly_set: false,
                 tag_protocol: None,
                 prompt_tier: None,
+                local_mode: true,
                 smart_compact_threshold_ratio: 0.75,
                 subagent_max_iterations: DEFAULT_SUBAGENT_MAX_ITERATIONS,
                 subagent_timeout_secs: DEFAULT_SUBAGENT_TIMEOUT_SECS,
@@ -946,6 +950,9 @@ impl EffectiveConfig {
         if let Some(v) = cli.tag_protocol {
             self.runtime.tag_protocol = Some(v);
         }
+        if let Some(v) = cli.local_mode {
+            self.runtime.local_mode = v;
+        }
 
         // HTTP timeout
         if let Some(timeout) = cli.timeout {
@@ -1124,6 +1131,9 @@ impl EffectiveConfig {
                     } else {
                         Some(value.clone())
                     };
+                }
+                "local_mode" | "ANVIL_LOCAL_MODE" => {
+                    self.runtime.local_mode = parse_bool(value);
                 }
                 "smart_compact_threshold_ratio" | "ANVIL_SMART_COMPACT_THRESHOLD_RATIO" => {
                     self.runtime.smart_compact_threshold_ratio = value

@@ -538,8 +538,10 @@ impl App {
         // Issue #251: Sync plan completion from touched_files before gate check.
         if !self.execution_plan.is_empty() {
             let before = self.execution_plan.finished_count();
+            let touched_for_sync =
+                self.filter_touched_files_for_plan_sync(&self.session.working_memory.touched_files);
             self.execution_plan
-                .sync_from_touched_files(&self.session.working_memory.touched_files);
+                .sync_from_touched_files(&touched_for_sync);
             let after = self.execution_plan.finished_count();
             if after > before {
                 self.agent_telemetry.record_sync_from_touched_files();

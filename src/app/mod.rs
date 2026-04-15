@@ -238,6 +238,35 @@ pub struct CompactInfo {
     pub sidecar_rejected: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalBootstrapLock {
+    active: bool,
+    root_prefix: String,
+    retry_budget: u8,
+    scaffold_paths: Vec<String>,
+}
+
+impl LocalBootstrapLock {
+    const DEFAULT_RETRY_BUDGET: u8 = 2;
+
+    fn new(root_prefix: String, scaffold_paths: Vec<String>) -> Self {
+        Self {
+            active: true,
+            root_prefix,
+            retry_budget: Self::DEFAULT_RETRY_BUDGET,
+            scaffold_paths,
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        self.active
+    }
+
+    fn contains_scaffold_path(&self, path: &str) -> bool {
+        self.scaffold_paths.iter().any(|scaffold| scaffold == path)
+    }
+}
+
 /// Central application state.
 pub struct App {
     config: EffectiveConfig,
@@ -329,6 +358,8 @@ pub struct App {
     post_failure_thrash_detector: post_failure_thrash_detector::PostFailureThrashDetector,
     /// Done path task-semantics gate fired flag (prevents re-fire, Issue #382).
     task_semantics_done_path_fired: bool,
+    /// Temporary local-model stabilization overlay for post-scaffold drift.
+    local_bootstrap_lock: Option<LocalBootstrapLock>,
 }
 
 /// Whether the session loop should continue or exit.
@@ -743,6 +774,7 @@ impl App {
                     thrash_break,
                 ),
             task_semantics_done_path_fired: false,
+            local_bootstrap_lock: None,
         })
     }
 
@@ -916,6 +948,7 @@ impl App {
             crate::agent::build_native_tool_calling_prompt(
                 &self.detected_languages,
                 None, // MCP descriptions already checked above
+                self.local_mode_active(),
             )
         } else {
             tool_protocol_system_prompt(
@@ -924,6 +957,7 @@ impl App {
                 effective_used_tools,
                 self.config.mode.offline,
                 self.prompt_tier,
+                self.local_mode_active(),
             )
         };
 
@@ -1004,6 +1038,157 @@ impl App {
         } else {
             Some(normalized.to_string_lossy().into_owned())
         }
+    }
+
+    fn is_local_provider(&self) -> bool {
+        matches!(self.config.runtime.provider.as_str(), "ollama" | "lmstudio")
+    }
+
+    fn local_mode_active(&self) -> bool {
+        self.config.runtime.local_mode && self.is_local_provider()
+    }
+
+    fn detect_local_bootstrap_lock(
+        &self,
+        results: &[crate::tooling::ToolExecutionResult],
+    ) -> Option<LocalBootstrapLock> {
+        if !self.local_mode_active() {
+            return None;
+        }
+
+        results.iter().find_map(|result| {
+            if result.tool_name != "shell.exec"
+                || result.status != crate::tooling::ToolExecutionStatus::Completed
+                || result.rolled_back
+            {
+                return None;
+            }
+
+            let changed_paths = result.observed_changed_paths();
+            if changed_paths.is_empty() {
+                return None;
+            }
+
+            let mut root_prefix: Option<String> = None;
+            for path in &changed_paths {
+                let first = path.split('/').next()?.trim();
+                if first.is_empty() || first == "." {
+                    return None;
+                }
+                match &root_prefix {
+                    Some(existing) if existing != first => return None,
+                    None => root_prefix = Some(first.to_string()),
+                    _ => {}
+                }
+            }
+
+            let root_prefix = root_prefix?;
+            let has_manifest = changed_paths.iter().any(|path| {
+                path == &format!("{root_prefix}/package.json")
+                    || path == &format!("{root_prefix}/Cargo.toml")
+            });
+            let has_next_app_shape = changed_paths.iter().any(|path| {
+                path == &format!("{root_prefix}/src/app/page.tsx")
+                    || path == &format!("{root_prefix}/app/page.tsx")
+                    || path.starts_with(&format!("{root_prefix}/src/app/"))
+                    || path.starts_with(&format!("{root_prefix}/app/"))
+            });
+            let has_next_config = changed_paths
+                .iter()
+                .any(|path| path.starts_with(&format!("{root_prefix}/next.config.")));
+
+            if has_manifest && (has_next_app_shape || has_next_config) {
+                Some(LocalBootstrapLock::new(root_prefix, changed_paths))
+            } else {
+                None
+            }
+        })
+    }
+
+    fn update_local_bootstrap_lock(&mut self, results: &[crate::tooling::ToolExecutionResult]) {
+        if let Some(lock) = &self.local_bootstrap_lock {
+            let root_prefix = format!("{}/", lock.root_prefix);
+            let real_mutation_observed = results.iter().any(|result| {
+                Self::is_real_mutation_tool_name(&result.tool_name)
+                    && result.status == crate::tooling::ToolExecutionStatus::Completed
+                    && !result.rolled_back
+                    && result
+                        .observed_changed_paths()
+                        .iter()
+                        .any(|path| path.starts_with(&root_prefix))
+            });
+            if real_mutation_observed {
+                self.local_bootstrap_lock = None;
+                return;
+            }
+        }
+
+        if self.local_bootstrap_lock.is_none() {
+            self.local_bootstrap_lock = self.detect_local_bootstrap_lock(results);
+        }
+    }
+
+    fn should_apply_local_bootstrap_lock_retry(
+        &self,
+        structured: &crate::agent::StructuredAssistantResponse,
+    ) -> bool {
+        let Some(lock) = &self.local_bootstrap_lock else {
+            return false;
+        };
+        if !lock.is_active() || lock.retry_budget == 0 || !structured.tool_calls.is_empty() {
+            return false;
+        }
+        true
+    }
+
+    fn local_bootstrap_lock_has_followup_plan(&self, content: &str) -> bool {
+        crate::agent::extract_plan_block(content).is_some()
+            || crate::agent::extract_plan_update_block(content).is_some()
+    }
+
+    fn should_suppress_followup_plan_while_locked(&self, content: &str) -> bool {
+        let Some(lock) = &self.local_bootstrap_lock else {
+            return false;
+        };
+        lock.is_active() && self.local_bootstrap_lock_has_followup_plan(content)
+    }
+
+    fn consume_local_bootstrap_lock_retry(&mut self) -> Option<String> {
+        let lock = self.local_bootstrap_lock.as_mut()?;
+        if !lock.is_active() || lock.retry_budget == 0 {
+            self.local_bootstrap_lock = None;
+            return None;
+        }
+        lock.retry_budget = lock.retry_budget.saturating_sub(1);
+        Some(Self::local_bootstrap_lock_retry_message(&lock.root_prefix))
+    }
+
+    fn filter_touched_files_for_plan_sync(&self, touched_files: &[String]) -> Vec<String> {
+        let Some(lock) = &self.local_bootstrap_lock else {
+            return touched_files.to_vec();
+        };
+        if !lock.is_active() || lock.scaffold_paths.is_empty() {
+            return touched_files.to_vec();
+        }
+        touched_files
+            .iter()
+            .filter(|path| !lock.contains_scaffold_path(path))
+            .cloned()
+            .collect()
+    }
+
+    fn is_real_mutation_tool_name(tool_name: &str) -> bool {
+        matches!(
+            tool_name,
+            "file.write" | "file.edit" | "file.edit_anchor" | "file.rewrite"
+        )
+    }
+
+    fn local_bootstrap_lock_retry_message(root_prefix: &str) -> String {
+        format!(
+            "Do not output another plan. Do not explain. Emit exactly one file.write, file.edit, file.edit_anchor, or file.rewrite tool call now for files under {}.",
+            root_prefix
+        )
     }
 
     /// Prepare for write fallback: take checkpoint snapshot (Issue #158, DR4-007).
@@ -3246,6 +3431,10 @@ mod tests {
         config.paths.logs_dir = tmp.join(".anvil").join("logs");
         config.paths.mcp_config_file = tmp.join(".anvil").join("mcp.json");
         config.paths.hooks_config_file = tmp.join(".anvil").join("hooks.json");
+        std::fs::create_dir_all(&config.paths.cwd).expect("cwd should be created");
+        std::fs::create_dir_all(&config.paths.workspace_dir).expect("workspace should be created");
+        std::fs::create_dir_all(&config.paths.session_dir).expect("session dir should be created");
+        std::fs::create_dir_all(&config.paths.logs_dir).expect("logs dir should be created");
         let provider = crate::provider::ProviderRuntimeContext::bootstrap(&config)
             .expect("provider should bootstrap");
         let shutdown_flag = Arc::new(AtomicBool::new(false));
@@ -3352,5 +3541,70 @@ mod tests {
             .relative_path_for_working_memory(std::path::Path::new("./space-invaders/package.json"))
             .expect("relative path should be accepted");
         assert_eq!(rel, "space-invaders/package.json");
+    }
+
+    #[test]
+    fn detect_local_bootstrap_lock_from_shell_scaffold_delta() {
+        let mut app = build_test_app();
+        app.config.runtime.provider = "ollama".to_string();
+
+        let result = crate::tooling::ToolExecutionResult {
+            tool_call_id: "call_shell_exec_0".to_string(),
+            tool_name: "shell.exec".to_string(),
+            status: crate::tooling::ToolExecutionStatus::Completed,
+            summary: "shell.exec completed".to_string(),
+            payload: crate::tooling::ToolExecutionPayload::None,
+            artifacts: Vec::new(),
+            elapsed_ms: 0,
+            diff_summary: None,
+            edit_detail: None,
+            rolled_back: false,
+            observed_delta: Some(crate::tooling::ObservedWorkspaceDelta {
+                created_paths: vec![
+                    "space-invaders/package.json".to_string(),
+                    "space-invaders/next.config.ts".to_string(),
+                    "space-invaders/src/app/page.tsx".to_string(),
+                ],
+                modified_paths: Vec::new(),
+                deleted_paths: Vec::new(),
+                ignored_paths: Vec::new(),
+            }),
+            delta_observation_skipped: None,
+        };
+
+        let lock = app
+            .detect_local_bootstrap_lock(std::slice::from_ref(&result))
+            .expect("shell scaffold should activate local bootstrap lock");
+        assert!(lock.active);
+        assert_eq!(lock.root_prefix, "space-invaders");
+        assert!(
+            lock.scaffold_paths
+                .contains(&"space-invaders/package.json".to_string())
+        );
+    }
+
+    #[test]
+    fn filter_touched_files_for_plan_sync_excludes_scaffold_paths_while_locked() {
+        let mut app = build_test_app();
+        app.local_bootstrap_lock = Some(LocalBootstrapLock {
+            active: true,
+            root_prefix: "space-invaders".to_string(),
+            retry_budget: 1,
+            scaffold_paths: vec![
+                "space-invaders/src/app/page.tsx".to_string(),
+                "space-invaders/src/app/globals.css".to_string(),
+            ],
+        });
+
+        let filtered = app.filter_touched_files_for_plan_sync(&[
+            "space-invaders/src/app/page.tsx".to_string(),
+            "space-invaders/src/app/globals.css".to_string(),
+            "space-invaders/src/components/Game.tsx".to_string(),
+        ]);
+
+        assert_eq!(
+            filtered,
+            vec!["space-invaders/src/components/Game.tsx".to_string()]
+        );
     }
 }
