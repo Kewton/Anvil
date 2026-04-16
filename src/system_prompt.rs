@@ -2,10 +2,26 @@ use std::path::Path;
 
 use crate::modes::plan_act::ExecutionMode;
 
-pub fn build_system_prompt(mode: ExecutionMode, active_plan_path: Option<&Path>) -> String {
-    let mut prompt = String::from(
+pub fn build_system_prompt(
+    mode: ExecutionMode,
+    active_plan_path: Option<&Path>,
+    tool_call_tag: &str,
+    native_tools_enabled: bool,
+) -> String {
+    let tool_call_example =
+        format!("<{tool_call_tag}>{{\"name\":\"Tool\",\"arguments\":{{...}}}}</{tool_call_tag}>");
+    let tool_call_instruction = if native_tools_enabled {
+        format!(
+            "IMPORTANT: Never output <think> tags. Prefer native tool calls, but if they fail you may emit {tool_call_example}."
+        )
+    } else {
+        format!(
+            "IMPORTANT: Never output <think> tags. When you need tools, emit {tool_call_example} with valid JSON arguments."
+        )
+    };
+    let mut prompt = format!(
         "You are Anvil, a local-first coding agent running against Ollama.\n\
-IMPORTANT: Never output <think> tags. Prefer native tool calls, but if they fail you may emit <tool_call>{\"name\":\"Tool\",\"arguments\":{...}}</tool_call>.\n\
+{tool_call_instruction}\n\
 \n\
 CORE RULES:\n\
 1. TOOL FIRST. If the task needs filesystem or shell access, call a tool before explaining.\n\

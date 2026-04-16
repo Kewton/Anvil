@@ -21,18 +21,23 @@ fn merge_prefers_later_sources() {
         PartialConfig {
             model: Some("file-model".into()),
             yes_mode: Some(false),
+            chat_timeout_secs: Some(120),
             ..PartialConfig::default()
         },
         PartialConfig {
             model: Some("env-model".into()),
+            chat_timeout_secs: Some(240),
             ..PartialConfig::default()
         },
         PartialConfig {
             model: Some("cli-model".into()),
             yes_mode: Some(true),
+            chat_retries: Some(3),
             ..PartialConfig::default()
         },
     ]);
     assert_eq!(merged.model.as_deref(), Some("cli-model"));
     assert_eq!(merged.yes_mode, Some(true));
+    assert_eq!(merged.chat_timeout_secs, Some(240));
+    assert_eq!(merged.chat_retries, Some(3));
 }

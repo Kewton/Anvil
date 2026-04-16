@@ -18,6 +18,10 @@ pub struct CliArgs {
     pub context_budget: Option<usize>,
     #[arg(long = "max-iterations")]
     pub max_iterations: Option<usize>,
+    #[arg(long = "chat-timeout-secs")]
+    pub chat_timeout_secs: Option<u64>,
+    #[arg(long = "chat-retries")]
+    pub chat_retries: Option<usize>,
     #[arg(long = "debug")]
     pub debug: bool,
     #[arg(long = "stream")]

@@ -1,5 +1,7 @@
 use std::io::{self, IsTerminal, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 
 use crate::agent::{parallel, recovery};
 use crate::config::Config;
@@ -8,7 +10,7 @@ use crate::git::checkpoint::GitCheckpointManager;
 use crate::mcp::client::McpRegistry;
 use crate::model_registry::RuntimeModels;
 use crate::modes::plan_act::ExecutionMode;
-use crate::ollama::client::{AssistantReply, OllamaClient};
+use crate::ollama::client::{AssistantReply, OllamaClient, should_use_native_tool_calls};
 use crate::session::compact::{
     approximate_token_count, compact_messages, compact_messages_with_strategy,
 };
@@ -31,6 +33,7 @@ pub struct Agent {
     client: OllamaClient,
     session_store: SessionStore,
     session: SessionSnapshot,
+    work_root: PathBuf,
     tool_registry: ToolRegistry,
     checkpoint_manager: GitCheckpointManager,
     watcher: Option<FileWatcher>,
@@ -49,8 +52,12 @@ impl Agent {
     ) -> Self {
         let checkpoints = session.checkpoints.clone();
         let checkpoint_manager = GitCheckpointManager::new(config.cwd.clone(), checkpoints);
+        let work_root = session
+            .active_root
+            .clone()
+            .unwrap_or_else(|| config.cwd.clone());
         let watcher = if config.watch {
-            FileWatcher::new(config.cwd.clone()).ok()
+            FileWatcher::new(work_root.clone()).ok()
         } else {
             None
         };
@@ -63,6 +70,7 @@ impl Agent {
             client,
             session_store,
             session,
+            work_root,
             tool_registry: ToolRegistry::default(),
             checkpoint_manager,
             watcher,
@@ -96,7 +104,7 @@ impl Agent {
         println!(
             "mode={:?} cwd={}",
             self.session.mode_state.mode,
-            self.config.cwd.display()
+            self.work_root.display()
         );
         if self.config.debug
             && let Some(path) = crate::logging::llm_io_log_path()
@@ -134,18 +142,29 @@ impl Agent {
             return Ok(AgentEvent::Continue(None));
         }
 
-        if input.starts_with('/') {
-            let outcome = self.handle_command(input)?;
-            self.persist_session()?;
-            return Ok(outcome);
-        }
-
-        let reply = self.handle_user_message(input, stream_output)?;
-        self.persist_session()?;
-        if stream_output {
-            Ok(AgentEvent::Continue(None))
+        let outcome = if input.starts_with('/') {
+            self.handle_command(input)
         } else {
-            Ok(AgentEvent::Continue(Some(reply)))
+            match self.handle_user_message(input, stream_output) {
+                Ok(reply) => {
+                    if stream_output {
+                        Ok(AgentEvent::Continue(None))
+                    } else {
+                        Ok(AgentEvent::Continue(Some(reply)))
+                    }
+                }
+                Err(err) => Err(err),
+            }
+        };
+
+        let persist_error = self.persist_session().err();
+        match (outcome, persist_error) {
+            (Ok(event), None) => Ok(event),
+            (Ok(_), Some(err)) => Err(err),
+            (Err(err), None) => Err(err),
+            (Err(err), Some(persist_err)) => Err(format!(
+                "{err} (also failed to persist session: {persist_err})"
+            )),
         }
     }
 
@@ -156,11 +175,12 @@ impl Agent {
                 "/help /status /model /plan /approve /compact /checkpoint /rollback /yes /no /watch /autotest /skills /skill <name> /mcp /parallel t1 || t2 /exit".to_string(),
             ))),
             "/status" => Ok(AgentEvent::Continue(Some(format!(
-                "mode={:?} auto_approve={} watch={} auto_test={} session={} plan={} approx_tokens={}",
+                "mode={:?} auto_approve={} watch={} auto_test={} cwd={} session={} plan={} approx_tokens={}",
                 self.session.mode_state.mode,
                 self.config.yes_mode,
                 self.watcher.is_some(),
                 self.auto_test.command().unwrap_or("-"),
+                self.work_root.display(),
                 self.session_store.path().display(),
                 self.session
                     .mode_state
@@ -258,7 +278,7 @@ impl Agent {
                     self.watcher = None;
                     Ok(AgentEvent::Continue(Some("file watcher disabled".to_string())))
                 } else {
-                    self.watcher = Some(FileWatcher::new(self.config.cwd.clone())?);
+                    self.watcher = Some(FileWatcher::new(self.work_root.clone())?);
                     Ok(AgentEvent::Continue(Some("file watcher enabled".to_string())))
                 }
             }
@@ -345,7 +365,7 @@ impl Agent {
         let mut no_tool_retries = 0usize;
 
         for _ in 0..self.config.max_iterations {
-            let reply = self.request_assistant_reply(stream_output)?;
+            let reply = self.request_assistant_reply_with_retry(stream_output)?;
             if !reply.tool_calls.is_empty() {
                 tool_calls_made_this_turn += reply.tool_calls.len();
                 empty_retries = 0;
@@ -399,12 +419,60 @@ impl Agent {
         Err("assistant did not finish within max iterations".to_string())
     }
 
+    fn request_assistant_reply_with_retry(
+        &mut self,
+        stream_output: bool,
+    ) -> Result<AssistantReply, String> {
+        let mut last_error = None;
+        for attempt in 0..=self.config.chat_retries {
+            match self.request_assistant_reply(stream_output) {
+                Ok(reply) => return Ok(reply),
+                Err(err) => {
+                    last_error = Some(err.clone());
+                    if attempt == self.config.chat_retries {
+                        break;
+                    }
+                    let delay_secs = (attempt + 1) as u64 * 2;
+                    self.push_system_note(format!(
+                        "[Runtime Retry] The previous Ollama request failed with: {err}. Retry {}/{} waits {} seconds and then continues from the current tool state.",
+                        attempt + 1,
+                        self.config.chat_retries,
+                        delay_secs
+                    ));
+                    thread::sleep(Duration::from_secs(delay_secs));
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| "assistant request failed".to_string()))
+    }
+
     fn request_assistant_reply(&self, stream_output: bool) -> Result<AssistantReply, String> {
+        let native_tools_enabled = should_use_native_tool_calls(&self.models.main);
+        let tool_call_tag = if native_tools_enabled {
+            "tool_call"
+        } else {
+            "anvil_tool_call"
+        };
         let mut messages = Vec::new();
         messages.push(ConversationMessage::system(build_system_prompt(
             self.session.mode_state.mode,
             self.session.mode_state.active_plan_path.as_deref(),
+            tool_call_tag,
+            native_tools_enabled,
         )));
+        if !native_tools_enabled {
+            messages.push(ConversationMessage::system(
+                format!(
+                    "For this model, do not emit native tool_calls. When you need a tool, output only <{tool_call_tag}>{{\"name\":\"Tool\",\"arguments\":{{...}}}}</{tool_call_tag}> blocks with valid JSON arguments."
+                ),
+            ));
+        }
+        if self.work_root != self.config.cwd {
+            messages.push(ConversationMessage::system(format!(
+                "Current project root is {}. Use relative paths from this directory.",
+                self.work_root.display()
+            )));
+        }
         messages.extend(self.session.messages.clone());
 
         if stream_output {
@@ -433,18 +501,20 @@ impl Agent {
     }
 
     fn execute_tool_call(
-        &self,
+        &mut self,
         name: &str,
         arguments: &serde_json::Value,
     ) -> Result<String, String> {
         let context = ToolContext {
-            root: self.config.cwd.clone(),
+            root: self.work_root.clone(),
             mode: self.session.mode_state.mode,
             plan_path: self.session.mode_state.active_plan_path.clone(),
             auto_approve: self.config.yes_mode,
             interactive_approval: io::stdin().is_terminal(),
         };
-        self.tool_registry.execute(name, arguments, &context)
+        let result = self.tool_registry.execute(name, arguments, &context)?;
+        self.maybe_update_work_root(name, arguments, &result);
+        Ok(result)
     }
 
     fn push_system_note(&mut self, note: String) {
@@ -473,6 +543,11 @@ impl Agent {
 
     fn persist_session(&mut self) -> Result<(), String> {
         self.session.checkpoints = self.checkpoint_manager.checkpoints.clone();
+        self.session.active_root = if self.work_root == self.config.cwd {
+            None
+        } else {
+            Some(self.work_root.clone())
+        };
         self.session_store.save(&self.session)
     }
 
@@ -520,13 +595,42 @@ impl Agent {
         }
 
         let mut lines = vec![format!("watcher:\n{}", changes.join("\n"))];
-        if let Some(result) = self.auto_test.run_if_enabled(&self.config.cwd)? {
+        if let Some(result) = self.auto_test.run_if_enabled(&self.work_root)? {
             lines.push(format!(
                 "auto-test: {} exit={}\n{}",
                 result.command, result.exit_code, result.output
             ));
         }
         Ok(Some(lines.join("\n\n")))
+    }
+
+    fn maybe_update_work_root(&mut self, name: &str, arguments: &serde_json::Value, result: &str) {
+        if name != "Bash" {
+            return;
+        }
+        let Some(command) = arguments.get("command").and_then(serde_json::Value::as_str) else {
+            return;
+        };
+        if !command.contains("create-next-app") {
+            return;
+        }
+
+        let Some(new_root) = detect_created_project_root(result) else {
+            return;
+        };
+        if new_root == self.work_root || !new_root.is_dir() {
+            return;
+        }
+
+        self.work_root = new_root.clone();
+        self.session.active_root = Some(new_root.clone());
+        if self.config.watch {
+            self.watcher = FileWatcher::new(new_root.clone()).ok();
+        }
+        self.push_system_note(format!(
+            "[Workspace Root Updated] Continue work inside {} and use relative paths from there.",
+            new_root.display()
+        ));
     }
 }
 
@@ -547,4 +651,42 @@ fn plan_is_substantive(contents: &str) -> bool {
         .filter(|line| *line != "-" && *line != "1.")
         .count();
     meaningful_lines >= 2
+}
+
+fn detect_created_project_root(tool_output: &str) -> Option<PathBuf> {
+    for line in tool_output.lines() {
+        let trimmed = line.trim();
+        if let Some(path) = trimmed.strip_prefix("Success! Created ") {
+            let (_, path) = path.rsplit_once(" at ")?;
+            return Some(PathBuf::from(path.trim()));
+        }
+        if let Some(path) = trimmed.strip_prefix("Creating a new Next.js app in ") {
+            return Some(PathBuf::from(path.trim_end_matches('.').trim()));
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::detect_created_project_root;
+    use std::path::PathBuf;
+
+    #[test]
+    fn detects_created_next_app_root_from_success_line() {
+        let output = "Success! Created space-invaders at /tmp/work/space-invaders";
+        assert_eq!(
+            detect_created_project_root(output),
+            Some(PathBuf::from("/tmp/work/space-invaders"))
+        );
+    }
+
+    #[test]
+    fn detects_created_next_app_root_from_create_line() {
+        let output = "Creating a new Next.js app in /tmp/work/space-invaders.";
+        assert_eq!(
+            detect_created_project_root(output),
+            Some(PathBuf::from("/tmp/work/space-invaders"))
+        );
+    }
 }

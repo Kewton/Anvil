@@ -57,6 +57,8 @@ pub struct SessionSnapshot {
     pub mode_state: ModeState,
     pub messages: Vec<ConversationMessage>,
     pub checkpoints: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_root: Option<PathBuf>,
 }
 
 pub struct SessionStore {

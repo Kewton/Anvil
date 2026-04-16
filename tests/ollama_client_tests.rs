@@ -1,4 +1,6 @@
-use anvil::ollama::client::{parse_chat_response, parse_tags_response};
+use anvil::ollama::client::{
+    parse_chat_response, parse_tags_response, should_use_native_tool_calls,
+};
 
 #[test]
 fn parses_tags_and_chat_payloads() {
@@ -17,4 +19,11 @@ fn parses_tags_and_chat_payloads() {
     assert_eq!(reply.tool_calls.len(), 1);
     assert_eq!(reply.tool_calls[0].name, "Read");
     assert_eq!(reply.content, "done");
+}
+
+#[test]
+fn disables_native_tools_for_qwen3_family() {
+    assert!(!should_use_native_tool_calls("qwen3.5:122b"));
+    assert!(!should_use_native_tool_calls("qwen3:8b"));
+    assert!(should_use_native_tool_calls("gemma4:31b"));
 }

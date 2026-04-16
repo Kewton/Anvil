@@ -18,9 +18,40 @@ pub fn extract_tool_calls(text: &str, allowed_tools: &[String]) -> (Vec<ToolCall
     let mut extracted = Vec::new();
     let mut remaining = cleaned.clone();
 
-    let tagged_regex = Regex::new(r#"(?s)<tool_call\s+name="([^"]+)">\s*(\{.*?\})\s*</tool_call>"#)
+    for tag in ["tool_call", "anvil_tool_call"] {
+        let tagged_regex = Regex::new(&format!(
+            r#"(?s)<{tag}\s+name="([^"]+)">\s*(\{{.*?\}})\s*</{tag}>"#
+        ))
         .expect("valid regex");
-    for captures in tagged_regex.captures_iter(&cleaned) {
+        for captures in tagged_regex.captures_iter(&cleaned) {
+            let name = normalize_name(&captures[1], allowed_tools);
+            if let Some(arguments) = parse_arguments(&captures[2]) {
+                extracted.push(ToolCall {
+                    id: format!("xml-{}", extracted.len() + 1),
+                    name,
+                    arguments,
+                });
+            }
+        }
+        remaining = tagged_regex.replace_all(&remaining, "").into_owned();
+
+        let json_regex =
+            Regex::new(&format!(r"(?s)<{tag}>\s*(\{{.*?\}})\s*</{tag}>")).expect("valid regex");
+        for captures in json_regex.captures_iter(&cleaned) {
+            if let Some((name, arguments)) = parse_tool_call_object(&captures[1], allowed_tools) {
+                extracted.push(ToolCall {
+                    id: format!("xml-{}", extracted.len() + 1),
+                    name,
+                    arguments,
+                });
+            }
+        }
+        remaining = json_regex.replace_all(&remaining, "").into_owned();
+    }
+
+    let function_regex = Regex::new(r#"(?s)<function\s+name="([^"]+)">\s*(\{.*?\})\s*</function>"#)
+        .expect("valid regex");
+    for captures in function_regex.captures_iter(&cleaned) {
         let name = normalize_name(&captures[1], allowed_tools);
         if let Some(arguments) = parse_arguments(&captures[2]) {
             extracted.push(ToolCall {
@@ -30,20 +61,7 @@ pub fn extract_tool_calls(text: &str, allowed_tools: &[String]) -> (Vec<ToolCall
             });
         }
     }
-    remaining = tagged_regex.replace_all(&remaining, "").into_owned();
-
-    let json_regex =
-        Regex::new(r"(?s)<tool_call>\s*(\{.*?\})\s*</tool_call>").expect("valid regex");
-    for captures in json_regex.captures_iter(&cleaned) {
-        if let Some((name, arguments)) = parse_tool_call_object(&captures[1], allowed_tools) {
-            extracted.push(ToolCall {
-                id: format!("xml-{}", extracted.len() + 1),
-                name,
-                arguments,
-            });
-        }
-    }
-    remaining = json_regex.replace_all(&remaining, "").into_owned();
+    remaining = function_regex.replace_all(&remaining, "").into_owned();
 
     (extracted, remaining.trim().to_string())
 }

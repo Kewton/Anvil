@@ -23,8 +23,12 @@ pub struct AssistantReply {
 
 impl OllamaClient {
     pub fn new(base_url: String) -> Result<Self, String> {
+        Self::new_with_timeout(base_url, 120)
+    }
+
+    pub fn new_with_timeout(base_url: String, timeout_secs: u64) -> Result<Self, String> {
         let http = Client::builder()
-            .timeout(std::time::Duration::from_secs(120))
+            .timeout(std::time::Duration::from_secs(timeout_secs))
             .build()
             .map_err(|err| format!("failed to create HTTP client: {err}"))?;
         Ok(Self { base_url, http })
@@ -125,6 +129,20 @@ impl OllamaClient {
             tools: Option<&'a [ToolSpec]>,
         }
 
+        let native_tools_enabled = should_use_native_tool_calls(model);
+        let serialized_tools = if native_tools_enabled { tools } else { None };
+        logging::log_llm_event(
+            "ollama.chat.request",
+            json!({
+                "base_url": self.base_url,
+                "model": model,
+                "stream": stream,
+                "native_tools_enabled": native_tools_enabled,
+                "tools": tools.unwrap_or(&[]).iter().map(|tool| tool.function.name.clone()).collect::<Vec<_>>(),
+                "messages": messages,
+            }),
+        );
+
         let response = self
             .http
             .post(format!("{}/api/chat", self.base_url))
@@ -132,23 +150,36 @@ impl OllamaClient {
                 model,
                 stream,
                 messages,
-                tools,
+                tools: serialized_tools,
             })
             .send()
-            .map_err(|err| format!("failed to contact Ollama chat API: {err}"))?;
-        logging::log_llm_event(
-            "ollama.chat.request",
-            json!({
-                "base_url": self.base_url,
-                "model": model,
-                "stream": stream,
-                "tools": tools.unwrap_or(&[]).iter().map(|tool| tool.function.name.clone()).collect::<Vec<_>>(),
-                "messages": messages,
-            }),
-        );
+            .map_err(|err| {
+                logging::log_llm_event(
+                    "ollama.chat.error",
+                    json!({
+                        "model": model,
+                        "stream": stream,
+                        "kind": "transport",
+                        "error": err.to_string(),
+                    }),
+                );
+                format!("failed to contact Ollama chat API: {err}")
+            })?;
 
         if !response.status().is_success() {
-            return Err(format!("Ollama /api/chat failed: {}", response.status()));
+            let status = response.status();
+            let body = response.text().unwrap_or_default();
+            logging::log_llm_event(
+                "ollama.chat.error",
+                json!({
+                    "model": model,
+                    "stream": stream,
+                    "kind": "status",
+                    "status": status.as_u16(),
+                    "body": truncate_for_log(&body, 20_000),
+                }),
+            );
+            return Err(format!("Ollama /api/chat failed: {status}"));
         }
 
         let tool_names = tools
@@ -174,6 +205,11 @@ impl OllamaClient {
             parse_chat_response(&body, &tool_names)
         }
     }
+}
+
+pub fn should_use_native_tool_calls(model: &str) -> bool {
+    let normalized = model.to_ascii_lowercase();
+    !(normalized.contains("qwen3.5") || normalized.starts_with("qwen3:"))
 }
 
 #[derive(Deserialize)]

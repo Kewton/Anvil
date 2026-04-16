@@ -14,6 +14,8 @@ pub struct Config {
     pub ollama_host: String,
     pub context_budget: usize,
     pub max_iterations: usize,
+    pub chat_timeout_secs: u64,
+    pub chat_retries: usize,
     pub debug: bool,
     pub stream: bool,
     pub tui: bool,
@@ -32,6 +34,8 @@ pub struct PartialConfig {
     pub ollama_host: Option<String>,
     pub context_budget: Option<usize>,
     pub max_iterations: Option<usize>,
+    pub chat_timeout_secs: Option<u64>,
+    pub chat_retries: Option<usize>,
     pub debug: Option<bool>,
     pub stream: Option<bool>,
     pub tui: Option<bool>,
@@ -56,6 +60,8 @@ impl Config {
             ollama_host: args.ollama_host.clone(),
             context_budget: args.context_budget,
             max_iterations: args.max_iterations,
+            chat_timeout_secs: args.chat_timeout_secs,
+            chat_retries: args.chat_retries,
             debug: args.debug.then_some(true),
             stream: args.stream.then_some(true),
             tui: args.tui.then_some(true),
@@ -78,6 +84,8 @@ impl Config {
             ollama_host,
             context_budget: merged.context_budget.unwrap_or(24_000),
             max_iterations: merged.max_iterations.unwrap_or(12),
+            chat_timeout_secs: merged.chat_timeout_secs.unwrap_or(300),
+            chat_retries: merged.chat_retries.unwrap_or(2),
             debug: merged.debug.unwrap_or(false),
             stream: merged.stream.unwrap_or(false),
             tui: merged.tui.unwrap_or(false),
@@ -128,6 +136,12 @@ pub fn merge_partial_configs(configs: &[PartialConfig]) -> PartialConfig {
         if config.max_iterations.is_some() {
             merged.max_iterations = config.max_iterations;
         }
+        if config.chat_timeout_secs.is_some() {
+            merged.chat_timeout_secs = config.chat_timeout_secs;
+        }
+        if config.chat_retries.is_some() {
+            merged.chat_retries = config.chat_retries;
+        }
         if config.debug.is_some() {
             merged.debug = config.debug;
         }
@@ -175,6 +189,10 @@ pub fn load_config_file(path: &Path) -> Result<PartialConfig, String> {
         max_iterations: map
             .get("max_iterations")
             .and_then(|value| value.parse().ok()),
+        chat_timeout_secs: map
+            .get("chat_timeout_secs")
+            .and_then(|value| value.parse().ok()),
+        chat_retries: map.get("chat_retries").and_then(|value| value.parse().ok()),
         debug: map.get("debug").and_then(|value| parse_bool(value)),
         stream: map.get("stream").and_then(|value| parse_bool(value)),
         tui: map.get("tui").and_then(|value| parse_bool(value)),
@@ -199,6 +217,12 @@ pub fn load_env_config() -> PartialConfig {
             .ok()
             .and_then(|value| value.parse().ok()),
         max_iterations: env::var("ANVIL_MAX_ITERATIONS")
+            .ok()
+            .and_then(|value| value.parse().ok()),
+        chat_timeout_secs: env::var("ANVIL_CHAT_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse().ok()),
+        chat_retries: env::var("ANVIL_CHAT_RETRIES")
             .ok()
             .and_then(|value| value.parse().ok()),
         debug: env::var("ANVIL_DEBUG")
