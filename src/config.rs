@@ -18,9 +18,6 @@ pub struct Config {
     pub chat_retries: usize,
     pub debug: bool,
     pub stream: bool,
-    pub tui: bool,
-    pub watch: bool,
-    pub auto_test_command: Option<String>,
     pub yes_mode: bool,
     pub fresh_session: bool,
     pub oneshot: bool,
@@ -38,9 +35,6 @@ pub struct PartialConfig {
     pub chat_retries: Option<usize>,
     pub debug: Option<bool>,
     pub stream: Option<bool>,
-    pub tui: Option<bool>,
-    pub watch: Option<bool>,
-    pub auto_test_command: Option<String>,
     pub yes_mode: Option<bool>,
     pub fresh_session: Option<bool>,
 }
@@ -64,9 +58,6 @@ impl Config {
             chat_retries: args.chat_retries,
             debug: args.debug.then_some(true),
             stream: args.stream.then_some(true),
-            tui: args.tui.then_some(true),
-            watch: args.watch.then_some(true),
-            auto_test_command: args.auto_test.clone(),
             yes_mode: args.yes.then_some(true),
             fresh_session: args.fresh_session.then_some(true),
         };
@@ -88,9 +79,6 @@ impl Config {
             chat_retries: merged.chat_retries.unwrap_or(2),
             debug: merged.debug.unwrap_or(false),
             stream: merged.stream.unwrap_or(false),
-            tui: merged.tui.unwrap_or(false),
-            watch: merged.watch.unwrap_or(false),
-            auto_test_command: merged.auto_test_command,
             yes_mode: merged.yes_mode.unwrap_or(false),
             fresh_session: merged.fresh_session.unwrap_or(false),
             oneshot: args.oneshot || args.prompt.is_some(),
@@ -148,15 +136,6 @@ pub fn merge_partial_configs(configs: &[PartialConfig]) -> PartialConfig {
         if config.stream.is_some() {
             merged.stream = config.stream;
         }
-        if config.tui.is_some() {
-            merged.tui = config.tui;
-        }
-        if config.watch.is_some() {
-            merged.watch = config.watch;
-        }
-        if config.auto_test_command.is_some() {
-            merged.auto_test_command = config.auto_test_command.clone();
-        }
         if config.yes_mode.is_some() {
             merged.yes_mode = config.yes_mode;
         }
@@ -195,12 +174,6 @@ pub fn load_config_file(path: &Path) -> Result<PartialConfig, String> {
         chat_retries: map.get("chat_retries").and_then(|value| value.parse().ok()),
         debug: map.get("debug").and_then(|value| parse_bool(value)),
         stream: map.get("stream").and_then(|value| parse_bool(value)),
-        tui: map.get("tui").and_then(|value| parse_bool(value)),
-        watch: map.get("watch").and_then(|value| parse_bool(value)),
-        auto_test_command: map
-            .get("auto_test_command")
-            .cloned()
-            .or_else(|| map.get("auto_test").cloned()),
         yes_mode: map.get("yes_mode").and_then(|value| parse_bool(value)),
         fresh_session: map.get("fresh_session").and_then(|value| parse_bool(value)),
     })
@@ -231,13 +204,6 @@ pub fn load_env_config() -> PartialConfig {
         stream: env::var("ANVIL_STREAM")
             .ok()
             .and_then(|value| parse_bool(&value)),
-        tui: env::var("ANVIL_TUI")
-            .ok()
-            .and_then(|value| parse_bool(&value)),
-        watch: env::var("ANVIL_WATCH")
-            .ok()
-            .and_then(|value| parse_bool(&value)),
-        auto_test_command: env::var("ANVIL_AUTO_TEST").ok(),
         yes_mode: env::var("ANVIL_YES")
             .ok()
             .and_then(|value| parse_bool(&value)),

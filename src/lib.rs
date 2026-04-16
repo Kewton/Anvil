@@ -1,20 +1,26 @@
 pub mod agent;
 pub mod cli;
 pub mod config;
-pub mod git;
+#[allow(dead_code)]
+mod git;
 pub mod logging;
-pub mod mcp;
+#[allow(dead_code)]
+mod mcp;
 pub mod model_registry;
 pub mod modes;
 pub mod ollama;
 pub mod safety;
 pub mod session;
-pub mod skills;
+#[allow(dead_code)]
+mod skills;
 pub mod system_prompt;
-pub mod testloop;
+#[allow(dead_code)]
+mod testloop;
 pub mod tools;
-pub mod tui;
-pub mod watch;
+#[allow(dead_code)]
+mod tui;
+#[allow(dead_code)]
+mod watch;
 
 use std::io::{self, IsTerminal, Read};
 
@@ -29,8 +35,6 @@ pub fn run_cli(args: CliArgs) -> Result<(), String> {
     let config = Config::load(args)?;
     logging::init_logging(config.debug, &config.cwd)?;
     config.ensure_state_dirs()?;
-    let use_tui = config.tui;
-
     let client =
         OllamaClient::new_with_timeout(config.ollama_host.clone(), config.chat_timeout_secs)?;
     let available_models = client.list_models()?;
@@ -51,11 +55,7 @@ pub fn run_cli(args: CliArgs) -> Result<(), String> {
         return Ok(());
     }
 
-    if use_tui {
-        tui::run(&mut agent)
-    } else {
-        agent.run_repl()
-    }
+    agent.run_repl()
 }
 
 pub fn stdin_prompt() -> Result<Option<String>, String> {

@@ -3,24 +3,24 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
-use crate::agent::{parallel, recovery};
+use crate::agent::recovery;
 use crate::config::Config;
 use crate::format_model_banner;
-use crate::git::checkpoint::GitCheckpointManager;
-use crate::mcp::client::McpRegistry;
 use crate::model_registry::RuntimeModels;
 use crate::modes::plan_act::ExecutionMode;
 use crate::ollama::client::{AssistantReply, OllamaClient, should_use_native_tool_calls};
+use crate::ollama::xml_fallback::ToolCall;
+use crate::safety::path_guard::resolve_user_path;
 use crate::session::compact::{
     approximate_token_count, compact_messages, compact_messages_with_strategy,
 };
 use crate::session::store::{ConversationMessage, SessionSnapshot, SessionStore};
-use crate::skills::loader::SkillLibrary;
 use crate::stdin_prompt;
 use crate::system_prompt::build_system_prompt;
-use crate::testloop::auto_test::AutoTestRunner;
 use crate::tools::registry::{ToolContext, ToolRegistry};
-use crate::watch::file_watcher::FileWatcher;
+
+const DEFAULT_KEEP_TAIL: usize = 24;
+const MAX_TOOL_MESSAGE_CHARS: usize = 12_000;
 
 pub enum AgentEvent {
     Continue(Option<String>),
@@ -35,11 +35,6 @@ pub struct Agent {
     session: SessionSnapshot,
     work_root: PathBuf,
     tool_registry: ToolRegistry,
-    checkpoint_manager: GitCheckpointManager,
-    watcher: Option<FileWatcher>,
-    auto_test: AutoTestRunner,
-    skills: SkillLibrary,
-    mcp: McpRegistry,
 }
 
 impl Agent {
@@ -50,20 +45,10 @@ impl Agent {
         session_store: SessionStore,
         session: SessionSnapshot,
     ) -> Self {
-        let checkpoints = session.checkpoints.clone();
-        let checkpoint_manager = GitCheckpointManager::new(config.cwd.clone(), checkpoints);
         let work_root = session
             .active_root
             .clone()
             .unwrap_or_else(|| config.cwd.clone());
-        let watcher = if config.watch {
-            FileWatcher::new(work_root.clone()).ok()
-        } else {
-            None
-        };
-        let auto_test = AutoTestRunner::new(config.auto_test_command.clone());
-        let skills = SkillLibrary::new(config.cwd.join(".anvil").join("skills"));
-        let mcp = McpRegistry::new(config.cwd.join(".anvil").join("mcp.json"));
         Self {
             config,
             models,
@@ -72,11 +57,6 @@ impl Agent {
             session,
             work_root,
             tool_registry: ToolRegistry::default(),
-            checkpoint_manager,
-            watcher,
-            auto_test,
-            skills,
-            mcp,
         }
     }
 
@@ -114,9 +94,6 @@ impl Agent {
 
         let mut line = String::new();
         loop {
-            if let Some(background) = self.poll_background_tasks()? {
-                println!("{background}");
-            }
             print!("anvil> ");
             io::stdout()
                 .flush()
@@ -169,17 +146,15 @@ impl Agent {
     }
 
     fn handle_command(&mut self, input: &str) -> Result<AgentEvent, String> {
-        let (command, rest) = input.split_once(' ').unwrap_or((input, ""));
+        let (command, _) = input.split_once(' ').unwrap_or((input, ""));
         match command {
             "/help" => Ok(AgentEvent::Continue(Some(
-                "/help /status /model /plan /approve /compact /checkpoint /rollback /yes /no /watch /autotest /skills /skill <name> /mcp /parallel t1 || t2 /exit".to_string(),
+                "/help /status /model /plan /approve /compact /yes /no /exit".to_string(),
             ))),
             "/status" => Ok(AgentEvent::Continue(Some(format!(
-                "mode={:?} auto_approve={} watch={} auto_test={} cwd={} session={} plan={} approx_tokens={}",
+                "mode={:?} auto_approve={} cwd={} session={} plan={} approx_tokens={} deferred=git,watch,testloop,tui,skills,mcp,parallel",
                 self.session.mode_state.mode,
                 self.config.yes_mode,
-                self.watcher.is_some(),
-                self.auto_test.command().unwrap_or("-"),
                 self.work_root.display(),
                 self.session_store.path().display(),
                 self.session
@@ -190,14 +165,20 @@ impl Agent {
                     .unwrap_or_else(|| "-".to_string()),
                 approximate_token_count(&self.session.messages),
             )))),
-            "/model" => Ok(AgentEvent::Continue(Some(format_model_banner(&self.models)))),
+            "/model" => Ok(AgentEvent::Continue(Some(format_model_banner(
+                &self.models,
+            )))),
             "/yes" => {
                 self.config.yes_mode = true;
-                Ok(AgentEvent::Continue(Some("auto-approve enabled".to_string())))
+                Ok(AgentEvent::Continue(Some(
+                    "auto-approve enabled".to_string(),
+                )))
             }
             "/no" => {
                 self.config.yes_mode = false;
-                Ok(AgentEvent::Continue(Some("auto-approve disabled".to_string())))
+                Ok(AgentEvent::Continue(Some(
+                    "auto-approve disabled".to_string(),
+                )))
             }
             "/plan" => {
                 if self.session.mode_state.mode == ExecutionMode::Plan {
@@ -234,11 +215,6 @@ impl Agent {
                     return Err("plan file is empty or still template-only".to_string());
                 }
                 self.session.mode_state.approve();
-                if self.checkpoint_manager.is_git_repo() {
-                    let _ = self
-                        .checkpoint_manager
-                        .create_checkpoint("anvil-plan-to-act");
-                }
                 self.push_system_note(format!(
                     "[Act Mode] Implement the following plan step by step.\n\n{}",
                     plan_contents
@@ -253,100 +229,10 @@ impl Agent {
                     "session already compact".to_string()
                 })))
             }
-            "/checkpoint" => {
-                let label = if rest.trim().is_empty() {
-                    "anvil-manual-checkpoint"
-                } else {
-                    rest.trim()
-                };
-                let message = match self.checkpoint_manager.create_checkpoint(label)? {
-                    Some(sha) => format!("checkpoint saved: {sha}"),
-                    None => "no local changes to checkpoint".to_string(),
-                };
-                self.session.checkpoints = self.checkpoint_manager.checkpoints.clone();
-                Ok(AgentEvent::Continue(Some(message)))
-            }
-            "/rollback" => {
-                let sha = self.checkpoint_manager.rollback_latest()?;
-                self.session.checkpoints = self.checkpoint_manager.checkpoints.clone();
-                Ok(AgentEvent::Continue(Some(format!(
-                    "rolled back to checkpoint {sha}"
-                ))))
-            }
-            "/watch" => {
-                if self.watcher.is_some() {
-                    self.watcher = None;
-                    Ok(AgentEvent::Continue(Some("file watcher disabled".to_string())))
-                } else {
-                    self.watcher = Some(FileWatcher::new(self.work_root.clone())?);
-                    Ok(AgentEvent::Continue(Some("file watcher enabled".to_string())))
-                }
-            }
-            "/autotest" => {
-                let trimmed = rest.trim();
-                if trimmed.is_empty() {
-                    if self.auto_test.is_enabled() {
-                        self.auto_test.set_command(None);
-                        Ok(AgentEvent::Continue(Some("auto-test disabled".to_string())))
-                    } else {
-                        Err("usage: /autotest <command>".to_string())
-                    }
-                } else {
-                    self.auto_test.set_command(Some(trimmed.to_string()));
-                    Ok(AgentEvent::Continue(Some(format!(
-                        "auto-test command set: {trimmed}"
-                    ))))
-                }
-            }
-            "/skills" => {
-                let skills = self.skills.list()?;
-                let message = if skills.is_empty() {
-                    format!("no skills found in {}", self.skills.root().display())
-                } else {
-                    format!("skills: {}", skills.join(", "))
-                };
-                Ok(AgentEvent::Continue(Some(message)))
-            }
-            "/skill" => {
-                let name = rest.trim();
-                if name.is_empty() {
-                    return Err("usage: /skill <name>".to_string());
-                }
-                let skill = self.skills.load(name)?;
-                self.push_system_note(format!(
-                    "[Skill:{}]\n{}",
-                    skill.name,
-                    skill.content.chars().take(8_000).collect::<String>()
-                ));
-                Ok(AgentEvent::Continue(Some(format!(
-                    "loaded skill: {}",
-                    skill.path.display()
-                ))))
-            }
-            "/mcp" => Ok(AgentEvent::Continue(Some(
-                self.mcp.status_lines()?.join("\n"),
-            ))),
-            "/parallel" => {
-                let tasks = rest
-                    .split("||")
-                    .map(str::trim)
-                    .filter(|task| !task.is_empty())
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>();
-                let model = self
-                    .models
-                    .sidecar
-                    .clone()
-                    .unwrap_or_else(|| self.models.main.clone());
-                let outputs = parallel::run_parallel_analysis(self.client.clone(), model, tasks)?;
-                let message = outputs
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, output)| format!("[worker {}]\n{}", index + 1, output.trim()))
-                    .collect::<Vec<_>>()
-                    .join("\n\n");
-                Ok(AgentEvent::Continue(Some(message)))
-            }
+            "/checkpoint" | "/rollback" | "/watch" | "/autotest" | "/skills" | "/skill"
+            | "/mcp" | "/parallel" => Ok(AgentEvent::Continue(Some(format!(
+                "{command} is unavailable in the v0.1.0 core rebuild"
+            )))),
             "/exit" | "/quit" => Ok(AgentEvent::Exit),
             _ => Ok(AgentEvent::Continue(Some(format!(
                 "unknown command: {command}"
@@ -356,7 +242,7 @@ impl Agent {
 
     fn handle_user_message(&mut self, input: &str, stream_output: bool) -> Result<String, String> {
         self.push_user_message(input.to_string());
-        self.maybe_compact_session(24);
+        self.maybe_compact_session(DEFAULT_KEEP_TAIL);
 
         let action_expectation =
             recovery::classify_action_expectation(input, self.session.mode_state.mode);
@@ -369,10 +255,15 @@ impl Agent {
 
         for _ in 0..self.config.max_iterations {
             let reply = self.request_assistant_reply_with_retry(stream_output)?;
-            if !reply.tool_calls.is_empty() {
-                tool_calls_made_this_turn += reply.tool_calls.len();
-                repo_edit_calls_made_this_turn += reply
-                    .tool_calls
+            let prepared_tool_calls = reply
+                .tool_calls
+                .into_iter()
+                .map(|tool_call| self.prepare_tool_call(tool_call))
+                .collect::<Vec<_>>();
+
+            if !prepared_tool_calls.is_empty() {
+                tool_calls_made_this_turn += prepared_tool_calls.len();
+                repo_edit_calls_made_this_turn += prepared_tool_calls
                     .iter()
                     .filter(|tool_call| recovery::tool_call_counts_as_repo_edit(&tool_call.name))
                     .count();
@@ -381,17 +272,20 @@ impl Agent {
                 if repo_edit_calls_made_this_turn > 0 {
                     repo_change_retries = 0;
                 }
+
                 self.session.messages.push(ConversationMessage::assistant(
                     reply.content,
-                    reply.tool_calls.clone(),
+                    prepared_tool_calls.clone(),
                 ));
-                for tool_call in reply.tool_calls {
-                    let result = self.execute_tool_call(&tool_call.name, &tool_call.arguments)?;
+                for tool_call in prepared_tool_calls {
+                    let tool_name = tool_call.name.clone();
+                    let raw_result = self.execute_tool_call(&tool_name, &tool_call.arguments);
+                    let compact_result = compact_tool_result(&tool_name, raw_result);
                     self.session
                         .messages
-                        .push(ConversationMessage::tool(tool_call.name, result));
+                        .push(ConversationMessage::tool(tool_name, compact_result));
                 }
-                self.maybe_compact_session(24);
+                self.maybe_compact_session(DEFAULT_KEEP_TAIL);
                 continue;
             }
 
@@ -453,18 +347,11 @@ impl Agent {
             match self.request_assistant_reply(stream_output) {
                 Ok(reply) => return Ok(reply),
                 Err(err) => {
-                    last_error = Some(err.clone());
+                    last_error = Some(err);
                     if attempt == self.config.chat_retries {
                         break;
                     }
-                    let delay_secs = (attempt + 1) as u64 * 2;
-                    self.push_system_note(format!(
-                        "[Runtime Retry] The previous Ollama request failed with: {err}. Retry {}/{} waits {} seconds and then continues from the current tool state.",
-                        attempt + 1,
-                        self.config.chat_retries,
-                        delay_secs
-                    ));
-                    thread::sleep(Duration::from_secs(delay_secs));
+                    thread::sleep(Duration::from_secs((attempt + 1) as u64 * 2));
                 }
             }
         }
@@ -478,6 +365,7 @@ impl Agent {
         } else {
             "anvil_tool_call"
         };
+
         let mut messages = Vec::new();
         messages.push(ConversationMessage::system(build_system_prompt(
             self.session.mode_state.mode,
@@ -488,14 +376,21 @@ impl Agent {
         if !native_tools_enabled {
             messages.push(ConversationMessage::system(
                 format!(
-                    "For this model, do not emit native tool_calls. When you need a tool, output only <{tool_call_tag}>{{\"name\":\"Tool\",\"arguments\":{{...}}}}</{tool_call_tag}> blocks with valid JSON arguments."
+                    "For this model, do not emit native tool_calls. When you need tools, output only <{tool_call_tag}>{{\"name\":\"Tool\",\"arguments\":{{...}}}}</{tool_call_tag}> blocks with valid JSON arguments."
                 ),
             ));
         }
         if self.work_root != self.config.cwd {
             messages.push(ConversationMessage::system(format!(
-                "Current project root is {}. Use relative paths from this directory.",
+                "Current project root is {}. Use relative paths from this directory unless an absolute path is easier for file tools.",
                 self.work_root.display()
+            )));
+        }
+        if let Some(nextjs_targets) = detect_nextjs_targets(&self.work_root) {
+            messages.push(ConversationMessage::system(format!(
+                "Detected Next.js app entry files at {} and {}. If you need to edit the UI, inspect those files first.",
+                self.work_root.join(&nextjs_targets.page).display(),
+                self.work_root.join(&nextjs_targets.globals).display(),
             )));
         }
         messages.extend(self.session.messages.clone());
@@ -525,11 +420,7 @@ impl Agent {
         }
     }
 
-    fn execute_tool_call(
-        &mut self,
-        name: &str,
-        arguments: &serde_json::Value,
-    ) -> Result<String, String> {
+    fn execute_tool_call(&mut self, name: &str, arguments: &serde_json::Value) -> String {
         let context = ToolContext {
             root: self.work_root.clone(),
             mode: self.session.mode_state.mode,
@@ -537,9 +428,27 @@ impl Agent {
             auto_approve: self.config.yes_mode,
             interactive_approval: io::stdin().is_terminal(),
         };
-        let result = self.tool_registry.execute(name, arguments, &context)?;
-        self.maybe_update_work_root(name, arguments, &result);
-        Ok(result)
+        match self.tool_registry.execute(name, arguments, &context) {
+            Ok(result) => {
+                self.maybe_update_work_root(name, arguments, &result);
+                result
+            }
+            Err(err) => format_tool_error(&err),
+        }
+    }
+
+    fn prepare_tool_call(&self, mut tool_call: ToolCall) -> ToolCall {
+        if matches!(tool_call.name.as_str(), "Read" | "Write" | "Edit")
+            && let Some(arguments) = tool_call.arguments.as_object_mut()
+            && let Some(raw_path) = arguments.get("path").and_then(serde_json::Value::as_str)
+            && let Ok(resolved) = resolve_user_path(&self.work_root, raw_path)
+        {
+            arguments.insert(
+                "path".to_string(),
+                serde_json::Value::String(resolved.display().to_string()),
+            );
+        }
+        tool_call
     }
 
     fn push_system_note(&mut self, note: String) {
@@ -567,7 +476,6 @@ impl Agent {
     }
 
     fn persist_session(&mut self) -> Result<(), String> {
-        self.session.checkpoints = self.checkpoint_manager.checkpoints.clone();
         self.session.active_root = if self.work_root == self.config.cwd {
             None
         } else {
@@ -610,25 +518,6 @@ impl Agent {
         .map_err(|err| format!("failed to create plan file {}: {err}", plan_path.display()))
     }
 
-    fn poll_background_tasks(&mut self) -> Result<Option<String>, String> {
-        let Some(watcher) = &mut self.watcher else {
-            return Ok(None);
-        };
-        let changes = watcher.poll_changes()?;
-        if changes.is_empty() {
-            return Ok(None);
-        }
-
-        let mut lines = vec![format!("watcher:\n{}", changes.join("\n"))];
-        if let Some(result) = self.auto_test.run_if_enabled(&self.work_root)? {
-            lines.push(format!(
-                "auto-test: {} exit={}\n{}",
-                result.command, result.exit_code, result.output
-            ));
-        }
-        Ok(Some(lines.join("\n\n")))
-    }
-
     fn maybe_update_work_root(&mut self, name: &str, arguments: &serde_json::Value, result: &str) {
         if name != "Bash" {
             return;
@@ -649,9 +538,6 @@ impl Agent {
 
         self.work_root = new_root.clone();
         self.session.active_root = Some(new_root.clone());
-        if self.config.watch {
-            self.watcher = FileWatcher::new(new_root.clone()).ok();
-        }
         self.push_system_note(format!(
             "[Workspace Root Updated] Continue work inside {} and use relative paths from there.",
             new_root.display()
@@ -692,10 +578,71 @@ fn detect_created_project_root(tool_output: &str) -> Option<PathBuf> {
     None
 }
 
+#[derive(Debug, Clone)]
+struct NextJsTargets {
+    page: PathBuf,
+    globals: PathBuf,
+}
+
+fn detect_nextjs_targets(root: &Path) -> Option<NextJsTargets> {
+    let candidates = [
+        ("src/app/page.tsx", "src/app/globals.css"),
+        ("app/page.tsx", "app/globals.css"),
+    ];
+    for (page, globals) in candidates {
+        let page_path = root.join(page);
+        let globals_path = root.join(globals);
+        if page_path.is_file() || globals_path.is_file() {
+            return Some(NextJsTargets {
+                page: PathBuf::from(page),
+                globals: PathBuf::from(globals),
+            });
+        }
+    }
+    None
+}
+
+fn format_tool_error(err: &str) -> String {
+    if err.starts_with("Error:") {
+        err.to_string()
+    } else {
+        format!("Error: {err}")
+    }
+}
+
+fn compact_tool_result(name: &str, result: String) -> String {
+    if result.chars().count() <= MAX_TOOL_MESSAGE_CHARS {
+        return result;
+    }
+
+    let chars = result.chars().collect::<Vec<_>>();
+    let total = chars.len();
+    let head_len = if name == "Read" { 8_000 } else { 10_000 }.min(total);
+    let tail_len = if name == "Read" { 2_000 } else { 1_000 }.min(total.saturating_sub(head_len));
+    let head = chars[..head_len].iter().collect::<String>();
+    let tail = if tail_len == 0 {
+        String::new()
+    } else {
+        chars[total - tail_len..].iter().collect::<String>()
+    };
+
+    if tail.is_empty() {
+        format!("{head}\n...[truncated {} chars]", total - head_len)
+    } else {
+        format!(
+            "{head}\n...[truncated {} chars]...\n{tail}",
+            total.saturating_sub(head_len + tail_len)
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::detect_created_project_root;
+    use super::{
+        compact_tool_result, detect_created_project_root, detect_nextjs_targets, format_tool_error,
+    };
     use std::path::PathBuf;
+    use tempfile::tempdir;
 
     #[test]
     fn detects_created_next_app_root_from_success_line() {
@@ -713,5 +660,39 @@ mod tests {
             detect_created_project_root(output),
             Some(PathBuf::from("/tmp/work/space-invaders"))
         );
+    }
+
+    #[test]
+    fn detects_src_app_nextjs_targets() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            "export default function Page(){}",
+        )
+        .unwrap();
+        let targets = detect_nextjs_targets(dir.path()).unwrap();
+        assert_eq!(targets.page, PathBuf::from("src/app/page.tsx"));
+        assert_eq!(targets.globals, PathBuf::from("src/app/globals.css"));
+    }
+
+    #[test]
+    fn tool_errors_are_formatted_for_model_recovery() {
+        assert_eq!(
+            format_tool_error("failed to stat /tmp/missing: nope"),
+            "Error: failed to stat /tmp/missing: nope"
+        );
+        assert_eq!(
+            format_tool_error("Error: file not found"),
+            "Error: file not found"
+        );
+    }
+
+    #[test]
+    fn read_results_are_compacted_for_transcript() {
+        let long = "a".repeat(20_000);
+        let compacted = compact_tool_result("Read", long);
+        assert!(compacted.contains("[truncated"));
+        assert!(compacted.len() < 13_000);
     }
 }

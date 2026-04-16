@@ -8,6 +8,12 @@
 リリース前に、local LLM 実運用で最低限壊れていないことを人手で確認する。
 `cargo test` の通過だけでなく、live Ollama 上で意味的に完遂できるかを確認する。
 
+注記:
+
+- この checklist は `workspace/v0.1.0/05_phase_a_scope_freeze.md` のコア範囲に従う
+- watcher / autotest / tui / skills / mcp / parallel / git checkpoint は v0.1.0 コア acceptance から外す
+- それらは post-core の後段機能として別途確認する
+
 ## 前提
 
 - Ollama が localhost で起動している
@@ -41,6 +47,14 @@ ANVIL_E2E_RUNS=2 cargo test --test e2e_local_llm live_ollama_multi_run_file_writ
 - `live_ollama_multi_run_file_write_stability ... ok`
 - temp workspace に `e2e-output.txt` が作られる
 - 中身が `LOCAL_E2E_OK`
+
+加えて、release candidate 判定では意味的成功を確認する。
+
+- scaffold 止まりで終わっていない
+- `Write` または `Edit` が実際に発生している
+- `page.tsx` が初期テンプレートではない
+- `3011` で起動できる
+- 生成物に依頼内容に沿うゲーム要素がある
 
 ## 2. sidecar compaction
 
@@ -98,46 +112,7 @@ ANVIL_SIDECAR_MODEL=qwen3.5:4b ./target/release/anvil -y
 - empty reply が続いた場合は無限ループせず失敗で止まる
 - no-tool prose を 3 回以上繰り返さない
 
-## 5. rollback
-
-確認手順:
-
-1. `/checkpoint before-change`
-2. ファイルを書き換える
-3. `/rollback`
-
-期待結果:
-
-- 変更が checkpoint 時点へ戻る
-- untracked file も戻る
-
-## 6. watcher / autotest / tui / skills / mcp / parallel
-
-確認手順:
-
-```bash
-./target/release/anvil --watch --auto-test "cargo test --lib" --stream
-```
-
-対話中に以下を確認する。
-
-1. repo 内の任意ファイルを外部から更新する
-2. `/skills` で `.anvil/skills` の一覧を確認する
-3. skill file を1つ置いて `/skill <name>` を試す
-4. `.anvil/mcp.json` を置いて `/mcp` を試す
-5. `/parallel task1 || task2` を試す
-6. `./target/release/anvil --tui` で軽量 TUI を起動する
-
-期待結果:
-
-- watcher が変更を検知する
-- auto-test command の exit code と出力が返る
-- skill を system note として注入できる
-- MCP config の一覧が表示される
-- 2 並列の read-only analysis が返る
-- lightweight TUI で継続対話できる
-
-## 7. release shape
+## 5. release shape
 
 確認手順:
 
@@ -159,8 +134,8 @@ sed -n '1,220p' .github/workflows/release.yml
 
 - 静的ゲート通過
 - live Ollama E2E 通過
+- `Write/Edit` を伴う意味的完遂が確認できる
 - sidecar compaction 通過
 - Plan / Act 通過
 - no-tool / empty response recovery が無限ループしない
-- watcher / autotest / tui / skills / mcp / parallel の最小系が動く
 - release artifact と workflow が壊れていない

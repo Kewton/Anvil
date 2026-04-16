@@ -1,4 +1,6 @@
 use std::env;
+use std::path::Path;
+use std::process::Command;
 
 use anvil::agent::Agent;
 use anvil::config::Config;
@@ -15,44 +17,10 @@ fn live_ollama_can_write_a_file() {
         env::var("ANVIL_E2E_OLLAMA_HOST").unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
     let model = env::var("ANVIL_E2E_MODEL").unwrap_or_else(|_| "qwen3:8b".to_string());
 
-    let client = OllamaClient::new(host.clone()).unwrap();
-    let available = client.list_models().unwrap();
-    if !available.iter().any(|candidate| candidate == &model) {
-        eprintln!("skip live e2e: model {model} is not installed at {host}");
+    let Some(client) = available_client_or_skip(&host, &model).unwrap() else {
         return;
-    }
-
-    let config = Config {
-        cwd: temp.path().to_path_buf(),
-        requested_model: Some(model.clone()),
-        requested_sidecar_model: None,
-        ollama_host: host,
-        context_budget: 24_000,
-        max_iterations: 8,
-        chat_timeout_secs: 300,
-        chat_retries: 1,
-        debug: false,
-        stream: false,
-        tui: false,
-        watch: false,
-        auto_test_command: None,
-        yes_mode: true,
-        fresh_session: true,
-        oneshot: true,
-        prompt: None,
     };
-    config.ensure_state_dirs().unwrap();
-
-    let mut agent = Agent::new(
-        config,
-        RuntimeModels {
-            main: model,
-            sidecar: None,
-        },
-        client,
-        SessionStore::new(temp.path().join(".anvil/sessions/session.json")),
-        Default::default(),
-    );
+    let mut agent = new_agent(temp.path(), &host, &model, client.clone(), 8);
 
     let prompt = "Use the available file tools to create a file named e2e-output.txt in the current project root. The file content must be exactly LOCAL_E2E_OK on a single line. After writing the file, reply with one short sentence.";
     run_with_retry(
@@ -64,6 +32,7 @@ fn live_ollama_can_write_a_file() {
 
     let content = std::fs::read_to_string(temp.path().join("e2e-output.txt")).unwrap();
     assert_eq!(content.trim(), "LOCAL_E2E_OK");
+    assert!(temp.path().join(".anvil/sessions/session.json").is_file());
 }
 
 #[test]
@@ -77,45 +46,13 @@ fn live_ollama_multi_run_file_write_stability() {
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(3);
 
-    let client = OllamaClient::new(host.clone()).unwrap();
-    let available = client.list_models().unwrap();
-    if !available.iter().any(|candidate| candidate == &model) {
-        eprintln!("skip live e2e: model {model} is not installed at {host}");
+    let Some(client) = available_client_or_skip(&host, &model).unwrap() else {
         return;
-    }
+    };
 
     for run in 0..runs {
         let temp = tempdir().unwrap();
-        let config = Config {
-            cwd: temp.path().to_path_buf(),
-            requested_model: Some(model.clone()),
-            requested_sidecar_model: None,
-            ollama_host: host.clone(),
-            context_budget: 24_000,
-            max_iterations: 20,
-            chat_timeout_secs: 300,
-            chat_retries: 1,
-            debug: false,
-            stream: false,
-            tui: false,
-            watch: false,
-            auto_test_command: None,
-            yes_mode: true,
-            fresh_session: true,
-            oneshot: true,
-            prompt: None,
-        };
-        config.ensure_state_dirs().unwrap();
-        let mut agent = Agent::new(
-            config,
-            RuntimeModels {
-                main: model.clone(),
-                sidecar: None,
-            },
-            client.clone(),
-            SessionStore::new(temp.path().join(".anvil/sessions/session.json")),
-            Default::default(),
-        );
+        let mut agent = new_agent(temp.path(), &host, &model, client.clone(), 20);
         let prompt = format!(
             "Create a file at the relative path run-{run}.txt in the current workspace root. Do not use placeholders like /path/to/project. The file content must be exactly RUN_{run}_OK on one line."
         );
@@ -125,24 +62,22 @@ fn live_ollama_multi_run_file_write_stability() {
         run_with_retry(&mut agent, &prompt, &retry_prompt).unwrap();
         let content = std::fs::read_to_string(temp.path().join(format!("run-{run}.txt"))).unwrap();
         assert_eq!(content.trim(), format!("RUN_{run}_OK"));
+        assert!(temp.path().join(".anvil/sessions/session.json").is_file());
     }
 }
 
 #[test]
 #[ignore = "requires live Ollama, npm, and a working Next.js toolchain"]
-fn live_ollama_can_scaffold_and_start_dev_server() {
+fn live_ollama_can_semantically_edit_and_start_nextjs() {
     let host =
         env::var("ANVIL_E2E_OLLAMA_HOST").unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
     let model = env::var("ANVIL_E2E_MODEL").unwrap_or_else(|_| "qwen3:8b".to_string());
-    let client = OllamaClient::new(host.clone()).unwrap();
-    let available = client.list_models().unwrap();
-    if !available.iter().any(|candidate| candidate == &model) {
-        eprintln!("skip live e2e: model {model} is not installed at {host}");
+    let Some(client) = available_client_or_skip(&host, &model).unwrap() else {
         return;
-    }
+    };
 
     let temp = tempdir().unwrap();
-    std::process::Command::new("sh")
+    let scaffold_status = Command::new("sh")
         .args([
             "-lc",
             "npx create-next-app@latest app --ts --eslint --app --src-dir --use-npm --no-tailwind --import-alias '@/*' --yes",
@@ -150,50 +85,27 @@ fn live_ollama_can_scaffold_and_start_dev_server() {
         .current_dir(temp.path())
         .status()
         .unwrap();
+    assert!(scaffold_status.success());
 
     let cwd = temp.path().join("app");
-    let config = Config {
-        cwd: cwd.clone(),
-        requested_model: Some(model.clone()),
-        requested_sidecar_model: None,
-        ollama_host: host,
-        context_budget: 24_000,
-        max_iterations: 10,
-        chat_timeout_secs: 300,
-        chat_retries: 1,
-        debug: false,
-        stream: false,
-        tui: false,
-        watch: false,
-        auto_test_command: None,
-        yes_mode: true,
-        fresh_session: true,
-        oneshot: true,
-        prompt: None,
-    };
-    config.ensure_state_dirs().unwrap();
-    let mut agent = Agent::new(
-        config,
-        RuntimeModels {
-            main: model,
-            sidecar: None,
-        },
-        client,
-        SessionStore::new(cwd.join(".anvil/sessions/session.json")),
-        Default::default(),
-    );
-
-    let prompt = "Use the available tools to replace src/app/page.tsx with a simple page that renders the exact text LOCAL_E2E_WEB_OK. Then reply with a short sentence.";
+    let mut agent = new_agent(&cwd, &host, &model, client, 12);
+    let prompt = "Use the available tools to replace src/app/page.tsx with a simple page that renders the exact text LOCAL_E2E_WEB_OK. Finish the file edit before replying.";
     run_with_retry(
         &mut agent,
         prompt,
-        "Edit ./src/app/page.tsx now. Replace it with a page that renders exactly LOCAL_E2E_WEB_OK.",
+        &format!(
+            "Edit the file {} now. Replace it with a page that renders exactly LOCAL_E2E_WEB_OK. Do not stop after inspection.",
+            cwd.join("src/app/page.tsx").display()
+        ),
     )
     .unwrap();
-    let page = std::fs::read_to_string(cwd.join("src/app/page.tsx")).unwrap();
-    assert!(page.contains("LOCAL_E2E_WEB_OK"));
 
-    let status = std::process::Command::new("sh")
+    let page_path = cwd.join("src/app/page.tsx");
+    let page = std::fs::read_to_string(&page_path).unwrap();
+    assert_semantic_page_contents(&page, "LOCAL_E2E_WEB_OK");
+    assert!(cwd.join(".anvil/sessions/session.json").is_file());
+
+    let status = Command::new("sh")
         .args(["-lc", "npm run dev -- --port 3011 > /tmp/anvil-e2e-dev.log 2>&1 & pid=$!; sleep 8; kill $pid >/dev/null 2>&1; wait $pid >/dev/null 2>&1 || true"])
         .current_dir(&cwd)
         .status()
@@ -201,9 +113,63 @@ fn live_ollama_can_scaffold_and_start_dev_server() {
     assert!(status.success());
 }
 
+fn available_client_or_skip(host: &str, model: &str) -> Result<Option<OllamaClient>, String> {
+    let client = OllamaClient::new(host.to_string())?;
+    let available = client.list_models()?;
+    if available.iter().any(|candidate| candidate == model) {
+        Ok(Some(client))
+    } else {
+        eprintln!("skip live e2e: model {model} is not installed at {host}");
+        Ok(None)
+    }
+}
+
+fn new_agent(
+    cwd: &Path,
+    host: &str,
+    model: &str,
+    client: OllamaClient,
+    max_iterations: usize,
+) -> Agent {
+    let config = Config {
+        cwd: cwd.to_path_buf(),
+        requested_model: Some(model.to_string()),
+        requested_sidecar_model: None,
+        ollama_host: host.to_string(),
+        context_budget: 24_000,
+        max_iterations,
+        chat_timeout_secs: 300,
+        chat_retries: 1,
+        debug: false,
+        stream: false,
+        yes_mode: true,
+        fresh_session: true,
+        oneshot: true,
+        prompt: None,
+    };
+    config.ensure_state_dirs().unwrap();
+
+    Agent::new(
+        config,
+        RuntimeModels {
+            main: model.to_string(),
+            sidecar: None,
+        },
+        client,
+        SessionStore::new(cwd.join(".anvil/sessions/session.json")),
+        Default::default(),
+    )
+}
+
 fn run_with_retry(agent: &mut Agent, prompt: &str, retry_prompt: &str) -> Result<(), String> {
     match agent.run_oneshot(prompt) {
         Ok(_) => Ok(()),
         Err(_) => agent.run_oneshot(retry_prompt).map(|_| ()),
     }
+}
+
+fn assert_semantic_page_contents(page: &str, marker: &str) {
+    assert!(page.contains(marker));
+    assert!(!page.contains("Get started by editing"));
+    assert!(!page.contains("next/font/google"));
 }

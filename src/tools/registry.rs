@@ -115,7 +115,7 @@ fn default_tool_specs() -> Vec<ToolSpec> {
         ),
         tool(
             "Read",
-            "Read a text file or list a directory.",
+            "Read a text file or list a directory. Absolute paths are preferred.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -128,7 +128,7 @@ fn default_tool_specs() -> Vec<ToolSpec> {
         ),
         tool(
             "Write",
-            "Create or overwrite a file.",
+            "Create or overwrite a file. Absolute paths are preferred.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -140,7 +140,7 @@ fn default_tool_specs() -> Vec<ToolSpec> {
         ),
         tool(
             "Edit",
-            "Replace exact text in an existing file.",
+            "Replace exact text in an existing file. Absolute paths are preferred.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
