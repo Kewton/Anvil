@@ -1,5 +1,7 @@
 use anvil::agent::recovery::{
-    empty_response_recovery_note, no_tool_recovery_note, user_prompt_requires_action,
+    ActionExpectation, classify_action_expectation, empty_response_recovery_note,
+    no_tool_recovery_note, repo_change_recovery_note, tool_call_counts_as_repo_edit,
+    user_prompt_requires_action,
 };
 use anvil::modes::plan_act::ExecutionMode;
 
@@ -13,6 +15,17 @@ fn detects_action_prompts_in_english_and_japanese() {
         "README を修正して",
         ExecutionMode::Act
     ));
+    assert_eq!(
+        classify_action_expectation(
+            "最高に面白いゲームを next.js で開発してください",
+            ExecutionMode::Act
+        ),
+        ActionExpectation::RepoChange
+    );
+    assert_eq!(
+        classify_action_expectation("テストを実行して", ExecutionMode::Act),
+        ActionExpectation::ToolAction
+    );
     assert!(!user_prompt_requires_action(
         "Explain the architecture",
         ExecutionMode::Act
@@ -27,4 +40,8 @@ fn detects_action_prompts_in_english_and_japanese() {
 fn recovery_notes_are_non_empty() {
     assert!(empty_response_recovery_note(1, true).contains("attempt=1"));
     assert!(no_tool_recovery_note(2).contains("no_tool_attempt=2"));
+    assert!(repo_change_recovery_note(3).contains("repo_change_attempt=3"));
+    assert!(tool_call_counts_as_repo_edit("Write"));
+    assert!(tool_call_counts_as_repo_edit("Edit"));
+    assert!(!tool_call_counts_as_repo_edit("Bash"));
 }

@@ -358,18 +358,29 @@ impl Agent {
         self.push_user_message(input.to_string());
         self.maybe_compact_session(24);
 
-        let requires_action =
-            recovery::user_prompt_requires_action(input, self.session.mode_state.mode);
+        let action_expectation =
+            recovery::classify_action_expectation(input, self.session.mode_state.mode);
+        let requires_action = action_expectation != recovery::ActionExpectation::None;
         let mut tool_calls_made_this_turn = 0usize;
+        let mut repo_edit_calls_made_this_turn = 0usize;
         let mut empty_retries = 0usize;
         let mut no_tool_retries = 0usize;
+        let mut repo_change_retries = 0usize;
 
         for _ in 0..self.config.max_iterations {
             let reply = self.request_assistant_reply_with_retry(stream_output)?;
             if !reply.tool_calls.is_empty() {
                 tool_calls_made_this_turn += reply.tool_calls.len();
+                repo_edit_calls_made_this_turn += reply
+                    .tool_calls
+                    .iter()
+                    .filter(|tool_call| recovery::tool_call_counts_as_repo_edit(&tool_call.name))
+                    .count();
                 empty_retries = 0;
                 no_tool_retries = 0;
+                if repo_edit_calls_made_this_turn > 0 {
+                    repo_change_retries = 0;
+                }
                 self.session.messages.push(ConversationMessage::assistant(
                     reply.content,
                     reply.tool_calls.clone(),
@@ -406,6 +417,20 @@ impl Agent {
                     );
                 }
                 self.push_system_note(recovery::no_tool_recovery_note(no_tool_retries));
+                continue;
+            }
+
+            if action_expectation == recovery::ActionExpectation::RepoChange
+                && repo_edit_calls_made_this_turn == 0
+            {
+                repo_change_retries += 1;
+                if repo_change_retries >= 3 {
+                    return Err(
+                        "assistant kept stopping before making the requested repository edits"
+                            .to_string(),
+                    );
+                }
+                self.push_system_note(recovery::repo_change_recovery_note(repo_change_retries));
                 continue;
             }
 

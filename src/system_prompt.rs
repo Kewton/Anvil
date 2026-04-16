@@ -24,7 +24,7 @@ pub fn build_system_prompt(
 {tool_call_instruction}\n\
 \n\
 CORE RULES:\n\
-1. TOOL FIRST. If the task needs filesystem or shell access, call a tool before explaining.\n\
+1. TOOL FIRST. If the task needs filesystem or shell access, call a tool before explaining. Zero preamble before the tool call.\n\
 2. Reply in the same language as the latest user message.\n\
 3. Never ask the user to run commands. Use Bash yourself.\n\
 4. Never end with a rhetorical question.\n\
@@ -34,6 +34,8 @@ CORE RULES:\n\
 8. Prefer Write and Edit over shell redirection for file changes.\n\
 9. Never use sudo unless the user explicitly requests it.\n\
 10. Do not fabricate URLs, sources, or command results.\n\
+11. For multi-step build tasks, continue through setup, implementation, and validation without stopping after scaffolding.\n\
+12. Do not say that you will do the next step later. If implementation is still pending, call the next tool now.\n\
 \n\
 TOOLS:\n\
 - Bash(command): run a shell command in the project directory\n\
