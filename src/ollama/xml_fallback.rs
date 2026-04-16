@@ -67,7 +67,7 @@ pub fn extract_tool_calls(text: &str, allowed_tools: &[String]) -> (Vec<ToolCall
 }
 
 fn parse_tool_call_object(raw: &str, allowed_tools: &[String]) -> Option<(String, Value)> {
-    let value: Value = serde_json::from_str(raw).ok()?;
+    let value = parse_json_relaxed(raw)?;
     let object = value.as_object()?;
     let name = object
         .get("name")
@@ -75,14 +75,76 @@ fn parse_tool_call_object(raw: &str, allowed_tools: &[String]) -> Option<(String
         .and_then(Value::as_str)?;
     let arguments = object
         .get("arguments")
-        .cloned()
+        .and_then(normalize_arguments_value)
         .or_else(|| object.get("args").cloned())
-        .unwrap_or(Value::Object(Default::default()));
+        .unwrap_or_else(|| {
+            let mut remaining = object.clone();
+            remaining.remove("name");
+            remaining.remove("tool");
+            remaining.remove("arguments");
+            remaining.remove("args");
+            if remaining.is_empty() {
+                Value::Object(Default::default())
+            } else {
+                Value::Object(remaining)
+            }
+        });
     Some((normalize_name(name, allowed_tools), arguments))
 }
 
 fn parse_arguments(raw: &str) -> Option<Value> {
-    serde_json::from_str(raw).ok()
+    parse_json_relaxed(raw)
+}
+
+fn normalize_arguments_value(value: &Value) -> Option<Value> {
+    match value {
+        Value::String(raw) => parse_json_relaxed(raw).or_else(|| Some(Value::String(raw.clone()))),
+        other => Some(other.clone()),
+    }
+}
+
+fn parse_json_relaxed(raw: &str) -> Option<Value> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    for candidate in [trimmed.to_string(), strip_markdown_fence(trimmed)] {
+        if let Ok(parsed) = serde_json::from_str(&candidate) {
+            return Some(parsed);
+        }
+        if let Some(parsed) = repair_json_candidate(&candidate) {
+            return Some(parsed);
+        }
+    }
+
+    None
+}
+
+fn strip_markdown_fence(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if !trimmed.starts_with("```") {
+        return trimmed.to_string();
+    }
+
+    let mut lines = trimmed.lines();
+    let _ = lines.next();
+    let mut body = lines.collect::<Vec<_>>();
+    if matches!(body.last(), Some(last) if last.trim_start().starts_with("```")) {
+        body.pop();
+    }
+    body.join("\n")
+}
+
+fn repair_json_candidate(raw: &str) -> Option<Value> {
+    let trailing_commas = Regex::new(r",\s*([}\]])").expect("valid regex");
+    let bare_keys =
+        Regex::new(r#"([{\[,]\s*)([A-Za-z_][A-Za-z0-9_-]*)(\s*:)"#).expect("valid regex");
+
+    let without_commas = trailing_commas.replace_all(raw, "$1").into_owned();
+    let quoted_keys = bare_keys.replace_all(&without_commas, "$1\"$2\"$3");
+    let single_to_double = quoted_keys.replace('\'', "\"");
+    serde_json::from_str(&single_to_double).ok()
 }
 
 fn normalize_name(name: &str, allowed_tools: &[String]) -> String {

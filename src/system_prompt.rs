@@ -12,7 +12,7 @@ pub fn build_system_prompt(
         format!("<{tool_call_tag}>{{\"name\":\"Tool\",\"arguments\":{{...}}}}</{tool_call_tag}>");
     let tool_call_instruction = if native_tools_enabled {
         format!(
-            "IMPORTANT: Never output <think> tags. Prefer native tool calls, but if they fail you may emit {tool_call_example}."
+            "IMPORTANT: Never output <think> tags. Use native tool calls exclusively. Do not emit {tool_call_example}."
         )
     } else {
         format!(

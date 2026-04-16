@@ -22,8 +22,21 @@ fn parses_tags_and_chat_payloads() {
 }
 
 #[test]
-fn disables_native_tools_for_qwen3_family() {
-    assert!(!should_use_native_tool_calls("qwen3.5:122b"));
-    assert!(!should_use_native_tool_calls("qwen3:8b"));
+fn salvages_relaxed_tool_arguments() {
+    let reply = parse_chat_response(
+        r#"{"message":{"content":"","tool_calls":[{"function":{"name":"read","arguments":"{'path':'README.md',}"}}]}}"#,
+        &["Read".to_string()],
+    )
+    .unwrap();
+    assert_eq!(reply.tool_calls.len(), 1);
+    assert_eq!(reply.tool_calls[0].name, "Read");
+    assert_eq!(reply.tool_calls[0].arguments["path"], "README.md");
+}
+
+#[test]
+fn enables_native_tools_for_installed_models() {
+    assert!(should_use_native_tool_calls("qwen3.5:122b"));
+    assert!(should_use_native_tool_calls("qwen3:8b"));
     assert!(should_use_native_tool_calls("gemma4:31b"));
+    assert!(!should_use_native_tool_calls(""));
 }

@@ -35,8 +35,12 @@ pub fn run_cli(args: CliArgs) -> Result<(), String> {
     let config = Config::load(args)?;
     logging::init_logging(config.debug, &config.cwd)?;
     config.ensure_state_dirs()?;
-    let client =
-        OllamaClient::new_with_timeout(config.ollama_host.clone(), config.chat_timeout_secs)?;
+    let client = OllamaClient::new_with_timeout_and_options(
+        config.ollama_host.clone(),
+        config.chat_timeout_secs,
+        config.context_budget,
+        2_048,
+    )?;
     let available_models = client.list_models()?;
     let models = select_models(
         config.requested_model.clone(),

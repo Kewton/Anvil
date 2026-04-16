@@ -1,3 +1,4 @@
+use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -295,10 +296,13 @@ impl Agent {
                 if empty_retries >= 3 {
                     return Err("assistant returned empty responses repeatedly".to_string());
                 }
-                self.push_system_note(recovery::empty_response_recovery_note(
-                    empty_retries,
-                    requires_action,
-                ));
+                self.push_system_note(
+                    if action_expectation == recovery::ActionExpectation::RepoChange {
+                        self.next_repo_change_note()
+                    } else {
+                        recovery::empty_response_recovery_note(empty_retries, requires_action)
+                    },
+                );
                 continue;
             }
 
@@ -310,7 +314,13 @@ impl Agent {
                             .to_string(),
                     );
                 }
-                self.push_system_note(recovery::no_tool_recovery_note(no_tool_retries));
+                self.push_system_note(
+                    if action_expectation == recovery::ActionExpectation::RepoChange {
+                        self.next_repo_change_note()
+                    } else {
+                        recovery::no_tool_recovery_note(no_tool_retries)
+                    },
+                );
                 continue;
             }
 
@@ -324,7 +334,7 @@ impl Agent {
                             .to_string(),
                     );
                 }
-                self.push_system_note(recovery::repo_change_recovery_note(repo_change_retries));
+                self.push_system_note(self.next_repo_change_note());
                 continue;
             }
 
@@ -451,7 +461,14 @@ impl Agent {
         tool_call
     }
 
+    fn next_repo_change_note(&self) -> String {
+        repo_change_progress_note(&self.work_root)
+    }
+
     fn push_system_note(&mut self, note: String) {
+        if should_skip_system_note(&self.session.messages, &note) {
+            return;
+        }
         self.session
             .messages
             .push(ConversationMessage::system(note));
@@ -578,6 +595,36 @@ fn detect_created_project_root(tool_output: &str) -> Option<PathBuf> {
     None
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepoProgress {
+    Empty,
+    InitializedWithoutTests,
+    InitializedWithTests,
+}
+
+fn repo_change_progress_note(root: &Path) -> String {
+    match detect_repo_progress(root) {
+        RepoProgress::Empty => "The requested repository change is still unfinished. If setup or scaffolding is needed, do it now. As soon as concrete project files exist, stop exploring and use Read on the implementation files, then Write or Edit them in the same turn sequence.".to_string(),
+        RepoProgress::InitializedWithoutTests => "The repository is initialized but the requested implementation is still unfinished. Inspect the concrete implementation files now and make a real repository change with Write or Edit. If tests are part of the request, add or update at least one test file before finalizing.".to_string(),
+        RepoProgress::InitializedWithTests => "The repository already has source and test structure. Stop describing intent and make the next concrete code change with Write or Edit on the implementation or test files now. Only finalize after the requested repository change is present.".to_string(),
+    }
+}
+
+fn detect_repo_progress(root: &Path) -> RepoProgress {
+    let mut has_manifest = false;
+    let mut has_source = false;
+    let mut has_tests = false;
+    inspect_repo_tree(root, &mut has_manifest, &mut has_source, &mut has_tests);
+
+    if !(has_manifest || has_source) {
+        RepoProgress::Empty
+    } else if has_tests {
+        RepoProgress::InitializedWithTests
+    } else {
+        RepoProgress::InitializedWithoutTests
+    }
+}
+
 #[derive(Debug, Clone)]
 struct NextJsTargets {
     page: PathBuf,
@@ -602,12 +649,84 @@ fn detect_nextjs_targets(root: &Path) -> Option<NextJsTargets> {
     None
 }
 
+fn inspect_repo_tree(
+    current: &Path,
+    has_manifest: &mut bool,
+    has_source: &mut bool,
+    has_tests: &mut bool,
+) {
+    let Ok(entries) = fs::read_dir(current) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if file_type.is_dir() {
+            if matches!(name, "node_modules" | ".git" | ".anvil" | ".next") {
+                continue;
+            }
+            if matches!(name, "tests" | "__tests__") {
+                *has_tests = true;
+            }
+            inspect_repo_tree(&path, has_manifest, has_source, has_tests);
+            continue;
+        }
+        if is_manifest_file(name) {
+            *has_manifest = true;
+        }
+        if is_source_file(&path) {
+            *has_source = true;
+        }
+        if is_test_file(&path) {
+            *has_tests = true;
+        }
+    }
+}
+
+fn is_manifest_file(name: &str) -> bool {
+    matches!(
+        name,
+        "package.json" | "Cargo.toml" | "pyproject.toml" | "go.mod" | "Gemfile" | "composer.json"
+    )
+}
+
+fn is_source_file(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some("rs" | "ts" | "tsx" | "js" | "jsx" | "py" | "go" | "java" | "kt" | "rb" | "php")
+    )
+}
+
+fn is_test_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    name.contains(".test.") || name.contains(".spec.")
+}
+
 fn format_tool_error(err: &str) -> String {
     if err.starts_with("Error:") {
         err.to_string()
     } else {
         format!("Error: {err}")
     }
+}
+
+fn should_skip_system_note(messages: &[ConversationMessage], note: &str) -> bool {
+    for message in messages.iter().rev() {
+        if message.role == "user" {
+            break;
+        }
+        if message.role == "system" && message.content == note {
+            return true;
+        }
+    }
+    false
 }
 
 fn compact_tool_result(name: &str, result: String) -> String {
@@ -639,8 +758,11 @@ fn compact_tool_result(name: &str, result: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        compact_tool_result, detect_created_project_root, detect_nextjs_targets, format_tool_error,
+        RepoProgress, compact_tool_result, detect_created_project_root, detect_nextjs_targets,
+        detect_repo_progress, format_tool_error, repo_change_progress_note,
+        should_skip_system_note,
     };
+    use crate::session::store::ConversationMessage;
     use std::path::PathBuf;
     use tempfile::tempdir;
 
@@ -694,5 +816,66 @@ mod tests {
         let compacted = compact_tool_result("Read", long);
         assert!(compacted.contains("[truncated"));
         assert!(compacted.len() < 13_000);
+    }
+
+    #[test]
+    fn repo_progress_is_empty_without_manifest_or_source() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("README.md"), "hello").unwrap();
+        assert_eq!(detect_repo_progress(dir.path()), RepoProgress::Empty);
+    }
+
+    #[test]
+    fn repo_progress_detects_initialized_repo_without_tests() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("package.json"), "{\"name\":\"demo\"}").unwrap();
+        std::fs::write(dir.path().join("src/main.ts"), "console.log('hi');").unwrap();
+        assert_eq!(
+            detect_repo_progress(dir.path()),
+            RepoProgress::InitializedWithoutTests
+        );
+    }
+
+    #[test]
+    fn repo_progress_detects_tests_and_note_stays_generic() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("tests")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("src.rs"), "fn main() {}").unwrap();
+        std::fs::write(
+            dir.path().join("tests/app.test.ts"),
+            "it('works', () => expect(true).toBe(true));",
+        )
+        .unwrap();
+        assert_eq!(
+            detect_repo_progress(dir.path()),
+            RepoProgress::InitializedWithTests
+        );
+        let note = repo_change_progress_note(dir.path());
+        assert!(note.contains("implementation or test files"));
+        assert!(!note.contains("Next.js"));
+        assert!(!note.contains("space-invaders"));
+    }
+
+    #[test]
+    fn skips_duplicate_consecutive_system_note() {
+        let messages = vec![ConversationMessage::system("same note".to_string())];
+        assert!(should_skip_system_note(&messages, "same note"));
+        assert!(!should_skip_system_note(&messages, "other note"));
+    }
+
+    #[test]
+    fn skips_duplicate_system_note_with_tool_results_between() {
+        let messages = vec![
+            ConversationMessage::system("same note".to_string()),
+            ConversationMessage::assistant(String::new(), Vec::new()),
+            ConversationMessage::tool("Read".to_string(), "file contents".to_string()),
+        ];
+        assert!(should_skip_system_note(&messages, "same note"));
     }
 }

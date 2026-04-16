@@ -13,6 +13,8 @@ use crate::tools::registry::ToolSpec;
 pub struct OllamaClient {
     base_url: String,
     http: Client,
+    context_window: usize,
+    max_predict: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,15 +25,29 @@ pub struct AssistantReply {
 
 impl OllamaClient {
     pub fn new(base_url: String) -> Result<Self, String> {
-        Self::new_with_timeout(base_url, 120)
+        Self::new_with_timeout_and_options(base_url, 120, 24_000, 2_048)
     }
 
     pub fn new_with_timeout(base_url: String, timeout_secs: u64) -> Result<Self, String> {
+        Self::new_with_timeout_and_options(base_url, timeout_secs, 24_000, 2_048)
+    }
+
+    pub fn new_with_timeout_and_options(
+        base_url: String,
+        timeout_secs: u64,
+        context_window: usize,
+        max_predict: usize,
+    ) -> Result<Self, String> {
         let http = Client::builder()
             .timeout(std::time::Duration::from_secs(timeout_secs))
             .build()
             .map_err(|err| format!("failed to create HTTP client: {err}"))?;
-        Ok(Self { base_url, http })
+        Ok(Self {
+            base_url,
+            http,
+            context_window,
+            max_predict,
+        })
     }
 
     pub fn list_models(&self) -> Result<Vec<String>, String> {
@@ -121,23 +137,38 @@ impl OllamaClient {
         F: FnMut(&str),
     {
         #[derive(Serialize)]
+        struct RequestOptions {
+            temperature: f32,
+            num_ctx: usize,
+            num_predict: usize,
+        }
+
+        #[derive(Serialize)]
         struct ChatRequest<'a> {
             model: &'a str,
             stream: bool,
             messages: &'a [ConversationMessage],
+            keep_alive: i32,
+            options: RequestOptions,
             #[serde(skip_serializing_if = "Option::is_none")]
             tools: Option<&'a [ToolSpec]>,
         }
 
         let native_tools_enabled = should_use_native_tool_calls(model);
+        let tool_mode = tools.is_some_and(|tool_specs| !tool_specs.is_empty());
         let serialized_tools = if native_tools_enabled { tools } else { None };
+        let temperature = if tool_mode { 0.3 } else { 0.7 };
         logging::log_llm_event(
             "ollama.chat.request",
             json!({
                 "base_url": self.base_url,
                 "model": model,
                 "stream": stream,
+                "tool_mode": tool_mode,
                 "native_tools_enabled": native_tools_enabled,
+                "temperature": temperature,
+                "num_ctx": self.context_window,
+                "num_predict": self.max_predict,
                 "tools": tools.unwrap_or(&[]).iter().map(|tool| tool.function.name.clone()).collect::<Vec<_>>(),
                 "messages": messages,
             }),
@@ -150,6 +181,12 @@ impl OllamaClient {
                 model,
                 stream,
                 messages,
+                keep_alive: -1,
+                options: RequestOptions {
+                    temperature,
+                    num_ctx: self.context_window,
+                    num_predict: self.max_predict,
+                },
                 tools: serialized_tools,
             })
             .send()
@@ -179,6 +216,21 @@ impl OllamaClient {
                     "body": truncate_for_log(&body, 20_000),
                 }),
             );
+            if native_tools_enabled
+                && tool_mode
+                && is_native_tool_parse_failure(status.as_u16(), &body)
+                && let Ok(reply) =
+                    self.salvage_malformed_tool_call(model, messages, tools.unwrap_or(&[]))
+            {
+                logging::log_llm_event(
+                    "ollama.chat.salvage_success",
+                    json!({
+                        "model": model,
+                        "status": status.as_u16(),
+                    }),
+                );
+                return Ok(reply);
+            }
             return Err(format!("Ollama /api/chat failed: {status}"));
         }
 
@@ -205,11 +257,100 @@ impl OllamaClient {
             parse_chat_response(&body, &tool_names)
         }
     }
+
+    fn salvage_malformed_tool_call(
+        &self,
+        model: &str,
+        messages: &[ConversationMessage],
+        tools: &[ToolSpec],
+    ) -> Result<AssistantReply, String> {
+        #[derive(Serialize)]
+        struct RequestOptions {
+            temperature: f32,
+            num_ctx: usize,
+            num_predict: usize,
+        }
+
+        #[derive(Serialize)]
+        struct ChatRequest<'a> {
+            model: &'a str,
+            stream: bool,
+            messages: &'a [ConversationMessage],
+            keep_alive: i32,
+            options: RequestOptions,
+        }
+
+        let mut salvage_messages = messages.to_vec();
+        salvage_messages.push(ConversationMessage::system(
+            "The previous native tool call response was malformed and rejected by the runtime parser. Retry immediately. Return exactly one valid next action. If native tool calling fails again, emit a single <function name=\"Tool\">{\"key\":\"value\"}</function> block with valid JSON arguments and no extra prose."
+                .to_string(),
+        ));
+
+        logging::log_llm_event(
+            "ollama.chat.salvage_request",
+            json!({
+                "model": model,
+                "tools": tools.iter().map(|tool| tool.function.name.clone()).collect::<Vec<_>>(),
+            }),
+        );
+
+        let response = self
+            .http
+            .post(format!("{}/api/chat", self.base_url))
+            .json(&ChatRequest {
+                model,
+                stream: false,
+                messages: &salvage_messages,
+                keep_alive: -1,
+                options: RequestOptions {
+                    temperature: 0.2,
+                    num_ctx: self.context_window,
+                    num_predict: self.max_predict,
+                },
+            })
+            .send()
+            .map_err(|err| format!("failed salvage chat retry: {err}"))?;
+
+        if !response.status().is_success() {
+            return Err(format!(
+                "salvage Ollama /api/chat failed: {}",
+                response.status()
+            ));
+        }
+
+        let body = response
+            .text()
+            .map_err(|err| format!("failed to decode salvage chat response: {err}"))?;
+        logging::log_llm_event(
+            "ollama.chat.salvage_response_raw",
+            json!({
+                "model": model,
+                "body": truncate_for_log(&body, 200_000),
+            }),
+        );
+        let tool_names = tools
+            .iter()
+            .map(|tool| tool.function.name.clone())
+            .collect::<Vec<_>>();
+        parse_chat_response(&body, &tool_names)
+    }
 }
 
 pub fn should_use_native_tool_calls(model: &str) -> bool {
-    let normalized = model.to_ascii_lowercase();
-    !(normalized.contains("qwen3.5") || normalized.starts_with("qwen3:"))
+    !model.trim().is_empty()
+}
+
+fn is_native_tool_parse_failure(status: u16, body: &str) -> bool {
+    if status != 500 && status != 400 {
+        return false;
+    }
+    let lower = body.to_ascii_lowercase();
+    lower.contains("xml syntax error")
+        || lower.contains("unexpected end element")
+        || lower.contains("unexpected eof")
+        || lower.contains("</function>")
+        || lower.contains("tool call")
+        || lower.contains("function")
 }
 
 #[derive(Deserialize)]
@@ -332,8 +473,8 @@ fn finalize_reply(
                 id: tool_call
                     .id
                     .unwrap_or_else(|| format!("native-{}", index + 1)),
-                name: tool_call.function.name,
-                arguments: tool_call.function.arguments,
+                name: normalize_tool_name(&tool_call.function.name, tool_names),
+                arguments: normalize_native_arguments(tool_call.function.arguments),
             })
             .collect()
     };
@@ -358,6 +499,30 @@ fn finalize_reply(
         }),
     );
     Ok(reply)
+}
+
+fn normalize_tool_name(name: &str, allowed_tools: &[String]) -> String {
+    allowed_tools
+        .iter()
+        .find(|candidate| candidate.eq_ignore_ascii_case(name))
+        .cloned()
+        .unwrap_or_else(|| name.to_string())
+}
+
+fn normalize_native_arguments(arguments: Value) -> Value {
+    match arguments {
+        Value::String(raw) => {
+            extract_tool_calls(&format!("<function name=\"noop\">{raw}</function>"), &[])
+                .0
+                .into_iter()
+                .next()
+                .map(|call| call.arguments)
+                .unwrap_or_else(|| {
+                    serde_json::from_str::<Value>(&raw).unwrap_or(Value::String(raw))
+                })
+        }
+        other => other,
+    }
 }
 
 fn truncate_for_log(text: &str, max_chars: usize) -> String {
