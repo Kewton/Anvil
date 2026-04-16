@@ -98,6 +98,11 @@ impl Agent {
             self.session.mode_state.mode,
             self.config.cwd.display()
         );
+        if self.config.debug
+            && let Some(path) = crate::logging::llm_io_log_path()
+        {
+            println!("debug llm log={}", path.display());
+        }
 
         let mut line = String::new();
         loop {

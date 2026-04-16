@@ -2,8 +2,9 @@ use std::io::{BufRead, BufReader};
 
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
+use crate::logging;
 use crate::ollama::xml_fallback::{ToolCall, extract_tool_calls};
 use crate::session::store::ConversationMessage;
 use crate::tools::registry::ToolSpec;
@@ -41,6 +42,13 @@ impl OllamaClient {
         let body = response
             .text()
             .map_err(|err| format!("failed to decode Ollama tags response: {err}"))?;
+        logging::log_llm_event(
+            "ollama.tags.response",
+            json!({
+                "base_url": self.base_url,
+                "body": truncate_for_log(&body, 20_000),
+            }),
+        );
         parse_tags_response(&body)
     }
 
@@ -128,6 +136,16 @@ impl OllamaClient {
             })
             .send()
             .map_err(|err| format!("failed to contact Ollama chat API: {err}"))?;
+        logging::log_llm_event(
+            "ollama.chat.request",
+            json!({
+                "base_url": self.base_url,
+                "model": model,
+                "stream": stream,
+                "tools": tools.unwrap_or(&[]).iter().map(|tool| tool.function.name.clone()).collect::<Vec<_>>(),
+                "messages": messages,
+            }),
+        );
 
         if !response.status().is_success() {
             return Err(format!("Ollama /api/chat failed: {}", response.status()));
@@ -145,6 +163,14 @@ impl OllamaClient {
             let body = response
                 .text()
                 .map_err(|err| format!("failed to decode Ollama chat response: {err}"))?;
+            logging::log_llm_event(
+                "ollama.chat.response_raw",
+                json!({
+                    "model": model,
+                    "stream": false,
+                    "body": truncate_for_log(&body, 200_000),
+                }),
+            );
             parse_chat_response(&body, &tool_names)
         }
     }
@@ -221,6 +247,7 @@ where
     let reader = BufReader::new(response);
     let mut content = String::new();
     let mut native_tool_calls = Vec::new();
+    let mut raw_chunks = Vec::new();
 
     for line in reader.lines() {
         let line = line.map_err(|err| format!("failed to read streaming response: {err}"))?;
@@ -228,6 +255,7 @@ where
         if trimmed.is_empty() {
             continue;
         }
+        raw_chunks.push(truncate_for_log(trimmed, 20_000));
         let chunk: StreamChunk = serde_json::from_str(trimmed)
             .map_err(|err| format!("failed to parse streaming chat chunk: {err}"))?;
         if let Some(message) = chunk.message {
@@ -241,6 +269,14 @@ where
             break;
         }
     }
+
+    logging::log_llm_event(
+        "ollama.chat.response_raw",
+        json!({
+            "stream": true,
+            "chunks": raw_chunks,
+        }),
+    );
 
     finalize_reply(content, native_tool_calls, tool_names)
 }
@@ -274,8 +310,24 @@ fn finalize_reply(
         extract_tool_calls(&content, tool_names)
     };
 
-    Ok(AssistantReply {
+    let reply = AssistantReply {
         content: cleaned_content,
         tool_calls,
-    })
+    };
+    logging::log_llm_event(
+        "ollama.chat.reply_final",
+        json!({
+            "content": truncate_for_log(&reply.content, 100_000),
+            "tool_calls": reply.tool_calls,
+        }),
+    );
+    Ok(reply)
+}
+
+fn truncate_for_log(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let truncated = text.chars().take(max_chars).collect::<String>();
+    format!("{truncated}\n...[truncated]")
 }

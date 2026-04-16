@@ -27,7 +27,7 @@ use session::store::SessionStore;
 
 pub fn run_cli(args: CliArgs) -> Result<(), String> {
     let config = Config::load(args)?;
-    logging::init_logging(config.debug)?;
+    logging::init_logging(config.debug, &config.cwd)?;
     config.ensure_state_dirs()?;
     let use_tui = config.tui;
 
