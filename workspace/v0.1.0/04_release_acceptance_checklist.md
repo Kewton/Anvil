@@ -31,12 +31,14 @@ cargo build --release
 ignored test を live Ollama で実行する。
 
 ```bash
-cargo test --test e2e_local_llm -- --ignored --nocapture
+cargo test --test e2e_local_llm live_ollama_can_write_a_file -- --ignored --nocapture
+ANVIL_E2E_RUNS=2 cargo test --test e2e_local_llm live_ollama_multi_run_file_write_stability -- --ignored --nocapture
 ```
 
 期待結果:
 
 - `live_ollama_can_write_a_file ... ok`
+- `live_ollama_multi_run_file_write_stability ... ok`
 - temp workspace に `e2e-output.txt` が作られる
 - 中身が `LOCAL_E2E_OK`
 
@@ -109,7 +111,33 @@ ANVIL_SIDECAR_MODEL=qwen3.5:4b ./target/release/anvil -y
 - 変更が checkpoint 時点へ戻る
 - untracked file も戻る
 
-## 6. release shape
+## 6. watcher / autotest / tui / skills / mcp / parallel
+
+確認手順:
+
+```bash
+./target/release/anvil --watch --auto-test "cargo test --lib" --stream
+```
+
+対話中に以下を確認する。
+
+1. repo 内の任意ファイルを外部から更新する
+2. `/skills` で `.anvil/skills` の一覧を確認する
+3. skill file を1つ置いて `/skill <name>` を試す
+4. `.anvil/mcp.json` を置いて `/mcp` を試す
+5. `/parallel task1 || task2` を試す
+6. `./target/release/anvil --tui` で軽量 TUI を起動する
+
+期待結果:
+
+- watcher が変更を検知する
+- auto-test command の exit code と出力が返る
+- skill を system note として注入できる
+- MCP config の一覧が表示される
+- 2 並列の read-only analysis が返る
+- lightweight TUI で継続対話できる
+
+## 7. release shape
 
 確認手順:
 
@@ -134,4 +162,5 @@ sed -n '1,220p' .github/workflows/release.yml
 - sidecar compaction 通過
 - Plan / Act 通過
 - no-tool / empty response recovery が無限ループしない
+- watcher / autotest / tui / skills / mcp / parallel の最小系が動く
 - release artifact と workflow が壊れていない

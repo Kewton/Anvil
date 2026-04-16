@@ -3,13 +3,18 @@ pub mod cli;
 pub mod config;
 pub mod git;
 pub mod logging;
+pub mod mcp;
 pub mod model_registry;
 pub mod modes;
 pub mod ollama;
 pub mod safety;
 pub mod session;
+pub mod skills;
 pub mod system_prompt;
+pub mod testloop;
 pub mod tools;
+pub mod tui;
+pub mod watch;
 
 use std::io::{self, IsTerminal, Read};
 
@@ -24,6 +29,7 @@ pub fn run_cli(args: CliArgs) -> Result<(), String> {
     let config = Config::load(args)?;
     logging::init_logging(config.debug)?;
     config.ensure_state_dirs()?;
+    let use_tui = config.tui;
 
     let client = OllamaClient::new(config.ollama_host.clone())?;
     let available_models = client.list_models()?;
@@ -44,7 +50,11 @@ pub fn run_cli(args: CliArgs) -> Result<(), String> {
         return Ok(());
     }
 
-    agent.run_repl()
+    if use_tui {
+        tui::run(&mut agent)
+    } else {
+        agent.run_repl()
+    }
 }
 
 pub fn stdin_prompt() -> Result<Option<String>, String> {

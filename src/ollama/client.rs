@@ -1,3 +1,5 @@
+use std::io::{BufRead, BufReader};
+
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -48,7 +50,20 @@ impl OllamaClient {
         messages: &[ConversationMessage],
         tools: &[ToolSpec],
     ) -> Result<AssistantReply, String> {
-        self.chat_impl(model, messages, Some(tools))
+        self.chat_impl(model, messages, Some(tools), false, |_| {})
+    }
+
+    pub fn chat_streaming<F>(
+        &self,
+        model: &str,
+        messages: &[ConversationMessage],
+        tools: &[ToolSpec],
+        on_chunk: F,
+    ) -> Result<AssistantReply, String>
+    where
+        F: FnMut(&str),
+    {
+        self.chat_impl(model, messages, Some(tools), true, on_chunk)
     }
 
     pub fn chat_text(
@@ -56,7 +71,7 @@ impl OllamaClient {
         model: &str,
         messages: &[ConversationMessage],
     ) -> Result<AssistantReply, String> {
-        self.chat_impl(model, messages, None)
+        self.chat_impl(model, messages, None, false, |_| {})
     }
 
     pub fn summarize_conversation(
@@ -82,12 +97,17 @@ impl OllamaClient {
         Ok(summary.to_string())
     }
 
-    fn chat_impl(
+    fn chat_impl<F>(
         &self,
         model: &str,
         messages: &[ConversationMessage],
         tools: Option<&[ToolSpec]>,
-    ) -> Result<AssistantReply, String> {
+        stream: bool,
+        mut on_chunk: F,
+    ) -> Result<AssistantReply, String>
+    where
+        F: FnMut(&str),
+    {
         #[derive(Serialize)]
         struct ChatRequest<'a> {
             model: &'a str,
@@ -102,7 +122,7 @@ impl OllamaClient {
             .post(format!("{}/api/chat", self.base_url))
             .json(&ChatRequest {
                 model,
-                stream: false,
+                stream,
                 messages,
                 tools,
             })
@@ -112,15 +132,21 @@ impl OllamaClient {
         if !response.status().is_success() {
             return Err(format!("Ollama /api/chat failed: {}", response.status()));
         }
-        let body = response
-            .text()
-            .map_err(|err| format!("failed to decode Ollama chat response: {err}"))?;
+
         let tool_names = tools
             .unwrap_or(&[])
             .iter()
             .map(|tool| tool.function.name.clone())
             .collect::<Vec<_>>();
-        parse_chat_response(&body, &tool_names)
+
+        if stream {
+            parse_streaming_chat_response(response, &tool_names, &mut on_chunk)
+        } else {
+            let body = response
+                .text()
+                .map_err(|err| format!("failed to decode Ollama chat response: {err}"))?;
+            parse_chat_response(&body, &tool_names)
+        }
     }
 }
 
@@ -147,17 +173,25 @@ struct ResponseMessage {
     tool_calls: Vec<ResponseToolCall>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct ResponseToolCall {
     #[serde(default)]
     id: Option<String>,
     function: ResponseFunctionCall,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct ResponseFunctionCall {
     name: String,
     arguments: Value,
+}
+
+#[derive(Deserialize)]
+struct StreamChunk {
+    #[serde(default)]
+    done: bool,
+    #[serde(default)]
+    message: Option<ResponseMessage>,
 }
 
 pub fn parse_tags_response(body: &str) -> Result<Vec<String>, String> {
@@ -169,13 +203,57 @@ pub fn parse_tags_response(body: &str) -> Result<Vec<String>, String> {
 pub fn parse_chat_response(body: &str, tool_names: &[String]) -> Result<AssistantReply, String> {
     let parsed: ChatResponse = serde_json::from_str(body)
         .map_err(|err| format!("failed to decode Ollama chat response: {err}"))?;
-    let content = parsed.message.content;
-    let tool_calls = if parsed.message.tool_calls.is_empty() {
+    finalize_reply(
+        parsed.message.content,
+        parsed.message.tool_calls,
+        tool_names,
+    )
+}
+
+fn parse_streaming_chat_response<F>(
+    response: reqwest::blocking::Response,
+    tool_names: &[String],
+    on_chunk: &mut F,
+) -> Result<AssistantReply, String>
+where
+    F: FnMut(&str),
+{
+    let reader = BufReader::new(response);
+    let mut content = String::new();
+    let mut native_tool_calls = Vec::new();
+
+    for line in reader.lines() {
+        let line = line.map_err(|err| format!("failed to read streaming response: {err}"))?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let chunk: StreamChunk = serde_json::from_str(trimmed)
+            .map_err(|err| format!("failed to parse streaming chat chunk: {err}"))?;
+        if let Some(message) = chunk.message {
+            if !message.content.is_empty() {
+                on_chunk(&message.content);
+                content.push_str(&message.content);
+            }
+            native_tool_calls.extend(message.tool_calls);
+        }
+        if chunk.done {
+            break;
+        }
+    }
+
+    finalize_reply(content, native_tool_calls, tool_names)
+}
+
+fn finalize_reply(
+    content: String,
+    native_tool_calls: Vec<ResponseToolCall>,
+    tool_names: &[String],
+) -> Result<AssistantReply, String> {
+    let tool_calls = if native_tool_calls.is_empty() {
         extract_tool_calls(&content, tool_names).0
     } else {
-        parsed
-            .message
-            .tool_calls
+        native_tool_calls
             .into_iter()
             .enumerate()
             .map(|(index, tool_call)| ToolCall {

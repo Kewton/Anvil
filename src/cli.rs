@@ -20,6 +20,14 @@ pub struct CliArgs {
     pub max_iterations: Option<usize>,
     #[arg(long = "debug")]
     pub debug: bool,
+    #[arg(long = "stream")]
+    pub stream: bool,
+    #[arg(long = "tui")]
+    pub tui: bool,
+    #[arg(long = "watch")]
+    pub watch: bool,
+    #[arg(long = "auto-test")]
+    pub auto_test: Option<String>,
     #[arg(short = 'y', long = "yes")]
     pub yes: bool,
     #[arg(long = "fresh-session")]

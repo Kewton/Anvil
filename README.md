@@ -16,17 +16,23 @@ Ollama 直結の local-first コーディングエージェント。`workspace/v
 ## 実装済み機能
 
 - Ollama `/api/tags` `/api/chat` への直結クライアント
+- 同期 / streaming 両対応の chat loop
 - モデル自動選択と optional sidecar 選択
 - `.anvil/sessions/session.json` へのセッション保存
 - `/plan` と `/approve` による Plan / Act 切り替え
 - Git checkpoint / rollback
 - `<think>` 除去と `<tool_call>...</tool_call>` XML fallback
+- FileWatcher と AutoTest command
+- 軽量 TUI
+- local skills loader
+- MCP config registry
+- read-only parallel analysis command
 - 読み取り専用の Plan mode 制御
-- 主要ツールの unit / integration tests
+- live Ollama E2E を含む unit / integration / ignored E2E tests
 
 ## まだ入れていないもの
 
-`workspace/v0.1.0/03_rust_port_plan.md` の Phase 6 以降にある file watcher、auto test loop、重い TUI、MCP、skills、parallel agents はまだ未実装。v0.1.0 のコア経路を先に安定させるため、後段へ分離している。
+重い full-screen TUI、実際の MCP protocol transport、tool-enabled subagent delegation はまだ最小実装止まり。v0.1.0 では local-first なコア経路を優先し、後段拡張は軽量 slice に留めている。
 
 ## クイックスタート
 
@@ -69,6 +75,10 @@ anvil [OPTIONS]
       --context-budget <TOKENS>      message budget for compaction
       --max-iterations <N>           max agent loop iterations
       --debug                        verbose logging
+      --stream                       stream assistant text in interactive turns
+      --tui                          run the lightweight terminal UI
+      --watch                        enable file watcher on startup
+      --auto-test <COMMAND>          run a shell command when watcher sees changes
   -y, --yes                          auto-approve Bash / Write / Edit
       --fresh-session                ignore saved session
       --oneshot                      read one prompt from CLI or stdin
@@ -86,6 +96,12 @@ anvil [OPTIONS]
 - `/rollback`
 - `/yes`
 - `/no`
+- `/watch`
+- `/autotest <command>`
+- `/skills`
+- `/skill <name>`
+- `/mcp`
+- `/parallel task1 || task2`
 - `/exit`
 
 ## 設定
@@ -98,6 +114,10 @@ sidecar_model=qwen3:1.7b
 ollama_host=http://127.0.0.1:11434
 context_budget=24000
 max_iterations=12
+stream=false
+tui=false
+watch=false
+auto_test_command=
 yes_mode=false
 ```
 
@@ -109,6 +129,10 @@ export ANVIL_SIDECAR_MODEL=qwen3:1.7b
 export ANVIL_OLLAMA_HOST=http://127.0.0.1:11434
 export ANVIL_CONTEXT_BUDGET=24000
 export ANVIL_MAX_ITERATIONS=12
+export ANVIL_STREAM=1
+export ANVIL_TUI=1
+export ANVIL_WATCH=1
+export ANVIL_AUTO_TEST="cargo test --lib"
 export ANVIL_YES=1
 ```
 
@@ -128,7 +152,8 @@ export ANVIL_YES=1
 cargo fmt --all
 cargo clippy --all-targets -- -D warnings
 cargo test --all
-cargo test --test e2e_local_llm -- --ignored --nocapture
+cargo test --test e2e_local_llm live_ollama_can_write_a_file -- --ignored --nocapture
+ANVIL_E2E_RUNS=2 cargo test --test e2e_local_llm live_ollama_multi_run_file_write_stability -- --ignored --nocapture
 cargo build --release
 ```
 
