@@ -128,6 +128,7 @@ export ANVIL_YES=1
 cargo fmt --all
 cargo clippy --all-targets -- -D warnings
 cargo test --all
+cargo test --test e2e_local_llm -- --ignored --nocapture
 cargo build --release
 ```
 

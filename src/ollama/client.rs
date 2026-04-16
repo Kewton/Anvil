@@ -48,12 +48,53 @@ impl OllamaClient {
         messages: &[ConversationMessage],
         tools: &[ToolSpec],
     ) -> Result<AssistantReply, String> {
+        self.chat_impl(model, messages, Some(tools))
+    }
+
+    pub fn chat_text(
+        &self,
+        model: &str,
+        messages: &[ConversationMessage],
+    ) -> Result<AssistantReply, String> {
+        self.chat_impl(model, messages, None)
+    }
+
+    pub fn summarize_conversation(
+        &self,
+        model: &str,
+        messages: &[ConversationMessage],
+    ) -> Result<String, String> {
+        let transcript = crate::session::compact::render_messages_for_summary(messages, 16_000);
+        let summary_messages = vec![
+            ConversationMessage::system(
+                "You compress earlier conversation for a local coding agent. Summarize the user goal, repository facts learned, files already changed, current plan status, open risks, and next actions. Keep it concise, factual, and under 220 words. Reply only with the summary.".to_string(),
+            ),
+            ConversationMessage::user(transcript),
+        ];
+        let reply = self.chat_text(model, &summary_messages)?;
+        if !reply.tool_calls.is_empty() {
+            return Err("sidecar summary unexpectedly requested tools".to_string());
+        }
+        let summary = reply.content.trim();
+        if summary.is_empty() {
+            return Err("sidecar summary was empty".to_string());
+        }
+        Ok(summary.to_string())
+    }
+
+    fn chat_impl(
+        &self,
+        model: &str,
+        messages: &[ConversationMessage],
+        tools: Option<&[ToolSpec]>,
+    ) -> Result<AssistantReply, String> {
         #[derive(Serialize)]
         struct ChatRequest<'a> {
             model: &'a str,
             stream: bool,
             messages: &'a [ConversationMessage],
-            tools: &'a [ToolSpec],
+            #[serde(skip_serializing_if = "Option::is_none")]
+            tools: Option<&'a [ToolSpec]>,
         }
 
         let response = self
@@ -75,6 +116,7 @@ impl OllamaClient {
             .text()
             .map_err(|err| format!("failed to decode Ollama chat response: {err}"))?;
         let tool_names = tools
+            .unwrap_or(&[])
             .iter()
             .map(|tool| tool.function.name.clone())
             .collect::<Vec<_>>();
