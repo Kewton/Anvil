@@ -72,12 +72,11 @@ pub(crate) fn runtime_context_messages(
     if let Some(instruction) = protocol.fallback_instruction() {
         messages.push(ConversationMessage::system(instruction));
     }
-    if work_root != cwd {
-        messages.push(ConversationMessage::system(format!(
-            "Current project root is {}. Use relative paths from this directory unless an absolute path is easier for file tools.",
-            work_root.display()
-        )));
-    }
+    let _ = cwd;
+    messages.push(ConversationMessage::system(format!(
+        "Current project root is {}. All repository files live under this path. Use repository-relative paths (for example 'src/app/page.tsx') for Read, Write, and Edit. Never use absolute paths from other projects, user directories, or your memory such as '/Users/...' or '/home/...'.",
+        work_root.display()
+    )));
     messages
 }
 

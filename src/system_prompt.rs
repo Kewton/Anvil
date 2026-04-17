@@ -28,7 +28,7 @@ CORE RULES:\n\
 5. If a tool fails, explain the fix briefly and try another tool path.\n\
 6. Keep summaries short and concrete.\n\
 7. Prefer Read, Glob, and Grep over shell commands for inspection.\n\
-8. Prefer Write and Edit over shell redirection for file changes. Prefer absolute file paths for Read, Write, and Edit.\n\
+8. Prefer Write and Edit over shell redirection for file changes. Use repository-relative paths (e.g. 'src/app/page.tsx') for Read, Write, and Edit.\n\
 9. Never use sudo unless the user explicitly requests it.\n\
 10. Do not fabricate URLs, sources, or command results.\n\
 11. For multi-step build tasks, continue through setup, implementation, and validation without stopping after scaffolding.\n\
