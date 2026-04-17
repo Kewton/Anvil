@@ -113,6 +113,37 @@ fn live_ollama_can_semantically_edit_and_start_nextjs() {
     assert!(status.success());
 }
 
+#[test]
+#[ignore = "requires live Ollama, npm, and a working Next.js toolchain"]
+fn live_ollama_reaches_first_write_on_scaffolded_nextjs() {
+    let host =
+        env::var("ANVIL_E2E_OLLAMA_HOST").unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
+    let model = env::var("ANVIL_E2E_MODEL").unwrap_or_else(|_| "qwen3:8b".to_string());
+    let Some(client) = available_client_or_skip(&host, &model).unwrap() else {
+        return;
+    };
+
+    let temp = tempdir().unwrap();
+    let scaffold_status = Command::new("sh")
+        .args([
+            "-lc",
+            "npx create-next-app@latest app --ts --eslint --app --src-dir --use-npm --no-tailwind --import-alias '@/*' --yes",
+        ])
+        .current_dir(temp.path())
+        .status()
+        .unwrap();
+    assert!(scaffold_status.success());
+
+    let cwd = temp.path().join("app");
+    let mut agent = new_agent_with_debug(&cwd, &host, &model, client, 10, true);
+    let prompt = "Use the available tools to inspect the current app and make one concrete implementation code change. Stop after the first successful file change.";
+    let _ = agent.run_oneshot(prompt);
+
+    let llm_log = cwd.join(".anvil/logs/llm-io.jsonl");
+    let counts = count_tool_calls(&llm_log);
+    assert!(counts.write_calls + counts.edit_calls > 0);
+}
+
 fn available_client_or_skip(host: &str, model: &str) -> Result<Option<OllamaClient>, String> {
     let client = OllamaClient::new(host.to_string())?;
     let available = client.list_models()?;
@@ -131,6 +162,17 @@ fn new_agent(
     client: OllamaClient,
     max_iterations: usize,
 ) -> Agent {
+    new_agent_with_debug(cwd, host, model, client, max_iterations, false)
+}
+
+fn new_agent_with_debug(
+    cwd: &Path,
+    host: &str,
+    model: &str,
+    client: OllamaClient,
+    max_iterations: usize,
+    debug: bool,
+) -> Agent {
     let config = Config {
         cwd: cwd.to_path_buf(),
         requested_model: Some(model.to_string()),
@@ -140,7 +182,7 @@ fn new_agent(
         max_iterations,
         chat_timeout_secs: 300,
         chat_retries: 1,
-        debug: false,
+        debug,
         stream: false,
         yes_mode: true,
         fresh_session: true,
@@ -166,6 +208,28 @@ fn run_with_retry(agent: &mut Agent, prompt: &str, retry_prompt: &str) -> Result
         Ok(_) => Ok(()),
         Err(_) => agent.run_oneshot(retry_prompt).map(|_| ()),
     }
+}
+
+#[derive(Default)]
+struct ToolCallCounts {
+    write_calls: usize,
+    edit_calls: usize,
+}
+
+fn count_tool_calls(log_path: &Path) -> ToolCallCounts {
+    let mut counts = ToolCallCounts::default();
+    let Ok(text) = std::fs::read_to_string(log_path) else {
+        return counts;
+    };
+    for line in text.lines() {
+        if line.contains("\"name\":\"Write\"") {
+            counts.write_calls += 1;
+        }
+        if line.contains("\"name\":\"Edit\"") {
+            counts.edit_calls += 1;
+        }
+    }
+    counts
 }
 
 fn assert_semantic_page_contents(page: &str, marker: &str) {
