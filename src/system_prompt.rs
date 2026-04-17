@@ -8,16 +8,12 @@ pub(crate) fn build_system_prompt(
     active_plan_path: Option<&Path>,
     protocol: ToolProtocol,
 ) -> String {
-    let tool_call_tag = protocol.tool_call_tag();
-    let tool_call_example =
-        format!("<{tool_call_tag}>{{\"name\":\"Tool\",\"arguments\":{{...}}}}</{tool_call_tag}>");
     let tool_call_instruction = if protocol.native_tools_enabled() {
-        format!(
-            "IMPORTANT: Never output <think> tags. Use native tool calls exclusively. Do not emit {tool_call_example}."
-        )
+        "IMPORTANT: Never output <think> tags. Use native tool calls exclusively.".to_string()
     } else {
         format!(
-            "IMPORTANT: Never output <think> tags. When you need tools, emit {tool_call_example} with valid JSON arguments."
+            "IMPORTANT: Never output <think> tags. When you need tools, emit {} with valid JSON arguments.",
+            protocol.fallback_example()
         )
     };
     let mut prompt = format!(

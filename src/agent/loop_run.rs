@@ -73,8 +73,8 @@ impl Agent {
 mod tests {
     use super::lifecycle::format_tool_error;
     use crate::agent::prompting::{
-        RepoProgress, compact_tool_result, detect_created_project_root, detect_repo_progress,
-        repo_change_progress_note, should_skip_system_note,
+        compact_tool_result, detect_created_project_root, reset_messages_after_scaffold,
+        should_skip_system_note,
     };
     use crate::session::store::ConversationMessage;
     use std::path::PathBuf;
@@ -119,47 +119,23 @@ mod tests {
     }
 
     #[test]
-    fn repo_progress_is_empty_without_manifest_or_source() {
+    fn scaffold_reset_summary_stays_generic() {
         let dir = tempdir().unwrap();
-        std::fs::write(dir.path().join("README.md"), "hello").unwrap();
-        assert_eq!(detect_repo_progress(dir.path()), RepoProgress::Empty);
-    }
-
-    #[test]
-    fn repo_progress_detects_initialized_repo_without_tests() {
-        let dir = tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("src")).unwrap();
-        std::fs::write(dir.path().join("package.json"), "{\"name\":\"demo\"}").unwrap();
-        std::fs::write(dir.path().join("src/main.ts"), "console.log('hi');").unwrap();
-        assert_eq!(
-            detect_repo_progress(dir.path()),
-            RepoProgress::InitializedWithoutTests
+        let messages = vec![
+            ConversationMessage::system("earlier runtime note".to_string()),
+            ConversationMessage::assistant("scaffold finished".to_string(), Vec::new()),
+            ConversationMessage::user("continue implementation".to_string()),
+        ];
+        let reset = reset_messages_after_scaffold(dir.path(), &messages);
+        assert_eq!(reset.len(), 2);
+        assert!(reset[0].content.contains("Project scaffold is complete"));
+        assert!(
+            reset[0]
+                .content
+                .contains("Continue implementation in this project root")
         );
-    }
-
-    #[test]
-    fn repo_progress_detects_tests_and_note_stays_generic() {
-        let dir = tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("tests")).unwrap();
-        std::fs::write(
-            dir.path().join("Cargo.toml"),
-            "[package]\nname = \"demo\"\n",
-        )
-        .unwrap();
-        std::fs::write(dir.path().join("src.rs"), "fn main() {}").unwrap();
-        std::fs::write(
-            dir.path().join("tests/app.test.ts"),
-            "it('works', () => expect(true).toBe(true));",
-        )
-        .unwrap();
-        assert_eq!(
-            detect_repo_progress(dir.path()),
-            RepoProgress::InitializedWithTests
-        );
-        let note = repo_change_progress_note(dir.path());
-        assert!(note.contains("implementation or test files"));
-        assert!(!note.contains("Next.js"));
-        assert!(!note.contains("space-invaders"));
+        assert!(!reset[0].content.contains("Next.js"));
+        assert!(!reset[0].content.contains("implementation or test files"));
     }
 
     #[test]

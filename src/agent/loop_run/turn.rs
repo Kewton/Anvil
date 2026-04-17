@@ -56,35 +56,48 @@ impl Agent {
 
             let final_reply = reply.content.trim().to_string();
             if final_reply.is_empty() {
-                empty_retries += 1;
-                if empty_retries >= 3 {
-                    return Err("assistant returned empty responses repeatedly".to_string());
+                if action_expectation == recovery::ActionExpectation::RepoChange {
+                    repo_change_retries += 1;
+                    if repo_change_retries >= 3 {
+                        return Err(
+                            "assistant kept stopping before making the requested repository edits"
+                                .to_string(),
+                        );
+                    }
+                    self.push_system_note(recovery::repo_change_recovery_note(repo_change_retries));
+                } else {
+                    empty_retries += 1;
+                    if empty_retries >= 3 {
+                        return Err("assistant returned empty responses repeatedly".to_string());
+                    }
+                    self.push_system_note(recovery::empty_response_recovery_note(
+                        empty_retries,
+                        requires_action,
+                    ));
                 }
-                self.push_system_note(
-                    if action_expectation == recovery::ActionExpectation::RepoChange {
-                        self.next_repo_change_note()
-                    } else {
-                        recovery::empty_response_recovery_note(empty_retries, requires_action)
-                    },
-                );
                 continue;
             }
 
             if requires_action && tool_calls_made_this_turn == 0 {
-                no_tool_retries += 1;
-                if no_tool_retries >= 3 {
-                    return Err(
-                        "assistant kept describing actions without using tools to perform them"
-                            .to_string(),
-                    );
+                if action_expectation == recovery::ActionExpectation::RepoChange {
+                    repo_change_retries += 1;
+                    if repo_change_retries >= 3 {
+                        return Err(
+                            "assistant kept stopping before making the requested repository edits"
+                                .to_string(),
+                        );
+                    }
+                    self.push_system_note(recovery::repo_change_recovery_note(repo_change_retries));
+                } else {
+                    no_tool_retries += 1;
+                    if no_tool_retries >= 3 {
+                        return Err(
+                            "assistant kept describing actions without using tools to perform them"
+                                .to_string(),
+                        );
+                    }
+                    self.push_system_note(recovery::no_tool_recovery_note(no_tool_retries));
                 }
-                self.push_system_note(
-                    if action_expectation == recovery::ActionExpectation::RepoChange {
-                        self.next_repo_change_note()
-                    } else {
-                        recovery::no_tool_recovery_note(no_tool_retries)
-                    },
-                );
                 continue;
             }
 
@@ -98,7 +111,7 @@ impl Agent {
                             .to_string(),
                     );
                 }
-                self.push_system_note(self.next_repo_change_note());
+                self.push_system_note(recovery::repo_change_recovery_note(repo_change_retries));
                 continue;
             }
 
@@ -226,10 +239,6 @@ impl Agent {
             );
         }
         tool_call
-    }
-
-    fn next_repo_change_note(&self) -> String {
-        prompting::repo_change_progress_note(&self.work_root)
     }
 
     pub(super) fn push_system_note(&mut self, note: String) {

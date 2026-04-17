@@ -1,4 +1,3 @@
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -27,27 +26,31 @@ impl ToolProtocol {
         matches!(self, Self::Native)
     }
 
-    pub(crate) fn tool_call_tag(self) -> &'static str {
-        match self {
-            Self::Native => "tool_call",
-            Self::TaggedXml => "anvil_tool_call",
-        }
-    }
-
     pub(crate) fn fallback_instruction(self) -> Option<String> {
         match self {
             Self::Native => None,
-            Self::TaggedXml => Some(
-                "For this model, do not emit native tool_calls. When you need tools, output only <anvil_tool_call>{\"name\":\"Tool\",\"arguments\":{...}}</anvil_tool_call> blocks with valid JSON arguments.".to_string(),
-            ),
+            Self::TaggedXml => Some(format!(
+                "For this model, do not emit native tool_calls. When you need tools, output only {} with valid JSON arguments.",
+                self.fallback_example()
+            )),
         }
     }
 
     pub(crate) fn parser_downgrade_notice(self) -> String {
         match self {
-            Self::Native => "[Runtime Notice] Native tool calling is disabled for this session because the model/runtime parser rejected a tool-call response. Use only <anvil_tool_call>{\"name\":\"Tool\",\"arguments\":{...}}</anvil_tool_call> blocks with valid JSON arguments.".to_string(),
-            Self::TaggedXml => "[Runtime Notice] Continue using <anvil_tool_call>{\"name\":\"Tool\",\"arguments\":{...}}</anvil_tool_call> blocks with valid JSON arguments.".to_string(),
+            Self::Native => format!(
+                "[Runtime Notice] Native tool calling is disabled for this session because the model/runtime parser rejected a tool-call response. Use only {} with valid JSON arguments.",
+                Self::TaggedXml.fallback_example()
+            ),
+            Self::TaggedXml => format!(
+                "[Runtime Notice] Continue using {} with valid JSON arguments.",
+                self.fallback_example()
+            ),
         }
+    }
+
+    pub(crate) fn fallback_example(self) -> &'static str {
+        "<anvil_tool_call>{\"name\":\"Tool\",\"arguments\":{...}}</anvil_tool_call>"
     }
 }
 
@@ -77,10 +80,6 @@ pub(crate) fn runtime_context_messages(
         )));
     }
     messages
-}
-
-pub(crate) fn repo_change_progress_note(root: &Path) -> String {
-    RepoProgress::detect(root).note().to_string()
 }
 
 pub(crate) fn detect_scaffold_root(name: &str, arguments: &Value, result: &str) -> Option<PathBuf> {
@@ -165,112 +164,10 @@ pub(crate) fn detect_created_project_root(tool_output: &str) -> Option<PathBuf> 
     None
 }
 
-#[cfg(test)]
-pub(crate) fn detect_repo_progress(root: &Path) -> RepoProgress {
-    RepoProgress::detect(root)
-}
-
 fn build_scaffold_phase_summary(root: &Path, messages: &[ConversationMessage]) -> String {
     let compact_history = render_messages_for_summary(messages, 2_000);
-    let repo_state = repo_change_progress_note(root);
     let cwd_line = format!("Project scaffold is complete at {}.", root.display());
-    format!("{cwd_line}\n{repo_state}\nRecent context:\n{compact_history}")
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RepoProgress {
-    Empty,
-    InitializedWithoutTests,
-    InitializedWithTests,
-}
-
-impl RepoProgress {
-    fn detect(root: &Path) -> Self {
-        let mut has_manifest = false;
-        let mut has_source = false;
-        let mut has_tests = false;
-        inspect_repo_tree(root, &mut has_manifest, &mut has_source, &mut has_tests);
-
-        if !(has_manifest || has_source) {
-            Self::Empty
-        } else if has_tests {
-            Self::InitializedWithTests
-        } else {
-            Self::InitializedWithoutTests
-        }
-    }
-
-    fn note(self) -> &'static str {
-        match self {
-            Self::Empty => {
-                "The requested repository change is still unfinished. If setup or scaffolding is needed, do it now. As soon as concrete project files exist, stop exploring and use Read on the implementation files, then Write or Edit them in the same turn sequence."
-            }
-            Self::InitializedWithoutTests => {
-                "The repository is initialized but the requested implementation is still unfinished. Inspect the concrete implementation files now and make a real repository change with Write or Edit. If tests are part of the request, add or update at least one test file before finalizing."
-            }
-            Self::InitializedWithTests => {
-                "The repository already has source and test structure. Stop describing intent and make the next concrete code change with Write or Edit on the implementation or test files now. Only finalize after the requested repository change is present."
-            }
-        }
-    }
-}
-
-fn inspect_repo_tree(
-    current: &Path,
-    has_manifest: &mut bool,
-    has_source: &mut bool,
-    has_tests: &mut bool,
-) {
-    let Ok(entries) = fs::read_dir(current) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if file_type.is_dir() {
-            if matches!(name, "node_modules" | ".git" | ".anvil" | ".next") {
-                continue;
-            }
-            if matches!(name, "tests" | "__tests__") {
-                *has_tests = true;
-            }
-            inspect_repo_tree(&path, has_manifest, has_source, has_tests);
-            continue;
-        }
-        if is_manifest_file(name) {
-            *has_manifest = true;
-        }
-        if is_source_file(&path) {
-            *has_source = true;
-        }
-        if is_test_file(&path) {
-            *has_tests = true;
-        }
-    }
-}
-
-fn is_manifest_file(name: &str) -> bool {
-    matches!(
-        name,
-        "package.json" | "Cargo.toml" | "pyproject.toml" | "go.mod" | "Gemfile" | "composer.json"
+    format!(
+        "{cwd_line}\nContinue implementation in this project root without restarting setup.\nRecent context:\n{compact_history}"
     )
-}
-
-fn is_source_file(path: &Path) -> bool {
-    matches!(
-        path.extension().and_then(|ext| ext.to_str()),
-        Some("rs" | "ts" | "tsx" | "js" | "jsx" | "py" | "go" | "java" | "kt" | "rb" | "php")
-    )
-}
-
-fn is_test_file(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-    name.contains(".test.") || name.contains(".spec.")
 }
