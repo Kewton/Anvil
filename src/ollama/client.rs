@@ -23,6 +23,24 @@ pub struct AssistantReply {
     pub tool_calls: Vec<ToolCall>,
 }
 
+#[derive(Serialize)]
+struct RequestOptions {
+    temperature: f32,
+    num_ctx: usize,
+    num_predict: usize,
+}
+
+#[derive(Serialize)]
+struct ChatRequest<'a> {
+    model: &'a str,
+    stream: bool,
+    messages: &'a [ConversationMessage],
+    keep_alive: i32,
+    options: RequestOptions,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<&'a [ToolSpec]>,
+}
+
 impl OllamaClient {
     pub fn new(base_url: String) -> Result<Self, String> {
         Self::new_with_timeout_and_options(base_url, 120, 24_000, 2_048)
@@ -196,27 +214,10 @@ impl OllamaClient {
     where
         F: FnMut(&str),
     {
-        #[derive(Serialize)]
-        struct RequestOptions {
-            temperature: f32,
-            num_ctx: usize,
-            num_predict: usize,
-        }
-
-        #[derive(Serialize)]
-        struct ChatRequest<'a> {
-            model: &'a str,
-            stream: bool,
-            messages: &'a [ConversationMessage],
-            keep_alive: i32,
-            options: RequestOptions,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            tools: Option<&'a [ToolSpec]>,
-        }
-
         let tool_mode = tools.is_some_and(|tool_specs| !tool_specs.is_empty());
         let serialized_tools = if native_tools_enabled { tools } else { None };
         let temperature = if tool_mode { 0.3 } else { 0.7 };
+        let tool_names = tool_names(tools.unwrap_or(&[]));
         logging::log_llm_event(
             "ollama.chat.request",
             json!({
@@ -228,39 +229,32 @@ impl OllamaClient {
                 "temperature": temperature,
                 "num_ctx": self.context_window,
                 "num_predict": self.max_predict,
-                "tools": tools.unwrap_or(&[]).iter().map(|tool| tool.function.name.clone()).collect::<Vec<_>>(),
+                "tools": tool_names,
                 "messages": messages,
             }),
         );
 
-        let response = self
-            .http
-            .post(format!("{}/api/chat", self.base_url))
-            .json(&ChatRequest {
-                model,
-                stream,
-                messages,
-                keep_alive: -1,
-                options: RequestOptions {
-                    temperature,
-                    num_ctx: self.context_window,
-                    num_predict: self.max_predict,
-                },
-                tools: serialized_tools,
-            })
-            .send()
-            .map_err(|err| {
-                logging::log_llm_event(
-                    "ollama.chat.error",
-                    json!({
-                        "model": model,
-                        "stream": stream,
-                        "kind": "transport",
-                        "error": err.to_string(),
-                    }),
-                );
-                format!("failed to contact Ollama chat API: {err}")
-            })?;
+        let request = ChatRequest {
+            model,
+            stream,
+            messages,
+            keep_alive: -1,
+            options: self.request_options(temperature),
+            tools: serialized_tools,
+        };
+
+        let response = self.post_chat_request(&request).map_err(|err| {
+            logging::log_llm_event(
+                "ollama.chat.error",
+                json!({
+                    "model": model,
+                    "stream": stream,
+                    "kind": "transport",
+                    "error": err.to_string(),
+                }),
+            );
+            format!("failed to contact Ollama chat API: {err}")
+        })?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -302,12 +296,6 @@ impl OllamaClient {
             return Err(format!("Ollama /api/chat failed: {status}"));
         }
 
-        let tool_names = tools
-            .unwrap_or(&[])
-            .iter()
-            .map(|tool| tool.function.name.clone())
-            .collect::<Vec<_>>();
-
         if stream {
             parse_streaming_chat_response(response, &tool_names, &mut on_chunk)
         } else {
@@ -332,22 +320,6 @@ impl OllamaClient {
         messages: &[ConversationMessage],
         tools: &[ToolSpec],
     ) -> Result<AssistantReply, String> {
-        #[derive(Serialize)]
-        struct RequestOptions {
-            temperature: f32,
-            num_ctx: usize,
-            num_predict: usize,
-        }
-
-        #[derive(Serialize)]
-        struct ChatRequest<'a> {
-            model: &'a str,
-            stream: bool,
-            messages: &'a [ConversationMessage],
-            keep_alive: i32,
-            options: RequestOptions,
-        }
-
         let mut salvage_messages = messages.to_vec();
         salvage_messages.push(ConversationMessage::system(
             "The previous native tool call response was malformed and rejected by the runtime parser. Retry immediately. Return exactly one valid next action. Do not emit native tool_calls. If a tool is needed, emit a single <anvil_tool_call>{\"name\":\"Tool\",\"arguments\":{\"key\":\"value\"}}</anvil_tool_call> block with valid JSON and no extra prose."
@@ -362,21 +334,16 @@ impl OllamaClient {
             }),
         );
 
+        let request = ChatRequest {
+            model,
+            stream: false,
+            messages: &salvage_messages,
+            keep_alive: -1,
+            options: self.request_options(0.2),
+            tools: None,
+        };
         let response = self
-            .http
-            .post(format!("{}/api/chat", self.base_url))
-            .json(&ChatRequest {
-                model,
-                stream: false,
-                messages: &salvage_messages,
-                keep_alive: -1,
-                options: RequestOptions {
-                    temperature: 0.2,
-                    num_ctx: self.context_window,
-                    num_predict: self.max_predict,
-                },
-            })
-            .send()
+            .post_chat_request(&request)
             .map_err(|err| format!("failed salvage chat retry: {err}"))?;
 
         if !response.status().is_success() {
@@ -396,11 +363,26 @@ impl OllamaClient {
                 "body": truncate_for_log(&body, 200_000),
             }),
         );
-        let tool_names = tools
-            .iter()
-            .map(|tool| tool.function.name.clone())
-            .collect::<Vec<_>>();
+        let tool_names = tool_names(tools);
         parse_chat_response(&body, &tool_names)
+    }
+
+    fn request_options(&self, temperature: f32) -> RequestOptions {
+        RequestOptions {
+            temperature,
+            num_ctx: self.context_window,
+            num_predict: self.max_predict,
+        }
+    }
+
+    fn post_chat_request(
+        &self,
+        request: &ChatRequest<'_>,
+    ) -> Result<reqwest::blocking::Response, reqwest::Error> {
+        self.http
+            .post(format!("{}/api/chat", self.base_url))
+            .json(request)
+            .send()
     }
 }
 
@@ -419,6 +401,13 @@ fn is_native_tool_parse_failure(status: u16, body: &str) -> bool {
         || lower.contains("</function>")
         || lower.contains("tool call")
         || lower.contains("function")
+}
+
+fn tool_names(tools: &[ToolSpec]) -> Vec<String> {
+    tools
+        .iter()
+        .map(|tool| tool.function.name.clone())
+        .collect::<Vec<_>>()
 }
 
 #[derive(Deserialize)]

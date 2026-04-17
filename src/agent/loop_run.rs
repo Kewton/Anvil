@@ -384,40 +384,7 @@ impl Agent {
 
     fn request_assistant_reply(&self, stream_output: bool) -> Result<AssistantReply, String> {
         let native_tools_enabled = self.native_tools_enabled;
-        let tool_call_tag = if native_tools_enabled {
-            "tool_call"
-        } else {
-            "anvil_tool_call"
-        };
-
-        let mut messages = Vec::new();
-        messages.push(ConversationMessage::system(build_system_prompt(
-            self.session.mode_state.mode,
-            self.session.mode_state.active_plan_path.as_deref(),
-            tool_call_tag,
-            native_tools_enabled,
-        )));
-        if !native_tools_enabled {
-            messages.push(ConversationMessage::system(
-                format!(
-                    "For this model, do not emit native tool_calls. When you need tools, output only <{tool_call_tag}>{{\"name\":\"Tool\",\"arguments\":{{...}}}}</{tool_call_tag}> blocks with valid JSON arguments."
-                ),
-            ));
-        }
-        if self.work_root != self.config.cwd {
-            messages.push(ConversationMessage::system(format!(
-                "Current project root is {}. Use relative paths from this directory unless an absolute path is easier for file tools.",
-                self.work_root.display()
-            )));
-        }
-        if let Some(nextjs_targets) = detect_nextjs_targets(&self.work_root) {
-            messages.push(ConversationMessage::system(format!(
-                "Detected Next.js app entry files at {} and {}. If you need to edit the UI, inspect those files first.",
-                self.work_root.join(&nextjs_targets.page).display(),
-                self.work_root.join(&nextjs_targets.globals).display(),
-            )));
-        }
-        messages.extend(self.session.messages.clone());
+        let messages = self.build_request_messages(native_tools_enabled);
 
         if stream_output {
             let mut first_chunk = true;
@@ -446,6 +413,53 @@ impl Agent {
                 self.tool_registry.specs(),
                 native_tools_enabled,
             )
+        }
+    }
+
+    fn build_request_messages(&self, native_tools_enabled: bool) -> Vec<ConversationMessage> {
+        let mut messages = Vec::new();
+        let tool_call_tag = if native_tools_enabled {
+            "tool_call"
+        } else {
+            "anvil_tool_call"
+        };
+
+        messages.push(ConversationMessage::system(build_system_prompt(
+            self.session.mode_state.mode,
+            self.session.mode_state.active_plan_path.as_deref(),
+            tool_call_tag,
+            native_tools_enabled,
+        )));
+        self.append_runtime_context_messages(&mut messages, tool_call_tag, native_tools_enabled);
+        messages.extend(self.session.messages.clone());
+        messages
+    }
+
+    fn append_runtime_context_messages(
+        &self,
+        messages: &mut Vec<ConversationMessage>,
+        tool_call_tag: &str,
+        native_tools_enabled: bool,
+    ) {
+        if !native_tools_enabled {
+            messages.push(ConversationMessage::system(
+                format!(
+                    "For this model, do not emit native tool_calls. When you need tools, output only <{tool_call_tag}>{{\"name\":\"Tool\",\"arguments\":{{...}}}}</{tool_call_tag}> blocks with valid JSON arguments."
+                ),
+            ));
+        }
+        if self.work_root != self.config.cwd {
+            messages.push(ConversationMessage::system(format!(
+                "Current project root is {}. Use relative paths from this directory unless an absolute path is easier for file tools.",
+                self.work_root.display()
+            )));
+        }
+        if let Some(nextjs_targets) = detect_nextjs_targets(&self.work_root) {
+            messages.push(ConversationMessage::system(format!(
+                "Detected Next.js app entry files at {} and {}. If you need to edit the UI, inspect those files first.",
+                self.work_root.join(&nextjs_targets.page).display(),
+                self.work_root.join(&nextjs_targets.globals).display(),
+            )));
         }
     }
 
