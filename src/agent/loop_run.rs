@@ -1,9 +1,9 @@
-use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
+use crate::agent::prompting;
 use crate::agent::recovery;
 use crate::config::Config;
 use crate::format_model_banner;
@@ -21,7 +21,6 @@ use crate::system_prompt::build_system_prompt;
 use crate::tools::registry::{ToolContext, ToolRegistry};
 
 const DEFAULT_KEEP_TAIL: usize = 24;
-const MAX_TOOL_MESSAGE_CHARS: usize = 12_000;
 
 pub enum AgentEvent {
     Continue(Option<String>),
@@ -286,7 +285,7 @@ impl Agent {
                 for tool_call in prepared_tool_calls {
                     let tool_name = tool_call.name.clone();
                     let raw_result = self.execute_tool_call(&tool_name, &tool_call.arguments);
-                    let compact_result = compact_tool_result(&tool_name, raw_result);
+                    let compact_result = prompting::compact_tool_result(&tool_name, raw_result);
                     self.session
                         .messages
                         .push(ConversationMessage::tool(tool_name, compact_result));
@@ -430,37 +429,14 @@ impl Agent {
             tool_call_tag,
             native_tools_enabled,
         )));
-        self.append_runtime_context_messages(&mut messages, tool_call_tag, native_tools_enabled);
+        messages.extend(prompting::runtime_context_messages(
+            &self.config.cwd,
+            &self.work_root,
+            tool_call_tag,
+            native_tools_enabled,
+        ));
         messages.extend(self.session.messages.clone());
         messages
-    }
-
-    fn append_runtime_context_messages(
-        &self,
-        messages: &mut Vec<ConversationMessage>,
-        tool_call_tag: &str,
-        native_tools_enabled: bool,
-    ) {
-        if !native_tools_enabled {
-            messages.push(ConversationMessage::system(
-                format!(
-                    "For this model, do not emit native tool_calls. When you need tools, output only <{tool_call_tag}>{{\"name\":\"Tool\",\"arguments\":{{...}}}}</{tool_call_tag}> blocks with valid JSON arguments."
-                ),
-            ));
-        }
-        if self.work_root != self.config.cwd {
-            messages.push(ConversationMessage::system(format!(
-                "Current project root is {}. Use relative paths from this directory unless an absolute path is easier for file tools.",
-                self.work_root.display()
-            )));
-        }
-        if let Some(nextjs_targets) = detect_nextjs_targets(&self.work_root) {
-            messages.push(ConversationMessage::system(format!(
-                "Detected Next.js app entry files at {} and {}. If you need to edit the UI, inspect those files first.",
-                self.work_root.join(&nextjs_targets.page).display(),
-                self.work_root.join(&nextjs_targets.globals).display(),
-            )));
-        }
     }
 
     fn execute_tool_call(&mut self, name: &str, arguments: &serde_json::Value) -> String {
@@ -495,11 +471,11 @@ impl Agent {
     }
 
     fn next_repo_change_note(&self) -> String {
-        repo_change_progress_note(&self.work_root)
+        prompting::repo_change_progress_note(&self.work_root)
     }
 
     fn push_system_note(&mut self, note: String) {
-        if should_skip_system_note(&self.session.messages, &note) {
+        if prompting::should_skip_system_note(&self.session.messages, &note) {
             return;
         }
         self.session
@@ -569,7 +545,7 @@ impl Agent {
     }
 
     fn maybe_update_work_root(&mut self, name: &str, arguments: &serde_json::Value, result: &str) {
-        let Some(new_root) = detect_scaffold_root(name, arguments, result) else {
+        let Some(new_root) = prompting::detect_scaffold_root(name, arguments, result) else {
             return;
         };
         if new_root == self.work_root || !new_root.is_dir() {
@@ -599,9 +575,8 @@ impl Agent {
     }
 
     fn reset_after_scaffold(&mut self) {
-        let latest_user = latest_user_message(&self.session.messages);
-        let summary = build_scaffold_phase_summary(&self.work_root, &self.session.messages);
-        self.session.messages = scaffold_reset_messages(summary, latest_user);
+        self.session.messages =
+            prompting::reset_messages_after_scaffold(&self.work_root, &self.session.messages);
     }
 }
 
@@ -620,25 +595,6 @@ fn is_native_tool_parser_failure(error: &str) -> bool {
         || lower.contains("unexpected eof")
 }
 
-fn build_scaffold_phase_summary(root: &Path, messages: &[ConversationMessage]) -> String {
-    let compact_history = crate::session::compact::render_messages_for_summary(messages, 2_000);
-    let targets = detect_nextjs_targets(root).map(|targets| {
-        format!(
-            "Primary UI files detected: {} and {}.",
-            root.join(&targets.page).display(),
-            root.join(&targets.globals).display()
-        )
-    });
-    let repo_state = RepoProgress::detect(root).note();
-    let cwd_line = format!("Project scaffold is complete at {}.", root.display());
-    match targets {
-        Some(targets) => {
-            format!("{cwd_line}\n{targets}\n{repo_state}\nRecent context:\n{compact_history}")
-        }
-        None => format!("{cwd_line}\n{repo_state}\nRecent context:\n{compact_history}"),
-    }
-}
-
 fn plan_is_substantive(contents: &str) -> bool {
     let meaningful_lines = contents
         .lines()
@@ -650,191 +606,6 @@ fn plan_is_substantive(contents: &str) -> bool {
     meaningful_lines >= 2
 }
 
-fn detect_created_project_root(tool_output: &str) -> Option<PathBuf> {
-    for line in tool_output.lines() {
-        let trimmed = line.trim();
-        if let Some(path) = trimmed.strip_prefix("Success! Created ") {
-            let (_, path) = path.rsplit_once(" at ")?;
-            return Some(PathBuf::from(path.trim()));
-        }
-        if let Some(path) = trimmed.strip_prefix("Creating a new Next.js app in ") {
-            return Some(PathBuf::from(path.trim_end_matches('.').trim()));
-        }
-    }
-    None
-}
-
-fn detect_scaffold_root(
-    name: &str,
-    arguments: &serde_json::Value,
-    result: &str,
-) -> Option<PathBuf> {
-    if name != "Bash" {
-        return None;
-    }
-    let command = arguments
-        .get("command")
-        .and_then(serde_json::Value::as_str)?;
-    if !command.contains("create-next-app") {
-        return None;
-    }
-    detect_created_project_root(result)
-}
-
-fn latest_user_message(messages: &[ConversationMessage]) -> Option<ConversationMessage> {
-    messages
-        .iter()
-        .rev()
-        .find(|message| message.role == "user")
-        .cloned()
-}
-
-fn scaffold_reset_messages(
-    summary: String,
-    latest_user: Option<ConversationMessage>,
-) -> Vec<ConversationMessage> {
-    let mut messages = vec![ConversationMessage::system(format!(
-        "{}\n{}",
-        crate::session::compact::COMPACT_SUMMARY_PREFIX,
-        summary
-    ))];
-    if let Some(user) = latest_user {
-        messages.push(user);
-    }
-    messages
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RepoProgress {
-    Empty,
-    InitializedWithoutTests,
-    InitializedWithTests,
-}
-
-impl RepoProgress {
-    fn detect(root: &Path) -> Self {
-        let mut has_manifest = false;
-        let mut has_source = false;
-        let mut has_tests = false;
-        inspect_repo_tree(root, &mut has_manifest, &mut has_source, &mut has_tests);
-
-        if !(has_manifest || has_source) {
-            Self::Empty
-        } else if has_tests {
-            Self::InitializedWithTests
-        } else {
-            Self::InitializedWithoutTests
-        }
-    }
-
-    fn note(self) -> &'static str {
-        match self {
-            Self::Empty => {
-                "The requested repository change is still unfinished. If setup or scaffolding is needed, do it now. As soon as concrete project files exist, stop exploring and use Read on the implementation files, then Write or Edit them in the same turn sequence."
-            }
-            Self::InitializedWithoutTests => {
-                "The repository is initialized but the requested implementation is still unfinished. Inspect the concrete implementation files now and make a real repository change with Write or Edit. If tests are part of the request, add or update at least one test file before finalizing."
-            }
-            Self::InitializedWithTests => {
-                "The repository already has source and test structure. Stop describing intent and make the next concrete code change with Write or Edit on the implementation or test files now. Only finalize after the requested repository change is present."
-            }
-        }
-    }
-}
-
-fn repo_change_progress_note(root: &Path) -> String {
-    RepoProgress::detect(root).note().to_string()
-}
-
-#[cfg(test)]
-fn detect_repo_progress(root: &Path) -> RepoProgress {
-    RepoProgress::detect(root)
-}
-
-#[derive(Debug, Clone)]
-struct NextJsTargets {
-    page: PathBuf,
-    globals: PathBuf,
-}
-
-fn detect_nextjs_targets(root: &Path) -> Option<NextJsTargets> {
-    let candidates = [
-        ("src/app/page.tsx", "src/app/globals.css"),
-        ("app/page.tsx", "app/globals.css"),
-    ];
-    for (page, globals) in candidates {
-        let page_path = root.join(page);
-        let globals_path = root.join(globals);
-        if page_path.is_file() || globals_path.is_file() {
-            return Some(NextJsTargets {
-                page: PathBuf::from(page),
-                globals: PathBuf::from(globals),
-            });
-        }
-    }
-    None
-}
-
-fn inspect_repo_tree(
-    current: &Path,
-    has_manifest: &mut bool,
-    has_source: &mut bool,
-    has_tests: &mut bool,
-) {
-    let Ok(entries) = fs::read_dir(current) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if file_type.is_dir() {
-            if matches!(name, "node_modules" | ".git" | ".anvil" | ".next") {
-                continue;
-            }
-            if matches!(name, "tests" | "__tests__") {
-                *has_tests = true;
-            }
-            inspect_repo_tree(&path, has_manifest, has_source, has_tests);
-            continue;
-        }
-        if is_manifest_file(name) {
-            *has_manifest = true;
-        }
-        if is_source_file(&path) {
-            *has_source = true;
-        }
-        if is_test_file(&path) {
-            *has_tests = true;
-        }
-    }
-}
-
-fn is_manifest_file(name: &str) -> bool {
-    matches!(
-        name,
-        "package.json" | "Cargo.toml" | "pyproject.toml" | "go.mod" | "Gemfile" | "composer.json"
-    )
-}
-
-fn is_source_file(path: &Path) -> bool {
-    matches!(
-        path.extension().and_then(|ext| ext.to_str()),
-        Some("rs" | "ts" | "tsx" | "js" | "jsx" | "py" | "go" | "java" | "kt" | "rb" | "php")
-    )
-}
-
-fn is_test_file(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-    name.contains(".test.") || name.contains(".spec.")
-}
-
 fn format_tool_error(err: &str) -> String {
     if err.starts_with("Error:") {
         err.to_string()
@@ -843,50 +614,12 @@ fn format_tool_error(err: &str) -> String {
     }
 }
 
-fn should_skip_system_note(messages: &[ConversationMessage], note: &str) -> bool {
-    for message in messages.iter().rev() {
-        if message.role == "user" {
-            break;
-        }
-        if message.role == "system" && message.content == note {
-            return true;
-        }
-    }
-    false
-}
-
-fn compact_tool_result(name: &str, result: String) -> String {
-    if result.chars().count() <= MAX_TOOL_MESSAGE_CHARS {
-        return result;
-    }
-
-    let chars = result.chars().collect::<Vec<_>>();
-    let total = chars.len();
-    let head_len = if name == "Read" { 8_000 } else { 10_000 }.min(total);
-    let tail_len = if name == "Read" { 2_000 } else { 1_000 }.min(total.saturating_sub(head_len));
-    let head = chars[..head_len].iter().collect::<String>();
-    let tail = if tail_len == 0 {
-        String::new()
-    } else {
-        chars[total - tail_len..].iter().collect::<String>()
-    };
-
-    if tail.is_empty() {
-        format!("{head}\n...[truncated {} chars]", total - head_len)
-    } else {
-        format!(
-            "{head}\n...[truncated {} chars]...\n{tail}",
-            total.saturating_sub(head_len + tail_len)
-        )
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        RepoProgress, compact_tool_result, detect_created_project_root, detect_nextjs_targets,
-        detect_repo_progress, format_tool_error, repo_change_progress_note,
-        should_skip_system_note,
+    use super::format_tool_error;
+    use crate::agent::prompting::{
+        RepoProgress, compact_tool_result, detect_created_project_root, detect_repo_progress,
+        repo_change_progress_note, should_skip_system_note,
     };
     use crate::session::store::ConversationMessage;
     use std::path::PathBuf;
@@ -908,20 +641,6 @@ mod tests {
             detect_created_project_root(output),
             Some(PathBuf::from("/tmp/work/space-invaders"))
         );
-    }
-
-    #[test]
-    fn detects_src_app_nextjs_targets() {
-        let dir = tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
-        std::fs::write(
-            dir.path().join("src/app/page.tsx"),
-            "export default function Page(){}",
-        )
-        .unwrap();
-        let targets = detect_nextjs_targets(dir.path()).unwrap();
-        assert_eq!(targets.page, PathBuf::from("src/app/page.tsx"));
-        assert_eq!(targets.globals, PathBuf::from("src/app/globals.css"));
     }
 
     #[test]
