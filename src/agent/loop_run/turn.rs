@@ -124,7 +124,7 @@ impl Agent {
                 Err(err) => {
                     if self.native_tools_enabled
                         && !downgraded_native_tools
-                        && is_native_tool_parser_failure(&err)
+                        && lifecycle::is_native_tool_parser_failure(&err)
                     {
                         downgraded_native_tools = true;
                         self.disable_native_tools_for_session();
@@ -212,7 +212,7 @@ impl Agent {
                 self.maybe_update_work_root(name, arguments, &result);
                 result
             }
-            Err(err) => format_tool_error(&err),
+            Err(err) => lifecycle::format_tool_error(&err),
         }
     }
 

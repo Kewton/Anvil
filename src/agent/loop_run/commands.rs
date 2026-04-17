@@ -153,7 +153,7 @@ impl Agent {
                 let plan_contents = self
                     .current_plan_contents()?
                     .ok_or_else(|| "plan file is missing".to_string())?;
-                if !plan_is_substantive(&plan_contents) {
+                if !lifecycle::plan_is_substantive(&plan_contents) {
                     return Err("plan file is empty or still template-only".to_string());
                 }
                 self.session.mode_state.approve();
