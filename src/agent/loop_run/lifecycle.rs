@@ -81,16 +81,10 @@ impl Agent {
     fn apply_scaffold_root(&mut self, new_root: PathBuf) {
         self.work_root = new_root.clone();
         self.session.active_root = Some(new_root.clone());
-        self.reset_after_scaffold();
         self.push_system_note(format!(
             "[Workspace Root Updated] Continue work inside {} and use relative paths from there.",
             new_root.display()
         ));
-    }
-
-    fn reset_after_scaffold(&mut self) {
-        self.session.messages =
-            prompting::reset_messages_after_scaffold(&self.work_root, &self.session.messages);
     }
 }
 

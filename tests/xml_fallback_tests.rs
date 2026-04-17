@@ -11,7 +11,7 @@ fn strips_think_tags() {
 fn extracts_json_tool_call_blocks() {
     let (calls, content) = extract_tool_calls(
         r#"before
-<tool_call>{"name":"Read","arguments":{"path":"README.md"}}</tool_call>
+<anvil_tool_call>{"name":"Read","arguments":{"path":"README.md"}}</anvil_tool_call>
 after"#,
         &["Read".to_string()],
     );
@@ -40,7 +40,7 @@ after"#,
 #[test]
 fn extracts_tagged_tool_call_blocks() {
     let (calls, _) = extract_tool_calls(
-        r#"<tool_call name="Write">{"path":"plan.md","content":"hi"}</tool_call>"#,
+        r#"<anvil_tool_call name="Write">{"path":"plan.md","content":"hi"}</anvil_tool_call>"#,
         &["Write".to_string()],
     );
     assert_eq!(calls[0].name, "Write");

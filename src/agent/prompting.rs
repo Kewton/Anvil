@@ -2,7 +2,6 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::session::compact::{COMPACT_SUMMARY_PREFIX, render_messages_for_summary};
 use crate::session::store::ConversationMessage;
 
 const MAX_TOOL_MESSAGE_CHARS: usize = 12_000;
@@ -90,26 +89,6 @@ pub(crate) fn detect_scaffold_root(name: &str, arguments: &Value, result: &str) 
     detect_created_project_root(result)
 }
 
-pub(crate) fn reset_messages_after_scaffold(
-    root: &Path,
-    messages: &[ConversationMessage],
-) -> Vec<ConversationMessage> {
-    let summary = build_scaffold_phase_summary(root, messages);
-    let latest_user = messages
-        .iter()
-        .rev()
-        .find(|message| message.role == "user")
-        .cloned();
-
-    let mut reset = vec![ConversationMessage::system(format!(
-        "{COMPACT_SUMMARY_PREFIX}\n{summary}"
-    ))];
-    if let Some(user) = latest_user {
-        reset.push(user);
-    }
-    reset
-}
-
 pub(crate) fn should_skip_system_note(messages: &[ConversationMessage], note: &str) -> bool {
     for message in messages.iter().rev() {
         if message.role == "user" {
@@ -162,12 +141,4 @@ pub(crate) fn detect_created_project_root(tool_output: &str) -> Option<PathBuf> 
         }
     }
     None
-}
-
-fn build_scaffold_phase_summary(root: &Path, messages: &[ConversationMessage]) -> String {
-    let compact_history = render_messages_for_summary(messages, 2_000);
-    let cwd_line = format!("Project scaffold is complete at {}.", root.display());
-    format!(
-        "{cwd_line}\nContinue implementation in this project root without restarting setup.\nRecent context:\n{compact_history}"
-    )
 }

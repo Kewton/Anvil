@@ -12,7 +12,7 @@ fn parses_tags_and_chat_payloads() {
     );
 
     let reply = parse_chat_response(
-        r#"{"message":{"content":"<tool_call>{\"name\":\"Read\",\"arguments\":{\"path\":\"README.md\"}}</tool_call>done","tool_calls":[]}}"#,
+        r#"{"message":{"content":"<anvil_tool_call>{\"name\":\"Read\",\"arguments\":{\"path\":\"README.md\"}}</anvil_tool_call>done","tool_calls":[]}}"#,
         &["Read".to_string()],
     )
     .unwrap();

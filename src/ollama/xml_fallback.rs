@@ -18,7 +18,7 @@ pub fn extract_tool_calls(text: &str, allowed_tools: &[String]) -> (Vec<ToolCall
     let mut extracted = Vec::new();
     let mut remaining = cleaned.clone();
 
-    for tag in ["tool_call", "anvil_tool_call"] {
+    for tag in ["anvil_tool_call"] {
         let tagged_regex = Regex::new(&format!(
             r#"(?s)<{tag}\s+name="([^"]+)">\s*(\{{.*?\}})\s*</{tag}>"#
         ))

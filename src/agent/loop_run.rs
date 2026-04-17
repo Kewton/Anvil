@@ -73,12 +73,10 @@ impl Agent {
 mod tests {
     use super::lifecycle::format_tool_error;
     use crate::agent::prompting::{
-        compact_tool_result, detect_created_project_root, reset_messages_after_scaffold,
-        should_skip_system_note,
+        compact_tool_result, detect_created_project_root, should_skip_system_note,
     };
     use crate::session::store::ConversationMessage;
     use std::path::PathBuf;
-    use tempfile::tempdir;
 
     #[test]
     fn detects_created_next_app_root_from_success_line() {
@@ -116,26 +114,6 @@ mod tests {
         let compacted = compact_tool_result("Read", long);
         assert!(compacted.contains("[truncated"));
         assert!(compacted.len() < 13_000);
-    }
-
-    #[test]
-    fn scaffold_reset_summary_stays_generic() {
-        let dir = tempdir().unwrap();
-        let messages = vec![
-            ConversationMessage::system("earlier runtime note".to_string()),
-            ConversationMessage::assistant("scaffold finished".to_string(), Vec::new()),
-            ConversationMessage::user("continue implementation".to_string()),
-        ];
-        let reset = reset_messages_after_scaffold(dir.path(), &messages);
-        assert_eq!(reset.len(), 2);
-        assert!(reset[0].content.contains("Project scaffold is complete"));
-        assert!(
-            reset[0]
-                .content
-                .contains("Continue implementation in this project root")
-        );
-        assert!(!reset[0].content.contains("Next.js"));
-        assert!(!reset[0].content.contains("implementation or test files"));
     }
 
     #[test]
