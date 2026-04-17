@@ -569,23 +569,17 @@ impl Agent {
     }
 
     fn maybe_update_work_root(&mut self, name: &str, arguments: &serde_json::Value, result: &str) {
-        if name != "Bash" {
-            return;
-        }
-        let Some(command) = arguments.get("command").and_then(serde_json::Value::as_str) else {
-            return;
-        };
-        if !command.contains("create-next-app") {
-            return;
-        }
-
-        let Some(new_root) = detect_created_project_root(result) else {
+        let Some(new_root) = detect_scaffold_root(name, arguments, result) else {
             return;
         };
         if new_root == self.work_root || !new_root.is_dir() {
             return;
         }
 
+        self.apply_scaffold_root(new_root);
+    }
+
+    fn apply_scaffold_root(&mut self, new_root: PathBuf) {
         self.work_root = new_root.clone();
         self.session.active_root = Some(new_root.clone());
         self.reset_after_scaffold();
@@ -605,26 +599,9 @@ impl Agent {
     }
 
     fn reset_after_scaffold(&mut self) {
-        let latest_user = self
-            .session
-            .messages
-            .iter()
-            .rev()
-            .find(|message| message.role == "user")
-            .cloned();
-
+        let latest_user = latest_user_message(&self.session.messages);
         let summary = build_scaffold_phase_summary(&self.work_root, &self.session.messages);
-        self.session.messages.clear();
-        self.session
-            .messages
-            .push(ConversationMessage::system(format!(
-                "{}\n{}",
-                crate::session::compact::COMPACT_SUMMARY_PREFIX,
-                summary
-            )));
-        if let Some(user) = latest_user {
-            self.session.messages.push(user);
-        }
+        self.session.messages = scaffold_reset_messages(summary, latest_user);
     }
 }
 
@@ -652,7 +629,7 @@ fn build_scaffold_phase_summary(root: &Path, messages: &[ConversationMessage]) -
             root.join(&targets.globals).display()
         )
     });
-    let repo_state = repo_change_progress_note(root);
+    let repo_state = RepoProgress::detect(root).note();
     let cwd_line = format!("Project scaffold is complete at {}.", root.display());
     match targets {
         Some(targets) => {
@@ -687,6 +664,46 @@ fn detect_created_project_root(tool_output: &str) -> Option<PathBuf> {
     None
 }
 
+fn detect_scaffold_root(
+    name: &str,
+    arguments: &serde_json::Value,
+    result: &str,
+) -> Option<PathBuf> {
+    if name != "Bash" {
+        return None;
+    }
+    let command = arguments
+        .get("command")
+        .and_then(serde_json::Value::as_str)?;
+    if !command.contains("create-next-app") {
+        return None;
+    }
+    detect_created_project_root(result)
+}
+
+fn latest_user_message(messages: &[ConversationMessage]) -> Option<ConversationMessage> {
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .cloned()
+}
+
+fn scaffold_reset_messages(
+    summary: String,
+    latest_user: Option<ConversationMessage>,
+) -> Vec<ConversationMessage> {
+    let mut messages = vec![ConversationMessage::system(format!(
+        "{}\n{}",
+        crate::session::compact::COMPACT_SUMMARY_PREFIX,
+        summary
+    ))];
+    if let Some(user) = latest_user {
+        messages.push(user);
+    }
+    messages
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RepoProgress {
     Empty,
@@ -694,27 +711,44 @@ enum RepoProgress {
     InitializedWithTests,
 }
 
-fn repo_change_progress_note(root: &Path) -> String {
-    match detect_repo_progress(root) {
-        RepoProgress::Empty => "The requested repository change is still unfinished. If setup or scaffolding is needed, do it now. As soon as concrete project files exist, stop exploring and use Read on the implementation files, then Write or Edit them in the same turn sequence.".to_string(),
-        RepoProgress::InitializedWithoutTests => "The repository is initialized but the requested implementation is still unfinished. Inspect the concrete implementation files now and make a real repository change with Write or Edit. If tests are part of the request, add or update at least one test file before finalizing.".to_string(),
-        RepoProgress::InitializedWithTests => "The repository already has source and test structure. Stop describing intent and make the next concrete code change with Write or Edit on the implementation or test files now. Only finalize after the requested repository change is present.".to_string(),
+impl RepoProgress {
+    fn detect(root: &Path) -> Self {
+        let mut has_manifest = false;
+        let mut has_source = false;
+        let mut has_tests = false;
+        inspect_repo_tree(root, &mut has_manifest, &mut has_source, &mut has_tests);
+
+        if !(has_manifest || has_source) {
+            Self::Empty
+        } else if has_tests {
+            Self::InitializedWithTests
+        } else {
+            Self::InitializedWithoutTests
+        }
+    }
+
+    fn note(self) -> &'static str {
+        match self {
+            Self::Empty => {
+                "The requested repository change is still unfinished. If setup or scaffolding is needed, do it now. As soon as concrete project files exist, stop exploring and use Read on the implementation files, then Write or Edit them in the same turn sequence."
+            }
+            Self::InitializedWithoutTests => {
+                "The repository is initialized but the requested implementation is still unfinished. Inspect the concrete implementation files now and make a real repository change with Write or Edit. If tests are part of the request, add or update at least one test file before finalizing."
+            }
+            Self::InitializedWithTests => {
+                "The repository already has source and test structure. Stop describing intent and make the next concrete code change with Write or Edit on the implementation or test files now. Only finalize after the requested repository change is present."
+            }
+        }
     }
 }
 
-fn detect_repo_progress(root: &Path) -> RepoProgress {
-    let mut has_manifest = false;
-    let mut has_source = false;
-    let mut has_tests = false;
-    inspect_repo_tree(root, &mut has_manifest, &mut has_source, &mut has_tests);
+fn repo_change_progress_note(root: &Path) -> String {
+    RepoProgress::detect(root).note().to_string()
+}
 
-    if !(has_manifest || has_source) {
-        RepoProgress::Empty
-    } else if has_tests {
-        RepoProgress::InitializedWithTests
-    } else {
-        RepoProgress::InitializedWithoutTests
-    }
+#[cfg(test)]
+fn detect_repo_progress(root: &Path) -> RepoProgress {
+    RepoProgress::detect(root)
 }
 
 #[derive(Debug, Clone)]
