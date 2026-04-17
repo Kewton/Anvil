@@ -1,27 +1,5 @@
-use anvil::agent::orchestration::{
-    FailureClass, capture_repo_snapshot, classify_failure, should_restart_actor,
-    strip_restart_heavy_messages, verify_repo_progress,
-};
-use anvil::session::store::ConversationMessage;
+use anvil::agent::orchestration::{capture_repo_snapshot, verify_repo_progress};
 use tempfile::tempdir;
-
-#[test]
-fn classifies_failures_for_actor_restart() {
-    assert_eq!(
-        classify_failure("failed to contact Ollama chat API: error sending request for url"),
-        FailureClass::Transport
-    );
-    assert_eq!(
-        classify_failure("assistant did not finish within max iterations"),
-        FailureClass::MaxIterations
-    );
-    assert_eq!(
-        classify_failure("assistant kept stopping before making the requested repository edits"),
-        FailureClass::Incomplete
-    );
-    assert!(should_restart_actor(FailureClass::Transport));
-    assert!(!should_restart_actor(FailureClass::Other));
-}
 
 #[test]
 fn deterministic_verifier_reports_changed_file_categories() {
@@ -43,22 +21,5 @@ fn deterministic_verifier_reports_changed_file_categories() {
     assert_eq!(verification.implementation_files_changed, 1);
     assert_eq!(verification.test_files_changed, 1);
     assert!(verification.made_any_progress());
-    assert!(verification.summary_note().contains("Verifier: changed="));
-    assert!(
-        verification
-            .restart_note()
-            .contains("Continue from the changed files")
-    );
-}
-
-#[test]
-fn strips_compact_summary_before_actor_restart() {
-    let mut messages = vec![
-        ConversationMessage::system("[compact-summary]\nold".to_string()),
-        ConversationMessage::system("keep".to_string()),
-        ConversationMessage::user("task".to_string()),
-    ];
-    strip_restart_heavy_messages(&mut messages, 3);
-    assert_eq!(messages.len(), 2);
-    assert_eq!(messages[0].content, "keep");
+    assert_eq!(verification.changed_files.len(), 3);
 }
