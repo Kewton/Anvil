@@ -110,6 +110,47 @@ pub fn repo_change_recovery_note(attempt: usize) -> String {
     )
 }
 
+pub fn install_loop_recovery_note() -> String {
+    "Recent turns repeated setup or dependency installation commands without finishing the implementation. Stop reinstalling packages. Inspect the project files that matter, then use Write or Edit to make concrete code changes before any further setup.".to_string()
+}
+
+pub fn repeated_bash_error(command: &str) -> String {
+    format!(
+        "Error: repeated Bash command blocked to prevent a tool loop: {command}. Do not repeat setup or install steps. Inspect files and continue with Read, Write, or Edit instead."
+    )
+}
+
+pub fn is_dependency_install_command(command: &str) -> bool {
+    let normalized = command.to_ascii_lowercase();
+    normalized.contains("npm install")
+        || normalized.contains("npm i ")
+        || normalized.contains("pnpm add")
+        || normalized.contains("pnpm install")
+        || normalized.contains("yarn add")
+        || normalized.contains("yarn install")
+        || normalized.contains("pip install")
+        || normalized.contains("pip3 install")
+        || normalized.contains("cargo add")
+        || normalized.contains("cargo install")
+        || normalized.contains("bundle add")
+        || normalized.contains("composer require")
+}
+
+pub fn should_block_bash_command(
+    command: &str,
+    recent_bash_commands: &[String],
+    install_commands_seen: usize,
+) -> bool {
+    let normalized = command.trim().to_ascii_lowercase();
+    if recent_bash_commands
+        .iter()
+        .any(|previous| previous.trim().eq_ignore_ascii_case(command.trim()))
+    {
+        return true;
+    }
+    is_dependency_install_command(&normalized) && install_commands_seen >= 2
+}
+
 pub fn tool_call_counts_as_repo_edit(name: &str) -> bool {
     matches!(name, "Write" | "Edit")
 }

@@ -17,6 +17,8 @@ impl Agent {
         let mut empty_retries = 0usize;
         let mut no_tool_retries = 0usize;
         let mut repo_change_retries = 0usize;
+        let mut recent_bash_commands = Vec::<String>::new();
+        let mut install_commands_seen = 0usize;
 
         for _ in 0..self.config.max_iterations {
             let reply = self.request_assistant_reply_with_retry(stream_output)?;
@@ -42,13 +44,41 @@ impl Agent {
                     reply.content,
                     prepared_tool_calls.clone(),
                 ));
+                let mut emitted_bash_loop_note = false;
                 for tool_call in prepared_tool_calls {
                     let tool_name = tool_call.name.clone();
-                    let raw_result = self.execute_tool_call(&tool_name, &tool_call.arguments);
+                    let raw_result = if tool_name == "Bash" {
+                        let command = tool_call
+                            .arguments
+                            .get("command")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        let block_as_loop = recovery::should_block_bash_command(
+                            &command,
+                            &recent_bash_commands,
+                            install_commands_seen,
+                        );
+                        recent_bash_commands.push(command.clone());
+                        if recovery::is_dependency_install_command(&command) {
+                            install_commands_seen += 1;
+                        }
+                        if block_as_loop {
+                            emitted_bash_loop_note = true;
+                            recovery::repeated_bash_error(&command)
+                        } else {
+                            self.execute_tool_call(&tool_name, &tool_call.arguments)
+                        }
+                    } else {
+                        self.execute_tool_call(&tool_name, &tool_call.arguments)
+                    };
                     let compact_result = prompting::compact_tool_result(&tool_name, raw_result);
                     self.session
                         .messages
                         .push(ConversationMessage::tool(tool_name, compact_result));
+                }
+                if emitted_bash_loop_note {
+                    self.push_system_note(recovery::install_loop_recovery_note());
                 }
                 self.maybe_compact_session(DEFAULT_KEEP_TAIL);
                 continue;
@@ -131,6 +161,12 @@ impl Agent {
     ) -> Result<AssistantReply, String> {
         let mut downgraded_native_tools = false;
         let mut retries_remaining = self.config.chat_retries;
+        let mut extra_transport_retries = if self.session.messages.len() >= 12 {
+            2
+        } else {
+            0
+        };
+        let mut transport_retry_count = 0usize;
         loop {
             match self.request_assistant_reply(stream_output) {
                 Ok(reply) => return Ok(reply),
@@ -141,6 +177,12 @@ impl Agent {
                     {
                         downgraded_native_tools = true;
                         self.disable_native_tools_for_session();
+                        continue;
+                    }
+                    if lifecycle::is_transport_error(&err) && extra_transport_retries > 0 {
+                        transport_retry_count += 1;
+                        extra_transport_retries -= 1;
+                        thread::sleep(Duration::from_secs((transport_retry_count as u64) * 4));
                         continue;
                     }
                     if retries_remaining == 0 {

@@ -103,6 +103,15 @@ pub(super) fn is_native_tool_parser_failure(error: &str) -> bool {
         || lower.contains("unexpected eof")
 }
 
+pub(super) fn is_transport_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("failed to contact ollama chat api")
+        || lower.contains("error sending request for url")
+        || lower.contains("connection reset")
+        || lower.contains("connection refused")
+        || lower.contains("broken pipe")
+}
+
 pub(super) fn plan_is_substantive(contents: &str) -> bool {
     let meaningful_lines = contents
         .lines()
