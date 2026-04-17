@@ -25,6 +25,7 @@ mod lifecycle;
 mod turn;
 
 const DEFAULT_KEEP_TAIL: usize = 24;
+const LATE_TURN_KEEP_TAIL: usize = 12;
 
 pub enum AgentEvent {
     Continue(Option<String>),
@@ -71,7 +72,7 @@ impl Agent {
 
 #[cfg(test)]
 mod tests {
-    use super::lifecycle::format_tool_error;
+    use super::lifecycle::{format_tool_error, should_compact_late_turn};
     use crate::agent::prompting::{
         compact_tool_result, detect_created_project_root, should_skip_system_note,
     };
@@ -131,5 +132,14 @@ mod tests {
             ConversationMessage::tool("Read".to_string(), "file contents".to_string()),
         ];
         assert!(should_skip_system_note(&messages, "same note"));
+    }
+
+    #[test]
+    fn late_turn_compaction_triggers_for_edit_heavy_turns() {
+        let messages = (0..18)
+            .map(|index| ConversationMessage::user(format!("message {index}")))
+            .collect::<Vec<_>>();
+        assert!(should_compact_late_turn(&messages, 24_000, 4, 1));
+        assert!(!should_compact_late_turn(&messages[..8], 24_000, 1, 0));
     }
 }

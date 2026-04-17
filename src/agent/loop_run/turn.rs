@@ -80,7 +80,13 @@ impl Agent {
                 if emitted_bash_loop_note {
                     self.push_system_note(recovery::install_loop_recovery_note());
                 }
-                self.maybe_compact_session(DEFAULT_KEEP_TAIL);
+                let compacted = self.maybe_compact_late_turn_session(
+                    tool_calls_made_this_turn,
+                    repo_edit_calls_made_this_turn,
+                );
+                if !compacted {
+                    self.maybe_compact_session(DEFAULT_KEEP_TAIL);
+                }
                 continue;
             }
 

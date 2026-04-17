@@ -41,6 +41,23 @@ impl Agent {
         }
     }
 
+    pub(super) fn maybe_compact_late_turn_session(
+        &mut self,
+        tool_calls_this_turn: usize,
+        repo_edit_calls_this_turn: usize,
+    ) -> bool {
+        if !should_compact_late_turn(
+            &self.session.messages,
+            self.config.context_budget,
+            tool_calls_this_turn,
+            repo_edit_calls_this_turn,
+        ) {
+            return false;
+        }
+
+        self.maybe_compact_session(crate::agent::loop_run::LATE_TURN_KEEP_TAIL)
+    }
+
     pub(super) fn ensure_plan_file(&self, plan_path: &Path) -> Result<(), String> {
         if plan_path.exists() {
             return Ok(());
@@ -94,6 +111,19 @@ pub(super) fn should_compact(
     keep_tail: usize,
 ) -> bool {
     messages.len() > keep_tail + 4 || approximate_token_count(messages) > context_budget
+}
+
+pub(super) fn should_compact_late_turn(
+    messages: &[ConversationMessage],
+    context_budget: usize,
+    tool_calls_this_turn: usize,
+    repo_edit_calls_this_turn: usize,
+) -> bool {
+    if repo_edit_calls_this_turn == 0 && tool_calls_this_turn < 4 {
+        return false;
+    }
+
+    messages.len() >= 16 || approximate_token_count(messages) > context_budget.saturating_mul(3) / 5
 }
 
 pub(super) fn is_native_tool_parser_failure(error: &str) -> bool {
