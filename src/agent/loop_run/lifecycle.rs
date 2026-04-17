@@ -140,6 +140,8 @@ pub(super) fn is_transport_error(error: &str) -> bool {
         || lower.contains("connection reset")
         || lower.contains("connection refused")
         || lower.contains("broken pipe")
+        || lower.contains("ollama /api/chat failed: 5")
+        || lower.contains("ollama /api/chat failed: 429")
 }
 
 pub(super) fn plan_is_substantive(contents: &str) -> bool {

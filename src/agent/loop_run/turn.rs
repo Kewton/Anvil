@@ -184,9 +184,9 @@ impl Agent {
         let mut downgraded_native_tools = false;
         let mut retries_remaining = self.config.chat_retries;
         let mut extra_transport_retries = if self.session.messages.len() >= 12 {
-            2
+            4
         } else {
-            0
+            2
         };
         let mut transport_retry_count = 0usize;
         loop {
