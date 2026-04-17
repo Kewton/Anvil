@@ -120,6 +120,12 @@ pub fn repeated_bash_error(command: &str) -> String {
     )
 }
 
+pub fn broad_restart_discovery_error(tool_name: &str) -> String {
+    format!(
+        "Error: broad {tool_name} discovery is blocked during actor restart. Continue from the files already changed and use Read, Write, or Edit on the current implementation area instead."
+    )
+}
+
 pub fn is_dependency_install_command(command: &str) -> bool {
     let normalized = command.to_ascii_lowercase();
     normalized.contains("npm install")
@@ -153,4 +159,8 @@ pub fn should_block_bash_command(
 
 pub fn tool_call_counts_as_repo_edit(name: &str) -> bool {
     matches!(name, "Write" | "Edit")
+}
+
+pub fn should_block_restart_discovery(tool_name: &str, progress_exists: bool) -> bool {
+    progress_exists && matches!(tool_name, "Glob" | "Bash")
 }

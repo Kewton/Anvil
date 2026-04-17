@@ -24,7 +24,7 @@ impl Agent {
             }
 
             let baseline = orchestration::capture_repo_snapshot(&self.work_root);
-            match self.run_actor_loop(action_expectation, requires_action, stream_output) {
+            match self.run_actor_loop(action_expectation, requires_action, stream_output, false) {
                 Ok(reply) => return Ok(reply),
                 Err(err) => {
                     let failure = orchestration::classify_failure(&err);
@@ -48,6 +48,7 @@ impl Agent {
                             action_expectation,
                             requires_action,
                             stream_output,
+                            verification.prefers_converged_actor(),
                         );
                     }
                     return Err(err);
@@ -55,7 +56,7 @@ impl Agent {
             }
         }
 
-        self.run_actor_loop(action_expectation, requires_action, stream_output)
+        self.run_actor_loop(action_expectation, requires_action, stream_output, false)
     }
 
     fn run_actor_loop(
@@ -63,6 +64,7 @@ impl Agent {
         action_expectation: recovery::ActionExpectation,
         requires_action: bool,
         stream_output: bool,
+        restart_convergence_mode: bool,
     ) -> Result<String, String> {
         let mut tool_calls_made_this_turn = 0usize;
         let mut repo_edit_calls_made_this_turn = 0usize;
@@ -99,7 +101,12 @@ impl Agent {
                 let mut emitted_bash_loop_note = false;
                 for tool_call in prepared_tool_calls {
                     let tool_name = tool_call.name.clone();
-                    let raw_result = if tool_name == "Bash" {
+                    let raw_result = if recovery::should_block_restart_discovery(
+                        &tool_name,
+                        restart_convergence_mode && repo_edit_calls_made_this_turn == 0,
+                    ) {
+                        recovery::broad_restart_discovery_error(&tool_name)
+                    } else if tool_name == "Bash" {
                         let command = tool_call
                             .arguments
                             .get("command")

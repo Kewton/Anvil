@@ -62,6 +62,10 @@ impl RepoVerification {
             "No repository progress was detected. Continue without restarting setup, and make a concrete change next.".to_string()
         }
     }
+
+    pub fn prefers_converged_actor(self) -> bool {
+        self.made_any_progress()
+    }
 }
 
 pub fn classify_failure(error: &str) -> FailureClass {

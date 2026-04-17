@@ -1,8 +1,9 @@
 use anvil::agent::recovery::{
-    ActionExpectation, classify_action_expectation, empty_response_recovery_note,
-    install_loop_recovery_note, is_dependency_install_command, no_tool_recovery_note,
-    repeated_bash_error, repo_change_recovery_note, should_block_bash_command,
-    tool_call_counts_as_repo_edit, user_prompt_requires_action,
+    ActionExpectation, broad_restart_discovery_error, classify_action_expectation,
+    empty_response_recovery_note, install_loop_recovery_note, is_dependency_install_command,
+    no_tool_recovery_note, repeated_bash_error, repo_change_recovery_note,
+    should_block_bash_command, should_block_restart_discovery, tool_call_counts_as_repo_edit,
+    user_prompt_requires_action,
 };
 use anvil::modes::plan_act::ExecutionMode;
 
@@ -65,4 +66,8 @@ fn detects_dependency_install_loops() {
         0
     ));
     assert!(!should_block_bash_command("npm test", &[], 0));
+    assert!(should_block_restart_discovery("Glob", true));
+    assert!(should_block_restart_discovery("Bash", true));
+    assert!(!should_block_restart_discovery("Read", true));
+    assert!(broad_restart_discovery_error("Glob").contains("blocked during actor restart"));
 }
