@@ -3,6 +3,7 @@ use std::path::Path;
 use std::process::Command;
 
 use anvil::agent::Agent;
+use anvil::agent::orchestration::{capture_repo_snapshot, verify_repo_progress};
 use anvil::config::Config;
 use anvil::model_registry::RuntimeModels;
 use anvil::ollama::client::OllamaClient;
@@ -135,13 +136,17 @@ fn live_ollama_reaches_first_write_on_scaffolded_nextjs() {
     assert!(scaffold_status.success());
 
     let cwd = temp.path().join("app");
+    let before = capture_repo_snapshot(&cwd);
     let mut agent = new_agent_with_debug(&cwd, &host, &model, client, 10, true);
     let prompt = "Use the available tools to inspect the current app and make one concrete implementation code change. Stop after the first successful file change.";
     let _ = agent.run_oneshot(prompt);
 
-    let llm_log = cwd.join(".anvil/logs/llm-io.jsonl");
-    let counts = count_tool_calls(&llm_log);
-    assert!(counts.write_calls + counts.edit_calls > 0);
+    let verification = verify_repo_progress(&before, &cwd);
+    assert!(
+        verification.made_any_progress(),
+        "first-write assertion: no repository changes detected. changed_files={:?}",
+        verification.changed_files
+    );
 }
 
 fn available_client_or_skip(host: &str, model: &str) -> Result<Option<OllamaClient>, String> {
@@ -208,28 +213,6 @@ fn run_with_retry(agent: &mut Agent, prompt: &str, retry_prompt: &str) -> Result
         Ok(_) => Ok(()),
         Err(_) => agent.run_oneshot(retry_prompt).map(|_| ()),
     }
-}
-
-#[derive(Default)]
-struct ToolCallCounts {
-    write_calls: usize,
-    edit_calls: usize,
-}
-
-fn count_tool_calls(log_path: &Path) -> ToolCallCounts {
-    let mut counts = ToolCallCounts::default();
-    let Ok(text) = std::fs::read_to_string(log_path) else {
-        return counts;
-    };
-    for line in text.lines() {
-        if line.contains("\"name\":\"Write\"") {
-            counts.write_calls += 1;
-        }
-        if line.contains("\"name\":\"Edit\"") {
-            counts.edit_calls += 1;
-        }
-    }
-    counts
 }
 
 fn assert_semantic_page_contents(page: &str, marker: &str) {
