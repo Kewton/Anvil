@@ -12,49 +12,6 @@ impl Agent {
         let action_expectation =
             recovery::classify_action_expectation(input, self.session.mode_state.mode);
         let requires_action = action_expectation != recovery::ActionExpectation::None;
-        let turn_start_len = self.session.messages.len();
-
-        if action_expectation == recovery::ActionExpectation::RepoChange {
-            let actor_plan_note =
-                orchestration::build_actor_plan(&self.client, &self.models, &self.work_root, input)
-                    .ok()
-                    .map(|plan| format!("[Actor Plan]\n{}", plan.summary));
-            if let Some(note) = &actor_plan_note {
-                self.push_system_note(note.clone());
-            }
-
-            let baseline = orchestration::capture_repo_snapshot(&self.work_root);
-            match self.run_actor_loop(action_expectation, requires_action, stream_output, false) {
-                Ok(reply) => return Ok(reply),
-                Err(err) => {
-                    let failure = orchestration::classify_failure(&err);
-                    if orchestration::should_restart_actor(failure) {
-                        let verification =
-                            orchestration::verify_repo_progress(&baseline, &self.work_root);
-                        orchestration::strip_restart_heavy_messages(
-                            &mut self.session.messages,
-                            turn_start_len,
-                        );
-                        if let Some(note) = actor_plan_note {
-                            self.push_system_note(note);
-                        }
-                        self.push_system_note(verification.summary_note());
-                        self.push_system_note(format!(
-                            "[Actor Restart] Previous actor ended with {:?}. {}",
-                            failure,
-                            verification.restart_note()
-                        ));
-                        return self.run_actor_loop(
-                            action_expectation,
-                            requires_action,
-                            stream_output,
-                            verification.prefers_converged_actor(),
-                        );
-                    }
-                    return Err(err);
-                }
-            }
-        }
 
         self.run_actor_loop(action_expectation, requires_action, stream_output, false)
     }
