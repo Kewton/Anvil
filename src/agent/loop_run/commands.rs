@@ -93,7 +93,7 @@ impl Agent {
                 "/help /status /model /plan /approve /compact /yes /no /exit".to_string(),
             ))),
             "/status" => Ok(AgentEvent::Continue(Some(format!(
-                "mode={:?} auto_approve={} native_tools={} cwd={} session={} plan={} approx_tokens={} deferred=git,watch,testloop,tui,skills,mcp,parallel",
+                "mode={:?} auto_approve={} native_tools={} cwd={} session={} plan={} approx_tokens={} core_only=true",
                 self.session.mode_state.mode,
                 self.config.yes_mode,
                 self.native_tools_enabled,

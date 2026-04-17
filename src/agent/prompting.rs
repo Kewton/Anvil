@@ -8,6 +8,49 @@ use crate::session::store::ConversationMessage;
 
 const MAX_TOOL_MESSAGE_CHARS: usize = 12_000;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolProtocol {
+    Native,
+    TaggedXml,
+}
+
+impl ToolProtocol {
+    pub(crate) fn from_native_tools_enabled(native_tools_enabled: bool) -> Self {
+        if native_tools_enabled {
+            Self::Native
+        } else {
+            Self::TaggedXml
+        }
+    }
+
+    pub(crate) fn native_tools_enabled(self) -> bool {
+        matches!(self, Self::Native)
+    }
+
+    pub(crate) fn tool_call_tag(self) -> &'static str {
+        match self {
+            Self::Native => "tool_call",
+            Self::TaggedXml => "anvil_tool_call",
+        }
+    }
+
+    pub(crate) fn fallback_instruction(self) -> Option<String> {
+        match self {
+            Self::Native => None,
+            Self::TaggedXml => Some(
+                "For this model, do not emit native tool_calls. When you need tools, output only <anvil_tool_call>{\"name\":\"Tool\",\"arguments\":{...}}</anvil_tool_call> blocks with valid JSON arguments.".to_string(),
+            ),
+        }
+    }
+
+    pub(crate) fn parser_downgrade_notice(self) -> String {
+        match self {
+            Self::Native => "[Runtime Notice] Native tool calling is disabled for this session because the model/runtime parser rejected a tool-call response. Use only <anvil_tool_call>{\"name\":\"Tool\",\"arguments\":{...}}</anvil_tool_call> blocks with valid JSON arguments.".to_string(),
+            Self::TaggedXml => "[Runtime Notice] Continue using <anvil_tool_call>{\"name\":\"Tool\",\"arguments\":{...}}</anvil_tool_call> blocks with valid JSON arguments.".to_string(),
+        }
+    }
+}
+
 pub fn detect_language_hint(text: &str) -> &'static str {
     if text.chars().any(|ch| {
         ('\u{3040}'..='\u{30ff}').contains(&ch) || ('\u{4e00}'..='\u{9faf}').contains(&ch)
@@ -21,14 +64,11 @@ pub fn detect_language_hint(text: &str) -> &'static str {
 pub(crate) fn runtime_context_messages(
     cwd: &Path,
     work_root: &Path,
-    tool_call_tag: &str,
-    native_tools_enabled: bool,
+    protocol: ToolProtocol,
 ) -> Vec<ConversationMessage> {
     let mut messages = Vec::new();
-    if !native_tools_enabled {
-        messages.push(ConversationMessage::system(format!(
-            "For this model, do not emit native tool_calls. When you need tools, output only <{tool_call_tag}>{{\"name\":\"Tool\",\"arguments\":{{...}}}}</{tool_call_tag}> blocks with valid JSON arguments."
-        )));
+    if let Some(instruction) = protocol.fallback_instruction() {
+        messages.push(ConversationMessage::system(instruction));
     }
     if work_root != cwd {
         messages.push(ConversationMessage::system(format!(

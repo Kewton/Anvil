@@ -1,26 +1,14 @@
 pub mod agent;
 pub mod cli;
 pub mod config;
-#[allow(dead_code)]
-mod git;
 pub mod logging;
-#[allow(dead_code)]
-mod mcp;
 pub mod model_registry;
 pub mod modes;
 pub mod ollama;
 pub mod safety;
 pub mod session;
-#[allow(dead_code)]
-mod skills;
 pub mod system_prompt;
-#[allow(dead_code)]
-mod testloop;
 pub mod tools;
-#[allow(dead_code)]
-mod tui;
-#[allow(dead_code)]
-mod watch;
 
 use std::io::{self, IsTerminal, Read};
 

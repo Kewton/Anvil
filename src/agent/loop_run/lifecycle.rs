@@ -75,10 +75,7 @@ impl Agent {
     pub(super) fn disable_native_tools_for_session(&mut self) {
         self.native_tools_enabled = false;
         self.session.native_tools_disabled = true;
-        self.push_system_note(
-            "[Runtime Notice] Native tool calling is disabled for this session because the model/runtime parser rejected a tool-call response. Use only <anvil_tool_call>{\"name\":\"Tool\",\"arguments\":{...}}</anvil_tool_call> blocks with valid JSON arguments."
-                .to_string(),
-        );
+        self.push_system_note(prompting::ToolProtocol::TaggedXml.parser_downgrade_notice());
     }
 
     fn apply_scaffold_root(&mut self, new_root: PathBuf) {

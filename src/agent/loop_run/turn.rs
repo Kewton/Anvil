@@ -142,8 +142,10 @@ impl Agent {
     }
 
     fn request_assistant_reply(&self, stream_output: bool) -> Result<AssistantReply, String> {
-        let native_tools_enabled = self.native_tools_enabled;
-        let messages = self.build_request_messages(native_tools_enabled);
+        let protocol =
+            prompting::ToolProtocol::from_native_tools_enabled(self.native_tools_enabled);
+        let native_tools_enabled = protocol.native_tools_enabled();
+        let messages = self.build_request_messages(protocol);
 
         if stream_output {
             let mut first_chunk = true;
@@ -175,25 +177,21 @@ impl Agent {
         }
     }
 
-    fn build_request_messages(&self, native_tools_enabled: bool) -> Vec<ConversationMessage> {
+    fn build_request_messages(
+        &self,
+        protocol: prompting::ToolProtocol,
+    ) -> Vec<ConversationMessage> {
         let mut messages = Vec::new();
-        let tool_call_tag = if native_tools_enabled {
-            "tool_call"
-        } else {
-            "anvil_tool_call"
-        };
 
         messages.push(ConversationMessage::system(build_system_prompt(
             self.session.mode_state.mode,
             self.session.mode_state.active_plan_path.as_deref(),
-            tool_call_tag,
-            native_tools_enabled,
+            protocol,
         )));
         messages.extend(prompting::runtime_context_messages(
             &self.config.cwd,
             &self.work_root,
-            tool_call_tag,
-            native_tools_enabled,
+            protocol,
         ));
         messages.extend(self.session.messages.clone());
         messages
