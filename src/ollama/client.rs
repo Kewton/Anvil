@@ -1,13 +1,15 @@
-use std::io::{BufRead, BufReader};
-
 use reqwest::blocking::Client;
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::json;
 
 use crate::logging;
-use crate::ollama::xml_fallback::{ToolCall, extract_tool_calls};
+use crate::ollama::parsing::{parse_streaming_chat_response, tool_names, truncate_for_log};
+use crate::ollama::transport::{ChatTransport, is_native_tool_parse_failure};
 use crate::session::store::ConversationMessage;
 use crate::tools::registry::ToolSpec;
+
+pub use crate::ollama::parsing::AssistantReply;
+pub use crate::ollama::parsing::{parse_chat_response, parse_tags_response};
+pub use crate::ollama::transport::should_use_native_tool_calls;
 
 #[derive(Debug, Clone)]
 pub struct OllamaClient {
@@ -15,30 +17,6 @@ pub struct OllamaClient {
     http: Client,
     context_window: usize,
     max_predict: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AssistantReply {
-    pub content: String,
-    pub tool_calls: Vec<ToolCall>,
-}
-
-#[derive(Serialize)]
-struct RequestOptions {
-    temperature: f32,
-    num_ctx: usize,
-    num_predict: usize,
-}
-
-#[derive(Serialize)]
-struct ChatRequest<'a> {
-    model: &'a str,
-    stream: bool,
-    messages: &'a [ConversationMessage],
-    keep_alive: i32,
-    options: RequestOptions,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<&'a [ToolSpec]>,
 }
 
 impl OllamaClient {
@@ -234,27 +212,26 @@ impl OllamaClient {
             }),
         );
 
-        let request = ChatRequest {
-            model,
-            stream,
-            messages,
-            keep_alive: -1,
-            options: self.request_options(temperature),
-            tools: serialized_tools,
-        };
-
-        let response = self.post_chat_request(&request).map_err(|err| {
-            logging::log_llm_event(
-                "ollama.chat.error",
-                json!({
-                    "model": model,
-                    "stream": stream,
-                    "kind": "transport",
-                    "error": err.to_string(),
-                }),
-            );
-            format!("failed to contact Ollama chat API: {err}")
-        })?;
+        let transport = ChatTransport::new(
+            &self.base_url,
+            &self.http,
+            self.context_window,
+            self.max_predict,
+        );
+        let response = transport
+            .send_chat_request(model, messages, serialized_tools, stream, temperature)
+            .map_err(|err| {
+                logging::log_llm_event(
+                    "ollama.chat.error",
+                    json!({
+                        "model": model,
+                        "stream": stream,
+                        "kind": "transport",
+                        "error": err.to_string(),
+                    }),
+                );
+                format!("failed to contact Ollama chat API: {err}")
+            })?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -334,16 +311,14 @@ impl OllamaClient {
             }),
         );
 
-        let request = ChatRequest {
-            model,
-            stream: false,
-            messages: &salvage_messages,
-            keep_alive: -1,
-            options: self.request_options(0.2),
-            tools: None,
-        };
-        let response = self
-            .post_chat_request(&request)
+        let transport = ChatTransport::new(
+            &self.base_url,
+            &self.http,
+            self.context_window,
+            self.max_predict,
+        );
+        let response = transport
+            .send_chat_request(model, &salvage_messages, None, false, 0.2)
             .map_err(|err| format!("failed salvage chat retry: {err}"))?;
 
         if !response.status().is_success() {
@@ -366,226 +341,4 @@ impl OllamaClient {
         let tool_names = tool_names(tools);
         parse_chat_response(&body, &tool_names)
     }
-
-    fn request_options(&self, temperature: f32) -> RequestOptions {
-        RequestOptions {
-            temperature,
-            num_ctx: self.context_window,
-            num_predict: self.max_predict,
-        }
-    }
-
-    fn post_chat_request(
-        &self,
-        request: &ChatRequest<'_>,
-    ) -> Result<reqwest::blocking::Response, reqwest::Error> {
-        self.http
-            .post(format!("{}/api/chat", self.base_url))
-            .json(request)
-            .send()
-    }
-}
-
-pub fn should_use_native_tool_calls(model: &str) -> bool {
-    !model.trim().is_empty()
-}
-
-fn is_native_tool_parse_failure(status: u16, body: &str) -> bool {
-    if status != 500 && status != 400 {
-        return false;
-    }
-    let lower = body.to_ascii_lowercase();
-    lower.contains("xml syntax error")
-        || lower.contains("unexpected end element")
-        || lower.contains("unexpected eof")
-        || lower.contains("</function>")
-        || lower.contains("tool call")
-        || lower.contains("function")
-}
-
-fn tool_names(tools: &[ToolSpec]) -> Vec<String> {
-    tools
-        .iter()
-        .map(|tool| tool.function.name.clone())
-        .collect::<Vec<_>>()
-}
-
-#[derive(Deserialize)]
-struct TagsResponse {
-    models: Vec<ModelEntry>,
-}
-
-#[derive(Deserialize)]
-struct ModelEntry {
-    name: String,
-}
-
-#[derive(Deserialize)]
-struct ChatResponse {
-    message: ResponseMessage,
-}
-
-#[derive(Deserialize)]
-struct ResponseMessage {
-    #[serde(default)]
-    content: String,
-    #[serde(default)]
-    tool_calls: Vec<ResponseToolCall>,
-}
-
-#[derive(Deserialize, Clone)]
-struct ResponseToolCall {
-    #[serde(default)]
-    id: Option<String>,
-    function: ResponseFunctionCall,
-}
-
-#[derive(Deserialize, Clone)]
-struct ResponseFunctionCall {
-    name: String,
-    arguments: Value,
-}
-
-#[derive(Deserialize)]
-struct StreamChunk {
-    #[serde(default)]
-    done: bool,
-    #[serde(default)]
-    message: Option<ResponseMessage>,
-}
-
-pub fn parse_tags_response(body: &str) -> Result<Vec<String>, String> {
-    let parsed: TagsResponse = serde_json::from_str(body)
-        .map_err(|err| format!("failed to decode Ollama tags response: {err}"))?;
-    Ok(parsed.models.into_iter().map(|model| model.name).collect())
-}
-
-pub fn parse_chat_response(body: &str, tool_names: &[String]) -> Result<AssistantReply, String> {
-    let parsed: ChatResponse = serde_json::from_str(body)
-        .map_err(|err| format!("failed to decode Ollama chat response: {err}"))?;
-    finalize_reply(
-        parsed.message.content,
-        parsed.message.tool_calls,
-        tool_names,
-    )
-}
-
-fn parse_streaming_chat_response<F>(
-    response: reqwest::blocking::Response,
-    tool_names: &[String],
-    on_chunk: &mut F,
-) -> Result<AssistantReply, String>
-where
-    F: FnMut(&str),
-{
-    let reader = BufReader::new(response);
-    let mut content = String::new();
-    let mut native_tool_calls = Vec::new();
-    let mut raw_chunks = Vec::new();
-
-    for line in reader.lines() {
-        let line = line.map_err(|err| format!("failed to read streaming response: {err}"))?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        raw_chunks.push(truncate_for_log(trimmed, 20_000));
-        let chunk: StreamChunk = serde_json::from_str(trimmed)
-            .map_err(|err| format!("failed to parse streaming chat chunk: {err}"))?;
-        if let Some(message) = chunk.message {
-            if !message.content.is_empty() {
-                on_chunk(&message.content);
-                content.push_str(&message.content);
-            }
-            native_tool_calls.extend(message.tool_calls);
-        }
-        if chunk.done {
-            break;
-        }
-    }
-
-    logging::log_llm_event(
-        "ollama.chat.response_raw",
-        json!({
-            "stream": true,
-            "chunks": raw_chunks,
-        }),
-    );
-
-    finalize_reply(content, native_tool_calls, tool_names)
-}
-
-fn finalize_reply(
-    content: String,
-    native_tool_calls: Vec<ResponseToolCall>,
-    tool_names: &[String],
-) -> Result<AssistantReply, String> {
-    let tool_calls = if native_tool_calls.is_empty() {
-        extract_tool_calls(&content, tool_names).0
-    } else {
-        native_tool_calls
-            .into_iter()
-            .enumerate()
-            .map(|(index, tool_call)| ToolCall {
-                id: tool_call
-                    .id
-                    .unwrap_or_else(|| format!("native-{}", index + 1)),
-                name: normalize_tool_name(&tool_call.function.name, tool_names),
-                arguments: normalize_native_arguments(tool_call.function.arguments),
-            })
-            .collect()
-    };
-    let (_, cleaned_content) = if tool_calls.is_empty() {
-        (
-            Vec::new(),
-            crate::ollama::xml_fallback::strip_think_tags(&content),
-        )
-    } else {
-        extract_tool_calls(&content, tool_names)
-    };
-
-    let reply = AssistantReply {
-        content: cleaned_content,
-        tool_calls,
-    };
-    logging::log_llm_event(
-        "ollama.chat.reply_final",
-        json!({
-            "content": truncate_for_log(&reply.content, 100_000),
-            "tool_calls": reply.tool_calls,
-        }),
-    );
-    Ok(reply)
-}
-
-fn normalize_tool_name(name: &str, allowed_tools: &[String]) -> String {
-    allowed_tools
-        .iter()
-        .find(|candidate| candidate.eq_ignore_ascii_case(name))
-        .cloned()
-        .unwrap_or_else(|| name.to_string())
-}
-
-fn normalize_native_arguments(arguments: Value) -> Value {
-    match arguments {
-        Value::String(raw) => {
-            extract_tool_calls(&format!("<function name=\"noop\">{raw}</function>"), &[])
-                .0
-                .into_iter()
-                .next()
-                .map(|call| call.arguments)
-                .unwrap_or_else(|| {
-                    serde_json::from_str::<Value>(&raw).unwrap_or(Value::String(raw))
-                })
-        }
-        other => other,
-    }
-}
-
-fn truncate_for_log(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-    let truncated = text.chars().take(max_chars).collect::<String>();
-    format!("{truncated}\n...[truncated]")
 }
