@@ -59,6 +59,8 @@ pub struct SessionSnapshot {
     pub checkpoints: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_root: Option<PathBuf>,
+    #[serde(default)]
+    pub native_tools_disabled: bool,
 }
 
 pub struct SessionStore {

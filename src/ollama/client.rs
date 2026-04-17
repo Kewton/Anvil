@@ -78,7 +78,31 @@ impl OllamaClient {
         messages: &[ConversationMessage],
         tools: &[ToolSpec],
     ) -> Result<AssistantReply, String> {
-        self.chat_impl(model, messages, Some(tools), false, |_| {})
+        self.chat_impl(
+            model,
+            messages,
+            Some(tools),
+            false,
+            should_use_native_tool_calls(model),
+            |_| {},
+        )
+    }
+
+    pub fn chat_with_mode(
+        &self,
+        model: &str,
+        messages: &[ConversationMessage],
+        tools: &[ToolSpec],
+        native_tools_enabled: bool,
+    ) -> Result<AssistantReply, String> {
+        self.chat_impl(
+            model,
+            messages,
+            Some(tools),
+            false,
+            native_tools_enabled,
+            |_| {},
+        )
     }
 
     pub fn chat_streaming<F>(
@@ -91,7 +115,35 @@ impl OllamaClient {
     where
         F: FnMut(&str),
     {
-        self.chat_impl(model, messages, Some(tools), true, on_chunk)
+        self.chat_impl(
+            model,
+            messages,
+            Some(tools),
+            true,
+            should_use_native_tool_calls(model),
+            on_chunk,
+        )
+    }
+
+    pub fn chat_streaming_with_mode<F>(
+        &self,
+        model: &str,
+        messages: &[ConversationMessage],
+        tools: &[ToolSpec],
+        native_tools_enabled: bool,
+        on_chunk: F,
+    ) -> Result<AssistantReply, String>
+    where
+        F: FnMut(&str),
+    {
+        self.chat_impl(
+            model,
+            messages,
+            Some(tools),
+            true,
+            native_tools_enabled,
+            on_chunk,
+        )
     }
 
     pub fn chat_text(
@@ -99,7 +151,14 @@ impl OllamaClient {
         model: &str,
         messages: &[ConversationMessage],
     ) -> Result<AssistantReply, String> {
-        self.chat_impl(model, messages, None, false, |_| {})
+        self.chat_impl(
+            model,
+            messages,
+            None,
+            false,
+            should_use_native_tool_calls(model),
+            |_| {},
+        )
     }
 
     pub fn summarize_conversation(
@@ -131,6 +190,7 @@ impl OllamaClient {
         messages: &[ConversationMessage],
         tools: Option<&[ToolSpec]>,
         stream: bool,
+        native_tools_enabled: bool,
         mut on_chunk: F,
     ) -> Result<AssistantReply, String>
     where
@@ -154,7 +214,6 @@ impl OllamaClient {
             tools: Option<&'a [ToolSpec]>,
         }
 
-        let native_tools_enabled = should_use_native_tool_calls(model);
         let tool_mode = tools.is_some_and(|tool_specs| !tool_specs.is_empty());
         let serialized_tools = if native_tools_enabled { tools } else { None };
         let temperature = if tool_mode { 0.3 } else { 0.7 };
@@ -231,6 +290,15 @@ impl OllamaClient {
                 );
                 return Ok(reply);
             }
+            if native_tools_enabled
+                && tool_mode
+                && is_native_tool_parse_failure(status.as_u16(), &body)
+            {
+                return Err(format!(
+                    "native tool parser failed: {}",
+                    truncate_for_log(&body, 500)
+                ));
+            }
             return Err(format!("Ollama /api/chat failed: {status}"));
         }
 
@@ -282,7 +350,7 @@ impl OllamaClient {
 
         let mut salvage_messages = messages.to_vec();
         salvage_messages.push(ConversationMessage::system(
-            "The previous native tool call response was malformed and rejected by the runtime parser. Retry immediately. Return exactly one valid next action. If native tool calling fails again, emit a single <function name=\"Tool\">{\"key\":\"value\"}</function> block with valid JSON arguments and no extra prose."
+            "The previous native tool call response was malformed and rejected by the runtime parser. Retry immediately. Return exactly one valid next action. Do not emit native tool_calls. If a tool is needed, emit a single <anvil_tool_call>{\"name\":\"Tool\",\"arguments\":{\"key\":\"value\"}}</anvil_tool_call> block with valid JSON and no extra prose."
                 .to_string(),
         ));
 

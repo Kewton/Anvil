@@ -35,6 +35,7 @@ pub struct Agent {
     session_store: SessionStore,
     session: SessionSnapshot,
     work_root: PathBuf,
+    native_tools_enabled: bool,
     tool_registry: ToolRegistry,
 }
 
@@ -50,6 +51,8 @@ impl Agent {
             .active_root
             .clone()
             .unwrap_or_else(|| config.cwd.clone());
+        let native_tools_enabled =
+            should_use_native_tool_calls(&models.main) && !session.native_tools_disabled;
         Self {
             config,
             models,
@@ -57,6 +60,7 @@ impl Agent {
             session_store,
             session,
             work_root,
+            native_tools_enabled,
             tool_registry: ToolRegistry::default(),
         }
     }
@@ -153,9 +157,10 @@ impl Agent {
                 "/help /status /model /plan /approve /compact /yes /no /exit".to_string(),
             ))),
             "/status" => Ok(AgentEvent::Continue(Some(format!(
-                "mode={:?} auto_approve={} cwd={} session={} plan={} approx_tokens={} deferred=git,watch,testloop,tui,skills,mcp,parallel",
+                "mode={:?} auto_approve={} native_tools={} cwd={} session={} plan={} approx_tokens={} deferred=git,watch,testloop,tui,skills,mcp,parallel",
                 self.session.mode_state.mode,
                 self.config.yes_mode,
+                self.native_tools_enabled,
                 self.work_root.display(),
                 self.session_store.path().display(),
                 self.session
@@ -352,24 +357,33 @@ impl Agent {
         &mut self,
         stream_output: bool,
     ) -> Result<AssistantReply, String> {
-        let mut last_error = None;
-        for attempt in 0..=self.config.chat_retries {
+        let mut downgraded_native_tools = false;
+        let mut retries_remaining = self.config.chat_retries;
+        loop {
             match self.request_assistant_reply(stream_output) {
                 Ok(reply) => return Ok(reply),
                 Err(err) => {
-                    last_error = Some(err);
-                    if attempt == self.config.chat_retries {
-                        break;
+                    if self.native_tools_enabled
+                        && !downgraded_native_tools
+                        && is_native_tool_parser_failure(&err)
+                    {
+                        downgraded_native_tools = true;
+                        self.disable_native_tools_for_session();
+                        continue;
                     }
-                    thread::sleep(Duration::from_secs((attempt + 1) as u64 * 2));
+                    if retries_remaining == 0 {
+                        return Err(err);
+                    }
+                    let sleep_secs = (self.config.chat_retries - retries_remaining + 1) as u64 * 2;
+                    retries_remaining -= 1;
+                    thread::sleep(Duration::from_secs(sleep_secs));
                 }
             }
         }
-        Err(last_error.unwrap_or_else(|| "assistant request failed".to_string()))
     }
 
     fn request_assistant_reply(&self, stream_output: bool) -> Result<AssistantReply, String> {
-        let native_tools_enabled = should_use_native_tool_calls(&self.models.main);
+        let native_tools_enabled = self.native_tools_enabled;
         let tool_call_tag = if native_tools_enabled {
             "tool_call"
         } else {
@@ -407,10 +421,11 @@ impl Agent {
 
         if stream_output {
             let mut first_chunk = true;
-            let reply = self.client.chat_streaming(
+            let reply = self.client.chat_streaming_with_mode(
                 &self.models.main,
                 &messages,
                 self.tool_registry.specs(),
+                native_tools_enabled,
                 |chunk| {
                     if first_chunk {
                         print!("assistant> ");
@@ -425,8 +440,12 @@ impl Agent {
             }
             Ok(reply)
         } else {
-            self.client
-                .chat(&self.models.main, &messages, self.tool_registry.specs())
+            self.client.chat_with_mode(
+                &self.models.main,
+                &messages,
+                self.tool_registry.specs(),
+                native_tools_enabled,
+            )
         }
     }
 
@@ -555,10 +574,43 @@ impl Agent {
 
         self.work_root = new_root.clone();
         self.session.active_root = Some(new_root.clone());
+        self.reset_after_scaffold();
         self.push_system_note(format!(
             "[Workspace Root Updated] Continue work inside {} and use relative paths from there.",
             new_root.display()
         ));
+    }
+
+    fn disable_native_tools_for_session(&mut self) {
+        self.native_tools_enabled = false;
+        self.session.native_tools_disabled = true;
+        self.push_system_note(
+            "[Runtime Notice] Native tool calling is disabled for this session because the model/runtime parser rejected a tool-call response. Use only <anvil_tool_call>{\"name\":\"Tool\",\"arguments\":{...}}</anvil_tool_call> blocks with valid JSON arguments."
+                .to_string(),
+        );
+    }
+
+    fn reset_after_scaffold(&mut self) {
+        let latest_user = self
+            .session
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == "user")
+            .cloned();
+
+        let summary = build_scaffold_phase_summary(&self.work_root, &self.session.messages);
+        self.session.messages.clear();
+        self.session
+            .messages
+            .push(ConversationMessage::system(format!(
+                "{}\n{}",
+                crate::session::compact::COMPACT_SUMMARY_PREFIX,
+                summary
+            )));
+        if let Some(user) = latest_user {
+            self.session.messages.push(user);
+        }
     }
 }
 
@@ -568,6 +620,32 @@ fn should_compact(
     keep_tail: usize,
 ) -> bool {
     messages.len() > keep_tail + 4 || approximate_token_count(messages) > context_budget
+}
+
+fn is_native_tool_parser_failure(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("native tool parser failed")
+        || lower.contains("unexpected end element")
+        || lower.contains("unexpected eof")
+}
+
+fn build_scaffold_phase_summary(root: &Path, messages: &[ConversationMessage]) -> String {
+    let compact_history = crate::session::compact::render_messages_for_summary(messages, 2_000);
+    let targets = detect_nextjs_targets(root).map(|targets| {
+        format!(
+            "Primary UI files detected: {} and {}.",
+            root.join(&targets.page).display(),
+            root.join(&targets.globals).display()
+        )
+    });
+    let repo_state = repo_change_progress_note(root);
+    let cwd_line = format!("Project scaffold is complete at {}.", root.display());
+    match targets {
+        Some(targets) => {
+            format!("{cwd_line}\n{targets}\n{repo_state}\nRecent context:\n{compact_history}")
+        }
+        None => format!("{cwd_line}\n{repo_state}\nRecent context:\n{compact_history}"),
+    }
 }
 
 fn plan_is_substantive(contents: &str) -> bool {
