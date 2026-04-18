@@ -18,40 +18,69 @@ pub fn extract_tool_calls(text: &str, allowed_tools: &[String]) -> (Vec<ToolCall
     let mut extracted = Vec::new();
     let mut remaining = cleaned.clone();
 
-    for tag in ["anvil_tool_call"] {
-        let tagged_regex = Regex::new(&format!(
-            r#"(?s)<{tag}\s+name="([^"]+)">\s*(\{{.*?\}})\s*</{tag}>"#
-        ))
-        .expect("valid regex");
-        for captures in tagged_regex.captures_iter(&cleaned) {
-            let name = normalize_name(&captures[1], allowed_tools);
-            if let Some(arguments) = parse_arguments(&captures[2]) {
+    for (open_tag, close_tag) in [
+        ("<anvil_tool_call>", "</anvil_tool_call>"),
+        ("<function_call>", "</function_call>"),
+    ] {
+        while let Some(body) = extract_between(&remaining, open_tag, close_tag) {
+            if let Some((name, arguments)) = parse_tool_call_object(&body.inner, allowed_tools) {
                 extracted.push(ToolCall {
                     id: format!("xml-{}", extracted.len() + 1),
                     name,
                     arguments,
                 });
             }
+            remaining.replace_range(body.start..body.end, "");
         }
-        remaining = tagged_regex.replace_all(&remaining, "").into_owned();
-
-        let json_regex =
-            Regex::new(&format!(r"(?s)<{tag}>\s*(\{{.*?\}})\s*</{tag}>")).expect("valid regex");
-        for captures in json_regex.captures_iter(&cleaned) {
-            if let Some((name, arguments)) = parse_tool_call_object(&captures[1], allowed_tools) {
-                extracted.push(ToolCall {
-                    id: format!("xml-{}", extracted.len() + 1),
-                    name,
-                    arguments,
-                });
-            }
-        }
-        remaining = json_regex.replace_all(&remaining, "").into_owned();
     }
 
-    let function_regex = Regex::new(r#"(?s)<function\s+name="([^"]+)">\s*(\{.*?\})\s*</function>"#)
-        .expect("valid regex");
-    for captures in function_regex.captures_iter(&cleaned) {
+    let tagged_regex = Regex::new(
+        r#"(?s)<anvil_tool_call\s+name="([^"]+)">\s*(\{.*?\})\s*</anvil_tool_call>"#,
+    )
+    .expect("valid regex");
+    let cleaned_snapshot = remaining.clone();
+    for captures in tagged_regex.captures_iter(&cleaned_snapshot) {
+        let name = normalize_name(&captures[1], allowed_tools);
+        if let Some(arguments) = parse_arguments(&captures[2]) {
+            extracted.push(ToolCall {
+                id: format!("xml-{}", extracted.len() + 1),
+                name,
+                arguments,
+            });
+        }
+    }
+    remaining = tagged_regex.replace_all(&remaining, "").into_owned();
+
+    for (open_tag, close_tag) in [("<function=", "</function>")] {
+        while let Some(range) = remaining.find(open_tag).and_then(|start| {
+            remaining[start..]
+                .find(close_tag)
+                .map(|end_rel| (start, start + end_rel + close_tag.len()))
+        }) {
+            let block = &remaining[range.0..range.1];
+            if let Some(after_eq) = block.strip_prefix(open_tag)
+                && let Some(gt_pos) = after_eq.find('>')
+            {
+                let name_raw = &after_eq[..gt_pos];
+                let body = &after_eq[gt_pos + 1..after_eq.len() - close_tag.len()];
+                let name = normalize_name(name_raw.trim(), allowed_tools);
+                if let Some(arguments) = parse_arguments(body.trim()) {
+                    extracted.push(ToolCall {
+                        id: format!("xml-{}", extracted.len() + 1),
+                        name,
+                        arguments,
+                    });
+                }
+            }
+            remaining.replace_range(range.0..range.1, "");
+        }
+    }
+
+    let function_regex =
+        Regex::new(r#"(?s)<function\s+name="([^"]+)">\s*(\{.*?\})\s*</function>"#)
+            .expect("valid regex");
+    let cleaned_snapshot = remaining.clone();
+    for captures in function_regex.captures_iter(&cleaned_snapshot) {
         let name = normalize_name(&captures[1], allowed_tools);
         if let Some(arguments) = parse_arguments(&captures[2]) {
             extracted.push(ToolCall {
@@ -66,17 +95,46 @@ pub fn extract_tool_calls(text: &str, allowed_tools: &[String]) -> (Vec<ToolCall
     (extracted, remaining.trim().to_string())
 }
 
+struct ExtractedBlock {
+    inner: String,
+    start: usize,
+    end: usize,
+}
+
+fn extract_between(text: &str, open: &str, close: &str) -> Option<ExtractedBlock> {
+    let start = text.find(open)?;
+    let after_open = start + open.len();
+    let end_rel = text[after_open..].find(close)?;
+    let inner_end = after_open + end_rel;
+    let end = inner_end + close.len();
+    Some(ExtractedBlock {
+        inner: text[after_open..inner_end].trim().to_string(),
+        start,
+        end,
+    })
+}
+
 fn parse_tool_call_object(raw: &str, allowed_tools: &[String]) -> Option<(String, Value)> {
     let value = parse_json_relaxed(raw)?;
     let object = value.as_object()?;
+    let nested_arguments_object = object
+        .get("arguments")
+        .or_else(|| object.get("args"))
+        .and_then(Value::as_object);
     let name = object
         .get("name")
         .or_else(|| object.get("tool"))
-        .and_then(Value::as_str)?;
+        .and_then(Value::as_str)
+        .or_else(|| {
+            nested_arguments_object
+                .and_then(|inner| inner.get("name").or_else(|| inner.get("tool")))
+                .and_then(Value::as_str)
+        })?;
     let arguments = object
         .get("arguments")
         .and_then(normalize_arguments_value)
         .or_else(|| object.get("args").cloned())
+        .map(strip_name_from_arguments)
         .unwrap_or_else(|| {
             let mut remaining = object.clone();
             remaining.remove("name");
@@ -90,6 +148,17 @@ fn parse_tool_call_object(raw: &str, allowed_tools: &[String]) -> Option<(String
             }
         });
     Some((normalize_name(name, allowed_tools), arguments))
+}
+
+fn strip_name_from_arguments(value: Value) -> Value {
+    match value {
+        Value::Object(mut map) => {
+            map.remove("name");
+            map.remove("tool");
+            Value::Object(map)
+        }
+        other => other,
+    }
 }
 
 fn parse_arguments(raw: &str) -> Option<Value> {
@@ -116,9 +185,50 @@ fn parse_json_relaxed(raw: &str) -> Option<Value> {
         if let Some(parsed) = repair_json_candidate(&candidate) {
             return Some(parsed);
         }
+        let balanced = balance_braces(&candidate);
+        if balanced != candidate {
+            if let Ok(parsed) = serde_json::from_str(&balanced) {
+                return Some(parsed);
+            }
+            if let Some(parsed) = repair_json_candidate(&balanced) {
+                return Some(parsed);
+            }
+        }
     }
 
     None
+}
+
+fn balance_braces(raw: &str) -> String {
+    let mut curly: i32 = 0;
+    let mut square: i32 = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    for ch in raw.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_string => escaped = true,
+            '"' => in_string = !in_string,
+            '{' if !in_string => curly += 1,
+            '}' if !in_string => curly -= 1,
+            '[' if !in_string => square += 1,
+            ']' if !in_string => square -= 1,
+            _ => {}
+        }
+    }
+    let mut fixed = raw.to_string();
+    while square > 0 {
+        fixed.push(']');
+        square -= 1;
+    }
+    while curly > 0 {
+        fixed.push('}');
+        curly -= 1;
+    }
+    fixed
 }
 
 fn strip_markdown_fence(raw: &str) -> String {

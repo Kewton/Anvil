@@ -2,14 +2,13 @@ use reqwest::blocking::Client;
 use serde_json::json;
 
 use crate::logging;
-use crate::ollama::fallback;
-use crate::ollama::parsing::{parse_streaming_chat_response, tool_names, truncate_for_log};
-use crate::ollama::transport::{ChatTransport, is_native_tool_parse_failure};
+use crate::ollama::parsing::{parse_streaming_generate_response, tool_names, truncate_for_log};
+use crate::ollama::transport::GenerateTransport;
 use crate::session::store::ConversationMessage;
 use crate::tools::registry::ToolSpec;
 
 pub use crate::ollama::parsing::AssistantReply;
-pub use crate::ollama::parsing::{parse_chat_response, parse_tags_response};
+pub use crate::ollama::parsing::{parse_generate_response, parse_tags_response};
 pub use crate::ollama::transport::should_use_native_tool_calls;
 
 #[derive(Debug, Clone)]
@@ -75,14 +74,7 @@ impl OllamaClient {
         messages: &[ConversationMessage],
         tools: &[ToolSpec],
     ) -> Result<AssistantReply, String> {
-        self.chat_impl(
-            model,
-            messages,
-            Some(tools),
-            false,
-            should_use_native_tool_calls(model),
-            |_| {},
-        )
+        self.generate_impl(model, messages, Some(tools), false, |_| {})
     }
 
     pub fn chat_with_mode(
@@ -90,16 +82,9 @@ impl OllamaClient {
         model: &str,
         messages: &[ConversationMessage],
         tools: &[ToolSpec],
-        native_tools_enabled: bool,
+        _native_tools_enabled: bool,
     ) -> Result<AssistantReply, String> {
-        self.chat_impl(
-            model,
-            messages,
-            Some(tools),
-            false,
-            native_tools_enabled,
-            |_| {},
-        )
+        self.generate_impl(model, messages, Some(tools), false, |_| {})
     }
 
     pub fn chat_streaming<F>(
@@ -112,14 +97,7 @@ impl OllamaClient {
     where
         F: FnMut(&str),
     {
-        self.chat_impl(
-            model,
-            messages,
-            Some(tools),
-            true,
-            should_use_native_tool_calls(model),
-            on_chunk,
-        )
+        self.generate_impl(model, messages, Some(tools), true, on_chunk)
     }
 
     pub fn chat_streaming_with_mode<F>(
@@ -127,20 +105,13 @@ impl OllamaClient {
         model: &str,
         messages: &[ConversationMessage],
         tools: &[ToolSpec],
-        native_tools_enabled: bool,
+        _native_tools_enabled: bool,
         on_chunk: F,
     ) -> Result<AssistantReply, String>
     where
         F: FnMut(&str),
     {
-        self.chat_impl(
-            model,
-            messages,
-            Some(tools),
-            true,
-            native_tools_enabled,
-            on_chunk,
-        )
+        self.generate_impl(model, messages, Some(tools), true, on_chunk)
     }
 
     pub fn chat_text(
@@ -148,14 +119,7 @@ impl OllamaClient {
         model: &str,
         messages: &[ConversationMessage],
     ) -> Result<AssistantReply, String> {
-        self.chat_impl(
-            model,
-            messages,
-            None,
-            false,
-            should_use_native_tool_calls(model),
-            |_| {},
-        )
+        self.generate_impl(model, messages, None, false, |_| {})
     }
 
     pub fn summarize_conversation(
@@ -181,49 +145,48 @@ impl OllamaClient {
         Ok(summary.to_string())
     }
 
-    fn chat_impl<F>(
+    fn generate_impl<F>(
         &self,
         model: &str,
         messages: &[ConversationMessage],
         tools: Option<&[ToolSpec]>,
         stream: bool,
-        native_tools_enabled: bool,
         mut on_chunk: F,
     ) -> Result<AssistantReply, String>
     where
         F: FnMut(&str),
     {
         let tool_mode = tools.is_some_and(|tool_specs| !tool_specs.is_empty());
-        let serialized_tools = if native_tools_enabled { tools } else { None };
         let temperature = if tool_mode { 0.3 } else { 0.7 };
-        let tool_names = tool_names(tools.unwrap_or(&[]));
+        let tool_names_vec = tool_names(tools.unwrap_or(&[]));
+        let prompt = flatten_messages_to_chatml(messages);
+
         logging::log_llm_event(
-            "ollama.chat.request",
+            "ollama.generate.request",
             json!({
                 "base_url": self.base_url,
                 "model": model,
                 "stream": stream,
                 "tool_mode": tool_mode,
-                "native_tools_enabled": native_tools_enabled,
                 "temperature": temperature,
                 "num_ctx": self.context_window,
                 "num_predict": self.max_predict,
-                "tools": tool_names,
+                "tools": tool_names_vec,
                 "messages": messages,
             }),
         );
 
-        let transport = ChatTransport::new(
+        let transport = GenerateTransport::new(
             &self.base_url,
             &self.http,
             self.context_window,
             self.max_predict,
         );
         let response = transport
-            .send_chat_request(model, messages, serialized_tools, stream, temperature)
+            .send_generate_request(model, &prompt, stream, temperature)
             .map_err(|err| {
                 logging::log_llm_event(
-                    "ollama.chat.error",
+                    "ollama.generate.error",
                     json!({
                         "model": model,
                         "stream": stream,
@@ -231,14 +194,14 @@ impl OllamaClient {
                         "error": err.to_string(),
                     }),
                 );
-                format!("failed to contact Ollama chat API: {err}")
+                format!("failed to contact Ollama generate API: {err}")
             })?;
 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().unwrap_or_default();
             logging::log_llm_event(
-                "ollama.chat.error",
+                "ollama.generate.error",
                 json!({
                     "model": model,
                     "stream": stream,
@@ -247,52 +210,74 @@ impl OllamaClient {
                     "body": truncate_for_log(&body, 20_000),
                 }),
             );
-            if native_tools_enabled
-                && tool_mode
-                && is_native_tool_parse_failure(status.as_u16(), &body)
-                && let Ok(reply) = fallback::salvage_malformed_tool_call(
-                    &transport,
-                    model,
-                    messages,
-                    tools.unwrap_or(&[]),
-                )
-            {
-                logging::log_llm_event(
-                    "ollama.chat.salvage_success",
-                    json!({
-                        "model": model,
-                        "status": status.as_u16(),
-                    }),
-                );
-                return Ok(reply);
-            }
-            if native_tools_enabled
-                && tool_mode
-                && is_native_tool_parse_failure(status.as_u16(), &body)
-            {
-                return Err(format!(
-                    "native tool parser failed: {}",
-                    truncate_for_log(&body, 500)
-                ));
-            }
-            return Err(format!("Ollama /api/chat failed: {status}"));
+            return Err(format!("Ollama /api/generate failed: {status}"));
         }
 
         if stream {
-            parse_streaming_chat_response(response, &tool_names, &mut on_chunk)
+            parse_streaming_generate_response(response, &tool_names_vec, &mut on_chunk)
         } else {
             let body = response
                 .text()
-                .map_err(|err| format!("failed to decode Ollama chat response: {err}"))?;
+                .map_err(|err| format!("failed to decode Ollama generate response: {err}"))?;
             logging::log_llm_event(
-                "ollama.chat.response_raw",
+                "ollama.generate.response_raw",
                 json!({
                     "model": model,
                     "stream": false,
                     "body": truncate_for_log(&body, 200_000),
                 }),
             );
-            parse_chat_response(&body, &tool_names)
+            parse_generate_response(&body, &tool_names_vec)
         }
     }
+}
+
+fn flatten_messages_to_chatml(messages: &[ConversationMessage]) -> String {
+    let mut buffer = String::new();
+    for message in messages {
+        match message.role.as_str() {
+            "system" => {
+                buffer.push_str("<|im_start|>system\n");
+                buffer.push_str(&message.content);
+                buffer.push_str("<|im_end|>\n");
+            }
+            "user" => {
+                buffer.push_str("<|im_start|>user\n");
+                buffer.push_str(&message.content);
+                buffer.push_str("<|im_end|>\n");
+            }
+            "assistant" => {
+                buffer.push_str("<|im_start|>assistant\n");
+                buffer.push_str(&message.content);
+                if !message.tool_calls.is_empty() {
+                    for tool_call in &message.tool_calls {
+                        buffer.push_str("\n<anvil_tool_call>");
+                        buffer.push_str(
+                            &serde_json::to_string(&serde_json::json!({
+                                "name": tool_call.name,
+                                "arguments": tool_call.arguments,
+                            }))
+                            .unwrap_or_default(),
+                        );
+                        buffer.push_str("</anvil_tool_call>");
+                    }
+                }
+                buffer.push_str("<|im_end|>\n");
+            }
+            "tool" => {
+                let label = message.name.as_deref().unwrap_or("tool");
+                buffer.push_str("<|im_start|>user\n");
+                buffer.push_str(&format!("[tool result {label}]\n"));
+                buffer.push_str(&message.content);
+                buffer.push_str("<|im_end|>\n");
+            }
+            _ => {
+                buffer.push_str("<|im_start|>user\n");
+                buffer.push_str(&message.content);
+                buffer.push_str("<|im_end|>\n");
+            }
+        }
+    }
+    buffer.push_str("<|im_start|>assistant\n");
+    buffer
 }
