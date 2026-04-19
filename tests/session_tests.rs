@@ -8,8 +8,11 @@ use tempfile::tempdir;
 #[test]
 fn session_store_round_trip() {
     let dir = tempdir().unwrap();
-    let path = dir.path().join("session.json");
-    let store = SessionStore::new(path.clone());
+    let session_id = "0199fe00-0000-7000-8000-000000000001";
+    let workspace_key = "abc123";
+    let session_dir = dir.path().join("sessions").join(session_id);
+    std::fs::create_dir_all(&session_dir).unwrap();
+    let store = SessionStore::new(dir.path(), session_id, workspace_key);
     let snapshot = SessionSnapshot {
         messages: vec![ConversationMessage::user("hello".into())],
         ..SessionSnapshot::default()
@@ -17,6 +20,52 @@ fn session_store_round_trip() {
     store.save(&snapshot).unwrap();
     let loaded = store.load_or_new(false).unwrap();
     assert_eq!(loaded.messages, snapshot.messages);
+    assert_eq!(loaded.id, session_id);
+    assert_eq!(loaded.workspace_key, workspace_key);
+}
+
+#[test]
+fn session_snapshot_roundtrip_preserves_id_and_workspace_key() {
+    let snapshot = SessionSnapshot {
+        id: "0199fe00-0000-7000-8000-000000000002".to_string(),
+        workspace_key: "deadbeef".to_string(),
+        messages: vec![ConversationMessage::user("hi".into())],
+        ..SessionSnapshot::default()
+    };
+    let json = serde_json::to_string(&snapshot).unwrap();
+    let decoded: SessionSnapshot = serde_json::from_str(&json).unwrap();
+    assert_eq!(decoded.id, snapshot.id);
+    assert_eq!(decoded.workspace_key, snapshot.workspace_key);
+    assert_eq!(decoded.messages, snapshot.messages);
+}
+
+#[test]
+fn session_snapshot_legacy_defaults_id_and_workspace_key() {
+    let legacy =
+        r#"{"mode_state":{"mode":"Act","active_plan_path":null},"messages":[],"checkpoints":[]}"#;
+    let decoded: SessionSnapshot = serde_json::from_str(legacy).unwrap();
+    assert_eq!(decoded.id, "");
+    assert_eq!(decoded.workspace_key, "");
+}
+
+#[test]
+fn session_store_fills_in_empty_id_on_load() {
+    let dir = tempdir().unwrap();
+    let session_id = "0199fe00-0000-7000-8000-000000000003";
+    let workspace_key = "ws-key";
+    let session_dir = dir.path().join("sessions").join(session_id);
+    std::fs::create_dir_all(&session_dir).unwrap();
+    let session_json = session_dir.join("session.json");
+    std::fs::write(
+        &session_json,
+        r#"{"mode_state":{"mode":"Act","active_plan_path":null},"messages":[],"checkpoints":[]}"#,
+    )
+    .unwrap();
+
+    let store = SessionStore::new(dir.path(), session_id, workspace_key);
+    let loaded = store.load_or_new(false).unwrap();
+    assert_eq!(loaded.id, session_id);
+    assert_eq!(loaded.workspace_key, workspace_key);
 }
 
 #[test]

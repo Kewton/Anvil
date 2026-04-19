@@ -18,7 +18,7 @@ Ollama 直結の local-first コーディングエージェント。`workspace/v
 - Ollama `/api/tags` `/api/chat` への直結クライアント
 - 同期 / streaming 両対応の chat loop
 - モデル自動選択と optional sidecar 選択
-- `.anvil/sessions/session.json` へのセッション保存
+- `$XDG_STATE_HOME/anvil/sessions/{session_id}/session.json` へのセッション保存（workdir 外）
 - `/plan` と `/approve` による Plan / Act 切り替え
 - Git checkpoint / rollback
 - `<think>` 除去と `<tool_call>...</tool_call>` XML fallback
@@ -80,7 +80,8 @@ anvil [OPTIONS]
       --watch                        enable file watcher on startup
       --auto-test <COMMAND>          run a shell command when watcher sees changes
   -y, --yes                          auto-approve Bash / Write / Edit
-      --fresh-session                ignore saved session
+      --fresh-session                ignore saved session, start new session_id
+      --state-dir <PATH>             override XDG state root (default: $XDG_STATE_HOME/anvil)
       --oneshot                      read one prompt from CLI or stdin
 ```
 
@@ -101,6 +102,7 @@ anvil [OPTIONS]
 - `/skills`
 - `/skill <name>`
 - `/mcp`
+- `/logs path [<session_id>]`
 - `/parallel task1 || task2`
 - `/exit`
 
@@ -134,9 +136,29 @@ export ANVIL_TUI=1
 export ANVIL_WATCH=1
 export ANVIL_AUTO_TEST="cargo test --lib"
 export ANVIL_YES=1
+export ANVIL_STATE_DIR=/custom/path/to/anvil-state
 ```
 
 優先順位は `CLI > 環境変数 > .anvil/config > デフォルト値`。
+
+## 永続化とログの保存先
+
+セッションデータ・LLM I/O ログ・プランは **workdir 外の XDG state 領域**に保存され、`npx create-next-app .` 等の scaffold ツールによる workdir wipe を生き残る。
+
+```
+$XDG_STATE_HOME/anvil/           (未設定時: ~/.local/state/anvil)
+  sessions/
+    {session_id}/
+      session.json               ← 会話履歴・モード状態
+      logs/
+        llm-io.jsonl             ← LLM I/O ログ（--debug 時）
+      plans/
+        plan.md                  ← Plan mode のプランファイル
+```
+
+workdir 側の `.anvil/logs/` `.anvil/sessions/` `.anvil/plans/` は上記へのベストエフォート symlink（削除されても次回起動時に再作成）。
+
+`--state-dir <PATH>` または `ANVIL_STATE_DIR=<PATH>` で保存先を上書きできる。テストでは `ANVIL_STATE_DIR` を tempdir に設定することで実 `$HOME` を汚染しない。
 
 ## 安全性
 

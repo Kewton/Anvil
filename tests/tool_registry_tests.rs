@@ -84,3 +84,41 @@ fn plan_mode_only_allows_plan_file_writes() {
         .unwrap_err();
     assert!(err.contains("plan file"));
 }
+
+#[test]
+fn plan_mode_allows_plan_file_outside_workspace() {
+    let workspace = tempdir().unwrap();
+    let state_root = tempdir().unwrap();
+    let plan_path = state_root
+        .path()
+        .join("sessions/some-session/plans/plan-1.md");
+    std::fs::create_dir_all(plan_path.parent().unwrap()).unwrap();
+
+    let registry = ToolRegistry::default();
+    let context = ToolContext {
+        root: workspace.path().to_path_buf(),
+        mode: ExecutionMode::Plan,
+        plan_path: Some(plan_path.clone()),
+        auto_approve: true,
+        interactive_approval: false,
+    };
+
+    registry
+        .execute(
+            "Write",
+            &json!({"path": plan_path.display().to_string(), "content":"# outside plan"}),
+            &context,
+        )
+        .unwrap();
+    let contents = fs::read_to_string(&plan_path).unwrap();
+    assert!(contents.contains("# outside plan"));
+
+    let err = registry
+        .execute(
+            "Write",
+            &json!({"path":"src/lib.rs","content":"oops"}),
+            &context,
+        )
+        .unwrap_err();
+    assert!(err.contains("plan file"));
+}

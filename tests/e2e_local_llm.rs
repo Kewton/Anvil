@@ -8,6 +8,7 @@ use anvil::config::Config;
 use anvil::model_registry::RuntimeModels;
 use anvil::ollama::client::OllamaClient;
 use anvil::session::store::SessionStore;
+use anvil::{compute_workspace_key, ensure_state_dirs, resolve_session_id};
 use tempfile::tempdir;
 
 #[test]
@@ -33,7 +34,7 @@ fn live_ollama_can_write_a_file() {
 
     let content = std::fs::read_to_string(temp.path().join("e2e-output.txt")).unwrap();
     assert_eq!(content.trim(), "LOCAL_E2E_OK");
-    assert!(temp.path().join(".anvil/sessions/session.json").is_file());
+    assert!(temp.path().join(".anvil-state/sessions").is_dir());
 }
 
 #[test]
@@ -63,7 +64,7 @@ fn live_ollama_multi_run_file_write_stability() {
         run_with_retry(&mut agent, &prompt, &retry_prompt).unwrap();
         let content = std::fs::read_to_string(temp.path().join(format!("run-{run}.txt"))).unwrap();
         assert_eq!(content.trim(), format!("RUN_{run}_OK"));
-        assert!(temp.path().join(".anvil/sessions/session.json").is_file());
+        assert!(temp.path().join(".anvil-state/sessions").is_dir());
     }
 }
 
@@ -104,7 +105,7 @@ fn live_ollama_can_semantically_edit_and_start_nextjs() {
     let page_path = cwd.join("src/app/page.tsx");
     let page = std::fs::read_to_string(&page_path).unwrap();
     assert_semantic_page_contents(&page, "LOCAL_E2E_WEB_OK");
-    assert!(cwd.join(".anvil/sessions/session.json").is_file());
+    assert!(cwd.join(".anvil-state/sessions").is_dir());
 
     let status = Command::new("sh")
         .args(["-lc", "npm run dev -- --port 3011 > /tmp/anvil-e2e-dev.log 2>&1 & pid=$!; sleep 8; kill $pid >/dev/null 2>&1; wait $pid >/dev/null 2>&1 || true"])
@@ -178,6 +179,10 @@ fn new_agent_with_debug(
     max_iterations: usize,
     debug: bool,
 ) -> Agent {
+    let state_root = cwd.join(".anvil-state");
+    let workspace_key = compute_workspace_key(cwd);
+    let session_id = resolve_session_id(&state_root, &workspace_key, true);
+    ensure_state_dirs(&state_root, &session_id).unwrap();
     let config = Config {
         cwd: cwd.to_path_buf(),
         requested_model: Some(model.to_string()),
@@ -193,8 +198,8 @@ fn new_agent_with_debug(
         fresh_session: true,
         oneshot: true,
         prompt: None,
+        state_dir_override: Some(state_root.clone()),
     };
-    config.ensure_state_dirs().unwrap();
 
     Agent::new(
         config,
@@ -203,7 +208,7 @@ fn new_agent_with_debug(
             sidecar: None,
         },
         client,
-        SessionStore::new(cwd.join(".anvil/sessions/session.json")),
+        SessionStore::new(&state_root, &session_id, &workspace_key),
         Default::default(),
     )
 }

@@ -34,10 +34,9 @@ pub fn extract_tool_calls(text: &str, allowed_tools: &[String]) -> (Vec<ToolCall
         }
     }
 
-    let tagged_regex = Regex::new(
-        r#"(?s)<anvil_tool_call\s+name="([^"]+)">\s*(\{.*?\})\s*</anvil_tool_call>"#,
-    )
-    .expect("valid regex");
+    let tagged_regex =
+        Regex::new(r#"(?s)<anvil_tool_call\s+name="([^"]+)">\s*(\{.*?\})\s*</anvil_tool_call>"#)
+            .expect("valid regex");
     let cleaned_snapshot = remaining.clone();
     for captures in tagged_regex.captures_iter(&cleaned_snapshot) {
         let name = normalize_name(&captures[1], allowed_tools);
@@ -76,9 +75,8 @@ pub fn extract_tool_calls(text: &str, allowed_tools: &[String]) -> (Vec<ToolCall
         }
     }
 
-    let function_regex =
-        Regex::new(r#"(?s)<function\s+name="([^"]+)">\s*(\{.*?\})\s*</function>"#)
-            .expect("valid regex");
+    let function_regex = Regex::new(r#"(?s)<function\s+name="([^"]+)">\s*(\{.*?\})\s*</function>"#)
+        .expect("valid regex");
     let cleaned_snapshot = remaining.clone();
     for captures in function_regex.captures_iter(&cleaned_snapshot) {
         let name = normalize_name(&captures[1], allowed_tools);

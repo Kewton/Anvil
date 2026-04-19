@@ -68,14 +68,20 @@ impl ToolRegistry {
                 read::run(&path, start_line, end_line)
             }
             "Write" => {
-                let path =
-                    resolve_user_path(&context.root, get_required_string(arguments, "path")?)?;
+                let path = resolve_write_path(
+                    &context.root,
+                    get_required_string(arguments, "path")?,
+                    context,
+                )?;
                 let content = get_required_string(arguments, "content")?;
                 write::run(&path, content)
             }
             "Edit" => {
-                let path =
-                    resolve_user_path(&context.root, get_required_string(arguments, "path")?)?;
+                let path = resolve_write_path(
+                    &context.root,
+                    get_required_string(arguments, "path")?,
+                    context,
+                )?;
                 let old = get_required_string(arguments, "old_string")?;
                 let new = get_required_string(arguments, "new_string")?;
                 let replace_all = arguments
@@ -210,24 +216,73 @@ fn enforce_mode(name: &str, arguments: &Value, context: &ToolContext) -> Result<
     match name {
         "Read" | "Glob" | "Grep" => Ok(()),
         "Write" | "Edit" => {
-            let path = resolve_user_path(&context.root, get_required_string(arguments, "path")?)?;
+            let raw_path = get_required_string(arguments, "path")?;
             let allowed_path = context
                 .plan_path
                 .as_ref()
                 .ok_or_else(|| "plan mode write target is not set".to_string())?;
-            let allowed_path =
-                resolve_user_path(&context.root, &allowed_path.display().to_string())?;
-            if path == allowed_path {
+            let canonical_allowed = canonicalize_with_missing_tail(allowed_path);
+            let input_path = std::path::Path::new(raw_path);
+            let canonical_requested = if input_path.is_absolute() {
+                canonicalize_with_missing_tail(input_path)
+            } else {
+                resolve_user_path(&context.root, raw_path)?
+            };
+            if canonical_requested == canonical_allowed {
                 Ok(())
             } else {
                 Err(format!(
                     "plan mode only allows writing the plan file: {}",
-                    allowed_path.display()
+                    canonical_allowed.display()
                 ))
             }
         }
         _ => Err("plan mode only allows Read, Glob, Grep, and plan file edits".to_string()),
     }
+}
+
+fn resolve_write_path(
+    root: &std::path::Path,
+    raw: &str,
+    context: &ToolContext,
+) -> Result<std::path::PathBuf, String> {
+    if context.mode == ExecutionMode::Plan
+        && let Some(allowed) = context.plan_path.as_ref()
+    {
+        let canonical_allowed = canonicalize_with_missing_tail(allowed);
+        let input_path = std::path::Path::new(raw);
+        let canonical_requested = if input_path.is_absolute() {
+            canonicalize_with_missing_tail(input_path)
+        } else {
+            resolve_user_path(root, raw)?
+        };
+        if canonical_requested == canonical_allowed {
+            return Ok(canonical_allowed);
+        }
+    }
+    resolve_user_path(root, raw)
+}
+
+fn canonicalize_with_missing_tail(path: &std::path::Path) -> std::path::PathBuf {
+    let mut missing = Vec::new();
+    let mut cursor = path;
+    while !cursor.exists() {
+        let Some(name) = cursor.file_name() else {
+            return path.to_path_buf();
+        };
+        missing.push(name.to_os_string());
+        let Some(parent) = cursor.parent() else {
+            return path.to_path_buf();
+        };
+        cursor = parent;
+    }
+    let Ok(mut resolved) = std::fs::canonicalize(cursor) else {
+        return path.to_path_buf();
+    };
+    for component in missing.iter().rev() {
+        resolved.push(component);
+    }
+    resolved
 }
 
 fn maybe_confirm(name: &str, arguments: &Value, context: &ToolContext) -> Result<(), String> {

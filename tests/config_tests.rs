@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use anvil::config::{PartialConfig, merge_partial_configs, parse_key_value_config};
 
 #[test]
@@ -40,4 +42,29 @@ fn merge_prefers_later_sources() {
     assert_eq!(merged.yes_mode, Some(true));
     assert_eq!(merged.chat_timeout_secs, Some(240));
     assert_eq!(merged.chat_retries, Some(3));
+}
+
+#[test]
+fn merge_state_dir_override_prefers_cli_over_env() {
+    let env_config = PartialConfig {
+        state_dir_override: Some(PathBuf::from("/env/anvil")),
+        ..PartialConfig::default()
+    };
+    let cli_config = PartialConfig {
+        state_dir_override: Some(PathBuf::from("/cli/anvil")),
+        ..PartialConfig::default()
+    };
+    let merged = merge_partial_configs(&[env_config, cli_config]);
+    assert_eq!(merged.state_dir_override, Some(PathBuf::from("/cli/anvil")));
+}
+
+#[test]
+fn merge_state_dir_override_falls_back_to_env_when_cli_missing() {
+    let env_config = PartialConfig {
+        state_dir_override: Some(PathBuf::from("/env/anvil")),
+        ..PartialConfig::default()
+    };
+    let cli_config = PartialConfig::default();
+    let merged = merge_partial_configs(&[env_config, cli_config]);
+    assert_eq!(merged.state_dir_override, Some(PathBuf::from("/env/anvil")));
 }

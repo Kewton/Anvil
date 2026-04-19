@@ -34,4 +34,6 @@ pub struct CliArgs {
     pub oneshot: bool,
     #[arg(long = "cwd", hide = true)]
     pub cwd: Option<PathBuf>,
+    #[arg(long = "state-dir")]
+    pub state_dir: Option<PathBuf>,
 }

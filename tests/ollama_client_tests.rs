@@ -11,11 +11,7 @@ fn parses_tags_and_generate_payloads() {
     assert_eq!(tags, vec!["qwen3:8b", "gemma4:31b"]);
 
     let body = "{\"response\":\"Here you go.<anvil_tool_call>{\\\"name\\\":\\\"Read\\\",\\\"arguments\\\":{\\\"path\\\":\\\"README.md\\\"}}</anvil_tool_call>\"}";
-    let reply = parse_generate_response(
-        body,
-        &["Read".to_string(), "Write".to_string()],
-    )
-    .unwrap();
+    let reply = parse_generate_response(body, &["Read".to_string(), "Write".to_string()]).unwrap();
     assert_eq!(reply.tool_calls.len(), 1);
     assert_eq!(reply.tool_calls[0].name, "Read");
     assert_eq!(reply.tool_calls[0].arguments["path"], "README.md");

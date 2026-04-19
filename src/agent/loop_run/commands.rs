@@ -90,7 +90,7 @@ impl Agent {
         let (command, _) = input.split_once(' ').unwrap_or((input, ""));
         match command {
             "/help" => Ok(AgentEvent::Continue(Some(
-                "/help /status /model /plan /approve /compact /yes /no /exit".to_string(),
+                "/help /status /model /plan /approve /compact /logs /yes /no /exit".to_string(),
             ))),
             "/status" => Ok(AgentEvent::Continue(Some(format!(
                 "mode={:?} auto_approve={} native_tools={} cwd={} session={} plan={} approx_tokens={} core_only=true",
@@ -135,7 +135,10 @@ impl Agent {
                         "already in plan mode: {current}"
                     ))));
                 }
-                let plan_path = self.session.mode_state.enter_plan(self.config.plan_dir())?;
+                let plan_path = self
+                    .session
+                    .mode_state
+                    .enter_plan(self.session_store.plan_dir())?;
                 self.ensure_plan_file(&plan_path)?;
                 self.push_system_note(format!(
                     "[Plan Mode] Explore with Read, Glob, and Grep. Write the plan to {}. Wait for /approve before making code changes.",
@@ -170,6 +173,35 @@ impl Agent {
                 } else {
                     "session already compact".to_string()
                 })))
+            }
+            "/logs" => {
+                let args: Vec<&str> = input
+                    .trim_start_matches("/logs")
+                    .split_whitespace()
+                    .collect();
+                match args.as_slice() {
+                    ["path"] => {
+                        let path = self.session_store.log_dir().display().to_string();
+                        Ok(AgentEvent::Continue(Some(format!("log dir: {path}"))))
+                    }
+                    ["path", session_id] => match uuid::Uuid::parse_str(session_id) {
+                        Err(_) => Ok(AgentEvent::Continue(Some(format!(
+                            "invalid session id: {session_id}"
+                        )))),
+                        Ok(_) => match self.session_store.log_dir_for(session_id) {
+                            Some(path) => Ok(AgentEvent::Continue(Some(format!(
+                                "log dir: {}",
+                                path.display()
+                            )))),
+                            None => Ok(AgentEvent::Continue(Some(format!(
+                                "session not found: {session_id}"
+                            )))),
+                        },
+                    },
+                    _ => Ok(AgentEvent::Continue(Some(
+                        "/logs path [<session_id>] — show log dir".to_string(),
+                    ))),
+                }
             }
             "/checkpoint" | "/rollback" | "/watch" | "/autotest" | "/skills" | "/skill"
             | "/mcp" | "/parallel" => Ok(AgentEvent::Continue(Some(format!(
