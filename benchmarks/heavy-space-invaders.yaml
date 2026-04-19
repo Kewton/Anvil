@@ -1,0 +1,22 @@
+name: heavy-space-invaders
+prompt: |
+  You are working in a Next.js TypeScript project scaffolded with create-next-app.
+  Your task: implement a classic Space Invaders game as a React component.
+
+  Requirements:
+  - Create src/components/SpaceInvaders.tsx with full game logic
+  - Render the game on a <canvas> element (800x600)
+  - Player ship moves left/right with arrow keys
+  - Player shoots with spacebar
+  - 3 rows of 10 invaders each
+  - Invaders move side-to-side and descend when hitting edges
+  - Invaders shoot back randomly
+  - Score display, lives display, game over screen
+  - Use requestAnimationFrame for the game loop
+
+  After implementing SpaceInvaders.tsx, add it to src/app/page.tsx.
+  Stop after confirming the files are written.
+args:
+  max_iterations: 40
+  chat_retries: 2
+  sidecar_model: qwen3.5:9b
