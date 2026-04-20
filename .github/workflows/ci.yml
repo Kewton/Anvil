@@ -62,8 +62,32 @@ jobs:
       - uses: actions/checkout@v4
       - name: install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Install yq (mikefarah v4.44.1)
+        run: |
+          YQ_VERSION=v4.44.1
+          YQ_SHA256=6dc2d0cd4e0caca5aeffd0d784a48263591080e4a0895abe69f3a76eb50d1ba3
+          BASE="https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}"
+          curl -sSL "${BASE}/yq_linux_amd64" -o /tmp/yq
+          echo "${YQ_SHA256}  /tmp/yq" | sha256sum --check --status
+          sudo install -m 755 /tmp/yq /usr/local/bin/yq
+      - name: Install jq
+        run: sudo apt-get install -y jq
       - name: shellcheck
         run: shellcheck -S warning scripts/*.sh tests/scripts/*.sh
+      - name: bench.sh dry-run smoke tests
+        run: |
+          # matrix smoke test
+          rm -rf .anvil/benchmarks
+          bash scripts/bench.sh heavy-space-invaders --models 'modelA,modelB' --runs 2 --dry-run
+          report_path="$(find .anvil/benchmarks -mindepth 2 -maxdepth 2 -name matrix-report.md | head -n1)"
+          test -n "$report_path"
+          test -f "$report_path"
+
+          # single-model backward compat smoke test
+          rm -rf .anvil/benchmarks
+          single_out="$(bash scripts/bench.sh heavy-space-invaders --model modelA --runs 2 --dry-run)"
+          test -z "$(find .anvil/benchmarks -mindepth 2 -maxdepth 2 -name matrix-report.md 2>/dev/null | head -n1)"
+          printf '%s\n' "$single_out" | grep -Eq '^Done\. Results: .+/summary\.tsv$'
 
   python:
     name: Python (analyze_run)

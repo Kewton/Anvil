@@ -138,7 +138,7 @@ fi
 if ! yq --version 2>&1 | grep -qi 'mikefarah'; then
   echo "Error: yq (mikefarah/yq v4.x) is required." >&2
   echo "  macOS: brew install yq" >&2
-  echo "  Linux: sudo apt-get install -y yq" >&2
+  echo "  Linux: https://github.com/mikefarah/yq/releases" >&2
   exit 1
 fi
 
@@ -214,14 +214,21 @@ fi
 # -------- summary.tsv header --------
 printf 'run\tmodel\trc\telapsed_sec\tworkdir\tsession_copied\n' > "$BENCH_ROOT/summary.tsv"
 
-# -------- trap --------
-CURRENT_RUN=""
-CURRENT_MODEL=""
-CURRENT_RUN_DIR=""
-CURRENT_START_TS=""
-RUN_LOGGED=0
-META_WRITTEN=0
+# -------- validate_model --------
+validate_model() {
+  local m="$1"
+  if [[ "$m" =~ [^A-Za-z0-9._:/-] ]]; then
+    echo "Error: model name contains invalid characters: $m" >&2
+    exit 1
+  fi
+}
 
+# -------- slugify --------
+slugify() {
+  printf '%s' "$1" | sed 's/[^A-Za-z0-9._-]/-/g'
+}
+
+# -------- write_meta_json --------
 write_meta_json() {
   # $1=rc, $2=elapsed_s, $3=model, $4=start_ts, $5=run_dir
   local _rc="$1" _elapsed="$2" _model="$3" _start_ts="$4" _run_dir="$5"
@@ -238,32 +245,130 @@ write_meta_json() {
     > "$_run_dir/meta.json"
 }
 
-on_interrupt() {
-  if [[ "$RUN_LOGGED" -eq 0 && -n "$CURRENT_RUN" ]]; then
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "$CURRENT_RUN" "${CURRENT_MODEL:-unknown}" "130" "N/A" "N/A" "0" \
-      >> "$BENCH_ROOT/summary.tsv"
-  fi
-  if [[ "$META_WRITTEN" -eq 0 && -n "$CURRENT_RUN_DIR" ]]; then
-    write_meta_json 130 0 "${CURRENT_MODEL:-unknown}" "${CURRENT_START_TS:-}" "$CURRENT_RUN_DIR" \
-      || true
-  fi
-  exit 130
-}
-trap 'on_interrupt' SIGINT SIGTERM
-
-# -------- validate_model --------
-validate_model() {
-  local m="$1"
-  if [[ "$m" =~ [^A-Za-z0-9._:/-] ]]; then
-    echo "Error: model name contains invalid characters: $m" >&2
-    exit 1
-  fi
+# -------- validate_models_array --------
+validate_models_array() {
+  local seen_models=() seen_slugs=()
+  for m in "${cleaned_models[@]}"; do
+    validate_model "$m"
+    for s in "${seen_models[@]+"${seen_models[@]}"}"; do
+      [[ "$s" == "$m" ]] && { echo "Error: duplicate model: $m" >&2; exit 1; }
+    done
+    seen_models+=("$m")
+    local slug
+    slug=$(slugify "$m")
+    if [[ -z "$slug" || "$slug" == "." || "$slug" == ".." ]]; then
+      echo "Error: invalid slug for '$m'" >&2; exit 1
+    fi
+    for s in "${seen_slugs[@]+"${seen_slugs[@]}"}"; do
+      [[ "$s" == "$slug" ]] && { echo "Error: slug collision for '$m' (slug='$slug')" >&2; exit 1; }
+    done
+    seen_slugs+=("$slug")
+  done
 }
 
-# -------- slugify --------
-slugify() {
-  printf '%s' "$1" | sed 's/[^A-Za-z0-9._-]/-/g'
+# -------- generate_matrix_report --------
+# generate_matrix_report <bench_root> <benchmark_name> <runs> <model...>
+generate_matrix_report() {
+  local bench_root="$1"
+  local bench_name="$2"
+  local total_runs="$3"
+  shift 3
+  local models_list=("$@")
+
+  local tmp ts models_joined
+  tmp=$(mktemp "$bench_root/.matrix-report.md.XXXXXX") || return 1
+  ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+  # Join with comma (commas are invalid in model names per validate_model)
+  models_joined=$(printf '%s,' "${models_list[@]}")
+  models_joined="${models_joined%,}"
+
+  awk -F'\t' \
+    -v models_arg="$models_joined" \
+    -v bench_name="$bench_name" \
+    -v total_runs="$total_runs" \
+    -v ts="$ts" \
+    '
+    BEGIN {
+      order_count = 0
+      n = split(models_arg, models_order, ",")
+      for (i = 1; i <= n; i++) {
+        if (models_order[i] != "") {
+          order[++order_count] = models_order[i]
+        }
+      }
+    }
+    NR == 1 {
+      for (i = 1; i <= NF; i++) col[$i] = i
+      col_model   = col["model"]
+      col_rc      = col["rc"]
+      col_elapsed = col["elapsed_sec"]
+      if (!col_model || !col_rc || !col_elapsed) exit 2
+      next
+    }
+    NR > 1 {
+      m = $col_model
+      rc = $col_rc
+      el = $col_elapsed
+      cnt[m]++
+      if      (rc == "0")   succ[m]++
+      else if (rc == "130") intr[m]++
+      else                  fail[m]++
+      if (el ~ /^[0-9]+$/) {
+        idx = ++cnt_el[m]
+        elvals[m, idx] = el + 0
+      }
+    }
+    function median(m,    n, i, j, tmp, ta) {
+      n = cnt_el[m]
+      if (n == 0) return -1
+      for (i = 1; i <= n; i++) ta[i] = elvals[m, i]
+      for (i = 1; i < n; i++) {
+        for (j = i + 1; j <= n; j++) {
+          if (ta[i] > ta[j]) { tmp = ta[i]; ta[i] = ta[j]; ta[j] = tmp }
+        }
+      }
+      if (n % 2 == 1) return ta[int((n + 1) / 2)]
+      return (ta[int(n / 2)] + ta[int(n / 2) + 1]) / 2.0
+    }
+    function mean(m,    i, s) {
+      if (cnt_el[m] == 0) return -1
+      s = 0
+      for (i = 1; i <= cnt_el[m]; i++) s += elvals[m, i]
+      return s / cnt_el[m]
+    }
+    function min_val(m,    i, v) {
+      if (cnt_el[m] == 0) return -1
+      v = elvals[m, 1]
+      for (i = 2; i <= cnt_el[m]; i++) if (elvals[m, i] < v) v = elvals[m, i]
+      return v
+    }
+    function max_val(m,    i, v) {
+      if (cnt_el[m] == 0) return -1
+      v = elvals[m, 1]
+      for (i = 2; i <= cnt_el[m]; i++) if (elvals[m, i] > v) v = elvals[m, i]
+      return v
+    }
+    END {
+      printf "# Benchmark Matrix: %s\n", bench_name
+      printf "Generated: %s  Models: %d  Runs: %s\n\n", ts, order_count, total_runs
+      printf "| model | runs | success | fail | interrupted | median_sec | mean_sec | min_sec | max_sec |\n"
+      printf "|-------|------|---------|------|-------------|------------|----------|---------|----------|\n"
+      for (i = 1; i <= order_count; i++) {
+        m = order[i]
+        if (cnt[m] == 0) {
+          printf "| %s | - | - | - | - | - | - | - | - |\n", m
+        } else if (succ[m]+0 == 0 && fail[m]+0 == 0 && intr[m]+0 > 0) {
+          printf "| %s | %d | 0 | 0 | %d | - | - | - | - |\n", m, cnt[m], intr[m]
+        } else {
+          printf "| %s | %d | %d | %d | %d | %.1f | %.1f | %.1f | %.1f |\n", \
+            m, cnt[m], succ[m]+0, fail[m]+0, intr[m]+0, \
+            median(m), mean(m), min_val(m), max_val(m)
+        }
+      }
+    }
+    ' "$bench_root/summary.tsv" > "$tmp" || { rm -f "$tmp"; return 1; }
+
+  mv "$tmp" "$bench_root/matrix-report.md" || { rm -f "$tmp"; return 1; }
 }
 
 # -------- model list parse --------
@@ -290,20 +395,47 @@ if [[ ${#cleaned_models[@]} -eq 0 ]]; then
   exit 1
 fi
 
+# validate models (character set, duplicate, slug collision)
+validate_models_array
+
+# -------- trap (registered after cleaned_models is populated) --------
+CURRENT_RUN=""
+CURRENT_MODEL=""
+CURRENT_RUN_DIR=""
+CURRENT_START_TS=""
+RUN_LOGGED=0
+META_WRITTEN=0
+on_interrupt() {
+  if [[ "$RUN_LOGGED" -eq 0 && -n "$CURRENT_RUN" ]]; then
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$CURRENT_RUN" "${CURRENT_MODEL:-unknown}" "130" "N/A" "N/A" "0" \
+      >> "$BENCH_ROOT/summary.tsv"
+  fi
+  if [[ "$META_WRITTEN" -eq 0 && -n "$CURRENT_RUN_DIR" ]]; then
+    write_meta_json 130 0 "${CURRENT_MODEL:-unknown}" "${CURRENT_START_TS:-}" "$CURRENT_RUN_DIR" \
+      || true
+  fi
+  if [[ -n "$models_arg" ]]; then
+    generate_matrix_report "$BENCH_ROOT" "$benchmark_name" "$runs" "${cleaned_models[@]}" || true
+  fi
+  exit 130
+}
+trap 'on_interrupt' SIGINT SIGTERM
+
 # -------- main loop --------
+model_idx=0
 for model in "${cleaned_models[@]}"; do
+  model_idx=$((model_idx + 1))
+  model_slug=$(slugify "$model")
+
   for (( run=1; run<=runs; run++ )); do
+    printf '[model %d/%d | run %d/%d] %s\n' \
+      "$model_idx" "${#cleaned_models[@]}" "$run" "$runs" "$model" >&2
+
     CURRENT_RUN="$run"
     CURRENT_MODEL="$model"
     RUN_LOGGED=0
     META_WRITTEN=0
-
-    validate_model "$model"
-    model_slug=$(slugify "$model")
-    if [[ -z "$model_slug" || "$model_slug" == "." || "$model_slug" == ".." ]]; then
-      echo "invalid model slug: $model_slug" >&2
-      exit 1
-    fi
 
     RUN_DIR="$BENCH_ROOT/$model_slug/run-$run"
     WORKDIR="$RUN_DIR/workdir"
@@ -362,11 +494,10 @@ for model in "${cleaned_models[@]}"; do
       done
     fi
     if [[ -n "$latest_session" && -f "$latest_session" && ! -L "$latest_session" ]]; then
-      # CB-001: reject symlinks before copy to prevent information leakage
+      # reject symlinks before copy to prevent information leakage
       real_session=$(realpath "$latest_session" 2>/dev/null || true)
       real_state=$(realpath "$STATE_DIR" 2>/dev/null || true)
       if [[ -n "$real_session" && -n "$real_state" && "$real_session" == "$real_state"/* ]]; then
-        # CB-002: check copy success before setting session_copied=1
         if cp "$latest_session" ../session.json; then
           session_copied=1
         else
@@ -375,10 +506,8 @@ for model in "${cleaned_models[@]}"; do
 
         # Copy llm-io.jsonl from the state-dir session directory (if present)
         session_id=$(basename "$(dirname "$latest_session")")
-        # Validate session id (UUID-ish: alnum + dash). Skip copy on odd values.
         if [[ "$session_id" =~ ^[A-Za-z0-9._-]+$ ]]; then
           log_src="$STATE_DIR/sessions/$session_id/logs/llm-io.jsonl"
-          # CB-001: reject symlinks for llm-io.jsonl too
           if [[ -f "$log_src" && ! -L "$log_src" ]]; then
             real_log=$(realpath "$log_src" 2>/dev/null || true)
             if [[ -n "$real_log" && "$real_log" == "$real_state"/* ]]; then
@@ -392,7 +521,6 @@ for model in "${cleaned_models[@]}"; do
     fi
 
     # Write run-dir/meta.json so analyze_run.py can read rc/elapsed_s
-    # CB-002: check write success
     if write_meta_json "$rc" "$elapsed" "$model" "$CURRENT_START_TS" "$RUN_DIR"; then
       META_WRITTEN=1
     else
@@ -409,6 +537,10 @@ for model in "${cleaned_models[@]}"; do
     CURRENT_START_TS=""
     cd "$REPO_ROOT" || { echo "Error: cd $REPO_ROOT failed" >&2; exit 1; }
   done
+
+  if [[ -n "$models_arg" ]]; then
+    generate_matrix_report "$BENCH_ROOT" "$benchmark_name" "$runs" "${cleaned_models[@]}"
+  fi
 done
 
 echo "Done. Results: $BENCH_ROOT/summary.tsv"
