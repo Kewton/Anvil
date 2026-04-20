@@ -113,3 +113,11 @@ jobs:
         run: python3 tests/test_analyze_run_security.py
       - name: bench smoke test
         run: bash tests/scripts/test_bench_smoke.sh
+      - name: ruff (report.py)
+        run: ruff check scripts/report.py tests/test_report.py tests/test_report_security.py
+      - name: report.py snapshot tests
+        run: python3 -m unittest tests.test_report -v
+      - name: report.py security tests
+        run: python3 -m unittest tests.test_report_security -v
+      - name: report.py e2e compatibility
+        run: bash tests/scripts/test_report_compat.sh

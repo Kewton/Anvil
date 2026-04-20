@@ -168,6 +168,30 @@ workdir 側の `.anvil/logs/` `.anvil/sessions/` `.anvil/plans/` は上記への
 - `Bash` `Write` `Edit` は確認対象で、`-y` がない場合は対話承認が必要
 - `rm -rf /` など一部の明白に危険な Bash 断片はブロック
 
+## ベンチマーク・レポート
+
+`scripts/` 配下のハーネス群で 5-run ベンチマークと集計レポートを生成できる。
+
+```bash
+# 1モデル 5-run ベンチマーク
+bash scripts/bench.sh run5 <bench_root> <model_slug>
+
+# 実行結果を JSON に集計
+python3 scripts/analyze_run.py <bench_root>/<model_slug>/run-1/
+
+# 全 run を Markdown レポートに集計
+python3 scripts/report.py <bench_root>/
+
+# A/B 比較レポート
+python3 scripts/report.py --compare <bench_root_a>/ <bench_root_b>/
+```
+
+| スクリプト | 役割 |
+|-----------|------|
+| `scripts/bench.sh` | smoke / 5-run / matrix ベンチマーク実行 |
+| `scripts/analyze_run.py` | 1 run-dir を解析して JSON を出力 |
+| `scripts/report.py` | BENCH_ROOT 配下の全 run を集計して Markdown を出力 |
+
 ## テストと検証
 
 ```bash
