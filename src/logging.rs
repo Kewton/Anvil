@@ -23,6 +23,7 @@ pub fn init_logging(log_level: LogLevel, log_path: &Path) -> Result<(), String> 
         .with_env_filter(filter)
         .with_target(false)
         .without_time()
+        .with_writer(std::io::stderr)
         .try_init()
         .map_err(|err| format!("failed to initialize logging: {err}"))?;
 
