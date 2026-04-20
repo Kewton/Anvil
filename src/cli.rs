@@ -22,7 +22,12 @@ pub struct CliArgs {
     pub chat_timeout_secs: Option<u64>,
     #[arg(long = "chat-retries")]
     pub chat_retries: Option<usize>,
-    #[arg(long = "debug")]
+    #[arg(long = "verbose")]
+    pub verbose: bool,
+    #[arg(long = "trace")]
+    pub trace: bool,
+    /// deprecated alias for `--trace` (hidden)
+    #[arg(long = "debug", hide = true)]
     pub debug: bool,
     #[arg(long = "stream")]
     pub stream: bool,

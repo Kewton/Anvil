@@ -1,12 +1,134 @@
 use std::collections::BTreeMap;
 use std::env;
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use crate::cli::CliArgs;
 use crate::safety::host_validation::validate_localhost_url;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `EnvFilter` directive that silences DEBUG/TRACE noise from hyper/reqwest/rustls.
+pub const NOISY_CRATES_FILTER: &str = "hyper_util=warn,reqwest=warn,hyper=warn,rustls=warn";
+
+/// 3-level log verbosity. The `Info < Verbose < Trace` ordering is part of the
+/// public contract (callers use comparisons like `log_level >= Verbose`) and
+/// must not be reordered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, PartialOrd, Ord)]
+pub enum LogLevel {
+    #[default]
+    Info,
+    Verbose,
+    Trace,
+}
+
+impl LogLevel {
+    /// Build the `tracing_subscriber::EnvFilter` directive for this level.
+    pub fn env_filter(self) -> String {
+        match self {
+            LogLevel::Info => format!("info,{NOISY_CRATES_FILTER}"),
+            LogLevel::Verbose => format!("debug,{NOISY_CRATES_FILTER}"),
+            // Trace intentionally leaves noisy crates uncapped.
+            LogLevel::Trace => "trace".to_string(),
+        }
+    }
+
+    /// Map the legacy `debug=true/false` flag onto a `LogLevel`.
+    pub fn from_legacy_debug(debug: bool) -> Self {
+        if debug { Self::Trace } else { Self::Info }
+    }
+}
+
+impl fmt::Display for LogLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            LogLevel::Info => "info",
+            LogLevel::Verbose => "verbose",
+            LogLevel::Trace => "trace",
+        };
+        write!(f, "{s}")
+    }
+}
+
+impl FromStr for LogLevel {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "info" => Ok(LogLevel::Info),
+            "verbose" => Ok(LogLevel::Verbose),
+            "trace" => Ok(LogLevel::Trace),
+            other => Err(format!("unknown log level: {other}")),
+        }
+    }
+}
+
+/// Identifies where a `log_level` / legacy `debug` setting was read from, so
+/// `resolve_log_level` can emit source-appropriate warning messages.
+#[derive(Debug, Clone, Copy)]
+enum LogLevelSource {
+    ConfigFile,
+    Env,
+}
+
+/// Resolve a log level from an optional primary value (`log_level=` /
+/// `ANVIL_LOG_LEVEL`) plus an optional legacy debug value (`debug=` /
+/// `ANVIL_DEBUG`). The primary value wins; invalid primaries fall back to
+/// `Info` with a warning, and consulting the legacy key emits a deprecation
+/// warning.
+fn resolve_log_level(
+    primary: Option<&str>,
+    legacy_debug: Option<&str>,
+    source: LogLevelSource,
+    warnings: &mut Vec<String>,
+) -> Option<LogLevel> {
+    if let Some(raw) = primary {
+        return Some(match raw.parse::<LogLevel>() {
+            Ok(level) => level,
+            Err(err) => {
+                warnings.push(match source {
+                    LogLevelSource::ConfigFile => {
+                        format!("invalid log_level={raw} in config file, using info: {err}")
+                    }
+                    LogLevelSource::Env => {
+                        format!("invalid ANVIL_LOG_LEVEL={raw}, using info: {err}")
+                    }
+                });
+                LogLevel::Info
+            }
+        });
+    }
+
+    let debug = legacy_debug.and_then(parse_bool)?;
+    warnings.push(
+        match source {
+            LogLevelSource::ConfigFile => {
+                "config file key 'debug' is deprecated, use 'log_level=info|verbose|trace'"
+            }
+            LogLevelSource::Env => {
+                "ANVIL_DEBUG is deprecated, use ANVIL_LOG_LEVEL=info|verbose|trace"
+            }
+        }
+        .to_string(),
+    );
+    Some(LogLevel::from_legacy_debug(debug))
+}
+
+/// Translate CLI log-level flags into an optional `LogLevel`.
+/// `--trace` and the deprecated `--debug` alias win over `--verbose`; when
+/// none are present the caller defers to env/config/defaults.
+fn cli_log_level_from_flags(trace: bool, debug: bool, verbose: bool) -> Option<LogLevel> {
+    if trace || debug {
+        Some(LogLevel::Trace)
+    } else if verbose {
+        Some(LogLevel::Verbose)
+    } else {
+        None
+    }
+}
+
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Config {
     pub cwd: PathBuf,
     pub requested_model: Option<String>,
@@ -16,7 +138,7 @@ pub struct Config {
     pub max_iterations: usize,
     pub chat_timeout_secs: u64,
     pub chat_retries: usize,
-    pub debug: bool,
+    pub log_level: LogLevel,
     pub stream: bool,
     pub yes_mode: bool,
     pub fresh_session: bool,
@@ -34,7 +156,7 @@ pub struct PartialConfig {
     pub max_iterations: Option<usize>,
     pub chat_timeout_secs: Option<u64>,
     pub chat_retries: Option<usize>,
-    pub debug: Option<bool>,
+    pub log_level: Option<LogLevel>,
     pub stream: Option<bool>,
     pub yes_mode: Option<bool>,
     pub fresh_session: Option<bool>,
@@ -42,14 +164,19 @@ pub struct PartialConfig {
 }
 
 impl Config {
-    pub fn load(args: CliArgs) -> Result<Self, String> {
-        let cwd = match args.cwd {
+    pub fn load(args: CliArgs) -> Result<(Self, Vec<String>), String> {
+        let cwd = match args.cwd.clone() {
             Some(path) => path,
             None => env::current_dir().map_err(|err| format!("failed to resolve cwd: {err}"))?,
         };
 
-        let file_config = load_config_file(&cwd.join(".anvil").join("config"))?;
-        let env_config = load_env_config();
+        let mut warnings: Vec<String> = Vec::new();
+
+        let file_config = load_config_file(&cwd.join(".anvil").join("config"), &mut warnings)?;
+        let env_config = load_env_config(&mut warnings);
+
+        let cli_log_level = cli_log_level_from_flags(args.trace, args.debug, args.verbose);
+
         let cli_config = PartialConfig {
             model: args.model.clone(),
             sidecar_model: args.sidecar_model.clone(),
@@ -58,7 +185,7 @@ impl Config {
             max_iterations: args.max_iterations,
             chat_timeout_secs: args.chat_timeout_secs,
             chat_retries: args.chat_retries,
-            debug: args.debug.then_some(true),
+            log_level: cli_log_level,
             stream: args.stream.then_some(true),
             yes_mode: args.yes.then_some(true),
             fresh_session: args.fresh_session.then_some(true),
@@ -71,7 +198,7 @@ impl Config {
                 .unwrap_or_else(|| "http://127.0.0.1:11434".to_string()),
         )?;
 
-        Ok(Self {
+        let config = Self {
             cwd,
             requested_model: merged.model,
             requested_sidecar_model: merged.sidecar_model,
@@ -80,14 +207,15 @@ impl Config {
             max_iterations: merged.max_iterations.unwrap_or(12),
             chat_timeout_secs: merged.chat_timeout_secs.unwrap_or(300),
             chat_retries: merged.chat_retries.unwrap_or(2),
-            debug: merged.debug.unwrap_or(false),
+            log_level: merged.log_level.unwrap_or_default(),
             stream: merged.stream.unwrap_or(false),
             yes_mode: merged.yes_mode.unwrap_or(false),
             fresh_session: merged.fresh_session.unwrap_or(false),
             oneshot: args.oneshot || args.prompt.is_some(),
             prompt: args.prompt,
             state_dir_override: merged.state_dir_override,
-        })
+        };
+        Ok((config, warnings))
     }
 }
 
@@ -115,8 +243,8 @@ pub fn merge_partial_configs(configs: &[PartialConfig]) -> PartialConfig {
         if config.chat_retries.is_some() {
             merged.chat_retries = config.chat_retries;
         }
-        if config.debug.is_some() {
-            merged.debug = config.debug;
+        if config.log_level.is_some() {
+            merged.log_level = config.log_level;
         }
         if config.stream.is_some() {
             merged.stream = config.stream;
@@ -134,7 +262,7 @@ pub fn merge_partial_configs(configs: &[PartialConfig]) -> PartialConfig {
     merged
 }
 
-pub fn load_config_file(path: &Path) -> Result<PartialConfig, String> {
+pub fn load_config_file(path: &Path, warnings: &mut Vec<String>) -> Result<PartialConfig, String> {
     if !path.exists() {
         return Ok(PartialConfig::default());
     }
@@ -142,6 +270,13 @@ pub fn load_config_file(path: &Path) -> Result<PartialConfig, String> {
     let contents = fs::read_to_string(path)
         .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
     let map = parse_key_value_config(&contents);
+
+    let log_level = resolve_log_level(
+        map.get("log_level").map(String::as_str),
+        map.get("debug").map(String::as_str),
+        LogLevelSource::ConfigFile,
+        warnings,
+    );
 
     Ok(PartialConfig {
         model: map.get("model").cloned(),
@@ -160,7 +295,7 @@ pub fn load_config_file(path: &Path) -> Result<PartialConfig, String> {
             .get("chat_timeout_secs")
             .and_then(|value| value.parse().ok()),
         chat_retries: map.get("chat_retries").and_then(|value| value.parse().ok()),
-        debug: map.get("debug").and_then(|value| parse_bool(value)),
+        log_level,
         stream: map.get("stream").and_then(|value| parse_bool(value)),
         yes_mode: map.get("yes_mode").and_then(|value| parse_bool(value)),
         fresh_session: map.get("fresh_session").and_then(|value| parse_bool(value)),
@@ -168,7 +303,16 @@ pub fn load_config_file(path: &Path) -> Result<PartialConfig, String> {
     })
 }
 
-pub fn load_env_config() -> PartialConfig {
+pub fn load_env_config(warnings: &mut Vec<String>) -> PartialConfig {
+    let anvil_log_level = env::var("ANVIL_LOG_LEVEL").ok();
+    let anvil_debug = env::var("ANVIL_DEBUG").ok();
+    let log_level = resolve_log_level(
+        anvil_log_level.as_deref(),
+        anvil_debug.as_deref(),
+        LogLevelSource::Env,
+        warnings,
+    );
+
     PartialConfig {
         model: env::var("ANVIL_MODEL").ok(),
         sidecar_model: env::var("ANVIL_SIDECAR_MODEL").ok(),
@@ -187,9 +331,7 @@ pub fn load_env_config() -> PartialConfig {
         chat_retries: env::var("ANVIL_CHAT_RETRIES")
             .ok()
             .and_then(|value| value.parse().ok()),
-        debug: env::var("ANVIL_DEBUG")
-            .ok()
-            .and_then(|value| parse_bool(&value)),
+        log_level,
         stream: env::var("ANVIL_STREAM")
             .ok()
             .and_then(|value| parse_bool(&value)),
