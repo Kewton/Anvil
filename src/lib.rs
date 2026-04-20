@@ -21,7 +21,18 @@ use ollama::client::OllamaClient;
 use session::store::SessionStore;
 
 pub fn run_cli(args: CliArgs) -> Result<(), String> {
-    let config = Config::load(args)?;
+    // --debug deprecation is emitted here because the flag only exists on the
+    // CLI; env/config deprecations are collected inside `Config::load`.
+    if args.debug {
+        eprintln!(
+            "warning: --debug is deprecated, use --trace (or --verbose for medium verbosity)"
+        );
+    }
+
+    let (config, warnings) = Config::load(args)?;
+    for warning in &warnings {
+        eprintln!("warning: {warning}");
+    }
 
     let state_root = resolve_state_root(&config)?;
     let workspace_key = compute_workspace_key(&config.cwd);
@@ -34,7 +45,7 @@ pub fn run_cli(args: CliArgs) -> Result<(), String> {
         .join(&session_id)
         .join("logs")
         .join("llm-io.jsonl");
-    logging::init_logging(config.debug, &log_path)?;
+    logging::init_logging(config.log_level, &log_path)?;
 
     let _ = symlink_anvil_dirs(&config.cwd, &state_root, &session_id);
 

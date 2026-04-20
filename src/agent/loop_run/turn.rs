@@ -1,5 +1,22 @@
 use super::*;
 
+/// Maximum number of characters of tool-call arguments retained in trace logs.
+const LOG_ARGS_MAX_CHARS: usize = 200;
+
+/// UTF-8-safe truncation: keeps at most `max` characters and appends `...`
+/// when the input was longer. Never splits a multi-byte code point.
+fn truncate(s: &str, max: usize) -> String {
+    match s.char_indices().nth(max) {
+        Some((byte_idx, _)) => {
+            let mut out = String::with_capacity(byte_idx + 3);
+            out.push_str(&s[..byte_idx]);
+            out.push_str("...");
+            out
+        }
+        None => s.to_string(),
+    }
+}
+
 impl Agent {
     pub(super) fn handle_user_message(
         &mut self,
@@ -31,7 +48,9 @@ impl Agent {
         let mut recent_bash_commands = Vec::<String>::new();
         let mut install_commands_seen = 0usize;
 
-        for _ in 0..self.config.max_iterations {
+        for iter_count in 0..self.config.max_iterations {
+            let approx_tokens = approximate_token_count(&self.session.messages);
+            tracing::debug!(iter = iter_count, tokens = approx_tokens, "iter");
             let reply = self.request_assistant_reply_with_retry(stream_output)?;
             let prepared_tool_calls = reply
                 .tool_calls
@@ -58,6 +77,12 @@ impl Agent {
                 let mut emitted_bash_loop_note = false;
                 for tool_call in prepared_tool_calls {
                     let tool_name = tool_call.name.clone();
+                    let args_str = tool_call.arguments.to_string();
+                    tracing::debug!(
+                        tool = %tool_name,
+                        args = %truncate(&args_str, LOG_ARGS_MAX_CHARS),
+                        "tool call"
+                    );
                     let raw_result = if recovery::should_block_restart_discovery(
                         &tool_name,
                         restart_convergence_mode && repo_edit_calls_made_this_turn == 0,
@@ -318,5 +343,27 @@ impl Agent {
         self.session
             .messages
             .push(ConversationMessage::user(content));
+    }
+}
+
+#[cfg(test)]
+mod truncate_tests {
+    use super::truncate;
+
+    #[test]
+    fn preserves_short_strings_verbatim() {
+        assert_eq!(truncate("hello", 10), "hello");
+        assert_eq!(truncate("exact", 5), "exact");
+    }
+
+    #[test]
+    fn truncates_long_strings_with_ellipsis() {
+        assert_eq!(truncate("abcdefgh", 3), "abc...");
+    }
+
+    #[test]
+    fn never_splits_multibyte_code_points() {
+        // Each Japanese char is 3 bytes in UTF-8; taking 2 must not slice mid-char.
+        assert_eq!(truncate("あいうえお", 2), "あい...");
     }
 }

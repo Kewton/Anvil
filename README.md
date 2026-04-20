@@ -74,7 +74,9 @@ anvil [OPTIONS]
       --ollama-host <URL>            Ollama base URL (localhost only)
       --context-budget <TOKENS>      message budget for compaction
       --max-iterations <N>           max agent loop iterations
-      --debug                        verbose logging
+      --verbose                      anvil-side DEBUG logs (reqwest/hyper は warn に抑制)
+      --trace                        全クレート TRACE ログ（reqwest/hyper 含む）
+      --debug                        deprecated alias for --trace
       --stream                       stream assistant text in interactive turns
       --tui                          run the lightweight terminal UI
       --watch                        enable file watcher on startup
@@ -121,6 +123,7 @@ tui=false
 watch=false
 auto_test_command=
 yes_mode=false
+log_level=info            # info | verbose | trace
 ```
 
 環境変数も使える。
@@ -137,6 +140,7 @@ export ANVIL_WATCH=1
 export ANVIL_AUTO_TEST="cargo test --lib"
 export ANVIL_YES=1
 export ANVIL_STATE_DIR=/custom/path/to/anvil-state
+export ANVIL_LOG_LEVEL=info     # info | verbose | trace
 ```
 
 優先順位は `CLI > 環境変数 > .anvil/config > デフォルト値`。
@@ -151,7 +155,7 @@ $XDG_STATE_HOME/anvil/           (未設定時: ~/.local/state/anvil)
     {session_id}/
       session.json               ← 会話履歴・モード状態
       logs/
-        llm-io.jsonl             ← LLM I/O ログ（--debug 時）
+        llm-io.jsonl             ← LLM I/O ログ（log level によらず常時保存）
       plans/
         plan.md                  ← Plan mode のプランファイル
 ```

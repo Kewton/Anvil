@@ -7,12 +7,13 @@
 #   --models <list>   カンマ区切りで複数モデル（matrix 実行、逐次）
 #   --runs <n>        実行回数（デフォルト: 5）
 #   --dry-run         anvil 呼び出しを echo で代替
-#   --bench-no-debug  anvil に --debug を付けない（BENCH_DEBUG=0 と同義）
+#   --bench-no-debug  anvil に --trace を付けない（BENCH_DEBUG=0 と同義）
 #   --help            この用例を表示して終了
 #
 # Environment:
-#   BENCH_DEBUG=1 (default) anvil を --debug 付きで起動し、llm-io.jsonl を収集する
-#   BENCH_DEBUG=0           --debug を付けない。--bench-no-debug と等価。
+#   BENCH_DEBUG=1 (default) anvil を --trace 付きで起動し、詳細ログを stderr に流す
+#                           （llm-io.jsonl は log level によらず常時保存される）
+#   BENCH_DEBUG=0           --trace を付けない。--bench-no-debug と等価。
 #
 # Examples:
 #   scripts/bench.sh heavy --model qwen3.5:122b --runs 5
@@ -31,7 +32,7 @@ Usage: scripts/bench.sh <benchmark-name> [options]
   --models <list>   カンマ区切りで複数モデル（matrix 実行、逐次）
   --runs <n>        実行回数（デフォルト: 5）
   --dry-run         anvil 呼び出しを echo で代替
-  --bench-no-debug  anvil に --debug を付けない（BENCH_DEBUG=0 と同義）
+  --bench-no-debug  anvil に --trace を付けない（BENCH_DEBUG=0 と同義）
   --help            この用例を表示して終了
 
 Examples:
@@ -46,7 +47,7 @@ model_arg=""
 models_arg=""
 runs=5
 DRY_RUN=0
-# BENCH_DEBUG toggles `--debug` on the anvil invocation. Allowed values: "0" or "1".
+# BENCH_DEBUG toggles `--trace` on the anvil invocation. Allowed values: "0" or "1".
 BENCH_DEBUG="${BENCH_DEBUG:-1}"
 case "$BENCH_DEBUG" in
   0|1) ;;
@@ -475,7 +476,7 @@ for model in "${cleaned_models[@]}"; do
         anvil_args+=(--sidecar-model "$sidecar_model")
       fi
       if [[ "$BENCH_DEBUG" -eq 1 ]]; then
-        anvil_args+=(--debug)
+        anvil_args+=(--trace)
       fi
       # set -e is not enabled; capture rc directly
       "$ANVIL_BIN" "${anvil_args[@]}" > ../stdout.log 2>&1

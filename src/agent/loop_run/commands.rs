@@ -1,4 +1,5 @@
 use super::*;
+use crate::config::LogLevel;
 
 impl Agent {
     pub fn initial_prompt_from_cli_or_stdin(&self) -> Result<Option<String>, String> {
@@ -27,10 +28,10 @@ impl Agent {
             self.session.mode_state.mode,
             self.work_root.display()
         );
-        if self.config.debug
+        if self.config.log_level >= LogLevel::Verbose
             && let Some(path) = crate::logging::llm_io_log_path()
         {
-            println!("debug llm log={}", path.display());
+            println!("llm log={}", path.display());
         }
 
         let mut line = String::new();
@@ -93,7 +94,7 @@ impl Agent {
                 "/help /status /model /plan /approve /compact /logs /yes /no /exit".to_string(),
             ))),
             "/status" => Ok(AgentEvent::Continue(Some(format!(
-                "mode={:?} auto_approve={} native_tools={} cwd={} session={} plan={} approx_tokens={} core_only=true",
+                "mode={:?} auto_approve={} native_tools={} cwd={} session={} plan={} approx_tokens={} log_level={} core_only=true",
                 self.session.mode_state.mode,
                 self.config.yes_mode,
                 self.native_tools_enabled,
@@ -106,6 +107,7 @@ impl Agent {
                     .map(|path| path.display().to_string())
                     .unwrap_or_else(|| "-".to_string()),
                 approximate_token_count(&self.session.messages),
+                self.config.log_level,
             )))),
             "/model" => Ok(AgentEvent::Continue(Some(format_model_banner(
                 &self.models,

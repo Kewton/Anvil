@@ -4,7 +4,7 @@ use std::process::Command;
 
 use anvil::agent::Agent;
 use anvil::agent::orchestration::{capture_repo_snapshot, verify_repo_progress};
-use anvil::config::Config;
+use anvil::config::{Config, LogLevel};
 use anvil::model_registry::RuntimeModels;
 use anvil::ollama::client::OllamaClient;
 use anvil::session::store::SessionStore;
@@ -138,7 +138,7 @@ fn live_ollama_reaches_first_write_on_scaffolded_nextjs() {
 
     let cwd = temp.path().join("app");
     let before = capture_repo_snapshot(&cwd);
-    let mut agent = new_agent_with_debug(&cwd, &host, &model, client, 10, true);
+    let mut agent = new_agent_with_log_level(&cwd, &host, &model, client, 10, LogLevel::Trace);
     let prompt = "Use the available tools to inspect the current app and make one concrete implementation code change. Stop after the first successful file change.";
     let _ = agent.run_oneshot(prompt);
 
@@ -168,38 +168,34 @@ fn new_agent(
     client: OllamaClient,
     max_iterations: usize,
 ) -> Agent {
-    new_agent_with_debug(cwd, host, model, client, max_iterations, false)
+    new_agent_with_log_level(cwd, host, model, client, max_iterations, LogLevel::Info)
 }
 
-fn new_agent_with_debug(
+fn new_agent_with_log_level(
     cwd: &Path,
     host: &str,
     model: &str,
     client: OllamaClient,
     max_iterations: usize,
-    debug: bool,
+    log_level: LogLevel,
 ) -> Agent {
     let state_root = cwd.join(".anvil-state");
     let workspace_key = compute_workspace_key(cwd);
     let session_id = resolve_session_id(&state_root, &workspace_key, true);
     ensure_state_dirs(&state_root, &session_id).unwrap();
-    let config = Config {
-        cwd: cwd.to_path_buf(),
-        requested_model: Some(model.to_string()),
-        requested_sidecar_model: None,
-        ollama_host: host.to_string(),
-        context_budget: 24_000,
-        max_iterations,
-        chat_timeout_secs: 300,
-        chat_retries: 1,
-        debug,
-        stream: false,
-        yes_mode: true,
-        fresh_session: true,
-        oneshot: true,
-        prompt: None,
-        state_dir_override: Some(state_root.clone()),
-    };
+    let mut config = Config::default();
+    config.cwd = cwd.to_path_buf();
+    config.requested_model = Some(model.to_string());
+    config.ollama_host = host.to_string();
+    config.context_budget = 24_000;
+    config.max_iterations = max_iterations;
+    config.chat_timeout_secs = 300;
+    config.chat_retries = 1;
+    config.log_level = log_level;
+    config.yes_mode = true;
+    config.fresh_session = true;
+    config.oneshot = true;
+    config.state_dir_override = Some(state_root.clone());
 
     Agent::new(
         config,
