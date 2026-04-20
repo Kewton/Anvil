@@ -1,0 +1,1 @@
+{"id": "cub-2", "messages": [{"role": "user", "content": "go", "tool_calls": []}, {"role": "assistant", "content": "ok", "tool_calls": [{"id": "1", "name": "Write", "arguments": {"path": "src/app/file0.tsx"}}]}]}
