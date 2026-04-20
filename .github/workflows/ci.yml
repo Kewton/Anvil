@@ -121,3 +121,11 @@ jobs:
         run: python3 -m unittest tests.test_report_security -v
       - name: report.py e2e compatibility
         run: bash tests/scripts/test_report_compat.sh
+      - name: ruff compare.py
+        run: ruff check scripts/compare.py
+      - name: test_compare golden
+        run: python3 tests/golden/test_compare.py
+      - name: test_compare security
+        run: python3 tests/test_compare_security.py
+      - name: test_compare smoke
+        run: bash tests/scripts/test_compare_smoke.sh
