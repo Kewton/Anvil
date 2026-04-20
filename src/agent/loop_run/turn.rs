@@ -40,6 +40,7 @@ impl Agent {
         stream_output: bool,
         restart_convergence_mode: bool,
     ) -> Result<String, String> {
+        let use_color = io::stdout().is_terminal() && !no_color_requested();
         let mut tool_calls_made_this_turn = 0usize;
         let mut repo_edit_calls_made_this_turn = 0usize;
         let mut empty_retries = 0usize;
@@ -83,6 +84,16 @@ impl Agent {
                         args = %truncate(&args_str, LOG_ARGS_MAX_CHARS),
                         "tool call"
                     );
+                    let progress = format_progress_line(
+                        &tool_name,
+                        &tool_call.arguments,
+                        iter_count + 1,
+                        self.config.max_iterations,
+                        &self.work_root,
+                        use_color,
+                    );
+                    println!("{progress}");
+                    let _ = io::stdout().flush();
                     let raw_result = if recovery::should_block_restart_discovery(
                         &tool_name,
                         restart_convergence_mode && repo_edit_calls_made_this_turn == 0,
@@ -346,6 +357,113 @@ impl Agent {
     }
 }
 
+/// Returns true when the environment requests that color output be suppressed
+/// (https://no-color.org/): `NO_COLOR` is set to any non-empty value.
+fn no_color_requested() -> bool {
+    std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty())
+}
+
+/// Replace C0 control characters and DEL with spaces, then trim trailing
+/// whitespace. Required for model-derived text so that newlines or ANSI escape
+/// sequences cannot be injected into the terminal.
+fn sanitize_for_progress(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if (ch as u32) < 0x20 || ch == '\u{007F}' {
+            out.push(' ');
+        } else {
+            out.push(ch);
+        }
+    }
+    out.trim_end().to_string()
+}
+
+const COLOR_GREEN: &str = "\x1b[32m";
+const COLOR_CYAN: &str = "\x1b[36m";
+const COLOR_YELLOW: &str = "\x1b[33m";
+const COLOR_MAGENTA: &str = "\x1b[35m";
+const COLOR_BLUE: &str = "\x1b[34m";
+const COLOR_RESET: &str = "\x1b[0m";
+
+fn tool_color(tool_name: &str) -> &'static str {
+    match tool_name {
+        "Write" => COLOR_GREEN,
+        "Read" => COLOR_CYAN,
+        "Edit" => COLOR_YELLOW,
+        "Bash" => COLOR_MAGENTA,
+        "Glob" | "Grep" => COLOR_BLUE,
+        _ => "",
+    }
+}
+
+fn paint(s: &str, color: &str, use_color: bool) -> String {
+    if use_color && !color.is_empty() {
+        format!("{color}{s}{COLOR_RESET}")
+    } else {
+        s.to_string()
+    }
+}
+
+/// Returns `(display_str, extra)` for the progress line. `display_str` is the
+/// main single-line description (path / command / pattern); `extra` is an
+/// optional parenthesized suffix (e.g. `"5B"` for Write byte count). Paths are
+/// made relative to `work_root` when possible. All model-derived strings pass
+/// through `sanitize_for_progress` to prevent terminal injection.
+fn tool_display(
+    tool_name: &str,
+    arguments: &serde_json::Value,
+    work_root: &std::path::Path,
+) -> (String, Option<String>) {
+    let str_arg = |key: &str| -> &str {
+        arguments
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+    };
+    let relativize = |path: &str| -> String {
+        std::path::Path::new(path)
+            .strip_prefix(work_root)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| path.to_string())
+    };
+
+    match tool_name {
+        "Write" => {
+            let display = sanitize_for_progress(&relativize(str_arg("path")));
+            let extra = arguments
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .map(|c| format!("{}B", c.len()));
+            (display, extra)
+        }
+        "Edit" | "Read" => (sanitize_for_progress(&relativize(str_arg("path"))), None),
+        "Bash" => {
+            let sanitized = sanitize_for_progress(str_arg("command"));
+            (truncate(&sanitized, 57), None)
+        }
+        "Glob" | "Grep" => (sanitize_for_progress(str_arg("pattern")), None),
+        _ => (sanitize_for_progress(tool_name), None),
+    }
+}
+
+/// Format a single-line per-iteration progress line. ANSI color is only
+/// applied to the tool name when `use_color` is true.
+pub(super) fn format_progress_line(
+    tool_name: &str,
+    arguments: &serde_json::Value,
+    iter_human: usize,
+    max_iterations: usize,
+    work_root: &std::path::Path,
+    use_color: bool,
+) -> String {
+    let (display_str, extra) = tool_display(tool_name, arguments, work_root);
+    // Sanitize before painting so an adversarial tool_name cannot inject escapes.
+    let safe_tool_name = sanitize_for_progress(tool_name);
+    let painted_tool = paint(&safe_tool_name, tool_color(tool_name), use_color);
+    let extra_part = extra.map(|e| format!(" ({e})")).unwrap_or_default();
+    format!("[iter {iter_human}/{max_iterations}]  {painted_tool}  {display_str}{extra_part}")
+}
+
 #[cfg(test)]
 mod truncate_tests {
     use super::truncate;
@@ -365,5 +483,104 @@ mod truncate_tests {
     fn never_splits_multibyte_code_points() {
         // Each Japanese char is 3 bytes in UTF-8; taking 2 must not slice mid-char.
         assert_eq!(truncate("あいうえお", 2), "あい...");
+    }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::{format_progress_line, sanitize_for_progress, tool_display};
+    use serde_json::json;
+    use std::path::PathBuf;
+
+    #[test]
+    fn sanitize_removes_newline() {
+        assert_eq!(sanitize_for_progress("hello\nworld"), "hello world");
+    }
+
+    #[test]
+    fn sanitize_removes_escape() {
+        assert_eq!(sanitize_for_progress("red\x1b[31m!"), "red [31m!");
+    }
+
+    #[test]
+    fn sanitize_passthrough_normal() {
+        assert_eq!(sanitize_for_progress("hello world"), "hello world");
+    }
+
+    #[test]
+    fn tool_display_write_ascii() {
+        let work_root = PathBuf::from("/work");
+        let args = json!({"path": "/work/src/foo.rs", "content": "hello"});
+        let (display, extra) = tool_display("Write", &args, &work_root);
+        assert_eq!(display, "src/foo.rs");
+        assert_eq!(extra, Some("5B".to_string()));
+    }
+
+    #[test]
+    fn tool_display_write_non_ascii() {
+        let work_root = PathBuf::from("/work");
+        let args = json!({"path": "/work/a.txt", "content": "日本語"});
+        let (_, extra) = tool_display("Write", &args, &work_root);
+        // "日本語" is 9 bytes in UTF-8
+        assert_eq!(extra, Some("9B".to_string()));
+    }
+
+    #[test]
+    fn tool_display_bash_short() {
+        let work_root = PathBuf::from("/work");
+        let cmd = "cargo test";
+        let args = json!({"command": cmd});
+        let (display, _) = tool_display("Bash", &args, &work_root);
+        assert_eq!(display, cmd);
+    }
+
+    #[test]
+    fn tool_display_bash_long() {
+        let work_root = PathBuf::from("/work");
+        let cmd = "a".repeat(61);
+        let args = json!({"command": cmd});
+        let (display, _) = tool_display("Bash", &args, &work_root);
+        assert_eq!(display.len(), 60); // 57 chars + "..."
+        assert!(display.ends_with("..."));
+    }
+
+    #[test]
+    fn tool_display_path_relative() {
+        let work_root = PathBuf::from("/work");
+        let args = json!({"path": "/work/src/lib.rs"});
+        let (display, _) = tool_display("Read", &args, &work_root);
+        assert_eq!(display, "src/lib.rs");
+    }
+
+    #[test]
+    fn tool_display_path_outside() {
+        let work_root = PathBuf::from("/work");
+        let args = json!({"path": "/tmp/outside.txt"});
+        let (display, _) = tool_display("Read", &args, &work_root);
+        assert_eq!(display, "/tmp/outside.txt");
+    }
+
+    #[test]
+    fn progress_line_iter_1indexed() {
+        let work_root = PathBuf::from("/work");
+        let args = json!({"path": "/work/a.txt", "content": "x"});
+        let line = format_progress_line("Write", &args, 1, 12, &work_root, false);
+        assert!(line.starts_with("[iter 1/12]"));
+    }
+
+    #[test]
+    fn progress_line_no_color_no_escape() {
+        let work_root = PathBuf::from("/work");
+        let args = json!({"command": "ls"});
+        let line = format_progress_line("Bash", &args, 1, 12, &work_root, false);
+        assert!(!line.contains('\x1b'));
+    }
+
+    #[test]
+    fn progress_line_color_prefix_invariant() {
+        let work_root = PathBuf::from("/work");
+        let args = json!({"command": "ls"});
+        let line = format_progress_line("Bash", &args, 1, 12, &work_root, true);
+        assert!(line.starts_with("[iter "));
     }
 }
