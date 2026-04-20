@@ -1,3 +1,4 @@
+use super::summary::{ExitReason, format_run_summary};
 use super::*;
 use crate::config::LogLevel;
 
@@ -65,14 +66,21 @@ impl Agent {
             self.handle_command(input)
         } else {
             match self.handle_user_message(input, stream_output) {
-                Ok(reply) => {
-                    if stream_output {
-                        Ok(AgentEvent::Continue(None))
-                    } else {
-                        Ok(AgentEvent::Continue(Some(reply)))
+                Ok((prose, stats)) => {
+                    if !stream_output {
+                        println!("{prose}");
                     }
+                    let summary = format_run_summary(ExitReason::Done, &stats);
+                    println!();
+                    println!("{summary}");
+                    Ok(AgentEvent::Continue(None))
                 }
-                Err(err) => Err(err),
+                Err((reason, error_text, stats)) => {
+                    let summary = format_run_summary(reason, &stats);
+                    println!();
+                    println!("{summary}");
+                    Err(error_text)
+                }
             }
         };
 
