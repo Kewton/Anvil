@@ -1,4 +1,8 @@
+use super::summary::{ExitReason, LoopResult, LoopStats};
 use super::*;
+use crate::agent::orchestration::{RepoVerification, capture_repo_snapshot, verify_repo_progress};
+use std::collections::HashSet;
+use std::time::Instant;
 
 /// Maximum number of characters of tool-call arguments retained in trace logs.
 const LOG_ARGS_MAX_CHARS: usize = 200;
@@ -17,12 +21,45 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+fn build_stats(
+    accumulated: Vec<RepoVerification>,
+    final_verif: RepoVerification,
+    iter_used: usize,
+    iter_max: usize,
+    duration_secs: u64,
+) -> LoopStats {
+    let mut all_changed: HashSet<String> = HashSet::new();
+    let mut impl_changed = 0usize;
+    let mut test_changed = 0usize;
+    let mut setup_changed = 0usize;
+    let mut deleted_changed = 0usize;
+
+    for verif in accumulated.iter().chain(std::iter::once(&final_verif)) {
+        for f in &verif.changed_files {
+            all_changed.insert(f.clone());
+        }
+        impl_changed += verif.implementation_files_changed;
+        test_changed += verif.test_files_changed;
+        setup_changed += verif.setup_files_changed;
+        deleted_changed += verif.deleted_files_changed;
+    }
+
+    let total_changed = impl_changed + test_changed + setup_changed + deleted_changed;
+    let mut changed_files: Vec<String> = all_changed.into_iter().collect();
+    changed_files.sort();
+    changed_files.truncate(16);
+
+    LoopStats {
+        iter_used,
+        iter_max,
+        duration_secs,
+        changed_files,
+        total_changed,
+    }
+}
+
 impl Agent {
-    pub(super) fn handle_user_message(
-        &mut self,
-        input: &str,
-        stream_output: bool,
-    ) -> Result<String, String> {
+    pub(super) fn handle_user_message(&mut self, input: &str, stream_output: bool) -> LoopResult {
         self.push_user_message(input.to_string());
         self.maybe_compact_session(DEFAULT_KEEP_TAIL);
 
@@ -39,8 +76,13 @@ impl Agent {
         requires_action: bool,
         stream_output: bool,
         restart_convergence_mode: bool,
-    ) -> Result<String, String> {
+    ) -> LoopResult {
         let use_color = io::stdout().is_terminal() && !no_color_requested();
+        let start = Instant::now();
+        let mut before_snapshot = capture_repo_snapshot(&self.work_root);
+        let mut accumulated: Vec<RepoVerification> = Vec::new();
+        let mut last_known_root = self.work_root.clone();
+
         let mut tool_calls_made_this_turn = 0usize;
         let mut repo_edit_calls_made_this_turn = 0usize;
         let mut empty_retries = 0usize;
@@ -49,10 +91,25 @@ impl Agent {
         let mut recent_bash_commands = Vec::<String>::new();
         let mut install_commands_seen = 0usize;
 
-        for iter_count in 0..self.config.max_iterations {
+        let mut exit_reason = ExitReason::MaxIterations;
+        let mut error_text = String::new();
+        let mut last_iter = 0usize;
+        let mut final_prose = String::new();
+
+        'outer: for iter_count in 0..self.config.max_iterations {
+            last_iter = iter_count + 1;
             let approx_tokens = approximate_token_count(&self.session.messages);
             tracing::debug!(iter = iter_count, tokens = approx_tokens, "iter");
-            let reply = self.request_assistant_reply_with_retry(stream_output)?;
+
+            let reply = match self.request_assistant_reply_with_retry(stream_output) {
+                Ok(r) => r,
+                Err(err) => {
+                    exit_reason = ExitReason::TransportError;
+                    error_text = err;
+                    break 'outer;
+                }
+            };
+
             let prepared_tool_calls = reply
                 .tool_calls
                 .into_iter()
@@ -124,6 +181,15 @@ impl Agent {
                     } else {
                         self.execute_tool_call(&tool_name, &tool_call.arguments)
                     };
+
+                    // detect work_root change after each tool execution
+                    if self.work_root != last_known_root {
+                        let verif = verify_repo_progress(&before_snapshot, &last_known_root);
+                        accumulated.push(verif);
+                        before_snapshot = capture_repo_snapshot(&self.work_root);
+                        last_known_root = self.work_root.clone();
+                    }
+
                     let compact_result = prompting::compact_tool_result(&tool_name, raw_result);
                     self.session
                         .messages
@@ -147,16 +213,17 @@ impl Agent {
                 if action_expectation == recovery::ActionExpectation::RepoChange {
                     repo_change_retries += 1;
                     if repo_change_retries >= 3 {
-                        return Err(
-                            "assistant kept stopping before making the requested repository edits"
-                                .to_string(),
-                        );
+                        exit_reason = ExitReason::MissingRepoEdits;
+                        error_text = exit_reason.default_error_text().to_string();
+                        break 'outer;
                     }
                     self.push_system_note(recovery::repo_change_recovery_note(repo_change_retries));
                 } else {
                     empty_retries += 1;
                     if empty_retries >= 3 {
-                        return Err("assistant returned empty responses repeatedly".to_string());
+                        exit_reason = ExitReason::EmptyResponses;
+                        error_text = exit_reason.default_error_text().to_string();
+                        break 'outer;
                     }
                     self.push_system_note(recovery::empty_response_recovery_note(
                         empty_retries,
@@ -170,19 +237,17 @@ impl Agent {
                 if action_expectation == recovery::ActionExpectation::RepoChange {
                     repo_change_retries += 1;
                     if repo_change_retries >= 3 {
-                        return Err(
-                            "assistant kept stopping before making the requested repository edits"
-                                .to_string(),
-                        );
+                        exit_reason = ExitReason::MissingRepoEdits;
+                        error_text = exit_reason.default_error_text().to_string();
+                        break 'outer;
                     }
                     self.push_system_note(recovery::repo_change_recovery_note(repo_change_retries));
                 } else {
                     no_tool_retries += 1;
                     if no_tool_retries >= 3 {
-                        return Err(
-                            "assistant kept describing actions without using tools to perform them"
-                                .to_string(),
-                        );
+                        exit_reason = ExitReason::NoToolCalls;
+                        error_text = exit_reason.default_error_text().to_string();
+                        break 'outer;
                     }
                     self.push_system_note(recovery::no_tool_recovery_note(no_tool_retries));
                 }
@@ -194,23 +259,43 @@ impl Agent {
             {
                 repo_change_retries += 1;
                 if repo_change_retries >= 3 {
-                    return Err(
-                        "assistant kept stopping before making the requested repository edits"
-                            .to_string(),
-                    );
+                    exit_reason = ExitReason::MissingRepoEdits;
+                    error_text = exit_reason.default_error_text().to_string();
+                    break 'outer;
                 }
                 self.push_system_note(recovery::repo_change_recovery_note(repo_change_retries));
                 continue;
             }
 
-            self.session.messages.push(ConversationMessage::assistant(
-                final_reply.clone(),
-                Vec::new(),
-            ));
-            return Ok(final_reply);
+            // Done
+            final_prose = final_reply;
+            exit_reason = ExitReason::Done;
+            break 'outer;
         }
 
-        Err("assistant did not finish within max iterations".to_string())
+        // Single exit point: compute stats and return LoopResult
+        let duration_secs = start.elapsed().as_secs();
+        let final_verif = verify_repo_progress(&before_snapshot, &self.work_root);
+        let stats = build_stats(
+            accumulated,
+            final_verif,
+            last_iter.min(self.config.max_iterations),
+            self.config.max_iterations,
+            duration_secs,
+        );
+
+        if exit_reason.is_success() {
+            self.session.messages.push(ConversationMessage::assistant(
+                final_prose.clone(),
+                Vec::new(),
+            ));
+            Ok((final_prose, stats))
+        } else {
+            if error_text.is_empty() {
+                error_text = exit_reason.default_error_text().to_string();
+            }
+            Err((exit_reason, error_text, stats))
+        }
     }
 
     fn request_assistant_reply_with_retry(

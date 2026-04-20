@@ -22,6 +22,7 @@ use crate::tools::registry::{ToolContext, ToolRegistry};
 
 mod commands;
 mod lifecycle;
+mod summary;
 mod turn;
 
 const DEFAULT_KEEP_TAIL: usize = 24;

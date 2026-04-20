@@ -16,6 +16,7 @@ pub struct RepoVerification {
     pub implementation_files_changed: usize,
     pub test_files_changed: usize,
     pub setup_files_changed: usize,
+    pub deleted_files_changed: usize,
 }
 
 impl RepoVerification {
@@ -23,6 +24,13 @@ impl RepoVerification {
         self.implementation_files_changed > 0
             || self.test_files_changed > 0
             || self.setup_files_changed > 0
+    }
+
+    pub fn total_changed_files(&self) -> usize {
+        self.implementation_files_changed
+            + self.test_files_changed
+            + self.setup_files_changed
+            + self.deleted_files_changed
     }
 }
 
@@ -60,23 +68,37 @@ pub fn verify_repo_progress(before: &RepoSnapshot, root: &Path) -> RepoVerificat
     let mut implementation_files_changed = 0usize;
     let mut test_files_changed = 0usize;
     let mut setup_files_changed = 0usize;
+    let mut deleted_files_changed = 0usize;
 
-    for (path, after_hash) in after.files {
-        let changed = before.files.get(&path) != Some(&after_hash);
+    // modified or created files
+    for (path, after_hash) in &after.files {
+        let changed = before.files.get(path) != Some(after_hash);
         if !changed {
             continue;
         }
         let display = path.display().to_string();
-        if changed_files.len() < 4 {
+        if changed_files.len() < 16 {
             changed_files.push(display.clone());
         }
-        if is_test_file(&path) {
+        if is_test_file(path) {
             test_files_changed += 1;
-        } else if is_setup_file(&path) {
+        } else if is_setup_file(path) {
             setup_files_changed += 1;
-        } else if is_implementation_file(&path) {
+        } else if is_implementation_file(path) {
             implementation_files_changed += 1;
         }
+    }
+
+    // deleted files (present before but absent after)
+    for path in before.files.keys() {
+        if after.files.contains_key(path) {
+            continue;
+        }
+        let display = format!("{} (deleted)", path.display());
+        if changed_files.len() < 16 {
+            changed_files.push(display);
+        }
+        deleted_files_changed += 1;
     }
 
     RepoVerification {
@@ -84,6 +106,7 @@ pub fn verify_repo_progress(before: &RepoSnapshot, root: &Path) -> RepoVerificat
         implementation_files_changed,
         test_files_changed,
         setup_files_changed,
+        deleted_files_changed,
     }
 }
 

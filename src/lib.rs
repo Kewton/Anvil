@@ -69,7 +69,9 @@ pub fn run_cli(args: CliArgs) -> Result<(), String> {
 
     if let Some(prompt) = agent.initial_prompt_from_cli_or_stdin()? {
         let reply = agent.run_oneshot(&prompt)?;
-        println!("{reply}");
+        if !reply.is_empty() {
+            println!("{reply}");
+        }
         return Ok(());
     }
 
