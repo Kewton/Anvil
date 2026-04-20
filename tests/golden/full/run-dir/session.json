@@ -1,0 +1,16 @@
+{
+  "id": "test-session-id",
+  "messages": [
+    {"role": "system", "content": "[compact-summary] iteration 1-5", "tool_calls": []},
+    {"role": "system", "content": "[compact-summary] iteration 6-10", "tool_calls": []},
+    {"role": "user", "content": "task", "tool_calls": []},
+    {"role": "assistant", "content": "ok", "tool_calls": [
+      {"id": "1", "name": "Write", "arguments": {"path": "src/app/page.tsx"}},
+      {"id": "2", "name": "Bash", "arguments": {"command": "npm run build"}}
+    ]},
+    {"role": "assistant", "content": "done", "tool_calls": [
+      {"id": "3", "name": "Edit", "arguments": {"path": "src/lib/game.ts"}},
+      {"id": "4", "name": "Read", "arguments": {"path": "src/app/page.tsx"}}
+    ]}
+  ]
+}

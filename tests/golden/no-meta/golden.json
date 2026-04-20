@@ -1,0 +1,16 @@
+{
+  "compact_events": 0,
+  "elapsed_s": null,
+  "error_500_count": null,
+  "files_modified": [],
+  "iter_count": 0,
+  "keywords_version": 1,
+  "page_tsx_has_game_keywords": null,
+  "page_tsx_touched": false,
+  "rc": null,
+  "run_id": "no-meta-session",
+  "schema_version": 1,
+  "tool_calls": {},
+  "we_total": 0,
+  "xml_parser_errors": null
+}

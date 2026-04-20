@@ -1,0 +1,5 @@
+{
+  "messages": [
+    {"role": "assistant", "content": "ok", "tool_calls": []}
+  ]
+}

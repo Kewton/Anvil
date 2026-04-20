@@ -36,3 +36,5 @@ dev-reports/
 .env
 .env.local
 .env.*.local
+__pycache__/
+*.pyc
