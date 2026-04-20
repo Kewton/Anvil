@@ -1,0 +1,112 @@
+{
+  "baseline_dir": "<REPO_ROOT>/tests/golden/compare/basic/baseline",
+  "experiment_dir": "<REPO_ROOT>/tests/golden/compare/basic/experiment",
+  "generated_at": "2026-01-01T00:00:00Z",
+  "metrics": {
+    "elapsed_s": {
+      "baseline": {
+        "ci_high": 137.420825016211,
+        "ci_low": 112.57917498378899,
+        "mean": 125.0,
+        "n": 3
+      },
+      "delta": -20.0,
+      "delta_pct": -0.16,
+      "experiment": {
+        "ci_high": 117.42082501621101,
+        "ci_low": 92.57917498378899,
+        "mean": 105.0,
+        "n": 3
+      },
+      "verdict": "improved"
+    },
+    "error_500_count": {
+      "baseline": {
+        "ci_high": null,
+        "ci_low": null,
+        "mean": null,
+        "n": 0
+      },
+      "delta": null,
+      "delta_pct": null,
+      "experiment": {
+        "ci_high": null,
+        "ci_low": null,
+        "mean": null,
+        "n": 0
+      },
+      "verdict": "unchanged"
+    },
+    "iter_count": {
+      "baseline": {
+        "ci_high": 12.484165003242204,
+        "ci_low": 7.515834996757797,
+        "mean": 10.0,
+        "n": 3
+      },
+      "delta": -2.0,
+      "delta_pct": -0.2,
+      "experiment": {
+        "ci_high": 10.484165003242204,
+        "ci_low": 5.515834996757797,
+        "mean": 8.0,
+        "n": 3
+      },
+      "verdict": "improved"
+    },
+    "page_tsx_has_game_keywords": {
+      "baseline": {
+        "ci_high": null,
+        "ci_low": null,
+        "mean": null,
+        "n": 0
+      },
+      "delta": null,
+      "delta_pct": null,
+      "experiment": {
+        "ci_high": null,
+        "ci_low": null,
+        "mean": null,
+        "n": 0
+      },
+      "verdict": "unchanged"
+    },
+    "rc": {
+      "baseline": {
+        "ci_high": 0.9385096847238393,
+        "ci_low": 0.20765495512648788,
+        "mean": 0.6666666666666666,
+        "n": 3
+      },
+      "delta": 0.33333333333333337,
+      "delta_pct": null,
+      "experiment": {
+        "ci_high": 1.0,
+        "ci_low": 0.4384939195509822,
+        "mean": 1.0,
+        "n": 3
+      },
+      "verdict": "improved"
+    },
+    "we_total": {
+      "baseline": {
+        "ci_high": 2.1008999999999998,
+        "ci_low": -0.7675666666666666,
+        "mean": 0.6666666666666666,
+        "n": 3
+      },
+      "delta": 0.33333333333333337,
+      "delta_pct": null,
+      "experiment": {
+        "ci_high": 1.0,
+        "ci_low": 1.0,
+        "mean": 1.0,
+        "n": 3
+      },
+      "verdict": "informational"
+    }
+  },
+  "model_slug": "test-model",
+  "schema_version": 1,
+  "threshold": 0.05
+}
