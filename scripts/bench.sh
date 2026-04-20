@@ -7,7 +7,12 @@
 #   --models <list>   カンマ区切りで複数モデル（matrix 実行、逐次）
 #   --runs <n>        実行回数（デフォルト: 5）
 #   --dry-run         anvil 呼び出しを echo で代替
+#   --bench-no-debug  anvil に --debug を付けない（BENCH_DEBUG=0 と同義）
 #   --help            この用例を表示して終了
+#
+# Environment:
+#   BENCH_DEBUG=1 (default) anvil を --debug 付きで起動し、llm-io.jsonl を収集する
+#   BENCH_DEBUG=0           --debug を付けない。--bench-no-debug と等価。
 #
 # Examples:
 #   scripts/bench.sh heavy --model qwen3.5:122b --runs 5
@@ -26,6 +31,7 @@ Usage: scripts/bench.sh <benchmark-name> [options]
   --models <list>   カンマ区切りで複数モデル（matrix 実行、逐次）
   --runs <n>        実行回数（デフォルト: 5）
   --dry-run         anvil 呼び出しを echo で代替
+  --bench-no-debug  anvil に --debug を付けない（BENCH_DEBUG=0 と同義）
   --help            この用例を表示して終了
 
 Examples:
@@ -40,6 +46,15 @@ model_arg=""
 models_arg=""
 runs=5
 DRY_RUN=0
+# BENCH_DEBUG toggles `--debug` on the anvil invocation. Allowed values: "0" or "1".
+BENCH_DEBUG="${BENCH_DEBUG:-1}"
+case "$BENCH_DEBUG" in
+  0|1) ;;
+  *)
+    echo "Error: BENCH_DEBUG must be 0 or 1 (got: $BENCH_DEBUG)" >&2
+    exit 1
+    ;;
+esac
 
 if [[ $# -eq 0 ]]; then
   usage
@@ -69,6 +84,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --dry-run)
       DRY_RUN=1
+      shift
+      ;;
+    --bench-no-debug)
+      BENCH_DEBUG=0
       shift
       ;;
     --)
@@ -120,6 +139,14 @@ if ! yq --version 2>&1 | grep -qi 'mikefarah'; then
   echo "Error: yq (mikefarah/yq v4.x) is required." >&2
   echo "  macOS: brew install yq" >&2
   echo "  Linux: sudo apt-get install -y yq" >&2
+  exit 1
+fi
+
+# -------- jq check --------
+if ! command -v jq >/dev/null 2>&1; then
+  echo "Error: jq is required (used to write run-dir/meta.json)." >&2
+  echo "  macOS: brew install jq" >&2
+  echo "  Linux: sudo apt-get install -y jq" >&2
   exit 1
 fi
 
@@ -190,12 +217,36 @@ printf 'run\tmodel\trc\telapsed_sec\tworkdir\tsession_copied\n' > "$BENCH_ROOT/s
 # -------- trap --------
 CURRENT_RUN=""
 CURRENT_MODEL=""
+CURRENT_RUN_DIR=""
+CURRENT_START_TS=""
 RUN_LOGGED=0
+META_WRITTEN=0
+
+write_meta_json() {
+  # $1=rc, $2=elapsed_s, $3=model, $4=start_ts, $5=run_dir
+  local _rc="$1" _elapsed="$2" _model="$3" _start_ts="$4" _run_dir="$5"
+  if [[ -z "$_run_dir" ]]; then
+    return 0
+  fi
+  mkdir -p "$_run_dir"
+  jq -n \
+    --argjson rc "$_rc" \
+    --argjson elapsed_s "$_elapsed" \
+    --arg model "$_model" \
+    --arg start_ts "$_start_ts" \
+    '{rc: $rc, elapsed_s: $elapsed_s, model: $model, start_ts: $start_ts}' \
+    > "$_run_dir/meta.json"
+}
+
 on_interrupt() {
   if [[ "$RUN_LOGGED" -eq 0 && -n "$CURRENT_RUN" ]]; then
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
       "$CURRENT_RUN" "${CURRENT_MODEL:-unknown}" "130" "N/A" "N/A" "0" \
       >> "$BENCH_ROOT/summary.tsv"
+  fi
+  if [[ "$META_WRITTEN" -eq 0 && -n "$CURRENT_RUN_DIR" ]]; then
+    write_meta_json 130 0 "${CURRENT_MODEL:-unknown}" "${CURRENT_START_TS:-}" "$CURRENT_RUN_DIR" \
+      || true
   fi
   exit 130
 }
@@ -245,6 +296,7 @@ for model in "${cleaned_models[@]}"; do
     CURRENT_RUN="$run"
     CURRENT_MODEL="$model"
     RUN_LOGGED=0
+    META_WRITTEN=0
 
     validate_model "$model"
     model_slug=$(slugify "$model")
@@ -253,8 +305,11 @@ for model in "${cleaned_models[@]}"; do
       exit 1
     fi
 
-    WORKDIR="$BENCH_ROOT/$model_slug/run-$run/workdir"
-    STATE_DIR="$BENCH_ROOT/$model_slug/run-$run/state"
+    RUN_DIR="$BENCH_ROOT/$model_slug/run-$run"
+    WORKDIR="$RUN_DIR/workdir"
+    STATE_DIR="$RUN_DIR/state"
+    CURRENT_RUN_DIR="$RUN_DIR"
+    CURRENT_START_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
     # STATE_DIR assert: absolute path & no ..
     if [[ "$STATE_DIR" != /* ]]; then
@@ -268,7 +323,7 @@ for model in "${cleaned_models[@]}"; do
         ;;
     esac
 
-    mkdir -p "$WORKDIR" "$STATE_DIR"
+    mkdir -p "$WORKDIR" "$STATE_DIR" "$RUN_DIR/logs"
     cd "$WORKDIR" || { echo "Error: cd $WORKDIR failed" >&2; exit 1; }
 
     start=$SECONDS
@@ -287,6 +342,9 @@ for model in "${cleaned_models[@]}"; do
       if [[ -n "$sidecar_model" ]]; then
         anvil_args+=(--sidecar-model "$sidecar_model")
       fi
+      if [[ "$BENCH_DEBUG" -eq 1 ]]; then
+        anvil_args+=(--debug)
+      fi
       # set -e is not enabled; capture rc directly
       "$ANVIL_BIN" "${anvil_args[@]}" > ../stdout.log 2>&1
       rc=$?
@@ -303,9 +361,42 @@ for model in "${cleaned_models[@]}"; do
         latest_session="$f"
       done
     fi
-    if [[ -n "$latest_session" && -f "$latest_session" ]]; then
-      cp "$latest_session" ../session.json
-      session_copied=1
+    if [[ -n "$latest_session" && -f "$latest_session" && ! -L "$latest_session" ]]; then
+      # CB-001: reject symlinks before copy to prevent information leakage
+      real_session=$(realpath "$latest_session" 2>/dev/null || true)
+      real_state=$(realpath "$STATE_DIR" 2>/dev/null || true)
+      if [[ -n "$real_session" && -n "$real_state" && "$real_session" == "$real_state"/* ]]; then
+        # CB-002: check copy success before setting session_copied=1
+        if cp "$latest_session" ../session.json; then
+          session_copied=1
+        else
+          echo "warning: session.json copy failed" >&2
+        fi
+
+        # Copy llm-io.jsonl from the state-dir session directory (if present)
+        session_id=$(basename "$(dirname "$latest_session")")
+        # Validate session id (UUID-ish: alnum + dash). Skip copy on odd values.
+        if [[ "$session_id" =~ ^[A-Za-z0-9._-]+$ ]]; then
+          log_src="$STATE_DIR/sessions/$session_id/logs/llm-io.jsonl"
+          # CB-001: reject symlinks for llm-io.jsonl too
+          if [[ -f "$log_src" && ! -L "$log_src" ]]; then
+            real_log=$(realpath "$log_src" 2>/dev/null || true)
+            if [[ -n "$real_log" && "$real_log" == "$real_state"/* ]]; then
+              cp "$log_src" "$RUN_DIR/logs/llm-io.jsonl" || echo "warning: llm-io.jsonl copy failed" >&2
+            fi
+          fi
+        fi
+      else
+        echo "warning: session.json path outside STATE_DIR, skipping copy" >&2
+      fi
+    fi
+
+    # Write run-dir/meta.json so analyze_run.py can read rc/elapsed_s
+    # CB-002: check write success
+    if write_meta_json "$rc" "$elapsed" "$model" "$CURRENT_START_TS" "$RUN_DIR"; then
+      META_WRITTEN=1
+    else
+      echo "warning: meta.json write failed" >&2
     fi
 
     workdir_rel="$model_slug/run-$run/workdir"
@@ -314,6 +405,8 @@ for model in "${cleaned_models[@]}"; do
       >> "$BENCH_ROOT/summary.tsv"
     RUN_LOGGED=1
 
+    CURRENT_RUN_DIR=""
+    CURRENT_START_TS=""
     cd "$REPO_ROOT" || { echo "Error: cd $REPO_ROOT failed" >&2; exit 1; }
   done
 done

@@ -1,0 +1,8 @@
+{
+  "id": "duplicate-root-session",
+  "messages": [
+    {"role": "assistant", "content": "ok", "tool_calls": [
+      {"id": "1", "name": "Write", "arguments": {"path": "space-invaders/src/app/page.tsx"}}
+    ]}
+  ]
+}
