@@ -14,11 +14,16 @@ use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 
 use agent::Agent;
-use cli::CliArgs;
+use agent::loop_run::commands::{
+    print_startup_banner, print_startup_banner_stderr_oneshot, short_id,
+};
+use cli::{CliArgs, Command};
 use config::Config;
 use model_registry::{RuntimeModels, select_models};
 use ollama::client::OllamaClient;
-use session::store::SessionStore;
+use session::compact::find_last_user_prompt;
+use session::sessions_cli;
+use session::store::{SessionStore, reconcile_resume_state};
 
 pub fn run_cli(args: CliArgs) -> Result<(), String> {
     // --debug deprecation is emitted here because the flag only exists on the
@@ -29,6 +34,26 @@ pub fn run_cli(args: CliArgs) -> Result<(), String> {
         );
     }
 
+    // CLI-level mutual-exclusion checks that clap cannot express declaratively.
+    args.validate()?;
+
+    // Short-circuit for `anvil sessions ...` BEFORE loading Ollama / Agent so
+    // session inspection works offline and without an LLM running.
+    if let Some(Command::Sessions { action }) = args.command.clone() {
+        // We still need cwd-derived state_root + workspace_key to scope the
+        // sessions view; log level / model / Ollama host are deliberately
+        // not consulted.
+        let cwd = match args.cwd.clone() {
+            Some(path) => path,
+            None => {
+                std::env::current_dir().map_err(|err| format!("failed to resolve cwd: {err}"))?
+            }
+        };
+        let state_root = resolve_state_root_from_parts(args.state_dir.as_deref())?;
+        let workspace_key = compute_workspace_key(&cwd);
+        return sessions_cli::dispatch(&state_root, &workspace_key, action);
+    }
+
     let (config, warnings) = Config::load(args)?;
     for warning in &warnings {
         eprintln!("warning: {warning}");
@@ -36,7 +61,16 @@ pub fn run_cli(args: CliArgs) -> Result<(), String> {
 
     let state_root = resolve_state_root(&config)?;
     let workspace_key = compute_workspace_key(&config.cwd);
-    let session_id = resolve_session_id(&state_root, &workspace_key, config.fresh_session);
+
+    // Explicit `--resume <ID>` takes a different code path that refuses
+    // anything that is not a UUID v7 directory under state_root/sessions.
+    let session_id = match config.resume.explicit_id() {
+        Some(id) => {
+            sessions_cli::validate_explicit_session_id(&state_root, id)?;
+            id.to_string()
+        }
+        None => resolve_session_id(&state_root, &workspace_key, config.fresh_session),
+    };
 
     ensure_state_dirs(&state_root, &session_id)?;
 
@@ -64,8 +98,75 @@ pub fn run_cli(args: CliArgs) -> Result<(), String> {
     );
 
     let session_store = SessionStore::new(&state_root, &session_id, &workspace_key);
-    let session = session_store.load_or_new(config.fresh_session)?;
+    let mut session = session_store.load_or_new(config.fresh_session)?;
+
+    // Explicit --resume <ID>: refuse foreign workspace sessions. We only
+    // check here, after the snapshot is loaded, because workspace_key lives
+    // inside the snapshot (not the path).
+    if config.resume.explicit_id().is_some()
+        && !session.workspace_key.is_empty()
+        && session.workspace_key != workspace_key
+    {
+        return Err(format!(
+            "session {session_id} belongs to a different workspace; --resume cannot cross workspace"
+        ));
+    }
+
+    // Clean up broken references so the agent does not try to cd into a
+    // missing active_root or resume a deleted plan.md.
+    reconcile_resume_state(&mut session, &config.cwd);
+
+    let is_resume = config.resume.is_some();
+    let is_oneshot = config.oneshot;
+    let model_banner = format_model_banner(&models);
+    let version = env!("CARGO_PKG_VERSION");
+    let session_short = short_id(&session.id).to_string();
+    let messages_count = session.messages.len();
+    let work_root_for_banner = session
+        .active_root
+        .clone()
+        .unwrap_or_else(|| config.cwd.clone());
+    let mode_for_banner = session.mode_state.mode;
+    let fresh = config.fresh_session;
+    let log_level = config.log_level;
+
+    // Resume path has to read the last user prompt before we hand the
+    // snapshot to Agent::new (which consumes it by value).
+    let resume_prompt: Option<String> = if is_resume {
+        Some(find_last_user_prompt(&session.messages).ok_or_else(|| {
+            "cannot resume: the last user message has already been collapsed into a \
+             compaction summary. Start a new prompt instead."
+                .to_string()
+        })?)
+    } else {
+        None
+    };
+
     let mut agent = Agent::new(config, models, client, session_store, session);
+
+    // Banner: REPL / resume get stdout; oneshot gets stderr so stdout stays
+    // clean for script consumers.
+    if is_oneshot {
+        print_startup_banner_stderr_oneshot(&session_short, messages_count, fresh, is_resume);
+    } else {
+        print_startup_banner(
+            version,
+            &model_banner,
+            &mode_for_banner,
+            &work_root_for_banner,
+            &session_short,
+            messages_count,
+            fresh,
+            is_resume,
+            log_level,
+        );
+    }
+
+    if let Some(prompt) = resume_prompt {
+        // Resume: replay the last user turn, then fall into the REPL loop
+        // (banner has already been printed above).
+        return agent.run_resume(&prompt);
+    }
 
     if let Some(prompt) = agent.initial_prompt_from_cli_or_stdin()? {
         let reply = agent.run_oneshot(&prompt)?;
@@ -75,7 +176,39 @@ pub fn run_cli(args: CliArgs) -> Result<(), String> {
         return Ok(());
     }
 
-    agent.run_repl()
+    agent.run_repl_loop()
+}
+
+/// Lightweight state-root resolver for the `sessions` subcommand path, where
+/// we don't construct a full `Config`. Mirrors `resolve_state_root` but takes
+/// just the CLI override so sessions commands can run without Ollama/Agent.
+fn resolve_state_root_from_parts(state_dir_override: Option<&Path>) -> Result<PathBuf, String> {
+    if let Some(override_path) = state_dir_override {
+        if !override_path.is_absolute() {
+            return Err(format!(
+                "state-dir must be absolute: {}",
+                override_path.display()
+            ));
+        }
+        if override_path
+            .components()
+            .any(|c| c == std::path::Component::ParentDir)
+        {
+            return Err(format!(
+                "state-dir must not contain '..': {}",
+                override_path.display()
+            ));
+        }
+        return Ok(override_path.to_path_buf());
+    }
+    if let Ok(env_dir) = std::env::var("ANVIL_STATE_DIR") {
+        let p = PathBuf::from(env_dir);
+        if !p.is_absolute() || p.components().any(|c| c == std::path::Component::ParentDir) {
+            return Err("ANVIL_STATE_DIR must be an absolute path without '..'".to_string());
+        }
+        return Ok(p);
+    }
+    Ok(xdg_state_home().join("anvil"))
 }
 
 pub fn stdin_prompt() -> Result<Option<String>, String> {
@@ -149,54 +282,16 @@ pub fn resolve_session_id(state_root: &Path, workspace_key: &str, fresh: bool) -
         return uuid::Uuid::now_v7().to_string();
     }
 
-    let sessions_dir = state_root.join("sessions");
-    let mut candidates: Vec<String> = Vec::new();
+    // iter_session_dirs centralizes UUID/symlink/size/parse defenses;
+    // here we only keep entries whose persisted workspace_key matches.
+    let latest = session::discovery::iter_session_dirs(state_root)
+        .into_iter()
+        .filter(|entry| entry.snapshot.workspace_key == workspace_key)
+        .map(|entry| entry.id)
+        // UUID v7 strings are lexicographically time-ordered; take the max.
+        .max();
 
-    if let Ok(entries) = std::fs::read_dir(&sessions_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            // use directory name as session_id — never trust session.json content for path construction
-            let dir_name = match entry.file_name().into_string() {
-                Ok(n) => n,
-                Err(_) => continue,
-            };
-            // validate directory name is a well-formed UUID
-            if uuid::Uuid::parse_str(&dir_name).is_err() {
-                continue;
-            }
-            // skip symlinks
-            let Ok(meta) = path.symlink_metadata() else {
-                continue;
-            };
-            if meta.file_type().is_symlink() || !meta.is_dir() {
-                continue;
-            }
-            let session_json = path.join("session.json");
-            if !session_json.exists() {
-                continue;
-            }
-            if let Ok(meta) = std::fs::metadata(&session_json)
-                && meta.len() > 10 * 1024 * 1024
-            {
-                continue;
-            }
-            let Ok(data) = std::fs::read_to_string(&session_json) else {
-                continue;
-            };
-            let Ok(snap) = serde_json::from_str::<session::store::SessionSnapshot>(&data) else {
-                continue;
-            };
-            if snap.workspace_key == workspace_key {
-                candidates.push(dir_name);
-            }
-        }
-    }
-
-    // UUID v7 strings are lexicographically time-ordered; pick the most recent
-    if let Some(latest) = candidates.into_iter().max() {
-        return latest;
-    }
-    uuid::Uuid::now_v7().to_string()
+    latest.unwrap_or_else(|| uuid::Uuid::now_v7().to_string())
 }
 
 pub fn ensure_state_dirs(state_root: &Path, session_id: &str) -> Result<(), String> {

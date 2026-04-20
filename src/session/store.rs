@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::modes::plan_act::ModeState;
+use crate::modes::plan_act::{ExecutionMode, ModeState};
 use crate::ollama::xml_fallback::ToolCall;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -175,6 +175,47 @@ impl SessionStore {
             Some(candidate)
         } else {
             None
+        }
+    }
+}
+
+/// Bring a restored `SessionSnapshot` back to a runnable state before it is
+/// handed to `Agent::new`:
+///   (1) If `active_root` points at a directory that no longer exists,
+///       clear it so the agent falls back to the current cwd.
+///   (2) If the session is mid-Plan but its `active_plan_path` file is gone,
+///       downgrade to Act so the agent does not try to open a missing plan.
+///
+/// Emits a `warn:` line to stderr for each reconciliation. Idempotent.
+pub fn reconcile_resume_state(session: &mut SessionSnapshot, _cwd: &Path) {
+    if let Some(root) = &session.active_root
+        && !root.is_dir()
+    {
+        eprintln!(
+            "warn: session.active_root no longer exists ({}); falling back to cwd",
+            root.display()
+        );
+        session.active_root = None;
+    }
+
+    if session.mode_state.mode == ExecutionMode::Plan {
+        let missing_plan = session
+            .mode_state
+            .active_plan_path
+            .as_ref()
+            .is_some_and(|p| !p.exists());
+        if missing_plan {
+            eprintln!(
+                "warn: plan file missing ({}); downgrading to Act mode",
+                session
+                    .mode_state
+                    .active_plan_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default()
+            );
+            session.mode_state.mode = ExecutionMode::Act;
+            session.mode_state.active_plan_path = None;
         }
     }
 }

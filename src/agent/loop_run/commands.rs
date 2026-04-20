@@ -2,6 +2,64 @@ use super::summary::{ExitReason, format_run_summary};
 use super::*;
 use crate::config::LogLevel;
 
+/// First 8 characters of a session id, or the full id if shorter. Used for
+/// banner display so users get a stable short handle without exposing the
+/// whole UUID.
+pub fn short_id(id: &str) -> &str {
+    id.get(..8).unwrap_or(id)
+}
+
+/// Print the REPL / resume startup banner to stdout. The `fresh` and
+/// `resumed` flags drive the `[state]` suffix so users can tell at a glance
+/// which session they are in.
+#[allow(clippy::too_many_arguments)]
+pub fn print_startup_banner(
+    version: &str,
+    model_banner: &str,
+    mode: &crate::modes::plan_act::ExecutionMode,
+    work_root: &std::path::Path,
+    session_id_short: &str,
+    message_count: usize,
+    fresh: bool,
+    resumed: bool,
+    log_level: LogLevel,
+) {
+    println!("anvil {version}");
+    println!("{model_banner}");
+    println!("mode={mode:?} cwd={}", work_root.display());
+    let state = if fresh {
+        "fresh"
+    } else if resumed {
+        "resumed"
+    } else {
+        "continued"
+    };
+    println!("session={session_id_short} messages={message_count} [{state}]");
+    if log_level >= LogLevel::Verbose
+        && let Some(path) = crate::logging::llm_io_log_path()
+    {
+        println!("llm log={}", path.display());
+    }
+}
+
+/// Oneshot startup banner: single stderr line so script output on stdout stays
+/// clean.
+pub fn print_startup_banner_stderr_oneshot(
+    session_id_short: &str,
+    message_count: usize,
+    fresh: bool,
+    resumed: bool,
+) {
+    let state = if fresh {
+        "fresh"
+    } else if resumed {
+        "resumed"
+    } else {
+        "continued"
+    };
+    eprintln!("anvil session={session_id_short} messages={message_count} [{state}]");
+}
+
 impl Agent {
     pub fn initial_prompt_from_cli_or_stdin(&self) -> Result<Option<String>, String> {
         if let Some(prompt) = &self.config.prompt {
@@ -21,20 +79,27 @@ impl Agent {
         }
     }
 
-    pub fn run_repl(&mut self) -> Result<(), String> {
-        println!("anvil {}", env!("CARGO_PKG_VERSION"));
-        println!("{}", format_model_banner(&self.models));
-        println!(
-            "mode={:?} cwd={}",
-            self.session.mode_state.mode,
-            self.work_root.display()
-        );
-        if self.config.log_level >= LogLevel::Verbose
-            && let Some(path) = crate::logging::llm_io_log_path()
-        {
-            println!("llm log={}", path.display());
+    /// Replay the last user turn and then continue in the REPL loop.
+    /// Used by `--resume` / `--resume <ID>` after the session has been loaded
+    /// and reconciled. The caller is responsible for printing the startup
+    /// banner; this method does not re-print it.
+    pub fn run_resume(&mut self, replay_prompt: &str) -> Result<(), String> {
+        match self.process_line(replay_prompt, self.config.stream)? {
+            AgentEvent::Continue(Some(message)) => {
+                if !self.config.stream {
+                    println!("{message}");
+                }
+            }
+            AgentEvent::Continue(None) => {}
+            AgentEvent::Exit => return Ok(()),
         }
+        self.run_repl_loop()
+    }
 
+    /// REPL body without the startup banner. Separated from `run_repl` so that
+    /// `run_cli` can print the banner once (in a single location) and have
+    /// both the fresh-REPL and resumed-REPL paths share the same loop.
+    pub fn run_repl_loop(&mut self) -> Result<(), String> {
         let mut line = String::new();
         loop {
             print!("anvil> ");
@@ -55,6 +120,25 @@ impl Agent {
             }
         }
         Ok(())
+    }
+
+    /// Backwards-compatible wrapper that prints the startup banner and then
+    /// runs the REPL loop. Kept for consumers that still call `run_repl`
+    /// directly; `run_cli` no longer uses it because the banner is printed
+    /// one level up for consistency across REPL / oneshot / resume.
+    pub fn run_repl(&mut self) -> Result<(), String> {
+        print_startup_banner(
+            env!("CARGO_PKG_VERSION"),
+            &format_model_banner(&self.models),
+            &self.session.mode_state.mode,
+            &self.work_root,
+            short_id(&self.session.id),
+            self.session.messages.len(),
+            self.config.fresh_session,
+            false,
+            self.config.log_level,
+        );
+        self.run_repl_loop()
     }
 
     pub fn process_line(&mut self, input: &str, stream_output: bool) -> Result<AgentEvent, String> {

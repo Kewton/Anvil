@@ -85,7 +85,16 @@ anvil [OPTIONS]
       --fresh-session                ignore saved session, start new session_id
       --state-dir <PATH>             override XDG state root (default: $XDG_STATE_HOME/anvil)
       --oneshot                      read one prompt from CLI or stdin
+      --resume [<ID>]                replay the last user message; no arg = latest workspace session
+
+anvil sessions list  [--all] [--json]
+anvil sessions show  <ID> [--all] [--json]
+anvil sessions clean [--older-than <DAYS>] [--keep <N>] [--all] [--force] [<ID>]
 ```
+
+`--resume` は直近の `user` メッセージを自動で再投入し、履歴のまま会話を継続する。`--resume <ID>` で UUID v7 を明示指定でき、現在の workspace と一致しない session はエラーになる（他 workspace の閲覧は後述 `sessions show --all` 経由）。`--resume` は `--fresh-session` / `--prompt` / `--oneshot` と排他。
+
+`sessions list|show|clean` は Ollama / Agent を起動せずオフラインで完結する。既定は現 workspace のみが対象で、`--all` で他 workspace 分も表示する。`clean` は既定 dry-run で、実削除には `--force` が必要。`resolve_session_id` が指す現セッションは常に保護される。
 
 ## スラッシュコマンド
 
@@ -163,6 +172,15 @@ $XDG_STATE_HOME/anvil/           (未設定時: ~/.local/state/anvil)
 workdir 側の `.anvil/logs/` `.anvil/sessions/` `.anvil/plans/` は上記へのベストエフォート symlink（削除されても次回起動時に再作成）。
 
 `--state-dir <PATH>` または `ANVIL_STATE_DIR=<PATH>` で保存先を上書きできる。テストでは `ANVIL_STATE_DIR` を tempdir に設定することで実 `$HOME` を汚染しない。
+
+### Session 継続と検査
+
+- `anvil` を引数なしで起動すると、現 workspace 直下にある最新の session を自動復元する（暗黙リストア）。
+- `--resume` は復元に加え、**最後の `user` メッセージを自動で再投入** して run を再開する。500 / max_iter で中断した直近ターンの続きを流し直したいときに使う。
+- `--resume <UUID>` で session を明示指定できる。UUID v7 以外・symlink・`state_root/sessions/` 外を指すものは拒否され、他 workspace の session もエラーになる。
+- `anvil sessions list` で現 workspace の session 一覧（`ID / updated_at / messages / last_tool / mode`）を更新日降順で表示する。`--all` で他 workspace 分も一覧に含め、`workspace_key` 空の古い session は `unassigned` として表示される。
+- `anvil sessions show <ID>` は 1 session の概要（`id / workspace_key / active_root / messages 件数 / 先頭 user prompt / 最終 assistant or tool / checkpoints 件数 / mode_state`）を出す。`--json` で機械可読出力（transcript 本体は含まない）。
+- `anvil sessions clean` は既定 dry-run。`--older-than 30d` で 30 日超、`--keep 5` で直近 5 件以外を候補にする。`<UUID>` 直接指定も可能。`--force` を付けたときのみ削除する。**現在 `resolve_session_id` が解決する session は常に保護**される。
 
 ## 安全性
 

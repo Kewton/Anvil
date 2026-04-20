@@ -21,6 +21,8 @@
   - Plan / Act の単純な状態
 - `src/session/*`
   - セッション保存と compaction
+  - `discovery.rs`: `iter_session_dirs` 共有イテレータ（UUID/symlink/size/parse 防御）
+  - `sessions_cli.rs`: `anvil sessions list|show|clean` と `--resume <ID>` の path confinement / plan / I/O
 - `src/git/checkpoint.rs`
   - checkpoint / rollback
 
