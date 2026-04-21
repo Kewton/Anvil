@@ -127,6 +127,10 @@ impl Agent {
             last_iter = iter_count + 1;
             let approx_tokens = approximate_token_count(&self.session.messages);
             tracing::debug!(iter = iter_count, tokens = approx_tokens, "iter");
+            // Publish per-turn token count to the footer (issue #430, AC12).
+            // Reuses the value we just computed — O(1), no second walk over
+            // `messages`. No-op when the footer handle is disabled.
+            self.footer.publish_tokens(approx_tokens);
 
             // Boundary 1: before requesting the next assistant reply. Lets us
             // bail out between iterations without starting a fresh LLM call.
@@ -182,6 +186,12 @@ impl Agent {
                         args = %truncate(&args_str, LOG_ARGS_MAX_CHARS),
                         "tool call"
                     );
+                    // Issue #430 Phase D: pause footer redraw for the whole
+                    // tool dispatch (progress println, spinner, child-process
+                    // fd-inheriting exec, optional approve prompt). The guard
+                    // drops at the end of this iteration so the worker resumes
+                    // before the next loop tick.
+                    let _footer_freeze = self.footer.freeze_for_inference();
                     let progress = format_progress_line(
                         &tool_name,
                         &tool_call.arguments,
@@ -378,6 +388,11 @@ impl Agent {
         &mut self,
         stream_output: bool,
     ) -> Result<AssistantReply, String> {
+        // Issue #430 Phase D: freeze the footer for the entire LLM call (the
+        // thinking spinner writes to stderr, but stream chunks land on stdout
+        // and would otherwise race the footer rewrite). Guard drops on
+        // function exit alongside the spinner, restoring redraws.
+        let _footer_freeze = self.footer.freeze_for_inference();
         // Start spinner once at function entry; retries share the same
         // animation (no flicker between attempts). Dropped automatically on
         // function exit (Ok / Err / early-return), clearing the line.

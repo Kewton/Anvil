@@ -37,6 +37,9 @@ pub struct CliArgs {
     pub fresh_session: bool,
     #[arg(long = "oneshot")]
     pub oneshot: bool,
+    /// Disable the fixed footer status bar (mode / token usage / log level).
+    #[arg(long = "no-footer")]
+    pub no_footer: bool,
     /// Resume the most recent workspace session (`--resume`) or a specific
     /// session id (`--resume <ID>`). The empty string sentinel (produced by
     /// clap's `default_missing_value`) means "latest workspace session".
@@ -168,6 +171,7 @@ mod tests {
             yes: false,
             fresh_session: false,
             oneshot: false,
+            no_footer: false,
             resume: None,
             cwd: None,
             state_dir: None,
@@ -215,6 +219,17 @@ mod tests {
             ResumeRequest::from_flag(Some("abc".into())),
             ResumeRequest::WithId("abc".into())
         );
+    }
+
+    #[test]
+    fn no_footer_flag_defaults_false_and_parses_as_true() {
+        // Default: not set
+        let args = base_args();
+        assert!(!args.no_footer);
+
+        // CliArgs::parse_from to verify clap binding (AC14: --help carries the flag).
+        let parsed = CliArgs::parse_from(["anvil", "--no-footer"]);
+        assert!(parsed.no_footer);
     }
 
     #[test]

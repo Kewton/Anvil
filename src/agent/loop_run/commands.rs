@@ -367,6 +367,12 @@ impl Agent {
         use rustyline::error::ReadlineError;
 
         loop {
+            // Issue #430 Phase D: pause footer redraw for the rustyline
+            // prompt. The footer line stays painted (DR1-006 #6: maintain
+            // DECSTBM), only the daemon worker stops re-emitting ANSI so
+            // rustyline owns stdout / cursor positioning. Guard drops once
+            // readline returns and the worker resumes within the next tick.
+            let _footer_freeze = self.footer.freeze_for_prompt();
             match editor.readline("anvil> ") {
                 Ok(line) => {
                     let trimmed = line.trim();
@@ -487,12 +493,24 @@ impl Agent {
             )))),
             "/yes" => {
                 self.config.yes_mode = true;
+                // Issue #430: republish flags so the footer reflects the new
+                // yes-mode bit on the next render tick.
+                self.footer.publish_flags(
+                    self.session.mode_state.mode,
+                    self.config.log_level,
+                    self.config.yes_mode,
+                );
                 Ok(AgentEvent::Continue(Some(
                     "auto-approve enabled".to_string(),
                 )))
             }
             "/no" => {
                 self.config.yes_mode = false;
+                self.footer.publish_flags(
+                    self.session.mode_state.mode,
+                    self.config.log_level,
+                    self.config.yes_mode,
+                );
                 Ok(AgentEvent::Continue(Some(
                     "auto-approve disabled".to_string(),
                 )))
@@ -519,6 +537,12 @@ impl Agent {
                     "[Plan Mode] Explore with Read, Glob, and Grep. Write the plan to {}. Wait for /approve before making code changes.",
                     plan_path.display()
                 ));
+                // Republish flags after entering plan mode (issue #430).
+                self.footer.publish_flags(
+                    self.session.mode_state.mode,
+                    self.config.log_level,
+                    self.config.yes_mode,
+                );
                 Ok(AgentEvent::Continue(Some(format!(
                     "plan mode: {}",
                     plan_path.display()
@@ -539,6 +563,12 @@ impl Agent {
                     "[Act Mode] Implement the following plan step by step.\n\n{}",
                     plan_contents
                 ));
+                // Republish flags after switching to act mode (issue #430).
+                self.footer.publish_flags(
+                    self.session.mode_state.mode,
+                    self.config.log_level,
+                    self.config.yes_mode,
+                );
                 Ok(AgentEvent::Continue(Some("act mode".to_string())))
             }
             "/compact" => {

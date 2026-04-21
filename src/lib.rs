@@ -14,6 +14,7 @@ use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 
 use agent::Agent;
+use agent::loop_run::FooterLease;
 use agent::loop_run::commands::{
     print_startup_banner, print_startup_banner_stderr_oneshot, short_id,
 };
@@ -142,7 +143,26 @@ pub fn run_cli(args: CliArgs) -> Result<(), String> {
         None
     };
 
-    let mut agent = Agent::new(config, models, client, session_store, session);
+    // Acquire the fixed-footer lease before constructing `Agent` so the
+    // handle can be plumbed into the agent. Phase A: `acquire` always
+    // returns a disabled handle (cargo non-TTY harness short-circuits and
+    // the install path is itself still skeleton-only), so the lease is
+    // safe to take on every non-sessions path. AC9's strict zero-acquire
+    // for the oneshot path lands in Phase C alongside the real worker
+    // install (issue #430). The lease drops at the end of `run_cli`.
+    // `_footer_lease` (underscore-prefixed but NOT bare `_`) keeps the lease
+    // alive for the full `run_cli` scope; bare `_` would drop immediately.
+    let _footer_lease = FooterLease::acquire(&config);
+    let footer_handle = _footer_lease.handle_clone();
+
+    let mut agent = Agent::new(
+        config,
+        models,
+        client,
+        session_store,
+        session,
+        footer_handle,
+    );
 
     // Banner: REPL / resume get stdout; oneshot gets stderr so stdout stays
     // clean for script consumers.
