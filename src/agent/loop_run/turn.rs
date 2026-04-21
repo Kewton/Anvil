@@ -127,6 +127,10 @@ impl Agent {
             last_iter = iter_count + 1;
             let approx_tokens = approximate_token_count(&self.session.messages);
             tracing::debug!(iter = iter_count, tokens = approx_tokens, "iter");
+            // Publish per-turn token count to the footer (issue #430, AC12).
+            // Reuses the value we just computed — O(1), no second walk over
+            // `messages`. No-op when the footer handle is disabled.
+            self.footer.publish_tokens(approx_tokens);
 
             // Boundary 1: before requesting the next assistant reply. Lets us
             // bail out between iterations without starting a fresh LLM call.
