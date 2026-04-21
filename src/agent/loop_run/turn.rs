@@ -454,6 +454,23 @@ impl Agent {
 
         if stream_output {
             let mut first_chunk = true;
+            // Issue #431: resolve renderer behavior at call-site (env /
+            // is_terminal) and wire it as the terminal stage of the display
+            // pipeline. Session storage still receives `reply.content` raw.
+            let markdown_disabled = crate::tui::markdown::markdown_fully_disabled();
+            let color = crate::tui::markdown::color_enabled_for_markdown();
+            let utf8 = crate::tui::markdown::markdown_unicode_enabled();
+            tracing::debug!(
+                disabled = markdown_disabled,
+                color,
+                utf8,
+                "markdown renderer state for this stream"
+            );
+            let mut renderer = if markdown_disabled {
+                None
+            } else {
+                Some(crate::tui::markdown::MarkdownRenderer::new(color, utf8))
+            };
             let reply = self.client.chat_streaming_with_mode(
                 &self.models.main,
                 &messages,
@@ -470,10 +487,25 @@ impl Agent {
                         print!("assistant> ");
                         first_chunk = false;
                     }
-                    print!("{chunk}");
+                    if let Some(r) = renderer.as_mut() {
+                        let out = r.push_chunk(chunk);
+                        if !out.is_empty() {
+                            let _ = io::stdout().write_all(out.as_bytes());
+                        }
+                    } else {
+                        print!("{chunk}");
+                    }
                     let _ = io::stdout().flush();
                 },
             )?;
+            // Drain any residual buffered content before the closing newline.
+            if let Some(r) = renderer.as_mut() {
+                let tail = r.flush();
+                if !tail.is_empty() {
+                    let _ = io::stdout().write_all(tail.as_bytes());
+                    let _ = io::stdout().flush();
+                }
+            }
             if !first_chunk {
                 println!();
             }
@@ -557,7 +589,7 @@ impl Agent {
 
 /// Returns true when the environment requests that color output be suppressed
 /// (https://no-color.org/): `NO_COLOR` is set to any non-empty value.
-pub(super) fn no_color_requested() -> bool {
+pub(crate) fn no_color_requested() -> bool {
     std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty())
 }
 
@@ -568,7 +600,7 @@ fn is_utf8_locale(lang: &str) -> bool {
         .any(|t| t == "utf-8" || t == "utf8")
 }
 
-fn unicode_supported() -> bool {
+pub(crate) fn unicode_supported() -> bool {
     if std::env::var_os("ANVIL_NO_EMOJI").is_some_and(|v| !v.is_empty()) {
         return false;
     }

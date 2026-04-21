@@ -116,3 +116,46 @@ fn summarize_messages(messages: &[ConversationMessage]) -> String {
         lines.join("\n")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// AC14: `summarize_messages` produces summaries without ANSI escapes. The
+    /// input is pre-render raw text, but the output goes back into the LLM so
+    /// we defensively assert the lack of `\x1b[`. Uses only ANSI-free content
+    /// — summarize_messages is synchronous and does not call the network.
+    #[test]
+    fn summarize_messages_output_has_no_ansi() {
+        let messages = vec![
+            ConversationMessage::user("plain user text".to_string()),
+            ConversationMessage::assistant(
+                "# heading\n\nSome **bold** text and `code`.".to_string(),
+                Vec::new(),
+            ),
+            ConversationMessage::tool("Read".to_string(), "file contents".to_string()),
+        ];
+        let summary = summarize_messages(&messages);
+        assert!(
+            !summary.contains("\x1b["),
+            "ANSI escape leaked into summary: {summary:?}"
+        );
+    }
+
+    /// AC14: `render_messages_for_summary` produces ANSI-free output.
+    #[test]
+    fn render_messages_for_summary_output_has_no_ansi() {
+        let messages = vec![
+            ConversationMessage::user("plain user text".to_string()),
+            ConversationMessage::assistant(
+                "# heading\n\n`code here` and **bold**".to_string(),
+                Vec::new(),
+            ),
+        ];
+        let rendered = render_messages_for_summary(&messages, 2_000);
+        assert!(
+            !rendered.contains("\x1b["),
+            "ANSI escape leaked into rendered summary: {rendered:?}"
+        );
+    }
+}

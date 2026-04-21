@@ -434,7 +434,31 @@ impl Agent {
             match self.handle_user_message(input, stream_output) {
                 Ok((prose, stats)) => {
                     if !stream_output {
-                        println!("{prose}");
+                        // Issue #431: non-streaming assistant prose also goes
+                        // through the markdown renderer. `prose` here is the
+                        // raw LLM text (session has already stored this raw
+                        // content in `run_actor_loop`). Feed the raw text
+                        // directly into a one-shot renderer — its own
+                        // `<think>`-stripping matches the streaming path and
+                        // does not trim leading/trailing whitespace (unlike
+                        // `xml_fallback::strip_think_tags`). Skip entirely
+                        // when `ANVIL_NO_MARKDOWN` disables markdown.
+                        if crate::tui::markdown::markdown_fully_disabled() {
+                            println!("{prose}");
+                        } else {
+                            let color = crate::tui::markdown::color_enabled_for_markdown();
+                            let utf8 = crate::tui::markdown::markdown_unicode_enabled();
+                            let mut r = crate::tui::markdown::MarkdownRenderer::new(color, utf8);
+                            let mut body = r.push_chunk(&prose);
+                            body.push_str(&r.flush());
+                            // Preserve the trailing newline that `println!`
+                            // used to add.
+                            if !body.ends_with('\n') {
+                                body.push('\n');
+                            }
+                            let _ = std::io::stdout().write_all(body.as_bytes());
+                            let _ = std::io::stdout().flush();
+                        }
                     }
                     let summary = format_run_summary(ExitReason::Done, &stats);
                     println!();

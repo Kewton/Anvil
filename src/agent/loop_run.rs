@@ -33,6 +33,11 @@ mod turn;
 // `Agent::new` and own the matching `FooterLease` for its scope (issue #430).
 pub use footer::{FooterHandle, FooterLease};
 
+// Re-export env helpers from `turn` so `src/tui/markdown.rs` can reuse the
+// existing POSIX-compliant NO_COLOR and UTF-8 locale logic without duplicating
+// it. `mod turn;` itself stays private; only these two fns leak out (issue #431).
+pub(crate) use turn::{no_color_requested, unicode_supported};
+
 const DEFAULT_KEEP_TAIL: usize = 24;
 const LATE_TURN_KEEP_TAIL: usize = 12;
 
