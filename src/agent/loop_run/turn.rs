@@ -78,6 +78,7 @@ impl Agent {
         restart_convergence_mode: bool,
     ) -> LoopResult {
         let use_color = io::stdout().is_terminal() && !no_color_requested();
+        let use_unicode = unicode_supported();
         let start = Instant::now();
         let mut before_snapshot = capture_repo_snapshot(&self.work_root);
         let mut accumulated: Vec<RepoVerification> = Vec::new();
@@ -148,6 +149,7 @@ impl Agent {
                         self.config.max_iterations,
                         &self.work_root,
                         use_color,
+                        use_unicode,
                     );
                     println!("{progress}");
                     let _ = io::stdout().flush();
@@ -448,6 +450,27 @@ fn no_color_requested() -> bool {
     std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty())
 }
 
+fn is_utf8_locale(lang: &str) -> bool {
+    let lower = lang.to_ascii_lowercase();
+    lower
+        .split(['.', '_', '@', ';', ',', ' '])
+        .any(|t| t == "utf-8" || t == "utf8")
+}
+
+fn unicode_supported() -> bool {
+    if std::env::var_os("ANVIL_NO_EMOJI").is_some_and(|v| !v.is_empty()) {
+        return false;
+    }
+    for key in ["LC_ALL", "LC_CTYPE", "LANG"] {
+        if let Ok(v) = std::env::var(key)
+            && is_utf8_locale(&v)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Replace C0 control characters and DEL with spaces, then trim trailing
 /// whitespace. Required for model-derived text so that newlines or ANSI escape
 /// sequences cannot be injected into the terminal.
@@ -463,21 +486,29 @@ fn sanitize_for_progress(s: &str) -> String {
     out.trim_end().to_string()
 }
 
-const COLOR_GREEN: &str = "\x1b[32m";
-const COLOR_CYAN: &str = "\x1b[36m";
-const COLOR_YELLOW: &str = "\x1b[33m";
-const COLOR_MAGENTA: &str = "\x1b[35m";
-const COLOR_BLUE: &str = "\x1b[34m";
 const COLOR_RESET: &str = "\x1b[0m";
 
 fn tool_color(tool_name: &str) -> &'static str {
     match tool_name {
-        "Write" => COLOR_GREEN,
-        "Read" => COLOR_CYAN,
-        "Edit" => COLOR_YELLOW,
-        "Bash" => COLOR_MAGENTA,
-        "Glob" | "Grep" => COLOR_BLUE,
-        _ => "",
+        "Write" => "\x1b[38;5;198m",
+        "Read" => "\x1b[38;5;87m",
+        "Edit" => "\x1b[38;5;208m",
+        "Bash" => "\x1b[38;5;226m",
+        "Glob" => "\x1b[38;5;51m",
+        "Grep" => "\x1b[38;5;39m",
+        _ => "\x1b[38;5;245m",
+    }
+}
+
+fn tool_emoji(tool_name: &str) -> &'static str {
+    match tool_name {
+        "Write" => "✏️",
+        "Read" => "📄",
+        "Edit" => "📝",
+        "Bash" => "⚡",
+        "Glob" => "🔍",
+        "Grep" => "🔎",
+        _ => "🔧",
     }
 }
 
@@ -532,7 +563,8 @@ fn tool_display(
 }
 
 /// Format a single-line per-iteration progress line. ANSI color is only
-/// applied to the tool name when `use_color` is true.
+/// applied to the tool name when `use_color` is true, and emoji is prepended
+/// when `use_unicode` is true.
 pub(super) fn format_progress_line(
     tool_name: &str,
     arguments: &serde_json::Value,
@@ -540,13 +572,20 @@ pub(super) fn format_progress_line(
     max_iterations: usize,
     work_root: &std::path::Path,
     use_color: bool,
+    use_unicode: bool,
 ) -> String {
     let (display_str, extra) = tool_display(tool_name, arguments, work_root);
     // Sanitize before painting so an adversarial tool_name cannot inject escapes.
+    // emoji は &'static str ハードコードなので再 sanitize は不要。
     let safe_tool_name = sanitize_for_progress(tool_name);
-    let painted_tool = paint(&safe_tool_name, tool_color(tool_name), use_color);
+    let label = if use_unicode {
+        format!("{} {}", tool_emoji(tool_name), safe_tool_name)
+    } else {
+        safe_tool_name
+    };
+    let painted = paint(&label, tool_color(tool_name), use_color);
     let extra_part = extra.map(|e| format!(" ({e})")).unwrap_or_default();
-    format!("[iter {iter_human}/{max_iterations}]  {painted_tool}  {display_str}{extra_part}")
+    format!("[iter {iter_human}/{max_iterations}]  {painted}  {display_str}{extra_part}")
 }
 
 #[cfg(test)]
@@ -573,9 +612,15 @@ mod truncate_tests {
 
 #[cfg(test)]
 mod progress_tests {
-    use super::{format_progress_line, sanitize_for_progress, tool_display};
+    use super::{
+        format_progress_line, is_utf8_locale, sanitize_for_progress, tool_color, tool_display,
+        tool_emoji, unicode_supported,
+    };
     use serde_json::json;
     use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    static ENV_GUARD: Mutex<()> = Mutex::new(());
 
     #[test]
     fn sanitize_removes_newline() {
@@ -649,7 +694,7 @@ mod progress_tests {
     fn progress_line_iter_1indexed() {
         let work_root = PathBuf::from("/work");
         let args = json!({"path": "/work/a.txt", "content": "x"});
-        let line = format_progress_line("Write", &args, 1, 12, &work_root, false);
+        let line = format_progress_line("Write", &args, 1, 12, &work_root, false, false);
         assert!(line.starts_with("[iter 1/12]"));
     }
 
@@ -657,7 +702,7 @@ mod progress_tests {
     fn progress_line_no_color_no_escape() {
         let work_root = PathBuf::from("/work");
         let args = json!({"command": "ls"});
-        let line = format_progress_line("Bash", &args, 1, 12, &work_root, false);
+        let line = format_progress_line("Bash", &args, 1, 12, &work_root, false, false);
         assert!(!line.contains('\x1b'));
     }
 
@@ -665,7 +710,127 @@ mod progress_tests {
     fn progress_line_color_prefix_invariant() {
         let work_root = PathBuf::from("/work");
         let args = json!({"command": "ls"});
-        let line = format_progress_line("Bash", &args, 1, 12, &work_root, true);
+        let line = format_progress_line("Bash", &args, 1, 12, &work_root, true, false);
         assert!(line.starts_with("[iter "));
+    }
+
+    #[test]
+    fn tool_style_all_mappings() {
+        let cases: &[(&str, &str, &str)] = &[
+            ("Write", "\x1b[38;5;198m", "✏\u{fe0f}"),
+            ("Read", "\x1b[38;5;87m", "📄"),
+            ("Edit", "\x1b[38;5;208m", "📝"),
+            ("Bash", "\x1b[38;5;226m", "⚡"),
+            ("Glob", "\x1b[38;5;51m", "🔍"),
+            ("Grep", "\x1b[38;5;39m", "🔎"),
+            ("Unknown", "\x1b[38;5;245m", "🔧"),
+        ];
+        for (name, expected_color, expected_emoji) in cases {
+            assert_eq!(tool_color(name), *expected_color, "color for {name}");
+            assert_eq!(tool_emoji(name), *expected_emoji, "emoji for {name}");
+        }
+    }
+
+    #[test]
+    fn progress_line_emoji_and_color_for_bash() {
+        let work_root = PathBuf::from("/work");
+        let args = json!({"command": "ls"});
+        let line = format_progress_line("Bash", &args, 1, 12, &work_root, true, true);
+        let color_idx = line.find("\x1b[38;5;226m").expect("color present");
+        let emoji_idx = line.find('⚡').expect("emoji present");
+        let reset_idx = line.find("\x1b[0m").expect("reset present");
+        assert!(color_idx < emoji_idx, "color before emoji");
+        assert!(emoji_idx < reset_idx, "emoji before reset");
+    }
+
+    #[test]
+    fn progress_line_no_color_but_unicode_emits_emoji() {
+        let work_root = PathBuf::from("/work");
+        let args = json!({"command": "ls"});
+        let line = format_progress_line("Bash", &args, 1, 12, &work_root, false, true);
+        assert!(line.contains('⚡'));
+        assert!(!line.contains('\x1b'));
+    }
+
+    #[test]
+    fn progress_line_unicode_off_no_emoji() {
+        let work_root = PathBuf::from("/work");
+        let args = json!({"command": "ls"});
+        let line = format_progress_line("Bash", &args, 1, 12, &work_root, true, false);
+        assert!(!line.contains('⚡'));
+    }
+
+    #[test]
+    fn is_utf8_locale_table() {
+        let true_cases = [
+            "en_US.UTF-8",
+            "en_US.utf-8",
+            "C.UTF8",
+            "C.utf8",
+            "ja_JP.UTF-8@Modifier",
+            "en_US.UTF-8;POSIX",
+        ];
+        let false_cases = [
+            "",
+            "C",
+            "POSIX",
+            "en_US.utf-800",
+            "xutf8x",
+            "utf-88",
+            "en_US.ISO-8859-1",
+        ];
+        for c in true_cases {
+            assert!(is_utf8_locale(c), "expected true for {c:?}");
+        }
+        for c in false_cases {
+            assert!(!is_utf8_locale(c), "expected false for {c:?}");
+        }
+    }
+
+    fn set_or_remove(key: &str, value: Option<&str>) {
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    fn snapshot_and_clear(keys: &[&str]) -> Vec<(String, Option<String>)> {
+        keys.iter()
+            .map(|k| {
+                let prior = std::env::var(k).ok();
+                unsafe {
+                    std::env::remove_var(k);
+                }
+                ((*k).to_string(), prior)
+            })
+            .collect()
+    }
+
+    fn restore(snapshot: Vec<(String, Option<String>)>) {
+        for (k, v) in snapshot {
+            set_or_remove(&k, v.as_deref());
+        }
+    }
+
+    #[test]
+    fn unicode_supported_respects_anvil_no_emoji() {
+        let _g = ENV_GUARD.lock().unwrap();
+        let keys = ["ANVIL_NO_EMOJI", "LC_ALL", "LC_CTYPE", "LANG"];
+        let snap = snapshot_and_clear(&keys);
+        set_or_remove("LANG", Some("en_US.UTF-8"));
+        set_or_remove("ANVIL_NO_EMOJI", Some("1"));
+        assert!(!unicode_supported());
+        restore(snap);
+    }
+
+    #[test]
+    fn unicode_supported_empty_env_returns_false() {
+        let _g = ENV_GUARD.lock().unwrap();
+        let keys = ["ANVIL_NO_EMOJI", "LC_ALL", "LC_CTYPE", "LANG"];
+        let snap = snapshot_and_clear(&keys);
+        assert!(!unicode_supported());
+        restore(snap);
     }
 }
