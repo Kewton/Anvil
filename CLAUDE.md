@@ -17,6 +17,8 @@
   - `<think>` 除去と XML tool call 回収
 - `src/tools/*`
   - built-in tools
+- `src/agent/loop_run/spinner.rs`
+  - 推論 / ツール実行中のスピナー（stderr, 80ms, TTY / `NO_COLOR` / `ANVIL_NO_SPINNER` / UTF-8 分岐）
 - `src/modes/plan_act.rs`
   - Plan / Act の単純な状態
 - `src/session/*`
