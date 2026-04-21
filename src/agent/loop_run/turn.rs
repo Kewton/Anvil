@@ -186,6 +186,12 @@ impl Agent {
                         args = %truncate(&args_str, LOG_ARGS_MAX_CHARS),
                         "tool call"
                     );
+                    // Issue #430 Phase D: pause footer redraw for the whole
+                    // tool dispatch (progress println, spinner, child-process
+                    // fd-inheriting exec, optional approve prompt). The guard
+                    // drops at the end of this iteration so the worker resumes
+                    // before the next loop tick.
+                    let _footer_freeze = self.footer.freeze_for_inference();
                     let progress = format_progress_line(
                         &tool_name,
                         &tool_call.arguments,
@@ -382,6 +388,11 @@ impl Agent {
         &mut self,
         stream_output: bool,
     ) -> Result<AssistantReply, String> {
+        // Issue #430 Phase D: freeze the footer for the entire LLM call (the
+        // thinking spinner writes to stderr, but stream chunks land on stdout
+        // and would otherwise race the footer rewrite). Guard drops on
+        // function exit alongside the spinner, restoring redraws.
+        let _footer_freeze = self.footer.freeze_for_inference();
         // Start spinner once at function entry; retries share the same
         // animation (no flicker between attempts). Dropped automatically on
         // function exit (Ok / Err / early-return), clearing the line.

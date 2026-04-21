@@ -142,6 +142,11 @@ pub(super) struct FooterStateInner {
     pub flags: Mutex<FooterFlags>,
     pub freeze: AtomicBool,
     pub self_disabled: AtomicBool,
+    /// Wake `Condvar` shared with the daemon worker. `freeze_for_inference` /
+    /// `freeze_for_prompt` flip `freeze` and `notify_all()` here so the worker
+    /// observes the change immediately instead of waiting for the next 200ms
+    /// tick. The `Drop` of `FooterLease` and `FreezeGuard` also notify here.
+    pub wake: (Mutex<()>, Condvar),
 }
 
 impl FooterStateInner {
@@ -152,6 +157,7 @@ impl FooterStateInner {
             flags: Mutex::new(flags),
             freeze: AtomicBool::new(false),
             self_disabled: AtomicBool::new(false),
+            wake: (Mutex::new(()), Condvar::new()),
         })
     }
 
@@ -357,10 +363,8 @@ type PanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send + 'sta
 /// it here also gives the future `freeze_for_inference` (Phase D) a place to
 /// reach the state without going through the handle.
 struct Active {
-    #[allow(dead_code)]
     state: Arc<FooterStateInner>,
     stop: Arc<AtomicBool>,
-    wake: Arc<(Mutex<()>, Condvar)>,
     worker: Option<JoinHandle<()>>,
     /// Saved previous panic hook so we can restore it on Drop. `Some` after
     /// install; `None` after Drop has consumed it (or if install was skipped).
@@ -409,10 +413,13 @@ pub struct FooterHandle {
 }
 
 /// RAII guard returned by `freeze_for_inference` / `freeze_for_prompt`. Drop
-/// re-enables footer rendering. Phase C carries no state beyond the `enabled`
-/// echo because Phase D installs the actual Condvar wake.
+/// re-enables footer rendering by clearing the `freeze` flag and notifying the
+/// daemon worker via the wake `Condvar` carried inside `FooterStateInner`.
+/// `state` is `Some` only when the originating handle was wired to a live
+/// `FooterStateInner` (i.e. `acquire` succeeded); disabled handles produce a
+/// guard with `state == None` so Drop is a no-op.
 pub struct FreezeGuard {
-    _enabled: bool,
+    state: Option<Arc<FooterStateInner>>,
 }
 
 impl FooterLease {
@@ -563,9 +570,10 @@ fn install_active(
     bit_guard: LeaseBitGuard,
 ) -> Result<FooterLease, ()> {
     // 1. Build the shared state and synchronisation primitives up front.
+    //    The wake `Condvar` lives inside `FooterStateInner` (Phase D) so
+    //    `FreezeGuard::Drop` can wake the worker through the handle.
     let state = FooterStateInner::new(budget, initial_flags);
     let stop = Arc::new(AtomicBool::new(false));
-    let wake: Arc<(Mutex<()>, Condvar)> = Arc::new((Mutex::new(()), Condvar::new()));
     let writer = Arc::new(Mutex::new(writer));
 
     // 2. Set DECSTBM (Task C.4). Failure → release bit and disable.
@@ -608,7 +616,6 @@ fn install_active(
     // 4. Spawn the worker thread (Task C.3).
     let state_for_thread = state.clone();
     let stop_for_thread = stop.clone();
-    let wake_for_thread = wake.clone();
     let writer_for_thread = writer.clone();
     let spawn_result = thread::Builder::new()
         .name("anvil-footer".into())
@@ -617,12 +624,7 @@ fn install_active(
             // the process; the panic hook chain still fires before this
             // catch unwinds. Same shape as spinner.rs / interrupt.rs.
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                render_loop(
-                    state_for_thread,
-                    stop_for_thread.clone(),
-                    wake_for_thread,
-                    writer_for_thread,
-                );
+                render_loop(state_for_thread, stop_for_thread.clone(), writer_for_thread);
             }));
             stop_for_thread.store(true, Ordering::SeqCst);
         });
@@ -655,7 +657,6 @@ fn install_active(
         inner: Some(Active {
             state,
             stop,
-            wake,
             worker: Some(worker),
             prev_panic_hook: Some(prev_arc),
             decstbm_rows: rows,
@@ -718,10 +719,11 @@ impl Drop for FooterLease {
         // hook → release lease bit. This mirrors the install order in reverse
         // and matches the design (§3 Drop comment).
         if let Some(mut active) = self.inner.take() {
-            // 1. Signal stop and wake the worker.
+            // 1. Signal stop and wake the worker via the shared state's wake
+            //    Condvar (Phase D consolidates wake into FooterStateInner).
             active.stop.store(true, Ordering::SeqCst);
             {
-                let (lock, cvar) = &*active.wake;
+                let (lock, cvar) = &active.state.wake;
                 let _g = lock.lock().unwrap_or_else(|p| p.into_inner());
                 cvar.notify_all();
             }
@@ -799,19 +801,39 @@ impl FooterHandle {
     }
 
     /// Pause the footer worker for an inference / tool stdout-emitting block.
-    /// Returns an RAII guard that thaws on drop. Phase C: still a no-op
-    /// because the Condvar wake lands in Phase D.
+    /// Flips the shared `freeze` flag and notifies the daemon worker so it
+    /// stops re-rendering until the returned `FreezeGuard` drops.
+    ///
+    /// LIFO nesting is **not** supported (DR1-003): the design guarantees by
+    /// construction that a freeze region never overlaps with another freeze
+    /// region from the same handle, so a plain `AtomicBool` is sufficient. The
+    /// guard's `Drop` always clears `freeze` regardless of nesting depth.
     pub fn freeze_for_inference(&self) -> FreezeGuard {
-        FreezeGuard {
-            _enabled: self.enabled,
-        }
+        self.freeze_inner()
     }
 
-    /// Pause the footer worker for a rustyline prompt. Returns an RAII guard
-    /// that thaws on drop. Phase C: still a no-op (see `freeze_for_inference`).
+    /// Pause the footer worker for a rustyline prompt. Same implementation as
+    /// `freeze_for_inference`; the two function names exist so call-sites
+    /// document intent (DR1-003).
     pub fn freeze_for_prompt(&self) -> FreezeGuard {
+        self.freeze_inner()
+    }
+
+    /// Shared body for `freeze_for_inference` / `freeze_for_prompt`. Disabled
+    /// handles (no attached state) produce a guard whose `Drop` is a no-op.
+    fn freeze_inner(&self) -> FreezeGuard {
+        let Some(state) = &self.state else {
+            return FreezeGuard { state: None };
+        };
+        state.freeze.store(true, Ordering::SeqCst);
+        let (lock, cvar) = &state.wake;
+        // Take the wake lock briefly so the worker — which holds it across
+        // `wait_timeout` — is guaranteed to observe the freeze flag flip on
+        // its next loop iteration. Recover from poisoning per fail-open.
+        let _g = lock.lock().unwrap_or_else(|p| p.into_inner());
+        cvar.notify_all();
         FreezeGuard {
-            _enabled: self.enabled,
+            state: Some(state.clone()),
         }
     }
 
@@ -837,8 +859,17 @@ impl FooterHandle {
 
 impl Drop for FreezeGuard {
     fn drop(&mut self) {
-        // Phase C: nothing to thaw. Phase D will signal the worker via
-        // Condvar here.
+        // Phase D: clear `freeze` and notify the worker so the next render
+        // tick fires immediately. No-op when the originating handle was
+        // disabled (state == None). Recover from poison so a panicked
+        // peer thread cannot leak a stuck freeze (fail-open per AC17).
+        let Some(state) = self.state.take() else {
+            return;
+        };
+        state.freeze.store(false, Ordering::SeqCst);
+        let (lock, cvar) = &state.wake;
+        let _g = lock.lock().unwrap_or_else(|p| p.into_inner());
+        cvar.notify_all();
     }
 }
 
@@ -857,10 +888,9 @@ impl Drop for FreezeGuard {
 fn render_loop(
     state: Arc<FooterStateInner>,
     stop: Arc<AtomicBool>,
-    wake: Arc<(Mutex<()>, Condvar)>,
     writer: Arc<Mutex<FooterWriter>>,
 ) {
-    let (lock, cvar) = &*wake;
+    let (lock, cvar) = &state.wake;
     // Cache the previous size so we only re-emit DECSTBM when the row count
     // changes (AC3). Initialise from a fresh probe so the first tick already
     // has a baseline.
@@ -1494,19 +1524,17 @@ mod tests {
             Arc::new(Mutex::new(Box::new(CaptureWriter::new(buf.clone()))));
         let state = FooterStateInner::new(24_000, FooterFlags::default());
         let stop = Arc::new(AtomicBool::new(false));
-        let wake: Arc<(Mutex<()>, Condvar)> = Arc::new((Mutex::new(()), Condvar::new()));
 
         let state_t = state.clone();
         let stop_t = stop.clone();
-        let wake_t = wake.clone();
         let writer_t = writer.clone();
         let handle = thread::spawn(move || {
-            render_loop(state_t, stop_t, wake_t, writer_t);
+            render_loop(state_t, stop_t, writer_t);
         });
         // Let it tick at least once.
         std::thread::sleep(Duration::from_millis(50));
         stop.store(true, Ordering::SeqCst);
-        let (lock, cvar) = &*wake;
+        let (lock, cvar) = &state.wake;
         {
             let _g = lock.lock().unwrap();
             cvar.notify_all();
@@ -1531,18 +1559,16 @@ mod tests {
         // Pre-set self_disabled before the worker starts.
         state.self_disabled.store(true, Ordering::SeqCst);
         let stop = Arc::new(AtomicBool::new(false));
-        let wake: Arc<(Mutex<()>, Condvar)> = Arc::new((Mutex::new(()), Condvar::new()));
 
         let state_t = state.clone();
         let stop_t = stop.clone();
-        let wake_t = wake.clone();
         let writer_t = writer.clone();
         let handle = thread::spawn(move || {
-            render_loop(state_t, stop_t, wake_t, writer_t);
+            render_loop(state_t, stop_t, writer_t);
         });
         std::thread::sleep(Duration::from_millis(80));
         stop.store(true, Ordering::SeqCst);
-        let (lock, cvar) = &*wake;
+        let (lock, cvar) = &state.wake;
         {
             let _g = lock.lock().unwrap();
             cvar.notify_all();
@@ -1591,5 +1617,96 @@ mod tests {
         // tests' panic output.
         let _restored_test_hook = std::panic::take_hook();
         std::panic::set_hook(original);
+    }
+
+    // ===== Phase D: FreezeGuard rendezvous (Task D.1) ======================
+
+    /// Task D.1 (Red→Green): `freeze_for_inference` flips `state.freeze`
+    /// so the worker stops re-rendering. The flag stays set as long as the
+    /// returned guard is alive, even across publish_tokens calls.
+    #[test]
+    fn freeze_guard_blocks_writes_until_drop() {
+        let _g = PhaseCTestGuard::acquire();
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let lease = FooterLease::acquire_for_test(24, Box::new(CaptureWriter::new(buf.clone())));
+        assert!(lease.handle_clone().is_enabled());
+        let handle = lease.handle_clone();
+        let state = handle
+            .state()
+            .expect("enabled handle must carry state")
+            .clone();
+
+        // Take freeze guard. Worker must stop re-rendering.
+        let guard = handle.freeze_for_inference();
+        assert!(
+            state.freeze.load(Ordering::SeqCst),
+            "freeze flag must be set while guard is alive"
+        );
+
+        // Snapshot current capture length, wait > 1 tick, assert no growth
+        // attributable to a frozen worker writing footer ANSI. The capture
+        // may already contain DECSTBM + at most one race-window render from
+        // before freeze landed; after that nothing new should appear.
+        let len_after_freeze = buf.lock().unwrap().len();
+        std::thread::sleep(Duration::from_millis(TICK.as_millis() as u64 * 2 + 50));
+        let len_after_wait = buf.lock().unwrap().len();
+        assert_eq!(
+            len_after_wait, len_after_freeze,
+            "no further footer writes should occur while freeze guard is alive"
+        );
+
+        drop(guard);
+        // Guard drop clears freeze.
+        assert!(
+            !state.freeze.load(Ordering::SeqCst),
+            "freeze flag must be cleared once guard is dropped"
+        );
+        drop(lease);
+    }
+
+    /// Task D.1 (Red→Green): dropping the guard wakes the worker so the
+    /// next render fires within the tick window without further publishes.
+    #[test]
+    fn freeze_guard_drop_resumes_render() {
+        let _g = PhaseCTestGuard::acquire();
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let lease = FooterLease::acquire_for_test(24, Box::new(CaptureWriter::new(buf.clone())));
+        assert!(lease.handle_clone().is_enabled());
+        let handle = lease.handle_clone();
+        let state = handle
+            .state()
+            .expect("enabled handle must carry state")
+            .clone();
+
+        // Freeze, then drop, then assert the worker resumed by observing
+        // a footer line write within ~2 ticks. Drop publishes a fresh token
+        // value first so the resumed render produces fresh bytes (not an
+        // exact duplicate of any pre-freeze snapshot).
+        let guard = handle.freeze_for_inference();
+        assert!(state.freeze.load(Ordering::SeqCst));
+        drop(guard);
+        // Publish a distinctive value the worker will format into the line.
+        handle.publish_tokens(7_777);
+
+        // Wake-on-drop should be observed within one TICK. Allow generous
+        // slack for slow CI.
+        let deadline = std::time::Instant::now() + Duration::from_millis(800);
+        let mut saw_token = false;
+        while std::time::Instant::now() < deadline {
+            let captured = buf.lock().unwrap().clone();
+            let s = String::from_utf8_lossy(&captured);
+            // 7777 → "7.7k" by `format_token_count`.
+            if s.contains("7.7k") {
+                saw_token = true;
+                break;
+            }
+            drop(captured);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            saw_token,
+            "worker must resume rendering after FreezeGuard drop"
+        );
+        drop(lease);
     }
 }

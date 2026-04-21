@@ -367,6 +367,12 @@ impl Agent {
         use rustyline::error::ReadlineError;
 
         loop {
+            // Issue #430 Phase D: pause footer redraw for the rustyline
+            // prompt. The footer line stays painted (DR1-006 #6: maintain
+            // DECSTBM), only the daemon worker stops re-emitting ANSI so
+            // rustyline owns stdout / cursor positioning. Guard drops once
+            // readline returns and the worker resumes within the next tick.
+            let _footer_freeze = self.footer.freeze_for_prompt();
             match editor.readline("anvil> ") {
                 Ok(line) => {
                     let trimmed = line.trim();
