@@ -21,6 +21,7 @@ use crate::system_prompt::build_system_prompt;
 use crate::tools::registry::{ToolContext, ToolRegistry};
 
 pub mod commands;
+mod interrupt;
 mod lifecycle;
 pub mod slash_commands;
 mod spinner;

@@ -19,6 +19,8 @@
   - built-in tools
 - `src/agent/loop_run/spinner.rs`
   - 推論 / ツール実行中のスピナー（stderr, 80ms, TTY / `NO_COLOR` / `ANVIL_NO_SPINNER` / UTF-8 分岐）
+- `src/agent/loop_run/interrupt.rs`
+  - ESC 割り込み monitor（stdin raw mode + daemon thread、`ANVIL_NO_INTERRUPT` / 非TTY / approve prompt で自動無効化）
 - `src/modes/plan_act.rs`
   - Plan / Act の単純な状態
 - `src/session/*`

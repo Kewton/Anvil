@@ -1,3 +1,4 @@
+use super::interrupt::{InterruptEnv, InterruptMonitor};
 use super::spinner::{Spinner, SpinnerStopSignal};
 use super::summary::{ExitReason, LoopResult, LoopStats};
 use super::*;
@@ -61,6 +62,21 @@ fn build_stats(
 
 impl Agent {
     pub(super) fn handle_user_message(&mut self, input: &str, stream_output: bool) -> LoopResult {
+        // Start the ESC interrupt monitor for the duration of this turn only —
+        // rustyline owns raw mode during the REPL line-edit, so the monitor
+        // must live strictly inside `handle_user_message`. Drop at function
+        // exit disables raw mode deterministically (AC-2 / AC-3 / R1 / R2).
+        let env = InterruptEnv::detect();
+        let mut monitor = InterruptMonitor::start(&env);
+        self.run_turn(input, stream_output, &mut monitor)
+    }
+
+    fn run_turn(
+        &mut self,
+        input: &str,
+        stream_output: bool,
+        monitor: &mut InterruptMonitor,
+    ) -> LoopResult {
         self.push_user_message(input.to_string());
         self.maybe_compact_session(DEFAULT_KEEP_TAIL);
 
@@ -68,7 +84,13 @@ impl Agent {
             recovery::classify_action_expectation(input, self.session.mode_state.mode);
         let requires_action = action_expectation != recovery::ActionExpectation::None;
 
-        self.run_actor_loop(action_expectation, requires_action, stream_output, false)
+        self.run_actor_loop(
+            action_expectation,
+            requires_action,
+            stream_output,
+            false,
+            monitor,
+        )
     }
 
     fn run_actor_loop(
@@ -77,6 +99,7 @@ impl Agent {
         requires_action: bool,
         stream_output: bool,
         restart_convergence_mode: bool,
+        monitor: &mut InterruptMonitor,
     ) -> LoopResult {
         let use_color = io::stdout().is_terminal() && !no_color_requested();
         let use_unicode = unicode_supported();
@@ -98,10 +121,19 @@ impl Agent {
         let mut last_iter = 0usize;
         let mut final_prose = String::new();
 
+        let interrupt_flag = monitor.flag();
+
         'outer: for iter_count in 0..self.config.max_iterations {
             last_iter = iter_count + 1;
             let approx_tokens = approximate_token_count(&self.session.messages);
             tracing::debug!(iter = iter_count, tokens = approx_tokens, "iter");
+
+            // Boundary 1: before requesting the next assistant reply. Lets us
+            // bail out between iterations without starting a fresh LLM call.
+            if interrupt_flag.is_set() {
+                exit_reason = ExitReason::Interrupted;
+                break 'outer;
+            }
 
             let reply = match self.request_assistant_reply_with_retry(stream_output) {
                 Ok(r) => r,
@@ -111,6 +143,13 @@ impl Agent {
                     break 'outer;
                 }
             };
+
+            // Boundary 2: right after the Ollama response completes. This is
+            // the AC-10 checkpoint — mid-flight cancel is out of scope.
+            if interrupt_flag.is_set() {
+                exit_reason = ExitReason::Interrupted;
+                break 'outer;
+            }
 
             let prepared_tool_calls = reply
                 .tool_calls
@@ -165,6 +204,12 @@ impl Agent {
                             && !self.config.yes_mode
                             && io::stdin().is_terminal();
                     let start_spinner_for_exec = !needs_approve_prompt;
+                    // Yield raw mode to the approve `stdin().read_line` and park
+                    // the daemon thread until `resume()` is called. Idempotent,
+                    // so a tool that never triggers the prompt is unaffected.
+                    if needs_approve_prompt {
+                        monitor.pause();
+                    }
                     let raw_result = if recovery::should_block_restart_discovery(
                         &tool_name,
                         restart_convergence_mode && repo_edit_calls_made_this_turn == 0,
@@ -201,6 +246,9 @@ impl Agent {
                     } else {
                         self.execute_tool_call(&tool_name, &tool_call.arguments)
                     };
+                    if needs_approve_prompt {
+                        monitor.resume();
+                    }
 
                     // detect work_root change after each tool execution
                     if self.work_root != last_known_root {
@@ -224,6 +272,14 @@ impl Agent {
                 );
                 if !compacted {
                     self.maybe_compact_session(DEFAULT_KEEP_TAIL);
+                }
+                // Boundary 3: after tool messages have been pushed and the
+                // session has been compacted, so `persist_session` (called by
+                // `process_line`) can save a consistent snapshot the user can
+                // `--resume` from. `Condvar` wake on drop makes this cheap.
+                if interrupt_flag.is_set() {
+                    exit_reason = ExitReason::Interrupted;
+                    break 'outer;
                 }
                 continue;
             }
