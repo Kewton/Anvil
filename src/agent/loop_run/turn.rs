@@ -1,3 +1,4 @@
+use super::spinner::{Spinner, SpinnerStopSignal};
 use super::summary::{ExitReason, LoopResult, LoopStats};
 use super::*;
 use crate::agent::orchestration::{RepoVerification, capture_repo_snapshot, verify_repo_progress};
@@ -153,6 +154,17 @@ impl Agent {
                     );
                     println!("{progress}");
                     let _ = io::stdout().flush();
+                    // approve-guard: tools Bash/Write/Edit may invoke an
+                    // interactive approve prompt in `tools/registry.rs`. We
+                    // must not let the spinner write to stderr while stdin is
+                    // being read. Skip spinner in that narrow case; RAII
+                    // scope ends when execute_tool_call returns for all
+                    // other branches.
+                    let needs_approve_prompt =
+                        matches!(tool_name.as_str(), "Bash" | "Write" | "Edit")
+                            && !self.config.yes_mode
+                            && io::stdin().is_terminal();
+                    let start_spinner_for_exec = !needs_approve_prompt;
                     let raw_result = if recovery::should_block_restart_discovery(
                         &tool_name,
                         restart_convergence_mode && repo_edit_calls_made_this_turn == 0,
@@ -177,9 +189,15 @@ impl Agent {
                         if block_as_loop {
                             emitted_bash_loop_note = true;
                             recovery::repeated_bash_error(&command)
+                        } else if start_spinner_for_exec {
+                            let _sp = Spinner::start(format!("running {tool_name}..."));
+                            self.execute_tool_call(&tool_name, &tool_call.arguments)
                         } else {
                             self.execute_tool_call(&tool_name, &tool_call.arguments)
                         }
+                    } else if start_spinner_for_exec {
+                        let _sp = Spinner::start(format!("running {tool_name}..."));
+                        self.execute_tool_call(&tool_name, &tool_call.arguments)
                     } else {
                         self.execute_tool_call(&tool_name, &tool_call.arguments)
                     };
@@ -304,6 +322,10 @@ impl Agent {
         &mut self,
         stream_output: bool,
     ) -> Result<AssistantReply, String> {
+        // Start spinner once at function entry; retries share the same
+        // animation (no flicker between attempts). Dropped automatically on
+        // function exit (Ok / Err / early-return), clearing the line.
+        let sp = Spinner::start(format!("thinking... ({})", self.models.main));
         let mut downgraded_native_tools = false;
         let mut retries_remaining = self.config.chat_retries;
         let mut extra_transport_retries = if self.session.messages.len() >= 12 {
@@ -313,7 +335,14 @@ impl Agent {
         };
         let mut transport_retry_count = 0usize;
         loop {
-            match self.request_assistant_reply(stream_output) {
+            // Only streaming paths need first-chunk stop; oneshot blocks until
+            // the whole reply is assembled so Drop is sufficient.
+            let stop_signal = if stream_output {
+                sp.stop_signal()
+            } else {
+                None
+            };
+            match self.request_assistant_reply(stream_output, stop_signal) {
                 Ok(reply) => return Ok(reply),
                 Err(err) => {
                     if self.native_tools_enabled
@@ -341,7 +370,11 @@ impl Agent {
         }
     }
 
-    fn request_assistant_reply(&self, stream_output: bool) -> Result<AssistantReply, String> {
+    fn request_assistant_reply(
+        &self,
+        stream_output: bool,
+        stop_signal: Option<SpinnerStopSignal>,
+    ) -> Result<AssistantReply, String> {
         let protocol =
             prompting::ToolProtocol::from_native_tools_enabled(self.native_tools_enabled);
         let native_tools_enabled = protocol.native_tools_enabled();
@@ -356,6 +389,12 @@ impl Agent {
                 native_tools_enabled,
                 |chunk| {
                     if first_chunk {
+                        // First chunk: stop spinner immediately (stop flag +
+                        // Condvar notify) so no spinner residue appears before
+                        // "assistant> ". Safe when `stop_signal` is None.
+                        if let Some(sig) = &stop_signal {
+                            sig.trigger();
+                        }
                         print!("assistant> ");
                         first_chunk = false;
                     }

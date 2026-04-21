@@ -96,6 +96,16 @@ anvil sessions clean [--older-than <DAYS>] [--keep <N>] [--all] [--force] [<ID>]
 
 `sessions list|show|clean` は Ollama / Agent を起動せずオフラインで完結する。既定は現 workspace のみが対象で、`--all` で他 workspace 分も表示する。`clean` は既定 dry-run で、実削除には `--force` が必要。`resolve_session_id` が指す現セッションは常に保護される。
 
+## UX（スピナー表示）
+
+LLM 推論中・ツール実行中は stderr に 80ms 間隔のスピナーを表示する（例: `⠋ thinking... (gpt-oss-20b) 3s`、`⠙ running Bash... 1s`）。以下の条件で自動的に無効化される:
+
+- stderr が TTY でない（パイプ / リダイレクト）: `anvil -p '...' 2>spinner.log` のように stderr を非 TTY にすると完全無効
+- `NO_COLOR` が非空値で設定: モノクロ表示（フレーム文字のみ）
+- `ANVIL_NO_SPINNER` が非空値で設定: スピナーを一切描画しない（TTY でも無効）
+- `LC_ALL` / `LANG` が UTF-8 でない: ASCII フレーム `| / - \` へフォールバック
+- Bash / Write / Edit で承認（approve prompt）が必要な場合: prompt 表示中の干渉回避のためスピナーは起動しない
+
 ## スラッシュコマンド
 
 - `/help`
