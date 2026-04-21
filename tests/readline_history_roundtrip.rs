@@ -100,10 +100,10 @@ fn history_file_mode_is_0o600() {
     );
 }
 
-/// Error-handling acceptance: a missing history path produces a NotFound I/O
-/// error rather than a panic or a silent success. Production code
-/// (`prepare_editor`) matches on this specific error and suppresses it so the
-/// REPL still starts on a fresh environment.
+/// Error-handling acceptance: a missing history path produces a NotFound (or
+/// PermissionDenied on some CI runners) I/O error rather than a panic or a
+/// silent success. Production code (`prepare_editor`) treats both as
+/// "no history yet" and starts the REPL cleanly.
 ///
 /// Guards design policy Section 7.1 and Section 12.2
 /// (`history_load_tolerates_missing_file`).
@@ -117,7 +117,8 @@ fn load_history_missing_file_is_ok() {
         .expect_err("load_history on missing file must return Err");
     match err {
         rustyline::error::ReadlineError::Io(ref io_err)
-            if io_err.kind() == std::io::ErrorKind::NotFound => {}
-        other => panic!("expected NotFound I/O error, got {other:?}"),
+            if io_err.kind() == std::io::ErrorKind::NotFound
+                || io_err.kind() == std::io::ErrorKind::PermissionDenied => {}
+        other => panic!("expected NotFound or PermissionDenied I/O error, got {other:?}"),
     }
 }

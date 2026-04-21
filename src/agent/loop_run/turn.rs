@@ -485,7 +485,7 @@ impl Agent {
 
 /// Returns true when the environment requests that color output be suppressed
 /// (https://no-color.org/): `NO_COLOR` is set to any non-empty value.
-fn no_color_requested() -> bool {
+pub(super) fn no_color_requested() -> bool {
     std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty())
 }
 
@@ -510,13 +510,16 @@ fn unicode_supported() -> bool {
     false
 }
 
-/// Replace C0 control characters and DEL with spaces, then trim trailing
+/// Replace control characters (C0, DEL, and C1) with spaces, then trim trailing
 /// whitespace. Required for model-derived text so that newlines or ANSI escape
-/// sequences cannot be injected into the terminal.
+/// sequences cannot be injected into the terminal. C1 (`U+0080..U+009F`) is
+/// included because some terminals interpret 8-bit CSI (`U+009B`) and OSC
+/// (`U+009D`) equivalently to `ESC [` and `ESC ]`.
 fn sanitize_for_progress(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
-        if (ch as u32) < 0x20 || ch == '\u{007F}' {
+        let cp = ch as u32;
+        if cp < 0x20 || cp == 0x7F || (0x80..=0x9F).contains(&cp) {
             out.push(' ');
         } else {
             out.push(ch);
