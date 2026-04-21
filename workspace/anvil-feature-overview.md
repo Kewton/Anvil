@@ -19,7 +19,8 @@
 ```
 ┌─────────────────────────────────────────────────────┐
 │                      TUI / CLI                       │
-│  (rustyline REPL, スラッシュコマンド, 承認フロー)      │
+│  (rustyline REPL [実装済み: Issue #427],             │
+│   スラッシュコマンド, 承認フロー)                      │
 ├─────────────────────────────────────────────────────┤
 │                   App Orchestrator                    │
 │  (状態機械, セッション管理, プラン管理)                │
@@ -183,22 +184,36 @@ LLM とツール実行を繰り返すマルチターンループがエージェ�
 
 ### スラッシュコマンド
 
+v0.1.0 コアで提供されるスラッシュコマンドは以下の **10 個のみ** です（SSOT: `src/agent/loop_run/slash_commands.rs::SLASH_COMMANDS`）。rustyline の Tab 補完と `/help` 出力はこの SSOT から派生します（Issue #427）。
+
 | コマンド | 説明 |
 |----------|------|
-| `/help` | ヘルプ表示 |
-| `/plan`, `/plan-add`, `/plan-focus`, `/plan-clear` | プラン管理 |
-| `/checkpoint` | チェックポイント保存 |
-| `/compact` | 履歴圧縮 |
-| `/model`, `/model-list`, `/model-switch` | モデル管理 |
-| `/session-list`, `/session-switch`, `/session-delete` | セッション管理 |
-| `/trust` | ツール信頼設定 |
-| `/undo` | ツール実行取り消し |
-| `/repo-find` | リポジトリ検索 |
-| `/timeline` | セッションタイムライン |
+| `/help` | コマンド一覧を表示 |
+| `/status` | モード / 承認フラグ / セッション / プランなどの現在値を表示 |
+| `/model` | 現在利用中のモデル banner を表示 |
+| `/yes` | 承認プロンプトを自動承認（`--no-approval` 相当） |
+| `/no` | 承認プロンプトを手動承認に戻す |
+| `/plan` | Plan モードに入り、プランファイルを作成 |
+| `/approve` | プランを承認し Act モードへ遷移（エイリアス: `/act`） |
+| `/compact` | 会話履歴を要約して圧縮 |
+| `/logs` | `/logs path [<session_id>]` でログディレクトリを表示 |
+| `/exit` | REPL を終了（エイリアス: `/quit`） |
 
-### カスタムコマンド
+補完候補には aliases（`/act`, `/quit`）と将来構想プレースホルダ群は含まれません。
 
-`.anvil/slash-commands.json` で独自コマンドを定義可能。
+### 将来構想（v0.1.0 では未提供）
+
+以下は旧アーキテクチャに存在したコマンド案 / 別 Issue で検討中の機能であり、**現行コアには実装されていません**。対応する `/checkpoint`, `/rollback`, `/watch`, `/autotest`, `/skills`, `/skill`, `/mcp`, `/parallel` を入力した場合は「v0.1.0 コアでは利用不可」というメッセージが返ります。
+
+- プラン細粒度操作: `/plan-add`, `/plan-focus`, `/plan-clear`
+- チェックポイント / ロールバック: `/checkpoint`, `/undo`
+- モデル切替: `/model-list`, `/model-switch`
+- セッション操作: `/session-list`, `/session-switch`, `/session-delete`（CLI `anvil sessions` サブコマンドで代替）
+- ツール信頼 / 監視: `/trust`, `/watch`, `/autotest`
+- スキル / MCP / 並列実行: `/skills`, `/skill`, `/mcp`, `/parallel`
+- リポジトリ操作: `/repo-find`, `/timeline`
+
+`.anvil/slash-commands.json` によるカスタムコマンド定義も同様に v0.1.0 コアでは提供していません（将来拡張）。
 
 ### スキルシステム
 

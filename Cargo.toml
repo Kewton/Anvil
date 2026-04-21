@@ -10,6 +10,7 @@ globset = "0.4"
 ignore = "0.4"
 regex = { version = "1", default-features = false, features = ["std", "unicode-perl"] }
 reqwest = { version = "0.12", features = ["blocking", "rustls-tls", "json"], default-features = false }
+rustyline = { version = "14", default-features = false, features = ["with-file-history"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
