@@ -1,39 +1,47 @@
 # ANVIL.md
 
-## Purpose
+## Product Summary
 
-This file defines stable project instructions for Anvil contributors and agents.
+Anvil は Ollama 前提の local-first coding agent。
+v0.1.0 では旧 Anvil の汎用 phase machine を廃止し、以下のコアへ絞っている。
 
-## Development Rules
+- Ollama direct chat
+- tool-first agent loop
+- Bash / Read / Write / Edit / Glob / Grep
+- Plan / Act
+- session persistence
+- XML fallback
+- git checkpoint / rollback
 
-- Use TDD by default.
-- For every new behavior change:
-  - add or update a failing test first
-  - implement the smallest change to make it pass
-  - refactor only after the test suite is green
-- Do not merge untested behavior.
-- Prefer integration tests for cross-module behavior.
-- Prefer focused module tests for local state or parsing logic.
+## Non-Goals For This Rewrite
 
-## Current Testing Policy
+- multi-provider abstraction
+- 旧 `src/app/*` ベースの継続移植
+- 複雑な termination / bootstrap / detector 群の維持
+- MCP / skills / watcher / auto-test / heavy TUI の先行移植
 
-- `tests/config_bootstrap.rs`
-  - config loading
-  - provider bootstrap
-  - startup event expectations
-- `tests/state_session.rs`
-  - state transitions
-  - session persistence
-  - interruption normalization
-- `tests/tui_console.rs`
-  - startup screen
-  - operator console rendering
-  - working and done views
+## Public Compatibility Kept
 
-## Product Guardrails
+- crate name: `anvil`
+- binary name: `anvil`
+- CI entrypoints: `fmt`, `clippy`, `test`, `build`
+- release flow: tag push -> GitHub Release -> gzipped artifacts
 
-- Preserve explicit state transitions.
-- Preserve session integrity on interruption.
-- Keep `[U]`, `[A]`, and `[T]` visually distinct.
-- Keep the footer/status area visible and compact.
-- Avoid regressing local-first startup clarity.
+## Source Layout
+
+```text
+src/
+  agent/
+  git/
+  modes/
+  ollama/
+  safety/
+  session/
+  tools/
+```
+
+## Quality Bar
+
+- local LLM が一本道で追えること
+- 状態機械よりも失敗しにくい protocol を優先すること
+- 「起動した」ではなく「依頼どおりに動く」へ寄せること

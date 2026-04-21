@@ -54,3 +54,78 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: cargo build
         run: cargo build --release
+
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Install yq (mikefarah v4.44.1)
+        run: |
+          YQ_VERSION=v4.44.1
+          YQ_SHA256=6dc2d0cd4e0caca5aeffd0d784a48263591080e4a0895abe69f3a76eb50d1ba3
+          BASE="https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}"
+          curl -sSL "${BASE}/yq_linux_amd64" -o /tmp/yq
+          echo "${YQ_SHA256}  /tmp/yq" | sha256sum --check --status
+          sudo install -m 755 /tmp/yq /usr/local/bin/yq
+      - name: Install jq
+        run: sudo apt-get install -y jq
+      - name: shellcheck
+        run: shellcheck -S warning scripts/*.sh tests/scripts/*.sh
+      - name: bench.sh dry-run smoke tests
+        run: |
+          # matrix smoke test
+          rm -rf .anvil/benchmarks
+          bash scripts/bench.sh heavy-space-invaders --models 'modelA,modelB' --runs 2 --dry-run
+          report_path="$(find .anvil/benchmarks -mindepth 2 -maxdepth 2 -name matrix-report.md | head -n1)"
+          test -n "$report_path"
+          test -f "$report_path"
+
+          # single-model backward compat smoke test
+          rm -rf .anvil/benchmarks
+          single_out="$(bash scripts/bench.sh heavy-space-invaders --model modelA --runs 2 --dry-run)"
+          test -z "$(find .anvil/benchmarks -mindepth 2 -maxdepth 2 -name matrix-report.md 2>/dev/null | head -n1)"
+          printf '%s\n' "$single_out" | grep -Eq '^Done\. Results: .+/summary\.tsv$'
+
+  python:
+    name: Python (analyze_run)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: install lint deps
+        run: pip install ruff==0.14.9
+      - name: install jq & yq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+      - name: ruff check
+        run: ruff check scripts/analyze_run.py
+      - name: snapshot tests
+        run: python3 tests/golden/test_analyze_run.py
+      - name: security regression tests
+        run: python3 tests/test_analyze_run_security.py
+      - name: bench smoke test
+        run: bash tests/scripts/test_bench_smoke.sh
+      - name: ruff (report.py)
+        run: ruff check scripts/report.py tests/test_report.py tests/test_report_security.py
+      - name: report.py snapshot tests
+        run: python3 -m unittest tests.test_report -v
+      - name: report.py security tests
+        run: python3 -m unittest tests.test_report_security -v
+      - name: report.py e2e compatibility
+        run: bash tests/scripts/test_report_compat.sh
+      - name: ruff compare.py
+        run: ruff check scripts/compare.py
+      - name: test_compare golden
+        run: python3 tests/golden/test_compare.py
+      - name: test_compare security
+        run: python3 tests/test_compare_security.py
+      - name: test_compare smoke
+        run: bash tests/scripts/test_compare_smoke.sh

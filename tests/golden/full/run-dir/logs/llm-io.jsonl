@@ -1,0 +1,1 @@
+{"ts_ms":1000,"event":"ollama.generate.error","payload":{"kind":"status","status":500}}

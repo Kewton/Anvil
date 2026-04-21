@@ -1,342 +1,282 @@
 # Anvil
 
-ローカルターミナルで動作するコーディングエージェント。Ollama や OpenAI 互換サーバーを LLM バックエンドとして使用し、ファイル操作やシェルコマンドの実行をエージェント的に行います。
+Ollama 直結の local-first コーディングエージェント。`workspace/v0.1.0` の方針に従い、旧 Anvil の汎用状態機械を捨てて、ローカル LLM が追いやすい小さい実装へゼロベースで作り直した。
+
+## v0.1.0 の方針
+
+- Ollama 専用
+- prompt / protocol / loop を最小化
+- tool-first
+- Plan / Act の二段階だけを持つ
+- session persistence を持つ
+- JSON tool call が崩れた場合の XML fallback を持つ
+- `Bash` `Read` `Write` `Edit` `Glob` `Grep` を built-in tools として持つ
+- リリース導線は従来どおり `cargo build --release` と GitHub Releases を維持
+
+## 実装済み機能
+
+- Ollama `/api/tags` `/api/chat` への直結クライアント
+- 同期 / streaming 両対応の chat loop
+- モデル自動選択と optional sidecar 選択
+- `$XDG_STATE_HOME/anvil/sessions/{session_id}/session.json` へのセッション保存（workdir 外）
+- `/plan` と `/approve` による Plan / Act 切り替え
+- Git checkpoint / rollback
+- `<think>` 除去と `<tool_call>...</tool_call>` XML fallback
+- FileWatcher と AutoTest command
+- 軽量 TUI
+- local skills loader
+- MCP config registry
+- read-only parallel analysis command
+- 読み取り専用の Plan mode 制御
+- live Ollama E2E を含む unit / integration / ignored E2E tests
+
+## まだ入れていないもの
+
+重い full-screen TUI、実際の MCP protocol transport、tool-enabled subagent delegation はまだ最小実装止まり。v0.1.0 では local-first なコア経路を優先し、後段拡張は軽量 slice に留めている。
 
 ## クイックスタート
 
-### 1. バイナリのインストール
-
-[GitHub Releases](https://github.com/Kewton/Anvil/releases) からビルド済みバイナリをダウンロード:
+### 1. Ollama を起動
 
 ```bash
-# macOS (Apple Silicon)
-curl -L https://github.com/Kewton/Anvil/releases/download/v0.0.11/anvil-darwin-arm64.gz -o anvil.gz
-gunzip anvil.gz
-chmod +x anvil
-sudo mv anvil /usr/local/bin/
-
-# インストール確認
-anvil --help
+ollama serve
+ollama pull qwen3:8b
 ```
 
-### 2. LLM バックエンドの準備
-
-Anvil は LLM の推論を外部サーバーに委託します。以下のいずれかを用意してください。
-
-#### Ollama（推奨・無料）
+### 2. ビルド
 
 ```bash
-# インストール: https://ollama.com
-ollama serve                     # サーバー起動
-ollama pull qwen3.5:latest       # モデル取得（例）
+cargo build --release
+./target/release/anvil --help
 ```
 
-#### OpenAI 互換 API（LM Studio, vLLM 等）
+### 3. 対話モード
 
 ```bash
-# LM Studio 等でサーバーを起動し、URL とモデル名を指定
-# provider-url は http://localhost:1234 と http://localhost:1234/v1 のどちらでも利用できます
-anvil --provider openai --provider-url http://localhost:1234 --model your-model
-
-# LM Studio を使うだけなら lmstudio エイリアスも利用できます
-anvil --provider lmstudio --model your-model
+./target/release/anvil
 ```
 
-### 3. 起動
+### 4. ワンショット
 
 ```bash
-# プロジェクトのディレクトリで起動
-cd /path/to/your/project
-anvil --model qwen3.5:35b
+./target/release/anvil -p "README.md を要約して"
+echo "src を調べて plan を作って" | ./target/release/anvil --oneshot
 ```
 
-起動すると対話プロンプトが表示されます:
+## CLI
 
-```
-    ___              _ __
-   /   |  ____ _   _(_) /_
-  / /| | / __ \ | / / / __/
- / ___ |/ / / / |/ / / /_
-/_/  |_/_/ /_/|___/_/\__/
+```text
+anvil [OPTIONS]
 
-  local coding agent for serious terminal work
+  -p, --prompt <PROMPT>              one-shot prompt
+  -m, --model <MODEL>                main model
+      --sidecar-model <MODEL>        sidecar model
+      --ollama-host <URL>            Ollama base URL (localhost only)
+      --context-budget <TOKENS>      message budget for compaction
+      --max-iterations <N>           max agent loop iterations
+      --verbose                      anvil-side DEBUG logs (reqwest/hyper は warn に抑制)
+      --trace                        全クレート TRACE ログ（reqwest/hyper 含む）
+      --debug                        deprecated alias for --trace
+      --stream                       stream assistant text in interactive turns
+      --tui                          run the lightweight terminal UI
+      --watch                        enable file watcher on startup
+      --auto-test <COMMAND>          run a shell command when watcher sees changes
+  -y, --yes                          auto-approve Bash / Write / Edit
+      --fresh-session                ignore saved session, start new session_id
+      --state-dir <PATH>             override XDG state root (default: $XDG_STATE_HOME/anvil)
+      --oneshot                      read one prompt from CLI or stdin
+      --resume [<ID>]                replay the last user message; no arg = latest workspace session
 
-  Model   : qwen3.5:35b
-  Context : 200k
-  Mode    : local / confirm
-
-  [U] you >
-```
-
-## 使い方
-
-### 基本操作
-
-```bash
-# 対話モードで起動（前回のセッションを自動復元）
-anvil --model qwen3.5:35b
-
-# 新しいセッションで開始（履歴をリセット）
-anvil --model qwen3.5:35b --fresh-session
-
-# 全ツール自動承認モード（承認プロンプトをスキップ）
-anvil --model qwen3.5:35b --no-approval
-
-# 非対話モード（パイプ入力・スクリプト向け）
-echo "src/main.rsを読んで要約して" | anvil --model qwen3.5:35b --no-approval --oneshot
+anvil sessions list  [--all] [--json]
+anvil sessions show  <ID> [--all] [--json]
+anvil sessions clean [--older-than <DAYS>] [--keep <N>] [--all] [--force] [<ID>]
 ```
 
-### 対話例
+`--resume` は直近の `user` メッセージを自動で再投入し、履歴のまま会話を継続する。`--resume <ID>` で UUID v7 を明示指定でき、現在の workspace と一致しない session はエラーになる（他 workspace の閲覧は後述 `sessions show --all` 経由）。`--resume` は `--fresh-session` / `--prompt` / `--oneshot` と排他。
 
-```
-[U] you > このプロジェクトの構造を教えて
+`sessions list|show|clean` は Ollama / Agent を起動せずオフラインで完結する。既定は現 workspace のみが対象で、`--all` で他 workspace 分も表示する。`clean` は既定 dry-run で、実削除には `--force` が必要。`resolve_session_id` が指す現セッションは常に保護される。
 
-  $ ls -la                              ← shell.exec がリアルタイムで実行される
-  Cargo.toml  README.md  src/  tests/
-  ...
+## UX（ESC 割り込み）
 
-[A] anvil > このプロジェクトは Rust で構築されており...
+エージェント実行中（LLM 推論中・ツール実行中）に `ESC` キーを押すと、現在のイテレーションを安全に完了させてから REPL に戻る（`✘ interrupted`）。`Ctrl+C` でプロセス全体を殺す従来の強制終了と異なり、中断時も session は永続化され `--resume` で続行できる。以下の条件で自動的に無効化される:
 
-[U] you > src/main.rs にエラーハンドリングを追加して
+- stdin が TTY でない（パイプ / リダイレクト / CI）: `echo 'msg' | anvil ...` では ESC 検出が起動しない
+- `ANVIL_NO_INTERRUPT` が非空値で設定: ESC 検出を一切行わない（TTY でも無効）
+- スラッシュコマンド（`/status` 等）実行中: REPL 境界でのみ rustyline が raw mode を扱うため、interrupt monitor は起動しない
+- Bash / Write / Edit で承認（approve prompt）が必要な場合: prompt 表示中は monitor を一時停止（`stdin().read_line` との競合を回避）
 
-  Allow file.write: src/main.rs? [y/n] y    ← ファイル変更前に承認を求める
+割り込み挙動のスコープ:
+- ✅ ツール完了後 / LLM 応答完了後の境界で `ExitReason::Interrupted` に遷移
+- ❌ 実行中のツール（Bash の子プロセス等）は中断しない — 完了を待つ
+- ❌ LLM の mid-flight cancel は行わない — 応答が完了してから break（Ollama 応答境界）
 
-[A] anvil > エラーハンドリングを追加しました。変更内容は...
+注意: monitor 有効区間（raw mode on）では `Ctrl+C` が SIGINT として発生しなくなる（crossterm の `cfmakeraw` 仕様）。どうしても即殺したい場合は別ターミナルから `kill <pid>` するか、`ANVIL_NO_INTERRUPT=1` で monitor を無効化して起動する。
 
-[U] you > /exit
-```
+## UX（スピナー表示）
 
-### 承認フロー
+LLM 推論中・ツール実行中は stderr に 80ms 間隔のスピナーを表示する（例: `⠋ thinking... (gpt-oss-20b) 3s`、`⠙ running Bash... 1s`）。以下の条件で自動的に無効化される:
 
-通常モードでは、ファイル書き込み (`file.write`) とシェルコマンド (`shell.exec`) の実行前にインラインで確認を求めます:
+- stderr が TTY でない（パイプ / リダイレクト）: `anvil -p '...' 2>spinner.log` のように stderr を非 TTY にすると完全無効
+- `NO_COLOR` が非空値で設定: モノクロ表示（フレーム文字のみ）
+- `ANVIL_NO_SPINNER` が非空値で設定: スピナーを一切描画しない（TTY でも無効）
+- `LC_ALL` / `LANG` が UTF-8 でない: ASCII フレーム `| / - \` へフォールバック
+- Bash / Write / Edit で承認（approve prompt）が必要な場合: prompt 表示中の干渉回避のためスピナーは起動しない
 
-```
-  Allow shell.exec: npm test? [y/n]
-```
+## スラッシュコマンド
 
-| 入力 | 動作 |
-|------|------|
-| `y` / `yes` | ツールを実行 |
-| `n` / その他 | 拒否（LLMに「denied by user」として通知） |
+対話モード（REPL）で利用できる 10 コマンド。これらが Tab 補完の候補になり、`/help` の出力と完全に一致する。
 
-`--no-approval` で起動すると全ツールが承認なしで実行されます。
+- `/help`
+- `/status`
+- `/model`
+- `/yes`
+- `/no`
+- `/plan`
+- `/approve`
+- `/compact`
+- `/logs path [<session_id>]`
+- `/exit`
 
-### ツール一覧
+エイリアス: `/act`（= `/approve`）, `/quit`（= `/exit`）。補完候補には出さない。
 
-Anvil は LLM に以下のツールを提供します:
+### v0.1.0 では未提供（将来構想のプレースホルダ）
 
-| ツール | 権限 | 説明 |
-|--------|------|------|
-| `file.read` | Safe (自動実行) | ファイル読み取り・ディレクトリ一覧 |
-| `file.search` | Safe (自動実行) | ファイル名・内容で検索 |
-| `file.write` | Confirm (承認必要) | ファイル作成・上書き |
-| `shell.exec` | Confirm (承認必要) | シェルコマンド実行（出力はリアルタイム表示） |
+以下はコマンドとしては受け付けるが、`unavailable in the v0.1.0 core rebuild` を返すだけ。補完候補にも `/help` 出力にも含めない。
 
-### スラッシュコマンド
+- `/checkpoint [label]`
+- `/rollback`
+- `/watch`
+- `/autotest <command>`
+- `/skills`
+- `/skill <name>`
+- `/mcp`
+- `/parallel task1 || task2`
 
-セッション中に `/` で始まるコマンドを入力できます:
+### 対話モードの入力
 
-| コマンド | 説明 |
-|----------|------|
-| `/help` | コマンド一覧を表示 |
-| `/status` | 現在の状態を表示 |
-| `/plan` | 現在のプランを表示 |
-| `/plan-add <項目>` | プランに項目を追加 |
-| `/plan-focus <番号>` | アクティブなステップを変更 |
-| `/plan-clear` | プランをクリア |
-| `/checkpoint <メモ>` | チェックポイントを保存 |
-| `/repo-find <クエリ>` | リポジトリ内を検索 |
-| `/timeline` | セッションのタイムラインを表示 |
-| `/compact` | 古い履歴を圧縮 |
-| `/model` | 現在のモデル情報 |
-| `/provider` | プロバイダー情報 |
-| `/reset` | Ready 状態に戻す |
-| `/exit` | セッション終了 |
+TTY 環境で起動した場合は rustyline ベースの入力ハンドラを使う。上下キーで履歴呼び出し、Tab で上記 10 コマンドの補完、Ctrl+A/E/K/U/C/D が働く。パイプ入力・リダイレクト・CI 等の非 TTY 環境では従来どおり素朴な `read_line` にフォールバックする。
 
-### 安全性
+履歴は `$XDG_STATE_HOME/anvil/history`（`--state-dir <PATH>` override を尊重）に最大 1000 行まで保存される。先頭に半角スペースを付けた入力は履歴に保存されないので、機密入力はこの opt-out を使う。
 
-以下のコマンドは承認モードに関係なくブロックされます:
-- `rm -rf /` / `rm -rf ~` (再帰削除)
-- `mkfs` (フォーマット)
-- `dd if=` (rawディスク書き込み)
-- `:(){` (fork bomb)
+### /help 出力順の変更（v0.1.0 系内の互換性メモ）
 
-パスはサンドボックス内に制限され、絶対パス・`..`・シンボリックリンクによる脱出を防止します。
-
-## セッションと履歴
-
-### 自動保存・復元
-
-Anvil はプロジェクトディレクトリごとにセッションファイル (`.anvil/sessions/`) を自動保存します。同じディレクトリで再起動すると前回の会話が自動復元されます。
-
-```bash
-# セッション復元（デフォルト）
-anvil --model qwen3.5:35b
-
-# 新しいセッションで開始
-anvil --model qwen3.5:35b --fresh-session
-```
-
-### コンテキストウィンドウ管理
-
-LLM に送信するメッセージは**トークンバジェット**で自動制御されます:
-
-- 最新のメッセージから優先的にバジェット内に収まる分だけ送信
-- メッセージ数が閾値（デフォルト64）を超えると古い履歴を自動要約
-- `/compact` コマンドで手動圧縮も可能
-
-長い会話でも最近のやり取りが常に優先され、古い会話は要約として保持されます。
+`/help` 出力は `/help /status /model /yes /no /plan /approve /compact /logs /exit` の順に固定した。以前は `/yes /no` が末尾付近にあったが、承認系コマンドを目立つ位置に移動する UX 改善として `/model` 直後へ前進させている。
 
 ## 設定
 
-### 設定ファイル
-
-プロジェクトルートの `.anvil/config` に `key=value` 形式で記述:
+`.anvil/config` に `key=value` 形式で記述できる。
 
 ```ini
-provider = ollama
-model = qwen3.5:35b
-provider_url = http://127.0.0.1:11434
-context_window = 200000
-stream = true
+model=qwen3:8b
+sidecar_model=qwen3:1.7b
+ollama_host=http://127.0.0.1:11434
+context_budget=24000
+max_iterations=12
+stream=false
+tui=false
+watch=false
+auto_test_command=
+yes_mode=false
+log_level=info            # info | verbose | trace
 ```
 
-### 環境変数
+環境変数も使える。
 
 ```bash
-ANVIL_PROVIDER=ollama             # プロバイダー (ollama / openai)
-ANVIL_MODEL=qwen3.5:35b           # モデル名
-ANVIL_PROVIDER_URL=http://...     # プロバイダーURL
-ANVIL_CONTEXT_WINDOW=200000       # コンテキストウィンドウサイズ
-ANVIL_CONTEXT_BUDGET=50000        # トークンバジェット明示指定
-ANVIL_MAX_AGENT_ITERATIONS=30     # agenticループの最大反復数（default: 30）
-ANVIL_HTTP_TIMEOUT=300            # LLMリクエストタイムアウト（秒）（旧ANVIL_CURL_TIMEOUTもフォールバックとして有効）
-ANVIL_API_KEY=sk-...              # OpenAI互換APIキー
+export ANVIL_MODEL=qwen3:8b
+export ANVIL_SIDECAR_MODEL=qwen3:1.7b
+export ANVIL_OLLAMA_HOST=http://127.0.0.1:11434
+export ANVIL_CONTEXT_BUDGET=24000
+export ANVIL_MAX_ITERATIONS=12
+export ANVIL_STREAM=1
+export ANVIL_TUI=1
+export ANVIL_WATCH=1
+export ANVIL_AUTO_TEST="cargo test --lib"
+export ANVIL_YES=1
+export ANVIL_STATE_DIR=/custom/path/to/anvil-state
+export ANVIL_LOG_LEVEL=info     # info | verbose | trace
 ```
 
-### CLI オプション
+優先順位は `CLI > 環境変数 > .anvil/config > デフォルト値`。
+
+## 永続化とログの保存先
+
+セッションデータ・LLM I/O ログ・プランは **workdir 外の XDG state 領域**に保存され、`npx create-next-app .` 等の scaffold ツールによる workdir wipe を生き残る。
 
 ```
-anvil [OPTIONS]
-
-  -p, --provider <PROVIDER>              プロバイダー (ollama|openai|lmstudio)
-  -m, --model <MODEL>                    モデル名
-  -u, --provider-url <URL>               プロバイダーURL
-      --sidecar-model <MODEL>            サイドカーモデル名
-      --context-window <SIZE>            コンテキストウィンドウサイズ
-      --context-budget <TOKENS>          トークンバジェット明示指定
-      --max-iterations <N>               agenticループ最大反復数（default: 30）
-      --no-stream                        ストリーミング無効
-      --debug                            デバッグログ有効
-      --no-approval                      全ツール自動承認
-      --fresh-session                    新規セッションで開始
-      --oneshot                          非対話モード
-      --reasoning-visibility <LEVEL>     推論表示レベル (hidden|summary)
-  -h, --help                             ヘルプ表示
-  -V, --version                          バージョン表示
+$XDG_STATE_HOME/anvil/           (未設定時: ~/.local/state/anvil)
+  sessions/
+    {session_id}/
+      session.json               ← 会話履歴・モード状態
+      logs/
+        llm-io.jsonl             ← LLM I/O ログ（log level によらず常時保存）
+      plans/
+        plan.md                  ← Plan mode のプランファイル
 ```
 
-優先順位: CLI > 環境変数 > 設定ファイル > デフォルト値
+workdir 側の `.anvil/logs/` `.anvil/sessions/` `.anvil/plans/` は上記へのベストエフォート symlink（削除されても次回起動時に再作成）。
 
-### APIキーのセキュリティ
+`--state-dir <PATH>` または `ANVIL_STATE_DIR=<PATH>` で保存先を上書きできる。テストでは `ANVIL_STATE_DIR` を tempdir に設定することで実 `$HOME` を汚染しない。
 
-APIキーは設定ファイルではなく**環境変数**で設定することを推奨します:
+### Session 継続と検査
+
+- `anvil` を引数なしで起動すると、現 workspace 直下にある最新の session を自動復元する（暗黙リストア）。
+- `--resume` は復元に加え、**最後の `user` メッセージを自動で再投入** して run を再開する。500 / max_iter で中断した直近ターンの続きを流し直したいときに使う。
+- `--resume <UUID>` で session を明示指定できる。UUID v7 以外・symlink・`state_root/sessions/` 外を指すものは拒否され、他 workspace の session もエラーになる。
+- `anvil sessions list` で現 workspace の session 一覧（`ID / updated_at / messages / last_tool / mode`）を更新日降順で表示する。`--all` で他 workspace 分も一覧に含め、`workspace_key` 空の古い session は `unassigned` として表示される。
+- `anvil sessions show <ID>` は 1 session の概要（`id / workspace_key / active_root / messages 件数 / 先頭 user prompt / 最終 assistant or tool / checkpoints 件数 / mode_state`）を出す。`--json` で機械可読出力（transcript 本体は含まない）。
+- `anvil sessions clean` は既定 dry-run。`--older-than 30d` で 30 日超、`--keep 5` で直近 5 件以外を候補にする。`<UUID>` 直接指定も可能。`--force` を付けたときのみ削除する。**現在 `resolve_session_id` が解決する session は常に保護**される。
+
+## 安全性
+
+- Ollama host は `localhost` / `127.0.0.1` / `::1` のみ許可
+- ツールのファイル操作は workspace 外へ出られない
+- Plan mode では `Read` `Glob` `Grep` と plan file のみ許可
+- `Bash` `Write` `Edit` は確認対象で、`-y` がない場合は対話承認が必要
+- `rm -rf /` など一部の明白に危険な Bash 断片はブロック
+
+## ベンチマーク・レポート
+
+`scripts/` 配下のハーネス群で 5-run ベンチマークと集計レポートを生成できる。
 
 ```bash
-export ANVIL_API_KEY=sk-...        # OpenAI互換APIキー
-export SERPER_API_KEY=...          # Serper Web検索APIキー
+# 1モデル 5-run ベンチマーク
+bash scripts/bench.sh run5 <bench_root> <model_slug>
+
+# 実行結果を JSON に集計
+python3 scripts/analyze_run.py <bench_root>/<model_slug>/run-1/
+
+# 全 run を Markdown レポートに集計
+python3 scripts/report.py <bench_root>/
+
+# A/B 比較レポート
+python3 scripts/report.py --compare <bench_root_a>/ <bench_root_b>/
 ```
 
-設定ファイル（`.anvil/config`）にAPIキーが記載されている場合、起動時に警告メッセージが表示されます。また、`.anvil/` ディレクトリが `.gitignore` に登録されていない場合も警告が表示されます。
+| スクリプト | 役割 |
+|-----------|------|
+| `scripts/bench.sh` | smoke / 5-run / matrix ベンチマーク実行 |
+| `scripts/analyze_run.py` | 1 run-dir を解析して JSON を出力 |
+| `scripts/report.py` | BENCH_ROOT 配下の全 run を集計して Markdown を出力 |
 
-設定ファイルの誤コミットによるAPIキー漏洩を防ぐため、`.gitignore` に `.anvil/` を追加してください:
-
-```
-# .gitignore
-.anvil/
-```
-
-## カスタムコマンド
-
-`.anvil/slash-commands.json` で独自のスラッシュコマンドを定義できます:
-
-```json
-{
-  "commands": [
-    {
-      "name": "/review",
-      "description": "コードレビューを実行",
-      "prompt": "このリポジトリの最近の変更をレビューして、改善点を指摘してください。"
-    }
-  ]
-}
-```
-
-## プロバイダー対応
-
-| プロバイダー | 設定例 |
-|-------------|--------|
-| Ollama | `anvil --model qwen3.5:35b` (デフォルト) |
-| LM Studio | `anvil --provider lmstudio --model your-model` |
-| OpenAI互換 | `anvil --provider openai --provider-url http://localhost:1234 --model your-model` (`/v1` 付きURLも可) |
-| API キー認証 | `ANVIL_API_KEY=Bearer sk-...` を環境変数に設定 |
-
----
-
-## 開発者向け
-
-### ソースからビルド
+## テストと検証
 
 ```bash
-# Rust toolchain (1.85+) が必要: https://rustup.rs
-git clone https://github.com/Kewton/Anvil.git
-cd Anvil
+cargo fmt --all
+cargo clippy --all-targets -- -D warnings
+cargo test --all
+cargo test --test e2e_local_llm live_ollama_can_write_a_file -- --ignored --nocapture
+ANVIL_E2E_RUNS=2 cargo test --test e2e_local_llm live_ollama_multi_run_file_write_stability -- --ignored --nocapture
 cargo build --release
 ```
 
-### 開発コマンド
+## リリースプロセス
 
-```bash
-cargo build                       # デバッグビルド
-cargo test                        # 全テスト実行（108件）
-cargo clippy --all-targets        # 静的解析
-cargo fmt                         # フォーマット
-cargo run -- --model qwen3.5:35b  # デバッグ実行
-```
+リリース手順自体は従来のまま維持している。
 
-### プロジェクト構造
+- バイナリ名は `anvil`
+- `cargo build --release --target ...` で生成
+- `.github/workflows/release.yml` が `anvil-linux-*` / `anvil-darwin-*` を gzip 化
+- `v*` タグ push で GitHub Release を作成
 
-```
-src/
-├── main.rs              # エントリポイント
-├── app/                 # アプリケーション層
-│   ├── mod.rs           # オーケストレータ
-│   ├── agentic.rs       # agenticツール実行ループ
-│   ├── cli.rs           # CLI入力ループ
-│   ├── plan.rs          # プラン管理
-│   └── render.rs        # コンソール描画
-├── agent/mod.rs         # LLMプロトコル・パーサー
-├── provider/            # LLMプロバイダー
-│   ├── ollama.rs        # Ollamaクライアント
-│   ├── openai.rs        # OpenAI互換クライアント
-│   └── transport.rs     # HTTPトランスポート（curl）
-├── tooling/mod.rs       # ツール実行・検証・サンドボックス
-├── session/mod.rs       # セッション永続化
-├── config/mod.rs        # 設定管理
-├── state/mod.rs         # 状態マシン
-└── extensions/mod.rs    # スラッシュコマンド拡張
-tests/                   # 統合テスト（108件）
-```
-
-### コントリビューション
-
-1. Issue を作成
-2. `feature/<issue>-<description>` ブランチを作成
-3. 実装 → テスト → clippy 通過を確認
-4. Pull Request を作成（develop ブランチ向け）
-
-詳細は [CLAUDE.md](CLAUDE.md) を参照してください。
-
-## ライセンス
-
-[MIT](LICENSE)
+つまり、内部実装は全面刷新したが、配布導線は壊していない。
