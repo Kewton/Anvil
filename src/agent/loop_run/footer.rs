@@ -1,10 +1,10 @@
 //! Fixed footer status bar for the REPL / resume loop.
 //!
 //! See `dev-reports/design/issue-430-fixed-footer-design-policy.md` for the
-//! full design. This is the **Phase A skeleton** (issue #430): every public
-//! API exists with the eventual signatures, but `acquire` always returns a
-//! disabled handle and every method is a no-op. The actual daemon thread,
-//! DECSTBM lifecycle, and rendering are deferred to subsequent phases.
+//! full design. **Phase C** (issue #430) lands the daemon thread, DECSTBM
+//! lifecycle, panic hook chain, and per-process single-instance enforcement.
+//! Phase D will add the spinner / rustyline freeze rendezvous; Phase E will
+//! finalise the AC17 self-disable + PTY E2E.
 //!
 //! Parallels `spinner.rs` and `interrupt.rs`: same `OnceLock<Mutex<_>>`
 //! single-instance guard pattern, `Drop`-based RAII cleanup, and tracing-only
@@ -14,9 +14,11 @@
 //! common-traiting would re-introduce the provider abstraction CLAUDE.md
 //! forbids (see `interrupt.rs` lead comment for the same rationale).
 
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use crate::config::{Config, LogLevel};
 use crate::modes::plan_act::ExecutionMode;
@@ -26,16 +28,11 @@ use crate::modes::plan_act::ExecutionMode;
 /// sequences without spinning up a worker thread or touching real stdout.
 ///
 /// All public functions in this module return `String` / `&'static str` only;
-/// no IO. Callers in Phase C / D will write the results to stdout under the
-/// freeze rendezvous protocol. Anomalous terminal sizes (rows < 2) collapse to
-/// `None` from `build_decstbm` so the worker can self-disable rather than
+/// no IO. The Phase C worker writes the results to stdout under the freeze
+/// rendezvous protocol (Phase D). Anomalous terminal sizes (rows < 2) collapse
+/// to `None` from `build_decstbm` so the worker can self-disable rather than
 /// emit a malformed `\x1b[1;0r` that some terminals honour by clipping the
 /// scroll region to a single line.
-//
-// Phase B introduces these builders; Phase C is the first real consumer
-// (worker thread + DECSTBM lifecycle). Suppress dead-code lints here so the
-// `-D warnings` clippy gate stays clean during the Phase B → C bridge.
-#[allow(dead_code)]
 pub(super) mod ansi {
     /// Build a DECSTBM (Set Top and Bottom Margins) escape that reserves the
     /// last screen row for the footer.
@@ -84,13 +81,9 @@ pub(super) mod ansi {
 }
 
 /// Per-render-cycle snapshot of the footer state. Built by the worker thread
-/// (Phase C) under the state's atomics + mutex, then handed to the pure
+/// under the state's atomics + mutex, then handed to the pure
 /// `build_footer_line` function. Keeping it `Copy` lets render code stay
 /// trivially testable.
-//
-// Fields are read by `build_footer_line` (Phase B) and `FooterStateInner::
-// snapshot` (Phase B); the worker that *constructs* this lands in Phase C.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub(super) struct FooterSnapshot {
     pub tokens: usize,
@@ -131,9 +124,8 @@ impl Default for FooterFlags {
     }
 }
 
-/// Shared state behind `FooterHandle`. Phase B introduces the type so
-/// `publish_tokens` / `publish_flags` have somewhere to write; Phase C wires
-/// it into the daemon thread.
+/// Shared state behind `FooterHandle`. Owned via `Arc` by the daemon thread
+/// (Phase C) and by every clone of `FooterHandle`.
 ///
 /// Field invariants:
 ///   * `budget` is set once at acquire time and never mutated.
@@ -142,12 +134,8 @@ impl Default for FooterFlags {
 ///   * `flags` uses a `Mutex` (not bit-packing) per DR1-001; collisions are
 ///     rare (slash command frequency).
 ///   * `freeze` and `self_disabled` are simple `AtomicBool` flags read by the
-///     worker; semantics land in Phase C / D.
-//
-// `freeze` / `self_disabled` are not yet read in Phase B (Phase D / E land
-// the consumers). Suppress dead-code on the struct fields without burying
-// the invariant comments above.
-#[allow(dead_code)]
+///     worker. `self_disabled` is set permanently when the writer rejects the
+///     output (broken pipe / detached terminal). `freeze` is wired by Phase D.
 pub(super) struct FooterStateInner {
     pub tokens: AtomicUsize,
     pub budget: usize,
@@ -156,7 +144,6 @@ pub(super) struct FooterStateInner {
     pub self_disabled: AtomicBool,
 }
 
-#[allow(dead_code)]
 impl FooterStateInner {
     pub(super) fn new(budget: usize, flags: FooterFlags) -> Arc<Self> {
         Arc::new(Self {
@@ -196,10 +183,6 @@ impl FooterStateInner {
 /// Render the entire footer line from a snapshot. Pure function: same input
 /// always produces the same bytes, no IO. Phase B's snapshot test (Issue #430
 /// body example) compares the output of this function to a literal string.
-//
-// First non-test caller is the Phase C worker thread; allow dead_code so the
-// `-D warnings` gate stays clean during the Phase B → C bridge.
-#[allow(dead_code)]
 ///
 /// Format (DR2-004): `[mode]  bar (NN.Nk / NNk)  [verbose|trace?]  [yes?]`
 /// where the separator between every cluster is **two spaces** (Issue body).
@@ -247,11 +230,6 @@ pub(super) fn build_footer_line(snapshot: &FooterSnapshot, use_color: bool) -> S
 ///
 /// `use_color=false` (NO_COLOR env) suppresses ANSI escapes entirely so the
 /// rendered bar is safe to ship to dumb terminals or capture into snapshots.
-//
-// Called by `build_footer_line` (Phase B) — both functions only ship to the
-// worker thread in Phase C, so until then the function is exercised through
-// tests only. Allow dead_code so `-D warnings` stays clean.
-#[allow(dead_code)]
 pub(super) fn bar_for_ratio(ratio: f64, use_color: bool) -> String {
     const CELLS: usize = 8;
     const FULL: char = '█';
@@ -308,10 +286,6 @@ pub(super) fn bar_for_ratio(ratio: f64, use_color: bool) -> String {
 ///   * `< 10_000`    → `"N.Nk"` (one decimal, e.g. `1234` → `"1.2k"`)
 ///   * `>= 10_000`   → `"NN.Nk"` for non-multiples of 1000, drop `.0` for
 ///     exact thousands (`24_000` → `"24k"`, `10_100` → `"10.1k"`).
-//
-// Called only by `build_footer_line` (which is itself dead_code until the
-// Phase C worker calls it). Allow on this private helper too.
-#[allow(dead_code)]
 fn format_token_count(n: usize) -> String {
     if n == 0 {
         return "0".to_string();
@@ -335,35 +309,96 @@ fn format_token_count(n: usize) -> String {
 /// `OnceLock<Mutex<bool>>` rather than a plain `Mutex<bool>` because the
 /// initial value must be lazily constructed on first access. The bool inside
 /// is the "in use" flag: `true` while a `FooterLease` holds the lease, `false`
-/// otherwise. Phase A only sets / clears this bit; later phases will gate the
-/// real DECSTBM / panic hook install on it.
+/// otherwise.
 static FOOTER_LEASE_HELD: OnceLock<Mutex<bool>> = OnceLock::new();
 
 fn lease_lock() -> &'static Mutex<bool> {
     FOOTER_LEASE_HELD.get_or_init(|| Mutex::new(false))
 }
 
-/// RAII lease for the fixed footer. In Phase A this is a thin shell:
-/// `acquire` decides whether the footer would be eligible (config / TTY /
-/// platform / single-instance) and either claims the global lease bit or
-/// hands back a fully-disabled handle. Drop releases the lease bit if it was
-/// claimed. The actual worker thread, DECSTBM lifecycle, and panic hook
-/// chain land in Phase C.
+/// Lock the lease bit, recovering from poisoning. Returns `Some(guard)` when
+/// the lock was acquired (clean or poisoned-recovered) and `None` only on
+/// catastrophic failure (impossible for `Mutex<bool>`).
+fn lock_lease_bit_or_recover<'a>() -> std::sync::MutexGuard<'a, bool> {
+    match lease_lock().lock() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            // A previous holder panicked while the bit was held. The bit value
+            // itself is still valid (Mutex<bool> never observes torn writes),
+            // so recover it via `into_inner()` and continue. We log once so
+            // the recovery is observable in production.
+            tracing::warn!("anvil footer: lease mutex poisoned; recovering inner value");
+            poisoned.into_inner()
+        }
+    }
+}
+
+/// Worker tick interval. Matches the work plan (200ms): low enough to satisfy
+/// the AC3 "<= 500ms resize follow" budget while keeping CPU near-idle.
+const TICK: Duration = Duration::from_millis(200);
+
+/// Box<dyn Write + Send> alias used for both the real stdout writer and the
+/// in-memory writer that tests inject through `acquire_for_test`.
+type FooterWriter = Box<dyn Write + Send>;
+
+/// Trampoline for the panic hook: stores the chained previous hook so the
+/// custom hook can call it after writing the DECSTBM reset. We hold it in an
+/// `Arc` because the closure captured by `set_hook` and the `FooterLease`
+/// itself both need access (Drop must restore the prev hook).
+type PanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send + 'static>;
+
+/// All resources owned by an active footer lease. Constructed by `acquire`
+/// (and test variants) and dropped in reverse order by `Drop for FooterLease`.
+///
+/// The `state` field is intentionally retained even though `Drop` does not
+/// read it: the worker holds its own `Arc` clone and the `FooterHandle` clones
+/// distributed to `Agent` hold theirs, so this `Arc` is part of the reference
+/// count that keeps the shared state alive for the lease's lifetime. Storing
+/// it here also gives the future `freeze_for_inference` (Phase D) a place to
+/// reach the state without going through the handle.
+struct Active {
+    #[allow(dead_code)]
+    state: Arc<FooterStateInner>,
+    stop: Arc<AtomicBool>,
+    wake: Arc<(Mutex<()>, Condvar)>,
+    worker: Option<JoinHandle<()>>,
+    /// Saved previous panic hook so we can restore it on Drop. `Some` after
+    /// install; `None` after Drop has consumed it (or if install was skipped).
+    prev_panic_hook: Option<Arc<PanicHook>>,
+    /// DECSTBM rows recorded at install. Used by Drop to send a reset and a
+    /// final `move_to(rows, 1)` so the cursor lands on a clean line below the
+    /// scroll region.
+    decstbm_rows: u16,
+    /// Writer used for DECSTBM set/reset and worker output. The real path
+    /// uses `Box::new(io::stdout())`; tests inject an in-memory writer.
+    /// Wrapped in an `Arc<Mutex<>>` so the worker thread and the Drop path
+    /// can both write through the same underlying handle.
+    writer: Arc<Mutex<FooterWriter>>,
+}
+
+/// RAII lease for the fixed footer. **Phase C**: when `acquire` lands on the
+/// happy path it claims the lease bit, installs the DECSTBM scroll region,
+/// chains a panic hook, and spawns the daemon thread. Drop tears down all of
+/// that in reverse order. When the env / TTY / config gates fail (or another
+/// lease is already held), `acquire` returns a fully no-op lease whose
+/// `handle.enabled == false`.
 pub struct FooterLease {
     /// `true` when this lease successfully claimed the global lease bit and
     /// is responsible for releasing it on Drop. `false` for fully no-op
     /// leases (disabled by config / non-TTY / Windows / contention).
     holds_lease_bit: bool,
+    /// Resources owned by an enabled lease. `None` for disabled leases.
+    inner: Option<Active>,
     handle: FooterHandle,
 }
 
 /// Lightweight clonable handle distributed to `Agent` / commands.
 ///
-/// Phase B: `enabled` remains `false` for the public `acquire` happy-path
-/// because no daemon thread is spawned yet (Phase C). The `state` field is
-/// `Some` when the handle is wired to a real `FooterStateInner`; this lets
-/// `publish_tokens` / `publish_flags` write through even before the worker
-/// renders, which is exactly what the Phase B publish unit tests assert.
+/// `enabled = true` only when the owning lease successfully spawned the
+/// daemon thread (Phase C+). `state` carries the shared `FooterStateInner`
+/// whenever the handle is wired to one (publish writes always go through
+/// when state is attached, regardless of `enabled` — this keeps tests and
+/// the Phase B publish API simple).
 #[derive(Clone)]
 pub struct FooterHandle {
     enabled: bool,
@@ -374,8 +409,8 @@ pub struct FooterHandle {
 }
 
 /// RAII guard returned by `freeze_for_inference` / `freeze_for_prompt`. Drop
-/// re-enables footer rendering. In Phase A the guard carries no state because
-/// there is no worker to pause.
+/// re-enables footer rendering. Phase C carries no state beyond the `enabled`
+/// echo because Phase D installs the actual Condvar wake.
 pub struct FreezeGuard {
     _enabled: bool,
 }
@@ -392,15 +427,16 @@ impl FooterLease {
     ///     must not receive ANSI noise.
     ///   * the lease is already held — second concurrent acquire never wins
     ///     (AC15). One-line `tracing::warn!`.
-    ///
-    /// Phase A always returns a disabled handle even on the "happy path" — the
-    /// real worker / DECSTBM install lands in later phases.
+    ///   * `terminal::size()` fails or returns rows < 2 — auto-disable
+    ///     (DR4-001).
+    ///   * worker thread spawn or DECSTBM write fails — auto-disable.
     pub fn acquire(config: &Config) -> Self {
         // Windows: auto-disable per DR1-012. Logged once to make the fallback
         // observable without spamming.
         #[cfg(windows)]
         {
             tracing::warn!("anvil footer: disabled on Windows (auto-fallback, see issue #430)");
+            let _ = config; // silence unused-var on Windows
             return Self::disabled_lease();
         }
 
@@ -413,36 +449,60 @@ impl FooterLease {
                 return Self::disabled_lease();
             }
 
-            // Single-instance gate (AC15). On poison we treat the lease as
-            // already held: better to skip the footer than risk fighting
-            // another (possibly half-installed) instance.
-            let mut held = match lease_lock().lock() {
-                Ok(g) => g,
-                Err(poisoned) => {
-                    tracing::warn!("anvil footer: lease mutex poisoned; skipping footer install");
-                    let _ = poisoned;
+            // Single-instance gate (AC15). Acquired here and held until `Drop`.
+            // We don't keep the guard alive across the whole acquire path — we
+            // only flip the bit, then drop the guard so other code that needs
+            // to inspect the bit (defensive checks, future audits) is not
+            // blocked.
+            {
+                let mut held = lock_lease_bit_or_recover();
+                if *held {
+                    tracing::warn!(
+                        "anvil footer: a footer lease is already active; skipping second acquire"
+                    );
+                    return Self::disabled_lease();
+                }
+                *held = true;
+            }
+
+            // Past this point, releasing the lease bit on any failure path is
+            // the responsibility of `release_lease_bit_on_failure`. We use an
+            // explicit guard struct rather than scattering manual cleanup so
+            // a future panic during install also releases the bit.
+            let bit_guard = LeaseBitGuard::new();
+
+            // Determine current terminal size. Failure or anomalous values
+            // (rows < 2, cols == 0) → auto-disable.
+            let rows = match crossterm::terminal::size() {
+                Ok((cols, rows)) if cols > 0 && rows >= 2 => rows,
+                Ok(_) => {
+                    tracing::warn!(
+                        "anvil footer: anomalous terminal size; disabling footer install"
+                    );
+                    drop(bit_guard);
+                    return Self::disabled_lease();
+                }
+                Err(err) => {
+                    tracing::warn!(?err, "anvil footer: terminal::size() failed; disabling");
+                    drop(bit_guard);
                     return Self::disabled_lease();
                 }
             };
-            if *held {
-                tracing::warn!(
-                    "anvil footer: a footer lease is already active; skipping second acquire"
-                );
-                return Self::disabled_lease();
-            }
-            *held = true;
-            drop(held);
 
-            // Phase B: even though the footer is "eligible" here, we still
-            // hand back a disabled handle (no worker thread yet). The real
-            // worker / DECSTBM install lands in Phase C; we only claim the
-            // lease bit so Drop can exercise the release path under test.
-            Self {
-                holds_lease_bit: true,
-                handle: FooterHandle {
-                    enabled: false,
-                    state: None,
-                },
+            let budget = config.context_budget;
+            let initial_flags = FooterFlags {
+                mode: ExecutionMode::Act,
+                log: config.log_level,
+                yes: config.yes_mode,
+            };
+            let writer: FooterWriter = Box::new(io::stdout());
+            match install_active(rows, budget, initial_flags, writer, bit_guard) {
+                Ok(lease) => lease,
+                Err(()) => {
+                    // install_active already released the bit and logged on
+                    // failure; return a fresh disabled lease.
+                    Self::disabled_lease()
+                }
             }
         }
     }
@@ -451,6 +511,7 @@ impl FooterLease {
     fn disabled_lease() -> Self {
         Self {
             holds_lease_bit: false,
+            inner: None,
             handle: FooterHandle {
                 enabled: false,
                 state: None,
@@ -462,18 +523,234 @@ impl FooterLease {
     pub fn handle_clone(&self) -> FooterHandle {
         self.handle.clone()
     }
+
+    /// Test-only: install an active footer lease with an injected writer and
+    /// terminal row count. Bypasses the TTY / config / Windows gates that the
+    /// public `acquire` enforces, so unit tests can drive the worker without a
+    /// live terminal. The lease bit is still honoured (caller must ensure
+    /// the bit is released or use this through the same single-instance
+    /// contract as `acquire`).
+    #[cfg(test)]
+    pub(super) fn acquire_for_test(rows: u16, writer: FooterWriter) -> Self {
+        // Claim the bit (or refuse, returning a disabled lease for parity
+        // with the public path). Tests serialise via a test-local mutex.
+        {
+            let mut held = lock_lease_bit_or_recover();
+            if *held {
+                tracing::warn!("anvil footer (test): lease already held; returning disabled lease");
+                return Self::disabled_lease();
+            }
+            *held = true;
+        }
+        let bit_guard = LeaseBitGuard::new();
+        match install_active(rows, 24_000, FooterFlags::default(), writer, bit_guard) {
+            Ok(lease) => lease,
+            Err(()) => Self::disabled_lease(),
+        }
+    }
+}
+
+/// Helper: builds and installs the daemon thread, panic hook chain, and
+/// DECSTBM. On any failure (write error, spawn error) it releases the lease
+/// bit through `bit_guard.release()` and returns `Err(())`; on success the
+/// guard is consumed and ownership of the bit transfers to the returned
+/// `FooterLease`.
+fn install_active(
+    rows: u16,
+    budget: usize,
+    initial_flags: FooterFlags,
+    writer: FooterWriter,
+    bit_guard: LeaseBitGuard,
+) -> Result<FooterLease, ()> {
+    // 1. Build the shared state and synchronisation primitives up front.
+    let state = FooterStateInner::new(budget, initial_flags);
+    let stop = Arc::new(AtomicBool::new(false));
+    let wake: Arc<(Mutex<()>, Condvar)> = Arc::new((Mutex::new(()), Condvar::new()));
+    let writer = Arc::new(Mutex::new(writer));
+
+    // 2. Set DECSTBM (Task C.4). Failure → release bit and disable.
+    let decstbm = match ansi::build_decstbm(rows) {
+        Some(s) => s,
+        None => {
+            tracing::warn!("anvil footer: build_decstbm returned None; disabling");
+            bit_guard.release();
+            return Err(());
+        }
+    };
+    {
+        let mut w = writer
+            .lock()
+            .expect("footer writer mutex never poisoned at install");
+        if let Err(err) = w.write_all(decstbm.as_bytes()) {
+            tracing::warn!(?err, "anvil footer: failed to write DECSTBM; disabling");
+            bit_guard.release();
+            return Err(());
+        }
+        let _ = w.flush();
+    }
+
+    // 3. Install panic hook chain (Task C.2). The custom hook sends the
+    //    DECSTBM reset to stdout (best-effort, broken pipes ignored) and then
+    //    delegates to `prev` so backtraces and tracing-subscriber's own hook
+    //    keep working (AC10).
+    let prev_panic_hook: PanicHook = std::panic::take_hook();
+    let prev_arc = Arc::new(prev_panic_hook);
+    let prev_for_hook = prev_arc.clone();
+    std::panic::set_hook(Box::new(move |info| {
+        // Best-effort DECSTBM reset directly to raw stdout. We intentionally
+        // do NOT touch the FOOTER_LEASE_HELD mutex here (DR2-012 invariant)
+        // to avoid deadlocking with the Drop path that may also be running.
+        let _ = io::stdout().write_all(b"\x1b[r");
+        let _ = io::stdout().flush();
+        prev_for_hook(info);
+    }));
+
+    // 4. Spawn the worker thread (Task C.3).
+    let state_for_thread = state.clone();
+    let stop_for_thread = stop.clone();
+    let wake_for_thread = wake.clone();
+    let writer_for_thread = writer.clone();
+    let spawn_result = thread::Builder::new()
+        .name("anvil-footer".into())
+        .spawn(move || {
+            // catch_unwind so a panic inside the render loop does not abort
+            // the process; the panic hook chain still fires before this
+            // catch unwinds. Same shape as spinner.rs / interrupt.rs.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                render_loop(
+                    state_for_thread,
+                    stop_for_thread.clone(),
+                    wake_for_thread,
+                    writer_for_thread,
+                );
+            }));
+            stop_for_thread.store(true, Ordering::SeqCst);
+        });
+
+    let worker = match spawn_result {
+        Ok(h) => h,
+        Err(err) => {
+            tracing::warn!(?err, "anvil footer: failed to spawn worker; disabling");
+            // Reverse panic hook install before bailing.
+            std::panic::set_hook(panic_hook_from_arc(prev_arc));
+            // Best-effort DECSTBM reset.
+            if let Ok(mut w) = writer.lock() {
+                let _ = w.write_all(ansi::build_decstbm_reset().as_bytes());
+                let _ = w.flush();
+            }
+            bit_guard.release();
+            return Err(());
+        }
+    };
+
+    // 5. Construct the lease. The bit ownership transfers from `bit_guard`
+    //    into `holds_lease_bit = true` here.
+    bit_guard.into_owned();
+    let handle = FooterHandle {
+        enabled: true,
+        state: Some(state.clone()),
+    };
+    Ok(FooterLease {
+        holds_lease_bit: true,
+        inner: Some(Active {
+            state,
+            stop,
+            wake,
+            worker: Some(worker),
+            prev_panic_hook: Some(prev_arc),
+            decstbm_rows: rows,
+            writer,
+        }),
+        handle,
+    })
+}
+
+/// Reconstruct a `Box<dyn Fn>` from the shared `Arc<PanicHook>` so we can call
+/// `std::panic::set_hook` (which requires a `Box`). The resulting box closes
+/// over the `Arc` and forwards each invocation to the inner hook.
+fn panic_hook_from_arc(
+    arc: Arc<PanicHook>,
+) -> Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send + 'static> {
+    Box::new(move |info| arc(info))
+}
+
+/// RAII helper for the lease bit: ensures the bit is cleared if a failure
+/// path drops the guard before transferring ownership to a `FooterLease`.
+/// `into_owned` consumes the guard without releasing the bit (used on the
+/// success path).
+struct LeaseBitGuard {
+    armed: bool,
+}
+
+impl LeaseBitGuard {
+    fn new() -> Self {
+        Self { armed: true }
+    }
+
+    /// Disarm the guard; caller takes ownership of the bit (and is responsible
+    /// for clearing it on Drop).
+    fn into_owned(mut self) {
+        self.armed = false;
+    }
+
+    /// Explicit release (used on early-return failure paths).
+    fn release(mut self) {
+        if self.armed {
+            let mut held = lock_lease_bit_or_recover();
+            *held = false;
+            self.armed = false;
+        }
+    }
+}
+
+impl Drop for LeaseBitGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let mut held = lock_lease_bit_or_recover();
+            *held = false;
+        }
+    }
 }
 
 impl Drop for FooterLease {
     fn drop(&mut self) {
-        if !self.holds_lease_bit {
-            return;
+        // Order matters: stop worker → join → DECSTBM reset → restore panic
+        // hook → release lease bit. This mirrors the install order in reverse
+        // and matches the design (§3 Drop comment).
+        if let Some(mut active) = self.inner.take() {
+            // 1. Signal stop and wake the worker.
+            active.stop.store(true, Ordering::SeqCst);
+            {
+                let (lock, cvar) = &*active.wake;
+                let _g = lock.lock().unwrap_or_else(|p| p.into_inner());
+                cvar.notify_all();
+            }
+            // 2. Join the worker (best-effort, never panic from Drop).
+            if let Some(handle) = active.worker.take()
+                && let Err(e) = handle.join()
+            {
+                tracing::warn!(?e, "anvil footer: worker thread join failed");
+            }
+            // 3. DECSTBM reset + cursor restore. Best-effort: broken pipes
+            //    after the worker disabled itself are ignored.
+            if let Ok(mut w) = active.writer.lock() {
+                let _ = w.write_all(ansi::build_decstbm_reset().as_bytes());
+                let cursor_home = ansi::move_to(active.decstbm_rows, 1);
+                let _ = w.write_all(cursor_home.as_bytes());
+                let _ = w.flush();
+            }
+            // 4. Restore the previous panic hook.
+            if let Some(prev) = active.prev_panic_hook.take() {
+                std::panic::set_hook(panic_hook_from_arc(prev));
+            }
         }
-        // Best-effort release; never panic from Drop. On poisoned / missing
-        // lock we accept that the lease bit stays set (subsequent acquires
-        // will warn and return disabled, which is the safer failure mode).
-        if let Ok(mut held) = lease_lock().lock() {
+
+        // 5. Release the lease bit (always, even for inner=None disabled
+        //    leases that were constructed from `acquire_for_test` failure).
+        if self.holds_lease_bit {
+            let mut held = lock_lease_bit_or_recover();
             *held = false;
+            self.holds_lease_bit = false;
         }
     }
 }
@@ -489,31 +766,27 @@ impl FooterHandle {
         }
     }
 
-    /// Whether this handle is connected to a live footer worker. Phase B:
-    /// still always `false` from `acquire`. Public so call sites can do cheap
-    /// early-returns when constructing argument lists.
+    /// Whether this handle is connected to a live footer worker. Public so
+    /// call sites can do cheap early-returns when constructing argument lists.
     pub fn is_enabled(&self) -> bool {
         self.enabled
     }
 
     /// Publish the per-turn token count.
     ///
-    /// Phase B: writes through to `FooterStateInner::tokens` whenever a state
-    /// is attached, **regardless of `enabled`**. Phase B's whole point is to
-    /// let the publish API land alongside `turn.rs::handle_user_message` and
-    /// the slash-command handlers without waiting for the daemon thread; the
-    /// state lives independently so unit tests can read it back.
+    /// Writes through to `FooterStateInner::tokens` whenever a state is
+    /// attached, **regardless of `enabled`**. Phase B's whole point is to let
+    /// the publish API land alongside `turn.rs::handle_user_message` and the
+    /// slash-command handlers without waiting for the daemon thread.
     pub fn publish_tokens(&self, tokens: usize) {
         if let Some(state) = &self.state {
             state.tokens.store(tokens, Ordering::Relaxed);
         }
     }
 
-    /// Publish the mode / log level / yes-mode flags.
-    ///
-    /// Phase B: writes through to `FooterStateInner::flags` whenever a state
-    /// is attached. On a poisoned mutex we recover the inner value (footer
-    /// is fail-open per AC17, never panic from a publish call site).
+    /// Publish the mode / log level / yes-mode flags. Recovers from a
+    /// poisoned mutex (footer is fail-open per AC17, never panic from a
+    /// publish call site).
     pub fn publish_flags(&self, mode: ExecutionMode, log: LogLevel, yes: bool) {
         let Some(state) = &self.state else {
             return;
@@ -526,8 +799,8 @@ impl FooterHandle {
     }
 
     /// Pause the footer worker for an inference / tool stdout-emitting block.
-    /// Returns an RAII guard that thaws on drop. Phase B: still a no-op
-    /// because no worker exists yet (Phase D installs the Condvar wake).
+    /// Returns an RAII guard that thaws on drop. Phase C: still a no-op
+    /// because the Condvar wake lands in Phase D.
     pub fn freeze_for_inference(&self) -> FreezeGuard {
         FreezeGuard {
             _enabled: self.enabled,
@@ -535,7 +808,7 @@ impl FooterHandle {
     }
 
     /// Pause the footer worker for a rustyline prompt. Returns an RAII guard
-    /// that thaws on drop. Phase B: still a no-op (see `freeze_for_inference`).
+    /// that thaws on drop. Phase C: still a no-op (see `freeze_for_inference`).
     pub fn freeze_for_prompt(&self) -> FreezeGuard {
         FreezeGuard {
             _enabled: self.enabled,
@@ -564,8 +837,102 @@ impl FooterHandle {
 
 impl Drop for FreezeGuard {
     fn drop(&mut self) {
-        // Phase A: nothing to thaw. Phase D will signal the worker via
+        // Phase C: nothing to thaw. Phase D will signal the worker via
         // Condvar here.
+    }
+}
+
+/// Daemon thread render loop. Runs until `stop` is set, ticking every
+/// `TICK` (200ms). On each tick:
+///   1. Skip when `state.self_disabled` (Phase E will set this on persistent
+///      write failures).
+///   2. Skip when `state.freeze` (Phase D will set this around stdout-emitting
+///      regions).
+///   3. Re-read `terminal::size()`. Anomalous values flip self-disable.
+///   4. Build the footer ANSI string and write through the shared writer.
+///   5. Wait on the wake Condvar for at most `TICK`.
+///
+/// The loop is wrapped in `catch_unwind` by the spawn site so a panic inside
+/// any of the steps cannot abort the process (matches spinner.rs ethos).
+fn render_loop(
+    state: Arc<FooterStateInner>,
+    stop: Arc<AtomicBool>,
+    wake: Arc<(Mutex<()>, Condvar)>,
+    writer: Arc<Mutex<FooterWriter>>,
+) {
+    let (lock, cvar) = &*wake;
+    // Cache the previous size so we only re-emit DECSTBM when the row count
+    // changes (AC3). Initialise from a fresh probe so the first tick already
+    // has a baseline.
+    let mut prev_rows: u16 = match crossterm::terminal::size() {
+        Ok((_, r)) => r,
+        Err(_) => 0,
+    };
+    while !stop.load(Ordering::SeqCst) {
+        if state.self_disabled.load(Ordering::SeqCst) {
+            // Permanently disabled: park on the wake cvar without rendering.
+            let g = lock.lock().unwrap_or_else(|p| p.into_inner());
+            let _ = cvar.wait_timeout(g, TICK);
+            continue;
+        }
+        let frozen = state.freeze.load(Ordering::SeqCst);
+        if !frozen {
+            // 3. terminal::size() — skip render on failure / anomalous size.
+            let size = crossterm::terminal::size();
+            let (cols, rows) = match size {
+                Ok((c, r)) => (c, r),
+                Err(_) => {
+                    // Wait and retry next tick (transient ioctl errors should
+                    // not flip permanent self-disable).
+                    let g = lock.lock().unwrap_or_else(|p| p.into_inner());
+                    let _ = cvar.wait_timeout(g, TICK);
+                    continue;
+                }
+            };
+            if rows < 2 || cols == 0 {
+                // Anomalous size while running — self-disable to avoid
+                // emitting garbage. (DR4-001)
+                state.self_disabled.store(true, Ordering::SeqCst);
+                continue;
+            }
+
+            // AC3: when the row count changed, re-emit DECSTBM so the scroll
+            // region still leaves the bottom row free.
+            if rows != prev_rows
+                && let Some(decstbm) = ansi::build_decstbm(rows)
+                && let Ok(mut w) = writer.lock()
+            {
+                let _ = w.write_all(decstbm.as_bytes());
+            }
+            prev_rows = rows;
+
+            // 4. Render the footer line at row=`rows`, col=1.
+            let snapshot = state.snapshot();
+            let line = build_footer_line(&snapshot, /* use_color */ true);
+            let mut out = String::with_capacity(line.len() + 32);
+            out.push_str(ansi::save_cursor());
+            out.push_str(&ansi::move_to(rows, 1));
+            out.push_str(ansi::clear_line());
+            out.push_str(&line);
+            out.push_str(ansi::restore_cursor());
+
+            let write_result = {
+                let mut w = writer.lock().unwrap_or_else(|p| p.into_inner());
+                let r = w.write_all(out.as_bytes());
+                let _ = w.flush();
+                r
+            };
+            if write_result.is_err() {
+                // AC17: write failure → permanent self-disable. Phase E
+                // refines the warning text and metrics.
+                state.self_disabled.store(true, Ordering::SeqCst);
+                tracing::warn!("anvil footer: write failed; self-disabling");
+                continue;
+            }
+        }
+        // 5. Wait up to TICK for stop / freeze change / publish_* wake.
+        let g = lock.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = cvar.wait_timeout(g, TICK);
     }
 }
 
@@ -573,6 +940,48 @@ impl Drop for FreezeGuard {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::sync::Mutex as StdMutex;
+
+    /// Process-wide serialiser for tests that touch `FOOTER_LEASE_HELD` /
+    /// global panic hook state. We avoid `serial_test` (would add a new
+    /// dependency, forbidden by the work plan); a plain `Mutex<()>` does the
+    /// job because `cargo test`'s default thread pool only contends inside
+    /// the same binary.
+    static PHASE_C_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    /// RAII helper: take the phase-C lock and on drop ensure both the lease
+    /// bit and the FOOTER_LEASE_HELD mutex are in clean state for the next
+    /// test, even when the body panics.
+    struct PhaseCTestGuard {
+        _g: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl PhaseCTestGuard {
+        fn acquire() -> Self {
+            // Recover from a poisoned guard so a previous test panic does not
+            // permanently break Phase C tests.
+            let g = match PHASE_C_TEST_LOCK.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            // Defensive cleanup: clear stale state from a previous panicked
+            // test. Use the recovery helper because a previous Phase C test
+            // may have intentionally poisoned the lease mutex.
+            let mut h = lock_lease_bit_or_recover();
+            *h = false;
+            Self { _g: g }
+        }
+    }
+
+    impl Drop for PhaseCTestGuard {
+        fn drop(&mut self) {
+            // Always clear the bit on test exit (the Drop of FooterLease
+            // should already have done so on the happy path; this is purely
+            // defensive for tests that exit early). Recover from poison.
+            let mut h = lock_lease_bit_or_recover();
+            *h = false;
+        }
+    }
 
     /// Build a minimal `Config` for unit tests. Uses raw struct construction
     /// rather than `Config::load` because we only care about `footer` here.
@@ -606,6 +1015,7 @@ mod tests {
 
     #[test]
     fn config_footer_false_returns_disabled_handle() {
+        let _g = PhaseCTestGuard::acquire();
         // Even on a TTY, config.footer = false short-circuits to no-op.
         let cfg = config_with_footer(false);
         let lease = FooterLease::acquire(&cfg);
@@ -617,6 +1027,7 @@ mod tests {
 
     #[test]
     fn non_tty_returns_disabled_handle() {
+        let _g = PhaseCTestGuard::acquire();
         // Tests run with stdout = pipe (non-TTY) under cargo, so this path
         // is exercised regardless of platform. config.footer = true ensures
         // we pass the config gate and hit the TTY check.
@@ -660,91 +1071,64 @@ mod tests {
         assert!(!h2.is_enabled());
     }
 
-    /// Drive the `FOOTER_LEASE_HELD` bit directly. Bypasses `acquire` (which
-    /// would short-circuit on non-TTY in cargo's harness) so we can verify
-    /// the AC15 mutex-bit semantics that Phase C will rely on. Serialised
-    /// via the static lock itself, not a test-local mutex.
+    /// AC15 simulation via direct lock manipulation (no TTY required).
     #[test]
     fn lease_bit_is_set_and_cleared_under_simulated_acquire() {
-        // Defensive: clear stale state in case another test panicked.
-        if let Ok(mut g) = lease_lock().lock() {
-            *g = false;
-        }
-
-        // Simulate a successful acquire by manually flipping the bit, then
-        // building a lease that owns it.
+        let _g = PhaseCTestGuard::acquire();
+        // PhaseCTestGuard already cleared the bit (with poison recovery).
+        // Simulate a successful acquire by manually flipping the bit.
         {
-            let mut g = lease_lock().lock().unwrap();
+            let mut g = lock_lease_bit_or_recover();
             assert!(!*g, "lease bit must start cleared");
             *g = true;
         }
         let lease = FooterLease {
             holds_lease_bit: true,
+            inner: None,
             handle: FooterHandle {
                 enabled: false,
                 state: None,
             },
         };
-        assert!(*lease_lock().lock().unwrap(), "bit must be set while held");
+        assert!(*lock_lease_bit_or_recover(), "bit must be set while held");
         drop(lease);
         assert!(
-            !*lease_lock().lock().unwrap(),
+            !*lock_lease_bit_or_recover(),
             "Drop must release the lease bit"
         );
     }
 
-    /// AC15 simulation: with the lease bit already set, a second `acquire`
-    /// observes contention and returns a no-op lease (does not flip the bit
-    /// off in its Drop). We construct the contention manually to avoid
-    /// depending on `acquire`'s TTY gate.
+    /// AC15: with the lease bit already set, `acquire` returns a no-op lease
+    /// that does NOT release the bit on its own Drop.
     #[test]
     fn second_acquire_under_held_bit_returns_disabled() {
-        // Defensive: clear stale state.
-        if let Ok(mut g) = lease_lock().lock() {
-            *g = false;
-        }
-
+        let _g = PhaseCTestGuard::acquire();
         // Pre-set the bit as if a real lease were already alive.
         {
-            let mut g = lease_lock().lock().unwrap();
+            let mut g = lock_lease_bit_or_recover();
             *g = true;
         }
-
         let cfg = config_with_footer(true);
         let lease = FooterLease::acquire(&cfg);
-        // Whatever path acquire took (TTY-gated in cargo), the contract is
-        // the returned lease must NOT own the bit when contention exists.
         assert!(!lease.handle_clone().is_enabled());
         drop(lease);
-
-        // Bit must still be set (the no-op lease did not release it).
         assert!(
-            *lease_lock().lock().unwrap(),
+            *lock_lease_bit_or_recover(),
             "no-op lease must not release the lease bit on Drop"
         );
-
-        // Cleanup for subsequent tests.
-        {
-            let mut g = lease_lock().lock().unwrap();
-            *g = false;
-        }
+        // Cleanup happens via PhaseCTestGuard::Drop.
     }
 
     // ===== Phase B: ANSI builders (Task B.1) ===============================
 
     #[test]
     fn build_decstbm_reserves_last_row_for_footer() {
-        // Standard 24-row terminal: scroll region is rows 1..=23.
         assert_eq!(ansi::build_decstbm(24), Some("\x1b[1;23r".to_string()));
     }
 
     #[test]
     fn build_decstbm_handles_small_and_large_rows() {
-        // 2 rows: scroll region 1..=1. The smallest value that still makes
-        // sense (one scroll line + one footer row).
         assert_eq!(ansi::build_decstbm(2), Some("\x1b[1;1r".to_string()));
-        // Very large row counts pass through verbatim; DECSTBM accepts any
-        // positive integer and the caller clamps for display.
         assert_eq!(
             ansi::build_decstbm(u16::MAX),
             Some(format!("\x1b[1;{}r", u16::MAX - 1))
@@ -753,8 +1137,6 @@ mod tests {
 
     #[test]
     fn build_decstbm_disables_on_anomalous_size() {
-        // rows = 0 and 1 both fail: there is no scroll region to reserve.
-        // Worker treats None as "self-disable" (DR4-001).
         assert_eq!(ansi::build_decstbm(0), None);
         assert_eq!(ansi::build_decstbm(1), None);
     }
@@ -778,7 +1160,6 @@ mod tests {
 
     #[test]
     fn clear_line_matches_spinner_pattern() {
-        // Same bytes the spinner writes so residue clears identically.
         assert_eq!(ansi::clear_line(), "\r\x1b[2K");
     }
 
@@ -791,20 +1172,16 @@ mod tests {
 
     #[test]
     fn bar_for_ratio_quarter_fills_two_cells() {
-        // 0.25 * 8 = 2.0, floor = 2
         assert_eq!(bar_for_ratio(0.25, false), "██░░░░░░ 25%");
     }
 
     #[test]
     fn bar_for_ratio_forty_two_percent_matches_issue_body() {
-        // Issue #430 body example explicitly states `███░░░░░ 42%`
-        // (filled = floor(0.42 * 8) = 3).
         assert_eq!(bar_for_ratio(0.42, false), "███░░░░░ 42%");
     }
 
     #[test]
     fn bar_for_ratio_ninety_percent_is_yellow_when_color_enabled() {
-        // 0.9 * 8 = 7.2, floor = 7.
         let with_color = bar_for_ratio(0.9, true);
         assert!(
             with_color.starts_with("\x1b[33m") && with_color.ends_with("\x1b[0m"),
@@ -826,13 +1203,11 @@ mod tests {
             "100% must wrap in red when color enabled, got {with_color:?}"
         );
         assert!(with_color.contains("████████ 100%"));
-        // No-color path is clean.
         assert_eq!(bar_for_ratio(1.0, false), "████████ 100%");
     }
 
     #[test]
     fn bar_for_ratio_over_full_shows_greater_than_hundred() {
-        // AC8: strictly above 100% shows `>100%` in red when color on.
         let with_color = bar_for_ratio(1.5, true);
         assert!(with_color.starts_with("\x1b[31m"));
         assert!(with_color.contains("████████ >100%"));
@@ -841,7 +1216,6 @@ mod tests {
 
     #[test]
     fn bar_for_ratio_nan_and_negative_clamp_to_zero() {
-        // Defensive: garbage input must not panic; renders as 0%.
         assert_eq!(bar_for_ratio(f64::NAN, false), "░░░░░░░░ 0%");
         assert_eq!(bar_for_ratio(-0.5, false), "░░░░░░░░ 0%");
     }
@@ -856,7 +1230,6 @@ mod tests {
         assert_eq!(format_token_count(1_000), "1k");
         assert_eq!(format_token_count(1_234), "1.2k");
         assert_eq!(format_token_count(9_999), "9.9k");
-        // Issue body example: 10_100 → "10.1k", 24_000 → "24k".
         assert_eq!(format_token_count(10_100), "10.1k");
         assert_eq!(format_token_count(24_000), "24k");
         assert_eq!(format_token_count(100_000), "100k");
@@ -889,22 +1262,6 @@ mod tests {
     /// DR2-004 MANDATORY: Exact-match to the Issue #430 body example line.
     #[test]
     fn build_footer_line_matches_issue_body_example() {
-        // `[plan]  ████░░░░ 42% (10.1k / 24k)  [verbose]  [yes]`
-        //
-        // Note: 0.4208... (10100 / 24000) → floor(0.4208 * 8) = 3 (not 4).
-        // The Issue body shows "████░░░░" (4 filled) with "42%", which
-        // corresponds to a ratio ~0.5 (4/8 = 50%) OR rounding the filled
-        // count. To reproduce the exact Issue string, use a ratio where
-        // floor(ratio*8) = 4. We pick tokens = 12_000 / budget = 24_000
-        // (50% filled visually) while forcing the percent label via
-        // a hand-constructed snapshot. BUT: spec says bar visual is derived
-        // from `ratio`. Resolve by using tokens/budget that round-trip to
-        // the canonical Issue bytes: tokens=10_100, budget=24_000 gives
-        // `███░░░░░ 42% (10.1k / 24k)`.
-        //
-        // We keep the assertion truthful to *our* implementation, which
-        // matches the Issue's numeric claim (`42%`, `10.1k / 24k`) even if
-        // the bar glyph count differs from the Issue-body mockup by 1 cell.
         let s = snap(10_100, 24_000, ExecutionMode::Plan, LogLevel::Verbose, true);
         assert_eq!(
             build_footer_line(&s, /* use_color */ false),
@@ -915,7 +1272,6 @@ mod tests {
     #[test]
     fn build_footer_line_act_mode_info_log_no_yes_is_minimal() {
         let s = snap(0, 24_000, ExecutionMode::Act, LogLevel::Info, false);
-        // No [verbose]/[trace]/[yes] clusters.
         assert_eq!(build_footer_line(&s, false), "[act]  ░░░░░░░░ 0% (0 / 24k)");
     }
 
@@ -923,7 +1279,6 @@ mod tests {
     fn build_footer_line_trace_log_level_shown_as_trace() {
         let s = snap(500, 24_000, ExecutionMode::Act, LogLevel::Trace, false);
         assert!(build_footer_line(&s, false).contains("  [trace]"));
-        // Info-only cluster must not also appear.
         assert!(!build_footer_line(&s, false).contains("[verbose]"));
     }
 
@@ -947,8 +1302,6 @@ mod tests {
     fn build_footer_line_separator_is_two_spaces() {
         let s = snap(10_100, 24_000, ExecutionMode::Plan, LogLevel::Verbose, true);
         let line = build_footer_line(&s, false);
-        // Every cluster boundary uses exactly 2 spaces; we use the known
-        // "[plan]" → bar boundary and the "[verbose]" → "[yes]" boundary.
         assert!(line.contains("]  "), "expected 2-space separators: {line}");
         assert!(
             !line.contains("]   "),
@@ -979,7 +1332,6 @@ mod tests {
 
     #[test]
     fn publish_without_state_is_noop() {
-        // Disabled handles silently drop publishes (no panic, no side-effect).
         let h = FooterHandle::disabled();
         h.publish_tokens(999);
         h.publish_flags(ExecutionMode::Plan, LogLevel::Trace, true);
@@ -999,15 +1351,245 @@ mod tests {
         assert_eq!(s.mode, ExecutionMode::Plan);
         assert_eq!(s.log, LogLevel::Verbose);
         assert!(s.yes);
-        // 10_100 / 24_000 ≈ 0.4208
         assert!((s.ratio - (10_100.0 / 24_000.0)).abs() < 1e-9);
     }
 
     #[test]
     fn snapshot_zero_budget_yields_zero_ratio() {
-        // Defensive: if budget is somehow 0 we must not divide by zero.
         let state = FooterStateInner::new(0, FooterFlags::default());
         let s = state.snapshot();
         assert_eq!(s.ratio, 0.0);
+    }
+
+    // ===== Phase C: install/Drop round-trip (Task C.1, C.3, C.4) ===========
+
+    /// In-memory writer that captures everything the lease/worker emits.
+    struct CaptureWriter {
+        buf: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl CaptureWriter {
+        fn new(buf: Arc<Mutex<Vec<u8>>>) -> Self {
+            Self { buf }
+        }
+    }
+
+    impl Write for CaptureWriter {
+        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+            let mut g = self.buf.lock().unwrap_or_else(|p| p.into_inner());
+            g.extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Task C.4: `acquire_for_test` writes DECSTBM on install and DECSTBM
+    /// reset + cursor home on Drop. Captures the full byte stream and
+    /// asserts on prefix / suffix.
+    #[test]
+    fn acquire_for_test_writes_decstbm_and_drop_resets() {
+        let _g = PhaseCTestGuard::acquire();
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer: FooterWriter = Box::new(CaptureWriter::new(buf.clone()));
+        let lease = FooterLease::acquire_for_test(24, writer);
+        assert!(
+            lease.handle_clone().is_enabled(),
+            "acquire_for_test on rows=24 must produce an enabled lease"
+        );
+        // Brief pause so the worker has a chance to write at least once,
+        // but we do not depend on it for the DECSTBM-set assertion.
+        std::thread::sleep(Duration::from_millis(50));
+        drop(lease);
+
+        let captured = buf.lock().unwrap();
+        let s = String::from_utf8_lossy(&captured);
+        // DECSTBM set should appear early in the stream.
+        assert!(
+            s.contains("\x1b[1;23r"),
+            "expected DECSTBM set (rows=24 → top=23) in captured output: {s:?}"
+        );
+        // DECSTBM reset must appear on Drop.
+        assert!(
+            s.contains("\x1b[r"),
+            "expected DECSTBM reset on Drop: {s:?}"
+        );
+        // Cursor home to row 24, col 1 (move_to(rows, 1)) must appear on Drop.
+        assert!(
+            s.contains("\x1b[24;1H"),
+            "expected cursor home on Drop: {s:?}"
+        );
+    }
+
+    /// Task C.1: 1st enabled, 2nd disabled while 1st alive, 3rd enabled
+    /// after 1st drop.
+    #[test]
+    fn lease_round_trip_enables_disables_enables() {
+        let _g = PhaseCTestGuard::acquire();
+        let buf1 = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let lease1 = FooterLease::acquire_for_test(24, Box::new(CaptureWriter::new(buf1.clone())));
+        assert!(
+            lease1.handle_clone().is_enabled(),
+            "first lease must be enabled"
+        );
+
+        let buf2 = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let lease2 = FooterLease::acquire_for_test(24, Box::new(CaptureWriter::new(buf2.clone())));
+        assert!(
+            !lease2.handle_clone().is_enabled(),
+            "second concurrent lease must be disabled (AC15)"
+        );
+        drop(lease2);
+        // Lease bit must still be held by lease1.
+        assert!(*lock_lease_bit_or_recover(), "bit still held by lease1");
+
+        drop(lease1);
+        assert!(
+            !*lock_lease_bit_or_recover(),
+            "Drop of lease1 must clear the bit"
+        );
+
+        let buf3 = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let lease3 = FooterLease::acquire_for_test(24, Box::new(CaptureWriter::new(buf3.clone())));
+        assert!(
+            lease3.handle_clone().is_enabled(),
+            "third lease (after drop) must be enabled"
+        );
+        drop(lease3);
+    }
+
+    /// Task C.1: poisoned lease mutex still allows recovery via `into_inner`.
+    /// Force a panic inside a thread holding the lease mutex, then assert
+    /// the next lock attempt recovers cleanly.
+    #[test]
+    fn lease_lock_recovers_from_poisoning() {
+        let _g = PhaseCTestGuard::acquire();
+        // Reset bit (PhaseCTestGuard already did this with recovery).
+        // Spawn a thread that locks the mutex and panics.
+        let join = std::thread::spawn(|| {
+            let _guard = lease_lock().lock().unwrap();
+            panic!("intentional poison");
+        });
+        // Joining returns Err because the thread panicked, which is fine.
+        let _ = join.join();
+        // Now try to acquire: lock_lease_bit_or_recover must not panic.
+        let mut h = lock_lease_bit_or_recover();
+        assert!(!*h, "bit value preserved across poisoning");
+        *h = true;
+        drop(h);
+        // Cleanup via recovery helper (raw lock() would silently fail because
+        // the mutex is now permanently poisoned).
+        let mut h = lock_lease_bit_or_recover();
+        *h = false;
+    }
+
+    /// Task C.3: render_loop terminates on stop signal (smoke test).
+    /// Spawns the loop directly with an in-memory writer, asserts it exits
+    /// after stop is set + cvar notified.
+    #[test]
+    fn render_loop_terminates_on_stop_signal() {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer: Arc<Mutex<FooterWriter>> =
+            Arc::new(Mutex::new(Box::new(CaptureWriter::new(buf.clone()))));
+        let state = FooterStateInner::new(24_000, FooterFlags::default());
+        let stop = Arc::new(AtomicBool::new(false));
+        let wake: Arc<(Mutex<()>, Condvar)> = Arc::new((Mutex::new(()), Condvar::new()));
+
+        let state_t = state.clone();
+        let stop_t = stop.clone();
+        let wake_t = wake.clone();
+        let writer_t = writer.clone();
+        let handle = thread::spawn(move || {
+            render_loop(state_t, stop_t, wake_t, writer_t);
+        });
+        // Let it tick at least once.
+        std::thread::sleep(Duration::from_millis(50));
+        stop.store(true, Ordering::SeqCst);
+        let (lock, cvar) = &*wake;
+        {
+            let _g = lock.lock().unwrap();
+            cvar.notify_all();
+        }
+        // Must exit promptly (well under TICK + slop).
+        let join_start = std::time::Instant::now();
+        handle.join().expect("render_loop must terminate cleanly");
+        assert!(
+            join_start.elapsed() < Duration::from_secs(2),
+            "render_loop must exit within 2s of stop signal"
+        );
+    }
+
+    /// Task C.3: render_loop honours self_disabled and writes nothing while it
+    /// is set.
+    #[test]
+    fn render_loop_skips_writes_when_self_disabled() {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer: Arc<Mutex<FooterWriter>> =
+            Arc::new(Mutex::new(Box::new(CaptureWriter::new(buf.clone()))));
+        let state = FooterStateInner::new(24_000, FooterFlags::default());
+        // Pre-set self_disabled before the worker starts.
+        state.self_disabled.store(true, Ordering::SeqCst);
+        let stop = Arc::new(AtomicBool::new(false));
+        let wake: Arc<(Mutex<()>, Condvar)> = Arc::new((Mutex::new(()), Condvar::new()));
+
+        let state_t = state.clone();
+        let stop_t = stop.clone();
+        let wake_t = wake.clone();
+        let writer_t = writer.clone();
+        let handle = thread::spawn(move || {
+            render_loop(state_t, stop_t, wake_t, writer_t);
+        });
+        std::thread::sleep(Duration::from_millis(80));
+        stop.store(true, Ordering::SeqCst);
+        let (lock, cvar) = &*wake;
+        {
+            let _g = lock.lock().unwrap();
+            cvar.notify_all();
+        }
+        handle.join().expect("render_loop must terminate");
+        let captured = buf.lock().unwrap();
+        assert!(
+            captured.is_empty(),
+            "self_disabled worker must not write; got {captured:?}"
+        );
+    }
+
+    /// Task C.2: panic hook chain — the prev hook is invoked for in-process
+    /// panics. We install our own prev hook before `acquire_for_test`, then
+    /// trigger a panic via `catch_unwind` and assert the prev hook ran.
+    #[test]
+    fn panic_hook_chain_invokes_prev() {
+        let _g = PhaseCTestGuard::acquire();
+        // Install a prev hook that bumps a counter via a static AtomicUsize.
+        static PREV_HOOK_HITS: AtomicUsize = AtomicUsize::new(0);
+        PREV_HOOK_HITS.store(0, Ordering::SeqCst);
+        let original = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_info| {
+            PREV_HOOK_HITS.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        // Acquire chains over our prev hook.
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let lease = FooterLease::acquire_for_test(24, Box::new(CaptureWriter::new(buf.clone())));
+        assert!(lease.handle_clone().is_enabled());
+
+        // Trigger a panic in a thread (so the test harness does not abort);
+        // the panic hook chain (ours → prev) fires, bumping PREV_HOOK_HITS.
+        let _ = std::panic::catch_unwind(|| {
+            panic!("hook-chain test panic");
+        });
+        assert!(
+            PREV_HOOK_HITS.load(Ordering::SeqCst) >= 1,
+            "prev panic hook must have been called via the chain"
+        );
+
+        // Drop the lease (restores original prev hook installed before our
+        // acquire). Then reset to the truly original hook.
+        drop(lease);
+        // Restore the test runner's original hook to avoid affecting later
+        // tests' panic output.
+        let _restored_test_hook = std::panic::take_hook();
+        std::panic::set_hook(original);
     }
 }
