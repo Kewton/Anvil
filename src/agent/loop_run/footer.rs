@@ -15,7 +15,7 @@
 //! forbids (see `interrupt.rs` lead comment for the same rationale).
 
 use std::io::{self, IsTerminal, Write};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -147,6 +147,12 @@ pub(super) struct FooterStateInner {
     /// observes the change immediately instead of waiting for the next 200ms
     /// tick. The `Drop` of `FooterLease` and `FreezeGuard` also notify here.
     pub wake: (Mutex<()>, Condvar),
+    /// Fallback row count used by `render_loop` when `crossterm::terminal::size()`
+    /// returns `Err` (typically non-TTY environments such as CI test harnesses).
+    /// `0` means no fallback configured. `install_active` stores the rows it
+    /// resolved at acquire time so the worker can keep rendering through the
+    /// captured writer even when the live terminal size is unavailable.
+    pub fallback_rows: AtomicU16,
 }
 
 impl FooterStateInner {
@@ -158,6 +164,7 @@ impl FooterStateInner {
             freeze: AtomicBool::new(false),
             self_disabled: AtomicBool::new(false),
             wake: (Mutex::new(()), Condvar::new()),
+            fallback_rows: AtomicU16::new(0),
         })
     }
 
@@ -573,6 +580,7 @@ fn install_active(
     //    The wake `Condvar` lives inside `FooterStateInner` (Phase D) so
     //    `FreezeGuard::Drop` can wake the worker through the handle.
     let state = FooterStateInner::new(budget, initial_flags);
+    state.fallback_rows.store(rows, Ordering::Relaxed);
     let stop = Arc::new(AtomicBool::new(false));
     let writer = Arc::new(Mutex::new(writer));
 
@@ -907,16 +915,23 @@ fn render_loop(
         }
         let frozen = state.freeze.load(Ordering::SeqCst);
         if !frozen {
-            // 3. terminal::size() — skip render on failure / anomalous size.
+            // 3. terminal::size() — fall back to the rows captured at acquire
+            // time when the live probe fails (CI / non-TTY harness writers).
+            // Anomalous values still flip permanent self-disable below.
             let size = crossterm::terminal::size();
             let (cols, rows) = match size {
                 Ok((c, r)) => (c, r),
                 Err(_) => {
-                    // Wait and retry next tick (transient ioctl errors should
-                    // not flip permanent self-disable).
-                    let g = lock.lock().unwrap_or_else(|p| p.into_inner());
-                    let _ = cvar.wait_timeout(g, TICK);
-                    continue;
+                    let fallback = state.fallback_rows.load(Ordering::Relaxed);
+                    if fallback > 0 {
+                        (80, fallback)
+                    } else {
+                        // No fallback recorded — wait and retry next tick;
+                        // transient ioctl errors must not self-disable.
+                        let g = lock.lock().unwrap_or_else(|p| p.into_inner());
+                        let _ = cvar.wait_timeout(g, TICK);
+                        continue;
+                    }
                 }
             };
             if rows < 2 || cols == 0 {
