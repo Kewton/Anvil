@@ -108,24 +108,43 @@ LLM 推論中・ツール実行中は stderr に 80ms 間隔のスピナーを�
 
 ## スラッシュコマンド
 
+対話モード（REPL）で利用できる 10 コマンド。これらが Tab 補完の候補になり、`/help` の出力と完全に一致する。
+
 - `/help`
 - `/status`
 - `/model`
+- `/yes`
+- `/no`
 - `/plan`
 - `/approve`
 - `/compact`
+- `/logs path [<session_id>]`
+- `/exit`
+
+エイリアス: `/act`（= `/approve`）, `/quit`（= `/exit`）。補完候補には出さない。
+
+### v0.1.0 では未提供（将来構想のプレースホルダ）
+
+以下はコマンドとしては受け付けるが、`unavailable in the v0.1.0 core rebuild` を返すだけ。補完候補にも `/help` 出力にも含めない。
+
 - `/checkpoint [label]`
 - `/rollback`
-- `/yes`
-- `/no`
 - `/watch`
 - `/autotest <command>`
 - `/skills`
 - `/skill <name>`
 - `/mcp`
-- `/logs path [<session_id>]`
 - `/parallel task1 || task2`
-- `/exit`
+
+### 対話モードの入力
+
+TTY 環境で起動した場合は rustyline ベースの入力ハンドラを使う。上下キーで履歴呼び出し、Tab で上記 10 コマンドの補完、Ctrl+A/E/K/U/C/D が働く。パイプ入力・リダイレクト・CI 等の非 TTY 環境では従来どおり素朴な `read_line` にフォールバックする。
+
+履歴は `$XDG_STATE_HOME/anvil/history`（`--state-dir <PATH>` override を尊重）に最大 1000 行まで保存される。先頭に半角スペースを付けた入力は履歴に保存されないので、機密入力はこの opt-out を使う。
+
+### /help 出力順の変更（v0.1.0 系内の互換性メモ）
+
+`/help` 出力は `/help /status /model /yes /no /plan /approve /compact /logs /exit` の順に固定した。以前は `/yes /no` が末尾付近にあったが、承認系コマンドを目立つ位置に移動する UX 改善として `/model` 直後へ前進させている。
 
 ## 設定
 

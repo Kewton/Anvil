@@ -1,3 +1,4 @@
+use super::slash_commands::{self, AnvilEditor, build_editor};
 use super::summary::{ExitReason, format_run_summary};
 use super::*;
 use crate::config::LogLevel;
@@ -99,7 +100,31 @@ impl Agent {
     /// REPL body without the startup banner. Separated from `run_repl` so that
     /// `run_cli` can print the banner once (in a single location) and have
     /// both the fresh-REPL and resumed-REPL paths share the same loop.
+    ///
+    /// Delegates to either the rustyline-powered path (when stdin/stdout are
+    /// both TTYs) or the plain `read_line` fallback (for pipes / CI / redirect).
+    ///
+    /// # Preconditions
+    ///
+    /// This function assumes it is called via `run_cli`, which has already
+    /// invoked `crate::ensure_state_dirs` to materialize `state_root` with the
+    /// correct 0o700 permissions. `prepare_editor()` still re-creates the
+    /// directory defensively (`fs::create_dir_all(state_root)`) so direct
+    /// callers that forgot to run `ensure_state_dirs` don't silently lose
+    /// history persistence, but they also won't get the SSOT permission
+    /// guarantees. Prefer `run_cli` for all new entry points.
     pub fn run_repl_loop(&mut self) -> Result<(), String> {
+        let is_tty = io::stdin().is_terminal() && io::stdout().is_terminal();
+        if !is_tty {
+            return self.run_repl_loop_fallback();
+        }
+        self.run_repl_loop_rustyline()
+    }
+
+    /// Plain `read_line` REPL kept for non-TTY contexts (pipe input, CI,
+    /// redirected stdout). Behaviorally identical to the pre-#427 loop so
+    /// `echo foo | anvil` and friends keep working unchanged.
+    fn run_repl_loop_fallback(&mut self) -> Result<(), String> {
         let mut line = String::new();
         loop {
             print!("anvil> ");
@@ -122,10 +147,101 @@ impl Agent {
         Ok(())
     }
 
+    /// Rustyline-powered REPL: persistent history + tab-completed slash
+    /// commands + Ctrl+A/E/K/U etc. Thin: builds an editor, runs the loop,
+    /// then best-effort appends history and tightens file perms on unix.
+    fn run_repl_loop_rustyline(&mut self) -> Result<(), String> {
+        let (mut editor, history_path) = self.prepare_editor()?;
+        let outcome = self.repl_loop_body(&mut editor);
+        if let Err(err) = editor.append_history(&history_path) {
+            tracing::warn!(
+                "readline: failed to append history ({}): {err}",
+                history_path.display()
+            );
+        }
+        #[cfg(unix)]
+        {
+            tighten_history_perms(&history_path);
+        }
+        outcome
+    }
+
+    /// Resolve state_root, build the editor, and load any existing history
+    /// file. The parent `state_root` is normally created by `ensure_state_dirs`
+    /// before we get here (SSOT, via `run_cli`). We additionally call
+    /// `create_dir_all(state_root)` here as a defensive fallback for direct
+    /// callers of `run_repl` / `run_repl_loop` (see `run_repl_loop` preconditions):
+    /// without it, `append_history` would silently fail on REPL teardown and we
+    /// would lose history persistence — a latent regression the wrapper can
+    /// prevent cheaply (a single `mkdir -p`).
+    fn prepare_editor(&self) -> Result<(AnvilEditor, std::path::PathBuf), String> {
+        let state_root = crate::resolve_state_root(&self.config)?;
+        if let Err(err) = std::fs::create_dir_all(&state_root) {
+            tracing::warn!(
+                "readline: failed to ensure state_root exists ({}): {err}",
+                state_root.display()
+            );
+        }
+        let history_path = state_root.join("history");
+
+        let mut editor = build_editor().map_err(|err| {
+            format!("readline: failed to init editor (Editor::with_config): {err}")
+        })?;
+
+        if let Err(err) = editor.load_history(&history_path)
+            && !is_not_found(&err)
+        {
+            tracing::warn!(
+                "readline: failed to load history ({}): {err}",
+                history_path.display()
+            );
+        }
+
+        Ok((editor, history_path))
+    }
+
+    /// The readline loop body itself — no history I/O, no permission work.
+    /// Ctrl+C discards the current line and keeps going, Ctrl+D (on empty
+    /// line) exits cleanly, other errors are logged and cause a graceful exit.
+    fn repl_loop_body(&mut self, editor: &mut AnvilEditor) -> Result<(), String> {
+        use rustyline::error::ReadlineError;
+
+        loop {
+            match editor.readline("anvil> ") {
+                Ok(line) => {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    match self.process_line(trimmed, self.config.stream) {
+                        Ok(AgentEvent::Continue(Some(msg))) => println!("{msg}"),
+                        Ok(AgentEvent::Continue(None)) => {}
+                        Ok(AgentEvent::Exit) => break Ok(()),
+                        Err(err) => break Err(err),
+                    }
+                }
+                Err(ReadlineError::Interrupted) => continue,
+                Err(ReadlineError::Eof) => break Ok(()),
+                Err(other) => {
+                    tracing::error!("readline: failed to read input: {other}");
+                    break Ok(());
+                }
+            }
+        }
+    }
+
     /// Backwards-compatible wrapper that prints the startup banner and then
     /// runs the REPL loop. Kept for consumers that still call `run_repl`
     /// directly; `run_cli` no longer uses it because the banner is printed
     /// one level up for consistency across REPL / oneshot / resume.
+    ///
+    /// # Preconditions
+    ///
+    /// Same as `run_repl_loop`: the caller is expected to have invoked
+    /// `crate::ensure_state_dirs` (via `run_cli`) so `state_root` exists with
+    /// 0o700 permissions. `prepare_editor` will still `create_dir_all` the
+    /// state root as a fallback, but direct callers do not get the
+    /// permission-hardening SSOT — prefer `run_cli` for new entry points.
     pub fn run_repl(&mut self) -> Result<(), String> {
         print_startup_banner(
             env!("CARGO_PKG_VERSION"),
@@ -182,9 +298,7 @@ impl Agent {
     fn handle_command(&mut self, input: &str) -> Result<AgentEvent, String> {
         let (command, _) = input.split_once(' ').unwrap_or((input, ""));
         match command {
-            "/help" => Ok(AgentEvent::Continue(Some(
-                "/help /status /model /plan /approve /compact /logs /yes /no /exit".to_string(),
-            ))),
+            "/help" => Ok(AgentEvent::Continue(Some(slash_commands::help_line()))),
             "/status" => Ok(AgentEvent::Continue(Some(format!(
                 "mode={:?} auto_approve={} native_tools={} cwd={} session={} plan={} approx_tokens={} log_level={} core_only=true",
                 self.session.mode_state.mode,
@@ -306,5 +420,55 @@ impl Agent {
                 "unknown command: {command}"
             )))),
         }
+    }
+}
+
+/// NotFound on `load_history` is the fresh-env case: no history file yet.
+/// We swallow it silently so first-time REPL starts don't emit a warning.
+fn is_not_found(err: &rustyline::error::ReadlineError) -> bool {
+    matches!(
+        err,
+        rustyline::error::ReadlineError::Io(io_err)
+            if io_err.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
+/// Defense-in-depth: rustyline 14 already chmods 0o600 on save, but in case
+/// an external tool widened the file, we re-apply 0o600 after append. Best
+/// effort; the path-not-found case is silent (common on first run before
+/// `append_history` has created the file).
+///
+/// Hardening against CB-002: we use `symlink_metadata()` + `FileType::is_file()`
+/// so a symlink-swap or non-regular-file substitution at `state_root/history`
+/// does NOT cause us to chmod an unintended target. A symlink here already
+/// implies an adversarial / misconfigured state (state_root is owner-only
+/// 0o700 on Unix) so we log a warning and skip instead of following the link.
+#[cfg(unix)]
+fn tighten_history_perms(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+        Err(err) => {
+            tracing::warn!(
+                "readline: failed to stat history for chmod ({}): {err}",
+                path.display()
+            );
+            return;
+        }
+    };
+    if !meta.file_type().is_file() {
+        tracing::warn!(
+            "readline: refusing to chmod non-regular history path ({}): file_type={:?}",
+            path.display(),
+            meta.file_type()
+        );
+        return;
+    }
+    if let Err(err) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+        tracing::warn!(
+            "readline: failed to chmod history ({}): {err}",
+            path.display()
+        );
     }
 }

@@ -22,6 +22,7 @@ use crate::tools::registry::{ToolContext, ToolRegistry};
 
 pub mod commands;
 mod lifecycle;
+pub mod slash_commands;
 mod spinner;
 mod summary;
 mod turn;
