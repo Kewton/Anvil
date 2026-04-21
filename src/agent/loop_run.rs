@@ -20,7 +20,7 @@ use crate::stdin_prompt;
 use crate::system_prompt::build_system_prompt;
 use crate::tools::registry::{ToolContext, ToolRegistry};
 
-mod commands;
+pub mod commands;
 mod lifecycle;
 mod summary;
 mod turn;

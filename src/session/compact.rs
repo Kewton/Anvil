@@ -76,6 +76,21 @@ pub fn is_compact_summary(message: &ConversationMessage) -> bool {
     message.role == "system" && message.content.starts_with(COMPACT_SUMMARY_PREFIX)
 }
 
+/// Walk the message history from the tail toward the head and return the
+/// content of the most recent `role=user` message, skipping compaction
+/// summaries. Used by `--resume` to replay the last user turn.
+///
+/// Returns `None` when the tail (or the entire history) has been collapsed
+/// into a summary by `compact_messages` — callers should surface a specific
+/// error telling the user the last prompt is no longer replayable.
+pub fn find_last_user_prompt(messages: &[ConversationMessage]) -> Option<String> {
+    messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user" && !is_compact_summary(m))
+        .map(|m| m.content.clone())
+}
+
 fn summarize_messages(messages: &[ConversationMessage]) -> String {
     let mut lines = Vec::new();
     let recent = messages

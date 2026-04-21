@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use crate::cli::CliArgs;
+use crate::cli::{CliArgs, ResumeRequest};
 use crate::safety::host_validation::validate_localhost_url;
 
 /// `EnvFilter` directive that silences DEBUG/TRACE noise from hyper/reqwest/rustls.
@@ -145,6 +145,7 @@ pub struct Config {
     pub oneshot: bool,
     pub prompt: Option<String>,
     pub state_dir_override: Option<PathBuf>,
+    pub resume: ResumeRequest,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -214,6 +215,7 @@ impl Config {
             oneshot: args.oneshot || args.prompt.is_some(),
             prompt: args.prompt,
             state_dir_override: merged.state_dir_override,
+            resume: ResumeRequest::from_flag(args.resume),
         };
         Ok((config, warnings))
     }
