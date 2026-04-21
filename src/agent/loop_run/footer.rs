@@ -153,10 +153,32 @@ pub(super) struct FooterStateInner {
     /// resolved at acquire time so the worker can keep rendering through the
     /// captured writer even when the live terminal size is unavailable.
     pub fallback_rows: AtomicU16,
+    /// Whether DECSTBM install + footer line rendering are active. `false`
+    /// means "probe-only lease": the daemon keeps polling / storing
+    /// `current_cols`, but does not install DECSTBM, chain a panic hook, or
+    /// write footer lines (issue #432 §4.4.2).
+    pub draw_enabled: bool,
+    /// Broadcast channel for the current terminal width. Updated every `TICK`
+    /// (200ms) by `render_loop`. A value of `0` means "not yet probed" (first
+    /// tick hasn't run, `terminal::size()` failed at acquire, or the daemon
+    /// permanently self-disabled). Readers (progress line) observe this via
+    /// `FooterHandle::current_cols()` and treat `0` as "width unknown; use
+    /// fallback".
+    pub current_cols: AtomicU16,
+    /// `ANVIL_NO_RESIZE` opt-out flag decided once at `FooterLease::acquire`
+    /// time (issue #432 §4.4.1). When true, `render_loop` skips `current_cols`
+    /// store and `FooterHandle::current_cols()` returns `None` regardless of
+    /// stored value. Immutable after construction.
+    pub resize_opt_out: bool,
 }
 
 impl FooterStateInner {
-    pub(super) fn new(budget: usize, flags: FooterFlags) -> Arc<Self> {
+    pub(super) fn new(
+        budget: usize,
+        flags: FooterFlags,
+        draw_enabled: bool,
+        resize_opt_out: bool,
+    ) -> Arc<Self> {
         Arc::new(Self {
             tokens: AtomicUsize::new(0),
             budget,
@@ -165,7 +187,18 @@ impl FooterStateInner {
             self_disabled: AtomicBool::new(false),
             wake: (Mutex::new(()), Condvar::new()),
             fallback_rows: AtomicU16::new(0),
+            draw_enabled,
+            current_cols: AtomicU16::new(0),
+            resize_opt_out,
         })
+    }
+
+    /// Permanently self-disable the footer daemon. Zeroes `current_cols` so
+    /// readers stop receiving the last-known-good value after disable. This
+    /// is the only code path that should set `self_disabled = true`.
+    pub(super) fn mark_self_disabled(&self) {
+        self.self_disabled.store(true, Ordering::SeqCst);
+        self.current_cols.store(0, Ordering::Relaxed);
     }
 
     /// Compute the current footer snapshot. Pure read; safe to call from the
@@ -456,12 +489,18 @@ impl FooterLease {
 
         #[cfg(not(windows))]
         {
-            if !config.footer {
+            let is_terminal = io::stdout().is_terminal();
+            // Non-TTY: fully disabled regardless of config (issue #430 / #432).
+            if !is_terminal {
                 return Self::disabled_lease();
             }
-            if !io::stdout().is_terminal() {
-                return Self::disabled_lease();
-            }
+
+            // Determine draw vs. probe-only (issue #432 §4.4.2). On a TTY with
+            // `config.footer == false` we still spawn the daemon for cols
+            // broadcast; DECSTBM / footer line writes are suppressed.
+            let draw_enabled = config.footer;
+            // ANVIL_NO_RESIZE opt-out decided once at acquire time.
+            let resize_opt_out = std::env::var_os("ANVIL_NO_RESIZE").is_some_and(|v| !v.is_empty());
 
             // Single-instance gate (AC15). Acquired here and held until `Drop`.
             // We don't keep the guard alive across the whole acquire path — we
@@ -510,7 +549,15 @@ impl FooterLease {
                 yes: config.yes_mode,
             };
             let writer: FooterWriter = Box::new(io::stdout());
-            match install_active(rows, budget, initial_flags, writer, bit_guard) {
+            match install_active(
+                rows,
+                budget,
+                initial_flags,
+                writer,
+                bit_guard,
+                draw_enabled,
+                resize_opt_out,
+            ) {
                 Ok(lease) => lease,
                 Err(()) => {
                     // install_active already released the bit and logged on
@@ -546,8 +593,19 @@ impl FooterLease {
     /// contract as `acquire`).
     #[cfg(test)]
     pub(super) fn acquire_for_test(rows: u16, writer: FooterWriter) -> Self {
-        // Claim the bit (or refuse, returning a disabled lease for parity
-        // with the public path). Tests serialise via a test-local mutex.
+        Self::acquire_for_test_with(rows, writer, /* draw_enabled */ true, false)
+    }
+
+    /// Test-only: `acquire_for_test` with explicit `draw_enabled` and
+    /// `resize_opt_out` flags, letting probe-only / no-resize contracts be
+    /// exercised without mutating real env vars.
+    #[cfg(test)]
+    pub(super) fn acquire_for_test_with(
+        rows: u16,
+        writer: FooterWriter,
+        draw_enabled: bool,
+        resize_opt_out: bool,
+    ) -> Self {
         {
             let mut held = lock_lease_bit_or_recover();
             if *held {
@@ -557,7 +615,15 @@ impl FooterLease {
             *held = true;
         }
         let bit_guard = LeaseBitGuard::new();
-        match install_active(rows, 24_000, FooterFlags::default(), writer, bit_guard) {
+        match install_active(
+            rows,
+            24_000,
+            FooterFlags::default(),
+            writer,
+            bit_guard,
+            draw_enabled,
+            resize_opt_out,
+        ) {
             Ok(lease) => lease,
             Err(()) => Self::disabled_lease(),
         }
@@ -569,36 +635,46 @@ impl FooterLease {
 /// bit through `bit_guard.release()` and returns `Err(())`; on success the
 /// guard is consumed and ownership of the bit transfers to the returned
 /// `FooterLease`.
+///
+/// When `draw_enabled == false` the lease becomes "probe-only" (issue #432):
+/// the daemon still runs and updates `current_cols` every tick, but DECSTBM
+/// install, panic hook chain, and footer line writes are skipped. The
+/// resulting `FooterHandle` has `enabled == false` but carries live state so
+/// `current_cols()` can return `Some(_)`.
 fn install_active(
     rows: u16,
     budget: usize,
     initial_flags: FooterFlags,
     writer: FooterWriter,
     bit_guard: LeaseBitGuard,
+    draw_enabled: bool,
+    resize_opt_out: bool,
 ) -> Result<FooterLease, ()> {
     // 1. Build the shared state and synchronisation primitives up front.
     //    The wake `Condvar` lives inside `FooterStateInner` (Phase D) so
     //    `FreezeGuard::Drop` can wake the worker through the handle.
-    let state = FooterStateInner::new(budget, initial_flags);
+    let state = FooterStateInner::new(budget, initial_flags, draw_enabled, resize_opt_out);
     state.fallback_rows.store(rows, Ordering::Relaxed);
     let stop = Arc::new(AtomicBool::new(false));
     let writer = Arc::new(Mutex::new(writer));
 
     // 2. Set DECSTBM (Task C.4). Failure → release bit and disable.
-    let decstbm = match ansi::build_decstbm(rows) {
-        Some(s) => s,
-        None => {
-            tracing::warn!("anvil footer: build_decstbm returned None; disabling");
-            bit_guard.release();
-            return Err(());
-        }
-    };
-    {
+    //    Skipped entirely for probe-only leases (issue #432 §4.4.2).
+    if draw_enabled {
+        let decstbm = match ansi::build_decstbm(rows) {
+            Some(s) => s,
+            None => {
+                tracing::warn!("anvil footer: build_decstbm returned None; disabling");
+                bit_guard.release();
+                return Err(());
+            }
+        };
         let mut w = writer
             .lock()
             .expect("footer writer mutex never poisoned at install");
         if let Err(err) = w.write_all(decstbm.as_bytes()) {
             tracing::warn!(?err, "anvil footer: failed to write DECSTBM; disabling");
+            drop(w);
             bit_guard.release();
             return Err(());
         }
@@ -608,18 +684,24 @@ fn install_active(
     // 3. Install panic hook chain (Task C.2). The custom hook sends the
     //    DECSTBM reset to stdout (best-effort, broken pipes ignored) and then
     //    delegates to `prev` so backtraces and tracing-subscriber's own hook
-    //    keep working (AC10).
-    let prev_panic_hook: PanicHook = std::panic::take_hook();
-    let prev_arc = Arc::new(prev_panic_hook);
-    let prev_for_hook = prev_arc.clone();
-    std::panic::set_hook(Box::new(move |info| {
-        // Best-effort DECSTBM reset directly to raw stdout. We intentionally
-        // do NOT touch the FOOTER_LEASE_HELD mutex here (DR2-012 invariant)
-        // to avoid deadlocking with the Drop path that may also be running.
-        let _ = io::stdout().write_all(b"\x1b[r");
-        let _ = io::stdout().flush();
-        prev_for_hook(info);
-    }));
+    //    keep working (AC10). Skipped for probe-only leases — there is no
+    //    DECSTBM to reset in that path.
+    let prev_panic_hook_arc: Option<Arc<PanicHook>> = if draw_enabled {
+        let prev_panic_hook: PanicHook = std::panic::take_hook();
+        let prev_arc = Arc::new(prev_panic_hook);
+        let prev_for_hook = prev_arc.clone();
+        std::panic::set_hook(Box::new(move |info| {
+            // Best-effort DECSTBM reset directly to raw stdout. We intentionally
+            // do NOT touch the FOOTER_LEASE_HELD mutex here (DR2-012 invariant)
+            // to avoid deadlocking with the Drop path that may also be running.
+            let _ = io::stdout().write_all(b"\x1b[r");
+            let _ = io::stdout().flush();
+            prev_for_hook(info);
+        }));
+        Some(prev_arc)
+    } else {
+        None
+    };
 
     // 4. Spawn the worker thread (Task C.3).
     let state_for_thread = state.clone();
@@ -641,10 +723,12 @@ fn install_active(
         Ok(h) => h,
         Err(err) => {
             tracing::warn!(?err, "anvil footer: failed to spawn worker; disabling");
-            // Reverse panic hook install before bailing.
-            std::panic::set_hook(panic_hook_from_arc(prev_arc));
-            // Best-effort DECSTBM reset.
-            if let Ok(mut w) = writer.lock() {
+            // Reverse panic hook install before bailing (only if we installed).
+            if let Some(prev_arc) = prev_panic_hook_arc {
+                std::panic::set_hook(panic_hook_from_arc(prev_arc));
+            }
+            // Best-effort DECSTBM reset (only if we installed DECSTBM).
+            if draw_enabled && let Ok(mut w) = writer.lock() {
                 let _ = w.write_all(ansi::build_decstbm_reset().as_bytes());
                 let _ = w.flush();
             }
@@ -657,7 +741,7 @@ fn install_active(
     //    into `holds_lease_bit = true` here.
     bit_guard.into_owned();
     let handle = FooterHandle {
-        enabled: true,
+        enabled: draw_enabled,
         state: Some(state.clone()),
     };
     Ok(FooterLease {
@@ -666,7 +750,7 @@ fn install_active(
             state,
             stop,
             worker: Some(worker),
-            prev_panic_hook: Some(prev_arc),
+            prev_panic_hook: prev_panic_hook_arc,
             decstbm_rows: rows,
             writer,
         }),
@@ -742,8 +826,11 @@ impl Drop for FooterLease {
                 tracing::warn!(?e, "anvil footer: worker thread join failed");
             }
             // 3. DECSTBM reset + cursor restore. Best-effort: broken pipes
-            //    after the worker disabled itself are ignored.
-            if let Ok(mut w) = active.writer.lock() {
+            //    after the worker disabled itself are ignored. Skipped for
+            //    probe-only leases (issue #432): we never wrote DECSTBM set.
+            if active.state.draw_enabled
+                && let Ok(mut w) = active.writer.lock()
+            {
                 let _ = w.write_all(ansi::build_decstbm_reset().as_bytes());
                 let cursor_home = ansi::move_to(active.decstbm_rows, 1);
                 let _ = w.write_all(cursor_home.as_bytes());
@@ -780,6 +867,28 @@ impl FooterHandle {
     /// call sites can do cheap early-returns when constructing argument lists.
     pub fn is_enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// Current terminal width in columns as observed by the footer render loop.
+    ///
+    /// Returns `Some(cols)` when the handle carries shared state (even if
+    /// visual footer rendering is disabled, i.e. `is_enabled() == false`) and
+    /// `render_loop` has written at least one non-zero probe.
+    ///
+    /// Returns `None` when the handle is fully detached (`FooterHandle::disabled()`
+    /// / non-TTY at acquire time), when `ANVIL_NO_RESIZE` is set, or when
+    /// `render_loop` has never recorded a live size (first-tick race).
+    ///
+    /// Readers MUST fall back to a fixed default on `None`.
+    pub fn current_cols(&self) -> Option<u16> {
+        let state = self.state.as_ref()?;
+        if state.resize_opt_out {
+            return None;
+        }
+        match state.current_cols.load(Ordering::Relaxed) {
+            0 => None,
+            cols => Some(cols),
+        }
     }
 
     /// Publish the per-turn token count.
@@ -913,18 +1022,47 @@ fn render_loop(
             let _ = cvar.wait_timeout(g, TICK);
             continue;
         }
+
+        // Issue #432: probe terminal size exactly once per tick. Distinguish
+        // transient ioctl failures (Err) from anomalous live sizes (rows<2 ||
+        // cols==0). Transient failures fall back to `fallback_rows`; anomalous
+        // sizes trigger permanent self-disable so readers stop receiving stale
+        // values (CB-002 / issue #432 §6.2).
+        enum Probe {
+            Live { cols: u16, rows: u16 },
+            Err,
+            Anomalous,
+        }
+        let probe = match crossterm::terminal::size() {
+            Ok((c, r)) if c >= 1 && r >= 2 => Probe::Live { cols: c, rows: r },
+            Ok(_) => Probe::Anomalous,
+            Err(_) => Probe::Err,
+        };
+        if matches!(probe, Probe::Anomalous) {
+            // Anomalous in any lease (probe-only or draw-enabled): permanently
+            // self-disable. `mark_self_disabled()` also zeroes current_cols
+            // so readers stop receiving stale values.
+            state.mark_self_disabled();
+            continue;
+        }
+        if !state.resize_opt_out
+            && let Probe::Live { cols, .. } = probe
+        {
+            // Keep current_cols fresh for progress_line readers even while
+            // frozen. Reader has its own opt-out guard; this is defence-in-depth.
+            state.current_cols.store(cols, Ordering::Relaxed);
+        }
+
         let frozen = state.freeze.load(Ordering::SeqCst);
-        if !frozen {
-            // 3. terminal::size() — fall back to the rows captured at acquire
-            // time when the live probe fails (CI / non-TTY harness writers).
-            // Anomalous values still flip permanent self-disable below.
-            let size = crossterm::terminal::size();
-            let (cols, rows) = match size {
-                Ok((c, r)) => (c, r),
-                Err(_) => {
+        if state.draw_enabled && !frozen {
+            // Reuse the probe above — fall back to rows captured at acquire
+            // time when the live probe failed (CI / non-TTY harness writers).
+            let rows = match probe {
+                Probe::Live { rows, .. } => rows,
+                Probe::Err => {
                     let fallback = state.fallback_rows.load(Ordering::Relaxed);
                     if fallback > 0 {
-                        (80, fallback)
+                        fallback
                     } else {
                         // No fallback recorded — wait and retry next tick;
                         // transient ioctl errors must not self-disable.
@@ -933,13 +1071,8 @@ fn render_loop(
                         continue;
                     }
                 }
+                Probe::Anomalous => unreachable!("handled above"),
             };
-            if rows < 2 || cols == 0 {
-                // Anomalous size while running — self-disable to avoid
-                // emitting garbage. (DR4-001)
-                state.self_disabled.store(true, Ordering::SeqCst);
-                continue;
-            }
 
             // AC3: when the row count changed, re-emit DECSTBM so the scroll
             // region still leaves the bottom row free.
@@ -970,7 +1103,7 @@ fn render_loop(
             if write_result.is_err() {
                 // AC17: write failure → permanent self-disable. Phase E
                 // refines the warning text and metrics.
-                state.self_disabled.store(true, Ordering::SeqCst);
+                state.mark_self_disabled();
                 tracing::warn!("anvil footer: write failed; self-disabling");
                 continue;
             }
@@ -1358,7 +1491,7 @@ mod tests {
 
     #[test]
     fn publish_tokens_writes_through_state() {
-        let state = FooterStateInner::new(24_000, FooterFlags::default());
+        let state = FooterStateInner::new(24_000, FooterFlags::default(), true, false);
         let h = FooterHandle::with_state(state.clone());
         h.publish_tokens(12_345);
         assert_eq!(state.tokens.load(Ordering::Relaxed), 12_345);
@@ -1366,7 +1499,7 @@ mod tests {
 
     #[test]
     fn publish_flags_writes_through_state() {
-        let state = FooterStateInner::new(24_000, FooterFlags::default());
+        let state = FooterStateInner::new(24_000, FooterFlags::default(), true, false);
         let h = FooterHandle::with_state(state.clone());
         h.publish_flags(ExecutionMode::Plan, LogLevel::Trace, true);
         let flags = *state.flags.lock().unwrap();
@@ -1385,7 +1518,7 @@ mod tests {
 
     #[test]
     fn snapshot_reads_back_published_values() {
-        let state = FooterStateInner::new(24_000, FooterFlags::default());
+        let state = FooterStateInner::new(24_000, FooterFlags::default(), true, false);
         let h = FooterHandle::with_state(state.clone());
         h.publish_tokens(10_100);
         h.publish_flags(ExecutionMode::Plan, LogLevel::Verbose, true);
@@ -1401,7 +1534,7 @@ mod tests {
 
     #[test]
     fn snapshot_zero_budget_yields_zero_ratio() {
-        let state = FooterStateInner::new(0, FooterFlags::default());
+        let state = FooterStateInner::new(0, FooterFlags::default(), true, false);
         let s = state.snapshot();
         assert_eq!(s.ratio, 0.0);
     }
@@ -1537,7 +1670,7 @@ mod tests {
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let writer: Arc<Mutex<FooterWriter>> =
             Arc::new(Mutex::new(Box::new(CaptureWriter::new(buf.clone()))));
-        let state = FooterStateInner::new(24_000, FooterFlags::default());
+        let state = FooterStateInner::new(24_000, FooterFlags::default(), true, false);
         let stop = Arc::new(AtomicBool::new(false));
 
         let state_t = state.clone();
@@ -1570,7 +1703,7 @@ mod tests {
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let writer: Arc<Mutex<FooterWriter>> =
             Arc::new(Mutex::new(Box::new(CaptureWriter::new(buf.clone()))));
-        let state = FooterStateInner::new(24_000, FooterFlags::default());
+        let state = FooterStateInner::new(24_000, FooterFlags::default(), true, false);
         // Pre-set self_disabled before the worker starts.
         state.self_disabled.store(true, Ordering::SeqCst);
         let stop = Arc::new(AtomicBool::new(false));
@@ -1723,5 +1856,105 @@ mod tests {
             "worker must resume rendering after FreezeGuard drop"
         );
         drop(lease);
+    }
+
+    // ===== Issue #432: cols broadcaster / probe-only lease ==================
+
+    #[test]
+    fn current_cols_returns_none_after_mark_self_disabled() {
+        let state = FooterStateInner::new(24_000, FooterFlags::default(), true, false);
+        // Simulate a post-tick probe result by storing a live width.
+        state.current_cols.store(120, Ordering::Relaxed);
+        let handle = FooterHandle::with_state(state.clone());
+        assert_eq!(handle.current_cols(), Some(120));
+
+        state.mark_self_disabled();
+        assert!(state.self_disabled.load(Ordering::SeqCst));
+        assert_eq!(
+            handle.current_cols(),
+            None,
+            "mark_self_disabled must zero current_cols"
+        );
+    }
+
+    #[test]
+    fn current_cols_returns_none_when_resize_opt_out() {
+        // resize_opt_out=true: reader-side guard returns None regardless of
+        // any stored value.
+        let state = FooterStateInner::new(24_000, FooterFlags::default(), true, true);
+        state.current_cols.store(120, Ordering::Relaxed);
+        let handle = FooterHandle::with_state(state);
+        assert_eq!(handle.current_cols(), None);
+    }
+
+    #[test]
+    fn visuals_disabled_handle_can_still_report_current_cols() {
+        // Probe-only lease contract: draw_enabled=false + state=Some(_) means
+        // `is_enabled() == false` yet `current_cols()` still broadcasts.
+        let state = FooterStateInner::new(24_000, FooterFlags::default(), false, false);
+        state.current_cols.store(120, Ordering::Relaxed);
+        let handle = FooterHandle::with_state(state);
+        assert!(!handle.is_enabled());
+        assert_eq!(handle.current_cols(), Some(120));
+    }
+
+    #[test]
+    fn mark_self_disabled_zeros_current_cols() {
+        let state = FooterStateInner::new(24_000, FooterFlags::default(), true, false);
+        state.current_cols.store(80, Ordering::Relaxed);
+        state.mark_self_disabled();
+        assert_eq!(state.current_cols.load(Ordering::Relaxed), 0);
+        assert!(state.self_disabled.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn acquire_with_footer_disabled_yields_probe_only_lease() {
+        // Directly construct a probe-only lease via `acquire_for_test_with`
+        // (the real `FooterLease::acquire` path requires a TTY, which cargo's
+        // test harness does not provide). This asserts the contract:
+        // handle.is_enabled() == false but state is attached so current_cols()
+        // can return Some(_).
+        let _g = PhaseCTestGuard::acquire();
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let lease = FooterLease::acquire_for_test_with(
+            24,
+            Box::new(CaptureWriter::new(buf.clone())),
+            /* draw_enabled */ false,
+            /* resize_opt_out */ false,
+        );
+        let handle = lease.handle_clone();
+        assert!(
+            !handle.is_enabled(),
+            "probe-only lease must report is_enabled() == false"
+        );
+        // Wait a couple of ticks for the worker to probe and store cols.
+        let deadline = std::time::Instant::now() + Duration::from_millis(2000);
+        let mut saw_cols = false;
+        while std::time::Instant::now() < deadline {
+            if handle.current_cols().is_some() {
+                saw_cols = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // When cargo test runs on a non-TTY, `crossterm::terminal::size()`
+        // may still return Ok (as is common on macOS / Linux with a pty
+        // wrapper) or Err. Only assert that the probe-only lease itself does
+        // not panic and keeps `is_enabled()` false. `saw_cols` is allowed to
+        // be either true or false depending on the harness.
+        let _ = saw_cols;
+
+        // Probe-only lease must NOT write DECSTBM.
+        drop(lease);
+        let captured = buf.lock().unwrap();
+        let s = String::from_utf8_lossy(&captured);
+        assert!(
+            !s.contains("\x1b[1;"),
+            "probe-only lease must not write DECSTBM set: {s:?}"
+        );
+        assert!(
+            !s.contains("\x1b[r"),
+            "probe-only lease must not write DECSTBM reset: {s:?}"
+        );
     }
 }

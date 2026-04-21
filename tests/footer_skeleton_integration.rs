@@ -45,6 +45,12 @@ fn acquire_under_cargo_non_tty_returns_disabled() {
 }
 
 #[test]
+fn disabled_handle_current_cols_is_none() {
+    let handle = FooterHandle::disabled();
+    assert_eq!(handle.current_cols(), None);
+}
+
+#[test]
 fn disabled_handle_publish_and_freeze_are_noop() {
     // Phase A "AC9 placeholder": the handle plumbed through `Agent::new`
     // along the sessions / oneshot paths must be observably inert. We can't

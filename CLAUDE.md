@@ -21,6 +21,8 @@
   - 推論 / ツール実行中のスピナー（stderr, 80ms, TTY / `NO_COLOR` / `ANVIL_NO_SPINNER` / UTF-8 分岐）
 - `src/agent/loop_run/interrupt.rs`
   - ESC 割り込み monitor（stdin raw mode + daemon thread、`ANVIL_NO_INTERRUPT` / 非TTY / approve prompt で自動無効化）
+- `src/agent/loop_run/footer.rs`
+  - 固定フッター daemon (stdout, 200ms, DECSTBM 再適用、token / mode / log / yes 表示、current_cols broadcast for turn.rs progress line)
 - `src/modes/plan_act.rs`
   - Plan / Act の単純な状態
 - `src/session/*`
