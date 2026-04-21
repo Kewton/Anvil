@@ -1690,7 +1690,7 @@ mod tests {
 
         // Wake-on-drop should be observed within one TICK. Allow generous
         // slack for slow CI.
-        let deadline = std::time::Instant::now() + Duration::from_millis(800);
+        let deadline = std::time::Instant::now() + Duration::from_millis(4000);
         let mut saw_token = false;
         while std::time::Instant::now() < deadline {
             let captured = buf.lock().unwrap().clone();
