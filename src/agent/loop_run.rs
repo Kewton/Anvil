@@ -21,12 +21,17 @@ use crate::system_prompt::build_system_prompt;
 use crate::tools::registry::{ToolContext, ToolRegistry};
 
 pub mod commands;
+mod footer;
 mod interrupt;
 mod lifecycle;
 pub mod slash_commands;
 mod spinner;
 mod summary;
 mod turn;
+
+// Public re-exports so `lib.rs::run_cli` can hand a `FooterHandle` into
+// `Agent::new` and own the matching `FooterLease` for its scope (issue #430).
+pub use footer::{FooterHandle, FooterLease};
 
 const DEFAULT_KEEP_TAIL: usize = 24;
 const LATE_TURN_KEEP_TAIL: usize = 12;
@@ -45,6 +50,11 @@ pub struct Agent {
     work_root: PathBuf,
     native_tools_enabled: bool,
     tool_registry: ToolRegistry,
+    /// Fixed footer handle. Phase A: always disabled (no-op); the handle
+    /// shape is plumbed now so Phase B-D can attach `publish_*` calls
+    /// without re-touching `Agent::new` callers (issue #430).
+    #[allow(dead_code)]
+    footer: FooterHandle,
 }
 
 impl Agent {
@@ -54,6 +64,7 @@ impl Agent {
         client: OllamaClient,
         session_store: SessionStore,
         session: SessionSnapshot,
+        footer: FooterHandle,
     ) -> Self {
         let work_root = session
             .active_root
@@ -70,6 +81,7 @@ impl Agent {
             work_root,
             native_tools_enabled,
             tool_registry: ToolRegistry::default(),
+            footer,
         }
     }
 }

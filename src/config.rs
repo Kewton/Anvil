@@ -146,6 +146,10 @@ pub struct Config {
     pub prompt: Option<String>,
     pub state_dir_override: Option<PathBuf>,
     pub resume: ResumeRequest,
+    /// Whether the fixed footer status bar should be enabled. `true` by default;
+    /// disabled by `--no-footer`, `ANVIL_NO_FOOTER` (non-empty), or
+    /// `.anvil/config` `footer=false`. See issue #430 §5.
+    pub footer: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -162,6 +166,10 @@ pub struct PartialConfig {
     pub yes_mode: Option<bool>,
     pub fresh_session: Option<bool>,
     pub state_dir_override: Option<PathBuf>,
+    /// `Some(false)` when an explicit disable signal is present
+    /// (`--no-footer` / non-empty `ANVIL_NO_FOOTER` / `.anvil/config` `footer=false`).
+    /// `None` means "no opinion" so default (`true`) wins.
+    pub footer: Option<bool>,
 }
 
 impl Config {
@@ -191,6 +199,9 @@ impl Config {
             yes_mode: args.yes.then_some(true),
             fresh_session: args.fresh_session.then_some(true),
             state_dir_override: args.state_dir.clone(),
+            // CLI footer flag is "disable-only": `--no-footer` emits Some(false),
+            // omission emits None so file/env/default can still apply.
+            footer: args.no_footer.then_some(false),
         };
         let merged = merge_partial_configs(&[file_config, env_config, cli_config]);
         let ollama_host = validate_localhost_url(
@@ -216,6 +227,8 @@ impl Config {
             prompt: args.prompt,
             state_dir_override: merged.state_dir_override,
             resume: ResumeRequest::from_flag(args.resume),
+            // Default true; any disable signal (file/env/CLI) lands as Some(false).
+            footer: merged.footer.unwrap_or(true),
         };
         Ok((config, warnings))
     }
@@ -260,6 +273,9 @@ pub fn merge_partial_configs(configs: &[PartialConfig]) -> PartialConfig {
         if config.state_dir_override.is_some() {
             merged.state_dir_override = config.state_dir_override.clone();
         }
+        if config.footer.is_some() {
+            merged.footer = config.footer;
+        }
     }
     merged
 }
@@ -302,6 +318,12 @@ pub fn load_config_file(path: &Path, warnings: &mut Vec<String>) -> Result<Parti
         yes_mode: map.get("yes_mode").and_then(|value| parse_bool(value)),
         fresh_session: map.get("fresh_session").and_then(|value| parse_bool(value)),
         state_dir_override: map.get("state_dir").map(PathBuf::from),
+        // Only emit Some(false) for explicit disable; any other value (true /
+        // unrecognized / missing) leaves footer as None so default wins.
+        footer: map
+            .get("footer")
+            .and_then(|value| parse_bool(value))
+            .and_then(|enabled| (!enabled).then_some(false)),
     })
 }
 
@@ -344,6 +366,11 @@ pub fn load_env_config(warnings: &mut Vec<String>) -> PartialConfig {
             .ok()
             .and_then(|value| parse_bool(&value)),
         state_dir_override: env::var("ANVIL_STATE_DIR").ok().map(PathBuf::from),
+        // POSIX `NO_COLOR` convention: any non-empty value disables; matches
+        // `ANVIL_NO_SPINNER` / `ANVIL_NO_INTERRUPT` precedent (see spinner.rs).
+        footer: env::var("ANVIL_NO_FOOTER")
+            .ok()
+            .and_then(|value| (!value.is_empty()).then_some(false)),
     }
 }
 

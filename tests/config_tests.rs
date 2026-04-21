@@ -257,6 +257,112 @@ fn config_file_legacy_debug_true_maps_to_trace_with_warning() {
     );
 }
 
+// --- footer (issue #430 Phase A) ---
+
+#[test]
+fn config_file_footer_false_emits_some_false() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config");
+    std::fs::write(&path, "footer=false\n").unwrap();
+    let mut warnings: Vec<String> = Vec::new();
+    let cfg = load_config_file(&path, &mut warnings).unwrap();
+    assert_eq!(cfg.footer, Some(false));
+}
+
+#[test]
+fn config_file_footer_true_emits_none_for_default_to_win() {
+    // `footer=true` is "no opinion" relative to the default-true; only
+    // explicit disable propagates so CLI/env can still override.
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config");
+    std::fs::write(&path, "footer=true\n").unwrap();
+    let mut warnings: Vec<String> = Vec::new();
+    let cfg = load_config_file(&path, &mut warnings).unwrap();
+    assert_eq!(cfg.footer, None);
+}
+
+#[test]
+fn config_file_missing_footer_key_is_none() {
+    // Backward compatibility (DR3-003): legacy configs without `footer=` key
+    // must not flip behavior.
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config");
+    std::fs::write(&path, "model=qwen3:8b\n").unwrap();
+    let mut warnings: Vec<String> = Vec::new();
+    let cfg = load_config_file(&path, &mut warnings).unwrap();
+    assert_eq!(cfg.footer, None);
+}
+
+#[test]
+fn env_anvil_no_footer_nonempty_disables() {
+    with_env(&[("ANVIL_NO_FOOTER", Some("1"))], || {
+        let mut warnings: Vec<String> = Vec::new();
+        let cfg = load_env_config(&mut warnings);
+        assert_eq!(cfg.footer, Some(false));
+    });
+}
+
+#[test]
+fn env_anvil_no_footer_empty_does_not_disable() {
+    // POSIX `NO_COLOR` convention: empty value is treated as unset.
+    with_env(&[("ANVIL_NO_FOOTER", Some(""))], || {
+        let mut warnings: Vec<String> = Vec::new();
+        let cfg = load_env_config(&mut warnings);
+        assert_eq!(cfg.footer, None);
+    });
+}
+
+#[test]
+fn env_anvil_no_footer_unset_is_none() {
+    with_env(&[("ANVIL_NO_FOOTER", None)], || {
+        let mut warnings: Vec<String> = Vec::new();
+        let cfg = load_env_config(&mut warnings);
+        assert_eq!(cfg.footer, None);
+    });
+}
+
+#[test]
+fn merge_footer_disable_from_any_source_wins() {
+    // AC16: `--no-footer` > `ANVIL_NO_FOOTER` > `.anvil/config footer=false` > default.
+    // All disable signals collapse to `Some(false)`; the merged result is
+    // `Some(false)` whenever any source disables.
+    let file_disable = PartialConfig {
+        footer: Some(false),
+        ..PartialConfig::default()
+    };
+    let env_none = PartialConfig::default();
+    let cli_none = PartialConfig::default();
+    let merged = merge_partial_configs(&[file_disable, env_none, cli_none]);
+    assert_eq!(merged.footer, Some(false));
+
+    let file_none = PartialConfig::default();
+    let env_disable = PartialConfig {
+        footer: Some(false),
+        ..PartialConfig::default()
+    };
+    let merged = merge_partial_configs(&[file_none, env_disable, PartialConfig::default()]);
+    assert_eq!(merged.footer, Some(false));
+
+    let cli_disable = PartialConfig {
+        footer: Some(false),
+        ..PartialConfig::default()
+    };
+    let merged = merge_partial_configs(&[
+        PartialConfig::default(),
+        PartialConfig::default(),
+        cli_disable,
+    ]);
+    assert_eq!(merged.footer, Some(false));
+
+    // No disable signal anywhere: footer stays None so the default-true wins.
+    let merged = merge_partial_configs(&[
+        PartialConfig::default(),
+        PartialConfig::default(),
+        PartialConfig::default(),
+    ]);
+    assert_eq!(merged.footer, None);
+}
+
 #[test]
 fn merge_log_level_prefers_later_source() {
     let merged = merge_partial_configs(&[

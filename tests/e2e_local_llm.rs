@@ -206,6 +206,7 @@ fn new_agent_with_log_level(
         client,
         SessionStore::new(&state_root, &session_id, &workspace_key),
         Default::default(),
+        anvil::agent::loop_run::FooterHandle::disabled(),
     )
 }
 
