@@ -439,7 +439,14 @@ impl Agent {
                     let summary = format_run_summary(reason, &stats);
                     println!();
                     println!("{summary}");
-                    Err(error_text)
+                    // ESC-initiated exits are a user-intended pause, not a run
+                    // failure — stay in the REPL and let the persist_session
+                    // below save a resumable snapshot (AC-1 / S3-001 / S5-002).
+                    if matches!(reason, ExitReason::Interrupted) {
+                        Ok(AgentEvent::Continue(None))
+                    } else {
+                        Err(error_text)
+                    }
                 }
             }
         };

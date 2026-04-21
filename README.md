@@ -96,6 +96,22 @@ anvil sessions clean [--older-than <DAYS>] [--keep <N>] [--all] [--force] [<ID>]
 
 `sessions list|show|clean` は Ollama / Agent を起動せずオフラインで完結する。既定は現 workspace のみが対象で、`--all` で他 workspace 分も表示する。`clean` は既定 dry-run で、実削除には `--force` が必要。`resolve_session_id` が指す現セッションは常に保護される。
 
+## UX（ESC 割り込み）
+
+エージェント実行中（LLM 推論中・ツール実行中）に `ESC` キーを押すと、現在のイテレーションを安全に完了させてから REPL に戻る（`✘ interrupted`）。`Ctrl+C` でプロセス全体を殺す従来の強制終了と異なり、中断時も session は永続化され `--resume` で続行できる。以下の条件で自動的に無効化される:
+
+- stdin が TTY でない（パイプ / リダイレクト / CI）: `echo 'msg' | anvil ...` では ESC 検出が起動しない
+- `ANVIL_NO_INTERRUPT` が非空値で設定: ESC 検出を一切行わない（TTY でも無効）
+- スラッシュコマンド（`/status` 等）実行中: REPL 境界でのみ rustyline が raw mode を扱うため、interrupt monitor は起動しない
+- Bash / Write / Edit で承認（approve prompt）が必要な場合: prompt 表示中は monitor を一時停止（`stdin().read_line` との競合を回避）
+
+割り込み挙動のスコープ:
+- ✅ ツール完了後 / LLM 応答完了後の境界で `ExitReason::Interrupted` に遷移
+- ❌ 実行中のツール（Bash の子プロセス等）は中断しない — 完了を待つ
+- ❌ LLM の mid-flight cancel は行わない — 応答が完了してから break（Ollama 応答境界）
+
+注意: monitor 有効区間（raw mode on）では `Ctrl+C` が SIGINT として発生しなくなる（crossterm の `cfmakeraw` 仕様）。どうしても即殺したい場合は別ターミナルから `kill <pid>` するか、`ANVIL_NO_INTERRUPT=1` で monitor を無効化して起動する。
+
 ## UX（スピナー表示）
 
 LLM 推論中・ツール実行中は stderr に 80ms 間隔のスピナーを表示する（例: `⠋ thinking... (gpt-oss-20b) 3s`、`⠙ running Bash... 1s`）。以下の条件で自動的に無効化される:

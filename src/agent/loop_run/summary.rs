@@ -6,6 +6,7 @@ pub(super) enum ExitReason {
     NoToolCalls,
     MissingRepoEdits,
     TransportError,
+    Interrupted,
 }
 
 impl ExitReason {
@@ -21,6 +22,7 @@ impl ExitReason {
             ExitReason::NoToolCalls => "no_tool_calls",
             ExitReason::MissingRepoEdits => "missing_repo_edits",
             ExitReason::TransportError => "transport_error",
+            ExitReason::Interrupted => "interrupted",
         }
     }
 
@@ -36,6 +38,7 @@ impl ExitReason {
                 "assistant kept stopping before making the requested repository edits"
             }
             ExitReason::TransportError => "transport error: request failed after retries",
+            ExitReason::Interrupted => "",
         }
     }
 }
@@ -172,6 +175,7 @@ mod tests {
             ExitReason::NoToolCalls,
             ExitReason::MissingRepoEdits,
             ExitReason::TransportError,
+            ExitReason::Interrupted,
         ];
         let labels: Vec<_> = reasons.iter().map(|r| r.label()).collect();
         let unique: std::collections::HashSet<_> = labels.iter().collect();
@@ -186,5 +190,19 @@ mod tests {
         assert!(!ExitReason::NoToolCalls.is_success());
         assert!(!ExitReason::MissingRepoEdits.is_success());
         assert!(!ExitReason::TransportError.is_success());
+        assert!(!ExitReason::Interrupted.is_success());
+    }
+
+    #[test]
+    fn interrupted_renders_cross_with_label() {
+        let s = stats(3, 10, 15, vec!["a.rs"], 1);
+        let out = format_run_summary(ExitReason::Interrupted, &s);
+        assert!(out.starts_with("✘ interrupted"), "got: {out}");
+        assert!(out.contains("iter 3/10"), "got: {out}");
+    }
+
+    #[test]
+    fn interrupted_has_empty_default_error_text() {
+        assert_eq!(ExitReason::Interrupted.default_error_text(), "");
     }
 }
