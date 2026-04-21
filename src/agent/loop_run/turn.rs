@@ -200,6 +200,7 @@ impl Agent {
                         &self.work_root,
                         use_color,
                         use_unicode,
+                        self.footer.current_cols(),
                     );
                     println!("{progress}");
                     let _ = io::stdout().flush();
@@ -638,10 +639,15 @@ fn paint(s: &str, color: &str, use_color: bool) -> String {
 /// optional parenthesized suffix (e.g. `"5B"` for Write byte count). Paths are
 /// made relative to `work_root` when possible. All model-derived strings pass
 /// through `sanitize_for_progress` to prevent terminal injection.
+///
+/// `arg_budget` caps the Bash command display length (issue #432). Other tool
+/// arms currently ignore this budget; the uniform signature lets the caller
+/// compute the budget once via `progress_available_width`.
 fn tool_display(
     tool_name: &str,
     arguments: &serde_json::Value,
     work_root: &std::path::Path,
+    arg_budget: usize,
 ) -> (String, Option<String>) {
     let str_arg = |key: &str| -> &str {
         arguments
@@ -668,16 +674,60 @@ fn tool_display(
         "Edit" | "Read" => (sanitize_for_progress(&relativize(str_arg("path"))), None),
         "Bash" => {
             let sanitized = sanitize_for_progress(str_arg("command"));
-            (truncate(&sanitized, 57), None)
+            (truncate(&sanitized, arg_budget), None)
         }
         "Glob" | "Grep" => (sanitize_for_progress(str_arg("pattern")), None),
         _ => (sanitize_for_progress(tool_name), None),
     }
 }
 
+/// Compute the argument-summary budget for a progress line given the current
+/// terminal width (issue #432 §4.3.1).
+///
+/// Subtracts the fixed chrome (`[iter N/M]  `, optional emoji, tool name, and
+/// the two-space separator) plus 3 chars reserved for the `...` ellipsis that
+/// `truncate()` appends when the input exceeds the budget, then clamps the
+/// result to `MIN_ARG_BUDGET` (20). When `cols` is `None` (footer disabled /
+/// handle absent / first-tick race) the caller falls back to
+/// `DEFAULT_ARG_BUDGET` (57), preserving the pre-#432 behaviour.
+pub(super) fn progress_available_width(
+    cols: Option<u16>,
+    tool_name: &str,
+    iter_human: usize,
+    max_iterations: usize,
+    use_unicode: bool,
+) -> usize {
+    const DEFAULT_ARG_BUDGET: usize = 57;
+    const MIN_ARG_BUDGET: usize = 20;
+    // truncate() appends "..." (3 chars) when it fires, so reserve those chars
+    // up-front. Otherwise a fully-truncated Bash command overflows cols by 3.
+    const ELLIPSIS_RESERVE: usize = 3;
+
+    let Some(cols) = cols else {
+        return DEFAULT_ARG_BUDGET;
+    };
+
+    // Chrome must stay in sync with the `format!` in `format_progress_line`:
+    //   "[iter N/M]  " + (emoji " ")? + tool_name + "  "
+    let iter_prefix = format!("[iter {iter_human}/{max_iterations}]  ");
+    let emoji_width = if use_unicode {
+        tool_emoji(tool_name).chars().count() + 1
+    } else {
+        0
+    };
+    let chrome = iter_prefix.len() + emoji_width + tool_name.chars().count() + 2;
+
+    (cols as usize)
+        .saturating_sub(chrome)
+        .saturating_sub(ELLIPSIS_RESERVE)
+        .max(MIN_ARG_BUDGET)
+}
+
 /// Format a single-line per-iteration progress line. ANSI color is only
 /// applied to the tool name when `use_color` is true, and emoji is prepended
-/// when `use_unicode` is true.
+/// when `use_unicode` is true. `cols` is the current terminal width from the
+/// footer broadcaster; `None` falls back to the pre-#432 fixed budget.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn format_progress_line(
     tool_name: &str,
     arguments: &serde_json::Value,
@@ -686,8 +736,11 @@ pub(super) fn format_progress_line(
     work_root: &std::path::Path,
     use_color: bool,
     use_unicode: bool,
+    cols: Option<u16>,
 ) -> String {
-    let (display_str, extra) = tool_display(tool_name, arguments, work_root);
+    let arg_budget =
+        progress_available_width(cols, tool_name, iter_human, max_iterations, use_unicode);
+    let (display_str, extra) = tool_display(tool_name, arguments, work_root, arg_budget);
     // Sanitize before painting so an adversarial tool_name cannot inject escapes.
     // emoji は &'static str ハードコードなので再 sanitize は不要。
     let safe_tool_name = sanitize_for_progress(tool_name);
@@ -726,8 +779,8 @@ mod truncate_tests {
 #[cfg(test)]
 mod progress_tests {
     use super::{
-        format_progress_line, is_utf8_locale, sanitize_for_progress, tool_color, tool_display,
-        tool_emoji, unicode_supported,
+        format_progress_line, is_utf8_locale, progress_available_width, sanitize_for_progress,
+        tool_color, tool_display, tool_emoji, unicode_supported,
     };
     use serde_json::json;
     use std::path::PathBuf;
@@ -754,7 +807,7 @@ mod progress_tests {
     fn tool_display_write_ascii() {
         let work_root = PathBuf::from("/work");
         let args = json!({"path": "/work/src/foo.rs", "content": "hello"});
-        let (display, extra) = tool_display("Write", &args, &work_root);
+        let (display, extra) = tool_display("Write", &args, &work_root, 57);
         assert_eq!(display, "src/foo.rs");
         assert_eq!(extra, Some("5B".to_string()));
     }
@@ -763,7 +816,7 @@ mod progress_tests {
     fn tool_display_write_non_ascii() {
         let work_root = PathBuf::from("/work");
         let args = json!({"path": "/work/a.txt", "content": "日本語"});
-        let (_, extra) = tool_display("Write", &args, &work_root);
+        let (_, extra) = tool_display("Write", &args, &work_root, 57);
         // "日本語" is 9 bytes in UTF-8
         assert_eq!(extra, Some("9B".to_string()));
     }
@@ -773,7 +826,7 @@ mod progress_tests {
         let work_root = PathBuf::from("/work");
         let cmd = "cargo test";
         let args = json!({"command": cmd});
-        let (display, _) = tool_display("Bash", &args, &work_root);
+        let (display, _) = tool_display("Bash", &args, &work_root, 57);
         assert_eq!(display, cmd);
     }
 
@@ -782,7 +835,7 @@ mod progress_tests {
         let work_root = PathBuf::from("/work");
         let cmd = "a".repeat(61);
         let args = json!({"command": cmd});
-        let (display, _) = tool_display("Bash", &args, &work_root);
+        let (display, _) = tool_display("Bash", &args, &work_root, 57);
         assert_eq!(display.len(), 60); // 57 chars + "..."
         assert!(display.ends_with("..."));
     }
@@ -791,7 +844,7 @@ mod progress_tests {
     fn tool_display_path_relative() {
         let work_root = PathBuf::from("/work");
         let args = json!({"path": "/work/src/lib.rs"});
-        let (display, _) = tool_display("Read", &args, &work_root);
+        let (display, _) = tool_display("Read", &args, &work_root, 57);
         assert_eq!(display, "src/lib.rs");
     }
 
@@ -799,15 +852,105 @@ mod progress_tests {
     fn tool_display_path_outside() {
         let work_root = PathBuf::from("/work");
         let args = json!({"path": "/tmp/outside.txt"});
-        let (display, _) = tool_display("Read", &args, &work_root);
+        let (display, _) = tool_display("Read", &args, &work_root, 57);
         assert_eq!(display, "/tmp/outside.txt");
+    }
+
+    #[test]
+    fn tool_display_bash_with_wide_budget() {
+        let work_root = PathBuf::from("/work");
+        let cmd = "a".repeat(100);
+        let args = json!({"command": cmd});
+        let (display, _) = tool_display("Bash", &args, &work_root, 200);
+        assert_eq!(display.len(), 100);
+        assert!(!display.ends_with("..."));
+    }
+
+    #[test]
+    fn tool_display_bash_with_narrow_budget() {
+        let work_root = PathBuf::from("/work");
+        let cmd = "a".repeat(30);
+        let args = json!({"command": cmd});
+        let (display, _) = tool_display("Bash", &args, &work_root, 20);
+        assert_eq!(display.len(), 23); // 20 chars + "..."
+        assert!(display.ends_with("..."));
+    }
+
+    #[test]
+    fn progress_available_width_none_returns_default() {
+        assert_eq!(progress_available_width(None, "Bash", 1, 12, false), 57);
+    }
+
+    #[test]
+    fn progress_available_width_large_cols_returns_budget() {
+        // cols=200, tool_name="Bash" (4 chars), use_unicode=false
+        // iter_prefix "[iter 1/12]  " = 13 chars; chrome = 13 + 0 + 4 + 2 = 19
+        // ellipsis reserve = 3; expected budget = 200 - 19 - 3 = 178
+        assert_eq!(
+            progress_available_width(Some(200), "Bash", 1, 12, false),
+            178
+        );
+    }
+
+    #[test]
+    fn progress_available_width_small_cols_clamps_to_min() {
+        // cols=30; chrome + ellipsis = 22; 30 - 22 = 8 → clamp to 20
+        assert_eq!(progress_available_width(Some(30), "Bash", 1, 12, false), 20);
+    }
+
+    #[test]
+    fn progress_available_width_zero_cols_clamps_to_min() {
+        // saturating_sub to 0 → max(20)
+        assert_eq!(progress_available_width(Some(0), "Bash", 1, 12, false), 20);
+    }
+
+    #[test]
+    fn progress_available_width_emoji_accounts_for_vs16() {
+        // "Write" emoji is `✏️` (U+270F + U+FE0F VS16), `.chars().count() == 2`.
+        // iter_prefix "[iter 1/12]  " = 13; emoji_width = 2 + 1 = 3; name = 5; +2 → chrome=23
+        // ellipsis reserve = 3; cols=200 → 200 - 23 - 3 = 174
+        assert_eq!(
+            progress_available_width(Some(200), "Write", 1, 12, true),
+            174
+        );
+    }
+
+    #[test]
+    fn format_progress_line_fits_within_cols_on_truncate() {
+        // CB-001 regression: when Bash command overflows arg_budget and cols is
+        // wide enough for the MIN_ARG_BUDGET=20 clamp not to fire, the final
+        // progress line (chars) must still fit within `cols`. For cols narrower
+        // than chrome+MIN+ELLIPSIS the clamp keeps useful output at the cost of
+        // a small overflow — that tradeoff is documented in §4.3.1.
+        let work_root = PathBuf::from("/work");
+        let cmd = "a".repeat(500);
+        let args = json!({"command": cmd});
+        // chrome=19 (iter_prefix 13 + Bash 4 + 2); MIN=20; ellipsis=3. So cols
+        // must be >= 42 to avoid the clamp dominating.
+        for &cols in &[60u16, 80, 120, 200] {
+            let line = format_progress_line(
+                "Bash",
+                &args,
+                1,
+                12,
+                &work_root,
+                /* use_color */ false,
+                /* use_unicode */ false,
+                Some(cols),
+            );
+            let line_chars = line.chars().count();
+            assert!(
+                line_chars <= cols as usize,
+                "progress line {line_chars} chars exceeds cols={cols}: {line:?}"
+            );
+        }
     }
 
     #[test]
     fn progress_line_iter_1indexed() {
         let work_root = PathBuf::from("/work");
         let args = json!({"path": "/work/a.txt", "content": "x"});
-        let line = format_progress_line("Write", &args, 1, 12, &work_root, false, false);
+        let line = format_progress_line("Write", &args, 1, 12, &work_root, false, false, None);
         assert!(line.starts_with("[iter 1/12]"));
     }
 
@@ -815,7 +958,7 @@ mod progress_tests {
     fn progress_line_no_color_no_escape() {
         let work_root = PathBuf::from("/work");
         let args = json!({"command": "ls"});
-        let line = format_progress_line("Bash", &args, 1, 12, &work_root, false, false);
+        let line = format_progress_line("Bash", &args, 1, 12, &work_root, false, false, None);
         assert!(!line.contains('\x1b'));
     }
 
@@ -823,7 +966,7 @@ mod progress_tests {
     fn progress_line_color_prefix_invariant() {
         let work_root = PathBuf::from("/work");
         let args = json!({"command": "ls"});
-        let line = format_progress_line("Bash", &args, 1, 12, &work_root, true, false);
+        let line = format_progress_line("Bash", &args, 1, 12, &work_root, true, false, None);
         assert!(line.starts_with("[iter "));
     }
 
@@ -848,7 +991,7 @@ mod progress_tests {
     fn progress_line_emoji_and_color_for_bash() {
         let work_root = PathBuf::from("/work");
         let args = json!({"command": "ls"});
-        let line = format_progress_line("Bash", &args, 1, 12, &work_root, true, true);
+        let line = format_progress_line("Bash", &args, 1, 12, &work_root, true, true, None);
         let color_idx = line.find("\x1b[38;5;226m").expect("color present");
         let emoji_idx = line.find('⚡').expect("emoji present");
         let reset_idx = line.find("\x1b[0m").expect("reset present");
@@ -860,7 +1003,7 @@ mod progress_tests {
     fn progress_line_no_color_but_unicode_emits_emoji() {
         let work_root = PathBuf::from("/work");
         let args = json!({"command": "ls"});
-        let line = format_progress_line("Bash", &args, 1, 12, &work_root, false, true);
+        let line = format_progress_line("Bash", &args, 1, 12, &work_root, false, true, None);
         assert!(line.contains('⚡'));
         assert!(!line.contains('\x1b'));
     }
@@ -869,7 +1012,7 @@ mod progress_tests {
     fn progress_line_unicode_off_no_emoji() {
         let work_root = PathBuf::from("/work");
         let args = json!({"command": "ls"});
-        let line = format_progress_line("Bash", &args, 1, 12, &work_root, true, false);
+        let line = format_progress_line("Bash", &args, 1, 12, &work_root, true, false, None);
         assert!(!line.contains('⚡'));
     }
 
