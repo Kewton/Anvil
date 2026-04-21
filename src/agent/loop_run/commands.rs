@@ -583,13 +583,15 @@ impl Agent {
     }
 }
 
-/// NotFound on `load_history` is the fresh-env case: no history file yet.
-/// We swallow it silently so first-time REPL starts don't emit a warning.
+/// NotFound (or PermissionDenied on some CI/sandbox environments) on
+/// `load_history` means "no history yet" — swallow silently so REPL starts
+/// cleanly on a fresh environment.
 fn is_not_found(err: &rustyline::error::ReadlineError) -> bool {
     matches!(
         err,
         rustyline::error::ReadlineError::Io(io_err)
             if io_err.kind() == std::io::ErrorKind::NotFound
+                || io_err.kind() == std::io::ErrorKind::PermissionDenied
     )
 }
 
