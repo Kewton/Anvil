@@ -2,6 +2,11 @@ use super::slash_commands::{self, AnvilEditor, build_editor};
 use super::summary::{ExitReason, format_run_summary};
 use super::*;
 use crate::config::LogLevel;
+use crate::modes::plan_act::TaskProfile;
+use crate::session::store::ConversationMessage;
+use crossterm::event::{self, Event, KeyCode};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use serde::Deserialize;
 
 /// First 8 characters of a session id, or the full id if shorter. Used for
 /// banner display so users get a stable short handle without exposing the
@@ -80,6 +85,96 @@ pub(crate) fn state_suffix(fresh: bool, resumed: bool) -> &'static str {
 /// same environment.
 fn banner_no_color_requested() -> bool {
     std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty())
+}
+
+#[derive(Debug, Deserialize)]
+struct LargeTaskDecision {
+    large_task: bool,
+    #[serde(default)]
+    task_profile: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClassifiedTask {
+    large_task: bool,
+    task_profile: TaskProfile,
+}
+
+fn extract_json_object(raw: &str) -> Option<&str> {
+    let start = raw.find('{')?;
+    let end = raw.rfind('}')?;
+    (end > start).then_some(&raw[start..=end])
+}
+
+fn parse_large_task_decision(raw: &str) -> Option<ClassifiedTask> {
+    let body = extract_json_object(raw.trim())?;
+    serde_json::from_str::<LargeTaskDecision>(body)
+        .ok()
+        .map(|decision| ClassifiedTask {
+            large_task: decision.large_task,
+            task_profile: match decision.task_profile.as_deref() {
+                Some("coding") => TaskProfile::Coding,
+                _ => TaskProfile::Generic,
+            },
+        })
+}
+
+pub(crate) fn is_plan_execution_request(input: &str) -> bool {
+    let trimmed = input
+        .trim()
+        .trim_end_matches(['。', '.', '!', '！', '?', '？']);
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let normalized = trimmed.to_ascii_lowercase();
+    let english = [
+        "yes",
+        "y",
+        "approve",
+        "act",
+        "go",
+        "run it",
+        "execute",
+        "start implementation",
+        "implement it",
+        "proceed",
+    ];
+    if english.iter().any(|phrase| normalized == *phrase) {
+        return true;
+    }
+
+    let japanese = [
+        "はい",
+        "お願いします",
+        "実行して",
+        "進めて",
+        "着手して",
+        "実装して",
+        "始めて",
+        "開始して",
+        "やって",
+        "この計画で進めて",
+    ];
+    japanese.iter().any(|phrase| trimmed == *phrase)
+}
+
+pub(crate) fn is_plan_rejection_request(input: &str) -> bool {
+    let trimmed = input
+        .trim()
+        .trim_end_matches(['。', '.', '!', '！', '?', '？']);
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let normalized = trimmed.to_ascii_lowercase();
+    matches!(normalized.as_str(), "no" | "n") || matches!(trimmed, "いいえ" | "だめ" | "却下")
+}
+
+enum PlanApprovalChoice {
+    Execute,
+    Revise,
+    Feedback,
 }
 
 /// Replace control characters (C0, DEL, and C1) with spaces, then trim trailing
@@ -222,6 +317,236 @@ pub fn print_startup_banner_stderr_oneshot(
 }
 
 impl Agent {
+    fn execute_approved_plan(
+        &mut self,
+        trigger_text: &str,
+        stream_output: bool,
+    ) -> Result<AgentEvent, String> {
+        let status = self.approve_plan_mode()?;
+        let profile_guidance = match self.session.mode_state.task_profile {
+            TaskProfile::Generic => {
+                "Work through the plan in phases, verify key outcomes, and evaluate the result against the acceptance criteria before stopping."
+            }
+            TaskProfile::Coding => {
+                "Work through the plan in phases: design, implement, review, test, evaluate. Preserve the intended quality bar, polish the user-facing result, and avoid unnecessary re-scaffolding or workspace resets."
+            }
+        };
+        let exec_prompt = format!(
+            "The user approved the plan and said: {trigger_text}\nExecute the approved plan now. Follow the accepted plan and its completion criteria. {profile_guidance} Start with one small, self-contained repository change, then continue until the requested work is complete."
+        );
+        println!("{status}");
+        match self.handle_user_message(&exec_prompt, stream_output) {
+            Ok((prose, stats)) => {
+                if !stream_output {
+                    if crate::tui::markdown::markdown_fully_disabled() {
+                        println!("{prose}");
+                    } else {
+                        let color = crate::tui::markdown::color_enabled_for_markdown();
+                        let utf8 = crate::tui::markdown::markdown_unicode_enabled();
+                        let mut r = crate::tui::markdown::MarkdownRenderer::new(color, utf8);
+                        let mut body = r.push_chunk(&prose);
+                        body.push_str(&r.flush());
+                        if !body.ends_with('\n') {
+                            body.push('\n');
+                        }
+                        let _ = std::io::stdout().write_all(body.as_bytes());
+                        let _ = std::io::stdout().flush();
+                    }
+                }
+                println!();
+                println!("{}", format_run_summary(ExitReason::Done, &stats));
+                self.persist_session()?;
+                Ok(AgentEvent::Continue(None))
+            }
+            Err((reason, error_text, stats)) => {
+                println!();
+                println!("{}", format_run_summary(reason, &stats));
+                if reason.keeps_repl_alive() && !error_text.trim().is_empty() {
+                    println!("{error_text}");
+                }
+                self.persist_session()?;
+                if reason.keeps_repl_alive() {
+                    Ok(AgentEvent::Continue(None))
+                } else {
+                    Err(error_text)
+                }
+            }
+        }
+    }
+
+    fn prompt_for_plan_approval_choice(&self) -> Result<Option<PlanApprovalChoice>, String> {
+        if !self.config.auto_plan || !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+            return Ok(None);
+        }
+
+        let _footer_freeze = self.footer.freeze_for_prompt();
+        let options = [("yes", "execute"), ("no", "revise"), ("other", "feedback")];
+        let mut selected = 0usize;
+        let redraw = |selected: usize| {
+            print!("\x1b[4F\x1b[J");
+            println!("plan approval:");
+            for (index, (label, description)) in options.iter().enumerate() {
+                let prefix = if index == selected { "▶" } else { " " };
+                println!("  {prefix} {label:<5} {description}");
+            }
+            let _ = io::stdout().flush();
+        };
+        println!("plan approval:");
+        println!("  ▶ yes   execute");
+        println!("    no    revise");
+        println!("    other feedback");
+        let _ = io::stdout().flush();
+        enable_raw_mode().map_err(|err| format!("failed to enable raw mode: {err}"))?;
+        let choice = loop {
+            match event::read() {
+                Ok(Event::Key(key)) => match key.code {
+                    KeyCode::Up => {
+                        selected = selected.saturating_sub(1);
+                        redraw(selected);
+                    }
+                    KeyCode::Down => {
+                        selected = (selected + 1).min(options.len() - 1);
+                        redraw(selected);
+                    }
+                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        println!("selected: execute");
+                        break Some(PlanApprovalChoice::Execute);
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('N') => {
+                        println!("selected: revise");
+                        break Some(PlanApprovalChoice::Revise);
+                    }
+                    KeyCode::Char('o') | KeyCode::Char('O') => {
+                        println!("selected: feedback");
+                        break Some(PlanApprovalChoice::Feedback);
+                    }
+                    KeyCode::Enter => {
+                        let selected_choice = match selected {
+                            0 => PlanApprovalChoice::Execute,
+                            1 => PlanApprovalChoice::Revise,
+                            _ => PlanApprovalChoice::Feedback,
+                        };
+                        println!("selected: {}", options[selected].1);
+                        break Some(selected_choice);
+                    }
+                    KeyCode::Esc => {
+                        println!("selected: revise");
+                        break Some(PlanApprovalChoice::Revise);
+                    }
+                    _ => {}
+                },
+                Ok(_) => {}
+                Err(err) => {
+                    disable_raw_mode().ok();
+                    return Err(format!("failed to read plan approval choice: {err}"));
+                }
+            }
+        };
+        disable_raw_mode().map_err(|err| format!("failed to disable raw mode: {err}"))?;
+        Ok(choice)
+    }
+
+    fn enter_plan_mode(&mut self, task_profile: TaskProfile) -> Result<String, String> {
+        if self.session.mode_state.mode == ExecutionMode::Plan {
+            let current = self
+                .session
+                .mode_state
+                .active_plan_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "-".to_string());
+            return Ok(format!("already in plan mode: {current}"));
+        }
+        let plan_path = self
+            .session
+            .mode_state
+            .enter_plan(self.session_store.plan_dir(), task_profile)?;
+        self.ensure_plan_file(&plan_path)?;
+        self.push_system_note(format!(
+            "[Plan Mode / {}] Explore with Read, Glob, and Grep. Write the plan to {}. Wait for /approve before making code changes.",
+            self.session.mode_state.task_profile.as_str(),
+            plan_path.display()
+        ));
+        self.footer.publish_flags(
+            self.session.mode_state.mode,
+            self.config.log_level,
+            self.config.yes_mode,
+        );
+        Ok(format!("plan mode: {}", plan_path.display()))
+    }
+
+    fn approve_plan_mode(&mut self) -> Result<String, String> {
+        if self.session.mode_state.mode != ExecutionMode::Plan {
+            return Err("approve is only available from plan mode".to_string());
+        }
+        let plan_contents = self
+            .current_plan_contents()?
+            .ok_or_else(|| "plan file is missing".to_string())?;
+        if !lifecycle::plan_is_substantive(&plan_contents) {
+            return Err("plan file is empty or still template-only".to_string());
+        }
+        self.session.mode_state.approve();
+        self.push_system_note(format!(
+            "[Act Mode / {}] Execute the accepted plan in phases and keep the work aligned with its acceptance criteria.\n\n{}",
+            self.session.mode_state.task_profile.as_str(),
+            plan_contents
+        ));
+        self.footer.publish_flags(
+            self.session.mode_state.mode,
+            self.config.log_level,
+            self.config.yes_mode,
+        );
+        Ok("act mode".to_string())
+    }
+
+    fn classify_large_task_with_main_model(&self, input: &str) -> Result<ClassifiedTask, String> {
+        let messages = vec![
+            ConversationMessage::system(
+                "You classify whether a user request for a local-first repository agent should go through planning before execution, and which act profile fits best. Reply with JSON only in this shape: {\"large_task\":true|false,\"task_profile\":\"generic\"|\"coding\"}. Use task_profile=\"coding\" when the main work is code changes, software implementation, debugging, tests, UI work, build changes, or repository edits. Use task_profile=\"generic\" for broader planning, docs, analysis, organization, or mixed work without a code-heavy execution phase. Use large_task=true for broad multi-step work that benefits from a plan before execution."
+                    .to_string(),
+            ),
+            ConversationMessage::user(format!(
+                "Current mode: Act\nProject root: {}\nUser request:\n{}",
+                self.work_root.display(),
+                input
+            )),
+        ];
+        let reply = self.client.chat_text(&self.models.main, &messages)?;
+        parse_large_task_decision(&reply.content).ok_or_else(|| {
+            format!(
+                "failed to parse large-task classifier response: {}",
+                reply.content.trim()
+            )
+        })
+    }
+
+    fn maybe_auto_plan_prompt(&mut self, input: &str) -> Result<Option<String>, String> {
+        if !self.config.auto_plan
+            || self.session.mode_state.mode != ExecutionMode::Act
+            || self.config.oneshot
+        {
+            return Ok(None);
+        }
+
+        match self.classify_large_task_with_main_model(input) {
+            Ok(classified) if classified.large_task => {
+                let status = self.enter_plan_mode(classified.task_profile)?;
+                Ok(Some(format!(
+                    "{status}\nauto-plan: large task detected; planning before implementation ({})",
+                    classified.task_profile.as_str()
+                )))
+            }
+            Ok(classified) => {
+                self.session.mode_state.task_profile = classified.task_profile;
+                Ok(None)
+            }
+            Err(err) => {
+                tracing::warn!("auto-plan classifier failed: {err}");
+                Ok(None)
+            }
+        }
+    }
+
     pub fn initial_prompt_from_cli_or_stdin(&self) -> Result<Option<String>, String> {
         if let Some(prompt) = &self.config.prompt {
             return Ok(Some(prompt.clone()));
@@ -229,7 +554,11 @@ impl Agent {
         if self.config.oneshot {
             return stdin_prompt();
         }
-        stdin_prompt()
+        // Non-oneshot startup must not drain stdin. Wrappers such as
+        // `anvildev` keep stdin open and exchange line-oriented commands over
+        // a pipe; a blocking `read_to_string()` here would stall before the
+        // fallback REPL has a chance to process `/help` or other commands.
+        Ok(None)
     }
 
     pub fn run_oneshot(&mut self, prompt: &str) -> Result<String, String> {
@@ -282,15 +611,20 @@ impl Agent {
     }
 
     /// Plain `read_line` REPL kept for non-TTY contexts (pipe input, CI,
-    /// redirected stdout). Behaviorally identical to the pre-#427 loop so
-    /// `echo foo | anvil` and friends keep working unchanged.
+    /// redirected stdout). When stdout is a TTY we still print the legacy
+    /// `anvil> ` prompt for shell convenience (`echo foo | anvil`), but when
+    /// stdout is also non-TTY we suppress the prompt so line-based wrappers can
+    /// exchange commands and replies without extra framing.
     fn run_repl_loop_fallback(&mut self) -> Result<(), String> {
         let mut line = String::new();
+        let show_prompt = should_render_fallback_prompt(io::stdout().is_terminal());
         loop {
-            print!("anvil> ");
-            io::stdout()
-                .flush()
-                .map_err(|err| format!("failed to flush stdout: {err}"))?;
+            if show_prompt {
+                print!("anvil> ");
+                io::stdout()
+                    .flush()
+                    .map_err(|err| format!("failed to flush stdout: {err}"))?;
+            }
             line.clear();
             let bytes = io::stdin()
                 .read_line(&mut line)
@@ -298,10 +632,21 @@ impl Agent {
             if bytes == 0 {
                 break;
             }
-            match self.process_line(line.trim(), self.config.stream)? {
-                AgentEvent::Continue(Some(message)) => println!("{message}"),
-                AgentEvent::Continue(None) => {}
-                AgentEvent::Exit => break,
+            let trimmed = line.trim();
+            let is_command = trimmed.starts_with('/');
+            if is_command {
+                let _footer_freeze = self.footer.freeze_for_prompt();
+                match self.process_line(trimmed, self.config.stream)? {
+                    AgentEvent::Continue(Some(message)) => println!("{message}"),
+                    AgentEvent::Continue(None) => {}
+                    AgentEvent::Exit => break,
+                }
+            } else {
+                match self.process_line(trimmed, self.config.stream)? {
+                    AgentEvent::Continue(Some(message)) => println!("{message}"),
+                    AgentEvent::Continue(None) => {}
+                    AgentEvent::Exit => break,
+                }
             }
         }
         Ok(())
@@ -379,11 +724,22 @@ impl Agent {
                     if trimmed.is_empty() {
                         continue;
                     }
-                    match self.process_line(trimmed, self.config.stream) {
-                        Ok(AgentEvent::Continue(Some(msg))) => println!("{msg}"),
-                        Ok(AgentEvent::Continue(None)) => {}
-                        Ok(AgentEvent::Exit) => break Ok(()),
-                        Err(err) => break Err(err),
+                    let is_command = trimmed.starts_with('/');
+                    if is_command {
+                        let _footer_freeze = self.footer.freeze_for_prompt();
+                        match self.process_line(trimmed, self.config.stream) {
+                            Ok(AgentEvent::Continue(Some(msg))) => println!("{msg}"),
+                            Ok(AgentEvent::Continue(None)) => {}
+                            Ok(AgentEvent::Exit) => break Ok(()),
+                            Err(err) => break Err(err),
+                        }
+                    } else {
+                        match self.process_line(trimmed, self.config.stream) {
+                            Ok(AgentEvent::Continue(Some(msg))) => println!("{msg}"),
+                            Ok(AgentEvent::Continue(None)) => {}
+                            Ok(AgentEvent::Exit) => break Ok(()),
+                            Err(err) => break Err(err),
+                        }
                     }
                 }
                 Err(ReadlineError::Interrupted) => continue,
@@ -428,10 +784,41 @@ impl Agent {
             return Ok(AgentEvent::Continue(None));
         }
 
-        let outcome = if input.starts_with('/') {
-            self.handle_command(input)
+        let trimmed = input.trim();
+
+        if self.session.mode_state.mode == ExecutionMode::Plan && is_plan_execution_request(trimmed)
+        {
+            return self.execute_approved_plan(trimmed, stream_output);
+        }
+
+        if self.session.mode_state.mode == ExecutionMode::Plan && is_plan_rejection_request(trimmed)
+        {
+            return Ok(AgentEvent::Continue(Some(
+                "plan not approved; stay in plan mode and provide feedback or revisions"
+                    .to_string(),
+            )));
+        }
+
+        let auto_plan_entered = if !trimmed.starts_with('/') {
+            self.maybe_auto_plan_prompt(trimmed)?
         } else {
-            match self.handle_user_message(input, stream_output) {
+            None
+        };
+        if let Some(message) = auto_plan_entered.as_deref() {
+            println!("{message}");
+        }
+
+        let outcome = if trimmed.starts_with('/') {
+            self.handle_command(trimmed)
+        } else {
+            let user_input = if auto_plan_entered.is_some() {
+                format!(
+                    "Create an implementation plan for the user's request. Inspect the repository as needed, write the plan to the active plan file, and stop after the plan is complete. Do not make code changes yet. The plan must define: (1) the first shippable vertical slice, (2) concrete acceptance criteria for that slice, (3) the implementation phases after that, (4) the specific files/modules likely to change, and (5) the verification steps. Prefer an incremental plan that reaches a working first version before polish. End your user-facing response by telling the user to reply yes to execute, no to revise, or provide feedback.\n\nUser request:\n{trimmed}"
+                )
+            } else {
+                trimmed.to_string()
+            };
+            match self.handle_user_message(&user_input, stream_output) {
                 Ok((prose, stats)) => {
                     if !stream_output {
                         // Issue #431: non-streaming assistant prose also goes
@@ -462,6 +849,24 @@ impl Agent {
                     }
                     let summary = format_run_summary(ExitReason::Done, &stats);
                     println!();
+                    if self.session.mode_state.mode == ExecutionMode::Plan {
+                        match self.prompt_for_plan_approval_choice()? {
+                            Some(PlanApprovalChoice::Execute) => {
+                                return self.execute_approved_plan("yes", stream_output);
+                            }
+                            Some(PlanApprovalChoice::Revise) => {
+                                println!("plan ready: not approved; provide revisions or feedback");
+                            }
+                            Some(PlanApprovalChoice::Feedback) => {
+                                println!("plan ready: provide feedback to revise the plan");
+                            }
+                            None => {
+                                println!(
+                                    "plan ready: reply yes to execute, no to revise, or provide feedback"
+                                );
+                            }
+                        }
+                    }
                     println!("{summary}");
                     Ok(AgentEvent::Continue(None))
                 }
@@ -469,10 +874,12 @@ impl Agent {
                     let summary = format_run_summary(reason, &stats);
                     println!();
                     println!("{summary}");
-                    // ESC-initiated exits are a user-intended pause, not a run
-                    // failure — stay in the REPL and let the persist_session
-                    // below save a resumable snapshot (AC-1 / S3-001 / S5-002).
-                    if matches!(reason, ExitReason::Interrupted) {
+                    // Soft failures keep the REPL alive so the user can give a
+                    // follow-up instruction without losing the session.
+                    if reason.keeps_repl_alive() {
+                        if !error_text.trim().is_empty() {
+                            println!("{error_text}");
+                        }
                         Ok(AgentEvent::Continue(None))
                     } else {
                         Err(error_text)
@@ -497,9 +904,11 @@ impl Agent {
         match command {
             "/help" => Ok(AgentEvent::Continue(Some(slash_commands::help_line()))),
             "/status" => Ok(AgentEvent::Continue(Some(format!(
-                "mode={:?} auto_approve={} native_tools={} cwd={} session={} plan={} approx_tokens={} log_level={} core_only=true",
+                "mode={:?} task_profile={} auto_approve={} auto_plan={} native_tools={} cwd={} session={} plan={} approx_tokens={} log_level={} core_only=true",
                 self.session.mode_state.mode,
+                self.session.mode_state.task_profile.as_str(),
                 self.config.yes_mode,
+                self.config.auto_plan,
                 self.native_tools_enabled,
                 self.work_root.display(),
                 self.session_store.path().display(),
@@ -539,62 +948,10 @@ impl Agent {
                     "auto-approve disabled".to_string(),
                 )))
             }
-            "/plan" => {
-                if self.session.mode_state.mode == ExecutionMode::Plan {
-                    let current = self
-                        .session
-                        .mode_state
-                        .active_plan_path
-                        .as_ref()
-                        .map(|path| path.display().to_string())
-                        .unwrap_or_else(|| "-".to_string());
-                    return Ok(AgentEvent::Continue(Some(format!(
-                        "already in plan mode: {current}"
-                    ))));
-                }
-                let plan_path = self
-                    .session
-                    .mode_state
-                    .enter_plan(self.session_store.plan_dir())?;
-                self.ensure_plan_file(&plan_path)?;
-                self.push_system_note(format!(
-                    "[Plan Mode] Explore with Read, Glob, and Grep. Write the plan to {}. Wait for /approve before making code changes.",
-                    plan_path.display()
-                ));
-                // Republish flags after entering plan mode (issue #430).
-                self.footer.publish_flags(
-                    self.session.mode_state.mode,
-                    self.config.log_level,
-                    self.config.yes_mode,
-                );
-                Ok(AgentEvent::Continue(Some(format!(
-                    "plan mode: {}",
-                    plan_path.display()
-                ))))
-            }
-            "/approve" | "/act" => {
-                if self.session.mode_state.mode != ExecutionMode::Plan {
-                    return Err("approve is only available from plan mode".to_string());
-                }
-                let plan_contents = self
-                    .current_plan_contents()?
-                    .ok_or_else(|| "plan file is missing".to_string())?;
-                if !lifecycle::plan_is_substantive(&plan_contents) {
-                    return Err("plan file is empty or still template-only".to_string());
-                }
-                self.session.mode_state.approve();
-                self.push_system_note(format!(
-                    "[Act Mode] Implement the following plan step by step.\n\n{}",
-                    plan_contents
-                ));
-                // Republish flags after switching to act mode (issue #430).
-                self.footer.publish_flags(
-                    self.session.mode_state.mode,
-                    self.config.log_level,
-                    self.config.yes_mode,
-                );
-                Ok(AgentEvent::Continue(Some("act mode".to_string())))
-            }
+            "/plan" => Ok(AgentEvent::Continue(Some(
+                self.enter_plan_mode(self.session.mode_state.task_profile)?,
+            ))),
+            "/approve" | "/act" => Ok(AgentEvent::Continue(Some(self.approve_plan_mode()?))),
             "/compact" => {
                 let changed = self.maybe_compact_session(20);
                 Ok(AgentEvent::Continue(Some(if changed {
@@ -642,6 +999,10 @@ impl Agent {
             )))),
         }
     }
+}
+
+fn should_render_fallback_prompt(stdout_is_tty: bool) -> bool {
+    stdout_is_tty
 }
 
 /// NotFound (or PermissionDenied on some CI/sandbox environments) on
@@ -817,6 +1178,49 @@ mod tests {
             decide_banner_style(true, true, Some(10)),
             BannerStyle::Legacy4Line
         );
+    }
+
+    #[test]
+    fn fallback_prompt_only_renders_on_tty_stdout() {
+        assert!(should_render_fallback_prompt(true));
+        assert!(!should_render_fallback_prompt(false));
+    }
+
+    #[test]
+    fn parses_large_task_classifier_json() {
+        assert_eq!(
+            parse_large_task_decision(r#"{"large_task":true}"#),
+            Some(ClassifiedTask {
+                large_task: true,
+                task_profile: TaskProfile::Generic,
+            })
+        );
+        assert_eq!(
+            parse_large_task_decision(
+                "```json\n{\"large_task\":false,\"task_profile\":\"coding\"}\n```"
+            ),
+            Some(ClassifiedTask {
+                large_task: false,
+                task_profile: TaskProfile::Coding,
+            })
+        );
+        assert_eq!(parse_large_task_decision("not json"), None);
+    }
+
+    #[test]
+    fn detects_plan_execution_requests_in_english_and_japanese() {
+        assert!(is_plan_execution_request("実行して"));
+        assert!(is_plan_execution_request("進めて。"));
+        assert!(is_plan_execution_request("approve"));
+        assert!(is_plan_execution_request("run it"));
+        assert!(!is_plan_execution_request("計画をもう少し詳しくして"));
+    }
+
+    #[test]
+    fn detects_plan_rejection_requests_in_english_and_japanese() {
+        assert!(is_plan_rejection_request("no"));
+        assert!(is_plan_rejection_request("いいえ。"));
+        assert!(!is_plan_rejection_request("計画をもう少し詳しくして"));
     }
 
     #[test]

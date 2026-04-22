@@ -1,3 +1,6 @@
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
 use serde::Serialize;
 use serde_json::Value;
 
@@ -12,6 +15,7 @@ pub struct ToolContext {
     pub plan_path: Option<std::path::PathBuf>,
     pub auto_approve: bool,
     pub interactive_approval: bool,
+    pub cancel_flag: Option<Arc<AtomicBool>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -58,7 +62,7 @@ impl ToolRegistry {
         match name {
             "Bash" => {
                 let command = get_required_string(arguments, "command")?;
-                bash::run(command, &context.root)
+                bash::run(command, &context.root, context.cancel_flag.as_ref())
             }
             "Read" => {
                 let path =
@@ -305,7 +309,7 @@ fn maybe_confirm(name: &str, arguments: &Value, context: &ToolContext) -> Result
             .unwrap_or("<missing path>"),
     };
 
-    println!("Approve {name}: {summary}? [y/N]");
+    println!("Approve {name}: {summary}? [yes/no]");
     let mut input = String::new();
     std::io::stdin()
         .read_line(&mut input)

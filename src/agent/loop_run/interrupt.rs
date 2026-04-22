@@ -35,7 +35,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// tests can inject a preset flag via `InterruptFlag::new_preset(true)`.
 #[derive(Clone)]
 pub(super) struct InterruptFlag {
-    flag: Arc<AtomicBool>,
+    pub(super) flag: Arc<AtomicBool>,
 }
 
 impl InterruptFlag {

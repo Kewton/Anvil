@@ -110,13 +110,19 @@ pub fn repo_change_recovery_note(attempt: usize) -> String {
     )
 }
 
+pub fn tool_call_format_recovery_note(error: &str, attempt: usize) -> String {
+    format!(
+        "Previous tool call failed to parse: {error}. On the next turn, emit exactly one valid <anvil_tool_call>{{\"name\":\"Tool\",\"arguments\":{{...}}}}</anvil_tool_call> block with complete JSON. Keep the tool call small. Start with one small, self-contained change only, and prefer short Write or Edit actions over large full-file outputs. tool_call_format_attempt={attempt}"
+    )
+}
+
 pub fn install_loop_recovery_note() -> String {
-    "Recent turns repeated setup or dependency installation commands without finishing the implementation. Stop reinstalling packages. Inspect the project files that matter, then use Write or Edit to make concrete code changes before any further setup.".to_string()
+    "Recent turns repeated setup, rescaffolding, or dependency installation commands without finishing the implementation. Stop reinstalling packages or recreating the project. Inspect the project files that matter, then use Write or Edit to make concrete code changes before any further setup.".to_string()
 }
 
 pub fn repeated_bash_error(command: &str) -> String {
     format!(
-        "Error: repeated Bash command blocked to prevent a tool loop: {command}. Do not repeat setup or install steps. Inspect files and continue with Read, Write, or Edit instead."
+        "Error: repeated or risky Bash command blocked to prevent a tool loop: {command}. Do not repeat setup, rescaffolding, workspace resets, or install steps. Inspect files and continue with Read, Write, or Edit instead."
     )
 }
 
@@ -142,15 +148,43 @@ pub fn is_dependency_install_command(command: &str) -> bool {
         || normalized.contains("composer require")
 }
 
+pub fn is_scaffold_command(command: &str) -> bool {
+    let normalized = command.to_ascii_lowercase();
+    normalized.contains("create-next-app")
+        || normalized.contains("npm create ")
+        || normalized.contains("pnpm create ")
+        || normalized.contains("yarn create ")
+        || normalized.contains("cargo new ")
+        || normalized.contains("cargo init ")
+}
+
+pub fn is_workspace_reset_command(command: &str) -> bool {
+    let normalized = command.to_ascii_lowercase();
+    normalized.contains("rm -rf .anvil")
+        || normalized.contains("rm -rf .next")
+        || normalized.contains("rm -rf node_modules")
+        || normalized.contains("rm -rf package-lock.json")
+}
+
 pub fn should_block_bash_command(
     command: &str,
     recent_bash_commands: &[String],
     install_commands_seen: usize,
 ) -> bool {
     let normalized = command.trim().to_ascii_lowercase();
+    if is_workspace_reset_command(&normalized) {
+        return true;
+    }
     if recent_bash_commands
         .iter()
         .any(|previous| previous.trim().eq_ignore_ascii_case(command.trim()))
+    {
+        return true;
+    }
+    if is_scaffold_command(&normalized)
+        && recent_bash_commands
+            .iter()
+            .any(|previous| is_scaffold_command(previous))
     {
         return true;
     }

@@ -13,11 +13,13 @@ fn parses_key_value_config() {
         sidecar-model = qwen3:1.7b
         # comment
         yes_mode = true
+        auto_plan = on
         "#,
     );
     assert_eq!(map.get("model").unwrap(), "qwen3:8b");
     assert_eq!(map.get("sidecar_model").unwrap(), "qwen3:1.7b");
     assert_eq!(map.get("yes_mode").unwrap(), "true");
+    assert_eq!(map.get("auto_plan").unwrap(), "on");
 }
 
 #[test]
@@ -45,6 +47,21 @@ fn merge_prefers_later_sources() {
     assert_eq!(merged.yes_mode, Some(true));
     assert_eq!(merged.chat_timeout_secs, Some(240));
     assert_eq!(merged.chat_retries, Some(3));
+}
+
+#[test]
+fn merge_auto_plan_prefers_later_sources() {
+    let merged = merge_partial_configs(&[
+        PartialConfig {
+            auto_plan: Some(false),
+            ..PartialConfig::default()
+        },
+        PartialConfig {
+            auto_plan: Some(true),
+            ..PartialConfig::default()
+        },
+    ]);
+    assert_eq!(merged.auto_plan, Some(true));
 }
 
 #[test]

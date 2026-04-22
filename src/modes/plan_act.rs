@@ -7,10 +7,28 @@ pub enum ExecutionMode {
     Act,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub enum TaskProfile {
+    #[default]
+    Generic,
+    Coding,
+}
+
+impl TaskProfile {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TaskProfile::Generic => "generic",
+            TaskProfile::Coding => "coding",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ModeState {
     pub mode: ExecutionMode,
     pub active_plan_path: Option<PathBuf>,
+    #[serde(default)]
+    pub task_profile: TaskProfile,
 }
 
 impl Default for ModeState {
@@ -18,12 +36,17 @@ impl Default for ModeState {
         Self {
             mode: ExecutionMode::Act,
             active_plan_path: None,
+            task_profile: TaskProfile::Generic,
         }
     }
 }
 
 impl ModeState {
-    pub fn enter_plan(&mut self, plan_dir: PathBuf) -> Result<PathBuf, String> {
+    pub fn enter_plan(
+        &mut self,
+        plan_dir: PathBuf,
+        task_profile: TaskProfile,
+    ) -> Result<PathBuf, String> {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|err| format!("failed to build timestamp: {err}"))?
@@ -31,6 +54,7 @@ impl ModeState {
         let path = plan_dir.join(format!("plan-{ts}.md"));
         self.mode = ExecutionMode::Plan;
         self.active_plan_path = Some(path.clone());
+        self.task_profile = task_profile;
         Ok(path)
     }
 

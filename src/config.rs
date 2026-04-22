@@ -143,6 +143,7 @@ pub struct Config {
     pub yes_mode: bool,
     pub fresh_session: bool,
     pub oneshot: bool,
+    pub auto_plan: bool,
     pub prompt: Option<String>,
     pub state_dir_override: Option<PathBuf>,
     pub resume: ResumeRequest,
@@ -165,6 +166,7 @@ pub struct PartialConfig {
     pub stream: Option<bool>,
     pub yes_mode: Option<bool>,
     pub fresh_session: Option<bool>,
+    pub auto_plan: Option<bool>,
     pub state_dir_override: Option<PathBuf>,
     /// `Some(false)` when an explicit disable signal is present
     /// (`--no-footer` / non-empty `ANVIL_NO_FOOTER` / `.anvil/config` `footer=false`).
@@ -198,6 +200,7 @@ impl Config {
             stream: args.stream.then_some(true),
             yes_mode: args.yes.then_some(true),
             fresh_session: args.fresh_session.then_some(true),
+            auto_plan: args.auto_plan.then_some(true),
             state_dir_override: args.state_dir.clone(),
             // CLI footer flag is "disable-only": `--no-footer` emits Some(false),
             // omission emits None so file/env/default can still apply.
@@ -216,7 +219,7 @@ impl Config {
             requested_sidecar_model: merged.sidecar_model,
             ollama_host,
             context_budget: merged.context_budget.unwrap_or(24_000),
-            max_iterations: merged.max_iterations.unwrap_or(12),
+            max_iterations: merged.max_iterations.unwrap_or(50),
             chat_timeout_secs: merged.chat_timeout_secs.unwrap_or(300),
             chat_retries: merged.chat_retries.unwrap_or(2),
             log_level: merged.log_level.unwrap_or_default(),
@@ -224,6 +227,7 @@ impl Config {
             yes_mode: merged.yes_mode.unwrap_or(false),
             fresh_session: merged.fresh_session.unwrap_or(false),
             oneshot: args.oneshot || args.prompt.is_some(),
+            auto_plan: merged.auto_plan.unwrap_or(false),
             prompt: args.prompt,
             state_dir_override: merged.state_dir_override,
             resume: ResumeRequest::from_flag(args.resume),
@@ -269,6 +273,9 @@ pub fn merge_partial_configs(configs: &[PartialConfig]) -> PartialConfig {
         }
         if config.fresh_session.is_some() {
             merged.fresh_session = config.fresh_session;
+        }
+        if config.auto_plan.is_some() {
+            merged.auto_plan = config.auto_plan;
         }
         if config.state_dir_override.is_some() {
             merged.state_dir_override = config.state_dir_override.clone();
@@ -317,6 +324,7 @@ pub fn load_config_file(path: &Path, warnings: &mut Vec<String>) -> Result<Parti
         stream: map.get("stream").and_then(|value| parse_bool(value)),
         yes_mode: map.get("yes_mode").and_then(|value| parse_bool(value)),
         fresh_session: map.get("fresh_session").and_then(|value| parse_bool(value)),
+        auto_plan: map.get("auto_plan").and_then(|value| parse_bool(value)),
         state_dir_override: map.get("state_dir").map(PathBuf::from),
         // Only emit Some(false) for explicit disable; any other value (true /
         // unrecognized / missing) leaves footer as None so default wins.
@@ -363,6 +371,9 @@ pub fn load_env_config(warnings: &mut Vec<String>) -> PartialConfig {
             .ok()
             .and_then(|value| parse_bool(&value)),
         fresh_session: env::var("ANVIL_FRESH_SESSION")
+            .ok()
+            .and_then(|value| parse_bool(&value)),
+        auto_plan: env::var("ANVIL_AUTO_PLAN")
             .ok()
             .and_then(|value| parse_bool(&value)),
         state_dir_override: env::var("ANVIL_STATE_DIR").ok().map(PathBuf::from),

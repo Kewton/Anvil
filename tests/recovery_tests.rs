@@ -1,9 +1,9 @@
 use anvil::agent::recovery::{
     ActionExpectation, broad_restart_discovery_error, classify_action_expectation,
     empty_response_recovery_note, install_loop_recovery_note, is_dependency_install_command,
-    no_tool_recovery_note, repeated_bash_error, repo_change_recovery_note,
-    should_block_bash_command, should_block_restart_discovery, tool_call_counts_as_repo_edit,
-    user_prompt_requires_action,
+    is_scaffold_command, is_workspace_reset_command, no_tool_recovery_note, repeated_bash_error,
+    repo_change_recovery_note, should_block_bash_command, should_block_restart_discovery,
+    tool_call_counts_as_repo_edit, user_prompt_requires_action,
 };
 use anvil::modes::plan_act::ExecutionMode;
 
@@ -44,7 +44,7 @@ fn recovery_notes_are_non_empty() {
     assert!(no_tool_recovery_note(2).contains("no_tool_attempt=2"));
     assert!(repo_change_recovery_note(3).contains("repo_change_attempt=3"));
     assert!(install_loop_recovery_note().contains("Stop reinstalling packages"));
-    assert!(repeated_bash_error("npm install jest").contains("repeated Bash command"));
+    assert!(repeated_bash_error("npm install jest").contains("risky Bash command blocked"));
     assert!(tool_call_counts_as_repo_edit("Write"));
     assert!(tool_call_counts_as_repo_edit("Edit"));
     assert!(!tool_call_counts_as_repo_edit("Bash"));
@@ -66,6 +66,18 @@ fn detects_dependency_install_loops() {
         0
     ));
     assert!(!should_block_bash_command("npm test", &[], 0));
+    assert!(is_scaffold_command("npx create-next-app@latest . --ts"));
+    assert!(is_workspace_reset_command("rm -rf .anvil"));
+    assert!(should_block_bash_command(
+        "rm -rf .anvil && npx create-next-app@latest . --ts",
+        &[],
+        0
+    ));
+    assert!(should_block_bash_command(
+        "npx create-next-app@latest . --ts",
+        &["npx create-next-app@latest app --ts".to_string()],
+        0
+    ));
     assert!(should_block_restart_discovery("Glob", true));
     assert!(should_block_restart_discovery("Bash", true));
     assert!(!should_block_restart_discovery("Read", true));

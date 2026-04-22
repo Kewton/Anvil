@@ -142,7 +142,11 @@ impl Agent {
             let reply = match self.request_assistant_reply_with_retry(stream_output) {
                 Ok(r) => r,
                 Err(err) => {
-                    exit_reason = ExitReason::TransportError;
+                    exit_reason = if lifecycle::is_tool_call_format_error(&err) {
+                        ExitReason::ToolCallFormatError
+                    } else {
+                        ExitReason::TransportError
+                    };
                     error_text = err;
                     break 'outer;
                 }
@@ -181,6 +185,26 @@ impl Agent {
                 for tool_call in prepared_tool_calls {
                     let tool_name = tool_call.name.clone();
                     let args_str = tool_call.arguments.to_string();
+                    let bash_command = if tool_name == "Bash" {
+                        tool_call
+                            .arguments
+                            .get("command")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_string()
+                    } else {
+                        String::new()
+                    };
+                    let block_restart_discovery = recovery::should_block_restart_discovery(
+                        &tool_name,
+                        restart_convergence_mode && repo_edit_calls_made_this_turn == 0,
+                    );
+                    let block_bash_loop = tool_name == "Bash"
+                        && recovery::should_block_bash_command(
+                            &bash_command,
+                            &recent_bash_commands,
+                            install_commands_seen,
+                        );
                     tracing::debug!(
                         tool = %tool_name,
                         args = %truncate(&args_str, LOG_ARGS_MAX_CHARS),
@@ -192,16 +216,29 @@ impl Agent {
                     // drops at the end of this iteration so the worker resumes
                     // before the next loop tick.
                     let _footer_freeze = self.footer.freeze_for_inference();
-                    let progress = format_progress_line(
-                        &tool_name,
-                        &tool_call.arguments,
-                        iter_count + 1,
-                        self.config.max_iterations,
-                        &self.work_root,
-                        use_color,
-                        use_unicode,
-                        self.footer.current_cols(),
-                    );
+                    let progress = if block_restart_discovery || block_bash_loop {
+                        format_blocked_bash_progress_line(
+                            &tool_name,
+                            &tool_call.arguments,
+                            iter_count + 1,
+                            self.config.max_iterations,
+                            &self.work_root,
+                            use_color,
+                            use_unicode,
+                            self.footer.current_cols(),
+                        )
+                    } else {
+                        format_progress_line(
+                            &tool_name,
+                            &tool_call.arguments,
+                            iter_count + 1,
+                            self.config.max_iterations,
+                            &self.work_root,
+                            use_color,
+                            use_unicode,
+                            self.footer.current_cols(),
+                        )
+                    };
                     println!("{progress}");
                     let _ = io::stdout().flush();
                     // approve-guard: tools Bash/Write/Edit may invoke an
@@ -221,41 +258,43 @@ impl Agent {
                     if needs_approve_prompt {
                         monitor.pause();
                     }
-                    let raw_result = if recovery::should_block_restart_discovery(
-                        &tool_name,
-                        restart_convergence_mode && repo_edit_calls_made_this_turn == 0,
-                    ) {
+                    let raw_result = if block_restart_discovery {
                         recovery::broad_restart_discovery_error(&tool_name)
                     } else if tool_name == "Bash" {
-                        let command = tool_call
-                            .arguments
-                            .get("command")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or_default()
-                            .to_string();
-                        let block_as_loop = recovery::should_block_bash_command(
-                            &command,
-                            &recent_bash_commands,
-                            install_commands_seen,
-                        );
-                        recent_bash_commands.push(command.clone());
-                        if recovery::is_dependency_install_command(&command) {
+                        recent_bash_commands.push(bash_command.clone());
+                        if recovery::is_dependency_install_command(&bash_command) {
                             install_commands_seen += 1;
                         }
-                        if block_as_loop {
+                        if block_bash_loop {
                             emitted_bash_loop_note = true;
-                            recovery::repeated_bash_error(&command)
+                            recovery::repeated_bash_error(&bash_command)
                         } else if start_spinner_for_exec {
                             let _sp = Spinner::start(format!("running {tool_name}..."));
-                            self.execute_tool_call(&tool_name, &tool_call.arguments)
+                            self.execute_tool_call(
+                                &tool_name,
+                                &tool_call.arguments,
+                                Some(interrupt_flag.flag.clone()),
+                            )
                         } else {
-                            self.execute_tool_call(&tool_name, &tool_call.arguments)
+                            self.execute_tool_call(
+                                &tool_name,
+                                &tool_call.arguments,
+                                Some(interrupt_flag.flag.clone()),
+                            )
                         }
                     } else if start_spinner_for_exec {
                         let _sp = Spinner::start(format!("running {tool_name}..."));
-                        self.execute_tool_call(&tool_name, &tool_call.arguments)
+                        self.execute_tool_call(
+                            &tool_name,
+                            &tool_call.arguments,
+                            Some(interrupt_flag.flag.clone()),
+                        )
                     } else {
-                        self.execute_tool_call(&tool_name, &tool_call.arguments)
+                        self.execute_tool_call(
+                            &tool_name,
+                            &tool_call.arguments,
+                            Some(interrupt_flag.flag.clone()),
+                        )
                     };
                     if needs_approve_prompt {
                         monitor.resume();
@@ -400,12 +439,14 @@ impl Agent {
         let sp = Spinner::start(format!("thinking... ({})", self.models.main));
         let mut downgraded_native_tools = false;
         let mut retries_remaining = self.config.chat_retries;
+        let mut tool_call_format_retries_remaining = 2usize;
         let mut extra_transport_retries = if self.session.messages.len() >= 12 {
             4
         } else {
             2
         };
         let mut transport_retry_count = 0usize;
+        let mut tool_call_format_retry_count = 0usize;
         loop {
             // Only streaming paths need first-chunk stop; oneshot blocks until
             // the whole reply is assembled so Drop is sufficient.
@@ -423,6 +464,17 @@ impl Agent {
                     {
                         downgraded_native_tools = true;
                         self.disable_native_tools_for_session();
+                        continue;
+                    }
+                    if lifecycle::is_tool_call_format_error(&err)
+                        && tool_call_format_retries_remaining > 0
+                    {
+                        tool_call_format_retry_count += 1;
+                        tool_call_format_retries_remaining -= 1;
+                        self.push_system_note(recovery::tool_call_format_recovery_note(
+                            &err,
+                            tool_call_format_retry_count,
+                        ));
                         continue;
                     }
                     if lifecycle::is_transport_error(&err) && extra_transport_retries > 0 {
@@ -529,6 +581,7 @@ impl Agent {
         messages.push(ConversationMessage::system(build_system_prompt(
             self.session.mode_state.mode,
             self.session.mode_state.active_plan_path.as_deref(),
+            self.session.mode_state.task_profile,
             protocol,
         )));
         messages.extend(prompting::runtime_context_messages(
@@ -540,13 +593,19 @@ impl Agent {
         messages
     }
 
-    fn execute_tool_call(&mut self, name: &str, arguments: &serde_json::Value) -> String {
+    fn execute_tool_call(
+        &mut self,
+        name: &str,
+        arguments: &serde_json::Value,
+        cancel_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> String {
         let context = ToolContext {
             root: self.work_root.clone(),
             mode: self.session.mode_state.mode,
             plan_path: self.session.mode_state.active_plan_path.clone(),
             auto_approve: self.config.yes_mode,
             interactive_approval: io::stdin().is_terminal(),
+            cancel_flag,
         };
         match self.tool_registry.execute(name, arguments, &context) {
             Ok(result) => {
@@ -784,6 +843,34 @@ pub(super) fn format_progress_line(
     let painted = paint(&label, tool_color(tool_name), use_color);
     let extra_part = extra.map(|e| format!(" ({e})")).unwrap_or_default();
     format!("[iter {iter_human}/{max_iterations}]  {painted}  {display_str}{extra_part}")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn format_blocked_bash_progress_line(
+    tool_name: &str,
+    arguments: &serde_json::Value,
+    iter_human: usize,
+    max_iterations: usize,
+    work_root: &std::path::Path,
+    use_color: bool,
+    use_unicode: bool,
+    cols: Option<u16>,
+) -> String {
+    let arg_budget = progress_available_width(
+        cols,
+        "Bash blocked",
+        iter_human,
+        max_iterations,
+        use_unicode,
+    );
+    let (display_str, _) = tool_display(tool_name, arguments, work_root, arg_budget);
+    let label = if use_unicode {
+        "⛔ Bash blocked".to_string()
+    } else {
+        "Bash blocked".to_string()
+    };
+    let painted = paint(&label, "\x1b[38;5;196m", use_color);
+    format!("[iter {iter_human}/{max_iterations}]  {painted}  {display_str}")
 }
 
 #[cfg(test)]

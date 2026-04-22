@@ -15,6 +15,7 @@ fn read_write_edit_glob_and_grep_work() {
         plan_path: None,
         auto_approve: true,
         interactive_approval: false,
+        cancel_flag: None,
     };
 
     registry
@@ -66,6 +67,7 @@ fn plan_mode_only_allows_plan_file_writes() {
         plan_path: Some(plan_path.clone()),
         auto_approve: true,
         interactive_approval: false,
+        cancel_flag: None,
     };
 
     registry
@@ -101,6 +103,7 @@ fn plan_mode_allows_plan_file_outside_workspace() {
         plan_path: Some(plan_path.clone()),
         auto_approve: true,
         interactive_approval: false,
+        cancel_flag: None,
     };
 
     registry

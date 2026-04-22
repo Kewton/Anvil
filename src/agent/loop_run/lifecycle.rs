@@ -68,7 +68,7 @@ impl Agent {
         }
         std::fs::write(
             plan_path,
-            "# Plan\n\n## Goal\n- \n\n## Findings\n- \n\n## Steps\n1. \n",
+            "# Plan\n\n## Goal\n- \n\n## Constraints\n- \n\n## Deliverables\n- \n\n## Acceptance Criteria\n- \n\n## Execution Plan\n1. First slice:\n2. Next phases:\n3. Review checkpoint:\n\n## Verification Plan\n- \n\n## Risks / Fallbacks\n- \n",
         )
         .map_err(|err| format!("failed to create plan file {}: {err}", plan_path.display()))
     }
@@ -131,6 +131,12 @@ pub(super) fn is_native_tool_parser_failure(error: &str) -> bool {
     lower.contains("native tool parser failed")
         || lower.contains("unexpected end element")
         || lower.contains("unexpected eof")
+}
+
+pub(super) fn is_tool_call_format_error(error: &str) -> bool {
+    error
+        .to_ascii_lowercase()
+        .contains("tool call parser failed:")
 }
 
 pub(super) fn is_transport_error(error: &str) -> bool {

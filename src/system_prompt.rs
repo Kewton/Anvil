@@ -1,11 +1,12 @@
 use std::path::Path;
 
 use crate::agent::prompting::ToolProtocol;
-use crate::modes::plan_act::ExecutionMode;
+use crate::modes::plan_act::{ExecutionMode, TaskProfile};
 
 pub(crate) fn build_system_prompt(
     mode: ExecutionMode,
     active_plan_path: Option<&Path>,
+    task_profile: TaskProfile,
     protocol: ToolProtocol,
 ) -> String {
     let tool_call_instruction = if protocol.native_tools_enabled() {
@@ -38,18 +39,11 @@ CORE RULES:\n\
 15. Do not say \"I will do the next step later\". If implementation is still pending, call the next tool now.\n\
 16. Use repository-relative paths (e.g. 'src/app/page.tsx') for Read, Write, and Edit. Never invent absolute paths from memory such as '/Users/...' or '/home/...'.\n\
 17. When the project root is given, do not repeat the project directory name in tool paths.\n\
-\n\
-WRONG: \"以下のコマンドをターミナルで実行してください: npm install\"\n\
-RIGHT: [immediately call Bash(npm install)]\n\
+18. When a task is large, do not attempt a large output in one response. Start with one small, self-contained change that moves the task forward.\n\
+19. Prefer short Write/Edit actions over large full-file outputs. If more work is needed, continue in later turns with additional small changes.\n\
 \n\
 WRONG: \"何か特定の操作が必要ですか？\"\n\
 RIGHT: [finish your response, wait silently]\n\
-\n\
-WRONG: \"まず全てのテストファイルを書き、その後に実装します。\" [proceeds to write only tests]\n\
-RIGHT: [for a Next.js game task, write src/app/page.tsx with a minimal game render as the first implementation file, then add logic and tests]\n\
-\n\
-WRONG: \"page.tsx はテンプレートなので編集しません。\" [leaves src/app/page.tsx untouched for a Next.js UI request]\n\
-RIGHT: [replace src/app/page.tsx with the actual implementation that renders the requested feature]\n\
 \n\
 TOOLS:\n\
 - Bash(command): run a shell command in the project directory\n\
@@ -71,12 +65,38 @@ You are in read-only exploration mode. Use Read, Glob, and Grep to inspect the r
                 path.display()
             ));
         }
-        prompt.push_str("When the plan is complete, stop and wait for /approve.\n");
+        prompt.push_str(
+            "Build a plan with these sections in order: Goal, Constraints, Deliverables, Acceptance Criteria, Execution Plan, Verification Plan, Risks/Fallbacks.\n\
+Execution Plan must define the first concrete slice, the order of work, the files or areas likely to change, and the checkpoint where the user should review progress.\n\
+When the plan is complete, stop and ask the user to choose yes to execute, no to revise, or provide feedback. Wait for /approve, yes, or equivalent approval before making code changes.\n",
+        );
     } else {
         prompt.push_str(
             "\nACT MODE:\n\
-Implement the requested change completely. Run validation when it is reasonable.\n",
+Execute the accepted plan in phases: Prepare, Do, Verify, Evaluate, Iterate.\n",
         );
+    }
+
+    match task_profile {
+        TaskProfile::Generic => {
+            prompt.push_str(
+                "\nTASK PROFILE: GENERIC\n\
+Focus on the requested outcome, not on a coding-only workflow. Preserve the accepted plan structure, keep work incremental, verify important claims, and evaluate the result against the acceptance criteria before stopping.\n",
+            );
+        }
+        TaskProfile::Coding => {
+            prompt.push_str(
+                "\nTASK PROFILE: CODING\n\
+For coding work, use this process inside Act mode:\n\
+1. Design against the accepted plan and acceptance criteria.\n\
+2. Implement in small slices instead of one large rewrite.\n\
+3. Review your own changes for gaps, regressions, and missing files.\n\
+4. Run validation or tests when reasonable.\n\
+5. Evaluate whether the result meets the quality bar and polish gaps if needed.\n\
+Never re-scaffold or reset the workspace once a viable project skeleton exists unless the user explicitly asks.\n\
+For UI-heavy work, improve game feel, visual polish, and completeness before considering the task done.\n",
+            );
+        }
     }
 
     prompt

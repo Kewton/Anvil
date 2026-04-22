@@ -462,6 +462,36 @@ pub struct FreezeGuard {
     state: Option<Arc<FooterStateInner>>,
 }
 
+fn footer_known_incompatible_terminal(
+    term_program: Option<&str>,
+    lc_terminal: Option<&str>,
+    term: Option<&str>,
+    colorterm: Option<&str>,
+) -> bool {
+    let term_program_incompatible = term_program
+        .map(|value| value.eq_ignore_ascii_case("Apple_Terminal"))
+        .unwrap_or(false);
+    term_program_incompatible
+        || [term_program, lc_terminal, term, colorterm]
+            .into_iter()
+            .flatten()
+            .map(|value| value.to_ascii_lowercase())
+            .any(|value| value.contains("commandmate"))
+}
+
+fn footer_terminal_is_compatible() -> bool {
+    let term_program = std::env::var("TERM_PROGRAM").ok();
+    let lc_terminal = std::env::var("LC_TERMINAL").ok();
+    let term = std::env::var("TERM").ok();
+    let colorterm = std::env::var("COLORTERM").ok();
+    !footer_known_incompatible_terminal(
+        term_program.as_deref(),
+        lc_terminal.as_deref(),
+        term.as_deref(),
+        colorterm.as_deref(),
+    )
+}
+
 impl FooterLease {
     /// Acquire the process-global footer lease.
     ///
@@ -489,6 +519,10 @@ impl FooterLease {
 
         #[cfg(not(windows))]
         {
+            if !footer_terminal_is_compatible() {
+                tracing::warn!("anvil footer: disabled on incompatible terminal emulator");
+                return Self::disabled_lease();
+            }
             let is_terminal = io::stdout().is_terminal();
             // Non-TTY: fully disabled regardless of config (issue #430 / #432).
             if !is_terminal {
@@ -678,6 +712,13 @@ fn install_active(
             bit_guard.release();
             return Err(());
         }
+        // Move cursor to home position (1,1) immediately after setting DECSTBM.
+        // DECSTBM does not move the cursor on xterm-compatible terminals; if the
+        // cursor was already at the absolute last row (outside the new scroll
+        // region), all subsequent output would land on that row and be cleared
+        // by the footer daemon on each render tick, making all output invisible.
+        // CUP \x1b[H ensures the cursor is within the scroll region from the start.
+        let _ = w.write_all(b"\x1b[H");
         let _ = w.flush();
     }
 
@@ -1178,6 +1219,7 @@ mod tests {
             yes_mode: false,
             fresh_session: false,
             oneshot: false,
+            auto_plan: false,
             prompt: None,
             state_dir_override: None,
             resume: Default::default(),
@@ -1216,6 +1258,46 @@ mod tests {
             !h.is_enabled(),
             "cargo test stdout is non-TTY; acquire must return disabled handle"
         );
+    }
+
+    #[test]
+    fn commandmate_terminal_is_treated_as_incompatible() {
+        assert!(footer_known_incompatible_terminal(
+            Some("Apple_Terminal"),
+            None,
+            None,
+            None
+        ));
+        assert!(footer_known_incompatible_terminal(
+            Some("CommandMate"),
+            None,
+            None,
+            None
+        ));
+        assert!(footer_known_incompatible_terminal(
+            None,
+            Some("commandmate"),
+            None,
+            None
+        ));
+        assert!(footer_known_incompatible_terminal(
+            None,
+            None,
+            Some("xterm-commandmate"),
+            None
+        ));
+        assert!(footer_known_incompatible_terminal(
+            None,
+            None,
+            None,
+            Some("commandmate-truecolor")
+        ));
+        assert!(!footer_known_incompatible_terminal(
+            Some("iTerm2"),
+            Some("iTerm2"),
+            Some("xterm-256color"),
+            Some("truecolor")
+        ));
     }
 
     #[test]
@@ -1587,6 +1669,15 @@ mod tests {
         assert!(
             s.contains("\x1b[1;23r"),
             "expected DECSTBM set (rows=24 → top=23) in captured output: {s:?}"
+        );
+        // Cursor home (CUP 1;1) must follow DECSTBM set at install time so
+        // that a cursor that was below the scroll region (e.g. at the absolute
+        // last row) is moved inside it before any output is written.
+        let decstbm_pos = s.find("\x1b[1;23r").unwrap();
+        let cup_pos = s[decstbm_pos..].find("\x1b[H").map(|p| p + decstbm_pos);
+        assert!(
+            cup_pos.is_some(),
+            "expected CUP \\x1b[H after DECSTBM set in captured output: {s:?}"
         );
         // DECSTBM reset must appear on Drop.
         assert!(
