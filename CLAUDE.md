@@ -23,6 +23,8 @@
   - ESC 割り込み monitor（stdin raw mode + daemon thread、`ANVIL_NO_INTERRUPT` / 非TTY / approve prompt で自動無効化）
 - `src/agent/loop_run/footer.rs`
   - 固定フッター daemon (stdout, 200ms, DECSTBM 再適用、token / mode / log / yes 表示、current_cols broadcast for turn.rs progress line)
+- `src/tui/markdown.rs`
+  - assistant 応答の SGR-only markdown renderer（行バッファ式、`<think>` strip、`ANVIL_NO_MARKDOWN` / `NO_COLOR` / `is_terminal` で多段無効化、session storage は raw LLM text のまま保持）
 - `src/modes/plan_act.rs`
   - Plan / Act の単純な状態
 - `src/session/*`
