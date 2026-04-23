@@ -106,6 +106,7 @@ impl Agent {
     ) -> LoopResult {
         self.push_user_message(input.to_string());
         self.maybe_compact_session(DEFAULT_KEEP_TAIL);
+        let _ = self.refresh_plan_stage();
 
         let action_expectation =
             recovery::classify_action_expectation(input, self.session.mode_state.mode);
@@ -199,6 +200,9 @@ impl Agent {
             if !prepared_tool_calls.is_empty() {
                 let mut plan_file_edit_calls_this_turn = 0usize;
                 let mut plan_exploration_calls_this_turn = 0usize;
+                let current_plan_stage = self.session.mode_state.plan_stage;
+                let plan_exploration_budget =
+                    lifecycle::plan_stage_exploration_budget(current_plan_stage);
                 tool_calls_made_this_turn += prepared_tool_calls.len();
                 repo_edit_calls_made_this_turn += prepared_tool_calls
                     .iter()
@@ -277,6 +281,11 @@ impl Agent {
                             &recent_bash_commands,
                             install_commands_seen,
                         );
+                    let block_plan_exploration = self.session.mode_state.mode
+                        == ExecutionMode::Plan
+                        && matches!(tool_name.as_str(), "Read" | "Glob" | "Grep")
+                        && plan_exploration_budget > 0
+                        && plan_exploration_calls_this_turn > plan_exploration_budget;
                     tracing::debug!(
                         tool = %tool_name,
                         args = %truncate(&args_str, LOG_ARGS_MAX_CHARS),
@@ -288,29 +297,30 @@ impl Agent {
                     // drops at the end of this iteration so the worker resumes
                     // before the next loop tick.
                     let _footer_freeze = self.footer.freeze_for_inference();
-                    let progress = if block_restart_discovery || block_bash_loop {
-                        format_blocked_bash_progress_line(
-                            &tool_name,
-                            &tool_call.arguments,
-                            iter_count + 1,
-                            self.config.max_iterations,
-                            &self.work_root,
-                            use_color,
-                            use_unicode,
-                            self.footer.current_cols(),
-                        )
-                    } else {
-                        format_progress_line(
-                            &tool_name,
-                            &tool_call.arguments,
-                            iter_count + 1,
-                            self.config.max_iterations,
-                            &self.work_root,
-                            use_color,
-                            use_unicode,
-                            self.footer.current_cols(),
-                        )
-                    };
+                    let progress =
+                        if block_restart_discovery || block_bash_loop || block_plan_exploration {
+                            format_blocked_bash_progress_line(
+                                &tool_name,
+                                &tool_call.arguments,
+                                iter_count + 1,
+                                self.config.max_iterations,
+                                &self.work_root,
+                                use_color,
+                                use_unicode,
+                                self.footer.current_cols(),
+                            )
+                        } else {
+                            format_progress_line(
+                                &tool_name,
+                                &tool_call.arguments,
+                                iter_count + 1,
+                                self.config.max_iterations,
+                                &self.work_root,
+                                use_color,
+                                use_unicode,
+                                self.footer.current_cols(),
+                            )
+                        };
                     println!("{progress}");
                     let _ = io::stdout().flush();
                     // approve-guard: tools Bash/Write/Edit may invoke an
@@ -332,6 +342,18 @@ impl Agent {
                     }
                     let raw_result = if block_restart_discovery {
                         recovery::broad_restart_discovery_error(&tool_name)
+                    } else if block_plan_exploration {
+                        let next_sections = self
+                            .current_plan_contents()
+                            .ok()
+                            .flatten()
+                            .map(|contents| lifecycle::plan_next_stage_sections(&contents))
+                            .unwrap_or_default();
+                        recovery::plan_stage_budget_error(
+                            current_plan_stage,
+                            &next_sections,
+                            plan_exploration_budget,
+                        )
                     } else if tool_name == "Bash" {
                         recent_bash_commands.push(bash_command.clone());
                         if recovery::is_dependency_install_command(&bash_command) {
@@ -387,16 +409,19 @@ impl Agent {
                 }
                 if self.session.mode_state.mode == ExecutionMode::Plan {
                     if plan_file_edit_calls_this_turn > 0 {
+                        let _ = self.refresh_plan_stage();
                         plan_progress_retries = 0;
                         plan_exploration_only_turns = 0;
                     } else if plan_exploration_calls_this_turn >= 2 {
                         match self.current_plan_contents() {
                             Ok(Some(contents)) => {
+                                let current_stage = lifecycle::current_plan_stage(&contents);
                                 let next_sections = lifecycle::plan_next_stage_sections(&contents);
                                 let missing_sections = lifecycle::plan_missing_sections(&contents);
                                 if !missing_sections.is_empty() {
                                     plan_progress_retries += 1;
                                     self.push_system_note(recovery::plan_progress_recovery_note(
+                                        current_stage,
                                         &next_sections,
                                         &missing_sections,
                                         plan_progress_retries,
@@ -415,6 +440,7 @@ impl Agent {
                         if plan_exploration_only_turns >= 2 {
                             match self.current_plan_contents() {
                                 Ok(Some(contents)) => {
+                                    let current_stage = lifecycle::current_plan_stage(&contents);
                                     let next_sections =
                                         lifecycle::plan_next_stage_sections(&contents);
                                     let missing_sections =
@@ -423,6 +449,7 @@ impl Agent {
                                         plan_progress_retries += 1;
                                         self.push_system_note(
                                             recovery::plan_progress_recovery_note(
+                                                current_stage,
                                                 &next_sections,
                                                 &missing_sections,
                                                 plan_progress_retries,
@@ -473,25 +500,22 @@ impl Agent {
                     }
                     self.push_system_note(recovery::repo_change_recovery_note(repo_change_retries));
                 } else if action_expectation == recovery::ActionExpectation::PlanProgress {
+                    let plan_contents = self
+                        .current_plan_contents()
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default();
+                    let current_stage = lifecycle::current_plan_stage(&plan_contents);
+                    let next_sections = lifecycle::plan_next_stage_sections(&plan_contents);
                     plan_progress_retries += 1;
                     if plan_progress_retries >= 4 {
                         exit_reason = ExitReason::PlanIncomplete;
                         error_text = exit_reason.default_error_text().to_string();
                         break 'outer;
                     }
-                    let next_sections = self
-                        .current_plan_contents()
-                        .ok()
-                        .flatten()
-                        .map(|contents| lifecycle::plan_next_stage_sections(&contents))
-                        .unwrap_or_default();
-                    let missing_sections = self
-                        .current_plan_contents()
-                        .ok()
-                        .flatten()
-                        .map(|contents| lifecycle::plan_missing_sections(&contents))
-                        .unwrap_or_default();
+                    let missing_sections = lifecycle::plan_missing_sections(&plan_contents);
                     self.push_system_note(recovery::plan_progress_recovery_note(
+                        current_stage,
                         &next_sections,
                         &missing_sections,
                         plan_progress_retries,
@@ -521,6 +545,13 @@ impl Agent {
                     }
                     self.push_system_note(recovery::repo_change_recovery_note(repo_change_retries));
                 } else if action_expectation == recovery::ActionExpectation::PlanProgress {
+                    let plan_contents = self
+                        .current_plan_contents()
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default();
+                    let current_stage = lifecycle::current_plan_stage(&plan_contents);
+                    let next_sections = lifecycle::plan_next_stage_sections(&plan_contents);
                     plan_progress_retries += 1;
                     if plan_progress_retries >= 4 {
                         exit_reason = ExitReason::PlanIncomplete;
@@ -528,6 +559,8 @@ impl Agent {
                         break 'outer;
                     }
                     self.push_system_note(recovery::plan_no_tool_recovery_note(
+                        current_stage,
+                        &next_sections,
                         plan_progress_retries,
                     ));
                 } else {
@@ -565,9 +598,11 @@ impl Agent {
                         break 'outer;
                     }
                 };
+                self.session.mode_state.plan_stage = lifecycle::current_plan_stage(&plan_contents);
                 if !lifecycle::plan_is_substantive(&plan_contents) {
                     let next_sections = lifecycle::plan_next_stage_sections(&plan_contents);
                     let missing_sections = lifecycle::plan_missing_sections(&plan_contents);
+                    let current_stage = lifecycle::current_plan_stage(&plan_contents);
                     plan_progress_retries += 1;
                     if plan_progress_retries >= 4 {
                         exit_reason = ExitReason::PlanIncomplete;
@@ -575,6 +610,7 @@ impl Agent {
                         break 'outer;
                     }
                     self.push_system_note(recovery::plan_progress_recovery_note(
+                        current_stage,
                         &next_sections,
                         &missing_sections,
                         plan_progress_retries,
@@ -779,12 +815,30 @@ impl Agent {
         protocol: prompting::ToolProtocol,
     ) -> Vec<ConversationMessage> {
         let mut messages = Vec::new();
+        let plan_contents = if self.session.mode_state.mode == ExecutionMode::Plan {
+            self.current_plan_contents().ok().flatten()
+        } else {
+            None
+        };
+        let plan_stage = plan_contents
+            .as_deref()
+            .map(lifecycle::current_plan_stage)
+            .or_else(|| {
+                (self.session.mode_state.mode == ExecutionMode::Plan)
+                    .then_some(self.session.mode_state.plan_stage)
+            });
+        let next_sections = plan_contents
+            .as_deref()
+            .map(lifecycle::plan_next_stage_sections)
+            .unwrap_or_default();
 
         messages.push(ConversationMessage::system(build_system_prompt(
             self.session.mode_state.mode,
             self.session.mode_state.active_plan_path.as_deref(),
             self.session.mode_state.task_profile,
             protocol,
+            plan_stage,
+            &next_sections,
         )));
         messages.extend(prompting::runtime_context_messages(
             &self.config.cwd,

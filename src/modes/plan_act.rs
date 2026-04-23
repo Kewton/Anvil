@@ -29,12 +29,43 @@ impl TaskProfile {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub enum PlanStage {
+    #[default]
+    Stage1,
+    Stage2,
+    Stage3,
+    Ready,
+}
+
+impl PlanStage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PlanStage::Stage1 => "stage1",
+            PlanStage::Stage2 => "stage2",
+            PlanStage::Stage3 => "stage3",
+            PlanStage::Ready => "ready",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PlanStage::Stage1 => "Stage 1",
+            PlanStage::Stage2 => "Stage 2",
+            PlanStage::Stage3 => "Stage 3",
+            PlanStage::Ready => "Ready",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ModeState {
     pub mode: ExecutionMode,
     pub active_plan_path: Option<PathBuf>,
     #[serde(default)]
     pub task_profile: TaskProfile,
+    #[serde(default)]
+    pub plan_stage: PlanStage,
 }
 
 impl Default for ModeState {
@@ -43,6 +74,7 @@ impl Default for ModeState {
             mode: ExecutionMode::Act,
             active_plan_path: None,
             task_profile: TaskProfile::Generic,
+            plan_stage: PlanStage::Stage1,
         }
     }
 }
@@ -61,10 +93,12 @@ impl ModeState {
         self.mode = ExecutionMode::Plan;
         self.active_plan_path = Some(path.clone());
         self.task_profile = task_profile;
+        self.plan_stage = PlanStage::Stage1;
         Ok(path)
     }
 
     pub fn approve(&mut self) {
         self.mode = ExecutionMode::Act;
+        self.plan_stage = PlanStage::Ready;
     }
 }

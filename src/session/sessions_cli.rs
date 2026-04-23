@@ -880,6 +880,7 @@ mod tests {
                 mode: ExecutionMode::Plan,
                 active_plan_path: Some(PathBuf::from("/tmp/work/.anvil/plan.md")),
                 task_profile: crate::modes::plan_act::TaskProfile::Generic,
+                plan_stage: crate::modes::plan_act::PlanStage::Stage1,
             },
             messages: vec![
                 ConversationMessage::system("sys".into()),

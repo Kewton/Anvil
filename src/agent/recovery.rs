@@ -1,4 +1,5 @@
 use crate::modes::plan_act::ExecutionMode;
+use crate::modes::plan_act::PlanStage;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionExpectation {
@@ -87,9 +88,20 @@ pub fn user_prompt_requires_action(prompt: &str, mode: ExecutionMode) -> bool {
     classify_action_expectation(prompt, mode) != ActionExpectation::None
 }
 
-pub fn plan_no_tool_recovery_note(attempt: usize) -> String {
+pub fn plan_no_tool_recovery_note(
+    stage: PlanStage,
+    next_sections: &[&str],
+    attempt: usize,
+) -> String {
+    let next = if next_sections.is_empty() {
+        "the current stage".to_string()
+    } else {
+        next_sections.join(", ")
+    };
     format!(
-        "You are still in Plan mode and the plan has not advanced. Do not describe intent only. On the next turn, call a tool immediately and make one small Write or Edit to the active plan file. plan_no_tool_attempt={attempt}"
+        "You are still in Plan mode and the plan has not advanced. Current stage is {}. Do not describe intent only. On the next turn, call a tool immediately and make one small Write or Edit to the active plan file, focusing only on: {}. plan_no_tool_attempt={attempt}",
+        stage.label(),
+        next
     )
 }
 
@@ -124,6 +136,7 @@ pub fn tool_call_format_recovery_note(error: &str, attempt: usize) -> String {
 }
 
 pub fn plan_progress_recovery_note(
+    stage: PlanStage,
     next_sections: &[&str],
     missing_sections: &[&str],
     attempt: usize,
@@ -139,7 +152,22 @@ pub fn plan_progress_recovery_note(
         missing_sections.join(", ")
     };
     format!(
-        "The plan is still incomplete. Do not keep exploring. On the next turn, make exactly one small Write or Edit to the plan file and fill only these next sections: {next}. Missing sections now: {missing}. Avoid broad Read or Glob unless a specific missing section requires it. plan_progress_attempt={attempt}"
+        "The plan is still incomplete. Current stage is {}. Do not keep exploring. On the next turn, make exactly one small Write or Edit to the plan file and fill only these next sections: {next}. Missing sections now: {missing}. Avoid broad Read or Glob unless a specific missing section requires it. plan_progress_attempt={attempt}",
+        stage.label()
+    )
+}
+
+pub fn plan_stage_budget_error(stage: PlanStage, next_sections: &[&str], budget: usize) -> String {
+    let next = if next_sections.is_empty() {
+        "the current stage sections".to_string()
+    } else {
+        next_sections.join(", ")
+    };
+    format!(
+        "Error: plan exploration budget reached for {} after {} exploration step(s). Stop exploring and update the active plan file next. Focus only on: {}.",
+        stage.label(),
+        budget,
+        next
     )
 }
 

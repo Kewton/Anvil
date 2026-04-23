@@ -1,4 +1,5 @@
 use super::*;
+use crate::modes::plan_act::PlanStage;
 
 impl Agent {
     pub(super) fn current_plan_contents(&self) -> Result<Option<String>, String> {
@@ -154,6 +155,15 @@ const PLAN_STAGE_ONE: &[&str] = &["Goal", "Constraints", "Deliverables"];
 const PLAN_STAGE_TWO: &[&str] = &["Acceptance Criteria", "Quality Bar"];
 const PLAN_STAGE_THREE: &[&str] = &["Execution Plan", "Verification Plan", "Risks / Fallbacks"];
 
+pub(super) fn plan_stage_sections(stage: PlanStage) -> &'static [&'static str] {
+    match stage {
+        PlanStage::Stage1 => PLAN_STAGE_ONE,
+        PlanStage::Stage2 => PLAN_STAGE_TWO,
+        PlanStage::Stage3 => PLAN_STAGE_THREE,
+        PlanStage::Ready => &[],
+    }
+}
+
 fn normalize_plan_heading(heading: &str) -> &str {
     match heading.trim() {
         "Risks/Fallbacks" => "Risks / Fallbacks",
@@ -226,8 +236,52 @@ pub(super) fn plan_next_stage_sections(contents: &str) -> Vec<&'static str> {
     Vec::new()
 }
 
+pub(super) fn current_plan_stage(contents: &str) -> PlanStage {
+    if PLAN_STAGE_ONE
+        .iter()
+        .any(|section| !plan_section_is_substantive(contents, section))
+    {
+        PlanStage::Stage1
+    } else if PLAN_STAGE_TWO
+        .iter()
+        .any(|section| !plan_section_is_substantive(contents, section))
+    {
+        PlanStage::Stage2
+    } else if PLAN_STAGE_THREE
+        .iter()
+        .any(|section| !plan_section_is_substantive(contents, section))
+    {
+        PlanStage::Stage3
+    } else {
+        PlanStage::Ready
+    }
+}
+
+pub(super) fn plan_stage_exploration_budget(stage: PlanStage) -> usize {
+    match stage {
+        PlanStage::Stage1 => 2,
+        PlanStage::Stage2 => 1,
+        PlanStage::Stage3 => 1,
+        PlanStage::Ready => 0,
+    }
+}
+
 pub(super) fn plan_is_substantive(contents: &str) -> bool {
     plan_missing_sections(contents).is_empty()
+}
+
+pub(super) fn plan_is_approval_ready(contents: &str) -> bool {
+    [
+        "Goal",
+        "Constraints",
+        "Deliverables",
+        "Acceptance Criteria",
+        "Quality Bar",
+        "Execution Plan",
+        "Verification Plan",
+    ]
+    .into_iter()
+    .all(|section| plan_section_is_substantive(contents, section))
 }
 
 pub(super) fn plan_act_summary(contents: &str) -> String {
@@ -260,11 +314,28 @@ pub(super) fn format_tool_error(err: &str) -> String {
     }
 }
 
+impl Agent {
+    pub(super) fn refresh_plan_stage(&mut self) -> Result<Option<PlanStage>, String> {
+        if self.session.mode_state.mode != ExecutionMode::Plan {
+            return Ok(None);
+        }
+        let Some(contents) = self.current_plan_contents()? else {
+            return Ok(None);
+        };
+        let stage = current_plan_stage(&contents);
+        self.session.mode_state.plan_stage = stage;
+        Ok(Some(stage))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        plan_act_summary, plan_is_substantive, plan_missing_sections, plan_next_stage_sections,
+        current_plan_stage, plan_act_summary, plan_is_approval_ready, plan_is_substantive,
+        plan_missing_sections, plan_next_stage_sections, plan_stage_exploration_budget,
+        plan_stage_sections,
     };
+    use crate::modes::plan_act::PlanStage;
 
     const TEMPLATE: &str = "# Plan
 
@@ -320,6 +391,7 @@ mod tests {
             plan_next_stage_sections(&contents),
             vec!["Acceptance Criteria", "Quality Bar"]
         );
+        assert_eq!(current_plan_stage(&contents), PlanStage::Stage2);
     }
 
     #[test]
@@ -354,6 +426,7 @@ mod tests {
 ";
         assert!(plan_missing_sections(contents).is_empty());
         assert!(plan_is_substantive(contents));
+        assert_eq!(current_plan_stage(contents), PlanStage::Ready);
     }
 
     #[test]
@@ -394,5 +467,50 @@ mod tests {
         assert!(summary.contains("## Execution Plan"));
         assert!(!summary.contains("## Constraints"));
         assert!(!summary.contains("## Deliverables"));
+    }
+
+    #[test]
+    fn approval_ready_allows_risks_to_be_filled_later() {
+        let contents = "# Plan
+
+## Goal
+- Improve the README.
+
+## Constraints
+- Keep the existing sections.
+
+## Deliverables
+- Updated README plan.
+
+## Acceptance Criteria
+- Adds a useful new section.
+
+## Quality Bar
+- The result is concrete and not filler.
+
+## Execution Plan
+1. Add the heading.
+2. Add supporting content.
+3. Review readability.
+
+## Verification Plan
+- Re-read the file and confirm the section is useful.
+
+## Risks / Fallbacks
+- 
+";
+        assert!(plan_is_approval_ready(contents));
+    }
+
+    #[test]
+    fn plan_stage_budget_is_tight_after_stage_one() {
+        assert_eq!(plan_stage_exploration_budget(PlanStage::Stage1), 2);
+        assert_eq!(plan_stage_exploration_budget(PlanStage::Stage2), 1);
+        assert_eq!(plan_stage_exploration_budget(PlanStage::Stage3), 1);
+        assert_eq!(plan_stage_exploration_budget(PlanStage::Ready), 0);
+        assert_eq!(
+            plan_stage_sections(PlanStage::Stage2),
+            &["Acceptance Criteria", "Quality Bar"]
+        );
     }
 }

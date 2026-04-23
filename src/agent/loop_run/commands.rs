@@ -602,8 +602,8 @@ impl Agent {
         let plan_contents = self
             .current_plan_contents()?
             .ok_or_else(|| "plan file is missing".to_string())?;
-        if !lifecycle::plan_is_substantive(&plan_contents) {
-            return Err("plan file is empty or still template-only".to_string());
+        if !lifecycle::plan_is_approval_ready(&plan_contents) {
+            return Err("plan file is not ready for approval yet".to_string());
         }
         self.session.mode_state.approve();
         self.push_system_note(format!(
@@ -952,10 +952,7 @@ impl Agent {
             let user_input = if auto_plan_entered.is_some() {
                 format!(
                     "Create an implementation plan for the user's request. Inspect only the directly relevant files first, then fill the active plan file incrementally. Do not make code changes yet.\n\
-Stage 1 fills Goal, Constraints, and Deliverables.\n\
-Stage 2 fills Acceptance Criteria and Quality Bar.\n\
-Stage 3 fills Execution Plan, Verification Plan, and Risks/Fallbacks.\n\
-Use one small Write or Edit at a time. Do not try to write the full completed plan in one large tool call. Prefer at most one or two Read/Glob steps before updating the plan. The plan must still define: (1) the first shippable vertical slice, (2) concrete acceptance criteria for that slice, (3) the quality bar that defines what makes the result genuinely good, (4) the implementation phases after that, (5) the specific files/modules likely to change, and (6) the verification steps. End your user-facing response only after the plan is complete, and then tell the user to reply yes to execute, no to revise, or provide feedback.\n\nUser request:\n{trimmed}"
+Focus only on the current plan stage that the runtime indicates. Use one small Write or Edit at a time. Do not try to write the full completed plan in one large tool call. The plan must still define: (1) the first shippable vertical slice, (2) concrete acceptance criteria for that slice, (3) the quality bar that defines what makes the result genuinely good, (4) the implementation phases after that, (5) the specific files/modules likely to change, and (6) the verification steps. End your user-facing response only after the plan is complete, and then tell the user to reply yes to execute, no to revise, or provide feedback.\n\nUser request:\n{trimmed}"
                 )
             } else {
                 trimmed.to_string()
@@ -993,7 +990,7 @@ Use one small Write or Edit at a time. Do not try to write the full completed pl
                     println!();
                     if self.session.mode_state.mode == ExecutionMode::Plan {
                         let plan_contents = self.current_plan_contents()?.unwrap_or_default();
-                        if lifecycle::plan_is_substantive(&plan_contents) {
+                        if lifecycle::plan_is_approval_ready(&plan_contents) {
                             match self.prompt_for_plan_approval_choice()? {
                                 Some(PlanApprovalChoice::Execute) => {
                                     return self.execute_approved_plan("yes", stream_output);

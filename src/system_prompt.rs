@@ -1,13 +1,15 @@
 use std::path::Path;
 
 use crate::agent::prompting::ToolProtocol;
-use crate::modes::plan_act::{ExecutionMode, TaskProfile};
+use crate::modes::plan_act::{ExecutionMode, PlanStage, TaskProfile};
 
 pub(crate) fn build_system_prompt(
     mode: ExecutionMode,
     active_plan_path: Option<&Path>,
     task_profile: TaskProfile,
     protocol: ToolProtocol,
+    plan_stage: Option<PlanStage>,
+    next_sections: &[&str],
 ) -> String {
     let tool_call_instruction = if protocol.native_tools_enabled() {
         "IMPORTANT: Never output <think> tags. Use native tool calls exclusively.".to_string()
@@ -65,17 +67,53 @@ You are in read-only exploration mode. Use Read, Glob, and Grep to inspect the r
                 path.display()
             ));
         }
+        let stage = plan_stage.unwrap_or(PlanStage::Stage1);
+        let next = if next_sections.is_empty() {
+            "none".to_string()
+        } else {
+            next_sections.join(", ")
+        };
         prompt.push_str(
-            "Build a plan with these sections in order: Goal, Constraints, Deliverables, Acceptance Criteria, Quality Bar, Execution Plan, Verification Plan, Risks/Fallbacks.\n\
+            "The full plan structure is: Goal, Constraints, Deliverables, Acceptance Criteria, Quality Bar, Execution Plan, Verification Plan, Risks/Fallbacks.\n\
 Quality Bar defines what makes the result genuinely good, not just minimally complete.\n\
 Execution Plan must define the first concrete slice, the order of work, the files or areas likely to change, and the checkpoint where the user should review progress.\n\
-Do not try to write the full plan in one large tool call. Fill the plan incrementally in stages.\n\
-Stage 1 fills Goal, Constraints, and Deliverables.\n\
-Stage 2 fills Acceptance Criteria and Quality Bar.\n\
-Stage 3 fills Execution Plan, Verification Plan, and Risks/Fallbacks.\n\
-For generic planning tasks, inspect only the directly relevant files first. Avoid broad repository exploration unless a missing plan section truly requires it.\n\
-Prefer at most one or two Read/Glob steps before writing or editing the plan file.\n\
-When the plan is complete, stop and ask the user to choose yes to execute, no to revise, or provide feedback. Wait for /approve, yes, or equivalent approval before making code changes.\n",
+Do not try to write the full plan in one large tool call.\n",
+        );
+        prompt.push_str(&format!(
+            "Current plan stage: {}. Focus only on these sections now: {}.\n",
+            stage.label(),
+            next
+        ));
+        match stage {
+            PlanStage::Stage1 => {
+                prompt.push_str(
+                    "Stage 1 goal: fill Goal, Constraints, and Deliverables only.\n\
+Inspect only directly relevant files. Prefer at most one or two Read/Glob steps before making one small Write or Edit to the plan file.\n\
+Do not start Acceptance Criteria, Quality Bar, or later sections yet.\n",
+                );
+            }
+            PlanStage::Stage2 => {
+                prompt.push_str(
+                    "Stage 2 goal: fill Acceptance Criteria and Quality Bar only.\n\
+Avoid broad exploration. Use the existing plan and the directly relevant files already inspected. Make one small Write or Edit to the plan file.\n\
+Do not start Execution Plan, Verification Plan, or Risks/Fallbacks yet.\n",
+                );
+            }
+            PlanStage::Stage3 => {
+                prompt.push_str(
+                    "Stage 3 goal: fill Execution Plan, Verification Plan, and Risks/Fallbacks.\n\
+Avoid broad exploration unless one specific missing detail truly requires it. Make one small Write or Edit to the plan file.\n\
+When these sections are complete, stop and wait for approval.\n",
+                );
+            }
+            PlanStage::Ready => {
+                prompt.push_str(
+                    "The plan is ready for approval. Do not explore further. Make only minimal plan-file edits if needed, otherwise wait for yes, no, or feedback.\n",
+                );
+            }
+        }
+        prompt.push_str(
+            "When the plan is complete, stop and ask the user to choose yes to execute, no to revise, or provide feedback. Wait for /approve, yes, or equivalent approval before making code changes.\n",
         );
     } else {
         prompt.push_str(
