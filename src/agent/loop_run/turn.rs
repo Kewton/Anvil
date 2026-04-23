@@ -166,6 +166,51 @@ fn log_plan_stall(
     );
 }
 
+fn extract_plan_constraints(contents: &str) -> Vec<String> {
+    let mut in_constraints = false;
+    let mut lines = Vec::new();
+    for raw_line in contents.lines() {
+        let trimmed = raw_line.trim();
+        if let Some(heading) = trimmed.strip_prefix("## ") {
+            in_constraints = heading.trim() == "Constraints";
+            continue;
+        }
+        if !in_constraints {
+            continue;
+        }
+        if trimmed.is_empty() || trimmed == "-" {
+            continue;
+        }
+        let cleaned = trimmed.trim_start_matches("- ").trim().to_string();
+        if !cleaned.is_empty() {
+            lines.push(cleaned);
+        }
+    }
+    lines
+}
+
+fn normalize_memory_path(raw_path: &str, work_root: &Path) -> String {
+    let path = Path::new(raw_path);
+    if let Ok(resolved) = resolve_user_path(work_root, raw_path)
+        && let Ok(relative) = resolved.strip_prefix(work_root)
+    {
+        return relative.to_string_lossy().replace('\\', "/");
+    }
+    let canonical_root = std::fs::canonicalize(work_root).ok();
+    let canonical_path = std::fs::canonicalize(path)
+        .ok()
+        .or_else(|| resolve_user_path(work_root, raw_path).ok());
+    if let (Some(root), Some(candidate)) = (canonical_root, canonical_path)
+        && let Ok(relative) = candidate.strip_prefix(root)
+    {
+        return relative.to_string_lossy().replace('\\', "/");
+    }
+    if let Ok(relative) = path.strip_prefix(work_root) {
+        return relative.to_string_lossy().replace('\\', "/");
+    }
+    raw_path.replace('\\', "/")
+}
+
 fn build_stats(
     accumulated: Vec<RepoVerification>,
     final_verif: RepoVerification,
@@ -966,7 +1011,7 @@ impl Agent {
     }
 
     fn request_assistant_reply(
-        &self,
+        &mut self,
         stream_output: bool,
         stop_signal: Option<SpinnerStopSignal>,
     ) -> Result<AssistantReply, String> {
@@ -1044,7 +1089,7 @@ impl Agent {
     }
 
     fn build_request_messages(
-        &self,
+        &mut self,
         protocol: prompting::ToolProtocol,
     ) -> Vec<ConversationMessage> {
         let mut messages = Vec::new();
@@ -1073,6 +1118,9 @@ impl Agent {
             plan_stage,
             &next_sections,
         )));
+        if let Some(memory_message) = self.working_memory_message() {
+            messages.push(memory_message);
+        }
         messages.extend(prompting::runtime_context_messages(
             &self.config.cwd,
             &self.work_root,
@@ -1098,11 +1146,42 @@ impl Agent {
         };
         match self.tool_registry.execute(name, arguments, &context) {
             Ok(result) => {
+                if matches!(name, "Write" | "Edit")
+                    && let Some(raw_path) =
+                        arguments.get("path").and_then(serde_json::Value::as_str)
+                {
+                    self.session
+                        .working_memory
+                        .note_touched_file(normalize_memory_path(raw_path, &self.work_root));
+                }
                 self.maybe_update_work_root(name, arguments, &result);
                 result
             }
-            Err(err) => lifecycle::format_tool_error(&err),
+            Err(err) => {
+                self.session
+                    .working_memory
+                    .note_error(format!("{name}: {err}"));
+                lifecycle::format_tool_error(&err)
+            }
         }
+    }
+
+    fn refresh_working_memory(&mut self) {
+        let constraints = self
+            .current_plan_contents()
+            .ok()
+            .flatten()
+            .map(|contents| extract_plan_constraints(&contents))
+            .unwrap_or_default();
+        self.session.working_memory.replace_constraints(constraints);
+    }
+
+    fn working_memory_message(&mut self) -> Option<ConversationMessage> {
+        self.refresh_working_memory();
+        self.session
+            .working_memory
+            .format_for_prompt()
+            .map(ConversationMessage::system)
     }
 
     fn prepare_tool_call(&self, mut tool_call: ToolCall) -> ToolCall {
@@ -1130,6 +1209,9 @@ impl Agent {
     }
 
     fn push_user_message(&mut self, content: String) {
+        self.session
+            .working_memory
+            .set_active_task(Some(content.clone()));
         self.session
             .messages
             .push(ConversationMessage::user(content));

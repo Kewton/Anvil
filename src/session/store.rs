@@ -4,6 +4,96 @@ use std::path::{Path, PathBuf};
 use crate::modes::plan_act::{ExecutionMode, ModeState};
 use crate::ollama::xml_fallback::ToolCall;
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub struct WorkingMemory {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_task: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub constraints: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub touched_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unresolved_errors: Vec<String>,
+}
+
+impl WorkingMemory {
+    const MAX_CONSTRAINTS: usize = 8;
+    const MAX_TOUCHED_FILES: usize = 12;
+    const MAX_UNRESOLVED_ERRORS: usize = 8;
+
+    pub fn set_active_task(&mut self, task: Option<String>) {
+        self.active_task = task.map(|value| truncate_entry(value, 240));
+    }
+
+    pub fn replace_constraints(&mut self, constraints: Vec<String>) {
+        self.constraints = constraints
+            .into_iter()
+            .map(|entry| truncate_entry(entry, 180))
+            .take(Self::MAX_CONSTRAINTS)
+            .collect();
+    }
+
+    pub fn note_touched_file(&mut self, path: String) {
+        let path = truncate_entry(path, 180);
+        self.touched_files.retain(|entry| entry != &path);
+        self.touched_files.push(path);
+        while self.touched_files.len() > Self::MAX_TOUCHED_FILES {
+            self.touched_files.remove(0);
+        }
+    }
+
+    pub fn note_error(&mut self, error: String) {
+        let error = truncate_entry(error, 220);
+        self.unresolved_errors.retain(|entry| entry != &error);
+        self.unresolved_errors.push(error);
+        while self.unresolved_errors.len() > Self::MAX_UNRESOLVED_ERRORS {
+            self.unresolved_errors.remove(0);
+        }
+    }
+
+    pub fn format_for_prompt(&self) -> Option<String> {
+        if self.active_task.is_none()
+            && self.constraints.is_empty()
+            && self.touched_files.is_empty()
+            && self.unresolved_errors.is_empty()
+        {
+            return None;
+        }
+
+        let mut lines = vec!["[Working Memory]".to_string()];
+        if let Some(task) = &self.active_task {
+            lines.push(format!("Active task: {task}"));
+        }
+        if !self.constraints.is_empty() {
+            lines.push("Constraints:".to_string());
+            for item in &self.constraints {
+                lines.push(format!("- {item}"));
+            }
+        }
+        if !self.touched_files.is_empty() {
+            lines.push("Touched files:".to_string());
+            for item in &self.touched_files {
+                lines.push(format!("- {item}"));
+            }
+        }
+        if !self.unresolved_errors.is_empty() {
+            lines.push("Unresolved errors:".to_string());
+            for item in &self.unresolved_errors {
+                lines.push(format!("- {item}"));
+            }
+        }
+        Some(lines.join("\n"))
+    }
+}
+
+fn truncate_entry(value: String, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value;
+    }
+    let truncated = value.chars().take(max_chars).collect::<String>();
+    format!("{truncated}...")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ConversationMessage {
     pub role: String,
@@ -61,6 +151,8 @@ pub struct SessionSnapshot {
     pub active_root: Option<PathBuf>,
     #[serde(default)]
     pub native_tools_disabled: bool,
+    #[serde(default)]
+    pub working_memory: WorkingMemory,
     #[serde(default)]
     pub id: String,
     #[serde(default)]

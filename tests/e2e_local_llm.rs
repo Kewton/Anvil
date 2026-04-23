@@ -195,6 +195,39 @@ fn live_ollama_edit_fallback_handles_drifted_old_string() {
     }));
 }
 
+#[test]
+#[ignore = "requires live Ollama"]
+fn live_ollama_persists_working_memory_after_write() {
+    let temp = tempdir().unwrap();
+    let host =
+        env::var("ANVIL_E2E_OLLAMA_HOST").unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
+    let model = env::var("ANVIL_E2E_MODEL").unwrap_or_else(|_| "qwen3:8b".to_string());
+
+    let Some(client) = available_client_or_skip(&host, &model).unwrap() else {
+        return;
+    };
+    let mut agent = new_agent(temp.path(), &host, &model, client, 8);
+    let prompt = "Use the available file tools to create a file named e2e-memory.txt in the current project root. The file content must be exactly MEMORY_OK on a single line.";
+    run_with_retry(
+        &mut agent,
+        prompt,
+        "Create ./e2e-memory.txt now using a file tool. Write exactly MEMORY_OK.",
+    )
+    .unwrap();
+
+    let session_json = find_latest_session_json(&temp.path().join(".anvil-state"));
+    let session: Value =
+        serde_json::from_str(&std::fs::read_to_string(session_json).unwrap()).unwrap();
+    assert_eq!(
+        session["working_memory"]["active_task"].as_str(),
+        Some(prompt)
+    );
+    let touched = session["working_memory"]["touched_files"]
+        .as_array()
+        .unwrap();
+    assert!(touched.iter().any(|value| value == "e2e-memory.txt"));
+}
+
 fn available_client_or_skip(host: &str, model: &str) -> Result<Option<OllamaClient>, String> {
     let client = OllamaClient::new(host.to_string())?;
     let available = client.list_models()?;
