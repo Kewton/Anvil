@@ -4,6 +4,7 @@ use super::summary::{ExitReason, LoopResult, LoopStats};
 use super::*;
 use crate::agent::orchestration::{RepoVerification, capture_repo_snapshot, verify_repo_progress};
 use crate::logging::log_llm_event;
+use crate::ollama::xml_fallback::normalize_tool_call_arguments;
 use std::collections::HashSet;
 use std::path::Path;
 use std::time::Instant;
@@ -818,6 +819,7 @@ impl Agent {
     }
 
     fn prepare_tool_call(&self, mut tool_call: ToolCall) -> ToolCall {
+        tool_call.arguments = normalize_tool_call_arguments(&tool_call.name, tool_call.arguments);
         if matches!(tool_call.name.as_str(), "Read" | "Write" | "Edit")
             && let Some(arguments) = tool_call.arguments.as_object_mut()
             && let Some(raw_path) = arguments.get("path").and_then(serde_json::Value::as_str)

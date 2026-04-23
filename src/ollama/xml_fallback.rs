@@ -44,7 +44,7 @@ pub fn extract_tool_calls(text: &str, allowed_tools: &[String]) -> (Vec<ToolCall
             extracted.push(ToolCall {
                 id: format!("xml-{}", extracted.len() + 1),
                 name,
-                arguments,
+                arguments: normalize_tool_call_arguments(&captures[1], arguments),
             });
         }
     }
@@ -67,7 +67,7 @@ pub fn extract_tool_calls(text: &str, allowed_tools: &[String]) -> (Vec<ToolCall
                     extracted.push(ToolCall {
                         id: format!("xml-{}", extracted.len() + 1),
                         name,
-                        arguments,
+                        arguments: normalize_tool_call_arguments(name_raw.trim(), arguments),
                     });
                 }
             }
@@ -84,7 +84,7 @@ pub fn extract_tool_calls(text: &str, allowed_tools: &[String]) -> (Vec<ToolCall
             extracted.push(ToolCall {
                 id: format!("xml-{}", extracted.len() + 1),
                 name,
-                arguments,
+                arguments: normalize_tool_call_arguments(&captures[1], arguments),
             });
         }
     }
@@ -128,6 +128,7 @@ fn parse_tool_call_object(raw: &str, allowed_tools: &[String]) -> Option<(String
                 .and_then(|inner| inner.get("name").or_else(|| inner.get("tool")))
                 .and_then(Value::as_str)
         })?;
+    let normalized_name = normalize_name(name, allowed_tools);
     let arguments = object
         .get("arguments")
         .and_then(normalize_arguments_value)
@@ -145,7 +146,10 @@ fn parse_tool_call_object(raw: &str, allowed_tools: &[String]) -> Option<(String
                 Value::Object(remaining)
             }
         });
-    Some((normalize_name(name, allowed_tools), arguments))
+    Some((
+        normalized_name.clone(),
+        normalize_tool_call_arguments(&normalized_name, arguments),
+    ))
 }
 
 fn strip_name_from_arguments(value: Value) -> Value {
@@ -165,6 +169,72 @@ fn normalize_arguments_value(value: &Value) -> Option<Value> {
     }
 }
 
+fn take_first_alias(map: &mut serde_json::Map<String, Value>, aliases: &[&str]) -> Option<Value> {
+    aliases.iter().find_map(|alias| map.remove(*alias))
+}
+
+fn maybe_insert_alias(map: &mut serde_json::Map<String, Value>, canonical: &str, aliases: &[&str]) {
+    if map.contains_key(canonical) {
+        return;
+    }
+    if let Some(value) = take_first_alias(map, aliases) {
+        map.insert(canonical.to_string(), value);
+    }
+}
+
+pub fn normalize_tool_call_arguments(name: &str, value: Value) -> Value {
+    match value {
+        Value::Object(mut map) => {
+            let normalized_name = name.to_ascii_lowercase();
+            for nested in map.values_mut() {
+                let original = std::mem::take(nested);
+                *nested = normalize_tool_call_arguments(name, original);
+            }
+
+            match normalized_name.as_str() {
+                "read" | "write" | "edit" => {
+                    maybe_insert_alias(&mut map, "path", &["file", "filepath", "filename"]);
+                }
+                _ => {}
+            }
+
+            match normalized_name.as_str() {
+                "write" => {
+                    maybe_insert_alias(&mut map, "content", &["body", "text"]);
+                }
+                "edit" => {
+                    maybe_insert_alias(
+                        &mut map,
+                        "old_string",
+                        &["old", "old_text", "oldText", "find"],
+                    );
+                    maybe_insert_alias(
+                        &mut map,
+                        "new_string",
+                        &["new", "new_text", "newText", "replacement", "replace_with"],
+                    );
+                }
+                "bash" => {
+                    maybe_insert_alias(&mut map, "command", &["cmd"]);
+                }
+                "grep" | "glob" => {
+                    maybe_insert_alias(&mut map, "pattern", &["query", "glob"]);
+                }
+                _ => {}
+            }
+
+            Value::Object(map)
+        }
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|item| normalize_tool_call_arguments(name, item))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
 fn unwrap_argument_wrappers(value: Value) -> Value {
     match value {
         Value::Object(mut map) => {
@@ -175,9 +245,14 @@ fn unwrap_argument_wrappers(value: Value) -> Value {
                 let unwrapped_nested = unwrap_argument_wrappers(nested);
                 if let Value::Object(nested_map) = &unwrapped_nested
                     && (nested_map.contains_key("path")
+                        || nested_map.contains_key("file")
+                        || nested_map.contains_key("filepath")
+                        || nested_map.contains_key("filename")
                         || nested_map.contains_key("command")
                         || nested_map.contains_key("pattern")
                         || nested_map.contains_key("content")
+                        || nested_map.contains_key("body")
+                        || nested_map.contains_key("text")
                         || nested_map.contains_key("old_string"))
                 {
                     return unwrapped_nested;
@@ -288,12 +363,45 @@ fn normalize_name(name: &str, allowed_tools: &[String]) -> String {
 mod tests {
     use serde_json::json;
 
-    use super::extract_tool_calls;
+    use super::{extract_tool_calls, normalize_tool_call_arguments};
 
     #[test]
     fn unwraps_nested_arguments_wrapper() {
         let allowed = vec!["Write".to_string()];
         let input = r#"<anvil_tool_call>{"arguments":{"name":"Write","arguments":{"path":"plans/plan.md","content":"hello"}}}</anvil_tool_call>"#;
+        let (tool_calls, remaining) = extract_tool_calls(input, &allowed);
+        assert!(remaining.is_empty(), "remaining={remaining:?}");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].name, "Write");
+        assert_eq!(
+            tool_calls[0].arguments,
+            json!({"path":"plans/plan.md","content":"hello"})
+        );
+    }
+
+    #[test]
+    fn normalizes_write_aliases() {
+        let args =
+            normalize_tool_call_arguments("Write", json!({"file":"plans/plan.md","body":"hello"}));
+        assert_eq!(args, json!({"path":"plans/plan.md","content":"hello"}));
+    }
+
+    #[test]
+    fn normalizes_edit_aliases() {
+        let args = normalize_tool_call_arguments(
+            "Edit",
+            json!({"file":"README.md","find":"old","replacement":"new"}),
+        );
+        assert_eq!(
+            args,
+            json!({"path":"README.md","old_string":"old","new_string":"new"})
+        );
+    }
+
+    #[test]
+    fn unwraps_nested_arguments_with_file_alias() {
+        let allowed = vec!["Write".to_string()];
+        let input = r#"<anvil_tool_call>{"arguments":{"name":"Write","arguments":{"file":"plans/plan.md","body":"hello"}}}</anvil_tool_call>"#;
         let (tool_calls, remaining) = extract_tool_calls(input, &allowed);
         assert!(remaining.is_empty(), "remaining={remaining:?}");
         assert_eq!(tool_calls.len(), 1);
