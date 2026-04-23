@@ -1,4 +1,5 @@
 use std::io::Read;
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,7 +33,7 @@ pub fn run(
     cancel_flag: Option<&Arc<AtomicBool>>,
     offline: bool,
 ) -> Result<String, String> {
-    let command = normalize_noninteractive_scaffold_command(command);
+    let command = normalize_background_command(&normalize_noninteractive_scaffold_command(command));
     for snippet in BLOCKED_SNIPPETS {
         if command.contains(snippet) {
             return Err(format!("blocked dangerous command fragment: {snippet}"));
@@ -170,6 +171,53 @@ fn likely_long_running_command(command: &str) -> bool {
     ]
     .iter()
     .any(|needle| normalized.contains(needle))
+}
+
+fn normalize_background_command(command: &str) -> String {
+    if !requests_background_execution(command) {
+        return command.to_string();
+    }
+
+    let body = strip_trailing_background_operator(command);
+    let log_path = background_log_path();
+    let quoted_log = shell_single_quote(log_path.to_string_lossy().as_ref());
+    let quoted_body = shell_single_quote(&body);
+    format!(
+        "nohup sh -lc {} >{} 2>&1 </dev/null & printf 'background_pid=%s\\nbackground_log=%s\\n' \"$!\" {}",
+        quoted_body,
+        quoted_log,
+        quoted_log
+    )
+}
+
+fn requests_background_execution(command: &str) -> bool {
+    command.trim_end().ends_with('&')
+}
+
+fn strip_trailing_background_operator(command: &str) -> String {
+    command
+        .trim_end()
+        .strip_suffix('&')
+        .unwrap_or(command.trim_end())
+        .trim_end()
+        .to_string()
+}
+
+fn background_log_path() -> PathBuf {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!(
+        "anvil-bash-bg-{}-{}.log",
+        std::process::id(),
+        unique
+    ))
+}
+
+fn shell_single_quote(value: &str) -> String {
+    let escaped = value.replace('\'', "'\"'\"'");
+    format!("'{escaped}'")
 }
 
 fn is_noninteractive_scaffold_command(command: &str) -> bool {
@@ -348,8 +396,13 @@ fn terminate_child(child: &mut Child) {
 mod tests {
     use super::{
         BashCommandClass, classify_command, command_uses_network,
-        likely_long_running_command, normalize_noninteractive_scaffold_command,
+        likely_long_running_command, normalize_background_command,
+        normalize_noninteractive_scaffold_command, requests_background_execution, run,
+        strip_trailing_background_operator,
     };
+    use std::time::{Duration, Instant};
+
+    use tempfile::tempdir;
 
     #[test]
     fn detects_long_running_dev_commands() {
@@ -390,5 +443,47 @@ mod tests {
         let original = "npx create-next-app@latest . --typescript --yes --use-pnpm";
         let rewritten = normalize_noninteractive_scaffold_command(original);
         assert_eq!(rewritten, original);
+    }
+
+    #[test]
+    fn detects_background_execution_requests() {
+        assert!(requests_background_execution("npx next dev -p 3011 &"));
+        assert!(requests_background_execution("pkill -f \"next dev\"; npx next dev -p 3011 &   "));
+        assert!(!requests_background_execution("npm run build"));
+    }
+
+    #[test]
+    fn rewrites_background_commands_to_detach_output() {
+        let rewritten = normalize_background_command("npx next dev -p 3011 &");
+        assert!(rewritten.contains("background_pid="));
+        assert!(rewritten.contains("background_log="));
+        assert!(rewritten.contains("nohup sh -lc"));
+        assert!(rewritten.contains("2>&1"));
+        assert!(rewritten.contains("'npx next dev -p 3011'"));
+    }
+
+    #[test]
+    fn leaves_foreground_commands_unchanged() {
+        let original = "npm run build";
+        assert_eq!(normalize_background_command(original), original);
+    }
+
+    #[test]
+    fn strips_only_trailing_background_operator() {
+        assert_eq!(
+            strip_trailing_background_operator("pkill -f \"next dev\"; npx next dev -p 3011 &   "),
+            "pkill -f \"next dev\"; npx next dev -p 3011"
+        );
+    }
+
+    #[test]
+    fn detached_background_command_returns_quickly() {
+        let temp = tempdir().unwrap();
+        let started = Instant::now();
+        let output = run("sleep 30 &", temp.path(), None, false).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(output.contains("exit_code=0"));
+        assert!(output.contains("background_pid="));
+        assert!(output.contains("background_log="));
     }
 }
