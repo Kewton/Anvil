@@ -193,4 +193,15 @@ mod tests {
         let err = parse_generate_response(body, &["Bash".to_string()]).unwrap_err();
         assert!(err.contains("malformed tool call"), "got: {err}");
     }
+
+    #[test]
+    fn parse_generate_response_salvages_unterminated_tool_call_with_closed_json() {
+        let body = r#"{
+          "response":"<anvil_tool_call>{\"name\":\"Write\",\"arguments\":{\"path\":\"plans/plan.md\",\"content\":\"hello\"}}",
+          "done_reason":"stop"
+        }"#;
+        let reply = parse_generate_response(body, &["Write".to_string()]).unwrap();
+        assert_eq!(reply.tool_calls.len(), 1);
+        assert_eq!(reply.tool_calls[0].name, "Write");
+    }
 }

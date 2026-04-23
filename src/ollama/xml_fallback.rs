@@ -32,6 +32,17 @@ pub fn extract_tool_calls(text: &str, allowed_tools: &[String]) -> (Vec<ToolCall
             }
             remaining.replace_range(body.start..body.end, "");
         }
+
+        if let Some(body) = extract_unterminated_trailing_block(&remaining, open_tag, close_tag) {
+            if let Some((name, arguments)) = parse_tool_call_object(&body.inner, allowed_tools) {
+                extracted.push(ToolCall {
+                    id: format!("xml-{}", extracted.len() + 1),
+                    name,
+                    arguments,
+                });
+                remaining.replace_range(body.start..body.end, "");
+            }
+        }
     }
 
     let tagged_regex =
@@ -109,6 +120,25 @@ fn extract_between(text: &str, open: &str, close: &str) -> Option<ExtractedBlock
         inner: text[after_open..inner_end].trim().to_string(),
         start,
         end,
+    })
+}
+
+fn extract_unterminated_trailing_block(text: &str, open: &str, close: &str) -> Option<ExtractedBlock> {
+    let start = text.find(open)?;
+    let after_open = start + open.len();
+    if text[after_open..].contains(close) {
+        return None;
+    }
+
+    let inner = text[after_open..].trim();
+    if !json_looks_closed(inner) {
+        return None;
+    }
+
+    Some(ExtractedBlock {
+        inner: inner.to_string(),
+        start,
+        end: text.len(),
     })
 }
 
@@ -325,6 +355,39 @@ fn balance_braces(raw: &str) -> String {
     fixed
 }
 
+fn json_looks_closed(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let mut curly: i32 = 0;
+    let mut square: i32 = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for ch in trimmed.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_string => escaped = true,
+            '"' => in_string = !in_string,
+            '{' if !in_string => curly += 1,
+            '}' if !in_string => curly -= 1,
+            '[' if !in_string => square += 1,
+            ']' if !in_string => square -= 1,
+            _ => {}
+        }
+        if curly < 0 || square < 0 {
+            return false;
+        }
+    }
+
+    !in_string && curly == 0 && square == 0
+}
+
 fn strip_markdown_fence(raw: &str) -> String {
     let trimmed = raw.trim();
     if !trimmed.starts_with("```") {
@@ -363,7 +426,7 @@ fn normalize_name(name: &str, allowed_tools: &[String]) -> String {
 mod tests {
     use serde_json::json;
 
-    use super::{extract_tool_calls, normalize_tool_call_arguments};
+    use super::{extract_tool_calls, json_looks_closed, normalize_tool_call_arguments};
 
     #[test]
     fn unwraps_nested_arguments_wrapper() {
@@ -410,5 +473,37 @@ mod tests {
             tool_calls[0].arguments,
             json!({"path":"plans/plan.md","content":"hello"})
         );
+    }
+
+    #[test]
+    fn salvages_unterminated_trailing_tool_call_when_json_is_closed() {
+        let allowed = vec!["Write".to_string()];
+        let input =
+            r#"<anvil_tool_call>{"name":"Write","arguments":{"path":"plans/plan.md","content":"hello"}}"#;
+        let (tool_calls, remaining) = extract_tool_calls(input, &allowed);
+        assert!(remaining.is_empty(), "remaining={remaining:?}");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].name, "Write");
+        assert_eq!(
+            tool_calls[0].arguments,
+            json!({"path":"plans/plan.md","content":"hello"})
+        );
+    }
+
+    #[test]
+    fn does_not_salvage_unterminated_trailing_tool_call_when_json_is_open() {
+        let allowed = vec!["Write".to_string()];
+        let input =
+            r#"<anvil_tool_call>{"name":"Write","arguments":{"path":"plans/plan.md","content":"hello"}"#;
+        let (tool_calls, remaining) = extract_tool_calls(input, &allowed);
+        assert!(tool_calls.is_empty());
+        assert_eq!(remaining, input);
+    }
+
+    #[test]
+    fn detects_closed_json_shape() {
+        assert!(json_looks_closed(r#"{"a":[1,2],"b":"x"}"#));
+        assert!(!json_looks_closed(r#"{"a":[1,2],"b":"x""#));
+        assert!(!json_looks_closed(r#"{"a":"unterminated}"#));
     }
 }
