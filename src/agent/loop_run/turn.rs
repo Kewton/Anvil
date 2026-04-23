@@ -1246,7 +1246,7 @@ impl Agent {
         // Start spinner once at function entry; retries share the same
         // animation (no flicker between attempts). Dropped automatically on
         // function exit (Ok / Err / early-return), clearing the line.
-        let sp = Spinner::start(format!("thinking... ({})", self.models.main));
+        let sp = Spinner::start(format!("thinking... ({})", self.current_assistant_model()));
         let mut downgraded_native_tools = false;
         let mut retries_remaining = self.config.chat_retries;
         let mut tool_call_format_retries_remaining = 2usize;
@@ -1287,6 +1287,9 @@ impl Agent {
                         continue;
                     }
                     if lifecycle::is_transport_error(&err) && extra_transport_retries > 0 {
+                        if self.maybe_fallback_plan_model_after_timeout(&err) {
+                            continue;
+                        }
                         transport_retry_count += 1;
                         extra_transport_retries -= 1;
                         thread::sleep(Duration::from_secs((transport_retry_count as u64) * 4));
@@ -1313,8 +1316,9 @@ impl Agent {
             prompting::ToolProtocol::from_native_tools_enabled(self.native_tools_enabled);
         let native_tools_enabled = protocol.native_tools_enabled();
         let messages = self.build_request_messages(protocol);
+        let assistant_model = self.current_assistant_model();
         let use_streaming_transport = should_use_streaming_transport(
-            &self.models.main,
+            assistant_model.as_str(),
             native_tools_enabled,
             stream_output,
             io::stdin().is_terminal(),
@@ -1340,7 +1344,7 @@ impl Agent {
                 Some(crate::tui::markdown::MarkdownRenderer::new(color, utf8))
             };
             let reply = self.client.chat_streaming_with_mode(
-                &self.models.main,
+                assistant_model.as_str(),
                 &messages,
                 self.tool_registry.specs(),
                 native_tools_enabled,
@@ -1394,17 +1398,22 @@ impl Agent {
             }
             Ok(reply)
         } else {
-            self.request_assistant_reply_non_streaming(&messages, native_tools_enabled)
+            self.request_assistant_reply_non_streaming(
+                assistant_model.as_str(),
+                &messages,
+                native_tools_enabled,
+            )
         }
     }
 
     fn request_assistant_reply_non_streaming(
         &self,
+        model: &str,
         messages: &[ConversationMessage],
         native_tools_enabled: bool,
     ) -> Result<AssistantReply, String> {
         let client = self.client.clone();
-        let model = self.models.main.clone();
+        let model = model.to_string();
         let tool_specs = self.tool_registry.specs().to_vec();
         let owned_messages = messages.to_vec();
         let timeout = Duration::from_secs(non_streaming_assistant_reply_timeout_secs(
@@ -1430,6 +1439,35 @@ impl Agent {
                 Err("assistant reply worker disconnected".to_string())
             }
         }
+    }
+
+    fn current_assistant_model(&self) -> String {
+        assistant_model_for_mode(
+            self.session.mode_state.mode,
+            &self.models.main,
+            self.plan_model_override.as_deref(),
+        )
+    }
+
+    fn maybe_fallback_plan_model_after_timeout(&mut self, err: &str) -> bool {
+        let Some(sidecar) = self.models.sidecar.as_ref().filter(|model| !model.trim().is_empty())
+        else {
+            return false;
+        };
+        if !should_fallback_plan_model_after_timeout(
+            self.session.mode_state.mode,
+            self.plan_model_override.as_deref(),
+            err,
+            sidecar,
+        ) {
+            return false;
+        }
+
+        self.plan_model_override = Some(sidecar.clone());
+        self.push_system_note(format!(
+            "Main planning model timed out. Retry the plan step with sidecar model {sidecar}."
+        ));
+        true
     }
 
     fn build_request_messages(
@@ -1626,9 +1664,11 @@ pub(crate) fn unicode_supported() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        PlanExplorationKey, non_streaming_assistant_reply_timeout_secs,
-        normalize_exploration_path, normalize_plan_exploration_key, should_use_streaming_transport,
+        PlanExplorationKey, assistant_model_for_mode, non_streaming_assistant_reply_timeout_secs,
+        normalize_exploration_path, normalize_plan_exploration_key,
+        should_fallback_plan_model_after_timeout, should_use_streaming_transport,
     };
+    use crate::modes::plan_act::ExecutionMode;
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -1701,6 +1741,40 @@ mod tests {
         assert_eq!(
             non_streaming_assistant_reply_timeout_secs("qwen3.6:27b-coding-nvfp4", true, 120),
             120
+        );
+    }
+
+    #[test]
+    fn plan_timeout_can_fallback_to_sidecar_model() {
+        assert!(should_fallback_plan_model_after_timeout(
+            ExecutionMode::Plan,
+            None,
+            "assistant reply timed out after 90s",
+            "qwen3.5:9b",
+        ));
+        assert!(!should_fallback_plan_model_after_timeout(
+            ExecutionMode::Act,
+            None,
+            "assistant reply timed out after 90s",
+            "qwen3.5:9b",
+        ));
+        assert!(!should_fallback_plan_model_after_timeout(
+            ExecutionMode::Plan,
+            Some("qwen3.5:9b"),
+            "assistant reply timed out after 90s",
+            "qwen3.5:9b",
+        ));
+    }
+
+    #[test]
+    fn plan_mode_override_selects_sidecar_model_only_for_plan() {
+        assert_eq!(
+            assistant_model_for_mode(ExecutionMode::Plan, "qwen3.5:122b", Some("qwen3.5:9b")),
+            "qwen3.5:9b"
+        );
+        assert_eq!(
+            assistant_model_for_mode(ExecutionMode::Act, "qwen3.5:122b", Some("qwen3.5:9b")),
+            "qwen3.5:122b"
         );
     }
 }
@@ -1850,6 +1924,35 @@ fn non_streaming_assistant_reply_timeout_secs(
         return QWEN35_NON_NATIVE_HARD_TIMEOUT_SECS;
     }
     default_timeout_secs
+}
+
+fn assistant_model_for_mode(
+    mode: ExecutionMode,
+    main_model: &str,
+    plan_model_override: Option<&str>,
+) -> String {
+    if mode == ExecutionMode::Plan && let Some(model) = plan_model_override {
+        return model.to_string();
+    }
+    main_model.to_string()
+}
+
+fn should_fallback_plan_model_after_timeout(
+    mode: ExecutionMode,
+    plan_model_override: Option<&str>,
+    err: &str,
+    sidecar_model: &str,
+) -> bool {
+    if mode != ExecutionMode::Plan {
+        return false;
+    }
+    if plan_model_override.is_some() {
+        return false;
+    }
+    if sidecar_model.trim().is_empty() {
+        return false;
+    }
+    err.to_ascii_lowercase().contains("timed out")
 }
 
 fn plan_sections_with_content(contents: &str) -> Vec<&'static str> {

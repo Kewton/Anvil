@@ -53,6 +53,7 @@ pub struct Agent {
     session: SessionSnapshot,
     work_root: PathBuf,
     native_tools_enabled: bool,
+    plan_model_override: Option<String>,
     tool_registry: ToolRegistry,
     repo_context_cache: Option<RepoContextCache>,
     /// Fixed footer handle. Phase A: always disabled (no-op); the handle
@@ -92,6 +93,7 @@ impl Agent {
             session,
             work_root,
             native_tools_enabled,
+            plan_model_override: None,
             tool_registry: ToolRegistry::default(),
             repo_context_cache: None,
             footer,
