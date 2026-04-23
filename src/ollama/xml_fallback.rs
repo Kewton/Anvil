@@ -123,7 +123,11 @@ fn extract_between(text: &str, open: &str, close: &str) -> Option<ExtractedBlock
     })
 }
 
-fn extract_unterminated_trailing_block(text: &str, open: &str, close: &str) -> Option<ExtractedBlock> {
+fn extract_unterminated_trailing_block(
+    text: &str,
+    open: &str,
+    close: &str,
+) -> Option<ExtractedBlock> {
     let start = text.find(open)?;
     let after_open = start + open.len();
     if text[after_open..].contains(close) {
@@ -212,8 +216,25 @@ fn maybe_insert_alias(map: &mut serde_json::Map<String, Value>, canonical: &str,
     }
 }
 
+fn contains_tool_argument_keys(map: &serde_json::Map<String, Value>) -> bool {
+    map.contains_key("path")
+        || map.contains_key("file")
+        || map.contains_key("file_path")
+        || map.contains_key("filepath")
+        || map.contains_key("filename")
+        || map.contains_key("command")
+        || map.contains_key("pattern")
+        || map.contains_key("content")
+        || map.contains_key("contents")
+        || map.contains_key("body")
+        || map.contains_key("text")
+        || map.contains_key("old_string")
+        || map.contains_key("new_string")
+        || map.contains_key("replacement")
+}
+
 pub fn normalize_tool_call_arguments(name: &str, value: Value) -> Value {
-    match value {
+    match unwrap_argument_wrappers(value) {
         Value::Object(mut map) => {
             let normalized_name = name.to_ascii_lowercase();
             for nested in map.values_mut() {
@@ -223,14 +244,18 @@ pub fn normalize_tool_call_arguments(name: &str, value: Value) -> Value {
 
             match normalized_name.as_str() {
                 "read" | "write" | "edit" => {
-                    maybe_insert_alias(&mut map, "path", &["file", "filepath", "filename"]);
+                    maybe_insert_alias(
+                        &mut map,
+                        "path",
+                        &["file", "file_path", "filepath", "filename"],
+                    );
                 }
                 _ => {}
             }
 
             match normalized_name.as_str() {
                 "write" => {
-                    maybe_insert_alias(&mut map, "content", &["body", "text"]);
+                    maybe_insert_alias(&mut map, "content", &["body", "text", "contents"]);
                 }
                 "edit" => {
                     maybe_insert_alias(
@@ -271,19 +296,17 @@ fn unwrap_argument_wrappers(value: Value) -> Value {
             map.remove("name");
             map.remove("tool");
 
-            if let Some(nested) = map.remove("arguments").or_else(|| map.remove("args")) {
+            if let Some(nested) = map
+                .remove("arguments")
+                .or_else(|| map.remove("args"))
+                .or_else(|| map.remove("payload"))
+                .or_else(|| map.remove("params"))
+                .or_else(|| map.remove("input"))
+                .or_else(|| map.remove("data"))
+            {
                 let unwrapped_nested = unwrap_argument_wrappers(nested);
                 if let Value::Object(nested_map) = &unwrapped_nested
-                    && (nested_map.contains_key("path")
-                        || nested_map.contains_key("file")
-                        || nested_map.contains_key("filepath")
-                        || nested_map.contains_key("filename")
-                        || nested_map.contains_key("command")
-                        || nested_map.contains_key("pattern")
-                        || nested_map.contains_key("content")
-                        || nested_map.contains_key("body")
-                        || nested_map.contains_key("text")
-                        || nested_map.contains_key("old_string"))
+                    && contains_tool_argument_keys(nested_map)
                 {
                     return unwrapped_nested;
                 }
@@ -450,6 +473,15 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_write_file_path_and_contents_aliases() {
+        let args = normalize_tool_call_arguments(
+            "Write",
+            json!({"file_path":"plans/plan.md","contents":"hello"}),
+        );
+        assert_eq!(args, json!({"path":"plans/plan.md","content":"hello"}));
+    }
+
+    #[test]
     fn normalizes_edit_aliases() {
         let args = normalize_tool_call_arguments(
             "Edit",
@@ -476,10 +508,23 @@ mod tests {
     }
 
     #[test]
+    fn unwraps_payload_wrapper_with_file_path_alias() {
+        let allowed = vec!["Write".to_string()];
+        let input = r#"<anvil_tool_call>{"name":"Write","payload":{"params":{"file_path":"plans/plan.md","contents":"hello"}}}</anvil_tool_call>"#;
+        let (tool_calls, remaining) = extract_tool_calls(input, &allowed);
+        assert!(remaining.is_empty(), "remaining={remaining:?}");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].name, "Write");
+        assert_eq!(
+            tool_calls[0].arguments,
+            json!({"path":"plans/plan.md","content":"hello"})
+        );
+    }
+
+    #[test]
     fn salvages_unterminated_trailing_tool_call_when_json_is_closed() {
         let allowed = vec!["Write".to_string()];
-        let input =
-            r#"<anvil_tool_call>{"name":"Write","arguments":{"path":"plans/plan.md","content":"hello"}}"#;
+        let input = r#"<anvil_tool_call>{"name":"Write","arguments":{"path":"plans/plan.md","content":"hello"}}"#;
         let (tool_calls, remaining) = extract_tool_calls(input, &allowed);
         assert!(remaining.is_empty(), "remaining={remaining:?}");
         assert_eq!(tool_calls.len(), 1);
@@ -493,8 +538,7 @@ mod tests {
     #[test]
     fn does_not_salvage_unterminated_trailing_tool_call_when_json_is_open() {
         let allowed = vec!["Write".to_string()];
-        let input =
-            r#"<anvil_tool_call>{"name":"Write","arguments":{"path":"plans/plan.md","content":"hello"}"#;
+        let input = r#"<anvil_tool_call>{"name":"Write","arguments":{"path":"plans/plan.md","content":"hello"}"#;
         let (tool_calls, remaining) = extract_tool_calls(input, &allowed);
         assert!(tool_calls.is_empty());
         assert_eq!(remaining, input);
