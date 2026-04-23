@@ -1121,6 +1121,9 @@ impl Agent {
         if let Some(memory_message) = self.working_memory_message() {
             messages.push(memory_message);
         }
+        if let Some(repo_context_message) = self.repo_context_message() {
+            messages.push(repo_context_message);
+        }
         messages.extend(prompting::runtime_context_messages(
             &self.config.cwd,
             &self.work_root,
@@ -1182,6 +1185,24 @@ impl Agent {
             .working_memory
             .format_for_prompt()
             .map(ConversationMessage::system)
+    }
+
+    fn repo_context_message(&mut self) -> Option<ConversationMessage> {
+        self.refresh_working_memory();
+        let task = self.session.working_memory.active_task.clone()?;
+        if let Some(cache) = &self.repo_context_cache
+            && cache.task == task
+            && cache.work_root == self.work_root
+        {
+            return cache.message.clone();
+        }
+        let message = prompting::repo_context_message(&self.work_root, Some(&task));
+        self.repo_context_cache = Some(super::RepoContextCache {
+            task,
+            work_root: self.work_root.clone(),
+            message: message.clone(),
+        });
+        message
     }
 
     fn prepare_tool_call(&self, mut tool_call: ToolCall) -> ToolCall {

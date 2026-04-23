@@ -228,6 +228,61 @@ fn live_ollama_persists_working_memory_after_write() {
     assert!(touched.iter().any(|value| value == "e2e-memory.txt"));
 }
 
+#[test]
+#[ignore = "requires live Ollama"]
+fn live_ollama_repo_context_guides_targeted_edit() {
+    let temp = tempdir().unwrap();
+    let host =
+        env::var("ANVIL_E2E_OLLAMA_HOST").unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
+    let model = env::var("ANVIL_E2E_MODEL").unwrap_or_else(|_| "qwen3:8b".to_string());
+
+    let Some(client) = available_client_or_skip(&host, &model).unwrap() else {
+        return;
+    };
+
+    std::fs::create_dir_all(temp.path().join("src/billing")).unwrap();
+    std::fs::create_dir_all(temp.path().join("src/ui")).unwrap();
+    std::fs::create_dir_all(temp.path().join("docs")).unwrap();
+    std::fs::write(
+        temp.path().join("src/billing/retry_policy.ts"),
+        "export const paymentRetryDelayMs = 3000;\nexport const paymentRetryLimit = 4;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        temp.path().join("src/ui/retry_banner.ts"),
+        "export const retryBannerDelayMs = 1200;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        temp.path().join("docs/payment-retries.md"),
+        "Payment retries are handled by the billing retry policy.\n",
+    )
+    .unwrap();
+
+    let mut agent = new_agent(temp.path(), &host, &model, client, 8);
+    let prompt = "Update the billing retry policy so `paymentRetryDelayMs` becomes 7000. Keep the change minimal and stop after the edit.";
+    let retry_prompt = "Edit src/billing/retry_policy.ts now so `paymentRetryDelayMs` becomes 7000. Keep the rest unchanged.";
+    run_with_retry(&mut agent, prompt, retry_prompt).unwrap();
+
+    let content = std::fs::read_to_string(temp.path().join("src/billing/retry_policy.ts")).unwrap();
+    assert!(content.contains("paymentRetryDelayMs = 7000"));
+
+    let session_json = find_latest_session_json(&temp.path().join(".anvil-state"));
+    let session: Value =
+        serde_json::from_str(&std::fs::read_to_string(session_json).unwrap()).unwrap();
+    let messages = session["messages"].as_array().unwrap();
+    assert!(messages.iter().any(|message| {
+        message["tool_calls"].as_array().is_some_and(|calls| {
+            calls.iter().any(|call| {
+                call["arguments"]["path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with("src/billing/retry_policy.ts"))
+            })
+        })
+    }));
+
+}
+
 fn available_client_or_skip(host: &str, model: &str) -> Result<Option<OllamaClient>, String> {
     let client = OllamaClient::new(host.to_string())?;
     let available = client.list_models()?;

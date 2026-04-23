@@ -55,11 +55,19 @@ pub struct Agent {
     work_root: PathBuf,
     native_tools_enabled: bool,
     tool_registry: ToolRegistry,
+    repo_context_cache: Option<RepoContextCache>,
     /// Fixed footer handle. Phase A: always disabled (no-op); the handle
     /// shape is plumbed now so Phase B-D can attach `publish_*` calls
     /// without re-touching `Agent::new` callers (issue #430).
     #[allow(dead_code)]
     footer: FooterHandle,
+}
+
+#[derive(Clone)]
+struct RepoContextCache {
+    task: String,
+    work_root: PathBuf,
+    message: Option<ConversationMessage>,
 }
 
 impl Agent {
@@ -86,6 +94,7 @@ impl Agent {
             work_root,
             native_tools_enabled,
             tool_registry: ToolRegistry::default(),
+            repo_context_cache: None,
             footer,
         }
     }
