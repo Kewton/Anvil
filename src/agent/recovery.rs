@@ -116,6 +116,26 @@ pub fn tool_call_format_recovery_note(error: &str, attempt: usize) -> String {
     )
 }
 
+pub fn plan_progress_recovery_note(
+    next_sections: &[&str],
+    missing_sections: &[&str],
+    attempt: usize,
+) -> String {
+    let next = if next_sections.is_empty() {
+        "the remaining missing sections".to_string()
+    } else {
+        next_sections.join(", ")
+    };
+    let missing = if missing_sections.is_empty() {
+        "-".to_string()
+    } else {
+        missing_sections.join(", ")
+    };
+    format!(
+        "The plan is still incomplete. Do not keep exploring. On the next turn, make exactly one small Write or Edit to the plan file and fill only these next sections: {next}. Missing sections now: {missing}. Avoid broad Read or Glob unless a specific missing section requires it. plan_progress_attempt={attempt}"
+    )
+}
+
 pub fn install_loop_recovery_note() -> String {
     "Recent turns repeated setup, rescaffolding, or dependency installation commands without finishing the implementation. Stop reinstalling packages or recreating the project. Inspect the project files that matter, then use Write or Edit to make concrete code changes before any further setup.".to_string()
 }

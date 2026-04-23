@@ -5,6 +5,7 @@ pub(super) enum ExitReason {
     EmptyResponses,
     NoToolCalls,
     MissingRepoEdits,
+    PlanIncomplete,
     ToolCallFormatError,
     TransportError,
     Interrupted,
@@ -22,6 +23,7 @@ impl ExitReason {
                 | ExitReason::EmptyResponses
                 | ExitReason::NoToolCalls
                 | ExitReason::MissingRepoEdits
+                | ExitReason::PlanIncomplete
                 | ExitReason::ToolCallFormatError
                 | ExitReason::Interrupted
         )
@@ -34,6 +36,7 @@ impl ExitReason {
             ExitReason::EmptyResponses => "empty_responses",
             ExitReason::NoToolCalls => "no_tool_calls",
             ExitReason::MissingRepoEdits => "missing_repo_edits",
+            ExitReason::PlanIncomplete => "plan_incomplete",
             ExitReason::ToolCallFormatError => "tool_call_format_error",
             ExitReason::TransportError => "transport_error",
             ExitReason::Interrupted => "interrupted",
@@ -50,6 +53,9 @@ impl ExitReason {
             }
             ExitReason::MissingRepoEdits => {
                 "assistant kept stopping before making the requested repository edits"
+            }
+            ExitReason::PlanIncomplete => {
+                "assistant did not finish the plan after repeated planning retries"
             }
             ExitReason::ToolCallFormatError => {
                 "assistant emitted malformed or truncated tool calls repeatedly"
@@ -191,6 +197,7 @@ mod tests {
             ExitReason::EmptyResponses,
             ExitReason::NoToolCalls,
             ExitReason::MissingRepoEdits,
+            ExitReason::PlanIncomplete,
             ExitReason::ToolCallFormatError,
             ExitReason::TransportError,
             ExitReason::Interrupted,
@@ -207,6 +214,7 @@ mod tests {
         assert!(!ExitReason::EmptyResponses.is_success());
         assert!(!ExitReason::NoToolCalls.is_success());
         assert!(!ExitReason::MissingRepoEdits.is_success());
+        assert!(!ExitReason::PlanIncomplete.is_success());
         assert!(!ExitReason::ToolCallFormatError.is_success());
         assert!(!ExitReason::TransportError.is_success());
         assert!(!ExitReason::Interrupted.is_success());
@@ -231,6 +239,7 @@ mod tests {
         assert!(ExitReason::EmptyResponses.keeps_repl_alive());
         assert!(ExitReason::NoToolCalls.keeps_repl_alive());
         assert!(ExitReason::MissingRepoEdits.keeps_repl_alive());
+        assert!(ExitReason::PlanIncomplete.keeps_repl_alive());
         assert!(ExitReason::ToolCallFormatError.keeps_repl_alive());
         assert!(ExitReason::Interrupted.keeps_repl_alive());
         assert!(!ExitReason::TransportError.keeps_repl_alive());

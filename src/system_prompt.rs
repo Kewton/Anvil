@@ -66,14 +66,22 @@ You are in read-only exploration mode. Use Read, Glob, and Grep to inspect the r
             ));
         }
         prompt.push_str(
-            "Build a plan with these sections in order: Goal, Constraints, Deliverables, Acceptance Criteria, Execution Plan, Verification Plan, Risks/Fallbacks.\n\
+            "Build a plan with these sections in order: Goal, Constraints, Deliverables, Acceptance Criteria, Quality Bar, Execution Plan, Verification Plan, Risks/Fallbacks.\n\
+Quality Bar defines what makes the result genuinely good, not just minimally complete.\n\
 Execution Plan must define the first concrete slice, the order of work, the files or areas likely to change, and the checkpoint where the user should review progress.\n\
+Do not try to write the full plan in one large tool call. Fill the plan incrementally in stages.\n\
+Stage 1 fills Goal, Constraints, and Deliverables.\n\
+Stage 2 fills Acceptance Criteria and Quality Bar.\n\
+Stage 3 fills Execution Plan, Verification Plan, and Risks/Fallbacks.\n\
+For generic planning tasks, inspect only the directly relevant files first. Avoid broad repository exploration unless a missing plan section truly requires it.\n\
+Prefer at most one or two Read/Glob steps before writing or editing the plan file.\n\
 When the plan is complete, stop and ask the user to choose yes to execute, no to revise, or provide feedback. Wait for /approve, yes, or equivalent approval before making code changes.\n",
         );
     } else {
         prompt.push_str(
             "\nACT MODE:\n\
-Execute the accepted plan in phases: Prepare, Do, Verify, Evaluate, Iterate.\n",
+Execute the accepted plan in phases: Do, Verify, Evaluate, Improve.\n\
+Keep Act mode concise. Use the accepted plan summary, acceptance criteria, and quality bar to decide whether another improvement pass is needed.\n",
         );
     }
 
@@ -81,7 +89,8 @@ Execute the accepted plan in phases: Prepare, Do, Verify, Evaluate, Iterate.\n",
         TaskProfile::Generic => {
             prompt.push_str(
                 "\nTASK PROFILE: GENERIC\n\
-Focus on the requested outcome, not on a coding-only workflow. Preserve the accepted plan structure, keep work incremental, verify important claims, and evaluate the result against the acceptance criteria before stopping.\n",
+Focus on the requested outcome, not on a coding-only workflow. Preserve the accepted plan structure, keep work incremental, verify important claims, and evaluate the result against the acceptance criteria before stopping.\n\
+When planning, inspect only the files explicitly mentioned by the user or clearly required by the request. Do not expand into framework-specific files unless the task truly depends on them.\n",
             );
         }
         TaskProfile::Coding => {
@@ -95,6 +104,30 @@ For coding work, use this process inside Act mode:\n\
 5. Evaluate whether the result meets the quality bar and polish gaps if needed.\n\
 Never re-scaffold or reset the workspace once a viable project skeleton exists unless the user explicitly asks.\n\
 For UI-heavy work, improve game feel, visual polish, and completeness before considering the task done.\n",
+            );
+        }
+        TaskProfile::Content => {
+            prompt.push_str(
+                "\nTASK PROFILE: CONTENT\n\
+For content work, use this process inside Act mode:\n\
+1. Make the requested change in one small slice.\n\
+2. Verify the content still preserves required facts and structure.\n\
+3. Evaluate the draft against the quality bar: clarity, specificity, usefulness, and signal density.\n\
+4. If the content is still generic, repetitive, or low-value, improve it before stopping.\n\
+Prefer concrete reader value over filler text.\n",
+            );
+        }
+        TaskProfile::Ui => {
+            prompt.push_str(
+                "\nTASK PROFILE: UI\n\
+For UI-heavy work, implement in slices, verify the target state renders, and evaluate the result for hierarchy, polish, clarity, and completeness before stopping.\n\
+If the result feels bland or unfinished, improve it before considering the task done.\n",
+            );
+        }
+        TaskProfile::Research => {
+            prompt.push_str(
+                "\nTASK PROFILE: RESEARCH\n\
+For research work, gather only the evidence needed, verify key claims, and evaluate whether the output is decision-useful, not just descriptive.\n",
             );
         }
     }

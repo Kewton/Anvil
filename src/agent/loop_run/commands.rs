@@ -108,15 +108,35 @@ fn extract_json_object(raw: &str) -> Option<&str> {
 
 fn parse_large_task_decision(raw: &str) -> Option<ClassifiedTask> {
     let body = extract_json_object(raw.trim())?;
-    serde_json::from_str::<LargeTaskDecision>(body)
-        .ok()
-        .map(|decision| ClassifiedTask {
+    if let Ok(decision) = serde_json::from_str::<LargeTaskDecision>(body) {
+        return Some(ClassifiedTask {
             large_task: decision.large_task,
             task_profile: match decision.task_profile.as_deref() {
                 Some("coding") => TaskProfile::Coding,
+                Some("content") => TaskProfile::Content,
+                Some("ui") => TaskProfile::Ui,
+                Some("research") => TaskProfile::Research,
                 _ => TaskProfile::Generic,
             },
-        })
+        });
+    }
+
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let object = value.as_object()?;
+    let action = object.get("action").and_then(serde_json::Value::as_str);
+    let has_plan = object.get("plan").is_some();
+    let step_count = object
+        .get("steps")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, |steps| steps.len());
+    if matches!(action, Some("create_plan")) || (has_plan && step_count >= 2) {
+        return Some(ClassifiedTask {
+            large_task: true,
+            task_profile: TaskProfile::Generic,
+        });
+    }
+
+    None
 }
 
 pub(crate) fn is_plan_execution_request(input: &str) -> bool {
@@ -323,16 +343,27 @@ impl Agent {
         stream_output: bool,
     ) -> Result<AgentEvent, String> {
         let status = self.approve_plan_mode()?;
+        let plan_contents = self.current_plan_contents()?.unwrap_or_default();
+        let plan_summary = lifecycle::plan_act_summary(&plan_contents);
         let profile_guidance = match self.session.mode_state.task_profile {
             TaskProfile::Generic => {
-                "Work through the plan in phases, verify key outcomes, and evaluate the result against the acceptance criteria before stopping."
+                "Work through the plan in phases, verify key outcomes, evaluate the result against the acceptance criteria and quality bar, and run one improvement pass if the result is only minimally complete."
             }
             TaskProfile::Coding => {
                 "Work through the plan in phases: design, implement, review, test, evaluate. Preserve the intended quality bar, polish the user-facing result, and avoid unnecessary re-scaffolding or workspace resets."
             }
+            TaskProfile::Content => {
+                "Work through the plan in phases: edit, verify, evaluate, improve. After the first edit, review the output for clarity, specificity, usefulness, and signal density. If it still reads like filler, improve it before stopping."
+            }
+            TaskProfile::Ui => {
+                "Work through the plan in phases: implement, verify, evaluate, improve. Check hierarchy, polish, completeness, and user-facing quality before stopping."
+            }
+            TaskProfile::Research => {
+                "Work through the plan in phases: gather, verify, evaluate, refine. Prefer concise evidence-backed output over generic summaries."
+            }
         };
         let exec_prompt = format!(
-            "The user approved the plan and said: {trigger_text}\nExecute the approved plan now. Follow the accepted plan and its completion criteria. {profile_guidance} Start with one small, self-contained repository change, then continue until the requested work is complete."
+            "The user approved the plan and said: {trigger_text}\nExecute the approved plan now. Follow this accepted plan summary:\n\n{plan_summary}\n\n{profile_guidance} Start with one small, self-contained repository change, then continue until the requested work is complete."
         );
         println!("{status}");
         match self.handle_user_message(&exec_prompt, stream_output) {
@@ -487,9 +518,9 @@ impl Agent {
         }
         self.session.mode_state.approve();
         self.push_system_note(format!(
-            "[Act Mode / {}] Execute the accepted plan in phases and keep the work aligned with its acceptance criteria.\n\n{}",
+            "[Act Mode / {}] Execute the accepted plan in phases and keep the work aligned with its acceptance criteria and quality bar.\n\n{}",
             self.session.mode_state.task_profile.as_str(),
-            plan_contents
+            lifecycle::plan_act_summary(&plan_contents)
         ));
         self.footer.publish_flags(
             self.session.mode_state.mode,
@@ -502,7 +533,7 @@ impl Agent {
     fn classify_large_task_with_main_model(&self, input: &str) -> Result<ClassifiedTask, String> {
         let messages = vec![
             ConversationMessage::system(
-                "You classify whether a user request for a local-first repository agent should go through planning before execution, and which act profile fits best. Reply with JSON only in this shape: {\"large_task\":true|false,\"task_profile\":\"generic\"|\"coding\"}. Use task_profile=\"coding\" when the main work is code changes, software implementation, debugging, tests, UI work, build changes, or repository edits. Use task_profile=\"generic\" for broader planning, docs, analysis, organization, or mixed work without a code-heavy execution phase. Use large_task=true for broad multi-step work that benefits from a plan before execution."
+                "You classify whether a user request for a local-first repository agent should go through planning before execution, and which act profile fits best. Reply with JSON only in this shape: {\"large_task\":true|false,\"task_profile\":\"generic\"|\"coding\"|\"content\"|\"ui\"|\"research\"}. Use task_profile=\"coding\" for code changes, software implementation, debugging, tests, build changes, or repository edits. Use task_profile=\"ui\" for user-facing interface, visual design, interaction design, motion, or layout-heavy work. Use task_profile=\"content\" for writing, rewriting, documentation quality, copy, structured text, or reader-facing improvements where output quality matters. Use task_profile=\"research\" for investigation, comparison, or analysis-heavy work. Use task_profile=\"generic\" only for broader mixed work that does not clearly fit the others. Use large_task=true for broad multi-step work that benefits from a plan before execution."
                     .to_string(),
             ),
             ConversationMessage::user(format!(
@@ -813,7 +844,11 @@ impl Agent {
         } else {
             let user_input = if auto_plan_entered.is_some() {
                 format!(
-                    "Create an implementation plan for the user's request. Inspect the repository as needed, write the plan to the active plan file, and stop after the plan is complete. Do not make code changes yet. The plan must define: (1) the first shippable vertical slice, (2) concrete acceptance criteria for that slice, (3) the implementation phases after that, (4) the specific files/modules likely to change, and (5) the verification steps. Prefer an incremental plan that reaches a working first version before polish. End your user-facing response by telling the user to reply yes to execute, no to revise, or provide feedback.\n\nUser request:\n{trimmed}"
+                    "Create an implementation plan for the user's request. Inspect only the directly relevant files first, then fill the active plan file incrementally. Do not make code changes yet.\n\
+Stage 1 fills Goal, Constraints, and Deliverables.\n\
+Stage 2 fills Acceptance Criteria and Quality Bar.\n\
+Stage 3 fills Execution Plan, Verification Plan, and Risks/Fallbacks.\n\
+Use one small Write or Edit at a time. Do not try to write the full completed plan in one large tool call. Prefer at most one or two Read/Glob steps before updating the plan. The plan must still define: (1) the first shippable vertical slice, (2) concrete acceptance criteria for that slice, (3) the quality bar that defines what makes the result genuinely good, (4) the implementation phases after that, (5) the specific files/modules likely to change, and (6) the verification steps. End your user-facing response only after the plan is complete, and then tell the user to reply yes to execute, no to revise, or provide feedback.\n\nUser request:\n{trimmed}"
                 )
             } else {
                 trimmed.to_string()
@@ -850,19 +885,34 @@ impl Agent {
                     let summary = format_run_summary(ExitReason::Done, &stats);
                     println!();
                     if self.session.mode_state.mode == ExecutionMode::Plan {
-                        match self.prompt_for_plan_approval_choice()? {
-                            Some(PlanApprovalChoice::Execute) => {
-                                return self.execute_approved_plan("yes", stream_output);
+                        let plan_contents = self.current_plan_contents()?.unwrap_or_default();
+                        if lifecycle::plan_is_substantive(&plan_contents) {
+                            match self.prompt_for_plan_approval_choice()? {
+                                Some(PlanApprovalChoice::Execute) => {
+                                    return self.execute_approved_plan("yes", stream_output);
+                                }
+                                Some(PlanApprovalChoice::Revise) => {
+                                    println!(
+                                        "plan ready: not approved; provide revisions or feedback"
+                                    );
+                                }
+                                Some(PlanApprovalChoice::Feedback) => {
+                                    println!("plan ready: provide feedback to revise the plan");
+                                }
+                                None => {
+                                    println!(
+                                        "plan ready: reply yes to execute, no to revise, or provide feedback"
+                                    );
+                                }
                             }
-                            Some(PlanApprovalChoice::Revise) => {
-                                println!("plan ready: not approved; provide revisions or feedback");
-                            }
-                            Some(PlanApprovalChoice::Feedback) => {
-                                println!("plan ready: provide feedback to revise the plan");
-                            }
-                            None => {
+                        } else {
+                            let next_sections = lifecycle::plan_next_stage_sections(&plan_contents);
+                            if next_sections.is_empty() {
+                                println!("plan in progress: continue refining the plan");
+                            } else {
                                 println!(
-                                    "plan ready: reply yes to execute, no to revise, or provide feedback"
+                                    "plan in progress: next fill {}",
+                                    next_sections.join(", ")
                                 );
                             }
                         }
@@ -1205,6 +1255,23 @@ mod tests {
             })
         );
         assert_eq!(parse_large_task_decision("not json"), None);
+    }
+
+    #[test]
+    fn parses_large_task_classifier_fallback_shape() {
+        assert_eq!(
+            parse_large_task_decision(
+                r#"{
+                    "action":"create_plan",
+                    "plan":"README improvement process",
+                    "steps":["draft","edit","verify"]
+                }"#
+            ),
+            Some(ClassifiedTask {
+                large_task: true,
+                task_profile: TaskProfile::Generic,
+            })
+        );
     }
 
     #[test]

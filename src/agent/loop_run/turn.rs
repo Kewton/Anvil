@@ -4,6 +4,7 @@ use super::summary::{ExitReason, LoopResult, LoopStats};
 use super::*;
 use crate::agent::orchestration::{RepoVerification, capture_repo_snapshot, verify_repo_progress};
 use std::collections::HashSet;
+use std::path::Path;
 use std::time::Instant;
 
 /// Maximum number of characters of tool-call arguments retained in trace logs.
@@ -21,6 +22,30 @@ fn truncate(s: &str, max: usize) -> String {
         }
         None => s.to_string(),
     }
+}
+
+fn same_existing_path(lhs: &Path, rhs: &Path) -> bool {
+    match (std::fs::canonicalize(lhs), std::fs::canonicalize(rhs)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => lhs == rhs,
+    }
+}
+
+fn is_plan_file_tool_call(
+    tool_name: &str,
+    arguments: &serde_json::Value,
+    plan_path: Option<&Path>,
+) -> bool {
+    if !matches!(tool_name, "Write" | "Edit") {
+        return false;
+    }
+    let Some(plan_path) = plan_path else {
+        return false;
+    };
+    let Some(raw_path) = arguments.get("path").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    same_existing_path(Path::new(raw_path), plan_path)
 }
 
 fn build_stats(
@@ -113,6 +138,8 @@ impl Agent {
         let mut empty_retries = 0usize;
         let mut no_tool_retries = 0usize;
         let mut repo_change_retries = 0usize;
+        let mut plan_progress_retries = 0usize;
+        let mut plan_exploration_only_turns = 0usize;
         let mut recent_bash_commands = Vec::<String>::new();
         let mut install_commands_seen = 0usize;
 
@@ -166,6 +193,8 @@ impl Agent {
                 .collect::<Vec<_>>();
 
             if !prepared_tool_calls.is_empty() {
+                let mut plan_file_edit_calls_this_turn = 0usize;
+                let mut plan_exploration_calls_this_turn = 0usize;
                 tool_calls_made_this_turn += prepared_tool_calls.len();
                 repo_edit_calls_made_this_turn += prepared_tool_calls
                     .iter()
@@ -195,6 +224,17 @@ impl Agent {
                     } else {
                         String::new()
                     };
+                    if self.session.mode_state.mode == ExecutionMode::Plan {
+                        if is_plan_file_tool_call(
+                            &tool_name,
+                            &tool_call.arguments,
+                            self.session.mode_state.active_plan_path.as_deref(),
+                        ) {
+                            plan_file_edit_calls_this_turn += 1;
+                        } else if matches!(tool_name.as_str(), "Read" | "Glob" | "Grep") {
+                            plan_exploration_calls_this_turn += 1;
+                        }
+                    }
                     let block_restart_discovery = recovery::should_block_restart_discovery(
                         &tool_name,
                         restart_convergence_mode && repo_edit_calls_made_this_turn == 0,
@@ -313,6 +353,62 @@ impl Agent {
                         .messages
                         .push(ConversationMessage::tool(tool_name, compact_result));
                 }
+                if self.session.mode_state.mode == ExecutionMode::Plan {
+                    if plan_file_edit_calls_this_turn > 0 {
+                        plan_progress_retries = 0;
+                        plan_exploration_only_turns = 0;
+                    } else if plan_exploration_calls_this_turn >= 2 {
+                        match self.current_plan_contents() {
+                            Ok(Some(contents)) => {
+                                let next_sections = lifecycle::plan_next_stage_sections(&contents);
+                                let missing_sections = lifecycle::plan_missing_sections(&contents);
+                                if !missing_sections.is_empty() {
+                                    plan_progress_retries += 1;
+                                    self.push_system_note(recovery::plan_progress_recovery_note(
+                                        &next_sections,
+                                        &missing_sections,
+                                        plan_progress_retries,
+                                    ));
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(err) => {
+                                exit_reason = ExitReason::TransportError;
+                                error_text = err;
+                                break 'outer;
+                            }
+                        }
+                    } else if plan_exploration_calls_this_turn > 0 {
+                        plan_exploration_only_turns += 1;
+                        if plan_exploration_only_turns >= 2 {
+                            match self.current_plan_contents() {
+                                Ok(Some(contents)) => {
+                                    let next_sections =
+                                        lifecycle::plan_next_stage_sections(&contents);
+                                    let missing_sections =
+                                        lifecycle::plan_missing_sections(&contents);
+                                    if !missing_sections.is_empty() {
+                                        plan_progress_retries += 1;
+                                        self.push_system_note(
+                                            recovery::plan_progress_recovery_note(
+                                                &next_sections,
+                                                &missing_sections,
+                                                plan_progress_retries,
+                                            ),
+                                        );
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(err) => {
+                                    exit_reason = ExitReason::TransportError;
+                                    error_text = err;
+                                    break 'outer;
+                                }
+                            }
+                            plan_exploration_only_turns = 0;
+                        }
+                    }
+                }
                 if emitted_bash_loop_note {
                     self.push_system_note(recovery::install_loop_recovery_note());
                 }
@@ -394,6 +490,32 @@ impl Agent {
             }
 
             // Done
+            if self.session.mode_state.mode == ExecutionMode::Plan {
+                let plan_contents = match self.current_plan_contents() {
+                    Ok(contents) => contents.unwrap_or_default(),
+                    Err(err) => {
+                        exit_reason = ExitReason::TransportError;
+                        error_text = err;
+                        break 'outer;
+                    }
+                };
+                if !lifecycle::plan_is_substantive(&plan_contents) {
+                    let next_sections = lifecycle::plan_next_stage_sections(&plan_contents);
+                    let missing_sections = lifecycle::plan_missing_sections(&plan_contents);
+                    plan_progress_retries += 1;
+                    if plan_progress_retries >= 4 {
+                        exit_reason = ExitReason::PlanIncomplete;
+                        error_text = exit_reason.default_error_text().to_string();
+                        break 'outer;
+                    }
+                    self.push_system_note(recovery::plan_progress_recovery_note(
+                        &next_sections,
+                        &missing_sections,
+                        plan_progress_retries,
+                    ));
+                    continue;
+                }
+            }
             final_prose = final_reply;
             exit_reason = ExitReason::Done;
             break 'outer;

@@ -149,14 +149,7 @@ fn parse_tool_call_object(raw: &str, allowed_tools: &[String]) -> Option<(String
 }
 
 fn strip_name_from_arguments(value: Value) -> Value {
-    match value {
-        Value::Object(mut map) => {
-            map.remove("name");
-            map.remove("tool");
-            Value::Object(map)
-        }
-        other => other,
-    }
+    unwrap_argument_wrappers(value)
 }
 
 fn parse_arguments(raw: &str) -> Option<Value> {
@@ -165,8 +158,36 @@ fn parse_arguments(raw: &str) -> Option<Value> {
 
 fn normalize_arguments_value(value: &Value) -> Option<Value> {
     match value {
-        Value::String(raw) => parse_json_relaxed(raw).or_else(|| Some(Value::String(raw.clone()))),
-        other => Some(other.clone()),
+        Value::String(raw) => parse_json_relaxed(raw)
+            .map(unwrap_argument_wrappers)
+            .or_else(|| Some(Value::String(raw.clone()))),
+        other => Some(unwrap_argument_wrappers(other.clone())),
+    }
+}
+
+fn unwrap_argument_wrappers(value: Value) -> Value {
+    match value {
+        Value::Object(mut map) => {
+            map.remove("name");
+            map.remove("tool");
+
+            if let Some(nested) = map.remove("arguments").or_else(|| map.remove("args")) {
+                let unwrapped_nested = unwrap_argument_wrappers(nested);
+                if let Value::Object(nested_map) = &unwrapped_nested
+                    && (nested_map.contains_key("path")
+                        || nested_map.contains_key("command")
+                        || nested_map.contains_key("pattern")
+                        || nested_map.contains_key("content")
+                        || nested_map.contains_key("old_string"))
+                {
+                    return unwrapped_nested;
+                }
+                map.insert("arguments".to_string(), unwrapped_nested);
+            }
+
+            Value::Object(map)
+        }
+        other => other,
     }
 }
 
@@ -261,4 +282,25 @@ fn normalize_name(name: &str, allowed_tools: &[String]) -> String {
         .find(|candidate| candidate.eq_ignore_ascii_case(name))
         .cloned()
         .unwrap_or_else(|| name.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::extract_tool_calls;
+
+    #[test]
+    fn unwraps_nested_arguments_wrapper() {
+        let allowed = vec!["Write".to_string()];
+        let input = r#"<anvil_tool_call>{"arguments":{"name":"Write","arguments":{"path":"plans/plan.md","content":"hello"}}}</anvil_tool_call>"#;
+        let (tool_calls, remaining) = extract_tool_calls(input, &allowed);
+        assert!(remaining.is_empty(), "remaining={remaining:?}");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].name, "Write");
+        assert_eq!(
+            tool_calls[0].arguments,
+            json!({"path":"plans/plan.md","content":"hello"})
+        );
+    }
 }

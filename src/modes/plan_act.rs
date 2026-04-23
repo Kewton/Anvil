@@ -12,6 +12,9 @@ pub enum TaskProfile {
     #[default]
     Generic,
     Coding,
+    Content,
+    Ui,
+    Research,
 }
 
 impl TaskProfile {
@@ -19,6 +22,9 @@ impl TaskProfile {
         match self {
             TaskProfile::Generic => "generic",
             TaskProfile::Coding => "coding",
+            TaskProfile::Content => "content",
+            TaskProfile::Ui => "ui",
+            TaskProfile::Research => "research",
         }
     }
 }

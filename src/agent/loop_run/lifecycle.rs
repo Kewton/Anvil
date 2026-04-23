@@ -68,7 +68,7 @@ impl Agent {
         }
         std::fs::write(
             plan_path,
-            "# Plan\n\n## Goal\n- \n\n## Constraints\n- \n\n## Deliverables\n- \n\n## Acceptance Criteria\n- \n\n## Execution Plan\n1. First slice:\n2. Next phases:\n3. Review checkpoint:\n\n## Verification Plan\n- \n\n## Risks / Fallbacks\n- \n",
+            "# Plan\n\n## Goal\n- \n\n## Constraints\n- \n\n## Deliverables\n- \n\n## Acceptance Criteria\n- \n\n## Quality Bar\n- \n\n## Execution Plan\n1. First slice:\n2. Next phases:\n3. Review checkpoint:\n\n## Verification Plan\n- \n\n## Risks / Fallbacks\n- \n",
         )
         .map_err(|err| format!("failed to create plan file {}: {err}", plan_path.display()))
     }
@@ -150,15 +150,106 @@ pub(super) fn is_transport_error(error: &str) -> bool {
         || lower.contains("ollama /api/chat failed: 429")
 }
 
-pub(super) fn plan_is_substantive(contents: &str) -> bool {
-    let meaningful_lines = contents
-        .lines()
+const PLAN_STAGE_ONE: &[&str] = &["Goal", "Constraints", "Deliverables"];
+const PLAN_STAGE_TWO: &[&str] = &["Acceptance Criteria", "Quality Bar"];
+const PLAN_STAGE_THREE: &[&str] = &["Execution Plan", "Verification Plan", "Risks / Fallbacks"];
+
+fn normalize_plan_heading(heading: &str) -> &str {
+    match heading.trim() {
+        "Risks/Fallbacks" => "Risks / Fallbacks",
+        other => other,
+    }
+}
+
+fn substantive_plan_lines<'a>(body: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+    body.lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
-        .filter(|line| !matches!(*line, "# Plan" | "## Goal" | "## Findings" | "## Steps"))
-        .filter(|line| *line != "-" && *line != "1.")
-        .count();
-    meaningful_lines >= 2
+        .filter(|line| *line != "-")
+        .filter(|line| *line != "1.")
+        .filter(|line| *line != "2.")
+        .filter(|line| *line != "3.")
+        .filter(|line| {
+            !matches!(
+                *line,
+                "1. First slice:" | "2. Next phases:" | "3. Review checkpoint:"
+            )
+        })
+}
+
+fn plan_section_body<'a>(contents: &'a str, section: &str) -> Option<String> {
+    let mut current_heading: Option<&str> = None;
+    let mut collected = Vec::new();
+
+    for raw_line in contents.lines() {
+        let trimmed = raw_line.trim();
+        if let Some(heading) = trimmed.strip_prefix("## ") {
+            current_heading = Some(normalize_plan_heading(heading));
+            continue;
+        }
+
+        if current_heading == Some(section) {
+            collected.push(raw_line);
+        }
+    }
+
+    (!collected.is_empty()).then(|| collected.join("\n"))
+}
+
+fn plan_section_is_substantive(contents: &str, section: &str) -> bool {
+    plan_section_body(contents, section)
+        .map(|body| substantive_plan_lines(&body).count() > 0)
+        .unwrap_or(false)
+}
+
+pub(super) fn plan_missing_sections(contents: &str) -> Vec<&'static str> {
+    PLAN_STAGE_ONE
+        .iter()
+        .chain(PLAN_STAGE_TWO.iter())
+        .chain(PLAN_STAGE_THREE.iter())
+        .copied()
+        .filter(|section| !plan_section_is_substantive(contents, section))
+        .collect()
+}
+
+pub(super) fn plan_next_stage_sections(contents: &str) -> Vec<&'static str> {
+    for stage in [PLAN_STAGE_ONE, PLAN_STAGE_TWO, PLAN_STAGE_THREE] {
+        let missing = stage
+            .iter()
+            .copied()
+            .filter(|section| !plan_section_is_substantive(contents, section))
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return missing;
+        }
+    }
+    Vec::new()
+}
+
+pub(super) fn plan_is_substantive(contents: &str) -> bool {
+    plan_missing_sections(contents).is_empty()
+}
+
+pub(super) fn plan_act_summary(contents: &str) -> String {
+    let mut parts = Vec::new();
+    for section in [
+        "Goal",
+        "Acceptance Criteria",
+        "Quality Bar",
+        "Execution Plan",
+        "Verification Plan",
+    ] {
+        if let Some(body) = plan_section_body(contents, section) {
+            let lines = substantive_plan_lines(&body)
+                .take(3)
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>();
+            if !lines.is_empty() {
+                parts.push(format!("## {section}\n{}", lines.join("\n")));
+            }
+        }
+    }
+    parts.join("\n\n")
 }
 
 pub(super) fn format_tool_error(err: &str) -> String {
@@ -166,5 +257,142 @@ pub(super) fn format_tool_error(err: &str) -> String {
         err.to_string()
     } else {
         format!("Error: {err}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        plan_act_summary, plan_is_substantive, plan_missing_sections, plan_next_stage_sections,
+    };
+
+    const TEMPLATE: &str = "# Plan
+
+## Goal
+- 
+
+## Constraints
+- 
+
+## Deliverables
+- 
+
+## Acceptance Criteria
+- 
+
+## Quality Bar
+- 
+
+## Execution Plan
+1. First slice:
+2. Next phases:
+3. Review checkpoint:
+
+## Verification Plan
+- 
+
+## Risks / Fallbacks
+- 
+";
+
+    #[test]
+    fn incomplete_template_reports_stage_one_missing() {
+        assert_eq!(
+            plan_next_stage_sections(TEMPLATE),
+            vec!["Goal", "Constraints", "Deliverables"]
+        );
+        assert!(!plan_is_substantive(TEMPLATE));
+    }
+
+    #[test]
+    fn partially_filled_plan_advances_to_next_stage() {
+        let contents = TEMPLATE
+            .replace("## Goal\n- ", "## Goal\n- Improve the README")
+            .replace(
+                "## Constraints\n- ",
+                "## Constraints\n- Keep the current content",
+            )
+            .replace(
+                "## Deliverables\n- ",
+                "## Deliverables\n- Updated README plan",
+            );
+        assert_eq!(
+            plan_next_stage_sections(&contents),
+            vec!["Acceptance Criteria", "Quality Bar"]
+        );
+    }
+
+    #[test]
+    fn fully_filled_plan_is_substantive() {
+        let contents = "# Plan
+
+## Goal
+- Improve the README in three stages.
+
+## Constraints
+- Preserve existing content.
+
+## Deliverables
+- A plan, a new heading, and a verification pass.
+
+## Acceptance Criteria
+- The new heading is present and the original text remains.
+
+## Quality Bar
+- The new section adds concrete value and does not read like filler.
+
+## Execution Plan
+1. First slice: define the README goal and heading to add.
+2. Next phases: update the README and review the result.
+3. Review checkpoint: confirm the final content before approval.
+
+## Verification Plan
+- Read the README after editing and confirm the expected heading exists.
+
+## Risks / Fallbacks
+- If the heading is unclear, revise the plan before execution.
+";
+        assert!(plan_missing_sections(contents).is_empty());
+        assert!(plan_is_substantive(contents));
+    }
+
+    #[test]
+    fn plan_act_summary_uses_key_sections_only() {
+        let contents = "# Plan
+
+## Goal
+- Improve the README with clearer guidance.
+
+## Constraints
+- Keep the existing intro.
+
+## Deliverables
+- Better README text.
+
+## Acceptance Criteria
+- Add a specific usage section.
+
+## Quality Bar
+- Avoid vague filler text.
+- Prefer concrete reader value.
+
+## Execution Plan
+1. First slice: add a focused usage section.
+2. Next phases: tighten wording.
+3. Review checkpoint: re-read for usefulness.
+
+## Verification Plan
+- Re-read README for clarity.
+
+## Risks / Fallbacks
+- If wording is vague, rewrite it.
+";
+        let summary = plan_act_summary(contents);
+        assert!(summary.contains("## Goal"));
+        assert!(summary.contains("## Acceptance Criteria"));
+        assert!(summary.contains("## Quality Bar"));
+        assert!(summary.contains("## Execution Plan"));
+        assert!(!summary.contains("## Constraints"));
+        assert!(!summary.contains("## Deliverables"));
     }
 }
