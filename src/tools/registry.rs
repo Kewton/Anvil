@@ -129,17 +129,23 @@ pub(crate) fn resolve_plan_mode_write_target(
     let canonical_allowed = canonicalize_with_missing_tail(allowed_path);
     let input_path = std::path::Path::new(raw_path);
     let requested = if input_path.is_absolute() {
-        canonicalize_with_missing_tail(input_path)
-    } else if input_path
-        .file_name()
-        .zip(allowed_path.file_name())
-        .is_some_and(|(lhs, rhs)| lhs == rhs)
-    {
+        if path_has_same_filename(input_path, allowed_path) {
+            canonical_allowed.clone()
+        } else {
+            canonicalize_with_missing_tail(input_path)
+        }
+    } else if path_has_same_filename(input_path, allowed_path) {
         canonical_allowed.clone()
     } else {
         resolve_user_path(root, raw_path)?
     };
     Ok((requested == canonical_allowed).then_some(canonical_allowed))
+}
+
+fn path_has_same_filename(lhs: &std::path::Path, rhs: &std::path::Path) -> bool {
+    lhs.file_name()
+        .zip(rhs.file_name())
+        .is_some_and(|(lhs, rhs)| lhs == rhs)
 }
 
 fn default_tool_specs() -> Vec<ToolSpec> {
@@ -367,6 +373,42 @@ mod tests {
         let resolved = resolve_plan_mode_write_target(&root, "plans/plan-123.md", Some(&plan_path))
             .unwrap()
             .unwrap();
+        assert_eq!(
+            canonicalize_with_missing_tail(&resolved),
+            canonicalize_with_missing_tail(&plan_path)
+        );
+    }
+
+    #[test]
+    fn plan_mode_write_target_accepts_direct_basename_alias() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("repo");
+        let plan_root = temp.path().join("state").join("plans");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&plan_root).unwrap();
+        let plan_path = plan_root.join("plan-123.md");
+        let resolved = resolve_plan_mode_write_target(&root, "plan-123.md", Some(&plan_path))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            canonicalize_with_missing_tail(&resolved),
+            canonicalize_with_missing_tail(&plan_path)
+        );
+    }
+
+    #[test]
+    fn plan_mode_write_target_accepts_absolute_same_filename_alias() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("repo");
+        let plan_root = temp.path().join("state").join("plans");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&plan_root).unwrap();
+        let plan_path = plan_root.join("plan-123.md");
+        let alias = root.join("plan-123.md");
+        let resolved =
+            resolve_plan_mode_write_target(&root, alias.to_str().unwrap(), Some(&plan_path))
+                .unwrap()
+                .unwrap();
         assert_eq!(
             canonicalize_with_missing_tail(&resolved),
             canonicalize_with_missing_tail(&plan_path)

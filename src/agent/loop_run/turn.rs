@@ -334,7 +334,9 @@ impl Agent {
         monitor: &mut InterruptMonitor,
     ) -> LoopResult {
         self.push_user_message(input.to_string());
-        self.maybe_compact_session(DEFAULT_KEEP_TAIL);
+        if self.session.mode_state.mode != ExecutionMode::Plan {
+            self.maybe_compact_session(DEFAULT_KEEP_TAIL);
+        }
         let _ = self.refresh_plan_stage();
 
         let action_expectation =
@@ -918,11 +920,15 @@ impl Agent {
                 if emitted_bash_loop_note {
                     self.push_system_note(recovery::install_loop_recovery_note());
                 }
-                let compacted = self.maybe_compact_late_turn_session(
-                    tool_calls_made_this_turn,
-                    repo_edit_calls_made_this_turn,
-                );
-                if !compacted {
+                let compacted = if self.session.mode_state.mode == ExecutionMode::Plan {
+                    false
+                } else {
+                    self.maybe_compact_late_turn_session(
+                        tool_calls_made_this_turn,
+                        repo_edit_calls_made_this_turn,
+                    )
+                };
+                if !compacted && self.session.mode_state.mode != ExecutionMode::Plan {
                     self.maybe_compact_session(DEFAULT_KEEP_TAIL);
                 }
                 // Boundary 3: after tool messages have been pushed and the
