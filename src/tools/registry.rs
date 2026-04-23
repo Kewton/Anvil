@@ -91,7 +91,13 @@ impl ToolRegistry {
                     context,
                 )?;
                 let content = get_required_string(arguments, "content")?;
-                write::run(&path, content)
+                if let Some(merged) =
+                    plan_mode_merged_plan_contents("Write", &path, arguments, context)?
+                {
+                    write::run(&path, &merged)
+                } else {
+                    write::run(&path, content)
+                }
             }
             "Edit" => {
                 let path = resolve_write_path(
@@ -105,7 +111,13 @@ impl ToolRegistry {
                     .get("replace_all")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-                edit::run(&path, old, new, replace_all)
+                if let Some(merged) =
+                    plan_mode_merged_plan_contents("Edit", &path, arguments, context)?
+                {
+                    write::run(&path, &merged)
+                } else {
+                    edit::run(&path, old, new, replace_all)
+                }
             }
             "Glob" => {
                 let pattern = get_required_string(arguments, "pattern")?;
@@ -293,8 +305,7 @@ fn resolve_write_path(
     context: &ToolContext,
 ) -> Result<std::path::PathBuf, String> {
     if context.mode == ExecutionMode::Plan {
-        if let Some(path) =
-            resolve_plan_mode_write_target(root, raw, context.plan_path.as_deref())?
+        if let Some(path) = resolve_plan_mode_write_target(root, raw, context.plan_path.as_deref())?
         {
             return Ok(path);
         }
@@ -302,7 +313,11 @@ fn resolve_write_path(
     resolve_user_path(root, raw)
 }
 
-fn enforce_plan_stage_scope(name: &str, arguments: &Value, context: &ToolContext) -> Result<(), String> {
+fn enforce_plan_stage_scope(
+    name: &str,
+    arguments: &Value,
+    context: &ToolContext,
+) -> Result<(), String> {
     if context.mode != ExecutionMode::Plan || !matches!(name, "Write" | "Edit") {
         return Ok(());
     }
@@ -324,7 +339,7 @@ fn enforce_plan_stage_scope(name: &str, arguments: &Value, context: &ToolContext
         .into_iter()
         .filter(|section| payload_mentions_plan_section(payload, section))
         .collect::<Vec<_>>();
-    if disallowed.is_empty() {
+    if disallowed.is_empty() || payload_contains_allowed_plan_section(payload, context.plan_stage) {
         return Ok(());
     }
 
@@ -366,6 +381,170 @@ fn disallowed_plan_sections(stage: PlanStage) -> Vec<&'static str> {
 fn payload_mentions_plan_section(payload: &str, section: &str) -> bool {
     let heading = format!("## {section}");
     payload.contains(&heading)
+}
+
+fn payload_contains_allowed_plan_section(payload: &str, stage: PlanStage) -> bool {
+    allowed_plan_sections(stage)
+        .iter()
+        .any(|section| payload_mentions_plan_section(payload, section))
+}
+
+fn plan_mode_merged_plan_contents(
+    tool_name: &str,
+    path: &std::path::Path,
+    arguments: &Value,
+    context: &ToolContext,
+) -> Result<Option<String>, String> {
+    if context.mode != ExecutionMode::Plan {
+        return Ok(None);
+    }
+    let Some(plan_path) = context.plan_path.as_deref() else {
+        return Ok(None);
+    };
+    if canonicalize_with_missing_tail(path) != canonicalize_with_missing_tail(plan_path) {
+        return Ok(None);
+    }
+
+    let payload = match tool_name {
+        "Write" => get_required_string(arguments, "content")?,
+        "Edit" => get_required_string(arguments, "new_string")?,
+        _ => return Ok(None),
+    };
+
+    let merged = merge_plan_payload_for_stage(path, payload, context.plan_stage)?;
+    Ok(Some(merged))
+}
+
+fn merge_plan_payload_for_stage(
+    path: &std::path::Path,
+    payload: &str,
+    stage: PlanStage,
+) -> Result<String, String> {
+    let allowed = allowed_plan_sections(stage);
+    if allowed.is_empty() {
+        return Err(
+            "plan is already approval ready; no further stage-scoped edits are allowed".to_string(),
+        );
+    }
+
+    let payload_sections = parse_plan_sections(payload);
+    let staged_updates = allowed
+        .iter()
+        .filter_map(|section| {
+            payload_sections
+                .get(*section)
+                .map(|body| ((*section).to_string(), body.clone()))
+        })
+        .collect::<Vec<_>>();
+    if staged_updates.is_empty() {
+        return Err(format!(
+            "plan stage {} update must include one of these sections: {}",
+            stage.label(),
+            allowed.join(", ")
+        ));
+    }
+
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    let existing_sections = parse_plan_sections(&existing);
+    let preamble = choose_plan_preamble(&existing, payload);
+    let mut merged_sections = existing_sections;
+    for (section, body) in staged_updates {
+        merged_sections.insert(section, body);
+    }
+
+    Ok(render_plan_document(&preamble, &merged_sections))
+}
+
+fn choose_plan_preamble(existing: &str, payload: &str) -> String {
+    let existing_preamble = plan_preamble(existing);
+    if !existing_preamble.trim().is_empty() {
+        return existing_preamble;
+    }
+    let payload_preamble = plan_preamble(payload);
+    if !payload_preamble.trim().is_empty() {
+        return payload_preamble;
+    }
+    "# Plan".to_string()
+}
+
+fn plan_preamble(contents: &str) -> String {
+    let lines = contents
+        .lines()
+        .take_while(|line| !line.trim_start().starts_with("## "))
+        .collect::<Vec<_>>();
+    lines.join("\n").trim().to_string()
+}
+
+fn parse_plan_sections(contents: &str) -> std::collections::BTreeMap<String, String> {
+    let mut sections = std::collections::BTreeMap::new();
+    let mut current_heading: Option<String> = None;
+    let mut current_body = Vec::new();
+
+    for line in contents.lines() {
+        if let Some(raw_heading) = line.trim().strip_prefix("## ") {
+            if let Some(heading) = current_heading.take() {
+                let body = current_body.join("\n").trim().to_string();
+                if !body.is_empty() {
+                    sections.insert(heading, body);
+                }
+                current_body.clear();
+            }
+            current_heading = Some(normalize_plan_heading(raw_heading).to_string());
+            continue;
+        }
+        if current_heading.is_some() {
+            current_body.push(line);
+        }
+    }
+
+    if let Some(heading) = current_heading.take() {
+        let body = current_body.join("\n").trim().to_string();
+        if !body.is_empty() {
+            sections.insert(heading, body);
+        }
+    }
+
+    sections
+}
+
+fn normalize_plan_heading(heading: &str) -> &str {
+    match heading.trim() {
+        "Risks/Fallbacks" => "Risks / Fallbacks",
+        "実行計画" | "実装計画" | "実装フェーズ" => "Execution Plan",
+        "検証計画" => "Verification Plan",
+        "リスク/フォールバック" | "リスク・フォールバック" | "リスク / フォールバック" => {
+            "Risks / Fallbacks"
+        }
+        other => other,
+    }
+}
+
+fn render_plan_document(
+    preamble: &str,
+    sections: &std::collections::BTreeMap<String, String>,
+) -> String {
+    let mut blocks = Vec::new();
+    let trimmed_preamble = preamble.trim();
+    if !trimmed_preamble.is_empty() {
+        blocks.push(trimmed_preamble.to_string());
+    }
+
+    for section in [
+        "Goal",
+        "Constraints",
+        "Deliverables",
+        "Acceptance Criteria",
+        "Quality Bar",
+        "Execution Plan",
+        "Verification Plan",
+        "Risks / Fallbacks",
+    ] {
+        if let Some(body) = sections.get(section) {
+            blocks.push(format!("## {section}\n{}", body.trim()));
+        }
+    }
+
+    format!("{}\n", blocks.join("\n\n"))
 }
 
 fn canonicalize_with_missing_tail(path: &std::path::Path) -> std::path::PathBuf {
@@ -433,8 +612,8 @@ pub fn truncate_output(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        canonicalize_with_missing_tail, enforce_plan_stage_scope, resolve_plan_mode_write_target,
-        ToolContext, ToolRegistry,
+        ToolContext, ToolRegistry, canonicalize_with_missing_tail, enforce_plan_stage_scope,
+        resolve_plan_mode_write_target,
     };
     use crate::modes::plan_act::{ExecutionMode, PlanStage};
     use serde_json::json;
@@ -532,8 +711,8 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(&plan_root).unwrap();
         let plan_path = plan_root.join("plan-123.md");
-        let resolved = resolve_plan_mode_write_target(&root, "plans/other.md", Some(&plan_path))
-            .unwrap();
+        let resolved =
+            resolve_plan_mode_write_target(&root, "plans/other.md", Some(&plan_path)).unwrap();
         assert!(resolved.is_none());
     }
 
@@ -596,5 +775,90 @@ mod tests {
             &context,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn plan_mode_stage2_write_merges_without_dropping_stage1_sections() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("repo");
+        let plan_root = temp.path().join("state").join("plans");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&plan_root).unwrap();
+        let plan_path = plan_root.join("plan-123.md");
+        std::fs::write(
+            &plan_path,
+            "# Plan\n\n## Goal\n- build game\n\n## Constraints\n- keep next.js\n\n## Deliverables\n- runnable app\n",
+        )
+        .unwrap();
+        let context = ToolContext {
+            root,
+            mode: ExecutionMode::Plan,
+            plan_path: Some(plan_path.clone()),
+            plan_stage: PlanStage::Stage2,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            cancel_flag: None,
+        };
+        ToolRegistry::default()
+            .execute(
+                "Write",
+                &json!({
+                    "path": "plans/plan-123.md",
+                    "content": "## Acceptance Criteria\n- playable\n\n## Quality Bar\n- anchored to src/app/page.tsx\n"
+                }),
+                &context,
+            )
+            .unwrap();
+        let updated = std::fs::read_to_string(&plan_path).unwrap();
+        assert!(updated.contains("## Goal\n- build game"));
+        assert!(updated.contains("## Constraints\n- keep next.js"));
+        assert!(updated.contains("## Deliverables\n- runnable app"));
+        assert!(updated.contains("## Acceptance Criteria\n- playable"));
+        assert!(updated.contains("## Quality Bar\n- anchored to src/app/page.tsx"));
+    }
+
+    #[test]
+    fn plan_mode_stage2_edit_salvages_allowed_sections_from_full_document() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("repo");
+        let plan_root = temp.path().join("state").join("plans");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&plan_root).unwrap();
+        let plan_path = plan_root.join("plan-123.md");
+        std::fs::write(
+            &plan_path,
+            "# Plan\n\n## Goal\n- build game\n\n## Constraints\n- keep next.js\n\n## Deliverables\n- runnable app\n",
+        )
+        .unwrap();
+        let context = ToolContext {
+            root,
+            mode: ExecutionMode::Plan,
+            plan_path: Some(plan_path.clone()),
+            plan_stage: PlanStage::Stage2,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            cancel_flag: None,
+        };
+        ToolRegistry::default()
+            .execute(
+                "Edit",
+                &json!({
+                    "path": "plan-123.md",
+                    "old_string": "# Plan",
+                    "new_string": "# Plan\n\n## Goal\n- overwritten goal\n\n## Constraints\n- overwritten constraints\n\n## Deliverables\n- overwritten deliverables\n\n## Acceptance Criteria\n- playable\n\n## Quality Bar\n- anchored to src/app/page.tsx\n\n## Execution Plan\n1. later\n"
+                }),
+                &context,
+            )
+            .unwrap();
+        let updated = std::fs::read_to_string(&plan_path).unwrap();
+        assert!(updated.contains("## Goal\n- build game"));
+        assert!(updated.contains("## Constraints\n- keep next.js"));
+        assert!(updated.contains("## Deliverables\n- runnable app"));
+        assert!(updated.contains("## Acceptance Criteria\n- playable"));
+        assert!(updated.contains("## Quality Bar\n- anchored to src/app/page.tsx"));
+        assert!(!updated.contains("overwritten goal"));
+        assert!(!updated.contains("## Execution Plan\n1. later"));
     }
 }
