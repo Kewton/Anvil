@@ -55,6 +55,44 @@ fn read_write_edit_glob_and_grep_work() {
 }
 
 #[test]
+fn edit_tool_salvages_token_anchor_drift() {
+    let dir = tempdir().unwrap();
+    let registry = ToolRegistry::default();
+    let context = ToolContext {
+        root: dir.path().to_path_buf(),
+        mode: ExecutionMode::Act,
+        plan_path: None,
+        auto_approve: true,
+        interactive_approval: false,
+        cancel_flag: None,
+    };
+
+    registry
+        .execute(
+            "Write",
+            &json!({"path":"src/main.rs","content":"fn main() {\n    let my_special_variable = compute_result(42);\n}\n"}),
+            &context,
+        )
+        .unwrap();
+
+    let result = registry
+        .execute(
+            "Edit",
+            &json!({
+                "path":"src/main.rs",
+                "old_string":"let my_special_variable = compute_result(input_value);",
+                "new_string":"let my_special_variable = compute_result(7);"
+            }),
+            &context,
+        )
+        .unwrap();
+
+    assert!(result.contains("token-anchor fallback"));
+    let updated = fs::read_to_string(dir.path().join("src/main.rs")).unwrap();
+    assert!(updated.contains("compute_result(7)"));
+}
+
+#[test]
 fn plan_mode_only_allows_plan_file_writes() {
     let dir = tempdir().unwrap();
     let plan_path = dir.path().join(".anvil/plans/plan.md");

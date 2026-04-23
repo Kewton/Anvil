@@ -9,6 +9,7 @@ use anvil::model_registry::RuntimeModels;
 use anvil::ollama::client::OllamaClient;
 use anvil::session::store::SessionStore;
 use anvil::{compute_workspace_key, ensure_state_dirs, resolve_session_id};
+use serde_json::Value;
 use tempfile::tempdir;
 
 #[test]
@@ -150,6 +151,50 @@ fn live_ollama_reaches_first_write_on_scaffolded_nextjs() {
     );
 }
 
+#[test]
+#[ignore = "requires live Ollama"]
+fn live_ollama_edit_fallback_handles_drifted_old_string() {
+    let temp = tempdir().unwrap();
+    let host =
+        env::var("ANVIL_E2E_OLLAMA_HOST").unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
+    let model = env::var("ANVIL_E2E_MODEL").unwrap_or_else(|_| "qwen3:8b".to_string());
+
+    let Some(client) = available_client_or_skip(&host, &model).unwrap() else {
+        return;
+    };
+
+    std::fs::create_dir_all(temp.path().join("src")).unwrap();
+    std::fs::write(
+        temp.path().join("src/main.ts"),
+        "export function main() {\n  const my_special_variable = compute_result(42);\n  return my_special_variable;\n}\n",
+    )
+    .unwrap();
+
+    let mut agent = new_agent(temp.path(), &host, &model, client, 8);
+    let prompt = "Do not call Read first. Use the Edit tool, not Write, on src/main.ts. Replace the line `const my_special_variable = compute_result(input_value);` with `const my_special_variable = compute_result(7);`. Keep the rest of the file unchanged.";
+    let retry_prompt = "Use Edit, not Write, on src/main.ts right now. Do not read first. Replace `const my_special_variable = compute_result(input_value);` with `const my_special_variable = compute_result(7);` and keep the rest unchanged.";
+    run_with_retry(&mut agent, prompt, retry_prompt).unwrap();
+
+    let content = std::fs::read_to_string(temp.path().join("src/main.ts")).unwrap();
+    assert!(content.contains("compute_result(7)"));
+
+    let session_json = find_latest_session_json(&temp.path().join(".anvil-state"));
+    let session: Value =
+        serde_json::from_str(&std::fs::read_to_string(session_json).unwrap()).unwrap();
+    let messages = session["messages"].as_array().unwrap();
+    assert!(messages.iter().any(|message| {
+        message["tool_calls"]
+            .as_array()
+            .is_some_and(|calls| calls.iter().any(|call| call["name"] == "Edit"))
+    }));
+    assert!(messages.iter().any(|message| {
+        message["role"] == "tool"
+            && message["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("token-anchor fallback"))
+    }));
+}
+
 fn available_client_or_skip(host: &str, model: &str) -> Result<Option<OllamaClient>, String> {
     let client = OllamaClient::new(host.to_string())?;
     let available = client.list_models()?;
@@ -221,4 +266,16 @@ fn assert_semantic_page_contents(page: &str, marker: &str) {
     assert!(page.contains(marker));
     assert!(!page.contains("Get started by editing"));
     assert!(!page.contains("next/font/google"));
+}
+
+fn find_latest_session_json(state_root: &Path) -> std::path::PathBuf {
+    let sessions_dir = state_root.join("sessions");
+    let mut candidates = std::fs::read_dir(&sessions_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("session.json"))
+        .filter(|path| path.exists())
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.pop().unwrap()
 }
