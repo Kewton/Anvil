@@ -25,6 +25,8 @@ pub struct OllamaClient {
 
 const SIDECAR_SUMMARY_TIMEOUT_SECS: u64 = 8;
 const SIDECAR_SUMMARY_MAX_PREDICT: usize = 384;
+const CLASSIFIER_TIMEOUT_SECS: u64 = 20;
+const CLASSIFIER_MAX_PREDICT: usize = 160;
 
 impl OllamaClient {
     pub fn new(base_url: String) -> Result<Self, String> {
@@ -164,6 +166,20 @@ impl OllamaClient {
             return Err("sidecar summary was empty".to_string());
         }
         Ok(summary.to_string())
+    }
+
+    pub fn classify_task_request(
+        &self,
+        model: &str,
+        messages: &[ConversationMessage],
+    ) -> Result<AssistantReply, String> {
+        let classifier_client = Self::new_with_timeout_and_options(
+            self.base_url.clone(),
+            CLASSIFIER_TIMEOUT_SECS,
+            self.context_window,
+            CLASSIFIER_MAX_PREDICT,
+        )?;
+        classifier_client.chat_text(model, messages)
     }
 
     fn generate_impl<F>(

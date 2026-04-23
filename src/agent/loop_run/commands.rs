@@ -312,6 +312,10 @@ fn heuristic_classified_task(input: &str) -> ClassifiedTask {
     }
 }
 
+fn classifier_model<'a>(main_model: &'a str, sidecar_model: Option<&'a str>) -> &'a str {
+    sidecar_model.unwrap_or(main_model)
+}
+
 fn parse_large_task_decision(raw: &str, request_hint: Option<&str>) -> Option<ClassifiedTask> {
     let body = extract_json_object(raw.trim())?;
     if let Ok(decision) = serde_json::from_str::<LargeTaskDecision>(body) {
@@ -796,6 +800,8 @@ impl Agent {
     }
 
     fn classify_large_task_with_main_model(&self, input: &str) -> Result<ClassifiedTask, String> {
+        let classifier_model =
+            classifier_model(&self.models.main, self.models.sidecar.as_deref());
         let messages = vec![
             ConversationMessage::system(
                 "You classify whether a user request for a local-first repository agent should go through planning before execution, and which act profile fits best. Reply with JSON only in this shape: {\"large_task\":true|false,\"task_profile\":\"generic\"|\"coding\"|\"content\"|\"ui\"|\"research\"}. Use task_profile=\"coding\" for code changes, software implementation, debugging, tests, build changes, or repository edits. Use task_profile=\"ui\" for user-facing interface, visual design, interaction design, motion, or layout-heavy work. Use task_profile=\"content\" for writing, rewriting, documentation quality, copy, structured text, or reader-facing improvements where output quality matters. Use task_profile=\"research\" for investigation, comparison, or analysis-heavy work. Use task_profile=\"generic\" only for broader mixed work that does not clearly fit the others. Use large_task=true for broad multi-step work that benefits from a plan before execution."
@@ -810,7 +816,10 @@ impl Agent {
         let max_attempts = 2usize;
         let mut last_error = None;
         for attempt in 1..=max_attempts {
-            match self.client.chat_text(&self.models.main, &messages) {
+            match self
+                .client
+                .classify_task_request(classifier_model, &messages)
+            {
                 Ok(reply) => {
                     if let Some(classified) = parse_large_task_decision(&reply.content, Some(input))
                     {
@@ -824,7 +833,7 @@ impl Agent {
                         "agent.classifier.error",
                         serde_json::json!({
                             "session_id": self.session_store.session_id(),
-                            "model": self.models.main,
+                            "model": classifier_model,
                             "input": input,
                             "attempt": attempt,
                             "kind": "parse",
@@ -840,7 +849,7 @@ impl Agent {
                         "agent.classifier.error",
                         serde_json::json!({
                             "session_id": self.session_store.session_id(),
-                            "model": self.models.main,
+                            "model": classifier_model,
                             "input": input,
                             "attempt": attempt,
                             "kind": if retryable { "transport" } else { "other" },
@@ -1650,6 +1659,12 @@ mod tests {
         assert!(!is_classifier_transport_error(
             "failed to parse large-task classifier response: nope"
         ));
+    }
+
+    #[test]
+    fn classifier_model_prefers_sidecar_when_available() {
+        assert_eq!(classifier_model("main-model", Some("sidecar-model")), "sidecar-model");
+        assert_eq!(classifier_model("main-model", None), "main-model");
     }
 
     #[test]
