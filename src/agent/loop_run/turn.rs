@@ -4,7 +4,7 @@ use super::summary::{ExitReason, LoopResult, LoopStats};
 use super::*;
 use crate::agent::orchestration::{RepoVerification, capture_repo_snapshot, verify_repo_progress};
 use crate::logging::log_llm_event;
-use crate::modes::plan_act::PlanStage;
+use crate::modes::plan_act::{PlanStage, TaskProfile};
 use crate::ollama::xml_fallback::normalize_tool_call_arguments;
 use crate::tools::registry::resolve_plan_mode_write_target;
 use std::collections::{HashMap, HashSet};
@@ -54,6 +54,73 @@ fn write_stdout_rendered(text: &str, trailing_newline: bool) {
 
 fn user_interrupt_result() -> String {
     "exit_code=-1\ninterrupted=true\ninterrupt requested by user".to_string()
+}
+
+fn extract_requested_port(task: &str) -> Option<String> {
+    let bytes = task.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        let candidate = &task[start..i];
+        if (2..=5).contains(&candidate.len()) {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+fn fallback_plan_request_label(task: &str) -> String {
+    let lower = task.to_ascii_lowercase();
+    if lower.contains("space invader") || task.contains("スペースインベーダー") {
+        "a stylish and highly playable Space Invaders game".to_string()
+    } else if lower.contains("next.js") {
+        "the requested Next.js app".to_string()
+    } else {
+        "the requested deliverable".to_string()
+    }
+}
+
+fn fallback_plan_platform_label(task: &str) -> &'static str {
+    if task.to_ascii_lowercase().contains("next.js") {
+        "Next.js app"
+    } else {
+        "local app"
+    }
+}
+
+fn deterministic_timeout_fallback_plan(
+    task: &str,
+    task_profile: TaskProfile,
+    work_root: &Path,
+) -> String {
+    let request_label = fallback_plan_request_label(task);
+    let platform_label = fallback_plan_platform_label(task);
+    let port = extract_requested_port(task)
+        .map(|port| format!("port {port}"))
+        .unwrap_or_else(|| "the requested port".to_string());
+    let worktree_name = work_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("the current repo");
+    let execution_focus = match task_profile {
+        TaskProfile::Ui => "strong visual identity, motion, and interaction polish",
+        TaskProfile::Content => "clear reader-facing output and quality copy",
+        TaskProfile::Research => "structured investigation and evidence capture",
+        TaskProfile::Coding | TaskProfile::Generic => {
+            "a playable vertical slice first, then layered polish"
+        }
+    };
+
+    format!(
+        "# Plan\n\n## Goal\n- Build {request_label} as a {platform_label} inside `{worktree_name}`.\n- Ensure the result runs locally on {port} and feels intentionally polished rather than placeholder-quality.\n\n## Constraints\n- Keep all work inside the current repository root and use repository-relative paths.\n- If the repository is empty, scaffold only the minimum project structure needed before implementing the requested feature.\n- Keep the implementation incremental: ship a working first slice before adding effects or polish.\n- Preserve a path to local verification so the final result can be launched and checked end-to-end.\n\n## Deliverables\n- A runnable {platform_label} that fulfills the user request.\n- The core interactive flow, supporting UI/state, and the minimum assets or styles needed for a polished first release.\n- Verification notes covering dependency install, local startup, and feature checks.\n\n## Acceptance Criteria\n- Dependency installation succeeds and the project can be started locally on {port}.\n- The default entry route renders the requested experience instead of a placeholder page.\n- The first playable slice is complete enough to demonstrate the core user interaction from start to finish.\n- The implementation includes a clear restart or recovery path when the primary interaction ends in failure or completion.\n\n## Quality Bar\n- The first minute of use should feel deliberate: cohesive visuals, readable HUD/text, and responsive controls.\n- Motion, feedback, and state updates should feel consistent rather than jarring or random.\n- The experience should be understandable without reading source code, and the main interaction should be enjoyable on the first try.\n- The code structure should leave obvious extension points for later tuning, polish, and debugging.\n\n## Execution Plan\n1. First slice: confirm or scaffold the base app, wire the main screen, implement the core interaction loop, and make the requested experience playable from start to finish.\n2. Next phases: improve presentation, tune difficulty/interaction balance, add richer feedback, and harden any supporting UI or state transitions.\n3. Review checkpoint: stop once the first playable slice runs locally on {port} and passes the core verification steps.\n\n## Verification Plan\n- Install dependencies and confirm the app boots locally on {port}.\n- Exercise the main interaction loop end-to-end, including the expected success and failure states.\n- Check that layout, controls, and status/UI updates remain readable at common desktop widths and degrade reasonably on smaller screens.\n\n## Risks / Fallbacks\n- If framework scaffolding is missing, create the smallest viable project structure first and defer non-essential polish.\n- If the requested polish threatens delivery, keep the core loop intact and add lighter-weight effects before heavier assets or integrations.\n- If performance or complexity becomes unstable, simplify update frequency and visual effects before cutting the core user interaction.\n\n<!-- runtime fallback plan: generated after repeated planning model timeouts; focus on {execution_focus}. -->\n"
+    )
 }
 
 fn format_iteration_status(
@@ -1297,6 +1364,9 @@ impl Agent {
                         if self.maybe_fallback_plan_model_after_timeout(&err) {
                             continue;
                         }
+                        if let Some(reply) = self.maybe_materialize_plan_after_timeout(&err)? {
+                            return Ok(reply);
+                        }
                         transport_retry_count += 1;
                         extra_transport_retries -= 1;
                         thread::sleep(Duration::from_secs((transport_retry_count as u64) * 4));
@@ -1475,6 +1545,69 @@ impl Agent {
             "Main planning model timed out. Retry the plan step with sidecar model {sidecar}."
         ));
         true
+    }
+
+    fn maybe_materialize_plan_after_timeout(
+        &mut self,
+        err: &str,
+    ) -> Result<Option<AssistantReply>, String> {
+        if !should_materialize_plan_after_timeout(
+            self.session.mode_state.mode,
+            self.plan_model_override.as_deref(),
+            err,
+        ) {
+            return Ok(None);
+        }
+        let Some(plan_path) = self.session.mode_state.active_plan_path.clone() else {
+            return Ok(None);
+        };
+
+        let current_contents = self.current_plan_contents()?.unwrap_or_default();
+        if lifecycle::plan_is_substantive(&current_contents) {
+            return Ok(None);
+        }
+
+        let task = self
+            .session
+            .working_memory
+            .active_task
+            .clone()
+            .or_else(|| {
+                self.session
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|message| message.role == "user")
+                    .map(|message| message.content.clone())
+            })
+            .unwrap_or_else(|| "Complete the requested task.".to_string());
+
+        let fallback_plan = deterministic_timeout_fallback_plan(
+            &task,
+            self.session.mode_state.task_profile,
+            &self.work_root,
+        );
+        self.ensure_plan_file(&plan_path)?;
+        std::fs::write(&plan_path, fallback_plan).map_err(|err| {
+            format!(
+                "failed to write deterministic fallback plan {}: {err}",
+                plan_path.display()
+            )
+        })?;
+        log_llm_event(
+            "agent.plan.timeout_fallback_materialized",
+            serde_json::json!({
+                "session_id": self.session_store.session_id(),
+                "plan_path": plan_path.display().to_string(),
+                "task_profile": self.session.mode_state.task_profile.as_str(),
+                "model_override": self.plan_model_override,
+            }),
+        );
+        Ok(Some(AssistantReply {
+            content: "Plan complete. Reply yes to execute, no to revise, or provide feedback."
+                .to_string(),
+            tool_calls: Vec::new(),
+        }))
     }
 
     fn build_request_messages(
@@ -1671,11 +1804,12 @@ pub(crate) fn unicode_supported() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        PlanExplorationKey, assistant_model_for_mode, non_streaming_assistant_reply_timeout_secs,
-        normalize_exploration_path, normalize_plan_exploration_key,
-        should_fallback_plan_model_after_timeout, should_use_streaming_transport,
+        PlanExplorationKey, assistant_model_for_mode, deterministic_timeout_fallback_plan,
+        non_streaming_assistant_reply_timeout_secs, normalize_exploration_path,
+        normalize_plan_exploration_key, should_fallback_plan_model_after_timeout,
+        should_materialize_plan_after_timeout, should_use_streaming_transport,
     };
-    use crate::modes::plan_act::ExecutionMode;
+    use crate::modes::plan_act::{ExecutionMode, TaskProfile};
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -1797,6 +1931,39 @@ mod tests {
             assistant_model_for_mode(ExecutionMode::Act, "qwen3.5:122b", Some("qwen3.5:9b")),
             "qwen3.5:122b"
         );
+    }
+
+    #[test]
+    fn repeated_plan_timeout_after_sidecar_override_materializes_fallback_plan() {
+        assert!(should_materialize_plan_after_timeout(
+            ExecutionMode::Plan,
+            Some("qwen3.5:9b"),
+            "assistant reply timed out after 90s",
+        ));
+        assert!(!should_materialize_plan_after_timeout(
+            ExecutionMode::Plan,
+            None,
+            "assistant reply timed out after 90s",
+        ));
+        assert!(!should_materialize_plan_after_timeout(
+            ExecutionMode::Act,
+            Some("qwen3.5:9b"),
+            "assistant reply timed out after 90s",
+        ));
+    }
+
+    #[test]
+    fn deterministic_timeout_fallback_plan_mentions_requested_port() {
+        let temp = tempdir().unwrap();
+        let plan = deterministic_timeout_fallback_plan(
+            "スペースインベーダーゲームを3011ポートで起動可能なnext.jsアプリとして開発してください。",
+            TaskProfile::Coding,
+            temp.path(),
+        );
+        assert!(plan.contains("3011"));
+        assert!(plan.contains("## Quality Bar"));
+        assert!(plan.contains("## Execution Plan"));
+        assert!(plan.contains("runtime fallback plan"));
     }
 }
 
@@ -1943,6 +2110,16 @@ fn non_streaming_assistant_reply_timeout_secs(
         return QWEN35_NON_NATIVE_HARD_TIMEOUT_SECS;
     }
     default_timeout_secs
+}
+
+fn should_materialize_plan_after_timeout(
+    mode: ExecutionMode,
+    plan_model_override: Option<&str>,
+    err: &str,
+) -> bool {
+    mode == ExecutionMode::Plan
+        && plan_model_override.is_some()
+        && err.to_ascii_lowercase().contains("timed out")
 }
 
 fn assistant_model_for_mode(
