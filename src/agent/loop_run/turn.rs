@@ -1312,7 +1312,12 @@ impl Agent {
             prompting::ToolProtocol::from_native_tools_enabled(self.native_tools_enabled);
         let native_tools_enabled = protocol.native_tools_enabled();
         let messages = self.build_request_messages(protocol);
-        let use_streaming_transport = stream_output || io::stdin().is_terminal();
+        let use_streaming_transport = should_use_streaming_transport(
+            &self.models.main,
+            native_tools_enabled,
+            stream_output,
+            io::stdin().is_terminal(),
+        );
 
         if use_streaming_transport {
             let mut first_chunk = true;
@@ -1590,7 +1595,10 @@ pub(crate) fn unicode_supported() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{PlanExplorationKey, normalize_exploration_path, normalize_plan_exploration_key};
+    use super::{
+        PlanExplorationKey, normalize_exploration_path, normalize_plan_exploration_key,
+        should_use_streaming_transport,
+    };
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -1632,6 +1640,26 @@ mod tests {
         let stage1 = normalize_plan_exploration_key("Glob", &args, temp.path(), "stage1").unwrap();
         let stage2 = normalize_plan_exploration_key("Glob", &args, temp.path(), "stage2").unwrap();
         assert_ne!(stage1, stage2);
+    }
+
+    #[test]
+    fn qwen35_generate_tool_path_uses_non_streaming_transport() {
+        assert!(!should_use_streaming_transport(
+            "qwen3.5:122b",
+            false,
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn native_tool_models_still_use_streaming_transport() {
+        assert!(should_use_streaming_transport(
+            "qwen3.6:27b-coding-nvfp4",
+            true,
+            false,
+            true,
+        ));
     }
 }
 
@@ -1749,6 +1777,25 @@ fn join_sections_for_progress(sections: &[&str]) -> String {
             parts.join(", ")
         }
     }
+}
+
+fn should_use_streaming_transport(
+    model: &str,
+    native_tools_enabled: bool,
+    stream_output: bool,
+    stdin_is_terminal: bool,
+) -> bool {
+    let wants_streaming = stream_output || stdin_is_terminal;
+    if !wants_streaming {
+        return false;
+    }
+
+    let normalized = model.trim().to_ascii_lowercase();
+    if !native_tools_enabled && normalized == "qwen3.5:122b" {
+        return false;
+    }
+
+    true
 }
 
 fn plan_sections_with_content(contents: &str) -> Vec<&'static str> {

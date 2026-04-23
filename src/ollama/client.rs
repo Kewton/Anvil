@@ -44,6 +44,7 @@ impl OllamaClient {
         max_predict: usize,
     ) -> Result<Self, String> {
         let http = Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(timeout_secs))
             .timeout(std::time::Duration::from_secs(timeout_secs))
             .build()
             .map_err(|err| format!("failed to create HTTP client: {err}"))?;
