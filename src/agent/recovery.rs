@@ -130,6 +130,12 @@ pub fn repo_change_recovery_note(attempt: usize) -> String {
 }
 
 pub fn tool_call_format_recovery_note(error: &str, attempt: usize) -> String {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("truncated tool call") {
+        return format!(
+            "Previous tool call was cut off by the model length limit: {error}. On the next turn, do not retry another large full-file Write. First call Read on the target file, then make exactly one small Edit or a short Write with complete JSON. Keep the tool call compact and self-contained, and do not inline a large code body in one response. tool_call_format_attempt={attempt}"
+        );
+    }
     format!(
         "Previous tool call failed to parse: {error}. On the next turn, emit exactly one valid <anvil_tool_call>{{\"name\":\"Tool\",\"arguments\":{{...}}}}</anvil_tool_call> block with complete JSON. Keep the tool call small. Start with one small, self-contained change only, and prefer short Write or Edit actions over large full-file outputs. tool_call_format_attempt={attempt}"
     )
@@ -269,4 +275,18 @@ pub fn tool_call_counts_as_repo_edit(name: &str) -> bool {
 
 pub fn should_block_restart_discovery(tool_name: &str, progress_exists: bool) -> bool {
     progress_exists && matches!(tool_name, "Glob" | "Bash")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tool_call_format_recovery_note;
+
+    #[test]
+    fn truncated_tool_call_note_pushes_read_then_small_edit() {
+        let note =
+            tool_call_format_recovery_note("tool call parser failed: truncated tool call", 1);
+        assert!(note.contains("First call Read"), "got: {note}");
+        assert!(note.contains("small Edit"), "got: {note}");
+        assert!(note.contains("full-file Write"), "got: {note}");
+    }
 }

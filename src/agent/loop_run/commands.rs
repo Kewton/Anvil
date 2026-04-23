@@ -209,6 +209,15 @@ fn infer_task_profile_from_text(raw: &str) -> TaskProfile {
         || lower.contains("test")
         || lower.contains("fix")
         || lower.contains("refactor")
+        || lower.contains("next.js")
+        || lower.contains("react")
+        || lower.contains("typescript")
+        || lower.contains("web app")
+        || lower.contains("app router")
+        || lower.contains("single-page")
+        || lower.contains("game")
+        || raw.contains("アプリ")
+        || raw.contains("ゲーム")
         || raw.contains("コード")
         || raw.contains("実装")
         || raw.contains("修正")
@@ -1647,6 +1656,16 @@ mod tests {
                 large_task: true,
                 task_profile: TaskProfile::Content,
             })
+        );
+    }
+
+    #[test]
+    fn infers_coding_profile_for_nextjs_app_requests() {
+        assert_eq!(
+            infer_task_profile_from_text(
+                "Next.js アプリとしてスペースインベーダーゲームを開発してください。"
+            ),
+            TaskProfile::Coding
         );
     }
 
