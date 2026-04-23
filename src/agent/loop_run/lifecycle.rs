@@ -1,4 +1,5 @@
 use super::*;
+use crate::logging::log_llm_event;
 use crate::modes::plan_act::PlanStage;
 use serde_json::Value;
 
@@ -372,8 +373,21 @@ impl Agent {
         let Some(contents) = self.current_plan_contents()? else {
             return Ok(None);
         };
+        let previous_stage = self.session.mode_state.plan_stage;
         let stage = current_plan_stage(&contents);
         self.session.mode_state.plan_stage = stage;
+        if stage != previous_stage {
+            log_llm_event(
+                "agent.plan.stage_changed",
+                serde_json::json!({
+                    "session_id": self.session_store.session_id(),
+                    "from": previous_stage.as_str(),
+                    "to": stage.as_str(),
+                    "next_sections": plan_next_stage_sections(&contents),
+                    "missing_sections": plan_missing_sections(&contents),
+                }),
+            );
+        }
         Ok(Some(stage))
     }
 

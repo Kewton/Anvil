@@ -4,6 +4,7 @@ use super::summary::{ExitReason, LoopResult, LoopStats};
 use super::*;
 use crate::agent::orchestration::{RepoVerification, capture_repo_snapshot, verify_repo_progress};
 use crate::logging::log_llm_event;
+use crate::modes::plan_act::PlanStage;
 use crate::ollama::xml_fallback::normalize_tool_call_arguments;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -140,6 +141,29 @@ fn normalize_exploration_path(raw_path: &str, work_root: &Path) -> String {
     }
 
     raw_path.trim().replace('\\', "/")
+}
+
+fn log_plan_stall(
+    session_id: &str,
+    iter: usize,
+    reason: &str,
+    stage: PlanStage,
+    next_sections: &[&str],
+    missing_sections: &[&str],
+    attempt: usize,
+) {
+    log_llm_event(
+        "agent.plan.stalled",
+        serde_json::json!({
+            "session_id": session_id,
+            "iter": iter,
+            "reason": reason,
+            "stage": stage.as_str(),
+            "next_sections": next_sections,
+            "missing_sections": missing_sections,
+            "attempt": attempt,
+        }),
+    );
 }
 
 fn build_stats(
@@ -379,6 +403,19 @@ impl Agent {
                             .and_then(|key| {
                                 let count = plan_exploration_counts.entry(key.clone()).or_insert(0);
                                 *count += 1;
+                                if *count == PLAN_REPEATED_EXPLORATION_BLOCK_THRESHOLD {
+                                    log_llm_event(
+                                        "agent.plan.repeated_exploration_detected",
+                                        serde_json::json!({
+                                            "session_id": self.session_store.session_id(),
+                                            "iter": last_iter,
+                                            "stage": key.stage,
+                                            "tool": key.tool_name,
+                                            "normalized_args": key.normalized_args,
+                                            "count": *count,
+                                        }),
+                                    );
+                                }
                                 Some(*count >= PLAN_REPEATED_EXPLORATION_BLOCK_THRESHOLD)
                             })
                             .unwrap_or(false)
@@ -488,6 +525,17 @@ impl Agent {
                             .flatten()
                             .map(|contents| lifecycle::plan_next_stage_sections(&contents))
                             .unwrap_or_default();
+                        log_llm_event(
+                            "agent.plan.guard_blocked",
+                            serde_json::json!({
+                                "session_id": self.session_store.session_id(),
+                                "iter": last_iter,
+                                "tool": tool_name,
+                                "reason": "exploration_budget",
+                                "stage": current_plan_stage.as_str(),
+                                "budget": plan_exploration_budget,
+                            }),
+                        );
                         recovery::plan_stage_budget_error(
                             current_plan_stage,
                             &next_sections,
@@ -559,6 +607,15 @@ impl Agent {
                                 let missing_sections = lifecycle::plan_missing_sections(&contents);
                                 if !missing_sections.is_empty() {
                                     plan_progress_retries += 1;
+                                    log_plan_stall(
+                                        self.session_store.session_id(),
+                                        last_iter,
+                                        "exploration_only_turn",
+                                        current_stage,
+                                        &next_sections,
+                                        &missing_sections,
+                                        plan_progress_retries,
+                                    );
                                     self.push_system_note(recovery::plan_progress_recovery_note(
                                         current_stage,
                                         &next_sections,
@@ -586,6 +643,15 @@ impl Agent {
                                         lifecycle::plan_missing_sections(&contents);
                                     if !missing_sections.is_empty() {
                                         plan_progress_retries += 1;
+                                        log_plan_stall(
+                                            self.session_store.session_id(),
+                                            last_iter,
+                                            "repeated_exploration_only_turns",
+                                            current_stage,
+                                            &next_sections,
+                                            &missing_sections,
+                                            plan_progress_retries,
+                                        );
                                         self.push_system_note(
                                             recovery::plan_progress_recovery_note(
                                                 current_stage,
@@ -653,6 +719,15 @@ impl Agent {
                         break 'outer;
                     }
                     let missing_sections = lifecycle::plan_missing_sections(&plan_contents);
+                    log_plan_stall(
+                        self.session_store.session_id(),
+                        last_iter,
+                        "empty_reply",
+                        current_stage,
+                        &next_sections,
+                        &missing_sections,
+                        plan_progress_retries,
+                    );
                     self.push_system_note(recovery::plan_progress_recovery_note(
                         current_stage,
                         &next_sections,
@@ -697,6 +772,16 @@ impl Agent {
                         error_text = exit_reason.default_error_text().to_string();
                         break 'outer;
                     }
+                    let missing_sections = lifecycle::plan_missing_sections(&plan_contents);
+                    log_plan_stall(
+                        self.session_store.session_id(),
+                        last_iter,
+                        "no_tool_reply",
+                        current_stage,
+                        &next_sections,
+                        &missing_sections,
+                        plan_progress_retries,
+                    );
                     self.push_system_note(recovery::plan_no_tool_recovery_note(
                         current_stage,
                         &next_sections,
@@ -748,6 +833,15 @@ impl Agent {
                         error_text = exit_reason.default_error_text().to_string();
                         break 'outer;
                     }
+                    log_plan_stall(
+                        self.session_store.session_id(),
+                        last_iter,
+                        "plan_incomplete_after_reply",
+                        current_stage,
+                        &next_sections,
+                        &missing_sections,
+                        plan_progress_retries,
+                    );
                     self.push_system_note(recovery::plan_progress_recovery_note(
                         current_stage,
                         &next_sections,
