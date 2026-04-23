@@ -106,18 +106,74 @@ fn extract_json_object(raw: &str) -> Option<&str> {
     (end > start).then_some(&raw[start..=end])
 }
 
-fn parse_large_task_decision(raw: &str) -> Option<ClassifiedTask> {
+fn parse_task_profile(raw: Option<&str>) -> TaskProfile {
+    match raw {
+        Some("coding") => TaskProfile::Coding,
+        Some("content") => TaskProfile::Content,
+        Some("ui") => TaskProfile::Ui,
+        Some("research") => TaskProfile::Research,
+        _ => TaskProfile::Generic,
+    }
+}
+
+fn infer_task_profile_from_text(raw: &str) -> TaskProfile {
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("readme")
+        || lower.contains("markdown")
+        || lower.contains("documentation")
+        || lower.contains("docs")
+        || lower.contains("copy")
+        || raw.contains("README")
+        || raw.contains("文章")
+        || raw.contains("説明")
+        || raw.contains("改善")
+        || raw.contains("ドキュメント")
+    {
+        TaskProfile::Content
+    } else if lower.contains("ui")
+        || lower.contains("ux")
+        || lower.contains("design")
+        || lower.contains("layout")
+        || lower.contains("screen")
+        || raw.contains("画面")
+        || raw.contains("見た目")
+        || raw.contains("デザイン")
+    {
+        TaskProfile::Ui
+    } else if lower.contains("research")
+        || lower.contains("investigate")
+        || lower.contains("analysis")
+        || lower.contains("compare")
+        || raw.contains("調査")
+        || raw.contains("分析")
+        || raw.contains("比較")
+    {
+        TaskProfile::Research
+    } else if lower.contains("code")
+        || lower.contains("implement")
+        || lower.contains("debug")
+        || lower.contains("build")
+        || lower.contains("test")
+        || lower.contains("fix")
+        || lower.contains("refactor")
+        || raw.contains("コード")
+        || raw.contains("実装")
+        || raw.contains("修正")
+        || raw.contains("テスト")
+        || raw.contains("ビルド")
+    {
+        TaskProfile::Coding
+    } else {
+        TaskProfile::Generic
+    }
+}
+
+fn parse_large_task_decision(raw: &str, request_hint: Option<&str>) -> Option<ClassifiedTask> {
     let body = extract_json_object(raw.trim())?;
     if let Ok(decision) = serde_json::from_str::<LargeTaskDecision>(body) {
         return Some(ClassifiedTask {
             large_task: decision.large_task,
-            task_profile: match decision.task_profile.as_deref() {
-                Some("coding") => TaskProfile::Coding,
-                Some("content") => TaskProfile::Content,
-                Some("ui") => TaskProfile::Ui,
-                Some("research") => TaskProfile::Research,
-                _ => TaskProfile::Generic,
-            },
+            task_profile: parse_task_profile(decision.task_profile.as_deref()),
         });
     }
 
@@ -129,10 +185,34 @@ fn parse_large_task_decision(raw: &str) -> Option<ClassifiedTask> {
         .get("steps")
         .and_then(serde_json::Value::as_array)
         .map_or(0, |steps| steps.len());
-    if matches!(action, Some("create_plan")) || (has_plan && step_count >= 2) {
+    let profile_hint = object
+        .get("task_profile")
+        .and_then(serde_json::Value::as_str)
+        .map(|value| value.to_string())
+        .or_else(|| {
+            object
+                .get("action_input")
+                .and_then(serde_json::Value::as_str)
+                .map(|value| value.to_string())
+        })
+        .or_else(|| {
+            object
+                .get("plan")
+                .and_then(serde_json::Value::as_str)
+                .map(|value| value.to_string())
+        });
+    if matches!(action, Some("create_plan" | "write_plan")) || (has_plan && step_count >= 2) {
+        let inferred_profile = parse_task_profile(profile_hint.as_deref());
+        let fallback_profile = if inferred_profile == TaskProfile::Generic {
+            infer_task_profile_from_text(
+                request_hint.unwrap_or_else(|| profile_hint.as_deref().unwrap_or(raw)),
+            )
+        } else {
+            inferred_profile
+        };
         return Some(ClassifiedTask {
             large_task: true,
-            task_profile: TaskProfile::Generic,
+            task_profile: fallback_profile,
         });
     }
 
@@ -543,7 +623,7 @@ impl Agent {
             )),
         ];
         let reply = self.client.chat_text(&self.models.main, &messages)?;
-        parse_large_task_decision(&reply.content).ok_or_else(|| {
+        parse_large_task_decision(&reply.content, Some(input)).ok_or_else(|| {
             format!(
                 "failed to parse large-task classifier response: {}",
                 reply.content.trim()
@@ -1239,7 +1319,7 @@ mod tests {
     #[test]
     fn parses_large_task_classifier_json() {
         assert_eq!(
-            parse_large_task_decision(r#"{"large_task":true}"#),
+            parse_large_task_decision(r#"{"large_task":true}"#, None),
             Some(ClassifiedTask {
                 large_task: true,
                 task_profile: TaskProfile::Generic,
@@ -1247,14 +1327,15 @@ mod tests {
         );
         assert_eq!(
             parse_large_task_decision(
-                "```json\n{\"large_task\":false,\"task_profile\":\"coding\"}\n```"
+                "```json\n{\"large_task\":false,\"task_profile\":\"coding\"}\n```",
+                None,
             ),
             Some(ClassifiedTask {
                 large_task: false,
                 task_profile: TaskProfile::Coding,
             })
         );
-        assert_eq!(parse_large_task_decision("not json"), None);
+        assert_eq!(parse_large_task_decision("not json", None), None);
     }
 
     #[test]
@@ -1265,11 +1346,29 @@ mod tests {
                     "action":"create_plan",
                     "plan":"README improvement process",
                     "steps":["draft","edit","verify"]
-                }"#
+                }"#,
+                None,
             ),
             Some(ClassifiedTask {
                 large_task: true,
-                task_profile: TaskProfile::Generic,
+                task_profile: TaskProfile::Content,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_large_task_classifier_write_plan_fallback_shape() {
+        assert_eq!(
+            parse_large_task_decision(
+                r#"{
+                    "action":"write_plan",
+                    "action_input":"README.md を改善する3段階の作業です"
+                }"#,
+                None,
+            ),
+            Some(ClassifiedTask {
+                large_task: true,
+                task_profile: TaskProfile::Content,
             })
         );
     }
