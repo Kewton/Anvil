@@ -479,7 +479,7 @@ fn footer_known_incompatible_terminal(
             .any(|value| value.contains("commandmate"))
 }
 
-fn footer_terminal_is_compatible() -> bool {
+pub(crate) fn footer_terminal_is_compatible() -> bool {
     let term_program = std::env::var("TERM_PROGRAM").ok();
     let lc_terminal = std::env::var("LC_TERMINAL").ok();
     let term = std::env::var("TERM").ok();

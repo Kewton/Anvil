@@ -3,7 +3,7 @@ use super::summary::{ExitReason, format_run_summary};
 use super::*;
 use crate::config::LogLevel;
 use crate::logging::log_llm_event;
-use crate::modes::plan_act::TaskProfile;
+use crate::modes::plan_act::{PlanStage, TaskProfile};
 use crate::session::store::ConversationMessage;
 use crossterm::event::{self, Event, KeyCode};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
@@ -102,6 +102,13 @@ struct ClassifiedTask {
     task_profile: TaskProfile,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlanApprovalChoice {
+    Execute,
+    Revise,
+    Feedback,
+}
+
 fn extract_json_object(raw: &str) -> Option<&str> {
     let start = raw.find('{')?;
     let end = raw.rfind('}')?;
@@ -115,6 +122,29 @@ fn parse_task_profile(raw: Option<&str>) -> TaskProfile {
         Some("ui") => TaskProfile::Ui,
         Some("research") => TaskProfile::Research,
         _ => TaskProfile::Generic,
+    }
+}
+
+fn parse_plan_approval_choice(input: &str) -> Option<PlanApprovalChoice> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" | "execute" => Some(PlanApprovalChoice::Execute),
+        "n" | "no" | "revise" => Some(PlanApprovalChoice::Revise),
+        "o" | "other" | "feedback" => Some(PlanApprovalChoice::Feedback),
+        _ => None,
+    }
+}
+
+fn plan_stage_status_line(stage: PlanStage, next_sections: &[&str]) -> String {
+    let focus = if next_sections.is_empty() {
+        lifecycle::plan_stage_sections(stage).join(", ")
+    } else {
+        next_sections.join(", ")
+    };
+    match stage {
+        PlanStage::Stage1 => format!("Stage 1: bootstrap {focus}"),
+        PlanStage::Stage2 => format!("Stage 2: define {focus}"),
+        PlanStage::Stage3 => format!("Stage 3: complete {focus}"),
+        PlanStage::Ready => "Ready: wait for approval or feedback".to_string(),
     }
 }
 
@@ -375,12 +405,6 @@ pub(crate) fn is_plan_rejection_request(input: &str) -> bool {
     matches!(normalized.as_str(), "no" | "n") || matches!(trimmed, "いいえ" | "だめ" | "却下")
 }
 
-enum PlanApprovalChoice {
-    Execute,
-    Revise,
-    Feedback,
-}
-
 /// Replace control characters (C0, DEL, and C1) with spaces, then trim trailing
 /// whitespace. Mirrors `turn::sanitize_for_progress` so that model-derived
 /// text (model banner, cwd, log path) cannot inject newlines or ANSI escapes
@@ -603,6 +627,9 @@ impl Agent {
         }
 
         let _footer_freeze = self.footer.freeze_for_prompt();
+        if !super::footer::footer_terminal_is_compatible() {
+            return self.prompt_for_plan_approval_choice_plain();
+        }
         let options = [("yes", "execute"), ("no", "revise"), ("other", "feedback")];
         let mut selected = 0usize;
         let redraw = |selected: usize| {
@@ -669,6 +696,21 @@ impl Agent {
         Ok(choice)
     }
 
+    fn prompt_for_plan_approval_choice_plain(&self) -> Result<Option<PlanApprovalChoice>, String> {
+        println!("plan approval:");
+        println!("  yes   execute");
+        println!("  no    revise");
+        println!("  other feedback");
+        print!("select [yes/no/other]: ");
+        let _ = io::stdout().flush();
+
+        let mut input = String::new();
+        io::stdin()
+            .read_line(&mut input)
+            .map_err(|err| format!("failed to read plan approval choice: {err}"))?;
+        Ok(parse_plan_approval_choice(&input))
+    }
+
     fn enter_plan_mode(&mut self, task_profile: TaskProfile) -> Result<String, String> {
         if self.session.mode_state.mode == ExecutionMode::Plan {
             let current = self
@@ -695,7 +737,14 @@ impl Agent {
             self.config.log_level,
             self.config.yes_mode,
         );
-        Ok(format!("plan mode: {}", plan_path.display()))
+        let stage = self.session.mode_state.plan_stage;
+        let next_sections = lifecycle::plan_stage_sections(stage);
+        Ok(format!(
+            "plan mode: {}\nplanning now: building the implementation plan before coding ({})\n{}",
+            plan_path.display(),
+            task_profile.as_str(),
+            plan_stage_status_line(stage, next_sections)
+        ))
     }
 
     fn approve_plan_mode(&mut self) -> Result<String, String> {
@@ -1184,9 +1233,10 @@ The plan must still define: (1) the first shippable vertical slice, (2) concrete
                             if next_sections.is_empty() {
                                 println!("plan in progress: continue refining the plan");
                             } else {
+                                let stage = lifecycle::current_plan_stage(&plan_contents);
                                 println!(
-                                    "plan in progress: next fill {}",
-                                    next_sections.join(", ")
+                                    "plan in progress: {}",
+                                    plan_stage_status_line(stage, &next_sections)
                                 );
                             }
                         }
@@ -1611,6 +1661,35 @@ mod tests {
         assert!(is_plan_rejection_request("no"));
         assert!(is_plan_rejection_request("いいえ。"));
         assert!(!is_plan_rejection_request("計画をもう少し詳しくして"));
+    }
+
+    #[test]
+    fn parses_plan_approval_choice_aliases() {
+        assert_eq!(
+            parse_plan_approval_choice("yes"),
+            Some(PlanApprovalChoice::Execute)
+        );
+        assert_eq!(
+            parse_plan_approval_choice("n"),
+            Some(PlanApprovalChoice::Revise)
+        );
+        assert_eq!(
+            parse_plan_approval_choice("feedback"),
+            Some(PlanApprovalChoice::Feedback)
+        );
+        assert_eq!(parse_plan_approval_choice("maybe"), None);
+    }
+
+    #[test]
+    fn plan_stage_status_line_describes_focus() {
+        assert_eq!(
+            plan_stage_status_line(PlanStage::Stage1, &["Goal", "Constraints"]),
+            "Stage 1: bootstrap Goal, Constraints"
+        );
+        assert_eq!(
+            plan_stage_status_line(PlanStage::Stage3, &["Execution Plan"]),
+            "Stage 3: complete Execution Plan"
+        );
     }
 
     #[test]

@@ -1400,23 +1400,155 @@ fn tool_display(
             .unwrap_or_else(|_| path.to_string())
     };
 
+    let path_display = sanitize_for_progress(&relativize(str_arg("path")));
     match tool_name {
         "Write" => {
-            let display = sanitize_for_progress(&relativize(str_arg("path")));
+            let content = arguments
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let summary = plan_progress_summary("Write", &path_display, content)
+                .map(|summary| format!("{path_display} <- {summary}"))
+                .unwrap_or_else(|| path_display.clone());
+            let preview = text_preview(content, 50);
+            let display = if preview.is_empty() {
+                summary
+            } else {
+                format!("{summary} :: \"{preview}\"")
+            };
             let extra = arguments
                 .get("content")
                 .and_then(serde_json::Value::as_str)
                 .map(|c| format!("{}B", c.len()));
-            (display, extra)
+            (truncate(&display, arg_budget), extra)
         }
-        "Edit" | "Read" => (sanitize_for_progress(&relativize(str_arg("path"))), None),
+        "Edit" => {
+            let new_text = arguments
+                .get("new_string")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let summary = plan_progress_summary("Edit", &path_display, new_text)
+                .map(|summary| format!("{path_display} <- {summary}"))
+                .unwrap_or_else(|| path_display.clone());
+            let preview = text_preview(new_text, 50);
+            let display = if preview.is_empty() {
+                summary
+            } else {
+                format!("{summary} :: \"{preview}\"")
+            };
+            (truncate(&display, arg_budget), None)
+        }
+        "Read" => {
+            let line_suffix = read_line_suffix(arguments);
+            let summary = if looks_like_plan_path(&path_display) {
+                format!("{path_display}{line_suffix} [plan review]")
+            } else {
+                format!("{path_display}{line_suffix}")
+            };
+            (truncate(&summary, arg_budget), None)
+        }
         "Bash" => {
             let sanitized = sanitize_for_progress(str_arg("command"));
             (truncate(&sanitized, arg_budget), None)
         }
-        "Glob" | "Grep" => (sanitize_for_progress(str_arg("pattern")), None),
-        _ => (sanitize_for_progress(tool_name), None),
+        "Glob" | "Grep" => (truncate(&sanitize_for_progress(str_arg("pattern")), arg_budget), None),
+        _ => (truncate(&sanitize_for_progress(tool_name), arg_budget), None),
     }
+}
+
+fn looks_like_plan_path(path: &str) -> bool {
+    let lowered = path.to_ascii_lowercase();
+    lowered.contains("/plans/plan-")
+        || lowered.contains("\\plans\\plan-")
+        || lowered.ends_with("/plan.md")
+        || lowered.ends_with("\\plan.md")
+}
+
+fn plan_progress_summary(tool_name: &str, path_display: &str, text: &str) -> Option<String> {
+    if !looks_like_plan_path(path_display) {
+        return None;
+    }
+    let mut sections = Vec::new();
+    for section in [
+        "Goal",
+        "Constraints",
+        "Deliverables",
+        "Acceptance Criteria",
+        "Quality Bar",
+        "Execution Plan",
+        "Verification Plan",
+        "Risks / Fallbacks",
+    ] {
+        if plan_section_has_content(text, section) {
+            sections.push(section);
+        }
+    }
+    if sections.is_empty() {
+        return Some(match tool_name {
+            "Read" => "review plan".to_string(),
+            "Edit" => "update plan".to_string(),
+            _ => "write plan".to_string(),
+        });
+    }
+    let shown = sections.into_iter().take(3).collect::<Vec<_>>();
+    Some(shown.join(", "))
+}
+
+fn plan_section_has_content(contents: &str, target: &str) -> bool {
+    let mut in_section = false;
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if let Some(heading) = trimmed.strip_prefix("## ") {
+            in_section = normalize_plan_heading_for_progress(heading) == target;
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        if trimmed.is_empty()
+            || trimmed == "-"
+            || matches!(
+                trimmed,
+                "1." | "2." | "3." | "1. First slice:" | "2. Next phases:" | "3. Review checkpoint:"
+            )
+        {
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
+fn normalize_plan_heading_for_progress(heading: &str) -> &str {
+    match heading.trim() {
+        "Risks/Fallbacks" => "Risks / Fallbacks",
+        "実行計画" | "実装計画" | "実装フェーズ" => "Execution Plan",
+        "検証計画" => "Verification Plan",
+        "リスク/フォールバック" | "リスク・フォールバック" | "リスク / フォールバック" => {
+            "Risks / Fallbacks"
+        }
+        other => other,
+    }
+}
+
+fn read_line_suffix(arguments: &serde_json::Value) -> String {
+    let start = arguments.get("start_line").and_then(serde_json::Value::as_u64);
+    let end = arguments.get("end_line").and_then(serde_json::Value::as_u64);
+    match (start, end) {
+        (Some(start), Some(end)) if start == end => format!(":{start}"),
+        (Some(start), Some(end)) => format!(":{start}-{end}"),
+        (Some(start), None) => format!(":{start}-"),
+        (None, Some(end)) => format!(":1-{end}"),
+        (None, None) => String::new(),
+    }
+}
+
+fn text_preview(text: &str, max_chars: usize) -> String {
+    let collapsed = sanitize_for_progress(text)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    truncate(&collapsed, max_chars)
 }
 
 /// Compute the argument-summary budget for a progress line given the current
@@ -1574,7 +1706,7 @@ mod progress_tests {
         let work_root = PathBuf::from("/work");
         let args = json!({"path": "/work/src/foo.rs", "content": "hello"});
         let (display, extra) = tool_display("Write", &args, &work_root, 57);
-        assert_eq!(display, "src/foo.rs");
+        assert_eq!(display, "src/foo.rs :: \"hello\"");
         assert_eq!(extra, Some("5B".to_string()));
     }
 
@@ -1620,6 +1752,35 @@ mod progress_tests {
         let args = json!({"path": "/tmp/outside.txt"});
         let (display, _) = tool_display("Read", &args, &work_root, 57);
         assert_eq!(display, "/tmp/outside.txt");
+    }
+
+    #[test]
+    fn tool_display_plan_write_shows_sections() {
+        let work_root = PathBuf::from("/work");
+        let args = json!({
+            "path": "/work/.anvil-state/sessions/abc/plans/plan-1.md",
+            "content": "# Plan\n\n## Goal\n- Improve README.\n\n## Constraints\n- Keep markdown.\n\n## Deliverables\n- Updated README.\n"
+        });
+        let (display, extra) = tool_display("Write", &args, &work_root, 120);
+        assert!(display.contains("plans/plan-1.md <- Goal, Constraints, Deliverables"));
+        assert!(display.contains("\"# Plan ## Goal - Improve README."));
+        assert!(extra.is_some());
+    }
+
+    #[test]
+    fn tool_display_plan_read_marks_review() {
+        let work_root = PathBuf::from("/work");
+        let args = json!({"path": "/work/.anvil-state/sessions/abc/plans/plan-1.md"});
+        let (display, _) = tool_display("Read", &args, &work_root, 120);
+        assert_eq!(display, ".anvil-state/sessions/abc/plans/plan-1.md [plan review]");
+    }
+
+    #[test]
+    fn tool_display_read_includes_line_range() {
+        let work_root = PathBuf::from("/work");
+        let args = json!({"path": "/work/src/lib.rs", "start_line": 12, "end_line": 40});
+        let (display, _) = tool_display("Read", &args, &work_root, 120);
+        assert_eq!(display, "src/lib.rs:12-40");
     }
 
     #[test]
