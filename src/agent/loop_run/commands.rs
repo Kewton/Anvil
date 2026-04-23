@@ -8,6 +8,7 @@ use crate::session::store::ConversationMessage;
 use crossterm::event::{self, Event, KeyCode};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use serde::Deserialize;
+use std::time::Duration;
 
 /// First 8 characters of a session id, or the full id if shorter. Used for
 /// banner display so users get a stable short handle without exposing the
@@ -218,6 +219,17 @@ fn parse_large_task_decision(raw: &str, request_hint: Option<&str>) -> Option<Cl
     }
 
     None
+}
+
+fn is_classifier_transport_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("failed to contact ollama generate api")
+        || lower.contains("error sending request for url")
+        || lower.contains("connection reset")
+        || lower.contains("connection refused")
+        || lower.contains("broken pipe")
+        || lower.contains("operation timed out")
+        || lower.contains("timed out")
 }
 
 pub(crate) fn is_plan_execution_request(input: &str) -> bool {
@@ -631,13 +643,57 @@ impl Agent {
                 input
             )),
         ];
-        let reply = self.client.chat_text(&self.models.main, &messages)?;
-        parse_large_task_decision(&reply.content, Some(input)).ok_or_else(|| {
-            format!(
-                "failed to parse large-task classifier response: {}",
-                reply.content.trim()
-            )
-        })
+        let max_attempts = 2usize;
+        let mut last_error = None;
+        for attempt in 1..=max_attempts {
+            match self.client.chat_text(&self.models.main, &messages) {
+                Ok(reply) => {
+                    if let Some(classified) = parse_large_task_decision(&reply.content, Some(input))
+                    {
+                        return Ok(classified);
+                    }
+                    let error = format!(
+                        "failed to parse large-task classifier response: {}",
+                        reply.content.trim()
+                    );
+                    log_llm_event(
+                        "agent.classifier.error",
+                        serde_json::json!({
+                            "session_id": self.session_store.session_id(),
+                            "model": self.models.main,
+                            "input": input,
+                            "attempt": attempt,
+                            "kind": "parse",
+                            "retryable": false,
+                            "error": error,
+                        }),
+                    );
+                    return Err(error);
+                }
+                Err(err) => {
+                    let retryable = is_classifier_transport_error(&err);
+                    log_llm_event(
+                        "agent.classifier.error",
+                        serde_json::json!({
+                            "session_id": self.session_store.session_id(),
+                            "model": self.models.main,
+                            "input": input,
+                            "attempt": attempt,
+                            "kind": if retryable { "transport" } else { "other" },
+                            "retryable": retryable,
+                            "error": err,
+                        }),
+                    );
+                    if retryable && attempt < max_attempts {
+                        std::thread::sleep(Duration::from_millis(350));
+                        last_error = Some(err);
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| "classifier failed".to_string()))
     }
 
     fn maybe_auto_plan_prompt(&mut self, input: &str) -> Result<Option<String>, String> {
@@ -1395,6 +1451,17 @@ mod tests {
                 task_profile: TaskProfile::Content,
             })
         );
+    }
+
+    #[test]
+    fn detects_classifier_transport_errors() {
+        assert!(is_classifier_transport_error(
+            "failed to contact Ollama generate API: error sending request for url"
+        ));
+        assert!(is_classifier_transport_error("connection refused"));
+        assert!(!is_classifier_transport_error(
+            "failed to parse large-task classifier response: nope"
+        ));
     }
 
     #[test]
