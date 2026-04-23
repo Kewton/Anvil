@@ -9,12 +9,13 @@ use crate::ollama::xml_fallback::normalize_tool_call_arguments;
 use crate::tools::registry::resolve_plan_mode_write_target;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Maximum number of characters of tool-call arguments retained in trace logs.
 const LOG_ARGS_MAX_CHARS: usize = 200;
 const PLAN_REPEATED_EXPLORATION_BLOCK_THRESHOLD: usize = 2;
 const USER_INTERRUPT_ERROR: &str = "__anvil_user_interrupt__";
+const QWEN35_NON_NATIVE_HARD_TIMEOUT_SECS: u64 = 90;
 
 /// UTF-8-safe truncation: keeps at most `max` characters and appends `...`
 /// when the input was longer. Never splits a multi-byte code point.
@@ -1393,12 +1394,41 @@ impl Agent {
             }
             Ok(reply)
         } else {
-            self.client.chat_with_mode(
-                &self.models.main,
-                &messages,
-                self.tool_registry.specs(),
-                native_tools_enabled,
-            )
+            self.request_assistant_reply_non_streaming(&messages, native_tools_enabled)
+        }
+    }
+
+    fn request_assistant_reply_non_streaming(
+        &self,
+        messages: &[ConversationMessage],
+        native_tools_enabled: bool,
+    ) -> Result<AssistantReply, String> {
+        let client = self.client.clone();
+        let model = self.models.main.clone();
+        let tool_specs = self.tool_registry.specs().to_vec();
+        let owned_messages = messages.to_vec();
+        let timeout = Duration::from_secs(non_streaming_assistant_reply_timeout_secs(
+            &model,
+            native_tools_enabled,
+            client.timeout_secs(),
+        ));
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+
+        std::thread::spawn(move || {
+            let result =
+                client.chat_with_mode(&model, &owned_messages, &tool_specs, native_tools_enabled);
+            let _ = tx.send(result);
+        });
+
+        match rx.recv_timeout(timeout) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(format!(
+                "assistant reply timed out after {}s",
+                timeout.as_secs()
+            )),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err("assistant reply worker disconnected".to_string())
+            }
         }
     }
 
@@ -1596,8 +1626,8 @@ pub(crate) fn unicode_supported() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        PlanExplorationKey, normalize_exploration_path, normalize_plan_exploration_key,
-        should_use_streaming_transport,
+        PlanExplorationKey, non_streaming_assistant_reply_timeout_secs,
+        normalize_exploration_path, normalize_plan_exploration_key, should_use_streaming_transport,
     };
     use serde_json::json;
     use tempfile::tempdir;
@@ -1660,6 +1690,18 @@ mod tests {
             false,
             true,
         ));
+    }
+
+    #[test]
+    fn qwen35_non_native_requests_use_shorter_hard_timeout() {
+        assert_eq!(
+            non_streaming_assistant_reply_timeout_secs("qwen3.5:122b", false, 120),
+            90
+        );
+        assert_eq!(
+            non_streaming_assistant_reply_timeout_secs("qwen3.6:27b-coding-nvfp4", true, 120),
+            120
+        );
     }
 }
 
@@ -1796,6 +1838,18 @@ fn should_use_streaming_transport(
     }
 
     true
+}
+
+fn non_streaming_assistant_reply_timeout_secs(
+    model: &str,
+    native_tools_enabled: bool,
+    default_timeout_secs: u64,
+) -> u64 {
+    let normalized = model.trim().to_ascii_lowercase();
+    if !native_tools_enabled && normalized == "qwen3.5:122b" {
+        return QWEN35_NON_NATIVE_HARD_TIMEOUT_SECS;
+    }
+    default_timeout_secs
 }
 
 fn plan_sections_with_content(contents: &str) -> Vec<&'static str> {

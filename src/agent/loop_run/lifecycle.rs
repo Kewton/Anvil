@@ -146,6 +146,7 @@ pub(super) fn is_transport_error(error: &str) -> bool {
     let lower = error.to_ascii_lowercase();
     lower.contains("failed to contact ollama chat api")
         || lower.contains("error sending request for url")
+        || lower.contains("timed out")
         || lower.contains("connection reset")
         || lower.contains("connection refused")
         || lower.contains("broken pipe")

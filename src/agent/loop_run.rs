@@ -1,7 +1,6 @@
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::Duration;
 
 use crate::agent::prompting;
 use crate::agent::recovery;

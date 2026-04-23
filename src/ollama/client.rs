@@ -21,6 +21,7 @@ pub struct OllamaClient {
     http: Client,
     context_window: usize,
     max_predict: usize,
+    timeout_secs: u64,
 }
 
 const SIDECAR_SUMMARY_TIMEOUT_SECS: u64 = 8;
@@ -53,7 +54,12 @@ impl OllamaClient {
             http,
             context_window,
             max_predict,
+            timeout_secs,
         })
+    }
+
+    pub fn timeout_secs(&self) -> u64 {
+        self.timeout_secs
     }
 
     pub fn list_models(&self) -> Result<Vec<String>, String> {
