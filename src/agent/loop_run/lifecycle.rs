@@ -156,6 +156,14 @@ pub(super) fn is_transport_error(error: &str) -> bool {
 const PLAN_STAGE_ONE: &[&str] = &["Goal", "Constraints", "Deliverables"];
 const PLAN_STAGE_TWO: &[&str] = &["Acceptance Criteria", "Quality Bar"];
 const PLAN_STAGE_THREE: &[&str] = &["Execution Plan", "Verification Plan", "Risks / Fallbacks"];
+const QUALITY_BAR_ANCHOR_SECTIONS: &[&str] = &[
+    "Goal",
+    "Constraints",
+    "Deliverables",
+    "Acceptance Criteria",
+    "Execution Plan",
+    "Verification Plan",
+];
 
 pub(super) fn plan_stage_sections(stage: PlanStage) -> &'static [&'static str] {
     match stage {
@@ -219,13 +227,135 @@ fn plan_section_is_substantive(contents: &str, section: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn plan_section_is_complete(contents: &str, section: &str) -> bool {
+    if !plan_section_is_substantive(contents, section) {
+        return false;
+    }
+    if section == "Quality Bar" {
+        return quality_bar_has_repo_specific_anchor(contents);
+    }
+    true
+}
+
+fn quality_bar_has_repo_specific_anchor(contents: &str) -> bool {
+    let Some(body) = plan_section_body(contents, "Quality Bar") else {
+        return false;
+    };
+    let anchors = repo_specific_anchor_terms(contents);
+    if anchors.is_empty() {
+        return false;
+    }
+    substantive_plan_lines(&body).any(|line| {
+        let lowered = line.to_ascii_lowercase();
+        lowered.contains('`')
+            || lowered.contains('/')
+            || [".md", ".rs", ".ts", ".tsx", ".js", ".jsx", ".json", ".toml", ".py"]
+                .iter()
+                .any(|needle| lowered.contains(needle))
+            || tokenize_plan_terms(line)
+                .into_iter()
+                .any(|token| anchors.contains(&token))
+    })
+}
+
+fn repo_specific_anchor_terms(contents: &str) -> std::collections::HashSet<String> {
+    let mut anchors = std::collections::HashSet::new();
+    for section in QUALITY_BAR_ANCHOR_SECTIONS {
+        let Some(body) = plan_section_body(contents, section) else {
+            continue;
+        };
+        for line in substantive_plan_lines(&body) {
+            for token in tokenize_plan_terms(line) {
+                anchors.insert(token);
+            }
+        }
+    }
+    anchors
+}
+
+fn tokenize_plan_terms(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut previous_was_lower = false;
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            if ch.is_ascii_uppercase() && previous_was_lower && !current.is_empty() {
+                push_plan_term(&mut tokens, &mut current);
+            }
+            current.push(ch.to_ascii_lowercase());
+            previous_was_lower = ch.is_ascii_lowercase();
+        } else {
+            push_plan_term(&mut tokens, &mut current);
+            previous_was_lower = false;
+        }
+    }
+    push_plan_term(&mut tokens, &mut current);
+    tokens.sort();
+    tokens.dedup();
+    tokens
+}
+
+fn push_plan_term(tokens: &mut Vec<String>, current: &mut String) {
+    if current.len() >= 4 && !is_generic_plan_term(current) {
+        tokens.push(std::mem::take(current));
+    } else {
+        current.clear();
+    }
+}
+
+fn is_generic_plan_term(token: &str) -> bool {
+    matches!(
+        token,
+        "that"
+            | "this"
+            | "with"
+            | "from"
+            | "into"
+            | "keep"
+            | "preserve"
+            | "result"
+            | "quality"
+            | "plan"
+            | "phases"
+            | "phase"
+            | "review"
+            | "checkpoint"
+            | "criteria"
+            | "deliverables"
+            | "constraints"
+            | "execution"
+            | "verification"
+            | "fallback"
+            | "fallbacks"
+            | "risk"
+            | "risks"
+            | "concrete"
+            | "useful"
+            | "clear"
+            | "clearer"
+            | "generic"
+            | "specific"
+            | "reader"
+            | "maintainer"
+            | "current"
+            | "existing"
+            | "content"
+            | "section"
+            | "sections"
+            | "file"
+            | "files"
+            | "repo"
+            | "repository"
+    )
+}
+
 pub(super) fn plan_missing_sections(contents: &str) -> Vec<&'static str> {
     PLAN_STAGE_ONE
         .iter()
         .chain(PLAN_STAGE_TWO.iter())
         .chain(PLAN_STAGE_THREE.iter())
         .copied()
-        .filter(|section| !plan_section_is_substantive(contents, section))
+        .filter(|section| !plan_section_is_complete(contents, section))
         .collect()
 }
 
@@ -246,17 +376,17 @@ pub(super) fn plan_next_stage_sections(contents: &str) -> Vec<&'static str> {
 pub(super) fn current_plan_stage(contents: &str) -> PlanStage {
     if PLAN_STAGE_ONE
         .iter()
-        .any(|section| !plan_section_is_substantive(contents, section))
+        .any(|section| !plan_section_is_complete(contents, section))
     {
         PlanStage::Stage1
     } else if PLAN_STAGE_TWO
         .iter()
-        .any(|section| !plan_section_is_substantive(contents, section))
+        .any(|section| !plan_section_is_complete(contents, section))
     {
         PlanStage::Stage2
     } else if PLAN_STAGE_THREE
         .iter()
-        .any(|section| !plan_section_is_substantive(contents, section))
+        .any(|section| !plan_section_is_complete(contents, section))
     {
         PlanStage::Stage3
     } else {
@@ -288,7 +418,7 @@ pub(super) fn plan_is_approval_ready(contents: &str) -> bool {
         "Verification Plan",
     ]
     .into_iter()
-    .all(|section| plan_section_is_substantive(contents, section))
+    .all(|section| plan_section_is_complete(contents, section))
 }
 
 fn plan_needs_stage_three_fallback(contents: &str) -> bool {
@@ -595,6 +725,76 @@ mod tests {
 ## Risks / Fallbacks
 - 
 ";
+        assert!(plan_is_approval_ready(contents));
+    }
+
+    #[test]
+    fn generic_quality_bar_keeps_plan_in_stage_two() {
+        let contents = "# Plan
+
+## Goal
+- Improve the README title and introduction.
+
+## Constraints
+- Keep the README structure stable.
+
+## Deliverables
+- A revised README plan.
+
+## Acceptance Criteria
+- README has a new title and short introduction.
+
+## Quality Bar
+- The result is clear and useful.
+
+## Execution Plan
+1. Update the README title.
+2. Add a short introduction.
+3. Review for clarity.
+
+## Verification Plan
+- Re-read the updated file.
+
+## Risks / Fallbacks
+- Revisit wording if the introduction is vague.
+";
+        assert_eq!(current_plan_stage(contents), PlanStage::Stage2);
+        assert!(!plan_is_approval_ready(contents));
+        assert!(plan_missing_sections(contents).contains(&"Quality Bar"));
+    }
+
+    #[test]
+    fn repo_specific_quality_bar_is_approval_ready() {
+        let contents = "# Plan
+
+## Goal
+- Improve the README title and introduction.
+
+## Constraints
+- Keep the README structure stable.
+
+## Deliverables
+- A revised README plan.
+
+## Acceptance Criteria
+- README has a new title and short introduction.
+
+## Quality Bar
+- The README introduction reflects the current repo scope instead of generic filler.
+- The README title and intro stay aligned with the existing README sections.
+
+## Execution Plan
+1. Update the README title.
+2. Add a short introduction.
+3. Review for clarity.
+
+## Verification Plan
+- Re-read README.md and confirm the new introduction fits the existing sections.
+
+## Risks / Fallbacks
+- Revisit wording if the introduction is vague.
+";
+        assert_eq!(current_plan_stage(contents), PlanStage::Ready);
         assert!(plan_is_approval_ready(contents));
     }
 

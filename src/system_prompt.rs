@@ -97,7 +97,7 @@ Do not start Acceptance Criteria, Quality Bar, or later sections yet.\n",
                 prompt.push_str(
                     "Stage 2 goal: fill Acceptance Criteria and Quality Bar only.\n\
 Avoid broad exploration. Use the existing plan and the directly relevant files already inspected. Make one small Write or Edit to the plan file.\n\
-Include at least one repo-specific observation or weakness from the files you already inspected. Do not accept generic quality language that could apply to any repository.\n\
+Include at least one repo-specific observation or weakness from the files you already inspected. Name the concrete file, section, component, or current repo artifact that the quality bar should protect. Do not accept generic quality language that could apply to any repository.\n\
 Do not start Execution Plan, Verification Plan, or Risks/Fallbacks yet.\n",
                 );
             }
@@ -110,7 +110,7 @@ When these sections are complete, stop and wait for approval.\n",
             }
             PlanStage::Ready => {
                 prompt.push_str(
-                    "The plan is ready for approval. Do not explore further. Make only minimal plan-file edits if needed, otherwise wait for yes, no, or feedback.\n",
+                    "The plan is ready for approval. Do not explore further. Make only minimal plan-file edits if needed, otherwise wait for yes, no, or feedback. If the Quality Bar does not mention a concrete repo artifact, file, or section, fix that before stopping.\n",
                 );
             }
         }
