@@ -15,6 +15,7 @@ fn read_write_edit_glob_and_grep_work() {
         plan_path: None,
         auto_approve: true,
         interactive_approval: false,
+        offline: false,
         cancel_flag: None,
     };
 
@@ -64,6 +65,7 @@ fn edit_tool_salvages_token_anchor_drift() {
         plan_path: None,
         auto_approve: true,
         interactive_approval: false,
+        offline: false,
         cancel_flag: None,
     };
 
@@ -105,6 +107,7 @@ fn plan_mode_only_allows_plan_file_writes() {
         plan_path: Some(plan_path.clone()),
         auto_approve: true,
         interactive_approval: false,
+        offline: false,
         cancel_flag: None,
     };
 
@@ -141,6 +144,7 @@ fn plan_mode_allows_plan_file_outside_workspace() {
         plan_path: Some(plan_path.clone()),
         auto_approve: true,
         interactive_approval: false,
+        offline: false,
         cancel_flag: None,
     };
 
@@ -162,4 +166,44 @@ fn plan_mode_allows_plan_file_outside_workspace() {
         )
         .unwrap_err();
     assert!(err.contains("plan file"));
+}
+
+#[test]
+fn offline_mode_blocks_network_bash_commands() {
+    let dir = tempdir().unwrap();
+    let registry = ToolRegistry::default();
+    let context = ToolContext {
+        root: dir.path().to_path_buf(),
+        mode: ExecutionMode::Act,
+        plan_path: None,
+        auto_approve: true,
+        interactive_approval: false,
+        offline: true,
+        cancel_flag: None,
+    };
+
+    let err = registry
+        .execute("Bash", &json!({"command":"curl -I https://example.com"}), &context)
+        .unwrap_err();
+    assert!(err.contains("offline mode blocks network shell commands"));
+}
+
+#[test]
+fn offline_mode_allows_build_test_bash_commands() {
+    let dir = tempdir().unwrap();
+    let registry = ToolRegistry::default();
+    let context = ToolContext {
+        root: dir.path().to_path_buf(),
+        mode: ExecutionMode::Act,
+        plan_path: None,
+        auto_approve: true,
+        interactive_approval: false,
+        offline: true,
+        cancel_flag: None,
+    };
+
+    let result = registry
+        .execute("Bash", &json!({"command":"cargo test --help"}), &context)
+        .unwrap();
+    assert!(result.contains("exit_code=0"));
 }

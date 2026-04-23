@@ -15,6 +15,7 @@ pub struct ToolContext {
     pub plan_path: Option<std::path::PathBuf>,
     pub auto_approve: bool,
     pub interactive_approval: bool,
+    pub offline: bool,
     pub cancel_flag: Option<Arc<AtomicBool>>,
 }
 
@@ -62,7 +63,12 @@ impl ToolRegistry {
         match name {
             "Bash" => {
                 let command = get_required_string(arguments, "command")?;
-                bash::run(command, &context.root, context.cancel_flag.as_ref())
+                bash::run(
+                    command,
+                    &context.root,
+                    context.cancel_flag.as_ref(),
+                    context.offline,
+                )
             }
             "Read" => {
                 let path =
@@ -116,7 +122,7 @@ fn default_tool_specs() -> Vec<ToolSpec> {
     vec![
         tool(
             "Bash",
-            "Run a shell command in the project directory.",
+            "Run a shell command in the project directory. Runtime classifies commands as read-only, build-test, or general, and offline mode blocks networked or general shell commands.",
             serde_json::json!({
                 "type": "object",
                 "properties": { "command": { "type": "string" } },

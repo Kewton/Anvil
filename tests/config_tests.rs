@@ -65,6 +65,21 @@ fn merge_auto_plan_prefers_later_sources() {
 }
 
 #[test]
+fn merge_offline_prefers_later_sources() {
+    let merged = merge_partial_configs(&[
+        PartialConfig {
+            offline: Some(false),
+            ..PartialConfig::default()
+        },
+        PartialConfig {
+            offline: Some(true),
+            ..PartialConfig::default()
+        },
+    ]);
+    assert_eq!(merged.offline, Some(true));
+}
+
+#[test]
 fn merge_state_dir_override_prefers_cli_over_env() {
     let env_config = PartialConfig {
         state_dir_override: Some(PathBuf::from("/env/anvil")),
@@ -218,6 +233,15 @@ fn env_config_anvil_log_level_uppercase_trace() {
             assert_eq!(cfg.log_level, Some(LogLevel::Trace));
         },
     );
+}
+
+#[test]
+fn env_config_reads_offline_flag() {
+    with_env(&[("ANVIL_OFFLINE", Some("true"))], || {
+        let mut warnings: Vec<String> = Vec::new();
+        let cfg = load_env_config(&mut warnings);
+        assert_eq!(cfg.offline, Some(true));
+    });
 }
 
 #[test]

@@ -1220,6 +1220,7 @@ mod tests {
             fresh_session: false,
             oneshot: false,
             auto_plan: false,
+            offline: false,
             prompt: None,
             state_dir_override: None,
             resume: Default::default(),

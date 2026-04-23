@@ -1124,6 +1124,12 @@ impl Agent {
         if let Some(repo_context_message) = self.repo_context_message() {
             messages.push(repo_context_message);
         }
+        if self.config.offline {
+            messages.push(ConversationMessage::system(
+                "[Runtime Policy] Offline mode is enabled. Do not use network access, package installs, or general-purpose shell commands. If shell is necessary, keep it read-only or build-test only."
+                    .to_string(),
+            ));
+        }
         messages.extend(prompting::runtime_context_messages(
             &self.config.cwd,
             &self.work_root,
@@ -1145,6 +1151,7 @@ impl Agent {
             plan_path: self.session.mode_state.active_plan_path.clone(),
             auto_approve: self.config.yes_mode,
             interactive_approval: io::stdin().is_terminal(),
+            offline: self.config.offline,
             cancel_flag,
         };
         match self.tool_registry.execute(name, arguments, &context) {

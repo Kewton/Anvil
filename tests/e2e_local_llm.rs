@@ -280,7 +280,31 @@ fn live_ollama_repo_context_guides_targeted_edit() {
             })
         })
     }));
+}
 
+#[test]
+#[ignore = "requires live Ollama"]
+fn live_ollama_offline_mode_still_writes_files() {
+    let temp = tempdir().unwrap();
+    let host =
+        env::var("ANVIL_E2E_OLLAMA_HOST").unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
+    let model = env::var("ANVIL_E2E_MODEL").unwrap_or_else(|_| "qwen3:8b".to_string());
+
+    let Some(client) = available_client_or_skip(&host, &model).unwrap() else {
+        return;
+    };
+    let mut agent = new_offline_agent(temp.path(), &host, &model, client, 8);
+
+    let prompt = "Offline mode is enabled. Use available file tools to create offline-output.txt in the project root. The file content must be exactly OFFLINE_OK.";
+    run_with_retry(
+        &mut agent,
+        prompt,
+        "Create ./offline-output.txt now using a file tool. Write exactly OFFLINE_OK.",
+    )
+    .unwrap();
+
+    let content = std::fs::read_to_string(temp.path().join("offline-output.txt")).unwrap();
+    assert_eq!(content.trim(), "OFFLINE_OK");
 }
 
 fn available_client_or_skip(host: &str, model: &str) -> Result<Option<OllamaClient>, String> {
@@ -301,7 +325,17 @@ fn new_agent(
     client: OllamaClient,
     max_iterations: usize,
 ) -> Agent {
-    new_agent_with_log_level(cwd, host, model, client, max_iterations, LogLevel::Info)
+    new_agent_with_options(cwd, host, model, client, max_iterations, LogLevel::Info, false)
+}
+
+fn new_offline_agent(
+    cwd: &Path,
+    host: &str,
+    model: &str,
+    client: OllamaClient,
+    max_iterations: usize,
+) -> Agent {
+    new_agent_with_options(cwd, host, model, client, max_iterations, LogLevel::Info, true)
 }
 
 fn new_agent_with_log_level(
@@ -311,6 +345,18 @@ fn new_agent_with_log_level(
     client: OllamaClient,
     max_iterations: usize,
     log_level: LogLevel,
+) -> Agent {
+    new_agent_with_options(cwd, host, model, client, max_iterations, log_level, false)
+}
+
+fn new_agent_with_options(
+    cwd: &Path,
+    host: &str,
+    model: &str,
+    client: OllamaClient,
+    max_iterations: usize,
+    log_level: LogLevel,
+    offline: bool,
 ) -> Agent {
     let state_root = cwd.join(".anvil-state");
     let workspace_key = compute_workspace_key(cwd);
@@ -328,6 +374,7 @@ fn new_agent_with_log_level(
     config.yes_mode = true;
     config.fresh_session = true;
     config.oneshot = true;
+    config.offline = offline;
     config.state_dir_override = Some(state_root.clone());
 
     Agent::new(
