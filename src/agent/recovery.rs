@@ -171,6 +171,23 @@ pub fn plan_stage_budget_error(stage: PlanStage, next_sections: &[&str], budget:
     )
 }
 
+pub fn repeated_plan_exploration_error(
+    stage: PlanStage,
+    next_sections: &[&str],
+    tool_name: &str,
+) -> String {
+    let next = if next_sections.is_empty() {
+        "the current stage sections".to_string()
+    } else {
+        next_sections.join(", ")
+    };
+    format!(
+        "Error: repeated exploration blocked for {}. This {tool_name} repeats the same target for the current plan stage. Update the active plan file next. Focus only on: {}.",
+        stage.label(),
+        next
+    )
+}
+
 pub fn install_loop_recovery_note() -> String {
     "Recent turns repeated setup, rescaffolding, or dependency installation commands without finishing the implementation. Stop reinstalling packages or recreating the project. Inspect the project files that matter, then use Write or Edit to make concrete code changes before any further setup.".to_string()
 }

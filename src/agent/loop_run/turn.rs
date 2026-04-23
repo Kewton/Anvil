@@ -5,12 +5,13 @@ use super::*;
 use crate::agent::orchestration::{RepoVerification, capture_repo_snapshot, verify_repo_progress};
 use crate::logging::log_llm_event;
 use crate::ollama::xml_fallback::normalize_tool_call_arguments;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Instant;
 
 /// Maximum number of characters of tool-call arguments retained in trace logs.
 const LOG_ARGS_MAX_CHARS: usize = 200;
+const PLAN_REPEATED_EXPLORATION_BLOCK_THRESHOLD: usize = 2;
 
 /// UTF-8-safe truncation: keeps at most `max` characters and appends `...`
 /// when the input was longer. Never splits a multi-byte code point.
@@ -48,6 +49,97 @@ fn is_plan_file_tool_call(
         return false;
     };
     same_existing_path(Path::new(raw_path), plan_path)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PlanExplorationKey {
+    stage: String,
+    tool_name: String,
+    normalized_args: String,
+}
+
+fn normalize_plan_exploration_key(
+    tool_name: &str,
+    arguments: &serde_json::Value,
+    work_root: &Path,
+    stage: &str,
+) -> Option<PlanExplorationKey> {
+    let normalized_args = match tool_name {
+        "Read" => {
+            let path = arguments.get("path").and_then(serde_json::Value::as_str)?;
+            let path = normalize_exploration_path(path, work_root);
+            let start_line = arguments
+                .get("start_line")
+                .and_then(serde_json::Value::as_u64);
+            let end_line = arguments
+                .get("end_line")
+                .and_then(serde_json::Value::as_u64);
+            serde_json::json!({
+                "path": path,
+                "start_line": start_line,
+                "end_line": end_line,
+            })
+            .to_string()
+        }
+        "Glob" => serde_json::json!({
+            "pattern": arguments
+                .get("pattern")
+                .and_then(serde_json::Value::as_str)?
+                .trim(),
+        })
+        .to_string(),
+        "Grep" => serde_json::json!({
+            "pattern": arguments
+                .get("pattern")
+                .and_then(serde_json::Value::as_str)?
+                .trim(),
+            "glob": arguments.get("glob").and_then(serde_json::Value::as_str),
+            "case_sensitive": arguments
+                .get("case_sensitive")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+        })
+        .to_string(),
+        _ => return None,
+    };
+
+    Some(PlanExplorationKey {
+        stage: stage.to_string(),
+        tool_name: tool_name.to_string(),
+        normalized_args,
+    })
+}
+
+fn normalize_exploration_path(raw_path: &str, work_root: &Path) -> String {
+    let input = Path::new(raw_path);
+    if input.is_relative() {
+        let cleaned = input
+            .components()
+            .filter_map(|component| match component {
+                std::path::Component::Normal(part) => Some(part.to_string_lossy().to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if !cleaned.is_empty() {
+            return cleaned.join("/");
+        }
+    }
+
+    if let Ok(resolved) = resolve_user_path(work_root, raw_path) {
+        let canonical_root = std::fs::canonicalize(work_root).ok();
+        let canonical_resolved = std::fs::canonicalize(&resolved).ok();
+        if let (Some(root), Some(resolved_path)) = (canonical_root, canonical_resolved)
+            && let Ok(relative) = resolved_path.strip_prefix(root)
+        {
+            return relative.to_string_lossy().replace('\\', "/");
+        }
+        if let Ok(relative) = resolved.strip_prefix(work_root) {
+            return relative.to_string_lossy().replace('\\', "/");
+        }
+        return resolved.to_string_lossy().replace('\\', "/");
+    }
+
+    raw_path.trim().replace('\\', "/")
 }
 
 fn build_stats(
@@ -143,6 +235,7 @@ impl Agent {
         let mut repo_change_retries = 0usize;
         let mut plan_progress_retries = 0usize;
         let mut plan_exploration_only_turns = 0usize;
+        let mut plan_exploration_counts = HashMap::<PlanExplorationKey, usize>::new();
         let mut recent_bash_commands = Vec::<String>::new();
         let mut install_commands_seen = 0usize;
         let mut logged_plan_first_write = false;
@@ -275,12 +368,33 @@ impl Agent {
                         &tool_name,
                         restart_convergence_mode && repo_edit_calls_made_this_turn == 0,
                     );
+                    let repeated_plan_exploration =
+                        if self.session.mode_state.mode == ExecutionMode::Plan {
+                            normalize_plan_exploration_key(
+                                &tool_name,
+                                &tool_call.arguments,
+                                &self.work_root,
+                                current_plan_stage.as_str(),
+                            )
+                            .and_then(|key| {
+                                let count = plan_exploration_counts.entry(key.clone()).or_insert(0);
+                                *count += 1;
+                                Some(*count >= PLAN_REPEATED_EXPLORATION_BLOCK_THRESHOLD)
+                            })
+                            .unwrap_or(false)
+                        } else {
+                            false
+                        };
                     let block_bash_loop = tool_name == "Bash"
                         && recovery::should_block_bash_command(
                             &bash_command,
                             &recent_bash_commands,
                             install_commands_seen,
                         );
+                    let block_repeated_plan_exploration = self.session.mode_state.mode
+                        == ExecutionMode::Plan
+                        && matches!(tool_name.as_str(), "Read" | "Glob" | "Grep")
+                        && repeated_plan_exploration;
                     let block_plan_exploration = self.session.mode_state.mode
                         == ExecutionMode::Plan
                         && matches!(tool_name.as_str(), "Read" | "Glob" | "Grep")
@@ -297,30 +411,33 @@ impl Agent {
                     // drops at the end of this iteration so the worker resumes
                     // before the next loop tick.
                     let _footer_freeze = self.footer.freeze_for_inference();
-                    let progress =
-                        if block_restart_discovery || block_bash_loop || block_plan_exploration {
-                            format_blocked_bash_progress_line(
-                                &tool_name,
-                                &tool_call.arguments,
-                                iter_count + 1,
-                                self.config.max_iterations,
-                                &self.work_root,
-                                use_color,
-                                use_unicode,
-                                self.footer.current_cols(),
-                            )
-                        } else {
-                            format_progress_line(
-                                &tool_name,
-                                &tool_call.arguments,
-                                iter_count + 1,
-                                self.config.max_iterations,
-                                &self.work_root,
-                                use_color,
-                                use_unicode,
-                                self.footer.current_cols(),
-                            )
-                        };
+                    let progress = if block_restart_discovery
+                        || block_bash_loop
+                        || block_plan_exploration
+                        || block_repeated_plan_exploration
+                    {
+                        format_blocked_bash_progress_line(
+                            &tool_name,
+                            &tool_call.arguments,
+                            iter_count + 1,
+                            self.config.max_iterations,
+                            &self.work_root,
+                            use_color,
+                            use_unicode,
+                            self.footer.current_cols(),
+                        )
+                    } else {
+                        format_progress_line(
+                            &tool_name,
+                            &tool_call.arguments,
+                            iter_count + 1,
+                            self.config.max_iterations,
+                            &self.work_root,
+                            use_color,
+                            use_unicode,
+                            self.footer.current_cols(),
+                        )
+                    };
                     println!("{progress}");
                     let _ = io::stdout().flush();
                     // approve-guard: tools Bash/Write/Edit may invoke an
@@ -342,6 +459,28 @@ impl Agent {
                     }
                     let raw_result = if block_restart_discovery {
                         recovery::broad_restart_discovery_error(&tool_name)
+                    } else if block_repeated_plan_exploration {
+                        let next_sections = self
+                            .current_plan_contents()
+                            .ok()
+                            .flatten()
+                            .map(|contents| lifecycle::plan_next_stage_sections(&contents))
+                            .unwrap_or_default();
+                        log_llm_event(
+                            "agent.plan.guard_blocked",
+                            serde_json::json!({
+                                "session_id": self.session_store.session_id(),
+                                "iter": last_iter,
+                                "tool": tool_name,
+                                "reason": "repeated_exploration",
+                                "stage": current_plan_stage.as_str(),
+                            }),
+                        );
+                        recovery::repeated_plan_exploration_error(
+                            current_plan_stage,
+                            &next_sections,
+                            &tool_name,
+                        )
                     } else if block_plan_exploration {
                         let next_sections = self
                             .current_plan_contents()
@@ -928,6 +1067,53 @@ pub(crate) fn unicode_supported() -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PlanExplorationKey, normalize_exploration_path, normalize_plan_exploration_key};
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    #[test]
+    fn normalizes_read_path_to_repo_relative_key() {
+        let temp = tempdir().unwrap();
+        let file = temp.path().join("README.md");
+        std::fs::write(&file, "hello").unwrap();
+
+        let key = normalize_plan_exploration_key(
+            "Read",
+            &json!({"path": file.display().to_string(), "start_line": 1, "end_line": 10}),
+            temp.path(),
+            "stage1",
+        )
+        .unwrap();
+
+        assert_eq!(
+            key,
+            PlanExplorationKey {
+                stage: "stage1".to_string(),
+                tool_name: "Read".to_string(),
+                normalized_args: r#"{"end_line":10,"path":"README.md","start_line":1}"#.to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn normalizes_relative_path_without_touching_missing_file() {
+        let temp = tempdir().unwrap();
+        let normalized = normalize_exploration_path("docs/plan.md", temp.path());
+        assert_eq!(normalized, "docs/plan.md");
+    }
+
+    #[test]
+    fn includes_stage_in_plan_exploration_key() {
+        let temp = tempdir().unwrap();
+        let args = json!({"pattern": "README.md"});
+        let stage1 = normalize_plan_exploration_key("Glob", &args, temp.path(), "stage1").unwrap();
+        let stage2 = normalize_plan_exploration_key("Glob", &args, temp.path(), "stage2").unwrap();
+        assert_ne!(stage1, stage2);
+    }
 }
 
 /// Replace control characters (C0, DEL, and C1) with spaces, then trim trailing
