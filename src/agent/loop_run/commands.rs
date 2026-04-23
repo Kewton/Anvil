@@ -141,11 +141,24 @@ fn plan_stage_status_line(stage: PlanStage, next_sections: &[&str]) -> String {
         next_sections.join(", ")
     };
     match stage {
-        PlanStage::Stage1 => format!("Stage 1: bootstrap {focus}"),
-        PlanStage::Stage2 => format!("Stage 2: define {focus}"),
-        PlanStage::Stage3 => format!("Stage 3: complete {focus}"),
+        PlanStage::Stage1 => format!("Stage1: bootstrap {focus}"),
+        PlanStage::Stage2 => format!("Stage2: define {focus}"),
+        PlanStage::Stage3 => format!("Stage3: complete {focus}"),
         PlanStage::Ready => "Ready: wait for approval or feedback".to_string(),
     }
+}
+
+fn plan_stage_checklist() -> String {
+    [
+        "<タスク一覧>",
+        "▫️Stage1",
+        "▫️Stage1 レビュー",
+        "▫️Stage2",
+        "▫️Stage2 レビュー",
+        "▫️Stage3",
+        "▫️承認待ち",
+    ]
+    .join("\n")
 }
 
 fn infer_task_profile_from_text(raw: &str) -> TaskProfile {
@@ -740,9 +753,10 @@ impl Agent {
         let stage = self.session.mode_state.plan_stage;
         let next_sections = lifecycle::plan_stage_sections(stage);
         Ok(format!(
-            "plan mode: {}\nplanning now: building the implementation plan before coding ({})\n{}",
+            "plan mode: {}\nplanning now: building the implementation plan before coding ({})\n{}\n{}",
             plan_path.display(),
             task_profile.as_str(),
+            plan_stage_checklist(),
             plan_stage_status_line(stage, next_sections)
         ))
     }
@@ -1684,11 +1698,11 @@ mod tests {
     fn plan_stage_status_line_describes_focus() {
         assert_eq!(
             plan_stage_status_line(PlanStage::Stage1, &["Goal", "Constraints"]),
-            "Stage 1: bootstrap Goal, Constraints"
+            "Stage1: bootstrap Goal, Constraints"
         );
         assert_eq!(
             plan_stage_status_line(PlanStage::Stage3, &["Execution Plan"]),
-            "Stage 3: complete Execution Plan"
+            "Stage3: complete Execution Plan"
         );
     }
 

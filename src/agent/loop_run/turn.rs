@@ -166,6 +166,33 @@ fn log_plan_stall(
     );
 }
 
+fn progress_stage_label(
+    mode: ExecutionMode,
+    plan_stage: PlanStage,
+    tool_name: &str,
+    arguments: &serde_json::Value,
+    work_root: &Path,
+) -> Option<String> {
+    let stage_name = match plan_stage {
+        PlanStage::Stage1 => "Stage1",
+        PlanStage::Stage2 => "Stage2",
+        PlanStage::Stage3 => "Stage3",
+        PlanStage::Ready => "Ready",
+    };
+    if mode != ExecutionMode::Plan {
+        return Some("Act".to_string());
+    }
+    let path = arguments
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .map(|raw| normalize_exploration_path(raw, work_root))
+        .unwrap_or_default();
+    if tool_name == "Read" && looks_like_plan_path(&path) {
+        return Some(format!("{stage_name} review"));
+    }
+    Some(stage_name.to_string())
+}
+
 fn extract_plan_constraints(contents: &str) -> Vec<String> {
     let mut in_constraints = false;
     let mut lines = Vec::new();
@@ -509,6 +536,23 @@ impl Agent {
                             self.footer.current_cols(),
                         )
                     } else {
+                        let live_plan_stage = if self.session.mode_state.mode == ExecutionMode::Plan
+                        {
+                            self.current_plan_contents()
+                                .ok()
+                                .flatten()
+                                .map(|contents| lifecycle::current_plan_stage(&contents))
+                                .unwrap_or(current_plan_stage)
+                        } else {
+                            current_plan_stage
+                        };
+                        let stage_label = progress_stage_label(
+                            self.session.mode_state.mode,
+                            live_plan_stage,
+                            &tool_name,
+                            &tool_call.arguments,
+                            &self.work_root,
+                        );
                         format_progress_line(
                             &tool_name,
                             &tool_call.arguments,
@@ -518,6 +562,7 @@ impl Agent {
                             use_color,
                             use_unicode,
                             self.footer.current_cols(),
+                            stage_label.as_deref(),
                         )
                     };
                     println!("{progress}");
@@ -1381,12 +1426,19 @@ fn paint(s: &str, color: &str, use_color: bool) -> String {
 /// `arg_budget` caps the Bash command display length (issue #432). Other tool
 /// arms currently ignore this budget; the uniform signature lets the caller
 /// compute the budget once via `progress_available_width`.
+struct ProgressDisplay {
+    action: String,
+    path: Option<String>,
+    preview: Option<String>,
+    extra: Option<String>,
+}
+
 fn tool_display(
     tool_name: &str,
     arguments: &serde_json::Value,
     work_root: &std::path::Path,
     arg_budget: usize,
-) -> (String, Option<String>) {
+) -> ProgressDisplay {
     let str_arg = |key: &str| -> &str {
         arguments
             .get(key)
@@ -1400,59 +1452,86 @@ fn tool_display(
             .unwrap_or_else(|_| path.to_string())
     };
 
-    let path_display = sanitize_for_progress(&relativize(str_arg("path")));
+    let raw_path = str_arg("path");
+    let path_display = if raw_path.is_empty() {
+        "<missing path>".to_string()
+    } else {
+        compact_progress_path(&sanitize_for_progress(&relativize(raw_path)), arg_budget.max(48))
+    };
     match tool_name {
         "Write" => {
             let content = arguments
                 .get("content")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default();
-            let summary = plan_progress_summary("Write", &path_display, content)
-                .map(|summary| format!("{path_display} <- {summary}"))
-                .unwrap_or_else(|| path_display.clone());
+            let action = plan_progress_summary("Write", &path_display, content)
+                .unwrap_or_else(|| "file write".to_string());
             let preview = text_preview(content, 50);
-            let display = if preview.is_empty() {
-                summary
-            } else {
-                format!("{summary} :: \"{preview}\"")
-            };
             let extra = arguments
                 .get("content")
                 .and_then(serde_json::Value::as_str)
                 .map(|c| format!("{}B", c.len()));
-            (truncate(&display, arg_budget), extra)
+            ProgressDisplay {
+                action,
+                path: Some(path_display),
+                preview: (!preview.is_empty()).then_some(preview),
+                extra,
+            }
         }
         "Edit" => {
             let new_text = arguments
                 .get("new_string")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default();
-            let summary = plan_progress_summary("Edit", &path_display, new_text)
-                .map(|summary| format!("{path_display} <- {summary}"))
-                .unwrap_or_else(|| path_display.clone());
+            let action = plan_progress_summary("Edit", &path_display, new_text)
+                .unwrap_or_else(|| "text replace".to_string());
             let preview = text_preview(new_text, 50);
-            let display = if preview.is_empty() {
-                summary
-            } else {
-                format!("{summary} :: \"{preview}\"")
-            };
-            (truncate(&display, arg_budget), None)
+            ProgressDisplay {
+                action,
+                path: Some(path_display),
+                preview: (!preview.is_empty()).then_some(preview),
+                extra: None,
+            }
         }
         "Read" => {
             let line_suffix = read_line_suffix(arguments);
-            let summary = if looks_like_plan_path(&path_display) {
-                format!("{path_display}{line_suffix} [plan review]")
+            let action = if looks_like_plan_path(&path_display) {
+                "plan review".to_string()
+            } else if !line_suffix.is_empty() {
+                format!("lines {}", line_suffix.trim_start_matches(':'))
             } else {
-                format!("{path_display}{line_suffix}")
+                "file read".to_string()
             };
-            (truncate(&summary, arg_budget), None)
+            let path = format!("{path_display}{line_suffix}");
+            let (preview, extra) = read_preview(raw_path, work_root);
+            ProgressDisplay {
+                action,
+                path: Some(compact_progress_path(&path, arg_budget.max(48))),
+                preview,
+                extra,
+            }
         }
         "Bash" => {
             let sanitized = sanitize_for_progress(str_arg("command"));
-            (truncate(&sanitized, arg_budget), None)
+            ProgressDisplay {
+                action: truncate(&sanitized, arg_budget),
+                path: None,
+                preview: None,
+                extra: None,
+            }
         }
-        "Glob" | "Grep" => (truncate(&sanitize_for_progress(str_arg("pattern")), arg_budget), None),
-        _ => (truncate(&sanitize_for_progress(tool_name), arg_budget), None),
+        "Glob" | "Grep" => ProgressDisplay {
+            action: truncate(&sanitize_for_progress(str_arg("pattern")), arg_budget),
+            path: None,
+            preview: None,
+            extra: None,
+        },
+        _ => ProgressDisplay {
+            action: truncate(&sanitize_for_progress(tool_name), arg_budget),
+            path: None,
+            preview: None,
+            extra: None,
+        },
     }
 }
 
@@ -1551,6 +1630,49 @@ fn text_preview(text: &str, max_chars: usize) -> String {
     truncate(&collapsed, max_chars)
 }
 
+fn read_preview(raw_path: &str, work_root: &Path) -> (Option<String>, Option<String>) {
+    if raw_path.is_empty() {
+        return (None, None);
+    }
+    let Ok(path) = resolve_user_path(work_root, raw_path) else {
+        return (None, None);
+    };
+    let Ok(metadata) = std::fs::metadata(&path) else {
+        return (None, None);
+    };
+    if !metadata.is_file() || metadata.len() > 64 * 1024 {
+        return (None, None);
+    }
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return (None, None);
+    };
+    let preview = text_preview(&contents, 50);
+    ((!preview.is_empty()).then_some(preview), Some(format!("{}B", metadata.len())))
+}
+
+fn compact_progress_path(path: &str, max_chars: usize) -> String {
+    let char_count = path.chars().count();
+    if char_count <= max_chars {
+        return path.to_string();
+    }
+    if let Some((_, suffix)) = path.rsplit_once("/plans/") {
+        let collapsed = format!(".../plans/{suffix}");
+        if collapsed.chars().count() <= max_chars {
+            return collapsed;
+        }
+    }
+    let keep = max_chars.saturating_sub(3);
+    let tail = path
+        .chars()
+        .rev()
+        .take(keep)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!("...{tail}")
+}
+
 /// Compute the argument-summary budget for a progress line given the current
 /// terminal width (issue #432 §4.3.1).
 ///
@@ -1607,10 +1729,11 @@ pub(super) fn format_progress_line(
     use_color: bool,
     use_unicode: bool,
     cols: Option<u16>,
+    stage_label: Option<&str>,
 ) -> String {
     let arg_budget =
         progress_available_width(cols, tool_name, iter_human, max_iterations, use_unicode);
-    let (display_str, extra) = tool_display(tool_name, arguments, work_root, arg_budget);
+    let display = tool_display(tool_name, arguments, work_root, arg_budget);
     // Sanitize before painting so an adversarial tool_name cannot inject escapes.
     // emoji は &'static str ハードコードなので再 sanitize は不要。
     let safe_tool_name = sanitize_for_progress(tool_name);
@@ -1620,8 +1743,24 @@ pub(super) fn format_progress_line(
         safe_tool_name
     };
     let painted = paint(&label, tool_color(tool_name), use_color);
-    let extra_part = extra.map(|e| format!(" ({e})")).unwrap_or_default();
-    format!("[iter {iter_human}/{max_iterations}]  {painted}  {display_str}{extra_part}")
+    if matches!(tool_name, "Read" | "Write" | "Edit") {
+        let mut lines = Vec::new();
+        let stage = stage_label.unwrap_or("Working");
+        lines.push(format!("[iter {iter_human}/{max_iterations}] {stage}"));
+        lines.push(format!("{painted} :: {}", display.action));
+        if let Some(path) = display.path {
+            lines.push(path);
+        }
+        if let Some(preview) = display.preview {
+            let extra = display.extra.map(|e| format!(" ({e})")).unwrap_or_default();
+            lines.push(format!("\"{preview}\"{extra}"));
+        } else if let Some(extra) = display.extra {
+            lines.push(format!("({extra})"));
+        }
+        lines.join("\n")
+    } else {
+        format!("[iter {iter_human}/{max_iterations}]  {painted}  {}", display.action)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1642,14 +1781,14 @@ fn format_blocked_bash_progress_line(
         max_iterations,
         use_unicode,
     );
-    let (display_str, _) = tool_display(tool_name, arguments, work_root, arg_budget);
+    let display = tool_display(tool_name, arguments, work_root, arg_budget);
     let label = if use_unicode {
         "⛔ Bash blocked".to_string()
     } else {
         "Bash blocked".to_string()
     };
     let painted = paint(&label, "\x1b[38;5;196m", use_color);
-    format!("[iter {iter_human}/{max_iterations}]  {painted}  {display_str}")
+    format!("[iter {iter_human}/{max_iterations}]  {painted}  {}", display.action)
 }
 
 #[cfg(test)]
@@ -1705,18 +1844,20 @@ mod progress_tests {
     fn tool_display_write_ascii() {
         let work_root = PathBuf::from("/work");
         let args = json!({"path": "/work/src/foo.rs", "content": "hello"});
-        let (display, extra) = tool_display("Write", &args, &work_root, 57);
-        assert_eq!(display, "src/foo.rs :: \"hello\"");
-        assert_eq!(extra, Some("5B".to_string()));
+        let display = tool_display("Write", &args, &work_root, 57);
+        assert_eq!(display.action, "file write");
+        assert_eq!(display.path.as_deref(), Some("src/foo.rs"));
+        assert_eq!(display.preview.as_deref(), Some("hello"));
+        assert_eq!(display.extra, Some("5B".to_string()));
     }
 
     #[test]
     fn tool_display_write_non_ascii() {
         let work_root = PathBuf::from("/work");
         let args = json!({"path": "/work/a.txt", "content": "日本語"});
-        let (_, extra) = tool_display("Write", &args, &work_root, 57);
+        let display = tool_display("Write", &args, &work_root, 57);
         // "日本語" is 9 bytes in UTF-8
-        assert_eq!(extra, Some("9B".to_string()));
+        assert_eq!(display.extra, Some("9B".to_string()));
     }
 
     #[test]
@@ -1724,8 +1865,8 @@ mod progress_tests {
         let work_root = PathBuf::from("/work");
         let cmd = "cargo test";
         let args = json!({"command": cmd});
-        let (display, _) = tool_display("Bash", &args, &work_root, 57);
-        assert_eq!(display, cmd);
+        let display = tool_display("Bash", &args, &work_root, 57);
+        assert_eq!(display.action, cmd);
     }
 
     #[test]
@@ -1733,25 +1874,25 @@ mod progress_tests {
         let work_root = PathBuf::from("/work");
         let cmd = "a".repeat(61);
         let args = json!({"command": cmd});
-        let (display, _) = tool_display("Bash", &args, &work_root, 57);
-        assert_eq!(display.len(), 60); // 57 chars + "..."
-        assert!(display.ends_with("..."));
+        let display = tool_display("Bash", &args, &work_root, 57);
+        assert_eq!(display.action.len(), 60); // 57 chars + "..."
+        assert!(display.action.ends_with("..."));
     }
 
     #[test]
     fn tool_display_path_relative() {
         let work_root = PathBuf::from("/work");
         let args = json!({"path": "/work/src/lib.rs"});
-        let (display, _) = tool_display("Read", &args, &work_root, 57);
-        assert_eq!(display, "src/lib.rs");
+        let display = tool_display("Read", &args, &work_root, 57);
+        assert_eq!(display.path.as_deref(), Some("src/lib.rs"));
     }
 
     #[test]
     fn tool_display_path_outside() {
         let work_root = PathBuf::from("/work");
         let args = json!({"path": "/tmp/outside.txt"});
-        let (display, _) = tool_display("Read", &args, &work_root, 57);
-        assert_eq!(display, "/tmp/outside.txt");
+        let display = tool_display("Read", &args, &work_root, 57);
+        assert_eq!(display.path.as_deref(), Some("/tmp/outside.txt"));
     }
 
     #[test]
@@ -1761,26 +1902,51 @@ mod progress_tests {
             "path": "/work/.anvil-state/sessions/abc/plans/plan-1.md",
             "content": "# Plan\n\n## Goal\n- Improve README.\n\n## Constraints\n- Keep markdown.\n\n## Deliverables\n- Updated README.\n"
         });
-        let (display, extra) = tool_display("Write", &args, &work_root, 120);
-        assert!(display.contains("plans/plan-1.md <- Goal, Constraints, Deliverables"));
-        assert!(display.contains("\"# Plan ## Goal - Improve README."));
-        assert!(extra.is_some());
+        let display = tool_display("Write", &args, &work_root, 120);
+        assert_eq!(display.action, "Goal, Constraints, Deliverables");
+        assert!(
+            display
+                .path
+                .as_deref()
+                .is_some_and(|path| path.contains("plans/plan-1.md"))
+        );
+        assert!(
+            display
+                .preview
+                .as_deref()
+                .is_some_and(|preview| preview.contains("# Plan ## Goal - Improve README."))
+        );
+        assert!(display.extra.is_some());
     }
 
     #[test]
     fn tool_display_plan_read_marks_review() {
         let work_root = PathBuf::from("/work");
         let args = json!({"path": "/work/.anvil-state/sessions/abc/plans/plan-1.md"});
-        let (display, _) = tool_display("Read", &args, &work_root, 120);
-        assert_eq!(display, ".anvil-state/sessions/abc/plans/plan-1.md [plan review]");
+        let display = tool_display("Read", &args, &work_root, 120);
+        assert_eq!(display.action, "plan review");
+        assert_eq!(
+            display.path.as_deref(),
+            Some(".anvil-state/sessions/abc/plans/plan-1.md")
+        );
     }
 
     #[test]
     fn tool_display_read_includes_line_range() {
         let work_root = PathBuf::from("/work");
         let args = json!({"path": "/work/src/lib.rs", "start_line": 12, "end_line": 40});
-        let (display, _) = tool_display("Read", &args, &work_root, 120);
-        assert_eq!(display, "src/lib.rs:12-40");
+        let display = tool_display("Read", &args, &work_root, 120);
+        assert_eq!(display.action, "lines 12-40");
+        assert_eq!(display.path.as_deref(), Some("src/lib.rs:12-40"));
+    }
+
+    #[test]
+    fn tool_display_missing_path_is_explicit() {
+        let work_root = PathBuf::from("/work");
+        let args = json!({});
+        let display = tool_display("Read", &args, &work_root, 120);
+        assert_eq!(display.action, "file read");
+        assert_eq!(display.path.as_deref(), Some("<missing path>"));
     }
 
     #[test]
@@ -1788,9 +1954,9 @@ mod progress_tests {
         let work_root = PathBuf::from("/work");
         let cmd = "a".repeat(100);
         let args = json!({"command": cmd});
-        let (display, _) = tool_display("Bash", &args, &work_root, 200);
-        assert_eq!(display.len(), 100);
-        assert!(!display.ends_with("..."));
+        let display = tool_display("Bash", &args, &work_root, 200);
+        assert_eq!(display.action.len(), 100);
+        assert!(!display.action.ends_with("..."));
     }
 
     #[test]
@@ -1798,9 +1964,9 @@ mod progress_tests {
         let work_root = PathBuf::from("/work");
         let cmd = "a".repeat(30);
         let args = json!({"command": cmd});
-        let (display, _) = tool_display("Bash", &args, &work_root, 20);
-        assert_eq!(display.len(), 23); // 20 chars + "..."
-        assert!(display.ends_with("..."));
+        let display = tool_display("Bash", &args, &work_root, 20);
+        assert_eq!(display.action.len(), 23); // 20 chars + "..."
+        assert!(display.action.ends_with("..."));
     }
 
     #[test]
@@ -1864,6 +2030,7 @@ mod progress_tests {
                 /* use_color */ false,
                 /* use_unicode */ false,
                 Some(cols),
+                None,
             );
             let line_chars = line.chars().count();
             assert!(
@@ -1877,15 +2044,70 @@ mod progress_tests {
     fn progress_line_iter_1indexed() {
         let work_root = PathBuf::from("/work");
         let args = json!({"path": "/work/a.txt", "content": "x"});
-        let line = format_progress_line("Write", &args, 1, 12, &work_root, false, false, None);
+        let line = format_progress_line(
+            "Write",
+            &args,
+            1,
+            12,
+            &work_root,
+            false,
+            false,
+            None,
+            Some("Stage1"),
+        );
         assert!(line.starts_with("[iter 1/12]"));
+    }
+
+    #[test]
+    fn progress_line_for_write_uses_multiline_block() {
+        let work_root = PathBuf::from("/work");
+        let args = json!({"path": "/work/plans/plan-1.md", "content": "# Plan\n\n## Goal\n- Build game.\n"});
+        let line = format_progress_line(
+            "Write",
+            &args,
+            1,
+            50,
+            &work_root,
+            false,
+            true,
+            None,
+            Some("Stage1"),
+        );
+        assert!(line.contains("[iter 1/50] Stage1"));
+        assert!(line.contains("✏"));
+        assert!(line.contains("Write ::"));
+        assert!(line.contains("Goal"));
+        assert!(line.contains("plans/plan-1.md"));
+        assert!(line.contains("\"# Plan ## Goal - Build game.\""));
+    }
+
+    #[test]
+    fn progress_line_for_read_with_missing_path_is_visible() {
+        let work_root = PathBuf::from("/work");
+        let args = json!({});
+        let line = format_progress_line(
+            "Read",
+            &args,
+            2,
+            50,
+            &work_root,
+            false,
+            true,
+            None,
+            Some("Act"),
+        );
+        assert!(line.contains("[iter 2/50] Act"));
+        assert!(line.contains("📄 Read :: file read"));
+        assert!(line.contains("<missing path>"));
     }
 
     #[test]
     fn progress_line_no_color_no_escape() {
         let work_root = PathBuf::from("/work");
         let args = json!({"command": "ls"});
-        let line = format_progress_line("Bash", &args, 1, 12, &work_root, false, false, None);
+        let line = format_progress_line(
+            "Bash", &args, 1, 12, &work_root, false, false, None, None
+        );
         assert!(!line.contains('\x1b'));
     }
 
@@ -1893,7 +2115,9 @@ mod progress_tests {
     fn progress_line_color_prefix_invariant() {
         let work_root = PathBuf::from("/work");
         let args = json!({"command": "ls"});
-        let line = format_progress_line("Bash", &args, 1, 12, &work_root, true, false, None);
+        let line = format_progress_line(
+            "Bash", &args, 1, 12, &work_root, true, false, None, None
+        );
         assert!(line.starts_with("[iter "));
     }
 
@@ -1918,7 +2142,9 @@ mod progress_tests {
     fn progress_line_emoji_and_color_for_bash() {
         let work_root = PathBuf::from("/work");
         let args = json!({"command": "ls"});
-        let line = format_progress_line("Bash", &args, 1, 12, &work_root, true, true, None);
+        let line = format_progress_line(
+            "Bash", &args, 1, 12, &work_root, true, true, None, None
+        );
         let color_idx = line.find("\x1b[38;5;226m").expect("color present");
         let emoji_idx = line.find('⚡').expect("emoji present");
         let reset_idx = line.find("\x1b[0m").expect("reset present");
@@ -1930,7 +2156,9 @@ mod progress_tests {
     fn progress_line_no_color_but_unicode_emits_emoji() {
         let work_root = PathBuf::from("/work");
         let args = json!({"command": "ls"});
-        let line = format_progress_line("Bash", &args, 1, 12, &work_root, false, true, None);
+        let line = format_progress_line(
+            "Bash", &args, 1, 12, &work_root, false, true, None, None
+        );
         assert!(line.contains('⚡'));
         assert!(!line.contains('\x1b'));
     }
@@ -1939,7 +2167,9 @@ mod progress_tests {
     fn progress_line_unicode_off_no_emoji() {
         let work_root = PathBuf::from("/work");
         let args = json!({"command": "ls"});
-        let line = format_progress_line("Bash", &args, 1, 12, &work_root, true, false, None);
+        let line = format_progress_line(
+            "Bash", &args, 1, 12, &work_root, true, false, None, None
+        );
         assert!(!line.contains('⚡'));
     }
 
