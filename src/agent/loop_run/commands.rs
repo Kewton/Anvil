@@ -164,9 +164,7 @@ fn format_plan_tasks(tasks: &[String], stage_line: &str) -> String {
         .nth(1)
         .map(|task| strip_task_status(task))
         .unwrap_or("Wait for approval feedback");
-    format!(
-        "Current task: {current}\nUp next: {next}\n{stage_line}"
-    )
+    format!("Current task: {current}\nUp next: {next}\n{stage_line}")
 }
 
 fn infer_task_profile_from_text(raw: &str) -> TaskProfile {
@@ -795,6 +793,7 @@ impl Agent {
             return Err("plan file is not ready for approval yet".to_string());
         }
         self.session.mode_state.approve();
+        super::turn::prune_plan_mode_messages(&mut self.session.messages);
         self.push_system_note(format!(
             "[Act Mode / {}] Execute the accepted plan in phases and keep the work aligned with its acceptance criteria and quality bar.\n\n{}",
             self.session.mode_state.task_profile.as_str(),
@@ -809,8 +808,7 @@ impl Agent {
     }
 
     fn classify_large_task_with_main_model(&self, input: &str) -> Result<ClassifiedTask, String> {
-        let classifier_model =
-            classifier_model(&self.models.main, self.models.sidecar.as_deref());
+        let classifier_model = classifier_model(&self.models.main, self.models.sidecar.as_deref());
         let messages = vec![
             ConversationMessage::system(
                 "You classify whether a user request for a local-first repository agent should go through planning before execution, and which act profile fits best. Reply with JSON only in this shape: {\"large_task\":true|false,\"task_profile\":\"generic\"|\"coding\"|\"content\"|\"ui\"|\"research\"}. Use task_profile=\"coding\" for code changes, software implementation, debugging, tests, build changes, or repository edits. Use task_profile=\"ui\" for user-facing interface, visual design, interaction design, motion, or layout-heavy work. Use task_profile=\"content\" for writing, rewriting, documentation quality, copy, structured text, or reader-facing improvements where output quality matters. Use task_profile=\"research\" for investigation, comparison, or analysis-heavy work. Use task_profile=\"generic\" only for broader mixed work that does not clearly fit the others. Use large_task=true for broad multi-step work that benefits from a plan before execution."
@@ -1682,7 +1680,10 @@ mod tests {
 
     #[test]
     fn classifier_model_prefers_sidecar_when_available() {
-        assert_eq!(classifier_model("main-model", Some("sidecar-model")), "sidecar-model");
+        assert_eq!(
+            classifier_model("main-model", Some("sidecar-model")),
+            "sidecar-model"
+        );
         assert_eq!(classifier_model("main-model", None), "main-model");
     }
 

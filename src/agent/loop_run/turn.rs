@@ -18,10 +18,7 @@ const USER_INTERRUPT_ERROR: &str = "__anvil_user_interrupt__";
 const QWEN35_NON_NATIVE_HARD_TIMEOUT_SECS: u64 = 90;
 
 fn is_qwen35_family(model: &str) -> bool {
-    model
-        .trim()
-        .to_ascii_lowercase()
-        .starts_with("qwen3.5:")
+    model.trim().to_ascii_lowercase().starts_with("qwen3.5:")
 }
 
 /// UTF-8-safe truncation: keeps at most `max` characters and appends `...`
@@ -479,21 +476,21 @@ impl Agent {
                 break 'outer;
             }
 
-            let reply = match self.request_assistant_reply_with_retry(stream_output, &interrupt_flag)
-            {
-                Ok(r) => r,
-                Err(err) => {
-                    exit_reason = if err == USER_INTERRUPT_ERROR {
-                        ExitReason::Interrupted
-                    } else if lifecycle::is_tool_call_format_error(&err) {
-                        ExitReason::ToolCallFormatError
-                    } else {
-                        ExitReason::TransportError
-                    };
-                    error_text = err;
-                    break 'outer;
-                }
-            };
+            let reply =
+                match self.request_assistant_reply_with_retry(stream_output, &interrupt_flag) {
+                    Ok(r) => r,
+                    Err(err) => {
+                        exit_reason = if err == USER_INTERRUPT_ERROR {
+                            ExitReason::Interrupted
+                        } else if lifecycle::is_tool_call_format_error(&err) {
+                            ExitReason::ToolCallFormatError
+                        } else {
+                            ExitReason::TransportError
+                        };
+                        error_text = err;
+                        break 'outer;
+                    }
+                };
 
             // Boundary 2: right after the Ollama response completes. This is
             // the AC-10 checkpoint — mid-flight cancel is out of scope.
@@ -727,14 +724,14 @@ impl Agent {
                             &self.work_root,
                             self.session.mode_state.active_plan_path.as_deref(),
                         );
-                        let write_retry_label = if self.session.mode_state.mode == ExecutionMode::Plan
+                        let write_retry_label = if self.session.mode_state.mode
+                            == ExecutionMode::Plan
                             && is_plan_file_tool_call(
                                 &tool_name,
                                 &tool_call.arguments,
                                 &self.work_root,
                                 self.session.mode_state.active_plan_path.as_deref(),
-                            )
-                        {
+                            ) {
                             let raw_path = tool_call
                                 .arguments
                                 .get("path")
@@ -906,7 +903,9 @@ impl Agent {
                             .current_plan_contents()
                             .ok()
                             .flatten()
-                            .is_some_and(|contents| self.plan_is_approval_ready_with_fallback(&contents))
+                            .is_some_and(|contents| {
+                                self.plan_is_approval_ready_with_fallback(&contents)
+                            })
                     {
                         plan_ready_after_tool = true;
                         break;
@@ -1454,9 +1453,7 @@ impl Agent {
                         // First chunk: stop spinner immediately (stop flag +
                         // Condvar notify) so no spinner residue appears before
                         // "assistant> ". Safe when `stop_signal` is None.
-                        if stream_output
-                            && let Some(sig) = &stop_signal
-                        {
+                        if stream_output && let Some(sig) = &stop_signal {
                             sig.trigger();
                         }
                         if stream_output {
@@ -1545,7 +1542,11 @@ impl Agent {
     }
 
     fn maybe_fallback_plan_model_after_timeout(&mut self, err: &str) -> bool {
-        let Some(sidecar) = self.models.sidecar.as_ref().filter(|model| !model.trim().is_empty())
+        let Some(sidecar) = self
+            .models
+            .sidecar
+            .as_ref()
+            .filter(|model| !model.trim().is_empty())
         else {
             return false;
         };
@@ -1633,6 +1634,7 @@ impl Agent {
         protocol: prompting::ToolProtocol,
     ) -> Vec<ConversationMessage> {
         let mut messages = Vec::new();
+        let focused_edit_target = self.focused_edit_recovery_target();
         let plan_contents = if self.session.mode_state.mode == ExecutionMode::Plan {
             self.current_plan_contents().ok().flatten()
         } else {
@@ -1658,11 +1660,13 @@ impl Agent {
             plan_stage,
             &next_sections,
         )));
-        if let Some(memory_message) = self.working_memory_message() {
-            messages.push(memory_message);
-        }
-        if let Some(repo_context_message) = self.repo_context_message() {
-            messages.push(repo_context_message);
+        if focused_edit_target.is_none() {
+            if let Some(memory_message) = self.working_memory_message() {
+                messages.push(memory_message);
+            }
+            if let Some(repo_context_message) = self.repo_context_message() {
+                messages.push(repo_context_message);
+            }
         }
         if self.config.offline {
             messages.push(ConversationMessage::system(
@@ -1690,7 +1694,18 @@ impl Agent {
             &self.work_root,
             protocol,
         ));
-        messages.extend(self.session.messages.clone());
+        if let Some(target) = focused_edit_target {
+            messages.push(ConversationMessage::system(
+                focused_edit_guidance_note(&target, &self.work_root),
+            ));
+            messages.extend(focused_edit_history(
+                &self.session.messages,
+                &target,
+                &self.work_root,
+            ));
+        } else {
+            messages.extend(self.session.messages.clone());
+        }
         messages
     }
 
@@ -1751,7 +1766,9 @@ impl Agent {
         if self.session.mode_state.mode != ExecutionMode::Act {
             return None;
         }
-        if has_successful_repo_edit(&self.session.messages) || !recent_scaffold_command_seen(&self.session.messages) {
+        if has_successful_repo_edit(&self.session.messages)
+            || !recent_scaffold_command_seen(&self.session.messages)
+        {
             return None;
         }
         if let Some(path) = last_read_tool_path(&self.session.messages)
@@ -1761,6 +1778,11 @@ impl Agent {
             return Some(candidate);
         }
         first_existing_impl_target(&self.work_root)
+    }
+
+    fn focused_edit_recovery_target(&self) -> Option<PathBuf> {
+        self.forced_small_edit_recovery_target()
+            .or_else(|| self.post_scaffold_edit_recovery_target())
     }
 
     fn execute_tool_call(
@@ -2153,7 +2175,12 @@ fn plan_path_matches(raw_path: &str, work_root: &Path, plan_path: Option<&Path>)
         .is_some()
 }
 
-fn progress_path_display(raw_path: &str, work_root: &Path, plan_path: Option<&Path>, max_chars: usize) -> String {
+fn progress_path_display(
+    raw_path: &str,
+    work_root: &Path,
+    plan_path: Option<&Path>,
+    max_chars: usize,
+) -> String {
     if raw_path.is_empty() {
         return "<missing path>".to_string();
     }
@@ -2230,7 +2257,9 @@ fn assistant_model_for_mode(
     main_model: &str,
     plan_model_override: Option<&str>,
 ) -> String {
-    if mode == ExecutionMode::Plan && let Some(model) = plan_model_override {
+    if mode == ExecutionMode::Plan
+        && let Some(model) = plan_model_override
+    {
         return model.to_string();
     }
     main_model.to_string()
@@ -2299,6 +2328,26 @@ fn recent_post_scaffold_edit_attempt(messages: &[ConversationMessage]) -> usize 
         .unwrap_or(0)
 }
 
+pub(super) fn prune_plan_mode_messages(messages: &mut Vec<ConversationMessage>) {
+    messages.retain(|message| {
+        if message.role != "system" {
+            return true;
+        }
+        !is_plan_mode_only_system_note(&message.content)
+    });
+}
+
+fn is_plan_mode_only_system_note(note: &str) -> bool {
+    let trimmed = note.trim_start();
+    trimmed.starts_with("[Plan Mode /")
+        || trimmed.starts_with("[Plan File Alias]")
+        || trimmed.contains("plan_no_tool_attempt=")
+        || trimmed.contains("plan_progress_attempt=")
+        || trimmed.starts_with("Main planning model timed out.")
+        || trimmed.starts_with("The plan is still incomplete.")
+        || trimmed.starts_with("You are still in Plan mode")
+}
+
 fn has_successful_repo_edit(messages: &[ConversationMessage]) -> bool {
     messages.iter().any(|message| {
         message.role == "tool"
@@ -2356,6 +2405,74 @@ fn first_existing_impl_target(work_root: &Path) -> Option<PathBuf> {
     .find(|candidate| candidate.is_file())
 }
 
+fn focused_edit_guidance_note(target: &Path, work_root: &Path) -> String {
+    let path = target
+        .strip_prefix(work_root)
+        .unwrap_or(target)
+        .to_string_lossy()
+        .replace('\\', "/");
+    format!(
+        "[Focused Edit Recovery] Keep this turn minimal. Use exactly one compact Edit on {path}. Do not attempt a full-file rewrite, multi-file change, scaffold command, or dev-server command. Replace only one contiguous block from the last Read and move the implementation forward with the first concrete slice."
+    )
+}
+
+fn focused_edit_history(
+    messages: &[ConversationMessage],
+    target: &Path,
+    work_root: &Path,
+) -> Vec<ConversationMessage> {
+    let mut filtered = Vec::new();
+    if let Some(note) = messages.iter().rev().find(|message| {
+        message.role == "system" && message.content.trim_start().starts_with("[Act Mode /")
+    }) {
+        filtered.push(note.clone());
+    }
+    if let Some(user) = messages.iter().rev().find(|message| message.role == "user") {
+        filtered.push(user.clone());
+    }
+    if let Some((assistant, tool)) = latest_read_exchange_for_target(messages, target, work_root) {
+        filtered.push(assistant);
+        filtered.push(tool);
+    }
+    filtered
+}
+
+fn latest_read_exchange_for_target(
+    messages: &[ConversationMessage],
+    target: &Path,
+    work_root: &Path,
+) -> Option<(ConversationMessage, ConversationMessage)> {
+    for (index, message) in messages.iter().enumerate().rev() {
+        if message.role != "assistant" || !assistant_reads_target(message, target, work_root) {
+            continue;
+        }
+        let tool_message = messages.get(index + 1)?;
+        if tool_message.role == "tool" && tool_message.name.as_deref() == Some("Read") {
+            return Some((message.clone(), tool_message.clone()));
+        }
+    }
+    None
+}
+
+fn assistant_reads_target(
+    message: &ConversationMessage,
+    target: &Path,
+    work_root: &Path,
+) -> bool {
+    let normalized_target = std::fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
+    message.tool_calls.iter().any(|tool_call| {
+        if tool_call.name != "Read" {
+            return false;
+        }
+        let Some(path) = tool_call.arguments.get("path").and_then(serde_json::Value::as_str) else {
+            return false;
+        };
+        resolve_user_path(work_root, path)
+            .ok()
+            .is_some_and(|resolved| resolved == normalized_target)
+    })
+}
+
 fn plan_sections_with_content(contents: &str) -> Vec<&'static str> {
     [
         "Goal",
@@ -2402,13 +2519,20 @@ fn plan_section_excerpt(contents: &str, sections: &[&str]) -> Option<String> {
                 || line == "-"
                 || matches!(
                     line,
-                    "1." | "2." | "3." | "1. First slice:" | "2. Next phases:" | "3. Review checkpoint:"
+                    "1." | "2."
+                        | "3."
+                        | "1. First slice:"
+                        | "2. Next phases:"
+                        | "3. Review checkpoint:"
                 )
             {
                 continue;
             }
             let cleaned = line.trim_start_matches("- ").trim();
-            return Some(format!("{section}: {}", truncate(&sanitize_for_progress(cleaned), 72)));
+            return Some(format!(
+                "{section}: {}",
+                truncate(&sanitize_for_progress(cleaned), 72)
+            ));
         }
     }
     None
@@ -2421,10 +2545,12 @@ fn plan_phase_from_sections(
 ) -> &'static str {
     if approval_ready {
         "Approval review"
-    } else if sections
-        .iter()
-        .any(|section| matches!(*section, "Execution Plan" | "Verification Plan" | "Risks / Fallbacks"))
-    {
+    } else if sections.iter().any(|section| {
+        matches!(
+            *section,
+            "Execution Plan" | "Verification Plan" | "Risks / Fallbacks"
+        )
+    }) {
         "Finalize execution plan"
     } else if sections
         .iter()
@@ -2545,14 +2671,9 @@ fn summarize_plan_write(
     } else {
         Some(format!("delta {delta:+}B"))
     };
-    let phase = plan_phase_from_sections(&focus_sections, current_stage, approval_ready)
-        .to_string();
-    let signature = format!(
-        "{}|{}|{}",
-        phase,
-        action,
-        note.clone().unwrap_or_default()
-    );
+    let phase =
+        plan_phase_from_sections(&focus_sections, current_stage, approval_ready).to_string();
+    let signature = format!("{}|{}|{}", phase, action, note.clone().unwrap_or_default());
     PlanWriteSummary {
         action,
         note,
@@ -2597,9 +2718,8 @@ fn tool_display(
             } else {
                 (
                     "Write file".to_string(),
-                    (!text_preview(content, 72).is_empty()).then(|| {
-                        format!("Preview: {}", text_preview(content, 72))
-                    }),
+                    (!text_preview(content, 72).is_empty())
+                        .then(|| format!("Preview: {}", text_preview(content, 72))),
                     arguments
                         .get("content")
                         .and_then(serde_json::Value::as_str)
@@ -2631,9 +2751,8 @@ fn tool_display(
             } else {
                 (
                     "Revise file".to_string(),
-                    (!text_preview(new_text, 72).is_empty()).then(|| {
-                        format!("Preview: {}", text_preview(new_text, 72))
-                    }),
+                    (!text_preview(new_text, 72).is_empty())
+                        .then(|| format!("Preview: {}", text_preview(new_text, 72))),
                     None,
                 )
             };
@@ -2731,7 +2850,11 @@ fn plan_section_has_content(contents: &str, target: &str) -> bool {
             || trimmed == "-"
             || matches!(
                 trimmed,
-                "1." | "2." | "3." | "1. First slice:" | "2. Next phases:" | "3. Review checkpoint:"
+                "1." | "2."
+                    | "3."
+                    | "1. First slice:"
+                    | "2. Next phases:"
+                    | "3. Review checkpoint:"
             )
         {
             continue;
@@ -2754,8 +2877,12 @@ fn normalize_plan_heading_for_progress(heading: &str) -> &str {
 }
 
 fn read_line_suffix(arguments: &serde_json::Value) -> String {
-    let start = arguments.get("start_line").and_then(serde_json::Value::as_u64);
-    let end = arguments.get("end_line").and_then(serde_json::Value::as_u64);
+    let start = arguments
+        .get("start_line")
+        .and_then(serde_json::Value::as_u64);
+    let end = arguments
+        .get("end_line")
+        .and_then(serde_json::Value::as_u64);
     match (start, end) {
         (Some(start), Some(end)) if start == end => format!(":{start}"),
         (Some(start), Some(end)) => format!(":{start}-{end}"),
@@ -2790,7 +2917,10 @@ fn read_preview(raw_path: &str, work_root: &Path) -> (Option<String>, Option<Str
         return (None, None);
     };
     let preview = text_preview(&contents, 50);
-    ((!preview.is_empty()).then_some(preview), Some(format!("{}B", metadata.len())))
+    (
+        (!preview.is_empty()).then_some(preview),
+        Some(format!("{}B", metadata.len())),
+    )
 }
 
 fn compact_progress_path(path: &str, max_chars: usize) -> String {
@@ -2871,7 +3001,10 @@ fn progress_detail_budget(cols: Option<u16>, prefix: &str) -> usize {
 
 fn format_progress_field(prefix: &str, value: &str, cols: Option<u16>) -> String {
     let budget = progress_detail_budget(cols, prefix);
-    format!("{prefix}{}", truncate(&sanitize_for_progress(value), budget))
+    format!(
+        "{prefix}{}",
+        truncate(&sanitize_for_progress(value), budget)
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2931,7 +3064,10 @@ pub(super) fn format_progress_line(
         lines.push(String::new());
         lines.join("\n")
     } else {
-        format!("[iter {iter_human}/{max_iterations}]  {painted}  {}", display.action)
+        format!(
+            "[iter {iter_human}/{max_iterations}]  {painted}  {}",
+            display.action
+        )
     }
 }
 
@@ -2950,13 +3086,8 @@ fn format_blocked_progress_line(
     plan_path: Option<&Path>,
     current_stage: PlanStage,
 ) -> String {
-    let arg_budget = progress_available_width(
-        cols,
-        headline,
-        iter_human,
-        max_iterations,
-        use_unicode,
-    );
+    let arg_budget =
+        progress_available_width(cols, headline, iter_human, max_iterations, use_unicode);
     let display = tool_display(
         tool_name,
         arguments,
@@ -2983,7 +3114,10 @@ fn format_blocked_progress_line(
         lines.push(String::new());
         lines.join("\n")
     } else {
-        format!("[iter {iter_human}/{max_iterations}]  {painted}  {}", display.action)
+        format!(
+            "[iter {iter_human}/{max_iterations}]  {painted}  {}",
+            display.action
+        )
     }
 }
 
@@ -3013,9 +3147,10 @@ mod truncate_tests {
 mod progress_tests {
     use super::{
         first_existing_impl_target, format_blocked_progress_line, format_progress_line,
-        has_successful_repo_edit, is_utf8_locale, last_read_tool_path, progress_available_width,
-        recent_scaffold_command_seen, recent_truncated_tool_call_attempt, sanitize_for_progress,
-        tool_color, tool_display, tool_emoji, unicode_supported,
+        focused_edit_history, has_successful_repo_edit, is_utf8_locale, last_read_tool_path,
+        progress_available_width, prune_plan_mode_messages, recent_scaffold_command_seen,
+        recent_truncated_tool_call_attempt, sanitize_for_progress, tool_color, tool_display,
+        tool_emoji, unicode_supported,
     };
     use crate::modes::plan_act::PlanStage;
     use crate::ollama::xml_fallback::ToolCall;
@@ -3050,7 +3185,12 @@ mod progress_tests {
         let display = tool_display("Write", &args, &work_root, None, PlanStage::Stage1, 57);
         assert_eq!(display.action, "Write file");
         assert_eq!(display.path.as_deref(), Some("src/foo.rs"));
-        assert!(display.note.as_deref().is_some_and(|note| note.contains("hello")));
+        assert!(
+            display
+                .note
+                .as_deref()
+                .is_some_and(|note| note.contains("hello"))
+        );
         assert_eq!(display.status, Some("5B".to_string()));
     }
 
@@ -3302,10 +3442,82 @@ mod progress_tests {
                 }],
             ),
         ];
-        let resolved = resolve_user_path(&work_root, &last_read_tool_path(&messages).unwrap()).unwrap();
-        assert!(resolved.ends_with("app/page.tsx"), "got: {}", resolved.display());
+        let resolved =
+            resolve_user_path(&work_root, &last_read_tool_path(&messages).unwrap()).unwrap();
+        assert!(
+            resolved.ends_with("app/page.tsx"),
+            "got: {}",
+            resolved.display()
+        );
         assert_eq!(recent_truncated_tool_call_attempt(&messages), 1);
         assert!(!has_successful_repo_edit(&messages));
+    }
+
+    #[test]
+    fn prune_plan_mode_messages_removes_plan_only_notes() {
+        let mut messages = vec![
+            ConversationMessage::system(
+                "[Plan Mode / coding] Explore with Read, Glob, and Grep.".to_string(),
+            ),
+            ConversationMessage::system(
+                "[Plan File Alias] Treat paths as the same file.".to_string(),
+            ),
+            ConversationMessage::system(
+                "The plan is still incomplete. plan_progress_attempt=2".to_string(),
+            ),
+            ConversationMessage::user("build the app".to_string()),
+            ConversationMessage::system("[Act Mode / coding] Execute the plan.".to_string()),
+        ];
+        prune_plan_mode_messages(&mut messages);
+        let contents = messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(contents.len(), 2, "got: {contents:?}");
+        assert!(contents.iter().any(|content| content.starts_with("[Act Mode /")));
+        assert!(contents.iter().any(|content| *content == "build the app"));
+    }
+
+    #[test]
+    fn focused_edit_history_keeps_act_note_user_and_latest_target_read_only() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        let target = work_root.join("app").join("page.tsx");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "export default function Home() { return null; }\n").unwrap();
+        let other = work_root.join("README.md");
+        std::fs::write(&other, "# readme\n").unwrap();
+        let messages = vec![
+            ConversationMessage::system("[Plan Mode / coding] old".to_string()),
+            ConversationMessage::system("[Act Mode / coding] Execute the plan.".to_string()),
+            ConversationMessage::user("make a game".to_string()),
+            ConversationMessage::assistant(
+                String::new(),
+                vec![ToolCall {
+                    id: "xml-1".to_string(),
+                    name: "Read".to_string(),
+                    arguments: json!({"path":"README.md"}),
+                }],
+            ),
+            ConversationMessage::tool("Read".to_string(), "# readme".to_string()),
+            ConversationMessage::assistant(
+                String::new(),
+                vec![ToolCall {
+                    id: "xml-2".to_string(),
+                    name: "Read".to_string(),
+                    arguments: json!({"path":"app/page.tsx"}),
+                }],
+            ),
+            ConversationMessage::tool("Read".to_string(), "1: export default".to_string()),
+        ];
+        let filtered = focused_edit_history(&messages, &target, &work_root);
+        assert_eq!(filtered.len(), 4, "got: {filtered:?}");
+        assert!(filtered[0].content.starts_with("[Act Mode /"));
+        assert_eq!(filtered[1].role, "user");
+        assert_eq!(filtered[2].role, "assistant");
+        assert_eq!(filtered[3].name.as_deref(), Some("Read"));
+        assert!(!filtered.iter().any(|message| message.content.starts_with("[Plan Mode /")));
+        assert!(!filtered.iter().any(|message| message.content == "# readme"));
     }
 
     #[test]
@@ -3326,10 +3538,18 @@ mod progress_tests {
         let temp = tempdir().unwrap();
         let work_root = temp.path();
         std::fs::create_dir_all(work_root.join("app")).unwrap();
-        std::fs::write(work_root.join("app/page.tsx"), "export default function Home() { return null; }\n").unwrap();
+        std::fs::write(
+            work_root.join("app/page.tsx"),
+            "export default function Home() { return null; }\n",
+        )
+        .unwrap();
         std::fs::write(work_root.join("next.config.ts"), "export default {};\n").unwrap();
         let target = first_existing_impl_target(work_root).unwrap();
-        assert!(target.ends_with("app/page.tsx"), "got: {}", target.display());
+        assert!(
+            target.ends_with("app/page.tsx"),
+            "got: {}",
+            target.display()
+        );
     }
 
     #[test]
@@ -3483,7 +3703,18 @@ mod progress_tests {
         let work_root = PathBuf::from("/work");
         let args = json!({"command": "ls"});
         let line = format_progress_line(
-            "Bash", &args, 1, 12, &work_root, false, false, None, None, PlanStage::Stage1, None, None
+            "Bash",
+            &args,
+            1,
+            12,
+            &work_root,
+            false,
+            false,
+            None,
+            None,
+            PlanStage::Stage1,
+            None,
+            None,
         );
         assert!(!line.contains('\x1b'));
     }
@@ -3493,7 +3724,18 @@ mod progress_tests {
         let work_root = PathBuf::from("/work");
         let args = json!({"command": "ls"});
         let line = format_progress_line(
-            "Bash", &args, 1, 12, &work_root, true, false, None, None, PlanStage::Stage1, None, None
+            "Bash",
+            &args,
+            1,
+            12,
+            &work_root,
+            true,
+            false,
+            None,
+            None,
+            PlanStage::Stage1,
+            None,
+            None,
         );
         assert!(line.starts_with("[iter "));
     }
@@ -3520,7 +3762,18 @@ mod progress_tests {
         let work_root = PathBuf::from("/work");
         let args = json!({"command": "ls"});
         let line = format_progress_line(
-            "Bash", &args, 1, 12, &work_root, true, true, None, None, PlanStage::Stage1, None, None
+            "Bash",
+            &args,
+            1,
+            12,
+            &work_root,
+            true,
+            true,
+            None,
+            None,
+            PlanStage::Stage1,
+            None,
+            None,
         );
         let color_idx = line.find("\x1b[38;5;226m").expect("color present");
         let emoji_idx = line.find('⚡').expect("emoji present");
@@ -3534,7 +3787,18 @@ mod progress_tests {
         let work_root = PathBuf::from("/work");
         let args = json!({"command": "ls"});
         let line = format_progress_line(
-            "Bash", &args, 1, 12, &work_root, false, true, None, None, PlanStage::Stage1, None, None
+            "Bash",
+            &args,
+            1,
+            12,
+            &work_root,
+            false,
+            true,
+            None,
+            None,
+            PlanStage::Stage1,
+            None,
+            None,
         );
         assert!(line.contains('⚡'));
         assert!(!line.contains('\x1b'));
@@ -3545,7 +3809,18 @@ mod progress_tests {
         let work_root = PathBuf::from("/work");
         let args = json!({"command": "ls"});
         let line = format_progress_line(
-            "Bash", &args, 1, 12, &work_root, true, false, None, None, PlanStage::Stage1, None, None
+            "Bash",
+            &args,
+            1,
+            12,
+            &work_root,
+            true,
+            false,
+            None,
+            None,
+            PlanStage::Stage1,
+            None,
+            None,
         );
         assert!(!line.contains('⚡'));
     }
