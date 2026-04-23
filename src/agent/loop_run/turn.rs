@@ -1670,6 +1670,15 @@ impl Agent {
                     .to_string(),
             ));
         }
+        if self.session.mode_state.mode == ExecutionMode::Plan
+            && let Some(plan_path) = self.session.mode_state.active_plan_path.as_deref()
+        {
+            messages.push(ConversationMessage::system(format!(
+                "[Plan File Alias] The active plan file may live outside the project root, but it is still accessible. Treat these two paths as the same file: {} and {}. Do not loop on Read because of the outside-workspace path; continue updating the same active plan file.",
+                plan_path.display(),
+                plan_file_alias(plan_path)
+            )));
+        }
         if let Some(note) = self.forced_small_edit_recovery_message() {
             messages.push(ConversationMessage::system(note));
         }
@@ -2208,6 +2217,12 @@ fn should_fallback_plan_model_after_timeout(
         return false;
     }
     err.to_ascii_lowercase().contains("timed out")
+}
+
+fn plan_file_alias(path: &Path) -> String {
+    path.file_name()
+        .map(|name| format!("plans/{}", name.to_string_lossy()))
+        .unwrap_or_else(|| "plans/plan.md".to_string())
 }
 
 fn recent_truncated_tool_call_attempt(messages: &[ConversationMessage]) -> usize {

@@ -62,10 +62,17 @@ TOOLS:\n\
 You are in read-only exploration mode. Use Read, Glob, and Grep to inspect the repo. Bash is disabled.\n",
         );
         if let Some(path) = active_plan_path {
+            let alias = plan_file_alias(path);
             prompt.push_str(&format!(
                 "Write and Edit are allowed only for the plan file: {}\n",
                 path.display()
             ));
+            prompt.push_str(&format!(
+                "The same active plan file is also available through this repository-relative alias: {alias}\n"
+            ));
+            prompt.push_str(
+                "Do not assume the plan file is inaccessible just because the absolute path lives outside the project root. Use either the exact absolute path above or the alias shown for the same active plan file.\n",
+            );
         }
         let stage = plan_stage.unwrap_or(PlanStage::Stage1);
         let next = if next_sections.is_empty() {
@@ -173,4 +180,10 @@ For research work, gather only the evidence needed, verify key claims, and evalu
     }
 
     prompt
+}
+
+fn plan_file_alias(path: &Path) -> String {
+    path.file_name()
+        .map(|name| format!("plans/{}", name.to_string_lossy()))
+        .unwrap_or_else(|| "plans/plan.md".to_string())
 }
