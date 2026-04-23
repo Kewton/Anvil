@@ -17,6 +17,13 @@ const PLAN_REPEATED_EXPLORATION_BLOCK_THRESHOLD: usize = 2;
 const USER_INTERRUPT_ERROR: &str = "__anvil_user_interrupt__";
 const QWEN35_NON_NATIVE_HARD_TIMEOUT_SECS: u64 = 90;
 
+fn is_qwen35_family(model: &str) -> bool {
+    model
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("qwen3.5:")
+}
+
 /// UTF-8-safe truncation: keeps at most `max` characters and appends `...`
 /// when the input was longer. Never splits a multi-byte code point.
 fn truncate(s: &str, max: usize) -> String {
@@ -1723,6 +1730,16 @@ mod tests {
     }
 
     #[test]
+    fn qwen35_sidecar_tool_path_also_uses_non_streaming_transport() {
+        assert!(!should_use_streaming_transport(
+            "qwen3.5:9b",
+            false,
+            false,
+            true,
+        ));
+    }
+
+    #[test]
     fn native_tool_models_still_use_streaming_transport() {
         assert!(should_use_streaming_transport(
             "qwen3.6:27b-coding-nvfp4",
@@ -1736,6 +1753,10 @@ mod tests {
     fn qwen35_non_native_requests_use_shorter_hard_timeout() {
         assert_eq!(
             non_streaming_assistant_reply_timeout_secs("qwen3.5:122b", false, 120),
+            90
+        );
+        assert_eq!(
+            non_streaming_assistant_reply_timeout_secs("qwen3.5:9b", false, 120),
             90
         );
         assert_eq!(
@@ -1906,8 +1927,7 @@ fn should_use_streaming_transport(
         return false;
     }
 
-    let normalized = model.trim().to_ascii_lowercase();
-    if !native_tools_enabled && normalized == "qwen3.5:122b" {
+    if !native_tools_enabled && is_qwen35_family(model) {
         return false;
     }
 
@@ -1919,8 +1939,7 @@ fn non_streaming_assistant_reply_timeout_secs(
     native_tools_enabled: bool,
     default_timeout_secs: u64,
 ) -> u64 {
-    let normalized = model.trim().to_ascii_lowercase();
-    if !native_tools_enabled && normalized == "qwen3.5:122b" {
+    if !native_tools_enabled && is_qwen35_family(model) {
         return QWEN35_NON_NATIVE_HARD_TIMEOUT_SECS;
     }
     default_timeout_secs
