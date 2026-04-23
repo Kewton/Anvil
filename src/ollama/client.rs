@@ -2,13 +2,17 @@ use reqwest::blocking::Client;
 use serde_json::json;
 
 use crate::logging;
-use crate::ollama::parsing::{parse_streaming_generate_response, tool_names, truncate_for_log};
+use crate::ollama::parsing::{
+    parse_streaming_chat_response, parse_streaming_generate_response, tool_names, truncate_for_log,
+};
 use crate::ollama::transport::GenerateTransport;
 use crate::session::store::ConversationMessage;
 use crate::tools::registry::ToolSpec;
 
 pub use crate::ollama::parsing::AssistantReply;
-pub use crate::ollama::parsing::{parse_generate_response, parse_tags_response};
+pub use crate::ollama::parsing::{
+    parse_chat_response, parse_generate_response, parse_tags_response,
+};
 pub use crate::ollama::transport::should_use_native_tool_calls;
 
 #[derive(Debug, Clone)]
@@ -82,9 +86,13 @@ impl OllamaClient {
         model: &str,
         messages: &[ConversationMessage],
         tools: &[ToolSpec],
-        _native_tools_enabled: bool,
+        native_tools_enabled: bool,
     ) -> Result<AssistantReply, String> {
-        self.generate_impl(model, messages, Some(tools), false, |_| {})
+        if native_tools_enabled {
+            self.chat_impl(model, messages, tools, false, |_| {})
+        } else {
+            self.generate_impl(model, messages, Some(tools), false, |_| {})
+        }
     }
 
     pub fn chat_streaming<F>(
@@ -105,13 +113,17 @@ impl OllamaClient {
         model: &str,
         messages: &[ConversationMessage],
         tools: &[ToolSpec],
-        _native_tools_enabled: bool,
+        native_tools_enabled: bool,
         on_chunk: F,
     ) -> Result<AssistantReply, String>
     where
         F: FnMut(&str),
     {
-        self.generate_impl(model, messages, Some(tools), true, on_chunk)
+        if native_tools_enabled {
+            self.chat_impl(model, messages, tools, true, on_chunk)
+        } else {
+            self.generate_impl(model, messages, Some(tools), true, on_chunk)
+        }
     }
 
     pub fn chat_text(
@@ -228,6 +240,89 @@ impl OllamaClient {
                 }),
             );
             parse_generate_response(&body, &tool_names_vec)
+        }
+    }
+
+    fn chat_impl<F>(
+        &self,
+        model: &str,
+        messages: &[ConversationMessage],
+        tools: &[ToolSpec],
+        stream: bool,
+        mut on_chunk: F,
+    ) -> Result<AssistantReply, String>
+    where
+        F: FnMut(&str),
+    {
+        let temperature = 0.3;
+        let tool_names_vec = tool_names(tools);
+
+        logging::log_llm_event(
+            "ollama.chat.request",
+            json!({
+                "base_url": self.base_url,
+                "model": model,
+                "stream": stream,
+                "temperature": temperature,
+                "num_ctx": self.context_window,
+                "num_predict": self.max_predict,
+                "tools": tool_names_vec,
+                "messages": messages,
+            }),
+        );
+
+        let transport = GenerateTransport::new(
+            &self.base_url,
+            &self.http,
+            self.context_window,
+            self.max_predict,
+        );
+        let response = transport
+            .send_chat_request(model, messages, tools, stream, temperature)
+            .map_err(|err| {
+                logging::log_llm_event(
+                    "ollama.chat.error",
+                    json!({
+                        "model": model,
+                        "stream": stream,
+                        "kind": "transport",
+                        "error": err.to_string(),
+                    }),
+                );
+                format!("failed to contact Ollama chat API: {err}")
+            })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().unwrap_or_default();
+            logging::log_llm_event(
+                "ollama.chat.error",
+                json!({
+                    "model": model,
+                    "stream": stream,
+                    "kind": "status",
+                    "status": status.as_u16(),
+                    "body": truncate_for_log(&body, 20_000),
+                }),
+            );
+            return Err(format!("Ollama /api/chat failed: {status}"));
+        }
+
+        if stream {
+            parse_streaming_chat_response(response, &tool_names_vec, &mut on_chunk)
+        } else {
+            let body = response
+                .text()
+                .map_err(|err| format!("failed to decode Ollama chat response: {err}"))?;
+            logging::log_llm_event(
+                "ollama.chat.response_raw",
+                json!({
+                    "model": model,
+                    "stream": false,
+                    "body": truncate_for_log(&body, 200_000),
+                }),
+            );
+            parse_chat_response(&body, &tool_names_vec)
         }
     }
 }

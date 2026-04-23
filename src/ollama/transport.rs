@@ -1,6 +1,9 @@
 use reqwest::blocking::{Client, Response};
 use serde::Serialize;
 
+use crate::session::store::ConversationMessage;
+use crate::tools::registry::ToolSpec;
+
 #[derive(Serialize)]
 struct RequestOptions {
     temperature: f32,
@@ -16,6 +19,38 @@ struct GenerateRequest<'a> {
     stream: bool,
     keep_alive: i32,
     options: RequestOptions,
+}
+
+#[derive(Serialize)]
+struct ChatMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Serialize)]
+struct ChatToolDefinition {
+    #[serde(rename = "type")]
+    kind: String,
+    function: ChatToolFunction,
+}
+
+#[derive(Serialize)]
+struct ChatToolFunction {
+    name: String,
+    description: String,
+    parameters: serde_json::Value,
+}
+
+#[derive(Serialize)]
+struct ChatRequest<'a> {
+    model: &'a str,
+    messages: Vec<ChatMessage>,
+    stream: bool,
+    think: bool,
+    keep_alive: i32,
+    options: RequestOptions,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<ChatToolDefinition>>,
 }
 
 pub(crate) struct GenerateTransport<'a> {
@@ -68,8 +103,73 @@ impl<'a> GenerateTransport<'a> {
             num_predict: self.max_predict,
         }
     }
+
+    pub(crate) fn send_chat_request(
+        &self,
+        model: &str,
+        messages: &[ConversationMessage],
+        tools: &[ToolSpec],
+        stream: bool,
+        temperature: f32,
+    ) -> Result<Response, reqwest::Error> {
+        let request = ChatRequest {
+            model,
+            messages: to_chat_messages(messages),
+            stream,
+            think: false,
+            keep_alive: -1,
+            options: self.request_options(temperature),
+            tools: (!tools.is_empty()).then(|| to_chat_tool_definitions(tools)),
+        };
+        self.http
+            .post(format!("{}/api/chat", self.base_url))
+            .json(&request)
+            .send()
+    }
 }
 
-pub fn should_use_native_tool_calls(_model: &str) -> bool {
-    false
+fn to_chat_messages(messages: &[ConversationMessage]) -> Vec<ChatMessage> {
+    let mut chat_messages = Vec::with_capacity(messages.len());
+    for message in messages {
+        match message.role.as_str() {
+            "system" | "user" | "assistant" => chat_messages.push(ChatMessage {
+                role: message.role.clone(),
+                content: message.content.clone(),
+            }),
+            "tool" => {
+                let label = message.name.as_deref().unwrap_or("tool");
+                chat_messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: format!("[tool result {label}]\n{}", message.content),
+                });
+            }
+            _ => chat_messages.push(ChatMessage {
+                role: "user".to_string(),
+                content: message.content.clone(),
+            }),
+        }
+    }
+    chat_messages
+}
+
+fn to_chat_tool_definitions(tools: &[ToolSpec]) -> Vec<ChatToolDefinition> {
+    tools
+        .iter()
+        .map(|tool| ChatToolDefinition {
+            kind: tool.kind.clone(),
+            function: ChatToolFunction {
+                name: tool.function.name.clone(),
+                description: tool.function.description.clone(),
+                parameters: tool.function.parameters.clone(),
+            },
+        })
+        .collect()
+}
+
+pub fn should_use_native_tool_calls(model: &str) -> bool {
+    let normalized = model.trim().to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "qwen3.6:27b-coding-nvfp4" | "qwen3.5:122b"
+    )
 }
