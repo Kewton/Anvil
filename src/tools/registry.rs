@@ -4,7 +4,7 @@ use std::sync::atomic::AtomicBool;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::modes::plan_act::ExecutionMode;
+use crate::modes::plan_act::{ExecutionMode, PlanStage};
 use crate::safety::path_guard::resolve_user_path;
 use crate::tools::{bash, edit, glob, grep, read, write};
 
@@ -13,6 +13,7 @@ pub struct ToolContext {
     pub root: std::path::PathBuf,
     pub mode: ExecutionMode,
     pub plan_path: Option<std::path::PathBuf>,
+    pub plan_stage: PlanStage,
     pub auto_approve: bool,
     pub interactive_approval: bool,
     pub offline: bool,
@@ -58,6 +59,7 @@ impl ToolRegistry {
         context: &ToolContext,
     ) -> Result<String, String> {
         enforce_mode(name, arguments, context)?;
+        enforce_plan_stage_scope(name, arguments, context)?;
         maybe_confirm(name, arguments, context)?;
 
         match name {
@@ -295,6 +297,72 @@ fn resolve_write_path(
     resolve_user_path(root, raw)
 }
 
+fn enforce_plan_stage_scope(name: &str, arguments: &Value, context: &ToolContext) -> Result<(), String> {
+    if context.mode != ExecutionMode::Plan || !matches!(name, "Write" | "Edit") {
+        return Ok(());
+    }
+
+    let raw_path = get_required_string(arguments, "path")?;
+    if resolve_plan_mode_write_target(&context.root, raw_path, context.plan_path.as_deref())?
+        .is_none()
+    {
+        return Ok(());
+    }
+
+    let payload = match name {
+        "Write" => get_required_string(arguments, "content")?,
+        "Edit" => get_required_string(arguments, "new_string")?,
+        _ => return Ok(()),
+    };
+
+    let disallowed = disallowed_plan_sections(context.plan_stage)
+        .into_iter()
+        .filter(|section| payload_mentions_plan_section(payload, section))
+        .collect::<Vec<_>>();
+    if disallowed.is_empty() {
+        return Ok(());
+    }
+
+    let allowed = allowed_plan_sections(context.plan_stage).join(", ");
+    Err(format!(
+        "plan stage {} only allows updating these sections now: {}. Remove later sections from this {}: {}",
+        context.plan_stage.label(),
+        allowed,
+        name,
+        disallowed.join(", ")
+    ))
+}
+
+fn allowed_plan_sections(stage: PlanStage) -> &'static [&'static str] {
+    match stage {
+        PlanStage::Stage1 => &["Goal", "Constraints", "Deliverables"],
+        PlanStage::Stage2 => &["Acceptance Criteria", "Quality Bar"],
+        PlanStage::Stage3 => &["Execution Plan", "Verification Plan", "Risks / Fallbacks"],
+        PlanStage::Ready => &[],
+    }
+}
+
+fn disallowed_plan_sections(stage: PlanStage) -> Vec<&'static str> {
+    let all = [
+        "Goal",
+        "Constraints",
+        "Deliverables",
+        "Acceptance Criteria",
+        "Quality Bar",
+        "Execution Plan",
+        "Verification Plan",
+        "Risks / Fallbacks",
+    ];
+    all.into_iter()
+        .filter(|section| !allowed_plan_sections(stage).contains(section))
+        .collect()
+}
+
+fn payload_mentions_plan_section(payload: &str, section: &str) -> bool {
+    let heading = format!("## {section}");
+    payload.contains(&heading)
+}
+
 fn canonicalize_with_missing_tail(path: &std::path::Path) -> std::path::PathBuf {
     let mut missing = Vec::new();
     let mut cursor = path;
@@ -359,7 +427,12 @@ pub fn truncate_output(text: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{canonicalize_with_missing_tail, resolve_plan_mode_write_target};
+    use super::{
+        canonicalize_with_missing_tail, enforce_plan_stage_scope, resolve_plan_mode_write_target,
+        ToolContext,
+    };
+    use crate::modes::plan_act::{ExecutionMode, PlanStage};
+    use serde_json::json;
     use tempfile::tempdir;
 
     #[test]
@@ -426,5 +499,66 @@ mod tests {
         let resolved = resolve_plan_mode_write_target(&root, "plans/other.md", Some(&plan_path))
             .unwrap();
         assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn plan_stage_scope_rejects_later_sections_in_stage1_write() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("repo");
+        let plan_root = temp.path().join("state").join("plans");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&plan_root).unwrap();
+        let plan_path = plan_root.join("plan-123.md");
+        let context = ToolContext {
+            root,
+            mode: ExecutionMode::Plan,
+            plan_path: Some(plan_path),
+            plan_stage: PlanStage::Stage1,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            cancel_flag: None,
+        };
+        let err = enforce_plan_stage_scope(
+            "Write",
+            &json!({
+                "path": "plan-123.md",
+                "content": "# Plan\n\n## Goal\n- x\n\n## Acceptance Criteria\n- y\n"
+            }),
+            &context,
+        )
+        .unwrap_err();
+        assert!(err.contains("Stage 1"), "got: {err}");
+        assert!(err.contains("Acceptance Criteria"), "got: {err}");
+    }
+
+    #[test]
+    fn plan_stage_scope_allows_stage_local_write() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("repo");
+        let plan_root = temp.path().join("state").join("plans");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&plan_root).unwrap();
+        let plan_path = plan_root.join("plan-123.md");
+        let context = ToolContext {
+            root,
+            mode: ExecutionMode::Plan,
+            plan_path: Some(plan_path),
+            plan_stage: PlanStage::Stage2,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            cancel_flag: None,
+        };
+        enforce_plan_stage_scope(
+            "Edit",
+            &json!({
+                "path": "plan-123.md",
+                "old_string": "## Acceptance Criteria\n- old\n",
+                "new_string": "## Acceptance Criteria\n- new\n\n## Quality Bar\n- anchored to src/app/page.tsx\n"
+            }),
+            &context,
+        )
+        .unwrap();
     }
 }

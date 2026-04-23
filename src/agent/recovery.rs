@@ -129,6 +129,10 @@ pub fn repo_change_recovery_note(attempt: usize) -> String {
     )
 }
 
+pub fn repo_change_after_setup_note() -> String {
+    "Setup or verification shell commands have already run, but the requested repository change is still missing. On the next turn, first inspect the target implementation file with Read, then make exactly one small Edit or short Write. Do not run another scaffold or dev-server command until a concrete repo change exists.".to_string()
+}
+
 pub fn tool_call_format_recovery_note(error: &str, attempt: usize) -> String {
     let lower = error.to_ascii_lowercase();
     if lower.contains("truncated tool call") {
@@ -138,6 +142,12 @@ pub fn tool_call_format_recovery_note(error: &str, attempt: usize) -> String {
     }
     format!(
         "Previous tool call failed to parse: {error}. On the next turn, emit exactly one valid <anvil_tool_call>{{\"name\":\"Tool\",\"arguments\":{{...}}}}</anvil_tool_call> block with complete JSON. Keep the tool call small. Start with one small, self-contained change only, and prefer short Write or Edit actions over large full-file outputs. tool_call_format_attempt={attempt}"
+    )
+}
+
+pub fn forced_small_edit_recovery_note(path: &str, attempt: usize) -> String {
+    format!(
+        "Recovery mode is active after repeated truncated tool calls. For the next turn, only use Read or Edit, and target this existing file: {path}. Do not use Write, Bash, Glob, or Grep until one Edit succeeds. Make exactly one small Edit that changes one contiguous block, anchored to exact text from the last Read. Keep the edited block compact and self-contained. forced_small_edit_attempt={attempt}"
     )
 }
 
@@ -279,7 +289,10 @@ pub fn should_block_restart_discovery(tool_name: &str, progress_exists: bool) ->
 
 #[cfg(test)]
 mod tests {
-    use super::tool_call_format_recovery_note;
+    use super::{
+        forced_small_edit_recovery_note, repo_change_after_setup_note,
+        tool_call_format_recovery_note,
+    };
 
     #[test]
     fn truncated_tool_call_note_pushes_read_then_small_edit() {
@@ -288,5 +301,24 @@ mod tests {
         assert!(note.contains("First call Read"), "got: {note}");
         assert!(note.contains("small Edit"), "got: {note}");
         assert!(note.contains("full-file Write"), "got: {note}");
+    }
+
+    #[test]
+    fn setup_note_pushes_read_then_small_edit() {
+        let note = repo_change_after_setup_note();
+        assert!(note.contains("Read"), "got: {note}");
+        assert!(note.contains("small Edit"), "got: {note}");
+        assert!(note.contains("dev-server"), "got: {note}");
+    }
+
+    #[test]
+    fn forced_small_edit_note_limits_tools_to_read_and_edit() {
+        let note = forced_small_edit_recovery_note("app/page.tsx", 2);
+        assert!(note.contains("only use Read or Edit"), "got: {note}");
+        assert!(
+            note.contains("Do not use Write, Bash, Glob, or Grep"),
+            "got: {note}"
+        );
+        assert!(note.contains("app/page.tsx"), "got: {note}");
     }
 }

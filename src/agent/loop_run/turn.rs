@@ -6,7 +6,7 @@ use crate::agent::orchestration::{RepoVerification, capture_repo_snapshot, verif
 use crate::logging::log_llm_event;
 use crate::modes::plan_act::{PlanStage, TaskProfile};
 use crate::ollama::xml_fallback::normalize_tool_call_arguments;
-use crate::tools::registry::resolve_plan_mode_write_target;
+use crate::tools::registry::{ToolSpec, resolve_plan_mode_write_target};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -512,6 +512,7 @@ impl Agent {
                 let mut plan_file_edit_calls_this_turn = 0usize;
                 let mut plan_exploration_calls_this_turn = 0usize;
                 let mut plan_ready_after_tool = false;
+                let mut bash_only_tool_turn = true;
                 let current_plan_stage = self.session.mode_state.plan_stage;
                 let plan_exploration_budget =
                     lifecycle::plan_stage_exploration_budget(current_plan_stage);
@@ -533,6 +534,9 @@ impl Agent {
                 let mut emitted_bash_loop_note = false;
                 for tool_call in prepared_tool_calls {
                     let tool_name = tool_call.name.clone();
+                    if tool_name != "Bash" {
+                        bash_only_tool_turn = false;
+                    }
                     let args_str = tool_call.arguments.to_string();
                     let bash_command = if tool_name == "Bash" {
                         tool_call
@@ -994,6 +998,13 @@ impl Agent {
                 }
                 if emitted_bash_loop_note {
                     self.push_system_note(recovery::install_loop_recovery_note());
+                } else if self.session.mode_state.mode == ExecutionMode::Act
+                    && action_expectation == recovery::ActionExpectation::RepoChange
+                    && bash_only_tool_turn
+                    && repo_edit_calls_made_this_turn == 0
+                    && !logged_act_first_repo_edit
+                {
+                    self.push_system_note(recovery::repo_change_after_setup_note());
                 }
                 let compacted = if self.session.mode_state.mode == ExecutionMode::Plan {
                     false
@@ -1406,6 +1417,8 @@ impl Agent {
             io::stdin().is_terminal(),
         );
 
+        let tool_specs = self.effective_tool_specs();
+
         if use_streaming_transport {
             let mut first_chunk = true;
             // Issue #431: resolve renderer behavior at call-site (env /
@@ -1428,7 +1441,7 @@ impl Agent {
             let reply = self.client.chat_streaming_with_mode(
                 assistant_model.as_str(),
                 &messages,
-                self.tool_registry.specs(),
+                &tool_specs,
                 native_tools_enabled,
                 |chunk| {
                     if interrupt_flag.is_set() {
@@ -1496,7 +1509,7 @@ impl Agent {
     ) -> Result<AssistantReply, String> {
         let client = self.client.clone();
         let model = model.to_string();
-        let tool_specs = self.tool_registry.specs().to_vec();
+        let tool_specs = self.effective_tool_specs();
         let owned_messages = messages.to_vec();
         let timeout = Duration::from_secs(non_streaming_assistant_reply_timeout_secs(
             &model,
@@ -1657,6 +1670,9 @@ impl Agent {
                     .to_string(),
             ));
         }
+        if let Some(note) = self.forced_small_edit_recovery_message() {
+            messages.push(ConversationMessage::system(note));
+        }
         messages.extend(prompting::runtime_context_messages(
             &self.config.cwd,
             &self.work_root,
@@ -1664,6 +1680,43 @@ impl Agent {
         ));
         messages.extend(self.session.messages.clone());
         messages
+    }
+
+    fn effective_tool_specs(&self) -> Vec<ToolSpec> {
+        let mut specs = self.tool_registry.specs().to_vec();
+        if self.forced_small_edit_recovery_target().is_some() {
+            specs.retain(|spec| matches!(spec.function.name.as_str(), "Read" | "Edit"));
+        }
+        specs
+    }
+
+    fn forced_small_edit_recovery_message(&self) -> Option<String> {
+        let path = self.forced_small_edit_recovery_target()?;
+        let attempt = recent_truncated_tool_call_attempt(&self.session.messages).max(1);
+        Some(recovery::forced_small_edit_recovery_note(
+            &progress_path_display(
+                &path.display().to_string(),
+                &self.work_root,
+                self.session.mode_state.active_plan_path.as_deref(),
+                120,
+            ),
+            attempt,
+        ))
+    }
+
+    fn forced_small_edit_recovery_target(&self) -> Option<PathBuf> {
+        if self.session.mode_state.mode != ExecutionMode::Act {
+            return None;
+        }
+        if recent_truncated_tool_call_attempt(&self.session.messages) == 0 {
+            return None;
+        }
+        if has_successful_repo_edit(&self.session.messages) {
+            return None;
+        }
+        let path = last_read_tool_path(&self.session.messages)?;
+        let candidate = resolve_user_path(&self.work_root, &path).ok()?;
+        candidate.is_file().then_some(candidate)
     }
 
     fn execute_tool_call(
@@ -1682,6 +1735,7 @@ impl Agent {
             root: self.work_root.clone(),
             mode: self.session.mode_state.mode,
             plan_path: self.session.mode_state.active_plan_path.clone(),
+            plan_stage: self.session.mode_state.plan_stage,
             auto_approve: self.config.yes_mode,
             interactive_approval: io::stdin().is_terminal(),
             offline: self.config.offline,
@@ -2154,6 +2208,54 @@ fn should_fallback_plan_model_after_timeout(
         return false;
     }
     err.to_ascii_lowercase().contains("timed out")
+}
+
+fn recent_truncated_tool_call_attempt(messages: &[ConversationMessage]) -> usize {
+    messages
+        .iter()
+        .rev()
+        .find_map(|message| {
+            if message.role != "system" {
+                return None;
+            }
+            let lower = message.content.to_ascii_lowercase();
+            if !lower.contains("truncated tool call") {
+                return None;
+            }
+            message
+                .content
+                .rsplit("tool_call_format_attempt=")
+                .next()
+                .and_then(|suffix| suffix.trim().parse::<usize>().ok())
+                .or(Some(1))
+        })
+        .unwrap_or(0)
+}
+
+fn has_successful_repo_edit(messages: &[ConversationMessage]) -> bool {
+    messages.iter().any(|message| {
+        message.role == "tool"
+            && matches!(message.name.as_deref(), Some("Write" | "Edit"))
+            && !message.content.trim_start().starts_with("Error:")
+    })
+}
+
+fn last_read_tool_path(messages: &[ConversationMessage]) -> Option<String> {
+    messages.iter().rev().find_map(|message| {
+        if message.role != "assistant" {
+            return None;
+        }
+        message.tool_calls.iter().rev().find_map(|tool_call| {
+            if tool_call.name != "Read" {
+                return None;
+            }
+            tool_call
+                .arguments
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string)
+        })
+    })
 }
 
 fn plan_sections_with_content(contents: &str) -> Vec<&'static str> {
@@ -2812,11 +2914,15 @@ mod truncate_tests {
 #[cfg(test)]
 mod progress_tests {
     use super::{
-        format_blocked_progress_line, format_progress_line, is_utf8_locale,
-        progress_available_width, sanitize_for_progress, tool_color, tool_display, tool_emoji,
-        unicode_supported,
+        format_blocked_progress_line, format_progress_line, has_successful_repo_edit,
+        is_utf8_locale, last_read_tool_path, progress_available_width,
+        recent_truncated_tool_call_attempt, sanitize_for_progress, tool_color, tool_display,
+        tool_emoji, unicode_supported,
     };
     use crate::modes::plan_act::PlanStage;
+    use crate::ollama::xml_fallback::ToolCall;
+    use crate::safety::path_guard::resolve_user_path;
+    use crate::session::store::ConversationMessage;
     use serde_json::json;
     use std::path::PathBuf;
     use std::sync::Mutex;
@@ -3037,6 +3143,71 @@ mod progress_tests {
         assert!(progress.contains("[iter 3/50] Plan exploration blocked"));
         assert!(progress.contains("tool:   ⛔ Plan exploration blocked"));
         assert!(!progress.contains("Bash blocked"));
+    }
+
+    #[test]
+    fn truncated_tool_call_recovery_detects_latest_attempt() {
+        let messages = vec![
+            ConversationMessage::system("irrelevant".to_string()),
+            ConversationMessage::system(
+                "Previous tool call was cut off by the model length limit: tool call parser failed: truncated tool call (generate response hit length limit). tool_call_format_attempt=2".to_string(),
+            ),
+        ];
+        assert_eq!(recent_truncated_tool_call_attempt(&messages), 2);
+    }
+
+    #[test]
+    fn last_read_tool_path_returns_recent_read_target() {
+        let messages = vec![
+            ConversationMessage::assistant(
+                String::new(),
+                vec![ToolCall {
+                    id: "xml-1".to_string(),
+                    name: "Read".to_string(),
+                    arguments: json!({"path":"app/page.tsx"}),
+                }],
+            ),
+            ConversationMessage::tool("Read".to_string(), "ok".to_string()),
+        ];
+        assert_eq!(
+            last_read_tool_path(&messages).as_deref(),
+            Some("app/page.tsx")
+        );
+    }
+
+    #[test]
+    fn has_successful_repo_edit_ignores_errors() {
+        let messages = vec![
+            ConversationMessage::tool("Write".to_string(), "Error: nope".to_string()),
+            ConversationMessage::tool("Edit".to_string(), "edited app/page.tsx".to_string()),
+        ];
+        assert!(has_successful_repo_edit(&messages));
+    }
+
+    #[test]
+    fn forced_small_edit_recovery_targets_existing_recent_read_file() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        let target = work_root.join("app").join("page.tsx");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "export default function Home() { return null; }\n").unwrap();
+        let messages = vec![
+            ConversationMessage::system(
+                "Previous tool call was cut off by the model length limit: tool call parser failed: truncated tool call (generate response hit length limit). tool_call_format_attempt=1".to_string(),
+            ),
+            ConversationMessage::assistant(
+                String::new(),
+                vec![ToolCall {
+                    id: "xml-1".to_string(),
+                    name: "Read".to_string(),
+                    arguments: json!({"path":"app/page.tsx"}),
+                }],
+            ),
+        ];
+        let resolved = resolve_user_path(&work_root, &last_read_tool_path(&messages).unwrap()).unwrap();
+        assert!(resolved.ends_with("app/page.tsx"), "got: {}", resolved.display());
+        assert_eq!(recent_truncated_tool_call_attempt(&messages), 1);
+        assert!(!has_successful_repo_edit(&messages));
     }
 
     #[test]

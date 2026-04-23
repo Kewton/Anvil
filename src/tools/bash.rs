@@ -33,7 +33,8 @@ pub fn run(
     cancel_flag: Option<&Arc<AtomicBool>>,
     offline: bool,
 ) -> Result<String, String> {
-    let command = normalize_background_command(&normalize_noninteractive_scaffold_command(command));
+    let command =
+        normalize_background_command(&normalize_noninteractive_scaffold_command(command));
     for snippet in BLOCKED_SNIPPETS {
         if command.contains(snippet) {
             return Err(format!("blocked dangerous command fragment: {snippet}"));
@@ -155,6 +156,15 @@ fn render_combined_output(stdout: String, stderr: String) -> String {
 }
 
 fn likely_long_running_command(command: &str) -> bool {
+    if launches_persistent_service(command) {
+        return true;
+    }
+
+    let normalized = command.trim().to_ascii_lowercase();
+    normalized.contains("cargo watch")
+}
+
+fn launches_persistent_service(command: &str) -> bool {
     let normalized = command.trim().to_ascii_lowercase();
     [
         "npm run dev",
@@ -167,14 +177,13 @@ fn likely_long_running_command(command: &str) -> bool {
         "python -m http.server",
         "ruby -run -e httpd",
         "rails server",
-        "cargo watch",
     ]
     .iter()
     .any(|needle| normalized.contains(needle))
 }
 
 fn normalize_background_command(command: &str) -> String {
-    if !requests_background_execution(command) {
+    if !requests_background_execution(command) && !launches_persistent_service(command) {
         return command.to_string();
     }
 
@@ -396,7 +405,7 @@ fn terminate_child(child: &mut Child) {
 mod tests {
     use super::{
         BashCommandClass, classify_command, command_uses_network,
-        likely_long_running_command, normalize_background_command,
+        launches_persistent_service, likely_long_running_command, normalize_background_command,
         normalize_noninteractive_scaffold_command, requests_background_execution, run,
         strip_trailing_background_operator,
     };
@@ -410,6 +419,13 @@ mod tests {
         assert!(likely_long_running_command("next dev"));
         assert!(likely_long_running_command("python -m http.server 8080"));
         assert!(!likely_long_running_command("npm test"));
+    }
+
+    #[test]
+    fn detects_persistent_service_commands() {
+        assert!(launches_persistent_service("npm run dev -- -p 3011"));
+        assert!(launches_persistent_service("next dev"));
+        assert!(!launches_persistent_service("cargo test"));
     }
 
     #[test]
@@ -466,6 +482,14 @@ mod tests {
     fn leaves_foreground_commands_unchanged() {
         let original = "npm run build";
         assert_eq!(normalize_background_command(original), original);
+    }
+
+    #[test]
+    fn detaches_foreground_dev_servers_automatically() {
+        let rewritten = normalize_background_command("npm run dev -- -p 3011");
+        assert!(rewritten.contains("background_pid="));
+        assert!(rewritten.contains("background_log="));
+        assert!(rewritten.contains("'npm run dev -- -p 3011'"));
     }
 
     #[test]
