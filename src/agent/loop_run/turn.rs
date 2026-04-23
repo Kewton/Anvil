@@ -3,6 +3,7 @@ use super::spinner::{Spinner, SpinnerStopSignal};
 use super::summary::{ExitReason, LoopResult, LoopStats};
 use super::*;
 use crate::agent::orchestration::{RepoVerification, capture_repo_snapshot, verify_repo_progress};
+use crate::logging::log_llm_event;
 use std::collections::HashSet;
 use std::path::Path;
 use std::time::Instant;
@@ -142,6 +143,8 @@ impl Agent {
         let mut plan_exploration_only_turns = 0usize;
         let mut recent_bash_commands = Vec::<String>::new();
         let mut install_commands_seen = 0usize;
+        let mut logged_plan_first_write = false;
+        let mut logged_act_first_repo_edit = false;
 
         let mut exit_reason = ExitReason::MaxIterations;
         let mut error_text = String::new();
@@ -231,9 +234,37 @@ impl Agent {
                             self.session.mode_state.active_plan_path.as_deref(),
                         ) {
                             plan_file_edit_calls_this_turn += 1;
+                            if !logged_plan_first_write {
+                                logged_plan_first_write = true;
+                                log_llm_event(
+                                    "agent.milestone.plan_first_write",
+                                    serde_json::json!({
+                                        "session_id": self.session_store.session_id(),
+                                        "iter": last_iter,
+                                        "tool": tool_name,
+                                        "path": tool_call.arguments.get("path").and_then(serde_json::Value::as_str),
+                                    }),
+                                );
+                            }
                         } else if matches!(tool_name.as_str(), "Read" | "Glob" | "Grep") {
                             plan_exploration_calls_this_turn += 1;
                         }
+                    }
+                    if self.session.mode_state.mode == ExecutionMode::Act
+                        && recovery::tool_call_counts_as_repo_edit(&tool_name)
+                        && !logged_act_first_repo_edit
+                    {
+                        logged_act_first_repo_edit = true;
+                        log_llm_event(
+                            "agent.milestone.act_first_repo_edit",
+                            serde_json::json!({
+                                "session_id": self.session_store.session_id(),
+                                "iter": last_iter,
+                                "task_profile": self.session.mode_state.task_profile.as_str(),
+                                "tool": tool_name,
+                                "path": tool_call.arguments.get("path").and_then(serde_json::Value::as_str),
+                            }),
+                        );
                     }
                     let block_restart_discovery = recovery::should_block_restart_discovery(
                         &tool_name,
@@ -530,6 +561,20 @@ impl Agent {
             last_iter.min(self.config.max_iterations),
             self.config.max_iterations,
             duration_secs,
+        );
+        log_llm_event(
+            "agent.milestone.turn_completed",
+            serde_json::json!({
+                "session_id": self.session_store.session_id(),
+                "mode": format!("{:?}", self.session.mode_state.mode),
+                "task_profile": self.session.mode_state.task_profile.as_str(),
+                "exit_reason": exit_reason.label(),
+                "iter_used": stats.iter_used,
+                "iter_max": stats.iter_max,
+                "duration_secs": stats.duration_secs,
+                "total_changed": stats.total_changed,
+                "changed_files": stats.changed_files.clone(),
+            }),
         );
 
         if exit_reason.is_success() {

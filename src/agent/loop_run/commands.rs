@@ -2,6 +2,7 @@ use super::slash_commands::{self, AnvilEditor, build_editor};
 use super::summary::{ExitReason, format_run_summary};
 use super::*;
 use crate::config::LogLevel;
+use crate::logging::log_llm_event;
 use crate::modes::plan_act::TaskProfile;
 use crate::session::store::ConversationMessage;
 use crossterm::event::{self, Event, KeyCode};
@@ -423,6 +424,14 @@ impl Agent {
         stream_output: bool,
     ) -> Result<AgentEvent, String> {
         let status = self.approve_plan_mode()?;
+        log_llm_event(
+            "agent.milestone.plan_approved",
+            serde_json::json!({
+                "session_id": self.session_store.session_id(),
+                "task_profile": self.session.mode_state.task_profile.as_str(),
+                "trigger": trigger_text,
+            }),
+        );
         let plan_contents = self.current_plan_contents()?.unwrap_or_default();
         let plan_summary = lifecycle::plan_act_summary(&plan_contents);
         let profile_guidance = match self.session.mode_state.task_profile {
@@ -641,6 +650,15 @@ impl Agent {
 
         match self.classify_large_task_with_main_model(input) {
             Ok(classified) if classified.large_task => {
+                log_llm_event(
+                    "agent.classifier.result",
+                    serde_json::json!({
+                        "session_id": self.session_store.session_id(),
+                        "input": input,
+                        "large_task": true,
+                        "task_profile": classified.task_profile.as_str(),
+                    }),
+                );
                 let status = self.enter_plan_mode(classified.task_profile)?;
                 Ok(Some(format!(
                     "{status}\nauto-plan: large task detected; planning before implementation ({})",
@@ -648,6 +666,15 @@ impl Agent {
                 )))
             }
             Ok(classified) => {
+                log_llm_event(
+                    "agent.classifier.result",
+                    serde_json::json!({
+                        "session_id": self.session_store.session_id(),
+                        "input": input,
+                        "large_task": false,
+                        "task_profile": classified.task_profile.as_str(),
+                    }),
+                );
                 self.session.mode_state.task_profile = classified.task_profile;
                 Ok(None)
             }
