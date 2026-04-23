@@ -258,7 +258,9 @@ pub(super) fn plan_task_list(contents: &str, task_profile: TaskProfile) -> Vec<S
     } else {
         "[pending]"
     };
-    tasks.push(format!("{approval_status} Review the completed plan and approve execution"));
+    tasks.push(format!(
+        "{approval_status} Review the completed plan and approve execution"
+    ));
     tasks
 }
 
@@ -337,9 +339,11 @@ fn quality_bar_has_repo_specific_anchor(contents: &str) -> bool {
         let lowered = line.to_ascii_lowercase();
         lowered.contains('`')
             || lowered.contains('/')
-            || [".md", ".rs", ".ts", ".tsx", ".js", ".jsx", ".json", ".toml", ".py"]
-                .iter()
-                .any(|needle| lowered.contains(needle))
+            || [
+                ".md", ".rs", ".ts", ".tsx", ".js", ".jsx", ".json", ".toml", ".py",
+            ]
+            .iter()
+            .any(|needle| lowered.contains(needle))
             || tokenize_plan_terms(line)
                 .into_iter()
                 .any(|token| anchors.contains(&token))
@@ -512,11 +516,16 @@ pub(super) fn plan_is_approval_ready(contents: &str) -> bool {
 fn plan_needs_stage_three_fallback(contents: &str) -> bool {
     let missing = plan_missing_sections(contents);
     !missing.is_empty()
-        && missing.iter().all(|section| PLAN_STAGE_THREE.contains(section))
+        && missing
+            .iter()
+            .all(|section| PLAN_STAGE_THREE.contains(section))
         && PLAN_STAGE_ONE
             .iter()
             .chain(PLAN_STAGE_TWO.iter())
             .all(|section| plan_section_is_substantive(contents, section))
+        && PLAN_STAGE_THREE
+            .iter()
+            .any(|section| plan_section_is_substantive(contents, section))
 }
 
 fn extract_first_json_object(raw: &str) -> Option<&str> {
@@ -627,7 +636,10 @@ impl Agent {
             )),
         ];
 
-        match self.client.chat_text(sidecar, &messages) {
+        match self
+            .client
+            .classify_stage_three_fallback(sidecar, &messages)
+        {
             Ok(reply) => parse_stage_three_fallback_decision(&reply.content).unwrap_or(false),
             Err(_) => false,
         }
@@ -646,8 +658,8 @@ impl Agent {
 mod tests {
     use super::{
         current_plan_stage, plan_act_summary, plan_is_approval_ready, plan_is_substantive,
-        plan_missing_sections, plan_next_stage_sections, plan_stage_exploration_budget,
-        plan_stage_sections, plan_task_list,
+        plan_missing_sections, plan_needs_stage_three_fallback, plan_next_stage_sections,
+        plan_stage_exploration_budget, plan_stage_sections, plan_task_list,
     };
     use crate::modes::plan_act::{PlanStage, TaskProfile};
 
@@ -835,6 +847,72 @@ mod tests {
 - 
 ";
         assert!(plan_is_approval_ready(contents));
+    }
+
+    #[test]
+    fn stage_three_fallback_skips_placeholder_only_sections() {
+        let contents = "# Plan
+
+## Goal
+- Build the feature.
+
+## Constraints
+- Keep the repo shape.
+
+## Deliverables
+- A runnable feature.
+
+## Acceptance Criteria
+- The first slice works.
+
+## Quality Bar
+- Anchor polish to `src/app/page.tsx`.
+
+## Execution Plan
+1. First slice:
+2. Next phases:
+3. Review checkpoint:
+
+## Verification Plan
+- 
+
+## Risks / Fallbacks
+- 
+";
+        assert!(!plan_needs_stage_three_fallback(contents));
+    }
+
+    #[test]
+    fn stage_three_fallback_still_allows_partial_real_stage_three_content() {
+        let contents = "# Plan
+
+## Goal
+- Build the feature.
+
+## Constraints
+- Keep the repo shape.
+
+## Deliverables
+- A runnable feature.
+
+## Acceptance Criteria
+- The first slice works.
+
+## Quality Bar
+- Anchor polish to `src/app/page.tsx`.
+
+## Execution Plan
+1. First slice: wire the main game loop in `src/app/page.tsx`.
+2. Next phases:
+3. Review checkpoint:
+
+## Verification Plan
+- 
+
+## Risks / Fallbacks
+- 
+";
+        assert!(plan_needs_stage_three_fallback(contents));
     }
 
     #[test]

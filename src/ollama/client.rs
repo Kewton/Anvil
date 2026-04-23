@@ -28,6 +28,8 @@ const SIDECAR_SUMMARY_TIMEOUT_SECS: u64 = 8;
 const SIDECAR_SUMMARY_MAX_PREDICT: usize = 384;
 const CLASSIFIER_TIMEOUT_SECS: u64 = 20;
 const CLASSIFIER_MAX_PREDICT: usize = 160;
+const STAGE_THREE_FALLBACK_TIMEOUT_SECS: u64 = 6;
+const STAGE_THREE_FALLBACK_MAX_PREDICT: usize = 96;
 
 impl OllamaClient {
     pub fn new(base_url: String) -> Result<Self, String> {
@@ -187,6 +189,20 @@ impl OllamaClient {
             CLASSIFIER_MAX_PREDICT,
         )?;
         classifier_client.chat_text(model, messages)
+    }
+
+    pub fn classify_stage_three_fallback(
+        &self,
+        model: &str,
+        messages: &[ConversationMessage],
+    ) -> Result<AssistantReply, String> {
+        let fallback_client = Self::new_with_timeout_and_options(
+            self.base_url.clone(),
+            STAGE_THREE_FALLBACK_TIMEOUT_SECS,
+            self.context_window,
+            STAGE_THREE_FALLBACK_MAX_PREDICT,
+        )?;
+        fallback_client.chat_text(model, messages)
     }
 
     fn generate_impl<F>(
