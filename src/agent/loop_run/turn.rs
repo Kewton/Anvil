@@ -1635,6 +1635,9 @@ impl Agent {
     ) -> Vec<ConversationMessage> {
         let mut messages = Vec::new();
         let focused_edit_target = self.focused_edit_recovery_target();
+        let focused_edit_target_already_read = focused_edit_target
+            .as_deref()
+            .is_some_and(|target| focused_edit_target_already_read(&self.session.messages, target, &self.work_root));
         let plan_contents = if self.session.mode_state.mode == ExecutionMode::Plan {
             self.current_plan_contents().ok().flatten()
         } else {
@@ -1696,8 +1699,17 @@ impl Agent {
         ));
         if let Some(target) = focused_edit_target {
             messages.push(ConversationMessage::system(
-                focused_edit_guidance_note(&target, &self.work_root),
+                focused_edit_guidance_note(
+                    &target,
+                    &self.work_root,
+                    focused_edit_target_already_read,
+                ),
             ));
+            if let Some(note) =
+                focused_edit_first_slice_note(&target, &self.work_root, focused_edit_target_already_read)
+            {
+                messages.push(ConversationMessage::system(note));
+            }
             messages.extend(focused_edit_history(
                 &self.session.messages,
                 &target,
@@ -1711,10 +1723,14 @@ impl Agent {
 
     fn effective_tool_specs(&self) -> Vec<ToolSpec> {
         let mut specs = self.tool_registry.specs().to_vec();
-        if self.forced_small_edit_recovery_target().is_some()
-            || self.post_scaffold_edit_recovery_target().is_some()
-        {
-            specs.retain(|spec| matches!(spec.function.name.as_str(), "Read" | "Edit"));
+        if let Some(target) = self.focused_edit_recovery_target() {
+            let target_already_read =
+                focused_edit_target_already_read(&self.session.messages, &target, &self.work_root);
+            if target_already_read {
+                specs.retain(|spec| spec.function.name == "Edit");
+            } else {
+                specs.retain(|spec| matches!(spec.function.name.as_str(), "Read" | "Edit"));
+            }
         }
         specs
     }
@@ -2405,15 +2421,52 @@ fn first_existing_impl_target(work_root: &Path) -> Option<PathBuf> {
     .find(|candidate| candidate.is_file())
 }
 
-fn focused_edit_guidance_note(target: &Path, work_root: &Path) -> String {
+fn focused_edit_guidance_note(
+    target: &Path,
+    work_root: &Path,
+    target_already_read: bool,
+) -> String {
     let path = target
         .strip_prefix(work_root)
         .unwrap_or(target)
         .to_string_lossy()
         .replace('\\', "/");
-    format!(
-        "[Focused Edit Recovery] Keep this turn minimal. Use exactly one compact Edit on {path}. Do not attempt a full-file rewrite, multi-file change, scaffold command, or dev-server command. Replace only one contiguous block from the last Read and move the implementation forward with the first concrete slice."
-    )
+    if target_already_read {
+        format!(
+            "[Focused Edit Recovery] The target file {path} has already been read. Do not call Read again. Use exactly one compact Edit on that file now. Replace only one contiguous block from the last Read. Do not attempt a full-file rewrite, multi-file change, scaffold command, or dev-server command."
+        )
+    } else {
+        format!(
+            "[Focused Edit Recovery] Keep this turn minimal. If you need context, do one Read on {path} first; otherwise use exactly one compact Edit. Do not attempt a full-file rewrite, multi-file change, scaffold command, or dev-server command. Replace only one contiguous block from the last Read and move the implementation forward with the first concrete slice."
+        )
+    }
+}
+
+fn focused_edit_first_slice_note(
+    target: &Path,
+    work_root: &Path,
+    target_already_read: bool,
+) -> Option<String> {
+    if !target_already_read {
+        return None;
+    }
+    let relative = target
+        .strip_prefix(work_root)
+        .unwrap_or(target)
+        .to_string_lossy()
+        .replace('\\', "/");
+    if matches!(relative.as_str(), "app/page.tsx" | "src/app/page.tsx") {
+        return Some(recovery::first_scaffold_shell_edit_note(&relative));
+    }
+    None
+}
+
+fn focused_edit_target_already_read(
+    messages: &[ConversationMessage],
+    target: &Path,
+    work_root: &Path,
+) -> bool {
+    latest_read_exchange_for_target(messages, target, work_root).is_some()
 }
 
 fn focused_edit_history(
@@ -3147,17 +3200,18 @@ mod truncate_tests {
 mod progress_tests {
     use super::{
         first_existing_impl_target, format_blocked_progress_line, format_progress_line,
-        focused_edit_history, has_successful_repo_edit, is_utf8_locale, last_read_tool_path,
-        progress_available_width, prune_plan_mode_messages, recent_scaffold_command_seen,
-        recent_truncated_tool_call_attempt, sanitize_for_progress, tool_color, tool_display,
-        tool_emoji, unicode_supported,
+        focused_edit_first_slice_note, focused_edit_guidance_note, focused_edit_history,
+        focused_edit_target_already_read, has_successful_repo_edit, is_utf8_locale,
+        last_read_tool_path, progress_available_width, prune_plan_mode_messages,
+        recent_scaffold_command_seen, recent_truncated_tool_call_attempt, sanitize_for_progress,
+        tool_color, tool_display, tool_emoji, unicode_supported,
     };
     use crate::modes::plan_act::PlanStage;
     use crate::ollama::xml_fallback::ToolCall;
     use crate::safety::path_guard::resolve_user_path;
     use crate::session::store::ConversationMessage;
     use serde_json::json;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::Mutex;
     use tempfile::tempdir;
 
@@ -3518,6 +3572,48 @@ mod progress_tests {
         assert_eq!(filtered[3].name.as_deref(), Some("Read"));
         assert!(!filtered.iter().any(|message| message.content.starts_with("[Plan Mode /")));
         assert!(!filtered.iter().any(|message| message.content == "# readme"));
+    }
+
+    #[test]
+    fn focused_edit_target_already_read_detects_latest_target_read() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        let target = work_root.join("app").join("page.tsx");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "export default function Home() { return null; }\n").unwrap();
+        let messages = vec![
+            ConversationMessage::assistant(
+                String::new(),
+                vec![ToolCall {
+                    id: "xml-1".to_string(),
+                    name: "Read".to_string(),
+                    arguments: json!({"path":"app/page.tsx"}),
+                }],
+            ),
+            ConversationMessage::tool("Read".to_string(), "1: export default".to_string()),
+        ];
+        assert!(focused_edit_target_already_read(
+            &messages, &target, &work_root
+        ));
+    }
+
+    #[test]
+    fn focused_edit_guidance_note_requires_edit_after_read() {
+        let note = focused_edit_guidance_note(Path::new("app/page.tsx"), Path::new("."), true);
+        assert!(note.contains("Do not call Read again"));
+        assert!(note.contains("exactly one compact Edit"));
+    }
+
+    #[test]
+    fn focused_edit_first_slice_note_targets_next_page_shell() {
+        let note = focused_edit_first_slice_note(
+            Path::new("/tmp/project/src/app/page.tsx"),
+            Path::new("/tmp/project"),
+            true,
+        )
+        .expect("expected note");
+        assert!(note.contains("compact static game shell"));
+        assert!(note.contains("src/app/page.tsx"));
     }
 
     #[test]

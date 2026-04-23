@@ -157,6 +157,12 @@ pub fn post_scaffold_edit_recovery_note(path: &str, attempt: usize) -> String {
     )
 }
 
+pub fn first_scaffold_shell_edit_note(path: &str) -> String {
+    format!(
+        "The first repository edit after scaffolding must stay small. On {path}, replace only one contiguous UI block with a compact static game shell: title, HUD, playfield frame, and controls hint. Do not add game loop logic, keyboard handlers, collision logic, canvas animation, or a full-file rewrite in this turn."
+    )
+}
+
 pub fn plan_progress_recovery_note(
     stage: PlanStage,
     next_sections: &[&str],
@@ -297,8 +303,7 @@ pub fn should_block_restart_discovery(tool_name: &str, progress_exists: bool) ->
 mod tests {
     use super::{
         forced_small_edit_recovery_note, post_scaffold_edit_recovery_note,
-        repo_change_after_setup_note,
-        tool_call_format_recovery_note,
+        repo_change_after_setup_note, tool_call_format_recovery_note,
     };
 
     #[test]
