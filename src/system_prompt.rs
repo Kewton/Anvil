@@ -97,6 +97,7 @@ Do not start Acceptance Criteria, Quality Bar, or later sections yet.\n",
                 prompt.push_str(
                     "Stage 2 goal: fill Acceptance Criteria and Quality Bar only.\n\
 Avoid broad exploration. Use the existing plan and the directly relevant files already inspected. Make one small Write or Edit to the plan file.\n\
+Include at least one repo-specific observation or weakness from the files you already inspected. Do not accept generic quality language that could apply to any repository.\n\
 Do not start Execution Plan, Verification Plan, or Risks/Fallbacks yet.\n",
                 );
             }
@@ -153,7 +154,7 @@ For content work, use this process inside Act mode:\n\
 2. Verify the content still preserves required facts and structure.\n\
 3. Evaluate the draft against the quality bar: clarity, specificity, usefulness, and signal density.\n\
 4. If the content is still generic, repetitive, or low-value, improve it before stopping.\n\
-Prefer concrete reader value over filler text.\n",
+Prefer concrete reader value over filler text, and tie the plan to the current file or repository instead of generic documentation advice.\n",
             );
         }
         TaskProfile::Ui => {
