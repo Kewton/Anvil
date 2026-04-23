@@ -110,7 +110,7 @@ pub(crate) fn parse_streaming_generate_response<F>(
     on_chunk: &mut F,
 ) -> Result<AssistantReply, String>
 where
-    F: FnMut(&str),
+    F: FnMut(&str) -> Result<(), String>,
 {
     let reader = BufReader::new(response);
     let mut content = String::new();
@@ -127,7 +127,7 @@ where
         let chunk: GenerateStreamChunk = serde_json::from_str(trimmed)
             .map_err(|err| format!("failed to parse streaming generate chunk: {err}"))?;
         if !chunk.response.is_empty() {
-            on_chunk(&chunk.response);
+            on_chunk(&chunk.response)?;
             content.push_str(&chunk.response);
         }
         if chunk.done {
@@ -153,7 +153,7 @@ pub(crate) fn parse_streaming_chat_response<F>(
     on_chunk: &mut F,
 ) -> Result<AssistantReply, String>
 where
-    F: FnMut(&str),
+    F: FnMut(&str) -> Result<(), String>,
 {
     let reader = BufReader::new(response);
     let mut content = String::new();
@@ -172,7 +172,7 @@ where
             .map_err(|err| format!("failed to parse streaming chat chunk: {err}"))?;
         if let Some(message) = chunk.message {
             if !message.content.is_empty() {
-                on_chunk(&message.content);
+                on_chunk(&message.content)?;
                 content.push_str(&message.content);
             }
             tool_calls.extend(message.tool_calls);

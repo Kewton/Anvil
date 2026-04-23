@@ -1,6 +1,6 @@
 use super::*;
 use crate::logging::log_llm_event;
-use crate::modes::plan_act::PlanStage;
+use crate::modes::plan_act::{PlanStage, TaskProfile};
 use serde_json::Value;
 
 impl Agent {
@@ -172,6 +172,93 @@ pub(super) fn plan_stage_sections(stage: PlanStage) -> &'static [&'static str] {
         PlanStage::Stage3 => PLAN_STAGE_THREE,
         PlanStage::Ready => &[],
     }
+}
+
+fn join_plan_sections(sections: &[&str]) -> String {
+    match sections {
+        [] => String::new(),
+        [one] => (*one).to_string(),
+        [first, second] => format!("{first} and {second}"),
+        _ => {
+            let mut parts = sections[..sections.len() - 1]
+                .iter()
+                .map(|section| (*section).to_string())
+                .collect::<Vec<_>>();
+            let tail = sections[sections.len() - 1];
+            parts.push(format!("and {tail}"));
+            parts.join(", ")
+        }
+    }
+}
+
+fn task_scope_label(task_profile: TaskProfile) -> &'static str {
+    match task_profile {
+        TaskProfile::Coding => "implementation work",
+        TaskProfile::Content => "content update",
+        TaskProfile::Ui => "UI work",
+        TaskProfile::Research => "research task",
+        TaskProfile::Generic => "requested task",
+    }
+}
+
+pub(super) fn plan_task_list(contents: &str, task_profile: TaskProfile) -> Vec<String> {
+    let groups = [
+        (
+            PLAN_STAGE_ONE,
+            format!(
+                "Fill {} for the {}",
+                join_plan_sections(PLAN_STAGE_ONE),
+                task_scope_label(task_profile)
+            ),
+        ),
+        (
+            PLAN_STAGE_TWO,
+            format!("Fill {}", join_plan_sections(PLAN_STAGE_TWO)),
+        ),
+        (
+            PLAN_STAGE_THREE,
+            format!("Fill {}", join_plan_sections(PLAN_STAGE_THREE)),
+        ),
+    ];
+
+    let current_group = groups
+        .iter()
+        .position(|(sections, _)| {
+            sections
+                .iter()
+                .any(|section| !plan_section_is_complete(contents, section))
+        })
+        .unwrap_or(groups.len());
+
+    let mut tasks = Vec::new();
+    for (index, (sections, label)) in groups.iter().enumerate() {
+        let missing = sections
+            .iter()
+            .copied()
+            .filter(|section| !plan_section_is_complete(contents, section))
+            .collect::<Vec<_>>();
+        let status = if missing.is_empty() {
+            "[done]"
+        } else if index == current_group {
+            "[in progress]"
+        } else {
+            "[pending]"
+        };
+        let task = if missing.is_empty() {
+            label.clone()
+        } else {
+            format!("Fill {}", join_plan_sections(&missing))
+        };
+        tasks.push(format!("{status} {task}"));
+    }
+
+    let approval_status = if current_group >= groups.len() {
+        "[in progress]"
+    } else {
+        "[pending]"
+    };
+    tasks.push(format!("{approval_status} Review the completed plan and approve execution"));
+    tasks
 }
 
 fn normalize_plan_heading(heading: &str) -> &str {
@@ -559,9 +646,9 @@ mod tests {
     use super::{
         current_plan_stage, plan_act_summary, plan_is_approval_ready, plan_is_substantive,
         plan_missing_sections, plan_next_stage_sections, plan_stage_exploration_budget,
-        plan_stage_sections,
+        plan_stage_sections, plan_task_list,
     };
-    use crate::modes::plan_act::PlanStage;
+    use crate::modes::plan_act::{PlanStage, TaskProfile};
 
     const TEMPLATE: &str = "# Plan
 
@@ -599,6 +686,27 @@ mod tests {
             vec!["Goal", "Constraints", "Deliverables"]
         );
         assert!(!plan_is_substantive(TEMPLATE));
+    }
+
+    #[test]
+    fn plan_task_list_uses_actual_missing_sections() {
+        let tasks = plan_task_list(TEMPLATE, TaskProfile::Coding);
+        assert_eq!(
+            tasks[0],
+            "[in progress] Fill Goal, Constraints, and Deliverables"
+        );
+        assert_eq!(
+            tasks[1],
+            "[pending] Fill Acceptance Criteria and Quality Bar"
+        );
+        assert_eq!(
+            tasks[2],
+            "[pending] Fill Execution Plan, Verification Plan, and Risks / Fallbacks"
+        );
+        assert_eq!(
+            tasks[3],
+            "[pending] Review the completed plan and approve execution"
+        );
     }
 
     #[test]

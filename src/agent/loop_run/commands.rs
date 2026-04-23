@@ -148,17 +148,10 @@ fn plan_stage_status_line(stage: PlanStage, next_sections: &[&str]) -> String {
     }
 }
 
-fn plan_stage_checklist() -> String {
-    [
-        "<タスク一覧>",
-        "▫️Stage1",
-        "▫️Stage1 レビュー",
-        "▫️Stage2",
-        "▫️Stage2 レビュー",
-        "▫️Stage3",
-        "▫️承認待ち",
-    ]
-    .join("\n")
+fn format_plan_tasks(tasks: &[String]) -> String {
+    let mut lines = vec!["Tasks:".to_string()];
+    lines.extend(tasks.iter().map(|task| format!("- {task}")));
+    lines.join("\n")
 }
 
 fn infer_task_profile_from_text(raw: &str) -> TaskProfile {
@@ -752,11 +745,13 @@ impl Agent {
         );
         let stage = self.session.mode_state.plan_stage;
         let next_sections = lifecycle::plan_stage_sections(stage);
+        let plan_contents = self.current_plan_contents()?.unwrap_or_default();
+        let tasks = lifecycle::plan_task_list(&plan_contents, task_profile);
         Ok(format!(
             "plan mode: {}\nplanning now: building the implementation plan before coding ({})\n{}\n{}",
             plan_path.display(),
             task_profile.as_str(),
-            plan_stage_checklist(),
+            format_plan_tasks(&tasks),
             plan_stage_status_line(stage, next_sections)
         ))
     }

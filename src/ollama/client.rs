@@ -78,7 +78,7 @@ impl OllamaClient {
         messages: &[ConversationMessage],
         tools: &[ToolSpec],
     ) -> Result<AssistantReply, String> {
-        self.generate_impl(model, messages, Some(tools), false, |_| {})
+        self.generate_impl(model, messages, Some(tools), false, |_| Ok(()))
     }
 
     pub fn chat_with_mode(
@@ -89,9 +89,9 @@ impl OllamaClient {
         native_tools_enabled: bool,
     ) -> Result<AssistantReply, String> {
         if native_tools_enabled {
-            self.chat_impl(model, messages, tools, false, |_| {})
+            self.chat_impl(model, messages, tools, false, |_| Ok(()))
         } else {
-            self.generate_impl(model, messages, Some(tools), false, |_| {})
+            self.generate_impl(model, messages, Some(tools), false, |_| Ok(()))
         }
     }
 
@@ -103,7 +103,7 @@ impl OllamaClient {
         on_chunk: F,
     ) -> Result<AssistantReply, String>
     where
-        F: FnMut(&str),
+        F: FnMut(&str) -> Result<(), String>,
     {
         self.generate_impl(model, messages, Some(tools), true, on_chunk)
     }
@@ -117,7 +117,7 @@ impl OllamaClient {
         on_chunk: F,
     ) -> Result<AssistantReply, String>
     where
-        F: FnMut(&str),
+        F: FnMut(&str) -> Result<(), String>,
     {
         if native_tools_enabled {
             self.chat_impl(model, messages, tools, true, on_chunk)
@@ -131,7 +131,7 @@ impl OllamaClient {
         model: &str,
         messages: &[ConversationMessage],
     ) -> Result<AssistantReply, String> {
-        self.generate_impl(model, messages, None, false, |_| {})
+        self.generate_impl(model, messages, None, false, |_| Ok(()))
     }
 
     pub fn summarize_conversation(
@@ -166,7 +166,7 @@ impl OllamaClient {
         mut on_chunk: F,
     ) -> Result<AssistantReply, String>
     where
-        F: FnMut(&str),
+        F: FnMut(&str) -> Result<(), String>,
     {
         let tool_mode = tools.is_some_and(|tool_specs| !tool_specs.is_empty());
         let temperature = if tool_mode { 0.3 } else { 0.7 };
@@ -252,7 +252,7 @@ impl OllamaClient {
         mut on_chunk: F,
     ) -> Result<AssistantReply, String>
     where
-        F: FnMut(&str),
+        F: FnMut(&str) -> Result<(), String>,
     {
         let temperature = 0.3;
         let tool_names_vec = tool_names(tools);

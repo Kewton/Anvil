@@ -1,4 +1,4 @@
-use super::interrupt::{InterruptEnv, InterruptMonitor};
+use super::interrupt::{InterruptEnv, InterruptFlag, InterruptMonitor};
 use super::spinner::{Spinner, SpinnerStopSignal};
 use super::summary::{ExitReason, LoopResult, LoopStats};
 use super::*;
@@ -13,6 +13,7 @@ use std::time::Instant;
 /// Maximum number of characters of tool-call arguments retained in trace logs.
 const LOG_ARGS_MAX_CHARS: usize = 200;
 const PLAN_REPEATED_EXPLORATION_BLOCK_THRESHOLD: usize = 2;
+const USER_INTERRUPT_ERROR: &str = "__anvil_user_interrupt__";
 
 /// UTF-8-safe truncation: keeps at most `max` characters and appends `...`
 /// when the input was longer. Never splits a multi-byte code point.
@@ -26,6 +27,24 @@ fn truncate(s: &str, max: usize) -> String {
         }
         None => s.to_string(),
     }
+}
+
+fn raw_mode_safe_text(text: &str) -> String {
+    text.replace('\n', "\r\n")
+}
+
+fn write_stdout_rendered(text: &str, trailing_newline: bool) {
+    let mut out = io::stdout().lock();
+    let rendered = raw_mode_safe_text(text);
+    let _ = out.write_all(rendered.as_bytes());
+    if trailing_newline {
+        let _ = out.write_all(b"\r\n");
+    }
+    let _ = out.flush();
+}
+
+fn user_interrupt_result() -> String {
+    "exit_code=-1\ninterrupted=true\ninterrupt requested by user".to_string()
 }
 
 fn same_existing_path(lhs: &Path, rhs: &Path) -> bool {
@@ -360,10 +379,13 @@ impl Agent {
                 break 'outer;
             }
 
-            let reply = match self.request_assistant_reply_with_retry(stream_output) {
+            let reply = match self.request_assistant_reply_with_retry(stream_output, &interrupt_flag)
+            {
                 Ok(r) => r,
                 Err(err) => {
-                    exit_reason = if lifecycle::is_tool_call_format_error(&err) {
+                    exit_reason = if err == USER_INTERRUPT_ERROR {
+                        ExitReason::Interrupted
+                    } else if lifecycle::is_tool_call_format_error(&err) {
                         ExitReason::ToolCallFormatError
                     } else {
                         ExitReason::TransportError
@@ -565,8 +587,7 @@ impl Agent {
                             stage_label.as_deref(),
                         )
                     };
-                    println!("{progress}");
-                    let _ = io::stdout().flush();
+                    write_stdout_rendered(&progress, true);
                     // approve-guard: tools Bash/Write/Edit may invoke an
                     // interactive approve prompt in `tools/registry.rs`. We
                     // must not let the spinner write to stderr while stdin is
@@ -988,6 +1009,7 @@ impl Agent {
     fn request_assistant_reply_with_retry(
         &mut self,
         stream_output: bool,
+        interrupt_flag: &InterruptFlag,
     ) -> Result<AssistantReply, String> {
         // Issue #430 Phase D: freeze the footer for the entire LLM call (the
         // thinking spinner writes to stderr, but stream chunks land on stdout
@@ -1011,14 +1033,13 @@ impl Agent {
         loop {
             // Only streaming paths need first-chunk stop; oneshot blocks until
             // the whole reply is assembled so Drop is sufficient.
-            let stop_signal = if stream_output {
-                sp.stop_signal()
-            } else {
-                None
-            };
-            match self.request_assistant_reply(stream_output, stop_signal) {
+            let stop_signal = sp.stop_signal();
+            match self.request_assistant_reply(stream_output, stop_signal, interrupt_flag) {
                 Ok(reply) => return Ok(reply),
                 Err(err) => {
+                    if err == USER_INTERRUPT_ERROR {
+                        return Err(err);
+                    }
                     if self.native_tools_enabled
                         && !downgraded_native_tools
                         && lifecycle::is_native_tool_parser_failure(&err)
@@ -1059,13 +1080,15 @@ impl Agent {
         &mut self,
         stream_output: bool,
         stop_signal: Option<SpinnerStopSignal>,
+        interrupt_flag: &InterruptFlag,
     ) -> Result<AssistantReply, String> {
         let protocol =
             prompting::ToolProtocol::from_native_tools_enabled(self.native_tools_enabled);
         let native_tools_enabled = protocol.native_tools_enabled();
         let messages = self.build_request_messages(protocol);
+        let use_streaming_transport = stream_output || io::stdin().is_terminal();
 
-        if stream_output {
+        if use_streaming_transport {
             let mut first_chunk = true;
             // Issue #431: resolve renderer behavior at call-site (env /
             // is_terminal) and wire it as the terminal stage of the display
@@ -1090,37 +1113,52 @@ impl Agent {
                 self.tool_registry.specs(),
                 native_tools_enabled,
                 |chunk| {
+                    if interrupt_flag.is_set() {
+                        if let Some(sig) = &stop_signal {
+                            sig.trigger();
+                        }
+                        return Err(USER_INTERRUPT_ERROR.to_string());
+                    }
                     if first_chunk {
                         // First chunk: stop spinner immediately (stop flag +
                         // Condvar notify) so no spinner residue appears before
                         // "assistant> ". Safe when `stop_signal` is None.
-                        if let Some(sig) = &stop_signal {
+                        if stream_output
+                            && let Some(sig) = &stop_signal
+                        {
                             sig.trigger();
                         }
-                        print!("assistant> ");
+                        if stream_output {
+                            write_stdout_rendered("assistant> ", false);
+                        }
                         first_chunk = false;
                     }
                     if let Some(r) = renderer.as_mut() {
                         let out = r.push_chunk(chunk);
                         if !out.is_empty() {
-                            let _ = io::stdout().write_all(out.as_bytes());
+                            if stream_output {
+                                write_stdout_rendered(&out, false);
+                            }
                         }
                     } else {
-                        print!("{chunk}");
+                        if stream_output {
+                            write_stdout_rendered(chunk, false);
+                        }
                     }
-                    let _ = io::stdout().flush();
+                    Ok(())
                 },
             )?;
             // Drain any residual buffered content before the closing newline.
             if let Some(r) = renderer.as_mut() {
                 let tail = r.flush();
                 if !tail.is_empty() {
-                    let _ = io::stdout().write_all(tail.as_bytes());
-                    let _ = io::stdout().flush();
+                    if stream_output {
+                        write_stdout_rendered(&tail, false);
+                    }
                 }
             }
-            if !first_chunk {
-                println!();
+            if stream_output && !first_chunk {
+                write_stdout_rendered("", true);
             }
             Ok(reply)
         } else {
@@ -1190,6 +1228,12 @@ impl Agent {
         arguments: &serde_json::Value,
         cancel_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> String {
+        if cancel_flag
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+        {
+            return user_interrupt_result();
+        }
         let context = ToolContext {
             root: self.work_root.clone(),
             mode: self.session.mode_state.mode,
