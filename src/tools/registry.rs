@@ -118,6 +118,30 @@ impl ToolRegistry {
     }
 }
 
+pub(crate) fn resolve_plan_mode_write_target(
+    root: &std::path::Path,
+    raw_path: &str,
+    plan_path: Option<&std::path::Path>,
+) -> Result<Option<std::path::PathBuf>, String> {
+    let Some(allowed_path) = plan_path else {
+        return Ok(None);
+    };
+    let canonical_allowed = canonicalize_with_missing_tail(allowed_path);
+    let input_path = std::path::Path::new(raw_path);
+    let requested = if input_path.is_absolute() {
+        canonicalize_with_missing_tail(input_path)
+    } else if input_path
+        .file_name()
+        .zip(allowed_path.file_name())
+        .is_some_and(|(lhs, rhs)| lhs == rhs)
+    {
+        canonical_allowed.clone()
+    } else {
+        resolve_user_path(root, raw_path)?
+    };
+    Ok((requested == canonical_allowed).then_some(canonical_allowed))
+}
+
 fn default_tool_specs() -> Vec<ToolSpec> {
     vec![
         tool(
@@ -227,23 +251,22 @@ fn enforce_mode(name: &str, arguments: &Value, context: &ToolContext) -> Result<
         "Read" | "Glob" | "Grep" => Ok(()),
         "Write" | "Edit" => {
             let raw_path = get_required_string(arguments, "path")?;
-            let allowed_path = context
-                .plan_path
-                .as_ref()
-                .ok_or_else(|| "plan mode write target is not set".to_string())?;
-            let canonical_allowed = canonicalize_with_missing_tail(allowed_path);
-            let input_path = std::path::Path::new(raw_path);
-            let canonical_requested = if input_path.is_absolute() {
-                canonicalize_with_missing_tail(input_path)
-            } else {
-                resolve_user_path(&context.root, raw_path)?
-            };
-            if canonical_requested == canonical_allowed {
+            if resolve_plan_mode_write_target(
+                &context.root,
+                raw_path,
+                context.plan_path.as_deref(),
+            )?
+            .is_some()
+            {
                 Ok(())
             } else {
+                let allowed_path = context
+                    .plan_path
+                    .as_ref()
+                    .ok_or_else(|| "plan mode write target is not set".to_string())?;
                 Err(format!(
                     "plan mode only allows writing the plan file: {}",
-                    canonical_allowed.display()
+                    canonicalize_with_missing_tail(allowed_path).display()
                 ))
             }
         }
@@ -256,18 +279,11 @@ fn resolve_write_path(
     raw: &str,
     context: &ToolContext,
 ) -> Result<std::path::PathBuf, String> {
-    if context.mode == ExecutionMode::Plan
-        && let Some(allowed) = context.plan_path.as_ref()
-    {
-        let canonical_allowed = canonicalize_with_missing_tail(allowed);
-        let input_path = std::path::Path::new(raw);
-        let canonical_requested = if input_path.is_absolute() {
-            canonicalize_with_missing_tail(input_path)
-        } else {
-            resolve_user_path(root, raw)?
-        };
-        if canonical_requested == canonical_allowed {
-            return Ok(canonical_allowed);
+    if context.mode == ExecutionMode::Plan {
+        if let Some(path) =
+            resolve_plan_mode_write_target(root, raw, context.plan_path.as_deref())?
+        {
+            return Ok(path);
         }
     }
     resolve_user_path(root, raw)
@@ -333,4 +349,40 @@ pub fn truncate_output(text: &str, max_chars: usize) -> String {
     }
     let truncated = text.chars().take(max_chars).collect::<String>();
     format!("{truncated}\n...[truncated]")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{canonicalize_with_missing_tail, resolve_plan_mode_write_target};
+    use tempfile::tempdir;
+
+    #[test]
+    fn plan_mode_write_target_accepts_same_filename_alias() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("repo");
+        let plan_root = temp.path().join("state").join("plans");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&plan_root).unwrap();
+        let plan_path = plan_root.join("plan-123.md");
+        let resolved = resolve_plan_mode_write_target(&root, "plans/plan-123.md", Some(&plan_path))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            canonicalize_with_missing_tail(&resolved),
+            canonicalize_with_missing_tail(&plan_path)
+        );
+    }
+
+    #[test]
+    fn plan_mode_write_target_rejects_wrong_filename() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("repo");
+        let plan_root = temp.path().join("state").join("plans");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&plan_root).unwrap();
+        let plan_path = plan_root.join("plan-123.md");
+        let resolved = resolve_plan_mode_write_target(&root, "plans/other.md", Some(&plan_path))
+            .unwrap();
+        assert!(resolved.is_none());
+    }
 }

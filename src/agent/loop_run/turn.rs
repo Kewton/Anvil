@@ -6,6 +6,7 @@ use crate::agent::orchestration::{RepoVerification, capture_repo_snapshot, verif
 use crate::logging::log_llm_event;
 use crate::modes::plan_act::PlanStage;
 use crate::ollama::xml_fallback::normalize_tool_call_arguments;
+use crate::tools::registry::resolve_plan_mode_write_target;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Instant;
@@ -60,28 +61,22 @@ fn format_iteration_status(
     lines.join("\n")
 }
 
-fn same_existing_path(lhs: &Path, rhs: &Path) -> bool {
-    match (std::fs::canonicalize(lhs), std::fs::canonicalize(rhs)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => lhs == rhs,
-    }
-}
-
 fn is_plan_file_tool_call(
     tool_name: &str,
     arguments: &serde_json::Value,
+    work_root: &Path,
     plan_path: Option<&Path>,
 ) -> bool {
     if !matches!(tool_name, "Write" | "Edit") {
         return false;
     }
-    let Some(plan_path) = plan_path else {
-        return false;
-    };
     let Some(raw_path) = arguments.get("path").and_then(serde_json::Value::as_str) else {
         return false;
     };
-    same_existing_path(Path::new(raw_path), plan_path)
+    resolve_plan_mode_write_target(work_root, raw_path, plan_path)
+        .ok()
+        .flatten()
+        .is_some()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -476,6 +471,7 @@ impl Agent {
                         if is_plan_file_tool_call(
                             &tool_name,
                             &tool_call.arguments,
+                            &self.work_root,
                             self.session.mode_state.active_plan_path.as_deref(),
                         ) {
                             plan_file_edit_calls_this_turn += 1;
@@ -571,12 +567,8 @@ impl Agent {
                     // drops at the end of this iteration so the worker resumes
                     // before the next loop tick.
                     let _footer_freeze = self.footer.freeze_for_inference();
-                    let progress = if block_restart_discovery
-                        || block_bash_loop
-                        || block_plan_exploration
-                        || block_repeated_plan_exploration
-                    {
-                        format_blocked_bash_progress_line(
+                    let progress = if block_restart_discovery {
+                        format_blocked_progress_line(
                             &tool_name,
                             &tool_call.arguments,
                             iter_count + 1,
@@ -585,6 +577,55 @@ impl Agent {
                             use_color,
                             use_unicode,
                             self.footer.current_cols(),
+                            "Restart discovery blocked",
+                            "Resume from the current repo state instead of restarting broad discovery.",
+                            self.session.mode_state.active_plan_path.as_deref(),
+                            current_plan_stage,
+                        )
+                    } else if block_bash_loop {
+                        format_blocked_progress_line(
+                            &tool_name,
+                            &tool_call.arguments,
+                            iter_count + 1,
+                            self.config.max_iterations,
+                            &self.work_root,
+                            use_color,
+                            use_unicode,
+                            self.footer.current_cols(),
+                            "Bash loop blocked",
+                            "Repeated shell command detected; choose a different next step.",
+                            self.session.mode_state.active_plan_path.as_deref(),
+                            current_plan_stage,
+                        )
+                    } else if block_plan_exploration {
+                        format_blocked_progress_line(
+                            &tool_name,
+                            &tool_call.arguments,
+                            iter_count + 1,
+                            self.config.max_iterations,
+                            &self.work_root,
+                            use_color,
+                            use_unicode,
+                            self.footer.current_cols(),
+                            "Plan exploration blocked",
+                            "Exploration budget reached for this stage; write the next missing plan section.",
+                            self.session.mode_state.active_plan_path.as_deref(),
+                            current_plan_stage,
+                        )
+                    } else if block_repeated_plan_exploration {
+                        format_blocked_progress_line(
+                            &tool_name,
+                            &tool_call.arguments,
+                            iter_count + 1,
+                            self.config.max_iterations,
+                            &self.work_root,
+                            use_color,
+                            use_unicode,
+                            self.footer.current_cols(),
+                            "Plan exploration blocked",
+                            "Repeated exploration detected; move the plan forward instead of rereading.",
+                            self.session.mode_state.active_plan_path.as_deref(),
+                            current_plan_stage,
                         )
                     } else {
                         let live_plan_stage = if self.session.mode_state.mode == ExecutionMode::Plan
@@ -609,6 +650,7 @@ impl Agent {
                             && is_plan_file_tool_call(
                                 &tool_name,
                                 &tool_call.arguments,
+                                &self.work_root,
                                 self.session.mode_state.active_plan_path.as_deref(),
                             )
                         {
@@ -776,6 +818,7 @@ impl Agent {
                         && is_plan_file_tool_call(
                             &tool_name,
                             &tool_call.arguments,
+                            &self.work_root,
                             self.session.mode_state.active_plan_path.as_deref(),
                         )
                         && self
@@ -1663,19 +1706,10 @@ struct PlanWriteSummary {
 }
 
 fn plan_path_matches(raw_path: &str, work_root: &Path, plan_path: Option<&Path>) -> bool {
-    let Some(plan_path) = plan_path else {
-        return false;
-    };
-    if Path::new(raw_path)
-        .file_name()
-        .zip(plan_path.file_name())
-        .is_some_and(|(lhs, rhs)| lhs == rhs)
-    {
-        return true;
-    }
-    resolve_user_path(work_root, raw_path)
+    resolve_plan_mode_write_target(work_root, raw_path, plan_path)
         .ok()
-        .is_some_and(|resolved| same_existing_path(&resolved, plan_path))
+        .flatten()
+        .is_some()
 }
 
 fn progress_path_display(raw_path: &str, work_root: &Path, plan_path: Option<&Path>, max_chars: usize) -> String {
@@ -2291,7 +2325,7 @@ pub(super) fn format_progress_line(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn format_blocked_bash_progress_line(
+fn format_blocked_progress_line(
     tool_name: &str,
     arguments: &serde_json::Value,
     iter_human: usize,
@@ -2300,10 +2334,14 @@ fn format_blocked_bash_progress_line(
     use_color: bool,
     use_unicode: bool,
     cols: Option<u16>,
+    headline: &str,
+    note: &str,
+    plan_path: Option<&Path>,
+    current_stage: PlanStage,
 ) -> String {
     let arg_budget = progress_available_width(
         cols,
-        "Bash blocked",
+        headline,
         iter_human,
         max_iterations,
         use_unicode,
@@ -2312,17 +2350,30 @@ fn format_blocked_bash_progress_line(
         tool_name,
         arguments,
         work_root,
-        None,
-        PlanStage::Ready,
+        plan_path,
+        current_stage,
         arg_budget,
     );
     let label = if use_unicode {
-        "⛔ Bash blocked".to_string()
+        format!("⛔ {headline}")
     } else {
-        "Bash blocked".to_string()
+        headline.to_string()
     };
     let painted = paint(&label, "\x1b[38;5;196m", use_color);
-    format!("[iter {iter_human}/{max_iterations}]  {painted}  {}", display.action)
+    if matches!(tool_name, "Read" | "Write" | "Edit") {
+        let mut lines = Vec::new();
+        lines.push(format!("[iter {iter_human}/{max_iterations}] {headline}"));
+        lines.push(format!("  tool:   {painted}"));
+        lines.push(format_progress_field("  action: ", &display.action, cols));
+        if let Some(path) = display.path {
+            lines.push(format_progress_field("  file:   ", &path, cols));
+        }
+        lines.push(format_progress_field("  status: ", note, cols));
+        lines.push(String::new());
+        lines.join("\n")
+    } else {
+        format!("[iter {iter_human}/{max_iterations}]  {painted}  {}", display.action)
+    }
 }
 
 #[cfg(test)]
@@ -2350,13 +2401,15 @@ mod truncate_tests {
 #[cfg(test)]
 mod progress_tests {
     use super::{
-        format_progress_line, is_utf8_locale, progress_available_width, sanitize_for_progress,
-        tool_color, tool_display, tool_emoji, unicode_supported,
+        format_blocked_progress_line, format_progress_line, is_utf8_locale,
+        progress_available_width, sanitize_for_progress, tool_color, tool_display, tool_emoji,
+        unicode_supported,
     };
     use crate::modes::plan_act::PlanStage;
     use serde_json::json;
     use std::path::PathBuf;
     use std::sync::Mutex;
+    use tempfile::tempdir;
 
     static ENV_GUARD: Mutex<()> = Mutex::new(());
 
@@ -2463,6 +2516,36 @@ mod progress_tests {
     }
 
     #[test]
+    fn tool_display_plan_write_accepts_same_filename_alias() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().join("repo");
+        let plan_root = temp.path().join("state").join("plans");
+        std::fs::create_dir_all(&work_root).unwrap();
+        std::fs::create_dir_all(&plan_root).unwrap();
+        let plan_path = plan_root.join("plan-1.md");
+        std::fs::write(&plan_path, "# Plan\n\n## Goal\n- Existing goal\n").unwrap();
+        let args = json!({
+            "path": "plans/plan-1.md",
+            "content": "# Plan\n\n## Goal\n- Improve README.\n\n## Constraints\n- Keep markdown.\n\n## Deliverables\n- Updated README.\n"
+        });
+        let display = tool_display(
+            "Write",
+            &args,
+            &work_root,
+            Some(plan_path.as_path()),
+            PlanStage::Stage1,
+            120,
+        );
+        assert_eq!(display.action, "Add Goal, Constraints, and Deliverables");
+        assert!(
+            display
+                .path
+                .as_deref()
+                .is_some_and(|path| path.contains("plans/plan-1.md"))
+        );
+    }
+
+    #[test]
     fn tool_display_plan_read_marks_review() {
         let work_root = PathBuf::from("/work");
         let plan_path = PathBuf::from("/work/.anvil-state/sessions/abc/plans/plan-1.md");
@@ -2520,6 +2603,29 @@ mod progress_tests {
         let display = tool_display("Bash", &args, &work_root, None, PlanStage::Stage1, 20);
         assert_eq!(display.action.len(), 23);
         assert!(display.action.ends_with("..."));
+    }
+
+    #[test]
+    fn blocked_progress_uses_specific_reason_not_bash_label() {
+        let work_root = PathBuf::from("/work");
+        let args = json!({"path": "/work/README.md"});
+        let progress = format_blocked_progress_line(
+            "Read",
+            &args,
+            3,
+            50,
+            &work_root,
+            false,
+            true,
+            Some(120),
+            "Plan exploration blocked",
+            "Exploration budget reached for this stage; write the next missing plan section.",
+            None,
+            PlanStage::Stage2,
+        );
+        assert!(progress.contains("[iter 3/50] Plan exploration blocked"));
+        assert!(progress.contains("tool:   ⛔ Plan exploration blocked"));
+        assert!(!progress.contains("Bash blocked"));
     }
 
     #[test]

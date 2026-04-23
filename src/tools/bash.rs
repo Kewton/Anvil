@@ -32,20 +32,24 @@ pub fn run(
     cancel_flag: Option<&Arc<AtomicBool>>,
     offline: bool,
 ) -> Result<String, String> {
+    let command = normalize_noninteractive_scaffold_command(command);
     for snippet in BLOCKED_SNIPPETS {
         if command.contains(snippet) {
             return Err(format!("blocked dangerous command fragment: {snippet}"));
         }
     }
-    let class = classify_command(command);
-    enforce_offline_policy(command, class, offline)?;
+    let class = classify_command(&command);
+    enforce_offline_policy(&command, class, offline)?;
 
     let mut cmd = Command::new("sh");
-    cmd.args(["-lc", command])
+    cmd.args(["-lc", &command])
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if is_noninteractive_scaffold_command(&command) {
+        cmd.env("CI", "1");
+    }
 
     #[cfg(unix)]
     {
@@ -63,7 +67,7 @@ pub fn run(
     let mut child = cmd
         .spawn()
         .map_err(|err| format!("failed to run shell command: {err}"))?;
-    let timeout = likely_long_running_command(command).then_some(LONG_RUNNING_TIMEOUT);
+    let timeout = likely_long_running_command(&command).then_some(LONG_RUNNING_TIMEOUT);
     let started = Instant::now();
 
     let status = loop {
@@ -166,6 +170,34 @@ fn likely_long_running_command(command: &str) -> bool {
     ]
     .iter()
     .any(|needle| normalized.contains(needle))
+}
+
+fn is_noninteractive_scaffold_command(command: &str) -> bool {
+    let normalized = command.trim().to_ascii_lowercase();
+    normalized.contains("create-next-app") || normalized.contains("create next-app")
+}
+
+fn normalize_noninteractive_scaffold_command(command: &str) -> String {
+    if !is_noninteractive_scaffold_command(command) {
+        return command.to_string();
+    }
+
+    let normalized = command.to_ascii_lowercase();
+    let mut rewritten = command.trim().to_string();
+    let has_yes = normalized.contains(" --yes")
+        || normalized.ends_with(" --yes")
+        || normalized.contains(" -y")
+        || normalized.ends_with(" -y");
+    if !has_yes {
+        rewritten.push_str(" --yes");
+    }
+    let has_package_manager = ["--use-npm", "--use-pnpm", "--use-yarn", "--use-bun"]
+        .iter()
+        .any(|flag| normalized.contains(flag));
+    if !has_package_manager {
+        rewritten.push_str(" --use-npm");
+    }
+    rewritten
 }
 
 fn enforce_offline_policy(
@@ -314,7 +346,10 @@ fn terminate_child(child: &mut Child) {
 
 #[cfg(test)]
 mod tests {
-    use super::{BashCommandClass, classify_command, command_uses_network, likely_long_running_command};
+    use super::{
+        BashCommandClass, classify_command, command_uses_network,
+        likely_long_running_command, normalize_noninteractive_scaffold_command,
+    };
 
     #[test]
     fn detects_long_running_dev_commands() {
@@ -339,5 +374,21 @@ mod tests {
         assert!(command_uses_network("curl -I https://example.com"));
         assert!(command_uses_network("npm install vitest"));
         assert!(!command_uses_network("cargo test"));
+    }
+
+    #[test]
+    fn normalizes_create_next_app_to_noninteractive() {
+        let rewritten = normalize_noninteractive_scaffold_command(
+            "npx create-next-app@latest . --typescript --tailwind",
+        );
+        assert!(rewritten.contains("--yes"));
+        assert!(rewritten.contains("--use-npm"));
+    }
+
+    #[test]
+    fn preserves_existing_scaffold_flags() {
+        let original = "npx create-next-app@latest . --typescript --yes --use-pnpm";
+        let rewritten = normalize_noninteractive_scaffold_command(original);
+        assert_eq!(rewritten, original);
     }
 }
