@@ -32,10 +32,14 @@ fn detects_action_prompts_in_english_and_japanese() {
         "Explain the architecture",
         ExecutionMode::Act
     ));
-    assert!(!user_prompt_requires_action(
+    assert!(user_prompt_requires_action(
         "plan the work",
         ExecutionMode::Plan
     ));
+    assert_eq!(
+        classify_action_expectation("plan the work", ExecutionMode::Plan),
+        ActionExpectation::PlanProgress
+    );
 }
 
 #[test]

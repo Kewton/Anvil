@@ -471,6 +471,30 @@ impl Agent {
                         break 'outer;
                     }
                     self.push_system_note(recovery::repo_change_recovery_note(repo_change_retries));
+                } else if action_expectation == recovery::ActionExpectation::PlanProgress {
+                    plan_progress_retries += 1;
+                    if plan_progress_retries >= 4 {
+                        exit_reason = ExitReason::PlanIncomplete;
+                        error_text = exit_reason.default_error_text().to_string();
+                        break 'outer;
+                    }
+                    let next_sections = self
+                        .current_plan_contents()
+                        .ok()
+                        .flatten()
+                        .map(|contents| lifecycle::plan_next_stage_sections(&contents))
+                        .unwrap_or_default();
+                    let missing_sections = self
+                        .current_plan_contents()
+                        .ok()
+                        .flatten()
+                        .map(|contents| lifecycle::plan_missing_sections(&contents))
+                        .unwrap_or_default();
+                    self.push_system_note(recovery::plan_progress_recovery_note(
+                        &next_sections,
+                        &missing_sections,
+                        plan_progress_retries,
+                    ));
                 } else {
                     empty_retries += 1;
                     if empty_retries >= 3 {
@@ -495,6 +519,16 @@ impl Agent {
                         break 'outer;
                     }
                     self.push_system_note(recovery::repo_change_recovery_note(repo_change_retries));
+                } else if action_expectation == recovery::ActionExpectation::PlanProgress {
+                    plan_progress_retries += 1;
+                    if plan_progress_retries >= 4 {
+                        exit_reason = ExitReason::PlanIncomplete;
+                        error_text = exit_reason.default_error_text().to_string();
+                        break 'outer;
+                    }
+                    self.push_system_note(recovery::plan_no_tool_recovery_note(
+                        plan_progress_retries,
+                    ));
                 } else {
                     no_tool_retries += 1;
                     if no_tool_retries >= 3 {

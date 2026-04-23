@@ -5,11 +5,12 @@ pub enum ActionExpectation {
     None,
     ToolAction,
     RepoChange,
+    PlanProgress,
 }
 
 pub fn classify_action_expectation(prompt: &str, mode: ExecutionMode) -> ActionExpectation {
     if mode == ExecutionMode::Plan {
-        return ActionExpectation::None;
+        return ActionExpectation::PlanProgress;
     }
 
     let normalized = prompt.to_ascii_lowercase();
@@ -84,6 +85,12 @@ pub fn classify_action_expectation(prompt: &str, mode: ExecutionMode) -> ActionE
 
 pub fn user_prompt_requires_action(prompt: &str, mode: ExecutionMode) -> bool {
     classify_action_expectation(prompt, mode) != ActionExpectation::None
+}
+
+pub fn plan_no_tool_recovery_note(attempt: usize) -> String {
+    format!(
+        "You are still in Plan mode and the plan has not advanced. Do not describe intent only. On the next turn, call a tool immediately and make one small Write or Edit to the active plan file. plan_no_tool_attempt={attempt}"
+    )
 }
 
 pub fn empty_response_recovery_note(attempt: usize, requires_action: bool) -> String {
