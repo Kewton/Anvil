@@ -1130,6 +1130,11 @@ impl Agent {
                         .ok()
                         .flatten()
                         .unwrap_or_default();
+                    if self.plan_is_substantive_with_fallback(&plan_contents) {
+                        final_prose = final_reply;
+                        exit_reason = ExitReason::Done;
+                        break 'outer;
+                    }
                     let current_stage = lifecycle::current_plan_stage(&plan_contents);
                     let next_sections = lifecycle::plan_next_stage_sections(&plan_contents);
                     plan_progress_retries += 1;
