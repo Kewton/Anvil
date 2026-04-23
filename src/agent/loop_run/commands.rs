@@ -170,6 +170,72 @@ fn infer_task_profile_from_text(raw: &str) -> TaskProfile {
     }
 }
 
+fn infer_large_task_from_text(raw: &str) -> bool {
+    let lower = raw.to_ascii_lowercase();
+    let mut score = 0u8;
+
+    let strong_english = [
+        "create", "build", "develop", "implement", "scaffold", "from scratch", "full app",
+    ];
+    if strong_english.iter().any(|keyword| lower.contains(keyword)) {
+        score += 3;
+    }
+
+    let strong_japanese = ["作って", "作成", "開発", "実装", "新規", "構築"];
+    if strong_japanese.iter().any(|keyword| raw.contains(keyword)) {
+        score += 3;
+    }
+
+    let stage_english = ["first", "then", "finally", "step", "phase", "plan", "verify"];
+    let english_stage_hits = stage_english
+        .iter()
+        .filter(|keyword| lower.contains(**keyword))
+        .count()
+        .min(2) as u8;
+    if english_stage_hits > 0 {
+        score += english_stage_hits;
+    }
+
+    let stage_japanese = ["まず", "その後", "最後に", "段階", "ステップ", "計画", "確認"];
+    let japanese_stage_hits = stage_japanese
+        .iter()
+        .filter(|keyword| raw.contains(**keyword))
+        .count()
+        .min(3) as u8;
+    if japanese_stage_hits > 0 {
+        score += japanese_stage_hits;
+    }
+
+    let framework_english = ["next.js", "react", "rails", "fastapi", "port"];
+    if framework_english.iter().any(|keyword| lower.contains(keyword)) {
+        score += 2;
+    }
+
+    let framework_japanese = ["アプリ", "ゲーム", "サイト", "ポート", "起動"];
+    if framework_japanese.iter().any(|keyword| raw.contains(keyword)) {
+        score += 2;
+    }
+
+    let quality_english = ["polish", "high quality", "beautiful", "cool"];
+    if quality_english.iter().any(|keyword| lower.contains(keyword)) {
+        score += 1;
+    }
+
+    let quality_japanese = ["高品質", "かっこいい", "作り込", "面白"];
+    if quality_japanese.iter().any(|keyword| raw.contains(keyword)) {
+        score += 1;
+    }
+
+    score >= 3
+}
+
+fn heuristic_classified_task(input: &str) -> ClassifiedTask {
+    ClassifiedTask {
+        large_task: infer_large_task_from_text(input),
+        task_profile: infer_task_profile_from_text(input),
+    }
+}
+
 fn parse_large_task_decision(raw: &str, request_hint: Option<&str>) -> Option<ClassifiedTask> {
     let body = extract_json_object(raw.trim())?;
     if let Ok(decision) = serde_json::from_str::<LargeTaskDecision>(body) {
@@ -736,7 +802,29 @@ impl Agent {
             }
             Err(err) => {
                 tracing::warn!("auto-plan classifier failed: {err}");
-                Ok(None)
+                let fallback = heuristic_classified_task(input);
+                log_llm_event(
+                    "agent.classifier.fallback_used",
+                    serde_json::json!({
+                        "session_id": self.session_store.session_id(),
+                        "input": input,
+                        "reason": "classifier_failure",
+                        "error": err,
+                        "large_task": fallback.large_task,
+                        "task_profile": fallback.task_profile.as_str(),
+                        "fallback": "heuristic",
+                    }),
+                );
+                if fallback.large_task {
+                    let status = self.enter_plan_mode(fallback.task_profile)?;
+                    Ok(Some(format!(
+                        "{status}\nauto-plan: classifier unavailable; using heuristic fallback ({})",
+                        fallback.task_profile.as_str()
+                    )))
+                } else {
+                    self.session.mode_state.task_profile = fallback.task_profile;
+                    Ok(None)
+                }
             }
         }
     }
@@ -1462,6 +1550,23 @@ mod tests {
         assert!(!is_classifier_transport_error(
             "failed to parse large-task classifier response: nope"
         ));
+    }
+
+    #[test]
+    fn infers_large_task_for_staged_japanese_request() {
+        assert!(infer_large_task_from_text(
+            "README.md を改善する3段階の作業です。まず変更計画を書き、その後見出しを1つ追加し、最後に内容を確認してください。"
+        ));
+        assert!(!infer_large_task_from_text("README の typo を1箇所だけ修正して"));
+    }
+
+    #[test]
+    fn heuristic_classification_prefers_content_for_readme_work() {
+        let classified = heuristic_classified_task(
+            "README.md を改善する3段階の作業です。まず変更計画を書き、その後見出しを1つ追加し、最後に内容を確認してください。",
+        );
+        assert!(classified.large_task);
+        assert_eq!(classified.task_profile, TaskProfile::Content);
     }
 
     #[test]
