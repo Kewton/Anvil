@@ -599,7 +599,7 @@ impl Agent {
                     }
                 };
                 self.session.mode_state.plan_stage = lifecycle::current_plan_stage(&plan_contents);
-                if !lifecycle::plan_is_substantive(&plan_contents) {
+                if !self.plan_is_substantive_with_fallback(&plan_contents) {
                     let next_sections = lifecycle::plan_next_stage_sections(&plan_contents);
                     let missing_sections = lifecycle::plan_missing_sections(&plan_contents);
                     let current_stage = lifecycle::current_plan_stage(&plan_contents);

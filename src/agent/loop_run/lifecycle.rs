@@ -1,5 +1,6 @@
 use super::*;
 use crate::modes::plan_act::PlanStage;
+use serde_json::Value;
 
 impl Agent {
     pub(super) fn current_plan_contents(&self) -> Result<Option<String>, String> {
@@ -167,6 +168,11 @@ pub(super) fn plan_stage_sections(stage: PlanStage) -> &'static [&'static str] {
 fn normalize_plan_heading(heading: &str) -> &str {
     match heading.trim() {
         "Risks/Fallbacks" => "Risks / Fallbacks",
+        "実行計画" | "実装計画" | "実装フェーズ" => "Execution Plan",
+        "検証計画" => "Verification Plan",
+        "リスク/フォールバック" | "リスク・フォールバック" | "リスク / フォールバック" => {
+            "Risks / Fallbacks"
+        }
         other => other,
     }
 }
@@ -284,6 +290,50 @@ pub(super) fn plan_is_approval_ready(contents: &str) -> bool {
     .all(|section| plan_section_is_substantive(contents, section))
 }
 
+fn plan_needs_stage_three_fallback(contents: &str) -> bool {
+    let missing = plan_missing_sections(contents);
+    !missing.is_empty()
+        && missing.iter().all(|section| PLAN_STAGE_THREE.contains(section))
+        && PLAN_STAGE_ONE
+            .iter()
+            .chain(PLAN_STAGE_TWO.iter())
+            .all(|section| plan_section_is_substantive(contents, section))
+}
+
+fn extract_first_json_object(raw: &str) -> Option<&str> {
+    let start = raw.find('{')?;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escape = false;
+    for (offset, ch) in raw[start..].char_indices() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_string => escape = true,
+            '"' => in_string = !in_string,
+            '{' if !in_string => depth += 1,
+            '}' if !in_string => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(&raw[start..start + offset + ch.len_utf8()]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn parse_stage_three_fallback_decision(raw: &str) -> Option<bool> {
+    let body = extract_first_json_object(raw.trim())?;
+    let value: Value = serde_json::from_str(body).ok()?;
+    value
+        .get("contains_stage_three_sections")
+        .and_then(Value::as_bool)
+}
+
 pub(super) fn plan_act_summary(contents: &str) -> String {
     let mut parts = Vec::new();
     for section in [
@@ -325,6 +375,38 @@ impl Agent {
         let stage = current_plan_stage(&contents);
         self.session.mode_state.plan_stage = stage;
         Ok(Some(stage))
+    }
+
+    fn plan_stage_three_fallback_matches(&self, contents: &str) -> bool {
+        if !plan_needs_stage_three_fallback(contents) {
+            return false;
+        }
+        let Some(sidecar) = self.models.sidecar.as_ref() else {
+            return false;
+        };
+
+        let messages = vec![
+            ConversationMessage::system(
+                "You verify whether a plan already contains the substance of three sections. Reply with JSON only in this shape: {\"contains_stage_three_sections\":true|false}. Return true only if the plan substantially includes all of these: Execution Plan, Verification Plan, and Risks/Fallbacks, even when the headings are written in another language or alternate wording."
+                    .to_string(),
+            ),
+            ConversationMessage::user(format!(
+                "Decide whether this plan already contains the substance of Execution Plan, Verification Plan, and Risks/Fallbacks.\n\nPlan:\n{contents}"
+            )),
+        ];
+
+        match self.client.chat_text(sidecar, &messages) {
+            Ok(reply) => parse_stage_three_fallback_decision(&reply.content).unwrap_or(false),
+            Err(_) => false,
+        }
+    }
+
+    pub(super) fn plan_is_substantive_with_fallback(&self, contents: &str) -> bool {
+        plan_is_substantive(contents) || self.plan_stage_three_fallback_matches(contents)
+    }
+
+    pub(super) fn plan_is_approval_ready_with_fallback(&self, contents: &str) -> bool {
+        plan_is_approval_ready(contents) || self.plan_stage_three_fallback_matches(contents)
     }
 }
 
@@ -512,5 +594,38 @@ mod tests {
             plan_stage_sections(PlanStage::Stage2),
             &["Acceptance Criteria", "Quality Bar"]
         );
+    }
+
+    #[test]
+    fn japanese_stage_three_headings_are_normalized() {
+        let contents = "# Plan
+
+## Goal
+- a
+
+## Constraints
+- b
+
+## Deliverables
+- c
+
+## Acceptance Criteria
+- d
+
+## Quality Bar
+- e
+
+## 実行計画
+- f
+
+## 検証計画
+- g
+
+## リスク/フォールバック
+- h
+";
+        assert!(plan_is_substantive(contents));
+        assert!(plan_is_approval_ready(contents));
+        assert_eq!(current_plan_stage(contents), PlanStage::Ready);
     }
 }

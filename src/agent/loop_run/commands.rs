@@ -705,7 +705,7 @@ impl Agent {
         let plan_contents = self
             .current_plan_contents()?
             .ok_or_else(|| "plan file is missing".to_string())?;
-        if !lifecycle::plan_is_approval_ready(&plan_contents) {
+        if !self.plan_is_approval_ready_with_fallback(&plan_contents) {
             return Err("plan file is not ready for approval yet".to_string());
         }
         self.session.mode_state.approve();
@@ -1160,7 +1160,7 @@ The plan must still define: (1) the first shippable vertical slice, (2) concrete
                     println!();
                     if self.session.mode_state.mode == ExecutionMode::Plan {
                         let plan_contents = self.current_plan_contents()?.unwrap_or_default();
-                        if lifecycle::plan_is_approval_ready(&plan_contents) {
+                        if self.plan_is_approval_ready_with_fallback(&plan_contents) {
                             match self.prompt_for_plan_approval_choice()? {
                                 Some(PlanApprovalChoice::Execute) => {
                                     return self.execute_approved_plan("yes", stream_output);
