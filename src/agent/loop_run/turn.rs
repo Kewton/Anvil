@@ -1682,6 +1682,9 @@ impl Agent {
         if let Some(note) = self.forced_small_edit_recovery_message() {
             messages.push(ConversationMessage::system(note));
         }
+        if let Some(note) = self.post_scaffold_edit_recovery_message() {
+            messages.push(ConversationMessage::system(note));
+        }
         messages.extend(prompting::runtime_context_messages(
             &self.config.cwd,
             &self.work_root,
@@ -1693,7 +1696,9 @@ impl Agent {
 
     fn effective_tool_specs(&self) -> Vec<ToolSpec> {
         let mut specs = self.tool_registry.specs().to_vec();
-        if self.forced_small_edit_recovery_target().is_some() {
+        if self.forced_small_edit_recovery_target().is_some()
+            || self.post_scaffold_edit_recovery_target().is_some()
+        {
             specs.retain(|spec| matches!(spec.function.name.as_str(), "Read" | "Edit"));
         }
         specs
@@ -1726,6 +1731,36 @@ impl Agent {
         let path = last_read_tool_path(&self.session.messages)?;
         let candidate = resolve_user_path(&self.work_root, &path).ok()?;
         candidate.is_file().then_some(candidate)
+    }
+
+    fn post_scaffold_edit_recovery_message(&self) -> Option<String> {
+        let path = self.post_scaffold_edit_recovery_target()?;
+        let attempt = recent_post_scaffold_edit_attempt(&self.session.messages).max(1);
+        Some(recovery::post_scaffold_edit_recovery_note(
+            &progress_path_display(
+                &path.display().to_string(),
+                &self.work_root,
+                self.session.mode_state.active_plan_path.as_deref(),
+                120,
+            ),
+            attempt,
+        ))
+    }
+
+    fn post_scaffold_edit_recovery_target(&self) -> Option<PathBuf> {
+        if self.session.mode_state.mode != ExecutionMode::Act {
+            return None;
+        }
+        if has_successful_repo_edit(&self.session.messages) || !recent_scaffold_command_seen(&self.session.messages) {
+            return None;
+        }
+        if let Some(path) = last_read_tool_path(&self.session.messages)
+            && let Ok(candidate) = resolve_user_path(&self.work_root, &path)
+            && candidate.is_file()
+        {
+            return Some(candidate);
+        }
+        first_existing_impl_target(&self.work_root)
     }
 
     fn execute_tool_call(
@@ -2247,6 +2282,23 @@ fn recent_truncated_tool_call_attempt(messages: &[ConversationMessage]) -> usize
         .unwrap_or(0)
 }
 
+fn recent_post_scaffold_edit_attempt(messages: &[ConversationMessage]) -> usize {
+    messages
+        .iter()
+        .rev()
+        .find_map(|message| {
+            if message.role != "system" {
+                return None;
+            }
+            message
+                .content
+                .rsplit("post_scaffold_edit_attempt=")
+                .next()
+                .and_then(|suffix| suffix.trim().parse::<usize>().ok())
+        })
+        .unwrap_or(0)
+}
+
 fn has_successful_repo_edit(messages: &[ConversationMessage]) -> bool {
     messages.iter().any(|message| {
         message.role == "tool"
@@ -2271,6 +2323,37 @@ fn last_read_tool_path(messages: &[ConversationMessage]) -> Option<String> {
                 .map(ToString::to_string)
         })
     })
+}
+
+fn recent_scaffold_command_seen(messages: &[ConversationMessage]) -> bool {
+    messages.iter().rev().any(|message| {
+        if message.role != "assistant" {
+            return false;
+        }
+        message.tool_calls.iter().rev().any(|tool_call| {
+            tool_call.name == "Bash"
+                && tool_call
+                    .arguments
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(recovery::is_scaffold_command)
+        })
+    })
+}
+
+fn first_existing_impl_target(work_root: &Path) -> Option<PathBuf> {
+    [
+        "app/page.tsx",
+        "src/app/page.tsx",
+        "app/globals.css",
+        "src/app/globals.css",
+        "next.config.ts",
+        "next.config.js",
+        "package.json",
+    ]
+    .iter()
+    .map(|relative| work_root.join(relative))
+    .find(|candidate| candidate.is_file())
 }
 
 fn plan_sections_with_content(contents: &str) -> Vec<&'static str> {
@@ -2929,10 +3012,10 @@ mod truncate_tests {
 #[cfg(test)]
 mod progress_tests {
     use super::{
-        format_blocked_progress_line, format_progress_line, has_successful_repo_edit,
-        is_utf8_locale, last_read_tool_path, progress_available_width,
-        recent_truncated_tool_call_attempt, sanitize_for_progress, tool_color, tool_display,
-        tool_emoji, unicode_supported,
+        first_existing_impl_target, format_blocked_progress_line, format_progress_line,
+        has_successful_repo_edit, is_utf8_locale, last_read_tool_path, progress_available_width,
+        recent_scaffold_command_seen, recent_truncated_tool_call_attempt, sanitize_for_progress,
+        tool_color, tool_display, tool_emoji, unicode_supported,
     };
     use crate::modes::plan_act::PlanStage;
     use crate::ollama::xml_fallback::ToolCall;
@@ -3223,6 +3306,30 @@ mod progress_tests {
         assert!(resolved.ends_with("app/page.tsx"), "got: {}", resolved.display());
         assert_eq!(recent_truncated_tool_call_attempt(&messages), 1);
         assert!(!has_successful_repo_edit(&messages));
+    }
+
+    #[test]
+    fn recent_scaffold_command_seen_detects_create_next_app() {
+        let messages = vec![ConversationMessage::assistant(
+            String::new(),
+            vec![ToolCall {
+                id: "xml-1".to_string(),
+                name: "Bash".to_string(),
+                arguments: json!({"command":"npx create-next-app@latest . --ts --yes"}),
+            }],
+        )];
+        assert!(recent_scaffold_command_seen(&messages));
+    }
+
+    #[test]
+    fn first_existing_impl_target_prefers_page_component() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        std::fs::write(work_root.join("app/page.tsx"), "export default function Home() { return null; }\n").unwrap();
+        std::fs::write(work_root.join("next.config.ts"), "export default {};\n").unwrap();
+        let target = first_existing_impl_target(work_root).unwrap();
+        assert!(target.ends_with("app/page.tsx"), "got: {}", target.display());
     }
 
     #[test]

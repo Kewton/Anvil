@@ -151,6 +151,12 @@ pub fn forced_small_edit_recovery_note(path: &str, attempt: usize) -> String {
     )
 }
 
+pub fn post_scaffold_edit_recovery_note(path: &str, attempt: usize) -> String {
+    format!(
+        "Framework scaffolding already succeeded, but the requested implementation change is still missing. For the next turn, only use Read or Edit and stay on this existing file: {path}. Do not use Bash, Glob, or Grep until one concrete Edit succeeds. First inspect the file if needed, then make exactly one small Edit that moves the implementation forward. post_scaffold_edit_attempt={attempt}"
+    )
+}
+
 pub fn plan_progress_recovery_note(
     stage: PlanStage,
     next_sections: &[&str],
@@ -290,7 +296,8 @@ pub fn should_block_restart_discovery(tool_name: &str, progress_exists: bool) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        forced_small_edit_recovery_note, repo_change_after_setup_note,
+        forced_small_edit_recovery_note, post_scaffold_edit_recovery_note,
+        repo_change_after_setup_note,
         tool_call_format_recovery_note,
     };
 
@@ -320,5 +327,16 @@ mod tests {
             "got: {note}"
         );
         assert!(note.contains("app/page.tsx"), "got: {note}");
+    }
+
+    #[test]
+    fn post_scaffold_note_pushes_first_edit_on_existing_file() {
+        let note = post_scaffold_edit_recovery_note("app/page.tsx", 1);
+        assert!(note.contains("only use Read or Edit"), "got: {note}");
+        assert!(
+            note.contains("Do not use Bash, Glob, or Grep"),
+            "got: {note}"
+        );
+        assert!(note.contains("one concrete Edit succeeds"), "got: {note}");
     }
 }
