@@ -73,8 +73,13 @@ impl ToolRegistry {
                 )
             }
             "Read" => {
-                let path =
-                    resolve_user_path(&context.root, get_required_string(arguments, "path")?)?;
+                let raw_path = get_required_string(arguments, "path")?;
+                let path = resolve_plan_mode_write_target(
+                    &context.root,
+                    raw_path,
+                    context.plan_path.as_deref(),
+                )?
+                .unwrap_or(resolve_user_path(&context.root, raw_path)?);
                 let start_line = get_optional_usize(arguments, "start_line");
                 let end_line = get_optional_usize(arguments, "end_line");
                 read::run(&path, start_line, end_line)
@@ -429,7 +434,7 @@ pub fn truncate_output(text: &str, max_chars: usize) -> String {
 mod tests {
     use super::{
         canonicalize_with_missing_tail, enforce_plan_stage_scope, resolve_plan_mode_write_target,
-        ToolContext,
+        ToolContext, ToolRegistry,
     };
     use crate::modes::plan_act::{ExecutionMode, PlanStage};
     use serde_json::json;
@@ -486,6 +491,37 @@ mod tests {
             canonicalize_with_missing_tail(&resolved),
             canonicalize_with_missing_tail(&plan_path)
         );
+    }
+
+    #[test]
+    fn plan_mode_read_accepts_absolute_same_filename_alias() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("repo");
+        let plan_root = temp.path().join("state").join("plans");
+        std::fs::create_dir_all(root.join("plans")).unwrap();
+        std::fs::create_dir_all(&plan_root).unwrap();
+        let plan_path = plan_root.join("plan-123.md");
+        std::fs::write(&plan_path, "hello plan\n").unwrap();
+        let alias = root.join("plans").join("plan-123.md");
+        let registry = ToolRegistry::default();
+        let context = ToolContext {
+            root,
+            mode: ExecutionMode::Plan,
+            plan_path: Some(plan_path),
+            plan_stage: PlanStage::Stage2,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            cancel_flag: None,
+        };
+        let out = registry
+            .execute(
+                "Read",
+                &json!({"path": alias.to_string_lossy().to_string()}),
+                &context,
+            )
+            .unwrap();
+        assert!(out.contains("hello plan"), "got: {out}");
     }
 
     #[test]
