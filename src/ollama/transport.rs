@@ -168,8 +168,17 @@ fn to_chat_tool_definitions(tools: &[ToolSpec]) -> Vec<ChatToolDefinition> {
 
 pub fn should_use_native_tool_calls(model: &str) -> bool {
     let normalized = model.trim().to_ascii_lowercase();
-    matches!(
-        normalized.as_str(),
-        "qwen3.6:27b-coding-nvfp4" | "qwen3.5:122b"
-    )
+    matches!(normalized.as_str(), "qwen3.6:27b-coding-nvfp4")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_use_native_tool_calls;
+
+    #[test]
+    fn native_tool_allowlist_is_narrow() {
+        assert!(should_use_native_tool_calls("qwen3.6:27b-coding-nvfp4"));
+        assert!(!should_use_native_tool_calls("qwen3.5:122b"));
+        assert!(!should_use_native_tool_calls("qwen3.5:9b"));
+    }
 }
