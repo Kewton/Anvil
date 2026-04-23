@@ -175,7 +175,13 @@ fn infer_large_task_from_text(raw: &str) -> bool {
     let mut score = 0u8;
 
     let strong_english = [
-        "create", "build", "develop", "implement", "scaffold", "from scratch", "full app",
+        "create",
+        "build",
+        "develop",
+        "implement",
+        "scaffold",
+        "from scratch",
+        "full app",
     ];
     if strong_english.iter().any(|keyword| lower.contains(keyword)) {
         score += 3;
@@ -186,7 +192,9 @@ fn infer_large_task_from_text(raw: &str) -> bool {
         score += 3;
     }
 
-    let stage_english = ["first", "then", "finally", "step", "phase", "plan", "verify"];
+    let stage_english = [
+        "first", "then", "finally", "step", "phase", "plan", "verify",
+    ];
     let english_stage_hits = stage_english
         .iter()
         .filter(|keyword| lower.contains(**keyword))
@@ -196,7 +204,15 @@ fn infer_large_task_from_text(raw: &str) -> bool {
         score += english_stage_hits;
     }
 
-    let stage_japanese = ["まず", "その後", "最後に", "段階", "ステップ", "計画", "確認"];
+    let stage_japanese = [
+        "まず",
+        "その後",
+        "最後に",
+        "段階",
+        "ステップ",
+        "計画",
+        "確認",
+    ];
     let japanese_stage_hits = stage_japanese
         .iter()
         .filter(|keyword| raw.contains(**keyword))
@@ -207,17 +223,26 @@ fn infer_large_task_from_text(raw: &str) -> bool {
     }
 
     let framework_english = ["next.js", "react", "rails", "fastapi", "port"];
-    if framework_english.iter().any(|keyword| lower.contains(keyword)) {
+    if framework_english
+        .iter()
+        .any(|keyword| lower.contains(keyword))
+    {
         score += 2;
     }
 
     let framework_japanese = ["アプリ", "ゲーム", "サイト", "ポート", "起動"];
-    if framework_japanese.iter().any(|keyword| raw.contains(keyword)) {
+    if framework_japanese
+        .iter()
+        .any(|keyword| raw.contains(keyword))
+    {
         score += 2;
     }
 
     let quality_english = ["polish", "high quality", "beautiful", "cool"];
-    if quality_english.iter().any(|keyword| lower.contains(keyword)) {
+    if quality_english
+        .iter()
+        .any(|keyword| lower.contains(keyword))
+    {
         score += 1;
     }
 
@@ -1095,8 +1120,9 @@ impl Agent {
         } else {
             let user_input = if auto_plan_entered.is_some() {
                 format!(
-                    "Create an implementation plan for the user's request. Inspect only the directly relevant files first, then fill the active plan file incrementally. Do not make code changes yet.\n\
-Focus only on the current plan stage that the runtime indicates. Use one small Write or Edit at a time. Do not try to write the full completed plan in one large tool call. The plan must still define: (1) the first shippable vertical slice, (2) concrete acceptance criteria for that slice, (3) the quality bar that defines what makes the result genuinely good, (4) the implementation phases after that, (5) the specific files/modules likely to change, and (6) the verification steps. End your user-facing response only after the plan is complete, and then tell the user to reply yes to execute, no to revise, or provide feedback.\n\nUser request:\n{trimmed}"
+                    "Create an implementation plan for the user's request. Do not make code changes yet.\n\
+Focus only on the current plan stage that the runtime indicates. In Stage 1, bootstrap the plan from the user request first: make one small Write or Edit to the active plan file before doing any exploration. Only inspect a directly relevant file if one specific detail is still missing after that first plan update. Use one small Write or Edit at a time, and do not try to write the full completed plan in one large tool call.\n\
+The plan must still define: (1) the first shippable vertical slice, (2) concrete acceptance criteria for that slice, (3) the quality bar that defines what makes the result genuinely good, (4) the implementation phases after that, (5) the specific files/modules likely to change, and (6) the verification steps. End your user-facing response only after the plan is complete, and then tell the user to reply yes to execute, no to revise, or provide feedback.\n\nUser request:\n{trimmed}"
                 )
             } else {
                 trimmed.to_string()
@@ -1557,7 +1583,9 @@ mod tests {
         assert!(infer_large_task_from_text(
             "README.md を改善する3段階の作業です。まず変更計画を書き、その後見出しを1つ追加し、最後に内容を確認してください。"
         ));
-        assert!(!infer_large_task_from_text("README の typo を1箇所だけ修正して"));
+        assert!(!infer_large_task_from_text(
+            "README の typo を1箇所だけ修正して"
+        ));
     }
 
     #[test]

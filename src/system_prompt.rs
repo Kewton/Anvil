@@ -88,7 +88,8 @@ Do not try to write the full plan in one large tool call.\n",
             PlanStage::Stage1 => {
                 prompt.push_str(
                     "Stage 1 goal: fill Goal, Constraints, and Deliverables only.\n\
-Inspect only directly relevant files. Prefer at most one or two Read/Glob steps before making one small Write or Edit to the plan file.\n\
+Bootstrap the plan from the user's request first. Start with one small Write or Edit to the plan file before doing any exploration.\n\
+Only inspect directly relevant files if one specific detail is still missing after that first plan update. Prefer at most one Read/Glob step in Stage 1.\n\
 Do not start Acceptance Criteria, Quality Bar, or later sections yet.\n",
                 );
             }
