@@ -23,6 +23,9 @@ pub struct OllamaClient {
     max_predict: usize,
 }
 
+const SIDECAR_SUMMARY_TIMEOUT_SECS: u64 = 8;
+const SIDECAR_SUMMARY_MAX_PREDICT: usize = 384;
+
 impl OllamaClient {
     pub fn new(base_url: String) -> Result<Self, String> {
         Self::new_with_timeout_and_options(base_url, 120, 24_000, 2_048)
@@ -146,7 +149,13 @@ impl OllamaClient {
             ),
             ConversationMessage::user(transcript),
         ];
-        let reply = self.chat_text(model, &summary_messages)?;
+        let summary_client = Self::new_with_timeout_and_options(
+            self.base_url.clone(),
+            SIDECAR_SUMMARY_TIMEOUT_SECS,
+            self.context_window,
+            SIDECAR_SUMMARY_MAX_PREDICT,
+        )?;
+        let reply = summary_client.chat_text(model, &summary_messages)?;
         if !reply.tool_calls.is_empty() {
             return Err("sidecar summary unexpectedly requested tools".to_string());
         }
