@@ -47,6 +47,19 @@ fn user_interrupt_result() -> String {
     "exit_code=-1\ninterrupted=true\ninterrupt requested by user".to_string()
 }
 
+fn format_iteration_status(
+    iter_human: usize,
+    max_iterations: usize,
+    headline: &str,
+    note: &str,
+    cols: Option<u16>,
+) -> String {
+    let mut lines = vec![format!("[iter {iter_human}/{max_iterations}] {headline}")];
+    lines.push(format_progress_field("  note:   ", note, cols));
+    lines.push(String::new());
+    lines.join("\n")
+}
+
 fn same_existing_path(lhs: &Path, rhs: &Path) -> bool {
     match (std::fs::canonicalize(lhs), std::fs::canonicalize(rhs)) {
         (Ok(a), Ok(b)) => a == b,
@@ -191,25 +204,39 @@ fn progress_stage_label(
     tool_name: &str,
     arguments: &serde_json::Value,
     work_root: &Path,
+    plan_path: Option<&Path>,
 ) -> Option<String> {
-    let stage_name = match plan_stage {
-        PlanStage::Stage1 => "Stage1",
-        PlanStage::Stage2 => "Stage2",
-        PlanStage::Stage3 => "Stage3",
-        PlanStage::Ready => "Ready",
-    };
     if mode != ExecutionMode::Plan {
-        return Some("Act".to_string());
+        return Some("Implementation".to_string());
     }
-    let path = arguments
+    let raw_path = arguments
         .get("path")
         .and_then(serde_json::Value::as_str)
-        .map(|raw| normalize_exploration_path(raw, work_root))
         .unwrap_or_default();
-    if tool_name == "Read" && looks_like_plan_path(&path) {
-        return Some(format!("{stage_name} review"));
+    if plan_path_matches(raw_path, work_root, plan_path) {
+        if tool_name == "Read" {
+            return Some(if plan_stage == PlanStage::Ready {
+                "Approval review".to_string()
+            } else {
+                "Plan review".to_string()
+            });
+        }
+        let source_text = arguments
+            .get("content")
+            .or_else(|| arguments.get("new_string"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let summary = summarize_plan_write(
+            tool_name,
+            raw_path,
+            source_text,
+            work_root,
+            plan_path,
+            plan_stage,
+        );
+        return Some(summary.phase);
     }
-    Some(stage_name.to_string())
+    Some("Repo exploration".to_string())
 }
 
 fn extract_plan_constraints(contents: &str) -> Vec<String> {
@@ -351,6 +378,7 @@ impl Agent {
         let mut plan_progress_retries = 0usize;
         let mut plan_exploration_only_turns = 0usize;
         let mut plan_exploration_counts = HashMap::<PlanExplorationKey, usize>::new();
+        let mut plan_write_signature_counts = HashMap::<String, usize>::new();
         let mut recent_bash_commands = Vec::<String>::new();
         let mut install_commands_seen = 0usize;
         let mut logged_plan_first_write = false;
@@ -411,6 +439,7 @@ impl Agent {
             if !prepared_tool_calls.is_empty() {
                 let mut plan_file_edit_calls_this_turn = 0usize;
                 let mut plan_exploration_calls_this_turn = 0usize;
+                let mut plan_ready_after_tool = false;
                 let current_plan_stage = self.session.mode_state.plan_stage;
                 let plan_exploration_budget =
                     lifecycle::plan_stage_exploration_budget(current_plan_stage);
@@ -574,7 +603,42 @@ impl Agent {
                             &tool_name,
                             &tool_call.arguments,
                             &self.work_root,
+                            self.session.mode_state.active_plan_path.as_deref(),
                         );
+                        let write_retry_label = if self.session.mode_state.mode == ExecutionMode::Plan
+                            && is_plan_file_tool_call(
+                                &tool_name,
+                                &tool_call.arguments,
+                                self.session.mode_state.active_plan_path.as_deref(),
+                            )
+                        {
+                            let raw_path = tool_call
+                                .arguments
+                                .get("path")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or_default();
+                            let source_text = tool_call
+                                .arguments
+                                .get("content")
+                                .or_else(|| tool_call.arguments.get("new_string"))
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or_default();
+                            let summary = summarize_plan_write(
+                                &tool_name,
+                                raw_path,
+                                source_text,
+                                &self.work_root,
+                                self.session.mode_state.active_plan_path.as_deref(),
+                                live_plan_stage,
+                            );
+                            let count = plan_write_signature_counts
+                                .entry(summary.signature)
+                                .and_modify(|value| *value += 1)
+                                .or_insert(1);
+                            (*count > 1).then(|| format!("Model rewrite #{}", *count))
+                        } else {
+                            None
+                        };
                         format_progress_line(
                             &tool_name,
                             &tool_call.arguments,
@@ -584,6 +648,9 @@ impl Agent {
                             use_color,
                             use_unicode,
                             self.footer.current_cols(),
+                            self.session.mode_state.active_plan_path.as_deref(),
+                            live_plan_stage,
+                            write_retry_label.as_deref(),
                             stage_label.as_deref(),
                         )
                     };
@@ -703,9 +770,30 @@ impl Agent {
                     let compact_result = prompting::compact_tool_result(&tool_name, raw_result);
                     self.session
                         .messages
-                        .push(ConversationMessage::tool(tool_name, compact_result));
+                        .push(ConversationMessage::tool(tool_name.clone(), compact_result));
+
+                    if self.session.mode_state.mode == ExecutionMode::Plan
+                        && is_plan_file_tool_call(
+                            &tool_name,
+                            &tool_call.arguments,
+                            self.session.mode_state.active_plan_path.as_deref(),
+                        )
+                        && self
+                            .current_plan_contents()
+                            .ok()
+                            .flatten()
+                            .is_some_and(|contents| self.plan_is_approval_ready_with_fallback(&contents))
+                    {
+                        plan_ready_after_tool = true;
+                        break;
+                    }
                 }
                 if self.session.mode_state.mode == ExecutionMode::Plan {
+                    if plan_ready_after_tool {
+                        final_prose = "Plan complete. Reply yes to execute, no to revise, or provide feedback.".to_string();
+                        exit_reason = ExitReason::Done;
+                        break 'outer;
+                    }
                     if plan_file_edit_calls_this_turn > 0 {
                         let _ = self.refresh_plan_stage();
                         plan_progress_retries = 0;
@@ -814,6 +902,16 @@ impl Agent {
                         error_text = exit_reason.default_error_text().to_string();
                         break 'outer;
                     }
+                    write_stdout_rendered(
+                        &format_iteration_status(
+                            last_iter,
+                            self.config.max_iterations,
+                            "Retry requested",
+                            "The model replied without edits. Asked it to make the required repository changes.",
+                            self.footer.current_cols(),
+                        ),
+                        true,
+                    );
                     self.push_system_note(recovery::repo_change_recovery_note(repo_change_retries));
                 } else if action_expectation == recovery::ActionExpectation::PlanProgress {
                     let plan_contents = self
@@ -829,6 +927,19 @@ impl Agent {
                         error_text = exit_reason.default_error_text().to_string();
                         break 'outer;
                     }
+                    write_stdout_rendered(
+                        &format_iteration_status(
+                            last_iter,
+                            self.config.max_iterations,
+                            "Retry requested",
+                            &format!(
+                                "The model returned an empty reply. Asked it to continue the plan by writing {}.",
+                                join_sections_for_progress(&next_sections)
+                            ),
+                            self.footer.current_cols(),
+                        ),
+                        true,
+                    );
                     let missing_sections = lifecycle::plan_missing_sections(&plan_contents);
                     log_plan_stall(
                         self.session_store.session_id(),
@@ -852,6 +963,16 @@ impl Agent {
                         error_text = exit_reason.default_error_text().to_string();
                         break 'outer;
                     }
+                    write_stdout_rendered(
+                        &format_iteration_status(
+                            last_iter,
+                            self.config.max_iterations,
+                            "Retry requested",
+                            "The model returned an empty reply. Asked it to continue with concrete tool actions.",
+                            self.footer.current_cols(),
+                        ),
+                        true,
+                    );
                     self.push_system_note(recovery::empty_response_recovery_note(
                         empty_retries,
                         requires_action,
@@ -868,6 +989,16 @@ impl Agent {
                         error_text = exit_reason.default_error_text().to_string();
                         break 'outer;
                     }
+                    write_stdout_rendered(
+                        &format_iteration_status(
+                            last_iter,
+                            self.config.max_iterations,
+                            "Retry requested",
+                            "The model answered with prose only. Asked it to make the repository edits with tools.",
+                            self.footer.current_cols(),
+                        ),
+                        true,
+                    );
                     self.push_system_note(recovery::repo_change_recovery_note(repo_change_retries));
                 } else if action_expectation == recovery::ActionExpectation::PlanProgress {
                     let plan_contents = self
@@ -883,6 +1014,19 @@ impl Agent {
                         error_text = exit_reason.default_error_text().to_string();
                         break 'outer;
                     }
+                    write_stdout_rendered(
+                        &format_iteration_status(
+                            last_iter,
+                            self.config.max_iterations,
+                            "Retry requested",
+                            &format!(
+                                "The model answered without tool calls. Asked it to update {} with Write or Edit.",
+                                join_sections_for_progress(&next_sections)
+                            ),
+                            self.footer.current_cols(),
+                        ),
+                        true,
+                    );
                     let missing_sections = lifecycle::plan_missing_sections(&plan_contents);
                     log_plan_stall(
                         self.session_store.session_id(),
@@ -905,6 +1049,16 @@ impl Agent {
                         error_text = exit_reason.default_error_text().to_string();
                         break 'outer;
                     }
+                    write_stdout_rendered(
+                        &format_iteration_status(
+                            last_iter,
+                            self.config.max_iterations,
+                            "Retry requested",
+                            "The model answered without tool calls. Asked it to continue with concrete actions.",
+                            self.footer.current_cols(),
+                        ),
+                        true,
+                    );
                     self.push_system_note(recovery::no_tool_recovery_note(no_tool_retries));
                 }
                 continue;
@@ -919,6 +1073,16 @@ impl Agent {
                     error_text = exit_reason.default_error_text().to_string();
                     break 'outer;
                 }
+                write_stdout_rendered(
+                    &format_iteration_status(
+                        last_iter,
+                        self.config.max_iterations,
+                        "Retry requested",
+                        "The turn finished without repository edits. Asked the model to continue implementing changes.",
+                        self.footer.current_cols(),
+                    ),
+                    true,
+                );
                 self.push_system_note(recovery::repo_change_recovery_note(repo_change_retries));
                 continue;
             }
@@ -944,6 +1108,19 @@ impl Agent {
                         error_text = exit_reason.default_error_text().to_string();
                         break 'outer;
                     }
+                    write_stdout_rendered(
+                        &format_iteration_status(
+                            last_iter,
+                            self.config.max_iterations,
+                            "Plan still incomplete",
+                            &format!(
+                                "Asked the model to finish {} before approval.",
+                                join_sections_for_progress(&missing_sections)
+                            ),
+                            self.footer.current_cols(),
+                        ),
+                        true,
+                    );
                     log_plan_stall(
                         self.session_store.session_id(),
                         last_iter,
@@ -1473,126 +1650,69 @@ fn paint(s: &str, color: &str, use_color: bool) -> String {
 struct ProgressDisplay {
     action: String,
     path: Option<String>,
-    preview: Option<String>,
-    extra: Option<String>,
+    note: Option<String>,
+    status: Option<String>,
 }
 
-fn tool_display(
-    tool_name: &str,
-    arguments: &serde_json::Value,
-    work_root: &std::path::Path,
-    arg_budget: usize,
-) -> ProgressDisplay {
-    let str_arg = |key: &str| -> &str {
-        arguments
-            .get(key)
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-    };
-    let relativize = |path: &str| -> String {
-        std::path::Path::new(path)
-            .strip_prefix(work_root)
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| path.to_string())
-    };
+struct PlanWriteSummary {
+    action: String,
+    note: Option<String>,
+    status: Option<String>,
+    phase: String,
+    signature: String,
+}
 
-    let raw_path = str_arg("path");
-    let path_display = if raw_path.is_empty() {
-        "<missing path>".to_string()
-    } else {
-        compact_progress_path(&sanitize_for_progress(&relativize(raw_path)), arg_budget.max(48))
+fn plan_path_matches(raw_path: &str, work_root: &Path, plan_path: Option<&Path>) -> bool {
+    let Some(plan_path) = plan_path else {
+        return false;
     };
-    match tool_name {
-        "Write" => {
-            let content = arguments
-                .get("content")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            let action = plan_progress_summary("Write", &path_display, content)
-                .unwrap_or_else(|| "file write".to_string());
-            let preview = text_preview(content, 50);
-            let extra = arguments
-                .get("content")
-                .and_then(serde_json::Value::as_str)
-                .map(|c| format!("{}B", c.len()));
-            ProgressDisplay {
-                action,
-                path: Some(path_display),
-                preview: (!preview.is_empty()).then_some(preview),
-                extra,
-            }
+    if Path::new(raw_path)
+        .file_name()
+        .zip(plan_path.file_name())
+        .is_some_and(|(lhs, rhs)| lhs == rhs)
+    {
+        return true;
+    }
+    resolve_user_path(work_root, raw_path)
+        .ok()
+        .is_some_and(|resolved| same_existing_path(&resolved, plan_path))
+}
+
+fn progress_path_display(raw_path: &str, work_root: &Path, plan_path: Option<&Path>, max_chars: usize) -> String {
+    if raw_path.is_empty() {
+        return "<missing path>".to_string();
+    }
+    if plan_path_matches(raw_path, work_root, plan_path) {
+        return compact_progress_path(
+            &sanitize_for_progress(&plan_path.unwrap().display().to_string()),
+            max_chars,
+        );
+    }
+    let relative = std::path::Path::new(raw_path)
+        .strip_prefix(work_root)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| raw_path.to_string());
+    compact_progress_path(&sanitize_for_progress(&relative), max_chars)
+}
+
+fn join_sections_for_progress(sections: &[&str]) -> String {
+    match sections {
+        [] => String::new(),
+        [one] => (*one).to_string(),
+        [first, second] => format!("{first} and {second}"),
+        _ => {
+            let mut parts = sections[..sections.len() - 1]
+                .iter()
+                .map(|section| (*section).to_string())
+                .collect::<Vec<_>>();
+            parts.push(format!("and {}", sections[sections.len() - 1]));
+            parts.join(", ")
         }
-        "Edit" => {
-            let new_text = arguments
-                .get("new_string")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            let action = plan_progress_summary("Edit", &path_display, new_text)
-                .unwrap_or_else(|| "text replace".to_string());
-            let preview = text_preview(new_text, 50);
-            ProgressDisplay {
-                action,
-                path: Some(path_display),
-                preview: (!preview.is_empty()).then_some(preview),
-                extra: None,
-            }
-        }
-        "Read" => {
-            let line_suffix = read_line_suffix(arguments);
-            let action = if looks_like_plan_path(&path_display) {
-                "plan review".to_string()
-            } else if !line_suffix.is_empty() {
-                format!("lines {}", line_suffix.trim_start_matches(':'))
-            } else {
-                "file read".to_string()
-            };
-            let path = format!("{path_display}{line_suffix}");
-            let (preview, extra) = read_preview(raw_path, work_root);
-            ProgressDisplay {
-                action,
-                path: Some(compact_progress_path(&path, arg_budget.max(48))),
-                preview,
-                extra,
-            }
-        }
-        "Bash" => {
-            let sanitized = sanitize_for_progress(str_arg("command"));
-            ProgressDisplay {
-                action: truncate(&sanitized, arg_budget),
-                path: None,
-                preview: None,
-                extra: None,
-            }
-        }
-        "Glob" | "Grep" => ProgressDisplay {
-            action: truncate(&sanitize_for_progress(str_arg("pattern")), arg_budget),
-            path: None,
-            preview: None,
-            extra: None,
-        },
-        _ => ProgressDisplay {
-            action: truncate(&sanitize_for_progress(tool_name), arg_budget),
-            path: None,
-            preview: None,
-            extra: None,
-        },
     }
 }
 
-fn looks_like_plan_path(path: &str) -> bool {
-    let lowered = path.to_ascii_lowercase();
-    lowered.contains("/plans/plan-")
-        || lowered.contains("\\plans\\plan-")
-        || lowered.ends_with("/plan.md")
-        || lowered.ends_with("\\plan.md")
-}
-
-fn plan_progress_summary(tool_name: &str, path_display: &str, text: &str) -> Option<String> {
-    if !looks_like_plan_path(path_display) {
-        return None;
-    }
-    let mut sections = Vec::new();
-    for section in [
+fn plan_sections_with_content(contents: &str) -> Vec<&'static str> {
+    [
         "Goal",
         "Constraints",
         "Deliverables",
@@ -1601,20 +1721,354 @@ fn plan_progress_summary(tool_name: &str, path_display: &str, text: &str) -> Opt
         "Execution Plan",
         "Verification Plan",
         "Risks / Fallbacks",
-    ] {
-        if plan_section_has_content(text, section) {
-            sections.push(section);
+    ]
+    .into_iter()
+    .filter(|section| plan_section_has_content(contents, section))
+    .collect()
+}
+
+fn plan_section_body_for_progress<'a>(contents: &'a str, section: &str) -> Option<&'a str> {
+    let mut start = None;
+    let mut end = contents.len();
+    let mut offset = 0usize;
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if let Some(heading) = trimmed.strip_prefix("## ") {
+            if start.is_some() {
+                end = offset;
+                break;
+            }
+            if normalize_plan_heading_for_progress(heading) == section {
+                start = Some(offset + line.len());
+            }
+        }
+        offset += line.len() + 1;
+    }
+    start.map(|idx| &contents[idx..end])
+}
+
+fn plan_section_excerpt(contents: &str, sections: &[&str]) -> Option<String> {
+    for section in sections {
+        let Some(body) = plan_section_body_for_progress(contents, section) else {
+            continue;
+        };
+        for line in body.lines().map(str::trim) {
+            if line.is_empty()
+                || line == "-"
+                || matches!(
+                    line,
+                    "1." | "2." | "3." | "1. First slice:" | "2. Next phases:" | "3. Review checkpoint:"
+                )
+            {
+                continue;
+            }
+            let cleaned = line.trim_start_matches("- ").trim();
+            return Some(format!("{section}: {}", truncate(&sanitize_for_progress(cleaned), 72)));
         }
     }
-    if sections.is_empty() {
-        return Some(match tool_name {
-            "Read" => "review plan".to_string(),
-            "Edit" => "update plan".to_string(),
-            _ => "write plan".to_string(),
-        });
+    None
+}
+
+fn plan_phase_from_sections(
+    sections: &[&str],
+    current_stage: PlanStage,
+    approval_ready: bool,
+) -> &'static str {
+    if approval_ready {
+        "Approval review"
+    } else if sections
+        .iter()
+        .any(|section| matches!(*section, "Execution Plan" | "Verification Plan" | "Risks / Fallbacks"))
+    {
+        "Finalize execution plan"
+    } else if sections
+        .iter()
+        .any(|section| matches!(*section, "Acceptance Criteria" | "Quality Bar"))
+    {
+        "Define quality bar"
+    } else if sections
+        .iter()
+        .any(|section| matches!(*section, "Goal" | "Constraints" | "Deliverables"))
+    {
+        "Draft foundation"
+    } else {
+        match current_stage {
+            PlanStage::Stage1 => "Draft foundation",
+            PlanStage::Stage2 => "Define quality bar",
+            PlanStage::Stage3 => "Finalize execution plan",
+            PlanStage::Ready => "Approval review",
+        }
     }
-    let shown = sections.into_iter().take(3).collect::<Vec<_>>();
-    Some(shown.join(", "))
+}
+
+fn summarize_plan_read(contents: &str) -> (String, Option<String>) {
+    let missing = lifecycle::plan_missing_sections(contents);
+    if missing.is_empty() {
+        (
+            "Review completed plan".to_string(),
+            Some("Approval ready; review the final plan before /approve".to_string()),
+        )
+    } else {
+        let next = lifecycle::plan_next_stage_sections(contents);
+        let note = if !next.is_empty() {
+            format!("Next focus: {}", join_sections_for_progress(&next))
+        } else {
+            format!("Missing: {}", join_sections_for_progress(&missing))
+        };
+        ("Review plan draft".to_string(), Some(note))
+    }
+}
+
+fn summarize_plan_write(
+    tool_name: &str,
+    raw_path: &str,
+    new_text: &str,
+    work_root: &Path,
+    plan_path: Option<&Path>,
+    current_stage: PlanStage,
+) -> PlanWriteSummary {
+    let previous = if raw_path.is_empty() {
+        String::new()
+    } else if plan_path_matches(raw_path, work_root, plan_path) {
+        plan_path
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .unwrap_or_default()
+    } else {
+        resolve_user_path(work_root, raw_path)
+            .ok()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .unwrap_or_default()
+    };
+    let previous_sections = plan_sections_with_content(&previous);
+    let current_sections = plan_sections_with_content(new_text);
+    let changed_sections = current_sections
+        .iter()
+        .copied()
+        .filter(|section| {
+            let old_body = plan_section_body_for_progress(&previous, section).unwrap_or_default();
+            let new_body = plan_section_body_for_progress(new_text, section).unwrap_or_default();
+            sanitize_for_progress(old_body) != sanitize_for_progress(new_body)
+        })
+        .collect::<Vec<_>>();
+    let added_sections = current_sections
+        .iter()
+        .copied()
+        .filter(|section| !previous_sections.contains(section))
+        .collect::<Vec<_>>();
+    let removed_sections = previous_sections
+        .iter()
+        .copied()
+        .filter(|section| !current_sections.contains(section))
+        .collect::<Vec<_>>();
+    let focus_sections = if !changed_sections.is_empty() {
+        changed_sections.clone()
+    } else if !current_sections.is_empty() {
+        current_sections.clone()
+    } else {
+        Vec::new()
+    };
+    let verb = if !removed_sections.is_empty() {
+        "Rewrite"
+    } else if previous_sections.is_empty() {
+        "Draft"
+    } else if !added_sections.is_empty() {
+        "Add"
+    } else if tool_name == "Edit" {
+        "Revise"
+    } else {
+        "Update"
+    };
+    let action = if focus_sections.is_empty() {
+        "Update plan draft".to_string()
+    } else {
+        format!("{verb} {}", join_sections_for_progress(&focus_sections))
+    };
+    let note = plan_section_excerpt(new_text, &focus_sections).or_else(|| {
+        let fallback = current_sections.clone();
+        plan_section_excerpt(new_text, &fallback)
+    });
+    let delta = new_text.len() as isize - previous.len() as isize;
+    let next = lifecycle::plan_next_stage_sections(new_text);
+    let approval_ready = lifecycle::plan_missing_sections(new_text).is_empty();
+    let status = if approval_ready {
+        Some(format!("Approval ready | delta {delta:+}B"))
+    } else if !next.is_empty() {
+        Some(format!(
+            "Next: {} | delta {delta:+}B",
+            join_sections_for_progress(&next)
+        ))
+    } else {
+        Some(format!("delta {delta:+}B"))
+    };
+    let phase = plan_phase_from_sections(&focus_sections, current_stage, approval_ready)
+        .to_string();
+    let signature = format!(
+        "{}|{}|{}",
+        phase,
+        action,
+        note.clone().unwrap_or_default()
+    );
+    PlanWriteSummary {
+        action,
+        note,
+        status,
+        phase,
+        signature,
+    }
+}
+
+fn tool_display(
+    tool_name: &str,
+    arguments: &serde_json::Value,
+    work_root: &std::path::Path,
+    plan_path: Option<&Path>,
+    current_stage: PlanStage,
+    arg_budget: usize,
+) -> ProgressDisplay {
+    let str_arg = |key: &str| -> &str {
+        arguments
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+    };
+    let raw_path = str_arg("path");
+    let path_display = progress_path_display(raw_path, work_root, plan_path, arg_budget.max(48));
+    match tool_name {
+        "Write" => {
+            let content = arguments
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let (action, note, status) = if plan_path_matches(raw_path, work_root, plan_path) {
+                let summary = summarize_plan_write(
+                    "Write",
+                    raw_path,
+                    content,
+                    work_root,
+                    plan_path,
+                    current_stage,
+                );
+                (summary.action, summary.note, summary.status)
+            } else {
+                (
+                    "Write file".to_string(),
+                    (!text_preview(content, 72).is_empty()).then(|| {
+                        format!("Preview: {}", text_preview(content, 72))
+                    }),
+                    arguments
+                        .get("content")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|c| format!("{}B", c.len())),
+                )
+            };
+            ProgressDisplay {
+                action,
+                path: Some(path_display),
+                note,
+                status,
+            }
+        }
+        "Edit" => {
+            let new_text = arguments
+                .get("new_string")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let (action, note, status) = if plan_path_matches(raw_path, work_root, plan_path) {
+                let summary = summarize_plan_write(
+                    "Edit",
+                    raw_path,
+                    new_text,
+                    work_root,
+                    plan_path,
+                    current_stage,
+                );
+                (summary.action, summary.note, summary.status)
+            } else {
+                (
+                    "Revise file".to_string(),
+                    (!text_preview(new_text, 72).is_empty()).then(|| {
+                        format!("Preview: {}", text_preview(new_text, 72))
+                    }),
+                    None,
+                )
+            };
+            ProgressDisplay {
+                action,
+                path: Some(path_display),
+                note,
+                status,
+            }
+        }
+        "Read" => {
+            let line_suffix = read_line_suffix(arguments);
+            let path = format!("{path_display}{line_suffix}");
+            let (action, note, status) = if plan_path_matches(raw_path, work_root, plan_path) {
+                let contents = plan_path
+                    .and_then(|path| std::fs::read_to_string(path).ok())
+                    .unwrap_or_default();
+                let (action, note) = summarize_plan_read(&contents);
+                let status = if lifecycle::current_plan_stage(&contents) == PlanStage::Ready {
+                    Some("Approval ready".to_string())
+                } else {
+                    let next = lifecycle::plan_next_stage_sections(&contents);
+                    (!next.is_empty()).then(|| {
+                        format!(
+                            "Current phase: {}",
+                            plan_phase_from_sections(&next, current_stage, false)
+                        )
+                    })
+                };
+                (action, note, status)
+            } else if !line_suffix.is_empty() {
+                let (preview, extra) = read_preview(raw_path, work_root);
+                (
+                    format!("Read lines {}", line_suffix.trim_start_matches(':')),
+                    preview.map(|preview| format!("Preview: {preview}")),
+                    extra,
+                )
+            } else {
+                let (preview, extra) = read_preview(raw_path, work_root);
+                (
+                    "Read file".to_string(),
+                    preview.map(|preview| format!("Preview: {preview}")),
+                    extra,
+                )
+            };
+            ProgressDisplay {
+                action,
+                path: Some(compact_progress_path(&path, arg_budget.max(48))),
+                note,
+                status,
+            }
+        }
+        "Bash" => {
+            let sanitized = sanitize_for_progress(str_arg("command"));
+            ProgressDisplay {
+                action: format!("Run {}", truncate(&sanitized, arg_budget.saturating_sub(4))),
+                path: None,
+                note: None,
+                status: None,
+            }
+        }
+        "Glob" | "Grep" => ProgressDisplay {
+            action: format!(
+                "Search {}",
+                truncate(
+                    &sanitize_for_progress(str_arg("pattern")),
+                    arg_budget.saturating_sub(7)
+                )
+            ),
+            path: None,
+            note: None,
+            status: None,
+        },
+        _ => ProgressDisplay {
+            action: truncate(&sanitize_for_progress(tool_name), arg_budget),
+            path: None,
+            note: None,
+            status: None,
+        },
+    }
 }
 
 fn plan_section_has_content(contents: &str, target: &str) -> bool {
@@ -1763,6 +2217,18 @@ pub(super) fn progress_available_width(
 /// applied to the tool name when `use_color` is true, and emoji is prepended
 /// when `use_unicode` is true. `cols` is the current terminal width from the
 /// footer broadcaster; `None` falls back to the pre-#432 fixed budget.
+fn progress_detail_budget(cols: Option<u16>, prefix: &str) -> usize {
+    cols.map(|value| value as usize)
+        .unwrap_or(96)
+        .saturating_sub(prefix.chars().count())
+        .max(24)
+}
+
+fn format_progress_field(prefix: &str, value: &str, cols: Option<u16>) -> String {
+    let budget = progress_detail_budget(cols, prefix);
+    format!("{prefix}{}", truncate(&sanitize_for_progress(value), budget))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn format_progress_line(
     tool_name: &str,
@@ -1773,11 +2239,21 @@ pub(super) fn format_progress_line(
     use_color: bool,
     use_unicode: bool,
     cols: Option<u16>,
+    plan_path: Option<&Path>,
+    current_stage: PlanStage,
+    status_prefix: Option<&str>,
     stage_label: Option<&str>,
 ) -> String {
     let arg_budget =
         progress_available_width(cols, tool_name, iter_human, max_iterations, use_unicode);
-    let display = tool_display(tool_name, arguments, work_root, arg_budget);
+    let display = tool_display(
+        tool_name,
+        arguments,
+        work_root,
+        plan_path,
+        current_stage,
+        arg_budget,
+    );
     // Sanitize before painting so an adversarial tool_name cannot inject escapes.
     // emoji は &'static str ハードコードなので再 sanitize は不要。
     let safe_tool_name = sanitize_for_progress(tool_name);
@@ -1791,16 +2267,23 @@ pub(super) fn format_progress_line(
         let mut lines = Vec::new();
         let stage = stage_label.unwrap_or("Working");
         lines.push(format!("[iter {iter_human}/{max_iterations}] {stage}"));
-        lines.push(format!("{painted} :: {}", display.action));
+        lines.push(format!("  tool:   {painted}"));
+        lines.push(format_progress_field("  action: ", &display.action, cols));
         if let Some(path) = display.path {
-            lines.push(path);
+            lines.push(format_progress_field("  file:   ", &path, cols));
         }
-        if let Some(preview) = display.preview {
-            let extra = display.extra.map(|e| format!(" ({e})")).unwrap_or_default();
-            lines.push(format!("\"{preview}\"{extra}"));
-        } else if let Some(extra) = display.extra {
-            lines.push(format!("({extra})"));
+        if let Some(note) = display.note {
+            lines.push(format_progress_field("  note:   ", &note, cols));
         }
+        if let Some(status) = display.status {
+            let combined_status = status_prefix
+                .map(|prefix| format!("{prefix} | {status}"))
+                .unwrap_or(status);
+            lines.push(format_progress_field("  status: ", &combined_status, cols));
+        } else if let Some(prefix) = status_prefix {
+            lines.push(format_progress_field("  status: ", prefix, cols));
+        }
+        lines.push(String::new());
         lines.join("\n")
     } else {
         format!("[iter {iter_human}/{max_iterations}]  {painted}  {}", display.action)
@@ -1825,7 +2308,14 @@ fn format_blocked_bash_progress_line(
         max_iterations,
         use_unicode,
     );
-    let display = tool_display(tool_name, arguments, work_root, arg_budget);
+    let display = tool_display(
+        tool_name,
+        arguments,
+        work_root,
+        None,
+        PlanStage::Ready,
+        arg_budget,
+    );
     let label = if use_unicode {
         "⛔ Bash blocked".to_string()
     } else {
@@ -1863,6 +2353,7 @@ mod progress_tests {
         format_progress_line, is_utf8_locale, progress_available_width, sanitize_for_progress,
         tool_color, tool_display, tool_emoji, unicode_supported,
     };
+    use crate::modes::plan_act::PlanStage;
     use serde_json::json;
     use std::path::PathBuf;
     use std::sync::Mutex;
@@ -1888,20 +2379,20 @@ mod progress_tests {
     fn tool_display_write_ascii() {
         let work_root = PathBuf::from("/work");
         let args = json!({"path": "/work/src/foo.rs", "content": "hello"});
-        let display = tool_display("Write", &args, &work_root, 57);
-        assert_eq!(display.action, "file write");
+        let display = tool_display("Write", &args, &work_root, None, PlanStage::Stage1, 57);
+        assert_eq!(display.action, "Write file");
         assert_eq!(display.path.as_deref(), Some("src/foo.rs"));
-        assert_eq!(display.preview.as_deref(), Some("hello"));
-        assert_eq!(display.extra, Some("5B".to_string()));
+        assert!(display.note.as_deref().is_some_and(|note| note.contains("hello")));
+        assert_eq!(display.status, Some("5B".to_string()));
     }
 
     #[test]
     fn tool_display_write_non_ascii() {
         let work_root = PathBuf::from("/work");
         let args = json!({"path": "/work/a.txt", "content": "日本語"});
-        let display = tool_display("Write", &args, &work_root, 57);
+        let display = tool_display("Write", &args, &work_root, None, PlanStage::Stage1, 57);
         // "日本語" is 9 bytes in UTF-8
-        assert_eq!(display.extra, Some("9B".to_string()));
+        assert_eq!(display.status, Some("9B".to_string()));
     }
 
     #[test]
@@ -1909,8 +2400,8 @@ mod progress_tests {
         let work_root = PathBuf::from("/work");
         let cmd = "cargo test";
         let args = json!({"command": cmd});
-        let display = tool_display("Bash", &args, &work_root, 57);
-        assert_eq!(display.action, cmd);
+        let display = tool_display("Bash", &args, &work_root, None, PlanStage::Stage1, 57);
+        assert_eq!(display.action, format!("Run {cmd}"));
     }
 
     #[test]
@@ -1918,8 +2409,8 @@ mod progress_tests {
         let work_root = PathBuf::from("/work");
         let cmd = "a".repeat(61);
         let args = json!({"command": cmd});
-        let display = tool_display("Bash", &args, &work_root, 57);
-        assert_eq!(display.action.len(), 60); // 57 chars + "..."
+        let display = tool_display("Bash", &args, &work_root, None, PlanStage::Stage1, 57);
+        assert_eq!(display.action.len(), 60);
         assert!(display.action.ends_with("..."));
     }
 
@@ -1927,7 +2418,7 @@ mod progress_tests {
     fn tool_display_path_relative() {
         let work_root = PathBuf::from("/work");
         let args = json!({"path": "/work/src/lib.rs"});
-        let display = tool_display("Read", &args, &work_root, 57);
+        let display = tool_display("Read", &args, &work_root, None, PlanStage::Stage1, 57);
         assert_eq!(display.path.as_deref(), Some("src/lib.rs"));
     }
 
@@ -1935,19 +2426,27 @@ mod progress_tests {
     fn tool_display_path_outside() {
         let work_root = PathBuf::from("/work");
         let args = json!({"path": "/tmp/outside.txt"});
-        let display = tool_display("Read", &args, &work_root, 57);
+        let display = tool_display("Read", &args, &work_root, None, PlanStage::Stage1, 57);
         assert_eq!(display.path.as_deref(), Some("/tmp/outside.txt"));
     }
 
     #[test]
     fn tool_display_plan_write_shows_sections() {
         let work_root = PathBuf::from("/work");
+        let plan_path = PathBuf::from("/work/.anvil-state/sessions/abc/plans/plan-1.md");
         let args = json!({
             "path": "/work/.anvil-state/sessions/abc/plans/plan-1.md",
             "content": "# Plan\n\n## Goal\n- Improve README.\n\n## Constraints\n- Keep markdown.\n\n## Deliverables\n- Updated README.\n"
         });
-        let display = tool_display("Write", &args, &work_root, 120);
-        assert_eq!(display.action, "Goal, Constraints, Deliverables");
+        let display = tool_display(
+            "Write",
+            &args,
+            &work_root,
+            Some(plan_path.as_path()),
+            PlanStage::Stage1,
+            120,
+        );
+        assert_eq!(display.action, "Draft Goal, Constraints, and Deliverables");
         assert!(
             display
                 .path
@@ -1956,22 +2455,32 @@ mod progress_tests {
         );
         assert!(
             display
-                .preview
+                .note
                 .as_deref()
-                .is_some_and(|preview| preview.contains("# Plan ## Goal - Improve README."))
+                .is_some_and(|note| note.contains("Goal: Improve README."))
         );
-        assert!(display.extra.is_some());
+        assert!(display.status.is_some());
     }
 
     #[test]
     fn tool_display_plan_read_marks_review() {
         let work_root = PathBuf::from("/work");
+        let plan_path = PathBuf::from("/work/.anvil-state/sessions/abc/plans/plan-1.md");
         let args = json!({"path": "/work/.anvil-state/sessions/abc/plans/plan-1.md"});
-        let display = tool_display("Read", &args, &work_root, 120);
-        assert_eq!(display.action, "plan review");
-        assert_eq!(
-            display.path.as_deref(),
-            Some(".anvil-state/sessions/abc/plans/plan-1.md")
+        let display = tool_display(
+            "Read",
+            &args,
+            &work_root,
+            Some(plan_path.as_path()),
+            PlanStage::Stage2,
+            120,
+        );
+        assert_eq!(display.action, "Review plan draft");
+        assert!(
+            display
+                .path
+                .as_deref()
+                .is_some_and(|path| path.contains("plans/plan-1.md"))
         );
     }
 
@@ -1979,8 +2488,8 @@ mod progress_tests {
     fn tool_display_read_includes_line_range() {
         let work_root = PathBuf::from("/work");
         let args = json!({"path": "/work/src/lib.rs", "start_line": 12, "end_line": 40});
-        let display = tool_display("Read", &args, &work_root, 120);
-        assert_eq!(display.action, "lines 12-40");
+        let display = tool_display("Read", &args, &work_root, None, PlanStage::Stage1, 120);
+        assert_eq!(display.action, "Read lines 12-40");
         assert_eq!(display.path.as_deref(), Some("src/lib.rs:12-40"));
     }
 
@@ -1988,8 +2497,8 @@ mod progress_tests {
     fn tool_display_missing_path_is_explicit() {
         let work_root = PathBuf::from("/work");
         let args = json!({});
-        let display = tool_display("Read", &args, &work_root, 120);
-        assert_eq!(display.action, "file read");
+        let display = tool_display("Read", &args, &work_root, None, PlanStage::Stage1, 120);
+        assert_eq!(display.action, "Read file");
         assert_eq!(display.path.as_deref(), Some("<missing path>"));
     }
 
@@ -1998,8 +2507,8 @@ mod progress_tests {
         let work_root = PathBuf::from("/work");
         let cmd = "a".repeat(100);
         let args = json!({"command": cmd});
-        let display = tool_display("Bash", &args, &work_root, 200);
-        assert_eq!(display.action.len(), 100);
+        let display = tool_display("Bash", &args, &work_root, None, PlanStage::Stage1, 200);
+        assert_eq!(display.action.len(), 104);
         assert!(!display.action.ends_with("..."));
     }
 
@@ -2008,8 +2517,8 @@ mod progress_tests {
         let work_root = PathBuf::from("/work");
         let cmd = "a".repeat(30);
         let args = json!({"command": cmd});
-        let display = tool_display("Bash", &args, &work_root, 20);
-        assert_eq!(display.action.len(), 23); // 20 chars + "..."
+        let display = tool_display("Bash", &args, &work_root, None, PlanStage::Stage1, 20);
+        assert_eq!(display.action.len(), 23);
         assert!(display.action.ends_with("..."));
     }
 
@@ -2075,6 +2584,9 @@ mod progress_tests {
                 /* use_unicode */ false,
                 Some(cols),
                 None,
+                PlanStage::Stage1,
+                None,
+                None,
             );
             let line_chars = line.chars().count();
             assert!(
@@ -2097,6 +2609,9 @@ mod progress_tests {
             false,
             false,
             None,
+            None,
+            PlanStage::Stage1,
+            None,
             Some("Stage1"),
         );
         assert!(line.starts_with("[iter 1/12]"));
@@ -2105,6 +2620,7 @@ mod progress_tests {
     #[test]
     fn progress_line_for_write_uses_multiline_block() {
         let work_root = PathBuf::from("/work");
+        let plan_path = PathBuf::from("/work/plans/plan-1.md");
         let args = json!({"path": "/work/plans/plan-1.md", "content": "# Plan\n\n## Goal\n- Build game.\n"});
         let line = format_progress_line(
             "Write",
@@ -2115,14 +2631,17 @@ mod progress_tests {
             false,
             true,
             None,
+            Some(plan_path.as_path()),
+            PlanStage::Stage1,
+            None,
             Some("Stage1"),
         );
         assert!(line.contains("[iter 1/50] Stage1"));
-        assert!(line.contains("✏"));
-        assert!(line.contains("Write ::"));
-        assert!(line.contains("Goal"));
+        assert!(line.contains("tool:"));
+        assert!(line.contains("action:"));
+        assert!(line.contains("Draft Goal"));
         assert!(line.contains("plans/plan-1.md"));
-        assert!(line.contains("\"# Plan ## Goal - Build game.\""));
+        assert!(line.contains("Goal: Build game."));
     }
 
     #[test]
@@ -2138,10 +2657,14 @@ mod progress_tests {
             false,
             true,
             None,
+            None,
+            PlanStage::Ready,
+            None,
             Some("Act"),
         );
         assert!(line.contains("[iter 2/50] Act"));
-        assert!(line.contains("📄 Read :: file read"));
+        assert!(line.contains("tool:"));
+        assert!(line.contains("Read file"));
         assert!(line.contains("<missing path>"));
     }
 
@@ -2150,7 +2673,7 @@ mod progress_tests {
         let work_root = PathBuf::from("/work");
         let args = json!({"command": "ls"});
         let line = format_progress_line(
-            "Bash", &args, 1, 12, &work_root, false, false, None, None
+            "Bash", &args, 1, 12, &work_root, false, false, None, None, PlanStage::Stage1, None, None
         );
         assert!(!line.contains('\x1b'));
     }
@@ -2160,7 +2683,7 @@ mod progress_tests {
         let work_root = PathBuf::from("/work");
         let args = json!({"command": "ls"});
         let line = format_progress_line(
-            "Bash", &args, 1, 12, &work_root, true, false, None, None
+            "Bash", &args, 1, 12, &work_root, true, false, None, None, PlanStage::Stage1, None, None
         );
         assert!(line.starts_with("[iter "));
     }
@@ -2187,7 +2710,7 @@ mod progress_tests {
         let work_root = PathBuf::from("/work");
         let args = json!({"command": "ls"});
         let line = format_progress_line(
-            "Bash", &args, 1, 12, &work_root, true, true, None, None
+            "Bash", &args, 1, 12, &work_root, true, true, None, None, PlanStage::Stage1, None, None
         );
         let color_idx = line.find("\x1b[38;5;226m").expect("color present");
         let emoji_idx = line.find('⚡').expect("emoji present");
@@ -2201,7 +2724,7 @@ mod progress_tests {
         let work_root = PathBuf::from("/work");
         let args = json!({"command": "ls"});
         let line = format_progress_line(
-            "Bash", &args, 1, 12, &work_root, false, true, None, None
+            "Bash", &args, 1, 12, &work_root, false, true, None, None, PlanStage::Stage1, None, None
         );
         assert!(line.contains('⚡'));
         assert!(!line.contains('\x1b'));
@@ -2212,7 +2735,7 @@ mod progress_tests {
         let work_root = PathBuf::from("/work");
         let args = json!({"command": "ls"});
         let line = format_progress_line(
-            "Bash", &args, 1, 12, &work_root, true, false, None, None
+            "Bash", &args, 1, 12, &work_root, true, false, None, None, PlanStage::Stage1, None, None
         );
         assert!(!line.contains('⚡'));
     }

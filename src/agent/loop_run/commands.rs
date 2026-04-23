@@ -141,17 +141,32 @@ fn plan_stage_status_line(stage: PlanStage, next_sections: &[&str]) -> String {
         next_sections.join(", ")
     };
     match stage {
-        PlanStage::Stage1 => format!("Stage1: bootstrap {focus}"),
-        PlanStage::Stage2 => format!("Stage2: define {focus}"),
-        PlanStage::Stage3 => format!("Stage3: complete {focus}"),
-        PlanStage::Ready => "Ready: wait for approval or feedback".to_string(),
+        PlanStage::Stage1 => format!("Current phase: Draft {focus}"),
+        PlanStage::Stage2 => format!("Current phase: Define {focus}"),
+        PlanStage::Stage3 => format!("Current phase: Finalize {focus}"),
+        PlanStage::Ready => "Current phase: Approval review".to_string(),
     }
 }
 
-fn format_plan_tasks(tasks: &[String]) -> String {
-    let mut lines = vec!["Tasks:".to_string()];
-    lines.extend(tasks.iter().map(|task| format!("- {task}")));
-    lines.join("\n")
+fn strip_task_status(task: &str) -> &str {
+    task.split_once("] ").map(|(_, rest)| rest).unwrap_or(task)
+}
+
+fn format_plan_tasks(tasks: &[String], stage_line: &str) -> String {
+    let current = tasks
+        .iter()
+        .find(|task| !task.starts_with("[done]"))
+        .map(|task| strip_task_status(task))
+        .unwrap_or("Review the completed plan and approve execution");
+    let next = tasks
+        .iter()
+        .filter(|task| !task.starts_with("[done]"))
+        .nth(1)
+        .map(|task| strip_task_status(task))
+        .unwrap_or("Wait for approval feedback");
+    format!(
+        "Current task: {current}\nUp next: {next}\n{stage_line}"
+    )
 }
 
 fn infer_task_profile_from_text(raw: &str) -> TaskProfile {
@@ -747,12 +762,12 @@ impl Agent {
         let next_sections = lifecycle::plan_stage_sections(stage);
         let plan_contents = self.current_plan_contents()?.unwrap_or_default();
         let tasks = lifecycle::plan_task_list(&plan_contents, task_profile);
+        let stage_line = plan_stage_status_line(stage, next_sections);
         Ok(format!(
-            "plan mode: {}\nplanning now: building the implementation plan before coding ({})\n{}\n{}",
+            "plan file: {}\nmode: plan ({})\n{}",
             plan_path.display(),
             task_profile.as_str(),
-            format_plan_tasks(&tasks),
-            plan_stage_status_line(stage, next_sections)
+            format_plan_tasks(&tasks, &stage_line),
         ))
     }
 
@@ -866,8 +881,8 @@ impl Agent {
                 );
                 let status = self.enter_plan_mode(classified.task_profile)?;
                 Ok(Some(format!(
-                    "{status}\nauto-plan: large task detected; planning before implementation ({})",
-                    classified.task_profile.as_str()
+                    "auto-plan: large {} task detected; entering plan mode\n{status}",
+                    classified.task_profile.as_str(),
                 )))
             }
             Ok(classified) => {
@@ -901,8 +916,8 @@ impl Agent {
                 if fallback.large_task {
                     let status = self.enter_plan_mode(fallback.task_profile)?;
                     Ok(Some(format!(
-                        "{status}\nauto-plan: classifier unavailable; using heuristic fallback ({})",
-                        fallback.task_profile.as_str()
+                        "auto-plan: classifier unavailable; using heuristic {} fallback\n{status}",
+                        fallback.task_profile.as_str(),
                     )))
                 } else {
                     self.session.mode_state.task_profile = fallback.task_profile;
@@ -1693,11 +1708,11 @@ mod tests {
     fn plan_stage_status_line_describes_focus() {
         assert_eq!(
             plan_stage_status_line(PlanStage::Stage1, &["Goal", "Constraints"]),
-            "Stage1: bootstrap Goal, Constraints"
+            "Current phase: Draft Goal, Constraints"
         );
         assert_eq!(
             plan_stage_status_line(PlanStage::Stage3, &["Execution Plan"]),
-            "Stage3: complete Execution Plan"
+            "Current phase: Finalize Execution Plan"
         );
     }
 
