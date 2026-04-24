@@ -1459,6 +1459,58 @@ impl Agent {
                 && repo_edit_calls_made_this_turn > 0
                 && reply_looks_like_future_work(&final_reply)
             {
+                if let Some(target) = self.focused_edit_recovery_target()
+                    && let Some(fallback_reply) = deterministic_page_completion_edit_reply(
+                        &self.session.messages,
+                        &target,
+                        &self.work_root,
+                    )
+                {
+                    let fallback_tool_calls = fallback_reply
+                        .tool_calls
+                        .iter()
+                        .cloned()
+                        .map(|tool_call| self.prepare_tool_call(tool_call))
+                        .collect::<Vec<_>>();
+                    let fallback_tool_count = fallback_tool_calls.len();
+                    self.session.messages.push(ConversationMessage::assistant(
+                        fallback_reply.content,
+                        fallback_tool_calls.clone(),
+                    ));
+                    write_stdout_rendered(
+                        &format_iteration_status(
+                            last_iter,
+                            self.config.max_iterations,
+                            "Focused edit fallback",
+                            "Small scaffold edit stalled in prose; applying deterministic playable page completion.",
+                            self.footer.current_cols(),
+                        ),
+                        true,
+                    );
+                    for tool_call in fallback_tool_calls {
+                        let raw_result = self.execute_tool_call(
+                            &tool_call.name,
+                            &tool_call.arguments,
+                            Some(interrupt_flag.flag.clone()),
+                        );
+                        let compact_result =
+                            prompting::compact_tool_result(&tool_call.name, raw_result);
+                        self.session.messages.push(ConversationMessage::tool(
+                            tool_call.name.clone(),
+                            compact_result,
+                        ));
+                    }
+                    repo_change_retries = 0;
+                    repo_edit_calls_made_this_turn += fallback_tool_count;
+                    log_llm_event(
+                        "agent.focused_edit.deterministic_completion_after_prose_stall",
+                        serde_json::json!({
+                            "session_id": self.session_store.session_id(),
+                            "target": target.display().to_string(),
+                        }),
+                    );
+                    continue;
+                }
                 repo_change_retries += 1;
                 if repo_change_retries >= 3 {
                     exit_reason = ExitReason::MissingRepoEdits;
