@@ -2494,6 +2494,15 @@ impl Agent {
             && let Some(raw_path) = arguments.get("path").and_then(serde_json::Value::as_str)
             && let Ok(resolved) = resolve_user_path(&self.work_root, raw_path)
         {
+            let resolved = if tool_call.name == "Read" {
+                self.focused_edit_recovery_target()
+                    .and_then(|target| {
+                        focused_read_target_for_directory(&resolved, &target).then_some(target)
+                    })
+                    .unwrap_or(resolved)
+            } else {
+                resolved
+            };
             arguments.insert(
                 "path".to_string(),
                 serde_json::Value::String(resolved.display().to_string()),
@@ -3878,6 +3887,19 @@ fn tool_path_matches_target(raw_path: &str, target: &Path, work_root: &Path) -> 
     canonical_resolved == canonical_target
 }
 
+fn focused_read_target_for_directory(resolved: &Path, target: &Path) -> bool {
+    if !resolved.is_dir() {
+        return false;
+    }
+    let Some(parent) = target.parent() else {
+        return false;
+    };
+    let canonical_resolved =
+        std::fs::canonicalize(resolved).unwrap_or_else(|_| resolved.to_path_buf());
+    let canonical_parent = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+    canonical_resolved == canonical_parent
+}
+
 fn latest_read_exchange_for_target(
     messages: &[ConversationMessage],
     target: &Path,
@@ -4616,9 +4638,9 @@ mod progress_tests {
         focused_edit_history, focused_edit_max_predict_override, focused_edit_minimal_history,
         focused_edit_target_already_read, focused_edit_timeout_override_secs,
         focused_edit_tool_batch_action, focused_edit_tool_policy_error,
-        format_blocked_progress_line, format_progress_line, has_successful_non_plan_repo_edit,
-        has_successful_repo_edit, is_utf8_locale, last_read_tool_path,
-        latest_page_copy_block_from_read, post_scaffold_continuation_active,
+        focused_read_target_for_directory, format_blocked_progress_line, format_progress_line,
+        has_successful_non_plan_repo_edit, has_successful_repo_edit, is_utf8_locale,
+        last_read_tool_path, latest_page_copy_block_from_read, post_scaffold_continuation_active,
         post_scaffold_recovery_active, progress_available_width, prune_plan_mode_messages,
         recent_scaffold_command_seen, recent_truncated_tool_call_attempt, sanitize_for_progress,
         should_use_deterministic_first_edit_for_focused_stall, should_use_streaming_transport,
@@ -5656,6 +5678,26 @@ export default function Home() {
         )
         .expect("expected policy error");
         assert!(err.contains("only allows Read or Edit on app/page.tsx"));
+    }
+
+    #[test]
+    fn focused_read_target_for_directory_matches_target_parent_only() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("src/app")).unwrap();
+        std::fs::create_dir_all(work_root.join("src/components")).unwrap();
+        let target = work_root.join("src/app/page.tsx");
+        std::fs::write(&target, "export default function Home() { return null; }\n").unwrap();
+
+        assert!(focused_read_target_for_directory(
+            &work_root.join("src/app"),
+            &target
+        ));
+        assert!(!focused_read_target_for_directory(
+            &work_root.join("src/components"),
+            &target
+        ));
+        assert!(!focused_read_target_for_directory(&target, &target));
     }
 
     #[test]
