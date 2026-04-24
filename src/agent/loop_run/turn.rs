@@ -1486,10 +1486,12 @@ impl Agent {
                 continue;
             }
 
-            if action_expectation == recovery::ActionExpectation::RepoChange
-                && self.session.mode_state.mode == ExecutionMode::Act
-                && let Some((request, target_path, issue)) =
-                    self.accepted_repo_change_quality_issue()
+            if should_apply_repo_change_quality_gate(
+                action_expectation,
+                self.active_task_expects_repo_change(),
+                self.session.mode_state.mode,
+            ) && let Some((request, target_path, issue)) =
+                self.accepted_repo_change_quality_issue()
             {
                 repo_change_retries += 1;
                 if repo_change_retries >= 3 {
@@ -3452,6 +3454,16 @@ fn request_needs_playable_ui_quality_gate(request: &str) -> bool {
     asks_for_game && asks_for_app_or_ui
 }
 
+fn should_apply_repo_change_quality_gate(
+    action_expectation: recovery::ActionExpectation,
+    active_task_expects_repo_change: bool,
+    mode: ExecutionMode,
+) -> bool {
+    mode == ExecutionMode::Act
+        && (action_expectation == recovery::ActionExpectation::RepoChange
+            || active_task_expects_repo_change)
+}
+
 fn implementation_quality_issue_for_request(request: &str, content: &str) -> Option<String> {
     let normalized = content.to_lowercase();
     let mechanics = [
@@ -4841,11 +4853,13 @@ mod progress_tests {
         post_scaffold_recovery_active, progress_available_width, prune_plan_mode_messages,
         recent_scaffold_command_seen, recent_truncated_tool_call_attempt,
         request_needs_playable_ui_quality_gate, sanitize_for_progress,
-        should_use_streaming_transport, strip_read_line_number_prefix,
-        successful_non_plan_repo_edit_count, successful_repo_edit_count, tool_color, tool_display,
-        tool_emoji, unicode_supported, workspace_appears_empty,
+        should_apply_repo_change_quality_gate, should_use_streaming_transport,
+        strip_read_line_number_prefix, successful_non_plan_repo_edit_count,
+        successful_repo_edit_count, tool_color, tool_display, tool_emoji, unicode_supported,
+        workspace_appears_empty,
     };
-    use crate::modes::plan_act::PlanStage;
+    use crate::agent::recovery::ActionExpectation;
+    use crate::modes::plan_act::{ExecutionMode, PlanStage};
     use crate::ollama::xml_fallback::ToolCall;
     use crate::safety::path_guard::resolve_user_path;
     use crate::session::store::ConversationMessage;
@@ -5739,6 +5753,25 @@ mod progress_tests {
         ));
         assert!(!request_needs_playable_ui_quality_gate(
             "READMEをわかりやすく改善してください"
+        ));
+    }
+
+    #[test]
+    fn repo_change_quality_gate_applies_to_active_task_after_yes() {
+        assert!(should_apply_repo_change_quality_gate(
+            ActionExpectation::None,
+            true,
+            ExecutionMode::Act,
+        ));
+        assert!(!should_apply_repo_change_quality_gate(
+            ActionExpectation::None,
+            true,
+            ExecutionMode::Plan,
+        ));
+        assert!(!should_apply_repo_change_quality_gate(
+            ActionExpectation::None,
+            false,
+            ExecutionMode::Act,
         ));
     }
 
