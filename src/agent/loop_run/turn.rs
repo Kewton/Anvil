@@ -3410,14 +3410,16 @@ fn post_scaffold_recovery_active(
 }
 
 fn post_scaffold_continuation_active(
-    messages: &[ConversationMessage],
-    active_root: Option<&Path>,
-    cwd: &Path,
-    work_root: &Path,
-    plan_path: Option<&Path>,
+    _messages: &[ConversationMessage],
+    _active_root: Option<&Path>,
+    _cwd: &Path,
+    _work_root: &Path,
+    _plan_path: Option<&Path>,
 ) -> bool {
-    post_scaffold_recovery_active(messages, active_root, cwd)
-        && successful_non_plan_repo_edit_count(messages, work_root, plan_path) == 1
+    // A second forced microscopic edit tends to trap scaffolded apps in
+    // placeholder-copy churn. After the first repo edit, let the normal
+    // implementation loop and final quality gate drive the next action.
+    false
 }
 
 fn workspace_appears_empty(work_root: &Path) -> bool {
@@ -5627,7 +5629,7 @@ mod progress_tests {
     }
 
     #[test]
-    fn post_scaffold_continuation_is_active_only_after_first_edit() {
+    fn post_scaffold_continuation_stays_disabled_after_first_edit() {
         let cwd = Path::new("/tmp/project");
         let work_root = Path::new("/tmp/project");
         let messages = vec![
@@ -5650,7 +5652,7 @@ mod progress_tests {
             ),
             ConversationMessage::tool("Edit".to_string(), "updated page".to_string()),
         ];
-        assert!(post_scaffold_continuation_active(
+        assert!(!post_scaffold_continuation_active(
             &messages, None, cwd, work_root, None
         ));
 
@@ -5673,7 +5675,7 @@ mod progress_tests {
     }
 
     #[test]
-    fn post_scaffold_continuation_ignores_plan_file_edits() {
+    fn post_scaffold_continuation_stays_disabled_with_plan_file_edits() {
         let cwd = Path::new("/tmp/project");
         let work_root = Path::new("/tmp/project");
         let plan_path = Path::new("/tmp/project/.anvil/plan.md");
@@ -5706,7 +5708,7 @@ mod progress_tests {
             ),
             ConversationMessage::tool("Edit".to_string(), "updated page".to_string()),
         ];
-        assert!(post_scaffold_continuation_active(
+        assert!(!post_scaffold_continuation_active(
             &messages,
             None,
             cwd,
