@@ -325,7 +325,15 @@ fn new_agent(
     client: OllamaClient,
     max_iterations: usize,
 ) -> Agent {
-    new_agent_with_options(cwd, host, model, client, max_iterations, LogLevel::Info, false)
+    new_agent_with_options(
+        cwd,
+        host,
+        model,
+        client,
+        max_iterations,
+        LogLevel::Info,
+        false,
+    )
 }
 
 fn new_offline_agent(
@@ -335,7 +343,15 @@ fn new_offline_agent(
     client: OllamaClient,
     max_iterations: usize,
 ) -> Agent {
-    new_agent_with_options(cwd, host, model, client, max_iterations, LogLevel::Info, true)
+    new_agent_with_options(
+        cwd,
+        host,
+        model,
+        client,
+        max_iterations,
+        LogLevel::Info,
+        true,
+    )
 }
 
 fn new_agent_with_log_level(

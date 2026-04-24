@@ -80,7 +80,7 @@ pub(crate) fn runtime_context_messages(
     }
     let _ = cwd;
     messages.push(ConversationMessage::system(format!(
-        "Current project root is {}. All repository files live under this path. Use repository-relative paths (for example 'src/app/page.tsx') for Read, Write, and Edit. Never use absolute paths from other projects, user directories, or your memory such as '/Users/...' or '/home/...'.",
+        "Current project root is {}. All repository files live under this path. Use repository-relative paths (for example 'app/page.tsx' or 'src/app/page.tsx', depending on the actual repo layout) for Read, Write, and Edit. Never use absolute paths from other projects, user directories, or your memory such as '/Users/...' or '/home/...'.",
         work_root.display()
     )));
     messages
@@ -101,7 +101,10 @@ struct QueryTerms {
     symbols: Vec<String>,
 }
 
-pub(crate) fn repo_context_message(work_root: &Path, task: Option<&str>) -> Option<ConversationMessage> {
+pub(crate) fn repo_context_message(
+    work_root: &Path,
+    task: Option<&str>,
+) -> Option<ConversationMessage> {
     let task = task?.trim();
     if task.is_empty() {
         return None;
@@ -193,7 +196,11 @@ fn should_skip_retrieval_path(path: &Path) -> bool {
     })
 }
 
-fn score_candidate(path: &Path, relative_path: &str, terms: &QueryTerms) -> Option<RetrievalCandidate> {
+fn score_candidate(
+    path: &Path,
+    relative_path: &str,
+    terms: &QueryTerms,
+) -> Option<RetrievalCandidate> {
     let path_lower = relative_path.to_ascii_lowercase();
     let path_tokens = tokenize_fragments(relative_path, 2);
     let file_name_tokens = path
@@ -484,7 +491,11 @@ mod tests {
             .filter(|line| line.starts_with("- "))
             .collect::<Vec<_>>();
         assert!(!bullet_lines.is_empty());
-        assert!(bullet_lines.remove(0).contains("src/billing/retry_policy.ts"));
+        assert!(
+            bullet_lines
+                .remove(0)
+                .contains("src/billing/retry_policy.ts")
+        );
         assert!(message.content.contains("symbol=delay,payment,retry"));
     }
 }

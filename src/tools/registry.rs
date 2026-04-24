@@ -339,7 +339,14 @@ fn enforce_plan_stage_scope(
         .into_iter()
         .filter(|section| payload_mentions_plan_section(payload, section))
         .collect::<Vec<_>>();
-    if disallowed.is_empty() || payload_contains_allowed_plan_section(payload, context.plan_stage) {
+    if disallowed.is_empty() {
+        return Ok(());
+    }
+    if name == "Edit"
+        && allowed_plan_sections(context.plan_stage)
+            .iter()
+            .any(|section| payload_mentions_plan_section(payload, section))
+    {
         return Ok(());
     }
 
@@ -381,12 +388,6 @@ fn disallowed_plan_sections(stage: PlanStage) -> Vec<&'static str> {
 fn payload_mentions_plan_section(payload: &str, section: &str) -> bool {
     let heading = format!("## {section}");
     payload.contains(&heading)
-}
-
-fn payload_contains_allowed_plan_section(payload: &str, stage: PlanStage) -> bool {
-    allowed_plan_sections(stage)
-        .iter()
-        .any(|section| payload_mentions_plan_section(payload, section))
 }
 
 fn plan_mode_merged_plan_contents(

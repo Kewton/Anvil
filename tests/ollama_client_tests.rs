@@ -19,8 +19,8 @@ fn parses_tags_and_generate_payloads() {
 }
 
 #[test]
-fn native_tools_are_disabled_for_all_models() {
-    assert!(should_use_native_tool_calls("qwen3.5:122b"));
+fn native_tools_are_allowlisted_for_supported_models() {
+    assert!(!should_use_native_tool_calls("qwen3.5:122b"));
     assert!(should_use_native_tool_calls("qwen3.6:27b-coding-nvfp4"));
     assert!(!should_use_native_tool_calls("qwen3:8b"));
     assert!(!should_use_native_tool_calls("gemma4:31b"));

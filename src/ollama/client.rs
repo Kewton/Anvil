@@ -64,6 +64,19 @@ impl OllamaClient {
         self.timeout_secs
     }
 
+    pub fn clone_with_overrides(
+        &self,
+        timeout_secs: u64,
+        max_predict: usize,
+    ) -> Result<Self, String> {
+        Self::new_with_timeout_and_options(
+            self.base_url.clone(),
+            timeout_secs,
+            self.context_window,
+            max_predict,
+        )
+    }
+
     pub fn list_models(&self) -> Result<Vec<String>, String> {
         let response = self
             .http

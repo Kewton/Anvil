@@ -833,7 +833,7 @@ mod tests {
 - Adds a useful new section.
 
 ## Quality Bar
-- The result is concrete and not filler.
+- Anchor the quality bar to README.md readability.
 
 ## Execution Plan
 1. Add the heading.
@@ -1002,7 +1002,7 @@ mod tests {
         let contents = "# Plan
 
 ## Goal
-- a
+- Update src/app/page.tsx.
 
 ## Constraints
 - b
@@ -1014,7 +1014,7 @@ mod tests {
 - d
 
 ## Quality Bar
-- e
+- Anchor polish to `src/app/page.tsx`.
 
 ## 実行計画
 - f

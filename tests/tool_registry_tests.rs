@@ -1,6 +1,6 @@
 use std::fs;
 
-use anvil::modes::plan_act::ExecutionMode;
+use anvil::modes::plan_act::{ExecutionMode, PlanStage};
 use anvil::tools::registry::{ToolContext, ToolRegistry};
 use serde_json::json;
 use tempfile::tempdir;
@@ -13,6 +13,7 @@ fn read_write_edit_glob_and_grep_work() {
         root: dir.path().to_path_buf(),
         mode: ExecutionMode::Act,
         plan_path: None,
+        plan_stage: PlanStage::Stage1,
         auto_approve: true,
         interactive_approval: false,
         offline: false,
@@ -63,6 +64,7 @@ fn edit_tool_salvages_token_anchor_drift() {
         root: dir.path().to_path_buf(),
         mode: ExecutionMode::Act,
         plan_path: None,
+        plan_stage: PlanStage::Stage1,
         auto_approve: true,
         interactive_approval: false,
         offline: false,
@@ -105,6 +107,7 @@ fn plan_mode_only_allows_plan_file_writes() {
         root: dir.path().to_path_buf(),
         mode: ExecutionMode::Plan,
         plan_path: Some(plan_path.clone()),
+        plan_stage: PlanStage::Stage1,
         auto_approve: true,
         interactive_approval: false,
         offline: false,
@@ -114,7 +117,7 @@ fn plan_mode_only_allows_plan_file_writes() {
     registry
         .execute(
             "Write",
-            &json!({"path": plan_path.display().to_string(), "content":"# plan"}),
+            &json!({"path": plan_path.display().to_string(), "content":"# Plan\n\n## Goal\n- keep writes confined"}),
             &context,
         )
         .unwrap();
@@ -142,6 +145,7 @@ fn plan_mode_allows_plan_file_outside_workspace() {
         root: workspace.path().to_path_buf(),
         mode: ExecutionMode::Plan,
         plan_path: Some(plan_path.clone()),
+        plan_stage: PlanStage::Stage1,
         auto_approve: true,
         interactive_approval: false,
         offline: false,
@@ -151,12 +155,12 @@ fn plan_mode_allows_plan_file_outside_workspace() {
     registry
         .execute(
             "Write",
-            &json!({"path": plan_path.display().to_string(), "content":"# outside plan"}),
+            &json!({"path": plan_path.display().to_string(), "content":"# Plan\n\n## Goal\n- outside plan"}),
             &context,
         )
         .unwrap();
     let contents = fs::read_to_string(&plan_path).unwrap();
-    assert!(contents.contains("# outside plan"));
+    assert!(contents.contains("outside plan"));
 
     let err = registry
         .execute(
@@ -176,6 +180,7 @@ fn offline_mode_blocks_network_bash_commands() {
         root: dir.path().to_path_buf(),
         mode: ExecutionMode::Act,
         plan_path: None,
+        plan_stage: PlanStage::Stage1,
         auto_approve: true,
         interactive_approval: false,
         offline: true,
@@ -183,7 +188,11 @@ fn offline_mode_blocks_network_bash_commands() {
     };
 
     let err = registry
-        .execute("Bash", &json!({"command":"curl -I https://example.com"}), &context)
+        .execute(
+            "Bash",
+            &json!({"command":"curl -I https://example.com"}),
+            &context,
+        )
         .unwrap_err();
     assert!(err.contains("offline mode blocks network shell commands"));
 }
@@ -196,6 +205,7 @@ fn offline_mode_allows_build_test_bash_commands() {
         root: dir.path().to_path_buf(),
         mode: ExecutionMode::Act,
         plan_path: None,
+        plan_stage: PlanStage::Stage1,
         auto_approve: true,
         interactive_approval: false,
         offline: true,

@@ -129,8 +129,30 @@ pub fn repo_change_recovery_note(attempt: usize) -> String {
     )
 }
 
+pub fn repo_change_no_tool_recovery_note(attempt: usize) -> String {
+    format!(
+        "The user asked for an actual repository change. Do not answer in prose. Emit exactly one tool call now. If implementation files already exist, inspect the target file and then edit it. If the workspace is still empty and the task needs a project scaffold, emit one scaffold Bash command now. repo_change_no_tool_attempt={attempt}"
+    )
+}
+
 pub fn repo_change_after_setup_note() -> String {
     "Setup or verification shell commands have already run, but the requested repository change is still missing. On the next turn, first inspect the target implementation file with Read, then make exactly one small Edit or short Write. Do not run another scaffold or dev-server command until a concrete repo change exists.".to_string()
+}
+
+pub fn repo_change_partial_progress_note(attempt: usize) -> String {
+    format!(
+        "A small repository edit landed, but the reply still describes future work instead of completed results. Do not stop here. On the next turn, emit exactly one tool call and keep implementing the requested feature until it is meaningfully usable. Do not answer with 'now I will', 'let me', or other next-step prose. repo_change_partial_attempt={attempt}"
+    )
+}
+
+pub fn empty_workspace_scaffold_note() -> String {
+    "The current workspace is still empty. Do not inspect it again with ls or Read on the root directory. Emit exactly one tool call now: either scaffold the minimum project needed for the task, or create the first required file directly if no scaffold is needed.".to_string()
+}
+
+pub fn framework_scaffold_now_note(framework: &str) -> String {
+    format!(
+        "The current workspace is still empty and the task explicitly requires {framework}. Do not write package.json or placeholder files by hand. Emit exactly one scaffold Bash command now that creates the framework app skeleton first."
+    )
 }
 
 pub fn tool_call_format_recovery_note(error: &str, attempt: usize) -> String {
@@ -157,10 +179,94 @@ pub fn post_scaffold_edit_recovery_note(path: &str, attempt: usize) -> String {
     )
 }
 
+pub fn post_scaffold_continuation_note(path: &str, attempt: usize) -> String {
+    format!(
+        "The first scaffold edit landed, but the feature is not complete yet. Stay on {path} for the next turn. Emit exactly one compact Edit on that file now, keep the change anchored to the last Read, and continue implementation before any verification shell commands. post_scaffold_continue_attempt={attempt}"
+    )
+}
+
+pub fn focused_edit_no_tool_recovery_note(
+    path: &str,
+    already_read: bool,
+    attempt: usize,
+) -> String {
+    if already_read {
+        format!(
+            "Focused edit recovery is active on {path}. Do not answer in prose. Emit exactly one Edit tool call now on that file. Copy old_string exactly from the last Read, replace one contiguous block only, and keep the change small. Do not call Read again. focused_edit_no_tool_attempt={attempt}"
+        )
+    } else {
+        format!(
+            "Focused edit recovery is active on {path}. Do not answer in prose. Emit exactly one tool call now on that file: Read it first if you need anchors, otherwise make one small Edit. Do not switch files, scaffold again, or describe intent. focused_edit_no_tool_attempt={attempt}"
+        )
+    }
+}
+
+pub fn focused_edit_timeout_recovery_note(
+    path: &str,
+    already_read: bool,
+    attempt: usize,
+) -> String {
+    if already_read {
+        let anchor_hint = page_component_anchor_hint(path);
+        return format!(
+            "Focused edit recovery on {path} timed out before any tool call returned. Do not rethink the whole feature. Emit exactly one compact Edit tool call now on that file, anchored to the last Read, and change only one contiguous block.{anchor_hint} focused_edit_timeout_attempt={attempt}"
+        );
+    }
+    format!(
+        "Focused edit recovery on {path} timed out before the target file was read successfully. Do not inspect other files, run Bash, or explain intent. Emit exactly one Read tool call now on that file only, with complete JSON and no prose before or after it. focused_edit_timeout_attempt={attempt}"
+    )
+}
+
+pub fn focused_edit_truncated_tool_call_note(
+    path: &str,
+    already_read: bool,
+    attempt: usize,
+) -> String {
+    if already_read {
+        let anchor_hint = page_component_anchor_hint(path);
+        return format!(
+            "Focused edit recovery on {path} produced a truncated tool call. Do not call Read again. Emit exactly one Edit tool call now on that file, copy old_string exactly from the last Read, replace one contiguous block only, and keep new_string compact enough to fit in a single response.{anchor_hint} focused_edit_truncated_attempt={attempt}"
+        );
+    }
+    format!(
+        "Focused edit recovery on {path} produced a truncated tool call before the target file was read successfully. Emit exactly one Read tool call now on that file only. Do not call Bash, do not switch files, and do not add prose before or after the tool call. focused_edit_truncated_attempt={attempt}"
+    )
+}
+
+pub fn focused_edit_unterminated_tool_call_note(
+    path: &str,
+    already_read: bool,
+    attempt: usize,
+) -> String {
+    if already_read {
+        let anchor_hint = page_component_anchor_hint(path);
+        return format!(
+            "Focused edit recovery on {path} produced an unterminated tool call block. Do not call Read again. Emit exactly one Edit tool call now on that file, with no prose before or after the tool call. Copy old_string exactly from the last Read, replace one contiguous block only, and keep the JSON body minimal so the wrapper closes cleanly.{anchor_hint} focused_edit_unterminated_attempt={attempt}"
+        );
+    }
+    format!(
+        "Focused edit recovery on {path} produced an unterminated tool call block before the target file was read successfully. Emit exactly one Read tool call now on that file only, with no prose before or after the tool call, and keep the JSON body minimal so the wrapper closes cleanly. focused_edit_unterminated_attempt={attempt}"
+    )
+}
+
 pub fn first_scaffold_shell_edit_note(path: &str) -> String {
     format!(
-        "The first repository edit after scaffolding must stay small. On {path}, replace only one contiguous UI block with a compact static game shell: title, HUD, playfield frame, and controls hint. Do not add game loop logic, keyboard handlers, collision logic, canvas animation, or a full-file rewrite in this turn."
+        "The first repository edit after scaffolding must stay microscopic. On {path}, replace only one contiguous UI block with a compact game teaser: the headline plus one short HUD and controls line. Keep the import lines, parent wrappers, and component signature unchanged for now. Use the central intro copy block as the exact Edit anchor: start at `<h1 className=` and replace only through its matching `</p>`. Reuse the existing `h1` and `p` tags if possible. Keep the new block to roughly 4-8 lines. Do not add a playfield, buttons, extra wrappers, game loop logic, keyboard handlers, collision logic, canvas animation, or a full-file rewrite in this turn."
     )
+}
+
+pub fn first_scaffold_shell_edit_exact_anchor_note(path: &str, old_string: &str) -> String {
+    format!(
+        "The first repository edit after scaffolding must stay microscopic. On {path}, emit exactly one Edit now and replace only the already-read intro copy block with a compact game teaser. Limit the new UI slice to: title, one short HUD line, and a controls hint only. Keep the surrounding layout, imports, and component signature unchanged. Copy the following block byte-for-byte as old_string and replace only this contiguous block. Reuse the same `h1` and `p` tags and className strings where possible. Keep new_string to roughly 4-8 lines and under about 500 characters. Do not add a playfield, buttons, extra wrappers, game loop logic, keyboard handlers, collision logic, canvas animation, extra sections, or a full-file rewrite in this turn. If unsure, keep the visible copy as short as `VOID RAIDERS` and `Score 000000 | Lives 3 | Move Arrow Keys | Fire Space`. Return only one Edit tool call with this shape and no prose before or after it: {{\"name\":\"Edit\",\"arguments\":{{\"path\":\"{path}\",\"old_string\":\"<use the exact block below>\",\"new_string\":\"<compact teaser only>\"}}}}.\n```tsx\n{old_string}\n```"
+    )
+}
+
+fn page_component_anchor_hint(path: &str) -> &'static str {
+    if path.ends_with("app/page.tsx") || path.ends_with("src/app/page.tsx") {
+        " For this page component, keep imports and the component signature unchanged, and anchor the Edit on the exact central copy block that starts with `<div className=\"flex flex-col items-center gap-6 text-center sm:items-start sm:text-left\">`."
+    } else {
+        ""
+    }
 }
 
 pub fn plan_progress_recovery_note(
@@ -302,8 +408,14 @@ pub fn should_block_restart_discovery(tool_name: &str, progress_exists: bool) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        forced_small_edit_recovery_note, post_scaffold_edit_recovery_note,
-        repo_change_after_setup_note, tool_call_format_recovery_note,
+        empty_workspace_scaffold_note, first_scaffold_shell_edit_exact_anchor_note,
+        first_scaffold_shell_edit_note, focused_edit_no_tool_recovery_note,
+        focused_edit_timeout_recovery_note, focused_edit_truncated_tool_call_note,
+        focused_edit_unterminated_tool_call_note, forced_small_edit_recovery_note,
+        framework_scaffold_now_note, post_scaffold_continuation_note,
+        post_scaffold_edit_recovery_note, repo_change_after_setup_note,
+        repo_change_no_tool_recovery_note, repo_change_partial_progress_note,
+        tool_call_format_recovery_note,
     };
 
     #[test]
@@ -324,6 +436,45 @@ mod tests {
     }
 
     #[test]
+    fn repo_change_no_tool_note_forces_single_tool_call() {
+        let note = repo_change_no_tool_recovery_note(2);
+        assert!(note.contains("exactly one tool call"), "got: {note}");
+        assert!(
+            note.contains("repo_change_no_tool_attempt=2"),
+            "got: {note}"
+        );
+    }
+
+    #[test]
+    fn empty_workspace_note_blocks_repeated_root_inspection() {
+        let note = empty_workspace_scaffold_note();
+        assert!(
+            note.contains("Do not inspect it again with ls"),
+            "got: {note}"
+        );
+        assert!(note.contains("exactly one tool call"), "got: {note}");
+    }
+
+    #[test]
+    fn partial_progress_note_rejects_future_intent_prose() {
+        let note = repo_change_partial_progress_note(2);
+        assert!(note.contains("future work"), "got: {note}");
+        assert!(note.contains("exactly one tool call"), "got: {note}");
+        assert!(
+            note.contains("repo_change_partial_attempt=2"),
+            "got: {note}"
+        );
+    }
+
+    #[test]
+    fn framework_scaffold_note_blocks_manual_package_bootstrap() {
+        let note = framework_scaffold_now_note("Next.js");
+        assert!(note.contains("Next.js"), "got: {note}");
+        assert!(note.contains("Do not write package.json"), "got: {note}");
+        assert!(note.contains("scaffold Bash command"), "got: {note}");
+    }
+
+    #[test]
     fn forced_small_edit_note_limits_tools_to_read_and_edit() {
         let note = forced_small_edit_recovery_note("app/page.tsx", 2);
         assert!(note.contains("only use Read or Edit"), "got: {note}");
@@ -335,6 +486,58 @@ mod tests {
     }
 
     #[test]
+    fn focused_edit_no_tool_note_forces_single_edit_after_read() {
+        let note = focused_edit_no_tool_recovery_note("src/app/page.tsx", true, 2);
+        assert!(note.contains("exactly one Edit tool call"), "got: {note}");
+        assert!(note.contains("Do not call Read again"), "got: {note}");
+        assert!(
+            note.contains("focused_edit_no_tool_attempt=2"),
+            "got: {note}"
+        );
+    }
+
+    #[test]
+    fn focused_edit_timeout_note_demands_compact_edit() {
+        let note = focused_edit_timeout_recovery_note("src/app/page.tsx", true, 1);
+        assert!(note.contains("timed out"), "got: {note}");
+        assert!(
+            note.contains("exactly one compact Edit tool call"),
+            "got: {note}"
+        );
+        assert!(note.contains("central copy block"), "got: {note}");
+        assert!(
+            note.contains("focused_edit_timeout_attempt=1"),
+            "got: {note}"
+        );
+    }
+
+    #[test]
+    fn focused_edit_truncated_note_blocks_repeat_read() {
+        let note = focused_edit_truncated_tool_call_note("src/app/page.tsx", true, 2);
+        assert!(note.contains("truncated tool call"), "got: {note}");
+        assert!(note.contains("Do not call Read again"), "got: {note}");
+        assert!(note.contains("exactly one Edit tool call"), "got: {note}");
+        assert!(note.contains("central copy block"), "got: {note}");
+        assert!(
+            note.contains("focused_edit_truncated_attempt=2"),
+            "got: {note}"
+        );
+    }
+
+    #[test]
+    fn focused_edit_unterminated_note_forbids_prose_wrapper_noise() {
+        let note = focused_edit_unterminated_tool_call_note("src/app/page.tsx", true, 1);
+        assert!(note.contains("unterminated tool call block"), "got: {note}");
+        assert!(note.contains("no prose before or after"), "got: {note}");
+        assert!(note.contains("exactly one Edit tool call"), "got: {note}");
+        assert!(note.contains("central copy block"), "got: {note}");
+        assert!(
+            note.contains("focused_edit_unterminated_attempt=1"),
+            "got: {note}"
+        );
+    }
+
+    #[test]
     fn post_scaffold_note_pushes_first_edit_on_existing_file() {
         let note = post_scaffold_edit_recovery_note("app/page.tsx", 1);
         assert!(note.contains("only use Read or Edit"), "got: {note}");
@@ -343,5 +546,66 @@ mod tests {
             "got: {note}"
         );
         assert!(note.contains("one concrete Edit succeeds"), "got: {note}");
+    }
+
+    #[test]
+    fn post_scaffold_continuation_note_pushes_one_more_edit() {
+        let note = post_scaffold_continuation_note("src/app/page.tsx", 2);
+        assert!(note.contains("exactly one compact Edit"), "got: {note}");
+        assert!(note.contains("src/app/page.tsx"), "got: {note}");
+        assert!(
+            note.contains("post_scaffold_continue_attempt=2"),
+            "got: {note}"
+        );
+    }
+
+    #[test]
+    fn first_scaffold_shell_note_targets_main_block_only() {
+        let note = first_scaffold_shell_edit_note("src/app/page.tsx");
+        assert!(note.contains("central intro copy block"), "got: {note}");
+        assert!(note.contains("start at `<h1 className=`"), "got: {note}");
+        assert!(note.contains("roughly 4-8 lines"), "got: {note}");
+        assert!(
+            note.contains("component signature unchanged"),
+            "got: {note}"
+        );
+    }
+
+    #[test]
+    fn first_scaffold_shell_exact_anchor_note_embeds_old_string() {
+        let old_string = "<div>\n  old\n</div>";
+        let note = first_scaffold_shell_edit_exact_anchor_note("src/app/page.tsx", old_string);
+        assert!(note.contains("byte-for-byte as old_string"), "got: {note}");
+        assert!(note.contains(old_string), "got: {note}");
+        assert!(note.contains("exactly one Edit now"), "got: {note}");
+        assert!(note.contains("\"name\":\"Edit\""), "got: {note}");
+        assert!(note.contains("no prose before or after"), "got: {note}");
+    }
+
+    #[test]
+    fn focused_edit_timeout_note_before_read_forces_single_read() {
+        let note = focused_edit_timeout_recovery_note("src/app/page.tsx", false, 1);
+        assert!(
+            note.contains("target file was read successfully"),
+            "got: {note}"
+        );
+        assert!(note.contains("exactly one Read tool call"), "got: {note}");
+        assert!(note.contains("no prose"), "got: {note}");
+    }
+
+    #[test]
+    fn focused_edit_truncated_note_before_read_forces_single_read() {
+        let note = focused_edit_truncated_tool_call_note("src/app/page.tsx", false, 2);
+        assert!(note.contains("truncated tool call"), "got: {note}");
+        assert!(note.contains("exactly one Read tool call"), "got: {note}");
+        assert!(note.contains("Do not call Bash"), "got: {note}");
+    }
+
+    #[test]
+    fn focused_edit_unterminated_note_before_read_forces_single_read() {
+        let note = focused_edit_unterminated_tool_call_note("src/app/page.tsx", false, 1);
+        assert!(note.contains("unterminated tool call block"), "got: {note}");
+        assert!(note.contains("exactly one Read tool call"), "got: {note}");
+        assert!(note.contains("no prose before or after"), "got: {note}");
     }
 }

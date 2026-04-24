@@ -33,8 +33,7 @@ pub fn run(
     cancel_flag: Option<&Arc<AtomicBool>>,
     offline: bool,
 ) -> Result<String, String> {
-    let command =
-        normalize_background_command(&normalize_noninteractive_scaffold_command(command));
+    let command = normalize_background_command(&normalize_noninteractive_scaffold_command(command));
     for snippet in BLOCKED_SNIPPETS {
         if command.contains(snippet) {
             return Err(format!("blocked dangerous command fragment: {snippet}"));
@@ -193,9 +192,7 @@ fn normalize_background_command(command: &str) -> String {
     let quoted_body = shell_single_quote(&body);
     format!(
         "nohup sh -lc {} >{} 2>&1 </dev/null & printf 'background_pid=%s\\nbackground_log=%s\\n' \"$!\" {}",
-        quoted_body,
-        quoted_log,
-        quoted_log
+        quoted_body, quoted_log, quoted_log
     )
 }
 
@@ -239,22 +236,94 @@ fn normalize_noninteractive_scaffold_command(command: &str) -> String {
         return command.to_string();
     }
 
-    let normalized = command.to_ascii_lowercase();
-    let mut rewritten = command.trim().to_string();
+    split_shell_control_segments(command)
+        .into_iter()
+        .map(normalize_scaffold_segment)
+        .collect::<String>()
+}
+
+fn split_shell_control_segments(command: &str) -> Vec<&str> {
+    let bytes = command.as_bytes();
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let op_len = match bytes[i] {
+            b'&' if i + 1 < bytes.len() && bytes[i + 1] == b'&' => Some(2),
+            b'|' if i + 1 < bytes.len() && bytes[i + 1] == b'|' => Some(2),
+            b'|' | b';' => Some(1),
+            _ => None,
+        };
+        if let Some(len) = op_len {
+            if start < i {
+                parts.push(&command[start..i]);
+            }
+            parts.push(&command[i..i + len]);
+            i += len;
+            start = i;
+        } else {
+            i += 1;
+        }
+    }
+    if start < command.len() {
+        parts.push(&command[start..]);
+    }
+    parts
+}
+
+fn normalize_scaffold_segment(segment: &str) -> String {
+    if !is_noninteractive_scaffold_command(segment) {
+        return segment.to_string();
+    }
+
+    let trimmed = segment.trim();
+    if trimmed.is_empty() {
+        return segment.to_string();
+    }
+
+    let mut tokens = trimmed
+        .split_whitespace()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let mut trailing_suffix = Vec::new();
+    while tokens
+        .last()
+        .is_some_and(|token| is_shell_redirection_token(token))
+    {
+        trailing_suffix.push(tokens.pop().expect("last token exists"));
+    }
+
+    let normalized = tokens.join(" ").to_ascii_lowercase();
     let has_yes = normalized.contains(" --yes")
         || normalized.ends_with(" --yes")
         || normalized.contains(" -y")
         || normalized.ends_with(" -y");
     if !has_yes {
-        rewritten.push_str(" --yes");
+        tokens.push("--yes".to_string());
     }
     let has_package_manager = ["--use-npm", "--use-pnpm", "--use-yarn", "--use-bun"]
         .iter()
         .any(|flag| normalized.contains(flag));
     if !has_package_manager {
-        rewritten.push_str(" --use-npm");
+        tokens.push("--use-npm".to_string());
+    }
+
+    let mut rewritten = tokens.join(" ");
+    if !trailing_suffix.is_empty() {
+        rewritten.push(' ');
+        rewritten.push_str(
+            &trailing_suffix
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
     }
     rewritten
+}
+
+fn is_shell_redirection_token(token: &str) -> bool {
+    token.contains('>') || token.contains('<')
 }
 
 fn enforce_offline_policy(
@@ -404,8 +473,8 @@ fn terminate_child(child: &mut Child) {
 #[cfg(test)]
 mod tests {
     use super::{
-        BashCommandClass, classify_command, command_uses_network,
-        launches_persistent_service, likely_long_running_command, normalize_background_command,
+        BashCommandClass, classify_command, command_uses_network, launches_persistent_service,
+        likely_long_running_command, normalize_background_command,
         normalize_noninteractive_scaffold_command, requests_background_execution, run,
         strip_trailing_background_operator,
     };
@@ -462,9 +531,25 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_only_scaffold_segment_before_pipe() {
+        let rewritten = normalize_noninteractive_scaffold_command(
+            "cd /tmp/app && npx create-next-app@latest space-invaders --typescript 2>&1 | tail -20",
+        );
+        assert!(
+            rewritten.contains(
+                "create-next-app@latest space-invaders --typescript --yes --use-npm 2>&1"
+            )
+        );
+        assert!(rewritten.ends_with("| tail -20"), "got: {rewritten}");
+        assert!(!rewritten.contains("tail -20 --yes"), "got: {rewritten}");
+    }
+
+    #[test]
     fn detects_background_execution_requests() {
         assert!(requests_background_execution("npx next dev -p 3011 &"));
-        assert!(requests_background_execution("pkill -f \"next dev\"; npx next dev -p 3011 &   "));
+        assert!(requests_background_execution(
+            "pkill -f \"next dev\"; npx next dev -p 3011 &   "
+        ));
         assert!(!requests_background_execution("npm run build"));
     }
 
