@@ -2121,30 +2121,35 @@ impl Agent {
             protocol,
         ));
         if let Some(target) = focused_edit_target {
-            let exact_anchor = focused_edit_exact_recovery_anchor(
+            let recovery_anchor = focused_edit_exact_recovery_anchor(
                 &self.session.messages,
                 &target,
                 &self.work_root,
                 focused_edit_target_already_read,
                 successful_repo_edits,
-            )
-            .or_else(|| {
-                (focused_edit_target_already_read
-                    && recent_truncated_tool_call_attempt(&self.session.messages) > 0)
-                    .then(|| {
-                        focused_edit_compact_recovery_anchor(
-                            &self.session.messages,
-                            &target,
-                            &self.work_root,
-                        )
-                    })
-                    .flatten()
-            });
+            );
+            let compact_anchor = (recovery_anchor.is_none()
+                && focused_edit_target_already_read
+                && recent_truncated_tool_call_attempt(&self.session.messages) > 0)
+                .then(|| {
+                    focused_edit_compact_recovery_anchor(
+                        &self.session.messages,
+                        &target,
+                        &self.work_root,
+                    )
+                })
+                .flatten();
+            let exact_anchor = recovery_anchor.or_else(|| compact_anchor.clone());
             messages.push(ConversationMessage::system(focused_edit_guidance_note(
                 &target,
                 &self.work_root,
                 focused_edit_target_already_read,
             )));
+            if compact_anchor.is_some() {
+                messages.push(ConversationMessage::system(
+                    focused_edit_compact_anchor_note(&target, &self.work_root),
+                ));
+            }
             if successful_repo_edits == 0
                 && let Some(note) = focused_edit_first_slice_note(
                     &self.session.messages,
@@ -3460,6 +3465,17 @@ fn focused_edit_guidance_note(
     }
 }
 
+fn focused_edit_compact_anchor_note(target: &Path, work_root: &Path) -> String {
+    let path = target
+        .strip_prefix(work_root)
+        .unwrap_or(target)
+        .to_string_lossy()
+        .replace('\\', "/");
+    format!(
+        "[Focused Edit Recovery / Compact Anchor] The Read result for {path} is intentionally only a tiny exact anchor from the real file, not the whole file. Use that anchor only for `old_string`. Keep `new_string` similarly small: at most 3 lines and under 240 characters. Do not insert imports, hooks, component definitions, or full-file content. If the anchor is CTA or placeholder text, replace only that text with a short task-specific label or copy."
+    )
+}
+
 fn focused_edit_first_slice_note(
     messages: &[ConversationMessage],
     target: &Path,
@@ -4622,15 +4638,15 @@ mod progress_tests {
         FOCUSED_EDIT_POST_READ_MAX_PREDICT, FOCUSED_EDIT_POST_READ_TIMEOUT_SECS,
         FOCUSED_EDIT_PRE_READ_MAX_PREDICT, FOCUSED_EDIT_PRE_READ_TIMEOUT_SECS,
         FocusedEditBatchAction, extract_page_copy_block_from_numbered_read,
-        first_existing_impl_target, focused_edit_compact_recovery_anchor,
-        focused_edit_exact_anchor_history, focused_edit_exact_recovery_anchor,
-        focused_edit_first_slice_note, focused_edit_first_slice_uses_exact_anchor,
-        focused_edit_guidance_note, focused_edit_history, focused_edit_max_predict_override,
-        focused_edit_minimal_history, focused_edit_second_slice_note,
-        focused_edit_target_already_read, focused_edit_timeout_override_secs,
-        focused_edit_tool_batch_action, focused_edit_tool_policy_error,
-        focused_read_target_for_directory, format_blocked_progress_line, format_progress_line,
-        has_successful_non_plan_repo_edit,
+        first_existing_impl_target, focused_edit_compact_anchor_note,
+        focused_edit_compact_recovery_anchor, focused_edit_exact_anchor_history,
+        focused_edit_exact_recovery_anchor, focused_edit_first_slice_note,
+        focused_edit_first_slice_uses_exact_anchor, focused_edit_guidance_note,
+        focused_edit_history, focused_edit_max_predict_override, focused_edit_minimal_history,
+        focused_edit_second_slice_note, focused_edit_target_already_read,
+        focused_edit_timeout_override_secs, focused_edit_tool_batch_action,
+        focused_edit_tool_policy_error, focused_read_target_for_directory,
+        format_blocked_progress_line, format_progress_line, has_successful_non_plan_repo_edit,
         has_successful_non_plan_repo_edit_after_latest_truncated_tool_call,
         has_successful_repo_edit, is_utf8_locale, last_read_tool_path,
         latest_page_copy_block_from_read, post_scaffold_continuation_active,
@@ -5174,6 +5190,16 @@ mod progress_tests {
         let note = focused_edit_guidance_note(Path::new("app/page.tsx"), Path::new("."), true);
         assert!(note.contains("Do not call Read again"));
         assert!(note.contains("exactly one compact Edit"));
+    }
+
+    #[test]
+    fn focused_edit_compact_anchor_note_forbids_full_file_insertions() {
+        let note = focused_edit_compact_anchor_note(Path::new("app/page.tsx"), Path::new("."));
+        assert!(note.contains("tiny exact anchor"));
+        assert!(note.contains("at most 3 lines"));
+        assert!(note.contains("under 240 characters"));
+        assert!(note.contains("Do not insert imports"));
+        assert!(note.contains("full-file content"));
     }
 
     #[test]
