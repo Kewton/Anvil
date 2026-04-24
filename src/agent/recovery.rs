@@ -145,6 +145,17 @@ pub fn repo_change_partial_progress_note(attempt: usize) -> String {
     )
 }
 
+pub fn repo_change_quality_gate_note(
+    request: &str,
+    target_path: &str,
+    issue: &str,
+    attempt: usize,
+) -> String {
+    format!(
+        "Quality gate failed for the user's request: {request}. Current target {target_path} is not a meaningful implementation yet: {issue}. Do not finish with prose. On the next turn, inspect or edit {target_path} and replace placeholder/demo content with a runnable vertical slice that directly matches the requested experience, including its domain objects, controls, state, and visible feedback. repo_change_quality_attempt={attempt}"
+    )
+}
+
 pub fn empty_workspace_scaffold_note() -> String {
     "The current workspace is still empty. Do not inspect it again with ls or Read on the root directory. Emit exactly one tool call now: either scaffold the minimum project needed for the task, or create the first required file directly if no scaffold is needed.".to_string()
 }

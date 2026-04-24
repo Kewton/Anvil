@@ -1486,6 +1486,36 @@ impl Agent {
                 continue;
             }
 
+            if action_expectation == recovery::ActionExpectation::RepoChange
+                && self.session.mode_state.mode == ExecutionMode::Act
+                && let Some((request, target_path, issue)) =
+                    self.accepted_repo_change_quality_issue()
+            {
+                repo_change_retries += 1;
+                if repo_change_retries >= 3 {
+                    exit_reason = ExitReason::MissingRepoEdits;
+                    error_text = issue;
+                    break 'outer;
+                }
+                write_stdout_rendered(
+                    &format_iteration_status(
+                        last_iter,
+                        self.config.max_iterations,
+                        "Quality gate",
+                        &format!("Asked the model to replace placeholder output in {target_path}."),
+                        self.footer.current_cols(),
+                    ),
+                    true,
+                );
+                self.push_system_note(recovery::repo_change_quality_gate_note(
+                    &request,
+                    &target_path,
+                    &issue,
+                    repo_change_retries,
+                ));
+                continue;
+            }
+
             // Done
             if self.session.mode_state.mode == ExecutionMode::Plan {
                 let plan_contents = match self.current_plan_contents() {
@@ -2562,6 +2592,22 @@ impl Agent {
         )
     }
 
+    fn accepted_repo_change_quality_issue(&self) -> Option<(String, String, String)> {
+        let request = self.session.working_memory.active_task.as_deref()?.trim();
+        if !request_needs_playable_ui_quality_gate(request) {
+            return None;
+        }
+        let target = first_existing_impl_target(&self.work_root)?;
+        let content = std::fs::read_to_string(&target).ok()?;
+        let issue = implementation_quality_issue_for_request(request, &content)?;
+        let relative = target
+            .strip_prefix(&self.work_root)
+            .unwrap_or(&target)
+            .to_string_lossy()
+            .replace('\\', "/");
+        Some((request.to_string(), relative, issue))
+    }
+
     fn refresh_working_memory(&mut self) {
         let constraints = self
             .current_plan_contents()
@@ -3386,6 +3432,119 @@ fn workspace_appears_empty(work_root: &Path) -> bool {
             ".git" | ".anvil-state" | "node_modules" | "target"
         )
     })
+}
+
+fn request_needs_playable_ui_quality_gate(request: &str) -> bool {
+    let lower = request.to_lowercase();
+    let asks_for_game = lower.contains("game")
+        || request.contains("ゲーム")
+        || request.contains("テトリス")
+        || request.contains("インベーダ")
+        || request.contains("ボール崩し");
+    let asks_for_app_or_ui = lower.contains("app")
+        || lower.contains("next.js")
+        || lower.contains("react")
+        || lower.contains("nuxt")
+        || request.contains("アプリ")
+        || request.contains("起動");
+    asks_for_game && asks_for_app_or_ui
+}
+
+fn implementation_quality_issue_for_request(request: &str, content: &str) -> Option<String> {
+    let normalized = content.to_lowercase();
+    let mechanics = [
+        "score",
+        "life",
+        "lives",
+        "level",
+        "player",
+        "enemy",
+        "alien",
+        "bullet",
+        "canvas",
+        "keydown",
+        "keyup",
+        "requestanimationframe",
+        "collision",
+        "gameover",
+        "restart",
+        "paddle",
+        "brick",
+        "tetromino",
+        "grid",
+        "スコア",
+        "ライフ",
+        "プレイヤ",
+        "敵",
+        "弾",
+    ];
+    let mechanic_hits = mechanics
+        .iter()
+        .filter(|token| normalized.contains(*token))
+        .count();
+    let placeholder_markers = [
+        "next.svg",
+        "vercel",
+        "documentation",
+        "create next app",
+        "local-first coding agent",
+        "start experience",
+        "core interaction",
+    ];
+    let placeholder_hits = placeholder_markers
+        .iter()
+        .filter(|token| normalized.contains(*token))
+        .count();
+    let domain_terms = requested_game_domain_terms(request);
+    let domain_matches = domain_terms
+        .iter()
+        .filter(|token| normalized.contains(token.as_str()))
+        .count();
+
+    if !domain_terms.is_empty() && domain_matches == 0 {
+        return Some(format!(
+            "it does not contain the requested game domain ({})",
+            domain_terms.join(", ")
+        ));
+    }
+    if mechanic_hits < 3 {
+        return Some(format!(
+            "it has only {mechanic_hits} game-mechanic markers; expected player/enemy/input/score/state behavior"
+        ));
+    }
+    if placeholder_hits >= 2 {
+        return Some(
+            "it still contains multiple scaffold or generic placeholder markers".to_string(),
+        );
+    }
+    None
+}
+
+fn requested_game_domain_terms(request: &str) -> Vec<String> {
+    let lower = request.to_lowercase();
+    if request.contains("スペース")
+        || request.contains("インベーダ")
+        || lower.contains("space invader")
+        || lower.contains("invader")
+    {
+        return ["space", "invader", "スペース", "インベーダ"]
+            .into_iter()
+            .map(ToString::to_string)
+            .collect();
+    }
+    if request.contains("ボール崩し") || lower.contains("breakout") {
+        return ["ball", "brick", "paddle", "ボール", "崩し"]
+            .into_iter()
+            .map(ToString::to_string)
+            .collect();
+    }
+    if request.contains("テトリス") || lower.contains("tetris") {
+        return ["tetris", "tetromino", "grid", "テトリス"]
+            .into_iter()
+            .map(ToString::to_string)
+            .collect();
+    }
+    Vec::new()
 }
 
 fn first_existing_impl_target(work_root: &Path) -> Option<PathBuf> {
@@ -4648,10 +4807,11 @@ mod progress_tests {
         focused_edit_tool_policy_error, focused_read_target_for_directory,
         format_blocked_progress_line, format_progress_line, has_successful_non_plan_repo_edit,
         has_successful_non_plan_repo_edit_after_latest_truncated_tool_call,
-        has_successful_repo_edit, is_utf8_locale, last_read_tool_path,
-        latest_page_copy_block_from_read, post_scaffold_continuation_active,
+        has_successful_repo_edit, implementation_quality_issue_for_request, is_utf8_locale,
+        last_read_tool_path, latest_page_copy_block_from_read, post_scaffold_continuation_active,
         post_scaffold_recovery_active, progress_available_width, prune_plan_mode_messages,
-        recent_scaffold_command_seen, recent_truncated_tool_call_attempt, sanitize_for_progress,
+        recent_scaffold_command_seen, recent_truncated_tool_call_attempt,
+        request_needs_playable_ui_quality_gate, sanitize_for_progress,
         should_use_streaming_transport, strip_read_line_number_prefix,
         successful_non_plan_repo_edit_count, successful_repo_edit_count, tool_color, tool_display,
         tool_emoji, unicode_supported, workspace_appears_empty,
@@ -5538,6 +5698,51 @@ mod progress_tests {
 
         std::fs::write(work_root.join("README.md"), "# app\n").unwrap();
         assert!(!workspace_appears_empty(work_root));
+    }
+
+    #[test]
+    fn playable_ui_quality_gate_targets_game_app_requests() {
+        assert!(request_needs_playable_ui_quality_gate(
+            "スペースインベーダーゲームを3011ポートで起動可能なnext.jsアプリとして開発してください"
+        ));
+        assert!(request_needs_playable_ui_quality_gate(
+            "Build a breakout game as a React app"
+        ));
+        assert!(!request_needs_playable_ui_quality_gate(
+            "READMEをわかりやすく改善してください"
+        ));
+    }
+
+    #[test]
+    fn playable_ui_quality_gate_rejects_generic_placeholder_page() {
+        let request =
+            "スペースインベーダーゲームを3011ポートで起動可能なnext.jsアプリとして開発してください";
+        let content = r#"
+            "use client";
+            import Image from "next/image";
+            export default function Home() {
+              return <button onClick={() => alert("ok")}>Start Experience</button>;
+            }
+        "#;
+        let issue = implementation_quality_issue_for_request(request, content)
+            .expect("expected quality issue");
+        assert!(issue.contains("requested game domain"), "got: {issue}");
+    }
+
+    #[test]
+    fn playable_ui_quality_gate_accepts_basic_space_invaders_slice() {
+        let request =
+            "スペースインベーダーゲームを3011ポートで起動可能なnext.jsアプリとして開発してください";
+        let content = r#"
+            "use client";
+            const title = "SPACE INVADERS";
+            const player = { x: 0, lives: 3 };
+            const enemies = [{ kind: "invader" }];
+            const bullets = [];
+            const score = 0;
+            window.addEventListener("keydown", () => {});
+        "#;
+        assert!(implementation_quality_issue_for_request(request, content).is_none());
     }
 
     #[test]
