@@ -2127,7 +2127,19 @@ impl Agent {
                 &self.work_root,
                 focused_edit_target_already_read,
                 successful_repo_edits,
-            );
+            )
+            .or_else(|| {
+                (focused_edit_target_already_read
+                    && recent_truncated_tool_call_attempt(&self.session.messages) > 0)
+                    .then(|| {
+                        focused_edit_compact_recovery_anchor(
+                            &self.session.messages,
+                            &target,
+                            &self.work_root,
+                        )
+                    })
+                    .flatten()
+            });
             messages.push(ConversationMessage::system(focused_edit_guidance_note(
                 &target,
                 &self.work_root,
@@ -3566,6 +3578,57 @@ fn latest_page_intro_paragraph_from_read(
     extract_page_intro_paragraph_from_numbered_read(&tool.content)
 }
 
+fn focused_edit_compact_recovery_anchor(
+    messages: &[ConversationMessage],
+    target: &Path,
+    work_root: &Path,
+) -> Option<String> {
+    let (_, tool) = latest_read_exchange_for_target(messages, target, work_root)?;
+    extract_compact_edit_anchor_from_numbered_read(&tool.content)
+}
+
+fn extract_compact_edit_anchor_from_numbered_read(contents: &str) -> Option<String> {
+    let lines = contents
+        .lines()
+        .map(strip_read_line_number_prefix)
+        .collect::<Vec<_>>();
+    let candidate = |line: &&String| {
+        let trimmed = line.trim();
+        !trimmed.is_empty()
+            && !matches!(trimmed, "{" | "}" | ");" | "</div>" | "</main>")
+            && line.chars().count() <= 180
+    };
+
+    lines
+        .iter()
+        .find(|line| {
+            candidate(line)
+                && matches!(
+                    line.trim(),
+                    "Deploy Now" | "Documentation" | "Get started" | "Learn More"
+                )
+        })
+        .or_else(|| {
+            lines.iter().find(|line| {
+                let trimmed = line.trim_start();
+                candidate(line)
+                    && (trimmed.starts_with("<button ")
+                        || trimmed.starts_with("<a ")
+                        || trimmed.starts_with("<h1 ")
+                        || trimmed.starts_with("<p "))
+            })
+        })
+        .or_else(|| {
+            lines.iter().find(|line| {
+                let trimmed = line.trim_start();
+                candidate(line)
+                    && !trimmed.starts_with("import ")
+                    && !trimmed.starts_with("export default")
+            })
+        })
+        .cloned()
+}
+
 fn extract_page_copy_block_from_numbered_read(contents: &str) -> Option<String> {
     let lines = contents
         .lines()
@@ -4559,14 +4622,15 @@ mod progress_tests {
         FOCUSED_EDIT_POST_READ_MAX_PREDICT, FOCUSED_EDIT_POST_READ_TIMEOUT_SECS,
         FOCUSED_EDIT_PRE_READ_MAX_PREDICT, FOCUSED_EDIT_PRE_READ_TIMEOUT_SECS,
         FocusedEditBatchAction, extract_page_copy_block_from_numbered_read,
-        first_existing_impl_target, focused_edit_exact_anchor_history,
-        focused_edit_exact_recovery_anchor, focused_edit_first_slice_note,
-        focused_edit_first_slice_uses_exact_anchor, focused_edit_guidance_note,
-        focused_edit_history, focused_edit_max_predict_override, focused_edit_minimal_history,
-        focused_edit_second_slice_note, focused_edit_target_already_read,
-        focused_edit_timeout_override_secs, focused_edit_tool_batch_action,
-        focused_edit_tool_policy_error, focused_read_target_for_directory,
-        format_blocked_progress_line, format_progress_line, has_successful_non_plan_repo_edit,
+        first_existing_impl_target, focused_edit_compact_recovery_anchor,
+        focused_edit_exact_anchor_history, focused_edit_exact_recovery_anchor,
+        focused_edit_first_slice_note, focused_edit_first_slice_uses_exact_anchor,
+        focused_edit_guidance_note, focused_edit_history, focused_edit_max_predict_override,
+        focused_edit_minimal_history, focused_edit_second_slice_note,
+        focused_edit_target_already_read, focused_edit_timeout_override_secs,
+        focused_edit_tool_batch_action, focused_edit_tool_policy_error,
+        focused_read_target_for_directory, format_blocked_progress_line, format_progress_line,
+        has_successful_non_plan_repo_edit,
         has_successful_non_plan_repo_edit_after_latest_truncated_tool_call,
         has_successful_repo_edit, is_utf8_locale, last_read_tool_path,
         latest_page_copy_block_from_read, post_scaffold_continuation_active,
@@ -5184,6 +5248,67 @@ mod progress_tests {
         assert!(
             focused_edit_exact_recovery_anchor(&messages, &target, &work_root, true, 2).is_none()
         );
+    }
+
+    #[test]
+    fn focused_edit_compact_recovery_anchor_prefers_placeholder_cta_text() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        let target = work_root.join("src").join("app").join("page.tsx");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "export default function Home() { return null; }\n").unwrap();
+        let messages = vec![
+            ConversationMessage::assistant(
+                String::new(),
+                vec![ToolCall {
+                    id: "xml-1".to_string(),
+                    name: "Read".to_string(),
+                    arguments: json!({"path":"src/app/page.tsx"}),
+                }],
+            ),
+            ConversationMessage::tool(
+                "Read".to_string(),
+                "   1: import Image from \"next/image\";\n   2: export default function Home() {\n   3:   return (\n   4:     <main>\n   5:       <h1>NEON SPACE INVADERS</h1>\n   6:       <p>Play the mission.</p>\n   7:       <a href=\"https://vercel.com/new\">\n   8:         Deploy Now\n   9:       </a>\n  10:     </main>\n  11:   );\n  12: }"
+                    .to_string(),
+            ),
+        ];
+
+        assert_eq!(
+            focused_edit_compact_recovery_anchor(&messages, &target, &work_root).as_deref(),
+            Some("        Deploy Now")
+        );
+    }
+
+    #[test]
+    fn focused_edit_compact_anchor_history_drops_full_latest_read() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        let target = work_root.join("src").join("app").join("page.tsx");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "export default function Home() { return null; }\n").unwrap();
+        let long_read = "   1: import Image from \"next/image\";\n   2: export default function Home() {\n   3:   return (\n   4:     <main>\n   5:       <h1>NEON SPACE INVADERS</h1>\n   6:       <p>Play the mission.</p>\n   7:       <a href=\"https://vercel.com/new\">\n   8:         Deploy Now\n   9:       </a>\n  10:     </main>\n  11:   );\n  12: }";
+        let messages = vec![
+            ConversationMessage::system("[Act Mode / coding] Execute the plan.".to_string()),
+            ConversationMessage::user("make a game".to_string()),
+            ConversationMessage::assistant(
+                String::new(),
+                vec![ToolCall {
+                    id: "xml-1".to_string(),
+                    name: "Read".to_string(),
+                    arguments: json!({"path":"src/app/page.tsx"}),
+                }],
+            ),
+            ConversationMessage::tool("Read".to_string(), long_read.to_string()),
+        ];
+        let anchor = focused_edit_compact_recovery_anchor(&messages, &target, &work_root)
+            .expect("expected compact anchor");
+        let filtered = focused_edit_exact_anchor_history(&messages, &target, &work_root, &anchor);
+
+        assert_eq!(anchor, "        Deploy Now");
+        assert_eq!(filtered.len(), 4, "got: {filtered:?}");
+        assert_eq!(filtered[3].name.as_deref(), Some("Read"));
+        assert_eq!(filtered[3].content, "   1:         Deploy Now");
+        assert!(!filtered.iter().any(|message| message.content == long_read));
     }
 
     #[test]
