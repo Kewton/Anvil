@@ -642,6 +642,32 @@ impl Agent {
                 }
             }
 
+            if prepared_tool_calls.is_empty()
+                && requires_action
+                && action_expectation == recovery::ActionExpectation::RepoChange
+                && let Some(target) = self.focused_edit_recovery_target()
+                && let Some(fallback_reply) =
+                    self.deterministic_first_edit_after_focused_stall(&target, "no_tool_reply")
+            {
+                prepared_tool_calls = fallback_reply
+                    .tool_calls
+                    .iter()
+                    .cloned()
+                    .map(|tool_call| self.prepare_tool_call(tool_call))
+                    .collect::<Vec<_>>();
+                reply = fallback_reply;
+                write_stdout_rendered(
+                    &format_iteration_status(
+                        last_iter,
+                        self.config.max_iterations,
+                        "Focused edit fallback",
+                        "Model answered without tools after reading the target; applying deterministic first slice edit.",
+                        self.footer.current_cols(),
+                    ),
+                    true,
+                );
+            }
+
             if !prepared_tool_calls.is_empty() {
                 let mut plan_file_edit_calls_this_turn = 0usize;
                 let mut plan_exploration_calls_this_turn = 0usize;
