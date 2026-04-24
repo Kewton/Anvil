@@ -531,7 +531,7 @@ impl Agent {
                 break 'outer;
             }
 
-            let reply =
+            let mut reply =
                 match self.request_assistant_reply_with_retry(stream_output, &interrupt_flag) {
                     Ok(r) => r,
                     Err(err) => {
@@ -588,33 +588,56 @@ impl Agent {
                     }
                     FocusedEditBatchAction::Reject(err) => {
                         self.session.working_memory.note_error(err);
-                        repo_change_retries += 1;
-                        if repo_change_retries >= 3 {
-                            exit_reason = ExitReason::MissingRepoEdits;
-                            error_text = exit_reason.default_error_text().to_string();
-                            break 'outer;
+                        if let Some(fallback_reply) = self
+                            .deterministic_first_edit_after_focused_stall(&target, "batch_reject")
+                        {
+                            let fallback_tool_calls = fallback_reply
+                                .tool_calls
+                                .iter()
+                                .cloned()
+                                .map(|tool_call| self.prepare_tool_call(tool_call))
+                                .collect::<Vec<_>>();
+                            reply = fallback_reply;
+                            prepared_tool_calls = fallback_tool_calls;
+                            write_stdout_rendered(
+                                &format_iteration_status(
+                                    last_iter,
+                                    self.config.max_iterations,
+                                    "Focused edit fallback",
+                                    "Model missed the required target edit; applying deterministic first slice edit.",
+                                    self.footer.current_cols(),
+                                ),
+                                true,
+                            );
+                        } else {
+                            repo_change_retries += 1;
+                            if repo_change_retries >= 3 {
+                                exit_reason = ExitReason::MissingRepoEdits;
+                                error_text = exit_reason.default_error_text().to_string();
+                                break 'outer;
+                            }
+                            write_stdout_rendered(
+                                &format_iteration_status(
+                                    last_iter,
+                                    self.config.max_iterations,
+                                    "Retry requested",
+                                    "Focused edit recovery requires exactly one compact tool call on the target file. Asked the model to retry with a single action.",
+                                    self.footer.current_cols(),
+                                ),
+                                true,
+                            );
+                            self.push_system_note(recovery::focused_edit_no_tool_recovery_note(
+                                &progress_path_display(
+                                    &target.display().to_string(),
+                                    &self.work_root,
+                                    self.session.mode_state.active_plan_path.as_deref(),
+                                    120,
+                                ),
+                                target_already_read,
+                                repo_change_retries,
+                            ));
+                            continue;
                         }
-                        write_stdout_rendered(
-                            &format_iteration_status(
-                                last_iter,
-                                self.config.max_iterations,
-                                "Retry requested",
-                                "Focused edit recovery requires exactly one compact tool call on the target file. Asked the model to retry with a single action.",
-                                self.footer.current_cols(),
-                            ),
-                            true,
-                        );
-                        self.push_system_note(recovery::focused_edit_no_tool_recovery_note(
-                            &progress_path_display(
-                                &target.display().to_string(),
-                                &self.work_root,
-                                self.session.mode_state.active_plan_path.as_deref(),
-                                120,
-                            ),
-                            target_already_read,
-                            repo_change_retries,
-                        ));
-                        continue;
                     }
                 }
             }
@@ -2271,6 +2294,32 @@ impl Agent {
             .or_else(|| self.post_scaffold_continuation_recovery_target())
     }
 
+    fn deterministic_first_edit_after_focused_stall(
+        &self,
+        target: &Path,
+        reason: &str,
+    ) -> Option<AssistantReply> {
+        if !should_use_deterministic_first_edit_for_focused_stall(
+            &self.session.messages,
+            target,
+            &self.work_root,
+            self.session.mode_state.active_plan_path.as_deref(),
+        ) {
+            return None;
+        }
+        let reply =
+            deterministic_page_first_edit_reply(&self.session.messages, target, &self.work_root)?;
+        log_llm_event(
+            "agent.focused_edit.deterministic_first_edit_after_stall",
+            serde_json::json!({
+                "session_id": self.session_store.session_id(),
+                "target": target.display().to_string(),
+                "reason": reason,
+            }),
+        );
+        Some(reply)
+    }
+
     fn execute_tool_call(
         &mut self,
         name: &str,
@@ -3363,6 +3412,17 @@ fn deterministic_page_first_edit_reply(
             }),
         }],
     })
+}
+
+fn should_use_deterministic_first_edit_for_focused_stall(
+    messages: &[ConversationMessage],
+    target: &Path,
+    work_root: &Path,
+    plan_path: Option<&Path>,
+) -> bool {
+    focused_edit_target_already_read(messages, target, work_root)
+        && successful_non_plan_repo_edit_count(messages, work_root, plan_path) == 0
+        && deterministic_page_first_edit_reply(messages, target, work_root).is_some()
 }
 
 fn deterministic_page_completion_edit_reply(
@@ -4574,9 +4634,10 @@ mod progress_tests {
         latest_page_copy_block_from_read, post_scaffold_continuation_active,
         post_scaffold_recovery_active, progress_available_width, prune_plan_mode_messages,
         recent_scaffold_command_seen, recent_truncated_tool_call_attempt, sanitize_for_progress,
-        should_use_streaming_transport, strip_read_line_number_prefix,
-        successful_non_plan_repo_edit_count, successful_repo_edit_count, tool_color, tool_display,
-        tool_emoji, unicode_supported, workspace_appears_empty,
+        should_use_deterministic_first_edit_for_focused_stall, should_use_streaming_transport,
+        strip_read_line_number_prefix, successful_non_plan_repo_edit_count,
+        successful_repo_edit_count, tool_color, tool_display, tool_emoji, unicode_supported,
+        workspace_appears_empty,
     };
     use crate::modes::plan_act::PlanStage;
     use crate::ollama::xml_fallback::ToolCall;
@@ -5435,6 +5496,62 @@ mod progress_tests {
             .expect("new_string");
         assert!(new_string.contains("VOID RAIDERS"), "got: {new_string}");
         assert!(new_string.contains("Score 000000"), "got: {new_string}");
+    }
+
+    #[test]
+    fn focused_stall_first_edit_fallback_requires_read_target_and_no_prior_repo_edit() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("src/app")).unwrap();
+        let target = work_root.join("src/app/page.tsx");
+        std::fs::write(&target, "placeholder\n").unwrap();
+        let read_messages = vec![
+            ConversationMessage::assistant(
+                String::new(),
+                vec![ToolCall {
+                    id: "read-1".to_string(),
+                    name: "Read".to_string(),
+                    arguments: json!({"path":"src/app/page.tsx"}),
+                }],
+            ),
+            ConversationMessage::tool(
+                "Read".to_string(),
+                r#"  16:           <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
+  17:             To get started, edit the page.tsx file.
+  18:           </h1>
+  19:           <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
+  20:             Looking for a starting point or more instructions?
+  21:           </p>"#
+                    .to_string(),
+            ),
+        ];
+
+        assert!(should_use_deterministic_first_edit_for_focused_stall(
+            &read_messages,
+            &target,
+            work_root,
+            None
+        ));
+
+        let mut edited_messages = read_messages.clone();
+        edited_messages.push(ConversationMessage::assistant(
+            String::new(),
+            vec![ToolCall {
+                id: "edit-1".to_string(),
+                name: "Edit".to_string(),
+                arguments: json!({"path":"src/app/page.tsx"}),
+            }],
+        ));
+        edited_messages.push(ConversationMessage::tool(
+            "Edit".to_string(),
+            "edited successfully".to_string(),
+        ));
+        assert!(!should_use_deterministic_first_edit_for_focused_stall(
+            &edited_messages,
+            &target,
+            work_root,
+            None
+        ));
     }
 
     #[test]
