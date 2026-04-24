@@ -20,6 +20,7 @@ const FOCUSED_EDIT_PRE_READ_TIMEOUT_SECS: u64 = 30;
 const FOCUSED_EDIT_PRE_READ_MAX_PREDICT: usize = 320;
 const FOCUSED_EDIT_POST_READ_TIMEOUT_SECS: u64 = 45;
 const FOCUSED_EDIT_POST_READ_MAX_PREDICT: usize = 320;
+const CREATE_NEXT_APP_PACKAGE_VERSION: &str = "16.2.4";
 
 fn is_qwen35_family(model: &str) -> bool {
     model.trim().to_ascii_lowercase().starts_with("qwen3.5:")
@@ -97,6 +98,10 @@ fn user_interrupt_result() -> String {
     "exit_code=-1\ninterrupted=true\ninterrupt requested by user".to_string()
 }
 
+fn tool_result_failed(result: &str) -> bool {
+    result.starts_with("Error:") || result.contains("\ninterrupted=true\n")
+}
+
 fn extract_requested_port(task: &str) -> Option<String> {
     let bytes = task.as_bytes();
     let mut i = 0usize;
@@ -122,20 +127,25 @@ fn task_requires_nextjs_scaffold(task: &str) -> bool {
     normalized.contains("next.js") || normalized.contains("nextjs")
 }
 
-fn messages_require_nextjs_scaffold(messages: &[ConversationMessage]) -> bool {
-    messages
-        .iter()
-        .any(|message| message.role == "user" && task_requires_nextjs_scaffold(&message.content))
+fn task_or_plan_requires_nextjs_scaffold(
+    active_task: Option<&str>,
+    plan_contents: Option<&str>,
+) -> bool {
+    active_task.is_some_and(task_requires_nextjs_scaffold)
+        || plan_contents.is_some_and(task_requires_nextjs_scaffold)
 }
 
 fn deterministic_nextjs_scaffold_reply() -> AssistantReply {
+    let command = format!(
+        "npx --yes create-next-app@{CREATE_NEXT_APP_PACKAGE_VERSION} . --typescript --tailwind --eslint --app --no-src-dir --import-alias \"@/*\" --use-npm --yes"
+    );
     AssistantReply {
         content: String::new(),
         tool_calls: vec![ToolCall {
             id: "deterministic-nextjs-scaffold-1".to_string(),
             name: "Bash".to_string(),
             arguments: serde_json::json!({
-                "command": "npx create-next-app@latest . --typescript --tailwind --eslint --app --no-src-dir --import-alias \"@/*\" --use-npm"
+                "command": command
             }),
         }],
     }
@@ -458,6 +468,14 @@ fn build_stats(
         changed_files,
         total_changed,
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScaffoldFallbackResult {
+    NotApplicable,
+    Applied,
+    Failed,
+    Skipped,
 }
 
 impl Agent {
@@ -1385,50 +1403,24 @@ impl Agent {
             if action_expectation == recovery::ActionExpectation::RepoChange
                 && repo_edit_calls_made_this_turn == 0
             {
-                if self.active_task_requires_nextjs_scaffold() && self.workspace_appears_empty() {
-                    let fallback_reply = deterministic_nextjs_scaffold_reply();
-                    let fallback_tool_calls = fallback_reply
-                        .tool_calls
-                        .iter()
-                        .cloned()
-                        .map(|tool_call| self.prepare_tool_call(tool_call))
-                        .collect::<Vec<_>>();
-                    self.session.messages.push(ConversationMessage::assistant(
-                        fallback_reply.content,
-                        fallback_tool_calls.clone(),
-                    ));
-                    write_stdout_rendered(
-                        &format_iteration_status(
-                            last_iter,
-                            self.config.max_iterations,
-                            "Scaffold fallback",
-                            "Empty Next.js workspace stalled on exploration; running deterministic scaffold command.",
-                            self.footer.current_cols(),
-                        ),
-                        true,
-                    );
-                    for tool_call in fallback_tool_calls {
-                        let raw_result = self.execute_tool_call(
-                            &tool_call.name,
-                            &tool_call.arguments,
-                            Some(interrupt_flag.flag.clone()),
-                        );
-                        let compact_result =
-                            prompting::compact_tool_result(&tool_call.name, raw_result);
-                        self.session.messages.push(ConversationMessage::tool(
-                            tool_call.name.clone(),
-                            compact_result,
-                        ));
+                match self.maybe_apply_deterministic_nextjs_scaffold(last_iter, &interrupt_flag) {
+                    ScaffoldFallbackResult::Applied => {
+                        repo_change_retries = 0;
+                        continue;
                     }
-                    repo_change_retries = 0;
-                    log_llm_event(
-                        "agent.empty_workspace.deterministic_nextjs_scaffold",
-                        serde_json::json!({
-                            "session_id": self.session_store.session_id(),
-                            "work_root": self.work_root.display().to_string(),
-                        }),
-                    );
-                    continue;
+                    ScaffoldFallbackResult::Failed | ScaffoldFallbackResult::Skipped => {
+                        repo_change_retries += 1;
+                        if repo_change_retries >= 3 {
+                            exit_reason = ExitReason::MissingRepoEdits;
+                            error_text = exit_reason.default_error_text().to_string();
+                            break 'outer;
+                        }
+                        self.push_system_note(recovery::repo_change_recovery_note(
+                            repo_change_retries,
+                        ));
+                        continue;
+                    }
+                    ScaffoldFallbackResult::NotApplicable => {}
                 }
                 repo_change_retries += 1;
                 if repo_change_retries >= 3 {
@@ -2403,6 +2395,110 @@ impl Agent {
         None
     }
 
+    fn deterministic_nextjs_scaffold_skip_reason(&self) -> Option<&'static str> {
+        if self.config.offline {
+            return Some("offline mode blocks network scaffolding");
+        }
+        if !self.config.yes_mode && !io::stdin().is_terminal() {
+            return Some("network scaffolding requires yes mode or an interactive approval prompt");
+        }
+        None
+    }
+
+    fn maybe_apply_deterministic_nextjs_scaffold(
+        &mut self,
+        last_iter: usize,
+        interrupt_flag: &InterruptFlag,
+    ) -> ScaffoldFallbackResult {
+        if !self.active_task_requires_nextjs_scaffold()
+            || !self.workspace_appears_empty()
+            || recent_scaffold_command_seen(&self.session.messages)
+        {
+            return ScaffoldFallbackResult::NotApplicable;
+        }
+
+        if let Some(reason) = self.deterministic_nextjs_scaffold_skip_reason() {
+            write_stdout_rendered(
+                &format_iteration_status(
+                    last_iter,
+                    self.config.max_iterations,
+                    "Scaffold fallback skipped",
+                    reason,
+                    self.footer.current_cols(),
+                ),
+                true,
+            );
+            log_llm_event(
+                "agent.empty_workspace.deterministic_nextjs_scaffold_skipped",
+                serde_json::json!({
+                    "session_id": self.session_store.session_id(),
+                    "work_root": self.work_root.display().to_string(),
+                    "reason": reason,
+                }),
+            );
+            return ScaffoldFallbackResult::Skipped;
+        }
+
+        let fallback_reply = deterministic_nextjs_scaffold_reply();
+        let fallback_tool_calls = fallback_reply
+            .tool_calls
+            .iter()
+            .cloned()
+            .map(|tool_call| self.prepare_tool_call(tool_call))
+            .collect::<Vec<_>>();
+        self.session.messages.push(ConversationMessage::assistant(
+            fallback_reply.content,
+            fallback_tool_calls.clone(),
+        ));
+        write_stdout_rendered(
+            &format_iteration_status(
+                last_iter,
+                self.config.max_iterations,
+                "Scaffold fallback",
+                "Empty Next.js workspace stalled on exploration; running pinned deterministic scaffold command.",
+                self.footer.current_cols(),
+            ),
+            true,
+        );
+
+        let mut fallback_failed = false;
+        for tool_call in fallback_tool_calls {
+            let raw_result = self.execute_tool_call(
+                &tool_call.name,
+                &tool_call.arguments,
+                Some(interrupt_flag.flag.clone()),
+            );
+            if tool_result_failed(&raw_result) {
+                fallback_failed = true;
+            }
+            let compact_result = prompting::compact_tool_result(&tool_call.name, raw_result);
+            self.session.messages.push(ConversationMessage::tool(
+                tool_call.name.clone(),
+                compact_result,
+            ));
+        }
+
+        let event = if fallback_failed {
+            "agent.empty_workspace.deterministic_nextjs_scaffold_failed"
+        } else {
+            "agent.empty_workspace.deterministic_nextjs_scaffold"
+        };
+        log_llm_event(
+            event,
+            serde_json::json!({
+                "session_id": self.session_store.session_id(),
+                "work_root": self.work_root.display().to_string(),
+                "create_next_app_version": CREATE_NEXT_APP_PACKAGE_VERSION,
+            }),
+        );
+
+        if fallback_failed {
+            ScaffoldFallbackResult::Failed
+        } else {
+            ScaffoldFallbackResult::Applied
+        }
+    }
+
     fn workspace_appears_empty(&self) -> bool {
         workspace_appears_empty(&self.work_root)
     }
@@ -2421,20 +2517,14 @@ impl Agent {
     }
 
     fn active_task_requires_nextjs_scaffold(&self) -> bool {
-        self.session.mode_state.mode == ExecutionMode::Act
-            && (self
-                .session
-                .working_memory
-                .active_task
-                .as_deref()
-                .is_some_and(task_requires_nextjs_scaffold)
-                || messages_require_nextjs_scaffold(&self.session.messages)
-                || self
-                    .current_plan_contents()
-                    .ok()
-                    .flatten()
-                    .as_deref()
-                    .is_some_and(task_requires_nextjs_scaffold))
+        if self.session.mode_state.mode != ExecutionMode::Act {
+            return false;
+        }
+        let plan_contents = self.current_plan_contents().ok().flatten();
+        task_or_plan_requires_nextjs_scaffold(
+            self.session.working_memory.active_task.as_deref(),
+            plan_contents.as_deref(),
+        )
     }
 
     fn refresh_working_memory(&mut self) {
@@ -4223,10 +4313,9 @@ fn format_blocked_progress_line(
 #[cfg(test)]
 mod truncate_tests {
     use super::{
-        messages_require_nextjs_scaffold, reply_looks_like_future_work,
-        task_requires_nextjs_scaffold, truncate,
+        deterministic_nextjs_scaffold_reply, reply_looks_like_future_work,
+        task_or_plan_requires_nextjs_scaffold, task_requires_nextjs_scaffold, truncate,
     };
-    use crate::session::store::ConversationMessage;
 
     #[test]
     fn preserves_short_strings_verbatim() {
@@ -4266,16 +4355,32 @@ mod truncate_tests {
     }
 
     #[test]
-    fn detects_nextjs_request_from_original_user_message() {
-        let messages = vec![
-            ConversationMessage::system(
-                "The accepted plan summary says to build a local app.".to_string(),
-            ),
-            ConversationMessage::user(
-                "3011ポートで起動可能なnext.jsアプリとして開発してください".to_string(),
-            ),
-        ];
-        assert!(messages_require_nextjs_scaffold(&messages));
+    fn detects_nextjs_request_from_active_task_or_plan_only() {
+        assert!(task_or_plan_requires_nextjs_scaffold(
+            Some("3011ポートで起動可能なnext.jsアプリとして開発してください"),
+            None,
+        ));
+        assert!(task_or_plan_requires_nextjs_scaffold(
+            Some("yes"),
+            Some("Build the accepted plan as a Next.js app."),
+        ));
+        assert!(!task_or_plan_requires_nextjs_scaffold(
+            Some("yes"),
+            Some("Build a local Rust CLI."),
+        ));
+    }
+
+    #[test]
+    fn deterministic_nextjs_scaffold_uses_pinned_noninteractive_command() {
+        let reply = deterministic_nextjs_scaffold_reply();
+        let command = reply.tool_calls[0]
+            .arguments
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .expect("command");
+        assert!(command.contains("npx --yes create-next-app@16.2.4"));
+        assert!(command.contains(" --yes"));
+        assert!(!command.contains("@latest"));
     }
 }
 
