@@ -3707,7 +3707,7 @@ fn focused_edit_exact_recovery_anchor(
             if !target_already_read || !is_page_component_target(&relative) {
                 return None;
             }
-            latest_page_intro_paragraph_from_read(messages, target, work_root)
+            latest_page_intro_copy_line_from_read(messages, target, work_root)
         }
         _ => None,
     }
@@ -3730,7 +3730,7 @@ fn focused_edit_second_slice_note(
     if !is_page_component_target(&relative) {
         return None;
     }
-    latest_page_intro_paragraph_from_read(messages, target, work_root).map(|old_string| {
+    latest_page_intro_copy_line_from_read(messages, target, work_root).map(|old_string| {
         recovery::second_scaffold_shell_edit_exact_anchor_note(&relative, &old_string)
     })
 }
@@ -3744,13 +3744,14 @@ fn latest_page_copy_block_from_read(
     extract_page_copy_block_from_numbered_read(&tool.content)
 }
 
-fn latest_page_intro_paragraph_from_read(
+fn latest_page_intro_copy_line_from_read(
     messages: &[ConversationMessage],
     target: &Path,
     work_root: &Path,
 ) -> Option<String> {
     let (_, tool) = latest_read_exchange_for_target(messages, target, work_root)?;
-    extract_page_intro_paragraph_from_numbered_read(&tool.content)
+    extract_page_intro_copy_line_from_numbered_read(&tool.content)
+        .or_else(|| extract_page_intro_paragraph_from_numbered_read(&tool.content))
 }
 
 fn focused_edit_compact_recovery_anchor(
@@ -3836,6 +3837,32 @@ fn extract_page_intro_paragraph_from_numbered_read(contents: &str) -> Option<Str
         .skip(start)
         .find_map(|(index, line)| line.trim_start().contains("</p>").then_some(index))?;
     Some(lines[start..=end].join("\n"))
+}
+
+fn extract_page_intro_copy_line_from_numbered_read(contents: &str) -> Option<String> {
+    let lines = contents
+        .lines()
+        .map(strip_read_line_number_prefix)
+        .collect::<Vec<_>>();
+    let start = lines.iter().position(|line| {
+        let trimmed = line.trim_start();
+        trimmed.starts_with("<p ") || trimmed.starts_with("<p>")
+    })?;
+    let end = lines
+        .iter()
+        .enumerate()
+        .skip(start)
+        .find_map(|(index, line)| line.trim_start().contains("</p>").then_some(index))?;
+
+    lines[start + 1..end]
+        .iter()
+        .find(|line| {
+            let trimmed = line.trim();
+            !trimmed.is_empty()
+                && !trimmed.starts_with('<')
+                && trimmed.chars().any(|ch| ch.is_alphabetic())
+        })
+        .cloned()
 }
 
 fn strip_read_line_number_prefix(line: &str) -> String {
@@ -5399,7 +5426,7 @@ mod progress_tests {
         ];
         let note = focused_edit_second_slice_note(&messages, &target, &work_root, true)
             .expect("expected second slice note");
-        assert!(note.contains("`<p>` intro block"), "got: {note}");
+        assert!(note.contains("intro copy line"), "got: {note}");
         assert!(note.contains("Old starter copy."), "got: {note}");
         assert!(note.contains("src/app/page.tsx"), "got: {note}");
     }
@@ -5429,7 +5456,7 @@ mod progress_tests {
 
         assert_eq!(
             focused_edit_exact_recovery_anchor(&messages, &target, &work_root, true, 1).as_deref(),
-            Some("<p className=\"copy\">\n  Old starter copy.\n</p>")
+            Some("  Old starter copy.")
         );
         assert!(
             focused_edit_exact_recovery_anchor(&messages, &target, &work_root, true, 2).is_none()

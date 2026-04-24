@@ -279,7 +279,7 @@ pub fn first_scaffold_shell_edit_exact_anchor_note(path: &str, old_string: &str)
 
 pub fn second_scaffold_shell_edit_exact_anchor_note(path: &str, old_string: &str) -> String {
     format!(
-        "The first scaffold edit already changed the page title. On {path}, emit exactly one Edit now and replace only the already-read `<p>` intro block with a compact task-specific description. Keep imports, the component signature, parent wrappers, buttons/links, and every other block unchanged for now. Copy the following small block byte-for-byte as old_string and replace only this contiguous block. Keep new_string to roughly 1-4 lines and under about 360 characters. Do not add runtime logic, keyboard handlers, animation, extra sections, or a full-file rewrite in this turn. Return only one Edit tool call with this shape and no prose before or after it: {{\"name\":\"Edit\",\"arguments\":{{\"path\":\"{path}\",\"old_string\":\"<use the exact block below>\",\"new_string\":\"<compact description only>\"}}}}.\n```tsx\n{old_string}\n```"
+        "The first scaffold edit already changed the page title. On {path}, emit exactly one Edit now and replace only the already-read intro copy line with a compact task-specific description line. Keep imports, the component signature, parent wrappers, buttons/links, paragraph tags, and every other block unchanged for now. Copy the following single line byte-for-byte as old_string and replace only that line. Keep new_string to one line and under about 180 characters. Do not add runtime logic, keyboard handlers, animation, extra sections, or a full-file rewrite in this turn. Return only one Edit tool call with this shape and no prose before or after it: {{\"name\":\"Edit\",\"arguments\":{{\"path\":\"{path}\",\"old_string\":\"<use the exact line below>\",\"new_string\":\"<compact description line only>\"}}}}.\n```tsx\n{old_string}\n```"
     )
 }
 
@@ -615,12 +615,12 @@ mod tests {
 
     #[test]
     fn second_scaffold_shell_exact_anchor_note_targets_intro_paragraph() {
-        let old_string = "<p>\n  old copy\n</p>";
+        let old_string = "  old copy";
         let note = second_scaffold_shell_edit_exact_anchor_note("src/app/page.tsx", old_string);
-        assert!(note.contains("`<p>` intro block"), "got: {note}");
+        assert!(note.contains("intro copy line"), "got: {note}");
         assert!(note.contains(old_string), "got: {note}");
         assert!(note.contains("Do not add runtime logic"), "got: {note}");
-        assert!(note.contains("under about 360 characters"), "got: {note}");
+        assert!(note.contains("under about 180 characters"), "got: {note}");
     }
 
     #[test]
