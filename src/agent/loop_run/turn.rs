@@ -2203,7 +2203,7 @@ impl Agent {
         if recent_truncated_tool_call_attempt(&self.session.messages) == 0 {
             return None;
         }
-        if has_successful_non_plan_repo_edit(
+        if has_successful_non_plan_repo_edit_after_latest_truncated_tool_call(
             &self.session.messages,
             &self.work_root,
             self.session.mode_state.active_plan_path.as_deref(),
@@ -3155,6 +3155,27 @@ fn recent_truncated_tool_call_attempt(messages: &[ConversationMessage]) -> usize
                 .or(Some(1))
         })
         .unwrap_or(0)
+}
+
+fn latest_truncated_tool_call_note_index(messages: &[ConversationMessage]) -> Option<usize> {
+    messages.iter().rposition(|message| {
+        message.role == "system"
+            && message
+                .content
+                .to_ascii_lowercase()
+                .contains("truncated tool call")
+    })
+}
+
+fn has_successful_non_plan_repo_edit_after_latest_truncated_tool_call(
+    messages: &[ConversationMessage],
+    work_root: &Path,
+    plan_path: Option<&Path>,
+) -> bool {
+    let Some(index) = latest_truncated_tool_call_note_index(messages) else {
+        return false;
+    };
+    successful_non_plan_repo_edit_count(&messages[index + 1..], work_root, plan_path) > 0
 }
 
 fn recent_post_scaffold_edit_attempt(messages: &[ConversationMessage]) -> usize {
@@ -4470,6 +4491,7 @@ mod progress_tests {
         focused_edit_timeout_override_secs, focused_edit_tool_batch_action,
         focused_edit_tool_policy_error, focused_read_target_for_directory,
         format_blocked_progress_line, format_progress_line, has_successful_non_plan_repo_edit,
+        has_successful_non_plan_repo_edit_after_latest_truncated_tool_call,
         has_successful_repo_edit, is_utf8_locale, last_read_tool_path,
         latest_page_copy_block_from_read, post_scaffold_continuation_active,
         post_scaffold_recovery_active, progress_available_width, prune_plan_mode_messages,
@@ -4777,6 +4799,82 @@ mod progress_tests {
         );
         assert_eq!(recent_truncated_tool_call_attempt(&messages), 1);
         assert!(!has_successful_repo_edit(&messages));
+    }
+
+    #[test]
+    fn truncated_recovery_ignores_edits_before_latest_truncation() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        std::fs::write(
+            work_root.join("app/page.tsx"),
+            "export default function Home() {}\n",
+        )
+        .unwrap();
+        let messages = vec![
+            ConversationMessage::assistant(
+                String::new(),
+                vec![ToolCall {
+                    id: "xml-1".to_string(),
+                    name: "Edit".to_string(),
+                    arguments: json!({"path":"app/page.tsx"}),
+                }],
+            ),
+            ConversationMessage::tool("Edit".to_string(), "edited app/page.tsx".to_string()),
+            ConversationMessage::system(
+                "Previous tool call was cut off by the model length limit: tool call parser failed: truncated tool call (generate response hit length limit). tool_call_format_attempt=1".to_string(),
+            ),
+            ConversationMessage::assistant(
+                String::new(),
+                vec![ToolCall {
+                    id: "xml-2".to_string(),
+                    name: "Read".to_string(),
+                    arguments: json!({"path":"app/page.tsx"}),
+                }],
+            ),
+            ConversationMessage::tool("Read".to_string(), "1: export default".to_string()),
+        ];
+
+        assert!(has_successful_non_plan_repo_edit(
+            &messages, &work_root, None
+        ));
+        assert!(
+            !has_successful_non_plan_repo_edit_after_latest_truncated_tool_call(
+                &messages, &work_root, None
+            )
+        );
+    }
+
+    #[test]
+    fn truncated_recovery_stops_after_edit_following_latest_truncation() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        std::fs::write(
+            work_root.join("app/page.tsx"),
+            "export default function Home() {}\n",
+        )
+        .unwrap();
+        let messages = vec![
+            ConversationMessage::system(
+                "Previous tool call was cut off by the model length limit: tool call parser failed: truncated tool call (generate response hit length limit). tool_call_format_attempt=1".to_string(),
+            ),
+            ConversationMessage::assistant(
+                String::new(),
+                vec![ToolCall {
+                    id: "xml-1".to_string(),
+                    name: "Edit".to_string(),
+                    arguments: json!({"path":"app/page.tsx"}),
+                }],
+            ),
+            ConversationMessage::tool("Edit".to_string(), "edited app/page.tsx".to_string()),
+        ];
+
+        assert!(
+            has_successful_non_plan_repo_edit_after_latest_truncated_tool_call(
+                &messages, &work_root, None
+            )
+        );
     }
 
     #[test]
