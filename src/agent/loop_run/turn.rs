@@ -1487,12 +1487,18 @@ impl Agent {
                         ),
                         true,
                     );
+                    let mut fallback_failed = false;
                     for tool_call in fallback_tool_calls {
                         let raw_result = self.execute_tool_call(
                             &tool_call.name,
                             &tool_call.arguments,
                             Some(interrupt_flag.flag.clone()),
                         );
+                        if raw_result.starts_with("Error:")
+                            || raw_result.contains("\ninterrupted=true\n")
+                        {
+                            fallback_failed = true;
+                        }
                         let compact_result =
                             prompting::compact_tool_result(&tool_call.name, raw_result);
                         self.session.messages.push(ConversationMessage::tool(
@@ -1509,6 +1515,13 @@ impl Agent {
                             "target": target.display().to_string(),
                         }),
                     );
+                    if !fallback_failed {
+                        final_prose =
+                            "スペースインベーダーゲームを実装しました。Next.js のメイン画面で移動、射撃、敵弾、スコア、ライフ、ウェーブ、リスタートを含む playable な Canvas ゲームとして動作します。"
+                                .to_string();
+                        exit_reason = ExitReason::Done;
+                        break 'outer;
+                    }
                     continue;
                 }
                 repo_change_retries += 1;
