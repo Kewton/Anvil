@@ -1585,6 +1585,11 @@ impl Agent {
                         self.disable_native_tools_for_session();
                         continue;
                     }
+                    if let Some(reply) =
+                        self.maybe_materialize_plan_after_tool_call_format_error(&err)?
+                    {
+                        return Ok(reply);
+                    }
                     if lifecycle::is_tool_call_format_error(&err)
                         && tool_call_format_retries_remaining > 0
                     {
@@ -1926,6 +1931,26 @@ impl Agent {
         if !self
             .materialize_deterministic_fallback_plan("agent.plan.timeout_fallback_materialized")?
         {
+            return Ok(None);
+        }
+        Ok(Some(AssistantReply {
+            content: "Plan complete. Reply yes to execute, no to revise, or provide feedback."
+                .to_string(),
+            tool_calls: Vec::new(),
+        }))
+    }
+
+    fn maybe_materialize_plan_after_tool_call_format_error(
+        &mut self,
+        err: &str,
+    ) -> Result<Option<AssistantReply>, String> {
+        if !should_materialize_plan_after_tool_call_format_error(self.session.mode_state.mode, err)
+        {
+            return Ok(None);
+        }
+        if !self.materialize_deterministic_fallback_plan(
+            "agent.plan.tool_call_format_fallback_materialized",
+        )? {
             return Ok(None);
         }
         Ok(Some(AssistantReply {
@@ -2482,7 +2507,7 @@ mod tests {
         effective_non_streaming_timeout_secs, non_streaming_assistant_reply_timeout_secs,
         normalize_exploration_path, normalize_plan_exploration_key,
         should_fallback_plan_model_after_timeout, should_materialize_plan_after_timeout,
-        should_use_streaming_transport,
+        should_materialize_plan_after_tool_call_format_error, should_use_streaming_transport,
     };
     use crate::modes::plan_act::{ExecutionMode, TaskProfile};
     use serde_json::json;
@@ -2672,6 +2697,22 @@ mod tests {
         assert!(!should_materialize_plan_after_timeout(
             ExecutionMode::Act,
             Some("qwen3.5:9b"),
+            "assistant reply timed out after 90s",
+        ));
+    }
+
+    #[test]
+    fn plan_tool_call_format_error_materializes_fallback_plan() {
+        assert!(should_materialize_plan_after_tool_call_format_error(
+            ExecutionMode::Plan,
+            "tool call parser failed: malformed tool call markup",
+        ));
+        assert!(!should_materialize_plan_after_tool_call_format_error(
+            ExecutionMode::Act,
+            "tool call parser failed: malformed tool call markup",
+        ));
+        assert!(!should_materialize_plan_after_tool_call_format_error(
+            ExecutionMode::Plan,
             "assistant reply timed out after 90s",
         ));
     }
@@ -2904,6 +2945,10 @@ fn should_materialize_plan_after_timeout(
     mode == ExecutionMode::Plan
         && plan_model_override.is_some()
         && err.to_ascii_lowercase().contains("timed out")
+}
+
+fn should_materialize_plan_after_tool_call_format_error(mode: ExecutionMode, err: &str) -> bool {
+    mode == ExecutionMode::Plan && lifecycle::is_tool_call_format_error(err)
 }
 
 fn assistant_model_for_mode(
