@@ -2121,13 +2121,13 @@ impl Agent {
             protocol,
         ));
         if let Some(target) = focused_edit_target {
-            let trim_history_for_first_slice = successful_repo_edits == 0
-                && focused_edit_first_slice_uses_exact_anchor(
-                    &self.session.messages,
-                    &target,
-                    &self.work_root,
-                    focused_edit_target_already_read,
-                );
+            let trim_history_for_exact_anchor = focused_edit_uses_exact_recovery_anchor(
+                &self.session.messages,
+                &target,
+                &self.work_root,
+                focused_edit_target_already_read,
+                successful_repo_edits,
+            );
             messages.push(ConversationMessage::system(focused_edit_guidance_note(
                 &target,
                 &self.work_root,
@@ -2153,7 +2153,7 @@ impl Agent {
             {
                 messages.push(ConversationMessage::system(note));
             }
-            if trim_history_for_first_slice {
+            if trim_history_for_exact_anchor {
                 messages.extend(focused_edit_minimal_history(&self.session.messages));
             } else {
                 messages.extend(focused_edit_history(
@@ -3487,6 +3487,34 @@ fn focused_edit_first_slice_uses_exact_anchor(
         && latest_page_copy_block_from_read(messages, target, work_root).is_some()
 }
 
+fn focused_edit_uses_exact_recovery_anchor(
+    messages: &[ConversationMessage],
+    target: &Path,
+    work_root: &Path,
+    target_already_read: bool,
+    successful_repo_edits: usize,
+) -> bool {
+    match successful_repo_edits {
+        0 => focused_edit_first_slice_uses_exact_anchor(
+            messages,
+            target,
+            work_root,
+            target_already_read,
+        ),
+        1 => {
+            let relative = target
+                .strip_prefix(work_root)
+                .unwrap_or(target)
+                .to_string_lossy()
+                .replace('\\', "/");
+            target_already_read
+                && is_page_component_target(&relative)
+                && latest_page_intro_paragraph_from_read(messages, target, work_root).is_some()
+        }
+        _ => false,
+    }
+}
+
 fn focused_edit_second_slice_note(
     messages: &[ConversationMessage],
     target: &Path,
@@ -4489,8 +4517,9 @@ mod progress_tests {
         focused_edit_history, focused_edit_max_predict_override, focused_edit_minimal_history,
         focused_edit_second_slice_note, focused_edit_target_already_read,
         focused_edit_timeout_override_secs, focused_edit_tool_batch_action,
-        focused_edit_tool_policy_error, focused_read_target_for_directory,
-        format_blocked_progress_line, format_progress_line, has_successful_non_plan_repo_edit,
+        focused_edit_tool_policy_error, focused_edit_uses_exact_recovery_anchor,
+        focused_read_target_for_directory, format_blocked_progress_line, format_progress_line,
+        has_successful_non_plan_repo_edit,
         has_successful_non_plan_repo_edit_after_latest_truncated_tool_call,
         has_successful_repo_edit, is_utf8_locale, last_read_tool_path,
         latest_page_copy_block_from_read, post_scaffold_continuation_active,
@@ -5076,6 +5105,37 @@ mod progress_tests {
         assert!(note.contains("`<p>` intro block"), "got: {note}");
         assert!(note.contains("Old starter copy."), "got: {note}");
         assert!(note.contains("src/app/page.tsx"), "got: {note}");
+    }
+
+    #[test]
+    fn focused_edit_exact_anchor_applies_to_second_slice() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        let target = work_root.join("src").join("app").join("page.tsx");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "export default function Home() { return null; }\n").unwrap();
+        let messages = vec![
+            ConversationMessage::assistant(
+                String::new(),
+                vec![ToolCall {
+                    id: "xml-1".to_string(),
+                    name: "Read".to_string(),
+                    arguments: json!({"path":"src/app/page.tsx"}),
+                }],
+            ),
+            ConversationMessage::tool(
+                "Read".to_string(),
+                "1: <h1 className=\"title\">\n2:   NEON INVADERS\n3: </h1>\n4: <p className=\"copy\">\n5:   Old starter copy.\n6: </p>"
+                    .to_string(),
+            ),
+        ];
+
+        assert!(focused_edit_uses_exact_recovery_anchor(
+            &messages, &target, &work_root, true, 1,
+        ));
+        assert!(!focused_edit_uses_exact_recovery_anchor(
+            &messages, &target, &work_root, true, 2,
+        ));
     }
 
     #[test]
