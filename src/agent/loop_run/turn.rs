@@ -1366,11 +1366,11 @@ impl Agent {
                     self.push_system_note(recovery::repo_change_after_setup_note());
                 }
                 if repo_edit_calls_made_this_turn > 0
-                    && should_apply_repo_change_quality_gate(
+                    && (should_apply_repo_change_quality_gate(
                         action_expectation,
                         self.active_task_expects_repo_change(),
                         self.session.mode_state.mode,
-                    )
+                    ) || self.current_request_needs_playable_ui_quality_gate())
                     && let Some((request, target_path, issue)) =
                         self.accepted_repo_change_quality_issue()
                 {
@@ -1739,12 +1739,13 @@ impl Agent {
                 continue;
             }
 
-            if should_apply_repo_change_quality_gate(
+            if (should_apply_repo_change_quality_gate(
                 action_expectation,
                 self.active_task_expects_repo_change(),
                 self.session.mode_state.mode,
-            ) && let Some((request, target_path, issue)) =
-                self.accepted_repo_change_quality_issue()
+            ) || self.current_request_needs_playable_ui_quality_gate())
+                && let Some((request, target_path, issue)) =
+                    self.accepted_repo_change_quality_issue()
             {
                 if self.maybe_apply_deterministic_playable_ui_fallback(
                     last_iter,
@@ -2907,15 +2908,10 @@ impl Agent {
 
     fn active_task_expects_repo_change(&self) -> bool {
         self.session.mode_state.mode == ExecutionMode::Act
-            && self
-                .session
-                .working_memory
-                .active_task
-                .as_deref()
-                .is_some_and(|task| {
-                    recovery::classify_action_expectation(task, self.session.mode_state.mode)
-                        == recovery::ActionExpectation::RepoChange
-                })
+            && self.active_request_text().as_deref().is_some_and(|task| {
+                recovery::classify_action_expectation(task, self.session.mode_state.mode)
+                    == recovery::ActionExpectation::RepoChange
+            })
     }
 
     fn active_task_requires_nextjs_scaffold(&self) -> bool {
@@ -2924,13 +2920,29 @@ impl Agent {
         }
         let plan_contents = self.current_plan_contents().ok().flatten();
         task_or_plan_requires_nextjs_scaffold(
-            self.session.working_memory.active_task.as_deref(),
+            self.active_request_text().as_deref(),
             plan_contents.as_deref(),
         )
     }
 
+    fn active_request_text(&self) -> Option<String> {
+        repo_change_request_text(
+            self.session.working_memory.active_task.as_deref(),
+            &self.session.messages,
+        )
+    }
+
+    fn current_request_needs_playable_ui_quality_gate(&self) -> bool {
+        self.session.mode_state.mode == ExecutionMode::Act
+            && self
+                .active_request_text()
+                .as_deref()
+                .is_some_and(request_needs_playable_ui_quality_gate)
+    }
+
     fn accepted_repo_change_quality_issue(&self) -> Option<(String, String, String)> {
-        let request = self.session.working_memory.active_task.as_deref()?.trim();
+        let request = self.active_request_text()?;
+        let request = request.trim();
         if !request_needs_playable_ui_quality_gate(request) {
             return None;
         }
@@ -3787,6 +3799,24 @@ fn request_needs_playable_ui_quality_gate(request: &str) -> bool {
         || request.contains("アプリ")
         || request.contains("起動");
     asks_for_game && asks_for_app_or_ui
+}
+
+fn repo_change_request_text(
+    active_task: Option<&str>,
+    messages: &[ConversationMessage],
+) -> Option<String> {
+    active_task
+        .map(str::trim)
+        .filter(|task| !task.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            messages
+                .iter()
+                .rev()
+                .find(|message| message.role == "user")
+                .map(|message| message.content.trim().to_string())
+                .filter(|content| !content.is_empty())
+        })
 }
 
 fn should_apply_repo_change_quality_gate(
@@ -5187,7 +5217,7 @@ mod progress_tests {
         has_successful_repo_edit, implementation_quality_issue_for_request, is_utf8_locale,
         last_read_tool_path, latest_page_copy_block_from_read, post_scaffold_continuation_active,
         post_scaffold_recovery_active, progress_available_width, prune_plan_mode_messages,
-        recent_scaffold_command_seen, recent_truncated_tool_call_attempt,
+        recent_scaffold_command_seen, recent_truncated_tool_call_attempt, repo_change_request_text,
         request_needs_playable_ui_quality_gate, sanitize_for_progress,
         should_apply_repo_change_quality_gate, should_use_streaming_transport,
         strip_read_line_number_prefix, successful_non_plan_repo_edit_count,
@@ -6109,6 +6139,22 @@ mod progress_tests {
             false,
             ExecutionMode::Act,
         ));
+    }
+
+    #[test]
+    fn repo_change_request_text_falls_back_to_latest_user_prompt() {
+        let messages = vec![
+            ConversationMessage::user("Build a Space Invaders Next.js game".to_string()),
+            ConversationMessage::assistant("done".to_string(), Vec::new()),
+        ];
+        assert_eq!(
+            repo_change_request_text(None, &messages).as_deref(),
+            Some("Build a Space Invaders Next.js game")
+        );
+        assert_eq!(
+            repo_change_request_text(Some("Active task wins"), &messages).as_deref(),
+            Some("Active task wins")
+        );
     }
 
     #[test]
