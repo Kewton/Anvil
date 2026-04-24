@@ -431,10 +431,68 @@ fn repair_json_candidate(raw: &str) -> Option<Value> {
     let bare_keys =
         Regex::new(r#"([{\[,]\s*)([A-Za-z_][A-Za-z0-9_-]*)(\s*:)"#).expect("valid regex");
 
+    if let Some(fixed) = repair_terminal_bracket_swap(raw)
+        && let Ok(parsed) = serde_json::from_str(&fixed)
+    {
+        return Some(parsed);
+    }
+
     let without_commas = trailing_commas.replace_all(raw, "$1").into_owned();
     let quoted_keys = bare_keys.replace_all(&without_commas, "$1\"$2\"$3");
     let single_to_double = quoted_keys.replace('\'', "\"");
-    serde_json::from_str(&single_to_double).ok()
+    serde_json::from_str(&single_to_double).ok().or_else(|| {
+        repair_terminal_bracket_swap(&single_to_double)
+            .and_then(|fixed| serde_json::from_str(&fixed).ok())
+    })
+}
+
+fn repair_terminal_bracket_swap(raw: &str) -> Option<String> {
+    let (curly, square, in_string) = bracket_balance(raw);
+    if in_string {
+        return None;
+    }
+
+    match (curly, square) {
+        (1, -1) => replace_last_non_ws(raw, ']', '}'),
+        (-1, 1) => replace_last_non_ws(raw, '}', ']'),
+        _ => None,
+    }
+}
+
+fn bracket_balance(raw: &str) -> (i32, i32, bool) {
+    let mut curly: i32 = 0;
+    let mut square: i32 = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    for ch in raw.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_string => escaped = true,
+            '"' => in_string = !in_string,
+            '{' if !in_string => curly += 1,
+            '}' if !in_string => curly -= 1,
+            '[' if !in_string => square += 1,
+            ']' if !in_string => square -= 1,
+            _ => {}
+        }
+    }
+    (curly, square, in_string)
+}
+
+fn replace_last_non_ws(raw: &str, from: char, to: char) -> Option<String> {
+    let (idx, ch) = raw
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| !ch.is_whitespace())?;
+    if ch != from {
+        return None;
+    }
+    let mut fixed = raw.to_string();
+    fixed.replace_range(idx..idx + ch.len_utf8(), &to.to_string());
+    Some(fixed)
 }
 
 fn normalize_name(name: &str, allowed_tools: &[String]) -> String {
@@ -532,6 +590,20 @@ mod tests {
         assert_eq!(
             tool_calls[0].arguments,
             json!({"path":"plans/plan.md","content":"hello"})
+        );
+    }
+
+    #[test]
+    fn repairs_terminal_bracket_swap_in_tool_call_json() {
+        let allowed = vec!["Edit".to_string()];
+        let input = r#"<anvil_tool_call>{"name":"Edit","arguments":{"path":"src/app/page.tsx","old_string":"old","new_string":"new"}]</anvil_tool_call>"#;
+        let (tool_calls, remaining) = extract_tool_calls(input, &allowed);
+        assert!(remaining.is_empty(), "remaining={remaining:?}");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].name, "Edit");
+        assert_eq!(
+            tool_calls[0].arguments,
+            json!({"path":"src/app/page.tsx","old_string":"old","new_string":"new"})
         );
     }
 
