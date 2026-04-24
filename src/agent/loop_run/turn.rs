@@ -122,6 +122,25 @@ fn task_requires_nextjs_scaffold(task: &str) -> bool {
     normalized.contains("next.js") || normalized.contains("nextjs")
 }
 
+fn messages_require_nextjs_scaffold(messages: &[ConversationMessage]) -> bool {
+    messages
+        .iter()
+        .any(|message| message.role == "user" && task_requires_nextjs_scaffold(&message.content))
+}
+
+fn deterministic_nextjs_scaffold_reply() -> AssistantReply {
+    AssistantReply {
+        content: String::new(),
+        tool_calls: vec![ToolCall {
+            id: "deterministic-nextjs-scaffold-1".to_string(),
+            name: "Bash".to_string(),
+            arguments: serde_json::json!({
+                "command": "npx create-next-app@latest . --typescript --tailwind --eslint --app --no-src-dir --import-alias \"@/*\" --use-npm"
+            }),
+        }],
+    }
+}
+
 fn fallback_plan_request_label(task: &str) -> String {
     let lower = task.to_ascii_lowercase();
     if lower.contains("space invader") || task.contains("スペースインベーダー") {
@@ -1417,6 +1436,51 @@ impl Agent {
             if action_expectation == recovery::ActionExpectation::RepoChange
                 && repo_edit_calls_made_this_turn == 0
             {
+                if self.active_task_requires_nextjs_scaffold() && self.workspace_appears_empty() {
+                    let fallback_reply = deterministic_nextjs_scaffold_reply();
+                    let fallback_tool_calls = fallback_reply
+                        .tool_calls
+                        .iter()
+                        .cloned()
+                        .map(|tool_call| self.prepare_tool_call(tool_call))
+                        .collect::<Vec<_>>();
+                    self.session.messages.push(ConversationMessage::assistant(
+                        fallback_reply.content,
+                        fallback_tool_calls.clone(),
+                    ));
+                    write_stdout_rendered(
+                        &format_iteration_status(
+                            last_iter,
+                            self.config.max_iterations,
+                            "Scaffold fallback",
+                            "Empty Next.js workspace stalled on exploration; running deterministic scaffold command.",
+                            self.footer.current_cols(),
+                        ),
+                        true,
+                    );
+                    for tool_call in fallback_tool_calls {
+                        let raw_result = self.execute_tool_call(
+                            &tool_call.name,
+                            &tool_call.arguments,
+                            Some(interrupt_flag.flag.clone()),
+                        );
+                        let compact_result =
+                            prompting::compact_tool_result(&tool_call.name, raw_result);
+                        self.session.messages.push(ConversationMessage::tool(
+                            tool_call.name.clone(),
+                            compact_result,
+                        ));
+                    }
+                    repo_change_retries = 0;
+                    log_llm_event(
+                        "agent.empty_workspace.deterministic_nextjs_scaffold",
+                        serde_json::json!({
+                            "session_id": self.session_store.session_id(),
+                            "work_root": self.work_root.display().to_string(),
+                        }),
+                    );
+                    continue;
+                }
                 repo_change_retries += 1;
                 if repo_change_retries >= 3 {
                     exit_reason = ExitReason::MissingRepoEdits;
@@ -2542,12 +2606,19 @@ impl Agent {
 
     fn active_task_requires_nextjs_scaffold(&self) -> bool {
         self.session.mode_state.mode == ExecutionMode::Act
-            && self
+            && (self
                 .session
                 .working_memory
                 .active_task
                 .as_deref()
                 .is_some_and(task_requires_nextjs_scaffold)
+                || messages_require_nextjs_scaffold(&self.session.messages)
+                || self
+                    .current_plan_contents()
+                    .ok()
+                    .flatten()
+                    .as_deref()
+                    .is_some_and(task_requires_nextjs_scaffold))
     }
 
     fn refresh_working_memory(&mut self) {
@@ -4685,7 +4756,11 @@ fn format_blocked_progress_line(
 
 #[cfg(test)]
 mod truncate_tests {
-    use super::{reply_looks_like_future_work, task_requires_nextjs_scaffold, truncate};
+    use super::{
+        messages_require_nextjs_scaffold, reply_looks_like_future_work,
+        task_requires_nextjs_scaffold, truncate,
+    };
+    use crate::session::store::ConversationMessage;
 
     #[test]
     fn preserves_short_strings_verbatim() {
@@ -4722,6 +4797,19 @@ mod truncate_tests {
         ));
         assert!(task_requires_nextjs_scaffold("Build this as a NextJS app"));
         assert!(!task_requires_nextjs_scaffold("Build a Rust CLI tool"));
+    }
+
+    #[test]
+    fn detects_nextjs_request_from_original_user_message() {
+        let messages = vec![
+            ConversationMessage::system(
+                "The accepted plan summary says to build a local app.".to_string(),
+            ),
+            ConversationMessage::user(
+                "3011ポートで起動可能なnext.jsアプリとして開発してください".to_string(),
+            ),
+        ];
+        assert!(messages_require_nextjs_scaffold(&messages));
     }
 }
 
