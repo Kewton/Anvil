@@ -2548,7 +2548,17 @@ mod tests {
     }
 
     #[test]
-    fn native_tool_models_still_use_streaming_transport() {
+    fn qwen35_native_tool_path_uses_non_streaming_transport() {
+        assert!(!should_use_streaming_transport(
+            "qwen3.5:122b",
+            true,
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn non_qwen35_native_tool_models_still_use_streaming_transport() {
         assert!(should_use_streaming_transport(
             "qwen3.6:27b-coding-nvfp4",
             true,
@@ -2565,6 +2575,10 @@ mod tests {
         );
         assert_eq!(
             non_streaming_assistant_reply_timeout_secs("qwen3.5:9b", false, 120),
+            90
+        );
+        assert_eq!(
+            non_streaming_assistant_reply_timeout_secs("qwen3.5:122b", true, 120),
             90
         );
         assert_eq!(
@@ -2771,7 +2785,7 @@ fn join_sections_for_progress(sections: &[&str]) -> String {
 
 fn should_use_streaming_transport(
     model: &str,
-    native_tools_enabled: bool,
+    _native_tools_enabled: bool,
     stream_output: bool,
     stdin_is_terminal: bool,
 ) -> bool {
@@ -2780,7 +2794,7 @@ fn should_use_streaming_transport(
         return false;
     }
 
-    if !native_tools_enabled && is_qwen35_family(model) {
+    if is_qwen35_family(model) {
         return false;
     }
 
@@ -2789,10 +2803,10 @@ fn should_use_streaming_transport(
 
 fn non_streaming_assistant_reply_timeout_secs(
     model: &str,
-    native_tools_enabled: bool,
+    _native_tools_enabled: bool,
     default_timeout_secs: u64,
 ) -> u64 {
-    if !native_tools_enabled && is_qwen35_family(model) {
+    if is_qwen35_family(model) {
         return QWEN35_NON_NATIVE_HARD_TIMEOUT_SECS;
     }
     default_timeout_secs
