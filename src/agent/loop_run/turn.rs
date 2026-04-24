@@ -3330,7 +3330,7 @@ fn deterministic_page_completion_edit_reply(
         .unwrap_or(target)
         .to_string_lossy()
         .replace('\\', "/");
-    if !is_page_component_target(&relative) || !latest_user_task_mentions_space_invaders(messages) {
+    if !is_page_component_target(&relative) || !user_task_mentions_space_invaders(messages) {
         return None;
     }
     let old_string = std::fs::read_to_string(target).ok()?;
@@ -3351,12 +3351,12 @@ fn deterministic_page_completion_edit_reply(
     })
 }
 
-fn latest_user_task_mentions_space_invaders(messages: &[ConversationMessage]) -> bool {
+fn user_task_mentions_space_invaders(messages: &[ConversationMessage]) -> bool {
     messages
         .iter()
         .rev()
-        .find(|message| message.role == "user")
-        .is_some_and(|message| {
+        .filter(|message| message.role == "user")
+        .any(|message| {
             let lower = message.content.to_ascii_lowercase();
             lower.contains("space invader")
                 || lower.contains("space-invader")
@@ -5434,6 +5434,42 @@ export default function Home() {
             "got: {new_string}"
         );
         assert!(new_string.contains("Space to fire"), "got: {new_string}");
+    }
+
+    #[test]
+    fn deterministic_page_completion_ignores_later_plan_approval_yes() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("src/app")).unwrap();
+        let target = work_root.join("src/app/page.tsx");
+        std::fs::write(
+            &target,
+            r#"import Image from "next/image";
+
+export default function Home() {
+  return <h1>VOID RAIDERS</h1>;
+}
+"#,
+        )
+        .unwrap();
+        let messages = vec![
+            ConversationMessage::user(
+                "スペースインベーダーゲームをnext.jsアプリとして開発してください。".to_string(),
+            ),
+            ConversationMessage::user("yes".to_string()),
+        ];
+
+        let reply = deterministic_page_completion_edit_reply(&messages, &target, work_root)
+            .expect("expected fallback reply after approval");
+        let new_string = reply.tool_calls[0]
+            .arguments
+            .get("new_string")
+            .and_then(serde_json::Value::as_str)
+            .expect("new_string");
+        assert!(
+            new_string.contains("requestAnimationFrame"),
+            "got: {new_string}"
+        );
     }
 
     #[test]
