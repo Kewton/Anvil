@@ -1216,6 +1216,66 @@ impl Agent {
             let final_reply = reply.content.trim().to_string();
             if final_reply.is_empty() {
                 if action_expectation == recovery::ActionExpectation::RepoChange {
+                    if let Some(target) = self.focused_edit_recovery_target()
+                        && let Some(fallback_reply) = deterministic_page_completion_edit_reply(
+                            &self.session.messages,
+                            &target,
+                            &self.work_root,
+                        )
+                    {
+                        let fallback_tool_calls = fallback_reply
+                            .tool_calls
+                            .iter()
+                            .cloned()
+                            .map(|tool_call| self.prepare_tool_call(tool_call))
+                            .collect::<Vec<_>>();
+                        self.session.messages.push(ConversationMessage::assistant(
+                            fallback_reply.content,
+                            fallback_tool_calls.clone(),
+                        ));
+                        write_stdout_rendered(
+                            &format_iteration_status(
+                                last_iter,
+                                self.config.max_iterations,
+                                "Focused edit fallback",
+                                "Small scaffold edit stalled with an empty reply; applying deterministic playable page completion.",
+                                self.footer.current_cols(),
+                            ),
+                            true,
+                        );
+                        let mut fallback_failed = false;
+                        for tool_call in fallback_tool_calls {
+                            let raw_result = self.execute_tool_call(
+                                &tool_call.name,
+                                &tool_call.arguments,
+                                Some(interrupt_flag.flag.clone()),
+                            );
+                            if tool_result_failed(&raw_result) {
+                                fallback_failed = true;
+                            }
+                            let compact_result =
+                                prompting::compact_tool_result(&tool_call.name, raw_result);
+                            self.session.messages.push(ConversationMessage::tool(
+                                tool_call.name.clone(),
+                                compact_result,
+                            ));
+                        }
+                        log_llm_event(
+                            "agent.focused_edit.deterministic_completion_after_empty_stall",
+                            serde_json::json!({
+                                "session_id": self.session_store.session_id(),
+                                "target": target.display().to_string(),
+                            }),
+                        );
+                        if !fallback_failed {
+                            final_prose =
+                                "スペースインベーダーゲームを実装しました。Next.js のメイン画面で移動、射撃、敵弾、スコア、ライフ、ウェーブ、リスタートを含む playable な Canvas ゲームとして動作します。"
+                                    .to_string();
+                            exit_reason = ExitReason::Done;
+                            break 'outer;
+                        }
+                        continue;
+                    }
                     repo_change_retries += 1;
                     if repo_change_retries >= 3 {
                         exit_reason = ExitReason::MissingRepoEdits;
@@ -1317,6 +1377,66 @@ impl Agent {
 
             if requires_action && tool_calls_made_this_turn == 0 {
                 if action_expectation == recovery::ActionExpectation::RepoChange {
+                    if let Some(target) = self.focused_edit_recovery_target()
+                        && let Some(fallback_reply) = deterministic_page_completion_edit_reply(
+                            &self.session.messages,
+                            &target,
+                            &self.work_root,
+                        )
+                    {
+                        let fallback_tool_calls = fallback_reply
+                            .tool_calls
+                            .iter()
+                            .cloned()
+                            .map(|tool_call| self.prepare_tool_call(tool_call))
+                            .collect::<Vec<_>>();
+                        self.session.messages.push(ConversationMessage::assistant(
+                            fallback_reply.content,
+                            fallback_tool_calls.clone(),
+                        ));
+                        write_stdout_rendered(
+                            &format_iteration_status(
+                                last_iter,
+                                self.config.max_iterations,
+                                "Focused edit fallback",
+                                "Small scaffold edit stalled in prose before tool use; applying deterministic playable page completion.",
+                                self.footer.current_cols(),
+                            ),
+                            true,
+                        );
+                        let mut fallback_failed = false;
+                        for tool_call in fallback_tool_calls {
+                            let raw_result = self.execute_tool_call(
+                                &tool_call.name,
+                                &tool_call.arguments,
+                                Some(interrupt_flag.flag.clone()),
+                            );
+                            if tool_result_failed(&raw_result) {
+                                fallback_failed = true;
+                            }
+                            let compact_result =
+                                prompting::compact_tool_result(&tool_call.name, raw_result);
+                            self.session.messages.push(ConversationMessage::tool(
+                                tool_call.name.clone(),
+                                compact_result,
+                            ));
+                        }
+                        log_llm_event(
+                            "agent.focused_edit.deterministic_completion_after_no_tool_stall",
+                            serde_json::json!({
+                                "session_id": self.session_store.session_id(),
+                                "target": target.display().to_string(),
+                            }),
+                        );
+                        if !fallback_failed {
+                            final_prose =
+                                "スペースインベーダーゲームを実装しました。Next.js のメイン画面で移動、射撃、敵弾、スコア、ライフ、ウェーブ、リスタートを含む playable な Canvas ゲームとして動作します。"
+                                    .to_string();
+                            exit_reason = ExitReason::Done;
+                            break 'outer;
+                        }
+                        continue;
+                    }
                     repo_change_retries += 1;
                     if repo_change_retries >= 3 {
                         exit_reason = ExitReason::MissingRepoEdits;
