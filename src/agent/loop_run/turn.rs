@@ -2143,6 +2143,16 @@ impl Agent {
             {
                 messages.push(ConversationMessage::system(note));
             }
+            if successful_repo_edits == 1
+                && let Some(note) = focused_edit_second_slice_note(
+                    &self.session.messages,
+                    &target,
+                    &self.work_root,
+                    focused_edit_target_already_read,
+                )
+            {
+                messages.push(ConversationMessage::system(note));
+            }
             if trim_history_for_first_slice {
                 messages.extend(focused_edit_minimal_history(&self.session.messages));
             } else {
@@ -3456,6 +3466,28 @@ fn focused_edit_first_slice_uses_exact_anchor(
         && latest_page_copy_block_from_read(messages, target, work_root).is_some()
 }
 
+fn focused_edit_second_slice_note(
+    messages: &[ConversationMessage],
+    target: &Path,
+    work_root: &Path,
+    target_already_read: bool,
+) -> Option<String> {
+    if !target_already_read {
+        return None;
+    }
+    let relative = target
+        .strip_prefix(work_root)
+        .unwrap_or(target)
+        .to_string_lossy()
+        .replace('\\', "/");
+    if !is_page_component_target(&relative) {
+        return None;
+    }
+    latest_page_intro_paragraph_from_read(messages, target, work_root).map(|old_string| {
+        recovery::second_scaffold_shell_edit_exact_anchor_note(&relative, &old_string)
+    })
+}
+
 fn latest_page_copy_block_from_read(
     messages: &[ConversationMessage],
     target: &Path,
@@ -3463,6 +3495,15 @@ fn latest_page_copy_block_from_read(
 ) -> Option<String> {
     let (_, tool) = latest_read_exchange_for_target(messages, target, work_root)?;
     extract_page_copy_block_from_numbered_read(&tool.content)
+}
+
+fn latest_page_intro_paragraph_from_read(
+    messages: &[ConversationMessage],
+    target: &Path,
+    work_root: &Path,
+) -> Option<String> {
+    let (_, tool) = latest_read_exchange_for_target(messages, target, work_root)?;
+    extract_page_intro_paragraph_from_numbered_read(&tool.content)
 }
 
 fn extract_page_copy_block_from_numbered_read(contents: &str) -> Option<String> {
@@ -3479,6 +3520,23 @@ fn extract_page_copy_block_from_numbered_read(contents: &str) -> Option<String> 
         .enumerate()
         .skip(start)
         .find_map(|(index, line)| line.trim_start().contains("</h1>").then_some(index))?;
+    Some(lines[start..=end].join("\n"))
+}
+
+fn extract_page_intro_paragraph_from_numbered_read(contents: &str) -> Option<String> {
+    let lines = contents
+        .lines()
+        .map(strip_read_line_number_prefix)
+        .collect::<Vec<_>>();
+    let start = lines.iter().position(|line| {
+        let trimmed = line.trim_start();
+        trimmed.starts_with("<p ") || trimmed.starts_with("<p>")
+    })?;
+    let end = lines
+        .iter()
+        .enumerate()
+        .skip(start)
+        .find_map(|(index, line)| line.trim_start().contains("</p>").then_some(index))?;
     Some(lines[start..=end].join("\n"))
 }
 
@@ -3640,10 +3698,22 @@ fn latest_read_exchange_for_target(
         }
         let tool_message = messages.get(index + 1)?;
         if tool_message.role == "tool" && tool_message.name.as_deref() == Some("Read") {
+            if messages[index + 2..]
+                .iter()
+                .any(is_successful_repo_edit_tool_result)
+            {
+                continue;
+            }
             return Some((message.clone(), tool_message.clone()));
         }
     }
     None
+}
+
+fn is_successful_repo_edit_tool_result(message: &ConversationMessage) -> bool {
+    message.role == "tool"
+        && matches!(message.name.as_deref(), Some("Write" | "Edit"))
+        && !message.content.trim_start().starts_with("Error:")
 }
 
 fn assistant_reads_target(message: &ConversationMessage, target: &Path, work_root: &Path) -> bool {
@@ -4396,11 +4466,12 @@ mod progress_tests {
         first_existing_impl_target, focused_edit_first_slice_note,
         focused_edit_first_slice_uses_exact_anchor, focused_edit_guidance_note,
         focused_edit_history, focused_edit_max_predict_override, focused_edit_minimal_history,
-        focused_edit_target_already_read, focused_edit_timeout_override_secs,
-        focused_edit_tool_batch_action, focused_edit_tool_policy_error,
-        focused_read_target_for_directory, format_blocked_progress_line, format_progress_line,
-        has_successful_non_plan_repo_edit, has_successful_repo_edit, is_utf8_locale,
-        last_read_tool_path, latest_page_copy_block_from_read, post_scaffold_continuation_active,
+        focused_edit_second_slice_note, focused_edit_target_already_read,
+        focused_edit_timeout_override_secs, focused_edit_tool_batch_action,
+        focused_edit_tool_policy_error, focused_read_target_for_directory,
+        format_blocked_progress_line, format_progress_line, has_successful_non_plan_repo_edit,
+        has_successful_repo_edit, is_utf8_locale, last_read_tool_path,
+        latest_page_copy_block_from_read, post_scaffold_continuation_active,
         post_scaffold_recovery_active, progress_available_width, prune_plan_mode_messages,
         recent_scaffold_command_seen, recent_truncated_tool_call_attempt, sanitize_for_progress,
         should_use_streaming_transport, strip_read_line_number_prefix,
@@ -4829,6 +4900,38 @@ mod progress_tests {
     }
 
     #[test]
+    fn focused_edit_target_read_becomes_stale_after_successful_edit() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        let target = work_root.join("app").join("page.tsx");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "export default function Home() { return null; }\n").unwrap();
+        let messages = vec![
+            ConversationMessage::assistant(
+                String::new(),
+                vec![ToolCall {
+                    id: "xml-1".to_string(),
+                    name: "Read".to_string(),
+                    arguments: json!({"path":"app/page.tsx"}),
+                }],
+            ),
+            ConversationMessage::tool("Read".to_string(), "1: export default".to_string()),
+            ConversationMessage::assistant(
+                String::new(),
+                vec![ToolCall {
+                    id: "xml-2".to_string(),
+                    name: "Edit".to_string(),
+                    arguments: json!({"path":"app/page.tsx","old_string":"Home","new_string":"Game"}),
+                }],
+            ),
+            ConversationMessage::tool("Edit".to_string(), "edited app/page.tsx".to_string()),
+        ];
+        assert!(!focused_edit_target_already_read(
+            &messages, &target, &work_root
+        ));
+    }
+
+    #[test]
     fn focused_edit_guidance_note_requires_edit_after_read() {
         let note = focused_edit_guidance_note(Path::new("app/page.tsx"), Path::new("."), true);
         assert!(note.contains("Do not call Read again"));
@@ -4846,6 +4949,35 @@ mod progress_tests {
         .expect("expected note");
         assert!(note.contains("compact task-specific title"));
         assert!(note.contains("src/app/page.tsx"));
+    }
+
+    #[test]
+    fn focused_edit_second_slice_note_targets_intro_paragraph() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        let target = work_root.join("src").join("app").join("page.tsx");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "export default function Home() { return null; }\n").unwrap();
+        let messages = vec![
+            ConversationMessage::assistant(
+                String::new(),
+                vec![ToolCall {
+                    id: "xml-1".to_string(),
+                    name: "Read".to_string(),
+                    arguments: json!({"path":"src/app/page.tsx"}),
+                }],
+            ),
+            ConversationMessage::tool(
+                "Read".to_string(),
+                "1: <h1 className=\"title\">\n2:   NEON INVADERS\n3: </h1>\n4: <p className=\"copy\">\n5:   Old starter copy.\n6: </p>"
+                    .to_string(),
+            ),
+        ];
+        let note = focused_edit_second_slice_note(&messages, &target, &work_root, true)
+            .expect("expected second slice note");
+        assert!(note.contains("`<p>` intro block"), "got: {note}");
+        assert!(note.contains("Old starter copy."), "got: {note}");
+        assert!(note.contains("src/app/page.tsx"), "got: {note}");
     }
 
     #[test]
