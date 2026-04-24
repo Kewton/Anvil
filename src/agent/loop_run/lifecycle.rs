@@ -136,6 +136,11 @@ pub(super) fn is_native_tool_parser_failure(error: &str) -> bool {
         || lower.contains("unexpected eof")
 }
 
+pub(super) fn is_native_tool_transport_failure(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("ollama /api/chat failed: 5")
+}
+
 pub(super) fn is_tool_call_format_error(error: &str) -> bool {
     error
         .to_ascii_lowercase()
@@ -657,9 +662,10 @@ impl Agent {
 #[cfg(test)]
 mod tests {
     use super::{
-        current_plan_stage, plan_act_summary, plan_is_approval_ready, plan_is_substantive,
-        plan_missing_sections, plan_needs_stage_three_fallback, plan_next_stage_sections,
-        plan_stage_exploration_budget, plan_stage_sections, plan_task_list,
+        current_plan_stage, is_native_tool_transport_failure, plan_act_summary,
+        plan_is_approval_ready, plan_is_substantive, plan_missing_sections,
+        plan_needs_stage_three_fallback, plan_next_stage_sections, plan_stage_exploration_budget,
+        plan_stage_sections, plan_task_list,
     };
     use crate::modes::plan_act::{PlanStage, TaskProfile};
 
@@ -995,6 +1001,19 @@ mod tests {
             plan_stage_sections(PlanStage::Stage2),
             &["Acceptance Criteria", "Quality Bar"]
         );
+    }
+
+    #[test]
+    fn detects_native_tool_transport_failures() {
+        assert!(is_native_tool_transport_failure(
+            "Ollama /api/chat failed: 500 Internal Server Error"
+        ));
+        assert!(is_native_tool_transport_failure(
+            "Ollama /api/chat failed: 502 Bad Gateway"
+        ));
+        assert!(!is_native_tool_transport_failure(
+            "Ollama /api/chat failed: 429 Too Many Requests"
+        ));
     }
 
     #[test]

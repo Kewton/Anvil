@@ -1634,6 +1634,14 @@ impl Agent {
                         self.disable_native_tools_for_session();
                         continue;
                     }
+                    if self.native_tools_enabled
+                        && !downgraded_native_tools
+                        && lifecycle::is_native_tool_transport_failure(&err)
+                    {
+                        downgraded_native_tools = true;
+                        self.disable_native_tools_for_session();
+                        continue;
+                    }
                     if let Some(reply) =
                         self.maybe_materialize_plan_after_tool_call_format_error(&err)?
                     {
