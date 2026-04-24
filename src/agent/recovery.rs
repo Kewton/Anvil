@@ -169,11 +169,16 @@ pub fn tool_call_format_recovery_note(error: &str, attempt: usize) -> String {
 
 pub fn forced_small_edit_recovery_note(path: &str, attempt: usize) -> String {
     format!(
-        "Recovery mode is active after repeated truncated tool calls. For the next turn, only use Read or Edit, and target this existing file: {path}. Do not use Write, Bash, Glob, or Grep until one Edit succeeds. Make exactly one small Edit that changes one contiguous block, anchored to exact text from the last Read. Keep the edited block compact and self-contained. forced_small_edit_attempt={attempt}"
+        "Recovery mode is active after repeated truncated tool calls. The target file has already been read, and the only available tool for the next turn is Edit on this existing file: {path}. Do not use Read, Write, Bash, Glob, or Grep until one Edit succeeds. Emit exactly one small Edit that changes one contiguous block, anchored to exact text from the last Read. Keep the edited block compact and self-contained. forced_small_edit_attempt={attempt}"
     )
 }
 
-pub fn post_scaffold_edit_recovery_note(path: &str, attempt: usize) -> String {
+pub fn post_scaffold_edit_recovery_note(path: &str, already_read: bool, attempt: usize) -> String {
+    if already_read {
+        return format!(
+            "Framework scaffolding already succeeded, but the requested implementation change is still missing. The target file has already been read, and the only available tool for the next turn is Edit on this existing file: {path}. Do not use Read, Write, Bash, Glob, or Grep until one concrete Edit succeeds. Emit exactly one compact Edit that moves the implementation forward. post_scaffold_edit_attempt={attempt}"
+        );
+    }
     format!(
         "Framework scaffolding already succeeded, but the requested implementation change is still missing. For the next turn, only use Read or Edit and stay on this existing file: {path}. Do not use Bash, Glob, or Grep until one concrete Edit succeeds. First inspect the file if needed, then make exactly one small Edit that moves the implementation forward. post_scaffold_edit_attempt={attempt}"
     )
@@ -475,11 +480,12 @@ mod tests {
     }
 
     #[test]
-    fn forced_small_edit_note_limits_tools_to_read_and_edit() {
+    fn forced_small_edit_note_limits_tools_to_edit_after_read() {
         let note = forced_small_edit_recovery_note("app/page.tsx", 2);
-        assert!(note.contains("only use Read or Edit"), "got: {note}");
+        assert!(note.contains("only available tool"), "got: {note}");
+        assert!(note.contains("Edit"), "got: {note}");
         assert!(
-            note.contains("Do not use Write, Bash, Glob, or Grep"),
+            note.contains("Do not use Read, Write, Bash, Glob, or Grep"),
             "got: {note}"
         );
         assert!(note.contains("app/page.tsx"), "got: {note}");
@@ -539,13 +545,23 @@ mod tests {
 
     #[test]
     fn post_scaffold_note_pushes_first_edit_on_existing_file() {
-        let note = post_scaffold_edit_recovery_note("app/page.tsx", 1);
+        let note = post_scaffold_edit_recovery_note("app/page.tsx", false, 1);
         assert!(note.contains("only use Read or Edit"), "got: {note}");
         assert!(
             note.contains("Do not use Bash, Glob, or Grep"),
             "got: {note}"
         );
         assert!(note.contains("one concrete Edit succeeds"), "got: {note}");
+    }
+
+    #[test]
+    fn post_scaffold_note_allows_only_edit_after_target_read() {
+        let note = post_scaffold_edit_recovery_note("app/page.tsx", true, 1);
+        assert!(note.contains("only available tool"), "got: {note}");
+        assert!(note.contains("Edit"), "got: {note}");
+        assert!(note.contains("Do not use Read"), "got: {note}");
+        assert!(!note.contains("only use Read or Edit"), "got: {note}");
+        assert!(!note.contains("First inspect"), "got: {note}");
     }
 
     #[test]

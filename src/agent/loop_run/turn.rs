@@ -2208,6 +2208,8 @@ impl Agent {
     fn post_scaffold_edit_recovery_message(&self) -> Option<String> {
         let path = self.post_scaffold_edit_recovery_target()?;
         let attempt = recent_post_scaffold_edit_attempt(&self.session.messages).max(1);
+        let already_read =
+            focused_edit_target_already_read(&self.session.messages, &path, &self.work_root);
         Some(recovery::post_scaffold_edit_recovery_note(
             &progress_path_display(
                 &path.display().to_string(),
@@ -2215,6 +2217,7 @@ impl Agent {
                 self.session.mode_state.active_plan_path.as_deref(),
                 120,
             ),
+            already_read,
             attempt,
         ))
     }
@@ -3400,7 +3403,7 @@ fn focused_edit_guidance_note(
         .replace('\\', "/");
     if target_already_read {
         format!(
-            "[Focused Edit Recovery] The target file {path} has already been read. Do not call Read again. Use exactly one compact Edit on that file now. Replace only one contiguous block from the last Read. Do not attempt a full-file rewrite, multi-file change, scaffold command, or dev-server command."
+            "[Focused Edit Recovery] The target file {path} has already been read. The only available tool for this turn is Edit. Do not call Read again. Use exactly one compact Edit on that file now. Replace only one contiguous block from the last Read. Do not attempt a full-file rewrite, multi-file change, scaffold command, or dev-server command."
         )
     } else {
         format!(
