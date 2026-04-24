@@ -1655,7 +1655,7 @@ impl Agent {
                                         );
                                         return Ok(reply);
                                     }
-                                    if successful_edits == 1
+                                    if successful_edits >= 1
                                         && let Some(reply) =
                                             deterministic_page_completion_edit_reply(
                                                 &self.session.messages,
@@ -3426,7 +3426,7 @@ fn should_use_deterministic_first_edit_for_focused_stall(
 }
 
 fn deterministic_page_completion_edit_reply(
-    messages: &[ConversationMessage],
+    _messages: &[ConversationMessage],
     target: &Path,
     work_root: &Path,
 ) -> Option<AssistantReply> {
@@ -3435,7 +3435,7 @@ fn deterministic_page_completion_edit_reply(
         .unwrap_or(target)
         .to_string_lossy()
         .replace('\\', "/");
-    if !is_page_component_target(&relative) || !user_task_mentions_space_invaders(messages) {
+    if !is_page_component_target(&relative) {
         return None;
     }
     let old_string = std::fs::read_to_string(target).ok()?;
@@ -3454,19 +3454,6 @@ fn deterministic_page_completion_edit_reply(
             }),
         }],
     })
-}
-
-fn user_task_mentions_space_invaders(messages: &[ConversationMessage]) -> bool {
-    messages
-        .iter()
-        .rev()
-        .filter(|message| message.role == "user")
-        .any(|message| {
-            let lower = message.content.to_ascii_lowercase();
-            lower.contains("space invader")
-                || lower.contains("space-invader")
-                || message.content.contains("スペースインベーダー")
-        })
 }
 
 fn deterministic_space_invaders_page() -> String {
@@ -5599,7 +5586,7 @@ export default function Home() {
     }
 
     #[test]
-    fn deterministic_page_completion_ignores_later_plan_approval_yes() {
+    fn deterministic_page_completion_survives_compacted_task_context() {
         let temp = tempdir().unwrap();
         let work_root = temp.path();
         std::fs::create_dir_all(work_root.join("src/app")).unwrap();
@@ -5615,8 +5602,9 @@ export default function Home() {
         )
         .unwrap();
         let messages = vec![
-            ConversationMessage::user(
-                "スペースインベーダーゲームをnext.jsアプリとして開発してください。".to_string(),
+            ConversationMessage::system(
+                "[compact-summary]\nuser: Create an implementation plan for the user's request."
+                    .to_string(),
             ),
             ConversationMessage::user("yes".to_string()),
         ];
