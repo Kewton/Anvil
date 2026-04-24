@@ -53,7 +53,7 @@ fn recovery_notes_are_non_empty() {
     assert!(repo_change_after_setup_note().contains("small Edit"));
     assert!(empty_workspace_scaffold_note().contains("Do not inspect it again with ls"));
     assert!(
-        first_scaffold_shell_edit_note("src/app/page.tsx").contains("compact task-specific teaser")
+        first_scaffold_shell_edit_note("src/app/page.tsx").contains("compact task-specific title")
     );
     assert!(install_loop_recovery_note().contains("Stop reinstalling packages"));
     assert!(repeated_bash_error("npm install jest").contains("risky Bash command blocked"));

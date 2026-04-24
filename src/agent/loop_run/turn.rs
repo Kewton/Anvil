@@ -3478,7 +3478,7 @@ fn extract_page_copy_block_from_numbered_read(contents: &str) -> Option<String> 
         .iter()
         .enumerate()
         .skip(start)
-        .find_map(|(index, line)| line.trim_start().contains("</p>").then_some(index))?;
+        .find_map(|(index, line)| line.trim_start().contains("</h1>").then_some(index))?;
     Some(lines[start..=end].join("\n"))
 }
 
@@ -4844,7 +4844,7 @@ mod progress_tests {
             true,
         )
         .expect("expected note");
-        assert!(note.contains("compact task-specific teaser"));
+        assert!(note.contains("compact task-specific title"));
         assert!(note.contains("src/app/page.tsx"));
     }
 
@@ -5091,7 +5091,7 @@ mod progress_tests {
             true,
         )
         .expect("expected note");
-        assert!(note.contains("compact task-specific teaser"));
+        assert!(note.contains("compact task-specific title"));
         assert!(note.contains("space-invaders/app/page.tsx"));
     }
 
@@ -5124,7 +5124,8 @@ mod progress_tests {
         let block = extract_page_copy_block_from_numbered_read(read).expect("expected block");
         assert!(block.contains("<h1>Hello</h1>"), "got: {block}");
         assert!(block.starts_with("          <h1"), "got: {block}");
-        assert!(block.ends_with("          <p>World</p>"), "got: {block}");
+        assert!(!block.contains("<p>World</p>"), "got: {block}");
+        assert!(block.ends_with("          <h1>Hello</h1>"), "got: {block}");
     }
 
     #[test]
@@ -5151,7 +5152,8 @@ mod progress_tests {
         ];
         let block =
             latest_page_copy_block_from_read(&messages, &target, work_root).expect("expected");
-        assert!(block.contains("<p>World</p>"), "got: {block}");
+        assert!(block.contains("<h1>Hello</h1>"), "got: {block}");
+        assert!(!block.contains("<p>World</p>"), "got: {block}");
     }
 
     #[test]
@@ -5215,7 +5217,8 @@ mod progress_tests {
         .expect("expected note");
         assert!(note.contains("byte-for-byte as old_string"), "got: {note}");
         assert!(note.contains("<h1>Hello</h1>"), "got: {note}");
-        assert!(note.contains("under about 500 characters"), "got: {note}");
+        assert!(!note.contains("<p>World</p>"), "got: {note}");
+        assert!(note.contains("under about 240 characters"), "got: {note}");
     }
 
     #[test]

@@ -256,13 +256,13 @@ pub fn focused_edit_unterminated_tool_call_note(
 
 pub fn first_scaffold_shell_edit_note(path: &str) -> String {
     format!(
-        "The first repository edit after scaffolding must stay microscopic. On {path}, replace only one contiguous UI block with a compact task-specific teaser: the headline plus one short status or controls line. Keep the import lines, parent wrappers, and component signature unchanged for now. Use the central intro copy block as the exact Edit anchor: start at `<h1 className=` and replace only through its matching `</p>`. Reuse the existing `h1` and `p` tags if possible. Keep the new block to roughly 4-8 lines. Do not add complex runtime logic, keyboard handlers, animation, extra sections, or a full-file rewrite in this turn."
+        "The first repository edit after scaffolding must stay microscopic. On {path}, replace only the existing `<h1>` headline block with a compact task-specific title. Keep the import lines, parent wrappers, component signature, and nearby paragraph unchanged for now. Use the existing `<h1` through its matching `</h1>` as the exact Edit anchor. Keep new_string to roughly 1-3 lines and under about 240 characters. Do not add complex runtime logic, keyboard handlers, animation, extra sections, or a full-file rewrite in this turn."
     )
 }
 
 pub fn first_scaffold_shell_edit_exact_anchor_note(path: &str, old_string: &str) -> String {
     format!(
-        "The first repository edit after scaffolding must stay microscopic. On {path}, emit exactly one Edit now and replace only the already-read intro copy block with a compact task-specific teaser. Limit the new UI slice to: title, one short status line, and one controls or next-step hint only. Keep the surrounding layout, imports, and component signature unchanged. Copy the following block byte-for-byte as old_string and replace only this contiguous block. Reuse the same `h1` and `p` tags and className strings where possible. Keep new_string to roughly 4-8 lines and under about 500 characters. Do not add complex runtime logic, keyboard handlers, animation, extra sections, or a full-file rewrite in this turn. Return only one Edit tool call with this shape and no prose before or after it: {{\"name\":\"Edit\",\"arguments\":{{\"path\":\"{path}\",\"old_string\":\"<use the exact block below>\",\"new_string\":\"<compact teaser only>\"}}}}.\n```tsx\n{old_string}\n```"
+        "The first repository edit after scaffolding must stay microscopic. On {path}, emit exactly one Edit now and replace only the already-read `<h1>` headline block with a compact task-specific title. Keep the surrounding layout, imports, component signature, and nearby paragraph unchanged. Copy the following small block byte-for-byte as old_string and replace only this contiguous block. Reuse the same `h1` tag and className string. Keep new_string to roughly 1-3 lines and under about 240 characters. Do not add complex runtime logic, keyboard handlers, animation, extra sections, or a full-file rewrite in this turn. Return only one Edit tool call with this shape and no prose before or after it: {{\"name\":\"Edit\",\"arguments\":{{\"path\":\"{path}\",\"old_string\":\"<use the exact block below>\",\"new_string\":\"<compact title only>\"}}}}.\n```tsx\n{old_string}\n```"
     )
 }
 
@@ -578,13 +578,10 @@ mod tests {
     #[test]
     fn first_scaffold_shell_note_targets_main_block_only() {
         let note = first_scaffold_shell_edit_note("src/app/page.tsx");
-        assert!(note.contains("central intro copy block"), "got: {note}");
-        assert!(note.contains("start at `<h1 className=`"), "got: {note}");
-        assert!(note.contains("roughly 4-8 lines"), "got: {note}");
-        assert!(
-            note.contains("component signature unchanged"),
-            "got: {note}"
-        );
+        assert!(note.contains("only the existing `<h1>`"), "got: {note}");
+        assert!(note.contains("matching `</h1>`"), "got: {note}");
+        assert!(note.contains("roughly 1-3 lines"), "got: {note}");
+        assert!(note.contains("component signature"), "got: {note}");
     }
 
     #[test]
@@ -596,6 +593,7 @@ mod tests {
         assert!(note.contains("exactly one Edit now"), "got: {note}");
         assert!(note.contains("\"name\":\"Edit\""), "got: {note}");
         assert!(note.contains("no prose before or after"), "got: {note}");
+        assert!(note.contains("under about 240 characters"), "got: {note}");
     }
 
     #[test]
