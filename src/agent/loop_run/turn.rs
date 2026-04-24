@@ -97,10 +97,6 @@ fn user_interrupt_result() -> String {
     "exit_code=-1\ninterrupted=true\ninterrupt requested by user".to_string()
 }
 
-fn tool_result_failed(result: &str) -> bool {
-    result.starts_with("Error:") || result.contains("\ninterrupted=true\n")
-}
-
 fn extract_requested_port(task: &str) -> Option<String> {
     let bytes = task.as_bytes();
     let mut i = 0usize;
@@ -147,9 +143,7 @@ fn deterministic_nextjs_scaffold_reply() -> AssistantReply {
 
 fn fallback_plan_request_label(task: &str) -> String {
     let lower = task.to_ascii_lowercase();
-    if lower.contains("space invader") || task.contains("スペースインベーダー") {
-        "a stylish and highly playable Space Invaders game".to_string()
-    } else if lower.contains("next.js") {
+    if lower.contains("next.js") {
         "the requested Next.js app".to_string()
     } else {
         "the requested deliverable".to_string()
@@ -554,7 +548,7 @@ impl Agent {
                 break 'outer;
             }
 
-            let mut reply =
+            let reply =
                 match self.request_assistant_reply_with_retry(stream_output, &interrupt_flag) {
                     Ok(r) => r,
                     Err(err) => {
@@ -611,84 +605,35 @@ impl Agent {
                     }
                     FocusedEditBatchAction::Reject(err) => {
                         self.session.working_memory.note_error(err);
-                        if let Some(fallback_reply) = self
-                            .deterministic_first_edit_after_focused_stall(&target, "batch_reject")
-                        {
-                            let fallback_tool_calls = fallback_reply
-                                .tool_calls
-                                .iter()
-                                .cloned()
-                                .map(|tool_call| self.prepare_tool_call(tool_call))
-                                .collect::<Vec<_>>();
-                            reply = fallback_reply;
-                            prepared_tool_calls = fallback_tool_calls;
-                            write_stdout_rendered(
-                                &format_iteration_status(
-                                    last_iter,
-                                    self.config.max_iterations,
-                                    "Focused edit fallback",
-                                    "Model missed the required target edit; applying deterministic first slice edit.",
-                                    self.footer.current_cols(),
-                                ),
-                                true,
-                            );
-                        } else {
-                            repo_change_retries += 1;
-                            if repo_change_retries >= 3 {
-                                exit_reason = ExitReason::MissingRepoEdits;
-                                error_text = exit_reason.default_error_text().to_string();
-                                break 'outer;
-                            }
-                            write_stdout_rendered(
-                                &format_iteration_status(
-                                    last_iter,
-                                    self.config.max_iterations,
-                                    "Retry requested",
-                                    "Focused edit recovery requires exactly one compact tool call on the target file. Asked the model to retry with a single action.",
-                                    self.footer.current_cols(),
-                                ),
-                                true,
-                            );
-                            self.push_system_note(recovery::focused_edit_no_tool_recovery_note(
-                                &progress_path_display(
-                                    &target.display().to_string(),
-                                    &self.work_root,
-                                    self.session.mode_state.active_plan_path.as_deref(),
-                                    120,
-                                ),
-                                target_already_read,
-                                repo_change_retries,
-                            ));
-                            continue;
+                        repo_change_retries += 1;
+                        if repo_change_retries >= 3 {
+                            exit_reason = ExitReason::MissingRepoEdits;
+                            error_text = exit_reason.default_error_text().to_string();
+                            break 'outer;
                         }
+                        write_stdout_rendered(
+                            &format_iteration_status(
+                                last_iter,
+                                self.config.max_iterations,
+                                "Retry requested",
+                                "Focused edit recovery requires exactly one compact tool call on the target file. Asked the model to retry with a single action.",
+                                self.footer.current_cols(),
+                            ),
+                            true,
+                        );
+                        self.push_system_note(recovery::focused_edit_no_tool_recovery_note(
+                            &progress_path_display(
+                                &target.display().to_string(),
+                                &self.work_root,
+                                self.session.mode_state.active_plan_path.as_deref(),
+                                120,
+                            ),
+                            target_already_read,
+                            repo_change_retries,
+                        ));
+                        continue;
                     }
                 }
-            }
-
-            if prepared_tool_calls.is_empty()
-                && requires_action
-                && action_expectation == recovery::ActionExpectation::RepoChange
-                && let Some(target) = self.focused_edit_recovery_target()
-                && let Some(fallback_reply) =
-                    self.deterministic_first_edit_after_focused_stall(&target, "no_tool_reply")
-            {
-                prepared_tool_calls = fallback_reply
-                    .tool_calls
-                    .iter()
-                    .cloned()
-                    .map(|tool_call| self.prepare_tool_call(tool_call))
-                    .collect::<Vec<_>>();
-                reply = fallback_reply;
-                write_stdout_rendered(
-                    &format_iteration_status(
-                        last_iter,
-                        self.config.max_iterations,
-                        "Focused edit fallback",
-                        "Model answered without tools after reading the target; applying deterministic first slice edit.",
-                        self.footer.current_cols(),
-                    ),
-                    true,
-                );
             }
 
             if !prepared_tool_calls.is_empty() {
@@ -1216,66 +1161,6 @@ impl Agent {
             let final_reply = reply.content.trim().to_string();
             if final_reply.is_empty() {
                 if action_expectation == recovery::ActionExpectation::RepoChange {
-                    if let Some(target) = self.focused_edit_recovery_target()
-                        && let Some(fallback_reply) = deterministic_page_completion_edit_reply(
-                            &self.session.messages,
-                            &target,
-                            &self.work_root,
-                        )
-                    {
-                        let fallback_tool_calls = fallback_reply
-                            .tool_calls
-                            .iter()
-                            .cloned()
-                            .map(|tool_call| self.prepare_tool_call(tool_call))
-                            .collect::<Vec<_>>();
-                        self.session.messages.push(ConversationMessage::assistant(
-                            fallback_reply.content,
-                            fallback_tool_calls.clone(),
-                        ));
-                        write_stdout_rendered(
-                            &format_iteration_status(
-                                last_iter,
-                                self.config.max_iterations,
-                                "Focused edit fallback",
-                                "Small scaffold edit stalled with an empty reply; applying deterministic playable page completion.",
-                                self.footer.current_cols(),
-                            ),
-                            true,
-                        );
-                        let mut fallback_failed = false;
-                        for tool_call in fallback_tool_calls {
-                            let raw_result = self.execute_tool_call(
-                                &tool_call.name,
-                                &tool_call.arguments,
-                                Some(interrupt_flag.flag.clone()),
-                            );
-                            if tool_result_failed(&raw_result) {
-                                fallback_failed = true;
-                            }
-                            let compact_result =
-                                prompting::compact_tool_result(&tool_call.name, raw_result);
-                            self.session.messages.push(ConversationMessage::tool(
-                                tool_call.name.clone(),
-                                compact_result,
-                            ));
-                        }
-                        log_llm_event(
-                            "agent.focused_edit.deterministic_completion_after_empty_stall",
-                            serde_json::json!({
-                                "session_id": self.session_store.session_id(),
-                                "target": target.display().to_string(),
-                            }),
-                        );
-                        if !fallback_failed {
-                            final_prose =
-                                "スペースインベーダーゲームを実装しました。Next.js のメイン画面で移動、射撃、敵弾、スコア、ライフ、ウェーブ、リスタートを含む playable な Canvas ゲームとして動作します。"
-                                    .to_string();
-                            exit_reason = ExitReason::Done;
-                            break 'outer;
-                        }
-                        continue;
-                    }
                     repo_change_retries += 1;
                     if repo_change_retries >= 3 {
                         exit_reason = ExitReason::MissingRepoEdits;
@@ -1377,66 +1262,6 @@ impl Agent {
 
             if requires_action && tool_calls_made_this_turn == 0 {
                 if action_expectation == recovery::ActionExpectation::RepoChange {
-                    if let Some(target) = self.focused_edit_recovery_target()
-                        && let Some(fallback_reply) = deterministic_page_completion_edit_reply(
-                            &self.session.messages,
-                            &target,
-                            &self.work_root,
-                        )
-                    {
-                        let fallback_tool_calls = fallback_reply
-                            .tool_calls
-                            .iter()
-                            .cloned()
-                            .map(|tool_call| self.prepare_tool_call(tool_call))
-                            .collect::<Vec<_>>();
-                        self.session.messages.push(ConversationMessage::assistant(
-                            fallback_reply.content,
-                            fallback_tool_calls.clone(),
-                        ));
-                        write_stdout_rendered(
-                            &format_iteration_status(
-                                last_iter,
-                                self.config.max_iterations,
-                                "Focused edit fallback",
-                                "Small scaffold edit stalled in prose before tool use; applying deterministic playable page completion.",
-                                self.footer.current_cols(),
-                            ),
-                            true,
-                        );
-                        let mut fallback_failed = false;
-                        for tool_call in fallback_tool_calls {
-                            let raw_result = self.execute_tool_call(
-                                &tool_call.name,
-                                &tool_call.arguments,
-                                Some(interrupt_flag.flag.clone()),
-                            );
-                            if tool_result_failed(&raw_result) {
-                                fallback_failed = true;
-                            }
-                            let compact_result =
-                                prompting::compact_tool_result(&tool_call.name, raw_result);
-                            self.session.messages.push(ConversationMessage::tool(
-                                tool_call.name.clone(),
-                                compact_result,
-                            ));
-                        }
-                        log_llm_event(
-                            "agent.focused_edit.deterministic_completion_after_no_tool_stall",
-                            serde_json::json!({
-                                "session_id": self.session_store.session_id(),
-                                "target": target.display().to_string(),
-                            }),
-                        );
-                        if !fallback_failed {
-                            final_prose =
-                                "スペースインベーダーゲームを実装しました。Next.js のメイン画面で移動、射撃、敵弾、スコア、ライフ、ウェーブ、リスタートを含む playable な Canvas ゲームとして動作します。"
-                                    .to_string();
-                            exit_reason = ExitReason::Done;
-                            break 'outer;
-                        }
-                        continue;
-                    }
                     repo_change_retries += 1;
                     if repo_change_retries >= 3 {
                         exit_reason = ExitReason::MissingRepoEdits;
@@ -1560,66 +1385,6 @@ impl Agent {
             if action_expectation == recovery::ActionExpectation::RepoChange
                 && repo_edit_calls_made_this_turn == 0
             {
-                if let Some(target) = self.focused_edit_recovery_target()
-                    && let Some(fallback_reply) = deterministic_page_completion_edit_reply(
-                        &self.session.messages,
-                        &target,
-                        &self.work_root,
-                    )
-                {
-                    let fallback_tool_calls = fallback_reply
-                        .tool_calls
-                        .iter()
-                        .cloned()
-                        .map(|tool_call| self.prepare_tool_call(tool_call))
-                        .collect::<Vec<_>>();
-                    self.session.messages.push(ConversationMessage::assistant(
-                        fallback_reply.content,
-                        fallback_tool_calls.clone(),
-                    ));
-                    write_stdout_rendered(
-                        &format_iteration_status(
-                            last_iter,
-                            self.config.max_iterations,
-                            "Focused edit fallback",
-                            "Focused edit recovery stalled on blocked tools; applying deterministic playable page completion.",
-                            self.footer.current_cols(),
-                        ),
-                        true,
-                    );
-                    let mut fallback_failed = false;
-                    for tool_call in fallback_tool_calls {
-                        let raw_result = self.execute_tool_call(
-                            &tool_call.name,
-                            &tool_call.arguments,
-                            Some(interrupt_flag.flag.clone()),
-                        );
-                        if tool_result_failed(&raw_result) {
-                            fallback_failed = true;
-                        }
-                        let compact_result =
-                            prompting::compact_tool_result(&tool_call.name, raw_result);
-                        self.session.messages.push(ConversationMessage::tool(
-                            tool_call.name.clone(),
-                            compact_result,
-                        ));
-                    }
-                    log_llm_event(
-                        "agent.focused_edit.deterministic_completion_after_blocked_tools",
-                        serde_json::json!({
-                            "session_id": self.session_store.session_id(),
-                            "target": target.display().to_string(),
-                        }),
-                    );
-                    if !fallback_failed {
-                        final_prose =
-                            "スペースインベーダーゲームを実装しました。Next.js のメイン画面で移動、射撃、敵弾、スコア、ライフ、ウェーブ、リスタートを含む playable な Canvas ゲームとして動作します。"
-                                .to_string();
-                        exit_reason = ExitReason::Done;
-                        break 'outer;
-                    }
-                    continue;
-                }
                 if self.active_task_requires_nextjs_scaffold() && self.workspace_appears_empty() {
                     let fallback_reply = deterministic_nextjs_scaffold_reply();
                     let fallback_tool_calls = fallback_reply
@@ -1707,69 +1472,6 @@ impl Agent {
                 && repo_edit_calls_made_this_turn > 0
                 && reply_looks_like_future_work(&final_reply)
             {
-                if let Some(target) = self.focused_edit_recovery_target()
-                    && let Some(fallback_reply) = deterministic_page_completion_edit_reply(
-                        &self.session.messages,
-                        &target,
-                        &self.work_root,
-                    )
-                {
-                    let fallback_tool_calls = fallback_reply
-                        .tool_calls
-                        .iter()
-                        .cloned()
-                        .map(|tool_call| self.prepare_tool_call(tool_call))
-                        .collect::<Vec<_>>();
-                    let fallback_tool_count = fallback_tool_calls.len();
-                    self.session.messages.push(ConversationMessage::assistant(
-                        fallback_reply.content,
-                        fallback_tool_calls.clone(),
-                    ));
-                    write_stdout_rendered(
-                        &format_iteration_status(
-                            last_iter,
-                            self.config.max_iterations,
-                            "Focused edit fallback",
-                            "Small scaffold edit stalled in prose; applying deterministic playable page completion.",
-                            self.footer.current_cols(),
-                        ),
-                        true,
-                    );
-                    let mut fallback_failed = false;
-                    for tool_call in fallback_tool_calls {
-                        let raw_result = self.execute_tool_call(
-                            &tool_call.name,
-                            &tool_call.arguments,
-                            Some(interrupt_flag.flag.clone()),
-                        );
-                        if tool_result_failed(&raw_result) {
-                            fallback_failed = true;
-                        }
-                        let compact_result =
-                            prompting::compact_tool_result(&tool_call.name, raw_result);
-                        self.session.messages.push(ConversationMessage::tool(
-                            tool_call.name.clone(),
-                            compact_result,
-                        ));
-                    }
-                    repo_change_retries = 0;
-                    repo_edit_calls_made_this_turn += fallback_tool_count;
-                    log_llm_event(
-                        "agent.focused_edit.deterministic_completion_after_prose_stall",
-                        serde_json::json!({
-                            "session_id": self.session_store.session_id(),
-                            "target": target.display().to_string(),
-                        }),
-                    );
-                    if !fallback_failed {
-                        final_prose =
-                            "スペースインベーダーゲームを実装しました。Next.js のメイン画面で移動、射撃、敵弾、スコア、ライフ、ウェーブ、リスタートを含む playable な Canvas ゲームとして動作します。"
-                                .to_string();
-                        exit_reason = ExitReason::Done;
-                        break 'outer;
-                    }
-                    continue;
-                }
                 repo_change_retries += 1;
                 if repo_change_retries >= 3 {
                     exit_reason = ExitReason::MissingRepoEdits;
@@ -1977,48 +1679,6 @@ impl Agent {
                                 120,
                             );
                             if lower_err.contains("truncated tool call") {
-                                if target_already_read {
-                                    let successful_edits = successful_non_plan_repo_edit_count(
-                                        &self.session.messages,
-                                        &self.work_root,
-                                        self.session.mode_state.active_plan_path.as_deref(),
-                                    );
-                                    if successful_edits == 0
-                                        && let Some(reply) = deterministic_page_first_edit_reply(
-                                            &self.session.messages,
-                                            &target,
-                                            &self.work_root,
-                                        )
-                                    {
-                                        log_llm_event(
-                                            "agent.focused_edit.deterministic_first_edit_fallback",
-                                            serde_json::json!({
-                                                "session_id": self.session_store.session_id(),
-                                                "target": target.display().to_string(),
-                                                "reason": err,
-                                            }),
-                                        );
-                                        return Ok(reply);
-                                    }
-                                    if successful_edits >= 1
-                                        && let Some(reply) =
-                                            deterministic_page_completion_edit_reply(
-                                                &self.session.messages,
-                                                &target,
-                                                &self.work_root,
-                                            )
-                                    {
-                                        log_llm_event(
-                                            "agent.focused_edit.deterministic_completion_fallback",
-                                            serde_json::json!({
-                                                "session_id": self.session_store.session_id(),
-                                                "target": target.display().to_string(),
-                                                "reason": err,
-                                            }),
-                                        );
-                                        return Ok(reply);
-                                    }
-                                }
                                 self.push_system_note(
                                     recovery::focused_edit_truncated_tool_call_note(
                                         &target_display,
@@ -2637,32 +2297,6 @@ impl Agent {
         self.forced_small_edit_recovery_target()
             .or_else(|| self.post_scaffold_edit_recovery_target())
             .or_else(|| self.post_scaffold_continuation_recovery_target())
-    }
-
-    fn deterministic_first_edit_after_focused_stall(
-        &self,
-        target: &Path,
-        reason: &str,
-    ) -> Option<AssistantReply> {
-        if !should_use_deterministic_first_edit_for_focused_stall(
-            &self.session.messages,
-            target,
-            &self.work_root,
-            self.session.mode_state.active_plan_path.as_deref(),
-        ) {
-            return None;
-        }
-        let reply =
-            deterministic_page_first_edit_reply(&self.session.messages, target, &self.work_root)?;
-        log_llm_event(
-            "agent.focused_edit.deterministic_first_edit_after_stall",
-            serde_json::json!({
-                "session_id": self.session_store.session_id(),
-                "target": target.display().to_string(),
-                "reason": reason,
-            }),
-        );
-        Some(reply)
     }
 
     fn execute_tool_call(
@@ -3738,356 +3372,6 @@ fn latest_page_copy_block_from_read(
     extract_page_copy_block_from_numbered_read(&tool.content)
 }
 
-fn deterministic_page_first_edit_reply(
-    messages: &[ConversationMessage],
-    target: &Path,
-    work_root: &Path,
-) -> Option<AssistantReply> {
-    let relative = target
-        .strip_prefix(work_root)
-        .unwrap_or(target)
-        .to_string_lossy()
-        .replace('\\', "/");
-    if !is_page_component_target(&relative) {
-        return None;
-    }
-    let old_string = latest_page_copy_block_from_read(messages, target, work_root)?;
-    let new_string = [
-        "          <h1 className=\"max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50\">",
-        "            VOID RAIDERS",
-        "          </h1>",
-        "          <p className=\"max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400\">",
-        "            Score 000000 | Lives 3 | Move Arrow Keys | Fire Space",
-        "          </p>",
-    ]
-    .join("\n");
-    Some(AssistantReply {
-        content: String::new(),
-        tool_calls: vec![ToolCall {
-            id: "focused-edit-fallback-1".to_string(),
-            name: "Edit".to_string(),
-            arguments: serde_json::json!({
-                "path": target.display().to_string(),
-                "old_string": old_string,
-                "new_string": new_string,
-            }),
-        }],
-    })
-}
-
-fn should_use_deterministic_first_edit_for_focused_stall(
-    messages: &[ConversationMessage],
-    target: &Path,
-    work_root: &Path,
-    plan_path: Option<&Path>,
-) -> bool {
-    focused_edit_target_already_read(messages, target, work_root)
-        && successful_non_plan_repo_edit_count(messages, work_root, plan_path) == 0
-        && deterministic_page_first_edit_reply(messages, target, work_root).is_some()
-}
-
-fn deterministic_page_completion_edit_reply(
-    _messages: &[ConversationMessage],
-    target: &Path,
-    work_root: &Path,
-) -> Option<AssistantReply> {
-    let relative = target
-        .strip_prefix(work_root)
-        .unwrap_or(target)
-        .to_string_lossy()
-        .replace('\\', "/");
-    if !is_page_component_target(&relative) {
-        return None;
-    }
-    let old_string = std::fs::read_to_string(target).ok()?;
-    if !old_string.contains("VOID RAIDERS") {
-        return None;
-    }
-    Some(AssistantReply {
-        content: String::new(),
-        tool_calls: vec![ToolCall {
-            id: "focused-edit-completion-fallback-1".to_string(),
-            name: "Edit".to_string(),
-            arguments: serde_json::json!({
-                "path": target.display().to_string(),
-                "old_string": old_string,
-                "new_string": deterministic_space_invaders_page(),
-            }),
-        }],
-    })
-}
-
-fn deterministic_space_invaders_page() -> String {
-    r##""use client";
-
-import { useEffect, useRef, useState } from "react";
-
-type Ship = { x: number; y: number; w: number; h: number };
-type Shot = { x: number; y: number; vy: number };
-type Invader = { x: number; y: number; alive: boolean; phase: number };
-type Spark = { x: number; y: number; vx: number; vy: number; life: number };
-
-const W = 860;
-const H = 560;
-const cols = 10;
-const rows = 4;
-
-function makeInvaders(wave: number): Invader[] {
-  return Array.from({ length: cols * rows }, (_, index) => ({
-    x: 110 + (index % cols) * 64,
-    y: 72 + Math.floor(index / cols) * 48,
-    alive: true,
-    phase: (index % cols) * 0.37 + wave,
-  }));
-}
-
-export default function Home() {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const keys = useRef(new Set<string>());
-  const raf = useRef<number | null>(null);
-  const last = useRef(0);
-  const ship = useRef<Ship>({ x: W / 2 - 22, y: H - 62, w: 44, h: 24 });
-  const shots = useRef<Shot[]>([]);
-  const enemyShots = useRef<Shot[]>([]);
-  const invaders = useRef<Invader[]>(makeInvaders(1));
-  const sparks = useRef<Spark[]>([]);
-  const dir = useRef(1);
-  const fireLock = useRef(false);
-  const [score, setScore] = useState(0);
-  const [lives, setLives] = useState(3);
-  const [wave, setWave] = useState(1);
-  const [status, setStatus] = useState("DEFEND THE NEON ORBIT");
-
-  useEffect(() => {
-    const down = (event: KeyboardEvent) => {
-      keys.current.add(event.code);
-      if (["ArrowLeft", "ArrowRight", "Space", "KeyA", "KeyD"].includes(event.code)) {
-        event.preventDefault();
-      }
-    };
-    const up = (event: KeyboardEvent) => {
-      keys.current.delete(event.code);
-      if (event.code === "Space") fireLock.current = false;
-    };
-    window.addEventListener("keydown", down);
-    window.addEventListener("keyup", up);
-    return () => {
-      window.removeEventListener("keydown", down);
-      window.removeEventListener("keyup", up);
-    };
-  }, []);
-
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    const ctx = canvas?.getContext("2d");
-    if (!canvas || !ctx) return;
-
-    const boom = (x: number, y: number, color = "#7df9ff") => {
-      for (let i = 0; i < 14; i++) {
-        sparks.current.push({
-          x,
-          y,
-          vx: Math.cos(i) * (60 + Math.random() * 90),
-          vy: Math.sin(i) * (60 + Math.random() * 90),
-          life: 0.5,
-        });
-      }
-      ctx.fillStyle = color;
-    };
-
-    const reset = () => {
-      setScore(0);
-      setLives(3);
-      setWave(1);
-      setStatus("DEFEND THE NEON ORBIT");
-      ship.current = { x: W / 2 - 22, y: H - 62, w: 44, h: 24 };
-      shots.current = [];
-      enemyShots.current = [];
-      sparks.current = [];
-      invaders.current = makeInvaders(1);
-      dir.current = 1;
-    };
-
-    const step = (time: number) => {
-      const dt = Math.min(0.033, (time - last.current) / 1000 || 0.016);
-      last.current = time;
-      if (keys.current.has("KeyR")) reset();
-
-      const speed = 330;
-      if (keys.current.has("ArrowLeft") || keys.current.has("KeyA")) ship.current.x -= speed * dt;
-      if (keys.current.has("ArrowRight") || keys.current.has("KeyD")) ship.current.x += speed * dt;
-      ship.current.x = Math.max(24, Math.min(W - ship.current.w - 24, ship.current.x));
-      if (keys.current.has("Space") && !fireLock.current) {
-        shots.current.push({ x: ship.current.x + ship.current.w / 2, y: ship.current.y, vy: -520 });
-        fireLock.current = true;
-      }
-
-      const alive = invaders.current.filter((i) => i.alive);
-      const drift = (40 + wave * 8) * dt * dir.current;
-      let edge = false;
-      alive.forEach((invader) => {
-        invader.x += drift;
-        invader.y += Math.sin(time / 420 + invader.phase) * 0.15;
-        if (invader.x < 30 || invader.x > W - 54) edge = true;
-        if (Math.random() < dt * 0.18 + wave * 0.002) {
-          enemyShots.current.push({ x: invader.x + 18, y: invader.y + 22, vy: 190 + wave * 18 });
-        }
-      });
-      if (edge) {
-        dir.current *= -1;
-        alive.forEach((invader) => (invader.y += 18));
-      }
-
-      shots.current = shots.current.map((s) => ({ ...s, y: s.y + s.vy * dt })).filter((s) => s.y > -20);
-      enemyShots.current = enemyShots.current
-        .map((s) => ({ ...s, y: s.y + s.vy * dt }))
-        .filter((s) => s.y < H + 30);
-
-      shots.current = shots.current.filter((shot) => {
-        const hit = invaders.current.find(
-          (invader) =>
-            invader.alive &&
-            shot.x > invader.x &&
-            shot.x < invader.x + 40 &&
-            shot.y > invader.y &&
-            shot.y < invader.y + 28,
-        );
-        if (!hit) return true;
-        hit.alive = false;
-        boom(hit.x + 20, hit.y + 14, "#ff4fd8");
-        setScore((value) => value + 120);
-        return false;
-      });
-
-      enemyShots.current = enemyShots.current.filter((shot) => {
-        const hit =
-          shot.x > ship.current.x &&
-          shot.x < ship.current.x + ship.current.w &&
-          shot.y > ship.current.y &&
-          shot.y < ship.current.y + ship.current.h;
-        if (!hit) return true;
-        boom(ship.current.x + 22, ship.current.y + 8, "#ffb000");
-        setLives((value) => {
-          const next = value - 1;
-          setStatus(next <= 0 ? "SHIP LOST - PRESS R" : "HULL BREACH - KEEP FIRING");
-          return Math.max(0, next);
-        });
-        return false;
-      });
-
-      if (invaders.current.every((invader) => !invader.alive)) {
-        setWave((value) => {
-          const next = value + 1;
-          invaders.current = makeInvaders(next);
-          shots.current = [];
-          enemyShots.current = [];
-          setStatus(`WAVE ${next}: INVADERS REFORMING`);
-          return next;
-        });
-      }
-
-      sparks.current = sparks.current
-        .map((spark) => ({
-          ...spark,
-          x: spark.x + spark.vx * dt,
-          y: spark.y + spark.vy * dt,
-          vy: spark.vy + 120 * dt,
-          life: spark.life - dt,
-        }))
-        .filter((spark) => spark.life > 0);
-
-      ctx.clearRect(0, 0, W, H);
-      const gradient = ctx.createLinearGradient(0, 0, 0, H);
-      gradient.addColorStop(0, "#05071f");
-      gradient.addColorStop(1, "#16051f");
-      ctx.fillStyle = gradient;
-      ctx.fillRect(0, 0, W, H);
-      ctx.fillStyle = "rgba(125,249,255,.28)";
-      for (let i = 0; i < 70; i++) ctx.fillRect((i * 97 + time / 18) % W, (i * 53) % H, 1.5, 1.5);
-
-      ctx.strokeStyle = "#18f2ff";
-      ctx.lineWidth = 3;
-      ctx.beginPath();
-      ctx.moveTo(ship.current.x, ship.current.y + ship.current.h);
-      ctx.lineTo(ship.current.x + ship.current.w / 2, ship.current.y);
-      ctx.lineTo(ship.current.x + ship.current.w, ship.current.y + ship.current.h);
-      ctx.closePath();
-      ctx.stroke();
-      ctx.fillStyle = "rgba(24,242,255,.20)";
-      ctx.fill();
-
-      invaders.current.forEach((invader) => {
-        if (!invader.alive) return;
-        ctx.fillStyle = "#ff4fd8";
-        ctx.fillRect(invader.x, invader.y, 40, 10);
-        ctx.fillRect(invader.x + 6, invader.y + 12, 28, 16);
-        ctx.fillStyle = "#fff";
-        ctx.fillRect(invader.x + 10, invader.y + 17, 5, 5);
-        ctx.fillRect(invader.x + 25, invader.y + 17, 5, 5);
-      });
-
-      ctx.fillStyle = "#7df9ff";
-      shots.current.forEach((shot) => ctx.fillRect(shot.x - 2, shot.y - 14, 4, 16));
-      ctx.fillStyle = "#ffb000";
-      enemyShots.current.forEach((shot) => ctx.fillRect(shot.x - 3, shot.y, 6, 14));
-      sparks.current.forEach((spark) => {
-        ctx.globalAlpha = Math.max(0, spark.life * 2);
-        ctx.fillStyle = "#ffffff";
-        ctx.fillRect(spark.x, spark.y, 3, 3);
-      });
-      ctx.globalAlpha = 1;
-
-      if (lives <= 0) {
-        ctx.fillStyle = "rgba(0,0,0,.55)";
-        ctx.fillRect(0, 0, W, H);
-        ctx.fillStyle = "#ff4fd8";
-        ctx.font = "700 44px monospace";
-        ctx.fillText("GAME OVER", W / 2 - 128, H / 2);
-      }
-
-      raf.current = requestAnimationFrame(step);
-    };
-
-    raf.current = requestAnimationFrame(step);
-    return () => {
-      if (raf.current) cancelAnimationFrame(raf.current);
-    };
-  }, [lives, wave]);
-
-  return (
-    <main className="min-h-screen overflow-hidden bg-[#050313] px-5 py-8 text-white">
-      <section className="mx-auto flex max-w-6xl flex-col gap-5">
-        <div className="rounded-[2rem] border border-cyan-300/30 bg-white/5 p-6 shadow-2xl shadow-fuchsia-500/20">
-          <p className="text-sm uppercase tracking-[0.55em] text-cyan-200">3011 // arcade defense</p>
-          <h1 className="mt-3 text-5xl font-black tracking-tight text-white md:text-7xl">VOID RAIDERS</h1>
-          <p className="mt-3 max-w-3xl text-lg text-cyan-50/80">
-            Arrow keys or A/D to drift, Space to fire, R to restart. Clear every wave before the fleet reaches orbit.
-          </p>
-        </div>
-        <div className="grid gap-4 rounded-[2rem] border border-white/10 bg-black/40 p-4 lg:grid-cols-[1fr_220px]">
-          <canvas
-            ref={canvasRef}
-            width={W}
-            height={H}
-            className="w-full rounded-[1.4rem] border border-cyan-300/30 bg-black shadow-inner shadow-cyan-500/20"
-          />
-          <aside className="grid content-between gap-4 rounded-[1.4rem] bg-cyan-300/10 p-5">
-            <div className="space-y-4 font-mono text-sm uppercase tracking-[0.25em] text-cyan-100">
-              <p>Score <span className="block text-3xl text-white">{score.toString().padStart(6, "0")}</span></p>
-              <p>Lives <span className="block text-3xl text-white">{"I ".repeat(lives).trim() || "0"}</span></p>
-              <p>Wave <span className="block text-3xl text-white">{wave}</span></p>
-            </div>
-            <p className="rounded-2xl border border-fuchsia-300/30 bg-fuchsia-400/10 p-4 text-sm text-fuchsia-50">{status}</p>
-          </aside>
-        </div>
-      </section>
-    </main>
-  );
-}
-"##
-    .to_string()
-}
-
 fn extract_page_copy_block_from_numbered_read(contents: &str) -> Option<String> {
     let lines = contents
         .lines()
@@ -4964,7 +4248,7 @@ mod truncate_tests {
     #[test]
     fn detects_future_work_prose_after_partial_edit() {
         assert!(reply_looks_like_future_work(
-            "Now I'll create the full Space Invaders game as a client component."
+            "Now I'll create the full interactive app as a client component."
         ));
         assert!(reply_looks_like_future_work("次にゲーム本体を実装します。"));
         assert!(!reply_looks_like_future_work(
@@ -5000,8 +4284,7 @@ mod progress_tests {
     use super::{
         FOCUSED_EDIT_POST_READ_MAX_PREDICT, FOCUSED_EDIT_POST_READ_TIMEOUT_SECS,
         FOCUSED_EDIT_PRE_READ_MAX_PREDICT, FOCUSED_EDIT_PRE_READ_TIMEOUT_SECS,
-        FocusedEditBatchAction, deterministic_page_completion_edit_reply,
-        deterministic_page_first_edit_reply, extract_page_copy_block_from_numbered_read,
+        FocusedEditBatchAction, extract_page_copy_block_from_numbered_read,
         first_existing_impl_target, focused_edit_first_slice_note,
         focused_edit_first_slice_uses_exact_anchor, focused_edit_guidance_note,
         focused_edit_history, focused_edit_max_predict_override, focused_edit_minimal_history,
@@ -5012,10 +4295,9 @@ mod progress_tests {
         last_read_tool_path, latest_page_copy_block_from_read, post_scaffold_continuation_active,
         post_scaffold_recovery_active, progress_available_width, prune_plan_mode_messages,
         recent_scaffold_command_seen, recent_truncated_tool_call_attempt, sanitize_for_progress,
-        should_use_deterministic_first_edit_for_focused_stall, should_use_streaming_transport,
-        strip_read_line_number_prefix, successful_non_plan_repo_edit_count,
-        successful_repo_edit_count, tool_color, tool_display, tool_emoji, unicode_supported,
-        workspace_appears_empty,
+        should_use_streaming_transport, strip_read_line_number_prefix,
+        successful_non_plan_repo_edit_count, successful_repo_edit_count, tool_color, tool_display,
+        tool_emoji, unicode_supported, workspace_appears_empty,
     };
     use crate::modes::plan_act::PlanStage;
     use crate::ollama::xml_fallback::ToolCall;
@@ -5454,7 +4736,7 @@ mod progress_tests {
             true,
         )
         .expect("expected note");
-        assert!(note.contains("compact game teaser"));
+        assert!(note.contains("compact task-specific teaser"));
         assert!(note.contains("src/app/page.tsx"));
     }
 
@@ -5701,7 +4983,7 @@ mod progress_tests {
             true,
         )
         .expect("expected note");
-        assert!(note.contains("compact game teaser"));
+        assert!(note.contains("compact task-specific teaser"));
         assert!(note.contains("space-invaders/app/page.tsx"));
     }
 
@@ -5826,191 +5108,6 @@ mod progress_tests {
         assert!(note.contains("byte-for-byte as old_string"), "got: {note}");
         assert!(note.contains("<h1>Hello</h1>"), "got: {note}");
         assert!(note.contains("under about 500 characters"), "got: {note}");
-    }
-
-    #[test]
-    fn deterministic_page_first_edit_reply_builds_compact_edit() {
-        let temp = tempdir().unwrap();
-        let work_root = temp.path();
-        std::fs::create_dir_all(work_root.join("src/app")).unwrap();
-        let target = work_root.join("src/app/page.tsx");
-        std::fs::write(&target, "placeholder\n").unwrap();
-        let messages = vec![
-            ConversationMessage::assistant(
-                String::new(),
-                vec![ToolCall {
-                    id: "xml-1".to_string(),
-                    name: "Read".to_string(),
-                    arguments: json!({"path":"src/app/page.tsx"}),
-                }],
-            ),
-            ConversationMessage::tool(
-                "Read".to_string(),
-                r#"  16:           <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-  17:             To get started, edit the page.tsx file.
-  18:           </h1>
-  19:           <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-  20:             Looking for a starting point or more instructions?
-  21:           </p>"#
-                    .to_string(),
-            ),
-        ];
-        let reply = deterministic_page_first_edit_reply(&messages, &target, work_root)
-            .expect("expected fallback reply");
-        assert_eq!(reply.tool_calls.len(), 1, "got: {reply:?}");
-        let tool_call = &reply.tool_calls[0];
-        assert_eq!(tool_call.name, "Edit");
-        assert_eq!(
-            tool_call
-                .arguments
-                .get("path")
-                .and_then(serde_json::Value::as_str),
-            Some(target.display().to_string().as_str())
-        );
-        let new_string = tool_call
-            .arguments
-            .get("new_string")
-            .and_then(serde_json::Value::as_str)
-            .expect("new_string");
-        assert!(new_string.contains("VOID RAIDERS"), "got: {new_string}");
-        assert!(new_string.contains("Score 000000"), "got: {new_string}");
-    }
-
-    #[test]
-    fn focused_stall_first_edit_fallback_requires_read_target_and_no_prior_repo_edit() {
-        let temp = tempdir().unwrap();
-        let work_root = temp.path();
-        std::fs::create_dir_all(work_root.join("src/app")).unwrap();
-        let target = work_root.join("src/app/page.tsx");
-        std::fs::write(&target, "placeholder\n").unwrap();
-        let read_messages = vec![
-            ConversationMessage::assistant(
-                String::new(),
-                vec![ToolCall {
-                    id: "read-1".to_string(),
-                    name: "Read".to_string(),
-                    arguments: json!({"path":"src/app/page.tsx"}),
-                }],
-            ),
-            ConversationMessage::tool(
-                "Read".to_string(),
-                r#"  16:           <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-  17:             To get started, edit the page.tsx file.
-  18:           </h1>
-  19:           <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-  20:             Looking for a starting point or more instructions?
-  21:           </p>"#
-                    .to_string(),
-            ),
-        ];
-
-        assert!(should_use_deterministic_first_edit_for_focused_stall(
-            &read_messages,
-            &target,
-            work_root,
-            None
-        ));
-
-        let mut edited_messages = read_messages.clone();
-        edited_messages.push(ConversationMessage::assistant(
-            String::new(),
-            vec![ToolCall {
-                id: "edit-1".to_string(),
-                name: "Edit".to_string(),
-                arguments: json!({"path":"src/app/page.tsx"}),
-            }],
-        ));
-        edited_messages.push(ConversationMessage::tool(
-            "Edit".to_string(),
-            "edited successfully".to_string(),
-        ));
-        assert!(!should_use_deterministic_first_edit_for_focused_stall(
-            &edited_messages,
-            &target,
-            work_root,
-            None
-        ));
-    }
-
-    #[test]
-    fn deterministic_page_completion_edit_reply_builds_playable_page() {
-        let temp = tempdir().unwrap();
-        let work_root = temp.path();
-        std::fs::create_dir_all(work_root.join("src/app")).unwrap();
-        let target = work_root.join("src/app/page.tsx");
-        std::fs::write(
-            &target,
-            r#"import Image from "next/image";
-
-export default function Home() {
-  return <h1>VOID RAIDERS</h1>;
-}
-"#,
-        )
-        .unwrap();
-        let messages = vec![ConversationMessage::user(
-            "スペースインベーダーゲームをnext.jsアプリとして開発してください。".to_string(),
-        )];
-
-        let reply = deterministic_page_completion_edit_reply(&messages, &target, work_root)
-            .expect("expected fallback reply");
-        assert_eq!(reply.tool_calls.len(), 1, "got: {reply:?}");
-        let tool_call = &reply.tool_calls[0];
-        assert_eq!(tool_call.name, "Edit");
-        let old_string = tool_call
-            .arguments
-            .get("old_string")
-            .and_then(serde_json::Value::as_str)
-            .expect("old_string");
-        let new_string = tool_call
-            .arguments
-            .get("new_string")
-            .and_then(serde_json::Value::as_str)
-            .expect("new_string");
-        assert!(old_string.contains("VOID RAIDERS"), "got: {old_string}");
-        assert!(new_string.contains("\"use client\""), "got: {new_string}");
-        assert!(
-            new_string.contains("requestAnimationFrame"),
-            "got: {new_string}"
-        );
-        assert!(new_string.contains("Space to fire"), "got: {new_string}");
-    }
-
-    #[test]
-    fn deterministic_page_completion_survives_compacted_task_context() {
-        let temp = tempdir().unwrap();
-        let work_root = temp.path();
-        std::fs::create_dir_all(work_root.join("src/app")).unwrap();
-        let target = work_root.join("src/app/page.tsx");
-        std::fs::write(
-            &target,
-            r#"import Image from "next/image";
-
-export default function Home() {
-  return <h1>VOID RAIDERS</h1>;
-}
-"#,
-        )
-        .unwrap();
-        let messages = vec![
-            ConversationMessage::system(
-                "[compact-summary]\nuser: Create an implementation plan for the user's request."
-                    .to_string(),
-            ),
-            ConversationMessage::user("yes".to_string()),
-        ];
-
-        let reply = deterministic_page_completion_edit_reply(&messages, &target, work_root)
-            .expect("expected fallback reply after approval");
-        let new_string = reply.tool_calls[0]
-            .arguments
-            .get("new_string")
-            .and_then(serde_json::Value::as_str)
-            .expect("new_string");
-        assert!(
-            new_string.contains("requestAnimationFrame"),
-            "got: {new_string}"
-        );
     }
 
     #[test]
