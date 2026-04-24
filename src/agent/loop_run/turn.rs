@@ -1853,13 +1853,12 @@ impl Agent {
         let model = model.to_string();
         let tool_specs = self.effective_tool_specs();
         let owned_messages = messages.to_vec();
-        let timeout = Duration::from_secs(timeout_override_secs.unwrap_or_else(|| {
-            non_streaming_assistant_reply_timeout_secs(
-                &model,
-                native_tools_enabled,
-                client.timeout_secs(),
-            )
-        }));
+        let timeout = Duration::from_secs(effective_non_streaming_timeout_secs(
+            &model,
+            native_tools_enabled,
+            client.timeout_secs(),
+            timeout_override_secs,
+        ));
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
 
         std::thread::spawn(move || {
@@ -2478,10 +2477,12 @@ pub(crate) fn unicode_supported() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
+        FOCUSED_EDIT_POST_READ_TIMEOUT_SECS, FOCUSED_EDIT_PRE_READ_TIMEOUT_SECS,
         PlanExplorationKey, assistant_model_for_mode, deterministic_timeout_fallback_plan,
-        non_streaming_assistant_reply_timeout_secs, normalize_exploration_path,
-        normalize_plan_exploration_key, should_fallback_plan_model_after_timeout,
-        should_materialize_plan_after_timeout, should_use_streaming_transport,
+        effective_non_streaming_timeout_secs, non_streaming_assistant_reply_timeout_secs,
+        normalize_exploration_path, normalize_plan_exploration_key,
+        should_fallback_plan_model_after_timeout, should_materialize_plan_after_timeout,
+        should_use_streaming_transport,
     };
     use crate::modes::plan_act::{ExecutionMode, TaskProfile};
     use serde_json::json;
@@ -2584,6 +2585,41 @@ mod tests {
         assert_eq!(
             non_streaming_assistant_reply_timeout_secs("qwen3.6:27b-coding-nvfp4", true, 120),
             120
+        );
+    }
+
+    #[test]
+    fn qwen35_focused_edit_timeout_override_keeps_model_floor() {
+        assert_eq!(
+            effective_non_streaming_timeout_secs(
+                "qwen3.5:122b",
+                true,
+                120,
+                Some(FOCUSED_EDIT_POST_READ_TIMEOUT_SECS),
+            ),
+            90
+        );
+        assert_eq!(
+            effective_non_streaming_timeout_secs(
+                "qwen3.5:122b",
+                true,
+                120,
+                Some(FOCUSED_EDIT_PRE_READ_TIMEOUT_SECS),
+            ),
+            90
+        );
+    }
+
+    #[test]
+    fn non_qwen35_focused_edit_timeout_override_remains_short() {
+        assert_eq!(
+            effective_non_streaming_timeout_secs(
+                "qwen3.6:27b-coding-nvfp4",
+                true,
+                120,
+                Some(FOCUSED_EDIT_POST_READ_TIMEOUT_SECS),
+            ),
+            FOCUSED_EDIT_POST_READ_TIMEOUT_SECS
         );
     }
 
@@ -2810,6 +2846,24 @@ fn non_streaming_assistant_reply_timeout_secs(
         return QWEN35_NON_NATIVE_HARD_TIMEOUT_SECS;
     }
     default_timeout_secs
+}
+
+fn effective_non_streaming_timeout_secs(
+    model: &str,
+    native_tools_enabled: bool,
+    default_timeout_secs: u64,
+    timeout_override_secs: Option<u64>,
+) -> u64 {
+    let model_timeout = non_streaming_assistant_reply_timeout_secs(
+        model,
+        native_tools_enabled,
+        default_timeout_secs,
+    );
+    match timeout_override_secs {
+        Some(override_secs) if is_qwen35_family(model) => override_secs.max(model_timeout),
+        Some(override_secs) => override_secs,
+        None => model_timeout,
+    }
 }
 
 fn focused_edit_timeout_override_secs(
