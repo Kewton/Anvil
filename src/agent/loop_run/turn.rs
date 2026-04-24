@@ -1154,6 +1154,40 @@ impl Agent {
                 {
                     self.push_system_note(recovery::repo_change_after_setup_note());
                 }
+                if repo_edit_calls_made_this_turn > 0
+                    && should_apply_repo_change_quality_gate(
+                        action_expectation,
+                        self.active_task_expects_repo_change(),
+                        self.session.mode_state.mode,
+                    )
+                    && let Some((request, target_path, issue)) =
+                        self.accepted_repo_change_quality_issue()
+                {
+                    repo_change_retries += 1;
+                    if repo_change_retries >= 3 {
+                        exit_reason = ExitReason::MissingRepoEdits;
+                        error_text = issue;
+                        break 'outer;
+                    }
+                    write_stdout_rendered(
+                        &format_iteration_status(
+                            last_iter,
+                            self.config.max_iterations,
+                            "Quality gate",
+                            &format!(
+                                "Asked the model to replace placeholder output in {target_path}."
+                            ),
+                            self.footer.current_cols(),
+                        ),
+                        true,
+                    );
+                    self.push_system_note(recovery::repo_change_quality_gate_note(
+                        &request,
+                        &target_path,
+                        &issue,
+                        repo_change_retries,
+                    ));
+                }
                 let compacted = if self.session.mode_state.mode == ExecutionMode::Plan {
                     false
                 } else {
@@ -5789,6 +5823,27 @@ mod progress_tests {
         let issue = implementation_quality_issue_for_request(request, content)
             .expect("expected quality issue");
         assert!(issue.contains("requested game domain"), "got: {issue}");
+    }
+
+    #[test]
+    fn playable_ui_quality_gate_rejects_template_after_copy_edits() {
+        let request =
+            "スペースインベーダーゲームを3011ポートで起動可能なnext.jsアプリとして開発してください";
+        let content = r#"
+            import Image from "next/image";
+            export default function Home() {
+              return <main>
+                <Image src="/next.svg" alt="Next.js logo" />
+                <h1>SPACE INVADERS</h1>
+                <p>Neon Space Invaders - score, enemy, bullet, gameover</p>
+                <a href="https://vercel.com/new">Deploy Now</a>
+                <a href="https://nextjs.org/docs">Documentation</a>
+              </main>;
+            }
+        "#;
+        let issue = implementation_quality_issue_for_request(request, content)
+            .expect("expected quality issue");
+        assert!(issue.contains("placeholder markers"), "got: {issue}");
     }
 
     #[test]

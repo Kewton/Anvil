@@ -152,7 +152,7 @@ pub fn repo_change_quality_gate_note(
     attempt: usize,
 ) -> String {
     format!(
-        "Quality gate failed for the user's request: {request}. Current target {target_path} is not a meaningful implementation yet: {issue}. Do not finish with prose. On the next turn, inspect or edit {target_path} and replace placeholder/demo content with a runnable vertical slice that directly matches the requested experience, including its domain objects, controls, state, and visible feedback. repo_change_quality_attempt={attempt}"
+        "Quality gate failed for the user's request: {request}. Current target {target_path} is not a meaningful implementation yet: {issue}. Do not finish with prose. On the next turn, emit exactly one concrete tool call for {target_path}: prefer Write when scaffold placeholder content remains, otherwise use one substantial Edit. Replace placeholder/demo content with a compact runnable vertical slice that directly matches the requested experience, including its domain objects, controls, state, and visible feedback. Do not make another tiny copy-only headline or paragraph edit. repo_change_quality_attempt={attempt}"
     )
 }
 
@@ -437,7 +437,8 @@ mod tests {
         framework_scaffold_now_note, post_scaffold_continuation_note,
         post_scaffold_edit_recovery_note, repo_change_after_setup_note,
         repo_change_no_tool_recovery_note, repo_change_partial_progress_note,
-        second_scaffold_shell_edit_exact_anchor_note, tool_call_format_recovery_note,
+        repo_change_quality_gate_note, second_scaffold_shell_edit_exact_anchor_note,
+        tool_call_format_recovery_note,
     };
 
     #[test]
@@ -588,6 +589,22 @@ mod tests {
         assert!(note.contains("src/app/page.tsx"), "got: {note}");
         assert!(
             note.contains("post_scaffold_continue_attempt=2"),
+            "got: {note}"
+        );
+    }
+
+    #[test]
+    fn quality_gate_note_prefers_write_for_placeholder_scaffolds() {
+        let note = repo_change_quality_gate_note(
+            "Build a space invaders game",
+            "app/page.tsx",
+            "it still contains multiple scaffold or generic placeholder markers",
+            1,
+        );
+        assert!(note.contains("prefer Write"), "got: {note}");
+        assert!(note.contains("Do not make another tiny"), "got: {note}");
+        assert!(
+            note.contains("repo_change_quality_attempt=1"),
             "got: {note}"
         );
     }
