@@ -2121,7 +2121,7 @@ impl Agent {
             protocol,
         ));
         if let Some(target) = focused_edit_target {
-            let trim_history_for_exact_anchor = focused_edit_uses_exact_recovery_anchor(
+            let exact_anchor = focused_edit_exact_recovery_anchor(
                 &self.session.messages,
                 &target,
                 &self.work_root,
@@ -2153,8 +2153,13 @@ impl Agent {
             {
                 messages.push(ConversationMessage::system(note));
             }
-            if trim_history_for_exact_anchor {
-                messages.extend(focused_edit_minimal_history(&self.session.messages));
+            if let Some(anchor) = exact_anchor {
+                messages.extend(focused_edit_exact_anchor_history(
+                    &self.session.messages,
+                    &target,
+                    &self.work_root,
+                    &anchor,
+                ));
             } else {
                 messages.extend(focused_edit_history(
                     &self.session.messages,
@@ -3487,31 +3492,37 @@ fn focused_edit_first_slice_uses_exact_anchor(
         && latest_page_copy_block_from_read(messages, target, work_root).is_some()
 }
 
-fn focused_edit_uses_exact_recovery_anchor(
+fn focused_edit_exact_recovery_anchor(
     messages: &[ConversationMessage],
     target: &Path,
     work_root: &Path,
     target_already_read: bool,
     successful_repo_edits: usize,
-) -> bool {
+) -> Option<String> {
     match successful_repo_edits {
-        0 => focused_edit_first_slice_uses_exact_anchor(
-            messages,
-            target,
-            work_root,
-            target_already_read,
-        ),
+        0 => {
+            if !focused_edit_first_slice_uses_exact_anchor(
+                messages,
+                target,
+                work_root,
+                target_already_read,
+            ) {
+                return None;
+            }
+            latest_page_copy_block_from_read(messages, target, work_root)
+        }
         1 => {
             let relative = target
                 .strip_prefix(work_root)
                 .unwrap_or(target)
                 .to_string_lossy()
                 .replace('\\', "/");
-            target_already_read
-                && is_page_component_target(&relative)
-                && latest_page_intro_paragraph_from_read(messages, target, work_root).is_some()
+            if !target_already_read || !is_page_component_target(&relative) {
+                return None;
+            }
+            latest_page_intro_paragraph_from_read(messages, target, work_root)
         }
-        _ => false,
+        _ => None,
     }
 }
 
@@ -3640,6 +3651,42 @@ fn focused_edit_minimal_history(messages: &[ConversationMessage]) -> Vec<Convers
         filtered.push(user.clone());
     }
     filtered
+}
+
+fn focused_edit_exact_anchor_history(
+    messages: &[ConversationMessage],
+    target: &Path,
+    work_root: &Path,
+    anchor: &str,
+) -> Vec<ConversationMessage> {
+    let mut filtered = focused_edit_minimal_history(messages);
+    let relative = target
+        .strip_prefix(work_root)
+        .unwrap_or(target)
+        .to_string_lossy()
+        .replace('\\', "/");
+    filtered.push(ConversationMessage::assistant(
+        String::new(),
+        vec![ToolCall {
+            id: "focused-anchor-read".to_string(),
+            name: "Read".to_string(),
+            arguments: serde_json::json!({ "path": relative }),
+        }],
+    ));
+    filtered.push(ConversationMessage::tool(
+        "Read".to_string(),
+        format_numbered_read_block(anchor),
+    ));
+    filtered
+}
+
+fn format_numbered_read_block(contents: &str) -> String {
+    contents
+        .lines()
+        .enumerate()
+        .map(|(index, line)| format!("{:>4}: {line}", index + 1))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn focused_edit_tool_policy_error(
@@ -4512,14 +4559,14 @@ mod progress_tests {
         FOCUSED_EDIT_POST_READ_MAX_PREDICT, FOCUSED_EDIT_POST_READ_TIMEOUT_SECS,
         FOCUSED_EDIT_PRE_READ_MAX_PREDICT, FOCUSED_EDIT_PRE_READ_TIMEOUT_SECS,
         FocusedEditBatchAction, extract_page_copy_block_from_numbered_read,
-        first_existing_impl_target, focused_edit_first_slice_note,
+        first_existing_impl_target, focused_edit_exact_anchor_history,
+        focused_edit_exact_recovery_anchor, focused_edit_first_slice_note,
         focused_edit_first_slice_uses_exact_anchor, focused_edit_guidance_note,
         focused_edit_history, focused_edit_max_predict_override, focused_edit_minimal_history,
         focused_edit_second_slice_note, focused_edit_target_already_read,
         focused_edit_timeout_override_secs, focused_edit_tool_batch_action,
-        focused_edit_tool_policy_error, focused_edit_uses_exact_recovery_anchor,
-        focused_read_target_for_directory, format_blocked_progress_line, format_progress_line,
-        has_successful_non_plan_repo_edit,
+        focused_edit_tool_policy_error, focused_read_target_for_directory,
+        format_blocked_progress_line, format_progress_line, has_successful_non_plan_repo_edit,
         has_successful_non_plan_repo_edit_after_latest_truncated_tool_call,
         has_successful_repo_edit, is_utf8_locale, last_read_tool_path,
         latest_page_copy_block_from_read, post_scaffold_continuation_active,
@@ -5130,12 +5177,44 @@ mod progress_tests {
             ),
         ];
 
-        assert!(focused_edit_uses_exact_recovery_anchor(
-            &messages, &target, &work_root, true, 1,
-        ));
-        assert!(!focused_edit_uses_exact_recovery_anchor(
-            &messages, &target, &work_root, true, 2,
-        ));
+        assert_eq!(
+            focused_edit_exact_recovery_anchor(&messages, &target, &work_root, true, 1).as_deref(),
+            Some("<p className=\"copy\">\n  Old starter copy.\n</p>")
+        );
+        assert!(
+            focused_edit_exact_recovery_anchor(&messages, &target, &work_root, true, 2).is_none()
+        );
+    }
+
+    #[test]
+    fn focused_edit_exact_anchor_history_includes_compact_synthetic_read() {
+        let work_root = Path::new("/tmp/project");
+        let target = Path::new("/tmp/project/src/app/page.tsx");
+        let messages = vec![
+            ConversationMessage::system("[Act Mode / coding] Execute the plan.".to_string()),
+            ConversationMessage::user("make a game".to_string()),
+        ];
+        let filtered = focused_edit_exact_anchor_history(
+            &messages,
+            target,
+            work_root,
+            "  <p>\n    Old\n  </p>",
+        );
+
+        assert_eq!(filtered.len(), 4, "got: {filtered:?}");
+        assert!(filtered[0].content.starts_with("[Act Mode /"));
+        assert_eq!(filtered[1].role, "user");
+        assert_eq!(filtered[2].role, "assistant");
+        assert_eq!(filtered[2].tool_calls[0].name, "Read");
+        assert_eq!(
+            filtered[2].tool_calls[0].arguments.get("path"),
+            Some(&json!("src/app/page.tsx"))
+        );
+        assert_eq!(filtered[3].name.as_deref(), Some("Read"));
+        assert_eq!(
+            filtered[3].content,
+            "   1:   <p>\n   2:     Old\n   3:   </p>"
+        );
     }
 
     #[test]
