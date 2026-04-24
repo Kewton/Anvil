@@ -164,8 +164,14 @@ fn deterministic_timeout_fallback_plan(
         }
     };
 
-    format!(
+    let plan = format!(
         "# Plan\n\n## Goal\n- Build {request_label} as a {platform_label} inside `{worktree_name}`.\n- Ensure the result runs locally on {port} and feels intentionally polished rather than placeholder-quality.\n\n## Constraints\n- Keep all work inside the current repository root and use repository-relative paths.\n- If the repository is empty, scaffold only the minimum project structure needed before implementing the requested feature.\n- Keep the implementation incremental: ship a working first slice before adding effects or polish.\n- Preserve a path to local verification so the final result can be launched and checked end-to-end.\n\n## Deliverables\n- A runnable {platform_label} that fulfills the user request.\n- The core interactive flow, supporting UI/state, and the minimum assets or styles needed for a polished first release.\n- Verification notes covering dependency install, local startup, and feature checks.\n\n## Acceptance Criteria\n- Dependency installation succeeds and the project can be started locally on {port}.\n- The default entry route renders the requested experience instead of a placeholder page.\n- The first playable slice is complete enough to demonstrate the core user interaction from start to finish.\n- The implementation includes a clear restart or recovery path when the primary interaction ends in failure or completion.\n\n## Quality Bar\n- The first minute of use should feel deliberate: cohesive visuals, readable HUD/text, and responsive controls.\n- Motion, feedback, and state updates should feel consistent rather than jarring or random.\n- The experience should be understandable without reading source code, and the main interaction should be enjoyable on the first try.\n- The code structure should leave obvious extension points for later tuning, polish, and debugging.\n\n## Execution Plan\n1. First slice: confirm or scaffold the base app, wire the main screen, implement the core interaction loop, and make the requested experience playable from start to finish.\n2. Next phases: improve presentation, tune difficulty/interaction balance, add richer feedback, and harden any supporting UI or state transitions.\n3. Review checkpoint: stop once the first playable slice runs locally on {port} and passes the core verification steps.\n\n## Verification Plan\n- Install dependencies and confirm the app boots locally on {port}.\n- Exercise the main interaction loop end-to-end, including the expected success and failure states.\n- Check that layout, controls, and status/UI updates remain readable at common desktop widths and degrade reasonably on smaller screens.\n\n## Risks / Fallbacks\n- If framework scaffolding is missing, create the smallest viable project structure first and defer non-essential polish.\n- If the requested polish threatens delivery, keep the core loop intact and add lighter-weight effects before heavier assets or integrations.\n- If performance or complexity becomes unstable, simplify update frequency and visual effects before cutting the core user interaction.\n\n<!-- runtime fallback plan: generated after repeated planning model timeouts; focus on {execution_focus}. -->\n"
+    );
+    plan.replace(
+        "- The code structure should leave obvious extension points for later tuning, polish, and debugging.",
+        &format!(
+            "- Anchor the main implementation in a concrete repo artifact such as `src/app/page.tsx` or `app/page.tsx`, and keep `package.json` scripts aligned with {port}."
+        ),
     )
 }
 
@@ -1165,8 +1171,22 @@ impl Agent {
                     let next_sections = lifecycle::plan_next_stage_sections(&plan_contents);
                     plan_progress_retries += 1;
                     if plan_progress_retries >= 4 {
-                        exit_reason = ExitReason::PlanIncomplete;
-                        error_text = exit_reason.default_error_text().to_string();
+                        match self.materialize_deterministic_fallback_plan(
+                            "agent.plan.progress_fallback_materialized",
+                        ) {
+                            Ok(true) => {
+                                final_prose = "Plan complete. Reply yes to execute, no to revise, or provide feedback.".to_string();
+                                exit_reason = ExitReason::Done;
+                            }
+                            Ok(false) => {
+                                exit_reason = ExitReason::PlanIncomplete;
+                                error_text = exit_reason.default_error_text().to_string();
+                            }
+                            Err(err) => {
+                                exit_reason = ExitReason::TransportError;
+                                error_text = err;
+                            }
+                        }
                         break 'outer;
                     }
                     write_stdout_rendered(
@@ -1277,8 +1297,22 @@ impl Agent {
                     let next_sections = lifecycle::plan_next_stage_sections(&plan_contents);
                     plan_progress_retries += 1;
                     if plan_progress_retries >= 4 {
-                        exit_reason = ExitReason::PlanIncomplete;
-                        error_text = exit_reason.default_error_text().to_string();
+                        match self.materialize_deterministic_fallback_plan(
+                            "agent.plan.progress_fallback_materialized",
+                        ) {
+                            Ok(true) => {
+                                final_prose = "Plan complete. Reply yes to execute, no to revise, or provide feedback.".to_string();
+                                exit_reason = ExitReason::Done;
+                            }
+                            Ok(false) => {
+                                exit_reason = ExitReason::PlanIncomplete;
+                                error_text = exit_reason.default_error_text().to_string();
+                            }
+                            Err(err) => {
+                                exit_reason = ExitReason::TransportError;
+                                error_text = err;
+                            }
+                        }
                         break 'outer;
                     }
                     write_stdout_rendered(
@@ -1415,8 +1449,22 @@ impl Agent {
                     let current_stage = lifecycle::current_plan_stage(&plan_contents);
                     plan_progress_retries += 1;
                     if plan_progress_retries >= 4 {
-                        exit_reason = ExitReason::PlanIncomplete;
-                        error_text = exit_reason.default_error_text().to_string();
+                        match self.materialize_deterministic_fallback_plan(
+                            "agent.plan.progress_fallback_materialized",
+                        ) {
+                            Ok(true) => {
+                                final_prose = "Plan complete. Reply yes to execute, no to revise, or provide feedback.".to_string();
+                                exit_reason = ExitReason::Done;
+                            }
+                            Ok(false) => {
+                                exit_reason = ExitReason::PlanIncomplete;
+                                error_text = exit_reason.default_error_text().to_string();
+                            }
+                            Err(err) => {
+                                exit_reason = ExitReason::TransportError;
+                                error_text = err;
+                            }
+                        }
                         break 'outer;
                     }
                     write_stdout_rendered(
@@ -1876,13 +1924,29 @@ impl Agent {
         ) {
             return Ok(None);
         }
-        let Some(plan_path) = self.session.mode_state.active_plan_path.clone() else {
+        if !self
+            .materialize_deterministic_fallback_plan("agent.plan.timeout_fallback_materialized")?
+        {
             return Ok(None);
+        }
+        Ok(Some(AssistantReply {
+            content: "Plan complete. Reply yes to execute, no to revise, or provide feedback."
+                .to_string(),
+            tool_calls: Vec::new(),
+        }))
+    }
+
+    fn materialize_deterministic_fallback_plan(
+        &mut self,
+        event_name: &str,
+    ) -> Result<bool, String> {
+        let Some(plan_path) = self.session.mode_state.active_plan_path.clone() else {
+            return Ok(false);
         };
 
         let current_contents = self.current_plan_contents()?.unwrap_or_default();
         if lifecycle::plan_is_substantive(&current_contents) {
-            return Ok(None);
+            return Ok(false);
         }
 
         let task = self
@@ -1912,8 +1976,9 @@ impl Agent {
                 plan_path.display()
             )
         })?;
+        self.session.mode_state.plan_stage = PlanStage::Ready;
         log_llm_event(
-            "agent.plan.timeout_fallback_materialized",
+            event_name,
             serde_json::json!({
                 "session_id": self.session_store.session_id(),
                 "plan_path": plan_path.display().to_string(),
@@ -1921,11 +1986,7 @@ impl Agent {
                 "model_override": self.plan_model_override,
             }),
         );
-        Ok(Some(AssistantReply {
-            content: "Plan complete. Reply yes to execute, no to revise, or provide feedback."
-                .to_string(),
-            tool_calls: Vec::new(),
-        }))
+        Ok(true)
     }
 
     fn build_request_messages(
@@ -2574,9 +2635,16 @@ mod tests {
             temp.path(),
         );
         assert!(plan.contains("3011"));
+        assert!(plan.contains("`src/app/page.tsx`"));
+        assert!(plan.contains("`package.json`"));
         assert!(plan.contains("## Quality Bar"));
         assert!(plan.contains("## Execution Plan"));
         assert!(plan.contains("runtime fallback plan"));
+        assert!(super::lifecycle::plan_is_substantive(&plan));
+        assert_eq!(
+            super::lifecycle::current_plan_stage(&plan),
+            crate::modes::plan_act::PlanStage::Ready
+        );
     }
 }
 
