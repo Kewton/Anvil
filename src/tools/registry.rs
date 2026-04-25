@@ -304,11 +304,10 @@ fn resolve_write_path(
     raw: &str,
     context: &ToolContext,
 ) -> Result<std::path::PathBuf, String> {
-    if context.mode == ExecutionMode::Plan {
-        if let Some(path) = resolve_plan_mode_write_target(root, raw, context.plan_path.as_deref())?
-        {
-            return Ok(path);
-        }
+    if context.mode == ExecutionMode::Plan
+        && let Some(path) = resolve_plan_mode_write_target(root, raw, context.plan_path.as_deref())?
+    {
+        return Ok(path);
     }
     resolve_user_path(root, raw)
 }
@@ -362,9 +361,9 @@ fn enforce_plan_stage_scope(
 
 fn allowed_plan_sections(stage: PlanStage) -> &'static [&'static str] {
     match stage {
-        PlanStage::Stage1 => &["Goal", "Constraints", "Deliverables"],
-        PlanStage::Stage2 => &["Acceptance Criteria", "Quality Bar"],
-        PlanStage::Stage3 => &["Execution Plan", "Verification Plan", "Risks / Fallbacks"],
+        PlanStage::Stage1 => &["Goal", "Constraints"],
+        PlanStage::Stage2 => &["First Action", "Verification"],
+        PlanStage::Stage3 => &[],
         PlanStage::Ready => &[],
     }
 }
@@ -373,6 +372,8 @@ fn disallowed_plan_sections(stage: PlanStage) -> Vec<&'static str> {
     let all = [
         "Goal",
         "Constraints",
+        "First Action",
+        "Verification",
         "Deliverables",
         "Acceptance Criteria",
         "Quality Bar",
@@ -510,9 +511,10 @@ fn parse_plan_sections(contents: &str) -> std::collections::BTreeMap<String, Str
 
 fn normalize_plan_heading(heading: &str) -> &str {
     match heading.trim() {
+        "Next Step" | "First Step" | "Execution Plan" | "実行計画" | "実装計画"
+        | "実装フェーズ" => "First Action",
+        "Verification Plan" | "検証計画" => "Verification",
         "Risks/Fallbacks" => "Risks / Fallbacks",
-        "実行計画" | "実装計画" | "実装フェーズ" => "Execution Plan",
-        "検証計画" => "Verification Plan",
         "リスク/フォールバック" | "リスク・フォールバック" | "リスク / フォールバック" => {
             "Risks / Fallbacks"
         }
@@ -533,6 +535,8 @@ fn render_plan_document(
     for section in [
         "Goal",
         "Constraints",
+        "First Action",
+        "Verification",
         "Deliverables",
         "Acceptance Criteria",
         "Quality Bar",
@@ -770,8 +774,8 @@ mod tests {
             "Edit",
             &json!({
                 "path": "plan-123.md",
-                "old_string": "## Acceptance Criteria\n- old\n",
-                "new_string": "## Acceptance Criteria\n- new\n\n## Quality Bar\n- anchored to src/app/page.tsx\n"
+                "old_string": "## First Action\n- old\n",
+                "new_string": "## First Action\n- Edit src/app/page.tsx first.\n\n## Verification\n- Run npm test.\n"
             }),
             &context,
         )
@@ -788,7 +792,7 @@ mod tests {
         let plan_path = plan_root.join("plan-123.md");
         std::fs::write(
             &plan_path,
-            "# Plan\n\n## Goal\n- build game\n\n## Constraints\n- keep next.js\n\n## Deliverables\n- runnable app\n",
+            "# Plan\n\n## Goal\n- build game\n\n## Constraints\n- keep next.js\n",
         )
         .unwrap();
         let context = ToolContext {
@@ -806,7 +810,7 @@ mod tests {
                 "Write",
                 &json!({
                     "path": "plans/plan-123.md",
-                    "content": "## Acceptance Criteria\n- playable\n\n## Quality Bar\n- anchored to src/app/page.tsx\n"
+                    "content": "## First Action\n- Edit src/app/page.tsx first.\n\n## Verification\n- Run npm test.\n"
                 }),
                 &context,
             )
@@ -814,9 +818,8 @@ mod tests {
         let updated = std::fs::read_to_string(&plan_path).unwrap();
         assert!(updated.contains("## Goal\n- build game"));
         assert!(updated.contains("## Constraints\n- keep next.js"));
-        assert!(updated.contains("## Deliverables\n- runnable app"));
-        assert!(updated.contains("## Acceptance Criteria\n- playable"));
-        assert!(updated.contains("## Quality Bar\n- anchored to src/app/page.tsx"));
+        assert!(updated.contains("## First Action\n- Edit src/app/page.tsx first."));
+        assert!(updated.contains("## Verification\n- Run npm test."));
     }
 
     #[test]
@@ -829,7 +832,7 @@ mod tests {
         let plan_path = plan_root.join("plan-123.md");
         std::fs::write(
             &plan_path,
-            "# Plan\n\n## Goal\n- build game\n\n## Constraints\n- keep next.js\n\n## Deliverables\n- runnable app\n",
+            "# Plan\n\n## Goal\n- build game\n\n## Constraints\n- keep next.js\n",
         )
         .unwrap();
         let context = ToolContext {
@@ -848,7 +851,7 @@ mod tests {
                 &json!({
                     "path": "plan-123.md",
                     "old_string": "# Plan",
-                    "new_string": "# Plan\n\n## Goal\n- overwritten goal\n\n## Constraints\n- overwritten constraints\n\n## Deliverables\n- overwritten deliverables\n\n## Acceptance Criteria\n- playable\n\n## Quality Bar\n- anchored to src/app/page.tsx\n\n## Execution Plan\n1. later\n"
+                    "new_string": "# Plan\n\n## Goal\n- overwritten goal\n\n## Constraints\n- overwritten constraints\n\n## Deliverables\n- overwritten deliverables\n\n## First Action\n- Edit src/app/page.tsx first.\n\n## Verification\n- Run npm test.\n\n## Quality Bar\n- later\n"
                 }),
                 &context,
             )
@@ -856,10 +859,9 @@ mod tests {
         let updated = std::fs::read_to_string(&plan_path).unwrap();
         assert!(updated.contains("## Goal\n- build game"));
         assert!(updated.contains("## Constraints\n- keep next.js"));
-        assert!(updated.contains("## Deliverables\n- runnable app"));
-        assert!(updated.contains("## Acceptance Criteria\n- playable"));
-        assert!(updated.contains("## Quality Bar\n- anchored to src/app/page.tsx"));
+        assert!(updated.contains("## First Action\n- Edit src/app/page.tsx first."));
+        assert!(updated.contains("## Verification\n- Run npm test."));
         assert!(!updated.contains("overwritten goal"));
-        assert!(!updated.contains("## Execution Plan\n1. later"));
+        assert!(!updated.contains("## Quality Bar\n- later"));
     }
 }

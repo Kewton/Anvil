@@ -71,7 +71,7 @@ impl Agent {
         }
         std::fs::write(
             plan_path,
-            "# Plan\n\n## Goal\n- \n\n## Constraints\n- \n\n## Deliverables\n- \n\n## Acceptance Criteria\n- \n\n## Quality Bar\n- \n\n## Execution Plan\n1. First slice:\n2. Next phases:\n3. Review checkpoint:\n\n## Verification Plan\n- \n\n## Risks / Fallbacks\n- \n",
+            "# Plan\n\n## Goal\n- \n\n## Constraints\n- \n\n## First Action\n- \n\n## Verification\n- \n",
         )
         .map_err(|err| format!("failed to create plan file {}: {err}", plan_path.display()))
     }
@@ -159,15 +159,15 @@ pub(super) fn is_transport_error(error: &str) -> bool {
         || lower.contains("ollama /api/chat failed: 429")
 }
 
-const PLAN_STAGE_ONE: &[&str] = &["Goal", "Constraints", "Deliverables"];
-const PLAN_STAGE_TWO: &[&str] = &["Acceptance Criteria", "Quality Bar"];
-const PLAN_STAGE_THREE: &[&str] = &["Execution Plan", "Verification Plan", "Risks / Fallbacks"];
+const PLAN_STAGE_ONE: &[&str] = &["Goal", "Constraints"];
+const PLAN_STAGE_TWO: &[&str] = &["First Action", "Verification"];
+const PLAN_STAGE_THREE: &[&str] = &[];
 const QUALITY_BAR_ANCHOR_SECTIONS: &[&str] = &[
     "Goal",
     "Constraints",
-    "Deliverables",
-    "Acceptance Criteria",
+    "First Action",
     "Execution Plan",
+    "Verification",
     "Verification Plan",
 ];
 
@@ -226,6 +226,10 @@ pub(super) fn plan_task_list(contents: &str, task_profile: TaskProfile) -> Vec<S
             format!("Fill {}", join_plan_sections(PLAN_STAGE_THREE)),
         ),
     ];
+    let groups = groups
+        .into_iter()
+        .filter(|(sections, _)| !sections.is_empty())
+        .collect::<Vec<_>>();
 
     let current_group = groups
         .iter()
@@ -271,9 +275,10 @@ pub(super) fn plan_task_list(contents: &str, task_profile: TaskProfile) -> Vec<S
 
 fn normalize_plan_heading(heading: &str) -> &str {
     match heading.trim() {
+        "Next Step" | "First Step" | "Execution Plan" | "実行計画" | "実装計画"
+        | "実装フェーズ" => "First Action",
+        "Verification Plan" | "検証計画" => "Verification",
         "Risks/Fallbacks" => "Risks / Fallbacks",
-        "実行計画" | "実装計画" | "実装フェーズ" => "Execution Plan",
-        "検証計画" => "Verification Plan",
         "リスク/フォールバック" | "リスク・フォールバック" | "リスク / フォールバック" => {
             "Risks / Fallbacks"
         }
@@ -297,7 +302,7 @@ fn substantive_plan_lines<'a>(body: &'a str) -> impl Iterator<Item = &'a str> + 
         })
 }
 
-fn plan_section_body<'a>(contents: &'a str, section: &str) -> Option<String> {
+fn plan_section_body(contents: &str, section: &str) -> Option<String> {
     let mut current_heading: Option<&str> = None;
     let mut collected = Vec::new();
 
@@ -457,7 +462,7 @@ pub(super) fn plan_missing_sections(contents: &str) -> Vec<&'static str> {
 }
 
 pub(super) fn plan_next_stage_sections(contents: &str) -> Vec<&'static str> {
-    for stage in [PLAN_STAGE_ONE, PLAN_STAGE_TWO, PLAN_STAGE_THREE] {
+    for stage in [PLAN_STAGE_ONE, PLAN_STAGE_TWO] {
         let missing = stage
             .iter()
             .copied()
@@ -493,9 +498,9 @@ pub(super) fn current_plan_stage(contents: &str) -> PlanStage {
 
 pub(super) fn plan_stage_exploration_budget(stage: PlanStage) -> usize {
     match stage {
-        PlanStage::Stage1 => 2,
+        PlanStage::Stage1 => 1,
         PlanStage::Stage2 => 1,
-        PlanStage::Stage3 => 1,
+        PlanStage::Stage3 => 0,
         PlanStage::Ready => 0,
     }
 }
@@ -505,17 +510,9 @@ pub(super) fn plan_is_substantive(contents: &str) -> bool {
 }
 
 pub(super) fn plan_is_approval_ready(contents: &str) -> bool {
-    [
-        "Goal",
-        "Constraints",
-        "Deliverables",
-        "Acceptance Criteria",
-        "Quality Bar",
-        "Execution Plan",
-        "Verification Plan",
-    ]
-    .into_iter()
-    .all(|section| plan_section_is_complete(contents, section))
+    ["Goal", "Constraints", "First Action", "Verification"]
+        .into_iter()
+        .all(|section| plan_section_is_complete(contents, section))
 }
 
 fn plan_needs_stage_three_fallback(contents: &str) -> bool {
@@ -569,13 +566,7 @@ fn parse_stage_three_fallback_decision(raw: &str) -> Option<bool> {
 
 pub(super) fn plan_act_summary(contents: &str) -> String {
     let mut parts = Vec::new();
-    for section in [
-        "Goal",
-        "Acceptance Criteria",
-        "Quality Bar",
-        "Execution Plan",
-        "Verification Plan",
-    ] {
+    for section in ["Goal", "Constraints", "First Action", "Verification"] {
         if let Some(body) = plan_section_body(contents, section) {
             let lines = substantive_plan_lines(&body)
                 .take(3)
@@ -702,7 +693,7 @@ mod tests {
     fn incomplete_template_reports_stage_one_missing() {
         assert_eq!(
             plan_next_stage_sections(TEMPLATE),
-            vec!["Goal", "Constraints", "Deliverables"]
+            vec!["Goal", "Constraints"]
         );
         assert!(!plan_is_substantive(TEMPLATE));
     }
@@ -710,20 +701,10 @@ mod tests {
     #[test]
     fn plan_task_list_uses_actual_missing_sections() {
         let tasks = plan_task_list(TEMPLATE, TaskProfile::Coding);
-        assert_eq!(
-            tasks[0],
-            "[in progress] Fill Goal, Constraints, and Deliverables"
-        );
-        assert_eq!(
-            tasks[1],
-            "[pending] Fill Acceptance Criteria and Quality Bar"
-        );
+        assert_eq!(tasks[0], "[in progress] Fill Goal and Constraints");
+        assert_eq!(tasks[1], "[pending] Fill First Action and Verification");
         assert_eq!(
             tasks[2],
-            "[pending] Fill Execution Plan, Verification Plan, and Risks / Fallbacks"
-        );
-        assert_eq!(
-            tasks[3],
             "[pending] Review the completed plan and approve execution"
         );
     }
@@ -742,7 +723,7 @@ mod tests {
             );
         assert_eq!(
             plan_next_stage_sections(&contents),
-            vec!["Acceptance Criteria", "Quality Bar"]
+            vec!["First Action", "Verification"]
         );
         assert_eq!(current_plan_stage(&contents), PlanStage::Stage2);
     }
@@ -815,11 +796,11 @@ mod tests {
 ";
         let summary = plan_act_summary(contents);
         assert!(summary.contains("## Goal"));
-        assert!(summary.contains("## Acceptance Criteria"));
-        assert!(summary.contains("## Quality Bar"));
-        assert!(summary.contains("## Execution Plan"));
-        assert!(!summary.contains("## Constraints"));
+        assert!(summary.contains("## Constraints"));
+        assert!(summary.contains("## First Action"));
+        assert!(summary.contains("## Verification"));
         assert!(!summary.contains("## Deliverables"));
+        assert!(!summary.contains("## Acceptance Criteria"));
     }
 
     #[test]
@@ -918,11 +899,11 @@ mod tests {
 ## Risks / Fallbacks
 - 
 ";
-        assert!(plan_needs_stage_three_fallback(contents));
+        assert!(!plan_needs_stage_three_fallback(contents));
     }
 
     #[test]
-    fn generic_quality_bar_keeps_plan_in_stage_two() {
+    fn generic_quality_bar_no_longer_blocks_minimal_plan() {
         let contents = "# Plan
 
 ## Goal
@@ -951,9 +932,9 @@ mod tests {
 ## Risks / Fallbacks
 - Revisit wording if the introduction is vague.
 ";
-        assert_eq!(current_plan_stage(contents), PlanStage::Stage2);
-        assert!(!plan_is_approval_ready(contents));
-        assert!(plan_missing_sections(contents).contains(&"Quality Bar"));
+        assert_eq!(current_plan_stage(contents), PlanStage::Ready);
+        assert!(plan_is_approval_ready(contents));
+        assert!(plan_missing_sections(contents).is_empty());
     }
 
     #[test]
@@ -993,13 +974,13 @@ mod tests {
 
     #[test]
     fn plan_stage_budget_is_tight_after_stage_one() {
-        assert_eq!(plan_stage_exploration_budget(PlanStage::Stage1), 2);
+        assert_eq!(plan_stage_exploration_budget(PlanStage::Stage1), 1);
         assert_eq!(plan_stage_exploration_budget(PlanStage::Stage2), 1);
-        assert_eq!(plan_stage_exploration_budget(PlanStage::Stage3), 1);
+        assert_eq!(plan_stage_exploration_budget(PlanStage::Stage3), 0);
         assert_eq!(plan_stage_exploration_budget(PlanStage::Ready), 0);
         assert_eq!(
             plan_stage_sections(PlanStage::Stage2),
-            &["Acceptance Criteria", "Quality Bar"]
+            &["First Action", "Verification"]
         );
     }
 

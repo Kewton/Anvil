@@ -4,6 +4,7 @@ use super::*;
 use crate::config::LogLevel;
 use crate::logging::log_llm_event;
 use crate::modes::plan_act::{PlanStage, TaskProfile};
+use crate::ollama::xml_fallback::strip_think_tags;
 use crate::session::store::ConversationMessage;
 use crossterm::event::{self, Event, KeyCode};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
@@ -143,7 +144,7 @@ fn plan_stage_status_line(stage: PlanStage, next_sections: &[&str]) -> String {
     match stage {
         PlanStage::Stage1 => format!("Current phase: Draft {focus}"),
         PlanStage::Stage2 => format!("Current phase: Define {focus}"),
-        PlanStage::Stage3 => format!("Current phase: Finalize {focus}"),
+        PlanStage::Stage3 => "Current phase: Approval review".to_string(),
         PlanStage::Ready => "Current phase: Approval review".to_string(),
     }
 }
@@ -169,7 +170,39 @@ fn format_plan_tasks(tasks: &[String], stage_line: &str) -> String {
 
 fn infer_task_profile_from_text(raw: &str) -> TaskProfile {
     let lower = raw.to_ascii_lowercase();
-    if lower.contains("readme")
+
+    let strong_coding = [
+        "code",
+        "implement",
+        "debug",
+        "build",
+        "test",
+        "fix",
+        "refactor",
+        "next.js",
+        "react",
+        "nuxt",
+        "vue",
+        "vite",
+        "typescript",
+        "javascript",
+        "web app",
+        "app router",
+        "single-page",
+        "game",
+    ];
+    if strong_coding.iter().any(|keyword| lower.contains(keyword))
+        || raw.contains("アプリ")
+        || raw.contains("ゲーム")
+        || raw.contains("コード")
+        || raw.contains("実装")
+        || raw.contains("開発")
+        || raw.contains("修正")
+        || raw.contains("テスト")
+        || raw.contains("ビルド")
+    {
+        TaskProfile::Coding
+    } else if lower.contains("readme")
         || lower.contains("markdown")
         || lower.contains("documentation")
         || lower.contains("docs")
@@ -200,29 +233,6 @@ fn infer_task_profile_from_text(raw: &str) -> TaskProfile {
         || raw.contains("比較")
     {
         TaskProfile::Research
-    } else if lower.contains("code")
-        || lower.contains("implement")
-        || lower.contains("debug")
-        || lower.contains("build")
-        || lower.contains("test")
-        || lower.contains("fix")
-        || lower.contains("refactor")
-        || lower.contains("next.js")
-        || lower.contains("react")
-        || lower.contains("typescript")
-        || lower.contains("web app")
-        || lower.contains("app router")
-        || lower.contains("single-page")
-        || lower.contains("game")
-        || raw.contains("アプリ")
-        || raw.contains("ゲーム")
-        || raw.contains("コード")
-        || raw.contains("実装")
-        || raw.contains("修正")
-        || raw.contains("テスト")
-        || raw.contains("ビルド")
-    {
-        TaskProfile::Coding
     } else {
         TaskProfile::Generic
     }
@@ -324,7 +334,8 @@ fn classifier_model<'a>(main_model: &'a str, sidecar_model: Option<&'a str>) -> 
 }
 
 fn parse_large_task_decision(raw: &str, request_hint: Option<&str>) -> Option<ClassifiedTask> {
-    let body = extract_json_object(raw.trim())?;
+    let normalized = strip_think_tags(raw);
+    let body = extract_json_object(normalized.trim())?;
     if let Ok(decision) = serde_json::from_str::<LargeTaskDecision>(body) {
         return Some(ClassifiedTask {
             large_task: decision.large_task,
@@ -372,6 +383,10 @@ fn parse_large_task_decision(raw: &str, request_hint: Option<&str>) -> Option<Cl
     }
 
     None
+}
+
+fn classifier_parse_error() -> String {
+    "classifier response was not JSON-only".to_string()
 }
 
 fn is_classifier_transport_error(error: &str) -> bool {
@@ -422,7 +437,7 @@ pub(crate) fn is_plan_execution_request(input: &str) -> bool {
         "やって",
         "この計画で進めて",
     ];
-    japanese.iter().any(|phrase| trimmed == *phrase)
+    japanese.contains(&trimmed)
 }
 
 pub(crate) fn is_plan_rejection_request(input: &str) -> bool {
@@ -832,10 +847,7 @@ impl Agent {
                     {
                         return Ok(classified);
                     }
-                    let error = format!(
-                        "failed to parse large-task classifier response: {}",
-                        reply.content.trim()
-                    );
+                    let error = classifier_parse_error();
                     log_llm_event(
                         "agent.classifier.error",
                         serde_json::json!({
@@ -915,7 +927,11 @@ impl Agent {
                 Ok(None)
             }
             Err(err) => {
-                tracing::warn!("auto-plan classifier failed: {err}");
+                if is_classifier_transport_error(&err) {
+                    tracing::warn!("auto-plan classifier failed: {err}");
+                } else {
+                    tracing::debug!("auto-plan classifier fallback: {err}");
+                }
                 let fallback = heuristic_classified_task(input);
                 log_llm_event(
                     "agent.classifier.fallback_used",
@@ -1623,6 +1639,28 @@ mod tests {
     }
 
     #[test]
+    fn parses_large_task_classifier_json_after_think_block() {
+        assert_eq!(
+            parse_large_task_decision(
+                "<think>classify the request first</think>\n{\"large_task\":true,\"task_profile\":\"coding\"}",
+                None,
+            ),
+            Some(ClassifiedTask {
+                large_task: true,
+                task_profile: TaskProfile::Coding,
+            })
+        );
+    }
+
+    #[test]
+    fn classifier_parse_error_does_not_echo_model_text() {
+        let error = classifier_parse_error();
+        assert!(!error.contains("<think>"));
+        assert!(!error.contains("analysis"));
+        assert_eq!(error, "classifier response was not JSON-only");
+    }
+
+    #[test]
     fn parses_large_task_classifier_fallback_shape() {
         assert_eq!(
             parse_large_task_decision(
@@ -1660,9 +1698,11 @@ mod tests {
     #[test]
     fn infers_coding_profile_for_nextjs_app_requests() {
         assert_eq!(
-            infer_task_profile_from_text(
-                "Next.js アプリとしてスペースインベーダーゲームを開発してください。"
-            ),
+            infer_task_profile_from_text("Next.js アプリとしてブラウザゲームを開発してください。"),
+            TaskProfile::Coding
+        );
+        assert_eq!(
+            infer_task_profile_from_text("Nuxt.js アプリとしてテトリスゲームを開発してください。"),
             TaskProfile::Coding
         );
     }
@@ -1674,7 +1714,7 @@ mod tests {
         ));
         assert!(is_classifier_transport_error("connection refused"));
         assert!(!is_classifier_transport_error(
-            "failed to parse large-task classifier response: nope"
+            "classifier response was not JSON-only"
         ));
     }
 
@@ -1746,8 +1786,8 @@ mod tests {
             "Current phase: Draft Goal, Constraints"
         );
         assert_eq!(
-            plan_stage_status_line(PlanStage::Stage3, &["Execution Plan"]),
-            "Current phase: Finalize Execution Plan"
+            plan_stage_status_line(PlanStage::Stage2, &["First Action", "Verification"]),
+            "Current phase: Define First Action, Verification"
         );
     }
 

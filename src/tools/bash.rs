@@ -182,7 +182,11 @@ fn launches_persistent_service(command: &str) -> bool {
 }
 
 fn normalize_background_command(command: &str) -> String {
-    if !requests_background_execution(command) && !launches_persistent_service(command) {
+    let requested_background = requests_background_execution(command);
+    if !requested_background && !launches_persistent_service(command) {
+        return command.to_string();
+    }
+    if !requested_background && has_shell_control_operator(command) {
         return command.to_string();
     }
 
@@ -247,7 +251,26 @@ fn split_shell_control_segments(command: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut start = 0usize;
     let mut i = 0usize;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
     while i < bytes.len() {
+        match bytes[i] {
+            b'\'' if !in_double_quote => {
+                in_single_quote = !in_single_quote;
+                i += 1;
+                continue;
+            }
+            b'"' if !in_single_quote && !is_escaped(bytes, i) => {
+                in_double_quote = !in_double_quote;
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+        if in_single_quote || in_double_quote {
+            i += 1;
+            continue;
+        }
         let op_len = match bytes[i] {
             b'&' if i + 1 < bytes.len() && bytes[i + 1] == b'&' => Some(2),
             b'|' if i + 1 < bytes.len() && bytes[i + 1] == b'|' => Some(2),
@@ -269,6 +292,22 @@ fn split_shell_control_segments(command: &str) -> Vec<&str> {
         parts.push(&command[start..]);
     }
     parts
+}
+
+fn has_shell_control_operator(command: &str) -> bool {
+    split_shell_control_segments(command)
+        .iter()
+        .any(|part| matches!(*part, "&&" | "||" | "|" | ";"))
+}
+
+fn is_escaped(bytes: &[u8], index: usize) -> bool {
+    let mut slash_count = 0usize;
+    let mut cursor = index;
+    while cursor > 0 && bytes[cursor - 1] == b'\\' {
+        slash_count += 1;
+        cursor -= 1;
+    }
+    slash_count % 2 == 1
 }
 
 fn normalize_scaffold_segment(segment: &str) -> String {
@@ -473,10 +512,10 @@ fn terminate_child(child: &mut Child) {
 #[cfg(test)]
 mod tests {
     use super::{
-        BashCommandClass, classify_command, command_uses_network, launches_persistent_service,
-        likely_long_running_command, normalize_background_command,
+        BashCommandClass, classify_command, command_uses_network, has_shell_control_operator,
+        launches_persistent_service, likely_long_running_command, normalize_background_command,
         normalize_noninteractive_scaffold_command, requests_background_execution, run,
-        strip_trailing_background_operator,
+        split_shell_control_segments, strip_trailing_background_operator,
     };
     use std::time::{Duration, Instant};
 
@@ -533,15 +572,25 @@ mod tests {
     #[test]
     fn normalizes_only_scaffold_segment_before_pipe() {
         let rewritten = normalize_noninteractive_scaffold_command(
-            "cd /tmp/app && npx create-next-app@latest space-invaders --typescript 2>&1 | tail -20",
+            "cd /tmp/app && npx create-next-app@latest sample-app --typescript 2>&1 | tail -20",
         );
         assert!(
-            rewritten.contains(
-                "create-next-app@latest space-invaders --typescript --yes --use-npm 2>&1"
-            )
+            rewritten
+                .contains("create-next-app@latest sample-app --typescript --yes --use-npm 2>&1")
         );
         assert!(rewritten.ends_with("| tail -20"), "got: {rewritten}");
         assert!(!rewritten.contains("tail -20 --yes"), "got: {rewritten}");
+    }
+
+    #[test]
+    fn shell_control_split_ignores_quoted_operators() {
+        assert_eq!(
+            split_shell_control_segments(r#"echo "alpha|beta"; npm run build"#),
+            vec![r#"echo "alpha|beta""#, ";", " npm run build"]
+        );
+        assert!(!has_shell_control_operator(
+            r#"npx create-next-app@latest "alpha|beta" --typescript"#
+        ));
     }
 
     #[test]
@@ -575,6 +624,12 @@ mod tests {
         assert!(rewritten.contains("background_pid="));
         assert!(rewritten.contains("background_log="));
         assert!(rewritten.contains("'npm run dev -- -p 3011'"));
+    }
+
+    #[test]
+    fn leaves_compound_foreground_dev_server_commands_attached() {
+        let original = r#"pkill -f "next dev"; npx next dev -p 3011"#;
+        assert_eq!(normalize_background_command(original), original);
     }
 
     #[test]

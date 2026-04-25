@@ -23,6 +23,7 @@ pub mod commands;
 mod footer;
 mod interrupt;
 mod lifecycle;
+mod quality;
 pub mod slash_commands;
 mod spinner;
 mod summary;
@@ -112,19 +113,19 @@ mod tests {
 
     #[test]
     fn detects_created_next_app_root_from_success_line() {
-        let output = "Success! Created space-invaders at /tmp/work/space-invaders";
+        let output = "Success! Created sample-app at /tmp/work/sample-app";
         assert_eq!(
             detect_created_project_root(output),
-            Some(PathBuf::from("/tmp/work/space-invaders"))
+            Some(PathBuf::from("/tmp/work/sample-app"))
         );
     }
 
     #[test]
     fn detects_created_next_app_root_from_create_line() {
-        let output = "Creating a new Next.js app in /tmp/work/space-invaders.";
+        let output = "Creating a new Next.js app in /tmp/work/sample-app.";
         assert_eq!(
             detect_created_project_root(output),
-            Some(PathBuf::from("/tmp/work/space-invaders"))
+            Some(PathBuf::from("/tmp/work/sample-app"))
         );
     }
 

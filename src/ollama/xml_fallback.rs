@@ -33,15 +33,15 @@ pub fn extract_tool_calls(text: &str, allowed_tools: &[String]) -> (Vec<ToolCall
             remaining.replace_range(body.start..body.end, "");
         }
 
-        if let Some(body) = extract_unterminated_trailing_block(&remaining, open_tag, close_tag) {
-            if let Some((name, arguments)) = parse_tool_call_object(&body.inner, allowed_tools) {
-                extracted.push(ToolCall {
-                    id: format!("xml-{}", extracted.len() + 1),
-                    name,
-                    arguments,
-                });
-                remaining.replace_range(body.start..body.end, "");
-            }
+        if let Some(body) = extract_unterminated_trailing_block(&remaining, open_tag, close_tag)
+            && let Some((name, arguments)) = parse_tool_call_object(&body.inner, allowed_tools)
+        {
+            extracted.push(ToolCall {
+                id: format!("xml-{}", extracted.len() + 1),
+                name,
+                arguments,
+            });
+            remaining.replace_range(body.start..body.end, "");
         }
     }
 

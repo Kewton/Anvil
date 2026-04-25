@@ -81,10 +81,10 @@ You are in read-only exploration mode. Use Read, Glob, and Grep to inspect the r
             next_sections.join(", ")
         };
         prompt.push_str(
-            "The full plan structure is: Goal, Constraints, Deliverables, Acceptance Criteria, Quality Bar, Execution Plan, Verification Plan, Risks/Fallbacks.\n\
-Quality Bar defines what makes the result genuinely good, not just minimally complete.\n\
-Execution Plan must define the first concrete slice, the order of work, the files or areas likely to change, and the checkpoint where the user should review progress.\n\
-Do not try to write the full plan in one large tool call.\n",
+            "The required plan structure is short: Goal, Constraints, First Action, Verification.\n\
+First Action must name the next concrete tool-level step and likely target file or scaffold action.\n\
+Verification must name the command or local check the runtime should attempt before final success.\n\
+Do not expand the plan into broad design sections unless the user explicitly asks for them.\n",
         );
         prompt.push_str(&format!(
             "Current plan stage: {}. Focus only on these sections now: {}.\n",
@@ -94,30 +94,27 @@ Do not try to write the full plan in one large tool call.\n",
         match stage {
             PlanStage::Stage1 => {
                 prompt.push_str(
-                    "Stage 1 goal: fill Goal, Constraints, and Deliverables only.\n\
+                    "Stage 1 goal: fill Goal and Constraints only.\n\
 Bootstrap the plan from the user's request first. Start with one small Write or Edit to the plan file before doing any exploration.\n\
 Only inspect directly relevant files if one specific detail is still missing after that first plan update. Prefer at most one Read/Glob step in Stage 1.\n\
-Do not start Acceptance Criteria, Quality Bar, or later sections yet.\n",
+Do not start First Action or Verification yet.\n",
                 );
             }
             PlanStage::Stage2 => {
                 prompt.push_str(
-                    "Stage 2 goal: fill Acceptance Criteria and Quality Bar only.\n\
-Avoid broad exploration. Use the existing plan and the directly relevant files already inspected. Make one small Write or Edit to the plan file.\n\
-Include at least one repo-specific observation or weakness from the files you already inspected. Name the concrete file, section, component, or current repo artifact that the quality bar should protect. Do not accept generic quality language that could apply to any repository.\n\
-Do not start Execution Plan, Verification Plan, or Risks/Fallbacks yet.\n",
+                    "Stage 2 goal: fill First Action and Verification only.\n\
+Avoid broad exploration. Use the existing plan and any directly relevant files already inspected. Make one small Write or Edit to the plan file.\n\
+Name one concrete next action, target path or scaffold command, and one verification command or explicit environment constraint.\n",
                 );
             }
             PlanStage::Stage3 => {
                 prompt.push_str(
-                    "Stage 3 goal: fill Execution Plan, Verification Plan, and Risks/Fallbacks.\n\
-Avoid broad exploration unless one specific missing detail truly requires it. Make one small Write or Edit to the plan file.\n\
-When these sections are complete, stop and wait for approval.\n",
+                    "The minimal plan should already be ready. Do not explore further. Make only a small corrective Write or Edit if the active plan still lacks a concrete First Action or Verification item.\n",
                 );
             }
             PlanStage::Ready => {
                 prompt.push_str(
-                    "The plan is ready for approval. Do not explore further. Make only minimal plan-file edits if needed, otherwise wait for yes, no, or feedback. If the Quality Bar does not mention a concrete repo artifact, file, or section, fix that before stopping.\n",
+                    "The plan is ready for approval. Do not explore further. Make only minimal plan-file edits if needed, otherwise wait for yes, no, or feedback.\n",
                 );
             }
         }
