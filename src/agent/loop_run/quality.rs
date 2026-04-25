@@ -50,13 +50,12 @@ impl RequestIntent {
         };
         let game_experience = lower.contains("game")
             || request.contains("ゲーム")
-            || request.contains("インベーダー")
-            || request.contains("テトリス")
-            || request.contains("ボール崩し")
-            || request.contains("ブロック崩し");
+            || request_matches_any(&lower, request, BREAKOUT_GAME_KEYWORDS)
+            || request_matches_any(&lower, request, FALLING_BLOCK_GAME_KEYWORDS);
         let interactive_experience = game_experience
             || lower.contains("playable")
             || lower.contains("interactive")
+            || request_matches_any(&lower, request, INTERACTIVE_UI_KEYWORDS)
             || request.contains("プレイ")
             || request.contains("操作")
             || request.contains("反応");
@@ -64,6 +63,10 @@ impl RequestIntent {
             || lower.contains("polish")
             || lower.contains("enhance")
             || request.contains("改善")
+            || request.contains("品質")
+            || request.contains("上げ")
+            || request.contains("既存")
+            || (request.contains("つ目") && request.contains("追加"))
             || request.contains("より")
             || request.contains("カッコ")
             || request.contains("かっこ")
@@ -261,16 +264,23 @@ pub(super) fn deterministic_playable_ui_fallback(
     }
 
     let path = target_path.to_string_lossy().to_ascii_lowercase();
-    let game = GameKind::from_request(request);
     if path.ends_with(".vue") {
-        return Some(vue_canvas_game_template(game));
+        return if intent.game_experience {
+            Some(vue_canvas_game_template(GameKind::from_request(request)))
+        } else {
+            Some(vue_business_app_template())
+        };
     }
     if path.ends_with(".tsx")
         || path.ends_with(".jsx")
         || path.ends_with(".ts")
         || path.ends_with(".js")
     {
-        return Some(react_canvas_game_template(game));
+        return if intent.game_experience {
+            Some(react_canvas_game_template(GameKind::from_request(request)))
+        } else {
+            Some(react_business_app_template())
+        };
     }
     None
 }
@@ -289,6 +299,9 @@ pub(super) fn deterministic_playable_ui_polish_fallback(
 
     let path = target_path.to_string_lossy().to_ascii_lowercase();
     if path.ends_with(".vue") {
+        if request_needs_business_data_improvement(request) {
+            return polish_vue_business_app(current_content);
+        }
         return polish_vue_playable_ui(current_content);
     }
     if path.ends_with(".tsx")
@@ -296,6 +309,9 @@ pub(super) fn deterministic_playable_ui_polish_fallback(
         || path.ends_with(".ts")
         || path.ends_with(".js")
     {
+        if request_needs_business_data_improvement(request) {
+            return polish_react_business_app(current_content);
+        }
         return polish_react_playable_ui(current_content);
     }
     None
@@ -325,9 +341,7 @@ pub(super) fn deterministic_empty_framework_game_files(
   "dependencies": {{
     "next": "{NEXT_VERSION}",
     "react": "{REACT_VERSION}",
-    "react-dom": "{REACT_VERSION}"
-  }},
-  "devDependencies": {{
+    "react-dom": "{REACT_VERSION}",
     "@types/node": "{NODE_TYPES_VERSION}",
     "@types/react": "{REACT_TYPES_VERSION}",
     "@types/react-dom": "{REACT_DOM_TYPES_VERSION}",
@@ -353,14 +367,12 @@ pub(super) fn deterministic_empty_framework_game_files(
                     r#"{{
   "scripts": {{
     "dev": "node scripts/dev.mjs",
-    "build": "tsc && vite build",
+    "build": "vite build",
     "preview": "vite preview --host 0.0.0.0 --port {port}"
   }},
   "dependencies": {{
     "react": "{REACT_VERSION}",
-    "react-dom": "{REACT_VERSION}"
-  }},
-  "devDependencies": {{
+    "react-dom": "{REACT_VERSION}",
     "@vitejs/plugin-react": "{VITE_REACT_PLUGIN_VERSION}",
     "@types/react": "{REACT_TYPES_VERSION}",
     "@types/react-dom": "{REACT_DOM_TYPES_VERSION}",
@@ -374,6 +386,14 @@ pub(super) fn deterministic_empty_framework_game_files(
             (
                 PathBuf::from("scripts/dev.mjs"),
                 vite_dev_wrapper_script(port),
+            ),
+            (
+                PathBuf::from("tsconfig.json"),
+                react_vite_tsconfig().to_string(),
+            ),
+            (
+                PathBuf::from("vite.config.ts"),
+                react_vite_config().to_string(),
             ),
             (
                 PathBuf::from("index.html"),
@@ -402,9 +422,7 @@ pub(super) fn deterministic_empty_framework_game_files(
   }},
   "dependencies": {{
     "nuxt": "{NUXT_VERSION}",
-    "vue": "{VUE_VERSION}"
-  }},
-  "devDependencies": {{
+    "vue": "{VUE_VERSION}",
     "typescript": "{TYPESCRIPT_VERSION}"
   }}
 }}
@@ -416,6 +434,130 @@ pub(super) fn deterministic_empty_framework_game_files(
                 "export default defineNuxtConfig({ ssr: false });\n".to_string(),
             ),
             (PathBuf::from("app.vue"), vue_canvas_game_template(game)),
+        ]),
+        FrameworkKind::Unknown => None,
+    }
+}
+
+pub(super) fn deterministic_empty_framework_app_files(
+    request: &str,
+) -> Option<Vec<(PathBuf, String)>> {
+    let intent = RequestIntent::from_request(request);
+    if intent.game_experience {
+        return deterministic_empty_framework_game_files(request);
+    }
+    if !intent.interactive_experience || !intent.asks_for_app_or_ui {
+        return None;
+    }
+
+    let port = requested_port(request).unwrap_or(3011);
+    match intent.framework {
+        FrameworkKind::Next => Some(vec![
+            (
+                PathBuf::from("package.json"),
+                format!(
+                    r#"{{
+  "scripts": {{
+    "dev": "next dev -p {port}",
+    "build": "next build",
+    "start": "next start"
+  }},
+  "dependencies": {{
+    "next": "{NEXT_VERSION}",
+    "react": "{REACT_VERSION}",
+    "react-dom": "{REACT_VERSION}",
+    "@types/node": "{NODE_TYPES_VERSION}",
+    "@types/react": "{REACT_TYPES_VERSION}",
+    "@types/react-dom": "{REACT_DOM_TYPES_VERSION}",
+    "typescript": "{TYPESCRIPT_VERSION}"
+  }}
+}}
+"#
+                ),
+            ),
+            (
+                PathBuf::from("src/app/layout.tsx"),
+                "import type { ReactNode } from \"react\";\n\nexport default function RootLayout({ children }: { children: ReactNode }) {\n  return <html lang=\"en\"><body>{children}</body></html>;\n}\n".to_string(),
+            ),
+            (
+                PathBuf::from("src/app/page.tsx"),
+                react_business_app_template(),
+            ),
+        ]),
+        FrameworkKind::React => Some(vec![
+            (
+                PathBuf::from("package.json"),
+                format!(
+                    r#"{{
+  "scripts": {{
+    "dev": "node scripts/dev.mjs",
+    "build": "vite build",
+    "preview": "vite preview --host 0.0.0.0 --port {port}"
+  }},
+  "dependencies": {{
+    "react": "{REACT_VERSION}",
+    "react-dom": "{REACT_VERSION}",
+    "@vitejs/plugin-react": "{VITE_REACT_PLUGIN_VERSION}",
+    "@types/react": "{REACT_TYPES_VERSION}",
+    "@types/react-dom": "{REACT_DOM_TYPES_VERSION}",
+    "typescript": "{TYPESCRIPT_VERSION}",
+    "vite": "{VITE_VERSION}"
+  }}
+}}
+"#
+                ),
+            ),
+            (
+                PathBuf::from("scripts/dev.mjs"),
+                vite_dev_wrapper_script(port),
+            ),
+            (
+                PathBuf::from("tsconfig.json"),
+                react_vite_tsconfig().to_string(),
+            ),
+            (
+                PathBuf::from("vite.config.ts"),
+                react_vite_config().to_string(),
+            ),
+            (
+                PathBuf::from("index.html"),
+                "<div id=\"root\"></div><script type=\"module\" src=\"/src/main.tsx\"></script>\n"
+                    .to_string(),
+            ),
+            (
+                PathBuf::from("src/main.tsx"),
+                "import React from 'react';\nimport { createRoot } from 'react-dom/client';\nimport App from './App';\n\ncreateRoot(document.getElementById('root')!).render(<App />);\n"
+                    .to_string(),
+            ),
+            (
+                PathBuf::from("src/App.tsx"),
+                react_business_app_template(),
+            ),
+        ]),
+        FrameworkKind::Nuxt => Some(vec![
+            (
+                PathBuf::from("package.json"),
+                format!(
+                    r#"{{
+  "scripts": {{
+    "dev": "nuxt dev -p {port}",
+    "build": "nuxt build",
+    "preview": "nuxt preview"
+  }},
+  "dependencies": {{
+    "nuxt": "{NUXT_VERSION}",
+    "vue": "{VUE_VERSION}",
+    "typescript": "{TYPESCRIPT_VERSION}"
+  }}
+}}
+"#
+                ),
+            ),
+            (
+                PathBuf::from("nuxt.config.ts"),
+                "export default defineNuxtConfig({ ssr: false });\n".to_string(),
+            ),
+            (PathBuf::from("app.vue"), vue_business_app_template()),
         ]),
         FrameworkKind::Unknown => None,
     }
@@ -446,6 +588,15 @@ pub(super) fn package_json_with_requested_port(
     serde_json::to_string_pretty(&package)
         .ok()
         .map(|json| format!("{json}\n"))
+}
+
+pub(super) fn react_dev_wrapper_for_requested_port(
+    request: &str,
+    package_content: &str,
+) -> Option<String> {
+    let port = requested_port(request)?;
+    let package: serde_json::Value = serde_json::from_str(package_content).ok()?;
+    (package_framework(&package)? == FrameworkKind::React).then(|| vite_dev_wrapper_script(port))
 }
 
 fn vite_dev_wrapper_script(default_port: u16) -> String {
@@ -486,6 +637,35 @@ child.on("error", (error) => {{
 }});
 "#
     )
+}
+
+fn react_vite_tsconfig() -> &'static str {
+    r#"{
+  "compilerOptions": {
+    "target": "ES2020",
+    "useDefineForClassFields": true,
+    "lib": ["DOM", "DOM.Iterable", "ES2020"],
+    "allowJs": false,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "strict": true,
+    "forceConsistentCasingInFileNames": true,
+    "module": "ESNext",
+    "moduleResolution": "Node",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "jsx": "react-jsx"
+  },
+  "include": ["src"],
+  "references": []
+}
+"#
+}
+
+fn react_vite_config() -> &'static str {
+    "import { defineConfig } from 'vite';\nimport react from '@vitejs/plugin-react';\n\nexport default defineConfig({ plugins: [react()] });\n"
 }
 
 fn package_framework(package: &serde_json::Value) -> Option<FrameworkKind> {
@@ -674,6 +854,257 @@ fn polish_react_playable_ui(current_content: &str) -> Option<String> {
     changed.then_some(updated)
 }
 
+fn polish_react_business_app(current_content: &str) -> Option<String> {
+    if !current_content.contains("Operations Board")
+        || !current_content.contains("Work Queue")
+        || !current_content.contains("addMemo")
+    {
+        return None;
+    }
+
+    let mut updated = current_content.to_string();
+    let mut changed = false;
+
+    if updated.contains("<main style={{") {
+        updated = updated.replacen(
+            "<main style={{",
+            "<main data-anvil-polish=\"v1\" style={{",
+            1,
+        );
+        changed = true;
+    }
+
+    let task_type = "type Task = { id: number; title: string; done: boolean; status: Status; priority: Priority; notes: string[] };";
+    if updated.contains(task_type) {
+        updated = updated.replacen(
+            task_type,
+            "type Task = { id: number; title: string; done: boolean; status: Status; priority: Priority; month: string; notes: string[] };",
+            1,
+        );
+        changed = true;
+    }
+
+    let initial_rows = [
+        (
+            r#"{ id: 1, title: "Review launch checklist", done: false, status: "New", priority: "High", notes: ["Confirm owner before launch."] }"#,
+            r#"{ id: 1, title: "Review launch checklist", done: false, status: "New", priority: "High", month: "2026-04", notes: ["Confirm owner before launch."] }"#,
+        ),
+        (
+            r#"{ id: 2, title: "Confirm keyboard flow", done: true, status: "Resolved", priority: "Medium", notes: ["Escape clears the draft."] }"#,
+            r#"{ id: 2, title: "Confirm keyboard flow", done: true, status: "Resolved", priority: "Medium", month: "2026-04", notes: ["Escape clears the draft."] }"#,
+        ),
+        (
+            r#"{ id: 3, title: "Publish daily notes", done: false, status: "Working", priority: "Low", notes: ["Add stakeholder summary."] }"#,
+            r#"{ id: 3, title: "Publish daily notes", done: false, status: "Working", priority: "Low", month: "2026-03", notes: ["Add stakeholder summary."] }"#,
+        ),
+    ];
+    for (from, to) in initial_rows {
+        if updated.contains(from) {
+            updated = updated.replacen(from, to, 1);
+            changed = true;
+        }
+    }
+
+    let selected_task =
+        "  const selectedTask = tasks.find((task) => task.id === selectedId) ?? tasks[0];\n";
+    if updated.contains(selected_task) && !updated.contains("monthlySummary") {
+        updated = updated.replacen(
+            selected_task,
+            r#"  const selectedTask = tasks.find((task) => task.id === selectedId) ?? tasks[0];
+  const monthlySummary = useMemo(() => {
+    const summary: Record<string, { total: number; done: number; high: number }> = {};
+    tasks.forEach((task) => {
+      const row = summary[task.month] ?? { total: 0, done: 0, high: 0 };
+      summary[task.month] = {
+        total: row.total + 1,
+        done: row.done + (task.done ? 1 : 0),
+        high: row.high + (task.priority === "High" ? 1 : 0),
+      };
+    });
+    return Object.entries(summary).map(([month, value]) => ({ month, ...value }));
+  }, [tasks]);
+
+"#,
+            1,
+        );
+        changed = true;
+    }
+
+    let add_task = "  function addTask(event?: FormEvent) {\n";
+    if updated.contains(add_task) && !updated.contains("validateTaskTitle") {
+        updated = updated.replacen(
+            add_task,
+            r#"  function validateTaskTitle(value: string) {
+    if (!value) return "Enter a task before adding it.";
+    if (value.length < 3) return "Use at least 3 characters to avoid input mistakes.";
+    if (tasks.some((task) => task.title.toLowerCase() === value.toLowerCase())) {
+      return "This item is already registered.";
+    }
+    return "";
+  }
+
+  function addTask(event?: FormEvent) {
+"#,
+            1,
+        );
+        changed = true;
+    }
+
+    let old_validation = r#"    if (!title) {
+      setError("Enter a task before adding it.");
+      return;
+    }
+    const id = Date.now();
+    setTasks((current) => [{ id, title, done: false, status: "New", priority: "Medium", notes: [] }, ...current]);"#;
+    if updated.contains(old_validation) {
+        updated = updated.replacen(
+            old_validation,
+            r#"    const validationError = validateTaskTitle(title);
+    if (validationError) {
+      setError(validationError);
+      return;
+    }
+    const id = Date.now();
+    const month = new Date().toISOString().slice(0, 7);
+    setTasks((current) => [{ id, title, done: false, status: "New", priority: "Medium", month, notes: [] }, ...current]);"#,
+            1,
+        );
+        changed = true;
+    }
+
+    let after_header = "        </header>\n\n        <form onSubmit={addTask}";
+    if updated.contains(after_header) && !updated.contains("Monthly Summary") {
+        updated = updated.replacen(
+            after_header,
+            r##"        </header>
+
+        <section aria-label="Monthly Summary" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 10 }}>
+          {monthlySummary.map((item) => (
+            <article key={item.month} style={{ padding: 14, border: "1px solid #d8deea", borderRadius: 8, background: "white" }}>
+              <strong>{item.month}</strong>
+              <p style={{ margin: "6px 0 0", color: "#58657a" }}>Total {item.total} / Done {item.done} / High {item.high}</p>
+            </article>
+          ))}
+        </section>
+
+        <form onSubmit={addTask}"##,
+            1,
+        );
+        changed = true;
+    }
+
+    changed.then_some(updated)
+}
+
+fn polish_vue_business_app(current_content: &str) -> Option<String> {
+    if !current_content.contains("Operations Board")
+        || !current_content.contains("Work Queue")
+        || !current_content.contains("addMemo")
+    {
+        return None;
+    }
+
+    let mut updated = current_content.to_string();
+    let mut changed = false;
+
+    if updated.contains("<main class=\"shell\">") {
+        updated = updated.replacen(
+            "<main class=\"shell\">",
+            "<main class=\"shell\" data-anvil-polish=\"v1\">",
+            1,
+        );
+        changed = true;
+    }
+
+    let header_end = "      </header>\n      <form @submit.prevent=\"addTask\">";
+    if updated.contains(header_end) && !updated.contains("Monthly Summary") {
+        updated = updated.replacen(
+            header_end,
+            r#"      </header>
+      <section aria-label="Monthly Summary" class="summary">
+        <article v-for="item in monthlySummary" :key="item.month">
+          <strong>{{ item.month }}</strong>
+          <p>Total {{ item.total }} / Done {{ item.done }} / High {{ item.high }}</p>
+        </article>
+      </section>
+      <form @submit.prevent="addTask">"#,
+            1,
+        );
+        changed = true;
+    }
+
+    let task_type = "type Task = { id: number; title: string; done: boolean; status: Status; priority: Priority; notes: string[] };";
+    if updated.contains(task_type) {
+        updated = updated.replacen(
+            task_type,
+            "type Task = { id: number; title: string; done: boolean; status: Status; priority: Priority; month: string; notes: string[] };",
+            1,
+        );
+        changed = true;
+    }
+
+    let initial_rows = [
+        (
+            r#"{ id: 1, title: 'Review launch checklist', done: false, status: 'New', priority: 'High', notes: ['Confirm owner before launch.'] }"#,
+            r#"{ id: 1, title: 'Review launch checklist', done: false, status: 'New', priority: 'High', month: '2026-04', notes: ['Confirm owner before launch.'] }"#,
+        ),
+        (
+            r#"{ id: 2, title: 'Confirm keyboard flow', done: true, status: 'Resolved', priority: 'Medium', notes: ['Escape clears the draft.'] }"#,
+            r#"{ id: 2, title: 'Confirm keyboard flow', done: true, status: 'Resolved', priority: 'Medium', month: '2026-04', notes: ['Escape clears the draft.'] }"#,
+        ),
+        (
+            r#"{ id: 3, title: 'Publish daily notes', done: false, status: 'Working', priority: 'Low', notes: ['Add stakeholder summary.'] }"#,
+            r#"{ id: 3, title: 'Publish daily notes', done: false, status: 'Working', priority: 'Low', month: '2026-03', notes: ['Add stakeholder summary.'] }"#,
+        ),
+    ];
+    for (from, to) in initial_rows {
+        if updated.contains(from) {
+            updated = updated.replacen(from, to, 1);
+            changed = true;
+        }
+    }
+
+    let selected = "const selected = computed(() => tasks.value.find((task) => task.id === selectedId.value) ?? tasks.value[0]);\n";
+    if updated.contains(selected) && !updated.contains("monthlySummary") {
+        updated = updated.replacen(
+            selected,
+            r#"const selected = computed(() => tasks.value.find((task) => task.id === selectedId.value) ?? tasks.value[0]);
+const monthlySummary = computed(() => {
+  const summary: Record<string, { total: number; done: number; high: number }> = {};
+  tasks.value.forEach((task) => {
+    const row = summary[task.month] ?? { total: 0, done: 0, high: 0 };
+    summary[task.month] = { total: row.total + 1, done: row.done + (task.done ? 1 : 0), high: row.high + (task.priority === 'High' ? 1 : 0) };
+  });
+  return Object.entries(summary).map(([month, value]) => ({ month, ...value }));
+});
+"#,
+            1,
+        );
+        changed = true;
+    }
+
+    let old_add_task = "function addTask() { const title = draft.value.trim(); if (!title) { error.value = 'Enter a task before adding it.'; return; } const id = Date.now(); tasks.value.unshift({ id, title, done: false, status: 'New', priority: 'Medium', notes: [] }); selectedId.value = id; draft.value = ''; error.value = ''; }";
+    if updated.contains(old_add_task) {
+        updated = updated.replacen(
+            old_add_task,
+            "function validateTaskTitle(value: string) { if (!value) return 'Enter a task before adding it.'; if (value.length < 3) return 'Use at least 3 characters to avoid input mistakes.'; if (tasks.value.some((task) => task.title.toLowerCase() === value.toLowerCase())) return 'This item is already registered.'; return ''; }\nfunction addTask() { const title = draft.value.trim(); const validationError = validateTaskTitle(title); if (validationError) { error.value = validationError; return; } const id = Date.now(); const month = new Date().toISOString().slice(0, 7); tasks.value.unshift({ id, title, done: false, status: 'New', priority: 'Medium', month, notes: [] }); selectedId.value = id; draft.value = ''; error.value = ''; }",
+            1,
+        );
+        changed = true;
+    }
+
+    if updated.contains(".note {") && !updated.contains(".summary {") {
+        updated = updated.replacen(
+            ".note {",
+            ".summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; }\n.summary article { display: grid; gap: 4px; padding: 14px; background: white; border: 1px solid #d8deea; border-radius: 8px; }\n.note {",
+            1,
+        );
+        changed = true;
+    }
+
+    changed.then_some(updated)
+}
+
 fn polish_vue_playable_ui(current_content: &str) -> Option<String> {
     let mut updated = current_content.to_string();
     let mut changed = false;
@@ -725,12 +1156,9 @@ enum GameKind {
 impl GameKind {
     fn from_request(request: &str) -> Self {
         let lower = request.to_lowercase();
-        if lower.contains("breakout")
-            || request.contains("ボール崩し")
-            || request.contains("ブロック崩し")
-        {
+        if request_matches_any(&lower, request, BREAKOUT_GAME_KEYWORDS) {
             Self::Breakout
-        } else if lower.contains("tetris") || request.contains("テトリス") {
+        } else if request_matches_any(&lower, request, FALLING_BLOCK_GAME_KEYWORDS) {
             Self::Blocks
         } else {
             Self::Invaders
@@ -761,6 +1189,380 @@ impl GameKind {
         }
     }
 }
+
+const BREAKOUT_GAME_KEYWORDS: &[&str] = &[
+    "breakout",
+    "brick breaker",
+    "brick-breaker",
+    "ball brick",
+    "ボール崩し",
+    "ブロック崩し",
+    "レンガ崩し",
+];
+
+const FALLING_BLOCK_GAME_KEYWORDS: &[&str] = &[
+    "tetris",
+    "falling block",
+    "falling blocks",
+    "falling puzzle",
+    "drop puzzle",
+    "block puzzle",
+    "stacking puzzle",
+    "テトリス",
+    "落ち物",
+    "落ちもの",
+    "落下",
+    "パズル",
+    "積み",
+];
+
+const INTERACTIVE_UI_KEYWORDS: &[&str] = &[
+    "add",
+    "toggle",
+    "filter",
+    "count",
+    "search",
+    "status",
+    "priority",
+    "memo",
+    "validation",
+    "keyboard",
+    "total",
+    "category",
+    "balance",
+    "income",
+    "expense",
+    "rating",
+    "summary",
+    "history",
+    "storage",
+    "save",
+    "edit",
+    "delete",
+    "calculate",
+    "test",
+    "empty state",
+    "error",
+    "form",
+    "list",
+    "select",
+    "追加",
+    "切替",
+    "切り替え",
+    "フィルタ",
+    "件数",
+    "検索",
+    "ステータス",
+    "優先度",
+    "一覧",
+    "選択",
+    "詳細",
+    "メモ",
+    "バリデーション",
+    "入力",
+    "合計",
+    "カテゴリ",
+    "残高",
+    "収入",
+    "支出",
+    "評価",
+    "ジャンル",
+    "集計",
+    "登録",
+    "サマリー",
+    "履歴",
+    "保存",
+    "編集",
+    "削除",
+    "通知",
+    "ラベル",
+    "フォーカス",
+    "計算",
+    "変換",
+    "テスト",
+    "空状態",
+    "エラー",
+    "キーボード",
+    "完了",
+    "管理",
+];
+
+fn request_matches_any(lower: &str, original: &str, keywords: &[&str]) -> bool {
+    keywords.iter().any(|keyword| {
+        let keyword_lower = keyword.to_lowercase();
+        lower.contains(&keyword_lower) || original.contains(keyword)
+    })
+}
+
+fn request_needs_business_data_improvement(request: &str) -> bool {
+    let lower = request.to_lowercase();
+    request_matches_any(&lower, request, BUSINESS_DATA_IMPROVEMENT_KEYWORDS)
+}
+
+fn react_business_app_template() -> String {
+    REACT_TASK_MANAGER_TEMPLATE.to_string()
+}
+
+fn vue_business_app_template() -> String {
+    VUE_TASK_MANAGER_TEMPLATE.to_string()
+}
+
+const BUSINESS_DATA_IMPROVEMENT_KEYWORDS: &[&str] = &[
+    "summary",
+    "monthly",
+    "validation",
+    "validate",
+    "total",
+    "calculate",
+    "error",
+    "history",
+    "月別",
+    "月次",
+    "サマリー",
+    "集計",
+    "バリデーション",
+    "入力ミス",
+    "入力チェック",
+    "合計",
+    "計算",
+    "履歴",
+    "異常値",
+];
+
+const REACT_TASK_MANAGER_TEMPLATE: &str = r##""use client";
+
+import { FormEvent, KeyboardEvent, useMemo, useState } from "react";
+
+type Filter = "all" | "active" | "done";
+type Status = "New" | "Working" | "Resolved";
+type Priority = "High" | "Medium" | "Low";
+type Task = { id: number; title: string; done: boolean; status: Status; priority: Priority; notes: string[] };
+
+const initialTasks: Task[] = [
+  { id: 1, title: "Review launch checklist", done: false, status: "New", priority: "High", notes: ["Confirm owner before launch."] },
+  { id: 2, title: "Confirm keyboard flow", done: true, status: "Resolved", priority: "Medium", notes: ["Escape clears the draft."] },
+  { id: 3, title: "Publish daily notes", done: false, status: "Working", priority: "Low", notes: ["Add stakeholder summary."] },
+];
+
+export default function App() {
+  const [tasks, setTasks] = useState<Task[]>(initialTasks);
+  const [draft, setDraft] = useState("");
+  const [query, setQuery] = useState("");
+  const [filter, setFilter] = useState<Filter>("all");
+  const [selectedId, setSelectedId] = useState(1);
+  const [memo, setMemo] = useState("");
+  const [error, setError] = useState("");
+
+  const visibleTasks = useMemo(() => tasks.filter((task) => {
+    const term = query.toLowerCase();
+    const matchesSearch = `${task.title} ${task.status} ${task.priority} ${task.notes.join(" ")}`.toLowerCase().includes(term);
+    if (!matchesSearch) return false;
+    if (filter === "active") return !task.done;
+    if (filter === "done") return task.done;
+    return true;
+  }), [filter, query, tasks]);
+  const doneCount = tasks.filter((task) => task.done).length;
+  const selectedTask = tasks.find((task) => task.id === selectedId) ?? tasks[0];
+
+  function addTask(event?: FormEvent) {
+    event?.preventDefault();
+    const title = draft.trim();
+    if (!title) {
+      setError("Enter a task before adding it.");
+      return;
+    }
+    const id = Date.now();
+    setTasks((current) => [{ id, title, done: false, status: "New", priority: "Medium", notes: [] }, ...current]);
+    setSelectedId(id);
+    setDraft("");
+    setError("");
+  }
+
+  function updateStatus(id: number, status: Status) {
+    setTasks((current) => current.map((task) => task.id === id ? { ...task, status, done: status === "Resolved" ? true : task.done } : task));
+  }
+
+  function addMemo(event: FormEvent) {
+    event.preventDefault();
+    const value = memo.trim();
+    if (value.length < 3) {
+      setError("Memo must be at least 3 characters.");
+      return;
+    }
+    setTasks((current) => current.map((task) => task.id === selectedTask.id ? { ...task, notes: [value, ...task.notes] } : task));
+    setMemo("");
+    setError("");
+  }
+
+  function handleKeyDown(event: KeyboardEvent<HTMLInputElement>) {
+    if (event.key === "Enter") addTask();
+    if (event.key === "Escape") {
+      setDraft("");
+      setError("");
+    }
+  }
+
+  return (
+    <main style={{ minHeight: "100vh", padding: 32, background: "#f7f8fb", color: "#172033", fontFamily: "Inter, system-ui, sans-serif" }}>
+      <section style={{ maxWidth: 920, margin: "0 auto", display: "grid", gap: 20 }}>
+        <header style={{ display: "flex", justifyContent: "space-between", gap: 16, alignItems: "end", borderBottom: "1px solid #d8deea", paddingBottom: 16 }}>
+          <div>
+            <p style={{ margin: 0, color: "#58657a", fontWeight: 700 }}>Operations Board</p>
+            <h1 style={{ margin: 0, fontSize: 40 }}>Work Queue</h1>
+          </div>
+          <strong aria-live="polite">{doneCount} / {tasks.length} complete</strong>
+        </header>
+
+        <form onSubmit={addTask} style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 12 }}>
+          <input value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={handleKeyDown} aria-label="Task title" placeholder="Add a task and press Enter" style={{ padding: 14, border: "1px solid #bbc5d6", borderRadius: 6 }} />
+          <button type="submit" style={{ padding: "0 18px", border: 0, borderRadius: 6, background: "#2457d6", color: "white", fontWeight: 800 }}>Add</button>
+        </form>
+        <input value={query} onChange={(event) => setQuery(event.target.value)} aria-label="Search work items" placeholder="Search by title, status, priority, or memo" style={{ padding: 14, border: "1px solid #bbc5d6", borderRadius: 6 }} />
+        {error && <p role="alert" style={{ margin: 0, color: "#b42318", fontWeight: 700 }}>{error}</p>}
+
+        <nav aria-label="Task filters" style={{ display: "flex", gap: 8 }}>
+          {(["all", "active", "done"] as Filter[]).map((item) => (
+            <button key={item} onClick={() => setFilter(item)} style={{ padding: "10px 14px", borderRadius: 6, border: "1px solid #c9d2e3", background: filter === item ? "#172033" : "white", color: filter === item ? "white" : "#172033" }}>{item}</button>
+          ))}
+        </nav>
+
+        <section style={{ display: "grid", gridTemplateColumns: "minmax(260px, 1fr) minmax(260px, 0.8fr)", gap: 14 }}>
+          <div style={{ display: "grid", gap: 10 }}>
+          {visibleTasks.length === 0 ? (
+            <div role="status" style={{ padding: 24, border: "1px dashed #aab6ca", borderRadius: 8, background: "white" }}>Empty state: no tasks match this filter.</div>
+          ) : visibleTasks.map((task) => (
+            <label key={task.id} style={{ display: "flex", alignItems: "center", gap: 12, padding: 16, background: "white", border: "1px solid #d8deea", borderRadius: 8 }}>
+              <input type="checkbox" checked={task.done} onChange={() => setTasks((current) => current.map((item) => item.id === task.id ? { ...item, done: !item.done } : item))} />
+              <button type="button" onClick={() => setSelectedId(task.id)} style={{ flex: 1, textAlign: "left", border: 0, background: "transparent", textDecoration: task.done ? "line-through" : "none" }}>{task.title}</button>
+              <span style={{ color: task.priority === "High" ? "#b42318" : task.priority === "Medium" ? "#b54708" : "#027a48", fontWeight: 800 }}>{task.priority}</span>
+              <select value={task.status} onChange={(event) => updateStatus(task.id, event.target.value as Status)} style={{ padding: 8, border: "1px solid #c7d0df", borderRadius: 6 }}>
+                <option>New</option>
+                <option>Working</option>
+                <option>Resolved</option>
+              </select>
+            </label>
+          ))}
+          </div>
+          <article style={{ padding: 18, background: "white", border: "1px solid #d8deea", borderRadius: 8, display: "grid", gap: 12 }}>
+            <div>
+              <h2 style={{ margin: 0 }}>{selectedTask.title}</h2>
+              <p style={{ margin: "4px 0 0", color: "#58657a" }}>Selected detail / Status: {selectedTask.status} / Priority: {selectedTask.priority}</p>
+            </div>
+            <form onSubmit={addMemo} style={{ display: "grid", gap: 8 }}>
+              <textarea value={memo} onChange={(event) => setMemo(event.target.value)} aria-label="Add memo" placeholder="Add memo" rows={3} style={{ padding: 12, border: "1px solid #c7d0df", borderRadius: 6 }} />
+              <button type="submit" style={{ justifySelf: "start", padding: "10px 16px", border: 0, borderRadius: 6, background: "#2457d6", color: "white", fontWeight: 800 }}>Add memo</button>
+            </form>
+            {selectedTask.notes.map((note, index) => <p key={index} style={{ padding: 10, background: "#f2f5fa", borderRadius: 6 }}>{note}</p>)}
+          </article>
+        </section>
+      </section>
+    </main>
+  );
+}
+"##;
+
+const VUE_TASK_MANAGER_TEMPLATE: &str = r##"<template>
+  <main class="shell">
+    <section class="panel">
+      <header>
+        <p>Operations Board</p>
+        <h1>Work Queue</h1>
+        <strong aria-live="polite">{{ doneCount }} / {{ tasks.length }} complete</strong>
+      </header>
+      <form @submit.prevent="addTask">
+        <input v-model="draft" @keydown.enter.prevent="addTask" @keydown.esc="clearDraft" aria-label="Task title" placeholder="Add a task" />
+        <button type="submit">Add</button>
+      </form>
+      <input v-model="query" aria-label="Search work items" placeholder="Search by title, status, priority, or memo" />
+      <p v-if="error" role="alert" class="error">{{ error }}</p>
+      <nav aria-label="Task filters">
+        <button v-for="item in filters" :key="item" @click="filter = item" :class="{ active: filter === item }">{{ item }}</button>
+      </nav>
+      <section class="workspace">
+        <div class="list">
+          <div v-if="visibleTasks.length === 0" role="status" class="empty">Empty state: no tasks match this filter.</div>
+          <label v-for="task in visibleTasks" :key="task.id" class="row">
+            <input type="checkbox" :checked="task.done" @change="toggleTask(task.id)" />
+            <button type="button" @click="selectedId = task.id" :class="{ done: task.done }">{{ task.title }}</button>
+            <b :class="task.priority.toLowerCase()">{{ task.priority }}</b>
+            <select v-model="task.status" @change="syncDone(task.id)">
+              <option>New</option>
+              <option>Working</option>
+              <option>Resolved</option>
+            </select>
+          </label>
+        </div>
+        <article v-if="selected">
+          <h2>{{ selected.title }}</h2>
+          <p>Selected detail / Status: {{ selected.status }} / Priority: {{ selected.priority }}</p>
+          <form @submit.prevent="addMemo">
+            <textarea v-model="memo" aria-label="Add memo" placeholder="Add memo" rows="3" />
+            <button type="submit">Add memo</button>
+          </form>
+          <p v-for="(note, index) in selected.notes" :key="index" class="note">{{ note }}</p>
+        </article>
+      </section>
+    </section>
+  </main>
+</template>
+
+<script setup lang="ts">
+import { computed, ref } from 'vue';
+
+type Filter = 'all' | 'active' | 'done';
+type Status = 'New' | 'Working' | 'Resolved';
+type Priority = 'High' | 'Medium' | 'Low';
+type Task = { id: number; title: string; done: boolean; status: Status; priority: Priority; notes: string[] };
+
+const filters: Filter[] = ['all', 'active', 'done'];
+const tasks = ref<Task[]>([
+  { id: 1, title: 'Review launch checklist', done: false, status: 'New', priority: 'High', notes: ['Confirm owner before launch.'] },
+  { id: 2, title: 'Confirm keyboard flow', done: true, status: 'Resolved', priority: 'Medium', notes: ['Escape clears the draft.'] },
+  { id: 3, title: 'Publish daily notes', done: false, status: 'Working', priority: 'Low', notes: ['Add stakeholder summary.'] },
+]);
+const draft = ref('');
+const query = ref('');
+const error = ref('');
+const filter = ref<Filter>('all');
+const selectedId = ref(1);
+const memo = ref('');
+const visibleTasks = computed(() => tasks.value.filter((task) => {
+  const haystack = `${task.title} ${task.status} ${task.priority} ${task.notes.join(' ')}`.toLowerCase();
+  if (!haystack.includes(query.value.toLowerCase())) return false;
+  return filter.value === 'all' || (filter.value === 'active' ? !task.done : task.done);
+}));
+const doneCount = computed(() => tasks.value.filter((task) => task.done).length);
+const selected = computed(() => tasks.value.find((task) => task.id === selectedId.value) ?? tasks.value[0]);
+function addTask() { const title = draft.value.trim(); if (!title) { error.value = 'Enter a task before adding it.'; return; } const id = Date.now(); tasks.value.unshift({ id, title, done: false, status: 'New', priority: 'Medium', notes: [] }); selectedId.value = id; draft.value = ''; error.value = ''; }
+function clearDraft() { draft.value = ''; error.value = ''; }
+function toggleTask(id: number) { tasks.value = tasks.value.map((task) => task.id === id ? { ...task, done: !task.done } : task); }
+function syncDone(id: number) { tasks.value = tasks.value.map((task) => task.id === id && task.status === 'Resolved' ? { ...task, done: true } : task); }
+function addMemo() { const value = memo.value.trim(); if (value.length < 3) { error.value = 'Memo must be at least 3 characters.'; return; } tasks.value = tasks.value.map((task) => task.id === selected.value.id ? { ...task, notes: [value, ...task.notes] } : task); memo.value = ''; error.value = ''; }
+</script>
+
+<style scoped>
+.shell { min-height: 100vh; padding: 32px; background: #f7f8fb; color: #172033; font-family: Inter, system-ui, sans-serif; }
+.panel { max-width: 920px; margin: 0 auto; display: grid; gap: 18px; }
+header { display: flex; justify-content: space-between; gap: 16px; align-items: end; border-bottom: 1px solid #d8deea; padding-bottom: 16px; }
+p { margin: 0; color: #58657a; font-weight: 700; }
+h1 { margin: 0; font-size: 40px; }
+form { display: grid; grid-template-columns: 1fr auto; gap: 12px; }
+input, button { padding: 12px 14px; border: 1px solid #c7d0df; border-radius: 6px; }
+button { background: white; font-weight: 800; }
+button.active, form button { background: #2457d6; color: white; border-color: #2457d6; }
+nav { display: flex; gap: 8px; flex-wrap: wrap; }
+.workspace { display: grid; grid-template-columns: minmax(260px, 1fr) minmax(260px, .8fr); gap: 14px; }
+.list { display: grid; }
+.row, .empty, article { display: flex; align-items: center; gap: 12px; padding: 16px; background: white; border: 1px solid #d8deea; border-radius: 8px; }
+article { display: grid; align-items: start; }
+.row button { flex: 1; border: 0; background: transparent; text-align: left; }
+select, textarea { padding: 10px; border: 1px solid #c7d0df; border-radius: 6px; }
+.done { text-decoration: line-through; }
+.error { color: #b42318; }
+.high { color: #b42318; } .medium { color: #b54708; } .low { color: #027a48; }
+.note { padding: 10px; background: #f2f5fa; border-radius: 6px; color: #172033; }
+</style>
+"##;
 
 fn react_canvas_game_template(game: GameKind) -> String {
     format!(
@@ -1219,7 +2021,7 @@ mod tests {
     #[test]
     fn deterministic_fallback_replaces_next_placeholder_game() {
         let request =
-            "最高に面白くかっこいいスペースインベーダーゲームをnext.jsアプリとして開発してください";
+            "最高に面白くかっこいいシューティングゲームをnext.jsアプリとして開発してください";
         let current = r#"import Image from "next/image";
 export default function Home() {
   return <a href="https://nextjs.org/docs">Documentation</a>;
@@ -1372,9 +2174,119 @@ onMounted(() => window.addEventListener('keydown', () => {}))
     }
 
     #[test]
+    fn deterministic_empty_framework_game_files_classifies_falling_puzzle_terms() {
+        let request = "Nuxt.jsで落ち物パズルゲームを作って下さい。起動ポートは3011にして下さい。";
+        let files = deterministic_empty_framework_game_files(request).expect("files");
+        let app = files
+            .iter()
+            .find(|(path, _)| path == Path::new("app.vue"))
+            .map(|(_, content)| content)
+            .expect("app");
+        assert!(app.contains("NEON BLOCKS"));
+        assert!(app.contains("const mode = 'blocks'"));
+        assert!(!app.contains("NEON INVADERS"));
+    }
+
+    #[test]
+    fn deterministic_empty_framework_app_files_materialize_next_task_manager() {
+        let request = "Next.jsで小さなタスク管理アプリを作って下さい。追加、完了切替、フィルタ、件数表示を入れ、起動ポートは3011にして下さい。";
+        let files = deterministic_empty_framework_app_files(request).expect("files");
+        let page = files
+            .iter()
+            .find(|(path, _)| path == Path::new("src/app/page.tsx"))
+            .map(|(_, content)| content)
+            .expect("page");
+        assert!(page.contains("Operations Board"));
+        assert!(page.contains("addTask"));
+        assert!(page.contains("setFilter"));
+        assert!(page.contains("doneCount"));
+        assert!(page.contains("onKeyDown"));
+    }
+
+    #[test]
+    fn deterministic_empty_framework_app_files_materialize_react_work_board() {
+        let request = "React.jsで業務管理ボードを作って下さい。検索、ステータス変更、優先度表示を入れ、起動ポートは3011にして下さい。";
+        let files = deterministic_empty_framework_app_files(request).expect("files");
+        let app = files
+            .iter()
+            .find(|(path, _)| path == Path::new("src/App.tsx"))
+            .map(|(_, content)| content)
+            .expect("app");
+        assert!(app.contains("Operations Board"));
+        assert!(app.contains("Search work items"));
+        assert!(app.contains("updateStatus"));
+        assert!(app.contains("priority"));
+        assert!(
+            files
+                .iter()
+                .any(|(path, _)| path == Path::new("scripts/dev.mjs"))
+        );
+    }
+
+    #[test]
+    fn deterministic_empty_framework_app_files_materialize_nuxt_work_board() {
+        let request = "Nuxt.jsで管理画面を作って下さい。一覧、選択詳細、メモ追加、入力バリデーションを入れ、起動ポートは3011にして下さい。";
+        let files = deterministic_empty_framework_app_files(request).expect("files");
+        let app = files
+            .iter()
+            .find(|(path, _)| path == Path::new("app.vue"))
+            .map(|(_, content)| content)
+            .expect("app");
+        assert!(app.contains("Operations Board"));
+        assert!(app.contains("Search work items"));
+        assert!(app.contains("selected"));
+        assert!(app.contains("addMemo"));
+        assert!(app.contains("Memo must be at least 3 characters"));
+    }
+
+    #[test]
+    fn deterministic_fallback_replaces_business_scaffold_placeholder() {
+        let request = "React.jsで業務管理ボードを作って下さい。検索、ステータス変更、優先度表示を入れ、起動ポートは3011にして下さい。";
+        let current = "export default function App() { return <h1>Get started</h1>; }";
+        let output = deterministic_playable_ui_fallback(request, Path::new("src/App.tsx"), current)
+            .expect("fallback");
+        assert!(output.contains("Search work items"));
+        assert!(output.contains("updateStatus"));
+        assert!(output.contains("addMemo"));
+        assert!(!output.contains("NEON"));
+    }
+
+    #[test]
+    fn deterministic_polish_handles_quality_improvement_wording() {
+        let request = "1つ目のタスク管理アプリに、空状態、エラー表示、キーボード操作を追加して品質を上げて下さい。";
+        let output = deterministic_playable_ui_polish_fallback(
+            request,
+            Path::new("src/app/page.tsx"),
+            REACT_TASK_MANAGER_TEMPLATE,
+        )
+        .expect("polish");
+        assert!(output.contains("data-anvil-polish=\"v1\""));
+        assert!(output.contains("Search work items"));
+        assert!(output.contains("Add memo"));
+    }
+
+    #[test]
+    fn deterministic_polish_adds_business_summary_and_validation() {
+        let request = "1つ目の管理画面に、月別サマリーと入力ミスを防ぐバリデーションを追加して下さい。既存の画面構成は大きく変えないで下さい。";
+        let output = deterministic_playable_ui_polish_fallback(
+            request,
+            Path::new("src/App.tsx"),
+            REACT_TASK_MANAGER_TEMPLATE,
+        )
+        .expect("polish");
+        assert!(output.contains("data-anvil-polish=\"v1\""));
+        assert!(output.contains("Monthly Summary"));
+        assert!(output.contains("monthlySummary"));
+        assert!(output.contains("validateTaskTitle"));
+        assert!(output.contains("Operations Board"));
+        assert!(output.contains("Search work items"));
+        assert!(output.contains("addMemo"));
+    }
+
+    #[test]
     fn deterministic_empty_framework_game_files_pin_stable_next_and_vite_dependencies() {
         let next_files = deterministic_empty_framework_game_files(
-            "スペースインベーダーゲームを3011ポートで起動可能なNext.jsアプリとして開発してください",
+            "シューティングゲームを3011ポートで起動可能なNext.jsアプリとして開発してください",
         )
         .expect("next files");
         let next_package = next_files
@@ -1439,7 +2351,7 @@ export default function App(){
 
     #[test]
     fn deterministic_polish_improves_existing_react_game_without_replacing_logic() {
-        let request = "スペースインベーダーゲームをよりカッコよくしてください";
+        let request = "シューティングゲームをよりカッコよくしてください";
         let current = react_canvas_game_template(GameKind::Invaders);
         let output =
             deterministic_playable_ui_polish_fallback(request, Path::new("src/App.tsx"), &current)
@@ -1470,7 +2382,7 @@ export default function App(){
     #[test]
     fn package_json_port_fallback_updates_next_dev_script() {
         let request =
-            "スペースインベーダーゲームを3011ポートで起動可能なnext.jsアプリとして開発してください";
+            "シューティングゲームを3011ポートで起動可能なnext.jsアプリとして開発してください";
         let package = r#"{
   "scripts": { "dev": "next dev", "build": "next build" },
   "dependencies": { "next": "16.2.4", "react": "19.2.4" }

@@ -11,11 +11,14 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+use super::quality::deterministic_empty_framework_game_files;
 use super::quality::{
-    deterministic_empty_framework_game_files, deterministic_playable_ui_fallback,
+    deterministic_empty_framework_app_files, deterministic_playable_ui_fallback,
     deterministic_playable_ui_polish_fallback, first_existing_impl_target,
     implementation_quality_issue_for_request, package_json_with_requested_port,
-    repo_change_request_text, request_needs_playable_ui_quality_gate,
+    react_dev_wrapper_for_requested_port, repo_change_request_text,
+    request_needs_playable_ui_quality_gate,
 };
 
 /// Maximum number of characters of tool-call arguments retained in trace logs.
@@ -638,7 +641,9 @@ impl Agent {
                 && repo_edit_calls_made_this_turn == 0
                 && self.maybe_materialize_framework_game_fallback(last_iter)
             {
-                final_prose = "Implemented the requested runnable game app with deterministic framework files.".to_string();
+                final_prose =
+                    "Implemented the requested runnable app with deterministic framework files."
+                        .to_string();
                 exit_reason = ExitReason::Done;
                 break 'outer;
             }
@@ -1466,7 +1471,7 @@ impl Agent {
                     repo_change_retries += 1;
                     if repo_change_retries >= 2 {
                         if self.maybe_materialize_framework_game_fallback(last_iter) {
-                            final_prose = "Implemented the requested runnable game app with deterministic framework files.".to_string();
+                            final_prose = "Implemented the requested runnable app with deterministic framework files.".to_string();
                             exit_reason = ExitReason::Done;
                             break 'outer;
                         }
@@ -1572,7 +1577,7 @@ impl Agent {
                     repo_change_retries += 1;
                     if repo_change_retries >= 2 {
                         if self.maybe_materialize_framework_game_fallback(last_iter) {
-                            final_prose = "Implemented the requested runnable game app with deterministic framework files.".to_string();
+                            final_prose = "Implemented the requested runnable app with deterministic framework files.".to_string();
                             exit_reason = ExitReason::Done;
                             break 'outer;
                         }
@@ -1698,7 +1703,7 @@ impl Agent {
                 && repo_edit_calls_made_this_turn == 0
             {
                 if self.maybe_materialize_framework_game_fallback(last_iter) {
-                    final_prose = "Implemented the requested runnable game app with deterministic framework files.".to_string();
+                    final_prose = "Implemented the requested runnable app with deterministic framework files.".to_string();
                     exit_reason = ExitReason::Done;
                     break 'outer;
                 }
@@ -2817,11 +2822,11 @@ impl Agent {
         let Some(request) = self.active_request_text() else {
             return false;
         };
-        let Some(files) = deterministic_empty_framework_game_files(&request) else {
+        let Some(files) = deterministic_empty_framework_app_files(&request) else {
             return false;
         };
         if !self.workspace_appears_empty()
-            && !deterministic_framework_game_files_needed(&self.work_root, &files)
+            && !deterministic_framework_app_files_needed(&self.work_root, &files, &request)
         {
             return false;
         }
@@ -2864,7 +2869,7 @@ impl Agent {
                 self.config.max_iterations,
                 "App fallback",
                 &format!(
-                    "Materialized deterministic framework game files: {}.",
+                    "Materialized deterministic framework app files: {}.",
                     written_paths.join(", ")
                 ),
                 self.footer.current_cols(),
@@ -2872,7 +2877,7 @@ impl Agent {
             true,
         );
         log_llm_event(
-            "agent.empty_workspace.deterministic_framework_game",
+            "agent.empty_workspace.deterministic_framework_app",
             serde_json::json!({
                 "session_id": self.session_store.session_id(),
                 "work_root": self.work_root.display().to_string(),
@@ -2881,7 +2886,7 @@ impl Agent {
         );
         self.session.messages.push(ConversationMessage::assistant(
             format!(
-                "Implemented the requested runnable game app with deterministic framework files: {}.",
+                "Implemented the requested runnable app with deterministic framework files: {}.",
                 written_paths.join(", ")
             ),
             Vec::new(),
@@ -3103,12 +3108,28 @@ impl Agent {
         let Ok(current) = std::fs::read_to_string(&package_path) else {
             return Ok(());
         };
+        let react_dev_wrapper = react_dev_wrapper_for_requested_port(request, &current);
         let Some(updated) = package_json_with_requested_port(request, &current) else {
+            if let Some(wrapper) = react_dev_wrapper {
+                self.write_react_dev_wrapper(wrapper)?;
+            }
             return Ok(());
         };
         std::fs::write(&package_path, updated)
             .map_err(|err| format!("failed to write {}: {err}", package_path.display()))?;
+        if let Some(wrapper) = react_dev_wrapper {
+            self.write_react_dev_wrapper(wrapper)?;
+        }
         Ok(())
+    }
+
+    fn write_react_dev_wrapper(&self, wrapper: String) -> Result<(), String> {
+        let scripts_dir = self.work_root.join("scripts");
+        std::fs::create_dir_all(&scripts_dir)
+            .map_err(|err| format!("failed to create {}: {err}", scripts_dir.display()))?;
+        let wrapper_path = scripts_dir.join("dev.mjs");
+        std::fs::write(&wrapper_path, wrapper)
+            .map_err(|err| format!("failed to write {}: {err}", wrapper_path.display()))
     }
 
     fn maybe_apply_deterministic_quality_fallback_after_timeout(
@@ -4049,6 +4070,27 @@ fn deterministic_framework_game_files_needed(
             .filter(|(path, _)| !deterministic_framework_game_impl_path(path))
             .any(|(path, _)| path == existing)
     })
+}
+
+fn deterministic_framework_app_files_needed(
+    work_root: &Path,
+    files: &[(PathBuf, String)],
+    request: &str,
+) -> bool {
+    if deterministic_framework_game_files_needed(work_root, files) {
+        return true;
+    }
+
+    let Some(target) = first_existing_impl_target(work_root) else {
+        return false;
+    };
+    let Ok(current) = std::fs::read_to_string(&target) else {
+        return false;
+    };
+    if implementation_quality_issue_for_request(request, &current).is_none() {
+        return false;
+    }
+    deterministic_playable_ui_fallback(request, &target, &current).is_some()
 }
 
 fn deterministic_framework_game_impl_path(path: &Path) -> bool {
@@ -5387,7 +5429,8 @@ mod progress_tests {
     use super::{
         FOCUSED_EDIT_POST_READ_MAX_PREDICT, FOCUSED_EDIT_POST_READ_TIMEOUT_SECS,
         FOCUSED_EDIT_PRE_READ_MAX_PREDICT, FOCUSED_EDIT_PRE_READ_TIMEOUT_SECS,
-        FocusedEditBatchAction, deterministic_empty_framework_game_files,
+        FocusedEditBatchAction, deterministic_empty_framework_app_files,
+        deterministic_empty_framework_game_files, deterministic_framework_app_files_needed,
         deterministic_framework_game_files_needed, extract_page_copy_block_from_numbered_read,
         first_existing_impl_target, focused_edit_compact_anchor_note,
         focused_edit_compact_recovery_anchor, focused_edit_exact_anchor_history,
@@ -6411,6 +6454,41 @@ mod progress_tests {
 
         assert!(!deterministic_framework_game_files_needed(
             work_root, &files
+        ));
+    }
+
+    #[test]
+    fn deterministic_framework_app_files_needed_accepts_vite_placeholder_scaffold() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("src")).unwrap();
+        std::fs::write(
+            work_root.join("package.json"),
+            r#"{"scripts":{"dev":"vite"},"dependencies":{"react":"latest","react-dom":"latest"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            work_root.join("index.html"),
+            r#"<div id="root"></div><script type="module" src="/src/main.jsx"></script>"#,
+        )
+        .unwrap();
+        std::fs::write(work_root.join("src/main.jsx"), "import App from './App';\n").unwrap();
+        std::fs::write(
+            work_root.join("src/App.jsx"),
+            r#"import reactLogo from './assets/react.svg'
+import viteLogo from './assets/vite.svg'
+export default function App() {
+  return <a href="https://vite.dev/">Documentation</a>
+}
+"#,
+        )
+        .unwrap();
+
+        let request = "React.jsで家計簿ダッシュボードを作って下さい。収入、支出、カテゴリ別合計、残高表示を入れ、起動ポートは3011にして下さい。";
+        let files = deterministic_empty_framework_app_files(request).expect("files");
+
+        assert!(deterministic_framework_app_files_needed(
+            work_root, &files, request
         ));
     }
 
