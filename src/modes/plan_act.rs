@@ -132,7 +132,21 @@ pub struct ModePolicy {
     pub allow_repo_context: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ModeClassification {
+    pub work_mode: WorkMode,
+    pub intent: &'static str,
+    pub allows_file_edits: bool,
+    pub requires_tests: bool,
+    pub confidence: f32,
+    pub reason: &'static str,
+}
+
 pub fn infer_work_mode_from_text(raw: &str) -> WorkMode {
+    classify_work_mode_json(raw).work_mode
+}
+
+pub fn classify_work_mode_json(raw: &str) -> ModeClassification {
     let lower = raw.to_ascii_lowercase();
     let explicit_edit = contains_any(
         &lower,
@@ -200,7 +214,14 @@ pub fn infer_work_mode_from_text(raw: &str) -> WorkMode {
         ],
     );
     if explicit_no_edit || (answer_request && !explicit_edit) {
-        return WorkMode::AnswerOnly;
+        return ModeClassification {
+            work_mode: WorkMode::AnswerOnly,
+            intent: "answer",
+            allows_file_edits: false,
+            requires_tests: false,
+            confidence: if explicit_no_edit { 0.95 } else { 0.82 },
+            reason: "request is read-only or asks for analysis without edit intent",
+        };
     }
 
     let typescript_ui = contains_any(
@@ -228,7 +249,14 @@ pub fn infer_work_mode_from_text(raw: &str) -> WorkMode {
         ],
     );
     if typescript_ui {
-        return WorkMode::TypeScriptUi;
+        return ModeClassification {
+            work_mode: WorkMode::TypeScriptUi,
+            intent: "ui-code",
+            allows_file_edits: true,
+            requires_tests: request_requires_tests(&lower, raw),
+            confidence: 0.86,
+            reason: "request mentions UI, frontend, TypeScript, or browser app terms",
+        };
     }
 
     if contains_any(
@@ -237,7 +265,14 @@ pub fn infer_work_mode_from_text(raw: &str) -> WorkMode {
             "python", ".py", "pytest", "pip", "venv", "csv", "pandas", "python3",
         ],
     ) {
-        return WorkMode::Python;
+        return ModeClassification {
+            work_mode: WorkMode::Python,
+            intent: "python-code",
+            allows_file_edits: true,
+            requires_tests: request_requires_tests(&lower, raw),
+            confidence: 0.88,
+            reason: "request mentions Python runtime, files, or Python data terms",
+        };
     }
 
     if contains_any(
@@ -256,18 +291,47 @@ pub fn infer_work_mode_from_text(raw: &str) -> WorkMode {
             "文章",
         ],
     ) {
-        return WorkMode::Docs;
+        return ModeClassification {
+            work_mode: WorkMode::Docs,
+            intent: "docs",
+            allows_file_edits: true,
+            requires_tests: false,
+            confidence: 0.84,
+            reason: "request mentions documentation artifacts",
+        };
     }
 
     if explicit_edit {
-        WorkMode::GenericCode
+        ModeClassification {
+            work_mode: WorkMode::GenericCode,
+            intent: "code",
+            allows_file_edits: true,
+            requires_tests: request_requires_tests(&lower, raw),
+            confidence: 0.7,
+            reason: "request has edit intent without a specific language or artifact mode",
+        }
     } else {
-        WorkMode::Unknown
+        ModeClassification {
+            work_mode: WorkMode::Unknown,
+            intent: "unknown",
+            allows_file_edits: true,
+            requires_tests: request_requires_tests(&lower, raw),
+            confidence: 0.35,
+            reason: "request lacks enough mode-specific signals",
+        }
     }
 }
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
+}
+
+fn request_requires_tests(lower: &str, raw: &str) -> bool {
+    lower.contains("test")
+        || lower.contains("pytest")
+        || lower.contains("unittest")
+        || raw.contains("テスト")
+        || raw.contains("検証")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
@@ -382,6 +446,17 @@ mod tests {
             infer_work_mode_from_text("READMEを更新してください"),
             WorkMode::Docs
         );
+    }
+
+    #[test]
+    fn mode_classifier_has_json_safe_shape() {
+        let classification = classify_work_mode_json("PythonでCSV集計CLIを作成しテストも追加");
+        assert_eq!(classification.work_mode, WorkMode::Python);
+        assert!(classification.allows_file_edits);
+        assert!(classification.requires_tests);
+        let json = serde_json::to_string(&classification).expect("json");
+        assert!(json.contains("\"work_mode\":\"Python\""));
+        assert!(json.contains("\"intent\":\"python-code\""));
     }
 
     #[test]

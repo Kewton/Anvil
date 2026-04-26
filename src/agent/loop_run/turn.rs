@@ -1,4 +1,6 @@
+use super::auto_test::AutoTestRunner;
 use super::interrupt::{InterruptEnv, InterruptFlag, InterruptMonitor};
+use super::protocol::ExecutionProtocol;
 use super::spinner::{Spinner, SpinnerStopSignal};
 use super::summary::{ExitReason, LoopResult, LoopStats};
 use super::*;
@@ -11,17 +13,17 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use super::deterministic;
 #[cfg(test)]
-use super::quality::deterministic_empty_framework_game_files;
+use super::deterministic::empty_framework_app_files as deterministic_empty_framework_app_files;
+#[cfg(test)]
+use super::deterministic::empty_framework_game_files as deterministic_empty_framework_game_files;
 use super::quality::{
-    deterministic_empty_docs_files, deterministic_empty_framework_app_files,
-    deterministic_empty_python_cli_files, deterministic_playable_ui_fallback,
-    deterministic_playable_ui_polish_fallback, first_existing_impl_target,
-    implementation_quality_issue_for_request, package_json_with_requested_port,
-    react_dev_wrapper_for_requested_port, repo_change_request_text,
-    request_allows_fast_polish_fallback, request_explicitly_requires_tests,
-    request_mentions_unsupported_ui_framework, request_needs_playable_ui_quality_gate,
-    workspace_has_unsupported_ui_framework,
+    first_existing_impl_target, implementation_quality_issue_for_request,
+    package_json_with_requested_port, react_dev_wrapper_for_requested_port,
+    repo_change_request_text, request_allows_fast_polish_fallback,
+    request_explicitly_requires_tests, request_mentions_unsupported_ui_framework,
+    request_needs_playable_ui_quality_gate, workspace_has_unsupported_ui_framework,
 };
 
 /// Maximum number of characters of tool-call arguments retained in trace logs.
@@ -165,6 +167,11 @@ fn reply_looks_like_future_work(reply: &str) -> bool {
         "これから",
         "今から",
         "次は",
+        "探してみます",
+        "確認します",
+        "調べます",
+        "見てみます",
+        "してみます",
         "実行してください",
         "確認してください",
     ];
@@ -1816,7 +1823,7 @@ impl Agent {
                 && reply_looks_like_future_work(&final_reply)
             {
                 no_tool_retries += 1;
-                if no_tool_retries >= 2 {
+                if no_tool_retries >= 1 {
                     final_prose = self.answer_only_fallback_response();
                     exit_reason = ExitReason::Done;
                     break 'outer;
@@ -1832,7 +1839,7 @@ impl Agent {
                     true,
                 );
                 self.push_system_note(
-                    "[Answer-only Recovery] Answer the user's request now. Do not say you will inspect more files, do not use Bash, and do not edit files."
+                    "[Answer-only Recovery] Answer the user's request now using only the context already inspected. Do not announce the next action, do not use tools, do not edit files, and do not ask the user to run anything."
                         .to_string(),
                 );
                 continue;
@@ -2141,13 +2148,49 @@ impl Agent {
             && is_qwen35_family(&self.current_assistant_model())
             && stats.total_changed > 0
             && self.session.mode_state.mode == ExecutionMode::Act
-            && !(self.active_python_request_requires_tests() && !self.python_test_artifact_exists())
+            && (!self.active_python_request_requires_tests() || self.python_test_artifact_exists())
         {
             final_prose =
                 "Applied repository edits before qwen3.5 emitted a malformed follow-up tool call."
                     .to_string();
             exit_reason = ExitReason::Done;
             error_text.clear();
+        }
+        if exit_reason.is_success() {
+            let protocol = ExecutionProtocol::from_work_mode(self.session.mode_state.work_mode);
+            if let Some(issue) = protocol.success_issue(&stats) {
+                exit_reason = ExitReason::MissingRepoEdits;
+                error_text = issue;
+            } else if self.should_run_auto_test_for_success()
+                && let Some(plan) = AutoTestRunner::detect(&self.work_root, &stats.changed_files)
+            {
+                match AutoTestRunner::run(&self.work_root, &plan) {
+                    Ok(result) => {
+                        log_llm_event(
+                            "agent.autotest.completed",
+                            serde_json::json!({
+                                "session_id": self.session_store.session_id(),
+                                "command": result.command,
+                                "passed": result.passed,
+                                "reason": plan.reason,
+                            }),
+                        );
+                        if !result.passed {
+                            exit_reason = ExitReason::MissingRepoEdits;
+                            error_text = format!(
+                                "auto test failed for protocol {:?}: {}\n{}",
+                                protocol.kind(),
+                                result.command,
+                                result.output
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        exit_reason = ExitReason::TransportError;
+                        error_text = err;
+                    }
+                }
+            }
         }
         log_llm_event(
             "agent.milestone.turn_completed",
@@ -2176,6 +2219,14 @@ impl Agent {
             }
             Err((exit_reason, error_text, stats))
         }
+    }
+
+    fn should_run_auto_test_for_success(&self) -> bool {
+        if self.session.mode_state.work_mode == WorkMode::Python {
+            return true;
+        }
+        self.active_request_text()
+            .is_some_and(|request| request_explicitly_requires_tests(&request))
     }
 
     fn request_assistant_reply_with_retry(
@@ -2301,12 +2352,11 @@ impl Agent {
                             continue;
                         }
                     }
-                    if err.to_ascii_lowercase().contains("timed out") {
-                        if let Some(reply) =
+                    if err.to_ascii_lowercase().contains("timed out")
+                        && let Some(reply) =
                             self.maybe_apply_deterministic_polish_fallback_after_timeout(&err)?
-                        {
-                            return Ok(reply);
-                        }
+                    {
+                        return Ok(reply);
                     }
                     if err.to_ascii_lowercase().contains("timed out")
                         && let Some(target) = self.focused_edit_recovery_target()
@@ -3254,14 +3304,14 @@ impl Agent {
             (
                 "Python fallback",
                 "agent.empty_workspace.deterministic_python_cli",
-                deterministic_empty_python_cli_files(&request)?,
+                deterministic::empty_python_cli_files(&request)?,
                 "Implemented the requested Python CSV CLI with deterministic files.".to_string(),
             )
         } else if policy.allow_docs_deterministic_fallback {
             (
                 "Docs fallback",
                 "agent.empty_workspace.deterministic_docs",
-                deterministic_empty_docs_files(&request)?,
+                deterministic::empty_docs_files(&request)?,
                 "Created the requested documentation with deterministic files.".to_string(),
             )
         } else {
@@ -3344,7 +3394,7 @@ impl Agent {
         let Some(request) = self.active_request_text() else {
             return false;
         };
-        let Some(files) = deterministic_empty_framework_app_files(&request) else {
+        let Some(files) = deterministic::empty_framework_app_files(&request) else {
             return false;
         };
         if !self.workspace_appears_empty()
@@ -3597,7 +3647,7 @@ impl Agent {
         }
         let target = first_existing_impl_target(&self.work_root)?;
         let content = std::fs::read_to_string(&target).ok()?;
-        deterministic_playable_ui_polish_fallback(request, &target, &content)?;
+        deterministic::playable_ui_polish(request, &target, &content)?;
         let relative = target
             .strip_prefix(&self.work_root)
             .unwrap_or(&target)
@@ -3736,7 +3786,7 @@ if __name__ == "__main__":
         let target = self.work_root.join(relative_target);
         let current = std::fs::read_to_string(&target)
             .map_err(|err| format!("failed to read {}: {err}", target.display()))?;
-        let Some(replacement) = deterministic_playable_ui_fallback(request, &target, &current)
+        let Some(replacement) = deterministic::playable_ui_repair(request, &target, &current)
         else {
             return Ok(false);
         };
@@ -3754,8 +3804,7 @@ if __name__ == "__main__":
         let target = self.work_root.join(relative_target);
         let current = std::fs::read_to_string(&target)
             .map_err(|err| format!("failed to read {}: {err}", target.display()))?;
-        let Some(replacement) =
-            deterministic_playable_ui_polish_fallback(request, &target, &current)
+        let Some(replacement) = deterministic::playable_ui_polish(request, &target, &current)
         else {
             return Ok(false);
         };
@@ -3886,6 +3935,21 @@ if __name__ == "__main__":
         }
         if lower.contains("rust") && lower.contains("cli") {
             return "ファイルは変更せず、Rust CLI 化の構成案だけを整理します。\n\n- `Cargo.toml`: crate 名、依存、bin 設定を管理する。\n- `src/main.rs`: 引数解析と終了コード制御だけを置く。\n- `src/cli.rs`: CLI オプション、help、入力検証をまとめる。\n- `src/lib.rs`: 実処理をライブラリ化し、CLI 以外からもテスト可能にする。\n- `tests/cli.rs`: 代表コマンド、異常入力、終了コードを E2E 寄りに検証する。\n- `README.md`: インストール、実行例、検証コマンド、制約を記載する。\n\n方針としては、CLI 表層とドメイン処理を分離し、`cargo test` でロジック、必要なら `assert_cmd` 系でコマンド挙動を確認するのが扱いやすいです。".to_string();
+        }
+        if lower.contains("readme")
+            && (request.contains("要約") || lower.contains("summarize"))
+            && let Ok(readme) = std::fs::read_to_string(self.work_root.join("README.md"))
+        {
+            let summary = readme
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .take(4)
+                .collect::<Vec<_>>()
+                .join(" ");
+            return format!(
+                "README の要約: {summary}\n\n設計上の課題: README から確認できる情報は概要レベルに限られており、内部構成、実行手順、検証方法、制約、fallback や session 管理の責務分担が文書化されていません。そのため、初見の開発者が変更範囲や品質確認方法を判断しにくい状態です。ファイルは変更していません。"
+            );
         }
         "ファイルは変更せず、読み取り専用の回答として整理します。目的、前提、推奨構成、検証方法、残リスクを分け、実装や編集が必要な場合だけ次のターンで明示的に依頼してください。".to_string()
     }
@@ -4824,7 +4888,7 @@ fn deterministic_framework_app_files_needed(
     if implementation_quality_issue_for_request(request, &current).is_none() {
         return false;
     }
-    deterministic_playable_ui_fallback(request, &target, &current).is_some()
+    deterministic::playable_ui_repair(request, &target, &current).is_some()
 }
 
 fn deterministic_framework_game_impl_path(path: &Path) -> bool {
@@ -6069,6 +6133,9 @@ mod truncate_tests {
             "Now I'll create the full interactive app as a client component."
         ));
         assert!(reply_looks_like_future_work("次にゲーム本体を実装します。"));
+        assert!(reply_looks_like_future_work(
+            "READMEの全文を確認しました。さらに詳細な設計ファイルがないか探してみます。"
+        ));
         assert!(!reply_looks_like_future_work(
             "Implemented the first playable shell in app/page.tsx."
         ));

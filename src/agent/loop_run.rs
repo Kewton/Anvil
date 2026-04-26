@@ -19,10 +19,13 @@ use crate::stdin_prompt;
 use crate::system_prompt::build_system_prompt;
 use crate::tools::registry::{ToolContext, ToolRegistry};
 
+mod auto_test;
 pub mod commands;
+mod deterministic;
 mod footer;
 mod interrupt;
 mod lifecycle;
+mod protocol;
 mod quality;
 pub mod slash_commands;
 mod spinner;

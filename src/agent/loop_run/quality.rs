@@ -12,12 +12,16 @@ const VITE_VERSION: &str = "5.4.11";
 const VITE_REACT_PLUGIN_VERSION: &str = "4.3.4";
 const NUXT_VERSION: &str = "3.13.2";
 const VUE_VERSION: &str = "3.5.13";
+const SVELTE_VERSION: &str = "4.2.19";
+const SVELTEKIT_VERSION: &str = "2.7.7";
+const SVELTE_VITE_PLUGIN_VERSION: &str = "3.1.2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FrameworkKind {
     Next,
     React,
     Nuxt,
+    SvelteKit,
     Unknown,
 }
 
@@ -45,6 +49,11 @@ impl RequestIntent {
             FrameworkKind::Nuxt
         } else if lower.contains("react.js") || lower.contains("react") {
             FrameworkKind::React
+        } else if lower.contains("sveltekit")
+            || lower.contains("svelte kit")
+            || lower.contains("svelte")
+        {
+            FrameworkKind::SvelteKit
         } else {
             FrameworkKind::Unknown
         };
@@ -81,6 +90,7 @@ impl RequestIntent {
             || lower.contains("nextjs")
             || lower.contains("react")
             || lower.contains("nuxt")
+            || lower.contains("svelte")
             || request.contains("アプリ")
             || request.contains("起動");
         Self {
@@ -354,6 +364,13 @@ pub(super) fn deterministic_playable_ui_fallback(
             Some(vue_business_app_template(request))
         };
     }
+    if path.ends_with(".svelte") {
+        return if intent.game_experience {
+            Some(svelte_canvas_game_template(GameKind::from_request(request)))
+        } else {
+            Some(svelte_business_app_template(request))
+        };
+    }
     if path.ends_with(".tsx")
         || path.ends_with(".jsx")
         || path.ends_with(".ts")
@@ -381,10 +398,10 @@ pub(super) fn deterministic_playable_ui_polish_fallback(
 
     let path = target_path.to_string_lossy().to_ascii_lowercase();
     if path.ends_with(".vue") {
-        if request_needs_business_data_improvement(request) {
-            if let Some(updated) = polish_vue_business_app(current_content) {
-                return Some(updated);
-            }
+        if request_needs_business_data_improvement(request)
+            && let Some(updated) = polish_vue_business_app(current_content)
+        {
+            return Some(updated);
         }
         return polish_vue_playable_ui(current_content);
     }
@@ -393,10 +410,10 @@ pub(super) fn deterministic_playable_ui_polish_fallback(
         || path.ends_with(".ts")
         || path.ends_with(".js")
     {
-        if request_needs_business_data_improvement(request) {
-            if let Some(updated) = polish_react_business_app(current_content) {
-                return Some(updated);
-            }
+        if request_needs_business_data_improvement(request)
+            && let Some(updated) = polish_react_business_app(current_content)
+        {
+            return Some(updated);
         }
         return polish_react_playable_ui(current_content);
     }
@@ -539,6 +556,29 @@ pub(super) fn deterministic_empty_framework_game_files(
             ),
             (PathBuf::from("app.vue"), vue_canvas_game_template(game)),
         ]),
+        FrameworkKind::SvelteKit => Some(vec![
+            (PathBuf::from("package.json"), sveltekit_package_json(port)),
+            (
+                PathBuf::from("svelte.config.js"),
+                "import { vitePreprocess } from '@sveltejs/vite-plugin-svelte';\n\nexport default { preprocess: vitePreprocess() };\n".to_string(),
+            ),
+            (
+                PathBuf::from("vite.config.ts"),
+                sveltekit_vite_config().to_string(),
+            ),
+            (
+                PathBuf::from("src/routes/+layout.svelte"),
+                "<slot />\n".to_string(),
+            ),
+            (
+                PathBuf::from("src/routes/+page.svelte"),
+                svelte_canvas_game_template(game),
+            ),
+            (
+                PathBuf::from("scripts/smoke-test.mjs"),
+                smoke_test_script().to_string(),
+            ),
+        ]),
         FrameworkKind::Unknown => None,
     }
 }
@@ -680,6 +720,29 @@ pub(super) fn deterministic_empty_framework_app_files(
                 smoke_test_script().to_string(),
             ),
             (PathBuf::from("app.vue"), vue_business_app_template(request)),
+        ]),
+        FrameworkKind::SvelteKit => Some(vec![
+            (PathBuf::from("package.json"), sveltekit_package_json(port)),
+            (
+                PathBuf::from("svelte.config.js"),
+                "import { vitePreprocess } from '@sveltejs/vite-plugin-svelte';\n\nexport default { preprocess: vitePreprocess() };\n".to_string(),
+            ),
+            (
+                PathBuf::from("vite.config.ts"),
+                sveltekit_vite_config().to_string(),
+            ),
+            (
+                PathBuf::from("src/routes/+layout.svelte"),
+                "<slot />\n".to_string(),
+            ),
+            (
+                PathBuf::from("src/routes/+page.svelte"),
+                svelte_business_app_template(request),
+            ),
+            (
+                PathBuf::from("scripts/smoke-test.mjs"),
+                smoke_test_script().to_string(),
+            ),
         ]),
         FrameworkKind::Unknown => None,
     }
@@ -829,15 +892,7 @@ Keep this document focused on concrete project behavior, setup steps, and mainte
 pub(super) fn request_mentions_unsupported_ui_framework(request: &str) -> bool {
     let lower = request.to_ascii_lowercase();
     [
-        "svelte",
-        "sveltekit",
-        "astro",
-        "solid",
-        "solidjs",
-        "solid.js",
-        "qwik",
-        "ember",
-        "remix",
+        "astro", "solid", "solidjs", "solid.js", "qwik", "ember", "remix",
     ]
     .iter()
     .any(|keyword| lower.contains(keyword))
@@ -852,8 +907,6 @@ pub(super) fn workspace_has_unsupported_ui_framework(work_root: &Path) -> bool {
             "astro.config.ts",
             "solid.config.ts",
             "solid.config.js",
-            "src/routes/+page.svelte",
-            "src/App.svelte",
         ]
         .iter()
         .any(|relative| root.join(relative).is_file())
@@ -885,6 +938,7 @@ pub(super) fn package_json_with_requested_port(
         FrameworkKind::Next => format!("next dev -p {port}"),
         FrameworkKind::React => "node scripts/dev.mjs".to_string(),
         FrameworkKind::Nuxt => format!("nuxt dev -p {port}"),
+        FrameworkKind::SvelteKit => format!("vite --host 0.0.0.0 --port {port}"),
         FrameworkKind::Unknown => return None,
     };
     if scripts.get("dev").and_then(|value| value.as_str()) == Some(dev.as_str()) {
@@ -948,7 +1002,7 @@ child.on("error", (error) => {{
 fn smoke_test_script() -> &'static str {
     r#"import { existsSync, readFileSync } from 'node:fs';
 
-const candidates = ['src/App.tsx', 'src/app/page.tsx', 'app.vue'];
+const candidates = ['src/App.tsx', 'src/app/page.tsx', 'app.vue', 'src/routes/+page.svelte'];
 const target = candidates.find((path) => existsSync(path));
 if (!target) {
   console.error('No application entry file found.');
@@ -999,6 +1053,33 @@ fn react_vite_config() -> &'static str {
     "import { defineConfig } from 'vite';\nimport react from '@vitejs/plugin-react';\n\nexport default defineConfig({ plugins: [react()] });\n"
 }
 
+fn sveltekit_package_json(port: u16) -> String {
+    format!(
+        r#"{{
+  "scripts": {{
+    "dev": "vite --host 0.0.0.0 --port {port}",
+    "build": "vite build",
+    "preview": "vite preview --host 0.0.0.0 --port {port}",
+    "test": "node scripts/smoke-test.mjs",
+    "audit": "npm audit --audit-level=critical"
+  }},
+  "dependencies": {{
+    "@sveltejs/kit": "{SVELTEKIT_VERSION}",
+    "@sveltejs/vite-plugin-svelte": "{SVELTE_VITE_PLUGIN_VERSION}",
+    "svelte": "{SVELTE_VERSION}",
+    "typescript": "{TYPESCRIPT_VERSION}",
+    "vite": "{VITE_VERSION}"
+  }},
+  "devDependencies": {{}}
+}}
+"#
+    )
+}
+
+fn sveltekit_vite_config() -> &'static str {
+    "import { sveltekit } from '@sveltejs/kit/vite';\nimport { defineConfig } from 'vite';\n\nexport default defineConfig({ plugins: [sveltekit()] });\n"
+}
+
 fn package_framework(package: &serde_json::Value) -> Option<FrameworkKind> {
     let has_dep = |name: &str| {
         ["dependencies", "devDependencies"]
@@ -1011,6 +1092,8 @@ fn package_framework(package: &serde_json::Value) -> Option<FrameworkKind> {
         Some(FrameworkKind::Next)
     } else if has_dep("nuxt") {
         Some(FrameworkKind::Nuxt)
+    } else if has_dep("@sveltejs/kit") || has_dep("svelte") {
+        Some(FrameworkKind::SvelteKit)
     } else if has_dep("vite") || has_dep("@vitejs/plugin-react") || has_dep("react") {
         Some(FrameworkKind::React)
     } else {
@@ -1840,6 +1923,246 @@ fn vue_business_app_template(request: &str) -> String {
         &escape_text_literal(&generic_app_title(request)),
     )
 }
+
+fn svelte_business_app_template(request: &str) -> String {
+    SVELTE_INTERACTIVE_APP_TEMPLATE.replace(
+        "__APP_TITLE__",
+        &escape_text_literal(&generic_app_title(request)),
+    )
+}
+
+fn svelte_canvas_game_template(game: GameKind) -> String {
+    let title = match game {
+        GameKind::Invaders => "Svelte Canvas Challenge",
+        GameKind::Breakout => "Svelte Breakout Arena",
+        GameKind::Blocks => "Svelte Falling Blocks",
+    };
+    SVELTE_CANVAS_GAME_TEMPLATE.replace("__GAME_TITLE__", title)
+}
+
+const SVELTE_INTERACTIVE_APP_TEMPLATE: &str = r##"<script lang="ts">
+  type Attempt = { id: number; label: string; score: number; elapsed: number; note: string };
+
+  const storageKey = "anvil:svelte-interactive-history";
+  let running = false;
+  let startedAt: number | null = null;
+  let elapsed = 0;
+  let entry = "";
+  let message = "Ready to capture a new attempt.";
+  let target = 85;
+  let history: Attempt[] = [
+    { id: 1, label: "Baseline", score: 74, elapsed: 18.4, note: "Initial reference run" },
+    { id: 2, label: "Clean run", score: 88, elapsed: 14.2, note: "Faster and more accurate" }
+  ];
+
+  if (typeof localStorage !== "undefined") {
+    const saved = localStorage.getItem(storageKey);
+    if (saved) history = JSON.parse(saved);
+  }
+
+  $: calculatedTotal = history.reduce((sum, item) => sum + item.score, 0);
+  $: average = history.length ? Math.round(calculatedTotal / history.length) : 0;
+  $: best = history.reduce((max, item) => Math.max(max, item.score), 0);
+  $: targetMet = best >= target;
+  $: progress = Math.min(100, Math.max(0, Math.round((best / Math.max(target, 1)) * 100)));
+
+  function persist(next: Attempt[]) {
+    history = next;
+    if (typeof localStorage !== "undefined") {
+      localStorage.setItem(storageKey, JSON.stringify(next));
+    }
+  }
+
+  function startRun() {
+    running = true;
+    startedAt = Date.now();
+    elapsed = 0;
+    message = "Run started. Record the outcome when complete.";
+  }
+
+  function saveAttempt() {
+    const label = entry.trim();
+    if (!label) {
+      message = "Enter a label before saving.";
+      return;
+    }
+    const duration = startedAt ? (Date.now() - startedAt) / 1000 : elapsed + 12;
+    const score = Math.min(100, Math.max(0, Math.round(62 + label.length * 3 + Math.random() * 12)));
+    persist([{ id: Date.now(), label, score, elapsed: Number(duration.toFixed(1)), note: targetMet ? "Target already met" : "Needs another pass" }, ...history].slice(0, 8));
+    entry = "";
+    elapsed = Number(duration.toFixed(1));
+    running = false;
+    startedAt = null;
+    message = `Saved ${label} with score ${score}.`;
+  }
+
+  function clearHistory() {
+    persist([]);
+    message = "History cleared.";
+  }
+</script>
+
+<svelte:head><title>__APP_TITLE__</title></svelte:head>
+
+<main class="shell">
+  <section class="hero">
+    <p class="eyebrow">Interactive dashboard</p>
+    <h1>__APP_TITLE__</h1>
+    <p>Track attempts, validate target progress, persist Score history, and surface accessible status feedback.</p>
+  </section>
+
+  <section class="panel">
+    <label>
+      Attempt label
+      <input bind:value={entry} placeholder="Practice run A" />
+    </label>
+    <label>
+      Target
+      <input type="number" bind:value={target} min="1" max="100" />
+    </label>
+    <div class="actions">
+      <button on:click={startRun} disabled={running}>Start</button>
+      <button on:click={saveAttempt}>Save result</button>
+      <button on:click={clearHistory}>Clear</button>
+    </div>
+    <p role="alert" aria-live="polite">{message}</p>
+  </section>
+
+  <section class="metrics">
+    <article><span>Calculated total</span><strong>{calculatedTotal}</strong></article>
+    <article><span>Average</span><strong>{average}</strong></article>
+    <article><span>Target</span><strong>{targetMet ? "Met" : "Open"}</strong></article>
+  </section>
+
+  <section class="progress" aria-label="Target progress">
+    <div style={`width: ${progress}%`}></div>
+  </section>
+
+  <section class="history" aria-label="Score history">
+    <h2>Score history</h2>
+    {#each history as item}
+      <article>
+        <strong>{item.label}</strong>
+        <span>{item.score} pts / {item.elapsed}s</span>
+        <small>{item.note}</small>
+      </article>
+    {/each}
+  </section>
+</main>
+
+<style>
+  :global(body) { margin: 0; font-family: Inter, system-ui, sans-serif; background: #f6f7f2; color: #18211f; }
+  .shell { max-width: 1040px; margin: 0 auto; padding: 32px; display: grid; gap: 18px; }
+  .hero { padding: 28px 0 10px; }
+  .eyebrow { margin: 0 0 8px; color: #5f6f61; font-weight: 700; text-transform: uppercase; font-size: 12px; }
+  h1 { margin: 0; font-size: 42px; line-height: 1.05; }
+  .panel, .metrics article, .history article { border: 1px solid #d7ddcf; background: white; border-radius: 8px; }
+  .panel { padding: 18px; display: grid; gap: 14px; }
+  label { display: grid; gap: 6px; font-weight: 700; }
+  input { min-height: 38px; border: 1px solid #b9c3b5; border-radius: 6px; padding: 0 10px; }
+  .actions { display: flex; flex-wrap: wrap; gap: 8px; }
+  button { min-height: 38px; border: 0; border-radius: 6px; padding: 0 14px; background: #235347; color: white; font-weight: 700; }
+  button:disabled { opacity: .45; }
+  [role="alert"] { margin: 0; color: #395148; }
+  .metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+  .metrics article { padding: 16px; display: grid; gap: 6px; }
+  .metrics span { color: #647268; }
+  .metrics strong { font-size: 28px; }
+  .progress { height: 14px; border-radius: 999px; background: #dfe7db; overflow: hidden; }
+  .progress div { height: 100%; background: #e0a526; }
+  .history { display: grid; gap: 10px; }
+  .history article { padding: 14px; display: grid; grid-template-columns: 1fr auto; gap: 4px 12px; }
+  .history small { grid-column: 1 / -1; color: #607166; }
+  @media (max-width: 720px) { .shell { padding: 20px; } h1 { font-size: 32px; } .metrics { grid-template-columns: 1fr; } }
+</style>
+"##;
+
+const SVELTE_CANVAS_GAME_TEMPLATE: &str = r##"<script lang="ts">
+  import { onMount } from "svelte";
+
+  let canvas: HTMLCanvasElement;
+  let score = 0;
+  let running = true;
+  let message = "Use arrow keys to move. Restart any time.";
+  const keys = new Set<string>();
+
+  let player = { x: 160, y: 220, width: 44, height: 12 };
+  let ball = { x: 190, y: 150, vx: 2.4, vy: -2.8, radius: 7 };
+
+  function reset() {
+    score = 0;
+    running = true;
+    message = "Restarted. Keep the ball in play.";
+    player = { x: 160, y: 220, width: 44, height: 12 };
+    ball = { x: 190, y: 150, vx: 2.4, vy: -2.8, radius: 7 };
+  }
+
+  onMount(() => {
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    const down = (event: KeyboardEvent) => keys.add(event.key);
+    const up = (event: KeyboardEvent) => keys.delete(event.key);
+    window.addEventListener("keydown", down);
+    window.addEventListener("keyup", up);
+
+    function step() {
+      if (running) {
+        if (keys.has("ArrowLeft")) player.x = Math.max(0, player.x - 5);
+        if (keys.has("ArrowRight")) player.x = Math.min(canvas.width - player.width, player.x + 5);
+        ball.x += ball.vx;
+        ball.y += ball.vy;
+        if (ball.x < ball.radius || ball.x > canvas.width - ball.radius) ball.vx *= -1;
+        if (ball.y < ball.radius) ball.vy *= -1;
+        const hitPaddle = ball.y + ball.radius >= player.y && ball.x >= player.x && ball.x <= player.x + player.width;
+        if (hitPaddle) {
+          ball.vy = -Math.abs(ball.vy) - 0.08;
+          score += 10;
+          message = `Score ${score}. Keep going.`;
+        }
+        if (ball.y > canvas.height) {
+          running = false;
+          message = "Round over. Press Restart.";
+        }
+      }
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = "#12201d";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = "#f2be45";
+      ctx.fillRect(player.x, player.y, player.width, player.height);
+      ctx.beginPath();
+      ctx.arc(ball.x, ball.y, ball.radius, 0, Math.PI * 2);
+      ctx.fillStyle = "#7bd4c5";
+      ctx.fill();
+      requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+    return () => {
+      window.removeEventListener("keydown", down);
+      window.removeEventListener("keyup", up);
+    };
+  });
+</script>
+
+<main>
+  <section>
+    <h1>__GAME_TITLE__</h1>
+    <p role="alert" aria-live="polite">{message}</p>
+    <button on:click={reset}>Restart</button>
+    <strong>Score: {score}</strong>
+  </section>
+  <canvas bind:this={canvas} width="380" height="250" aria-label="Playable canvas game"></canvas>
+</main>
+
+<style>
+  :global(body) { margin: 0; font-family: Inter, system-ui, sans-serif; background: #e8eee8; color: #17231f; }
+  main { min-height: 100vh; display: grid; place-items: center; gap: 18px; padding: 24px; }
+  section { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 12px; }
+  h1 { width: 100%; text-align: center; margin: 0; font-size: 38px; }
+  p { width: 100%; text-align: center; margin: 0; }
+  button { border: 0; border-radius: 6px; min-height: 40px; padding: 0 14px; background: #235347; color: white; font-weight: 800; }
+  canvas { width: min(92vw, 760px); aspect-ratio: 380 / 250; border-radius: 8px; border: 1px solid #aab8ae; box-shadow: 0 16px 40px rgb(20 40 34 / 16%); }
+</style>
+"##;
 
 const REACT_INTERACTIVE_APP_TEMPLATE: &str = r##""use client";
 
@@ -2789,6 +3112,14 @@ fn placeholder_markers_for(framework: FrameworkKind) -> &'static [&'static str] 
             "start experience",
             "core interaction",
         ],
+        FrameworkKind::SvelteKit => &[
+            "svelte",
+            "welcome",
+            "documentation",
+            "create-svelte",
+            "start experience",
+            "core interaction",
+        ],
         FrameworkKind::Unknown => &[
             "documentation",
             "welcome",
@@ -2804,6 +3135,7 @@ fn placeholder_hit_count(framework: FrameworkKind, normalized_content: &str) -> 
         placeholder_markers_for(FrameworkKind::Next),
         placeholder_markers_for(FrameworkKind::React),
         placeholder_markers_for(FrameworkKind::Nuxt),
+        placeholder_markers_for(FrameworkKind::SvelteKit),
         placeholder_markers_for(FrameworkKind::Unknown),
     ];
     marker_groups
@@ -2887,11 +3219,14 @@ mod tests {
             )
             .is_none()
         );
+        let svelte_files = deterministic_empty_framework_app_files(
+            "SvelteKitで予約フォームアプリを作って下さい。入力チェックと保存も入れて下さい。",
+        )
+        .expect("sveltekit files");
         assert!(
-            deterministic_empty_framework_app_files(
-                "SvelteKitで予約フォームアプリを作って下さい。入力チェックと保存も入れて下さい。"
-            )
-            .is_none()
+            svelte_files
+                .iter()
+                .any(|(path, _)| path.ends_with("src/routes/+page.svelte"))
         );
         assert!(!request_needs_playable_ui_quality_gate(
             "READMEをわかりやすく改善してください"
@@ -2903,7 +3238,7 @@ mod tests {
 
     #[test]
     fn unsupported_ui_framework_detection_is_explicit() {
-        assert!(request_mentions_unsupported_ui_framework(
+        assert!(!request_mentions_unsupported_ui_framework(
             "SvelteKitで小さなメモアプリを作って下さい。"
         ));
         assert!(request_mentions_unsupported_ui_framework(

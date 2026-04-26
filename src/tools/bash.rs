@@ -15,6 +15,8 @@ const BLOCKED_SNIPPETS: &[&str] = &[
     "dd if=",
     ":(){",
     "rm -rf .anvil",
+    "sudo ",
+    "chmod -r 777",
 ];
 const LONG_RUNNING_TIMEOUT: Duration = Duration::from_secs(15);
 const TERMINATE_GRACE: Duration = Duration::from_secs(2);
@@ -24,6 +26,10 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 pub enum BashCommandClass {
     ReadOnly,
     BuildTest,
+    ScriptRun,
+    Network,
+    Mutating,
+    Dangerous,
     General,
 }
 
@@ -113,10 +119,18 @@ pub fn run(
 
 pub fn classify_command(command: &str) -> BashCommandClass {
     let normalized = command.trim().to_ascii_lowercase();
-    if is_read_only_command(&normalized) {
+    if is_dangerous_command(&normalized) {
+        BashCommandClass::Dangerous
+    } else if command_uses_network(&normalized) {
+        BashCommandClass::Network
+    } else if is_read_only_command(&normalized) {
         BashCommandClass::ReadOnly
     } else if is_build_test_command(&normalized) {
         BashCommandClass::BuildTest
+    } else if is_script_run_command(&normalized) {
+        BashCommandClass::ScriptRun
+    } else if is_mutating_command(&normalized) {
+        BashCommandClass::Mutating
     } else {
         BashCommandClass::General
     }
@@ -379,13 +393,78 @@ fn enforce_offline_policy(
             command.trim()
         ));
     }
-    if matches!(class, BashCommandClass::General) {
+    if matches!(
+        class,
+        BashCommandClass::General
+            | BashCommandClass::Network
+            | BashCommandClass::Mutating
+            | BashCommandClass::Dangerous
+    ) {
         return Err(format!(
-            "offline mode only allows read-only or build-test shell commands: {}",
+            "offline mode only allows read-only, build-test, or local script-run shell commands: {}",
             command.trim()
         ));
     }
     Ok(())
+}
+
+fn is_script_run_command(normalized: &str) -> bool {
+    [
+        "python ",
+        "python3 ",
+        "python -m ",
+        "python3 -m ",
+        "node ",
+        "deno run ",
+        "bun run ",
+        "ruby ",
+        "perl ",
+        "sh ",
+        "bash ",
+    ]
+    .iter()
+    .any(|needle| normalized == *needle || normalized.starts_with(needle))
+}
+
+fn is_mutating_command(normalized: &str) -> bool {
+    [
+        "cp ",
+        "mv ",
+        "mkdir ",
+        "touch ",
+        "printf ",
+        "echo ",
+        "tee ",
+        "git add",
+        "git commit",
+        "git merge",
+        "git rebase",
+        "cargo fmt",
+        "npm run format",
+        "pnpm format",
+        "yarn format",
+    ]
+    .iter()
+    .any(|needle| normalized == *needle || normalized.starts_with(needle))
+        || normalized.contains(" >")
+        || normalized.contains(">>")
+}
+
+fn is_dangerous_command(normalized: &str) -> bool {
+    [
+        "rm ",
+        "rm -r",
+        "rm -rf",
+        "sudo ",
+        "chmod -r",
+        "chown -r",
+        "mkfs",
+        "dd ",
+        "diskutil ",
+        "launchctl ",
+    ]
+    .iter()
+    .any(|needle| normalized == *needle || normalized.starts_with(needle))
 }
 
 fn is_read_only_command(normalized: &str) -> bool {
@@ -541,8 +620,21 @@ mod tests {
         assert_eq!(classify_command("pwd"), BashCommandClass::ReadOnly);
         assert_eq!(classify_command("cargo test"), BashCommandClass::BuildTest);
         assert_eq!(
+            classify_command("python3 scripts/check.py"),
+            BashCommandClass::ScriptRun
+        );
+        assert_eq!(classify_command("mkdir -p out"), BashCommandClass::Mutating);
+        assert_eq!(
+            classify_command("curl -I https://example.com"),
+            BashCommandClass::Network
+        );
+        assert_eq!(
+            classify_command("rm -rf build"),
+            BashCommandClass::Dangerous
+        );
+        assert_eq!(
             classify_command("echo hello > output.txt"),
-            BashCommandClass::General
+            BashCommandClass::Mutating
         );
     }
 
