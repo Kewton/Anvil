@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use crate::agent::prompting::load_project_instructions;
+
 const MAX_OUTPUT_BYTES: usize = 12_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,6 +23,9 @@ pub(super) struct AutoTestRunner;
 
 impl AutoTestRunner {
     pub(super) fn detect(work_root: &Path, changed_files: &[String]) -> Option<AutoTestPlan> {
+        if let Some(plan) = detect_project_instruction_test(work_root, changed_files) {
+            return Some(plan);
+        }
         if work_root.join("Cargo.toml").is_file() {
             return Some(AutoTestPlan {
                 command: "cargo test".to_string(),
@@ -91,6 +96,77 @@ impl AutoTestRunner {
     }
 }
 
+fn detect_project_instruction_test(
+    work_root: &Path,
+    changed_files: &[String],
+) -> Option<AutoTestPlan> {
+    let instructions = load_project_instructions(work_root, work_root)?;
+    let command = extract_safe_preferred_command(&instructions.content, work_root, changed_files)?;
+    Some(AutoTestPlan {
+        command,
+        reason: "ANVIL.md preferred command".to_string(),
+    })
+}
+
+fn extract_safe_preferred_command(
+    text: &str,
+    work_root: &Path,
+    changed_files: &[String],
+) -> Option<String> {
+    for command in backtick_commands(text) {
+        let normalized = command.trim().to_ascii_lowercase();
+        if changed_files.iter().any(|path| path.ends_with(".py"))
+            && (normalized.starts_with("python3 ") || normalized.starts_with("python "))
+            && command_references_existing_local_file(&command, work_root)
+        {
+            return Some(command);
+        }
+        if work_root.join("Cargo.toml").is_file()
+            && matches!(
+                normalized.as_str(),
+                "cargo test" | "cargo clippy --all-targets -- -d warnings" | "cargo check"
+            )
+        {
+            return Some(command);
+        }
+        if work_root.join("package.json").is_file()
+            && matches!(normalized.as_str(), "npm test" | "npm run build")
+        {
+            return Some(command);
+        }
+    }
+    None
+}
+
+fn backtick_commands(text: &str) -> Vec<String> {
+    let mut commands = Vec::new();
+    let mut rest = text;
+    while let Some((_, after_open)) = rest.split_once('`') {
+        let Some((candidate, after_close)) = after_open.split_once('`') else {
+            break;
+        };
+        let trimmed = candidate.trim();
+        if !trimmed.is_empty() && trimmed.len() <= 200 {
+            commands.push(trimmed.to_string());
+        }
+        rest = after_close;
+    }
+    commands
+}
+
+fn command_references_existing_local_file(command: &str, work_root: &Path) -> bool {
+    command
+        .split_whitespace()
+        .filter(|token| token.ends_with(".py") || token.ends_with(".csv"))
+        .map(|token| token.trim_matches(['"', '\'', '`']))
+        .all(|token| {
+            !token.contains('/')
+                && !token.contains('\\')
+                && !token.starts_with('.')
+                && work_root.join(token).is_file()
+        })
+}
+
 fn has_python_surface(work_root: &Path, changed_files: &[String]) -> bool {
     changed_files.iter().any(|path| path.ends_with(".py"))
         || work_root.join("pyproject.toml").is_file()
@@ -153,5 +229,34 @@ mod tests {
         std::fs::create_dir(dir.path().join("tests")).expect("tests dir");
         let plan = AutoTestRunner::detect(dir.path(), &["app.py".to_string()]).expect("plan");
         assert_eq!(plan.command, "python3 -m pytest");
+    }
+
+    #[test]
+    fn detects_safe_anvil_python_command() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("ANVIL.md"),
+            "Preferred verify: `python3 project_csv_tool.py example.csv`\n",
+        )
+        .expect("anvil");
+        std::fs::write(dir.path().join("project_csv_tool.py"), "print('ok')\n").expect("py");
+        std::fs::write(dir.path().join("example.csv"), "Category,Amount\nA,1\n").expect("csv");
+
+        let plan =
+            AutoTestRunner::detect(dir.path(), &["project_csv_tool.py".to_string()]).expect("plan");
+        assert_eq!(plan.command, "python3 project_csv_tool.py example.csv");
+    }
+
+    #[test]
+    fn ignores_unsafe_anvil_command() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("ANVIL.md"),
+            "Preferred verify: `rm -rf .`\n",
+        )
+        .expect("anvil");
+        let plan = AutoTestRunner::detect(dir.path(), &["tool.py".to_string()]);
+        assert!(plan.is_some());
+        assert_ne!(plan.unwrap().command, "rm -rf .");
     }
 }

@@ -17,8 +17,12 @@ pub(super) fn empty_framework_game_files(request: &str) -> Option<Vec<(PathBuf, 
     quality::deterministic_empty_framework_game_files(request)
 }
 
-pub(super) fn empty_python_cli_files(request: &str) -> Option<Vec<(PathBuf, String)>> {
-    quality::deterministic_empty_python_cli_files(request)
+pub(super) fn empty_python_cli_files_with_names(
+    request: &str,
+    script_name: Option<&str>,
+    sample_name: Option<&str>,
+) -> Option<Vec<(PathBuf, String)>> {
+    quality::deterministic_empty_python_cli_files_with_names(request, script_name, sample_name)
 }
 
 pub(super) fn empty_docs_files(request: &str) -> Option<Vec<(PathBuf, String)>> {

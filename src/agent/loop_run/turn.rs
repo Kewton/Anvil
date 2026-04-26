@@ -203,6 +203,41 @@ fn answer_only_reply_is_inadequate(reply: &str) -> bool {
     trimmed.chars().count() < 40
 }
 
+fn extract_filename_with_suffix(text: &str, suffix: &str) -> Option<String> {
+    text.split(|ch: char| {
+        ch.is_whitespace()
+            || matches!(
+                ch,
+                '`' | '"'
+                    | '\''
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '、'
+                    | '。'
+                    | '，'
+                    | '：'
+                    | ':'
+                    | ';'
+            )
+    })
+    .map(|token| token.trim_matches([',', '.', '。', '、']))
+    .find(|token| {
+        token.ends_with(suffix)
+            && token.len() <= 80
+            && !token.contains('/')
+            && !token.contains('\\')
+            && !token.starts_with('.')
+            && token
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+    })
+    .map(ToString::to_string)
+}
+
 fn write_stdout_rendered(text: &str, trailing_newline: bool) {
     let mut out = io::stdout().lock();
     let rendered = raw_mode_safe_text(text);
@@ -3301,10 +3336,15 @@ impl Agent {
         let policy = self.session.mode_state.policy();
         let request = self.active_request_text()?;
         let (label, event, files, final_message) = if policy.allow_python_deterministic_fallback {
+            let (script_name, sample_name) = self.python_csv_names_from_request_and_anvil(&request);
             (
                 "Python fallback",
                 "agent.empty_workspace.deterministic_python_cli",
-                deterministic::empty_python_cli_files(&request)?,
+                deterministic::empty_python_cli_files_with_names(
+                    &request,
+                    script_name.as_deref(),
+                    sample_name.as_deref(),
+                )?,
                 "Implemented the requested Python CSV CLI with deterministic files.".to_string(),
             )
         } else if policy.allow_docs_deterministic_fallback {
@@ -3380,6 +3420,24 @@ impl Agent {
             Vec::new(),
         ));
         Some(final_message)
+    }
+
+    fn python_csv_names_from_request_and_anvil(
+        &self,
+        request: &str,
+    ) -> (Option<String>, Option<String>) {
+        let request_script = extract_filename_with_suffix(request, ".py");
+        let request_sample = extract_filename_with_suffix(request, ".csv");
+        let instructions = prompting::load_project_instructions(&self.config.cwd, &self.work_root);
+        let instruction_text = instructions.as_ref().map(|value| value.content.as_str());
+        let instruction_script =
+            instruction_text.and_then(|text| extract_filename_with_suffix(text, ".py"));
+        let instruction_sample =
+            instruction_text.and_then(|text| extract_filename_with_suffix(text, ".csv"));
+        (
+            request_script.or(instruction_script),
+            request_sample.or(instruction_sample),
+        )
     }
 
     fn maybe_materialize_framework_game_fallback(&mut self, last_iter: usize) -> bool {
@@ -4837,7 +4895,7 @@ fn workspace_appears_empty(work_root: &Path) -> bool {
         let name = name.to_string_lossy();
         !matches!(
             name.as_ref(),
-            ".git" | ".anvil" | ".anvil-state" | "node_modules" | "target"
+            ".git" | ".anvil" | ".anvil-state" | "ANVIL.md" | "node_modules" | "target"
         )
     })
 }
@@ -6105,9 +6163,10 @@ fn format_blocked_progress_line(
 #[cfg(test)]
 mod truncate_tests {
     use super::{
-        ScaffoldFramework, deterministic_nextjs_scaffold_reply, reply_looks_like_future_work,
-        requested_scaffold_framework, scaffold_command_matches_framework,
-        task_or_plan_requires_nextjs_scaffold, task_requires_nextjs_scaffold, truncate,
+        ScaffoldFramework, deterministic_nextjs_scaffold_reply, extract_filename_with_suffix,
+        reply_looks_like_future_work, requested_scaffold_framework,
+        scaffold_command_matches_framework, task_or_plan_requires_nextjs_scaffold,
+        task_requires_nextjs_scaffold, truncate,
     };
 
     #[test]
@@ -6139,6 +6198,25 @@ mod truncate_tests {
         assert!(!reply_looks_like_future_work(
             "Implemented the first playable shell in app/page.tsx."
         ));
+    }
+
+    #[test]
+    fn extracts_safe_project_instruction_filenames() {
+        assert_eq!(
+            extract_filename_with_suffix("main script `project_csv_tool.py`", ".py"),
+            Some("project_csv_tool.py".to_string())
+        );
+        assert_eq!(
+            extract_filename_with_suffix(
+                "メインスクリプト名は user_requested_name.py にして下さい",
+                ".py"
+            ),
+            Some("user_requested_name.py".to_string())
+        );
+        assert_eq!(
+            extract_filename_with_suffix("use ../unsafe.py", ".py"),
+            None
+        );
     }
 
     #[test]
@@ -7185,6 +7263,7 @@ mod progress_tests {
         std::fs::create_dir_all(work_root.join(".git")).unwrap();
         std::fs::create_dir_all(work_root.join(".anvil/plans")).unwrap();
         std::fs::create_dir_all(work_root.join(".anvil-state")).unwrap();
+        std::fs::write(work_root.join("ANVIL.md"), "# rules\n").unwrap();
         assert!(workspace_appears_empty(work_root));
 
         std::fs::write(work_root.join("README.md"), "# app\n").unwrap();

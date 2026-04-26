@@ -751,6 +751,14 @@ pub(super) fn deterministic_empty_framework_app_files(
 pub(super) fn deterministic_empty_python_cli_files(
     request: &str,
 ) -> Option<Vec<(PathBuf, String)>> {
+    deterministic_empty_python_cli_files_with_names(request, None, None)
+}
+
+pub(super) fn deterministic_empty_python_cli_files_with_names(
+    request: &str,
+    script_name: Option<&str>,
+    sample_name: Option<&str>,
+) -> Option<Vec<(PathBuf, String)>> {
     let lower = request.to_ascii_lowercase();
     let asks_python =
         lower.contains("python") || lower.contains("python3") || lower.contains(".py");
@@ -777,10 +785,16 @@ pub(super) fn deterministic_empty_python_cli_files(
     if !asks_python || !asks_cli || !asks_csv || disallowed_ui.iter().any(|kw| lower.contains(kw)) {
         return None;
     }
+    let script_name = script_name
+        .and_then(|name| safe_generated_filename(name, ".py"))
+        .unwrap_or_else(|| "analyze_csv.py".to_string());
+    let sample_name = sample_name
+        .and_then(|name| safe_generated_filename(name, ".csv"))
+        .unwrap_or_else(|| "sample.csv".to_string());
 
     Some(vec![
         (
-            PathBuf::from("analyze_csv.py"),
+            PathBuf::from(&script_name),
             r#"#!/usr/bin/env python3
 import argparse
 import csv
@@ -822,24 +836,43 @@ if __name__ == "__main__":
             .to_string(),
         ),
         (
-            PathBuf::from("sample.csv"),
+            PathBuf::from(&sample_name),
             "Category,Amount\nFood,1200\nTransport,450\nFood,800\nBooks,2500\n".to_string(),
         ),
         (
             PathBuf::from("README.md"),
-            r#"# CSV Summary CLI
+            format!(
+                r#"# CSV Summary CLI
 
 Run:
 
 ```bash
-python3 analyze_csv.py sample.csv
+python3 {script_name} {sample_name}
 ```
 
 The input CSV must include `Category` and `Amount` columns. Use `--category` and `--amount` to point the CLI at different column names.
 "#
-            .to_string(),
+            ),
         ),
     ])
+}
+
+fn safe_generated_filename(candidate: &str, required_suffix: &str) -> Option<String> {
+    let trimmed = candidate
+        .trim()
+        .trim_matches(['`', '"', '\'', '。', '、', ',', '.']);
+    if trimmed.len() > 80
+        || !trimmed.ends_with(required_suffix)
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.starts_with('.')
+    {
+        return None;
+    }
+    let valid = trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'));
+    valid.then(|| trimmed.to_string())
 }
 
 pub(super) fn deterministic_empty_docs_files(request: &str) -> Option<Vec<(PathBuf, String)>> {
@@ -3266,6 +3299,32 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn deterministic_python_cli_accepts_safe_project_names() {
+        let files = deterministic_empty_python_cli_files_with_names(
+            "PythonでCSVを集計するCLIを作成してください。",
+            Some("project_csv_tool.py"),
+            Some("example.csv"),
+        )
+        .expect("python cli files");
+        assert!(
+            files
+                .iter()
+                .any(|(path, _)| path == Path::new("project_csv_tool.py"))
+        );
+        assert!(
+            files
+                .iter()
+                .any(|(path, _)| path == Path::new("example.csv"))
+        );
+        let readme = files
+            .iter()
+            .find(|(path, _)| path == Path::new("README.md"))
+            .map(|(_, content)| content)
+            .expect("README");
+        assert!(readme.contains("python3 project_csv_tool.py example.csv"));
     }
 
     #[test]
