@@ -30,6 +30,247 @@ impl TaskProfile {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub enum WorkMode {
+    #[default]
+    Auto,
+    TypeScriptUi,
+    Python,
+    Docs,
+    AnswerOnly,
+    GenericCode,
+    Unknown,
+}
+
+impl WorkMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WorkMode::Auto => "auto",
+            WorkMode::TypeScriptUi => "typescript-ui",
+            WorkMode::Python => "python",
+            WorkMode::Docs => "docs",
+            WorkMode::AnswerOnly => "answer-only",
+            WorkMode::GenericCode => "generic-code",
+            WorkMode::Unknown => "unknown",
+        }
+    }
+
+    pub fn policy(self) -> ModePolicy {
+        match self {
+            WorkMode::TypeScriptUi => ModePolicy {
+                repo_edit_required: true,
+                allow_ui_deterministic_fallback: true,
+                allow_polish_fallback: true,
+                allow_python_deterministic_fallback: false,
+                allow_docs_deterministic_fallback: false,
+                quality_gate_enabled: true,
+                include_working_memory: true,
+                allow_repo_context: true,
+            },
+            WorkMode::Python => ModePolicy {
+                repo_edit_required: true,
+                allow_ui_deterministic_fallback: false,
+                allow_polish_fallback: false,
+                allow_python_deterministic_fallback: true,
+                allow_docs_deterministic_fallback: false,
+                quality_gate_enabled: false,
+                include_working_memory: true,
+                allow_repo_context: true,
+            },
+            WorkMode::Docs => ModePolicy {
+                repo_edit_required: true,
+                allow_ui_deterministic_fallback: false,
+                allow_polish_fallback: false,
+                allow_python_deterministic_fallback: false,
+                allow_docs_deterministic_fallback: true,
+                quality_gate_enabled: false,
+                include_working_memory: true,
+                allow_repo_context: true,
+            },
+            WorkMode::AnswerOnly => ModePolicy {
+                repo_edit_required: false,
+                allow_ui_deterministic_fallback: false,
+                allow_polish_fallback: false,
+                allow_python_deterministic_fallback: false,
+                allow_docs_deterministic_fallback: false,
+                quality_gate_enabled: false,
+                include_working_memory: false,
+                allow_repo_context: true,
+            },
+            WorkMode::GenericCode | WorkMode::Unknown => ModePolicy {
+                repo_edit_required: true,
+                allow_ui_deterministic_fallback: false,
+                allow_polish_fallback: false,
+                allow_python_deterministic_fallback: false,
+                allow_docs_deterministic_fallback: false,
+                quality_gate_enabled: false,
+                include_working_memory: true,
+                allow_repo_context: true,
+            },
+            WorkMode::Auto => ModePolicy {
+                repo_edit_required: true,
+                allow_ui_deterministic_fallback: true,
+                allow_polish_fallback: true,
+                allow_python_deterministic_fallback: false,
+                allow_docs_deterministic_fallback: false,
+                quality_gate_enabled: true,
+                include_working_memory: true,
+                allow_repo_context: true,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModePolicy {
+    pub repo_edit_required: bool,
+    pub allow_ui_deterministic_fallback: bool,
+    pub allow_polish_fallback: bool,
+    pub allow_python_deterministic_fallback: bool,
+    pub allow_docs_deterministic_fallback: bool,
+    pub quality_gate_enabled: bool,
+    pub include_working_memory: bool,
+    pub allow_repo_context: bool,
+}
+
+pub fn infer_work_mode_from_text(raw: &str) -> WorkMode {
+    let lower = raw.to_ascii_lowercase();
+    let explicit_edit = contains_any(
+        &lower,
+        &[
+            "create",
+            "build",
+            "develop",
+            "implement",
+            "scaffold",
+            "write",
+            "edit",
+            "update",
+            "modify",
+            "fix",
+            "refactor",
+            "add",
+            "生成",
+            "作成",
+            "開発",
+            "実装",
+            "編集",
+            "更新",
+            "変更して",
+            "修正",
+            "追加",
+        ],
+    );
+    let explicit_no_edit = contains_any(
+        &lower,
+        &[
+            "do not modify",
+            "don't modify",
+            "no file changes",
+            "without changing files",
+            "read only",
+            "read-only",
+            "変更しない",
+            "編集しない",
+            "ファイルは変更しない",
+            "変更せず",
+            "編集せず",
+            "読み取り専用",
+        ],
+    );
+    let answer_request = contains_any(
+        &lower,
+        &[
+            "summarize",
+            "explain",
+            "tell me",
+            "analyze",
+            "investigate",
+            "review",
+            "what is",
+            "how is",
+            "要約",
+            "説明",
+            "教えて",
+            "整理",
+            "調査",
+            "検討",
+            "レビュー",
+            "どうですか",
+            "とは",
+        ],
+    );
+    if explicit_no_edit || (answer_request && !explicit_edit) {
+        return WorkMode::AnswerOnly;
+    }
+
+    let typescript_ui = contains_any(
+        &lower,
+        &[
+            "next.js",
+            "nextjs",
+            "react",
+            "nuxt",
+            "vue",
+            "vite",
+            "typescript",
+            "tsx",
+            "browser ui",
+            "web ui",
+            "web app",
+            "frontend",
+            "front-end",
+            "ui",
+            "ux",
+            "画面",
+            "アプリ",
+            "ゲーム",
+            "フロントエンド",
+        ],
+    );
+    if typescript_ui {
+        return WorkMode::TypeScriptUi;
+    }
+
+    if contains_any(
+        &lower,
+        &[
+            "python", ".py", "pytest", "pip", "venv", "csv", "pandas", "python3",
+        ],
+    ) {
+        return WorkMode::Python;
+    }
+
+    if contains_any(
+        &lower,
+        &[
+            "readme",
+            "markdown",
+            "documentation",
+            "docs",
+            "doc",
+            "document",
+            "ドキュメント",
+            "設計書",
+            "仕様書",
+            "手順書",
+            "文章",
+        ],
+    ) {
+        return WorkMode::Docs;
+    }
+
+    if explicit_edit {
+        WorkMode::GenericCode
+    } else {
+        WorkMode::Unknown
+    }
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub enum PlanStage {
     #[default]
     Stage1,
@@ -65,6 +306,8 @@ pub struct ModeState {
     #[serde(default)]
     pub task_profile: TaskProfile,
     #[serde(default)]
+    pub work_mode: WorkMode,
+    #[serde(default)]
     pub plan_stage: PlanStage,
 }
 
@@ -74,12 +317,17 @@ impl Default for ModeState {
             mode: ExecutionMode::Act,
             active_plan_path: None,
             task_profile: TaskProfile::Generic,
+            work_mode: WorkMode::Auto,
             plan_stage: PlanStage::Stage1,
         }
     }
 }
 
 impl ModeState {
+    pub fn policy(&self) -> ModePolicy {
+        self.work_mode.policy()
+    }
+
     pub fn enter_plan(
         &mut self,
         plan_dir: PathBuf,
@@ -93,6 +341,7 @@ impl ModeState {
         self.mode = ExecutionMode::Plan;
         self.active_plan_path = Some(path.clone());
         self.task_profile = task_profile;
+        self.work_mode = WorkMode::Auto;
         self.plan_stage = PlanStage::Stage1;
         Ok(path)
     }
@@ -100,5 +349,50 @@ impl ModeState {
     pub fn approve(&mut self) {
         self.mode = ExecutionMode::Act;
         self.plan_stage = PlanStage::Ready;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn infer_work_mode_detects_answer_only_without_repo_edits() {
+        assert_eq!(
+            infer_work_mode_from_text("READMEを要約してください。ファイルは変更しないでください。"),
+            WorkMode::AnswerOnly
+        );
+        assert_eq!(
+            infer_work_mode_from_text("現在の設計について教えて"),
+            WorkMode::AnswerOnly
+        );
+    }
+
+    #[test]
+    fn infer_work_mode_detects_specific_edit_domains() {
+        assert_eq!(
+            infer_work_mode_from_text("Next.jsで家計簿UIアプリを作成してください"),
+            WorkMode::TypeScriptUi
+        );
+        assert_eq!(
+            infer_work_mode_from_text("PythonでCSVを集計するCLIを作成してください"),
+            WorkMode::Python
+        );
+        assert_eq!(
+            infer_work_mode_from_text("READMEを更新してください"),
+            WorkMode::Docs
+        );
+    }
+
+    #[test]
+    fn answer_only_policy_disables_repo_edit_recovery() {
+        let state = ModeState {
+            work_mode: WorkMode::AnswerOnly,
+            ..ModeState::default()
+        };
+        let policy = state.policy();
+        assert!(!policy.repo_edit_required);
+        assert!(!policy.allow_ui_deterministic_fallback);
+        assert!(!policy.include_working_memory);
     }
 }

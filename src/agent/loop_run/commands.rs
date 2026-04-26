@@ -1,9 +1,14 @@
+use super::quality::{
+    deterministic_empty_docs_files, deterministic_empty_framework_app_files,
+    deterministic_empty_python_cli_files, first_existing_impl_target,
+    request_allows_fast_polish_fallback, request_is_playable_ui_improvement,
+};
 use super::slash_commands::{self, AnvilEditor, build_editor};
 use super::summary::{ExitReason, format_run_summary};
 use super::*;
 use crate::config::LogLevel;
 use crate::logging::log_llm_event;
-use crate::modes::plan_act::{PlanStage, TaskProfile};
+use crate::modes::plan_act::{PlanStage, TaskProfile, infer_work_mode_from_text};
 use crate::ollama::xml_fallback::strip_think_tags;
 use crate::session::store::ConversationMessage;
 use crossterm::event::{self, Event, KeyCode};
@@ -896,6 +901,63 @@ impl Agent {
             return Ok(None);
         }
 
+        let work_mode = infer_work_mode_from_text(input);
+        self.session.mode_state.work_mode = work_mode;
+        let policy = work_mode.policy();
+        if !policy.repo_edit_required {
+            self.session.mode_state.task_profile = TaskProfile::Research;
+            log_llm_event(
+                "agent.classifier.bypassed_for_answer_only_mode",
+                serde_json::json!({
+                    "session_id": self.session_store.session_id(),
+                    "input": input,
+                    "work_mode": work_mode.as_str(),
+                    "task_profile": TaskProfile::Research.as_str(),
+                }),
+            );
+            return Ok(None);
+        }
+
+        if (policy.allow_python_deterministic_fallback
+            && deterministic_empty_python_cli_files(input).is_some()
+            && Self::command_workspace_appears_empty(&self.work_root))
+            || (policy.allow_docs_deterministic_fallback
+                && deterministic_empty_docs_files(input).is_some()
+                && Self::command_workspace_appears_empty(&self.work_root))
+        {
+            self.session.mode_state.task_profile = TaskProfile::Coding;
+            log_llm_event(
+                "agent.classifier.bypassed_for_mode_deterministic_fallback",
+                serde_json::json!({
+                    "session_id": self.session_store.session_id(),
+                    "input": input,
+                    "work_root": self.work_root.display().to_string(),
+                    "task_profile": TaskProfile::Coding.as_str(),
+                    "work_mode": work_mode.as_str(),
+                }),
+            );
+            return Ok(None);
+        }
+
+        if (policy.allow_ui_deterministic_fallback
+            && Self::deterministic_framework_app_auto_plan_bypass(input, &self.work_root))
+            || (policy.allow_polish_fallback
+                && Self::deterministic_playable_ui_polish_auto_plan_bypass(input, &self.work_root))
+        {
+            self.session.mode_state.task_profile = TaskProfile::Coding;
+            log_llm_event(
+                "agent.classifier.bypassed_for_deterministic_ui_fallback",
+                serde_json::json!({
+                    "session_id": self.session_store.session_id(),
+                    "input": input,
+                    "work_root": self.work_root.display().to_string(),
+                    "task_profile": TaskProfile::Coding.as_str(),
+                    "work_mode": work_mode.as_str(),
+                }),
+            );
+            return Ok(None);
+        }
+
         match self.classify_large_task_with_main_model(input) {
             Ok(classified) if classified.large_task => {
                 log_llm_event(
@@ -957,6 +1019,37 @@ impl Agent {
                 }
             }
         }
+    }
+
+    fn deterministic_framework_app_auto_plan_bypass(
+        input: &str,
+        work_root: &std::path::Path,
+    ) -> bool {
+        deterministic_empty_framework_app_files(input).is_some()
+            && Self::command_workspace_appears_empty(work_root)
+    }
+
+    fn deterministic_playable_ui_polish_auto_plan_bypass(
+        input: &str,
+        work_root: &std::path::Path,
+    ) -> bool {
+        request_is_playable_ui_improvement(input)
+            && request_allows_fast_polish_fallback(input)
+            && first_existing_impl_target(work_root).is_some()
+    }
+
+    fn command_workspace_appears_empty(work_root: &std::path::Path) -> bool {
+        let Ok(entries) = std::fs::read_dir(work_root) else {
+            return false;
+        };
+        entries.flatten().all(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            matches!(
+                name.as_ref(),
+                ".git" | ".anvil" | ".anvil-state" | "node_modules" | "target"
+            )
+        })
     }
 
     pub fn initial_prompt_from_cli_or_stdin(&self) -> Result<Option<String>, String> {
@@ -1334,9 +1427,10 @@ The plan must still define: (1) the first shippable vertical slice, (2) concrete
         match command {
             "/help" => Ok(AgentEvent::Continue(Some(slash_commands::help_line()))),
             "/status" => Ok(AgentEvent::Continue(Some(format!(
-                "mode={:?} task_profile={} auto_approve={} auto_plan={} native_tools={} cwd={} session={} plan={} approx_tokens={} log_level={} core_only=true",
+                "mode={:?} task_profile={} work_mode={} auto_approve={} auto_plan={} native_tools={} cwd={} session={} plan={} approx_tokens={} log_level={} core_only=true",
                 self.session.mode_state.mode,
                 self.session.mode_state.task_profile.as_str(),
+                self.session.mode_state.work_mode.as_str(),
                 self.config.yes_mode,
                 self.config.auto_plan,
                 self.native_tools_enabled,

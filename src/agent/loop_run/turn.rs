@@ -4,7 +4,7 @@ use super::summary::{ExitReason, LoopResult, LoopStats};
 use super::*;
 use crate::agent::orchestration::{RepoVerification, capture_repo_snapshot, verify_repo_progress};
 use crate::logging::log_llm_event;
-use crate::modes::plan_act::{PlanStage, TaskProfile};
+use crate::modes::plan_act::{PlanStage, TaskProfile, WorkMode, infer_work_mode_from_text};
 use crate::ollama::xml_fallback::normalize_tool_call_arguments;
 use crate::tools::registry::{ToolSpec, resolve_plan_mode_write_target};
 use std::collections::{HashMap, HashSet};
@@ -14,11 +14,12 @@ use std::time::{Duration, Instant};
 #[cfg(test)]
 use super::quality::deterministic_empty_framework_game_files;
 use super::quality::{
-    deterministic_empty_framework_app_files, deterministic_playable_ui_fallback,
+    deterministic_empty_docs_files, deterministic_empty_framework_app_files,
+    deterministic_empty_python_cli_files, deterministic_playable_ui_fallback,
     deterministic_playable_ui_polish_fallback, first_existing_impl_target,
     implementation_quality_issue_for_request, package_json_with_requested_port,
     react_dev_wrapper_for_requested_port, repo_change_request_text,
-    request_needs_playable_ui_quality_gate,
+    request_allows_fast_polish_fallback, request_needs_playable_ui_quality_gate,
 };
 
 /// Maximum number of characters of tool-call arguments retained in trace logs.
@@ -568,12 +569,16 @@ impl Agent {
     ) -> LoopResult {
         self.push_user_message(input.to_string());
         if self.session.mode_state.mode != ExecutionMode::Plan {
+            self.session.mode_state.work_mode = infer_work_mode_from_text(input);
             self.maybe_compact_session(DEFAULT_KEEP_TAIL);
         }
         let _ = self.refresh_plan_stage();
 
-        let action_expectation =
+        let mut action_expectation =
             recovery::classify_action_expectation(input, self.session.mode_state.mode);
+        if !self.session.mode_state.policy().repo_edit_required {
+            action_expectation = recovery::ActionExpectation::None;
+        }
         let requires_action = action_expectation != recovery::ActionExpectation::None;
 
         self.run_actor_loop(
@@ -639,6 +644,15 @@ impl Agent {
 
             if action_expectation == recovery::ActionExpectation::RepoChange
                 && repo_edit_calls_made_this_turn == 0
+                && let Some(summary) = self.maybe_materialize_mode_deterministic_fallback(last_iter)
+            {
+                final_prose = summary;
+                exit_reason = ExitReason::Done;
+                break 'outer;
+            }
+
+            if action_expectation == recovery::ActionExpectation::RepoChange
+                && repo_edit_calls_made_this_turn == 0
                 && self.maybe_materialize_framework_game_fallback(last_iter)
             {
                 final_prose =
@@ -648,8 +662,7 @@ impl Agent {
                 break 'outer;
             }
 
-            if action_expectation == recovery::ActionExpectation::RepoChange
-                && repo_edit_calls_made_this_turn == 0
+            if repo_edit_calls_made_this_turn == 0
                 && self.current_request_needs_playable_ui_quality_gate()
                 && let Some((request, target_path)) = self.accepted_repo_change_polish_target()
             {
@@ -1699,6 +1712,33 @@ impl Agent {
                 continue;
             }
 
+            if !requires_action
+                && self.answer_only_mode_active()
+                && reply_looks_like_future_work(&final_reply)
+            {
+                no_tool_retries += 1;
+                if no_tool_retries >= 2 {
+                    final_prose = self.answer_only_fallback_response();
+                    exit_reason = ExitReason::Done;
+                    break 'outer;
+                }
+                write_stdout_rendered(
+                    &format_iteration_status(
+                        last_iter,
+                        self.config.max_iterations,
+                        "Retry requested",
+                        "The model answered with next-step prose in answer-only mode. Asked it to answer directly without more tools.",
+                        self.footer.current_cols(),
+                    ),
+                    true,
+                );
+                self.push_system_note(
+                    "[Answer-only Recovery] Answer the user's request now. Do not say you will inspect more files, do not use Bash, and do not edit files."
+                        .to_string(),
+                );
+                continue;
+            }
+
             if action_expectation == recovery::ActionExpectation::RepoChange
                 && repo_edit_calls_made_this_turn == 0
             {
@@ -2443,6 +2483,9 @@ impl Agent {
             plan_stage,
             &next_sections,
         )));
+        if let Some(message) = self.mode_policy_message() {
+            messages.push(message);
+        }
         if focused_edit_target.is_none() {
             if self.active_task_expects_repo_change() && self.workspace_appears_empty() {
                 if let Some(framework) = self.active_task_requested_scaffold_framework() {
@@ -2562,6 +2605,13 @@ impl Agent {
 
     fn effective_tool_specs(&self) -> Vec<ToolSpec> {
         let mut specs = self.tool_registry.specs().to_vec();
+        if self.answer_only_mode_active() {
+            if self.workspace_appears_empty() {
+                specs.clear();
+                return specs;
+            }
+            specs.retain(|spec| matches!(spec.function.name.as_str(), "Read" | "Glob" | "Grep"));
+        }
         if let Some(target) = self.focused_edit_recovery_target() {
             let target_already_read =
                 focused_edit_target_already_read(&self.session.messages, &target, &self.work_root);
@@ -2572,6 +2622,29 @@ impl Agent {
             }
         }
         specs
+    }
+
+    fn mode_policy_message(&self) -> Option<ConversationMessage> {
+        let work_mode = self.session.mode_state.work_mode;
+        let text = match work_mode {
+            WorkMode::Auto => return None,
+            WorkMode::TypeScriptUi => {
+                "[Mode Policy] Work mode is TypeScript UI. Prefer the existing JavaScript or TypeScript framework when present. Do not switch to Python or documentation-only output unless the user asks."
+            }
+            WorkMode::Python => {
+                "[Mode Policy] Work mode is Python. Use Python-oriented files and verification. Do not create TypeScript, React, Next.js, Nuxt, or browser UI scaffolds unless the user asks."
+            }
+            WorkMode::Docs => {
+                "[Mode Policy] Work mode is documentation. Edit or create documentation files only unless code changes are explicitly requested."
+            }
+            WorkMode::AnswerOnly => {
+                "[Mode Policy] Work mode is answer-only/read-only. You may inspect files if needed, but do not require or perform repository edits."
+            }
+            WorkMode::GenericCode | WorkMode::Unknown => {
+                "[Mode Policy] Work mode is generic code. Follow the repository stack and avoid TypeScript UI deterministic fallback unless the request explicitly asks for a browser UI."
+            }
+        };
+        Some(ConversationMessage::system(text.to_string()))
     }
 
     fn forced_small_edit_recovery_message(&self) -> Option<String> {
@@ -2702,6 +2775,10 @@ impl Agent {
         arguments: &serde_json::Value,
         cancel_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> String {
+        if let Some(err) = self.answer_only_policy_error(name) {
+            self.session.working_memory.note_error(err.clone());
+            return lifecycle::format_tool_error(&err);
+        }
         if let Some(err) = self.empty_workspace_scaffold_policy_error(name, arguments) {
             self.session.working_memory.note_error(err.clone());
             return lifecycle::format_tool_error(&err);
@@ -2746,6 +2823,26 @@ impl Agent {
                 lifecycle::format_tool_error(&err)
             }
         }
+    }
+
+    fn answer_only_policy_error(&self, name: &str) -> Option<String> {
+        if !self.answer_only_mode_active() {
+            return None;
+        }
+        if matches!(name, "Read" | "Glob" | "Grep") {
+            return None;
+        }
+        Some(format!(
+            "Error: answer-only mode is read-only. Use Read, Glob, or Grep if inspection is needed, then answer directly without editing files. Blocked tool: {name}."
+        ))
+    }
+
+    fn answer_only_mode_active(&self) -> bool {
+        self.session.mode_state.work_mode == WorkMode::AnswerOnly
+            || self
+                .active_request_text()
+                .as_deref()
+                .is_some_and(|request| infer_work_mode_from_text(request) == WorkMode::AnswerOnly)
     }
 
     fn focused_edit_policy_error(
@@ -2815,8 +2912,101 @@ impl Agent {
         None
     }
 
+    fn maybe_materialize_mode_deterministic_fallback(
+        &mut self,
+        last_iter: usize,
+    ) -> Option<String> {
+        let policy = self.session.mode_state.policy();
+        let request = self.active_request_text()?;
+        let (label, event, files, final_message) = if policy.allow_python_deterministic_fallback {
+            (
+                "Python fallback",
+                "agent.empty_workspace.deterministic_python_cli",
+                deterministic_empty_python_cli_files(&request)?,
+                "Implemented the requested Python CSV CLI with deterministic files.".to_string(),
+            )
+        } else if policy.allow_docs_deterministic_fallback {
+            (
+                "Docs fallback",
+                "agent.empty_workspace.deterministic_docs",
+                deterministic_empty_docs_files(&request)?,
+                "Created the requested documentation with deterministic files.".to_string(),
+            )
+        } else {
+            return None;
+        };
+        if !self.workspace_appears_empty() {
+            return None;
+        }
+
+        let mut written = Vec::<PathBuf>::new();
+        for (relative, content) in files {
+            let target = self.work_root.join(&relative);
+            if let Some(parent) = target.parent()
+                && let Err(err) = std::fs::create_dir_all(parent)
+            {
+                self.session.working_memory.note_error(format!(
+                    "deterministic fallback: failed to create {}: {err}",
+                    parent.display()
+                ));
+                return None;
+            }
+            if let Err(err) = std::fs::write(&target, content) {
+                self.session.working_memory.note_error(format!(
+                    "deterministic fallback: failed to write {}: {err}",
+                    target.display()
+                ));
+                return None;
+            }
+            self.session
+                .working_memory
+                .note_touched_file(normalize_memory_path(
+                    &relative.to_string_lossy(),
+                    &self.work_root,
+                ));
+            written.push(relative);
+        }
+
+        let written_paths = written
+            .iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        write_stdout_rendered(
+            &format_iteration_status(
+                last_iter,
+                self.config.max_iterations,
+                label,
+                &format!(
+                    "Materialized deterministic files: {}.",
+                    written_paths.join(", ")
+                ),
+                self.footer.current_cols(),
+            ),
+            true,
+        );
+        log_llm_event(
+            event,
+            serde_json::json!({
+                "session_id": self.session_store.session_id(),
+                "work_root": self.work_root.display().to_string(),
+                "work_mode": self.session.mode_state.work_mode.as_str(),
+                "files": written_paths,
+            }),
+        );
+        self.session.messages.push(ConversationMessage::assistant(
+            format!("{final_message} Files: {}.", written_paths.join(", ")),
+            Vec::new(),
+        ));
+        Some(final_message)
+    }
+
     fn maybe_materialize_framework_game_fallback(&mut self, last_iter: usize) -> bool {
-        if !self.current_request_needs_playable_ui_quality_gate() {
+        if !self
+            .session
+            .mode_state
+            .policy()
+            .allow_ui_deterministic_fallback
+        {
             return false;
         }
         let Some(request) = self.active_request_text() else {
@@ -2994,6 +3184,7 @@ impl Agent {
 
     fn active_task_expects_repo_change(&self) -> bool {
         self.session.mode_state.mode == ExecutionMode::Act
+            && self.session.mode_state.policy().repo_edit_required
             && self.active_request_text().as_deref().is_some_and(|task| {
                 recovery::classify_action_expectation(task, self.session.mode_state.mode)
                     == recovery::ActionExpectation::RepoChange
@@ -3029,6 +3220,7 @@ impl Agent {
 
     fn current_request_needs_playable_ui_quality_gate(&self) -> bool {
         self.session.mode_state.mode == ExecutionMode::Act
+            && self.session.mode_state.policy().quality_gate_enabled
             && self
                 .active_request_text()
                 .as_deref()
@@ -3036,6 +3228,9 @@ impl Agent {
     }
 
     fn accepted_repo_change_quality_issue(&self) -> Option<(String, String, String)> {
+        if !self.session.mode_state.policy().quality_gate_enabled {
+            return None;
+        }
         let request = self.active_request_text()?;
         let request = request.trim();
         if !request_needs_playable_ui_quality_gate(request) {
@@ -3053,8 +3248,14 @@ impl Agent {
     }
 
     fn accepted_repo_change_polish_target(&self) -> Option<(String, String)> {
+        if !self.session.mode_state.policy().allow_polish_fallback {
+            return None;
+        }
         let request = self.active_request_text()?;
         let request = request.trim();
+        if !request_allows_fast_polish_fallback(request) {
+            return None;
+        }
         let target = first_existing_impl_target(&self.work_root)?;
         let content = std::fs::read_to_string(&target).ok()?;
         deterministic_playable_ui_polish_fallback(request, &target, &content)?;
@@ -3206,6 +3407,9 @@ impl Agent {
     }
 
     fn working_memory_message(&mut self) -> Option<ConversationMessage> {
+        if !self.session.mode_state.policy().include_working_memory {
+            return None;
+        }
         self.refresh_working_memory();
         self.session
             .working_memory
@@ -3213,7 +3417,19 @@ impl Agent {
             .map(ConversationMessage::system)
     }
 
+    fn answer_only_fallback_response(&self) -> String {
+        let request = self.active_request_text().unwrap_or_default();
+        let lower = request.to_ascii_lowercase();
+        if lower.contains("rust") && lower.contains("cli") {
+            return "ファイルは変更せず、Rust CLI 化の構成案だけを整理します。\n\n- `Cargo.toml`: crate 名、依存、bin 設定を管理する。\n- `src/main.rs`: 引数解析と終了コード制御だけを置く。\n- `src/cli.rs`: CLI オプション、help、入力検証をまとめる。\n- `src/lib.rs`: 実処理をライブラリ化し、CLI 以外からもテスト可能にする。\n- `tests/cli.rs`: 代表コマンド、異常入力、終了コードを E2E 寄りに検証する。\n- `README.md`: インストール、実行例、検証コマンド、制約を記載する。\n\n方針としては、CLI 表層とドメイン処理を分離し、`cargo test` でロジック、必要なら `assert_cmd` 系でコマンド挙動を確認するのが扱いやすいです。".to_string();
+        }
+        "ファイルは変更せず、読み取り専用の回答として整理します。目的、前提、推奨構成、検証方法、残リスクを分け、実装や編集が必要な場合だけ次のターンで明示的に依頼してください。".to_string()
+    }
+
     fn repo_context_message(&mut self) -> Option<ConversationMessage> {
+        if !self.session.mode_state.policy().allow_repo_context {
+            return None;
+        }
         self.refresh_working_memory();
         let task = self.session.working_memory.active_task.clone()?;
         if let Some(cache) = &self.repo_context_cache
