@@ -826,6 +826,49 @@ Keep this document focused on concrete project behavior, setup steps, and mainte
     )])
 }
 
+pub(super) fn request_mentions_unsupported_ui_framework(request: &str) -> bool {
+    let lower = request.to_ascii_lowercase();
+    [
+        "svelte",
+        "sveltekit",
+        "astro",
+        "solid",
+        "solidjs",
+        "solid.js",
+        "qwik",
+        "ember",
+        "remix",
+    ]
+    .iter()
+    .any(|keyword| lower.contains(keyword))
+}
+
+pub(super) fn workspace_has_unsupported_ui_framework(work_root: &Path) -> bool {
+    scaffold_search_roots(work_root).into_iter().any(|root| {
+        [
+            "svelte.config.js",
+            "svelte.config.ts",
+            "astro.config.mjs",
+            "astro.config.ts",
+            "solid.config.ts",
+            "solid.config.js",
+            "src/routes/+page.svelte",
+            "src/App.svelte",
+        ]
+        .iter()
+        .any(|relative| root.join(relative).is_file())
+    })
+}
+
+pub(super) fn request_explicitly_requires_tests(request: &str) -> bool {
+    let lower = request.to_ascii_lowercase();
+    lower.contains("test")
+        || lower.contains("pytest")
+        || lower.contains("unittest")
+        || request.contains("テスト")
+        || request.contains("検証")
+}
+
 pub(super) fn package_json_with_requested_port(
     request: &str,
     package_content: &str,
@@ -2701,17 +2744,6 @@ pub(super) fn first_existing_impl_target(work_root: &Path) -> Option<PathBuf> {
         "app/app.vue",
         "pages/index.vue",
         "src/pages/index.vue",
-        "app/globals.css",
-        "src/app/globals.css",
-        "src/index.css",
-        "assets/css/main.css",
-        "nuxt.config.ts",
-        "nuxt.config.js",
-        "next.config.ts",
-        "next.config.js",
-        "vite.config.ts",
-        "vite.config.js",
-        "package.json",
     ]
     .iter()
     .find_map(|relative| {
@@ -2866,6 +2898,19 @@ mod tests {
         ));
         assert!(!request_allows_fast_polish_fallback(
             "既存のPython CLIにCSV出力を追加して品質を上げて下さい。"
+        ));
+    }
+
+    #[test]
+    fn unsupported_ui_framework_detection_is_explicit() {
+        assert!(request_mentions_unsupported_ui_framework(
+            "SvelteKitで小さなメモアプリを作って下さい。"
+        ));
+        assert!(request_mentions_unsupported_ui_framework(
+            "Astroでドキュメントサイトを作って下さい。"
+        ));
+        assert!(!request_mentions_unsupported_ui_framework(
+            "Next.jsで小さなメモアプリを作って下さい。"
         ));
     }
 
