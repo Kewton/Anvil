@@ -27,6 +27,7 @@ mod interrupt;
 mod lifecycle;
 mod protocol;
 mod quality;
+mod reminder;
 pub mod slash_commands;
 mod spinner;
 mod summary;
@@ -65,6 +66,10 @@ pub struct Agent {
     /// without re-touching `Agent::new` callers (issue #430).
     #[allow(dead_code)]
     footer: FooterHandle,
+    /// Per-turn cap for the Reminder Sidecar (#452). Reset at the top of every
+    /// `handle_user_message`, set to `true` only when an actual sidecar call
+    /// was attempted (Completed/Failed); Skipped does not consume the cap.
+    reminder_called_this_turn: bool,
 }
 
 #[derive(Clone)]
@@ -101,6 +106,7 @@ impl Agent {
             tool_registry: ToolRegistry::default(),
             repo_context_cache: None,
             footer,
+            reminder_called_this_turn: false,
         }
     }
 }

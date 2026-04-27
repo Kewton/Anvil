@@ -1,12 +1,16 @@
 use super::auto_test::{AutoTestPlan, AutoTestResult, AutoTestRunner, classify_auto_test};
 use super::interrupt::{InterruptEnv, InterruptFlag, InterruptMonitor};
 use super::protocol::ExecutionProtocol;
+use super::reminder::{
+    self, ReminderInputs, ReminderOutcome, build_log_payload as build_reminder_log_payload,
+};
 use super::spinner::{Spinner, SpinnerStopSignal};
 use super::summary::{ExitReason, LoopResult, LoopStats};
 use super::*;
 use crate::agent::orchestration::{RepoVerification, capture_repo_snapshot, verify_repo_progress};
 use crate::logging::log_llm_event;
 use crate::modes::plan_act::{PlanStage, TaskProfile, WorkMode, infer_work_mode_from_text};
+use crate::ollama::client::SIDECAR_SUMMARY_TIMEOUT_SECS;
 use crate::ollama::xml_fallback::normalize_tool_call_arguments;
 use crate::session::feedback::{
     FeedbackFrame, FeedbackFrameDraft, FeedbackKind, build_feedback_frame,
@@ -917,7 +921,121 @@ impl Agent {
         // exit disables raw mode deterministically (AC-2 / AC-3 / R1 / R2).
         let env = InterruptEnv::detect();
         let mut monitor = InterruptMonitor::start(&env);
+        // Issue #452: Reminder Sidecar per-turn cap counter. "Turn" is one
+        // user message — reset here so a fresh handle_user_message can fire
+        // the Reminder once even if the previous turn already did.
+        self.reminder_called_this_turn = false;
         self.run_turn(input, stream_output, &mut monitor)
+    }
+
+    /// Issue #452: Reminder Sidecar hook. Called from two sites in
+    /// `run_actor_loop` (iteration-internal before compaction, and post-loop
+    /// for NoRepoProgress / auto_test / NoVerifierAvailable). Per-turn cap
+    /// (`reminder_called_this_turn`) is consumed only by Completed / Failed
+    /// — Skipped does not consume the cap (DR3-002).
+    pub(super) fn maybe_invoke_reminder(&mut self, interrupt_flag: &InterruptFlag) {
+        let kind = match &self.session.last_feedback {
+            Some(f) if reminder::kind_eligible(&f.kind) => f.kind.clone(),
+            _ => return, // no failure-kind feedback to react to → silent
+        };
+
+        let gate = reminder::ReminderGate {
+            disabled_by_env: reminder::reminder_disabled(|key| std::env::var_os(key)),
+            sidecar_available: self.models.sidecar.is_some(),
+            kind_eligible: true,
+            plan_mode: self.session.mode_state.mode == ExecutionMode::Plan,
+            interrupted: interrupt_flag.is_set(),
+            per_turn_already_called: self.reminder_called_this_turn,
+        };
+
+        let session_id = self.session_store.session_id().to_string();
+        let model = self.models.sidecar.clone();
+
+        if let Some(skip_reason) = gate.skip_reason() {
+            let outcome = ReminderOutcome::Skipped {
+                skip_reason,
+                feedback_kind: Some(kind),
+            };
+            let (event, payload) =
+                build_reminder_log_payload(&outcome, &session_id, model.as_deref());
+            log_llm_event(event, payload);
+            return;
+        }
+
+        let sidecar_model = model
+            .clone()
+            .expect("sidecar_available was checked by gate");
+        let frame = self
+            .session
+            .last_feedback
+            .clone()
+            .expect("kind_eligible implies last_feedback is Some");
+
+        let reminder_client = match self
+            .client
+            .clone_with_overrides(SIDECAR_SUMMARY_TIMEOUT_SECS, 384)
+        {
+            Ok(c) => c,
+            Err(e) => {
+                self.reminder_called_this_turn = true;
+                let outcome = ReminderOutcome::Failed {
+                    reason: reminder::FailureReason::LlmCall(format!("clone_with_overrides: {e}")),
+                    latency_ms: 0,
+                    prompt_log: String::new(),
+                    response_raw_log: String::new(),
+                    feedback_kind: kind,
+                };
+                let (event, payload) =
+                    build_reminder_log_payload(&outcome, &session_id, model.as_deref());
+                log_llm_event(event, payload);
+                return;
+            }
+        };
+
+        let mode_label = match self.session.mode_state.mode {
+            ExecutionMode::Act => "act",
+            ExecutionMode::Plan => "plan",
+        };
+        let active_precautions_summary = self
+            .session
+            .working_memory
+            .format_for_prompt()
+            .unwrap_or_else(|| "(none)".to_string());
+        let touched_files = self.session.working_memory.touched_files.clone();
+        let user_task = self
+            .session
+            .working_memory
+            .active_task
+            .clone()
+            .unwrap_or_default();
+        let workspace_root = self.work_root.clone();
+
+        let inputs = ReminderInputs {
+            user_task: &user_task,
+            mode_label,
+            plan_summary: None,
+            active_precautions_summary: &active_precautions_summary,
+            frame: &frame,
+            working_memory_touched: &touched_files,
+        };
+
+        let outcome = reminder::run_reminder_with_strategy(
+            inputs,
+            &mut self.session.working_memory,
+            &workspace_root,
+            |prompt| {
+                reminder_client.chat_text(
+                    &sidecar_model,
+                    &[ConversationMessage::user(prompt.to_string())],
+                )
+            },
+        );
+
+        // Per-turn cap consumed only when we actually attempted the call
+        // (Completed / Failed). Skipped never reaches this branch.
+        self.reminder_called_this_turn = true;
+        let (event, payload) = build_reminder_log_payload(&outcome, &session_id, model.as_deref());
+        log_llm_event(event, payload);
     }
 
     fn run_turn(
@@ -1839,6 +1957,13 @@ impl Agent {
                         repo_change_retries,
                     ));
                 }
+                // Issue #452: Reminder Sidecar (iteration-internal hook).
+                // Fires after the iteration's `record_feedback` calls have
+                // landed and before compaction so that any new precautions
+                // are visible to subsequent prompt builds. Per-turn cap means
+                // only the first eligible failure in this turn produces a
+                // sidecar call.
+                self.maybe_invoke_reminder(&interrupt_flag);
                 let compacted = if self.session.mode_state.mode == ExecutionMode::Plan {
                     false
                 } else {
@@ -2499,6 +2624,11 @@ impl Agent {
                 }
             }
         }
+        // Issue #452: Reminder Sidecar (post-loop hook). Picks up
+        // NoRepoProgress / auto_test / NoVerifierAvailable frames recorded
+        // after the actor loop exited. Per-turn cap means this no-ops if the
+        // iteration-internal hook already ran.
+        self.maybe_invoke_reminder(&interrupt_flag);
         log_llm_event(
             "agent.milestone.turn_completed",
             serde_json::json!({
