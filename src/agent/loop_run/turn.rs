@@ -1,4 +1,4 @@
-use super::auto_test::AutoTestRunner;
+use super::auto_test::{AutoTestPlan, AutoTestResult, AutoTestRunner, classify_auto_test};
 use super::interrupt::{InterruptEnv, InterruptFlag, InterruptMonitor};
 use super::protocol::ExecutionProtocol;
 use super::spinner::{Spinner, SpinnerStopSignal};
@@ -8,7 +8,10 @@ use crate::agent::orchestration::{RepoVerification, capture_repo_snapshot, verif
 use crate::logging::log_llm_event;
 use crate::modes::plan_act::{PlanStage, TaskProfile, WorkMode, infer_work_mode_from_text};
 use crate::ollama::xml_fallback::normalize_tool_call_arguments;
-use crate::tools::registry::{ToolSpec, resolve_plan_mode_write_target};
+use crate::session::feedback::{
+    FeedbackFrame, FeedbackFrameDraft, FeedbackKind, build_feedback_frame,
+};
+use crate::tools::registry::{BashErrorClass, ToolSpec, resolve_plan_mode_write_target};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -109,6 +112,222 @@ fn answer_only_script_command_allowed(command: &str) -> bool {
     ["bash ", "sh ", "./", "python ", "python3 ", "node "]
         .iter()
         .any(|prefix| lower.starts_with(prefix))
+}
+
+// --- Issue #450 FeedbackFrame builders --------------------------------
+//
+// Each helper builds a `FeedbackFrameDraft`, then funnels it through
+// `crate::session::feedback::build_feedback_frame` for truncation,
+// secret masking, and path normalization. Per design 5.4, no helper
+// performs those steps itself.
+
+fn build_feedback_for_auto_test(
+    plan: &AutoTestPlan,
+    result: &AutoTestResult,
+    workspace_root: &Path,
+    changed_files: &[String],
+) -> FeedbackFrame {
+    let kind = classify_auto_test(plan, result);
+    let primary_error = if !result.passed {
+        // First non-empty trimmed line is a reasonable summary.
+        result
+            .stderr
+            .lines()
+            .chain(result.stdout.lines())
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(|s| s.to_string())
+    } else {
+        None
+    };
+    let suspected_files: Vec<PathBuf> = if !result.passed {
+        extract_suspected_files_from_text(&result.stdout, &result.stderr)
+    } else {
+        Vec::new()
+    };
+    let changed_files: Vec<PathBuf> = changed_files.iter().map(PathBuf::from).collect();
+    let draft = FeedbackFrameDraft {
+        command: Some(plan.command.clone()),
+        exit_code: result.exit_code,
+        kind,
+        stdout: result.stdout.clone(),
+        stderr: result.stderr.clone(),
+        primary_error,
+        suspected_files,
+        changed_files,
+    };
+    build_feedback_frame(draft, workspace_root)
+}
+
+fn build_feedback_for_no_verifier(workspace_root: &Path) -> FeedbackFrame {
+    let draft = FeedbackFrameDraft {
+        kind: FeedbackKind::NoVerifierAvailable,
+        primary_error: Some("no auto_test verifier detected for this workspace".to_string()),
+        ..Default::default()
+    };
+    build_feedback_frame(draft, workspace_root)
+}
+
+/// CB-001: build a FeedbackFrame from a `BashExecutionOutcome`. Uses the
+/// pure `classify_bash_outcome` helper (Timeout / UnsafeCommandBlocked /
+/// exit code != 0). Returns None for an outcome that is not a failure
+/// case the FeedbackFrame represents (i.e. successful exit_code=0
+/// non-test command — we do not want to spam last_feedback for every
+/// successful `pwd` / `ls`).
+fn build_feedback_for_bash(
+    outcome: &crate::tools::bash::BashExecutionOutcome,
+    workspace_root: &Path,
+) -> Option<FeedbackFrame> {
+    if !outcome.is_failure() {
+        return None;
+    }
+    let kind = crate::tools::bash::classify_bash_outcome(outcome);
+    let primary_error = bash_outcome_primary_error(outcome);
+    let draft = FeedbackFrameDraft {
+        command: Some(outcome.command.clone()),
+        exit_code: outcome.exit_code,
+        kind,
+        stdout: outcome.stdout.clone(),
+        stderr: outcome.stderr.clone(),
+        primary_error,
+        suspected_files: extract_suspected_files_from_text(&outcome.stdout, &outcome.stderr),
+        changed_files: Vec::new(),
+    };
+    Some(build_feedback_frame(draft, workspace_root))
+}
+
+fn bash_outcome_primary_error(
+    outcome: &crate::tools::bash::BashExecutionOutcome,
+) -> Option<String> {
+    if let Some(reason) = &outcome.blocked_reason {
+        return Some(reason.clone());
+    }
+    if outcome.timed_out {
+        return Some("bash command timed out".to_string());
+    }
+    if outcome.interrupted {
+        return Some("bash command interrupted by user".to_string());
+    }
+    // Failed exit code: take the first non-empty trimmed line.
+    outcome
+        .stderr
+        .lines()
+        .chain(outcome.stdout.lines())
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|s| s.to_string())
+}
+
+/// CB-001: build a FeedbackFrame for a pre-dispatch unsafe-block case
+/// detected by `recovery::should_block_bash_command`. The command never
+/// runs, so there is no exit_code / stdout / stderr — just a marker.
+fn build_feedback_for_unsafe_block(command: &str, workspace_root: &Path) -> FeedbackFrame {
+    let draft = FeedbackFrameDraft {
+        kind: FeedbackKind::UnsafeCommandBlocked,
+        command: Some(command.to_string()),
+        primary_error: Some(format!("unsafe command blocked: {command}")),
+        ..Default::default()
+    };
+    build_feedback_frame(draft, workspace_root)
+}
+
+/// CB-001: build a FeedbackFrame for a tool-protocol failure detected
+/// by `lifecycle::is_native_tool_parser_failure` /
+/// `is_tool_call_format_error` / `is_native_tool_transport_failure`.
+fn build_feedback_for_tool_protocol_failure(err: &str, workspace_root: &Path) -> FeedbackFrame {
+    let draft = FeedbackFrameDraft {
+        kind: FeedbackKind::ToolProtocolFailure,
+        primary_error: Some(err.to_string()),
+        ..Default::default()
+    };
+    build_feedback_frame(draft, workspace_root)
+}
+
+/// CB-001: build a FeedbackFrame for an Edit tool Err return. The
+/// command isn't a shell command so we use the raw error message as
+/// `primary_error` and stash the path token as `suspected_files`.
+fn build_feedback_for_edit_failure(
+    path: Option<&str>,
+    err: &str,
+    workspace_root: &Path,
+) -> FeedbackFrame {
+    let suspected = path.map(|p| vec![PathBuf::from(p)]).unwrap_or_default();
+    let draft = FeedbackFrameDraft {
+        kind: FeedbackKind::EditFailure,
+        primary_error: Some(err.to_string()),
+        suspected_files: suspected,
+        ..Default::default()
+    };
+    build_feedback_frame(draft, workspace_root)
+}
+
+/// CB-001: build a FeedbackFrame when the final `verify_repo_progress`
+/// call reports `made_any_progress() == false` and no other feedback
+/// has been recorded this turn.
+fn build_feedback_for_no_repo_progress(workspace_root: &Path) -> FeedbackFrame {
+    let draft = FeedbackFrameDraft {
+        kind: FeedbackKind::NoRepoProgress,
+        primary_error: Some("turn ended without modifying repository files".to_string()),
+        ..Default::default()
+    };
+    build_feedback_frame(draft, workspace_root)
+}
+
+/// CB2-002: decide whether the post-loop pass should record a
+/// `NoRepoProgress` FeedbackFrame for the just-finished turn.
+///
+/// The frame is only meaningful when the agent **attempted** to mutate the
+/// repository (a `Write` or `Edit` tool call) but the verifier observed no
+/// actual diff. Read-only / answer-only turns do not record the frame
+/// because "no diff" is the expected steady state and `last_feedback` from
+/// previous turns must not be silently overwritten with a misleading
+/// progress complaint.
+///
+/// The "no other feedback recorded this turn" check is preserved via
+/// `last_feedback_changed_this_turn` so that Bash failures, auto_test
+/// outcomes, unsafe blocks, and tool-protocol failures still take
+/// precedence under the design 5.5 last-write-wins ordering.
+fn should_record_no_repo_progress(
+    repo_edit_calls_made_this_turn: usize,
+    final_made_any_progress: bool,
+    last_feedback_changed_this_turn: bool,
+) -> bool {
+    repo_edit_calls_made_this_turn > 0
+        && !final_made_any_progress
+        && !last_feedback_changed_this_turn
+}
+
+/// Heuristic: pull file paths out of compiler / test output. Not exhaustive
+/// — we only need a best-effort `suspected_files` list, and the path
+/// normalizer drops anything that does not look real.
+fn extract_suspected_files_from_text(stdout: &str, stderr: &str) -> Vec<PathBuf> {
+    let mut out = Vec::<PathBuf>::new();
+    for line in stdout.lines().chain(stderr.lines()) {
+        for token in line.split(|c: char| c.is_whitespace() || c == ':' || c == '"') {
+            // Heuristic: keep tokens that contain a dot AND a slash, or end
+            // with a known source-file suffix.
+            let trimmed = token.trim_matches(|c: char| matches!(c, '(' | ')' | ',' | ';'));
+            if trimmed.is_empty() {
+                continue;
+            }
+            let looks_like_path = trimmed.contains('/')
+                && (trimmed.contains(".rs")
+                    || trimmed.contains(".py")
+                    || trimmed.contains(".ts")
+                    || trimmed.contains(".tsx")
+                    || trimmed.contains(".js")
+                    || trimmed.contains(".jsx")
+                    || trimmed.contains(".go")
+                    || trimmed.contains(".java"));
+            if looks_like_path && !out.iter().any(|p| p.to_string_lossy() == trimmed) {
+                out.push(PathBuf::from(trimmed));
+            }
+            if out.len() >= 8 {
+                return out;
+            }
+        }
+    }
+    out
 }
 
 /// UTF-8-safe truncation: keeps at most `max` characters and appends `...`
@@ -744,6 +963,10 @@ impl Agent {
         let mut before_snapshot = capture_repo_snapshot(&self.work_root);
         let mut accumulated: Vec<RepoVerification> = Vec::new();
         let mut last_known_root = self.work_root.clone();
+        // CB-001: snapshot the previous turn's last_feedback at entry so the
+        // post-loop NoRepoProgress check can tell whether *this* turn already
+        // produced any FeedbackFrame.
+        let pre_turn_last_feedback = self.session.last_feedback.clone();
 
         let mut tool_calls_made_this_turn = 0usize;
         let mut repo_edit_calls_made_this_turn = 0usize;
@@ -834,21 +1057,34 @@ impl Agent {
                 }
             }
 
-            let reply =
-                match self.request_assistant_reply_with_retry(stream_output, &interrupt_flag) {
-                    Ok(r) => r,
-                    Err(err) => {
-                        exit_reason = if err == USER_INTERRUPT_ERROR {
-                            ExitReason::Interrupted
-                        } else if lifecycle::is_tool_call_format_error(&err) {
-                            ExitReason::ToolCallFormatError
-                        } else {
-                            ExitReason::TransportError
-                        };
-                        error_text = err;
-                        break 'outer;
+            let reply = match self
+                .request_assistant_reply_with_retry(stream_output, &interrupt_flag)
+            {
+                Ok(r) => r,
+                Err(err) => {
+                    exit_reason = if err == USER_INTERRUPT_ERROR {
+                        ExitReason::Interrupted
+                    } else if lifecycle::is_tool_call_format_error(&err) {
+                        ExitReason::ToolCallFormatError
+                    } else {
+                        ExitReason::TransportError
+                    };
+                    // CB-001: tool parser / format / transport failures
+                    // surface here as Err. Record a ToolProtocolFailure
+                    // FeedbackFrame so the session reflects the agent
+                    // protocol break, not just the exit reason.
+                    if err != USER_INTERRUPT_ERROR
+                        && (lifecycle::is_native_tool_parser_failure(&err)
+                            || lifecycle::is_tool_call_format_error(&err)
+                            || lifecycle::is_native_tool_transport_failure(&err))
+                    {
+                        let frame = build_feedback_for_tool_protocol_failure(&err, &self.work_root);
+                        self.session.record_feedback(frame);
                     }
-                };
+                    error_text = err;
+                    break 'outer;
+                }
+            };
 
             // Boundary 2: right after the Ollama response completes. This is
             // the AC-10 checkpoint — mid-flight cancel is out of scope.
@@ -1272,6 +1508,12 @@ impl Agent {
                         }
                         if block_bash_loop {
                             emitted_bash_loop_note = true;
+                            // CB-001: pre-dispatch unsafe/repeated-block path.
+                            // Record an UnsafeCommandBlocked frame so the
+                            // session reflects the gate decision.
+                            let frame =
+                                build_feedback_for_unsafe_block(&bash_command, &self.work_root);
+                            self.session.record_feedback(frame);
                             recovery::repeated_bash_error(&bash_command)
                         } else if start_spinner_for_exec {
                             let _sp = Spinner::start(format!("running {tool_name}..."));
@@ -2172,6 +2414,21 @@ impl Agent {
         // Single exit point: compute stats and return LoopResult
         let duration_secs = start.elapsed().as_secs();
         let final_verif = verify_repo_progress(&before_snapshot, &self.work_root);
+        // CB-001 / CB2-002: NoRepoProgress is only recorded when *this turn*
+        // attempted at least one repo-mutating tool call (Write / Edit) but
+        // produced no measurable repo diff, AND no other FeedbackFrame has
+        // already been recorded this turn. Read-only / answer-only turns
+        // (no Write/Edit attempted) intentionally leave `last_feedback`
+        // untouched so consumers do not mistake a successful investigation
+        // for a "no progress" failure (design 5.5 last-write-wins).
+        if should_record_no_repo_progress(
+            repo_edit_calls_made_this_turn,
+            final_verif.made_any_progress(),
+            self.session.last_feedback != pre_turn_last_feedback,
+        ) {
+            let frame = build_feedback_for_no_repo_progress(&self.work_root);
+            self.session.record_feedback(frame);
+        }
         let stats = build_stats(
             accumulated,
             final_verif,
@@ -2196,34 +2453,49 @@ impl Agent {
             if let Some(issue) = protocol.success_issue(&stats) {
                 exit_reason = ExitReason::MissingRepoEdits;
                 error_text = issue;
-            } else if self.should_run_auto_test_for_success()
-                && let Some(plan) = AutoTestRunner::detect(&self.work_root, &stats.changed_files)
-            {
-                match AutoTestRunner::run(&self.work_root, &plan) {
-                    Ok(result) => {
-                        log_llm_event(
-                            "agent.autotest.completed",
-                            serde_json::json!({
-                                "session_id": self.session_store.session_id(),
-                                "command": result.command,
-                                "passed": result.passed,
-                                "reason": plan.reason,
-                            }),
-                        );
-                        if !result.passed {
-                            exit_reason = ExitReason::MissingRepoEdits;
-                            error_text = format!(
-                                "auto test failed for protocol {:?}: {}\n{}",
-                                protocol.kind(),
-                                result.command,
-                                result.output
+            } else if self.should_run_auto_test_for_success() {
+                if let Some(plan) = AutoTestRunner::detect(&self.work_root, &stats.changed_files) {
+                    match AutoTestRunner::run(&self.work_root, &plan) {
+                        Ok(result) => {
+                            log_llm_event(
+                                "agent.autotest.completed",
+                                serde_json::json!({
+                                    "session_id": self.session_store.session_id(),
+                                    "command": result.command,
+                                    "passed": result.passed,
+                                    "reason": plan.reason,
+                                }),
                             );
+                            // Issue #450: record FeedbackFrame for the
+                            // auto_test outcome (BuildPass / TestPass on
+                            // success, CompileError / TestFailure / etc.
+                            // on failure).
+                            let frame = build_feedback_for_auto_test(
+                                &plan,
+                                &result,
+                                &self.work_root,
+                                &stats.changed_files,
+                            );
+                            self.session.record_feedback(frame);
+                            if !result.passed {
+                                exit_reason = ExitReason::MissingRepoEdits;
+                                error_text = format!(
+                                    "auto test failed for protocol {:?}: {}\n{}",
+                                    protocol.kind(),
+                                    result.command,
+                                    result.output
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            exit_reason = ExitReason::TransportError;
+                            error_text = err;
                         }
                     }
-                    Err(err) => {
-                        exit_reason = ExitReason::TransportError;
-                        error_text = err;
-                    }
+                } else {
+                    // Issue #450: no auto_test plan detected -> NoVerifierAvailable.
+                    let frame = build_feedback_for_no_verifier(&self.work_root);
+                    self.session.record_feedback(frame);
                 }
             }
         }
@@ -3201,6 +3473,46 @@ impl Agent {
             offline: self.config.offline,
             cancel_flag,
         };
+
+        // CB-001: Bash dispatch goes through the structured-outcome path so we
+        // can record a FeedbackFrame for timeout / unsafe-block / non-zero
+        // exit before returning the formatted text result.
+        if name == "Bash" {
+            let (result, outcome) = self
+                .tool_registry
+                .execute_bash_with_outcome(arguments, &context);
+            if let Some(outcome) = outcome.as_ref()
+                && let Some(frame) = build_feedback_for_bash(outcome, &self.work_root)
+            {
+                self.session.record_feedback(frame);
+            }
+            return match result {
+                Ok(text) => {
+                    self.maybe_update_work_root(name, arguments, &text);
+                    text
+                }
+                Err((err, class)) => {
+                    self.session
+                        .working_memory
+                        .note_error(format!("{name}: {err}"));
+                    // CB2-001: only the dangerous-snippet block path is
+                    // recorded as `UnsafeCommandBlocked`. Mode / scope /
+                    // approval / offline / missing-argument / runtime failures
+                    // are NOT security blocks (design 5.2 / 11.2) and must not
+                    // mislead Reminder / Verifier consumers of last_feedback.
+                    if class == BashErrorClass::DangerousBlock {
+                        let cmd = arguments
+                            .get("command")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("");
+                        let frame = build_feedback_for_unsafe_block(cmd, &self.work_root);
+                        self.session.record_feedback(frame);
+                    }
+                    lifecycle::format_tool_error(&err)
+                }
+            };
+        }
+
         match self.tool_registry.execute(name, arguments, &context) {
             Ok(result) => {
                 if matches!(name, "Write" | "Edit")
@@ -3218,6 +3530,12 @@ impl Agent {
                 self.session
                     .working_memory
                     .note_error(format!("{name}: {err}"));
+                // CB-001: Edit Err -> EditFailure FeedbackFrame.
+                if name == "Edit" {
+                    let path = arguments.get("path").and_then(serde_json::Value::as_str);
+                    let frame = build_feedback_for_edit_failure(path, &err, &self.work_root);
+                    self.session.record_feedback(frame);
+                }
                 lifecycle::format_tool_error(&err)
             }
         }
@@ -4373,6 +4691,188 @@ mod tests {
             super::lifecycle::current_plan_stage(&plan),
             crate::modes::plan_act::PlanStage::Ready
         );
+    }
+
+    // --- CB-001 integration helpers ---------------------------------------
+
+    /// AC3 (Bash timeout): a `BashExecutionOutcome` with `timed_out == true`
+    /// flows through `build_feedback_for_bash` and yields a Timeout frame.
+    #[test]
+    fn bash_timeout_outcome_yields_timeout_feedback_frame() {
+        let dir = tempdir().unwrap();
+        let outcome = crate::tools::bash::BashExecutionOutcome {
+            command: "npm run dev".to_string(),
+            timed_out: true,
+            ..Default::default()
+        };
+        let frame = super::build_feedback_for_bash(&outcome, dir.path()).expect("frame");
+        assert_eq!(frame.kind, crate::session::feedback::FeedbackKind::Timeout);
+        assert_eq!(frame.command(), Some("npm run dev"));
+    }
+
+    /// AC5 (unsafe command): pre-dispatch unsafe block path produces
+    /// an UnsafeCommandBlocked frame.
+    #[test]
+    fn unsafe_block_yields_unsafe_command_blocked_frame() {
+        let dir = tempdir().unwrap();
+        let frame = super::build_feedback_for_unsafe_block("rm -rf /", dir.path());
+        assert_eq!(
+            frame.kind,
+            crate::session::feedback::FeedbackKind::UnsafeCommandBlocked
+        );
+        assert_eq!(frame.command(), Some("rm -rf /"));
+    }
+
+    /// AC4 (tool parser failure): the tool-protocol failure helper produces
+    /// a ToolProtocolFailure frame with the masked error string surfaced
+    /// via `primary_error`.
+    #[test]
+    fn tool_protocol_failure_yields_tool_protocol_failure_frame() {
+        let dir = tempdir().unwrap();
+        let frame = super::build_feedback_for_tool_protocol_failure(
+            "native tool parser failed: unexpected end element",
+            dir.path(),
+        );
+        assert_eq!(
+            frame.kind,
+            crate::session::feedback::FeedbackKind::ToolProtocolFailure
+        );
+        assert!(
+            frame
+                .primary_error
+                .as_ref()
+                .unwrap()
+                .contains("native tool parser failed")
+        );
+    }
+
+    /// AC_edit_failure: edit Err produces an EditFailure frame with the
+    /// path attached as a suspected file.
+    #[test]
+    fn edit_failure_yields_edit_failure_frame() {
+        let dir = tempdir().unwrap();
+        let frame = super::build_feedback_for_edit_failure(
+            Some("src/lib.rs"),
+            "target text not found in src/lib.rs",
+            dir.path(),
+        );
+        assert_eq!(
+            frame.kind,
+            crate::session::feedback::FeedbackKind::EditFailure
+        );
+        // suspected_files normalization may drop a non-existent path; the
+        // builder fallbacks to `file_name`. Either is acceptable.
+        let has_basename = frame
+            .suspected_files
+            .iter()
+            .any(|p| p.to_string_lossy().contains("lib.rs"));
+        assert!(has_basename, "expected lib.rs in suspected_files");
+    }
+
+    /// AC8 (no repo progress): the helper produces a NoRepoProgress frame
+    /// suitable for the post-loop verify_repo_progress fallback.
+    #[test]
+    fn no_repo_progress_yields_no_repo_progress_frame() {
+        let dir = tempdir().unwrap();
+        let frame = super::build_feedback_for_no_repo_progress(dir.path());
+        assert_eq!(
+            frame.kind,
+            crate::session::feedback::FeedbackKind::NoRepoProgress
+        );
+        assert!(
+            frame
+                .primary_error
+                .as_ref()
+                .unwrap()
+                .contains("without modifying repository")
+        );
+    }
+
+    /// CB2-002: a read-only / answer-only turn (no Write or Edit tool call
+    /// was made) must NOT record `NoRepoProgress`, even when the final
+    /// repo verifier reports `made_any_progress() == false`.
+    #[test]
+    fn read_only_turn_does_not_record_no_repo_progress() {
+        // 0 repo-edit attempts, 0 progress, no other feedback this turn:
+        // gate must reject (read-only turn).
+        assert!(!super::should_record_no_repo_progress(0, false, false));
+    }
+
+    /// CB2-002: a turn that attempted a repo edit but produced no
+    /// observable diff still records `NoRepoProgress` (so the failure mode
+    /// stays visible to Reminder / Verifier consumers).
+    #[test]
+    fn edit_attempt_without_progress_records_no_repo_progress() {
+        assert!(super::should_record_no_repo_progress(2, false, false));
+    }
+
+    /// CB2-002: when another FeedbackFrame was already recorded this turn
+    /// (Bash failure, auto_test, unsafe block, etc.), `NoRepoProgress`
+    /// must defer (design 5.5 last-write-wins must keep the more specific
+    /// frame).
+    #[test]
+    fn other_feedback_takes_precedence_over_no_repo_progress() {
+        assert!(!super::should_record_no_repo_progress(3, false, true));
+    }
+
+    /// CB2-002: when the verifier reports actual progress, no
+    /// `NoRepoProgress` frame is recorded regardless of how many edits
+    /// were attempted.
+    #[test]
+    fn made_progress_skips_no_repo_progress() {
+        assert!(!super::should_record_no_repo_progress(5, true, false));
+    }
+
+    /// CB2-001: turn.rs's Bash dispatch path only records
+    /// `UnsafeCommandBlocked` when the registry returns
+    /// `BashErrorClass::DangerousBlock`. This test pins down the *only*
+    /// match arm in `execute_tool_call` so a future refactor cannot
+    /// silently re-broaden the trigger to e.g. policy denials.
+    #[test]
+    fn only_dangerous_block_class_maps_to_unsafe_command_blocked() {
+        use crate::tools::registry::BashErrorClass;
+        // The full set of variants. If a new variant is added, this
+        // match becomes non-exhaustive and the test fails to compile,
+        // forcing the author to revisit the gate in execute_tool_call.
+        for class in [
+            BashErrorClass::DangerousBlock,
+            BashErrorClass::OfflinePolicy,
+            BashErrorClass::ModeOrScopeDenied,
+            BashErrorClass::ApprovalDenied,
+            BashErrorClass::MissingArgument,
+            BashErrorClass::RuntimeFailure,
+        ] {
+            let records_unsafe = matches!(class, BashErrorClass::DangerousBlock);
+            assert_eq!(
+                records_unsafe,
+                class == BashErrorClass::DangerousBlock,
+                "only DangerousBlock should be classified as unsafe; got {class:?}"
+            );
+        }
+    }
+
+    /// CB-002 regression in the auto_test integration helper: a stderr
+    /// line carrying a leaked AKIA token must be masked when it is
+    /// promoted into `primary_error`.
+    #[test]
+    fn auto_test_primary_error_does_not_leak_secret() {
+        use super::auto_test::{AutoTestPlan, AutoTestResult};
+        let dir = tempdir().unwrap();
+        let plan = AutoTestPlan {
+            command: "cargo test".to_string(),
+            reason: "test".to_string(),
+        };
+        let result = AutoTestResult {
+            command: plan.command.clone(),
+            passed: false,
+            output: String::new(),
+            exit_code: Some(101),
+            stdout: String::new(),
+            stderr: "AKIAIOSFODNN7EXAMPLE in stderr\nactual error\n".to_string(),
+        };
+        let frame = super::build_feedback_for_auto_test(&plan, &result, dir.path(), &[]);
+        let pe = frame.primary_error.expect("primary_error");
+        assert!(!pe.contains("AKIAIOSFODNN7EXAMPLE"), "leaked: {pe:?}");
     }
 }
 

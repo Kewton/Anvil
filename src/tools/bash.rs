@@ -6,7 +6,50 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::session::feedback::FeedbackKind;
 use crate::tools::registry::truncate_output;
+
+/// Internal Bash outcome bag exposed for FeedbackFrame generation in
+/// the agent layer (Issue #450). Not part of `ToolRegistry::execute`'s
+/// `Result<String, String>` contract; turn.rs invokes
+/// `run_with_outcome` directly when it needs the structured form.
+#[derive(Debug, Clone, Default)]
+pub struct BashExecutionOutcome {
+    pub command: String,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub timed_out: bool,
+    pub blocked_reason: Option<String>,
+    pub interrupted: bool,
+}
+
+impl BashExecutionOutcome {
+    pub fn is_failure(&self) -> bool {
+        self.timed_out
+            || self.blocked_reason.is_some()
+            || self.exit_code.is_some_and(|code| code != 0)
+            || self.interrupted
+    }
+}
+
+/// Classify a `BashExecutionOutcome` into a `FeedbackKind` for FeedbackFrame
+/// generation. Pure function over the outcome; tested in `tests`.
+pub fn classify_bash_outcome(outcome: &BashExecutionOutcome) -> FeedbackKind {
+    if outcome.blocked_reason.is_some() {
+        return FeedbackKind::UnsafeCommandBlocked;
+    }
+    if outcome.timed_out {
+        return FeedbackKind::Timeout;
+    }
+    if outcome.interrupted {
+        return FeedbackKind::UnknownFailure;
+    }
+    if outcome.exit_code.is_some_and(|code| code == 0) {
+        return FeedbackKind::TestPass;
+    }
+    FeedbackKind::UnknownFailure
+}
 
 const BLOCKED_SNIPPETS: &[&str] = &[
     "rm -rf /",
@@ -39,22 +82,36 @@ pub fn run(
     cancel_flag: Option<&Arc<AtomicBool>>,
     offline: bool,
 ) -> Result<String, String> {
-    let command = normalize_background_command(&normalize_noninteractive_scaffold_command(command));
+    run_with_outcome(command, cwd, cancel_flag, offline).map(|(text, _)| text)
+}
+
+/// Like `run`, but additionally returns the structured
+/// `BashExecutionOutcome` (Issue #450). The returned `Result<String, String>`
+/// is identical to what `run` returns so the registry contract is unchanged.
+pub fn run_with_outcome(
+    command: &str,
+    cwd: &std::path::Path,
+    cancel_flag: Option<&Arc<AtomicBool>>,
+    offline: bool,
+) -> Result<(String, BashExecutionOutcome), String> {
+    let normalized =
+        normalize_background_command(&normalize_noninteractive_scaffold_command(command));
     for snippet in BLOCKED_SNIPPETS {
-        if command.contains(snippet) {
-            return Err(format!("blocked dangerous command fragment: {snippet}"));
+        if normalized.contains(snippet) {
+            let msg = format!("blocked dangerous command fragment: {snippet}");
+            return Err(msg);
         }
     }
-    let class = classify_command(&command);
-    enforce_offline_policy(&command, class, offline)?;
+    let class = classify_command(&normalized);
+    enforce_offline_policy(&normalized, class, offline)?;
 
     let mut cmd = Command::new("sh");
-    cmd.args(["-lc", &command])
+    cmd.args(["-lc", &normalized])
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if is_noninteractive_scaffold_command(&command) {
+    if is_noninteractive_scaffold_command(&normalized) {
         cmd.env("CI", "1");
     }
 
@@ -74,17 +131,29 @@ pub fn run(
     let mut child = cmd
         .spawn()
         .map_err(|err| format!("failed to run shell command: {err}"))?;
-    let timeout = likely_long_running_command(&command).then_some(LONG_RUNNING_TIMEOUT);
+    let timeout = likely_long_running_command(&normalized).then_some(LONG_RUNNING_TIMEOUT);
     let started = Instant::now();
 
     let status = loop {
         if cancel_flag.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
             terminate_child(&mut child);
             let output = collect_output(&mut child)?;
-            let combined = render_combined_output(output.stdout, output.stderr);
-            return Ok(format!(
-                "exit_code=-1\ninterrupted=true\n{}",
-                truncate_output(&combined, 20_000)
+            let combined = render_combined_output(output.stdout.clone(), output.stderr.clone());
+            let outcome = BashExecutionOutcome {
+                command: normalized.clone(),
+                exit_code: None,
+                stdout: output.stdout,
+                stderr: output.stderr,
+                timed_out: false,
+                blocked_reason: None,
+                interrupted: true,
+            };
+            return Ok((
+                format!(
+                    "exit_code=-1\ninterrupted=true\n{}",
+                    truncate_output(&combined, 20_000)
+                ),
+                outcome,
             ));
         }
 
@@ -93,11 +162,23 @@ pub fn run(
         {
             terminate_child(&mut child);
             let output = collect_output(&mut child)?;
-            let combined = render_combined_output(output.stdout, output.stderr);
-            return Ok(format!(
-                "exit_code=-1\ntimed_out=true\ntimeout_secs={}\n{}",
-                limit.as_secs(),
-                truncate_output(&combined, 20_000)
+            let combined = render_combined_output(output.stdout.clone(), output.stderr.clone());
+            let outcome = BashExecutionOutcome {
+                command: normalized.clone(),
+                exit_code: None,
+                stdout: output.stdout,
+                stderr: output.stderr,
+                timed_out: true,
+                blocked_reason: None,
+                interrupted: false,
+            };
+            return Ok((
+                format!(
+                    "exit_code=-1\ntimed_out=true\ntimeout_secs={}\n{}",
+                    limit.as_secs(),
+                    truncate_output(&combined, 20_000)
+                ),
+                outcome,
             ));
         }
 
@@ -109,11 +190,24 @@ pub fn run(
     };
 
     let output = collect_output(&mut child)?;
-    let combined = render_combined_output(output.stdout, output.stderr);
-    Ok(format!(
-        "exit_code={}\n{}",
-        status.code().unwrap_or(-1),
-        truncate_output(&combined, 20_000)
+    let combined = render_combined_output(output.stdout.clone(), output.stderr.clone());
+    let exit_code = status.code();
+    let outcome = BashExecutionOutcome {
+        command: normalized.clone(),
+        exit_code,
+        stdout: output.stdout,
+        stderr: output.stderr,
+        timed_out: false,
+        blocked_reason: None,
+        interrupted: false,
+    };
+    Ok((
+        format!(
+            "exit_code={}\n{}",
+            exit_code.unwrap_or(-1),
+            truncate_output(&combined, 20_000)
+        ),
+        outcome,
     ))
 }
 
@@ -143,18 +237,24 @@ struct ChildOutput {
 }
 
 fn collect_output(child: &mut Child) -> Result<ChildOutput, String> {
-    let mut stdout = String::new();
-    let mut stderr = String::new();
+    // CB-003: read raw bytes and decode lossily. `read_to_string` previously
+    // failed the whole bash dispatch when the child process emitted non-UTF8
+    // output (binary blobs, mixed encodings). FeedbackFrame generation must
+    // never be aborted by invalid byte sequences (Issue #450 R5).
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
     if let Some(mut out) = child.stdout.take() {
-        out.read_to_string(&mut stdout)
+        out.read_to_end(&mut stdout_bytes)
             .map_err(|err| format!("failed to read command stdout: {err}"))?;
     }
     if let Some(mut err_out) = child.stderr.take() {
         err_out
-            .read_to_string(&mut stderr)
+            .read_to_end(&mut stderr_bytes)
             .map_err(|err| format!("failed to read command stderr: {err}"))?;
     }
     let _ = child.wait();
+    let stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
+    let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
     Ok(ChildOutput { stdout, stderr })
 }
 
@@ -741,5 +841,139 @@ mod tests {
         assert!(output.contains("exit_code=0"));
         assert!(output.contains("background_pid="));
         assert!(output.contains("background_log="));
+    }
+
+    // --- Issue #450 AC3 / AC5 / AC6 ---------------------------------------
+
+    use super::{BashExecutionOutcome, classify_bash_outcome, run_with_outcome};
+    use crate::session::feedback::{
+        EXCERPT_CAP_BYTES, FeedbackFrameDraft, FeedbackKind, build_feedback_frame, mask_secrets,
+    };
+
+    /// AC5: a Bash command rejected by the dangerous-snippet block (e.g.
+    /// `rm -rf /`) returns Err with a "blocked dangerous command" reason
+    /// before the process is even spawned. The agent layer turns that
+    /// into `FeedbackKind::UnsafeCommandBlocked`.
+    #[test]
+    fn dangerous_bash_yields_unsafe_blocked() {
+        let temp = tempdir().unwrap();
+        let err = run("rm -rf /", temp.path(), None, false).unwrap_err();
+        assert!(
+            err.contains("blocked dangerous command"),
+            "expected dangerous block, got {err}"
+        );
+        // Equivalent classify path: outcome with blocked_reason set.
+        let outcome = BashExecutionOutcome {
+            command: "rm -rf /".to_string(),
+            blocked_reason: Some(err),
+            ..Default::default()
+        };
+        assert_eq!(
+            classify_bash_outcome(&outcome),
+            FeedbackKind::UnsafeCommandBlocked
+        );
+    }
+
+    /// AC3: a Bash command that is killed by the long-running timeout
+    /// produces an outcome with `timed_out == true`, which classifies as
+    /// `FeedbackKind::Timeout`.
+    #[test]
+    fn bash_timeout_yields_timeout_kind() {
+        // Synthesize the outcome shape directly. Spawning a 15-second
+        // sleeping dev server in cargo test would slow CI without
+        // adding signal coverage.
+        let outcome = BashExecutionOutcome {
+            command: "npm run dev".to_string(),
+            timed_out: true,
+            ..Default::default()
+        };
+        assert_eq!(classify_bash_outcome(&outcome), FeedbackKind::Timeout);
+    }
+
+    /// AC6: a 16 KiB stdout passes through `build_feedback_frame` and the
+    /// resulting `stdout_excerpt` is at most 8 KiB (marker included).
+    #[test]
+    fn excerpt_capped_at_8kib_with_marker() {
+        let big = "a".repeat(16 * 1024);
+        let draft = FeedbackFrameDraft {
+            kind: FeedbackKind::TestFailure,
+            stdout: big,
+            ..Default::default()
+        };
+        let dir = tempdir().unwrap();
+        let frame = build_feedback_frame(draft, dir.path());
+        let excerpt = frame.stdout_excerpt();
+        assert!(
+            excerpt.len() <= EXCERPT_CAP_BYTES,
+            "excerpt too large: {}",
+            excerpt.len()
+        );
+        assert!(excerpt.contains("[...truncated"));
+    }
+
+    /// R5: building a FeedbackFrame from an outcome whose stdout/stderr
+    /// were lossily decoded from invalid UTF-8 must not panic.
+    #[test]
+    fn non_utf8_outcome_does_not_panic_in_feedback_pipeline() {
+        let raw = b"hello\xFFworld";
+        let lossy = String::from_utf8_lossy(raw).into_owned();
+        let outcome = BashExecutionOutcome {
+            command: "cat /tmp/raw".to_string(),
+            stdout: lossy.clone(),
+            stderr: lossy.clone(),
+            exit_code: Some(1),
+            ..Default::default()
+        };
+        let kind = classify_bash_outcome(&outcome);
+        let draft = FeedbackFrameDraft {
+            kind,
+            command: Some(outcome.command.clone()),
+            stdout: outcome.stdout.clone(),
+            stderr: outcome.stderr.clone(),
+            exit_code: outcome.exit_code,
+            ..Default::default()
+        };
+        let dir = tempdir().unwrap();
+        let _frame = build_feedback_frame(draft, dir.path());
+        // Sanity check that mask_secrets is also panic-free with this
+        // kind of input.
+        let _ = mask_secrets(&lossy);
+    }
+
+    /// `run_with_outcome` reports a successful Bash exit code in the
+    /// structured outcome, not just in the formatted text result.
+    #[test]
+    fn run_with_outcome_emits_structured_exit_code() {
+        let temp = tempdir().unwrap();
+        let (text, outcome) = run_with_outcome("printf hello", temp.path(), None, false).unwrap();
+        assert!(text.starts_with("exit_code=0"));
+        assert_eq!(outcome.exit_code, Some(0));
+        assert!(outcome.stdout.contains("hello"));
+        assert!(!outcome.timed_out);
+    }
+
+    /// CB-003: a Bash command that emits invalid UTF-8 on stdout must NOT
+    /// fail the bash dispatch. `collect_output` decodes bytes lossily so
+    /// FeedbackFrame generation downstream cannot be aborted by binary
+    /// or mis-encoded output.
+    #[test]
+    fn non_utf8_stdout_does_not_panic_or_error() {
+        let temp = tempdir().unwrap();
+        // `printf '\xff\xfe\xfd'` writes 3 invalid-UTF8 bytes. POSIX
+        // printf accepts \xNN escapes on macOS / Linux.
+        let (text, outcome) =
+            run_with_outcome("printf '\\xff\\xfe\\xfd'", temp.path(), None, false)
+                .expect("run_with_outcome must succeed even for non-UTF8 output");
+        // Successful exit (exit_code=0); not timed_out.
+        assert_eq!(outcome.exit_code, Some(0));
+        assert!(!outcome.timed_out);
+        assert!(text.starts_with("exit_code=0"));
+        // The lossy-decoded stdout contains the U+FFFD replacement char
+        // for each invalid byte.
+        assert!(
+            outcome.stdout.contains('\u{FFFD}'),
+            "expected replacement char in lossy stdout, got {:?}",
+            outcome.stdout
+        );
     }
 }
