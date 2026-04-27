@@ -959,20 +959,30 @@ mod tests {
     #[test]
     fn non_utf8_stdout_does_not_panic_or_error() {
         let temp = tempdir().unwrap();
-        // `printf '\xff\xfe\xfd'` writes 3 invalid-UTF8 bytes. POSIX
-        // printf accepts \xNN escapes on macOS / Linux.
+        // Use POSIX-portable octal escapes (`\NNN`) instead of `\xNN`:
+        // GitHub Actions Linux runners ship dash as /bin/sh, whose
+        // `printf` does not interpret `\x` escapes (they pass through
+        // as literal text). Octal `\377\376\375` produces bytes
+        // 0xFF 0xFE 0xFD on every POSIX shell.
         let (text, outcome) =
-            run_with_outcome("printf '\\xff\\xfe\\xfd'", temp.path(), None, false)
+            run_with_outcome("printf '\\377\\376\\375'", temp.path(), None, false)
                 .expect("run_with_outcome must succeed even for non-UTF8 output");
         // Successful exit (exit_code=0); not timed_out.
         assert_eq!(outcome.exit_code, Some(0));
         assert!(!outcome.timed_out);
         assert!(text.starts_with("exit_code=0"));
         // The lossy-decoded stdout contains the U+FFFD replacement char
-        // for each invalid byte.
+        // for each invalid byte. Critically: the literal escape string
+        // (e.g. "\\377") must NOT remain in the output - that would
+        // indicate the shell's printf did not actually emit raw bytes.
         assert!(
             outcome.stdout.contains('\u{FFFD}'),
             "expected replacement char in lossy stdout, got {:?}",
+            outcome.stdout
+        );
+        assert!(
+            !outcome.stdout.contains("\\377"),
+            "shell printf did not interpret octal escape, got {:?}",
             outcome.stdout
         );
     }
