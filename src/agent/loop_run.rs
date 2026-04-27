@@ -42,6 +42,11 @@ pub use footer::{FooterHandle, FooterLease};
 // it. `mod turn;` itself stays private; only these two fns leak out (issue #431).
 pub(crate) use turn::{no_color_requested, unicode_supported};
 
+// Issue #453: expose the precaution prompt selector so integration tests in
+// `tests/` (and any future callers) can validate the Act-mode prompt
+// selection pipeline without requiring a live Ollama call.
+pub use turn::select_precautions_for_prompt;
+
 const DEFAULT_KEEP_TAIL: usize = 24;
 const LATE_TURN_KEEP_TAIL: usize = 12;
 

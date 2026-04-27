@@ -35,6 +35,13 @@ impl WorkingMemory {
     /// Cap on `applies_to` length per precaution (CB-002). Bounds canonicalize
     /// / sort / dedup work and `fs::canonicalize` syscalls per add/load.
     pub const MAX_PRECAUTION_APPLIES_TO: usize = 32;
+    /// Hard cap on number of `Active Precautions:` bullets emitted into the
+    /// Act-mode prompt (Issue #453). Must be `<= MAX_ACTIVE_PRECAUTIONS`.
+    pub const MAX_ACTIVE_PRECAUTIONS_PROMPT: usize = 8;
+    /// Soft cap on cumulative `chars().count()` of bullet lines emitted into
+    /// the `Active Precautions:` section. At least one precaution is always
+    /// included even if its single line exceeds this cap (Issue #453).
+    pub const MAX_ACTIVE_PRECAUTIONS_CHARS: usize = 1024;
 
     pub fn set_active_task(&mut self, task: Option<String>) {
         self.active_task = task.map(|value| truncate_entry(value, 240));
@@ -66,11 +73,50 @@ impl WorkingMemory {
         }
     }
 
+    /// Backward-compatible wrapper: render the working memory using the
+    /// full Active-only precaution list (no severity sort / no token-budget
+    /// cap / no relevance filter). This is the entry point used by:
+    /// * existing tests that predate Issue #453;
+    /// * the Reminder Sidecar (`format_for_prompt()` is called via
+    ///   `loop_run::turn::handle_user_message` to build
+    ///   `active_precautions_summary`, which needs the full list to keep
+    ///   duplicate-push detection precise — see Issue #453 design judgment #5);
+    /// * `compact.rs::compact_messages_preserves_active_precautions` regression.
+    ///
+    /// The selection / sort / cap pipeline for the Act-mode prompt lives in
+    /// `loop_run::turn::select_precautions_for_prompt` and reaches the
+    /// renderer via [`Self::format_for_prompt_with_precautions`].
     pub fn format_for_prompt(&self) -> Option<String> {
-        let active_precaution_some = self
+        let active: Vec<Precaution> = self
             .active_precautions
             .iter()
-            .any(|p| p.status == PrecautionStatus::Active);
+            .filter(|p| p.status == PrecautionStatus::Active)
+            .cloned()
+            .collect();
+        self.format_for_prompt_with_precautions(&active)
+    }
+
+    /// Render the working memory using the supplied pre-filtered / sorted /
+    /// budgeted precautions snapshot for the `Active Precautions:` section.
+    ///
+    /// The caller is expected to pre-filter to `status == Active`, but the
+    /// renderer re-applies the same filter defensively (Issue #453 S5-001):
+    /// any non-Active entry slipped in by mistake is silently skipped instead
+    /// of being rendered as a binding constraint.
+    ///
+    /// # Invariant (CB-002)
+    ///
+    /// The supplied `Precaution`s must already be sanitized via
+    /// [`Self::add_precaution`] / [`Self::sanitize_active_precautions_after_load`].
+    /// This renderer does not re-mask secrets, re-truncate text, or re-canonicalize
+    /// `applies_to`; bypassing the storage pipeline can leak unmasked content
+    /// into the prompt and `llm-io.jsonl`.
+    pub fn format_for_prompt_with_precautions(&self, precautions: &[Precaution]) -> Option<String> {
+        let active: Vec<&Precaution> = precautions
+            .iter()
+            .filter(|p| p.status == PrecautionStatus::Active)
+            .collect();
+        let active_precaution_some = !active.is_empty();
         if self.active_task.is_none()
             && self.constraints.is_empty()
             && self.touched_files.is_empty()
@@ -100,13 +146,9 @@ impl WorkingMemory {
         // Unresolved errors so the prompt order is
         // Active task -> Constraints -> Touched files -> Active Precautions ->
         // Unresolved errors (design judgment #9, DR1-006). Severity sort /
-        // token-budget filtering is the responsibility of Issue #4 (#453).
-        let active: Vec<&Precaution> = self
-            .active_precautions
-            .iter()
-            .filter(|p| p.status == PrecautionStatus::Active)
-            .collect();
-        if !active.is_empty() {
+        // token-budget filtering / relevance scoring is performed by the
+        // caller (`select_precautions_for_prompt` in turn.rs) per Issue #453.
+        if active_precaution_some {
             lines.push("Active Precautions:".to_string());
             for p in active {
                 lines.push(format!("- [{}] {}", p.severity.as_label(), p.text));
@@ -757,5 +799,105 @@ pub fn reconcile_resume_state(session: &mut SessionSnapshot, _cwd: &Path) {
             session.mode_state.mode = ExecutionMode::Act;
             session.mode_state.active_plan_path = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Precaution, PrecautionSource, PrecautionStatus, Severity, WorkingMemory};
+    use tempfile::tempdir;
+
+    fn make_precaution(text: &str, severity: Severity, status: PrecautionStatus) -> Precaution {
+        Precaution {
+            id: format!("manual-{text}"),
+            source: PrecautionSource::Manual,
+            severity,
+            text: text.to_string(),
+            applies_to: Vec::new(),
+            status,
+            retired_reason: None,
+        }
+    }
+
+    #[test]
+    fn format_for_prompt_with_precautions_renders_supplied_list() {
+        // Issue #453: format_for_prompt_with_precautions must render exactly
+        // what the caller supplies, ignoring `self.active_precautions`.
+        let dir = tempdir().unwrap();
+        let mut wm = WorkingMemory::default();
+        // self.active_precautions has one entry that should NOT appear.
+        wm.add_precaution(
+            make_precaution(
+                "self-side-only-do-not-render",
+                Severity::Medium,
+                PrecautionStatus::Active,
+            ),
+            dir.path(),
+        );
+
+        let supplied = vec![make_precaution(
+            "supplied-only-render-me",
+            Severity::High,
+            PrecautionStatus::Active,
+        )];
+
+        let rendered = wm
+            .format_for_prompt_with_precautions(&supplied)
+            .expect("should render");
+        assert!(rendered.contains("Active Precautions:"));
+        assert!(rendered.contains("- [high] supplied-only-render-me"));
+        assert!(
+            !rendered.contains("self-side-only-do-not-render"),
+            "self.active_precautions must be ignored: {rendered}"
+        );
+    }
+
+    #[test]
+    fn format_for_prompt_with_precautions_filters_non_active_defensively() {
+        // Issue #453 S5-001: even if the caller mistakenly passes a
+        // Resolved/Retired/Unknown entry, the renderer must drop it.
+        let mut wm = WorkingMemory::default();
+        wm.set_active_task(Some("dummy".to_string()));
+        let supplied = vec![
+            make_precaution("active-keep", Severity::High, PrecautionStatus::Active),
+            make_precaution("resolved-drop", Severity::High, PrecautionStatus::Resolved),
+            make_precaution("retired-drop", Severity::Medium, PrecautionStatus::Retired),
+            make_precaution("unknown-drop", Severity::Low, PrecautionStatus::Unknown),
+        ];
+
+        let rendered = wm
+            .format_for_prompt_with_precautions(&supplied)
+            .expect("should render at least the Active task line");
+        assert!(rendered.contains("- [high] active-keep"));
+        assert!(!rendered.contains("resolved-drop"), "{rendered}");
+        assert!(!rendered.contains("retired-drop"), "{rendered}");
+        assert!(!rendered.contains("unknown-drop"), "{rendered}");
+    }
+
+    #[test]
+    fn format_for_prompt_with_precautions_renders_empty_as_no_section() {
+        // Issue #453 DR1-003: an empty supplied list must not emit the
+        // `Active Precautions:` header. With everything else empty too,
+        // the entire working memory message must be None.
+        let wm = WorkingMemory::default();
+        let rendered = wm.format_for_prompt_with_precautions(&[]);
+        assert!(rendered.is_none(), "expected None, got {:?}", rendered);
+    }
+
+    #[test]
+    fn format_for_prompt_with_precautions_renders_empty_section_when_other_fields_present() {
+        // When other working-memory fields exist but no active precautions
+        // are supplied, the message should still render but without an
+        // Active Precautions section.
+        let mut wm = WorkingMemory::default();
+        wm.set_active_task(Some("do something".to_string()));
+        let rendered = wm
+            .format_for_prompt_with_precautions(&[])
+            .expect("should render with active task only");
+        assert!(rendered.contains("Active task: do something"));
+        assert!(
+            !rendered.contains("Active Precautions:"),
+            "section must be hidden: {rendered}"
+        );
     }
 }

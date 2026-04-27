@@ -15,6 +15,8 @@ use crate::ollama::xml_fallback::normalize_tool_call_arguments;
 use crate::session::feedback::{
     FeedbackFrame, FeedbackFrameDraft, FeedbackKind, build_feedback_frame,
 };
+use crate::session::precaution::{Precaution, PrecautionStatus, severity_order};
+use crate::session::store::WorkingMemory;
 use crate::tools::registry::{BashErrorClass, ToolSpec, resolve_plan_mode_write_target};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -863,6 +865,168 @@ fn normalize_memory_path(raw_path: &str, work_root: &Path) -> String {
         return relative.to_string_lossy().replace('\\', "/");
     }
     raw_path.replace('\\', "/")
+}
+
+/// Normalize an arbitrary path-shaped string (`PathBuf::to_string_lossy()` or
+/// already-normalized `WorkingMemory.touched_files` entry) into the canonical
+/// key form used by the relevance set lookup. Idempotent for already
+/// forward-slash-only paths (Issue #453 DR1-001).
+#[must_use]
+fn normalize_relevance_key(s: &str) -> String {
+    s.replace('\\', "/")
+}
+
+/// Build a `HashSet<String>` of normalized keys from `WorkingMemory.touched_files`
+/// (already produced by `normalize_memory_path`). Used by
+/// `select_precautions_for_prompt` for O(1) relevance lookup (Issue #453).
+#[must_use]
+fn relevance_keyset_from_touched(items: &[String]) -> HashSet<String> {
+    items.iter().map(|s| normalize_relevance_key(s)).collect()
+}
+
+/// Build a `HashSet<String>` of normalized keys from
+/// `FeedbackFrame.suspected_files`. Projects each `PathBuf` via
+/// `to_string_lossy()` + slash normalization so the result matches the same
+/// key format as `relevance_keyset_from_touched` (Issue #453 DR1-001).
+#[must_use]
+fn relevance_keyset_from_suspected(paths: &[PathBuf]) -> HashSet<String> {
+    paths
+        .iter()
+        .map(|p| normalize_relevance_key(&p.to_string_lossy()))
+        .collect()
+}
+
+/// Compute a relevance score for a single precaution against the per-turn
+/// touched / suspected keysets (Issue #453 DR1-001).
+///
+/// Order (Codex CB-001 fix): suspected > touched > global > unrelated, so a
+/// path-scoped precaution that matches the current turn always outranks a
+/// broad global one within the same severity bucket.
+///
+/// * `3`: any `applies_to` entry hits `suspected_files` (highest priority).
+/// * `2`: any `applies_to` entry hits only `touched_files`.
+/// * `1`: `applies_to` is empty (treated as a global precaution; sorted ahead
+///   of unrelated path-scoped ones to keep the user's broad guidance visible).
+/// * `0`: path-scoped but unrelated to current turn.
+#[must_use]
+fn relevance_score(p: &Precaution, touched: &HashSet<String>, suspected: &HashSet<String>) -> u8 {
+    if p.applies_to.is_empty() {
+        return 1;
+    }
+    let mut best = 0u8;
+    for path in &p.applies_to {
+        let key = normalize_relevance_key(&path.to_string_lossy());
+        if suspected.contains(&key) {
+            return 3;
+        }
+        if touched.contains(&key) {
+            best = best.max(2);
+        }
+    }
+    best
+}
+
+/// Apply the per-prompt budget caps (Issue #453):
+/// * hard cap: at most `MAX_ACTIVE_PRECAUTIONS_PROMPT` items;
+/// * soft cap: cumulative `chars().count()` of bullet lines must not exceed
+///   `MAX_ACTIVE_PRECAUTIONS_CHARS`. The soft cap is bypassed for the first
+///   item so a single oversized precaution is still emitted (DR1-002).
+///
+/// Per-line length is computed as the exact bullet `format!("- [{label}] {text}")`
+/// `chars().count()`, where `label` is `Severity::as_label()`.
+#[must_use]
+fn apply_budget_caps(sorted: Vec<&Precaution>) -> Vec<Precaution> {
+    let mut chosen: Vec<Precaution> =
+        Vec::with_capacity(WorkingMemory::MAX_ACTIVE_PRECAUTIONS_PROMPT);
+    let mut chars_total: usize = 0;
+    for p in sorted {
+        if chosen.len() >= WorkingMemory::MAX_ACTIVE_PRECAUTIONS_PROMPT {
+            break;
+        }
+        let line_len = "- [".chars().count()
+            + p.severity.as_label().chars().count()
+            + "] ".chars().count()
+            + p.text.chars().count();
+        if chars_total + line_len > WorkingMemory::MAX_ACTIVE_PRECAUTIONS_CHARS
+            && !chosen.is_empty()
+        {
+            break;
+        }
+        chars_total += line_len;
+        chosen.push(p.clone());
+    }
+    chosen
+}
+
+/// Select precautions to inject into the Act-mode prompt (Issue #453).
+///
+/// Pipeline:
+///   1. Plan-mode short-circuit -> `Vec::new()` (design judgment #2).
+///   2. Active-only filter (defense-in-depth; the renderer re-applies it).
+///   3. Stable sort by `severity_order` ascending, then `relevance_score`
+///      descending. Stable sort preserves insertion order within ties.
+///   4. Budget caps via `apply_budget_caps` (N = 8, M = 1024 chars).
+///
+/// The function is intentionally a free function (rather than an `Agent`
+/// method) so it can be unit-tested with plain slices and values, with no
+/// `Agent` fixture (DR2-002).
+///
+/// # Invariant (CB-002)
+///
+/// Callers MUST pass `Precaution`s that already went through
+/// [`crate::session::store::WorkingMemory::add_precaution`] (or the load-time
+/// [`crate::session::store::WorkingMemory::sanitize_active_precautions_after_load`]
+/// pass). Those entry points apply secret masking, text truncation, and
+/// workspace-relative `applies_to` canonicalization. Passing raw `Precaution`
+/// values built outside that pipeline can leak unmasked secrets into prompts
+/// and `llm-io.jsonl` and bypass the size/path bounds the renderer assumes.
+#[must_use]
+pub fn select_precautions_for_prompt(
+    active_precautions: &[Precaution],
+    mode: ExecutionMode,
+    touched_files: &[String],
+    suspected_files: Option<&[PathBuf]>,
+) -> Vec<Precaution> {
+    if mode == ExecutionMode::Plan {
+        return Vec::new();
+    }
+
+    let active: Vec<&Precaution> = active_precautions
+        .iter()
+        .filter(|p| p.status == PrecautionStatus::Active)
+        .collect();
+    if active.is_empty() {
+        return Vec::new();
+    }
+
+    let touched_set = relevance_keyset_from_touched(touched_files);
+    let suspected_set = suspected_files
+        .map(relevance_keyset_from_suspected)
+        .unwrap_or_default();
+
+    let sorted = sort_precautions_for_prompt(active, &touched_set, &suspected_set);
+    apply_budget_caps(sorted)
+}
+
+/// Stable sort: primary key is `severity_order` ascending (High first),
+/// secondary key is `relevance_score` descending so suspected > touched >
+/// global > unrelated within the same severity bucket. Stable sort preserves
+/// the original insertion order within identical (severity, relevance) ties
+/// (Issue #453 AC: severity 同点時は applies_to 関連度優先 → 残りは insertion order).
+#[must_use]
+fn sort_precautions_for_prompt<'a>(
+    mut active: Vec<&'a Precaution>,
+    touched: &HashSet<String>,
+    suspected: &HashSet<String>,
+) -> Vec<&'a Precaution> {
+    active.sort_by(|a, b| {
+        let by_severity = severity_order(a.severity).cmp(&severity_order(b.severity));
+        if by_severity != std::cmp::Ordering::Equal {
+            return by_severity;
+        }
+        relevance_score(b, touched, suspected).cmp(&relevance_score(a, touched, suspected))
+    });
+    active
 }
 
 fn build_stats(
@@ -4427,9 +4591,26 @@ if __name__ == "__main__":
             return None;
         }
         self.refresh_working_memory();
+
+        // Issue #453: build the per-prompt precaution slice from
+        // (active_precautions × mode × touched_files × last_feedback.suspected_files)
+        // before handing it to the renderer. The Reminder Sidecar path
+        // (handle_user_message → format_for_prompt() wrapper) keeps using the
+        // full active-only list (design judgment #5).
+        let suspected_owned: Option<Vec<PathBuf>> = self
+            .session
+            .last_feedback
+            .as_ref()
+            .map(|f| f.suspected_files.clone());
+        let precautions_for_prompt = select_precautions_for_prompt(
+            &self.session.working_memory.active_precautions,
+            self.session.mode_state.mode,
+            &self.session.working_memory.touched_files,
+            suspected_owned.as_deref(),
+        );
         self.session
             .working_memory
-            .format_for_prompt()
+            .format_for_prompt_with_precautions(&precautions_for_prompt)
             .map(ConversationMessage::system)
     }
 
@@ -5003,6 +5184,299 @@ mod tests {
         let frame = super::build_feedback_for_auto_test(&plan, &result, dir.path(), &[]);
         let pe = frame.primary_error.expect("primary_error");
         assert!(!pe.contains("AKIAIOSFODNN7EXAMPLE"), "leaked: {pe:?}");
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #453: select_precautions_for_prompt + helpers
+    // -----------------------------------------------------------------
+
+    use super::{
+        apply_budget_caps, normalize_relevance_key, relevance_keyset_from_suspected,
+        relevance_keyset_from_touched, relevance_score, select_precautions_for_prompt,
+        sort_precautions_for_prompt,
+    };
+    use crate::session::precaution::{Precaution, PrecautionSource, PrecautionStatus, Severity};
+    use crate::session::store::WorkingMemory;
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+
+    fn p(text: &str, severity: Severity, applies_to: Vec<&str>) -> Precaution {
+        Precaution {
+            id: format!("id-{text}"),
+            source: PrecautionSource::Manual,
+            severity,
+            text: text.to_string(),
+            applies_to: applies_to.into_iter().map(PathBuf::from).collect(),
+            status: PrecautionStatus::Active,
+            retired_reason: None,
+        }
+    }
+
+    fn p_with_status(text: &str, severity: Severity, status: PrecautionStatus) -> Precaution {
+        let mut prec = p(text, severity, Vec::new());
+        prec.status = status;
+        prec
+    }
+
+    #[test]
+    fn select_precautions_for_prompt_sorts_by_severity_desc() {
+        let inputs = vec![
+            p("low-1", Severity::Low, vec![]),
+            p("med-1", Severity::Medium, vec![]),
+            p("high-1", Severity::High, vec![]),
+            p("med-2", Severity::Medium, vec![]),
+        ];
+        let out = select_precautions_for_prompt(&inputs, ExecutionMode::Act, &[], None);
+        let texts: Vec<&str> = out.iter().map(|p| p.text.as_str()).collect();
+        assert_eq!(texts, vec!["high-1", "med-1", "med-2", "low-1"]);
+    }
+
+    #[test]
+    fn select_precautions_for_prompt_stable_within_severity() {
+        // All Medium severity, no applies_to so relevance is uniform (3).
+        // Stable sort must preserve insertion order.
+        let inputs = vec![
+            p("med-a", Severity::Medium, vec![]),
+            p("med-b", Severity::Medium, vec![]),
+            p("med-c", Severity::Medium, vec![]),
+        ];
+        let out = select_precautions_for_prompt(&inputs, ExecutionMode::Act, &[], None);
+        let texts: Vec<&str> = out.iter().map(|p| p.text.as_str()).collect();
+        assert_eq!(texts, vec!["med-a", "med-b", "med-c"]);
+    }
+
+    #[test]
+    fn select_precautions_for_prompt_prioritizes_relevance_within_severity() {
+        // Two High precautions: one related to a touched file, one unrelated.
+        // Relevance must promote the related one ahead despite later insertion.
+        let inputs = vec![
+            p("high-unrelated", Severity::High, vec!["src/other.rs"]),
+            p("high-touched", Severity::High, vec!["src/main.rs"]),
+        ];
+        let touched = vec!["src/main.rs".to_string()];
+        let out = select_precautions_for_prompt(&inputs, ExecutionMode::Act, &touched, None);
+        let texts: Vec<&str> = out.iter().map(|p| p.text.as_str()).collect();
+        assert_eq!(texts, vec!["high-touched", "high-unrelated"]);
+    }
+
+    #[test]
+    fn select_precautions_for_prompt_caps_at_n_8() {
+        // 9 active precautions, all Medium, no relevance — must cap at 8.
+        let inputs: Vec<Precaution> = (0..9)
+            .map(|i| p(&format!("p{i}"), Severity::Medium, vec![]))
+            .collect();
+        let out = select_precautions_for_prompt(&inputs, ExecutionMode::Act, &[], None);
+        assert_eq!(out.len(), WorkingMemory::MAX_ACTIVE_PRECAUTIONS_PROMPT);
+        assert_eq!(out.len(), 8);
+    }
+
+    #[test]
+    fn select_precautions_for_prompt_caps_at_m_1024_chars() {
+        // 5 entries each "X" * 240 chars + bullet prefix > 250 chars per line.
+        // Cumulative goes 250, 500, 750, 1000, 1250 — must stop before 1250.
+        let big = "X".repeat(240);
+        let inputs: Vec<Precaution> = (0..5)
+            .map(|i| {
+                let mut prec = p(&format!("{i}-{}", big), Severity::Medium, vec![]);
+                // Use a fresh id so they aren't deduped at storage layer
+                // (we bypass storage anyway by handing them to the selector).
+                prec.id = format!("id-{i}");
+                prec
+            })
+            .collect();
+        let out = select_precautions_for_prompt(&inputs, ExecutionMode::Act, &[], None);
+        // First 4 fit (~1000 chars). 5th would push past 1024 -> dropped.
+        assert!(
+            out.len() < 5,
+            "expected budget to drop at least one item, got {}",
+            out.len()
+        );
+        assert!(
+            out.len() >= 4,
+            "expected at least 4 items to fit in budget, got {}",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn select_precautions_for_prompt_returns_empty_in_plan_mode() {
+        let inputs = vec![p("important", Severity::High, vec![])];
+        let out = select_precautions_for_prompt(&inputs, ExecutionMode::Plan, &[], None);
+        assert!(out.is_empty(), "Plan mode must yield no precautions");
+    }
+
+    #[test]
+    fn select_precautions_for_prompt_uses_last_feedback_suspected_files() {
+        // Same severity, same insertion order. Suspected hit must outrank
+        // touched hit.
+        let inputs = vec![
+            p("hits-touched", Severity::Medium, vec!["src/a.rs"]),
+            p("hits-suspected", Severity::Medium, vec!["src/b.rs"]),
+        ];
+        let touched = vec!["src/a.rs".to_string()];
+        let suspected = vec![PathBuf::from("src/b.rs")];
+        let out =
+            select_precautions_for_prompt(&inputs, ExecutionMode::Act, &touched, Some(&suspected));
+        let texts: Vec<&str> = out.iter().map(|p| p.text.as_str()).collect();
+        assert_eq!(texts, vec!["hits-suspected", "hits-touched"]);
+    }
+
+    #[test]
+    fn select_precautions_for_prompt_treats_empty_applies_to_as_global_relevant() {
+        // applies_to empty (=score 3) must outrank an unrelated path-scoped
+        // precaution (=score 0) within the same severity.
+        let inputs = vec![
+            p("scoped-unrelated", Severity::High, vec!["src/zzz.rs"]),
+            p("global", Severity::High, vec![]),
+        ];
+        let touched = vec!["src/main.rs".to_string()];
+        let out = select_precautions_for_prompt(&inputs, ExecutionMode::Act, &touched, None);
+        let texts: Vec<&str> = out.iter().map(|p| p.text.as_str()).collect();
+        assert_eq!(texts, vec!["global", "scoped-unrelated"]);
+    }
+
+    #[test]
+    fn select_precautions_for_prompt_handles_no_last_feedback() {
+        let inputs = vec![
+            p("a", Severity::Medium, vec![]),
+            p("b", Severity::High, vec![]),
+        ];
+        let out = select_precautions_for_prompt(&inputs, ExecutionMode::Act, &[], None);
+        let texts: Vec<&str> = out.iter().map(|p| p.text.as_str()).collect();
+        assert_eq!(texts, vec!["b", "a"]);
+    }
+
+    #[test]
+    fn select_precautions_for_prompt_filters_non_active() {
+        let inputs = vec![
+            p_with_status("active", Severity::Medium, PrecautionStatus::Active),
+            p_with_status("resolved", Severity::High, PrecautionStatus::Resolved),
+            p_with_status("retired", Severity::High, PrecautionStatus::Retired),
+        ];
+        let out = select_precautions_for_prompt(&inputs, ExecutionMode::Act, &[], None);
+        let texts: Vec<&str> = out.iter().map(|p| p.text.as_str()).collect();
+        assert_eq!(texts, vec!["active"]);
+    }
+
+    // -- helper-level unit tests ---------------------------------------
+
+    #[test]
+    fn normalize_relevance_key_idempotent_for_unix_paths() {
+        assert_eq!(normalize_relevance_key("src/foo.rs"), "src/foo.rs");
+        assert_eq!(normalize_relevance_key("src\\foo.rs"), "src/foo.rs");
+        assert_eq!(normalize_relevance_key("a\\b\\c"), "a/b/c");
+    }
+
+    #[test]
+    fn relevance_score_returns_1_for_empty_applies_to() {
+        // Global (empty applies_to) scores below path-scoped hits but above
+        // path-scoped misses (CB-001 fix: suspected > touched > global > unrelated).
+        let prec = p("g", Severity::Medium, vec![]);
+        let touched: HashSet<String> = HashSet::new();
+        let suspected: HashSet<String> = HashSet::new();
+        assert_eq!(relevance_score(&prec, &touched, &suspected), 1);
+    }
+
+    #[test]
+    fn relevance_score_returns_3_for_suspected_hit() {
+        let prec = p("s", Severity::Medium, vec!["src/a.rs"]);
+        let touched: HashSet<String> = HashSet::new();
+        let suspected: HashSet<String> = ["src/a.rs".to_string()].into_iter().collect();
+        assert_eq!(relevance_score(&prec, &touched, &suspected), 3);
+    }
+
+    #[test]
+    fn relevance_score_returns_2_for_touched_only_hit() {
+        let prec = p("t", Severity::Medium, vec!["src/a.rs"]);
+        let touched: HashSet<String> = ["src/a.rs".to_string()].into_iter().collect();
+        let suspected: HashSet<String> = HashSet::new();
+        assert_eq!(relevance_score(&prec, &touched, &suspected), 2);
+    }
+
+    #[test]
+    fn relevance_score_returns_0_for_no_overlap() {
+        let prec = p("n", Severity::Medium, vec!["src/a.rs"]);
+        let touched: HashSet<String> = ["src/zzz.rs".to_string()].into_iter().collect();
+        let suspected: HashSet<String> = HashSet::new();
+        assert_eq!(relevance_score(&prec, &touched, &suspected), 0);
+    }
+
+    #[test]
+    fn select_precautions_for_prompt_touched_outranks_global() {
+        // CB-001 regression guard: a path-scoped touched precaution must come
+        // before a broad global precaution within the same severity, because
+        // touched relevance (2) > global (1).
+        let inputs = vec![
+            p("global", Severity::Medium, vec![]),
+            p("touched", Severity::Medium, vec!["src/main.rs"]),
+        ];
+        let touched = vec!["src/main.rs".to_string()];
+        let out = select_precautions_for_prompt(&inputs, ExecutionMode::Act, &touched, None);
+        let texts: Vec<&str> = out.iter().map(|p| p.text.as_str()).collect();
+        assert_eq!(texts, vec!["touched", "global"]);
+    }
+
+    #[test]
+    fn select_precautions_for_prompt_suspected_outranks_global() {
+        // CB-001 regression guard: suspected (3) must come before global (1).
+        let inputs = vec![
+            p("global", Severity::Medium, vec![]),
+            p("suspected", Severity::Medium, vec!["src/a.rs"]),
+        ];
+        let suspected = vec![PathBuf::from("src/a.rs")];
+        let out = select_precautions_for_prompt(&inputs, ExecutionMode::Act, &[], Some(&suspected));
+        let texts: Vec<&str> = out.iter().map(|p| p.text.as_str()).collect();
+        assert_eq!(texts, vec!["suspected", "global"]);
+    }
+
+    #[test]
+    fn relevance_keyset_from_touched_normalizes_backslashes() {
+        let items = vec!["src\\foo.rs".to_string(), "src/bar.rs".to_string()];
+        let set = relevance_keyset_from_touched(&items);
+        assert!(set.contains("src/foo.rs"));
+        assert!(set.contains("src/bar.rs"));
+    }
+
+    #[test]
+    fn relevance_keyset_from_suspected_projects_pathbufs_to_keys() {
+        let items = vec![PathBuf::from("src/a.rs"), PathBuf::from("src/b.rs")];
+        let set = relevance_keyset_from_suspected(&items);
+        assert!(set.contains("src/a.rs"));
+        assert!(set.contains("src/b.rs"));
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn apply_budget_caps_includes_at_least_one_oversize_item() {
+        // Single precaution whose line is > MAX_ACTIVE_PRECAUTIONS_CHARS.
+        let huge_text = "Y".repeat(WorkingMemory::MAX_ACTIVE_PRECAUTIONS_CHARS + 100);
+        let prec = p(&huge_text, Severity::High, vec![]);
+        let sorted: Vec<&Precaution> = vec![&prec];
+        let out = apply_budget_caps(sorted);
+        assert_eq!(out.len(), 1, "first item must always pass the soft cap");
+    }
+
+    #[test]
+    fn apply_budget_caps_respects_n_hard_cap() {
+        let inputs: Vec<Precaution> = (0..(WorkingMemory::MAX_ACTIVE_PRECAUTIONS_PROMPT + 5))
+            .map(|i| p(&format!("p{i}"), Severity::Medium, vec![]))
+            .collect();
+        let refs: Vec<&Precaution> = inputs.iter().collect();
+        let out = apply_budget_caps(refs);
+        assert_eq!(out.len(), WorkingMemory::MAX_ACTIVE_PRECAUTIONS_PROMPT);
+    }
+
+    #[test]
+    fn sort_precautions_for_prompt_orders_by_severity_then_relevance() {
+        let high_unrel = p("hi-no", Severity::High, vec!["src/zzz.rs"]);
+        let high_rel = p("hi-yes", Severity::High, vec!["src/main.rs"]);
+        let med_rel = p("md-yes", Severity::Medium, vec!["src/main.rs"]);
+        let inputs = vec![&high_unrel, &high_rel, &med_rel];
+        let touched: HashSet<String> = ["src/main.rs".to_string()].into_iter().collect();
+        let suspected: HashSet<String> = HashSet::new();
+        let sorted = sort_precautions_for_prompt(inputs, &touched, &suspected);
+        let texts: Vec<&str> = sorted.iter().map(|p| p.text.as_str()).collect();
+        assert_eq!(texts, vec!["hi-yes", "hi-no", "md-yes"]);
     }
 }
 
