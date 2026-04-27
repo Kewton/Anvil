@@ -24,7 +24,7 @@ pub struct OllamaClient {
     timeout_secs: u64,
 }
 
-const SIDECAR_SUMMARY_TIMEOUT_SECS: u64 = 8;
+pub(crate) const SIDECAR_SUMMARY_TIMEOUT_SECS: u64 = 8;
 const SIDECAR_SUMMARY_MAX_PREDICT: usize = 384;
 const CLASSIFIER_TIMEOUT_SECS: u64 = 20;
 const CLASSIFIER_MAX_PREDICT: usize = 160;

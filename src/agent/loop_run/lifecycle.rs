@@ -530,7 +530,7 @@ fn plan_needs_stage_three_fallback(contents: &str) -> bool {
             .any(|section| plan_section_is_substantive(contents, section))
 }
 
-fn extract_first_json_object(raw: &str) -> Option<&str> {
+pub(crate) fn extract_first_json_object(raw: &str) -> Option<&str> {
     let start = raw.find('{')?;
     let mut depth = 0usize;
     let mut in_string = false;

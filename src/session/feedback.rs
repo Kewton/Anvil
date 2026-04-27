@@ -308,6 +308,32 @@ pub fn truncate_excerpt(s: &str) -> String {
     out
 }
 
+/// Cap `s` to `head_bytes + tail_bytes + marker` by keeping `head_bytes` from
+/// the head and `tail_bytes` from the tail (both at char boundaries). Always
+/// returns a UTF-8 string. Used by Reminder Sidecar (#452) to compress
+/// stdout/stderr excerpts further (e.g. 1 KiB head + 1 KiB tail) than
+/// `truncate_excerpt`'s fixed 8 KiB cap.
+pub fn truncate_excerpt_with_caps(s: &str, head_bytes: usize, tail_bytes: usize) -> String {
+    let original_len = s.len();
+    if original_len <= head_bytes + tail_bytes {
+        return s.to_string();
+    }
+    let head_end = floor_char_boundary(s, head_bytes);
+    let tail_start_raw = original_len.saturating_sub(tail_bytes);
+    let tail_start = ceil_char_boundary(s, tail_start_raw);
+    if head_end >= tail_start {
+        return s.to_string();
+    }
+    let kept_len = head_end + (original_len - tail_start);
+    let removed = original_len.saturating_sub(kept_len);
+    let marker = format!("\n[...truncated {removed} bytes...]\n");
+    let mut out = String::with_capacity(head_end + marker.len() + (original_len - tail_start));
+    out.push_str(&s[..head_end]);
+    out.push_str(&marker);
+    out.push_str(&s[tail_start..]);
+    out
+}
+
 // --- Path normalization ---------------------------------------------------
 
 /// Normalize `p` to a workspace-relative `PathBuf` for persistence.
