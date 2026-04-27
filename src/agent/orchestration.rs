@@ -16,6 +16,7 @@ pub struct RepoVerification {
     pub implementation_files_changed: usize,
     pub test_files_changed: usize,
     pub setup_files_changed: usize,
+    pub other_files_changed: usize,
     pub deleted_files_changed: usize,
 }
 
@@ -24,12 +25,14 @@ impl RepoVerification {
         self.implementation_files_changed > 0
             || self.test_files_changed > 0
             || self.setup_files_changed > 0
+            || self.other_files_changed > 0
     }
 
     pub fn total_changed_files(&self) -> usize {
         self.implementation_files_changed
             + self.test_files_changed
             + self.setup_files_changed
+            + self.other_files_changed
             + self.deleted_files_changed
     }
 }
@@ -68,6 +71,7 @@ pub fn verify_repo_progress(before: &RepoSnapshot, root: &Path) -> RepoVerificat
     let mut implementation_files_changed = 0usize;
     let mut test_files_changed = 0usize;
     let mut setup_files_changed = 0usize;
+    let mut other_files_changed = 0usize;
     let mut deleted_files_changed = 0usize;
 
     // modified or created files
@@ -86,6 +90,8 @@ pub fn verify_repo_progress(before: &RepoSnapshot, root: &Path) -> RepoVerificat
             setup_files_changed += 1;
         } else if is_implementation_file(path) {
             implementation_files_changed += 1;
+        } else {
+            other_files_changed += 1;
         }
     }
 
@@ -106,6 +112,7 @@ pub fn verify_repo_progress(before: &RepoSnapshot, root: &Path) -> RepoVerificat
         implementation_files_changed,
         test_files_changed,
         setup_files_changed,
+        other_files_changed,
         deleted_files_changed,
     }
 }

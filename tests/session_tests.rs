@@ -2,7 +2,7 @@ use anvil::session::compact::{
     COMPACT_SUMMARY_PREFIX, approximate_token_count, compact_messages,
     compact_messages_with_strategy,
 };
-use anvil::session::store::{ConversationMessage, SessionSnapshot, SessionStore};
+use anvil::session::store::{ConversationMessage, SessionSnapshot, SessionStore, WorkingMemory};
 use tempfile::tempdir;
 
 #[test]
@@ -106,4 +106,36 @@ fn approximate_token_count_is_positive() {
         ConversationMessage::assistant("world".into(), Vec::new()),
     ];
     assert!(approximate_token_count(&messages) > 0);
+}
+
+#[test]
+fn working_memory_formats_for_prompt() {
+    let mut memory = WorkingMemory::default();
+    memory.set_active_task(Some("Implement long-session memory".to_string()));
+    memory.replace_constraints(vec!["Keep paths relative".to_string()]);
+    memory.note_touched_file("src/main.rs".to_string());
+    memory.note_error("Edit: target text not found".to_string());
+
+    let rendered = memory.format_for_prompt().unwrap();
+    assert!(rendered.contains("Active task: Implement long-session memory"));
+    assert!(rendered.contains("Constraints:"));
+    assert!(rendered.contains("src/main.rs"));
+    assert!(rendered.contains("target text not found"));
+}
+
+#[test]
+fn session_snapshot_roundtrip_preserves_working_memory() {
+    let snapshot = SessionSnapshot {
+        working_memory: WorkingMemory {
+            active_task: Some("Do the thing".to_string()),
+            constraints: vec!["Do not lose context".to_string()],
+            touched_files: vec!["src/lib.rs".to_string()],
+            unresolved_errors: vec!["Edit: target text not found".to_string()],
+        },
+        ..SessionSnapshot::default()
+    };
+
+    let json = serde_json::to_string(&snapshot).unwrap();
+    let decoded: SessionSnapshot = serde_json::from_str(&json).unwrap();
+    assert_eq!(decoded.working_memory, snapshot.working_memory);
 }

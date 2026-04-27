@@ -879,6 +879,9 @@ mod tests {
             mode_state: ModeState {
                 mode: ExecutionMode::Plan,
                 active_plan_path: Some(PathBuf::from("/tmp/work/.anvil/plan.md")),
+                task_profile: crate::modes::plan_act::TaskProfile::Generic,
+                work_mode: crate::modes::plan_act::WorkMode::Auto,
+                plan_stage: crate::modes::plan_act::PlanStage::Stage1,
             },
             messages: vec![
                 ConversationMessage::system("sys".into()),
@@ -887,6 +890,7 @@ mod tests {
             ],
             checkpoints: vec!["cp1".into()],
             native_tools_disabled: false,
+            working_memory: Default::default(),
         };
         let v = ShowView::from_snapshot(&snap);
         assert_eq!(v.id, "sid");

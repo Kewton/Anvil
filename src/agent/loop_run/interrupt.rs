@@ -14,7 +14,7 @@
 //! Scope (per S5-003): interrupt takes effect at the next `run_actor_loop`
 //! boundary — tool completion or LLM response completion. No mid-flight cancel.
 
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -26,6 +26,7 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 /// Poll timeout in the daemon thread. 100ms keeps CPU near-idle while staying
 /// responsive to ESC. Also bounded by `Condvar::notify_all()` from pause/Drop.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+const INTERRUPT_NOTICE: &str = "interrupt requested; stopping after current operation";
 
 // ---------------------------------------------------------------------------
 // InterruptFlag — read-only handle checked at `run_actor_loop` boundaries.
@@ -35,7 +36,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// tests can inject a preset flag via `InterruptFlag::new_preset(true)`.
 #[derive(Clone)]
 pub(super) struct InterruptFlag {
-    flag: Arc<AtomicBool>,
+    pub(super) flag: Arc<AtomicBool>,
 }
 
 impl InterruptFlag {
@@ -298,6 +299,7 @@ fn render_loop(flag: Arc<AtomicBool>, state: Arc<(Mutex<MonitorState>, Condvar)>
         match event::poll(POLL_INTERVAL) {
             Ok(true) => match event::read() {
                 Ok(Event::Key(k)) if k.code == KeyCode::Esc => {
+                    emit_interrupt_feedback();
                     flag.store(true, Ordering::SeqCst);
                     break;
                 }
@@ -308,6 +310,14 @@ fn render_loop(flag: Arc<AtomicBool>, state: Arc<(Mutex<MonitorState>, Condvar)>
             Err(_) => break,
         }
     }
+}
+
+fn emit_interrupt_feedback() {
+    let mut err = io::stderr().lock();
+    let _ = err.write_all(b"\r\x1b[2K\r\n");
+    let _ = err.write_all(INTERRUPT_NOTICE.as_bytes());
+    let _ = err.write_all(b"\r\n");
+    let _ = err.flush();
 }
 
 // ---------------------------------------------------------------------------

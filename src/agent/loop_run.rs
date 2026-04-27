@@ -1,7 +1,6 @@
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::Duration;
 
 use crate::agent::prompting;
 use crate::agent::recovery;
@@ -20,10 +19,14 @@ use crate::stdin_prompt;
 use crate::system_prompt::build_system_prompt;
 use crate::tools::registry::{ToolContext, ToolRegistry};
 
+mod auto_test;
 pub mod commands;
+mod deterministic;
 mod footer;
 mod interrupt;
 mod lifecycle;
+mod protocol;
+mod quality;
 pub mod slash_commands;
 mod spinner;
 mod summary;
@@ -54,12 +57,21 @@ pub struct Agent {
     session: SessionSnapshot,
     work_root: PathBuf,
     native_tools_enabled: bool,
+    plan_model_override: Option<String>,
     tool_registry: ToolRegistry,
+    repo_context_cache: Option<RepoContextCache>,
     /// Fixed footer handle. Phase A: always disabled (no-op); the handle
     /// shape is plumbed now so Phase B-D can attach `publish_*` calls
     /// without re-touching `Agent::new` callers (issue #430).
     #[allow(dead_code)]
     footer: FooterHandle,
+}
+
+#[derive(Clone)]
+struct RepoContextCache {
+    task: String,
+    work_root: PathBuf,
+    message: Option<ConversationMessage>,
 }
 
 impl Agent {
@@ -85,7 +97,9 @@ impl Agent {
             session,
             work_root,
             native_tools_enabled,
+            plan_model_override: None,
             tool_registry: ToolRegistry::default(),
+            repo_context_cache: None,
             footer,
         }
     }
@@ -102,19 +116,19 @@ mod tests {
 
     #[test]
     fn detects_created_next_app_root_from_success_line() {
-        let output = "Success! Created space-invaders at /tmp/work/space-invaders";
+        let output = "Success! Created sample-app at /tmp/work/sample-app";
         assert_eq!(
             detect_created_project_root(output),
-            Some(PathBuf::from("/tmp/work/space-invaders"))
+            Some(PathBuf::from("/tmp/work/sample-app"))
         );
     }
 
     #[test]
     fn detects_created_next_app_root_from_create_line() {
-        let output = "Creating a new Next.js app in /tmp/work/space-invaders.";
+        let output = "Creating a new Next.js app in /tmp/work/sample-app.";
         assert_eq!(
             detect_created_project_root(output),
-            Some(PathBuf::from("/tmp/work/space-invaders"))
+            Some(PathBuf::from("/tmp/work/sample-app"))
         );
     }
 

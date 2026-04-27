@@ -20,6 +20,7 @@ fn deterministic_verifier_reports_changed_file_categories() {
     assert_eq!(verification.setup_files_changed, 1);
     assert_eq!(verification.implementation_files_changed, 1);
     assert_eq!(verification.test_files_changed, 1);
+    assert_eq!(verification.other_files_changed, 0);
     assert_eq!(verification.deleted_files_changed, 0);
     assert!(verification.made_any_progress());
     assert_eq!(verification.changed_files.len(), 3);
@@ -62,8 +63,23 @@ fn total_changed_files_sums_all_categories() {
     let v = verify_repo_progress(&before, temp.path());
     assert_eq!(v.implementation_files_changed, 1);
     assert_eq!(v.test_files_changed, 1);
+    assert_eq!(v.other_files_changed, 0);
     assert_eq!(v.deleted_files_changed, 1);
     assert_eq!(v.total_changed_files(), 3);
+}
+
+#[test]
+fn markdown_docs_are_counted_as_other_changed_files() {
+    let temp = tempdir().unwrap();
+    std::fs::write(temp.path().join("README.md"), "# Before\n").unwrap();
+    let before = capture_repo_snapshot(temp.path());
+
+    std::fs::write(temp.path().join("README.md"), "# After\n").unwrap();
+
+    let v = verify_repo_progress(&before, temp.path());
+    assert_eq!(v.other_files_changed, 1);
+    assert_eq!(v.total_changed_files(), 1);
+    assert_eq!(v.changed_files, vec!["README.md".to_string()]);
 }
 
 #[test]

@@ -37,6 +37,10 @@ pub struct CliArgs {
     pub fresh_session: bool,
     #[arg(long = "oneshot")]
     pub oneshot: bool,
+    #[arg(long = "auto-plan")]
+    pub auto_plan: bool,
+    #[arg(long = "offline")]
+    pub offline: bool,
     /// Disable the fixed footer status bar (mode / token usage / log level).
     #[arg(long = "no-footer")]
     pub no_footer: bool,
@@ -171,6 +175,8 @@ mod tests {
             yes: false,
             fresh_session: false,
             oneshot: false,
+            auto_plan: false,
+            offline: false,
             no_footer: false,
             resume: None,
             cwd: None,
@@ -230,6 +236,15 @@ mod tests {
         // CliArgs::parse_from to verify clap binding (AC14: --help carries the flag).
         let parsed = CliArgs::parse_from(["anvil", "--no-footer"]);
         assert!(parsed.no_footer);
+    }
+
+    #[test]
+    fn auto_plan_flag_defaults_false_and_parses_as_true() {
+        let args = base_args();
+        assert!(!args.auto_plan);
+
+        let parsed = CliArgs::parse_from(["anvil", "--auto-plan"]);
+        assert!(parsed.auto_plan);
     }
 
     #[test]

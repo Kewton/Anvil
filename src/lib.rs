@@ -351,8 +351,8 @@ pub fn symlink_anvil_dirs(
     session_id: &str,
 ) -> Result<(), String> {
     let anvil_dir = workdir.join(".anvil");
-    if !anvil_dir.exists() {
-        let _ = std::fs::create_dir_all(&anvil_dir);
+    if !anvil_dir.is_dir() {
+        return Ok(());
     }
 
     let session_root = state_root.join("sessions").join(session_id);
@@ -411,5 +411,39 @@ fn create_symlink_best_effort(link: &Path, target: &Path) {
                 target.display()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ensure_state_dirs, symlink_anvil_dirs};
+    use tempfile::tempdir;
+
+    #[test]
+    fn symlink_anvil_dirs_does_not_create_anvil_dir_implicitly() {
+        let workdir = tempdir().unwrap();
+        let state_root = tempdir().unwrap();
+        let session_id = "019dbb24-uat";
+        ensure_state_dirs(state_root.path(), session_id).unwrap();
+
+        symlink_anvil_dirs(workdir.path(), state_root.path(), session_id).unwrap();
+
+        assert!(!workdir.path().join(".anvil").exists());
+    }
+
+    #[test]
+    fn symlink_anvil_dirs_populates_existing_legacy_anvil_dir() {
+        let workdir = tempdir().unwrap();
+        let state_root = tempdir().unwrap();
+        let session_id = "019dbb24-uat";
+        ensure_state_dirs(state_root.path(), session_id).unwrap();
+        std::fs::create_dir_all(workdir.path().join(".anvil")).unwrap();
+
+        symlink_anvil_dirs(workdir.path(), state_root.path(), session_id).unwrap();
+
+        let anvil_dir = workdir.path().join(".anvil");
+        assert!(anvil_dir.join("logs").exists());
+        assert!(anvil_dir.join("plans").exists());
+        assert!(anvil_dir.join("sessions").exists());
     }
 }

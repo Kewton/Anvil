@@ -5,7 +5,7 @@
 //! offline (no Ollama, no network) and stay deterministic.
 
 use anvil::cli::{CliArgs, Command, ResumeRequest, SessionsAction};
-use anvil::modes::plan_act::{ExecutionMode, ModeState};
+use anvil::modes::plan_act::{ExecutionMode, ModeState, PlanStage, TaskProfile, WorkMode};
 use anvil::session::compact::{COMPACT_SUMMARY_PREFIX, compact_messages, find_last_user_prompt};
 use anvil::session::sessions_cli::{
     CleanArgs, ShowView, compute_list_rows, plan_clean, scan_session_meta,
@@ -46,6 +46,9 @@ fn write_session(
         mode_state: ModeState {
             mode,
             active_plan_path,
+            task_profile: TaskProfile::Generic,
+            work_mode: WorkMode::Auto,
+            plan_stage: PlanStage::Stage1,
         },
         active_root,
         ..Default::default()
@@ -419,6 +422,9 @@ fn reconcile_downgrades_plan_when_plan_file_missing() {
         mode_state: ModeState {
             mode: ExecutionMode::Plan,
             active_plan_path: Some(PathBuf::from("/definitely-not-a-file-xyz")),
+            task_profile: TaskProfile::Generic,
+            work_mode: WorkMode::Auto,
+            plan_stage: PlanStage::Stage1,
         },
         ..Default::default()
     };
@@ -438,6 +444,9 @@ fn reconcile_is_noop_when_everything_is_valid() {
         mode_state: ModeState {
             mode: ExecutionMode::Plan,
             active_plan_path: Some(plan.clone()),
+            task_profile: TaskProfile::Generic,
+            work_mode: WorkMode::Auto,
+            plan_stage: PlanStage::Stage1,
         },
         ..Default::default()
     };
