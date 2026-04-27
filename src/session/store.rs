@@ -1,9 +1,14 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
+
 use crate::modes::plan_act::{ExecutionMode, ModeState};
 use crate::ollama::xml_fallback::ToolCall;
-use crate::session::feedback::FeedbackFrame;
+use crate::session::feedback::{FeedbackFrame, mask_secrets, normalize_path_to_workspace};
+use crate::session::precaution::{
+    AddPrecautionOutcome, Precaution, PrecautionSource, PrecautionStatus, RetiredReason, Severity,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub struct WorkingMemory {
@@ -15,12 +20,21 @@ pub struct WorkingMemory {
     pub touched_files: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unresolved_errors: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_precautions: Vec<Precaution>,
 }
 
 impl WorkingMemory {
     const MAX_CONSTRAINTS: usize = 8;
     const MAX_TOUCHED_FILES: usize = 12;
     const MAX_UNRESOLVED_ERRORS: usize = 8;
+    pub const MAX_ACTIVE_PRECAUTIONS: usize = 16;
+    pub const MAX_PRECAUTION_TEXT: usize = 240;
+    pub const MAX_PRECAUTION_RAW_TEXT: usize = 8 * 1024;
+    pub const MAX_PRECAUTIONS_TOTAL: usize = 64;
+    /// Cap on `applies_to` length per precaution (CB-002). Bounds canonicalize
+    /// / sort / dedup work and `fs::canonicalize` syscalls per add/load.
+    pub const MAX_PRECAUTION_APPLIES_TO: usize = 32;
 
     pub fn set_active_task(&mut self, task: Option<String>) {
         self.active_task = task.map(|value| truncate_entry(value, 240));
@@ -53,10 +67,15 @@ impl WorkingMemory {
     }
 
     pub fn format_for_prompt(&self) -> Option<String> {
+        let active_precaution_some = self
+            .active_precautions
+            .iter()
+            .any(|p| p.status == PrecautionStatus::Active);
         if self.active_task.is_none()
             && self.constraints.is_empty()
             && self.touched_files.is_empty()
             && self.unresolved_errors.is_empty()
+            && !active_precaution_some
         {
             return None;
         }
@@ -77,6 +96,22 @@ impl WorkingMemory {
                 lines.push(format!("- {item}"));
             }
         }
+        // Active Precautions section: emitted between Touched files and
+        // Unresolved errors so the prompt order is
+        // Active task -> Constraints -> Touched files -> Active Precautions ->
+        // Unresolved errors (design judgment #9, DR1-006). Severity sort /
+        // token-budget filtering is the responsibility of Issue #4 (#453).
+        let active: Vec<&Precaution> = self
+            .active_precautions
+            .iter()
+            .filter(|p| p.status == PrecautionStatus::Active)
+            .collect();
+        if !active.is_empty() {
+            lines.push("Active Precautions:".to_string());
+            for p in active {
+                lines.push(format!("- [{}] {}", p.severity.as_label(), p.text));
+            }
+        }
         if !self.unresolved_errors.is_empty() {
             lines.push("Unresolved errors:".to_string());
             for item in &self.unresolved_errors {
@@ -85,9 +120,397 @@ impl WorkingMemory {
         }
         Some(lines.join("\n"))
     }
+
+    /// Canonical entry point for inserting a `Precaution`. Bypassing this
+    /// method skips secret masking, truncation, path normalization, and id
+    /// derivation — see module docstring on `precaution.rs`.
+    pub fn add_precaution(
+        &mut self,
+        precaution: Precaution,
+        workspace_root: &Path,
+    ) -> AddPrecautionOutcome {
+        let (canonical, was_truncated) = canonicalize_for_storage(precaution, workspace_root);
+
+        if self.find_blocking_duplicate(&canonical).is_some() {
+            return AddPrecautionOutcome::DuplicateIgnored;
+        }
+
+        self.evict_oldest_active_if_full();
+        self.active_precautions.push(canonical);
+        self.prune_precaution_history_if_needed();
+
+        if was_truncated {
+            AddPrecautionOutcome::Truncated
+        } else {
+            AddPrecautionOutcome::Added
+        }
+    }
+
+    /// Mark an Active precaution as Resolved. Returns true on success.
+    pub fn resolve_precaution(&mut self, id: &str) -> bool {
+        if let Some(p) = self.active_precautions.iter_mut().find(|p| p.id == id)
+            && p.status == PrecautionStatus::Active
+        {
+            p.status = PrecautionStatus::Resolved;
+            return true;
+        }
+        false
+    }
+
+    /// Retire a precaution (terminal). Returns true on success.
+    pub fn retire_precaution(&mut self, id: &str) -> bool {
+        if let Some(p) = self.active_precautions.iter_mut().find(|p| p.id == id)
+            && matches!(
+                p.status,
+                PrecautionStatus::Active | PrecautionStatus::Resolved
+            )
+        {
+            p.status = PrecautionStatus::Retired;
+            p.retired_reason = Some(RetiredReason::UserRetired);
+            return true;
+        }
+        false
+    }
+
+    /// Re-apply the canonicalization pipeline to every loaded precaution
+    /// using bounded reconstruction (CB-001 / design judgment #14).
+    ///
+    /// session.json is user-editable, so the on-disk Vec is not trusted. The
+    /// sanitizer rebuilds `active_precautions` from scratch:
+    ///   * each entry is re-canonicalized (mask / truncate / path normalize /
+    ///     id recompute / Unknown-status downgrade);
+    ///   * Active entries pass through `add_precaution`-equivalent duplicate
+    ///     detection and FIFO active-cap eviction so a tampered file with 50
+    ///     identical-id Active entries collapses to one and overflow Active
+    ///     entries are evicted to `Retired(CapacityEvicted)`;
+    ///   * Resolved / Retired entries are de-duplicated by id;
+    ///   * the final length is bounded by `prune_precaution_history_if_needed`
+    ///     and a fail-safe `truncate(MAX_PRECAUTIONS_TOTAL)` so even a file
+    ///     dominated by Active or by Retired-with-no-victim-reason entries
+    ///     cannot exceed the total cap.
+    pub fn sanitize_active_precautions_after_load(&mut self, workspace_root: &Path) {
+        let raw = std::mem::take(&mut self.active_precautions);
+        for precaution in raw {
+            let canonical = canonicalize_loaded_precaution(precaution, workspace_root);
+            match canonical.status {
+                PrecautionStatus::Active => {
+                    if self.find_blocking_duplicate(&canonical).is_some() {
+                        // Duplicate id (vs. Active / Resolved / blocked Retired)
+                        // — drop instead of pushing.
+                        continue;
+                    }
+                    self.evict_oldest_active_if_full();
+                    self.active_precautions.push(canonical);
+                }
+                PrecautionStatus::Resolved | PrecautionStatus::Retired => {
+                    if !self.active_precautions.iter().any(|p| p.id == canonical.id) {
+                        self.active_precautions.push(canonical);
+                    }
+                }
+                PrecautionStatus::Unknown => {
+                    // canonicalize_loaded_precaution downgrades Unknown to
+                    // Retired(Unknown) so this branch is unreachable in
+                    // practice, but kept defensively to make the invariant
+                    // explicit.
+                    if !self.active_precautions.iter().any(|p| p.id == canonical.id) {
+                        self.active_precautions.push(canonical);
+                    }
+                }
+            }
+        }
+        self.prune_precaution_history_if_needed();
+        // Final fail-safe — even if every entry survived pruning (e.g. the
+        // file consists entirely of Active entries up to the active cap plus
+        // Retired entries that were not pruning victims), guarantee the total
+        // cap. This terminal truncate is the last line of defence (CB-001).
+        if self.active_precautions.len() > Self::MAX_PRECAUTIONS_TOTAL {
+            self.active_precautions
+                .truncate(Self::MAX_PRECAUTIONS_TOTAL);
+        }
+    }
+
+    /// id-based duplicate detection with status × retired_reason matrix
+    /// (DR1-004). `(Retired, None)` and `(Retired, Some(Unknown))` are
+    /// conservatively treated as blocking to honor old session.json semantics.
+    fn find_blocking_duplicate(&self, p: &Precaution) -> Option<&Precaution> {
+        self.active_precautions.iter().find(|existing| {
+            existing.id == p.id
+                && match (existing.status, existing.retired_reason) {
+                    (PrecautionStatus::Active, _) => true,
+                    (PrecautionStatus::Resolved, _) => true,
+                    (PrecautionStatus::Retired, Some(RetiredReason::UserRetired)) => true,
+                    (PrecautionStatus::Retired, Some(RetiredReason::CapacityEvicted)) => false,
+                    (PrecautionStatus::Retired, Some(RetiredReason::Unknown)) => true,
+                    (PrecautionStatus::Retired, None) => true,
+                    (PrecautionStatus::Unknown, _) => true,
+                }
+        })
+    }
+
+    /// FIFO-evict the oldest Active precaution into Retired(CapacityEvicted)
+    /// when at MAX_ACTIVE_PRECAUTIONS capacity. The CapacityEvicted reason
+    /// allows the same canonical key to be re-Activated next time
+    /// `add_precaution` is called (design judgment #3).
+    fn evict_oldest_active_if_full(&mut self) {
+        let active_count = self
+            .active_precautions
+            .iter()
+            .filter(|p| p.status == PrecautionStatus::Active)
+            .count();
+        if active_count < Self::MAX_ACTIVE_PRECAUTIONS {
+            return;
+        }
+        if let Some(idx) = self
+            .active_precautions
+            .iter()
+            .position(|p| p.status == PrecautionStatus::Active)
+        {
+            let evicted = &mut self.active_precautions[idx];
+            evicted.status = PrecautionStatus::Retired;
+            evicted.retired_reason = Some(RetiredReason::CapacityEvicted);
+        }
+    }
+
+    /// Bound the total Vec length at `MAX_PRECAUTIONS_TOTAL` (design judgment
+    /// #13). Pruning order:
+    ///   1. Retired(CapacityEvicted)
+    ///   2. Resolved
+    ///   3. Retired(UserRetired)
+    ///   4. Retired(Unknown) / Retired(None) — added in CB-001 so a tampered
+    ///      file consisting entirely of these states cannot bypass the total
+    ///      cap by hitting the previous fall-through `break`.
+    ///
+    /// Active items are never pruned here — Active capacity is enforced by
+    /// `evict_oldest_active_if_full`. Final fail-safe is in
+    /// `sanitize_active_precautions_after_load`.
+    fn prune_precaution_history_if_needed(&mut self) {
+        while self.active_precautions.len() > Self::MAX_PRECAUTIONS_TOTAL {
+            let victim = self
+                .active_precautions
+                .iter()
+                .position(|p| {
+                    p.status == PrecautionStatus::Retired
+                        && p.retired_reason == Some(RetiredReason::CapacityEvicted)
+                })
+                .or_else(|| {
+                    self.active_precautions
+                        .iter()
+                        .position(|p| p.status == PrecautionStatus::Resolved)
+                })
+                .or_else(|| {
+                    self.active_precautions.iter().position(|p| {
+                        p.status == PrecautionStatus::Retired
+                            && p.retired_reason == Some(RetiredReason::UserRetired)
+                    })
+                })
+                .or_else(|| {
+                    // CB-001: Retired(Unknown) / Retired(None) entries are also
+                    // valid pruning victims. Without this branch a tampered
+                    // session.json full of these states would break out of
+                    // the loop and leave total > MAX_PRECAUTIONS_TOTAL.
+                    self.active_precautions.iter().position(|p| {
+                        p.status == PrecautionStatus::Retired
+                            && !matches!(
+                                p.retired_reason,
+                                Some(RetiredReason::CapacityEvicted)
+                                    | Some(RetiredReason::UserRetired)
+                            )
+                    })
+                });
+            if let Some(idx) = victim {
+                self.active_precautions.remove(idx);
+            } else {
+                break;
+            }
+        }
+    }
 }
 
-fn truncate_entry(value: String, max_chars: usize) -> String {
+/// Pre-storage canonicalization: raw cap -> sanitize_text -> mask -> truncate
+/// -> path normalize/sort/dedup -> severity-unknown downgrade -> id derivation.
+/// Returns `(precaution, was_truncated)` where `was_truncated` is whether
+/// `text` exceeded `MAX_PRECAUTION_TEXT` after `mask_secrets` was applied.
+fn canonicalize_for_storage(mut p: Precaution, workspace_root: &Path) -> (Precaution, bool) {
+    // 1. text: raw cap -> control-char strip / newline-fold (CB-006) -> mask
+    //    -> truncate (DR1-002 / DR2-006 / DR4-002).
+    p.text = truncate_entry(p.text, WorkingMemory::MAX_PRECAUTION_RAW_TEXT);
+    p.text = sanitize_text(&p.text);
+    p.text = mask_secrets(&p.text);
+    let original_chars = p.text.chars().count();
+    p.text = truncate_entry(p.text, WorkingMemory::MAX_PRECAUTION_TEXT);
+    let truncated = original_chars > WorkingMemory::MAX_PRECAUTION_TEXT;
+
+    // 2. applies_to: reject ParentDir + workspace-relativize + sort/dedup by
+    //    canonical key + cap input length (CB-002).
+    p.applies_to = canonicalize_applies_to(&p.applies_to, workspace_root);
+
+    // 3. severity: collapse forward-compat `Unknown` to `Medium` (CB-003) so
+    //    the prompt uses a known label and id derivation does not depend on a
+    //    label the runtime cannot interpret. Severity does not feed into the
+    //    id hash, so this is safe ordering-wise.
+    if matches!(p.severity, Severity::Unknown) {
+        p.severity = Severity::Medium;
+    }
+
+    // 4. id: SHA-256 full hex over (text, source, applies_to canonical sorted).
+    p.id = compute_precaution_id(&p);
+    p.status = PrecautionStatus::Active;
+    p.retired_reason = None;
+
+    (p, truncated)
+}
+
+/// CB-006: collapse newlines (`\n` / `\r`) to a single space and drop other
+/// ASCII / Unicode control characters. Keeps regular spaces, tabs are
+/// converted to spaces (tabs are control chars in `char::is_control`). This
+/// runs before `mask_secrets` so a multi-line payload cannot smuggle a forged
+/// `Unresolved errors:` section header into the prompt.
+fn sanitize_text(input: &str) -> String {
+    input
+        .chars()
+        .filter_map(|c| match c {
+            '\n' | '\r' | '\t' => Some(' '),
+            c if c.is_control() => None,
+            c => Some(c),
+        })
+        .collect()
+}
+
+/// Defensive re-canonicalization for precautions read from session.json.
+/// Preserves the existing status/retired_reason but recomputes the id from
+/// canonical fields. `Unknown` status is downgraded to `Retired(Unknown)` so it
+/// is never prompt-injected as Active (design judgment #14).
+fn canonicalize_loaded_precaution(p: Precaution, workspace_root: &Path) -> Precaution {
+    let original_status = p.status;
+    let original_retired_reason = p.retired_reason;
+    let (mut canonical, _) = canonicalize_for_storage(p, workspace_root);
+    canonical.status = match original_status {
+        PrecautionStatus::Active => PrecautionStatus::Active,
+        PrecautionStatus::Resolved => PrecautionStatus::Resolved,
+        PrecautionStatus::Retired => PrecautionStatus::Retired,
+        PrecautionStatus::Unknown => PrecautionStatus::Retired,
+    };
+    canonical.retired_reason = if canonical.status == PrecautionStatus::Retired {
+        if original_status == PrecautionStatus::Unknown {
+            Some(RetiredReason::Unknown)
+        } else {
+            original_retired_reason.or(Some(RetiredReason::Unknown))
+        }
+    } else {
+        None
+    };
+    canonical
+}
+
+/// SHA-256 full hex of `text + 0x00 + source_tag + 0x00 + applies_to_keys`.
+/// Storage uses 64-hex full hash; CLI tooling (#454/#455) is free to display
+/// the leading 12-hex prefix (design judgment #5).
+fn compute_precaution_id(p: &Precaution) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(p.text.as_bytes());
+    hasher.update(b"\x00");
+    hasher.update(precaution_source_tag(p.source).as_bytes());
+    hasher.update(b"\x00");
+    for path in &p.applies_to {
+        if let Some(key) = path_to_canonical_string(path) {
+            hasher.update(key.as_bytes());
+            hasher.update(b"\x00");
+        }
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+/// Deterministic snake_case tag for `PrecautionSource`, independent of
+/// serde_json version (DR1-013).
+fn precaution_source_tag(s: PrecautionSource) -> &'static str {
+    match s {
+        PrecautionSource::UserRequirement => "user_requirement",
+        PrecautionSource::PlanConstraint => "plan_constraint",
+        PrecautionSource::BuildFailure => "build_failure",
+        PrecautionSource::TestFailure => "test_failure",
+        PrecautionSource::ToolFailure => "tool_failure",
+        PrecautionSource::NoProgress => "no_progress",
+        PrecautionSource::SafetyPolicy => "safety_policy",
+        PrecautionSource::Manual => "manual",
+        PrecautionSource::Unknown => "unknown",
+    }
+}
+
+/// Canonical "/"-joined UTF-8 string of a path, OR None if any component is
+/// non-UTF-8. We deliberately never emit a partial path (DR4-004): a single
+/// non-UTF-8 component drops the whole path.
+fn path_to_canonical_string(p: &Path) -> Option<String> {
+    let parts: Option<Vec<&str>> = p.components().map(|c| c.as_os_str().to_str()).collect();
+    parts.map(|parts| parts.join("/"))
+}
+
+/// Sanitize `applies_to` for hashing/display: cap input length, reject `..`
+/// (twofold defence against path traversal: explicit reject +
+/// `normalize_path_to_workspace`), drop non-UTF-8 paths, drop absolute paths
+/// that do not resolve inside `workspace_root`, drop relative paths that fall
+/// back to a bare basename, and sort + dedup by canonical key
+/// (DR1-001 / DR1-007 / CB-002 / CB-004).
+fn canonicalize_applies_to(input: &[PathBuf], workspace_root: &Path) -> Vec<PathBuf> {
+    let mut keyed: Vec<(String, PathBuf)> = input
+        .iter()
+        // CB-002: cap input length so a tampered or huge applies_to cannot
+        // amplify canonicalize / sort / dedup work.
+        .take(WorkingMemory::MAX_PRECAUTION_APPLIES_TO)
+        .filter(|p| {
+            !p.components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        })
+        .filter_map(|p| canonicalize_single_path_in_workspace(p, workspace_root))
+        .filter_map(|p| {
+            let key = path_to_canonical_string(&p)?;
+            (!key.is_empty()).then_some((key, p))
+        })
+        .collect();
+    keyed.sort_by(|a, b| a.0.cmp(&b.0));
+    keyed.dedup_by(|a, b| a.0 == b.0);
+    keyed.into_iter().map(|(_, p)| p).collect()
+}
+
+/// CB-004: stricter wrapper around `normalize_path_to_workspace` for the
+/// precaution store.
+///
+/// `normalize_path_to_workspace` falls back to `Path::file_name()` when
+/// canonicalize fails, which would let an absolute path outside the workspace
+/// (`/etc/passwd`) or a multi-component nonexistent path leak as a bare
+/// basename. The precaution layer is stricter: it must never store a path
+/// whose original meaning was outside the workspace.
+///
+/// Policy:
+///   * absolute path -> require `canonicalize` to land inside `workspace_root`
+///     (any other outcome drops the path);
+///   * relative path -> use `normalize_path_to_workspace`, but if the helper
+///     reduces a multi-component path to a bare basename via `file_name()`
+///     fallback (i.e. canonicalize failed and the original had > 1 component
+///     or differs from the basename), drop it.
+fn canonicalize_single_path_in_workspace(p: &Path, workspace_root: &Path) -> Option<PathBuf> {
+    if p.is_absolute() {
+        let abs = p.canonicalize().ok()?;
+        let root = workspace_root.canonicalize().ok()?;
+        let rel = abs.strip_prefix(&root).ok()?;
+        return Some(rel.to_path_buf());
+    }
+    let normalized = normalize_path_to_workspace(p, workspace_root)?;
+    // Detect basename-only fallback: if the original path had more than one
+    // component but the helper returned a single-component bare basename,
+    // canonicalize must have failed and the helper fell back to `file_name`.
+    // We refuse that (CB-004) so a nonexistent `nested/dir/leak.rs` does not
+    // collapse to `leak.rs` in storage.
+    if normalized.components().count() == 1
+        && p.components().count() > 1
+        && p.file_name().map(PathBuf::from).as_deref() == Some(normalized.as_path())
+        && p.canonicalize().is_err()
+    {
+        return None;
+    }
+    Some(normalized)
+}
+
+pub(crate) fn truncate_entry(value: String, max_chars: usize) -> String {
     if value.chars().count() <= max_chars {
         return value;
     }
@@ -192,6 +615,19 @@ impl SessionStore {
         }
     }
 
+    /// Load a session.json from disk (or return a fresh `SessionSnapshot`).
+    ///
+    /// IMPORTANT (CB-005): the returned `SessionSnapshot` is **untrusted**.
+    /// session.json is user-editable and may contain stale ids, unmasked
+    /// secrets, oversized text, traversal paths, unknown enum variants, and
+    /// active-precaution counts beyond `WorkingMemory::MAX_ACTIVE_PRECAUTIONS`.
+    /// Callers MUST invoke
+    /// `WorkingMemory::sanitize_active_precautions_after_load(&workspace_root)`
+    /// on `snapshot.working_memory` before passing the snapshot to
+    /// `WorkingMemory::format_for_prompt`, before re-saving via
+    /// [`SessionStore::save`], or before exposing it to the agent loop. The
+    /// canonical entry point in `src/lib.rs` does this immediately after
+    /// `reconcile_resume_state`; do not skip it on alternate code paths.
     pub fn load_or_new(&self, fresh: bool) -> Result<SessionSnapshot, String> {
         if fresh || !self.path.exists() {
             return Ok(SessionSnapshot {

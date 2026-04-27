@@ -159,6 +159,50 @@ mod tests {
         );
     }
 
+    /// AC7 (Issue #451): `compact_messages` operates only on the message
+    /// vector and never observes `WorkingMemory.active_precautions`. We seed
+    /// a snapshot with a precaution + 40 messages, run compaction, and assert
+    /// the precaution Vec is untouched.
+    #[test]
+    fn compact_messages_preserves_active_precautions() {
+        use crate::session::precaution::{
+            Precaution, PrecautionSource, PrecautionStatus, Severity,
+        };
+        use crate::session::store::{SessionSnapshot, WorkingMemory};
+        use std::path::PathBuf;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut wm = WorkingMemory::default();
+        wm.add_precaution(
+            Precaution {
+                id: String::new(),
+                source: PrecautionSource::BuildFailure,
+                severity: Severity::High,
+                text: "Avoid using sed for in-place edits".to_string(),
+                applies_to: vec![PathBuf::from("src/lib.rs")],
+                status: PrecautionStatus::Active,
+                retired_reason: None,
+            },
+            dir.path(),
+        );
+
+        let mut snapshot = SessionSnapshot {
+            messages: (0..40)
+                .map(|i| ConversationMessage::user(format!("message {i}")))
+                .collect(),
+            working_memory: wm,
+            ..SessionSnapshot::default()
+        };
+
+        let before = snapshot.working_memory.active_precautions.clone();
+        let compacted = compact_messages(&mut snapshot.messages, 10);
+        assert!(compacted, "expected compaction to fire on 40-message log");
+        assert_eq!(
+            snapshot.working_memory.active_precautions, before,
+            "active_precautions must survive compact_messages"
+        );
+    }
+
     /// AC10 (Issue #450): `compact_messages` collapses head messages into a
     /// summary but never observes (let alone touches) `SessionSnapshot.last_feedback`.
     /// The contract is "compaction operates on the message vector only,
