@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::modes::plan_act::{ExecutionMode, ModeState};
 use crate::ollama::xml_fallback::ToolCall;
+use crate::session::feedback::FeedbackFrame;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub struct WorkingMemory {
@@ -157,6 +158,17 @@ pub struct SessionSnapshot {
     pub id: String,
     #[serde(default)]
     pub workspace_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_feedback: Option<FeedbackFrame>,
+}
+
+impl SessionSnapshot {
+    /// Overwrite `last_feedback` with the given frame. The same-turn
+    /// override rule (design 5.5) is satisfied by callers that invoke
+    /// this once per detected feedback event; later calls win.
+    pub fn record_feedback(&mut self, frame: FeedbackFrame) {
+        self.last_feedback = Some(frame);
+    }
 }
 
 pub struct SessionStore {

@@ -6,6 +6,7 @@ use serde_json::Value;
 
 use crate::modes::plan_act::{ExecutionMode, PlanStage};
 use crate::safety::path_guard::resolve_user_path;
+use crate::tools::bash::BashExecutionOutcome;
 use crate::tools::{bash, edit, glob, grep, read, write};
 
 #[derive(Debug, Clone)]
@@ -134,6 +135,92 @@ impl ToolRegistry {
             }
             other => Err(format!("unknown tool: {other}")),
         }
+    }
+
+    /// Bash-only execution path that exposes the structured
+    /// `BashExecutionOutcome` alongside the formatted text result. Used by
+    /// the agent layer (turn.rs) to drive FeedbackFrame generation
+    /// (Issue #450 / CB-001) for Bash dispatches without changing the
+    /// public `execute` contract.
+    ///
+    /// The `Err` arm now carries a `BashErrorClass` so the agent can
+    /// distinguish the dangerous-snippet block (the only case that
+    /// should be recorded as `UnsafeCommandBlocked` per design 5.2 / 11.2)
+    /// from policy denials, missing arguments, and runtime failures
+    /// (CB2-001).
+    pub fn execute_bash_with_outcome(
+        &self,
+        arguments: &Value,
+        context: &ToolContext,
+    ) -> (
+        Result<String, (String, BashErrorClass)>,
+        Option<BashExecutionOutcome>,
+    ) {
+        if let Err(err) = enforce_mode("Bash", arguments, context) {
+            return (Err((err, BashErrorClass::ModeOrScopeDenied)), None);
+        }
+        if let Err(err) = enforce_plan_stage_scope("Bash", arguments, context) {
+            return (Err((err, BashErrorClass::ModeOrScopeDenied)), None);
+        }
+        if let Err(err) = maybe_confirm("Bash", arguments, context) {
+            return (Err((err, BashErrorClass::ApprovalDenied)), None);
+        }
+        let command = match get_required_string(arguments, "command") {
+            Ok(c) => c,
+            Err(err) => return (Err((err, BashErrorClass::MissingArgument)), None),
+        };
+        match bash::run_with_outcome(
+            command,
+            &context.root,
+            context.cancel_flag.as_ref(),
+            context.offline,
+        ) {
+            Ok((text, outcome)) => (Ok(text), Some(outcome)),
+            Err(err) => {
+                let class = classify_bash_dispatch_err(&err);
+                (Err((err, class)), None)
+            }
+        }
+    }
+}
+
+/// CB2-001: how a bash dispatch failed when no `BashExecutionOutcome` was
+/// produced. Only `DangerousBlock` should be surfaced as
+/// `FeedbackKind::UnsafeCommandBlocked` per design 5.2 / 11.2; the other
+/// variants are policy / argument / runtime issues and must not be recorded
+/// as security blocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BashErrorClass {
+    /// `tools/bash.rs::is_dangerous_command` post-dispatch block (the
+    /// "blocked dangerous command fragment: ..." Err string).
+    DangerousBlock,
+    /// `enforce_offline_policy` rejected a network / general / mutating
+    /// command in offline mode.
+    OfflinePolicy,
+    /// `enforce_mode` or `enforce_plan_stage_scope` rejected the call.
+    ModeOrScopeDenied,
+    /// `maybe_confirm` rejected the call (user denial or non-interactive
+    /// without `--yes`).
+    ApprovalDenied,
+    /// `command` argument was missing or not a string.
+    MissingArgument,
+    /// Anything else (failed `spawn`, failed `wait`, etc.). Not a security
+    /// block.
+    RuntimeFailure,
+}
+
+/// Classify an Err string returned by `bash::run_with_outcome` (i.e. a
+/// pre-spawn error path that produced no `BashExecutionOutcome`). The
+/// dangerous-snippet block uses a stable `"blocked dangerous command
+/// fragment: ..."` prefix; offline policy uses a stable `"offline mode "`
+/// prefix. Everything else is treated as a generic runtime failure.
+fn classify_bash_dispatch_err(err: &str) -> BashErrorClass {
+    if err.starts_with("blocked dangerous command fragment") {
+        BashErrorClass::DangerousBlock
+    } else if err.starts_with("offline mode ") {
+        BashErrorClass::OfflinePolicy
+    } else {
+        BashErrorClass::RuntimeFailure
     }
 }
 
@@ -863,5 +950,153 @@ mod tests {
         assert!(updated.contains("## Verification\n- Run npm test."));
         assert!(!updated.contains("overwritten goal"));
         assert!(!updated.contains("## Quality Bar\n- later"));
+    }
+
+    /// CB-001: `execute_bash_with_outcome` exposes the structured
+    /// `BashExecutionOutcome` alongside the formatted text result so the
+    /// agent layer can record a FeedbackFrame without losing the existing
+    /// `Result<String, String>` contract.
+    #[test]
+    fn execute_bash_with_outcome_returns_structured_result() {
+        let temp = tempdir().unwrap();
+        let registry = ToolRegistry::default();
+        let context = ToolContext {
+            root: temp.path().to_path_buf(),
+            mode: ExecutionMode::Act,
+            plan_path: None,
+            plan_stage: PlanStage::Stage1,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            cancel_flag: None,
+        };
+        let (text_result, outcome) =
+            registry.execute_bash_with_outcome(&json!({"command": "printf hello"}), &context);
+        let text = text_result.expect("ok");
+        let outcome = outcome.expect("structured outcome");
+        assert!(text.starts_with("exit_code=0"));
+        assert_eq!(outcome.exit_code, Some(0));
+        assert!(outcome.stdout.contains("hello"));
+    }
+
+    /// CB-001: a dangerous bash command (`rm -rf /`) is rejected pre-spawn
+    /// and the structured outcome is `None` (no child process ran). The
+    /// caller in turn.rs treats that as `UnsafeCommandBlocked`.
+    #[test]
+    fn execute_bash_with_outcome_returns_no_outcome_for_dangerous_block() {
+        use super::BashErrorClass;
+        let temp = tempdir().unwrap();
+        let registry = ToolRegistry::default();
+        let context = ToolContext {
+            root: temp.path().to_path_buf(),
+            mode: ExecutionMode::Act,
+            plan_path: None,
+            plan_stage: PlanStage::Stage1,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            cancel_flag: None,
+        };
+        let (text_result, outcome) =
+            registry.execute_bash_with_outcome(&json!({"command": "rm -rf /"}), &context);
+        let (_msg, class) = text_result.expect_err("rm -rf / must be blocked");
+        assert_eq!(class, BashErrorClass::DangerousBlock);
+        assert!(outcome.is_none());
+    }
+
+    /// CB2-001: a missing `command` argument classifies as MissingArgument,
+    /// not DangerousBlock — turn.rs must not record UnsafeCommandBlocked
+    /// for malformed tool calls.
+    #[test]
+    fn execute_bash_with_outcome_classifies_missing_command_as_missing_argument() {
+        use super::BashErrorClass;
+        let temp = tempdir().unwrap();
+        let registry = ToolRegistry::default();
+        let context = ToolContext {
+            root: temp.path().to_path_buf(),
+            mode: ExecutionMode::Act,
+            plan_path: None,
+            plan_stage: PlanStage::Stage1,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            cancel_flag: None,
+        };
+        let (text_result, outcome) = registry.execute_bash_with_outcome(&json!({}), &context);
+        let (_msg, class) = text_result.expect_err("missing command must error");
+        assert_eq!(class, BashErrorClass::MissingArgument);
+        assert!(outcome.is_none());
+    }
+
+    /// CB2-001: an approval denial (non-interactive without --yes) classifies
+    /// as ApprovalDenied — must not record UnsafeCommandBlocked.
+    #[test]
+    fn execute_bash_with_outcome_classifies_approval_denial() {
+        use super::BashErrorClass;
+        let temp = tempdir().unwrap();
+        let registry = ToolRegistry::default();
+        let context = ToolContext {
+            root: temp.path().to_path_buf(),
+            mode: ExecutionMode::Act,
+            plan_path: None,
+            plan_stage: PlanStage::Stage1,
+            auto_approve: false,
+            interactive_approval: false,
+            offline: false,
+            cancel_flag: None,
+        };
+        let (text_result, outcome) =
+            registry.execute_bash_with_outcome(&json!({"command": "ls"}), &context);
+        let (_msg, class) = text_result.expect_err("approval denial must error");
+        assert_eq!(class, BashErrorClass::ApprovalDenied);
+        assert!(outcome.is_none());
+    }
+
+    /// CB2-001: an offline-policy denial classifies as OfflinePolicy — must
+    /// not record UnsafeCommandBlocked.
+    #[test]
+    fn execute_bash_with_outcome_classifies_offline_policy() {
+        use super::BashErrorClass;
+        let temp = tempdir().unwrap();
+        let registry = ToolRegistry::default();
+        let context = ToolContext {
+            root: temp.path().to_path_buf(),
+            mode: ExecutionMode::Act,
+            plan_path: None,
+            plan_stage: PlanStage::Stage1,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: true,
+            cancel_flag: None,
+        };
+        let (text_result, outcome) =
+            registry.execute_bash_with_outcome(&json!({"command": "curl example.com"}), &context);
+        let (_msg, class) = text_result.expect_err("offline policy must block curl");
+        assert_eq!(class, BashErrorClass::OfflinePolicy);
+        assert!(outcome.is_none());
+    }
+
+    /// CB2-001: a Plan-mode Bash dispatch is rejected by `enforce_mode`
+    /// (Plan mode only allows Read / Glob / Grep / plan-file edits).
+    #[test]
+    fn execute_bash_with_outcome_classifies_plan_mode_denial() {
+        use super::BashErrorClass;
+        let temp = tempdir().unwrap();
+        let registry = ToolRegistry::default();
+        let context = ToolContext {
+            root: temp.path().to_path_buf(),
+            mode: ExecutionMode::Plan,
+            plan_path: None,
+            plan_stage: PlanStage::Stage1,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            cancel_flag: None,
+        };
+        let (text_result, outcome) =
+            registry.execute_bash_with_outcome(&json!({"command": "ls"}), &context);
+        let (_msg, class) = text_result.expect_err("plan mode must reject Bash");
+        assert_eq!(class, BashErrorClass::ModeOrScopeDenied);
+        assert!(outcome.is_none());
     }
 }

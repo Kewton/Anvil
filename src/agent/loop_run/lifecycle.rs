@@ -997,6 +997,39 @@ mod tests {
         ));
     }
 
+    /// AC4 (Issue #450): when the native tool parser detects a malformed
+    /// tool call, the pipeline classifies the resulting error as
+    /// `FeedbackKind::ToolProtocolFailure`. We model the classification
+    /// directly here because the parser-failure detector is already a
+    /// `pub(super)` boolean helper — the FeedbackFrame mapping in turn.rs
+    /// just calls it.
+    #[test]
+    fn parser_error_yields_tool_protocol_failure() {
+        use super::{is_native_tool_parser_failure, is_tool_call_format_error};
+        use crate::session::feedback::FeedbackKind;
+
+        let parser_err = "native tool parser failed: unexpected end element";
+        let format_err = "tool call parser failed: bad XML";
+        let transport_err = "Ollama /api/chat failed: 500";
+
+        // Helper closure mirroring the agent-layer classification logic.
+        let classify = |err: &str| {
+            if is_native_tool_parser_failure(err)
+                || is_tool_call_format_error(err)
+                || super::is_native_tool_transport_failure(err)
+            {
+                FeedbackKind::ToolProtocolFailure
+            } else {
+                FeedbackKind::UnknownFailure
+            }
+        };
+
+        assert_eq!(classify(parser_err), FeedbackKind::ToolProtocolFailure);
+        assert_eq!(classify(format_err), FeedbackKind::ToolProtocolFailure);
+        assert_eq!(classify(transport_err), FeedbackKind::ToolProtocolFailure);
+        assert_eq!(classify("nothing weird here"), FeedbackKind::UnknownFailure);
+    }
+
     #[test]
     fn japanese_stage_three_headings_are_normalized() {
         let contents = "# Plan

@@ -891,6 +891,7 @@ mod tests {
             checkpoints: vec!["cp1".into()],
             native_tools_disabled: false,
             working_memory: Default::default(),
+            last_feedback: None,
         };
         let v = ShowView::from_snapshot(&snap);
         assert_eq!(v.id, "sid");

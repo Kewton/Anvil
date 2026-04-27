@@ -158,4 +158,43 @@ mod tests {
             "ANSI escape leaked into rendered summary: {rendered:?}"
         );
     }
+
+    /// AC10 (Issue #450): `compact_messages` collapses head messages into a
+    /// summary but never observes (let alone touches) `SessionSnapshot.last_feedback`.
+    /// The contract is "compaction operates on the message vector only,
+    /// last_feedback survives by virtue of separation."
+    #[test]
+    fn compact_messages_preserves_last_feedback() {
+        use crate::session::feedback::{
+            FeedbackFrame, FeedbackFrameDraft, FeedbackKind, build_feedback_frame,
+        };
+        use crate::session::store::SessionSnapshot;
+        use std::path::PathBuf;
+
+        let workspace = PathBuf::from(".");
+        let frame = build_feedback_frame(
+            FeedbackFrameDraft {
+                kind: FeedbackKind::CompileError,
+                primary_error: Some("compile error: type mismatch".to_string()),
+                ..Default::default()
+            },
+            &workspace,
+        );
+
+        let mut snapshot = SessionSnapshot {
+            messages: (0..40)
+                .map(|i| ConversationMessage::user(format!("message {i}")))
+                .collect(),
+            last_feedback: Some(frame.clone()),
+            ..SessionSnapshot::default()
+        };
+
+        let before: Option<FeedbackFrame> = snapshot.last_feedback.clone();
+        let compacted = compact_messages(&mut snapshot.messages, 10);
+        assert!(compacted, "expected compaction to fire on 40-message log");
+        assert_eq!(
+            snapshot.last_feedback, before,
+            "last_feedback must survive compact_messages"
+        );
+    }
 }
