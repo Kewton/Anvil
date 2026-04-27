@@ -72,6 +72,25 @@ pub enum PrecautionSource {
     Unknown,
 }
 
+impl PrecautionSource {
+    /// Stable snake_case label for id derivation, command output, and logs.
+    /// Matches `#[serde(rename_all = "snake_case")]` so session.json and
+    /// runtime labels stay aligned.
+    pub fn as_label(&self) -> &'static str {
+        match self {
+            PrecautionSource::UserRequirement => "user_requirement",
+            PrecautionSource::PlanConstraint => "plan_constraint",
+            PrecautionSource::BuildFailure => "build_failure",
+            PrecautionSource::TestFailure => "test_failure",
+            PrecautionSource::ToolFailure => "tool_failure",
+            PrecautionSource::NoProgress => "no_progress",
+            PrecautionSource::SafetyPolicy => "safety_policy",
+            PrecautionSource::Manual => "manual",
+            PrecautionSource::Unknown => "unknown",
+        }
+    }
+}
+
 /// Lifecycle state of a precaution.
 ///
 /// `Unknown` is a forward-compat fallback (DR4-002). After session load,
@@ -172,7 +191,7 @@ pub(crate) fn severity_order(s: Severity) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Severity, severity_order};
+    use super::{PrecautionSource, Severity, severity_order};
 
     #[test]
     fn severity_order_high_lowest_low_highest() {
@@ -180,5 +199,30 @@ mod tests {
         assert_eq!(severity_order(Severity::Medium), 1);
         assert_eq!(severity_order(Severity::Unknown), 1);
         assert_eq!(severity_order(Severity::Low), 2);
+    }
+
+    #[test]
+    fn precaution_source_as_label_matches_serde_rename() {
+        let cases = [
+            (PrecautionSource::UserRequirement, "user_requirement"),
+            (PrecautionSource::PlanConstraint, "plan_constraint"),
+            (PrecautionSource::BuildFailure, "build_failure"),
+            (PrecautionSource::TestFailure, "test_failure"),
+            (PrecautionSource::ToolFailure, "tool_failure"),
+            (PrecautionSource::NoProgress, "no_progress"),
+            (PrecautionSource::SafetyPolicy, "safety_policy"),
+            (PrecautionSource::Manual, "manual"),
+            (PrecautionSource::Unknown, "unknown"),
+        ];
+
+        for (source, expected) in cases {
+            let serialized = serde_json::to_value(source)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert_eq!(serialized, expected);
+            assert_eq!(source.as_label(), expected);
+        }
     }
 }
