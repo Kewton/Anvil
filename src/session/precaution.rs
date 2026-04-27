@@ -154,3 +154,31 @@ pub enum AddPrecautionOutcome {
     /// Text exceeded MAX_PRECAUTION_TEXT and was truncated, but Added.
     Truncated,
 }
+
+/// Sort key for prompt rendering: smaller value = higher priority.
+///
+/// `Unknown` shares the `Medium` slot (Severity::Unknown is normalized to
+/// Medium by the load-side sanitizer; this helper keeps the mapping explicit
+/// for any code path that might still see a raw `Unknown`). See Issue #453
+/// design judgment #4.
+#[must_use]
+pub(crate) fn severity_order(s: Severity) -> u8 {
+    match s {
+        Severity::High => 0,
+        Severity::Medium | Severity::Unknown => 1,
+        Severity::Low => 2,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Severity, severity_order};
+
+    #[test]
+    fn severity_order_high_lowest_low_highest() {
+        assert_eq!(severity_order(Severity::High), 0);
+        assert_eq!(severity_order(Severity::Medium), 1);
+        assert_eq!(severity_order(Severity::Unknown), 1);
+        assert_eq!(severity_order(Severity::Low), 2);
+    }
+}
