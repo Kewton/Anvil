@@ -91,6 +91,36 @@ fn session_store_fills_in_empty_id_on_load() {
 }
 
 #[test]
+fn manual_precaution_survives_session_store_load_and_sanitize() {
+    let dir = tempdir().unwrap();
+    let session_id = "0199fe00-0000-7000-8000-000000000454";
+    let workspace_key = "ws-key";
+    let store = SessionStore::new(dir.path(), session_id, workspace_key);
+    let mut snapshot = SessionSnapshot {
+        id: session_id.to_string(),
+        workspace_key: workspace_key.to_string(),
+        ..SessionSnapshot::default()
+    };
+    snapshot
+        .working_memory
+        .add_precaution(sample_precaution("preserve manual precaution"), dir.path());
+    let original_id = snapshot.working_memory.active_precautions[0].id.clone();
+
+    store.save(&snapshot).unwrap();
+    let mut loaded = store.load_or_new(false).unwrap();
+    loaded
+        .working_memory
+        .sanitize_active_precautions_after_load(dir.path());
+
+    assert_eq!(loaded.working_memory.active_precautions.len(), 1);
+    let restored = &loaded.working_memory.active_precautions[0];
+    assert_eq!(restored.id, original_id);
+    assert_eq!(restored.source, PrecautionSource::Manual);
+    assert_eq!(restored.status, PrecautionStatus::Active);
+    assert_eq!(restored.text, "preserve manual precaution");
+}
+
+#[test]
 fn compaction_keeps_recent_tail() {
     let mut messages = (0..40)
         .map(|index| ConversationMessage::user(format!("message {index}")))

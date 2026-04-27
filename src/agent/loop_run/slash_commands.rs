@@ -23,7 +23,18 @@ use rustyline::{Config as RlConfig, Context, Editor};
 /// (`/checkpoint /rollback /watch /autotest /skills /skill /mcp /parallel`)
 /// are deliberately excluded.
 pub const SLASH_COMMANDS: &[&str] = &[
-    "/help", "/status", "/model", "/yes", "/no", "/plan", "/approve", "/compact", "/logs", "/exit",
+    "/help",
+    "/status",
+    "/model",
+    "/yes",
+    "/no",
+    "/plan",
+    "/approve",
+    "/compact",
+    // IO/状態確認カテゴリ: /logs と /precautions は機能カテゴリで隣接させる
+    "/logs",
+    "/precautions",
+    "/exit",
 ];
 
 /// Render the `/help` output line from `SLASH_COMMANDS`.

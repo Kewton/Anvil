@@ -7,7 +7,7 @@ use crate::modes::plan_act::{ExecutionMode, ModeState};
 use crate::ollama::xml_fallback::ToolCall;
 use crate::session::feedback::{FeedbackFrame, mask_secrets, normalize_path_to_workspace};
 use crate::session::precaution::{
-    AddPrecautionOutcome, Precaution, PrecautionSource, PrecautionStatus, RetiredReason, Severity,
+    AddPrecautionOutcome, Precaution, PrecautionStatus, RetiredReason, Severity,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
@@ -451,7 +451,7 @@ fn compute_precaution_id(p: &Precaution) -> String {
     let mut hasher = Sha256::new();
     hasher.update(p.text.as_bytes());
     hasher.update(b"\x00");
-    hasher.update(precaution_source_tag(p.source).as_bytes());
+    hasher.update(p.source.as_label().as_bytes());
     hasher.update(b"\x00");
     for path in &p.applies_to {
         if let Some(key) = path_to_canonical_string(path) {
@@ -460,22 +460,6 @@ fn compute_precaution_id(p: &Precaution) -> String {
         }
     }
     format!("{:x}", hasher.finalize())
-}
-
-/// Deterministic snake_case tag for `PrecautionSource`, independent of
-/// serde_json version (DR1-013).
-fn precaution_source_tag(s: PrecautionSource) -> &'static str {
-    match s {
-        PrecautionSource::UserRequirement => "user_requirement",
-        PrecautionSource::PlanConstraint => "plan_constraint",
-        PrecautionSource::BuildFailure => "build_failure",
-        PrecautionSource::TestFailure => "test_failure",
-        PrecautionSource::ToolFailure => "tool_failure",
-        PrecautionSource::NoProgress => "no_progress",
-        PrecautionSource::SafetyPolicy => "safety_policy",
-        PrecautionSource::Manual => "manual",
-        PrecautionSource::Unknown => "unknown",
-    }
 }
 
 /// Canonical "/"-joined UTF-8 string of a path, OR None if any component is
@@ -804,7 +788,9 @@ pub fn reconcile_resume_state(session: &mut SessionSnapshot, _cwd: &Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Precaution, PrecautionSource, PrecautionStatus, Severity, WorkingMemory};
+    use crate::session::precaution::PrecautionSource;
+
+    use super::{Precaution, PrecautionStatus, Severity, WorkingMemory, compute_precaution_id};
     use tempfile::tempdir;
 
     fn make_precaution(text: &str, severity: Severity, status: PrecautionStatus) -> Precaution {
@@ -817,6 +803,24 @@ mod tests {
             status,
             retired_reason: None,
         }
+    }
+
+    #[test]
+    fn compute_precaution_id_uses_stable_source_label() {
+        let precaution = Precaution {
+            id: String::new(),
+            source: PrecautionSource::ToolFailure,
+            severity: Severity::Medium,
+            text: "legacy-id-fixture".to_string(),
+            applies_to: Vec::new(),
+            status: PrecautionStatus::Active,
+            retired_reason: None,
+        };
+
+        assert_eq!(
+            compute_precaution_id(&precaution),
+            "672e482bcd99c2d07445e5acce743b3ec669b2e7916e0af59c9ef6a668e4e573"
+        );
     }
 
     #[test]
