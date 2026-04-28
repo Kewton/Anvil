@@ -1055,3 +1055,224 @@ fn format_for_prompt_does_not_break_section_with_newline_in_text() {
         );
     }
 }
+
+// ============================================================================
+// Issue #456: AnvilScore persistence / lossy / discovery / oversized tests
+// ============================================================================
+
+mod anvil_score_tests {
+    use super::*;
+    use anvil::session::anvil_score::{
+        AnvilScore, MAX_ANVIL_SCORE_COUNT, MAX_ANVIL_SCORE_RAW_BYTES,
+    };
+    use anvil::session::discovery::{MAX_SESSION_JSON_BYTES, iter_session_dirs};
+    use std::fs;
+
+    fn write_session_dir(state_root: &std::path::Path, id: &str) -> std::path::PathBuf {
+        let session_dir = state_root.join("sessions").join(id);
+        fs::create_dir_all(&session_dir).unwrap();
+        session_dir
+    }
+
+    fn fixture_score() -> AnvilScore {
+        AnvilScore {
+            build_passed: Some(true),
+            tests_passed: Some(false),
+            compile_errors_delta: Some(-1),
+            test_failures_delta: Some(2),
+            compile_error_count: Some(0),
+            test_failure_count: Some(2),
+            implementation_files_changed: Some(3),
+            test_files_changed: Some(1),
+            setup_files_changed: Some(0),
+            unsafe_actions_blocked: 1,
+            consecutive_no_progress_turns: 0,
+            user_visible_artifact: true,
+        }
+    }
+
+    /// AC: roundtrip serializes & deserializes an AnvilScore-bearing snapshot.
+    #[test]
+    fn snapshot_with_anvil_score_roundtrips() {
+        let snapshot = SessionSnapshot {
+            last_anvil_score: Some(fixture_score()),
+            ..SessionSnapshot::default()
+        };
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let decoded: SessionSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.last_anvil_score, Some(fixture_score()));
+    }
+
+    /// AC: a snapshot whose last_anvil_score is None roundtrips with None.
+    #[test]
+    fn snapshot_with_no_anvil_score_roundtrips_none() {
+        let snapshot = SessionSnapshot::default();
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let decoded: SessionSnapshot = serde_json::from_str(&json).unwrap();
+        assert!(decoded.last_anvil_score.is_none());
+    }
+
+    /// AC: legacy session.json (no last_anvil_score key) loads cleanly with
+    /// last_anvil_score = None.
+    #[test]
+    fn legacy_session_without_anvil_score_loads_with_none() {
+        let legacy = r#"{"mode_state":{"mode":"Act","active_plan_path":null},"messages":[],"checkpoints":[]}"#;
+        let decoded: SessionSnapshot = serde_json::from_str(legacy).unwrap();
+        assert!(decoded.last_anvil_score.is_none());
+        assert_eq!(decoded.consecutive_no_progress_turns, 0);
+    }
+
+    /// AC: malformed last_anvil_score (e.g. wrong type for a usize) is
+    /// silently lossy → None, the rest of the snapshot still loads.
+    #[test]
+    fn malformed_anvil_score_drops_to_none_session_loads() {
+        let malformed = r#"{
+            "mode_state":{"mode":"Act","active_plan_path":null},
+            "messages":[],
+            "checkpoints":[],
+            "last_anvil_score":{"compile_error_count":"not-a-number"}
+        }"#;
+        let decoded: SessionSnapshot = serde_json::from_str(malformed).unwrap();
+        assert!(decoded.last_anvil_score.is_none());
+    }
+
+    /// AC: a session whose last_anvil_score is malformed must NOT disappear
+    /// from `iter_session_dirs` — discovery uses the same lossy wrapper as
+    /// resume, so the directory survives and `anvil sessions list / clean`
+    /// keeps showing it (S7-003).
+    #[test]
+    fn discovery_keeps_session_with_malformed_anvil_score() {
+        let tmp = tempdir().unwrap();
+        let id = uuid::Uuid::now_v7().to_string();
+        let session_dir = write_session_dir(tmp.path(), &id);
+        let payload = format!(
+            r#"{{"id":"{id}","workspace_key":"ws","mode_state":{{"mode":"Act","active_plan_path":null}},"messages":[],"checkpoints":[],"last_anvil_score":{{"compile_error_count":-1}}}}"#
+        );
+        fs::write(session_dir.join("session.json"), payload).unwrap();
+        let entries = iter_session_dirs(tmp.path());
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].snapshot.last_anvil_score.is_none());
+    }
+
+    /// AC: oversized last_anvil_score (raw JSON over MAX_ANVIL_SCORE_RAW_BYTES)
+    /// is dropped to None without parsing; the session itself stays loadable
+    /// (DR4-003).
+    #[test]
+    fn oversized_anvil_score_drops_to_none_session_loads() {
+        let mut big = String::new();
+        big.push_str(r#"{"compile_error_count": 1, "filler":""#);
+        big.push_str(&"x".repeat(MAX_ANVIL_SCORE_RAW_BYTES + 100));
+        big.push_str(r#""}"#);
+        let payload = format!(
+            r#"{{"mode_state":{{"mode":"Act","active_plan_path":null}},"messages":[],"checkpoints":[],"last_anvil_score":{big}}}"#
+        );
+        let decoded: SessionSnapshot = serde_json::from_str(&payload).unwrap();
+        assert!(decoded.last_anvil_score.is_none());
+    }
+
+    /// AC: oversized session.json (MAX_SESSION_JSON_BYTES) is rejected at
+    /// load_or_new before parsing, in addition to discovery skipping it
+    /// (DR4-003).
+    #[test]
+    fn oversized_session_json_rejected_by_load_or_new() {
+        let dir = tempdir().unwrap();
+        let id = "0199fe00-0000-7000-8000-456000000001";
+        let session_dir = write_session_dir(dir.path(), id);
+        let path = session_dir.join("session.json");
+        // Write > MAX_SESSION_JSON_BYTES.
+        let payload = vec![b'a'; (MAX_SESSION_JSON_BYTES + 1) as usize];
+        fs::write(&path, payload).unwrap();
+        let store = SessionStore::new(dir.path(), id, "ws-x");
+        let result = store.load_or_new(false);
+        assert!(result.is_err(), "expected oversized session to be rejected");
+    }
+
+    /// AC: huge numeric values (above MAX_ANVIL_SCORE_COUNT) are clamped /
+    /// dropped in `sanitize`, so subsequent delta math doesn't panic
+    /// (DR4-002).
+    #[test]
+    fn huge_numeric_values_are_sanitized() {
+        // Use a value within usize range but above MAX_ANVIL_SCORE_COUNT for
+        // the saturating clamp test (usize::MAX would be valid u64 JSON, but
+        // the goal here is to verify clamp semantics, not parser limits).
+        let payload = format!(
+            r#"{{"mode_state":{{"mode":"Act","active_plan_path":null}},"messages":[],"checkpoints":[],"last_anvil_score":{{"compile_error_count":{},"unsafe_actions_blocked":{}}}}}"#,
+            MAX_ANVIL_SCORE_COUNT + 1,
+            MAX_ANVIL_SCORE_COUNT + 5,
+        );
+        let decoded: SessionSnapshot = serde_json::from_str(&payload).unwrap();
+        let score = decoded.last_anvil_score.expect("score deserialized");
+        // Optional count above cap → None.
+        assert_eq!(score.compile_error_count, None);
+        // Non-optional counter saturates at MAX_ANVIL_SCORE_COUNT.
+        assert_eq!(score.unsafe_actions_blocked, MAX_ANVIL_SCORE_COUNT);
+    }
+
+    /// AC: i32::MIN delta values are dropped to None to keep delta math safe
+    /// even when an attacker writes pathological values to session.json.
+    #[test]
+    fn i32_min_delta_dropped_to_none() {
+        let payload = format!(
+            r#"{{"mode_state":{{"mode":"Act","active_plan_path":null}},"messages":[],"checkpoints":[],"last_anvil_score":{{"compile_errors_delta":{},"test_failures_delta":{}}}}}"#,
+            i32::MIN,
+            i32::MIN,
+        );
+        let decoded: SessionSnapshot = serde_json::from_str(&payload).unwrap();
+        let score = decoded.last_anvil_score.expect("score");
+        assert_eq!(score.compile_errors_delta, None);
+        assert_eq!(score.test_failures_delta, None);
+    }
+
+    /// AC: top-level JSON corruption is NOT silently downgraded to a fresh
+    /// snapshot — it surfaces as a load error, the same way it did before
+    /// AnvilScore was introduced (DR4-004).
+    #[test]
+    fn top_level_corruption_still_errors() {
+        let dir = tempdir().unwrap();
+        let id = "0199fe00-0000-7000-8000-456000000002";
+        let session_dir = write_session_dir(dir.path(), id);
+        fs::write(session_dir.join("session.json"), b"{not even json").unwrap();
+        let store = SessionStore::new(dir.path(), id, "ws-x");
+        assert!(store.load_or_new(false).is_err());
+    }
+
+    /// AC: top-level corruption keeps `iter_session_dirs` skipping the
+    /// session (existing behavior, not regressed by AnvilScore).
+    #[test]
+    fn top_level_corruption_skipped_by_discovery() {
+        let tmp = tempdir().unwrap();
+        let id = uuid::Uuid::now_v7().to_string();
+        let session_dir = write_session_dir(tmp.path(), &id);
+        fs::write(session_dir.join("session.json"), b"{broken").unwrap();
+        let entries = iter_session_dirs(tmp.path());
+        assert!(entries.is_empty());
+    }
+
+    /// AC: SessionStore::save / load_or_new roundtrip preserves
+    /// `last_anvil_score` and `consecutive_no_progress_turns` (the only two
+    /// of the new fields that are persisted).
+    #[test]
+    fn store_save_and_load_preserves_persisted_anvil_fields() {
+        let dir = tempdir().unwrap();
+        let id = "0199fe00-0000-7000-8000-456000000003";
+        write_session_dir(dir.path(), id);
+        let store = SessionStore::new(dir.path(), id, "ws-x");
+        let snapshot = SessionSnapshot {
+            last_anvil_score: Some(fixture_score()),
+            consecutive_no_progress_turns: 7,
+            // runtime-only fields: should not survive save/load
+            unsafe_blocks_this_turn: 99,
+            repo_edit_succeeded_this_turn: true,
+            touched_files_at_turn_start: vec!["src/main.rs".into()],
+            ..SessionSnapshot::default()
+        };
+        store.save(&snapshot).unwrap();
+        let loaded = store.load_or_new(false).unwrap();
+        assert_eq!(loaded.last_anvil_score, Some(fixture_score()));
+        assert_eq!(loaded.consecutive_no_progress_turns, 7);
+        // Skip-marked fields default after load.
+        assert_eq!(loaded.unsafe_blocks_this_turn, 0);
+        assert!(!loaded.repo_edit_succeeded_this_turn);
+        assert!(loaded.touched_files_at_turn_start.is_empty());
+    }
+}

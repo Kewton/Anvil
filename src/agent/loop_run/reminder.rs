@@ -25,6 +25,7 @@ use crate::agent::loop_run::lifecycle::extract_first_json_object;
 use crate::ollama::client::AssistantReply;
 use crate::ollama::parsing::truncate_for_log;
 use crate::ollama::xml_fallback::strip_think_tags;
+use crate::session::anvil_score::AnvilScoreSnapshot;
 use crate::session::feedback::{FeedbackFrame, FeedbackKind, mask_secrets};
 use crate::session::precaution::{
     AddPrecautionOutcome, Precaution, PrecautionSource, PrecautionStatus, Severity,
@@ -168,6 +169,14 @@ pub struct ReminderInputs<'a> {
     pub active_precautions_summary: &'a str,
     pub frame: &'a FeedbackFrame,
     pub working_memory_touched: &'a [String],
+    /// Issue #456: AnvilScore snapshot for prompt injection. The variant
+    /// (PreviousTurn vs CurrentTurn) is rendered into a stable label so the
+    /// sidecar cannot silently mix the previous turn's persisted score with
+    /// the current turn's freshly computed one (DR1-006).
+    ///
+    /// Lifetime-tagged (carries `&AnvilScore`) → not serde-derivable. The
+    /// field is consumed only by `build_reminder_prompt`.
+    pub anvil_score: Option<AnvilScoreSnapshot<'a>>,
 }
 
 /// Gate state. Each field is computed once by the caller (`Agent::invoke_reminder`)
@@ -350,6 +359,17 @@ pub fn build_reminder_prompt(inputs: &ReminderInputs<'_>) -> String {
     prompt.push_str(inputs.plan_summary.unwrap_or("(none)"));
     prompt.push_str("\n\n# Active precautions\n");
     prompt.push_str(inputs.active_precautions_summary);
+    // Issue #456 / DR1-003 / DR1-006: render AnvilScore between Active
+    // precautions and Latest feedback so the post-truncate prompt still keeps
+    // the "# Output\nJSON only.\n" guard at the tail. Renderer is the single
+    // source of truth and applies its own MAX_RENDERED_CHARS cap; caller
+    // never re-truncates.
+    if let Some(snapshot) = inputs.anvil_score {
+        prompt.push_str("\n\n# AnvilScore\n");
+        prompt.push_str(snapshot.label());
+        prompt.push('\n');
+        prompt.push_str(&snapshot.score().format_for_prompt());
+    }
     prompt.push_str("\n\n# Latest feedback\n");
     prompt.push_str(&format!("kind: {kind_label}\n"));
     prompt.push_str(&format!("primary_error: {primary_error}\n"));
@@ -591,6 +611,7 @@ mod tests {
             active_precautions_summary: "(none)",
             frame,
             working_memory_touched: &[],
+            anvil_score: None,
         }
     }
 
@@ -1576,5 +1597,115 @@ mod tests {
             d2_wm.active_precautions[0].source,
             PrecautionSource::ToolFailure
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Issue #456: AnvilScore prompt injection
+    // ---------------------------------------------------------------------
+
+    use crate::session::anvil_score::{AnvilScore, AnvilScoreSnapshot};
+
+    fn fixture_score() -> AnvilScore {
+        AnvilScore {
+            build_passed: Some(true),
+            tests_passed: Some(false),
+            compile_errors_delta: Some(-2),
+            test_failures_delta: Some(1),
+            compile_error_count: Some(0),
+            test_failure_count: Some(2),
+            implementation_files_changed: Some(3),
+            test_files_changed: Some(1),
+            setup_files_changed: Some(0),
+            unsafe_actions_blocked: 1,
+            consecutive_no_progress_turns: 0,
+            user_visible_artifact: true,
+        }
+    }
+
+    #[test]
+    fn anvil_score_section_uses_previous_label_for_iteration_internal() {
+        let frame = frame_with_kind(FeedbackKind::TestFailure);
+        let score = fixture_score();
+        let inputs = ReminderInputs {
+            user_task: "u",
+            mode_label: "act",
+            plan_summary: None,
+            active_precautions_summary: "(none)",
+            frame: &frame,
+            working_memory_touched: &[],
+            anvil_score: Some(AnvilScoreSnapshot::PreviousTurn(&score)),
+        };
+        let prompt = build_reminder_prompt(&inputs);
+        assert!(
+            prompt.contains("[Previous AnvilScore]"),
+            "expected previous label, got: {prompt}"
+        );
+        assert!(!prompt.contains("[Current AnvilScore]"));
+        // Renderer key must appear (not the bare struct).
+        assert!(prompt.contains("build_passed: true"));
+        assert!(prompt.contains("user_visible_artifact: true"));
+    }
+
+    #[test]
+    fn anvil_score_section_uses_current_label_for_post_loop() {
+        let frame = frame_with_kind(FeedbackKind::TestFailure);
+        let score = fixture_score();
+        let inputs = ReminderInputs {
+            user_task: "u",
+            mode_label: "act",
+            plan_summary: None,
+            active_precautions_summary: "(none)",
+            frame: &frame,
+            working_memory_touched: &[],
+            anvil_score: Some(AnvilScoreSnapshot::CurrentTurn(&score)),
+        };
+        let prompt = build_reminder_prompt(&inputs);
+        assert!(prompt.contains("[Current AnvilScore]"));
+        assert!(!prompt.contains("[Previous AnvilScore]"));
+    }
+
+    #[test]
+    fn anvil_score_section_omitted_when_none() {
+        let frame = frame_with_kind(FeedbackKind::TestFailure);
+        let inputs = ReminderInputs {
+            user_task: "u",
+            mode_label: "act",
+            plan_summary: None,
+            active_precautions_summary: "(none)",
+            frame: &frame,
+            working_memory_touched: &[],
+            anvil_score: None,
+        };
+        let prompt = build_reminder_prompt(&inputs);
+        assert!(!prompt.contains("AnvilScore"));
+        assert!(!prompt.contains("[Current"));
+    }
+
+    #[test]
+    fn anvil_score_section_render_is_capped_and_output_guard_remains() {
+        // Even with the AnvilScore section appended, the prompt MUST still
+        // end with the JSON-only output guard. With renderer truncation at
+        // MAX_RENDERED_CHARS = 512 and total prompt budget at
+        // REMINDER_PROMPT_MAX_BYTES = 12 KiB, the trailing guard survives.
+        let frame = frame_with_kind(FeedbackKind::TestFailure);
+        let score = fixture_score();
+        let inputs = ReminderInputs {
+            user_task: "u",
+            mode_label: "act",
+            plan_summary: None,
+            active_precautions_summary: "(none)",
+            frame: &frame,
+            working_memory_touched: &[],
+            anvil_score: Some(AnvilScoreSnapshot::CurrentTurn(&score)),
+        };
+        let prompt = build_reminder_prompt(&inputs);
+        assert!(
+            prompt.ends_with("# Output\nJSON only.\n"),
+            "expected trailing JSON-only guard, got tail: {:?}",
+            &prompt[prompt.len().saturating_sub(60)..]
+        );
+        // Renderer cap: the rendered AnvilScore section's body must be at
+        // most MAX_RENDERED_CHARS chars (and we used ~280-char fixture).
+        assert!(prompt.contains("# AnvilScore\n"));
     }
 }

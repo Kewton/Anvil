@@ -75,6 +75,15 @@ pub struct Agent {
     /// `handle_user_message`, set to `true` only when an actual sidecar call
     /// was attempted (Completed/Failed); Skipped does not consume the cap.
     reminder_called_this_turn: bool,
+    /// Issue #456: tracks whether `compute_anvil_score` has already run for
+    /// the current turn. Reset at the top of every `handle_user_message`,
+    /// flipped to `true` after the post-loop compute writes
+    /// `session.last_anvil_score`. Used by `maybe_invoke_reminder` to pick
+    /// between `AnvilScoreSnapshot::PreviousTurn` (iteration-internal hook,
+    /// score is the previous turn's persisted value) and
+    /// `AnvilScoreSnapshot::CurrentTurn` (post-loop hook, score is the value
+    /// just computed for this turn).
+    pub(super) anvil_score_computed_this_turn: bool,
 }
 
 #[derive(Clone)]
@@ -112,6 +121,7 @@ impl Agent {
             repo_context_cache: None,
             footer,
             reminder_called_this_turn: false,
+            anvil_score_computed_this_turn: false,
         }
     }
 }
