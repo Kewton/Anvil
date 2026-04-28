@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 
 use ignore::WalkBuilder;
 
+use crate::util::file_classify::{is_implementation_file, is_setup_file, is_test_file};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoSnapshot {
     files: BTreeMap<PathBuf, u64>,
@@ -137,58 +139,6 @@ fn should_skip_path(root: &Path, path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn is_test_file(path: &Path) -> bool {
-    let display = path.display().to_string();
-    display.contains("__tests__") || display.contains(".test.") || display.contains(".spec.")
-}
-
-fn is_setup_file(path: &Path) -> bool {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default();
-    matches!(
-        file_name,
-        "package.json"
-            | "package-lock.json"
-            | "pnpm-lock.yaml"
-            | "yarn.lock"
-            | "tsconfig.json"
-            | "jest.config.js"
-            | "jest.config.ts"
-            | "vitest.config.ts"
-            | "vitest.config.js"
-            | "next.config.ts"
-            | "next.config.js"
-            | "eslint.config.js"
-            | "eslint.config.mjs"
-    )
-}
-
-fn is_implementation_file(path: &Path) -> bool {
-    matches!(
-        path.extension().and_then(|ext| ext.to_str()),
-        Some(
-            "rs" | "ts"
-                | "tsx"
-                | "js"
-                | "jsx"
-                | "py"
-                | "go"
-                | "java"
-                | "kt"
-                | "swift"
-                | "c"
-                | "cc"
-                | "cpp"
-                | "h"
-                | "hpp"
-                | "css"
-                | "scss"
-                | "html"
-                | "mdx"
-                | "vue"
-                | "svelte"
-        )
-    )
-}
+// Issue #456 / DR1-007: file classification helpers were moved to
+// `crate::util::file_classify` so AnvilScore computation can re-use them
+// without `session/` depending on `agent/`.

@@ -1125,6 +1125,11 @@ impl Agent {
         // user message — reset here so a fresh handle_user_message can fire
         // the Reminder once even if the previous turn already did.
         self.reminder_called_this_turn = false;
+        // Issue #456: AnvilScore compute happens once per turn, post-loop.
+        // The flag flips after the compute so the post-loop Reminder hook
+        // sees `CurrentTurn` while the iteration-internal hook sees
+        // `PreviousTurn`.
+        self.anvil_score_computed_this_turn = false;
         self.run_turn(input, stream_output, &mut monitor)
     }
 
@@ -1210,6 +1215,18 @@ impl Agent {
             .unwrap_or_default();
         let workspace_root = self.work_root.clone();
 
+        // Issue #456 / DR1-006: pick the right snapshot variant based on
+        // whether AnvilScore has already been computed for this turn. The
+        // iteration-internal hook fires before compute, so it sees the
+        // previous turn's persisted value; the post-loop hook fires after
+        // compute, so it sees the just-computed value.
+        let anvil_score = self.session.last_anvil_score.as_ref().map(|s| {
+            if self.anvil_score_computed_this_turn {
+                crate::session::anvil_score::AnvilScoreSnapshot::CurrentTurn(s)
+            } else {
+                crate::session::anvil_score::AnvilScoreSnapshot::PreviousTurn(s)
+            }
+        });
         let inputs = ReminderInputs {
             user_task: &user_task,
             mode_label,
@@ -1217,6 +1234,7 @@ impl Agent {
             active_precautions_summary: &active_precautions_summary,
             frame: &frame,
             working_memory_touched: &touched_files,
+            anvil_score,
         };
 
         let outcome = reminder::run_reminder_with_strategy(
@@ -1288,6 +1306,14 @@ impl Agent {
         // an eligible-kind frame, and is consulted by
         // `record_feedback_if_unset` to decide skip-vs-overwrite.
         self.session.reset_eligible_feedback_recorded_this_turn();
+        // Issue #456 / DR2-003: reset the AnvilScore turn-local runtime
+        // fields. Inline assignment (no dedicated method) keeps SRP small.
+        // `consecutive_no_progress_turns` is session-cumulative and is
+        // intentionally NOT reset here.
+        self.session.unsafe_blocks_this_turn = 0;
+        self.session.repo_edit_succeeded_this_turn = false;
+        self.session.touched_files_at_turn_start =
+            self.session.working_memory.touched_files.clone();
 
         let mut tool_calls_made_this_turn = 0usize;
         let mut repo_edit_calls_made_this_turn = 0usize;
@@ -1844,6 +1870,10 @@ impl Agent {
                             let frame =
                                 build_feedback_for_unsafe_block(&bash_command, &self.work_root);
                             self.session.record_feedback(frame);
+                            // Issue #456: count this unsafe block toward the
+                            // turn-local AnvilScore counter.
+                            self.session.unsafe_blocks_this_turn =
+                                self.session.unsafe_blocks_this_turn.saturating_add(1);
                             recovery::repeated_bash_error(&bash_command)
                         } else if start_spinner_for_exec {
                             let _sp = Spinner::start(format!("running {tool_name}..."));
@@ -2806,9 +2836,23 @@ impl Agent {
             let frame = build_feedback_for_no_repo_progress(&self.work_root);
             self.session.record_feedback_if_unset(frame);
         }
+        // Issue #456: maintain `consecutive_no_progress_turns` baseline. A
+        // turn that produced verifiable progress resets the counter; a turn
+        // that recorded NoRepoProgress increments it. Other failure shapes
+        // (build/test failure with diff, parser failure, etc.) leave the
+        // counter unchanged.
+        if final_verif.made_any_progress() {
+            self.session.consecutive_no_progress_turns = 0;
+        } else if matches!(
+            self.session.last_feedback.as_ref().map(|f| f.kind.clone()),
+            Some(FeedbackKind::NoRepoProgress)
+        ) {
+            self.session.consecutive_no_progress_turns =
+                self.session.consecutive_no_progress_turns.saturating_add(1);
+        }
         let stats = build_stats(
             accumulated,
-            final_verif,
+            final_verif.clone(),
             last_iter.min(self.config.max_iterations),
             self.config.max_iterations,
             duration_secs,
@@ -2879,6 +2923,38 @@ impl Agent {
                     self.session.record_feedback_if_unset(frame);
                 }
             }
+        }
+        // Issue #456: compute the AnvilScore for this turn after all
+        // record_feedback* / verify_repo_progress / auto_test signals have
+        // settled, but BEFORE the post-loop Reminder hook so the sidecar can
+        // see `CurrentTurn(&score)`.
+        {
+            let inputs = crate::session::anvil_score::AnvilScoreInputs {
+                unsafe_blocks_this_turn: self.session.unsafe_blocks_this_turn,
+                repo_edit_succeeded_this_turn: self.session.repo_edit_succeeded_this_turn,
+                consecutive_no_progress_turns: self.session.consecutive_no_progress_turns,
+                prev: self.session.last_anvil_score.as_ref(),
+            };
+            let started = std::time::Instant::now();
+            // #456 always passes None for auto_test; #457 will convert
+            // AutoTestResult into AnvilTestSummary at the orchestration
+            // boundary.
+            let score =
+                crate::session::anvil_score::compute_anvil_score(&inputs, Some(&final_verif), None);
+            let compute_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let rendered = score.format_for_prompt();
+            let render_chars = rendered.chars().count();
+            log_llm_event(
+                "agent.anvil_score.computed",
+                serde_json::json!({
+                    "session_id": self.session_store.session_id(),
+                    "score": &score,
+                    "render_chars": render_chars,
+                    "compute_ms": compute_ms,
+                }),
+            );
+            self.session.last_anvil_score = Some(score);
+            self.anvil_score_computed_this_turn = true;
         }
         // Issue #452: Reminder Sidecar (post-loop hook). Picks up
         // NoRepoProgress / auto_test / NoVerifierAvailable frames recorded
@@ -3909,6 +3985,10 @@ impl Agent {
                             .unwrap_or("");
                         let frame = build_feedback_for_unsafe_block(cmd, &self.work_root);
                         self.session.record_feedback(frame);
+                        // Issue #456: count this unsafe block toward the
+                        // turn-local AnvilScore counter.
+                        self.session.unsafe_blocks_this_turn =
+                            self.session.unsafe_blocks_this_turn.saturating_add(1);
                     }
                     lifecycle::format_tool_error(&err)
                 }
@@ -3924,6 +4004,13 @@ impl Agent {
                     self.session
                         .working_memory
                         .note_touched_file(normalize_memory_path(raw_path, &self.work_root));
+                }
+                if matches!(name, "Write" | "Edit") {
+                    // Issue #456: a successful Write/Edit feeds
+                    // `user_visible_artifact` (combined with the post-loop
+                    // verify_repo_progress diff signal in
+                    // `compute_anvil_score`).
+                    self.session.repo_edit_succeeded_this_turn = true;
                 }
                 self.maybe_update_work_root(name, arguments, &result);
                 result
