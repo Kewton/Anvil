@@ -34,6 +34,7 @@ pub const SLASH_COMMANDS: &[&str] = &[
     // IO/状態確認カテゴリ: /logs と /precautions は機能カテゴリで隣接させる
     "/logs",
     "/precautions",
+    "/tests",
     "/exit",
 ];
 
