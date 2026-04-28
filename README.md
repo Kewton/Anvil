@@ -122,6 +122,19 @@ LLM 推論中・ツール実行中は stderr に 80ms 間隔のスピナーを�
 - `LC_ALL` / `LANG` が UTF-8 でない: ASCII フレーム `| / - \` へフォールバック
 - Bash / Write / Edit で承認（approve prompt）が必要な場合: prompt 表示中の干渉回避のためスピナーは起動しない
 
+## Tester Skill
+
+Act-mode で `AutoTestRunner::detect == None`（明示的な test verifier が無い repo）かつ Rust / Node / Python のいずれかが検出されたとき、main model を 1 回だけ同期呼び出し（`tools=None`、JSON-only、`<think>` strip + first JSON object 抽出、`tool_calls` 非空は abort）して smoke test を生成し、`state_root/sessions/<id>/tmp-tests/files/` に保存したうえで固定テンプレートの Bash（Rust: `cargo test --manifest-path ...`、Node: `node --check`、Python: `python3 -m py_compile`）を 30 秒の明示 timeout 付きで実行する。Rust 経路は `tester-runs/<run_id>/` に transient harness（path dependency = workspace package）を書き出して走らせ、終了後に best-effort cleanup する。結果は `FeedbackFrame` として `WorkingMemory.last_feedback` に記録され、Reminder Sidecar 経路と接続して `Precaution` の自動生成に繋がる。
+
+以下の条件で自動的に無効化される:
+
+- per-turn cap = 1（`tester_called_this_turn` で同一ターン内 2 回目以降を抑止）
+- Plan モード中（`/plan` 解除前は smoke test 生成・実行とも行わない）
+- `ANVIL_NO_TESTER` が非空値で設定: Tester Skill を一切起動しない
+- `AutoTestRunner::detect` が `Some(_)` を返す repo（`npm test` / `cargo test` with `tests/` / `pytest` 等の明示 verifier が既にある場合は従来の auto_test 経路を使う）
+
+承認モードは runtime から派生する: `--yes` 起動時は Auto、TTY 環境では Interactive（`y` / `yes` 以外は abort）、それ以外（CI / 非 TTY）は Forbidden で即 abort。Tester 起動中は registry 層で `ToolContext.tester_active = true` が立ち、Edit / Write の対象 path が `tmp-tests/` 配下でない場合は reject される。Logging は `agent.tester.{llm_call_started,llm_call_completed,llm_call_failed,completed,failed,skipped}` を `llm-io.jsonl` へ追記する。
+
 ## スラッシュコマンド
 
 対話モード（REPL）で利用できる 11 コマンド。これらが Tab 補完の候補になり、`/help` の出力と完全に一致する。

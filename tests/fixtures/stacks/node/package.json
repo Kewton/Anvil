@@ -1,0 +1,9 @@
+{
+  "name": "anvil-tester-fixture-node",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Issue #459 Tester Skill v1 Node.js fixture: package.json without a 'test' script so AutoTestRunner does not find an explicit verifier and the Tester Skill takes the Node branch.",
+  "scripts": {
+    "build": "echo build"
+  }
+}

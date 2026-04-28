@@ -31,6 +31,7 @@ mod reminder;
 pub mod slash_commands;
 mod spinner;
 mod summary;
+mod tester;
 mod turn;
 
 // Public re-exports so `lib.rs::run_cli` can hand a `FooterHandle` into
@@ -46,6 +47,20 @@ pub(crate) use turn::{no_color_requested, unicode_supported};
 // `tests/` (and any future callers) can validate the Act-mode prompt
 // selection pipeline without requiring a live Ollama call.
 pub use turn::select_precautions_for_prompt;
+
+// Issue #459 / Phase 2: expose the Tester Skill orchestrator + types so the
+// E2E suite under `tests/tester_skill_smoke.rs` can drive the closure-DI
+// boundary directly (LLM call + Bash runner + approver) without an Ollama /
+// cargo / node / python dependency. Production code paths in `turn.rs`
+// continue to call these via `super::tester::...` — these `pub use` lines
+// only widen the visibility for integration tests.
+pub use tester::{
+    AbortReason as TesterAbortReason, ApprovalMode as TesterApprovalMode,
+    MAX_GENERATED_TESTS_PER_TURN as TESTER_MAX_GENERATED_TESTS_PER_TURN,
+    MAX_TESTER_LLM_REPLY_BYTES, NotInvokedReason as TesterNotInvokedReason, TesterCandidate,
+    TesterLlmError, TesterOutcome, TesterPrompt, TesterRun, check_invocation_gate as tester_gate,
+    run_tester_with_strategy, tester_disabled,
+};
 
 const DEFAULT_KEEP_TAIL: usize = 24;
 const LATE_TURN_KEEP_TAIL: usize = 12;
@@ -75,6 +90,10 @@ pub struct Agent {
     /// `handle_user_message`, set to `true` only when an actual sidecar call
     /// was attempted (Completed/Failed); Skipped does not consume the cap.
     reminder_called_this_turn: bool,
+    /// Issue #459: per-turn cap for the Tester Skill. Reset at the top of every
+    /// `handle_user_message`. Consumed only when a Tester smoke run actually
+    /// dispatched (Recorded / Aborted); NotInvoked does not consume the cap.
+    pub(super) tester_called_this_turn: bool,
 }
 
 #[derive(Clone)]
@@ -112,6 +131,7 @@ impl Agent {
             repo_context_cache: None,
             footer,
             reminder_called_this_turn: false,
+            tester_called_this_turn: false,
         }
     }
 }
