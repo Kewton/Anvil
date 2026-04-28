@@ -4,7 +4,10 @@ use std::process::{Command, Stdio};
 use crate::agent::prompting::load_project_instructions;
 use crate::session::feedback::FeedbackKind;
 
-const MAX_OUTPUT_BYTES: usize = 12_000;
+/// Maximum bytes of combined stdout+stderr the auto_test path keeps in its
+/// `AutoTestResult.output`. Issue #459 / DR2-009 keeps this private to the
+/// auto_test path (Tester uses session/feedback excerpt cap instead).
+pub(super) const MAX_OUTPUT_BYTES: usize = 12_000;
 
 /// Build vs Test classification for an auto_test plan. Used by the
 /// FeedbackFrame generator to decide between `BuildPass`/`TestPass` on
@@ -69,13 +72,13 @@ impl AutoTestRunner {
             });
         }
         if work_root.join("package.json").is_file() {
-            let package = std::fs::read_to_string(work_root.join("package.json")).ok()?;
-            if package.contains("\"test\"") {
+            if package_json_has_test_script(work_root) {
                 return Some(AutoTestPlan {
                     command: "npm test".to_string(),
                     reason: "package.json test script detected".to_string(),
                 });
             }
+            let package = std::fs::read_to_string(work_root.join("package.json")).ok()?;
             if package.contains("\"build\"") {
                 return Some(AutoTestPlan {
                     command: "npm run build".to_string(),
@@ -280,13 +283,20 @@ fn command_references_existing_local_file(command: &str, work_root: &Path) -> bo
         })
 }
 
-fn has_python_surface(work_root: &Path, changed_files: &[String]) -> bool {
+/// Returns true if the workspace surface looks like a Python project (a
+/// changed `.py` file, `pyproject.toml`, or `requirements.txt`). Promoted
+/// to `pub(super)` for Issue #459 so Tester can reuse the same heuristic
+/// (DR1-001).
+pub(super) fn has_python_surface(work_root: &Path, changed_files: &[String]) -> bool {
     changed_files.iter().any(|path| path.ends_with(".py"))
         || work_root.join("pyproject.toml").is_file()
         || work_root.join("requirements.txt").is_file()
 }
 
-fn first_python_script(changed_files: &[String]) -> Option<PathBuf> {
+/// Returns the first non-test `.py` path among `changed_files`. Promoted
+/// to `pub(super)` for Issue #459 (DR1-001 / Tester::Python::surface_files
+/// derivation).
+pub(super) fn first_python_script(changed_files: &[String]) -> Option<PathBuf> {
     changed_files
         .iter()
         .find(|path| {
@@ -295,7 +305,68 @@ fn first_python_script(changed_files: &[String]) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn shell_quote(path: &Path) -> String {
+/// Returns true when `work_root/Cargo.toml` exists and the workspace has
+/// no `tests/` directory. Issue #459 / DR1-001: Tester treats a
+/// "Cargo.toml without tests/" workspace as a candidate for smoke-test
+/// generation (the inverse of what auto_test handles). Currently only
+/// referenced by Tester (Phase 1b) and unit tests; `dead_code` allowed
+/// for the duration of Phase 1a so clippy stays clean before the Tester
+/// module lands.
+#[allow(dead_code)]
+pub(super) fn has_cargo_manifest(work_root: &Path) -> bool {
+    let manifest = work_root.join("Cargo.toml");
+    if !manifest.is_file() || work_root.join("tests").is_dir() {
+        return false;
+    }
+    // CB-006 (Issue #459): a Cargo.toml that defines an explicit `[[test]]`
+    // target section is an explicit test verifier — Tester must not generate
+    // a smoke test in that case. Use a deliberately small line-level scan
+    // (no TOML parser dep, mirroring `package_json_has_test_script`'s style)
+    // and skip lines whose first non-whitespace char is `#` (comment) so a
+    // documented `[[test]]` reference inside a comment does not trigger.
+    if let Ok(raw) = std::fs::read_to_string(&manifest)
+        && cargo_manifest_has_test_target_section(&raw)
+    {
+        return false;
+    }
+    true
+}
+
+/// Returns true when `Cargo.toml` source defines at least one `[[test]]`
+/// section header. Cheap line-level scan: `[[test]]` must appear as the first
+/// non-whitespace token of a non-comment line. CB-006 (Issue #459).
+pub(super) fn cargo_manifest_has_test_target_section(raw: &str) -> bool {
+    for line in raw.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed.starts_with("[[test]]") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Returns true when `work_root/package.json` defines a `scripts.test`
+/// entry. Issue #459 / DR1-001: Tester takes the *false* branch (no test
+/// script defined) as a candidate for smoke-test generation. The check is
+/// substring-based on the raw JSON to mirror auto_test's existing
+/// `package.contains("\"test\"")` heuristic — a deliberate match for
+/// DR2-001 (no AST parsing dependency).
+pub(super) fn package_json_has_test_script(work_root: &Path) -> bool {
+    let path = work_root.join("package.json");
+    let Ok(package) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    package.contains("\"test\"")
+}
+
+/// Single-quote a path for safe inclusion in a `sh -lc` command line.
+/// Promoted to `pub(super)` for Issue #459 so Tester's shell-template
+/// builder can quote LLM-supplied filenames identically (DR1-001 /
+/// DR2-008).
+pub(super) fn shell_quote(path: &Path) -> String {
     let value = path.to_string_lossy();
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
@@ -489,5 +560,109 @@ mod tests {
         assert_eq!(build_plan().auto_test_kind(), AutoTestKind::Build);
         assert_eq!(cargo_plan().auto_test_kind(), AutoTestKind::Test);
         assert_eq!(pytest_plan().auto_test_kind(), AutoTestKind::Test);
+    }
+
+    // --- Issue #459 / Task 1a.1: Tester-facing helper coverage ----------
+
+    /// `has_cargo_manifest` is true only when `Cargo.toml` exists and there
+    /// is no `tests/` directory (the "Tester candidate" shape).
+    #[test]
+    fn has_cargo_manifest_true_when_manifest_only() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname='x'\nversion='0.0.0'\n",
+        )
+        .expect("write");
+        assert!(has_cargo_manifest(dir.path()));
+    }
+
+    #[test]
+    fn has_cargo_manifest_false_when_tests_dir_present() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname='x'\nversion='0.0.0'\n",
+        )
+        .expect("write");
+        std::fs::create_dir(dir.path().join("tests")).expect("tests dir");
+        assert!(!has_cargo_manifest(dir.path()));
+    }
+
+    #[test]
+    fn has_cargo_manifest_false_when_no_manifest() {
+        let dir = tempdir().expect("tempdir");
+        assert!(!has_cargo_manifest(dir.path()));
+    }
+
+    /// CB-006: a Cargo.toml that defines an explicit `[[test]]` target is an
+    /// explicit test verifier even without a `tests/` directory. Tester must
+    /// not generate a smoke test in that case.
+    #[test]
+    fn has_cargo_manifest_false_when_explicit_test_target_section() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.0.0\"\n\n[[test]]\nname = \"smoke\"\npath = \"tests/smoke.rs\"\n",
+        )
+        .expect("write");
+        assert!(!has_cargo_manifest(dir.path()));
+    }
+
+    /// CB-006: a Cargo.toml that lists `[[test]]` with leading whitespace and
+    /// commented sections is still detected as an explicit verifier.
+    #[test]
+    fn has_cargo_manifest_false_when_test_section_indented() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.0.0\"\n# inline comment\n   [[test]]\nname = \"smoke\"\n",
+        )
+        .expect("write");
+        assert!(!has_cargo_manifest(dir.path()));
+    }
+
+    /// CB-006: a `[[test]]` substring inside a string value (e.g. inside a
+    /// metadata description) must NOT be treated as a real section header.
+    #[test]
+    fn has_cargo_manifest_true_when_test_substring_inside_string() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.0.0\"\ndescription = \"docs about [[test]] sections\"\n",
+        )
+        .expect("write");
+        assert!(has_cargo_manifest(dir.path()));
+    }
+
+    /// `package_json_has_test_script` is true iff the JSON literally
+    /// contains the `"test"` token (mirrors auto_test's existing
+    /// substring heuristic).
+    #[test]
+    fn package_json_has_test_script_true_when_test_defined() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts": {"test": "vitest"}}"#,
+        )
+        .expect("write");
+        assert!(package_json_has_test_script(dir.path()));
+    }
+
+    #[test]
+    fn package_json_has_test_script_false_when_test_missing() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts": {"build": "tsc"}}"#,
+        )
+        .expect("write");
+        assert!(!package_json_has_test_script(dir.path()));
+    }
+
+    #[test]
+    fn package_json_has_test_script_false_when_file_missing() {
+        let dir = tempdir().expect("tempdir");
+        assert!(!package_json_has_test_script(dir.path()));
     }
 }

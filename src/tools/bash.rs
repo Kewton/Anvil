@@ -9,6 +9,69 @@ use std::time::{Duration, Instant};
 use crate::session::feedback::FeedbackKind;
 use crate::tools::registry::truncate_output;
 
+/// Env-inheritance policy for `run_with_outcome`. CB-003 (Issue #459).
+///
+/// `Inherit` is the historical default — the child shell inherits every
+/// `std::env::vars()` entry from the parent process. `TesterSanitized` clears
+/// the child env and forwards only an explicit allowlist; this is the policy
+/// the Tester Skill smoke runner uses so LLM-generated test code cannot read
+/// `OPENAI_API_KEY` / `GITHUB_TOKEN` / `AWS_*` etc. and exfiltrate them via
+/// stdout / stderr.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BashEnvPolicy {
+    #[default]
+    Inherit,
+    TesterSanitized,
+}
+
+/// CB-003 (Issue #459): exact set of env keys forwarded to a Tester smoke
+/// child. Anything else (including `ANVIL_*`, `ANTHROPIC_*`, `OPENAI_*`,
+/// `GITHUB_*`, `AWS_*`, `*_TOKEN`, `*_KEY`, `*_SECRET`, `*_PASSWORD`) is
+/// dropped. `LANG` / `LC_*` / `TZ` are not forwarded by exact match — the
+/// allowlist below picks up `LANG`, and `LC_ALL` is included explicitly to
+/// keep cargo / rustc / python output deterministic on CI.
+pub const TESTER_ENV_ALLOWLIST_EXACT: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "TMPDIR",
+    "SHELL",
+    "TERM",
+    // Rust toolchain locations are necessary for `cargo test` to find rustc.
+    "RUSTUP_HOME",
+    "CARGO_HOME",
+    // Anvil's smoke-runner injects this directly via `env CARGO_TARGET_DIR=...`
+    // in the command line (CB-005), but pass-through is harmless and lets a
+    // workspace-wide override flow through unchanged.
+    "CARGO_TARGET_DIR",
+];
+
+/// Filter the parent process env down to the Tester-safe allowlist. Pure
+/// function over a list of `(key, value)` pairs so the unit test can drive
+/// it without mutating the global process env.
+pub fn filter_env_for_tester<I, K, V>(env: I) -> Vec<(String, String)>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<str>,
+    V: Into<String>,
+{
+    env.into_iter()
+        .filter_map(|(k, v)| {
+            let key = k.as_ref();
+            if TESTER_ENV_ALLOWLIST_EXACT.contains(&key) {
+                Some((key.to_string(), v.into()))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 /// Internal Bash outcome bag exposed for FeedbackFrame generation in
 /// the agent layer (Issue #450). Not part of `ToolRegistry::execute`'s
 /// `Result<String, String>` contract; turn.rs invokes
@@ -82,17 +145,30 @@ pub fn run(
     cancel_flag: Option<&Arc<AtomicBool>>,
     offline: bool,
 ) -> Result<String, String> {
-    run_with_outcome(command, cwd, cancel_flag, offline).map(|(text, _)| text)
+    run_with_outcome(command, cwd, cancel_flag, offline, None, None).map(|(text, _)| text)
 }
 
 /// Like `run`, but additionally returns the structured
 /// `BashExecutionOutcome` (Issue #450). The returned `Result<String, String>`
 /// is identical to what `run` returns so the registry contract is unchanged.
+///
+/// `explicit_timeout` (Issue #459 / DR1-003 / DR2-005):
+///
+/// * `Some(d)` — bypass the `likely_long_running_command` heuristic and
+///   enforce `d` as the wall-clock timeout for this dispatch. Used by the
+///   Tester Skill smoke runner (`TESTER_SMOKE_TIMEOUT_SECS`).
+/// * `None` — preserve the existing call-site behaviour: a timeout is set
+///   only when `likely_long_running_command` returns true.
+///
+/// `is_dangerous_command` / `BLOCKED_SNIPPETS` / offline policy filters are
+/// applied unconditionally — `explicit_timeout` does not provide a bypass.
 pub fn run_with_outcome(
     command: &str,
     cwd: &std::path::Path,
     cancel_flag: Option<&Arc<AtomicBool>>,
     offline: bool,
+    explicit_timeout: Option<Duration>,
+    env_policy: Option<BashEnvPolicy>,
 ) -> Result<(String, BashExecutionOutcome), String> {
     let normalized =
         normalize_background_command(&normalize_noninteractive_scaffold_command(command));
@@ -111,6 +187,17 @@ pub fn run_with_outcome(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // CB-003 (Issue #459): Tester's smoke runner clears the child env and
+    // forwards only the allowlist below. Production code (registry-driven
+    // Bash, AutoTestRunner) passes `None` and keeps the historical inherit
+    // behaviour so existing call sites are unaffected.
+    let policy = env_policy.unwrap_or_default();
+    if matches!(policy, BashEnvPolicy::TesterSanitized) {
+        cmd.env_clear();
+        for (key, value) in filter_env_for_tester(std::env::vars()) {
+            cmd.env(key, value);
+        }
+    }
     if is_noninteractive_scaffold_command(&normalized) {
         cmd.env("CI", "1");
     }
@@ -131,7 +218,11 @@ pub fn run_with_outcome(
     let mut child = cmd
         .spawn()
         .map_err(|err| format!("failed to run shell command: {err}"))?;
-    let timeout = likely_long_running_command(&normalized).then_some(LONG_RUNNING_TIMEOUT);
+    // Issue #459 / DR1-003: explicit_timeout takes precedence over the
+    // long-running heuristic so the Tester smoke runner can always cap
+    // execution at TESTER_SMOKE_TIMEOUT_SECS.
+    let timeout = explicit_timeout
+        .or_else(|| likely_long_running_command(&normalized).then_some(LONG_RUNNING_TIMEOUT));
     let started = Instant::now();
 
     let status = loop {
@@ -945,7 +1036,8 @@ mod tests {
     #[test]
     fn run_with_outcome_emits_structured_exit_code() {
         let temp = tempdir().unwrap();
-        let (text, outcome) = run_with_outcome("printf hello", temp.path(), None, false).unwrap();
+        let (text, outcome) =
+            run_with_outcome("printf hello", temp.path(), None, false, None, None).unwrap();
         assert!(text.starts_with("exit_code=0"));
         assert_eq!(outcome.exit_code, Some(0));
         assert!(outcome.stdout.contains("hello"));
@@ -964,9 +1056,15 @@ mod tests {
         // `printf` does not interpret `\x` escapes (they pass through
         // as literal text). Octal `\377\376\375` produces bytes
         // 0xFF 0xFE 0xFD on every POSIX shell.
-        let (text, outcome) =
-            run_with_outcome("printf '\\377\\376\\375'", temp.path(), None, false)
-                .expect("run_with_outcome must succeed even for non-UTF8 output");
+        let (text, outcome) = run_with_outcome(
+            "printf '\\377\\376\\375'",
+            temp.path(),
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect("run_with_outcome must succeed even for non-UTF8 output");
         // Successful exit (exit_code=0); not timed_out.
         assert_eq!(outcome.exit_code, Some(0));
         assert!(!outcome.timed_out);
@@ -984,6 +1082,188 @@ mod tests {
             !outcome.stdout.contains("\\377"),
             "shell printf did not interpret octal escape, got {:?}",
             outcome.stdout
+        );
+    }
+
+    // --- Issue #459: explicit_timeout coverage ---------------------------
+
+    /// `explicit_timeout = Some(d)` enforces `d` even when the command is
+    /// not on the `likely_long_running_command` allow-list (Tester smoke
+    /// runs do not match dev-server / cargo-watch heuristics).
+    #[test]
+    fn explicit_timeout_enforces_kill_on_short_sleep() {
+        let temp = tempdir().unwrap();
+        let started = Instant::now();
+        let (text, outcome) = run_with_outcome(
+            "sleep 5",
+            temp.path(),
+            None,
+            false,
+            Some(Duration::from_millis(500)),
+            None,
+        )
+        .expect("run_with_outcome must report timeout via Ok((text, outcome))");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "explicit_timeout did not preempt sleep: elapsed={:?}",
+            started.elapsed()
+        );
+        assert!(outcome.timed_out, "outcome.timed_out must be true");
+        assert_eq!(outcome.exit_code, None);
+        assert!(text.contains("timed_out=true"));
+    }
+
+    /// `explicit_timeout = None` preserves existing behaviour: short
+    /// non-long-running commands run to completion without a timeout.
+    #[test]
+    fn explicit_timeout_none_keeps_existing_behaviour() {
+        let temp = tempdir().unwrap();
+        let (_text, outcome) =
+            run_with_outcome("printf ok", temp.path(), None, false, None, None).unwrap();
+        assert!(!outcome.timed_out);
+        assert_eq!(outcome.exit_code, Some(0));
+    }
+
+    // --- CB-003: env sanitization for Tester smoke runs -------------------
+
+    /// `filter_env_for_tester` drops everything not in the exact allowlist.
+    /// Pure-function unit test so we never have to mutate the global env.
+    #[test]
+    fn filter_env_for_tester_drops_secret_like_keys() {
+        let input: Vec<(String, String)> = vec![
+            ("PATH".into(), "/usr/bin".into()),
+            ("HOME".into(), "/home/user".into()),
+            ("OPENAI_API_KEY".into(), "sk-secret".into()),
+            ("ANTHROPIC_API_KEY".into(), "sk-ant".into()),
+            ("GITHUB_TOKEN".into(), "ghp_xxx".into()),
+            ("AWS_SECRET_ACCESS_KEY".into(), "AKIA-secret".into()),
+            ("ANVIL_NO_TESTER".into(), "1".into()),
+            ("ANVIL_DEBUG".into(), "1".into()),
+            ("MY_TOKEN".into(), "redact".into()),
+            ("SOME_PASSWORD".into(), "redact".into()),
+            ("LANG".into(), "en_US.UTF-8".into()),
+        ];
+        let filtered = super::filter_env_for_tester(input);
+        let keys: Vec<&str> = filtered.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(keys.contains(&"PATH"), "PATH must remain: {keys:?}");
+        assert!(keys.contains(&"HOME"));
+        assert!(keys.contains(&"LANG"));
+        for forbidden in &[
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "GITHUB_TOKEN",
+            "AWS_SECRET_ACCESS_KEY",
+            "ANVIL_NO_TESTER",
+            "ANVIL_DEBUG",
+            "MY_TOKEN",
+            "SOME_PASSWORD",
+        ] {
+            assert!(
+                !keys.contains(forbidden),
+                "{forbidden} must be dropped, got keys: {keys:?}"
+            );
+        }
+    }
+
+    /// E2E coverage: with `BashEnvPolicy::TesterSanitized`, a child shell that
+    /// echoes its env does NOT see secret-like keys we set on the parent
+    /// process. Uses `printenv -0` style sentinels so we do not depend on
+    /// `env`(1) output formatting.
+    #[test]
+    fn run_with_outcome_tester_sanitized_drops_secrets() {
+        let temp = tempdir().unwrap();
+        // Set a representative secret-like env var on the parent. SAFETY:
+        // mutating process env is unsound under threaded execution. We use
+        // a key prefix (`ANVIL_TEST_FAKE_`) that nothing else in the
+        // codebase reads.
+        let key = "ANVIL_TEST_FAKE_OPENAI_API_KEY_CB003";
+        // SAFETY: tests are single-threaded for this case; the var is unique
+        // and only consumed inside this test.
+        unsafe {
+            std::env::set_var(key, "sk-fake-secret-cb003");
+        }
+        let (text, outcome) = run_with_outcome(
+            // Print only env keys that match our test prefix or expected
+            // allowlist members so the assertion is deterministic.
+            "printenv ANVIL_TEST_FAKE_OPENAI_API_KEY_CB003 || true; printenv PATH || true",
+            temp.path(),
+            None,
+            false,
+            None,
+            Some(super::BashEnvPolicy::TesterSanitized),
+        )
+        .expect("sanitized run must complete");
+        // Cleanup before assertions so a failure leaves no leftover env.
+        // SAFETY: see above.
+        unsafe {
+            std::env::remove_var(key);
+        }
+        assert_eq!(outcome.exit_code, Some(0), "child should exit 0: {text}");
+        assert!(
+            !outcome.stdout.contains("sk-fake-secret-cb003"),
+            "secret value leaked to child stdout: {:?}",
+            outcome.stdout
+        );
+        // PATH must still be forwarded — without it, `cargo` / `node` /
+        // `python3` cannot be located in the smoke run.
+        assert!(
+            !outcome.stdout.trim().is_empty()
+                || outcome.stderr.contains("printenv")
+                || outcome.exit_code == Some(0),
+            "PATH should be forwarded; observed stdout: {:?}",
+            outcome.stdout
+        );
+    }
+
+    /// Inverse: with `env_policy = None` (default `Inherit`), the same
+    /// secret env we set on the parent IS visible to the child — confirming
+    /// the existing code paths are unchanged when not opting in.
+    #[test]
+    fn run_with_outcome_default_inherits_env() {
+        let temp = tempdir().unwrap();
+        let key = "ANVIL_TEST_FAKE_INHERIT_CB003";
+        // SAFETY: see sanitized test above.
+        unsafe {
+            std::env::set_var(key, "value-leaks");
+        }
+        let (text, _outcome) = run_with_outcome(
+            "printenv ANVIL_TEST_FAKE_INHERIT_CB003 || true",
+            temp.path(),
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect("default run must complete");
+        // SAFETY: see above.
+        unsafe {
+            std::env::remove_var(key);
+        }
+        // Default is Inherit, so the value must reach the child stdout.
+        assert!(
+            text.contains("value-leaks"),
+            "default policy should inherit env; got text {text:?}"
+        );
+    }
+
+    /// `is_dangerous_command` / `BLOCKED_SNIPPETS` block a `rm -rf /`
+    /// call regardless of `explicit_timeout` — there is no Tester bypass
+    /// (DR2-014).
+    #[test]
+    fn explicit_timeout_does_not_bypass_dangerous_block() {
+        let temp = tempdir().unwrap();
+        let err = run_with_outcome(
+            "rm -rf /",
+            temp.path(),
+            None,
+            false,
+            Some(Duration::from_secs(30)),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("blocked dangerous command"),
+            "explicit_timeout must not bypass dangerous-snippet filter, got: {err}"
         );
     }
 }

@@ -6,6 +6,7 @@ use super::reminder::{
 };
 use super::spinner::{Spinner, SpinnerStopSignal};
 use super::summary::{ExitReason, LoopResult, LoopStats};
+use super::tester;
 use super::*;
 use crate::agent::orchestration::{RepoVerification, capture_repo_snapshot, verify_repo_progress};
 use crate::logging::log_llm_event;
@@ -163,6 +164,56 @@ fn build_feedback_for_auto_test(
         changed_files,
     };
     build_feedback_frame(draft, workspace_root)
+}
+
+/// CB-002 (Issue #459): which verifier should run on a successful turn.
+///
+/// `select_success_verifier` is a pure decision function over three boolean
+/// inputs so the dispatch logic can be unit tested without spinning up the
+/// full agent. Production wiring lives in the success branch of
+/// `handle_user_message_inner` and uses this enum to decide between
+/// `AutoTestRunner::run`, `try_invoke_tester`, the `NoVerifierAvailable`
+/// fallback, and a no-op skip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SuccessVerifier {
+    /// Run `AutoTestRunner::run(plan)` (existing auto_test path).
+    AutoTest,
+    /// Run the Tester Skill via `try_invoke_tester`.
+    Tester,
+    /// No verifier ran — record `NoVerifierAvailable` feedback.
+    NoVerifier,
+    /// `should_run_auto_test_for_success() == false` and no Tester candidate
+    /// — do nothing (the historical pre-#450 behaviour).
+    Skip,
+}
+
+/// CB-002 (Issue #459): the Tester is gated **independently** of
+/// `should_run_auto_test_for_success()`. The selection rules are:
+///
+/// 1. `should_run && auto_test_some` → `AutoTest` (an explicit verifier
+///    exists and the protocol asked for it).
+/// 2. `tester_some` (regardless of `should_run`) → `Tester`. The
+///    `TesterCandidate::detect` filter already returns `None` when an
+///    explicit verifier is present, so this branch is only reachable when
+///    `auto_test_some == false` *or* the auto_test plan is build-only.
+/// 3. `should_run && !auto_test_some && !tester_some` → `NoVerifier` — the
+///    protocol demanded verification and nothing matched.
+/// 4. Otherwise (`!should_run && !tester_some` and any `auto_test_some`) →
+///    `Skip`.
+pub(super) fn select_success_verifier(
+    should_run: bool,
+    auto_test_some: bool,
+    tester_some: bool,
+) -> SuccessVerifier {
+    if should_run && auto_test_some {
+        SuccessVerifier::AutoTest
+    } else if tester_some {
+        SuccessVerifier::Tester
+    } else if should_run {
+        SuccessVerifier::NoVerifier
+    } else {
+        SuccessVerifier::Skip
+    }
 }
 
 fn build_feedback_for_no_verifier(workspace_root: &Path) -> FeedbackFrame {
@@ -1125,6 +1176,10 @@ impl Agent {
         // user message — reset here so a fresh handle_user_message can fire
         // the Reminder once even if the previous turn already did.
         self.reminder_called_this_turn = false;
+        // Issue #459: Tester Skill per-turn cap counter (DR1-004). Mirror of
+        // the reminder cap above; reset so a fresh user turn can fire the
+        // Tester once even if the previous turn already did.
+        self.tester_called_this_turn = false;
         // Issue #456: AnvilScore compute happens once per turn, post-loop.
         // The flag flips after the compute so the post-loop Reminder hook
         // sees `CurrentTurn` while the iteration-internal hook sees
@@ -2874,53 +2929,91 @@ impl Agent {
             if let Some(issue) = protocol.success_issue(&stats) {
                 exit_reason = ExitReason::MissingRepoEdits;
                 error_text = issue;
-            } else if self.should_run_auto_test_for_success() {
-                if let Some(plan) = AutoTestRunner::detect(&self.work_root, &stats.changed_files) {
-                    match AutoTestRunner::run(&self.work_root, &plan) {
-                        Ok(result) => {
-                            log_llm_event(
-                                "agent.autotest.completed",
-                                serde_json::json!({
-                                    "session_id": self.session_store.session_id(),
-                                    "command": result.command,
-                                    "passed": result.passed,
-                                    "reason": plan.reason,
-                                }),
-                            );
-                            // Issue #450: record FeedbackFrame for the
-                            // auto_test outcome (BuildPass / TestPass on
-                            // success, CompileError / TestFailure / etc.
-                            // on failure).
-                            // Issue #455 / D4: switch to first-eligible-failure-wins
-                            // so a deterministic content fallback / NoToolCall
-                            // frame from earlier in this turn is preserved.
-                            let frame = build_feedback_for_auto_test(
-                                &plan,
-                                &result,
-                                &self.work_root,
-                                &stats.changed_files,
-                            );
-                            self.session.record_feedback_if_unset(frame);
-                            if !result.passed {
-                                exit_reason = ExitReason::MissingRepoEdits;
-                                error_text = format!(
-                                    "auto test failed for protocol {:?}: {}\n{}",
-                                    protocol.kind(),
-                                    result.command,
-                                    result.output
+            } else {
+                // CB-002 (Issue #459): the Tester is gated **independently** of
+                // `should_run_auto_test_for_success()`. We probe both verifiers
+                // up front and let `select_success_verifier` pick the right
+                // dispatch. `TesterCandidate::detect` already returns `None`
+                // when an explicit AutoTestRunner verifier is present, so a
+                // build-only AutoTest plan does not block the Tester branch.
+                let auto_test_plan = AutoTestRunner::detect(&self.work_root, &stats.changed_files);
+                let tester_candidate =
+                    tester::TesterCandidate::detect(&self.work_root, &stats.changed_files);
+                let decision = select_success_verifier(
+                    self.should_run_auto_test_for_success(),
+                    auto_test_plan.is_some(),
+                    tester_candidate.is_some(),
+                );
+                match (decision, auto_test_plan) {
+                    (SuccessVerifier::AutoTest, Some(plan)) => {
+                        match AutoTestRunner::run(&self.work_root, &plan) {
+                            Ok(result) => {
+                                log_llm_event(
+                                    "agent.autotest.completed",
+                                    serde_json::json!({
+                                        "session_id": self.session_store.session_id(),
+                                        "command": result.command,
+                                        "passed": result.passed,
+                                        "reason": plan.reason,
+                                    }),
                                 );
+                                // Issue #450: record FeedbackFrame for the
+                                // auto_test outcome (BuildPass / TestPass on
+                                // success, CompileError / TestFailure / etc.
+                                // on failure).
+                                // Issue #455 / D4: switch to first-eligible-failure-wins
+                                // so a deterministic content fallback / NoToolCall
+                                // frame from earlier in this turn is preserved.
+                                let frame = build_feedback_for_auto_test(
+                                    &plan,
+                                    &result,
+                                    &self.work_root,
+                                    &stats.changed_files,
+                                );
+                                self.session.record_feedback_if_unset(frame);
+                                if !result.passed {
+                                    exit_reason = ExitReason::MissingRepoEdits;
+                                    error_text = format!(
+                                        "auto test failed for protocol {:?}: {}\n{}",
+                                        protocol.kind(),
+                                        result.command,
+                                        result.output
+                                    );
+                                }
+                            }
+                            Err(err) => {
+                                exit_reason = ExitReason::TransportError;
+                                error_text = err;
                             }
                         }
-                        Err(err) => {
-                            exit_reason = ExitReason::TransportError;
-                            error_text = err;
+                    }
+                    (SuccessVerifier::Tester, _) => {
+                        // CB-002: Tester runs even when
+                        // `should_run_auto_test_for_success()` was false. If
+                        // Tester aborts / declines, fall through to
+                        // `NoVerifierAvailable` only when the protocol asked
+                        // for a verifier (mirrors the historical fallback).
+                        let tester_recorded = self.try_invoke_tester(&stats.changed_files);
+                        if !tester_recorded && self.should_run_auto_test_for_success() {
+                            let frame = build_feedback_for_no_verifier(&self.work_root);
+                            self.session.record_feedback_if_unset(frame);
                         }
                     }
-                } else {
-                    // Issue #450: no auto_test plan detected -> NoVerifierAvailable.
-                    // Issue #455 / D4: first-eligible-failure-wins.
-                    let frame = build_feedback_for_no_verifier(&self.work_root);
-                    self.session.record_feedback_if_unset(frame);
+                    (SuccessVerifier::NoVerifier, _) => {
+                        // Issue #450: no auto_test plan detected and no Tester
+                        // candidate -> NoVerifierAvailable.
+                        let frame = build_feedback_for_no_verifier(&self.work_root);
+                        self.session.record_feedback_if_unset(frame);
+                    }
+                    (SuccessVerifier::Skip, _) | (SuccessVerifier::AutoTest, None) => {
+                        // Skip: no verifier demanded and no Tester candidate;
+                        // do nothing (pre-#450 behaviour for non-Python /
+                        // non-test-requesting turns). The (AutoTest, None)
+                        // arm is theoretically unreachable per
+                        // `select_success_verifier` invariants but we cover
+                        // it defensively to keep production code free of
+                        // `expect()` / `unwrap()` (Issue #459 quality gate).
+                    }
                 }
             }
         }
@@ -2996,6 +3089,239 @@ impl Agent {
         }
         self.active_request_text()
             .is_some_and(|request| request_explicitly_requires_tests(&request))
+    }
+
+    /// Issue #459: try to invoke the Tester Skill when `AutoTestRunner::detect`
+    /// returned None. Returns `true` iff the Tester recorded a FeedbackFrame
+    /// (so the caller skips the `NoVerifierAvailable` fallback). Disable
+    /// gating (Plan / `ANVIL_NO_TESTER` / per-turn cap / no candidate) is
+    /// evaluated here so the orchestrator (`run_tester_with_strategy`) only
+    /// sees the run-body inputs.
+    ///
+    /// `Aborted` outcomes (LLM malformed / approval denied / harness build
+    /// failure) consume the per-turn cap and **do not** record a frame —
+    /// caller falls through to the `NoVerifierAvailable` fallback per design
+    /// § 4-2 ("Skip / Abort の細粒度 variant は同じ branch (= 既存
+    /// no_verifier) に集約し、log のみで識別する"). This is the boundary
+    /// captured by the bool return.
+    fn try_invoke_tester(&mut self, changed_files: &[String]) -> bool {
+        // Per-turn cap → Plan mode → `ANVIL_NO_TESTER` early-out (DR1-004 /
+        // DR1-012 / DR2-017). The shared `check_invocation_gate` is the single
+        // source of truth so integration tests in `tests/tester_skill_smoke.rs`
+        // exercise the same ordering.
+        if let Some(reason) = tester::check_invocation_gate(
+            self.tester_called_this_turn,
+            self.session.mode_state.mode == ExecutionMode::Plan,
+            tester::tester_disabled(|key| std::env::var(key).ok()),
+        ) {
+            self.log_tester_event(
+                "agent.tester.skipped",
+                serde_json::json!({
+                    "session_id": self.session_store.session_id(),
+                    "skip_reason": reason.as_str(),
+                }),
+            );
+            return false;
+        }
+        // Stack candidate detection (DR1-001 / DR3-001).
+        let candidate = match tester::TesterCandidate::detect(&self.work_root, changed_files) {
+            Some(c) => c,
+            None => {
+                self.log_tester_event(
+                    "agent.tester.skipped",
+                    serde_json::json!({
+                        "session_id": self.session_store.session_id(),
+                        "skip_reason": tester::NotInvokedReason::NoCandidate.as_str(),
+                    }),
+                );
+                return false;
+            }
+        };
+
+        // Build session-scoped artifact roots (DR1-009).
+        let session_dir = self
+            .session_store
+            .state_root()
+            .join("sessions")
+            .join(self.session_store.session_id());
+        let tmp_tests_root = session_dir.join("tmp-tests");
+        let tester_runs_root = session_dir.join("tester-runs");
+        if let Err(err) = std::fs::create_dir_all(&tester_runs_root) {
+            self.log_tester_event(
+                "agent.tester.failed",
+                serde_json::json!({
+                    "session_id": self.session_store.session_id(),
+                    "failure_reason": format!("mkdir tester-runs: {err}"),
+                }),
+            );
+            return false;
+        }
+
+        let approval_mode = if self.config.yes_mode {
+            tester::ApprovalMode::Auto
+        } else if io::stdin().is_terminal() {
+            tester::ApprovalMode::Interactive
+        } else {
+            tester::ApprovalMode::Forbidden
+        };
+
+        // Mark cap consumed BEFORE we dispatch — Aborted still counts (DR1-004).
+        self.tester_called_this_turn = true;
+
+        let work_root = self.work_root.clone();
+        let session_id = self.session_store.session_id().to_string();
+        let run = tester::TesterRun {
+            work_root: &work_root,
+            tmp_tests_root: &tmp_tests_root,
+            tester_runs_root: &tester_runs_root,
+            approval_mode,
+            plan_mode: false,
+            no_tester_env: false,
+            session_id: std::borrow::Cow::Owned(session_id.clone()),
+        };
+
+        let session_id_for_log = session_id.clone();
+        // Phase 2: wire the LLM call to the main model via `chat_text` so the
+        // Tester gets a real reply in production. Mirrors the Reminder Sidecar
+        // closure (line ~1227) but targets `self.models.main` instead of
+        // sidecar. The closure stays a `FnOnce(&TesterPrompt) -> Result<String,
+        // TesterLlmError>` so unit / integration tests keep injecting fakes.
+        let tester_client = self.client.clone();
+        let tester_main_model = self.models.main.clone();
+        let llm_call =
+            move |prompt: &tester::TesterPrompt| -> Result<String, tester::TesterLlmError> {
+                log_llm_event(
+                    "agent.tester.llm_call_started",
+                    serde_json::json!({
+                        "session_id": session_id_for_log,
+                        "stack": prompt.stack_label(),
+                        "model": tester_main_model,
+                        "prompt_len": prompt.body().len(),
+                    }),
+                );
+                let messages = vec![ConversationMessage::user(prompt.body().to_string())];
+                match tester_client.chat_text(&tester_main_model, &messages) {
+                    Ok(reply) => {
+                        log_llm_event(
+                            "agent.tester.llm_call_completed",
+                            serde_json::json!({
+                                "session_id": session_id_for_log,
+                                "stack": prompt.stack_label(),
+                                "model": tester_main_model,
+                                "reply_len": reply.content.len(),
+                                "tool_calls": reply.tool_calls.len(),
+                            }),
+                        );
+                        // tools=None on chat_text means the model should reply
+                        // JSON-only; defensively reject any tool-call payload
+                        // so we never try to interpret structured tool output
+                        // as a JSON test_files object (Reminder Sidecar parity).
+                        if !reply.tool_calls.is_empty() {
+                            return Err(tester::TesterLlmError(
+                                "tester reply unexpectedly contained tool_calls".to_string(),
+                            ));
+                        }
+                        Ok(reply.content)
+                    }
+                    Err(err) => {
+                        log_llm_event(
+                            "agent.tester.llm_call_failed",
+                            serde_json::json!({
+                                "session_id": session_id_for_log,
+                                "stack": prompt.stack_label(),
+                                "model": tester_main_model,
+                                "error": tester::sanitize_tester_log(
+                                    &err,
+                                    tester::TESTER_LOG_CAP,
+                                ),
+                            }),
+                        );
+                        Err(tester::TesterLlmError(err))
+                    }
+                }
+            };
+
+        let offline = self.config.offline;
+        let run_bash = move |cmd: &str,
+                             cwd: &Path,
+                             timeout: Option<std::time::Duration>|
+              -> Result<crate::tools::bash::BashExecutionOutcome, String> {
+            // No cancel_flag propagation: Tester's smoke run sits past the
+            // main interrupt monitor scope (post-loop hook). The 30s
+            // explicit_timeout still caps wall time.
+            //
+            // CB-003 (Issue #459): pass `BashEnvPolicy::TesterSanitized` so
+            // LLM-generated smoke code cannot read parent-process secrets
+            // (`OPENAI_API_KEY`, `GITHUB_TOKEN`, `AWS_*`, anything `*_TOKEN`/
+            // `*_SECRET`/`*_PASSWORD`). Only the explicit allowlist in
+            // `bash::TESTER_ENV_ALLOWLIST_EXACT` is forwarded.
+            crate::tools::bash::run_with_outcome(
+                cmd,
+                cwd,
+                None,
+                offline,
+                timeout,
+                Some(crate::tools::bash::BashEnvPolicy::TesterSanitized),
+            )
+            .map(|(_, outcome)| outcome)
+        };
+
+        let approver = move |mode: tester::ApprovalMode,
+                             command: &[String]|
+              -> Result<(), tester::AbortReason> {
+            // Honour the same write/run/promote 3-gate symmetry: Auto bypass /
+            // Forbidden deny / Interactive y/N. Production prompt goes through
+            // `prompt_for_approval(stdout, stdin)` so both ends are real TTY
+            // streams; CI takes the Forbidden branch above.
+            let mut stdout = std::io::stdout().lock();
+            let stdin_handle = std::io::stdin();
+            let mut stdin = stdin_handle.lock();
+            tester::prompt_for_approval(mode, command, &mut stdout, &mut stdin)
+        };
+
+        let outcome =
+            tester::run_tester_with_strategy(run, candidate, llm_call, run_bash, approver);
+
+        match outcome {
+            tester::TesterOutcome::Recorded(frame) => {
+                let kind_value =
+                    serde_json::to_value(&frame.kind).unwrap_or(serde_json::Value::Null);
+                self.session.record_feedback_if_unset(frame);
+                self.log_tester_event(
+                    "agent.tester.completed",
+                    serde_json::json!({
+                        "session_id": session_id,
+                        "feedback_kind": kind_value,
+                    }),
+                );
+                true
+            }
+            tester::TesterOutcome::NotInvoked(reason) => {
+                self.log_tester_event(
+                    "agent.tester.skipped",
+                    serde_json::json!({
+                        "session_id": session_id,
+                        "skip_reason": reason.as_str(),
+                    }),
+                );
+                false
+            }
+            tester::TesterOutcome::Aborted(reason) => {
+                self.log_tester_event(
+                    "agent.tester.failed",
+                    serde_json::json!({
+                        "session_id": session_id,
+                        "failure_reason": reason.as_str(),
+                        "detail": reason.detail().map(|d| tester::sanitize_tester_log(d, tester::TESTER_LOG_CAP)),
+                    }),
+                );
+                false
+            }
+        }
+    }
+
+    fn log_tester_event(&self, event: &'static str, payload: serde_json::Value) {
+        log_llm_event(event, payload);
     }
 
     fn request_assistant_reply_with_retry(
@@ -3950,6 +4276,12 @@ impl Agent {
             offline: self.config.offline,
             cancel_flag,
             tmp_tests_root,
+            // Issue #459: Tester is active for the remainder of this turn once
+            // its smoke run has dispatched. The Tester orchestrator itself
+            // routes Edit/Write through the closure-DI Bash path, but any
+            // residual main-turn tool calls after Tester ran are confined to
+            // the session-scoped tmp-tests prefix (DR1-014 / DR3-002).
+            tester_active: self.tester_called_this_turn,
         };
 
         // CB-001: Bash dispatch goes through the structured-outcome path so we
@@ -9659,6 +9991,66 @@ export default function App() {
         assert_eq!(
             super::DETERMINISTIC_CONTENT_FALLBACK_TAG,
             "deterministic_content_fallback"
+        );
+    }
+
+    // ---- CB-002 (Issue #459): success-verifier selection -------------------
+
+    /// auto_test verifier exists AND the protocol asked for it → AutoTest.
+    #[test]
+    fn select_success_verifier_runs_auto_test_when_should_and_plan_some() {
+        assert_eq!(
+            super::select_success_verifier(true, true, false),
+            super::SuccessVerifier::AutoTest
+        );
+        // Even when a Tester candidate is also available, an explicit
+        // verifier wins.
+        assert_eq!(
+            super::select_success_verifier(true, true, true),
+            super::SuccessVerifier::AutoTest
+        );
+    }
+
+    /// CB-002 core regression: should_run_auto_test_for_success == false and
+    /// AutoTestRunner::detect == None, but TesterCandidate::detect == Some →
+    /// Tester MUST run. The previous code mistakenly skipped Tester when
+    /// should_run was false.
+    #[test]
+    fn select_success_verifier_runs_tester_independent_of_should_run() {
+        assert_eq!(
+            super::select_success_verifier(false, false, true),
+            super::SuccessVerifier::Tester,
+            "Tester must fire even when should_run_auto_test_for_success is false"
+        );
+        // Same selection if AutoTestRunner returns Some (build-only verifier
+        // — TesterCandidate::detect already filtered explicit verifiers out).
+        assert_eq!(
+            super::select_success_verifier(false, true, true),
+            super::SuccessVerifier::Tester
+        );
+    }
+
+    /// should_run is true but neither auto_test plan nor Tester candidate
+    /// exists → NoVerifier (existing fallback).
+    #[test]
+    fn select_success_verifier_no_verifier_when_should_run_but_nothing_detects() {
+        assert_eq!(
+            super::select_success_verifier(true, false, false),
+            super::SuccessVerifier::NoVerifier
+        );
+    }
+
+    /// should_run is false and no Tester candidate → Skip (do nothing).
+    #[test]
+    fn select_success_verifier_skip_when_no_demand_no_tester() {
+        assert_eq!(
+            super::select_success_verifier(false, false, false),
+            super::SuccessVerifier::Skip
+        );
+        assert_eq!(
+            super::select_success_verifier(false, true, false),
+            super::SuccessVerifier::Skip,
+            "auto_test plan alone without should_run nor tester is a Skip"
         );
     }
 

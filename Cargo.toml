@@ -3,6 +3,13 @@ name = "anvil"
 version = "0.2.0"
 edition = "2024"
 
+# Issue #459 / Phase 2: declare an empty workspace so `cargo` does not pick
+# up the `Cargo.toml` fixture under `tests/fixtures/stacks/rust/` as a member
+# (the fixture is meant to be read as fixture data, not built). The root
+# crate stays the only member; `exclude` keeps the fixture tree out.
+[workspace]
+exclude = ["tests/fixtures"]
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 crossterm = { version = "0.28", default-features = false, features = ["events"] }

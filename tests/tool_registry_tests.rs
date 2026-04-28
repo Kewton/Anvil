@@ -19,6 +19,7 @@ fn read_write_edit_glob_and_grep_work() {
         offline: false,
         cancel_flag: None,
         tmp_tests_root: None,
+        tester_active: false,
     };
 
     registry
@@ -71,6 +72,7 @@ fn edit_tool_salvages_token_anchor_drift() {
         offline: false,
         cancel_flag: None,
         tmp_tests_root: None,
+        tester_active: false,
     };
 
     registry
@@ -115,6 +117,7 @@ fn plan_mode_only_allows_plan_file_writes() {
         offline: false,
         cancel_flag: None,
         tmp_tests_root: None,
+        tester_active: false,
     };
 
     registry
@@ -154,6 +157,7 @@ fn plan_mode_allows_plan_file_outside_workspace() {
         offline: false,
         cancel_flag: None,
         tmp_tests_root: None,
+        tester_active: false,
     };
 
     registry
@@ -190,6 +194,7 @@ fn offline_mode_blocks_network_bash_commands() {
         offline: true,
         cancel_flag: None,
         tmp_tests_root: None,
+        tester_active: false,
     };
 
     let err = registry
@@ -216,6 +221,7 @@ fn offline_mode_allows_build_test_bash_commands() {
         offline: true,
         cancel_flag: None,
         tmp_tests_root: None,
+        tester_active: false,
     };
 
     let result = registry

@@ -107,6 +107,7 @@ fn tool_context_for(fixture: &SessionFixture) -> ToolContext {
         offline: false,
         cancel_flag: None,
         tmp_tests_root: Some(fixture.tmp_tests_root.clone()),
+        tester_active: false,
     }
 }
 
@@ -298,6 +299,7 @@ fn tmp_tests_prefix_with_none_root_is_rejected() {
         cancel_flag: None,
         // Critical: simulate the early-startup / unit-test path.
         tmp_tests_root: None,
+        tester_active: false,
     };
 
     let err = registry
