@@ -664,6 +664,12 @@ pub struct SessionSnapshot {
     /// emerges.
     #[serde(skip, default)]
     pub touched_files_at_turn_start: Vec<String>,
+    /// Issue #462: turn-local per-turn cap for CaseRecord extraction. Set to
+    /// `true` once `maybe_extract_case_record` runs (regardless of
+    /// extraction outcome), preventing duplicate work in the same turn. Not
+    /// persisted; runtime-only flag like `repo_edit_succeeded_this_turn`.
+    #[serde(skip, default)]
+    pub case_record_extracted_this_turn: bool,
 }
 
 impl SessionSnapshot {
@@ -709,6 +715,13 @@ impl SessionSnapshot {
     /// fresh on every turn.
     pub fn reset_eligible_feedback_recorded_this_turn(&mut self) {
         self.eligible_feedback_recorded_this_turn = false;
+    }
+
+    /// Issue #462: clear the per-turn CaseRecord extraction flag. Invoked from
+    /// `run_turn` head alongside the other turn-local resets so the next turn
+    /// can extract afresh.
+    pub fn reset_case_record_extracted_this_turn(&mut self) {
+        self.case_record_extracted_this_turn = false;
     }
 }
 
