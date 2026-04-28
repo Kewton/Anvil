@@ -5,6 +5,7 @@ use sha2::{Digest, Sha256};
 
 use crate::modes::plan_act::{ExecutionMode, ModeState};
 use crate::ollama::xml_fallback::ToolCall;
+use crate::session::anvil_score::{AnvilScore, deserialize_lossy_anvil_score};
 use crate::session::feedback::{FeedbackFrame, mask_secrets, normalize_path_to_workspace};
 use crate::session::precaution::{
     AddPrecautionOutcome, Precaution, PrecautionStatus, RetiredReason, Severity,
@@ -621,6 +622,48 @@ pub struct SessionSnapshot {
     /// is the correct turn-start value for a freshly resumed session.
     #[serde(skip, default)]
     pub eligible_feedback_recorded_this_turn: bool,
+    /// Issue #456: persisted snapshot of the previous turn's AnvilScore. Used
+    /// by [`crate::session::anvil_score::compute_anvil_score`] as the delta
+    /// baseline for the current turn. `None` for fresh sessions and for the
+    /// pre-compute window inside a turn (DR1-010 / 設計判断 #9).
+    ///
+    /// Field-level lossy deserializer (`deserialize_lossy_anvil_score`) drops
+    /// malformed / oversized JSON to `None` so a tampered session.json or an
+    /// old-anvil future-incompatible field cannot block resume / discovery
+    /// (DR1-008 / DR4-003 / S5-004 / S7-003).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_lossy_anvil_score"
+    )]
+    pub last_anvil_score: Option<AnvilScore>,
+    /// Issue #456: turn-local counter for `UnsafeCommandBlocked` events. Reset
+    /// to `0` at the top of `run_turn`, incremented at the unsafe-block
+    /// `record_feedback` site, copied into `AnvilScore.unsafe_actions_blocked`
+    /// at compute time. Not persisted.
+    #[serde(skip, default)]
+    pub unsafe_blocks_this_turn: usize,
+    /// Issue #456: session-cumulative counter for `NoRepoProgress` turns.
+    /// Incremented when the post-loop `verify_repo_progress` finds no diff,
+    /// reset to 0 when the turn produces verifiable progress. Persisted so
+    /// resumed sessions keep their accumulated streak.
+    #[serde(default)]
+    pub consecutive_no_progress_turns: usize,
+    /// Issue #456: turn-local flag set when at least one `Write` / `Edit`
+    /// tool call returned `Ok`. Reset to `false` at the top of `run_turn`,
+    /// consumed by `compute_anvil_score` to determine `user_visible_artifact`.
+    /// Not persisted.
+    #[serde(skip, default)]
+    pub repo_edit_succeeded_this_turn: bool,
+    /// Issue #456: snapshot of `working_memory.touched_files` captured at the
+    /// top of `run_turn`. Provides the Reminder Sidecar / future Observability
+    /// with a stable view of "what the agent already knew before this turn",
+    /// independent of the in-turn cap that `working_memory.touched_files`
+    /// applies. Not persisted (this is per-turn diagnostic context, not state
+    /// to resume from). Open Question OQ-1: removal candidate if no consumer
+    /// emerges.
+    #[serde(skip, default)]
+    pub touched_files_at_turn_start: Vec<String>,
 }
 
 impl SessionSnapshot {
@@ -710,6 +753,21 @@ impl SessionStore {
                 workspace_key: self.workspace_key.clone(),
                 ..SessionSnapshot::default()
             });
+        }
+
+        // Issue #456 / DR4-003: refuse to read oversized session.json before
+        // we even open it so a hostile / corrupt file cannot push the parser
+        // into an oversized allocation. The cap mirrors the discovery-path
+        // limit in `discovery::MAX_SESSION_JSON_BYTES` so resume and
+        // `iter_session_dirs` enforce the same upper bound.
+        if let Ok(file_meta) = fs::metadata(&self.path)
+            && file_meta.len() > crate::session::discovery::MAX_SESSION_JSON_BYTES
+        {
+            return Err(format!(
+                "session {} exceeds {} bytes",
+                self.path.display(),
+                crate::session::discovery::MAX_SESSION_JSON_BYTES
+            ));
         }
 
         let contents = fs::read_to_string(&self.path)

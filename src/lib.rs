@@ -10,6 +10,7 @@ pub mod session;
 pub mod system_prompt;
 pub mod tools;
 pub mod tui;
+pub mod util;
 
 use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
