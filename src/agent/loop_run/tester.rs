@@ -793,7 +793,7 @@ pub(super) fn cleanup_stale_tester_runs(tester_runs_root: &Path, keep: usize) {
         return;
     }
     // Sort newest first; remove anything past `keep`.
-    dirs.sort_by(|a, b| b.1.cmp(&a.1));
+    dirs.sort_by_key(|x| std::cmp::Reverse(x.1));
     for (path, _) in dirs.into_iter().skip(keep) {
         let _ = std::fs::remove_dir_all(&path);
     }
