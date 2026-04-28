@@ -304,6 +304,87 @@ fn reconcile_resume_state_preserves_last_feedback() {
     assert_eq!(snap.last_feedback, Some(frame));
 }
 
+// --- Issue #455 / Task 4.1: NoToolCall session.json compat ---------------
+
+/// AC9 extension: legacy session.json saved by an older binary will not
+/// contain `last_feedback.kind == "no_tool_call"` because the variant did
+/// not exist. The new binary must still load such files cleanly. The
+/// `last_feedback` field is absent here so it stays `None`.
+#[test]
+fn legacy_session_loads_without_no_tool_call_kind() {
+    let legacy = r#"{
+        "mode_state": {"mode": "Act", "active_plan_path": null},
+        "messages": [],
+        "checkpoints": [],
+        "id": "0199fe00-0000-7000-8000-000000000455",
+        "workspace_key": "legacy-no-no-tool-call"
+    }"#;
+    let decoded: SessionSnapshot = serde_json::from_str(legacy).unwrap();
+    assert!(decoded.last_feedback.is_none());
+}
+
+/// Issue #455 / D1: a `last_feedback` carrying `NoToolCall` must round-trip
+/// through serde / SessionStore without losing the variant tag.
+#[test]
+fn no_tool_call_session_round_trips() {
+    let dir = tempdir().unwrap();
+    let session_id = "0199fe00-0000-7000-8000-000000000456";
+    let workspace_key = "ws-no-tool-call";
+    let session_dir = dir.path().join("sessions").join(session_id);
+    std::fs::create_dir_all(&session_dir).unwrap();
+    let store = SessionStore::new(dir.path(), session_id, workspace_key);
+
+    // Build a session with last_feedback.kind == NoToolCall.
+    let frame: FeedbackFrame = serde_json::from_str(
+        r#"{"kind":"no_tool_call","primary_error":"no_tool_retries_exhausted"}"#,
+    )
+    .unwrap();
+    let mut snapshot = SessionSnapshot::default();
+    snapshot.record_feedback(frame.clone());
+
+    store.save(&snapshot).unwrap();
+    let loaded = store.load_or_new(false).unwrap();
+    assert_eq!(loaded.last_feedback, Some(frame));
+    assert_eq!(loaded.last_feedback.unwrap().kind, FeedbackKind::NoToolCall);
+}
+
+/// Issue #455 / DR3-004: an unknown future variant must continue to
+/// deserialize as `UnknownFailure` (the `#[serde(other)]` fallback). This
+/// guards against forward-compat regression after adding `NoToolCall`.
+#[test]
+fn unknown_kind_session_falls_back_to_unknown_failure() {
+    let json = r#"{
+        "mode_state": {"mode": "Act", "active_plan_path": null},
+        "messages": [],
+        "checkpoints": [],
+        "id": "0199fe00-0000-7000-8000-000000000457",
+        "workspace_key": "ws-unknown",
+        "last_feedback": {"kind": "future_unseen_kind"}
+    }"#;
+    let decoded: SessionSnapshot = serde_json::from_str(json).unwrap();
+    let kind = decoded.last_feedback.expect("last_feedback present").kind;
+    assert_eq!(kind, FeedbackKind::UnknownFailure);
+}
+
+/// Issue #455 / DR1-004: NoToolCall must survive message compaction. The
+/// compact pass only touches the messages Vec, but we explicitly pin this
+/// invariant so a future refactor cannot accidentally clear last_feedback.
+#[test]
+fn no_tool_call_preserved_after_compact() {
+    use anvil::session::compact::compact_messages;
+    let frame: FeedbackFrame = serde_json::from_str(r#"{"kind":"no_tool_call"}"#).unwrap();
+    let mut snapshot = SessionSnapshot::default();
+    snapshot.record_feedback(frame.clone());
+    snapshot.messages = (0..40)
+        .map(|index| ConversationMessage::user(format!("msg {index}")))
+        .collect();
+
+    let changed = compact_messages(&mut snapshot.messages, 10);
+    assert!(changed, "compact should run");
+    // last_feedback must still be NoToolCall.
+    assert_eq!(snapshot.last_feedback, Some(frame));
+}
+
 // --- Issue #451 (active_precautions) -----------------------------------------
 
 /// TDD step 1: Precaution serde roundtrip + Default values.

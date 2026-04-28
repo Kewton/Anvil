@@ -279,6 +279,42 @@ fn build_feedback_for_no_repo_progress(workspace_root: &Path) -> FeedbackFrame {
     build_feedback_frame(draft, workspace_root)
 }
 
+/// Issue #455 / D2 / DR1-002: subkind ("polish" / "quality" / ...) is
+/// intentionally NOT exposed via this helper because the AC regex
+/// (`(?i)deterministic|fallback|placeholder|scaffold|quality gate|repair|polish`)
+/// does not require it. Callers that need to distinguish in logs should
+/// use the surrounding `agent.*.fallback_applied` events.
+const DETERMINISTIC_CONTENT_FALLBACK_TAG: &str = "deterministic_content_fallback";
+
+/// Issue #455 / CB-001: FeedbackFrame for the no-tool-call exhaustion
+/// path (`no_tool_retries >= 3` in Act/repo-change exhaustion, or
+/// `>= 2` in answer-only inadequate-reply exhaustion).
+///
+/// `reason` MUST be a `&'static str` classifier — never raw user/assistant
+/// prose (DR4-001). `build_feedback_frame` masks anyway, but caller-side
+/// discipline keeps the prompt-injection surface narrow.
+fn build_feedback_for_no_tool_call(reason: &'static str, workspace_root: &Path) -> FeedbackFrame {
+    let draft = FeedbackFrameDraft {
+        kind: FeedbackKind::NoToolCall,
+        primary_error: Some(reason.to_string()),
+        ..Default::default()
+    };
+    build_feedback_frame(draft, workspace_root)
+}
+
+/// Issue #455 / CB-001 / D2: FeedbackFrame for a successful deterministic
+/// content fallback (polish / quality / nextjs scaffold / playable UI repair
+/// / timeout-after wrappers). Uses fixed `primary_error` tag (DR1-002) — no
+/// subkind argument to avoid fan-out.
+fn build_feedback_for_deterministic_content_fallback(workspace_root: &Path) -> FeedbackFrame {
+    let draft = FeedbackFrameDraft {
+        kind: FeedbackKind::ToolProtocolFailure,
+        primary_error: Some(DETERMINISTIC_CONTENT_FALLBACK_TAG.to_string()),
+        ..Default::default()
+    };
+    build_feedback_frame(draft, workspace_root)
+}
+
 /// CB2-002: decide whether the post-loop pass should record a
 /// `NoRepoProgress` FeedbackFrame for the just-finished turn.
 ///
@@ -1245,10 +1281,13 @@ impl Agent {
         let mut before_snapshot = capture_repo_snapshot(&self.work_root);
         let mut accumulated: Vec<RepoVerification> = Vec::new();
         let mut last_known_root = self.work_root.clone();
-        // CB-001: snapshot the previous turn's last_feedback at entry so the
-        // post-loop NoRepoProgress check can tell whether *this* turn already
-        // produced any FeedbackFrame.
-        let pre_turn_last_feedback = self.session.last_feedback.clone();
+        // Issue #455 / D4 / CB-001: clear the in-snapshot turn-scoped flag
+        // so first-eligible-failure-wins starts fresh on this turn. The
+        // flag lives on `SessionSnapshot` itself (`#[serde(skip)]`), is set
+        // by every `record_feedback`/`record_feedback_if_unset` that writes
+        // an eligible-kind frame, and is consulted by
+        // `record_feedback_if_unset` to decide skip-vs-overwrite.
+        self.session.reset_eligible_feedback_recorded_this_turn();
 
         let mut tool_calls_made_this_turn = 0usize;
         let mut repo_edit_calls_made_this_turn = 0usize;
@@ -1323,6 +1362,15 @@ impl Agent {
                                 self.footer.current_cols(),
                             ),
                             true,
+                        );
+                        // Issue #455 / D2: deterministic content fallback success.
+                        // Record a ToolProtocolFailure frame tagged
+                        // `deterministic_content_fallback` so the Reminder
+                        // Sidecar can hint the next turn to produce non-fallback
+                        // output. First-eligible-failure-wins guard (D4) keeps
+                        // earlier this-turn failure frames intact.
+                        self.session.record_feedback_if_unset(
+                            build_feedback_for_deterministic_content_fallback(&self.work_root),
                         );
                         final_prose = format!(
                             "Improved the requested playable UI with deterministic visual polish in {target_path}."
@@ -2012,6 +2060,10 @@ impl Agent {
                                 ),
                                 true,
                             );
+                            // Issue #455 / D2 (deterministic content fallback).
+                            self.session.record_feedback_if_unset(
+                                build_feedback_for_deterministic_content_fallback(&self.work_root),
+                            );
                             final_prose = format!(
                                 "Improved the requested playable UI with deterministic visual polish in {target_path}."
                             );
@@ -2045,6 +2097,10 @@ impl Agent {
                                     self.footer.current_cols(),
                                 ),
                                 true,
+                            );
+                            // Issue #455 / D2 (deterministic content fallback).
+                            self.session.record_feedback_if_unset(
+                                build_feedback_for_deterministic_content_fallback(&self.work_root),
                             );
                             final_prose = format!(
                                 "Implemented the requested playable UI by replacing scaffold placeholder output in {target_path}."
@@ -2082,6 +2138,10 @@ impl Agent {
                                     self.footer.current_cols(),
                                 ),
                                 true,
+                            );
+                            // Issue #455 / D2 (deterministic content fallback).
+                            self.session.record_feedback_if_unset(
+                                build_feedback_for_deterministic_content_fallback(&self.work_root),
                             );
                             final_prose = format!(
                                 "Implemented the requested playable UI by replacing scaffold placeholder output in {target_path}."
@@ -2365,6 +2425,16 @@ impl Agent {
                 } else {
                     no_tool_retries += 1;
                     if no_tool_retries >= 3 {
+                        // Issue #455 / D1: surface a NoToolCall FeedbackFrame
+                        // to the Reminder Sidecar via first-eligible-failure-wins
+                        // (D4) so the next turn carries an actionable precaution
+                        // about emitting concrete tool calls. `pre_turn_last_feedback`
+                        // is the snapshot captured at run_turn entry (DR4-002).
+                        self.session
+                            .record_feedback_if_unset(build_feedback_for_no_tool_call(
+                                "no_tool_retries_exhausted",
+                                &self.work_root,
+                            ));
                         exit_reason = ExitReason::NoToolCalls;
                         error_text = exit_reason.default_error_text().to_string();
                         break 'outer;
@@ -2524,6 +2594,16 @@ impl Agent {
             {
                 no_tool_retries += 1;
                 if no_tool_retries >= 2 {
+                    // Issue #455 / D1: answer-only inadequate reply exhaustion
+                    // also records NoToolCall — the model never produced a
+                    // concrete tool call. Recovery still completes via the
+                    // deterministic answer_only_fallback_response, but the
+                    // Reminder Sidecar should still see the failure pattern.
+                    self.session
+                        .record_feedback_if_unset(build_feedback_for_no_tool_call(
+                            "answer_only_inadequate_reply",
+                            &self.work_root,
+                        ));
                     final_prose = self.answer_only_fallback_response();
                     exit_reason = ExitReason::Done;
                     break 'outer;
@@ -2590,6 +2670,10 @@ impl Agent {
                                 self.footer.current_cols(),
                             ),
                             true,
+                        );
+                        // Issue #455 / D2 (deterministic content fallback).
+                        self.session.record_feedback_if_unset(
+                            build_feedback_for_deterministic_content_fallback(&self.work_root),
                         );
                         final_prose = format!(
                             "Implemented the requested playable UI by replacing scaffold placeholder output in {target_path}."
@@ -2713,10 +2797,14 @@ impl Agent {
         if should_record_no_repo_progress(
             repo_edit_calls_made_this_turn,
             final_verif.made_any_progress(),
-            self.session.last_feedback != pre_turn_last_feedback,
+            self.session.eligible_feedback_recorded_this_turn,
         ) {
+            // Issue #455 / D4: switch to first-eligible-failure-wins so a
+            // deterministic content fallback / NoToolCall frame recorded
+            // earlier in this turn is preserved over the post-loop
+            // NoRepoProgress signal.
             let frame = build_feedback_for_no_repo_progress(&self.work_root);
-            self.session.record_feedback(frame);
+            self.session.record_feedback_if_unset(frame);
         }
         let stats = build_stats(
             accumulated,
@@ -2759,13 +2847,16 @@ impl Agent {
                             // auto_test outcome (BuildPass / TestPass on
                             // success, CompileError / TestFailure / etc.
                             // on failure).
+                            // Issue #455 / D4: switch to first-eligible-failure-wins
+                            // so a deterministic content fallback / NoToolCall
+                            // frame from earlier in this turn is preserved.
                             let frame = build_feedback_for_auto_test(
                                 &plan,
                                 &result,
                                 &self.work_root,
                                 &stats.changed_files,
                             );
-                            self.session.record_feedback(frame);
+                            self.session.record_feedback_if_unset(frame);
                             if !result.passed {
                                 exit_reason = ExitReason::MissingRepoEdits;
                                 error_text = format!(
@@ -2783,8 +2874,9 @@ impl Agent {
                     }
                 } else {
                     // Issue #450: no auto_test plan detected -> NoVerifierAvailable.
+                    // Issue #455 / D4: first-eligible-failure-wins.
                     let frame = build_feedback_for_no_verifier(&self.work_root);
-                    self.session.record_feedback(frame);
+                    self.session.record_feedback_if_unset(frame);
                 }
             }
         }
@@ -2957,6 +3049,10 @@ impl Agent {
                         && let Some(reply) =
                             self.maybe_apply_deterministic_polish_fallback_after_timeout(&err)?
                     {
+                        // Issue #455 / D2: timeout-after polish fallback success.
+                        self.session.record_feedback_if_unset(
+                            build_feedback_for_deterministic_content_fallback(&self.work_root),
+                        );
                         return Ok(reply);
                     }
                     if err.to_ascii_lowercase().contains("timed out")
@@ -2965,6 +3061,10 @@ impl Agent {
                         if let Some(reply) =
                             self.maybe_apply_deterministic_quality_fallback_after_timeout(&err)?
                         {
+                            // Issue #455 / D2: timeout-after quality fallback success.
+                            self.session.record_feedback_if_unset(
+                                build_feedback_for_deterministic_content_fallback(&self.work_root),
+                            );
                             return Ok(reply);
                         }
                         let target_already_read = focused_edit_target_already_read(
@@ -9426,5 +9526,72 @@ export default function App() {
         let snap = snapshot_and_clear(&keys);
         assert!(!unicode_supported());
         restore(snap);
+    }
+
+    // --- Issue #455 / Task 3.1: CB-001 helpers --------------------------
+
+    /// Issue #455 / D1: NoToolCall helper sets kind and reason on the frame.
+    #[test]
+    fn build_feedback_for_no_tool_call_sets_kind_and_reason() {
+        let dir = tempdir().unwrap();
+        let frame = super::build_feedback_for_no_tool_call("no_tool_retries_exhausted", dir.path());
+        assert_eq!(
+            frame.kind,
+            crate::session::feedback::FeedbackKind::NoToolCall
+        );
+        assert_eq!(
+            frame.primary_error.as_deref(),
+            Some("no_tool_retries_exhausted")
+        );
+    }
+
+    /// Issue #455 / D2 / DR1-002: deterministic content fallback helper uses
+    /// the fixed `DETERMINISTIC_CONTENT_FALLBACK_TAG` const so the AC regex
+    /// (`(?i)deterministic|fallback|...`) can match the prompt text the
+    /// reminder LLM sees in `primary_error`.
+    #[test]
+    fn build_feedback_for_deterministic_content_fallback_uses_constant_tag() {
+        let dir = tempdir().unwrap();
+        let frame = super::build_feedback_for_deterministic_content_fallback(dir.path());
+        assert_eq!(
+            frame.kind,
+            crate::session::feedback::FeedbackKind::ToolProtocolFailure
+        );
+        assert_eq!(
+            frame.primary_error.as_deref(),
+            Some(super::DETERMINISTIC_CONTENT_FALLBACK_TAG)
+        );
+        assert_eq!(
+            super::DETERMINISTIC_CONTENT_FALLBACK_TAG,
+            "deterministic_content_fallback"
+        );
+    }
+
+    /// Issue #455 / DR4-001: even if a `&'static str` reason looked
+    /// secret-like (this should never happen in production — callers pass
+    /// classifiers only), the masking pass inside `build_feedback_frame`
+    /// still runs and removes the token. The test pins this behaviour so
+    /// future refactors of the helper cannot accidentally bypass mask.
+    #[test]
+    fn no_tool_call_reason_is_masked_when_secret_like() {
+        // We can't construct a fake `&'static str` containing a real key —
+        // promote it via Box::leak so it satisfies `&'static`. The literal
+        // pattern matches the AKIA token regex.
+        let leaked: &'static str = Box::leak(
+            "AKIAIOSFODNN7EXAMPLE leaked here"
+                .to_string()
+                .into_boxed_str(),
+        );
+        let dir = tempdir().unwrap();
+        let frame = super::build_feedback_for_no_tool_call(leaked, dir.path());
+        let masked = frame.primary_error.as_deref().unwrap_or("");
+        assert!(
+            !masked.contains("AKIAIOSFODNN7EXAMPLE"),
+            "primary_error leaked AKIA token: {masked}"
+        );
+        assert!(
+            masked.contains("***"),
+            "expected mask marker in primary_error: {masked}"
+        );
     }
 }
