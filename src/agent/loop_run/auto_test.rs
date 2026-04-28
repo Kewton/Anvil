@@ -9,6 +9,16 @@ use crate::session::feedback::FeedbackKind;
 /// auto_test path (Tester uses session/feedback excerpt cap instead).
 pub(super) const MAX_OUTPUT_BYTES: usize = 12_000;
 
+// Marker patterns shared between `classify_auto_test` and the count
+// heuristics introduced in #457. Keeping these as the SSOT prevents drift
+// where classification matches but counts return None (or vice versa).
+// Naming convention: `MARKER_<LANG>_<KIND>` (with `_<SCOPE>` suffix when
+// disambiguation is needed, e.g. `MARKER_PYTEST_FAILED_SUMMARY`).
+const MARKER_CARGO_COMPILE_ERROR: &str = "error[";
+const MARKER_NPM_TSC_ERROR: &str = "error ts";
+const MARKER_CARGO_TEST_FAILED: &str = "test result: failed";
+const MARKER_PYTEST_FAILED_SUMMARY: &str = " failed";
+
 /// Build vs Test classification for an auto_test plan. Used by the
 /// FeedbackFrame generator to decide between `BuildPass`/`TestPass` on
 /// success, and to refine `CompileError`/`TestFailure`/etc. on failure.
@@ -158,9 +168,9 @@ pub(super) fn classify_auto_test(plan: &AutoTestPlan, result: &AutoTestResult) -
     let lower = combined.to_ascii_lowercase();
 
     // Compile / build errors first.
-    if lower.contains("error[")
+    if lower.contains(MARKER_CARGO_COMPILE_ERROR)
         || lower.contains("could not compile")
-        || lower.contains("error ts")
+        || lower.contains(MARKER_NPM_TSC_ERROR)
         || lower.contains("syntaxerror")
         || lower.contains("syntax error")
     {
@@ -187,7 +197,7 @@ pub(super) fn classify_auto_test(plan: &AutoTestPlan, result: &AutoTestResult) -
     // Test failures (pytest / cargo test).
     if lower.contains("failed")
         || lower.contains("assert")
-        || lower.contains("test result: failed")
+        || lower.contains(MARKER_CARGO_TEST_FAILED)
         || lower.contains("failing")
     {
         return FeedbackKind::TestFailure;
@@ -210,6 +220,95 @@ fn combined_output_for_classify(result: &AutoTestResult) -> String {
     } else {
         result.output.clone()
     }
+}
+
+// Issue #457: heuristic count of compile errors observed in
+// `AutoTestResult.stdout` / `stderr`. Plan-agnostic by design (DR1-001 of
+// the design policy): the caller in turn.rs decides whether the count is
+// relevant for the current `AutoTestKind` × `passed` combination. Returns
+// `None` when no marker matches, when the count would overflow `i32::MAX`,
+// or when the result genuinely has no compile-error signal.
+pub(super) fn count_compile_errors(result: &AutoTestResult) -> Option<usize> {
+    let combined = combined_output_for_classify(result);
+    let lower = combined.to_ascii_lowercase();
+    let cargo = count_marker_lines(&lower, MARKER_CARGO_COMPILE_ERROR);
+    let npm = count_marker_lines(&lower, MARKER_NPM_TSC_ERROR);
+    let total = cargo.saturating_add(npm);
+    if total == 0 {
+        return None;
+    }
+    if total > i32::MAX as usize {
+        return None;
+    }
+    Some(total)
+}
+
+// Issue #457: heuristic count of test failures observed in
+// `AutoTestResult.stdout` / `stderr`. Recognises:
+// - cargo: `test result: FAILED. <pass> passed; <N> failed`
+// - pytest: `=== <N> failed, ... ===` summary line
+// Returns `None` when no recognised summary appears or parsing fails.
+pub(super) fn count_test_failures(result: &AutoTestResult) -> Option<usize> {
+    let combined = combined_output_for_classify(result);
+    let lower = combined.to_ascii_lowercase();
+
+    if let Some(n) = parse_cargo_failed(&lower) {
+        return cap_count(n);
+    }
+    if let Some(n) = parse_pytest_failed(&lower) {
+        return cap_count(n);
+    }
+    None
+}
+
+fn count_marker_lines(lower: &str, marker: &str) -> usize {
+    if marker.is_empty() {
+        return 0;
+    }
+    lower.lines().filter(|line| line.contains(marker)).count()
+}
+
+fn cap_count(n: usize) -> Option<usize> {
+    if n > i32::MAX as usize { None } else { Some(n) }
+}
+
+// Parse `test result: FAILED. <pass> passed; <N> failed` (cargo test).
+fn parse_cargo_failed(lower: &str) -> Option<usize> {
+    let idx = lower.find(MARKER_CARGO_TEST_FAILED)?;
+    let tail = &lower[idx..];
+    parse_first_failed_count(tail)
+}
+
+// Parse pytest summary `==== <N> failed[, ...] ====`.
+fn parse_pytest_failed(lower: &str) -> Option<usize> {
+    for line in lower.lines() {
+        let trimmed = line.trim_matches('=').trim();
+        if !trimmed.contains(MARKER_PYTEST_FAILED_SUMMARY.trim_start()) {
+            continue;
+        }
+        if let Some(n) = parse_first_failed_count(trimmed) {
+            return Some(n);
+        }
+    }
+    None
+}
+
+// Find a numeric token immediately preceding the literal `failed` in the
+// supplied text. Plan-agnostic and panic-free.
+fn parse_first_failed_count(text: &str) -> Option<usize> {
+    let needle = MARKER_PYTEST_FAILED_SUMMARY.trim_start();
+    let mut search_from = 0usize;
+    while let Some(rel) = text[search_from..].find(needle) {
+        let abs = search_from + rel;
+        let prefix = text[..abs].trim_end();
+        let digit_byte_count = prefix.bytes().rev().take_while(u8::is_ascii_digit).count();
+        let digits = &prefix[prefix.len() - digit_byte_count..];
+        if let Ok(n) = digits.parse::<usize>() {
+            return Some(n);
+        }
+        search_from = abs + needle.len();
+    }
+    None
 }
 
 fn detect_project_instruction_test(
@@ -664,5 +763,65 @@ mod tests {
     fn package_json_has_test_script_false_when_file_missing() {
         let dir = tempdir().expect("tempdir");
         assert!(!package_json_has_test_script(dir.path()));
+    }
+
+    // --- Issue #457: count_compile_errors / count_test_failures -----------
+
+    #[test]
+    fn count_compile_errors_cargo_returns_count() {
+        let plan = build_plan();
+        let stderr = "error[E0308]: mismatched types\n\
+                      error[E0382]: borrow of moved value\n\
+                      error: could not compile `crate`";
+        let result = make_result(&plan, false, "", stderr);
+        assert_eq!(count_compile_errors(&result), Some(2));
+    }
+
+    #[test]
+    fn count_compile_errors_npm_tsc_returns_count() {
+        let plan = AutoTestPlan {
+            command: "npm run build".to_string(),
+            reason: "build".to_string(),
+        };
+        let stdout = "src/a.ts(10,5): error TS2304: Cannot find name 'foo'.\n\
+                      src/b.ts(3,1): error TS1005: ',' expected.\n";
+        let result = make_result(&plan, false, &stdout.to_ascii_lowercase(), "");
+        assert_eq!(count_compile_errors(&result), Some(2));
+    }
+
+    #[test]
+    fn count_compile_errors_no_match_returns_none() {
+        let plan = pytest_plan();
+        let result = make_result(&plan, false, "everything fine\n", "");
+        assert_eq!(count_compile_errors(&result), None);
+    }
+
+    #[test]
+    fn count_test_failures_cargo_returns_count() {
+        let plan = cargo_plan();
+        let stdout = "running 5 tests\n\
+             test foo ... ok\n\
+             test bar ... FAILED\n\
+             test result: FAILED. 4 passed; 1 failed; 0 ignored\n";
+        let result = make_result(&plan, false, stdout, "");
+        assert_eq!(count_test_failures(&result), Some(1));
+    }
+
+    #[test]
+    fn count_test_failures_pytest_returns_count() {
+        let plan = pytest_plan();
+        let stdout = "============= test session starts =============\n\
+             FAILED tests/test_x.py::test_a - assert 1 == 2\n\
+             FAILED tests/test_x.py::test_b - assert 3 == 4\n\
+             ============= 2 failed, 5 passed in 1.23s ====\n";
+        let result = make_result(&plan, false, stdout, "");
+        assert_eq!(count_test_failures(&result), Some(2));
+    }
+
+    #[test]
+    fn count_test_failures_no_summary_returns_none() {
+        let plan = cargo_plan();
+        let result = make_result(&plan, false, "compile error nothing else", "");
+        assert_eq!(count_test_failures(&result), None);
     }
 }

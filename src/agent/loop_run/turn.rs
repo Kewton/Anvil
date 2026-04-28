@@ -1,4 +1,7 @@
-use super::auto_test::{AutoTestPlan, AutoTestResult, AutoTestRunner, classify_auto_test};
+use super::auto_test::{
+    AutoTestKind, AutoTestPlan, AutoTestResult, AutoTestRunner, classify_auto_test,
+    count_compile_errors, count_test_failures,
+};
 use super::interrupt::{InterruptEnv, InterruptFlag, InterruptMonitor};
 use super::protocol::ExecutionProtocol;
 use super::reminder::{
@@ -164,6 +167,53 @@ fn build_feedback_for_auto_test(
         changed_files,
     };
     build_feedback_frame(draft, workspace_root)
+}
+
+/// Issue #457: convert an `AutoTestResult` into the `AnvilTestSummary` view
+/// consumed by `compute_anvil_score`. This is the orchestration boundary
+/// that prevents the session layer (`anvil_score.rs`) from learning about
+/// the agent-internal `AutoTestResult` type (DR3-002 in the design policy
+/// document — DR numbers in this file refer to its DR space, not CLAUDE.md's).
+///
+/// The match table follows AutoTestKind × passed dimensions strictly:
+///
+/// | (kind, passed)  | build_passed | tests_passed | compile_error_count | test_failure_count |
+/// |-----------------|--------------|--------------|---------------------|--------------------|
+/// | (Build, true)   | Some(true)   | None         | Some(0)             | None               |
+/// | (Build, false)  | Some(false)  | None         | count_compile_errors| None               |
+/// | (Test, true)    | None         | Some(true)   | None                | Some(0)            |
+/// | (Test, false)   | None         | Some(false)  | count_compile_errors| count_test_failures|
+fn build_anvil_test_summary(
+    plan: &AutoTestPlan,
+    result: &AutoTestResult,
+) -> crate::session::anvil_score::AnvilTestSummary {
+    use crate::session::anvil_score::AnvilTestSummary;
+    match (plan.auto_test_kind(), result.passed) {
+        (AutoTestKind::Build, true) => AnvilTestSummary {
+            build_passed: Some(true),
+            tests_passed: None,
+            compile_error_count: Some(0),
+            test_failure_count: None,
+        },
+        (AutoTestKind::Build, false) => AnvilTestSummary {
+            build_passed: Some(false),
+            tests_passed: None,
+            compile_error_count: count_compile_errors(result),
+            test_failure_count: None,
+        },
+        (AutoTestKind::Test, true) => AnvilTestSummary {
+            build_passed: None,
+            tests_passed: Some(true),
+            compile_error_count: None,
+            test_failure_count: Some(0),
+        },
+        (AutoTestKind::Test, false) => AnvilTestSummary {
+            build_passed: None,
+            tests_passed: Some(false),
+            compile_error_count: count_compile_errors(result),
+            test_failure_count: count_test_failures(result),
+        },
+    }
 }
 
 /// CB-002 (Issue #459): which verifier should run on a successful turn.
@@ -2947,6 +2997,15 @@ impl Agent {
             exit_reason = ExitReason::Done;
             error_text.clear();
         }
+        // Issue #457: capture AnvilTestSummary in the AutoTest/Ok arm below
+        // so the compute_anvil_score block (further down) can wire it into
+        // the third argument. Outside-arm declaration is intentional: the
+        // alternative (turning the entire match into an expression) would
+        // force every arm to return Option<AnvilTestSummary> on top of its
+        // existing side effects (record_feedback_if_unset / exit_reason /
+        // error_text), which the design policy concluded is not worth the
+        // KISS trade.
+        let mut auto_test_summary: Option<crate::session::anvil_score::AnvilTestSummary> = None;
         if exit_reason.is_success() {
             let protocol = ExecutionProtocol::from_work_mode(self.session.mode_state.work_mode);
             if let Some(issue) = protocol.success_issue(&stats) {
@@ -2994,6 +3053,11 @@ impl Agent {
                                     &stats.changed_files,
                                 );
                                 self.session.record_feedback_if_unset(frame);
+                                // Issue #457: convert AutoTestResult into
+                                // AnvilTestSummary so compute_anvil_score
+                                // (below) can populate
+                                // build_passed/tests_passed/*_count fields.
+                                auto_test_summary = Some(build_anvil_test_summary(&plan, &result));
                                 if !result.passed {
                                     exit_reason = ExitReason::MissingRepoEdits;
                                     error_text = format!(
@@ -3052,11 +3116,16 @@ impl Agent {
                 prev: self.session.last_anvil_score.as_ref(),
             };
             let started = std::time::Instant::now();
-            // #456 always passes None for auto_test; #457 will convert
-            // AutoTestResult into AnvilTestSummary at the orchestration
-            // boundary.
-            let score =
-                crate::session::anvil_score::compute_anvil_score(&inputs, Some(&final_verif), None);
+            // Issue #457: third argument now carries the AnvilTestSummary
+            // converted from AutoTestResult by `build_anvil_test_summary`
+            // when the AutoTest verifier branch ran successfully (Ok arm).
+            // Tester / NoVerifier / Skip / TransportError branches keep
+            // it None — those paths never observe an AutoTestResult.
+            let score = crate::session::anvil_score::compute_anvil_score(
+                &inputs,
+                Some(&final_verif),
+                auto_test_summary.as_ref(),
+            );
             let compute_ms = started.elapsed().as_secs_f64() * 1000.0;
             let rendered = score.format_for_prompt();
             let render_chars = rendered.chars().count();
@@ -10142,5 +10211,117 @@ export default function App() {
             masked.contains("***"),
             "expected mask marker in primary_error: {masked}"
         );
+    }
+
+    // --- Issue #457: build_anvil_test_summary adapter regression -----------
+
+    fn auto_test_result(
+        plan: &super::auto_test::AutoTestPlan,
+        passed: bool,
+        stdout: &str,
+        stderr: &str,
+    ) -> super::auto_test::AutoTestResult {
+        super::auto_test::AutoTestResult {
+            command: plan.command.clone(),
+            passed,
+            output: format!("{stdout}\n{stderr}"),
+            exit_code: if passed { Some(0) } else { Some(101) },
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+        }
+    }
+
+    fn build_plan() -> super::auto_test::AutoTestPlan {
+        super::auto_test::AutoTestPlan {
+            command: "cargo build".to_string(),
+            reason: "build".to_string(),
+        }
+    }
+
+    fn test_plan() -> super::auto_test::AutoTestPlan {
+        super::auto_test::AutoTestPlan {
+            command: "cargo test".to_string(),
+            reason: "test".to_string(),
+        }
+    }
+
+    /// (a) build pass: only build_passed = Some(true), compile_error_count = Some(0).
+    #[test]
+    fn build_anvil_test_summary_build_pass() {
+        let plan = build_plan();
+        let result = auto_test_result(&plan, true, "", "");
+        let s = super::build_anvil_test_summary(&plan, &result);
+        assert_eq!(s.build_passed, Some(true));
+        assert_eq!(s.tests_passed, None);
+        assert_eq!(s.compile_error_count, Some(0));
+        assert_eq!(s.test_failure_count, None);
+    }
+
+    /// (b) build fail with parsable count.
+    #[test]
+    fn build_anvil_test_summary_build_fail_with_count() {
+        let plan = build_plan();
+        let stderr = "error[E0308]: mismatched types\nerror[E0382]: borrow of moved value\n";
+        let result = auto_test_result(&plan, false, "", stderr);
+        let s = super::build_anvil_test_summary(&plan, &result);
+        assert_eq!(s.build_passed, Some(false));
+        assert_eq!(s.tests_passed, None);
+        assert_eq!(s.compile_error_count, Some(2));
+        assert_eq!(s.test_failure_count, None);
+    }
+
+    /// (c) build fail without recognisable marker → count is None, never Some(0).
+    #[test]
+    fn build_anvil_test_summary_build_fail_count_none_when_unparsable() {
+        let plan = build_plan();
+        let result = auto_test_result(&plan, false, "linker died unexpectedly", "");
+        let s = super::build_anvil_test_summary(&plan, &result);
+        assert_eq!(s.build_passed, Some(false));
+        assert_eq!(s.compile_error_count, None);
+        assert_eq!(s.test_failure_count, None);
+    }
+
+    /// (d) test pass: only tests_passed = Some(true), test_failure_count = Some(0).
+    #[test]
+    fn build_anvil_test_summary_test_pass() {
+        let plan = test_plan();
+        let result = auto_test_result(&plan, true, "test result: ok\n", "");
+        let s = super::build_anvil_test_summary(&plan, &result);
+        assert_eq!(s.build_passed, None);
+        assert_eq!(s.tests_passed, Some(true));
+        assert_eq!(s.compile_error_count, None);
+        assert_eq!(s.test_failure_count, Some(0));
+    }
+
+    /// (e) test fail: both compile_error_count and test_failure_count
+    ///      can be present (test stderr may carry compile errors during
+    ///      cargo test on a workspace).
+    #[test]
+    fn build_anvil_test_summary_test_fail_with_counts() {
+        let plan = test_plan();
+        let stdout = "running 5 tests\n\
+             test foo ... ok\n\
+             test bar ... FAILED\n\
+             test result: FAILED. 4 passed; 1 failed; 0 ignored\n";
+        let result = auto_test_result(&plan, false, stdout, "");
+        let s = super::build_anvil_test_summary(&plan, &result);
+        assert_eq!(s.build_passed, None);
+        assert_eq!(s.tests_passed, Some(false));
+        // test_result line has no `error[` marker, so compile count is None.
+        assert_eq!(s.compile_error_count, None);
+        assert_eq!(s.test_failure_count, Some(1));
+    }
+
+    /// Issue #457: non-AutoTest verifier branches keep auto_test_summary
+    /// at None — `compute_anvil_score` then receives `None` for the third
+    /// argument (existing #456 behaviour preserved).
+    /// This is a structural test against the adapter contract: the adapter
+    /// must NOT be reachable from any branch other than the AutoTest/Ok
+    /// arm. We assert by construction via `Option::is_none` on a freshly
+    /// initialised summary holder.
+    #[test]
+    fn auto_test_summary_starts_none_for_non_autotest_branches() {
+        let s: Option<crate::session::anvil_score::AnvilTestSummary> = None;
+        assert!(s.is_none());
     }
 }

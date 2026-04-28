@@ -13,8 +13,10 @@
 //!   actually needs, so fixture tests don't have to instantiate the whole
 //!   `SessionSnapshot` (DR1-005 / DR2-010).
 //! - [`AnvilTestSummary`]: a thin view over `AutoTestResult`. #456 always
-//!   passes `None`; #457 will populate it from `auto_test::AutoTestResult`
-//!   without leaking the internal type into the session layer (DR3-002).
+//!   passed `None`; #457 wires `auto_test::AutoTestResult` into this view
+//!   via `build_anvil_test_summary` in `agent::loop_run::turn` so the
+//!   session layer never observes the internal `AutoTestResult` type
+//!   (DR3-002).
 //! - [`AnvilScoreSnapshot`]: a non-serde lifetime-tagged enum for Reminder
 //!   prompt injection that distinguishes the previous turn's persisted score
 //!   from the current turn's freshly computed one (DR1-006).
@@ -268,15 +270,17 @@ impl<'a> AnvilScoreSnapshot<'a> {
 ///
 /// Pure / deterministic / no I/O. fixture tests can call this directly. The
 /// caller (turn.rs) gathers inputs from `SessionSnapshot` / `RepoVerification`
-/// / (in #457) `AutoTestResult` and passes them in.
+/// / `AutoTestResult` (via `build_anvil_test_summary`) and passes them in.
 ///
 /// `repo` is `None` when this turn never ran `verify_repo_progress`; in that
 /// case all `*_files_changed` fields stay `None` (the absence is observable
 /// downstream rather than collapsed to `Some(0)`).
 ///
-/// `auto_test` is `None` for the entirety of #456 (the wire-up lands in
-/// #457). When `Some`, the four supplied fields populate the matching
-/// AnvilScore fields verbatim.
+/// `auto_test` is `None` for the `Tester` / `NoVerifier` / `Skip` /
+/// `TransportError` branches (no `AutoTestResult` was produced). When
+/// `Some`, the four supplied fields populate the matching AnvilScore fields
+/// verbatim. Wiring landed in #457 (`build_anvil_test_summary` adapter in
+/// `agent::loop_run::turn`).
 pub fn compute_anvil_score(
     inputs: &AnvilScoreInputs<'_>,
     repo: Option<&RepoVerification>,
