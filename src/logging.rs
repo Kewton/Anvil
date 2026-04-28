@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use tracing_subscriber::EnvFilter;
 
 use crate::config::LogLevel;
+use crate::session::feedback::mask_secrets;
 
 static LLM_IO_LOGGER: OnceLock<Mutex<File>> = OnceLock::new();
 static LLM_IO_LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
@@ -59,6 +60,9 @@ pub fn log_llm_event(event: &str, payload: Value) {
         return;
     };
 
+    let mut payload = payload;
+    mask_payload_inplace(&mut payload);
+
     let ts_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
@@ -71,5 +75,262 @@ pub fn log_llm_event(event: &str, payload: Value) {
 
     if let Ok(mut file) = logger.lock() {
         let _ = writeln!(file, "{record}");
+    }
+}
+
+/// Issue #461: Walk a `serde_json::Value` payload tree and mask secrets
+/// before it is written to `llm-io.jsonl`.
+///
+/// - `Value::String` leaves go through `mask_secrets` (the public API
+///   from `src/session/feedback.rs`) which catches token-prefix
+///   credentials, key=value secret pairs, and URL userinfo.
+/// - For `Value::Object`, any key matched by `is_secret_like_key` has its
+///   value replaced wholesale with `Value::String("***")` regardless of
+///   the original value type (DR4-003): this means an `api_key`
+///   carrying an object/array/number/bool/null is also redacted, at
+///   the cost of a localized schema break under those keys.
+/// - For non-secret keys we recurse, so e.g. an `arguments` object with
+///   nested string leaves still gets `mask_secrets` applied.
+/// - `Value::Array` recurses element-wise.
+/// - `Value::Number` / `Value::Bool` / `Value::Null` under non-secret
+///   keys are left untouched, preserving the existing jsonl schema for
+///   non-credential payloads.
+pub(crate) fn mask_payload_inplace(value: &mut Value) {
+    match value {
+        Value::String(s) => {
+            let masked = mask_secrets(s);
+            if &masked != s {
+                *s = masked;
+            }
+        }
+        Value::Object(map) => {
+            for (k, v) in map.iter_mut() {
+                if is_secret_like_key(k) {
+                    *v = Value::String("***".to_string());
+                } else {
+                    mask_payload_inplace(v);
+                }
+            }
+        }
+        Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                mask_payload_inplace(v);
+            }
+        }
+        Value::Number(_) | Value::Bool(_) | Value::Null => {}
+    }
+}
+
+/// Issue #461: Decide whether a JSON object key looks like an env var or
+/// payload field carrying a credential. We uppercase first then look for
+/// the canonical secret-name fragments, plus a `_KEY` / `_TOKEN` suffix
+/// rule. This is intentionally broader than the Issue AC's anchored
+/// alternation (`MY_API_KEY_BACKUP` is also caught) — we prefer over-mask
+/// over leaks (DR2-003).
+pub(crate) fn is_secret_like_key(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    if upper.contains("API_KEY")
+        || upper.contains("APIKEY")
+        || upper.contains("TOKEN")
+        || upper.contains("SECRET")
+        || upper.contains("PASSWORD")
+        || upper.contains("ACCESS_KEY")
+        || upper.contains("ACCESSKEY")
+        || upper.contains("CLIENT_SECRET")
+    {
+        return true;
+    }
+    upper.ends_with("_KEY") || upper.ends_with("_TOKEN")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_secret_like_key, mask_payload_inplace};
+    use serde_json::{Value, json};
+
+    // ---- is_secret_like_key boundary cases (DR1-006 / DR2-003) -----------
+
+    #[test]
+    fn is_secret_like_key_handles_canonical_names() {
+        assert!(is_secret_like_key("API_KEY"));
+        assert!(is_secret_like_key("api_key"));
+        assert!(is_secret_like_key("token"));
+        assert!(is_secret_like_key("Secret"));
+        assert!(is_secret_like_key("password"));
+        assert!(is_secret_like_key("ACCESS_KEY"));
+        assert!(is_secret_like_key("CLIENT_SECRET"));
+    }
+
+    #[test]
+    fn is_secret_like_key_handles_mixed_case_secret_keys() {
+        assert!(is_secret_like_key("Api_Key"));
+        assert!(is_secret_like_key("api_token"));
+        assert!(is_secret_like_key("StRiPe_Api_kEy"));
+    }
+
+    #[test]
+    fn is_secret_like_key_handles_compound_key_like_my_api_key_backup() {
+        // Over-mask (DR2-003): broader than the Issue AC's anchored
+        // alternation, intentional.
+        assert!(is_secret_like_key("MY_API_KEY_BACKUP"));
+        assert!(is_secret_like_key("STRIPE_API_KEY"));
+        assert!(is_secret_like_key("OAUTH_TOKEN_REFRESH"));
+    }
+
+    #[test]
+    fn is_secret_like_key_does_not_match_innocent_keys() {
+        assert!(!is_secret_like_key("note"));
+        assert!(!is_secret_like_key("event"));
+        assert!(!is_secret_like_key("ts_ms"));
+        assert!(!is_secret_like_key("payload"));
+        assert!(!is_secret_like_key("status"));
+    }
+
+    // ---- mask_payload_inplace recursion / type behavior (DR4-003) --------
+
+    #[test]
+    fn mask_payload_inplace_recursively_masks_string_leaf_in_object() {
+        let mut payload = json!({
+            "outer": {
+                "inner": "GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123",
+            }
+        });
+        mask_payload_inplace(&mut payload);
+        let masked = payload["outer"]["inner"].as_str().unwrap();
+        assert!(
+            !masked.contains("ghp_abcdefghijklmnopqrstuvwxyz0123"),
+            "got: {masked}"
+        );
+    }
+
+    #[test]
+    fn mask_payload_inplace_recursively_masks_string_leaf_in_array() {
+        let mut payload = json!({
+            "items": ["GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123", "ok"],
+        });
+        mask_payload_inplace(&mut payload);
+        let first = payload["items"][0].as_str().unwrap();
+        let second = payload["items"][1].as_str().unwrap();
+        assert!(!first.contains("ghp_abcdefghijklmnopqrstuvwxyz0123"));
+        assert_eq!(second, "ok");
+    }
+
+    #[test]
+    fn mask_payload_inplace_replaces_secret_key_value_with_stars() {
+        let mut payload = json!({
+            "api_key": "sk-proj-abcdefghijklmnopqrstuvwxyz",
+            "note": "Hello world",
+        });
+        mask_payload_inplace(&mut payload);
+        assert_eq!(payload["api_key"], Value::String("***".to_string()));
+        assert_eq!(payload["note"], Value::String("Hello world".to_string()));
+    }
+
+    /// DR4-003: secret-like key with a NON-string value (object / array /
+    /// number / bool / null) is also redacted to `***` to avoid leaking
+    /// structured credential data. The schema invariant says: secret-like
+    /// keys may now carry `Value::String("***")` regardless of original type.
+    #[test]
+    fn mask_payload_inplace_replaces_non_string_value_under_secret_key() {
+        let mut payload = json!({
+            "api_key": {"nested": "secret_object"},
+            "auth_token": [1, 2, 3],
+            "client_secret": 42,
+            "password": true,
+            "access_key": null,
+        });
+        mask_payload_inplace(&mut payload);
+        assert_eq!(payload["api_key"], Value::String("***".to_string()));
+        assert_eq!(payload["auth_token"], Value::String("***".to_string()));
+        assert_eq!(payload["client_secret"], Value::String("***".to_string()));
+        assert_eq!(payload["password"], Value::String("***".to_string()));
+        assert_eq!(payload["access_key"], Value::String("***".to_string()));
+    }
+
+    #[test]
+    fn mask_payload_inplace_preserves_number_bool_null_under_non_secret_keys() {
+        let mut payload = json!({
+            "count": 42,
+            "ok": true,
+            "missing": null,
+            "ratio": 1.5,
+        });
+        let before = payload.clone();
+        mask_payload_inplace(&mut payload);
+        assert_eq!(payload, before);
+    }
+
+    #[test]
+    fn mask_payload_inplace_does_not_mask_non_secret_key_value_pair() {
+        let mut payload = json!({
+            "note": "Hello world",
+            "summary": "ts_ms=1700000000",
+        });
+        let before = payload.clone();
+        mask_payload_inplace(&mut payload);
+        assert_eq!(payload, before);
+    }
+
+    #[test]
+    fn mask_payload_inplace_masks_value_in_inner_string_via_token_regex() {
+        // Non-secret-like key carrying a string with embedded
+        // `password=foo` — the recursive `mask_secrets` call must catch
+        // the `password=...` kv pattern even though the parent key isn't
+        // secret-like.
+        let mut payload = json!({
+            "summary": "user supplied password=hunter2 in arg",
+        });
+        mask_payload_inplace(&mut payload);
+        let s = payload["summary"].as_str().unwrap();
+        assert!(!s.contains("hunter2"), "got: {s}");
+        assert!(s.contains("***"));
+    }
+
+    #[test]
+    fn mask_payload_inplace_masks_compound_key_like_my_api_key_backup() {
+        let mut payload = json!({
+            "MY_API_KEY_BACKUP": "ghp_abcdefghijklmnopqrstuvwxyz0123",
+        });
+        mask_payload_inplace(&mut payload);
+        assert_eq!(
+            payload["MY_API_KEY_BACKUP"],
+            Value::String("***".to_string())
+        );
+    }
+
+    #[test]
+    fn mask_payload_inplace_preserves_existing_reminder_payload_key_set() {
+        // CLAUDE.md mentions `agent.reminder.{completed,failed,skipped}`
+        // payloads. We pin that the existing object structure under
+        // non-secret keys is preserved.
+        let mut payload = json!({
+            "completed": {
+                "iteration": 3,
+                "feedback_kind": "UnsafeCommandBlocked",
+                "duration_ms": 1234,
+            },
+            "skipped_reason": "no_recent_failure",
+        });
+        let before_keys: Vec<String> = payload
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        mask_payload_inplace(&mut payload);
+        let after_keys: Vec<String> = payload
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(before_keys, after_keys);
+        // Inner payloads' types are preserved.
+        assert_eq!(payload["completed"]["iteration"], json!(3));
+        assert_eq!(payload["completed"]["duration_ms"], json!(1234));
+        assert_eq!(
+            payload["completed"]["feedback_kind"].as_str().unwrap(),
+            "UnsafeCommandBlocked"
+        );
     }
 }

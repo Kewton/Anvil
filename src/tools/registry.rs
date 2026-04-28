@@ -94,6 +94,17 @@ impl ToolRegistry {
         arguments: &Value,
         context: &ToolContext,
     ) -> Result<String, String> {
+        // Issue #461 / DR3-002: For Bash, run preflight (typed `check_blocked_command`
+        // helper) before mode/scope/approval. This makes the dispatch behavior
+        // identical between `execute` and `execute_bash_with_outcome` (the agent
+        // layer entry point), and lets the user see the policy block reason
+        // before being asked to approve.
+        if name == "Bash"
+            && let Some(err) = preflight_bash_command(arguments)
+        {
+            return Err(err);
+        }
+
         enforce_mode(name, arguments, context)?;
         enforce_plan_stage_scope(name, arguments, context)?;
         maybe_confirm(name, arguments, context)?;
@@ -196,6 +207,24 @@ impl ToolRegistry {
         Result<String, (String, BashErrorClass)>,
         Option<BashExecutionOutcome>,
     ) {
+        // Issue #461 / DR3-001 / DR3-002 / DR2-004: command argument is the
+        // first thing we extract so the typed `check_blocked_command` preflight
+        // can run before mode/scope/approval checks. This means a `command`-
+        // missing call now returns `MissingArgument` before `ModeOrScopeDenied`
+        // (regression-pinned by `execute_bash_with_outcome_classifies_missing_argument_takes_precedence_over_mode`).
+        let command = match get_required_string(arguments, "command") {
+            Ok(c) => c,
+            Err(err) => return (Err((err, BashErrorClass::MissingArgument)), None),
+        };
+        if let Some(reason) = bash::check_blocked_command(command) {
+            return (
+                Err((
+                    bash::render_block_error(&reason),
+                    BashErrorClass::DangerousBlock,
+                )),
+                None,
+            );
+        }
         if let Err(err) = enforce_mode("Bash", arguments, context) {
             return (Err((err, BashErrorClass::ModeOrScopeDenied)), None);
         }
@@ -205,10 +234,6 @@ impl ToolRegistry {
         if let Err(err) = maybe_confirm("Bash", arguments, context) {
             return (Err((err, BashErrorClass::ApprovalDenied)), None);
         }
-        let command = match get_required_string(arguments, "command") {
-            Ok(c) => c,
-            Err(err) => return (Err((err, BashErrorClass::MissingArgument)), None),
-        };
         match bash::run_with_outcome(
             command,
             &context.root,
@@ -229,6 +254,19 @@ impl ToolRegistry {
             }
         }
     }
+}
+
+/// Issue #461 / DR3-002: Shared preflight for the `execute` Bash path.
+/// Returns `Some(err)` when the command should be blocked before any
+/// mode/scope/approval check runs. The error string is rendered via
+/// `bash::render_block_error` so it carries the `"blocked dangerous command
+/// fragment: …"` prefix and is mapped back to
+/// `BashErrorClass::DangerousBlock` by `classify_bash_dispatch_err` when
+/// the agent layer routes through `execute_bash_with_outcome`.
+fn preflight_bash_command(arguments: &Value) -> Option<String> {
+    let command = arguments.get("command")?.as_str()?;
+    let reason = bash::check_blocked_command(command)?;
+    Some(bash::render_block_error(&reason))
 }
 
 /// CB2-001: how a bash dispatch failed when no `BashExecutionOutcome` was
@@ -1505,5 +1543,129 @@ mod tests {
             .execute("Read", &json!({"path": "README.md"}), &ctx)
             .expect("Read must work even when Tester is active");
         assert!(out.contains("hello readme"));
+    }
+
+    // ---- Issue #461: shared preflight regression tests --------------
+
+    /// Issue #461: a new destructive pattern (`shutdown`) is blocked by
+    /// the shared preflight in `execute_bash_with_outcome` and surfaces
+    /// as `BashErrorClass::DangerousBlock`, even when approval would
+    /// otherwise be required.
+    #[test]
+    fn execute_bash_with_outcome_preflights_blocked_command_before_approval() {
+        use super::BashErrorClass;
+        let temp = tempdir().unwrap();
+        let registry = ToolRegistry::default();
+        let context = ToolContext {
+            root: temp.path().to_path_buf(),
+            mode: ExecutionMode::Act,
+            plan_path: None,
+            plan_stage: PlanStage::Stage1,
+            // auto_approve = false so that without the preflight the
+            // call would otherwise return ApprovalDenied. The preflight
+            // must run first and return DangerousBlock instead.
+            auto_approve: false,
+            interactive_approval: false,
+            offline: false,
+            cancel_flag: None,
+            tmp_tests_root: None,
+            tester_active: false,
+        };
+        let (text_result, outcome) =
+            registry.execute_bash_with_outcome(&json!({"command": "shutdown -h now"}), &context);
+        let (msg, class) = text_result.expect_err("shutdown must be blocked");
+        assert_eq!(class, BashErrorClass::DangerousBlock);
+        assert!(outcome.is_none());
+        assert!(
+            msg.starts_with("blocked dangerous command fragment: "),
+            "got: {msg}"
+        );
+        assert!(msg.contains("shutdown"));
+    }
+
+    /// Issue #461 / DR3-001: preflight signature contract — when the
+    /// preflight matches, the result is `Err((rendered, DangerousBlock))`
+    /// and the outcome is `None`.
+    #[test]
+    fn execute_bash_with_outcome_preflight_returns_dangerous_block_class_with_none_outcome() {
+        use super::BashErrorClass;
+        let temp = tempdir().unwrap();
+        let registry = ToolRegistry::default();
+        let context = ToolContext {
+            root: temp.path().to_path_buf(),
+            mode: ExecutionMode::Act,
+            plan_path: None,
+            plan_stage: PlanStage::Stage1,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            cancel_flag: None,
+            tmp_tests_root: None,
+            tester_active: false,
+        };
+        let (text_result, outcome) =
+            registry.execute_bash_with_outcome(&json!({"command": "iptables -F"}), &context);
+        let (_msg, class) = text_result.expect_err("iptables blocked");
+        assert_eq!(class, BashErrorClass::DangerousBlock);
+        assert!(outcome.is_none());
+    }
+
+    /// Issue #461 / DR3-002: `ToolRegistry::execute` Bash path also
+    /// rejects new destructive patterns via the same shared preflight
+    /// (no policy drift between `execute` and `execute_bash_with_outcome`).
+    #[test]
+    fn execute_bash_path_blocks_destructive_command() {
+        let temp = tempdir().unwrap();
+        let registry = ToolRegistry::default();
+        let context = ToolContext {
+            root: temp.path().to_path_buf(),
+            mode: ExecutionMode::Act,
+            plan_path: None,
+            plan_stage: PlanStage::Stage1,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            cancel_flag: None,
+            tmp_tests_root: None,
+            tester_active: false,
+        };
+        let err = registry
+            .execute("Bash", &json!({"command": "reboot"}), &context)
+            .expect_err("reboot blocked via execute path");
+        assert!(
+            err.starts_with("blocked dangerous command fragment: "),
+            "got: {err}"
+        );
+        assert!(err.contains("reboot"));
+    }
+
+    /// Issue #461 / DR2-004: preflight insertion moved `command` extraction
+    /// before mode/scope checks. A Plan-mode call missing the `command`
+    /// argument now returns `MissingArgument` first, not
+    /// `ModeOrScopeDenied`. This pin documents the intentional behavior.
+    #[test]
+    fn execute_bash_with_outcome_classifies_missing_argument_takes_precedence_over_mode() {
+        use super::BashErrorClass;
+        let temp = tempdir().unwrap();
+        let registry = ToolRegistry::default();
+        let context = ToolContext {
+            root: temp.path().to_path_buf(),
+            // Plan-mode would normally reject Bash dispatch with
+            // ModeOrScopeDenied, but the missing-argument path runs
+            // before mode/scope after Issue #461.
+            mode: ExecutionMode::Plan,
+            plan_path: None,
+            plan_stage: PlanStage::Stage1,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            cancel_flag: None,
+            tmp_tests_root: None,
+            tester_active: false,
+        };
+        let (text_result, outcome) = registry.execute_bash_with_outcome(&json!({}), &context);
+        let (_msg, class) = text_result.expect_err("missing command must error");
+        assert_eq!(class, BashErrorClass::MissingArgument);
+        assert!(outcome.is_none());
     }
 }

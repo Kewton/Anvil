@@ -995,6 +995,91 @@ mod tests {
         assert!(rendered.is_none(), "expected None, got {:?}", rendered);
     }
 
+    /// Issue #461 / DR3-003 / DR2-007 (Sidecar dedup): adding the same
+    /// `SafetyPolicy` precaution multiple times with deterministic text
+    /// must dedup via id-based blocking-duplicate detection so that
+    /// `MAX_ACTIVE_PRECAUTIONS=16` is never breached, and the same
+    /// pattern does not push other source precautions out of the cap.
+    /// The id derives from (canonicalized text, source, applies_to).
+    #[test]
+    fn safety_policy_precaution_dedups_by_id_under_repeated_add() {
+        let dir = tempdir().unwrap();
+        let mut wm = WorkingMemory::default();
+
+        // Pre-fill with 8 distinct non-SafetyPolicy precautions.
+        for i in 0..8 {
+            wm.add_precaution(
+                make_precaution(
+                    &format!("other-source-precaution-{i}"),
+                    Severity::Medium,
+                    PrecautionStatus::Active,
+                ),
+                dir.path(),
+            );
+        }
+        let baseline_active = wm
+            .active_precautions
+            .iter()
+            .filter(|p| p.status == PrecautionStatus::Active)
+            .count();
+        assert_eq!(baseline_active, 8);
+
+        // Now hammer the same SafetyPolicy precaution 50 times.
+        let safety_text = "blocked dangerous command fragment: shutdown (category=DangerousVerb)";
+        for _ in 0..50 {
+            let pre = Precaution {
+                id: String::new(), // recomputed by canonicalize_for_storage
+                source: PrecautionSource::SafetyPolicy,
+                severity: Severity::High,
+                text: safety_text.to_string(),
+                applies_to: Vec::new(),
+                status: PrecautionStatus::Active,
+                retired_reason: None,
+            };
+            let _ = wm.add_precaution(pre, dir.path());
+        }
+
+        // Cap not breached.
+        let total = wm.active_precautions.len();
+        assert!(
+            total <= WorkingMemory::MAX_ACTIVE_PRECAUTIONS,
+            "active precautions {total} exceeds MAX_ACTIVE_PRECAUTIONS"
+        );
+
+        // Original 8 non-SafetyPolicy precautions are still Active (not
+        // pushed out by the SafetyPolicy onslaught).
+        let other_active = wm
+            .active_precautions
+            .iter()
+            .filter(|p| {
+                p.status == PrecautionStatus::Active && p.source != PrecautionSource::SafetyPolicy
+            })
+            .count();
+        assert_eq!(
+            other_active,
+            8,
+            "the 8 non-SafetyPolicy active precautions must not be evicted: \
+             active = {:?}",
+            wm.active_precautions
+                .iter()
+                .map(|p| (&p.text, p.source, p.status))
+                .collect::<Vec<_>>()
+        );
+
+        // Exactly one SafetyPolicy entry remains Active (id dedup).
+        let safety_active = wm
+            .active_precautions
+            .iter()
+            .filter(|p| {
+                p.source == PrecautionSource::SafetyPolicy && p.status == PrecautionStatus::Active
+            })
+            .count();
+        assert_eq!(
+            safety_active, 1,
+            "deterministic-text SafetyPolicy precaution must dedup to 1 Active entry"
+        );
+    }
+
     #[test]
     fn format_for_prompt_with_precautions_renders_empty_section_when_other_fields_present() {
         // When other working-memory fields exist but no active precautions
