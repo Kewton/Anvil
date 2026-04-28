@@ -1239,9 +1239,8 @@ mod tests {
         let dir = tempdir().unwrap();
         // We don't actually run shutdown — `run_with_outcome` returns the
         // block error before spawning anything.
-        let err =
-            run_with_outcome("shutdown -h now", dir.path(), None, false, None, None)
-                .expect_err("blocked");
+        let err = run_with_outcome("shutdown -h now", dir.path(), None, false, None, None)
+            .expect_err("blocked");
         assert!(
             err.starts_with("blocked dangerous command fragment: "),
             "got: {err}"
