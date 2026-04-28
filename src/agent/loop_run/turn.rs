@@ -183,6 +183,27 @@ fn build_feedback_for_auto_test(
 /// | (Build, false)  | Some(false)  | None         | count_compile_errors| None               |
 /// | (Test, true)    | None         | Some(true)   | None                | Some(0)            |
 /// | (Test, false)   | None         | Some(false)  | count_compile_errors| count_test_failures|
+/// Issue #462: derive the `language_stack` Vec for `RepoFingerprint`.
+/// Reuses `auto_test::has_*` helpers (also in the agent layer) so DR3-002 —
+/// agent → session is one-way — is preserved: the session-layer
+/// `case_record::extract` accepts the slice as input rather than calling back.
+fn derive_language_stack(work_root: &std::path::Path) -> Vec<String> {
+    let mut stack: Vec<String> = Vec::new();
+    if super::auto_test::has_cargo_manifest(work_root) {
+        stack.push("rust".into());
+    }
+    if super::auto_test::package_json_has_test_script(work_root) {
+        stack.push("node".into());
+    }
+    if super::auto_test::has_python_surface(work_root, &[]) {
+        stack.push("python".into());
+    }
+    stack.iter_mut().for_each(|s| *s = s.to_ascii_lowercase());
+    stack.sort();
+    stack.dedup();
+    stack
+}
+
 fn build_anvil_test_summary(
     plan: &AutoTestPlan,
     result: &AutoTestResult,
@@ -1261,7 +1282,164 @@ impl Agent {
         self.run_turn(input, stream_output, &mut monitor)
     }
 
-    /// Issue #452: Reminder Sidecar hook. Called from two sites in
+    /// Issue #462: post-loop CaseRecord extraction. Pure success-condition,
+    /// scrub, and persist; never calls Ollama / sidecars. Per-turn cap is
+    /// `case_record_extracted_this_turn` on `SessionSnapshot` (cleared at
+    /// `run_turn` head). Failures are logged via `agent.case_record.failed`
+    /// and never propagate.
+    ///
+    /// DR3-002: gathers `verify_commands` from the agent layer (turn.rs)
+    /// and passes them into `case_record::extract` via a borrowed slice.
+    /// `language_stack` is derived here using `auto_test::has_*` helpers
+    /// (also agent-layer) for the same reason.
+    pub(super) fn maybe_extract_case_record(
+        &mut self,
+        stats: &crate::agent::loop_run::summary::LoopStats,
+        verify_commands: &[String],
+    ) {
+        use crate::session::case_record;
+
+        // Plan-mode gate: never extract in Plan mode.
+        if self.session.mode_state.mode == ExecutionMode::Plan {
+            return;
+        }
+        // Per-turn cap.
+        if self.session.case_record_extracted_this_turn {
+            return;
+        }
+        // Disable env.
+        if case_record::case_record_disabled(|k| std::env::var(k)) {
+            log_llm_event(
+                "agent.case_record.disabled",
+                serde_json::json!({
+                    "session_id": self.session_store.session_id(),
+                }),
+            );
+            self.session.case_record_extracted_this_turn = true;
+            return;
+        }
+
+        // Success condition (Issue #462 spec).
+        let Some(score) = self.session.last_anvil_score.as_ref() else {
+            // No AnvilScore computed for this turn (e.g., TransportError) — skip silently.
+            self.session.case_record_extracted_this_turn = true;
+            return;
+        };
+        let auto_test_active = score.build_passed.is_some() || score.tests_passed.is_some();
+        let success = if auto_test_active {
+            score.build_passed == Some(true)
+                && score.tests_passed == Some(true)
+                && score.user_visible_artifact
+                && score.consecutive_no_progress_turns == 0
+        } else {
+            self.session.repo_edit_succeeded_this_turn
+                && self.session.unsafe_blocks_this_turn == 0
+                && score.consecutive_no_progress_turns == 0
+        };
+        if !success {
+            self.session.case_record_extracted_this_turn = true;
+            return;
+        }
+
+        // language_stack derivation (agent layer; reuses `auto_test::has_*`).
+        let language_stack = derive_language_stack(&self.work_root);
+
+        // Build inputs.
+        let active_task = self.session.working_memory.active_task.clone();
+        let active_precautions: Vec<crate::session::precaution::Precaution> =
+            self.session.working_memory.active_precautions.to_vec();
+        // initial_feedback: take the kind of the latest recorded feedback as a
+        // single-item list (Issue Out of Scope: rich N-frame history is for
+        // CBR follow-up Issue).
+        let initial_feedback: Vec<crate::session::feedback::FeedbackKind> = self
+            .session
+            .last_feedback
+            .as_ref()
+            .map(|f| vec![f.kind.clone()])
+            .unwrap_or_default();
+        let workspace_key = self.session.workspace_key.clone();
+
+        let inputs = case_record::CaseRecordInputs {
+            workspace_key: &workspace_key,
+            work_root: &self.work_root,
+            active_task: active_task.as_deref(),
+            language_stack: &language_stack,
+            initial_feedback: &initial_feedback,
+            active_precautions: &active_precautions,
+            changed_files: &stats.changed_files,
+            verify_commands,
+            anvil_score: score,
+            repo_edit_succeeded_this_turn: self.session.repo_edit_succeeded_this_turn,
+            unsafe_blocks_this_turn: self.session.unsafe_blocks_this_turn,
+            auto_test_active,
+        };
+
+        let started = std::time::Instant::now();
+        let Some(record) = case_record::extract(&inputs) else {
+            log_llm_event(
+                "agent.case_record.skipped",
+                serde_json::json!({
+                    "session_id": self.session_store.session_id(),
+                    "reason": "extract_returned_none",
+                }),
+            );
+            self.session.case_record_extracted_this_turn = true;
+            return;
+        };
+
+        // Dry-run gate (DR3-002 / Issue): extract still runs so log payloads
+        // can confirm the would-be case_id.
+        if case_record::case_record_dry_run(|k| std::env::var(k)) {
+            log_llm_event(
+                "agent.case_record.skipped",
+                serde_json::json!({
+                    "session_id": self.session_store.session_id(),
+                    "reason": "dry_run",
+                    "case_id": record.case_id,
+                }),
+            );
+            self.session.case_record_extracted_this_turn = true;
+            return;
+        }
+
+        let state_root = self.session_store.state_root().to_path_buf();
+        match case_record::persist(&state_root, &record) {
+            Ok(bytes) => {
+                let compute_ms = started.elapsed().as_secs_f64() * 1000.0;
+                log_llm_event(
+                    "agent.case_record.extracted",
+                    serde_json::json!({
+                        "session_id": self.session_store.session_id(),
+                        "case_id": record.case_id,
+                        "bytes": bytes,
+                        "compute_ms": compute_ms,
+                    }),
+                );
+            }
+            Err(case_record::PersistError::TooLarge { bytes }) => {
+                log_llm_event(
+                    "agent.case_record.skipped",
+                    serde_json::json!({
+                        "session_id": self.session_store.session_id(),
+                        "reason": "too_large",
+                        "bytes": bytes,
+                    }),
+                );
+            }
+            Err(e) => {
+                log_llm_event(
+                    "agent.case_record.failed",
+                    serde_json::json!({
+                        "session_id": self.session_store.session_id(),
+                        "error": e.to_string(),
+                    }),
+                );
+            }
+        }
+        self.session.case_record_extracted_this_turn = true;
+    }
+
+    /// Issue #452: post-actor-loop hook for the Reminder Sidecar. Called from
     /// `run_actor_loop` (iteration-internal before compaction, and post-loop
     /// for NoRepoProgress / auto_test / NoVerifierAvailable). Per-turn cap
     /// (`reminder_called_this_turn`) is consumed only by Completed / Failed
@@ -1442,6 +1620,8 @@ impl Agent {
         self.session.repo_edit_succeeded_this_turn = false;
         self.session.touched_files_at_turn_start =
             self.session.working_memory.touched_files.clone();
+        // Issue #462: reset the per-turn CaseRecord extraction cap.
+        self.session.case_record_extracted_this_turn = false;
 
         let mut tool_calls_made_this_turn = 0usize;
         let mut repo_edit_calls_made_this_turn = 0usize;
@@ -3006,6 +3186,14 @@ impl Agent {
         // error_text), which the design policy concluded is not worth the
         // KISS trade.
         let mut auto_test_summary: Option<crate::session::anvil_score::AnvilTestSummary> = None;
+        // Issue #462: collect verifier commands as the verifier branches run,
+        // so the post-loop CaseRecord adapter can pass them into
+        // `case_record::extract` via `CaseRecordInputs.verify_commands`.
+        // Tester's `build_command` is internal to `try_invoke_tester` and is
+        // intentionally NOT plumbed here in this Issue (kept Out of Scope —
+        // see design policy §11-1). Only AutoTest's command lands in the Vec
+        // for now; Tester wiring is a fast-follow.
+        let mut verify_commands_collected: Vec<String> = Vec::new();
         if exit_reason.is_success() {
             let protocol = ExecutionProtocol::from_work_mode(self.session.mode_state.work_mode);
             if let Some(issue) = protocol.success_issue(&stats) {
@@ -3058,6 +3246,14 @@ impl Agent {
                                 // (below) can populate
                                 // build_passed/tests_passed/*_count fields.
                                 auto_test_summary = Some(build_anvil_test_summary(&plan, &result));
+                                // Issue #462: keep the actual executed command
+                                // so the post-loop CaseRecord adapter can
+                                // record it in `verify_commands` (DR3-002:
+                                // the agent layer collects, session layer
+                                // consumes a `&[String]` view).
+                                if !result.command.is_empty() {
+                                    verify_commands_collected.push(result.command.clone());
+                                }
                                 if !result.passed {
                                     exit_reason = ExitReason::MissingRepoEdits;
                                     error_text = format!(
@@ -3146,6 +3342,10 @@ impl Agent {
         // after the actor loop exited. Per-turn cap means this no-ops if the
         // iteration-internal hook already ran.
         self.maybe_invoke_reminder(&interrupt_flag);
+        // Issue #462: CaseRecord extraction (post-loop, after Reminder, before
+        // turn_completed event). Pure success-condition + scrub + persist; no
+        // sidecar / LLM calls. Failures are logged and never propagate.
+        self.maybe_extract_case_record(&stats, &verify_commands_collected);
         log_llm_event(
             "agent.milestone.turn_completed",
             serde_json::json!({

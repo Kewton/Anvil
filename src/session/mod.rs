@@ -1,4 +1,5 @@
 pub mod anvil_score;
+pub mod case_record;
 pub mod compact;
 pub mod discovery;
 pub mod feedback;
