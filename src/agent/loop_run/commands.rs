@@ -1576,6 +1576,92 @@ The plan must still define: (1) the first shippable vertical slice, (2) concrete
         ))))
     }
 
+    /// Resolve the per-session `tmp-tests/` directory under `state_root`.
+    /// `session_store.path()` points at `<state_root>/sessions/<id>/session.json`,
+    /// so the parent directory is the session root.
+    fn tmp_tests_root(&self) -> Result<PathBuf, String> {
+        self.session_store
+            .path()
+            .parent()
+            .map(|dir| dir.join("tmp-tests"))
+            .ok_or_else(|| "session path has no parent directory".to_string())
+    }
+
+    /// Dispatch `/tests` and its subcommands. Mirrors the
+    /// `anvil sessions tmp-tests {list,promote,discard}` CLI but calls the
+    /// `tmp_tests::*` lifecycle helpers directly so REPL operations bypass
+    /// the `ToolRegistry` `Write` path (and its `tester_active=true`
+    /// confinement) — see `src/session/tmp_tests.rs` for the SSOT.
+    fn handle_tests_command(&mut self, rest: &str) -> Result<AgentEvent, String> {
+        use crate::session::tmp_tests;
+
+        let tmp_tests_root = match self.tmp_tests_root() {
+            Ok(p) => p,
+            Err(err) => return Ok(AgentEvent::Continue(Some(format!("error: {err}")))),
+        };
+
+        let args: Vec<&str> = rest.split_whitespace().collect();
+        match args.as_slice() {
+            [] | ["list"] => {
+                let tests = match tmp_tests::list_tmp_tests(&tmp_tests_root) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        return Ok(AgentEvent::Continue(Some(format!("error: {err}"))));
+                    }
+                };
+                Ok(AgentEvent::Continue(Some(render_tests_list(&tests))))
+            }
+            ["promote", test_id] => self.run_tests_promote(&tmp_tests_root, test_id, false),
+            ["promote", test_id, "--force"] => {
+                self.run_tests_promote(&tmp_tests_root, test_id, true)
+            }
+            ["discard", test_id] => match tmp_tests::discard_tmp_test(&tmp_tests_root, test_id) {
+                Ok(()) => Ok(AgentEvent::Continue(Some(format!("discarded {test_id}")))),
+                Err(err) => Ok(AgentEvent::Continue(Some(format!("error: {err}")))),
+            },
+            _ => Ok(AgentEvent::Continue(Some(tests_usage().to_string()))),
+        }
+    }
+
+    /// Promote a tmp-test to the workspace tree. Plan mode is rejected up
+    /// front because promote writes a regular file to `work_root`.
+    /// `auto_approve` follows `config.yes_mode` (matches the `/yes` UX);
+    /// `interactive_approval=true` is fixed because the REPL is always
+    /// interactive when this code runs.
+    fn run_tests_promote(
+        &self,
+        tmp_tests_root: &Path,
+        test_id: &str,
+        force: bool,
+    ) -> Result<AgentEvent, String> {
+        use crate::session::tmp_tests;
+
+        if self.session.mode_state.mode == ExecutionMode::Plan {
+            return Ok(AgentEvent::Continue(Some(
+                "Plan mode disallows /tests promote (use /approve to enter Act mode first)"
+                    .to_string(),
+            )));
+        }
+
+        let auto_approve = self.config.yes_mode;
+        let interactive_approval = true;
+
+        match tmp_tests::promote_tmp_test(
+            &self.work_root,
+            tmp_tests_root,
+            test_id,
+            force,
+            auto_approve,
+            interactive_approval,
+        ) {
+            Ok(dst) => Ok(AgentEvent::Continue(Some(format!(
+                "promoted {test_id} -> {}",
+                dst.display()
+            )))),
+            Err(err) => Ok(AgentEvent::Continue(Some(format!("error: {err}")))),
+        }
+    }
+
     fn handle_command(&mut self, input: &str) -> Result<AgentEvent, String> {
         let (command, rest) = input.split_once(' ').unwrap_or((input, ""));
         match command {
@@ -1668,6 +1754,7 @@ The plan must still define: (1) the first shippable vertical slice, (2) concrete
                 }
             }
             "/precautions" => self.handle_precautions_command(rest),
+            "/tests" => self.handle_tests_command(rest),
             "/checkpoint" | "/rollback" | "/watch" | "/autotest" | "/skills" | "/skill"
             | "/mcp" | "/parallel" => Ok(AgentEvent::Continue(Some(format!(
                 "{command} is unavailable in the v0.1.0 core rebuild"
@@ -1682,6 +1769,43 @@ The plan must still define: (1) the first shippable vertical slice, (2) concrete
 
 fn precautions_usage() -> &'static str {
     "usage: /precautions [add <text>|retire <id>|clear]"
+}
+
+fn tests_usage() -> &'static str {
+    "usage: /tests [list] | /tests promote <id> [--force] | /tests discard <id>"
+}
+
+/// Format the result of `tmp_tests::list_tmp_tests` for REPL display. The
+/// header / column layout is byte-identical to the
+/// `anvil sessions tmp-tests list` CLI handler (see
+/// `src/session/sessions_cli.rs::run_tmp_tests_list`) so muscle memory carries
+/// across the two surfaces.
+fn render_tests_list(tests: &[crate::session::tmp_tests::TmpTest]) -> String {
+    use crate::session::tmp_tests::TmpTestStatus;
+
+    if tests.is_empty() {
+        return "no tmp-tests found".to_string();
+    }
+
+    let mut output = String::from(
+        "ID                                              STATUS     CREATED_AT  RELATIVE_PATH",
+    );
+    for t in tests {
+        let status = match t.status {
+            TmpTestStatus::Draft => "draft",
+            TmpTestStatus::Promoted => "promoted",
+            TmpTestStatus::Discarded => "discarded",
+        };
+        output.push('\n');
+        output.push_str(&format!(
+            "{id:48} {status:<10} {ts:<10} {rel}",
+            id = t.id,
+            status = status,
+            ts = t.created_at,
+            rel = t.relative_path.display(),
+        ));
+    }
+    output
 }
 
 fn precaution_id12(id: &str) -> String {

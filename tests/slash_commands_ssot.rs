@@ -32,7 +32,7 @@ fn help_line_matches_slash_commands() {
 }
 
 #[test]
-fn slash_commands_contains_expected_11() {
+fn slash_commands_contains_expected_12() {
     assert_eq!(
         SLASH_COMMANDS,
         &[
@@ -46,6 +46,7 @@ fn slash_commands_contains_expected_11() {
             "/compact",
             "/logs",
             "/precautions",
+            "/tests",
             "/exit",
         ]
     );
