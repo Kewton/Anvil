@@ -24,6 +24,36 @@ pub struct ToolContext {
     /// not yet bound (CLI startup, unit tests); the prefix is then rejected
     /// rather than flowing to the workspace root.
     pub tmp_tests_root: Option<std::path::PathBuf>,
+    /// Issue #459 / DR1-014: while a Tester turn is in flight, Edit/Write
+    /// must only target the session-scoped `tmp-tests/` namespace. The
+    /// registry enforces this at dispatch time via
+    /// [`ToolContext::enforce_tmp_tests_only_when_active`] before the raw
+    /// path is resolved (keeping the check on the raw `tmp-tests/<rel>`
+    /// prefix rather than the post-resolution absolute path).
+    pub tester_active: bool,
+}
+
+impl ToolContext {
+    /// Issue #459 / DR1-014: when `tester_active` is true, reject any
+    /// Edit/Write whose raw path is not under the `tmp-tests/` prefix.
+    /// The check runs on the raw textual prefix (DR3-002) so it must be
+    /// invoked before `resolve_tmp_tests_path` — after resolution the
+    /// path becomes the absolute session-scoped form
+    /// (`<state_root>/sessions/<id>/tmp-tests/files/<rel>`) and a textual
+    /// `tmp-tests/` prefix check would falsely reject valid writes.
+    ///
+    /// `tester_active = false` is a no-op so the existing tool dispatch
+    /// path is unchanged for non-Tester turns.
+    pub fn enforce_tmp_tests_only_when_active(&self, path: &std::path::Path) -> Result<(), String> {
+        if !self.tester_active {
+            return Ok(());
+        }
+        let as_str = path.to_string_lossy();
+        if as_str.starts_with("tmp-tests/") {
+            return Ok(());
+        }
+        Err("Tester Skill 起動中は tmp-tests/ 以外への Edit/Write は拒否されます".to_string())
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -106,11 +136,13 @@ impl ToolRegistry {
                 read::run(&path, start_line, end_line)
             }
             "Write" => {
-                let path = resolve_write_path(
-                    &context.root,
-                    get_required_string(arguments, "path")?,
-                    context,
-                )?;
+                let raw_path = get_required_string(arguments, "path")?;
+                // Issue #459 / DR1-014 / DR3-002: enforce on the raw textual
+                // path BEFORE `resolve_write_path` — after `resolve_tmp_tests_path`
+                // resolves to the absolute session-scoped form, the textual
+                // `tmp-tests/` prefix is gone.
+                context.enforce_tmp_tests_only_when_active(std::path::Path::new(raw_path))?;
+                let path = resolve_write_path(&context.root, raw_path, context)?;
                 let content = get_required_string(arguments, "content")?;
                 if let Some(merged) =
                     plan_mode_merged_plan_contents("Write", &path, arguments, context)?
@@ -121,11 +153,10 @@ impl ToolRegistry {
                 }
             }
             "Edit" => {
-                let path = resolve_write_path(
-                    &context.root,
-                    get_required_string(arguments, "path")?,
-                    context,
-                )?;
+                let raw_path = get_required_string(arguments, "path")?;
+                // Issue #459 / DR1-014 / DR3-002: see Write branch above.
+                context.enforce_tmp_tests_only_when_active(std::path::Path::new(raw_path))?;
+                let path = resolve_write_path(&context.root, raw_path, context)?;
                 let old = get_required_string(arguments, "old_string")?;
                 let new = get_required_string(arguments, "new_string")?;
                 let replace_all = arguments
@@ -208,6 +239,13 @@ impl ToolRegistry {
             &context.root,
             context.cancel_flag.as_ref(),
             context.offline,
+            // Issue #459: only the Tester smoke runner sets an explicit
+            // timeout; the regular registry-driven Bash path keeps the
+            // existing `likely_long_running_command` heuristic.
+            None,
+            // CB-003: registry-driven Bash inherits the parent env (existing
+            // behaviour). Tester's smoke runner sets `TesterSanitized`.
+            None,
         ) {
             Ok((text, outcome)) => (Ok(text), Some(outcome)),
             Err(err) => {
@@ -873,6 +911,7 @@ mod tests {
             offline: false,
             cancel_flag: None,
             tmp_tests_root: None,
+            tester_active: false,
         };
         let out = registry
             .execute(
@@ -915,6 +954,7 @@ mod tests {
             offline: false,
             cancel_flag: None,
             tmp_tests_root: None,
+            tester_active: false,
         };
         let err = enforce_plan_stage_scope(
             "Write",
@@ -947,6 +987,7 @@ mod tests {
             offline: false,
             cancel_flag: None,
             tmp_tests_root: None,
+            tester_active: false,
         };
         enforce_plan_stage_scope(
             "Edit",
@@ -983,6 +1024,7 @@ mod tests {
             offline: false,
             cancel_flag: None,
             tmp_tests_root: None,
+            tester_active: false,
         };
         ToolRegistry::default()
             .execute(
@@ -1024,6 +1066,7 @@ mod tests {
             offline: false,
             cancel_flag: None,
             tmp_tests_root: None,
+            tester_active: false,
         };
         ToolRegistry::default()
             .execute(
@@ -1063,6 +1106,7 @@ mod tests {
             offline: false,
             cancel_flag: None,
             tmp_tests_root: None,
+            tester_active: false,
         };
         let (text_result, outcome) =
             registry.execute_bash_with_outcome(&json!({"command": "printf hello"}), &context);
@@ -1091,6 +1135,7 @@ mod tests {
             offline: false,
             cancel_flag: None,
             tmp_tests_root: None,
+            tester_active: false,
         };
         let (text_result, outcome) =
             registry.execute_bash_with_outcome(&json!({"command": "rm -rf /"}), &context);
@@ -1117,6 +1162,7 @@ mod tests {
             offline: false,
             cancel_flag: None,
             tmp_tests_root: None,
+            tester_active: false,
         };
         let (text_result, outcome) = registry.execute_bash_with_outcome(&json!({}), &context);
         let (_msg, class) = text_result.expect_err("missing command must error");
@@ -1141,6 +1187,7 @@ mod tests {
             offline: false,
             cancel_flag: None,
             tmp_tests_root: None,
+            tester_active: false,
         };
         let (text_result, outcome) =
             registry.execute_bash_with_outcome(&json!({"command": "ls"}), &context);
@@ -1166,6 +1213,7 @@ mod tests {
             offline: true,
             cancel_flag: None,
             tmp_tests_root: None,
+            tester_active: false,
         };
         let (text_result, outcome) =
             registry.execute_bash_with_outcome(&json!({"command": "curl example.com"}), &context);
@@ -1191,6 +1239,7 @@ mod tests {
             offline: false,
             cancel_flag: None,
             tmp_tests_root: None,
+            tester_active: false,
         };
         let (text_result, outcome) =
             registry.execute_bash_with_outcome(&json!({"command": "ls"}), &context);
@@ -1215,6 +1264,7 @@ mod tests {
             offline: false,
             cancel_flag: None,
             tmp_tests_root: tmp_tests_root.map(|p| p.to_path_buf()),
+            tester_active: false,
         }
     }
 
@@ -1288,6 +1338,7 @@ mod tests {
             offline: false,
             cancel_flag: None,
             tmp_tests_root: Some(tmp_tests.clone()),
+            tester_active: false,
         };
         registry
             .execute(
@@ -1319,6 +1370,7 @@ mod tests {
             offline: false,
             cancel_flag: None,
             tmp_tests_root: None,
+            tester_active: false,
         };
         let err = registry
             .execute(
@@ -1349,11 +1401,148 @@ mod tests {
             offline: false,
             cancel_flag: None,
             tmp_tests_root: Some(tmp_tests),
+            tester_active: false,
         };
         let out = registry
             .execute("Read", &json!({"path": "tmp-tests/src/foo.rs"}), &context)
             .unwrap();
         assert!(out.contains("hello tmp"), "got: {out}");
+    }
+
+    // ----- Issue #459: tester_active path confinement ---------------------
+
+    fn act_context_with_tester(
+        root: &std::path::Path,
+        tmp_tests_root: &std::path::Path,
+        tester_active: bool,
+    ) -> ToolContext {
+        ToolContext {
+            root: root.to_path_buf(),
+            mode: ExecutionMode::Act,
+            plan_path: None,
+            plan_stage: PlanStage::Stage1,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            cancel_flag: None,
+            tmp_tests_root: Some(tmp_tests_root.to_path_buf()),
+            tester_active,
+        }
+    }
+
+    /// `tester_active = true` rejects an Edit/Write whose raw path is not
+    /// under `tmp-tests/`.
+    #[test]
+    fn enforce_tmp_tests_only_when_active_rejects_workspace_path() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let tmp_tests = temp.path().join("tmp-tests");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let ctx = act_context_with_tester(&workspace, &tmp_tests, true);
+        let err = ctx
+            .enforce_tmp_tests_only_when_active(std::path::Path::new("src/foo.rs"))
+            .unwrap_err();
+        assert!(err.contains("tmp-tests/"), "got: {err}");
+    }
+
+    /// `tester_active = true` accepts an Edit/Write under `tmp-tests/<rel>`.
+    #[test]
+    fn enforce_tmp_tests_only_when_active_accepts_tmp_tests_prefix() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let tmp_tests = temp.path().join("tmp-tests");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let ctx = act_context_with_tester(&workspace, &tmp_tests, true);
+        ctx.enforce_tmp_tests_only_when_active(std::path::Path::new("tmp-tests/files/smoke.rs"))
+            .expect("tmp-tests prefix must be accepted while Tester is active");
+    }
+
+    /// `tester_active = false` is a no-op even for non-tmp-tests paths,
+    /// preserving existing behaviour for normal turns.
+    #[test]
+    fn enforce_tmp_tests_only_when_active_noop_when_inactive() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let tmp_tests = temp.path().join("tmp-tests");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let ctx = act_context_with_tester(&workspace, &tmp_tests, false);
+        ctx.enforce_tmp_tests_only_when_active(std::path::Path::new("src/foo.rs"))
+            .expect("inactive Tester must not block normal writes");
+    }
+
+    /// End-to-end: with `tester_active = true`, `registry.execute("Write", …)`
+    /// rejects a non-`tmp-tests/` path before it even resolves the path.
+    #[test]
+    fn execute_write_rejects_non_tmp_tests_when_tester_active() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let tmp_tests = temp.path().join("tmp-tests");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let registry = ToolRegistry::default();
+        let ctx = act_context_with_tester(&workspace, &tmp_tests, true);
+        let err = registry
+            .execute(
+                "Write",
+                &json!({"path": "src/foo.rs", "content": "x"}),
+                &ctx,
+            )
+            .unwrap_err();
+        assert!(err.contains("tmp-tests/"), "got: {err}");
+        // workspace must remain clean (no file leaked through dispatch).
+        assert!(!workspace.join("src/foo.rs").exists());
+    }
+
+    /// End-to-end: with `tester_active = true`, `registry.execute("Write", …)`
+    /// still routes a `tmp-tests/<rel>` write to the session-scoped files
+    /// root via `resolve_tmp_tests_path`.
+    #[test]
+    fn execute_write_allows_tmp_tests_prefix_when_tester_active() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let tmp_tests = temp.path().join("state/tmp-tests");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let registry = ToolRegistry::default();
+        let ctx = act_context_with_tester(&workspace, &tmp_tests, true);
+        registry
+            .execute(
+                "Write",
+                &json!({
+                    "path": "tmp-tests/smoke.rs",
+                    "content": "#[test] fn smoke() {}",
+                }),
+                &ctx,
+            )
+            .expect("tmp-tests/<rel> must succeed while Tester is active");
+        // Resolved into <tmp_tests>/files/<rel>. macOS prefixes /var with
+        // /private during canonicalization, so compare via canonicalize.
+        let expected = std::fs::canonicalize(tmp_tests.join("files"))
+            .unwrap()
+            .join("smoke.rs");
+        assert!(
+            expected.is_file(),
+            "expected {} to exist after Write",
+            expected.display()
+        );
+        // Workspace untouched.
+        assert!(!workspace.join("smoke.rs").exists());
+    }
+
+    /// `Read` is unaffected by `tester_active`: the confinement is for
+    /// Edit/Write only (Tester still needs to read repo state to construct
+    /// its smoke prompt).
+    #[test]
+    fn execute_read_unaffected_by_tester_active() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let tmp_tests = temp.path().join("tmp-tests");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("README.md"), b"hello readme").unwrap();
+        let registry = ToolRegistry::default();
+        let ctx = act_context_with_tester(&workspace, &tmp_tests, true);
+        let out = registry
+            .execute("Read", &json!({"path": "README.md"}), &ctx)
+            .expect("Read must work even when Tester is active");
+        assert!(out.contains("hello readme"));
     }
 
     // ---- Issue #461: shared preflight regression tests --------------
@@ -1380,6 +1569,7 @@ mod tests {
             offline: false,
             cancel_flag: None,
             tmp_tests_root: None,
+            tester_active: false,
         };
         let (text_result, outcome) =
             registry.execute_bash_with_outcome(&json!({"command": "shutdown -h now"}), &context);
@@ -1411,6 +1601,7 @@ mod tests {
             offline: false,
             cancel_flag: None,
             tmp_tests_root: None,
+            tester_active: false,
         };
         let (text_result, outcome) =
             registry.execute_bash_with_outcome(&json!({"command": "iptables -F"}), &context);
@@ -1436,6 +1627,7 @@ mod tests {
             offline: false,
             cancel_flag: None,
             tmp_tests_root: None,
+            tester_active: false,
         };
         let err = registry
             .execute("Bash", &json!({"command": "reboot"}), &context)
@@ -1469,6 +1661,7 @@ mod tests {
             offline: false,
             cancel_flag: None,
             tmp_tests_root: None,
+            tester_active: false,
         };
         let (text_result, outcome) = registry.execute_bash_with_outcome(&json!({}), &context);
         let (_msg, class) = text_result.expect_err("missing command must error");
