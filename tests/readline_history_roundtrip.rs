@@ -5,9 +5,26 @@
 //! history_ignore_space / helper wiring).
 
 use anvil::agent::loop_run::slash_commands::build_editor;
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
+/// Serialize every test in this binary that touches `append_history` /
+/// `tempfile::tempdir()`. rustyline 14's `History::save()`
+/// (`rustyline-14.0.0/src/history.rs:685-697`) flips the **process-global**
+/// umask to `0o0177` non-atomically around `File::create`. If a parallel test
+/// thread runs `tempdir()` (which `mkdir`s with mode `0o700`) inside that
+/// window, the new directory ends up `0o0700 & ~0o0177 == 0o0600` — missing
+/// the user execute bit — and any subsequent file open inside it fails with
+/// `EACCES`. See Issue #443.
+static UMASK_SERIAL: Mutex<()> = Mutex::new(());
+
+fn serial_lock() -> MutexGuard<'static, ()> {
+    // Recover from a prior test's panic so one failure doesn't cascade.
+    UMASK_SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 #[test]
 fn history_roundtrip_via_append_and_load() {
+    let _serial = serial_lock();
     let tmp = tempfile::tempdir().unwrap();
     let history = tmp.path().join("history");
 
@@ -39,6 +56,7 @@ fn history_roundtrip_via_append_and_load() {
 /// (`history_ignore_space_skips_sensitive_line`).
 #[test]
 fn history_ignore_space_opt_out() {
+    let _serial = serial_lock();
     let tmp = tempfile::tempdir().unwrap();
     let history = tmp.path().join("history");
 
@@ -79,6 +97,7 @@ fn history_ignore_space_opt_out() {
 fn history_file_mode_is_0o600() {
     use std::os::unix::fs::PermissionsExt;
 
+    let _serial = serial_lock();
     let tmp = tempfile::tempdir().unwrap();
     let history = tmp.path().join("history");
 
@@ -109,6 +128,7 @@ fn history_file_mode_is_0o600() {
 /// (`history_load_tolerates_missing_file`).
 #[test]
 fn load_history_missing_file_is_ok() {
+    let _serial = serial_lock();
     let tmp = tempfile::tempdir().unwrap();
     let history = tmp.path().join("does-not-exist");
     let mut ed = build_editor().expect("build_editor must succeed");

@@ -118,6 +118,13 @@ pub fn run_cli(args: CliArgs) -> Result<(), String> {
     // missing active_root or resume a deleted plan.md.
     reconcile_resume_state(&mut session, &config.cwd);
 
+    // session.json is user-editable; re-apply add_precaution canonicalization
+    // (raw cap / mask / truncate / path normalize / id / unknown-status) to
+    // any precautions deserialized from disk. Issue #451 design judgment #14.
+    session
+        .working_memory
+        .sanitize_active_precautions_after_load(&config.cwd);
+
     let is_resume = config.resume.is_some();
     let is_oneshot = config.oneshot;
     let model_banner = format_model_banner(&models);

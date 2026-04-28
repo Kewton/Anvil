@@ -10,7 +10,10 @@ use crate::config::LogLevel;
 use crate::logging::log_llm_event;
 use crate::modes::plan_act::{PlanStage, TaskProfile, infer_work_mode_from_text};
 use crate::ollama::xml_fallback::strip_think_tags;
-use crate::session::store::ConversationMessage;
+use crate::session::precaution::{
+    AddPrecautionOutcome, Precaution, PrecautionSource, PrecautionStatus, Severity,
+};
+use crate::session::store::{ConversationMessage, WorkingMemory};
 use crossterm::event::{self, Event, KeyCode};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use serde::Deserialize;
@@ -1422,8 +1425,159 @@ The plan must still define: (1) the first shippable vertical slice, (2) concrete
         }
     }
 
+    fn handle_precautions_command(&mut self, args: &str) -> Result<AgentEvent, String> {
+        let args = args.trim();
+        let (subcommand, rest) = args
+            .split_once(' ')
+            .map(|(command, rest)| (command, rest.trim()))
+            .unwrap_or((args, ""));
+
+        match subcommand {
+            "" => self.precautions_list(),
+            "add" if rest.is_empty() => Ok(AgentEvent::Continue(Some(
+                "usage: /precautions add <text>".to_string(),
+            ))),
+            "add" => self.precautions_add(rest),
+            "retire" if rest.is_empty() => Ok(AgentEvent::Continue(Some(
+                "usage: /precautions retire <id>".to_string(),
+            ))),
+            "retire" => self.precautions_retire(rest),
+            "clear" if rest.is_empty() => self.precautions_clear(),
+            "clear" => Ok(AgentEvent::Continue(Some(precautions_usage().to_string()))),
+            _ => Ok(AgentEvent::Continue(Some(precautions_usage().to_string()))),
+        }
+    }
+
+    fn precautions_list(&self) -> Result<AgentEvent, String> {
+        let lines: Vec<String> = self
+            .session
+            .working_memory
+            .active_precautions
+            .iter()
+            .filter(|precaution| precaution.status == PrecautionStatus::Active)
+            .map(|precaution| {
+                format!(
+                    "{}  [{}]  [{}]  {}",
+                    precaution_id12(&precaution.id),
+                    precaution.severity.as_label(),
+                    precaution.source.as_label(),
+                    precaution.text
+                )
+            })
+            .collect();
+
+        let message = if lines.is_empty() {
+            "(no active precautions)".to_string()
+        } else {
+            lines.join("\n")
+        };
+        Ok(AgentEvent::Continue(Some(message)))
+    }
+
+    fn precautions_add(&mut self, text: &str) -> Result<AgentEvent, String> {
+        let precaution = Precaution {
+            id: String::new(),
+            source: PrecautionSource::Manual,
+            severity: Severity::Medium,
+            text: text.to_string(),
+            applies_to: Vec::new(),
+            status: PrecautionStatus::Active,
+            retired_reason: None,
+        };
+
+        let canonical = canonical_preview_precaution(precaution.clone(), &self.work_root)?;
+        let outcome = self
+            .session
+            .working_memory
+            .add_precaution(precaution, &self.work_root);
+        let id12 = precaution_id12(&canonical.id);
+
+        let message = match outcome {
+            AddPrecautionOutcome::Added => {
+                format!("added precaution: {id12}  {}", canonical.text)
+            }
+            AddPrecautionOutcome::DuplicateIgnored => format!("duplicate ignored: {id12}"),
+            AddPrecautionOutcome::Truncated => format!(
+                "added precaution (truncated to {} chars): {id12}  {}",
+                WorkingMemory::MAX_PRECAUTION_TEXT,
+                canonical.text
+            ),
+        };
+        Ok(AgentEvent::Continue(Some(message)))
+    }
+
+    fn precautions_retire(&mut self, id_prefix: &str) -> Result<AgentEvent, String> {
+        let given = id_prefix.to_ascii_lowercase();
+        if !is_valid_precaution_id_prefix(&given) {
+            return Ok(AgentEvent::Continue(Some(format!(
+                "precaution not found: {given}"
+            ))));
+        }
+
+        let matches: Vec<String> = self
+            .session
+            .working_memory
+            .active_precautions
+            .iter()
+            .filter(|precaution| {
+                matches!(
+                    precaution.status,
+                    PrecautionStatus::Active | PrecautionStatus::Resolved
+                ) && precaution.id.starts_with(&given)
+            })
+            .map(|precaution| precaution.id.clone())
+            .collect();
+
+        match matches.as_slice() {
+            [] => Ok(AgentEvent::Continue(Some(format!(
+                "precaution not found: {given}"
+            )))),
+            [_, _, ..] => Ok(AgentEvent::Continue(Some(format!(
+                "ambiguous id prefix: {given}; matches {} entries",
+                matches.len()
+            )))),
+            [id] => {
+                if self.session.working_memory.retire_precaution(id) {
+                    Ok(AgentEvent::Continue(Some(format!(
+                        "retired: {}",
+                        precaution_id12(id)
+                    ))))
+                } else {
+                    Ok(AgentEvent::Continue(Some(format!(
+                        "precaution not found: {given}"
+                    ))))
+                }
+            }
+        }
+    }
+
+    fn precautions_clear(&mut self) -> Result<AgentEvent, String> {
+        if !self.config.yes_mode {
+            return Ok(AgentEvent::Continue(Some(
+                "refused: enable /yes or retire individually".to_string(),
+            )));
+        }
+
+        let ids: Vec<String> = self
+            .session
+            .working_memory
+            .active_precautions
+            .iter()
+            .filter(|precaution| precaution.status == PrecautionStatus::Active)
+            .map(|precaution| precaution.id.clone())
+            .collect();
+        let retired = ids
+            .iter()
+            .filter(|id| self.session.working_memory.retire_precaution(id))
+            .count();
+
+        Ok(AgentEvent::Continue(Some(format!(
+            "retired {retired} precautions"
+        ))))
+    }
+
     fn handle_command(&mut self, input: &str) -> Result<AgentEvent, String> {
-        let (command, _) = input.split_once(' ').unwrap_or((input, ""));
+        let (command, rest) = input.split_once(' ').unwrap_or((input, ""));
         match command {
             "/help" => Ok(AgentEvent::Continue(Some(slash_commands::help_line()))),
             "/status" => Ok(AgentEvent::Continue(Some(format!(
@@ -1513,6 +1667,7 @@ The plan must still define: (1) the first shippable vertical slice, (2) concrete
                     ))),
                 }
             }
+            "/precautions" => self.handle_precautions_command(rest),
             "/checkpoint" | "/rollback" | "/watch" | "/autotest" | "/skills" | "/skill"
             | "/mcp" | "/parallel" => Ok(AgentEvent::Continue(Some(format!(
                 "{command} is unavailable in the v0.1.0 core rebuild"
@@ -1523,6 +1678,31 @@ The plan must still define: (1) the first shippable vertical slice, (2) concrete
             )))),
         }
     }
+}
+
+fn precautions_usage() -> &'static str {
+    "usage: /precautions [add <text>|retire <id>|clear]"
+}
+
+fn precaution_id12(id: &str) -> String {
+    id.get(..12).unwrap_or(id).to_string()
+}
+
+fn is_valid_precaution_id_prefix(id: &str) -> bool {
+    id.len() == 12 && id.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn canonical_preview_precaution(
+    precaution: Precaution,
+    work_root: &Path,
+) -> Result<Precaution, String> {
+    let mut preview = WorkingMemory::default();
+    let _ = preview.add_precaution(precaution, work_root);
+    preview
+        .active_precautions
+        .into_iter()
+        .next()
+        .ok_or_else(|| "failed to canonicalize precaution".to_string())
 }
 
 fn should_render_fallback_prompt(stdout_is_tty: bool) -> bool {
@@ -1584,9 +1764,15 @@ fn tighten_history_perms(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::loop_run::FooterHandle;
+    use crate::config::Config;
+    use crate::model_registry::RuntimeModels;
     use crate::modes::plan_act::ExecutionMode;
+    use crate::ollama::client::OllamaClient;
+    use crate::session::store::{SessionSnapshot, SessionStore};
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
+    use tempfile::{TempDir, tempdir};
 
     /// Serialize env-mutating tests within this module so `cargo test`'s
     /// default parallel runner cannot race on `NO_COLOR`.
@@ -1641,6 +1827,212 @@ mod tests {
 
     fn sample_mode() -> ExecutionMode {
         ExecutionMode::Act
+    }
+
+    fn test_agent(yes_mode: bool) -> (Agent, TempDir) {
+        let temp = tempdir().unwrap();
+        let state_root = temp.path().join(".anvil-state");
+        let session_id = "0199fe00-0000-7000-8000-000000000454";
+        let workspace_key = "test-workspace";
+        let config = Config {
+            cwd: temp.path().to_path_buf(),
+            requested_model: Some("test-model".to_string()),
+            ollama_host: "http://127.0.0.1:11434".to_string(),
+            yes_mode,
+            state_dir_override: Some(state_root.clone()),
+            ..Config::default()
+        };
+        let client = OllamaClient::new(config.ollama_host.clone()).unwrap();
+        let session = SessionSnapshot {
+            id: session_id.to_string(),
+            workspace_key: workspace_key.to_string(),
+            ..SessionSnapshot::default()
+        };
+        let agent = Agent::new(
+            config,
+            RuntimeModels {
+                main: "test-model".to_string(),
+                sidecar: None,
+            },
+            client,
+            SessionStore::new(&state_root, session_id, workspace_key),
+            session,
+            FooterHandle::disabled(),
+        );
+        (agent, temp)
+    }
+
+    fn continue_message(event: AgentEvent) -> String {
+        match event {
+            AgentEvent::Continue(Some(message)) => message,
+            AgentEvent::Continue(None) => panic!("expected message, got Continue(None)"),
+            AgentEvent::Exit => panic!("expected Continue, got Exit"),
+        }
+    }
+
+    fn active_precautions_prompt(agent: &Agent) -> Option<String> {
+        let selected = select_precautions_for_prompt(
+            &agent.session.working_memory.active_precautions,
+            ExecutionMode::Act,
+            &agent.session.working_memory.touched_files,
+            None,
+        );
+        agent
+            .session
+            .working_memory
+            .format_for_prompt_with_precautions(&selected)
+    }
+
+    #[test]
+    fn precautions_command_add_list_retire_updates_prompt() {
+        let (mut agent, _temp) = test_agent(false);
+        let add = continue_message(
+            agent
+                .handle_precautions_command("add Do not modify generated files")
+                .unwrap(),
+        );
+        let id12 = precaution_id12(&agent.session.working_memory.active_precautions[0].id);
+        assert!(add.contains("added precaution"));
+        assert!(add.contains(&id12));
+        assert!(add.contains("Do not modify generated files"));
+
+        let list = continue_message(agent.handle_precautions_command("").unwrap());
+        assert!(list.contains(&id12), "{list}");
+        assert!(list.contains("[medium]"), "{list}");
+        assert!(list.contains("[manual]"), "{list}");
+        assert!(list.contains("Do not modify generated files"), "{list}");
+
+        let prompt = active_precautions_prompt(&agent).expect("prompt should render");
+        assert!(prompt.contains("Active Precautions:"), "{prompt}");
+        assert!(
+            prompt.contains("- [medium] Do not modify generated files"),
+            "{prompt}"
+        );
+
+        let retire = continue_message(
+            agent
+                .handle_precautions_command(&format!("retire {id12}"))
+                .unwrap(),
+        );
+        assert_eq!(retire, format!("retired: {id12}"));
+        let prompt_after = active_precautions_prompt(&agent);
+        assert!(
+            prompt_after
+                .as_deref()
+                .is_none_or(|body| !body.contains("Active Precautions:")),
+            "{prompt_after:?}"
+        );
+    }
+
+    #[test]
+    fn precautions_add_message_uses_canonicalized_text() {
+        let (mut agent, _temp) = test_agent(false);
+        let raw = "Do not leak AKIAIOSFODNN7EXAMPLE\u{1b}[31m";
+
+        let message = continue_message(
+            agent
+                .handle_precautions_command(&format!("add {raw}"))
+                .unwrap(),
+        );
+
+        assert!(!message.contains("AKIAIOSFODNN7EXAMPLE"), "{message}");
+        assert!(!message.contains('\u{1b}'), "{message:?}");
+        assert!(message.contains("***"), "{message}");
+    }
+
+    #[test]
+    fn precautions_retire_rejects_invalid_prefixes() {
+        let (mut agent, _temp) = test_agent(false);
+        continue_message(agent.handle_precautions_command("add keep this").unwrap());
+        let id = agent.session.working_memory.active_precautions[0]
+            .id
+            .clone();
+
+        let full_hash = continue_message(
+            agent
+                .handle_precautions_command(&format!("retire {id}"))
+                .unwrap(),
+        );
+        assert_eq!(full_hash, format!("precaution not found: {id}"));
+
+        let invalid = continue_message(
+            agent
+                .handle_precautions_command("retire not-hex-id!")
+                .unwrap(),
+        );
+        assert_eq!(invalid, "precaution not found: not-hex-id!");
+        assert_eq!(
+            agent.session.working_memory.active_precautions[0].status,
+            PrecautionStatus::Active
+        );
+    }
+
+    #[test]
+    fn precautions_clear_requires_yes_and_rejects_extra_args() {
+        let (mut agent, _temp) = test_agent(false);
+        continue_message(agent.handle_precautions_command("add clear me").unwrap());
+
+        let refused = continue_message(agent.handle_precautions_command("clear").unwrap());
+        assert_eq!(refused, "refused: enable /yes or retire individually");
+        assert_eq!(
+            agent.session.working_memory.active_precautions[0].status,
+            PrecautionStatus::Active
+        );
+
+        agent.config.yes_mode = true;
+        let usage = continue_message(agent.handle_precautions_command("clear now").unwrap());
+        assert_eq!(usage, precautions_usage());
+        assert_eq!(
+            agent.session.working_memory.active_precautions[0].status,
+            PrecautionStatus::Active
+        );
+
+        let cleared = continue_message(agent.handle_precautions_command("clear").unwrap());
+        assert_eq!(cleared, "retired 1 precautions");
+        assert_eq!(
+            agent.session.working_memory.active_precautions[0].status,
+            PrecautionStatus::Retired
+        );
+    }
+
+    #[test]
+    fn precautions_retire_ambiguous_prefix_does_not_change_entries() {
+        let (mut agent, _temp) = test_agent(false);
+        let prefix = "abcdef123456";
+        for suffix in ["0000", "1111"] {
+            agent
+                .session
+                .working_memory
+                .active_precautions
+                .push(Precaution {
+                    id: format!("{prefix}{suffix}7890abcdef1234567890abcdef1234567890abcdef123456"),
+                    source: PrecautionSource::Manual,
+                    severity: Severity::Medium,
+                    text: format!("entry {suffix}"),
+                    applies_to: Vec::new(),
+                    status: PrecautionStatus::Active,
+                    retired_reason: None,
+                });
+        }
+
+        let message = continue_message(
+            agent
+                .handle_precautions_command(&format!("retire {prefix}"))
+                .unwrap(),
+        );
+
+        assert_eq!(
+            message,
+            "ambiguous id prefix: abcdef123456; matches 2 entries"
+        );
+        assert!(
+            agent
+                .session
+                .working_memory
+                .active_precautions
+                .iter()
+                .all(|precaution| precaution.status == PrecautionStatus::Active)
+        );
     }
 
     fn build_inputs<'a>(

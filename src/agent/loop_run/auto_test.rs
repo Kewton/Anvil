@@ -2,8 +2,18 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::agent::prompting::load_project_instructions;
+use crate::session::feedback::FeedbackKind;
 
 const MAX_OUTPUT_BYTES: usize = 12_000;
+
+/// Build vs Test classification for an auto_test plan. Used by the
+/// FeedbackFrame generator to decide between `BuildPass`/`TestPass` on
+/// success, and to refine `CompileError`/`TestFailure`/etc. on failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AutoTestKind {
+    Build,
+    Test,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct AutoTestPlan {
@@ -11,11 +21,37 @@ pub(super) struct AutoTestPlan {
     pub reason: String,
 }
 
+impl AutoTestPlan {
+    pub(super) fn auto_test_kind(&self) -> AutoTestKind {
+        infer_auto_test_kind(&self.command)
+    }
+}
+
+fn infer_auto_test_kind(command: &str) -> AutoTestKind {
+    let lower = command.trim().to_ascii_lowercase();
+    if lower.starts_with("cargo build")
+        || lower.starts_with("npm run build")
+        || lower.starts_with("pnpm build")
+        || lower.starts_with("yarn build")
+        || lower.starts_with("python3 -m py_compile")
+        || lower.starts_with("python -m py_compile")
+        || lower.starts_with("make build")
+        || lower.starts_with("cargo check")
+    {
+        AutoTestKind::Build
+    } else {
+        AutoTestKind::Test
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct AutoTestResult {
     pub command: String,
     pub passed: bool,
     pub output: String,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -80,19 +116,96 @@ impl AutoTestRunner {
             .stdin(Stdio::null())
             .output()
             .map_err(|err| format!("failed to run auto test command: {err}"))?;
+        // Always lossy-decode: invalid UTF-8 must not panic FeedbackFrame
+        // creation downstream (Issue #450 / R5).
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         let mut combined = String::new();
-        combined.push_str(&String::from_utf8_lossy(&output.stdout));
-        if !output.stderr.is_empty() {
+        combined.push_str(&stdout);
+        if !stderr.is_empty() {
             if !combined.is_empty() {
                 combined.push('\n');
             }
-            combined.push_str(&String::from_utf8_lossy(&output.stderr));
+            combined.push_str(&stderr);
         }
         Ok(AutoTestResult {
             command: plan.command.clone(),
             passed: output.status.success(),
             output: truncate(&combined, MAX_OUTPUT_BYTES),
+            exit_code: output.status.code(),
+            stdout,
+            stderr,
         })
+    }
+}
+
+/// Classify an auto_test outcome into the appropriate `FeedbackKind`.
+/// This is a pure function over the plan + result text, separated so
+/// AC1/AC2 (Issue #450) can be tested without spawning processes.
+pub(super) fn classify_auto_test(plan: &AutoTestPlan, result: &AutoTestResult) -> FeedbackKind {
+    if result.passed {
+        return match plan.auto_test_kind() {
+            AutoTestKind::Build => FeedbackKind::BuildPass,
+            AutoTestKind::Test => FeedbackKind::TestPass,
+        };
+    }
+
+    // Failure: look at output for category-specific markers.
+    let combined = combined_output_for_classify(result);
+    let lower = combined.to_ascii_lowercase();
+
+    // Compile / build errors first.
+    if lower.contains("error[")
+        || lower.contains("could not compile")
+        || lower.contains("error ts")
+        || lower.contains("syntaxerror")
+        || lower.contains("syntax error")
+    {
+        return FeedbackKind::CompileError;
+    }
+
+    // Type errors (mypy / pyright / tsc).
+    if (lower.contains("error: ") && lower.contains("incompatible types"))
+        || lower.contains("error: argument") && lower.contains("incompatible type")
+        || lower.contains("type error")
+        || lower.contains("typeerror:")
+    {
+        return FeedbackKind::TypeError;
+    }
+
+    // Lint failures (clippy / eslint / ruff).
+    if lower.contains("clippy::")
+        || (lower.contains("eslint") && lower.contains("error"))
+        || lower.contains("ruff")
+    {
+        return FeedbackKind::LintFailure;
+    }
+
+    // Test failures (pytest / cargo test).
+    if lower.contains("failed")
+        || lower.contains("assert")
+        || lower.contains("test result: failed")
+        || lower.contains("failing")
+    {
+        return FeedbackKind::TestFailure;
+    }
+
+    FeedbackKind::UnknownFailure
+}
+
+fn combined_output_for_classify(result: &AutoTestResult) -> String {
+    if !result.stdout.is_empty() || !result.stderr.is_empty() {
+        let mut s = String::new();
+        s.push_str(&result.stdout);
+        if !result.stderr.is_empty() {
+            if !s.is_empty() {
+                s.push('\n');
+            }
+            s.push_str(&result.stderr);
+        }
+        s
+    } else {
+        result.output.clone()
     }
 }
 
@@ -258,5 +371,123 @@ mod tests {
         let plan = AutoTestRunner::detect(dir.path(), &["tool.py".to_string()]);
         assert!(plan.is_some());
         assert_ne!(plan.unwrap().command, "rm -rf .");
+    }
+
+    // --- Issue #450 AC1 / AC2 / NoVerifierAvailable -----------------------
+
+    fn cargo_plan() -> AutoTestPlan {
+        AutoTestPlan {
+            command: "cargo test".to_string(),
+            reason: "test".to_string(),
+        }
+    }
+
+    fn pytest_plan() -> AutoTestPlan {
+        AutoTestPlan {
+            command: "python3 -m pytest".to_string(),
+            reason: "test".to_string(),
+        }
+    }
+
+    fn build_plan() -> AutoTestPlan {
+        AutoTestPlan {
+            command: "cargo build".to_string(),
+            reason: "build".to_string(),
+        }
+    }
+
+    fn make_result(
+        plan: &AutoTestPlan,
+        passed: bool,
+        stdout: &str,
+        stderr: &str,
+    ) -> AutoTestResult {
+        AutoTestResult {
+            command: plan.command.clone(),
+            passed,
+            output: format!("{stdout}\n{stderr}"),
+            exit_code: if passed { Some(0) } else { Some(101) },
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+        }
+    }
+
+    /// AC1: cargo compile error output classifies as `CompileError`.
+    #[test]
+    fn compile_error_classified_as_compile_error() {
+        let plan = cargo_plan();
+        let stderr = "error[E0308]: mismatched types\nerror: could not compile `crate` due to previous error";
+        let result = make_result(&plan, false, "", stderr);
+        assert_eq!(
+            classify_auto_test(&plan, &result),
+            FeedbackKind::CompileError
+        );
+    }
+
+    /// AC2: pytest assertion failure classifies as `TestFailure`.
+    #[test]
+    fn pytest_assertion_classified_as_test_failure() {
+        let plan = pytest_plan();
+        let stdout = "============= test session starts =============\nFAILED tests/test_x.py::test_a - assert 1 == 2\n";
+        let result = make_result(&plan, false, stdout, "");
+        assert_eq!(
+            classify_auto_test(&plan, &result),
+            FeedbackKind::TestFailure
+        );
+    }
+
+    #[test]
+    fn build_pass_classified() {
+        let plan = build_plan();
+        let result = make_result(&plan, true, "", "");
+        assert_eq!(classify_auto_test(&plan, &result), FeedbackKind::BuildPass);
+    }
+
+    #[test]
+    fn test_pass_classified() {
+        let plan = cargo_plan();
+        let result = make_result(&plan, true, "test result: ok\n", "");
+        assert_eq!(classify_auto_test(&plan, &result), FeedbackKind::TestPass);
+    }
+
+    /// `AutoTestRunner::detect` returning None plus
+    /// `should_run_auto_test_for_success() == true` is the source signal
+    /// for `NoVerifierAvailable`. The classification is performed in
+    /// turn.rs but the input — `detect` returning None — is what we
+    /// guarantee here.
+    #[test]
+    fn no_verifier_available_when_detect_returns_none() {
+        let dir = tempdir().expect("tempdir");
+        // Empty workspace, no Cargo.toml, no package.json, no python files.
+        let plan = AutoTestRunner::detect(dir.path(), &[]);
+        assert!(plan.is_none());
+    }
+
+    /// AC11 / R5: invalid UTF-8 in stdout/stderr does not panic
+    /// `String::from_utf8_lossy` and downstream classify_auto_test still
+    /// works. Driven directly through `AutoTestResult` because spawning
+    /// a process that emits invalid UTF-8 reliably is platform-dependent.
+    #[test]
+    fn non_utf8_output_is_lossy_and_does_not_panic() {
+        let plan = cargo_plan();
+        let raw = b"hello\xFFworld";
+        let lossy = String::from_utf8_lossy(raw).into_owned();
+        let result = AutoTestResult {
+            command: plan.command.clone(),
+            passed: false,
+            output: lossy.clone(),
+            exit_code: Some(1),
+            stdout: lossy,
+            stderr: String::new(),
+        };
+        // No panic, valid kind output.
+        let _kind = classify_auto_test(&plan, &result);
+    }
+
+    #[test]
+    fn auto_test_kind_distinguishes_build_from_test() {
+        assert_eq!(build_plan().auto_test_kind(), AutoTestKind::Build);
+        assert_eq!(cargo_plan().auto_test_kind(), AutoTestKind::Test);
+        assert_eq!(pytest_plan().auto_test_kind(), AutoTestKind::Test);
     }
 }

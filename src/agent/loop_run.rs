@@ -27,6 +27,7 @@ mod interrupt;
 mod lifecycle;
 mod protocol;
 mod quality;
+mod reminder;
 pub mod slash_commands;
 mod spinner;
 mod summary;
@@ -40,6 +41,11 @@ pub use footer::{FooterHandle, FooterLease};
 // existing POSIX-compliant NO_COLOR and UTF-8 locale logic without duplicating
 // it. `mod turn;` itself stays private; only these two fns leak out (issue #431).
 pub(crate) use turn::{no_color_requested, unicode_supported};
+
+// Issue #453: expose the precaution prompt selector so integration tests in
+// `tests/` (and any future callers) can validate the Act-mode prompt
+// selection pipeline without requiring a live Ollama call.
+pub use turn::select_precautions_for_prompt;
 
 const DEFAULT_KEEP_TAIL: usize = 24;
 const LATE_TURN_KEEP_TAIL: usize = 12;
@@ -65,6 +71,10 @@ pub struct Agent {
     /// without re-touching `Agent::new` callers (issue #430).
     #[allow(dead_code)]
     footer: FooterHandle,
+    /// Per-turn cap for the Reminder Sidecar (#452). Reset at the top of every
+    /// `handle_user_message`, set to `true` only when an actual sidecar call
+    /// was attempted (Completed/Failed); Skipped does not consume the cap.
+    reminder_called_this_turn: bool,
 }
 
 #[derive(Clone)]
@@ -101,6 +111,7 @@ impl Agent {
             tool_registry: ToolRegistry::default(),
             repo_context_cache: None,
             footer,
+            reminder_called_this_turn: false,
         }
     }
 }

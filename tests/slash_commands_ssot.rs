@@ -32,11 +32,20 @@ fn help_line_matches_slash_commands() {
 }
 
 #[test]
-fn slash_commands_contains_expected_10() {
+fn slash_commands_contains_expected_11() {
     assert_eq!(
         SLASH_COMMANDS,
         &[
-            "/help", "/status", "/model", "/yes", "/no", "/plan", "/approve", "/compact", "/logs",
+            "/help",
+            "/status",
+            "/model",
+            "/yes",
+            "/no",
+            "/plan",
+            "/approve",
+            "/compact",
+            "/logs",
+            "/precautions",
             "/exit",
         ]
     );
@@ -63,7 +72,7 @@ fn slash_commands_excludes_aliases() {
     }
 }
 
-/// A single `/` at pos=1 must expand to the full inventory (10 commands) so
+/// A single `/` at pos=1 must expand to the full inventory (11 commands) so
 /// Tab-after-`/` shows everything. Guards design policy Section 8.2.
 #[test]
 fn completer_returns_all_candidates_for_single_slash() {
