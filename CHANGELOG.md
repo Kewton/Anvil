@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Tester Skill v1 (#459)。`AutoTestRunner::detect == None` かつ Rust / Node / Python のいずれかが検出された Act-mode ターンで、main model を 1 回だけ同期呼び出して smoke test を生成し、`state_root/sessions/<id>/tmp-tests/files/` に保存したうえで固定テンプレートの Bash（Rust: `cargo test --manifest-path`、Node: `node --check`、Python: `python3 -m py_compile`）を 30 秒の明示 timeout 付きで実行（per-turn cap = 1、`tools=None`、JSON-only、`<think>` strip + first JSON object 抽出、`tool_calls` 非空は abort、`ANVIL_NO_TESTER` / Plan mode で disable 可）。Rust 経路は `state_root/sessions/<id>/tester-runs/<run_id>/` に transient harness を書き出し、終了後に best-effort cleanup する。結果は `FeedbackFrame` として `WorkingMemory.last_feedback` に記録され、Reminder Sidecar 経路で `Precaution` 生成に繋がる。`agent.tester.{llm_call_started,llm_call_completed,llm_call_failed,completed,failed,skipped}` ログ出力。影響モジュール: `src/agent/loop_run/tester.rs` (新規)、`src/tools/registry.rs` (`ToolContext.tester_active` フィールド追加 + Edit/Write の `tmp-tests/` 強制)、`src/agent/loop_run/auto_test.rs` (`has_cargo_manifest` / `package_json_has_test_script` / `has_python_surface` / `first_python_script` / `shell_quote` / `MAX_OUTPUT_BYTES` の `pub(super)` 化)、`src/tools/bash.rs` (`run_with_outcome` に `explicit_timeout: Option<Duration>` 追加)、`src/agent/loop_run/turn.rs` (`Agent.tester_called_this_turn` + `try_invoke_tester` 分岐挿入)。
+
 ## [0.2.0] - 2026-04-28
 
 Epic A: Dynamic Precaution Runtime — runtime feedback の正規化、Active Precaution の永続化、Reminder Sidecar による自動生成、Act-mode prompt への注入、`/precautions` REPL コマンド、ランタイム回復経路との接続を一通り入れた。

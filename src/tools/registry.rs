@@ -19,6 +19,41 @@ pub struct ToolContext {
     pub interactive_approval: bool,
     pub offline: bool,
     pub cancel_flag: Option<Arc<AtomicBool>>,
+    /// Issue #458: when set, paths starting with `tmp-tests/<rel>` resolve
+    /// against `<this>/files/` instead of `root`. `None` means tmp-tests is
+    /// not yet bound (CLI startup, unit tests); the prefix is then rejected
+    /// rather than flowing to the workspace root.
+    pub tmp_tests_root: Option<std::path::PathBuf>,
+    /// Issue #459 / DR1-014: while a Tester turn is in flight, Edit/Write
+    /// must only target the session-scoped `tmp-tests/` namespace. The
+    /// registry enforces this at dispatch time via
+    /// [`ToolContext::enforce_tmp_tests_only_when_active`] before the raw
+    /// path is resolved (keeping the check on the raw `tmp-tests/<rel>`
+    /// prefix rather than the post-resolution absolute path).
+    pub tester_active: bool,
+}
+
+impl ToolContext {
+    /// Issue #459 / DR1-014: when `tester_active` is true, reject any
+    /// Edit/Write whose raw path is not under the `tmp-tests/` prefix.
+    /// The check runs on the raw textual prefix (DR3-002) so it must be
+    /// invoked before `resolve_tmp_tests_path` — after resolution the
+    /// path becomes the absolute session-scoped form
+    /// (`<state_root>/sessions/<id>/tmp-tests/files/<rel>`) and a textual
+    /// `tmp-tests/` prefix check would falsely reject valid writes.
+    ///
+    /// `tester_active = false` is a no-op so the existing tool dispatch
+    /// path is unchanged for non-Tester turns.
+    pub fn enforce_tmp_tests_only_when_active(&self, path: &std::path::Path) -> Result<(), String> {
+        if !self.tester_active {
+            return Ok(());
+        }
+        let as_str = path.to_string_lossy();
+        if as_str.starts_with("tmp-tests/") {
+            return Ok(());
+        }
+        Err("Tester Skill 起動中は tmp-tests/ 以外への Edit/Write は拒否されます".to_string())
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -59,6 +94,17 @@ impl ToolRegistry {
         arguments: &Value,
         context: &ToolContext,
     ) -> Result<String, String> {
+        // Issue #461 / DR3-002: For Bash, run preflight (typed `check_blocked_command`
+        // helper) before mode/scope/approval. This makes the dispatch behavior
+        // identical between `execute` and `execute_bash_with_outcome` (the agent
+        // layer entry point), and lets the user see the policy block reason
+        // before being asked to approve.
+        if name == "Bash"
+            && let Some(err) = preflight_bash_command(arguments)
+        {
+            return Err(err);
+        }
+
         enforce_mode(name, arguments, context)?;
         enforce_plan_stage_scope(name, arguments, context)?;
         maybe_confirm(name, arguments, context)?;
@@ -75,22 +121,28 @@ impl ToolRegistry {
             }
             "Read" => {
                 let raw_path = get_required_string(arguments, "path")?;
-                let path = resolve_plan_mode_write_target(
-                    &context.root,
-                    raw_path,
-                    context.plan_path.as_deref(),
-                )?
-                .unwrap_or(resolve_user_path(&context.root, raw_path)?);
+                let path = if let Some(tmp_path) = resolve_tmp_tests_path(raw_path, context)? {
+                    tmp_path
+                } else {
+                    resolve_plan_mode_write_target(
+                        &context.root,
+                        raw_path,
+                        context.plan_path.as_deref(),
+                    )?
+                    .unwrap_or(resolve_user_path(&context.root, raw_path)?)
+                };
                 let start_line = get_optional_usize(arguments, "start_line");
                 let end_line = get_optional_usize(arguments, "end_line");
                 read::run(&path, start_line, end_line)
             }
             "Write" => {
-                let path = resolve_write_path(
-                    &context.root,
-                    get_required_string(arguments, "path")?,
-                    context,
-                )?;
+                let raw_path = get_required_string(arguments, "path")?;
+                // Issue #459 / DR1-014 / DR3-002: enforce on the raw textual
+                // path BEFORE `resolve_write_path` — after `resolve_tmp_tests_path`
+                // resolves to the absolute session-scoped form, the textual
+                // `tmp-tests/` prefix is gone.
+                context.enforce_tmp_tests_only_when_active(std::path::Path::new(raw_path))?;
+                let path = resolve_write_path(&context.root, raw_path, context)?;
                 let content = get_required_string(arguments, "content")?;
                 if let Some(merged) =
                     plan_mode_merged_plan_contents("Write", &path, arguments, context)?
@@ -101,11 +153,10 @@ impl ToolRegistry {
                 }
             }
             "Edit" => {
-                let path = resolve_write_path(
-                    &context.root,
-                    get_required_string(arguments, "path")?,
-                    context,
-                )?;
+                let raw_path = get_required_string(arguments, "path")?;
+                // Issue #459 / DR1-014 / DR3-002: see Write branch above.
+                context.enforce_tmp_tests_only_when_active(std::path::Path::new(raw_path))?;
+                let path = resolve_write_path(&context.root, raw_path, context)?;
                 let old = get_required_string(arguments, "old_string")?;
                 let new = get_required_string(arguments, "new_string")?;
                 let replace_all = arguments
@@ -156,6 +207,24 @@ impl ToolRegistry {
         Result<String, (String, BashErrorClass)>,
         Option<BashExecutionOutcome>,
     ) {
+        // Issue #461 / DR3-001 / DR3-002 / DR2-004: command argument is the
+        // first thing we extract so the typed `check_blocked_command` preflight
+        // can run before mode/scope/approval checks. This means a `command`-
+        // missing call now returns `MissingArgument` before `ModeOrScopeDenied`
+        // (regression-pinned by `execute_bash_with_outcome_classifies_missing_argument_takes_precedence_over_mode`).
+        let command = match get_required_string(arguments, "command") {
+            Ok(c) => c,
+            Err(err) => return (Err((err, BashErrorClass::MissingArgument)), None),
+        };
+        if let Some(reason) = bash::check_blocked_command(command) {
+            return (
+                Err((
+                    bash::render_block_error(&reason),
+                    BashErrorClass::DangerousBlock,
+                )),
+                None,
+            );
+        }
         if let Err(err) = enforce_mode("Bash", arguments, context) {
             return (Err((err, BashErrorClass::ModeOrScopeDenied)), None);
         }
@@ -165,15 +234,18 @@ impl ToolRegistry {
         if let Err(err) = maybe_confirm("Bash", arguments, context) {
             return (Err((err, BashErrorClass::ApprovalDenied)), None);
         }
-        let command = match get_required_string(arguments, "command") {
-            Ok(c) => c,
-            Err(err) => return (Err((err, BashErrorClass::MissingArgument)), None),
-        };
         match bash::run_with_outcome(
             command,
             &context.root,
             context.cancel_flag.as_ref(),
             context.offline,
+            // Issue #459: only the Tester smoke runner sets an explicit
+            // timeout; the regular registry-driven Bash path keeps the
+            // existing `likely_long_running_command` heuristic.
+            None,
+            // CB-003: registry-driven Bash inherits the parent env (existing
+            // behaviour). Tester's smoke runner sets `TesterSanitized`.
+            None,
         ) {
             Ok((text, outcome)) => (Ok(text), Some(outcome)),
             Err(err) => {
@@ -182,6 +254,19 @@ impl ToolRegistry {
             }
         }
     }
+}
+
+/// Issue #461 / DR3-002: Shared preflight for the `execute` Bash path.
+/// Returns `Some(err)` when the command should be blocked before any
+/// mode/scope/approval check runs. The error string is rendered via
+/// `bash::render_block_error` so it carries the `"blocked dangerous command
+/// fragment: …"` prefix and is mapped back to
+/// `BashErrorClass::DangerousBlock` by `classify_bash_dispatch_err` when
+/// the agent layer routes through `execute_bash_with_outcome`.
+fn preflight_bash_command(arguments: &Value) -> Option<String> {
+    let command = arguments.get("command")?.as_str()?;
+    let reason = bash::check_blocked_command(command)?;
+    Some(bash::render_block_error(&reason))
 }
 
 /// CB2-001: how a bash dispatch failed when no `BashExecutionOutcome` was
@@ -391,12 +476,53 @@ fn resolve_write_path(
     raw: &str,
     context: &ToolContext,
 ) -> Result<std::path::PathBuf, String> {
+    // Issue #458: tmp-tests/ prefix takes precedence over Plan mode plan-file
+    // routing — tmp-tests is a session-scoped namespace independent of the
+    // plan file constraint. Plan mode + tmp-tests/<rel> writes are still
+    // routed to the session's tmp-tests root.
+    if let Some(path) = resolve_tmp_tests_path(raw, context)? {
+        return Ok(path);
+    }
     if context.mode == ExecutionMode::Plan
         && let Some(path) = resolve_plan_mode_write_target(root, raw, context.plan_path.as_deref())?
     {
         return Ok(path);
     }
     resolve_user_path(root, raw)
+}
+
+/// Issue #458: resolve a `tmp-tests/<rel>` request to the session-scoped
+/// tmp-tests files root. Returns:
+///   * `Ok(Some(path))` when `raw` starts with `tmp-tests/` and a tmp-tests
+///     root is bound (`context.tmp_tests_root.is_some()`).
+///   * `Err(...)` when the prefix is used but no root is bound, OR when the
+///     literal `"tmp-tests"` (no trailing slash) is passed (which would
+///     otherwise be ambiguous with a workspace-root `tmp-tests` entry).
+///   * `Ok(None)` when `raw` is unrelated to tmp-tests; the caller falls
+///     through to its existing path resolution.
+pub(crate) fn resolve_tmp_tests_path(
+    raw: &str,
+    context: &ToolContext,
+) -> Result<Option<std::path::PathBuf>, String> {
+    if let Some(rel) = raw.strip_prefix("tmp-tests/") {
+        let tmp_root = context
+            .tmp_tests_root
+            .as_ref()
+            .ok_or_else(|| "tmp-tests root is unavailable in this context".to_string())?;
+        let files_root = tmp_root.join("files");
+        std::fs::create_dir_all(&files_root).map_err(|err| {
+            format!(
+                "failed to prepare tmp-tests files dir {}: {err}",
+                files_root.display()
+            )
+        })?;
+        let resolved = resolve_user_path(&files_root, rel)?;
+        return Ok(Some(resolved));
+    }
+    if raw == "tmp-tests" {
+        return Err("tmp-tests/ must be followed by a relative path".to_string());
+    }
+    Ok(None)
 }
 
 fn enforce_plan_stage_scope(
@@ -784,6 +910,8 @@ mod tests {
             interactive_approval: false,
             offline: false,
             cancel_flag: None,
+            tmp_tests_root: None,
+            tester_active: false,
         };
         let out = registry
             .execute(
@@ -825,6 +953,8 @@ mod tests {
             interactive_approval: false,
             offline: false,
             cancel_flag: None,
+            tmp_tests_root: None,
+            tester_active: false,
         };
         let err = enforce_plan_stage_scope(
             "Write",
@@ -856,6 +986,8 @@ mod tests {
             interactive_approval: false,
             offline: false,
             cancel_flag: None,
+            tmp_tests_root: None,
+            tester_active: false,
         };
         enforce_plan_stage_scope(
             "Edit",
@@ -891,6 +1023,8 @@ mod tests {
             interactive_approval: false,
             offline: false,
             cancel_flag: None,
+            tmp_tests_root: None,
+            tester_active: false,
         };
         ToolRegistry::default()
             .execute(
@@ -931,6 +1065,8 @@ mod tests {
             interactive_approval: false,
             offline: false,
             cancel_flag: None,
+            tmp_tests_root: None,
+            tester_active: false,
         };
         ToolRegistry::default()
             .execute(
@@ -969,6 +1105,8 @@ mod tests {
             interactive_approval: false,
             offline: false,
             cancel_flag: None,
+            tmp_tests_root: None,
+            tester_active: false,
         };
         let (text_result, outcome) =
             registry.execute_bash_with_outcome(&json!({"command": "printf hello"}), &context);
@@ -996,6 +1134,8 @@ mod tests {
             interactive_approval: false,
             offline: false,
             cancel_flag: None,
+            tmp_tests_root: None,
+            tester_active: false,
         };
         let (text_result, outcome) =
             registry.execute_bash_with_outcome(&json!({"command": "rm -rf /"}), &context);
@@ -1021,6 +1161,8 @@ mod tests {
             interactive_approval: false,
             offline: false,
             cancel_flag: None,
+            tmp_tests_root: None,
+            tester_active: false,
         };
         let (text_result, outcome) = registry.execute_bash_with_outcome(&json!({}), &context);
         let (_msg, class) = text_result.expect_err("missing command must error");
@@ -1044,6 +1186,8 @@ mod tests {
             interactive_approval: false,
             offline: false,
             cancel_flag: None,
+            tmp_tests_root: None,
+            tester_active: false,
         };
         let (text_result, outcome) =
             registry.execute_bash_with_outcome(&json!({"command": "ls"}), &context);
@@ -1068,6 +1212,8 @@ mod tests {
             interactive_approval: false,
             offline: true,
             cancel_flag: None,
+            tmp_tests_root: None,
+            tester_active: false,
         };
         let (text_result, outcome) =
             registry.execute_bash_with_outcome(&json!({"command": "curl example.com"}), &context);
@@ -1092,11 +1238,434 @@ mod tests {
             interactive_approval: false,
             offline: false,
             cancel_flag: None,
+            tmp_tests_root: None,
+            tester_active: false,
         };
         let (text_result, outcome) =
             registry.execute_bash_with_outcome(&json!({"command": "ls"}), &context);
         let (_msg, class) = text_result.expect_err("plan mode must reject Bash");
         assert_eq!(class, BashErrorClass::ModeOrScopeDenied);
+        assert!(outcome.is_none());
+    }
+
+    // ----- Issue #458: resolve_tmp_tests_path / tmp-tests prefix routing -----
+
+    fn act_context_with_tmp(
+        root: &std::path::Path,
+        tmp_tests_root: Option<&std::path::Path>,
+    ) -> ToolContext {
+        ToolContext {
+            root: root.to_path_buf(),
+            mode: ExecutionMode::Act,
+            plan_path: None,
+            plan_stage: PlanStage::Stage1,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            cancel_flag: None,
+            tmp_tests_root: tmp_tests_root.map(|p| p.to_path_buf()),
+            tester_active: false,
+        }
+    }
+
+    #[test]
+    fn resolve_tmp_tests_path_returns_none_for_unrelated_paths() {
+        let temp = tempdir().unwrap();
+        let ctx = act_context_with_tmp(temp.path(), None);
+        let out = super::resolve_tmp_tests_path("src/main.rs", &ctx).unwrap();
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn resolve_tmp_tests_path_routes_prefix_to_files_root() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let tmp_tests = temp.path().join("tmp-tests");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let ctx = act_context_with_tmp(&workspace, Some(&tmp_tests));
+        let out = super::resolve_tmp_tests_path("tmp-tests/src/test_foo.rs", &ctx)
+            .unwrap()
+            .expect("Some(path) for prefixed input");
+        let expected = std::fs::canonicalize(tmp_tests.join("files")).unwrap();
+        assert!(out.starts_with(&expected), "got {}", out.display());
+        assert!(out.ends_with("src/test_foo.rs"));
+    }
+
+    #[test]
+    fn resolve_tmp_tests_path_rejects_when_root_unbound() {
+        let temp = tempdir().unwrap();
+        let ctx = act_context_with_tmp(temp.path(), None);
+        let err = super::resolve_tmp_tests_path("tmp-tests/x.rs", &ctx).unwrap_err();
+        assert!(err.contains("unavailable"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_tmp_tests_path_rejects_bare_prefix_without_slash() {
+        let temp = tempdir().unwrap();
+        let tmp_tests = temp.path().join("tmp-tests");
+        let ctx = act_context_with_tmp(temp.path(), Some(&tmp_tests));
+        let err = super::resolve_tmp_tests_path("tmp-tests", &ctx).unwrap_err();
+        assert!(err.contains("relative path"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_tmp_tests_path_rejects_path_traversal() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let tmp_tests = temp.path().join("tmp-tests");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let ctx = act_context_with_tmp(&workspace, Some(&tmp_tests));
+        let err = super::resolve_tmp_tests_path("tmp-tests/../escape.rs", &ctx).unwrap_err();
+        assert!(err.contains("escape") || err.contains(".."), "got: {err}");
+    }
+
+    #[test]
+    fn write_with_tmp_tests_prefix_does_not_leak_to_workspace() {
+        // Issue #458 acceptance #4 (create-direction regression):
+        // a Write tmp-tests/<rel> must NOT create a file under workspace root.
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let tmp_tests = temp.path().join("state/tmp-tests");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let registry = ToolRegistry::default();
+        let context = ToolContext {
+            root: workspace.clone(),
+            mode: ExecutionMode::Act,
+            plan_path: None,
+            plan_stage: PlanStage::Stage1,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            cancel_flag: None,
+            tmp_tests_root: Some(tmp_tests.clone()),
+            tester_active: false,
+        };
+        registry
+            .execute(
+                "Write",
+                &json!({"path": "tmp-tests/src/test_foo.rs", "content": "#[test] fn it(){}"}),
+                &context,
+            )
+            .unwrap();
+        // workspace is clean
+        assert!(!workspace.join("src/test_foo.rs").exists());
+        assert!(!workspace.join("tmp-tests").exists());
+        // tmp-tests has the body
+        assert!(tmp_tests.join("files/src/test_foo.rs").exists());
+    }
+
+    #[test]
+    fn write_with_tmp_tests_prefix_when_root_is_none_is_rejected() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let registry = ToolRegistry::default();
+        let context = ToolContext {
+            root: workspace.clone(),
+            mode: ExecutionMode::Act,
+            plan_path: None,
+            plan_stage: PlanStage::Stage1,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            cancel_flag: None,
+            tmp_tests_root: None,
+            tester_active: false,
+        };
+        let err = registry
+            .execute(
+                "Write",
+                &json!({"path": "tmp-tests/x.rs", "content": "x"}),
+                &context,
+            )
+            .unwrap_err();
+        assert!(err.contains("unavailable"), "got: {err}");
+    }
+
+    #[test]
+    fn read_with_tmp_tests_prefix_reads_from_files_root() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let tmp_tests = temp.path().join("state/tmp-tests");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(tmp_tests.join("files/src")).unwrap();
+        std::fs::write(tmp_tests.join("files/src/foo.rs"), b"hello tmp").unwrap();
+        let registry = ToolRegistry::default();
+        let context = ToolContext {
+            root: workspace,
+            mode: ExecutionMode::Act,
+            plan_path: None,
+            plan_stage: PlanStage::Stage1,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            cancel_flag: None,
+            tmp_tests_root: Some(tmp_tests),
+            tester_active: false,
+        };
+        let out = registry
+            .execute("Read", &json!({"path": "tmp-tests/src/foo.rs"}), &context)
+            .unwrap();
+        assert!(out.contains("hello tmp"), "got: {out}");
+    }
+
+    // ----- Issue #459: tester_active path confinement ---------------------
+
+    fn act_context_with_tester(
+        root: &std::path::Path,
+        tmp_tests_root: &std::path::Path,
+        tester_active: bool,
+    ) -> ToolContext {
+        ToolContext {
+            root: root.to_path_buf(),
+            mode: ExecutionMode::Act,
+            plan_path: None,
+            plan_stage: PlanStage::Stage1,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            cancel_flag: None,
+            tmp_tests_root: Some(tmp_tests_root.to_path_buf()),
+            tester_active,
+        }
+    }
+
+    /// `tester_active = true` rejects an Edit/Write whose raw path is not
+    /// under `tmp-tests/`.
+    #[test]
+    fn enforce_tmp_tests_only_when_active_rejects_workspace_path() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let tmp_tests = temp.path().join("tmp-tests");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let ctx = act_context_with_tester(&workspace, &tmp_tests, true);
+        let err = ctx
+            .enforce_tmp_tests_only_when_active(std::path::Path::new("src/foo.rs"))
+            .unwrap_err();
+        assert!(err.contains("tmp-tests/"), "got: {err}");
+    }
+
+    /// `tester_active = true` accepts an Edit/Write under `tmp-tests/<rel>`.
+    #[test]
+    fn enforce_tmp_tests_only_when_active_accepts_tmp_tests_prefix() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let tmp_tests = temp.path().join("tmp-tests");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let ctx = act_context_with_tester(&workspace, &tmp_tests, true);
+        ctx.enforce_tmp_tests_only_when_active(std::path::Path::new("tmp-tests/files/smoke.rs"))
+            .expect("tmp-tests prefix must be accepted while Tester is active");
+    }
+
+    /// `tester_active = false` is a no-op even for non-tmp-tests paths,
+    /// preserving existing behaviour for normal turns.
+    #[test]
+    fn enforce_tmp_tests_only_when_active_noop_when_inactive() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let tmp_tests = temp.path().join("tmp-tests");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let ctx = act_context_with_tester(&workspace, &tmp_tests, false);
+        ctx.enforce_tmp_tests_only_when_active(std::path::Path::new("src/foo.rs"))
+            .expect("inactive Tester must not block normal writes");
+    }
+
+    /// End-to-end: with `tester_active = true`, `registry.execute("Write", …)`
+    /// rejects a non-`tmp-tests/` path before it even resolves the path.
+    #[test]
+    fn execute_write_rejects_non_tmp_tests_when_tester_active() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let tmp_tests = temp.path().join("tmp-tests");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let registry = ToolRegistry::default();
+        let ctx = act_context_with_tester(&workspace, &tmp_tests, true);
+        let err = registry
+            .execute(
+                "Write",
+                &json!({"path": "src/foo.rs", "content": "x"}),
+                &ctx,
+            )
+            .unwrap_err();
+        assert!(err.contains("tmp-tests/"), "got: {err}");
+        // workspace must remain clean (no file leaked through dispatch).
+        assert!(!workspace.join("src/foo.rs").exists());
+    }
+
+    /// End-to-end: with `tester_active = true`, `registry.execute("Write", …)`
+    /// still routes a `tmp-tests/<rel>` write to the session-scoped files
+    /// root via `resolve_tmp_tests_path`.
+    #[test]
+    fn execute_write_allows_tmp_tests_prefix_when_tester_active() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let tmp_tests = temp.path().join("state/tmp-tests");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let registry = ToolRegistry::default();
+        let ctx = act_context_with_tester(&workspace, &tmp_tests, true);
+        registry
+            .execute(
+                "Write",
+                &json!({
+                    "path": "tmp-tests/smoke.rs",
+                    "content": "#[test] fn smoke() {}",
+                }),
+                &ctx,
+            )
+            .expect("tmp-tests/<rel> must succeed while Tester is active");
+        // Resolved into <tmp_tests>/files/<rel>. macOS prefixes /var with
+        // /private during canonicalization, so compare via canonicalize.
+        let expected = std::fs::canonicalize(tmp_tests.join("files"))
+            .unwrap()
+            .join("smoke.rs");
+        assert!(
+            expected.is_file(),
+            "expected {} to exist after Write",
+            expected.display()
+        );
+        // Workspace untouched.
+        assert!(!workspace.join("smoke.rs").exists());
+    }
+
+    /// `Read` is unaffected by `tester_active`: the confinement is for
+    /// Edit/Write only (Tester still needs to read repo state to construct
+    /// its smoke prompt).
+    #[test]
+    fn execute_read_unaffected_by_tester_active() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let tmp_tests = temp.path().join("tmp-tests");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("README.md"), b"hello readme").unwrap();
+        let registry = ToolRegistry::default();
+        let ctx = act_context_with_tester(&workspace, &tmp_tests, true);
+        let out = registry
+            .execute("Read", &json!({"path": "README.md"}), &ctx)
+            .expect("Read must work even when Tester is active");
+        assert!(out.contains("hello readme"));
+    }
+
+    // ---- Issue #461: shared preflight regression tests --------------
+
+    /// Issue #461: a new destructive pattern (`shutdown`) is blocked by
+    /// the shared preflight in `execute_bash_with_outcome` and surfaces
+    /// as `BashErrorClass::DangerousBlock`, even when approval would
+    /// otherwise be required.
+    #[test]
+    fn execute_bash_with_outcome_preflights_blocked_command_before_approval() {
+        use super::BashErrorClass;
+        let temp = tempdir().unwrap();
+        let registry = ToolRegistry::default();
+        let context = ToolContext {
+            root: temp.path().to_path_buf(),
+            mode: ExecutionMode::Act,
+            plan_path: None,
+            plan_stage: PlanStage::Stage1,
+            // auto_approve = false so that without the preflight the
+            // call would otherwise return ApprovalDenied. The preflight
+            // must run first and return DangerousBlock instead.
+            auto_approve: false,
+            interactive_approval: false,
+            offline: false,
+            cancel_flag: None,
+            tmp_tests_root: None,
+            tester_active: false,
+        };
+        let (text_result, outcome) =
+            registry.execute_bash_with_outcome(&json!({"command": "shutdown -h now"}), &context);
+        let (msg, class) = text_result.expect_err("shutdown must be blocked");
+        assert_eq!(class, BashErrorClass::DangerousBlock);
+        assert!(outcome.is_none());
+        assert!(
+            msg.starts_with("blocked dangerous command fragment: "),
+            "got: {msg}"
+        );
+        assert!(msg.contains("shutdown"));
+    }
+
+    /// Issue #461 / DR3-001: preflight signature contract — when the
+    /// preflight matches, the result is `Err((rendered, DangerousBlock))`
+    /// and the outcome is `None`.
+    #[test]
+    fn execute_bash_with_outcome_preflight_returns_dangerous_block_class_with_none_outcome() {
+        use super::BashErrorClass;
+        let temp = tempdir().unwrap();
+        let registry = ToolRegistry::default();
+        let context = ToolContext {
+            root: temp.path().to_path_buf(),
+            mode: ExecutionMode::Act,
+            plan_path: None,
+            plan_stage: PlanStage::Stage1,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            cancel_flag: None,
+            tmp_tests_root: None,
+            tester_active: false,
+        };
+        let (text_result, outcome) =
+            registry.execute_bash_with_outcome(&json!({"command": "iptables -F"}), &context);
+        let (_msg, class) = text_result.expect_err("iptables blocked");
+        assert_eq!(class, BashErrorClass::DangerousBlock);
+        assert!(outcome.is_none());
+    }
+
+    /// Issue #461 / DR3-002: `ToolRegistry::execute` Bash path also
+    /// rejects new destructive patterns via the same shared preflight
+    /// (no policy drift between `execute` and `execute_bash_with_outcome`).
+    #[test]
+    fn execute_bash_path_blocks_destructive_command() {
+        let temp = tempdir().unwrap();
+        let registry = ToolRegistry::default();
+        let context = ToolContext {
+            root: temp.path().to_path_buf(),
+            mode: ExecutionMode::Act,
+            plan_path: None,
+            plan_stage: PlanStage::Stage1,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            cancel_flag: None,
+            tmp_tests_root: None,
+            tester_active: false,
+        };
+        let err = registry
+            .execute("Bash", &json!({"command": "reboot"}), &context)
+            .expect_err("reboot blocked via execute path");
+        assert!(
+            err.starts_with("blocked dangerous command fragment: "),
+            "got: {err}"
+        );
+        assert!(err.contains("reboot"));
+    }
+
+    /// Issue #461 / DR2-004: preflight insertion moved `command` extraction
+    /// before mode/scope checks. A Plan-mode call missing the `command`
+    /// argument now returns `MissingArgument` first, not
+    /// `ModeOrScopeDenied`. This pin documents the intentional behavior.
+    #[test]
+    fn execute_bash_with_outcome_classifies_missing_argument_takes_precedence_over_mode() {
+        use super::BashErrorClass;
+        let temp = tempdir().unwrap();
+        let registry = ToolRegistry::default();
+        let context = ToolContext {
+            root: temp.path().to_path_buf(),
+            // Plan-mode would normally reject Bash dispatch with
+            // ModeOrScopeDenied, but the missing-argument path runs
+            // before mode/scope after Issue #461.
+            mode: ExecutionMode::Plan,
+            plan_path: None,
+            plan_stage: PlanStage::Stage1,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            cancel_flag: None,
+            tmp_tests_root: None,
+            tester_active: false,
+        };
+        let (text_result, outcome) = registry.execute_bash_with_outcome(&json!({}), &context);
+        let (_msg, class) = text_result.expect_err("missing command must error");
+        assert_eq!(class, BashErrorClass::MissingArgument);
         assert!(outcome.is_none());
     }
 }

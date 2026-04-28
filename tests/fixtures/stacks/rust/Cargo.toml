@@ -1,0 +1,15 @@
+# Fixture for Issue #459 Tester Skill smoke E2E tests.
+#
+# Minimal library crate with NO `tests/` directory and NO `[[test]]` entries
+# so that `auto_test::has_cargo_manifest` returns true (i.e. `AutoTestRunner`
+# does NOT find an explicit Rust test verifier) and the Tester Skill takes
+# the Rust branch via `TesterCandidate::detect`. Read-only fixture: tests
+# clone its layout into a temporary directory before exercising any I/O.
+[package]
+name = "anvil_tester_fixture_rust"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"

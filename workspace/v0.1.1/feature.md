@@ -638,19 +638,30 @@ AnvilScore を導入し、検証可能な状態を deterministic に計算する
 
 仕様
 
-想定構造:
+想定構造 (Issue #456 確定版、12 field / 5 lifecycle group):
 
 pub struct AnvilScore {
+    // Group 1: outcome (turn-local)
     pub build_passed: Option<bool>,
     pub tests_passed: Option<bool>,
+
+    // Group 2: delta (turn-local, 直前 turn 比)
     pub compile_errors_delta: Option<i32>,
     pub test_failures_delta: Option<i32>,
-    pub implementation_files_changed: usize,
-    pub test_files_changed: usize,
-    pub setup_files_changed: usize,
-    pub unsafe_actions_blocked: usize,
-    pub no_progress_turns: usize,
-    pub user_visible_artifact: bool,
+
+    // Group 3: next-turn baseline (turn-local 絶対値、#456 では fixture のみ、本番経路は #457)
+    pub compile_error_count: Option<usize>,
+    pub test_failure_count: Option<usize>,
+
+    // Group 4: repo diff (turn-local、RepoVerification 由来)
+    pub implementation_files_changed: Option<usize>,
+    pub test_files_changed: Option<usize>,
+    pub setup_files_changed: Option<usize>,
+
+    // Group 5: counter / accumulator / flag
+    pub unsafe_actions_blocked: usize,           // turn-local
+    pub consecutive_no_progress_turns: usize,    // session-cumulative の denormalize copy
+    pub user_visible_artifact: bool,             // turn-local
 }
 
 制約:

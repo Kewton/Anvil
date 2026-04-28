@@ -5,6 +5,7 @@ use sha2::{Digest, Sha256};
 
 use crate::modes::plan_act::{ExecutionMode, ModeState};
 use crate::ollama::xml_fallback::ToolCall;
+use crate::session::anvil_score::{AnvilScore, deserialize_lossy_anvil_score};
 use crate::session::feedback::{FeedbackFrame, mask_secrets, normalize_path_to_workspace};
 use crate::session::precaution::{
     AddPrecautionOutcome, Precaution, PrecautionStatus, RetiredReason, Severity,
@@ -621,6 +622,48 @@ pub struct SessionSnapshot {
     /// is the correct turn-start value for a freshly resumed session.
     #[serde(skip, default)]
     pub eligible_feedback_recorded_this_turn: bool,
+    /// Issue #456: persisted snapshot of the previous turn's AnvilScore. Used
+    /// by [`crate::session::anvil_score::compute_anvil_score`] as the delta
+    /// baseline for the current turn. `None` for fresh sessions and for the
+    /// pre-compute window inside a turn (DR1-010 / 設計判断 #9).
+    ///
+    /// Field-level lossy deserializer (`deserialize_lossy_anvil_score`) drops
+    /// malformed / oversized JSON to `None` so a tampered session.json or an
+    /// old-anvil future-incompatible field cannot block resume / discovery
+    /// (DR1-008 / DR4-003 / S5-004 / S7-003).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_lossy_anvil_score"
+    )]
+    pub last_anvil_score: Option<AnvilScore>,
+    /// Issue #456: turn-local counter for `UnsafeCommandBlocked` events. Reset
+    /// to `0` at the top of `run_turn`, incremented at the unsafe-block
+    /// `record_feedback` site, copied into `AnvilScore.unsafe_actions_blocked`
+    /// at compute time. Not persisted.
+    #[serde(skip, default)]
+    pub unsafe_blocks_this_turn: usize,
+    /// Issue #456: session-cumulative counter for `NoRepoProgress` turns.
+    /// Incremented when the post-loop `verify_repo_progress` finds no diff,
+    /// reset to 0 when the turn produces verifiable progress. Persisted so
+    /// resumed sessions keep their accumulated streak.
+    #[serde(default)]
+    pub consecutive_no_progress_turns: usize,
+    /// Issue #456: turn-local flag set when at least one `Write` / `Edit`
+    /// tool call returned `Ok`. Reset to `false` at the top of `run_turn`,
+    /// consumed by `compute_anvil_score` to determine `user_visible_artifact`.
+    /// Not persisted.
+    #[serde(skip, default)]
+    pub repo_edit_succeeded_this_turn: bool,
+    /// Issue #456: snapshot of `working_memory.touched_files` captured at the
+    /// top of `run_turn`. Provides the Reminder Sidecar / future Observability
+    /// with a stable view of "what the agent already knew before this turn",
+    /// independent of the in-turn cap that `working_memory.touched_files`
+    /// applies. Not persisted (this is per-turn diagnostic context, not state
+    /// to resume from). Open Question OQ-1: removal candidate if no consumer
+    /// emerges.
+    #[serde(skip, default)]
+    pub touched_files_at_turn_start: Vec<String>,
 }
 
 impl SessionSnapshot {
@@ -710,6 +753,21 @@ impl SessionStore {
                 workspace_key: self.workspace_key.clone(),
                 ..SessionSnapshot::default()
             });
+        }
+
+        // Issue #456 / DR4-003: refuse to read oversized session.json before
+        // we even open it so a hostile / corrupt file cannot push the parser
+        // into an oversized allocation. The cap mirrors the discovery-path
+        // limit in `discovery::MAX_SESSION_JSON_BYTES` so resume and
+        // `iter_session_dirs` enforce the same upper bound.
+        if let Ok(file_meta) = fs::metadata(&self.path)
+            && file_meta.len() > crate::session::discovery::MAX_SESSION_JSON_BYTES
+        {
+            return Err(format!(
+                "session {} exceeds {} bytes",
+                self.path.display(),
+                crate::session::discovery::MAX_SESSION_JSON_BYTES
+            ));
         }
 
         let contents = fs::read_to_string(&self.path)
@@ -935,6 +993,91 @@ mod tests {
         let wm = WorkingMemory::default();
         let rendered = wm.format_for_prompt_with_precautions(&[]);
         assert!(rendered.is_none(), "expected None, got {:?}", rendered);
+    }
+
+    /// Issue #461 / DR3-003 / DR2-007 (Sidecar dedup): adding the same
+    /// `SafetyPolicy` precaution multiple times with deterministic text
+    /// must dedup via id-based blocking-duplicate detection so that
+    /// `MAX_ACTIVE_PRECAUTIONS=16` is never breached, and the same
+    /// pattern does not push other source precautions out of the cap.
+    /// The id derives from (canonicalized text, source, applies_to).
+    #[test]
+    fn safety_policy_precaution_dedups_by_id_under_repeated_add() {
+        let dir = tempdir().unwrap();
+        let mut wm = WorkingMemory::default();
+
+        // Pre-fill with 8 distinct non-SafetyPolicy precautions.
+        for i in 0..8 {
+            wm.add_precaution(
+                make_precaution(
+                    &format!("other-source-precaution-{i}"),
+                    Severity::Medium,
+                    PrecautionStatus::Active,
+                ),
+                dir.path(),
+            );
+        }
+        let baseline_active = wm
+            .active_precautions
+            .iter()
+            .filter(|p| p.status == PrecautionStatus::Active)
+            .count();
+        assert_eq!(baseline_active, 8);
+
+        // Now hammer the same SafetyPolicy precaution 50 times.
+        let safety_text = "blocked dangerous command fragment: shutdown (category=DangerousVerb)";
+        for _ in 0..50 {
+            let pre = Precaution {
+                id: String::new(), // recomputed by canonicalize_for_storage
+                source: PrecautionSource::SafetyPolicy,
+                severity: Severity::High,
+                text: safety_text.to_string(),
+                applies_to: Vec::new(),
+                status: PrecautionStatus::Active,
+                retired_reason: None,
+            };
+            let _ = wm.add_precaution(pre, dir.path());
+        }
+
+        // Cap not breached.
+        let total = wm.active_precautions.len();
+        assert!(
+            total <= WorkingMemory::MAX_ACTIVE_PRECAUTIONS,
+            "active precautions {total} exceeds MAX_ACTIVE_PRECAUTIONS"
+        );
+
+        // Original 8 non-SafetyPolicy precautions are still Active (not
+        // pushed out by the SafetyPolicy onslaught).
+        let other_active = wm
+            .active_precautions
+            .iter()
+            .filter(|p| {
+                p.status == PrecautionStatus::Active && p.source != PrecautionSource::SafetyPolicy
+            })
+            .count();
+        assert_eq!(
+            other_active,
+            8,
+            "the 8 non-SafetyPolicy active precautions must not be evicted: \
+             active = {:?}",
+            wm.active_precautions
+                .iter()
+                .map(|p| (&p.text, p.source, p.status))
+                .collect::<Vec<_>>()
+        );
+
+        // Exactly one SafetyPolicy entry remains Active (id dedup).
+        let safety_active = wm
+            .active_precautions
+            .iter()
+            .filter(|p| {
+                p.source == PrecautionSource::SafetyPolicy && p.status == PrecautionStatus::Active
+            })
+            .count();
+        assert_eq!(
+            safety_active, 1,
+            "deterministic-text SafetyPolicy precaution must dedup to 1 Active entry"
+        );
     }
 
     #[test]

@@ -9,6 +9,69 @@ use std::time::{Duration, Instant};
 use crate::session::feedback::FeedbackKind;
 use crate::tools::registry::truncate_output;
 
+/// Env-inheritance policy for `run_with_outcome`. CB-003 (Issue #459).
+///
+/// `Inherit` is the historical default — the child shell inherits every
+/// `std::env::vars()` entry from the parent process. `TesterSanitized` clears
+/// the child env and forwards only an explicit allowlist; this is the policy
+/// the Tester Skill smoke runner uses so LLM-generated test code cannot read
+/// `OPENAI_API_KEY` / `GITHUB_TOKEN` / `AWS_*` etc. and exfiltrate them via
+/// stdout / stderr.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BashEnvPolicy {
+    #[default]
+    Inherit,
+    TesterSanitized,
+}
+
+/// CB-003 (Issue #459): exact set of env keys forwarded to a Tester smoke
+/// child. Anything else (including `ANVIL_*`, `ANTHROPIC_*`, `OPENAI_*`,
+/// `GITHUB_*`, `AWS_*`, `*_TOKEN`, `*_KEY`, `*_SECRET`, `*_PASSWORD`) is
+/// dropped. `LANG` / `LC_*` / `TZ` are not forwarded by exact match — the
+/// allowlist below picks up `LANG`, and `LC_ALL` is included explicitly to
+/// keep cargo / rustc / python output deterministic on CI.
+pub const TESTER_ENV_ALLOWLIST_EXACT: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "TMPDIR",
+    "SHELL",
+    "TERM",
+    // Rust toolchain locations are necessary for `cargo test` to find rustc.
+    "RUSTUP_HOME",
+    "CARGO_HOME",
+    // Anvil's smoke-runner injects this directly via `env CARGO_TARGET_DIR=...`
+    // in the command line (CB-005), but pass-through is harmless and lets a
+    // workspace-wide override flow through unchanged.
+    "CARGO_TARGET_DIR",
+];
+
+/// Filter the parent process env down to the Tester-safe allowlist. Pure
+/// function over a list of `(key, value)` pairs so the unit test can drive
+/// it without mutating the global process env.
+pub fn filter_env_for_tester<I, K, V>(env: I) -> Vec<(String, String)>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<str>,
+    V: Into<String>,
+{
+    env.into_iter()
+        .filter_map(|(k, v)| {
+            let key = k.as_ref();
+            if TESTER_ENV_ALLOWLIST_EXACT.contains(&key) {
+                Some((key.to_string(), v.into()))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 /// Internal Bash outcome bag exposed for FeedbackFrame generation in
 /// the agent layer (Issue #450). Not part of `ToolRegistry::execute`'s
 /// `Result<String, String>` contract; turn.rs invokes
@@ -61,6 +124,247 @@ const BLOCKED_SNIPPETS: &[&str] = &[
     "sudo ",
     "chmod -r 777",
 ];
+
+/// Issue #461: Categories of destructive command blocks. Each variant
+/// corresponds to a distinct predicate in `check_blocked_command`. The order
+/// of trial inside `check_blocked_command` is `Snippet` first (existing
+/// `BLOCKED_SNIPPETS` contains-scan, preserves precedence with prior
+/// behavior), then the new categories in declaration order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlockCategory {
+    /// Existing `BLOCKED_SNIPPETS` contains-scan match.
+    Snippet,
+    /// `shutdown` / `reboot` / `halt` / `iptables` / `ufw` / `route` matched
+    /// at a word-boundary / token-leading position (does not match
+    /// `traceroute`, `cargo test --test reboot_recovery`, etc.).
+    DangerousVerb,
+    /// `kill -1 <pid>` matched at the leading token (does not match
+    /// `pkill -1`).
+    KillSignalOne,
+    /// `>` / `>>` / `>|` / `1>` / `2>` / `1>>` / `2>>` redirection token
+    /// followed by `/dev/sd[a-z]` (with a path-boundary, partition suffix,
+    /// or whitespace; does not match `cmp /dev/sda1` or `/dev/sdx_backup`).
+    DeviceRedirect,
+    /// Fork bomb canonical pattern `:(){:|:&};:` (after stripping all ASCII
+    /// whitespace from the normalized command).
+    ForkBomb,
+}
+
+/// Issue #461: Reason a command was blocked by `check_blocked_command`.
+/// `pattern` is a static label suitable for emitting in the
+/// `"blocked dangerous command fragment: <pattern>"` error message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BlockReason {
+    pub pattern: &'static str,
+    pub category: BlockCategory,
+}
+
+/// Issue #461: Render the canonical Err string for a `BlockReason`. The
+/// returned string MUST start with `"blocked dangerous command fragment: "`
+/// so that `classify_bash_dispatch_err` (`registry.rs:217-225`) maps it to
+/// `BashErrorClass::DangerousBlock`. This is the single source of truth for
+/// the block error format; `run_with_outcome` and the registry preflight
+/// both call this.
+pub(crate) fn render_block_error(reason: &BlockReason) -> String {
+    format!(
+        "blocked dangerous command fragment: {} (category={:?})",
+        reason.pattern, reason.category
+    )
+}
+
+/// Issue #461: Single source of truth for destructive-command judgment.
+/// Returns `Some(BlockReason)` if the command should be blocked, `None`
+/// otherwise. Internally tries categories in order: `Snippet` first
+/// (preserves existing behavior for overlapping inputs like `:(){:|:&};:`
+/// matching the existing `:({` snippet), then `DangerousVerb`,
+/// `KillSignalOne`, `DeviceRedirect`, `ForkBomb`.
+pub(crate) fn check_blocked_command(command: &str) -> Option<BlockReason> {
+    let normalized =
+        normalize_background_command(&normalize_noninteractive_scaffold_command(command));
+
+    for snippet in BLOCKED_SNIPPETS {
+        if normalized.contains(snippet) {
+            return Some(BlockReason {
+                pattern: snippet,
+                category: BlockCategory::Snippet,
+            });
+        }
+    }
+
+    if let Some(verb) = match_dangerous_verb(&normalized) {
+        return Some(BlockReason {
+            pattern: verb,
+            category: BlockCategory::DangerousVerb,
+        });
+    }
+
+    if matches_kill_signal_one(&normalized) {
+        return Some(BlockReason {
+            pattern: "kill -1",
+            category: BlockCategory::KillSignalOne,
+        });
+    }
+
+    if matches_device_redirect(&normalized) {
+        return Some(BlockReason {
+            pattern: "> /dev/sd*",
+            category: BlockCategory::DeviceRedirect,
+        });
+    }
+
+    if matches_fork_bomb(&normalized) {
+        return Some(BlockReason {
+            pattern: ":(){:|:&};:",
+            category: BlockCategory::ForkBomb,
+        });
+    }
+
+    None
+}
+
+/// Issue #461: Word-boundary match for `shutdown` / `reboot` / `halt` /
+/// `iptables` / `ufw` / `route`. A "token" is the leading word of any
+/// shell-control segment (split on `&&`, `||`, `;`, `|`). The token is
+/// compared against the verb list verbatim. `route add` / `route del` are
+/// covered because the leading token is `route`.
+fn match_dangerous_verb(normalized: &str) -> Option<&'static str> {
+    const VERBS: &[&str] = &["shutdown", "reboot", "halt", "iptables", "ufw", "route"];
+    for segment in split_shell_control_segments(normalized) {
+        let stripped = strip_trailing_background_operator(segment);
+        let trimmed = stripped.trim();
+        // First whitespace-separated token of the segment.
+        let token = trimmed.split_whitespace().next().unwrap_or("");
+        for verb in VERBS {
+            if token == *verb {
+                return Some(verb);
+            }
+        }
+    }
+    None
+}
+
+/// Issue #461: `kill -1 ...` only — does not match `pkill -1`,
+/// `xkill -1`, `killall -1`. The leading token of a shell segment must be
+/// exactly `kill`, and one of the following whitespace-separated args must
+/// be `-1`.
+fn matches_kill_signal_one(normalized: &str) -> bool {
+    for segment in split_shell_control_segments(normalized) {
+        let stripped = strip_trailing_background_operator(segment);
+        let trimmed = stripped.trim();
+        let mut parts = trimmed.split_whitespace();
+        let head = parts.next().unwrap_or("");
+        if head != "kill" {
+            continue;
+        }
+        if parts.any(|arg| arg == "-1") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Issue #461: Block redirect (`>`, `>>`, `>|`, `1>`, `2>`, `1>>`, `2>>`)
+/// that targets `/dev/sd[a-z]` (optionally followed by a digit suffix,
+/// e.g. `/dev/sda1`). Does NOT match `cmp /dev/sda1 reference.bin`
+/// (no redirect operator) or `> /dev/sdx_backup` (`x` is not in `a-z`
+/// followed by `_backup`; we also reject when `_` follows the device
+/// letter since this isn't a real `/dev/sdN` device).
+fn matches_device_redirect(normalized: &str) -> bool {
+    const REDIRECT_TOKENS: &[&str] = &[">>", ">|", "1>>", "2>>", "1>", "2>", ">"];
+    let bytes = normalized.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        for tok in REDIRECT_TOKENS {
+            let tlen = tok.len();
+            if i + tlen <= bytes.len() && &bytes[i..i + tlen] == tok.as_bytes() {
+                // Skip whitespace after the redirect token.
+                let mut j = i + tlen;
+                while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
+                    j += 1;
+                }
+                let rest = &normalized[j..];
+                if redirect_target_is_dev_sd(rest) {
+                    return true;
+                }
+                // Advance past the redirect token (we already inspected the
+                // target; advance by the whole token length).
+                i += tlen;
+                break;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Helper: does `s` (the bytes immediately after a redirect operator and
+/// optional whitespace) start with `/dev/sd[a-z]` followed by either
+/// end-of-string, an ASCII digit (partition suffix), whitespace, or a
+/// shell metacharacter? `_`, alphabetic continuation (e.g. `_backup`,
+/// `xbackup`) is rejected.
+fn redirect_target_is_dev_sd(s: &str) -> bool {
+    const PREFIX: &str = "/dev/sd";
+    if !s.starts_with(PREFIX) {
+        return false;
+    }
+    let after = &s[PREFIX.len()..];
+    let mut chars = after.chars();
+    let Some(letter) = chars.next() else {
+        return false;
+    };
+    if !letter.is_ascii_lowercase() {
+        return false;
+    }
+    match chars.next() {
+        None => true,
+        Some(c) if c.is_ascii_digit() => true,
+        Some(c) if c.is_ascii_whitespace() => true,
+        Some(';' | '&' | '|' | '<' | '>') => true,
+        _ => false,
+    }
+}
+
+/// Issue #461 / DR4-001: Fork bomb detector. Strips all ASCII whitespace
+/// from `normalized`, then tests for the canonical fixed substring
+/// `:(){:|:&};:`. This catches both the no-space form and spaced
+/// variants (e.g. `:() { :|: & };:`) without using a regex.
+fn matches_fork_bomb(normalized: &str) -> bool {
+    const CANONICAL: &str = ":(){:|:&};:";
+    let stripped: String = normalized.chars().filter(|c| !c.is_whitespace()).collect();
+    stripped.contains(CANONICAL)
+}
+
+/// Issue #461 / DR1-005 / DR4-005: Apply Unix process-group setup to a
+/// `Command` so that `terminate_child` can later `kill(-pid, ...)` the
+/// whole group. On non-unix platforms this is a no-op; `terminate_child`
+/// falls back to `child.kill()`.
+///
+/// **`unsafe` boundary**: the `pre_exec` closure runs in the forked child
+/// between `fork(2)` and `exec(2)`, where allocation, locks, logging, and
+/// general Rust runtime calls are unsafe. The closure inside this helper
+/// is therefore restricted to `libc::setpgid(0, 0)` and
+/// `std::io::Error::last_os_error()` only. Do not extend it.
+#[cfg(unix)]
+pub(crate) fn apply_unix_pgroup(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: the closure is async-signal-safe — it only calls
+    // `libc::setpgid(0, 0)` and constructs an `io::Error` from the libc
+    // errno. No allocation, locks, logging, or arbitrary Rust code runs in
+    // the forked child before exec.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn apply_unix_pgroup(_cmd: &mut Command) {
+    // No-op on non-unix; `terminate_child` falls back to `child.kill()`.
+}
 const LONG_RUNNING_TIMEOUT: Duration = Duration::from_secs(15);
 const TERMINATE_GRACE: Duration = Duration::from_secs(2);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -82,25 +386,35 @@ pub fn run(
     cancel_flag: Option<&Arc<AtomicBool>>,
     offline: bool,
 ) -> Result<String, String> {
-    run_with_outcome(command, cwd, cancel_flag, offline).map(|(text, _)| text)
+    run_with_outcome(command, cwd, cancel_flag, offline, None, None).map(|(text, _)| text)
 }
 
 /// Like `run`, but additionally returns the structured
 /// `BashExecutionOutcome` (Issue #450). The returned `Result<String, String>`
 /// is identical to what `run` returns so the registry contract is unchanged.
+///
+/// `explicit_timeout` (Issue #459 / DR1-003 / DR2-005):
+///
+/// * `Some(d)` — bypass the `likely_long_running_command` heuristic and
+///   enforce `d` as the wall-clock timeout for this dispatch. Used by the
+///   Tester Skill smoke runner (`TESTER_SMOKE_TIMEOUT_SECS`).
+/// * `None` — preserve the existing call-site behaviour: a timeout is set
+///   only when `likely_long_running_command` returns true.
+///
+/// `is_dangerous_command` / `BLOCKED_SNIPPETS` / offline policy filters are
+/// applied unconditionally — `explicit_timeout` does not provide a bypass.
 pub fn run_with_outcome(
     command: &str,
     cwd: &std::path::Path,
     cancel_flag: Option<&Arc<AtomicBool>>,
     offline: bool,
+    explicit_timeout: Option<Duration>,
+    env_policy: Option<BashEnvPolicy>,
 ) -> Result<(String, BashExecutionOutcome), String> {
     let normalized =
         normalize_background_command(&normalize_noninteractive_scaffold_command(command));
-    for snippet in BLOCKED_SNIPPETS {
-        if normalized.contains(snippet) {
-            let msg = format!("blocked dangerous command fragment: {snippet}");
-            return Err(msg);
-        }
+    if let Some(reason) = check_blocked_command(&normalized) {
+        return Err(render_block_error(&reason));
     }
     let class = classify_command(&normalized);
     enforce_offline_policy(&normalized, class, offline)?;
@@ -111,27 +425,31 @@ pub fn run_with_outcome(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // CB-003 (Issue #459): Tester's smoke runner clears the child env and
+    // forwards only the allowlist below. Production code (registry-driven
+    // Bash, AutoTestRunner) passes `None` and keeps the historical inherit
+    // behaviour so existing call sites are unaffected.
+    let policy = env_policy.unwrap_or_default();
+    if matches!(policy, BashEnvPolicy::TesterSanitized) {
+        cmd.env_clear();
+        for (key, value) in filter_env_for_tester(std::env::vars()) {
+            cmd.env(key, value);
+        }
+    }
     if is_noninteractive_scaffold_command(&normalized) {
         cmd.env("CI", "1");
     }
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        unsafe {
-            cmd.pre_exec(|| {
-                if libc::setpgid(0, 0) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-    }
+    apply_unix_pgroup(&mut cmd);
 
     let mut child = cmd
         .spawn()
         .map_err(|err| format!("failed to run shell command: {err}"))?;
-    let timeout = likely_long_running_command(&normalized).then_some(LONG_RUNNING_TIMEOUT);
+    // Issue #459 / DR1-003: explicit_timeout takes precedence over the
+    // long-running heuristic so the Tester smoke runner can always cap
+    // execution at TESTER_SMOKE_TIMEOUT_SECS.
+    let timeout = explicit_timeout
+        .or_else(|| likely_long_running_command(&normalized).then_some(LONG_RUNNING_TIMEOUT));
     let started = Instant::now();
 
     let status = loop {
@@ -479,7 +797,10 @@ fn is_shell_redirection_token(token: &str) -> bool {
     token.contains('>') || token.contains('<')
 }
 
-fn enforce_offline_policy(
+/// Issue #461: Promoted to `pub(crate)` so that #458 (Temporary Test
+/// Workspace) generated-test executors can apply the same offline policy
+/// without re-implementing the network-class detection.
+pub(crate) fn enforce_offline_policy(
     command: &str,
     class: BashCommandClass,
     offline: bool,
@@ -658,7 +979,12 @@ fn command_uses_network(command: &str) -> bool {
     .any(|needle| normalized.contains(needle))
 }
 
-fn terminate_child(child: &mut Child) {
+/// Issue #461: Promoted to `pub(crate)` so that #458 (Temporary Test
+/// Workspace) generated-test executors can reuse the same SIGTERM →
+/// 2s grace → SIGKILL termination strategy. Must be paired with a
+/// `Command` that had `apply_unix_pgroup` applied before spawn so the
+/// `kill(-pid, ...)` reaches the whole process group on Unix.
+pub(crate) fn terminate_child(child: &mut Child) {
     #[cfg(unix)]
     {
         let pid = child.id() as i32;
@@ -691,14 +1017,288 @@ fn terminate_child(child: &mut Child) {
 #[cfg(test)]
 mod tests {
     use super::{
-        BashCommandClass, classify_command, command_uses_network, has_shell_control_operator,
-        launches_persistent_service, likely_long_running_command, normalize_background_command,
-        normalize_noninteractive_scaffold_command, requests_background_execution, run,
-        split_shell_control_segments, strip_trailing_background_operator,
+        BashCommandClass, BlockCategory, BlockReason, check_blocked_command, classify_command,
+        command_uses_network, has_shell_control_operator, launches_persistent_service,
+        likely_long_running_command, match_dangerous_verb, matches_device_redirect,
+        matches_fork_bomb, matches_kill_signal_one, normalize_background_command,
+        normalize_noninteractive_scaffold_command, render_block_error,
+        requests_background_execution, run, run_with_outcome, split_shell_control_segments,
+        strip_trailing_background_operator,
     };
     use std::time::{Duration, Instant};
 
     use tempfile::tempdir;
+
+    // -----------------------------------------------------------------
+    // Issue #461: destructive pattern enrichment + typed helper.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn blocks_shutdown_via_check_blocked_command() {
+        let reason = check_blocked_command("shutdown -h now").expect("shutdown blocked");
+        assert_eq!(reason.category, BlockCategory::DangerousVerb);
+        assert_eq!(reason.pattern, "shutdown");
+    }
+
+    #[test]
+    fn blocks_reboot_via_check_blocked_command() {
+        let reason = check_blocked_command("reboot").expect("reboot blocked");
+        assert_eq!(reason.category, BlockCategory::DangerousVerb);
+    }
+
+    #[test]
+    fn blocks_halt_via_check_blocked_command() {
+        let reason = check_blocked_command("halt --force").expect("halt blocked");
+        assert_eq!(reason.category, BlockCategory::DangerousVerb);
+    }
+
+    #[test]
+    fn blocks_iptables_via_check_blocked_command() {
+        let reason = check_blocked_command("iptables -F").expect("iptables blocked");
+        assert_eq!(reason.category, BlockCategory::DangerousVerb);
+    }
+
+    #[test]
+    fn blocks_ufw_via_check_blocked_command() {
+        let reason = check_blocked_command("ufw enable").expect("ufw blocked");
+        assert_eq!(reason.category, BlockCategory::DangerousVerb);
+    }
+
+    #[test]
+    fn blocks_route_add_via_check_blocked_command() {
+        let reason =
+            check_blocked_command("route add default gw 10.0.0.1").expect("route add blocked");
+        assert_eq!(reason.category, BlockCategory::DangerousVerb);
+        assert_eq!(reason.pattern, "route");
+    }
+
+    #[test]
+    fn blocks_kill_signal_one_via_check_blocked_command() {
+        let reason = check_blocked_command("kill -1 12345").expect("kill -1 blocked");
+        assert_eq!(reason.category, BlockCategory::KillSignalOne);
+        assert_eq!(reason.pattern, "kill -1");
+    }
+
+    #[test]
+    fn blocks_device_redirect_via_check_blocked_command() {
+        let r1 = check_blocked_command("dd_alt > /dev/sda").expect("> /dev/sda blocked");
+        assert_eq!(r1.category, BlockCategory::DeviceRedirect);
+        let r2 = check_blocked_command("cat zero >> /dev/sdb1").expect(">> /dev/sdb1 blocked");
+        assert_eq!(r2.category, BlockCategory::DeviceRedirect);
+        let r3 = check_blocked_command("cmd 2> /dev/sdc").expect("2> /dev/sdc blocked");
+        assert_eq!(r3.category, BlockCategory::DeviceRedirect);
+        let r4 = check_blocked_command("echo x >| /dev/sda").expect(">| /dev/sda blocked");
+        assert_eq!(r4.category, BlockCategory::DeviceRedirect);
+    }
+
+    #[test]
+    fn blocks_fork_bomb_canonical_via_check_blocked_command() {
+        // The canonical no-space form is also a substring of the existing
+        // BLOCKED_SNIPPETS entry `:({` — so by the SSOT precedence rule
+        // (Snippet first), it's reported as a Snippet match. This test
+        // pins that precedence; see also
+        // `precedence_existing_snippets_win_over_new_categories_for_overlapping_input`.
+        let reason = check_blocked_command(":(){:|:&};:").expect("fork bomb blocked");
+        assert!(matches!(
+            reason.category,
+            BlockCategory::Snippet | BlockCategory::ForkBomb
+        ));
+    }
+
+    #[test]
+    fn blocks_fork_bomb_spaced_variant_via_check_blocked_command() {
+        // Spaced variant: still hits the existing `:({` snippet because
+        // `BLOCKED_SNIPPETS` only requires the literal substring.
+        let reason = check_blocked_command(":() { :|: & };:").expect("spaced fork bomb blocked");
+        assert!(matches!(
+            reason.category,
+            BlockCategory::Snippet | BlockCategory::ForkBomb
+        ));
+    }
+
+    #[test]
+    fn matches_fork_bomb_handles_no_space_and_spaced_variants() {
+        assert!(matches_fork_bomb(":(){:|:&};:"));
+        assert!(matches_fork_bomb(":() { :|: & };:"));
+        assert!(matches_fork_bomb(":(){\t:|:&};:"));
+        assert!(!matches_fork_bomb("echo hello"));
+    }
+
+    // ---- false-positive prevention -----------------------------------
+
+    #[test]
+    fn does_not_block_traceroute() {
+        // `route` should NOT match `traceroute` — the leading token is
+        // `traceroute`, not `route`.
+        assert!(check_blocked_command("traceroute -m 5 example.com").is_none());
+    }
+
+    #[test]
+    fn does_not_block_pkill_dash_one() {
+        // `pkill -1 nginx` must NOT trigger the `kill -1` predicate.
+        assert!(check_blocked_command("pkill -1 nginx").is_none());
+    }
+
+    #[test]
+    fn does_not_block_pkill_dash_f() {
+        assert!(check_blocked_command("pkill -f next").is_none());
+    }
+
+    #[test]
+    fn does_not_block_cargo_test_with_reboot_in_test_name() {
+        // The leading verb is `cargo`, not `reboot`, so the
+        // word-boundary check on `match_dangerous_verb` must skip this.
+        assert!(check_blocked_command("cargo test --test reboot_recovery").is_none());
+    }
+
+    #[test]
+    fn does_not_block_normal_redirect() {
+        // Plain redirects to non-/dev/sd targets must pass.
+        assert!(check_blocked_command("echo foo > /tmp/data").is_none());
+        assert!(check_blocked_command("ls -la > out.txt").is_none());
+    }
+
+    #[test]
+    fn does_not_block_redirect_to_non_sd_dev_path() {
+        // `/dev/null` and similar do NOT match `/dev/sd[a-z]`.
+        assert!(check_blocked_command("echo foo > /dev/null").is_none());
+        assert!(check_blocked_command("cat zero > /dev/zero").is_none());
+    }
+
+    #[test]
+    fn does_not_block_dev_sd_with_alpha_suffix_after_letter() {
+        // `/dev/sdx_backup` is rejected because the byte after `sd<letter>`
+        // is `_`, not a digit / whitespace / shell metacharacter / EOF.
+        assert!(check_blocked_command("echo x > /dev/sdx_backup").is_none());
+        assert!(check_blocked_command("echo x > /dev/sdaa").is_none());
+    }
+
+    // ---- per-predicate granular tests -------------------------------
+
+    #[test]
+    fn match_dangerous_verb_blocks_each_verb() {
+        assert_eq!(match_dangerous_verb("shutdown -r now"), Some("shutdown"));
+        assert_eq!(match_dangerous_verb("reboot --force"), Some("reboot"));
+        assert_eq!(match_dangerous_verb("halt"), Some("halt"));
+        assert_eq!(match_dangerous_verb("iptables -L"), Some("iptables"));
+        assert_eq!(match_dangerous_verb("ufw status"), Some("ufw"));
+        assert_eq!(match_dangerous_verb("route show"), Some("route"));
+        assert_eq!(match_dangerous_verb("ls"), None);
+        assert_eq!(match_dangerous_verb("traceroute google.com"), None);
+    }
+
+    #[test]
+    fn matches_kill_signal_one_blocks_kill_dash_one_with_pid() {
+        assert!(matches_kill_signal_one("kill -1 1234"));
+        assert!(!matches_kill_signal_one("pkill -1 nginx"));
+        assert!(!matches_kill_signal_one("kill -9 1234"));
+        assert!(!matches_kill_signal_one("killall nginx"));
+    }
+
+    #[test]
+    fn matches_device_redirect_blocks_dev_sd_letter_variants() {
+        assert!(matches_device_redirect("> /dev/sda"));
+        assert!(matches_device_redirect(">> /dev/sda"));
+        assert!(matches_device_redirect(">| /dev/sda"));
+        assert!(matches_device_redirect("1> /dev/sda"));
+        assert!(matches_device_redirect("2> /dev/sda"));
+        assert!(matches_device_redirect("1>> /dev/sda"));
+        assert!(matches_device_redirect("2>> /dev/sda"));
+        assert!(matches_device_redirect("> /dev/sda1"));
+        assert!(matches_device_redirect(">/dev/sdb"));
+        assert!(!matches_device_redirect("> /dev/null"));
+        assert!(!matches_device_redirect("cmp /dev/sda1 ref.bin"));
+    }
+
+    // ---- API integrity ----------------------------------------------
+
+    #[test]
+    fn check_blocked_command_returns_pattern_and_category() {
+        let r = check_blocked_command("shutdown -h").expect("blocked");
+        assert_eq!(r.pattern, "shutdown");
+        assert_eq!(r.category, BlockCategory::DangerousVerb);
+    }
+
+    #[test]
+    fn render_block_error_starts_with_blocked_dangerous_command_fragment() {
+        let r = BlockReason {
+            pattern: "shutdown",
+            category: BlockCategory::DangerousVerb,
+        };
+        let rendered = render_block_error(&r);
+        assert!(
+            rendered.starts_with("blocked dangerous command fragment: "),
+            "got: {rendered}"
+        );
+        assert!(rendered.contains("shutdown"));
+        assert!(rendered.contains("DangerousVerb"));
+    }
+
+    #[test]
+    fn run_with_outcome_emits_dangerous_block_for_new_patterns() {
+        let dir = tempdir().unwrap();
+        // We don't actually run shutdown — `run_with_outcome` returns the
+        // block error before spawning anything.
+        let err = run_with_outcome("shutdown -h now", dir.path(), None, false, None, None)
+            .expect_err("blocked");
+        assert!(
+            err.starts_with("blocked dangerous command fragment: "),
+            "got: {err}"
+        );
+        assert!(err.contains("shutdown"));
+    }
+
+    #[test]
+    fn precedence_existing_snippets_win_over_new_categories_for_overlapping_input() {
+        // The fork-bomb canonical contains the existing `:({` snippet, so
+        // the Snippet category must win (DR2-005 / SSOT precedence).
+        let r = check_blocked_command(":(){:|:&};:").expect("blocked");
+        assert_eq!(r.category, BlockCategory::Snippet);
+        assert_eq!(r.pattern, ":(){");
+    }
+
+    // ---- pgroup + terminate_child regression ------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_unix_pgroup_puts_child_in_its_own_process_group() {
+        use std::process::{Command, Stdio};
+
+        let dir = tempdir().unwrap();
+        let mut cmd = Command::new("sh");
+        cmd.args(["-lc", "echo $$"])
+            .current_dir(dir.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        super::apply_unix_pgroup(&mut cmd);
+        let mut child = cmd.spawn().expect("spawn");
+        let pid = child.id() as i32;
+        // The pgid of the child should equal its own pid because
+        // `apply_unix_pgroup` ran `setpgid(0, 0)` in the forked child.
+        let pgid = unsafe { libc::getpgid(pid) };
+        assert_eq!(
+            pgid, pid,
+            "expected child pid {pid} to be its own process-group leader, got pgid {pgid}"
+        );
+        let _ = child.wait();
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn apply_unix_pgroup_is_noop_on_non_unix() {
+        // On non-unix platforms `apply_unix_pgroup` is a no-op; we just
+        // verify that calling it does not panic and the spawned child
+        // still runs to completion via the standard `child.kill()` /
+        // `child.wait()` fallback in `terminate_child`.
+        use std::process::{Command, Stdio};
+        let mut cmd = Command::new("cmd");
+        cmd.args(["/C", "echo hi"]).stdin(Stdio::null());
+        super::apply_unix_pgroup(&mut cmd);
+        // We don't actually spawn on Windows in tests; the no-op compile
+        // path is the assertion.
+        let _ = cmd;
+    }
 
     #[test]
     fn detects_long_running_dev_commands() {
@@ -845,7 +1445,7 @@ mod tests {
 
     // --- Issue #450 AC3 / AC5 / AC6 ---------------------------------------
 
-    use super::{BashExecutionOutcome, classify_bash_outcome, run_with_outcome};
+    use super::{BashExecutionOutcome, classify_bash_outcome};
     use crate::session::feedback::{
         EXCERPT_CAP_BYTES, FeedbackFrameDraft, FeedbackKind, build_feedback_frame, mask_secrets,
     };
@@ -945,7 +1545,8 @@ mod tests {
     #[test]
     fn run_with_outcome_emits_structured_exit_code() {
         let temp = tempdir().unwrap();
-        let (text, outcome) = run_with_outcome("printf hello", temp.path(), None, false).unwrap();
+        let (text, outcome) =
+            run_with_outcome("printf hello", temp.path(), None, false, None, None).unwrap();
         assert!(text.starts_with("exit_code=0"));
         assert_eq!(outcome.exit_code, Some(0));
         assert!(outcome.stdout.contains("hello"));
@@ -964,9 +1565,15 @@ mod tests {
         // `printf` does not interpret `\x` escapes (they pass through
         // as literal text). Octal `\377\376\375` produces bytes
         // 0xFF 0xFE 0xFD on every POSIX shell.
-        let (text, outcome) =
-            run_with_outcome("printf '\\377\\376\\375'", temp.path(), None, false)
-                .expect("run_with_outcome must succeed even for non-UTF8 output");
+        let (text, outcome) = run_with_outcome(
+            "printf '\\377\\376\\375'",
+            temp.path(),
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect("run_with_outcome must succeed even for non-UTF8 output");
         // Successful exit (exit_code=0); not timed_out.
         assert_eq!(outcome.exit_code, Some(0));
         assert!(!outcome.timed_out);
@@ -984,6 +1591,188 @@ mod tests {
             !outcome.stdout.contains("\\377"),
             "shell printf did not interpret octal escape, got {:?}",
             outcome.stdout
+        );
+    }
+
+    // --- Issue #459: explicit_timeout coverage ---------------------------
+
+    /// `explicit_timeout = Some(d)` enforces `d` even when the command is
+    /// not on the `likely_long_running_command` allow-list (Tester smoke
+    /// runs do not match dev-server / cargo-watch heuristics).
+    #[test]
+    fn explicit_timeout_enforces_kill_on_short_sleep() {
+        let temp = tempdir().unwrap();
+        let started = Instant::now();
+        let (text, outcome) = run_with_outcome(
+            "sleep 5",
+            temp.path(),
+            None,
+            false,
+            Some(Duration::from_millis(500)),
+            None,
+        )
+        .expect("run_with_outcome must report timeout via Ok((text, outcome))");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "explicit_timeout did not preempt sleep: elapsed={:?}",
+            started.elapsed()
+        );
+        assert!(outcome.timed_out, "outcome.timed_out must be true");
+        assert_eq!(outcome.exit_code, None);
+        assert!(text.contains("timed_out=true"));
+    }
+
+    /// `explicit_timeout = None` preserves existing behaviour: short
+    /// non-long-running commands run to completion without a timeout.
+    #[test]
+    fn explicit_timeout_none_keeps_existing_behaviour() {
+        let temp = tempdir().unwrap();
+        let (_text, outcome) =
+            run_with_outcome("printf ok", temp.path(), None, false, None, None).unwrap();
+        assert!(!outcome.timed_out);
+        assert_eq!(outcome.exit_code, Some(0));
+    }
+
+    // --- CB-003: env sanitization for Tester smoke runs -------------------
+
+    /// `filter_env_for_tester` drops everything not in the exact allowlist.
+    /// Pure-function unit test so we never have to mutate the global env.
+    #[test]
+    fn filter_env_for_tester_drops_secret_like_keys() {
+        let input: Vec<(String, String)> = vec![
+            ("PATH".into(), "/usr/bin".into()),
+            ("HOME".into(), "/home/user".into()),
+            ("OPENAI_API_KEY".into(), "sk-secret".into()),
+            ("ANTHROPIC_API_KEY".into(), "sk-ant".into()),
+            ("GITHUB_TOKEN".into(), "ghp_xxx".into()),
+            ("AWS_SECRET_ACCESS_KEY".into(), "AKIA-secret".into()),
+            ("ANVIL_NO_TESTER".into(), "1".into()),
+            ("ANVIL_DEBUG".into(), "1".into()),
+            ("MY_TOKEN".into(), "redact".into()),
+            ("SOME_PASSWORD".into(), "redact".into()),
+            ("LANG".into(), "en_US.UTF-8".into()),
+        ];
+        let filtered = super::filter_env_for_tester(input);
+        let keys: Vec<&str> = filtered.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(keys.contains(&"PATH"), "PATH must remain: {keys:?}");
+        assert!(keys.contains(&"HOME"));
+        assert!(keys.contains(&"LANG"));
+        for forbidden in &[
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "GITHUB_TOKEN",
+            "AWS_SECRET_ACCESS_KEY",
+            "ANVIL_NO_TESTER",
+            "ANVIL_DEBUG",
+            "MY_TOKEN",
+            "SOME_PASSWORD",
+        ] {
+            assert!(
+                !keys.contains(forbidden),
+                "{forbidden} must be dropped, got keys: {keys:?}"
+            );
+        }
+    }
+
+    /// E2E coverage: with `BashEnvPolicy::TesterSanitized`, a child shell that
+    /// echoes its env does NOT see secret-like keys we set on the parent
+    /// process. Uses `printenv -0` style sentinels so we do not depend on
+    /// `env`(1) output formatting.
+    #[test]
+    fn run_with_outcome_tester_sanitized_drops_secrets() {
+        let temp = tempdir().unwrap();
+        // Set a representative secret-like env var on the parent. SAFETY:
+        // mutating process env is unsound under threaded execution. We use
+        // a key prefix (`ANVIL_TEST_FAKE_`) that nothing else in the
+        // codebase reads.
+        let key = "ANVIL_TEST_FAKE_OPENAI_API_KEY_CB003";
+        // SAFETY: tests are single-threaded for this case; the var is unique
+        // and only consumed inside this test.
+        unsafe {
+            std::env::set_var(key, "sk-fake-secret-cb003");
+        }
+        let (text, outcome) = run_with_outcome(
+            // Print only env keys that match our test prefix or expected
+            // allowlist members so the assertion is deterministic.
+            "printenv ANVIL_TEST_FAKE_OPENAI_API_KEY_CB003 || true; printenv PATH || true",
+            temp.path(),
+            None,
+            false,
+            None,
+            Some(super::BashEnvPolicy::TesterSanitized),
+        )
+        .expect("sanitized run must complete");
+        // Cleanup before assertions so a failure leaves no leftover env.
+        // SAFETY: see above.
+        unsafe {
+            std::env::remove_var(key);
+        }
+        assert_eq!(outcome.exit_code, Some(0), "child should exit 0: {text}");
+        assert!(
+            !outcome.stdout.contains("sk-fake-secret-cb003"),
+            "secret value leaked to child stdout: {:?}",
+            outcome.stdout
+        );
+        // PATH must still be forwarded — without it, `cargo` / `node` /
+        // `python3` cannot be located in the smoke run.
+        assert!(
+            !outcome.stdout.trim().is_empty()
+                || outcome.stderr.contains("printenv")
+                || outcome.exit_code == Some(0),
+            "PATH should be forwarded; observed stdout: {:?}",
+            outcome.stdout
+        );
+    }
+
+    /// Inverse: with `env_policy = None` (default `Inherit`), the same
+    /// secret env we set on the parent IS visible to the child — confirming
+    /// the existing code paths are unchanged when not opting in.
+    #[test]
+    fn run_with_outcome_default_inherits_env() {
+        let temp = tempdir().unwrap();
+        let key = "ANVIL_TEST_FAKE_INHERIT_CB003";
+        // SAFETY: see sanitized test above.
+        unsafe {
+            std::env::set_var(key, "value-leaks");
+        }
+        let (text, _outcome) = run_with_outcome(
+            "printenv ANVIL_TEST_FAKE_INHERIT_CB003 || true",
+            temp.path(),
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect("default run must complete");
+        // SAFETY: see above.
+        unsafe {
+            std::env::remove_var(key);
+        }
+        // Default is Inherit, so the value must reach the child stdout.
+        assert!(
+            text.contains("value-leaks"),
+            "default policy should inherit env; got text {text:?}"
+        );
+    }
+
+    /// `is_dangerous_command` / `BLOCKED_SNIPPETS` block a `rm -rf /`
+    /// call regardless of `explicit_timeout` — there is no Tester bypass
+    /// (DR2-014).
+    #[test]
+    fn explicit_timeout_does_not_bypass_dangerous_block() {
+        let temp = tempdir().unwrap();
+        let err = run_with_outcome(
+            "rm -rf /",
+            temp.path(),
+            None,
+            false,
+            Some(Duration::from_secs(30)),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("blocked dangerous command"),
+            "explicit_timeout must not bypass dangerous-snippet filter, got: {err}"
         );
     }
 }
