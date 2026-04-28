@@ -19,6 +19,11 @@ pub struct ToolContext {
     pub interactive_approval: bool,
     pub offline: bool,
     pub cancel_flag: Option<Arc<AtomicBool>>,
+    /// Issue #458: when set, paths starting with `tmp-tests/<rel>` resolve
+    /// against `<this>/files/` instead of `root`. `None` means tmp-tests is
+    /// not yet bound (CLI startup, unit tests); the prefix is then rejected
+    /// rather than flowing to the workspace root.
+    pub tmp_tests_root: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -75,12 +80,16 @@ impl ToolRegistry {
             }
             "Read" => {
                 let raw_path = get_required_string(arguments, "path")?;
-                let path = resolve_plan_mode_write_target(
-                    &context.root,
-                    raw_path,
-                    context.plan_path.as_deref(),
-                )?
-                .unwrap_or(resolve_user_path(&context.root, raw_path)?);
+                let path = if let Some(tmp_path) = resolve_tmp_tests_path(raw_path, context)? {
+                    tmp_path
+                } else {
+                    resolve_plan_mode_write_target(
+                        &context.root,
+                        raw_path,
+                        context.plan_path.as_deref(),
+                    )?
+                    .unwrap_or(resolve_user_path(&context.root, raw_path)?)
+                };
                 let start_line = get_optional_usize(arguments, "start_line");
                 let end_line = get_optional_usize(arguments, "end_line");
                 read::run(&path, start_line, end_line)
@@ -391,12 +400,53 @@ fn resolve_write_path(
     raw: &str,
     context: &ToolContext,
 ) -> Result<std::path::PathBuf, String> {
+    // Issue #458: tmp-tests/ prefix takes precedence over Plan mode plan-file
+    // routing — tmp-tests is a session-scoped namespace independent of the
+    // plan file constraint. Plan mode + tmp-tests/<rel> writes are still
+    // routed to the session's tmp-tests root.
+    if let Some(path) = resolve_tmp_tests_path(raw, context)? {
+        return Ok(path);
+    }
     if context.mode == ExecutionMode::Plan
         && let Some(path) = resolve_plan_mode_write_target(root, raw, context.plan_path.as_deref())?
     {
         return Ok(path);
     }
     resolve_user_path(root, raw)
+}
+
+/// Issue #458: resolve a `tmp-tests/<rel>` request to the session-scoped
+/// tmp-tests files root. Returns:
+///   * `Ok(Some(path))` when `raw` starts with `tmp-tests/` and a tmp-tests
+///     root is bound (`context.tmp_tests_root.is_some()`).
+///   * `Err(...)` when the prefix is used but no root is bound, OR when the
+///     literal `"tmp-tests"` (no trailing slash) is passed (which would
+///     otherwise be ambiguous with a workspace-root `tmp-tests` entry).
+///   * `Ok(None)` when `raw` is unrelated to tmp-tests; the caller falls
+///     through to its existing path resolution.
+pub(crate) fn resolve_tmp_tests_path(
+    raw: &str,
+    context: &ToolContext,
+) -> Result<Option<std::path::PathBuf>, String> {
+    if let Some(rel) = raw.strip_prefix("tmp-tests/") {
+        let tmp_root = context
+            .tmp_tests_root
+            .as_ref()
+            .ok_or_else(|| "tmp-tests root is unavailable in this context".to_string())?;
+        let files_root = tmp_root.join("files");
+        std::fs::create_dir_all(&files_root).map_err(|err| {
+            format!(
+                "failed to prepare tmp-tests files dir {}: {err}",
+                files_root.display()
+            )
+        })?;
+        let resolved = resolve_user_path(&files_root, rel)?;
+        return Ok(Some(resolved));
+    }
+    if raw == "tmp-tests" {
+        return Err("tmp-tests/ must be followed by a relative path".to_string());
+    }
+    Ok(None)
 }
 
 fn enforce_plan_stage_scope(
@@ -784,6 +834,7 @@ mod tests {
             interactive_approval: false,
             offline: false,
             cancel_flag: None,
+            tmp_tests_root: None,
         };
         let out = registry
             .execute(
@@ -825,6 +876,7 @@ mod tests {
             interactive_approval: false,
             offline: false,
             cancel_flag: None,
+            tmp_tests_root: None,
         };
         let err = enforce_plan_stage_scope(
             "Write",
@@ -856,6 +908,7 @@ mod tests {
             interactive_approval: false,
             offline: false,
             cancel_flag: None,
+            tmp_tests_root: None,
         };
         enforce_plan_stage_scope(
             "Edit",
@@ -891,6 +944,7 @@ mod tests {
             interactive_approval: false,
             offline: false,
             cancel_flag: None,
+            tmp_tests_root: None,
         };
         ToolRegistry::default()
             .execute(
@@ -931,6 +985,7 @@ mod tests {
             interactive_approval: false,
             offline: false,
             cancel_flag: None,
+            tmp_tests_root: None,
         };
         ToolRegistry::default()
             .execute(
@@ -969,6 +1024,7 @@ mod tests {
             interactive_approval: false,
             offline: false,
             cancel_flag: None,
+            tmp_tests_root: None,
         };
         let (text_result, outcome) =
             registry.execute_bash_with_outcome(&json!({"command": "printf hello"}), &context);
@@ -996,6 +1052,7 @@ mod tests {
             interactive_approval: false,
             offline: false,
             cancel_flag: None,
+            tmp_tests_root: None,
         };
         let (text_result, outcome) =
             registry.execute_bash_with_outcome(&json!({"command": "rm -rf /"}), &context);
@@ -1021,6 +1078,7 @@ mod tests {
             interactive_approval: false,
             offline: false,
             cancel_flag: None,
+            tmp_tests_root: None,
         };
         let (text_result, outcome) = registry.execute_bash_with_outcome(&json!({}), &context);
         let (_msg, class) = text_result.expect_err("missing command must error");
@@ -1044,6 +1102,7 @@ mod tests {
             interactive_approval: false,
             offline: false,
             cancel_flag: None,
+            tmp_tests_root: None,
         };
         let (text_result, outcome) =
             registry.execute_bash_with_outcome(&json!({"command": "ls"}), &context);
@@ -1068,6 +1127,7 @@ mod tests {
             interactive_approval: false,
             offline: true,
             cancel_flag: None,
+            tmp_tests_root: None,
         };
         let (text_result, outcome) =
             registry.execute_bash_with_outcome(&json!({"command": "curl example.com"}), &context);
@@ -1092,11 +1152,169 @@ mod tests {
             interactive_approval: false,
             offline: false,
             cancel_flag: None,
+            tmp_tests_root: None,
         };
         let (text_result, outcome) =
             registry.execute_bash_with_outcome(&json!({"command": "ls"}), &context);
         let (_msg, class) = text_result.expect_err("plan mode must reject Bash");
         assert_eq!(class, BashErrorClass::ModeOrScopeDenied);
         assert!(outcome.is_none());
+    }
+
+    // ----- Issue #458: resolve_tmp_tests_path / tmp-tests prefix routing -----
+
+    fn act_context_with_tmp(
+        root: &std::path::Path,
+        tmp_tests_root: Option<&std::path::Path>,
+    ) -> ToolContext {
+        ToolContext {
+            root: root.to_path_buf(),
+            mode: ExecutionMode::Act,
+            plan_path: None,
+            plan_stage: PlanStage::Stage1,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            cancel_flag: None,
+            tmp_tests_root: tmp_tests_root.map(|p| p.to_path_buf()),
+        }
+    }
+
+    #[test]
+    fn resolve_tmp_tests_path_returns_none_for_unrelated_paths() {
+        let temp = tempdir().unwrap();
+        let ctx = act_context_with_tmp(temp.path(), None);
+        let out = super::resolve_tmp_tests_path("src/main.rs", &ctx).unwrap();
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn resolve_tmp_tests_path_routes_prefix_to_files_root() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let tmp_tests = temp.path().join("tmp-tests");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let ctx = act_context_with_tmp(&workspace, Some(&tmp_tests));
+        let out = super::resolve_tmp_tests_path("tmp-tests/src/test_foo.rs", &ctx)
+            .unwrap()
+            .expect("Some(path) for prefixed input");
+        let expected = std::fs::canonicalize(tmp_tests.join("files")).unwrap();
+        assert!(out.starts_with(&expected), "got {}", out.display());
+        assert!(out.ends_with("src/test_foo.rs"));
+    }
+
+    #[test]
+    fn resolve_tmp_tests_path_rejects_when_root_unbound() {
+        let temp = tempdir().unwrap();
+        let ctx = act_context_with_tmp(temp.path(), None);
+        let err = super::resolve_tmp_tests_path("tmp-tests/x.rs", &ctx).unwrap_err();
+        assert!(err.contains("unavailable"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_tmp_tests_path_rejects_bare_prefix_without_slash() {
+        let temp = tempdir().unwrap();
+        let tmp_tests = temp.path().join("tmp-tests");
+        let ctx = act_context_with_tmp(temp.path(), Some(&tmp_tests));
+        let err = super::resolve_tmp_tests_path("tmp-tests", &ctx).unwrap_err();
+        assert!(err.contains("relative path"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_tmp_tests_path_rejects_path_traversal() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let tmp_tests = temp.path().join("tmp-tests");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let ctx = act_context_with_tmp(&workspace, Some(&tmp_tests));
+        let err = super::resolve_tmp_tests_path("tmp-tests/../escape.rs", &ctx).unwrap_err();
+        assert!(err.contains("escape") || err.contains(".."), "got: {err}");
+    }
+
+    #[test]
+    fn write_with_tmp_tests_prefix_does_not_leak_to_workspace() {
+        // Issue #458 acceptance #4 (create-direction regression):
+        // a Write tmp-tests/<rel> must NOT create a file under workspace root.
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let tmp_tests = temp.path().join("state/tmp-tests");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let registry = ToolRegistry::default();
+        let context = ToolContext {
+            root: workspace.clone(),
+            mode: ExecutionMode::Act,
+            plan_path: None,
+            plan_stage: PlanStage::Stage1,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            cancel_flag: None,
+            tmp_tests_root: Some(tmp_tests.clone()),
+        };
+        registry
+            .execute(
+                "Write",
+                &json!({"path": "tmp-tests/src/test_foo.rs", "content": "#[test] fn it(){}"}),
+                &context,
+            )
+            .unwrap();
+        // workspace is clean
+        assert!(!workspace.join("src/test_foo.rs").exists());
+        assert!(!workspace.join("tmp-tests").exists());
+        // tmp-tests has the body
+        assert!(tmp_tests.join("files/src/test_foo.rs").exists());
+    }
+
+    #[test]
+    fn write_with_tmp_tests_prefix_when_root_is_none_is_rejected() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let registry = ToolRegistry::default();
+        let context = ToolContext {
+            root: workspace.clone(),
+            mode: ExecutionMode::Act,
+            plan_path: None,
+            plan_stage: PlanStage::Stage1,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            cancel_flag: None,
+            tmp_tests_root: None,
+        };
+        let err = registry
+            .execute(
+                "Write",
+                &json!({"path": "tmp-tests/x.rs", "content": "x"}),
+                &context,
+            )
+            .unwrap_err();
+        assert!(err.contains("unavailable"), "got: {err}");
+    }
+
+    #[test]
+    fn read_with_tmp_tests_prefix_reads_from_files_root() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let tmp_tests = temp.path().join("state/tmp-tests");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(tmp_tests.join("files/src")).unwrap();
+        std::fs::write(tmp_tests.join("files/src/foo.rs"), b"hello tmp").unwrap();
+        let registry = ToolRegistry::default();
+        let context = ToolContext {
+            root: workspace,
+            mode: ExecutionMode::Act,
+            plan_path: None,
+            plan_stage: PlanStage::Stage1,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            cancel_flag: None,
+            tmp_tests_root: Some(tmp_tests),
+        };
+        let out = registry
+            .execute("Read", &json!({"path": "tmp-tests/src/foo.rs"}), &context)
+            .unwrap();
+        assert!(out.contains("hello tmp"), "got: {out}");
     }
 }

@@ -1,5 +1,25 @@
 # Changelog
 
+## [Unreleased]
+
+## [0.2.0] - 2026-04-28
+
+Epic A: Dynamic Precaution Runtime — runtime feedback の正規化、Active Precaution の永続化、Reminder Sidecar による自動生成、Act-mode prompt への注入、`/precautions` REPL コマンド、ランタイム回復経路との接続を一通り入れた。
+
+### Added
+
+- `FeedbackFrame` / `FeedbackKind` runtime feedback 値型 (#450)。Bash / auto_test / tool parser failure / unsafe command block / no-progress / edit failure を共通 shape に正規化し、`SessionSnapshot.last_feedback` に保存。secret mask（token prefix / kv secret / URL credential）と head+tail 8 KiB excerpt cap、PathBuf workspace 相対化を含む。
+- `WorkingMemory.active_precautions` と `Precaution` 型 (#451)。SHA-256 deterministic id、FIFO eviction、bounded caps（active 16 / total 64 / text 240）、untrusted-load sanitizer、`format_for_prompt` での Active Precautions セクション出力。
+- Reminder Sidecar (#452)。`FeedbackFrame` の失敗系 kind を sidecar Ollama に渡して `Precaution` を自動生成（per-turn cap = 1、`tools=None`、JSON-only、`<think>` strip + first JSON object 抽出、`ANVIL_NO_REMINDER` で disable 可）。`agent.reminder.{completed,failed,skipped}` ログ出力。
+- Active Precautions の Act-mode prompt 注入 (#453)。`select_precautions_for_prompt` で severity sort、touched/suspected ファイル相対の relevance scoring、token budget cap（`MAX_ACTIVE_PRECAUTIONS_PROMPT=8` / `MAX_ACTIVE_PRECAUTIONS_CHARS=1024`）、Plan-mode 抑止を適用。
+- `/precautions [add <text>|retire <id>|clear]` REPL コマンド (#454)。Active precautions を一覧 / 追加 / retire / clear。`PrecautionSource::as_label` で表示と `compute_precaution_id` の source label を共有。
+- Runtime recovery と precaution の接続 (#455)。`FeedbackKind::NoToolCall` (D1) と deterministic content fallback (D2) を追加し、no-tool-call exhaustion / 5 つの in-loop fallback success / 2 つの timeout wrapper / 3 つの post-loop site で feedback を記録。`eligible_feedback_recorded_this_turn` flag で first-eligible-failure-wins を保証。
+
+### Fixed
+
+- `history_roundtrip_via_append_and_load` ほか rustyline history テストの flaky を解消 (#443)。rustyline 14 の `History::save()` が umask を非アトミックに反転する race を、test ファイル全体を process-wide Mutex で直列化することで回避。
+- `non_utf8_stdout_does_not_panic_or_error` テストを CI の dash で安定化。`printf '\xff\xfe\xfd'` を POSIX 互換の `printf '\377\376\375'` に置換し、escape が展開されなかった場合の guard assertion を追加。
+
 ## [0.1.0] - 2026-04-16
 
 - Rebuilt Anvil from scratch as an Ollama-first local coding agent.

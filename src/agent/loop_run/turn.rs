@@ -3933,6 +3933,13 @@ impl Agent {
         {
             return user_interrupt_result();
         }
+        let tmp_tests_root = Some(
+            self.session_store
+                .state_root()
+                .join("sessions")
+                .join(self.session_store.session_id())
+                .join("tmp-tests"),
+        );
         let context = ToolContext {
             root: self.work_root.clone(),
             mode: self.session.mode_state.mode,
@@ -3942,6 +3949,7 @@ impl Agent {
             interactive_approval: io::stdin().is_terminal(),
             offline: self.config.offline,
             cancel_flag,
+            tmp_tests_root,
         };
 
         // CB-001: Bash dispatch goes through the structured-outcome path so we
