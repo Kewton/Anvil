@@ -1059,6 +1059,11 @@ mod tests {
             working_memory: Default::default(),
             last_feedback: None,
             eligible_feedback_recorded_this_turn: false,
+            last_anvil_score: None,
+            unsafe_blocks_this_turn: 0,
+            consecutive_no_progress_turns: 0,
+            repo_edit_succeeded_this_turn: false,
+            touched_files_at_turn_start: Vec::new(),
         };
         let v = ShowView::from_snapshot(&snap);
         assert_eq!(v.id, "sid");

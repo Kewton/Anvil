@@ -1,3 +1,4 @@
+pub mod anvil_score;
 pub mod compact;
 pub mod discovery;
 pub mod feedback;
