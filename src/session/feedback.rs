@@ -40,9 +40,36 @@ pub enum FeedbackKind {
     NoRepoProgress,
     UnsafeCommandBlocked,
     NoVerifierAvailable,
+    /// Issue #455 / D1: agent finished a turn without making any tool call
+    /// (no_tool_retries exhausted, or answer-only inadequate-reply path).
+    /// serde tag = "no_tool_call".
+    NoToolCall,
     #[serde(other)]
     #[default]
     UnknownFailure,
+}
+
+impl FeedbackKind {
+    /// True when this kind would trigger a Reminder Sidecar call.
+    /// Mirror of the `=> Some(_)` arms in `reminder::normalize_source`.
+    /// Kept in sync via `normalize_source_matrix` and
+    /// `is_eligible_for_reminder_parity` tests (Issue #455 / DR1-003).
+    pub fn is_eligible_for_reminder(&self) -> bool {
+        use FeedbackKind::*;
+        matches!(
+            self,
+            CompileError
+                | TypeError
+                | LintFailure
+                | Timeout
+                | TestFailure
+                | ToolProtocolFailure
+                | EditFailure
+                | NoRepoProgress
+                | UnsafeCommandBlocked
+                | NoToolCall
+        )
+    }
 }
 
 /// Sealed runtime feedback record. Text fields (`command` / `stdout_excerpt`
@@ -441,6 +468,48 @@ mod tests {
     fn unknown_feedback_kind_deserializes_as_unknown_failure() {
         let kind: FeedbackKind = serde_json::from_str("\"future_unseen_kind\"").unwrap();
         assert_eq!(kind, FeedbackKind::UnknownFailure);
+    }
+
+    /// Issue #455 / D1: NoToolCall serializes to snake_case "no_tool_call".
+    #[test]
+    fn no_tool_call_serializes_as_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&FeedbackKind::NoToolCall).unwrap(),
+            "\"no_tool_call\""
+        );
+    }
+
+    /// Issue #455 / D1: round-trip serialize/deserialize of NoToolCall.
+    #[test]
+    fn no_tool_call_roundtrips_through_serde() {
+        let original = FeedbackKind::NoToolCall;
+        let json = serde_json::to_string(&original).unwrap();
+        let decoded: FeedbackKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    /// Issue #455 / DR1-003: explicit truth table for every FeedbackKind
+    /// variant. This is the single source-of-truth for which kinds drive the
+    /// Reminder Sidecar.
+    #[test]
+    fn is_eligible_for_reminder_matrix() {
+        use FeedbackKind::*;
+        // Pass kinds and meta kinds → not eligible.
+        assert!(!BuildPass.is_eligible_for_reminder());
+        assert!(!TestPass.is_eligible_for_reminder());
+        assert!(!NoVerifierAvailable.is_eligible_for_reminder());
+        assert!(!UnknownFailure.is_eligible_for_reminder());
+        // Failure kinds → eligible.
+        assert!(CompileError.is_eligible_for_reminder());
+        assert!(TestFailure.is_eligible_for_reminder());
+        assert!(TypeError.is_eligible_for_reminder());
+        assert!(LintFailure.is_eligible_for_reminder());
+        assert!(Timeout.is_eligible_for_reminder());
+        assert!(ToolProtocolFailure.is_eligible_for_reminder());
+        assert!(EditFailure.is_eligible_for_reminder());
+        assert!(NoRepoProgress.is_eligible_for_reminder());
+        assert!(UnsafeCommandBlocked.is_eligible_for_reminder());
+        assert!(NoToolCall.is_eligible_for_reminder());
     }
 
     #[test]

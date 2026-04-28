@@ -219,18 +219,27 @@ where
         .unwrap_or(false)
 }
 
-/// Whether the FeedbackKind triggers a Reminder call.
+/// Whether the FeedbackKind triggers a Reminder call. Issue #455 / DR1-003:
+/// thin wrapper over `FeedbackKind::is_eligible_for_reminder()` — kept here
+/// for API compatibility with #452 callers. The
+/// `is_eligible_for_reminder_parity` test pins the two in sync.
 pub fn kind_eligible(kind: &FeedbackKind) -> bool {
-    normalize_source(kind).is_some()
+    kind.is_eligible_for_reminder()
 }
 
 /// Map FeedbackKind → canonical PrecautionSource. None = Reminder is skipped.
+///
+/// Issue #455 / D1-a: `NoToolCall` (the agent finished a turn without making
+/// any tool call) maps to `ToolFailure` rather than getting its own variant.
+/// Semantically the failure category "tool was not invoked" is a subset of
+/// "tool-related failure"; reusing the source keeps the prompt and
+/// `/precautions` rendering paths unchanged.
 pub fn normalize_source(kind: &FeedbackKind) -> Option<PrecautionSource> {
     use FeedbackKind::*;
     match kind {
         CompileError | TypeError | LintFailure | Timeout => Some(PrecautionSource::BuildFailure),
         TestFailure => Some(PrecautionSource::TestFailure),
-        ToolProtocolFailure | EditFailure => Some(PrecautionSource::ToolFailure),
+        ToolProtocolFailure | EditFailure | NoToolCall => Some(PrecautionSource::ToolFailure),
         NoRepoProgress => Some(PrecautionSource::NoProgress),
         UnsafeCommandBlocked => Some(PrecautionSource::SafetyPolicy),
         BuildPass | TestPass | NoVerifierAvailable | UnknownFailure => None,
@@ -784,10 +793,47 @@ mod tests {
             normalize_source(&UnsafeCommandBlocked),
             Some(PrecautionSource::SafetyPolicy)
         );
+        // Issue #455 / D1-a: NoToolCall reuses ToolFailure source.
+        assert_eq!(
+            normalize_source(&NoToolCall),
+            Some(PrecautionSource::ToolFailure)
+        );
         assert_eq!(normalize_source(&BuildPass), None);
         assert_eq!(normalize_source(&TestPass), None);
         assert_eq!(normalize_source(&NoVerifierAvailable), None);
         assert_eq!(normalize_source(&UnknownFailure), None);
+    }
+
+    /// Issue #455 / DR2-005: parity between `normalize_source` and
+    /// `FeedbackKind::is_eligible_for_reminder`. Iterates over every
+    /// FeedbackKind variant explicitly so the CI fails if either side
+    /// gets updated without the other.
+    #[test]
+    fn is_eligible_for_reminder_parity() {
+        use FeedbackKind::*;
+        const ALL_KINDS: [FeedbackKind; 14] = [
+            BuildPass,
+            TestPass,
+            CompileError,
+            TestFailure,
+            TypeError,
+            LintFailure,
+            Timeout,
+            ToolProtocolFailure,
+            EditFailure,
+            NoRepoProgress,
+            UnsafeCommandBlocked,
+            NoVerifierAvailable,
+            NoToolCall,
+            UnknownFailure,
+        ];
+        for kind in ALL_KINDS.iter() {
+            assert_eq!(
+                normalize_source(kind).is_some(),
+                kind.is_eligible_for_reminder(),
+                "parity broken for {kind:?}"
+            );
+        }
     }
 
     // -- 4. precaution_from_draft -------------------------------------------
@@ -1076,6 +1122,48 @@ mod tests {
         assert_eq!(wm.active_precautions.len(), before);
     }
 
+    /// Issue #455 / Task 2.2: drive `run_reminder_with_strategy` with a
+    /// `FeedbackKind::NoToolCall` fixture and assert that the precaution is
+    /// added with the correct source (`ToolFailure`) and the
+    /// `feedback_kind` field on the outcome equals `NoToolCall`. Also
+    /// asserts the build_log_payload serializes the kind as
+    /// `"no_tool_call"`.
+    #[test]
+    fn run_reminder_with_strategy_drives_no_tool_call() {
+        let frame = frame_with_kind(FeedbackKind::NoToolCall);
+        let mut wm = WorkingMemory::default();
+        let outcome = run_reminder_with_strategy(inputs_for(&frame), &mut wm, &workspace(), |_| {
+            Ok(ok_reply(
+                r#"{"precautions":[{"severity":"high","text":"emit a concrete tool call next turn"}]}"#,
+            ))
+        });
+        match &outcome {
+            ReminderOutcome::Completed {
+                added_count,
+                parse_status,
+                feedback_kind,
+                ..
+            } => {
+                assert_eq!(*added_count, 1);
+                assert_eq!(*parse_status, ParseStatus::Ok);
+                assert_eq!(*feedback_kind, FeedbackKind::NoToolCall);
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+        assert_eq!(wm.active_precautions.len(), 1);
+        // Source must be ToolFailure (D1-a).
+        assert_eq!(
+            wm.active_precautions[0].source,
+            PrecautionSource::ToolFailure
+        );
+        // Log payload must serialize feedback_kind as "no_tool_call".
+        let (_event, payload) = build_log_payload(&outcome, "sess", Some("model"));
+        assert_eq!(
+            payload.get("feedback_kind").and_then(|v| v.as_str()),
+            Some("no_tool_call")
+        );
+    }
+
     // -- 8. build_log_payload (AC-13) ---------------------------------------
 
     fn make_completed() -> ReminderOutcome {
@@ -1174,5 +1262,319 @@ mod tests {
         assert!(obj.get("model").unwrap().is_null());
         assert!(obj.get("prompt").unwrap().is_null());
         assert!(obj.get("response_raw").unwrap().is_null());
+    }
+
+    // ---------------------------------------------------------------------
+    // -- 9. Issue #455 / Phase 5 acceptance tests --------------------------
+    // ---------------------------------------------------------------------
+    //
+    // Each AC test drives `run_reminder_with_strategy` with a fixture closure
+    // that returns a precaution whose text matches the AC regex (per Issue
+    // body §10 / design policy §10). We cannot exercise the live reminder
+    // sidecar prompt here (CI does not have Ollama), so we pin the contract
+    // that "given a frame of kind X and a hypothetical sidecar reply
+    // matching regex R, the precaution lands in WorkingMemory with text
+    // matching R". Mismatch with real sidecar output is tracked separately
+    // in dev-reports/issue/455 and is out of scope for this issue.
+
+    /// Helper: drive the reminder loop once with a fixed reply and assert
+    /// the first stored precaution text matches the supplied regex.
+    /// Compile the AC regex with ASCII-only case-insensitivity. The
+    /// `regex` crate is configured without `unicode-case` (Cargo.toml), so
+    /// `(?i)` is unsupported. We lowercase the haystack before matching to
+    /// keep the AC patterns short and human-readable.
+    fn assert_ac_regex(kind: FeedbackKind, text: &str, pattern: &str) {
+        let frame = frame_with_kind(kind.clone());
+        let mut wm = WorkingMemory::default();
+        let body = format!(
+            r#"{{"precautions":[{{"severity":"high","text":{}}}]}}"#,
+            serde_json::to_string(text).unwrap()
+        );
+        let outcome = run_reminder_with_strategy(inputs_for(&frame), &mut wm, &workspace(), |_| {
+            Ok(ok_reply(&body))
+        });
+        match outcome {
+            ReminderOutcome::Completed { added_count, .. } => {
+                assert_eq!(added_count, 1, "expected 1 precaution stored, body={body}");
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+        assert_eq!(wm.active_precautions.len(), 1);
+        let stored = wm.active_precautions[0].text.to_ascii_lowercase();
+        let re = regex::Regex::new(pattern).expect("regex compiles");
+        assert!(
+            re.is_match(&stored),
+            "AC regex mismatch for kind {kind:?}: pattern={pattern} stored={stored}"
+        );
+    }
+
+    /// AC: focused edit failure → text matches `read.{0,4}before.{0,4}edit|read first|verify (the )?file`.
+    #[test]
+    fn ac_focused_edit_text_matches_regex() {
+        assert_ac_regex(
+            FeedbackKind::EditFailure,
+            "Read the target file before edit; verify the file exists.",
+            r"read.{0,4}before.{0,4}edit|read first|verify (the )?file",
+        );
+    }
+
+    /// AC: repeated bash command → text matches `avoid (re)?running|do not (re)?run|repeat|same command`.
+    #[test]
+    fn ac_repeated_bash_text_matches_regex() {
+        assert_ac_regex(
+            FeedbackKind::Timeout,
+            "Avoid rerunning the same command; vary the args before retry.",
+            r"avoid (re)?running|do not (re)?run|repeat|same command",
+        );
+    }
+
+    /// AC: unsafe command blocked → text matches `unsafe|denied|safety|policy`.
+    #[test]
+    fn ac_unsafe_block_text_matches_regex() {
+        assert_ac_regex(
+            FeedbackKind::UnsafeCommandBlocked,
+            "Command was blocked by the safety policy; choose a safer alternative.",
+            r"unsafe|denied|safety|policy",
+        );
+    }
+
+    /// AC: no repo progress → text matches `narrow|focus|reduce scope|smaller|specific (file|target)`.
+    #[test]
+    fn ac_no_repo_progress_text_matches_regex() {
+        assert_ac_regex(
+            FeedbackKind::NoRepoProgress,
+            "Narrow the scope and focus on a specific file before retrying.",
+            r"narrow|focus|reduce scope|smaller|specific (file|target)",
+        );
+    }
+
+    /// AC: parser failure → text matches `tool call|valid .*json|valid .*tool|parser|format|compact`.
+    #[test]
+    fn ac_parser_failure_text_matches_regex() {
+        assert_ac_regex(
+            FeedbackKind::ToolProtocolFailure,
+            "Emit a single valid tool call in compact format next turn.",
+            r"tool call|valid .*json|valid .*tool|parser|format|compact",
+        );
+    }
+
+    /// AC (D1): NoToolCall → text matches `tool call|concrete action|use .*tool|emit .*tool|repo work`.
+    #[test]
+    fn ac_no_tool_call_text_matches_regex() {
+        assert_ac_regex(
+            FeedbackKind::NoToolCall,
+            "Emit a concrete tool call next turn instead of prose.",
+            r"tool call|concrete action|use .*tool|emit .*tool|repo work",
+        );
+    }
+
+    /// AC (D2): deterministic content fallback → ToolProtocolFailure with
+    /// regex `deterministic|fallback|placeholder|scaffold|quality gate|repair|polish`.
+    #[test]
+    fn ac_deterministic_content_fallback_text_matches_regex() {
+        assert_ac_regex(
+            FeedbackKind::ToolProtocolFailure,
+            "Avoid relying on the deterministic fallback; produce concrete content.",
+            r"deterministic|fallback|placeholder|scaffold|quality gate|repair|polish",
+        );
+    }
+
+    // -- D4 same-turn conflict guard --------------------------------------
+
+    /// Issue #455 / D4 / CB-001: when an UnsafeCommandBlocked frame is
+    /// recorded during this turn via `record_feedback_tracked`, a follow-up
+    /// call with `record_feedback_if_unset` passing a NoToolCall / D2 frame
+    /// must NOT overwrite the unsafe frame. (This duplicates the store.rs
+    /// unit test but pins it again at the integration boundary using the
+    /// `SessionSnapshot` API.)
+    #[test]
+    fn d4_same_turn_unsafe_frame_wins_over_no_tool_call() {
+        use crate::session::store::SessionSnapshot;
+        let mut snap = SessionSnapshot::default();
+        // Fire 1: UnsafeCommandBlocked recorded this turn (sets the in-snapshot flag).
+        let unsafe_frame: FeedbackFrame =
+            serde_json::from_str(r#"{"kind":"unsafe_command_blocked"}"#).unwrap();
+        snap.record_feedback(unsafe_frame);
+        assert!(snap.eligible_feedback_recorded_this_turn);
+        // Fire 2: D2 / D1 frame attempted via guard — must be no-op.
+        let d2_frame: FeedbackFrame = serde_json::from_str(
+            r#"{"kind":"tool_protocol_failure","primary_error":"deterministic_content_fallback"}"#,
+        )
+        .unwrap();
+        snap.record_feedback_if_unset(d2_frame);
+        assert_eq!(
+            snap.last_feedback.unwrap().kind,
+            FeedbackKind::UnsafeCommandBlocked,
+            "this-turn unsafe frame must win over follow-up D2"
+        );
+    }
+
+    // -- Reminder failure modes -------------------------------------------
+
+    /// Failure mode (a): sidecar Ollama call fails (e.g. timeout).
+    /// Outcome must be `Failed` with `LlmCall` reason; `active_precautions`
+    /// must be unchanged; the log payload must serialize
+    /// `feedback_kind = "no_tool_call"`.
+    #[test]
+    fn ac_failure_mode_llm_call_error() {
+        let frame = frame_with_kind(FeedbackKind::NoToolCall);
+        let mut wm = WorkingMemory::default();
+        let outcome = run_reminder_with_strategy(inputs_for(&frame), &mut wm, &workspace(), |_| {
+            Err("connection timed out".to_string())
+        });
+        match &outcome {
+            ReminderOutcome::Failed {
+                reason,
+                feedback_kind,
+                ..
+            } => {
+                match reason {
+                    FailureReason::LlmCall(msg) => assert_eq!(msg, "connection timed out"),
+                    other => panic!("expected LlmCall, got {other:?}"),
+                }
+                assert_eq!(*feedback_kind, FeedbackKind::NoToolCall);
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert!(wm.active_precautions.is_empty());
+        let (_event, payload) = build_log_payload(&outcome, "sess", Some("model"));
+        assert_eq!(
+            payload.get("feedback_kind").and_then(|v| v.as_str()),
+            Some("no_tool_call")
+        );
+    }
+
+    /// Failure mode (b): malformed JSON. Outcome is `Completed` with
+    /// `parse_status = malformed` and `added_count = 0`. (Per design — a
+    /// non-JSON sidecar reply is degenerate but not protocol-breaking.)
+    #[test]
+    fn ac_failure_mode_malformed_json() {
+        let frame = frame_with_kind(FeedbackKind::NoToolCall);
+        let mut wm = WorkingMemory::default();
+        let outcome = run_reminder_with_strategy(inputs_for(&frame), &mut wm, &workspace(), |_| {
+            Ok(ok_reply("garbage not json"))
+        });
+        match &outcome {
+            ReminderOutcome::Completed {
+                parse_status,
+                added_count,
+                feedback_kind,
+                ..
+            } => {
+                assert_eq!(*parse_status, ParseStatus::Malformed);
+                assert_eq!(*added_count, 0);
+                assert_eq!(*feedback_kind, FeedbackKind::NoToolCall);
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+        assert!(wm.active_precautions.is_empty());
+    }
+
+    /// Failure mode (c): sidecar returns non-empty `tool_calls`. Must surface
+    /// `Failed { reason: UnexpectedToolCalls }`.
+    #[test]
+    fn ac_failure_mode_unexpected_tool_calls() {
+        use crate::ollama::xml_fallback::ToolCall;
+        let frame = frame_with_kind(FeedbackKind::NoToolCall);
+        let mut wm = WorkingMemory::default();
+        let outcome = run_reminder_with_strategy(inputs_for(&frame), &mut wm, &workspace(), |_| {
+            Ok(AssistantReply {
+                content: r#"{"precautions":[{"severity":"high","text":"x"}]}"#.to_string(),
+                tool_calls: vec![ToolCall {
+                    id: "tc-1".to_string(),
+                    name: "shell".to_string(),
+                    arguments: serde_json::json!({}),
+                }],
+            })
+        });
+        match &outcome {
+            ReminderOutcome::Failed {
+                reason,
+                feedback_kind,
+                ..
+            } => {
+                assert_eq!(*reason, FailureReason::UnexpectedToolCalls);
+                assert_eq!(*feedback_kind, FeedbackKind::NoToolCall);
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert!(wm.active_precautions.is_empty());
+    }
+
+    /// Failure mode (d): connection failure. Same shape as (a) but driven
+    /// by a different error message; the failure_reason in the log payload
+    /// must start with `llm_call:`.
+    #[test]
+    fn ac_failure_mode_connection_unavailable() {
+        let frame = frame_with_kind(FeedbackKind::NoToolCall);
+        let mut wm = WorkingMemory::default();
+        let outcome = run_reminder_with_strategy(inputs_for(&frame), &mut wm, &workspace(), |_| {
+            Err("connection refused".to_string())
+        });
+        let (event, payload) = build_log_payload(&outcome, "sess", Some("model"));
+        assert_eq!(event, "agent.reminder.failed");
+        let failure_reason = payload
+            .get("failure_reason")
+            .and_then(|v| v.as_str())
+            .expect("failure_reason");
+        assert!(
+            failure_reason.starts_with("llm_call:"),
+            "expected llm_call: prefix, got {failure_reason}"
+        );
+        assert!(wm.active_precautions.is_empty());
+    }
+
+    // -- E2E-shaped regression for both new wirings -----------------------
+
+    /// Issue #455 Task 5.4 / E2E-shaped: drive the reminder pipeline twice,
+    /// once for D1 (NoToolCall) and once for D2 (deterministic content
+    /// fallback), and assert each delivers a precaution whose text matches
+    /// the corresponding AC regex. This pins the wiring at the
+    /// `run_reminder_with_strategy` boundary against a future regression
+    /// that silently changes either kind's normalize_source.
+    #[test]
+    fn d1_d2_both_deliver_precaution_to_working_memory() {
+        let workspace = workspace();
+        // D1: NoToolCall.
+        let d1_frame = frame_with_kind(FeedbackKind::NoToolCall);
+        let mut d1_wm = WorkingMemory::default();
+        let d1_outcome = run_reminder_with_strategy(
+            inputs_for(&d1_frame),
+            &mut d1_wm,
+            &workspace,
+            |_| {
+                Ok(ok_reply(
+                    r#"{"precautions":[{"severity":"high","text":"emit a concrete tool call now"}]}"#,
+                ))
+            },
+        );
+        assert!(matches!(d1_outcome, ReminderOutcome::Completed { .. }));
+        assert_eq!(d1_wm.active_precautions.len(), 1);
+        assert_eq!(
+            d1_wm.active_precautions[0].source,
+            PrecautionSource::ToolFailure
+        );
+
+        // D2: ToolProtocolFailure with deterministic_content_fallback tag.
+        // Note: the kind alone is enough — the tag travels through
+        // primary_error in the prompt only, not through the precaution.
+        let d2_frame = frame_with_kind(FeedbackKind::ToolProtocolFailure);
+        let mut d2_wm = WorkingMemory::default();
+        let d2_outcome = run_reminder_with_strategy(
+            inputs_for(&d2_frame),
+            &mut d2_wm,
+            &workspace,
+            |_| {
+                Ok(ok_reply(
+                    r#"{"precautions":[{"severity":"high","text":"avoid relying on the deterministic fallback"}]}"#,
+                ))
+            },
+        );
+        assert!(matches!(d2_outcome, ReminderOutcome::Completed { .. }));
+        assert_eq!(d2_wm.active_precautions.len(), 1);
+        assert_eq!(
+            d2_wm.active_precautions[0].source,
+            PrecautionSource::ToolFailure
+        );
     }
 }

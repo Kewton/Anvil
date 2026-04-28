@@ -609,14 +609,63 @@ pub struct SessionSnapshot {
     pub workspace_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_feedback: Option<FeedbackFrame>,
+    /// Issue #455 / D4 / CB-001: turn-scoped flag for "an eligible-kind
+    /// FeedbackFrame has already been recorded during the current turn".
+    /// `record_feedback` automatically sets it whenever an eligible frame
+    /// is written; `record_feedback_if_unset` consults it and skips when
+    /// already set; `reset_eligible_recorded_this_turn` clears it at turn
+    /// boundaries (callers invoke this at the top of `run_turn`).
+    ///
+    /// Not persisted (`#[serde(skip)]`): this is purely runtime state. Old
+    /// session.json files load with the field defaulted to `false`, which
+    /// is the correct turn-start value for a freshly resumed session.
+    #[serde(skip, default)]
+    pub eligible_feedback_recorded_this_turn: bool,
 }
 
 impl SessionSnapshot {
-    /// Overwrite `last_feedback` with the given frame. The same-turn
-    /// override rule (design 5.5) is satisfied by callers that invoke
-    /// this once per detected feedback event; later calls win.
+    /// Overwrite `last_feedback` with the given frame. Updates the
+    /// turn-scoped flag (`eligible_feedback_recorded_this_turn`) when the
+    /// frame's kind is Reminder-eligible so subsequent
+    /// [`Self::record_feedback_if_unset`] calls in the same turn correctly
+    /// skip. The same-turn override rule (design 5.5) is preserved for the
+    /// last_feedback field itself: later calls within a turn still
+    /// overwrite `last_feedback`.
     pub fn record_feedback(&mut self, frame: FeedbackFrame) {
+        if frame.kind.is_eligible_for_reminder() {
+            self.eligible_feedback_recorded_this_turn = true;
+        }
         self.last_feedback = Some(frame);
+    }
+
+    /// Issue #455 / D4 / CB-001: first-eligible-failure-wins guard. Skips
+    /// recording when `eligible_feedback_recorded_this_turn` is already
+    /// `true`; otherwise records `frame` via [`Self::record_feedback`].
+    ///
+    /// CB-001: this method intentionally uses the in-snapshot bool flag
+    /// rather than comparing frame contents against a baseline snapshot.
+    /// Identical failure frames (e.g. NoToolCall with the same static
+    /// reason, or `deterministic_content_fallback` whose `primary_error` is
+    /// a fixed string) recurring across turns would compare equal under
+    /// value semantics and silently bypass the guard.
+    ///
+    /// Single-event sites (Bash failure / edit failure inside tool dispatch)
+    /// keep using [`Self::record_feedback`] because last-write-wins is the
+    /// right semantics for them — the flag still propagates so later
+    /// guarded sites in the same turn see "an eligible failure already
+    /// fired".
+    pub fn record_feedback_if_unset(&mut self, frame: FeedbackFrame) {
+        if self.eligible_feedback_recorded_this_turn {
+            return;
+        }
+        self.record_feedback(frame);
+    }
+
+    /// Issue #455 / D4 / CB-001: clear the turn-scoped flag. MUST be
+    /// invoked at the top of `run_turn` so the in-snapshot baseline starts
+    /// fresh on every turn.
+    pub fn reset_eligible_feedback_recorded_this_turn(&mut self) {
+        self.eligible_feedback_recorded_this_turn = false;
     }
 }
 
@@ -902,6 +951,154 @@ mod tests {
         assert!(
             !rendered.contains("Active Precautions:"),
             "section must be hidden: {rendered}"
+        );
+    }
+
+    // --- Issue #455 / D4: in-snapshot eligible_feedback flag --------------
+
+    use super::SessionSnapshot;
+    use crate::session::feedback::{FeedbackFrame, FeedbackKind};
+
+    /// Build a minimal `FeedbackFrame` with the given kind through serde so
+    /// the unit test does not have to thread `build_feedback_frame` (the
+    /// guard is purely about kind, not field content).
+    fn frame_with_kind(kind: &str) -> FeedbackFrame {
+        let json = format!("{{\"kind\":\"{kind}\"}}");
+        serde_json::from_str(&json).expect("frame deserializes")
+    }
+
+    /// Issue #455 / D4 / CB-001: when this turn already recorded a Reminder-
+    /// eligible failure frame (via `record_feedback`), a follow-up call to
+    /// `record_feedback_if_unset` must be a no-op (first eligible failure
+    /// wins).
+    #[test]
+    fn record_feedback_if_unset_no_op_when_this_turn_failure_set() {
+        let mut snap = SessionSnapshot::default();
+        // Fire 1: this turn records a TestFailure (sets the flag).
+        snap.record_feedback(frame_with_kind("test_failure"));
+        assert!(
+            snap.eligible_feedback_recorded_this_turn,
+            "record_feedback of failure-kind must set the flag"
+        );
+        // Fire 2: NoToolCall would overwrite — guard must block it.
+        snap.record_feedback_if_unset(frame_with_kind("no_tool_call"));
+        assert_eq!(
+            snap.last_feedback.as_ref().unwrap().kind,
+            FeedbackKind::TestFailure,
+            "first this-turn failure-kind frame must win"
+        );
+    }
+
+    /// Issue #455 / CB-001: identical failure frames (e.g. NoToolCall with
+    /// the same static reason) recurring across turns must NOT bypass the
+    /// guard. With the bool flag, the previous turn's leftover frame in
+    /// `last_feedback` is irrelevant — only the in-snapshot flag gates.
+    #[test]
+    fn record_feedback_if_unset_records_when_flag_unset_even_with_stale_failure() {
+        let stale = frame_with_kind("test_failure");
+        let mut snap = SessionSnapshot {
+            last_feedback: Some(stale),
+            // new turn baseline: flag starts false (after reset)
+            eligible_feedback_recorded_this_turn: false,
+            ..SessionSnapshot::default()
+        };
+        snap.record_feedback_if_unset(frame_with_kind("no_tool_call"));
+        assert_eq!(
+            snap.last_feedback.unwrap().kind,
+            FeedbackKind::NoToolCall,
+            "previous-turn failure must not block the new turn's record"
+        );
+        assert!(
+            snap.eligible_feedback_recorded_this_turn,
+            "fresh eligible record sets the flag"
+        );
+    }
+
+    /// Pass-kind frames (BuildPass / TestPass) recorded via `record_feedback`
+    /// earlier in the turn must NOT set the flag, so later guarded sites
+    /// can still record. They are semantically "no-failure" markers.
+    #[test]
+    fn record_feedback_if_unset_records_when_only_pass_kind_recorded() {
+        let mut snap = SessionSnapshot::default();
+        // Fire 1: pass-kind (BuildPass) lands during this turn — flag stays false.
+        snap.record_feedback(frame_with_kind("build_pass"));
+        assert!(
+            !snap.eligible_feedback_recorded_this_turn,
+            "pass-kind must not set the flag"
+        );
+        // Fire 2: NoToolCall must overwrite it AND set the flag.
+        snap.record_feedback_if_unset(frame_with_kind("no_tool_call"));
+        assert_eq!(
+            snap.last_feedback.unwrap().kind,
+            FeedbackKind::NoToolCall,
+            "pass-kind frames must not block subsequent record"
+        );
+        assert!(snap.eligible_feedback_recorded_this_turn);
+    }
+
+    /// `last_feedback == None` and the flag false is the standard turn-start
+    /// state (after `reset_eligible_feedback_recorded_this_turn`). The new
+    /// frame is recorded.
+    #[test]
+    fn record_feedback_if_unset_records_when_flag_unset_and_field_none() {
+        let mut snap = SessionSnapshot::default();
+        snap.record_feedback_if_unset(frame_with_kind("no_tool_call"));
+        assert_eq!(snap.last_feedback.unwrap().kind, FeedbackKind::NoToolCall);
+        assert!(snap.eligible_feedback_recorded_this_turn);
+    }
+
+    /// `record_feedback` keeps last-write-wins semantics on `last_feedback`
+    /// itself: Bash failure → unsafe block in the same iteration still
+    /// overwrites. The flag stays set throughout the turn so subsequent
+    /// `record_feedback_if_unset` calls correctly skip.
+    #[test]
+    fn record_feedback_overwrites_last_value_and_keeps_flag_set() {
+        let mut snap = SessionSnapshot::default();
+        snap.record_feedback(frame_with_kind("timeout"));
+        snap.record_feedback(frame_with_kind("compile_error"));
+        assert_eq!(snap.last_feedback.unwrap().kind, FeedbackKind::CompileError);
+        assert!(snap.eligible_feedback_recorded_this_turn);
+    }
+
+    /// `reset_eligible_feedback_recorded_this_turn` clears the flag without
+    /// touching `last_feedback`. After reset, `record_feedback_if_unset`
+    /// records again even if `last_feedback` still holds the previous
+    /// turn's failure.
+    #[test]
+    fn reset_eligible_feedback_recorded_this_turn_clears_flag_only() {
+        let mut snap = SessionSnapshot::default();
+        snap.record_feedback(frame_with_kind("test_failure"));
+        assert!(snap.eligible_feedback_recorded_this_turn);
+        snap.reset_eligible_feedback_recorded_this_turn();
+        assert!(!snap.eligible_feedback_recorded_this_turn);
+        assert!(snap.last_feedback.is_some(), "last_feedback preserved");
+        // New turn: another record_feedback_if_unset succeeds.
+        snap.record_feedback_if_unset(frame_with_kind("no_tool_call"));
+        assert_eq!(snap.last_feedback.unwrap().kind, FeedbackKind::NoToolCall);
+    }
+
+    /// The flag is `#[serde(skip)]`: serializing and deserializing a
+    /// SessionSnapshot drops the runtime flag (resumed sessions start a
+    /// turn cleanly).
+    #[test]
+    fn eligible_feedback_flag_is_not_persisted() {
+        let mut snap = SessionSnapshot::default();
+        snap.record_feedback(frame_with_kind("test_failure"));
+        assert!(snap.eligible_feedback_recorded_this_turn);
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(
+            !json.contains("eligible_feedback_recorded_this_turn"),
+            "flag must be skipped during serialization: {json}"
+        );
+        let decoded: SessionSnapshot = serde_json::from_str(&json).unwrap();
+        assert!(
+            !decoded.eligible_feedback_recorded_this_turn,
+            "flag must default to false on deserialize"
+        );
+        assert_eq!(
+            decoded.last_feedback.as_ref().unwrap().kind,
+            FeedbackKind::TestFailure,
+            "last_feedback survives the round-trip"
         );
     }
 }
