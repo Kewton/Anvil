@@ -670,6 +670,12 @@ pub struct SessionSnapshot {
     /// persisted; runtime-only flag like `repo_edit_succeeded_this_turn`.
     #[serde(skip, default)]
     pub case_record_extracted_this_turn: bool,
+    /// Issue #463: turn-local per-turn cap for case_retrieval injection.
+    /// Set to `true` once `try_inject_case_retrieval_message` consumes the
+    /// cap (env disable / failure / completed / dry-run / below-threshold).
+    /// Plan-mode early return does NOT set this. Reset at `run_turn` head.
+    #[serde(skip, default)]
+    pub case_retrieval_invoked_this_turn: bool,
 }
 
 impl SessionSnapshot {

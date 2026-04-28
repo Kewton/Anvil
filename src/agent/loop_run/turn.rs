@@ -1439,6 +1439,144 @@ impl Agent {
         self.session.case_record_extracted_this_turn = true;
     }
 
+    /// Issue #463: build and (when applicable) inject a `Relevant Local Cases:`
+    /// system message into the next prompt. Called from the per-iteration
+    /// message-build path immediately after `working_memory_message`. Pure-
+    /// function retrieval; never calls Ollama / sidecars. Failures are logged
+    /// via `agent.case_retrieval.failed` and never propagate.
+    pub(super) fn try_inject_case_retrieval_message(&mut self) -> Option<ConversationMessage> {
+        use crate::session::case_record::{
+            PrecautionSnapshot, build_task_signature, capture_repo_fingerprint,
+        };
+        use crate::session::case_retrieval::{self, CaseRetrievalInputs, RetrievalOutcome};
+
+        // 1. Plan mode → skipped(plan_mode), do not consume cap.
+        if self.session.mode_state.mode == ExecutionMode::Plan {
+            log_llm_event(
+                "agent.case_retrieval.skipped",
+                serde_json::json!({
+                    "session_id": self.session_store.session_id(),
+                    "reason": "plan_mode",
+                }),
+            );
+            return None;
+        }
+        // 2. per-turn cap consumed → skipped(per_turn_cap_consumed).
+        if self.session.case_retrieval_invoked_this_turn {
+            log_llm_event(
+                "agent.case_retrieval.skipped",
+                serde_json::json!({
+                    "session_id": self.session_store.session_id(),
+                    "reason": "per_turn_cap_consumed",
+                }),
+            );
+            return None;
+        }
+        // 3. Env disable → cap=true, disabled event.
+        if case_retrieval::case_retrieval_disabled(|k| std::env::var(k)) {
+            self.session.case_retrieval_invoked_this_turn = true;
+            log_llm_event(
+                "agent.case_retrieval.disabled",
+                serde_json::json!({
+                    "session_id": self.session_store.session_id(),
+                }),
+            );
+            return None;
+        }
+
+        // 4. Build inputs from the current SessionSnapshot view.
+        let language_stack = derive_language_stack(&self.work_root);
+        let workspace_key = self.session.workspace_key.clone();
+        let active_task = self.session.working_memory.active_task.clone();
+        let task_signature = build_task_signature(active_task.as_deref(), &self.work_root);
+        let repo_fp = capture_repo_fingerprint(&workspace_key, &self.work_root, &language_stack);
+        let touched_files = self.session.working_memory.touched_files.clone();
+        let feedback_kind = self.session.last_feedback.as_ref().map(|f| f.kind.clone());
+        let prec_snapshots: Vec<PrecautionSnapshot> = self
+            .session
+            .working_memory
+            .active_precautions
+            .iter()
+            .filter(|p| p.status == PrecautionStatus::Active)
+            .map(PrecautionSnapshot::from)
+            .collect();
+
+        let dry_run = case_retrieval::case_retrieval_dry_run(|k| std::env::var(k));
+
+        let inputs = CaseRetrievalInputs {
+            current_task_signature: &task_signature,
+            current_language_stack: &language_stack,
+            current_repo_fingerprint: &repo_fp,
+            current_touched_files: &touched_files,
+            current_feedback_kind: feedback_kind,
+            current_active_precautions: &prec_snapshots,
+        };
+
+        // 5. Consume the cap before retrieve so the failure path also accounts.
+        self.session.case_retrieval_invoked_this_turn = true;
+
+        let state_root = self.session_store.state_root().to_path_buf();
+        match case_retrieval::retrieve_relevant_cases(&state_root, &inputs, dry_run) {
+            Ok(RetrievalOutcome::Completed {
+                candidate_count,
+                selected,
+                skipped_corrupt_count,
+                compute_ms,
+            }) => {
+                let top_score = selected.first().map(|s| s.breakdown.total).unwrap_or(0.0);
+                let top_case_id = selected
+                    .first()
+                    .map(|s| s.record.case_id.clone())
+                    .unwrap_or_default();
+                let selected_reasons: Vec<&case_retrieval::CaseScoreBreakdown> =
+                    selected.iter().map(|s| &s.breakdown).collect();
+                log_llm_event(
+                    "agent.case_retrieval.completed",
+                    serde_json::json!({
+                        "session_id": self.session_store.session_id(),
+                        "candidate_count": candidate_count,
+                        "selected_count": selected.len(),
+                        "top_score": top_score,
+                        "top_case_id": top_case_id,
+                        "threshold": 0.40_f32,
+                        "compute_ms": compute_ms,
+                        "skipped_corrupt_count": skipped_corrupt_count,
+                        "selected_reasons": selected_reasons,
+                    }),
+                );
+                case_retrieval::format_for_prompt(&selected).map(ConversationMessage::system)
+            }
+            Ok(RetrievalOutcome::Skipped {
+                reason,
+                candidate_count,
+                skipped_corrupt_count,
+                compute_ms,
+            }) => {
+                log_llm_event(
+                    "agent.case_retrieval.skipped",
+                    serde_json::json!({
+                        "session_id": self.session_store.session_id(),
+                        "reason": reason.as_log_str(),
+                        "candidate_count": candidate_count,
+                        "skipped_corrupt_count": skipped_corrupt_count,
+                        "compute_ms": compute_ms,
+                    }),
+                );
+                None
+            }
+            Err(error) => {
+                log_llm_event(
+                    "agent.case_retrieval.failed",
+                    serde_json::json!({
+                        "session_id": self.session_store.session_id(),
+                        "error": error,
+                    }),
+                );
+                None
+            }
+        }
+    }
+
     /// Issue #452: post-actor-loop hook for the Reminder Sidecar. Called from
     /// `run_actor_loop` (iteration-internal before compaction, and post-loop
     /// for NoRepoProgress / auto_test / NoVerifierAvailable). Per-turn cap
@@ -1622,6 +1760,8 @@ impl Agent {
             self.session.working_memory.touched_files.clone();
         // Issue #462: reset the per-turn CaseRecord extraction cap.
         self.session.case_record_extracted_this_turn = false;
+        // Issue #463: reset the per-turn case_retrieval cap.
+        self.session.case_retrieval_invoked_this_turn = false;
 
         let mut tool_calls_made_this_turn = 0usize;
         let mut repo_edit_calls_made_this_turn = 0usize;
@@ -4221,6 +4361,11 @@ impl Agent {
             }
             if let Some(memory_message) = self.working_memory_message() {
                 messages.push(memory_message);
+            }
+            // Issue #463: inject `Relevant Local Cases:` directly after the
+            // Working Memory section. Pure-function retrieval; no Ollama call.
+            if let Some(case_message) = self.try_inject_case_retrieval_message() {
+                messages.push(case_message);
             }
             if let Some(repo_context_message) = self.repo_context_message() {
                 messages.push(repo_context_message);
