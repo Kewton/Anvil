@@ -51,9 +51,16 @@ pub fn run_cli(args: CliArgs) -> Result<(), String> {
                 std::env::current_dir().map_err(|err| format!("failed to resolve cwd: {err}"))?
             }
         };
+        // CB-003 fix: canonicalize the workspace root once here and pass it
+        // explicitly to dispatch so tmp-tests `promote` writes its output
+        // relative to the user-declared workspace (`--cwd <path>`) rather
+        // than the process's `current_dir()`. Falls back to the raw cwd if
+        // canonicalize fails (e.g. non-existent path) so existing error
+        // messages from downstream layers still surface.
+        let workspace_root = std::fs::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone());
         let state_root = resolve_state_root_from_parts(args.state_dir.as_deref())?;
         let workspace_key = compute_workspace_key(&cwd);
-        return sessions_cli::dispatch(&state_root, &workspace_key, action);
+        return sessions_cli::dispatch(&state_root, &workspace_key, &workspace_root, action);
     }
 
     let (config, warnings) = Config::load(args)?;

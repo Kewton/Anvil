@@ -7,14 +7,16 @@
 //! layer is covered by integration tests in `tests/session_cli_tests.rs`.
 
 use std::fs;
+use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use crate::cli::SessionsAction;
+use crate::cli::{SessionsAction, TmpTestsAction};
 use crate::modes::plan_act::ExecutionMode;
 use crate::session::compact::is_compact_summary;
 use crate::session::discovery::{SessionDirEntry, iter_session_dirs};
 use crate::session::store::{ConversationMessage, SessionSnapshot};
+use crate::session::tmp_tests;
 
 pub const UNASSIGNED_WORKSPACE: &str = "unassigned";
 
@@ -389,7 +391,19 @@ fn preview(s: &str) -> String {
 // Dispatch and I/O layer
 // ---------------------------------------------------------------------------
 
-pub fn dispatch(state_root: &Path, current_ws: &str, action: SessionsAction) -> Result<(), String> {
+/// `dispatch` for `anvil sessions ...`.
+///
+/// `workspace_root` is the canonicalized cwd-or-`--cwd` path that the caller
+/// resolved before constructing `state_root` / `current_ws`. tmp-tests
+/// `promote` writes its destination relative to this path, never
+/// `std::env::current_dir()` (CB-003: the two could diverge when `--cwd`
+/// was passed and anvil is invoked from a sibling directory).
+pub fn dispatch(
+    state_root: &Path,
+    current_ws: &str,
+    workspace_root: &Path,
+    action: SessionsAction,
+) -> Result<(), String> {
     match action {
         SessionsAction::List { all, json } => run_list(state_root, current_ws, all, json),
         SessionsAction::Show { id, all, json } => run_show(state_root, current_ws, &id, all, json),
@@ -411,6 +425,28 @@ pub fn dispatch(state_root: &Path, current_ws: &str, action: SessionsAction) -> 
             };
             run_clean(state_root, current_ws, args, force)
         }
+        SessionsAction::TmpTests { action } => match action {
+            TmpTestsAction::Promote {
+                session,
+                test_id,
+                force,
+                yes,
+            } => run_tmp_tests_promote(
+                state_root,
+                current_ws,
+                workspace_root,
+                &session,
+                &test_id,
+                force,
+                yes,
+            ),
+            TmpTestsAction::Discard { session, test_id } => {
+                run_tmp_tests_discard(state_root, current_ws, &session, &test_id)
+            }
+            TmpTestsAction::List { session } => {
+                run_tmp_tests_list(state_root, current_ws, &session)
+            }
+        },
     }
 }
 
@@ -512,6 +548,136 @@ pub fn execute_clean_plan(state_root: &Path, plan: &CleanPlan, force: bool) -> R
         deleted += 1;
     }
     println!("removed {deleted} session(s)");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// TmpTests handlers (Issue #458)
+// ---------------------------------------------------------------------------
+
+/// Read `state_root/sessions/<id>/session.json` and assert it belongs to
+/// `current_ws`. Used by tmp-tests handlers to refuse cross-workspace
+/// promote / discard / list.
+fn require_session_in_workspace(
+    state_root: &Path,
+    session_id: &str,
+    current_ws: &str,
+) -> Result<PathBuf, String> {
+    let session_dir = validate_explicit_session_id(state_root, session_id)?;
+    let session_json = session_dir.join("session.json");
+    let data = fs::read_to_string(&session_json)
+        .map_err(|err| format!("failed to read session.json for {session_id}: {err}"))?;
+    let snap: SessionSnapshot = serde_json::from_str(&data)
+        .map_err(|err| format!("failed to parse session.json for {session_id}: {err}"))?;
+    if !snap.workspace_key.is_empty() && snap.workspace_key != current_ws {
+        return Err(format!(
+            "session {session_id} belongs to a different workspace; tmp-tests operations \
+             are confined to the current workspace"
+        ));
+    }
+    Ok(session_dir)
+}
+
+fn tmp_tests_root_for(session_dir: &Path) -> PathBuf {
+    session_dir.join("tmp-tests")
+}
+
+/// CLI handler for `anvil sessions tmp-tests promote`.
+///
+/// Approval policy (CB-002 fix):
+///
+/// * `--yes` is the explicit approval signal for the promote operation
+///   itself. It is wired to `auto_approve` in `promote_tmp_test`.
+/// * `interactive_approval` is `io::stdin().is_terminal()` so a human
+///   running anvil from a TTY does not need `--yes`.
+/// * Without `--yes` and without a TTY, promote is rejected. This means a
+///   non-interactive cron / CI job that has not opted in cannot silently
+///   write to the workspace.
+/// * `--force` is **separate** from approval: it is the override for the
+///   "destination already exists" collision case (and only allows
+///   overwriting a regular file — symlinks are still rejected).
+///
+/// `workspace_root` is the canonicalized current workspace path the parent
+/// dispatcher resolved (CB-003 fix: never `std::env::current_dir()` here).
+pub fn run_tmp_tests_promote(
+    state_root: &Path,
+    current_ws: &str,
+    workspace_root: &Path,
+    session_id: &str,
+    test_id: &str,
+    force: bool,
+    yes: bool,
+) -> Result<(), String> {
+    let session_dir = require_session_in_workspace(state_root, session_id, current_ws)?;
+    let tmp_tests_root = tmp_tests_root_for(&session_dir);
+
+    let auto_approve = yes;
+    let interactive_approval = io::stdin().is_terminal();
+
+    let dst = tmp_tests::promote_tmp_test(
+        workspace_root,
+        &tmp_tests_root,
+        test_id,
+        force,
+        auto_approve,
+        interactive_approval,
+    )
+    .map_err(|err| {
+        eprintln!("error: {err}");
+        err
+    })?;
+    println!("promoted {test_id} -> {}", dst.display());
+    Ok(())
+}
+
+pub fn run_tmp_tests_discard(
+    state_root: &Path,
+    current_ws: &str,
+    session_id: &str,
+    test_id: &str,
+) -> Result<(), String> {
+    let session_dir = require_session_in_workspace(state_root, session_id, current_ws)?;
+    let tmp_tests_root = tmp_tests_root_for(&session_dir);
+    tmp_tests::discard_tmp_test(&tmp_tests_root, test_id).map_err(|err| {
+        eprintln!("error: {err}");
+        err
+    })?;
+    println!("discarded {test_id}");
+    Ok(())
+}
+
+pub fn run_tmp_tests_list(
+    state_root: &Path,
+    current_ws: &str,
+    session_id: &str,
+) -> Result<(), String> {
+    let session_dir = require_session_in_workspace(state_root, session_id, current_ws)?;
+    let tmp_tests_root = tmp_tests_root_for(&session_dir);
+    let tests = tmp_tests::list_tmp_tests(&tmp_tests_root).map_err(|err| {
+        eprintln!("error: {err}");
+        err
+    })?;
+    if tests.is_empty() {
+        println!("no tmp-tests found");
+        return Ok(());
+    }
+    println!(
+        "ID                                              STATUS     CREATED_AT  RELATIVE_PATH"
+    );
+    for t in &tests {
+        let status = match t.status {
+            tmp_tests::TmpTestStatus::Draft => "draft",
+            tmp_tests::TmpTestStatus::Promoted => "promoted",
+            tmp_tests::TmpTestStatus::Discarded => "discarded",
+        };
+        println!(
+            "{id:48} {status:<10} {ts:<10} {rel}",
+            id = t.id,
+            status = status,
+            ts = t.created_at,
+            rel = t.relative_path.display(),
+        );
+    }
     Ok(())
 }
 
@@ -901,5 +1067,159 @@ mod tests {
         assert_eq!(v.first_user_preview.as_deref(), Some("hello worldextra"));
         assert_eq!(v.checkpoint_count, 1);
         assert_eq!(v.mode, ExecutionMode::Plan);
+    }
+
+    // -- Issue #458: tmp-tests handler workspace confinement ----------------
+
+    fn write_session_json(state_root: &Path, session_id: &str, ws: &str) {
+        let session_dir = state_root.join("sessions").join(session_id);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let snap = SessionSnapshot {
+            id: session_id.to_string(),
+            workspace_key: ws.to_string(),
+            ..SessionSnapshot::default()
+        };
+        std::fs::write(
+            session_dir.join("session.json"),
+            serde_json::to_string_pretty(&snap).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn run_tmp_tests_list_rejects_invalid_uuid() {
+        let tmp = TempDir::new().unwrap();
+        let err = run_tmp_tests_list(tmp.path(), "ws-x", "not-a-uuid").unwrap_err();
+        assert!(err.contains("UUID"), "got: {err}");
+    }
+
+    #[test]
+    fn run_tmp_tests_list_rejects_missing_session() {
+        let tmp = TempDir::new().unwrap();
+        let id = uuid::Uuid::now_v7().to_string();
+        let err = run_tmp_tests_list(tmp.path(), "ws-x", &id).unwrap_err();
+        assert!(
+            err.contains("not found") || err.contains("session"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn run_tmp_tests_list_rejects_cross_workspace() {
+        let tmp = TempDir::new().unwrap();
+        let id = uuid::Uuid::now_v7().to_string();
+        write_session_json(tmp.path(), &id, "ws-other");
+        let err = run_tmp_tests_list(tmp.path(), "ws-x", &id).unwrap_err();
+        assert!(err.contains("different workspace"), "got: {err}");
+    }
+
+    #[test]
+    fn run_tmp_tests_discard_rejects_cross_workspace() {
+        let tmp = TempDir::new().unwrap();
+        let id = uuid::Uuid::now_v7().to_string();
+        write_session_json(tmp.path(), &id, "ws-other");
+        let err =
+            run_tmp_tests_discard(tmp.path(), "ws-x", &id, "tmp_aaaaaaaaaaaaaaaa").unwrap_err();
+        assert!(err.contains("different workspace"), "got: {err}");
+    }
+
+    #[test]
+    fn run_tmp_tests_promote_rejects_cross_workspace() {
+        let tmp = TempDir::new().unwrap();
+        let id = uuid::Uuid::now_v7().to_string();
+        write_session_json(tmp.path(), &id, "ws-other");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let err = run_tmp_tests_promote(
+            tmp.path(),
+            "ws-x",
+            &workspace,
+            &id,
+            "tmp_aaaaaaaaaaaaaaaa",
+            false,
+            true,
+        )
+        .unwrap_err();
+        assert!(err.contains("different workspace"), "got: {err}");
+    }
+
+    #[test]
+    fn run_tmp_tests_list_returns_ok_for_session_in_current_workspace() {
+        let tmp = TempDir::new().unwrap();
+        let id = uuid::Uuid::now_v7().to_string();
+        write_session_json(tmp.path(), &id, "ws-x");
+        // Ok with empty output (no tmp-tests yet).
+        run_tmp_tests_list(tmp.path(), "ws-x", &id).unwrap();
+    }
+
+    // -- Issue #458 / Codex CB-002: non-interactive --yes guard ----------------
+    // CB-002 regression: the CLI must reject promote when stdin is not a TTY
+    // and `--yes` was not passed, because the `auto_approve || interactive_approval`
+    // gate inside promote_tmp_test would otherwise accept any caller.
+    //
+    // We can verify the *underlying* gate directly by calling
+    // `promote_tmp_test` with auto_approve=false and interactive_approval=false
+    // — that is exactly what the CLI passes when `cargo test` runs (no TTY)
+    // without `--yes`.
+    #[test]
+    fn promote_rejects_non_interactive_without_yes_at_lifecycle_layer() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let tmp_tests_root = tmp.path().join("tmp-tests");
+        let tt =
+            tmp_tests::create_generated_test(&tmp_tests_root, "src/test_x.rs", b"body").unwrap();
+        let err = tmp_tests::promote_tmp_test(
+            &workspace,
+            &tmp_tests_root,
+            &tt.id,
+            false,
+            false, // auto_approve=false (no --yes)
+            false, // interactive_approval=false (no TTY)
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("approval") || err.contains("--yes"),
+            "got: {err}"
+        );
+        assert!(!workspace.join("src/test_x.rs").exists());
+    }
+
+    // CB-003 regression: run_tmp_tests_promote must use the `workspace_root`
+    // arg, not std::env::current_dir(). We verify by promoting into a
+    // workspace path that is unrelated to the test process's cwd and
+    // confirming the file lands inside that path.
+    #[test]
+    fn run_tmp_tests_promote_uses_explicit_workspace_root_not_cwd() {
+        let tmp = TempDir::new().unwrap();
+        let id = uuid::Uuid::now_v7().to_string();
+        write_session_json(tmp.path(), &id, "ws-x");
+        // Build a tmp-test under the session's tmp-tests root.
+        let session_dir = tmp.path().join("sessions").join(&id);
+        let tmp_tests_root = session_dir.join("tmp-tests");
+        let tt =
+            tmp_tests::create_generated_test(&tmp_tests_root, "promoted.rs", b"hello").unwrap();
+        // Use a workspace_root that is NOT the process cwd.
+        let workspace = tmp.path().join("explicit-workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        // auto_approve=true via `--yes` so the gate passes deterministically.
+        run_tmp_tests_promote(
+            tmp.path(),
+            "ws-x",
+            &workspace,
+            &id,
+            &tt.id,
+            false,
+            true, // --yes
+        )
+        .unwrap();
+
+        // Body landed under the explicit workspace, not the process cwd.
+        let landed = workspace.join("promoted.rs");
+        assert!(
+            landed.exists(),
+            "promote must use workspace_root arg, not env::current_dir(): {landed:?}"
+        );
     }
 }
