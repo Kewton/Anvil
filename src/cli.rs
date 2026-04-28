@@ -102,6 +102,51 @@ pub enum SessionsAction {
         #[arg(long)]
         force: bool,
     },
+    /// Manage temporary tests generated under
+    /// `state_root/sessions/<id>/tmp-tests/` (Issue #458).
+    TmpTests {
+        #[command(subcommand)]
+        action: TmpTestsAction,
+    },
+}
+
+/// `anvil sessions tmp-tests <list|promote|discard>` (Issue #458).
+#[derive(Debug, Clone, Subcommand)]
+pub enum TmpTestsAction {
+    /// Promote a draft tmp-test into the workspace.
+    Promote {
+        /// Session id whose tmp-tests to promote from.
+        #[arg(long)]
+        session: String,
+        /// Tmp-test id (`tmp_<sha-prefix>`) to promote.
+        #[arg(long = "test-id")]
+        test_id: String,
+        /// Overwrite an existing workspace file (regular file only; symlinks
+        /// are always rejected). NOTE: `--force` is the **collision** override
+        /// (allow overwriting a pre-existing file at the destination), not the
+        /// approval signal for the promote operation itself — that is `--yes`.
+        #[arg(long)]
+        force: bool,
+        /// Approve the promote operation in non-interactive contexts (CI,
+        /// piped stdin). When stdin is a TTY, anvil treats the user as having
+        /// approved interactively. Without `--yes` and without a TTY, promote
+        /// is rejected so a misconfigured cron / CI job cannot silently write
+        /// to the workspace.
+        #[arg(long = "yes", short = 'y')]
+        yes: bool,
+    },
+    /// Discard a tmp-test (deletes both body and metadata).
+    Discard {
+        #[arg(long)]
+        session: String,
+        #[arg(long = "test-id")]
+        test_id: String,
+    },
+    /// List tmp-tests for a session.
+    List {
+        #[arg(long)]
+        session: String,
+    },
 }
 
 impl CliArgs {
