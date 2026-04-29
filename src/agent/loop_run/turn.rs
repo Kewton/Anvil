@@ -488,29 +488,33 @@ fn should_record_no_repo_progress(
         && !last_feedback_changed_this_turn
 }
 
+fn extract_path_like_tokens(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|c: char| c.is_whitespace() || c == ':' || c == '"' || c == '\'')
+        .map(|t| t.trim_matches(|c: char| matches!(c, '(' | ')' | ',' | ';')))
+        .filter(|t| {
+            !t.is_empty()
+                && t.contains('/')
+                && (t.contains(".rs")
+                    || t.contains(".py")
+                    || t.contains(".ts")
+                    || t.contains(".tsx")
+                    || t.contains(".js")
+                    || t.contains(".jsx")
+                    || t.contains(".go")
+                    || t.contains(".java")
+                    || t.contains(".toml")
+                    || t.contains(".json"))
+        })
+}
+
 /// Heuristic: pull file paths out of compiler / test output. Not exhaustive
 /// — we only need a best-effort `suspected_files` list, and the path
 /// normalizer drops anything that does not look real.
 fn extract_suspected_files_from_text(stdout: &str, stderr: &str) -> Vec<PathBuf> {
     let mut out = Vec::<PathBuf>::new();
     for line in stdout.lines().chain(stderr.lines()) {
-        for token in line.split(|c: char| c.is_whitespace() || c == ':' || c == '"') {
-            // Heuristic: keep tokens that contain a dot AND a slash, or end
-            // with a known source-file suffix.
-            let trimmed = token.trim_matches(|c: char| matches!(c, '(' | ')' | ',' | ';'));
-            if trimmed.is_empty() {
-                continue;
-            }
-            let looks_like_path = trimmed.contains('/')
-                && (trimmed.contains(".rs")
-                    || trimmed.contains(".py")
-                    || trimmed.contains(".ts")
-                    || trimmed.contains(".tsx")
-                    || trimmed.contains(".js")
-                    || trimmed.contains(".jsx")
-                    || trimmed.contains(".go")
-                    || trimmed.contains(".java"));
-            if looks_like_path && !out.iter().any(|p| p.to_string_lossy() == trimmed) {
+        for trimmed in extract_path_like_tokens(line) {
+            if !out.iter().any(|p| p.to_string_lossy() == trimmed) {
                 out.push(PathBuf::from(trimmed));
             }
             if out.len() >= 8 {
@@ -518,6 +522,66 @@ fn extract_suspected_files_from_text(stdout: &str, stderr: &str) -> Vec<PathBuf>
             }
         }
     }
+    out
+}
+
+fn extract_path_tokens_from_text(text: &str, work_root: &std::path::Path) -> Vec<String> {
+    use crate::safety::path_guard::resolve_user_path;
+    let canonical_root = work_root.canonicalize().ok();
+    let mut out = Vec::new();
+    for token in extract_path_like_tokens(text) {
+        if let Ok(resolved) = resolve_user_path(work_root, token) {
+            let rel = if let Some(root) = &canonical_root {
+                resolved
+                    .strip_prefix(root)
+                    .ok()
+                    .map(|r| r.to_string_lossy().replace('\\', "/"))
+            } else {
+                resolved
+                    .strip_prefix(work_root)
+                    .ok()
+                    .map(|r| r.to_string_lossy().replace('\\', "/"))
+            };
+            if let Some(rel_str) = rel
+                && !out.contains(&rel_str)
+            {
+                out.push(rel_str);
+            }
+        }
+    }
+    out
+}
+
+fn extract_current_request_paths(agent: &Agent, work_root: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+
+    if let Some(text) = agent.active_request_text() {
+        for p in extract_path_tokens_from_text(&text, work_root) {
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+    }
+    if let Some(target) = agent.focused_edit_recovery_target() {
+        let canonical_root = work_root.canonicalize().ok();
+        let rel = if let Some(root) = &canonical_root {
+            target
+                .strip_prefix(root)
+                .ok()
+                .map(|r| r.to_string_lossy().replace('\\', "/"))
+        } else {
+            target
+                .strip_prefix(work_root)
+                .ok()
+                .map(|r| r.to_string_lossy().replace('\\', "/"))
+        };
+        if let Some(rel_str) = rel
+            && !out.contains(&rel_str)
+        {
+            out.push(rel_str);
+        }
+    }
+    out.truncate(prompting::MAX_CURRENT_REQUEST_PATHS);
     out
 }
 
@@ -4705,10 +4769,19 @@ impl Agent {
         if let Some(note) = self.post_scaffold_continuation_recovery_message() {
             messages.push(ConversationMessage::system(note));
         }
+        let current_request_paths = extract_current_request_paths(self, &self.work_root);
+        let last_suspected = self
+            .session
+            .last_feedback
+            .as_ref()
+            .map(|f| f.suspected_files.as_slice());
         messages.extend(prompting::runtime_context_messages(
             &self.config.cwd,
             &self.work_root,
             protocol,
+            &self.session.working_memory.touched_files,
+            last_suspected,
+            &current_request_paths,
         ));
         if let Some(target) = focused_edit_target {
             let recovery_anchor = focused_edit_exact_recovery_anchor(
@@ -5323,7 +5396,9 @@ impl Agent {
         let request_script = extract_filename_with_suffix(request, ".py");
         let request_sample = extract_filename_with_suffix(request, ".csv");
         let instructions = prompting::load_project_instructions(&self.config.cwd, &self.work_root);
-        let instruction_text = instructions.as_ref().map(|value| value.content.as_str());
+        let instruction_text = instructions
+            .as_ref()
+            .map(|value| value.global_content.as_str());
         let instruction_script =
             instruction_text.and_then(|text| extract_filename_with_suffix(text, ".py"));
         let instruction_sample =
