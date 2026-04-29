@@ -1,6 +1,6 @@
 use super::auto_test::{
-    AutoTestKind, AutoTestPlan, AutoTestResult, AutoTestRunner, classify_auto_test,
-    count_compile_errors, count_test_failures,
+    AutoTestKind, AutoTestPlan, AutoTestResult, classify_auto_test, count_compile_errors,
+    count_test_failures,
 };
 use super::interrupt::{InterruptEnv, InterruptFlag, InterruptMonitor};
 use super::protocol::ExecutionProtocol;
@@ -131,7 +131,7 @@ fn answer_only_script_command_allowed(command: &str) -> bool {
 // secret masking, and path normalization. Per design 5.4, no helper
 // performs those steps itself.
 
-fn build_feedback_for_auto_test(
+pub(super) fn build_feedback_for_auto_test(
     plan: &AutoTestPlan,
     result: &AutoTestResult,
     workspace_root: &Path,
@@ -204,6 +204,10 @@ fn derive_language_stack(work_root: &std::path::Path) -> Vec<String> {
     stack
 }
 
+// Issue #466: build_anvil_test_summary は VerifierSkill 経路でも利用するため残置。
+// VerifierSkill 側 (verifier_skill.rs::build_anvil_test_summary_for_skill) は同等の
+// ロジックを内部 helper として保持する。将来 Issue で SSOT を一本化する。
+#[cfg_attr(not(test), allow(dead_code))]
 fn build_anvil_test_summary(
     plan: &AutoTestPlan,
     result: &AutoTestResult,
@@ -287,7 +291,7 @@ pub(super) fn select_success_verifier(
     }
 }
 
-fn build_feedback_for_no_verifier(workspace_root: &Path) -> FeedbackFrame {
+pub(super) fn build_feedback_for_no_verifier(workspace_root: &Path) -> FeedbackFrame {
     let draft = FeedbackFrameDraft {
         kind: FeedbackKind::NoVerifierAvailable,
         primary_error: Some("no auto_test verifier detected for this workspace".to_string()),
@@ -3587,158 +3591,177 @@ impl Agent {
             exit_reason = ExitReason::Done;
             error_text.clear();
         }
-        // Issue #457: capture AnvilTestSummary in the AutoTest/Ok arm below
-        // so the compute_anvil_score block (further down) can wire it into
-        // the third argument. Outside-arm declaration is intentional: the
-        // alternative (turning the entire match into an expression) would
-        // force every arm to return Option<AnvilTestSummary> on top of its
-        // existing side effects (record_feedback_if_unset / exit_reason /
-        // error_text), which the design policy concluded is not worth the
-        // KISS trade.
-        let mut auto_test_summary: Option<crate::session::anvil_score::AnvilTestSummary> = None;
-        // Issue #462: collect verifier commands as the verifier branches run,
-        // so the post-loop CaseRecord adapter can pass them into
-        // `case_record::extract` via `CaseRecordInputs.verify_commands`.
-        // Tester's `build_command` is internal to `try_invoke_tester` and is
-        // intentionally NOT plumbed here in this Issue (kept Out of Scope —
-        // see design policy §11-1). Only AutoTest's command lands in the Vec
-        // for now; Tester wiring is a fast-follow.
+        // Issue #466: post-loop verifier dispatch を VerifierSkill 経由に置換.
+        // facade applies outcome 方針 (DR-466-002 / Stage 5):
+        //   1. exit_reason.is_success() && success_issue chk → should_dispatch_success_verifier
+        //   2. VerifierSkill::execute が AutoTestRunner::detect/run + compute_anvil_score を完結
+        //   3. facade が VerifierOutcome を解釈して legacy events emit / verify_commands push /
+        //      record_feedback_if_unset / try_invoke_tester / exit_reason 設定 / last_anvil_score
+        //      永続化を Reminder より前に行う (Stage 7 S7-001..003 / DR2-001..004 / DR3-001..002).
         let mut verify_commands_collected: Vec<String> = Vec::new();
-        if exit_reason.is_success() {
+        let should_dispatch_success_verifier = if exit_reason.is_success() {
             let protocol = ExecutionProtocol::from_work_mode(self.session.mode_state.work_mode);
             if let Some(issue) = protocol.success_issue(&stats) {
                 exit_reason = ExitReason::MissingRepoEdits;
                 error_text = issue;
+                false
             } else {
-                // CB-002 (Issue #459): the Tester is gated **independently** of
-                // `should_run_auto_test_for_success()`. We probe both verifiers
-                // up front and let `select_success_verifier` pick the right
-                // dispatch. `TesterCandidate::detect` already returns `None`
-                // when an explicit AutoTestRunner verifier is present, so a
-                // build-only AutoTest plan does not block the Tester branch.
-                let auto_test_plan = AutoTestRunner::detect(&self.work_root, &stats.changed_files);
-                let tester_candidate =
-                    tester::TesterCandidate::detect(&self.work_root, &stats.changed_files);
-                let decision = select_success_verifier(
-                    self.should_run_auto_test_for_success(),
-                    auto_test_plan.is_some(),
-                    tester_candidate.is_some(),
-                );
-                match (decision, auto_test_plan) {
-                    (SuccessVerifier::AutoTest, Some(plan)) => {
-                        match AutoTestRunner::run(&self.work_root, &plan) {
-                            Ok(result) => {
-                                log_llm_event(
-                                    "agent.autotest.completed",
-                                    serde_json::json!({
-                                        "session_id": self.session_store.session_id(),
-                                        "command": result.command,
-                                        "passed": result.passed,
-                                        "reason": plan.reason,
-                                    }),
-                                );
-                                // Issue #450: record FeedbackFrame for the
-                                // auto_test outcome (BuildPass / TestPass on
-                                // success, CompileError / TestFailure / etc.
-                                // on failure).
-                                // Issue #455 / D4: switch to first-eligible-failure-wins
-                                // so a deterministic content fallback / NoToolCall
-                                // frame from earlier in this turn is preserved.
-                                let frame = build_feedback_for_auto_test(
-                                    &plan,
-                                    &result,
-                                    &self.work_root,
-                                    &stats.changed_files,
-                                );
-                                self.session.record_feedback_if_unset(frame);
-                                // Issue #457: convert AutoTestResult into
-                                // AnvilTestSummary so compute_anvil_score
-                                // (below) can populate
-                                // build_passed/tests_passed/*_count fields.
-                                auto_test_summary = Some(build_anvil_test_summary(&plan, &result));
-                                // Issue #462: keep the actual executed command
-                                // so the post-loop CaseRecord adapter can
-                                // record it in `verify_commands` (DR3-002:
-                                // the agent layer collects, session layer
-                                // consumes a `&[String]` view).
-                                if !result.command.is_empty() {
-                                    verify_commands_collected.push(result.command.clone());
-                                }
-                                if !result.passed {
-                                    exit_reason = ExitReason::MissingRepoEdits;
-                                    error_text = format!(
-                                        "auto test failed for protocol {:?}: {}\n{}",
-                                        protocol.kind(),
-                                        result.command,
-                                        result.output
-                                    );
-                                }
-                            }
-                            Err(err) => {
-                                exit_reason = ExitReason::TransportError;
-                                error_text = err;
-                            }
-                        }
-                    }
-                    (SuccessVerifier::Tester, _) => {
-                        // CB-002: Tester runs even when
-                        // `should_run_auto_test_for_success()` was false. If
-                        // Tester aborts / declines, fall through to
-                        // `NoVerifierAvailable` only when the protocol asked
-                        // for a verifier (mirrors the historical fallback).
-                        let tester_recorded = self.try_invoke_tester(&stats.changed_files);
-                        if !tester_recorded && self.should_run_auto_test_for_success() {
-                            let frame = build_feedback_for_no_verifier(&self.work_root);
-                            self.session.record_feedback_if_unset(frame);
-                        }
-                    }
-                    (SuccessVerifier::NoVerifier, _) => {
-                        // Issue #450: no auto_test plan detected and no Tester
-                        // candidate -> NoVerifierAvailable.
-                        let frame = build_feedback_for_no_verifier(&self.work_root);
-                        self.session.record_feedback_if_unset(frame);
-                    }
-                    (SuccessVerifier::Skip, _) | (SuccessVerifier::AutoTest, None) => {
-                        // Skip: no verifier demanded and no Tester candidate;
-                        // do nothing (pre-#450 behaviour for non-Python /
-                        // non-test-requesting turns). The (AutoTest, None)
-                        // arm is theoretically unreachable per
-                        // `select_success_verifier` invariants but we cover
-                        // it defensively to keep production code free of
-                        // `expect()` / `unwrap()` (Issue #459 quality gate).
-                    }
-                }
+                true
             }
-        }
-        // Issue #456: compute the AnvilScore for this turn after all
-        // record_feedback* / verify_repo_progress / auto_test signals have
-        // settled, but BEFORE the post-loop Reminder hook so the sidecar can
-        // see `CurrentTurn(&score)`.
-        {
-            let inputs = crate::session::anvil_score::AnvilScoreInputs {
+        } else {
+            false
+        };
+        let tester_candidate_some = if should_dispatch_success_verifier {
+            tester::TesterCandidate::detect(&self.work_root, &stats.changed_files).is_some()
+        } else {
+            false
+        };
+        let protocol_demands_verifier = self.should_run_auto_test_for_success();
+        let session_id = self.session_store.session_id().to_string();
+        let model = self.models.main.clone();
+        // VerifierInputs / SkillInvocationRequest を組み立て invoke
+        let v_inputs = crate::agent::loop_run::verifier_skill::VerifierInputs {
+            score_inputs: crate::session::anvil_score::AnvilScoreInputs {
                 unsafe_blocks_this_turn: self.session.unsafe_blocks_this_turn,
                 repo_edit_succeeded_this_turn: self.session.repo_edit_succeeded_this_turn,
                 consecutive_no_progress_turns: self.session.consecutive_no_progress_turns,
                 prev: self.session.last_anvil_score.as_ref(),
+            },
+            repo_verification: Some(&final_verif),
+            should_dispatch_success_verifier,
+            protocol_demands_verifier,
+            changed_files: &stats.changed_files,
+            tester_candidate_some,
+            workspace_root: &self.work_root,
+        };
+        let started = std::time::Instant::now();
+        let snapshot_for_state = self.session.clone();
+        let runtime_state = crate::agent::skills::RuntimeState {
+            plan_mode: self.session.mode_state.mode == ExecutionMode::Plan,
+            interrupted: false,
+            turn_index: 0,
+            session: &snapshot_for_state,
+            last_anvil_score: self.session.last_anvil_score.as_ref(),
+            reminder_sidecar_available: false,
+            reminder_kind_eligible: false,
+            reminder_called_this_turn: self.reminder_called_this_turn,
+        };
+        let mut events_local: Vec<(&'static str, serde_json::Value)> = Vec::new();
+        let invocation = {
+            let mut wm = WorkingMemory::default();
+            let ctx = crate::agent::skills::SkillExecutionContext {
+                working_memory: &mut wm,
+                workspace_root: &self.work_root,
             };
-            let started = std::time::Instant::now();
-            // Issue #457: third argument now carries the AnvilTestSummary
-            // converted from AutoTestResult by `build_anvil_test_summary`
-            // when the AutoTest verifier branch ran successfully (Ok arm).
-            // Tester / NoVerifier / Skip / TransportError branches keep
-            // it None — those paths never observe an AutoTestResult.
-            let score = crate::session::anvil_score::compute_anvil_score(
-                &inputs,
-                Some(&final_verif),
-                auto_test_summary.as_ref(),
-            );
-            let compute_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let request = crate::agent::skills::SkillInvocationRequest {
+                skill_name: "verifier",
+                trigger: crate::agent::skills::SkillTrigger::PostLoop,
+                state: &runtime_state,
+                input: crate::agent::skills::SkillInput::Verifier(v_inputs),
+                ctx,
+                get_env: &|k: &str| std::env::var_os(k),
+                emit_event: &mut |k, p| events_local.push((k, p)),
+                session_id: &session_id,
+                model: Some(&model),
+            };
+            self.skill_registry.invoke(request)
+        };
+        // emit captured agent.verifier.* events via log_llm_event (logging::log_llm_event は
+        // mask_payload_inplace を内蔵するため secret 漏洩防御の SSOT、DR4-004).
+        for (k, p) in events_local.into_iter() {
+            log_llm_event(k, p);
+        }
+        let compute_ms = started.elapsed().as_secs_f64() * 1000.0;
+        // facade applies outcome (5 step):
+        // SkillOutput::Verifier(Box<VerifierOutcome>) - deref to access variant
+        let final_score = match invocation.output {
+            Some(crate::agent::skills::SkillOutput::Verifier(boxed)) => {
+                use crate::agent::loop_run::verifier_skill::{
+                    AutoTestKindView, VerifierOutcome, sanitize_verify_command_for_case_record,
+                };
+                let outcome: VerifierOutcome = *boxed;
+                let score = match &outcome {
+                    VerifierOutcome::AutoTestRan { score, .. }
+                    | VerifierOutcome::AutoTestTransportError { score, .. }
+                    | VerifierOutcome::TesterDelegated { score }
+                    | VerifierOutcome::NoVerifier { score, .. }
+                    | VerifierOutcome::Skipped { score } => score.clone(),
+                };
+                // [a] AutoTest 分岐時のみ legacy events emit + verify_commands push
+                //     (DR2-004: 空文字列 / DR4-001: sanitize でガード)
+                if let VerifierOutcome::AutoTestRan {
+                    auto_test_kind,
+                    auto_test_passed,
+                    auto_test_command,
+                    auto_test_output,
+                    auto_test_reason,
+                    ..
+                } = &outcome
+                {
+                    log_llm_event(
+                        "agent.autotest.completed",
+                        serde_json::json!({
+                            "session_id": &session_id,
+                            "command": auto_test_command,
+                            "passed": auto_test_passed,
+                            "reason": auto_test_reason,
+                        }),
+                    );
+                    if let Some(sanitized) =
+                        sanitize_verify_command_for_case_record(auto_test_command)
+                    {
+                        verify_commands_collected.push(sanitized);
+                    }
+                    // AutoTest failed (Ok だが passed=false) → MissingRepoEdits 反映 (DR3-001)
+                    if !auto_test_passed {
+                        let kind_dbg = match auto_test_kind {
+                            AutoTestKindView::Build => "Build",
+                            AutoTestKindView::Test => "Test",
+                        };
+                        exit_reason = ExitReason::MissingRepoEdits;
+                        error_text = format!(
+                            "auto test failed for protocol {kind_dbg}: {}\n{}",
+                            auto_test_command, auto_test_output
+                        );
+                    }
+                }
+                // [c] FeedbackFrame 記録 (DR2-003: record_feedback_if_unset で
+                //     first-eligible-failure-wins #455 規約を維持)
+                if let VerifierOutcome::AutoTestRan {
+                    feedback: Some(fb), ..
+                } = &outcome
+                {
+                    self.session.record_feedback_if_unset(fb.clone());
+                }
+                if let VerifierOutcome::NoVerifier { feedback, .. } = &outcome {
+                    self.session.record_feedback_if_unset(feedback.clone());
+                }
+                // [d] Tester 委譲 (本 Issue では Tester skill 化 Out of Scope、既存
+                //     try_invoke_tester を facade で呼ぶ)
+                if matches!(outcome, VerifierOutcome::TesterDelegated { .. }) {
+                    let tester_recorded = self.try_invoke_tester(&stats.changed_files);
+                    if !tester_recorded && self.should_run_auto_test_for_success() {
+                        let frame = build_feedback_for_no_verifier(&self.work_root);
+                        self.session.record_feedback_if_unset(frame);
+                    }
+                }
+                // [e] AutoTestTransportError → exit_reason 反映 (DR2-002)
+                if let VerifierOutcome::AutoTestTransportError { error, .. } = &outcome {
+                    exit_reason = ExitReason::TransportError;
+                    error_text = error.clone();
+                }
+                Some(score)
+            }
+            _ => None,
+        };
+        // [b] AnvilScore 永続化と flag 立て (Reminder より先).
+        if let Some(score) = final_score {
             let rendered = score.format_for_prompt();
             let render_chars = rendered.chars().count();
             log_llm_event(
                 "agent.anvil_score.computed",
                 serde_json::json!({
-                    "session_id": self.session_store.session_id(),
+                    "session_id": &session_id,
                     "score": &score,
                     "render_chars": render_chars,
                     "compute_ms": compute_ms,

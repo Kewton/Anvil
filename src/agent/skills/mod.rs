@@ -20,6 +20,7 @@ use std::ffi::OsString;
 use std::path::Path;
 
 use crate::agent::loop_run::reminder::{ReminderInputs, ReminderOutcome, SkipReason};
+use crate::agent::loop_run::verifier_skill::{VerifierInputs, VerifierOutcome};
 use crate::session::anvil_score::AnvilScore;
 use crate::session::store::{SessionSnapshot, WorkingMemory};
 
@@ -59,10 +60,14 @@ pub struct SkillExecutionContext<'a> {
 
 /// Skill 入力 (skill 種別ごとに variant).
 ///
-/// 本 Issue では Reminder のみ。Tester / CaseRecord / CaseRetrieval は別 Issue
-/// で variant 追加 (Out of Scope)。
+/// 本 Issue (#466) で `Verifier` variant を追加。Tester / CaseRecord / CaseRetrieval
+/// は別 Issue で variant 追加 (Out of Scope)。
+///
+/// `#[non_exhaustive]` は将来 variant 追加時の `match` 互換性を保つため (DR-466-004)。
+#[non_exhaustive]
 pub enum SkillInput<'a> {
     Reminder(ReminderInputs<'a>),
+    Verifier(VerifierInputs<'a>),
     /// Test fixture / NoOp 用
     NoOp,
 }
@@ -71,9 +76,15 @@ pub enum SkillInput<'a> {
 ///
 /// Reminder の `Failed` / `Skipped` / `Completed` は ReminderOutcome 内 variant
 /// として表現 (recoverable failure は Result::Err ではなく outcome variant)。
+///
+/// `#[non_exhaustive]` は将来 variant 追加時の `match` 互換性を保つため (DR-466-004)。
+/// `Verifier` は payload が大きい (AutoTestRan 内 FeedbackFrame / String 多数) ため
+/// `Box` で indirection し、`large_enum_variant` clippy lint を満たす。
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum SkillOutput {
     Reminder(ReminderOutcome),
+    Verifier(Box<VerifierOutcome>),
     NoOp,
 }
 
@@ -310,6 +321,7 @@ impl SkillRegistry {
 fn skipped_event_key(skill_name: &str) -> &'static str {
     match skill_name {
         "reminder" => "agent.reminder.skipped",
+        "verifier" => "agent.verifier.skipped",
         _ => "agent.skill.skipped",
     }
 }
@@ -318,6 +330,7 @@ fn skipped_event_key(skill_name: &str) -> &'static str {
 fn failed_event_key(skill_name: &str) -> &'static str {
     match skill_name {
         "reminder" => "agent.reminder.failed",
+        "verifier" => "agent.verifier.failed",
         _ => "agent.skill.failed",
     }
 }
