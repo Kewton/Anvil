@@ -5929,16 +5929,56 @@ if __name__ == "__main__":
         }
         self.refresh_working_memory();
         let task = self.session.working_memory.active_task.clone()?;
+
+        // Issue #469: cache key is widened to include graph ranking inputs.
+        let suspected_files: Vec<PathBuf> = self
+            .session
+            .last_feedback
+            .as_ref()
+            .map(|f| f.suspected_files.clone())
+            .unwrap_or_default();
+        let suspected_strings: Vec<String> = suspected_files
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        let changed_files: Vec<String> = self.session.touched_files_at_turn_start.clone();
+        let last_feedback_kind: Option<String> = self
+            .session
+            .last_feedback
+            .as_ref()
+            .map(|f| format!("{:?}", f.kind));
+        let repo_graph_present = self.repo_graph.is_some();
+        let suspected_fp = super::fingerprint_paths(&suspected_strings);
+        let touched_fp = super::fingerprint_paths(&changed_files);
+
         if let Some(cache) = &self.repo_context_cache
             && cache.task == task
             && cache.work_root == self.work_root
+            && cache.repo_graph_present == repo_graph_present
+            && cache.last_feedback_kind == last_feedback_kind
+            && cache.suspected_files_fingerprint == suspected_fp
+            && cache.touched_files_fingerprint == touched_fp
         {
             return cache.message.clone();
         }
-        let message = prompting::repo_context_message(&self.work_root, Some(&task));
+
+        let session_id = self.session_store.session_id().to_string();
+        let model = self.models.main.clone();
+        let inputs = prompting::RepoContextInputs {
+            repo_graph: self.repo_graph.as_deref(),
+            suspected_files: &suspected_files,
+            changed_files: &changed_files,
+            session_id: &session_id,
+            model: Some(model.as_str()),
+        };
+        let message = prompting::repo_context_message(&self.work_root, Some(&task), &inputs);
         self.repo_context_cache = Some(super::RepoContextCache {
             task,
             work_root: self.work_root.clone(),
+            repo_graph_present,
+            last_feedback_kind,
+            suspected_files_fingerprint: suspected_fp,
+            touched_files_fingerprint: touched_fp,
             message: message.clone(),
         });
         message
