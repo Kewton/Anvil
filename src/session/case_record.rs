@@ -20,8 +20,7 @@
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -31,6 +30,7 @@ use crate::session::feedback::{FeedbackKind, mask_secrets, normalize_path_to_wor
 use crate::session::precaution::{Precaution, PrecautionSource, PrecautionStatus, Severity};
 use crate::session::store::truncate_entry;
 use crate::util::file_classify::{is_implementation_file, is_setup_file, is_test_file};
+use crate::util::git_hardened::run_git;
 
 // ---------------------------------------------------------------------------
 // Constants (DR-005 / DR-007 / DR-008 / DR-010)
@@ -53,9 +53,6 @@ pub const TASK_SIGNATURE_SAFETY_CAP: usize = 240;
 
 /// Per-kind cap for individual file names in `changed_files_summary` (DR-005).
 const MAX_CHANGED_FILE_NAMES: usize = 8;
-
-/// Subprocess timeout for `git config --get` / `git symbolic-ref` (DR-3).
-const GIT_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(1);
 
 // ---------------------------------------------------------------------------
 // Types
@@ -322,72 +319,6 @@ fn capture_git_head_branch(work_root: &Path) -> Option<String> {
     run_git(work_root, &["symbolic-ref", "--short", "HEAD"])
 }
 
-/// Run `git` in `work_root` with hardened config (DR-009): hooks / pager / gpg
-/// / credential helper silenced, all `GIT_*` env vars removed. Returns trimmed
-/// stdout on success, `None` on any failure or timeout.
-fn run_git(work_root: &Path, args: &[&str]) -> Option<String> {
-    if !cfg!(unix) {
-        // wait_with_timeout below is unix-only; bail safely on other platforms.
-        return None;
-    }
-    let hardened_prefix = [
-        "-c",
-        "core.sshCommand=",
-        "-c",
-        "credential.helper=",
-        "-c",
-        "core.pager=cat",
-        "-c",
-        "core.hooksPath=/dev/null",
-        "-c",
-        "gpg.program=/dev/null",
-    ];
-    let mut full_args: Vec<&str> = hardened_prefix.to_vec();
-    full_args.extend_from_slice(args);
-
-    let mut child = Command::new("git")
-        .args(&full_args)
-        .current_dir(work_root)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_CONFIG")
-        .env_remove("GIT_CONFIG_GLOBAL")
-        .env_remove("GIT_CONFIG_SYSTEM")
-        .env_remove("GIT_SSH")
-        .env_remove("GIT_SSH_COMMAND")
-        .env_remove("GIT_TRACE")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .stdin(Stdio::null())
-        .spawn()
-        .ok()?;
-
-    let started = Instant::now();
-    loop {
-        match child.try_wait().ok()? {
-            Some(status) => {
-                if !status.success() {
-                    return None;
-                }
-                let output = child.wait_with_output().ok()?;
-                let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if s.is_empty() {
-                    return None;
-                }
-                return Some(s);
-            }
-            None => {
-                if started.elapsed() >= GIT_SUBPROCESS_TIMEOUT {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return None;
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Extract (M5)
 // ---------------------------------------------------------------------------
@@ -596,6 +527,7 @@ where
 mod tests {
     use super::*;
     use crate::session::precaution::{PrecautionSource, PrecautionStatus, Severity};
+    use std::time::Duration;
 
     fn fake_precaution(id: &str, text: &str) -> Precaution {
         Precaution {

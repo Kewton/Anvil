@@ -5,3 +5,4 @@
 //! dependency direction one-way (util → session → agent).
 
 pub mod file_classify;
+pub mod git_hardened;
