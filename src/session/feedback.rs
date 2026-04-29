@@ -44,6 +44,11 @@ pub enum FeedbackKind {
     /// (no_tool_retries exhausted, or answer-only inadequate-reply path).
     /// serde tag = "no_tool_call".
     NoToolCall,
+    /// Issue #467: skill 層 trust tier 違反 (`SkillRegistry::invoke` の tier_check
+    /// が deny した場合)。`is_eligible_for_reminder()` は false を返す
+    /// (Reminder Sidecar の入力にしない)。`record_feedback_if_unset` 経由で書き込み
+    /// (#455 first-eligible-failure-wins を維持)。
+    SkillPermissionDenied,
     #[serde(other)]
     #[default]
     UnknownFailure,
@@ -488,6 +493,56 @@ mod tests {
         assert_eq!(decoded, original);
     }
 
+    /// Issue #467: SkillPermissionDenied serializes to snake_case "skill_permission_denied".
+    #[test]
+    fn feedback_kind_skill_permission_denied_serializes_as_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&FeedbackKind::SkillPermissionDenied).unwrap(),
+            "\"skill_permission_denied\""
+        );
+    }
+
+    /// Issue #467: round-trip pin for SkillPermissionDenied.
+    #[test]
+    fn feedback_kind_skill_permission_denied_round_trip() {
+        let original = FeedbackKind::SkillPermissionDenied;
+        let json = serde_json::to_string(&original).unwrap();
+        let decoded: FeedbackKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    /// Issue #467 / DR2-002: SkillPermissionDenied は Reminder Sidecar の入力にしない.
+    #[test]
+    fn feedback_kind_skill_permission_denied_not_eligible_for_reminder() {
+        assert!(!FeedbackKind::SkillPermissionDenied.is_eligible_for_reminder());
+    }
+
+    /// Issue #467 / DR4-001: build_feedback_frame の primary_error が secret mask 経由で
+    /// SkillPermissionDenied frame でも防御されることを pin.
+    #[test]
+    fn feedback_frame_skill_permission_denied_primary_error_is_masked() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path();
+        let raw_reason = "tier_mismatch GITHUB_TOKEN=ghp_supersecret123";
+        let primary = format!("skill=verifier requested=bash reason={raw_reason}");
+        let draft = FeedbackFrameDraft {
+            command: None,
+            exit_code: None,
+            kind: FeedbackKind::SkillPermissionDenied,
+            stdout: String::new(),
+            stderr: String::new(),
+            primary_error: Some(primary),
+            suspected_files: Vec::new(),
+            changed_files: Vec::new(),
+        };
+        let frame = build_feedback_frame(draft, workspace);
+        let masked = frame.primary_error.as_deref().unwrap_or_default();
+        assert!(
+            !masked.contains("ghp_supersecret123"),
+            "raw secret leaked into frame.primary_error: {masked:?}"
+        );
+    }
+
     /// Issue #455 / DR1-003: explicit truth table for every FeedbackKind
     /// variant. This is the single source-of-truth for which kinds drive the
     /// Reminder Sidecar.
@@ -498,6 +553,8 @@ mod tests {
         assert!(!BuildPass.is_eligible_for_reminder());
         assert!(!TestPass.is_eligible_for_reminder());
         assert!(!NoVerifierAvailable.is_eligible_for_reminder());
+        // Issue #467: SkillPermissionDenied は Reminder Sidecar の入力にしない.
+        assert!(!SkillPermissionDenied.is_eligible_for_reminder());
         assert!(!UnknownFailure.is_eligible_for_reminder());
         // Failure kinds → eligible.
         assert!(CompileError.is_eligible_for_reminder());

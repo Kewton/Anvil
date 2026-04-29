@@ -3752,6 +3752,13 @@ impl Agent {
                 }
                 Some(score)
             }
+            // Issue #467 / DR1-002 2 次防御: PermissionDenied は SkillRegistry::invoke 内で
+            // 完結する設計のため facade に届かない。届いたら debug_assert で検知し
+            // release では安全に None フォールバック。
+            Some(crate::agent::skills::SkillOutput::PermissionDenied(_)) => {
+                debug_assert!(false, "PermissionDenied must not reach facade");
+                None
+            }
             _ => None,
         };
         // [b] AnvilScore 永続化と flag 立て (Reminder より先).

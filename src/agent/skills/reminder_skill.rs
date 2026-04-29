@@ -21,7 +21,7 @@ use crate::ollama::client::AssistantReply;
 
 use super::{
     AgentSkill, RuntimeState, SkillExecuteError, SkillExecutionContext, SkillInput, SkillOutput,
-    SkillTrigger,
+    SkillTrigger, SkillTrustTier,
 };
 
 const REMINDER_TRIGGERS: &[SkillTrigger] =
@@ -120,6 +120,18 @@ impl AgentSkill for ReminderSkill {
             _ => ("agent.reminder.failed", serde_json::Value::Null),
         }
     }
+
+    /// Issue #467: ReminderSkill は Read-only (sidecar Ollama 呼び出し +
+    /// WorkingMemory 書込のみ、Tool 経由の repo Write はしない).
+    ///
+    /// **DR3-002 注記**: 本 Issue では ReminderSkill は production 経路で
+    /// `SkillRegistry::invoke` を通らない (`Agent::maybe_invoke_reminder` の
+    /// direct call 経路、turn.rs:1856)。本値は将来 registry 経由化 Issue で
+    /// 実効稼働する宣言値、および設計判断 #1 の沈黙の権限付与防止のための
+    /// 型定義上の必須要件として位置付ける。
+    fn tier(&self) -> SkillTrustTier {
+        SkillTrustTier::BuiltInReadOnly
+    }
 }
 
 #[cfg(test)]
@@ -149,6 +161,13 @@ mod tests {
         assert_eq!(triggers.len(), 2);
         assert!(triggers.contains(&SkillTrigger::IterationInternal));
         assert!(triggers.contains(&SkillTrigger::PostLoop));
+    }
+
+    /// Issue #467: ReminderSkill::tier() == BuiltInReadOnly を pin.
+    #[test]
+    fn reminder_skill_tier_is_read_only() {
+        let s = make_skill_with_dummy();
+        assert_eq!(s.tier(), SkillTrustTier::BuiltInReadOnly);
     }
 
     #[test]
