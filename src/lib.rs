@@ -5,6 +5,7 @@ pub mod logging;
 pub mod model_registry;
 pub mod modes;
 pub mod ollama;
+pub mod repo_graph;
 pub mod safety;
 pub mod session;
 pub mod system_prompt;
