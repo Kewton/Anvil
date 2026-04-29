@@ -33,6 +33,7 @@ mod spinner;
 mod summary;
 mod tester;
 mod turn;
+pub(crate) mod verifier_skill;
 
 // Public re-exports so `lib.rs::run_cli` can hand a `FooterHandle` into
 // `Agent::new` and own the matching `FooterLease` for its scope (issue #430).
@@ -112,6 +113,12 @@ pub struct Agent {
     /// `AnvilScoreSnapshot::CurrentTurn` (post-loop hook, score is the value
     /// just computed for this turn).
     pub(super) anvil_score_computed_this_turn: bool,
+    /// Issue #466: skill registry. ReminderSkill (#465) は trait 実装を直接呼び出す
+    /// 既存経路を維持し、本 Issue では VerifierSkill を post-loop fence で invoke
+    /// するために registry instance を hold する。dynamic skill loading は許可しない
+    /// (DR4-003): static registration only.
+    #[allow(dead_code)]
+    pub(super) skill_registry: crate::agent::skills::SkillRegistry,
 }
 
 #[derive(Clone)]
@@ -136,6 +143,8 @@ impl Agent {
             .unwrap_or_else(|| config.cwd.clone());
         let native_tools_enabled =
             should_use_native_tool_calls(&models.main) && !session.native_tools_disabled;
+        let mut skill_registry = crate::agent::skills::SkillRegistry::new();
+        skill_registry.register(crate::agent::loop_run::verifier_skill::VerifierSkill);
         Self {
             config,
             models,
@@ -151,6 +160,7 @@ impl Agent {
             reminder_called_this_turn: false,
             tester_called_this_turn: false,
             anvil_score_computed_this_turn: false,
+            skill_registry,
         }
     }
 }
