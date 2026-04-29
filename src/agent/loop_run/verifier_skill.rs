@@ -26,7 +26,7 @@ use crate::session::feedback::FeedbackFrame;
 
 use crate::agent::skills::{
     AgentSkill, RuntimeState, SkillExecuteError, SkillExecutionContext, SkillInput, SkillOutput,
-    SkillTrigger,
+    SkillTrigger, SkillTrustTier,
 };
 
 const VERIFIER_TRIGGERS: &[SkillTrigger] = &[SkillTrigger::PostLoop];
@@ -247,6 +247,17 @@ impl AgentSkill for VerifierSkill {
             }),
         )
     }
+
+    /// Issue #467: VerifierSkill は AutoTestRunner 経由で `cargo test` 等の
+    /// 固定テンプレート Bash を要求するため `BuiltInCanRequestBash`.
+    ///
+    /// Plan mode では DR-466-001 の例外として tier_check を bypass し、
+    /// 既存の `agent.verifier.completed { dispatched: "skip" }` 経路 (run() 内で
+    /// success gate false 時に Skipped 返却) を維持する。bypass は
+    /// `skill_bypasses_plan_mode("verifier") == true` で表現される。
+    fn tier(&self) -> SkillTrustTier {
+        SkillTrustTier::BuiltInCanRequestBash
+    }
 }
 
 /// turn.rs の private fn `build_anvil_test_summary` を VerifierSkill 側でも参照するため
@@ -334,6 +345,13 @@ mod tests {
         let triggers = s.triggers();
         assert_eq!(triggers.len(), 1);
         assert!(triggers.contains(&SkillTrigger::PostLoop));
+    }
+
+    /// Issue #467: VerifierSkill::tier() == BuiltInCanRequestBash を pin.
+    #[test]
+    fn verifier_skill_tier_is_can_request_bash() {
+        let s = VerifierSkill;
+        assert_eq!(s.tier(), SkillTrustTier::BuiltInCanRequestBash);
     }
 
     #[test]

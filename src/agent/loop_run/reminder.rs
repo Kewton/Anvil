@@ -251,7 +251,9 @@ pub fn normalize_source(kind: &FeedbackKind) -> Option<PrecautionSource> {
         ToolProtocolFailure | EditFailure | NoToolCall => Some(PrecautionSource::ToolFailure),
         NoRepoProgress => Some(PrecautionSource::NoProgress),
         UnsafeCommandBlocked => Some(PrecautionSource::SafetyPolicy),
-        BuildPass | TestPass | NoVerifierAvailable | UnknownFailure => None,
+        // Issue #467: SkillPermissionDenied は Reminder Sidecar の入力にしない
+        // (DR1-001 / DR2-001 の網羅性検知設計を踏襲)。
+        BuildPass | TestPass | NoVerifierAvailable | SkillPermissionDenied | UnknownFailure => None,
     }
 }
 
@@ -822,6 +824,7 @@ mod tests {
         assert_eq!(normalize_source(&BuildPass), None);
         assert_eq!(normalize_source(&TestPass), None);
         assert_eq!(normalize_source(&NoVerifierAvailable), None);
+        assert_eq!(normalize_source(&SkillPermissionDenied), None);
         assert_eq!(normalize_source(&UnknownFailure), None);
     }
 
@@ -832,7 +835,7 @@ mod tests {
     #[test]
     fn is_eligible_for_reminder_parity() {
         use FeedbackKind::*;
-        const ALL_KINDS: [FeedbackKind; 14] = [
+        const ALL_KINDS: [FeedbackKind; 15] = [
             BuildPass,
             TestPass,
             CompileError,
@@ -846,6 +849,7 @@ mod tests {
             UnsafeCommandBlocked,
             NoVerifierAvailable,
             NoToolCall,
+            SkillPermissionDenied,
             UnknownFailure,
         ];
         for kind in ALL_KINDS.iter() {

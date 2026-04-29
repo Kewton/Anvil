@@ -326,6 +326,9 @@ pub fn build_avoid_precaution(kind: &FeedbackKind, summary: &str) -> String {
         FeedbackKind::NoRepoProgress => "Avoid the no-progress loop:",
         FeedbackKind::UnsafeCommandBlocked => "Avoid the unsafe command:",
         FeedbackKind::NoToolCall => "Avoid finishing the turn without any tool call:",
+        // Issue #467 / DR3-003: SkillPermissionDenied を明示 arm として書き出す
+        // (wildcard fall-through を残すが、変更漏れの自動検知のために明示)。
+        FeedbackKind::SkillPermissionDenied => "Avoid repeating skill permission denial:",
         _ => "Avoid repeating this failed action:",
     };
     let summary = summary.trim();
@@ -922,6 +925,10 @@ mod tests {
         assert!(!is_repeat_eligible_kind(&FeedbackKind::BuildPass));
         assert!(!is_repeat_eligible_kind(&FeedbackKind::TestPass));
         assert!(!is_repeat_eligible_kind(&FeedbackKind::NoVerifierAvailable));
+        // Issue #467 / DR3-003: SkillPermissionDenied は anti-pattern eligibility=false
+        assert!(!is_repeat_eligible_kind(
+            &FeedbackKind::SkillPermissionDenied
+        ));
         assert!(!is_repeat_eligible_kind(&FeedbackKind::UnknownFailure));
     }
 

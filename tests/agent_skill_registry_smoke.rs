@@ -22,7 +22,7 @@ use anvil::agent::loop_run::{
 use anvil::agent::skills::reminder_skill::ReminderSkill;
 use anvil::agent::skills::{
     AgentSkill, RuntimeState, SkillExecuteError, SkillExecutionContext, SkillInput,
-    SkillInvocationRequest, SkillOutput, SkillRegistry, SkillTrigger,
+    SkillInvocationRequest, SkillOutput, SkillRegistry, SkillTrigger, SkillTrustTier,
 };
 use anvil::ollama::client::AssistantReply;
 use anvil::session::feedback::{FeedbackFrame, FeedbackKind};
@@ -41,6 +41,8 @@ struct DummySkill {
     applicability_result: bool,
     /// execute の戻り値. true = Ok(NoOp), false = Err
     execute_returns_ok: bool,
+    /// Issue #467: tier() の戻り値. 既存ケースは BuiltInReadOnly でデフォルト挙動。
+    tier_value: SkillTrustTier,
 }
 
 impl AgentSkill for DummySkill {
@@ -81,6 +83,9 @@ impl AgentSkill for DummySkill {
             "agent.dummy.completed",
             serde_json::json!({"session_id": session_id, "outcome": "ok"}),
         )
+    }
+    fn tier(&self) -> SkillTrustTier {
+        self.tier_value
     }
 }
 
@@ -147,6 +152,7 @@ fn fence_routing_iteration_internal() {
         pre_check_result: None,
         applicability_result: true,
         execute_returns_ok: true,
+        tier_value: SkillTrustTier::BuiltInReadOnly,
     });
     let snapshot = make_session_snapshot();
     let state = make_state(&snapshot, false, false);
@@ -189,6 +195,7 @@ fn fence_routing_post_loop_does_not_invoke_iteration_only_skill() {
         pre_check_result: None,
         applicability_result: true,
         execute_returns_ok: true,
+        tier_value: SkillTrustTier::BuiltInReadOnly,
     });
     let snapshot = make_session_snapshot();
     let state = make_state(&snapshot, false, false);
@@ -347,6 +354,7 @@ fn execute_err_emits_failed_event_and_continues() {
         pre_check_result: None,
         applicability_result: true,
         execute_returns_ok: false,
+        tier_value: SkillTrustTier::BuiltInReadOnly,
     });
     let snapshot = make_session_snapshot();
     let state = make_state(&snapshot, false, false);
@@ -397,6 +405,7 @@ fn applicability_false_emits_silent_skip() {
         pre_check_result: None,
         applicability_result: false,
         execute_returns_ok: true,
+        tier_value: SkillTrustTier::BuiltInReadOnly,
     });
     let snapshot = make_session_snapshot();
     let state = make_state(&snapshot, false, false);
