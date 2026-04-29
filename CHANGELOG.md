@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-04-29
+
+Epic C: Case Memory & CBR + Epic D: Agentic Skills Layer を統合リリース。turn 単位の手続き記憶を CaseRecord として永続化し、6-element Jaccard 類似度で過去ケースを次 turn の prompt に注入。失敗パターンを AntiPattern として upsert し、繰り返し閾値超で "Avoid Patterns:" を注入する。さらに `AgentSkill` trait + `SkillRegistry` 基盤を導入し、Reminder / Verifier を skill ディスパッチに移植、`SkillTrustTier` で read-only skill の Write 違反を runtime block する。
+
+### Added
+
+- `CaseRecord` 抽出 + `state_root/cases/<case_id>.json` 永続化 (#462)。Act mode の post-loop hook で `last_anvil_score` の success 条件を満たす turn から手続き記憶 (case_id / repo_fingerprint / task_signature / language_stack / initial_feedback / successful_precautions / changed_files_summary / verify_commands / outcome_score) を抽出。`MAX_CASE_RECORD_BYTES=16 KiB`, `MAX_CASE_RECORDS=256` (lazy LRU eviction)、`case_[a-z0-9_-]{16,64}` allowlist。git_remote 取得は `Command` に `-c core.sshCommand= -c credential.helper= -c core.pager=cat -c core.hooksPath=/dev/null -c gpg.program=/dev/null` + 全 `GIT_*` env 削除 + 1s timeout で hardening し、`mask_secrets` → `sanitize_git_remote` (rfind('@') で IPv6 / 多重@ / scheme 無し ssh shorthand 対応) を通す。per-turn cap = 1、Plan mode disable、`ANVIL_NO_CASE_RECORD` / `ANVIL_CASE_RECORD_DRY_RUN` 環境変数。
+- Case retrieval (#463)。新 turn 開始時に `state_root/cases/` を母集団に 6-element Jaccard 重み付き和（W_TASK 0.30 / W_STACK 0.10 / W_REPO 0.20 / W_FILES 0.20 / W_KIND 0.10 / W_PRECAUTIONS 0.10、合計 1.0）で score し、閾値 `CASE_RETRIEVAL_SCORE_THRESHOLD=0.40` 以上を `MAX_SELECTED_CASES=3` 件まで選定。`format_for_prompt` は per-case `MAX_CASE_RENDERED_CHARS_PER_CASE=240` / total `MAX_CASE_RENDERED_CHARS_TOTAL=1024` cap。`try_inject_case_retrieval_message` adapter で Act mode prompt に "Relevant Local Cases:" セクションを注入。Plan mode / per-turn cap / `ANVIL_NO_CASE_RETRIEVAL` を adapter 内で完結判定 (S3-008 layer 分離)。
+- AntiPattern (#464)。`(workspace_key, task_signature, feedback_kind)` をキーに失敗パターンを upsert し、`repeat_count >= 2` で "Avoid Patterns:" system message 注入。env gates / per-turn cap で過剰注入を防御。
+- `AgentSkill` trait + `SkillRegistry` 基盤 (#465)。`SkillTrigger::{IterationInternal, MessageBuild, PostLoop}` で 3 か所の dispatch site を統一。Reminder Sidecar を thin trait adapter に移行し、既存 4 reminder regression + 7 ReminderGate test を温存。
+- VerifierSkill (#466)。post-loop verifier dispatch を `SkillRegistry::invoke(VerifierSkill)` 経由に切替。AnvilScore 計算 / AutoTest runner / verify-command 収集を skill ディスパッチに統合。
+- `SkillTrustTier` enum 4 variant + `AgentSkill::tier()` + `SkillOutput::PermissionDenied` + `FeedbackKind::SkillPermissionDenied` + `agent.skill.permission_denied` jsonl event (#467)。read-only skill による誤 Write を runtime block し、permission 違反を FeedbackFrame 経由で記録。
+- Epic A/B/C/D の orchestration plans / summaries を `workspace/orchestration/runs/{2026-04-27,2026-04-28,2026-04-29,2026-04-29-epic-d}/` 配下に追加。
+
 ## [0.3.0] - 2026-04-29
 
 Epic B: Verification & Temporary Testing — turn 単位で検証可能な進捗信号を凝集する `AnvilScore`、test verifier が無い repo 向けの Tester Skill、生成テストを repo に汚染させない Temporary Test Workspace、`auto_test` ↔ AnvilScore 接続、`/tests` REPL コマンド、ランタイム sandbox の強化を一括投入した。
