@@ -676,6 +676,16 @@ pub struct SessionSnapshot {
     /// Plan-mode early return does NOT set this. Reset at `run_turn` head.
     #[serde(skip, default)]
     pub case_retrieval_invoked_this_turn: bool,
+    /// Issue #464: turn-local per-turn cap for anti-pattern extraction.
+    /// Set to `true` once `maybe_extract_anti_pattern` runs (regardless of
+    /// outcome). Not persisted; runtime-only flag.
+    #[serde(skip, default)]
+    pub anti_pattern_extracted_this_turn: bool,
+    /// Issue #464: turn-local per-turn cap for anti-pattern retrieval.
+    /// Set to `true` once `try_inject_anti_pattern_message` consumes the cap.
+    /// Plan-mode early return does NOT set this. Reset at `run_turn` head.
+    #[serde(skip, default)]
+    pub anti_pattern_retrieval_invoked_this_turn: bool,
 }
 
 impl SessionSnapshot {

@@ -1577,6 +1577,273 @@ impl Agent {
         }
     }
 
+    /// Issue #464: post-loop AntiPattern extraction. Mirrors
+    /// `maybe_extract_case_record` but triggers on **failure** turns instead
+    /// of success. Upserts a record keyed by (workspace_key, task_signature,
+    /// feedback_kind); the second + N-th occurrence increments `repeat_count`.
+    /// Pure upsert / scrub / persist; no sidecar / LLM calls.
+    pub(super) fn maybe_extract_anti_pattern(&mut self) {
+        use crate::session::anti_pattern;
+
+        // Plan-mode gate: never extract in Plan mode.
+        if self.session.mode_state.mode == ExecutionMode::Plan {
+            return;
+        }
+        // Per-turn cap.
+        if self.session.anti_pattern_extracted_this_turn {
+            return;
+        }
+        // Disable env.
+        if anti_pattern::anti_pattern_disabled(|k| std::env::var(k)) {
+            log_llm_event(
+                "agent.anti_pattern.disabled",
+                serde_json::json!({
+                    "session_id": self.session_store.session_id(),
+                }),
+            );
+            self.session.anti_pattern_extracted_this_turn = true;
+            return;
+        }
+
+        // Eligible failure FeedbackFrame is the trigger.
+        let Some(frame) = self.session.last_feedback.as_ref() else {
+            self.session.anti_pattern_extracted_this_turn = true;
+            return;
+        };
+        if !anti_pattern::is_repeat_eligible_kind(&frame.kind) {
+            self.session.anti_pattern_extracted_this_turn = true;
+            return;
+        }
+
+        // Build the failed_action_summary from primary_error → command → kind.
+        let summary_owned: String = frame
+            .primary_error
+            .clone()
+            .or_else(|| frame.command().map(|s| s.to_string()))
+            .unwrap_or_else(|| format!("{:?}", frame.kind));
+
+        let language_stack = derive_language_stack(&self.work_root);
+        let active_task = self.session.working_memory.active_task.clone();
+        let workspace_key = self.session.workspace_key.clone();
+        let touched_files = self.session.working_memory.touched_files.clone();
+        let kind = frame.kind.clone();
+
+        if anti_pattern::anti_pattern_dry_run(|k| std::env::var(k)) {
+            log_llm_event(
+                "agent.anti_pattern.skipped",
+                serde_json::json!({
+                    "session_id": self.session_store.session_id(),
+                    "reason": "dry_run",
+                    "feedback_kind": serde_json::to_value(&kind).unwrap_or_default(),
+                }),
+            );
+            self.session.anti_pattern_extracted_this_turn = true;
+            return;
+        }
+
+        let inputs = anti_pattern::AntiPatternRecordInputs {
+            workspace_key: &workspace_key,
+            work_root: &self.work_root,
+            active_task: active_task.as_deref(),
+            language_stack: &language_stack,
+            touched_files: &touched_files,
+            feedback_kind: kind.clone(),
+            failed_action_summary: &summary_owned,
+        };
+
+        let started = std::time::Instant::now();
+        let state_root = self.session_store.state_root().to_path_buf();
+        match anti_pattern::extract_or_increment(&state_root, &inputs) {
+            Ok(anti_pattern::ExtractOutcome::Created(record)) => {
+                let compute_ms = started.elapsed().as_secs_f64() * 1000.0;
+                log_llm_event(
+                    "agent.anti_pattern.extracted",
+                    serde_json::json!({
+                        "session_id": self.session_store.session_id(),
+                        "anti_pattern_id": record.anti_pattern_id,
+                        "outcome": "created",
+                        "repeat_count": record.repeat_count,
+                        "feedback_kind": serde_json::to_value(&record.feedback_kind).unwrap_or_default(),
+                        "compute_ms": compute_ms,
+                    }),
+                );
+            }
+            Ok(anti_pattern::ExtractOutcome::Incremented(record)) => {
+                let compute_ms = started.elapsed().as_secs_f64() * 1000.0;
+                log_llm_event(
+                    "agent.anti_pattern.extracted",
+                    serde_json::json!({
+                        "session_id": self.session_store.session_id(),
+                        "anti_pattern_id": record.anti_pattern_id,
+                        "outcome": "incremented",
+                        "repeat_count": record.repeat_count,
+                        "feedback_kind": serde_json::to_value(&record.feedback_kind).unwrap_or_default(),
+                        "compute_ms": compute_ms,
+                    }),
+                );
+            }
+            Ok(anti_pattern::ExtractOutcome::SkippedIneligibleKind) => {
+                log_llm_event(
+                    "agent.anti_pattern.skipped",
+                    serde_json::json!({
+                        "session_id": self.session_store.session_id(),
+                        "reason": "ineligible_kind",
+                    }),
+                );
+            }
+            Ok(anti_pattern::ExtractOutcome::SkippedNoActiveTask) => {
+                log_llm_event(
+                    "agent.anti_pattern.skipped",
+                    serde_json::json!({
+                        "session_id": self.session_store.session_id(),
+                        "reason": "no_active_task",
+                    }),
+                );
+            }
+            Err(anti_pattern::PersistError::TooLarge { bytes }) => {
+                log_llm_event(
+                    "agent.anti_pattern.skipped",
+                    serde_json::json!({
+                        "session_id": self.session_store.session_id(),
+                        "reason": "too_large",
+                        "bytes": bytes,
+                    }),
+                );
+            }
+            Err(e) => {
+                log_llm_event(
+                    "agent.anti_pattern.failed",
+                    serde_json::json!({
+                        "session_id": self.session_store.session_id(),
+                        "error": e.to_string(),
+                    }),
+                );
+            }
+        }
+        self.session.anti_pattern_extracted_this_turn = true;
+    }
+
+    /// Issue #464: build and (when applicable) inject an `Avoid Patterns:`
+    /// system message into the next prompt. Mirrors
+    /// `try_inject_case_retrieval_message` but pulls from
+    /// `state_root/anti_patterns/`.
+    pub(super) fn try_inject_anti_pattern_message(&mut self) -> Option<ConversationMessage> {
+        use crate::session::anti_pattern::{self, AntiPatternRetrievalInputs, RetrievalOutcome};
+        use crate::session::case_record::{build_task_signature, capture_repo_fingerprint};
+
+        // 1. Plan mode → skipped, do not consume cap.
+        if self.session.mode_state.mode == ExecutionMode::Plan {
+            log_llm_event(
+                "agent.anti_pattern.skipped",
+                serde_json::json!({
+                    "session_id": self.session_store.session_id(),
+                    "reason": "plan_mode",
+                }),
+            );
+            return None;
+        }
+        // 2. per-turn cap consumed.
+        if self.session.anti_pattern_retrieval_invoked_this_turn {
+            log_llm_event(
+                "agent.anti_pattern.skipped",
+                serde_json::json!({
+                    "session_id": self.session_store.session_id(),
+                    "reason": "per_turn_cap_consumed",
+                }),
+            );
+            return None;
+        }
+        // 3. Env disable.
+        if anti_pattern::anti_pattern_disabled(|k| std::env::var(k)) {
+            self.session.anti_pattern_retrieval_invoked_this_turn = true;
+            log_llm_event(
+                "agent.anti_pattern.disabled",
+                serde_json::json!({
+                    "session_id": self.session_store.session_id(),
+                }),
+            );
+            return None;
+        }
+
+        // 4. Build inputs.
+        let language_stack = derive_language_stack(&self.work_root);
+        let workspace_key = self.session.workspace_key.clone();
+        let active_task = self.session.working_memory.active_task.clone();
+        let task_signature = build_task_signature(active_task.as_deref(), &self.work_root);
+        let repo_fp = capture_repo_fingerprint(&workspace_key, &self.work_root, &language_stack);
+        let touched_files = self.session.working_memory.touched_files.clone();
+        let feedback_kind = self.session.last_feedback.as_ref().map(|f| f.kind.clone());
+
+        let dry_run = anti_pattern::anti_pattern_dry_run(|k| std::env::var(k));
+        let inputs = AntiPatternRetrievalInputs {
+            current_task_signature: &task_signature,
+            current_language_stack: &language_stack,
+            current_repo_fingerprint: &repo_fp,
+            current_touched_files: &touched_files,
+            current_feedback_kind: feedback_kind,
+        };
+
+        self.session.anti_pattern_retrieval_invoked_this_turn = true;
+
+        let state_root = self.session_store.state_root().to_path_buf();
+        match anti_pattern::retrieve_relevant_anti_patterns(&state_root, &inputs, dry_run) {
+            Ok(RetrievalOutcome::Completed {
+                candidate_count,
+                selected,
+                skipped_corrupt_count,
+                compute_ms,
+            }) => {
+                let top_score = selected.first().map(|s| s.breakdown.total).unwrap_or(0.0);
+                let top_id = selected
+                    .first()
+                    .map(|s| s.record.anti_pattern_id.clone())
+                    .unwrap_or_default();
+                log_llm_event(
+                    "agent.anti_pattern.retrieved",
+                    serde_json::json!({
+                        "session_id": self.session_store.session_id(),
+                        "candidate_count": candidate_count,
+                        "selected_count": selected.len(),
+                        "top_score": top_score,
+                        "top_anti_pattern_id": top_id,
+                        "threshold": anti_pattern::ANTI_PATTERN_RETRIEVAL_SCORE_THRESHOLD,
+                        "compute_ms": compute_ms,
+                        "skipped_corrupt_count": skipped_corrupt_count,
+                    }),
+                );
+                anti_pattern::format_for_prompt(&selected).map(ConversationMessage::system)
+            }
+            Ok(RetrievalOutcome::Skipped {
+                reason,
+                candidate_count,
+                skipped_corrupt_count,
+                compute_ms,
+            }) => {
+                log_llm_event(
+                    "agent.anti_pattern.skipped",
+                    serde_json::json!({
+                        "session_id": self.session_store.session_id(),
+                        "reason": reason.as_log_str(),
+                        "candidate_count": candidate_count,
+                        "skipped_corrupt_count": skipped_corrupt_count,
+                        "compute_ms": compute_ms,
+                    }),
+                );
+                None
+            }
+            Err(error) => {
+                log_llm_event(
+                    "agent.anti_pattern.failed",
+                    serde_json::json!({
+                        "session_id": self.session_store.session_id(),
+                        "error": error,
+                    }),
+                );
+                None
+            }
+        }
+    }
+
     /// Issue #452: post-actor-loop hook for the Reminder Sidecar. Called from
     /// `run_actor_loop` (iteration-internal before compaction, and post-loop
     /// for NoRepoProgress / auto_test / NoVerifierAvailable). Per-turn cap
@@ -1762,6 +2029,9 @@ impl Agent {
         self.session.case_record_extracted_this_turn = false;
         // Issue #463: reset the per-turn case_retrieval cap.
         self.session.case_retrieval_invoked_this_turn = false;
+        // Issue #464: reset the per-turn anti-pattern caps.
+        self.session.anti_pattern_extracted_this_turn = false;
+        self.session.anti_pattern_retrieval_invoked_this_turn = false;
 
         let mut tool_calls_made_this_turn = 0usize;
         let mut repo_edit_calls_made_this_turn = 0usize;
@@ -3486,6 +3756,10 @@ impl Agent {
         // turn_completed event). Pure success-condition + scrub + persist; no
         // sidecar / LLM calls. Failures are logged and never propagate.
         self.maybe_extract_case_record(&stats, &verify_commands_collected);
+        // Issue #464: AntiPatternRecord extraction (post-loop, after CaseRecord).
+        // Triggered by the latest eligible failure feedback. Pure upsert; no
+        // sidecar / LLM calls.
+        self.maybe_extract_anti_pattern();
         log_llm_event(
             "agent.milestone.turn_completed",
             serde_json::json!({
@@ -4366,6 +4640,12 @@ impl Agent {
             // Working Memory section. Pure-function retrieval; no Ollama call.
             if let Some(case_message) = self.try_inject_case_retrieval_message() {
                 messages.push(case_message);
+            }
+            // Issue #464: inject `Avoid Patterns (from prior failures):` after
+            // the case retrieval section. Pure-function retrieval; no Ollama
+            // call.
+            if let Some(anti_message) = self.try_inject_anti_pattern_message() {
+                messages.push(anti_message);
             }
             if let Some(repo_context_message) = self.repo_context_message() {
                 messages.push(repo_context_message);
