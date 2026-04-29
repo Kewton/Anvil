@@ -772,17 +772,15 @@ fn score_record(
         cand_task.iter().map(String::as_str),
     );
 
-    let kind = match current.current_feedback_kind {
-        Some(ref ck) if ck == &candidate.feedback_kind => 1.0,
-        Some(ref ck) => {
-            // Same family (both reminder-eligible) → 0.5
-            if ck.is_eligible_for_reminder() == candidate.feedback_kind.is_eligible_for_reminder() {
-                0.5
-            } else {
-                0.0
-            }
+    let kind = match &current.current_feedback_kind {
+        Some(ck) if ck == &candidate.feedback_kind => 1.0,
+        Some(ck)
+            if ck.is_eligible_for_reminder()
+                == candidate.feedback_kind.is_eligible_for_reminder() =>
+        {
+            0.5
         }
-        None => 0.0,
+        Some(_) | None => 0.0,
     };
 
     let cur_files: HashSet<String> = current
