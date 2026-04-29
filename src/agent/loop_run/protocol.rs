@@ -28,6 +28,8 @@ impl ExecutionProtocol {
         Self { kind }
     }
 
+    #[allow(dead_code)] // Issue #466: 一時的に call site が VerifierSkill 経由になり
+    // 直接呼ばれなくなったが API は残置 (将来 Tester / CaseRecord の skill 化で再利用予定)
     pub(super) fn kind(self) -> ProtocolKind {
         self.kind
     }

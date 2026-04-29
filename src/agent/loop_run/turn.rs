@@ -1,6 +1,6 @@
 use super::auto_test::{
-    AutoTestKind, AutoTestPlan, AutoTestResult, AutoTestRunner, classify_auto_test,
-    count_compile_errors, count_test_failures,
+    AutoTestKind, AutoTestPlan, AutoTestResult, classify_auto_test, count_compile_errors,
+    count_test_failures,
 };
 use super::interrupt::{InterruptEnv, InterruptFlag, InterruptMonitor};
 use super::protocol::ExecutionProtocol;
@@ -131,7 +131,7 @@ fn answer_only_script_command_allowed(command: &str) -> bool {
 // secret masking, and path normalization. Per design 5.4, no helper
 // performs those steps itself.
 
-fn build_feedback_for_auto_test(
+pub(super) fn build_feedback_for_auto_test(
     plan: &AutoTestPlan,
     result: &AutoTestResult,
     workspace_root: &Path,
@@ -183,6 +183,31 @@ fn build_feedback_for_auto_test(
 /// | (Build, false)  | Some(false)  | None         | count_compile_errors| None               |
 /// | (Test, true)    | None         | Some(true)   | None                | Some(0)            |
 /// | (Test, false)   | None         | Some(false)  | count_compile_errors| count_test_failures|
+/// Issue #462: derive the `language_stack` Vec for `RepoFingerprint`.
+/// Reuses `auto_test::has_*` helpers (also in the agent layer) so DR3-002 —
+/// agent → session is one-way — is preserved: the session-layer
+/// `case_record::extract` accepts the slice as input rather than calling back.
+fn derive_language_stack(work_root: &std::path::Path) -> Vec<String> {
+    let mut stack: Vec<String> = Vec::new();
+    if super::auto_test::has_cargo_manifest(work_root) {
+        stack.push("rust".into());
+    }
+    if super::auto_test::package_json_has_test_script(work_root) {
+        stack.push("node".into());
+    }
+    if super::auto_test::has_python_surface(work_root, &[]) {
+        stack.push("python".into());
+    }
+    stack.iter_mut().for_each(|s| *s = s.to_ascii_lowercase());
+    stack.sort();
+    stack.dedup();
+    stack
+}
+
+// Issue #466: build_anvil_test_summary は VerifierSkill 経路でも利用するため残置。
+// VerifierSkill 側 (verifier_skill.rs::build_anvil_test_summary_for_skill) は同等の
+// ロジックを内部 helper として保持する。将来 Issue で SSOT を一本化する。
+#[cfg_attr(not(test), allow(dead_code))]
 fn build_anvil_test_summary(
     plan: &AutoTestPlan,
     result: &AutoTestResult,
@@ -266,7 +291,7 @@ pub(super) fn select_success_verifier(
     }
 }
 
-fn build_feedback_for_no_verifier(workspace_root: &Path) -> FeedbackFrame {
+pub(super) fn build_feedback_for_no_verifier(workspace_root: &Path) -> FeedbackFrame {
     let draft = FeedbackFrameDraft {
         kind: FeedbackKind::NoVerifierAvailable,
         primary_error: Some("no auto_test verifier detected for this workspace".to_string()),
@@ -1261,7 +1286,569 @@ impl Agent {
         self.run_turn(input, stream_output, &mut monitor)
     }
 
-    /// Issue #452: Reminder Sidecar hook. Called from two sites in
+    /// Issue #462: post-loop CaseRecord extraction. Pure success-condition,
+    /// scrub, and persist; never calls Ollama / sidecars. Per-turn cap is
+    /// `case_record_extracted_this_turn` on `SessionSnapshot` (cleared at
+    /// `run_turn` head). Failures are logged via `agent.case_record.failed`
+    /// and never propagate.
+    ///
+    /// DR3-002: gathers `verify_commands` from the agent layer (turn.rs)
+    /// and passes them into `case_record::extract` via a borrowed slice.
+    /// `language_stack` is derived here using `auto_test::has_*` helpers
+    /// (also agent-layer) for the same reason.
+    pub(super) fn maybe_extract_case_record(
+        &mut self,
+        stats: &crate::agent::loop_run::summary::LoopStats,
+        verify_commands: &[String],
+    ) {
+        use crate::session::case_record;
+
+        // Plan-mode gate: never extract in Plan mode.
+        if self.session.mode_state.mode == ExecutionMode::Plan {
+            return;
+        }
+        // Per-turn cap.
+        if self.session.case_record_extracted_this_turn {
+            return;
+        }
+        // Disable env.
+        if case_record::case_record_disabled(|k| std::env::var(k)) {
+            log_llm_event(
+                "agent.case_record.disabled",
+                serde_json::json!({
+                    "session_id": self.session_store.session_id(),
+                }),
+            );
+            self.session.case_record_extracted_this_turn = true;
+            return;
+        }
+
+        // Success condition (Issue #462 spec).
+        let Some(score) = self.session.last_anvil_score.as_ref() else {
+            // No AnvilScore computed for this turn (e.g., TransportError) — skip silently.
+            self.session.case_record_extracted_this_turn = true;
+            return;
+        };
+        let auto_test_active = score.build_passed.is_some() || score.tests_passed.is_some();
+        let success = if auto_test_active {
+            score.build_passed == Some(true)
+                && score.tests_passed == Some(true)
+                && score.user_visible_artifact
+                && score.consecutive_no_progress_turns == 0
+        } else {
+            self.session.repo_edit_succeeded_this_turn
+                && self.session.unsafe_blocks_this_turn == 0
+                && score.consecutive_no_progress_turns == 0
+        };
+        if !success {
+            self.session.case_record_extracted_this_turn = true;
+            return;
+        }
+
+        // language_stack derivation (agent layer; reuses `auto_test::has_*`).
+        let language_stack = derive_language_stack(&self.work_root);
+
+        // Build inputs.
+        let active_task = self.session.working_memory.active_task.clone();
+        let active_precautions: Vec<crate::session::precaution::Precaution> =
+            self.session.working_memory.active_precautions.to_vec();
+        // initial_feedback: take the kind of the latest recorded feedback as a
+        // single-item list (Issue Out of Scope: rich N-frame history is for
+        // CBR follow-up Issue).
+        let initial_feedback: Vec<crate::session::feedback::FeedbackKind> = self
+            .session
+            .last_feedback
+            .as_ref()
+            .map(|f| vec![f.kind.clone()])
+            .unwrap_or_default();
+        let workspace_key = self.session.workspace_key.clone();
+
+        let inputs = case_record::CaseRecordInputs {
+            workspace_key: &workspace_key,
+            work_root: &self.work_root,
+            active_task: active_task.as_deref(),
+            language_stack: &language_stack,
+            initial_feedback: &initial_feedback,
+            active_precautions: &active_precautions,
+            changed_files: &stats.changed_files,
+            verify_commands,
+            anvil_score: score,
+            repo_edit_succeeded_this_turn: self.session.repo_edit_succeeded_this_turn,
+            unsafe_blocks_this_turn: self.session.unsafe_blocks_this_turn,
+            auto_test_active,
+        };
+
+        let started = std::time::Instant::now();
+        let Some(record) = case_record::extract(&inputs) else {
+            log_llm_event(
+                "agent.case_record.skipped",
+                serde_json::json!({
+                    "session_id": self.session_store.session_id(),
+                    "reason": "extract_returned_none",
+                }),
+            );
+            self.session.case_record_extracted_this_turn = true;
+            return;
+        };
+
+        // Dry-run gate (DR3-002 / Issue): extract still runs so log payloads
+        // can confirm the would-be case_id.
+        if case_record::case_record_dry_run(|k| std::env::var(k)) {
+            log_llm_event(
+                "agent.case_record.skipped",
+                serde_json::json!({
+                    "session_id": self.session_store.session_id(),
+                    "reason": "dry_run",
+                    "case_id": record.case_id,
+                }),
+            );
+            self.session.case_record_extracted_this_turn = true;
+            return;
+        }
+
+        let state_root = self.session_store.state_root().to_path_buf();
+        match case_record::persist(&state_root, &record) {
+            Ok(bytes) => {
+                let compute_ms = started.elapsed().as_secs_f64() * 1000.0;
+                log_llm_event(
+                    "agent.case_record.extracted",
+                    serde_json::json!({
+                        "session_id": self.session_store.session_id(),
+                        "case_id": record.case_id,
+                        "bytes": bytes,
+                        "compute_ms": compute_ms,
+                    }),
+                );
+            }
+            Err(case_record::PersistError::TooLarge { bytes }) => {
+                log_llm_event(
+                    "agent.case_record.skipped",
+                    serde_json::json!({
+                        "session_id": self.session_store.session_id(),
+                        "reason": "too_large",
+                        "bytes": bytes,
+                    }),
+                );
+            }
+            Err(e) => {
+                log_llm_event(
+                    "agent.case_record.failed",
+                    serde_json::json!({
+                        "session_id": self.session_store.session_id(),
+                        "error": e.to_string(),
+                    }),
+                );
+            }
+        }
+        self.session.case_record_extracted_this_turn = true;
+    }
+
+    /// Issue #463: build and (when applicable) inject a `Relevant Local Cases:`
+    /// system message into the next prompt. Called from the per-iteration
+    /// message-build path immediately after `working_memory_message`. Pure-
+    /// function retrieval; never calls Ollama / sidecars. Failures are logged
+    /// via `agent.case_retrieval.failed` and never propagate.
+    pub(super) fn try_inject_case_retrieval_message(&mut self) -> Option<ConversationMessage> {
+        use crate::session::case_record::{
+            PrecautionSnapshot, build_task_signature, capture_repo_fingerprint,
+        };
+        use crate::session::case_retrieval::{self, CaseRetrievalInputs, RetrievalOutcome};
+
+        // 1. Plan mode → skipped(plan_mode), do not consume cap.
+        if self.session.mode_state.mode == ExecutionMode::Plan {
+            log_llm_event(
+                "agent.case_retrieval.skipped",
+                serde_json::json!({
+                    "session_id": self.session_store.session_id(),
+                    "reason": "plan_mode",
+                }),
+            );
+            return None;
+        }
+        // 2. per-turn cap consumed → skipped(per_turn_cap_consumed).
+        if self.session.case_retrieval_invoked_this_turn {
+            log_llm_event(
+                "agent.case_retrieval.skipped",
+                serde_json::json!({
+                    "session_id": self.session_store.session_id(),
+                    "reason": "per_turn_cap_consumed",
+                }),
+            );
+            return None;
+        }
+        // 3. Env disable → cap=true, disabled event.
+        if case_retrieval::case_retrieval_disabled(|k| std::env::var(k)) {
+            self.session.case_retrieval_invoked_this_turn = true;
+            log_llm_event(
+                "agent.case_retrieval.disabled",
+                serde_json::json!({
+                    "session_id": self.session_store.session_id(),
+                }),
+            );
+            return None;
+        }
+
+        // 4. Build inputs from the current SessionSnapshot view.
+        let language_stack = derive_language_stack(&self.work_root);
+        let workspace_key = self.session.workspace_key.clone();
+        let active_task = self.session.working_memory.active_task.clone();
+        let task_signature = build_task_signature(active_task.as_deref(), &self.work_root);
+        let repo_fp = capture_repo_fingerprint(&workspace_key, &self.work_root, &language_stack);
+        let touched_files = self.session.working_memory.touched_files.clone();
+        let feedback_kind = self.session.last_feedback.as_ref().map(|f| f.kind.clone());
+        let prec_snapshots: Vec<PrecautionSnapshot> = self
+            .session
+            .working_memory
+            .active_precautions
+            .iter()
+            .filter(|p| p.status == PrecautionStatus::Active)
+            .map(PrecautionSnapshot::from)
+            .collect();
+
+        let dry_run = case_retrieval::case_retrieval_dry_run(|k| std::env::var(k));
+
+        let inputs = CaseRetrievalInputs {
+            current_task_signature: &task_signature,
+            current_language_stack: &language_stack,
+            current_repo_fingerprint: &repo_fp,
+            current_touched_files: &touched_files,
+            current_feedback_kind: feedback_kind,
+            current_active_precautions: &prec_snapshots,
+        };
+
+        // 5. Consume the cap before retrieve so the failure path also accounts.
+        self.session.case_retrieval_invoked_this_turn = true;
+
+        let state_root = self.session_store.state_root().to_path_buf();
+        match case_retrieval::retrieve_relevant_cases(&state_root, &inputs, dry_run) {
+            Ok(RetrievalOutcome::Completed {
+                candidate_count,
+                selected,
+                skipped_corrupt_count,
+                compute_ms,
+            }) => {
+                let top_score = selected.first().map(|s| s.breakdown.total).unwrap_or(0.0);
+                let top_case_id = selected
+                    .first()
+                    .map(|s| s.record.case_id.clone())
+                    .unwrap_or_default();
+                let selected_reasons: Vec<&case_retrieval::CaseScoreBreakdown> =
+                    selected.iter().map(|s| &s.breakdown).collect();
+                log_llm_event(
+                    "agent.case_retrieval.completed",
+                    serde_json::json!({
+                        "session_id": self.session_store.session_id(),
+                        "candidate_count": candidate_count,
+                        "selected_count": selected.len(),
+                        "top_score": top_score,
+                        "top_case_id": top_case_id,
+                        "threshold": 0.40_f32,
+                        "compute_ms": compute_ms,
+                        "skipped_corrupt_count": skipped_corrupt_count,
+                        "selected_reasons": selected_reasons,
+                    }),
+                );
+                case_retrieval::format_for_prompt(&selected).map(ConversationMessage::system)
+            }
+            Ok(RetrievalOutcome::Skipped {
+                reason,
+                candidate_count,
+                skipped_corrupt_count,
+                compute_ms,
+            }) => {
+                log_llm_event(
+                    "agent.case_retrieval.skipped",
+                    serde_json::json!({
+                        "session_id": self.session_store.session_id(),
+                        "reason": reason.as_log_str(),
+                        "candidate_count": candidate_count,
+                        "skipped_corrupt_count": skipped_corrupt_count,
+                        "compute_ms": compute_ms,
+                    }),
+                );
+                None
+            }
+            Err(error) => {
+                log_llm_event(
+                    "agent.case_retrieval.failed",
+                    serde_json::json!({
+                        "session_id": self.session_store.session_id(),
+                        "error": error,
+                    }),
+                );
+                None
+            }
+        }
+    }
+
+    /// Issue #464: post-loop AntiPattern extraction. Mirrors
+    /// `maybe_extract_case_record` but triggers on **failure** turns instead
+    /// of success. Upserts a record keyed by (workspace_key, task_signature,
+    /// feedback_kind); the second + N-th occurrence increments `repeat_count`.
+    /// Pure upsert / scrub / persist; no sidecar / LLM calls.
+    pub(super) fn maybe_extract_anti_pattern(&mut self) {
+        use crate::session::anti_pattern;
+
+        // Plan-mode gate: never extract in Plan mode.
+        if self.session.mode_state.mode == ExecutionMode::Plan {
+            return;
+        }
+        // Per-turn cap.
+        if self.session.anti_pattern_extracted_this_turn {
+            return;
+        }
+        // Disable env.
+        if anti_pattern::anti_pattern_disabled(|k| std::env::var(k)) {
+            log_llm_event(
+                "agent.anti_pattern.disabled",
+                serde_json::json!({
+                    "session_id": self.session_store.session_id(),
+                }),
+            );
+            self.session.anti_pattern_extracted_this_turn = true;
+            return;
+        }
+
+        // Eligible failure FeedbackFrame is the trigger.
+        let Some(frame) = self.session.last_feedback.as_ref() else {
+            self.session.anti_pattern_extracted_this_turn = true;
+            return;
+        };
+        if !anti_pattern::is_repeat_eligible_kind(&frame.kind) {
+            self.session.anti_pattern_extracted_this_turn = true;
+            return;
+        }
+
+        // Build the failed_action_summary from primary_error → command → kind.
+        let summary_owned: String = frame
+            .primary_error
+            .clone()
+            .or_else(|| frame.command().map(|s| s.to_string()))
+            .unwrap_or_else(|| format!("{:?}", frame.kind));
+
+        let language_stack = derive_language_stack(&self.work_root);
+        let active_task = self.session.working_memory.active_task.clone();
+        let workspace_key = self.session.workspace_key.clone();
+        let touched_files = self.session.working_memory.touched_files.clone();
+        let kind = frame.kind.clone();
+
+        if anti_pattern::anti_pattern_dry_run(|k| std::env::var(k)) {
+            log_llm_event(
+                "agent.anti_pattern.skipped",
+                serde_json::json!({
+                    "session_id": self.session_store.session_id(),
+                    "reason": "dry_run",
+                    "feedback_kind": serde_json::to_value(&kind).unwrap_or_default(),
+                }),
+            );
+            self.session.anti_pattern_extracted_this_turn = true;
+            return;
+        }
+
+        let inputs = anti_pattern::AntiPatternRecordInputs {
+            workspace_key: &workspace_key,
+            work_root: &self.work_root,
+            active_task: active_task.as_deref(),
+            language_stack: &language_stack,
+            touched_files: &touched_files,
+            feedback_kind: kind.clone(),
+            failed_action_summary: &summary_owned,
+        };
+
+        let started = std::time::Instant::now();
+        let state_root = self.session_store.state_root().to_path_buf();
+        match anti_pattern::extract_or_increment(&state_root, &inputs) {
+            Ok(anti_pattern::ExtractOutcome::Created(record)) => {
+                let compute_ms = started.elapsed().as_secs_f64() * 1000.0;
+                log_llm_event(
+                    "agent.anti_pattern.extracted",
+                    serde_json::json!({
+                        "session_id": self.session_store.session_id(),
+                        "anti_pattern_id": record.anti_pattern_id,
+                        "outcome": "created",
+                        "repeat_count": record.repeat_count,
+                        "feedback_kind": serde_json::to_value(&record.feedback_kind).unwrap_or_default(),
+                        "compute_ms": compute_ms,
+                    }),
+                );
+            }
+            Ok(anti_pattern::ExtractOutcome::Incremented(record)) => {
+                let compute_ms = started.elapsed().as_secs_f64() * 1000.0;
+                log_llm_event(
+                    "agent.anti_pattern.extracted",
+                    serde_json::json!({
+                        "session_id": self.session_store.session_id(),
+                        "anti_pattern_id": record.anti_pattern_id,
+                        "outcome": "incremented",
+                        "repeat_count": record.repeat_count,
+                        "feedback_kind": serde_json::to_value(&record.feedback_kind).unwrap_or_default(),
+                        "compute_ms": compute_ms,
+                    }),
+                );
+            }
+            Ok(anti_pattern::ExtractOutcome::SkippedIneligibleKind) => {
+                log_llm_event(
+                    "agent.anti_pattern.skipped",
+                    serde_json::json!({
+                        "session_id": self.session_store.session_id(),
+                        "reason": "ineligible_kind",
+                    }),
+                );
+            }
+            Ok(anti_pattern::ExtractOutcome::SkippedNoActiveTask) => {
+                log_llm_event(
+                    "agent.anti_pattern.skipped",
+                    serde_json::json!({
+                        "session_id": self.session_store.session_id(),
+                        "reason": "no_active_task",
+                    }),
+                );
+            }
+            Err(anti_pattern::PersistError::TooLarge { bytes }) => {
+                log_llm_event(
+                    "agent.anti_pattern.skipped",
+                    serde_json::json!({
+                        "session_id": self.session_store.session_id(),
+                        "reason": "too_large",
+                        "bytes": bytes,
+                    }),
+                );
+            }
+            Err(e) => {
+                log_llm_event(
+                    "agent.anti_pattern.failed",
+                    serde_json::json!({
+                        "session_id": self.session_store.session_id(),
+                        "error": e.to_string(),
+                    }),
+                );
+            }
+        }
+        self.session.anti_pattern_extracted_this_turn = true;
+    }
+
+    /// Issue #464: build and (when applicable) inject an `Avoid Patterns:`
+    /// system message into the next prompt. Mirrors
+    /// `try_inject_case_retrieval_message` but pulls from
+    /// `state_root/anti_patterns/`.
+    pub(super) fn try_inject_anti_pattern_message(&mut self) -> Option<ConversationMessage> {
+        use crate::session::anti_pattern::{self, AntiPatternRetrievalInputs, RetrievalOutcome};
+        use crate::session::case_record::{build_task_signature, capture_repo_fingerprint};
+
+        // 1. Plan mode → skipped, do not consume cap.
+        if self.session.mode_state.mode == ExecutionMode::Plan {
+            log_llm_event(
+                "agent.anti_pattern.skipped",
+                serde_json::json!({
+                    "session_id": self.session_store.session_id(),
+                    "reason": "plan_mode",
+                }),
+            );
+            return None;
+        }
+        // 2. per-turn cap consumed.
+        if self.session.anti_pattern_retrieval_invoked_this_turn {
+            log_llm_event(
+                "agent.anti_pattern.skipped",
+                serde_json::json!({
+                    "session_id": self.session_store.session_id(),
+                    "reason": "per_turn_cap_consumed",
+                }),
+            );
+            return None;
+        }
+        // 3. Env disable.
+        if anti_pattern::anti_pattern_disabled(|k| std::env::var(k)) {
+            self.session.anti_pattern_retrieval_invoked_this_turn = true;
+            log_llm_event(
+                "agent.anti_pattern.disabled",
+                serde_json::json!({
+                    "session_id": self.session_store.session_id(),
+                }),
+            );
+            return None;
+        }
+
+        // 4. Build inputs.
+        let language_stack = derive_language_stack(&self.work_root);
+        let workspace_key = self.session.workspace_key.clone();
+        let active_task = self.session.working_memory.active_task.clone();
+        let task_signature = build_task_signature(active_task.as_deref(), &self.work_root);
+        let repo_fp = capture_repo_fingerprint(&workspace_key, &self.work_root, &language_stack);
+        let touched_files = self.session.working_memory.touched_files.clone();
+        let feedback_kind = self.session.last_feedback.as_ref().map(|f| f.kind.clone());
+
+        let dry_run = anti_pattern::anti_pattern_dry_run(|k| std::env::var(k));
+        let inputs = AntiPatternRetrievalInputs {
+            current_task_signature: &task_signature,
+            current_language_stack: &language_stack,
+            current_repo_fingerprint: &repo_fp,
+            current_touched_files: &touched_files,
+            current_feedback_kind: feedback_kind,
+        };
+
+        self.session.anti_pattern_retrieval_invoked_this_turn = true;
+
+        let state_root = self.session_store.state_root().to_path_buf();
+        match anti_pattern::retrieve_relevant_anti_patterns(&state_root, &inputs, dry_run) {
+            Ok(RetrievalOutcome::Completed {
+                candidate_count,
+                selected,
+                skipped_corrupt_count,
+                compute_ms,
+            }) => {
+                let top_score = selected.first().map(|s| s.breakdown.total).unwrap_or(0.0);
+                let top_id = selected
+                    .first()
+                    .map(|s| s.record.anti_pattern_id.clone())
+                    .unwrap_or_default();
+                log_llm_event(
+                    "agent.anti_pattern.retrieved",
+                    serde_json::json!({
+                        "session_id": self.session_store.session_id(),
+                        "candidate_count": candidate_count,
+                        "selected_count": selected.len(),
+                        "top_score": top_score,
+                        "top_anti_pattern_id": top_id,
+                        "threshold": anti_pattern::ANTI_PATTERN_RETRIEVAL_SCORE_THRESHOLD,
+                        "compute_ms": compute_ms,
+                        "skipped_corrupt_count": skipped_corrupt_count,
+                    }),
+                );
+                anti_pattern::format_for_prompt(&selected).map(ConversationMessage::system)
+            }
+            Ok(RetrievalOutcome::Skipped {
+                reason,
+                candidate_count,
+                skipped_corrupt_count,
+                compute_ms,
+            }) => {
+                log_llm_event(
+                    "agent.anti_pattern.skipped",
+                    serde_json::json!({
+                        "session_id": self.session_store.session_id(),
+                        "reason": reason.as_log_str(),
+                        "candidate_count": candidate_count,
+                        "skipped_corrupt_count": skipped_corrupt_count,
+                        "compute_ms": compute_ms,
+                    }),
+                );
+                None
+            }
+            Err(error) => {
+                log_llm_event(
+                    "agent.anti_pattern.failed",
+                    serde_json::json!({
+                        "session_id": self.session_store.session_id(),
+                        "error": error,
+                    }),
+                );
+                None
+            }
+        }
+    }
+
+    /// Issue #452: post-actor-loop hook for the Reminder Sidecar. Called from
     /// `run_actor_loop` (iteration-internal before compaction, and post-loop
     /// for NoRepoProgress / auto_test / NoVerifierAvailable). Per-turn cap
     /// (`reminder_called_this_turn`) is consumed only by Completed / Failed
@@ -1442,6 +2029,13 @@ impl Agent {
         self.session.repo_edit_succeeded_this_turn = false;
         self.session.touched_files_at_turn_start =
             self.session.working_memory.touched_files.clone();
+        // Issue #462: reset the per-turn CaseRecord extraction cap.
+        self.session.case_record_extracted_this_turn = false;
+        // Issue #463: reset the per-turn case_retrieval cap.
+        self.session.case_retrieval_invoked_this_turn = false;
+        // Issue #464: reset the per-turn anti-pattern caps.
+        self.session.anti_pattern_extracted_this_turn = false;
+        self.session.anti_pattern_retrieval_invoked_this_turn = false;
 
         let mut tool_calls_made_this_turn = 0usize;
         let mut repo_edit_calls_made_this_turn = 0usize;
@@ -2997,142 +3591,184 @@ impl Agent {
             exit_reason = ExitReason::Done;
             error_text.clear();
         }
-        // Issue #457: capture AnvilTestSummary in the AutoTest/Ok arm below
-        // so the compute_anvil_score block (further down) can wire it into
-        // the third argument. Outside-arm declaration is intentional: the
-        // alternative (turning the entire match into an expression) would
-        // force every arm to return Option<AnvilTestSummary> on top of its
-        // existing side effects (record_feedback_if_unset / exit_reason /
-        // error_text), which the design policy concluded is not worth the
-        // KISS trade.
-        let mut auto_test_summary: Option<crate::session::anvil_score::AnvilTestSummary> = None;
-        if exit_reason.is_success() {
+        // Issue #466: post-loop verifier dispatch を VerifierSkill 経由に置換.
+        // facade applies outcome 方針 (DR-466-002 / Stage 5):
+        //   1. exit_reason.is_success() && success_issue chk → should_dispatch_success_verifier
+        //   2. VerifierSkill::execute が AutoTestRunner::detect/run + compute_anvil_score を完結
+        //   3. facade が VerifierOutcome を解釈して legacy events emit / verify_commands push /
+        //      record_feedback_if_unset / try_invoke_tester / exit_reason 設定 / last_anvil_score
+        //      永続化を Reminder より前に行う (Stage 7 S7-001..003 / DR2-001..004 / DR3-001..002).
+        let mut verify_commands_collected: Vec<String> = Vec::new();
+        let should_dispatch_success_verifier = if exit_reason.is_success() {
             let protocol = ExecutionProtocol::from_work_mode(self.session.mode_state.work_mode);
             if let Some(issue) = protocol.success_issue(&stats) {
                 exit_reason = ExitReason::MissingRepoEdits;
                 error_text = issue;
+                false
             } else {
-                // CB-002 (Issue #459): the Tester is gated **independently** of
-                // `should_run_auto_test_for_success()`. We probe both verifiers
-                // up front and let `select_success_verifier` pick the right
-                // dispatch. `TesterCandidate::detect` already returns `None`
-                // when an explicit AutoTestRunner verifier is present, so a
-                // build-only AutoTest plan does not block the Tester branch.
-                let auto_test_plan = AutoTestRunner::detect(&self.work_root, &stats.changed_files);
-                let tester_candidate =
-                    tester::TesterCandidate::detect(&self.work_root, &stats.changed_files);
-                let decision = select_success_verifier(
-                    self.should_run_auto_test_for_success(),
-                    auto_test_plan.is_some(),
-                    tester_candidate.is_some(),
-                );
-                match (decision, auto_test_plan) {
-                    (SuccessVerifier::AutoTest, Some(plan)) => {
-                        match AutoTestRunner::run(&self.work_root, &plan) {
-                            Ok(result) => {
-                                log_llm_event(
-                                    "agent.autotest.completed",
-                                    serde_json::json!({
-                                        "session_id": self.session_store.session_id(),
-                                        "command": result.command,
-                                        "passed": result.passed,
-                                        "reason": plan.reason,
-                                    }),
-                                );
-                                // Issue #450: record FeedbackFrame for the
-                                // auto_test outcome (BuildPass / TestPass on
-                                // success, CompileError / TestFailure / etc.
-                                // on failure).
-                                // Issue #455 / D4: switch to first-eligible-failure-wins
-                                // so a deterministic content fallback / NoToolCall
-                                // frame from earlier in this turn is preserved.
-                                let frame = build_feedback_for_auto_test(
-                                    &plan,
-                                    &result,
-                                    &self.work_root,
-                                    &stats.changed_files,
-                                );
-                                self.session.record_feedback_if_unset(frame);
-                                // Issue #457: convert AutoTestResult into
-                                // AnvilTestSummary so compute_anvil_score
-                                // (below) can populate
-                                // build_passed/tests_passed/*_count fields.
-                                auto_test_summary = Some(build_anvil_test_summary(&plan, &result));
-                                if !result.passed {
-                                    exit_reason = ExitReason::MissingRepoEdits;
-                                    error_text = format!(
-                                        "auto test failed for protocol {:?}: {}\n{}",
-                                        protocol.kind(),
-                                        result.command,
-                                        result.output
-                                    );
-                                }
-                            }
-                            Err(err) => {
-                                exit_reason = ExitReason::TransportError;
-                                error_text = err;
-                            }
-                        }
-                    }
-                    (SuccessVerifier::Tester, _) => {
-                        // CB-002: Tester runs even when
-                        // `should_run_auto_test_for_success()` was false. If
-                        // Tester aborts / declines, fall through to
-                        // `NoVerifierAvailable` only when the protocol asked
-                        // for a verifier (mirrors the historical fallback).
-                        let tester_recorded = self.try_invoke_tester(&stats.changed_files);
-                        if !tester_recorded && self.should_run_auto_test_for_success() {
-                            let frame = build_feedback_for_no_verifier(&self.work_root);
-                            self.session.record_feedback_if_unset(frame);
-                        }
-                    }
-                    (SuccessVerifier::NoVerifier, _) => {
-                        // Issue #450: no auto_test plan detected and no Tester
-                        // candidate -> NoVerifierAvailable.
-                        let frame = build_feedback_for_no_verifier(&self.work_root);
-                        self.session.record_feedback_if_unset(frame);
-                    }
-                    (SuccessVerifier::Skip, _) | (SuccessVerifier::AutoTest, None) => {
-                        // Skip: no verifier demanded and no Tester candidate;
-                        // do nothing (pre-#450 behaviour for non-Python /
-                        // non-test-requesting turns). The (AutoTest, None)
-                        // arm is theoretically unreachable per
-                        // `select_success_verifier` invariants but we cover
-                        // it defensively to keep production code free of
-                        // `expect()` / `unwrap()` (Issue #459 quality gate).
-                    }
-                }
+                true
             }
-        }
-        // Issue #456: compute the AnvilScore for this turn after all
-        // record_feedback* / verify_repo_progress / auto_test signals have
-        // settled, but BEFORE the post-loop Reminder hook so the sidecar can
-        // see `CurrentTurn(&score)`.
-        {
-            let inputs = crate::session::anvil_score::AnvilScoreInputs {
+        } else {
+            false
+        };
+        let tester_candidate_some = if should_dispatch_success_verifier {
+            tester::TesterCandidate::detect(&self.work_root, &stats.changed_files).is_some()
+        } else {
+            false
+        };
+        let protocol_demands_verifier = self.should_run_auto_test_for_success();
+        let session_id = self.session_store.session_id().to_string();
+        let model = self.models.main.clone();
+        // VerifierInputs / SkillInvocationRequest を組み立て invoke
+        let v_inputs = crate::agent::loop_run::verifier_skill::VerifierInputs {
+            score_inputs: crate::session::anvil_score::AnvilScoreInputs {
                 unsafe_blocks_this_turn: self.session.unsafe_blocks_this_turn,
                 repo_edit_succeeded_this_turn: self.session.repo_edit_succeeded_this_turn,
                 consecutive_no_progress_turns: self.session.consecutive_no_progress_turns,
                 prev: self.session.last_anvil_score.as_ref(),
+            },
+            repo_verification: Some(&final_verif),
+            should_dispatch_success_verifier,
+            protocol_demands_verifier,
+            changed_files: &stats.changed_files,
+            tester_candidate_some,
+            workspace_root: &self.work_root,
+        };
+        let started = std::time::Instant::now();
+        let snapshot_for_state = self.session.clone();
+        let runtime_state = crate::agent::skills::RuntimeState {
+            plan_mode: self.session.mode_state.mode == ExecutionMode::Plan,
+            interrupted: false,
+            turn_index: 0,
+            session: &snapshot_for_state,
+            last_anvil_score: self.session.last_anvil_score.as_ref(),
+            reminder_sidecar_available: false,
+            reminder_kind_eligible: false,
+            reminder_called_this_turn: self.reminder_called_this_turn,
+        };
+        let mut events_local: Vec<(&'static str, serde_json::Value)> = Vec::new();
+        let invocation = {
+            let mut wm = WorkingMemory::default();
+            let ctx = crate::agent::skills::SkillExecutionContext {
+                working_memory: &mut wm,
+                workspace_root: &self.work_root,
             };
-            let started = std::time::Instant::now();
-            // Issue #457: third argument now carries the AnvilTestSummary
-            // converted from AutoTestResult by `build_anvil_test_summary`
-            // when the AutoTest verifier branch ran successfully (Ok arm).
-            // Tester / NoVerifier / Skip / TransportError branches keep
-            // it None — those paths never observe an AutoTestResult.
-            let score = crate::session::anvil_score::compute_anvil_score(
-                &inputs,
-                Some(&final_verif),
-                auto_test_summary.as_ref(),
-            );
-            let compute_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let request = crate::agent::skills::SkillInvocationRequest {
+                skill_name: "verifier",
+                trigger: crate::agent::skills::SkillTrigger::PostLoop,
+                state: &runtime_state,
+                input: crate::agent::skills::SkillInput::Verifier(v_inputs),
+                ctx,
+                get_env: &|k: &str| std::env::var_os(k),
+                emit_event: &mut |k, p| events_local.push((k, p)),
+                session_id: &session_id,
+                model: Some(&model),
+            };
+            self.skill_registry.invoke(request)
+        };
+        // emit captured agent.verifier.* events via log_llm_event (logging::log_llm_event は
+        // mask_payload_inplace を内蔵するため secret 漏洩防御の SSOT、DR4-004).
+        for (k, p) in events_local.into_iter() {
+            log_llm_event(k, p);
+        }
+        let compute_ms = started.elapsed().as_secs_f64() * 1000.0;
+        // facade applies outcome (5 step):
+        // SkillOutput::Verifier(Box<VerifierOutcome>) - deref to access variant
+        let final_score = match invocation.output {
+            Some(crate::agent::skills::SkillOutput::Verifier(boxed)) => {
+                use crate::agent::loop_run::verifier_skill::{
+                    AutoTestKindView, VerifierOutcome, sanitize_verify_command_for_case_record,
+                };
+                let outcome: VerifierOutcome = *boxed;
+                let score = match &outcome {
+                    VerifierOutcome::AutoTestRan { score, .. }
+                    | VerifierOutcome::AutoTestTransportError { score, .. }
+                    | VerifierOutcome::TesterDelegated { score }
+                    | VerifierOutcome::NoVerifier { score, .. }
+                    | VerifierOutcome::Skipped { score } => score.clone(),
+                };
+                // [a] AutoTest 分岐時のみ legacy events emit + verify_commands push
+                //     (DR2-004: 空文字列 / DR4-001: sanitize でガード)
+                if let VerifierOutcome::AutoTestRan {
+                    auto_test_kind,
+                    auto_test_passed,
+                    auto_test_command,
+                    auto_test_output,
+                    auto_test_reason,
+                    ..
+                } = &outcome
+                {
+                    log_llm_event(
+                        "agent.autotest.completed",
+                        serde_json::json!({
+                            "session_id": &session_id,
+                            "command": auto_test_command,
+                            "passed": auto_test_passed,
+                            "reason": auto_test_reason,
+                        }),
+                    );
+                    if let Some(sanitized) =
+                        sanitize_verify_command_for_case_record(auto_test_command)
+                    {
+                        verify_commands_collected.push(sanitized);
+                    }
+                    // AutoTest failed (Ok だが passed=false) → MissingRepoEdits 反映 (DR3-001)
+                    if !auto_test_passed {
+                        let kind_dbg = match auto_test_kind {
+                            AutoTestKindView::Build => "Build",
+                            AutoTestKindView::Test => "Test",
+                        };
+                        exit_reason = ExitReason::MissingRepoEdits;
+                        error_text = format!(
+                            "auto test failed for protocol {kind_dbg}: {}\n{}",
+                            auto_test_command, auto_test_output
+                        );
+                    }
+                }
+                // [c] FeedbackFrame 記録 (DR2-003: record_feedback_if_unset で
+                //     first-eligible-failure-wins #455 規約を維持)
+                if let VerifierOutcome::AutoTestRan {
+                    feedback: Some(fb), ..
+                } = &outcome
+                {
+                    self.session.record_feedback_if_unset(fb.clone());
+                }
+                if let VerifierOutcome::NoVerifier { feedback, .. } = &outcome {
+                    self.session.record_feedback_if_unset(feedback.clone());
+                }
+                // [d] Tester 委譲 (本 Issue では Tester skill 化 Out of Scope、既存
+                //     try_invoke_tester を facade で呼ぶ)
+                if matches!(outcome, VerifierOutcome::TesterDelegated { .. }) {
+                    let tester_recorded = self.try_invoke_tester(&stats.changed_files);
+                    if !tester_recorded && self.should_run_auto_test_for_success() {
+                        let frame = build_feedback_for_no_verifier(&self.work_root);
+                        self.session.record_feedback_if_unset(frame);
+                    }
+                }
+                // [e] AutoTestTransportError → exit_reason 反映 (DR2-002)
+                if let VerifierOutcome::AutoTestTransportError { error, .. } = &outcome {
+                    exit_reason = ExitReason::TransportError;
+                    error_text = error.clone();
+                }
+                Some(score)
+            }
+            // Issue #467 / DR1-002 2 次防御: PermissionDenied は SkillRegistry::invoke 内で
+            // 完結する設計のため facade に届かない。届いたら debug_assert で検知し
+            // release では安全に None フォールバック。
+            Some(crate::agent::skills::SkillOutput::PermissionDenied(_)) => {
+                debug_assert!(false, "PermissionDenied must not reach facade");
+                None
+            }
+            _ => None,
+        };
+        // [b] AnvilScore 永続化と flag 立て (Reminder より先).
+        if let Some(score) = final_score {
             let rendered = score.format_for_prompt();
             let render_chars = rendered.chars().count();
             log_llm_event(
                 "agent.anvil_score.computed",
                 serde_json::json!({
-                    "session_id": self.session_store.session_id(),
+                    "session_id": &session_id,
                     "score": &score,
                     "render_chars": render_chars,
                     "compute_ms": compute_ms,
@@ -3146,6 +3782,14 @@ impl Agent {
         // after the actor loop exited. Per-turn cap means this no-ops if the
         // iteration-internal hook already ran.
         self.maybe_invoke_reminder(&interrupt_flag);
+        // Issue #462: CaseRecord extraction (post-loop, after Reminder, before
+        // turn_completed event). Pure success-condition + scrub + persist; no
+        // sidecar / LLM calls. Failures are logged and never propagate.
+        self.maybe_extract_case_record(&stats, &verify_commands_collected);
+        // Issue #464: AntiPatternRecord extraction (post-loop, after CaseRecord).
+        // Triggered by the latest eligible failure feedback. Pure upsert; no
+        // sidecar / LLM calls.
+        self.maybe_extract_anti_pattern();
         log_llm_event(
             "agent.milestone.turn_completed",
             serde_json::json!({
@@ -4021,6 +4665,17 @@ impl Agent {
             }
             if let Some(memory_message) = self.working_memory_message() {
                 messages.push(memory_message);
+            }
+            // Issue #463: inject `Relevant Local Cases:` directly after the
+            // Working Memory section. Pure-function retrieval; no Ollama call.
+            if let Some(case_message) = self.try_inject_case_retrieval_message() {
+                messages.push(case_message);
+            }
+            // Issue #464: inject `Avoid Patterns (from prior failures):` after
+            // the case retrieval section. Pure-function retrieval; no Ollama
+            // call.
+            if let Some(anti_message) = self.try_inject_anti_pattern_message() {
+                messages.push(anti_message);
             }
             if let Some(repo_context_message) = self.repo_context_message() {
                 messages.push(repo_context_message);

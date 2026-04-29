@@ -1064,6 +1064,10 @@ mod tests {
             consecutive_no_progress_turns: 0,
             repo_edit_succeeded_this_turn: false,
             touched_files_at_turn_start: Vec::new(),
+            case_record_extracted_this_turn: false,
+            case_retrieval_invoked_this_turn: false,
+            anti_pattern_extracted_this_turn: false,
+            anti_pattern_retrieval_invoked_this_turn: false,
         };
         let v = ShowView::from_snapshot(&snap);
         assert_eq!(v.id, "sid");
