@@ -27,7 +27,7 @@ mod interrupt;
 mod lifecycle;
 mod protocol;
 mod quality;
-mod reminder;
+pub(crate) mod reminder;
 pub mod slash_commands;
 mod spinner;
 mod summary;
@@ -47,6 +47,15 @@ pub(crate) use turn::{no_color_requested, unicode_supported};
 // `tests/` (and any future callers) can validate the Act-mode prompt
 // selection pipeline without requiring a live Ollama call.
 pub use turn::select_precautions_for_prompt;
+
+// Issue #465 / Phase 5: expose Reminder types needed by tests/agent_skill_registry_smoke.rs
+// (E2E tests live outside the crate so `pub(crate) mod reminder` cannot be reached
+// directly). Production code paths continue to use `super::reminder::...`; these
+// `pub use` lines only widen the visibility for integration tests.
+pub use reminder::{
+    FailureReason as ReminderFailureReason, ReminderInputs, ReminderOutcome,
+    SkipReason as ReminderSkipReason,
+};
 
 // Issue #459 / Phase 2: expose the Tester Skill orchestrator + types so the
 // E2E suite under `tests/tester_skill_smoke.rs` can drive the closure-DI
