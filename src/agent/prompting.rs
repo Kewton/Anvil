@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use ignore::WalkBuilder;
 use serde_json::Value;
 
+use crate::logging::log_llm_event;
+use crate::repo_graph::RepoGraph;
 use crate::session::store::ConversationMessage;
 
 const MAX_TOOL_MESSAGE_CHARS: usize = 12_000;
@@ -14,6 +16,26 @@ const MAX_REPO_CONTEXT_FILES: usize = 1_500;
 const MAX_REPO_CONTEXT_FILE_BYTES: usize = 16_000;
 const PROJECT_INSTRUCTIONS_FILE: &str = "ANVIL.md";
 const MAX_PROJECT_INSTRUCTIONS_BYTES: usize = 16 * 1024;
+
+// Issue #469: ranking weights SSOT (lexical 7 + graph 4 = 11 elements).
+// All values are usize to align with `RetrievalCandidate.score: usize`.
+const WEIGHT_FILE_NAME_TOKEN: usize = 8;
+const WEIGHT_PATH_TOKEN: usize = 5;
+const WEIGHT_PATH_CONTAINS: usize = 3;
+const WEIGHT_CONTENT_TOKEN: usize = 2;
+const WEIGHT_CONTENT_CONTAINS: usize = 1;
+const WEIGHT_SYMBOL: usize = 4;
+const BONUS_PATH_CONTENT_COHERENCE: usize = 3;
+const WEIGHT_TEST_IMPL_PAIR: usize = 7;
+const WEIGHT_SUSPECTED_FILE: usize = 10;
+const WEIGHT_CHANGED_FILE: usize = 4;
+const WEIGHT_GRAPH_NEIGHBOR: usize = 6;
+const MIN_RANKING_SCORE: usize = 6;
+
+// Issue #469 DR4-002: import target sanitization caps.
+const MAX_IMPORT_TARGET_BYTES: usize = 512;
+
+const ENV_NO_GRAPH_RANKING: &str = "ANVIL_NO_GRAPH_RANKING";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ToolProtocol {
@@ -194,6 +216,7 @@ struct RetrievalCandidate {
     path_hits: Vec<String>,
     symbol_hits: Vec<String>,
     keyword_hits: Vec<String>,
+    graph_reasons: Vec<&'static str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -202,28 +225,99 @@ struct QueryTerms {
     symbols: Vec<String>,
 }
 
+/// Issue #469: Graph-aware ranking inputs bundled to avoid argument explosion (ISP).
+///
+/// `repo_graph` is `None` when the build failed/disabled or when this code path
+/// is invoked from a context that does not have access to a built graph. In that
+/// case the graph-derived weights collapse to 0 and the ranking falls back to
+/// pure lexical scoring.
+#[derive(Default)]
+pub(crate) struct RepoContextInputs<'a> {
+    pub repo_graph: Option<&'a RepoGraph>,
+    pub suspected_files: &'a [PathBuf],
+    pub changed_files: &'a [String],
+    pub session_id: &'a str,
+    pub model: Option<&'a str>,
+}
+
 pub(crate) fn repo_context_message(
     work_root: &Path,
     task: Option<&str>,
+    inputs: &RepoContextInputs<'_>,
 ) -> Option<ConversationMessage> {
-    let task = task?.trim();
-    if task.is_empty() {
-        return None;
-    }
+    repo_context_message_with_env(work_root, task, inputs, |key| std::env::var(key))
+}
+
+fn repo_context_message_with_env<F>(
+    work_root: &Path,
+    task: Option<&str>,
+    inputs: &RepoContextInputs<'_>,
+    env: F,
+) -> Option<ConversationMessage>
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
+    let graph_disabled = env(ENV_NO_GRAPH_RANKING)
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    let task = match task.map(str::trim) {
+        Some(t) if !t.is_empty() => t,
+        _ => {
+            emit_skipped_event(inputs, "no_task", inputs.repo_graph.is_some());
+            return None;
+        }
+    };
     let terms = extract_query_terms(task);
     if terms.keywords.is_empty() && terms.symbols.is_empty() {
+        emit_skipped_event(inputs, "no_query_terms", inputs.repo_graph.is_some());
         return None;
     }
-    let candidates = rank_repo_candidates(work_root, &terms);
+
+    let effective_graph = if graph_disabled {
+        None
+    } else {
+        inputs.repo_graph
+    };
+    let candidates = rank_repo_candidates(work_root, &terms, effective_graph, inputs);
     if candidates.is_empty() {
+        let event = if graph_disabled {
+            "agent.repo_context.disabled"
+        } else {
+            "agent.repo_context.skipped"
+        };
+        let reason = if graph_disabled {
+            "graph_ranking_disabled"
+        } else {
+            "no_candidates"
+        };
+        log_llm_event(
+            event,
+            serde_json::json!({
+                "session_id": inputs.session_id,
+                "model": inputs.model,
+                "reason": reason,
+                "selected_files": Vec::<serde_json::Value>::new(),
+                "total_candidates_considered": 0,
+                "cap_reached": false,
+                "repo_graph_state": graph_state_label(inputs.repo_graph),
+            }),
+        );
         return None;
     }
+
+    let total_considered = candidates.len();
+    let cap_reached = total_considered > MAX_REPO_CONTEXT_CANDIDATES;
+    let selected: Vec<RetrievalCandidate> = candidates
+        .into_iter()
+        .take(MAX_REPO_CONTEXT_CANDIDATES)
+        .collect();
 
     let mut lines = vec![
         "[Repo Context]".to_string(),
         "Likely relevant files for the current task:".to_string(),
     ];
-    for candidate in candidates.into_iter().take(MAX_REPO_CONTEXT_CANDIDATES) {
+    let mut payload_files = Vec::with_capacity(selected.len());
+    for candidate in &selected {
         let mut reasons = Vec::new();
         if !candidate.path_hits.is_empty() {
             reasons.push(format!("path={}", candidate.path_hits.join(",")));
@@ -234,22 +328,87 @@ pub(crate) fn repo_context_message(
         if !candidate.keyword_hits.is_empty() {
             reasons.push(format!("keyword={}", candidate.keyword_hits.join(",")));
         }
+        if !candidate.graph_reasons.is_empty() {
+            reasons.push(format!("graph={}", candidate.graph_reasons.join(",")));
+        }
         let suffix = if reasons.is_empty() {
             String::new()
         } else {
             format!(" | {}", reasons.join(" | "))
         };
         lines.push(format!("- {}{}", candidate.path, suffix));
+
+        let mut payload_reasons: Vec<&'static str> = Vec::new();
+        if !candidate.path_hits.is_empty() {
+            payload_reasons.push("lexical_path");
+        }
+        if !candidate.symbol_hits.is_empty() {
+            payload_reasons.push("lexical_symbol");
+        }
+        if !candidate.keyword_hits.is_empty() {
+            payload_reasons.push("lexical_keyword");
+        }
+        for r in &candidate.graph_reasons {
+            payload_reasons.push(r);
+        }
+        payload_files.push(serde_json::json!({
+            "path": candidate.path,
+            "score": candidate.score,
+            "reasons": payload_reasons,
+        }));
     }
     lines.push(
         "Start with one of these files before broad Glob/Grep. Prefer a direct Read or Edit when one candidate clearly matches."
             .to_string(),
     );
+
+    log_llm_event(
+        "agent.repo_context.completed",
+        serde_json::json!({
+            "session_id": inputs.session_id,
+            "model": inputs.model,
+            "selected_files": payload_files,
+            "total_candidates_considered": total_considered,
+            "cap_reached": cap_reached,
+            "repo_graph_state": graph_state_label(inputs.repo_graph),
+        }),
+    );
+
     Some(ConversationMessage::system(lines.join("\n")))
 }
 
-fn rank_repo_candidates(work_root: &Path, terms: &QueryTerms) -> Vec<RetrievalCandidate> {
+fn graph_state_label(repo_graph: Option<&RepoGraph>) -> &'static str {
+    if repo_graph.is_some() {
+        "available"
+    } else {
+        "absent"
+    }
+}
+
+fn emit_skipped_event(inputs: &RepoContextInputs<'_>, reason: &str, graph_present: bool) {
+    let _ = graph_present;
+    log_llm_event(
+        "agent.repo_context.skipped",
+        serde_json::json!({
+            "session_id": inputs.session_id,
+            "model": inputs.model,
+            "reason": reason,
+            "selected_files": Vec::<serde_json::Value>::new(),
+            "total_candidates_considered": 0,
+            "cap_reached": false,
+            "repo_graph_state": graph_state_label(inputs.repo_graph),
+        }),
+    );
+}
+
+fn rank_repo_candidates(
+    work_root: &Path,
+    terms: &QueryTerms,
+    repo_graph: Option<&RepoGraph>,
+    inputs: &RepoContextInputs<'_>,
+) -> Vec<RetrievalCandidate> {
     let mut candidates = Vec::new();
+    let mut all_paths: Vec<PathBuf> = Vec::new();
     let walker = WalkBuilder::new(work_root)
         .hidden(false)
         .git_ignore(true)
@@ -272,11 +431,66 @@ fn rank_repo_candidates(work_root: &Path, terms: &QueryTerms) -> Vec<RetrievalCa
         let Some(relative) = path.strip_prefix(work_root).ok() else {
             continue;
         };
-        let relative = relative.to_string_lossy().replace('\\', "/");
-        if let Some(candidate) = score_candidate(path, &relative, terms) {
-            candidates.push(candidate);
+        let relative_str = relative.to_string_lossy().replace('\\', "/");
+        all_paths.push(PathBuf::from(&relative_str));
+        let lexical = score_lexical(path, &relative_str, terms);
+        if lexical.0 == 0 && lexical.1.is_empty() && lexical.2.is_empty() && lexical.3.is_empty() {
+            continue;
+        }
+        let graph = score_graph(
+            &relative_str,
+            repo_graph,
+            inputs.suspected_files,
+            inputs.changed_files,
+            None,
+        );
+        let coherence = if lexical.1.len() >= 2 && (!lexical.2.is_empty() || !lexical.3.is_empty())
+        {
+            BONUS_PATH_CONTENT_COHERENCE
+        } else {
+            0
+        };
+        let total = lexical.0 + graph.0 + coherence;
+        if total < MIN_RANKING_SCORE {
+            continue;
+        }
+        candidates.push(RetrievalCandidate {
+            path: relative_str,
+            score: total,
+            path_hits: lexical.1,
+            symbol_hits: lexical.2,
+            keyword_hits: lexical.3,
+            graph_reasons: graph.1,
+        });
+    }
+
+    if let Some(graph) = repo_graph {
+        let neighbor_index = build_neighbor_index(&all_paths);
+        for candidate in &mut candidates {
+            let cur_path = PathBuf::from(&candidate.path);
+            let mut graph_reasons: Vec<&'static str> = candidate.graph_reasons.clone();
+            let mut delta = 0usize;
+            for import in graph.imports_of(&cur_path) {
+                if let Some(_resolved) =
+                    resolve_import_target_to_file(&import.target, &neighbor_index)
+                    && !graph_reasons.contains(&"graph_neighbor")
+                {
+                    delta += WEIGHT_GRAPH_NEIGHBOR;
+                    graph_reasons.push("graph_neighbor");
+                    break;
+                }
+            }
+            if graph.find_pairs(&cur_path).into_iter().next().is_some()
+                && !graph_reasons.contains(&"test_impl_pair")
+            {
+                delta += WEIGHT_TEST_IMPL_PAIR;
+                graph_reasons.push("test_impl_pair");
+            }
+            candidate.score += delta;
+            candidate.graph_reasons = graph_reasons;
         }
     }
+
     candidates.sort_by(|lhs, rhs| {
         rhs.score
             .cmp(&lhs.score)
@@ -287,21 +501,13 @@ fn rank_repo_candidates(work_root: &Path, terms: &QueryTerms) -> Vec<RetrievalCa
     candidates
 }
 
-fn should_skip_retrieval_path(path: &Path) -> bool {
-    path.components().any(|component| {
-        let name = component.as_os_str().to_string_lossy();
-        matches!(
-            name.as_ref(),
-            ".git" | ".anvil-state" | "target" | "node_modules" | "dist" | "build"
-        )
-    })
-}
-
-fn score_candidate(
+/// Pure function: compute lexical score for a single candidate.
+/// Returns `(score, path_hits, symbol_hits, keyword_hits)`.
+fn score_lexical(
     path: &Path,
     relative_path: &str,
     terms: &QueryTerms,
-) -> Option<RetrievalCandidate> {
+) -> (usize, Vec<String>, Vec<String>, Vec<String>) {
     let path_lower = relative_path.to_ascii_lowercase();
     let path_tokens = tokenize_fragments(relative_path, 2);
     let file_name_tokens = path
@@ -322,27 +528,27 @@ fn score_candidate(
 
     for keyword in &terms.keywords {
         if file_name_tokens.iter().any(|token| token == keyword) {
-            score += 8;
+            score += WEIGHT_FILE_NAME_TOKEN;
             push_unique(&mut path_hits, keyword.clone());
             continue;
         }
         if path_tokens.iter().any(|token| token == keyword) {
-            score += 5;
+            score += WEIGHT_PATH_TOKEN;
             push_unique(&mut path_hits, keyword.clone());
             continue;
         }
         if path_lower.contains(keyword) {
-            score += 3;
+            score += WEIGHT_PATH_CONTAINS;
             push_unique(&mut path_hits, keyword.clone());
         }
         if content_tokens.iter().any(|token| token == keyword) {
-            score += 2;
+            score += WEIGHT_CONTENT_TOKEN;
             push_unique(&mut keyword_hits, keyword.clone());
         } else if content_lower
             .as_deref()
             .is_some_and(|body| body.contains(keyword))
         {
-            score += 1;
+            score += WEIGHT_CONTENT_CONTAINS;
             push_unique(&mut keyword_hits, keyword.clone());
         }
     }
@@ -353,24 +559,168 @@ fn score_candidate(
                 .as_deref()
                 .is_some_and(|body| body.contains(symbol))
         {
-            score += 4;
+            score += WEIGHT_SYMBOL;
             push_unique(&mut symbol_hits, symbol.clone());
         }
     }
 
-    if path_hits.len() >= 2 && (!symbol_hits.is_empty() || !keyword_hits.is_empty()) {
-        score += 3;
+    (score, path_hits, symbol_hits, keyword_hits)
+}
+
+/// Pure function: compute graph-derived score for a single candidate.
+/// Note: graph_neighbor is computed in a second pass after all candidates
+/// are collected (to use the pre-built neighbor_index). This function only
+/// handles suspected_file / changed_file at this stage.
+fn score_graph(
+    relative_path: &str,
+    repo_graph: Option<&RepoGraph>,
+    suspected_files: &[PathBuf],
+    changed_files: &[String],
+    _placeholder: Option<()>,
+) -> (usize, Vec<&'static str>) {
+    let mut score = 0usize;
+    let mut reasons: Vec<&'static str> = Vec::new();
+    if repo_graph.is_none() {
+        return (0, reasons);
     }
-    if score < 6 {
+    if suspected_files
+        .iter()
+        .any(|p| path_matches_relative(p, relative_path))
+    {
+        score += WEIGHT_SUSPECTED_FILE;
+        reasons.push("suspected_file");
+    }
+    if changed_files
+        .iter()
+        .any(|p| path_string_matches_relative(p, relative_path))
+    {
+        score += WEIGHT_CHANGED_FILE;
+        reasons.push("changed_file");
+    }
+    (score, reasons)
+}
+
+fn path_matches_relative(p: &Path, relative_path: &str) -> bool {
+    let candidate = p.to_string_lossy().replace('\\', "/");
+    candidate == relative_path
+        || candidate.ends_with(&format!("/{}", relative_path))
+        || relative_path.ends_with(&format!("/{}", candidate))
+        || p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| relative_path.ends_with(n))
+}
+
+fn path_string_matches_relative(s: &str, relative_path: &str) -> bool {
+    let candidate = s.replace('\\', "/");
+    candidate == relative_path
+        || candidate.ends_with(&format!("/{}", relative_path))
+        || relative_path.ends_with(&format!("/{}", candidate))
+}
+
+/// Build a `HashMap<&str, &Path>` from candidate paths for O(1) import target
+/// resolution (DR1-002 DIP).
+fn build_neighbor_index(candidates: &[PathBuf]) -> HashMap<String, PathBuf> {
+    let mut index: HashMap<String, PathBuf> = HashMap::new();
+    for p in candidates {
+        if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+            index.entry(stem.to_string()).or_insert_with(|| p.clone());
+        }
+        let module_path = p
+            .with_extension("")
+            .to_string_lossy()
+            .replace('\\', "/")
+            .replace('/', "::");
+        index.entry(module_path).or_insert_with(|| p.clone());
+    }
+    index
+}
+
+/// Sanitize an `ImportRef.target` before suffix matching (DR4-002).
+/// Rejects empty, oversized, NUL/control, absolute, or `..`-bearing targets
+/// to prevent prompt-context poisoning via malformed imports.
+fn sanitize_import_target(target: &str) -> Option<&str> {
+    if target.is_empty() || target.len() > MAX_IMPORT_TARGET_BYTES {
         return None;
     }
+    if target.contains('\0') {
+        return None;
+    }
+    if target
+        .chars()
+        .any(|c| c.is_control() && c != '\t' && c != '\n')
+    {
+        return None;
+    }
+    if target.starts_with('/') || target.starts_with('\\') {
+        return None;
+    }
+    if target.split(['/', '\\', ':']).any(|seg| seg == "..") {
+        return None;
+    }
+    // Reject Windows-style absolute paths like "C:\..." or "C:/..."
+    // but allow Rust module paths like "crate::foo" (which have "::").
+    if target.len() >= 3
+        && target.as_bytes()[1] == b':'
+        && target.as_bytes()[2] != b':'
+        && target.as_bytes()[0].is_ascii_alphabetic()
+    {
+        return None;
+    }
+    Some(target)
+}
 
-    Some(RetrievalCandidate {
-        path: relative_path.to_string(),
-        score,
-        path_hits,
-        symbol_hits,
-        keyword_hits,
+/// Resolve an `ImportRef.target` to a candidate file via the neighbor index.
+/// Uses exact match first, then component-boundary suffix fallback.
+/// Returns `None` for malformed inputs (DR4-002) and `None` for ambiguous
+/// matches (multiple distinct candidate paths) to prevent first-match bias.
+fn resolve_import_target_to_file<'a>(
+    target: &str,
+    index: &'a HashMap<String, PathBuf>,
+) -> Option<&'a PathBuf> {
+    let target = sanitize_import_target(target)?;
+    if let Some(p) = index.get(target) {
+        return Some(p);
+    }
+    let mut found: Option<&PathBuf> = None;
+    let mut ambiguous = false;
+    for (key, p) in index.iter() {
+        if !target_ends_at_component_boundary(target, key) {
+            continue;
+        }
+        match found {
+            None => found = Some(p),
+            Some(existing) if existing == p => {}
+            Some(_) => {
+                ambiguous = true;
+                break;
+            }
+        }
+    }
+    if ambiguous { None } else { found }
+}
+
+fn target_ends_at_component_boundary(target: &str, key: &str) -> bool {
+    if !target.ends_with(key) {
+        return false;
+    }
+    if target.len() == key.len() {
+        return true;
+    }
+    let prefix = &target[..target.len() - key.len()];
+    let last = match prefix.chars().last() {
+        Some(c) => c,
+        None => return true,
+    };
+    matches!(last, ':' | '/' | '.')
+}
+
+fn should_skip_retrieval_path(path: &Path) -> bool {
+    path.components().any(|component| {
+        let name = component.as_os_str().to_string_lossy();
+        matches!(
+            name.as_ref(),
+            ".git" | ".anvil-state" | "target" | "node_modules" | "dist" | "build"
+        )
     })
 }
 
@@ -558,9 +908,17 @@ pub(crate) fn detect_created_project_root(tool_output: &str) -> Option<PathBuf> 
 #[cfg(test)]
 mod tests {
     use super::{
-        ToolProtocol, load_project_instructions, repo_context_message, runtime_context_messages,
+        RepoContextInputs, ToolProtocol, build_neighbor_index, load_project_instructions,
+        repo_context_message, repo_context_message_with_env, resolve_import_target_to_file,
+        runtime_context_messages, sanitize_import_target,
     };
+    use std::collections::HashMap;
+    use std::path::PathBuf;
     use tempfile::tempdir;
+
+    fn empty_inputs<'a>() -> RepoContextInputs<'a> {
+        RepoContextInputs::default()
+    }
 
     #[test]
     fn repo_context_prefers_path_and_symbol_matches() {
@@ -583,9 +941,11 @@ mod tests {
         )
         .unwrap();
 
+        let inputs = empty_inputs();
         let message = repo_context_message(
             temp.path(),
             Some("Update the billing retry policy so `paymentRetryDelayMs` becomes 7000."),
+            &inputs,
         )
         .unwrap();
         let mut bullet_lines = message
@@ -600,6 +960,163 @@ mod tests {
                 .contains("src/billing/retry_policy.ts")
         );
         assert!(message.content.contains("symbol=delay,payment,retry"));
+        // Issue #469: graph= reason key MUST NOT be emitted when no graph/feedback present.
+        assert!(!message.content.contains("graph="));
+    }
+
+    #[test]
+    fn repo_context_message_returns_identical_output_when_repo_graph_is_none() {
+        let temp = tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        std::fs::write(
+            temp.path().join("src/payment.rs"),
+            "pub fn paymentRetryDelayMs() -> u32 { 3000 }\n",
+        )
+        .unwrap();
+
+        let inputs = empty_inputs();
+        let msg1 = repo_context_message(
+            temp.path(),
+            Some("Update `paymentRetryDelayMs` in payment module"),
+            &inputs,
+        );
+        let msg2 = repo_context_message(
+            temp.path(),
+            Some("Update `paymentRetryDelayMs` in payment module"),
+            &inputs,
+        );
+        assert_eq!(msg1.map(|m| m.content), msg2.map(|m| m.content));
+    }
+
+    #[test]
+    fn changed_file_boost_alone_does_not_trigger_threshold() {
+        // changed_file=+4 alone < MIN_RANKING_SCORE=6
+        let temp = tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        std::fs::write(temp.path().join("src/unrelated.rs"), "// nothing\n").unwrap();
+
+        let inputs = RepoContextInputs {
+            changed_files: &["src/unrelated.rs".to_string()],
+            ..RepoContextInputs::default()
+        };
+        let msg =
+            repo_context_message(temp.path(), Some("focus on `paymentRetryDelayMs`"), &inputs);
+        // Without lexical hits, changed_file=+4 alone cannot reach threshold 6
+        if let Some(m) = msg {
+            assert!(!m.content.contains("src/unrelated.rs"));
+        }
+    }
+
+    #[test]
+    fn graph_ranking_disabled_env_falls_back_to_lexical() {
+        let temp = tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("src/billing")).unwrap();
+        std::fs::write(
+            temp.path().join("src/billing/retry.rs"),
+            "pub fn paymentRetryDelayMs() -> u32 { 3000 }\n",
+        )
+        .unwrap();
+
+        let inputs = RepoContextInputs {
+            changed_files: &["src/billing/retry.rs".to_string()],
+            ..RepoContextInputs::default()
+        };
+        let env = |k: &str| -> Result<String, std::env::VarError> {
+            if k == super::ENV_NO_GRAPH_RANKING {
+                Ok("1".to_string())
+            } else {
+                Err(std::env::VarError::NotPresent)
+            }
+        };
+        let msg = repo_context_message_with_env(
+            temp.path(),
+            Some("Update `paymentRetryDelayMs` in billing"),
+            &inputs,
+            env,
+        );
+        if let Some(m) = msg {
+            assert!(!m.content.contains("graph="));
+        }
+    }
+
+    #[test]
+    fn sanitize_import_target_rejects_unsafe_inputs() {
+        // empty
+        assert!(sanitize_import_target("").is_none());
+        // oversized
+        let big = "a".repeat(super::MAX_IMPORT_TARGET_BYTES + 1);
+        assert!(sanitize_import_target(&big).is_none());
+        // NUL
+        assert!(sanitize_import_target("foo\0bar").is_none());
+        // control
+        assert!(sanitize_import_target("foo\x01bar").is_none());
+        // absolute unix
+        assert!(sanitize_import_target("/etc/passwd").is_none());
+        // absolute windows-like
+        assert!(sanitize_import_target("C:\\windows").is_none());
+        // ".." segment
+        assert!(sanitize_import_target("../foo").is_none());
+        assert!(sanitize_import_target("a/../b").is_none());
+        assert!(sanitize_import_target("a::..::b").is_none());
+        // valid
+        assert_eq!(
+            sanitize_import_target("crate::foo::bar"),
+            Some("crate::foo::bar")
+        );
+        assert_eq!(sanitize_import_target("foo/bar"), Some("foo/bar"));
+    }
+
+    #[test]
+    fn ambiguous_import_target_match_returns_none() {
+        let mut index: HashMap<String, PathBuf> = HashMap::new();
+        index.insert("foo".to_string(), PathBuf::from("a/foo.rs"));
+        index.insert("bar/foo".to_string(), PathBuf::from("b/foo.rs"));
+        // target "x::foo" component-boundary-matches both keys "foo" and "bar/foo"? Only "foo" would
+        // match if both target paths suffix differently; build a clearer ambiguous case below.
+
+        let mut idx2: HashMap<String, PathBuf> = HashMap::new();
+        idx2.insert("foo".to_string(), PathBuf::from("a/foo.rs"));
+        idx2.insert("alpha::foo".to_string(), PathBuf::from("b/foo.rs"));
+        // Both keys end with "foo" at component boundary for target "alpha::foo":
+        // - "foo" matches at "alpha::|foo" boundary (last char before is ':')
+        // - "alpha::foo" matches exactly
+        // Exact match takes precedence per resolve_import_target_to_file, so test exact-only path:
+        let r = resolve_import_target_to_file("alpha::foo", &idx2);
+        assert!(r.is_some()); // exact hit returns
+        assert_eq!(r.unwrap(), &PathBuf::from("b/foo.rs"));
+
+        // True ambiguity: no exact hit, two distinct fallback matches.
+        let mut idx3: HashMap<String, PathBuf> = HashMap::new();
+        idx3.insert("foo".to_string(), PathBuf::from("a/foo.rs"));
+        idx3.insert("bar".to_string(), PathBuf::from("b/bar.rs"));
+        // Target "x::foo" only matches "foo" → unambiguous.
+        let r2 = resolve_import_target_to_file("x::foo", &idx3);
+        assert_eq!(r2, Some(&PathBuf::from("a/foo.rs")));
+
+        // True ambiguous: two keys both component-boundary suffix-match the target, distinct files.
+        let mut idx4: HashMap<String, PathBuf> = HashMap::new();
+        idx4.insert("foo".to_string(), PathBuf::from("a/foo.rs"));
+        idx4.insert("baz/foo".to_string(), PathBuf::from("c/baz/foo.rs"));
+        // Target "qux/baz/foo": "foo" matches at boundary, "baz/foo" matches at boundary
+        // — distinct candidate files → ambiguous → None.
+        let r3 = resolve_import_target_to_file("qux/baz/foo", &idx4);
+        assert!(
+            r3.is_none(),
+            "ambiguous match should return None, got {:?}",
+            r3
+        );
+    }
+
+    #[test]
+    fn build_neighbor_index_inserts_stem_and_module_path() {
+        let cands = vec![PathBuf::from("src/foo/bar.rs")];
+        let idx = build_neighbor_index(&cands);
+        assert_eq!(idx.get("bar"), Some(&PathBuf::from("src/foo/bar.rs")));
+        // module path: "src/foo/bar" → "src::foo::bar"
+        assert_eq!(
+            idx.get("src::foo::bar"),
+            Some(&PathBuf::from("src/foo/bar.rs"))
+        );
     }
 
     #[test]

@@ -137,7 +137,26 @@ pub struct Agent {
 struct RepoContextCache {
     task: String,
     work_root: PathBuf,
+    repo_graph_present: bool,
+    last_feedback_kind: Option<String>,
+    suspected_files_fingerprint: u64,
+    touched_files_fingerprint: u64,
     message: Option<ConversationMessage>,
+}
+
+/// Issue #469 DR1-005: SSOT for path-list fingerprinting used by the
+/// `RepoContextCache` key. Empty slice yields a process-stable sentinel
+/// hash; non-empty path lists are sorted before hashing for stability
+/// across feedback ordering.
+pub(super) fn fingerprint_paths(paths: &[String]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut sorted: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+    sorted.sort_unstable();
+    let mut hasher = DefaultHasher::new();
+    sorted.hash(&mut hasher);
+    hasher.finish()
 }
 
 impl Agent {
