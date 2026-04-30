@@ -78,6 +78,10 @@ pub use tester::{
     run_tester_with_strategy, tester_disabled,
 };
 
+// Issue #472: expose env-gate helper so `tests/eval_harness_smoke.rs` can
+// drive the closure-DI boundary (ANVIL_NO_AUTO_TEST) without live Ollama.
+pub use auto_test::auto_test_disabled;
+
 const DEFAULT_KEEP_TAIL: usize = 24;
 const LATE_TURN_KEEP_TAIL: usize = 12;
 
@@ -131,6 +135,15 @@ pub struct Agent {
     /// avoid bloating the session JSON (DR1-004 / S3-006).
     #[allow(dead_code)]
     pub(super) repo_graph: Option<Arc<RepoGraph>>,
+    /// Issue #471: per-turn cache of the last case retrieval summary for the
+    /// eval log. Set by `try_inject_case_retrieval_message` when a Completed
+    /// outcome is obtained. Reset at the top of `run_actor_loop`.
+    pub(super) last_case_retrieval_summary: Option<crate::session::eval_log::CaseRetrievalSummary>,
+    /// Issue #473: monotonically increasing counter (1-based) for the current
+    /// session turn. Incremented at the top of `handle_user_message` before any
+    /// per-turn logic runs. Used as a join key in `agent.reminder.completed` and
+    /// `agent.anvil_score.computed` log events for dataset export.
+    pub(super) current_turn_index: usize,
 }
 
 #[derive(Clone)]
@@ -194,6 +207,8 @@ impl Agent {
             anvil_score_computed_this_turn: false,
             skill_registry,
             repo_graph,
+            last_case_retrieval_summary: None,
+            current_turn_index: 0,
         }
     }
 }

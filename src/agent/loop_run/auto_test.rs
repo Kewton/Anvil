@@ -482,6 +482,15 @@ fn truncate(value: &str, max_bytes: usize) -> String {
     format!("{}...", &value[..end])
 }
 
+/// Returns true when `ANVIL_NO_AUTO_TEST` is set to a non-empty value.
+/// Follows the same closure DI pattern as `case_record_disabled` (session/case_record.rs).
+pub fn auto_test_disabled<F>(get_env: F) -> bool
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
+    matches!(get_env("ANVIL_NO_AUTO_TEST"), Ok(v) if !v.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -824,5 +833,26 @@ mod tests {
         let plan = cargo_plan();
         let result = make_result(&plan, false, "compile error nothing else", "");
         assert_eq!(count_test_failures(&result), None);
+    }
+
+    #[test]
+    fn auto_test_disabled_returns_true_when_env_set() {
+        assert!(auto_test_disabled(|k| {
+            if k == "ANVIL_NO_AUTO_TEST" {
+                Ok("1".to_string())
+            } else {
+                Err(std::env::VarError::NotPresent)
+            }
+        }));
+    }
+
+    #[test]
+    fn auto_test_disabled_returns_false_when_env_empty() {
+        assert!(!auto_test_disabled(|_| Ok(String::new())));
+    }
+
+    #[test]
+    fn auto_test_disabled_returns_false_when_env_absent() {
+        assert!(!auto_test_disabled(|_| Err(std::env::VarError::NotPresent)));
     }
 }

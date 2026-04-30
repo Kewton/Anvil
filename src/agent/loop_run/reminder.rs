@@ -97,6 +97,13 @@ pub enum ReminderOutcome {
         prompt_log: String,
         response_raw_log: String,
         feedback_kind: FeedbackKind,
+        /// Issue #473: canonical stored texts of precautions that were
+        /// accepted by `WorkingMemory::add_precaution` as `Added` or
+        /// `Truncated` during this Reminder invocation. Used by the dataset
+        /// export pipeline as the `output.added_precautions` ground truth.
+        /// Sourced from the canonicalization pipeline (mask_secrets +
+        /// truncation already applied) — not the raw LLM JSON (DR-473-014).
+        added_precautions_text: Vec<String>,
     },
     Failed {
         reason: FailureReason,
@@ -177,6 +184,11 @@ pub struct ReminderInputs<'a> {
     /// Lifetime-tagged (carries `&AnvilScore`) → not serde-derivable. The
     /// field is consumed only by `build_reminder_prompt`.
     pub anvil_score: Option<AnvilScoreSnapshot<'a>>,
+    /// Issue #473: Active precautions at the time of the Reminder call, used
+    /// to populate the `precautions_at_call_time` log field for dataset export.
+    /// Must be the canonical stored `.text` values from `WorkingMemory.active_precautions`
+    /// (Active status only); **not** derived from `format_for_prompt()` output.
+    pub active_precautions_at_call_time: &'a [String],
 }
 
 /// Gate state. Each field is computed once by the caller (`Agent::invoke_reminder`)
@@ -458,6 +470,12 @@ where
     let mut duplicates = 0usize;
     let mut truncated = 0usize;
     let mut applies_to_dropped = 0usize;
+    // Issue #473: collect canonical stored text of every accepted precaution
+    // (Added or Truncated) for the dataset export `added_precautions_text`
+    // log field. Sourced from the storage pipeline post-canonicalization, so
+    // mask_secrets / truncate_entry / path normalization are already applied
+    // (DR-473-014: never use raw `PrecautionDraft.text`).
+    let mut added_precautions_text: Vec<String> = Vec::new();
     for draft in drafts {
         let (precaution, dropped) = match precaution_from_draft(draft, &kind) {
             Some(pair) => pair,
@@ -465,11 +483,19 @@ where
         };
         applies_to_dropped += dropped;
         match working_memory.add_precaution(precaution, workspace_root) {
-            AddPrecautionOutcome::Added => added += 1,
+            AddPrecautionOutcome::Added => {
+                added += 1;
+                if let Some(p) = working_memory.active_precautions.last() {
+                    added_precautions_text.push(p.text.clone());
+                }
+            }
             AddPrecautionOutcome::DuplicateIgnored => duplicates += 1,
             AddPrecautionOutcome::Truncated => {
                 added += 1;
                 truncated += 1;
+                if let Some(p) = working_memory.active_precautions.last() {
+                    added_precautions_text.push(p.text.clone());
+                }
             }
         }
     }
@@ -483,6 +509,7 @@ where
         prompt_log,
         response_raw_log,
         feedback_kind: kind,
+        added_precautions_text,
     }
 }
 
@@ -490,14 +517,48 @@ where
 // Logging payload
 // ---------------------------------------------------------------------------
 
+/// Hard cap on the `feedback_excerpt` field embedded in the
+/// `agent.reminder.completed` log payload (Issue #473). The full
+/// `FeedbackFrame` excerpt may be up to 8 KiB head + 8 KiB tail; for the
+/// dataset export we only need a 4 KiB summary so the resulting JSONL
+/// records stay compact.
+pub(crate) const REMINDER_LOG_FEEDBACK_EXCERPT_BYTES: usize = 4 * 1024;
+
+/// Build a 4 KiB-capped, secret-masked feedback excerpt for the
+/// `agent.reminder.completed` log payload. Concatenates stdout + stderr
+/// excerpts (separator `\n---\n`) so a downstream learner sees both sides
+/// of the failure signal in a single string, then truncates after masking.
+fn build_feedback_excerpt_for_log(frame: &FeedbackFrame) -> String {
+    let stdout = frame.stdout_excerpt();
+    let stderr = frame.stderr_excerpt();
+    let combined = match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => stdout.to_string(),
+        (true, false) => stderr.to_string(),
+        (false, false) => format!("{stdout}\n---\n{stderr}"),
+    };
+    let masked = mask_secrets(&combined);
+    truncate_for_log(&masked, REMINDER_LOG_FEEDBACK_EXCERPT_BYTES)
+}
+
 /// Build the `serde_json::Value` recorded by `log_llm_event`. Exposed as
 /// `pub(crate)` so the order/integration tests can assert payload shape
 /// without going through the global `OnceLock<Mutex<File>>` sink in
 /// `src/logging.rs`.
+///
+/// Issue #473: `turn_index` and `inputs` are required so the dataset export
+/// pipeline can join the `agent.reminder.completed` event with the
+/// post-loop `agent.anvil_score.computed` event by `(session_id, turn_index)`,
+/// and reconstruct the prompt-side context (`task_at_call_time`,
+/// `precautions_at_call_time`, `feedback_excerpt`). When the caller does not
+/// have a `ReminderInputs` (e.g. legacy regression test fixtures), the new
+/// fields render as `null` / `[]` so the payload schema stays well-formed.
 pub(crate) fn build_log_payload(
     outcome: &ReminderOutcome,
     session_id: &str,
     model: Option<&str>,
+    turn_index: usize,
+    inputs: Option<&ReminderInputs<'_>>,
 ) -> (&'static str, serde_json::Value) {
     use serde_json::{Value, json};
     fn or_null(s: &str) -> Value {
@@ -510,6 +571,28 @@ pub(crate) fn build_log_payload(
     fn kind_label(kind: &FeedbackKind) -> Value {
         serde_json::to_value(kind).unwrap_or(Value::Null)
     }
+    let task_at_call_time: Value = inputs
+        .map(|i| Value::String(i.user_task.to_string()))
+        .unwrap_or(Value::Null);
+    let precautions_at_call_time: Value = match inputs {
+        Some(i) => Value::Array(
+            i.active_precautions_at_call_time
+                .iter()
+                .map(|s| Value::String(s.clone()))
+                .collect(),
+        ),
+        None => Value::Array(Vec::new()),
+    };
+    let feedback_excerpt: Value = inputs
+        .map(|i| {
+            let s = build_feedback_excerpt_for_log(i.frame);
+            if s.is_empty() {
+                Value::Null
+            } else {
+                Value::String(s)
+            }
+        })
+        .unwrap_or(Value::Null);
     match outcome {
         ReminderOutcome::Completed {
             added_count,
@@ -521,11 +604,17 @@ pub(crate) fn build_log_payload(
             prompt_log,
             response_raw_log,
             feedback_kind,
+            added_precautions_text,
         } => (
             "agent.reminder.completed",
             json!({
                 "session_id": session_id,
                 "model": model,
+                "turn_index": turn_index,
+                "task_at_call_time": task_at_call_time,
+                "precautions_at_call_time": precautions_at_call_time,
+                "feedback_excerpt": feedback_excerpt,
+                "added_precautions_text": added_precautions_text,
                 "parse_status": parse_status.as_str(),
                 "added_count": added_count,
                 "duplicate_count": duplicate_count,
@@ -614,6 +703,7 @@ mod tests {
             frame,
             working_memory_touched: &[],
             anvil_score: None,
+            active_precautions_at_call_time: &[],
         }
     }
 
@@ -621,6 +711,8 @@ mod tests {
         AssistantReply {
             content: content.to_string(),
             tool_calls: Vec::new(),
+            prompt_tokens: None,
+            completion_tokens: None,
         }
     }
 
@@ -1089,6 +1181,8 @@ mod tests {
                     name: "shell".to_string(),
                     arguments: serde_json::json!({}),
                 }],
+                prompt_tokens: None,
+                completion_tokens: None,
             })
         });
         match outcome {
@@ -1182,7 +1276,7 @@ mod tests {
             PrecautionSource::ToolFailure
         );
         // Log payload must serialize feedback_kind as "no_tool_call".
-        let (_event, payload) = build_log_payload(&outcome, "sess", Some("model"));
+        let (_event, payload) = build_log_payload(&outcome, "sess", Some("model"), 0, None);
         assert_eq!(
             payload.get("feedback_kind").and_then(|v| v.as_str()),
             Some("no_tool_call")
@@ -1202,14 +1296,17 @@ mod tests {
             prompt_log: "prompt".to_string(),
             response_raw_log: "raw".to_string(),
             feedback_kind: FeedbackKind::TestFailure,
+            added_precautions_text: vec!["watch the mock".to_string()],
         }
     }
 
     #[test]
     fn payload_completed_has_all_keys() {
-        let (event, payload) = build_log_payload(&make_completed(), "sess", Some("qwen-0.5b"));
+        let (event, payload) =
+            build_log_payload(&make_completed(), "sess", Some("qwen-0.5b"), 0, None);
         assert_eq!(event, "agent.reminder.completed");
         let obj = payload.as_object().expect("object");
+        // Issue #473: 17 keys total (12 legacy + 5 new for dataset export).
         for key in [
             "session_id",
             "model",
@@ -1223,12 +1320,37 @@ mod tests {
             "skip_reason",
             "prompt",
             "response_raw",
+            // Issue #473 — 5 new fields.
+            "turn_index",
+            "task_at_call_time",
+            "precautions_at_call_time",
+            "feedback_excerpt",
+            "added_precautions_text",
         ] {
             assert!(obj.contains_key(key), "missing key: {key}");
         }
         assert_eq!(obj.get("model").unwrap().as_str(), Some("qwen-0.5b"));
         assert_eq!(obj.get("parse_status").unwrap().as_str(), Some("ok"));
         assert!(obj.get("skip_reason").unwrap().is_null());
+        // Issue #473: with `inputs: None`, the new prompt-side fields render
+        // as null / empty array; `turn_index` reflects the explicit argument.
+        assert_eq!(obj.get("turn_index").unwrap().as_u64(), Some(0));
+        assert!(obj.get("task_at_call_time").unwrap().is_null());
+        assert!(
+            obj.get("precautions_at_call_time")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(obj.get("feedback_excerpt").unwrap().is_null());
+        let added_texts = obj
+            .get("added_precautions_text")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(added_texts.len(), 1);
+        assert_eq!(added_texts[0].as_str(), Some("watch the mock"));
     }
 
     #[test]
@@ -1240,7 +1362,7 @@ mod tests {
             response_raw_log: String::new(),
             feedback_kind: FeedbackKind::TestFailure,
         };
-        let (event, payload) = build_log_payload(&outcome, "sess", Some("qwen-0.5b"));
+        let (event, payload) = build_log_payload(&outcome, "sess", Some("qwen-0.5b"), 0, None);
         assert_eq!(event, "agent.reminder.failed");
         let obj = payload.as_object().expect("object");
         assert_eq!(obj.get("added_count").unwrap().as_u64(), Some(0));
@@ -1258,7 +1380,7 @@ mod tests {
             response_raw_log: "raw_with_tools".to_string(),
             feedback_kind: FeedbackKind::TestFailure,
         };
-        let (event, payload) = build_log_payload(&outcome, "sess", Some("qwen-0.5b"));
+        let (event, payload) = build_log_payload(&outcome, "sess", Some("qwen-0.5b"), 0, None);
         assert_eq!(event, "agent.reminder.failed");
         let obj = payload.as_object().expect("object");
         assert_eq!(
@@ -1277,7 +1399,7 @@ mod tests {
             skip_reason: SkipReason::SidecarUnavailable,
             feedback_kind: None,
         };
-        let (event, payload) = build_log_payload(&outcome, "sess", None);
+        let (event, payload) = build_log_payload(&outcome, "sess", None, 0, None);
         assert_eq!(event, "agent.reminder.skipped");
         let obj = payload.as_object().expect("object");
         assert_eq!(
@@ -1462,7 +1584,7 @@ mod tests {
             other => panic!("expected Failed, got {other:?}"),
         }
         assert!(wm.active_precautions.is_empty());
-        let (_event, payload) = build_log_payload(&outcome, "sess", Some("model"));
+        let (_event, payload) = build_log_payload(&outcome, "sess", Some("model"), 0, None);
         assert_eq!(
             payload.get("feedback_kind").and_then(|v| v.as_str()),
             Some("no_tool_call")
@@ -1510,6 +1632,8 @@ mod tests {
                     name: "shell".to_string(),
                     arguments: serde_json::json!({}),
                 }],
+                prompt_tokens: None,
+                completion_tokens: None,
             })
         });
         match &outcome {
@@ -1536,7 +1660,7 @@ mod tests {
         let outcome = run_reminder_with_strategy(inputs_for(&frame), &mut wm, &workspace(), |_| {
             Err("connection refused".to_string())
         });
-        let (event, payload) = build_log_payload(&outcome, "sess", Some("model"));
+        let (event, payload) = build_log_payload(&outcome, "sess", Some("model"), 0, None);
         assert_eq!(event, "agent.reminder.failed");
         let failure_reason = payload
             .get("failure_reason")
@@ -1638,6 +1762,7 @@ mod tests {
             frame: &frame,
             working_memory_touched: &[],
             anvil_score: Some(AnvilScoreSnapshot::PreviousTurn(&score)),
+            active_precautions_at_call_time: &[],
         };
         let prompt = build_reminder_prompt(&inputs);
         assert!(
@@ -1662,6 +1787,7 @@ mod tests {
             frame: &frame,
             working_memory_touched: &[],
             anvil_score: Some(AnvilScoreSnapshot::CurrentTurn(&score)),
+            active_precautions_at_call_time: &[],
         };
         let prompt = build_reminder_prompt(&inputs);
         assert!(prompt.contains("[Current AnvilScore]"));
@@ -1679,6 +1805,7 @@ mod tests {
             frame: &frame,
             working_memory_touched: &[],
             anvil_score: None,
+            active_precautions_at_call_time: &[],
         };
         let prompt = build_reminder_prompt(&inputs);
         assert!(!prompt.contains("AnvilScore"));
@@ -1701,6 +1828,7 @@ mod tests {
             frame: &frame,
             working_memory_touched: &[],
             anvil_score: Some(AnvilScoreSnapshot::CurrentTurn(&score)),
+            active_precautions_at_call_time: &[],
         };
         let prompt = build_reminder_prompt(&inputs);
         assert!(

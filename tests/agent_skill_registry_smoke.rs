@@ -470,6 +470,7 @@ fn reminder_skill_completes_with_dummy_failure_outcome() {
         frame: &frame,
         working_memory_touched: &[],
         anvil_score: None,
+        active_precautions_at_call_time: &[],
     };
     let result = registry.invoke(SkillInvocationRequest {
         skill_name: "reminder",

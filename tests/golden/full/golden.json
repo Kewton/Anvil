@@ -1,7 +1,9 @@
 {
+  "anvil_score": null,
   "compact_events": 2,
   "elapsed_s": 120,
   "error_500_count": 1,
+  "failure_kind": null,
   "files_modified": ["src/app/page.tsx", "src/lib/game.ts"],
   "iter_count": 2,
   "keywords_version": 1,
@@ -10,6 +12,9 @@
   "rc": 0,
   "run_id": "test-session-id",
   "schema_version": 1,
+  "token_completion": null,
+  "token_prompt": null,
+  "tool_call_total": 4,
   "tool_calls": {"Bash": 1, "Edit": 1, "Read": 1, "Write": 1},
   "we_total": 2,
   "xml_parser_errors": null

@@ -72,6 +72,12 @@ pub(super) struct LoopStats {
     pub duration_secs: u64,
     pub changed_files: Vec<String>,
     pub total_changed: usize,
+    /// Issue #471: classification counts from `build_stats`. NOT derived from
+    /// `changed_files` (which is truncated to 16) — these come from the full
+    /// `RepoVerification` accumulator (DR3-001).
+    pub changed_impl_count: usize,
+    pub changed_test_count: usize,
+    pub changed_setup_count: usize,
 }
 
 /// Ok((prose, stats)) on success; Err((reason, error_text, stats)) on failure.
@@ -137,6 +143,9 @@ mod tests {
             duration_secs,
             changed_files: files.into_iter().map(str::to_string).collect(),
             total_changed,
+            changed_impl_count: 0,
+            changed_test_count: 0,
+            changed_setup_count: 0,
         }
     }
 

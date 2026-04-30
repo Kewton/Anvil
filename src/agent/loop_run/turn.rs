@@ -837,6 +837,8 @@ fn deterministic_nextjs_scaffold_reply() -> AssistantReply {
                 "command": command
             }),
         }],
+        prompt_tokens: None,
+        completion_tokens: None,
     }
 }
 
@@ -1315,6 +1317,9 @@ fn build_stats(
         duration_secs,
         changed_files,
         total_changed,
+        changed_impl_count: impl_changed,
+        changed_test_count: test_changed,
+        changed_setup_count: setup_changed,
     }
 }
 
@@ -1347,6 +1352,11 @@ impl Agent {
         // sees `CurrentTurn` while the iteration-internal hook sees
         // `PreviousTurn`.
         self.anvil_score_computed_this_turn = false;
+        // Issue #473: increment monotonic per-session turn counter so the
+        // dataset export can join `agent.reminder.completed` with
+        // `agent.anvil_score.computed` events by `(session_id, turn_index)`.
+        // Saturating add defends against pathological session lengths.
+        self.current_turn_index = self.current_turn_index.saturating_add(1);
         self.run_turn(input, stream_output, &mut monitor)
     }
 
@@ -1612,6 +1622,13 @@ impl Agent {
                         "selected_reasons": selected_reasons,
                     }),
                 );
+                // Issue #471 / DR2-005: build CaseRetrievalSummary before
+                // format_for_prompt consumes `selected`.
+                self.last_case_retrieval_summary =
+                    Some(crate::session::eval_log::CaseRetrievalSummary {
+                        selected: selected.len(),
+                        scores: selected.iter().map(|s| s.breakdown.clone()).collect(),
+                    });
                 case_retrieval::format_for_prompt(&selected).map(ConversationMessage::system)
             }
             Ok(RetrievalOutcome::Skipped {
@@ -1940,8 +1957,16 @@ impl Agent {
                 skip_reason,
                 feedback_kind: Some(kind),
             };
-            let (event, payload) =
-                build_reminder_log_payload(&outcome, &session_id, model.as_deref());
+            // Issue #473: Skipped payload has no inputs context (we never built
+            // a prompt) — pass `inputs: None` so feedback_excerpt /
+            // task_at_call_time render as null and the schema stays well-formed.
+            let (event, payload) = build_reminder_log_payload(
+                &outcome,
+                &session_id,
+                model.as_deref(),
+                self.current_turn_index,
+                None,
+            );
             log_llm_event(event, payload);
             return;
         }
@@ -1969,8 +1994,15 @@ impl Agent {
                     response_raw_log: String::new(),
                     feedback_kind: kind,
                 };
-                let (event, payload) =
-                    build_reminder_log_payload(&outcome, &session_id, model.as_deref());
+                // Issue #473: clone_with_overrides failed before we had a
+                // chance to build the prompt context — pass `inputs: None`.
+                let (event, payload) = build_reminder_log_payload(
+                    &outcome,
+                    &session_id,
+                    model.as_deref(),
+                    self.current_turn_index,
+                    None,
+                );
                 log_llm_event(event, payload);
                 return;
             }
@@ -1993,6 +2025,19 @@ impl Agent {
             .clone()
             .unwrap_or_default();
         let workspace_root = self.work_root.clone();
+        // Issue #473: collect canonical Active precaution texts at call time
+        // for the dataset export pipeline (`agent.reminder.completed` payload).
+        // Filtering by `status == Active` mirrors the prompt-side filter; the
+        // text is already mask_secrets-applied and truncated by
+        // `WorkingMemory::add_precaution`, so we forward it as-is.
+        let active_precautions_at_call_time: Vec<String> = self
+            .session
+            .working_memory
+            .active_precautions
+            .iter()
+            .filter(|p| p.status == crate::session::precaution::PrecautionStatus::Active)
+            .map(|p| p.text.clone())
+            .collect();
 
         // Issue #456 / DR1-006: pick the right snapshot variant based on
         // whether AnvilScore has already been computed for this turn. The
@@ -2014,6 +2059,7 @@ impl Agent {
             frame: &frame,
             working_memory_touched: &touched_files,
             anvil_score,
+            active_precautions_at_call_time: &active_precautions_at_call_time,
         };
 
         let outcome = reminder::run_reminder_with_strategy(
@@ -2031,7 +2077,30 @@ impl Agent {
         // Per-turn cap consumed only when we actually attempted the call
         // (Completed / Failed). Skipped never reaches this branch.
         self.reminder_called_this_turn = true;
-        let (event, payload) = build_reminder_log_payload(&outcome, &session_id, model.as_deref());
+        // Issue #473: rebuild a fresh `ReminderInputs` view for log payload
+        // construction. `run_reminder_with_strategy` consumed the original
+        // `inputs` by move; the underlying borrowed data (user_task, frame,
+        // active_precautions_at_call_time, …) still lives on this stack
+        // frame so we can rebuild a borrow-only view cheaply. This is the
+        // SSOT input for `task_at_call_time` / `precautions_at_call_time` /
+        // `feedback_excerpt` in the log payload.
+        let log_inputs = ReminderInputs {
+            user_task: &user_task,
+            mode_label,
+            plan_summary: None,
+            active_precautions_summary: &active_precautions_summary,
+            frame: &frame,
+            working_memory_touched: &touched_files,
+            anvil_score,
+            active_precautions_at_call_time: &active_precautions_at_call_time,
+        };
+        let (event, payload) = build_reminder_log_payload(
+            &outcome,
+            &session_id,
+            model.as_deref(),
+            self.current_turn_index,
+            Some(&log_inputs),
+        );
         log_llm_event(event, payload);
     }
 
@@ -2097,6 +2166,8 @@ impl Agent {
         self.session.case_record_extracted_this_turn = false;
         // Issue #463: reset the per-turn case_retrieval cap.
         self.session.case_retrieval_invoked_this_turn = false;
+        // Issue #471: reset the per-turn eval log case retrieval summary.
+        self.last_case_retrieval_summary = None;
         // Issue #464: reset the per-turn anti-pattern caps.
         self.session.anti_pattern_extracted_this_turn = false;
         self.session.anti_pattern_retrieval_invoked_this_turn = false;
@@ -2120,6 +2191,10 @@ impl Agent {
         let mut error_text = String::new();
         let mut last_iter = 0usize;
         let mut final_prose = String::new();
+        // Issue #471: collect all LLM-requested tool calls BEFORE any
+        // focused-edit truncation so the eval log records the full intent
+        // (DR3-003).
+        let mut tool_call_summaries: Vec<crate::session::eval_log::ToolCallSummary> = Vec::new();
 
         let interrupt_flag = monitor.flag();
 
@@ -2240,6 +2315,30 @@ impl Agent {
                 .into_iter()
                 .map(|tool_call| self.prepare_tool_call(tool_call))
                 .collect::<Vec<_>>();
+
+            // Issue #471 / DR3-003: collect summaries BEFORE focused-edit
+            // truncation so the eval log sees the full LLM intent.
+            for tc in &prepared_tool_calls {
+                use crate::session::eval_log::ToolCallSummary;
+                use crate::session::feedback::mask_secrets;
+                let raw_args = tc.arguments.to_string();
+                let args_summary = {
+                    let masked = mask_secrets(&raw_args);
+                    if masked.len() > crate::session::eval_log::MAX_EVAL_TOOL_ARG_BYTES {
+                        let mut end = crate::session::eval_log::MAX_EVAL_TOOL_ARG_BYTES;
+                        while !masked.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        format!("{}…", &masked[..end])
+                    } else {
+                        masked
+                    }
+                };
+                tool_call_summaries.push(ToolCallSummary {
+                    name: tc.name.clone(),
+                    args_summary,
+                });
+            }
 
             if let Some(target) = self.focused_edit_recovery_target() {
                 let target_already_read = focused_edit_target_already_read(
@@ -3703,7 +3802,7 @@ impl Agent {
         let runtime_state = crate::agent::skills::RuntimeState {
             plan_mode: self.session.mode_state.mode == ExecutionMode::Plan,
             interrupted: false,
-            turn_index: 0,
+            turn_index: self.current_turn_index,
             session: &snapshot_for_state,
             last_anvil_score: self.session.last_anvil_score.as_ref(),
             reminder_sidecar_available: false,
@@ -3749,7 +3848,8 @@ impl Agent {
                     | VerifierOutcome::AutoTestTransportError { score, .. }
                     | VerifierOutcome::TesterDelegated { score }
                     | VerifierOutcome::NoVerifier { score, .. }
-                    | VerifierOutcome::Skipped { score } => score.clone(),
+                    | VerifierOutcome::Skipped { score }
+                    | VerifierOutcome::EnvDisabled { score } => score.clone(),
                 };
                 // [a] AutoTest 分岐時のみ legacy events emit + verify_commands push
                 //     (DR2-004: 空文字列 / DR4-001: sanitize でガード)
@@ -3814,6 +3914,16 @@ impl Agent {
                     exit_reason = ExitReason::TransportError;
                     error_text = error.clone();
                 }
+                // [f] EnvDisabled → agent.autotest.disabled event emit (DR2-004)
+                if matches!(outcome, VerifierOutcome::EnvDisabled { .. }) {
+                    log_llm_event(
+                        "agent.autotest.disabled",
+                        serde_json::json!({
+                            "session_id": &session_id,
+                            "reason": "ANVIL_NO_AUTO_TEST",
+                        }),
+                    );
+                }
                 Some(score)
             }
             // Issue #467 / DR1-002 2 次防御: PermissionDenied は SkillRegistry::invoke 内で
@@ -3833,6 +3943,7 @@ impl Agent {
                 "agent.anvil_score.computed",
                 serde_json::json!({
                     "session_id": &session_id,
+                    "turn_index": self.current_turn_index,
                     "score": &score,
                     "render_chars": render_chars,
                     "compute_ms": compute_ms,
@@ -3854,6 +3965,92 @@ impl Agent {
         // Triggered by the latest eligible failure feedback. Pure upsert; no
         // sidecar / LLM calls.
         self.maybe_extract_anti_pattern();
+
+        // Issue #471: write structured eval log record (turn-level snapshot).
+        {
+            use crate::session::eval_log::{
+                AnvilScoreSummary, ChangedFileClasses, EvalPrecautionSnapshot,
+                FeedbackFrameSummary, build_eval_record, write_eval_record,
+            };
+            use crate::session::precaution::PrecautionStatus;
+            use std::time::{SystemTime, UNIX_EPOCH};
+
+            let ts_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let active_task = self
+                .session
+                .working_memory
+                .active_task
+                .as_deref()
+                .unwrap_or("");
+            let mode_str = format!("{:?}", self.session.mode_state.mode);
+            let tool_protocol = if self.native_tools_enabled {
+                "native"
+            } else {
+                "xml"
+            };
+            let feedback_summary =
+                self.session
+                    .last_feedback
+                    .as_ref()
+                    .map(|ff| FeedbackFrameSummary {
+                        kind: format!("{:?}", ff.kind),
+                        excerpt: {
+                            let raw = format!("{}{}", ff.stdout_excerpt(), ff.stderr_excerpt());
+                            let masked = crate::session::feedback::mask_secrets(&raw);
+                            if masked.len()
+                                > crate::session::eval_log::MAX_EVAL_FEEDBACK_EXCERPT_BYTES
+                            {
+                                let mut end =
+                                    crate::session::eval_log::MAX_EVAL_FEEDBACK_EXCERPT_BYTES;
+                                while !masked.is_char_boundary(end) {
+                                    end -= 1;
+                                }
+                                format!("{}…", &masked[..end])
+                            } else {
+                                masked
+                            }
+                        },
+                    });
+            let precaution_snapshots: Vec<EvalPrecautionSnapshot> = self
+                .session
+                .working_memory
+                .active_precautions
+                .iter()
+                .filter(|p| p.status == PrecautionStatus::Active)
+                .map(EvalPrecautionSnapshot::from)
+                .collect();
+            let anvil_summary = self
+                .session
+                .last_anvil_score
+                .as_ref()
+                .map(AnvilScoreSummary::from);
+            let changed_classes = ChangedFileClasses {
+                test: stats.changed_test_count,
+                impl_files: stats.changed_impl_count,
+                setup: stats.changed_setup_count,
+            };
+            let record = build_eval_record(
+                &session_id,
+                ts_ms,
+                active_task,
+                &model,
+                &mode_str,
+                tool_protocol,
+                &tool_call_summaries,
+                feedback_summary,
+                &precaution_snapshots,
+                anvil_summary,
+                changed_classes,
+                &verify_commands_collected,
+                self.last_case_retrieval_summary.take(),
+                exit_reason.label(),
+            );
+            write_eval_record(&record);
+        }
+
         log_llm_event(
             "agent.milestone.turn_completed",
             serde_json::json!({
@@ -4493,6 +4690,8 @@ impl Agent {
         (edits > 0).then(|| AssistantReply {
             content: "Applied the focused edit; stopping after a malformed follow-up tool call from qwen3.5.".to_string(),
             tool_calls: Vec::new(),
+            prompt_tokens: None,
+            completion_tokens: None,
         })
     }
 
@@ -4538,6 +4737,8 @@ impl Agent {
                 "Applied a deterministic small-edit fallback for qwen3.5 after malformed tool calls in {relative}."
             ),
             tool_calls: Vec::new(),
+            prompt_tokens: None,
+            completion_tokens: None,
         }))
     }
 
@@ -4586,6 +4787,8 @@ impl Agent {
             content: "Plan complete. Reply yes to execute, no to revise, or provide feedback."
                 .to_string(),
             tool_calls: Vec::new(),
+            prompt_tokens: None,
+            completion_tokens: None,
         }))
     }
 
@@ -4606,6 +4809,8 @@ impl Agent {
             content: "Plan complete. Reply yes to execute, no to revise, or provide feedback."
                 .to_string(),
             tool_calls: Vec::new(),
+            prompt_tokens: None,
+            completion_tokens: None,
         }))
     }
 
@@ -5899,6 +6104,8 @@ if __name__ == "__main__":
                 "Implemented the requested playable UI by replacing scaffold placeholder output in {target_path} after the model timed out."
             ),
             tool_calls: Vec::new(),
+            prompt_tokens: None,
+            completion_tokens: None,
         }))
     }
 
@@ -5930,6 +6137,8 @@ if __name__ == "__main__":
                 "Improved the requested playable UI with deterministic visual polish in {target_path} after the model timed out."
             ),
             tool_calls: Vec::new(),
+            prompt_tokens: None,
+            completion_tokens: None,
         }))
     }
 

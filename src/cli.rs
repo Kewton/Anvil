@@ -108,6 +108,24 @@ pub enum SessionsAction {
         #[command(subcommand)]
         action: TmpTestsAction,
     },
+    /// Export fine-tuning training data from session logs (Issue #473).
+    Export {
+        /// Write JSONL output to FILE (default: stdout).
+        #[arg(long, value_name = "FILE")]
+        output: Option<PathBuf>,
+        /// Include only successful turns (build_passed && tests_passed).
+        #[arg(long, conflicts_with = "failed_only")]
+        success_only: bool,
+        /// Include only failed turns.
+        #[arg(long, conflicts_with = "success_only")]
+        failed_only: bool,
+        /// Include sessions from all workspaces (default: current workspace).
+        #[arg(long)]
+        all: bool,
+        /// Export a specific session by id.
+        #[arg(long, value_name = "ID")]
+        session: Option<String>,
+    },
 }
 
 /// `anvil sessions tmp-tests <list|promote|discard>` (Issue #458).

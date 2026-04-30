@@ -17,7 +17,9 @@
 use std::ffi::OsString;
 use std::path::Path;
 
-use super::auto_test::{AutoTestKind, AutoTestPlan, AutoTestResult, AutoTestRunner};
+use super::auto_test::{
+    AutoTestKind, AutoTestPlan, AutoTestResult, AutoTestRunner, auto_test_disabled,
+};
 use crate::agent::orchestration::RepoVerification;
 use crate::session::anvil_score::{
     AnvilScore, AnvilScoreInputs, AnvilTestSummary, compute_anvil_score,
@@ -87,6 +89,8 @@ pub enum VerifierOutcome {
     },
     /// success gate false / verifier 候補無し のいずれも吸収
     Skipped { score: AnvilScore },
+    /// ANVIL_NO_AUTO_TEST が設定されている場合. AnvilScore は計算済み.
+    EnvDisabled { score: AnvilScore },
 }
 
 /// VerifierSkill アダプタ. unit struct (状態を持たない).
@@ -135,6 +139,16 @@ impl AgentSkill for VerifierSkill {
         if !inputs.should_dispatch_success_verifier {
             let score = compute_anvil_score(&inputs.score_inputs, inputs.repo_verification, None);
             return Ok(wrap_skill_output(VerifierOutcome::Skipped { score }));
+        }
+
+        // [1.5] ANVIL_NO_AUTO_TEST gate: success_gate=true かつ env disabled のみここに入る
+        // DR-466-001 不変条件: AnvilScore は必ず compute してから EnvDisabled を返す
+        let score_before_env_check =
+            compute_anvil_score(&inputs.score_inputs, inputs.repo_verification, None);
+        if auto_test_disabled(|k| std::env::var(k)) {
+            return Ok(wrap_skill_output(VerifierOutcome::EnvDisabled {
+                score: score_before_env_check,
+            }));
         }
 
         // [2] gate true → SuccessVerifier 三値で分岐 (DR2-001/007: AutoTestRunner は
@@ -227,6 +241,7 @@ impl AgentSkill for VerifierSkill {
                 VerifierOutcome::TesterDelegated { .. } => "tester",
                 VerifierOutcome::NoVerifier { .. } => "no_verifier",
                 VerifierOutcome::Skipped { .. } => "skip",
+                VerifierOutcome::EnvDisabled { .. } => "env_disabled",
             },
             // DR1-007: 将来 variant 追加で更新漏れがあると debug build で panic、release では
             // 安全 fallback。
