@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-04-30
+
+Epic F: Structured Eval & Dataset Export — turn 単位の評価ログを構造化 JSONL で永続化し、ローカルモデルの A/B 評価ハーネスと fine-tuning 用データセットエクスポートを提供。
+
+### Added
+
+- Structured evaluation log per turn (`src/session/eval_log.rs`, #471)。Act mode の post-loop hook で `EvalRecord` (schema_version / session_id / ts_ms / task / model / mode / tool_protocol / tool_calls / feedback_frame / active_precautions / anvil_score / changed_file_classes / verify_commands / case_retrieval_result / final_outcome) を `state_root/sessions/<id>/logs/eval.jsonl` に 1 record/turn で追記。`OnceLock<Mutex<File>>` の append-only logger + permissions 0o600。セキュリティパイプライン: `to_value → mask_payload_inplace → to_string → scrub_absolute_paths (ANVIL_EVAL_SCRUB_PATHS opt-in) → size check (MAX_EVAL_LOG_RECORD_BYTES=64KiB) → append`。E2E smoke tests 12 件 (`tests/eval_log_smoke.rs` R1-R12、Ollama-free)。
+- Local model A/B evaluation harness (#472)。セッション間でのモデル比較評価を自動化するハーネス。eval.jsonl を入力に、指定モデル対の結果を集計・比較する。
+- Fine-tuning dataset export (`src/session/export.rs`, #473)。`llm-io.jsonl` から `agent.reminder.completed` と `agent.anvil_score.computed` を `(session_id, turn_index)` で join し、fine-tuning 用 training JSONL を出力。`ExportConfig` / `ExportScope` / `ExportFilter` / `ExportOutput` / `ExportResult` 型。`anonymize_paths` (unix only、`OnceLock<Regex>`、work_root prefix→`<workdir>`、home dir→`~/`) → `mask_secrets` 順でスクラブ。`MAX_EXPORT_JSONL_BYTES=64MiB` 超 session は parse 前 skip。`--output FILE` は symlink 拒否 + Unix 0600 新規作成。`run_export_with_io<FR,FW,FS>` closure DI seam で E2E 12 ケースを Ollama 不要で検証 (`tests/dataset_export_smoke.rs`)。
+
+### Changed
+
+- `agent.reminder.completed` payload を 17 key に拡張 (`turn_index` / `task_at_call_time` / `precautions_at_call_time` / `feedback_excerpt` / `added_precautions_text` を追加) — fine-tuning dataset export との join key として `turn_index` を追加 (#473)。
+- `agent.anvil_score.computed` event payload に `turn_index` を追加 (dataset export の join key, #473)。
+
 ## [0.5.0] - 2026-04-30
 
 Epic E: Repo Graph & Domain Context — ローカルリポジトリの import 依存グラフを静的解析で構築し、graph-aware な repo context 選択でコンテキスト精度を向上。path-aware な ANVIL.md 指示ファイルをワークスペースから読み込み可能にした。
