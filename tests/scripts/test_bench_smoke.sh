@@ -92,7 +92,7 @@ if [[ ! -f "$summary" ]]; then
 fi
 
 header=$(head -n 1 "$summary")
-expected_header=$'run\tmodel\trc\telapsed_sec\tworkdir\tsession_copied'
+expected_header=$'run\tmodel\trc\telapsed_sec\tworkdir\tsession_copied\textras_json'
 if [[ "$header" != "$expected_header" ]]; then
   echo "FAIL: summary.tsv header mismatch" >&2
   echo "  got:      $header" >&2

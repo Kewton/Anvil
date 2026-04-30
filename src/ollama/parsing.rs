@@ -11,6 +11,8 @@ use crate::tools::registry::ToolSpec;
 pub struct AssistantReply {
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -29,6 +31,10 @@ struct GenerateResponse {
     response: String,
     #[serde(default)]
     done_reason: String,
+    #[serde(default)]
+    prompt_eval_count: Option<u64>,
+    #[serde(default)]
+    eval_count: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -39,6 +45,10 @@ struct GenerateStreamChunk {
     response: String,
     #[serde(default)]
     done_reason: String,
+    #[serde(default)]
+    prompt_eval_count: Option<u64>,
+    #[serde(default)]
+    eval_count: Option<u64>,
 }
 
 #[derive(Default, Deserialize)]
@@ -55,6 +65,10 @@ struct ChatResponse {
     message: ChatMessage,
     #[serde(default)]
     done_reason: String,
+    #[serde(default)]
+    prompt_eval_count: Option<u64>,
+    #[serde(default)]
+    eval_count: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -65,6 +79,10 @@ struct ChatStreamChunk {
     message: Option<ChatMessage>,
     #[serde(default)]
     done_reason: String,
+    #[serde(default)]
+    prompt_eval_count: Option<u64>,
+    #[serde(default)]
+    eval_count: Option<u64>,
 }
 
 #[derive(Default, Deserialize)]
@@ -95,13 +113,25 @@ pub fn parse_generate_response(
 ) -> Result<AssistantReply, String> {
     let parsed: GenerateResponse = serde_json::from_str(body)
         .map_err(|err| format!("failed to decode Ollama generate response: {err}"))?;
-    finalize_reply(parsed.response, tool_names, &parsed.done_reason)
+    finalize_reply(
+        parsed.response,
+        tool_names,
+        &parsed.done_reason,
+        parsed.prompt_eval_count,
+        parsed.eval_count,
+    )
 }
 
 pub fn parse_chat_response(body: &str, tool_names: &[String]) -> Result<AssistantReply, String> {
     let parsed: ChatResponse = serde_json::from_str(body)
         .map_err(|err| format!("failed to decode Ollama chat response: {err}"))?;
-    finalize_native_reply(parsed.message, tool_names, &parsed.done_reason)
+    finalize_native_reply(
+        parsed.message,
+        tool_names,
+        &parsed.done_reason,
+        parsed.prompt_eval_count,
+        parsed.eval_count,
+    )
 }
 
 pub(crate) fn parse_streaming_generate_response<F>(
@@ -116,6 +146,8 @@ where
     let mut content = String::new();
     let mut raw_chunks = Vec::new();
     let mut done_reason = String::new();
+    let mut prompt_tokens: Option<u64> = None;
+    let mut completion_tokens: Option<u64> = None;
 
     for line in reader.lines() {
         let line = line.map_err(|err| format!("failed to read streaming response: {err}"))?;
@@ -132,6 +164,8 @@ where
         }
         if chunk.done {
             done_reason = chunk.done_reason;
+            prompt_tokens = chunk.prompt_eval_count;
+            completion_tokens = chunk.eval_count;
             break;
         }
     }
@@ -144,7 +178,13 @@ where
         }),
     );
 
-    finalize_reply(content, tool_names, &done_reason)
+    finalize_reply(
+        content,
+        tool_names,
+        &done_reason,
+        prompt_tokens,
+        completion_tokens,
+    )
 }
 
 pub(crate) fn parse_streaming_chat_response<F>(
@@ -160,6 +200,8 @@ where
     let mut tool_calls = Vec::new();
     let mut raw_chunks = Vec::new();
     let mut done_reason = String::new();
+    let mut prompt_tokens: Option<u64> = None;
+    let mut completion_tokens: Option<u64> = None;
 
     for line in reader.lines() {
         let line = line.map_err(|err| format!("failed to read streaming response: {err}"))?;
@@ -179,6 +221,8 @@ where
         }
         if chunk.done {
             done_reason = chunk.done_reason;
+            prompt_tokens = chunk.prompt_eval_count;
+            completion_tokens = chunk.eval_count;
             break;
         }
     }
@@ -198,6 +242,8 @@ where
         },
         tool_names,
         &done_reason,
+        prompt_tokens,
+        completion_tokens,
     )
 }
 
@@ -220,18 +266,24 @@ fn finalize_reply(
     content: String,
     tool_names: &[String],
     done_reason: &str,
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
 ) -> Result<AssistantReply, String> {
     let (tool_calls, cleaned_content) = extract_tool_calls(&content, tool_names);
     detect_malformed_tool_call(&content, &tool_calls, done_reason)?;
     let reply = AssistantReply {
         content: cleaned_content,
         tool_calls,
+        prompt_tokens,
+        completion_tokens,
     };
     logging::log_llm_event(
         "ollama.generate.reply_final",
         json!({
             "content": truncate_for_log(&reply.content, 100_000),
             "tool_calls": reply.tool_calls,
+            "prompt_tokens": reply.prompt_tokens,
+            "completion_tokens": reply.completion_tokens,
         }),
     );
     Ok(reply)
@@ -241,18 +293,24 @@ fn finalize_native_reply(
     message: ChatMessage,
     tool_names: &[String],
     done_reason: &str,
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
 ) -> Result<AssistantReply, String> {
     let tool_calls = parse_native_tool_calls(message.tool_calls, tool_names)?;
     detect_malformed_tool_call(&message.content, &tool_calls, done_reason)?;
     let reply = AssistantReply {
         content: crate::ollama::xml_fallback::strip_think_tags(&message.content),
         tool_calls,
+        prompt_tokens,
+        completion_tokens,
     };
     logging::log_llm_event(
         "ollama.chat.reply_final",
         json!({
             "content": truncate_for_log(&reply.content, 100_000),
             "tool_calls": reply.tool_calls,
+            "prompt_tokens": reply.prompt_tokens,
+            "completion_tokens": reply.completion_tokens,
         }),
     );
     Ok(reply)

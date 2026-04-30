@@ -837,6 +837,8 @@ fn deterministic_nextjs_scaffold_reply() -> AssistantReply {
                 "command": command
             }),
         }],
+        prompt_tokens: None,
+        completion_tokens: None,
     }
 }
 
@@ -3789,7 +3791,8 @@ impl Agent {
                     | VerifierOutcome::AutoTestTransportError { score, .. }
                     | VerifierOutcome::TesterDelegated { score }
                     | VerifierOutcome::NoVerifier { score, .. }
-                    | VerifierOutcome::Skipped { score } => score.clone(),
+                    | VerifierOutcome::Skipped { score }
+                    | VerifierOutcome::EnvDisabled { score } => score.clone(),
                 };
                 // [a] AutoTest 分岐時のみ legacy events emit + verify_commands push
                 //     (DR2-004: 空文字列 / DR4-001: sanitize でガード)
@@ -3853,6 +3856,16 @@ impl Agent {
                 if let VerifierOutcome::AutoTestTransportError { error, .. } = &outcome {
                     exit_reason = ExitReason::TransportError;
                     error_text = error.clone();
+                }
+                // [f] EnvDisabled → agent.autotest.disabled event emit (DR2-004)
+                if matches!(outcome, VerifierOutcome::EnvDisabled { .. }) {
+                    log_llm_event(
+                        "agent.autotest.disabled",
+                        serde_json::json!({
+                            "session_id": &session_id,
+                            "reason": "ANVIL_NO_AUTO_TEST",
+                        }),
+                    );
                 }
                 Some(score)
             }
@@ -4619,6 +4632,8 @@ impl Agent {
         (edits > 0).then(|| AssistantReply {
             content: "Applied the focused edit; stopping after a malformed follow-up tool call from qwen3.5.".to_string(),
             tool_calls: Vec::new(),
+            prompt_tokens: None,
+            completion_tokens: None,
         })
     }
 
@@ -4664,6 +4679,8 @@ impl Agent {
                 "Applied a deterministic small-edit fallback for qwen3.5 after malformed tool calls in {relative}."
             ),
             tool_calls: Vec::new(),
+            prompt_tokens: None,
+            completion_tokens: None,
         }))
     }
 
@@ -4712,6 +4729,8 @@ impl Agent {
             content: "Plan complete. Reply yes to execute, no to revise, or provide feedback."
                 .to_string(),
             tool_calls: Vec::new(),
+            prompt_tokens: None,
+            completion_tokens: None,
         }))
     }
 
@@ -4732,6 +4751,8 @@ impl Agent {
             content: "Plan complete. Reply yes to execute, no to revise, or provide feedback."
                 .to_string(),
             tool_calls: Vec::new(),
+            prompt_tokens: None,
+            completion_tokens: None,
         }))
     }
 
@@ -6025,6 +6046,8 @@ if __name__ == "__main__":
                 "Implemented the requested playable UI by replacing scaffold placeholder output in {target_path} after the model timed out."
             ),
             tool_calls: Vec::new(),
+            prompt_tokens: None,
+            completion_tokens: None,
         }))
     }
 
@@ -6056,6 +6079,8 @@ if __name__ == "__main__":
                 "Improved the requested playable UI with deterministic visual polish in {target_path} after the model timed out."
             ),
             tool_calls: Vec::new(),
+            prompt_tokens: None,
+            completion_tokens: None,
         }))
     }
 

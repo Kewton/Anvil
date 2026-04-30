@@ -78,6 +78,10 @@ pub use tester::{
     run_tester_with_strategy, tester_disabled,
 };
 
+// Issue #472: expose env-gate helper so `tests/eval_harness_smoke.rs` can
+// drive the closure-DI boundary (ANVIL_NO_AUTO_TEST) without live Ollama.
+pub use auto_test::auto_test_disabled;
+
 const DEFAULT_KEEP_TAIL: usize = 24;
 const LATE_TURN_KEEP_TAIL: usize = 12;
 

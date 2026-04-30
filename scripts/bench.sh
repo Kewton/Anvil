@@ -31,6 +31,9 @@ Usage: scripts/bench.sh <benchmark-name> [options]
   --model <name>    使用モデル
   --models <list>   カンマ区切りで複数モデル（matrix 実行、逐次）
   --runs <n>        実行回数（デフォルト: 5）
+  --no-precautions  Reminder Sidecar を無効化（ANVIL_NO_REMINDER=1）
+  --no-case-memory  Case memory を無効化（ANVIL_NO_CASE_RETRIEVAL=1 ANVIL_NO_CASE_RECORD=1）
+  --no-auto-test    Auto test を無効化（ANVIL_NO_AUTO_TEST=1）
   --dry-run         anvil 呼び出しを echo で代替
   --bench-no-debug  anvil に --trace を付けない（BENCH_DEBUG=0 と同義）
   --help            この用例を表示して終了
@@ -38,6 +41,7 @@ Usage: scripts/bench.sh <benchmark-name> [options]
 Examples:
   scripts/bench.sh heavy-space-invaders --model qwen3.5:122b --runs 5
   scripts/bench.sh heavy-space-invaders --models '35b-a3b,122b' --runs 5
+  scripts/bench.sh heavy-space-invaders --model qwen3.5:122b --no-precautions --no-auto-test
 EOF
 }
 
@@ -47,6 +51,9 @@ model_arg=""
 models_arg=""
 runs=5
 DRY_RUN=0
+no_precautions=0
+no_case_memory=0
+no_auto_test=0
 # BENCH_DEBUG toggles `--trace` on the anvil invocation. Allowed values: "0" or "1".
 BENCH_DEBUG="${BENCH_DEBUG:-1}"
 case "$BENCH_DEBUG" in
@@ -82,6 +89,18 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || { echo "Error: --runs requires a value" >&2; exit 1; }
       runs="$2"
       shift 2
+      ;;
+    --no-precautions)
+      no_precautions=1
+      shift
+      ;;
+    --no-case-memory)
+      no_case_memory=1
+      shift
+      ;;
+    --no-auto-test)
+      no_auto_test=1
+      shift
       ;;
     --dry-run)
       DRY_RUN=1
@@ -213,7 +232,7 @@ if ! { [[ -z "$chat_retries" ]] || [[ "$chat_retries" =~ ^[0-9]+$ ]]; }; then
 fi
 
 # -------- summary.tsv header --------
-printf 'run\tmodel\trc\telapsed_sec\tworkdir\tsession_copied\n' > "$BENCH_ROOT/summary.tsv"
+printf 'run\tmodel\trc\telapsed_sec\tworkdir\tsession_copied\textras_json\n' > "$BENCH_ROOT/summary.tsv"
 
 # -------- validate_model --------
 validate_model() {
@@ -408,8 +427,8 @@ RUN_LOGGED=0
 META_WRITTEN=0
 on_interrupt() {
   if [[ "$RUN_LOGGED" -eq 0 && -n "$CURRENT_RUN" ]]; then
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "$CURRENT_RUN" "${CURRENT_MODEL:-unknown}" "130" "N/A" "N/A" "0" \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$CURRENT_RUN" "${CURRENT_MODEL:-unknown}" "130" "N/A" "N/A" "0" "null" \
       >> "$BENCH_ROOT/summary.tsv"
   fi
   if [[ "$META_WRITTEN" -eq 0 && -n "$CURRENT_RUN_DIR" ]]; then
@@ -459,13 +478,31 @@ for model in "${cleaned_models[@]}"; do
     mkdir -p "$WORKDIR" "$STATE_DIR" "$RUN_DIR/logs"
     cd "$WORKDIR" || { echo "Error: cd $WORKDIR failed" >&2; exit 1; }
 
+    # -------- caller env isolation --------
+    # Unset ANVIL_NO_* from caller env to prevent baseline cell contamination.
+    unset ANVIL_NO_REMINDER ANVIL_NO_CASE_RETRIEVAL ANVIL_NO_CASE_RECORD \
+          ANVIL_NO_AUTO_TEST ANVIL_NO_TESTER ANVIL_NO_REPO_GRAPH \
+          ANVIL_CASE_RECORD_DRY_RUN ANVIL_CASE_RETRIEVAL_DRY_RUN
+
+    # Build env_kv array from feature flags (bash array, no eval)
+    declare -a env_kv=()
+    if [[ "$no_precautions" -eq 1 ]]; then
+      env_kv+=("ANVIL_NO_REMINDER=1")
+    fi
+    if [[ "$no_case_memory" -eq 1 ]]; then
+      env_kv+=("ANVIL_NO_CASE_RETRIEVAL=1" "ANVIL_NO_CASE_RECORD=1")
+    fi
+    if [[ "$no_auto_test" -eq 1 ]]; then
+      env_kv+=("ANVIL_NO_AUTO_TEST=1")
+    fi
+
     start=$SECONDS
     if [[ "$DRY_RUN" -eq 1 ]]; then
       echo "(dry-run) anvil --oneshot --prompt ... --state-dir $STATE_DIR --model $model" \
         > ../stdout.log
       rc=0
     else
-      anvil_args=(--oneshot --prompt "$prompt" --state-dir "$STATE_DIR" --model "$model")
+      anvil_args=(--oneshot --offline --prompt "$prompt" --state-dir "$STATE_DIR" --model "$model")
       if [[ -n "$max_iterations" ]]; then
         anvil_args+=(--max-iterations "$max_iterations")
       fi
@@ -478,8 +515,17 @@ for model in "${cleaned_models[@]}"; do
       if [[ "$BENCH_DEBUG" -eq 1 ]]; then
         anvil_args+=(--trace)
       fi
-      # set -e is not enabled; capture rc directly
-      "$ANVIL_BIN" "${anvil_args[@]}" > ../stdout.log 2>&1
+      # Launch anvil with:
+      #   - env_kv feature flags (ANVIL_NO_* vars)
+      #   - stripped parent credentials (security: DR4-002)
+      #   - allowlisted env vars only
+      env -i \
+        HOME="$HOME" \
+        PATH="$PATH" \
+        TERM="${TERM:-xterm}" \
+        TMPDIR="${TMPDIR:-/tmp}" \
+        "${env_kv[@]+"${env_kv[@]}"}" \
+        "$ANVIL_BIN" "${anvil_args[@]}" > ../stdout.log 2>&1
       rc=$?
     fi
     elapsed=$(( SECONDS - start ))
@@ -528,9 +574,30 @@ for model in "${cleaned_models[@]}"; do
       echo "warning: meta.json write failed" >&2
     fi
 
+    # -------- analyze_run.py per-cell invocation (DR2-002, DR4-001) --------
+    # Absolute path + symlink check (DR4-001: prevent hijack from benchmark workdir)
+    ANALYZE_RUN="$REPO_ROOT/scripts/analyze_run.py"
+    extras_json="null"
+    if [[ -f "$ANALYZE_RUN" && ! -L "$ANALYZE_RUN" ]] && command -v python3 &>/dev/null; then
+      # python3 -I: isolated mode (no PYTHONPATH/sitecustomize from environment)
+      raw_json=$(python3 -I "$ANALYZE_RUN" "$RUN_DIR" 2>/dev/null || echo "null")
+      # jq -c: compact JSON + validate + whitelist fields (DR4-003: TSV/Markdown injection)
+      if command -v jq &>/dev/null; then
+        extras_json=$(printf '%s' "$raw_json" | jq -c '{
+          anvil_score: .anvil_score,
+          tool_call_count: .tool_call_total,
+          failure_kind: .failure_kind,
+          token_prompt: .token_prompt,
+          token_completion: .token_completion
+        }' 2>/dev/null || echo "null")
+      else
+        extras_json="null"
+      fi
+    fi
+
     workdir_rel="$model_slug/run-$run/workdir"
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "$run" "$model" "$rc" "$elapsed" "$workdir_rel" "$session_copied" \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$run" "$model" "$rc" "$elapsed" "$workdir_rel" "$session_copied" "$extras_json" \
       >> "$BENCH_ROOT/summary.tsv"
     RUN_LOGGED=1
 
