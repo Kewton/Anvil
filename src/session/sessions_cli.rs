@@ -15,6 +15,9 @@ use crate::cli::{SessionsAction, TmpTestsAction};
 use crate::modes::plan_act::ExecutionMode;
 use crate::session::compact::is_compact_summary;
 use crate::session::discovery::{SessionDirEntry, iter_session_dirs};
+use crate::session::export::{
+    ExportConfig, ExportFilter, ExportOutput, ExportScope, MAX_EXPORT_JSONL_BYTES, run_export,
+};
 use crate::session::store::{ConversationMessage, SessionSnapshot};
 use crate::session::tmp_tests;
 
@@ -447,6 +450,44 @@ pub fn dispatch(
                 run_tmp_tests_list(state_root, current_ws, &session)
             }
         },
+        SessionsAction::Export {
+            output,
+            success_only,
+            failed_only,
+            all,
+            session,
+        } => {
+            let filter = if success_only {
+                ExportFilter::SuccessOnly
+            } else if failed_only {
+                ExportFilter::FailedOnly
+            } else {
+                ExportFilter::All
+            };
+            let scope = if let Some(ref id) = session {
+                validate_session_id_format(id)?;
+                validate_session_dir(state_root, id)?;
+                ExportScope::Session(id.clone())
+            } else if all {
+                ExportScope::AllWorkspaces
+            } else {
+                ExportScope::CurrentWorkspace
+            };
+            let export_output = match output {
+                Some(path) => ExportOutput::File(path),
+                None => ExportOutput::Stdout,
+            };
+            let config = ExportConfig {
+                state_root,
+                workspace_root,
+                current_ws,
+                scope,
+                filter,
+                output: export_output,
+                max_bytes: MAX_EXPORT_JSONL_BYTES,
+            };
+            run_export(&config).map(|_| ())
+        }
     }
 }
 
