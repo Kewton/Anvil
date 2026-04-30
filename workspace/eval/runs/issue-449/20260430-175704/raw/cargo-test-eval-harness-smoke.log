@@ -1,0 +1,15 @@
+    Blocking waiting for file lock on artifact directory
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s
+     Running tests/eval_harness_smoke.rs (target/debug/deps/eval_harness_smoke-0b524cf7dcdf1499)
+
+running 7 tests
+test auto_test_disabled_gate_empty_value ... ok
+test auto_test_disabled_gate_unset ... ok
+test auto_test_disabled_gate_set ... ok
+test parse_chat_response_emits_token_usage ... ok
+test parse_chat_response_token_usage_absent ... ok
+test parse_generate_response_emits_token_usage ... ok
+test parse_generate_response_token_usage_absent ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+

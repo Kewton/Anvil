@@ -108,3 +108,25 @@ Known gap:
 - Python test policy is over-strict when an existing test file already exists; it required a new test artifact after a correct source fix.
 - qwen3.5 still struggles with absolute-path Bash and focused edit recovery on Rust tasks.
 - `changed_files` telemetry still includes `.anvil-state` and generated fixture artifacts.
+
+## 20260430-175704 / Issue 449
+
+Commit: `be1fae4534a3ac162f8f8de2dd72993a51a2d05a`
+
+Judgement: `Mixed Positive / Observability Foundation Works, Export Redaction Needs Fix`
+
+Highlights:
+
+- Static verification passed: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`.
+- Epic F focused tests passed: `eval_log_smoke` 12/12, `eval_harness_smoke` 7/7, `dataset_export_smoke` 12/12, `test_compare_security.py` 9/9.
+- A live qwen3.6 turn wrote `logs/eval.jsonl` with `schema_version`, `tool_calls`, full 12-field `AnvilScore`, `changed_file_classes`, `final_outcome`, and `model`.
+- `ANVIL_EVAL_SCRUB_PATHS=1` replaced absolute paths in eval-log tool arguments with `<path>`.
+- `bench.sh` accepted a two-model dry-run matrix and feature gates, then generated `summary.tsv` and `matrix-report.md`.
+- `anvil sessions export` produced valid JSONL; `--success-only`, `--failed-only`, and mutual exclusion behavior worked.
+
+Known gap:
+
+- Dataset export redaction is incomplete in practical use. `TOKEN=...` in the task was masked, but a raw `ghp_...`-looking token remained in `input.feedback_excerpt`.
+- Documentation-only README edits still score `user_visible_artifact=false`.
+- The A/B harness was checked with dry-run only; a full live two-model benchmark was not run.
+- GitHub issue state is inconsistent at evaluation time: #449 and child issues #471/#472/#473 are still open despite implementation commits being merged.

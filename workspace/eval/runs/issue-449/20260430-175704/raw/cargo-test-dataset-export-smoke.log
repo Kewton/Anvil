@@ -1,0 +1,19 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.08s
+     Running tests/dataset_export_smoke.rs (target/debug/deps/dataset_export_smoke-c487762bb7e14a77)
+
+running 12 tests
+test c11_oversize_session_skipped ... ok
+test c10_missing_required_field_skipped ... ok
+test c12_output_file_symlink_rejected ... ok
+test c3_reminder_only_no_score_not_exported ... ok
+test c5_no_output_flag_jsonl_to_writer_summary_to_summary_writer ... ok
+test c1_success_trace_included_in_success_only ... ok
+test c7_secret_scrubbed ... ok
+test c9_payload_shape_and_join_key_correct ... ok
+test c4_corrupt_line_skipped_and_counted ... ok
+test c2_failed_trace_included_in_failed_only ... ok
+test c8_absolute_path_anonymized ... ok
+test c6_jsonl_writer_and_summary_writer_separate ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+

@@ -1,0 +1,18 @@
+Usage: scripts/bench.sh <benchmark-name> [options]
+  benchmark-name    benchmarks/ 配下の yaml ファイル名（拡張子なし）
+                    例: heavy-space-invaders
+                    ※ first-write: planned for future, not yet supported
+  --model <name>    使用モデル
+  --models <list>   カンマ区切りで複数モデル（matrix 実行、逐次）
+  --runs <n>        実行回数（デフォルト: 5）
+  --no-precautions  Reminder Sidecar を無効化（ANVIL_NO_REMINDER=1）
+  --no-case-memory  Case memory を無効化（ANVIL_NO_CASE_RETRIEVAL=1 ANVIL_NO_CASE_RECORD=1）
+  --no-auto-test    Auto test を無効化（ANVIL_NO_AUTO_TEST=1）
+  --dry-run         anvil 呼び出しを echo で代替
+  --bench-no-debug  anvil に --trace を付けない（BENCH_DEBUG=0 と同義）
+  --help            この用例を表示して終了
+
+Examples:
+  scripts/bench.sh heavy-space-invaders --model qwen3.5:122b --runs 5
+  scripts/bench.sh heavy-space-invaders --models '35b-a3b,122b' --runs 5
+  scripts/bench.sh heavy-space-invaders --model qwen3.5:122b --no-precautions --no-auto-test
