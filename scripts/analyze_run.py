@@ -54,6 +54,9 @@ GAME_KEYWORDS_V1 = [
 COMPACT_SUMMARY_PREFIX = "[compact-summary]"
 LLM_IO_ERROR_EVENT = "ollama.generate.error"
 LLM_IO_ERROR_KIND = "status"
+LLM_IO_REPLY_EVENTS: frozenset[str] = frozenset(
+    {"ollama.generate.reply_final", "ollama.chat.reply_final"}
+)
 
 # size limits (bytes)
 MAX_SESSION_JSON = 10 * 1024 * 1024  # 10 MiB
@@ -374,6 +377,97 @@ def _read_error_500_count(run_dir: Path) -> int | None:
 
 
 # ---------------------------------------------------------------------------
+# session.json — anvil_score / failure_kind
+# ---------------------------------------------------------------------------
+
+
+def _read_anvil_score(session_data: dict) -> dict | None:
+    """Return last_anvil_score dict, or None if absent or not a dict (lossy recovery)."""
+    raw = session_data.get("last_anvil_score")
+    if not isinstance(raw, dict):
+        return None
+    return raw
+
+
+def _read_failure_kind(session_data: dict) -> str | None:
+    """Return last_feedback.kind string (snake_case serialised by Rust), or None."""
+    last_feedback = session_data.get("last_feedback")
+    if not isinstance(last_feedback, dict):
+        return None
+    kind = last_feedback.get("kind")
+    if not isinstance(kind, str) or not kind:
+        return None
+    return kind
+
+
+# ---------------------------------------------------------------------------
+# llm-io.jsonl — token usage
+# ---------------------------------------------------------------------------
+
+
+def _read_token_usage(run_dir: Path) -> tuple[int | None, int | None]:
+    """Return (prompt_tokens_total, completion_tokens_total) from llm-io.jsonl.
+
+    Accumulates across all ollama.generate.reply_final / ollama.chat.reply_final
+    events. Returns (None, None) when the log is absent, unreadable, or contains
+    no token fields.
+    """
+    logs_dir = run_dir / "logs"
+    candidate = logs_dir / "llm-io.jsonl"
+    try:
+        if logs_dir.is_symlink():
+            return None, None
+    except OSError:
+        return None, None
+    if not logs_dir.exists():
+        return None, None
+    safe = _safe_regular_file_in(candidate, run_dir, MAX_LLM_IO_JSONL)
+    if safe is None:
+        if candidate.exists() and not candidate.is_symlink():
+            _warn(f"llm-io.jsonl unusable for token usage: {candidate}")
+        return None, None
+
+    prompt_total: int | None = None
+    completion_total: int | None = None
+    try:
+        with safe.open("rb") as fh:
+            while True:
+                raw_line = fh.readline(MAX_LLM_IO_LINE + 1)
+                if not raw_line:
+                    break
+                if len(raw_line) > MAX_LLM_IO_LINE:
+                    _warn("llm-io.jsonl: oversized line, skipping remainder (token usage)")
+                    return None, None
+                try:
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                except Exception:
+                    continue
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                if rec.get("event") not in LLM_IO_REPLY_EVENTS:
+                    continue
+                payload = rec.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+                p_tok = payload.get("prompt_tokens")
+                c_tok = payload.get("completion_tokens")
+                if isinstance(p_tok, int) and not isinstance(p_tok, bool) and p_tok >= 0:
+                    prompt_total = (prompt_total or 0) + p_tok
+                if isinstance(c_tok, int) and not isinstance(c_tok, bool) and c_tok >= 0:
+                    completion_total = (completion_total or 0) + c_tok
+    except OSError as e:
+        _warn(f"llm-io.jsonl read error (token usage): {e}")
+        return None, None
+    return prompt_total, completion_total
+
+
+# ---------------------------------------------------------------------------
 # page.tsx
 # ---------------------------------------------------------------------------
 
@@ -524,14 +618,21 @@ def main(argv: list[str]) -> int:
     rc, elapsed_s = _read_meta(run_dir)
     error_500_count = _read_error_500_count(run_dir)
     page_tsx_has_keywords = _read_page_tsx_keywords(run_dir, workdir)
+    anvil_score = _read_anvil_score(session)
+    failure_kind = _read_failure_kind(session)
+    token_prompt, token_completion = _read_token_usage(run_dir)
 
     files_modified = session_metrics["files_modified"]
     page_tsx_touched = "src/app/page.tsx" in files_modified
+    tool_calls = session_metrics["tool_calls"]
+    tool_call_total = sum(tool_calls.values())
 
     out: dict[str, Any] = {
+        "anvil_score": anvil_score,
         "compact_events": session_metrics["compact_events"],
         "elapsed_s": elapsed_s,
         "error_500_count": error_500_count,
+        "failure_kind": failure_kind,
         "files_modified": files_modified,
         "iter_count": session_metrics["iter_count"],
         "keywords_version": KEYWORDS_VERSION,
@@ -540,7 +641,10 @@ def main(argv: list[str]) -> int:
         "rc": rc,
         "run_id": session_metrics["run_id"],
         "schema_version": SCHEMA_VERSION,
-        "tool_calls": session_metrics["tool_calls"],
+        "token_completion": token_completion,
+        "token_prompt": token_prompt,
+        "tool_call_total": tool_call_total,
+        "tool_calls": tool_calls,
         "we_total": session_metrics["we_total"],
         "xml_parser_errors": None,
     }

@@ -621,6 +621,8 @@ mod tests {
         AssistantReply {
             content: content.to_string(),
             tool_calls: Vec::new(),
+            prompt_tokens: None,
+            completion_tokens: None,
         }
     }
 
@@ -1089,6 +1091,8 @@ mod tests {
                     name: "shell".to_string(),
                     arguments: serde_json::json!({}),
                 }],
+                prompt_tokens: None,
+                completion_tokens: None,
             })
         });
         match outcome {
@@ -1510,6 +1514,8 @@ mod tests {
                     name: "shell".to_string(),
                     arguments: serde_json::json!({}),
                 }],
+                prompt_tokens: None,
+                completion_tokens: None,
             })
         });
         match &outcome {
