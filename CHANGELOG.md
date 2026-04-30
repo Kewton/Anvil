@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-04-30
+
+Epic E: Repo Graph & Domain Context — ローカルリポジトリの import 依存グラフを静的解析で構築し、graph-aware な repo context 選択でコンテキスト精度を向上。path-aware な ANVIL.md 指示ファイルをワークスペースから読み込み可能にした。
+
+### Added
+
+- `RepoGraph` v1 独立 layer (`src/repo_graph/*`) (#468)。`mod.rs` 公開境界 + builder / `parse.rs` 言語別 regex parser / `pair.rs` `likely_covers` ペアリング / `persist.rs` JSON I/O + LRU / `fingerprint.rs` git rev + path hash の 5 ファイル構成。`agent` / `session` のいずれにも依存せず `util::file_classify` / `util::git_hardened` のみを参照。public 4 型 (`RepoGraph` / `BuildOutcome` / `BuildOptions` / `RepoGraphError`) + ImportRef/ImportKind。const SSOT 5 種 (`MAX_REPO_GRAPH_FILES=50_000` / `_DEPTH=32` / `_FILE_BYTES=1MiB` / `_TOTAL_BYTES=16MiB` / `_FILES_PERSISTED=8`)。永続化先 `state_root/repo_graph/<fingerprint_id>.json`。`Agent::new` 直後に同期 1 回 build、env gate `ANVIL_NO_REPO_GRAPH`。
+- Graph-aware repo context ranking (#469)。`src/agent/prompting.rs` に `WEIGHT_*` (file_name=8 / path_token=5 / path_contains=3 / content_token=2 / content_contains=1 / symbol=4 / test_impl_pair=7 / suspected_file=10 / changed_file=4 / graph_neighbor=6) と `BONUS_PATH_CONTENT_COHERENCE=3` の 11 要素を SSOT 集約。`RepoContextInputs<'a>` 入力束ね型で signature を 3 引数化。`rank_repo_candidates` は `score_lexical` / `score_graph` 純関数 + graph 第二パス (`build_neighbor_index` + `resolve_import_target_to_file`) の 3 段で score 計算。`ANVIL_NO_GRAPH_RANKING` env gate で graph 由来 score を 0 に。
+- Path-aware ANVIL.md instructions (#470)。ワークスペースルートの `ANVIL.md` をリポジトリ固有の指示ファイルとして読み込み、システムプロンプトに注入する仕組みを追加。
+- `util/git_hardened.rs` (#468)。`pub(crate) fn run_git(work_root, args) -> Option<String>` の単一情報源。`case_record` の private `run_git` を物理移設し、`session::case_record` と `repo_graph::fingerprint` の双方が共有する。`-c core.sshCommand= -c credential.helper= -c core.pager=cat -c core.hooksPath=/dev/null -c gpg.program=/dev/null` + `GIT_*` env scrub + 1s timeout の hardening を集約。
+- AGENTS.md、workspace 成果物 (UAT records / eval runs / agent skills / v0.1.1 docs) を追加 (#524)。
+
+### Fixed
+
+- readline history テストの rustyline 14 umask race を process-wide Mutex でシリアライズして修正 (#474)。`History::save()` が `umask` を非アトミックに変更する window に他スレッドの `tempdir()` が入ると EACCES が発生する問題を解消。
+
 ## [0.4.0] - 2026-04-29
 
 Epic C: Case Memory & CBR + Epic D: Agentic Skills Layer を統合リリース。turn 単位の手続き記憶を CaseRecord として永続化し、6-element Jaccard 類似度で過去ケースを次 turn の prompt に注入。失敗パターンを AntiPattern として upsert し、繰り返し閾値超で "Avoid Patterns:" を注入する。さらに `AgentSkill` trait + `SkillRegistry` 基盤を導入し、Reminder / Verifier を skill ディスパッチに移植、`SkillTrustTier` で read-only skill の Write 違反を runtime block する。
