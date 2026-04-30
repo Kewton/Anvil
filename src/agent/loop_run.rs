@@ -1,15 +1,21 @@
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread;
 
 use crate::agent::prompting;
 use crate::agent::recovery;
 use crate::config::Config;
 use crate::format_model_banner;
+use crate::logging::log_llm_event;
 use crate::model_registry::RuntimeModels;
 use crate::modes::plan_act::ExecutionMode;
 use crate::ollama::client::{AssistantReply, OllamaClient, should_use_native_tool_calls};
 use crate::ollama::xml_fallback::ToolCall;
+use crate::repo_graph::{
+    BuildOptions as RepoGraphBuildOptions, BuildOutcome, RepoGraph, RepoGraphError,
+    build_repo_graph,
+};
 use crate::safety::path_guard::resolve_user_path;
 use crate::session::compact::{
     approximate_token_count, compact_messages, compact_messages_with_strategy,
@@ -119,13 +125,38 @@ pub struct Agent {
     /// (DR4-003): static registration only.
     #[allow(dead_code)]
     pub(super) skill_registry: crate::agent::skills::SkillRegistry,
+    /// Issue #468: session-lifetime cache of the repository structure graph.
+    /// Built once at `Agent::new` (blocking) and never mutated afterward.
+    /// Not serialized — RepoGraph state lives outside `SessionSnapshot` to
+    /// avoid bloating the session JSON (DR1-004 / S3-006).
+    #[allow(dead_code)]
+    pub(super) repo_graph: Option<Arc<RepoGraph>>,
 }
 
 #[derive(Clone)]
 struct RepoContextCache {
     task: String,
     work_root: PathBuf,
+    repo_graph_present: bool,
+    last_feedback_kind: Option<String>,
+    suspected_files_fingerprint: u64,
+    touched_files_fingerprint: u64,
     message: Option<ConversationMessage>,
+}
+
+/// Issue #469 DR1-005: SSOT for path-list fingerprinting used by the
+/// `RepoContextCache` key. Empty slice yields a process-stable sentinel
+/// hash; non-empty path lists are sorted before hashing for stability
+/// across feedback ordering.
+pub(super) fn fingerprint_paths(paths: &[String]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut sorted: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+    sorted.sort_unstable();
+    let mut hasher = DefaultHasher::new();
+    sorted.hash(&mut hasher);
+    hasher.finish()
 }
 
 impl Agent {
@@ -145,6 +176,7 @@ impl Agent {
             should_use_native_tool_calls(&models.main) && !session.native_tools_disabled;
         let mut skill_registry = crate::agent::skills::SkillRegistry::new();
         skill_registry.register(crate::agent::loop_run::verifier_skill::VerifierSkill);
+        let repo_graph = ensure_repo_graph(&work_root, session_store.state_root());
         Self {
             config,
             models,
@@ -161,8 +193,84 @@ impl Agent {
             tester_called_this_turn: false,
             anvil_score_computed_this_turn: false,
             skill_registry,
+            repo_graph,
         }
     }
+}
+
+/// Issue #468 facade: build (or load from cache) the `RepoGraph` once at
+/// session start. **All `agent.repo_graph.*` event emission lives here**
+/// (DR1-005). Failures are non-fatal: the agent loop always continues.
+fn ensure_repo_graph(work_root: &Path, state_root: &Path) -> Option<Arc<RepoGraph>> {
+    let opts = RepoGraphBuildOptions::default();
+    let outcome = build_repo_graph(work_root, state_root, &opts);
+    match outcome {
+        Ok(BuildOutcome::Built {
+            graph,
+            node_count,
+            edge_count,
+        }) => {
+            log_llm_event(
+                "agent.repo_graph.completed",
+                serde_json::json!({
+                    "reason": "built",
+                    "node_count": node_count,
+                    "edge_count": edge_count,
+                    "fingerprint_id": graph_fingerprint_id(&graph),
+                }),
+            );
+            Some(graph)
+        }
+        Ok(BuildOutcome::CacheHit { graph }) => {
+            log_llm_event(
+                "agent.repo_graph.completed",
+                serde_json::json!({
+                    "reason": "cache_hit",
+                    "fingerprint_id": graph_fingerprint_id(&graph),
+                }),
+            );
+            Some(graph)
+        }
+        Ok(BuildOutcome::Skipped { reason }) => {
+            log_llm_event(
+                "agent.repo_graph.skipped",
+                serde_json::json!({"reason": reason}),
+            );
+            None
+        }
+        Err(RepoGraphError::Disabled) => {
+            log_llm_event(
+                "agent.repo_graph.disabled",
+                serde_json::json!({"reason": "env_no_repo_graph"}),
+            );
+            None
+        }
+        Err(RepoGraphError::CwdCanonicalFailed) => {
+            log_llm_event(
+                "agent.repo_graph.failed",
+                serde_json::json!({"reason": "cwd_canonical_failed"}),
+            );
+            None
+        }
+        Err(RepoGraphError::PersistFailed(message)) => {
+            log_llm_event(
+                "agent.repo_graph.failed",
+                serde_json::json!({
+                    "reason": "persist_failed",
+                    "message": message,
+                }),
+            );
+            None
+        }
+    }
+}
+
+fn graph_fingerprint_id(_graph: &Arc<RepoGraph>) -> String {
+    // RepoGraph keeps the fingerprint internal; we expose a short id surface
+    // here through the public node/edge counts already logged above. The id
+    // itself is currently not part of the public API to keep the surface
+    // minimal — a tracking entry to expose it lives with #469's seam work.
+    String::new()
 }
 
 #[cfg(test)]

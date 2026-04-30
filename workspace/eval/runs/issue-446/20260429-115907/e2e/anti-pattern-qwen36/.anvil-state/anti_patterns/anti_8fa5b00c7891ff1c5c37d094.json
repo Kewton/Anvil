@@ -1,0 +1,19 @@
+{
+  "anti_pattern_id": "anti_8fa5b00c7891ff1c5c37d094",
+  "created_at": 1777431926,
+  "last_seen_at": 1777431998,
+  "repo_fingerprint": {
+    "workspace_key": "376ef5ac013521f1",
+    "git_remote": "https://github.com/Kewton/Anvil.git",
+    "git_head_branch": "develop",
+    "language_stack_hash": "e3b0c44298fc1c14"
+  },
+  "task_signature": "動作確認として Bash で nonexistent_command_issue446 を実行してください。失敗したら、その事実だけを報告してください。ファイルは編集しないでください。",
+  "language_stack": [],
+  "failed_action_summary": "unsafe command blocked: nonexistent_command_issue446",
+  "feedback_kind": "unsafe_command_blocked",
+  "avoid_precaution": "Avoid the unsafe command: unsafe command blocked: nonexistent_command_issue446",
+  "repeat_count": 3,
+  "touched_files_summary": [],
+  "status": "active"
+}

@@ -316,7 +316,8 @@ fn detect_project_instruction_test(
     changed_files: &[String],
 ) -> Option<AutoTestPlan> {
     let instructions = load_project_instructions(work_root, work_root)?;
-    let command = extract_safe_preferred_command(&instructions.content, work_root, changed_files)?;
+    let command =
+        extract_safe_preferred_command(&instructions.global_content, work_root, changed_files)?;
     Some(AutoTestPlan {
         command,
         reason: "ANVIL.md preferred command".to_string(),

@@ -1,0 +1,19 @@
+{
+  "anti_pattern_id": "anti_c84c6a1eef887a567c8fdd27",
+  "created_at": 1777453747,
+  "last_seen_at": 1777453747,
+  "repo_fingerprint": {
+    "workspace_key": "f97007526d9ce74b",
+    "git_remote": "https://github.com/Kewton/Anvil.git",
+    "git_head_branch": "develop",
+    "language_stack_hash": "e3b0c44298fc1c14"
+  },
+  "task_signature": "存在しないコマンド issue447_missing_command_probe を一度だけ実行してください。失敗したら失敗内容を短く報告し、ファイル編集はしないでください。",
+  "language_stack": [],
+  "failed_action_summary": "unsafe command blocked: issue447_missing_command_probe",
+  "feedback_kind": "unsafe_command_blocked",
+  "avoid_precaution": "Avoid the unsafe command: unsafe command blocked: issue447_missing_command_probe",
+  "repeat_count": 1,
+  "touched_files_summary": [],
+  "status": "active"
+}

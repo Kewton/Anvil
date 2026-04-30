@@ -1,0 +1,5 @@
+{
+  "name": "repo-graph-node-fixture",
+  "version": "0.0.1",
+  "main": "src/index.ts"
+}
