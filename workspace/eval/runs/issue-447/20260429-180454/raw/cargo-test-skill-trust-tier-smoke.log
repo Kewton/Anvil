@@ -1,0 +1,15 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.09s
+     Running tests/skill_trust_tier_smoke.rs (target/debug/deps/skill_trust_tier_smoke-a32d1378ba2dd4d2)
+
+running 8 tests
+test act_mode_non_external_tiers_allow ... ok
+test external_disabled_skill_is_denied_in_act_mode ... ok
+test permission_denied_does_not_consume_per_turn_cap ... ok
+test plan_mode_can_write_temp_is_denied ... ok
+test skill_permission_denied_serde_round_trip ... ok
+test plan_mode_verifier_bypasses_tier_check ... ok
+test plan_mode_built_in_read_only_passes_tier_check ... ok
+test permission_denied_event_payload_contains_snake_case_tier ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

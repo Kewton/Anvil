@@ -1,0 +1,173 @@
+    Blocking waiting for file lock on artifact directory
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.09s
+     Running unittests src/lib.rs (target/debug/deps/anvil-822b934569ee8013)
+
+running 9 tests
+test agent::prompting::tests::parse_path_scoped_blocks_global_only ... ok
+test agent::prompting::tests::parse_path_scoped_blocks_with_scoped ... ok
+test agent::prompting::tests::parse_path_scoped_blocks_multiple_patterns ... ok
+test agent::prompting::tests::parse_path_scoped_blocks_invalid_pattern_skipped ... ok
+test agent::prompting::tests::parse_path_scoped_blocks_mixed_valid_invalid_patterns ... ok
+test agent::prompting::tests::path_scoped_global_only_injected_always ... ok
+test agent::prompting::tests::path_scoped_env_gate_disables_filter ... ok
+test agent::prompting::tests::path_scoped_no_match_skips_instruction ... ok
+test agent::prompting::tests::path_scoped_match_injects_instruction ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 1025 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/anvil-da320dfa24a66711)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/agent_skill_registry_smoke.rs (target/debug/deps/agent_skill_registry_smoke-9633916e2cdbdf21)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+     Running tests/anti_pattern_extraction.rs (target/debug/deps/anti_pattern_extraction-1f988a8ccfa3f247)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s
+
+     Running tests/case_record_extraction.rs (target/debug/deps/case_record_extraction-0803fff434441fd6)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
+
+     Running tests/case_retrieval_smoke.rs (target/debug/deps/case_retrieval_smoke-23b3b611073522a7)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s
+
+     Running tests/config_tests.rs (target/debug/deps/config_tests-3967c74d2c33e012)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 29 filtered out; finished in 0.00s
+
+     Running tests/e2e_local_llm.rs (target/debug/deps/e2e_local_llm-c8a4c588fa467437)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+
+     Running tests/footer_skeleton_integration.rs (target/debug/deps/footer_skeleton_integration-bf1acbbc36f6d46d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/markdown_stream_integration.rs (target/debug/deps/markdown_stream_integration-7d7628d5cf02c82e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+     Running tests/ollama_client_tests.rs (target/debug/deps/ollama_client_tests-18f216225d56b1e3)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/orchestration_tests.rs (target/debug/deps/orchestration_tests-a6b93798ac791e69)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+     Running tests/plan_act_tests.rs (target/debug/deps/plan_act_tests-138ba4478cc00534)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/precaution_prompt_injection.rs (target/debug/deps/precaution_prompt_injection-17f0efc64089363f)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+     Running tests/precautions_repl.rs (target/debug/deps/precautions_repl-a324453ac8ee2321)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/readline_history_roundtrip.rs (target/debug/deps/readline_history_roundtrip-c171b1aadc6944f9)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/recovery_tests.rs (target/debug/deps/recovery_tests-27fab7c1d5ba4b2c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/repo_graph_smoke.rs (target/debug/deps/repo_graph_smoke-a6c8448c2a51bf77)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/session_cli_tests.rs (target/debug/deps/session_cli_tests-fa1aa47696c465cb)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 25 filtered out; finished in 0.00s
+
+     Running tests/session_tests.rs (target/debug/deps/session_tests-016dfed6a6efc777)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 56 filtered out; finished in 0.00s
+
+     Running tests/skill_trust_tier_smoke.rs (target/debug/deps/skill_trust_tier_smoke-47a7a3652a8270dc)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+
+     Running tests/slash_commands_ssot.rs (target/debug/deps/slash_commands_ssot-5b7f1678611fc7a3)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/tester_skill_smoke.rs (target/debug/deps/tester_skill_smoke-f5013bd12f79bf40)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
+
+     Running tests/tests_slash_command.rs (target/debug/deps/tests_slash_command-40cb2e069a18edba)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+     Running tests/tmp_tests_e2e.rs (target/debug/deps/tmp_tests_e2e-a02dcba796c53975)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 16 filtered out; finished in 0.00s
+
+     Running tests/tool_registry_tests.rs (target/debug/deps/tool_registry_tests-c363a6498a1ea3ad)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/xml_fallback_tests.rs (target/debug/deps/xml_fallback_tests-22251041825ab973)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+

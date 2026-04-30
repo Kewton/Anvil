@@ -1,0 +1,27 @@
+error: no test target named `repo_context_ranking_smoke` in default-run packages
+help: available test targets:
+    agent_skill_registry_smoke
+    anti_pattern_extraction
+    case_record_extraction
+    case_retrieval_smoke
+    config_tests
+    e2e_local_llm
+    footer_skeleton_integration
+    markdown_stream_integration
+    ollama_client_tests
+    orchestration_tests
+    plan_act_tests
+    precaution_prompt_injection
+    precautions_repl
+    readline_history_roundtrip
+    recovery_tests
+    repo_graph_smoke
+    session_cli_tests
+    session_tests
+    skill_trust_tier_smoke
+    slash_commands_ssot
+    tester_skill_smoke
+    tests_slash_command
+    tmp_tests_e2e
+    tool_registry_tests
+    xml_fallback_tests

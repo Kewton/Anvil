@@ -1,0 +1,16 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.07s
+     Running tests/agent_skill_registry_smoke.rs (target/debug/deps/agent_skill_registry_smoke-2d6bd7cc1d65636f)
+
+running 9 tests
+test applicability_false_emits_silent_skip ... ok
+test env_disable_returns_disabled_by_env ... ok
+test execute_err_emits_failed_event_and_continues ... ok
+test fence_routing_iteration_internal ... ok
+test registry_lookup_misses_unknown_skill ... ok
+test fence_routing_post_loop_does_not_invoke_iteration_only_skill ... ok
+test plan_mode_disable_returns_plan_mode_skip_reason ... ok
+test per_turn_cap_via_pre_check_returns_per_turn_capped ... ok
+test reminder_skill_completes_with_dummy_failure_outcome ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

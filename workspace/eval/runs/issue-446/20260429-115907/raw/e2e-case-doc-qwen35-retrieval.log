@@ -1,0 +1,17 @@
+anvil session=019dd731 messages=0 [fresh]
+[iter 1/50] Implementation
+  tool:   📄 Read
+  action: Read file
+  file:   README.md
+  note:   Preview: # Widget CLI Widget CLI helps operators inspect lo...
+  status: 446B
+
+[iter 2/50] Implementation
+  tool:   📝 Edit
+  action: Revise file
+  file:   README.md
+  note:   Preview: # Widget CLI ## Usage ```bash widget-cli run --config config.yaml ```
+
+README.md の Usage セクションを更新し、Widget CLI の実行例を widget-cli run --config config.yaml の 1 つに整理しました。既存の例は重複を避けて短くまとめられています。
+
+✔ done  iter 3/50  duration 25s  edited 2 files (.anvil-state/sessions/019dd731-b4b8-7223-b4ac-fe575b9a7f54/logs/llm-io.jsonl, README.md)
