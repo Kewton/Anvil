@@ -92,6 +92,16 @@ pub fn run_cli(args: CliArgs) -> Result<(), String> {
         .join("llm-io.jsonl");
     logging::init_logging(config.log_level, &log_path)?;
 
+    // Issue #471: structured eval log. Failure is warn-only (DR3-002).
+    let eval_log_path = state_root
+        .join("sessions")
+        .join(&session_id)
+        .join("logs")
+        .join("eval.jsonl");
+    if let Err(err) = session::eval_log::init_eval_log(&eval_log_path) {
+        eprintln!("warning: {err}");
+    }
+
     let _ = symlink_anvil_dirs(&config.cwd, &state_root, &session_id);
 
     let client = OllamaClient::new_with_timeout_and_options(

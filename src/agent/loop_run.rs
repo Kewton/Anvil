@@ -131,6 +131,10 @@ pub struct Agent {
     /// avoid bloating the session JSON (DR1-004 / S3-006).
     #[allow(dead_code)]
     pub(super) repo_graph: Option<Arc<RepoGraph>>,
+    /// Issue #471: per-turn cache of the last case retrieval summary for the
+    /// eval log. Set by `try_inject_case_retrieval_message` when a Completed
+    /// outcome is obtained. Reset at the top of `run_actor_loop`.
+    pub(super) last_case_retrieval_summary: Option<crate::session::eval_log::CaseRetrievalSummary>,
 }
 
 #[derive(Clone)]
@@ -194,6 +198,7 @@ impl Agent {
             anvil_score_computed_this_turn: false,
             skill_registry,
             repo_graph,
+            last_case_retrieval_summary: None,
         }
     }
 }
