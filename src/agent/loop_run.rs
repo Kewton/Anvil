@@ -139,6 +139,11 @@ pub struct Agent {
     /// eval log. Set by `try_inject_case_retrieval_message` when a Completed
     /// outcome is obtained. Reset at the top of `run_actor_loop`.
     pub(super) last_case_retrieval_summary: Option<crate::session::eval_log::CaseRetrievalSummary>,
+    /// Issue #473: monotonically increasing counter (1-based) for the current
+    /// session turn. Incremented at the top of `handle_user_message` before any
+    /// per-turn logic runs. Used as a join key in `agent.reminder.completed` and
+    /// `agent.anvil_score.computed` log events for dataset export.
+    pub(super) current_turn_index: usize,
 }
 
 #[derive(Clone)]
@@ -203,6 +208,7 @@ impl Agent {
             skill_registry,
             repo_graph,
             last_case_retrieval_summary: None,
+            current_turn_index: 0,
         }
     }
 }

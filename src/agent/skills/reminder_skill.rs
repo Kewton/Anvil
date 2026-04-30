@@ -113,9 +113,12 @@ impl AgentSkill for ReminderSkill {
     ) -> (&'static str, serde_json::Value) {
         match outcome {
             SkillOutput::Reminder(o) => {
-                // 既存 build_log_payload を呼ぶことで 12 key 完全互換を維持.
-                // (4 regression test `payload_*_has_all_keys` が green を維持).
-                build_log_payload(o, session_id, model)
+                // Issue #473: skill registry 経路は production の Reminder で
+                // 通らない (DR3-002: turn.rs::maybe_invoke_reminder direct call
+                // 経路を維持)。turn_index は registry 経由 path が将来稼働する
+                // までは 0 fallback、inputs も None で payload schema を well-formed
+                // に保つ (新 5 field は null/[] で render される)。
+                build_log_payload(o, session_id, model, 0, None)
             }
             _ => ("agent.reminder.failed", serde_json::Value::Null),
         }
