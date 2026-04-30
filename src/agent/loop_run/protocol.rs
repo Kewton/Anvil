@@ -101,6 +101,9 @@ mod tests {
             duration_secs: 0,
             changed_files: files.iter().map(|file| file.to_string()).collect(),
             total_changed,
+            changed_impl_count: 0,
+            changed_test_count: 0,
+            changed_setup_count: 0,
         }
     }
 

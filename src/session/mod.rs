@@ -4,6 +4,7 @@ pub mod case_record;
 pub mod case_retrieval;
 pub mod compact;
 pub mod discovery;
+pub mod eval_log;
 pub mod feedback;
 pub mod precaution;
 pub mod sessions_cli;

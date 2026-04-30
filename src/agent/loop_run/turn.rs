@@ -1315,6 +1315,9 @@ fn build_stats(
         duration_secs,
         changed_files,
         total_changed,
+        changed_impl_count: impl_changed,
+        changed_test_count: test_changed,
+        changed_setup_count: setup_changed,
     }
 }
 
@@ -1612,6 +1615,13 @@ impl Agent {
                         "selected_reasons": selected_reasons,
                     }),
                 );
+                // Issue #471 / DR2-005: build CaseRetrievalSummary before
+                // format_for_prompt consumes `selected`.
+                self.last_case_retrieval_summary =
+                    Some(crate::session::eval_log::CaseRetrievalSummary {
+                        selected: selected.len(),
+                        scores: selected.iter().map(|s| s.breakdown.clone()).collect(),
+                    });
                 case_retrieval::format_for_prompt(&selected).map(ConversationMessage::system)
             }
             Ok(RetrievalOutcome::Skipped {
@@ -2097,6 +2107,8 @@ impl Agent {
         self.session.case_record_extracted_this_turn = false;
         // Issue #463: reset the per-turn case_retrieval cap.
         self.session.case_retrieval_invoked_this_turn = false;
+        // Issue #471: reset the per-turn eval log case retrieval summary.
+        self.last_case_retrieval_summary = None;
         // Issue #464: reset the per-turn anti-pattern caps.
         self.session.anti_pattern_extracted_this_turn = false;
         self.session.anti_pattern_retrieval_invoked_this_turn = false;
@@ -2120,6 +2132,10 @@ impl Agent {
         let mut error_text = String::new();
         let mut last_iter = 0usize;
         let mut final_prose = String::new();
+        // Issue #471: collect all LLM-requested tool calls BEFORE any
+        // focused-edit truncation so the eval log records the full intent
+        // (DR3-003).
+        let mut tool_call_summaries: Vec<crate::session::eval_log::ToolCallSummary> = Vec::new();
 
         let interrupt_flag = monitor.flag();
 
@@ -2240,6 +2256,30 @@ impl Agent {
                 .into_iter()
                 .map(|tool_call| self.prepare_tool_call(tool_call))
                 .collect::<Vec<_>>();
+
+            // Issue #471 / DR3-003: collect summaries BEFORE focused-edit
+            // truncation so the eval log sees the full LLM intent.
+            for tc in &prepared_tool_calls {
+                use crate::session::eval_log::ToolCallSummary;
+                use crate::session::feedback::mask_secrets;
+                let raw_args = tc.arguments.to_string();
+                let args_summary = {
+                    let masked = mask_secrets(&raw_args);
+                    if masked.len() > crate::session::eval_log::MAX_EVAL_TOOL_ARG_BYTES {
+                        let mut end = crate::session::eval_log::MAX_EVAL_TOOL_ARG_BYTES;
+                        while !masked.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        format!("{}…", &masked[..end])
+                    } else {
+                        masked
+                    }
+                };
+                tool_call_summaries.push(ToolCallSummary {
+                    name: tc.name.clone(),
+                    args_summary,
+                });
+            }
 
             if let Some(target) = self.focused_edit_recovery_target() {
                 let target_already_read = focused_edit_target_already_read(
@@ -3854,6 +3894,92 @@ impl Agent {
         // Triggered by the latest eligible failure feedback. Pure upsert; no
         // sidecar / LLM calls.
         self.maybe_extract_anti_pattern();
+
+        // Issue #471: write structured eval log record (turn-level snapshot).
+        {
+            use crate::session::eval_log::{
+                AnvilScoreSummary, ChangedFileClasses, EvalPrecautionSnapshot,
+                FeedbackFrameSummary, build_eval_record, write_eval_record,
+            };
+            use crate::session::precaution::PrecautionStatus;
+            use std::time::{SystemTime, UNIX_EPOCH};
+
+            let ts_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let active_task = self
+                .session
+                .working_memory
+                .active_task
+                .as_deref()
+                .unwrap_or("");
+            let mode_str = format!("{:?}", self.session.mode_state.mode);
+            let tool_protocol = if self.native_tools_enabled {
+                "native"
+            } else {
+                "xml"
+            };
+            let feedback_summary =
+                self.session
+                    .last_feedback
+                    .as_ref()
+                    .map(|ff| FeedbackFrameSummary {
+                        kind: format!("{:?}", ff.kind),
+                        excerpt: {
+                            let raw = format!("{}{}", ff.stdout_excerpt(), ff.stderr_excerpt());
+                            let masked = crate::session::feedback::mask_secrets(&raw);
+                            if masked.len()
+                                > crate::session::eval_log::MAX_EVAL_FEEDBACK_EXCERPT_BYTES
+                            {
+                                let mut end =
+                                    crate::session::eval_log::MAX_EVAL_FEEDBACK_EXCERPT_BYTES;
+                                while !masked.is_char_boundary(end) {
+                                    end -= 1;
+                                }
+                                format!("{}…", &masked[..end])
+                            } else {
+                                masked
+                            }
+                        },
+                    });
+            let precaution_snapshots: Vec<EvalPrecautionSnapshot> = self
+                .session
+                .working_memory
+                .active_precautions
+                .iter()
+                .filter(|p| p.status == PrecautionStatus::Active)
+                .map(EvalPrecautionSnapshot::from)
+                .collect();
+            let anvil_summary = self
+                .session
+                .last_anvil_score
+                .as_ref()
+                .map(AnvilScoreSummary::from);
+            let changed_classes = ChangedFileClasses {
+                test: stats.changed_test_count,
+                impl_files: stats.changed_impl_count,
+                setup: stats.changed_setup_count,
+            };
+            let record = build_eval_record(
+                &session_id,
+                ts_ms,
+                active_task,
+                &model,
+                &mode_str,
+                tool_protocol,
+                &tool_call_summaries,
+                feedback_summary,
+                &precaution_snapshots,
+                anvil_summary,
+                changed_classes,
+                &verify_commands_collected,
+                self.last_case_retrieval_summary.take(),
+                exit_reason.label(),
+            );
+            write_eval_record(&record);
+        }
+
         log_llm_event(
             "agent.milestone.turn_completed",
             serde_json::json!({
