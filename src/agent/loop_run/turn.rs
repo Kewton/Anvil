@@ -22,6 +22,7 @@ use crate::session::feedback::{
 use crate::session::precaution::{Precaution, PrecautionStatus, severity_order};
 use crate::session::store::WorkingMemory;
 use crate::tools::registry::{BashErrorClass, ToolSpec, resolve_plan_mode_write_target};
+use crate::util::file_classify::{is_implementation_file, is_setup_file, is_test_file};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -5348,9 +5349,7 @@ impl Agent {
         ) {
             return None;
         }
-        let path = latest_turn_last_read_tool_path(&self.session.messages)?;
-        let candidate = resolve_user_path(&self.work_root, &path).ok()?;
-        candidate.is_file().then_some(candidate)
+        latest_turn_preferred_read_edit_target(&self.session.messages, &self.work_root)
     }
 
     fn mode_policy_message(&self) -> Option<ConversationMessage> {
@@ -5404,9 +5403,13 @@ impl Agent {
         ) {
             return None;
         }
-        let path = last_read_tool_path(&self.session.messages)?;
-        let candidate = resolve_user_path(&self.work_root, &path).ok()?;
-        candidate.is_file().then_some(candidate)
+        latest_turn_preferred_read_edit_target(&self.session.messages, &self.work_root).or_else(
+            || {
+                let path = last_read_tool_path(&self.session.messages)?;
+                let candidate = resolve_user_path(&self.work_root, &path).ok()?;
+                candidate.is_file().then_some(candidate)
+            },
+        )
     }
 
     fn post_scaffold_edit_recovery_message(&self) -> Option<String> {
@@ -5456,6 +5459,11 @@ impl Agent {
             return None;
         }
         if let Some(candidate) = first_existing_impl_target(&self.work_root) {
+            return Some(candidate);
+        }
+        if let Some(candidate) =
+            latest_turn_preferred_read_edit_target(&self.session.messages, &self.work_root)
+        {
             return Some(candidate);
         }
         if let Some(path) = last_read_tool_path(&self.session.messages)
@@ -5515,9 +5523,13 @@ impl Agent {
         {
             return Some(candidate);
         }
-        let path = last_read_tool_path(&self.session.messages)?;
-        let candidate = resolve_user_path(&self.work_root, &path).ok()?;
-        candidate.is_file().then_some(candidate)
+        latest_turn_preferred_read_edit_target(&self.session.messages, &self.work_root).or_else(
+            || {
+                let path = last_read_tool_path(&self.session.messages)?;
+                let candidate = resolve_user_path(&self.work_root, &path).ok()?;
+                candidate.is_file().then_some(candidate)
+            },
+        )
     }
 
     fn push_repo_change_no_edit_recovery_note(&mut self, attempt: usize) -> bool {
@@ -6437,6 +6449,11 @@ if __name__ == "__main__":
             || !self.active_task_expects_repo_change()
         {
             return None;
+        }
+        if let Some(candidate) =
+            latest_turn_preferred_read_edit_target(&self.session.messages, &self.work_root)
+        {
+            return Some(candidate);
         }
         if let Some(path) = last_read_tool_path(&self.session.messages)
             && let Ok(candidate) = resolve_user_path(&self.work_root, &path)
@@ -7997,25 +8014,43 @@ fn last_read_tool_path(messages: &[ConversationMessage]) -> Option<String> {
     })
 }
 
-fn latest_turn_last_read_tool_path(messages: &[ConversationMessage]) -> Option<String> {
-    latest_user_turn_slice(messages)
-        .iter()
-        .rev()
-        .find_map(|message| {
-            if message.role != "assistant" {
-                return None;
+fn latest_turn_preferred_read_edit_target(
+    messages: &[ConversationMessage],
+    work_root: &Path,
+) -> Option<PathBuf> {
+    let mut latest_existing = None;
+    for message in latest_user_turn_slice(messages).iter().rev() {
+        if message.role != "assistant" {
+            continue;
+        }
+        for tool_call in message.tool_calls.iter().rev() {
+            if tool_call.name != "Read" {
+                continue;
             }
-            message.tool_calls.iter().rev().find_map(|tool_call| {
-                if tool_call.name != "Read" {
-                    return None;
-                }
-                tool_call
-                    .arguments
-                    .get("path")
-                    .and_then(serde_json::Value::as_str)
-                    .map(ToString::to_string)
-            })
-        })
+            let Some(path) = tool_call
+                .arguments
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            let Ok(candidate) = resolve_user_path(work_root, path) else {
+                continue;
+            };
+            if !candidate.is_file() {
+                continue;
+            }
+            latest_existing.get_or_insert_with(|| candidate.clone());
+            if is_preferred_read_edit_target(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    latest_existing
+}
+
+fn is_preferred_read_edit_target(path: &Path) -> bool {
+    is_implementation_file(path) && !is_test_file(path) && !is_setup_file(path)
 }
 
 fn recent_scaffold_command_seen(messages: &[ConversationMessage]) -> bool {
@@ -9530,10 +9565,10 @@ mod progress_tests {
         has_successful_non_plan_repo_edit_after_latest_truncated_tool_call,
         has_successful_repo_edit, implementation_quality_issue_for_request, is_utf8_locale,
         last_read_tool_path, latest_page_copy_block_from_read,
-        latest_truncated_tool_call_note_index, post_scaffold_continuation_active,
-        post_scaffold_recovery_active, progress_available_width, prune_plan_mode_messages,
-        recent_scaffold_command_seen, recent_truncated_tool_call_attempt, repo_change_request_text,
-        request_needs_playable_ui_quality_gate, sanitize_for_progress,
+        latest_truncated_tool_call_note_index, latest_turn_preferred_read_edit_target,
+        post_scaffold_continuation_active, post_scaffold_recovery_active, progress_available_width,
+        prune_plan_mode_messages, recent_scaffold_command_seen, recent_truncated_tool_call_attempt,
+        repo_change_request_text, request_needs_playable_ui_quality_gate, sanitize_for_progress,
         should_apply_repo_change_quality_gate, should_try_framework_app_fallback,
         should_use_streaming_transport, strip_read_line_number_prefix,
         successful_non_plan_repo_edit_count, successful_repo_edit_count,
@@ -9853,6 +9888,68 @@ mod progress_tests {
             last_read_tool_path(&messages).as_deref(),
             Some("app/page.tsx")
         );
+    }
+
+    #[test]
+    fn preferred_read_edit_target_chooses_impl_over_later_test_file() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::write(
+            work_root.join("calculator.py"),
+            "def add(a, b): return a - b\n",
+        )
+        .unwrap();
+        std::fs::write(
+            work_root.join("test_calculator.py"),
+            "from calculator import add\n",
+        )
+        .unwrap();
+        let messages = vec![
+            ConversationMessage::user("fix calculator.py and run tests".to_string()),
+            ConversationMessage::assistant(
+                String::new(),
+                vec![
+                    ToolCall {
+                        id: "xml-1".to_string(),
+                        name: "Read".to_string(),
+                        arguments: json!({"path":"calculator.py"}),
+                    },
+                    ToolCall {
+                        id: "xml-2".to_string(),
+                        name: "Read".to_string(),
+                        arguments: json!({"path":"test_calculator.py"}),
+                    },
+                ],
+            ),
+        ];
+
+        let target = latest_turn_preferred_read_edit_target(&messages, work_root).unwrap();
+        assert!(
+            target.ends_with("calculator.py"),
+            "got: {}",
+            target.display()
+        );
+    }
+
+    #[test]
+    fn preferred_read_edit_target_falls_back_to_latest_read_file() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::write(work_root.join("README.md"), "# docs\n").unwrap();
+        let messages = vec![
+            ConversationMessage::user("update README.md".to_string()),
+            ConversationMessage::assistant(
+                String::new(),
+                vec![ToolCall {
+                    id: "xml-1".to_string(),
+                    name: "Read".to_string(),
+                    arguments: json!({"path":"README.md"}),
+                }],
+            ),
+        ];
+
+        let target = latest_turn_preferred_read_edit_target(&messages, work_root).unwrap();
+        assert!(target.ends_with("README.md"), "got: {}", target.display());
     }
 
     #[test]
