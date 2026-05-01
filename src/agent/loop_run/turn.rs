@@ -12,6 +12,7 @@ use super::tester;
 use super::*;
 use crate::agent::orchestration::{RepoVerification, capture_repo_snapshot, verify_repo_progress};
 use crate::logging::log_llm_event;
+use crate::model_capabilities::model_capabilities;
 use crate::modes::plan_act::{
     PlanStage, TaskProfile, WorkMode, classify_work_mode_json, infer_work_mode_from_text,
 };
@@ -46,21 +47,7 @@ use super::success::DETERMINISTIC_CONTENT_FALLBACK_TAG;
 const LOG_ARGS_MAX_CHARS: usize = 200;
 const PLAN_REPEATED_EXPLORATION_BLOCK_THRESHOLD: usize = 2;
 const USER_INTERRUPT_ERROR: &str = "__anvil_user_interrupt__";
-const QWEN35_NON_NATIVE_HARD_TIMEOUT_SECS: u64 = 90;
-const FOCUSED_EDIT_PRE_READ_TIMEOUT_SECS: u64 = 30;
-const FOCUSED_EDIT_PRE_READ_MAX_PREDICT: usize = 320;
-const FOCUSED_EDIT_POST_READ_TIMEOUT_SECS: u64 = 45;
-const FOCUSED_EDIT_POST_READ_MAX_PREDICT: usize = 320;
 const CREATE_NEXT_APP_PACKAGE_VERSION: &str = "16.2.4";
-
-fn is_qwen35_family(model: &str) -> bool {
-    model.trim().to_ascii_lowercase().starts_with("qwen3.5:")
-}
-
-fn uses_read_after_small_edit_protocol(model: &str) -> bool {
-    let normalized = model.trim().to_ascii_lowercase();
-    normalized.starts_with("qwen3.5:") || normalized.starts_with("qwen3.6:")
-}
 
 fn request_explicitly_requests_script_execution(request: &str) -> bool {
     let lower = request.to_ascii_lowercase();
@@ -3930,7 +3917,7 @@ impl Agent {
             duration_secs,
         );
         if exit_reason == ExitReason::ToolCallFormatError
-            && is_qwen35_family(&self.current_assistant_model())
+            && model_capabilities(&self.current_assistant_model()).finish_after_edit_format_error
             && stats.total_changed > 0
             && self.session.mode_state.mode == ExecutionMode::Act
             && (!self.active_python_request_requires_tests() || self.python_test_artifact_exists())
@@ -4512,11 +4499,13 @@ impl Agent {
         let messages = self.build_request_messages(protocol);
         let assistant_model = self.current_assistant_model();
         let focused_edit_timeout_override = focused_edit_timeout_override_secs(
+            assistant_model.as_str(),
             &self.session.messages,
             self.focused_edit_recovery_target().as_deref(),
             &self.work_root,
         );
         let focused_edit_max_predict_override = focused_edit_max_predict_override(
+            assistant_model.as_str(),
             &self.session.messages,
             self.focused_edit_recovery_target().as_deref(),
             &self.work_root,
@@ -4664,7 +4653,7 @@ impl Agent {
 
     fn maybe_finish_after_qwen35_edit_format_error(&self, err: &str) -> Option<AssistantReply> {
         if !lifecycle::is_tool_call_format_error(err)
-            || !is_qwen35_family(&self.current_assistant_model())
+            || !model_capabilities(&self.current_assistant_model()).finish_after_edit_format_error
             || self.session.mode_state.mode != ExecutionMode::Act
         {
             return None;
@@ -4690,7 +4679,8 @@ impl Agent {
         err: &str,
     ) -> Result<Option<AssistantReply>, String> {
         if !lifecycle::is_tool_call_format_error(err)
-            || !is_qwen35_family(&self.current_assistant_model())
+            || !model_capabilities(&self.current_assistant_model())
+                .deterministic_edit_after_format_error
             || has_successful_non_plan_repo_edit(
                 &self.session.messages,
                 &self.work_root,
@@ -5090,7 +5080,7 @@ impl Agent {
     }
 
     fn qwen35_small_edit_target(&self) -> Option<PathBuf> {
-        if !uses_read_after_small_edit_protocol(&self.current_assistant_model()) {
+        if !model_capabilities(&self.current_assistant_model()).read_after_small_edit_protocol {
             return None;
         }
         if self.session.mode_state.mode != ExecutionMode::Act
@@ -6184,7 +6174,7 @@ if __name__ == "__main__":
         {
             return Ok(None);
         }
-        if !uses_read_after_small_edit_protocol(&self.current_assistant_model()) {
+        if !model_capabilities(&self.current_assistant_model()).read_after_small_edit_protocol {
             return Ok(None);
         }
         let Some(target) = self.local_llm_small_edit_fallback_target() else {
@@ -6500,7 +6490,6 @@ pub(crate) fn unicode_supported() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        FOCUSED_EDIT_POST_READ_TIMEOUT_SECS, FOCUSED_EDIT_PRE_READ_TIMEOUT_SECS,
         PlanExplorationKey, answer_only_reply_is_inadequate, answer_only_script_command_allowed,
         answer_only_script_execution_fallback_response, assistant_model_for_mode,
         deterministic_timeout_fallback_plan, effective_non_streaming_timeout_secs,
@@ -6618,35 +6607,20 @@ mod tests {
     #[test]
     fn qwen35_focused_edit_timeout_override_remains_short() {
         assert_eq!(
-            effective_non_streaming_timeout_secs(
-                "qwen3.5:122b",
-                true,
-                120,
-                Some(FOCUSED_EDIT_POST_READ_TIMEOUT_SECS),
-            ),
-            FOCUSED_EDIT_POST_READ_TIMEOUT_SECS
+            effective_non_streaming_timeout_secs("qwen3.5:122b", true, 120, Some(45),),
+            45
         );
         assert_eq!(
-            effective_non_streaming_timeout_secs(
-                "qwen3.5:122b",
-                true,
-                120,
-                Some(FOCUSED_EDIT_PRE_READ_TIMEOUT_SECS),
-            ),
-            FOCUSED_EDIT_PRE_READ_TIMEOUT_SECS
+            effective_non_streaming_timeout_secs("qwen3.5:122b", true, 120, Some(30),),
+            30
         );
     }
 
     #[test]
     fn non_qwen35_focused_edit_timeout_override_remains_short() {
         assert_eq!(
-            effective_non_streaming_timeout_secs(
-                "qwen3.6:27b-coding-nvfp4",
-                true,
-                120,
-                Some(FOCUSED_EDIT_POST_READ_TIMEOUT_SECS),
-            ),
-            FOCUSED_EDIT_POST_READ_TIMEOUT_SECS
+            effective_non_streaming_timeout_secs("qwen3.6:27b-coding-nvfp4", true, 120, Some(45),),
+            45
         );
     }
 
@@ -7450,7 +7424,7 @@ fn should_use_streaming_transport(
         return false;
     }
 
-    if is_qwen35_family(model) {
+    if !model_capabilities(model).streaming_tool_calls {
         return false;
     }
 
@@ -7462,10 +7436,9 @@ fn non_streaming_assistant_reply_timeout_secs(
     _native_tools_enabled: bool,
     default_timeout_secs: u64,
 ) -> u64 {
-    if is_qwen35_family(model) {
-        return QWEN35_NON_NATIVE_HARD_TIMEOUT_SECS;
-    }
-    default_timeout_secs
+    model_capabilities(model)
+        .non_streaming_hard_timeout_secs
+        .unwrap_or(default_timeout_secs)
 }
 
 fn effective_non_streaming_timeout_secs(
@@ -7486,31 +7459,35 @@ fn effective_non_streaming_timeout_secs(
 }
 
 fn focused_edit_timeout_override_secs(
+    model: &str,
     messages: &[ConversationMessage],
     target: Option<&Path>,
     work_root: &Path,
 ) -> Option<u64> {
     let target = target?;
+    let focused_edit = model_capabilities(model).focused_edit?;
     Some(
         if focused_edit_target_already_read(messages, target, work_root) {
-            FOCUSED_EDIT_POST_READ_TIMEOUT_SECS
+            focused_edit.post_read_timeout_secs
         } else {
-            FOCUSED_EDIT_PRE_READ_TIMEOUT_SECS
+            focused_edit.pre_read_timeout_secs
         },
     )
 }
 
 fn focused_edit_max_predict_override(
+    model: &str,
     messages: &[ConversationMessage],
     target: Option<&Path>,
     work_root: &Path,
 ) -> Option<usize> {
     let target = target?;
+    let focused_edit = model_capabilities(model).focused_edit?;
     Some(
         if focused_edit_target_already_read(messages, target, work_root) {
-            FOCUSED_EDIT_POST_READ_MAX_PREDICT
+            focused_edit.post_read_max_predict
         } else {
-            FOCUSED_EDIT_PRE_READ_MAX_PREDICT
+            focused_edit.pre_read_max_predict
         },
     )
 }
@@ -9164,8 +9141,9 @@ mod truncate_tests {
         ScaffoldFramework, deterministic_nextjs_scaffold_reply, extract_filename_with_suffix,
         reply_looks_like_future_work, requested_scaffold_framework,
         scaffold_command_matches_framework, task_or_plan_requires_nextjs_scaffold,
-        task_requires_nextjs_scaffold, truncate, uses_read_after_small_edit_protocol,
+        task_requires_nextjs_scaffold, truncate,
     };
+    use crate::model_capabilities::model_capabilities;
 
     #[test]
     fn preserves_short_strings_verbatim() {
@@ -9245,11 +9223,9 @@ mod truncate_tests {
 
     #[test]
     fn local_qwen_models_use_read_after_small_edit_protocol() {
-        assert!(uses_read_after_small_edit_protocol("qwen3.5:122b"));
-        assert!(uses_read_after_small_edit_protocol(
-            "qwen3.6:27b-coding-nvfp4"
-        ));
-        assert!(!uses_read_after_small_edit_protocol("llama3.1:8b"));
+        assert!(model_capabilities("qwen3.5:122b").read_after_small_edit_protocol);
+        assert!(model_capabilities("qwen3.6:27b-coding-nvfp4").read_after_small_edit_protocol);
+        assert!(!model_capabilities("llama3.1:8b").read_after_small_edit_protocol);
     }
 
     #[test]
@@ -9313,8 +9289,6 @@ mod truncate_tests {
 #[cfg(test)]
 mod progress_tests {
     use super::{
-        FOCUSED_EDIT_POST_READ_MAX_PREDICT, FOCUSED_EDIT_POST_READ_TIMEOUT_SECS,
-        FOCUSED_EDIT_PRE_READ_MAX_PREDICT, FOCUSED_EDIT_PRE_READ_TIMEOUT_SECS,
         FocusedEditBatchAction, deterministic_empty_framework_app_files,
         deterministic_empty_framework_game_files, deterministic_framework_app_files_needed,
         deterministic_framework_game_files_needed, deterministic_support_target_relative,
@@ -11105,12 +11079,12 @@ export default function App() {
             ConversationMessage::tool("Read".to_string(), "page contents".to_string()),
         ];
         assert_eq!(
-            focused_edit_timeout_override_secs(&messages, Some(&target), work_root),
-            Some(FOCUSED_EDIT_POST_READ_TIMEOUT_SECS)
+            focused_edit_timeout_override_secs("qwen3.5:122b", &messages, Some(&target), work_root),
+            Some(45)
         );
         assert_eq!(
-            focused_edit_max_predict_override(&messages, Some(&target), work_root),
-            Some(FOCUSED_EDIT_POST_READ_MAX_PREDICT)
+            focused_edit_max_predict_override("qwen3.5:122b", &messages, Some(&target), work_root),
+            Some(320)
         );
     }
 
@@ -11123,12 +11097,12 @@ export default function App() {
         std::fs::write(&target, "export default function Home() { return null; }\n").unwrap();
         let messages = vec![ConversationMessage::user("build the app".to_string())];
         assert_eq!(
-            focused_edit_timeout_override_secs(&messages, Some(&target), work_root),
-            Some(FOCUSED_EDIT_PRE_READ_TIMEOUT_SECS)
+            focused_edit_timeout_override_secs("qwen3.5:122b", &messages, Some(&target), work_root),
+            Some(30)
         );
         assert_eq!(
-            focused_edit_max_predict_override(&messages, Some(&target), work_root),
-            Some(FOCUSED_EDIT_PRE_READ_MAX_PREDICT)
+            focused_edit_max_predict_override("qwen3.5:122b", &messages, Some(&target), work_root),
+            Some(320)
         );
     }
 
@@ -11151,8 +11125,15 @@ export default function App() {
             ConversationMessage::tool("Read".to_string(), "page contents".to_string()),
         ];
         let force_non_streaming =
-            focused_edit_timeout_override_secs(&messages, Some(&target), work_root).is_some()
-                || focused_edit_max_predict_override(&messages, Some(&target), work_root).is_some();
+            focused_edit_timeout_override_secs("qwen3.5:122b", &messages, Some(&target), work_root)
+                .is_some()
+                || focused_edit_max_predict_override(
+                    "qwen3.5:122b",
+                    &messages,
+                    Some(&target),
+                    work_root,
+                )
+                .is_some();
         let use_streaming_transport = !force_non_streaming
             && should_use_streaming_transport("qwen3.5:122b", true, false, true);
         assert!(
@@ -11170,8 +11151,15 @@ export default function App() {
         std::fs::write(&target, "export default function Home() { return null; }\n").unwrap();
         let messages = vec![ConversationMessage::user("build the app".to_string())];
         let force_non_streaming =
-            focused_edit_timeout_override_secs(&messages, Some(&target), work_root).is_some()
-                || focused_edit_max_predict_override(&messages, Some(&target), work_root).is_some();
+            focused_edit_timeout_override_secs("qwen3.5:122b", &messages, Some(&target), work_root)
+                .is_some()
+                || focused_edit_max_predict_override(
+                    "qwen3.5:122b",
+                    &messages,
+                    Some(&target),
+                    work_root,
+                )
+                .is_some();
         let use_streaming_transport = !force_non_streaming
             && should_use_streaming_transport("qwen3.5:122b", true, false, true);
         assert!(
