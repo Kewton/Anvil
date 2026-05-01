@@ -49,7 +49,16 @@ ollama serve
 ollama pull qwen3:8b
 ```
 
-### 2. ビルド
+### 2. インストール
+
+GitHub Releases の prebuilt binary を使う場合:
+
+```bash
+curl -fsSL 'https://raw.githubusercontent.com/Kewton/Anvil/main/scripts/install.sh' | bash
+anvil --help
+```
+
+手元でビルドする場合:
 
 ```bash
 cargo build --release
@@ -95,7 +104,8 @@ Options:
       --auto-plan                    classify broad tasks and enter Plan mode first
       --offline                      block network/package-install style shell work
       --deterministic-fallback <MODE>
-                                      recovery writes: off | support-only | full
+                                      recovery: off | hint-only | minimal-patch | full-template
+                                      aliases: support-only, full
       --no-footer                    disable fixed footer status bar
       --resume [<ID>]                resume latest workspace session or specific UUID
       --state-dir <PATH>             override XDG state root
@@ -212,7 +222,7 @@ context_budget=24000
 max_iterations=12
 yes_mode=false
 log_level=info            # info | verbose | trace
-deterministic_fallback=support-only # support-only | full | off
+deterministic_fallback=minimal-patch # off | hint-only | minimal-patch | full-template
 ```
 
 環境変数も使える。
@@ -227,16 +237,17 @@ export ANVIL_STREAM=1
 export ANVIL_YES=1
 export ANVIL_STATE_DIR=/custom/path/to/anvil-state
 export ANVIL_LOG_LEVEL=info     # info | verbose | trace
-export ANVIL_DETERMINISTIC_FALLBACK=support-only # support-only | full | off
+export ANVIL_DETERMINISTIC_FALLBACK=minimal-patch # off | hint-only | minimal-patch | full-template
 ```
 
 優先順位は `CLI > 環境変数 > .anvil/config > デフォルト値`。
 
 `deterministic_fallback` は product-quality fallback の強さを切り替える。
-デフォルトは `support-only`。scaffold / support recovery に限定し、テンプレート単体を
-完了扱いにしない。`full` は従来互換のテンプレート補完を明示的に許可し、`off`
-は deterministic recovery write を無効化する。互換 alias として `minimal-patch`
-は `support-only`、`full-template` は `full`、`hint-only` は `off` として扱う。
+デフォルトは `minimal-patch`。scaffold / support recovery に限定し、テンプレート単体を
+完了扱いにしない。`hint-only` は deterministic write を行わずモデルへの継続ヒントだけを出し、
+`full-template` は従来互換のテンプレート補完を明示的に許可する。`off` は deterministic
+recovery write を無効化する。互換 alias として `support-only` は `minimal-patch`、
+`full` は `full-template` として扱う。
 path guard、localhost validation、危険な Bash のブロックなどの安全境界はこの設定に関係なく維持される。
 
 ## 永続化とログの保存先
@@ -318,6 +329,8 @@ cargo build --release
 - バイナリ名は `anvil`
 - `cargo build --release --target ...` で生成
 - `.github/workflows/release.yml` が `anvil-linux-*` / `anvil-darwin-*` を gzip 化
+- 各 artifact に `.sha256` checksum を添付
 - `v*` タグ push で GitHub Release を作成
+- 対応OS、manual install、Homebrew plan、既知制限は [docs/install.md](docs/install.md) を参照
 
 つまり、内部実装は全面刷新したが、配布導線は壊していない。
