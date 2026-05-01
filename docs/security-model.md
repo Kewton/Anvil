@@ -46,6 +46,17 @@ Security-sensitive code should stay deterministic where possible:
 Heuristic or model-assisted judgment is appropriate for ambiguous product
 decisions, but not as the only guard for security boundaries.
 
+## Verifier Selection
+
+Verifier selection should be evidence-based. A candidate can come from a safe
+`ANVIL.md` command, a manifest, a package script, an existing test surface, or a
+compile-only fallback. The chosen verifier should expose its source and evidence
+in logs or feedback so failures can be evaluated without guessing which pattern
+matched.
+
+Do not treat incidental strings as executable proof. For example, a top-level
+`"test"` key in `package.json` is not equivalent to `scripts.test`.
+
 ## Safer Operation
 
 Recommended defaults for untrusted repositories:

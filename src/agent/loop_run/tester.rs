@@ -1162,11 +1162,26 @@ mod tests {
     }
 
     #[test]
-    fn detect_returns_none_when_pyproject_present_for_pytest() {
-        // pyproject.toml triggers AutoTestRunner -> "python3 -m pytest" which is
-        // explicit; Tester defers to existing auto_test.
+    fn detect_python_when_pyproject_has_no_pytest_signal() {
+        // pyproject.toml alone no longer implies pytest. AutoTestRunner falls
+        // back to py_compile, which is build-only, so Tester can still create
+        // a Python smoke test.
         let dir = tempdir().unwrap();
         write(&dir.path().join("pyproject.toml"), "[tool.poetry]\n");
+        write(&dir.path().join("app.py"), "print('ok')\n");
+        assert!(matches!(
+            TesterCandidate::detect(dir.path(), &["app.py".to_string()]),
+            Some(TesterCandidate::Python { .. })
+        ));
+    }
+
+    #[test]
+    fn detect_returns_none_when_pyproject_has_pytest_dependency() {
+        let dir = tempdir().unwrap();
+        write(
+            &dir.path().join("pyproject.toml"),
+            "[project]\ndependencies = ['pytest']\n",
+        );
         write(&dir.path().join("app.py"), "print('ok')\n");
         assert!(TesterCandidate::detect(dir.path(), &["app.py".to_string()]).is_none());
     }

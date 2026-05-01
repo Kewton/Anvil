@@ -128,6 +128,8 @@ LLM 推論中・ツール実行中は stderr に 80ms 間隔のスピナーを�
 
 Act-mode で `AutoTestRunner::detect == None`（明示的な test verifier が無い repo）かつ Rust / Node / Python のいずれかが検出されたとき、main model を 1 回だけ同期呼び出し（`tools=None`、JSON-only、`<think>` strip + first JSON object 抽出、`tool_calls` 非空は abort）して smoke test を生成し、`state_root/sessions/<id>/tmp-tests/files/` に保存したうえで固定テンプレートの Bash（Rust: `cargo test --manifest-path ...`、Node: `node --check`、Python: `python3 -m py_compile`）を 30 秒の明示 timeout 付きで実行する。Rust 経路は `tester-runs/<run_id>/` に transient harness（path dependency = workspace package）を書き出して走らせ、終了後に best-effort cleanup する。結果は `FeedbackFrame` として `WorkingMemory.last_feedback` に記録され、Reminder Sidecar 経路と接続して `Precaution` の自動生成に繋がる。
 
+`AutoTestRunner` は verifier を単一キーワードで即決せず、`ANVIL.md` の安全な preferred command、Cargo manifest、`package.json` の `scripts.*`、Python test surface、`py_compile` fallback を候補化して confidence / evidence 付きで選択する。`package.json` は JSON として読み、トップレベルの `"test"` 文字列だけでは `npm test` を選ばない。
+
 以下の条件で自動的に無効化される:
 
 - per-turn cap = 1（`tester_called_this_turn` で同一ターン内 2 回目以降を抑止）
