@@ -3908,6 +3908,7 @@ impl Agent {
             if let Some(issue) = protocol.success_issue_with_context(ProtocolSuccessContext {
                 stats: &stats,
                 deterministic_recovery_recorded,
+                model_repo_edits_this_turn: repo_edit_calls_made_this_turn,
             }) {
                 exit_reason = ExitReason::MissingRepoEdits;
                 error_text = issue;
@@ -5858,6 +5859,10 @@ impl Agent {
                 "files": written_paths,
             }),
         );
+        self.session
+            .record_feedback_if_unset(build_feedback_for_deterministic_content_fallback(
+                &self.work_root,
+            ));
         self.session.messages.push(ConversationMessage::assistant(
             format!(
                 "Materialized deterministic framework app fallback files as a recovery scaffold: {}. Continue implementation and verification before treating the task as complete.",
@@ -6264,7 +6269,7 @@ if __name__ == "__main__":
     }
 
     fn maybe_apply_local_llm_small_edit_fallback(
-        &self,
+        &mut self,
         request: &str,
     ) -> Result<Option<String>, String> {
         if !self
@@ -6294,6 +6299,10 @@ if __name__ == "__main__":
         };
         std::fs::write(&target, replacement)
             .map_err(|err| format!("failed to write {}: {err}", target.display()))?;
+        self.session
+            .record_feedback_if_unset(build_feedback_for_deterministic_content_fallback(
+                &self.work_root,
+            ));
         let relative = target
             .strip_prefix(&self.work_root)
             .unwrap_or(target.as_path())

@@ -20,6 +20,7 @@ pub(super) struct ExecutionProtocol {
 pub(super) struct ProtocolSuccessContext<'a> {
     pub(super) stats: &'a LoopStats,
     pub(super) deterministic_recovery_recorded: bool,
+    pub(super) model_repo_edits_this_turn: usize,
 }
 
 impl ExecutionProtocol {
@@ -45,6 +46,7 @@ impl ExecutionProtocol {
         self.success_issue_with_context(ProtocolSuccessContext {
             stats,
             deterministic_recovery_recorded: false,
+            model_repo_edits_this_turn: 0,
         })
     }
 
@@ -52,7 +54,7 @@ impl ExecutionProtocol {
         self,
         context: ProtocolSuccessContext<'_>,
     ) -> Option<String> {
-        if context.deterministic_recovery_recorded {
+        if context.deterministic_recovery_recorded && context.model_repo_edits_this_turn == 0 {
             return Some(
                 "protocol requires model-produced or verified work; deterministic fallback is recovery context, not completion"
                     .to_string(),
@@ -158,6 +160,7 @@ mod tests {
         ProtocolSuccessContext {
             stats,
             deterministic_recovery_recorded,
+            model_repo_edits_this_turn: 0,
         }
     }
 
@@ -219,6 +222,22 @@ mod tests {
         assert!(
             protocol
                 .success_issue_with_context(context(&ui_stats, false))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn deterministic_recovery_allows_later_model_repo_edit() {
+        let ui_stats = stats(&["src/app/page.tsx"], 1);
+        let protocol = ExecutionProtocol::from_work_mode(WorkMode::TypeScriptUi);
+
+        assert!(
+            protocol
+                .success_issue_with_context(ProtocolSuccessContext {
+                    stats: &ui_stats,
+                    deterministic_recovery_recorded: true,
+                    model_repo_edits_this_turn: 1,
+                })
                 .is_none()
         );
     }
