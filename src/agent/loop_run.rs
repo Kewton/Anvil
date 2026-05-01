@@ -36,6 +36,7 @@ mod quality;
 pub(crate) mod reminder;
 pub mod slash_commands;
 mod spinner;
+mod success;
 mod summary;
 mod tester;
 mod turn;

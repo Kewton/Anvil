@@ -3,7 +3,6 @@ use super::auto_test::{
     count_compile_errors, count_test_failures,
 };
 use super::interrupt::{InterruptEnv, InterruptFlag, InterruptMonitor};
-use super::protocol::{ExecutionProtocol, ProtocolSuccessContext};
 use super::reminder::{
     self, ReminderInputs, ReminderOutcome, build_log_payload as build_reminder_log_payload,
 };
@@ -41,6 +40,7 @@ use super::quality::{
     request_explicitly_requires_tests, request_mentions_unsupported_ui_framework,
     request_needs_playable_ui_quality_gate, workspace_has_unsupported_ui_framework,
 };
+use super::success::DETERMINISTIC_CONTENT_FALLBACK_TAG;
 
 /// Maximum number of characters of tool-call arguments retained in trace logs.
 const LOG_ARGS_MAX_CHARS: usize = 200;
@@ -296,65 +296,6 @@ fn build_anvil_test_summary(
     }
 }
 
-/// CB-002 (Issue #459): which verifier should run on a successful turn.
-///
-/// `select_success_verifier` is a pure decision function over three boolean
-/// inputs so the dispatch logic can be unit tested without spinning up the
-/// full agent. Production wiring lives in the success branch of
-/// `handle_user_message_inner` and uses this enum to decide between
-/// `AutoTestRunner::run`, `try_invoke_tester`, the `NoVerifierAvailable`
-/// fallback, and a no-op skip.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum SuccessVerifier {
-    /// Run `AutoTestRunner::run(plan)` (existing auto_test path).
-    AutoTest,
-    /// Run the Tester Skill via `try_invoke_tester`.
-    Tester,
-    /// No verifier ran — record `NoVerifierAvailable` feedback.
-    NoVerifier,
-    /// `should_run_auto_test_for_success() == false` and no Tester candidate
-    /// — do nothing (the historical pre-#450 behaviour).
-    Skip,
-}
-
-/// CB-002 (Issue #459): the Tester is gated **independently** of
-/// `should_run_auto_test_for_success()`. The selection rules are:
-///
-/// 1. `should_run && auto_test_some` → `AutoTest` (an explicit verifier
-///    exists and the protocol asked for it).
-/// 2. `tester_some` (regardless of `should_run`) → `Tester`. The
-///    `TesterCandidate::detect` filter already returns `None` when an
-///    explicit verifier is present, so this branch is only reachable when
-///    `auto_test_some == false` *or* the auto_test plan is build-only.
-/// 3. `should_run && !auto_test_some && !tester_some` → `NoVerifier` — the
-///    protocol demanded verification and nothing matched.
-/// 4. Otherwise (`!should_run && !tester_some` and any `auto_test_some`) →
-///    `Skip`.
-pub(super) fn select_success_verifier(
-    should_run: bool,
-    auto_test_some: bool,
-    tester_some: bool,
-) -> SuccessVerifier {
-    if should_run && auto_test_some {
-        SuccessVerifier::AutoTest
-    } else if tester_some {
-        SuccessVerifier::Tester
-    } else if should_run {
-        SuccessVerifier::NoVerifier
-    } else {
-        SuccessVerifier::Skip
-    }
-}
-
-pub(super) fn build_feedback_for_no_verifier(workspace_root: &Path) -> FeedbackFrame {
-    let draft = FeedbackFrameDraft {
-        kind: FeedbackKind::NoVerifierAvailable,
-        primary_error: Some("no auto_test verifier detected for this workspace".to_string()),
-        ..Default::default()
-    };
-    build_feedback_frame(draft, workspace_root)
-}
-
 /// CB-001: build a FeedbackFrame from a `BashExecutionOutcome`. Uses the
 /// pure `classify_bash_outcome` helper (Timeout / UnsafeCommandBlocked /
 /// exit code != 0). Returns None for an outcome that is not a failure
@@ -488,8 +429,6 @@ fn build_feedback_for_no_repo_progress(workspace_root: &Path) -> FeedbackFrame {
 /// (`(?i)deterministic|fallback|placeholder|scaffold|quality gate|repair|polish`)
 /// does not require it. Callers that need to distinguish in logs should
 /// use the surrounding `agent.*.fallback_applied` events.
-const DETERMINISTIC_CONTENT_FALLBACK_TAG: &str = "deterministic_content_fallback";
-
 /// Issue #455 / CB-001: FeedbackFrame for the no-tool-call exhaustion
 /// path (`no_tool_retries >= 3` in Act/repo-change exhaustion, or
 /// `>= 2` in answer-only inadequate-reply exhaustion).
@@ -3995,212 +3934,13 @@ impl Agent {
             exit_reason = ExitReason::Done;
             error_text.clear();
         }
-        // Issue #466: post-loop verifier dispatch を VerifierSkill 経由に置換.
-        // facade applies outcome 方針 (DR-466-002 / Stage 5):
-        //   1. exit_reason.is_success() && success_issue chk → should_dispatch_success_verifier
-        //   2. VerifierSkill::execute が AutoTestRunner::detect/run + compute_anvil_score を完結
-        //   3. facade が VerifierOutcome を解釈して legacy events emit / verify_commands push /
-        //      record_feedback_if_unset / try_invoke_tester / exit_reason 設定 / last_anvil_score
-        //      永続化を Reminder より前に行う (Stage 7 S7-001..003 / DR2-001..004 / DR3-001..002).
-        let mut verify_commands_collected: Vec<String> = Vec::new();
-        let should_dispatch_success_verifier = if exit_reason.is_success() {
-            let protocol = ExecutionProtocol::from_work_mode(self.session.mode_state.work_mode);
-            let deterministic_recovery_recorded =
-                self.session.last_feedback.as_ref().is_some_and(|frame| {
-                    frame.primary_error.as_deref() == Some(DETERMINISTIC_CONTENT_FALLBACK_TAG)
-                });
-            if let Some(issue) = protocol.success_issue_with_context(ProtocolSuccessContext {
-                stats: &stats,
-                deterministic_recovery_recorded,
-                model_repo_edits_this_turn: repo_edit_calls_made_this_turn,
-            }) {
-                exit_reason = ExitReason::MissingRepoEdits;
-                error_text = issue;
-                false
-            } else {
-                true
-            }
-        } else {
-            false
-        };
-        let tester_candidate_some = if should_dispatch_success_verifier {
-            tester::TesterCandidate::detect(&self.work_root, &stats.changed_files).is_some()
-        } else {
-            false
-        };
-        let protocol_demands_verifier = self.should_run_auto_test_for_success();
-        let session_id = self.session_store.session_id().to_string();
-        let model = self.models.main.clone();
-        // VerifierInputs / SkillInvocationRequest を組み立て invoke
-        let v_inputs = crate::agent::loop_run::verifier_skill::VerifierInputs {
-            score_inputs: crate::session::anvil_score::AnvilScoreInputs {
-                unsafe_blocks_this_turn: self.session.unsafe_blocks_this_turn,
-                repo_edit_succeeded_this_turn: self.session.repo_edit_succeeded_this_turn,
-                consecutive_no_progress_turns: self.session.consecutive_no_progress_turns,
-                prev: self.session.last_anvil_score.as_ref(),
-            },
-            repo_verification: Some(&final_verif),
-            should_dispatch_success_verifier,
-            protocol_demands_verifier,
-            changed_files: &stats.changed_files,
-            tester_candidate_some,
-            workspace_root: &self.work_root,
-        };
-        let started = std::time::Instant::now();
-        let snapshot_for_state = self.session.clone();
-        let runtime_state = crate::agent::skills::RuntimeState {
-            plan_mode: self.session.mode_state.mode == ExecutionMode::Plan,
-            interrupted: false,
-            turn_index: self.current_turn_index,
-            session: &snapshot_for_state,
-            last_anvil_score: self.session.last_anvil_score.as_ref(),
-            reminder_sidecar_available: false,
-            reminder_kind_eligible: false,
-            reminder_called_this_turn: self.reminder_called_this_turn,
-        };
-        let mut events_local: Vec<(&'static str, serde_json::Value)> = Vec::new();
-        let invocation = {
-            let mut wm = WorkingMemory::default();
-            let ctx = crate::agent::skills::SkillExecutionContext {
-                working_memory: &mut wm,
-                workspace_root: &self.work_root,
-            };
-            let request = crate::agent::skills::SkillInvocationRequest {
-                skill_name: "verifier",
-                trigger: crate::agent::skills::SkillTrigger::PostLoop,
-                state: &runtime_state,
-                input: crate::agent::skills::SkillInput::Verifier(v_inputs),
-                ctx,
-                get_env: &|k: &str| std::env::var_os(k),
-                emit_event: &mut |k, p| events_local.push((k, p)),
-                session_id: &session_id,
-                model: Some(&model),
-            };
-            self.skill_registry.invoke(request)
-        };
-        // emit captured agent.verifier.* events via log_llm_event (logging::log_llm_event は
-        // mask_payload_inplace を内蔵するため secret 漏洩防御の SSOT、DR4-004).
-        for (k, p) in events_local.into_iter() {
-            log_llm_event(k, p);
-        }
-        let compute_ms = started.elapsed().as_secs_f64() * 1000.0;
-        // facade applies outcome (5 step):
-        // SkillOutput::Verifier(Box<VerifierOutcome>) - deref to access variant
-        let final_score = match invocation.output {
-            Some(crate::agent::skills::SkillOutput::Verifier(boxed)) => {
-                use crate::agent::loop_run::verifier_skill::{
-                    AutoTestKindView, VerifierOutcome, sanitize_verify_command_for_case_record,
-                };
-                let outcome: VerifierOutcome = *boxed;
-                let score = match &outcome {
-                    VerifierOutcome::AutoTestRan { score, .. }
-                    | VerifierOutcome::AutoTestTransportError { score, .. }
-                    | VerifierOutcome::TesterDelegated { score }
-                    | VerifierOutcome::NoVerifier { score, .. }
-                    | VerifierOutcome::Skipped { score }
-                    | VerifierOutcome::EnvDisabled { score } => score.clone(),
-                };
-                // [a] AutoTest 分岐時のみ legacy events emit + verify_commands push
-                //     (DR2-004: 空文字列 / DR4-001: sanitize でガード)
-                if let VerifierOutcome::AutoTestRan {
-                    auto_test_kind,
-                    auto_test_passed,
-                    auto_test_command,
-                    auto_test_output,
-                    auto_test_reason,
-                    ..
-                } = &outcome
-                {
-                    log_llm_event(
-                        "agent.autotest.completed",
-                        serde_json::json!({
-                            "session_id": &session_id,
-                            "command": auto_test_command,
-                            "passed": auto_test_passed,
-                            "reason": auto_test_reason,
-                        }),
-                    );
-                    if let Some(sanitized) =
-                        sanitize_verify_command_for_case_record(auto_test_command)
-                    {
-                        verify_commands_collected.push(sanitized);
-                    }
-                    // AutoTest failed (Ok だが passed=false) → MissingRepoEdits 反映 (DR3-001)
-                    if !auto_test_passed {
-                        let kind_dbg = match auto_test_kind {
-                            AutoTestKindView::Build => "Build",
-                            AutoTestKindView::Test => "Test",
-                        };
-                        exit_reason = ExitReason::MissingRepoEdits;
-                        error_text = format!(
-                            "auto test failed for protocol {kind_dbg}: {}\n{}",
-                            auto_test_command, auto_test_output
-                        );
-                    }
-                }
-                // [c] FeedbackFrame 記録 (DR2-003: record_feedback_if_unset で
-                //     first-eligible-failure-wins #455 規約を維持)
-                if let VerifierOutcome::AutoTestRan {
-                    feedback: Some(fb), ..
-                } = &outcome
-                {
-                    self.session.record_feedback_if_unset(fb.clone());
-                }
-                if let VerifierOutcome::NoVerifier { feedback, .. } = &outcome {
-                    self.session.record_feedback_if_unset(feedback.clone());
-                }
-                // [d] Tester 委譲 (本 Issue では Tester skill 化 Out of Scope、既存
-                //     try_invoke_tester を facade で呼ぶ)
-                if matches!(outcome, VerifierOutcome::TesterDelegated { .. }) {
-                    let tester_recorded = self.try_invoke_tester(&stats.changed_files);
-                    if !tester_recorded && self.should_run_auto_test_for_success() {
-                        let frame = build_feedback_for_no_verifier(&self.work_root);
-                        self.session.record_feedback_if_unset(frame);
-                    }
-                }
-                // [e] AutoTestTransportError → exit_reason 反映 (DR2-002)
-                if let VerifierOutcome::AutoTestTransportError { error, .. } = &outcome {
-                    exit_reason = ExitReason::TransportError;
-                    error_text = error.clone();
-                }
-                // [f] EnvDisabled → agent.autotest.disabled event emit (DR2-004)
-                if matches!(outcome, VerifierOutcome::EnvDisabled { .. }) {
-                    log_llm_event(
-                        "agent.autotest.disabled",
-                        serde_json::json!({
-                            "session_id": &session_id,
-                            "reason": "ANVIL_NO_AUTO_TEST",
-                        }),
-                    );
-                }
-                Some(score)
-            }
-            // Issue #467 / DR1-002 2 次防御: PermissionDenied は SkillRegistry::invoke 内で
-            // 完結する設計のため facade に届かない。届いたら debug_assert で検知し
-            // release では安全に None フォールバック。
-            Some(crate::agent::skills::SkillOutput::PermissionDenied(_)) => {
-                debug_assert!(false, "PermissionDenied must not reach facade");
-                None
-            }
-            _ => None,
-        };
-        // [b] AnvilScore 永続化と flag 立て (Reminder より先).
-        if let Some(score) = final_score {
-            let rendered = score.format_for_prompt();
-            let render_chars = rendered.chars().count();
-            log_llm_event(
-                "agent.anvil_score.computed",
-                serde_json::json!({
-                    "session_id": &session_id,
-                    "turn_index": self.current_turn_index,
-                    "score": &score,
-                    "render_chars": render_chars,
-                    "compute_ms": compute_ms,
-                }),
-            );
-            self.session.last_anvil_score = Some(score);
-            self.anvil_score_computed_this_turn = true;
-        }
+        let verify_commands_collected = self.run_post_loop_success_verifier(
+            &final_verif,
+            &stats,
+            repo_edit_calls_made_this_turn,
+            &mut exit_reason,
+            &mut error_text,
+        );
         // Issue #452: Reminder Sidecar (post-loop hook). Picks up
         // NoRepoProgress / auto_test / NoVerifierAvailable frames recorded
         // after the actor loop exited. Per-turn cap means this no-ops if the
@@ -4234,6 +3974,8 @@ impl Agent {
                 .active_task
                 .as_deref()
                 .unwrap_or("");
+            let session_id = self.session_store.session_id().to_string();
+            let model = self.models.main.clone();
             let mode_str = format!("{:?}", self.session.mode_state.mode);
             let tool_protocol = if self.native_tools_enabled {
                 "native"
@@ -4329,20 +4071,6 @@ impl Agent {
         }
     }
 
-    fn should_run_auto_test_for_success(&self) -> bool {
-        if self.session.mode_state.work_mode == WorkMode::Python {
-            return true;
-        }
-        if self.session.mode_state.work_mode == WorkMode::TypeScriptUi {
-            return true;
-        }
-        if super::auto_test::AutoTestRunner::detect(&self.work_root, &[]).is_some() {
-            return true;
-        }
-        self.active_request_text()
-            .is_some_and(|request| request_explicitly_requires_tests(&request))
-    }
-
     /// Issue #459: try to invoke the Tester Skill when `AutoTestRunner::detect`
     /// returned None. Returns `true` iff the Tester recorded a FeedbackFrame
     /// (so the caller skips the `NoVerifierAvailable` fallback). Disable
@@ -4356,7 +4084,7 @@ impl Agent {
     /// § 4-2 ("Skip / Abort の細粒度 variant は同じ branch (= 既存
     /// no_verifier) に集約し、log のみで識別する"). This is the boundary
     /// captured by the bool return.
-    fn try_invoke_tester(&mut self, changed_files: &[String]) -> bool {
+    pub(super) fn try_invoke_tester(&mut self, changed_files: &[String]) -> bool {
         // Per-turn cap → Plan mode → `ANVIL_NO_TESTER` early-out (DR1-004 /
         // DR1-012 / DR2-017). The shared `check_invocation_gate` is the single
         // source of truth so integration tests in `tests/tester_skill_smoke.rs`
@@ -6167,7 +5895,7 @@ impl Agent {
             .and_then(requested_scaffold_framework)
     }
 
-    fn active_request_text(&self) -> Option<String> {
+    pub(super) fn active_request_text(&self) -> Option<String> {
         repo_change_request_text(
             self.session.working_memory.active_task.as_deref(),
             &self.session.messages,
@@ -11823,71 +11551,11 @@ export default function App() {
         );
         assert_eq!(
             frame.primary_error.as_deref(),
-            Some(super::DETERMINISTIC_CONTENT_FALLBACK_TAG)
+            Some(super::super::success::DETERMINISTIC_CONTENT_FALLBACK_TAG)
         );
         assert_eq!(
-            super::DETERMINISTIC_CONTENT_FALLBACK_TAG,
+            super::super::success::DETERMINISTIC_CONTENT_FALLBACK_TAG,
             "deterministic_content_fallback"
-        );
-    }
-
-    // ---- CB-002 (Issue #459): success-verifier selection -------------------
-
-    /// auto_test verifier exists AND the protocol asked for it → AutoTest.
-    #[test]
-    fn select_success_verifier_runs_auto_test_when_should_and_plan_some() {
-        assert_eq!(
-            super::select_success_verifier(true, true, false),
-            super::SuccessVerifier::AutoTest
-        );
-        // Even when a Tester candidate is also available, an explicit
-        // verifier wins.
-        assert_eq!(
-            super::select_success_verifier(true, true, true),
-            super::SuccessVerifier::AutoTest
-        );
-    }
-
-    /// CB-002 core regression: should_run_auto_test_for_success == false and
-    /// AutoTestRunner::detect == None, but TesterCandidate::detect == Some →
-    /// Tester MUST run. The previous code mistakenly skipped Tester when
-    /// should_run was false.
-    #[test]
-    fn select_success_verifier_runs_tester_independent_of_should_run() {
-        assert_eq!(
-            super::select_success_verifier(false, false, true),
-            super::SuccessVerifier::Tester,
-            "Tester must fire even when should_run_auto_test_for_success is false"
-        );
-        // Same selection if AutoTestRunner returns Some (build-only verifier
-        // — TesterCandidate::detect already filtered explicit verifiers out).
-        assert_eq!(
-            super::select_success_verifier(false, true, true),
-            super::SuccessVerifier::Tester
-        );
-    }
-
-    /// should_run is true but neither auto_test plan nor Tester candidate
-    /// exists → NoVerifier (existing fallback).
-    #[test]
-    fn select_success_verifier_no_verifier_when_should_run_but_nothing_detects() {
-        assert_eq!(
-            super::select_success_verifier(true, false, false),
-            super::SuccessVerifier::NoVerifier
-        );
-    }
-
-    /// should_run is false and no Tester candidate → Skip (do nothing).
-    #[test]
-    fn select_success_verifier_skip_when_no_demand_no_tester() {
-        assert_eq!(
-            super::select_success_verifier(false, false, false),
-            super::SuccessVerifier::Skip
-        );
-        assert_eq!(
-            super::select_success_verifier(false, true, false),
-            super::SuccessVerifier::Skip,
-            "auto_test plan alone without should_run nor tester is a Skip"
         );
     }
 

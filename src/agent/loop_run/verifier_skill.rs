@@ -10,9 +10,9 @@
 //!   (facade applies outcome、DR-466-002 / Stage 5)
 //! - `render_log_payload`: agent.verifier.completed (3 + 1 key、DR3-002)
 //!
-//! turn.rs から `select_success_verifier` / `build_feedback_for_no_verifier` /
-//! `build_feedback_for_auto_test` の物理移動は本 Issue 範囲を超えるため、
-//! `pub(super)` 経路で参照する。設計書 §11 で将来 Issue に申し送り。
+//! success.rs owns verifier selection and no-verifier feedback; turn.rs still
+//! owns the AutoTest feedback builder until the remaining tool feedback
+//! builders are split as a separate boundary.
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -156,14 +156,14 @@ impl AgentSkill for VerifierSkill {
         let detected_plan = AutoTestRunner::detect(inputs.workspace_root, inputs.changed_files);
         let auto_test_some = detected_plan.is_some();
 
-        let decision = super::turn::select_success_verifier(
+        let decision = super::success::select_success_verifier(
             inputs.protocol_demands_verifier,
             auto_test_some,
             inputs.tester_candidate_some,
         );
 
         match (decision, detected_plan) {
-            (super::turn::SuccessVerifier::AutoTest, Some(plan)) => {
+            (super::success::SuccessVerifier::AutoTest, Some(plan)) => {
                 // DR2-002: Result::Err を AutoTestTransportError variant に分岐
                 match AutoTestRunner::run(inputs.workspace_root, &plan) {
                     Ok(result) => {
@@ -203,24 +203,25 @@ impl AgentSkill for VerifierSkill {
                     }
                 }
             }
-            (super::turn::SuccessVerifier::Tester, _) => {
+            (super::success::SuccessVerifier::Tester, _) => {
                 let score =
                     compute_anvil_score(&inputs.score_inputs, inputs.repo_verification, None);
                 Ok(wrap_skill_output(VerifierOutcome::TesterDelegated {
                     score,
                 }))
             }
-            (super::turn::SuccessVerifier::NoVerifier, _) => {
+            (super::success::SuccessVerifier::NoVerifier, _) => {
                 let score =
                     compute_anvil_score(&inputs.score_inputs, inputs.repo_verification, None);
-                let feedback = super::turn::build_feedback_for_no_verifier(inputs.workspace_root);
+                let feedback =
+                    super::success::build_feedback_for_no_verifier(inputs.workspace_root);
                 Ok(wrap_skill_output(VerifierOutcome::NoVerifier {
                     score,
                     feedback,
                 }))
             }
-            (super::turn::SuccessVerifier::Skip, _)
-            | (super::turn::SuccessVerifier::AutoTest, None) => {
+            (super::success::SuccessVerifier::Skip, _)
+            | (super::success::SuccessVerifier::AutoTest, None) => {
                 let score =
                     compute_anvil_score(&inputs.score_inputs, inputs.repo_verification, None);
                 Ok(wrap_skill_output(VerifierOutcome::Skipped { score }))
