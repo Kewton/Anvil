@@ -62,6 +62,7 @@ pub(super) enum VerifierCandidateSource {
     ProjectInstruction,
     CargoManifest,
     PackageJsonScripts,
+    NativeNodeFramework,
     PythonTests,
     PythonCompileFallback,
 }
@@ -72,6 +73,7 @@ impl VerifierCandidateSource {
             Self::ProjectInstruction => "project_instruction",
             Self::CargoManifest => "cargo_manifest",
             Self::PackageJsonScripts => "package_json_scripts",
+            Self::NativeNodeFramework => "native_node_framework",
             Self::PythonTests => "python_tests",
             Self::PythonCompileFallback => "python_compile_fallback",
         }
@@ -178,6 +180,9 @@ fn detect_verifier_candidates(
     if let Some(candidate) = detect_node_scripts(work_root) {
         candidates.push(candidate);
     }
+    if let Some(candidate) = detect_native_node_framework(work_root, changed_files) {
+        candidates.push(candidate);
+    }
     if let Some(candidate) = detect_python_verifier(work_root, changed_files) {
         candidates.push(candidate);
     }
@@ -198,6 +203,7 @@ fn source_priority(source: VerifierCandidateSource) -> u8 {
         VerifierCandidateSource::ProjectInstruction => 5,
         VerifierCandidateSource::CargoManifest => 4,
         VerifierCandidateSource::PackageJsonScripts => 3,
+        VerifierCandidateSource::NativeNodeFramework => 2,
         VerifierCandidateSource::PythonTests => 2,
         VerifierCandidateSource::PythonCompileFallback => 1,
     }
@@ -258,6 +264,92 @@ fn detect_node_scripts(work_root: &Path) -> Option<VerifierCandidate> {
         confidence,
         evidence,
     })
+}
+
+fn detect_native_node_framework(
+    work_root: &Path,
+    changed_files: &[String],
+) -> Option<VerifierCandidate> {
+    if !work_root.join("package.json").is_file() {
+        return None;
+    }
+    let package = std::fs::read_to_string(work_root.join("package.json")).ok()?;
+    if package_json_has_script(&package, "build") || package_json_has_script(&package, "test") {
+        return None;
+    }
+    let framework = native_node_framework_command(&package, work_root, changed_files)?;
+    let command = node_verifier_command(work_root, framework.command);
+    Some(VerifierCandidate {
+        plan: AutoTestPlan {
+            command,
+            reason: format!(
+                "{} project detected without package scripts",
+                framework.label
+            ),
+        },
+        source: VerifierCandidateSource::NativeNodeFramework,
+        confidence: 0.56,
+        evidence: framework.evidence,
+    })
+}
+
+struct NativeNodeFrameworkCommand {
+    label: &'static str,
+    command: &'static str,
+    evidence: Vec<String>,
+}
+
+fn native_node_framework_command(
+    package: &str,
+    work_root: &Path,
+    changed_files: &[String],
+) -> Option<NativeNodeFrameworkCommand> {
+    let lower = package.to_ascii_lowercase();
+    let changed_ui = changed_files.iter().any(|path| {
+        matches!(
+            Path::new(path).extension().and_then(|ext| ext.to_str()),
+            Some("svelte" | "vue" | "tsx" | "jsx" | "astro" | "css")
+        )
+    });
+    let mut evidence = Vec::new();
+    if changed_ui {
+        evidence.push("changed-ui-file".to_string());
+    }
+    if lower.contains("\"next\"") {
+        evidence.push("package.next".to_string());
+        return Some(NativeNodeFrameworkCommand {
+            label: "Next.js",
+            command: "npm exec -- next build",
+            evidence,
+        });
+    }
+    if lower.contains("\"astro\"") || changed_files.iter().any(|path| path.ends_with(".astro")) {
+        evidence.push("package.astro-or-astro-file".to_string());
+        return Some(NativeNodeFrameworkCommand {
+            label: "Astro",
+            command: "npm exec -- astro build",
+            evidence,
+        });
+    }
+    let has_vite_family = lower.contains("\"vite\"")
+        || lower.contains("\"@sveltejs/kit\"")
+        || lower.contains("\"svelte\"")
+        || lower.contains("\"@vitejs/plugin-vue\"")
+        || lower.contains("\"vue\"")
+        || lower.contains("\"solid-js\"")
+        || work_root.join("vite.config.js").is_file()
+        || work_root.join("vite.config.ts").is_file()
+        || work_root.join("svelte.config.js").is_file()
+        || work_root.join("svelte.config.ts").is_file();
+    if has_vite_family && changed_ui {
+        evidence.push("vite-family-framework".to_string());
+        return Some(NativeNodeFrameworkCommand {
+            label: "Vite-family UI",
+            command: "npm exec -- vite build",
+            evidence,
+        });
+    }
+    None
 }
 
 fn detect_python_verifier(work_root: &Path, changed_files: &[String]) -> Option<VerifierCandidate> {
@@ -770,6 +862,47 @@ mod tests {
             plan.command,
             "export CI=1 NUXT_IGNORE_LOCK=1; npm test && npm run build"
         );
+    }
+
+    #[test]
+    fn detects_sveltekit_build_without_package_scripts() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"@sveltejs/kit":"1.0.0","svelte":"4.0.0","vite":"5.0.0"}}"#,
+        )
+        .expect("package");
+        std::fs::write(dir.path().join("svelte.config.js"), "export default {};\n")
+            .expect("svelte config");
+
+        let plan = AutoTestRunner::detect(dir.path(), &["src/routes/+page.svelte".to_string()])
+            .expect("plan");
+
+        assert_eq!(
+            plan.command,
+            "export CI=1 NUXT_IGNORE_LOCK=1; npm install && npm exec -- vite build"
+        );
+        assert!(plan.reason.contains("source=native_node_framework"));
+        assert!(plan.reason.contains("vite-family-framework"));
+    }
+
+    #[test]
+    fn package_build_script_beats_native_framework_fallback() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"build":"svelte-kit build"},"dependencies":{"@sveltejs/kit":"1.0.0","svelte":"4.0.0","vite":"5.0.0"}}"#,
+        )
+        .expect("package");
+
+        let plan = AutoTestRunner::detect(dir.path(), &["src/routes/+page.svelte".to_string()])
+            .expect("plan");
+
+        assert_eq!(
+            plan.command,
+            "export CI=1 NUXT_IGNORE_LOCK=1; npm install && npm run build"
+        );
+        assert!(plan.reason.contains("source=package_json_scripts"));
     }
 
     #[test]

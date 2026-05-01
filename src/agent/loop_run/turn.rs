@@ -2363,11 +2363,11 @@ impl Agent {
                         self.session.record_feedback_if_unset(
                             build_feedback_for_deterministic_content_fallback(&self.work_root),
                         );
-                        final_prose = format!(
-                            "Improved the requested playable UI with deterministic visual polish in {target_path}."
+                        self.push_deterministic_ui_recovery_continuation_note(
+                            &target_path,
+                            repo_change_retries.saturating_add(1),
                         );
-                        exit_reason = ExitReason::Done;
-                        break 'outer;
+                        continue;
                     }
                     Ok(false) => {}
                     Err(err) => {
@@ -3100,11 +3100,11 @@ impl Agent {
                             self.session.record_feedback_if_unset(
                                 build_feedback_for_deterministic_content_fallback(&self.work_root),
                             );
-                            final_prose = format!(
-                                "Improved the requested playable UI with deterministic visual polish in {target_path}."
+                            self.push_deterministic_ui_recovery_continuation_note(
+                                &target_path,
+                                repo_change_retries.saturating_add(1),
                             );
-                            exit_reason = ExitReason::Done;
-                            break 'outer;
+                            continue;
                         }
                         Ok(false) => {}
                         Err(err) => {
@@ -3138,11 +3138,11 @@ impl Agent {
                             self.session.record_feedback_if_unset(
                                 build_feedback_for_deterministic_content_fallback(&self.work_root),
                             );
-                            final_prose = format!(
-                                "Implemented the requested playable UI by replacing scaffold placeholder output in {target_path}."
+                            self.push_deterministic_ui_recovery_continuation_note(
+                                &target_path,
+                                repo_change_retries.saturating_add(1),
                             );
-                            exit_reason = ExitReason::Done;
-                            break 'outer;
+                            continue;
                         }
                         Ok(false) => {}
                         Err(err) => {
@@ -3179,11 +3179,11 @@ impl Agent {
                             self.session.record_feedback_if_unset(
                                 build_feedback_for_deterministic_content_fallback(&self.work_root),
                             );
-                            final_prose = format!(
-                                "Implemented the requested playable UI by replacing scaffold placeholder output in {target_path}."
+                            self.push_deterministic_ui_recovery_continuation_note(
+                                &target_path,
+                                repo_change_retries.saturating_add(1),
                             );
-                            exit_reason = ExitReason::Done;
-                            break 'outer;
+                            continue;
                         }
                         Ok(false) => {}
                         Err(err) => {
@@ -3809,11 +3809,11 @@ impl Agent {
                         self.session.record_feedback_if_unset(
                             build_feedback_for_deterministic_content_fallback(&self.work_root),
                         );
-                        final_prose = format!(
-                            "Implemented the requested playable UI by replacing scaffold placeholder output in {target_path}."
+                        self.push_deterministic_ui_recovery_continuation_note(
+                            &target_path,
+                            repo_change_retries.saturating_add(1),
                         );
-                        exit_reason = ExitReason::Done;
-                        break 'outer;
+                        continue;
                     }
                     Ok(false) => {}
                     Err(err) => {
@@ -4679,7 +4679,7 @@ impl Agent {
                     }
                     if err.to_ascii_lowercase().contains("timed out")
                         && let Some(reply) =
-                            self.maybe_apply_deterministic_polish_fallback_after_timeout(&err)?
+                            self.maybe_apply_deterministic_polish_fallback_after_timeout(&err)
                     {
                         // Issue #455 / D2: timeout-after polish fallback success.
                         self.session.record_feedback_if_unset(
@@ -4691,7 +4691,7 @@ impl Agent {
                         && let Some(target) = self.focused_edit_recovery_target()
                     {
                         if let Some(reply) =
-                            self.maybe_apply_deterministic_quality_fallback_after_timeout(&err)?
+                            self.maybe_apply_deterministic_quality_fallback_after_timeout(&err)
                         {
                             // Issue #455 / D2: timeout-after quality fallback success.
                             self.session.record_feedback_if_unset(
@@ -5547,6 +5547,16 @@ impl Agent {
             attempt,
         ));
         true
+    }
+
+    fn push_deterministic_ui_recovery_continuation_note(
+        &mut self,
+        target_path: &str,
+        attempt: usize,
+    ) {
+        self.push_system_note(format!(
+            "Deterministic UI recovery updated {target_path}, but this is recovery context, not completion. Inspect the file if needed, then make one small model-produced Edit or run the project verifier before finalizing. deterministic_ui_recovery_attempt={attempt}"
+        ));
     }
 
     fn execute_tool_call(
@@ -6496,68 +6506,31 @@ if __name__ == "__main__":
     fn maybe_apply_deterministic_quality_fallback_after_timeout(
         &self,
         err: &str,
-    ) -> Result<Option<AssistantReply>, String> {
+    ) -> Option<AssistantReply> {
         if !err.to_ascii_lowercase().contains("timed out")
             || !self.current_request_needs_playable_ui_quality_gate()
         {
-            return Ok(None);
+            return None;
         }
-        let Some((request, target_path, issue)) = self.accepted_repo_change_quality_issue() else {
-            return Ok(None);
-        };
-        if !self.maybe_apply_deterministic_quality_fallback(&request, &target_path)? {
-            return Ok(None);
-        }
-        log_llm_event(
-            "agent.quality.timeout_fallback_applied",
-            serde_json::json!({
-                "session_id": self.session_store.session_id(),
-                "target": target_path,
-                "issue": issue,
-                "error": err,
-            }),
-        );
-        Ok(Some(AssistantReply {
-            content: format!(
-                "Implemented the requested playable UI by replacing scaffold placeholder output in {target_path} after the model timed out."
-            ),
-            tool_calls: Vec::new(),
-            prompt_tokens: None,
-            completion_tokens: None,
-        }))
+        // Creative/playable UI timeout recovery must not synthesize a
+        // completion reply. Let the focused-edit recovery path continue so the
+        // next successful completion is model-produced or verifier-backed.
+        None
     }
 
     fn maybe_apply_deterministic_polish_fallback_after_timeout(
         &self,
         err: &str,
-    ) -> Result<Option<AssistantReply>, String> {
+    ) -> Option<AssistantReply> {
         if !err.to_ascii_lowercase().contains("timed out")
             || !self.current_request_needs_playable_ui_quality_gate()
         {
-            return Ok(None);
+            return None;
         }
-        let Some((request, target_path)) = self.accepted_repo_change_polish_target() else {
-            return Ok(None);
-        };
-        if !self.maybe_apply_deterministic_polish_fallback(&request, &target_path)? {
-            return Ok(None);
-        }
-        log_llm_event(
-            "agent.polish.timeout_fallback_applied",
-            serde_json::json!({
-                "session_id": self.session_store.session_id(),
-                "target": target_path,
-                "error": err,
-            }),
-        );
-        Ok(Some(AssistantReply {
-            content: format!(
-                "Improved the requested playable UI with deterministic visual polish in {target_path} after the model timed out."
-            ),
-            tool_calls: Vec::new(),
-            prompt_tokens: None,
-            completion_tokens: None,
-        }))
+        // Same boundary as quality fallback above: deterministic polish can be
+        // a recovery aid during normal loop iterations, but timeout handling
+        // must not turn it into an assistant completion.
+        None
     }
 
     fn refresh_working_memory(&mut self) {
