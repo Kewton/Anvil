@@ -43,9 +43,9 @@ pub struct CliArgs {
     pub auto_plan: bool,
     #[arg(long = "offline")]
     pub offline: bool,
-    /// Control deterministic recovery templates. `full` preserves legacy
-    /// recovery behavior; `support-only` limits recovery to scaffolding/support
-    /// files; `off` disables deterministic recovery writes.
+    /// Control deterministic recovery. `hint-only` only nudges the model,
+    /// `minimal-patch` writes support files only, and `full-template` preserves
+    /// legacy full template recovery. `support-only` and `full` remain aliases.
     #[arg(long = "deterministic-fallback", value_enum)]
     pub deterministic_fallback: Option<DeterministicFallbackMode>,
     /// Disable the fixed footer status bar (mode / token usage / log level).

@@ -4718,6 +4718,16 @@ impl Agent {
         self.session
             .working_memory
             .note_touched_file(relative.clone());
+        log_llm_event(
+            "agent.deterministic_format_error_small_edit",
+            serde_json::json!({
+                "session_id": self.session_store.session_id(),
+                "work_root": self.work_root.display().to_string(),
+                "fallback_level": self.config.deterministic_fallback.fallback_level(),
+                "fallback_action": "minimal_patch",
+                "target": &relative,
+            }),
+        );
         Ok(Some(AssistantReply {
             content: format!(
                 "Applied a deterministic small-edit fallback for qwen3.5 after malformed tool calls in {relative}."
@@ -4848,6 +4858,8 @@ impl Agent {
                 "plan_path": plan_path.display().to_string(),
                 "task_profile": self.session.mode_state.task_profile.as_str(),
                 "model_override": self.plan_model_override,
+                "fallback_level": self.config.deterministic_fallback.fallback_level(),
+                "fallback_action": "minimal_patch",
             }),
         );
         Ok(true)
@@ -5637,6 +5649,8 @@ impl Agent {
                 "session_id": self.session_store.session_id(),
                 "work_root": self.work_root.display().to_string(),
                 "work_mode": self.session.mode_state.work_mode.as_str(),
+                "fallback_level": self.config.deterministic_fallback.fallback_level(),
+                "fallback_action": "full_template",
                 "files": written_paths,
             }),
         );
@@ -5668,11 +5682,7 @@ impl Agent {
     }
 
     fn maybe_materialize_framework_game_fallback(&mut self, last_iter: usize) -> bool {
-        if !self
-            .config
-            .deterministic_fallback
-            .allows_template_completion()
-        {
+        if !self.config.deterministic_fallback.allows_hint_only() {
             return false;
         }
         if !self
@@ -5693,6 +5703,35 @@ impl Agent {
             && !deterministic_framework_app_files_needed(&self.work_root, &files, &request)
         {
             return false;
+        }
+        if !self
+            .config
+            .deterministic_fallback
+            .allows_template_completion()
+        {
+            let level = self.config.deterministic_fallback.fallback_level();
+            write_stdout_rendered(
+                &format_iteration_status(
+                    last_iter,
+                    self.config.max_iterations,
+                    "App fallback hint",
+                    &format!(
+                        "Deterministic full-template fallback is disabled at level {level}; asked the model to continue with a task-specific implementation."
+                    ),
+                    self.footer.current_cols(),
+                ),
+                true,
+            );
+            log_llm_event(
+                "agent.empty_workspace.deterministic_framework_app_hint",
+                serde_json::json!({
+                    "session_id": self.session_store.session_id(),
+                    "work_root": self.work_root.display().to_string(),
+                    "fallback_level": level,
+                    "fallback_action": "hint_only",
+                }),
+            );
+            return true;
         }
 
         let mut written = Vec::<PathBuf>::new();
@@ -5745,6 +5784,8 @@ impl Agent {
             serde_json::json!({
                 "session_id": self.session_store.session_id(),
                 "work_root": self.work_root.display().to_string(),
+                "fallback_level": self.config.deterministic_fallback.fallback_level(),
+                "fallback_action": "full_template",
                 "files": written_paths,
             }),
         );
@@ -5793,6 +5834,8 @@ impl Agent {
                 serde_json::json!({
                     "session_id": self.session_store.session_id(),
                     "work_root": self.work_root.display().to_string(),
+                    "fallback_level": self.config.deterministic_fallback.fallback_level(),
+                    "fallback_action": "minimal_patch",
                     "reason": reason,
                 }),
             );
@@ -5848,6 +5891,8 @@ impl Agent {
             serde_json::json!({
                 "session_id": self.session_store.session_id(),
                 "work_root": self.work_root.display().to_string(),
+                "fallback_level": self.config.deterministic_fallback.fallback_level(),
+                "fallback_action": "minimal_patch",
                 "create_next_app_version": CREATE_NEXT_APP_PACKAGE_VERSION,
             }),
         );
@@ -6108,6 +6153,16 @@ if __name__ == "__main__":
             .map_err(|err| format!("failed to write {}: {err}", target.display()))?;
         self.maybe_apply_deterministic_framework_support_files(request)?;
         self.maybe_apply_requested_port_script(request)?;
+        log_llm_event(
+            "agent.deterministic_ui_quality_repair",
+            serde_json::json!({
+                "session_id": self.session_store.session_id(),
+                "work_root": self.work_root.display().to_string(),
+                "fallback_level": self.config.deterministic_fallback.fallback_level(),
+                "fallback_action": "full_template",
+                "target": relative_target,
+            }),
+        );
         Ok(true)
     }
 
@@ -6121,6 +6176,7 @@ if __name__ == "__main__":
         let Some(files) = deterministic::empty_framework_app_files(request) else {
             return Ok(());
         };
+        let mut written_paths = Vec::<String>::new();
         for (relative, content) in files {
             if deterministic_framework_game_impl_path(&relative) {
                 continue;
@@ -6134,6 +6190,19 @@ if __name__ == "__main__":
             }
             std::fs::write(&target, content)
                 .map_err(|err| format!("failed to write {}: {err}", target.display()))?;
+            written_paths.push(target_relative.to_string_lossy().replace('\\', "/"));
+        }
+        if !written_paths.is_empty() {
+            log_llm_event(
+                "agent.deterministic_framework_support_files",
+                serde_json::json!({
+                    "session_id": self.session_store.session_id(),
+                    "work_root": self.work_root.display().to_string(),
+                    "fallback_level": self.config.deterministic_fallback.fallback_level(),
+                    "fallback_action": "minimal_patch",
+                    "files": written_paths,
+                }),
+            );
         }
         Ok(())
     }
@@ -6160,6 +6229,16 @@ if __name__ == "__main__":
         std::fs::write(&target, replacement)
             .map_err(|err| format!("failed to write {}: {err}", target.display()))?;
         self.maybe_apply_requested_port_script(request)?;
+        log_llm_event(
+            "agent.deterministic_ui_polish",
+            serde_json::json!({
+                "session_id": self.session_store.session_id(),
+                "work_root": self.work_root.display().to_string(),
+                "fallback_level": self.config.deterministic_fallback.fallback_level(),
+                "fallback_action": "full_template",
+                "target": relative_target,
+            }),
+        );
         Ok(true)
     }
 
@@ -6203,6 +6282,16 @@ if __name__ == "__main__":
             .unwrap_or(target.as_path())
             .to_string_lossy()
             .replace('\\', "/");
+        log_llm_event(
+            "agent.deterministic_local_llm_small_edit",
+            serde_json::json!({
+                "session_id": self.session_store.session_id(),
+                "work_root": self.work_root.display().to_string(),
+                "fallback_level": self.config.deterministic_fallback.fallback_level(),
+                "fallback_action": "full_template",
+                "target": &relative,
+            }),
+        );
         Ok(Some(relative))
     }
 

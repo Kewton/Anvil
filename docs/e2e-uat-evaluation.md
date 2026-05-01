@@ -88,6 +88,7 @@ Record these for every scenario/model/repetition.
 | `protocol_complete` | Work mode protocol accepted the artifact | higher |
 | `verification_pass` | Auto/manual verifier passed | higher |
 | `fallback_used` | Deterministic or recovery fallback was applied | lower |
+| `fallback_level` | Configured deterministic fallback stage (`off`, `hint-only`, `minimal-patch`, `full-template`) | visible |
 | `fallback_completed` | Fallback was treated as completion | must be 0 |
 | `first_success_iter` | First useful progress iteration | lower |
 | `total_iter` | Final loop iteration count | lower |
@@ -215,7 +216,7 @@ For release-quality validation, use the expanded strict rule:
 `workspace/eval/runs/<run-id>/results.csv` should use this header:
 
 ```csv
-run_id,commit,scenario_id,model,sidecar_model,rep,pass,high_quality,protocol_complete,verification_pass,fallback_used,fallback_completed,first_success_iter,total_iter,duration_sec,changed_files_count,unrelated_change_count,tool_failure_count,read_before_edit,real_entry_file_touched,safe_fail,safety_violation,browser_smoke_pass,resume_pass,dirty_worktree_preserved,notes
+run_id,commit,scenario_id,model,sidecar_model,rep,pass,high_quality,protocol_complete,verification_pass,fallback_used,fallback_level,fallback_completed,first_success_iter,total_iter,duration_sec,changed_files_count,unrelated_change_count,tool_failure_count,read_before_edit,real_entry_file_touched,safe_fail,safety_violation,browser_smoke_pass,resume_pass,dirty_worktree_preserved,notes
 ```
 
 Boolean fields must be `true` or `false`. Unknown values should be empty rather
@@ -293,8 +294,9 @@ Change focus:
   returning a pass/fail reason.
 - RepoContext now has project-structure seed candidates for pathless test,
   Rust, Python, Node/UI, and docs requests.
-- `deterministic_fallback` now defaults to `support-only`; full template
-  completion requires explicit `full` / `full-template`.
+- `deterministic_fallback` now defaults to `minimal-patch`; `support-only`
+  remains an alias. Full template completion requires explicit `full` /
+  `full-template`, and `hint-only` records guidance without deterministic writes.
 
 Verification run:
 

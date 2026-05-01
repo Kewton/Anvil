@@ -83,7 +83,7 @@ fn merge_offline_prefers_later_sources() {
 fn deterministic_fallback_mode_parses_aliases() {
     assert_eq!(
         DeterministicFallbackMode::default(),
-        DeterministicFallbackMode::SupportOnly
+        DeterministicFallbackMode::MinimalPatch
     );
     assert_eq!(
         "off".parse::<DeterministicFallbackMode>().unwrap(),
@@ -91,39 +91,46 @@ fn deterministic_fallback_mode_parses_aliases() {
     );
     assert_eq!(
         "hint-only".parse::<DeterministicFallbackMode>().unwrap(),
-        DeterministicFallbackMode::Off
+        DeterministicFallbackMode::HintOnly
     );
     assert_eq!(
         "support_only".parse::<DeterministicFallbackMode>().unwrap(),
-        DeterministicFallbackMode::SupportOnly
+        DeterministicFallbackMode::MinimalPatch
     );
     assert_eq!(
         "minimal-patch"
             .parse::<DeterministicFallbackMode>()
             .unwrap(),
-        DeterministicFallbackMode::SupportOnly
+        DeterministicFallbackMode::MinimalPatch
     );
     assert_eq!(
         "enabled".parse::<DeterministicFallbackMode>().unwrap(),
-        DeterministicFallbackMode::Full
+        DeterministicFallbackMode::FullTemplate
     );
     assert_eq!(
         "full-template"
             .parse::<DeterministicFallbackMode>()
             .unwrap(),
-        DeterministicFallbackMode::Full
+        DeterministicFallbackMode::FullTemplate
     );
+    assert_eq!(
+        DeterministicFallbackMode::MinimalPatch.to_string(),
+        "minimal-patch"
+    );
+    assert!(!DeterministicFallbackMode::HintOnly.allows_support_recovery());
+    assert!(!DeterministicFallbackMode::MinimalPatch.allows_template_completion());
+    assert!(DeterministicFallbackMode::FullTemplate.allows_template_completion());
 }
 
 #[test]
 fn merge_deterministic_fallback_prefers_later_sources() {
     let merged = merge_partial_configs(&[
         PartialConfig {
-            deterministic_fallback: Some(DeterministicFallbackMode::Full),
+            deterministic_fallback: Some(DeterministicFallbackMode::FullTemplate),
             ..PartialConfig::default()
         },
         PartialConfig {
-            deterministic_fallback: Some(DeterministicFallbackMode::SupportOnly),
+            deterministic_fallback: Some(DeterministicFallbackMode::MinimalPatch),
             ..PartialConfig::default()
         },
         PartialConfig {

@@ -44,6 +44,7 @@ RESULT_FIELDS = [
     "protocol_complete",
     "verification_pass",
     "fallback_used",
+    "fallback_level",
     "fallback_completed",
     "first_success_iter",
     "total_iter",
@@ -184,6 +185,7 @@ def common_result(
     return {
         "protocol_complete": rc == 0,
         "fallback_used": fallback_used,
+        "fallback_level": "minimal-patch",
         "fallback_completed": False,
         "first_success_iter": first_iter,
         "total_iter": total_iter,
@@ -820,6 +822,7 @@ def run_one(
             "protocol_complete": "",
             "verification_pass": "",
             "fallback_used": "",
+            "fallback_level": "minimal-patch",
             "fallback_completed": "",
             "first_success_iter": first_iter,
             "total_iter": total_iter,
@@ -842,6 +845,7 @@ def run_one(
     grade.setdefault("protocol_complete", rc == 0)
     grade.setdefault("verification_pass", "")
     grade.setdefault("fallback_used", "fallback" in output.lower())
+    grade.setdefault("fallback_level", "minimal-patch")
     grade.setdefault("fallback_completed", False)
     grade.setdefault("first_success_iter", "")
     grade.setdefault("total_iter", "")

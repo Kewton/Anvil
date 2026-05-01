@@ -72,30 +72,60 @@ impl FromStr for LogLevel {
     Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, serde::Serialize, serde::Deserialize,
 )]
 pub enum DeterministicFallbackMode {
+    #[value(alias = "disabled", alias = "false", alias = "0")]
     Off,
+    #[value(alias = "hint")]
+    HintOnly,
     #[default]
-    SupportOnly,
-    Full,
+    #[value(
+        alias = "support-only",
+        alias = "support_only",
+        alias = "support",
+        alias = "minimal",
+        alias = "minimal-patches",
+        alias = "minimal_patches"
+    )]
+    MinimalPatch,
+    #[value(
+        alias = "full",
+        alias = "enabled",
+        alias = "true",
+        alias = "1",
+        alias = "full-templates",
+        alias = "full_templates"
+    )]
+    FullTemplate,
 }
 
 impl DeterministicFallbackMode {
+    pub fn fallback_level(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::HintOnly => "hint-only",
+            Self::MinimalPatch => "minimal-patch",
+            Self::FullTemplate => "full-template",
+        }
+    }
+
+    pub fn allows_hint_only(self) -> bool {
+        matches!(
+            self,
+            Self::HintOnly | Self::MinimalPatch | Self::FullTemplate
+        )
+    }
+
     pub fn allows_template_completion(self) -> bool {
-        matches!(self, Self::Full)
+        matches!(self, Self::FullTemplate)
     }
 
     pub fn allows_support_recovery(self) -> bool {
-        matches!(self, Self::SupportOnly | Self::Full)
+        matches!(self, Self::MinimalPatch | Self::FullTemplate)
     }
 }
 
 impl fmt::Display for DeterministicFallbackMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = match self {
-            Self::Off => "off",
-            Self::SupportOnly => "support-only",
-            Self::Full => "full",
-        };
-        write!(f, "{s}")
+        write!(f, "{}", self.fallback_level())
     }
 }
 
@@ -104,12 +134,13 @@ impl FromStr for DeterministicFallbackMode {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_ascii_lowercase().replace('_', "-").as_str() {
-            "off" | "disabled" | "false" | "0" | "hint-only" | "hint" => Ok(Self::Off),
+            "off" | "disabled" | "false" | "0" => Ok(Self::Off),
+            "hint-only" | "hint" => Ok(Self::HintOnly),
             "support-only" | "support" | "minimal" | "minimal-patch" | "minimal-patches" => {
-                Ok(Self::SupportOnly)
+                Ok(Self::MinimalPatch)
             }
             "full" | "enabled" | "true" | "1" | "full-template" | "full-templates" => {
-                Ok(Self::Full)
+                Ok(Self::FullTemplate)
             }
             other => Err(format!("unknown deterministic fallback mode: {other}")),
         }
