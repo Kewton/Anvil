@@ -3,7 +3,7 @@
 ## Product Summary
 
 Anvil は Ollama 前提の local-first coding agent。
-v0.1.0 では旧 Anvil の汎用 phase machine を廃止し、以下のコアへ絞っている。
+旧 Anvil の汎用 phase machine ではなく、ローカル LLM が追いやすい tool-first loop と構造化された recovery / verification に寄せている。
 
 - Ollama direct chat
 - tool-first agent loop
@@ -12,13 +12,18 @@ v0.1.0 では旧 Anvil の汎用 phase machine を廃止し、以下のコアへ
 - session persistence
 - XML fallback
 - git checkpoint / rollback
+- evidence-based WorkMode policy
+- AutoTest / Tester / temporary test workspace
+- RepoGraph / Case Memory / AntiPattern
+- structured eval log
 
 ## Non-Goals For This Rewrite
 
 - multi-provider abstraction
 - 旧 `src/app/*` ベースの継続移植
-- 複雑な termination / bootstrap / detector 群の維持
-- MCP / skills / watcher / auto-test / heavy TUI の先行移植
+- 汎用クラウド agent 的な provider / subagent / MCP transport の拡張
+- 重い full-screen TUI
+- deterministic template を通常完了証明として扱うこと
 
 ## Public Compatibility Kept
 
@@ -32,9 +37,11 @@ v0.1.0 では旧 Anvil の汎用 phase machine を廃止し、以下のコアへ
 ```text
 src/
   agent/
+    loop_run/
   git/
   modes/
   ollama/
+  repo_graph/
   safety/
   session/
   tools/
@@ -45,3 +52,4 @@ src/
 - local LLM が一本道で追えること
 - 状態機械よりも失敗しにくい protocol を優先すること
 - 「起動した」ではなく「依頼どおりに動く」へ寄せること
+- パターンマッチは security / syntax recovery では許容し、intent / quality / success / verifier では evidence として扱うこと

@@ -23,6 +23,14 @@ pub(super) struct ProtocolSuccessContext<'a> {
     pub(super) model_repo_edits_this_turn: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ProtocolSuccessEvidence {
+    pub(super) changed_relevant_artifact: bool,
+    pub(super) relevant_artifact_reason: Option<&'static str>,
+    pub(super) deterministic_only: bool,
+    pub(super) total_changed: usize,
+}
+
 impl ExecutionProtocol {
     pub(super) fn from_work_mode(mode: WorkMode) -> Self {
         let kind = match mode {
@@ -54,16 +62,16 @@ impl ExecutionProtocol {
         self,
         context: ProtocolSuccessContext<'_>,
     ) -> Option<String> {
-        if context.deterministic_recovery_recorded && context.model_repo_edits_this_turn == 0 {
+        let evidence = self.success_evidence(context);
+        if evidence.deterministic_only {
             return Some(
                 "protocol requires model-produced or verified work; deterministic fallback is recovery context, not completion"
                     .to_string(),
             );
         }
-        let stats = context.stats;
         match self.kind {
             ProtocolKind::AnswerOnly => {
-                if stats.total_changed == 0 {
+                if evidence.total_changed == 0 {
                     None
                 } else {
                     Some(
@@ -72,16 +80,12 @@ impl ExecutionProtocol {
                     )
                 }
             }
-            ProtocolKind::Docs => require_any_changed(
-                stats,
-                &[".md", ".mdx", ".txt", ".rst"],
+            ProtocolKind::Docs => require_evidence_artifact(
+                &evidence,
                 "docs protocol requires a documentation artifact",
             ),
             ProtocolKind::Python => {
-                if stats.changed_impl_count > 0
-                    || stats.changed_test_count > 0
-                    || stats.changed_files.iter().any(|path| path.ends_with(".py"))
-                {
+                if evidence.changed_relevant_artifact {
                     None
                 } else {
                     Some(
@@ -91,16 +95,7 @@ impl ExecutionProtocol {
                 }
             }
             ProtocolKind::TypeScriptUi => {
-                if stats.changed_impl_count > 0
-                    || stats.changed_files.iter().any(|path| {
-                        [
-                            ".tsx", ".ts", ".jsx", ".js", ".vue", ".svelte", ".astro", ".css",
-                            ".html",
-                        ]
-                        .iter()
-                        .any(|suffix| path.ends_with(suffix))
-                    })
-                {
+                if evidence.changed_relevant_artifact {
                     None
                 } else {
                     Some(
@@ -110,7 +105,7 @@ impl ExecutionProtocol {
                 }
             }
             ProtocolKind::GenericCode => {
-                if stats.total_changed > 0 {
+                if evidence.total_changed > 0 {
                     None
                 } else {
                     Some("code protocol requires at least one repository edit".to_string())
@@ -118,22 +113,74 @@ impl ExecutionProtocol {
             }
         }
     }
+
+    pub(super) fn success_evidence(
+        self,
+        context: ProtocolSuccessContext<'_>,
+    ) -> ProtocolSuccessEvidence {
+        let stats = context.stats;
+        let deterministic_only =
+            context.deterministic_recovery_recorded && context.model_repo_edits_this_turn == 0;
+        let (changed_relevant_artifact, relevant_artifact_reason) = match self.kind {
+            ProtocolKind::AnswerOnly => (stats.total_changed == 0, Some("no_repo_edits")),
+            ProtocolKind::Docs => relevant_suffix(stats, &[".md", ".mdx", ".txt", ".rst"])
+                .map(|reason| (true, Some(reason)))
+                .unwrap_or((false, None)),
+            ProtocolKind::Python => {
+                if stats.changed_impl_count > 0 {
+                    (true, Some("impl_file_category"))
+                } else if stats.changed_test_count > 0 {
+                    (true, Some("test_file_category"))
+                } else {
+                    relevant_suffix(stats, &[".py"])
+                        .map(|reason| (true, Some(reason)))
+                        .unwrap_or((false, None))
+                }
+            }
+            ProtocolKind::TypeScriptUi => {
+                if stats.changed_impl_count > 0 {
+                    (true, Some("impl_file_category"))
+                } else {
+                    relevant_suffix(
+                        stats,
+                        &[
+                            ".tsx", ".ts", ".jsx", ".js", ".vue", ".svelte", ".astro", ".css",
+                            ".html",
+                        ],
+                    )
+                    .map(|reason| (true, Some(reason)))
+                    .unwrap_or((false, None))
+                }
+            }
+            ProtocolKind::GenericCode => (stats.total_changed > 0, Some("repo_edit")),
+        };
+
+        ProtocolSuccessEvidence {
+            changed_relevant_artifact,
+            relevant_artifact_reason,
+            deterministic_only,
+            total_changed: stats.total_changed,
+        }
+    }
 }
 
-fn require_any_changed(
-    stats: &LoopStats,
-    suffixes: &[&str],
+fn require_evidence_artifact(
+    evidence: &ProtocolSuccessEvidence,
     message: &'static str,
 ) -> Option<String> {
-    if stats
-        .changed_files
-        .iter()
-        .any(|path| suffixes.iter().any(|suffix| path.ends_with(suffix)))
-    {
+    if evidence.changed_relevant_artifact {
         None
     } else {
         Some(message.to_string())
     }
+}
+
+fn relevant_suffix(stats: &LoopStats, suffixes: &[&str]) -> Option<&'static str> {
+    stats
+        .changed_files
+        .iter()
+        .any(|path| suffixes.iter().any(|suffix| path.ends_with(suffix)))
+        .then_some("file_suffix")
 }
 
 #[cfg(test)]
@@ -224,6 +271,25 @@ mod tests {
                 .success_issue_with_context(context(&ui_stats, false))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn protocol_success_exposes_evidence_before_decision() {
+        let mut ui_stats = stats(&[".next/cache/0001.sst"], 36);
+        ui_stats.changed_impl_count = 1;
+        let protocol = ExecutionProtocol::from_work_mode(WorkMode::TypeScriptUi);
+        let evidence = protocol.success_evidence(ProtocolSuccessContext {
+            stats: &ui_stats,
+            deterministic_recovery_recorded: false,
+            model_repo_edits_this_turn: 1,
+        });
+
+        assert!(evidence.changed_relevant_artifact);
+        assert_eq!(
+            evidence.relevant_artifact_reason,
+            Some("impl_file_category")
+        );
+        assert!(!evidence.deterministic_only);
     }
 
     #[test]

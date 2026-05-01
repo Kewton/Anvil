@@ -8,7 +8,7 @@ use super::summary::{ExitReason, format_run_summary};
 use super::*;
 use crate::config::LogLevel;
 use crate::logging::log_llm_event;
-use crate::modes::plan_act::{PlanStage, TaskProfile, infer_work_mode_from_text};
+use crate::modes::plan_act::{PlanStage, TaskProfile, classify_work_mode_json};
 use crate::ollama::xml_fallback::strip_think_tags;
 use crate::session::precaution::{
     AddPrecautionOutcome, Precaution, PrecautionSource, PrecautionStatus, Severity,
@@ -904,8 +904,27 @@ impl Agent {
             return Ok(None);
         }
 
-        let work_mode = infer_work_mode_from_text(input);
+        let classification = classify_work_mode_json(input);
+        let work_mode = classification.work_mode;
         self.session.mode_state.work_mode = work_mode;
+        log_llm_event(
+            "agent.work_mode.classified",
+            serde_json::json!({
+                "session_id": self.session_store.session_id(),
+                "input": input,
+                "stage": "auto_plan_precheck",
+                "work_mode": classification.work_mode.as_str(),
+                "intent": classification.intent,
+                "confidence": classification.confidence,
+                "ambiguity": classification.ambiguity,
+                "alternative_gap": classification.alternative_gap,
+                "allows_file_edits": classification.allows_file_edits,
+                "requires_tests": classification.requires_tests,
+                "reason": classification.reason,
+                "evidence": &classification.evidence,
+                "alternatives": &classification.alternatives,
+            }),
+        );
         let policy = work_mode.policy();
         if !policy.repo_edit_required {
             self.session.mode_state.task_profile = TaskProfile::Research;

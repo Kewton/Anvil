@@ -13,7 +13,9 @@ use super::tester;
 use super::*;
 use crate::agent::orchestration::{RepoVerification, capture_repo_snapshot, verify_repo_progress};
 use crate::logging::log_llm_event;
-use crate::modes::plan_act::{PlanStage, TaskProfile, WorkMode, infer_work_mode_from_text};
+use crate::modes::plan_act::{
+    PlanStage, TaskProfile, WorkMode, classify_work_mode_json, infer_work_mode_from_text,
+};
 use crate::ollama::client::SIDECAR_SUMMARY_TIMEOUT_SECS;
 use crate::ollama::xml_fallback::normalize_tool_call_arguments;
 use crate::session::feedback::{
@@ -2216,7 +2218,26 @@ impl Agent {
     ) -> LoopResult {
         self.push_user_message(input.to_string());
         if self.session.mode_state.mode != ExecutionMode::Plan {
-            self.session.mode_state.work_mode = infer_work_mode_from_text(input);
+            let classification = classify_work_mode_json(input);
+            self.session.mode_state.work_mode = classification.work_mode;
+            log_llm_event(
+                "agent.work_mode.classified",
+                serde_json::json!({
+                    "session_id": self.session_store.session_id(),
+                    "input": input,
+                    "stage": "turn_start",
+                    "work_mode": classification.work_mode.as_str(),
+                    "intent": classification.intent,
+                    "confidence": classification.confidence,
+                    "ambiguity": classification.ambiguity,
+                    "alternative_gap": classification.alternative_gap,
+                    "allows_file_edits": classification.allows_file_edits,
+                    "requires_tests": classification.requires_tests,
+                    "reason": classification.reason,
+                    "evidence": &classification.evidence,
+                    "alternatives": &classification.alternatives,
+                }),
+            );
             self.maybe_compact_session(DEFAULT_KEEP_TAIL);
         }
         let _ = self.refresh_plan_stage();

@@ -73,8 +73,8 @@ impl FromStr for LogLevel {
 )]
 pub enum DeterministicFallbackMode {
     Off,
-    SupportOnly,
     #[default]
+    SupportOnly,
     Full,
 }
 
@@ -104,9 +104,13 @@ impl FromStr for DeterministicFallbackMode {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_ascii_lowercase().replace('_', "-").as_str() {
-            "off" | "disabled" | "false" | "0" => Ok(Self::Off),
-            "support-only" | "support" | "minimal" => Ok(Self::SupportOnly),
-            "full" | "enabled" | "true" | "1" => Ok(Self::Full),
+            "off" | "disabled" | "false" | "0" | "hint-only" | "hint" => Ok(Self::Off),
+            "support-only" | "support" | "minimal" | "minimal-patch" | "minimal-patches" => {
+                Ok(Self::SupportOnly)
+            }
+            "full" | "enabled" | "true" | "1" | "full-template" | "full-templates" => {
+                Ok(Self::Full)
+            }
             other => Err(format!("unknown deterministic fallback mode: {other}")),
         }
     }

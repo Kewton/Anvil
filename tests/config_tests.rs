@@ -82,7 +82,15 @@ fn merge_offline_prefers_later_sources() {
 #[test]
 fn deterministic_fallback_mode_parses_aliases() {
     assert_eq!(
+        DeterministicFallbackMode::default(),
+        DeterministicFallbackMode::SupportOnly
+    );
+    assert_eq!(
         "off".parse::<DeterministicFallbackMode>().unwrap(),
+        DeterministicFallbackMode::Off
+    );
+    assert_eq!(
+        "hint-only".parse::<DeterministicFallbackMode>().unwrap(),
         DeterministicFallbackMode::Off
     );
     assert_eq!(
@@ -90,7 +98,19 @@ fn deterministic_fallback_mode_parses_aliases() {
         DeterministicFallbackMode::SupportOnly
     );
     assert_eq!(
+        "minimal-patch"
+            .parse::<DeterministicFallbackMode>()
+            .unwrap(),
+        DeterministicFallbackMode::SupportOnly
+    );
+    assert_eq!(
         "enabled".parse::<DeterministicFallbackMode>().unwrap(),
+        DeterministicFallbackMode::Full
+    );
+    assert_eq!(
+        "full-template"
+            .parse::<DeterministicFallbackMode>()
+            .unwrap(),
         DeterministicFallbackMode::Full
     );
 }

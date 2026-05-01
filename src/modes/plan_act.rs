@@ -139,6 +139,8 @@ pub struct ModeClassification {
     pub allows_file_edits: bool,
     pub requires_tests: bool,
     pub confidence: f32,
+    pub ambiguity: bool,
+    pub alternative_gap: f32,
     pub reason: &'static str,
     #[serde(default)]
     pub evidence: Vec<&'static str>,
@@ -388,6 +390,12 @@ pub fn classify_work_mode_json(raw: &str) -> ModeClassification {
     });
 
     let selected = candidates[0].clone();
+    let second_confidence = candidates
+        .get(1)
+        .map(|candidate| candidate.confidence)
+        .unwrap_or(0.0);
+    let alternative_gap = (selected.confidence - second_confidence).max(0.0);
+    let ambiguity = alternative_gap < 0.15 && selected.confidence < 0.90;
     let requires_tests =
         selected.work_mode != WorkMode::AnswerOnly && request_requires_tests(&lower, raw);
     ModeClassification {
@@ -396,6 +404,8 @@ pub fn classify_work_mode_json(raw: &str) -> ModeClassification {
         allows_file_edits: selected.work_mode != WorkMode::AnswerOnly,
         requires_tests: selected.work_mode != WorkMode::Docs && requires_tests,
         confidence: selected.confidence,
+        ambiguity,
+        alternative_gap,
         reason: mode_reason(selected.work_mode),
         evidence: selected.evidence.clone(),
         alternatives: candidates,
@@ -564,9 +574,13 @@ mod tests {
         assert!(classification.requires_tests);
         assert!(!classification.evidence.is_empty());
         assert!(!classification.alternatives.is_empty());
+        assert!(!classification.ambiguity);
+        assert!(classification.alternative_gap >= 0.0);
         let json = serde_json::to_string(&classification).expect("json");
         assert!(json.contains("\"work_mode\":\"Python\""));
         assert!(json.contains("\"intent\":\"python-code\""));
+        assert!(json.contains("\"ambiguity\""));
+        assert!(json.contains("\"alternative_gap\""));
         assert!(json.contains("\"alternatives\""));
     }
 

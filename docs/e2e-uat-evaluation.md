@@ -197,3 +197,41 @@ Use this set immediately after protocol or fallback changes:
 This smoke set intentionally mixes coding, non-coding, UI, script execution,
 existing-code editing, and fallback-sensitive creative work.
 
+## 2026-05-01 Implementation Validation
+
+Change focus:
+
+- README / ANVIL.md public description was synced with the current local-first
+  implementation.
+- WorkMode classification now records selected mode, confidence, ambiguity,
+  evidence, and alternatives in structured logs.
+- Protocol success decisions now flow through explicit success evidence before
+  returning a pass/fail reason.
+- RepoContext now has project-structure seed candidates for pathless test,
+  Rust, Python, Node/UI, and docs requests.
+- `deterministic_fallback` now defaults to `support-only`; full template
+  completion requires explicit `full` / `full-template`.
+
+Verification run:
+
+| Check | Result | Notes |
+| --- | --- | --- |
+| `cargo fmt --all -- --check` | PASS | Formatting clean |
+| `cargo test --all` | PASS | 1092 lib tests, all integration tests, and doc tests passed; live Ollama tests remained ignored by design |
+| `cargo clippy --all-targets -- -D warnings` | PASS | No clippy warnings |
+| qwen3.6 answer-only canary | PASS | Fresh session, `qwen3.6:27b-coding-nvfp4`, iter 2/4, 22s, 0 edited files |
+| qwen3.5 answer-only canary | PASS | Fresh session, `qwen3.5:122b`, iter 2/4, 27s, 0 edited files |
+
+Strict matrix status:
+
+| Requirement | Status |
+| --- | --- |
+| 4 instructions from different scenario groups | Not completed in this pass |
+| 2 required models | Canary completed for both models |
+| 3 consecutive high-quality repetitions | Not completed in this pass |
+| Public result table | This section records implementation validation; strict matrix results must be appended after the full run |
+
+The current result confirms that the code-level changes are stable and that the
+two required local models can execute the simplest read-only protocol without
+repo edits. It does not yet prove strict quality stability across coding,
+framework, script, and existing-code modification scenarios.
