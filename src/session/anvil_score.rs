@@ -436,6 +436,7 @@ mod tests {
     fn repo_with(impls: usize, tests: usize, setups: usize) -> RepoVerification {
         RepoVerification {
             changed_files: Vec::new(),
+            all_changed_files: Vec::new(),
             implementation_files_changed: impls,
             test_files_changed: tests,
             setup_files_changed: setups,

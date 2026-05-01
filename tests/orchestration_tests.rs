@@ -24,6 +24,7 @@ fn deterministic_verifier_reports_changed_file_categories() {
     assert_eq!(verification.deleted_files_changed, 0);
     assert!(verification.made_any_progress());
     assert_eq!(verification.changed_files.len(), 3);
+    assert_eq!(verification.all_changed_files.len(), 3);
     assert_eq!(verification.total_changed_files(), 3);
 }
 
@@ -45,6 +46,12 @@ fn deleted_files_are_counted_with_suffix() {
             .any(|f| f.contains("(deleted)")),
         "expected (deleted) suffix, got: {:?}",
         verification.changed_files
+    );
+    assert!(
+        verification
+            .all_changed_files
+            .iter()
+            .any(|f| f.contains("(deleted)"))
     );
 }
 
@@ -80,6 +87,7 @@ fn markdown_docs_are_counted_as_other_changed_files() {
     assert_eq!(v.other_files_changed, 1);
     assert_eq!(v.total_changed_files(), 1);
     assert_eq!(v.changed_files, vec!["README.md".to_string()]);
+    assert_eq!(v.all_changed_files, vec!["README.md".to_string()]);
 }
 
 #[test]
@@ -98,6 +106,7 @@ fn runtime_artifact_dirs_are_ignored() {
 
     let v = verify_repo_progress(&before, temp.path());
     assert_eq!(v.changed_files, vec!["calculator.py".to_string()]);
+    assert_eq!(v.all_changed_files, vec!["calculator.py".to_string()]);
     assert_eq!(v.implementation_files_changed, 1);
     assert_eq!(v.total_changed_files(), 1);
 }
@@ -122,5 +131,6 @@ fn changed_files_capped_at_sixteen() {
         v.changed_files.len()
     );
     assert_eq!(v.implementation_files_changed, 20);
+    assert_eq!(v.all_changed_files.len(), 20);
     assert_eq!(v.total_changed_files(), 20);
 }

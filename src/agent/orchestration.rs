@@ -14,7 +14,11 @@ pub struct RepoSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoVerification {
+    /// Display-capped changed files. Kept small for summaries and telemetry.
     pub changed_files: Vec<String>,
+    /// Complete changed file list for protocol evidence. Do not render this
+    /// directly in user-facing summaries without an explicit cap.
+    pub all_changed_files: Vec<String>,
     pub implementation_files_changed: usize,
     pub test_files_changed: usize,
     pub setup_files_changed: usize,
@@ -70,6 +74,7 @@ pub fn capture_repo_snapshot(root: &Path) -> RepoSnapshot {
 pub fn verify_repo_progress(before: &RepoSnapshot, root: &Path) -> RepoVerification {
     let after = capture_repo_snapshot(root);
     let mut changed_files = Vec::new();
+    let mut all_changed_files = Vec::new();
     let mut implementation_files_changed = 0usize;
     let mut test_files_changed = 0usize;
     let mut setup_files_changed = 0usize;
@@ -83,6 +88,7 @@ pub fn verify_repo_progress(before: &RepoSnapshot, root: &Path) -> RepoVerificat
             continue;
         }
         let display = path.display().to_string();
+        all_changed_files.push(display.clone());
         if changed_files.len() < 16 {
             changed_files.push(display.clone());
         }
@@ -103,6 +109,7 @@ pub fn verify_repo_progress(before: &RepoSnapshot, root: &Path) -> RepoVerificat
             continue;
         }
         let display = format!("{} (deleted)", path.display());
+        all_changed_files.push(display.clone());
         if changed_files.len() < 16 {
             changed_files.push(display);
         }
@@ -111,6 +118,7 @@ pub fn verify_repo_progress(before: &RepoSnapshot, root: &Path) -> RepoVerificat
 
     RepoVerification {
         changed_files,
+        all_changed_files,
         implementation_files_changed,
         test_files_changed,
         setup_files_changed,

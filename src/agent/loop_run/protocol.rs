@@ -21,12 +21,18 @@ pub(super) struct ProtocolSuccessContext<'a> {
     pub(super) stats: &'a LoopStats,
     pub(super) deterministic_recovery_recorded: bool,
     pub(super) model_repo_edits_this_turn: usize,
+    pub(super) requested_paths: &'a [String],
+    pub(super) verifier_passed_after_edit: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ProtocolSuccessEvidence {
     pub(super) changed_relevant_artifact: bool,
     pub(super) relevant_artifact_reason: Option<&'static str>,
+    pub(super) requested_path_count: usize,
+    pub(super) requested_path_changed: bool,
+    pub(super) unrequested_changed_count: usize,
+    pub(super) verifier_passed_after_edit: Option<bool>,
     pub(super) deterministic_only: bool,
     pub(super) total_changed: usize,
 }
@@ -55,6 +61,8 @@ impl ExecutionProtocol {
             stats,
             deterministic_recovery_recorded: false,
             model_repo_edits_this_turn: 0,
+            requested_paths: &[],
+            verifier_passed_after_edit: None,
         })
     }
 
@@ -68,6 +76,9 @@ impl ExecutionProtocol {
                 "protocol requires model-produced or verified work; deterministic fallback is recovery context, not completion"
                     .to_string(),
             );
+        }
+        if evidence.verifier_passed_after_edit == Some(false) {
+            return Some("protocol verifier failed after the edit".to_string());
         }
         match self.kind {
             ProtocolKind::AnswerOnly => {
@@ -85,6 +96,9 @@ impl ExecutionProtocol {
                 "docs protocol requires a documentation artifact",
             ),
             ProtocolKind::Python => {
+                if let Some(issue) = requested_path_issue(&evidence) {
+                    return Some(issue);
+                }
                 if evidence.changed_relevant_artifact {
                     None
                 } else {
@@ -95,6 +109,9 @@ impl ExecutionProtocol {
                 }
             }
             ProtocolKind::TypeScriptUi => {
+                if let Some(issue) = requested_path_issue(&evidence) {
+                    return Some(issue);
+                }
                 if evidence.changed_relevant_artifact {
                     None
                 } else {
@@ -105,6 +122,9 @@ impl ExecutionProtocol {
                 }
             }
             ProtocolKind::GenericCode => {
+                if let Some(issue) = requested_path_issue(&evidence) {
+                    return Some(issue);
+                }
                 if evidence.total_changed > 0 {
                     None
                 } else {
@@ -121,6 +141,10 @@ impl ExecutionProtocol {
         let stats = context.stats;
         let deterministic_only =
             context.deterministic_recovery_recorded && context.model_repo_edits_this_turn == 0;
+        let requested_path_changed =
+            requested_path_changed(context.requested_paths, &stats.all_changed_files);
+        let unrequested_changed_count =
+            unrequested_changed_count(context.requested_paths, &stats.all_changed_files);
         let (changed_relevant_artifact, relevant_artifact_reason) = match self.kind {
             ProtocolKind::AnswerOnly => (stats.total_changed == 0, Some("no_repo_edits")),
             ProtocolKind::Docs => relevant_suffix(stats, &[".md", ".mdx", ".txt", ".rst"])
@@ -158,9 +182,81 @@ impl ExecutionProtocol {
         ProtocolSuccessEvidence {
             changed_relevant_artifact,
             relevant_artifact_reason,
+            requested_path_count: context.requested_paths.len(),
+            requested_path_changed,
+            unrequested_changed_count,
+            verifier_passed_after_edit: context.verifier_passed_after_edit,
             deterministic_only,
             total_changed: stats.total_changed,
         }
+    }
+}
+
+pub(super) fn requested_paths_from_text(text: &str) -> Vec<String> {
+    const EXTENSIONS: &[&str] = &[
+        ".rs", ".py", ".ts", ".tsx", ".js", ".jsx", ".vue", ".svelte", ".astro", ".css", ".html",
+        ".md", ".mdx", ".toml", ".json", ".yaml", ".yml", ".txt",
+    ];
+    let mut out = Vec::new();
+    for raw in text.split_whitespace() {
+        let token = raw.trim_matches(|c: char| {
+            matches!(
+                c,
+                '`' | '\''
+                    | '"'
+                    | ','
+                    | ':'
+                    | ';'
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '<'
+                    | '>'
+                    | '「'
+                    | '」'
+                    | '『'
+                    | '』'
+                    | '（'
+                    | '）'
+                    | '、'
+                    | '。'
+            )
+        });
+        let token = token.strip_prefix("./").unwrap_or(token);
+        let lower = token.to_ascii_lowercase();
+        if !EXTENSIONS.iter().any(|ext| lower.ends_with(ext)) {
+            continue;
+        }
+        if token.is_empty()
+            || token.starts_with('/')
+            || token.contains("..")
+            || token.contains("://")
+            || token.contains('\\')
+        {
+            continue;
+        }
+        let normalized = token.to_string();
+        if !out.contains(&normalized) {
+            out.push(normalized);
+        }
+        if out.len() >= 8 {
+            break;
+        }
+    }
+    out
+}
+
+fn requested_path_issue(evidence: &ProtocolSuccessEvidence) -> Option<String> {
+    if evidence.requested_path_count > 0 && !evidence.requested_path_changed {
+        Some(format!(
+            "protocol requires changing the requested path; unrequested_changed_count={}",
+            evidence.unrequested_changed_count
+        ))
+    } else {
+        None
     }
 }
 
@@ -177,10 +273,43 @@ fn require_evidence_artifact(
 
 fn relevant_suffix(stats: &LoopStats, suffixes: &[&str]) -> Option<&'static str> {
     stats
-        .changed_files
+        .all_changed_files
         .iter()
         .any(|path| suffixes.iter().any(|suffix| path.ends_with(suffix)))
         .then_some("file_suffix")
+}
+
+fn requested_path_changed(requested_paths: &[String], changed_files: &[String]) -> bool {
+    !requested_paths.is_empty()
+        && requested_paths.iter().any(|requested| {
+            changed_files
+                .iter()
+                .any(|changed| path_matches_request(changed, requested))
+        })
+}
+
+fn unrequested_changed_count(requested_paths: &[String], changed_files: &[String]) -> usize {
+    if requested_paths.is_empty() {
+        return 0;
+    }
+    changed_files
+        .iter()
+        .filter(|changed| {
+            !requested_paths
+                .iter()
+                .any(|requested| path_matches_request(changed, requested))
+        })
+        .count()
+}
+
+fn path_matches_request(changed: &str, requested: &str) -> bool {
+    let changed = changed.strip_suffix(" (deleted)").unwrap_or(changed);
+    let requested = requested.strip_prefix("./").unwrap_or(requested);
+    changed == requested
+        || std::path::Path::new(changed)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == requested)
 }
 
 #[cfg(test)]
@@ -192,7 +321,16 @@ mod tests {
             iter_used: 1,
             iter_max: 50,
             duration_secs: 0,
-            changed_files: files.iter().map(|file| file.to_string()).collect(),
+            changed_files: files
+                .iter()
+                .map(|file| file.to_string())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            all_changed_files: files
+                .iter()
+                .map(|file| file.to_string())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
             total_changed,
             changed_impl_count: 0,
             changed_test_count: 0,
@@ -208,6 +346,8 @@ mod tests {
             stats,
             deterministic_recovery_recorded,
             model_repo_edits_this_turn: 0,
+            requested_paths: &[],
+            verifier_passed_after_edit: None,
         }
     }
 
@@ -282,6 +422,8 @@ mod tests {
             stats: &ui_stats,
             deterministic_recovery_recorded: false,
             model_repo_edits_this_turn: 1,
+            requested_paths: &[],
+            verifier_passed_after_edit: None,
         });
 
         assert!(evidence.changed_relevant_artifact);
@@ -303,8 +445,93 @@ mod tests {
                     stats: &ui_stats,
                     deterministic_recovery_recorded: true,
                     model_repo_edits_this_turn: 1,
+                    requested_paths: &[],
+                    verifier_passed_after_edit: None,
                 })
                 .is_none()
         );
+    }
+
+    #[test]
+    fn requested_path_must_be_changed_when_explicit() {
+        let protocol = ExecutionProtocol::from_work_mode(WorkMode::Python);
+        let requested = vec!["src/tool.py".to_string()];
+
+        assert!(
+            protocol
+                .success_issue_with_context(ProtocolSuccessContext {
+                    stats: &stats(&["src/other.py"], 1),
+                    deterministic_recovery_recorded: false,
+                    model_repo_edits_this_turn: 1,
+                    requested_paths: &requested,
+                    verifier_passed_after_edit: None,
+                })
+                .is_some()
+        );
+        assert!(
+            protocol
+                .success_issue_with_context(ProtocolSuccessContext {
+                    stats: &stats(&["src/tool.py"], 1),
+                    deterministic_recovery_recorded: false,
+                    model_repo_edits_this_turn: 1,
+                    requested_paths: &requested,
+                    verifier_passed_after_edit: None,
+                })
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn evidence_counts_unrequested_changes_against_requested_paths() {
+        let protocol = ExecutionProtocol::from_work_mode(WorkMode::GenericCode);
+        let requested = vec!["src/app.ts".to_string()];
+        let stats = stats(&["src/app.ts", "src/other.ts", "README.md"], 3);
+        let evidence = protocol.success_evidence(ProtocolSuccessContext {
+            stats: &stats,
+            deterministic_recovery_recorded: false,
+            model_repo_edits_this_turn: 1,
+            requested_paths: &requested,
+            verifier_passed_after_edit: None,
+        });
+
+        assert!(evidence.requested_path_changed);
+        assert_eq!(evidence.unrequested_changed_count, 2);
+    }
+
+    #[test]
+    fn verifier_failure_after_edit_blocks_protocol_success() {
+        let protocol = ExecutionProtocol::from_work_mode(WorkMode::GenericCode);
+        let stats = stats(&["src/app.ts"], 1);
+
+        assert_eq!(
+            protocol.success_issue_with_context(ProtocolSuccessContext {
+                stats: &stats,
+                deterministic_recovery_recorded: false,
+                model_repo_edits_this_turn: 1,
+                requested_paths: &[],
+                verifier_passed_after_edit: Some(false),
+            }),
+            Some("protocol verifier failed after the edit".to_string())
+        );
+        assert!(
+            protocol
+                .success_issue_with_context(ProtocolSuccessContext {
+                    stats: &stats,
+                    deterministic_recovery_recorded: false,
+                    model_repo_edits_this_turn: 1,
+                    requested_paths: &[],
+                    verifier_passed_after_edit: Some(true),
+                })
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn requested_paths_from_text_extracts_safe_relative_paths() {
+        assert_eq!(
+            requested_paths_from_text("src/app/page.tsx と `README.md` を更新してください"),
+            vec!["src/app/page.tsx".to_string(), "README.md".to_string()]
+        );
+        assert!(requested_paths_from_text("../secret.py /tmp/x.py https://x/y.py").is_empty());
     }
 }

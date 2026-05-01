@@ -1333,6 +1333,7 @@ fn build_stats(
     duration_secs: u64,
 ) -> LoopStats {
     let mut all_changed: HashSet<String> = HashSet::new();
+    let mut all_changed_full: HashSet<String> = HashSet::new();
     let mut impl_changed = 0usize;
     let mut test_changed = 0usize;
     let mut setup_changed = 0usize;
@@ -1342,6 +1343,9 @@ fn build_stats(
     for verif in accumulated.iter().chain(std::iter::once(&final_verif)) {
         for f in &verif.changed_files {
             all_changed.insert(f.clone());
+        }
+        for f in &verif.all_changed_files {
+            all_changed_full.insert(f.clone());
         }
         impl_changed += verif.implementation_files_changed;
         test_changed += verif.test_files_changed;
@@ -1355,12 +1359,15 @@ fn build_stats(
     let mut changed_files: Vec<String> = all_changed.into_iter().collect();
     changed_files.sort();
     changed_files.truncate(16);
+    let mut all_changed_files: Vec<String> = all_changed_full.into_iter().collect();
+    all_changed_files.sort();
 
     LoopStats {
         iter_used,
         iter_max,
         duration_secs,
-        changed_files,
+        changed_files: changed_files.into_boxed_slice(),
+        all_changed_files: all_changed_files.into_boxed_slice(),
         total_changed,
         changed_impl_count: impl_changed,
         changed_test_count: test_changed,

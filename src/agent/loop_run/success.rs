@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use super::auto_test::AutoTestRunner;
-use super::protocol::{ExecutionProtocol, ProtocolSuccessContext};
+use super::protocol::{ExecutionProtocol, ProtocolSuccessContext, requested_paths_from_text};
 use super::summary::{ExitReason, LoopStats};
 use super::tester;
 use super::verifier_skill::VerifierInputs;
@@ -96,10 +96,16 @@ impl Agent {
                 self.session.last_feedback.as_ref().is_some_and(|frame| {
                     frame.primary_error.as_deref() == Some(DETERMINISTIC_CONTENT_FALLBACK_TAG)
                 });
+            let requested_paths = self
+                .active_request_text()
+                .map(|text| requested_paths_from_text(&text))
+                .unwrap_or_default();
             if let Some(issue) = protocol.success_issue_with_context(ProtocolSuccessContext {
                 stats,
                 deterministic_recovery_recorded,
                 model_repo_edits_this_turn,
+                requested_paths: &requested_paths,
+                verifier_passed_after_edit: None,
             }) {
                 *exit_reason = ExitReason::MissingRepoEdits;
                 *error_text = issue;
