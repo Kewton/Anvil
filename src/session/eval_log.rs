@@ -563,6 +563,7 @@ mod tests {
             scores: vec![CaseScoreBreakdown {
                 case_id: "case_abc".to_string(),
                 task: 0.5,
+                semantic: 0.0,
                 stack: 0.1,
                 repo: 0.2,
                 files: 0.1,

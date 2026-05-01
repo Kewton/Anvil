@@ -389,6 +389,7 @@ fn r11_case_retrieval_result_serialized() {
         scores: vec![CaseScoreBreakdown {
             case_id: "case_abc123".to_string(),
             task: 0.6,
+            semantic: 0.0,
             stack: 0.1,
             repo: 0.1,
             files: 0.1,

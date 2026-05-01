@@ -41,7 +41,8 @@ pub const MAX_SELECTED_CASES: usize = 3;
 pub(crate) const CASE_RETRIEVAL_SCORE_THRESHOLD: f32 = 0.40;
 
 // Score weights (DR1-001). Sum MUST equal 1.0 — debug_assert in `score_case`.
-pub(crate) const W_TASK: f32 = 0.30;
+pub(crate) const W_TASK: f32 = 0.10;
+pub(crate) const W_SEMANTIC: f32 = 0.20;
 pub(crate) const W_STACK: f32 = 0.10;
 pub(crate) const W_REPO: f32 = 0.20;
 pub(crate) const W_FILES: f32 = 0.20;
@@ -62,6 +63,7 @@ pub(crate) const ENV_DRY_RUN: &str = "ANVIL_CASE_RETRIEVAL_DRY_RUN";
 pub struct CaseScoreBreakdown {
     pub case_id: String,
     pub task: f32,
+    pub semantic: f32,
     pub stack: f32,
     pub repo: f32,
     pub files: f32,
@@ -306,6 +308,93 @@ fn tokenize_ascii_lowercase(s: &str) -> HashSet<String> {
     out
 }
 
+fn semantic_tokens(s: &str) -> HashSet<String> {
+    let lower = s.to_lowercase();
+    let mut out = HashSet::new();
+    let groups: &[(&str, &[&str])] = &[
+        (
+            "bugfix",
+            &[
+                "bug",
+                "defect",
+                "issue",
+                "broken",
+                "fix",
+                "repair",
+                "correct",
+                "不具合",
+                "バグ",
+                "修正",
+                "直し",
+                "直す",
+            ],
+        ),
+        (
+            "failing-test",
+            &[
+                "failing",
+                "failure",
+                "failed",
+                "assertion",
+                "test",
+                "pytest",
+                "テスト",
+                "失敗",
+                "落ちる",
+                "通す",
+            ],
+        ),
+        (
+            "ui-route",
+            &[
+                "route",
+                "page",
+                "screen",
+                "view",
+                "component",
+                "sveltekit",
+                "svelte",
+                "画面",
+                "ページ",
+                "ルート",
+            ],
+        ),
+        (
+            "run-script",
+            &[
+                "run",
+                "execute",
+                "script",
+                "command",
+                "summarize",
+                "実行",
+                "コマンド",
+                "スクリプト",
+                "要約",
+            ],
+        ),
+        (
+            "verify",
+            &[
+                "verify",
+                "verifier",
+                "validate",
+                "check",
+                "build",
+                "テスト",
+                "検証",
+                "確認",
+            ],
+        ),
+    ];
+    for (canonical, terms) in groups {
+        if terms.iter().any(|term| lower.contains(term)) {
+            out.insert((*canonical).to_string());
+        }
+    }
+    out
+}
+
 /// Jaccard over two `&str` iterators. Both empty → 0.0 (no signal).
 fn jaccard<'a, I, J>(left: I, right: J) -> f32
 where
@@ -325,7 +414,8 @@ where
 /// Compute the 6-component score for one candidate.
 fn score_case(current: &CaseRetrievalInputs<'_>, candidate: &CaseRecord) -> CaseScoreBreakdown {
     debug_assert!(
-        (W_TASK + W_STACK + W_REPO + W_FILES + W_KIND + W_PRECAUTIONS - 1.0).abs() < 1e-6,
+        (W_TASK + W_SEMANTIC + W_STACK + W_REPO + W_FILES + W_KIND + W_PRECAUTIONS - 1.0).abs()
+            < 1e-6,
         "case_retrieval weights must sum to 1.0"
     );
 
@@ -335,6 +425,12 @@ fn score_case(current: &CaseRetrievalInputs<'_>, candidate: &CaseRecord) -> Case
     let task = jaccard(
         cur_task.iter().map(String::as_str),
         cand_task.iter().map(String::as_str),
+    );
+    let cur_semantic = semantic_tokens(current.current_task_signature);
+    let cand_semantic = semantic_tokens(&candidate.task_signature);
+    let semantic = jaccard(
+        cur_semantic.iter().map(String::as_str),
+        cand_semantic.iter().map(String::as_str),
     );
 
     // Language stack: Jaccard over &[String].
@@ -427,6 +523,7 @@ fn score_case(current: &CaseRetrievalInputs<'_>, candidate: &CaseRecord) -> Case
     );
 
     let total = W_TASK * task
+        + W_SEMANTIC * semantic
         + W_STACK * stack
         + W_REPO * repo
         + W_FILES * files
@@ -436,6 +533,7 @@ fn score_case(current: &CaseRetrievalInputs<'_>, candidate: &CaseRecord) -> Case
     CaseScoreBreakdown {
         case_id: candidate.case_id.clone(),
         task,
+        semantic,
         stack,
         repo,
         files,
@@ -530,7 +628,7 @@ mod tests {
 
     #[test]
     fn weights_sum_to_one() {
-        let s = W_TASK + W_STACK + W_REPO + W_FILES + W_KIND + W_PRECAUTIONS;
+        let s = W_TASK + W_SEMANTIC + W_STACK + W_REPO + W_FILES + W_KIND + W_PRECAUTIONS;
         assert!((s - 1.0).abs() < 1e-6, "sum was {s}");
     }
 
@@ -570,6 +668,22 @@ mod tests {
     #[test]
     fn tokenize_ascii_lowercase_empty() {
         assert!(tokenize_ascii_lowercase("   ").is_empty());
+    }
+
+    #[test]
+    fn semantic_tokens_bridge_japanese_and_english_bugfix_terms() {
+        let japanese = semantic_tokens("失敗しているテストを通すために不具合を修正");
+        let english = semantic_tokens("repair broken failing test bug");
+        assert!(japanese.contains("bugfix"));
+        assert!(japanese.contains("failing-test"));
+        assert!(english.contains("bugfix"));
+        assert!(english.contains("failing-test"));
+        assert!(
+            jaccard(
+                japanese.iter().map(String::as_str),
+                english.iter().map(String::as_str)
+            ) > 0.0
+        );
     }
 
     // --- score_case ----------------------------------------------------
@@ -762,6 +876,37 @@ mod tests {
         assert!(b.total >= 0.0 && b.total <= 1.0);
     }
 
+    #[test]
+    fn score_semantic_match_when_lexical_overlap_is_low() {
+        let stack = vec!["rust".to_string()];
+        let rec = fake_record(
+            "case_aaaaaaaaaaaaaaaaaaaa",
+            "repair broken failing test bug",
+            "ws-X",
+            "h",
+        );
+        let cur_fp = RepoFingerprint {
+            workspace_key: "ws-Y".to_string(),
+            git_remote: None,
+            git_head_branch: None,
+            language_stack_hash: "h".to_string(),
+        };
+        let inputs = CaseRetrievalInputs {
+            current_task_signature: "失敗しているテストを通すために不具合を修正",
+            current_language_stack: &stack,
+            current_repo_fingerprint: &cur_fp,
+            current_touched_files: &[],
+            current_feedback_kind: Some(FeedbackKind::CompileError),
+            current_active_precautions: &[],
+        };
+        let b = score_case(&inputs, &rec);
+        assert_eq!(b.task, 0.0);
+        assert!(
+            b.semantic > 0.0,
+            "semantic score should bridge wording: {b:?}"
+        );
+    }
+
     // --- format_for_prompt ---------------------------------------------
 
     fn fake_selected(case_id: &str, task: &str, total: f32) -> SelectedCase {
@@ -770,6 +915,7 @@ mod tests {
             breakdown: CaseScoreBreakdown {
                 case_id: case_id.to_string(),
                 task: 1.0,
+                semantic: 1.0,
                 stack: 1.0,
                 repo: 1.0,
                 files: 0.0,
@@ -1039,6 +1185,47 @@ mod tests {
                 );
             }
             _ => panic!("expected Completed"),
+        }
+    }
+
+    #[test]
+    fn retrieve_semantic_rerank_prefers_synonym_match_over_misleading_lexical_overlap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("cases");
+        let mut semantic = fake_record(
+            "case_semanticmatch00000",
+            "repair broken failing test bug",
+            "ws-A",
+            "h",
+        );
+        semantic.created_at = 100;
+        let mut misleading = fake_record(
+            "case_misleading0000000",
+            "alpha bravo charlie docs",
+            "ws-A",
+            "h",
+        );
+        misleading.created_at = 200;
+        let e_semantic = write_record(&dir, &semantic).unwrap();
+        let e_misleading = write_record(&dir, &misleading).unwrap();
+        let stack = vec!["rust".to_string()];
+        let fp = cur_fp_match();
+        let inputs = CaseRetrievalInputs {
+            current_task_signature: "失敗しているテストを通すために不具合を修正 alpha",
+            current_language_stack: &stack,
+            current_repo_fingerprint: &fp,
+            current_touched_files: &[],
+            current_feedback_kind: Some(FeedbackKind::CompileError),
+            current_active_precautions: &[],
+        };
+        let out =
+            retrieve_with_iter(&inputs, false, || Ok(vec![e_misleading, e_semantic])).unwrap();
+        match out {
+            RetrievalOutcome::Completed { selected, .. } => {
+                assert_eq!(selected[0].record.case_id, "case_semanticmatch00000");
+                assert!(selected[0].breakdown.semantic > selected[1].breakdown.semantic);
+            }
+            other => panic!("expected Completed, got {other:?}"),
         }
     }
 
