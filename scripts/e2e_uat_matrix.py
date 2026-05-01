@@ -100,6 +100,14 @@ def run_cmd(
     )
 
 
+def timeout_output(value: bytes | str | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
+
+
 def snapshot_files(root: Path) -> dict[str, str]:
     out: dict[str, str] = {}
     for path in sorted(root.rglob("*")):
@@ -776,10 +784,19 @@ def run_one(
         stderr = ""
         rc = 0
     else:
-        cp = run_cmd(cmd, workdir, timeout=timeout_secs)
-        stdout = cp.stdout
-        stderr = cp.stderr
-        rc = cp.returncode
+        try:
+            cp = run_cmd(cmd, workdir, timeout=timeout_secs)
+            stdout = cp.stdout
+            stderr = cp.stderr
+            rc = cp.returncode
+        except subprocess.TimeoutExpired as exc:
+            stdout = timeout_output(exc.stdout)
+            stderr = timeout_output(exc.stderr)
+            stderr = (
+                stderr
+                + f"\nTIMEOUT: scenario exceeded {timeout_secs} seconds and was marked failed.\n"
+            )
+            rc = 124
     duration = time.monotonic() - started
 
     (log_dir / f"{scenario.id}.stdout.log").write_text(stdout, encoding="utf-8")
@@ -839,6 +856,13 @@ def run_one(
     grade.setdefault("resume_pass", "")
     grade.setdefault("dirty_worktree_preserved", "")
     grade.setdefault("notes", "")
+    if rc == 124:
+        grade["notes"] = "timeout"
+        grade["pass"] = False
+        grade["high_quality"] = False
+        grade["protocol_complete"] = False
+        grade["verification_pass"] = False
+        grade["tool_failure_count"] = 1
 
     row: dict[str, str] = {
         "run_id": run_dir.name,

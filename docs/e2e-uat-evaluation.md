@@ -278,7 +278,8 @@ Default `--scenario-set expanded` currently covers:
 Use `--dry-run` to verify the planned matrix and output paths without invoking
 Anvil; dry-run rows leave pass/fail fields blank and exit `0`. Real runs exit
 `0` only when every row is `high_quality=true`; otherwise they exit `2` after
-writing the artifacts for inspection.
+writing the artifacts for inspection. Per-scenario timeouts are recorded as
+failed rows with `notes=timeout`; they must not abort the rest of the matrix.
 
 ## 2026-05-01 Implementation Validation
 
