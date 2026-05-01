@@ -113,6 +113,8 @@ jobs:
         run: sudo apt-get install -y jq
       - name: shellcheck
         run: shellcheck -S warning scripts/*.sh tests/scripts/*.sh
+      - name: repository hygiene
+        run: bash scripts/check_repo_hygiene.sh
       - name: bench.sh dry-run smoke tests
         run: |
           # matrix smoke test

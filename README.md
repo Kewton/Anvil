@@ -291,6 +291,7 @@ workdir 側の `.anvil/logs/` `.anvil/sessions/` `.anvil/plans/` は上記への
 `scripts/` 配下のハーネス群で 5-run ベンチマークと集計レポートを生成できる。
 実践的な E2E/UAT の評価設計は `docs/e2e-uat-evaluation.md` にまとめている。
 CI / release confidence checks は [docs/ci.md](docs/ci.md) にまとめている。
+Git 管理に含める artifacts の方針は [docs/repository-hygiene.md](docs/repository-hygiene.md) にまとめている。
 
 ```bash
 # 1モデル 5-run ベンチマーク
@@ -319,6 +320,7 @@ cargo fmt --all
 cargo clippy --all-targets -- -D warnings
 cargo test --all
 bash scripts/check_cli_help_snapshot.sh
+bash scripts/check_repo_hygiene.sh
 cargo test --test e2e_local_llm live_ollama_can_write_a_file -- --ignored --nocapture
 ANVIL_E2E_RUNS=2 cargo test --test e2e_local_llm live_ollama_multi_run_file_write_stability -- --ignored --nocapture
 cargo build --release

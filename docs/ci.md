@@ -14,7 +14,7 @@ Default CI runs on `main`, `develop`, and `release/**` branches:
 - `audit`: RustSec dependency advisory check
 - `cli-help`: compares `anvil --help` against `docs/cli-help.snapshot.txt`
 - `test`: `cargo test --all` on Ubuntu and macOS
-- `shellcheck`: shell script lint plus dry-run shell smoke tests
+- `shellcheck`: shell script lint, repository hygiene, and dry-run shell smoke tests
 - `python`: Python lint, snapshot, compatibility, and security tests
 - `build`: release build on Ubuntu and macOS after the required checks pass
 
@@ -31,6 +31,13 @@ bash scripts/check_cli_help_snapshot.sh
 
 This catches README / release documentation drift before a release branch is
 cut.
+
+## Repository Hygiene
+
+`bash scripts/check_repo_hygiene.sh` fails when transient local artifact
+directories such as `workspace/`, `.anvil/`, `.commandmate/`, `dev-reports/`, or
+`sandbox/` are tracked. The policy is documented in
+`docs/repository-hygiene.md`.
 
 ## Manual Live E2E
 
