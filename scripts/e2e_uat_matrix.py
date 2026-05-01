@@ -14,12 +14,15 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import textwrap
 import time
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -46,6 +49,16 @@ RESULT_FIELDS = [
     "fallback_used",
     "fallback_level",
     "fallback_completed",
+    "mode",
+    "mode_confidence",
+    "mode_alternative_gap",
+    "mode_ambiguity",
+    "mode_override_count",
+    "verifier_source",
+    "verifier_candidate_count",
+    "repo_context_seed_source",
+    "repo_context_candidate_count",
+    "repo_context_no_candidates",
     "first_success_iter",
     "total_iter",
     "duration_sec",
@@ -168,6 +181,130 @@ def has_tool_failure(output: str) -> bool:
             "unsafe command blocked",
         ]
     )
+
+
+def load_llm_events(state_dir: Path) -> list[dict[str, object]]:
+    events: list[dict[str, object]] = []
+    for path in sorted(state_dir.glob("sessions/*/logs/llm-io.jsonl")):
+        with path.open(encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(record, dict):
+                    events.append(record)
+    return events
+
+
+def event_payload(event: dict[str, object]) -> dict[str, object]:
+    payload = event.get("payload")
+    return payload if isinstance(payload, dict) else {}
+
+
+def format_metric_float(value: object) -> str:
+    if isinstance(value, (int, float)):
+        return f"{float(value):.2f}"
+    return ""
+
+
+def extract_observability(events: list[dict[str, object]]) -> dict[str, object]:
+    metrics: dict[str, object] = {
+        "mode": "",
+        "mode_confidence": "",
+        "mode_alternative_gap": "",
+        "mode_ambiguity": "",
+        "mode_override_count": 0,
+        "verifier_source": "",
+        "verifier_candidate_count": "",
+        "repo_context_seed_source": "",
+        "repo_context_candidate_count": "",
+        "repo_context_no_candidates": "",
+    }
+
+    mode_events = [event for event in events if event.get("event") == "agent.work_mode.classified"]
+    if mode_events:
+        payload = event_payload(mode_events[-1])
+        metrics["mode"] = str(payload.get("work_mode", ""))
+        metrics["mode_confidence"] = format_metric_float(payload.get("confidence"))
+        metrics["mode_alternative_gap"] = format_metric_float(payload.get("alternative_gap"))
+        ambiguity = payload.get("ambiguity")
+        metrics["mode_ambiguity"] = ambiguity if isinstance(ambiguity, bool) else ""
+    else:
+        for event in events:
+            if event.get("event") != "ollama.chat.request":
+                continue
+            messages = event_payload(event).get("messages")
+            if not isinstance(messages, list):
+                continue
+            for message in messages:
+                if not isinstance(message, dict):
+                    continue
+                content = message.get("content")
+                if not isinstance(content, str):
+                    continue
+                match = re.search(r"\[Mode Policy\] Work mode is ([^.]+)\.", content)
+                if match:
+                    metrics["mode"] = match.group(1).strip()
+                    break
+            if metrics["mode"]:
+                break
+
+    metrics["mode_override_count"] = sum(
+        1
+        for event in events
+        if str(event.get("event", "")).startswith("agent.classifier.bypassed")
+        or event.get("event") == "agent.classifier.fallback_used"
+    )
+
+    fallback_levels = [
+        str(event_payload(event).get("fallback_level", ""))
+        for event in events
+        if event_payload(event).get("fallback_level")
+    ]
+    if fallback_levels:
+        metrics["fallback_level"] = fallback_levels[-1]
+
+    verifier_events = [event for event in events if event.get("event") == "agent.autotest.candidates"]
+    if verifier_events:
+        payload = event_payload(verifier_events[-1])
+        selected = payload.get("selected_source")
+        metrics["verifier_source"] = str(selected) if selected is not None else ""
+        count = payload.get("candidate_count")
+        metrics["verifier_candidate_count"] = count if isinstance(count, int) else ""
+
+    repo_events = [
+        event
+        for event in events
+        if str(event.get("event", "")).startswith("agent.repo_context.")
+    ]
+    if repo_events:
+        payload = event_payload(repo_events[-1])
+        candidate_count = payload.get("total_candidates_considered")
+        metrics["repo_context_candidate_count"] = (
+            candidate_count if isinstance(candidate_count, int) else ""
+        )
+        metrics["repo_context_no_candidates"] = payload.get("reason") == "no_candidates"
+        seed_sources: list[str] = []
+        selected_files = payload.get("selected_files")
+        if isinstance(selected_files, list):
+            for file_payload in selected_files:
+                if not isinstance(file_payload, dict):
+                    continue
+                reasons = file_payload.get("reasons")
+                if not isinstance(reasons, list):
+                    continue
+                for reason in reasons:
+                    if isinstance(reason, str) and reason.endswith("_project"):
+                        seed_sources.append(reason)
+                    elif reason == "test_discovery":
+                        seed_sources.append("test_discovery")
+        metrics["repo_context_seed_source"] = ";".join(sorted(set(seed_sources)))
+
+    return metrics
 
 
 def common_result(
@@ -824,6 +961,16 @@ def run_one(
             "fallback_used": "",
             "fallback_level": "minimal-patch",
             "fallback_completed": "",
+            "mode": "",
+            "mode_confidence": "",
+            "mode_alternative_gap": "",
+            "mode_ambiguity": "",
+            "mode_override_count": "",
+            "verifier_source": "",
+            "verifier_candidate_count": "",
+            "repo_context_seed_source": "",
+            "repo_context_candidate_count": "",
+            "repo_context_no_candidates": "",
             "first_success_iter": first_iter,
             "total_iter": total_iter,
             "duration_sec": f"{time.monotonic() - started:.1f}",
@@ -847,6 +994,10 @@ def run_one(
     grade.setdefault("fallback_used", "fallback" in output.lower())
     grade.setdefault("fallback_level", "minimal-patch")
     grade.setdefault("fallback_completed", False)
+    grade.update(extract_observability(load_llm_events(state_dir)))
+    grade.setdefault("fallback_level", "minimal-patch")
+    if grade.get("verification_pass") != "" and not grade.get("verifier_source"):
+        grade["verifier_source"] = "e2e_scenario_grader"
     grade.setdefault("first_success_iter", "")
     grade.setdefault("total_iter", "")
     grade.setdefault("changed_files_count", len(changed))
@@ -883,6 +1034,69 @@ def run_one(
         value = grade.get(field, "")
         row[field] = bool_s(value) if isinstance(value, bool) or value == "" else str(value)
     return row
+
+
+def counter_from_rows(rows: list[dict[str, str]], field: str) -> dict[str, int]:
+    counter = Counter(row.get(field, "") or "<empty>" for row in rows)
+    return dict(sorted(counter.items()))
+
+
+def ratio(numerator: int, denominator: int) -> float:
+    return round(numerator / denominator, 4) if denominator else 0.0
+
+
+def aggregate_observability(rows: list[dict[str, str]]) -> dict[str, object]:
+    total = len(rows)
+    changed_rows = [row for row in rows if int(row.get("changed_files_count") or 0) > 0]
+    verifier_false_negative_risk = [
+        row
+        for row in changed_rows
+        if row.get("verification_pass") != "true" and not row.get("verifier_source")
+    ]
+    no_repo_context = [
+        row for row in rows if row.get("repo_context_no_candidates") == "true"
+    ]
+    ambiguous_modes = [row for row in rows if row.get("mode_ambiguity") == "true"]
+    return {
+        "schema_version": 1,
+        "row_count": total,
+        "high_quality_rate": ratio(
+            sum(1 for row in rows if row.get("high_quality") == "true"), total
+        ),
+        "pass_rate": ratio(sum(1 for row in rows if row.get("pass") == "true"), total),
+        "mode_confidence_distribution": counter_from_rows(rows, "mode_confidence"),
+        "mode_distribution": counter_from_rows(rows, "mode"),
+        "mode_alternative_gap_distribution": counter_from_rows(rows, "mode_alternative_gap"),
+        "mode_ambiguity_rate": ratio(len(ambiguous_modes), total),
+        "mode_override_count": sum(int(row.get("mode_override_count") or 0) for row in rows),
+        "fallback_level_used": counter_from_rows(rows, "fallback_level"),
+        "fallback_completed_count": sum(
+            1 for row in rows if row.get("fallback_completed") == "true"
+        ),
+        "verifier_source_distribution": counter_from_rows(rows, "verifier_source"),
+        "verifier_no_candidates_rate": ratio(
+            sum(1 for row in rows if row.get("verifier_candidate_count") == "0"),
+            total,
+        ),
+        "repo_context_seed_source": counter_from_rows(rows, "repo_context_seed_source"),
+        "repo_context_no_candidates_rate": ratio(len(no_repo_context), total),
+        "false_negative_verifier_rate": ratio(
+            len(verifier_false_negative_risk), len(changed_rows)
+        ),
+    }
+
+
+def write_metrics_artifacts(run_dir: Path, rows: list[dict[str, str]]) -> None:
+    metrics = aggregate_observability(rows)
+    (run_dir / "metrics.json").write_text(
+        json.dumps(metrics, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    lines = ["# E2E/UAT Metrics\n\n", "| metric | value |\n", "| --- | --- |\n"]
+    for key, value in metrics.items():
+        rendered = json.dumps(value, sort_keys=True) if isinstance(value, dict) else str(value)
+        lines.append(f"| `{key}` | `{rendered}` |\n")
+    (run_dir / "metrics.md").write_text("".join(lines), encoding="utf-8")
 
 
 def main() -> int:
@@ -947,6 +1161,7 @@ def main() -> int:
         writer = csv.DictWriter(f, fieldnames=RESULT_FIELDS)
         writer.writeheader()
         writer.writerows(rows)
+    write_metrics_artifacts(run_dir, rows)
 
     total = len(rows)
     hq = sum(1 for row in rows if row["high_quality"] == "true")

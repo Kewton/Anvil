@@ -90,6 +90,10 @@ Record these for every scenario/model/repetition.
 | `fallback_used` | Deterministic or recovery fallback was applied | lower |
 | `fallback_level` | Configured deterministic fallback stage (`off`, `hint-only`, `minimal-patch`, `full-template`) | visible |
 | `fallback_completed` | Fallback was treated as completion | must be 0 |
+| `mode_confidence` / `mode_alternative_gap` | WorkMode classifier confidence and top-vs-next gap | explain failures |
+| `mode_override_count` | Classifier bypass/fallback events in the row | lower |
+| `verifier_source` / `verifier_candidate_count` | AutoTestRunner selected source and candidate count | explain verification gaps |
+| `repo_context_seed_source` / `repo_context_no_candidates` | RepoContext structure seed reasons or no-candidate signal | explain target selection gaps |
 | `first_success_iter` | First useful progress iteration | lower |
 | `total_iter` | Final loop iteration count | lower |
 | `duration_sec` | Wall-clock runtime | lower |
@@ -216,7 +220,7 @@ For release-quality validation, use the expanded strict rule:
 `workspace/eval/runs/<run-id>/results.csv` should use this header:
 
 ```csv
-run_id,commit,scenario_id,model,sidecar_model,rep,pass,high_quality,protocol_complete,verification_pass,fallback_used,fallback_level,fallback_completed,first_success_iter,total_iter,duration_sec,changed_files_count,unrelated_change_count,tool_failure_count,read_before_edit,real_entry_file_touched,safe_fail,safety_violation,browser_smoke_pass,resume_pass,dirty_worktree_preserved,notes
+run_id,commit,scenario_id,model,sidecar_model,rep,pass,high_quality,protocol_complete,verification_pass,fallback_used,fallback_level,fallback_completed,mode,mode_confidence,mode_alternative_gap,mode_ambiguity,mode_override_count,verifier_source,verifier_candidate_count,repo_context_seed_source,repo_context_candidate_count,repo_context_no_candidates,first_success_iter,total_iter,duration_sec,changed_files_count,unrelated_change_count,tool_failure_count,read_before_edit,real_entry_file_touched,safe_fail,safety_violation,browser_smoke_pass,resume_pass,dirty_worktree_preserved,notes
 ```
 
 Boolean fields must be `true` or `false`. Unknown values should be empty rather
@@ -256,6 +260,8 @@ The runner creates deterministic fixtures and writes:
 
 - `workspace/eval/runs/<run-id>/manifest.md`
 - `workspace/eval/runs/<run-id>/results.csv`
+- `workspace/eval/runs/<run-id>/metrics.json`
+- `workspace/eval/runs/<run-id>/metrics.md`
 - `workspace/eval/runs/<run-id>/notes.md`
 - `workspace/eval/runs/<run-id>/raw/`
 - `workspace/eval/runs/<run-id>/workdirs/`
