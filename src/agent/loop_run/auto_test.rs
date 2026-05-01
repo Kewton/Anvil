@@ -887,6 +887,65 @@ mod tests {
     }
 
     #[test]
+    fn detects_next_build_without_package_scripts() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"next":"14.0.0","react":"18.0.0","react-dom":"18.0.0"}}"#,
+        )
+        .expect("package");
+
+        let plan =
+            AutoTestRunner::detect(dir.path(), &["src/app/page.tsx".to_string()]).expect("plan");
+
+        assert_eq!(
+            plan.command,
+            "export CI=1 NUXT_IGNORE_LOCK=1; npm install && npm exec -- next build"
+        );
+        assert!(plan.reason.contains("Next.js project detected"));
+        assert!(plan.reason.contains("package.next"));
+    }
+
+    #[test]
+    fn detects_astro_build_without_package_scripts() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"astro":"4.0.0"}}"#,
+        )
+        .expect("package");
+
+        let plan = AutoTestRunner::detect(dir.path(), &["src/pages/index.astro".to_string()])
+            .expect("plan");
+
+        assert_eq!(
+            plan.command,
+            "export CI=1 NUXT_IGNORE_LOCK=1; npm install && npm exec -- astro build"
+        );
+        assert!(plan.reason.contains("Astro project detected"));
+        assert!(plan.reason.contains("package.astro-or-astro-file"));
+    }
+
+    #[test]
+    fn detects_solid_vite_build_without_package_scripts() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"solid-js":"1.8.0","vite":"5.0.0"}}"#,
+        )
+        .expect("package");
+
+        let plan = AutoTestRunner::detect(dir.path(), &["src/App.tsx".to_string()]).expect("plan");
+
+        assert_eq!(
+            plan.command,
+            "export CI=1 NUXT_IGNORE_LOCK=1; npm install && npm exec -- vite build"
+        );
+        assert!(plan.reason.contains("Vite-family UI project detected"));
+        assert!(plan.reason.contains("vite-family-framework"));
+    }
+
+    #[test]
     fn package_build_script_beats_native_framework_fallback() {
         let dir = tempdir().expect("tempdir");
         std::fs::write(

@@ -6374,7 +6374,8 @@ if __name__ == "__main__":
                 continue;
             }
             let content = sync_package_json_with_existing_lock(&self.work_root, &relative, content);
-            let target = self.work_root.join(&relative);
+            let target_relative = deterministic_support_target_relative(&self.work_root, &relative);
+            let target = self.work_root.join(&target_relative);
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)
                     .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
@@ -8059,6 +8060,7 @@ fn post_scaffold_recovery_active(
     cwd: &Path,
 ) -> bool {
     recent_scaffold_command_seen(messages)
+        || recent_deterministic_framework_app_fallback_seen(messages)
         || recent_post_scaffold_edit_attempt(messages) > 0
         || (active_root.is_some_and(|root| root != cwd)
             && latest_user_turn_slice(messages).iter().any(|message| {
@@ -8068,6 +8070,18 @@ fn post_scaffold_recovery_active(
                         .trim_start()
                         .starts_with("[Workspace Root Updated]")
             }))
+}
+
+fn recent_deterministic_framework_app_fallback_seen(messages: &[ConversationMessage]) -> bool {
+    latest_user_turn_slice(messages)
+        .iter()
+        .rev()
+        .any(|message| {
+            message.role == "assistant"
+                && message
+                    .content
+                    .contains(DETERMINISTIC_FRAMEWORK_APP_FALLBACK_MARKER)
+        })
 }
 
 fn post_scaffold_continuation_active(
@@ -8154,11 +8168,28 @@ fn framework_app_fallback_continuation_note() -> &'static str {
     "[Deterministic App Fallback] Treat the materialized framework files as a recovery scaffold only, not as task completion. Continue by reading and editing the real UI entry file with task-specific implementation details, then verify the app before final response."
 }
 
+const DETERMINISTIC_FRAMEWORK_APP_FALLBACK_MARKER: &str =
+    "Materialized deterministic framework app fallback files";
+
 fn deterministic_framework_game_impl_path(path: &Path) -> bool {
     matches!(
         path.to_string_lossy().as_ref(),
         "app.vue" | "src/App.tsx" | "src/app/page.tsx" | "app/page.tsx" | "src/routes/+page.svelte"
     )
+}
+
+fn deterministic_support_target_relative(work_root: &Path, relative: &Path) -> PathBuf {
+    if let Ok(rest) = relative.strip_prefix("src/app")
+        && work_root.join("app").is_dir()
+    {
+        return PathBuf::from("app").join(rest);
+    }
+    if let Ok(rest) = relative.strip_prefix("app")
+        && work_root.join("src/app").is_dir()
+    {
+        return PathBuf::from("src/app").join(rest);
+    }
+    relative.to_path_buf()
 }
 
 fn meaningful_workspace_files(work_root: &Path, limit: usize) -> Option<Vec<PathBuf>> {
@@ -9524,24 +9555,25 @@ mod progress_tests {
         FOCUSED_EDIT_PRE_READ_MAX_PREDICT, FOCUSED_EDIT_PRE_READ_TIMEOUT_SECS,
         FocusedEditBatchAction, deterministic_empty_framework_app_files,
         deterministic_empty_framework_game_files, deterministic_framework_app_files_needed,
-        deterministic_framework_game_files_needed, extract_page_copy_block_from_numbered_read,
-        first_existing_impl_target, focused_edit_compact_anchor_note,
-        focused_edit_compact_recovery_anchor, focused_edit_exact_anchor_history,
-        focused_edit_exact_recovery_anchor, focused_edit_first_slice_note,
-        focused_edit_first_slice_uses_exact_anchor, focused_edit_guidance_note,
-        focused_edit_history, focused_edit_max_predict_override, focused_edit_minimal_history,
-        focused_edit_second_slice_note, focused_edit_target_already_read,
-        focused_edit_timeout_override_secs, focused_edit_tool_batch_action,
-        focused_edit_tool_policy_error, focused_read_target_for_directory,
-        format_blocked_progress_line, format_progress_line,
+        deterministic_framework_game_files_needed, deterministic_support_target_relative,
+        extract_page_copy_block_from_numbered_read, first_existing_impl_target,
+        focused_edit_compact_anchor_note, focused_edit_compact_recovery_anchor,
+        focused_edit_exact_anchor_history, focused_edit_exact_recovery_anchor,
+        focused_edit_first_slice_note, focused_edit_first_slice_uses_exact_anchor,
+        focused_edit_guidance_note, focused_edit_history, focused_edit_max_predict_override,
+        focused_edit_minimal_history, focused_edit_second_slice_note,
+        focused_edit_target_already_read, focused_edit_timeout_override_secs,
+        focused_edit_tool_batch_action, focused_edit_tool_policy_error,
+        focused_read_target_for_directory, format_blocked_progress_line, format_progress_line,
         framework_app_fallback_continuation_note, has_successful_non_plan_repo_edit,
         has_successful_non_plan_repo_edit_after_latest_truncated_tool_call,
         has_successful_repo_edit, implementation_quality_issue_for_request, is_utf8_locale,
         last_read_tool_path, latest_page_copy_block_from_read,
         latest_truncated_tool_call_note_index, latest_turn_preferred_read_edit_target,
         post_scaffold_continuation_active, post_scaffold_recovery_active, progress_available_width,
-        prune_plan_mode_messages, recent_scaffold_command_seen, recent_truncated_tool_call_attempt,
-        repo_change_request_text, request_needs_playable_ui_quality_gate, sanitize_for_progress,
+        prune_plan_mode_messages, recent_deterministic_framework_app_fallback_seen,
+        recent_scaffold_command_seen, recent_truncated_tool_call_attempt, repo_change_request_text,
+        request_needs_playable_ui_quality_gate, sanitize_for_progress,
         should_apply_repo_change_quality_gate, should_try_framework_app_fallback,
         should_use_streaming_transport, strip_read_line_number_prefix,
         successful_non_plan_repo_edit_count, successful_repo_edit_count,
@@ -10410,6 +10442,73 @@ mod progress_tests {
             None,
             Path::new("/tmp/project"),
         ));
+    }
+
+    #[test]
+    fn deterministic_app_fallback_triggers_post_scaffold_recovery() {
+        let messages = vec![
+            ConversationMessage::user("build a Next.js game".to_string()),
+            ConversationMessage::assistant(
+                "Materialized deterministic framework app fallback files as a recovery scaffold: package.json, src/app/page.tsx. Continue implementation and verification before treating the task as complete."
+                    .to_string(),
+                Vec::new(),
+            ),
+        ];
+        assert!(recent_deterministic_framework_app_fallback_seen(&messages));
+        assert!(post_scaffold_recovery_active(
+            &messages,
+            None,
+            Path::new("/tmp/project"),
+        ));
+    }
+
+    #[test]
+    fn deterministic_app_fallback_recovery_ignores_previous_user_turns() {
+        let messages = vec![
+            ConversationMessage::user("build a Next.js game".to_string()),
+            ConversationMessage::assistant(
+                "Materialized deterministic framework app fallback files as a recovery scaffold: package.json, src/app/page.tsx. Continue implementation and verification before treating the task as complete."
+                    .to_string(),
+                Vec::new(),
+            ),
+            ConversationMessage::user("summarize README".to_string()),
+        ];
+        assert!(!recent_deterministic_framework_app_fallback_seen(&messages));
+        assert!(!post_scaffold_recovery_active(
+            &messages,
+            None,
+            Path::new("/tmp/project"),
+        ));
+    }
+
+    #[test]
+    fn deterministic_support_targets_existing_next_app_directory() {
+        let temp = tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("app")).unwrap();
+
+        assert_eq!(
+            deterministic_support_target_relative(temp.path(), Path::new("src/app/layout.tsx")),
+            PathBuf::from("app/layout.tsx")
+        );
+        assert_eq!(
+            deterministic_support_target_relative(temp.path(), Path::new("src/app/globals.css")),
+            PathBuf::from("app/globals.css")
+        );
+        assert_eq!(
+            deterministic_support_target_relative(temp.path(), Path::new("scripts/smoke-test.mjs")),
+            PathBuf::from("scripts/smoke-test.mjs")
+        );
+    }
+
+    #[test]
+    fn deterministic_support_targets_existing_src_next_app_directory() {
+        let temp = tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("src/app")).unwrap();
+
+        assert_eq!(
+            deterministic_support_target_relative(temp.path(), Path::new("app/layout.tsx")),
+            PathBuf::from("src/app/layout.tsx")
+        );
     }
 
     #[test]
