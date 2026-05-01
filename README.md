@@ -290,6 +290,7 @@ workdir 側の `.anvil/logs/` `.anvil/sessions/` `.anvil/plans/` は上記への
 
 `scripts/` 配下のハーネス群で 5-run ベンチマークと集計レポートを生成できる。
 実践的な E2E/UAT の評価設計は `docs/e2e-uat-evaluation.md` にまとめている。
+CI / release confidence checks は [docs/ci.md](docs/ci.md) にまとめている。
 
 ```bash
 # 1モデル 5-run ベンチマーク
@@ -317,6 +318,7 @@ python3 scripts/report.py --compare <bench_root_a>/ <bench_root_b>/
 cargo fmt --all
 cargo clippy --all-targets -- -D warnings
 cargo test --all
+bash scripts/check_cli_help_snapshot.sh
 cargo test --test e2e_local_llm live_ollama_can_write_a_file -- --ignored --nocapture
 ANVIL_E2E_RUNS=2 cargo test --test e2e_local_llm live_ollama_multi_run_file_write_stability -- --ignored --nocapture
 cargo build --release
@@ -332,5 +334,6 @@ cargo build --release
 - 各 artifact に `.sha256` checksum を添付
 - `v*` タグ push で GitHub Release を作成
 - 対応OS、manual install、Homebrew plan、既知制限は [docs/install.md](docs/install.md) を参照
+- release branch の自動チェックと manual live E2E は [docs/ci.md](docs/ci.md) を参照
 
 つまり、内部実装は全面刷新したが、配布導線は壊していない。
