@@ -265,6 +265,7 @@ workdir 側の `.anvil/logs/` `.anvil/sessions/` `.anvil/plans/` は上記への
 ## ベンチマーク・レポート
 
 `scripts/` 配下のハーネス群で 5-run ベンチマークと集計レポートを生成できる。
+実践的な E2E/UAT の評価設計は `docs/e2e-uat-evaluation.md` にまとめている。
 
 ```bash
 # 1モデル 5-run ベンチマーク
