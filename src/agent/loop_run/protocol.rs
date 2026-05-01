@@ -16,6 +16,12 @@ pub(super) struct ExecutionProtocol {
     kind: ProtocolKind,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct ProtocolSuccessContext<'a> {
+    pub(super) stats: &'a LoopStats,
+    pub(super) deterministic_recovery_recorded: bool,
+}
+
 impl ExecutionProtocol {
     pub(super) fn from_work_mode(mode: WorkMode) -> Self {
         let kind = match mode {
@@ -34,7 +40,25 @@ impl ExecutionProtocol {
         self.kind
     }
 
+    #[allow(dead_code)] // Convenience wrapper for legacy call sites and focused tests.
     pub(super) fn success_issue(self, stats: &LoopStats) -> Option<String> {
+        self.success_issue_with_context(ProtocolSuccessContext {
+            stats,
+            deterministic_recovery_recorded: false,
+        })
+    }
+
+    pub(super) fn success_issue_with_context(
+        self,
+        context: ProtocolSuccessContext<'_>,
+    ) -> Option<String> {
+        if context.deterministic_recovery_recorded {
+            return Some(
+                "protocol requires model-produced or verified work; deterministic fallback is recovery context, not completion"
+                    .to_string(),
+            );
+        }
+        let stats = context.stats;
         match self.kind {
             ProtocolKind::AnswerOnly => {
                 if stats.total_changed == 0 {
@@ -127,6 +151,16 @@ mod tests {
         }
     }
 
+    fn context<'a>(
+        stats: &'a LoopStats,
+        deterministic_recovery_recorded: bool,
+    ) -> ProtocolSuccessContext<'a> {
+        ProtocolSuccessContext {
+            stats,
+            deterministic_recovery_recorded,
+        }
+    }
+
     #[test]
     fn answer_only_rejects_file_changes() {
         let protocol = ExecutionProtocol::from_work_mode(WorkMode::AnswerOnly);
@@ -168,6 +202,23 @@ mod tests {
         assert!(
             ExecutionProtocol::from_work_mode(WorkMode::Python)
                 .success_issue(&py_stats)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn deterministic_recovery_is_not_protocol_completion() {
+        let ui_stats = stats(&["src/app/page.tsx"], 1);
+        let protocol = ExecutionProtocol::from_work_mode(WorkMode::TypeScriptUi);
+
+        assert!(
+            protocol
+                .success_issue_with_context(context(&ui_stats, true))
+                .is_some()
+        );
+        assert!(
+            protocol
+                .success_issue_with_context(context(&ui_stats, false))
                 .is_none()
         );
     }

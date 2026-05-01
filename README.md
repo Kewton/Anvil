@@ -130,6 +130,8 @@ Act-mode で `AutoTestRunner::detect == None`（明示的な test verifier が�
 
 `AutoTestRunner` は verifier を単一キーワードで即決せず、`ANVIL.md` の安全な preferred command、Cargo manifest、`package.json` の `scripts.*`、Python test surface、`py_compile` fallback を候補化して confidence / evidence 付きで選択する。`package.json` は JSON として読み、トップレベルの `"test"` 文字列だけでは `npm test` を選ばない。
 
+Protocol success は work mode ごとに判定される。deterministic fallback はローカル LLM が詰まったときの recovery context として扱い、ファイルが生成されてもそれ単体では完了扱いにしない。完了には model-produced work、または protocol に合う成果物と verifier の通過が必要になる。
+
 以下の条件で自動的に無効化される:
 
 - per-turn cap = 1（`tester_called_this_turn` で同一ターン内 2 回目以降を抑止）

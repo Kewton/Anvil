@@ -3,7 +3,7 @@ use super::auto_test::{
     count_test_failures,
 };
 use super::interrupt::{InterruptEnv, InterruptFlag, InterruptMonitor};
-use super::protocol::ExecutionProtocol;
+use super::protocol::{ExecutionProtocol, ProtocolSuccessContext};
 use super::reminder::{
     self, ReminderInputs, ReminderOutcome, build_log_payload as build_reminder_log_payload,
 };
@@ -3901,7 +3901,14 @@ impl Agent {
         let mut verify_commands_collected: Vec<String> = Vec::new();
         let should_dispatch_success_verifier = if exit_reason.is_success() {
             let protocol = ExecutionProtocol::from_work_mode(self.session.mode_state.work_mode);
-            if let Some(issue) = protocol.success_issue(&stats) {
+            let deterministic_recovery_recorded =
+                self.session.last_feedback.as_ref().is_some_and(|frame| {
+                    frame.primary_error.as_deref() == Some(DETERMINISTIC_CONTENT_FALLBACK_TAG)
+                });
+            if let Some(issue) = protocol.success_issue_with_context(ProtocolSuccessContext {
+                stats: &stats,
+                deterministic_recovery_recorded,
+            }) {
                 exit_reason = ExitReason::MissingRepoEdits;
                 error_text = issue;
                 false

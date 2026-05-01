@@ -57,6 +57,11 @@ matched.
 Do not treat incidental strings as executable proof. For example, a top-level
 `"test"` key in `package.json` is not equivalent to `scripts.test`.
 
+Protocol success should also stay evidence-based. Deterministic recovery writes
+may unblock a turn, but they are not proof that the requested implementation was
+completed; the protocol must still require an appropriate artifact and verifier
+path.
+
 ## Safer Operation
 
 Recommended defaults for untrusted repositories:
