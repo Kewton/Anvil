@@ -86,6 +86,53 @@ fn request_explicitly_requests_script_execution(request: &str) -> bool {
     mentions_script && asks_execution
 }
 
+fn latest_tool_result_since_last_user<'a>(
+    messages: &'a [ConversationMessage],
+    tool_name: &str,
+) -> Option<&'a str> {
+    for message in messages.iter().rev() {
+        if message.role == "user" {
+            break;
+        }
+        if message.role == "tool" && message.name.as_deref() == Some(tool_name) {
+            return Some(message.content.as_str());
+        }
+    }
+    None
+}
+
+fn truncate_for_answer(text: &str, max_chars: usize) -> String {
+    let total = text.chars().count();
+    if total <= max_chars {
+        return text.to_string();
+    }
+    let keep = max_chars.saturating_sub(32);
+    let truncated = text.chars().take(keep).collect::<String>();
+    format!(
+        "{truncated}\n...[truncated {} chars]",
+        total.saturating_sub(keep)
+    )
+}
+
+fn answer_only_script_execution_fallback_response(output: &str) -> String {
+    let excerpt = truncate_for_answer(output.trim(), 1_600);
+    let status = output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("exit_code="))
+        .map(|code| {
+            if code == "0" {
+                "コマンドは exit_code=0 で正常終了しています。".to_string()
+            } else {
+                format!("コマンドは exit_code={code} で終了しています。")
+            }
+        })
+        .unwrap_or_else(|| "コマンドの出力を確認しました。".to_string());
+
+    format!(
+        "ファイルは変更せず、指定されたコマンド/スクリプトの実行結果を確認しました。\n\n実行結果:\n```text\n{excerpt}\n```\n\n要約:\n- {status}\n- 上記の stdout/stderr が今回確認できた実行結果です。"
+    )
+}
+
 fn answer_only_script_command_allowed(command: &str) -> bool {
     let trimmed = command.trim();
     if trimmed.is_empty() {
@@ -6537,6 +6584,11 @@ if __name__ == "__main__":
     fn answer_only_fallback_response(&self) -> String {
         let request = self.active_request_text().unwrap_or_default();
         let lower = request.to_ascii_lowercase();
+        if request_explicitly_requests_script_execution(&request)
+            && let Some(output) = latest_tool_result_since_last_user(&self.session.messages, "Bash")
+        {
+            return answer_only_script_execution_fallback_response(output);
+        }
         if lower.contains("modepolicy") || lower.contains("構造化状態") {
             return "ファイルは変更せず、読み取り専用で整理します。\n\n利点:\n- モード判断を会話履歴から分離できるため、古い発話や回復プロンプトに引きずられにくい。\n- `repo_edit_required` や fallback 許可などを明示的な実行ポリシーとして扱えるため、ツール制御と品質ゲートを安定させやすい。\n- セッション保存や compaction 後も、必要な状態だけを小さく復元できる。\n\nリスク:\n- 状態更新の境界が曖昧だと、ユーザーの最新意図と ModePolicy がずれる。\n- ポリシーが強すぎると、読み取り専用のスクリプト実行など正当な作業まで止める。\n- LLM の自然言語判断と構造化状態の差分を観測できないと、誤分類の原因調査が難しい。\n\n方向性としては、ModePolicy は構造化状態で保持し、最新ユーザー要求から毎ターン再評価できるようにするのが妥当です。会話履歴へ埋め込むのは補助説明に留め、実際のツール許可と品質条件は構造化フィールドを正とするのが安定します。".to_string();
         }
@@ -6697,14 +6749,16 @@ mod tests {
     use super::{
         FOCUSED_EDIT_POST_READ_TIMEOUT_SECS, FOCUSED_EDIT_PRE_READ_TIMEOUT_SECS,
         PlanExplorationKey, answer_only_reply_is_inadequate, answer_only_script_command_allowed,
-        assistant_model_for_mode, deterministic_timeout_fallback_plan,
-        effective_non_streaming_timeout_secs, non_streaming_assistant_reply_timeout_secs,
+        answer_only_script_execution_fallback_response, assistant_model_for_mode,
+        deterministic_timeout_fallback_plan, effective_non_streaming_timeout_secs,
+        latest_tool_result_since_last_user, non_streaming_assistant_reply_timeout_secs,
         normalize_exploration_path, normalize_plan_exploration_key,
         request_explicitly_requests_script_execution, should_fallback_plan_model_after_timeout,
         should_materialize_plan_after_timeout,
         should_materialize_plan_after_tool_call_format_error, should_use_streaming_transport,
     };
     use crate::modes::plan_act::{ExecutionMode, TaskProfile};
+    use crate::session::store::ConversationMessage;
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -6864,6 +6918,46 @@ mod tests {
             "bash check_env.sh > out.txt"
         ));
         assert!(!answer_only_script_command_allowed("rm generated.txt"));
+    }
+
+    #[test]
+    fn latest_tool_result_since_last_user_returns_current_turn_bash_output() {
+        let messages = vec![
+            ConversationMessage::user("first task".to_string()),
+            ConversationMessage::tool("Bash".to_string(), "exit_code=0\nold".to_string()),
+            ConversationMessage::user("run summarize.py".to_string()),
+            ConversationMessage::assistant(String::new(), Vec::new()),
+            ConversationMessage::tool(
+                "Bash".to_string(),
+                "exit_code=0\nrecords=3 total=185".to_string(),
+            ),
+        ];
+
+        assert_eq!(
+            latest_tool_result_since_last_user(&messages, "Bash"),
+            Some("exit_code=0\nrecords=3 total=185")
+        );
+    }
+
+    #[test]
+    fn latest_tool_result_since_last_user_stops_at_user_boundary() {
+        let messages = vec![
+            ConversationMessage::user("run old script".to_string()),
+            ConversationMessage::tool("Bash".to_string(), "exit_code=0\nold".to_string()),
+            ConversationMessage::user("new read-only question".to_string()),
+        ];
+
+        assert_eq!(latest_tool_result_since_last_user(&messages, "Bash"), None);
+    }
+
+    #[test]
+    fn script_execution_fallback_preserves_bash_output() {
+        let response =
+            answer_only_script_execution_fallback_response("exit_code=0\nrecords=3 total=185");
+
+        assert!(response.contains("exit_code=0"));
+        assert!(response.contains("records=3 total=185"));
+        assert!(response.contains("正常終了"));
     }
 
     #[test]
