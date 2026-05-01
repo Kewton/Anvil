@@ -235,3 +235,50 @@ The current result confirms that the code-level changes are stable and that the
 two required local models can execute the simplest read-only protocol without
 repo edits. It does not yet prove strict quality stability across coding,
 framework, script, and existing-code modification scenarios.
+
+## 2026-05-01 Strict Matrix Result
+
+Run artifacts:
+
+- `workspace/eval/runs/strict-20260501-133143/`
+
+Implementation adjustment during the run:
+
+- Python test-request gating was corrected so an existing project self-test
+  command, such as an `ANVIL.md` preferred verifier, can satisfy the test
+  requirement instead of forcing a new test artifact before the verifier runs.
+
+Scenario set:
+
+| ID | Group | Scenario | High-quality gate |
+| --- | --- | --- | --- |
+| S0-01 | Baseline | README answer-only, no edits | `edited 0 files`, fixture unchanged |
+| S1-02 | Mode / protocol | Run local script and summarize output | Bash executed, output summarized, fixture unchanged |
+| S2-03 | UI framework | Existing SvelteKit route edit | Native Svelte file edited, no React/Next scaffold, AutoTest `npm run build` passed |
+| S3-01 | Existing code | Python bug fix with self-test | `calculator.py` fixed, `python3 verify.py` passed |
+
+Final strict result:
+
+| Model | Repetitions | High-quality | Result |
+| --- | ---: | ---: | --- |
+| `qwen3.6:27b-coding-nvfp4` | 12 | 12 | PASS |
+| `qwen3.5:122b` | 12 | 12 | PASS |
+
+Per-scenario final result:
+
+| Model | S0-01 | S1-02 | S2-03 | S3-01 |
+| --- | --- | --- | --- | --- |
+| `qwen3.6:27b-coding-nvfp4` | 3/3 HQ | 3/3 HQ | 3/3 HQ | 3/3 HQ |
+| `qwen3.5:122b` | 3/3 HQ | 3/3 HQ | 3/3 HQ | 3/3 HQ |
+
+Notes:
+
+- `qwen3.6` initially exposed a real gate-order issue on S3-01: the Python
+  test policy could stop before the detected self-test verifier ran. The fix
+  was applied and the matrix was rerun successfully.
+- S2-03 verification is based on structured `agent.autotest.completed` with
+  `passed=true`; the human console intentionally stays concise and may not
+  show the full verifier command.
+- The strict pass covers read-only, script execution, native Svelte UI editing,
+  and existing Python code modification. It does not cover creative greenfield
+  game generation or unsupported-framework safe-fail behavior.

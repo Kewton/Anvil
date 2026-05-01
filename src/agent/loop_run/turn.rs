@@ -1,6 +1,6 @@
 use super::auto_test::{
-    AutoTestKind, AutoTestPlan, AutoTestResult, classify_auto_test, count_compile_errors,
-    count_test_failures,
+    AutoTestKind, AutoTestPlan, AutoTestResult, AutoTestRunner, classify_auto_test,
+    count_compile_errors, count_test_failures,
 };
 use super::interrupt::{InterruptEnv, InterruptFlag, InterruptMonitor};
 use super::protocol::{ExecutionProtocol, ProtocolSuccessContext};
@@ -3704,6 +3704,7 @@ impl Agent {
             if repo_edit_calls_made_this_turn > 0
                 && self.active_python_request_requires_tests()
                 && !self.python_test_artifact_exists()
+                && !self.python_verifier_available_for_requested_tests()
             {
                 python_test_retries += 1;
                 if python_test_retries >= 2 {
@@ -6245,6 +6246,11 @@ impl Agent {
                 .active_request_text()
                 .as_deref()
                 .is_some_and(request_explicitly_requires_tests)
+    }
+
+    fn python_verifier_available_for_requested_tests(&self) -> bool {
+        AutoTestRunner::detect(&self.work_root, &self.session.working_memory.touched_files)
+            .is_some_and(|plan| plan.auto_test_kind() == AutoTestKind::Test)
     }
 
     fn python_test_artifact_exists(&self) -> bool {
