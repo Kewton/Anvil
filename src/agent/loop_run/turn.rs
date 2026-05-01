@@ -3203,6 +3203,21 @@ impl Agent {
                 if action_expectation == recovery::ActionExpectation::RepoChange {
                     repo_change_retries += 1;
                     if repo_change_retries >= 2 {
+                        if repo_change_retries == 2
+                            && self.push_repo_change_no_edit_recovery_note(repo_change_retries)
+                        {
+                            write_stdout_rendered(
+                                &format_iteration_status(
+                                    last_iter,
+                                    self.config.max_iterations,
+                                    "Retry requested",
+                                    "The target file was already read. Asked the model to emit one Edit tool call now.",
+                                    self.footer.current_cols(),
+                                ),
+                                true,
+                            );
+                            continue;
+                        }
                         let request = self.active_request_text().unwrap_or_default();
                         let fallback =
                             match self.maybe_apply_local_llm_small_edit_fallback(&request) {
@@ -3245,7 +3260,11 @@ impl Agent {
                         ),
                         true,
                     );
-                    self.push_system_note(recovery::repo_change_recovery_note(repo_change_retries));
+                    if !self.push_repo_change_no_edit_recovery_note(repo_change_retries) {
+                        self.push_system_note(recovery::repo_change_recovery_note(
+                            repo_change_retries,
+                        ));
+                    }
                 } else if action_expectation == recovery::ActionExpectation::PlanProgress {
                     let plan_contents = self
                         .current_plan_contents()
@@ -3332,6 +3351,21 @@ impl Agent {
                 if action_expectation == recovery::ActionExpectation::RepoChange {
                     repo_change_retries += 1;
                     if repo_change_retries >= 2 {
+                        if repo_change_retries == 2
+                            && self.push_repo_change_no_edit_recovery_note(repo_change_retries)
+                        {
+                            write_stdout_rendered(
+                                &format_iteration_status(
+                                    last_iter,
+                                    self.config.max_iterations,
+                                    "Retry requested",
+                                    "The target file was already read. Asked the model to emit one Edit tool call now.",
+                                    self.footer.current_cols(),
+                                ),
+                                true,
+                            );
+                            continue;
+                        }
                         let request = self.active_request_text().unwrap_or_default();
                         let fallback =
                             match self.maybe_apply_local_llm_small_edit_fallback(&request) {
@@ -3390,7 +3424,7 @@ impl Agent {
                             target_already_read,
                             repo_change_retries,
                         ));
-                    } else {
+                    } else if !self.push_repo_change_no_edit_recovery_note(repo_change_retries) {
                         self.push_system_note(recovery::repo_change_no_tool_recovery_note(
                             repo_change_retries,
                         ));
@@ -5415,6 +5449,45 @@ impl Agent {
         self.forced_small_edit_recovery_target()
             .or_else(|| self.post_scaffold_edit_recovery_target())
             .or_else(|| self.post_scaffold_continuation_recovery_target())
+    }
+
+    fn repo_change_no_edit_recovery_target(&self) -> Option<PathBuf> {
+        if self.session.mode_state.mode != ExecutionMode::Act
+            || !self.session.mode_state.policy().repo_edit_required
+            || !self.active_task_expects_repo_change()
+            || has_successful_non_plan_repo_edit(
+                &self.session.messages,
+                &self.work_root,
+                self.session.mode_state.active_plan_path.as_deref(),
+            )
+        {
+            return None;
+        }
+        if let Some(candidate) = first_existing_impl_target(&self.work_root)
+            && focused_edit_target_already_read(&self.session.messages, &candidate, &self.work_root)
+        {
+            return Some(candidate);
+        }
+        let path = last_read_tool_path(&self.session.messages)?;
+        let candidate = resolve_user_path(&self.work_root, &path).ok()?;
+        candidate.is_file().then_some(candidate)
+    }
+
+    fn push_repo_change_no_edit_recovery_note(&mut self, attempt: usize) -> bool {
+        let Some(target) = self.repo_change_no_edit_recovery_target() else {
+            return false;
+        };
+        let target_display = progress_path_display(
+            &target.display().to_string(),
+            &self.work_root,
+            self.session.mode_state.active_plan_path.as_deref(),
+            120,
+        );
+        self.push_system_note(recovery::repo_change_after_read_no_edit_note(
+            &target_display,
+            attempt,
+        ));
+        true
     }
 
     fn execute_tool_call(

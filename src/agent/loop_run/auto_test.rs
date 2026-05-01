@@ -283,7 +283,7 @@ fn detect_python_verifier(work_root: &Path, changed_files: &[String]) -> Option<
         }
         return Some(VerifierCandidate {
             plan: AutoTestPlan {
-                command: "python3 -m pytest".to_string(),
+                command: "python3 -B -m pytest -p no:cacheprovider".to_string(),
                 reason: "Python tests detected".to_string(),
             },
             source: VerifierCandidateSource::PythonTests,
@@ -713,7 +713,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         std::fs::create_dir(dir.path().join("tests")).expect("tests dir");
         let plan = AutoTestRunner::detect(dir.path(), &["app.py".to_string()]).expect("plan");
-        assert_eq!(plan.command, "python3 -m pytest");
+        assert_eq!(plan.command, "python3 -B -m pytest -p no:cacheprovider");
     }
 
     #[test]
@@ -825,7 +825,7 @@ mod tests {
 
     fn pytest_plan() -> AutoTestPlan {
         AutoTestPlan {
-            command: "python3 -m pytest".to_string(),
+            command: "python3 -B -m pytest -p no:cacheprovider".to_string(),
             reason: "test".to_string(),
         }
     }
@@ -1065,7 +1065,7 @@ mod tests {
         )
         .expect("pyproject");
         let plan = AutoTestRunner::detect(dir.path(), &["src/app.py".to_string()]).expect("plan");
-        assert_eq!(plan.command, "python3 -m pytest");
+        assert_eq!(plan.command, "python3 -B -m pytest -p no:cacheprovider");
         assert!(plan.reason.contains("pytest-dependency"));
     }
 

@@ -308,7 +308,9 @@ fn is_explicit_test_verifier(plan: &AutoTestPlan, work_root: &Path) -> bool {
         || cmd.starts_with("yarn test")
         || cmd.starts_with("pnpm test")
         || cmd.starts_with("python3 -m pytest")
+        || cmd.starts_with("python3 -b -m pytest")
         || cmd.starts_with("python -m pytest")
+        || cmd.starts_with("python -b -m pytest")
         || cmd.starts_with("pytest")
     {
         return true;

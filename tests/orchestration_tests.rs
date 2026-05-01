@@ -83,6 +83,26 @@ fn markdown_docs_are_counted_as_other_changed_files() {
 }
 
 #[test]
+fn runtime_artifact_dirs_are_ignored() {
+    let temp = tempdir().unwrap();
+    std::fs::write(temp.path().join("calculator.py"), "def f(): return 1\n").unwrap();
+    let before = capture_repo_snapshot(temp.path());
+
+    std::fs::write(temp.path().join("calculator.py"), "def f(): return 2\n").unwrap();
+    std::fs::create_dir_all(temp.path().join(".pytest_cache")).unwrap();
+    std::fs::write(temp.path().join(".pytest_cache/README.md"), "cache\n").unwrap();
+    std::fs::create_dir_all(temp.path().join("__pycache__")).unwrap();
+    std::fs::write(temp.path().join("__pycache__/calculator.pyc"), "cache\n").unwrap();
+    std::fs::create_dir_all(temp.path().join(".next/cache")).unwrap();
+    std::fs::write(temp.path().join(".next/cache/build"), "cache\n").unwrap();
+
+    let v = verify_repo_progress(&before, temp.path());
+    assert_eq!(v.changed_files, vec!["calculator.py".to_string()]);
+    assert_eq!(v.implementation_files_changed, 1);
+    assert_eq!(v.total_changed_files(), 1);
+}
+
+#[test]
 fn changed_files_capped_at_sixteen() {
     let temp = tempdir().unwrap();
     let before = capture_repo_snapshot(temp.path());

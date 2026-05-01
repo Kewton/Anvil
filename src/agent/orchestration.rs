@@ -132,7 +132,15 @@ fn should_skip_path(root: &Path, path: &Path) -> bool {
             relative.components().any(|component| {
                 matches!(
                     component.as_os_str().to_str(),
-                    Some(".git" | ".anvil" | "node_modules" | "target")
+                    Some(
+                        ".git"
+                            | ".anvil"
+                            | ".next"
+                            | ".pytest_cache"
+                            | "__pycache__"
+                            | "node_modules"
+                            | "target"
+                    )
                 )
             })
         })
