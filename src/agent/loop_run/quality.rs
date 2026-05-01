@@ -143,6 +143,13 @@ impl FeatureProfile {
     fn requires_semantic_business_slice(self) -> bool {
         self.validation || self.calculation || self.visualization || self.persistence
     }
+
+    fn requires_strict_semantic_quality(self, request_lower: &str) -> bool {
+        self.validation
+            || self.calculation
+            || self.visualization
+            || (self.persistence && !request_lower.contains("browser"))
+    }
 }
 
 pub(super) fn request_needs_playable_ui_quality_gate(request: &str) -> bool {
@@ -247,77 +254,29 @@ pub(super) fn implementation_quality_issue_for_request(
 ) -> Option<String> {
     let intent = RequestIntent::from_request(request);
     let profile = FeatureProfile::from_request(request);
+    let request_lower = request.to_lowercase();
     let normalized = content.to_lowercase();
-    let interaction_hits = count_any(
-        &normalized,
-        &[
-            "onclick",
-            "onchange",
-            "oninput",
-            "onsubmit",
-            "onkeydown",
-            "onkeyup",
-            "onpointer",
-            "onmouse",
-            "addeventlistener",
-            "button",
-            "input",
-            "select",
-            "textarea",
-            "form",
-            "操作",
-            "入力",
-        ],
-    );
-    let state_hits = count_any(
-        &normalized,
-        &[
-            "usestate",
-            "usereducer",
-            "useref",
-            "computed",
-            "reactive",
-            "ref(",
-            "state",
-            "status",
-            "current",
-            "selected",
-            "active",
-            "progress",
-            "状態",
-            "選択",
-        ],
-    );
-    let feedback_hits = count_any(
-        &normalized,
-        &[
-            "result",
-            "message",
-            "status",
-            "progress",
-            "aria-live",
-            "role=",
-            "className",
-            "class=",
-            "style",
-            "disabled",
-            "結果",
-            "表示",
-            "完了",
-        ],
-    );
-    let placeholder_hits = placeholder_hit_count(intent.framework, &normalized);
-    if interaction_hits == 0 || state_hits == 0 || feedback_hits == 0 {
-        return Some(format!(
-            "it lacks an interactive vertical slice; expected input handling, state, and visible feedback markers (input={interaction_hits}, state={state_hits}, feedback={feedback_hits})"
-        ));
+    if looks_like_ui_marker_spam(&normalized) {
+        return Some(
+            "it contains superficial UI quality marker spam without executable interaction, state, and feedback evidence"
+                .to_string(),
+        );
     }
+    let placeholder_hits = placeholder_hit_count(intent.framework, &normalized);
     if placeholder_hits >= 2 {
         return Some(
             "it still contains multiple scaffold or generic placeholder markers".to_string(),
         );
     }
-    if profile.requires_semantic_business_slice() {
+    let interaction_hits = count_ui_interaction_hits(&normalized);
+    let state_hits = count_ui_state_hits(&normalized);
+    let feedback_hits = count_ui_feedback_hits(&normalized);
+    if interaction_hits == 0 || state_hits == 0 || feedback_hits == 0 {
+        return Some(format!(
+            "it lacks an interactive vertical slice; expected executable input handling, state, and visible feedback evidence (input={interaction_hits}, state={state_hits}, feedback={feedback_hits})"
+        ));
+    }
+    if profile.requires_strict_semantic_quality(&request_lower) {
         let semantic_hits = count_any(
             &normalized,
             &[
@@ -1235,12 +1194,160 @@ fn looks_like_incomplete_playable_slice(normalized_content: &str) -> bool {
     ) > 0
 }
 
+fn count_ui_interaction_hits(normalized_content: &str) -> usize {
+    count_any(
+        normalized_content,
+        &[
+            "onclick=",
+            "onclick={",
+            "onchange=",
+            "onchange={",
+            "oninput=",
+            "oninput={",
+            "onsubmit=",
+            "onsubmit={",
+            "onkeydown=",
+            "onkeydown={",
+            "onkeyup=",
+            "onpointer",
+            "onmouse",
+            "@click=",
+            "@input=",
+            "@submit=",
+            "on:click=",
+            "on:input=",
+            "addeventlistener(",
+            "addeventlistener(\"",
+            "addeventlistener('",
+            "<button",
+            "<input",
+            "<select",
+            "<textarea",
+            "<form",
+            "<canvas",
+        ],
+    )
+}
+
+fn count_ui_state_hits(normalized_content: &str) -> usize {
+    count_any(
+        normalized_content,
+        &[
+            "usestate(",
+            "usereducer(",
+            "useref(",
+            "computed(",
+            "reactive(",
+            "ref(",
+            "$state(",
+            "let ",
+            "const ",
+            "var ",
+            "data()",
+            "localstorage",
+            "sessionstorage",
+            ".dataset",
+            ".value",
+            "value=",
+            "name=",
+            "required",
+            "checked",
+            "selected",
+            "score",
+            "status",
+            "progress",
+            "current",
+            "active",
+        ],
+    )
+}
+
+fn count_ui_feedback_hits(normalized_content: &str) -> usize {
+    count_any(
+        normalized_content,
+        &[
+            "textcontent",
+            "innerhtml",
+            "insertadjacenthtml",
+            "setattribute(",
+            ".classlist",
+            ".style",
+            "aria-live",
+            "role=",
+            "<output",
+            "<label",
+            "disabled",
+            "class=",
+            "classname",
+            "style=",
+            "result",
+            "message",
+            "status",
+            "progress",
+            "error",
+            "success",
+            "score",
+        ],
+    )
+}
+
+fn count_ui_runtime_evidence(normalized_content: &str) -> usize {
+    count_any(
+        normalized_content,
+        &[
+            "=>",
+            "function ",
+            "addEventListener(",
+            "addeventlistener(",
+            "document.queryselector",
+            "document.getelementbyid",
+            "setstate",
+            "setstatus",
+            "setprogress",
+            "setscore",
+            ".textcontent =",
+            ".innerhtml =",
+            ".value =",
+            ".classlist.",
+            ".style.",
+            "requestanimationframe(",
+            "<script",
+            "<form",
+        ],
+    )
+}
+
+fn looks_like_ui_marker_spam(normalized_content: &str) -> bool {
+    let marker_words = count_any(
+        normalized_content,
+        &[
+            "input handling",
+            "visible feedback",
+            "feedback markers",
+            "state markers",
+            "interactive vertical slice",
+            "requestanimationframe",
+            "addeventlistener",
+            "onclick",
+            "state",
+            "status",
+            "progress",
+            "canvas",
+        ],
+    );
+    if marker_words < 4 {
+        return false;
+    }
+    count_ui_interaction_hits(normalized_content) == 0
+        && count_ui_runtime_evidence(normalized_content) == 0
+}
+
 fn looks_like_low_fidelity_game_slice(normalized_content: &str) -> bool {
     let has_canvas = normalized_content.contains("<canvas")
         || normalized_content.contains("canvasref")
         || normalized_content.contains("getcontext(\"2d\")")
         || normalized_content.contains("getcontext('2d')");
-    let has_animation_loop = normalized_content.contains("requestanimationframe");
+    let has_animation_loop = normalized_content.contains("requestanimationframe(");
     let has_direct_input = count_any(
         normalized_content,
         &[
@@ -3421,7 +3528,12 @@ import TetrisGame from '~/components/TetrisGame.vue'
 "#;
         let issue = implementation_quality_issue_for_request(request, current)
             .expect("expected incomplete shell to fail quality gate");
-        assert!(issue.contains("interactive vertical slice"));
+        assert!(
+            issue.contains("interactive vertical slice")
+                || issue.contains("placeholder markers")
+                || issue.contains("marker spam"),
+            "got: {issue}"
+        );
         let output = deterministic_playable_ui_fallback(request, Path::new("app/app.vue"), current)
             .expect("fallback");
         assert!(output.contains("NEON BLOCKS"));

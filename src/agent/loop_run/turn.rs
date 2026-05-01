@@ -10637,7 +10637,10 @@ export default function App() {
         "#;
         let issue = implementation_quality_issue_for_request(request, content)
             .expect("expected quality issue");
-        assert!(issue.contains("interactive vertical slice"), "got: {issue}");
+        assert!(
+            issue.contains("interactive vertical slice") || issue.contains("placeholder markers"),
+            "got: {issue}"
+        );
     }
 
     #[test]
@@ -10674,6 +10677,61 @@ export default function App() {
             }
         "#;
         assert!(implementation_quality_issue_for_request(request, content).is_none());
+    }
+
+    #[test]
+    fn playable_ui_quality_gate_rejects_marker_spam_without_runtime_evidence() {
+        let request = "Build a playable browser game as a vanilla JavaScript app";
+        let content = r#"
+            <main>
+              <h1>Playable canvas game</h1>
+              <p>input handling state status progress visible feedback markers requestAnimationFrame addEventListener onclick canvas</p>
+            </main>
+        "#;
+        let issue = implementation_quality_issue_for_request(request, content)
+            .expect("expected marker spam to fail quality gate");
+        assert!(issue.contains("marker spam"), "got: {issue}");
+    }
+
+    #[test]
+    fn playable_ui_quality_gate_accepts_vanilla_javascript_ui_slice() {
+        let request = "Build an interactive browser UI as a vanilla JavaScript app";
+        let content = r#"
+            <main class="panel">
+              <label for="task">Task</label>
+              <input id="task" name="task" value="Deploy" />
+              <button id="run">Run</button>
+              <output id="status" aria-live="polite">ready</output>
+            </main>
+            <script>
+              const input = document.getElementById('task');
+              const status = document.getElementById('status');
+              let progress = 0;
+              document.getElementById('run').addEventListener('click', () => {
+                progress += 1;
+                status.textContent = `${input.value}: ${progress}`;
+              });
+            </script>
+        "#;
+        let issue = implementation_quality_issue_for_request(request, content);
+        assert!(issue.is_none(), "got: {issue:?}");
+    }
+
+    #[test]
+    fn playable_ui_quality_gate_accepts_server_rendered_html_form_slice() {
+        let request = "Build an interactive server-rendered HTML form UI";
+        let content = r#"
+            <main class="checkout">
+              <form method="post" action="/quote">
+                <label for="amount">Amount</label>
+                <input id="amount" name="amount" value="1200" required />
+                <button type="submit">Calculate</button>
+                <output name="status" role="status" aria-live="polite">Ready</output>
+              </form>
+            </main>
+        "#;
+        let issue = implementation_quality_issue_for_request(request, content);
+        assert!(issue.is_none(), "got: {issue:?}");
     }
 
     #[test]
