@@ -51,18 +51,38 @@ impl ExecutionProtocol {
                 &[".md", ".mdx", ".txt", ".rst"],
                 "docs protocol requires a documentation artifact",
             ),
-            ProtocolKind::Python => require_any_changed(
-                stats,
-                &[".py"],
-                "python protocol requires a Python implementation or test artifact",
-            ),
-            ProtocolKind::TypeScriptUi => require_any_changed(
-                stats,
-                &[
-                    ".tsx", ".ts", ".jsx", ".js", ".vue", ".svelte", ".astro", ".css", ".html",
-                ],
-                "typescript-ui protocol requires a real UI implementation artifact",
-            ),
+            ProtocolKind::Python => {
+                if stats.changed_impl_count > 0
+                    || stats.changed_test_count > 0
+                    || stats.changed_files.iter().any(|path| path.ends_with(".py"))
+                {
+                    None
+                } else {
+                    Some(
+                        "python protocol requires a Python implementation or test artifact"
+                            .to_string(),
+                    )
+                }
+            }
+            ProtocolKind::TypeScriptUi => {
+                if stats.changed_impl_count > 0
+                    || stats.changed_files.iter().any(|path| {
+                        [
+                            ".tsx", ".ts", ".jsx", ".js", ".vue", ".svelte", ".astro", ".css",
+                            ".html",
+                        ]
+                        .iter()
+                        .any(|suffix| path.ends_with(suffix))
+                    })
+                {
+                    None
+                } else {
+                    Some(
+                        "typescript-ui protocol requires a real UI implementation artifact"
+                            .to_string(),
+                    )
+                }
+            }
             ProtocolKind::GenericCode => {
                 if stats.total_changed > 0 {
                     None
@@ -129,6 +149,25 @@ mod tests {
         assert!(
             ExecutionProtocol::from_work_mode(WorkMode::TypeScriptUi)
                 .success_issue(&stats(&["src/routes/+page.svelte"], 1))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn protocol_success_uses_full_category_counts_when_changed_files_are_truncated() {
+        let mut ui_stats = stats(&[".next/cache/0001.sst"], 36);
+        ui_stats.changed_impl_count = 1;
+        assert!(
+            ExecutionProtocol::from_work_mode(WorkMode::TypeScriptUi)
+                .success_issue(&ui_stats)
+                .is_none()
+        );
+
+        let mut py_stats = stats(&["__pycache__/tool.pyc"], 2);
+        py_stats.changed_test_count = 1;
+        assert!(
+            ExecutionProtocol::from_work_mode(WorkMode::Python)
+                .success_issue(&py_stats)
                 .is_none()
         );
     }

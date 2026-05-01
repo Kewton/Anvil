@@ -16,7 +16,7 @@
 sandbox/
 
 # Workspace artifacts
-workspace/*.json
+workspace/
 
 # Development reports (Issue開発の中間成果物)
 dev-reports/

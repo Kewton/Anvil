@@ -68,7 +68,17 @@ impl RequestIntent {
             || request.contains("プレイ")
             || request.contains("操作")
             || request.contains("反応");
-        let operation = if lower.contains("improve")
+        let explicit_create = lower.contains("create")
+            || lower.contains("build")
+            || lower.contains("develop")
+            || lower.contains("implement")
+            || lower.contains("scaffold")
+            || request.contains("作って")
+            || request.contains("作成")
+            || request.contains("開発")
+            || request.contains("実装")
+            || request.contains("生成");
+        let improvement_intent = lower.contains("improve")
             || lower.contains("polish")
             || lower.contains("enhance")
             || request.contains("改善")
@@ -78,8 +88,8 @@ impl RequestIntent {
             || (request.contains("つ目") && request.contains("追加"))
             || request.contains("より")
             || request.contains("カッコ")
-            || request.contains("かっこ")
-        {
+            || request.contains("かっこ");
+        let operation = if improvement_intent && !explicit_create {
             RequestOperation::Improve
         } else {
             RequestOperation::Create
@@ -1035,7 +1045,7 @@ child.on("error", (error) => {{
 fn smoke_test_script() -> &'static str {
     r#"import { existsSync, readFileSync } from 'node:fs';
 
-const candidates = ['src/App.tsx', 'src/app/page.tsx', 'app.vue', 'src/routes/+page.svelte'];
+const candidates = ['src/App.tsx', 'src/app/page.tsx', 'app/page.tsx', 'app.vue', 'src/routes/+page.svelte'];
 const target = candidates.find((path) => existsSync(path));
 if (!target) {
   console.error('No application entry file found.');
@@ -1045,9 +1055,12 @@ if (!target) {
 const source = readFileSync(target, 'utf8');
 const isGame = source.includes('canvas') || source.includes('requestAnimationFrame');
 const required = isGame
-  ? ['canvas', 'requestAnimationFrame', 'addEventListener', 'Restart']
+  ? ['canvas', 'requestAnimationFrame', 'addEventListener']
   : ['role="alert"', 'localStorage', 'Score history', 'Calculated total', 'Target', 'aria-live', 'Math.max', 'Math.min'];
 const missing = required.filter((token) => !source.includes(token));
+if (isGame && !source.includes('<button') && !source.includes('@click')) {
+  missing.push('restart control');
+}
 if (missing.length > 0) {
   console.error(`Missing expected ${isGame ? 'game' : 'app'} quality markers: ${missing.join(', ')}`);
   process.exit(1);
@@ -2776,7 +2789,7 @@ fn react_canvas_game_template(game: GameKind) -> String {
 
 import {{ useEffect, useRef, useState }} from "react";
 
-const MODE = "{mode}";
+const MODE = "{mode}" as "invaders" | "breakout" | "blocks";
 const WIDTH = 900;
 const HEIGHT = 620;
 
@@ -3242,6 +3255,9 @@ mod tests {
         assert!(!request_allows_fast_polish_fallback(
             "既存の認証フローをOAuth連携に置き換えて下さい。"
         ));
+        assert!(!request_allows_fast_polish_fallback(
+            "あなたが考える最高に面白くかっこいいスペースインベーダーゲームを3011ポートで起動可能なnext.jsアプリとして開発してください。"
+        ));
     }
 
     #[test]
@@ -3540,6 +3556,7 @@ onMounted(() => window.addEventListener('keydown', () => {}))
         assert!(files.iter().any(
             |(path, content)| path == Path::new("scripts/smoke-test.mjs")
                 && content.contains("localStorage")
+                && content.contains("app/page.tsx")
         ));
     }
 

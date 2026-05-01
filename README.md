@@ -84,6 +84,8 @@ anvil [OPTIONS]
   -y, --yes                          auto-approve Bash / Write / Edit
       --fresh-session                ignore saved session, start new session_id
       --state-dir <PATH>             override XDG state root (default: $XDG_STATE_HOME/anvil)
+      --deterministic-fallback <MODE>
+                                      deterministic recovery writes: full | support-only | off
       --oneshot                      read one prompt from CLI or stdin
       --resume [<ID>]                replay the last user message; no arg = latest workspace session
 
@@ -192,6 +194,7 @@ watch=false
 auto_test_command=
 yes_mode=false
 log_level=info            # info | verbose | trace
+deterministic_fallback=full # full | support-only | off
 ```
 
 環境変数も使える。
@@ -209,9 +212,15 @@ export ANVIL_AUTO_TEST="cargo test --lib"
 export ANVIL_YES=1
 export ANVIL_STATE_DIR=/custom/path/to/anvil-state
 export ANVIL_LOG_LEVEL=info     # info | verbose | trace
+export ANVIL_DETERMINISTIC_FALLBACK=full # full | support-only | off
 ```
 
 優先順位は `CLI > 環境変数 > .anvil/config > デフォルト値`。
+
+`deterministic_fallback` は product-quality fallback の強さを切り替える。
+`full` は従来互換のテンプレート補完を許可し、`support-only` は scaffold /
+support recovery に限定し、`off` は deterministic recovery write を無効化する。
+path guard、localhost validation、危険な Bash のブロックなどの安全境界はこの設定に関係なく維持される。
 
 ## 永続化とログの保存先
 

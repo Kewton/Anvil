@@ -82,16 +82,24 @@ impl AutoTestRunner {
             });
         }
         if work_root.join("package.json").is_file() {
-            if package_json_has_test_script(work_root) {
+            let has_test = package_json_has_test_script(work_root);
+            let package = std::fs::read_to_string(work_root.join("package.json")).ok()?;
+            let has_build = package_json_has_build_script(&package);
+            if has_test && has_build {
                 return Some(AutoTestPlan {
-                    command: "npm test".to_string(),
+                    command: node_verifier_command(work_root, "npm test && npm run build"),
+                    reason: "package.json test and build scripts detected".to_string(),
+                });
+            }
+            if has_test {
+                return Some(AutoTestPlan {
+                    command: node_verifier_command(work_root, "npm test"),
                     reason: "package.json test script detected".to_string(),
                 });
             }
-            let package = std::fs::read_to_string(work_root.join("package.json")).ok()?;
-            if package.contains("\"build\"") {
+            if has_build {
                 return Some(AutoTestPlan {
-                    command: "npm run build".to_string(),
+                    command: node_verifier_command(work_root, "npm run build"),
                     reason: "package.json build script detected".to_string(),
                 });
             }
@@ -150,6 +158,15 @@ impl AutoTestRunner {
             stderr,
         })
     }
+}
+
+fn node_verifier_command(work_root: &Path, command: &str) -> String {
+    let body = if work_root.join("node_modules").is_dir() {
+        command.to_string()
+    } else {
+        format!("npm install && {command}")
+    };
+    format!("export CI=1 NUXT_IGNORE_LOCK=1; {body}")
 }
 
 /// Classify an auto_test outcome into the appropriate `FeedbackKind`.
@@ -462,6 +479,10 @@ pub(super) fn package_json_has_test_script(work_root: &Path) -> bool {
     package.contains("\"test\"")
 }
 
+fn package_json_has_build_script(package: &str) -> bool {
+    package.contains("\"build\"")
+}
+
 /// Single-quote a path for safe inclusion in a `sh -lc` command line.
 /// Promoted to `pub(super)` for Issue #459 so Tester's shell-template
 /// builder can quote LLM-supplied filenames identically (DR1-001 /
@@ -538,6 +559,42 @@ mod tests {
         let plan =
             AutoTestRunner::detect(dir.path(), &["project_csv_tool.py".to_string()]).expect("plan");
         assert_eq!(plan.command, "python3 project_csv_tool.py example.csv");
+    }
+
+    #[test]
+    fn detects_node_test_and_build_with_install_when_dependencies_missing() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"test":"node smoke.mjs","build":"vite build"}}"#,
+        )
+        .expect("package");
+
+        let plan = AutoTestRunner::detect(dir.path(), &[]).expect("plan");
+
+        assert_eq!(
+            plan.command,
+            "export CI=1 NUXT_IGNORE_LOCK=1; npm install && npm test && npm run build"
+        );
+        assert_eq!(plan.reason, "package.json test and build scripts detected");
+    }
+
+    #[test]
+    fn detects_node_test_and_build_without_install_when_dependencies_present() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join("node_modules")).expect("node_modules");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"test":"node smoke.mjs","build":"vite build"}}"#,
+        )
+        .expect("package");
+
+        let plan = AutoTestRunner::detect(dir.path(), &[]).expect("plan");
+
+        assert_eq!(
+            plan.command,
+            "export CI=1 NUXT_IGNORE_LOCK=1; npm test && npm run build"
+        );
     }
 
     #[test]

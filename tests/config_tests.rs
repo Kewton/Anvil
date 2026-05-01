@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
 use anvil::config::{
-    LogLevel, PartialConfig, load_config_file, load_env_config, merge_partial_configs,
-    parse_key_value_config,
+    DeterministicFallbackMode, LogLevel, PartialConfig, load_config_file, load_env_config,
+    merge_partial_configs, parse_key_value_config,
 };
 
 #[test]
@@ -77,6 +77,44 @@ fn merge_offline_prefers_later_sources() {
         },
     ]);
     assert_eq!(merged.offline, Some(true));
+}
+
+#[test]
+fn deterministic_fallback_mode_parses_aliases() {
+    assert_eq!(
+        "off".parse::<DeterministicFallbackMode>().unwrap(),
+        DeterministicFallbackMode::Off
+    );
+    assert_eq!(
+        "support_only".parse::<DeterministicFallbackMode>().unwrap(),
+        DeterministicFallbackMode::SupportOnly
+    );
+    assert_eq!(
+        "enabled".parse::<DeterministicFallbackMode>().unwrap(),
+        DeterministicFallbackMode::Full
+    );
+}
+
+#[test]
+fn merge_deterministic_fallback_prefers_later_sources() {
+    let merged = merge_partial_configs(&[
+        PartialConfig {
+            deterministic_fallback: Some(DeterministicFallbackMode::Full),
+            ..PartialConfig::default()
+        },
+        PartialConfig {
+            deterministic_fallback: Some(DeterministicFallbackMode::SupportOnly),
+            ..PartialConfig::default()
+        },
+        PartialConfig {
+            deterministic_fallback: Some(DeterministicFallbackMode::Off),
+            ..PartialConfig::default()
+        },
+    ]);
+    assert_eq!(
+        merged.deterministic_fallback,
+        Some(DeterministicFallbackMode::Off)
+    );
 }
 
 #[test]

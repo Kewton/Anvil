@@ -1,3 +1,0 @@
-# Scrub Fixture
-
-Status: done.
