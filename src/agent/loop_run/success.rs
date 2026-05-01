@@ -12,7 +12,8 @@ use crate::modes::plan_act::{ExecutionMode, WorkMode};
 use crate::session::feedback::{
     FeedbackFrame, FeedbackFrameDraft, FeedbackKind, build_feedback_frame,
 };
-use crate::session::store::WorkingMemory;
+use crate::session::store::{ConversationMessage, WorkingMemory};
+use std::collections::VecDeque;
 
 /// Fixed marker for deterministic recovery content. Protocol success treats
 /// this as recovery context, not as proof that the model completed the task.
@@ -70,6 +71,9 @@ impl Agent {
         if self.session.mode_state.work_mode == WorkMode::TypeScriptUi {
             return true;
         }
+        if !recent_successful_bash_commands_since_last_user(&self.session.messages).is_empty() {
+            return true;
+        }
         if AutoTestRunner::detect(&self.work_root, &[]).is_some() {
             return true;
         }
@@ -115,6 +119,8 @@ impl Agent {
         let protocol_demands_verifier = self.should_run_auto_test_for_success();
         let session_id = self.session_store.session_id().to_string();
         let model = self.models.main.clone();
+        let recent_successful_bash_commands =
+            recent_successful_bash_commands_since_last_user(&self.session.messages);
         let v_inputs = VerifierInputs {
             score_inputs: crate::session::anvil_score::AnvilScoreInputs {
                 unsafe_blocks_this_turn: self.session.unsafe_blocks_this_turn,
@@ -126,6 +132,7 @@ impl Agent {
             should_dispatch_success_verifier,
             protocol_demands_verifier,
             changed_files: &stats.changed_files,
+            recent_successful_bash_commands: &recent_successful_bash_commands,
             tester_candidate_some,
             workspace_root: &self.work_root,
         };
@@ -276,9 +283,63 @@ impl Agent {
     }
 }
 
+pub(super) fn recent_successful_bash_commands_since_last_user(
+    messages: &[ConversationMessage],
+) -> Vec<String> {
+    let start = messages
+        .iter()
+        .rposition(|message| message.role == "user")
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let mut pending_bash_commands: VecDeque<String> = VecDeque::new();
+    let mut commands = Vec::new();
+    for message in &messages[start..] {
+        match message.role.as_str() {
+            "assistant" => {
+                pending_bash_commands = message
+                    .tool_calls
+                    .iter()
+                    .filter(|tool_call| tool_call.name == "Bash")
+                    .filter_map(|tool_call| {
+                        tool_call
+                            .arguments
+                            .get("command")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::trim)
+                            .filter(|command| !command.is_empty())
+                            .map(ToOwned::to_owned)
+                    })
+                    .collect();
+            }
+            "tool" if message.name.as_deref() == Some("Bash") => {
+                let Some(command) = pending_bash_commands.pop_front() else {
+                    continue;
+                };
+                if bash_tool_result_succeeded(&message.content) {
+                    commands.push(command);
+                }
+            }
+            _ => {}
+        }
+    }
+    if commands.len() > 6 {
+        commands.drain(..commands.len() - 6);
+    }
+    commands
+}
+
+fn bash_tool_result_succeeded(content: &str) -> bool {
+    content
+        .lines()
+        .map(str::trim)
+        .any(|line| line == "exit_code=0" || line.starts_with("exit_code=0 "))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ollama::xml_fallback::ToolCall;
+    use serde_json::json;
 
     #[test]
     fn select_success_verifier_runs_auto_test_when_protocol_demands_it() {
@@ -332,6 +393,54 @@ mod tests {
         assert_eq!(
             frame.primary_error.as_deref(),
             Some("no auto_test verifier detected for this workspace")
+        );
+    }
+
+    #[test]
+    fn recent_successful_bash_commands_collects_only_current_turn_successes() {
+        let messages = vec![
+            ConversationMessage::user("old task".to_string()),
+            ConversationMessage::assistant(
+                String::new(),
+                vec![ToolCall {
+                    id: "old".to_string(),
+                    name: "Bash".to_string(),
+                    arguments: json!({"command": "cargo test"}),
+                }],
+            ),
+            ConversationMessage::tool("Bash".to_string(), "exit_code=0\n".to_string()),
+            ConversationMessage::user("fix python tests".to_string()),
+            ConversationMessage::assistant(
+                String::new(),
+                vec![
+                    ToolCall {
+                        id: "read".to_string(),
+                        name: "Read".to_string(),
+                        arguments: json!({"path": "app.py"}),
+                    },
+                    ToolCall {
+                        id: "bash".to_string(),
+                        name: "Bash".to_string(),
+                        arguments: json!({"command": "python3 -m pytest"}),
+                    },
+                ],
+            ),
+            ConversationMessage::tool("Read".to_string(), "contents".to_string()),
+            ConversationMessage::tool("Bash".to_string(), "stdout\nexit_code=0\n".to_string()),
+            ConversationMessage::assistant(
+                String::new(),
+                vec![ToolCall {
+                    id: "fail".to_string(),
+                    name: "Bash".to_string(),
+                    arguments: json!({"command": "npm test"}),
+                }],
+            ),
+            ConversationMessage::tool("Bash".to_string(), "exit_code=1\n".to_string()),
+        ];
+
+        assert_eq!(
+            recent_successful_bash_commands_since_last_user(&messages),
+            vec!["python3 -m pytest".to_string()]
         );
     }
 }

@@ -60,6 +60,7 @@ pub struct VerifierInputs<'a> {
     /// 既存 should_run_auto_test_for_success() の結果.
     pub protocol_demands_verifier: bool,
     pub changed_files: &'a [String],
+    pub recent_successful_bash_commands: &'a [String],
     pub tester_candidate_some: bool,
     pub workspace_root: &'a Path,
 }
@@ -153,7 +154,11 @@ impl AgentSkill for VerifierSkill {
 
         // [2] gate true → SuccessVerifier 三値で分岐 (DR2-001/007: AutoTestRunner は
         // unit struct + associated fn で changed_files が必須引数)
-        let detected_plan = AutoTestRunner::detect(inputs.workspace_root, inputs.changed_files);
+        let detected_plan = AutoTestRunner::detect_with_recent_successes(
+            inputs.workspace_root,
+            inputs.changed_files,
+            inputs.recent_successful_bash_commands,
+        );
         let auto_test_some = detected_plan.is_some();
 
         let decision = super::success::select_success_verifier(

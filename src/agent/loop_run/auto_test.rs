@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::agent::prompting::load_project_instructions;
+use crate::logging::log_llm_event;
 use crate::session::feedback::FeedbackKind;
 
 /// Maximum bytes of combined stdout+stderr the auto_test path keeps in its
@@ -60,6 +61,7 @@ fn infer_auto_test_kind(command: &str) -> AutoTestKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum VerifierCandidateSource {
     ProjectInstruction,
+    RecentSuccessfulBash,
     CargoManifest,
     PackageJsonScripts,
     NativeNodeFramework,
@@ -71,6 +73,7 @@ impl VerifierCandidateSource {
     fn as_str(self) -> &'static str {
         match self {
             Self::ProjectInstruction => "project_instruction",
+            Self::RecentSuccessfulBash => "recent_successful_bash",
             Self::CargoManifest => "cargo_manifest",
             Self::PackageJsonScripts => "package_json_scripts",
             Self::NativeNodeFramework => "native_node_framework",
@@ -119,12 +122,36 @@ impl AutoTestRunner {
         Self::detect_candidate(work_root, changed_files).map(VerifierCandidate::into_plan)
     }
 
+    pub(super) fn detect_with_recent_successes(
+        work_root: &Path,
+        changed_files: &[String],
+        recent_successful_bash_commands: &[String],
+    ) -> Option<AutoTestPlan> {
+        Self::detect_candidate_with_recent_successes(
+            work_root,
+            changed_files,
+            recent_successful_bash_commands,
+        )
+        .map(VerifierCandidate::into_plan)
+    }
+
     pub(super) fn detect_candidate(
         work_root: &Path,
         changed_files: &[String],
     ) -> Option<VerifierCandidate> {
-        let candidates = detect_verifier_candidates(work_root, changed_files);
-        select_verifier_candidate(candidates)
+        Self::detect_candidate_with_recent_successes(work_root, changed_files, &[])
+    }
+
+    pub(super) fn detect_candidate_with_recent_successes(
+        work_root: &Path,
+        changed_files: &[String],
+        recent_successful_bash_commands: &[String],
+    ) -> Option<VerifierCandidate> {
+        let candidates =
+            detect_verifier_candidates(work_root, changed_files, recent_successful_bash_commands);
+        let selected = select_verifier_candidate(candidates.clone());
+        emit_verifier_candidate_telemetry(&candidates, selected.as_ref());
+        selected
     }
 
     #[cfg(test)]
@@ -132,7 +159,16 @@ impl AutoTestRunner {
         work_root: &Path,
         changed_files: &[String],
     ) -> Vec<VerifierCandidate> {
-        detect_verifier_candidates(work_root, changed_files)
+        detect_verifier_candidates(work_root, changed_files, &[])
+    }
+
+    #[cfg(test)]
+    pub(super) fn detect_candidates_with_recent_successes(
+        work_root: &Path,
+        changed_files: &[String],
+        recent_successful_bash_commands: &[String],
+    ) -> Vec<VerifierCandidate> {
+        detect_verifier_candidates(work_root, changed_files, recent_successful_bash_commands)
     }
 
     pub(super) fn run(work_root: &Path, plan: &AutoTestPlan) -> Result<AutoTestResult, String> {
@@ -169,9 +205,15 @@ impl AutoTestRunner {
 fn detect_verifier_candidates(
     work_root: &Path,
     changed_files: &[String],
+    recent_successful_bash_commands: &[String],
 ) -> Vec<VerifierCandidate> {
     let mut candidates = Vec::new();
     if let Some(candidate) = detect_project_instruction_test(work_root, changed_files) {
+        candidates.push(candidate);
+    }
+    if let Some(candidate) =
+        detect_recent_successful_bash(changed_files, recent_successful_bash_commands)
+    {
         candidates.push(candidate);
     }
     if let Some(candidate) = detect_cargo_test(work_root) {
@@ -198,15 +240,153 @@ fn select_verifier_candidate(candidates: Vec<VerifierCandidate>) -> Option<Verif
     })
 }
 
+fn emit_verifier_candidate_telemetry(
+    candidates: &[VerifierCandidate],
+    selected: Option<&VerifierCandidate>,
+) {
+    let mut source_counts = std::collections::BTreeMap::new();
+    for candidate in candidates {
+        *source_counts
+            .entry(candidate.source.as_str())
+            .or_insert(0usize) += 1;
+    }
+    log_llm_event(
+        "agent.autotest.candidates",
+        serde_json::json!({
+            "candidate_count": candidates.len(),
+            "selected_source": selected.map(|candidate| candidate.source.as_str()),
+            "source_counts": source_counts,
+        }),
+    );
+}
+
 fn source_priority(source: VerifierCandidateSource) -> u8 {
     match source {
-        VerifierCandidateSource::ProjectInstruction => 5,
+        VerifierCandidateSource::ProjectInstruction => 6,
+        VerifierCandidateSource::RecentSuccessfulBash => 5,
         VerifierCandidateSource::CargoManifest => 4,
         VerifierCandidateSource::PackageJsonScripts => 3,
         VerifierCandidateSource::NativeNodeFramework => 2,
         VerifierCandidateSource::PythonTests => 2,
         VerifierCandidateSource::PythonCompileFallback => 1,
     }
+}
+
+fn detect_recent_successful_bash(
+    changed_files: &[String],
+    recent_successful_bash_commands: &[String],
+) -> Option<VerifierCandidate> {
+    let command = recent_successful_bash_commands
+        .iter()
+        .rev()
+        .find(|command| recent_successful_command_is_reusable_verifier(command, changed_files))?
+        .trim()
+        .to_string();
+    Some(VerifierCandidate {
+        plan: AutoTestPlan {
+            command,
+            reason: "recent successful Bash verifier detected".to_string(),
+        },
+        source: VerifierCandidateSource::RecentSuccessfulBash,
+        confidence: 0.9,
+        evidence: vec![
+            "bash-exit-code-0".to_string(),
+            "safe-verifier-command".to_string(),
+        ],
+    })
+}
+
+fn recent_successful_command_is_reusable_verifier(command: &str, changed_files: &[String]) -> bool {
+    let lower = command.trim().to_ascii_lowercase();
+    if lower.is_empty() || lower.len() > 300 {
+        return false;
+    }
+    if contains_blocked_shell_fragment(&lower) {
+        return false;
+    }
+    if is_project_level_verifier_command(&lower) {
+        return true;
+    }
+    command_references_changed_file(command, changed_files)
+        && is_local_script_verifier_command(&lower)
+}
+
+fn contains_blocked_shell_fragment(lower: &str) -> bool {
+    [
+        "rm -rf",
+        "sudo ",
+        "curl ",
+        "wget ",
+        "git push",
+        "git reset",
+        "chmod ",
+        "chown ",
+        "mkfs",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn is_project_level_verifier_command(lower: &str) -> bool {
+    [
+        "cargo test",
+        "cargo build",
+        "cargo check",
+        "cargo clippy",
+        "npm test",
+        "npm run test",
+        "npm run build",
+        "npm exec -- next build",
+        "npm exec -- vite build",
+        "npm exec -- astro build",
+        "pnpm test",
+        "pnpm run test",
+        "pnpm build",
+        "pnpm run build",
+        "yarn test",
+        "yarn build",
+        "python -m pytest",
+        "python3 -m pytest",
+        "python3 -b -m pytest",
+        "pytest",
+        "uv run pytest",
+        "uv run python -m pytest",
+        "poetry run pytest",
+        "hatch run test",
+        "hatch run pytest",
+        "ruff check",
+        "mypy",
+        "pyright",
+        "tsc",
+        "go test",
+    ]
+    .iter()
+    .any(|needle| lower.starts_with(needle) || lower.contains(&format!("&& {needle}")))
+}
+
+fn is_local_script_verifier_command(lower: &str) -> bool {
+    lower.starts_with("python ")
+        || lower.starts_with("python3 ")
+        || lower.starts_with("node ")
+        || lower.starts_with("deno ")
+        || lower.starts_with("bash ")
+        || lower.starts_with("sh ")
+}
+
+fn command_references_changed_file(command: &str, changed_files: &[String]) -> bool {
+    changed_files.iter().any(|path| {
+        let path = path.trim();
+        if path.is_empty() {
+            return false;
+        }
+        if command.contains(path) {
+            return true;
+        }
+        Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| !name.is_empty() && command.contains(name))
+    })
 }
 
 fn detect_cargo_test(work_root: &Path) -> Option<VerifierCandidate> {
@@ -373,13 +553,15 @@ fn detect_python_verifier(work_root: &Path, changed_files: &[String]) -> Option<
         if has_pytest_dependency {
             evidence.push("pytest-dependency".to_string());
         }
+        let pytest = python_pytest_command(work_root);
+        evidence.extend(pytest.evidence);
         return Some(VerifierCandidate {
             plan: AutoTestPlan {
-                command: "python3 -B -m pytest -p no:cacheprovider".to_string(),
-                reason: "Python tests detected".to_string(),
+                command: pytest.command,
+                reason: pytest.reason,
             },
             source: VerifierCandidateSource::PythonTests,
-            confidence: 0.78,
+            confidence: pytest.confidence,
             evidence,
         });
     }
@@ -398,6 +580,61 @@ fn detect_python_verifier(work_root: &Path, changed_files: &[String]) -> Option<
         });
     }
     None
+}
+
+struct PythonPytestCommand {
+    command: String,
+    reason: String,
+    confidence: f32,
+    evidence: Vec<String>,
+}
+
+fn python_pytest_command(work_root: &Path) -> PythonPytestCommand {
+    let pyproject = std::fs::read_to_string(work_root.join("pyproject.toml"))
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if work_root.join("uv.lock").is_file() || pyproject.contains("[tool.uv") {
+        return PythonPytestCommand {
+            command: "uv run pytest -p no:cacheprovider".to_string(),
+            reason: "Python pytest suite detected with uv project evidence".to_string(),
+            confidence: 0.84,
+            evidence: vec!["python-toolchain:uv".to_string()],
+        };
+    }
+    if work_root.join("poetry.lock").is_file() || pyproject.contains("[tool.poetry") {
+        return PythonPytestCommand {
+            command: "poetry run pytest -p no:cacheprovider".to_string(),
+            reason: "Python pytest suite detected with Poetry project evidence".to_string(),
+            confidence: 0.83,
+            evidence: vec!["python-toolchain:poetry".to_string()],
+        };
+    }
+    if pyproject.contains("[tool.hatch") {
+        let has_test_script = pyproject
+            .lines()
+            .map(str::trim)
+            .any(|line| line.starts_with("test =") || line.starts_with("test="));
+        return PythonPytestCommand {
+            command: if has_test_script {
+                "hatch run test".to_string()
+            } else {
+                "hatch run pytest -p no:cacheprovider".to_string()
+            },
+            reason: "Python pytest suite detected with Hatch project evidence".to_string(),
+            confidence: 0.82,
+            evidence: vec![if has_test_script {
+                "python-toolchain:hatch-test-script".to_string()
+            } else {
+                "python-toolchain:hatch".to_string()
+            }],
+        };
+    }
+    PythonPytestCommand {
+        command: "python3 -B -m pytest -p no:cacheprovider".to_string(),
+        reason: "Python tests detected".to_string(),
+        confidence: 0.78,
+        evidence: vec!["python-toolchain:stdlib".to_string()],
+    }
 }
 
 fn python_project_mentions_pytest(work_root: &Path) -> bool {
@@ -994,6 +1231,53 @@ mod tests {
     }
 
     #[test]
+    fn recent_successful_bash_beats_weak_python_fallback() {
+        let dir = tempdir().expect("tempdir");
+        let changed_files = vec!["scripts/report.py".to_string()];
+        let recent = vec!["python3 -m pytest".to_string()];
+
+        let candidates = AutoTestRunner::detect_candidates_with_recent_successes(
+            dir.path(),
+            &changed_files,
+            &recent,
+        );
+        assert!(candidates.iter().any(|candidate| {
+            candidate.source == VerifierCandidateSource::RecentSuccessfulBash
+        }));
+
+        let selected = AutoTestRunner::detect_candidate_with_recent_successes(
+            dir.path(),
+            &changed_files,
+            &recent,
+        )
+        .expect("selected");
+        assert_eq!(
+            selected.source,
+            VerifierCandidateSource::RecentSuccessfulBash
+        );
+        assert_eq!(selected.plan.command, "python3 -m pytest");
+    }
+
+    #[test]
+    fn recent_successful_bash_ignores_non_verifier_command() {
+        let dir = tempdir().expect("tempdir");
+        let recent = vec!["echo done".to_string()];
+
+        let selected = AutoTestRunner::detect_candidate_with_recent_successes(
+            dir.path(),
+            &["scripts/report.py".to_string()],
+            &recent,
+        )
+        .expect("python fallback");
+
+        assert_eq!(
+            selected.source,
+            VerifierCandidateSource::PythonCompileFallback
+        );
+        assert_ne!(selected.plan.command, "echo done");
+    }
+
+    #[test]
     fn ignores_unsafe_anvil_command() {
         let dir = tempdir().expect("tempdir");
         std::fs::write(
@@ -1259,6 +1543,55 @@ mod tests {
         let plan = AutoTestRunner::detect(dir.path(), &["src/app.py".to_string()]).expect("plan");
         assert_eq!(plan.command, "python3 -B -m pytest -p no:cacheprovider");
         assert!(plan.reason.contains("pytest-dependency"));
+    }
+
+    #[test]
+    fn python_pytest_uses_uv_when_lockfile_exists() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project]\ndependencies=['pytest']\n",
+        )
+        .expect("pyproject");
+        std::fs::write(dir.path().join("uv.lock"), "").expect("uv lock");
+        std::fs::create_dir(dir.path().join("tests")).expect("tests dir");
+
+        let plan = AutoTestRunner::detect(dir.path(), &["src/app.py".to_string()]).expect("plan");
+
+        assert_eq!(plan.command, "uv run pytest -p no:cacheprovider");
+        assert!(plan.reason.contains("python-toolchain:uv"));
+    }
+
+    #[test]
+    fn python_pytest_uses_poetry_when_poetry_project_detected() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[tool.poetry]\nname='x'\n[tool.poetry.dependencies]\npytest='*'\n",
+        )
+        .expect("pyproject");
+        std::fs::create_dir(dir.path().join("tests")).expect("tests dir");
+
+        let plan = AutoTestRunner::detect(dir.path(), &["src/app.py".to_string()]).expect("plan");
+
+        assert_eq!(plan.command, "poetry run pytest -p no:cacheprovider");
+        assert!(plan.reason.contains("python-toolchain:poetry"));
+    }
+
+    #[test]
+    fn python_pytest_uses_hatch_test_script_when_declared() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project]\ndependencies=['pytest']\n[tool.hatch.envs.default.scripts]\ntest = 'pytest'\n",
+        )
+        .expect("pyproject");
+        std::fs::create_dir(dir.path().join("tests")).expect("tests dir");
+
+        let plan = AutoTestRunner::detect(dir.path(), &["src/app.py".to_string()]).expect("plan");
+
+        assert_eq!(plan.command, "hatch run test");
+        assert!(plan.reason.contains("python-toolchain:hatch-test-script"));
     }
 
     #[test]
