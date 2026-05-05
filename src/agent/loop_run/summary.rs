@@ -70,7 +70,10 @@ pub(super) struct LoopStats {
     pub iter_used: usize,
     pub iter_max: usize,
     pub duration_secs: u64,
-    pub changed_files: Vec<String>,
+    /// Display-capped changed files for summaries.
+    pub changed_files: Box<[String]>,
+    /// Complete changed file list for protocol-level evidence.
+    pub all_changed_files: Box<[String]>,
     pub total_changed: usize,
     /// Issue #471: classification counts from `build_stats`. NOT derived from
     /// `changed_files` (which is truncated to 16) — these come from the full
@@ -141,7 +144,16 @@ mod tests {
             iter_used,
             iter_max,
             duration_secs,
-            changed_files: files.into_iter().map(str::to_string).collect(),
+            changed_files: files
+                .iter()
+                .map(|file| (*file).to_string())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            all_changed_files: files
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
             total_changed,
             changed_impl_count: 0,
             changed_test_count: 0,

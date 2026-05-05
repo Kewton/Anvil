@@ -135,6 +135,12 @@ pub fn repo_change_no_tool_recovery_note(attempt: usize) -> String {
     )
 }
 
+pub fn repo_change_after_read_no_edit_note(path: &str, attempt: usize) -> String {
+    format!(
+        "The user asked for an actual repository change, and {path} has already been inspected. Do not answer in prose and do not call Read again. Emit exactly one Edit tool call now on {path}. Use an exact old_string from the previous Read and make the smallest change that satisfies the request. repo_change_after_read_no_edit_attempt={attempt}"
+    )
+}
+
 pub fn repo_change_after_setup_note() -> String {
     "Setup or verification shell commands have already run, but the requested repository change is still missing. On the next turn, first inspect the target implementation file with Read, then make exactly one small Edit or short Write. Do not run another scaffold or dev-server command until a concrete repo change exists.".to_string()
 }
@@ -448,10 +454,10 @@ mod tests {
         focused_edit_timeout_recovery_note, focused_edit_truncated_tool_call_note,
         focused_edit_unterminated_tool_call_note, forced_small_edit_recovery_note,
         framework_scaffold_now_note, is_scaffold_command, post_scaffold_continuation_note,
-        post_scaffold_edit_recovery_note, repo_change_after_setup_note,
-        repo_change_no_tool_recovery_note, repo_change_partial_progress_note,
-        repo_change_quality_gate_note, second_scaffold_shell_edit_exact_anchor_note,
-        tool_call_format_recovery_note,
+        post_scaffold_edit_recovery_note, repo_change_after_read_no_edit_note,
+        repo_change_after_setup_note, repo_change_no_tool_recovery_note,
+        repo_change_partial_progress_note, repo_change_quality_gate_note,
+        second_scaffold_shell_edit_exact_anchor_note, tool_call_format_recovery_note,
     };
 
     #[test]
@@ -477,6 +483,18 @@ mod tests {
         assert!(note.contains("exactly one tool call"), "got: {note}");
         assert!(
             note.contains("repo_change_no_tool_attempt=2"),
+            "got: {note}"
+        );
+    }
+
+    #[test]
+    fn repo_change_after_read_no_edit_note_forces_edit_on_target() {
+        let note = repo_change_after_read_no_edit_note("calculator.py", 2);
+        assert!(note.contains("calculator.py has already been inspected"));
+        assert!(note.contains("Emit exactly one Edit tool call"));
+        assert!(note.contains("do not call Read again"));
+        assert!(
+            note.contains("repo_change_after_read_no_edit_attempt=2"),
             "got: {note}"
         );
     }

@@ -1,17 +1,28 @@
 # Anvil
 
-Ollama 直結の local-first コーディングエージェント。`workspace/v0.1.0` の方針に従い、旧 Anvil の汎用状態機械を捨てて、ローカル LLM が追いやすい小さい実装へゼロベースで作り直した。
+Ollama 直結の local-first コーディングエージェント。multi-provider 化ではなく、ローカル LLM が苦手にしやすい tool call 崩れ、no-edit ループ、検証不足、コンテキスト汚染を CLI 側の小さな protocol と安全ガードで支える。
 
-## v0.1.0 の方針
+## 方針
 
 - Ollama 専用
-- prompt / protocol / loop を最小化
 - tool-first
 - Plan / Act の二段階だけを持つ
 - session persistence を持つ
 - JSON tool call が崩れた場合の XML fallback を持つ
 - `Bash` `Read` `Write` `Edit` `Glob` `Grep` を built-in tools として持つ
+- WorkMode / protocol / verifier は構造化状態として扱い、会話履歴のノイズから分離する
+- deterministic fallback は recovery context であり、それ単体を完了証明にしない
 - リリース導線は従来どおり `cargo build --release` と GitHub Releases を維持
+
+## 機能の安定度
+
+| 区分 | 内容 |
+| --- | --- |
+| Stable | Ollama 直結、Plan / Act、built-in tools、session resume、approval、XML fallback、workspace path guard、localhost host validation |
+| Stable | `sessions list/show/clean`、structured logs、`ANVIL.md` project instruction、WorkMode policy、AutoTest candidate selection |
+| Experimental | Tester Skill、Temporary Test Workspace、Case Memory、AntiPattern、RepoGraph、Verifier/Reminder skill、dataset export |
+| Not implemented | 実 MCP transport、tool-enabled subagent delegation、重い full-screen TUI |
+| Known limitations | live Ollama E2E はモデル・量子化・ローカル toolchain に揺らぐ。Bash は完全 sandbox ではなくユーザー権限で実行される |
 
 ## 実装済み機能
 
@@ -22,17 +33,12 @@ Ollama 直結の local-first コーディングエージェント。`workspace/v
 - `/plan` と `/approve` による Plan / Act 切り替え
 - Git checkpoint / rollback
 - `<think>` 除去と `<tool_call>...</tool_call>` XML fallback
-- FileWatcher と AutoTest command
-- 軽量 TUI
-- local skills loader
-- MCP config registry
-- read-only parallel analysis command
+- WorkMode evidence / alternatives を持つ mode classification
+- AutoTestRunner の verifier candidate selection
+- Tester Skill / Temporary Test Workspace
+- Case Memory / AntiPattern / RepoGraph / structured eval log
 - 読み取り専用の Plan mode 制御
 - live Ollama E2E を含む unit / integration / ignored E2E tests
-
-## まだ入れていないもの
-
-重い full-screen TUI、実際の MCP protocol transport、tool-enabled subagent delegation はまだ最小実装止まり。v0.1.0 では local-first なコア経路を優先し、後段拡張は軽量 slice に留めている。
 
 ## クイックスタート
 
@@ -43,7 +49,16 @@ ollama serve
 ollama pull qwen3:8b
 ```
 
-### 2. ビルド
+### 2. インストール
+
+GitHub Releases の prebuilt binary を使う場合:
+
+```bash
+curl -fsSL 'https://raw.githubusercontent.com/Kewton/Anvil/main/scripts/install.sh' | bash
+anvil --help
+```
+
+手元でビルドする場合:
 
 ```bash
 cargo build --release
@@ -66,30 +81,44 @@ echo "src を調べて plan を作って" | ./target/release/anvil --oneshot
 ## CLI
 
 ```text
-anvil [OPTIONS]
+anvil [OPTIONS] [COMMAND]
 
+Commands:
+  sessions  Inspect / clean stored sessions
+
+Options:
   -p, --prompt <PROMPT>              one-shot prompt
   -m, --model <MODEL>                main model
       --sidecar-model <MODEL>        sidecar model
       --ollama-host <URL>            Ollama base URL (localhost only)
       --context-budget <TOKENS>      message budget for compaction
       --max-iterations <N>           max agent loop iterations
-      --verbose                      anvil-side DEBUG logs (reqwest/hyper は warn に抑制)
-      --trace                        全クレート TRACE ログ（reqwest/hyper 含む）
-      --debug                        deprecated alias for --trace
+      --chat-timeout-secs <SECONDS>  per-request Ollama chat timeout
+      --chat-retries <N>             transport retry count
+      --verbose                      anvil-side DEBUG logs
+      --trace                        all-crate TRACE logs
       --stream                       stream assistant text in interactive turns
-      --tui                          run the lightweight terminal UI
-      --watch                        enable file watcher on startup
-      --auto-test <COMMAND>          run a shell command when watcher sees changes
   -y, --yes                          auto-approve Bash / Write / Edit
       --fresh-session                ignore saved session, start new session_id
-      --state-dir <PATH>             override XDG state root (default: $XDG_STATE_HOME/anvil)
       --oneshot                      read one prompt from CLI or stdin
-      --resume [<ID>]                replay the last user message; no arg = latest workspace session
+      --auto-plan                    classify broad tasks and enter Plan mode first
+      --offline                      block network/package-install style shell work
+      --deterministic-fallback <MODE>
+                                      recovery: off | hint-only | minimal-patch | full-template
+                                      aliases: support-only, full
+      --no-footer                    disable fixed footer status bar
+      --resume [<ID>]                resume latest workspace session or specific UUID
+      --state-dir <PATH>             override XDG state root
+```
 
-anvil sessions list  [--all] [--json]
-anvil sessions show  <ID> [--all] [--json]
-anvil sessions clean [--older-than <DAYS>] [--keep <N>] [--all] [--force] [<ID>]
+Session subcommands:
+
+```text
+anvil sessions list      [--all] [--json]
+anvil sessions show      <ID> [--all] [--json]
+anvil sessions clean     [--older-than <DAYS>] [--keep <N>] [--all] [--force] [<ID>]
+anvil sessions tmp-tests <promote|discard|list> ...
+anvil sessions export    [--output <FILE>] [--success-only|--failed-only] [--all] [--session <ID>]
 ```
 
 `--resume` は直近の `user` メッセージを自動で再投入し、履歴のまま会話を継続する。`--resume <ID>` で UUID v7 を明示指定でき、現在の workspace と一致しない session はエラーになる（他 workspace の閲覧は後述 `sessions show --all` 経由）。`--resume` は `--fresh-session` / `--prompt` / `--oneshot` と排他。
@@ -126,6 +155,10 @@ LLM 推論中・ツール実行中は stderr に 80ms 間隔のスピナーを�
 
 Act-mode で `AutoTestRunner::detect == None`（明示的な test verifier が無い repo）かつ Rust / Node / Python のいずれかが検出されたとき、main model を 1 回だけ同期呼び出し（`tools=None`、JSON-only、`<think>` strip + first JSON object 抽出、`tool_calls` 非空は abort）して smoke test を生成し、`state_root/sessions/<id>/tmp-tests/files/` に保存したうえで固定テンプレートの Bash（Rust: `cargo test --manifest-path ...`、Node: `node --check`、Python: `python3 -m py_compile`）を 30 秒の明示 timeout 付きで実行する。Rust 経路は `tester-runs/<run_id>/` に transient harness（path dependency = workspace package）を書き出して走らせ、終了後に best-effort cleanup する。結果は `FeedbackFrame` として `WorkingMemory.last_feedback` に記録され、Reminder Sidecar 経路と接続して `Precaution` の自動生成に繋がる。
 
+`AutoTestRunner` は verifier を単一キーワードで即決せず、`ANVIL.md` の安全な preferred command、Cargo manifest、`package.json` の `scripts.*`、Python test surface、`py_compile` fallback を候補化して confidence / evidence 付きで選択する。`package.json` は JSON として読み、トップレベルの `"test"` 文字列だけでは `npm test` を選ばない。
+
+Protocol success は work mode ごとに判定される。deterministic fallback はローカル LLM が詰まったときの recovery context として扱い、ファイルが生成されてもそれ単体では完了扱いにしない。完了には model-produced work、または protocol に合う成果物と verifier の通過が必要になる。
+
 以下の条件で自動的に無効化される:
 
 - per-turn cap = 1（`tester_called_this_turn` で同一ターン内 2 回目以降を抑止）
@@ -137,7 +170,7 @@ Act-mode で `AutoTestRunner::detect == None`（明示的な test verifier が�
 
 ## スラッシュコマンド
 
-対話モード（REPL）で利用できる 11 コマンド。これらが Tab 補完の候補になり、`/help` の出力と完全に一致する。
+対話モード（REPL）で利用できる 12 コマンド。これらが Tab 補完の候補になり、`/help` の出力と完全に一致する。
 
 - `/help`
 - `/status`
@@ -149,13 +182,14 @@ Act-mode で `AutoTestRunner::detect == None`（明示的な test verifier が�
 - `/compact`
 - `/logs path [<session_id>]`
 - `/precautions [add <text>|retire <id>|clear]`
+- `/tests`
 - `/exit`
 
 エイリアス: `/act`（= `/approve`）, `/quit`（= `/exit`）。補完候補には出さない。
 
-### v0.1.0 では未提供（将来構想のプレースホルダ）
+### 未提供（将来構想のプレースホルダ）
 
-以下はコマンドとしては受け付けるが、`unavailable in the v0.1.0 core rebuild` を返すだけ。補完候補にも `/help` 出力にも含めない。
+以下はコマンドとしては受け付けるが、現行の軽量 core では unavailable を返すだけ。補完候補にも `/help` 出力にも含めない。
 
 - `/checkpoint [label]`
 - `/rollback`
@@ -172,9 +206,9 @@ TTY 環境で起動した場合は rustyline ベースの入力ハンドラを�
 
 履歴は `$XDG_STATE_HOME/anvil/history`（`--state-dir <PATH>` override を尊重）に最大 1000 行まで保存される。先頭に半角スペースを付けた入力は履歴に保存されないので、機密入力はこの opt-out を使う。
 
-### /help 出力順の変更（v0.1.0 系内の互換性メモ）
+### /help 出力順
 
-`/help` 出力は `/help /status /model /yes /no /plan /approve /compact /logs /precautions /exit` の順に固定した。以前は `/yes /no` が末尾付近にあったが、承認系コマンドを目立つ位置に移動する UX 改善として `/model` 直後へ前進させている。
+`/help` 出力は `/help /status /model /yes /no /plan /approve /compact /logs /precautions /tests /exit` の順に固定している。
 
 ## 設定
 
@@ -186,12 +220,9 @@ sidecar_model=qwen3:1.7b
 ollama_host=http://127.0.0.1:11434
 context_budget=24000
 max_iterations=12
-stream=false
-tui=false
-watch=false
-auto_test_command=
 yes_mode=false
 log_level=info            # info | verbose | trace
+deterministic_fallback=minimal-patch # off | hint-only | minimal-patch | full-template
 ```
 
 環境変数も使える。
@@ -203,15 +234,21 @@ export ANVIL_OLLAMA_HOST=http://127.0.0.1:11434
 export ANVIL_CONTEXT_BUDGET=24000
 export ANVIL_MAX_ITERATIONS=12
 export ANVIL_STREAM=1
-export ANVIL_TUI=1
-export ANVIL_WATCH=1
-export ANVIL_AUTO_TEST="cargo test --lib"
 export ANVIL_YES=1
 export ANVIL_STATE_DIR=/custom/path/to/anvil-state
 export ANVIL_LOG_LEVEL=info     # info | verbose | trace
+export ANVIL_DETERMINISTIC_FALLBACK=minimal-patch # off | hint-only | minimal-patch | full-template
 ```
 
 優先順位は `CLI > 環境変数 > .anvil/config > デフォルト値`。
+
+`deterministic_fallback` は product-quality fallback の強さを切り替える。
+デフォルトは `minimal-patch`。scaffold / support recovery に限定し、テンプレート単体を
+完了扱いにしない。`hint-only` は deterministic write を行わずモデルへの継続ヒントだけを出し、
+`full-template` は従来互換のテンプレート補完を明示的に許可する。`off` は deterministic
+recovery write を無効化する。互換 alias として `support-only` は `minimal-patch`、
+`full` は `full-template` として扱う。
+path guard、localhost validation、危険な Bash のブロックなどの安全境界はこの設定に関係なく維持される。
 
 ## 永続化とログの保存先
 
@@ -252,6 +289,9 @@ workdir 側の `.anvil/logs/` `.anvil/sessions/` `.anvil/plans/` は上記への
 ## ベンチマーク・レポート
 
 `scripts/` 配下のハーネス群で 5-run ベンチマークと集計レポートを生成できる。
+実践的な E2E/UAT の評価設計は `docs/e2e-uat-evaluation.md` にまとめている。
+CI / release confidence checks は [docs/ci.md](docs/ci.md) にまとめている。
+Git 管理に含める artifacts の方針は [docs/repository-hygiene.md](docs/repository-hygiene.md) にまとめている。
 
 ```bash
 # 1モデル 5-run ベンチマーク
@@ -279,6 +319,8 @@ python3 scripts/report.py --compare <bench_root_a>/ <bench_root_b>/
 cargo fmt --all
 cargo clippy --all-targets -- -D warnings
 cargo test --all
+bash scripts/check_cli_help_snapshot.sh
+bash scripts/check_repo_hygiene.sh
 cargo test --test e2e_local_llm live_ollama_can_write_a_file -- --ignored --nocapture
 ANVIL_E2E_RUNS=2 cargo test --test e2e_local_llm live_ollama_multi_run_file_write_stability -- --ignored --nocapture
 cargo build --release
@@ -291,6 +333,9 @@ cargo build --release
 - バイナリ名は `anvil`
 - `cargo build --release --target ...` で生成
 - `.github/workflows/release.yml` が `anvil-linux-*` / `anvil-darwin-*` を gzip 化
+- 各 artifact に `.sha256` checksum を添付
 - `v*` タグ push で GitHub Release を作成
+- 対応OS、manual install、Homebrew plan、既知制限は [docs/install.md](docs/install.md) を参照
+- release branch の自動チェックと manual live E2E は [docs/ci.md](docs/ci.md) を参照
 
 つまり、内部実装は全面刷新したが、配布導線は壊していない。

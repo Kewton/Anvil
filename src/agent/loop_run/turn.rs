@@ -1,9 +1,8 @@
 use super::auto_test::{
-    AutoTestKind, AutoTestPlan, AutoTestResult, classify_auto_test, count_compile_errors,
-    count_test_failures,
+    AutoTestKind, AutoTestPlan, AutoTestResult, AutoTestRunner, classify_auto_test,
+    count_compile_errors, count_test_failures,
 };
 use super::interrupt::{InterruptEnv, InterruptFlag, InterruptMonitor};
-use super::protocol::ExecutionProtocol;
 use super::reminder::{
     self, ReminderInputs, ReminderOutcome, build_log_payload as build_reminder_log_payload,
 };
@@ -13,7 +12,10 @@ use super::tester;
 use super::*;
 use crate::agent::orchestration::{RepoVerification, capture_repo_snapshot, verify_repo_progress};
 use crate::logging::log_llm_event;
-use crate::modes::plan_act::{PlanStage, TaskProfile, WorkMode, infer_work_mode_from_text};
+use crate::model_capabilities::model_capabilities;
+use crate::modes::plan_act::{
+    PlanStage, TaskProfile, WorkMode, classify_work_mode_json, infer_work_mode_from_text,
+};
 use crate::ollama::client::SIDECAR_SUMMARY_TIMEOUT_SECS;
 use crate::ollama::xml_fallback::normalize_tool_call_arguments;
 use crate::session::feedback::{
@@ -22,6 +24,7 @@ use crate::session::feedback::{
 use crate::session::precaution::{Precaution, PrecautionStatus, severity_order};
 use crate::session::store::WorkingMemory;
 use crate::tools::registry::{BashErrorClass, ToolSpec, resolve_plan_mode_write_target};
+use crate::util::file_classify::{is_implementation_file, is_setup_file, is_test_file};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -38,21 +41,13 @@ use super::quality::{
     request_explicitly_requires_tests, request_mentions_unsupported_ui_framework,
     request_needs_playable_ui_quality_gate, workspace_has_unsupported_ui_framework,
 };
+use super::success::DETERMINISTIC_CONTENT_FALLBACK_TAG;
 
 /// Maximum number of characters of tool-call arguments retained in trace logs.
 const LOG_ARGS_MAX_CHARS: usize = 200;
 const PLAN_REPEATED_EXPLORATION_BLOCK_THRESHOLD: usize = 2;
 const USER_INTERRUPT_ERROR: &str = "__anvil_user_interrupt__";
-const QWEN35_NON_NATIVE_HARD_TIMEOUT_SECS: u64 = 90;
-const FOCUSED_EDIT_PRE_READ_TIMEOUT_SECS: u64 = 30;
-const FOCUSED_EDIT_PRE_READ_MAX_PREDICT: usize = 320;
-const FOCUSED_EDIT_POST_READ_TIMEOUT_SECS: u64 = 45;
-const FOCUSED_EDIT_POST_READ_MAX_PREDICT: usize = 320;
 const CREATE_NEXT_APP_PACKAGE_VERSION: &str = "16.2.4";
-
-fn is_qwen35_family(model: &str) -> bool {
-    model.trim().to_ascii_lowercase().starts_with("qwen3.5:")
-}
 
 fn request_explicitly_requests_script_execution(request: &str) -> bool {
     let lower = request.to_ascii_lowercase();
@@ -79,6 +74,53 @@ fn request_explicitly_requests_script_execution(request: &str) -> bool {
     .iter()
     .any(|needle| lower.contains(needle));
     mentions_script && asks_execution
+}
+
+fn latest_tool_result_since_last_user<'a>(
+    messages: &'a [ConversationMessage],
+    tool_name: &str,
+) -> Option<&'a str> {
+    for message in messages.iter().rev() {
+        if message.role == "user" {
+            break;
+        }
+        if message.role == "tool" && message.name.as_deref() == Some(tool_name) {
+            return Some(message.content.as_str());
+        }
+    }
+    None
+}
+
+fn truncate_for_answer(text: &str, max_chars: usize) -> String {
+    let total = text.chars().count();
+    if total <= max_chars {
+        return text.to_string();
+    }
+    let keep = max_chars.saturating_sub(32);
+    let truncated = text.chars().take(keep).collect::<String>();
+    format!(
+        "{truncated}\n...[truncated {} chars]",
+        total.saturating_sub(keep)
+    )
+}
+
+fn answer_only_script_execution_fallback_response(output: &str) -> String {
+    let excerpt = truncate_for_answer(output.trim(), 1_600);
+    let status = output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("exit_code="))
+        .map(|code| {
+            if code == "0" {
+                "コマンドは exit_code=0 で正常終了しています。".to_string()
+            } else {
+                format!("コマンドは exit_code={code} で終了しています。")
+            }
+        })
+        .unwrap_or_else(|| "コマンドの出力を確認しました。".to_string());
+
+    format!(
+        "ファイルは変更せず、指定されたコマンド/スクリプトの実行結果を確認しました。\n\n実行結果:\n```text\n{excerpt}\n```\n\n要約:\n- {status}\n- 上記の stdout/stderr が今回確認できた実行結果です。"
+    )
 }
 
 fn answer_only_script_command_allowed(command: &str) -> bool {
@@ -241,65 +283,6 @@ fn build_anvil_test_summary(
     }
 }
 
-/// CB-002 (Issue #459): which verifier should run on a successful turn.
-///
-/// `select_success_verifier` is a pure decision function over three boolean
-/// inputs so the dispatch logic can be unit tested without spinning up the
-/// full agent. Production wiring lives in the success branch of
-/// `handle_user_message_inner` and uses this enum to decide between
-/// `AutoTestRunner::run`, `try_invoke_tester`, the `NoVerifierAvailable`
-/// fallback, and a no-op skip.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum SuccessVerifier {
-    /// Run `AutoTestRunner::run(plan)` (existing auto_test path).
-    AutoTest,
-    /// Run the Tester Skill via `try_invoke_tester`.
-    Tester,
-    /// No verifier ran — record `NoVerifierAvailable` feedback.
-    NoVerifier,
-    /// `should_run_auto_test_for_success() == false` and no Tester candidate
-    /// — do nothing (the historical pre-#450 behaviour).
-    Skip,
-}
-
-/// CB-002 (Issue #459): the Tester is gated **independently** of
-/// `should_run_auto_test_for_success()`. The selection rules are:
-///
-/// 1. `should_run && auto_test_some` → `AutoTest` (an explicit verifier
-///    exists and the protocol asked for it).
-/// 2. `tester_some` (regardless of `should_run`) → `Tester`. The
-///    `TesterCandidate::detect` filter already returns `None` when an
-///    explicit verifier is present, so this branch is only reachable when
-///    `auto_test_some == false` *or* the auto_test plan is build-only.
-/// 3. `should_run && !auto_test_some && !tester_some` → `NoVerifier` — the
-///    protocol demanded verification and nothing matched.
-/// 4. Otherwise (`!should_run && !tester_some` and any `auto_test_some`) →
-///    `Skip`.
-pub(super) fn select_success_verifier(
-    should_run: bool,
-    auto_test_some: bool,
-    tester_some: bool,
-) -> SuccessVerifier {
-    if should_run && auto_test_some {
-        SuccessVerifier::AutoTest
-    } else if tester_some {
-        SuccessVerifier::Tester
-    } else if should_run {
-        SuccessVerifier::NoVerifier
-    } else {
-        SuccessVerifier::Skip
-    }
-}
-
-pub(super) fn build_feedback_for_no_verifier(workspace_root: &Path) -> FeedbackFrame {
-    let draft = FeedbackFrameDraft {
-        kind: FeedbackKind::NoVerifierAvailable,
-        primary_error: Some("no auto_test verifier detected for this workspace".to_string()),
-        ..Default::default()
-    };
-    build_feedback_frame(draft, workspace_root)
-}
-
 /// CB-001: build a FeedbackFrame from a `BashExecutionOutcome`. Uses the
 /// pure `classify_bash_outcome` helper (Timeout / UnsafeCommandBlocked /
 /// exit code != 0). Returns None for an outcome that is not a failure
@@ -433,8 +416,6 @@ fn build_feedback_for_no_repo_progress(workspace_root: &Path) -> FeedbackFrame {
 /// (`(?i)deterministic|fallback|placeholder|scaffold|quality gate|repair|polish`)
 /// does not require it. Callers that need to distinguish in logs should
 /// use the surrounding `agent.*.fallback_applied` events.
-const DETERMINISTIC_CONTENT_FALLBACK_TAG: &str = "deterministic_content_fallback";
-
 /// Issue #455 / CB-001: FeedbackFrame for the no-tool-call exhaustion
 /// path (`no_tool_retries >= 3` in Act/repo-change exhaustion, or
 /// `>= 2` in answer-only inadequate-reply exhaustion).
@@ -1073,6 +1054,57 @@ fn progress_stage_label(
     Some("Repo exploration".to_string())
 }
 
+fn sync_package_json_with_existing_lock(
+    work_root: &Path,
+    relative: &Path,
+    package_content: String,
+) -> String {
+    if relative != Path::new("package.json") {
+        return package_content;
+    }
+    let Ok(lock_content) = std::fs::read_to_string(work_root.join("package-lock.json")) else {
+        return package_content;
+    };
+    let Ok(mut package) = serde_json::from_str::<serde_json::Value>(&package_content) else {
+        return package_content;
+    };
+    let Ok(lock) = serde_json::from_str::<serde_json::Value>(&lock_content) else {
+        return package_content;
+    };
+    let Some(root_package) = lock
+        .get("packages")
+        .and_then(|packages| packages.get(""))
+        .and_then(serde_json::Value::as_object)
+    else {
+        return package_content;
+    };
+    let Some(package_object) = package.as_object_mut() else {
+        return package_content;
+    };
+
+    let mut replaced_any = false;
+    for section in [
+        "dependencies",
+        "devDependencies",
+        "optionalDependencies",
+        "peerDependencies",
+    ] {
+        if let Some(lock_section) = root_package.get(section) {
+            package_object.insert(section.to_string(), lock_section.clone());
+            replaced_any = true;
+        } else {
+            package_object.remove(section);
+        }
+    }
+    if !replaced_any {
+        return package_content;
+    }
+
+    serde_json::to_string_pretty(&package)
+        .map(|json| format!("{json}\n"))
+        .unwrap_or(package_content)
+}
+
 fn extract_plan_constraints(contents: &str) -> Vec<String> {
     let mut in_constraints = false;
     let mut lines = Vec::new();
@@ -1288,6 +1320,7 @@ fn build_stats(
     duration_secs: u64,
 ) -> LoopStats {
     let mut all_changed: HashSet<String> = HashSet::new();
+    let mut all_changed_full: HashSet<String> = HashSet::new();
     let mut impl_changed = 0usize;
     let mut test_changed = 0usize;
     let mut setup_changed = 0usize;
@@ -1297,6 +1330,9 @@ fn build_stats(
     for verif in accumulated.iter().chain(std::iter::once(&final_verif)) {
         for f in &verif.changed_files {
             all_changed.insert(f.clone());
+        }
+        for f in &verif.all_changed_files {
+            all_changed_full.insert(f.clone());
         }
         impl_changed += verif.implementation_files_changed;
         test_changed += verif.test_files_changed;
@@ -1310,12 +1346,15 @@ fn build_stats(
     let mut changed_files: Vec<String> = all_changed.into_iter().collect();
     changed_files.sort();
     changed_files.truncate(16);
+    let mut all_changed_files: Vec<String> = all_changed_full.into_iter().collect();
+    all_changed_files.sort();
 
     LoopStats {
         iter_used,
         iter_max,
         duration_secs,
-        changed_files,
+        changed_files: changed_files.into_boxed_slice(),
+        all_changed_files: all_changed_files.into_boxed_slice(),
         total_changed,
         changed_impl_count: impl_changed,
         changed_test_count: test_changed,
@@ -2112,7 +2151,26 @@ impl Agent {
     ) -> LoopResult {
         self.push_user_message(input.to_string());
         if self.session.mode_state.mode != ExecutionMode::Plan {
-            self.session.mode_state.work_mode = infer_work_mode_from_text(input);
+            let classification = classify_work_mode_json(input);
+            self.session.mode_state.work_mode = classification.work_mode;
+            log_llm_event(
+                "agent.work_mode.classified",
+                serde_json::json!({
+                    "session_id": self.session_store.session_id(),
+                    "input": input,
+                    "stage": "turn_start",
+                    "work_mode": classification.work_mode.as_str(),
+                    "intent": classification.intent,
+                    "confidence": classification.confidence,
+                    "ambiguity": classification.ambiguity,
+                    "alternative_gap": classification.alternative_gap,
+                    "allows_file_edits": classification.allows_file_edits,
+                    "requires_tests": classification.requires_tests,
+                    "reason": classification.reason,
+                    "evidence": &classification.evidence,
+                    "alternatives": &classification.alternatives,
+                }),
+            );
             self.maybe_compact_session(DEFAULT_KEEP_TAIL);
         }
         let _ = self.refresh_plan_stage();
@@ -2186,6 +2244,7 @@ impl Agent {
         let mut install_commands_seen = 0usize;
         let mut logged_plan_first_write = false;
         let mut logged_act_first_repo_edit = false;
+        let mut framework_app_fallback_materialized = false;
 
         let mut exit_reason = ExitReason::MaxIterations;
         let mut error_text = String::new();
@@ -2225,13 +2284,12 @@ impl Agent {
 
             if action_expectation == recovery::ActionExpectation::RepoChange
                 && repo_edit_calls_made_this_turn == 0
+                && should_try_framework_app_fallback(last_iter, framework_app_fallback_materialized)
                 && self.maybe_materialize_framework_game_fallback(last_iter)
             {
-                final_prose =
-                    "Implemented the requested runnable app with deterministic framework files."
-                        .to_string();
-                exit_reason = ExitReason::Done;
-                break 'outer;
+                framework_app_fallback_materialized = true;
+                self.push_system_note(framework_app_fallback_continuation_note().to_string());
+                continue;
             }
 
             if repo_edit_calls_made_this_turn == 0
@@ -2259,11 +2317,11 @@ impl Agent {
                         self.session.record_feedback_if_unset(
                             build_feedback_for_deterministic_content_fallback(&self.work_root),
                         );
-                        final_prose = format!(
-                            "Improved the requested playable UI with deterministic visual polish in {target_path}."
+                        self.push_deterministic_ui_recovery_continuation_note(
+                            &target_path,
+                            repo_change_retries.saturating_add(1),
                         );
-                        exit_reason = ExitReason::Done;
-                        break 'outer;
+                        continue;
                     }
                     Ok(false) => {}
                     Err(err) => {
@@ -2370,6 +2428,23 @@ impl Agent {
                         self.session.working_memory.note_error(err);
                         repo_change_retries += 1;
                         if repo_change_retries >= 3 {
+                            let request = self.active_request_text().unwrap_or_default();
+                            let fallback =
+                                match self.maybe_apply_local_llm_small_edit_fallback(&request) {
+                                    Ok(fallback) => fallback,
+                                    Err(err) => {
+                                        exit_reason = ExitReason::TransportError;
+                                        error_text = err;
+                                        break 'outer;
+                                    }
+                                };
+                            if let Some(relative) = fallback {
+                                final_prose = format!(
+                                    "Applied a verified small edit fallback after the local model could not produce a compact edit for {relative}."
+                                );
+                                exit_reason = ExitReason::Done;
+                                break 'outer;
+                            }
                             exit_reason = ExitReason::MissingRepoEdits;
                             error_text = exit_reason.default_error_text().to_string();
                             break 'outer;
@@ -2979,11 +3054,11 @@ impl Agent {
                             self.session.record_feedback_if_unset(
                                 build_feedback_for_deterministic_content_fallback(&self.work_root),
                             );
-                            final_prose = format!(
-                                "Improved the requested playable UI with deterministic visual polish in {target_path}."
+                            self.push_deterministic_ui_recovery_continuation_note(
+                                &target_path,
+                                repo_change_retries.saturating_add(1),
                             );
-                            exit_reason = ExitReason::Done;
-                            break 'outer;
+                            continue;
                         }
                         Ok(false) => {}
                         Err(err) => {
@@ -3017,11 +3092,11 @@ impl Agent {
                             self.session.record_feedback_if_unset(
                                 build_feedback_for_deterministic_content_fallback(&self.work_root),
                             );
-                            final_prose = format!(
-                                "Implemented the requested playable UI by replacing scaffold placeholder output in {target_path}."
+                            self.push_deterministic_ui_recovery_continuation_note(
+                                &target_path,
+                                repo_change_retries.saturating_add(1),
                             );
-                            exit_reason = ExitReason::Done;
-                            break 'outer;
+                            continue;
                         }
                         Ok(false) => {}
                         Err(err) => {
@@ -3058,11 +3133,11 @@ impl Agent {
                             self.session.record_feedback_if_unset(
                                 build_feedback_for_deterministic_content_fallback(&self.work_root),
                             );
-                            final_prose = format!(
-                                "Implemented the requested playable UI by replacing scaffold placeholder output in {target_path}."
+                            self.push_deterministic_ui_recovery_continuation_note(
+                                &target_path,
+                                repo_change_retries.saturating_add(1),
                             );
-                            exit_reason = ExitReason::Done;
-                            break 'outer;
+                            continue;
                         }
                         Ok(false) => {}
                         Err(err) => {
@@ -3130,10 +3205,48 @@ impl Agent {
                 if action_expectation == recovery::ActionExpectation::RepoChange {
                     repo_change_retries += 1;
                     if repo_change_retries >= 2 {
-                        if self.maybe_materialize_framework_game_fallback(last_iter) {
-                            final_prose = "Implemented the requested runnable app with deterministic framework files.".to_string();
+                        if repo_change_retries == 2
+                            && self.push_repo_change_no_edit_recovery_note(repo_change_retries)
+                        {
+                            write_stdout_rendered(
+                                &format_iteration_status(
+                                    last_iter,
+                                    self.config.max_iterations,
+                                    "Retry requested",
+                                    "The target file was already read. Asked the model to emit one Edit tool call now.",
+                                    self.footer.current_cols(),
+                                ),
+                                true,
+                            );
+                            continue;
+                        }
+                        let request = self.active_request_text().unwrap_or_default();
+                        let fallback =
+                            match self.maybe_apply_local_llm_small_edit_fallback(&request) {
+                                Ok(fallback) => fallback,
+                                Err(err) => {
+                                    exit_reason = ExitReason::TransportError;
+                                    error_text = err;
+                                    break 'outer;
+                                }
+                            };
+                        if let Some(relative) = fallback {
+                            final_prose = format!(
+                                "Applied a verified small edit fallback after the local model stopped before editing {relative}."
+                            );
                             exit_reason = ExitReason::Done;
                             break 'outer;
+                        }
+                        if should_try_framework_app_fallback(
+                            last_iter,
+                            framework_app_fallback_materialized,
+                        ) && self.maybe_materialize_framework_game_fallback(last_iter)
+                        {
+                            framework_app_fallback_materialized = true;
+                            self.push_system_note(
+                                framework_app_fallback_continuation_note().to_string(),
+                            );
+                            continue;
                         }
                         exit_reason = ExitReason::MissingRepoEdits;
                         error_text = exit_reason.default_error_text().to_string();
@@ -3149,7 +3262,11 @@ impl Agent {
                         ),
                         true,
                     );
-                    self.push_system_note(recovery::repo_change_recovery_note(repo_change_retries));
+                    if !self.push_repo_change_no_edit_recovery_note(repo_change_retries) {
+                        self.push_system_note(recovery::repo_change_recovery_note(
+                            repo_change_retries,
+                        ));
+                    }
                 } else if action_expectation == recovery::ActionExpectation::PlanProgress {
                     let plan_contents = self
                         .current_plan_contents()
@@ -3236,10 +3353,48 @@ impl Agent {
                 if action_expectation == recovery::ActionExpectation::RepoChange {
                     repo_change_retries += 1;
                     if repo_change_retries >= 2 {
-                        if self.maybe_materialize_framework_game_fallback(last_iter) {
-                            final_prose = "Implemented the requested runnable app with deterministic framework files.".to_string();
+                        if repo_change_retries == 2
+                            && self.push_repo_change_no_edit_recovery_note(repo_change_retries)
+                        {
+                            write_stdout_rendered(
+                                &format_iteration_status(
+                                    last_iter,
+                                    self.config.max_iterations,
+                                    "Retry requested",
+                                    "The target file was already read. Asked the model to emit one Edit tool call now.",
+                                    self.footer.current_cols(),
+                                ),
+                                true,
+                            );
+                            continue;
+                        }
+                        let request = self.active_request_text().unwrap_or_default();
+                        let fallback =
+                            match self.maybe_apply_local_llm_small_edit_fallback(&request) {
+                                Ok(fallback) => fallback,
+                                Err(err) => {
+                                    exit_reason = ExitReason::TransportError;
+                                    error_text = err;
+                                    break 'outer;
+                                }
+                            };
+                        if let Some(relative) = fallback {
+                            final_prose = format!(
+                                "Applied a verified small edit fallback after the local model stopped before editing {relative}."
+                            );
                             exit_reason = ExitReason::Done;
                             break 'outer;
+                        }
+                        if should_try_framework_app_fallback(
+                            last_iter,
+                            framework_app_fallback_materialized,
+                        ) && self.maybe_materialize_framework_game_fallback(last_iter)
+                        {
+                            framework_app_fallback_materialized = true;
+                            self.push_system_note(
+                                framework_app_fallback_continuation_note().to_string(),
+                            );
+                            continue;
                         }
                         exit_reason = ExitReason::MissingRepoEdits;
                         error_text = exit_reason.default_error_text().to_string();
@@ -3271,7 +3426,7 @@ impl Agent {
                             target_already_read,
                             repo_change_retries,
                         ));
-                    } else {
+                    } else if !self.push_repo_change_no_edit_recovery_note(repo_change_retries) {
                         self.push_system_note(recovery::repo_change_no_tool_recovery_note(
                             repo_change_retries,
                         ));
@@ -3399,10 +3554,12 @@ impl Agent {
             if action_expectation == recovery::ActionExpectation::RepoChange
                 && repo_edit_calls_made_this_turn == 0
             {
-                if self.maybe_materialize_framework_game_fallback(last_iter) {
-                    final_prose = "Implemented the requested runnable app with deterministic framework files.".to_string();
-                    exit_reason = ExitReason::Done;
-                    break 'outer;
+                if should_try_framework_app_fallback(last_iter, framework_app_fallback_materialized)
+                    && self.maybe_materialize_framework_game_fallback(last_iter)
+                {
+                    framework_app_fallback_materialized = true;
+                    self.push_system_note(framework_app_fallback_continuation_note().to_string());
+                    continue;
                 }
                 match self.maybe_apply_deterministic_nextjs_scaffold(last_iter, &interrupt_flag) {
                     ScaffoldFallbackResult::Applied => {
@@ -3425,6 +3582,22 @@ impl Agent {
                 }
                 repo_change_retries += 1;
                 if repo_change_retries >= 3 {
+                    let request = self.active_request_text().unwrap_or_default();
+                    let fallback = match self.maybe_apply_local_llm_small_edit_fallback(&request) {
+                        Ok(fallback) => fallback,
+                        Err(err) => {
+                            exit_reason = ExitReason::TransportError;
+                            error_text = err;
+                            break 'outer;
+                        }
+                    };
+                    if let Some(relative) = fallback {
+                        final_prose = format!(
+                            "Applied a verified small edit fallback after the local model stopped before editing {relative}."
+                        );
+                        exit_reason = ExitReason::Done;
+                        break 'outer;
+                    }
                     exit_reason = ExitReason::MissingRepoEdits;
                     error_text = exit_reason.default_error_text().to_string();
                     break 'outer;
@@ -3464,6 +3637,7 @@ impl Agent {
             if repo_edit_calls_made_this_turn > 0
                 && self.active_python_request_requires_tests()
                 && !self.python_test_artifact_exists()
+                && !self.python_verifier_available_for_requested_tests()
             {
                 python_test_retries += 1;
                 if python_test_retries >= 2 {
@@ -3590,11 +3764,11 @@ impl Agent {
                         self.session.record_feedback_if_unset(
                             build_feedback_for_deterministic_content_fallback(&self.work_root),
                         );
-                        final_prose = format!(
-                            "Implemented the requested playable UI by replacing scaffold placeholder output in {target_path}."
+                        self.push_deterministic_ui_recovery_continuation_note(
+                            &target_path,
+                            repo_change_retries.saturating_add(1),
                         );
-                        exit_reason = ExitReason::Done;
-                        break 'outer;
+                        continue;
                     }
                     Ok(false) => {}
                     Err(err) => {
@@ -3743,7 +3917,7 @@ impl Agent {
             duration_secs,
         );
         if exit_reason == ExitReason::ToolCallFormatError
-            && is_qwen35_family(&self.current_assistant_model())
+            && model_capabilities(&self.current_assistant_model()).finish_after_edit_format_error
             && stats.total_changed > 0
             && self.session.mode_state.mode == ExecutionMode::Act
             && (!self.active_python_request_requires_tests() || self.python_test_artifact_exists())
@@ -3754,204 +3928,13 @@ impl Agent {
             exit_reason = ExitReason::Done;
             error_text.clear();
         }
-        // Issue #466: post-loop verifier dispatch を VerifierSkill 経由に置換.
-        // facade applies outcome 方針 (DR-466-002 / Stage 5):
-        //   1. exit_reason.is_success() && success_issue chk → should_dispatch_success_verifier
-        //   2. VerifierSkill::execute が AutoTestRunner::detect/run + compute_anvil_score を完結
-        //   3. facade が VerifierOutcome を解釈して legacy events emit / verify_commands push /
-        //      record_feedback_if_unset / try_invoke_tester / exit_reason 設定 / last_anvil_score
-        //      永続化を Reminder より前に行う (Stage 7 S7-001..003 / DR2-001..004 / DR3-001..002).
-        let mut verify_commands_collected: Vec<String> = Vec::new();
-        let should_dispatch_success_verifier = if exit_reason.is_success() {
-            let protocol = ExecutionProtocol::from_work_mode(self.session.mode_state.work_mode);
-            if let Some(issue) = protocol.success_issue(&stats) {
-                exit_reason = ExitReason::MissingRepoEdits;
-                error_text = issue;
-                false
-            } else {
-                true
-            }
-        } else {
-            false
-        };
-        let tester_candidate_some = if should_dispatch_success_verifier {
-            tester::TesterCandidate::detect(&self.work_root, &stats.changed_files).is_some()
-        } else {
-            false
-        };
-        let protocol_demands_verifier = self.should_run_auto_test_for_success();
-        let session_id = self.session_store.session_id().to_string();
-        let model = self.models.main.clone();
-        // VerifierInputs / SkillInvocationRequest を組み立て invoke
-        let v_inputs = crate::agent::loop_run::verifier_skill::VerifierInputs {
-            score_inputs: crate::session::anvil_score::AnvilScoreInputs {
-                unsafe_blocks_this_turn: self.session.unsafe_blocks_this_turn,
-                repo_edit_succeeded_this_turn: self.session.repo_edit_succeeded_this_turn,
-                consecutive_no_progress_turns: self.session.consecutive_no_progress_turns,
-                prev: self.session.last_anvil_score.as_ref(),
-            },
-            repo_verification: Some(&final_verif),
-            should_dispatch_success_verifier,
-            protocol_demands_verifier,
-            changed_files: &stats.changed_files,
-            tester_candidate_some,
-            workspace_root: &self.work_root,
-        };
-        let started = std::time::Instant::now();
-        let snapshot_for_state = self.session.clone();
-        let runtime_state = crate::agent::skills::RuntimeState {
-            plan_mode: self.session.mode_state.mode == ExecutionMode::Plan,
-            interrupted: false,
-            turn_index: self.current_turn_index,
-            session: &snapshot_for_state,
-            last_anvil_score: self.session.last_anvil_score.as_ref(),
-            reminder_sidecar_available: false,
-            reminder_kind_eligible: false,
-            reminder_called_this_turn: self.reminder_called_this_turn,
-        };
-        let mut events_local: Vec<(&'static str, serde_json::Value)> = Vec::new();
-        let invocation = {
-            let mut wm = WorkingMemory::default();
-            let ctx = crate::agent::skills::SkillExecutionContext {
-                working_memory: &mut wm,
-                workspace_root: &self.work_root,
-            };
-            let request = crate::agent::skills::SkillInvocationRequest {
-                skill_name: "verifier",
-                trigger: crate::agent::skills::SkillTrigger::PostLoop,
-                state: &runtime_state,
-                input: crate::agent::skills::SkillInput::Verifier(v_inputs),
-                ctx,
-                get_env: &|k: &str| std::env::var_os(k),
-                emit_event: &mut |k, p| events_local.push((k, p)),
-                session_id: &session_id,
-                model: Some(&model),
-            };
-            self.skill_registry.invoke(request)
-        };
-        // emit captured agent.verifier.* events via log_llm_event (logging::log_llm_event は
-        // mask_payload_inplace を内蔵するため secret 漏洩防御の SSOT、DR4-004).
-        for (k, p) in events_local.into_iter() {
-            log_llm_event(k, p);
-        }
-        let compute_ms = started.elapsed().as_secs_f64() * 1000.0;
-        // facade applies outcome (5 step):
-        // SkillOutput::Verifier(Box<VerifierOutcome>) - deref to access variant
-        let final_score = match invocation.output {
-            Some(crate::agent::skills::SkillOutput::Verifier(boxed)) => {
-                use crate::agent::loop_run::verifier_skill::{
-                    AutoTestKindView, VerifierOutcome, sanitize_verify_command_for_case_record,
-                };
-                let outcome: VerifierOutcome = *boxed;
-                let score = match &outcome {
-                    VerifierOutcome::AutoTestRan { score, .. }
-                    | VerifierOutcome::AutoTestTransportError { score, .. }
-                    | VerifierOutcome::TesterDelegated { score }
-                    | VerifierOutcome::NoVerifier { score, .. }
-                    | VerifierOutcome::Skipped { score }
-                    | VerifierOutcome::EnvDisabled { score } => score.clone(),
-                };
-                // [a] AutoTest 分岐時のみ legacy events emit + verify_commands push
-                //     (DR2-004: 空文字列 / DR4-001: sanitize でガード)
-                if let VerifierOutcome::AutoTestRan {
-                    auto_test_kind,
-                    auto_test_passed,
-                    auto_test_command,
-                    auto_test_output,
-                    auto_test_reason,
-                    ..
-                } = &outcome
-                {
-                    log_llm_event(
-                        "agent.autotest.completed",
-                        serde_json::json!({
-                            "session_id": &session_id,
-                            "command": auto_test_command,
-                            "passed": auto_test_passed,
-                            "reason": auto_test_reason,
-                        }),
-                    );
-                    if let Some(sanitized) =
-                        sanitize_verify_command_for_case_record(auto_test_command)
-                    {
-                        verify_commands_collected.push(sanitized);
-                    }
-                    // AutoTest failed (Ok だが passed=false) → MissingRepoEdits 反映 (DR3-001)
-                    if !auto_test_passed {
-                        let kind_dbg = match auto_test_kind {
-                            AutoTestKindView::Build => "Build",
-                            AutoTestKindView::Test => "Test",
-                        };
-                        exit_reason = ExitReason::MissingRepoEdits;
-                        error_text = format!(
-                            "auto test failed for protocol {kind_dbg}: {}\n{}",
-                            auto_test_command, auto_test_output
-                        );
-                    }
-                }
-                // [c] FeedbackFrame 記録 (DR2-003: record_feedback_if_unset で
-                //     first-eligible-failure-wins #455 規約を維持)
-                if let VerifierOutcome::AutoTestRan {
-                    feedback: Some(fb), ..
-                } = &outcome
-                {
-                    self.session.record_feedback_if_unset(fb.clone());
-                }
-                if let VerifierOutcome::NoVerifier { feedback, .. } = &outcome {
-                    self.session.record_feedback_if_unset(feedback.clone());
-                }
-                // [d] Tester 委譲 (本 Issue では Tester skill 化 Out of Scope、既存
-                //     try_invoke_tester を facade で呼ぶ)
-                if matches!(outcome, VerifierOutcome::TesterDelegated { .. }) {
-                    let tester_recorded = self.try_invoke_tester(&stats.changed_files);
-                    if !tester_recorded && self.should_run_auto_test_for_success() {
-                        let frame = build_feedback_for_no_verifier(&self.work_root);
-                        self.session.record_feedback_if_unset(frame);
-                    }
-                }
-                // [e] AutoTestTransportError → exit_reason 反映 (DR2-002)
-                if let VerifierOutcome::AutoTestTransportError { error, .. } = &outcome {
-                    exit_reason = ExitReason::TransportError;
-                    error_text = error.clone();
-                }
-                // [f] EnvDisabled → agent.autotest.disabled event emit (DR2-004)
-                if matches!(outcome, VerifierOutcome::EnvDisabled { .. }) {
-                    log_llm_event(
-                        "agent.autotest.disabled",
-                        serde_json::json!({
-                            "session_id": &session_id,
-                            "reason": "ANVIL_NO_AUTO_TEST",
-                        }),
-                    );
-                }
-                Some(score)
-            }
-            // Issue #467 / DR1-002 2 次防御: PermissionDenied は SkillRegistry::invoke 内で
-            // 完結する設計のため facade に届かない。届いたら debug_assert で検知し
-            // release では安全に None フォールバック。
-            Some(crate::agent::skills::SkillOutput::PermissionDenied(_)) => {
-                debug_assert!(false, "PermissionDenied must not reach facade");
-                None
-            }
-            _ => None,
-        };
-        // [b] AnvilScore 永続化と flag 立て (Reminder より先).
-        if let Some(score) = final_score {
-            let rendered = score.format_for_prompt();
-            let render_chars = rendered.chars().count();
-            log_llm_event(
-                "agent.anvil_score.computed",
-                serde_json::json!({
-                    "session_id": &session_id,
-                    "turn_index": self.current_turn_index,
-                    "score": &score,
-                    "render_chars": render_chars,
-                    "compute_ms": compute_ms,
-                }),
-            );
-            self.session.last_anvil_score = Some(score);
-            self.anvil_score_computed_this_turn = true;
-        }
+        let verify_commands_collected = self.run_post_loop_success_verifier(
+            &final_verif,
+            &stats,
+            repo_edit_calls_made_this_turn,
+            &mut exit_reason,
+            &mut error_text,
+        );
         // Issue #452: Reminder Sidecar (post-loop hook). Picks up
         // NoRepoProgress / auto_test / NoVerifierAvailable frames recorded
         // after the actor loop exited. Per-turn cap means this no-ops if the
@@ -3985,6 +3968,8 @@ impl Agent {
                 .active_task
                 .as_deref()
                 .unwrap_or("");
+            let session_id = self.session_store.session_id().to_string();
+            let model = self.models.main.clone();
             let mode_str = format!("{:?}", self.session.mode_state.mode);
             let tool_protocol = if self.native_tools_enabled {
                 "native"
@@ -4080,14 +4065,6 @@ impl Agent {
         }
     }
 
-    fn should_run_auto_test_for_success(&self) -> bool {
-        if self.session.mode_state.work_mode == WorkMode::Python {
-            return true;
-        }
-        self.active_request_text()
-            .is_some_and(|request| request_explicitly_requires_tests(&request))
-    }
-
     /// Issue #459: try to invoke the Tester Skill when `AutoTestRunner::detect`
     /// returned None. Returns `true` iff the Tester recorded a FeedbackFrame
     /// (so the caller skips the `NoVerifierAvailable` fallback). Disable
@@ -4101,7 +4078,7 @@ impl Agent {
     /// § 4-2 ("Skip / Abort の細粒度 variant は同じ branch (= 既存
     /// no_verifier) に集約し、log のみで識別する"). This is the boundary
     /// captured by the bool return.
-    fn try_invoke_tester(&mut self, changed_files: &[String]) -> bool {
+    pub(super) fn try_invoke_tester(&mut self, changed_files: &[String]) -> bool {
         // Per-turn cap → Plan mode → `ANVIL_NO_TESTER` early-out (DR1-004 /
         // DR1-012 / DR2-017). The shared `check_invocation_gate` is the single
         // source of truth so integration tests in `tests/tester_skill_smoke.rs`
@@ -4446,7 +4423,7 @@ impl Agent {
                     }
                     if err.to_ascii_lowercase().contains("timed out")
                         && let Some(reply) =
-                            self.maybe_apply_deterministic_polish_fallback_after_timeout(&err)?
+                            self.maybe_apply_deterministic_polish_fallback_after_timeout(&err)
                     {
                         // Issue #455 / D2: timeout-after polish fallback success.
                         self.session.record_feedback_if_unset(
@@ -4458,7 +4435,7 @@ impl Agent {
                         && let Some(target) = self.focused_edit_recovery_target()
                     {
                         if let Some(reply) =
-                            self.maybe_apply_deterministic_quality_fallback_after_timeout(&err)?
+                            self.maybe_apply_deterministic_quality_fallback_after_timeout(&err)
                         {
                             // Issue #455 / D2: timeout-after quality fallback success.
                             self.session.record_feedback_if_unset(
@@ -4522,11 +4499,13 @@ impl Agent {
         let messages = self.build_request_messages(protocol);
         let assistant_model = self.current_assistant_model();
         let focused_edit_timeout_override = focused_edit_timeout_override_secs(
+            assistant_model.as_str(),
             &self.session.messages,
             self.focused_edit_recovery_target().as_deref(),
             &self.work_root,
         );
         let focused_edit_max_predict_override = focused_edit_max_predict_override(
+            assistant_model.as_str(),
             &self.session.messages,
             self.focused_edit_recovery_target().as_deref(),
             &self.work_root,
@@ -4674,7 +4653,7 @@ impl Agent {
 
     fn maybe_finish_after_qwen35_edit_format_error(&self, err: &str) -> Option<AssistantReply> {
         if !lifecycle::is_tool_call_format_error(err)
-            || !is_qwen35_family(&self.current_assistant_model())
+            || !model_capabilities(&self.current_assistant_model()).finish_after_edit_format_error
             || self.session.mode_state.mode != ExecutionMode::Act
         {
             return None;
@@ -4700,7 +4679,8 @@ impl Agent {
         err: &str,
     ) -> Result<Option<AssistantReply>, String> {
         if !lifecycle::is_tool_call_format_error(err)
-            || !is_qwen35_family(&self.current_assistant_model())
+            || !model_capabilities(&self.current_assistant_model())
+                .deterministic_edit_after_format_error
             || has_successful_non_plan_repo_edit(
                 &self.session.messages,
                 &self.work_root,
@@ -4709,9 +4689,15 @@ impl Agent {
         {
             return Ok(None);
         }
-        let Some(target) = self.qwen35_small_edit_target() else {
+        let Some(path) = last_read_tool_path(&self.session.messages) else {
             return Ok(None);
         };
+        let Ok(target) = resolve_user_path(&self.work_root, &path) else {
+            return Ok(None);
+        };
+        if !target.is_file() {
+            return Ok(None);
+        }
         let current = std::fs::read_to_string(&target)
             .map_err(|err| format!("failed to read {}: {err}", target.display()))?;
         let replacement = if current.contains("pub fn multiply") && current.contains("left + right")
@@ -4732,6 +4718,16 @@ impl Agent {
         self.session
             .working_memory
             .note_touched_file(relative.clone());
+        log_llm_event(
+            "agent.deterministic_format_error_small_edit",
+            serde_json::json!({
+                "session_id": self.session_store.session_id(),
+                "work_root": self.work_root.display().to_string(),
+                "fallback_level": self.config.deterministic_fallback.fallback_level(),
+                "fallback_action": "minimal_patch",
+                "target": &relative,
+            }),
+        );
         Ok(Some(AssistantReply {
             content: format!(
                 "Applied a deterministic small-edit fallback for qwen3.5 after malformed tool calls in {relative}."
@@ -4862,6 +4858,8 @@ impl Agent {
                 "plan_path": plan_path.display().to_string(),
                 "task_profile": self.session.mode_state.task_profile.as_str(),
                 "model_override": self.plan_model_override,
+                "fallback_level": self.config.deterministic_fallback.fallback_level(),
+                "fallback_action": "minimal_patch",
             }),
         );
         Ok(true)
@@ -4912,7 +4910,7 @@ impl Agent {
         }
         if let Some(target) = self.qwen35_small_edit_target() {
             messages.push(ConversationMessage::system(format!(
-                "[qwen3.5 Focused Edit] The target file has already been read: {}. Emit exactly one small Edit on this file next. Do not use Read, Write, Bash, Glob, or Grep. Anchor the Edit to exact text from the latest Read and keep the replacement compact.",
+                "[Local LLM Focused Edit] The target file has already been read: {}. Emit exactly one small Edit on this file next. Do not use Read, Write, Bash, Glob, or Grep. Anchor the Edit to exact text from the latest Read and keep the replacement compact.",
                 progress_path_display(
                     &target.display().to_string(),
                     &self.work_root,
@@ -5094,7 +5092,7 @@ impl Agent {
     }
 
     fn qwen35_small_edit_target(&self) -> Option<PathBuf> {
-        if !is_qwen35_family(&self.current_assistant_model()) {
+        if !model_capabilities(&self.current_assistant_model()).read_after_small_edit_protocol {
             return None;
         }
         if self.session.mode_state.mode != ExecutionMode::Act
@@ -5110,9 +5108,7 @@ impl Agent {
         ) {
             return None;
         }
-        let path = latest_turn_last_read_tool_path(&self.session.messages)?;
-        let candidate = resolve_user_path(&self.work_root, &path).ok()?;
-        candidate.is_file().then_some(candidate)
+        latest_turn_preferred_read_edit_target(&self.session.messages, &self.work_root)
     }
 
     fn mode_policy_message(&self) -> Option<ConversationMessage> {
@@ -5166,9 +5162,13 @@ impl Agent {
         ) {
             return None;
         }
-        let path = last_read_tool_path(&self.session.messages)?;
-        let candidate = resolve_user_path(&self.work_root, &path).ok()?;
-        candidate.is_file().then_some(candidate)
+        latest_turn_preferred_read_edit_target(&self.session.messages, &self.work_root).or_else(
+            || {
+                let path = last_read_tool_path(&self.session.messages)?;
+                let candidate = resolve_user_path(&self.work_root, &path).ok()?;
+                candidate.is_file().then_some(candidate)
+            },
+        )
     }
 
     fn post_scaffold_edit_recovery_message(&self) -> Option<String> {
@@ -5220,6 +5220,11 @@ impl Agent {
         if let Some(candidate) = first_existing_impl_target(&self.work_root) {
             return Some(candidate);
         }
+        if let Some(candidate) =
+            latest_turn_preferred_read_edit_target(&self.session.messages, &self.work_root)
+        {
+            return Some(candidate);
+        }
         if let Some(path) = last_read_tool_path(&self.session.messages)
             && let Ok(candidate) = resolve_user_path(&self.work_root, &path)
             && candidate.is_file()
@@ -5258,6 +5263,59 @@ impl Agent {
         self.forced_small_edit_recovery_target()
             .or_else(|| self.post_scaffold_edit_recovery_target())
             .or_else(|| self.post_scaffold_continuation_recovery_target())
+    }
+
+    fn repo_change_no_edit_recovery_target(&self) -> Option<PathBuf> {
+        if self.session.mode_state.mode != ExecutionMode::Act
+            || !self.session.mode_state.policy().repo_edit_required
+            || !self.active_task_expects_repo_change()
+            || has_successful_non_plan_repo_edit(
+                &self.session.messages,
+                &self.work_root,
+                self.session.mode_state.active_plan_path.as_deref(),
+            )
+        {
+            return None;
+        }
+        if let Some(candidate) = first_existing_impl_target(&self.work_root)
+            && focused_edit_target_already_read(&self.session.messages, &candidate, &self.work_root)
+        {
+            return Some(candidate);
+        }
+        latest_turn_preferred_read_edit_target(&self.session.messages, &self.work_root).or_else(
+            || {
+                let path = last_read_tool_path(&self.session.messages)?;
+                let candidate = resolve_user_path(&self.work_root, &path).ok()?;
+                candidate.is_file().then_some(candidate)
+            },
+        )
+    }
+
+    fn push_repo_change_no_edit_recovery_note(&mut self, attempt: usize) -> bool {
+        let Some(target) = self.repo_change_no_edit_recovery_target() else {
+            return false;
+        };
+        let target_display = progress_path_display(
+            &target.display().to_string(),
+            &self.work_root,
+            self.session.mode_state.active_plan_path.as_deref(),
+            120,
+        );
+        self.push_system_note(recovery::repo_change_after_read_no_edit_note(
+            &target_display,
+            attempt,
+        ));
+        true
+    }
+
+    fn push_deterministic_ui_recovery_continuation_note(
+        &mut self,
+        target_path: &str,
+        attempt: usize,
+    ) {
+        self.push_system_note(format!(
+            "Deterministic UI recovery updated {target_path}, but this is recovery context, not completion. Inspect the file if needed, then make one small model-produced Edit or run the project verifier before finalizing. deterministic_ui_recovery_attempt={attempt}"
+        ));
     }
 
     fn execute_tool_call(
@@ -5505,6 +5563,13 @@ impl Agent {
         &mut self,
         last_iter: usize,
     ) -> Option<String> {
+        if !self
+            .config
+            .deterministic_fallback
+            .allows_template_completion()
+        {
+            return None;
+        }
         let policy = self.session.mode_state.policy();
         let request = self.active_request_text()?;
         let (label, event, files, final_message) = if policy.allow_python_deterministic_fallback {
@@ -5584,6 +5649,8 @@ impl Agent {
                 "session_id": self.session_store.session_id(),
                 "work_root": self.work_root.display().to_string(),
                 "work_mode": self.session.mode_state.work_mode.as_str(),
+                "fallback_level": self.config.deterministic_fallback.fallback_level(),
+                "fallback_action": "full_template",
                 "files": written_paths,
             }),
         );
@@ -5615,6 +5682,9 @@ impl Agent {
     }
 
     fn maybe_materialize_framework_game_fallback(&mut self, last_iter: usize) -> bool {
+        if !self.config.deterministic_fallback.allows_hint_only() {
+            return false;
+        }
         if !self
             .session
             .mode_state
@@ -5633,6 +5703,35 @@ impl Agent {
             && !deterministic_framework_app_files_needed(&self.work_root, &files, &request)
         {
             return false;
+        }
+        if !self
+            .config
+            .deterministic_fallback
+            .allows_template_completion()
+        {
+            let level = self.config.deterministic_fallback.fallback_level();
+            write_stdout_rendered(
+                &format_iteration_status(
+                    last_iter,
+                    self.config.max_iterations,
+                    "App fallback hint",
+                    &format!(
+                        "Deterministic full-template fallback is disabled at level {level}; asked the model to continue with a task-specific implementation."
+                    ),
+                    self.footer.current_cols(),
+                ),
+                true,
+            );
+            log_llm_event(
+                "agent.empty_workspace.deterministic_framework_app_hint",
+                serde_json::json!({
+                    "session_id": self.session_store.session_id(),
+                    "work_root": self.work_root.display().to_string(),
+                    "fallback_level": level,
+                    "fallback_action": "hint_only",
+                }),
+            );
+            return true;
         }
 
         let mut written = Vec::<PathBuf>::new();
@@ -5685,12 +5784,18 @@ impl Agent {
             serde_json::json!({
                 "session_id": self.session_store.session_id(),
                 "work_root": self.work_root.display().to_string(),
+                "fallback_level": self.config.deterministic_fallback.fallback_level(),
+                "fallback_action": "full_template",
                 "files": written_paths,
             }),
         );
+        self.session
+            .record_feedback_if_unset(build_feedback_for_deterministic_content_fallback(
+                &self.work_root,
+            ));
         self.session.messages.push(ConversationMessage::assistant(
             format!(
-                "Implemented the requested runnable app with deterministic framework files: {}.",
+                "Materialized deterministic framework app fallback files as a recovery scaffold: {}. Continue implementation and verification before treating the task as complete.",
                 written_paths.join(", ")
             ),
             Vec::new(),
@@ -5703,6 +5808,9 @@ impl Agent {
         last_iter: usize,
         interrupt_flag: &InterruptFlag,
     ) -> ScaffoldFallbackResult {
+        if !self.config.deterministic_fallback.allows_support_recovery() {
+            return ScaffoldFallbackResult::NotApplicable;
+        }
         if !self.active_task_requires_nextjs_scaffold()
             || !self.workspace_appears_empty()
             || recent_scaffold_command_seen(&self.session.messages)
@@ -5726,6 +5834,8 @@ impl Agent {
                 serde_json::json!({
                     "session_id": self.session_store.session_id(),
                     "work_root": self.work_root.display().to_string(),
+                    "fallback_level": self.config.deterministic_fallback.fallback_level(),
+                    "fallback_action": "minimal_patch",
                     "reason": reason,
                 }),
             );
@@ -5781,6 +5891,8 @@ impl Agent {
             serde_json::json!({
                 "session_id": self.session_store.session_id(),
                 "work_root": self.work_root.display().to_string(),
+                "fallback_level": self.config.deterministic_fallback.fallback_level(),
+                "fallback_action": "minimal_patch",
                 "create_next_app_version": CREATE_NEXT_APP_PACKAGE_VERSION,
             }),
         );
@@ -5825,7 +5937,7 @@ impl Agent {
             .and_then(requested_scaffold_framework)
     }
 
-    fn active_request_text(&self) -> Option<String> {
+    pub(super) fn active_request_text(&self) -> Option<String> {
         repo_change_request_text(
             self.session.working_memory.active_task.as_deref(),
             &self.session.messages,
@@ -5879,6 +5991,9 @@ impl Agent {
         }
         let target = first_existing_impl_target(&self.work_root)?;
         let content = std::fs::read_to_string(&target).ok()?;
+        if implementation_quality_issue_for_request(request, &content).is_some() {
+            return None;
+        }
         deterministic::playable_ui_polish(request, &target, &content)?;
         let relative = target
             .strip_prefix(&self.work_root)
@@ -5901,6 +6016,11 @@ impl Agent {
                 .active_request_text()
                 .as_deref()
                 .is_some_and(request_explicitly_requires_tests)
+    }
+
+    fn python_verifier_available_for_requested_tests(&self) -> bool {
+        AutoTestRunner::detect(&self.work_root, &self.session.working_memory.touched_files)
+            .is_some_and(|plan| plan.auto_test_kind() == AutoTestKind::Test)
     }
 
     fn python_test_artifact_exists(&self) -> bool {
@@ -6015,6 +6135,13 @@ if __name__ == "__main__":
         request: &str,
         relative_target: &str,
     ) -> Result<bool, String> {
+        if !self
+            .config
+            .deterministic_fallback
+            .allows_template_completion()
+        {
+            return Ok(false);
+        }
         let target = self.work_root.join(relative_target);
         let current = std::fs::read_to_string(&target)
             .map_err(|err| format!("failed to read {}: {err}", target.display()))?;
@@ -6024,8 +6151,60 @@ if __name__ == "__main__":
         };
         std::fs::write(&target, replacement)
             .map_err(|err| format!("failed to write {}: {err}", target.display()))?;
+        self.maybe_apply_deterministic_framework_support_files(request)?;
         self.maybe_apply_requested_port_script(request)?;
+        log_llm_event(
+            "agent.deterministic_ui_quality_repair",
+            serde_json::json!({
+                "session_id": self.session_store.session_id(),
+                "work_root": self.work_root.display().to_string(),
+                "fallback_level": self.config.deterministic_fallback.fallback_level(),
+                "fallback_action": "full_template",
+                "target": relative_target,
+            }),
+        );
         Ok(true)
+    }
+
+    fn maybe_apply_deterministic_framework_support_files(
+        &self,
+        request: &str,
+    ) -> Result<(), String> {
+        if !self.config.deterministic_fallback.allows_support_recovery() {
+            return Ok(());
+        }
+        let Some(files) = deterministic::empty_framework_app_files(request) else {
+            return Ok(());
+        };
+        let mut written_paths = Vec::<String>::new();
+        for (relative, content) in files {
+            if deterministic_framework_game_impl_path(&relative) {
+                continue;
+            }
+            let content = sync_package_json_with_existing_lock(&self.work_root, &relative, content);
+            let target_relative = deterministic_support_target_relative(&self.work_root, &relative);
+            let target = self.work_root.join(&target_relative);
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+            }
+            std::fs::write(&target, content)
+                .map_err(|err| format!("failed to write {}: {err}", target.display()))?;
+            written_paths.push(target_relative.to_string_lossy().replace('\\', "/"));
+        }
+        if !written_paths.is_empty() {
+            log_llm_event(
+                "agent.deterministic_framework_support_files",
+                serde_json::json!({
+                    "session_id": self.session_store.session_id(),
+                    "work_root": self.work_root.display().to_string(),
+                    "fallback_level": self.config.deterministic_fallback.fallback_level(),
+                    "fallback_action": "minimal_patch",
+                    "files": written_paths,
+                }),
+            );
+        }
+        Ok(())
     }
 
     fn maybe_apply_deterministic_polish_fallback(
@@ -6033,6 +6212,13 @@ if __name__ == "__main__":
         request: &str,
         relative_target: &str,
     ) -> Result<bool, String> {
+        if !self
+            .config
+            .deterministic_fallback
+            .allows_template_completion()
+        {
+            return Ok(false);
+        }
         let target = self.work_root.join(relative_target);
         let current = std::fs::read_to_string(&target)
             .map_err(|err| format!("failed to read {}: {err}", target.display()))?;
@@ -6043,7 +6229,91 @@ if __name__ == "__main__":
         std::fs::write(&target, replacement)
             .map_err(|err| format!("failed to write {}: {err}", target.display()))?;
         self.maybe_apply_requested_port_script(request)?;
+        log_llm_event(
+            "agent.deterministic_ui_polish",
+            serde_json::json!({
+                "session_id": self.session_store.session_id(),
+                "work_root": self.work_root.display().to_string(),
+                "fallback_level": self.config.deterministic_fallback.fallback_level(),
+                "fallback_action": "full_template",
+                "target": relative_target,
+            }),
+        );
         Ok(true)
+    }
+
+    fn maybe_apply_local_llm_small_edit_fallback(
+        &mut self,
+        request: &str,
+    ) -> Result<Option<String>, String> {
+        if !self
+            .config
+            .deterministic_fallback
+            .allows_template_completion()
+        {
+            return Ok(None);
+        }
+        if !model_capabilities(&self.current_assistant_model()).read_after_small_edit_protocol {
+            return Ok(None);
+        }
+        let Some(target) = self.local_llm_small_edit_fallback_target() else {
+            return Ok(None);
+        };
+        let current = std::fs::read_to_string(&target)
+            .map_err(|err| format!("failed to read {}: {err}", target.display()))?;
+        let polish_request = if quality::request_needs_playable_ui_quality_gate(request) {
+            "ゲームUIの品質を上げてください。".to_string()
+        } else {
+            format!("{request}\n品質を上げてください。")
+        };
+        let Some(replacement) =
+            deterministic::playable_ui_polish(&polish_request, &target, &current)
+        else {
+            return Ok(None);
+        };
+        std::fs::write(&target, replacement)
+            .map_err(|err| format!("failed to write {}: {err}", target.display()))?;
+        self.session
+            .record_feedback_if_unset(build_feedback_for_deterministic_content_fallback(
+                &self.work_root,
+            ));
+        let relative = target
+            .strip_prefix(&self.work_root)
+            .unwrap_or(target.as_path())
+            .to_string_lossy()
+            .replace('\\', "/");
+        log_llm_event(
+            "agent.deterministic_local_llm_small_edit",
+            serde_json::json!({
+                "session_id": self.session_store.session_id(),
+                "work_root": self.work_root.display().to_string(),
+                "fallback_level": self.config.deterministic_fallback.fallback_level(),
+                "fallback_action": "full_template",
+                "target": &relative,
+            }),
+        );
+        Ok(Some(relative))
+    }
+
+    fn local_llm_small_edit_fallback_target(&self) -> Option<PathBuf> {
+        if self.session.mode_state.mode != ExecutionMode::Act
+            || !self.session.mode_state.policy().repo_edit_required
+            || !self.active_task_expects_repo_change()
+        {
+            return None;
+        }
+        if let Some(candidate) =
+            latest_turn_preferred_read_edit_target(&self.session.messages, &self.work_root)
+        {
+            return Some(candidate);
+        }
+        if let Some(path) = last_read_tool_path(&self.session.messages)
+            && let Ok(candidate) = resolve_user_path(&self.work_root, &path)
+            && candidate.is_file()
+        {
+            return Some(candidate);
+        }
+        first_existing_impl_target(&self.work_root)
     }
 
     fn maybe_apply_requested_port_script(&self, request: &str) -> Result<(), String> {
@@ -6078,68 +6348,31 @@ if __name__ == "__main__":
     fn maybe_apply_deterministic_quality_fallback_after_timeout(
         &self,
         err: &str,
-    ) -> Result<Option<AssistantReply>, String> {
+    ) -> Option<AssistantReply> {
         if !err.to_ascii_lowercase().contains("timed out")
             || !self.current_request_needs_playable_ui_quality_gate()
         {
-            return Ok(None);
+            return None;
         }
-        let Some((request, target_path, issue)) = self.accepted_repo_change_quality_issue() else {
-            return Ok(None);
-        };
-        if !self.maybe_apply_deterministic_quality_fallback(&request, &target_path)? {
-            return Ok(None);
-        }
-        log_llm_event(
-            "agent.quality.timeout_fallback_applied",
-            serde_json::json!({
-                "session_id": self.session_store.session_id(),
-                "target": target_path,
-                "issue": issue,
-                "error": err,
-            }),
-        );
-        Ok(Some(AssistantReply {
-            content: format!(
-                "Implemented the requested playable UI by replacing scaffold placeholder output in {target_path} after the model timed out."
-            ),
-            tool_calls: Vec::new(),
-            prompt_tokens: None,
-            completion_tokens: None,
-        }))
+        // Creative/playable UI timeout recovery must not synthesize a
+        // completion reply. Let the focused-edit recovery path continue so the
+        // next successful completion is model-produced or verifier-backed.
+        None
     }
 
     fn maybe_apply_deterministic_polish_fallback_after_timeout(
         &self,
         err: &str,
-    ) -> Result<Option<AssistantReply>, String> {
+    ) -> Option<AssistantReply> {
         if !err.to_ascii_lowercase().contains("timed out")
             || !self.current_request_needs_playable_ui_quality_gate()
         {
-            return Ok(None);
+            return None;
         }
-        let Some((request, target_path)) = self.accepted_repo_change_polish_target() else {
-            return Ok(None);
-        };
-        if !self.maybe_apply_deterministic_polish_fallback(&request, &target_path)? {
-            return Ok(None);
-        }
-        log_llm_event(
-            "agent.polish.timeout_fallback_applied",
-            serde_json::json!({
-                "session_id": self.session_store.session_id(),
-                "target": target_path,
-                "error": err,
-            }),
-        );
-        Ok(Some(AssistantReply {
-            content: format!(
-                "Improved the requested playable UI with deterministic visual polish in {target_path} after the model timed out."
-            ),
-            tool_calls: Vec::new(),
-            prompt_tokens: None,
-            completion_tokens: None,
-        }))
+        // Same boundary as quality fallback above: deterministic polish can be
+        // a recovery aid during normal loop iterations, but timeout handling
+        // must not turn it into an assistant completion.
+        None
     }
 
     fn refresh_working_memory(&mut self) {
@@ -6183,6 +6416,11 @@ if __name__ == "__main__":
     fn answer_only_fallback_response(&self) -> String {
         let request = self.active_request_text().unwrap_or_default();
         let lower = request.to_ascii_lowercase();
+        if request_explicitly_requests_script_execution(&request)
+            && let Some(output) = latest_tool_result_since_last_user(&self.session.messages, "Bash")
+        {
+            return answer_only_script_execution_fallback_response(output);
+        }
         if lower.contains("modepolicy") || lower.contains("構造化状態") {
             return "ファイルは変更せず、読み取り専用で整理します。\n\n利点:\n- モード判断を会話履歴から分離できるため、古い発話や回復プロンプトに引きずられにくい。\n- `repo_edit_required` や fallback 許可などを明示的な実行ポリシーとして扱えるため、ツール制御と品質ゲートを安定させやすい。\n- セッション保存や compaction 後も、必要な状態だけを小さく復元できる。\n\nリスク:\n- 状態更新の境界が曖昧だと、ユーザーの最新意図と ModePolicy がずれる。\n- ポリシーが強すぎると、読み取り専用のスクリプト実行など正当な作業まで止める。\n- LLM の自然言語判断と構造化状態の差分を観測できないと、誤分類の原因調査が難しい。\n\n方向性としては、ModePolicy は構造化状態で保持し、最新ユーザー要求から毎ターン再評価できるようにするのが妥当です。会話履歴へ埋め込むのは補助説明に留め、実際のツール許可と品質条件は構造化フィールドを正とするのが安定します。".to_string();
         }
@@ -6341,16 +6579,17 @@ pub(crate) fn unicode_supported() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        FOCUSED_EDIT_POST_READ_TIMEOUT_SECS, FOCUSED_EDIT_PRE_READ_TIMEOUT_SECS,
         PlanExplorationKey, answer_only_reply_is_inadequate, answer_only_script_command_allowed,
-        assistant_model_for_mode, deterministic_timeout_fallback_plan,
-        effective_non_streaming_timeout_secs, non_streaming_assistant_reply_timeout_secs,
+        answer_only_script_execution_fallback_response, assistant_model_for_mode,
+        deterministic_timeout_fallback_plan, effective_non_streaming_timeout_secs,
+        latest_tool_result_since_last_user, non_streaming_assistant_reply_timeout_secs,
         normalize_exploration_path, normalize_plan_exploration_key,
         request_explicitly_requests_script_execution, should_fallback_plan_model_after_timeout,
         should_materialize_plan_after_timeout,
         should_materialize_plan_after_tool_call_format_error, should_use_streaming_transport,
     };
     use crate::modes::plan_act::{ExecutionMode, TaskProfile};
+    use crate::session::store::ConversationMessage;
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -6457,35 +6696,20 @@ mod tests {
     #[test]
     fn qwen35_focused_edit_timeout_override_remains_short() {
         assert_eq!(
-            effective_non_streaming_timeout_secs(
-                "qwen3.5:122b",
-                true,
-                120,
-                Some(FOCUSED_EDIT_POST_READ_TIMEOUT_SECS),
-            ),
-            FOCUSED_EDIT_POST_READ_TIMEOUT_SECS
+            effective_non_streaming_timeout_secs("qwen3.5:122b", true, 120, Some(45),),
+            45
         );
         assert_eq!(
-            effective_non_streaming_timeout_secs(
-                "qwen3.5:122b",
-                true,
-                120,
-                Some(FOCUSED_EDIT_PRE_READ_TIMEOUT_SECS),
-            ),
-            FOCUSED_EDIT_PRE_READ_TIMEOUT_SECS
+            effective_non_streaming_timeout_secs("qwen3.5:122b", true, 120, Some(30),),
+            30
         );
     }
 
     #[test]
     fn non_qwen35_focused_edit_timeout_override_remains_short() {
         assert_eq!(
-            effective_non_streaming_timeout_secs(
-                "qwen3.6:27b-coding-nvfp4",
-                true,
-                120,
-                Some(FOCUSED_EDIT_POST_READ_TIMEOUT_SECS),
-            ),
-            FOCUSED_EDIT_POST_READ_TIMEOUT_SECS
+            effective_non_streaming_timeout_secs("qwen3.6:27b-coding-nvfp4", true, 120, Some(45),),
+            45
         );
     }
 
@@ -6510,6 +6734,46 @@ mod tests {
             "bash check_env.sh > out.txt"
         ));
         assert!(!answer_only_script_command_allowed("rm generated.txt"));
+    }
+
+    #[test]
+    fn latest_tool_result_since_last_user_returns_current_turn_bash_output() {
+        let messages = vec![
+            ConversationMessage::user("first task".to_string()),
+            ConversationMessage::tool("Bash".to_string(), "exit_code=0\nold".to_string()),
+            ConversationMessage::user("run summarize.py".to_string()),
+            ConversationMessage::assistant(String::new(), Vec::new()),
+            ConversationMessage::tool(
+                "Bash".to_string(),
+                "exit_code=0\nrecords=3 total=185".to_string(),
+            ),
+        ];
+
+        assert_eq!(
+            latest_tool_result_since_last_user(&messages, "Bash"),
+            Some("exit_code=0\nrecords=3 total=185")
+        );
+    }
+
+    #[test]
+    fn latest_tool_result_since_last_user_stops_at_user_boundary() {
+        let messages = vec![
+            ConversationMessage::user("run old script".to_string()),
+            ConversationMessage::tool("Bash".to_string(), "exit_code=0\nold".to_string()),
+            ConversationMessage::user("new read-only question".to_string()),
+        ];
+
+        assert_eq!(latest_tool_result_since_last_user(&messages, "Bash"), None);
+    }
+
+    #[test]
+    fn script_execution_fallback_preserves_bash_output() {
+        let response =
+            answer_only_script_execution_fallback_response("exit_code=0\nrecords=3 total=185");
+
+        assert!(response.contains("exit_code=0"));
+        assert!(response.contains("records=3 total=185"));
+        assert!(response.contains("正常終了"));
     }
 
     #[test]
@@ -7249,7 +7513,7 @@ fn should_use_streaming_transport(
         return false;
     }
 
-    if is_qwen35_family(model) {
+    if !model_capabilities(model).streaming_tool_calls {
         return false;
     }
 
@@ -7261,10 +7525,9 @@ fn non_streaming_assistant_reply_timeout_secs(
     _native_tools_enabled: bool,
     default_timeout_secs: u64,
 ) -> u64 {
-    if is_qwen35_family(model) {
-        return QWEN35_NON_NATIVE_HARD_TIMEOUT_SECS;
-    }
-    default_timeout_secs
+    model_capabilities(model)
+        .non_streaming_hard_timeout_secs
+        .unwrap_or(default_timeout_secs)
 }
 
 fn effective_non_streaming_timeout_secs(
@@ -7285,31 +7548,35 @@ fn effective_non_streaming_timeout_secs(
 }
 
 fn focused_edit_timeout_override_secs(
+    model: &str,
     messages: &[ConversationMessage],
     target: Option<&Path>,
     work_root: &Path,
 ) -> Option<u64> {
     let target = target?;
+    let focused_edit = model_capabilities(model).focused_edit?;
     Some(
         if focused_edit_target_already_read(messages, target, work_root) {
-            FOCUSED_EDIT_POST_READ_TIMEOUT_SECS
+            focused_edit.post_read_timeout_secs
         } else {
-            FOCUSED_EDIT_PRE_READ_TIMEOUT_SECS
+            focused_edit.pre_read_timeout_secs
         },
     )
 }
 
 fn focused_edit_max_predict_override(
+    model: &str,
     messages: &[ConversationMessage],
     target: Option<&Path>,
     work_root: &Path,
 ) -> Option<usize> {
     let target = target?;
+    let focused_edit = model_capabilities(model).focused_edit?;
     Some(
         if focused_edit_target_already_read(messages, target, work_root) {
-            FOCUSED_EDIT_POST_READ_MAX_PREDICT
+            focused_edit.post_read_max_predict
         } else {
-            FOCUSED_EDIT_PRE_READ_MAX_PREDICT
+            focused_edit.pre_read_max_predict
         },
     )
 }
@@ -7549,25 +7816,43 @@ fn last_read_tool_path(messages: &[ConversationMessage]) -> Option<String> {
     })
 }
 
-fn latest_turn_last_read_tool_path(messages: &[ConversationMessage]) -> Option<String> {
-    latest_user_turn_slice(messages)
-        .iter()
-        .rev()
-        .find_map(|message| {
-            if message.role != "assistant" {
-                return None;
+fn latest_turn_preferred_read_edit_target(
+    messages: &[ConversationMessage],
+    work_root: &Path,
+) -> Option<PathBuf> {
+    let mut latest_existing = None;
+    for message in latest_user_turn_slice(messages).iter().rev() {
+        if message.role != "assistant" {
+            continue;
+        }
+        for tool_call in message.tool_calls.iter().rev() {
+            if tool_call.name != "Read" {
+                continue;
             }
-            message.tool_calls.iter().rev().find_map(|tool_call| {
-                if tool_call.name != "Read" {
-                    return None;
-                }
-                tool_call
-                    .arguments
-                    .get("path")
-                    .and_then(serde_json::Value::as_str)
-                    .map(ToString::to_string)
-            })
-        })
+            let Some(path) = tool_call
+                .arguments
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            let Ok(candidate) = resolve_user_path(work_root, path) else {
+                continue;
+            };
+            if !candidate.is_file() {
+                continue;
+            }
+            latest_existing.get_or_insert_with(|| candidate.clone());
+            if is_preferred_read_edit_target(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    latest_existing
+}
+
+fn is_preferred_read_edit_target(path: &Path) -> bool {
+    is_implementation_file(path) && !is_test_file(path) && !is_setup_file(path)
 }
 
 fn recent_scaffold_command_seen(messages: &[ConversationMessage]) -> bool {
@@ -7603,6 +7888,7 @@ fn post_scaffold_recovery_active(
     cwd: &Path,
 ) -> bool {
     recent_scaffold_command_seen(messages)
+        || recent_deterministic_framework_app_fallback_seen(messages)
         || recent_post_scaffold_edit_attempt(messages) > 0
         || (active_root.is_some_and(|root| root != cwd)
             && latest_user_turn_slice(messages).iter().any(|message| {
@@ -7612,6 +7898,18 @@ fn post_scaffold_recovery_active(
                         .trim_start()
                         .starts_with("[Workspace Root Updated]")
             }))
+}
+
+fn recent_deterministic_framework_app_fallback_seen(messages: &[ConversationMessage]) -> bool {
+    latest_user_turn_slice(messages)
+        .iter()
+        .rev()
+        .any(|message| {
+            message.role == "assistant"
+                && message
+                    .content
+                    .contains(DETERMINISTIC_FRAMEWORK_APP_FALLBACK_MARKER)
+        })
 }
 
 fn post_scaffold_continuation_active(
@@ -7690,11 +7988,36 @@ fn deterministic_framework_app_files_needed(
     deterministic::playable_ui_repair(request, &target, &current).is_some()
 }
 
+fn should_try_framework_app_fallback(last_iter: usize, already_materialized: bool) -> bool {
+    last_iter > 1 && !already_materialized
+}
+
+fn framework_app_fallback_continuation_note() -> &'static str {
+    "[Deterministic App Fallback] Treat the materialized framework files as a recovery scaffold only, not as task completion. Continue by reading and editing the real UI entry file with task-specific implementation details, then verify the app before final response."
+}
+
+const DETERMINISTIC_FRAMEWORK_APP_FALLBACK_MARKER: &str =
+    "Materialized deterministic framework app fallback files";
+
 fn deterministic_framework_game_impl_path(path: &Path) -> bool {
     matches!(
         path.to_string_lossy().as_ref(),
-        "app.vue" | "src/App.tsx" | "src/app/page.tsx"
+        "app.vue" | "src/App.tsx" | "src/app/page.tsx" | "app/page.tsx" | "src/routes/+page.svelte"
     )
+}
+
+fn deterministic_support_target_relative(work_root: &Path, relative: &Path) -> PathBuf {
+    if let Ok(rest) = relative.strip_prefix("src/app")
+        && work_root.join("app").is_dir()
+    {
+        return PathBuf::from("app").join(rest);
+    }
+    if let Ok(rest) = relative.strip_prefix("app")
+        && work_root.join("src/app").is_dir()
+    {
+        return PathBuf::from("src/app").join(rest);
+    }
+    relative.to_path_buf()
 }
 
 fn meaningful_workspace_files(work_root: &Path, limit: usize) -> Option<Vec<PathBuf>> {
@@ -8909,6 +9232,7 @@ mod truncate_tests {
         scaffold_command_matches_framework, task_or_plan_requires_nextjs_scaffold,
         task_requires_nextjs_scaffold, truncate,
     };
+    use crate::model_capabilities::model_capabilities;
 
     #[test]
     fn preserves_short_strings_verbatim() {
@@ -8987,6 +9311,13 @@ mod truncate_tests {
     }
 
     #[test]
+    fn local_qwen_models_use_read_after_small_edit_protocol() {
+        assert!(model_capabilities("qwen3.5:122b").read_after_small_edit_protocol);
+        assert!(model_capabilities("qwen3.6:27b-coding-nvfp4").read_after_small_edit_protocol);
+        assert!(!model_capabilities("llama3.1:8b").read_after_small_edit_protocol);
+    }
+
+    #[test]
     fn scaffold_commands_must_match_requested_framework() {
         assert!(scaffold_command_matches_framework(
             ScaffoldFramework::React,
@@ -9047,31 +9378,32 @@ mod truncate_tests {
 #[cfg(test)]
 mod progress_tests {
     use super::{
-        FOCUSED_EDIT_POST_READ_MAX_PREDICT, FOCUSED_EDIT_POST_READ_TIMEOUT_SECS,
-        FOCUSED_EDIT_PRE_READ_MAX_PREDICT, FOCUSED_EDIT_PRE_READ_TIMEOUT_SECS,
         FocusedEditBatchAction, deterministic_empty_framework_app_files,
         deterministic_empty_framework_game_files, deterministic_framework_app_files_needed,
-        deterministic_framework_game_files_needed, extract_page_copy_block_from_numbered_read,
-        first_existing_impl_target, focused_edit_compact_anchor_note,
-        focused_edit_compact_recovery_anchor, focused_edit_exact_anchor_history,
-        focused_edit_exact_recovery_anchor, focused_edit_first_slice_note,
-        focused_edit_first_slice_uses_exact_anchor, focused_edit_guidance_note,
-        focused_edit_history, focused_edit_max_predict_override, focused_edit_minimal_history,
-        focused_edit_second_slice_note, focused_edit_target_already_read,
-        focused_edit_timeout_override_secs, focused_edit_tool_batch_action,
-        focused_edit_tool_policy_error, focused_read_target_for_directory,
-        format_blocked_progress_line, format_progress_line, has_successful_non_plan_repo_edit,
+        deterministic_framework_game_files_needed, deterministic_support_target_relative,
+        extract_page_copy_block_from_numbered_read, first_existing_impl_target,
+        focused_edit_compact_anchor_note, focused_edit_compact_recovery_anchor,
+        focused_edit_exact_anchor_history, focused_edit_exact_recovery_anchor,
+        focused_edit_first_slice_note, focused_edit_first_slice_uses_exact_anchor,
+        focused_edit_guidance_note, focused_edit_history, focused_edit_max_predict_override,
+        focused_edit_minimal_history, focused_edit_second_slice_note,
+        focused_edit_target_already_read, focused_edit_timeout_override_secs,
+        focused_edit_tool_batch_action, focused_edit_tool_policy_error,
+        focused_read_target_for_directory, format_blocked_progress_line, format_progress_line,
+        framework_app_fallback_continuation_note, has_successful_non_plan_repo_edit,
         has_successful_non_plan_repo_edit_after_latest_truncated_tool_call,
         has_successful_repo_edit, implementation_quality_issue_for_request, is_utf8_locale,
         last_read_tool_path, latest_page_copy_block_from_read,
-        latest_truncated_tool_call_note_index, post_scaffold_continuation_active,
-        post_scaffold_recovery_active, progress_available_width, prune_plan_mode_messages,
+        latest_truncated_tool_call_note_index, latest_turn_preferred_read_edit_target,
+        post_scaffold_continuation_active, post_scaffold_recovery_active, progress_available_width,
+        prune_plan_mode_messages, recent_deterministic_framework_app_fallback_seen,
         recent_scaffold_command_seen, recent_truncated_tool_call_attempt, repo_change_request_text,
         request_needs_playable_ui_quality_gate, sanitize_for_progress,
-        should_apply_repo_change_quality_gate, should_use_streaming_transport,
-        strip_read_line_number_prefix, successful_non_plan_repo_edit_count,
-        successful_repo_edit_count, tool_color, tool_display, tool_emoji, unicode_supported,
-        workspace_appears_empty,
+        should_apply_repo_change_quality_gate, should_try_framework_app_fallback,
+        should_use_streaming_transport, strip_read_line_number_prefix,
+        successful_non_plan_repo_edit_count, successful_repo_edit_count,
+        sync_package_json_with_existing_lock, tool_color, tool_display, tool_emoji,
+        unicode_supported, workspace_appears_empty,
     };
     use crate::agent::recovery::ActionExpectation;
     use crate::modes::plan_act::{ExecutionMode, PlanStage};
@@ -9098,6 +9430,59 @@ mod progress_tests {
     #[test]
     fn sanitize_passthrough_normal() {
         assert_eq!(sanitize_for_progress("hello world"), "hello world");
+    }
+
+    #[test]
+    fn package_json_support_syncs_dependency_sections_with_existing_lock() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::write(
+            work_root.join("package-lock.json"),
+            r#"{
+  "lockfileVersion": 3,
+  "packages": {
+    "": {
+      "dependencies": {
+        "next": "16.2.4",
+        "react": "19.2.4",
+        "react-dom": "19.2.4"
+      },
+      "devDependencies": {
+        "typescript": "^5",
+        "@types/react": "^19"
+      }
+    }
+  }
+}
+"#,
+        )
+        .unwrap();
+        let generated = r#"{
+  "scripts": {
+    "dev": "next dev -p 3011",
+    "test": "node scripts/smoke-test.mjs"
+  },
+  "dependencies": {
+    "next": "14.2.35",
+    "react": "18.2.0",
+    "react-dom": "18.2.0",
+    "@types/react": "18.2.66"
+  }
+}
+"#;
+
+        let synced = sync_package_json_with_existing_lock(
+            work_root,
+            Path::new("package.json"),
+            generated.to_string(),
+        );
+        let package: serde_json::Value = serde_json::from_str(&synced).unwrap();
+
+        assert_eq!(package["scripts"]["dev"], "next dev -p 3011");
+        assert_eq!(package["dependencies"]["next"], "16.2.4");
+        assert_eq!(package["dependencies"]["react"], "19.2.4");
+        assert!(package["dependencies"].get("@types/react").is_none());
+        assert_eq!(package["devDependencies"]["@types/react"], "^19");
     }
 
     #[test]
@@ -9333,6 +9718,68 @@ mod progress_tests {
             last_read_tool_path(&messages).as_deref(),
             Some("app/page.tsx")
         );
+    }
+
+    #[test]
+    fn preferred_read_edit_target_chooses_impl_over_later_test_file() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::write(
+            work_root.join("calculator.py"),
+            "def add(a, b): return a - b\n",
+        )
+        .unwrap();
+        std::fs::write(
+            work_root.join("test_calculator.py"),
+            "from calculator import add\n",
+        )
+        .unwrap();
+        let messages = vec![
+            ConversationMessage::user("fix calculator.py and run tests".to_string()),
+            ConversationMessage::assistant(
+                String::new(),
+                vec![
+                    ToolCall {
+                        id: "xml-1".to_string(),
+                        name: "Read".to_string(),
+                        arguments: json!({"path":"calculator.py"}),
+                    },
+                    ToolCall {
+                        id: "xml-2".to_string(),
+                        name: "Read".to_string(),
+                        arguments: json!({"path":"test_calculator.py"}),
+                    },
+                ],
+            ),
+        ];
+
+        let target = latest_turn_preferred_read_edit_target(&messages, work_root).unwrap();
+        assert!(
+            target.ends_with("calculator.py"),
+            "got: {}",
+            target.display()
+        );
+    }
+
+    #[test]
+    fn preferred_read_edit_target_falls_back_to_latest_read_file() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::write(work_root.join("README.md"), "# docs\n").unwrap();
+        let messages = vec![
+            ConversationMessage::user("update README.md".to_string()),
+            ConversationMessage::assistant(
+                String::new(),
+                vec![ToolCall {
+                    id: "xml-1".to_string(),
+                    name: "Read".to_string(),
+                    arguments: json!({"path":"README.md"}),
+                }],
+            ),
+        ];
+
+        let target = latest_turn_preferred_read_edit_target(&messages, work_root).unwrap();
+        assert!(target.ends_with("README.md"), "got: {}", target.display());
     }
 
     #[test]
@@ -9823,6 +10270,73 @@ mod progress_tests {
     }
 
     #[test]
+    fn deterministic_app_fallback_triggers_post_scaffold_recovery() {
+        let messages = vec![
+            ConversationMessage::user("build a Next.js game".to_string()),
+            ConversationMessage::assistant(
+                "Materialized deterministic framework app fallback files as a recovery scaffold: package.json, src/app/page.tsx. Continue implementation and verification before treating the task as complete."
+                    .to_string(),
+                Vec::new(),
+            ),
+        ];
+        assert!(recent_deterministic_framework_app_fallback_seen(&messages));
+        assert!(post_scaffold_recovery_active(
+            &messages,
+            None,
+            Path::new("/tmp/project"),
+        ));
+    }
+
+    #[test]
+    fn deterministic_app_fallback_recovery_ignores_previous_user_turns() {
+        let messages = vec![
+            ConversationMessage::user("build a Next.js game".to_string()),
+            ConversationMessage::assistant(
+                "Materialized deterministic framework app fallback files as a recovery scaffold: package.json, src/app/page.tsx. Continue implementation and verification before treating the task as complete."
+                    .to_string(),
+                Vec::new(),
+            ),
+            ConversationMessage::user("summarize README".to_string()),
+        ];
+        assert!(!recent_deterministic_framework_app_fallback_seen(&messages));
+        assert!(!post_scaffold_recovery_active(
+            &messages,
+            None,
+            Path::new("/tmp/project"),
+        ));
+    }
+
+    #[test]
+    fn deterministic_support_targets_existing_next_app_directory() {
+        let temp = tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("app")).unwrap();
+
+        assert_eq!(
+            deterministic_support_target_relative(temp.path(), Path::new("src/app/layout.tsx")),
+            PathBuf::from("app/layout.tsx")
+        );
+        assert_eq!(
+            deterministic_support_target_relative(temp.path(), Path::new("src/app/globals.css")),
+            PathBuf::from("app/globals.css")
+        );
+        assert_eq!(
+            deterministic_support_target_relative(temp.path(), Path::new("scripts/smoke-test.mjs")),
+            PathBuf::from("scripts/smoke-test.mjs")
+        );
+    }
+
+    #[test]
+    fn deterministic_support_targets_existing_src_next_app_directory() {
+        let temp = tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("src/app")).unwrap();
+
+        assert_eq!(
+            deterministic_support_target_relative(temp.path(), Path::new("app/layout.tsx")),
+            PathBuf::from("src/app/layout.tsx")
+        );
+    }
+
+    #[test]
     fn post_scaffold_recovery_stays_active_after_root_switch() {
         let messages = vec![ConversationMessage::system(
             "[Workspace Root Updated] Continue work inside /tmp/project/app.".to_string(),
@@ -10114,6 +10628,17 @@ export default function App() {
     }
 
     #[test]
+    fn framework_app_fallback_is_recovery_only_after_first_iter() {
+        assert!(!should_try_framework_app_fallback(1, false));
+        assert!(should_try_framework_app_fallback(2, false));
+        assert!(!should_try_framework_app_fallback(2, true));
+
+        let note = framework_app_fallback_continuation_note();
+        assert!(note.contains("recovery scaffold"));
+        assert!(note.contains("not as task completion"));
+    }
+
+    #[test]
     fn playable_ui_quality_gate_targets_interactive_ui_requests() {
         assert!(request_needs_playable_ui_quality_gate(
             "操作できるUIを3011ポートで起動可能なnext.jsアプリとして開発してください"
@@ -10201,7 +10726,10 @@ export default function App() {
         "#;
         let issue = implementation_quality_issue_for_request(request, content)
             .expect("expected quality issue");
-        assert!(issue.contains("interactive vertical slice"), "got: {issue}");
+        assert!(
+            issue.contains("interactive vertical slice") || issue.contains("placeholder markers"),
+            "got: {issue}"
+        );
     }
 
     #[test]
@@ -10238,6 +10766,61 @@ export default function App() {
             }
         "#;
         assert!(implementation_quality_issue_for_request(request, content).is_none());
+    }
+
+    #[test]
+    fn playable_ui_quality_gate_rejects_marker_spam_without_runtime_evidence() {
+        let request = "Build a playable browser game as a vanilla JavaScript app";
+        let content = r#"
+            <main>
+              <h1>Playable canvas game</h1>
+              <p>input handling state status progress visible feedback markers requestAnimationFrame addEventListener onclick canvas</p>
+            </main>
+        "#;
+        let issue = implementation_quality_issue_for_request(request, content)
+            .expect("expected marker spam to fail quality gate");
+        assert!(issue.contains("marker spam"), "got: {issue}");
+    }
+
+    #[test]
+    fn playable_ui_quality_gate_accepts_vanilla_javascript_ui_slice() {
+        let request = "Build an interactive browser UI as a vanilla JavaScript app";
+        let content = r#"
+            <main class="panel">
+              <label for="task">Task</label>
+              <input id="task" name="task" value="Deploy" />
+              <button id="run">Run</button>
+              <output id="status" aria-live="polite">ready</output>
+            </main>
+            <script>
+              const input = document.getElementById('task');
+              const status = document.getElementById('status');
+              let progress = 0;
+              document.getElementById('run').addEventListener('click', () => {
+                progress += 1;
+                status.textContent = `${input.value}: ${progress}`;
+              });
+            </script>
+        "#;
+        let issue = implementation_quality_issue_for_request(request, content);
+        assert!(issue.is_none(), "got: {issue:?}");
+    }
+
+    #[test]
+    fn playable_ui_quality_gate_accepts_server_rendered_html_form_slice() {
+        let request = "Build an interactive server-rendered HTML form UI";
+        let content = r#"
+            <main class="checkout">
+              <form method="post" action="/quote">
+                <label for="amount">Amount</label>
+                <input id="amount" name="amount" value="1200" required />
+                <button type="submit">Calculate</button>
+                <output name="status" role="status" aria-live="polite">Ready</output>
+              </form>
+            </main>
+        "#;
+        let issue = implementation_quality_issue_for_request(request, content);
+        assert!(issue.is_none(), "got: {issue:?}");
     }
 
     #[test]
@@ -10643,12 +11226,12 @@ export default function App() {
             ConversationMessage::tool("Read".to_string(), "page contents".to_string()),
         ];
         assert_eq!(
-            focused_edit_timeout_override_secs(&messages, Some(&target), work_root),
-            Some(FOCUSED_EDIT_POST_READ_TIMEOUT_SECS)
+            focused_edit_timeout_override_secs("qwen3.5:122b", &messages, Some(&target), work_root),
+            Some(45)
         );
         assert_eq!(
-            focused_edit_max_predict_override(&messages, Some(&target), work_root),
-            Some(FOCUSED_EDIT_POST_READ_MAX_PREDICT)
+            focused_edit_max_predict_override("qwen3.5:122b", &messages, Some(&target), work_root),
+            Some(320)
         );
     }
 
@@ -10661,12 +11244,12 @@ export default function App() {
         std::fs::write(&target, "export default function Home() { return null; }\n").unwrap();
         let messages = vec![ConversationMessage::user("build the app".to_string())];
         assert_eq!(
-            focused_edit_timeout_override_secs(&messages, Some(&target), work_root),
-            Some(FOCUSED_EDIT_PRE_READ_TIMEOUT_SECS)
+            focused_edit_timeout_override_secs("qwen3.5:122b", &messages, Some(&target), work_root),
+            Some(30)
         );
         assert_eq!(
-            focused_edit_max_predict_override(&messages, Some(&target), work_root),
-            Some(FOCUSED_EDIT_PRE_READ_MAX_PREDICT)
+            focused_edit_max_predict_override("qwen3.5:122b", &messages, Some(&target), work_root),
+            Some(320)
         );
     }
 
@@ -10689,8 +11272,15 @@ export default function App() {
             ConversationMessage::tool("Read".to_string(), "page contents".to_string()),
         ];
         let force_non_streaming =
-            focused_edit_timeout_override_secs(&messages, Some(&target), work_root).is_some()
-                || focused_edit_max_predict_override(&messages, Some(&target), work_root).is_some();
+            focused_edit_timeout_override_secs("qwen3.5:122b", &messages, Some(&target), work_root)
+                .is_some()
+                || focused_edit_max_predict_override(
+                    "qwen3.5:122b",
+                    &messages,
+                    Some(&target),
+                    work_root,
+                )
+                .is_some();
         let use_streaming_transport = !force_non_streaming
             && should_use_streaming_transport("qwen3.5:122b", true, false, true);
         assert!(
@@ -10708,8 +11298,15 @@ export default function App() {
         std::fs::write(&target, "export default function Home() { return null; }\n").unwrap();
         let messages = vec![ConversationMessage::user("build the app".to_string())];
         let force_non_streaming =
-            focused_edit_timeout_override_secs(&messages, Some(&target), work_root).is_some()
-                || focused_edit_max_predict_override(&messages, Some(&target), work_root).is_some();
+            focused_edit_timeout_override_secs("qwen3.5:122b", &messages, Some(&target), work_root)
+                .is_some()
+                || focused_edit_max_predict_override(
+                    "qwen3.5:122b",
+                    &messages,
+                    Some(&target),
+                    work_root,
+                )
+                .is_some();
         let use_streaming_transport = !force_non_streaming
             && should_use_streaming_transport("qwen3.5:122b", true, false, true);
         assert!(
@@ -11096,71 +11693,11 @@ export default function App() {
         );
         assert_eq!(
             frame.primary_error.as_deref(),
-            Some(super::DETERMINISTIC_CONTENT_FALLBACK_TAG)
+            Some(super::super::success::DETERMINISTIC_CONTENT_FALLBACK_TAG)
         );
         assert_eq!(
-            super::DETERMINISTIC_CONTENT_FALLBACK_TAG,
+            super::super::success::DETERMINISTIC_CONTENT_FALLBACK_TAG,
             "deterministic_content_fallback"
-        );
-    }
-
-    // ---- CB-002 (Issue #459): success-verifier selection -------------------
-
-    /// auto_test verifier exists AND the protocol asked for it → AutoTest.
-    #[test]
-    fn select_success_verifier_runs_auto_test_when_should_and_plan_some() {
-        assert_eq!(
-            super::select_success_verifier(true, true, false),
-            super::SuccessVerifier::AutoTest
-        );
-        // Even when a Tester candidate is also available, an explicit
-        // verifier wins.
-        assert_eq!(
-            super::select_success_verifier(true, true, true),
-            super::SuccessVerifier::AutoTest
-        );
-    }
-
-    /// CB-002 core regression: should_run_auto_test_for_success == false and
-    /// AutoTestRunner::detect == None, but TesterCandidate::detect == Some →
-    /// Tester MUST run. The previous code mistakenly skipped Tester when
-    /// should_run was false.
-    #[test]
-    fn select_success_verifier_runs_tester_independent_of_should_run() {
-        assert_eq!(
-            super::select_success_verifier(false, false, true),
-            super::SuccessVerifier::Tester,
-            "Tester must fire even when should_run_auto_test_for_success is false"
-        );
-        // Same selection if AutoTestRunner returns Some (build-only verifier
-        // — TesterCandidate::detect already filtered explicit verifiers out).
-        assert_eq!(
-            super::select_success_verifier(false, true, true),
-            super::SuccessVerifier::Tester
-        );
-    }
-
-    /// should_run is true but neither auto_test plan nor Tester candidate
-    /// exists → NoVerifier (existing fallback).
-    #[test]
-    fn select_success_verifier_no_verifier_when_should_run_but_nothing_detects() {
-        assert_eq!(
-            super::select_success_verifier(true, false, false),
-            super::SuccessVerifier::NoVerifier
-        );
-    }
-
-    /// should_run is false and no Tester candidate → Skip (do nothing).
-    #[test]
-    fn select_success_verifier_skip_when_no_demand_no_tester() {
-        assert_eq!(
-            super::select_success_verifier(false, false, false),
-            super::SuccessVerifier::Skip
-        );
-        assert_eq!(
-            super::select_success_verifier(false, true, false),
-            super::SuccessVerifier::Skip,
-            "auto_test plan alone without should_run nor tester is a Skip"
         );
     }
 

@@ -1,0 +1,53 @@
+name: Live E2E
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_labels:
+        description: 'JSON array for runs-on, for example ["self-hosted","macOS"]'
+        required: true
+        default: '["self-hosted"]'
+      model:
+        description: "Installed Ollama model to exercise"
+        required: true
+        default: "qwen3.6:27b-coding-nvfp4"
+      ollama_host:
+        description: "Ollama host visible from the runner"
+        required: true
+        default: "http://127.0.0.1:11434"
+      runs:
+        description: "Repeat count for stability tests"
+        required: true
+        default: "2"
+      test_filter:
+        description: "Ignored Rust test filter to run"
+        required: true
+        default: "live_ollama_can_write_a_file"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  live-e2e:
+    name: Ollama live E2E
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    timeout-minutes: 120
+    env:
+      ANVIL_E2E_MODEL: ${{ inputs.model }}
+      ANVIL_E2E_OLLAMA_HOST: ${{ inputs.ollama_host }}
+      ANVIL_E2E_RUNS: ${{ inputs.runs }}
+      ANVIL_LIVE_E2E_TEST: ${{ inputs.test_filter }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Verify Ollama model is reachable
+        run: |
+          curl -fsSL "$ANVIL_E2E_OLLAMA_HOST/api/tags" | grep -F "$ANVIL_E2E_MODEL"
+
+      - name: Run ignored live E2E test
+        run: cargo test --test e2e_local_llm "$ANVIL_LIVE_E2E_TEST" -- --ignored --nocapture

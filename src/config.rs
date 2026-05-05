@@ -5,6 +5,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use clap::ValueEnum;
+
 use crate::cli::{CliArgs, ResumeRequest};
 use crate::safety::host_validation::validate_localhost_url;
 
@@ -59,6 +61,88 @@ impl FromStr for LogLevel {
             "verbose" => Ok(LogLevel::Verbose),
             "trace" => Ok(LogLevel::Trace),
             other => Err(format!("unknown log level: {other}")),
+        }
+    }
+}
+
+/// Controls deterministic recovery writes. Security and syntax guards remain
+/// deterministic regardless of this value; this only gates product-quality
+/// templates and fallback file materialization.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, serde::Serialize, serde::Deserialize,
+)]
+pub enum DeterministicFallbackMode {
+    #[value(alias = "disabled", alias = "false", alias = "0")]
+    Off,
+    #[value(alias = "hint")]
+    HintOnly,
+    #[default]
+    #[value(
+        alias = "support-only",
+        alias = "support_only",
+        alias = "support",
+        alias = "minimal",
+        alias = "minimal-patches",
+        alias = "minimal_patches"
+    )]
+    MinimalPatch,
+    #[value(
+        alias = "full",
+        alias = "enabled",
+        alias = "true",
+        alias = "1",
+        alias = "full-templates",
+        alias = "full_templates"
+    )]
+    FullTemplate,
+}
+
+impl DeterministicFallbackMode {
+    pub fn fallback_level(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::HintOnly => "hint-only",
+            Self::MinimalPatch => "minimal-patch",
+            Self::FullTemplate => "full-template",
+        }
+    }
+
+    pub fn allows_hint_only(self) -> bool {
+        matches!(
+            self,
+            Self::HintOnly | Self::MinimalPatch | Self::FullTemplate
+        )
+    }
+
+    pub fn allows_template_completion(self) -> bool {
+        matches!(self, Self::FullTemplate)
+    }
+
+    pub fn allows_support_recovery(self) -> bool {
+        matches!(self, Self::MinimalPatch | Self::FullTemplate)
+    }
+}
+
+impl fmt::Display for DeterministicFallbackMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.fallback_level())
+    }
+}
+
+impl FromStr for DeterministicFallbackMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "off" | "disabled" | "false" | "0" => Ok(Self::Off),
+            "hint-only" | "hint" => Ok(Self::HintOnly),
+            "support-only" | "support" | "minimal" | "minimal-patch" | "minimal-patches" => {
+                Ok(Self::MinimalPatch)
+            }
+            "full" | "enabled" | "true" | "1" | "full-template" | "full-templates" => {
+                Ok(Self::FullTemplate)
+            }
+            other => Err(format!("unknown deterministic fallback mode: {other}")),
         }
     }
 }
@@ -145,6 +229,7 @@ pub struct Config {
     pub oneshot: bool,
     pub auto_plan: bool,
     pub offline: bool,
+    pub deterministic_fallback: DeterministicFallbackMode,
     pub prompt: Option<String>,
     pub state_dir_override: Option<PathBuf>,
     pub resume: ResumeRequest,
@@ -169,6 +254,7 @@ pub struct PartialConfig {
     pub fresh_session: Option<bool>,
     pub auto_plan: Option<bool>,
     pub offline: Option<bool>,
+    pub deterministic_fallback: Option<DeterministicFallbackMode>,
     pub state_dir_override: Option<PathBuf>,
     /// `Some(false)` when an explicit disable signal is present
     /// (`--no-footer` / non-empty `ANVIL_NO_FOOTER` / `.anvil/config` `footer=false`).
@@ -204,6 +290,7 @@ impl Config {
             fresh_session: args.fresh_session.then_some(true),
             auto_plan: args.auto_plan.then_some(true),
             offline: args.offline.then_some(true),
+            deterministic_fallback: args.deterministic_fallback,
             state_dir_override: args.state_dir.clone(),
             // CLI footer flag is "disable-only": `--no-footer` emits Some(false),
             // omission emits None so file/env/default can still apply.
@@ -232,6 +319,7 @@ impl Config {
             oneshot: args.oneshot || args.prompt.is_some(),
             auto_plan: merged.auto_plan.unwrap_or(false),
             offline: merged.offline.unwrap_or(false),
+            deterministic_fallback: merged.deterministic_fallback.unwrap_or_default(),
             prompt: args.prompt,
             state_dir_override: merged.state_dir_override,
             resume: ResumeRequest::from_flag(args.resume),
@@ -284,6 +372,9 @@ pub fn merge_partial_configs(configs: &[PartialConfig]) -> PartialConfig {
         if config.offline.is_some() {
             merged.offline = config.offline;
         }
+        if config.deterministic_fallback.is_some() {
+            merged.deterministic_fallback = config.deterministic_fallback;
+        }
         if config.state_dir_override.is_some() {
             merged.state_dir_override = config.state_dir_override.clone();
         }
@@ -333,6 +424,9 @@ pub fn load_config_file(path: &Path, warnings: &mut Vec<String>) -> Result<Parti
         fresh_session: map.get("fresh_session").and_then(|value| parse_bool(value)),
         auto_plan: map.get("auto_plan").and_then(|value| parse_bool(value)),
         offline: map.get("offline").and_then(|value| parse_bool(value)),
+        deterministic_fallback: map
+            .get("deterministic_fallback")
+            .and_then(|value| value.parse::<DeterministicFallbackMode>().ok()),
         state_dir_override: map.get("state_dir").map(PathBuf::from),
         // Only emit Some(false) for explicit disable; any other value (true /
         // unrecognized / missing) leaves footer as None so default wins.
@@ -387,6 +481,9 @@ pub fn load_env_config(warnings: &mut Vec<String>) -> PartialConfig {
         offline: env::var("ANVIL_OFFLINE")
             .ok()
             .and_then(|value| parse_bool(&value)),
+        deterministic_fallback: env::var("ANVIL_DETERMINISTIC_FALLBACK")
+            .ok()
+            .and_then(|value| value.parse::<DeterministicFallbackMode>().ok()),
         state_dir_override: env::var("ANVIL_STATE_DIR").ok().map(PathBuf::from),
         // POSIX `NO_COLOR` convention: any non-empty value disables; matches
         // `ANVIL_NO_SPINNER` / `ANVIL_NO_INTERRUPT` precedent (see spinner.rs).

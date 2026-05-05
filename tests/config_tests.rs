@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
 use anvil::config::{
-    LogLevel, PartialConfig, load_config_file, load_env_config, merge_partial_configs,
-    parse_key_value_config,
+    DeterministicFallbackMode, LogLevel, PartialConfig, load_config_file, load_env_config,
+    merge_partial_configs, parse_key_value_config,
 };
 
 #[test]
@@ -77,6 +77,71 @@ fn merge_offline_prefers_later_sources() {
         },
     ]);
     assert_eq!(merged.offline, Some(true));
+}
+
+#[test]
+fn deterministic_fallback_mode_parses_aliases() {
+    assert_eq!(
+        DeterministicFallbackMode::default(),
+        DeterministicFallbackMode::MinimalPatch
+    );
+    assert_eq!(
+        "off".parse::<DeterministicFallbackMode>().unwrap(),
+        DeterministicFallbackMode::Off
+    );
+    assert_eq!(
+        "hint-only".parse::<DeterministicFallbackMode>().unwrap(),
+        DeterministicFallbackMode::HintOnly
+    );
+    assert_eq!(
+        "support_only".parse::<DeterministicFallbackMode>().unwrap(),
+        DeterministicFallbackMode::MinimalPatch
+    );
+    assert_eq!(
+        "minimal-patch"
+            .parse::<DeterministicFallbackMode>()
+            .unwrap(),
+        DeterministicFallbackMode::MinimalPatch
+    );
+    assert_eq!(
+        "enabled".parse::<DeterministicFallbackMode>().unwrap(),
+        DeterministicFallbackMode::FullTemplate
+    );
+    assert_eq!(
+        "full-template"
+            .parse::<DeterministicFallbackMode>()
+            .unwrap(),
+        DeterministicFallbackMode::FullTemplate
+    );
+    assert_eq!(
+        DeterministicFallbackMode::MinimalPatch.to_string(),
+        "minimal-patch"
+    );
+    assert!(!DeterministicFallbackMode::HintOnly.allows_support_recovery());
+    assert!(!DeterministicFallbackMode::MinimalPatch.allows_template_completion());
+    assert!(DeterministicFallbackMode::FullTemplate.allows_template_completion());
+}
+
+#[test]
+fn merge_deterministic_fallback_prefers_later_sources() {
+    let merged = merge_partial_configs(&[
+        PartialConfig {
+            deterministic_fallback: Some(DeterministicFallbackMode::FullTemplate),
+            ..PartialConfig::default()
+        },
+        PartialConfig {
+            deterministic_fallback: Some(DeterministicFallbackMode::MinimalPatch),
+            ..PartialConfig::default()
+        },
+        PartialConfig {
+            deterministic_fallback: Some(DeterministicFallbackMode::Off),
+            ..PartialConfig::default()
+        },
+    ]);
+    assert_eq!(
+        merged.deterministic_fallback,
+        Some(DeterministicFallbackMode::Off)
+    );
 }
 
 #[test]

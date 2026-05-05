@@ -204,7 +204,7 @@ fn total_render_chars_does_not_exceed_cap() {
 fn completed_payload_contains_top_score_and_reasons() {
     // Surface what the adapter's `agent.case_retrieval.completed` payload
     // assembles: completed.selected[*].breakdown is what gets serialised as
-    // `selected_reasons`. Verify the breakdown contains all 6 dimensions
+    // `selected_reasons`. Verify the breakdown contains all score dimensions
     // plus a total in [0, 1].
     let tmp = tempfile::tempdir().unwrap();
     let rec = fake_record("case_aaaaaaaaaaaaaaaaaaaa", "fix offset bug", "ws-A", "h");
@@ -227,6 +227,7 @@ fn completed_payload_contains_top_score_and_reasons() {
         for k in [
             "case_id",
             "task",
+            "semantic",
             "stack",
             "repo",
             "files",

@@ -1,0 +1,51 @@
+local-first coding agent for Ollama
+
+Usage: anvil [OPTIONS] [COMMAND]
+
+Commands:
+  sessions  Inspect / clean stored sessions
+  help      Print this message or the help of the given subcommand(s)
+
+Options:
+  -p, --prompt <PROMPT>
+          
+  -m, --model <MODEL>
+          
+      --sidecar-model <SIDECAR_MODEL>
+          
+      --ollama-host <OLLAMA_HOST>
+          
+      --context-budget <CONTEXT_BUDGET>
+          
+      --max-iterations <MAX_ITERATIONS>
+          
+      --chat-timeout-secs <CHAT_TIMEOUT_SECS>
+          
+      --chat-retries <CHAT_RETRIES>
+          
+      --verbose
+          
+      --trace
+          
+      --stream
+          
+  -y, --yes
+          
+      --fresh-session
+          
+      --oneshot
+          
+      --auto-plan
+          
+      --offline
+          
+      --deterministic-fallback <DETERMINISTIC_FALLBACK>
+          Control deterministic recovery. `hint-only` only nudges the model, `minimal-patch` writes support files only, and `full-template` preserves legacy full template recovery. `support-only` and `full` remain aliases [possible values: off, hint-only, minimal-patch, full-template]
+      --no-footer
+          Disable the fixed footer status bar (mode / token usage / log level)
+      --resume [<ID>]
+          Resume the most recent workspace session (`--resume`) or a specific session id (`--resume <ID>`). The empty string sentinel (produced by clap's `default_missing_value`) means "latest workspace session"
+      --state-dir <STATE_DIR>
+          
+  -h, --help
+          Print help

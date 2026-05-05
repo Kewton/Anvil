@@ -34,6 +34,7 @@ const WEIGHT_TEST_IMPL_PAIR: usize = 7;
 const WEIGHT_SUSPECTED_FILE: usize = 10;
 const WEIGHT_CHANGED_FILE: usize = 4;
 const WEIGHT_GRAPH_NEIGHBOR: usize = 6;
+const WEIGHT_PROJECT_STRUCTURE_SEED: usize = 7;
 const MIN_RANKING_SCORE: usize = 6;
 
 // Issue #469 DR4-002: import target sanitization caps.
@@ -437,6 +438,7 @@ struct RetrievalCandidate {
     symbol_hits: Vec<String>,
     keyword_hits: Vec<String>,
     graph_reasons: Vec<&'static str>,
+    structure_reasons: Vec<&'static str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -488,7 +490,8 @@ where
         }
     };
     let terms = extract_query_terms(task);
-    if terms.keywords.is_empty() && terms.symbols.is_empty() {
+    let structure_intents = classify_repo_structure_intents(task);
+    if terms.keywords.is_empty() && terms.symbols.is_empty() && structure_intents.is_empty() {
         emit_skipped_event(inputs, "no_query_terms", inputs.repo_graph.is_some());
         return None;
     }
@@ -498,7 +501,13 @@ where
     } else {
         inputs.repo_graph
     };
-    let candidates = rank_repo_candidates(work_root, &terms, effective_graph, inputs);
+    let candidates = rank_repo_candidates(
+        work_root,
+        &terms,
+        &structure_intents,
+        effective_graph,
+        inputs,
+    );
     if candidates.is_empty() {
         let event = if graph_disabled {
             "agent.repo_context.disabled"
@@ -551,6 +560,12 @@ where
         if !candidate.graph_reasons.is_empty() {
             reasons.push(format!("graph={}", candidate.graph_reasons.join(",")));
         }
+        if !candidate.structure_reasons.is_empty() {
+            reasons.push(format!(
+                "structure={}",
+                candidate.structure_reasons.join(",")
+            ));
+        }
         let suffix = if reasons.is_empty() {
             String::new()
         } else {
@@ -569,6 +584,9 @@ where
             payload_reasons.push("lexical_keyword");
         }
         for r in &candidate.graph_reasons {
+            payload_reasons.push(r);
+        }
+        for r in &candidate.structure_reasons {
             payload_reasons.push(r);
         }
         payload_files.push(serde_json::json!({
@@ -624,6 +642,7 @@ fn emit_skipped_event(inputs: &RepoContextInputs<'_>, reason: &str, graph_presen
 fn rank_repo_candidates(
     work_root: &Path,
     terms: &QueryTerms,
+    structure_intents: &[&'static str],
     repo_graph: Option<&RepoGraph>,
     inputs: &RepoContextInputs<'_>,
 ) -> Vec<RetrievalCandidate> {
@@ -654,9 +673,7 @@ fn rank_repo_candidates(
         let relative_str = relative.to_string_lossy().replace('\\', "/");
         all_paths.push(PathBuf::from(&relative_str));
         let lexical = score_lexical(path, &relative_str, terms);
-        if lexical.0 == 0 && lexical.1.is_empty() && lexical.2.is_empty() && lexical.3.is_empty() {
-            continue;
-        }
+        let structure = score_project_structure(&relative_str, structure_intents);
         let graph = score_graph(
             &relative_str,
             repo_graph,
@@ -664,13 +681,22 @@ fn rank_repo_candidates(
             inputs.changed_files,
             None,
         );
+        if lexical.0 == 0
+            && lexical.1.is_empty()
+            && lexical.2.is_empty()
+            && lexical.3.is_empty()
+            && structure.0 == 0
+            && graph.0 == 0
+        {
+            continue;
+        }
         let coherence = if lexical.1.len() >= 2 && (!lexical.2.is_empty() || !lexical.3.is_empty())
         {
             BONUS_PATH_CONTENT_COHERENCE
         } else {
             0
         };
-        let total = lexical.0 + graph.0 + coherence;
+        let total = lexical.0 + structure.0 + graph.0 + coherence;
         if total < MIN_RANKING_SCORE {
             continue;
         }
@@ -681,6 +707,7 @@ fn rank_repo_candidates(
             symbol_hits: lexical.2,
             keyword_hits: lexical.3,
             graph_reasons: graph.1,
+            structure_reasons: structure.1,
         });
     }
 
@@ -719,6 +746,140 @@ fn rank_repo_candidates(
     });
     candidates.truncate(MAX_REPO_CONTEXT_CANDIDATES);
     candidates
+}
+
+fn classify_repo_structure_intents(task: &str) -> Vec<&'static str> {
+    let lower = task.to_ascii_lowercase();
+    let mut intents = Vec::new();
+    if lower.contains("test")
+        || lower.contains("pytest")
+        || lower.contains("unittest")
+        || task.contains("テスト")
+        || task.contains("検証")
+    {
+        intents.push("test_discovery");
+    }
+    if lower.contains("rust") || lower.contains("cargo") {
+        intents.push("rust_project");
+    }
+    if lower.contains("python")
+        || lower.contains("pytest")
+        || lower.contains(".py")
+        || lower.contains("uv ")
+        || lower.contains("poetry")
+    {
+        intents.push("python_project");
+    }
+    if lower.contains("javascript")
+        || lower.contains("typescript")
+        || lower.contains("node")
+        || lower.contains("npm")
+        || lower.contains("next")
+        || lower.contains("react")
+        || lower.contains("frontend")
+        || lower.contains("ui")
+        || lower.contains("アプリ")
+        || lower.contains("画面")
+    {
+        intents.push("node_project");
+    }
+    if lower.contains("readme")
+        || lower.contains("docs")
+        || lower.contains("document")
+        || lower.contains("markdown")
+        || task.contains("ドキュメント")
+        || task.contains("仕様書")
+    {
+        intents.push("docs_project");
+    }
+    intents.sort();
+    intents.dedup();
+    intents
+}
+
+fn score_project_structure(
+    relative_path: &str,
+    intents: &[&'static str],
+) -> (usize, Vec<&'static str>) {
+    let path = relative_path.to_ascii_lowercase();
+    let mut score = 0usize;
+    let mut reasons = Vec::new();
+    for intent in intents {
+        match *intent {
+            "test_discovery" if is_test_discovery_path(&path) => {
+                score += WEIGHT_PROJECT_STRUCTURE_SEED;
+                reasons.push("test_discovery");
+            }
+            "rust_project" if is_rust_project_seed(&path) => {
+                score += WEIGHT_PROJECT_STRUCTURE_SEED;
+                reasons.push("rust_project");
+            }
+            "python_project" if is_python_project_seed(&path) => {
+                score += WEIGHT_PROJECT_STRUCTURE_SEED;
+                reasons.push("python_project");
+            }
+            "node_project" if is_node_project_seed(&path) => {
+                score += WEIGHT_PROJECT_STRUCTURE_SEED;
+                reasons.push("node_project");
+            }
+            "docs_project" if is_docs_project_seed(&path) => {
+                score += WEIGHT_PROJECT_STRUCTURE_SEED;
+                reasons.push("docs_project");
+            }
+            _ => {}
+        }
+    }
+    reasons.sort();
+    reasons.dedup();
+    (score, reasons)
+}
+
+fn is_test_discovery_path(path: &str) -> bool {
+    path == "package.json"
+        || path == "cargo.toml"
+        || path == "pyproject.toml"
+        || path == "pytest.ini"
+        || path == "vitest.config.ts"
+        || path == "jest.config.js"
+        || path.starts_with("tests/")
+        || path.contains("/tests/")
+        || path.contains(".test.")
+        || path.contains(".spec.")
+        || path.rsplit('/').next().is_some_and(|name| {
+            name.starts_with("test_") || name.ends_with("_test.py") || name.ends_with("_test.rs")
+        })
+}
+
+fn is_rust_project_seed(path: &str) -> bool {
+    path == "cargo.toml"
+        || path == "src/lib.rs"
+        || path == "src/main.rs"
+        || path.starts_with("tests/")
+}
+
+fn is_python_project_seed(path: &str) -> bool {
+    path == "pyproject.toml"
+        || path == "pytest.ini"
+        || path == "requirements.txt"
+        || path.starts_with("tests/")
+        || path.ends_with(".py")
+}
+
+fn is_node_project_seed(path: &str) -> bool {
+    path == "package.json"
+        || path == "src/app/page.tsx"
+        || path == "src/pages/index.tsx"
+        || path == "src/main.tsx"
+        || path == "src/main.ts"
+        || path == "app/page.tsx"
+        || path.ends_with(".tsx")
+        || path.ends_with(".vue")
+        || path.ends_with(".svelte")
+        || path.ends_with(".astro")
+}
+
+fn is_docs_project_seed(path: &str) -> bool {
+    path == "readme.md" || path.starts_with("docs/") || path.ends_with(".md")
 }
 
 /// Pure function: compute lexical score for a single candidate.
@@ -1227,6 +1388,68 @@ mod tests {
         if let Some(m) = msg {
             assert!(!m.content.contains("src/unrelated.rs"));
         }
+    }
+
+    #[test]
+    fn repo_context_uses_project_structure_seed_for_pathless_test_requests() {
+        let temp = tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        std::fs::create_dir_all(temp.path().join("tests")).unwrap();
+        std::fs::write(
+            temp.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("src/lib.rs"),
+            "pub fn add(a: i32, b: i32) -> i32 { a + b }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("tests/add_test.rs"),
+            "#[test]\nfn smoke() {}\n",
+        )
+        .unwrap();
+
+        let inputs = empty_inputs();
+        let message = repo_context_message(
+            temp.path(),
+            Some("テストを追加して検証してください"),
+            &inputs,
+        )
+        .expect("pathless test request should still get repo context");
+
+        assert!(
+            message.content.contains("Cargo.toml") || message.content.contains("tests/add_test.rs")
+        );
+        assert!(message.content.contains("structure=test_discovery"));
+    }
+
+    #[test]
+    fn repo_context_uses_node_structure_seed_for_pathless_ui_requests() {
+        let temp = tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("src/app")).unwrap();
+        std::fs::write(
+            temp.path().join("package.json"),
+            "{\"scripts\":{\"test\":\"vitest\"}}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("src/app/page.tsx"),
+            "export default function Page() { return null; }\n",
+        )
+        .unwrap();
+
+        let inputs = empty_inputs();
+        let message =
+            repo_context_message(temp.path(), Some("UIアプリを改善してください"), &inputs)
+                .expect("pathless UI request should still get repo context");
+
+        assert!(
+            message.content.contains("package.json")
+                || message.content.contains("src/app/page.tsx")
+        );
+        assert!(message.content.contains("structure=node_project"));
     }
 
     #[test]

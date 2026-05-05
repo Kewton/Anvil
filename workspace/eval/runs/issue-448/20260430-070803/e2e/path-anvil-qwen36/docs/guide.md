@@ -1,4 +1,0 @@
-# Guide
-
-Initial documentation.
-

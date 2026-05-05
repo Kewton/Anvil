@@ -139,7 +139,21 @@ pub struct ModeClassification {
     pub allows_file_edits: bool,
     pub requires_tests: bool,
     pub confidence: f32,
+    pub ambiguity: bool,
+    pub alternative_gap: f32,
     pub reason: &'static str,
+    #[serde(default)]
+    pub evidence: Vec<&'static str>,
+    #[serde(default)]
+    pub alternatives: Vec<WorkModeCandidate>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct WorkModeCandidate {
+    pub work_mode: WorkMode,
+    pub intent: &'static str,
+    pub confidence: f32,
+    pub evidence: Vec<&'static str>,
 }
 
 pub fn infer_work_mode_from_text(raw: &str) -> WorkMode {
@@ -172,6 +186,7 @@ pub fn classify_work_mode_json(raw: &str) -> ModeClassification {
             "変更して",
             "修正",
             "追加",
+            "追記",
         ],
     );
     let explicit_no_edit = contains_any(
@@ -213,16 +228,6 @@ pub fn classify_work_mode_json(raw: &str) -> ModeClassification {
             "とは",
         ],
     );
-    if explicit_no_edit || (answer_request && !explicit_edit) {
-        return ModeClassification {
-            work_mode: WorkMode::AnswerOnly,
-            intent: "answer",
-            allows_file_edits: false,
-            requires_tests: false,
-            confidence: if explicit_no_edit { 0.95 } else { 0.82 },
-            reason: "request is read-only or asks for analysis without edit intent",
-        };
-    }
 
     let typescript_ui = contains_any(
         &lower,
@@ -248,38 +253,29 @@ pub fn classify_work_mode_json(raw: &str) -> ModeClassification {
             "フロントエンド",
         ],
     );
-    if typescript_ui {
-        return ModeClassification {
-            work_mode: WorkMode::TypeScriptUi,
-            intent: "ui-code",
-            allows_file_edits: true,
-            requires_tests: request_requires_tests(&lower, raw),
-            confidence: 0.86,
-            reason: "request mentions UI, frontend, TypeScript, or browser app terms",
-        };
-    }
-
-    if contains_any(
+    let explicit_ui_framework = contains_any(
+        &lower,
+        &["next.js", "nextjs", "react", "nuxt", "vue", "vite", "tsx"],
+    );
+    let python = contains_any(
         &lower,
         &[
             "python", ".py", "pytest", "pip", "venv", "csv", "pandas", "python3",
         ],
-    ) {
-        return ModeClassification {
-            work_mode: WorkMode::Python,
-            intent: "python-code",
-            allows_file_edits: true,
-            requires_tests: request_requires_tests(&lower, raw),
-            confidence: 0.88,
-            reason: "request mentions Python runtime, files, or Python data terms",
-        };
-    }
-
-    if contains_any(
+    );
+    let explicit_python_artifact = contains_any(
+        &lower,
+        &[
+            "python", ".py", "pytest", "pip", "venv", "pandas", "python3",
+        ],
+    );
+    let docs = contains_any(
         &lower,
         &[
             "readme",
             "markdown",
+            ".md",
+            "docs/",
             "documentation",
             "docs",
             "doc",
@@ -290,35 +286,157 @@ pub fn classify_work_mode_json(raw: &str) -> ModeClassification {
             "手順書",
             "文章",
         ],
-    ) {
-        return ModeClassification {
+    );
+    let explicit_docs_artifact = contains_any(
+        &lower,
+        &[
+            "readme",
+            ".md",
+            "docs/",
+            "仕様書",
+            "設計書",
+            "手順書",
+            "documentation",
+            "document",
+        ],
+    );
+
+    let mut candidates = Vec::<WorkModeCandidate>::new();
+    if explicit_no_edit || (answer_request && !explicit_edit) {
+        candidates.push(WorkModeCandidate {
+            work_mode: WorkMode::AnswerOnly,
+            intent: "answer",
+            confidence: if explicit_no_edit { 0.95 } else { 0.82 },
+            evidence: if explicit_no_edit {
+                vec!["explicit-no-edit"]
+            } else {
+                vec!["answer-request", "no-edit-intent"]
+            },
+        });
+    }
+    if docs {
+        let mut confidence: f32 = 0.84;
+        let mut evidence = vec!["docs-artifact"];
+        if explicit_docs_artifact {
+            confidence += 0.08;
+            evidence.push("explicit-docs-target");
+        }
+        if explicit_edit {
+            confidence += 0.03;
+            evidence.push("edit-intent");
+        }
+        candidates.push(WorkModeCandidate {
             work_mode: WorkMode::Docs,
             intent: "docs",
-            allows_file_edits: true,
-            requires_tests: false,
-            confidence: 0.84,
-            reason: "request mentions documentation artifacts",
-        };
+            confidence: confidence.min(0.96),
+            evidence,
+        });
     }
-
+    if python {
+        let mut confidence: f32 = if explicit_python_artifact { 0.88 } else { 0.68 };
+        let mut evidence = vec!["python-or-data-signal"];
+        if explicit_python_artifact {
+            evidence.push("explicit-python-artifact");
+        }
+        if docs && !explicit_python_artifact {
+            confidence = 0.52;
+            evidence.push("weakened-by-docs-target");
+        }
+        candidates.push(WorkModeCandidate {
+            work_mode: WorkMode::Python,
+            intent: "python-code",
+            confidence,
+            evidence,
+        });
+    }
+    if typescript_ui {
+        let mut confidence: f32 = if explicit_ui_framework { 0.88 } else { 0.78 };
+        let mut evidence = vec!["ui-or-frontend-signal"];
+        if explicit_ui_framework {
+            evidence.push("explicit-ui-framework");
+        }
+        if docs {
+            confidence = confidence.min(0.48);
+            evidence.push("weakened-by-docs-target");
+        }
+        candidates.push(WorkModeCandidate {
+            work_mode: WorkMode::TypeScriptUi,
+            intent: "ui-code",
+            confidence,
+            evidence,
+        });
+    }
     if explicit_edit {
-        ModeClassification {
+        candidates.push(WorkModeCandidate {
             work_mode: WorkMode::GenericCode,
             intent: "code",
-            allows_file_edits: true,
-            requires_tests: request_requires_tests(&lower, raw),
             confidence: 0.7,
-            reason: "request has edit intent without a specific language or artifact mode",
-        }
-    } else {
-        ModeClassification {
+            evidence: vec!["edit-intent"],
+        });
+    }
+    if candidates.is_empty() {
+        candidates.push(WorkModeCandidate {
             work_mode: WorkMode::Unknown,
             intent: "unknown",
-            allows_file_edits: true,
-            requires_tests: request_requires_tests(&lower, raw),
             confidence: 0.35,
-            reason: "request lacks enough mode-specific signals",
+            evidence: vec!["insufficient-mode-signals"],
+        });
+    }
+    candidates.sort_by(|a, b| {
+        b.confidence
+            .partial_cmp(&a.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| mode_priority(b.work_mode).cmp(&mode_priority(a.work_mode)))
+    });
+
+    let selected = candidates[0].clone();
+    let second_confidence = candidates
+        .get(1)
+        .map(|candidate| candidate.confidence)
+        .unwrap_or(0.0);
+    let alternative_gap = (selected.confidence - second_confidence).max(0.0);
+    let ambiguity = alternative_gap < 0.15 && selected.confidence < 0.90;
+    let requires_tests =
+        selected.work_mode != WorkMode::AnswerOnly && request_requires_tests(&lower, raw);
+    ModeClassification {
+        work_mode: selected.work_mode,
+        intent: selected.intent,
+        allows_file_edits: selected.work_mode != WorkMode::AnswerOnly,
+        requires_tests: selected.work_mode != WorkMode::Docs && requires_tests,
+        confidence: selected.confidence,
+        ambiguity,
+        alternative_gap,
+        reason: mode_reason(selected.work_mode),
+        evidence: selected.evidence.clone(),
+        alternatives: candidates,
+    }
+}
+
+fn mode_priority(mode: WorkMode) -> u8 {
+    match mode {
+        WorkMode::AnswerOnly => 6,
+        WorkMode::Docs => 5,
+        WorkMode::Python => 4,
+        WorkMode::TypeScriptUi => 3,
+        WorkMode::GenericCode => 2,
+        WorkMode::Unknown | WorkMode::Auto => 1,
+    }
+}
+
+fn mode_reason(mode: WorkMode) -> &'static str {
+    match mode {
+        WorkMode::AnswerOnly => "request is read-only or asks for analysis without edit intent",
+        WorkMode::Docs => "documentation signals outscore competing mode signals",
+        WorkMode::Python => {
+            "Python runtime, file, or data-processing signals outscore alternatives"
         }
+        WorkMode::TypeScriptUi => {
+            "UI, frontend, TypeScript, or browser app signals outscore alternatives"
+        }
+        WorkMode::GenericCode => {
+            "request has edit intent without a specific language or artifact mode"
+        }
+        WorkMode::Unknown | WorkMode::Auto => "request lacks enough mode-specific signals",
     }
 }
 
@@ -454,9 +572,48 @@ mod tests {
         assert_eq!(classification.work_mode, WorkMode::Python);
         assert!(classification.allows_file_edits);
         assert!(classification.requires_tests);
+        assert!(!classification.evidence.is_empty());
+        assert!(!classification.alternatives.is_empty());
+        assert!(!classification.ambiguity);
+        assert!(classification.alternative_gap >= 0.0);
         let json = serde_json::to_string(&classification).expect("json");
         assert!(json.contains("\"work_mode\":\"Python\""));
         assert!(json.contains("\"intent\":\"python-code\""));
+        assert!(json.contains("\"ambiguity\""));
+        assert!(json.contains("\"alternative_gap\""));
+        assert!(json.contains("\"alternatives\""));
+    }
+
+    #[test]
+    fn mode_classifier_uses_evidence_when_docs_and_ui_conflict() {
+        let classification = classify_work_mode_json("READMEにUI設計セクションを追加してください");
+        assert_eq!(classification.work_mode, WorkMode::Docs);
+        assert!(
+            classification
+                .alternatives
+                .iter()
+                .any(|candidate| candidate.work_mode == WorkMode::TypeScriptUi)
+        );
+    }
+
+    #[test]
+    fn mode_classifier_handles_counterexamples_without_keyword_lock_in() {
+        assert_eq!(
+            infer_work_mode_from_text("Pythonコードの設計を説明して。変更しない"),
+            WorkMode::AnswerOnly
+        );
+        assert_eq!(
+            infer_work_mode_from_text("CSV仕様書をdocsに追記してください"),
+            WorkMode::Docs
+        );
+        assert_eq!(
+            infer_work_mode_from_text("レビューして問題があれば修正してください"),
+            WorkMode::GenericCode
+        );
+        assert_eq!(
+            infer_work_mode_from_text("docs/ui-guidelines.mdを更新してください"),
+            WorkMode::Docs
+        );
     }
 
     #[test]

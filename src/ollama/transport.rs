@@ -1,6 +1,7 @@
 use reqwest::blocking::{Client, Response};
 use serde::Serialize;
 
+use crate::model_capabilities::model_capabilities;
 use crate::session::store::ConversationMessage;
 use crate::tools::registry::ToolSpec;
 
@@ -167,8 +168,7 @@ fn to_chat_tool_definitions(tools: &[ToolSpec]) -> Vec<ChatToolDefinition> {
 }
 
 pub fn should_use_native_tool_calls(model: &str) -> bool {
-    let normalized = model.trim().to_ascii_lowercase();
-    matches!(normalized.as_str(), "qwen3.6:27b-coding-nvfp4")
+    model_capabilities(model).native_tool_calls
 }
 
 #[cfg(test)]

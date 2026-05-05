@@ -12,11 +12,17 @@
 # Anvil runtime data
 .anvil/
 
+# Local tool/runtime outputs
+.commandmate/
+*.log
+*.tmp
+
 # Sandbox (LLMが生成したテストファイル)
 sandbox/
 
-# Workspace artifacts
-workspace/*.json
+# Workspace artifacts. Durable public docs belong under docs/; deterministic
+# test fixtures belong under tests/fixtures or tests/golden.
+workspace/
 
 # Development reports (Issue開発の中間成果物)
 dev-reports/
@@ -38,3 +44,6 @@ dev-reports/
 .env.*.local
 __pycache__/
 *.pyc
+.pytest_cache/
+.ruff_cache/
+coverage/

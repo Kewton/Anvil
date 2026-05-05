@@ -2,6 +2,7 @@ pub mod agent;
 pub mod cli;
 pub mod config;
 pub mod logging;
+pub(crate) mod model_capabilities;
 pub mod model_registry;
 pub mod modes;
 pub mod ollama;

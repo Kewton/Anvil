@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+use crate::config::DeterministicFallbackMode;
+
 #[derive(Debug, Clone, Parser)]
 #[command(name = "anvil")]
 #[command(about = "local-first coding agent for Ollama")]
@@ -41,6 +43,11 @@ pub struct CliArgs {
     pub auto_plan: bool,
     #[arg(long = "offline")]
     pub offline: bool,
+    /// Control deterministic recovery. `hint-only` only nudges the model,
+    /// `minimal-patch` writes support files only, and `full-template` preserves
+    /// legacy full template recovery. `support-only` and `full` remain aliases.
+    #[arg(long = "deterministic-fallback", value_enum)]
+    pub deterministic_fallback: Option<DeterministicFallbackMode>,
     /// Disable the fixed footer status bar (mode / token usage / log level).
     #[arg(long = "no-footer")]
     pub no_footer: bool,
@@ -240,6 +247,7 @@ mod tests {
             oneshot: false,
             auto_plan: false,
             offline: false,
+            deterministic_fallback: None,
             no_footer: false,
             resume: None,
             cwd: None,

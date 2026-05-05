@@ -18,7 +18,19 @@ use std::path::Path;
 /// Python ecosystems.
 pub fn is_test_file(path: &Path) -> bool {
     let display = path.display().to_string();
-    display.contains("__tests__") || display.contains(".test.") || display.contains(".spec.")
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    display.contains("__tests__")
+        || display.contains("/tests/")
+        || display.contains("\\tests\\")
+        || display.starts_with("tests/")
+        || display.starts_with("tests\\")
+        || display.contains(".test.")
+        || display.contains(".spec.")
+        || file_name.starts_with("test_")
+        || file_name.contains("_test.")
 }
 
 /// Setup / configuration files that ship with the repo. The list is pinned to
@@ -89,22 +101,22 @@ mod tests {
     fn test_is_test_file_double_underscore_dir() {
         assert!(is_test_file(&PathBuf::from("src/__tests__/foo.ts")));
         assert!(is_test_file(&PathBuf::from("__tests__/foo.tsx")));
+        assert!(is_test_file(&PathBuf::from("tests/foo.rs")));
     }
 
     #[test]
     fn test_is_test_file_dotted_naming() {
         assert!(is_test_file(&PathBuf::from("src/foo.test.ts")));
         assert!(is_test_file(&PathBuf::from("packages/lib/bar.spec.js")));
+        assert!(is_test_file(&PathBuf::from("test_calculator.py")));
+        assert!(is_test_file(&PathBuf::from("calculator_test.py")));
     }
 
     #[test]
     fn test_is_test_file_negative() {
         assert!(!is_test_file(&PathBuf::from("src/main.rs")));
         assert!(!is_test_file(&PathBuf::from("README.md")));
-        // Non-dotted "tests" is intentionally NOT matched (matches Rust idiom
-        // of `tests/` integration dir at workspace root, but we leave that to
-        // higher-level rules).
-        assert!(!is_test_file(&PathBuf::from("tests/foo.rs")));
+        assert!(!is_test_file(&PathBuf::from("contest.py")));
     }
 
     #[test]

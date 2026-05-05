@@ -1,3 +1,0 @@
-[model 1/2 | run 1/1] qwen3.5:122b
-[model 2/2 | run 1/1] qwen3.6:27b-coding-nvfp4
-Done. Results: /Users/maenokota/share/work/github_kewton/Anvil-develop/.anvil/benchmarks/20260430T180217-10158/summary.tsv

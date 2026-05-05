@@ -778,6 +778,7 @@ fn normalize_scaffold_segment(segment: &str) -> String {
     if !has_package_manager {
         tokens.push("--use-npm".to_string());
     }
+    normalize_create_next_app_project_target(&mut tokens);
 
     let mut rewritten = tokens.join(" ");
     if !trailing_suffix.is_empty() {
@@ -791,6 +792,24 @@ fn normalize_scaffold_segment(segment: &str) -> String {
         );
     }
     rewritten
+}
+
+fn normalize_create_next_app_project_target(tokens: &mut Vec<String>) {
+    let Some(create_idx) = tokens.iter().position(|token| {
+        let lower = token.to_ascii_lowercase();
+        lower.contains("create-next-app") || lower.starts_with("next-app")
+    }) else {
+        return;
+    };
+    let project_idx = create_idx + 1;
+    if project_idx >= tokens.len()
+        || tokens[project_idx].starts_with('-')
+        || is_shell_redirection_token(&tokens[project_idx])
+    {
+        tokens.insert(project_idx, ".".to_string());
+    } else {
+        tokens[project_idx] = ".".to_string();
+    }
 }
 
 fn is_shell_redirection_token(token: &str) -> bool {
@@ -1348,8 +1367,10 @@ mod tests {
     #[test]
     fn normalizes_create_next_app_to_noninteractive() {
         let rewritten = normalize_noninteractive_scaffold_command(
-            "npx create-next-app@latest . --typescript --tailwind",
+            "npx create-next-app@latest my-game --typescript --tailwind",
         );
+        assert!(rewritten.contains("create-next-app@latest . --typescript"));
+        assert!(!rewritten.contains("my-game"));
         assert!(rewritten.contains("--yes"));
         assert!(rewritten.contains("--use-npm"));
     }
@@ -1366,10 +1387,7 @@ mod tests {
         let rewritten = normalize_noninteractive_scaffold_command(
             "cd /tmp/app && npx create-next-app@latest sample-app --typescript 2>&1 | tail -20",
         );
-        assert!(
-            rewritten
-                .contains("create-next-app@latest sample-app --typescript --yes --use-npm 2>&1")
-        );
+        assert!(rewritten.contains("create-next-app@latest . --typescript --yes --use-npm 2>&1"));
         assert!(rewritten.ends_with("| tail -20"), "got: {rewritten}");
         assert!(!rewritten.contains("tail -20 --yes"), "got: {rewritten}");
     }

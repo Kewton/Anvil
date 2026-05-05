@@ -1,7 +1,9 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::agent::prompting::load_project_instructions;
+use crate::logging::log_llm_event;
 use crate::session::feedback::FeedbackKind;
 
 /// Maximum bytes of combined stdout+stderr the auto_test path keeps in its
@@ -57,6 +59,52 @@ fn infer_auto_test_kind(command: &str) -> AutoTestKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum VerifierCandidateSource {
+    ProjectInstruction,
+    RecentSuccessfulBash,
+    CargoManifest,
+    PackageJsonScripts,
+    NativeNodeFramework,
+    PythonTests,
+    PythonCompileFallback,
+}
+
+impl VerifierCandidateSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ProjectInstruction => "project_instruction",
+            Self::RecentSuccessfulBash => "recent_successful_bash",
+            Self::CargoManifest => "cargo_manifest",
+            Self::PackageJsonScripts => "package_json_scripts",
+            Self::NativeNodeFramework => "native_node_framework",
+            Self::PythonTests => "python_tests",
+            Self::PythonCompileFallback => "python_compile_fallback",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct VerifierCandidate {
+    pub plan: AutoTestPlan,
+    pub source: VerifierCandidateSource,
+    pub confidence: f32,
+    pub evidence: Vec<String>,
+}
+
+impl VerifierCandidate {
+    fn into_plan(mut self) -> AutoTestPlan {
+        self.plan.reason = format!(
+            "{}; source={}; confidence={:.2}; evidence={}",
+            self.plan.reason,
+            self.source.as_str(),
+            self.confidence,
+            self.evidence.join(",")
+        );
+        self.plan
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct AutoTestResult {
     pub command: String,
@@ -72,53 +120,56 @@ pub(super) struct AutoTestRunner;
 
 impl AutoTestRunner {
     pub(super) fn detect(work_root: &Path, changed_files: &[String]) -> Option<AutoTestPlan> {
-        if let Some(plan) = detect_project_instruction_test(work_root, changed_files) {
-            return Some(plan);
-        }
-        if work_root.join("Cargo.toml").is_file() {
-            return Some(AutoTestPlan {
-                command: "cargo test".to_string(),
-                reason: "Cargo.toml detected".to_string(),
-            });
-        }
-        if work_root.join("package.json").is_file() {
-            if package_json_has_test_script(work_root) {
-                return Some(AutoTestPlan {
-                    command: "npm test".to_string(),
-                    reason: "package.json test script detected".to_string(),
-                });
-            }
-            let package = std::fs::read_to_string(work_root.join("package.json")).ok()?;
-            if package.contains("\"build\"") {
-                return Some(AutoTestPlan {
-                    command: "npm run build".to_string(),
-                    reason: "package.json build script detected".to_string(),
-                });
-            }
-        }
-        if has_python_surface(work_root, changed_files) {
-            if work_root.join("pytest.ini").is_file()
-                || work_root.join("pyproject.toml").is_file()
-                || work_root.join("tests").is_dir()
-                || changed_files.iter().any(|path| {
-                    path.starts_with("tests/")
-                        || path.ends_with("_test.py")
-                        || path.starts_with("test_")
-                })
-            {
-                return Some(AutoTestPlan {
-                    command: "python3 -m pytest".to_string(),
-                    reason: "Python tests detected".to_string(),
-                });
-            }
-            if let Some(script) = first_python_script(changed_files) {
-                return Some(AutoTestPlan {
-                    command: format!("python3 -m py_compile {}", shell_quote(&script)),
-                    reason: "Python implementation detected without pytest".to_string(),
-                });
-            }
-        }
-        None
+        Self::detect_candidate(work_root, changed_files).map(VerifierCandidate::into_plan)
+    }
+
+    pub(super) fn detect_with_recent_successes(
+        work_root: &Path,
+        changed_files: &[String],
+        recent_successful_bash_commands: &[String],
+    ) -> Option<AutoTestPlan> {
+        Self::detect_candidate_with_recent_successes(
+            work_root,
+            changed_files,
+            recent_successful_bash_commands,
+        )
+        .map(VerifierCandidate::into_plan)
+    }
+
+    pub(super) fn detect_candidate(
+        work_root: &Path,
+        changed_files: &[String],
+    ) -> Option<VerifierCandidate> {
+        Self::detect_candidate_with_recent_successes(work_root, changed_files, &[])
+    }
+
+    pub(super) fn detect_candidate_with_recent_successes(
+        work_root: &Path,
+        changed_files: &[String],
+        recent_successful_bash_commands: &[String],
+    ) -> Option<VerifierCandidate> {
+        let candidates =
+            detect_verifier_candidates(work_root, changed_files, recent_successful_bash_commands);
+        let selected = select_verifier_candidate(candidates.clone());
+        emit_verifier_candidate_telemetry(&candidates, selected.as_ref());
+        selected
+    }
+
+    #[cfg(test)]
+    pub(super) fn detect_candidates(
+        work_root: &Path,
+        changed_files: &[String],
+    ) -> Vec<VerifierCandidate> {
+        detect_verifier_candidates(work_root, changed_files, &[])
+    }
+
+    #[cfg(test)]
+    pub(super) fn detect_candidates_with_recent_successes(
+        work_root: &Path,
+        changed_files: &[String],
+        recent_successful_bash_commands: &[String],
+    ) -> Vec<VerifierCandidate> {
+        detect_verifier_candidates(work_root, changed_files, recent_successful_bash_commands)
     }
 
     pub(super) fn run(work_root: &Path, plan: &AutoTestPlan) -> Result<AutoTestResult, String> {
@@ -150,6 +201,651 @@ impl AutoTestRunner {
             stderr,
         })
     }
+}
+
+fn detect_verifier_candidates(
+    work_root: &Path,
+    changed_files: &[String],
+    recent_successful_bash_commands: &[String],
+) -> Vec<VerifierCandidate> {
+    let mut candidates = Vec::new();
+    if let Some(candidate) = detect_project_instruction_test(work_root, changed_files) {
+        candidates.push(candidate);
+    }
+    if let Some(candidate) =
+        detect_recent_successful_bash(changed_files, recent_successful_bash_commands)
+    {
+        candidates.push(candidate);
+    }
+    if let Some(candidate) = detect_cargo_test(work_root) {
+        candidates.push(candidate);
+    }
+    if let Some(candidate) = detect_node_scripts(work_root) {
+        candidates.push(candidate);
+    }
+    if let Some(candidate) = detect_native_node_framework(work_root, changed_files) {
+        candidates.push(candidate);
+    }
+    if let Some(candidate) = detect_python_verifier(work_root, changed_files) {
+        candidates.push(candidate);
+    }
+    candidates
+}
+
+fn select_verifier_candidate(candidates: Vec<VerifierCandidate>) -> Option<VerifierCandidate> {
+    candidates.into_iter().max_by(|a, b| {
+        a.confidence
+            .partial_cmp(&b.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| source_priority(a.source).cmp(&source_priority(b.source)))
+    })
+}
+
+fn emit_verifier_candidate_telemetry(
+    candidates: &[VerifierCandidate],
+    selected: Option<&VerifierCandidate>,
+) {
+    let mut source_counts = std::collections::BTreeMap::new();
+    for candidate in candidates {
+        *source_counts
+            .entry(candidate.source.as_str())
+            .or_insert(0usize) += 1;
+    }
+    log_llm_event(
+        "agent.autotest.candidates",
+        serde_json::json!({
+            "candidate_count": candidates.len(),
+            "selected_source": selected.map(|candidate| candidate.source.as_str()),
+            "source_counts": source_counts,
+        }),
+    );
+}
+
+fn source_priority(source: VerifierCandidateSource) -> u8 {
+    match source {
+        VerifierCandidateSource::ProjectInstruction => 6,
+        VerifierCandidateSource::RecentSuccessfulBash => 5,
+        VerifierCandidateSource::CargoManifest => 4,
+        VerifierCandidateSource::PackageJsonScripts => 3,
+        VerifierCandidateSource::NativeNodeFramework => 2,
+        VerifierCandidateSource::PythonTests => 2,
+        VerifierCandidateSource::PythonCompileFallback => 1,
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PackageJsonEvidence {
+    scripts: BTreeMap<String, String>,
+    packages: BTreeSet<String>,
+}
+
+impl PackageJsonEvidence {
+    fn from_file(work_root: &Path) -> Option<Self> {
+        let raw = std::fs::read_to_string(work_root.join("package.json")).ok()?;
+        Self::from_str(&raw)
+    }
+
+    fn from_str(raw: &str) -> Option<Self> {
+        let json = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+        let scripts = json
+            .get("scripts")
+            .and_then(serde_json::Value::as_object)
+            .map(|scripts| {
+                scripts
+                    .iter()
+                    .filter_map(|(name, value)| {
+                        value
+                            .as_str()
+                            .map(str::trim)
+                            .filter(|script| !script.is_empty())
+                            .map(|script| (name.to_ascii_lowercase(), script.to_string()))
+                    })
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .unwrap_or_default();
+        let mut packages = BTreeSet::new();
+        for section in [
+            "dependencies",
+            "devDependencies",
+            "peerDependencies",
+            "optionalDependencies",
+        ] {
+            if let Some(deps) = json.get(section).and_then(serde_json::Value::as_object) {
+                packages.extend(deps.keys().map(|name| name.to_ascii_lowercase()));
+            }
+        }
+        Some(Self { scripts, packages })
+    }
+
+    fn has_script(&self, name: &str) -> bool {
+        self.scripts
+            .get(&name.to_ascii_lowercase())
+            .is_some_and(|script| !script.trim().is_empty())
+    }
+
+    fn has_package(&self, name: &str) -> bool {
+        self.packages.contains(&name.to_ascii_lowercase())
+    }
+
+    fn has_any_package(&self, names: &[&str]) -> bool {
+        names.iter().any(|name| self.has_package(name))
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PythonProjectEvidence {
+    sections: BTreeSet<String>,
+    dependencies: BTreeSet<String>,
+    hatch_test_script: bool,
+}
+
+impl PythonProjectEvidence {
+    fn from_file(work_root: &Path) -> Self {
+        let raw = std::fs::read_to_string(work_root.join("pyproject.toml")).unwrap_or_default();
+        Self::from_str(&raw)
+    }
+
+    fn from_str(raw: &str) -> Self {
+        let mut evidence = Self::default();
+        let mut active_section = String::new();
+        for line in raw.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            if let Some(section) = parse_toml_section(trimmed) {
+                active_section = section;
+                evidence.sections.insert(active_section.clone());
+                continue;
+            }
+            let line_without_comment = trimmed.split('#').next().unwrap_or(trimmed).trim();
+            if active_section.starts_with("tool.hatch")
+                && (line_without_comment.starts_with("test =")
+                    || line_without_comment.starts_with("test="))
+            {
+                evidence.hatch_test_script = true;
+            }
+            if line_without_comment.starts_with("dependencies")
+                || line_without_comment.starts_with("optional-dependencies")
+                || active_section.starts_with("project.optional-dependencies")
+                || active_section.starts_with("tool.poetry.dependencies")
+                || active_section.starts_with("tool.poetry.group.")
+            {
+                evidence
+                    .dependencies
+                    .extend(extract_dependency_names(line_without_comment));
+            }
+        }
+        evidence
+    }
+
+    fn has_section_prefix(&self, prefix: &str) -> bool {
+        self.sections
+            .iter()
+            .any(|section| section.starts_with(prefix))
+    }
+
+    fn has_dependency(&self, name: &str) -> bool {
+        self.dependencies.contains(&name.to_ascii_lowercase())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CargoManifestEvidence {
+    has_explicit_test_target: bool,
+}
+
+impl CargoManifestEvidence {
+    fn from_str(raw: &str) -> Self {
+        Self {
+            has_explicit_test_target: raw
+                .lines()
+                .map(str::trim_start)
+                .filter(|line| !line.starts_with('#'))
+                .any(|line| {
+                    parse_toml_array_section(line).is_some_and(|section| section == "test")
+                }),
+        }
+    }
+}
+
+fn parse_toml_section(trimmed: &str) -> Option<String> {
+    if trimmed.starts_with('[') && trimmed.ends_with(']') && !trimmed.starts_with("[[") {
+        return Some(trimmed.trim_matches(['[', ']']).trim().to_ascii_lowercase());
+    }
+    None
+}
+
+fn parse_toml_array_section(trimmed: &str) -> Option<String> {
+    if trimmed.starts_with("[[") && trimmed.ends_with("]]") {
+        return Some(
+            trimmed
+                .trim_start_matches("[[")
+                .trim_end_matches("]]")
+                .trim()
+                .to_ascii_lowercase(),
+        );
+    }
+    None
+}
+
+fn extract_dependency_names(line: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    if let Some((name, _)) = line.split_once('=')
+        && !name.trim().eq_ignore_ascii_case("dependencies")
+        && !name.trim().eq_ignore_ascii_case("optional-dependencies")
+    {
+        names.push(normalize_dependency_name(name.trim()));
+    }
+    let mut rest = line;
+    while let Some((_, after_quote)) = rest.split_once(['"', '\'']) {
+        let Some((candidate, after_close)) = after_quote.split_once(['"', '\'']) else {
+            break;
+        };
+        if let Some(name) = dependency_name_from_requirement(candidate) {
+            names.push(name);
+        }
+        rest = after_close;
+    }
+    names
+        .into_iter()
+        .filter(|name| !name.is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn dependency_name_from_requirement(requirement: &str) -> Option<String> {
+    let trimmed = requirement.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let name = trimmed
+        .split(['<', '>', '=', '!', '~', '[', ';', ' '])
+        .next()
+        .unwrap_or("")
+        .trim();
+    (!name.is_empty()).then(|| normalize_dependency_name(name))
+}
+
+fn normalize_dependency_name(name: &str) -> String {
+    name.trim()
+        .trim_matches(['"', '\'', '`'])
+        .to_ascii_lowercase()
+        .replace('_', "-")
+}
+
+fn detect_recent_successful_bash(
+    changed_files: &[String],
+    recent_successful_bash_commands: &[String],
+) -> Option<VerifierCandidate> {
+    let command = recent_successful_bash_commands
+        .iter()
+        .rev()
+        .find(|command| recent_successful_command_is_reusable_verifier(command, changed_files))?
+        .trim()
+        .to_string();
+    Some(VerifierCandidate {
+        plan: AutoTestPlan {
+            command,
+            reason: "recent successful Bash verifier detected".to_string(),
+        },
+        source: VerifierCandidateSource::RecentSuccessfulBash,
+        confidence: 0.9,
+        evidence: vec![
+            "bash-exit-code-0".to_string(),
+            "safe-verifier-command".to_string(),
+        ],
+    })
+}
+
+fn recent_successful_command_is_reusable_verifier(command: &str, changed_files: &[String]) -> bool {
+    let lower = command.trim().to_ascii_lowercase();
+    if lower.is_empty() || lower.len() > 300 {
+        return false;
+    }
+    if contains_blocked_shell_fragment(&lower) {
+        return false;
+    }
+    if is_project_level_verifier_command(&lower) {
+        return true;
+    }
+    command_references_changed_file(command, changed_files)
+        && is_local_script_verifier_command(&lower)
+}
+
+fn contains_blocked_shell_fragment(lower: &str) -> bool {
+    [
+        "rm -rf",
+        "sudo ",
+        "curl ",
+        "wget ",
+        "git push",
+        "git reset",
+        "chmod ",
+        "chown ",
+        "mkfs",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn is_project_level_verifier_command(lower: &str) -> bool {
+    [
+        "cargo test",
+        "cargo build",
+        "cargo check",
+        "cargo clippy",
+        "npm test",
+        "npm run test",
+        "npm run build",
+        "npm exec -- next build",
+        "npm exec -- vite build",
+        "npm exec -- astro build",
+        "pnpm test",
+        "pnpm run test",
+        "pnpm build",
+        "pnpm run build",
+        "yarn test",
+        "yarn build",
+        "python -m pytest",
+        "python3 -m pytest",
+        "python3 -b -m pytest",
+        "pytest",
+        "uv run pytest",
+        "uv run python -m pytest",
+        "poetry run pytest",
+        "hatch run test",
+        "hatch run pytest",
+        "ruff check",
+        "mypy",
+        "pyright",
+        "tsc",
+        "go test",
+    ]
+    .iter()
+    .any(|needle| lower.starts_with(needle) || lower.contains(&format!("&& {needle}")))
+}
+
+fn is_local_script_verifier_command(lower: &str) -> bool {
+    lower.starts_with("python ")
+        || lower.starts_with("python3 ")
+        || lower.starts_with("node ")
+        || lower.starts_with("deno ")
+        || lower.starts_with("bash ")
+        || lower.starts_with("sh ")
+}
+
+fn command_references_changed_file(command: &str, changed_files: &[String]) -> bool {
+    changed_files.iter().any(|path| {
+        let path = path.trim();
+        if path.is_empty() {
+            return false;
+        }
+        if command.contains(path) {
+            return true;
+        }
+        Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| !name.is_empty() && command.contains(name))
+    })
+}
+
+fn detect_cargo_test(work_root: &Path) -> Option<VerifierCandidate> {
+    if work_root.join("Cargo.toml").is_file() {
+        return Some(VerifierCandidate {
+            plan: AutoTestPlan {
+                command: "cargo test".to_string(),
+                reason: "Cargo.toml detected".to_string(),
+            },
+            source: VerifierCandidateSource::CargoManifest,
+            confidence: 0.86,
+            evidence: vec!["Cargo.toml".to_string()],
+        });
+    }
+    None
+}
+
+fn detect_node_scripts(work_root: &Path) -> Option<VerifierCandidate> {
+    let package = PackageJsonEvidence::from_file(work_root)?;
+    let has_test = package.has_script("test");
+    let has_build = package.has_script("build");
+    let (command, reason, confidence, evidence) = if has_test && has_build {
+        (
+            node_verifier_command(work_root, "npm test && npm run build"),
+            "package.json test and build scripts detected",
+            0.84,
+            vec!["scripts.test".to_string(), "scripts.build".to_string()],
+        )
+    } else if has_test {
+        (
+            node_verifier_command(work_root, "npm test"),
+            "package.json test script detected",
+            0.8,
+            vec!["scripts.test".to_string()],
+        )
+    } else if has_build {
+        (
+            node_verifier_command(work_root, "npm run build"),
+            "package.json build script detected",
+            0.62,
+            vec!["scripts.build".to_string()],
+        )
+    } else {
+        return None;
+    };
+    Some(VerifierCandidate {
+        plan: AutoTestPlan {
+            command,
+            reason: reason.to_string(),
+        },
+        source: VerifierCandidateSource::PackageJsonScripts,
+        confidence,
+        evidence,
+    })
+}
+
+fn detect_native_node_framework(
+    work_root: &Path,
+    changed_files: &[String],
+) -> Option<VerifierCandidate> {
+    let package = PackageJsonEvidence::from_file(work_root)?;
+    if package.has_script("build") || package.has_script("test") {
+        return None;
+    }
+    let framework = native_node_framework_command(&package, work_root, changed_files)?;
+    let command = node_verifier_command(work_root, framework.command);
+    Some(VerifierCandidate {
+        plan: AutoTestPlan {
+            command,
+            reason: format!(
+                "{} project detected without package scripts",
+                framework.label
+            ),
+        },
+        source: VerifierCandidateSource::NativeNodeFramework,
+        confidence: 0.56,
+        evidence: framework.evidence,
+    })
+}
+
+struct NativeNodeFrameworkCommand {
+    label: &'static str,
+    command: &'static str,
+    evidence: Vec<String>,
+}
+
+fn native_node_framework_command(
+    package: &PackageJsonEvidence,
+    work_root: &Path,
+    changed_files: &[String],
+) -> Option<NativeNodeFrameworkCommand> {
+    let changed_ui = changed_files.iter().any(|path| {
+        matches!(
+            Path::new(path).extension().and_then(|ext| ext.to_str()),
+            Some("svelte" | "vue" | "tsx" | "jsx" | "astro" | "css")
+        )
+    });
+    let mut evidence = Vec::new();
+    if changed_ui {
+        evidence.push("changed-ui-file".to_string());
+    }
+    if package.has_package("next") {
+        evidence.push("package.next".to_string());
+        return Some(NativeNodeFrameworkCommand {
+            label: "Next.js",
+            command: "npm exec -- next build",
+            evidence,
+        });
+    }
+    if package.has_package("astro") || changed_files.iter().any(|path| path.ends_with(".astro")) {
+        evidence.push("package.astro-or-astro-file".to_string());
+        return Some(NativeNodeFrameworkCommand {
+            label: "Astro",
+            command: "npm exec -- astro build",
+            evidence,
+        });
+    }
+    let has_vite_family = package.has_any_package(&[
+        "vite",
+        "@sveltejs/kit",
+        "svelte",
+        "@vitejs/plugin-vue",
+        "vue",
+        "solid-js",
+    ]) || work_root.join("vite.config.js").is_file()
+        || work_root.join("vite.config.ts").is_file()
+        || work_root.join("svelte.config.js").is_file()
+        || work_root.join("svelte.config.ts").is_file();
+    if has_vite_family && changed_ui {
+        evidence.push("vite-family-framework".to_string());
+        return Some(NativeNodeFrameworkCommand {
+            label: "Vite-family UI",
+            command: "npm exec -- vite build",
+            evidence,
+        });
+    }
+    None
+}
+
+fn detect_python_verifier(work_root: &Path, changed_files: &[String]) -> Option<VerifierCandidate> {
+    if !has_python_surface(work_root, changed_files) {
+        return None;
+    }
+    let has_test_path = work_root.join("tests").is_dir()
+        || changed_files.iter().any(|path| {
+            path.starts_with("tests/") || path.ends_with("_test.py") || path.starts_with("test_")
+        });
+    let has_pytest_config = work_root.join("pytest.ini").is_file();
+    let has_pytest_dependency = python_project_mentions_pytest(work_root);
+    if has_test_path || has_pytest_config || has_pytest_dependency {
+        let mut evidence = Vec::new();
+        if has_test_path {
+            evidence.push("python-test-path".to_string());
+        }
+        if has_pytest_config {
+            evidence.push("pytest.ini".to_string());
+        }
+        if has_pytest_dependency {
+            evidence.push("pytest-dependency".to_string());
+        }
+        let pytest = python_pytest_command(work_root);
+        evidence.extend(pytest.evidence);
+        return Some(VerifierCandidate {
+            plan: AutoTestPlan {
+                command: pytest.command,
+                reason: pytest.reason,
+            },
+            source: VerifierCandidateSource::PythonTests,
+            confidence: pytest.confidence,
+            evidence,
+        });
+    }
+    if let Some(script) = first_python_script(changed_files) {
+        return Some(VerifierCandidate {
+            plan: AutoTestPlan {
+                command: format!("python3 -m py_compile {}", shell_quote(&script)),
+                reason: "Python implementation detected without pytest".to_string(),
+            },
+            source: VerifierCandidateSource::PythonCompileFallback,
+            confidence: 0.48,
+            evidence: vec![
+                "changed-python-file".to_string(),
+                "no-pytest-signal".to_string(),
+            ],
+        });
+    }
+    None
+}
+
+struct PythonPytestCommand {
+    command: String,
+    reason: String,
+    confidence: f32,
+    evidence: Vec<String>,
+}
+
+fn python_pytest_command(work_root: &Path) -> PythonPytestCommand {
+    let pyproject = PythonProjectEvidence::from_file(work_root);
+    if work_root.join("uv.lock").is_file() || pyproject.has_section_prefix("tool.uv") {
+        return PythonPytestCommand {
+            command: "uv run pytest -p no:cacheprovider".to_string(),
+            reason: "Python pytest suite detected with uv project evidence".to_string(),
+            confidence: 0.84,
+            evidence: vec!["python-toolchain:uv".to_string()],
+        };
+    }
+    if work_root.join("poetry.lock").is_file() || pyproject.has_section_prefix("tool.poetry") {
+        return PythonPytestCommand {
+            command: "poetry run pytest -p no:cacheprovider".to_string(),
+            reason: "Python pytest suite detected with Poetry project evidence".to_string(),
+            confidence: 0.83,
+            evidence: vec!["python-toolchain:poetry".to_string()],
+        };
+    }
+    if pyproject.has_section_prefix("tool.hatch") {
+        let has_test_script = pyproject.hatch_test_script;
+        return PythonPytestCommand {
+            command: if has_test_script {
+                "hatch run test".to_string()
+            } else {
+                "hatch run pytest -p no:cacheprovider".to_string()
+            },
+            reason: "Python pytest suite detected with Hatch project evidence".to_string(),
+            confidence: 0.82,
+            evidence: vec![if has_test_script {
+                "python-toolchain:hatch-test-script".to_string()
+            } else {
+                "python-toolchain:hatch".to_string()
+            }],
+        };
+    }
+    PythonPytestCommand {
+        command: "python3 -B -m pytest -p no:cacheprovider".to_string(),
+        reason: "Python tests detected".to_string(),
+        confidence: 0.78,
+        evidence: vec!["python-toolchain:stdlib".to_string()],
+    }
+}
+
+fn python_project_mentions_pytest(work_root: &Path) -> bool {
+    if PythonProjectEvidence::from_file(work_root).has_dependency("pytest") {
+        return true;
+    }
+    ["requirements.txt", "requirements-dev.txt"]
+        .iter()
+        .filter_map(|name| std::fs::read_to_string(work_root.join(name)).ok())
+        .any(|contents| requirements_mentions_package(&contents, "pytest"))
+}
+
+fn node_verifier_command(work_root: &Path, command: &str) -> String {
+    let body = if work_root.join("node_modules").is_dir() {
+        command.to_string()
+    } else {
+        format!("npm install && {command}")
+    };
+    format!("export CI=1 NUXT_IGNORE_LOCK=1; {body}")
 }
 
 /// Classify an auto_test outcome into the appropriate `FeedbackKind`.
@@ -314,13 +1010,18 @@ fn parse_first_failed_count(text: &str) -> Option<usize> {
 fn detect_project_instruction_test(
     work_root: &Path,
     changed_files: &[String],
-) -> Option<AutoTestPlan> {
+) -> Option<VerifierCandidate> {
     let instructions = load_project_instructions(work_root, work_root)?;
     let command =
         extract_safe_preferred_command(&instructions.global_content, work_root, changed_files)?;
-    Some(AutoTestPlan {
-        command,
-        reason: "ANVIL.md preferred command".to_string(),
+    Some(VerifierCandidate {
+        plan: AutoTestPlan {
+            command,
+            reason: "ANVIL.md preferred command".to_string(),
+        },
+        source: VerifierCandidateSource::ProjectInstruction,
+        confidence: 0.95,
+        evidence: vec!["ANVIL.md".to_string(), "safe-preferred-command".to_string()],
     })
 }
 
@@ -436,30 +1137,32 @@ pub(super) fn has_cargo_manifest(work_root: &Path) -> bool {
 /// section header. Cheap line-level scan: `[[test]]` must appear as the first
 /// non-whitespace token of a non-comment line. CB-006 (Issue #459).
 pub(super) fn cargo_manifest_has_test_target_section(raw: &str) -> bool {
-    for line in raw.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with('#') {
-            continue;
-        }
-        if trimmed.starts_with("[[test]]") {
-            return true;
-        }
-    }
-    false
+    CargoManifestEvidence::from_str(raw).has_explicit_test_target
 }
 
-/// Returns true when `work_root/package.json` defines a `scripts.test`
-/// entry. Issue #459 / DR1-001: Tester takes the *false* branch (no test
-/// script defined) as a candidate for smoke-test generation. The check is
-/// substring-based on the raw JSON to mirror auto_test's existing
-/// `package.contains("\"test\"")` heuristic — a deliberate match for
-/// DR2-001 (no AST parsing dependency).
+/// Returns true when `work_root/package.json` defines a real `scripts.test`
+/// string. Tester takes the *false* branch (no test script defined) as a
+/// candidate for smoke-test generation, so top-level `"test"` metadata must
+/// not be treated as a runnable verifier.
 pub(super) fn package_json_has_test_script(work_root: &Path) -> bool {
     let path = work_root.join("package.json");
     let Ok(package) = std::fs::read_to_string(&path) else {
         return false;
     };
-    package.contains("\"test\"")
+    package_json_has_script(&package, "test")
+}
+
+fn package_json_has_script(package: &str, name: &str) -> bool {
+    PackageJsonEvidence::from_str(package).is_some_and(|package| package.has_script(name))
+}
+
+fn requirements_mentions_package(contents: &str, package_name: &str) -> bool {
+    contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(dependency_name_from_requirement)
+        .any(|name| name == package_name)
 }
 
 /// Single-quote a path for safe inclusion in a `sh -lc` command line.
@@ -521,7 +1224,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         std::fs::create_dir(dir.path().join("tests")).expect("tests dir");
         let plan = AutoTestRunner::detect(dir.path(), &["app.py".to_string()]).expect("plan");
-        assert_eq!(plan.command, "python3 -m pytest");
+        assert_eq!(plan.command, "python3 -B -m pytest -p no:cacheprovider");
     }
 
     #[test]
@@ -538,6 +1241,222 @@ mod tests {
         let plan =
             AutoTestRunner::detect(dir.path(), &["project_csv_tool.py".to_string()]).expect("plan");
         assert_eq!(plan.command, "python3 project_csv_tool.py example.csv");
+    }
+
+    #[test]
+    fn detects_node_test_and_build_with_install_when_dependencies_missing() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"test":"node smoke.mjs","build":"vite build"}}"#,
+        )
+        .expect("package");
+
+        let plan = AutoTestRunner::detect(dir.path(), &[]).expect("plan");
+
+        assert_eq!(
+            plan.command,
+            "export CI=1 NUXT_IGNORE_LOCK=1; npm install && npm test && npm run build"
+        );
+        assert!(
+            plan.reason
+                .starts_with("package.json test and build scripts detected")
+        );
+        assert!(plan.reason.contains("source=package_json_scripts"));
+    }
+
+    #[test]
+    fn detects_node_test_and_build_without_install_when_dependencies_present() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join("node_modules")).expect("node_modules");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"test":"node smoke.mjs","build":"vite build"}}"#,
+        )
+        .expect("package");
+
+        let plan = AutoTestRunner::detect(dir.path(), &[]).expect("plan");
+
+        assert_eq!(
+            plan.command,
+            "export CI=1 NUXT_IGNORE_LOCK=1; npm test && npm run build"
+        );
+    }
+
+    #[test]
+    fn detects_sveltekit_build_without_package_scripts() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"@sveltejs/kit":"1.0.0","svelte":"4.0.0","vite":"5.0.0"}}"#,
+        )
+        .expect("package");
+        std::fs::write(dir.path().join("svelte.config.js"), "export default {};\n")
+            .expect("svelte config");
+
+        let plan = AutoTestRunner::detect(dir.path(), &["src/routes/+page.svelte".to_string()])
+            .expect("plan");
+
+        assert_eq!(
+            plan.command,
+            "export CI=1 NUXT_IGNORE_LOCK=1; npm install && npm exec -- vite build"
+        );
+        assert!(plan.reason.contains("source=native_node_framework"));
+        assert!(plan.reason.contains("vite-family-framework"));
+    }
+
+    #[test]
+    fn detects_next_build_without_package_scripts() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"next":"14.0.0","react":"18.0.0","react-dom":"18.0.0"}}"#,
+        )
+        .expect("package");
+
+        let plan =
+            AutoTestRunner::detect(dir.path(), &["src/app/page.tsx".to_string()]).expect("plan");
+
+        assert_eq!(
+            plan.command,
+            "export CI=1 NUXT_IGNORE_LOCK=1; npm install && npm exec -- next build"
+        );
+        assert!(plan.reason.contains("Next.js project detected"));
+        assert!(plan.reason.contains("package.next"));
+    }
+
+    #[test]
+    fn detects_astro_build_without_package_scripts() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"astro":"4.0.0"}}"#,
+        )
+        .expect("package");
+
+        let plan = AutoTestRunner::detect(dir.path(), &["src/pages/index.astro".to_string()])
+            .expect("plan");
+
+        assert_eq!(
+            plan.command,
+            "export CI=1 NUXT_IGNORE_LOCK=1; npm install && npm exec -- astro build"
+        );
+        assert!(plan.reason.contains("Astro project detected"));
+        assert!(plan.reason.contains("package.astro-or-astro-file"));
+    }
+
+    #[test]
+    fn detects_solid_vite_build_without_package_scripts() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"solid-js":"1.8.0","vite":"5.0.0"}}"#,
+        )
+        .expect("package");
+
+        let plan = AutoTestRunner::detect(dir.path(), &["src/App.tsx".to_string()]).expect("plan");
+
+        assert_eq!(
+            plan.command,
+            "export CI=1 NUXT_IGNORE_LOCK=1; npm install && npm exec -- vite build"
+        );
+        assert!(plan.reason.contains("Vite-family UI project detected"));
+        assert!(plan.reason.contains("vite-family-framework"));
+    }
+
+    #[test]
+    fn package_build_script_beats_native_framework_fallback() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"build":"svelte-kit build"},"dependencies":{"@sveltejs/kit":"1.0.0","svelte":"4.0.0","vite":"5.0.0"}}"#,
+        )
+        .expect("package");
+
+        let plan = AutoTestRunner::detect(dir.path(), &["src/routes/+page.svelte".to_string()])
+            .expect("plan");
+
+        assert_eq!(
+            plan.command,
+            "export CI=1 NUXT_IGNORE_LOCK=1; npm install && npm run build"
+        );
+        assert!(plan.reason.contains("source=package_json_scripts"));
+    }
+
+    #[test]
+    fn detector_exposes_ranked_verifier_candidates() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("ANVIL.md"),
+            "Preferred verify: `python3 tool.py sample.csv`\n",
+        )
+        .expect("anvil");
+        std::fs::write(dir.path().join("tool.py"), "print('ok')\n").expect("py");
+        std::fs::write(dir.path().join("sample.csv"), "x\n").expect("csv");
+        std::fs::write(dir.path().join("pyproject.toml"), "[project]\nname='x'\n")
+            .expect("pyproject");
+
+        let candidates = AutoTestRunner::detect_candidates(dir.path(), &["tool.py".to_string()]);
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.source == VerifierCandidateSource::ProjectInstruction)
+        );
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.source == VerifierCandidateSource::PythonCompileFallback));
+
+        let selected = AutoTestRunner::detect_candidate(dir.path(), &["tool.py".to_string()])
+            .expect("selected");
+        assert_eq!(selected.source, VerifierCandidateSource::ProjectInstruction);
+        assert_eq!(selected.plan.command, "python3 tool.py sample.csv");
+    }
+
+    #[test]
+    fn recent_successful_bash_beats_weak_python_fallback() {
+        let dir = tempdir().expect("tempdir");
+        let changed_files = vec!["scripts/report.py".to_string()];
+        let recent = vec!["python3 -m pytest".to_string()];
+
+        let candidates = AutoTestRunner::detect_candidates_with_recent_successes(
+            dir.path(),
+            &changed_files,
+            &recent,
+        );
+        assert!(candidates.iter().any(|candidate| {
+            candidate.source == VerifierCandidateSource::RecentSuccessfulBash
+        }));
+
+        let selected = AutoTestRunner::detect_candidate_with_recent_successes(
+            dir.path(),
+            &changed_files,
+            &recent,
+        )
+        .expect("selected");
+        assert_eq!(
+            selected.source,
+            VerifierCandidateSource::RecentSuccessfulBash
+        );
+        assert_eq!(selected.plan.command, "python3 -m pytest");
+    }
+
+    #[test]
+    fn recent_successful_bash_ignores_non_verifier_command() {
+        let dir = tempdir().expect("tempdir");
+        let recent = vec!["echo done".to_string()];
+
+        let selected = AutoTestRunner::detect_candidate_with_recent_successes(
+            dir.path(),
+            &["scripts/report.py".to_string()],
+            &recent,
+        )
+        .expect("python fallback");
+
+        assert_eq!(
+            selected.source,
+            VerifierCandidateSource::PythonCompileFallback
+        );
+        assert_ne!(selected.plan.command, "echo done");
     }
 
     #[test]
@@ -564,7 +1483,7 @@ mod tests {
 
     fn pytest_plan() -> AutoTestPlan {
         AutoTestPlan {
-            command: "python3 -m pytest".to_string(),
+            command: "python3 -B -m pytest -p no:cacheprovider".to_string(),
             reason: "test".to_string(),
         }
     }
@@ -744,9 +1663,8 @@ mod tests {
         assert!(has_cargo_manifest(dir.path()));
     }
 
-    /// `package_json_has_test_script` is true iff the JSON literally
-    /// contains the `"test"` token (mirrors auto_test's existing
-    /// substring heuristic).
+    /// `package_json_has_test_script` is true iff `scripts.test` is a real
+    /// non-empty string.
     #[test]
     fn package_json_has_test_script_true_when_test_defined() {
         let dir = tempdir().expect("tempdir");
@@ -770,9 +1688,152 @@ mod tests {
     }
 
     #[test]
+    fn package_json_has_test_script_false_when_test_is_not_script() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"x","test":"not a script","scripts":{"build":"tsc"}}"#,
+        )
+        .expect("write");
+        assert!(!package_json_has_test_script(dir.path()));
+        let plan = AutoTestRunner::detect(dir.path(), &[]).expect("build plan");
+        assert_eq!(
+            plan.command,
+            "export CI=1 NUXT_IGNORE_LOCK=1; npm install && npm run build"
+        );
+    }
+
+    #[test]
+    fn pyproject_without_pytest_uses_py_compile_fallback() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("pyproject.toml"), "[project]\nname='x'\n")
+            .expect("pyproject");
+        let plan = AutoTestRunner::detect(dir.path(), &["src/app.py".to_string()]).expect("plan");
+        assert_eq!(plan.command, "python3 -m py_compile 'src/app.py'");
+        assert!(plan.reason.contains("source=python_compile_fallback"));
+    }
+
+    #[test]
+    fn pyproject_with_pytest_dependency_uses_pytest() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project]\ndependencies = ['pytest']\n",
+        )
+        .expect("pyproject");
+        let plan = AutoTestRunner::detect(dir.path(), &["src/app.py".to_string()]).expect("plan");
+        assert_eq!(plan.command, "python3 -B -m pytest -p no:cacheprovider");
+        assert!(plan.reason.contains("pytest-dependency"));
+    }
+
+    #[test]
+    fn pyproject_description_keyword_does_not_count_as_pytest_dependency() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project]\nname='x'\ndescription='mentions pytest in prose only'\n",
+        )
+        .expect("pyproject");
+        let plan = AutoTestRunner::detect(dir.path(), &["app.py".to_string()]).expect("plan");
+        assert_eq!(plan.command, "python3 -m py_compile 'app.py'");
+    }
+
+    #[test]
+    fn requirements_comment_keyword_does_not_count_as_pytest_dependency() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("requirements.txt"),
+            "# pytest is optional later\n",
+        )
+        .expect("requirements");
+        let plan = AutoTestRunner::detect(dir.path(), &["app.py".to_string()]).expect("plan");
+        assert_eq!(plan.command, "python3 -m py_compile 'app.py'");
+    }
+
+    #[test]
+    fn python_pytest_uses_uv_when_lockfile_exists() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project]\ndependencies=['pytest']\n",
+        )
+        .expect("pyproject");
+        std::fs::write(dir.path().join("uv.lock"), "").expect("uv lock");
+        std::fs::create_dir(dir.path().join("tests")).expect("tests dir");
+
+        let plan = AutoTestRunner::detect(dir.path(), &["src/app.py".to_string()]).expect("plan");
+
+        assert_eq!(plan.command, "uv run pytest -p no:cacheprovider");
+        assert!(plan.reason.contains("python-toolchain:uv"));
+    }
+
+    #[test]
+    fn python_pytest_uses_poetry_when_poetry_project_detected() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[tool.poetry]\nname='x'\n[tool.poetry.dependencies]\npytest='*'\n",
+        )
+        .expect("pyproject");
+        std::fs::create_dir(dir.path().join("tests")).expect("tests dir");
+
+        let plan = AutoTestRunner::detect(dir.path(), &["src/app.py".to_string()]).expect("plan");
+
+        assert_eq!(plan.command, "poetry run pytest -p no:cacheprovider");
+        assert!(plan.reason.contains("python-toolchain:poetry"));
+    }
+
+    #[test]
+    fn python_pytest_uses_hatch_test_script_when_declared() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project]\ndependencies=['pytest']\n[tool.hatch.envs.default.scripts]\ntest = 'pytest'\n",
+        )
+        .expect("pyproject");
+        std::fs::create_dir(dir.path().join("tests")).expect("tests dir");
+
+        let plan = AutoTestRunner::detect(dir.path(), &["src/app.py".to_string()]).expect("plan");
+
+        assert_eq!(plan.command, "hatch run test");
+        assert!(plan.reason.contains("python-toolchain:hatch-test-script"));
+    }
+
+    #[test]
     fn package_json_has_test_script_false_when_file_missing() {
         let dir = tempdir().expect("tempdir");
         assert!(!package_json_has_test_script(dir.path()));
+    }
+
+    #[test]
+    fn native_node_framework_ignores_keywords_outside_dependency_names() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"description":"next astro svelte vite vue solid keywords only","dependencies":{}}"#,
+        )
+        .expect("package");
+        let candidates =
+            AutoTestRunner::detect_candidates(dir.path(), &["src/App.tsx".to_string()]);
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.source != VerifierCandidateSource::NativeNodeFramework),
+            "unexpected candidates: {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn native_node_framework_uses_dependency_names_as_evidence() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"vite":"5.0.0","solid-js":"1.0.0"}}"#,
+        )
+        .expect("package");
+        let plan = AutoTestRunner::detect(dir.path(), &["src/App.tsx".to_string()]).expect("plan");
+        assert!(plan.command.contains("vite build"));
+        assert!(plan.reason.contains("source=native_node_framework"));
     }
 
     // --- Issue #457: count_compile_errors / count_test_failures -----------
