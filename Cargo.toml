@@ -2,7 +2,7 @@
 name = "anvil"
 version = "0.6.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.86"
 description = "Local-first coding agent for Ollama"
 license = "MIT"
 repository = "https://github.com/Kewton/Anvil"

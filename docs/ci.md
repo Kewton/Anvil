@@ -10,7 +10,7 @@ Default CI runs on `main`, `develop`, and `release/**` branches:
 
 - `fmt`: `cargo fmt --all -- --check`
 - `clippy`: `cargo clippy --all-targets -- -D warnings`
-- `msrv`: `cargo check --all-targets --locked` on Rust `1.85.0`
+- `msrv`: `cargo check --all-targets --locked` on Rust `1.86.0`
 - `audit`: RustSec dependency advisory check
 - `cli-help`: compares `anvil --help` against `docs/cli-help.snapshot.txt`
 - `test`: `cargo test --all` on Ubuntu and macOS
