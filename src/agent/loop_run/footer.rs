@@ -1226,6 +1226,11 @@ mod tests {
             state_dir_override: None,
             resume: Default::default(),
             footer: enabled,
+            photon_enabled: false,
+            photon_url: "http://127.0.0.1:3030".to_string(),
+            photon_shadow_mode: true,
+            photon_canary: 0,
+            photon_timeout_ms: 200,
         }
     }
 

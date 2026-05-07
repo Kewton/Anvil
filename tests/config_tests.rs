@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 
+use anvil::cli::CliArgs;
 use anvil::config::{
-    DeterministicFallbackMode, LogLevel, PartialConfig, load_config_file, load_env_config,
+    Config, DeterministicFallbackMode, LogLevel, PartialConfig, load_config_file, load_env_config,
     merge_partial_configs, parse_key_value_config,
 };
 
@@ -482,4 +483,215 @@ fn merge_log_level_prefers_later_source() {
         },
     ]);
     assert_eq!(merged.log_level, Some(LogLevel::Trace));
+}
+
+// --- photon config (issue #553) ---
+
+fn minimal_args(cwd: &std::path::Path) -> CliArgs {
+    CliArgs {
+        cwd: Some(cwd.to_path_buf()),
+        prompt: None,
+        model: None,
+        sidecar_model: None,
+        ollama_host: None,
+        context_budget: None,
+        max_iterations: None,
+        chat_timeout_secs: None,
+        chat_retries: None,
+        verbose: false,
+        trace: false,
+        debug: false,
+        stream: false,
+        yes: false,
+        fresh_session: false,
+        oneshot: false,
+        auto_plan: false,
+        offline: false,
+        deterministic_fallback: None,
+        no_footer: false,
+        resume: None,
+        state_dir: None,
+        command: None,
+    }
+}
+
+const PHOTON_ENV_VARS: &[(&str, Option<&str>)] = &[
+    ("ANVIL_PHOTON_ENABLED", None),
+    ("ANVIL_PHOTON_URL", None),
+    ("ANVIL_PHOTON_SHADOW_MODE", None),
+    ("ANVIL_PHOTON_CANARY", None),
+    ("ANVIL_PHOTON_TIMEOUT_MS", None),
+    ("ANVIL_OFFLINE", None),
+];
+
+#[test]
+fn photon_disabled_by_default() {
+    let tmp = tempfile::tempdir().unwrap();
+    with_env(PHOTON_ENV_VARS, || {
+        let (cfg, _warnings) = Config::load(minimal_args(tmp.path())).unwrap();
+        assert!(!cfg.photon_enabled);
+        assert_eq!(cfg.photon_canary, 0);
+        assert_eq!(cfg.photon_timeout_ms, 200);
+        assert_eq!(cfg.photon_url, "http://127.0.0.1:3030");
+    });
+}
+
+#[test]
+fn photon_shadow_mode_default_true() {
+    let tmp = tempfile::tempdir().unwrap();
+    with_env(PHOTON_ENV_VARS, || {
+        let (cfg, _) = Config::load(minimal_args(tmp.path())).unwrap();
+        assert!(cfg.photon_shadow_mode);
+    });
+}
+
+#[test]
+fn env_photon_enabled_true() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut vars: Vec<(&str, Option<&str>)> = PHOTON_ENV_VARS.to_vec();
+    vars[0] = ("ANVIL_PHOTON_ENABLED", Some("true"));
+    with_env(&vars, || {
+        let (cfg, warnings) = Config::load(minimal_args(tmp.path())).unwrap();
+        assert!(cfg.photon_enabled);
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    });
+}
+
+#[test]
+fn env_photon_url_invalid_returns_err() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut vars: Vec<(&str, Option<&str>)> = PHOTON_ENV_VARS.to_vec();
+    vars[1] = ("ANVIL_PHOTON_URL", Some("not-a-url"));
+    with_env(&vars, || {
+        let result = Config::load(minimal_args(tmp.path()));
+        assert!(result.is_err(), "expected Err for invalid URL");
+    });
+}
+
+#[test]
+fn env_photon_url_external_returns_err() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut vars: Vec<(&str, Option<&str>)> = PHOTON_ENV_VARS.to_vec();
+    vars[1] = ("ANVIL_PHOTON_URL", Some("http://example.com:3030"));
+    with_env(&vars, || {
+        let result = Config::load(minimal_args(tmp.path()));
+        assert!(result.is_err(), "expected Err for external URL");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("photon_url"),
+            "expected 'photon_url' in error, got: {err}"
+        );
+    });
+}
+
+#[test]
+fn env_photon_canary_out_of_range_warns_and_defaults() {
+    with_env(&[("ANVIL_PHOTON_CANARY", Some("1001"))], || {
+        let mut warnings = Vec::new();
+        let cfg = load_env_config(&mut warnings);
+        assert_eq!(cfg.photon_canary, None, "out-of-range should be None");
+        assert!(
+            warnings.iter().any(|w| w.contains("ANVIL_PHOTON_CANARY")),
+            "expected ANVIL_PHOTON_CANARY warning: {warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("using default (0)")),
+            "expected default value in warning: {warnings:?}"
+        );
+    });
+}
+
+#[test]
+fn env_photon_timeout_zero_warns_and_defaults() {
+    with_env(&[("ANVIL_PHOTON_TIMEOUT_MS", Some("0"))], || {
+        let mut warnings = Vec::new();
+        let cfg = load_env_config(&mut warnings);
+        assert_eq!(cfg.photon_timeout_ms, None);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("ANVIL_PHOTON_TIMEOUT_MS")),
+            "expected ANVIL_PHOTON_TIMEOUT_MS warning: {warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("using default (200)")),
+            "expected default value in warning: {warnings:?}"
+        );
+    });
+}
+
+#[test]
+fn env_photon_timeout_too_large_warns_and_defaults() {
+    with_env(&[("ANVIL_PHOTON_TIMEOUT_MS", Some("60001"))], || {
+        let mut warnings = Vec::new();
+        let cfg = load_env_config(&mut warnings);
+        assert_eq!(cfg.photon_timeout_ms, None);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("ANVIL_PHOTON_TIMEOUT_MS")),
+            "expected ANVIL_PHOTON_TIMEOUT_MS warning: {warnings:?}"
+        );
+    });
+}
+
+#[test]
+fn config_file_photon_enabled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config");
+    std::fs::write(&path, "photon_enabled=true\n").unwrap();
+    let mut warnings = Vec::new();
+    let cfg = load_config_file(&path, &mut warnings).unwrap();
+    assert_eq!(cfg.photon_enabled, Some(true));
+    assert!(warnings.is_empty());
+}
+
+#[test]
+fn merge_photon_env_overrides_file() {
+    let file_config = PartialConfig {
+        photon_enabled: Some(false),
+        ..PartialConfig::default()
+    };
+    let env_config = PartialConfig {
+        photon_enabled: Some(true),
+        ..PartialConfig::default()
+    };
+    let merged = merge_partial_configs(&[file_config, env_config]);
+    assert_eq!(merged.photon_enabled, Some(true));
+}
+
+#[test]
+fn merge_photon_invalid_higher_priority_leaves_lower() {
+    // env has invalid canary (→ None from load_env_config); file has valid 500
+    // After merge, the file's valid value should win because env contributed None
+    let file_config = PartialConfig {
+        photon_canary: Some(500),
+        ..PartialConfig::default()
+    };
+    // simulate env producing None for invalid canary
+    let env_config = PartialConfig {
+        photon_canary: None,
+        ..PartialConfig::default()
+    };
+    let merged = merge_partial_configs(&[file_config, env_config]);
+    assert_eq!(merged.photon_canary, Some(500));
+}
+
+#[test]
+fn offline_forces_photon_disabled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut vars: Vec<(&str, Option<&str>)> = PHOTON_ENV_VARS.to_vec();
+    vars[0] = ("ANVIL_PHOTON_ENABLED", Some("true"));
+    vars.push(("ANVIL_OFFLINE", Some("true")));
+    with_env(&vars, || {
+        let (cfg, warnings) = Config::load(minimal_args(tmp.path())).unwrap();
+        assert!(
+            !cfg.photon_enabled,
+            "offline should force photon_enabled=false"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("photon_enabled")),
+            "expected offline override warning: {warnings:?}"
+        );
+    });
 }
