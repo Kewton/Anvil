@@ -1,0 +1,9 @@
+{
+  "photon_request_id": "pr-test-001",
+  "context_pack_id": "cpid-test-001",
+  "admission_decision": "accepted",
+  "admitted": true,
+  "warnings": [],
+  "task_outcome": "success",
+  "retry_summary": null
+}
