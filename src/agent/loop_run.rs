@@ -145,6 +145,10 @@ pub struct Agent {
     /// per-turn logic runs. Used as a join key in `agent.reminder.completed` and
     /// `agent.anvil_score.computed` log events for dataset export.
     pub(super) current_turn_index: usize,
+    /// Issue #554: optional Photon sidecar client. `None` when photon_url is
+    /// unset, URL validation fails, config.offline is true, or client init fails.
+    #[allow(dead_code)]
+    pub(super) photon: Option<crate::photon::PhotonClient>,
 }
 
 #[derive(Clone)]
@@ -191,6 +195,20 @@ impl Agent {
         let mut skill_registry = crate::agent::skills::SkillRegistry::new();
         skill_registry.register(crate::agent::loop_run::verifier_skill::VerifierSkill);
         let repo_graph = ensure_repo_graph(&work_root, session_store.state_root());
+        let photon = if config.offline || !config.photon_enabled {
+            None
+        } else {
+            match crate::photon::PhotonClient::new(
+                config.photon_url.clone(),
+                config.photon_timeout_ms,
+            ) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    tracing::warn!("photon client init failed, disabled: {e}");
+                    None
+                }
+            }
+        };
         Self {
             config,
             models,
@@ -210,6 +228,7 @@ impl Agent {
             repo_graph,
             last_case_retrieval_summary: None,
             current_turn_index: 0,
+            photon,
         }
     }
 }

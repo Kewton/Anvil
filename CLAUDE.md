@@ -7,6 +7,8 @@
 
 ## Current Architecture
 
+- `src/photon/*`
+  - Issue #554 で導入。Photon サイドカーへの HTTP クライアント（`pub mod photon`、integration tests からアクセス可能）。`schema.rs`: `HealthResponse` / `ContextPackRequest` / `ContextPackResponse` / `EvaluateRequest` / `EvaluateResponse` の serde 型定義（`serde_json::Value` newtype で暫定スキーマ）。`client.rs`: `PhotonClient { base_url, http: reqwest::blocking::Client }` + `send_failopen<T: DeserializeOwned>` DRY ヘルパー（エラー時は `session::feedback::mask_secrets` + `tracing::warn!` + fail-open 返し）。`health() -> bool` (GET /health, fail-open: false) / `context_pack() -> Option<ContextPackResponse>` (POST /v1/context/pack) / `evaluate() -> Option<EvaluateResponse>` (POST /v1/evaluate)。`Config.photon_url: Option<String>` (None=無効、`validate_localhost_url` でバリデーション、無効 URL は warning + None) / `Config.photon_timeout_secs: u64` (デフォルト 5、`ANVIL_PHOTON_TIMEOUT_SECS` env で上書き)。`Agent.photon: Option<PhotonClient>` は `config.offline=true` または `photon_url=None` のとき `None`、初期化失敗は `tracing::warn!` + `None`。E2E テスト: `tests/photon_client_smoke.rs` に mockito::Server を用いた 14 ケース（Ollama 不要）、`tests/config_tests.rs` に Photon 設定テスト 8 件。
 - `src/config.rs`
   - CLI / env / `.anvil/config` のマージ
 - `src/model_registry.rs`
