@@ -56,6 +56,14 @@ pub(crate) use turn::{no_color_requested, unicode_supported};
 // selection pipeline without requiring a live Ollama call.
 pub use turn::select_precautions_for_prompt;
 
+// Issue #556: expose pure helper functions so `tests/photon_turn_hook_smoke.rs`
+// can verify truncation and injection-message building without constructing
+// a full Agent (Ollama-free).
+pub use turn::{
+    MAX_PHOTON_CONTEXT_PACK_PROMPT_BYTES, build_photon_injection_message,
+    truncate_photon_context_pack,
+};
+
 // Issue #465 / Phase 5: expose Reminder types needed by tests/agent_skill_registry_smoke.rs
 // (E2E tests live outside the crate so `pub(crate) mod reminder` cannot be reached
 // directly). Production code paths continue to use `super::reminder::...`; these
@@ -147,8 +155,12 @@ pub struct Agent {
     pub(super) current_turn_index: usize,
     /// Issue #554: optional Photon sidecar client. `None` when photon_url is
     /// unset, URL validation fails, config.offline is true, or client init fails.
-    #[allow(dead_code)]
     pub(super) photon: Option<crate::photon::PhotonClient>,
+    /// Issue #556: masked context_pack response for the current turn.
+    /// Reset to None at the top of every `handle_user_message`.
+    /// Set in `run_turn` pre-hook (shadow mode=false only).
+    /// Cleared after `run_actor_loop` returns.
+    pub(super) photon_context_pack_response: Option<String>,
 }
 
 #[derive(Clone)]
@@ -229,6 +241,7 @@ impl Agent {
             last_case_retrieval_summary: None,
             current_turn_index: 0,
             photon,
+            photon_context_pack_response: None,
         }
     }
 }
