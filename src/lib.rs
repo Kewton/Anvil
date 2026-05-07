@@ -6,6 +6,7 @@ pub(crate) mod model_capabilities;
 pub mod model_registry;
 pub mod modes;
 pub mod ollama;
+pub mod photon;
 pub mod repo_graph;
 pub mod safety;
 pub mod session;
