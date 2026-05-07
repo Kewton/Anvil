@@ -1109,6 +1109,7 @@ mod tests {
             case_retrieval_invoked_this_turn: false,
             anti_pattern_extracted_this_turn: false,
             anti_pattern_retrieval_invoked_this_turn: false,
+            context_pack_sent_this_turn: false,
         };
         let v = ShowView::from_snapshot(&snap);
         assert_eq!(v.id, "sid");

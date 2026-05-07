@@ -1370,6 +1370,14 @@ enum ScaffoldFallbackResult {
     Skipped,
 }
 
+/// Issue #555: carries a retrieval message and the IDs of the selected
+/// records so the photon mapper can include them without re-parsing the
+/// rendered prompt text.
+pub(super) struct RetrievalInjection {
+    pub message: ConversationMessage,
+    pub selected_ids: Vec<String>,
+}
+
 impl Agent {
     pub(super) fn handle_user_message(&mut self, input: &str, stream_output: bool) -> LoopResult {
         // Start the ESC interrupt monitor for the duration of this turn only —
@@ -1561,7 +1569,7 @@ impl Agent {
     /// message-build path immediately after `working_memory_message`. Pure-
     /// function retrieval; never calls Ollama / sidecars. Failures are logged
     /// via `agent.case_retrieval.failed` and never propagate.
-    pub(super) fn try_inject_case_retrieval_message(&mut self) -> Option<ConversationMessage> {
+    pub(super) fn try_inject_case_retrieval_message(&mut self) -> Option<RetrievalInjection> {
         use crate::session::case_record::{
             PrecautionSnapshot, build_task_signature, capture_repo_fingerprint,
         };
@@ -1668,7 +1676,16 @@ impl Agent {
                         selected: selected.len(),
                         scores: selected.iter().map(|s| s.breakdown.clone()).collect(),
                     });
-                case_retrieval::format_for_prompt(&selected).map(ConversationMessage::system)
+                // Issue #555: capture selected IDs for photon mapper before
+                // format_for_prompt consumes `selected`.
+                let selected_ids: Vec<String> =
+                    selected.iter().map(|s| s.record.case_id.clone()).collect();
+                case_retrieval::format_for_prompt(&selected)
+                    .map(ConversationMessage::system)
+                    .map(|message| RetrievalInjection {
+                        message,
+                        selected_ids,
+                    })
             }
             Ok(RetrievalOutcome::Skipped {
                 reason,
@@ -1851,7 +1868,7 @@ impl Agent {
     /// system message into the next prompt. Mirrors
     /// `try_inject_case_retrieval_message` but pulls from
     /// `state_root/anti_patterns/`.
-    pub(super) fn try_inject_anti_pattern_message(&mut self) -> Option<ConversationMessage> {
+    pub(super) fn try_inject_anti_pattern_message(&mut self) -> Option<RetrievalInjection> {
         use crate::session::anti_pattern::{self, AntiPatternRetrievalInputs, RetrievalOutcome};
         use crate::session::case_record::{build_task_signature, capture_repo_fingerprint};
 
@@ -1935,7 +1952,18 @@ impl Agent {
                         "skipped_corrupt_count": skipped_corrupt_count,
                     }),
                 );
-                anti_pattern::format_for_prompt(&selected).map(ConversationMessage::system)
+                // Issue #555: capture selected IDs for photon mapper before
+                // format_for_prompt consumes `selected`.
+                let selected_ids: Vec<String> = selected
+                    .iter()
+                    .map(|s| s.record.anti_pattern_id.clone())
+                    .collect();
+                anti_pattern::format_for_prompt(&selected)
+                    .map(ConversationMessage::system)
+                    .map(|message| RetrievalInjection {
+                        message,
+                        selected_ids,
+                    })
             }
             Ok(RetrievalOutcome::Skipped {
                 reason,
@@ -2229,6 +2257,8 @@ impl Agent {
         // Issue #464: reset the per-turn anti-pattern caps.
         self.session.anti_pattern_extracted_this_turn = false;
         self.session.anti_pattern_retrieval_invoked_this_turn = false;
+        // Issue #555: reset photon context_pack per-turn one-shot flag.
+        self.session.context_pack_sent_this_turn = false;
 
         let mut tool_calls_made_this_turn = 0usize;
         let mut repo_edit_calls_made_this_turn = 0usize;
@@ -4935,14 +4965,64 @@ impl Agent {
             }
             // Issue #463: inject `Relevant Local Cases:` directly after the
             // Working Memory section. Pure-function retrieval; no Ollama call.
-            if let Some(case_message) = self.try_inject_case_retrieval_message() {
-                messages.push(case_message);
+            let case_injection = self.try_inject_case_retrieval_message();
+            if let Some(ref inj) = case_injection {
+                messages.push(inj.message.clone());
             }
             // Issue #464: inject `Avoid Patterns (from prior failures):` after
             // the case retrieval section. Pure-function retrieval; no Ollama
             // call.
-            if let Some(anti_message) = self.try_inject_anti_pattern_message() {
-                messages.push(anti_message);
+            let anti_injection = self.try_inject_anti_pattern_message();
+            if let Some(ref inj) = anti_injection {
+                messages.push(inj.message.clone());
+            }
+            // Issue #555: send context_pack to photon sidecar once per turn,
+            // after retrieval IDs are known (per-turn one-shot via session flag).
+            if !self.session.context_pack_sent_this_turn {
+                let selected_case_ids: Vec<String> = case_injection
+                    .as_ref()
+                    .map(|inj| inj.selected_ids.clone())
+                    .unwrap_or_default();
+                let selected_anti_ids: Vec<String> = anti_injection
+                    .as_ref()
+                    .map(|inj| inj.selected_ids.clone())
+                    .unwrap_or_default();
+                let selected_precaution_ids: Vec<String> = self
+                    .session
+                    .working_memory
+                    .active_precautions
+                    .iter()
+                    .filter(|p| p.status == crate::session::precaution::PrecautionStatus::Active)
+                    .map(|p| p.id.clone())
+                    .collect();
+                let recent_tool_summary = build_recent_tool_summary(&self.session.messages);
+                let gate = crate::photon::mapper::PhotonGateInputs {
+                    photon_present: self.photon.is_some(),
+                    shadow_mode: self.config.photon_shadow_mode,
+                    canary: self.config.photon_canary,
+                    session_id: self.session_store.session_id(),
+                    turn_idx: self.current_turn_index,
+                };
+                if crate::photon::mapper::should_send_context_pack(&gate) {
+                    if let Some(photon) = &self.photon {
+                        let working_memory_text = self.session.working_memory.format_for_prompt();
+                        let inputs = crate::photon::mapper::ContextPackInputs {
+                            task: self.session.working_memory.active_task.as_deref(),
+                            repo_path: &self.work_root,
+                            branch: None,
+                            commit: None,
+                            working_memory_text: working_memory_text.as_deref(),
+                            touched_files: &self.session.working_memory.touched_files,
+                            recent_tool_summary: &recent_tool_summary,
+                            selected_case_ids: &selected_case_ids,
+                            selected_anti_pattern_ids: &selected_anti_ids,
+                            selected_precaution_ids: &selected_precaution_ids,
+                        };
+                        let req = crate::photon::mapper::build_context_pack_request(&inputs);
+                        let _ = photon.context_pack(&req);
+                    }
+                    self.session.context_pack_sent_this_turn = true;
+                }
             }
             if let Some(repo_context_message) = self.repo_context_message() {
                 messages.push(repo_context_message);
@@ -9222,6 +9302,28 @@ fn format_blocked_progress_line(
             display.action
         )
     }
+}
+
+/// Issue #555: build `recent_tool_summary` for the photon mapper from the
+/// last `MAX_CONTEXT_PACK_RECENT_TOOLS` assistant messages that contain tool
+/// calls. Only the call name and JSON-serialised arguments are captured;
+/// tool result messages are intentionally excluded (no stdout/stderr).
+fn build_recent_tool_summary(
+    messages: &[crate::session::store::ConversationMessage],
+) -> Vec<crate::photon::mapper::RecentToolCall> {
+    use crate::photon::mapper::{MAX_CONTEXT_PACK_RECENT_TOOLS, RecentToolCall};
+
+    messages
+        .iter()
+        .rev()
+        .filter(|m| m.role == "assistant" && !m.tool_calls.is_empty())
+        .flat_map(|m| m.tool_calls.iter())
+        .take(MAX_CONTEXT_PACK_RECENT_TOOLS)
+        .map(|tc| RecentToolCall {
+            name: tc.name.clone(),
+            args_summary: tc.arguments.to_string(),
+        })
+        .collect()
 }
 
 #[cfg(test)]

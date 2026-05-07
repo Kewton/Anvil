@@ -1,4 +1,5 @@
 pub mod client;
+pub mod mapper;
 pub mod schema;
 
 pub use client::PhotonClient;

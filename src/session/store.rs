@@ -686,6 +686,11 @@ pub struct SessionSnapshot {
     /// Plan-mode early return does NOT set this. Reset at `run_turn` head.
     #[serde(skip, default)]
     pub anti_pattern_retrieval_invoked_this_turn: bool,
+    /// Issue #555: turn-local one-shot flag for photon context_pack POST.
+    /// Prevents multiple POSTs per user turn when build_request_messages is
+    /// called multiple times inside run_actor_loop. Reset at run_actor_loop head.
+    #[serde(skip, default)]
+    pub context_pack_sent_this_turn: bool,
 }
 
 impl SessionSnapshot {
