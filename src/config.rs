@@ -237,6 +237,11 @@ pub struct Config {
     /// disabled by `--no-footer`, `ANVIL_NO_FOOTER` (non-empty), or
     /// `.anvil/config` `footer=false`. See issue #430 §5.
     pub footer: bool,
+    pub photon_enabled: bool,
+    pub photon_url: String,
+    pub photon_shadow_mode: bool,
+    pub photon_canary: u16,
+    pub photon_timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -260,6 +265,11 @@ pub struct PartialConfig {
     /// (`--no-footer` / non-empty `ANVIL_NO_FOOTER` / `.anvil/config` `footer=false`).
     /// `None` means "no opinion" so default (`true`) wins.
     pub footer: Option<bool>,
+    pub photon_enabled: Option<bool>,
+    pub photon_url: Option<String>,
+    pub photon_shadow_mode: Option<bool>,
+    pub photon_canary: Option<u16>,
+    pub photon_timeout_ms: Option<u64>,
 }
 
 impl Config {
@@ -295,13 +305,30 @@ impl Config {
             // CLI footer flag is "disable-only": `--no-footer` emits Some(false),
             // omission emits None so file/env/default can still apply.
             footer: args.no_footer.then_some(false),
+            // photon settings are not configurable via CLI flags in A1
+            photon_enabled: None,
+            photon_url: None,
+            photon_shadow_mode: None,
+            photon_canary: None,
+            photon_timeout_ms: None,
         };
         let merged = merge_partial_configs(&[file_config, env_config, cli_config]);
         let ollama_host = validate_localhost_url(
             merged
                 .ollama_host
                 .unwrap_or_else(|| "http://127.0.0.1:11434".to_string()),
+            "ollama host",
         )?;
+        let photon_url_raw = merged
+            .photon_url
+            .unwrap_or_else(|| "http://127.0.0.1:3030".to_string());
+        let photon_url = validate_localhost_url(photon_url_raw, "photon_url")?;
+
+        let offline = merged.offline.unwrap_or(false);
+        if offline && merged.photon_enabled.unwrap_or(false) {
+            warnings.push("photon_enabled is forced false because offline=true".to_string());
+        }
+        let photon_enabled = !offline && merged.photon_enabled.unwrap_or(false);
 
         let config = Self {
             cwd,
@@ -318,13 +345,18 @@ impl Config {
             fresh_session: merged.fresh_session.unwrap_or(false),
             oneshot: args.oneshot || args.prompt.is_some(),
             auto_plan: merged.auto_plan.unwrap_or(false),
-            offline: merged.offline.unwrap_or(false),
+            offline,
             deterministic_fallback: merged.deterministic_fallback.unwrap_or_default(),
             prompt: args.prompt,
             state_dir_override: merged.state_dir_override,
             resume: ResumeRequest::from_flag(args.resume),
             // Default true; any disable signal (file/env/CLI) lands as Some(false).
             footer: merged.footer.unwrap_or(true),
+            photon_enabled,
+            photon_url,
+            photon_shadow_mode: merged.photon_shadow_mode.unwrap_or(true),
+            photon_canary: merged.photon_canary.unwrap_or(0),
+            photon_timeout_ms: merged.photon_timeout_ms.unwrap_or(200),
         };
         Ok((config, warnings))
     }
@@ -381,6 +413,21 @@ pub fn merge_partial_configs(configs: &[PartialConfig]) -> PartialConfig {
         if config.footer.is_some() {
             merged.footer = config.footer;
         }
+        if config.photon_enabled.is_some() {
+            merged.photon_enabled = config.photon_enabled;
+        }
+        if config.photon_url.is_some() {
+            merged.photon_url = config.photon_url.clone();
+        }
+        if config.photon_shadow_mode.is_some() {
+            merged.photon_shadow_mode = config.photon_shadow_mode;
+        }
+        if config.photon_canary.is_some() {
+            merged.photon_canary = config.photon_canary;
+        }
+        if config.photon_timeout_ms.is_some() {
+            merged.photon_timeout_ms = config.photon_timeout_ms;
+        }
     }
     merged
 }
@@ -434,6 +481,16 @@ pub fn load_config_file(path: &Path, warnings: &mut Vec<String>) -> Result<Parti
             .get("footer")
             .and_then(|value| parse_bool(value))
             .and_then(|enabled| (!enabled).then_some(false)),
+        photon_enabled: map.get("photon_enabled").and_then(|v| parse_bool(v)),
+        // photon_url empty string is skipped by parse_key_value_config, so None means unset
+        photon_url: map.get("photon_url").cloned(),
+        photon_shadow_mode: map.get("photon_shadow_mode").and_then(|v| parse_bool(v)),
+        photon_canary: map
+            .get("photon_canary")
+            .and_then(|v| parse_photon_canary(v, warnings)),
+        photon_timeout_ms: map
+            .get("photon_timeout_ms")
+            .and_then(|v| parse_photon_timeout_ms(v, warnings)),
     })
 }
 
@@ -490,6 +547,43 @@ pub fn load_env_config(warnings: &mut Vec<String>) -> PartialConfig {
         footer: env::var("ANVIL_NO_FOOTER")
             .ok()
             .and_then(|value| (!value.is_empty()).then_some(false)),
+        photon_enabled: env::var("ANVIL_PHOTON_ENABLED")
+            .ok()
+            .and_then(|v| parse_bool(&v)),
+        photon_url: env::var("ANVIL_PHOTON_URL").ok(),
+        photon_shadow_mode: env::var("ANVIL_PHOTON_SHADOW_MODE")
+            .ok()
+            .and_then(|v| parse_bool(&v)),
+        photon_canary: env::var("ANVIL_PHOTON_CANARY")
+            .ok()
+            .and_then(|v| parse_photon_canary(&v, warnings)),
+        photon_timeout_ms: env::var("ANVIL_PHOTON_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| parse_photon_timeout_ms(&v, warnings)),
+    }
+}
+
+fn parse_photon_canary(s: &str, warnings: &mut Vec<String>) -> Option<u16> {
+    match s.trim().parse::<u16>() {
+        Ok(n) if n <= 1000 => Some(n),
+        _ => {
+            warnings.push(format!(
+                "invalid ANVIL_PHOTON_CANARY={s}, must be 0-1000, using default (0)"
+            ));
+            None
+        }
+    }
+}
+
+fn parse_photon_timeout_ms(s: &str, warnings: &mut Vec<String>) -> Option<u64> {
+    match s.trim().parse::<u64>() {
+        Ok(n) if (1..=60_000).contains(&n) => Some(n),
+        _ => {
+            warnings.push(format!(
+                "invalid ANVIL_PHOTON_TIMEOUT_MS={s}, must be 1-60000, using default (200)"
+            ));
+            None
+        }
     }
 }
 
