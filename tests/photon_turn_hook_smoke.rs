@@ -256,3 +256,122 @@ fn t8_prompt_injection_boundary_header_present() {
         "must include closing boundary"
     );
 }
+
+// T9 -------------------------------------------------------------------------
+
+/// Issue #557: canary=0, shadow_mode=false → invoke_photon_context_pack
+/// must NOT call /v1/context/pack (canary gate fires before the HTTP fetch).
+#[test]
+fn t9_canary_zero_no_http_calls() {
+    use anvil::agent::Agent;
+    use anvil::agent::loop_run::FooterHandle;
+    use anvil::config::Config;
+    use anvil::model_registry::RuntimeModels;
+    use anvil::ollama::client::OllamaClient;
+    use anvil::session::store::{SessionSnapshot, SessionStore};
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let state_root = dir.path().join("state");
+    std::fs::create_dir_all(state_root.join("sessions").join("test-557-t9")).unwrap();
+
+    let mut photon_server = mockito::Server::new();
+    let pack_mock = photon_server
+        .mock("POST", "/v1/context/pack")
+        .expect(0) // must NOT be called
+        .create();
+
+    let mut config = Config::default();
+    config.cwd = dir.path().to_path_buf();
+    config.photon_enabled = true;
+    config.photon_url = photon_server.url();
+    config.photon_shadow_mode = false; // shadow mode off
+    config.photon_canary = 0; // canary=0 → gate always false
+    config.requested_model = Some("test-model".to_string());
+    config.state_dir_override = Some(state_root.clone());
+    config.yes_mode = true;
+    config.max_iterations = 1;
+
+    let session = SessionSnapshot {
+        id: "test-557-t9".to_string(),
+        workspace_key: "anvil-557-t9".to_string(),
+        ..Default::default()
+    };
+
+    let mut agent = Agent::new(
+        config,
+        RuntimeModels {
+            main: "test-model".to_string(),
+            sidecar: None,
+        },
+        OllamaClient::new("http://127.0.0.1:19999".to_string()).unwrap(),
+        SessionStore::new(&state_root, "test-557-t9", "anvil-557-t9"),
+        session,
+        FooterHandle::disabled(),
+    );
+
+    // Ollama will fail (port 19999 unused). Only the Photon hit count matters.
+    let _ = agent.process_line("hello", false);
+
+    pack_mock.assert(); // assert 0 calls
+}
+
+// T10 ------------------------------------------------------------------------
+
+/// Issue #557: shadow_mode=true → invoke_photon_context_pack must NOT call
+/// /v1/context/pack (shadow mode gate fires before the HTTP fetch).
+/// Tests the second early-return path distinct from T9 (canary=0 gate).
+#[test]
+fn t10_shadow_mode_no_http_calls() {
+    use anvil::agent::Agent;
+    use anvil::agent::loop_run::FooterHandle;
+    use anvil::config::Config;
+    use anvil::model_registry::RuntimeModels;
+    use anvil::ollama::client::OllamaClient;
+    use anvil::session::store::{SessionSnapshot, SessionStore};
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let state_root = dir.path().join("state");
+    std::fs::create_dir_all(state_root.join("sessions").join("test-557-t10")).unwrap();
+
+    let mut photon_server = mockito::Server::new();
+    let pack_mock = photon_server
+        .mock("POST", "/v1/context/pack")
+        .expect(0) // must NOT be called
+        .create();
+
+    let mut config = Config::default();
+    config.cwd = dir.path().to_path_buf();
+    config.photon_enabled = true;
+    config.photon_url = photon_server.url();
+    config.photon_shadow_mode = true; // shadow mode ON → skip fetch
+    config.photon_canary = 1000; // canary=1000 (would always sample if gate ran)
+    config.requested_model = Some("test-model".to_string());
+    config.state_dir_override = Some(state_root.clone());
+    config.yes_mode = true;
+    config.max_iterations = 1;
+
+    let session = SessionSnapshot {
+        id: "test-557-t10".to_string(),
+        workspace_key: "anvil-557-t10".to_string(),
+        ..Default::default()
+    };
+
+    let mut agent = Agent::new(
+        config,
+        RuntimeModels {
+            main: "test-model".to_string(),
+            sidecar: None,
+        },
+        OllamaClient::new("http://127.0.0.1:19999".to_string()).unwrap(),
+        SessionStore::new(&state_root, "test-557-t10", "anvil-557-t10"),
+        session,
+        FooterHandle::disabled(),
+    );
+
+    // Ollama will fail (port 19999 unused). Only the Photon hit count matters.
+    let _ = agent.process_line("hello", false);
+
+    pack_mock.assert(); // assert 0 calls
+}

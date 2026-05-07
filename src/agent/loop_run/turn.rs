@@ -2215,12 +2215,47 @@ impl Agent {
         log_llm_event(event, payload);
     }
 
-    /// Issue #556: call photon context_pack and store masked response.
+    /// Issue #557: call photon context_pack and store rendered response.
+    /// Canary gate runs BEFORE the HTTP fetch (DR3-002).
     fn invoke_photon_context_pack(&mut self) {
         // DR2-001: photon インライン呼び出しで借用チェッカー衝突を回避
         if self.photon.is_none() {
             return;
         }
+
+        // Issue #557: shadow mode disables prompt injection entirely.
+        if self.config.photon_shadow_mode {
+            log_llm_event(
+                "agent.photon_context_pack.skipped",
+                serde_json::json!({
+                    "session_id": self.session_store.session_id(),
+                    "turn_index": self.current_turn_index,
+                    "reason": "shadow_mode",
+                }),
+            );
+            return;
+        }
+
+        // Issue #557: canary gate BEFORE the HTTP fetch (SSOT: should_send_context_pack).
+        let gate = crate::photon::mapper::PhotonGateInputs {
+            photon_present: true,
+            shadow_mode: false,
+            canary: self.config.photon_canary,
+            session_id: self.session_store.session_id(),
+            turn_idx: self.current_turn_index,
+        };
+        if !crate::photon::mapper::should_send_context_pack(&gate) {
+            log_llm_event(
+                "agent.photon_context_pack.skipped",
+                serde_json::json!({
+                    "session_id": self.session_store.session_id(),
+                    "turn_index": self.current_turn_index,
+                    "reason": "canary_gate",
+                }),
+            );
+            return;
+        }
+
         let t0 = std::time::Instant::now();
         let req = crate::photon::schema::ContextPackRequest(serde_json::json!({
             "session_id": self.session_store.session_id(),
@@ -2230,21 +2265,22 @@ impl Agent {
         let duration_ms = t0.elapsed().as_millis();
         let failed = result.is_none();
         let mut truncated = false;
-        if !self.config.photon_shadow_mode
-            && let Some(resp) = result
-        {
-            use crate::session::feedback::mask_secrets;
-            let masked_raw = mask_secrets(&resp.0.to_string());
-            let (masked, trunc) = truncate_photon_context_pack(masked_raw);
-            truncated = trunc;
-            self.photon_context_pack_response = Some(masked);
+
+        if let Some(resp) = result {
+            // Issue #557: renderer replaces raw mask_secrets+truncate.
+            if let Some(rendered) = crate::photon::prompt::render_context_pack(&resp) {
+                let (truncated_rendered, trunc) = truncate_photon_context_pack(rendered);
+                truncated = trunc;
+                self.photon_context_pack_response = Some(truncated_rendered);
+            }
+            // else: no valid items after filtering → response stays None
         }
         log_llm_event(
             "agent.photon_context_pack.completed",
             serde_json::json!({
                 "session_id": self.session_store.session_id(),
                 "turn_index": self.current_turn_index,
-                "shadow_mode": self.config.photon_shadow_mode,
+                "shadow_mode": false,
                 "failed": failed,
                 "truncated": truncated,
                 "injected_bytes": self.photon_context_pack_response.as_deref().map(|s| s.len()).unwrap_or(0),
