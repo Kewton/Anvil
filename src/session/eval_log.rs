@@ -29,6 +29,9 @@ pub const MAX_EVAL_FEEDBACK_EXCERPT_BYTES: usize = 8192;
 pub const MAX_EVAL_PRECAUTIONS: usize = 8;
 pub const MAX_EVAL_PRECAUTIONS_CHARS: usize = 1024;
 pub const MAX_EVAL_VERIFY_CMD_BYTES: usize = 4096;
+pub const MAX_PHOTON_EVAL_FIELD_BYTES: usize = 256;
+pub const MAX_PHOTON_EVAL_WARNINGS: usize = 8;
+pub const MAX_PHOTON_EVAL_WARNING_BYTES: usize = 512;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -51,6 +54,7 @@ pub struct EvalRecord {
     pub changed_file_classes: ChangedFileClasses,
     pub verify_commands: Vec<String>,
     pub case_retrieval_result: Option<CaseRetrievalSummary>,
+    pub photon_eval: Option<PhotonEvalSummary>,
     pub final_outcome: String,
 }
 
@@ -145,6 +149,20 @@ pub struct ChangedFileClasses {
 pub struct CaseRetrievalSummary {
     pub selected: usize,
     pub scores: Vec<crate::session::case_retrieval::CaseScoreBreakdown>,
+}
+
+/// Photon evaluate result summary (Issue #558).
+/// Defined in the session layer to keep the layer dependency
+/// session←photon, not photon←session (DR3-002).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PhotonEvalSummary {
+    pub photon_request_id: Option<String>,
+    pub context_pack_id: Option<String>,
+    pub admission_decision: Option<String>,
+    pub warnings: Vec<String>,
+    pub prompt_adopted: Option<bool>,
+    pub task_outcome: Option<String>,
+    pub retry_summary: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -242,6 +260,7 @@ pub fn build_eval_record(
     changed_file_classes: ChangedFileClasses,
     verify_commands: &[String],
     case_retrieval_result: Option<CaseRetrievalSummary>,
+    photon_eval: Option<PhotonEvalSummary>,
     final_outcome: &str,
 ) -> EvalRecord {
     // DR4-002: mask_secrets → truncate for free-text fields
@@ -273,6 +292,7 @@ pub fn build_eval_record(
         changed_file_classes,
         verify_commands,
         case_retrieval_result,
+        photon_eval,
         final_outcome: final_outcome.to_string(),
     }
 }
@@ -350,6 +370,7 @@ mod tests {
             },
             verify_commands: vec!["cargo test".to_string()],
             case_retrieval_result: None,
+            photon_eval: None,
             final_outcome: "done".to_string(),
         }
     }
@@ -376,6 +397,7 @@ mod tests {
                 setup: 0,
             },
             &["cargo test".to_string()],
+            None,
             None,
             "done",
         );
@@ -407,6 +429,7 @@ mod tests {
             },
             &[],
             None,
+            None,
             "done",
         );
         assert!(
@@ -436,6 +459,7 @@ mod tests {
                 setup: 0,
             },
             &[],
+            None,
             None,
             "done",
         );
@@ -469,6 +493,7 @@ mod tests {
                 setup: 0,
             },
             &[],
+            None,
             None,
             "done",
         );

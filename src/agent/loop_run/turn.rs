@@ -1448,6 +1448,8 @@ impl Agent {
         self.current_turn_index = self.current_turn_index.saturating_add(1);
         // Issue #556: clear per-turn photon context_pack response.
         self.photon_context_pack_response = None;
+        // Issue #558: clear context_pack_id (turn boundary).
+        self.last_context_pack_id = None;
         self.run_turn(input, stream_output, &mut monitor)
     }
 
@@ -2264,6 +2266,28 @@ impl Agent {
         let result = self.photon.as_ref().unwrap().context_pack(&req);
         let duration_ms = t0.elapsed().as_millis();
         let failed = result.is_none();
+        // Issue #558: extract context_pack_id regardless of shadow mode.
+        if let Some(ref resp) = result {
+            use crate::session::eval_log::MAX_PHOTON_EVAL_FIELD_BYTES;
+            use crate::session::feedback::mask_secrets;
+            self.last_context_pack_id = resp
+                .0
+                .get("context_pack_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    let masked = mask_secrets(s);
+                    if masked.len() <= MAX_PHOTON_EVAL_FIELD_BYTES {
+                        masked
+                    } else {
+                        let mut end = MAX_PHOTON_EVAL_FIELD_BYTES;
+                        while !masked.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        format!("{}…", &masked[..end])
+                    }
+                });
+        }
         let mut truncated = false;
 
         if let Some(resp) = result {
@@ -2301,6 +2325,15 @@ impl Agent {
         }));
         let result = self.photon.as_ref().unwrap().evaluate(&req);
         let duration_ms = t0.elapsed().as_millis();
+        // Issue #558: parse EvaluateResponse and store in last_photon_eval_summary.
+        if let Some(ref resp) = result {
+            let mut summary = crate::photon::eval::parse_evaluate_response(resp);
+            // Fallback: if the response lacks context_pack_id, use last_context_pack_id.
+            if summary.context_pack_id.is_none() {
+                summary.context_pack_id = self.last_context_pack_id.clone();
+            }
+            self.last_photon_eval_summary = Some(summary);
+        }
         log_llm_event(
             "agent.photon_evaluate.completed",
             serde_json::json!({
@@ -2439,6 +2472,8 @@ impl Agent {
         self.session.anti_pattern_retrieval_invoked_this_turn = false;
         // Issue #555: reset photon context_pack per-turn one-shot flag.
         self.session.context_pack_sent_this_turn = false;
+        // Issue #558: reset photon eval summary (consumed by build_eval_record).
+        self.last_photon_eval_summary = None;
 
         let mut tool_calls_made_this_turn = 0usize;
         let mut repo_edit_calls_made_this_turn = 0usize;
@@ -4241,6 +4276,7 @@ impl Agent {
                 changed_classes,
                 &verify_commands_collected,
                 self.last_case_retrieval_summary.take(),
+                self.last_photon_eval_summary.take(),
                 exit_reason.label(),
             );
             write_eval_record(&record);

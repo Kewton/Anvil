@@ -78,6 +78,7 @@ fn r1_build_eval_record_round_trip() {
         make_classes(),
         &["cargo build".to_string()],
         None,
+        None,
         "done",
     );
     assert_eq!(rec.schema_version, 1);
@@ -121,6 +122,7 @@ fn r2_task_secret_is_masked() {
         },
         &[],
         None,
+        None,
         "done",
     );
     assert!(
@@ -159,6 +161,7 @@ fn r3_task_truncated_within_cap() {
         },
         &[],
         None,
+        None,
         "done",
     );
     // truncated string ≤ MAX + truncation marker overhead
@@ -195,6 +198,7 @@ fn r4_precautions_capped() {
             setup: 0,
         },
         &[],
+        None,
         None,
         "done",
     );
@@ -234,6 +238,7 @@ fn r5_write_eval_record_valid_jsonl() {
         make_classes(),
         &[],
         None,
+        None,
         "done",
     );
     write_eval_record_to(&rec, &file);
@@ -271,6 +276,7 @@ fn r6_build_record_masks_secret_in_verify_command() {
             setup: 0,
         },
         &["api_key=supersecret-hunter2 cargo build".to_string()],
+        None,
         None,
         "done",
     );
@@ -346,6 +352,7 @@ fn r9_oversized_record_is_dropped() {
         },
         verify_commands: giant_cmds,
         case_retrieval_result: None,
+        photon_eval: None,
         final_outcome: "done".to_string(),
     };
 
@@ -416,6 +423,7 @@ fn r11_case_retrieval_result_serialized() {
         },
         &[],
         Some(summary),
+        None,
         "done",
     );
     assert!(rec.case_retrieval_result.is_some());

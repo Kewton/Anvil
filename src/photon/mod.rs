@@ -1,4 +1,5 @@
 pub mod client;
+pub mod eval;
 pub mod mapper;
 pub mod prompt;
 pub mod schema;
