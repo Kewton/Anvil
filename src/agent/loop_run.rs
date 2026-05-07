@@ -161,6 +161,13 @@ pub struct Agent {
     /// Set in `run_turn` pre-hook (shadow mode=false only).
     /// Cleared after `run_actor_loop` returns.
     pub(super) photon_context_pack_response: Option<String>,
+    /// Issue #558: context_pack_id extracted in `invoke_photon_context_pack`.
+    /// Extracted regardless of shadow mode. Reset in `handle_user_message`.
+    /// NOT reset in run_turn post-loop (must survive until invoke_photon_evaluate).
+    pub(super) last_context_pack_id: Option<String>,
+    /// Issue #558: photon eval summary set by `invoke_photon_evaluate`.
+    /// Consumed by `build_eval_record` via `.take()`. Reset at run_turn head.
+    pub(super) last_photon_eval_summary: Option<crate::session::eval_log::PhotonEvalSummary>,
 }
 
 #[derive(Clone)]
@@ -242,6 +249,8 @@ impl Agent {
             current_turn_index: 0,
             photon,
             photon_context_pack_response: None,
+            last_context_pack_id: None,
+            last_photon_eval_summary: None,
         }
     }
 }
