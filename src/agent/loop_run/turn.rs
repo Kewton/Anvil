@@ -2267,12 +2267,13 @@ impl Agent {
         let duration_ms = t0.elapsed().as_millis();
         let failed = result.is_none();
         // Issue #558: extract context_pack_id regardless of shadow mode.
+        // The sidecar echoes the request_id back in the response as "request_id".
         if let Some(ref resp) = result {
             use crate::session::eval_log::MAX_PHOTON_EVAL_FIELD_BYTES;
             use crate::session::feedback::mask_secrets;
             self.last_context_pack_id = resp
                 .0
-                .get("context_pack_id")
+                .get("request_id")
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
                 .map(|s| {
@@ -2319,9 +2320,34 @@ impl Agent {
             return;
         }
         let t0 = std::time::Instant::now();
+        let adoption_status = if self.config.photon_shadow_mode {
+            "shadow_not_injected"
+        } else {
+            "not_injected"
+        };
+        // Only include context_pack_event when we have a request_id; the sidecar
+        // requires context_pack_request_id: str (non-null).
+        let context_pack_event = if let Some(ref cpack_id) = self.last_context_pack_id {
+            serde_json::json!({
+                "context_pack_request_id": cpack_id,
+                "adoption_status": adoption_status,
+                "evidence_expand_requested": false,
+                "evidence_ids_expanded": [],
+                "items_adopted_count": 0,
+                "items_ignored_count": 0,
+            })
+        } else {
+            serde_json::Value::Null
+        };
         let req = crate::photon::schema::EvaluateRequest(serde_json::json!({
+            "schema_version": crate::photon::mapper::PHOTON_EVALUATE_SCHEMA_VERSION,
+            "request_id": uuid::Uuid::now_v7().to_string(),
             "session_id": self.session_store.session_id(),
-            "turn_index": self.current_turn_index,
+            "agent": {
+                "name": crate::photon::mapper::PHOTON_AGENT_NAME,
+                "version": env!("CARGO_PKG_VERSION"),
+            },
+            "context_pack_event": context_pack_event,
         }));
         let result = self.photon.as_ref().unwrap().evaluate(&req);
         let duration_ms = t0.elapsed().as_millis();
@@ -2413,21 +2439,6 @@ impl Agent {
             false,
             monitor,
         );
-
-        // [Issue #556] post-turn photon evaluate hook
-        self.photon_context_pack_response = None; // clear per-turn state
-        if self.session.mode_state.mode != ExecutionMode::Plan {
-            self.invoke_photon_evaluate();
-        } else if self.photon.is_some() {
-            log_llm_event(
-                "agent.photon_evaluate.skipped",
-                serde_json::json!({
-                    "session_id": self.session_store.session_id(),
-                    "turn_index": self.current_turn_index,
-                    "reason": "plan_mode",
-                }),
-            );
-        }
 
         result
     }
@@ -4194,6 +4205,23 @@ impl Agent {
         // sidecar / LLM calls.
         self.maybe_extract_anti_pattern();
 
+        // [Issue #556] post-loop photon evaluate hook — must run before
+        // build_eval_record so last_photon_eval_summary is populated.
+        // Clear per-turn context_pack_response here (no longer needed).
+        self.photon_context_pack_response = None;
+        if self.session.mode_state.mode != ExecutionMode::Plan {
+            self.invoke_photon_evaluate();
+        } else if self.photon.is_some() {
+            log_llm_event(
+                "agent.photon_evaluate.skipped",
+                serde_json::json!({
+                    "session_id": self.session_store.session_id(),
+                    "turn_index": self.current_turn_index,
+                    "reason": "plan_mode",
+                }),
+            );
+        }
+
         // Issue #471: write structured eval log record (turn-level snapshot).
         {
             use crate::session::eval_log::{
@@ -5236,7 +5264,14 @@ impl Agent {
                             selected_precaution_ids: &selected_precaution_ids,
                         };
                         let req = crate::photon::mapper::build_context_pack_request(&inputs);
+                        // Capture request_id for evaluate tracking (shadow mode path).
+                        let rid = req.0["request_id"].as_str().map(|s| s.to_string());
                         let _ = photon.context_pack(&req);
+                        // Set last_context_pack_id only if not already set by
+                        // invoke_photon_context_pack (non-shadow path takes priority).
+                        if self.last_context_pack_id.is_none() {
+                            self.last_context_pack_id = rid;
+                        }
                     }
                     self.session.context_pack_sent_this_turn = true;
                 }

@@ -6,7 +6,9 @@ use crate::logging::mask_payload_inplace;
 use crate::photon::schema::ContextPackRequest;
 use crate::session::feedback::mask_secrets;
 
-pub const PHOTON_CONTEXT_PACK_SCHEMA_VERSION: u8 = 1;
+pub const PHOTON_CONTEXT_PACK_SCHEMA_VERSION: &str = "action-memory.v0.2";
+pub const PHOTON_EVALUATE_SCHEMA_VERSION: &str = "action-memory.v0.2";
+pub const PHOTON_AGENT_NAME: &str = "anvil";
 /// Manual sync with store.rs set_active_task literal 240.
 pub const MAX_CONTEXT_PACK_TASK_BYTES: usize = 240;
 pub const MAX_CONTEXT_PACK_WORKING_MEMORY_BYTES: usize = 4096;
@@ -100,23 +102,22 @@ fn normalize_tool_name(raw: &str) -> String {
 }
 
 pub fn build_context_pack_request(inputs: &ContextPackInputs<'_>) -> ContextPackRequest {
-    let task = inputs.task.map(|t| {
+    let task_text = inputs.task.map(|t| {
         let masked = mask_secrets(t);
         truncate_to_bytes(&masked, MAX_CONTEXT_PACK_TASK_BYTES).to_string()
     });
 
-    let repo_path = inputs
+    let repo_root = inputs
         .repo_path
         .canonicalize()
         .unwrap_or_else(|_| inputs.repo_path.to_path_buf())
         .to_string_lossy()
         .into_owned();
-    let repo_path = mask_secrets(&repo_path);
-
-    let working_memory = inputs.working_memory_text.map(|w| {
-        let masked = mask_secrets(w);
-        truncate_to_bytes(&masked, MAX_CONTEXT_PACK_WORKING_MEMORY_BYTES).to_string()
-    });
+    let repo_root = mask_secrets(&repo_root);
+    let repo_name = inputs
+        .repo_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned());
 
     let touched_files: Vec<String> = inputs
         .touched_files
@@ -145,14 +146,30 @@ pub fn build_context_pack_request(inputs: &ContextPackInputs<'_>) -> ContextPack
         })
         .collect();
 
+    let request_id = uuid::Uuid::now_v7().to_string();
+
     let mut value = serde_json::json!({
         "schema_version": PHOTON_CONTEXT_PACK_SCHEMA_VERSION,
-        "task": task,
-        "repo_path": repo_path,
-        "branch": inputs.branch,
-        "commit": inputs.commit,
-        "working_memory": working_memory,
-        "touched_files": touched_files,
+        "request_id": request_id,
+        "agent": {
+            "name": PHOTON_AGENT_NAME,
+            "version": env!("CARGO_PKG_VERSION"),
+        },
+        "repo": {
+            "root": repo_root,
+            "name": repo_name,
+            "branch": inputs.branch,
+            "commit": inputs.commit,
+        },
+        "task": {
+            "user_request": task_text,
+            "mode": "act",
+        },
+        "working_memory": {
+            "active_task": task_text,
+            "touched_files": touched_files,
+        },
+        // Additional Anvil-specific fields for extended context
         "recent_tool_summary": recent_tools,
         "selected_cases": inputs.selected_case_ids,
         "selected_anti_patterns": inputs.selected_anti_pattern_ids,

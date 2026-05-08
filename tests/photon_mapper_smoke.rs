@@ -2,9 +2,8 @@ use std::path::Path;
 
 use anvil::photon::mapper::{
     ContextPackInputs, MAX_CONTEXT_PACK_TOOL_ARG_BYTES, MAX_CONTEXT_PACK_TOOL_NAME_BYTES,
-    MAX_CONTEXT_PACK_WORKING_MEMORY_BYTES, PHOTON_CONTEXT_PACK_SCHEMA_VERSION, PhotonGateInputs,
-    RecentToolCall, build_context_pack_request, deterministic_canary_hash,
-    should_send_context_pack,
+    PHOTON_CONTEXT_PACK_SCHEMA_VERSION, PhotonGateInputs, RecentToolCall,
+    build_context_pack_request, deterministic_canary_hash, should_send_context_pack,
 };
 
 fn make_gate(photon_present: bool, shadow: bool, canary: u16) -> PhotonGateInputs<'static> {
@@ -59,26 +58,26 @@ fn t1_all_fields_mapped() {
     };
     let req = build_context_pack_request(&inputs);
     let v = &req.0;
-    assert_eq!(v["task"], "Fix login bug");
-    assert_eq!(v["branch"], "main");
-    assert_eq!(v["commit"], "deadbeef");
-    assert!(!v["repo_path"].as_str().unwrap().is_empty());
-    assert_eq!(v["working_memory"], "auth module");
-    assert_eq!(v["touched_files"][0], "src/lib.rs");
+    assert_eq!(v["task"]["user_request"], "Fix login bug");
+    assert_eq!(v["repo"]["branch"], "main");
+    assert_eq!(v["repo"]["commit"], "deadbeef");
+    assert!(!v["repo"]["root"].as_str().unwrap().is_empty());
+    assert_eq!(v["working_memory"]["active_task"], "Fix login bug");
+    assert_eq!(v["working_memory"]["touched_files"][0], "src/lib.rs");
     assert_eq!(v["recent_tool_summary"][0]["name"], "Read");
     assert_eq!(v["selected_cases"][0], "case_abc");
     assert_eq!(v["selected_anti_patterns"][0], "anti_xyz");
     assert_eq!(v["selected_precautions"][0], "prec_123");
 }
 
-// T2: schema_version = 数値 1
+// T2: schema_version = "action-memory.v0.2"
 #[test]
-fn t2_schema_version_is_1() {
+fn t2_schema_version_is_v02() {
     let repo = tempfile::TempDir::new().unwrap();
     let req = build_context_pack_request(&default_inputs(repo.path()));
     assert_eq!(
         req.0["schema_version"],
-        serde_json::Value::Number(serde_json::Number::from(PHOTON_CONTEXT_PACK_SCHEMA_VERSION))
+        serde_json::Value::String(PHOTON_CONTEXT_PACK_SCHEMA_VERSION.to_string())
     );
 }
 
@@ -109,7 +108,7 @@ fn t4_secret_masking_task() {
         selected_precaution_ids: &[],
     };
     let req = build_context_pack_request(&inputs);
-    let task_val = req.0["task"].as_str().unwrap();
+    let task_val = req.0["task"]["user_request"].as_str().unwrap();
     assert!(
         !task_val.contains("ghp_AAAAAAAABBBBBBBBCCCCCCCCDDDDDDDDEEEE"),
         "raw token should be masked, got: {task_val}"
@@ -138,7 +137,7 @@ fn t5_touched_files_workspace_relative() {
         selected_precaution_ids: &[],
     };
     let req = build_context_pack_request(&inputs);
-    let arr = req.0["touched_files"].as_array().unwrap();
+    let arr = req.0["working_memory"]["touched_files"].as_array().unwrap();
     assert_eq!(arr.len(), 2);
     assert_eq!(arr[0], "src/main.rs");
     assert_eq!(arr[1], "tests/foo_test.rs");
@@ -193,17 +192,16 @@ fn t10b_canary_different_inputs_differ() {
     );
 }
 
-// T11: working_memory 4096 bytes cap truncate
+// T11: working_memory は active_task と touched_files を持つオブジェクト
 #[test]
-fn t11_working_memory_cap_truncated() {
+fn t11_working_memory_is_structured_object() {
     let repo = tempfile::TempDir::new().unwrap();
-    let long_mem = "x".repeat(MAX_CONTEXT_PACK_WORKING_MEMORY_BYTES + 100);
     let inputs = ContextPackInputs {
-        task: None,
+        task: Some("test task"),
         repo_path: repo.path(),
         branch: None,
         commit: None,
-        working_memory_text: Some(&long_mem),
+        working_memory_text: None,
         touched_files: &[],
         recent_tool_summary: &[],
         selected_case_ids: &[],
@@ -211,13 +209,11 @@ fn t11_working_memory_cap_truncated() {
         selected_precaution_ids: &[],
     };
     let req = build_context_pack_request(&inputs);
-    let wm = req.0["working_memory"].as_str().unwrap();
-    assert!(
-        wm.len() <= MAX_CONTEXT_PACK_WORKING_MEMORY_BYTES,
-        "expected <= {} bytes, got {}",
-        MAX_CONTEXT_PACK_WORKING_MEMORY_BYTES,
-        wm.len()
-    );
+    let wm = req.0["working_memory"].as_object().unwrap();
+    assert!(wm.contains_key("active_task"), "working_memory must have active_task");
+    assert!(wm.contains_key("touched_files"), "working_memory must have touched_files");
+    assert_eq!(wm["active_task"], "test task");
+    assert!(wm["touched_files"].as_array().unwrap().is_empty());
 }
 
 // T12: recent_tool_summary: tool output 非包含、args 256 bytes cap
@@ -253,17 +249,26 @@ fn t12_recent_tool_summary_args_capped() {
     );
 }
 
-// T13: per-turn one-shot — build_context_pack_request itself is pure (no state),
-// so we verify the gate flag pattern by confirming the struct is stateless.
+// T13: リクエストに必須フィールドが揃っている（request_id は呼び出しごとに異なる UUID）
 #[test]
-fn t13_build_request_is_pure_same_inputs_same_output() {
+fn t13_build_request_has_required_schema_fields() {
     let repo = tempfile::TempDir::new().unwrap();
     let inputs = default_inputs(repo.path());
-    let req1 = build_context_pack_request(&inputs);
+    let req = build_context_pack_request(&inputs);
+    let v = &req.0;
+    assert!(v["schema_version"].is_string(), "schema_version must be a string");
+    assert!(v["request_id"].is_string(), "request_id must be a string");
+    assert!(!v["request_id"].as_str().unwrap().is_empty(), "request_id must not be empty");
+    assert!(v["agent"].is_object(), "agent must be an object");
+    assert_eq!(v["agent"]["name"], "anvil");
+    assert!(v["repo"].is_object(), "repo must be an object");
+    assert!(v["task"].is_object(), "task must be an object");
+    assert!(v["working_memory"].is_object(), "working_memory must be an object");
+    // Different calls produce different request_ids
     let req2 = build_context_pack_request(&inputs);
-    assert_eq!(
-        req1.0, req2.0,
-        "build_context_pack_request must be deterministic"
+    assert_ne!(
+        req.0["request_id"], req2.0["request_id"],
+        "each call must produce a unique request_id"
     );
 }
 
@@ -316,7 +321,7 @@ fn t15_dotdot_components_dropped() {
         selected_precaution_ids: &[],
     };
     let req = build_context_pack_request(&inputs);
-    let arr = req.0["touched_files"].as_array().unwrap();
+    let arr = req.0["working_memory"]["touched_files"].as_array().unwrap();
     let paths: Vec<&str> = arr.iter().map(|v| v.as_str().unwrap()).collect();
     assert!(
         paths.iter().all(|p| !p.contains("..")),
