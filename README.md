@@ -20,7 +20,7 @@ Ollama 直結の local-first コーディングエージェント。multi-provid
 | --- | --- |
 | Stable | Ollama 直結、Plan / Act、built-in tools、session resume、approval、XML fallback、workspace path guard、localhost host validation |
 | Stable | `sessions list/show/clean`、structured logs、`ANVIL.md` project instruction、WorkMode policy、AutoTest candidate selection |
-| Experimental | Tester Skill、Temporary Test Workspace、Case Memory、AntiPattern、RepoGraph、Verifier/Reminder skill、dataset export |
+| Experimental | Tester Skill、Temporary Test Workspace、Case Memory、AntiPattern、RepoGraph、Verifier/Reminder skill、dataset export、Photon サイドカー連携（context_pack / evaluate）（詳細: [docs/photon-ops.md](docs/photon-ops.md)） |
 | Not implemented | 実 MCP transport、tool-enabled subagent delegation、重い full-screen TUI |
 | Known limitations | live Ollama E2E はモデル・量子化・ローカル toolchain に揺らぐ。Bash は完全 sandbox ではなくユーザー権限で実行される |
 
