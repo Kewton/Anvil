@@ -55,25 +55,29 @@ pub struct EvalRecord {
     pub verify_commands: Vec<String>,
     pub case_retrieval_result: Option<CaseRetrievalSummary>,
     pub photon_eval: Option<PhotonEvalSummary>,
+    /// Photon canary value (0-1000) recorded at turn time.
+    /// 0 = disabled, 1000 = full traffic.
+    #[serde(default)]
+    pub photon_canary: u16,
     pub final_outcome: String,
 }
 
 /// Summary of a single LLM-requested tool call (no result).
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ToolCallSummary {
     pub name: String,
     pub args_summary: String,
 }
 
 /// Minimal public face of a `FeedbackFrame`.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FeedbackFrameSummary {
     pub kind: String,
     pub excerpt: String,
 }
 
 /// Type-safe summary of `AnvilScore`'s 12 public fields (DR1-002).
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AnvilScoreSummary {
     pub build_passed: Option<bool>,
     pub tests_passed: Option<bool>,
@@ -110,7 +114,7 @@ impl From<&AnvilScore> for AnvilScoreSummary {
 
 /// Eval-specific 4-field precaution snapshot (DR1-003 / DR2-001).
 /// No `kind` field — `Precaution` has no such field.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EvalPrecautionSnapshot {
     pub id: String,
     pub source: String,
@@ -136,7 +140,7 @@ impl From<&Precaution> for EvalPrecautionSnapshot {
 }
 
 /// Classification of changed files by type.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ChangedFileClasses {
     pub test: usize,
     #[serde(rename = "impl")]
@@ -145,7 +149,7 @@ pub struct ChangedFileClasses {
 }
 
 /// Summary of a case retrieval result (DR1-004: reuses `CaseScoreBreakdown`).
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CaseRetrievalSummary {
     pub selected: usize,
     pub scores: Vec<crate::session::case_retrieval::CaseScoreBreakdown>,
@@ -154,7 +158,7 @@ pub struct CaseRetrievalSummary {
 /// Photon evaluate result summary (Issue #558).
 /// Defined in the session layer to keep the layer dependency
 /// session←photon, not photon←session (DR3-002).
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PhotonEvalSummary {
     pub photon_request_id: Option<String>,
     pub context_pack_id: Option<String>,
@@ -293,6 +297,7 @@ pub fn build_eval_record(
         verify_commands,
         case_retrieval_result,
         photon_eval,
+        photon_canary: 0,
         final_outcome: final_outcome.to_string(),
     }
 }
@@ -371,6 +376,7 @@ mod tests {
             verify_commands: vec!["cargo test".to_string()],
             case_retrieval_result: None,
             photon_eval: None,
+            photon_canary: 0,
             final_outcome: "done".to_string(),
         }
     }

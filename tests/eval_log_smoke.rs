@@ -353,6 +353,7 @@ fn r9_oversized_record_is_dropped() {
         verify_commands: giant_cmds,
         case_retrieval_result: None,
         photon_eval: None,
+        photon_canary: 0,
         final_outcome: "done".to_string(),
     };
 

@@ -12,11 +12,16 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::cli::{SessionsAction, TmpTestsAction};
+use crate::config::resolve_photon_rollout_min_eval_turns;
 use crate::modes::plan_act::ExecutionMode;
 use crate::session::compact::is_compact_summary;
 use crate::session::discovery::{SessionDirEntry, iter_session_dirs};
 use crate::session::export::{
     ExportConfig, ExportFilter, ExportOutput, ExportScope, MAX_EXPORT_JSONL_BYTES, run_export,
+};
+use crate::session::rollout_policy::{
+    ConditionStatus, RolloutPolicyConfig, collect_rollout_stats_from_state,
+    evaluate_rollout_conditions,
 };
 use crate::session::store::{ConversationMessage, SessionSnapshot};
 use crate::session::tmp_tests;
@@ -488,7 +493,52 @@ pub fn dispatch(
             };
             run_export(&config).map(|_| ())
         }
+        SessionsAction::PhotonRolloutCheck {} => {
+            run_photon_rollout_check(state_root, workspace_root)
+        }
     }
+}
+
+pub fn run_photon_rollout_check(state_root: &Path, workspace_root: &Path) -> Result<(), String> {
+    let mut warnings = Vec::new();
+    let min_turns = resolve_photon_rollout_min_eval_turns(workspace_root, &mut warnings);
+    for warning in &warnings {
+        eprintln!("warning: {warning}");
+    }
+
+    let stats = collect_rollout_stats_from_state(state_root)?;
+    let status = evaluate_rollout_conditions(
+        &stats,
+        RolloutPolicyConfig {
+            min_eval_turns: min_turns,
+        },
+    );
+
+    for cond in &status.conditions {
+        let mark = match &cond.status {
+            ConditionStatus::Ok => "OK",
+            ConditionStatus::Ng(_) => "NG",
+            ConditionStatus::ManualRequired(_) => "ManualRequired",
+        };
+        println!("[{mark}] Condition {}: {}", cond.id, cond.label);
+        match &cond.status {
+            ConditionStatus::Ng(reason) => println!("    reason: {reason}"),
+            ConditionStatus::ManualRequired(reason) => println!("    manual: {reason}"),
+            ConditionStatus::Ok => {}
+        }
+        if let Some(note) = &cond.note {
+            println!("    note: {note}");
+        }
+    }
+
+    if status.ready_for_canary {
+        println!("\nRollout READY (shadow_mode=false, photon_canary>0 に設定可能)");
+    } else if status.manual_required {
+        println!("\nRollout BLOCKED: manual verification required before canary");
+    } else {
+        println!("\nRollout NOT READY (移行条件を満たしていません)");
+    }
+    Ok(())
 }
 
 pub fn run_list(state_root: &Path, current_ws: &str, all: bool, json: bool) -> Result<(), String> {

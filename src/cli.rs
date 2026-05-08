@@ -133,6 +133,8 @@ pub enum SessionsAction {
         #[arg(long, value_name = "ID")]
         session: Option<String>,
     },
+    /// Check Photon rollout readiness conditions (Issue #561).
+    PhotonRolloutCheck {},
 }
 
 /// `anvil sessions tmp-tests <list|promote|discard>` (Issue #458).

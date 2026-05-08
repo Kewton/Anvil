@@ -4262,7 +4262,7 @@ impl Agent {
                 impl_files: stats.changed_impl_count,
                 setup: stats.changed_setup_count,
             };
-            let record = build_eval_record(
+            let mut record = build_eval_record(
                 &session_id,
                 ts_ms,
                 active_task,
@@ -4279,6 +4279,7 @@ impl Agent {
                 self.last_photon_eval_summary.take(),
                 exit_reason.label(),
             );
+            record.photon_canary = self.config.photon_canary;
             write_eval_record(&record);
         }
 

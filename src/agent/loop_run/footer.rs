@@ -1231,6 +1231,7 @@ mod tests {
             photon_shadow_mode: true,
             photon_canary: 0,
             photon_timeout_ms: 200,
+            photon_rollout_min_eval_turns: 100,
         }
     }
 
