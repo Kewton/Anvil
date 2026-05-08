@@ -13,6 +13,8 @@ use crate::safety::host_validation::validate_localhost_url;
 /// `EnvFilter` directive that silences DEBUG/TRACE noise from hyper/reqwest/rustls.
 pub const NOISY_CRATES_FILTER: &str = "hyper_util=warn,reqwest=warn,hyper=warn,rustls=warn";
 
+pub const DEFAULT_PHOTON_ROLLOUT_MIN_EVAL_TURNS: u32 = 100;
+
 /// 3-level log verbosity. The `Info < Verbose < Trace` ordering is part of the
 /// public contract (callers use comparisons like `log_level >= Verbose`) and
 /// must not be reordered.
@@ -242,6 +244,9 @@ pub struct Config {
     pub photon_shadow_mode: bool,
     pub photon_canary: u16,
     pub photon_timeout_ms: u64,
+    /// Minimum number of shadow-mode evaluate turns required before canary rollout.
+    /// Default: 100. Env: ANVIL_PHOTON_ROLLOUT_MIN_EVAL_TURNS.
+    pub photon_rollout_min_eval_turns: u32,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -270,6 +275,7 @@ pub struct PartialConfig {
     pub photon_shadow_mode: Option<bool>,
     pub photon_canary: Option<u16>,
     pub photon_timeout_ms: Option<u64>,
+    pub photon_rollout_min_eval_turns: Option<u32>,
 }
 
 impl Config {
@@ -311,6 +317,7 @@ impl Config {
             photon_shadow_mode: None,
             photon_canary: None,
             photon_timeout_ms: None,
+            photon_rollout_min_eval_turns: None,
         };
         let merged = merge_partial_configs(&[file_config, env_config, cli_config]);
         let ollama_host = validate_localhost_url(
@@ -357,6 +364,7 @@ impl Config {
             photon_shadow_mode: merged.photon_shadow_mode.unwrap_or(true),
             photon_canary: merged.photon_canary.unwrap_or(0),
             photon_timeout_ms: merged.photon_timeout_ms.unwrap_or(200),
+            photon_rollout_min_eval_turns: merged.photon_rollout_min_eval_turns.unwrap_or(100),
         };
         Ok((config, warnings))
     }
@@ -428,6 +436,9 @@ pub fn merge_partial_configs(configs: &[PartialConfig]) -> PartialConfig {
         if config.photon_timeout_ms.is_some() {
             merged.photon_timeout_ms = config.photon_timeout_ms;
         }
+        if config.photon_rollout_min_eval_turns.is_some() {
+            merged.photon_rollout_min_eval_turns = config.photon_rollout_min_eval_turns;
+        }
     }
     merged
 }
@@ -491,6 +502,9 @@ pub fn load_config_file(path: &Path, warnings: &mut Vec<String>) -> Result<Parti
         photon_timeout_ms: map
             .get("photon_timeout_ms")
             .and_then(|v| parse_photon_timeout_ms(v, warnings)),
+        photon_rollout_min_eval_turns: map
+            .get("photon_rollout_min_eval_turns")
+            .and_then(|v| parse_photon_rollout_min_eval_turns(v, warnings)),
     })
 }
 
@@ -560,6 +574,9 @@ pub fn load_env_config(warnings: &mut Vec<String>) -> PartialConfig {
         photon_timeout_ms: env::var("ANVIL_PHOTON_TIMEOUT_MS")
             .ok()
             .and_then(|v| parse_photon_timeout_ms(&v, warnings)),
+        photon_rollout_min_eval_turns: env::var("ANVIL_PHOTON_ROLLOUT_MIN_EVAL_TURNS")
+            .ok()
+            .and_then(|v| parse_photon_rollout_min_eval_turns(&v, warnings)),
     }
 }
 
@@ -581,6 +598,18 @@ fn parse_photon_timeout_ms(s: &str, warnings: &mut Vec<String>) -> Option<u64> {
         _ => {
             warnings.push(format!(
                 "invalid ANVIL_PHOTON_TIMEOUT_MS={s}, must be 1-60000, using default (200)"
+            ));
+            None
+        }
+    }
+}
+
+fn parse_photon_rollout_min_eval_turns(s: &str, warnings: &mut Vec<String>) -> Option<u32> {
+    match s.trim().parse::<u32>() {
+        Ok(n) if (1..=10_000).contains(&n) => Some(n),
+        _ => {
+            warnings.push(format!(
+                "invalid photon_rollout_min_eval_turns={s}, must be 1-10000, using default ({DEFAULT_PHOTON_ROLLOUT_MIN_EVAL_TURNS})"
             ));
             None
         }
@@ -620,4 +649,21 @@ pub fn parse_bool(value: &str) -> Option<bool> {
         "0" | "false" | "no" | "off" => Some(false),
         _ => None,
     }
+}
+
+/// Resolve `photon_rollout_min_eval_turns` without running full `Config::load`.
+/// Priority: env > .anvil/config > default (100).
+pub fn resolve_photon_rollout_min_eval_turns(
+    workspace_root: &Path,
+    warnings: &mut Vec<String>,
+) -> u32 {
+    let file_val = load_config_file(&workspace_root.join(".anvil").join("config"), warnings)
+        .unwrap_or_default()
+        .photon_rollout_min_eval_turns;
+    let env_val = env::var("ANVIL_PHOTON_ROLLOUT_MIN_EVAL_TURNS")
+        .ok()
+        .and_then(|v| parse_photon_rollout_min_eval_turns(&v, warnings));
+    env_val
+        .or(file_val)
+        .unwrap_or(DEFAULT_PHOTON_ROLLOUT_MIN_EVAL_TURNS)
 }

@@ -59,7 +59,7 @@ pub(crate) const ENV_DRY_RUN: &str = "ANVIL_CASE_RETRIEVAL_DRY_RUN";
 
 /// Per-case score breakdown. Logged inside `selected_reasons` array
 /// (DR2-010: structured object array, not free-form string).
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CaseScoreBreakdown {
     pub case_id: String,
     pub task: f32,
