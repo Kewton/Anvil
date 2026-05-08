@@ -6,7 +6,7 @@
 //! (`truncate_photon_context_pack`, `build_photon_injection_message`) exercise
 //! truncation and injection-message building entirely without I/O.
 //!
-//! Test matrix (T1-T8 per work plan):
+//! Test matrix (T1-T11 per work plan):
 //!   T1  photon_disabled          photon=None → 0 Photon HTTP calls
 //!   T2  shadow_mode_no_injection  shadow=true → injection message is None
 //!   T3  shadow_mode_false_injects shadow=false → message contains [Photon External Memory]
@@ -15,6 +15,9 @@
 //!   T6  stale_clear               reset field → no stale injection across turns
 //!   T7  truncation                > 8192 bytes → "[truncated]" suffix
 //!   T8  prompt_injection_boundary injection wrapped with untrusted-memory header
+//!   T9  canary_zero_no_http       canary=0, shadow=false → 0 /v1/context/pack calls
+//!   T10 shadow_mode_no_http       shadow=true → invoke_photon_context_pack skips fetch
+//!   T11 live_mode_one_http_call   shadow=false, canary=1000 → exactly 1 /v1/context/pack call (LI-2)
 
 use anvil::agent::loop_run::{
     MAX_PHOTON_CONTEXT_PACK_PROMPT_BYTES, build_photon_injection_message,
@@ -313,14 +316,17 @@ fn t9_canary_zero_no_http_calls() {
     // Ollama will fail (port 19999 unused). Only the Photon hit count matters.
     let _ = agent.process_line("hello", false);
 
-    pack_mock.assert(); // assert 0 calls
+    pack_mock.assert(); // assert 0 calls (T9: canary=0 gate)
 }
 
 // T10 ------------------------------------------------------------------------
 
-/// Issue #557: shadow_mode=true → invoke_photon_context_pack must NOT call
-/// /v1/context/pack (shadow mode gate fires before the HTTP fetch).
-/// Tests the second early-return path distinct from T9 (canary=0 gate).
+/// Issue #557: shadow_mode=true, canary=1000 → invoke_photon_context_pack (path a)
+/// must NOT call /v1/context/pack (shadow mode gate fires before the HTTP fetch
+/// in path a). Tests the second early-return path distinct from T9 (canary=0 gate).
+/// Note: path (b) in build_request_messages may attempt HTTP for memory logging but
+/// fails silently because photon_timeout_ms is left at default (0ms → immediate
+/// fail-open), so the mockito counter stays at 0.
 #[test]
 fn t10_shadow_mode_no_http_calls() {
     use anvil::agent::Agent;
@@ -373,5 +379,74 @@ fn t10_shadow_mode_no_http_calls() {
     // Ollama will fail (port 19999 unused). Only the Photon hit count matters.
     let _ = agent.process_line("hello", false);
 
-    pack_mock.assert(); // assert 0 calls
+    pack_mock.assert(); // assert 0 calls (T10: shadow_mode gate in path a)
+}
+
+// T11 ------------------------------------------------------------------------
+
+/// LI-2: live mode (shadow=false, canary=1000) → invoke_photon_context_pack (path a)
+/// makes exactly 1 HTTP call to /v1/context/pack; path (b) in build_request_messages
+/// sees context_pack_sent_this_turn=true and skips to prevent a double call.
+///
+/// Uses photon_timeout_ms=5000 so the mockito server is reachable.
+/// Ollama still fails (port 19999) — we only care about the Photon call count.
+#[test]
+fn t11_live_mode_exactly_one_http_call() {
+    use anvil::agent::Agent;
+    use anvil::agent::loop_run::FooterHandle;
+    use anvil::config::Config;
+    use anvil::model_registry::RuntimeModels;
+    use anvil::ollama::client::OllamaClient;
+    use anvil::session::store::{SessionSnapshot, SessionStore};
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let state_root = dir.path().join("state");
+    std::fs::create_dir_all(state_root.join("sessions").join("test-li2-t11")).unwrap();
+
+    let mut photon_server = mockito::Server::new();
+    // Expect exactly 1 call — invoke_photon_context_pack (path a) only.
+    // Path (b) must be blocked by the one-shot context_pack_sent_this_turn flag (LI-2).
+    let pack_mock = photon_server
+        .mock("POST", "/v1/context/pack")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"items":[]}"#)
+        .expect(1)
+        .create();
+
+    let mut config = Config::default();
+    config.cwd = dir.path().to_path_buf();
+    config.photon_enabled = true;
+    config.photon_url = photon_server.url();
+    config.photon_shadow_mode = false; // live mode — injection enabled
+    config.photon_canary = 1000; // always sample
+    config.photon_timeout_ms = 5000; // real timeout so mock is reachable
+    config.requested_model = Some("test-model".to_string());
+    config.state_dir_override = Some(state_root.clone());
+    config.yes_mode = true;
+    config.max_iterations = 1;
+
+    let session = SessionSnapshot {
+        id: "test-li2-t11".to_string(),
+        workspace_key: "anvil-li2-t11".to_string(),
+        ..Default::default()
+    };
+
+    let mut agent = Agent::new(
+        config,
+        RuntimeModels {
+            main: "test-model".to_string(),
+            sidecar: None,
+        },
+        OllamaClient::new("http://127.0.0.1:19999".to_string()).unwrap(),
+        SessionStore::new(&state_root, "test-li2-t11", "anvil-li2-t11"),
+        session,
+        FooterHandle::disabled(),
+    );
+
+    // Ollama will fail (port 19999 unused). Only the Photon call count matters.
+    let _ = agent.process_line("hello", false);
+
+    pack_mock.assert(); // assert exactly 1 call (not 2) — LI-2 one-shot gate works
 }

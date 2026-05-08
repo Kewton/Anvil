@@ -3,7 +3,7 @@
 //! Tests the `render_context_pack` public API and the module-level constants.
 //! All tests are Ollama-free pure-function tests.
 //!
-//! Test matrix (P1-P14 per design policy):
+//! Test matrix (P1-P18 per design policy):
 //!   P1   valid summary item         → Some(string)
 //!   P2   only log-kind items        → None
 //!   P3   prompt injection in summary (case-insensitive) → item excluded
@@ -19,6 +19,10 @@
 //!   P12  boundary/role spoofing patterns                → item excluded
 //!   P13  CR/LF newline + role spoof in summary          → normalised → excluded
 //!   P14  secret-like key field with raw secret value    → raw secret absent
+//!   P15  v0.2 action_summary kind + text field         → Some(string) (LI-3)
+//!   P16  v0.2 text kind + text field                   → Some(string) (LI-3)
+//!   P17  text field takes priority over summary field   → text field used (LI-3)
+//!   P18  non-summary kind with text field is rejected   → None
 
 use anvil::photon::{ContextPackResponse, render_context_pack};
 
@@ -312,4 +316,81 @@ fn p14_secret_like_key_in_item_object_not_leaked() {
         );
     }
     // None is acceptable (item masked/excluded entirely)
+}
+
+// P15 ------------------------------------------------------------------------
+
+/// LI-3: v0.2 item with kind=action_summary and text field is accepted.
+#[test]
+fn p15_action_summary_kind_with_text_field_accepted() {
+    let resp = items_response(serde_json::json!([
+        { "kind": "action_summary", "text": "ran cargo test, 3 passed" }
+    ]));
+    let result = render_context_pack(&resp);
+    assert!(
+        result.is_some(),
+        "kind=action_summary must be accepted as a summary kind (LI-3)"
+    );
+    assert!(
+        result.unwrap().contains("ran cargo test"),
+        "text field content must appear in output"
+    );
+}
+
+// P16 ------------------------------------------------------------------------
+
+/// LI-3: v0.2 item with kind=text and text field is accepted.
+#[test]
+fn p16_text_kind_with_text_field_accepted() {
+    let resp = items_response(serde_json::json!([
+        { "kind": "text", "text": "project codename is heliograph" }
+    ]));
+    let result = render_context_pack(&resp);
+    assert!(
+        result.is_some(),
+        "kind=text must be accepted as a summary kind (LI-3)"
+    );
+    assert!(
+        result.unwrap().contains("heliograph"),
+        "text field content must appear in output"
+    );
+}
+
+// P17 ------------------------------------------------------------------------
+
+/// LI-3: when both text and summary fields are present, text takes priority.
+#[test]
+fn p17_text_field_priority_over_summary_field() {
+    let resp = items_response(serde_json::json!([
+        {
+            "kind": "action_summary",
+            "text": "v0.2-text-value",
+            "summary": "legacy-summary-value"
+        }
+    ]));
+    let result = render_context_pack(&resp).unwrap();
+    assert!(
+        result.contains("v0.2-text-value"),
+        "text field must take priority and appear in output"
+    );
+    assert!(
+        !result.contains("legacy-summary-value"),
+        "summary field must not appear when text field is present"
+    );
+}
+
+// P18 ------------------------------------------------------------------------
+
+/// A non-summary kind (e.g. log) with a text field is still rejected.
+#[test]
+fn p18_non_summary_kind_with_text_field_rejected() {
+    let resp = items_response(serde_json::json!([
+        { "kind": "log", "text": "some log output" },
+        { "kind": "raw", "text": "raw data" },
+    ]));
+    let result = render_context_pack(&resp);
+    assert!(
+        result.is_none(),
+        "non-summary kind must be rejected even when text field is present"
+    );
 }

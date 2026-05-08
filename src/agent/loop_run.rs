@@ -168,6 +168,11 @@ pub struct Agent {
     /// Issue #558: photon eval summary set by `invoke_photon_evaluate`.
     /// Consumed by `build_eval_record` via `.take()`. Reset at run_turn head.
     pub(super) last_photon_eval_summary: Option<crate::session::eval_log::PhotonEvalSummary>,
+    /// Live injection: number of context_pack items actually rendered into the
+    /// prompt this turn. Set in `invoke_photon_context_pack` after rendering.
+    /// Used by `invoke_photon_evaluate` for `adoption_status`/`items_adopted_count`.
+    /// Reset at run_turn head.
+    pub(super) last_photon_adopted_items: usize,
 }
 
 #[derive(Clone)]
@@ -251,6 +256,7 @@ impl Agent {
             photon_context_pack_response: None,
             last_context_pack_id: None,
             last_photon_eval_summary: None,
+            last_photon_adopted_items: 0,
         }
     }
 }

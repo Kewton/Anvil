@@ -102,9 +102,13 @@ pub(crate) fn parse_items(value: &serde_json::Value) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// Returns `true` when `item["kind"] == "summary"`.
+/// Returns `true` when `item["kind"]` is a valid summary kind.
+/// Accepts legacy `"summary"` as well as v0.2 `"action_summary"` and `"text"`.
 pub(crate) fn is_summary_kind(item: &serde_json::Value) -> bool {
-    item.get("kind").and_then(|v| v.as_str()) == Some("summary")
+    matches!(
+        item.get("kind").and_then(|v| v.as_str()),
+        Some("summary") | Some("action_summary") | Some("text")
+    )
 }
 
 /// Apply `mask_payload_inplace` to the whole JSON object (Value level masking).
@@ -113,10 +117,14 @@ pub(crate) fn mask_item(mut item: serde_json::Value) -> serde_json::Value {
     item
 }
 
-/// Extract the `summary` string, applying `mask_secrets` to the text.
-/// Returns `None` when the field is absent or not a string.
+/// Extract the summary text, applying `mask_secrets` to the result.
+/// Checks `"text"` first (v0.2 field), then falls back to `"summary"` (legacy).
+/// Returns `None` when neither field is present or not a string.
 pub(crate) fn extract_summary_text(item: &serde_json::Value) -> Option<String> {
-    let s = item.get("summary")?.as_str()?;
+    let s = item
+        .get("text")
+        .or_else(|| item.get("summary"))
+        .and_then(|v| v.as_str())?;
     Some(mask_secrets(s))
 }
 
@@ -198,11 +206,12 @@ pub(crate) fn build_section(items: &[String]) -> Option<String> {
 // Private helpers
 // ---------------------------------------------------------------------------
 
-/// Project an item JSON object to expected fields only (kind/summary/source).
+/// Project an item JSON object to expected fields only (kind/summary/text/source).
+/// Handles both legacy (`summary` field) and v0.2 (`text` field) response shapes.
 /// Unknown fields are discarded to limit recursive mask surface area (DR4-002).
 fn project_item_fields(item: &serde_json::Value) -> serde_json::Value {
     let mut projected = serde_json::Map::new();
-    for key in &["kind", "summary", "source"] {
+    for key in &["kind", "summary", "text", "source"] {
         if let Some(v) = item.get(key) {
             projected.insert(key.to_string(), v.clone());
         }

@@ -210,8 +210,14 @@ fn t11_working_memory_is_structured_object() {
     };
     let req = build_context_pack_request(&inputs);
     let wm = req.0["working_memory"].as_object().unwrap();
-    assert!(wm.contains_key("active_task"), "working_memory must have active_task");
-    assert!(wm.contains_key("touched_files"), "working_memory must have touched_files");
+    assert!(
+        wm.contains_key("active_task"),
+        "working_memory must have active_task"
+    );
+    assert!(
+        wm.contains_key("touched_files"),
+        "working_memory must have touched_files"
+    );
     assert_eq!(wm["active_task"], "test task");
     assert!(wm["touched_files"].as_array().unwrap().is_empty());
 }
@@ -256,14 +262,23 @@ fn t13_build_request_has_required_schema_fields() {
     let inputs = default_inputs(repo.path());
     let req = build_context_pack_request(&inputs);
     let v = &req.0;
-    assert!(v["schema_version"].is_string(), "schema_version must be a string");
+    assert!(
+        v["schema_version"].is_string(),
+        "schema_version must be a string"
+    );
     assert!(v["request_id"].is_string(), "request_id must be a string");
-    assert!(!v["request_id"].as_str().unwrap().is_empty(), "request_id must not be empty");
+    assert!(
+        !v["request_id"].as_str().unwrap().is_empty(),
+        "request_id must not be empty"
+    );
     assert!(v["agent"].is_object(), "agent must be an object");
     assert_eq!(v["agent"]["name"], "anvil");
     assert!(v["repo"].is_object(), "repo must be an object");
     assert!(v["task"].is_object(), "task must be an object");
-    assert!(v["working_memory"].is_object(), "working_memory must be an object");
+    assert!(
+        v["working_memory"].is_object(),
+        "working_memory must be an object"
+    );
     // Different calls produce different request_ids
     let req2 = build_context_pack_request(&inputs);
     assert_ne!(

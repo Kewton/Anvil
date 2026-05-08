@@ -1450,6 +1450,13 @@ impl Agent {
         self.photon_context_pack_response = None;
         // Issue #558: clear context_pack_id (turn boundary).
         self.last_context_pack_id = None;
+        // Live injection: reset adopted item count.
+        self.last_photon_adopted_items = 0;
+        // LI-2: reset the one-shot flag here (before invoke_photon_context_pack
+        // in run_turn) so the flag set by path (a) is still true when path (b)
+        // in build_request_messages runs. Previously this reset lived in
+        // run_actor_loop which wiped it before path (b) could check it.
+        self.session.context_pack_sent_this_turn = false;
         self.run_turn(input, stream_output, &mut monitor)
     }
 
@@ -2258,20 +2265,48 @@ impl Agent {
             return;
         }
 
+        // LI-1: build full v0.2 request via the mapper (same as path-b in
+        // build_request_messages) using inputs available at pre-turn time.
+        // selected_case_ids / selected_anti_pattern_ids are not yet known here;
+        // they are included only in the shadow-mode path (b) call.
+        let working_memory_text = self.session.working_memory.format_for_prompt();
+        let selected_precaution_ids: Vec<String> = self
+            .session
+            .working_memory
+            .active_precautions
+            .iter()
+            .filter(|p| p.status == crate::session::precaution::PrecautionStatus::Active)
+            .map(|p| p.id.clone())
+            .collect();
+        let recent_tool_summary = build_recent_tool_summary(&self.session.messages);
+        let inputs = crate::photon::mapper::ContextPackInputs {
+            task: self.session.working_memory.active_task.as_deref(),
+            repo_path: &self.work_root,
+            branch: None,
+            commit: None,
+            working_memory_text: working_memory_text.as_deref(),
+            touched_files: &self.session.working_memory.touched_files,
+            recent_tool_summary: &recent_tool_summary,
+            selected_case_ids: &[],
+            selected_anti_pattern_ids: &[],
+            selected_precaution_ids: &selected_precaution_ids,
+        };
         let t0 = std::time::Instant::now();
-        let req = crate::photon::schema::ContextPackRequest(serde_json::json!({
-            "session_id": self.session_store.session_id(),
-            "turn_index": self.current_turn_index,
-        }));
+        let req = crate::photon::mapper::build_context_pack_request(&inputs);
+        // Capture request_id from the built request before sending.
+        let req_id = req.0["request_id"].as_str().map(|s| s.to_string());
         let result = self.photon.as_ref().unwrap().context_pack(&req);
         let duration_ms = t0.elapsed().as_millis();
         let failed = result.is_none();
-        // Issue #558: extract context_pack_id regardless of shadow mode.
-        // The sidecar echoes the request_id back in the response as "request_id".
+        // LI-2: mark as sent so path (b) in build_request_messages skips the
+        // HTTP call in live mode (prevents double /v1/context/pack per turn).
+        self.session.context_pack_sent_this_turn = true;
+        // Use the request_id we built (sidecar echoes it back as "request_id").
+        // Fallback: extract from response if present.
         if let Some(ref resp) = result {
             use crate::session::eval_log::MAX_PHOTON_EVAL_FIELD_BYTES;
             use crate::session::feedback::mask_secrets;
-            self.last_context_pack_id = resp
+            let from_resp = resp
                 .0
                 .get("request_id")
                 .and_then(|v| v.as_str())
@@ -2288,12 +2323,18 @@ impl Agent {
                         format!("{}…", &masked[..end])
                     }
                 });
+            self.last_context_pack_id = from_resp.or(req_id);
+        } else {
+            self.last_context_pack_id = req_id;
         }
         let mut truncated = false;
 
         if let Some(resp) = result {
             // Issue #557: renderer replaces raw mask_secrets+truncate.
             if let Some(rendered) = crate::photon::prompt::render_context_pack(&resp) {
+                // AN-6: count items actually rendered for adoption_status tracking.
+                let item_count = rendered.lines().filter(|l| l.starts_with("- ")).count();
+                self.last_photon_adopted_items = item_count;
                 let (truncated_rendered, trunc) = truncate_photon_context_pack(rendered);
                 truncated = trunc;
                 self.photon_context_pack_response = Some(truncated_rendered);
@@ -2308,6 +2349,7 @@ impl Agent {
                 "shadow_mode": false,
                 "failed": failed,
                 "truncated": truncated,
+                "items_adopted": self.last_photon_adopted_items,
                 "injected_bytes": self.photon_context_pack_response.as_deref().map(|s| s.len()).unwrap_or(0),
                 "duration_ms": duration_ms,
             }),
@@ -2320,11 +2362,16 @@ impl Agent {
             return;
         }
         let t0 = std::time::Instant::now();
+        // AN-5/AN-6: determine adoption_status and item counts from actual
+        // injection state rather than a hardcoded string.
         let adoption_status = if self.config.photon_shadow_mode {
             "shadow_not_injected"
+        } else if self.last_photon_adopted_items > 0 {
+            "injected"
         } else {
             "not_injected"
         };
+        let items_adopted_count = self.last_photon_adopted_items;
         // Only include context_pack_event when we have a request_id; the sidecar
         // requires context_pack_request_id: str (non-null).
         let context_pack_event = if let Some(ref cpack_id) = self.last_context_pack_id {
@@ -2333,7 +2380,7 @@ impl Agent {
                 "adoption_status": adoption_status,
                 "evidence_expand_requested": false,
                 "evidence_ids_expanded": [],
-                "items_adopted_count": 0,
+                "items_adopted_count": items_adopted_count,
                 "items_ignored_count": 0,
             })
         } else {
@@ -2351,12 +2398,18 @@ impl Agent {
         }));
         let result = self.photon.as_ref().unwrap().evaluate(&req);
         let duration_ms = t0.elapsed().as_millis();
-        // Issue #558: parse EvaluateResponse and store in last_photon_eval_summary.
+        // Issue #558 / AN-6: parse EvaluateResponse and store in last_photon_eval_summary.
         if let Some(ref resp) = result {
             let mut summary = crate::photon::eval::parse_evaluate_response(resp);
             // Fallback: if the response lacks context_pack_id, use last_context_pack_id.
             if summary.context_pack_id.is_none() {
                 summary.context_pack_id = self.last_context_pack_id.clone();
+            }
+            // AN-6: override prompt_adopted from actual injection state so
+            // eval.jsonl reflects whether Anvil injected the context, not just
+            // what the sidecar acknowledged.
+            if !self.config.photon_shadow_mode {
+                summary.prompt_adopted = Some(self.last_photon_adopted_items > 0);
             }
             self.last_photon_eval_summary = Some(summary);
         }
@@ -2481,8 +2534,6 @@ impl Agent {
         // Issue #464: reset the per-turn anti-pattern caps.
         self.session.anti_pattern_extracted_this_turn = false;
         self.session.anti_pattern_retrieval_invoked_this_turn = false;
-        // Issue #555: reset photon context_pack per-turn one-shot flag.
-        self.session.context_pack_sent_this_turn = false;
         // Issue #558: reset photon eval summary (consumed by build_eval_record).
         self.last_photon_eval_summary = None;
 
