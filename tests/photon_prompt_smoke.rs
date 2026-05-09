@@ -23,6 +23,8 @@
 //!   P16  v0.2 text kind + text field                   → Some(string) (LI-3)
 //!   P17  text field takes priority over summary field   → text field used (LI-3)
 //!   P18  non-summary kind with text field is rejected   → None
+//!   P19  v0.2 sidecar layout (context_pack.items)       → unwrapped, Some (LI-4)
+//!   P19b top-level items fallback (legacy / test)       → Some
 
 use anvil::photon::{ContextPackResponse, render_context_pack};
 
@@ -393,4 +395,44 @@ fn p18_non_summary_kind_with_text_field_rejected() {
         result.is_none(),
         "non-summary kind must be rejected even when text field is present"
     );
+}
+
+// P19 ------------------------------------------------------------------------
+
+/// LI-4: v0.2 sidecar response wraps items under "context_pack.items".
+/// render_context_pack must unwrap this layout and render the items.
+#[test]
+fn p19_context_pack_nested_items_unwrapped() {
+    // Simulate the real sidecar v0.2 response layout.
+    let resp = make_response(serde_json::json!({
+        "schema_version": "action-memory.v0.2",
+        "context_pack": {
+            "items": [
+                { "kind": "action_summary", "text": "the project codename is heliograph" }
+            ]
+        }
+    }));
+    let result = render_context_pack(&resp);
+    assert!(
+        result.is_some(),
+        "v0.2 sidecar layout (context_pack.items) must be accepted"
+    );
+    assert!(
+        result.unwrap().contains("heliograph"),
+        "item text must appear in output"
+    );
+}
+
+/// P19b: top-level items fallback still works (test-fixture / legacy layout).
+#[test]
+fn p19b_top_level_items_fallback_still_works() {
+    let resp = items_response(serde_json::json!([
+        { "kind": "summary", "summary": "legacy top-level item" }
+    ]));
+    let result = render_context_pack(&resp);
+    assert!(
+        result.is_some(),
+        "top-level items must still work as fallback"
+    );
+    assert!(result.unwrap().contains("legacy top-level item"));
 }

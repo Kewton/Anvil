@@ -91,8 +91,15 @@ pub fn render_context_pack(resp: &ContextPackResponse) -> Option<String> {
 /// Extract the `items` array from the response value.
 /// Scans at most `MAX_PROMPT_SCAN_ITEMS` items and projects each to
 /// the expected fields only (kind / summary / source).
+/// Accepts v0.2 sidecar layout (`context_pack.items`) first,
+/// then falls back to legacy top-level `items` for test fixtures.
 pub(crate) fn parse_items(value: &serde_json::Value) -> Vec<serde_json::Value> {
-    let arr = match value.get("items").and_then(|v| v.as_array()) {
+    let arr = match value
+        .get("context_pack")
+        .and_then(|cp| cp.get("items"))
+        .and_then(|v| v.as_array())
+        .or_else(|| value.get("items").and_then(|v| v.as_array()))
+    {
         Some(a) => a,
         None => return vec![],
     };
