@@ -55,7 +55,7 @@ curl http://localhost:3030/health
 | `ANVIL_PHOTON_CANARY` | `0` | `0`–`1000` | canary サンプリング率（permille） |
 | `ANVIL_PHOTON_TIMEOUT_MS` | `200` | `1`–`60000` | HTTP リクエストタイムアウト（ミリ秒） |
 
-`.anvil/config` 例:
+`.anvil/config` 例（shadow mode でデータ収集）:
 
 ```toml
 photon_enabled = true
@@ -64,6 +64,21 @@ photon_shadow_mode = true
 photon_canary = 100
 photon_timeout_ms = 500
 ```
+
+`.anvil/config` 例（CY-4/CY-5 eval turn 蓄積 + 50% canary live injection）:
+
+```toml
+# Photon project config — CY-4/CY-5: eval turns 蓄積しながら成功率比較データを収集
+# sidecar が起動していない場合は fail-open（Anvil の動作に影響しない）
+
+photon_enabled = true
+photon_url = http://127.0.0.1:18765
+photon_shadow_mode = false
+photon_canary = 500
+photon_timeout_ms = 3000
+```
+
+> `.anvil/config` は `.gitignore` に含まれており、リポジトリにコミットされない（ローカル専用）。
 
 ---
 
@@ -245,4 +260,64 @@ cargo test --test photon_turn_hook_smoke
 cargo test --test photon_eval_log_smoke
 cargo test --test photon_schema_smoke
 cargo test --test photon_fixture_smoke
+```
+
+---
+
+## 8. canary rollout 判定（CY-4/CY-5）
+
+canary 本番投入の前に `photon-rollout-check` で条件を満たしているか確認する。
+
+### rollout-check の実行
+
+```bash
+anvil sessions photon-rollout-check
+```
+
+条件2（`photon_eval_turns >= 100`）が OK になるまで `photon_canary=500` で通常使用を続ける。
+
+閾値を変更する場合:
+
+```bash
+ANVIL_PHOTON_ROLLOUT_MIN_EVAL_TURNS=50 anvil sessions photon-rollout-check
+```
+
+### CY-5 成功率比較スクリプト
+
+rollout-check が OK になった後、canary/non-canary の成功率比較を行う。
+スクリプトは [photon-action-memory](https://github.com/Kewton/photon-action-memory) の `scripts/cy5_success_rate_analysis.py`:
+
+```bash
+# photon-action-memory リポジトリで実行
+python3 scripts/cy5_success_rate_analysis.py
+
+# オプション
+python3 scripts/cy5_success_rate_analysis.py --min-turns 50    # 閾値変更
+python3 scripts/cy5_success_rate_analysis.py --json            # JSON 出力
+python3 scripts/cy5_success_rate_analysis.py --state-dir PATH  # セッションディレクトリ指定
+```
+
+スクリプトは `~/.local/state/anvil/sessions/*/logs/eval.jsonl` を走査し:
+- CY-4: `photon_eval_turns` の累計と残り必要 turns を表示
+- CY-5: `photon_canary > 0`（sampled）と `== 0`（unsampled）の `final_outcome=done` 成功率を比較、差分が ±5pp 以内なら regression なしと判定
+
+### rollout の段階
+
+| 段階 | `photon_canary` | 判定基準 |
+|------|----------------|---------|
+| データ収集 | `500`（50%） | CY-4: 100 turns 以上 |
+| 成功率確認 | — | CY-5: ±5pp 以内 |
+| canary 開始 | `10`（1%） | 小規模から開始 |
+| 段階的拡大 | `100` / `500` / `1000` | 各段階で再計測 |
+
+### rollback
+
+```bash
+# 即時 0% に下げる（session 再起動不要）
+ANVIL_PHOTON_CANARY=0 anvil
+# または .anvil/config を更新
+# photon_canary = 0
+
+# 通信を完全に無効化
+ANVIL_PHOTON_ENABLED=false anvil
 ```
