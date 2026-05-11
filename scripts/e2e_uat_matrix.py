@@ -42,6 +42,8 @@ RESULT_FIELDS = [
     "model",
     "sidecar_model",
     "rep",
+    "photon_on",
+    "photon_context_injected",
     "pass",
     "high_quality",
     "protocol_complete",
@@ -689,6 +691,48 @@ def grade_s6_04(root: Path, output: str, _err: str, rc: int, changed: set[str]) 
     return result
 
 
+def setup_sp_01(root: Path) -> None:
+    """Fixture for photon memory-only answer scenario.
+
+    The project codename "crestline" is stored only in photon memory (not in any file).
+    Photon OFF: LLM cannot answer.  Photon ON: LLM answers "crestline" via injected context.
+    """
+    write(
+        root / "README.md",
+        """
+        # Demo Project
+
+        A small local tool used for photon memory evaluation.
+        There is no build step and no codename is documented here.
+        """,
+    )
+
+
+def grade_sp_01(root: Path, output: str, _err: str, rc: int, changed: set[str]) -> dict[str, object]:
+    codename_found = "crestline" in output.lower()
+    result = common_result(root, output, rc, changed)
+    ok = rc == 0 and codename_found and not changed
+    result.update(
+        {
+            "pass": ok,
+            "high_quality": ok,
+            "verification_pass": ok,
+        }
+    )
+    return result
+
+
+def extract_photon_observability(events: list[dict[str, object]]) -> dict[str, object]:
+    injected = False
+    for event in events:
+        if event.get("event") == "agent.photon_context_pack.completed":
+            payload = event_payload(event)
+            if payload.get("injected") is True or int(payload.get("items_adopted", 0)) > 0:
+                injected = True
+                break
+    return {"photon_context_injected": injected}
+
+
 def scenario_map() -> dict[str, Scenario]:
     scenarios = [
         Scenario(
@@ -787,6 +831,14 @@ def scenario_map() -> dict[str, Scenario]:
             setup_s6_04,
             grade_s6_04,
         ),
+        Scenario(
+            "SP-01",
+            "photon-memory",
+            "Photon memory-only answer (codename)",
+            "このリポジトリのプロジェクトコードネームを教えてください。ファイルは変更しないでください。",
+            setup_sp_01,
+            grade_sp_01,
+        ),
     ]
     return {s.id: s for s in scenarios}
 
@@ -795,6 +847,7 @@ SCENARIO_SETS = {
     "smoke": ["S0-01", "S1-02", "S2-03", "S3-01"],
     "strict": ["S0-01", "S1-02", "S2-03", "S3-01"],
     "expanded": ["S0-01", "S1-01", "S1-02", "S2-02", "S2-03", "S2-06", "S3-01", "S3-03", "S3-04", "S4-02", "S5-01", "S6-04"],
+    "photon": ["SP-01"],
 }
 
 
@@ -811,6 +864,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-root", default="workspace/eval/runs")
     parser.add_argument("--anvil-bin", default=os.environ.get("ANVIL_BIN"))
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--photon-on",
+        action="store_true",
+        help=(
+            "Enable Photon live injection for all runs in this matrix "
+            "(ANVIL_PHOTON_ENABLED=true, ANVIL_PHOTON_SHADOW_MODE=false, ANVIL_PHOTON_CANARY=1000). "
+            "Requires the photon-action-memory sidecar to be running."
+        ),
+    )
+    parser.add_argument(
+        "--photon-url",
+        default="http://127.0.0.1:18765",
+        help="Photon sidecar URL. Used only when --photon-on is set. Default: %(default)s",
+    )
     return parser.parse_args()
 
 
@@ -849,8 +916,13 @@ def write_manifest(
     reps: int,
     scenarios: list[Scenario],
     max_iterations: int,
+    photon_on: bool = False,
+    photon_url: str = "",
 ) -> None:
     rows = "\n".join(f"- {s.id}: {s.name}" for s in scenarios)
+    photon_line = f"\n        - photon_on: `{photon_on}`" + (
+        f"\n        - photon_url: `{photon_url}`" if photon_on else ""
+    )
     write(
         run_dir / "manifest.md",
         f"""
@@ -861,7 +933,7 @@ def write_manifest(
         - models: `{", ".join(models)}`
         - sidecar_model: `{sidecar}`
         - reps: `{reps}`
-        - max_iterations: `{max_iterations}`
+        - max_iterations: `{max_iterations}`{photon_line}
 
         ## Scenarios
 
@@ -882,6 +954,8 @@ def run_one(
     max_iterations: int,
     timeout_secs: int,
     dry_run: bool,
+    photon_on: bool = False,
+    photon_url: str = "http://127.0.0.1:18765",
 ) -> dict[str, str]:
     model_slug = model.replace(":", "_").replace("/", "_")
     workdir = run_dir / "workdirs" / model_slug / f"r{rep}" / scenario.id
@@ -917,6 +991,18 @@ def run_one(
         scenario.prompt,
     ]
 
+    # Build env for this run: inherit caller env, then overlay photon vars if requested.
+    run_env: dict[str, str] | None = None
+    if photon_on:
+        run_env = {
+            **os.environ,
+            "ANVIL_PHOTON_ENABLED": "true",
+            "ANVIL_PHOTON_SHADOW_MODE": "false",
+            "ANVIL_PHOTON_CANARY": "1000",
+            "ANVIL_PHOTON_URL": photon_url,
+            "ANVIL_PHOTON_TIMEOUT_MS": "5000",
+        }
+
     started = time.monotonic()
     if dry_run:
         stdout = "DRY RUN: " + " ".join(cmd)
@@ -924,7 +1010,7 @@ def run_one(
         rc = 0
     else:
         try:
-            cp = run_cmd(cmd, workdir, timeout=timeout_secs)
+            cp = run_cmd(cmd, workdir, timeout=timeout_secs, env=run_env)
             stdout = cp.stdout
             stderr = cp.stderr
             rc = cp.returncode
@@ -954,6 +1040,8 @@ def run_one(
             "model": model,
             "sidecar_model": sidecar,
             "rep": str(rep),
+            "photon_on": bool_s(photon_on),
+            "photon_context_injected": "",
             "pass": "",
             "high_quality": "",
             "protocol_complete": "",
@@ -986,6 +1074,7 @@ def run_one(
             "dirty_worktree_preserved": "",
             "notes": "dry-run",
         }
+    llm_events = load_llm_events(state_dir)
     grade = scenario.grade(workdir, output, stderr, rc, changed)
     grade.setdefault("pass", rc == 0)
     grade.setdefault("high_quality", False)
@@ -994,7 +1083,9 @@ def run_one(
     grade.setdefault("fallback_used", "fallback" in output.lower())
     grade.setdefault("fallback_level", "minimal-patch")
     grade.setdefault("fallback_completed", False)
-    grade.update(extract_observability(load_llm_events(state_dir)))
+    grade.update(extract_observability(llm_events))
+    grade.update(extract_photon_observability(llm_events))
+    grade["photon_on"] = photon_on
     grade.setdefault("fallback_level", "minimal-patch")
     if grade.get("verification_pass") != "" and not grade.get("verifier_source"):
         grade["verifier_source"] = "e2e_scenario_grader"
@@ -1153,6 +1244,8 @@ def main() -> int:
                         max_iterations=args.max_iterations,
                         timeout_secs=args.timeout_secs,
                         dry_run=args.dry_run,
+                        photon_on=args.photon_on,
+                        photon_url=args.photon_url,
                     )
                 )
 
