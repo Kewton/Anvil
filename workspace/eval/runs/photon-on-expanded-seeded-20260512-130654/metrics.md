@@ -1,0 +1,20 @@
+# E2E/UAT Metrics
+
+| metric | value |
+| --- | --- |
+| `schema_version` | `1` |
+| `row_count` | `72` |
+| `high_quality_rate` | `0.6944` |
+| `pass_rate` | `0.7222` |
+| `mode_confidence_distribution` | `{"0.88": 30, "0.92": 6, "0.95": 36}` |
+| `mode_distribution` | `{"answer-only": 30, "docs": 12, "python": 12, "typescript-ui": 18}` |
+| `mode_alternative_gap_distribution` | `{"0.03": 18, "0.04": 6, "0.06": 6, "0.07": 12, "0.18": 24, "0.25": 6}` |
+| `mode_ambiguity_rate` | `0.0833` |
+| `mode_override_count` | `0` |
+| `fallback_level_used` | `{"minimal-patch": 72}` |
+| `fallback_completed_count` | `0` |
+| `verifier_source_distribution` | `{"e2e_scenario_grader": 63, "package_json_scripts": 1, "python_compile_fallback": 7, "recent_successful_bash": 1}` |
+| `verifier_no_candidates_rate` | `0.4583` |
+| `repo_context_seed_source` | `{"<empty>": 24, "docs_project": 12, "node_project": 6, "python_project": 30}` |
+| `repo_context_no_candidates_rate` | `0.1528` |
+| `false_negative_verifier_rate` | `0.0` |
