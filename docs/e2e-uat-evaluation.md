@@ -205,6 +205,8 @@ answer exists **only** in the photon memory store, not in any file on disk.
 The photon sidecar holds `repo_id="SP-01"` with fact `"crestline"`. With
 `--photon-on` the agent must retrieve and echo the codename from memory;
 without it the agent has no signal and should fail or guess incorrectly.
+The prompt requests a rationale to ensure the reply exceeds Anvil's
+40-character adequacy threshold and avoids the answer-only fallback.
 This gives a clean PASS/FAIL signal for a single controlled variable.
 
 **Fixture**: `photon-action-memory/tests/fixtures/shared/anvil_eval_sp01_action_summary.json`

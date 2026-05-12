@@ -835,7 +835,7 @@ def scenario_map() -> dict[str, Scenario]:
             "SP-01",
             "photon-memory",
             "Photon memory-only answer (codename)",
-            "このリポジトリのプロジェクトコードネームを教えてください。ファイルは変更しないでください。",
+            "このリポジトリのプロジェクトコードネームを教えてください。コードネームとその根拠（どこから確認したか）を含めて回答してください。ファイルは変更しないでください。",
             setup_sp_01,
             grade_sp_01,
         ),
