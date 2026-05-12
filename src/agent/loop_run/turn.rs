@@ -1429,6 +1429,44 @@ pub(super) struct RetrievalInjection {
     pub selected_ids: Vec<String>,
 }
 
+/// CB-001 (Issue #576 follow-up): pure predicate that decides whether
+/// `classify_with_confirmation` should overwrite `session.mode_state.work_mode`
+/// with the freshly-computed first-pass result.
+///
+/// Returns `true` only when the per-turn confirmation cap has NOT yet been
+/// consumed for this user input. When the cap is already consumed (i.e. a
+/// prior call within the same `process_line` has already driven the
+/// second-pass), the previously-resolved value lives in
+/// `session.mode_state.work_mode` and must survive a subsequent first-pass
+/// re-classification (otherwise `auto_plan_precheck`'s LLM correction is lost
+/// when `turn_start` reclassifies the same input).
+pub(super) fn should_writeback_first_pass(work_mode_confirm_called_this_turn: bool) -> bool {
+    !work_mode_confirm_called_this_turn
+}
+
+/// CB-004 (Issue #576 follow-up): pure helper that maps a classification
+/// `stage_label` and the current value of `Agent.current_turn_index` to the
+/// `turn_index` to record in `agent.work_mode.{classified,confirmed,skipped,fallback}`
+/// events.
+///
+/// `auto_plan_precheck` runs in `process_line` BEFORE
+/// `handle_user_message` increments `current_turn_index`, so its raw counter
+/// value is one less than what `turn_start` (called inside `run_turn` after
+/// the increment) will see. The helper compensates by returning
+/// `current_turn_index + 1` for the precheck stage and the raw value for
+/// every other stage, so events sharing a user input also share the join
+/// key `(session_id, turn_index)`.
+pub(super) fn effective_turn_index_for_stage(
+    stage_label: &str,
+    current_turn_index: usize,
+) -> usize {
+    if stage_label == "auto_plan_precheck" {
+        current_turn_index.saturating_add(1)
+    } else {
+        current_turn_index
+    }
+}
+
 impl Agent {
     /// Issue #576: SSoT wrapper that classifies user input with
     /// `classify_work_mode_json`, emits the existing
@@ -1438,18 +1476,43 @@ impl Agent {
     /// corrected) work_mode is written into `self.session.mode_state.work_mode`
     /// by the wrapper before this function returns, so the caller can read
     /// `self.session.mode_state.work_mode` immediately afterwards.
+    ///
+    /// CB-001 (Issue #576 follow-up): when the per-turn confirmation cap has
+    /// already been consumed for this user input (e.g. `auto_plan_precheck`
+    /// invoked the second-pass first), do NOT overwrite the previously-resolved
+    /// `session.mode_state.work_mode` with the new first-pass result.
+    /// `maybe_invoke_work_mode_confirm` will then early-return as
+    /// `Skipped(PerTurnCapConsumed)` and the confirmed value survives. The
+    /// `agent.work_mode.classified` event is still emitted so downstream
+    /// observers can see the second classification attempt.
+    ///
+    /// CB-004 (Issue #576 follow-up): `auto_plan_precheck` runs in
+    /// `process_line` BEFORE `handle_user_message` increments
+    /// `current_turn_index`, so logging the raw counter would emit a stale value
+    /// for the precheck event. The wrapper compensates by logging
+    /// `current_turn_index + 1` for that specific stage so the precheck event
+    /// shares the same `(session_id, turn_index)` join key as the matching
+    /// `turn_start` event and the post-loop AnvilScore event.
     pub(super) fn classify_with_confirmation(
         &mut self,
         input: &str,
         stage_label: &'static str,
     ) -> ModeClassification {
         let classification = classify_work_mode_json(input);
-        self.session.mode_state.work_mode = classification.work_mode;
+        // CB-001: only write back the first-pass result when the per-turn cap
+        // has NOT yet been consumed. Otherwise the previous call already
+        // resolved the final mode and we must keep it.
+        if should_writeback_first_pass(self.work_mode_confirm_called_this_turn) {
+            self.session.mode_state.work_mode = classification.work_mode;
+        }
+        // CB-004: align `turn_index` with the upcoming `handle_user_message`
+        // turn for the pre-`handle_user_message` precheck event.
+        let event_turn_index = effective_turn_index_for_stage(stage_label, self.current_turn_index);
         log_llm_event(
             "agent.work_mode.classified",
             serde_json::json!({
                 "session_id": self.session_store.session_id(),
-                "turn_index": self.current_turn_index,
+                "turn_index": event_turn_index,
                 "input": input,
                 "stage": stage_label,
                 "work_mode": classification.work_mode.as_str(),
@@ -1464,7 +1527,7 @@ impl Agent {
                 "alternatives": &classification.alternatives,
             }),
         );
-        self.maybe_invoke_work_mode_confirm(&classification, input);
+        self.maybe_invoke_work_mode_confirm(&classification, input, event_turn_index);
         classification
     }
 
@@ -1480,14 +1543,19 @@ impl Agent {
     ///
     /// Sidecar unavailable / timeout / transport / malformed responses map to
     /// `Fallback` (consumes per-turn cap; first-pass work_mode kept).
+    ///
+    /// CB-004 (Issue #576 follow-up): `turn_index` is passed in by the caller
+    /// rather than read from `self.current_turn_index`, so events emitted by
+    /// the pre-`handle_user_message` `auto_plan_precheck` stage share the
+    /// upcoming-turn join key with the matching `turn_start` events.
     pub(super) fn maybe_invoke_work_mode_confirm(
         &mut self,
         first_pass: &ModeClassification,
         raw_input: &str,
+        turn_index: usize,
     ) {
         let session_id = self.session_store.session_id().to_string();
         let sidecar_model = self.models.sidecar.clone();
-        let turn_index = self.current_turn_index;
 
         // 1. per-turn cap.
         if self.work_mode_confirm_called_this_turn {
@@ -7968,6 +8036,61 @@ mod tests {
         let sorted = sort_precautions_for_prompt(inputs, &touched, &suspected);
         let texts: Vec<&str> = sorted.iter().map(|p| p.text.as_str()).collect();
         assert_eq!(texts, vec!["hi-yes", "hi-no", "md-yes"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // CB-001 / WM-15 regression: classify_with_confirmation must NOT overwrite
+    // a previously-resolved work_mode when the per-turn cap is already consumed
+    // (i.e. auto_plan_precheck's second-pass result must survive the
+    // turn_start re-classification on the same user input).
+    // -----------------------------------------------------------------------
+    #[test]
+    fn wm_15_writeback_allowed_when_cap_not_consumed() {
+        // First call of the user input: cap not yet consumed → must write back.
+        assert!(super::should_writeback_first_pass(false));
+    }
+
+    #[test]
+    fn wm_15_writeback_suppressed_when_cap_consumed() {
+        // Second call (e.g. turn_start after auto_plan_precheck confirmed):
+        // cap already consumed → previously-resolved value must survive.
+        assert!(!super::should_writeback_first_pass(true));
+    }
+
+    // -----------------------------------------------------------------------
+    // CB-004 regression: auto_plan_precheck events must record the upcoming
+    // turn_index so they join with the matching turn_start event by
+    // (session_id, turn_index).
+    // -----------------------------------------------------------------------
+    #[test]
+    fn cb_004_auto_plan_precheck_uses_upcoming_turn_index() {
+        // Before handle_user_message increments current_turn_index (still N-1),
+        // auto_plan_precheck must log the upcoming N value.
+        assert_eq!(
+            super::effective_turn_index_for_stage("auto_plan_precheck", 0),
+            1
+        );
+        assert_eq!(
+            super::effective_turn_index_for_stage("auto_plan_precheck", 5),
+            6
+        );
+    }
+
+    #[test]
+    fn cb_004_turn_start_uses_current_turn_index_unchanged() {
+        // turn_start runs after the increment so its raw counter value is
+        // already correct.
+        assert_eq!(super::effective_turn_index_for_stage("turn_start", 1), 1);
+        assert_eq!(super::effective_turn_index_for_stage("turn_start", 42), 42);
+    }
+
+    #[test]
+    fn cb_004_saturating_add_at_usize_max() {
+        // Defence in depth: saturating_add() must not panic at usize::MAX.
+        assert_eq!(
+            super::effective_turn_index_for_stage("auto_plan_precheck", usize::MAX),
+            usize::MAX
+        );
     }
 }
 
