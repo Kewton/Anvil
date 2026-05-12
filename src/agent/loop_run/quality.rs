@@ -248,34 +248,138 @@ fn is_plan_wrapper_or_approval_text(text: &str) -> bool {
         || lower.starts_with("create an implementation plan")
 }
 
-pub(super) fn implementation_quality_issue_for_request(
-    request: &str,
-    content: &str,
-) -> Option<String> {
+// ---------------------------------------------------------------------------
+// Issue #580: first-pass observation types (SSoT for quality-gate analysis)
+// ---------------------------------------------------------------------------
+
+/// Reason why the quality gate's 5-step first-pass fast-fail short-circuited
+/// without reaching the count-evidence verdict. These are *deterministic*
+/// failures that the second-pass LLM should NOT be allowed to override
+/// (DR1-005). Per `QualityFirstPassObservation` semantics they are mutually
+/// exclusive with `ConfirmationEligible`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QualityEarlyFailReason {
+    /// (1) `looks_like_ui_marker_spam` detected superficial marker spam.
+    UiMarkerSpam,
+    /// (2) `placeholder_hits >= 2` — scaffold / placeholder markers persist.
+    Placeholder,
+    /// (4) `requires_strict_semantic_quality` and `semantic_hits < 5`.
+    StrictSemantic,
+    /// (5) Game request whose body is a low-fidelity slice.
+    LowFidelityGame,
+}
+
+impl QualityEarlyFailReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::UiMarkerSpam => "ui_marker_spam",
+            Self::Placeholder => "placeholder",
+            Self::StrictSemantic => "strict_semantic",
+            Self::LowFidelityGame => "low_fidelity_game",
+        }
+    }
+}
+
+/// Whether second-pass confirmation is allowed for this first-pass outcome.
+///
+/// * `ConfirmationEligible` — adapter MAY consult the sidecar LLM (the
+///   final go/no-go also depends on `should_request_quality_confirmation`
+///   which inspects the count tuple).
+/// * `EarlyFail { reason }` — quality.rs already decided this is not
+///   interactive UI for a deterministic reason; second-pass must NOT be
+///   invoked (DR1-005 / S7-001).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QualityFirstPassGate {
+    ConfirmationEligible,
+    EarlyFail { reason: QualityEarlyFailReason },
+}
+
+impl QualityFirstPassGate {
+    pub fn confirmation_eligible(&self) -> bool {
+        matches!(self, Self::ConfirmationEligible)
+    }
+}
+
+/// Aggregated first-pass observation. `issue` retains the original wrapper
+/// semantics (returned by `implementation_quality_issue_for_request`), while
+/// `gate` is the independent eligibility signal for `quality_confirm.rs`.
+///
+/// DR2-002: the two are intentionally orthogonal — Type-B rescue
+/// (state_hits=0 but other categories hit) produces
+/// `issue = Some(_), gate = ConfirmationEligible` so the adapter can flip
+/// `issue` to `None` after LLM confirmation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QualityFirstPassObservation {
+    pub issue: Option<String>,
+    pub interaction_hits: usize,
+    pub state_hits: usize,
+    pub feedback_hits: usize,
+    pub gate: QualityFirstPassGate,
+}
+
+/// Issue #580 / DR1-010 SSoT: full 5-step first-pass analysis of a generated
+/// UI implementation. `implementation_quality_issue_for_request` is now a
+/// thin wrapper around this function — they share the same logic exactly
+/// once.
+pub fn quality_first_pass_observation(request: &str, content: &str) -> QualityFirstPassObservation {
     let intent = RequestIntent::from_request(request);
     let profile = FeatureProfile::from_request(request);
     let request_lower = request.to_lowercase();
     let normalized = content.to_lowercase();
+
+    // (1) UI marker spam (early fail).
     if looks_like_ui_marker_spam(&normalized) {
-        return Some(
-            "it contains superficial UI quality marker spam without executable interaction, state, and feedback evidence"
-                .to_string(),
-        );
+        return QualityFirstPassObservation {
+            issue: Some(
+                "it contains superficial UI quality marker spam without executable interaction, state, and feedback evidence"
+                    .to_string(),
+            ),
+            interaction_hits: count_ui_interaction_hits(&normalized),
+            state_hits: count_ui_state_hits(&normalized),
+            feedback_hits: count_ui_feedback_hits(&normalized),
+            gate: QualityFirstPassGate::EarlyFail {
+                reason: QualityEarlyFailReason::UiMarkerSpam,
+            },
+        };
     }
+
+    // (2) Placeholder hits (early fail).
     let placeholder_hits = placeholder_hit_count(intent.framework, &normalized);
     if placeholder_hits >= 2 {
-        return Some(
-            "it still contains multiple scaffold or generic placeholder markers".to_string(),
-        );
+        return QualityFirstPassObservation {
+            issue: Some(
+                "it still contains multiple scaffold or generic placeholder markers".to_string(),
+            ),
+            interaction_hits: count_ui_interaction_hits(&normalized),
+            state_hits: count_ui_state_hits(&normalized),
+            feedback_hits: count_ui_feedback_hits(&normalized),
+            gate: QualityFirstPassGate::EarlyFail {
+                reason: QualityEarlyFailReason::Placeholder,
+            },
+        };
     }
+
+    // (3) Count-evidence — second-pass eligible (Type-B rescue lane).
     let interaction_hits = count_ui_interaction_hits(&normalized);
     let state_hits = count_ui_state_hits(&normalized);
     let feedback_hits = count_ui_feedback_hits(&normalized);
     if interaction_hits == 0 || state_hits == 0 || feedback_hits == 0 {
-        return Some(format!(
+        let issue = Some(format!(
             "it lacks an interactive vertical slice; expected executable input handling, state, and visible feedback evidence (input={interaction_hits}, state={state_hits}, feedback={feedback_hits})"
         ));
+        // Confirmation eligible: at least one category may still be Some — the
+        // adapter consults `should_request_quality_confirmation` for the final
+        // gate (all_zero → skip, all_strong is impossible here, otherwise call LLM).
+        return QualityFirstPassObservation {
+            issue,
+            interaction_hits,
+            state_hits,
+            feedback_hits,
+            gate: QualityFirstPassGate::ConfirmationEligible,
+        };
     }
+
+    // (4) Strict semantic quality (early fail).
     if profile.requires_strict_semantic_quality(&request_lower) {
         let semantic_hits = count_any(
             &normalized,
@@ -293,18 +397,52 @@ pub(super) fn implementation_quality_issue_for_request(
             ],
         );
         if semantic_hits < 5 {
-            return Some(format!(
-                "it lacks requested semantic business primitives; expected validation, calculation, visualization, persistence, and accessible feedback markers (semantic_hits={semantic_hits})"
-            ));
+            return QualityFirstPassObservation {
+                issue: Some(format!(
+                    "it lacks requested semantic business primitives; expected validation, calculation, visualization, persistence, and accessible feedback markers (semantic_hits={semantic_hits})"
+                )),
+                interaction_hits,
+                state_hits,
+                feedback_hits,
+                gate: QualityFirstPassGate::EarlyFail {
+                    reason: QualityEarlyFailReason::StrictSemantic,
+                },
+            };
         }
     }
+
+    // (5) Low-fidelity game slice (early fail).
     if intent.game_experience && looks_like_low_fidelity_game_slice(&normalized) {
-        return Some(
-            "it is a low-fidelity game slice; expected a real-time render loop with canvas, keyboard input, and visible restart/status feedback"
-                .to_string(),
-        );
+        return QualityFirstPassObservation {
+            issue: Some(
+                "it is a low-fidelity game slice; expected a real-time render loop with canvas, keyboard input, and visible restart/status feedback"
+                    .to_string(),
+            ),
+            interaction_hits,
+            state_hits,
+            feedback_hits,
+            gate: QualityFirstPassGate::EarlyFail {
+                reason: QualityEarlyFailReason::LowFidelityGame,
+            },
+        };
     }
-    None
+
+    // First-pass pass — second-pass eligible (Type-A rescue lane: LLM may
+    // override None → Some if counts look strong but UI is actually static).
+    QualityFirstPassObservation {
+        issue: None,
+        interaction_hits,
+        state_hits,
+        feedback_hits,
+        gate: QualityFirstPassGate::ConfirmationEligible,
+    }
+}
+
+pub(super) fn implementation_quality_issue_for_request(
+    request: &str,
+    content: &str,
+) -> Option<String> {
+    quality_first_pass_observation(request, content).issue
 }
 
 pub(super) fn deterministic_playable_ui_fallback(

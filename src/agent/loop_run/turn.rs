@@ -46,10 +46,16 @@ use super::deterministic::empty_framework_app_files as deterministic_empty_frame
 use super::deterministic::empty_framework_game_files as deterministic_empty_framework_game_files;
 use super::quality::{
     first_existing_impl_target, implementation_quality_issue_for_request,
-    package_json_with_requested_port, react_dev_wrapper_for_requested_port,
-    repo_change_request_text, request_allows_fast_polish_fallback,
-    request_explicitly_requires_tests, request_mentions_unsupported_ui_framework,
-    request_needs_playable_ui_quality_gate, workspace_has_unsupported_ui_framework,
+    package_json_with_requested_port, quality_first_pass_observation,
+    react_dev_wrapper_for_requested_port, repo_change_request_text,
+    request_allows_fast_polish_fallback, request_explicitly_requires_tests,
+    request_mentions_unsupported_ui_framework, request_needs_playable_ui_quality_gate,
+    workspace_has_unsupported_ui_framework,
+};
+use super::quality_confirm::{
+    self, QUALITY_CONFIRM_TIMEOUT_SECS, QualityConfirmInputs, QualityConfirmOutcome,
+    QualityConfirmation, QualityConfirmationSource, build_quality_confirm_log_payload,
+    run_quality_confirm_with_strategy,
 };
 use super::success::DETERMINISTIC_CONTENT_FALLBACK_TAG;
 
@@ -1472,6 +1478,20 @@ pub(super) fn effective_turn_index_for_stage(
     }
 }
 
+/// Issue #580: SSoT memoization key for the Quality-gate second-pass adapter.
+/// Hashes `(request, full_content)` with `DefaultHasher` (per design judgement
+/// #5: full_content avoids stale reuse when only the middle of a large file
+/// changes — the LLM still sees only the head+tail excerpt).
+pub(super) fn quality_confirm_cache_key(request: &str, content: &str) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    request.hash(&mut hasher);
+    content.hash(&mut hasher);
+    hasher.finish()
+}
+
 impl Agent {
     /// Issue #576: SSoT wrapper that classifies user input with
     /// `classify_work_mode_json`, emits the existing
@@ -1848,6 +1868,201 @@ impl Agent {
         log_llm_event(event, payload);
 
         override_kind
+    }
+
+    /// Issue #580: Quality-gate second-pass confirmation wrapper. Replaces
+    /// direct `implementation_quality_issue_for_request(request, content)`
+    /// calls in `accepted_repo_change_quality_issue` /
+    /// `accepted_repo_change_polish_target`. Signature mirrors the SSoT
+    /// wrapper so callsites stay one-line drop-in replacements.
+    ///
+    /// Gate evaluation order (Skip → Fallback → Confirmed):
+    ///   1. Plan mode (caller-host check + defensive 2nd check here)
+    ///   2. `ANVIL_NO_QUALITY_CONFIRM` env disabled
+    ///   3. per-turn cap consumed AND no cache hit
+    ///   4. per-turn cap consumed AND cache hit → return cached `issue`
+    ///   5. early fail / all_zero / all_strong / no sidecar / etc. handled
+    ///      by `run_quality_confirm_with_strategy` (orchestrator)
+    ///
+    /// Returns the final `issue` (None = pass, Some = quality gate fail).
+    pub(super) fn implementation_quality_issue_with_confirm(
+        &mut self,
+        request: &str,
+        content: &str,
+    ) -> Option<String> {
+        // SSoT first-pass observation. The wrapper signature `Option<String>`
+        // is preserved for the deterministic / non-confirmable paths.
+        let observation = quality_first_pass_observation(request, content);
+
+        let session_id = self.session_store.session_id().to_string();
+        let sidecar_model = self.models.sidecar.clone();
+        let turn_index = self.current_turn_index;
+
+        // 1. Plan mode gate. Quality second-pass is an Act-mode tool.
+        if self.session.mode_state.mode == ExecutionMode::Plan {
+            let outcome = QualityConfirmOutcome::Skipped {
+                reason: quality_confirm::QualityConfirmSkipReason::PlanMode,
+            };
+            let (event, payload) = build_quality_confirm_log_payload(
+                &outcome,
+                &session_id,
+                turn_index,
+                sidecar_model.as_deref(),
+                &observation,
+                None,
+            );
+            log_llm_event(event, payload);
+            return observation.issue;
+        }
+
+        // 2. env disable.
+        if quality_confirm::quality_confirm_disabled(|k: &str| std::env::var(k)) {
+            let outcome = QualityConfirmOutcome::Skipped {
+                reason: quality_confirm::QualityConfirmSkipReason::EnvDisabled,
+            };
+            let (event, payload) = build_quality_confirm_log_payload(
+                &outcome,
+                &session_id,
+                turn_index,
+                sidecar_model.as_deref(),
+                &observation,
+                None,
+            );
+            log_llm_event(event, payload);
+            return observation.issue;
+        }
+
+        // Compute the memo key once for both cache lookup and cache write.
+        let content_hash = quality_confirm_cache_key(request, content);
+
+        // 3 / 4. per-turn cap consumed.
+        if self.quality_confirm_called_this_turn {
+            // 4. cache hit?
+            if let Some((hash, cached)) = &self.last_quality_confirm_result
+                && *hash == content_hash
+            {
+                let cached_clone = cached.clone();
+                let outcome = QualityConfirmOutcome::Confirmed(cached_clone.clone());
+                let (event, payload) = build_quality_confirm_log_payload(
+                    &outcome,
+                    &session_id,
+                    turn_index,
+                    sidecar_model.as_deref(),
+                    &observation,
+                    None,
+                );
+                log_llm_event(event, payload);
+                return cached_clone.issue;
+            }
+            // 3. miss — surface PerTurnCapConsumed, first-pass issue is kept.
+            let outcome = QualityConfirmOutcome::Skipped {
+                reason: quality_confirm::QualityConfirmSkipReason::PerTurnCapConsumed,
+            };
+            let (event, payload) = build_quality_confirm_log_payload(
+                &outcome,
+                &session_id,
+                turn_index,
+                sidecar_model.as_deref(),
+                &observation,
+                None,
+            );
+            log_llm_event(event, payload);
+            return observation.issue;
+        }
+
+        // 5. orchestrator dispatch.
+        //
+        // CB-001 fix: only consume the per-turn cap when the sidecar is
+        // actually dispatched — i.e. when `should_request_quality_confirmation`
+        // will return true AND a sidecar model is available. Pre-evaluating
+        // the predicate here keeps the cap guard faithful: early-fail /
+        // all_zero / all_strong Skips do not consume the cap so a subsequent
+        // callsite with a genuine borderline excerpt still gets second-pass.
+        let will_dispatch =
+            sidecar_model.is_some() && should_request_quality_confirmation(&observation);
+        let inputs = QualityConfirmInputs {
+            observation: &observation,
+            request,
+            content,
+            session_id: &session_id,
+            turn_index,
+            model: sidecar_model.as_deref(),
+        };
+        let attempt_started = Instant::now();
+        let outcome = if sidecar_model.is_some() {
+            if will_dispatch {
+                // Cap consumed only when we actually attempt the sidecar call.
+                self.quality_confirm_called_this_turn = true;
+            }
+            let sidecar_name = sidecar_model.clone().expect("sidecar_model is Some here");
+            let confirm_client = self
+                .client
+                .clone_with_overrides(QUALITY_CONFIRM_TIMEOUT_SECS, 384)
+                .ok();
+            run_quality_confirm_with_strategy(inputs, |prompt| match confirm_client.as_ref() {
+                Some(c) => c
+                    .chat_text(
+                        &sidecar_name,
+                        &[ConversationMessage::user(prompt.to_string())],
+                    )
+                    // CB-002 fix: if the sidecar returns tool_calls alongside
+                    // or instead of a text response, treat it as Malformed so
+                    // the strict SecondPassResponse parser rejects it and we
+                    // fail-open to first-pass. This guards against XML-fallback
+                    // sidecar responses that extract tool calls from content.
+                    .and_then(|reply| {
+                        if !reply.tool_calls.is_empty() {
+                            Err("sidecar reply contained unexpected tool_calls".to_string())
+                        } else {
+                            Ok(reply.content)
+                        }
+                    }),
+                None => Err("client clone_with_overrides failed".to_string()),
+            })
+        } else {
+            // sidecar None — orchestrator returns Fallback(SidecarUnavailable)
+            // without invoking the closure. We do not consume the per-turn cap
+            // (defensive — symmetric with WorkMode / FeedbackKind).
+            run_quality_confirm_with_strategy(inputs, |_| Err("sidecar unavailable".to_string()))
+        };
+        let latency_ms = attempt_started.elapsed().as_millis() as u64;
+
+        // Resolve the final issue + cache result for downstream callsites.
+        let final_issue: Option<String> = match &outcome {
+            QualityConfirmOutcome::Confirmed(c) => {
+                // Cache the resolved confirmation for in-turn reuse.
+                self.last_quality_confirm_result = Some((content_hash, c.clone()));
+                c.issue.clone()
+            }
+            QualityConfirmOutcome::Skipped { .. } | QualityConfirmOutcome::Fallback { .. } => {
+                // Fallback / non-dispatch skip — cache the first-pass issue
+                // under FirstPass source so cache-hit emissions remain
+                // faithful (DR4-005).
+                let fallback = QualityConfirmation {
+                    issue: observation.issue.clone(),
+                    reason: None,
+                    source: QualityConfirmationSource::FirstPass,
+                };
+                // Only memoize when we actually dispatched (cap consumed) —
+                // otherwise the cache lookup branch above never fires.
+                if self.quality_confirm_called_this_turn {
+                    self.last_quality_confirm_result = Some((content_hash, fallback));
+                }
+                observation.issue.clone()
+            }
+        };
+
+        let (event, payload) = build_quality_confirm_log_payload(
+            &outcome,
+            &session_id,
+            turn_index,
+            sidecar_model.as_deref(),
+            &observation,
+            Some(latency_ms),
+        );
+        log_llm_event(event, payload);
+
+        final_issue
     }
 
     pub(super) fn handle_user_message(&mut self, input: &str, stream_output: bool) -> LoopResult {
@@ -2947,6 +3162,12 @@ impl Agent {
         // sidecar (model.is_some()), so skipped / sidecar-unavailable paths
         // never starve subsequent turns of a confirmation attempt.
         self.feedback_kind_confirm_called_this_turn = false;
+        // Issue #580: reset the per-turn Quality-gate second-pass cap AND the
+        // per-turn memoization cache. See the field doc for why this adapter
+        // is the only one that carries an in-turn cache (5 callsites vs.
+        // 1-2 for #576/#579).
+        self.quality_confirm_called_this_turn = false;
+        self.last_quality_confirm_result = None;
         // Issue #463: reset the per-turn case_retrieval cap.
         self.session.case_retrieval_invoked_this_turn = false;
         // Issue #471: reset the per-turn eval log case retrieval summary.
@@ -6762,7 +6983,7 @@ impl Agent {
                 .is_some_and(request_needs_playable_ui_quality_gate)
     }
 
-    fn accepted_repo_change_quality_issue(&self) -> Option<(String, String, String)> {
+    fn accepted_repo_change_quality_issue(&mut self) -> Option<(String, String, String)> {
         if !self.session.mode_state.policy().quality_gate_enabled {
             return None;
         }
@@ -6770,22 +6991,24 @@ impl Agent {
             return None;
         }
         let request = self.active_request_text()?;
-        let request = request.trim();
-        if !request_needs_playable_ui_quality_gate(request) {
+        let request = request.trim().to_string();
+        if !request_needs_playable_ui_quality_gate(&request) {
             return None;
         }
         let target = first_existing_impl_target(&self.work_root)?;
         let content = std::fs::read_to_string(&target).ok()?;
-        let issue = implementation_quality_issue_for_request(request, &content)?;
+        // Issue #580: route through the second-pass adapter so borderline UI
+        // verdicts can be confirmed/overridden by the sidecar LLM.
+        let issue = self.implementation_quality_issue_with_confirm(&request, &content)?;
         let relative = target
             .strip_prefix(&self.work_root)
             .unwrap_or(&target)
             .to_string_lossy()
             .replace('\\', "/");
-        Some((request.to_string(), relative, issue))
+        Some((request, relative, issue))
     }
 
-    fn accepted_repo_change_polish_target(&self) -> Option<(String, String)> {
+    fn accepted_repo_change_polish_target(&mut self) -> Option<(String, String)> {
         if !self.session.mode_state.policy().allow_polish_fallback {
             return None;
         }
@@ -6793,22 +7016,29 @@ impl Agent {
             return None;
         }
         let request = self.active_request_text()?;
-        let request = request.trim();
-        if !request_allows_fast_polish_fallback(request) {
+        let request = request.trim().to_string();
+        if !request_allows_fast_polish_fallback(&request) {
             return None;
         }
         let target = first_existing_impl_target(&self.work_root)?;
         let content = std::fs::read_to_string(&target).ok()?;
-        if implementation_quality_issue_for_request(request, &content).is_some() {
+        // Issue #580: a second-pass `interactive=false` verdict surfaces here
+        // as `Some(...)` which correctly suppresses the polish action
+        // (treating the file as a quality issue rather than polishing static
+        // code).
+        if self
+            .implementation_quality_issue_with_confirm(&request, &content)
+            .is_some()
+        {
             return None;
         }
-        deterministic::playable_ui_polish(request, &target, &content)?;
+        deterministic::playable_ui_polish(&request, &target, &content)?;
         let relative = target
             .strip_prefix(&self.work_root)
             .unwrap_or(&target)
             .to_string_lossy()
             .replace('\\', "/");
-        Some((request.to_string(), relative))
+        Some((request, relative))
     }
 
     fn unsupported_ui_framework_context(&self) -> bool {
