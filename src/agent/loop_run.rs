@@ -34,6 +34,7 @@ mod interrupt;
 mod lifecycle;
 mod protocol;
 mod quality;
+pub(crate) mod quality_confirm;
 pub(crate) mod reminder;
 pub mod slash_commands;
 mod spinner;
@@ -126,6 +127,25 @@ pub use feedback_kind_confirm::{
     run_feedback_kind_confirm_with_strategy, should_request_feedback_confirmation,
 };
 
+// Issue #580: expose Quality second-pass confirmation surface so
+// `tests/quality_confirm_smoke.rs` can drive `run_quality_confirm_with_strategy`
+// (the closure-DI boundary) without an Ollama dependency. Production paths in
+// `turn.rs` continue to call these via `super::quality_confirm::...`; these
+// `pub use` lines only widen the visibility for integration tests.
+pub use quality::{
+    QualityEarlyFailReason, QualityFirstPassGate, QualityFirstPassObservation,
+    quality_first_pass_observation,
+};
+pub use quality_confirm::{
+    ParseStatus as QualityConfirmParseStatus, QUALITY_CONFIRM_PROMPT_INPUT_MAX_BYTES,
+    QUALITY_CONFIRM_REASON_MAX_BYTES, QUALITY_CONFIRM_RESPONSE_MAX_BYTES,
+    QUALITY_CONFIRM_STRONG_THRESHOLD, QUALITY_CONFIRM_TIMEOUT_SECS, QualityConfirmFallbackReason,
+    QualityConfirmInputs, QualityConfirmOutcome, QualityConfirmSkipReason, QualityConfirmation,
+    QualityConfirmationSource, build_quality_confirm_log_payload, build_quality_confirm_prompt,
+    parse_second_pass_response as parse_quality_second_pass_response, quality_confirm_disabled,
+    run_quality_confirm_with_strategy, should_request_quality_confirmation,
+};
+
 const DEFAULT_KEEP_TAIL: usize = 24;
 const LATE_TURN_KEEP_TAIL: usize = 12;
 
@@ -176,6 +196,32 @@ pub struct Agent {
     /// consume the cap. Field name mirrors `work_mode_confirm_called_this_turn`
     /// so future readers can spot the symmetry.
     pub(super) feedback_kind_confirm_called_this_turn: bool,
+    /// Issue #580: per-turn cap for the Quality-gate second-pass confirmation.
+    /// Reset at the top of every `run_actor_loop` (same block as
+    /// `feedback_kind_confirm_called_this_turn`). Consumed only when the
+    /// orchestrator actually dispatches to the sidecar LLM (`model.is_some()`).
+    pub(super) quality_confirm_called_this_turn: bool,
+    /// Issue #580: per-turn memoization cache for the Quality-gate
+    /// second-pass adapter.
+    ///
+    /// **Why this is different from #576 / #579**: Quality-gate is the only
+    /// adapter that may be reached from up to 5 callsites in the same turn
+    /// (`accepted_repo_change_quality_issue` and
+    /// `accepted_repo_change_polish_target` each invoke us from multiple
+    /// host code paths). After the per-turn cap is consumed, subsequent
+    /// callsites with the same `(request, content)` would otherwise revert
+    /// to first-pass only, losing turn-local consistency. With memoization
+    /// the cached `QualityConfirmation` is returned. #576 (WorkMode) has 2
+    /// callsites with no realistic overlap; #579 (FeedbackKind) is invoked
+    /// exactly once per post-loop hook.
+    ///
+    /// Key: `DefaultHasher::finish()` of `(request, full_content)`
+    /// — collisions are per-turn-local with negligible blast radius.
+    /// Value: the `QualityConfirmation` returned to the caller, preserving
+    /// `source` / `reason` so cache-hit log emission stays faithful.
+    /// Reset: top of every `run_actor_loop` together with
+    /// `quality_confirm_called_this_turn`.
+    pub(super) last_quality_confirm_result: Option<(u64, quality_confirm::QualityConfirmation)>,
     /// Issue #456: tracks whether `compute_anvil_score` has already run for
     /// the current turn. Reset at the top of every `handle_user_message`,
     /// flipped to `true` after the post-loop compute writes
@@ -302,6 +348,8 @@ impl Agent {
             tester_called_this_turn: false,
             work_mode_confirm_called_this_turn: false,
             feedback_kind_confirm_called_this_turn: false,
+            quality_confirm_called_this_turn: false,
+            last_quality_confirm_result: None,
             anvil_score_computed_this_turn: false,
             skill_registry,
             repo_graph,
