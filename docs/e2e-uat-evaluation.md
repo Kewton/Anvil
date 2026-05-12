@@ -191,6 +191,35 @@ the behavior.
 | S7-03 | Verifier failure then fix | Failing verifier prevents success; final verifier pass is recorded |
 | S7-04 | Long-running UI dev command | Command detaches or is bounded; agent remains responsive and records verifier state |
 
+### SP: Photon Memory Evaluation
+
+Scenarios that validate whether `photon-action-memory` sidecar injection
+improves agent answers. Each SP scenario has a binary structure: the correct
+answer exists **only** in the photon memory store, not in any file on disk.
+
+| ID | Scenario | Acceptance |
+| --- | --- | --- |
+| SP-01 | Photon memory-only codename answer | `rc=0`, `"crestline"` in stdout, 0 changed files |
+
+**Design rationale**: The workdir contains a small README with no codename.
+The photon sidecar holds `repo_id="SP-01"` with fact `"crestline"`. With
+`--photon-on` the agent must retrieve and echo the codename from memory;
+without it the agent has no signal and should fail or guess incorrectly.
+The prompt requests a rationale to ensure the reply exceeds Anvil's
+40-character adequacy threshold and avoids the answer-only fallback.
+This gives a clean PASS/FAIL signal for a single controlled variable.
+
+**Fixture**: `photon-action-memory/tests/fixtures/shared/anvil_eval_sp01_action_summary.json`
+
+Seed the sidecar before a `--photon-on` run:
+
+```bash
+cd /path/to/photon-action-memory
+python3 scripts/seed_live_injection_summary.py \
+  --fixture tests/fixtures/shared/anvil_eval_sp01_action_summary.json \
+  --request-id "seed-anvil-eval-sp01-codename-001"
+```
+
 ## Strict Acceptance Rule
 
 For a change to be considered stable:
@@ -220,8 +249,15 @@ For release-quality validation, use the expanded strict rule:
 `workspace/eval/runs/<run-id>/results.csv` should use this header:
 
 ```csv
-run_id,commit,scenario_id,model,sidecar_model,rep,pass,high_quality,protocol_complete,verification_pass,fallback_used,fallback_level,fallback_completed,mode,mode_confidence,mode_alternative_gap,mode_ambiguity,mode_override_count,verifier_source,verifier_candidate_count,repo_context_seed_source,repo_context_candidate_count,repo_context_no_candidates,first_success_iter,total_iter,duration_sec,changed_files_count,unrelated_change_count,tool_failure_count,read_before_edit,real_entry_file_touched,safe_fail,safety_violation,browser_smoke_pass,resume_pass,dirty_worktree_preserved,notes
+run_id,commit,scenario_id,model,sidecar_model,rep,photon_on,photon_context_injected,pass,high_quality,protocol_complete,verification_pass,fallback_used,fallback_level,fallback_completed,mode,mode_confidence,mode_alternative_gap,mode_ambiguity,mode_override_count,verifier_source,verifier_candidate_count,repo_context_seed_source,repo_context_candidate_count,repo_context_no_candidates,first_success_iter,total_iter,duration_sec,changed_files_count,unrelated_change_count,tool_failure_count,read_before_edit,real_entry_file_touched,safe_fail,safety_violation,browser_smoke_pass,resume_pass,dirty_worktree_preserved,notes
 ```
+
+`photon_on`: `true` when the run was invoked with `--photon-on`; `false`
+otherwise. Leave empty for legacy runs predating this field.
+
+`photon_context_injected`: `true` when the `agent.photon_context_pack.completed`
+event reports `injected=true` or `items_adopted>0` for that turn; `false`
+otherwise.
 
 Boolean fields must be `true` or `false`. Unknown values should be empty rather
 than guessed.
@@ -287,6 +323,43 @@ Anvil; dry-run rows leave pass/fail fields blank and exit `0`. Real runs exit
 `0` only when every row is `high_quality=true`; otherwise they exit `2` after
 writing the artifacts for inspection. Per-scenario timeouts are recorded as
 failed rows with `notes=timeout`; they must not abort the rest of the matrix.
+
+## Photon Memory Comparison Run
+
+To measure the impact of `photon-action-memory` injection, run the SP scenario
+set once with photon OFF (baseline) and once with photon ON, then compare
+`pass` and `photon_context_injected` columns.
+
+```bash
+# Step 1: Photon OFF baseline
+python3 scripts/e2e_uat_matrix.py \
+  --scenario-set photon \
+  --models qwen3.6:27b-coding-nvfp4,qwen3.5:122b \
+  --sidecar-model qwen3-coder:30b \
+  --reps 3 \
+  --run-id photon-off-$(date +%Y%m%d-%H%M%S)
+
+# Step 2: Seed SP-01 codename into the running sidecar
+cd /path/to/photon-action-memory
+python3 scripts/seed_live_injection_summary.py \
+  --fixture tests/fixtures/shared/anvil_eval_sp01_action_summary.json \
+  --request-id "seed-anvil-eval-sp01-codename-001"
+
+# Step 3: Photon ON run (sidecar must be running at http://127.0.0.1:18765)
+cd /path/to/Anvil-develop
+python3 scripts/e2e_uat_matrix.py \
+  --scenario-set photon \
+  --models qwen3.6:27b-coding-nvfp4,qwen3.5:122b \
+  --sidecar-model qwen3-coder:30b \
+  --reps 3 \
+  --photon-on \
+  --run-id photon-on-$(date +%Y%m%d-%H%M%S)
+```
+
+Expected result: `pass=false` for all OFF rows, `pass=true` and
+`photon_context_injected=true` for ON rows. Any deviation (e.g. ON rows where
+`photon_context_injected=false`) indicates a sidecar connectivity or seeding
+problem rather than an agent logic regression.
 
 ## 2026-05-01 Implementation Validation
 
