@@ -697,7 +697,11 @@ fn answer_only_reply_is_inadequate(reply: &str) -> bool {
     {
         return true;
     }
-    trimmed.chars().count() < 40
+    // Issue #574: do not use length as a proxy for adequacy. Short factual
+    // answers (codename, single value, Yes/No, especially in Japanese) were
+    // being discarded and replaced with a canned fallback. Only empty and
+    // tool-call-like replies are inadequate.
+    false
 }
 
 fn extract_filename_with_suffix(text: &str, suffix: &str) -> Option<String> {
@@ -2485,15 +2489,13 @@ impl Agent {
             );
         }
 
-        let result = self.run_actor_loop(
+        self.run_actor_loop(
             action_expectation,
             requires_action,
             stream_output,
             false,
             monitor,
-        );
-
-        result
+        )
     }
 
     fn run_actor_loop(
@@ -7169,6 +7171,21 @@ mod tests {
         assert!(!answer_only_reply_is_inadequate(
             "ModePolicyを構造化状態として持つ利点は、会話履歴のノイズからツール許可を分離できることです。リスクは最新意図とのずれです。"
         ));
+    }
+
+    #[test]
+    fn answer_only_accepts_short_correct_answers() {
+        // Issue #574: short factual answers (codename, single value, Yes/No)
+        // must not be discarded by a length heuristic. Only empty and
+        // tool-call-like replies are inadequate.
+        assert!(!answer_only_reply_is_inadequate(
+            "このリポジトリのプロジェクトコードネームは **crestline** です。"
+        ));
+        assert!(!answer_only_reply_is_inadequate("crestline"));
+        assert!(!answer_only_reply_is_inadequate("はい"));
+        assert!(!answer_only_reply_is_inadequate("42"));
+        assert!(answer_only_reply_is_inadequate(""));
+        assert!(answer_only_reply_is_inadequate("   \n  "));
     }
 
     #[test]
