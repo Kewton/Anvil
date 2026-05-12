@@ -75,6 +75,33 @@ impl FeedbackKind {
                 | NoToolCall
         )
     }
+
+    /// Issue #579 / DR2-001: snake-case tag string SSoT for this kind. The
+    /// match here mirrors `#[serde(rename_all = "snake_case")]` exactly so
+    /// callers (e.g. `feedback_kind_confirm` adapter) can embed the tag into
+    /// prompts / log payloads without round-tripping through `serde_json`.
+    /// `feedback_kind_as_str_matches_serde_tag` pins parity across all 17
+    /// variants.
+    pub fn as_str(&self) -> &'static str {
+        use FeedbackKind::*;
+        match self {
+            BuildPass => "build_pass",
+            TestPass => "test_pass",
+            CompileError => "compile_error",
+            TestFailure => "test_failure",
+            TypeError => "type_error",
+            LintFailure => "lint_failure",
+            Timeout => "timeout",
+            ToolProtocolFailure => "tool_protocol_failure",
+            EditFailure => "edit_failure",
+            NoRepoProgress => "no_repo_progress",
+            UnsafeCommandBlocked => "unsafe_command_blocked",
+            NoVerifierAvailable => "no_verifier_available",
+            NoToolCall => "no_tool_call",
+            SkillPermissionDenied => "skill_permission_denied",
+            UnknownFailure => "unknown_failure",
+        }
+    }
 }
 
 /// Sealed runtime feedback record. Text fields (`command` / `stdout_excerpt`
@@ -473,6 +500,44 @@ mod tests {
     fn unknown_feedback_kind_deserializes_as_unknown_failure() {
         let kind: FeedbackKind = serde_json::from_str("\"future_unseen_kind\"").unwrap();
         assert_eq!(kind, FeedbackKind::UnknownFailure);
+    }
+
+    /// Issue #579 / DR2-001: `FeedbackKind::as_str()` returns the same
+    /// snake_case tag that serde emits for every variant. Pins parity so
+    /// the adapter layer (`feedback_kind_confirm`) can rely on `as_str()`
+    /// for prompt embedding and log payloads without round-tripping through
+    /// `serde_json`.
+    #[test]
+    fn feedback_kind_as_str_matches_serde_tag() {
+        use FeedbackKind::*;
+        let all = [
+            BuildPass,
+            TestPass,
+            CompileError,
+            TestFailure,
+            TypeError,
+            LintFailure,
+            Timeout,
+            ToolProtocolFailure,
+            EditFailure,
+            NoRepoProgress,
+            UnsafeCommandBlocked,
+            NoVerifierAvailable,
+            NoToolCall,
+            SkillPermissionDenied,
+            UnknownFailure,
+        ];
+        for k in &all {
+            let serde_tag = serde_json::to_value(k).unwrap();
+            let serde_str = serde_tag
+                .as_str()
+                .unwrap_or_else(|| panic!("variant {k:?} did not serialise as string"));
+            assert_eq!(
+                k.as_str(),
+                serde_str,
+                "as_str() vs serde tag mismatch for {k:?}",
+            );
+        }
     }
 
     /// Issue #455 / D1: NoToolCall serializes to snake_case "no_tool_call".
