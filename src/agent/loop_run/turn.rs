@@ -2,6 +2,11 @@ use super::auto_test::{
     AutoTestKind, AutoTestPlan, AutoTestResult, AutoTestRunner, classify_auto_test,
     count_compile_errors, count_test_failures,
 };
+use super::feedback_kind_confirm::{
+    self, FEEDBACK_KIND_CONFIRM_TIMEOUT_SECS, FeedbackKindConfirmInputs,
+    FeedbackKindConfirmOutcome, build_feedback_kind_confirm_log_payload,
+    run_feedback_kind_confirm_with_strategy,
+};
 use super::interrupt::{InterruptEnv, InterruptFlag, InterruptMonitor};
 use super::reminder::{
     self, ReminderInputs, ReminderOutcome, build_log_payload as build_reminder_log_payload,
@@ -1691,6 +1696,160 @@ impl Agent {
         log_llm_event(event, payload);
     }
 
+    /// Issue #579: FeedbackKind second-pass confirmation wrapper. Called from
+    /// `success.rs` facade immediately before `record_feedback_if_unset(fb)`
+    /// when `VerifierOutcome::AutoTestRan { feedback: Some(_), .. }` is in
+    /// hand. Returns `Some(corrected_kind)` only when the orchestrator
+    /// resolved `Confirmed(SecondPassOverridden)` AND the LLM-chosen kind
+    /// actually differs from the first-pass kind; otherwise returns `None`
+    /// and the caller keeps `fb.kind` unchanged.
+    ///
+    /// Gate evaluation order (DR1-003 / DR2-005):
+    ///   1. Plan mode                              → Skip(PlanMode), cap intact
+    ///   2. `ANVIL_NO_FEEDBACK_KIND_CONFIRM` env   → Skip(EnvDisabled), cap intact
+    ///   3. per-turn cap already consumed          → Skip(PerTurnCapConsumed), cap intact
+    ///   4. Otherwise → orchestrator
+    ///
+    /// Per-turn cap (`feedback_kind_confirm_called_this_turn`) is consumed
+    /// here — not inside the orchestrator — because the orchestrator is a
+    /// pure function that does not hold `&mut Agent`. The cap is set only
+    /// when `model.is_some()` so `Fallback(SidecarUnavailable)` (model None)
+    /// remains retryable on a later turn.
+    pub(super) fn classify_with_feedback_confirm(
+        &mut self,
+        first_pass: &FeedbackKind,
+        combined_output: &str,
+    ) -> Option<FeedbackKind> {
+        let session_id = self.session_store.session_id().to_string();
+        let sidecar_model = self.models.sidecar.clone();
+        let turn_index = self.current_turn_index;
+        let combined_bytes = combined_output.len();
+
+        // 1. Plan mode gate. Always skip — second-pass is an Act-mode tool.
+        if self.session.mode_state.mode == ExecutionMode::Plan {
+            let outcome = FeedbackKindConfirmOutcome::Skipped {
+                reason: feedback_kind_confirm::FeedbackKindSkipReason::PlanMode,
+            };
+            let (event, payload) = build_feedback_kind_confirm_log_payload(
+                &outcome,
+                &session_id,
+                turn_index,
+                first_pass,
+                sidecar_model.as_deref(),
+                combined_bytes,
+                None,
+            );
+            log_llm_event(event, payload);
+            return None;
+        }
+
+        // 2. env disable.
+        if feedback_kind_confirm::feedback_kind_confirm_disabled(|k: &str| std::env::var(k)) {
+            let outcome = FeedbackKindConfirmOutcome::Skipped {
+                reason: feedback_kind_confirm::FeedbackKindSkipReason::EnvDisabled,
+            };
+            let (event, payload) = build_feedback_kind_confirm_log_payload(
+                &outcome,
+                &session_id,
+                turn_index,
+                first_pass,
+                sidecar_model.as_deref(),
+                combined_bytes,
+                None,
+            );
+            log_llm_event(event, payload);
+            return None;
+        }
+
+        // 3. per-turn cap.
+        if self.feedback_kind_confirm_called_this_turn {
+            let outcome = FeedbackKindConfirmOutcome::Skipped {
+                reason: feedback_kind_confirm::FeedbackKindSkipReason::PerTurnCapConsumed,
+            };
+            let (event, payload) = build_feedback_kind_confirm_log_payload(
+                &outcome,
+                &session_id,
+                turn_index,
+                first_pass,
+                sidecar_model.as_deref(),
+                combined_bytes,
+                None,
+            );
+            log_llm_event(event, payload);
+            return None;
+        }
+
+        // 4. orchestrator dispatch. Build inputs and (when model is Some)
+        // consume the per-turn cap BEFORE invoking the orchestrator so any
+        // closure failure path (timeout / transport / malformed / oversized)
+        // cannot re-trigger a second dispatch within the same turn.
+        let inputs = FeedbackKindConfirmInputs {
+            first_pass,
+            combined_output,
+            session_id: &session_id,
+            turn_index,
+            model: sidecar_model.as_deref(),
+        };
+        let attempt_started = Instant::now();
+        let outcome = if sidecar_model.is_some() {
+            self.feedback_kind_confirm_called_this_turn = true;
+            let sidecar_name = sidecar_model.clone().expect("sidecar_model is Some here");
+            let confirm_client = self
+                .client
+                .clone_with_overrides(FEEDBACK_KIND_CONFIRM_TIMEOUT_SECS, 384)
+                .ok();
+            run_feedback_kind_confirm_with_strategy(inputs, |prompt| {
+                match confirm_client.as_ref() {
+                    Some(c) => c
+                        .chat_text(
+                            &sidecar_name,
+                            &[ConversationMessage::user(prompt.to_string())],
+                        )
+                        .map(|reply| reply.content),
+                    None => Err("client clone_with_overrides failed".to_string()),
+                }
+            })
+        } else {
+            // `model.is_none()` — orchestrator returns Fallback(SidecarUnavailable)
+            // without invoking the closure. We do NOT consume the per-turn cap
+            // because no LLM dispatch was attempted (symmetric with
+            // `maybe_invoke_work_mode_confirm`).
+            run_feedback_kind_confirm_with_strategy(inputs, |_| {
+                Err("sidecar unavailable".to_string())
+            })
+        };
+        let latency_ms = attempt_started.elapsed().as_millis() as u64;
+
+        // Extract the override kind before we move `outcome` into the payload
+        // builder. We override only on `Confirmed(SecondPassOverridden)` where
+        // the resolved kind actually differs from the first-pass kind; both
+        // `Confirmed(SecondPassConfirmed)` and every `Fallback` keep
+        // `first_pass`.
+        let override_kind = match &outcome {
+            FeedbackKindConfirmOutcome::Confirmed(c)
+                if c.source
+                    == feedback_kind_confirm::FeedbackKindConfirmationSource::SecondPassOverridden
+                    && &c.kind != first_pass =>
+            {
+                Some(c.kind.clone())
+            }
+            _ => None,
+        };
+
+        let (event, payload) = build_feedback_kind_confirm_log_payload(
+            &outcome,
+            &session_id,
+            turn_index,
+            first_pass,
+            sidecar_model.as_deref(),
+            combined_bytes,
+            Some(latency_ms),
+        );
+        log_llm_event(event, payload);
+
+        override_kind
+    }
+
     pub(super) fn handle_user_message(&mut self, input: &str, stream_output: bool) -> LoopResult {
         // Start the ESC interrupt monitor for the duration of this turn only —
         // rustyline owns raw mode during the REPL line-edit, so the monitor
@@ -2782,6 +2941,12 @@ impl Agent {
             self.session.working_memory.touched_files.clone();
         // Issue #462: reset the per-turn CaseRecord extraction cap.
         self.session.case_record_extracted_this_turn = false;
+        // Issue #579: reset the per-turn FeedbackKind second-pass cap. Mirror
+        // of `work_mode_confirm_called_this_turn` semantics — the flag flips
+        // to `true` only when the orchestrator actually dispatches to the
+        // sidecar (model.is_some()), so skipped / sidecar-unavailable paths
+        // never starve subsequent turns of a confirmation attempt.
+        self.feedback_kind_confirm_called_this_turn = false;
         // Issue #463: reset the per-turn case_retrieval cap.
         self.session.case_retrieval_invoked_this_turn = false;
         // Issue #471: reset the per-turn eval log case retrieval summary.

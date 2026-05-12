@@ -19,6 +19,7 @@ use std::path::Path;
 
 use super::auto_test::{
     AutoTestKind, AutoTestPlan, AutoTestResult, AutoTestRunner, auto_test_disabled,
+    combined_output_for_classify,
 };
 use crate::agent::orchestration::RepoVerification;
 use crate::session::anvil_score::{
@@ -68,7 +69,16 @@ pub struct VerifierInputs<'a> {
 /// VerifierSkill::execute の出力. turn.rs facade が解釈して side-effect を適用する.
 #[derive(Debug, Clone)]
 pub enum VerifierOutcome {
-    /// AutoTest が走り score まで計算できたケース
+    /// AutoTest が走り score まで計算できたケース.
+    ///
+    /// `auto_test_output` (現存) と `auto_test_combined_output` (新規, Issue #579) は
+    /// 由来が異なるので混同しないこと (DR2-001 / DR2-015):
+    /// - `auto_test_output`: `AutoTestResult.output` の clone。truncated 済みの
+    ///   stdout/stderr 結合ログ。facade で `error_text` 等に再露出される表示用テキスト。
+    /// - `auto_test_combined_output`: `combined_output_for_classify(&result)` の戻り値。
+    ///   `classify_auto_test` が見た文字列と**同一** (DR1-001 SSoT 保証)。second-pass
+    ///   confirmation の strong-match 判定はこの文字列で行うため、output 構築ロジックに
+    ///   ズレが生じても classification と判定とが食い違わない。
     AutoTestRan {
         score: AnvilScore,
         auto_test_kind: AutoTestKindView,
@@ -78,6 +88,11 @@ pub enum VerifierOutcome {
         auto_test_reason: String,
         anvil_test_summary: AnvilTestSummary,
         feedback: Option<FeedbackFrame>,
+        /// Issue #579 / DR1-001: snapshot of the exact string
+        /// `classify_auto_test` consumed. Carried through to the facade so the
+        /// second-pass `should_request_feedback_confirmation` predicate runs on
+        /// the same input as the first-pass classifier.
+        auto_test_combined_output: String,
     },
     /// AutoTestRunner::run が Err を返した (DR2-002)
     AutoTestTransportError { score: AnvilScore, error: String },
@@ -178,6 +193,11 @@ impl AgentSkill for VerifierSkill {
                             inputs.repo_verification,
                             Some(&summary),
                         );
+                        // Issue #579 / DR1-001: evaluate `combined_output_for_classify`
+                        // exactly once so the same string flows into both
+                        // `classify_auto_test` (via `build_feedback_for_auto_test`)
+                        // and the second-pass confirmation in `success.rs`.
+                        let combined_output = combined_output_for_classify(&result);
                         let feedback = Some(super::turn::build_feedback_for_auto_test(
                             &plan,
                             &result,
@@ -193,6 +213,7 @@ impl AgentSkill for VerifierSkill {
                             auto_test_reason: plan.reason.clone(),
                             anvil_test_summary: summary,
                             feedback,
+                            auto_test_combined_output: combined_output,
                         }))
                     }
                     Err(error) => {

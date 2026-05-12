@@ -18,7 +18,7 @@ pub(super) const MAX_OUTPUT_BYTES: usize = 12_000;
 // disambiguation is needed, e.g. `MARKER_PYTEST_FAILED_SUMMARY`).
 const MARKER_CARGO_COMPILE_ERROR: &str = "error[";
 const MARKER_NPM_TSC_ERROR: &str = "error ts";
-const MARKER_CARGO_TEST_FAILED: &str = "test result: failed";
+pub(super) const MARKER_CARGO_TEST_FAILED: &str = "test result: failed";
 const MARKER_PYTEST_FAILED_SUMMARY: &str = " failed";
 
 /// Build vs Test classification for an auto_test plan. Used by the
@@ -902,7 +902,7 @@ pub(super) fn classify_auto_test(plan: &AutoTestPlan, result: &AutoTestResult) -
     FeedbackKind::UnknownFailure
 }
 
-fn combined_output_for_classify(result: &AutoTestResult) -> String {
+pub(super) fn combined_output_for_classify(result: &AutoTestResult) -> String {
     if !result.stdout.is_empty() || !result.stderr.is_empty() {
         let mut s = String::new();
         s.push_str(&result.stdout);
@@ -976,7 +976,7 @@ fn parse_cargo_failed(lower: &str) -> Option<usize> {
 }
 
 // Parse pytest summary `==== <N> failed[, ...] ====`.
-fn parse_pytest_failed(lower: &str) -> Option<usize> {
+pub(super) fn parse_pytest_failed(lower: &str) -> Option<usize> {
     for line in lower.lines() {
         let trimmed = line.trim_matches('=').trim();
         if !trimmed.contains(MARKER_PYTEST_FAILED_SUMMARY.trim_start()) {

@@ -231,10 +231,25 @@ impl Agent {
                     }
                 }
                 if let VerifierOutcome::AutoTestRan {
-                    feedback: Some(fb), ..
+                    feedback: Some(fb),
+                    auto_test_combined_output,
+                    ..
                 } = &outcome
                 {
-                    self.session.record_feedback_if_unset(fb.clone());
+                    // Issue #579: clone the frame so we can override `kind`
+                    // when the LLM second-pass disagrees with the first-pass
+                    // classification. `auto_test_combined_output` is the
+                    // exact string `classify_auto_test` consumed (DR1-001
+                    // SSoT), so the orchestrator's `should_request_*`
+                    // predicate runs on identical input.
+                    let mut fb = fb.clone();
+                    let combined_output = auto_test_combined_output.as_str();
+                    if let Some(confirmed_kind) =
+                        self.classify_with_feedback_confirm(&fb.kind, combined_output)
+                    {
+                        fb.kind = confirmed_kind;
+                    }
+                    self.session.record_feedback_if_unset(fb);
                 }
                 if let VerifierOutcome::NoVerifier { feedback, .. } = &outcome {
                     self.session.record_feedback_if_unset(feedback.clone());

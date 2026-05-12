@@ -28,6 +28,7 @@ use crate::tools::registry::{ToolContext, ToolRegistry};
 mod auto_test;
 pub mod commands;
 mod deterministic;
+pub(crate) mod feedback_kind_confirm;
 mod footer;
 mod interrupt;
 mod lifecycle;
@@ -107,6 +108,24 @@ pub use work_mode_confirm::{
     run_work_mode_confirm_with_strategy, work_mode_confirm_disabled,
 };
 
+// Issue #579: expose FeedbackKind second-pass confirmation adapter surface so
+// `tests/feedback_kind_confirm_smoke.rs` can drive
+// `run_feedback_kind_confirm_with_strategy` (the closure-DI boundary)
+// without an Ollama dependency. Production paths in `success.rs` / the
+// `Agent::classify_with_feedback_confirm` wrapper continue to call these via
+// `super::feedback_kind_confirm::...`; these `pub use` lines only widen the
+// visibility for integration tests.
+pub use feedback_kind_confirm::{
+    FEEDBACK_KIND_CONFIRM_PROMPT_INPUT_MAX_BYTES, FEEDBACK_KIND_CONFIRM_REASON_MAX_BYTES,
+    FEEDBACK_KIND_CONFIRM_RESPONSE_MAX_BYTES, FEEDBACK_KIND_CONFIRM_TIMEOUT_SECS,
+    FeedbackKindConfirmInputs, FeedbackKindConfirmOutcome, FeedbackKindConfirmation,
+    FeedbackKindConfirmationSource, FeedbackKindFallbackReason, FeedbackKindSkipReason,
+    ParseStatus as FeedbackKindConfirmParseStatus, build_feedback_kind_confirm_log_payload,
+    build_feedback_kind_confirm_prompt, feedback_kind_confirm_disabled,
+    parse_second_pass_response as parse_feedback_kind_second_pass_response,
+    run_feedback_kind_confirm_with_strategy, should_request_feedback_confirmation,
+};
+
 const DEFAULT_KEEP_TAIL: usize = 24;
 const LATE_TURN_KEEP_TAIL: usize = 12;
 
@@ -150,6 +169,13 @@ pub struct Agent {
     /// the cap is consumed (`true`), the value already in the session is the
     /// authoritative resolved mode and must not be clobbered.
     pub(super) work_mode_confirm_called_this_turn: bool,
+    /// Issue #579: per-turn cap for the FeedbackKind second-pass confirmation.
+    /// Reset at the top of every `run_turn` (DR2-005), consumed only when the
+    /// orchestrator actually dispatches to the sidecar LLM (i.e.
+    /// `model.is_some()`); Skip / `Fallback(SidecarUnavailable)` paths do not
+    /// consume the cap. Field name mirrors `work_mode_confirm_called_this_turn`
+    /// so future readers can spot the symmetry.
+    pub(super) feedback_kind_confirm_called_this_turn: bool,
     /// Issue #456: tracks whether `compute_anvil_score` has already run for
     /// the current turn. Reset at the top of every `handle_user_message`,
     /// flipped to `true` after the post-loop compute writes
@@ -275,6 +301,7 @@ impl Agent {
             reminder_called_this_turn: false,
             tester_called_this_turn: false,
             work_mode_confirm_called_this_turn: false,
+            feedback_kind_confirm_called_this_turn: false,
             anvil_score_computed_this_turn: false,
             skill_registry,
             repo_graph,
