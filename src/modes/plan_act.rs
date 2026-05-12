@@ -160,6 +160,23 @@ pub fn infer_work_mode_from_text(raw: &str) -> WorkMode {
     classify_work_mode_json(raw).work_mode
 }
 
+/// Issue #576: Confidence threshold below which WorkMode classification is
+/// considered uncertain enough to warrant a second-pass LLM confirmation.
+///
+/// SSoT used by:
+/// - `classify_work_mode_json` (for the `ambiguity` flag computation)
+/// - `should_request_confirmation` (the second-pass gate)
+pub(crate) const WORK_MODE_CONFIRM_CONFIDENCE_THRESHOLD: f32 = 0.90;
+
+/// Issue #576: pure predicate that decides whether the WorkMode classification
+/// is uncertain enough to call the LLM second-pass confirmation. The
+/// `raw_input` argument is retained for future signature extension but is
+/// currently unused. agent layer types must not be imported here (DR3-002).
+pub fn should_request_confirmation(c: &ModeClassification, raw_input: &str) -> bool {
+    let _ = raw_input; // reserved for future heuristics
+    c.ambiguity || c.confidence < WORK_MODE_CONFIRM_CONFIDENCE_THRESHOLD
+}
+
 pub fn classify_work_mode_json(raw: &str) -> ModeClassification {
     let lower = raw.to_ascii_lowercase();
     let explicit_edit = contains_any(
@@ -395,7 +412,8 @@ pub fn classify_work_mode_json(raw: &str) -> ModeClassification {
         .map(|candidate| candidate.confidence)
         .unwrap_or(0.0);
     let alternative_gap = (selected.confidence - second_confidence).max(0.0);
-    let ambiguity = alternative_gap < 0.15 && selected.confidence < 0.90;
+    let ambiguity =
+        alternative_gap < 0.15 && selected.confidence < WORK_MODE_CONFIRM_CONFIDENCE_THRESHOLD;
     let requires_tests =
         selected.work_mode != WorkMode::AnswerOnly && request_requires_tests(&lower, raw);
     ModeClassification {
@@ -626,5 +644,45 @@ mod tests {
         assert!(!policy.repo_edit_required);
         assert!(!policy.allow_ui_deterministic_fallback);
         assert!(!policy.include_working_memory);
+    }
+
+    fn make_classification(confidence: f32, ambiguity: bool) -> ModeClassification {
+        ModeClassification {
+            work_mode: WorkMode::GenericCode,
+            intent: "code",
+            allows_file_edits: true,
+            requires_tests: false,
+            confidence,
+            ambiguity,
+            alternative_gap: 0.20,
+            reason: "test",
+            evidence: vec![],
+            alternatives: vec![],
+        }
+    }
+
+    #[test]
+    fn should_request_confirmation_skips_high_confidence_classifications() {
+        let c = make_classification(0.95, false);
+        assert!(!should_request_confirmation(&c, "irrelevant"));
+    }
+
+    #[test]
+    fn should_request_confirmation_triggers_low_confidence_classifications() {
+        let c = make_classification(0.87, false);
+        assert!(should_request_confirmation(&c, "irrelevant"));
+    }
+
+    #[test]
+    fn should_request_confirmation_triggers_when_ambiguity_is_set() {
+        let c = make_classification(0.95, true);
+        assert!(should_request_confirmation(&c, "irrelevant"));
+    }
+
+    #[test]
+    fn should_request_confirmation_boundary_at_threshold_returns_false() {
+        // confidence == 0.90 → not below threshold → skip (strict `<`).
+        let c = make_classification(WORK_MODE_CONFIRM_CONFIDENCE_THRESHOLD, false);
+        assert!(!should_request_confirmation(&c, "irrelevant"));
     }
 }

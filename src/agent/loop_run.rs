@@ -41,6 +41,7 @@ mod summary;
 mod tester;
 mod turn;
 pub(crate) mod verifier_skill;
+pub(crate) mod work_mode_confirm;
 
 // Public re-exports so `lib.rs::run_cli` can hand a `FooterHandle` into
 // `Agent::new` and own the matching `FooterLease` for its scope (issue #430).
@@ -91,6 +92,21 @@ pub use tester::{
 // drive the closure-DI boundary (ANVIL_NO_AUTO_TEST) without live Ollama.
 pub use auto_test::auto_test_disabled;
 
+// Issue #576: expose WorkMode second-pass confirmation adapter surface so
+// `tests/work_mode_confirm_smoke.rs` can drive `run_work_mode_confirm_with_strategy`
+// (the closure-DI boundary) without an Ollama dependency. Production paths in
+// `turn.rs` / `commands.rs` continue to call these via `super::work_mode_confirm::...`;
+// these `pub use` lines only widen the visibility for integration tests.
+pub use work_mode_confirm::{
+    ParseStatus as WorkModeConfirmParseStatus, WORK_MODE_CONFIRM_PROMPT_INPUT_MAX_BYTES,
+    WORK_MODE_CONFIRM_REASON_MAX_BYTES, WORK_MODE_CONFIRM_RESPONSE_MAX_BYTES,
+    WORK_MODE_CONFIRM_TIMEOUT_SECS, WorkModeConfirmInputs, WorkModeConfirmOutcome,
+    WorkModeConfirmation, WorkModeConfirmationSource, WorkModeFallbackReason, WorkModeSkipReason,
+    build_work_mode_confirm_log_payload, build_work_mode_confirm_prompt,
+    first_pass_has_explicit_no_edit_signal, parse_second_pass_response,
+    run_work_mode_confirm_with_strategy, work_mode_confirm_disabled,
+};
+
 const DEFAULT_KEEP_TAIL: usize = 24;
 const LATE_TURN_KEEP_TAIL: usize = 12;
 
@@ -123,6 +139,11 @@ pub struct Agent {
     /// `handle_user_message`. Consumed only when a Tester smoke run actually
     /// dispatched (Recorded / Aborted); NotInvoked does not consume the cap.
     pub(super) tester_called_this_turn: bool,
+    /// Issue #576: per-turn cap for the WorkMode second-pass confirmation.
+    /// Reset at the top of every `process_line` (DR2-002), **not**
+    /// `handle_user_message` — `maybe_auto_plan_prompt` runs before
+    /// `handle_user_message` and is a valid second-pass call site.
+    pub(super) work_mode_confirm_called_this_turn: bool,
     /// Issue #456: tracks whether `compute_anvil_score` has already run for
     /// the current turn. Reset at the top of every `handle_user_message`,
     /// flipped to `true` after the post-loop compute writes
@@ -247,6 +268,7 @@ impl Agent {
             footer,
             reminder_called_this_turn: false,
             tester_called_this_turn: false,
+            work_mode_confirm_called_this_turn: false,
             anvil_score_computed_this_turn: false,
             skill_registry,
             repo_graph,

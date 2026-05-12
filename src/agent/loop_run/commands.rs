@@ -8,7 +8,7 @@ use super::summary::{ExitReason, format_run_summary};
 use super::*;
 use crate::config::LogLevel;
 use crate::logging::log_llm_event;
-use crate::modes::plan_act::{PlanStage, TaskProfile, classify_work_mode_json};
+use crate::modes::plan_act::{PlanStage, TaskProfile};
 use crate::ollama::xml_fallback::strip_think_tags;
 use crate::session::precaution::{
     AddPrecautionOutcome, Precaution, PrecautionSource, PrecautionStatus, Severity,
@@ -904,27 +904,16 @@ impl Agent {
             return Ok(None);
         }
 
-        let classification = classify_work_mode_json(input);
-        let work_mode = classification.work_mode;
-        self.session.mode_state.work_mode = work_mode;
-        log_llm_event(
-            "agent.work_mode.classified",
-            serde_json::json!({
-                "session_id": self.session_store.session_id(),
-                "input": input,
-                "stage": "auto_plan_precheck",
-                "work_mode": classification.work_mode.as_str(),
-                "intent": classification.intent,
-                "confidence": classification.confidence,
-                "ambiguity": classification.ambiguity,
-                "alternative_gap": classification.alternative_gap,
-                "allows_file_edits": classification.allows_file_edits,
-                "requires_tests": classification.requires_tests,
-                "reason": classification.reason,
-                "evidence": &classification.evidence,
-                "alternatives": &classification.alternatives,
-            }),
-        );
+        // Issue #576: classify + second-pass confirmation via the shared
+        // wrapper. `classify_with_confirmation` is the SSoT site for the
+        // existing `agent.work_mode.classified` event emission (now including
+        // `turn_index`), and it also drives the
+        // `agent.work_mode.{confirmed,skipped,fallback}` events via
+        // `maybe_invoke_work_mode_confirm`. After it returns, the final
+        // work_mode (LLM-corrected when applicable) lives in
+        // `self.session.mode_state.work_mode`.
+        let _classification = self.classify_with_confirmation(input, "auto_plan_precheck");
+        let work_mode = self.session.mode_state.work_mode;
         let policy = work_mode.policy();
         if !policy.repo_edit_required {
             self.session.mode_state.task_profile = TaskProfile::Research;
@@ -1310,6 +1299,13 @@ impl Agent {
         if input.trim().is_empty() {
             return Ok(AgentEvent::Continue(None));
         }
+
+        // Issue #576 / DR2-002: reset the per-user-input cap for the WorkMode
+        // second-pass confirmation. Reset must happen here (before
+        // `maybe_auto_plan_prompt` and the Plan approval / rejection early
+        // returns) so a Plan-approved-via-`execute_approved_plan` turn does
+        // not inherit a stale `true` from the previous turn (DR3-003).
+        self.work_mode_confirm_called_this_turn = false;
 
         let trimmed = input.trim();
 
