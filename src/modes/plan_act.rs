@@ -206,11 +206,24 @@ pub fn classify_work_mode_json(raw: &str) -> ModeClassification {
             "追記",
         ],
     );
+    // CB2-001: Use explicit prohibitive phrases for "no changes" instead of the
+    // bare substring "no changes", which would otherwise match descriptive
+    // contexts like "the app says no changes detected" and incorrectly route
+    // legitimate edit requests to `AnswerOnly`. The phrases below all encode an
+    // imperative "do not make changes" intent.
     let explicit_no_edit = contains_any(
         &lower,
         &[
             "do not modify",
             "don't modify",
+            "do not edit",
+            "don't edit",
+            "do not change",
+            "don't change",
+            "no edits",
+            "no changes please",
+            "make no changes",
+            "without changes",
             "no file changes",
             "without changing files",
             "read only",
@@ -684,5 +697,82 @@ mod tests {
         // confidence == 0.90 → not below threshold → skip (strict `<`).
         let c = make_classification(WORK_MODE_CONFIRM_CONFIDENCE_THRESHOLD, false);
         assert!(!should_request_confirmation(&c, "irrelevant"));
+    }
+
+    /// CB-002: ensure the `explicit_no_edit` needle set covers common English
+    /// negated-edit phrases ("do not edit" / "don't edit" / "no edits" /
+    /// "no changes please" / "do not change" / "don't change"). For each
+    /// phrase the classifier must select `AnswerOnly` regardless of any
+    /// edit-flavoured keywords in the input (e.g. "fix", "update").
+    #[test]
+    fn classifier_detects_english_negated_edit_phrases() {
+        for phrase in [
+            "Please review the code but do not edit anything.",
+            "Read the file, don't edit it.",
+            "Summarize the architecture; no edits.",
+            "Show me the issue but no changes please.",
+            "Explain the bug, do not change the file.",
+            "Analyze this code, don't change anything.",
+        ] {
+            let classification = classify_work_mode_json(phrase);
+            assert_eq!(
+                classification.work_mode,
+                WorkMode::AnswerOnly,
+                "phrase did not yield AnswerOnly: {phrase}",
+            );
+            assert!(
+                classification.evidence.contains(&"explicit-no-edit"),
+                "phrase missing explicit-no-edit evidence: {phrase}",
+            );
+        }
+    }
+
+    /// CB2-001 regression: edit requests that mention "no changes" inside a
+    /// descriptive context (e.g. error/status messages) must NOT acquire the
+    /// `explicit-no-edit` evidence, and therefore must NOT be classified as
+    /// `AnswerOnly`. The classifier must reserve `explicit-no-edit` for
+    /// imperative prohibitions ("no changes please", "make no changes",
+    /// "without changes", ...).
+    #[test]
+    fn classifier_does_not_treat_descriptive_no_changes_as_explicit_no_edit() {
+        for phrase in [
+            "Fix the bug where the app says no changes detected",
+            "When I run git status it shows no changes found, please fix the diff logic",
+            "The CI reports no changes but my edits are committed — please debug",
+        ] {
+            let classification = classify_work_mode_json(phrase);
+            assert_ne!(
+                classification.work_mode,
+                WorkMode::AnswerOnly,
+                "descriptive 'no changes' phrase was incorrectly routed to AnswerOnly: {phrase}",
+            );
+            assert!(
+                !classification.evidence.contains(&"explicit-no-edit"),
+                "descriptive 'no changes' phrase incorrectly tagged explicit-no-edit: {phrase}",
+            );
+        }
+    }
+
+    /// CB2-001: the new explicit prohibitive phrases must still route to
+    /// `AnswerOnly` with `explicit-no-edit` evidence. Locks the replacement
+    /// needles in.
+    #[test]
+    fn classifier_detects_new_explicit_no_changes_phrases() {
+        for phrase in [
+            "Summarize the design; no changes please.",
+            "Please review and make no changes to the source.",
+            "Explain the architecture without changes to any file.",
+        ] {
+            let classification = classify_work_mode_json(phrase);
+            assert_eq!(
+                classification.work_mode,
+                WorkMode::AnswerOnly,
+                "phrase did not yield AnswerOnly: {phrase}",
+            );
+            assert!(
+                classification.evidence.contains(&"explicit-no-edit"),
+                "phrase missing explicit-no-edit evidence: {phrase}",
+            );
+        }
     }
 }

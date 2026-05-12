@@ -143,6 +143,12 @@ pub struct Agent {
     /// Reset at the top of every `process_line` (DR2-002), **not**
     /// `handle_user_message` — `maybe_auto_plan_prompt` runs before
     /// `handle_user_message` and is a valid second-pass call site.
+    ///
+    /// CB-001 (Issue #576 follow-up): `classify_with_confirmation` reads this
+    /// flag to decide whether to overwrite the previously-resolved
+    /// `session.mode_state.work_mode` with a fresh first-pass result. While
+    /// the cap is consumed (`true`), the value already in the session is the
+    /// authoritative resolved mode and must not be clobbered.
     pub(super) work_mode_confirm_called_this_turn: bool,
     /// Issue #456: tracks whether `compute_anvil_score` has already run for
     /// the current turn. Reset at the top of every `handle_user_message`,
