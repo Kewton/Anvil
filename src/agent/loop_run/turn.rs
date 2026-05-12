@@ -9,12 +9,17 @@ use super::reminder::{
 use super::spinner::{Spinner, SpinnerStopSignal};
 use super::summary::{ExitReason, LoopResult, LoopStats};
 use super::tester;
+use super::work_mode_confirm::{
+    self, ParseStatus as WorkModeConfirmParseStatus, WORK_MODE_CONFIRM_TIMEOUT_SECS,
+    WorkModeConfirmInputs, WorkModeConfirmOutcome, build_work_mode_confirm_log_payload,
+    run_work_mode_confirm_with_strategy,
+};
 use super::*;
 use crate::agent::orchestration::{RepoVerification, capture_repo_snapshot, verify_repo_progress};
 use crate::logging::log_llm_event;
 use crate::model_capabilities::model_capabilities;
 use crate::modes::plan_act::{
-    PlanStage, TaskProfile, WorkMode, classify_work_mode_json, infer_work_mode_from_text,
+    ModeClassification, PlanStage, TaskProfile, WorkMode, classify_work_mode_json,
 };
 use crate::ollama::client::SIDECAR_SUMMARY_TIMEOUT_SECS;
 use crate::ollama::xml_fallback::normalize_tool_call_arguments;
@@ -1425,6 +1430,199 @@ pub(super) struct RetrievalInjection {
 }
 
 impl Agent {
+    /// Issue #576: SSoT wrapper that classifies user input with
+    /// `classify_work_mode_json`, emits the existing
+    /// `agent.work_mode.classified` event (now with `turn_index`), then drives
+    /// the LLM second-pass confirmation via `maybe_invoke_work_mode_confirm`.
+    /// Returns the first-pass classification — the final (possibly LLM-
+    /// corrected) work_mode is written into `self.session.mode_state.work_mode`
+    /// by the wrapper before this function returns, so the caller can read
+    /// `self.session.mode_state.work_mode` immediately afterwards.
+    pub(super) fn classify_with_confirmation(
+        &mut self,
+        input: &str,
+        stage_label: &'static str,
+    ) -> ModeClassification {
+        let classification = classify_work_mode_json(input);
+        self.session.mode_state.work_mode = classification.work_mode;
+        log_llm_event(
+            "agent.work_mode.classified",
+            serde_json::json!({
+                "session_id": self.session_store.session_id(),
+                "turn_index": self.current_turn_index,
+                "input": input,
+                "stage": stage_label,
+                "work_mode": classification.work_mode.as_str(),
+                "intent": classification.intent,
+                "confidence": classification.confidence,
+                "ambiguity": classification.ambiguity,
+                "alternative_gap": classification.alternative_gap,
+                "allows_file_edits": classification.allows_file_edits,
+                "requires_tests": classification.requires_tests,
+                "reason": classification.reason,
+                "evidence": &classification.evidence,
+                "alternatives": &classification.alternatives,
+            }),
+        );
+        self.maybe_invoke_work_mode_confirm(&classification, input);
+        classification
+    }
+
+    /// Issue #576: gate + dispatch the WorkMode second-pass confirmation. Skip
+    /// order (DR2-004):
+    ///   1. `work_mode_confirm_called_this_turn` (per-turn cap)
+    ///   2. Plan mode (caller-decided)
+    ///   3. `ANVIL_NO_MODE_CONFIRM` env
+    ///   4. `first_pass_has_explicit_no_edit_signal` — handled by the
+    ///      orchestrator as `Skipped(ExplicitReadOnly)`.
+    ///   5. `should_request_confirmation == false` — handled by the
+    ///      orchestrator as `Skipped(HighConfidence)`.
+    ///
+    /// Sidecar unavailable / timeout / transport / malformed responses map to
+    /// `Fallback` (consumes per-turn cap; first-pass work_mode kept).
+    pub(super) fn maybe_invoke_work_mode_confirm(
+        &mut self,
+        first_pass: &ModeClassification,
+        raw_input: &str,
+    ) {
+        let session_id = self.session_store.session_id().to_string();
+        let sidecar_model = self.models.sidecar.clone();
+        let turn_index = self.current_turn_index;
+
+        // 1. per-turn cap.
+        if self.work_mode_confirm_called_this_turn {
+            let outcome = WorkModeConfirmOutcome::Skipped {
+                reason: work_mode_confirm::WorkModeSkipReason::PerTurnCapConsumed,
+            };
+            let (event, payload) = build_work_mode_confirm_log_payload(
+                &outcome,
+                &session_id,
+                sidecar_model.as_deref(),
+                turn_index,
+                first_pass,
+                None,
+                WorkModeConfirmParseStatus::NotInvoked,
+            );
+            log_llm_event(event, payload);
+            return;
+        }
+
+        // 2. Plan mode (caller is expected not to call us in Plan mode, but
+        // defend in depth).
+        if self.session.mode_state.mode == ExecutionMode::Plan {
+            let outcome = WorkModeConfirmOutcome::Skipped {
+                reason: work_mode_confirm::WorkModeSkipReason::PlanMode,
+            };
+            let (event, payload) = build_work_mode_confirm_log_payload(
+                &outcome,
+                &session_id,
+                sidecar_model.as_deref(),
+                turn_index,
+                first_pass,
+                None,
+                WorkModeConfirmParseStatus::NotInvoked,
+            );
+            log_llm_event(event, payload);
+            return;
+        }
+
+        // 3. env disable.
+        if work_mode_confirm::work_mode_confirm_disabled(|k: &str| std::env::var(k)) {
+            let outcome = WorkModeConfirmOutcome::Skipped {
+                reason: work_mode_confirm::WorkModeSkipReason::EnvDisabled,
+            };
+            let (event, payload) = build_work_mode_confirm_log_payload(
+                &outcome,
+                &session_id,
+                sidecar_model.as_deref(),
+                turn_index,
+                first_pass,
+                None,
+                WorkModeConfirmParseStatus::NotInvoked,
+            );
+            log_llm_event(event, payload);
+            return;
+        }
+
+        // Build inputs + invoke orchestrator. The orchestrator handles the
+        // remaining skip / fallback branches.
+        let inputs = WorkModeConfirmInputs {
+            first_pass,
+            raw_input,
+            session_id: &session_id,
+            turn_index,
+            model: sidecar_model.as_deref(),
+        };
+
+        let attempt_started = Instant::now();
+        let outcome = if sidecar_model.is_some() {
+            // We're about to dispatch — consume the per-turn cap regardless of
+            // success/failure (DR4-004) so timeout/malformed/oversized cannot
+            // re-trigger another dispatch in the same user-input.
+            self.work_mode_confirm_called_this_turn = true;
+            let sidecar_name = sidecar_model.clone().expect("sidecar_model is Some here");
+            let confirm_client = self
+                .client
+                .clone_with_overrides(WORK_MODE_CONFIRM_TIMEOUT_SECS, 384)
+                .ok();
+            run_work_mode_confirm_with_strategy(inputs, |prompt| match confirm_client.as_ref() {
+                Some(c) => c
+                    .chat_text(
+                        &sidecar_name,
+                        &[ConversationMessage::user(prompt.to_string())],
+                    )
+                    .map(|reply| reply.content),
+                None => Err("client clone_with_overrides failed".to_string()),
+            })
+        } else {
+            // sidecar_model is None — orchestrator returns Fallback(SidecarUnavailable)
+            // without invoking the closure. We do not consume the per-turn cap
+            // because the user might transition into a state where the sidecar
+            // becomes available later in this same turn (defensive design).
+            run_work_mode_confirm_with_strategy(inputs, |_| Err("sidecar unavailable".to_string()))
+        };
+        let latency_ms = attempt_started.elapsed().as_millis() as u64;
+
+        // Determine parse_status + write back the resolved work_mode where
+        // applicable (Confirmed path only — Fallback keeps first-pass).
+        let parse_status = match &outcome {
+            WorkModeConfirmOutcome::Confirmed(_) => WorkModeConfirmParseStatus::Ok,
+            WorkModeConfirmOutcome::Skipped { .. } => WorkModeConfirmParseStatus::NotInvoked,
+            WorkModeConfirmOutcome::Fallback { reason, .. } => match reason {
+                work_mode_confirm::WorkModeFallbackReason::Timeout => {
+                    WorkModeConfirmParseStatus::Timeout
+                }
+                work_mode_confirm::WorkModeFallbackReason::TransportError
+                | work_mode_confirm::WorkModeFallbackReason::SidecarUnavailable => {
+                    WorkModeConfirmParseStatus::TransportError
+                }
+                work_mode_confirm::WorkModeFallbackReason::Empty => {
+                    WorkModeConfirmParseStatus::Empty
+                }
+                work_mode_confirm::WorkModeFallbackReason::Malformed
+                | work_mode_confirm::WorkModeFallbackReason::ResponseTooLarge
+                | work_mode_confirm::WorkModeFallbackReason::UnknownMode => {
+                    WorkModeConfirmParseStatus::Malformed
+                }
+            },
+        };
+
+        if let WorkModeConfirmOutcome::Confirmed(c) = &outcome {
+            self.session.mode_state.work_mode = c.mode;
+        }
+
+        let (event, payload) = build_work_mode_confirm_log_payload(
+            &outcome,
+            &session_id,
+            sidecar_model.as_deref(),
+            turn_index,
+            first_pass,
+            Some(latency_ms),
+            parse_status,
+        );
+        log_llm_event(event, payload);
+    }
+
     pub(super) fn handle_user_message(&mut self, input: &str, stream_output: bool) -> LoopResult {
         // Start the ESC interrupt monitor for the duration of this turn only —
         // rustyline owns raw mode during the REPL line-edit, so the monitor
@@ -2444,26 +2642,13 @@ impl Agent {
     ) -> LoopResult {
         self.push_user_message(input.to_string());
         if self.session.mode_state.mode != ExecutionMode::Plan {
-            let classification = classify_work_mode_json(input);
-            self.session.mode_state.work_mode = classification.work_mode;
-            log_llm_event(
-                "agent.work_mode.classified",
-                serde_json::json!({
-                    "session_id": self.session_store.session_id(),
-                    "input": input,
-                    "stage": "turn_start",
-                    "work_mode": classification.work_mode.as_str(),
-                    "intent": classification.intent,
-                    "confidence": classification.confidence,
-                    "ambiguity": classification.ambiguity,
-                    "alternative_gap": classification.alternative_gap,
-                    "allows_file_edits": classification.allows_file_edits,
-                    "requires_tests": classification.requires_tests,
-                    "reason": classification.reason,
-                    "evidence": &classification.evidence,
-                    "alternatives": &classification.alternatives,
-                }),
-            );
+            // Issue #576: replace direct `classify_work_mode_json` + event
+            // emit with the shared `classify_with_confirmation` wrapper. The
+            // wrapper emits the existing `agent.work_mode.classified` event
+            // (now with `turn_index`) and drives the LLM second-pass via
+            // `maybe_invoke_work_mode_confirm`. Final (LLM-corrected when
+            // applicable) work_mode lives in `self.session.mode_state.work_mode`.
+            let _ = self.classify_with_confirmation(input, "turn_start");
             self.maybe_compact_session(DEFAULT_KEEP_TAIL);
         }
         let _ = self.refresh_plan_stage();
@@ -5868,11 +6053,12 @@ impl Agent {
     }
 
     fn answer_only_mode_active(&self) -> bool {
+        // Issue #576 / DR3-001: tool policy must honour the second-pass-
+        // corrected `session.mode_state.work_mode` as the single source of
+        // truth. The previous OR with `infer_work_mode_from_text(active_request_text())`
+        // bypassed the second-pass result whenever the lexical pre-classifier
+        // still inferred `AnswerOnly`, defeating the whole point of this Issue.
         self.session.mode_state.work_mode == WorkMode::AnswerOnly
-            || self
-                .active_request_text()
-                .as_deref()
-                .is_some_and(|request| infer_work_mode_from_text(request) == WorkMode::AnswerOnly)
     }
 
     fn script_execution_requested(&self) -> bool {
