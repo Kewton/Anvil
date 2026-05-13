@@ -247,6 +247,11 @@ pub struct Config {
     /// Minimum number of shadow-mode evaluate turns required before canary rollout.
     /// Default: 100. Env: ANVIL_PHOTON_ROLLOUT_MIN_EVAL_TURNS.
     pub photon_rollout_min_eval_turns: u32,
+    /// Issue #583: whether `context_pack` warnings should be respected to filter
+    /// premature-termination seeds before prompt injection. Default: `true` via
+    /// `Config::load` (the struct's derived `Default` leaves this `false`; the
+    /// production path goes through `Config::load` which fills in `true`).
+    pub photon_respect_warnings: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -276,6 +281,8 @@ pub struct PartialConfig {
     pub photon_canary: Option<u16>,
     pub photon_timeout_ms: Option<u64>,
     pub photon_rollout_min_eval_turns: Option<u32>,
+    /// Issue #583: optional override for the warning filter (None = use default).
+    pub photon_respect_warnings: Option<bool>,
 }
 
 impl Config {
@@ -318,6 +325,7 @@ impl Config {
             photon_canary: None,
             photon_timeout_ms: None,
             photon_rollout_min_eval_turns: None,
+            photon_respect_warnings: None,
         };
         let merged = merge_partial_configs(&[file_config, env_config, cli_config]);
         let ollama_host = validate_localhost_url(
@@ -365,6 +373,9 @@ impl Config {
             photon_canary: merged.photon_canary.unwrap_or(0),
             photon_timeout_ms: merged.photon_timeout_ms.unwrap_or(200),
             photon_rollout_min_eval_turns: merged.photon_rollout_min_eval_turns.unwrap_or(100),
+            // Default true (Issue #583); explicit Some(false) from env/file
+            // disables the warning filter (escape hatch for canary rollback).
+            photon_respect_warnings: merged.photon_respect_warnings.unwrap_or(true),
         };
         Ok((config, warnings))
     }
@@ -439,6 +450,9 @@ pub fn merge_partial_configs(configs: &[PartialConfig]) -> PartialConfig {
         if config.photon_rollout_min_eval_turns.is_some() {
             merged.photon_rollout_min_eval_turns = config.photon_rollout_min_eval_turns;
         }
+        if config.photon_respect_warnings.is_some() {
+            merged.photon_respect_warnings = config.photon_respect_warnings;
+        }
     }
     merged
 }
@@ -505,6 +519,9 @@ pub fn load_config_file(path: &Path, warnings: &mut Vec<String>) -> Result<Parti
         photon_rollout_min_eval_turns: map
             .get("photon_rollout_min_eval_turns")
             .and_then(|v| parse_photon_rollout_min_eval_turns(v, warnings)),
+        photon_respect_warnings: map
+            .get("photon_respect_warnings")
+            .and_then(|v| parse_bool(v)),
     })
 }
 
@@ -577,6 +594,9 @@ pub fn load_env_config(warnings: &mut Vec<String>) -> PartialConfig {
         photon_rollout_min_eval_turns: env::var("ANVIL_PHOTON_ROLLOUT_MIN_EVAL_TURNS")
             .ok()
             .and_then(|v| parse_photon_rollout_min_eval_turns(&v, warnings)),
+        photon_respect_warnings: env::var("ANVIL_PHOTON_RESPECT_WARNINGS")
+            .ok()
+            .and_then(|v| parse_bool(&v)),
     }
 }
 

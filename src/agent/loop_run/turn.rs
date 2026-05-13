@@ -2973,12 +2973,46 @@ impl Agent {
         }
         let mut truncated = false;
 
+        let warning_filter_enabled = self.config.photon_respect_warnings;
+        let mut items_blocked = 0usize;
+
         if let Some(resp) = result {
-            // Issue #557: renderer replaces raw mask_secrets+truncate.
-            if let Some(rendered) = crate::photon::prompt::render_context_pack(&resp) {
-                // AN-6: count items actually rendered for adoption_status tracking.
-                let item_count = rendered.lines().filter(|l| l.starts_with("- ")).count();
-                self.last_photon_adopted_items = item_count;
+            // Issue #583: extract blocked summary IDs (no-op when
+            // warning_filter_enabled=false) and emit a warning_blocked event
+            // before rendering when any IDs were flagged.
+            let (blocked_ids, blocked_stats) = if warning_filter_enabled {
+                crate::photon::prompt::extract_blocked_summary_ids(&resp)
+            } else {
+                (
+                    std::collections::HashSet::<String>::new(),
+                    crate::photon::prompt::BlockedIdsStats::default(),
+                )
+            };
+            if !blocked_ids.is_empty() {
+                let mut id_list: Vec<String> = blocked_ids.iter().cloned().collect();
+                id_list.sort();
+                log_llm_event(
+                    "agent.photon_context_pack.warning_blocked",
+                    serde_json::json!({
+                        "session_id": self.session_store.session_id(),
+                        "turn_index": self.current_turn_index,
+                        "blocked_summary_ids": id_list,
+                        "total_warnings": blocked_stats.total_warnings,
+                        "total_blocked": blocked_ids.len(),
+                        "truncated_scan": blocked_stats.truncated_scan,
+                        "truncated_unique": blocked_stats.truncated_unique,
+                    }),
+                );
+            }
+
+            // Issue #557 + #583: renderer returns both the section and stats.
+            let (rendered_opt, render_stats) =
+                crate::photon::prompt::render_context_pack(&resp, &blocked_ids);
+            items_blocked = render_stats.items_blocked;
+            if let Some(rendered) = rendered_opt {
+                // AN-6: items_adopted is now sourced from RenderStats so the
+                // count matches the post-total-cap line set exactly.
+                self.last_photon_adopted_items = render_stats.items_adopted;
                 let (truncated_rendered, trunc) = truncate_photon_context_pack(rendered);
                 truncated = trunc;
                 self.photon_context_pack_response = Some(truncated_rendered);
@@ -2996,6 +3030,8 @@ impl Agent {
                 "items_adopted": self.last_photon_adopted_items,
                 "injected_bytes": self.photon_context_pack_response.as_deref().map(|s| s.len()).unwrap_or(0),
                 "duration_ms": duration_ms,
+                "warning_filter_enabled": warning_filter_enabled,
+                "items_blocked": items_blocked,
             }),
         );
     }
