@@ -1,8 +1,14 @@
+use std::collections::HashSet;
+
 use anvil::photon::eval::parse_evaluate_response;
 use anvil::photon::prompt::render_context_pack;
 use anvil::photon::schema::{
     ContextPackRequest, ContextPackResponse, EvaluateRequest, EvaluateResponse,
 };
+
+fn empty_blocked() -> HashSet<String> {
+    HashSet::new()
+}
 
 fn fixtures_dir() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/photon")
@@ -24,7 +30,7 @@ fn f1_context_pack_request_loads() {
 fn f2_context_pack_response_renders() {
     let raw = std::fs::read_to_string(fixtures_dir().join("context_pack_response.json")).unwrap();
     let resp: ContextPackResponse = serde_json::from_str(&raw).unwrap();
-    let result = render_context_pack(&resp);
+    let (result, _stats) = render_context_pack(&resp, &empty_blocked());
     assert!(result.is_some(), "expected Some(section) but got None");
     let section = result.unwrap();
     assert!(
@@ -60,7 +66,7 @@ fn f4_evaluate_response_parses() {
 fn f5_unsafe_raw_log_rejected() {
     let raw = std::fs::read_to_string(fixtures_dir().join("unsafe_raw_log_response.json")).unwrap();
     let resp: ContextPackResponse = serde_json::from_str(&raw).unwrap();
-    let result = render_context_pack(&resp);
+    let (result, _stats) = render_context_pack(&resp, &empty_blocked());
     assert!(
         result.is_none(),
         "expected None for unsafe fixture but got Some({:?})",

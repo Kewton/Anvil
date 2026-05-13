@@ -522,6 +522,9 @@ const PHOTON_ENV_VARS: &[(&str, Option<&str>)] = &[
     ("ANVIL_PHOTON_CANARY", None),
     ("ANVIL_PHOTON_TIMEOUT_MS", None),
     ("ANVIL_OFFLINE", None),
+    // Issue #583: keep this entry at the tail so existing index-based
+    // overrides (PHOTON_ENV_VARS[0..=4]) remain stable.
+    ("ANVIL_PHOTON_RESPECT_WARNINGS", None),
 ];
 
 #[test]
@@ -694,4 +697,66 @@ fn offline_forces_photon_disabled() {
             "expected offline override warning: {warnings:?}"
         );
     });
+}
+
+// ---------------------------------------------------------------------------
+// Issue #583: photon_respect_warnings (CW-01〜CW-04)
+// ---------------------------------------------------------------------------
+
+/// CW-01: default value is `true` when no override is provided.
+#[test]
+fn cw01_photon_respect_warnings_default_true() {
+    let tmp = tempfile::tempdir().unwrap();
+    with_env(PHOTON_ENV_VARS, || {
+        let (cfg, warnings) = Config::load(minimal_args(tmp.path())).unwrap();
+        assert!(
+            cfg.photon_respect_warnings,
+            "photon_respect_warnings must default to true"
+        );
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    });
+}
+
+/// CW-02: `ANVIL_PHOTON_RESPECT_WARNINGS=false` disables the filter.
+#[test]
+fn cw02_env_photon_respect_warnings_false() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut vars: Vec<(&str, Option<&str>)> = PHOTON_ENV_VARS.to_vec();
+    // tail position is the respect_warnings slot (see PHOTON_ENV_VARS comment)
+    let idx = vars.len() - 1;
+    vars[idx] = ("ANVIL_PHOTON_RESPECT_WARNINGS", Some("false"));
+    with_env(&vars, || {
+        let (cfg, _warnings) = Config::load(minimal_args(tmp.path())).unwrap();
+        assert!(
+            !cfg.photon_respect_warnings,
+            "ANVIL_PHOTON_RESPECT_WARNINGS=false must disable the filter"
+        );
+    });
+}
+
+/// CW-03: `.anvil/config` `photon_respect_warnings=false` is honoured.
+#[test]
+fn cw03_config_file_photon_respect_warnings_false() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config");
+    std::fs::write(&path, "photon_respect_warnings=false\n").unwrap();
+    let mut warnings = Vec::new();
+    let cfg = load_config_file(&path, &mut warnings).unwrap();
+    assert_eq!(cfg.photon_respect_warnings, Some(false));
+    assert!(warnings.is_empty());
+}
+
+/// CW-04: env overrides config-file when both are present.
+#[test]
+fn cw04_merge_photon_respect_warnings_env_overrides_file() {
+    let file_config = PartialConfig {
+        photon_respect_warnings: Some(false),
+        ..PartialConfig::default()
+    };
+    let env_config = PartialConfig {
+        photon_respect_warnings: Some(true),
+        ..PartialConfig::default()
+    };
+    let merged = merge_partial_configs(&[file_config, env_config]);
+    assert_eq!(merged.photon_respect_warnings, Some(true));
 }

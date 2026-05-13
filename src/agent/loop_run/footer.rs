@@ -1232,6 +1232,7 @@ mod tests {
             photon_canary: 0,
             photon_timeout_ms: 200,
             photon_rollout_min_eval_turns: 100,
+            photon_respect_warnings: true,
         }
     }
 
