@@ -19,7 +19,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import textwrap
 import time
 from collections import Counter
@@ -34,6 +33,7 @@ DEFAULT_SIDECAR = "qwen3-coder:30b"
 DEFAULT_REPS = 3
 DEFAULT_MAX_ITERATIONS = 50
 DEFAULT_TIMEOUT_SECS = 420
+DEFAULT_PHOTON_URL = "http://127.0.0.1:18765"
 
 RESULT_FIELDS = [
     "run_id",
@@ -44,6 +44,7 @@ RESULT_FIELDS = [
     "rep",
     "photon_on",
     "photon_context_injected",
+    "photon_warning_blocked_count",
     "pass",
     "high_quality",
     "protocol_complete",
@@ -205,6 +206,23 @@ def load_llm_events(state_dir: Path) -> list[dict[str, object]]:
 def event_payload(event: dict[str, object]) -> dict[str, object]:
     payload = event.get("payload")
     return payload if isinstance(payload, dict) else {}
+
+
+def safe_non_negative_int(value: object) -> int:
+    """Coerce an untrusted log payload value into a non-negative int.
+
+    Used by photon observability extraction where payload fields may be missing,
+    of unexpected type, or out of range. Returns 0 for any non-coercible or
+    negative value (including bool, which is intentionally rejected to avoid
+    `True -> 1` surprises in counters).
+    """
+    if isinstance(value, bool):
+        return 0
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return parsed if parsed >= 0 else 0
 
 
 def format_metric_float(value: object) -> str:
@@ -753,14 +771,25 @@ def grade_sp_01(root: Path, output: str, _err: str, rc: int, changed: set[str]) 
 
 
 def extract_photon_observability(events: list[dict[str, object]]) -> dict[str, object]:
+    # Walk every event (no early break): warning_blocked events may appear after
+    # the completed event in the same session, and we need to accumulate
+    # total_blocked across all turns. Payload fields are treated as untrusted
+    # input via safe_non_negative_int() as defense-in-depth.
     injected = False
+    warning_blocked_count = 0
     for event in events:
-        if event.get("event") == "agent.photon_context_pack.completed":
+        name = event.get("event")
+        if name == "agent.photon_context_pack.completed":
             payload = event_payload(event)
-            if payload.get("injected") is True or int(payload.get("items_adopted", 0)) > 0:
+            if payload.get("injected") is True or safe_non_negative_int(payload.get("items_adopted")) > 0:
                 injected = True
-                break
-    return {"photon_context_injected": injected}
+        elif name == "agent.photon_context_pack.warning_blocked":
+            payload = event_payload(event)
+            warning_blocked_count += safe_non_negative_int(payload.get("total_blocked"))
+    return {
+        "photon_context_injected": injected,
+        "photon_warning_blocked_count": warning_blocked_count,
+    }
 
 
 def scenario_map() -> dict[str, Scenario]:
@@ -806,6 +835,15 @@ def scenario_map() -> dict[str, Scenario]:
             grade_s2_03,
         ),
         Scenario(
+            "S2-03-en",
+            "ui-framework",
+            "Existing SvelteKit route edit (English)",
+            "Read the existing SvelteKit page and add status toggle UI to Operations Console. "
+            "Do not replace with React/Next.js. Verify with npm run build.",
+            setup_s2_03,
+            grade_s2_03,
+        ),
+        Scenario(
             "S2-06",
             "ui-framework",
             "Unknown UI framework safe fail",
@@ -818,6 +856,14 @@ def scenario_map() -> dict[str, Scenario]:
             "existing-code",
             "Python bug fix with self-test",
             "calculator.pyのバグを修正し、ANVIL.mdのPreferred verifierで確認してください。",
+            setup_s3_01,
+            grade_s3_01,
+        ),
+        Scenario(
+            "S3-01-en",
+            "existing-code",
+            "Python bug fix with self-test (English)",
+            "Fix the bug in calculator.py and verify using the Preferred verifier listed in ANVIL.md.",
             setup_s3_01,
             grade_s3_01,
         ),
@@ -854,6 +900,14 @@ def scenario_map() -> dict[str, Scenario]:
             grade_s5_01,
         ),
         Scenario(
+            "S5-01-en",
+            "harness",
+            "ANVIL.md preferred verifier (English)",
+            "Fix the bug in tool.py and verify using the Preferred verifier listed in ANVIL.md.",
+            setup_s5_01,
+            grade_s5_01,
+        ),
+        Scenario(
             "S6-04",
             "observability-safety",
             "Secret-looking value redaction",
@@ -878,6 +932,7 @@ SCENARIO_SETS = {
     "strict": ["S0-01", "S1-02", "S2-03", "S3-01"],
     "expanded": ["S0-01", "S1-01", "S1-02", "S2-02", "S2-03", "S2-06", "S3-01", "S3-03", "S3-04", "S4-02", "S5-01", "S6-04"],
     "photon": ["SP-01"],
+    "cross_lingual": ["S2-03", "S2-03-en", "S3-01", "S3-01-en", "S5-01", "S5-01-en"],
 }
 
 
@@ -905,7 +960,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--photon-url",
-        default="http://127.0.0.1:18765",
+        default=DEFAULT_PHOTON_URL,
         help="Photon sidecar URL. Used only when --photon-on is set. Default: %(default)s",
     )
     return parser.parse_args()
@@ -985,7 +1040,7 @@ def run_one(
     timeout_secs: int,
     dry_run: bool,
     photon_on: bool = False,
-    photon_url: str = "http://127.0.0.1:18765",
+    photon_url: str = DEFAULT_PHOTON_URL,
 ) -> dict[str, str]:
     model_slug = model.replace(":", "_").replace("/", "_")
     workdir = run_dir / "workdirs" / model_slug / f"r{rep}" / scenario.id
@@ -1063,7 +1118,7 @@ def run_one(
     output = stdout + "\n" + stderr
     if dry_run:
         first_iter, total_iter = count_iters(output)
-        return {
+        dry_run_row = {
             "run_id": run_dir.name,
             "commit": commit,
             "scenario_id": scenario.id,
@@ -1072,6 +1127,7 @@ def run_one(
             "rep": str(rep),
             "photon_on": bool_s(photon_on),
             "photon_context_injected": "",
+            "photon_warning_blocked_count": "",
             "pass": "",
             "high_quality": "",
             "protocol_complete": "",
@@ -1104,6 +1160,12 @@ def run_one(
             "dirty_worktree_preserved": "",
             "notes": "dry-run",
         }
+        assert set(dry_run_row) == set(RESULT_FIELDS), (
+            f"dry_run_row keys mismatch RESULT_FIELDS: "
+            f"extra={set(dry_run_row)-set(RESULT_FIELDS)}, "
+            f"missing={set(RESULT_FIELDS)-set(dry_run_row)}"
+        )
+        return dry_run_row
     llm_events = load_llm_events(state_dir)
     grade = scenario.grade(workdir, output, stderr, rc, changed)
     grade.setdefault("pass", rc == 0)
@@ -1116,6 +1178,8 @@ def run_one(
     grade.update(extract_observability(llm_events))
     grade.update(extract_photon_observability(llm_events))
     grade["photon_on"] = photon_on
+    if not photon_on:
+        grade["photon_warning_blocked_count"] = ""
     grade.setdefault("fallback_level", "minimal-patch")
     if grade.get("verification_pass") != "" and not grade.get("verifier_source"):
         grade["verifier_source"] = "e2e_scenario_grader"
@@ -1255,6 +1319,8 @@ def main() -> int:
         reps=args.reps,
         scenarios=scenarios,
         max_iterations=args.max_iterations,
+        photon_on=args.photon_on,
+        photon_url=args.photon_url,
     )
 
     rows: list[dict[str, str]] = []

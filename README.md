@@ -290,6 +290,7 @@ workdir 側の `.anvil/logs/` `.anvil/sessions/` `.anvil/plans/` は上記への
 
 `scripts/` 配下のハーネス群で 5-run ベンチマークと集計レポートを生成できる。
 実践的な E2E/UAT の評価設計は `docs/e2e-uat-evaluation.md` にまとめている。
+Photon の cross-lingual 効果を測る場合は `--scenario-set cross_lingual`（日本語/英語ペア 6 シナリオ）と `photon_warning_blocked_count` 列を併用する（詳細: [docs/e2e-uat-evaluation.md](docs/e2e-uat-evaluation.md#cross-lingual-eval-run)）。
 CI / release confidence checks は [docs/ci.md](docs/ci.md) にまとめている。
 Git 管理に含める artifacts の方針は [docs/repository-hygiene.md](docs/repository-hygiene.md) にまとめている。
 
