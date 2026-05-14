@@ -249,7 +249,7 @@ For release-quality validation, use the expanded strict rule:
 `workspace/eval/runs/<run-id>/results.csv` should use this header:
 
 ```csv
-run_id,commit,scenario_id,model,sidecar_model,rep,photon_on,photon_context_injected,pass,high_quality,protocol_complete,verification_pass,fallback_used,fallback_level,fallback_completed,mode,mode_confidence,mode_alternative_gap,mode_ambiguity,mode_override_count,verifier_source,verifier_candidate_count,repo_context_seed_source,repo_context_candidate_count,repo_context_no_candidates,first_success_iter,total_iter,duration_sec,changed_files_count,unrelated_change_count,tool_failure_count,read_before_edit,real_entry_file_touched,safe_fail,safety_violation,browser_smoke_pass,resume_pass,dirty_worktree_preserved,notes
+run_id,commit,scenario_id,model,sidecar_model,rep,photon_on,photon_context_injected,photon_warning_blocked_count,pass,high_quality,protocol_complete,verification_pass,fallback_used,fallback_level,fallback_completed,mode,mode_confidence,mode_alternative_gap,mode_ambiguity,mode_override_count,verifier_source,verifier_candidate_count,repo_context_seed_source,repo_context_candidate_count,repo_context_no_candidates,first_success_iter,total_iter,duration_sec,changed_files_count,unrelated_change_count,tool_failure_count,read_before_edit,real_entry_file_touched,safe_fail,safety_violation,browser_smoke_pass,resume_pass,dirty_worktree_preserved,notes
 ```
 
 `photon_on`: `true` when the run was invoked with `--photon-on`; `false`
@@ -258,6 +258,12 @@ otherwise. Leave empty for legacy runs predating this field.
 `photon_context_injected`: `true` when the `agent.photon_context_pack.completed`
 event reports `injected=true` or `items_adopted>0` for that turn; `false`
 otherwise.
+
+`photon_warning_blocked_count`: cumulative sum of `total_blocked` from all
+`agent.photon_context_pack.warning_blocked` events across all turns in the
+session. Empty string (`""`) when `photon_on=false`. `"0"` when
+`photon_on=true` but no warnings fired. A value `> 0` indicates the
+warning_filter was active for at least one turn.
 
 Boolean fields must be `true` or `false`. Unknown values should be empty rather
 than guessed.
@@ -323,6 +329,33 @@ Anvil; dry-run rows leave pass/fail fields blank and exit `0`. Real runs exit
 `0` only when every row is `high_quality=true`; otherwise they exit `2` after
 writing the artifacts for inspection. Per-scenario timeouts are recorded as
 failed rows with `notes=timeout`; they must not abort the rest of the matrix.
+
+## Cross-Lingual Eval Run
+
+To measure photon's cross-lingual effect, use the `cross_lingual` scenario set
+which pairs each Japanese scenario with an English variant:
+
+```bash
+python3 scripts/e2e_uat_matrix.py \
+  --scenario-set cross_lingual \
+  --models qwen3.6:27b-coding-nvfp4 \
+  --sidecar-model qwen3-coder:30b \
+  --reps 1 \
+  --photon-on
+```
+
+`--scenario-set cross_lingual` covers:
+
+- S2-03 existing SvelteKit route edit (Japanese)
+- S2-03-en existing SvelteKit route edit (English)
+- S3-01 Python bug fix with self-test (Japanese)
+- S3-01-en Python bug fix with self-test (English)
+- S5-01 ANVIL.md preferred verifier (Japanese)
+- S5-01-en ANVIL.md preferred verifier (English)
+
+Compare `photon_warning_blocked_count` between Japanese and English rows to
+quantify the cross-lingual effect. A value `> 0` in English rows confirms
+that the warning_filter is active for cross-lingual sessions.
 
 ## Photon Memory Comparison Run
 
