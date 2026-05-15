@@ -2988,7 +2988,7 @@ impl Agent {
                     crate::photon::prompt::BlockedIdsStats::default(),
                 )
             };
-            if !blocked_ids.is_empty() {
+            if !blocked_ids.is_empty() || blocked_stats.respected_by_admission_reason > 0 {
                 let mut id_list: Vec<String> = blocked_ids.iter().cloned().collect();
                 id_list.sort();
                 log_llm_event(
@@ -3001,6 +3001,11 @@ impl Agent {
                         "total_blocked": blocked_ids.len(),
                         "truncated_scan": blocked_stats.truncated_scan,
                         "truncated_unique": blocked_stats.truncated_unique,
+                        // Issue #589: audit how many IDs the photon sidecar's
+                        // admission_reason removed from the block set and how
+                        // many remain enforced after the subtraction pass.
+                        "respected_by_admission_reason": blocked_stats.respected_by_admission_reason,
+                        "still_blocked": blocked_stats.still_blocked,
                     }),
                 );
             }
