@@ -108,7 +108,8 @@ fn find_first_event(session_id: &str, event_name: &str) -> Option<serde_json::Va
 
 /// Build a mockito body for `/v1/context/pack` with the given items and
 /// optional warnings. Items each carry `id=seed_<i>` so we can flag specific
-/// entries by ID.
+/// entries by ID. Uses the real photon v0.2 sidecar layout where items and
+/// warnings are nested under `context_pack` (Issue #587).
 fn mock_context_pack_body(num_items: usize, warnings: serde_json::Value) -> String {
     let items: Vec<serde_json::Value> = (0..num_items)
         .map(|i| {
@@ -120,8 +121,11 @@ fn mock_context_pack_body(num_items: usize, warnings: serde_json::Value) -> Stri
         })
         .collect();
     serde_json::json!({
-        "items": items,
-        "warnings": warnings,
+        "schema_version": "action-memory.v0.2",
+        "context_pack": {
+            "items": items,
+            "warnings": warnings,
+        }
     })
     .to_string()
 }
