@@ -251,6 +251,10 @@ pub struct Config {
     /// premature-termination seeds before prompt injection. Default: `true` via
     /// `Config::load` (the struct's derived `Default` leaves this `false`; the
     /// production path goes through `Config::load` which fills in `true`).
+    ///
+    /// Issue #589: when enabled, admission_reason-handled IDs are subtracted
+    /// from the block set. No new env/config flag is added; the existing
+    /// `photon_respect_warnings` gate governs the entire two-stage pipeline.
     pub photon_respect_warnings: bool,
 }
 

@@ -50,6 +50,21 @@ pub const MAX_PHOTON_WARNING_MESSAGE_BYTES: usize = 2048;
 pub const BLOCKED_WARNING_REASON: &str = "premature_termination_risk";
 
 // ---------------------------------------------------------------------------
+// Issue #589: admission_reason-based softer block handling
+// ---------------------------------------------------------------------------
+
+/// Maximum byte length of an `admission_reason` string parsed by
+/// `is_already_handled_by_photon`. Strings beyond this cap are treated as
+/// non-handled (fail-closed) to prevent DoS via giant payloads.
+pub(crate) const MAX_PHOTON_ADMISSION_REASON_BYTES: usize = 512;
+
+/// Substring markers that signal the photon sidecar has already mitigated the
+/// premature-termination risk for an item (case-insensitive ASCII match). When
+/// such a marker is present, the item is removed from the block set so its
+/// summary can still be injected into the prompt.
+pub(crate) const PHOTON_HANDLED_MARKERS: &[&str] = &["next_hints suppressed"];
+
+// ---------------------------------------------------------------------------
 // Pattern lists — case-insensitive substring match via to_ascii_lowercase()
 // ---------------------------------------------------------------------------
 
@@ -101,6 +116,13 @@ pub(crate) struct BlockedIdsStats {
     pub truncated_scan: bool,
     /// `true` when the unique-ID cap (`MAX_BLOCKED_SUMMARY_IDS`) was reached.
     pub truncated_unique: bool,
+    /// Issue #589: number of IDs that were removed from the block set because
+    /// their corresponding item's `admission_reason` signalled the photon
+    /// sidecar had already handled the risk (e.g. `"next_hints suppressed"`).
+    pub respected_by_admission_reason: usize,
+    /// Issue #589: number of IDs remaining in the block set after the
+    /// admission_reason subtraction pass.
+    pub still_blocked: usize,
 }
 
 /// Per-call statistics produced by `render_context_pack`.
@@ -430,12 +452,96 @@ fn parse_warning_message(msg: &str) -> Option<(&str, &str)> {
     Some((id_raw, BLOCKED_WARNING_REASON))
 }
 
+/// Returns `true` when an `admission_reason` string signals that the photon
+/// sidecar has already mitigated the premature-termination risk for an item.
+///
+/// Fail-closed pipeline (Issue #589): each defensive layer returns `false`
+/// when the reason violates a safety invariant, ensuring a malicious or
+/// malformed reason cannot bypass the block. Layers (in order):
+///
+/// 1. Byte cap (`MAX_PHOTON_ADMISSION_REASON_BYTES`).
+/// 2. Reject ASCII control characters (`< 0x20`, `0x7f`).
+/// 3. Reject Unicode bidi/format control characters.
+/// 4. Reject reasons containing secret-like substrings (mask_secrets diff
+///    or known secret words such as `token`, `api_key`).
+/// 5. Case-insensitive ASCII match against `PHOTON_HANDLED_MARKERS`.
+pub(crate) fn is_already_handled_by_photon(reason: &str) -> bool {
+    if reason.len() > MAX_PHOTON_ADMISSION_REASON_BYTES {
+        return false;
+    }
+    if reason.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return false;
+    }
+    if reason.chars().any(is_bidi_control) {
+        return false;
+    }
+    if mask_secrets(reason) != reason {
+        return false;
+    }
+    if contains_secret_word(reason) {
+        return false;
+    }
+    let lower = reason.to_ascii_lowercase();
+    PHOTON_HANDLED_MARKERS
+        .iter()
+        .any(|marker| lower.contains(*marker))
+}
+
+/// Extract the set of sanitized summary IDs whose corresponding item carries an
+/// `admission_reason` accepted by `is_already_handled_by_photon`.
+///
+/// Mirrors `extract_blocked_summary_ids` / `parse_items_with_total` by accepting
+/// both the v0.2 sidecar layout (`context_pack.items`) and the legacy
+/// top-level `items` shape. Scans at most `MAX_PROMPT_SCAN_ITEMS` items.
+/// Fail-open: missing fields and unexpected types yield an empty set.
+pub(crate) fn extract_photon_handled_ids(resp: &ContextPackResponse) -> HashSet<String> {
+    let items = resp
+        .0
+        .get("context_pack")
+        .and_then(|cp| cp.get("items"))
+        .and_then(|v| v.as_array())
+        .or_else(|| resp.0.get("items").and_then(|v| v.as_array()));
+    let Some(items) = items else {
+        return HashSet::new();
+    };
+    let mut handled: HashSet<String> = HashSet::new();
+    for item in items.iter().take(MAX_PROMPT_SCAN_ITEMS) {
+        // CB-001: only summary-kind items may release a block. Non-summary items
+        // (e.g. kind="log") with the same id and a marker admission_reason must
+        // not bypass the warning filter — render_context_pack itself drops them.
+        if !is_summary_kind(item) {
+            continue;
+        }
+        let id_raw = match item.get("id").and_then(|v| v.as_str()) {
+            Some(s) => s,
+            None => continue,
+        };
+        let id_clean = match sanitize_summary_id(id_raw) {
+            Some(s) => s,
+            None => continue,
+        };
+        let reason = match item.get("admission_reason").and_then(|v| v.as_str()) {
+            Some(r) => r,
+            None => continue,
+        };
+        if is_already_handled_by_photon(reason) {
+            handled.insert(id_clean);
+        }
+    }
+    handled
+}
+
 /// Extract the set of summary IDs that the photon sidecar has flagged with
 /// `summary_quality_gate` / `premature_termination_risk` (Issue #583).
 ///
 /// Accepts the v0.2 sidecar layout (`context_pack.warnings`) first, then
 /// falls back to legacy top-level `warnings` for test fixtures — mirrors
 /// `parse_items_with_total` (Issue #587).
+///
+/// Issue #589: after building the initial block set from warnings, items whose
+/// `admission_reason` indicates the photon sidecar has already handled the
+/// risk are removed from the block set. `BlockedIdsStats` records the count of
+/// IDs respected and the residual count still blocked for audit.
 ///
 /// Fail-open: malformed responses, missing fields, and unexpected types yield
 /// an empty set rather than blocking everything. Returns the set together with
@@ -491,12 +597,26 @@ pub(crate) fn extract_blocked_summary_ids(
         blocked.insert(id_clean);
     }
 
+    // Issue #589: subtract photon-handled IDs from the block set so that items
+    // already mitigated by the sidecar (e.g. `next_hints suppressed`) survive
+    // into the rendered prompt.
+    let before = blocked.len();
+    let handled = extract_photon_handled_ids(resp);
+    if !handled.is_empty() {
+        blocked.retain(|id| !handled.contains(id));
+    }
+    let after = blocked.len();
+    let respected_by_admission_reason = before.saturating_sub(after);
+    let still_blocked = after;
+
     (
         blocked,
         BlockedIdsStats {
             total_warnings: total,
             truncated_scan,
             truncated_unique,
+            respected_by_admission_reason,
+            still_blocked,
         },
     )
 }
@@ -1161,5 +1281,174 @@ mod tests {
         // from a stray partial line).
         assert!(section.chars().count() <= MAX_PROMPT_TOTAL_CHARS);
         assert_eq!(adopted + dropped, items.len());
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #589: is_already_handled_by_photon — fail-closed boundary tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ihbp_accepts_simple_marker() {
+        assert!(is_already_handled_by_photon("next_hints suppressed"));
+    }
+
+    #[test]
+    fn ihbp_accepts_marker_with_surrounding_text() {
+        assert!(is_already_handled_by_photon(
+            "tail clipped, next_hints suppressed by policy"
+        ));
+    }
+
+    #[test]
+    fn ihbp_accepts_case_insensitive_marker() {
+        assert!(is_already_handled_by_photon("NEXT_HINTS SUPPRESSED"));
+    }
+
+    #[test]
+    fn ihbp_rejects_unrelated_reason() {
+        assert!(!is_already_handled_by_photon("ok"));
+        assert!(!is_already_handled_by_photon("admitted"));
+    }
+
+    #[test]
+    fn ihbp_rejects_oversize_reason() {
+        let big = format!("{} next_hints suppressed", "x".repeat(1024));
+        assert!(!is_already_handled_by_photon(&big));
+    }
+
+    #[test]
+    fn ihbp_rejects_ascii_control() {
+        assert!(!is_already_handled_by_photon("next_hints suppressed\n"));
+        assert!(!is_already_handled_by_photon("next_hints suppressed\t"));
+    }
+
+    #[test]
+    fn ihbp_rejects_bidi_control() {
+        let reason = "next_hints suppressed\u{202e}rev";
+        assert!(!is_already_handled_by_photon(reason));
+    }
+
+    #[test]
+    fn ihbp_rejects_secret_like_word() {
+        assert!(!is_already_handled_by_photon(
+            "next_hints suppressed token=abc"
+        ));
+        assert!(!is_already_handled_by_photon(
+            "next_hints suppressed; api_key issue"
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #589: extract_photon_handled_ids — layout coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn eph_legacy_top_level_layout() {
+        let resp = mk_resp(json!({
+            "items": [
+                { "kind": "summary", "id": "seed_a", "summary": "a",
+                  "admission_reason": "next_hints suppressed" },
+                { "kind": "summary", "id": "seed_b", "summary": "b" },
+            ]
+        }));
+        let handled = extract_photon_handled_ids(&resp);
+        assert!(handled.contains("seed_a"));
+        assert!(!handled.contains("seed_b"));
+    }
+
+    #[test]
+    fn eph_v0_2_nested_layout() {
+        let resp = mk_resp(json!({
+            "context_pack": {
+                "items": [
+                    { "kind": "summary", "id": "seed_n", "summary": "n",
+                      "admission_reason": "next_hints suppressed" },
+                ]
+            }
+        }));
+        let handled = extract_photon_handled_ids(&resp);
+        assert!(handled.contains("seed_n"));
+    }
+
+    #[test]
+    fn eph_missing_admission_reason_is_not_handled() {
+        let resp = mk_resp(json!({
+            "items": [
+                { "kind": "summary", "id": "seed_x", "summary": "x" }
+            ]
+        }));
+        let handled = extract_photon_handled_ids(&resp);
+        assert!(handled.is_empty());
+    }
+
+    #[test]
+    fn eph_invalid_id_is_dropped() {
+        // secret-like id is rejected by sanitize_summary_id even when the
+        // reason is otherwise valid.
+        let resp = mk_resp(json!({
+            "items": [
+                { "kind": "summary", "id": "seed_TOKEN", "summary": "t",
+                  "admission_reason": "next_hints suppressed" }
+            ]
+        }));
+        let handled = extract_photon_handled_ids(&resp);
+        assert!(handled.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #589: extract_blocked_summary_ids — subtraction stats
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ebs_admission_reason_subtracts_id_from_block() {
+        let resp = mk_resp(json!({
+            "items": [
+                { "kind": "summary", "id": "seed_a", "summary": "a",
+                  "admission_reason": "next_hints suppressed" },
+                { "kind": "summary", "id": "seed_b", "summary": "b" },
+            ],
+            "warnings": [
+                { "kind": "summary_quality_gate", "message": "seed_a: premature_termination_risk" },
+                { "kind": "summary_quality_gate", "message": "seed_b: premature_termination_risk" }
+            ]
+        }));
+        let (blocked, stats) = extract_blocked_summary_ids(&resp);
+        assert!(!blocked.contains("seed_a"));
+        assert!(blocked.contains("seed_b"));
+        assert_eq!(stats.respected_by_admission_reason, 1);
+        assert_eq!(stats.still_blocked, 1);
+    }
+
+    #[test]
+    fn ebs_no_admission_reason_preserves_full_block_set() {
+        let resp = mk_resp(json!({
+            "items": [
+                { "kind": "summary", "id": "seed_a", "summary": "a" },
+            ],
+            "warnings": [
+                { "kind": "summary_quality_gate", "message": "seed_a: premature_termination_risk" }
+            ]
+        }));
+        let (blocked, stats) = extract_blocked_summary_ids(&resp);
+        assert!(blocked.contains("seed_a"));
+        assert_eq!(stats.respected_by_admission_reason, 0);
+        assert_eq!(stats.still_blocked, 1);
+    }
+
+    #[test]
+    fn ebs_admission_reason_without_warning_is_noop() {
+        // No warnings at all → still_blocked=0, respected_by_admission_reason=0
+        // (the subtraction pass cannot remove what was never in the block set).
+        let resp = mk_resp(json!({
+            "items": [
+                { "kind": "summary", "id": "seed_a", "summary": "a",
+                  "admission_reason": "next_hints suppressed" },
+            ],
+            "warnings": []
+        }));
+        let (blocked, stats) = extract_blocked_summary_ids(&resp);
+        assert!(blocked.is_empty());
+        assert_eq!(stats.respected_by_admission_reason, 0);
+        assert_eq!(stats.still_blocked, 0);
     }
 }
