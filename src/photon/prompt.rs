@@ -433,13 +433,23 @@ fn parse_warning_message(msg: &str) -> Option<(&str, &str)> {
 /// Extract the set of summary IDs that the photon sidecar has flagged with
 /// `summary_quality_gate` / `premature_termination_risk` (Issue #583).
 ///
+/// Accepts the v0.2 sidecar layout (`context_pack.warnings`) first, then
+/// falls back to legacy top-level `warnings` for test fixtures — mirrors
+/// `parse_items_with_total` (Issue #587).
+///
 /// Fail-open: malformed responses, missing fields, and unexpected types yield
 /// an empty set rather than blocking everything. Returns the set together with
 /// stats describing which DoS caps fired.
 pub(crate) fn extract_blocked_summary_ids(
     resp: &ContextPackResponse,
 ) -> (HashSet<String>, BlockedIdsStats) {
-    let warnings = match resp.0.get("warnings").and_then(|v| v.as_array()) {
+    let warnings = match resp
+        .0
+        .get("context_pack")
+        .and_then(|cp| cp.get("warnings"))
+        .and_then(|v| v.as_array())
+        .or_else(|| resp.0.get("warnings").and_then(|v| v.as_array()))
+    {
         Some(arr) => arr,
         None => return (HashSet::new(), BlockedIdsStats::default()),
     };
@@ -954,6 +964,35 @@ mod tests {
         let section = section.expect("item lacking id must survive (fail-open)");
         assert!(section.contains("summary without id"));
         assert_eq!(render_stats.items_blocked, 0);
+        assert_eq!(render_stats.items_adopted, 1);
+    }
+
+    // WF-14 (Issue #587): warnings nested under `context_pack` (real photon
+    // v0.2 sidecar layout) are extracted; previously they were silently
+    // ignored because the function only looked at the top-level key.
+    #[test]
+    fn wf14_v0_2_nested_warnings_layout() {
+        let resp = mk_resp(json!({
+            "schema_version": "action-memory.v0.2",
+            "context_pack": {
+                "items": [
+                    { "kind": "summary", "id": "seed_a", "summary": "a" },
+                    { "kind": "summary", "id": "seed_b", "summary": "b" },
+                ],
+                "warnings": [
+                    { "kind": "summary_quality_gate", "message": "seed_a: premature_termination_risk" }
+                ]
+            }
+        }));
+        let (blocked, stats) = extract_blocked_summary_ids(&resp);
+        assert_eq!(stats.total_warnings, 1);
+        assert!(blocked.contains("seed_a"));
+        assert!(!blocked.contains("seed_b"));
+        let (section, render_stats) = render_context_pack(&resp, &blocked);
+        let section = section.expect("non-blocked item must survive");
+        assert!(section.contains("b"));
+        assert!(!section.contains("seed_a"));
+        assert_eq!(render_stats.items_blocked, 1);
         assert_eq!(render_stats.items_adopted, 1);
     }
 
