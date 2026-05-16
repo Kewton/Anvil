@@ -963,6 +963,16 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_PHOTON_URL,
         help="Photon sidecar URL. Used only when --photon-on is set. Default: %(default)s",
     )
+    parser.add_argument(
+        "--photon-repo-prefix",
+        default="",
+        help=(
+            "Prefix to prepend to scenario id when naming the workdir. "
+            "Anvil sends the workdir basename as the photon repo name; "
+            "use a non-empty prefix to bypass seeded photon memories "
+            "(A-0 measurement: photon ON, no seed match)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1041,10 +1051,14 @@ def run_one(
     dry_run: bool,
     photon_on: bool = False,
     photon_url: str = DEFAULT_PHOTON_URL,
+    photon_repo_prefix: str = "",
 ) -> dict[str, str]:
     model_slug = model.replace(":", "_").replace("/", "_")
-    workdir = run_dir / "workdirs" / model_slug / f"r{rep}" / scenario.id
-    state_dir = run_dir / "state" / model_slug / f"r{rep}" / scenario.id
+    # photon_repo_prefix lets caller bypass seeded photon memories by changing
+    # the workdir basename (which Anvil sends as photon repo name).
+    scenario_dir_name = f"{photon_repo_prefix}{scenario.id}" if photon_repo_prefix else scenario.id
+    workdir = run_dir / "workdirs" / model_slug / f"r{rep}" / scenario_dir_name
+    state_dir = run_dir / "state" / model_slug / f"r{rep}" / scenario_dir_name
     log_dir = run_dir / "raw" / model_slug / f"r{rep}"
     shutil.rmtree(workdir, ignore_errors=True)
     shutil.rmtree(state_dir, ignore_errors=True)
@@ -1342,6 +1356,7 @@ def main() -> int:
                         dry_run=args.dry_run,
                         photon_on=args.photon_on,
                         photon_url=args.photon_url,
+                        photon_repo_prefix=args.photon_repo_prefix,
                     )
                 )
 
