@@ -68,6 +68,12 @@ pub use turn::{
     truncate_photon_context_pack,
 };
 
+// Issue #601: expose the Case F `outcome_detail` static-allowlist literal so
+// `tests/photon_evaluate_signal_smoke.rs` can grep / assert against the same
+// SSOT used by production. `mod turn;` is private, so a `pub const` alone is
+// not reachable from integration tests; this re-export widens visibility.
+pub use turn::PHOTON_OUTCOME_DETAIL_NO_PROGRESS_DESPITE_INJECT;
+
 // Issue #594: expose the /photon-why message builder so
 // `tests/photon_provenance_smoke.rs` can verify the 7 status branches and the
 // per-seed rendering without constructing a full Agent (Ollama-free).
@@ -118,6 +124,41 @@ pub fn set_last_injected_for_test(agent: &mut Agent, ids: Vec<String>) {
     let current = agent.current_turn_index;
     agent.last_injected_summary_ids = ids;
     agent.last_injected_summary_turn_index = Some(current);
+}
+
+// Issue #601 — test-only accessors that expose the `SessionSnapshot` inside
+// the `Agent` so `tests/photon_evaluate_signal_smoke.rs` (NPS-03, NPS-06)
+// can force mode state / read post-turn counters without spinning up a full
+// production session API. These are intentionally narrow (return &/&mut
+// SessionSnapshot) and live alongside the existing `set_last_injected_for_test`
+// seam.
+
+#[doc(hidden)]
+pub fn agent_session_ref(agent: &Agent) -> &SessionSnapshot {
+    &agent.session
+}
+
+#[doc(hidden)]
+pub fn agent_session_mut(agent: &mut Agent) -> &mut SessionSnapshot {
+    &mut agent.session
+}
+
+impl Agent {
+    /// Issue #601 test seam: read-only access to the inner SessionSnapshot.
+    /// `pub fn` (not `pub(crate)`) so integration tests can verify per-turn
+    /// counters post-process_line. Production code uses `self.session` direct.
+    #[doc(hidden)]
+    pub fn session_ref(&self) -> &SessionSnapshot {
+        &self.session
+    }
+
+    /// Issue #601 test seam: mutable access to the inner SessionSnapshot.
+    /// Used to force WorkMode / ExecutionMode in NPS-03 / NPS-06 tests
+    /// without driving a real LLM classify cycle.
+    #[doc(hidden)]
+    pub fn session_mut(&mut self) -> &mut SessionSnapshot {
+        &mut self.session
+    }
 }
 
 // Issue #576: expose WorkMode second-pass confirmation adapter surface so

@@ -154,6 +154,9 @@ fn t3_shadow_mode_context_pack_id_in_eval_log() {
         task_outcome: None,
         retry_summary: None,
         summary_ids_adopted_count: None,
+        // Issue #601: new optional fields, None for legacy path.
+        outcome_emitted: None,
+        outcome_detail_emitted: None,
     };
 
     let last_context_pack_id = Some("cpid-from-shadow".to_string());

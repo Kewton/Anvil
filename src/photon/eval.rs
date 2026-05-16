@@ -68,6 +68,12 @@ pub fn parse_evaluate_response(resp: &EvaluateResponse) -> PhotonEvalSummary {
         // the actual evaluate request payload. The parser cannot know the
         // cap-applied count because the request was built in the agent layer.
         summary_ids_adopted_count: None,
+        // Issue #601 (DR3-002): photon → session is the only legal direction
+        // for value flow. The agent layer populates these in
+        // `invoke_photon_evaluate` from the `derive_photon_feedback_outcome`
+        // return value; the photon layer here just initializes to `None`.
+        outcome_emitted: None,
+        outcome_detail_emitted: None,
     }
 }
 

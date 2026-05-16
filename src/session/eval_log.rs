@@ -175,6 +175,23 @@ pub struct PhotonEvalSummary {
     /// defaults to `None`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary_ids_adopted_count: Option<usize>,
+    /// Issue #601 (S5-003 / 設計判断 #1 (B)): agent-side `outcome` value
+    /// (`"success"` / `"failure"` / `"safety_violation"`) actually emitted by
+    /// the agent to photon `/v1/evaluate`. `None` means either fail-open (no
+    /// evaluate response, photon disabled) or `derive_photon_feedback_outcome`
+    /// returned `outcome: None` for this turn. Used by the fine-tuning
+    /// dataset / A-0 evaluation to identify no-progress turns at scale.
+    /// `#[serde(default)]` maintains backward compatibility with eval.jsonl
+    /// files written before Issue #601 (#471 EvalRecord schema invariant).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome_emitted: Option<String>,
+    /// Issue #601 (S5-003 / 設計判断 #1 (B)): agent-side `outcome_detail`
+    /// value (`"no_progress_despite_inject"`) actually emitted by the agent.
+    /// Combined with `outcome_emitted`, downstream tooling can mechanically
+    /// identify Case F no-progress turns. `#[serde(default,
+    /// skip_serializing_if = "Option::is_none")]` maintains backward compat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome_detail_emitted: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

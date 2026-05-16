@@ -1427,6 +1427,8 @@ mod tests {
             anti_pattern_extracted_this_turn: false,
             anti_pattern_retrieval_invoked_this_turn: false,
             context_pack_sent_this_turn: false,
+            iter_count_this_turn: 0,
+            tool_calls_this_turn: 0,
         };
         let v = ShowView::from_snapshot(&snap);
         assert_eq!(v.id, "sid");
