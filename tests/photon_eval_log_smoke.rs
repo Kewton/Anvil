@@ -84,6 +84,7 @@ fn t1_normal_admitted_recorded_in_eval_log() {
         &[],
         None,
         Some(summary),
+        None,
         "done",
     );
 
@@ -124,6 +125,7 @@ fn t2_normal_rejected_recorded_in_eval_log() {
         &[],
         None,
         Some(summary),
+        None,
         "done",
     );
 
@@ -182,6 +184,7 @@ fn t3_shadow_mode_context_pack_id_in_eval_log() {
         &[],
         None,
         Some(summary),
+        None,
         "done",
     );
 
@@ -214,6 +217,7 @@ fn t4_fail_open_evaluate_none_records_null() {
         &[],
         None,
         None, // photon_eval = None (fail-open)
+        None,
         "done",
     );
 
@@ -291,6 +295,7 @@ fn t6_context_pack_id_fallback_from_last() {
         &[],
         None,
         Some(summary),
+        None,
         "done",
     );
 
@@ -335,6 +340,7 @@ fn t7_summary_ids_adopted_count_some_serialized_as_number() {
         &[],
         None,
         Some(summary),
+        None,
         "done",
     );
 
@@ -376,6 +382,7 @@ fn t8_summary_ids_adopted_count_none_omitted_from_json() {
         &[],
         None,
         Some(summary),
+        None,
         "done",
     );
 

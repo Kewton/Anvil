@@ -1425,6 +1425,7 @@ mod tests {
             case_record_extracted_this_turn: false,
             case_retrieval_invoked_this_turn: false,
             anti_pattern_extracted_this_turn: false,
+            auto_promote_called_this_turn: false,
             anti_pattern_retrieval_invoked_this_turn: false,
             context_pack_sent_this_turn: false,
             iter_count_this_turn: 0,

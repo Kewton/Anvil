@@ -2426,16 +2426,16 @@ impl Agent {
         &mut self,
         stats: &crate::agent::loop_run::summary::LoopStats,
         verify_commands: &[String],
-    ) {
+    ) -> Option<crate::session::case_record::CaseRecord> {
         use crate::session::case_record;
 
         // Plan-mode gate: never extract in Plan mode.
         if self.session.mode_state.mode == ExecutionMode::Plan {
-            return;
+            return None;
         }
         // Per-turn cap.
         if self.session.case_record_extracted_this_turn {
-            return;
+            return None;
         }
         // Disable env.
         if case_record::case_record_disabled(|k| std::env::var(k)) {
@@ -2446,14 +2446,14 @@ impl Agent {
                 }),
             );
             self.session.case_record_extracted_this_turn = true;
-            return;
+            return None;
         }
 
         // Success condition (Issue #462 spec).
         let Some(score) = self.session.last_anvil_score.as_ref() else {
             // No AnvilScore computed for this turn (e.g., TransportError) — skip silently.
             self.session.case_record_extracted_this_turn = true;
-            return;
+            return None;
         };
         let auto_test_active = score.build_passed.is_some() || score.tests_passed.is_some();
         let success = if auto_test_active {
@@ -2468,7 +2468,7 @@ impl Agent {
         };
         if !success {
             self.session.case_record_extracted_this_turn = true;
-            return;
+            return None;
         }
 
         // language_stack derivation (agent layer; reuses `auto_test::has_*`).
@@ -2514,7 +2514,7 @@ impl Agent {
                 }),
             );
             self.session.case_record_extracted_this_turn = true;
-            return;
+            return None;
         };
 
         // Dry-run gate (DR3-002 / Issue): extract still runs so log payloads
@@ -2529,11 +2529,15 @@ impl Agent {
                 }),
             );
             self.session.case_record_extracted_this_turn = true;
-            return;
+            // DR2-008: Issue #604 — return the extracted record even on
+            // dry_run so the post-loop auto-promote hook can still see what
+            // would have been promoted (dry_run is observability-only).
+            return Some(record);
         }
 
         let state_root = self.session_store.state_root().to_path_buf();
-        match case_record::persist(&state_root, &record) {
+        let persist_outcome = case_record::persist(&state_root, &record);
+        let persist_ok = match persist_outcome {
             Ok(bytes) => {
                 let compute_ms = started.elapsed().as_secs_f64() * 1000.0;
                 log_llm_event(
@@ -2545,6 +2549,7 @@ impl Agent {
                         "compute_ms": compute_ms,
                     }),
                 );
+                true
             }
             Err(case_record::PersistError::TooLarge { bytes }) => {
                 log_llm_event(
@@ -2555,6 +2560,7 @@ impl Agent {
                         "bytes": bytes,
                     }),
                 );
+                false
             }
             Err(e) => {
                 log_llm_event(
@@ -2564,9 +2570,11 @@ impl Agent {
                         "error": e.to_string(),
                     }),
                 );
+                false
             }
-        }
+        };
         self.session.case_record_extracted_this_turn = true;
+        if persist_ok { Some(record) } else { None }
     }
 
     /// Issue #463: build and (when applicable) inject a `Relevant Local Cases:`
@@ -3747,6 +3755,10 @@ impl Agent {
         self.session.anti_pattern_retrieval_invoked_this_turn = false;
         // Issue #558: reset photon eval summary (consumed by build_eval_record).
         self.last_photon_eval_summary = None;
+        // Issue #604 Task 5.2: reset the per-turn auto-promote cap flag and
+        // outcome cache. Mirror of `case_record_extracted_this_turn` semantics.
+        self.session.auto_promote_called_this_turn = false;
+        self.last_auto_promote_outcome = None;
 
         let mut tool_calls_made_this_turn = 0usize;
         let mut repo_edit_calls_made_this_turn = 0usize;
@@ -5473,7 +5485,11 @@ impl Agent {
         // Issue #462: CaseRecord extraction (post-loop, after Reminder, before
         // turn_completed event). Pure success-condition + scrub + persist; no
         // sidecar / LLM calls. Failures are logged and never propagate.
-        self.maybe_extract_case_record(&stats, &verify_commands_collected);
+        //
+        // DR2-008 (Issue #604): now returns `Option<CaseRecord>` so the
+        // post-loop auto-promote hook can consume the freshly-extracted record
+        // without re-reading from disk.
+        let extracted_case = self.maybe_extract_case_record(&stats, &verify_commands_collected);
         // Issue #464: AntiPatternRecord extraction (post-loop, after CaseRecord).
         // Triggered by the latest eligible failure feedback. Pure upsert; no
         // sidecar / LLM calls.
@@ -5494,6 +5510,72 @@ impl Agent {
                     "reason": "plan_mode",
                 }),
             );
+        }
+
+        // Issue #604 (Task 5.2): post-loop auto-promote hook. Order B —
+        // runs *after* invoke_photon_evaluate, before build_eval_record so
+        // `last_auto_promote_outcome` is populated for `EvalRecord.auto_promote`.
+        // Fail-open: the hook never panics or interrupts the agent loop.
+        {
+            use crate::agent::loop_run::auto_promote::{
+                AutoPromoteConfig, invoke_photon_auto_promote,
+            };
+            use crate::session::auto_promote_scrub::ScrubMode;
+            use std::time::{SystemTime, UNIX_EPOCH};
+
+            let now_unix = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let interrupted = interrupt_flag.is_set();
+            let session_id = self.session_store.session_id().to_string();
+            let turn_idx = self.current_turn_index as u64;
+            let state_root = self.session_store.state_root().to_path_buf();
+            let cfg = AutoPromoteConfig {
+                enabled: self.config.photon_auto_promote,
+                force_disabled: self.config.photon_no_auto_promote,
+                dry_run: self.config.photon_auto_promote_dry_run,
+                scrub_mode: ScrubMode::from_env_str_or_default(
+                    &self.config.photon_auto_promote_scrub_mode,
+                ),
+            };
+            // Per-turn cap: set BEFORE invoking on non-Interrupted/non-Disabled
+            // paths. DR2-010 — Interrupted intentionally leaves the flag false
+            // so the next turn can re-try. The hook itself never flips it
+            // (the flag is the caller's responsibility).
+            let will_invoke = !interrupted
+                && cfg.enabled
+                && !cfg.force_disabled
+                && self.photon.is_some()
+                && !self.session.auto_promote_called_this_turn;
+            if will_invoke {
+                self.session.auto_promote_called_this_turn = true;
+            }
+            // Borrow split: read all `&self`-only fields first, then re-borrow
+            // `self.photon` and call the free function.
+            let plan_mode = self.session.mode_state.mode == ExecutionMode::Plan;
+            let auto_called = self.session.auto_promote_called_this_turn;
+            // NB: `should_auto_promote` re-checks `auto_called` and routes to
+            // `PerTurnCapConsumed` only if the flag was *already* true on
+            // entry. Because we just flipped it ABOVE (on the will_invoke path),
+            // we pass the pre-flip value here.
+            let auto_called_for_gate = if will_invoke { false } else { auto_called };
+            let extracted_this_turn = self.session.case_record_extracted_this_turn;
+            let photon_ref = self.photon.as_ref();
+            let outcome = invoke_photon_auto_promote(
+                &session_id,
+                turn_idx,
+                plan_mode,
+                auto_called_for_gate,
+                extracted_this_turn,
+                extracted_case.as_ref(),
+                &state_root,
+                now_unix,
+                interrupted,
+                photon_ref,
+                &cfg,
+            );
+            self.last_auto_promote_outcome = Some(outcome);
         }
 
         // Issue #471: write structured eval log record (turn-level snapshot).
@@ -5579,6 +5661,7 @@ impl Agent {
                 &verify_commands_collected,
                 self.last_case_retrieval_summary.take(),
                 self.last_photon_eval_summary.take(),
+                self.last_auto_promote_outcome.clone(),
                 exit_reason.label(),
             );
             record.photon_canary = self.config.photon_canary;

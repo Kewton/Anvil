@@ -1234,6 +1234,10 @@ mod tests {
             photon_rollout_min_eval_turns: 100,
             photon_respect_warnings: true,
             photon_common_seed_enabled: false,
+            photon_auto_promote: true,
+            photon_no_auto_promote: false,
+            photon_auto_promote_dry_run: true,
+            photon_auto_promote_scrub_mode: "strict".to_string(),
         }
     }
 

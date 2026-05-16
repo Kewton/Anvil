@@ -1,3 +1,4 @@
+pub mod action_memory_v2_adapter;
 pub mod client;
 pub mod eval;
 pub mod mapper;
@@ -14,4 +15,5 @@ pub use prompt::{
 };
 pub use schema::{
     ContextPackRequest, ContextPackResponse, EvaluateRequest, EvaluateResponse, HealthResponse,
+    PhotonUpsertError, SummaryUpsertRequest, SummaryUpsertResponse,
 };

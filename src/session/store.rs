@@ -696,6 +696,14 @@ pub struct SessionSnapshot {
     /// outcome). Not persisted; runtime-only flag.
     #[serde(skip, default)]
     pub anti_pattern_extracted_this_turn: bool,
+    /// Issue #604: turn-local per-turn cap for the post-loop photon
+    /// auto-promote hook (`invoke_photon_auto_promote`). Set to `true` once
+    /// the hook actually runs to completion in the current turn (Interrupted
+    /// path does NOT consume the cap — see DR2-010). Not persisted; runtime-
+    /// only flag like `case_record_extracted_this_turn`. Reset at the top of
+    /// `handle_user_message` (wired in Task 5.2).
+    #[serde(skip, default)]
+    pub auto_promote_called_this_turn: bool,
     /// Issue #464: turn-local per-turn cap for anti-pattern retrieval.
     /// Set to `true` once `try_inject_anti_pattern_message` consumes the cap.
     /// Plan-mode early return does NOT set this. Reset at `run_turn` head.
@@ -1292,5 +1300,44 @@ mod tests {
             FeedbackKind::TestFailure,
             "last_feedback survives the round-trip"
         );
+    }
+
+    /// Issue #604 Task 3.1: the new `auto_promote_called_this_turn` per-turn
+    /// cap flag must be `#[serde(skip, default)]` — never serialized and
+    /// always defaults to `false` on deserialize. Modeled after
+    /// `eligible_feedback_flag_is_not_persisted`.
+    #[test]
+    fn auto_promote_called_this_turn_is_not_persisted() {
+        let snap = SessionSnapshot {
+            auto_promote_called_this_turn: true,
+            ..SessionSnapshot::default()
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(
+            !json.contains("auto_promote_called_this_turn"),
+            "flag must be skipped during serialization: {json}"
+        );
+        let decoded: SessionSnapshot = serde_json::from_str(&json).unwrap();
+        assert!(
+            !decoded.auto_promote_called_this_turn,
+            "flag must default to false on deserialize"
+        );
+    }
+
+    /// Issue #604 Task 3.1: a session JSON that *predates* the new field
+    /// must still deserialize cleanly (`#[serde(default)]`), with the new
+    /// flag landing on its `false` default. This guards backward compat
+    /// for sessions on disk.
+    #[test]
+    fn legacy_session_json_without_auto_promote_flag_deserializes() {
+        // Round-trip via a default snapshot so we exercise the real schema
+        // (all the existing required fields), then strip the new key out
+        // of the JSON before re-parsing.
+        let snap = SessionSnapshot::default();
+        let json = serde_json::to_string(&snap).unwrap();
+        // The flag is `#[serde(skip)]`, so it should already be absent.
+        assert!(!json.contains("auto_promote_called_this_turn"));
+        let decoded: SessionSnapshot = serde_json::from_str(&json).unwrap();
+        assert!(!decoded.auto_promote_called_this_turn);
     }
 }
