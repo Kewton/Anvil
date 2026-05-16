@@ -1770,6 +1770,11 @@ The plan must still define: (1) the first shippable vertical slice, (2) concrete
             }
             "/precautions" => self.handle_precautions_command(rest),
             "/tests" => self.handle_tests_command(rest),
+            // Issue #594: photon seed lineage for the last turn.
+            "/photon-why" => Ok(AgentEvent::Continue(Some(build_photon_why_message(
+                self.last_photon_context_pack_status,
+                &self.last_injected_seed_provenance,
+            )))),
             "/checkpoint" | "/rollback" | "/watch" | "/autotest" | "/skills" | "/skill"
             | "/mcp" | "/parallel" => Ok(AgentEvent::Continue(Some(format!(
                 "{command} is unavailable in the v0.1.0 core rebuild"
@@ -1780,6 +1785,61 @@ The plan must still define: (1) the first shippable vertical slice, (2) concrete
             )))),
         }
     }
+}
+
+/// Issue #594: format the `/photon-why` slash command response.
+///
+/// Pure function — takes the post-turn lineage state and renders a
+/// user-facing message. Lives at the module level (not on `Agent`) so unit
+/// tests can drive every status variant without constructing a full agent.
+///
+/// As a defensive measure (DR4-001) the final composed string is passed
+/// through `mask_secrets` one more time before being handed back to the REPL,
+/// even though each provenance field has already been sanitized upstream.
+pub fn build_photon_why_message(
+    status: super::PhotonContextPackStatus,
+    provenance: &[crate::photon::provenance::SeedProvenanceSummary],
+) -> String {
+    use super::PhotonContextPackStatus::*;
+    let body = match status {
+        NoTurn => "No photon turn has been executed yet.".to_string(),
+        ShadowMode => "Shadow mode active; provenance not surfaced.".to_string(),
+        CanarySkipped => "Photon disabled (canary=0); no seeds were considered.".to_string(),
+        PlanMode => "Plan mode; photon context not consulted.".to_string(),
+        Failed => "Photon context_pack fetch failed in the last turn.".to_string(),
+        NoInjection => "No seeds were injected in the last turn.".to_string(),
+        Injected => {
+            let n = provenance.len();
+            if n == 0 {
+                // Defensive: the status state machine should keep `Injected`
+                // and an empty vec mutually exclusive (invariant PV-01), but
+                // we still render a non-empty message for the REPL.
+                "No seeds were injected in the last turn.".to_string()
+            } else {
+                let mut out = if n == 1 {
+                    "Last turn injected 1 seed:\n".to_string()
+                } else {
+                    format!("Last turn injected {n} seeds:\n")
+                };
+                for (i, s) in provenance.iter().enumerate() {
+                    let sid = s.summary_id.as_deref().unwrap_or("(no id)");
+                    let tier = s.trust_tier.unwrap_or("unspecified");
+                    let created = s.created_at.as_deref().unwrap_or("(no timestamp)");
+                    out.push_str(&format!(
+                        "  {}. {}\n     source: {} (trust: {}) status: {}\n     created: {}\n",
+                        i + 1,
+                        sid,
+                        s.source,
+                        tier,
+                        s.provenance_status,
+                        created,
+                    ));
+                }
+                out
+            }
+        }
+    };
+    crate::session::feedback::mask_secrets(&body)
 }
 
 fn precautions_usage() -> &'static str {

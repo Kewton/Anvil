@@ -2,6 +2,7 @@ pub mod client;
 pub mod eval;
 pub mod mapper;
 pub mod prompt;
+pub mod provenance;
 pub mod schema;
 
 pub use client::PhotonClient;

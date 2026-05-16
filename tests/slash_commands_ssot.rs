@@ -32,7 +32,8 @@ fn help_line_matches_slash_commands() {
 }
 
 #[test]
-fn slash_commands_contains_expected_12() {
+fn slash_commands_contains_expected_13() {
+    // Issue #594 added `/photon-why` to surface photon seed lineage.
     assert_eq!(
         SLASH_COMMANDS,
         &[
@@ -47,6 +48,7 @@ fn slash_commands_contains_expected_12() {
             "/logs",
             "/precautions",
             "/tests",
+            "/photon-why",
             "/exit",
         ]
     );
