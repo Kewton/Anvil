@@ -67,6 +67,11 @@ pub use turn::{
     truncate_photon_context_pack,
 };
 
+// Issue #594: expose the /photon-why message builder so
+// `tests/photon_provenance_smoke.rs` can verify the 7 status branches and the
+// per-seed rendering without constructing a full Agent (Ollama-free).
+pub use commands::build_photon_why_message;
+
 // Issue #465 / Phase 5: expose Reminder types needed by tests/agent_skill_registry_smoke.rs
 // (E2E tests live outside the crate so `pub(crate) mod reminder` cannot be reached
 // directly). Production code paths continue to use `super::reminder::...`; these
@@ -284,6 +289,39 @@ pub struct Agent {
     /// returns; resetting at `run_actor_loop` would clobber the ids the
     /// evaluate hook needs to read.
     pub(super) last_adopted_summary_ids: Vec<String>,
+    /// Issue #594: per-turn provenance summary cache for `/photon-why`.
+    /// Cleared in `handle_user_message` before `invoke_photon_context_pack`
+    /// runs. Invariant (PV-01): when populated, its length equals
+    /// `RenderStats.items_adopted` for the same turn.
+    pub(super) last_injected_seed_provenance: Vec<crate::photon::provenance::SeedProvenanceSummary>,
+    /// Issue #594: state machine for `/photon-why` dispatch. Intentionally
+    /// NOT reset in `handle_user_message` so a `/plan` slash command between
+    /// turns can still surface the last Act turn's lineage (S7-002).
+    pub(super) last_photon_context_pack_status: PhotonContextPackStatus,
+}
+
+/// Issue #594: state machine for the `/photon-why` slash command. Lives at
+/// the loop_run module level (alongside `Agent`) because the enum is only
+/// consumed by `commands.rs::render_photon_why` and updated by
+/// `turn.rs::invoke_photon_context_pack`; no session-layer persistence is
+/// needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PhotonContextPackStatus {
+    /// Initial value before any turn has executed.
+    #[default]
+    NoTurn,
+    /// `photon_shadow_mode=true` — context_pack was not consulted for prompt.
+    ShadowMode,
+    /// Canary gate fired (e.g. `canary=0` or the per-session permille check).
+    CanarySkipped,
+    /// `run_turn` skipped the hook because the session was in Plan mode.
+    PlanMode,
+    /// HTTP fetch to `/v1/context/pack` failed (timeout / 5xx / fail-open).
+    Failed,
+    /// Fetch succeeded but all items were filtered out / capped.
+    NoInjection,
+    /// Fetch succeeded and at least one seed was rendered into the prompt.
+    Injected,
 }
 
 #[derive(Clone)]
@@ -373,6 +411,8 @@ impl Agent {
             last_photon_eval_summary: None,
             last_photon_adopted_items: 0,
             last_adopted_summary_ids: Vec::new(),
+            last_injected_seed_provenance: Vec::new(),
+            last_photon_context_pack_status: PhotonContextPackStatus::NoTurn,
         }
     }
 }

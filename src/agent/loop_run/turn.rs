@@ -2269,6 +2269,11 @@ impl Agent {
         // runs post-loop and reads this field; resetting at the loop entry
         // would wipe the ids before the evaluate hook can consume them.
         self.last_adopted_summary_ids.clear();
+        // Issue #594: clear per-turn provenance summary cache. NOTE we do NOT
+        // reset `last_photon_context_pack_status` here — `/photon-why` must
+        // remain able to surface the previous Act turn's lineage even after a
+        // `/plan` mode change (S7-002).
+        self.last_injected_seed_provenance.clear();
         // LI-2: reset the one-shot flag here (before invoke_photon_context_pack
         // in run_turn) so the flag set by path (a) is still true when path (b)
         // in build_request_messages runs. Previously this reset lived in
@@ -3051,6 +3056,9 @@ impl Agent {
 
         // Issue #557: shadow mode disables prompt injection entirely.
         if self.config.photon_shadow_mode {
+            // Issue #594: surface shadow-mode via /photon-why.
+            self.last_photon_context_pack_status =
+                crate::agent::loop_run::PhotonContextPackStatus::ShadowMode;
             log_llm_event(
                 "agent.photon_context_pack.skipped",
                 serde_json::json!({
@@ -3071,6 +3079,9 @@ impl Agent {
             turn_idx: self.current_turn_index,
         };
         if !crate::photon::mapper::should_send_context_pack(&gate) {
+            // Issue #594: surface canary-gated skip via /photon-why.
+            self.last_photon_context_pack_status =
+                crate::agent::loop_run::PhotonContextPackStatus::CanarySkipped;
             log_llm_event(
                 "agent.photon_context_pack.skipped",
                 serde_json::json!({
@@ -3183,10 +3194,44 @@ impl Agent {
                 );
             }
 
-            // Issue #557 + #583: renderer returns both the section and stats.
-            let (rendered_opt, render_stats) =
-                crate::photon::prompt::render_context_pack(&resp, &blocked_ids);
+            // Issue #594: drive the filter pipeline through the provenance-aware
+            // enumeration SSOT so the rendered prompt and the per-item lineage
+            // come from the same pass (invariant: views.len() == items_adopted).
+            let (admitted_views, render_stats) =
+                crate::photon::prompt::enumerate_admitted_items_with_provenance(
+                    &resp,
+                    &blocked_ids,
+                );
             items_blocked = render_stats.items_blocked;
+
+            // Pass 2a — build the rendered section from view text. We discard
+            // build_section_with_stats's adopted / dropped / ids because the
+            // authoritative values live on `render_stats` already (populated
+            // by enumerate_admitted_items_with_provenance per #591/#594 SSOT).
+            let render_candidates: Vec<crate::photon::prompt::RenderCandidate> = admitted_views
+                .iter()
+                .map(|v| crate::photon::prompt::RenderCandidate {
+                    text: v.render_text.clone(),
+                    summary_id: v.provenance.summary_id.clone(),
+                })
+                .collect();
+            let (rendered_opt, _, _, _) =
+                crate::photon::prompt::build_section_with_stats(&render_candidates);
+
+            // Pass 2b — collect per-item SeedProvenanceSummary (PV-01
+            // invariant). CB-001: the provenance summary is already sanitized
+            // and stored on `AdmittedItemView`; we move it out directly
+            // without re-running the 5-layer pipeline.
+            self.last_injected_seed_provenance = admitted_views
+                .into_iter()
+                .map(|view| view.provenance)
+                .collect();
+            debug_assert_eq!(
+                self.last_injected_seed_provenance.len(),
+                render_stats.items_adopted,
+                "Invariant: injected_seed_provenance_summary.len() == items_adopted"
+            );
+
             if let Some(rendered) = rendered_opt {
                 // AN-6: items_adopted is now sourced from RenderStats so the
                 // count matches the post-total-cap line set exactly.
@@ -3204,6 +3249,34 @@ impl Agent {
             }
             // else: no valid items after filtering → response stays None
         }
+
+        // Issue #594: status state machine (Failed / Injected / NoInjection)
+        // for /photon-why dispatch.
+        self.last_photon_context_pack_status = if failed {
+            crate::agent::loop_run::PhotonContextPackStatus::Failed
+        } else if self.last_photon_adopted_items > 0 {
+            crate::agent::loop_run::PhotonContextPackStatus::Injected
+        } else {
+            crate::agent::loop_run::PhotonContextPackStatus::NoInjection
+        };
+
+        // Issue #594: project SeedProvenanceSummary rows down to the 4 keys
+        // that appear in the event payload. This keeps the event payload small
+        // (~80 bytes per item) while the in-memory cache retains all fields
+        // for /photon-why's 5-key display surface.
+        let provenance_payload: Vec<serde_json::Value> = self
+            .last_injected_seed_provenance
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "summary_id":        s.summary_id,
+                    "source":            s.source,
+                    "trust_tier":        s.trust_tier,
+                    "provenance_status": s.provenance_status,
+                })
+            })
+            .collect();
+
         log_llm_event(
             "agent.photon_context_pack.completed",
             serde_json::json!({
@@ -3217,6 +3290,8 @@ impl Agent {
                 "duration_ms": duration_ms,
                 "warning_filter_enabled": warning_filter_enabled,
                 "items_blocked": items_blocked,
+                // Issue #594 (11th key) — per-item seed lineage summary.
+                "injected_seed_provenance_summary": provenance_payload,
             }),
         );
     }
@@ -3408,6 +3483,9 @@ impl Agent {
         if self.session.mode_state.mode != ExecutionMode::Plan {
             self.invoke_photon_context_pack();
         } else if self.photon.is_some() {
+            // Issue #594: surface plan-mode skip via /photon-why.
+            self.last_photon_context_pack_status =
+                crate::agent::loop_run::PhotonContextPackStatus::PlanMode;
             log_llm_event(
                 "agent.photon_context_pack.skipped",
                 serde_json::json!({

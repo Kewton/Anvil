@@ -35,6 +35,8 @@ pub const SLASH_COMMANDS: &[&str] = &[
     "/logs",
     "/precautions",
     "/tests",
+    // Issue #594: photon seed lineage for the last turn.
+    "/photon-why",
     "/exit",
 ];
 

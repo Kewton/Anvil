@@ -100,3 +100,30 @@ fn s10_evaluate_response_warnings_roundtrip() {
         "retry_summary": "retry after reducing context"
     })));
 }
+
+// S11 (Issue #594): ContextPackResponse preserves nested provenance fields
+// (including unknown sub-fields) through serde roundtrip.
+//
+// The newtype around `serde_json::Value` should pass arbitrary extra fields
+// inside `items[i].provenance` through unchanged so that future photon-side
+// schema additions do not require coordinated Anvil-side releases.
+#[test]
+fn s11_context_pack_response_preserves_items_provenance_nested() {
+    let raw = serde_json::json!({
+        "context_pack": {
+            "items": [{
+                "kind": "summary",
+                "id": "case_abc123",
+                "text": "use bevy 0.13 API",
+                "provenance": {
+                    "source": "anvil_case_record",
+                    "source_id": "case_019dde7d",
+                    "trust_tier": "auto_extracted",
+                    "correlated_case_ids": ["case_001", "case_002"],
+                    "nested_extra": { "future_field": 42 }
+                }
+            }]
+        }
+    });
+    assert_newtype_roundtrip(ContextPackResponse(raw));
+}
