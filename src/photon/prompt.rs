@@ -49,6 +49,15 @@ pub const MAX_PHOTON_WARNING_MESSAGE_BYTES: usize = 2048;
 /// Single reason string treated as "blocking" by the warning filter.
 pub const BLOCKED_WARNING_REASON: &str = "premature_termination_risk";
 
+/// Issue #591 (AS-05 / 設計判断 #4): cap on the number of `summary_ids_adopted`
+/// values appended to the `context_pack_event` sent to photon `/v1/evaluate`.
+/// Applied by `invoke_photon_evaluate` *after* `sanitize_summary_id` re-runs on
+/// `Agent.last_adopted_summary_ids` (DR4-NEW-001). When the post-sanitize list
+/// exceeds this cap, the payload is truncated and `summary_ids_adopted_truncated=true`
+/// is emitted as an audit signal. The value mirrors `MAX_BLOCKED_SUMMARY_IDS=32`
+/// to keep the SSOT in this module (Issue #583 流儀).
+pub const MAX_PHOTON_EVAL_ADOPTED_IDS: usize = 32;
+
 // ---------------------------------------------------------------------------
 // Issue #589: admission_reason-based softer block handling
 // ---------------------------------------------------------------------------
@@ -135,6 +144,15 @@ pub(crate) struct BlockedIdsStats {
 ///  + items_dropped_total_chars`.
 /// (`items_in_response` is the length of the original `items[]` array in the
 /// response, before `MAX_PROMPT_SCAN_ITEMS` is applied.)
+///
+/// Issue #591 (AS-02 / 設計判断 #1): `adopted_summary_ids` holds the sanitized
+/// `summary_id` of every item actually emitted into the rendered section
+/// (post-total-cap). Each id has already passed `sanitize_summary_id` on the
+/// injection side (DR4-002). Items without an id (or whose id was dropped by
+/// the sanitizer) are still counted in `items_adopted` but do NOT appear in
+/// `adopted_summary_ids` (S7-001 / 設計判断 #6). The payload cap
+/// `MAX_PHOTON_EVAL_ADOPTED_IDS` is NOT applied here — the caller
+/// (`invoke_photon_evaluate`) applies it after re-sanitizing.
 #[derive(Debug, Default, Clone)]
 pub struct RenderStats {
     /// Items skipped because their sanitized `id` was in `blocked_ids`.
@@ -156,6 +174,29 @@ pub struct RenderStats {
     /// Items in the response array beyond `MAX_PROMPT_SCAN_ITEMS` that were
     /// never inspected (CB-001 conservation closure).
     pub items_scan_capped: usize,
+    /// Issue #591 (AS-02): sanitized `summary_id` of every item actually
+    /// emitted into the rendered section, post-total-cap, in emission order
+    /// (deduplicated). Empty when no items survived or no item carried a
+    /// valid id. Length may be smaller than `items_adopted` when adopted
+    /// items lacked an id or the sanitizer rejected it (S7-001).
+    pub adopted_summary_ids: Vec<String>,
+}
+
+/// Issue #591 (AS-09 / 設計判断 #6): internal value bundling a normalized
+/// summary text with the (already-sanitized) summary_id it came from. Used by
+/// `build_section_with_stats` so the post-total-cap adopted set can pair each
+/// emitted bullet with its id.
+///
+/// `pub(crate)` per the visibility規約: this is an internal API and is not
+/// re-exported via `src/photon/mod.rs`. The agent / session layer interacts
+/// only with `RenderStats.adopted_summary_ids` produced by `render_context_pack`.
+#[derive(Debug, Clone)]
+pub(crate) struct RenderCandidate {
+    /// The normalized + truncated summary text ready to be emitted as a bullet.
+    pub text: String,
+    /// The sanitized summary id (post `sanitize_summary_id`). `None` when the
+    /// upstream item had no id or its id was rejected by the sanitizer.
+    pub summary_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -178,7 +219,7 @@ pub fn render_context_pack(
         items_scan_capped: total_in_array.saturating_sub(items.len()),
         ..RenderStats::default()
     };
-    let mut filtered: Vec<String> = Vec::new();
+    let mut filtered: Vec<RenderCandidate> = Vec::new();
 
     for item in items.into_iter() {
         if !is_summary_kind(&item) {
@@ -187,9 +228,14 @@ pub fn render_context_pack(
         }
         // Issue #583: skip items whose sanitized `id` matches a blocked entry
         // (fail-open: missing id / non-string id passes through).
-        let id_blocked = item
+        // Note: `project_item_fields` has already run `sanitize_summary_id` on
+        // the id (DR4-002), so the bare `as_str()` value is the canonical id.
+        let item_id = item
             .get("id")
             .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let id_blocked = item_id
+            .as_deref()
             .map(|id| blocked_ids.contains(id))
             .unwrap_or(false);
         if id_blocked {
@@ -213,13 +259,17 @@ pub fn render_context_pack(
             stats.items_over_cap += 1;
             continue;
         }
-        filtered.push(truncate_chars(text, MAX_PROMPT_ITEM_CHARS));
+        filtered.push(RenderCandidate {
+            text: truncate_chars(text, MAX_PROMPT_ITEM_CHARS),
+            summary_id: item_id,
+        });
         stats.items_accepted_pre_total_cap += 1;
     }
 
-    let (section, adopted, dropped) = build_section_with_stats(&filtered);
+    let (section, adopted, dropped, adopted_ids) = build_section_with_stats(&filtered);
     stats.items_adopted = adopted;
     stats.items_dropped_total_chars = dropped;
+    stats.adopted_summary_ids = adopted_ids;
     (section, stats)
 }
 
@@ -343,37 +393,59 @@ pub(crate) fn contains_destructive_command(text: &str) -> bool {
 /// which also returns the number of items actually emitted vs. dropped by the
 /// total-chars cap. The wrapper is retained for internal callers (module tests)
 /// that do not need the stats.
+///
+/// Issue #591 (案 α): the wrapper preserves its `&[String]` signature by
+/// wrapping each string into a `RenderCandidate { text, summary_id: None }`
+/// before delegating. Module unit tests that exercise `build_section`
+/// continue to compile unchanged.
 #[cfg(test)]
 pub(crate) fn build_section(items: &[String]) -> Option<String> {
-    let (section, _adopted, _dropped) = build_section_with_stats(items);
+    let candidates: Vec<RenderCandidate> = items
+        .iter()
+        .map(|s| RenderCandidate {
+            text: s.clone(),
+            summary_id: None,
+        })
+        .collect();
+    let (section, _adopted, _dropped, _ids) = build_section_with_stats(&candidates);
     section
 }
 
 /// Build the `"Photon Context:\n- …"` section, returning bookkeeping for the
-/// total-chars cap (Issue #583, DR3-002).
+/// total-chars cap (Issue #583, DR3-002) and the post-cap adopted summary-id
+/// list (Issue #591, AS-09 / 設計判断 #6).
 ///
-/// Returns `(section, items_adopted, items_dropped_total_chars)`.
+/// Returns `(section, items_adopted, items_dropped_total_chars, adopted_summary_ids)`.
 /// - `items_adopted` is the count of items that produced a complete bullet
 ///   line within the cap.
 /// - `items_dropped_total_chars` is the number of items present in `items`
 ///   that could not be emitted as a complete bullet due to the total cap.
+/// - `adopted_summary_ids` lists the `summary_id` of every emitted bullet, in
+///   emission order, deduplicated (stable: first occurrence wins). Items
+///   without an id (or whose id was dropped by `sanitize_summary_id`) are
+///   omitted from the list (S7-001).
 ///
 /// CB-002: when a bullet does not fit within `MAX_PROMPT_TOTAL_CHARS`, the
 /// function stops emission immediately rather than writing a partial line.
 /// This keeps the rendered prompt content and the `RenderStats` counters in
 /// sync — every bullet that appears in the section is counted as adopted, and
-/// the dropped tail is counted as `items_dropped_total_chars`.
-pub(crate) fn build_section_with_stats(items: &[String]) -> (Option<String>, usize, usize) {
+/// the dropped tail is counted as `items_dropped_total_chars`. Items dropped
+/// by the cap also have their id excluded from `adopted_summary_ids` (VR-06).
+pub(crate) fn build_section_with_stats(
+    items: &[RenderCandidate],
+) -> (Option<String>, usize, usize, Vec<String>) {
     if items.is_empty() {
-        return (None, 0, 0);
+        return (None, 0, 0, Vec::new());
     }
     let mut out = String::from("Photon Context:\n");
     let mut char_count = out.chars().count();
     let budget = MAX_PROMPT_TOTAL_CHARS;
     let mut adopted = 0usize;
+    let mut adopted_ids: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
 
     for item in items.iter() {
-        let line = format!("- {item}\n");
+        let line = format!("- {}\n", item.text);
         let line_chars = line.chars().count();
         if char_count + line_chars > budget {
             // CB-002: do not write a partial bullet. Stopping here keeps the
@@ -384,10 +456,17 @@ pub(crate) fn build_section_with_stats(items: &[String]) -> (Option<String>, usi
         out.push_str(&line);
         char_count += line_chars;
         adopted += 1;
+        // S7-001 / VR-06: only push the id when it is present AND not already
+        // in the adopted list (stable dedupe — first occurrence wins).
+        if let Some(id) = &item.summary_id
+            && seen.insert(id.clone())
+        {
+            adopted_ids.push(id.clone());
+        }
     }
 
     let dropped = items.len().saturating_sub(adopted);
-    (Some(out), adopted, dropped)
+    (Some(out), adopted, dropped, adopted_ids)
 }
 
 // ---------------------------------------------------------------------------
@@ -1248,8 +1327,13 @@ mod tests {
     // build_section_with_stats: total cap dropped count is exposed
     #[test]
     fn wf_build_section_with_stats_total_cap() {
-        let items: Vec<String> = (0..5).map(|_| "x".repeat(200)).collect();
-        let (section, adopted, dropped) = build_section_with_stats(&items);
+        let items: Vec<RenderCandidate> = (0..5)
+            .map(|_| RenderCandidate {
+                text: "x".repeat(200),
+                summary_id: None,
+            })
+            .collect();
+        let (section, adopted, dropped, _ids) = build_section_with_stats(&items);
         assert!(section.is_some());
         assert!(adopted + dropped == items.len());
         assert!(dropped > 0, "5 × 200 char items should exceed total cap");
@@ -1260,8 +1344,13 @@ mod tests {
     // complete (terminated by '\n') and matches items_adopted exactly.
     #[test]
     fn wf_build_section_no_partial_bullet_on_total_cap() {
-        let items: Vec<String> = (0..5).map(|_| "x".repeat(200)).collect();
-        let (section_opt, adopted, dropped) = build_section_with_stats(&items);
+        let items: Vec<RenderCandidate> = (0..5)
+            .map(|_| RenderCandidate {
+                text: "x".repeat(200),
+                summary_id: None,
+            })
+            .collect();
+        let (section_opt, adopted, dropped, _ids) = build_section_with_stats(&items);
         let section = section_opt.expect("section must exist");
         assert!(dropped > 0, "5 × 200 char items should exceed total cap");
         // Section shape: "Photon Context:\n" header + N complete bullets, each
@@ -1450,5 +1539,117 @@ mod tests {
         assert!(blocked.is_empty());
         assert_eq!(stats.respected_by_admission_reason, 0);
         assert_eq!(stats.still_blocked, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #591: adopted_summary_ids surfacing (AS-02 / AS-05 / AS-09)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ai_max_photon_eval_adopted_ids_constant_equals_32() {
+        // AS-05 / 設計判断 #4: constant SSOT colocated with the other photon
+        // caps. The cap is applied by `invoke_photon_evaluate`, not here.
+        assert_eq!(MAX_PHOTON_EVAL_ADOPTED_IDS, 32);
+    }
+
+    #[test]
+    fn ai_render_stats_defaults_to_empty_adopted_ids() {
+        let stats = RenderStats::default();
+        assert!(stats.adopted_summary_ids.is_empty());
+    }
+
+    #[test]
+    fn ai_build_section_with_stats_returns_ids_in_emission_order() {
+        let items = vec![
+            RenderCandidate {
+                text: "first".to_string(),
+                summary_id: Some("seed_a".to_string()),
+            },
+            RenderCandidate {
+                text: "second".to_string(),
+                summary_id: Some("seed_b".to_string()),
+            },
+        ];
+        let (_section, adopted, dropped, ids) = build_section_with_stats(&items);
+        assert_eq!(adopted, 2);
+        assert_eq!(dropped, 0);
+        assert_eq!(ids, vec!["seed_a".to_string(), "seed_b".to_string()]);
+    }
+
+    #[test]
+    fn ai_build_section_with_stats_drops_ids_for_items_over_total_cap() {
+        // 5 × 200 char items exceed MAX_PROMPT_TOTAL_CHARS=800.
+        // The id of the trailing dropped item must NOT appear in adopted_ids.
+        let items: Vec<RenderCandidate> = (0..5)
+            .map(|i| RenderCandidate {
+                text: "x".repeat(200),
+                summary_id: Some(format!("seed_{i}")),
+            })
+            .collect();
+        let (_section, adopted, dropped, ids) = build_section_with_stats(&items);
+        assert!(adopted > 0);
+        assert!(dropped > 0);
+        // Number of ids matches number of adopted (all items here have an id).
+        assert_eq!(ids.len(), adopted);
+        // The dropped suffix of ids must not be present.
+        for i in adopted..5 {
+            assert!(
+                !ids.contains(&format!("seed_{i}")),
+                "id of dropped item must be excluded"
+            );
+        }
+    }
+
+    #[test]
+    fn ai_build_section_with_stats_dedupes_repeating_ids() {
+        let items = vec![
+            RenderCandidate {
+                text: "alpha".to_string(),
+                summary_id: Some("seed_x".to_string()),
+            },
+            RenderCandidate {
+                text: "beta".to_string(),
+                summary_id: Some("seed_x".to_string()),
+            },
+        ];
+        let (_section, adopted, _dropped, ids) = build_section_with_stats(&items);
+        assert_eq!(adopted, 2);
+        assert_eq!(ids, vec!["seed_x".to_string()]);
+    }
+
+    #[test]
+    fn ai_build_section_with_stats_skips_items_without_id() {
+        let items = vec![
+            RenderCandidate {
+                text: "no id here".to_string(),
+                summary_id: None,
+            },
+            RenderCandidate {
+                text: "with id".to_string(),
+                summary_id: Some("seed_b".to_string()),
+            },
+        ];
+        let (_section, adopted, _dropped, ids) = build_section_with_stats(&items);
+        // Both items adopted (items_adopted counts emit), but id list has only one.
+        assert_eq!(adopted, 2);
+        assert_eq!(ids, vec!["seed_b".to_string()]);
+    }
+
+    #[test]
+    fn ai_render_context_pack_returns_sanitized_adopted_ids() {
+        let resp = mk_resp(json!({
+            "items": [
+                { "kind": "summary", "id": "seed_a", "summary": "alpha" },
+                { "kind": "summary", "id": "seed_b", "summary": "beta" },
+            ]
+        }));
+        let (section, stats) = render_context_pack(&resp, &HashSet::new());
+        let section = section.expect("expected rendered section");
+        assert!(section.contains("alpha"));
+        assert!(section.contains("beta"));
+        assert_eq!(stats.items_adopted, 2);
+        assert_eq!(stats.adopted_summary_ids.len(), 2);
+        assert!(stats.adopted_summary_ids.contains(&"seed_a".to_string()));
+        assert!(stats.adopted_summary_ids.contains(&"seed_b".to_string()));
     }
 }

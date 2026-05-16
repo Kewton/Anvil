@@ -63,6 +63,11 @@ pub fn parse_evaluate_response(resp: &EvaluateResponse) -> PhotonEvalSummary {
         prompt_adopted,
         task_outcome,
         retry_summary,
+        // Issue #591 (VR-08 / T2.2): populated by the agent layer
+        // (`build_eval_record` site in `turn.rs`) after the cap is applied to
+        // the actual evaluate request payload. The parser cannot know the
+        // cap-applied count because the request was built in the agent layer.
+        summary_ids_adopted_count: None,
     }
 }
 

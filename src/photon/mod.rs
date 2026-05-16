@@ -7,7 +7,8 @@ pub mod schema;
 pub use client::PhotonClient;
 pub use prompt::{
     BLOCKED_WARNING_REASON, MAX_BLOCKED_SUMMARY_ID_BYTES, MAX_BLOCKED_SUMMARY_IDS,
-    MAX_PHOTON_WARNING_MESSAGE_BYTES, MAX_PHOTON_WARNINGS_SCAN, RenderStats, render_context_pack,
+    MAX_PHOTON_EVAL_ADOPTED_IDS, MAX_PHOTON_WARNING_MESSAGE_BYTES, MAX_PHOTON_WARNINGS_SCAN,
+    RenderStats, render_context_pack,
 };
 pub use schema::{
     ContextPackRequest, ContextPackResponse, EvaluateRequest, EvaluateResponse, HealthResponse,

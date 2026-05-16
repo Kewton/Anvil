@@ -153,6 +153,7 @@ fn t3_shadow_mode_context_pack_id_in_eval_log() {
         prompt_adopted: Some(true),
         task_outcome: None,
         retry_summary: None,
+        summary_ids_adopted_count: None,
     };
 
     let last_context_pack_id = Some("cpid-from-shadow".to_string());
@@ -296,4 +297,92 @@ fn t6_context_pack_id_fallback_from_last() {
         "cpid-fallback-from-context-pack"
     );
     assert_eq!(json["photon_eval"]["admission_decision"], "accepted");
+}
+
+// T7 ─────────────────────────────────────────────────────────────────────────
+
+/// Issue #591 (VR-08 / T4.6): `summary_ids_adopted_count` is serialized as a
+/// JSON number when the agent layer populates it (live mode case).
+#[test]
+fn t7_summary_ids_adopted_count_some_serialized_as_number() {
+    use anvil::photon::eval::parse_evaluate_response;
+
+    let resp = make_resp(serde_json::json!({
+        "admitted": true,
+        "context_pack_id": "cpid-t7",
+    }));
+    let mut summary = parse_evaluate_response(&resp);
+    // The parser leaves this field as None — the agent layer
+    // (`invoke_photon_evaluate`) is responsible for setting it after applying
+    // the `MAX_PHOTON_EVAL_ADOPTED_IDS` cap. Simulate that here.
+    summary.summary_ids_adopted_count = Some(3);
+
+    let rec = build_eval_record(
+        "sess-t7",
+        7_000,
+        "task",
+        "model",
+        "Act",
+        "native",
+        &[],
+        None,
+        &[],
+        None,
+        empty_classes(),
+        &[],
+        None,
+        Some(summary),
+        "done",
+    );
+
+    let json = write_and_parse(&rec);
+    assert_eq!(
+        json["photon_eval"]["summary_ids_adopted_count"], 3,
+        "summary_ids_adopted_count must serialize as JSON number"
+    );
+}
+
+// T8 ─────────────────────────────────────────────────────────────────────────
+
+/// Issue #591 (VR-08): `summary_ids_adopted_count=None` is OMITTED from the
+/// serialized JSON (per `#[serde(default, skip_serializing_if = "Option::is_none")]`).
+/// This is the fail-open case (no evaluate response, photon disabled).
+#[test]
+fn t8_summary_ids_adopted_count_none_omitted_from_json() {
+    use anvil::photon::eval::parse_evaluate_response;
+
+    let resp = make_resp(serde_json::json!({
+        "admitted": false,
+    }));
+    let summary = parse_evaluate_response(&resp);
+    // Sanity: the parser default is None.
+    assert!(summary.summary_ids_adopted_count.is_none());
+
+    let rec = build_eval_record(
+        "sess-t8",
+        8_000,
+        "task",
+        "model",
+        "Act",
+        "native",
+        &[],
+        None,
+        &[],
+        None,
+        empty_classes(),
+        &[],
+        None,
+        Some(summary),
+        "done",
+    );
+
+    let json = write_and_parse(&rec);
+    let photon_eval = &json["photon_eval"];
+    assert!(
+        !photon_eval
+            .as_object()
+            .unwrap()
+            .contains_key("summary_ids_adopted_count"),
+        "None must be skipped by serde (no field at all in JSON)"
+    );
 }
