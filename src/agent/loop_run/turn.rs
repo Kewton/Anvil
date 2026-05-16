@@ -3049,6 +3049,16 @@ impl Agent {
     /// Issue #557: call photon context_pack and store rendered response.
     /// Canary gate runs BEFORE the HTTP fetch (DR3-002).
     fn invoke_photon_context_pack(&mut self) {
+        // CB-003 (Issue #592): unconditionally clear inject tracking at the
+        // very start so EVERY code path through this function (early returns
+        // for photon=None / shadow_mode / canary gate, HTTP failure, empty
+        // render, AND the case where this function is never reached because
+        // the caller hits a Plan-mode short-circuit before invoking us) leaves
+        // a clean slate. The success path re-populates both fields after a
+        // successful render, so this is the "rule (a) always overwrites" SSOT.
+        self.last_injected_summary_ids.clear();
+        self.last_injected_summary_turn_index = None;
+
         // DR2-001: photon インライン呼び出しで借用チェッカー衝突を回避
         if self.photon.is_none() {
             return;
@@ -3067,6 +3077,8 @@ impl Agent {
                     "reason": "shadow_mode",
                 }),
             );
+            self.last_injected_summary_ids.clear();
+            self.last_injected_summary_turn_index = None;
             return;
         }
 
@@ -3090,6 +3102,8 @@ impl Agent {
                     "reason": "canary_gate",
                 }),
             );
+            self.last_injected_summary_ids.clear();
+            self.last_injected_summary_turn_index = None;
             return;
         }
 
@@ -3242,12 +3256,26 @@ impl Agent {
                 // the injection side (DR4-002); the evaluate hook re-runs
                 // the sanitizer defensively (DR4-NEW-001) and applies the
                 // `MAX_PHOTON_EVAL_ADOPTED_IDS` cap before serialising.
-                self.last_adopted_summary_ids = render_stats.adopted_summary_ids;
+                self.last_adopted_summary_ids = render_stats.adopted_summary_ids.clone();
                 let (truncated_rendered, trunc) = truncate_photon_context_pack(rendered);
                 truncated = trunc;
                 self.photon_context_pack_response = Some(truncated_rendered);
+                // Issue #592: record the sanitized summary IDs of the items
+                // we actually injected so `/photon-thumbs-{up,down}` on the
+                // next turn can attribute feedback to this injection.
+                self.last_injected_summary_ids = render_stats.adopted_summary_ids;
+                self.last_injected_summary_turn_index = Some(self.current_turn_index);
+            } else {
+                // No items survived rendering → clear tracking so a stale
+                // list from an earlier turn cannot leak into the thumbs path.
+                self.last_injected_summary_ids.clear();
+                self.last_injected_summary_turn_index = None;
             }
             // else: no valid items after filtering → response stays None
+        } else {
+            // HTTP failure / fail-open path: nothing was injected this turn.
+            self.last_injected_summary_ids.clear();
+            self.last_injected_summary_turn_index = None;
         }
 
         // Issue #594: status state machine (Failed / Injected / NoInjection)
@@ -3486,6 +3514,11 @@ impl Agent {
             // Issue #594: surface plan-mode skip via /photon-why.
             self.last_photon_context_pack_status =
                 crate::agent::loop_run::PhotonContextPackStatus::PlanMode;
+            // CB-003 (Issue #592): Plan-mode skip path must also clear stale
+            // inject tracking so a previous Act-turn's seed ids do not survive
+            // into a Plan turn and become "visible" to `/photon-thumbs-*`.
+            self.last_injected_summary_ids.clear();
+            self.last_injected_summary_turn_index = None;
             log_llm_event(
                 "agent.photon_context_pack.skipped",
                 serde_json::json!({

@@ -256,6 +256,13 @@ pub struct Config {
     /// from the block set. No new env/config flag is added; the existing
     /// `photon_respect_warnings` gate governs the entire two-stage pipeline.
     pub photon_respect_warnings: bool,
+    /// Issue #592: when `true`, `/photon-rule` persists a `PhotonSeedDraft` and
+    /// ships it to the photon sidecar as a rule-promotion seed (i.e. potentially
+    /// adopted into the common photon corpus). When `false` (default), the
+    /// command runs as a dry-run that only records the rule locally without
+    /// hitting `/v1/evaluate`. Env: `ANVIL_PHOTON_COMMON_SEED`. Config file key:
+    /// `photon_common_seed_enabled`.
+    pub photon_common_seed_enabled: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -287,6 +294,9 @@ pub struct PartialConfig {
     pub photon_rollout_min_eval_turns: Option<u32>,
     /// Issue #583: optional override for the warning filter (None = use default).
     pub photon_respect_warnings: Option<bool>,
+    /// Issue #592: optional override for the common-seed (photon-rule) gate
+    /// (None = use default `false`).
+    pub photon_common_seed_enabled: Option<bool>,
 }
 
 impl Config {
@@ -330,6 +340,7 @@ impl Config {
             photon_timeout_ms: None,
             photon_rollout_min_eval_turns: None,
             photon_respect_warnings: None,
+            photon_common_seed_enabled: None,
         };
         let merged = merge_partial_configs(&[file_config, env_config, cli_config]);
         let ollama_host = validate_localhost_url(
@@ -380,6 +391,9 @@ impl Config {
             // Default true (Issue #583); explicit Some(false) from env/file
             // disables the warning filter (escape hatch for canary rollback).
             photon_respect_warnings: merged.photon_respect_warnings.unwrap_or(true),
+            // Default false (Issue #592); explicit Some(true) from env/file
+            // enables shipping `/photon-rule` drafts to the sidecar evaluate.
+            photon_common_seed_enabled: merged.photon_common_seed_enabled.unwrap_or(false),
         };
         Ok((config, warnings))
     }
@@ -457,6 +471,9 @@ pub fn merge_partial_configs(configs: &[PartialConfig]) -> PartialConfig {
         if config.photon_respect_warnings.is_some() {
             merged.photon_respect_warnings = config.photon_respect_warnings;
         }
+        if config.photon_common_seed_enabled.is_some() {
+            merged.photon_common_seed_enabled = config.photon_common_seed_enabled;
+        }
     }
     merged
 }
@@ -525,6 +542,9 @@ pub fn load_config_file(path: &Path, warnings: &mut Vec<String>) -> Result<Parti
             .and_then(|v| parse_photon_rollout_min_eval_turns(v, warnings)),
         photon_respect_warnings: map
             .get("photon_respect_warnings")
+            .and_then(|v| parse_bool(v)),
+        photon_common_seed_enabled: map
+            .get("photon_common_seed_enabled")
             .and_then(|v| parse_bool(v)),
     })
 }
@@ -599,6 +619,9 @@ pub fn load_env_config(warnings: &mut Vec<String>) -> PartialConfig {
             .ok()
             .and_then(|v| parse_photon_rollout_min_eval_turns(&v, warnings)),
         photon_respect_warnings: env::var("ANVIL_PHOTON_RESPECT_WARNINGS")
+            .ok()
+            .and_then(|v| parse_bool(&v)),
+        photon_common_seed_enabled: env::var("ANVIL_PHOTON_COMMON_SEED")
             .ok()
             .and_then(|v| parse_bool(&v)),
     }
