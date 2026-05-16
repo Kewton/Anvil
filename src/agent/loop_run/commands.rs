@@ -2103,6 +2103,40 @@ mod tests {
             .format_for_prompt_with_precautions(&selected)
     }
 
+    /// Issue #604 Task 3.2 (DR2-006 / Issue §AP-12 S7-001): a freshly
+    /// constructed `Agent` must initialize `last_auto_promote_outcome` to
+    /// `None`. Task 5.1 will populate it; Task 5.2 will reset it at the
+    /// top of every `handle_user_message`.
+    #[test]
+    fn fresh_agent_has_no_last_auto_promote_outcome() {
+        let (agent, _temp) = test_agent(false);
+        assert!(
+            agent.last_auto_promote_outcome.is_none(),
+            "Agent::new must initialize last_auto_promote_outcome to None"
+        );
+    }
+
+    /// Issue #604 Task 3.2: `last_auto_promote_outcome` is a plain
+    /// `Option<AutoPromoteOutcomeSummary>`; assigning a value preserves
+    /// the 3 SSOT fields verbatim until Task 5.2 resets it.
+    #[test]
+    fn last_auto_promote_outcome_round_trips_a_summary() {
+        use crate::agent::loop_run::auto_promote::AutoPromoteOutcomeSummary;
+        let (mut agent, _temp) = test_agent(false);
+        agent.last_auto_promote_outcome = Some(AutoPromoteOutcomeSummary {
+            decision: "promoted".into(),
+            skip_reason: None,
+            summary_id: Some("anvil-case-fixture".into()),
+        });
+        let read = agent
+            .last_auto_promote_outcome
+            .as_ref()
+            .expect("just set above");
+        assert_eq!(read.decision, "promoted");
+        assert!(read.skip_reason.is_none());
+        assert_eq!(read.summary_id.as_deref(), Some("anvil-case-fixture"));
+    }
+
     #[test]
     fn precautions_command_add_list_retire_updates_prompt() {
         let (mut agent, _temp) = test_agent(false);

@@ -59,6 +59,14 @@ pub struct EvalRecord {
     /// 0 = disabled, 1000 = full traffic.
     #[serde(default)]
     pub photon_canary: u16,
+    /// Issue #604 (Task 4.1 / DR2-007 / DR1-020): post-loop auto-promote hook
+    /// outcome summary attached to this turn. `None` when the hook was not
+    /// invoked or did not produce an outcome (e.g. Plan mode / Issue #604
+    /// pre-rollout). Omitted from JSON via `skip_serializing_if` so legacy
+    /// consumers parsing pre-#604 records remain compatible (Issue #471
+    /// schema invariant).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_promote: Option<AutoPromoteOutcomeSummary>,
     pub final_outcome: String,
 }
 
@@ -194,6 +202,32 @@ pub struct PhotonEvalSummary {
     pub outcome_detail_emitted: Option<String>,
 }
 
+/// Issue #604 (Task 4.1 / DR2-007): 3-field flat summary attached to
+/// `EvalRecord.auto_promote`. SSOT for the post-loop auto-promote hook's
+/// per-turn outcome carrier.
+///
+/// **3 fields by design** (DR2-007): `request_id` / `scrub_status` /
+/// `scrubbed_fields` / `fail_reason` / `skip_sub_reason` are event-payload
+/// only and intentionally not duplicated into `EvalRecord` (Issue §AP-12 /
+/// EvalRecord schema bloat抑止). The agent layer
+/// (`src/agent/loop_run/auto_promote.rs`) re-exports this type via
+/// `pub use` to maintain the agent → session layer direction (DR3-002).
+///
+/// `is_secret_like_key=false` is satisfied: `decision` / `skip_reason` /
+/// `summary_id` are all non-secret keys (DR2-025).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AutoPromoteOutcomeSummary {
+    /// `"promoted" | "skipped" | "scrubbed" | "failed" | "rejected_by_photon"`
+    /// (5-value enum). SSOT lives in `auto_promote::AutoPromoteOutcomeKind::decision_str()`
+    /// (Task 4.2 forward-decl).
+    pub decision: String,
+    /// `AutoPromoteSkipReason::event_str()` short tag (skip-family only is Some).
+    pub skip_reason: Option<String>,
+    /// Sanitized photon `summary_id` for the promoted / scrubbed /
+    /// rejected_by_photon cases. `None` for non-HTTP skip paths.
+    pub summary_id: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // OnceLock state
 // ---------------------------------------------------------------------------
@@ -290,6 +324,7 @@ pub fn build_eval_record(
     verify_commands: &[String],
     case_retrieval_result: Option<CaseRetrievalSummary>,
     photon_eval: Option<PhotonEvalSummary>,
+    auto_promote: Option<AutoPromoteOutcomeSummary>,
     final_outcome: &str,
 ) -> EvalRecord {
     // DR4-002: mask_secrets → truncate for free-text fields
@@ -323,6 +358,7 @@ pub fn build_eval_record(
         case_retrieval_result,
         photon_eval,
         photon_canary: 0,
+        auto_promote,
         final_outcome: final_outcome.to_string(),
     }
 }
@@ -402,6 +438,7 @@ mod tests {
             case_retrieval_result: None,
             photon_eval: None,
             photon_canary: 0,
+            auto_promote: None,
             final_outcome: "done".to_string(),
         }
     }
@@ -428,6 +465,7 @@ mod tests {
                 setup: 0,
             },
             &["cargo test".to_string()],
+            None,
             None,
             None,
             "done",
@@ -461,6 +499,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
             "done",
         );
         assert!(
@@ -490,6 +529,7 @@ mod tests {
                 setup: 0,
             },
             &[],
+            None,
             None,
             None,
             "done",
@@ -526,9 +566,64 @@ mod tests {
             &[],
             None,
             None,
+            None,
             "done",
         );
         assert!(rec.active_precautions.len() <= MAX_EVAL_PRECAUTIONS);
+    }
+
+    // Issue #604 Task 4.1: build_eval_record carries through auto_promote.
+    #[test]
+    fn build_eval_record_attaches_auto_promote_summary() {
+        let summary = AutoPromoteOutcomeSummary {
+            decision: "promoted".to_string(),
+            skip_reason: None,
+            summary_id: Some("anvil-case-aaaaaaaaaaaaaaaa".to_string()),
+        };
+        let rec = build_eval_record(
+            "sess-604",
+            0,
+            "task",
+            "model",
+            "Act",
+            "native",
+            &[],
+            None,
+            &[],
+            None,
+            ChangedFileClasses {
+                test: 0,
+                impl_files: 0,
+                setup: 0,
+            },
+            &[],
+            None,
+            None,
+            Some(summary.clone()),
+            "done",
+        );
+        let got = rec.auto_promote.expect("auto_promote present");
+        assert_eq!(got, summary);
+        // DR2-007: schema stays 3-field flat when serialized.
+        let v = serde_json::to_value(&got).unwrap();
+        let obj = v.as_object().unwrap();
+        assert_eq!(obj.len(), 3, "3-field flat: {v}");
+        assert_eq!(obj["decision"], "promoted");
+        assert!(obj["skip_reason"].is_null());
+        assert_eq!(obj["summary_id"], "anvil-case-aaaaaaaaaaaaaaaa");
+    }
+
+    // Issue #604 Task 4.1: when auto_promote is None, the field is omitted
+    // from the JSON output entirely (backward compat with pre-#604 readers).
+    #[test]
+    fn eval_record_omits_auto_promote_when_none() {
+        let mut rec = make_eval_record();
+        rec.auto_promote = None;
+        let json = serde_json::to_value(&rec).unwrap();
+        assert!(
+            json.get("auto_promote").is_none(),
+            "auto_promote should be omitted when None: {json}",
+        );
     }
 
     #[test]

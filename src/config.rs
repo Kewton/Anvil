@@ -263,6 +263,35 @@ pub struct Config {
     /// hitting `/v1/evaluate`. Env: `ANVIL_PHOTON_COMMON_SEED`. Config file key:
     /// `photon_common_seed_enabled`.
     pub photon_common_seed_enabled: bool,
+    /// Issue #604 (AP-07): post-loop photon auto-promote hook 機能フラグ。
+    /// Default: `true`。env: `ANVIL_PHOTON_AUTO_PROMOTE`、config key:
+    /// `photon_auto_promote`。Phase 1 rollout 中は本フラグだけでなく
+    /// `photon_auto_promote_dry_run=true` で HTTP skip するため、本フラグ
+    /// `true` 単独では実際の photon 投入は走らない。
+    pub photon_auto_promote: bool,
+    /// Issue #604 (AP-07): 緊急 disable kill-switch。`true` の場合
+    /// `photon_auto_promote` の値に関わらず hook を強制 disable する
+    /// (`AutoPromoteSkipReason::Disabled { sub_reason: None }`)。Default:
+    /// `false`。env: `ANVIL_PHOTON_NO_AUTO_PROMOTE` (POSIX `NO_COLOR` 慣例:
+    /// 非空値で disable)、config key: `photon_no_auto_promote`。
+    pub photon_no_auto_promote: bool,
+    /// Issue #604 (AP-07 / DR-AP-5): Phase 1 rollout 中の HTTP skip フラグ。
+    /// Default: **`true`** (Phase 1 dry-run period)。`true` の場合
+    /// eligibility 判定を通過しても photon `/v1/summary/upsert` POST を
+    /// skip し、`agent.photon_auto_promote.skipped {reason: dry_run}` event
+    /// だけ emit する (per-turn cap は立てる / S7-004 #3)。env:
+    /// `ANVIL_PHOTON_AUTO_PROMOTE_DRY_RUN`、config key:
+    /// `photon_auto_promote_dry_run`。
+    pub photon_auto_promote_dry_run: bool,
+    /// Issue #604 (AP-07 / DR1-015): scrub mode の **文字列保持**。
+    /// config 層は session 層 `ScrubMode` enum を import せず、生文字列で
+    /// 保持する (既存 photon 系 primitive 流儀)。Default: `"strict"`
+    /// (= `DEFAULT_SCRUB_MODE`)。`"warn"` を許容、それ以外は agent 層 hook
+    /// 内で `ScrubMode::from_env_str_or_default` を通したときに warn log を
+    /// 出して `Strict` にフォールバックする (DR1-016)。env:
+    /// `ANVIL_PHOTON_AUTO_PROMOTE_SCRUB_MODE`、config key:
+    /// `photon_auto_promote_scrub_mode`。
+    pub photon_auto_promote_scrub_mode: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -297,6 +326,20 @@ pub struct PartialConfig {
     /// Issue #592: optional override for the common-seed (photon-rule) gate
     /// (None = use default `false`).
     pub photon_common_seed_enabled: Option<bool>,
+    /// Issue #604: optional override for the auto-promote hook feature flag
+    /// (None = use default `true`).
+    pub photon_auto_promote: Option<bool>,
+    /// Issue #604: optional override for the emergency kill-switch
+    /// (None = use default `false`).
+    pub photon_no_auto_promote: Option<bool>,
+    /// Issue #604: optional override for the dry-run gate
+    /// (None = use default `true` — Phase 1 rollout).
+    pub photon_auto_promote_dry_run: Option<bool>,
+    /// Issue #604: optional override for the scrub mode string
+    /// (None = use default `"strict"`). Unknown strings are accepted at this
+    /// layer and validated only when the agent layer constructs `ScrubMode`
+    /// (DR1-015 / DR1-016).
+    pub photon_auto_promote_scrub_mode: Option<String>,
 }
 
 impl Config {
@@ -341,6 +384,11 @@ impl Config {
             photon_rollout_min_eval_turns: None,
             photon_respect_warnings: None,
             photon_common_seed_enabled: None,
+            // Issue #604: auto-promote hook env-only (no CLI flags).
+            photon_auto_promote: None,
+            photon_no_auto_promote: None,
+            photon_auto_promote_dry_run: None,
+            photon_auto_promote_scrub_mode: None,
         };
         let merged = merge_partial_configs(&[file_config, env_config, cli_config]);
         let ollama_host = validate_localhost_url(
@@ -394,6 +442,25 @@ impl Config {
             // Default false (Issue #592); explicit Some(true) from env/file
             // enables shipping `/photon-rule` drafts to the sidecar evaluate.
             photon_common_seed_enabled: merged.photon_common_seed_enabled.unwrap_or(false),
+            // Issue #604 (AP-07): post-loop auto-promote hook. Default true:
+            // the feature is on, but Phase 1 rollout still relies on
+            // `photon_auto_promote_dry_run=true` for HTTP skip.
+            photon_auto_promote: merged.photon_auto_promote.unwrap_or(true),
+            // Issue #604 (AP-07): emergency kill-switch. Default false; any
+            // non-empty `ANVIL_PHOTON_NO_AUTO_PROMOTE` sets Some(true) via
+            // `load_env_config` so the disable wins.
+            photon_no_auto_promote: merged.photon_no_auto_promote.unwrap_or(false),
+            // Issue #604 (AP-07 / DR-AP-5): Phase 1 rollout default = true
+            // (dry-run / HTTP skip). Switching to false enables real photon
+            // upserts (deferred to a later rollout phase / separate issue).
+            photon_auto_promote_dry_run: merged.photon_auto_promote_dry_run.unwrap_or(true),
+            // Issue #604 (AP-07 / DR1-015 / DR1-018): default `"strict"`
+            // matches `DEFAULT_SCRUB_MODE` (Strict). Unknown strings fall
+            // back to Strict with a `tracing::warn!` in the agent layer when
+            // `ScrubMode::from_env_str_or_default` is invoked.
+            photon_auto_promote_scrub_mode: merged
+                .photon_auto_promote_scrub_mode
+                .unwrap_or_else(|| "strict".to_string()),
         };
         Ok((config, warnings))
     }
@@ -474,6 +541,18 @@ pub fn merge_partial_configs(configs: &[PartialConfig]) -> PartialConfig {
         if config.photon_common_seed_enabled.is_some() {
             merged.photon_common_seed_enabled = config.photon_common_seed_enabled;
         }
+        if config.photon_auto_promote.is_some() {
+            merged.photon_auto_promote = config.photon_auto_promote;
+        }
+        if config.photon_no_auto_promote.is_some() {
+            merged.photon_no_auto_promote = config.photon_no_auto_promote;
+        }
+        if config.photon_auto_promote_dry_run.is_some() {
+            merged.photon_auto_promote_dry_run = config.photon_auto_promote_dry_run;
+        }
+        if config.photon_auto_promote_scrub_mode.is_some() {
+            merged.photon_auto_promote_scrub_mode = config.photon_auto_promote_scrub_mode.clone();
+        }
     }
     merged
 }
@@ -546,6 +625,15 @@ pub fn load_config_file(path: &Path, warnings: &mut Vec<String>) -> Result<Parti
         photon_common_seed_enabled: map
             .get("photon_common_seed_enabled")
             .and_then(|v| parse_bool(v)),
+        // Issue #604 auto-promote config keys.
+        photon_auto_promote: map.get("photon_auto_promote").and_then(|v| parse_bool(v)),
+        photon_no_auto_promote: map
+            .get("photon_no_auto_promote")
+            .and_then(|v| parse_bool(v)),
+        photon_auto_promote_dry_run: map
+            .get("photon_auto_promote_dry_run")
+            .and_then(|v| parse_bool(v)),
+        photon_auto_promote_scrub_mode: map.get("photon_auto_promote_scrub_mode").cloned(),
     })
 }
 
@@ -624,6 +712,21 @@ pub fn load_env_config(warnings: &mut Vec<String>) -> PartialConfig {
         photon_common_seed_enabled: env::var("ANVIL_PHOTON_COMMON_SEED")
             .ok()
             .and_then(|v| parse_bool(&v)),
+        // Issue #604 (AP-07) auto-promote env knobs.
+        photon_auto_promote: env::var("ANVIL_PHOTON_AUTO_PROMOTE")
+            .ok()
+            .and_then(|v| parse_bool(&v)),
+        // POSIX `NO_COLOR` convention: any non-empty value disables; matches
+        // `ANVIL_NO_FOOTER` / `ANVIL_NO_SPINNER` / `ANVIL_NO_INTERRUPT`.
+        photon_no_auto_promote: env::var("ANVIL_PHOTON_NO_AUTO_PROMOTE")
+            .ok()
+            .and_then(|v| (!v.is_empty()).then_some(true)),
+        photon_auto_promote_dry_run: env::var("ANVIL_PHOTON_AUTO_PROMOTE_DRY_RUN")
+            .ok()
+            .and_then(|v| parse_bool(&v)),
+        photon_auto_promote_scrub_mode: env::var("ANVIL_PHOTON_AUTO_PROMOTE_SCRUB_MODE")
+            .ok()
+            .filter(|v| !v.trim().is_empty()),
     }
 }
 

@@ -200,3 +200,131 @@ fn r14_evaluate_connection_refused_failopen() {
     let req = anvil::photon::EvaluateRequest(serde_json::json!({}));
     assert!(client.evaluate(&req).is_none());
 }
+
+// -------------------------------------------------------------------------
+// Task 1.4: PhotonClient::upsert_action_summary (Issue #604)
+// -------------------------------------------------------------------------
+
+fn make_upsert_summary() -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": "action-memory.v0.2",
+        "summary_id": "anvil-case-abc",
+        "summary_level": "task",
+        "facts": [],
+        "avoid": [],
+        "next_hints": [],
+        "quality_warnings": [],
+        "quality_check_status": "pending",
+    })
+}
+
+// R15: upsert_action_summary 200 -> Some(Ok(SummaryUpsertResponse))
+#[test]
+fn r15_upsert_200_returns_some_ok() {
+    let mut server = mockito::Server::new();
+    let _m = server
+        .mock("POST", "/v1/summary/upsert")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"schema_version":"action-memory.v0.2","request_id":"deadbeefcafef00d","summary_id":"anvil-case-abc","status":"stored"}"#,
+        )
+        .create();
+    let client = make_photon_client(server.url());
+    let out = client.upsert_action_summary(
+        "action-memory.v0.2",
+        "deadbeefcafef00d",
+        make_upsert_summary(),
+    );
+    let resp = out
+        .expect("expected Some on 200")
+        .expect("expected Ok on 200");
+    assert_eq!(resp.status, "stored");
+    assert_eq!(resp.summary_id, "anvil-case-abc");
+    assert_eq!(resp.request_id, "deadbeefcafef00d");
+    assert_eq!(resp.schema_version, "action-memory.v0.2");
+}
+
+// R16: upsert_action_summary 422 answer_leak_detected -> Some(Err(AnswerLeakDetected))
+#[test]
+fn r16_upsert_422_answer_leak_returns_some_err() {
+    let mut server = mockito::Server::new();
+    let _m = server
+        .mock("POST", "/v1/summary/upsert")
+        .with_status(422)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"detail":{"error":"answer_leak_detected"},"quality_warnings":["facts[0]: literal 42","avoid[1]: numeric"]}"#,
+        )
+        .create();
+    let client = make_photon_client(server.url());
+    let out = client.upsert_action_summary(
+        "action-memory.v0.2",
+        "0011223344556677",
+        make_upsert_summary(),
+    );
+    let err = out
+        .expect("expected Some on 422 with leak marker")
+        .expect_err("expected Err on 422 answer_leak_detected");
+    match err {
+        anvil::photon::PhotonUpsertError::AnswerLeakDetected(warnings) => {
+            assert_eq!(warnings.len(), 2);
+            assert!(warnings[0].contains("facts[0]"));
+        }
+    }
+}
+
+// R17: upsert_action_summary 500 -> None (fail-open)
+#[test]
+fn r17_upsert_500_returns_none() {
+    let mut server = mockito::Server::new();
+    let _m = server
+        .mock("POST", "/v1/summary/upsert")
+        .with_status(500)
+        .with_body("internal error")
+        .create();
+    let client = make_photon_client(server.url());
+    let out = client.upsert_action_summary(
+        "action-memory.v0.2",
+        "ffffffffffffffff",
+        make_upsert_summary(),
+    );
+    assert!(out.is_none(), "5xx should degrade to None");
+}
+
+// R18: upsert_action_summary connection refused -> None (fail-open)
+#[test]
+fn r18_upsert_connection_refused_returns_none() {
+    let client =
+        anvil::photon::PhotonClient::new("http://127.0.0.1:19997".to_string(), 1000).unwrap();
+    let out = client.upsert_action_summary(
+        "action-memory.v0.2",
+        "aaaabbbbccccdddd",
+        make_upsert_summary(),
+    );
+    assert!(out.is_none(), "connection refused should be None");
+}
+
+// R19: upsert_action_summary with invalid summary_id (sanitize -> None) returns None
+// without ever issuing the HTTP call (mock has expect(0)).
+#[test]
+fn r19_upsert_invalid_summary_id_returns_none_without_http() {
+    let mut server = mockito::Server::new();
+    let m = server
+        .mock("POST", "/v1/summary/upsert")
+        .expect(0)
+        .with_status(200)
+        .with_body(r#"{"schema_version":"x","request_id":"x","summary_id":"x","status":"x"}"#)
+        .create();
+    let client = make_photon_client(server.url());
+    // summary_id contains a space — `sanitize_summary_id` restricts to
+    // ASCII [A-Za-z0-9._-] so this must be rejected.
+    let mut s = make_upsert_summary();
+    s["summary_id"] = serde_json::Value::String("not a valid id".into());
+    let out = client.upsert_action_summary("action-memory.v0.2", "1111222233334444", s);
+    assert!(
+        out.is_none(),
+        "invalid summary_id must short-circuit to None"
+    );
+    m.assert();
+}

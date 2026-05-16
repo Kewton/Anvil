@@ -25,6 +25,7 @@ use crate::stdin_prompt;
 use crate::system_prompt::build_system_prompt;
 use crate::tools::registry::{ToolContext, ToolRegistry};
 
+pub(crate) mod auto_promote;
 mod auto_test;
 pub mod commands;
 mod deterministic;
@@ -380,6 +381,19 @@ pub struct Agent {
     /// (DR2-002), consumed only when an actual `/v1/evaluate` call was
     /// attempted (i.e. inject was present and we shipped the feedback event).
     pub(super) photon_user_feedback_called_this_turn: bool,
+    /// Issue #604 (DR2-006 / Issue §AP-12 S7-001): turn-local cache of the
+    /// most recent `invoke_photon_auto_promote` outcome. Set by Task 5.1
+    /// (`invoke_photon_auto_promote` hook) at the end of every Phase A/B
+    /// path, and read by `build_eval_record(...)` to attach to
+    /// `EvalRecord.auto_promote` (Task 4.1).
+    ///
+    /// **Distinct from `SessionSnapshot.auto_promote_called_this_turn`**:
+    /// the snapshot flag is the per-turn cap guard (twice-call suppression)
+    /// while this field is the EvalRecord persistence carrier. Both reset
+    /// at the same `handle_user_message` head (Task 5.2 wiring) but are
+    /// independent variables (Issue S7-001 SSOT).
+    pub(super) last_auto_promote_outcome:
+        Option<crate::agent::loop_run::auto_promote::AutoPromoteOutcomeSummary>,
 }
 
 /// Issue #594: state machine for the `/photon-why` slash command. Lives at
@@ -498,6 +512,7 @@ impl Agent {
             last_injected_summary_ids: Vec::new(),
             last_injected_summary_turn_index: None,
             photon_user_feedback_called_this_turn: false,
+            last_auto_promote_outcome: None,
         }
     }
 }
