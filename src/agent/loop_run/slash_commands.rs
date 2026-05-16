@@ -37,6 +37,11 @@ pub const SLASH_COMMANDS: &[&str] = &[
     "/tests",
     // Issue #594: photon seed lineage for the last turn.
     "/photon-why",
+    // Issue #592: user-explicit photon feedback commands.
+    "/photon-thumbs-up",
+    "/photon-thumbs-down",
+    "/photon-correct",
+    "/photon-rule",
     "/exit",
 ];
 

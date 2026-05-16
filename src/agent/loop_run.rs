@@ -32,6 +32,7 @@ pub(crate) mod feedback_kind_confirm;
 mod footer;
 mod interrupt;
 mod lifecycle;
+pub mod photon_user_feedback;
 mod protocol;
 mod quality;
 pub(crate) mod quality_confirm;
@@ -98,6 +99,26 @@ pub use tester::{
 // Issue #472: expose env-gate helper so `tests/eval_harness_smoke.rs` can
 // drive the closure-DI boundary (ANVIL_NO_AUTO_TEST) without live Ollama.
 pub use auto_test::auto_test_disabled;
+
+// Issue #592: expose the photon user-feedback adapter so the E2E smoke suite
+// under `tests/photon_user_feedback_smoke.rs` can drive the four entry-points
+// directly without a live Ollama dependency.
+pub use photon_user_feedback::{
+    handle_correct as photon_handle_correct, handle_rule as photon_handle_rule,
+    handle_thumbs_down as photon_handle_thumbs_down, handle_thumbs_up as photon_handle_thumbs_up,
+    photon_feedback_disabled,
+};
+
+/// Issue #592 — test-only helper for `tests/photon_user_feedback_smoke.rs` to
+/// simulate "photon injected these IDs in the previous turn" without spinning
+/// up a full context-pack round-trip. Production code populates the field via
+/// `invoke_photon_context_pack` (turn.rs); this seam is needed because the
+/// adapter is tested end-to-end at the Agent boundary.
+pub fn set_last_injected_for_test(agent: &mut Agent, ids: Vec<String>) {
+    let current = agent.current_turn_index;
+    agent.last_injected_summary_ids = ids;
+    agent.last_injected_summary_turn_index = Some(current);
+}
 
 // Issue #576: expose WorkMode second-pass confirmation adapter surface so
 // `tests/work_mode_confirm_smoke.rs` can drive `run_work_mode_confirm_with_strategy`
@@ -298,6 +319,26 @@ pub struct Agent {
     /// NOT reset in `handle_user_message` so a `/plan` slash command between
     /// turns can still surface the last Act turn's lineage (S7-002).
     pub(super) last_photon_context_pack_status: PhotonContextPackStatus,
+    /// Issue #592: sanitized summary IDs of the photon items that were
+    /// actually injected into the previous prompt build. Populated by
+    /// `invoke_photon_context_pack` from `RenderStats.adopted_summary_ids`.
+    /// Consumed by the `/photon-thumbs-{up,down}` adapter to attribute user
+    /// feedback to the actual injection.
+    ///
+    /// NOT reset in `handle_user_message`: the thumbs adapter runs on the
+    /// turn AFTER the injection, so the field must survive the inter-turn
+    /// boundary. Cleared on any early-return path inside
+    /// `invoke_photon_context_pack` (Plan / offline / shadow / canary skip).
+    pub(super) last_injected_summary_ids: Vec<String>,
+    /// Issue #592: turn index when `last_injected_summary_ids` was populated.
+    /// Used by the thumbs adapter to enforce a turn-staleness check (a thumbs
+    /// command must arrive on the turn immediately after the injection).
+    pub(super) last_injected_summary_turn_index: Option<usize>,
+    /// Issue #592: per-turn cap for the photon user-feedback adapter
+    /// (`/photon-thumbs-{up,down}`). Reset at the top of every `process_line`
+    /// (DR2-002), consumed only when an actual `/v1/evaluate` call was
+    /// attempted (i.e. inject was present and we shipped the feedback event).
+    pub(super) photon_user_feedback_called_this_turn: bool,
 }
 
 /// Issue #594: state machine for the `/photon-why` slash command. Lives at
@@ -413,6 +454,9 @@ impl Agent {
             last_adopted_summary_ids: Vec::new(),
             last_injected_seed_provenance: Vec::new(),
             last_photon_context_pack_status: PhotonContextPackStatus::NoTurn,
+            last_injected_summary_ids: Vec::new(),
+            last_injected_summary_turn_index: None,
+            photon_user_feedback_called_this_turn: false,
         }
     }
 }

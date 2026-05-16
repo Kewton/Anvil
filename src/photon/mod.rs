@@ -4,6 +4,7 @@ pub mod mapper;
 pub mod prompt;
 pub mod provenance;
 pub mod schema;
+pub mod seed_draft;
 
 pub use client::PhotonClient;
 pub use prompt::{

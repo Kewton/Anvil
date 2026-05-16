@@ -760,3 +760,52 @@ fn cw04_merge_photon_respect_warnings_env_overrides_file() {
     let merged = merge_partial_configs(&[file_config, env_config]);
     assert_eq!(merged.photon_respect_warnings, Some(true));
 }
+
+// ---------------------------------------------------------------------------
+// Issue #592: photon_common_seed_enabled regression tests
+// ---------------------------------------------------------------------------
+
+/// CS-01: default is None (PartialConfig) so Config::load resolves to false.
+#[test]
+fn cs01_photon_common_seed_default_is_none() {
+    let p = PartialConfig::default();
+    assert_eq!(p.photon_common_seed_enabled, None);
+}
+
+/// CS-02: config-file key parses bool.
+#[test]
+fn cs02_config_file_photon_common_seed_enabled_true() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config");
+    std::fs::write(&path, "photon_common_seed_enabled=true\n").unwrap();
+    let mut warnings = Vec::new();
+    let cfg = load_config_file(&path, &mut warnings).unwrap();
+    assert_eq!(cfg.photon_common_seed_enabled, Some(true));
+    assert!(warnings.is_empty());
+}
+
+/// CS-03: env var parses bool.
+#[test]
+fn cs03_env_photon_common_seed_enabled() {
+    use anvil::config::parse_bool;
+    // We test the parsing path directly because mutating process env in a
+    // parallel test is racy. parse_bool is the same SSOT load_env_config uses.
+    assert_eq!(parse_bool("true"), Some(true));
+    assert_eq!(parse_bool("1"), Some(true));
+    assert_eq!(parse_bool("false"), Some(false));
+}
+
+/// CS-04: env overrides config-file when both are present.
+#[test]
+fn cs04_merge_photon_common_seed_env_overrides_file() {
+    let file_config = PartialConfig {
+        photon_common_seed_enabled: Some(false),
+        ..PartialConfig::default()
+    };
+    let env_config = PartialConfig {
+        photon_common_seed_enabled: Some(true),
+        ..PartialConfig::default()
+    };
+    let merged = merge_partial_configs(&[file_config, env_config]);
+    assert_eq!(merged.photon_common_seed_enabled, Some(true));
+}

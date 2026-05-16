@@ -32,8 +32,10 @@ fn help_line_matches_slash_commands() {
 }
 
 #[test]
-fn slash_commands_contains_expected_13() {
-    // Issue #594 added `/photon-why` to surface photon seed lineage.
+fn slash_commands_contains_expected_17() {
+    // Issue #594 added `/photon-why` (lineage).
+    // Issue #592 added `/photon-thumbs-up`, `/photon-thumbs-down`,
+    // `/photon-correct`, `/photon-rule` (user-explicit feedback).
     assert_eq!(
         SLASH_COMMANDS,
         &[
@@ -49,6 +51,11 @@ fn slash_commands_contains_expected_13() {
             "/precautions",
             "/tests",
             "/photon-why",
+            // Issue #592: photon user-explicit feedback commands.
+            "/photon-thumbs-up",
+            "/photon-thumbs-down",
+            "/photon-correct",
+            "/photon-rule",
             "/exit",
         ]
     );

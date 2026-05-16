@@ -1306,6 +1306,10 @@ impl Agent {
         // returns) so a Plan-approved-via-`execute_approved_plan` turn does
         // not inherit a stale `true` from the previous turn (DR3-003).
         self.work_mode_confirm_called_this_turn = false;
+        // Issue #592: reset the photon user-feedback per-turn cap on the same
+        // boundary. Must run BEFORE Plan-mode early returns so the thumbs/
+        // correct/rule commands are dispatchable even from Plan mode.
+        self.photon_user_feedback_called_this_turn = false;
 
         let trimmed = input.trim();
 
@@ -1775,6 +1779,23 @@ The plan must still define: (1) the first shippable vertical slice, (2) concrete
                 self.last_photon_context_pack_status,
                 &self.last_injected_seed_provenance,
             )))),
+            // Issue #592: user-explicit photon feedback commands.
+            "/photon-thumbs-up" => {
+                let msg = super::photon_user_feedback::handle_thumbs_up(self)?;
+                Ok(AgentEvent::Continue(Some(msg)))
+            }
+            "/photon-thumbs-down" => {
+                let msg = super::photon_user_feedback::handle_thumbs_down(self)?;
+                Ok(AgentEvent::Continue(Some(msg)))
+            }
+            "/photon-correct" => {
+                let msg = super::photon_user_feedback::handle_correct(self, rest)?;
+                Ok(AgentEvent::Continue(Some(msg)))
+            }
+            "/photon-rule" => {
+                let msg = super::photon_user_feedback::handle_rule(self, rest)?;
+                Ok(AgentEvent::Continue(Some(msg)))
+            }
             "/checkpoint" | "/rollback" | "/watch" | "/autotest" | "/skills" | "/skill"
             | "/mcp" | "/parallel" => Ok(AgentEvent::Continue(Some(format!(
                 "{command} is unavailable in the v0.1.0 core rebuild"

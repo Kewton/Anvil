@@ -1233,6 +1233,7 @@ mod tests {
             photon_timeout_ms: 200,
             photon_rollout_min_eval_turns: 100,
             photon_respect_warnings: true,
+            photon_common_seed_enabled: false,
         }
     }
 
