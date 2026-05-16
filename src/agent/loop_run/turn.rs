@@ -87,6 +87,174 @@ pub fn truncate_photon_context_pack(s: String) -> (String, bool) {
     (out, true)
 }
 
+/// Issue #591 (DR4-NEW-001): result of re-sanitizing + capping an adopted-id
+/// list before sending it to photon `/v1/evaluate`. The struct is a pure
+/// transport for two return values (capped list + audit flag) and lives in
+/// the agent layer so the photon layer doesn't gain a dependency on
+/// `MAX_PHOTON_EVAL_ADOPTED_IDS` outside the SSOT.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SanitizedAdoptedIds {
+    /// Sanitized + capped list to send to photon.
+    pub list: Vec<String>,
+    /// `true` when the post-sanitize list length exceeded
+    /// `MAX_PHOTON_EVAL_ADOPTED_IDS` and was truncated.
+    pub truncated: bool,
+}
+
+/// Issue #591 (DR4-NEW-001 / DR4-NEW-002): pure helper that re-runs
+/// `sanitize_summary_id` on each raw id (drops `None`) and then truncates the
+/// result to `MAX_PHOTON_EVAL_ADOPTED_IDS`. Returns
+/// `SanitizedAdoptedIds { list, truncated }`. In `shadow_mode=true` the helper
+/// short-circuits to `(vec![], false)` regardless of input (the shadow guard).
+///
+/// Pure function — no I/O. Exposed at `pub(crate)` for module unit testing.
+pub(crate) fn prepare_adopted_ids_for_evaluate(
+    raw: &[String],
+    shadow_mode: bool,
+) -> SanitizedAdoptedIds {
+    if shadow_mode {
+        return SanitizedAdoptedIds {
+            list: Vec::new(),
+            truncated: false,
+        };
+    }
+    let sanitized: Vec<String> = raw
+        .iter()
+        .filter_map(|id| crate::photon::prompt::sanitize_summary_id(id))
+        .collect();
+    let truncated = sanitized.len() > crate::photon::MAX_PHOTON_EVAL_ADOPTED_IDS;
+    let list: Vec<String> = sanitized
+        .into_iter()
+        .take(crate::photon::MAX_PHOTON_EVAL_ADOPTED_IDS)
+        .collect();
+    SanitizedAdoptedIds { list, truncated }
+}
+
+/// Issue #591 (AS-04 / 設計判断 #3): inputs to the `derive_photon_feedback_outcome`
+/// pure helper. Bundles only the data the helper is allowed to inspect —
+/// `FeedbackKind` enum value, `AnvilScore` booleans / counts, same-turn flag,
+/// adopted-id count, and shadow flag. Free-text fields (feedback excerpt,
+/// command, model output) are NOT in scope here (security threat: outcome
+/// helper must not leak secrets into the static-allowlist return value).
+///
+/// Lifetime parameter ties the refs to `Agent` state that produced them.
+pub(crate) struct PhotonOutcomeInputs<'a> {
+    /// Latest recorded `FeedbackKind`, if any. Stale across turn boundaries:
+    /// the helper must only trust this when `eligible_feedback_recorded_this_turn`
+    /// is `true` (DR3-NEW-002).
+    pub last_feedback_kind: Option<&'a FeedbackKind>,
+    /// `SessionSnapshot.eligible_feedback_recorded_this_turn` flag (Issue #455).
+    /// Guards `failure` / `safety_violation` derivation against stale feedback.
+    /// `success` derivation (via `AnvilScore.user_visible_artifact`) is NOT
+    /// gated by this flag (DR3-NEW-002).
+    pub eligible_feedback_recorded_this_turn: bool,
+    /// Current turn's computed `AnvilScore`, if available. `None` for
+    /// TransportError / pre-compute paths — see `success.rs` facade.
+    pub anvil_score: Option<&'a crate::session::anvil_score::AnvilScore>,
+    /// Number of `summary_ids_adopted` actually sent to photon `/v1/evaluate`
+    /// (post sanitize + post cap). 0 short-circuits to `None`.
+    pub adopted_id_count: usize,
+    /// Shadow mode flag from `Config.photon_shadow_mode`. When `true`, the
+    /// helper short-circuits to `None` — Anvil must not stamp an adoption
+    /// outcome on shadow turns (AS-04 / 設計判断 #7).
+    pub shadow_mode: bool,
+}
+
+/// Issue #591 (AS-04 / 設計判断 #3): derive the adoption-loop `outcome` value
+/// for the `context_pack_event` sent to photon `/v1/evaluate`.
+///
+/// Pure function — no I/O, no side effects. Lives in the **agent layer**
+/// (`src/agent/loop_run/turn.rs`), NOT the photon layer (DR4-NEW-003).
+///
+/// Returns a value from the static allowlist:
+///   - `Some("safety_violation")` when an unsafe-action signal was observed
+///     this turn (either `AnvilScore.unsafe_actions_blocked > 0` or
+///     `FeedbackKind::UnsafeCommandBlocked` with the same-turn flag set).
+///   - `Some("failure")` when an eligible failure `FeedbackKind` was recorded
+///     this turn (allowlist: 9 variants from `is_eligible_for_reminder` minus
+///     `UnsafeCommandBlocked`).
+///   - `Some("success")` when no failure/safety signal applies and
+///     `AnvilScore.user_visible_artifact` is true (not gated by the
+///     same-turn flag — DR3-NEW-002).
+///   - `None` for shadow mode, zero adoptions, or any state that doesn't
+///     match the above.
+///
+/// The return type is `Option<&'static str>` to make it impossible for the
+/// helper to leak runtime data into the outcome value (DR4-NEW-004).
+pub(crate) fn derive_photon_feedback_outcome(
+    inputs: &PhotonOutcomeInputs<'_>,
+) -> Option<&'static str> {
+    // Case A: shadow mode → never stamp an outcome on shadow turns.
+    if inputs.shadow_mode {
+        return None;
+    }
+    // Case B: zero adoptions → adoption loop has nothing to attribute.
+    if inputs.adopted_id_count == 0 {
+        return None;
+    }
+
+    // Case C: safety_violation — fires when *either* the unsafe count is
+    // positive *or* the same-turn FeedbackKind is UnsafeCommandBlocked. The
+    // unsafe count is sourced from `AnvilScore` and does not depend on the
+    // eligible_recorded flag (a successful unsafe block always increments).
+    let unsafe_from_score = inputs
+        .anvil_score
+        .map(|s| s.unsafe_actions_blocked > 0)
+        .unwrap_or(false);
+    let unsafe_from_feedback = inputs.eligible_feedback_recorded_this_turn
+        && matches!(
+            inputs.last_feedback_kind,
+            Some(FeedbackKind::UnsafeCommandBlocked)
+        );
+    if unsafe_from_score || unsafe_from_feedback {
+        return Some("safety_violation");
+    }
+
+    // Case D: failure — when an eligible failure (excluding UnsafeCommandBlocked,
+    // already handled above) was recorded this turn. The allowlist mirrors
+    // `is_eligible_for_reminder` minus `UnsafeCommandBlocked` (9 variants).
+    if inputs.eligible_feedback_recorded_this_turn
+        && let Some(kind) = inputs.last_feedback_kind
+        && is_eligible_failure_kind(kind)
+    {
+        return Some("failure");
+    }
+
+    // Case E: success — user-visible artifact produced and nothing failed.
+    // NOT gated by `eligible_feedback_recorded_this_turn` (DR3-NEW-002): a
+    // turn that produced an artifact but did not record a failure frame
+    // still earns a `success` outcome.
+    if inputs
+        .anvil_score
+        .map(|s| s.user_visible_artifact)
+        .unwrap_or(false)
+    {
+        return Some("success");
+    }
+
+    // Case F: nothing applies.
+    None
+}
+
+/// Issue #591 (AS-04 / 設計判断 #3): SSOT allowlist for `failure` outcomes.
+/// Mirrors `FeedbackKind::is_eligible_for_reminder` minus `UnsafeCommandBlocked`
+/// (which is captured by the `safety_violation` branch earlier).
+fn is_eligible_failure_kind(kind: &FeedbackKind) -> bool {
+    use FeedbackKind::*;
+    matches!(
+        kind,
+        CompileError
+            | TypeError
+            | LintFailure
+            | Timeout
+            | TestFailure
+            | ToolProtocolFailure
+            | EditFailure
+            | NoRepoProgress
+            | NoToolCall
+    )
+}
+
 /// Issue #556: build the injection system message from a context_pack response.
 /// DR1-002 defense-in-depth: shadow_mode double-check as safety valve.
 /// DR4-001: wraps content as untrusted external memory.
@@ -2096,6 +2264,11 @@ impl Agent {
         self.last_context_pack_id = None;
         // Live injection: reset adopted item count.
         self.last_photon_adopted_items = 0;
+        // Issue #591 (AS-01 / 設計判断 #2): reset the per-turn adopted summary
+        // ids HERE — NOT at `run_actor_loop` head. `invoke_photon_evaluate`
+        // runs post-loop and reads this field; resetting at the loop entry
+        // would wipe the ids before the evaluate hook can consume them.
+        self.last_adopted_summary_ids.clear();
         // LI-2: reset the one-shot flag here (before invoke_photon_context_pack
         // in run_turn) so the flag set by path (a) is still true when path (b)
         // in build_request_messages runs. Previously this reset lived in
@@ -3018,6 +3191,13 @@ impl Agent {
                 // AN-6: items_adopted is now sourced from RenderStats so the
                 // count matches the post-total-cap line set exactly.
                 self.last_photon_adopted_items = render_stats.items_adopted;
+                // Issue #591 (AS-01): hand the post-total-cap adopted ids to
+                // the Agent so `invoke_photon_evaluate` can echo them back to
+                // photon. Ids are already `sanitize_summary_id`-clean from
+                // the injection side (DR4-002); the evaluate hook re-runs
+                // the sanitizer defensively (DR4-NEW-001) and applies the
+                // `MAX_PHOTON_EVAL_ADOPTED_IDS` cap before serialising.
+                self.last_adopted_summary_ids = render_stats.adopted_summary_ids;
                 let (truncated_rendered, trunc) = truncate_photon_context_pack(rendered);
                 truncated = trunc;
                 self.photon_context_pack_response = Some(truncated_rendered);
@@ -3042,21 +3222,85 @@ impl Agent {
     }
 
     /// Issue #556: call photon evaluate (post-turn).
+    ///
+    /// Issue #591 (AS-03 / AS-06 / DR4-NEW-001 / DR4-NEW-002):
+    /// - Re-sanitizes `Agent.last_adopted_summary_ids` via
+    ///   `crate::photon::prompt::sanitize_summary_id` (DR4-NEW-001 evaluate-side
+    ///   pass; the injection side runs the same SSOT inside `render_context_pack`).
+    /// - Drops `None` results, then applies the `MAX_PHOTON_EVAL_ADOPTED_IDS=32`
+    ///   cap. `summary_ids_adopted_truncated=true` is emitted when the
+    ///   sanitized list length exceeded the cap *before* truncation (audit
+    ///   signal even though `MAX_PROMPT_ITEMS=5` makes this rare).
+    /// - In `config.photon_shadow_mode=true`, the function forces the
+    ///   `summary_ids_adopted=[]` / `summary_ids_adopted_count=0` /
+    ///   `summary_ids_adopted_truncated=false` / `outcome=null` /
+    ///   `items_adopted_count=0` invariants regardless of Agent state
+    ///   (DR4-NEW-002 final guard, complements the upstream "shadow path skips
+    ///   render" rule).
+    /// - `agent.photon_evaluate.completed` event is expanded 4 → 8 keys:
+    ///   the new keys are `summary_ids_adopted_count` / `outcome` /
+    ///   `adoption_status` / `summary_ids_adopted_truncated`. The raw
+    ///   `summary_ids_adopted` array is NOT emitted in the event payload
+    ///   (DR4-NEW-004 — only counts and static-allowlist strings cross the
+    ///   audit boundary).
     fn invoke_photon_evaluate(&mut self) {
         if self.photon.is_none() {
             return;
         }
         let t0 = std::time::Instant::now();
+        let shadow_mode = self.config.photon_shadow_mode;
+
         // AN-5/AN-6: determine adoption_status and item counts from actual
         // injection state rather than a hardcoded string.
-        let adoption_status = if self.config.photon_shadow_mode {
+        let adoption_status = if shadow_mode {
             "shadow_not_injected"
         } else if self.last_photon_adopted_items > 0 {
             "injected"
         } else {
             "not_injected"
         };
-        let items_adopted_count = self.last_photon_adopted_items;
+
+        // Issue #591 (DR4-NEW-001 / DR4-NEW-002): re-sanitize → drop → cap.
+        //
+        // Even though the injection side already runs `sanitize_summary_id`,
+        // we re-run it on the evaluate side as defense-in-depth: any future
+        // refactor that introduces a write path into `last_adopted_summary_ids`
+        // bypassing the injection sanitizer must still pass this barrier
+        // before talking to photon. `prepare_adopted_ids_for_evaluate` is a
+        // pure helper so the sanitize/cap/shadow logic can be unit-tested
+        // without going through the agent loop.
+        let sanitized =
+            prepare_adopted_ids_for_evaluate(&self.last_adopted_summary_ids, shadow_mode);
+        let summary_ids_adopted = sanitized.list;
+        let truncated = sanitized.truncated;
+        let summary_ids_adopted_count = summary_ids_adopted.len();
+        // shadow_mode forces items_adopted_count=0 too (DR4-NEW-002).
+        let items_adopted_count = if shadow_mode {
+            0
+        } else {
+            self.last_photon_adopted_items
+        };
+
+        // AS-04 helper: derive outcome from the same-turn FeedbackKind /
+        // AnvilScore / shadow flag / adopted count. Returns a value from a
+        // static allowlist or None.
+        let outcome_static: Option<&'static str> = {
+            let inputs = PhotonOutcomeInputs {
+                last_feedback_kind: self.session.last_feedback.as_ref().map(|ff| &ff.kind),
+                eligible_feedback_recorded_this_turn: self
+                    .session
+                    .eligible_feedback_recorded_this_turn,
+                anvil_score: self.session.last_anvil_score.as_ref(),
+                adopted_id_count: summary_ids_adopted_count,
+                shadow_mode,
+            };
+            derive_photon_feedback_outcome(&inputs)
+        };
+        let outcome_json: serde_json::Value = match outcome_static {
+            Some(s) => serde_json::Value::String(s.to_string()),
+            None => serde_json::Value::Null,
+        };
+
         // Only include context_pack_event when we have a request_id; the sidecar
         // requires context_pack_request_id: str (non-null).
         let context_pack_event = if let Some(ref cpack_id) = self.last_context_pack_id {
@@ -3067,6 +3311,10 @@ impl Agent {
                 "evidence_ids_expanded": [],
                 "items_adopted_count": items_adopted_count,
                 "items_ignored_count": 0,
+                // Issue #591 (AS-03) — adoption signal carried back to photon.
+                "summary_ids_adopted": summary_ids_adopted,
+                "summary_ids_adopted_truncated": truncated,
+                "outcome": outcome_json.clone(),
             })
         } else {
             serde_json::Value::Null
@@ -3093,11 +3341,20 @@ impl Agent {
             // AN-6: override prompt_adopted from actual injection state so
             // eval.jsonl reflects whether Anvil injected the context, not just
             // what the sidecar acknowledged.
-            if !self.config.photon_shadow_mode {
+            if !shadow_mode {
                 summary.prompt_adopted = Some(self.last_photon_adopted_items > 0);
             }
+            // Issue #591 (VR-08 / T4.6): populate the post-cap count into the
+            // session-layer summary so `build_eval_record` writes it into
+            // `eval.jsonl`. shadow_mode yields Some(0) — the field's purpose
+            // is to record what was actually sent (which is 0 in shadow).
+            summary.summary_ids_adopted_count = Some(summary_ids_adopted_count);
             self.last_photon_eval_summary = Some(summary);
         }
+        // Issue #591 (AS-06 / DR4-NEW-004): event payload 4 → 8 keys. The
+        // raw `summary_ids_adopted` array is NOT included — only counts and
+        // static-allowlist strings cross the audit boundary. `mask_payload_inplace`
+        // in `log_llm_event` provides the final defensive scrub.
         log_llm_event(
             "agent.photon_evaluate.completed",
             serde_json::json!({
@@ -3105,6 +3362,10 @@ impl Agent {
                 "turn_index": self.current_turn_index,
                 "failed": result.is_none(),
                 "duration_ms": duration_ms,
+                "summary_ids_adopted_count": summary_ids_adopted_count,
+                "outcome": outcome_json,
+                "adoption_status": adoption_status,
+                "summary_ids_adopted_truncated": truncated,
             }),
         );
     }
@@ -13010,5 +13271,290 @@ export default function App() {
     fn auto_test_summary_starts_none_for_non_autotest_branches() {
         let s: Option<crate::session::anvil_score::AnvilTestSummary> = None;
         assert!(s.is_none());
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Issue #591 (Phase 3 / AS-04): derive_photon_feedback_outcome unit tests.
+// 6 truth-table cases (A-F) per work-plan T3.2 (TDD anchor).
+// ───────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod derive_photon_feedback_outcome_tests {
+    use super::{PhotonOutcomeInputs, derive_photon_feedback_outcome};
+    use crate::session::anvil_score::AnvilScore;
+    use crate::session::feedback::FeedbackKind;
+
+    fn empty_inputs() -> PhotonOutcomeInputs<'static> {
+        PhotonOutcomeInputs {
+            last_feedback_kind: None,
+            eligible_feedback_recorded_this_turn: false,
+            anvil_score: None,
+            adopted_id_count: 1, // non-zero so case A/B short-circuit doesn't fire by default
+            shadow_mode: false,
+        }
+    }
+
+    // Case A: shadow_mode=true → None regardless of any other input.
+    #[test]
+    fn case_a_shadow_mode_returns_none() {
+        let score = AnvilScore {
+            user_visible_artifact: true,
+            unsafe_actions_blocked: 5,
+            ..AnvilScore::default()
+        };
+        let inputs = PhotonOutcomeInputs {
+            shadow_mode: true,
+            anvil_score: Some(&score),
+            ..empty_inputs()
+        };
+        assert_eq!(derive_photon_feedback_outcome(&inputs), None);
+    }
+
+    // Case B: adopted_id_count=0 → None (no adoption to attribute).
+    #[test]
+    fn case_b_zero_adoption_returns_none() {
+        let score = AnvilScore {
+            user_visible_artifact: true,
+            ..AnvilScore::default()
+        };
+        let inputs = PhotonOutcomeInputs {
+            adopted_id_count: 0,
+            anvil_score: Some(&score),
+            ..empty_inputs()
+        };
+        assert_eq!(derive_photon_feedback_outcome(&inputs), None);
+    }
+
+    // Case C-1: AnvilScore.unsafe_actions_blocked > 0 → safety_violation.
+    #[test]
+    fn case_c1_unsafe_actions_blocked_count_yields_safety_violation() {
+        let score = AnvilScore {
+            unsafe_actions_blocked: 1,
+            ..AnvilScore::default()
+        };
+        let inputs = PhotonOutcomeInputs {
+            anvil_score: Some(&score),
+            ..empty_inputs()
+        };
+        assert_eq!(
+            derive_photon_feedback_outcome(&inputs),
+            Some("safety_violation")
+        );
+    }
+
+    // Case C-2: same-turn FeedbackKind=UnsafeCommandBlocked → safety_violation.
+    #[test]
+    fn case_c2_unsafe_command_feedback_yields_safety_violation() {
+        let kind = FeedbackKind::UnsafeCommandBlocked;
+        let inputs = PhotonOutcomeInputs {
+            last_feedback_kind: Some(&kind),
+            eligible_feedback_recorded_this_turn: true,
+            ..empty_inputs()
+        };
+        assert_eq!(
+            derive_photon_feedback_outcome(&inputs),
+            Some("safety_violation")
+        );
+    }
+
+    // Case C-3: stale UnsafeCommandBlocked (flag=false) must NOT trigger safety.
+    #[test]
+    fn case_c3_stale_unsafe_command_does_not_yield_safety() {
+        let kind = FeedbackKind::UnsafeCommandBlocked;
+        let inputs = PhotonOutcomeInputs {
+            last_feedback_kind: Some(&kind),
+            eligible_feedback_recorded_this_turn: false, // stale
+            anvil_score: None,
+            ..empty_inputs()
+        };
+        // Without an AnvilScore signal and with the same-turn flag false,
+        // the safety branch must not fire — fall through to None.
+        assert_eq!(derive_photon_feedback_outcome(&inputs), None);
+    }
+
+    // Case D: 9 failure-kind variants × eligible_flag=true → failure.
+    #[test]
+    fn case_d_eligible_failure_kinds_yield_failure() {
+        let kinds = [
+            FeedbackKind::CompileError,
+            FeedbackKind::TypeError,
+            FeedbackKind::LintFailure,
+            FeedbackKind::Timeout,
+            FeedbackKind::TestFailure,
+            FeedbackKind::ToolProtocolFailure,
+            FeedbackKind::EditFailure,
+            FeedbackKind::NoRepoProgress,
+            FeedbackKind::NoToolCall,
+        ];
+        for kind in &kinds {
+            let inputs = PhotonOutcomeInputs {
+                last_feedback_kind: Some(kind),
+                eligible_feedback_recorded_this_turn: true,
+                ..empty_inputs()
+            };
+            assert_eq!(
+                derive_photon_feedback_outcome(&inputs),
+                Some("failure"),
+                "kind {kind:?} must map to failure"
+            );
+        }
+    }
+
+    // Case D-2: failure kind but eligible_flag=false → must NOT yield failure.
+    #[test]
+    fn case_d2_failure_kind_without_eligible_flag_is_ignored() {
+        let kind = FeedbackKind::TestFailure;
+        let inputs = PhotonOutcomeInputs {
+            last_feedback_kind: Some(&kind),
+            eligible_feedback_recorded_this_turn: false, // stale
+            anvil_score: None,
+            ..empty_inputs()
+        };
+        assert_eq!(derive_photon_feedback_outcome(&inputs), None);
+    }
+
+    // Case E: success guard — flag=false but user_visible_artifact=true → success.
+    // (DR3-NEW-002: success path is NOT gated by eligible_recorded_this_turn.)
+    #[test]
+    fn case_e_user_visible_artifact_without_eligible_flag_yields_success() {
+        let score = AnvilScore {
+            user_visible_artifact: true,
+            ..AnvilScore::default()
+        };
+        let inputs = PhotonOutcomeInputs {
+            anvil_score: Some(&score),
+            eligible_feedback_recorded_this_turn: false,
+            ..empty_inputs()
+        };
+        assert_eq!(derive_photon_feedback_outcome(&inputs), Some("success"));
+    }
+
+    // Case F: no failure, no safety, no user_visible_artifact → None.
+    #[test]
+    fn case_f_no_signals_yields_none() {
+        let score = AnvilScore::default(); // user_visible_artifact=false, unsafe=0
+        let inputs = PhotonOutcomeInputs {
+            anvil_score: Some(&score),
+            ..empty_inputs()
+        };
+        assert_eq!(derive_photon_feedback_outcome(&inputs), None);
+    }
+
+    // Priority: failure beats success when both signals exist.
+    #[test]
+    fn priority_failure_over_success() {
+        let score = AnvilScore {
+            user_visible_artifact: true, // would map to success
+            ..AnvilScore::default()
+        };
+        let kind = FeedbackKind::CompileError;
+        let inputs = PhotonOutcomeInputs {
+            last_feedback_kind: Some(&kind),
+            eligible_feedback_recorded_this_turn: true,
+            anvil_score: Some(&score),
+            ..empty_inputs()
+        };
+        assert_eq!(derive_photon_feedback_outcome(&inputs), Some("failure"));
+    }
+
+    // Priority: safety_violation beats failure.
+    #[test]
+    fn priority_safety_over_failure() {
+        let score = AnvilScore {
+            unsafe_actions_blocked: 1, // would map to safety_violation
+            ..AnvilScore::default()
+        };
+        let kind = FeedbackKind::CompileError; // would map to failure
+        let inputs = PhotonOutcomeInputs {
+            last_feedback_kind: Some(&kind),
+            eligible_feedback_recorded_this_turn: true,
+            anvil_score: Some(&score),
+            ..empty_inputs()
+        };
+        assert_eq!(
+            derive_photon_feedback_outcome(&inputs),
+            Some("safety_violation")
+        );
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Issue #591 (Phase 4 / DR4-NEW-001 / DR4-NEW-002): prepare_adopted_ids_for_evaluate
+// unit tests covering the re-sanitize + drop + cap + shadow guard pipeline.
+// ───────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod prepare_adopted_ids_for_evaluate_tests {
+    use super::prepare_adopted_ids_for_evaluate;
+    use crate::photon::MAX_PHOTON_EVAL_ADOPTED_IDS;
+
+    #[test]
+    fn shadow_mode_returns_empty_list() {
+        let raw = vec!["seed_a".to_string(), "seed_b".to_string()];
+        let result = prepare_adopted_ids_for_evaluate(&raw, true);
+        assert!(result.list.is_empty());
+        assert!(!result.truncated);
+    }
+
+    #[test]
+    fn live_mode_passes_through_valid_ids() {
+        let raw = vec!["seed_a".to_string(), "seed_b".to_string()];
+        let result = prepare_adopted_ids_for_evaluate(&raw, false);
+        assert_eq!(result.list, raw);
+        assert!(!result.truncated);
+    }
+
+    #[test]
+    fn live_mode_drops_unsanitizable_ids() {
+        // Colon / space fail the ASCII allowlist in sanitize_summary_id.
+        let raw = vec![
+            "seed_ok".to_string(),
+            "seed:bad".to_string(),
+            "seed bad".to_string(),
+            "another_ok".to_string(),
+        ];
+        let result = prepare_adopted_ids_for_evaluate(&raw, false);
+        // Only 2 of 4 survive sanitization.
+        assert_eq!(
+            result.list,
+            vec!["seed_ok".to_string(), "another_ok".to_string()]
+        );
+        assert!(!result.truncated);
+    }
+
+    #[test]
+    fn live_mode_drops_secret_like_ids() {
+        let raw = vec!["seed_ok".to_string(), "api_key_seed".to_string()];
+        let result = prepare_adopted_ids_for_evaluate(&raw, false);
+        assert_eq!(result.list, vec!["seed_ok".to_string()]);
+    }
+
+    #[test]
+    fn live_mode_truncates_at_cap_and_flags_truncation() {
+        let raw: Vec<String> = (0..(MAX_PHOTON_EVAL_ADOPTED_IDS + 5))
+            .map(|i| format!("seed_{i:03}"))
+            .collect();
+        let result = prepare_adopted_ids_for_evaluate(&raw, false);
+        assert_eq!(result.list.len(), MAX_PHOTON_EVAL_ADOPTED_IDS);
+        assert!(result.truncated);
+    }
+
+    #[test]
+    fn live_mode_exactly_at_cap_is_not_truncated() {
+        let raw: Vec<String> = (0..MAX_PHOTON_EVAL_ADOPTED_IDS)
+            .map(|i| format!("seed_{i:03}"))
+            .collect();
+        let result = prepare_adopted_ids_for_evaluate(&raw, false);
+        assert_eq!(result.list.len(), MAX_PHOTON_EVAL_ADOPTED_IDS);
+        assert!(!result.truncated);
+    }
+
+    #[test]
+    fn shadow_mode_ignores_oversize_input() {
+        let raw: Vec<String> = (0..(MAX_PHOTON_EVAL_ADOPTED_IDS + 100))
+            .map(|i| format!("seed_{i:03}"))
+            .collect();
+        let result = prepare_adopted_ids_for_evaluate(&raw, true);
+        assert!(result.list.is_empty());
+        assert!(!result.truncated);
     }
 }

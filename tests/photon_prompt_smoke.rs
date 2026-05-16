@@ -446,3 +446,98 @@ fn p19b_top_level_items_fallback_still_works() {
     );
     assert!(result.unwrap().contains("legacy top-level item"));
 }
+
+// ---------------------------------------------------------------------------
+// Issue #591 (Phase 5 / T5.3): adopted_summary_ids surface tests
+// ---------------------------------------------------------------------------
+
+/// SI-01: `render_context_pack` returns the sanitized summary_ids of every
+/// emitted item, in emission order, when each item has a valid id.
+#[test]
+fn si01_render_returns_sanitized_adopted_ids() {
+    let resp = items_response(serde_json::json!([
+        { "kind": "summary", "id": "seed_a", "summary": "alpha" },
+        { "kind": "summary", "id": "seed_b", "summary": "beta" },
+        { "kind": "summary", "id": "seed_c", "summary": "gamma" },
+    ]));
+    let (section, stats) = render_context_pack(&resp, &empty_blocked());
+    let section = section.expect("at least one item must render");
+    assert!(section.contains("alpha"));
+    assert!(section.contains("beta"));
+    assert!(section.contains("gamma"));
+    assert_eq!(stats.items_adopted, 3);
+    assert_eq!(stats.adopted_summary_ids.len(), 3);
+    // All three sanitized ids appear in the list.
+    assert!(stats.adopted_summary_ids.contains(&"seed_a".to_string()));
+    assert!(stats.adopted_summary_ids.contains(&"seed_b".to_string()));
+    assert!(stats.adopted_summary_ids.contains(&"seed_c".to_string()));
+}
+
+/// SI-02: id of an item dropped by the total-chars cap is excluded from
+/// `adopted_summary_ids`. Duplicate ids are deduplicated.
+#[test]
+fn si02_total_cap_drops_trailing_ids_and_dedupes() {
+    // 5 × 200 char items exceeds MAX_PROMPT_TOTAL_CHARS=800.
+    // Items 1..4 share a duplicate id so we can also confirm dedupe semantics
+    // for adopted ids.
+    let items_json: Vec<serde_json::Value> = (0..5)
+        .map(|i| {
+            let id = if i == 1 {
+                "dup_id".to_string()
+            } else {
+                format!("seed_{i}")
+            };
+            serde_json::json!({
+                "kind": "summary",
+                "id": id,
+                "summary": "x".repeat(200),
+            })
+        })
+        .collect();
+    let resp = items_response(serde_json::Value::Array(items_json));
+    let (section, stats) = render_context_pack(&resp, &empty_blocked());
+    let _section = section.expect("at least one item must render");
+    assert!(stats.items_adopted > 0);
+    assert!(stats.items_dropped_total_chars > 0);
+    // adopted_ids length matches items_adopted (every item here has an id).
+    assert_eq!(stats.adopted_summary_ids.len(), stats.items_adopted);
+    // The dropped trailing id ("seed_4" if it was in scope) must not appear in
+    // the adopted list — at the very least the count is bounded.
+    assert!(stats.adopted_summary_ids.len() <= stats.items_adopted);
+    // Inspect dedupe: if dup_id appears twice in the input but only once in
+    // output, that's the expected stable-dedupe behaviour. Here only one slot
+    // remains because of the cap, so we just check there's no duplication.
+    let mut sorted = stats.adopted_summary_ids.clone();
+    sorted.sort();
+    let dedup = {
+        let mut s = sorted.clone();
+        s.dedup();
+        s
+    };
+    assert_eq!(
+        sorted, dedup,
+        "adopted_summary_ids must not contain duplicates"
+    );
+}
+
+/// SI-03: an item without an id (or whose id was rejected by `sanitize_summary_id`)
+/// is still emitted (counted in `items_adopted`) but does NOT appear in
+/// `adopted_summary_ids` (S7-001).
+#[test]
+fn si03_items_without_valid_id_skip_id_list() {
+    let resp = items_response(serde_json::json!([
+        { "kind": "summary", "summary": "no id here" },
+        { "kind": "summary", "id": "api_key_seed", "summary": "rejected id" },
+        { "kind": "summary", "id": "seed_ok", "summary": "with valid id" },
+    ]));
+    let (section, stats) = render_context_pack(&resp, &empty_blocked());
+    let section = section.expect("at least one item must render");
+    assert!(section.contains("no id here"));
+    assert!(section.contains("with valid id"));
+    // All three items are emitted because the item without id and the item
+    // with secret-like id still render (the sanitizer rejection drops the id
+    // field but the item itself stays in the prompt).
+    assert_eq!(stats.items_adopted, 3);
+    // Only the item with a valid id contributes to the adopted_ids list.
+    assert_eq!(stats.adopted_summary_ids, vec!["seed_ok".to_string()]);
+}

@@ -167,6 +167,14 @@ pub struct PhotonEvalSummary {
     pub prompt_adopted: Option<bool>,
     pub task_outcome: Option<String>,
     pub retry_summary: Option<String>,
+    /// Issue #591 (VR-08): number of `summary_ids_adopted` actually sent to
+    /// photon `/v1/evaluate` for this turn (post `sanitize_summary_id` re-run
+    /// and post `MAX_PHOTON_EVAL_ADOPTED_IDS` cap). `None` means either
+    /// fail-open (no evaluate response, photon disabled) or shadow mode (the
+    /// agent layer may populate `Some(0)` for shadow turns; constructor
+    /// defaults to `None`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_ids_adopted_count: Option<usize>,
 }
 
 // ---------------------------------------------------------------------------

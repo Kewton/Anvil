@@ -272,6 +272,18 @@ pub struct Agent {
     /// Used by `invoke_photon_evaluate` for `adoption_status`/`items_adopted_count`.
     /// Reset at run_turn head.
     pub(super) last_photon_adopted_items: usize,
+    /// Issue #591 (AS-01): sanitized `summary_id` of every item actually
+    /// emitted into the prompt this turn (post-total-cap). Populated by
+    /// `invoke_photon_context_pack` from `RenderStats.adopted_summary_ids`
+    /// and consumed by `invoke_photon_evaluate` (which re-runs
+    /// `sanitize_summary_id` defensively and applies
+    /// `MAX_PHOTON_EVAL_ADOPTED_IDS=32`).
+    ///
+    /// **Reset at `handle_user_message` head, NOT at `run_actor_loop` head**
+    /// (AS-01 / 設計判断 #2). The evaluate hook runs *after* the actor loop
+    /// returns; resetting at `run_actor_loop` would clobber the ids the
+    /// evaluate hook needs to read.
+    pub(super) last_adopted_summary_ids: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -360,6 +372,7 @@ impl Agent {
             last_context_pack_id: None,
             last_photon_eval_summary: None,
             last_photon_adopted_items: 0,
+            last_adopted_summary_ids: Vec::new(),
         }
     }
 }
