@@ -655,6 +655,21 @@ pub struct SessionSnapshot {
     /// Not persisted.
     #[serde(skip, default)]
     pub repo_edit_succeeded_this_turn: bool,
+    /// Issue #601: 1-based actor loop iteration count for this turn. Reset
+    /// to `0` at `handle_user_message` head (DR3-002 photon hook SSOT site),
+    /// populated at `run_actor_loop` tail from local
+    /// `last_iter.min(self.config.max_iterations)` (S5-002 — `self.last_iter`
+    /// field does **not** exist). Consumed by `derive_photon_feedback_outcome`
+    /// Case F no-progress detection. `#[serde(skip, default)]` so resume
+    /// invariant (`tests/photon_evaluate_signal_smoke.rs::nps07`) is preserved.
+    #[serde(skip, default)]
+    pub iter_count_this_turn: usize,
+    /// Issue #601: prepared-tool-call count for this turn. Reset to `0` at
+    /// `handle_user_message` head, populated at `run_actor_loop` tail from
+    /// local `tool_calls_made_this_turn`. Consumed by Case F no-progress
+    /// detection. `#[serde(skip, default)]` so resume invariant holds.
+    #[serde(skip, default)]
+    pub tool_calls_this_turn: usize,
     /// Issue #456: snapshot of `working_memory.touched_files` captured at the
     /// top of `run_turn`. Provides the Reminder Sidecar / future Observability
     /// with a stable view of "what the agent already knew before this turn",

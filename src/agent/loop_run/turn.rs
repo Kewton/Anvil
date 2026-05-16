@@ -158,39 +158,133 @@ pub(crate) struct PhotonOutcomeInputs<'a> {
     /// helper short-circuits to `None` — Anvil must not stamp an adoption
     /// outcome on shadow turns (AS-04 / 設計判断 #7).
     pub shadow_mode: bool,
+    /// Issue #601: 1-based actor loop iteration count for this turn, populated
+    /// at `run_actor_loop` tail from local `last_iter.min(max_iterations)`
+    /// (S5-002 — `self.last_iter` field does not exist). Used by Case F
+    /// no-progress detection (`<= 1` is one of the four AND conditions).
+    pub iter_count_this_turn: usize,
+    /// Issue #601: number of prepared tool calls dispatched this turn, populated
+    /// at `run_actor_loop` tail from local `tool_calls_made_this_turn`.
+    /// Used by Case F no-progress detection (`== 0` is one of the four AND
+    /// conditions).
+    pub tool_calls_this_turn: usize,
+    /// Issue #601: `SessionSnapshot.repo_edit_succeeded_this_turn` flag (Issue #456).
+    /// Used by Case F no-progress detection (`== false` is one of the four AND
+    /// conditions).
+    pub repo_edit_succeeded_this_turn: bool,
+    /// Issue #601: indicates whether the current turn's WorkMode resolved to
+    /// `AnswerOnly` (Issue #576). Populate **must** go through
+    /// `Agent::answer_only_mode_active()` SSOT helper (DR3-001), never a
+    /// direct `mode_state.work_mode == WorkMode::AnswerOnly` comparison.
+    /// Used by Case F no-progress detection (`== false` is one of the four
+    /// AND conditions — AnswerOnly turns are expected to make zero edits).
+    pub work_mode_is_answer_only: bool,
 }
 
-/// Issue #591 (AS-04 / 設計判断 #3): derive the adoption-loop `outcome` value
-/// for the `context_pack_event` sent to photon `/v1/evaluate`.
+/// Issue #601 (S5-001 / 設計判断 #4 (b)): unified return type for
+/// [`derive_photon_feedback_outcome`]. Bundles the legacy `outcome` value
+/// (`"success"` / `"failure"` / `"safety_violation"` / `None`) and the new
+/// `outcome_detail` value (`"no_progress_despite_inject"` / `None`) so the
+/// caller never has to recompute Case F conditions (DR1-001 SSOT).
+///
+/// Both fields are `Option<&'static str>` so the helper cannot leak runtime
+/// data into the outbound payload — the audit boundary stays at type level
+/// (DR4-NEW-004).
+#[derive(Debug, Clone)]
+pub(crate) struct PhotonFeedbackOutcome {
+    /// Static-allowlist outcome value: `"success"` / `"failure"` /
+    /// `"safety_violation"` / `None`.
+    pub outcome: Option<&'static str>,
+    /// Optional static-allowlist detail tag. Currently only
+    /// [`PHOTON_OUTCOME_DETAIL_NO_PROGRESS_DESPITE_INJECT`] is defined; the
+    /// `pub const` allowlist makes it grep-able and integration-test-callable.
+    pub outcome_detail: Option<&'static str>,
+}
+
+/// Issue #601 (Case F SSOT, D1-001 / DR1-001): no-progress 4-condition AND.
+///
+/// Returns `true` iff the current turn matches the no-progress shape:
+///   1. Not an AnswerOnly turn (`work_mode_is_answer_only == false`).
+///   2. At most one actor loop iteration (`iter_count_this_turn <= 1`).
+///   3. No successful repo edit (`repo_edit_succeeded_this_turn == false`).
+///   4. No tool call dispatched (`tool_calls_this_turn == 0`).
+///
+/// This helper is the **only** place these four conditions appear in code.
+/// `derive_photon_feedback_outcome` Case F is the **only** callsite in
+/// production. Test safeguards (`empty_inputs()` defaults) intentionally
+/// break at least one condition so existing tests that don't set the Case F
+/// fields keep returning the previous outcome shape.
+pub(crate) fn case_f_condition_met(inputs: &PhotonOutcomeInputs<'_>) -> bool {
+    !inputs.work_mode_is_answer_only
+        && inputs.iter_count_this_turn <= 1
+        && !inputs.repo_edit_succeeded_this_turn
+        && inputs.tool_calls_this_turn == 0
+}
+
+/// Issue #601 (Case F outcome_detail SSOT, DR4-NEW-004 audit boundary).
+///
+/// Static-allowlist literal for the new `outcome_detail` JSON value emitted
+/// in the `context_pack_event` request body and the
+/// `agent.photon_evaluate.completed` log payload. Currently exactly one value
+/// is defined (`no_progress_despite_inject`); the `pub const` keeps it
+/// grep-able and allows future cross-layer consistency checks (photon-side
+/// `_FAILURE_DETAILS` allowlist) and integration-test imports.
+///
+/// `pub` (not `pub(crate)`) so `tests/photon_evaluate_signal_smoke.rs` can
+/// import the symbol via the `pub use` re-export added in
+/// `src/agent/loop_run.rs`.
+pub const PHOTON_OUTCOME_DETAIL_NO_PROGRESS_DESPITE_INJECT: &str = "no_progress_despite_inject";
+
+/// Issue #591 (AS-04 / 設計判断 #3) + Issue #601 (S5-001 / 設計判断 #4 (b)):
+/// derive the adoption-loop outcome + optional detail value for the
+/// `context_pack_event` sent to photon `/v1/evaluate`.
 ///
 /// Pure function — no I/O, no side effects. Lives in the **agent layer**
 /// (`src/agent/loop_run/turn.rs`), NOT the photon layer (DR4-NEW-003).
 ///
-/// Returns a value from the static allowlist:
-///   - `Some("safety_violation")` when an unsafe-action signal was observed
-///     this turn (either `AnvilScore.unsafe_actions_blocked > 0` or
-///     `FeedbackKind::UnsafeCommandBlocked` with the same-turn flag set).
-///   - `Some("failure")` when an eligible failure `FeedbackKind` was recorded
-///     this turn (allowlist: 9 variants from `is_eligible_for_reminder` minus
-///     `UnsafeCommandBlocked`).
-///   - `Some("success")` when no failure/safety signal applies and
-///     `AnvilScore.user_visible_artifact` is true (not gated by the
-///     same-turn flag — DR3-NEW-002).
-///   - `None` for shadow mode, zero adoptions, or any state that doesn't
-///     match the above.
+/// Returns a [`PhotonFeedbackOutcome`] populated from the static allowlist:
+///   - **Case A** shadow_mode → `{ outcome: None, outcome_detail: None }`
+///   - **Case B** zero adoptions → `{ outcome: None, outcome_detail: None }`
+///   - **Case C** safety_violation — fires when *either* the unsafe count
+///     is positive *or* the same-turn FeedbackKind is UnsafeCommandBlocked.
+///   - **Case D** failure — when an eligible failure `FeedbackKind` was
+///     recorded this turn (9 variants from `is_eligible_for_reminder` minus
+///     `UnsafeCommandBlocked`). Case D `outcome_detail` is always `None`
+///     because the detail tag is reserved for no-progress shapes (see Case
+///     F note below).
+///   - **Case E** success — `AnvilScore.user_visible_artifact == true` and
+///     no failure/safety signal applied. Not gated by the same-turn flag
+///     (DR3-NEW-002).
+///   - **Case F (Issue #601)** no-progress despite inject — fires when
+///     `case_f_condition_met(inputs)` returns true and Cases A-E did not
+///     apply. Emits `outcome=Some("failure")` AND
+///     `outcome_detail=Some(PHOTON_OUTCOME_DETAIL_NO_PROGRESS_DESPITE_INJECT)`
+///     so photon can attribute the failure to "no progress despite injecting
+///     a seed". Case D and Case F may overlap on contrived `kind +
+///     0 tool_calls + 0 repo_edit` cases — Case D wins because the explicit
+///     failure kind is more informative than the no-progress shape (Case D
+///     returns first; `case_f_subordinate_to_case_d` test pins this).
+///   - **Case G (fallback, rename of legacy Case F)** — none of the above
+///     → `{ outcome: None, outcome_detail: None }`.
 ///
-/// The return type is `Option<&'static str>` to make it impossible for the
-/// helper to leak runtime data into the outcome value (DR4-NEW-004).
+/// Both fields are `Option<&'static str>` to make it impossible for the
+/// helper to leak runtime data into the outbound payload (DR4-NEW-004).
 pub(crate) fn derive_photon_feedback_outcome(
     inputs: &PhotonOutcomeInputs<'_>,
-) -> Option<&'static str> {
+) -> PhotonFeedbackOutcome {
     // Case A: shadow mode → never stamp an outcome on shadow turns.
     if inputs.shadow_mode {
-        return None;
+        return PhotonFeedbackOutcome {
+            outcome: None,
+            outcome_detail: None,
+        };
     }
     // Case B: zero adoptions → adoption loop has nothing to attribute.
     if inputs.adopted_id_count == 0 {
-        return None;
+        return PhotonFeedbackOutcome {
+            outcome: None,
+            outcome_detail: None,
+        };
     }
 
     // Case C: safety_violation — fires when *either* the unsafe count is
@@ -207,7 +301,10 @@ pub(crate) fn derive_photon_feedback_outcome(
             Some(FeedbackKind::UnsafeCommandBlocked)
         );
     if unsafe_from_score || unsafe_from_feedback {
-        return Some("safety_violation");
+        return PhotonFeedbackOutcome {
+            outcome: Some("safety_violation"),
+            outcome_detail: None,
+        };
     }
 
     // Case D: failure — when an eligible failure (excluding UnsafeCommandBlocked,
@@ -217,7 +314,10 @@ pub(crate) fn derive_photon_feedback_outcome(
         && let Some(kind) = inputs.last_feedback_kind
         && is_eligible_failure_kind(kind)
     {
-        return Some("failure");
+        return PhotonFeedbackOutcome {
+            outcome: Some("failure"),
+            outcome_detail: None,
+        };
     }
 
     // Case E: success — user-visible artifact produced and nothing failed.
@@ -229,11 +329,32 @@ pub(crate) fn derive_photon_feedback_outcome(
         .map(|s| s.user_visible_artifact)
         .unwrap_or(false)
     {
-        return Some("success");
+        return PhotonFeedbackOutcome {
+            outcome: Some("success"),
+            outcome_detail: None,
+        };
     }
 
-    // Case F: nothing applies.
-    None
+    // Case F (Issue #601): no-progress despite inject. Pre-conditions
+    // guaranteed by upstream cases:
+    //   - Case B passed → adopted_id_count > 0 (seed was actually injected)
+    //   - Case C passed → no unsafe block this turn
+    //   - Case D passed → no eligible failure kind recorded
+    //   - Case E passed → user_visible_artifact == false
+    // `case_f_condition_met` adds 4 more conditions (not AnswerOnly, 1 iter,
+    // 0 edit, 0 tool_call). See helper doc for the SSOT 4-condition AND.
+    if case_f_condition_met(inputs) {
+        return PhotonFeedbackOutcome {
+            outcome: Some("failure"),
+            outcome_detail: Some(PHOTON_OUTCOME_DETAIL_NO_PROGRESS_DESPITE_INJECT),
+        };
+    }
+
+    // Case G (rename of legacy Case F): fallback when nothing applies.
+    PhotonFeedbackOutcome {
+        outcome: None,
+        outcome_detail: None,
+    }
 }
 
 /// Issue #591 (AS-04 / 設計判断 #3): SSOT allowlist for `failure` outcomes.
@@ -2264,6 +2385,15 @@ impl Agent {
         self.last_context_pack_id = None;
         // Live injection: reset adopted item count.
         self.last_photon_adopted_items = 0;
+        // Issue #601: reset per-turn counters consumed by Case F no-progress
+        // detection. Reset HERE (handle_user_message head) — NOT in
+        // `run_actor_loop` head — because the `#[serde(skip, default)]`
+        // counters need to be cleared even for entry points that bypass the
+        // actor loop (Plan-mode turns skip `invoke_photon_evaluate`, but a
+        // subsequent Act turn must still see a clean baseline). Populated at
+        // `run_actor_loop` tail; see §5.5 of design v2.
+        self.session.iter_count_this_turn = 0;
+        self.session.tool_calls_this_turn = 0;
         // Issue #591 (AS-01 / 設計判断 #2): reset the per-turn adopted summary
         // ids HERE — NOT at `run_actor_loop` head. `invoke_photon_evaluate`
         // runs post-loop and reads this field; resetting at the loop entry
@@ -3384,22 +3514,33 @@ impl Agent {
             self.last_photon_adopted_items
         };
 
-        // AS-04 helper: derive outcome from the same-turn FeedbackKind /
-        // AnvilScore / shadow flag / adopted count. Returns a value from a
-        // static allowlist or None.
-        let outcome_static: Option<&'static str> = {
-            let inputs = PhotonOutcomeInputs {
-                last_feedback_kind: self.session.last_feedback.as_ref().map(|ff| &ff.kind),
-                eligible_feedback_recorded_this_turn: self
-                    .session
-                    .eligible_feedback_recorded_this_turn,
-                anvil_score: self.session.last_anvil_score.as_ref(),
-                adopted_id_count: summary_ids_adopted_count,
-                shadow_mode,
-            };
-            derive_photon_feedback_outcome(&inputs)
+        // AS-04 / Issue #601: derive outcome + outcome_detail from the
+        // same-turn FeedbackKind / AnvilScore / shadow flag / adopted count
+        // / per-turn counters / WorkMode. Returns a PhotonFeedbackOutcome
+        // whose fields are `Option<&'static str>` allowlist values.
+        let inputs = PhotonOutcomeInputs {
+            last_feedback_kind: self.session.last_feedback.as_ref().map(|ff| &ff.kind),
+            eligible_feedback_recorded_this_turn: self.session.eligible_feedback_recorded_this_turn,
+            anvil_score: self.session.last_anvil_score.as_ref(),
+            adopted_id_count: summary_ids_adopted_count,
+            shadow_mode,
+            // Issue #601 NEW (4 fields):
+            iter_count_this_turn: self.session.iter_count_this_turn,
+            tool_calls_this_turn: self.session.tool_calls_this_turn,
+            repo_edit_succeeded_this_turn: self.session.repo_edit_succeeded_this_turn,
+            // DR3-001 SSOT: AnswerOnly check goes through the helper, never
+            // a direct `mode_state.work_mode == WorkMode::AnswerOnly` compare.
+            work_mode_is_answer_only: self.answer_only_mode_active(),
         };
+        let PhotonFeedbackOutcome {
+            outcome: outcome_static,
+            outcome_detail: outcome_detail_static,
+        } = derive_photon_feedback_outcome(&inputs);
         let outcome_json: serde_json::Value = match outcome_static {
+            Some(s) => serde_json::Value::String(s.to_string()),
+            None => serde_json::Value::Null,
+        };
+        let outcome_detail_json: serde_json::Value = match outcome_detail_static {
             Some(s) => serde_json::Value::String(s.to_string()),
             None => serde_json::Value::Null,
         };
@@ -3418,6 +3559,10 @@ impl Agent {
                 "summary_ids_adopted": summary_ids_adopted,
                 "summary_ids_adopted_truncated": truncated,
                 "outcome": outcome_json.clone(),
+                // Issue #601: no-progress detail tag. Static-allowlist string
+                // or null. photon side `_FAILURE_DETAILS` allowlist consumes
+                // this in F-1 follow-up Issue.
+                "outcome_detail": outcome_detail_json.clone(),
             })
         } else {
             serde_json::Value::Null
@@ -3452,12 +3597,20 @@ impl Agent {
             // `eval.jsonl`. shadow_mode yields Some(0) — the field's purpose
             // is to record what was actually sent (which is 0 in shadow).
             summary.summary_ids_adopted_count = Some(summary_ids_adopted_count);
+            // Issue #601 (S5-003 / 設計判断 #1 (B)): persist the agent-side
+            // outcome + outcome_detail into eval.jsonl. Downstream fine-tuning
+            // / A-0 dataset can then identify no-progress turns mechanically.
+            // String::from(&'static str) — no free-text path, audit-safe.
+            summary.outcome_emitted = outcome_static.map(String::from);
+            summary.outcome_detail_emitted = outcome_detail_static.map(String::from);
             self.last_photon_eval_summary = Some(summary);
         }
-        // Issue #591 (AS-06 / DR4-NEW-004): event payload 4 → 8 keys. The
-        // raw `summary_ids_adopted` array is NOT included — only counts and
-        // static-allowlist strings cross the audit boundary. `mask_payload_inplace`
-        // in `log_llm_event` provides the final defensive scrub.
+        // Issue #591 (AS-06 / DR4-NEW-004) + Issue #601: event payload
+        // 4 → 8 keys (#591) → 9 keys (#601 adds `outcome_detail`). The raw
+        // `summary_ids_adopted` array is NOT included — only counts and
+        // static-allowlist strings cross the audit boundary.
+        // `mask_payload_inplace` in `log_llm_event` provides the final
+        // defensive scrub.
         log_llm_event(
             "agent.photon_evaluate.completed",
             serde_json::json!({
@@ -3469,6 +3622,10 @@ impl Agent {
                 "outcome": outcome_json,
                 "adoption_status": adoption_status,
                 "summary_ids_adopted_truncated": truncated,
+                // Issue #601: no-progress detail tag (static-allowlist string
+                // or null). Mirrors the `context_pack_event.outcome_detail`
+                // key for cross-channel audit consistency.
+                "outcome_detail": outcome_detail_json,
             }),
         );
     }
@@ -5270,6 +5427,18 @@ impl Agent {
             self.session.consecutive_no_progress_turns =
                 self.session.consecutive_no_progress_turns.saturating_add(1);
         }
+        // Issue #601: populate per-turn counters that Case F no-progress
+        // detection consumes. The SSOT for `iter_count_this_turn` is the
+        // local `last_iter.min(self.config.max_iterations)` expression below
+        // (S5-002 — `self.last_iter` field does NOT exist; only the local
+        // mutable `last_iter` in the actor loop exists). For
+        // `tool_calls_this_turn` the SSOT is the local
+        // `tool_calls_made_this_turn` counter. Populate happens here, after
+        // the loop exits but before any post-loop hook reads the values
+        // (Reminder / CaseRecord / AntiPattern / photon evaluate all run
+        // below this line).
+        self.session.iter_count_this_turn = last_iter.min(self.config.max_iterations);
+        self.session.tool_calls_this_turn = tool_calls_made_this_turn;
         let stats = build_stats(
             accumulated,
             final_verif.clone(),
@@ -13391,7 +13560,10 @@ export default function App() {
 // ───────────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod derive_photon_feedback_outcome_tests {
-    use super::{PhotonOutcomeInputs, derive_photon_feedback_outcome};
+    use super::{
+        PHOTON_OUTCOME_DETAIL_NO_PROGRESS_DESPITE_INJECT, PhotonFeedbackOutcome,
+        PhotonOutcomeInputs, case_f_condition_met, derive_photon_feedback_outcome,
+    };
     use crate::session::anvil_score::AnvilScore;
     use crate::session::feedback::FeedbackKind;
 
@@ -13402,6 +13574,15 @@ mod derive_photon_feedback_outcome_tests {
             anvil_score: None,
             adopted_id_count: 1, // non-zero so case A/B short-circuit doesn't fire by default
             shadow_mode: false,
+            // Issue #601 (D1-002 safeguard): defaults break the `iter_count_this_turn
+            // <= 1` condition in `case_f_condition_met` so existing tests that
+            // don't override Case F fields keep returning Case G (None). Mode
+            // is left as non-AnswerOnly to avoid biasing tests toward AnswerOnly.
+            // NPS-04 unit tests explicitly override `iter_count_this_turn: 1`.
+            iter_count_this_turn: 2,
+            tool_calls_this_turn: 0,
+            repo_edit_succeeded_this_turn: false,
+            work_mode_is_answer_only: false,
         }
     }
 
@@ -13414,11 +13595,19 @@ mod derive_photon_feedback_outcome_tests {
             ..AnvilScore::default()
         };
         let inputs = PhotonOutcomeInputs {
-            shadow_mode: true,
+            last_feedback_kind: None,
+            eligible_feedback_recorded_this_turn: false,
             anvil_score: Some(&score),
-            ..empty_inputs()
+            adopted_id_count: 1,
+            shadow_mode: true,
+            iter_count_this_turn: 2,
+            tool_calls_this_turn: 0,
+            repo_edit_succeeded_this_turn: false,
+            work_mode_is_answer_only: false,
         };
-        assert_eq!(derive_photon_feedback_outcome(&inputs), None);
+        let outcome = derive_photon_feedback_outcome(&inputs);
+        assert_eq!(outcome.outcome, None);
+        assert_eq!(outcome.outcome_detail, None);
     }
 
     // Case B: adopted_id_count=0 → None (no adoption to attribute).
@@ -13433,7 +13622,9 @@ mod derive_photon_feedback_outcome_tests {
             anvil_score: Some(&score),
             ..empty_inputs()
         };
-        assert_eq!(derive_photon_feedback_outcome(&inputs), None);
+        let outcome = derive_photon_feedback_outcome(&inputs);
+        assert_eq!(outcome.outcome, None);
+        assert_eq!(outcome.outcome_detail, None);
     }
 
     // Case C-1: AnvilScore.unsafe_actions_blocked > 0 → safety_violation.
@@ -13447,10 +13638,9 @@ mod derive_photon_feedback_outcome_tests {
             anvil_score: Some(&score),
             ..empty_inputs()
         };
-        assert_eq!(
-            derive_photon_feedback_outcome(&inputs),
-            Some("safety_violation")
-        );
+        let outcome = derive_photon_feedback_outcome(&inputs);
+        assert_eq!(outcome.outcome, Some("safety_violation"));
+        assert_eq!(outcome.outcome_detail, None);
     }
 
     // Case C-2: same-turn FeedbackKind=UnsafeCommandBlocked → safety_violation.
@@ -13462,10 +13652,9 @@ mod derive_photon_feedback_outcome_tests {
             eligible_feedback_recorded_this_turn: true,
             ..empty_inputs()
         };
-        assert_eq!(
-            derive_photon_feedback_outcome(&inputs),
-            Some("safety_violation")
-        );
+        let outcome = derive_photon_feedback_outcome(&inputs);
+        assert_eq!(outcome.outcome, Some("safety_violation"));
+        assert_eq!(outcome.outcome_detail, None);
     }
 
     // Case C-3: stale UnsafeCommandBlocked (flag=false) must NOT trigger safety.
@@ -13479,8 +13668,10 @@ mod derive_photon_feedback_outcome_tests {
             ..empty_inputs()
         };
         // Without an AnvilScore signal and with the same-turn flag false,
-        // the safety branch must not fire — fall through to None.
-        assert_eq!(derive_photon_feedback_outcome(&inputs), None);
+        // the safety branch must not fire — fall through to Case G (None).
+        let outcome = derive_photon_feedback_outcome(&inputs);
+        assert_eq!(outcome.outcome, None);
+        assert_eq!(outcome.outcome_detail, None);
     }
 
     // Case D: 9 failure-kind variants × eligible_flag=true → failure.
@@ -13503,11 +13694,13 @@ mod derive_photon_feedback_outcome_tests {
                 eligible_feedback_recorded_this_turn: true,
                 ..empty_inputs()
             };
+            let outcome = derive_photon_feedback_outcome(&inputs);
             assert_eq!(
-                derive_photon_feedback_outcome(&inputs),
+                outcome.outcome,
                 Some("failure"),
                 "kind {kind:?} must map to failure"
             );
+            assert_eq!(outcome.outcome_detail, None);
         }
     }
 
@@ -13521,7 +13714,9 @@ mod derive_photon_feedback_outcome_tests {
             anvil_score: None,
             ..empty_inputs()
         };
-        assert_eq!(derive_photon_feedback_outcome(&inputs), None);
+        let outcome = derive_photon_feedback_outcome(&inputs);
+        assert_eq!(outcome.outcome, None);
+        assert_eq!(outcome.outcome_detail, None);
     }
 
     // Case E: success guard — flag=false but user_visible_artifact=true → success.
@@ -13537,18 +13732,25 @@ mod derive_photon_feedback_outcome_tests {
             eligible_feedback_recorded_this_turn: false,
             ..empty_inputs()
         };
-        assert_eq!(derive_photon_feedback_outcome(&inputs), Some("success"));
+        let outcome = derive_photon_feedback_outcome(&inputs);
+        assert_eq!(outcome.outcome, Some("success"));
+        assert_eq!(outcome.outcome_detail, None);
     }
 
-    // Case F: no failure, no safety, no user_visible_artifact → None.
+    // Case G (rename from legacy case_f_no_signals_yields_none, Issue #601):
+    // no failure, no safety, no user_visible_artifact, no Case F → None.
+    // `empty_inputs()` defaults `iter_count_this_turn: 2` which breaks the
+    // Case F `<= 1` condition, so this falls through to Case G fallback.
     #[test]
-    fn case_f_no_signals_yields_none() {
+    fn case_g_no_signals_yields_none() {
         let score = AnvilScore::default(); // user_visible_artifact=false, unsafe=0
         let inputs = PhotonOutcomeInputs {
             anvil_score: Some(&score),
             ..empty_inputs()
         };
-        assert_eq!(derive_photon_feedback_outcome(&inputs), None);
+        let outcome = derive_photon_feedback_outcome(&inputs);
+        assert_eq!(outcome.outcome, None);
+        assert_eq!(outcome.outcome_detail, None);
     }
 
     // Priority: failure beats success when both signals exist.
@@ -13565,7 +13767,9 @@ mod derive_photon_feedback_outcome_tests {
             anvil_score: Some(&score),
             ..empty_inputs()
         };
-        assert_eq!(derive_photon_feedback_outcome(&inputs), Some("failure"));
+        let outcome = derive_photon_feedback_outcome(&inputs);
+        assert_eq!(outcome.outcome, Some("failure"));
+        assert_eq!(outcome.outcome_detail, None);
     }
 
     // Priority: safety_violation beats failure.
@@ -13582,10 +13786,206 @@ mod derive_photon_feedback_outcome_tests {
             anvil_score: Some(&score),
             ..empty_inputs()
         };
+        let outcome = derive_photon_feedback_outcome(&inputs);
+        assert_eq!(outcome.outcome, Some("safety_violation"));
+        assert_eq!(outcome.outcome_detail, None);
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Case F (Issue #601): no-progress detection. 6 new unit tests.
+    // ─────────────────────────────────────────────────────────────────
+
+    // NPS-04 unit equivalent: all 4 Case F conditions met → failure + detail.
+    #[test]
+    fn case_f_no_progress_yields_failure_with_detail() {
+        // Pre-conditions: Cases A/B/C/D/E all fall through.
+        // - shadow_mode=false (default)
+        // - adopted_id_count=1 (default)
+        // - no unsafe / no eligible failure kind / no user_visible_artifact.
+        let score = AnvilScore::default();
+        let inputs = PhotonOutcomeInputs {
+            anvil_score: Some(&score),
+            // Case F-specific overrides:
+            iter_count_this_turn: 1, // <= 1
+            tool_calls_this_turn: 0,
+            repo_edit_succeeded_this_turn: false,
+            work_mode_is_answer_only: false,
+            ..empty_inputs()
+        };
+        let outcome = derive_photon_feedback_outcome(&inputs);
+        assert_eq!(outcome.outcome, Some("failure"));
         assert_eq!(
-            derive_photon_feedback_outcome(&inputs),
-            Some("safety_violation")
+            outcome.outcome_detail,
+            Some(PHOTON_OUTCOME_DETAIL_NO_PROGRESS_DESPITE_INJECT)
         );
+    }
+
+    // NPS-03 unit equivalent: AnswerOnly mode → Case F does not fire.
+    #[test]
+    fn case_f_no_progress_answer_only_yields_none() {
+        let score = AnvilScore::default();
+        let inputs = PhotonOutcomeInputs {
+            anvil_score: Some(&score),
+            iter_count_this_turn: 1,
+            tool_calls_this_turn: 0,
+            repo_edit_succeeded_this_turn: false,
+            work_mode_is_answer_only: true, // mode bypass
+            ..empty_inputs()
+        };
+        let outcome = derive_photon_feedback_outcome(&inputs);
+        assert_eq!(outcome.outcome, None);
+        assert_eq!(outcome.outcome_detail, None);
+    }
+
+    // NPS-05 unit equivalent: multi-iter turn → Case F does not fire.
+    #[test]
+    fn case_f_no_progress_multi_iter_yields_none() {
+        let score = AnvilScore::default();
+        let inputs = PhotonOutcomeInputs {
+            anvil_score: Some(&score),
+            iter_count_this_turn: 2, // > 1
+            tool_calls_this_turn: 0,
+            repo_edit_succeeded_this_turn: false,
+            work_mode_is_answer_only: false,
+            ..empty_inputs()
+        };
+        let outcome = derive_photon_feedback_outcome(&inputs);
+        assert_eq!(outcome.outcome, None);
+        assert_eq!(outcome.outcome_detail, None);
+    }
+
+    // `tool_calls_this_turn >= 1` breaks Case F.
+    #[test]
+    fn case_f_no_progress_with_tool_call_yields_none() {
+        let score = AnvilScore::default();
+        let inputs = PhotonOutcomeInputs {
+            anvil_score: Some(&score),
+            iter_count_this_turn: 1,
+            tool_calls_this_turn: 1, // > 0
+            repo_edit_succeeded_this_turn: false,
+            work_mode_is_answer_only: false,
+            ..empty_inputs()
+        };
+        let outcome = derive_photon_feedback_outcome(&inputs);
+        assert_eq!(outcome.outcome, None);
+        assert_eq!(outcome.outcome_detail, None);
+    }
+
+    // `repo_edit_succeeded_this_turn=true` breaks Case F.
+    #[test]
+    fn case_f_no_progress_with_repo_edit_yields_none() {
+        let score = AnvilScore::default();
+        let inputs = PhotonOutcomeInputs {
+            anvil_score: Some(&score),
+            iter_count_this_turn: 1,
+            tool_calls_this_turn: 0,
+            repo_edit_succeeded_this_turn: true, // edit succeeded
+            work_mode_is_answer_only: false,
+            ..empty_inputs()
+        };
+        let outcome = derive_photon_feedback_outcome(&inputs);
+        assert_eq!(outcome.outcome, None);
+        assert_eq!(outcome.outcome_detail, None);
+    }
+
+    // Case D ∧ Case F overlap: explicit failure kind wins, detail stays None.
+    // (D1-003: a turn that recorded an eligible failure kind has more
+    // information than the no-progress shape; Case D returns first.)
+    #[test]
+    fn case_f_subordinate_to_case_d() {
+        // Contrived: ToolProtocolFailure recorded with 0 tool calls and 0 edit,
+        // 1 iter (could happen via a parser error before dispatch). Case D
+        // must fire first and yield `outcome=Some("failure")`,
+        // `outcome_detail=None` — NOT the Case F detail tag.
+        let kind = FeedbackKind::ToolProtocolFailure;
+        let inputs = PhotonOutcomeInputs {
+            last_feedback_kind: Some(&kind),
+            eligible_feedback_recorded_this_turn: true,
+            iter_count_this_turn: 1,
+            tool_calls_this_turn: 0,
+            repo_edit_succeeded_this_turn: false,
+            work_mode_is_answer_only: false,
+            ..empty_inputs()
+        };
+        let outcome = derive_photon_feedback_outcome(&inputs);
+        assert_eq!(outcome.outcome, Some("failure"));
+        assert_eq!(outcome.outcome_detail, None);
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // case_f_condition_met SSOT tests (Issue #601 / D1-001)
+    // ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn case_f_condition_met_returns_true_when_all_conditions_met() {
+        let inputs = PhotonOutcomeInputs {
+            iter_count_this_turn: 1,
+            tool_calls_this_turn: 0,
+            repo_edit_succeeded_this_turn: false,
+            work_mode_is_answer_only: false,
+            ..empty_inputs()
+        };
+        assert!(case_f_condition_met(&inputs));
+    }
+
+    #[test]
+    fn case_f_condition_met_returns_false_when_answer_only() {
+        let inputs = PhotonOutcomeInputs {
+            iter_count_this_turn: 1,
+            tool_calls_this_turn: 0,
+            repo_edit_succeeded_this_turn: false,
+            work_mode_is_answer_only: true,
+            ..empty_inputs()
+        };
+        assert!(!case_f_condition_met(&inputs));
+    }
+
+    #[test]
+    fn case_f_condition_met_returns_false_when_multi_iter() {
+        let inputs = PhotonOutcomeInputs {
+            iter_count_this_turn: 2,
+            tool_calls_this_turn: 0,
+            repo_edit_succeeded_this_turn: false,
+            work_mode_is_answer_only: false,
+            ..empty_inputs()
+        };
+        assert!(!case_f_condition_met(&inputs));
+    }
+
+    #[test]
+    fn case_f_condition_met_returns_false_when_tool_calls_made() {
+        let inputs = PhotonOutcomeInputs {
+            iter_count_this_turn: 1,
+            tool_calls_this_turn: 1,
+            repo_edit_succeeded_this_turn: false,
+            work_mode_is_answer_only: false,
+            ..empty_inputs()
+        };
+        assert!(!case_f_condition_met(&inputs));
+    }
+
+    #[test]
+    fn case_f_condition_met_returns_false_when_repo_edit_succeeded() {
+        let inputs = PhotonOutcomeInputs {
+            iter_count_this_turn: 1,
+            tool_calls_this_turn: 0,
+            repo_edit_succeeded_this_turn: true,
+            work_mode_is_answer_only: false,
+            ..empty_inputs()
+        };
+        assert!(!case_f_condition_met(&inputs));
+    }
+
+    // Unused-import suppression: ensure all imported symbols are exercised.
+    #[test]
+    fn struct_clone_smoke() {
+        let v = PhotonFeedbackOutcome {
+            outcome: Some("success"),
+            outcome_detail: None,
+        };
+        let v2 = v.clone();
+        assert_eq!(v2.outcome, Some("success"));
+        assert_eq!(v2.outcome_detail, None);
     }
 }
 
