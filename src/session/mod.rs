@@ -1,5 +1,6 @@
 pub mod anti_pattern;
 pub mod anvil_score;
+pub mod case_photon_bridge;
 pub mod case_record;
 pub mod case_retrieval;
 pub mod compact;

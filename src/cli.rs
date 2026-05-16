@@ -135,6 +135,31 @@ pub enum SessionsAction {
     },
     /// Check Photon rollout readiness conditions (Issue #561).
     PhotonRolloutCheck {},
+    /// Promote successful CaseRecord entries to photon seed format
+    /// (Issue #593, Phase A — manual CLI + dry-run + JSONL local output).
+    PhotonPromote {
+        /// Promote cases from a specific session id only.
+        #[arg(long)]
+        session: Option<String>,
+        /// Promote a single case by id.
+        #[arg(long = "case-id")]
+        case_id: Option<String>,
+        /// Promote all cases in this workspace.
+        #[arg(long)]
+        all: bool,
+        /// Show what would be promoted without writing log or output file.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        /// Confirm promotion (required for non-dry-run mode).
+        #[arg(long)]
+        yes: bool,
+        /// Print the full ActionSummary JSON for the matched case(s).
+        #[arg(long = "print-summary")]
+        print_summary: bool,
+        /// Write JSONL output to FILE (0600 perm, new file only).
+        #[arg(long, value_name = "FILE")]
+        output: Option<PathBuf>,
+    },
 }
 
 /// `anvil sessions tmp-tests <list|promote|discard>` (Issue #458).

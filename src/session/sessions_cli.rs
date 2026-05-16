@@ -496,6 +496,26 @@ pub fn dispatch(
         SessionsAction::PhotonRolloutCheck {} => {
             run_photon_rollout_check(state_root, workspace_root)
         }
+        SessionsAction::PhotonPromote {
+            session,
+            case_id,
+            all,
+            dry_run,
+            yes,
+            print_summary,
+            output,
+        } => run_photon_promote(
+            workspace_root,
+            state_root,
+            session,
+            case_id,
+            all,
+            dry_run,
+            yes,
+            print_summary,
+            output,
+        )
+        .map(|_| ()),
     }
 }
 
@@ -539,6 +559,253 @@ pub fn run_photon_rollout_check(state_root: &Path, workspace_root: &Path) -> Res
         println!("\nRollout NOT READY (移行条件を満たしていません)");
     }
     Ok(())
+}
+
+/// `anvil sessions photon-promote` handler (Issue #593, Phase A).
+///
+/// Promotes successful `CaseRecord` entries to photon `ActionSummary` v0.2
+/// format. Phase A is local-only: no HTTP POST, dry-run or `--output FILE`.
+///
+/// `session` and `case_id` narrow the scope; `--all` is an explicit "all
+/// cases" flag (for safety, matching `--all` style elsewhere). Non-dry-run
+/// without `--yes` falls back to dry-run with a stderr warning so misconfigured
+/// CI jobs cannot silently write the dedup log.
+#[allow(clippy::too_many_arguments)]
+pub fn run_photon_promote(
+    workspace_root: &Path,
+    state_root: &Path,
+    session: Option<String>,
+    case_id: Option<String>,
+    all: bool,
+    dry_run: bool,
+    yes: bool,
+    print_summary: bool,
+    output: Option<PathBuf>,
+) -> Result<i32, String> {
+    use crate::session::case_photon_bridge::{
+        ActionSummary, BridgeOutcome, MAX_ACTION_SUMMARY_BYTES, PromoteLogEntry, PromotedEntry,
+        SkipReason, SkippedEntry, append_promote_log_entry, check_quality_gate,
+        convert_case_to_action_summary, format_rfc3339_utc, read_promote_log, write_jsonl_output,
+    };
+    use crate::session::case_record::{CaseRecord, iter_case_files, validate_case_id};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let _ = workspace_root;
+
+    // Mutual exclusion: --session / --case-id / --all are mutually exclusive.
+    let mut chosen = 0;
+    if session.is_some() {
+        chosen += 1;
+    }
+    if case_id.is_some() {
+        chosen += 1;
+    }
+    if all {
+        chosen += 1;
+    }
+    if chosen > 1 {
+        return Err("--session, --case-id, --all are mutually exclusive".to_string());
+    }
+
+    // Validate --case-id (allowlist) before scanning.
+    if let Some(ref id) = case_id
+        && !validate_case_id(id)
+    {
+        return Err(format!("invalid --case-id: {id}"));
+    }
+
+    // Step 0: capture a single timestamp for all summaries this run.
+    let now_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let extracted_at = format_rfc3339_utc(now_unix);
+
+    // Fail-safe: non-dry-run requires --yes. Otherwise downgrade to dry-run.
+    let effective_dry_run = if !dry_run && !yes {
+        eprintln!("warning: non-dry-run promotion requires --yes; falling back to dry-run");
+        true
+    } else {
+        dry_run
+    };
+
+    // Step 1: dedup set.
+    let already_promoted = read_promote_log(state_root)?;
+
+    // Step 2: enumerate candidate cases.
+    let entries = iter_case_files(state_root);
+    let filtered: Vec<_> = entries
+        .into_iter()
+        .filter(|e| match &case_id {
+            Some(id) => &e.case_id == id,
+            None => true,
+        })
+        .collect();
+
+    // Resolve session filter early: filter is applied per-CaseRecord later.
+    let session_filter = session.clone();
+
+    // Phase A: --session is informational only. CaseRecord does not store the
+    // session id, so we cannot filter by it from disk. The flag is preserved
+    // for forward compatibility (Phase B will store session_id on CaseRecord).
+    let _ = session_filter.is_some();
+
+    let session_label = session.clone().unwrap_or_else(|| "unknown".to_string());
+
+    let mut outcome = BridgeOutcome {
+        promoted: Vec::new(),
+        skipped: Vec::new(),
+    };
+    let mut promoted_summaries: Vec<ActionSummary> = Vec::new();
+
+    // Step 3: load + gate + convert each case.
+    for entry in filtered {
+        let bytes = match std::fs::read(&entry.path) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let case: CaseRecord = match serde_json::from_slice(&bytes) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        if let Err(reason) = check_quality_gate(&case, &already_promoted, now_unix) {
+            outcome.skipped.push(SkippedEntry {
+                case_id: case.case_id.clone(),
+                reason,
+            });
+            continue;
+        }
+
+        let summary = convert_case_to_action_summary(&case, &session_label, &extracted_at);
+        let serialized = match serde_json::to_vec(&summary) {
+            Ok(v) => v,
+            Err(err) => {
+                eprintln!(
+                    "warning: failed to serialize ActionSummary for {}: {err}",
+                    case.case_id
+                );
+                continue;
+            }
+        };
+        let byte_size = serialized.len();
+        if byte_size > MAX_ACTION_SUMMARY_BYTES {
+            outcome.skipped.push(SkippedEntry {
+                case_id: case.case_id.clone(),
+                reason: SkipReason::Oversize,
+            });
+            continue;
+        }
+
+        outcome.promoted.push(PromotedEntry {
+            case_id: case.case_id.clone(),
+            summary_id: summary.summary_id.clone(),
+            confidence_prior: summary
+                .provenance
+                .as_ref()
+                .map(|p| p.confidence_prior)
+                .unwrap_or(0.0),
+            byte_size,
+        });
+        promoted_summaries.push(summary);
+    }
+
+    // Step 4: dry-run table OR step 5: write outputs.
+    if effective_dry_run {
+        print_dry_run_table(&outcome);
+    }
+
+    if print_summary {
+        for summary in &promoted_summaries {
+            match serde_json::to_string(summary) {
+                Ok(s) => println!("{s}"),
+                Err(err) => eprintln!("warning: failed to serialize summary: {err}"),
+            }
+        }
+    }
+
+    if !effective_dry_run {
+        if let Some(out_path) = &output {
+            write_jsonl_output(out_path, &promoted_summaries)?;
+        }
+        // Step 6: append to dedup log (promoted + skipped).
+        for entry in &outcome.promoted {
+            let log = PromoteLogEntry {
+                case_id: entry.case_id.clone(),
+                summary_id: entry.summary_id.clone(),
+                extracted_at: extracted_at.clone(),
+                outcome: "promoted".to_string(),
+                reason: None,
+            };
+            append_promote_log_entry(state_root, &log)?;
+        }
+        for entry in &outcome.skipped {
+            let log = PromoteLogEntry {
+                case_id: entry.case_id.clone(),
+                summary_id: format!(
+                    "{}{}",
+                    crate::session::case_photon_bridge::SUMMARY_ID_PREFIX,
+                    entry.case_id
+                ),
+                extracted_at: extracted_at.clone(),
+                outcome: "skipped".to_string(),
+                reason: Some(entry.reason.as_str().to_string()),
+            };
+            append_promote_log_entry(state_root, &log)?;
+        }
+    }
+
+    // Step 7: stderr summary.
+    eprintln!(
+        "photon-promote: promoted={} skipped={} (dry_run={})",
+        outcome.promoted.len(),
+        outcome.skipped.len(),
+        effective_dry_run
+    );
+
+    Ok(0)
+}
+
+fn print_dry_run_table(outcome: &crate::session::case_photon_bridge::BridgeOutcome) {
+    println!(
+        "{:<32} {:<48} {:>6} {:>7} status",
+        "case_id", "summary_id", "conf", "bytes"
+    );
+    println!("{}", "-".repeat(110));
+    for entry in &outcome.promoted {
+        println!(
+            "{:<32} {:<48} {:>6.2} {:>7} promoted",
+            truncate_for_table(&entry.case_id, 32),
+            truncate_for_table(&entry.summary_id, 48),
+            entry.confidence_prior,
+            entry.byte_size,
+        );
+    }
+    for entry in &outcome.skipped {
+        println!(
+            "{:<32} {:<48} {:>6} {:>7} skipped:{}",
+            truncate_for_table(&entry.case_id, 32),
+            "-",
+            "-",
+            "-",
+            entry.reason.as_str(),
+        );
+    }
+    println!(
+        "total: promoted={} skipped={}",
+        outcome.promoted.len(),
+        outcome.skipped.len()
+    );
+}
+
+fn truncate_for_table(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max - 1).collect();
+        out.push('…');
+        out
+    }
 }
 
 pub fn run_list(state_root: &Path, current_ws: &str, all: bool, json: bool) -> Result<(), String> {
