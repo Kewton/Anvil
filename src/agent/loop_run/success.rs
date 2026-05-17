@@ -100,17 +100,39 @@ impl Agent {
                 .active_request_text()
                 .map(|text| requested_paths_from_text(&text))
                 .unwrap_or_default();
+            // Issue #606 T-1.5: Stage-2 short-circuit — if the agent observed
+            // enough evidence this turn to satisfy the active protocol, the
+            // per-kind reject text is suppressed. Stage 1 (deterministic_only /
+            // verifier_passed_after_edit == Some(false)) still wins inside
+            // `success_issue_with_context`.
+            let kind = protocol.kind();
+            let evidence_satisfied = kind.evidence_set_satisfies(&self.evidence_set_this_turn);
             if let Some(issue) = protocol.success_issue_with_context(ProtocolSuccessContext {
                 stats,
                 deterministic_recovery_recorded,
                 model_repo_edits_this_turn,
                 requested_paths: &requested_paths,
                 verifier_passed_after_edit: None,
+                evidence_satisfied,
             }) {
+                let missing = kind.evidence_set_missing_shapes(&self.evidence_set_this_turn);
+                crate::logging::log_completion_evidence_unsatisfied(
+                    self.current_turn_index,
+                    kind.label(),
+                    &missing,
+                    self.evidence_set_this_turn.len(),
+                );
                 *exit_reason = ExitReason::MissingRepoEdits;
                 *error_text = issue;
                 false
             } else {
+                if evidence_satisfied {
+                    crate::logging::log_completion_evidence_satisfied(
+                        self.current_turn_index,
+                        kind.label(),
+                        self.evidence_set_this_turn.len(),
+                    );
+                }
                 true
             }
         } else {

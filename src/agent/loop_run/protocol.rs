@@ -1,5 +1,6 @@
 use crate::modes::plan_act::WorkMode;
 
+use super::completion_evidence::{CompletionEvidence, EvidenceSet, RepoEditCategory};
 use super::summary::LoopStats;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9,6 +10,180 @@ pub(super) enum ProtocolKind {
     Docs,
     AnswerOnly,
     GenericCode,
+}
+
+impl ProtocolKind {
+    /// Issue #606 T-1.9: stable `&'static str` label used in completion
+    /// evidence log payloads. Lower-case snake_case matches the enum
+    /// rename convention used elsewhere in the codebase.
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            ProtocolKind::Python => "python",
+            ProtocolKind::TypeScriptUi => "typescript_ui",
+            ProtocolKind::Docs => "docs",
+            ProtocolKind::AnswerOnly => "answer_only",
+            ProtocolKind::GenericCode => "generic_code",
+        }
+    }
+
+    /// Issue #606 T-1.4: does this protocol accept the given single
+    /// `CompletionEvidence` as proof of forward progress this turn? Pure
+    /// function over the (kind, evidence) cross-product:
+    ///
+    /// | kind          | RepoEdit accepted categories | VerifierExitZero | AnswerOnly |
+    /// |---------------|------------------------------|------------------|------------|
+    /// | Python        | Impl / Test                  | yes              | no         |
+    /// | TypeScriptUi  | Impl                         | yes              | no         |
+    /// | GenericCode   | Impl / Test / Setup / Other  | yes              | no         |
+    /// | AnswerOnly    | (none)                       | yes              | yes        |
+    /// | Docs          | Docs                         | no               | no         |
+    ///
+    /// `RepoEdit { category: Other }` is accepted only by `GenericCode` —
+    /// it is not a strong-enough signal for Python / TypeScriptUi / Docs.
+    pub(super) fn accepts(self, evidence: &CompletionEvidence) -> bool {
+        match (self, evidence) {
+            // Python protocol — implementation OR test edit OR verifier pass.
+            (
+                ProtocolKind::Python,
+                CompletionEvidence::RepoEdit {
+                    category: RepoEditCategory::Impl | RepoEditCategory::Test,
+                    ..
+                },
+            ) => true,
+            (ProtocolKind::Python, CompletionEvidence::VerifierExitZero { .. }) => true,
+            // TypeScript UI protocol — implementation edit OR verifier pass.
+            (
+                ProtocolKind::TypeScriptUi,
+                CompletionEvidence::RepoEdit {
+                    category: RepoEditCategory::Impl,
+                    ..
+                },
+            ) => true,
+            (ProtocolKind::TypeScriptUi, CompletionEvidence::VerifierExitZero { .. }) => true,
+            // GenericCode — any RepoEdit (incl. Setup / Other) OR verifier pass.
+            (ProtocolKind::GenericCode, CompletionEvidence::RepoEdit { .. }) => true,
+            (ProtocolKind::GenericCode, CompletionEvidence::VerifierExitZero { .. }) => true,
+            // AnswerOnly — accepts a verifier pass (e.g. user asked the
+            // model to run a read-only sanity script) OR an explicit
+            // AnswerOnly marker. RepoEdit is NOT accepted because the
+            // protocol forbids file changes.
+            (ProtocolKind::AnswerOnly, CompletionEvidence::VerifierExitZero { .. }) => true,
+            (ProtocolKind::AnswerOnly, CompletionEvidence::AnswerOnly) => true,
+            // Docs protocol — only a Docs RepoEdit counts. Verifier pass
+            // alone is not a docs artifact, even though a docs-style build
+            // command (e.g. `mkdocs build`) might exit 0.
+            (
+                ProtocolKind::Docs,
+                CompletionEvidence::RepoEdit {
+                    category: RepoEditCategory::Docs,
+                    ..
+                },
+            ) => true,
+            _ => false,
+        }
+    }
+
+    /// Issue #606 T-1.4: OR-fold — true when any single observation in the
+    /// set is accepted by this protocol.
+    pub(super) fn evidence_set_satisfies(self, set: &EvidenceSet) -> bool {
+        set.iter().any(|ev| self.accepts(ev))
+    }
+
+    /// Issue #606 T-1.4: human-friendly list of evidence shapes this
+    /// protocol still wants observed in the current turn. Used by
+    /// `success.rs` to populate `agent.completion_evidence.unsatisfied`
+    /// log payloads when the OR-fold returned false. The returned slice
+    /// of `&'static str` keeps allocation low and the names stable for
+    /// log analysers (no `format!` interpolation).
+    pub(super) fn evidence_set_missing_shapes(self, set: &EvidenceSet) -> Vec<&'static str> {
+        // For each shape we *would* accept, mark "missing" when the set
+        // does not contain a matching observation. The order here matches
+        // the documentation table above so log readers see a consistent
+        // ordering.
+        let mut missing: Vec<&'static str> = Vec::new();
+        match self {
+            ProtocolKind::Python => {
+                if !set.iter().any(|ev| {
+                    matches!(
+                        ev,
+                        CompletionEvidence::RepoEdit {
+                            category: RepoEditCategory::Impl | RepoEditCategory::Test,
+                            ..
+                        }
+                    )
+                }) {
+                    missing.push("repo_edit_impl_or_test");
+                }
+                if !set
+                    .iter()
+                    .any(|ev| matches!(ev, CompletionEvidence::VerifierExitZero { .. }))
+                {
+                    missing.push("verifier_exit_zero");
+                }
+            }
+            ProtocolKind::TypeScriptUi => {
+                if !set.iter().any(|ev| {
+                    matches!(
+                        ev,
+                        CompletionEvidence::RepoEdit {
+                            category: RepoEditCategory::Impl,
+                            ..
+                        }
+                    )
+                }) {
+                    missing.push("repo_edit_impl");
+                }
+                if !set
+                    .iter()
+                    .any(|ev| matches!(ev, CompletionEvidence::VerifierExitZero { .. }))
+                {
+                    missing.push("verifier_exit_zero");
+                }
+            }
+            ProtocolKind::GenericCode => {
+                if !set
+                    .iter()
+                    .any(|ev| matches!(ev, CompletionEvidence::RepoEdit { .. }))
+                {
+                    missing.push("repo_edit_any");
+                }
+                if !set
+                    .iter()
+                    .any(|ev| matches!(ev, CompletionEvidence::VerifierExitZero { .. }))
+                {
+                    missing.push("verifier_exit_zero");
+                }
+            }
+            ProtocolKind::AnswerOnly => {
+                if !set
+                    .iter()
+                    .any(|ev| matches!(ev, CompletionEvidence::VerifierExitZero { .. }))
+                {
+                    missing.push("verifier_exit_zero");
+                }
+                if !set
+                    .iter()
+                    .any(|ev| matches!(ev, CompletionEvidence::AnswerOnly))
+                {
+                    missing.push("answer_only");
+                }
+            }
+            ProtocolKind::Docs => {
+                if !set.iter().any(|ev| {
+                    matches!(
+                        ev,
+                        CompletionEvidence::RepoEdit {
+                            category: RepoEditCategory::Docs,
+                            ..
+                        }
+                    )
+                }) {
+                    missing.push("repo_edit_docs");
+                }
+            }
+        }
+        missing
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,6 +198,14 @@ pub(super) struct ProtocolSuccessContext<'a> {
     pub(super) model_repo_edits_this_turn: usize,
     pub(super) requested_paths: &'a [String],
     pub(super) verifier_passed_after_edit: Option<bool>,
+    /// Issue #606 (T-1.4): Stage-2 short-circuit signal. When the agent
+    /// post-hoc-observed enough evidence to satisfy the active protocol via
+    /// `ProtocolKind::evidence_set_satisfies`, `success.rs` sets this to
+    /// `true` so the per-protocol per-kind reject text never fires. Stage 1
+    /// (`deterministic_only` / `verifier_passed_after_edit == Some(false)`)
+    /// still wins because those are deterministic failure signals, not
+    /// missing-evidence signals.
+    pub(super) evidence_satisfied: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +246,7 @@ impl ExecutionProtocol {
             model_repo_edits_this_turn: 0,
             requested_paths: &[],
             verifier_passed_after_edit: None,
+            evidence_satisfied: false,
         })
     }
 
@@ -70,6 +254,9 @@ impl ExecutionProtocol {
         self,
         context: ProtocolSuccessContext<'_>,
     ) -> Option<String> {
+        // Issue #606 T-1.5: Stage-1 deterministic failure signals always win.
+        // Stage-2 (`evidence_satisfied`) is honored only after Stage-1 cleared.
+        let evidence_satisfied = context.evidence_satisfied;
         let evidence = self.success_evidence(context);
         if evidence.deterministic_only {
             return Some(
@@ -79,6 +266,13 @@ impl ExecutionProtocol {
         }
         if evidence.verifier_passed_after_edit == Some(false) {
             return Some("protocol verifier failed after the edit".to_string());
+        }
+        // Stage-2: post-hoc evidence short-circuit. AnswerOnly is intentionally
+        // NOT shortcut here — its reject ("answer-only protocol completed with
+        // repository edits") fires when `evidence.total_changed > 0` because
+        // it represents a *behavioural violation*, not missing evidence.
+        if evidence_satisfied && !matches!(self.kind, ProtocolKind::AnswerOnly) {
+            return None;
         }
         match self.kind {
             ProtocolKind::AnswerOnly => {
@@ -348,6 +542,7 @@ mod tests {
             model_repo_edits_this_turn: 0,
             requested_paths: &[],
             verifier_passed_after_edit: None,
+            evidence_satisfied: false,
         }
     }
 
@@ -424,6 +619,7 @@ mod tests {
             model_repo_edits_this_turn: 1,
             requested_paths: &[],
             verifier_passed_after_edit: None,
+            evidence_satisfied: false,
         });
 
         assert!(evidence.changed_relevant_artifact);
@@ -447,6 +643,7 @@ mod tests {
                     model_repo_edits_this_turn: 1,
                     requested_paths: &[],
                     verifier_passed_after_edit: None,
+                    evidence_satisfied: false,
                 })
                 .is_none()
         );
@@ -465,6 +662,7 @@ mod tests {
                     model_repo_edits_this_turn: 1,
                     requested_paths: &requested,
                     verifier_passed_after_edit: None,
+                    evidence_satisfied: false,
                 })
                 .is_some()
         );
@@ -476,6 +674,7 @@ mod tests {
                     model_repo_edits_this_turn: 1,
                     requested_paths: &requested,
                     verifier_passed_after_edit: None,
+                    evidence_satisfied: false,
                 })
                 .is_none()
         );
@@ -492,6 +691,7 @@ mod tests {
             model_repo_edits_this_turn: 1,
             requested_paths: &requested,
             verifier_passed_after_edit: None,
+            evidence_satisfied: false,
         });
 
         assert!(evidence.requested_path_changed);
@@ -510,6 +710,7 @@ mod tests {
                 model_repo_edits_this_turn: 1,
                 requested_paths: &[],
                 verifier_passed_after_edit: Some(false),
+                evidence_satisfied: false,
             }),
             Some("protocol verifier failed after the edit".to_string())
         );
@@ -521,6 +722,7 @@ mod tests {
                     model_repo_edits_this_turn: 1,
                     requested_paths: &[],
                     verifier_passed_after_edit: Some(true),
+                    evidence_satisfied: false,
                 })
                 .is_none()
         );
@@ -533,5 +735,190 @@ mod tests {
             vec!["src/app/page.tsx".to_string(), "README.md".to_string()]
         );
         assert!(requested_paths_from_text("../secret.py /tmp/x.py https://x/y.py").is_empty());
+    }
+
+    // ----------------------------- Issue #606 T-1.4 -----------------------
+
+    use crate::tools::bash::BashCommandClass;
+
+    fn ev_verifier() -> CompletionEvidence {
+        CompletionEvidence::VerifierExitZero {
+            class: BashCommandClass::BuildTest,
+            command: "cargo test".to_string(),
+        }
+    }
+
+    fn ev_repo_edit(category: RepoEditCategory) -> CompletionEvidence {
+        CompletionEvidence::RepoEdit { category, count: 1 }
+    }
+
+    /// U-09 — 5 ProtocolKind × evidence variant matrix smoke.
+    #[test]
+    fn protocol_kind_accepts_each_completion_evidence_kind() {
+        let verifier = ev_verifier();
+        let impl_edit = ev_repo_edit(RepoEditCategory::Impl);
+        let test_edit = ev_repo_edit(RepoEditCategory::Test);
+        let docs_edit = ev_repo_edit(RepoEditCategory::Docs);
+        let setup_edit = ev_repo_edit(RepoEditCategory::Setup);
+        let other_edit = ev_repo_edit(RepoEditCategory::Other);
+        let answer_only = CompletionEvidence::AnswerOnly;
+
+        // Python
+        assert!(ProtocolKind::Python.accepts(&verifier));
+        assert!(ProtocolKind::Python.accepts(&impl_edit));
+        assert!(ProtocolKind::Python.accepts(&test_edit));
+        assert!(!ProtocolKind::Python.accepts(&docs_edit));
+        assert!(!ProtocolKind::Python.accepts(&setup_edit));
+        assert!(!ProtocolKind::Python.accepts(&other_edit));
+        assert!(!ProtocolKind::Python.accepts(&answer_only));
+
+        // TypeScriptUi
+        assert!(ProtocolKind::TypeScriptUi.accepts(&verifier));
+        assert!(ProtocolKind::TypeScriptUi.accepts(&impl_edit));
+        assert!(!ProtocolKind::TypeScriptUi.accepts(&test_edit));
+        assert!(!ProtocolKind::TypeScriptUi.accepts(&docs_edit));
+
+        // GenericCode — any RepoEdit, plus VerifierExitZero
+        assert!(ProtocolKind::GenericCode.accepts(&verifier));
+        assert!(ProtocolKind::GenericCode.accepts(&impl_edit));
+        assert!(ProtocolKind::GenericCode.accepts(&test_edit));
+        assert!(ProtocolKind::GenericCode.accepts(&docs_edit));
+        assert!(ProtocolKind::GenericCode.accepts(&setup_edit));
+        assert!(ProtocolKind::GenericCode.accepts(&other_edit));
+        assert!(!ProtocolKind::GenericCode.accepts(&answer_only));
+
+        // AnswerOnly
+        assert!(ProtocolKind::AnswerOnly.accepts(&verifier));
+        assert!(ProtocolKind::AnswerOnly.accepts(&answer_only));
+        assert!(!ProtocolKind::AnswerOnly.accepts(&impl_edit));
+        assert!(!ProtocolKind::AnswerOnly.accepts(&docs_edit));
+
+        // Docs
+        assert!(ProtocolKind::Docs.accepts(&docs_edit));
+        assert!(!ProtocolKind::Docs.accepts(&verifier));
+        assert!(!ProtocolKind::Docs.accepts(&impl_edit));
+        assert!(!ProtocolKind::Docs.accepts(&answer_only));
+    }
+
+    /// U-10 — AnswerOnly + VerifierExitZero + no repo edits → done. The
+    /// success.rs Stage-2 short-circuit is suppressed for AnswerOnly, but
+    /// the original AnswerOnly logic still accepts `total_changed == 0`.
+    #[test]
+    fn answer_only_with_verifier_exit_zero_is_done() {
+        let protocol = ExecutionProtocol::from_work_mode(WorkMode::AnswerOnly);
+        // total_changed == 0 (verifier ran but no edits)
+        assert!(
+            protocol
+                .success_issue_with_context(ProtocolSuccessContext {
+                    stats: &stats(&[], 0),
+                    deterministic_recovery_recorded: false,
+                    model_repo_edits_this_turn: 0,
+                    requested_paths: &[],
+                    verifier_passed_after_edit: None,
+                    evidence_satisfied: true,
+                })
+                .is_none()
+        );
+    }
+
+    /// U-11 — AnswerOnly + RepoEdit only (no verifier) is still rejected
+    /// even when `evidence_satisfied = true`. This pins VR-02 regression:
+    /// the Stage-2 short-circuit must NOT silence the answer-only edit ban.
+    #[test]
+    fn answer_only_with_repo_edit_only_is_still_rejected() {
+        let protocol = ExecutionProtocol::from_work_mode(WorkMode::AnswerOnly);
+        let issue = protocol.success_issue_with_context(ProtocolSuccessContext {
+            stats: &stats(&["README.md"], 1),
+            deterministic_recovery_recorded: false,
+            model_repo_edits_this_turn: 1,
+            requested_paths: &[],
+            verifier_passed_after_edit: None,
+            evidence_satisfied: true, // ← even with evidence flag set
+        });
+        assert_eq!(
+            issue,
+            Some(
+                "answer-only protocol completed with repository edits; retry without changing files"
+                    .to_string()
+            )
+        );
+    }
+
+    /// U-12 — Stage-1 (`verifier_passed_after_edit == Some(false)`) wins
+    /// over Stage-2 (`evidence_satisfied == true`). Deterministic verifier
+    /// failure must not be silenced by post-hoc evidence.
+    #[test]
+    fn verifier_passed_after_edit_some_false_overrides_evidence_satisfied() {
+        let protocol = ExecutionProtocol::from_work_mode(WorkMode::GenericCode);
+        let stats = stats(&["src/app.ts"], 1);
+        assert_eq!(
+            protocol.success_issue_with_context(ProtocolSuccessContext {
+                stats: &stats,
+                deterministic_recovery_recorded: false,
+                model_repo_edits_this_turn: 1,
+                requested_paths: &[],
+                verifier_passed_after_edit: Some(false),
+                evidence_satisfied: true,
+            }),
+            Some("protocol verifier failed after the edit".to_string())
+        );
+    }
+
+    /// U-19 — `evidence_set_missing_shapes` returns the static labels
+    /// describing which shape is still wanted. Empty set → all shapes.
+    #[test]
+    fn evidence_set_missing_shapes_describes_unsatisfied_protocol() {
+        let empty = EvidenceSet::new();
+        assert_eq!(
+            ProtocolKind::Python.evidence_set_missing_shapes(&empty),
+            vec!["repo_edit_impl_or_test", "verifier_exit_zero"]
+        );
+        assert_eq!(
+            ProtocolKind::TypeScriptUi.evidence_set_missing_shapes(&empty),
+            vec!["repo_edit_impl", "verifier_exit_zero"]
+        );
+        assert_eq!(
+            ProtocolKind::GenericCode.evidence_set_missing_shapes(&empty),
+            vec!["repo_edit_any", "verifier_exit_zero"]
+        );
+        assert_eq!(
+            ProtocolKind::AnswerOnly.evidence_set_missing_shapes(&empty),
+            vec!["verifier_exit_zero", "answer_only"]
+        );
+        assert_eq!(
+            ProtocolKind::Docs.evidence_set_missing_shapes(&empty),
+            vec!["repo_edit_docs"]
+        );
+
+        // Partial — a Test edit satisfies Python's repo-edit slot but
+        // leaves the verifier slot open.
+        let mut set = EvidenceSet::new();
+        set.push(ev_repo_edit(RepoEditCategory::Test));
+        assert_eq!(
+            ProtocolKind::Python.evidence_set_missing_shapes(&set),
+            vec!["verifier_exit_zero"]
+        );
+    }
+
+    /// Integration of T-1.3 evidence_set_satisfies into protocol decisions.
+    #[test]
+    fn evidence_set_satisfies_python_with_test_edit() {
+        let mut set = EvidenceSet::new();
+        set.push(ev_repo_edit(RepoEditCategory::Test));
+        assert!(ProtocolKind::Python.evidence_set_satisfies(&set));
+    }
+
+    #[test]
+    fn evidence_set_satisfies_generic_code_with_verifier_exit_zero() {
+        let mut set = EvidenceSet::new();
+        set.push(ev_verifier());
+        assert!(ProtocolKind::GenericCode.evidence_set_satisfies(&set));
+    }
+
+    #[test]
+    fn evidence_set_unsatisfied_docs_with_only_verifier() {
+        let mut set = EvidenceSet::new();
+        set.push(ev_verifier());
+        assert!(!ProtocolKind::Docs.evidence_set_satisfies(&set));
     }
 }

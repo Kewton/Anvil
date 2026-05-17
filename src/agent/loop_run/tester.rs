@@ -1377,6 +1377,7 @@ mod tests {
             timed_out: false,
             blocked_reason: None,
             interrupted: false,
+            ..Default::default()
         }
     }
 
@@ -1762,6 +1763,7 @@ mod tests {
                 timed_out: false,
                 blocked_reason: None,
                 interrupted: false,
+                ..Default::default()
             })
         });
         assert!(result.is_ok());
@@ -1800,6 +1802,7 @@ mod tests {
                 timed_out: false,
                 blocked_reason: None,
                 interrupted: false,
+                ..Default::default()
             })
         }
     }
@@ -1815,6 +1818,7 @@ mod tests {
                 timed_out: false,
                 blocked_reason: None,
                 interrupted: false,
+                ..Default::default()
             })
         }
     }
@@ -2012,6 +2016,7 @@ mod tests {
                 timed_out: true,
                 blocked_reason: None,
                 interrupted: false,
+                ..Default::default()
             })
         };
         let outcome = run_tester_with_strategy(
@@ -2047,6 +2052,7 @@ mod tests {
                 timed_out: false,
                 blocked_reason: None,
                 interrupted: true,
+                ..Default::default()
             })
         };
         let outcome = run_tester_with_strategy(

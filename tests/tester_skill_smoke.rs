@@ -109,6 +109,7 @@ fn ok_bash_outcome(stdout: &str) -> BashExecutionOutcome {
         timed_out: false,
         blocked_reason: None,
         interrupted: false,
+        ..Default::default()
     }
 }
 

@@ -3759,6 +3759,12 @@ impl Agent {
         // outcome cache. Mirror of `case_record_extracted_this_turn` semantics.
         self.session.auto_promote_called_this_turn = false;
         self.last_auto_promote_outcome = None;
+        // Issue #606 (T-1.8): reset the per-turn completion-evidence set so
+        // observations never bleed across turns. Push-only `EvidenceSet`
+        // populated by the Bash / Edit / Write hooks below; consumed by
+        // `success.rs::run_post_loop_success_verifier` via
+        // `ProtocolKind::evidence_set_satisfies`.
+        self.evidence_set_this_turn.clear();
 
         let mut tool_calls_made_this_turn = 0usize;
         let mut repo_edit_calls_made_this_turn = 0usize;
@@ -7072,6 +7078,14 @@ impl Agent {
             {
                 self.session.record_feedback(frame);
             }
+            // Issue #606 (T-1.6): post-hoc observation of a successful
+            // build/test command as `VerifierExitZero` evidence. Gated by
+            // the T-3.1 security helper `is_completion_verifier_command`
+            // which rejects shell-control operators that could mask the
+            // real exit code (DR4-002 — `cargo test || true` is poisoned).
+            if let Some(outcome) = outcome.as_ref() {
+                self.observe_evidence_from_bash_outcome(outcome);
+            }
             return match result {
                 Ok(text) => {
                     self.maybe_update_work_root(name, arguments, &text);
@@ -7127,6 +7141,17 @@ impl Agent {
                     // verify_repo_progress diff signal in
                     // `compute_anvil_score`).
                     self.session.repo_edit_succeeded_this_turn = true;
+                    // Issue #606 (T-1.7): post-hoc observation of a
+                    // successful repo edit as `RepoEdit` evidence. Path
+                    // categorisation goes through
+                    // `completion_evidence::classify_repo_edit_path`
+                    // which evaluates predicates in a fixed order so
+                    // `.mdx` reliably classifies as Docs (DR1-001).
+                    if let Some(raw_path) =
+                        arguments.get("path").and_then(serde_json::Value::as_str)
+                    {
+                        self.observe_evidence_from_repo_edit(raw_path);
+                    }
                 }
                 self.maybe_update_work_root(name, arguments, &result);
                 result
@@ -7144,6 +7169,82 @@ impl Agent {
                 lifecycle::format_tool_error(&err)
             }
         }
+    }
+
+    /// Issue #606 (T-1.6): post-hoc observation of a Bash invocation as
+    /// `VerifierExitZero` completion evidence. A signal is recorded **only**
+    /// when:
+    ///
+    /// 1. `outcome.exit_code == Some(0)` — non-zero / timeout / interrupted
+    ///    invocations are explicit failures, not silent passes.
+    /// 2. `outcome.class == BuildTest` — read-only / network / mutating
+    ///    classes don't represent verification work even when they
+    ///    happen to exit 0.
+    /// 3. `is_completion_verifier_command(&outcome.command) == true` —
+    ///    rejects commands containing shell control operators that can
+    ///    mask the real exit code (DR4-002, e.g. `cargo test || true`).
+    ///
+    /// The evidence is consumed by
+    /// `ProtocolKind::evidence_set_satisfies` in `success.rs`.
+    fn observe_evidence_from_bash_outcome(
+        &mut self,
+        outcome: &crate::tools::bash::BashExecutionOutcome,
+    ) {
+        use crate::tools::bash::BashCommandClass;
+        if outcome.exit_code != Some(0) {
+            return;
+        }
+        if !matches!(outcome.class, BashCommandClass::BuildTest) {
+            return;
+        }
+        if !super::completion_evidence::is_completion_verifier_command(&outcome.command) {
+            return;
+        }
+        // Mask the command through the dedicated verifier-storage redactor
+        // before pushing it into the in-process EvidenceSet. This wraps
+        // `mask_secrets` with the additional Authorization / Cookie /
+        // X-API-Key header family redaction and control-char neutralization
+        // mandated by Stage 4 DR4-003 (see design §6.2 / §12.2). The same
+        // helper is reserved for the alpha-2
+        // `SessionSnapshot::last_verifier_command` /
+        // `VerifierInvocationRecord::command` persistence path so a single
+        // SSOT redactor covers every place a verifier command lands on disk.
+        let masked =
+            super::completion_evidence::redact_verifier_command_for_storage(&outcome.command);
+        self.evidence_set_this_turn.push(
+            super::completion_evidence::CompletionEvidence::VerifierExitZero {
+                class: outcome.class,
+                command: masked,
+            },
+        );
+        crate::logging::log_completion_evidence_observed(
+            self.current_turn_index,
+            0, // α-1: iter_index plumbing is α-2 work; emit 0 for now.
+            "verifier_exit_zero",
+            serde_json::json!({
+                "command_class": format!("{:?}", outcome.class),
+            }),
+        );
+    }
+
+    /// Issue #606 (T-1.7): post-hoc observation of an Edit/Write success
+    /// as `RepoEdit` completion evidence. The path is run through
+    /// `classify_repo_edit_path` which uses the SSOT in `util::file_classify`
+    /// and applies the DR1-001 ordering rule (`.mdx → Docs` even though
+    /// `is_implementation_file` would otherwise claim it).
+    fn observe_evidence_from_repo_edit(&mut self, path: &str) {
+        let category =
+            super::completion_evidence::classify_repo_edit_path(std::path::Path::new(path));
+        self.evidence_set_this_turn
+            .push(super::completion_evidence::CompletionEvidence::RepoEdit { category, count: 1 });
+        crate::logging::log_completion_evidence_observed(
+            self.current_turn_index,
+            0,
+            "repo_edit",
+            serde_json::json!({
+                "category": format!("{:?}", category),
+            }),
+        );
     }
 
     fn answer_only_policy_error(
