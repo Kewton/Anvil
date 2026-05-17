@@ -1,5 +1,6 @@
 use crate::modes::plan_act::WorkMode;
 use crate::tools::bash::BashCommandClass;
+use crate::util::file_classify::{is_setup_file, is_test_file};
 
 use super::completion_evidence::{CompletionEvidence, EvidenceSet, RepoEditCategory};
 use super::summary::LoopStats;
@@ -445,7 +446,7 @@ impl ExecutionProtocol {
             unrequested_changed_count(context.requested_paths, &stats.all_changed_files);
         let (changed_relevant_artifact, relevant_artifact_reason) = match self.kind {
             ProtocolKind::AnswerOnly => (stats.total_changed == 0, Some("no_repo_edits")),
-            ProtocolKind::Docs => relevant_suffix(stats, &[".md", ".mdx", ".txt", ".rst"])
+            ProtocolKind::Docs => relevant_docs_suffix(stats, &[".md", ".mdx", ".txt", ".rst"])
                 .map(|reason| (true, Some(reason)))
                 .unwrap_or((false, None)),
             ProtocolKind::Python => {
@@ -577,6 +578,19 @@ fn relevant_suffix(stats: &LoopStats, suffixes: &[&str]) -> Option<&'static str>
         .then_some("file_suffix")
 }
 
+fn relevant_docs_suffix(stats: &LoopStats, suffixes: &[&str]) -> Option<&'static str> {
+    stats
+        .all_changed_files
+        .iter()
+        .map(|path| path.strip_suffix(" (deleted)").unwrap_or(path))
+        .filter(|path| {
+            let path = std::path::Path::new(path);
+            !is_setup_file(path) && !is_test_file(path)
+        })
+        .any(|path| suffixes.iter().any(|suffix| path.ends_with(suffix)))
+        .then_some("file_suffix")
+}
+
 fn requested_path_changed(requested_paths: &[String], changed_files: &[String]) -> bool {
     !requested_paths.is_empty()
         && requested_paths.iter().any(|requested| {
@@ -672,6 +686,20 @@ mod tests {
         assert!(
             ExecutionProtocol::from_work_mode(WorkMode::TypeScriptUi)
                 .success_issue(&stats(&["src/routes/+page.svelte"], 1))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn docs_protocol_does_not_accept_setup_txt_as_usage_docs() {
+        assert!(
+            ExecutionProtocol::from_work_mode(WorkMode::Docs)
+                .success_issue(&stats(&["requirements.txt"], 1))
+                .is_some()
+        );
+        assert!(
+            ExecutionProtocol::from_work_mode(WorkMode::Docs)
+                .success_issue(&stats(&["README.md"], 1))
                 .is_none()
         );
     }

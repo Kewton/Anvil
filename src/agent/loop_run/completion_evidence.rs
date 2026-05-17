@@ -291,6 +291,14 @@ mod tests {
             classify_repo_edit_path(PathBuf::from("tsconfig.json")),
             RepoEditCategory::Setup
         );
+        assert_eq!(
+            classify_repo_edit_path(PathBuf::from("requirements.txt")),
+            RepoEditCategory::Setup
+        );
+        assert_eq!(
+            classify_repo_edit_path(PathBuf::from("pyproject.toml")),
+            RepoEditCategory::Setup
+        );
     }
 
     #[test]

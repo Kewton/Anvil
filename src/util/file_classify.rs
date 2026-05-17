@@ -48,6 +48,14 @@ pub fn is_setup_file(path: &Path) -> bool {
             | "package-lock.json"
             | "pnpm-lock.yaml"
             | "yarn.lock"
+            | "requirements.txt"
+            | "requirements-dev.txt"
+            | "pyproject.toml"
+            | "uv.lock"
+            | "poetry.lock"
+            | "pytest.ini"
+            | "tox.ini"
+            | "setup.cfg"
             | "tsconfig.json"
             | "jest.config.js"
             | "jest.config.ts"
@@ -126,6 +134,14 @@ mod tests {
             "package-lock.json",
             "pnpm-lock.yaml",
             "yarn.lock",
+            "requirements.txt",
+            "requirements-dev.txt",
+            "pyproject.toml",
+            "uv.lock",
+            "poetry.lock",
+            "pytest.ini",
+            "tox.ini",
+            "setup.cfg",
             "tsconfig.json",
             "jest.config.js",
             "jest.config.ts",

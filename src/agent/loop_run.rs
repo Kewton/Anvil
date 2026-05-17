@@ -50,6 +50,7 @@ pub mod slash_commands;
 mod spinner;
 mod success;
 mod summary;
+mod task_contract;
 mod tester;
 mod turn;
 pub(crate) mod verifier_skill;

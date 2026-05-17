@@ -4028,12 +4028,16 @@ impl Agent {
         // `success.rs::run_post_loop_success_verifier` via
         // `ProtocolKind::evidence_set_satisfies`.
         self.evidence_set_this_turn.clear();
+        let task_contract = self
+            .active_request_text()
+            .map(|request| super::task_contract::TaskContract::from_request(&request));
 
         let mut tool_calls_made_this_turn = 0usize;
         let mut repo_edit_calls_made_this_turn = 0usize;
         let mut empty_retries = 0usize;
         let mut no_tool_retries = 0usize;
         let mut repo_change_retries = 0usize;
+        let mut contract_completion_retries = 0usize;
         let mut python_test_retries = 0usize;
         let mut plan_progress_retries = 0usize;
         let mut plan_exploration_only_turns = 0usize;
@@ -5599,6 +5603,50 @@ impl Agent {
                     repo_change_retries,
                 ));
                 continue;
+            }
+
+            if self.session.mode_state.mode != ExecutionMode::Plan
+                && let Some(contract) = task_contract.as_ref()
+            {
+                let decision = contract.evaluate(&self.evidence_set_this_turn);
+                if decision.is_continue() {
+                    contract_completion_retries += 1;
+                    let missing = super::task_contract::missing_labels(&decision);
+                    if contract_completion_retries >= 3 {
+                        exit_reason = ExitReason::MissingRepoEdits;
+                        error_text = format!(
+                            "task contract incomplete; missing required artifact(s): {}",
+                            missing.join(", ")
+                        );
+                        break 'outer;
+                    }
+                    write_stdout_rendered(
+                        &format_iteration_status(
+                            last_iter,
+                            self.config.max_iterations,
+                            "Task contract",
+                            &format!(
+                                "Asked the model to complete missing artifact(s): {}.",
+                                missing.join(", ")
+                            ),
+                            self.footer.current_cols(),
+                        ),
+                        true,
+                    );
+                    log_llm_event(
+                        "agent.task_contract.incomplete",
+                        serde_json::json!({
+                            "session_id": self.session_store.session_id(),
+                            "turn_index": self.current_turn_index,
+                            "iter": last_iter,
+                            "missing": missing,
+                        }),
+                    );
+                    self.push_system_note(super::task_contract::render_contract_recovery_note(
+                        &decision,
+                    ));
+                    continue;
+                }
             }
 
             // Done

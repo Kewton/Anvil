@@ -290,13 +290,36 @@ pub fn classify_work_mode_json(raw: &str) -> ModeClassification {
     let python = contains_any(
         &lower,
         &[
-            "python", ".py", "pytest", "pip", "venv", "csv", "pandas", "python3",
+            "python",
+            ".py",
+            "pytest",
+            "pip",
+            "venv",
+            "csv",
+            "pandas",
+            "python3",
+            "fastapi",
+            "flask",
+            "django",
+            "pydantic",
+            "sqlalchemy",
         ],
     );
     let explicit_python_artifact = contains_any(
         &lower,
         &[
-            "python", ".py", "pytest", "pip", "venv", "pandas", "python3",
+            "python",
+            ".py",
+            "pytest",
+            "pip",
+            "venv",
+            "pandas",
+            "python3",
+            "fastapi",
+            "flask",
+            "django",
+            "pydantic",
+            "sqlalchemy",
         ],
     );
     let docs = contains_any(
@@ -330,6 +353,7 @@ pub fn classify_work_mode_json(raw: &str) -> ModeClassification {
             "document",
         ],
     );
+    let primary_code_task = request_has_primary_code_task(raw, &lower);
 
     let mut candidates = Vec::<WorkModeCandidate>::new();
     if explicit_no_edit || (answer_request && !explicit_edit) {
@@ -355,6 +379,10 @@ pub fn classify_work_mode_json(raw: &str) -> ModeClassification {
             confidence += 0.03;
             evidence.push("edit-intent");
         }
+        if primary_code_task && (explicit_python_artifact || explicit_ui_framework) {
+            confidence = confidence.min(0.55);
+            evidence.push("secondary-docs-for-code-task");
+        }
         candidates.push(WorkModeCandidate {
             work_mode: WorkMode::Docs,
             intent: "docs",
@@ -368,7 +396,7 @@ pub fn classify_work_mode_json(raw: &str) -> ModeClassification {
         if explicit_python_artifact {
             evidence.push("explicit-python-artifact");
         }
-        if docs && !explicit_python_artifact {
+        if docs && !primary_code_task {
             confidence = 0.52;
             evidence.push("weakened-by-docs-target");
         }
@@ -385,7 +413,7 @@ pub fn classify_work_mode_json(raw: &str) -> ModeClassification {
         if explicit_ui_framework {
             evidence.push("explicit-ui-framework");
         }
-        if docs {
+        if docs && !primary_code_task {
             confidence = confidence.min(0.48);
             evidence.push("weakened-by-docs-target");
         }
@@ -473,6 +501,87 @@ fn mode_reason(mode: WorkMode) -> &'static str {
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
+}
+
+fn request_has_primary_code_task(raw: &str, lower: &str) -> bool {
+    let production_action = contains_any(
+        lower,
+        &[
+            "create",
+            "build",
+            "develop",
+            "implement",
+            "scaffold",
+            "fix",
+            "refactor",
+        ],
+    ) || contains_any(raw, &["作成", "開発", "実装", "修正", "構築"]);
+    let code_subject = contains_any(
+        lower,
+        &[
+            "crud",
+            "endpoint",
+            "server",
+            "backend",
+            "frontend",
+            "web app",
+            "browser app",
+            "cli",
+            "component",
+            "service",
+            "module",
+        ],
+    ) || contains_ascii_token(lower, "api")
+        || contains_any(
+            raw,
+            &[
+                "エンドポイント",
+                "サーバ",
+                "バックエンド",
+                "フロントエンド",
+                "アプリ",
+                "機能",
+            ],
+        )
+        || mentions_stack_as_build_target(raw, lower);
+
+    production_action && code_subject
+}
+
+fn contains_ascii_token(haystack: &str, needle: &str) -> bool {
+    haystack.match_indices(needle).any(|(idx, _)| {
+        let before = haystack[..idx]
+            .chars()
+            .next_back()
+            .is_none_or(|ch| !ch.is_ascii_alphanumeric());
+        let after_idx = idx + needle.len();
+        let after = haystack[after_idx..]
+            .chars()
+            .next()
+            .is_none_or(|ch| !ch.is_ascii_alphanumeric());
+        before && after
+    })
+}
+
+fn mentions_stack_as_build_target(raw: &str, lower: &str) -> bool {
+    contains_any(
+        lower,
+        &[
+            "with fastapi",
+            "using fastapi",
+            "fastapi app",
+            "fastapi api",
+            "with flask",
+            "using flask",
+            "flask app",
+            "with django",
+            "using django",
+            "django app",
+        ],
+    ) || contains_any(
+        raw,
+        &["FastAPIで", "Flaskで", "Djangoで", "Pythonで", "Rustで"],
+    )
 }
 
 fn request_requires_tests(lower: &str, raw: &str) -> bool {
@@ -594,6 +703,20 @@ mod tests {
         assert_eq!(
             infer_work_mode_from_text("READMEを更新してください"),
             WorkMode::Docs
+        );
+        assert_eq!(
+            infer_work_mode_from_text("FastAPIプロジェクトのREADMEを更新してください"),
+            WorkMode::Docs
+        );
+        assert_eq!(
+            infer_work_mode_from_text(
+                "FastAPIでCRUD APIを開発してREADMEとテストコードも実装してください"
+            ),
+            WorkMode::Python
+        );
+        assert_eq!(
+            infer_work_mode_from_text("Next.jsアプリを作成してREADMEも追加してください"),
+            WorkMode::TypeScriptUi
         );
     }
 
