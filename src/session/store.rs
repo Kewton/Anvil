@@ -1,12 +1,15 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use serde::{Deserializer, Serializer};
 use sha2::{Digest, Sha256};
 
 use crate::modes::plan_act::{ExecutionMode, ModeState};
 use crate::ollama::xml_fallback::ToolCall;
 use crate::session::anvil_score::{AnvilScore, deserialize_lossy_anvil_score};
-use crate::session::feedback::{FeedbackFrame, mask_secrets, normalize_path_to_workspace};
+use crate::session::feedback::{
+    FeedbackFrame, mask_secrets, normalize_path_to_workspace, redact_verifier_command_for_storage,
+};
 use crate::session::precaution::{
     AddPrecautionOutcome, Precaution, PrecautionStatus, RetiredReason, Severity,
 };
@@ -593,6 +596,129 @@ impl ConversationMessage {
     }
 }
 
+// --- Issue #608 Phase α-2 / AP-09: VerifierInvocationRecord ---------------
+
+/// Issue #608 Phase α-2 (AP-09): persisted record of the previous turn's
+/// verifier (BuildTest) invocation. Used by the AP-09 rerun-trigger handler
+/// in `turn.rs` to re-present the last verifier command when the user types
+/// `再実行` / `rerun` / etc.
+///
+/// All string fields flowing through `command` are redacted via
+/// [`redact_verifier_command_for_storage`] on save AND load (DR4-002 SSOT
+/// + Defense in Depth — see design 設計判断 #7 mask layer diagram).
+#[derive(Default, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct VerifierInvocationRecord {
+    /// Verifier command string. Redacted on both save and load.
+    #[serde(
+        default,
+        serialize_with = "serialize_redacted_command",
+        deserialize_with = "deserialize_redacted_command"
+    )]
+    pub command: String,
+    /// Exit code recorded for this invocation. `0` for success; other values
+    /// indicate verifier failure.
+    #[serde(default)]
+    pub exit_code: i32,
+    /// RFC3339-formatted UTC timestamp ("YYYY-MM-DDTHH:MM:SSZ"). Validation
+    /// is intentionally NOT performed at deserialize time (design 判断 #4 (a) —
+    /// same tier as `case_photon_bridge::Provenance::extracted_at`).
+    #[serde(default = "default_recorded_at_epoch")]
+    pub recorded_at: String,
+}
+
+/// Default `recorded_at` for legacy session.json that predates the field.
+/// Epoch-anchored so that callers can distinguish "no record" from "real
+/// record" if needed.
+fn default_recorded_at_epoch() -> String {
+    "1970-01-01T00:00:00Z".to_string()
+}
+
+/// AP-09 field-level serde hook: redact the verifier command string before
+/// it is written to disk. Funnels through the session-layer SSOT redactor
+/// (`mask_secrets` + auth header + control-char + 4096-byte cap).
+fn serialize_redacted_command<S>(cmd: &str, ser: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let redacted = redact_verifier_command_for_storage(cmd);
+    ser.serialize_str(&redacted)
+}
+
+/// AP-09 field-level serde hook: re-apply the SSOT redactor at deserialize
+/// time so a legacy / tampered session.json cannot reintroduce a raw secret
+/// into memory. Non-string / null / object / array values fall back to the
+/// empty string (lossy — see design 設計判断 #7 / S7-004).
+fn deserialize_redacted_command<'de, D>(de: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let raw: serde_json::Value = serde_json::Value::deserialize(de)?;
+    let s = match raw {
+        serde_json::Value::String(s) => s,
+        _ => String::new(),
+    };
+    Ok(redact_verifier_command_for_storage(&s))
+}
+
+/// AP-09 field-level serde hook for `Option<String>` variant. Same lossy
+/// fallback as [`deserialize_redacted_command`] but yields `None` for the
+/// missing / non-string cases (so a tampered file collapses cleanly to
+/// "no last verifier command").
+fn deserialize_optional_redacted_command<'de, D>(de: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let raw: serde_json::Value = serde_json::Value::deserialize(de)?;
+    let s_opt = match raw {
+        serde_json::Value::String(s) if !s.is_empty() => Some(s),
+        _ => None,
+    };
+    Ok(s_opt.map(|s| redact_verifier_command_for_storage(&s)))
+}
+
+/// AP-09 field-level serde hook: same redaction on the way out for the
+/// snapshot-level `Option<String>` field.
+fn serialize_optional_redacted_command<S>(cmd: &Option<String>, ser: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match cmd {
+        Some(value) => {
+            let redacted = redact_verifier_command_for_storage(value);
+            ser.serialize_some(&redacted)
+        }
+        None => ser.serialize_none(),
+    }
+}
+
+/// AP-09 field-level serde hook: lossy deserialization of
+/// `last_verifier_invocation`. Object inputs deserialize normally
+/// (per-field redactor reapplies); non-object inputs collapse to `None` so a
+/// tampered file with `"last_verifier_invocation": "bad"` cannot abort the
+/// whole resume.
+fn deserialize_optional_verifier_invocation<'de, D>(
+    de: D,
+) -> Result<Option<VerifierInvocationRecord>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let raw: serde_json::Value = serde_json::Value::deserialize(de)?;
+    match raw {
+        serde_json::Value::Object(_) => {
+            // Lossy: any deserialize failure (e.g. oversized field, unknown
+            // shape) collapses to a default-initialized record so resume is
+            // never blocked by a malformed nested object.
+            let rec: VerifierInvocationRecord = serde_json::from_value(raw).unwrap_or_default();
+            Ok(Some(rec))
+        }
+        serde_json::Value::Null => Ok(None),
+        _ => Ok(None),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub struct SessionSnapshot {
     pub mode_state: ModeState,
@@ -714,6 +840,29 @@ pub struct SessionSnapshot {
     /// called multiple times inside run_actor_loop. Reset at run_actor_loop head.
     #[serde(skip, default)]
     pub context_pack_sent_this_turn: bool,
+    /// Issue #608 Phase α-2 (AP-09): persisted last verifier command from
+    /// the previous turn (redacted via `redact_verifier_command_for_storage`
+    /// SSOT on both save and load). Used by the rerun-trigger handler in
+    /// `turn.rs` to re-present the command when the user types `再実行` /
+    /// `rerun` / etc. Lossy deserializer (wrong-type / null / oversized
+    /// inputs → `None`) so a tampered session.json cannot block resume.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_redacted_command",
+        deserialize_with = "deserialize_optional_redacted_command"
+    )]
+    pub last_verifier_command: Option<String>,
+    /// Issue #608 Phase α-2 (AP-09): full record of the previous turn's
+    /// verifier invocation (command + exit_code + recorded_at). Companion
+    /// to `last_verifier_command`; the standalone field is kept for
+    /// backward compatibility / quick string access.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_verifier_invocation"
+    )]
+    pub last_verifier_invocation: Option<VerifierInvocationRecord>,
 }
 
 impl SessionSnapshot {
@@ -1339,5 +1488,241 @@ mod tests {
         assert!(!json.contains("auto_promote_called_this_turn"));
         let decoded: SessionSnapshot = serde_json::from_str(&json).unwrap();
         assert!(!decoded.auto_promote_called_this_turn);
+    }
+
+    // --- Issue #608 Phase α-2 (AP-09): VerifierInvocationRecord regression ---
+
+    use super::VerifierInvocationRecord;
+
+    /// Helper: serialize a default `SessionSnapshot` and splice a top-level
+    /// JSON field into it. Avoids hand-rolling the full schema in every
+    /// regression test below (resilient to future schema growth).
+    fn snapshot_json_with_field(field_name: &str, value: serde_json::Value) -> String {
+        let snap = SessionSnapshot::default();
+        let mut json = serde_json::to_value(&snap).unwrap();
+        if let serde_json::Value::Object(ref mut map) = json {
+            map.insert(field_name.to_string(), value);
+        }
+        serde_json::to_string(&json).unwrap()
+    }
+
+    /// VR-04: secret-bearing verifier command is redacted on save (via
+    /// `serialize_redacted_command`) so the on-disk JSON never carries the
+    /// raw token even if the in-memory snapshot held it (defensive).
+    #[test]
+    fn last_verifier_command_is_redacted_on_serialize() {
+        let snap = SessionSnapshot {
+            last_verifier_command: Some(
+                "cargo test --env api_key=ghp_supersecretvalueABCDEFGHIJKLMNOP".to_string(),
+            ),
+            ..SessionSnapshot::default()
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(
+            !json.contains("ghp_supersecretvalueABCDEFGHIJKLMNOP"),
+            "raw token leaked into serialized snapshot: {json}"
+        );
+        assert!(
+            json.contains("***"),
+            "expected redaction sentinel in serialized snapshot: {json}"
+        );
+    }
+
+    /// VR-04 direct-deserialize: a tampered session.json that already
+    /// contains a raw secret must be re-masked on the way IN, not just on
+    /// write. The field-level `deserialize_redacted_command` re-applies the
+    /// SSOT redactor.
+    #[test]
+    fn last_verifier_command_is_redacted_on_direct_deserialize() {
+        let raw = snapshot_json_with_field(
+            "last_verifier_command",
+            serde_json::Value::String(
+                "cargo test --env api_key=ghp_supersecretvalueABCDEFGHIJKLMNOP".to_string(),
+            ),
+        );
+        let snap: SessionSnapshot = serde_json::from_str(&raw).unwrap();
+        let stored = snap.last_verifier_command.unwrap();
+        assert!(
+            !stored.contains("ghp_supersecretvalueABCDEFGHIJKLMNOP"),
+            "raw token leaked into deserialized snapshot: {stored}"
+        );
+        assert!(
+            stored.contains("***"),
+            "expected redaction sentinel in deserialized snapshot: {stored}"
+        );
+    }
+
+    /// VR-04: Authorization header inside a stored verifier command is
+    /// redacted by the SSOT pipeline (`auth_header_regex` → `<REDACTED>`).
+    #[test]
+    fn last_verifier_command_redacts_authorization_header() {
+        let snap = SessionSnapshot {
+            last_verifier_command: Some(
+                "curl -H 'Authorization: Bearer abc123def456' http://x".to_string(),
+            ),
+            ..SessionSnapshot::default()
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(!json.contains("abc123def456"));
+        assert!(json.contains("<REDACTED>"));
+    }
+
+    /// VR-06 legacy compat: a session.json missing `last_verifier_command`
+    /// and `last_verifier_invocation` deserializes cleanly with both fields
+    /// defaulting to `None`. We start from a default snapshot serialization
+    /// and strip those keys to simulate the legacy file.
+    #[test]
+    fn legacy_session_json_without_verifier_fields_deserializes() {
+        let snap = SessionSnapshot::default();
+        let mut json = serde_json::to_value(&snap).unwrap();
+        if let serde_json::Value::Object(ref mut map) = json {
+            map.remove("last_verifier_command");
+            map.remove("last_verifier_invocation");
+        }
+        let raw = serde_json::to_string(&json).unwrap();
+        let decoded: SessionSnapshot = serde_json::from_str(&raw).unwrap();
+        assert!(decoded.last_verifier_command.is_none());
+        assert!(decoded.last_verifier_invocation.is_none());
+    }
+
+    /// VR-06 lossy: wrong-type `last_verifier_command` (array / object /
+    /// null) collapses to `None` so a tampered session.json cannot block
+    /// resume (design 設計判断 #7 / S7-004).
+    #[test]
+    fn last_verifier_command_lossy_for_wrong_types() {
+        let wrong_types = [
+            serde_json::Value::Null,
+            serde_json::Value::Array(vec![]),
+            serde_json::Value::Object(serde_json::Map::new()),
+            serde_json::Value::Number(123.into()),
+        ];
+        for v in wrong_types {
+            let raw = snapshot_json_with_field("last_verifier_command", v.clone());
+            let snap: SessionSnapshot = serde_json::from_str(&raw).unwrap();
+            assert!(
+                snap.last_verifier_command.is_none(),
+                "wrong-type last_verifier_command must collapse to None: {v}"
+            );
+        }
+    }
+
+    /// VR-06 lossy: wrong-type `last_verifier_invocation` (string / array /
+    /// number) collapses to `None`.
+    #[test]
+    fn last_verifier_invocation_lossy_for_wrong_types() {
+        let wrong_types = [
+            serde_json::Value::String("bad".to_string()),
+            serde_json::Value::Array(vec![serde_json::Value::from(1), serde_json::Value::from(2)]),
+            serde_json::Value::Number(42.into()),
+        ];
+        for v in wrong_types {
+            let raw = snapshot_json_with_field("last_verifier_invocation", v.clone());
+            let snap: SessionSnapshot = serde_json::from_str(&raw).unwrap();
+            assert!(
+                snap.last_verifier_invocation.is_none(),
+                "wrong-type last_verifier_invocation must collapse to None: {v}"
+            );
+        }
+    }
+
+    /// VR-06: partial `VerifierInvocationRecord` (missing `recorded_at` /
+    /// `exit_code` / `command`) deserializes with default fillers.
+    #[test]
+    fn verifier_invocation_record_partial_fields_default_in() {
+        let raw = snapshot_json_with_field(
+            "last_verifier_invocation",
+            serde_json::json!({"command": "cargo test"}),
+        );
+        let snap: SessionSnapshot = serde_json::from_str(&raw).unwrap();
+        let rec = snap.last_verifier_invocation.unwrap();
+        assert_eq!(rec.command, "cargo test");
+        assert_eq!(rec.exit_code, 0);
+        // recorded_at default: epoch.
+        assert_eq!(rec.recorded_at, "1970-01-01T00:00:00Z");
+    }
+
+    /// VR-04 direct-deserialize for nested record: a raw secret inside
+    /// `last_verifier_invocation.command` is re-masked on load.
+    #[test]
+    fn verifier_invocation_record_command_is_redacted_on_deserialize() {
+        let raw = snapshot_json_with_field(
+            "last_verifier_invocation",
+            serde_json::json!({
+                "command": "cargo test --env api_key=ghp_supersecretvalueABCDEFGHIJKLMNOP",
+                "exit_code": 1,
+                "recorded_at": "2026-05-17T00:00:00Z"
+            }),
+        );
+        let snap: SessionSnapshot = serde_json::from_str(&raw).unwrap();
+        let rec = snap.last_verifier_invocation.unwrap();
+        assert!(
+            !rec.command.contains("ghp_supersecretvalueABCDEFGHIJKLMNOP"),
+            "raw token leaked into deserialized record: {}",
+            rec.command
+        );
+        assert!(rec.command.contains("***"));
+        assert_eq!(rec.exit_code, 1);
+        assert_eq!(rec.recorded_at, "2026-05-17T00:00:00Z");
+    }
+
+    /// VR-13: `workspace_key` (a `*_key`-suffixed field) survives save/load
+    /// round-trip even though `mask_payload_inplace` would erase it via the
+    /// key-name heuristic. The Phase α-2 redactor is field-scoped to
+    /// verifier commands only and never touches `workspace_key` (design
+    /// 設計判断 #7 — `mask_payload_inplace` MUST NOT be applied to the
+    /// SessionSnapshot whole tree).
+    #[test]
+    fn workspace_key_survives_round_trip_unchanged() {
+        let snap = SessionSnapshot {
+            workspace_key: "anvil-ws-abcdef".to_string(),
+            ..SessionSnapshot::default()
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(json.contains("anvil-ws-abcdef"));
+        let decoded: SessionSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.workspace_key, "anvil-ws-abcdef");
+    }
+
+    /// VR-04: `mask_payload_inplace`-style erasure of `*_key` fields does
+    /// NOT happen for `workspace_key` on save/load. This pins the
+    /// "field-scoped redactor only" invariant.
+    #[test]
+    fn snapshot_id_survives_round_trip_unchanged() {
+        let snap = SessionSnapshot {
+            id: "abcd-1234-uuid".to_string(),
+            ..SessionSnapshot::default()
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(json.contains("abcd-1234-uuid"));
+        let decoded: SessionSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.id, "abcd-1234-uuid");
+    }
+
+    /// VR-06: empty-string `last_verifier_command` collapses to `None`
+    /// (via the optional deserializer's empty-string filter).
+    #[test]
+    fn last_verifier_command_empty_string_collapses_to_none() {
+        let raw = snapshot_json_with_field(
+            "last_verifier_command",
+            serde_json::Value::String("".into()),
+        );
+        let snap: SessionSnapshot = serde_json::from_str(&raw).unwrap();
+        assert!(snap.last_verifier_command.is_none());
+    }
+
+    /// VR-04: `VerifierInvocationRecord` round-trips through serde without
+    /// losing the redacted-on-write form (the field-level serializer
+    /// re-applies redaction, but a value that was already-redacted is a
+    /// fixed point).
+    #[test]
+    fn verifier_invocation_record_round_trip_after_redaction() {
+        let rec = VerifierInvocationRecord {
+            command: "cargo test --release".to_string(),
+            exit_code: 0,
+            recorded_at: "2026-05-17T12:00:00Z".to_string(),
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        let back: VerifierInvocationRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, rec);
     }
 }

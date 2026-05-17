@@ -566,10 +566,19 @@ pub fn run_photon_rollout_check(state_root: &Path, workspace_root: &Path) -> Res
 /// Promotes successful `CaseRecord` entries to photon `ActionSummary` v0.2
 /// format. Phase A is local-only: no HTTP POST, dry-run or `--output FILE`.
 ///
-/// `session` and `case_id` narrow the scope; `--all` is an explicit "all
-/// cases" flag (for safety, matching `--all` style elsewhere). Non-dry-run
-/// without `--yes` falls back to dry-run with a stderr warning so misconfigured
-/// CI jobs cannot silently write the dedup log.
+/// Selector contract (CB-003, codex review fix): **exactly one** of
+/// `--session` / `--case-id` / `--all` MUST be supplied. Supplying zero
+/// or two-or-more selectors is rejected with a descriptive error, so a
+/// caller running `anvil sessions photon-promote --print-summary` cannot
+/// accidentally expose every CaseRecord's `ActionSummary` to stdout.
+///
+/// `--session` is currently **unsupported**: Phase A's on-disk `CaseRecord`
+/// does not carry the originating session id, so the selector cannot be
+/// honored without leaking unrelated cases. Use `--case-id <id>` for a
+/// single case or `--all` for an explicit all-cases run.
+///
+/// Non-dry-run without `--yes` falls back to dry-run with a stderr warning
+/// so misconfigured CI jobs cannot silently write the dedup log.
 #[allow(clippy::too_many_arguments)]
 pub fn run_photon_promote(
     workspace_root: &Path,
@@ -592,7 +601,9 @@ pub fn run_photon_promote(
 
     let _ = workspace_root;
 
-    // Mutual exclusion: --session / --case-id / --all are mutually exclusive.
+    // CB-003: selector exactly-one. Reject:
+    //   * `chosen == 0` — accidental "promote everything" via no flag.
+    //   * `chosen >= 2` — ambiguous selection.
     let mut chosen = 0;
     if session.is_some() {
         chosen += 1;
@@ -603,8 +614,26 @@ pub fn run_photon_promote(
     if all {
         chosen += 1;
     }
+    if chosen == 0 {
+        return Err(
+            "exactly one of --session, --case-id, --all must be specified; \
+             use --all to promote every successful CaseRecord explicitly"
+                .to_string(),
+        );
+    }
     if chosen > 1 {
         return Err("--session, --case-id, --all are mutually exclusive".to_string());
+    }
+
+    // CB-003: --session is intentionally unsupported in Phase A. CaseRecord
+    // does not store the originating session id on disk, so we cannot scope
+    // the operation to a single session without leaking unrelated cases.
+    // Reject explicitly so users see the limitation immediately instead of
+    // discovering it via a silently-broadened scope.
+    if session.is_some() {
+        return Err(
+            "--session filtering is not yet supported; use --case-id <id> or --all".to_string(),
+        );
     }
 
     // Validate --case-id (allowlist) before scanning.
@@ -1413,23 +1442,11 @@ mod tests {
                 ConversationMessage::assistant("hi".into(), vec![]),
             ],
             checkpoints: vec!["cp1".into()],
-            native_tools_disabled: false,
-            working_memory: Default::default(),
-            last_feedback: None,
-            eligible_feedback_recorded_this_turn: false,
-            last_anvil_score: None,
-            unsafe_blocks_this_turn: 0,
-            consecutive_no_progress_turns: 0,
-            repo_edit_succeeded_this_turn: false,
-            touched_files_at_turn_start: Vec::new(),
-            case_record_extracted_this_turn: false,
-            case_retrieval_invoked_this_turn: false,
-            anti_pattern_extracted_this_turn: false,
-            auto_promote_called_this_turn: false,
-            anti_pattern_retrieval_invoked_this_turn: false,
-            context_pack_sent_this_turn: false,
-            iter_count_this_turn: 0,
-            tool_calls_this_turn: 0,
+            // Issue #608 (VR-13): converted the previously fully-enumerated
+            // SessionSnapshot literal to a struct-update-syntax form so new
+            // turn-local / persistence fields don't break the fixture on each
+            // schema growth.
+            ..SessionSnapshot::default()
         };
         let v = ShowView::from_snapshot(&snap);
         assert_eq!(v.id, "sid");

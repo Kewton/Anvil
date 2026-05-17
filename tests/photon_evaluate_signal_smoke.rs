@@ -1038,3 +1038,63 @@ fn nps07_resume_does_not_inherit_counters() {
         "deserialized SessionSnapshot must default tool_calls_this_turn to 0"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #608 Phase α-2 (AP-10 / 案A): context_pack_event schema invariant +
+// Case E expansion regression.
+//
+// VR-09 invariant: the case_pack_event keys remain stable — adding the
+// same-turn verifier success signal (Case E expansion) is a derive-only
+// change to `derive_photon_feedback_outcome`. The wire shape (key set,
+// outcome static allowlist) is unchanged so any photon-side consumer can
+// continue parsing without schema migration.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ap10_context_pack_event_keys_unchanged_after_case_e_expansion() {
+    let _ = shared_log_path();
+    let session_id = "ap10-context-pack-event-keys";
+
+    let mut photon_server = mockito::Server::new();
+    let _pack_mock = photon_server
+        .mock("POST", "/v1/context/pack")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(mock_context_pack_body(1))
+        .create();
+    let (capture, _eval_mock) = mock_evaluate_with_capture(&mut photon_server);
+
+    let (mut agent, _dir) = build_live_agent(session_id, photon_server.url(), false, 1000);
+    let _ = agent.process_line("hello", false);
+
+    let body = first_eval_body_as_json(&capture);
+    let event = body
+        .get("context_pack_event")
+        .expect("context_pack_event present");
+    // The key set is fixed by 案A (Issue #608 Phase α-2 design 設計判断 #1).
+    // Case E expansion is a same-turn derive only; no key was added.
+    let expected_keys: std::collections::HashSet<&str> = [
+        "context_pack_request_id",
+        "adoption_status",
+        "evidence_expand_requested",
+        "evidence_ids_expanded",
+        "items_adopted_count",
+        "items_ignored_count",
+        "summary_ids_adopted",
+        "summary_ids_adopted_truncated",
+        "outcome",
+        "outcome_detail",
+    ]
+    .into_iter()
+    .collect();
+    let actual_keys: std::collections::HashSet<&str> = event
+        .as_object()
+        .expect("context_pack_event must be an object")
+        .keys()
+        .map(|s| s.as_str())
+        .collect();
+    assert_eq!(
+        actual_keys, expected_keys,
+        "context_pack_event key set must be schema-stable (案A invariant)"
+    );
+}

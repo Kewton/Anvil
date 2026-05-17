@@ -173,19 +173,60 @@ pub fn is_verifier_active(score: &AnvilScore) -> bool {
 /// Defensive re-evaluation of CaseRecord persistence success criteria.
 /// CaseRecord is already persisted only on success turns; this is a second
 /// layer (DR1-001 / design judgment #4.5).
+///
+/// Issue #608 Phase α-2 (AP-10 / 設計判断 #1 + 案A): adoption signal
+/// interpretation extended via [`is_tests_only_success`] — a turn that
+/// passed tests but produced no user-visible artifact still counts as
+/// success when `build_passed` is not explicitly `Some(false)`. The case
+/// expressly excludes a verifier failure (`build_passed == Some(false)`)
+/// from promotion eligibility.
 pub fn is_eligible_for_promotion(case: &CaseRecord) -> bool {
     let score = &case.outcome_score;
     if is_verifier_active(score) {
-        score.build_passed == Some(true)
+        // CB-002 (codex review fix): full_pass MUST also require
+        // `unsafe_actions_blocked == 0` to prevent a CaseRecord with an
+        // unsafe command blocked this turn from being promoted into a
+        // photon seed solely because build / tests / artifact were green.
+        // This brings the full_pass branch in line with the verifier-less
+        // fallback and `is_tests_only_success` (both already enforce
+        // `unsafe_actions_blocked == 0`).
+        let full_pass = score.build_passed == Some(true)
             && score.tests_passed == Some(true)
             && score.user_visible_artifact
-            && score.consecutive_no_progress_turns == 0
+            && score.unsafe_actions_blocked == 0
+            && score.consecutive_no_progress_turns == 0;
+        // Tests-only success (Issue #608 / AP-10 case_photon_bridge
+        // interpretation):
+        //   - tests passed,
+        //   - user_visible_artifact is false,
+        //   - build_passed is NOT explicitly `Some(false)` (i.e. None or true),
+        //   - safety guards are clean.
+        let tests_only = is_tests_only_success(score);
+        full_pass || tests_only
     } else {
         // verifier-less fallback: use AnvilScore-persisted derived values.
         score.user_visible_artifact
             && score.unsafe_actions_blocked == 0
             && score.consecutive_no_progress_turns == 0
     }
+}
+
+/// Issue #608 Phase α-2 (AP-10 / 設計判断 #1 + 案A): tests-only success
+/// interpretation for adoption signal. Returns `true` iff:
+///   * `tests_passed == Some(true)`,
+///   * `user_visible_artifact == false`,
+///   * `build_passed` is NOT `Some(false)` (None or Some(true) accepted),
+///   * `unsafe_actions_blocked == 0`,
+///   * `consecutive_no_progress_turns == 0`.
+///
+/// DR3-002: only references `AnvilScore` fields; does NOT import from agent
+/// or photon layers (no `CompletionEvidence` / `PhotonOutcomeInputs`).
+pub fn is_tests_only_success(score: &AnvilScore) -> bool {
+    score.tests_passed == Some(true)
+        && !score.user_visible_artifact
+        && score.build_passed != Some(false)
+        && score.unsafe_actions_blocked == 0
+        && score.consecutive_no_progress_turns == 0
 }
 
 /// 3-tier confidence prior derivation (design judgment #2 / case B).
@@ -667,6 +708,84 @@ mod tests {
         c.outcome_score.tests_passed = None;
         c.outcome_score.user_visible_artifact = false;
         assert!(!is_eligible_for_promotion(&c));
+    }
+
+    // --- Issue #608 Phase α-2 (AP-10): tests-only success regression ----
+
+    /// AP-10: tests pass, no artifact, build_passed = None →
+    /// tests-only success interpretation kicks in.
+    #[test]
+    fn tests_only_success_with_build_none() {
+        let mut c = baseline_case("case_aaaaaaaaaaaaaaaaaaaaaaaa");
+        c.outcome_score.build_passed = None;
+        c.outcome_score.tests_passed = Some(true);
+        c.outcome_score.user_visible_artifact = false;
+        c.outcome_score.unsafe_actions_blocked = 0;
+        c.outcome_score.consecutive_no_progress_turns = 0;
+        assert!(is_tests_only_success(&c.outcome_score));
+        assert!(is_eligible_for_promotion(&c));
+    }
+
+    /// AP-10: tests pass, no artifact, build_passed = Some(true) →
+    /// tests-only success interpretation kicks in.
+    #[test]
+    fn tests_only_success_with_build_true() {
+        let mut c = baseline_case("case_aaaaaaaaaaaaaaaaaaaaaaaa");
+        c.outcome_score.build_passed = Some(true);
+        c.outcome_score.tests_passed = Some(true);
+        c.outcome_score.user_visible_artifact = false;
+        assert!(is_tests_only_success(&c.outcome_score));
+        assert!(is_eligible_for_promotion(&c));
+    }
+
+    /// AP-10 design 設計判断 #1: build_passed == Some(false) blocks
+    /// promotion even when tests_passed=true (verifier failure > tests
+    /// success).
+    #[test]
+    fn tests_only_success_blocked_when_build_failed() {
+        let mut c = baseline_case("case_aaaaaaaaaaaaaaaaaaaaaaaa");
+        c.outcome_score.build_passed = Some(false);
+        c.outcome_score.tests_passed = Some(true);
+        c.outcome_score.user_visible_artifact = false;
+        assert!(!is_tests_only_success(&c.outcome_score));
+        assert!(!is_eligible_for_promotion(&c));
+    }
+
+    /// AP-10: tests_passed = None or Some(false) → NOT a tests-only success.
+    #[test]
+    fn tests_only_success_requires_tests_passed_true() {
+        let mut c = baseline_case("case_aaaaaaaaaaaaaaaaaaaaaaaa");
+        c.outcome_score.tests_passed = None;
+        c.outcome_score.user_visible_artifact = false;
+        assert!(!is_tests_only_success(&c.outcome_score));
+
+        c.outcome_score.tests_passed = Some(false);
+        assert!(!is_tests_only_success(&c.outcome_score));
+    }
+
+    /// AP-10: unsafe_actions_blocked > 0 disqualifies tests-only success.
+    #[test]
+    fn tests_only_success_blocked_by_unsafe_actions() {
+        let mut c = baseline_case("case_aaaaaaaaaaaaaaaaaaaaaaaa");
+        c.outcome_score.build_passed = None;
+        c.outcome_score.tests_passed = Some(true);
+        c.outcome_score.user_visible_artifact = false;
+        c.outcome_score.unsafe_actions_blocked = 1;
+        assert!(!is_tests_only_success(&c.outcome_score));
+        assert!(!is_eligible_for_promotion(&c));
+    }
+
+    /// AP-10: a turn that already has user_visible_artifact=true takes the
+    /// `full_pass` path, NOT the tests-only path.
+    #[test]
+    fn tests_only_success_does_not_fire_when_artifact_present() {
+        let mut c = baseline_case("case_aaaaaaaaaaaaaaaaaaaaaaaa");
+        c.outcome_score.build_passed = Some(true);
+        c.outcome_score.tests_passed = Some(true);
+        c.outcome_score.user_visible_artifact = true;
+        assert!(!is_tests_only_success(&c.outcome_score));
+        // Promotion still eligible — via the full_pass branch.
+        assert!(is_eligible_for_promotion(&c));
     }
 
     // --- derive_confidence_prior --------------------------------------------

@@ -512,10 +512,14 @@ pub fn run_with_outcome(
                 interrupted: true,
                 class,
             };
+            // Issue #608 AP-08: BuildTest output bodies get the
+            // pytest/cargo/npm summary + tail trim formatter applied before
+            // the byte cap (design §4.6 ordering). Other classes pass through.
+            let body = apply_test_output_formatter_if_build_test(class, &combined);
             return Ok((
                 format!(
                     "exit_code=-1\ninterrupted=true\n{}",
-                    truncate_output(&combined, 20_000)
+                    truncate_output(&body, 20_000)
                 ),
                 outcome,
             ));
@@ -537,11 +541,13 @@ pub fn run_with_outcome(
                 interrupted: false,
                 class,
             };
+            // Issue #608 AP-08: BuildTest body formatter (see above).
+            let body = apply_test_output_formatter_if_build_test(class, &combined);
             return Ok((
                 format!(
                     "exit_code=-1\ntimed_out=true\ntimeout_secs={}\n{}",
                     limit.as_secs(),
-                    truncate_output(&combined, 20_000)
+                    truncate_output(&body, 20_000)
                 ),
                 outcome,
             ));
@@ -567,14 +573,34 @@ pub fn run_with_outcome(
         interrupted: false,
         class,
     };
+    // Issue #608 AP-08: BuildTest output bodies get the test_output
+    // formatter applied before the byte cap (design §4.6 ordering invariant).
+    // Bash metadata (`exit_code=`) stays at the head of the tool result.
+    let body = apply_test_output_formatter_if_build_test(class, &combined);
     Ok((
         format!(
             "exit_code={}\n{}",
             exit_code.unwrap_or(-1),
-            truncate_output(&combined, 20_000)
+            truncate_output(&body, 20_000)
         ),
         outcome,
     ))
+}
+
+/// Issue #608 AP-08 helper: apply the `test_output` formatter only when the
+/// class is `BuildTest`. Other classes pass through unchanged so this hook
+/// does not alter `ls` / `git status` / arbitrary `Mutating` output shapes.
+///
+/// Ordering invariant (design §4.6): formatter runs BEFORE the byte cap so
+/// the FAILED summary at the head of the body is preserved even after a
+/// 20_000-byte truncate. Bash metadata (`exit_code=`) is prepended by the
+/// caller so it stays at the very head of the tool result string.
+fn apply_test_output_formatter_if_build_test(class: BashCommandClass, combined: &str) -> String {
+    if matches!(class, BashCommandClass::BuildTest) {
+        crate::tools::test_output::format_for_tool_result(combined)
+    } else {
+        combined.to_string()
+    }
 }
 
 pub fn classify_command(command: &str) -> BashCommandClass {

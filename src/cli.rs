@@ -137,14 +137,20 @@ pub enum SessionsAction {
     PhotonRolloutCheck {},
     /// Promote successful CaseRecord entries to photon seed format
     /// (Issue #593, Phase A — manual CLI + dry-run + JSONL local output).
+    /// Exactly one of --session / --case-id / --all is required. --session
+    /// is currently UNSUPPORTED in Phase A (CaseRecord does not carry the
+    /// originating session id on disk).
     PhotonPromote {
-        /// Promote cases from a specific session id only.
+        /// (Phase A: UNSUPPORTED, returns error). Reserved for Phase B
+        /// where CaseRecord will carry the originating session id.
         #[arg(long)]
         session: Option<String>,
         /// Promote a single case by id.
         #[arg(long = "case-id")]
         case_id: Option<String>,
-        /// Promote all cases in this workspace.
+        /// Promote every successful CaseRecord in this workspace
+        /// (explicit opt-in; required when neither --session nor
+        /// --case-id is given).
         #[arg(long)]
         all: bool,
         /// Show what would be promoted without writing log or output file.

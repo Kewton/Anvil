@@ -179,6 +179,16 @@ pub(crate) struct PhotonOutcomeInputs<'a> {
     /// Used by Case F no-progress detection (`== false` is one of the four
     /// AND conditions — AnswerOnly turns are expected to make zero edits).
     pub work_mode_is_answer_only: bool,
+    /// Issue #608 Phase α-2 (AP-10 / 設計判断 #2 + #3): same-turn signal
+    /// that the agent observed a `VerifierExitZero` evidence entry (i.e.
+    /// a BuildTest invocation exited 0 and passed the DR4-002 gate).
+    /// Derived from `evidence_set_this_turn` at the production callsite
+    /// (turn.rs:3529 周辺) — no separate SessionSnapshot flag (design
+    /// 設計判断 #3 (B)). Case E in `derive_photon_feedback_outcome` ORs
+    /// this signal with `AnvilScore.user_visible_artifact` so a successful
+    /// verifier run still earns a `success` outcome even when no Write /
+    /// Edit produced an on-disk artifact (e.g. read-only repos).
+    pub verifier_exit_zero_this_turn: bool,
 }
 
 /// Issue #601 (S5-001 / 設計判断 #4 (b)): unified return type for
@@ -234,6 +244,219 @@ pub(crate) fn case_f_condition_met(inputs: &PhotonOutcomeInputs<'_>) -> bool {
 /// import the symbol via the `pub use` re-export added in
 /// `src/agent/loop_run.rs`.
 pub const PHOTON_OUTCOME_DETAIL_NO_PROGRESS_DESPITE_INJECT: &str = "no_progress_despite_inject";
+
+// ---------------------------------------------------------------------------
+// Issue #608 Phase α-2 (AP-09): rerun-trigger keyword detection (pure helper).
+// ---------------------------------------------------------------------------
+
+/// Issue #608 Phase α-2 (AP-09 / 設計判断 #5): detect whether a user message
+/// is a "re-run the verifier" trigger. Five fixed keywords (design 設計判断
+/// #5 / A): `再実行`, `もう一度`, `もう 1 回`, `やり直して`, `rerun`.
+///
+/// Normalization (design 設計判断 #5):
+///   * Fullwidth ASCII letters / digits (`Ａ`-`Ｚ` / `ａ`-`ｚ` / `０`-`９`) and
+///     fullwidth space (`U+3000`) are mapped to their halfwidth ASCII
+///     counterparts.
+///   * Result is lowercased (ASCII case-folded).
+///   * Japanese keywords use a "space-collapsed" view (whitespace stripped)
+///     for `contains` matching so `もう 1 回` matches `もう1回`.
+///   * `rerun` ASCII keyword adds a word-boundary check on the
+///     **non-space-stripped** normalized string (the surrounding chars
+///     must NOT be ASCII alphanumeric) so `interrupt`, `prerun`,
+///     `current-run`, `rerunning` are negative while `please rerun the
+///     tests` is positive.
+///   * Japanese negative phrasings such as `再実行不要` / `やり直さない` still
+///     match (受容方針 — false positives are preferred to false negatives,
+///     per design 設計判断 #5).
+///
+/// Pure / safe to call on any UTF-8 string. No external regex dependency.
+pub(crate) fn is_rerun_trigger(msg: &str) -> bool {
+    let normalized = normalize_rerun_trigger_input(msg);
+    // ASCII keyword `rerun`: check word-boundary on the normalized
+    // (whitespace-preserving) form. Whitespace between letters now acts as a
+    // boundary so `please rerun ...` matches.
+    if contains_rerun_with_word_boundary(&normalized) {
+        return true;
+    }
+    // Japanese keywords: collapse ASCII whitespace + fullwidth space so
+    // `もう 1 回` matches `もう1回`. Japanese keywords don't need
+    // word-boundaries (contains-based per design 設計判断 #5).
+    let collapsed: String = normalized.chars().filter(|c| !c.is_whitespace()).collect();
+    const JA_KEYWORDS: &[&str] = &[
+        "再実行",
+        "もう一度",
+        "もう1回",
+        "もう一回",
+        "やり直して",
+        "やり直さ",
+    ];
+    JA_KEYWORDS.iter().any(|kw| collapsed.contains(kw))
+}
+
+/// AP-09 normalize: fullwidth ASCII → halfwidth ASCII (incl. fullwidth space
+/// `U+3000` → ASCII space), lowercase.
+fn normalize_rerun_trigger_input(msg: &str) -> String {
+    let mut out = String::with_capacity(msg.len());
+    for c in msg.chars() {
+        match c {
+            // Fullwidth uppercase Ａ..Ｚ → halfwidth A..Z (then lowercased below).
+            'Ａ'..='Ｚ' => out.push((c as u32 - 'Ａ' as u32 + 'A' as u32) as u8 as char),
+            // Fullwidth lowercase ａ..ｚ → halfwidth a..z.
+            'ａ'..='ｚ' => out.push((c as u32 - 'ａ' as u32 + 'a' as u32) as u8 as char),
+            // Fullwidth digits ０..９ → halfwidth 0..9.
+            '０'..='９' => out.push((c as u32 - '０' as u32 + '0' as u32) as u8 as char),
+            // Fullwidth space → ASCII space (preserved as a boundary).
+            '\u{3000}' => out.push(' '),
+            _ => out.push(c),
+        }
+    }
+    out.to_lowercase()
+}
+
+/// Issue #608 Phase α-2 (AP-09 / VR-14 / DR4-001): build a prompt hint that
+/// re-presents the previous turn's verifier command when the user message is
+/// a rerun trigger AND the persisted command passes the runnable eligibility
+/// guard.
+///
+/// Returns `None` when:
+///   * the user message is not a rerun trigger;
+///   * the session has no persisted `last_verifier_command`;
+///   * the runnable eligibility guard rejects the command (empty / NUL /
+///     control char / 4096-byte cap hit / shell-control operator / not
+///     BuildTest classified).
+///
+/// The hint is a system message — it informs the model that the user wants
+/// to rerun and surfaces the command as guidance, but does NOT directly
+/// dispatch Bash. The agent loop / model decides whether to actually call
+/// the Bash tool (DR4-001 prompt-injection guard).
+pub(crate) fn build_rerun_prompt_hint_if_eligible(
+    user_msg: &str,
+    session: &crate::session::store::SessionSnapshot,
+) -> Option<String> {
+    if !is_rerun_trigger(user_msg) {
+        return None;
+    }
+    let cmd = session.last_verifier_command.as_deref()?;
+    if !is_runnable_rerun_hint(cmd) {
+        return None;
+    }
+    Some(format!(
+        "[Anvil rerun hint] The user appears to want a re-run of the \
+         previous verifier. Last recorded command: `{cmd}`. Verify it is \
+         still appropriate before invoking the Bash tool."
+    ))
+}
+
+/// Issue #608 Phase α-2 (AP-09 / VR-14 / DR4-001): runnable eligibility
+/// guard for the persisted last-verifier-command. Re-validates the command
+/// against the same invariants that gated its original observation, so a
+/// tampered session.json cannot smuggle an arbitrary command into a model
+/// prompt hint.
+///
+/// Returns `true` iff:
+///   1. command is non-empty after trim;
+///   2. command contains no NUL / ASCII control chars (`\x00..=\x1f` / DEL);
+///   3. command length is strictly less than the 4096-byte storage cap (a
+///      hit indicates the original command was over-cap and was truncated —
+///      not safe as a runnable hint);
+///   4. command does not contain shell-control operators
+///      (`is_completion_verifier_command` SSOT check);
+///   5. command classifies as `BashCommandClass::BuildTest`.
+fn is_runnable_rerun_hint(cmd: &str) -> bool {
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.chars().any(|c| (c as u32) < 0x20 || c == '\x7f') {
+        return false;
+    }
+    if trimmed.len() >= crate::session::feedback::MAX_VERIFIER_COMMAND_BYTES {
+        return false;
+    }
+    if !super::completion_evidence::is_completion_verifier_command(trimmed) {
+        return false;
+    }
+    if !matches!(
+        crate::tools::bash::classify_command(trimmed),
+        crate::tools::bash::BashCommandClass::BuildTest
+    ) {
+        return false;
+    }
+    true
+}
+
+/// Issue #608 Phase α-2 (AP-09): RFC3339 UTC timestamp for the current
+/// wall-clock. Delegates to `case_photon_bridge::format_rfc3339_utc` (which
+/// already implements the no-chrono civil-from-days algorithm). Pure helper
+/// for the `last_verifier_invocation.recorded_at` field.
+fn rfc3339_now_utc() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    crate::session::case_photon_bridge::format_rfc3339_utc(secs)
+}
+
+/// AP-09 word-boundary check for the `rerun` keyword. Returns true iff
+/// `s.contains("rerun")` AND the surrounding char on each side (if any) is
+/// NOT ASCII alphanumeric. Pure / no allocation.
+fn contains_rerun_with_word_boundary(s: &str) -> bool {
+    let kw = "rerun";
+    let mut search_start = 0;
+    while let Some(idx) = s[search_start..].find(kw) {
+        let abs = search_start + idx;
+        let before_ok = abs == 0
+            || !s[..abs]
+                .chars()
+                .next_back()
+                .map(|c| c.is_ascii_alphanumeric())
+                .unwrap_or(false);
+        let end = abs + kw.len();
+        let after_ok = end == s.len()
+            || !s[end..]
+                .chars()
+                .next()
+                .map(|c| c.is_ascii_alphanumeric())
+                .unwrap_or(false);
+        if before_ok && after_ok {
+            return true;
+        }
+        search_start = abs + 1;
+    }
+    false
+}
+
+#[cfg(test)]
+impl<'a> PhotonOutcomeInputs<'a> {
+    /// Issue #608 Phase α-2 (AP-10 / 設計判断 #8): test-only fixture builder
+    /// that defaults every field to a "no-signal" value. Tests override only
+    /// the fields they care about via struct-update syntax
+    /// (`..PhotonOutcomeInputs::test_default()`).
+    ///
+    /// Notable defaults:
+    /// * `adopted_id_count: 1` — non-zero so Case A/B short-circuits don't
+    ///   fire by default (matches the previous `empty_inputs()` shape).
+    /// * `iter_count_this_turn: 2` — breaks Case F's `<= 1` AND, so tests
+    ///   that don't override Case F fields land on Case G.
+    /// * `verifier_exit_zero_this_turn: false` — Case E expansion field
+    ///   defaults to false so the OR-merge in Case E does not fire by
+    ///   default (matches the production derive value when no
+    ///   `VerifierExitZero` evidence was observed this turn).
+    pub(crate) fn test_default() -> Self {
+        Self {
+            last_feedback_kind: None,
+            eligible_feedback_recorded_this_turn: false,
+            anvil_score: None,
+            adopted_id_count: 1,
+            shadow_mode: false,
+            iter_count_this_turn: 2,
+            tool_calls_this_turn: 0,
+            repo_edit_succeeded_this_turn: false,
+            work_mode_is_answer_only: false,
+            verifier_exit_zero_this_turn: false,
+        }
+    }
+}
 
 /// Issue #591 (AS-04 / 設計判断 #3) + Issue #601 (S5-001 / 設計判断 #4 (b)):
 /// derive the adoption-loop outcome + optional detail value for the
@@ -320,15 +543,20 @@ pub(crate) fn derive_photon_feedback_outcome(
         };
     }
 
-    // Case E: success — user-visible artifact produced and nothing failed.
+    // Case E (Issue #608 Phase α-2 / AP-10 / 設計判断 #2 拡張):
+    //   success = user_visible_artifact OR verifier_exit_zero_this_turn
+    //
+    // The OR-merge adds same-turn verifier success as a positive signal so a
+    // read-only verifier run (e.g. `cargo test` on an unchanged tree still
+    // exiting 0) earns a `success` outcome even when no Write / Edit fires.
     // NOT gated by `eligible_feedback_recorded_this_turn` (DR3-NEW-002): a
     // turn that produced an artifact but did not record a failure frame
     // still earns a `success` outcome.
-    if inputs
+    let user_visible = inputs
         .anvil_score
         .map(|s| s.user_visible_artifact)
-        .unwrap_or(false)
-    {
+        .unwrap_or(false);
+    if user_visible || inputs.verifier_exit_zero_this_turn {
         return PhotonFeedbackOutcome {
             outcome: Some("success"),
             outcome_detail: None,
@@ -2409,6 +2637,20 @@ impl Agent {
         // in build_request_messages runs. Previously this reset lived in
         // run_actor_loop which wiped it before path (b) could check it.
         self.session.context_pack_sent_this_turn = false;
+        // Issue #608 Phase α-2 (AP-09): detect rerun-trigger keyword in the
+        // user message and re-present the previous turn's verifier command
+        // as a model prompt hint. The runnable eligibility guard
+        // (`runnable_rerun_hint_for_session`) re-validates the persisted
+        // command against the same DR4-002 / DR4-003 invariants that gated
+        // its original observation (BuildTest class, no shell control,
+        // non-empty / no control chars / no 4096-byte cap hit). Tampered or
+        // ineligible commands are silently skipped — the prompt hint is
+        // never emitted as a direct Bash dispatch (DR4-001).
+        if let Some(hint) = build_rerun_prompt_hint_if_eligible(input, &self.session) {
+            self.session
+                .messages
+                .push(crate::session::store::ConversationMessage::system(hint));
+        }
         self.run_turn(input, stream_output, &mut monitor)
     }
 
@@ -2456,10 +2698,17 @@ impl Agent {
             return None;
         };
         let auto_test_active = score.build_passed.is_some() || score.tests_passed.is_some();
+        // CB-002 (codex review fix): the auto_test success branch now also
+        // requires `unsafe_actions_blocked == 0` to prevent a turn where
+        // an unsafe command was blocked in the same turn from extracting
+        // a CaseRecord solely because build / tests / artifact were green.
+        // This matches the verifier-less fallback and
+        // `case_photon_bridge::is_eligible_for_promotion`'s full_pass check.
         let success = if auto_test_active {
             score.build_passed == Some(true)
                 && score.tests_passed == Some(true)
                 && score.user_visible_artifact
+                && score.unsafe_actions_blocked == 0
                 && score.consecutive_no_progress_turns == 0
         } else {
             self.session.repo_edit_succeeded_this_turn
@@ -3526,6 +3775,18 @@ impl Agent {
         // same-turn FeedbackKind / AnvilScore / shadow flag / adopted count
         // / per-turn counters / WorkMode. Returns a PhotonFeedbackOutcome
         // whose fields are `Option<&'static str>` allowlist values.
+        // Issue #608 Phase α-2 (AP-10 / 設計判断 #3): derive the same-turn
+        // verifier_exit_zero signal from `evidence_set_this_turn` so we don't
+        // need a separate SessionSnapshot flag. Matches the
+        // `CompletionEvidence::VerifierExitZero` push site in
+        // `observe_evidence_from_bash_outcome` (same turn, same iteration
+        // boundary as `evidence_set_this_turn.clear()` at run_actor_loop head).
+        let verifier_exit_zero_this_turn = self.evidence_set_this_turn.iter().any(|e| {
+            matches!(
+                e,
+                super::completion_evidence::CompletionEvidence::VerifierExitZero { .. }
+            )
+        });
         let inputs = PhotonOutcomeInputs {
             last_feedback_kind: self.session.last_feedback.as_ref().map(|ff| &ff.kind),
             eligible_feedback_recorded_this_turn: self.session.eligible_feedback_recorded_this_turn,
@@ -3539,6 +3800,8 @@ impl Agent {
             // DR3-001 SSOT: AnswerOnly check goes through the helper, never
             // a direct `mode_state.work_mode == WorkMode::AnswerOnly` compare.
             work_mode_is_answer_only: self.answer_only_mode_active(),
+            // Issue #608 Phase α-2 (AP-10 / 設計判断 #2 + #3): Case E expansion.
+            verifier_exit_zero_this_turn,
         };
         let PhotonFeedbackOutcome {
             outcome: outcome_static,
@@ -7190,6 +7453,31 @@ impl Agent {
         &mut self,
         outcome: &crate::tools::bash::BashExecutionOutcome,
     ) {
+        use crate::tools::bash::BashCommandClass;
+        // Issue #608 Phase α-2 (AP-09): record `last_verifier_command` /
+        // `last_verifier_invocation` for any BuildTest invocation (regardless
+        // of exit code) so the rerun-trigger handler can surface the most
+        // recent verifier attempt — even failed ones (the user often types
+        // `再実行` precisely because the last run failed).
+        if matches!(outcome.class, BashCommandClass::BuildTest)
+            && super::completion_evidence::is_completion_verifier_command(&outcome.command)
+        {
+            let redacted =
+                crate::session::feedback::redact_verifier_command_for_storage(&outcome.command);
+            // Drop empty redacted commands (e.g. all-control-char input).
+            if !redacted.trim().is_empty() {
+                self.session.last_verifier_command = Some(redacted.clone());
+                self.session.last_verifier_invocation =
+                    Some(crate::session::store::VerifierInvocationRecord {
+                        command: redacted,
+                        exit_code: outcome.exit_code.unwrap_or(-1),
+                        recorded_at: rfc3339_now_utc(),
+                    });
+            }
+        }
+
+        // Issue #607 (β): build VerifierExitZero evidence for BuildTest |
+        // EnvSetup exit-zero outcomes (per `build_verifier_exit_zero_evidence`).
         let Some(evidence) = build_verifier_exit_zero_evidence(outcome) else {
             return;
         };
@@ -13906,23 +14194,11 @@ mod derive_photon_feedback_outcome_tests {
     use crate::session::anvil_score::AnvilScore;
     use crate::session::feedback::FeedbackKind;
 
+    /// Issue #608 Phase α-2 (AP-10 / 設計判断 #8 (a)): kept as a thin
+    /// alias for backward source compatibility — production fixture is
+    /// `PhotonOutcomeInputs::test_default()`.
     fn empty_inputs() -> PhotonOutcomeInputs<'static> {
-        PhotonOutcomeInputs {
-            last_feedback_kind: None,
-            eligible_feedback_recorded_this_turn: false,
-            anvil_score: None,
-            adopted_id_count: 1, // non-zero so case A/B short-circuit doesn't fire by default
-            shadow_mode: false,
-            // Issue #601 (D1-002 safeguard): defaults break the `iter_count_this_turn
-            // <= 1` condition in `case_f_condition_met` so existing tests that
-            // don't override Case F fields keep returning Case G (None). Mode
-            // is left as non-AnswerOnly to avoid biasing tests toward AnswerOnly.
-            // NPS-04 unit tests explicitly override `iter_count_this_turn: 1`.
-            iter_count_this_turn: 2,
-            tool_calls_this_turn: 0,
-            repo_edit_succeeded_this_turn: false,
-            work_mode_is_answer_only: false,
-        }
+        PhotonOutcomeInputs::test_default()
     }
 
     // Case A: shadow_mode=true → None regardless of any other input.
@@ -13934,15 +14210,9 @@ mod derive_photon_feedback_outcome_tests {
             ..AnvilScore::default()
         };
         let inputs = PhotonOutcomeInputs {
-            last_feedback_kind: None,
-            eligible_feedback_recorded_this_turn: false,
             anvil_score: Some(&score),
-            adopted_id_count: 1,
             shadow_mode: true,
-            iter_count_this_turn: 2,
-            tool_calls_this_turn: 0,
-            repo_edit_succeeded_this_turn: false,
-            work_mode_is_answer_only: false,
+            ..PhotonOutcomeInputs::test_default()
         };
         let outcome = derive_photon_feedback_outcome(&inputs);
         assert_eq!(outcome.outcome, None);
@@ -14315,6 +14585,72 @@ mod derive_photon_feedback_outcome_tests {
         assert!(!case_f_condition_met(&inputs));
     }
 
+    // ─────────────────────────────────────────────────────────────────
+    // Case E (Issue #608 Phase α-2 / AP-10 / VR-12): expansion boundary.
+    // ─────────────────────────────────────────────────────────────────
+
+    /// VR-12: `verifier_exit_zero_this_turn=true && user_visible_artifact=false
+    /// → outcome=success`. Pins the Case E OR-merge so future Case H splits
+    /// have a magnet test to change.
+    #[test]
+    fn case_e_verifier_exit_zero_alone_yields_success() {
+        let score = AnvilScore::default(); // user_visible_artifact=false
+        let inputs = PhotonOutcomeInputs {
+            anvil_score: Some(&score),
+            verifier_exit_zero_this_turn: true,
+            ..PhotonOutcomeInputs::test_default()
+        };
+        let outcome = derive_photon_feedback_outcome(&inputs);
+        assert_eq!(outcome.outcome, Some("success"));
+        assert_eq!(outcome.outcome_detail, None);
+    }
+
+    /// VR-12: both signals together still yield `success` (OR-merge).
+    #[test]
+    fn case_e_both_signals_yields_success() {
+        let score = AnvilScore {
+            user_visible_artifact: true,
+            ..AnvilScore::default()
+        };
+        let inputs = PhotonOutcomeInputs {
+            anvil_score: Some(&score),
+            verifier_exit_zero_this_turn: true,
+            ..PhotonOutcomeInputs::test_default()
+        };
+        let outcome = derive_photon_feedback_outcome(&inputs);
+        assert_eq!(outcome.outcome, Some("success"));
+    }
+
+    /// VR-12: neither signal → success does NOT fire; falls through to
+    /// downstream cases (Case F or Case G).
+    #[test]
+    fn case_e_no_signals_falls_through() {
+        let score = AnvilScore::default();
+        let inputs = PhotonOutcomeInputs {
+            anvil_score: Some(&score),
+            verifier_exit_zero_this_turn: false,
+            ..PhotonOutcomeInputs::test_default()
+        };
+        let outcome = derive_photon_feedback_outcome(&inputs);
+        // Case G fallback (test_default `iter_count_this_turn=2` breaks Case F).
+        assert_eq!(outcome.outcome, None);
+    }
+
+    /// VR-12: priority — `verifier_exit_zero=true` does NOT trump explicit
+    /// failure Case D (failure kind fires before Case E success).
+    #[test]
+    fn case_e_verifier_success_does_not_override_failure() {
+        let kind = FeedbackKind::CompileError;
+        let inputs = PhotonOutcomeInputs {
+            last_feedback_kind: Some(&kind),
+            eligible_feedback_recorded_this_turn: true,
+            verifier_exit_zero_this_turn: true,
+            ..PhotonOutcomeInputs::test_default()
+        };
+        let outcome = derive_photon_feedback_outcome(&inputs);
+        assert_eq!(outcome.outcome, Some("failure"));
+    }
+
     // Unused-import suppression: ensure all imported symbols are exercised.
     #[test]
     fn struct_clone_smoke() {
@@ -14325,6 +14661,192 @@ mod derive_photon_feedback_outcome_tests {
         let v2 = v.clone();
         assert_eq!(v2.outcome, Some("success"));
         assert_eq!(v2.outcome_detail, None);
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Issue #608 Phase α-2 (AP-09 / VR-10): is_rerun_trigger unit tests.
+// 5 keyword × positive + negative cases (≥ 10 assertions total).
+// ───────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod is_rerun_trigger_tests {
+    use super::is_rerun_trigger;
+
+    // --- positive: exact 5 keywords -----------------------------------------
+
+    #[test]
+    fn positive_japanese_saijikkou() {
+        assert!(is_rerun_trigger("再実行"));
+        assert!(is_rerun_trigger("テスト再実行してください"));
+    }
+
+    #[test]
+    fn positive_japanese_mou_ichido() {
+        assert!(is_rerun_trigger("もう一度"));
+        assert!(is_rerun_trigger("もう一度実行してほしい"));
+    }
+
+    #[test]
+    fn positive_japanese_mou_ikkai_with_ascii_digit() {
+        // `もう 1 回` with ASCII space and digit (design example).
+        assert!(is_rerun_trigger("もう 1 回"));
+        assert!(is_rerun_trigger("もう1回"));
+    }
+
+    #[test]
+    fn positive_japanese_mou_ikkai_with_fullwidth() {
+        // VR-10 design: fullwidth `１` / fullwidth space `　` normalized.
+        assert!(is_rerun_trigger("もう１回"));
+        assert!(is_rerun_trigger("もう　１回"));
+    }
+
+    #[test]
+    fn positive_japanese_yarinaoshite() {
+        assert!(is_rerun_trigger("やり直して"));
+        assert!(is_rerun_trigger("テストをやり直してください"));
+    }
+
+    #[test]
+    fn positive_rerun_ascii_standalone() {
+        assert!(is_rerun_trigger("rerun"));
+        assert!(is_rerun_trigger("please rerun the tests"));
+        assert!(is_rerun_trigger("Rerun!"));
+    }
+
+    #[test]
+    fn positive_rerun_fullwidth_ascii() {
+        // ＲＥＲＵＮ normalizes to "rerun".
+        assert!(is_rerun_trigger("ＲＥＲＵＮ"));
+    }
+
+    // --- negative: ascii word-boundary, no-match ----------------------------
+
+    #[test]
+    fn negative_rerun_substring_inside_word() {
+        // word-boundary check rejects substring matches.
+        assert!(!is_rerun_trigger("rerunning the build")); // suffix attached
+        assert!(!is_rerun_trigger("prerun hook")); // prefix attached
+        assert!(!is_rerun_trigger("current-run")); // hyphen breaks boundary? Hyphen is non-alphanumeric so this is positive — review design.
+    }
+
+    #[test]
+    fn negative_unrelated_text() {
+        assert!(!is_rerun_trigger(""));
+        assert!(!is_rerun_trigger("hello world"));
+        assert!(!is_rerun_trigger("interrupt the build"));
+        assert!(!is_rerun_trigger("stop please"));
+    }
+
+    /// VR-10 design 設計判断 #5 受容方針: Japanese negative phrasing
+    /// (`再実行不要`, `やり直さない`) still triggers (contains-based, design
+    /// trade-off — false positives preferred to false negatives).
+    #[test]
+    fn positive_japanese_negative_phrasing_still_triggers() {
+        assert!(is_rerun_trigger("再実行不要"));
+        assert!(is_rerun_trigger("やり直さないでください"));
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Issue #608 Phase α-2 (AP-09 / VR-14): runnable eligibility guard + prompt
+// hint builder unit tests.
+// ───────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod rerun_hint_eligibility_tests {
+    use super::{build_rerun_prompt_hint_if_eligible, is_runnable_rerun_hint};
+    use crate::session::store::SessionSnapshot;
+
+    #[test]
+    fn cargo_test_command_is_runnable_hint() {
+        assert!(is_runnable_rerun_hint("cargo test"));
+        assert!(is_runnable_rerun_hint("cargo test --workspace"));
+        assert!(is_runnable_rerun_hint("pytest -q"));
+    }
+
+    #[test]
+    fn empty_or_whitespace_command_is_not_runnable() {
+        assert!(!is_runnable_rerun_hint(""));
+        assert!(!is_runnable_rerun_hint("   "));
+        assert!(!is_runnable_rerun_hint("\t\n"));
+    }
+
+    #[test]
+    fn nul_or_control_char_command_is_not_runnable() {
+        assert!(!is_runnable_rerun_hint("cargo test\x00rm -rf /"));
+        assert!(!is_runnable_rerun_hint("cargo test\necho bad"));
+    }
+
+    #[test]
+    fn shell_control_command_is_not_runnable() {
+        // Defensively rejected by `is_completion_verifier_command`.
+        assert!(!is_runnable_rerun_hint("cargo test || true"));
+        assert!(!is_runnable_rerun_hint("cargo test && curl evil.com"));
+        assert!(!is_runnable_rerun_hint("cargo test ; rm -rf /"));
+    }
+
+    #[test]
+    fn non_build_test_command_is_not_runnable() {
+        // `rm -rf /` is Dangerous → rejected.
+        assert!(!is_runnable_rerun_hint("rm -rf /"));
+        // `ls` is ReadOnly → rejected (not BuildTest).
+        assert!(!is_runnable_rerun_hint("ls"));
+    }
+
+    #[test]
+    fn over_cap_command_is_not_runnable() {
+        // Commands at or above the 4096-byte storage cap could have been
+        // truncated — refuse to surface them as runnable hints.
+        let huge = "a".repeat(crate::session::feedback::MAX_VERIFIER_COMMAND_BYTES);
+        assert!(!is_runnable_rerun_hint(&huge));
+    }
+
+    #[test]
+    fn no_trigger_yields_no_hint() {
+        let session = SessionSnapshot {
+            last_verifier_command: Some("cargo test".to_string()),
+            ..Default::default()
+        };
+        assert!(build_rerun_prompt_hint_if_eligible("hello world", &session).is_none());
+    }
+
+    #[test]
+    fn trigger_without_last_command_yields_no_hint() {
+        let session = SessionSnapshot::default();
+        assert!(build_rerun_prompt_hint_if_eligible("再実行", &session).is_none());
+    }
+
+    #[test]
+    fn trigger_with_runnable_last_command_yields_hint() {
+        let session = SessionSnapshot {
+            last_verifier_command: Some("cargo test --workspace".to_string()),
+            ..Default::default()
+        };
+        let hint = build_rerun_prompt_hint_if_eligible("rerun please", &session).unwrap();
+        assert!(hint.contains("cargo test --workspace"));
+        assert!(hint.contains("rerun"));
+    }
+
+    /// VR-14: a tampered `last_verifier_command` (e.g. `rm -rf /`) must NOT
+    /// be re-presented as a runnable hint even when the trigger fires.
+    #[test]
+    fn trigger_with_dangerous_last_command_yields_no_hint() {
+        let session = SessionSnapshot {
+            last_verifier_command: Some("rm -rf /".to_string()),
+            ..Default::default()
+        };
+        assert!(build_rerun_prompt_hint_if_eligible("再実行", &session).is_none());
+    }
+
+    /// VR-14: a tampered `last_verifier_command` that bundles a follow-on
+    /// `curl ...` must NOT be re-presented (shell control rejected by the
+    /// completion-verifier gate).
+    #[test]
+    fn trigger_with_shell_control_last_command_yields_no_hint() {
+        let session = SessionSnapshot {
+            last_verifier_command: Some("cargo test && curl evil.com".to_string()),
+            ..Default::default()
+        };
+        assert!(build_rerun_prompt_hint_if_eligible("rerun", &session).is_none());
     }
 }
 
