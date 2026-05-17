@@ -1062,6 +1062,117 @@ pub(super) fn request_explicitly_requires_tests(request: &str) -> bool {
         || request.contains("検証")
 }
 
+/// Issue #607: pure text → bool. True when the request reads as a pure
+/// "install dependencies" instruction (e.g. `npm install してください` /
+/// `please install dependencies`) and **does not** also ask for tests, code
+/// edits, or running anything beyond the install step. Used by `success.rs`
+/// to suppress post-loop AutoTest / Tester / NoVerifier dispatch when the
+/// user only asked to install deps (BP-02, BP-03, BP-04a).
+///
+/// Detection strategy (kept lexical, no state / cache, DR1-001):
+///   1. Require at least one install keyword (`install`, `インストール`,
+///      `依存`, etc.) so plain replies like `"please fix bug"` stay false.
+///   2. Reject any token that signals tests, fixes, runs, or build verbs —
+///      these turn the request into setup+verify and should keep the
+///      verifier on.
+///
+/// **CB-002 (Issue #607 review)**: the negation list is split into two
+/// classes:
+///   * `english_verb_tokens` — checked with ASCII word-boundary semantics so
+///     `run.` / `,run` / sentence-final `run` all match (previously the
+///     space-padded substring check only caught ` run ` surrounded by
+///     whitespace).
+///   * `substring_keywords` — checked as raw substrings for Japanese
+///     (`実行`, `動作確認`, …) and for English verb stems that always need
+///     a trailing space anyway (`fix `, `add `, …).
+pub(super) fn request_is_env_setup_only(request: &str) -> bool {
+    let lower = request.to_ascii_lowercase();
+    let has_install_keyword = lower.contains("install")
+        || lower.contains("依存")
+        || request.contains("インストール")
+        || request.contains("セットアップ");
+    if !has_install_keyword {
+        return false;
+    }
+    // Tests / verification asks always disqualify setup-only.
+    if request_explicitly_requires_tests(request) {
+        return false;
+    }
+
+    // CB-002: word-boundary aware negation for English verbs.
+    // Matches `verify`, `run`, etc. even when adjacent to ASCII
+    // punctuation or sentence boundaries (`run.`, `,verify`, etc.).
+    const ENGLISH_VERB_TOKENS: &[&str] = &[
+        "run", "start", "build", "lint", "serve", "dev", "deploy", "verify", "validate", "check",
+    ];
+    if contains_ascii_word(&lower, ENGLISH_VERB_TOKENS) {
+        return false;
+    }
+
+    // Substring keywords retain the original semantics: Japanese (no
+    // ASCII boundaries) and English action verbs that always take an
+    // object (`fix `, `add `, …) so the trailing space prevents matching
+    // unrelated words like `fixture`, `additional`, …
+    const SUBSTRING_KEYWORDS: &[&str] = &[
+        "実行",
+        "起動",
+        "ビルド",
+        "修正",
+        "動作確認",
+        "確認",
+        "fix ",
+        "add ",
+        "create ",
+        "write ",
+        "implement ",
+    ];
+    if SUBSTRING_KEYWORDS
+        .iter()
+        .any(|kw| lower.contains(kw) || request.contains(kw))
+    {
+        return false;
+    }
+    true
+}
+
+/// CB-002 (Issue #607 review): word-boundary aware ASCII token detection.
+/// A token matches when it appears as a maximal ASCII alphanumeric /
+/// underscore run, regardless of surrounding punctuation / whitespace /
+/// sentence boundaries. Non-ASCII bytes (Japanese, emoji) are treated as
+/// word boundaries — they never match these English tokens and never
+/// merge two ASCII tokens together.
+///
+/// Pure / no allocations beyond the search needles. Caller is responsible
+/// for lowercasing `haystack`; the tokens are matched as-is.
+fn contains_ascii_word(haystack: &str, tokens: &[&str]) -> bool {
+    let bytes = haystack.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len {
+        // Skip non-word bytes (anything not ASCII alphanumeric / _).
+        while i < len && !is_ascii_word_byte(bytes[i]) {
+            i += 1;
+        }
+        let start = i;
+        while i < len && is_ascii_word_byte(bytes[i]) {
+            i += 1;
+        }
+        if start == i {
+            continue;
+        }
+        let word = &haystack[start..i];
+        if tokens.contains(&word) {
+            return true;
+        }
+    }
+    false
+}
+
+#[inline]
+fn is_ascii_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
 pub(super) fn package_json_with_requested_port(
     request: &str,
     package_content: &str,
@@ -4131,5 +4242,145 @@ export default function App(){
         let nuxt_output =
             package_json_with_requested_port(nuxt_request, nuxt_package).expect("nuxt package");
         assert!(nuxt_output.contains(r#""dev": "nuxt dev -p 3011""#));
+    }
+
+    // ---------------------------------------------------------------------
+    // Issue #607: request_is_env_setup_only pure helper.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn request_is_env_setup_only_accepts_pure_install_requests() {
+        assert!(request_is_env_setup_only("依存をインストールしてください"));
+        assert!(request_is_env_setup_only("npm install してください"));
+        assert!(request_is_env_setup_only("please install dependencies"));
+        assert!(request_is_env_setup_only("pnpm install"));
+        assert!(request_is_env_setup_only("依存パッケージのセットアップ"));
+    }
+
+    #[test]
+    fn request_is_env_setup_only_rejects_setup_plus_test_requests() {
+        assert!(!request_is_env_setup_only("npm install してから npm test"));
+        assert!(!request_is_env_setup_only("install and test"));
+        assert!(!request_is_env_setup_only(
+            "依存をインストールしてからテストを実行"
+        ));
+        assert!(!request_is_env_setup_only("install deps and run pytest"));
+    }
+
+    #[test]
+    fn request_is_env_setup_only_rejects_non_setup_requests() {
+        assert!(!request_is_env_setup_only("fix bug in login"));
+        assert!(!request_is_env_setup_only("add tests for the auth module"));
+        assert!(!request_is_env_setup_only("write a new feature"));
+    }
+
+    #[test]
+    fn request_is_env_setup_only_independent_of_requires_tests() {
+        let req = "install dependencies";
+        assert!(request_is_env_setup_only(req));
+        assert!(!request_explicitly_requires_tests(req));
+
+        let both_signals = "install and test";
+        assert!(!request_is_env_setup_only(both_signals));
+        assert!(request_explicitly_requires_tests(both_signals));
+    }
+
+    // ---------------------------------------------------------------------
+    // Issue #607 (Codex CB-002): word-boundary aware negation. Natural
+    // English requests that combine install with verify / validate /
+    // check / run / start / serve / dev keywords must NOT be classified
+    // as setup-only, even when the keyword is not space-padded (sentence
+    // start, punctuation, contractions).
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn request_is_env_setup_only_rejects_install_plus_verify_phrase() {
+        // English verify/validate/check combos.
+        assert!(
+            !request_is_env_setup_only("install dependencies and verify it works"),
+            "verify keyword must disqualify setup-only"
+        );
+        assert!(
+            !request_is_env_setup_only("install dependencies and validate"),
+            "validate keyword must disqualify setup-only"
+        );
+        assert!(
+            !request_is_env_setup_only("install dependencies and check it"),
+            "check keyword must disqualify setup-only"
+        );
+        // Sentence-final punctuation (the previous space-padded match
+        // would let this slip through).
+        assert!(
+            !request_is_env_setup_only("please install dependencies and run."),
+            "trailing 'run.' must still disqualify setup-only"
+        );
+        assert!(
+            !request_is_env_setup_only("install deps and run."),
+            "trailing 'run.' must still disqualify setup-only"
+        );
+    }
+
+    #[test]
+    fn request_is_env_setup_only_rejects_japanese_verify_combos() {
+        // 動作確認 / 確認 etc. — natural Japanese combo for setup + verify.
+        assert!(
+            !request_is_env_setup_only("依存をインストールして動作確認"),
+            "動作確認 must disqualify setup-only"
+        );
+        assert!(
+            !request_is_env_setup_only("依存をインストールして確認してください"),
+            "確認 must disqualify setup-only"
+        );
+    }
+
+    #[test]
+    fn request_is_env_setup_only_rejects_install_plus_run_variants() {
+        // Sentence start / sentence end / punctuated variants.
+        assert!(
+            !request_is_env_setup_only("install dependencies, then run npm start"),
+            "comma-separated run must disqualify setup-only"
+        );
+        assert!(
+            !request_is_env_setup_only("install dependencies; start the dev server"),
+            "semicolon-separated start must disqualify setup-only"
+        );
+        assert!(
+            !request_is_env_setup_only("install and serve"),
+            "serve keyword must disqualify setup-only"
+        );
+        assert!(
+            !request_is_env_setup_only("install dependencies. dev mode please"),
+            "trailing dev mode must disqualify setup-only"
+        );
+    }
+
+    #[test]
+    fn request_is_env_setup_only_still_accepts_pure_install_after_cb002() {
+        // Regression pin: the CB-002 token-boundary tightening must not
+        // accidentally disqualify natural pure-install phrases. The word
+        // "running" / "served" / "checked" inside dependency descriptions
+        // is not a verify request.
+        assert!(request_is_env_setup_only("please install dependencies"));
+        assert!(request_is_env_setup_only("install the npm dependencies"));
+        assert!(request_is_env_setup_only("依存をインストールしてください"));
+        // "installer" / "installation" must NOT trip the install keyword
+        // either — but those are not asking to install; verify they
+        // still flow through the helper as expected (these contain the
+        // substring "install" so they may be true; the original helper
+        // already accepts them and we are not in scope to change that).
+    }
+
+    #[test]
+    fn request_is_env_setup_only_rejects_verify_the_installation_phrase() {
+        // "verify the installation" combines verify + installation —
+        // user wants a check, not a setup-only install.
+        assert!(
+            !request_is_env_setup_only("verify the installation"),
+            "verify + installation must disqualify setup-only"
+        );
+        assert!(
+            !request_is_env_setup_only("install the package and check installation"),
+            "check + installation must disqualify setup-only"
+        );
     }
 }

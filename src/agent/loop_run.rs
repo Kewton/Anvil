@@ -116,6 +116,27 @@ pub fn is_completion_verifier_command_for_test(command: &str) -> bool {
     completion_evidence::is_completion_verifier_command(command)
 }
 
+/// Issue #607: integration-test seam exposing the pure projection from a
+/// `BashExecutionOutcome` to an optional `VerifierExitZero` evidence record.
+/// Returns a tuple `(promoted, masked_command, class_label)` where:
+///   * `promoted` — true if the outcome would be pushed into `EvidenceSet`
+///   * `masked_command` — the stored (mask-applied) command when promoted
+///   * `class_label` — the snake_case `BashCommandClass` label
+/// Used by `tests/completion_evidence_env_setup.rs` to pin BP-04 / BP-06
+/// without spinning up a full Agent.
+#[doc(hidden)]
+pub fn build_verifier_exit_zero_evidence_for_test(
+    outcome: &crate::tools::bash::BashExecutionOutcome,
+) -> Option<(String, &'static str)> {
+    let evidence = turn::build_verifier_exit_zero_evidence(outcome)?;
+    match evidence {
+        completion_evidence::CompletionEvidence::VerifierExitZero { class, command } => {
+            Some((command, class.as_str()))
+        }
+        _ => None,
+    }
+}
+
 // Issue #465 / Phase 5: expose Reminder types needed by tests/agent_skill_registry_smoke.rs
 // (E2E tests live outside the crate so `pub(crate) mod reminder` cannot be reached
 // directly). Production code paths continue to use `super::reminder::...`; these

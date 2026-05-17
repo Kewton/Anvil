@@ -1,7 +1,11 @@
 use std::path::Path;
 
 use super::auto_test::AutoTestRunner;
-use super::protocol::{ExecutionProtocol, ProtocolSuccessContext, requested_paths_from_text};
+use super::completion_evidence::{CompletionEvidence, EvidenceSet};
+use super::protocol::{
+    ExecutionProtocol, ProtocolKind, ProtocolSuccessContext, RequestContext,
+    requested_paths_from_text,
+};
 use super::summary::{ExitReason, LoopStats};
 use super::tester;
 use super::verifier_skill::VerifierInputs;
@@ -13,6 +17,7 @@ use crate::session::feedback::{
     FeedbackFrame, FeedbackFrameDraft, FeedbackKind, build_feedback_frame,
 };
 use crate::session::store::{ConversationMessage, WorkingMemory};
+use crate::tools::bash::BashCommandClass;
 use std::collections::VecDeque;
 
 /// Fixed marker for deterministic recovery content. Protocol success treats
@@ -54,6 +59,59 @@ pub(super) fn select_success_verifier(
     }
 }
 
+/// Issue #607: pure predicate. True when the request is pure install-deps
+/// AND EnvSetup-only satisfaction granted, so post-loop AutoTest / Tester /
+/// NoVerifier dispatch should be suppressed. The `success.rs` orchestration
+/// and the agent-level context-aware verifier check both consult this fn so
+/// the suppression decision lives in exactly one place (DR1-001 SSOT).
+pub(super) fn suppress_success_verifier_for_context(
+    ctx: &RequestContext,
+    env_setup_only_satisfied: bool,
+) -> bool {
+    ctx.is_env_setup_only && env_setup_only_satisfied && !ctx.requires_tests
+}
+
+/// Issue #607 (CB-001 fix): pure predicate. True iff the suppression of
+/// post-loop verifier dispatch is **specifically grounded** in EnvSetup
+/// evidence (i.e. the agent actually saw at least one
+/// `VerifierExitZero { class: EnvSetup, .. }`) for a setup-only request on
+/// a code-bearing protocol.
+///
+/// Rationale: the previous implementation used
+/// `evidence_set_satisfies_with_context` which returns true for **any**
+/// accepted evidence (RepoEdit, BuildTest, EnvSetup). That made setup-only
+/// requests over-suppress: a turn with only a stray RepoEdit (or no
+/// evidence at all) would silence the verifier dispatch even though no
+/// EnvSetup proof was observed. This helper narrows the suppression so it
+/// fires only when EnvSetup evidence is the explicit basis.
+///
+/// AnswerOnly / Docs intentionally return `false` — `npm install` is not an
+/// answer-only artifact, and Docs never accepts EnvSetup at all.
+pub(super) fn env_setup_only_evidence_satisfies(
+    set: &EvidenceSet,
+    kind: ProtocolKind,
+    ctx: &RequestContext,
+) -> bool {
+    if !ctx.is_env_setup_only || ctx.requires_tests {
+        return false;
+    }
+    if !matches!(
+        kind,
+        ProtocolKind::Python | ProtocolKind::TypeScriptUi | ProtocolKind::GenericCode
+    ) {
+        return false;
+    }
+    set.iter().any(|ev| {
+        matches!(
+            ev,
+            CompletionEvidence::VerifierExitZero {
+                class: BashCommandClass::EnvSetup,
+                ..
+            }
+        )
+    })
+}
+
 pub(super) fn build_feedback_for_no_verifier(workspace_root: &Path) -> FeedbackFrame {
     let draft = FeedbackFrameDraft {
         kind: FeedbackKind::NoVerifierAvailable,
@@ -81,6 +139,35 @@ impl Agent {
             .is_some_and(|request| super::quality::request_explicitly_requires_tests(&request))
     }
 
+    /// Issue #607 (DR1-001 SSOT): build the current `RequestContext` from
+    /// the active request text. Same fn used by every sink so the EnvSetup
+    /// suppression decision matches across `evidence_set_satisfies_with_context`,
+    /// `evidence_set_missing_shapes_with_context`, and
+    /// `should_run_auto_test_for_success_with_context`.
+    pub(super) fn current_request_context(&self) -> RequestContext {
+        let request = self.active_request_text().unwrap_or_default();
+        RequestContext {
+            requires_tests: super::quality::request_explicitly_requires_tests(&request),
+            is_env_setup_only: super::quality::request_is_env_setup_only(&request),
+        }
+    }
+
+    /// Issue #607: context-aware variant. When the request is pure
+    /// setup-only AND the agent observed enough evidence to satisfy the
+    /// active protocol via EnvSetup alone, suppress every post-loop
+    /// verifier dispatch (AutoTest / Tester / NoVerifier). Otherwise the
+    /// existing heuristic (`should_run_auto_test_for_success`) wins.
+    pub(super) fn should_run_auto_test_for_success_with_context(
+        &self,
+        ctx: &RequestContext,
+        env_setup_only_satisfied: bool,
+    ) -> bool {
+        if suppress_success_verifier_for_context(ctx, env_setup_only_satisfied) {
+            return false;
+        }
+        self.should_run_auto_test_for_success()
+    }
+
     pub(super) fn run_post_loop_success_verifier(
         &mut self,
         final_verif: &RepoVerification,
@@ -90,6 +177,9 @@ impl Agent {
         error_text: &mut String,
     ) -> Vec<String> {
         let mut verify_commands_collected: Vec<String> = Vec::new();
+        // Issue #607: build the request context once and reuse it across the
+        // satisfaction / missing-shapes / post-loop verifier-demand sinks.
+        let ctx = self.current_request_context();
         let should_dispatch_success_verifier = if exit_reason.is_success() {
             let protocol = ExecutionProtocol::from_work_mode(self.session.mode_state.work_mode);
             let deterministic_recovery_recorded =
@@ -100,13 +190,13 @@ impl Agent {
                 .active_request_text()
                 .map(|text| requested_paths_from_text(&text))
                 .unwrap_or_default();
-            // Issue #606 T-1.5: Stage-2 short-circuit — if the agent observed
-            // enough evidence this turn to satisfy the active protocol, the
-            // per-kind reject text is suppressed. Stage 1 (deterministic_only /
-            // verifier_passed_after_edit == Some(false)) still wins inside
-            // `success_issue_with_context`.
+            // Issue #606 T-1.5 / Issue #607: Stage-2 short-circuit. Context-
+            // aware so setup-only EnvSetup evidence satisfies Python /
+            // TypeScriptUi / GenericCode protocols when the user only asked
+            // to install dependencies.
             let kind = protocol.kind();
-            let evidence_satisfied = kind.evidence_set_satisfies(&self.evidence_set_this_turn);
+            let evidence_satisfied =
+                kind.evidence_set_satisfies_with_context(&self.evidence_set_this_turn, &ctx);
             if let Some(issue) = protocol.success_issue_with_context(ProtocolSuccessContext {
                 stats,
                 deterministic_recovery_recorded,
@@ -115,7 +205,8 @@ impl Agent {
                 verifier_passed_after_edit: None,
                 evidence_satisfied,
             }) {
-                let missing = kind.evidence_set_missing_shapes(&self.evidence_set_this_turn);
+                let missing = kind
+                    .evidence_set_missing_shapes_with_context(&self.evidence_set_this_turn, &ctx);
                 crate::logging::log_completion_evidence_unsatisfied(
                     self.current_turn_index,
                     kind.label(),
@@ -139,12 +230,28 @@ impl Agent {
             false
         };
 
-        let tester_candidate_some = if should_dispatch_success_verifier {
-            tester::TesterCandidate::detect(&self.work_root, &stats.changed_files).is_some()
-        } else {
-            false
-        };
-        let protocol_demands_verifier = self.should_run_auto_test_for_success();
+        // Issue #607 (CB-001 fix): suppress AutoTest / Tester / NoVerifier
+        // dispatch only when the request was pure install-deps AND we
+        // explicitly observed at least one EnvSetup VerifierExitZero. The
+        // previous implementation used the broad `evidence_set_satisfies_*`
+        // OR-fold, which fired for any accepted evidence (RepoEdit only,
+        // BuildTest only, etc.) and over-suppressed legitimate verifier
+        // runs. See `env_setup_only_evidence_satisfies` doc for details.
+        let protocol_kind =
+            ExecutionProtocol::from_work_mode(self.session.mode_state.work_mode).kind();
+        let env_setup_only_satisfied =
+            env_setup_only_evidence_satisfies(&self.evidence_set_this_turn, protocol_kind, &ctx);
+        let suppress_success_verifier =
+            suppress_success_verifier_for_context(&ctx, env_setup_only_satisfied);
+
+        let tester_candidate_some =
+            if should_dispatch_success_verifier && !suppress_success_verifier {
+                tester::TesterCandidate::detect(&self.work_root, &stats.changed_files).is_some()
+            } else {
+                false
+            };
+        let protocol_demands_verifier = !suppress_success_verifier
+            && self.should_run_auto_test_for_success_with_context(&ctx, env_setup_only_satisfied);
         let session_id = self.session_store.session_id().to_string();
         let model = self.models.main.clone();
         let recent_successful_bash_commands =
@@ -437,6 +544,265 @@ mod tests {
             frame.primary_error.as_deref(),
             Some("no auto_test verifier detected for this workspace")
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #607 VR-β-04 (f2): setup-only suppression matrix.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn suppress_success_verifier_for_context_blocks_pure_setup_only() {
+        let ctx = RequestContext {
+            requires_tests: false,
+            is_env_setup_only: true,
+        };
+        // setup-only request + EnvSetup-only evidence satisfied → suppress.
+        assert!(suppress_success_verifier_for_context(&ctx, true));
+        // setup-only request but evidence not yet satisfied → do not
+        // suppress (model may still need to act).
+        assert!(!suppress_success_verifier_for_context(&ctx, false));
+    }
+
+    #[test]
+    fn suppress_success_verifier_for_context_keeps_dispatch_when_tests_required() {
+        let ctx = RequestContext {
+            requires_tests: true,
+            is_env_setup_only: true,
+        };
+        assert!(!suppress_success_verifier_for_context(&ctx, true));
+    }
+
+    #[test]
+    fn suppress_success_verifier_for_context_keeps_dispatch_for_non_setup_request() {
+        let ctx = RequestContext {
+            requires_tests: false,
+            is_env_setup_only: false,
+        };
+        // Regular feature request → verifier never suppressed.
+        assert!(!suppress_success_verifier_for_context(&ctx, false));
+        assert!(!suppress_success_verifier_for_context(&ctx, true));
+    }
+
+    #[test]
+    fn suppressed_context_skips_post_loop_verifier() {
+        let ctx = RequestContext {
+            requires_tests: false,
+            is_env_setup_only: true,
+        };
+        assert!(suppress_success_verifier_for_context(&ctx, true));
+        // When suppression fires in `run_post_loop_success_verifier`,
+        // both `protocol_demands_verifier` and `tester_candidate_some`
+        // collapse to false, so `select_success_verifier` returns `Skip`.
+        assert_eq!(
+            select_success_verifier(false, false, false),
+            SuccessVerifier::Skip,
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #607 (Codex CB-001): env-setup-only evidence helper. The
+    // suppression must require an explicit `VerifierExitZero { class:
+    // EnvSetup, .. }` observation — RepoEdit-only / empty turns must not
+    // trigger the post-loop verifier dispatch suppression.
+    // -----------------------------------------------------------------
+
+    use super::super::completion_evidence::{
+        CompletionEvidence as CE, EvidenceSet as ES, RepoEditCategory,
+    };
+
+    fn setup_only_ctx() -> RequestContext {
+        RequestContext {
+            requires_tests: false,
+            is_env_setup_only: true,
+        }
+    }
+
+    fn tests_required_ctx() -> RequestContext {
+        RequestContext {
+            requires_tests: true,
+            is_env_setup_only: true,
+        }
+    }
+
+    fn env_setup_evidence() -> CE {
+        CE::VerifierExitZero {
+            class: BashCommandClass::EnvSetup,
+            command: "npm install".to_string(),
+        }
+    }
+
+    fn build_test_evidence() -> CE {
+        CE::VerifierExitZero {
+            class: BashCommandClass::BuildTest,
+            command: "cargo test".to_string(),
+        }
+    }
+
+    /// CB-001 (a): setup-only request + only RepoEdit evidence → must NOT
+    /// satisfy the EnvSetup-only suppression predicate. Previously the
+    /// broad `evidence_set_satisfies_with_context` claimed any accepted
+    /// evidence (including a stray RepoEdit) as satisfaction, so the
+    /// verifier dispatch was silenced even when no install ran.
+    #[test]
+    fn env_setup_only_evidence_rejects_repo_edit_only_turn() {
+        let mut set = ES::new();
+        set.push(CE::RepoEdit {
+            category: RepoEditCategory::Impl,
+            count: 1,
+        });
+        for kind in [
+            ProtocolKind::Python,
+            ProtocolKind::TypeScriptUi,
+            ProtocolKind::GenericCode,
+        ] {
+            assert!(
+                !env_setup_only_evidence_satisfies(&set, kind, &setup_only_ctx()),
+                "RepoEdit-only must not count as EnvSetup satisfaction ({kind:?})"
+            );
+        }
+    }
+
+    /// CB-001 (b): setup-only request + empty evidence set → must NOT
+    /// satisfy the EnvSetup-only suppression predicate. Empty turns are
+    /// not proof that the model installed anything.
+    #[test]
+    fn env_setup_only_evidence_rejects_empty_evidence_set() {
+        let set = ES::new();
+        for kind in [
+            ProtocolKind::Python,
+            ProtocolKind::TypeScriptUi,
+            ProtocolKind::GenericCode,
+        ] {
+            assert!(
+                !env_setup_only_evidence_satisfies(&set, kind, &setup_only_ctx()),
+                "empty set must not satisfy EnvSetup ({kind:?})"
+            );
+        }
+    }
+
+    /// CB-001 (c): setup-only request + actual EnvSetup VerifierExitZero
+    /// evidence → satisfies suppression on code-bearing protocols (BP-04a
+    /// behaviour preserved).
+    #[test]
+    fn env_setup_only_evidence_accepts_env_setup_verifier_evidence() {
+        let mut set = ES::new();
+        set.push(env_setup_evidence());
+        for kind in [
+            ProtocolKind::Python,
+            ProtocolKind::TypeScriptUi,
+            ProtocolKind::GenericCode,
+        ] {
+            assert!(
+                env_setup_only_evidence_satisfies(&set, kind, &setup_only_ctx()),
+                "EnvSetup verifier should satisfy suppression for {kind:?}"
+            );
+        }
+    }
+
+    /// CB-001: setup-only + BuildTest verifier only (no EnvSetup) must NOT
+    /// suppress. BuildTest is the "real" verifier; if the model already
+    /// ran tests, completion is decided by the protocol, not by the
+    /// setup-only short-circuit.
+    #[test]
+    fn env_setup_only_evidence_rejects_build_test_only_turn() {
+        let mut set = ES::new();
+        set.push(build_test_evidence());
+        for kind in [
+            ProtocolKind::Python,
+            ProtocolKind::TypeScriptUi,
+            ProtocolKind::GenericCode,
+        ] {
+            assert!(
+                !env_setup_only_evidence_satisfies(&set, kind, &setup_only_ctx()),
+                "BuildTest alone must not trigger EnvSetup suppression ({kind:?})"
+            );
+        }
+    }
+
+    /// CB-001: AnswerOnly / Docs never accept EnvSetup as a basis for
+    /// suppression — running `npm install` is not an answer-only artifact,
+    /// and Docs never wants verifier evidence at all.
+    #[test]
+    fn env_setup_only_evidence_rejects_answer_only_and_docs() {
+        let mut set = ES::new();
+        set.push(env_setup_evidence());
+        for kind in [ProtocolKind::AnswerOnly, ProtocolKind::Docs] {
+            assert!(
+                !env_setup_only_evidence_satisfies(&set, kind, &setup_only_ctx()),
+                "{kind:?} must not enable EnvSetup-only suppression"
+            );
+        }
+    }
+
+    /// CB-001: tests-required context flips the predicate off even when
+    /// EnvSetup evidence is present — the user expects a real verifier to
+    /// run, and BP-04a explicitly defers to BuildTest in that case.
+    #[test]
+    fn env_setup_only_evidence_rejects_when_tests_required() {
+        let mut set = ES::new();
+        set.push(env_setup_evidence());
+        assert!(!env_setup_only_evidence_satisfies(
+            &set,
+            ProtocolKind::GenericCode,
+            &tests_required_ctx(),
+        ));
+    }
+
+    /// CB-001: non-setup-only ctx (regular feature request) → suppression
+    /// is off, regardless of evidence shape.
+    #[test]
+    fn env_setup_only_evidence_rejects_non_setup_only_ctx() {
+        let ctx = RequestContext {
+            requires_tests: false,
+            is_env_setup_only: false,
+        };
+        let mut set = ES::new();
+        set.push(env_setup_evidence());
+        assert!(!env_setup_only_evidence_satisfies(
+            &set,
+            ProtocolKind::GenericCode,
+            &ctx,
+        ));
+    }
+
+    /// CB-001 (integration): when the agent sees only a RepoEdit (no
+    /// EnvSetup verifier) on a setup-only request, the post-loop verifier
+    /// must NOT be suppressed. Compose the helpers the way `success.rs`
+    /// does at the dispatch site.
+    #[test]
+    fn cb001_setup_only_with_only_repo_edit_does_not_suppress_verifier() {
+        let mut set = ES::new();
+        set.push(CE::RepoEdit {
+            category: RepoEditCategory::Setup,
+            count: 1,
+        });
+        let ctx = setup_only_ctx();
+        let satisfied = env_setup_only_evidence_satisfies(&set, ProtocolKind::GenericCode, &ctx);
+        assert!(!satisfied);
+        assert!(!suppress_success_verifier_for_context(&ctx, satisfied));
+    }
+
+    /// CB-001 (integration): an empty evidence set on a setup-only
+    /// request must still leave the verifier free to dispatch.
+    #[test]
+    fn cb001_setup_only_with_empty_evidence_does_not_suppress_verifier() {
+        let set = ES::new();
+        let ctx = setup_only_ctx();
+        let satisfied = env_setup_only_evidence_satisfies(&set, ProtocolKind::GenericCode, &ctx);
+        assert!(!satisfied);
+        assert!(!suppress_success_verifier_for_context(&ctx, satisfied));
+    }
+
+    /// CB-001 (integration): setup-only + EnvSetup verifier observed →
+    /// suppression fires as designed (BP-04a regression pin).
+    #[test]
+    fn cb001_setup_only_with_env_setup_verifier_suppresses() {
+        let mut set = ES::new();
+        set.push(env_setup_evidence());
+        let ctx = setup_only_ctx();
+        let satisfied = env_setup_only_evidence_satisfies(&set, ProtocolKind::GenericCode, &ctx);
+        assert!(satisfied);
+        assert!(suppress_success_verifier_for_context(&ctx, satisfied));
     }
 
     #[test]

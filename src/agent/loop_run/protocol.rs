@@ -1,7 +1,18 @@
 use crate::modes::plan_act::WorkMode;
+use crate::tools::bash::BashCommandClass;
 
 use super::completion_evidence::{CompletionEvidence, EvidenceSet, RepoEditCategory};
 use super::summary::LoopStats;
+
+/// Issue #607: judgment context extracted from the active request text.
+/// Bundled in a struct (instead of two bool params) so future flags
+/// (`request_is_docs_only`, `request_is_bench_only`, …) can be added with
+/// a field append rather than a breaking signature change (DR1-003 OCP).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct RequestContext {
+    pub requires_tests: bool,
+    pub is_env_setup_only: bool,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ProtocolKind {
@@ -84,9 +95,102 @@ impl ProtocolKind {
     }
 
     /// Issue #606 T-1.4: OR-fold — true when any single observation in the
-    /// set is accepted by this protocol.
+    /// set is accepted by this protocol. Pure / context-free.
+    ///
+    /// Production code calls `evidence_set_satisfies_with_context` so the
+    /// EnvSetup vs BuildTest distinction is preserved; the context-free
+    /// form remains for module-level tests and serves as the underlying
+    /// invariant about which evidence kinds the protocol can ever accept.
+    #[cfg(test)]
     pub(super) fn evidence_set_satisfies(self, set: &EvidenceSet) -> bool {
         set.iter().any(|ev| self.accepts(ev))
+    }
+
+    /// Issue #607: context-aware OR-fold. EnvSetup-only `VerifierExitZero`
+    /// only counts when the active request is setup-only (and does not also
+    /// ask for tests). When tests / code are requested the protocol still
+    /// demands a `BuildTest` verifier (or a code-shaped RepoEdit). AnswerOnly
+    /// never accepts EnvSetup alone — running `npm install` is not an
+    /// answer-only artifact. Docs is unchanged.
+    pub(super) fn evidence_set_satisfies_with_context(
+        self,
+        set: &EvidenceSet,
+        ctx: &RequestContext,
+    ) -> bool {
+        // Repo-edit / AnswerOnly evidence retain their context-free semantics.
+        let has_non_env_setup_evidence = set.iter().any(|ev| match ev {
+            CompletionEvidence::VerifierExitZero { class, .. } => {
+                *class != BashCommandClass::EnvSetup && self.accepts(ev)
+            }
+            _ => self.accepts(ev),
+        });
+        if has_non_env_setup_evidence {
+            return true;
+        }
+        // Only EnvSetup verifier(s) are present. Allow completion only for
+        // pure setup-only requests on code-bearing protocols.
+        let env_setup_present = set.iter().any(|ev| {
+            matches!(
+                ev,
+                CompletionEvidence::VerifierExitZero {
+                    class: BashCommandClass::EnvSetup,
+                    ..
+                }
+            )
+        });
+        if !env_setup_present {
+            return false;
+        }
+        if ctx.requires_tests {
+            return false;
+        }
+        if !ctx.is_env_setup_only {
+            return false;
+        }
+        matches!(
+            self,
+            ProtocolKind::Python | ProtocolKind::TypeScriptUi | ProtocolKind::GenericCode
+        )
+    }
+
+    /// Issue #607: context-aware missing-shapes report. When tests/code are
+    /// requested and only EnvSetup evidence is present, surface
+    /// `"verifier_exit_zero"` so the model knows a real BuildTest verifier
+    /// is still required. When setup-only request grants EnvSetup
+    /// satisfaction, the slot is suppressed.
+    pub(super) fn evidence_set_missing_shapes_with_context(
+        self,
+        set: &EvidenceSet,
+        ctx: &RequestContext,
+    ) -> Vec<&'static str> {
+        let mut missing = self.evidence_set_missing_shapes(set);
+        // Tests requested + only EnvSetup verifier in the set → the
+        // context-free helper considers `verifier_exit_zero` satisfied (any
+        // VerifierExitZero counts), but we still need a real test verifier.
+        let only_env_setup_verifier = set
+            .iter()
+            .any(|ev| matches!(ev, CompletionEvidence::VerifierExitZero { .. }))
+            && set.iter().all(|ev| match ev {
+                CompletionEvidence::VerifierExitZero { class, .. } => {
+                    *class == BashCommandClass::EnvSetup
+                }
+                _ => true,
+            });
+        if ctx.requires_tests && only_env_setup_verifier {
+            // Re-add the slot iff this protocol cares about a verifier and
+            // the slot was claimed by the context-free helper.
+            let wants_verifier = matches!(
+                self,
+                ProtocolKind::Python
+                    | ProtocolKind::TypeScriptUi
+                    | ProtocolKind::GenericCode
+                    | ProtocolKind::AnswerOnly
+            );
+            if wants_verifier && !missing.contains(&"verifier_exit_zero") {
+                missing.push("verifier_exit_zero");
+            }
+        }
+        missing
     }
 
     /// Issue #606 T-1.4: human-friendly list of evidence shapes this
@@ -920,5 +1024,151 @@ mod tests {
         let mut set = EvidenceSet::new();
         set.push(ev_verifier());
         assert!(!ProtocolKind::Docs.evidence_set_satisfies(&set));
+    }
+
+    // ---------------------------------------------------------------------
+    // Issue #607 VR-β-04 (f): EnvSetup verifier matrix.
+    // ---------------------------------------------------------------------
+
+    fn ev_env_setup() -> CompletionEvidence {
+        CompletionEvidence::VerifierExitZero {
+            class: BashCommandClass::EnvSetup,
+            command: "npm install".to_string(),
+        }
+    }
+
+    /// Context-free `accepts()` treats EnvSetup `VerifierExitZero` the same
+    /// way it treats BuildTest — every code-bearing protocol receives it,
+    /// Docs rejects it. The context-aware satisfaction logic above narrows
+    /// this down per request shape.
+    #[test]
+    fn protocol_kind_accepts_env_setup_verifier_matrix() {
+        let env_setup = ev_env_setup();
+        assert!(ProtocolKind::Python.accepts(&env_setup));
+        assert!(ProtocolKind::TypeScriptUi.accepts(&env_setup));
+        assert!(ProtocolKind::GenericCode.accepts(&env_setup));
+        assert!(ProtocolKind::AnswerOnly.accepts(&env_setup));
+        assert!(!ProtocolKind::Docs.accepts(&env_setup));
+    }
+
+    fn setup_only_ctx() -> RequestContext {
+        RequestContext {
+            requires_tests: false,
+            is_env_setup_only: true,
+        }
+    }
+
+    fn tests_required_ctx() -> RequestContext {
+        RequestContext {
+            requires_tests: true,
+            is_env_setup_only: false,
+        }
+    }
+
+    #[test]
+    fn evidence_set_satisfies_env_setup_context_matrix() {
+        // BuildTest alone — every code-bearing protocol + AnswerOnly accept.
+        let mut build_only = EvidenceSet::new();
+        build_only.push(ev_verifier());
+        for kind in [
+            ProtocolKind::Python,
+            ProtocolKind::TypeScriptUi,
+            ProtocolKind::GenericCode,
+            ProtocolKind::AnswerOnly,
+        ] {
+            assert!(
+                kind.evidence_set_satisfies_with_context(&build_only, &setup_only_ctx()),
+                "BuildTest alone should satisfy {kind:?}"
+            );
+            assert!(
+                kind.evidence_set_satisfies_with_context(&build_only, &tests_required_ctx()),
+                "BuildTest alone should satisfy {kind:?} even when tests required"
+            );
+        }
+        assert!(
+            !ProtocolKind::Docs.evidence_set_satisfies_with_context(&build_only, &setup_only_ctx())
+        );
+
+        // EnvSetup alone (setup-only) — Python / TypeScriptUi / GenericCode ✔.
+        let mut env_only = EvidenceSet::new();
+        env_only.push(ev_env_setup());
+        for kind in [
+            ProtocolKind::Python,
+            ProtocolKind::TypeScriptUi,
+            ProtocolKind::GenericCode,
+        ] {
+            assert!(
+                kind.evidence_set_satisfies_with_context(&env_only, &setup_only_ctx()),
+                "EnvSetup alone should satisfy {kind:?} for setup-only"
+            );
+        }
+        // AnswerOnly: EnvSetup alone is not an answer-only artifact.
+        assert!(
+            !ProtocolKind::AnswerOnly
+                .evidence_set_satisfies_with_context(&env_only, &setup_only_ctx())
+        );
+        // Docs always rejects.
+        assert!(
+            !ProtocolKind::Docs.evidence_set_satisfies_with_context(&env_only, &setup_only_ctx())
+        );
+
+        // EnvSetup alone but tests requested — every protocol rejects.
+        for kind in [
+            ProtocolKind::Python,
+            ProtocolKind::TypeScriptUi,
+            ProtocolKind::GenericCode,
+            ProtocolKind::AnswerOnly,
+            ProtocolKind::Docs,
+        ] {
+            assert!(
+                !kind.evidence_set_satisfies_with_context(&env_only, &tests_required_ctx()),
+                "EnvSetup alone must not satisfy {kind:?} when tests required"
+            );
+        }
+
+        // EnvSetup + BuildTest — BuildTest is the satisfier, valid for all
+        // code-bearing protocols + AnswerOnly.
+        let mut env_plus_build = EvidenceSet::new();
+        env_plus_build.push(ev_env_setup());
+        env_plus_build.push(ev_verifier());
+        for kind in [
+            ProtocolKind::Python,
+            ProtocolKind::TypeScriptUi,
+            ProtocolKind::GenericCode,
+            ProtocolKind::AnswerOnly,
+        ] {
+            assert!(
+                kind.evidence_set_satisfies_with_context(&env_plus_build, &tests_required_ctx()),
+                "EnvSetup + BuildTest should satisfy {kind:?} when tests required"
+            );
+            assert!(
+                kind.evidence_set_satisfies_with_context(&env_plus_build, &setup_only_ctx()),
+                "EnvSetup + BuildTest should satisfy {kind:?} when setup-only"
+            );
+        }
+        assert!(
+            !ProtocolKind::Docs
+                .evidence_set_satisfies_with_context(&env_plus_build, &tests_required_ctx())
+        );
+    }
+
+    /// Missing-shape reporting in context. With EnvSetup-only evidence and
+    /// tests requested, `"verifier_exit_zero"` stays in the missing list to
+    /// nudge the model to run a real test. With setup-only and EnvSetup
+    /// evidence, the slot is satisfied and not reported.
+    #[test]
+    fn evidence_set_missing_shapes_with_context_reflects_env_setup_satisfaction() {
+        let mut env_only = EvidenceSet::new();
+        env_only.push(ev_env_setup());
+
+        // setup-only: verifier slot is satisfied → not in missing list.
+        let setup_missing = ProtocolKind::GenericCode
+            .evidence_set_missing_shapes_with_context(&env_only, &setup_only_ctx());
+        assert!(!setup_missing.contains(&"verifier_exit_zero"));
+
+        // tests required: still missing.
+        let tests_missing = ProtocolKind::GenericCode
+            .evidence_set_missing_shapes_with_context(&env_only, &tests_required_ctx());
+        assert!(tests_missing.contains(&"verifier_exit_zero"));
     }
 }

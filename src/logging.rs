@@ -374,10 +374,11 @@ mod tests {
         );
     }
 
-    /// Issue #606 U-16: pin that `mask_payload_inplace` preserves the
-    /// payload key set used by the three completion-evidence events
-    /// (`agent.completion_evidence.{observed,satisfied,unsatisfied}`).
-    /// Same shape as the existing reminder-payload pin (VR-06).
+    /// Issue #606 U-16 / Issue #607: pin that `mask_payload_inplace`
+    /// preserves the payload key set used by the three completion-evidence
+    /// events (`agent.completion_evidence.{observed,satisfied,unsatisfied}`).
+    /// Snake_case `command_class` matches the `BashCommandClass`
+    /// serde rename_all schema introduced in Issue #607 (BP-07).
     #[test]
     fn mask_payload_inplace_preserves_completion_evidence_payload_key_set() {
         let mut payload = json!({
@@ -385,7 +386,7 @@ mod tests {
             "iter_index": 2,
             "evidence_kind": "verifier_exit_zero",
             "detail": {
-                "command_class": "BuildTest",
+                "command_class": "build_test",
             },
             "protocol_kind": "python",
             "missing_shapes": ["repo_edit_impl_or_test", "verifier_exit_zero"],
@@ -416,12 +417,49 @@ mod tests {
         assert_eq!(payload["protocol_kind"].as_str().unwrap(), "python");
         assert_eq!(
             payload["detail"]["command_class"].as_str().unwrap(),
-            "BuildTest"
+            "build_test"
         );
         assert_eq!(
             payload["missing_shapes"][0].as_str().unwrap(),
             "repo_edit_impl_or_test"
         );
+    }
+
+    /// Issue #607: same shape with the new `env_setup` label — the mask
+    /// pipeline preserves it identically.
+    #[test]
+    fn mask_payload_inplace_preserves_env_setup_command_class_label() {
+        let mut payload = json!({
+            "turn_index": 7,
+            "iter_index": 0,
+            "evidence_kind": "verifier_exit_zero",
+            "detail": {
+                "command_class": "env_setup",
+            },
+            "protocol_kind": "generic_code",
+            "missing_shapes": ["repo_edit_any"],
+            "observed_count": 1,
+        });
+        let before_keys: Vec<String> = payload
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        mask_payload_inplace(&mut payload);
+        let after_keys: Vec<String> = payload
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(before_keys, after_keys);
+        assert_eq!(payload["turn_index"], json!(7));
+        assert_eq!(
+            payload["detail"]["command_class"].as_str().unwrap(),
+            "env_setup"
+        );
+        assert_eq!(payload["protocol_kind"].as_str().unwrap(), "generic_code");
     }
 
     #[test]
