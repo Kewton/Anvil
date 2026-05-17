@@ -461,3 +461,223 @@ fn output_flag_writes_jsonl_one_line_per_summary() {
         assert_eq!(parsed.schema_version, ACTION_SUMMARY_SCHEMA_VERSION);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Issue #608 Phase α-2 (AP-10 / 案A): tests-only success regression
+// ---------------------------------------------------------------------------
+
+/// AP-10: a CaseRecord with `tests_passed=true` and no artifact, where
+/// `build_passed` is None, must still pass the quality gate so it is
+/// promoted to a photon seed. Pins the design 設計判断 #1 (案A) interpretation.
+#[test]
+fn ap10_tests_only_success_passes_quality_gate() {
+    let mut c = make_case(&unique_case_id(70));
+    c.outcome_score.build_passed = None;
+    c.outcome_score.tests_passed = Some(true);
+    c.outcome_score.user_visible_artifact = false;
+    let promoted: HashSet<String> = HashSet::new();
+    let r = check_quality_gate(&c, &promoted, c.created_at + 1);
+    assert!(
+        r.is_ok(),
+        "tests-only success must pass quality gate, got {:?}",
+        r
+    );
+}
+
+/// AP-10: `build_passed == Some(false)` must override tests-only success
+/// (verifier failure > test success per design 設計判断 #1).
+#[test]
+fn ap10_build_failure_overrides_tests_only_success() {
+    let mut c = make_case(&unique_case_id(71));
+    c.outcome_score.build_passed = Some(false);
+    c.outcome_score.tests_passed = Some(true);
+    c.outcome_score.user_visible_artifact = false;
+    let promoted: HashSet<String> = HashSet::new();
+    let r = check_quality_gate(&c, &promoted, c.created_at + 1);
+    assert_eq!(r, Err(SkipReason::NotSuccessState));
+}
+
+/// AP-10: tests_only path runs through full pipeline (convert →
+/// ActionSummary serialization). Confidence comes from the verifier-active
+/// 3-tier derivation: tests_passed=true && user_visible_artifact=false ⇒
+/// confidence_prior = 0.8.
+#[test]
+fn ap10_tests_only_success_yields_08_confidence_in_summary() {
+    let mut c = make_case(&unique_case_id(72));
+    c.outcome_score.tests_passed = Some(true);
+    c.outcome_score.user_visible_artifact = false;
+    let s = convert_case_to_action_summary(&c, "sess-ap10", "2026-05-17T00:00:00Z");
+    let prov = s.provenance.unwrap();
+    assert!(prov.verifier_active);
+    assert_eq!(prov.confidence_prior, 0.8);
+    assert!(s.summary_id.starts_with(SUMMARY_ID_PREFIX));
+}
+
+// ---------------------------------------------------------------------------
+// CB-002 (codex review fix): unsafe_actions_blocked must block full_pass
+// promotion even when build / tests / artifact are all green.
+// ---------------------------------------------------------------------------
+
+/// CB-002: a CaseRecord with `build_passed = true`, `tests_passed = true`,
+/// `user_visible_artifact = true` but `unsafe_actions_blocked > 0` MUST
+/// be rejected by the quality gate with `SkipReason::NotSuccessState`.
+/// Previously the full_pass branch ignored `unsafe_actions_blocked`,
+/// allowing an unsafe turn to be promoted into a photon seed.
+#[test]
+fn cb_002_full_pass_with_unsafe_blocks_fails_quality_gate() {
+    let mut c = make_case(&unique_case_id(80));
+    // baseline_score() already has unsafe_actions_blocked=0; flip it.
+    c.outcome_score.build_passed = Some(true);
+    c.outcome_score.tests_passed = Some(true);
+    c.outcome_score.user_visible_artifact = true;
+    c.outcome_score.unsafe_actions_blocked = 1;
+    let promoted: HashSet<String> = HashSet::new();
+    let r = check_quality_gate(&c, &promoted, c.created_at + 1);
+    assert_eq!(
+        r,
+        Err(SkipReason::NotSuccessState),
+        "CB-002: unsafe_actions_blocked > 0 must trigger NotSuccessState even on full_pass"
+    );
+}
+
+/// CB-002: the verifier-less fallback already enforced
+/// `unsafe_actions_blocked == 0`. Pin that path so the invariant holds
+/// across both branches.
+#[test]
+fn cb_002_verifier_less_with_unsafe_blocks_fails_quality_gate() {
+    let mut c = make_case(&unique_case_id(81));
+    c.outcome_score.build_passed = None;
+    c.outcome_score.tests_passed = None;
+    c.outcome_score.user_visible_artifact = true;
+    c.outcome_score.unsafe_actions_blocked = 1;
+    let promoted: HashSet<String> = HashSet::new();
+    let r = check_quality_gate(&c, &promoted, c.created_at + 1);
+    assert_eq!(r, Err(SkipReason::NotSuccessState));
+}
+
+/// CB-002 promotion-pipeline regression: a CaseRecord with
+/// `unsafe_actions_blocked > 0` must be SKIPPED end-to-end by
+/// `run_photon_promote` even when build/tests/artifact are green.
+/// Failing means the case appears in the dedup log → CaseRecord leaked.
+#[test]
+fn cb_002_unsafe_full_pass_is_skipped_by_run_photon_promote() {
+    let tmp = TempDir::new().unwrap();
+    let mut c = make_case(&unique_case_id(82));
+    c.outcome_score.unsafe_actions_blocked = 2;
+    write_case(tmp.path(), &c);
+
+    run_photon_promote(
+        tmp.path(),
+        tmp.path(),
+        None,
+        None,
+        true, // --all (CB-003 selector exactly-one)
+        false,
+        true,
+        false,
+        None,
+    )
+    .unwrap();
+
+    let promoted = read_promote_log(tmp.path()).unwrap();
+    assert!(
+        !promoted.contains(&c.case_id),
+        "CB-002: case with unsafe_actions_blocked > 0 must NOT appear in dedup log as promoted; got: {promoted:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// CB-003 (codex review fix): photon-promote selector exactly-one + --session
+// unsupported.
+// ---------------------------------------------------------------------------
+
+/// CB-003: zero selectors is rejected (previously interpreted as
+/// "promote everything").
+#[test]
+fn cb_003_no_selector_rejected() {
+    let tmp = TempDir::new().unwrap();
+    let r = run_photon_promote(
+        tmp.path(),
+        tmp.path(),
+        None,
+        None,
+        false,
+        true,
+        true,
+        false,
+        None,
+    );
+    assert!(r.is_err(), "no selector must return Err; got {r:?}");
+    let msg = r.unwrap_err();
+    assert!(
+        msg.contains("exactly one"),
+        "error must mention `exactly one` selector requirement; got {msg:?}"
+    );
+}
+
+/// CB-003: `--session` is explicitly unsupported in Phase A.
+#[test]
+fn cb_003_session_selector_rejected_as_unsupported() {
+    let tmp = TempDir::new().unwrap();
+    let r = run_photon_promote(
+        tmp.path(),
+        tmp.path(),
+        Some("sess-x".to_string()),
+        None,
+        false,
+        true,
+        true,
+        false,
+        None,
+    );
+    assert!(r.is_err(), "--session selector must return Err; got {r:?}");
+    let msg = r.unwrap_err();
+    assert!(
+        msg.contains("--session"),
+        "error must reference --session; got {msg:?}"
+    );
+    assert!(
+        msg.contains("not yet supported")
+            || msg.contains("unsupported")
+            || msg.contains("not supported"),
+        "error must say unsupported; got {msg:?}"
+    );
+}
+
+/// CB-003: `--case-id` only is accepted.
+#[test]
+fn cb_003_case_id_selector_accepted() {
+    let tmp = TempDir::new().unwrap();
+    let c = make_case(&unique_case_id(83));
+    write_case(tmp.path(), &c);
+    let r = run_photon_promote(
+        tmp.path(),
+        tmp.path(),
+        None,
+        Some(c.case_id.clone()),
+        false,
+        true,
+        false,
+        false,
+        None,
+    );
+    assert!(r.is_ok(), "--case-id alone must be accepted; got {r:?}");
+}
+
+/// CB-003: `--all` only is accepted.
+#[test]
+fn cb_003_all_selector_accepted() {
+    let tmp = TempDir::new().unwrap();
+    let r = run_photon_promote(
+        tmp.path(),
+        tmp.path(),
+        None,
+        None,
+        true,
+        true,
+        false,
+        false,
+        None,
+    );
+    assert!(r.is_ok(), "--all alone must be accepted; got {r:?}");
+}

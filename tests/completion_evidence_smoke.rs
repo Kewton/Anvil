@@ -237,3 +237,151 @@ fn agent_construction_after_evidence_set_wiring_does_not_panic() {
     // Drop the agent; the test passes if the constructor + Drop pipeline
     // doesn't panic. The new `evidence_set_this_turn` field default-inits.
 }
+
+// ----------------------- Issue #608 Phase 2C (AP-08 hook regressions) ------
+
+/// AP-08 hook regression: Bash tool output for a BuildTest class command
+/// flows through the `test_output` formatter (FAILED summary + tail trim)
+/// before the byte cap. Verifies the FAILED summary header is exposed at the
+/// head of the body (after `exit_code=` metadata).
+#[test]
+fn test_output_formatter_pipeline_renders_failed_summary_head() {
+    use anvil::tools::test_output::format_for_tool_result;
+    // Synthetic pytest output where the FAILED line is buried in noise.
+    let mut s = String::new();
+    for i in 0..200 {
+        s.push_str(&format!("noise line {i}\n"));
+    }
+    s.push_str("FAILED tests/test_a.py::test_x - boom\n");
+    let formatted = format_for_tool_result(&s);
+    assert!(
+        formatted.starts_with("FAILED: 1 test(s)"),
+        "FAILED header must be at head of formatted body: {:?}",
+        &formatted[..50.min(formatted.len())]
+    );
+    assert!(formatted.contains("test_x"));
+}
+
+/// AP-08 leak regression: a verifier command that printed an Authorization
+/// header to stderr must not surface that header through the formatter
+/// output. mask_secrets (token + URL credential) is applied to the trimmed
+/// body in `format_for_tool_result`.
+#[test]
+fn test_output_formatter_strips_url_credentials_from_body() {
+    use anvil::tools::test_output::format_for_tool_result;
+    let mut s = String::new();
+    s.push_str("FAILED tests/test_a.py::test_x\n");
+    for i in 0..50 {
+        s.push_str(&format!("frame {i}\n"));
+    }
+    s.push_str("calling https://user:hunter2@api.example.com/x\n");
+    let formatted = format_for_tool_result(&s);
+    assert!(
+        !formatted.contains("hunter2"),
+        "URL userinfo must be redacted by formatter body mask: {:?}",
+        formatted
+    );
+    assert!(
+        formatted.starts_with("FAILED: 1 test(s)"),
+        "summary header missing: {:?}",
+        &formatted[..50.min(formatted.len())]
+    );
+}
+
+/// CB-001 regression: header-family credentials (Authorization / Cookie /
+/// X-API-Key / X-Auth-Token) printed in stderr of a failing verifier must
+/// not surface through the formatter pipeline. The body redaction stacks
+/// `mask_secrets` + `mask_header_family` so these header lines are
+/// rewritten to `Header: <REDACTED>` before reaching the tool result.
+#[test]
+fn test_output_formatter_strips_header_family_credentials_from_body() {
+    use anvil::tools::test_output::format_for_tool_result;
+    let mut s = String::new();
+    s.push_str("FAILED tests/test_a.py::test_x\n");
+    for i in 0..50 {
+        s.push_str(&format!("frame {i}\n"));
+    }
+    s.push_str("> Authorization: Bearer cb001_bearer_leak_value_AAA\n");
+    s.push_str("> Cookie: session=cb001_cookie_leak_value_BBB; theme=dark\n");
+    s.push_str("> X-API-Key: cb001_apikey_leak_value_CCC\n");
+    s.push_str("> X-Auth-Token: cb001_xauthtoken_leak_value_DDD\n");
+    let formatted = format_for_tool_result(&s);
+    for leak in [
+        "cb001_bearer_leak_value_AAA",
+        "cb001_cookie_leak_value_BBB",
+        "cb001_apikey_leak_value_CCC",
+        "cb001_xauthtoken_leak_value_DDD",
+    ] {
+        assert!(
+            !formatted.contains(leak),
+            "raw header credential {leak} leaked into formatter output: {:?}",
+            formatted
+        );
+    }
+    assert!(
+        formatted.contains("<REDACTED>"),
+        "header redaction marker missing: {:?}",
+        formatted
+    );
+    assert!(
+        formatted.starts_with("FAILED: 1 test(s)"),
+        "summary header missing: {:?}",
+        &formatted[..50.min(formatted.len())]
+    );
+}
+
+/// CB-001 regression: header-family credentials embedded INSIDE the FAILED
+/// test name (parametrized test that captures a header value) must also
+/// be redacted in the FAILED summary bullet line.
+#[test]
+fn test_output_formatter_strips_header_family_credentials_from_failed_name() {
+    use anvil::tools::test_output::format_for_tool_result;
+    let s = "FAILED tests/test_a.py::test[hdr=Authorization: Bearer cb001_in_name_value] - boom\n";
+    let formatted = format_for_tool_result(s);
+    assert!(
+        !formatted.contains("cb001_in_name_value"),
+        "raw bearer in failed-name leaked into formatter output: {:?}",
+        formatted
+    );
+    assert!(formatted.contains("<REDACTED>"));
+    assert!(formatted.starts_with("FAILED: 1 test(s)"));
+}
+
+// ----------------------- Issue #608 Phase 2H VR-coverage smoke -------------
+
+/// Phase 2H VR-06: legacy session.json (no AP-09 fields) still
+/// deserializes cleanly. Light cross-crate smoke that the SessionSnapshot
+/// schema growth is forward-compatible.
+#[test]
+fn legacy_session_json_without_ap09_fields_deserializes_via_default() {
+    use anvil::session::store::SessionSnapshot;
+    let snap = SessionSnapshot::default();
+    assert!(snap.last_verifier_command.is_none());
+    assert!(snap.last_verifier_invocation.is_none());
+    let json = serde_json::to_string(&snap).unwrap();
+    // skip_serializing_if = "Option::is_none" — keys absent for None.
+    assert!(!json.contains("\"last_verifier_command\""));
+    assert!(!json.contains("\"last_verifier_invocation\""));
+    let back: SessionSnapshot = serde_json::from_str(&json).unwrap();
+    assert!(back.last_verifier_command.is_none());
+}
+
+/// Phase 2H VR-04: secret-bearing verifier command is redacted on save,
+/// re-redacted on load (defense-in-depth). Smoke check at the
+/// integration layer.
+#[test]
+fn verifier_command_persisted_with_secrets_is_redacted_round_trip() {
+    use anvil::session::store::SessionSnapshot;
+    let snap = SessionSnapshot {
+        last_verifier_command: Some(
+            "cargo test --env api_key=ghp_supersecretvalueABCDEFGHIJKLMNOP".to_string(),
+        ),
+        ..Default::default()
+    };
+    let json = serde_json::to_string(&snap).unwrap();
+    assert!(!json.contains("ghp_supersecretvalueABCDEFGHIJKLMNOP"));
+    let back: SessionSnapshot = serde_json::from_str(&json).unwrap();
+    let stored = back.last_verifier_command.unwrap();
+    assert!(!stored.contains("ghp_supersecretvalueABCDEFGHIJKLMNOP"));
+    assert!(stored.contains("***"));
+}
