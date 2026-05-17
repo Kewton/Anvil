@@ -197,14 +197,19 @@ impl Agent {
             let kind = protocol.kind();
             let evidence_satisfied =
                 kind.evidence_set_satisfies_with_context(&self.evidence_set_this_turn, &ctx);
-            if let Some(issue) = protocol.success_issue_with_context(ProtocolSuccessContext {
+            let success_context = ProtocolSuccessContext {
                 stats,
                 deterministic_recovery_recorded,
                 model_repo_edits_this_turn,
                 requested_paths: &requested_paths,
                 verifier_passed_after_edit: None,
                 evidence_satisfied,
-            }) {
+            };
+            let deterministic_rescued = protocol
+                .success_evidence(success_context)
+                .deterministic_only
+                && evidence_satisfied;
+            if let Some(issue) = protocol.success_issue_with_context(success_context) {
                 let missing = kind
                     .evidence_set_missing_shapes_with_context(&self.evidence_set_this_turn, &ctx);
                 crate::logging::log_completion_evidence_unsatisfied(
@@ -217,6 +222,13 @@ impl Agent {
                 *error_text = issue;
                 false
             } else {
+                if deterministic_rescued {
+                    crate::logging::log_completion_evidence_deterministic_rescued(
+                        self.current_turn_index,
+                        kind.label(),
+                        self.evidence_set_this_turn.len(),
+                    );
+                }
                 if evidence_satisfied {
                     crate::logging::log_completion_evidence_satisfied(
                         self.current_turn_index,

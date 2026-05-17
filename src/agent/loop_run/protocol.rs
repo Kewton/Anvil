@@ -305,10 +305,9 @@ pub(super) struct ProtocolSuccessContext<'a> {
     /// Issue #606 (T-1.4): Stage-2 short-circuit signal. When the agent
     /// post-hoc-observed enough evidence to satisfy the active protocol via
     /// `ProtocolKind::evidence_set_satisfies`, `success.rs` sets this to
-    /// `true` so the per-protocol per-kind reject text never fires. Stage 1
-    /// (`deterministic_only` / `verifier_passed_after_edit == Some(false)`)
-    /// still wins because those are deterministic failure signals, not
-    /// missing-evidence signals.
+    /// `true` so the per-protocol per-kind reject text never fires. Verifier
+    /// failure after an edit still wins. `deterministic_only` is only a
+    /// missing-evidence signal once Stage-2 evidence is absent.
     pub(super) evidence_satisfied: bool,
 }
 
@@ -358,11 +357,12 @@ impl ExecutionProtocol {
         self,
         context: ProtocolSuccessContext<'_>,
     ) -> Option<String> {
-        // Issue #606 T-1.5: Stage-1 deterministic failure signals always win.
-        // Stage-2 (`evidence_satisfied`) is honored only after Stage-1 cleared.
+        // Issue #613: Stage-2 evidence can rescue deterministic-only turns.
+        // A read-only investigation may have model-produced AnswerOnly-style
+        // evidence while deterministic recovery was recorded as context.
         let evidence_satisfied = context.evidence_satisfied;
         let evidence = self.success_evidence(context);
-        if evidence.deterministic_only {
+        if evidence.deterministic_only && !evidence_satisfied {
             return Some(
                 "protocol requires model-produced or verified work; deterministic fallback is recovery context, not completion"
                     .to_string(),
@@ -748,6 +748,123 @@ mod tests {
                     requested_paths: &[],
                     verifier_passed_after_edit: None,
                     evidence_satisfied: false,
+                })
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn deterministic_only_with_answer_only_evidence_rescued() {
+        let protocol = ExecutionProtocol::from_work_mode(WorkMode::GenericCode);
+        let stats = stats(&[], 0);
+
+        assert!(
+            protocol
+                .success_issue_with_context(ProtocolSuccessContext {
+                    stats: &stats,
+                    deterministic_recovery_recorded: true,
+                    model_repo_edits_this_turn: 0,
+                    requested_paths: &[],
+                    verifier_passed_after_edit: None,
+                    evidence_satisfied: true,
+                })
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn deterministic_only_without_evidence_still_fails() {
+        let protocol = ExecutionProtocol::from_work_mode(WorkMode::GenericCode);
+        let stats = stats(&[], 0);
+
+        assert_eq!(
+            protocol.success_issue_with_context(ProtocolSuccessContext {
+                stats: &stats,
+                deterministic_recovery_recorded: true,
+                model_repo_edits_this_turn: 0,
+                requested_paths: &[],
+                verifier_passed_after_edit: None,
+                evidence_satisfied: false,
+            }),
+            Some(
+                "protocol requires model-produced or verified work; deterministic fallback is recovery context, not completion"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn answer_only_with_repo_edit_still_rejected_after_rescue() {
+        let protocol = ExecutionProtocol::from_work_mode(WorkMode::AnswerOnly);
+        let stats = stats(&["README.md"], 1);
+
+        assert_eq!(
+            protocol.success_issue_with_context(ProtocolSuccessContext {
+                stats: &stats,
+                deterministic_recovery_recorded: true,
+                model_repo_edits_this_turn: 0,
+                requested_paths: &[],
+                verifier_passed_after_edit: None,
+                evidence_satisfied: true,
+            }),
+            Some(
+                "answer-only protocol completed with repository edits; retry without changing files"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn verifier_failed_after_edit_still_fails_when_evidence_satisfied() {
+        let protocol = ExecutionProtocol::from_work_mode(WorkMode::GenericCode);
+        let stats = stats(&["src/app.ts"], 1);
+
+        assert_eq!(
+            protocol.success_issue_with_context(ProtocolSuccessContext {
+                stats: &stats,
+                deterministic_recovery_recorded: true,
+                model_repo_edits_this_turn: 0,
+                requested_paths: &[],
+                verifier_passed_after_edit: Some(false),
+                evidence_satisfied: true,
+            }),
+            Some("protocol verifier failed after the edit".to_string())
+        );
+    }
+
+    #[test]
+    fn investigation_style_turn_succeeds_with_had_read_only() {
+        let protocol = ExecutionProtocol::from_work_mode(WorkMode::TypeScriptUi);
+        let stats = stats(&[], 0);
+
+        assert!(
+            protocol
+                .success_issue_with_context(ProtocolSuccessContext {
+                    stats: &stats,
+                    deterministic_recovery_recorded: true,
+                    model_repo_edits_this_turn: 0,
+                    requested_paths: &[],
+                    verifier_passed_after_edit: None,
+                    evidence_satisfied: true,
+                })
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn python_mode_with_read_only_investigation_succeeds() {
+        let protocol = ExecutionProtocol::from_work_mode(WorkMode::Python);
+        let stats = stats(&[], 0);
+
+        assert!(
+            protocol
+                .success_issue_with_context(ProtocolSuccessContext {
+                    stats: &stats,
+                    deterministic_recovery_recorded: true,
+                    model_repo_edits_this_turn: 0,
+                    requested_paths: &[],
+                    verifier_passed_after_edit: None,
+                    evidence_satisfied: true,
                 })
                 .is_none()
         );

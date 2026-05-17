@@ -156,8 +156,11 @@ pub(crate) fn is_secret_like_key(key: &str) -> bool {
 //   * `agent.completion_evidence.unsatisfied` — fired from success.rs when
 //     the protocol's reject text is still produced; the payload carries the
 //     `missing_shapes` slice from `evidence_set_missing_shapes`.
+//   * `agent.completion_evidence.deterministic_rescued` — fired when
+//     Stage-2 evidence rescues a turn that would otherwise be rejected as
+//     deterministic-only recovery.
 //
-// All three payloads pass through `mask_payload_inplace` (called from
+// All payloads pass through `mask_payload_inplace` (called from
 // `log_llm_event`) as the final defence line per CLAUDE.md Security
 // Invariants. The helpers only construct the payload — they do not bypass
 // that pipeline.
@@ -217,6 +220,20 @@ pub(crate) fn log_completion_evidence_unsatisfied(
         "observed_count": observed_count,
     });
     log_llm_event("agent.completion_evidence.unsatisfied", payload);
+}
+
+/// Issue #613 — `agent.completion_evidence.deterministic_rescued`.
+pub(crate) fn log_completion_evidence_deterministic_rescued(
+    turn_index: usize,
+    protocol_kind: &'static str,
+    observed_count: usize,
+) {
+    let payload = json!({
+        "turn_index": turn_index,
+        "protocol_kind": protocol_kind,
+        "observed_count": observed_count,
+    });
+    log_llm_event("agent.completion_evidence.deterministic_rescued", payload);
 }
 
 #[cfg(test)]
@@ -374,9 +391,10 @@ mod tests {
         );
     }
 
-    /// Issue #606 U-16 / Issue #607: pin that `mask_payload_inplace`
-    /// preserves the payload key set used by the three completion-evidence
-    /// events (`agent.completion_evidence.{observed,satisfied,unsatisfied}`).
+    /// Issue #606 U-16 / Issue #607 / Issue #613: pin that
+    /// `mask_payload_inplace` preserves the payload key set used by the
+    /// completion-evidence events (`agent.completion_evidence.{observed,
+    /// satisfied,unsatisfied,deterministic_rescued}`).
     /// Snake_case `command_class` matches the `BashCommandClass`
     /// serde rename_all schema introduced in Issue #607 (BP-07).
     #[test]
