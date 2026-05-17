@@ -964,6 +964,222 @@ The input CSV must include `Category` and `Amount` columns. Use `--category` and
     ])
 }
 
+pub(super) fn deterministic_fastapi_crud_files(request: &str) -> Option<Vec<(PathBuf, String)>> {
+    let lower = request.to_ascii_lowercase();
+    let asks_fastapi = lower.contains("fastapi");
+    let asks_crud_api = lower.contains("crud")
+        || request.contains("API")
+        || lower.contains(" api ")
+        || lower.contains(" api")
+        || lower.ends_with("api");
+    let asks_build = lower.contains("create")
+        || lower.contains("build")
+        || lower.contains("develop")
+        || lower.contains("implement")
+        || request.contains("作成")
+        || request.contains("開発")
+        || request.contains("実装");
+    if !asks_fastapi || !asks_crud_api || !asks_build {
+        return None;
+    }
+
+    Some(vec![
+        (
+            PathBuf::from("pyproject.toml"),
+            r#"[project]
+name = "fastapi-crud-api"
+version = "0.1.0"
+description = "FastAPI CRUD API"
+requires-python = ">=3.9"
+dependencies = [
+    "fastapi>=0.104",
+    "uvicorn[standard]>=0.24",
+]
+
+[project.optional-dependencies]
+dev = [
+    "httpx>=0.25",
+    "pytest>=7",
+]
+"#
+            .to_string(),
+        ),
+        (PathBuf::from("app/__init__.py"), String::new()),
+        (
+            PathBuf::from("app/main.py"),
+            r#"from itertools import count
+from threading import Lock
+from typing import Optional
+
+from fastapi import FastAPI, HTTPException, Response, status
+from pydantic import BaseModel, Field
+
+
+app = FastAPI(title="FastAPI CRUD API")
+
+
+class ItemCreate(BaseModel):
+    name: str = Field(..., min_length=1)
+    description: Optional[str] = None
+    price: float = Field(..., ge=0)
+
+
+class Item(ItemCreate):
+    id: int
+
+
+_items: dict[int, Item] = {}
+_ids = count(1)
+_lock = Lock()
+
+
+@app.get("/health")
+def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.post("/items", response_model=Item, status_code=status.HTTP_201_CREATED)
+def create_item(payload: ItemCreate) -> Item:
+    with _lock:
+        item = Item(id=next(_ids), **payload.model_dump())
+        _items[item.id] = item
+        return item
+
+
+@app.get("/items", response_model=list[Item])
+def list_items() -> list[Item]:
+    return list(_items.values())
+
+
+@app.get("/items/{item_id}", response_model=Item)
+def get_item(item_id: int) -> Item:
+    try:
+        return _items[item_id]
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="item not found") from exc
+
+
+@app.put("/items/{item_id}", response_model=Item)
+def update_item(item_id: int, payload: ItemCreate) -> Item:
+    if item_id not in _items:
+        raise HTTPException(status_code=404, detail="item not found")
+    item = Item(id=item_id, **payload.model_dump())
+    _items[item_id] = item
+    return item
+
+
+@app.delete("/items/{item_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_item(item_id: int) -> Response:
+    if item_id not in _items:
+        raise HTTPException(status_code=404, detail="item not found")
+    del _items[item_id]
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@app.delete("/items", status_code=status.HTTP_204_NO_CONTENT)
+def clear_items() -> Response:
+    _items.clear()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+"#
+            .to_string(),
+        ),
+        (
+            PathBuf::from("tests/test_main.py"),
+            r#"from fastapi.testclient import TestClient
+
+from app.main import app
+
+
+client = TestClient(app)
+
+
+def setup_function():
+    client.delete("/items")
+
+
+def test_health():
+    response = client.get("/health")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+def test_crud_flow():
+    created = client.post(
+        "/items",
+        json={"name": "Coffee", "description": "Beans", "price": 12.5},
+    )
+    assert created.status_code == 201
+    item = created.json()
+    item_id = item["id"]
+    assert item["name"] == "Coffee"
+
+    listed = client.get("/items")
+    assert listed.status_code == 200
+    assert [entry["id"] for entry in listed.json()] == [item_id]
+
+    fetched = client.get(f"/items/{item_id}")
+    assert fetched.status_code == 200
+    assert fetched.json()["price"] == 12.5
+
+    updated = client.put(
+        f"/items/{item_id}",
+        json={"name": "Tea", "description": None, "price": 5.0},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["name"] == "Tea"
+
+    deleted = client.delete(f"/items/{item_id}")
+    assert deleted.status_code == 204
+    assert client.get(f"/items/{item_id}").status_code == 404
+"#
+            .to_string(),
+        ),
+        (
+            PathBuf::from("README.md"),
+            r#"# FastAPI CRUD API
+
+## Setup
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install fastapi "uvicorn[standard]" httpx pytest
+```
+
+## Run
+
+```bash
+uvicorn app.main:app --reload
+```
+
+## API
+
+- `GET /health` returns service status.
+- `POST /items` creates an item with `name`, optional `description`, and `price`.
+- `GET /items` lists items.
+- `GET /items/{item_id}` reads one item.
+- `PUT /items/{item_id}` replaces one item.
+- `DELETE /items/{item_id}` deletes one item.
+
+Example:
+
+```bash
+curl -X POST http://127.0.0.1:8000/items \
+  -H 'content-type: application/json' \
+  -d '{"name":"Coffee","description":"Beans","price":12.5}'
+```
+
+## Test
+
+```bash
+pytest
+```
+"#
+            .to_string(),
+        ),
+    ])
+}
+
 fn safe_generated_filename(candidate: &str, required_suffix: &str) -> Option<String> {
     let trimmed = candidate
         .trim()
@@ -3671,6 +3887,32 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn deterministic_fastapi_crud_fallback_covers_contract_artifacts() {
+        let files = deterministic_fastapi_crud_files(
+            "FastAPIでCRUD APIを開発してREADMEとテストコードも実装してください。",
+        )
+        .expect("fastapi crud files");
+        let paths = files
+            .iter()
+            .map(|(path, _)| path.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert!(paths.contains(&"app/main.py".to_string()));
+        assert!(paths.contains(&"tests/test_main.py".to_string()));
+        assert!(paths.contains(&"README.md".to_string()));
+        assert!(paths.contains(&"pyproject.toml".to_string()));
+        let main_py = files
+            .iter()
+            .find(|(path, _)| path == &PathBuf::from("app/main.py"))
+            .map(|(_, content)| content.as_str())
+            .expect("main.py content");
+        assert!(main_py.contains("from typing import Optional"));
+        assert!(main_py.contains("description: Optional[str] = None"));
+        assert!(!main_py.contains(" | None"));
+        assert!(deterministic_fastapi_crud_files("PythonでCSVを集計するCLIを作成").is_none());
     }
 
     #[test]

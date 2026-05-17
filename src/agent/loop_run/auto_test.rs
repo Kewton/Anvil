@@ -355,6 +355,8 @@ impl PythonProjectEvidence {
     fn from_str(raw: &str) -> Self {
         let mut evidence = Self::default();
         let mut active_section = String::new();
+        let mut in_project_dependency_array = false;
+        let mut in_project_optional_dependency_array = false;
         for line in raw.lines() {
             let trimmed = line.trim();
             if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -366,15 +368,42 @@ impl PythonProjectEvidence {
                 continue;
             }
             let line_without_comment = trimmed.split('#').next().unwrap_or(trimmed).trim();
+            if in_project_dependency_array || in_project_optional_dependency_array {
+                evidence
+                    .dependencies
+                    .extend(extract_dependency_names(line_without_comment));
+                if line_without_comment.contains(']') {
+                    in_project_dependency_array = false;
+                    in_project_optional_dependency_array = false;
+                }
+                continue;
+            }
             if active_section.starts_with("tool.hatch")
                 && (line_without_comment.starts_with("test =")
                     || line_without_comment.starts_with("test="))
             {
                 evidence.hatch_test_script = true;
             }
-            if line_without_comment.starts_with("dependencies")
-                || line_without_comment.starts_with("optional-dependencies")
-                || active_section.starts_with("project.optional-dependencies")
+            if active_section == "project"
+                && (line_without_comment.starts_with("dependencies =")
+                    || line_without_comment.starts_with("dependencies="))
+            {
+                evidence
+                    .dependencies
+                    .extend(extract_dependency_names(line_without_comment));
+                in_project_dependency_array =
+                    line_without_comment.contains('[') && !line_without_comment.contains(']');
+                continue;
+            }
+            if active_section.starts_with("project.optional-dependencies") {
+                evidence
+                    .dependencies
+                    .extend(extract_quoted_dependency_names(line_without_comment));
+                in_project_optional_dependency_array =
+                    line_without_comment.contains('[') && !line_without_comment.contains(']');
+                continue;
+            }
+            if line_without_comment.starts_with("optional-dependencies")
                 || active_section.starts_with("tool.poetry.dependencies")
                 || active_section.starts_with("tool.poetry.group.")
             {
@@ -444,6 +473,17 @@ fn extract_dependency_names(line: &str) -> Vec<String> {
     {
         names.push(normalize_dependency_name(name.trim()));
     }
+    names.extend(extract_quoted_dependency_names(line));
+    names
+        .into_iter()
+        .filter(|name| !name.is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn extract_quoted_dependency_names(line: &str) -> Vec<String> {
+    let mut names = Vec::new();
     let mut rest = line;
     while let Some((_, after_quote)) = rest.split_once(['"', '\'']) {
         let Some((candidate, after_close)) = after_quote.split_once(['"', '\'']) else {
@@ -828,12 +868,43 @@ fn python_pytest_command(work_root: &Path) -> PythonPytestCommand {
             }],
         };
     }
+    if work_root.join("pyproject.toml").is_file() {
+        let packages = python_pyproject_test_packages(&pyproject);
+        return PythonPytestCommand {
+            command: format!(
+                "python3 -m pip install {} && PYTHONPATH=src:. python3 -B -m pytest -p no:cacheprovider",
+                packages.join(" ")
+            ),
+            reason: "Python tests detected with pyproject.toml; installing declared test dependencies before pytest".to_string(),
+            confidence: 0.8,
+            evidence: vec!["python-toolchain:pip-direct-deps".to_string()],
+        };
+    }
     PythonPytestCommand {
         command: "python3 -B -m pytest -p no:cacheprovider".to_string(),
         reason: "Python tests detected".to_string(),
         confidence: 0.78,
         evidence: vec!["python-toolchain:stdlib".to_string()],
     }
+}
+
+fn python_pyproject_test_packages(pyproject: &PythonProjectEvidence) -> Vec<String> {
+    let mut packages: BTreeSet<String> = pyproject
+        .dependencies
+        .iter()
+        .filter(|name| is_safe_python_package_name(name))
+        .cloned()
+        .collect();
+    packages.insert("pytest".to_string());
+    packages.into_iter().collect()
+}
+
+fn is_safe_python_package_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 80
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.'))
 }
 
 fn python_project_mentions_pytest(work_root: &Path) -> bool {
@@ -1729,8 +1800,40 @@ mod tests {
         )
         .expect("pyproject");
         let plan = AutoTestRunner::detect(dir.path(), &["src/app.py".to_string()]).expect("plan");
-        assert_eq!(plan.command, "python3 -B -m pytest -p no:cacheprovider");
+        assert_eq!(
+            plan.command,
+            "python3 -m pip install pytest && PYTHONPATH=src:. python3 -B -m pytest -p no:cacheprovider"
+        );
         assert!(plan.reason.contains("pytest-dependency"));
+        assert!(plan.reason.contains("python-toolchain:pip-direct-deps"));
+    }
+
+    #[test]
+    fn pyproject_multiline_dependencies_feed_direct_pip_pytest_command() {
+        let pyproject = PythonProjectEvidence::from_str(
+            r#"[project]
+dependencies = [
+    "fastapi>=0.104",
+    "uvicorn[standard]>=0.24",
+]
+
+[project.optional-dependencies]
+dev = [
+    "httpx>=0.25",
+    "pytest>=7",
+]
+"#,
+        );
+
+        assert!(pyproject.has_dependency("fastapi"));
+        assert!(pyproject.has_dependency("uvicorn"));
+        assert!(pyproject.has_dependency("httpx"));
+        assert!(pyproject.has_dependency("pytest"));
+        assert!(!pyproject.has_dependency("dev"));
+        assert_eq!(
+            python_pyproject_test_packages(&pyproject),
+            vec!["fastapi", "httpx", "pytest", "uvicorn"]
+        );
     }
 
     #[test]

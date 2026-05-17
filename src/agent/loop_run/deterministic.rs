@@ -25,6 +25,10 @@ pub(super) fn empty_python_cli_files_with_names(
     quality::deterministic_empty_python_cli_files_with_names(request, script_name, sample_name)
 }
 
+pub(super) fn fastapi_crud_files(request: &str) -> Option<Vec<(PathBuf, String)>> {
+    quality::deterministic_fastapi_crud_files(request)
+}
+
 pub(super) fn empty_docs_files(request: &str) -> Option<Vec<(PathBuf, String)>> {
     quality::deterministic_empty_docs_files(request)
 }

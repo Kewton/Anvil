@@ -4048,6 +4048,7 @@ impl Agent {
         let mut logged_plan_first_write = false;
         let mut logged_act_first_repo_edit = false;
         let mut framework_app_fallback_materialized = false;
+        let mut contract_deterministic_fallback_materialized = false;
 
         let mut exit_reason = ExitReason::MaxIterations;
         let mut error_text = String::new();
@@ -5610,9 +5611,20 @@ impl Agent {
             {
                 let decision = contract.evaluate(&self.evidence_set_this_turn);
                 if decision.is_continue() {
+                    if !contract_deterministic_fallback_materialized
+                        && self.maybe_materialize_task_contract_fallback(&decision, last_iter)
+                    {
+                        contract_deterministic_fallback_materialized = true;
+                        self.push_system_note(
+                            "[Task Contract] Deterministic fallback created missing task artifacts. Run the appropriate verifier next, repair failures if any, and only then give the final answer."
+                                .to_string(),
+                        );
+                        continue;
+                    }
                     contract_completion_retries += 1;
                     let missing = super::task_contract::missing_labels(&decision);
-                    if contract_completion_retries >= 3 {
+                    let attempt_limit = contract.recovery_attempt_limit();
+                    if contract_completion_retries >= attempt_limit {
                         exit_reason = ExitReason::MissingRepoEdits;
                         error_text = format!(
                             "task contract incomplete; missing required artifact(s): {}",
@@ -5644,6 +5656,9 @@ impl Agent {
                     );
                     self.push_system_note(super::task_contract::render_contract_recovery_note(
                         &decision,
+                        self.active_request_text().as_deref().unwrap_or_default(),
+                        contract_completion_retries,
+                        attempt_limit,
                     ));
                     continue;
                 }
@@ -7695,17 +7710,29 @@ impl Agent {
         let policy = self.session.mode_state.policy();
         let request = self.active_request_text()?;
         let (label, event, files, final_message) = if policy.allow_python_deterministic_fallback {
-            let (script_name, sample_name) = self.python_csv_names_from_request_and_anvil(&request);
-            (
-                "Python fallback",
-                "agent.empty_workspace.deterministic_python_cli",
-                deterministic::empty_python_cli_files_with_names(
-                    &request,
-                    script_name.as_deref(),
-                    sample_name.as_deref(),
-                )?,
-                "Implemented the requested Python CSV CLI with deterministic files.".to_string(),
-            )
+            if let Some(files) = deterministic::fastapi_crud_files(&request) {
+                (
+                    "FastAPI fallback",
+                    "agent.empty_workspace.deterministic_fastapi_crud",
+                    files,
+                    "Implemented the requested FastAPI CRUD API with deterministic files."
+                        .to_string(),
+                )
+            } else {
+                let (script_name, sample_name) =
+                    self.python_csv_names_from_request_and_anvil(&request);
+                (
+                    "Python fallback",
+                    "agent.empty_workspace.deterministic_python_cli",
+                    deterministic::empty_python_cli_files_with_names(
+                        &request,
+                        script_name.as_deref(),
+                        sample_name.as_deref(),
+                    )?,
+                    "Implemented the requested Python CSV CLI with deterministic files."
+                        .to_string(),
+                )
+            }
         } else if policy.allow_docs_deterministic_fallback {
             (
                 "Docs fallback",
@@ -7781,6 +7808,115 @@ impl Agent {
             Vec::new(),
         ));
         Some(final_message)
+    }
+
+    fn maybe_materialize_task_contract_fallback(
+        &mut self,
+        decision: &super::task_contract::CompletionDecision,
+        last_iter: usize,
+    ) -> bool {
+        if !self
+            .config
+            .deterministic_fallback
+            .allows_template_completion()
+        {
+            return false;
+        }
+        if !matches!(
+            decision,
+            super::task_contract::CompletionDecision::Continue { .. }
+        ) {
+            return false;
+        }
+        if !self
+            .session
+            .mode_state
+            .policy()
+            .allow_python_deterministic_fallback
+        {
+            return false;
+        }
+        let Some(request) = self.active_request_text() else {
+            return false;
+        };
+        let Some(files) = deterministic::fastapi_crud_files(&request) else {
+            return false;
+        };
+
+        let mut written = Vec::<PathBuf>::new();
+        for (relative, content) in files {
+            let target = self.work_root.join(&relative);
+            if target.exists() {
+                continue;
+            }
+            if let Some(parent) = target.parent()
+                && let Err(err) = std::fs::create_dir_all(parent)
+            {
+                self.session.working_memory.note_error(format!(
+                    "task contract deterministic fallback: failed to create {}: {err}",
+                    parent.display()
+                ));
+                return false;
+            }
+            if let Err(err) = std::fs::write(&target, content) {
+                self.session.working_memory.note_error(format!(
+                    "task contract deterministic fallback: failed to write {}: {err}",
+                    target.display()
+                ));
+                return false;
+            }
+            let relative_display = relative.to_string_lossy().to_string();
+            self.session
+                .working_memory
+                .note_touched_file(normalize_memory_path(&relative_display, &self.work_root));
+            self.observe_evidence_from_repo_edit(&relative_display);
+            written.push(relative);
+        }
+        if written.is_empty() {
+            return false;
+        }
+
+        self.session.repo_edit_succeeded_this_turn = true;
+        self.session
+            .record_feedback_if_unset(build_feedback_for_deterministic_content_fallback(
+                &self.work_root,
+            ));
+        let written_paths = written
+            .iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        write_stdout_rendered(
+            &format_iteration_status(
+                last_iter,
+                self.config.max_iterations,
+                "Task fallback",
+                &format!(
+                    "Materialized deterministic task files: {}.",
+                    written_paths.join(", ")
+                ),
+                self.footer.current_cols(),
+            ),
+            true,
+        );
+        log_llm_event(
+            "agent.task_contract.deterministic_fastapi_crud",
+            serde_json::json!({
+                "session_id": self.session_store.session_id(),
+                "work_root": self.work_root.display().to_string(),
+                "work_mode": self.session.mode_state.work_mode.as_str(),
+                "fallback_level": self.config.deterministic_fallback.fallback_level(),
+                "fallback_action": "full_template",
+                "files": written_paths,
+            }),
+        );
+        self.session.messages.push(ConversationMessage::assistant(
+            format!(
+                "Materialized deterministic FastAPI CRUD task files as contract recovery: {}. Continue with verification before treating the task as complete.",
+                written_paths.join(", ")
+            ),
+            Vec::new(),
+        ));
+        true
     }
 
     fn python_csv_names_from_request_and_anvil(

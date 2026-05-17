@@ -312,6 +312,14 @@ fn is_explicit_test_verifier(plan: &AutoTestPlan, work_root: &Path) -> bool {
         || cmd.starts_with("python -m pytest")
         || cmd.starts_with("python -b -m pytest")
         || cmd.starts_with("pytest")
+        || cmd.contains("&& python3 -b -m pytest")
+        || cmd.contains("&& python3 -m pytest")
+        || cmd.contains("&& pythonpath=src:. python3 -b -m pytest")
+        || cmd.contains("&& pythonpath=src:. python3 -m pytest")
+        || cmd.contains("&& python -b -m pytest")
+        || cmd.contains("&& python -m pytest")
+        || cmd.contains("&& pythonpath=src:. python -b -m pytest")
+        || cmd.contains("&& pythonpath=src:. python -m pytest")
     {
         return true;
     }
