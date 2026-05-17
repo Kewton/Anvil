@@ -28,6 +28,14 @@ use crate::tools::registry::{ToolContext, ToolRegistry};
 pub(crate) mod auto_promote;
 mod auto_test;
 pub mod commands;
+// Issue #606: pure data model for post-hoc completion-evidence observation.
+// Internal API surfaced via `super::completion_evidence::` from `protocol.rs`,
+// `success.rs`, and `turn.rs`. Two pure helpers are re-exported below with
+// `#[doc(hidden)] pub` so integration tests (`tests/completion_evidence_smoke.rs`)
+// can verify the SSOT classifier and the DR4-002 security gate without
+// reaching into private module state — see `is_completion_verifier_command`
+// / `classify_repo_edit_path` in `loop_run::completion_evidence`.
+pub(crate) mod completion_evidence;
 mod deterministic;
 pub(crate) mod feedback_kind_confirm;
 mod footer;
@@ -79,6 +87,34 @@ pub use turn::PHOTON_OUTCOME_DETAIL_NO_PROGRESS_DESPITE_INJECT;
 // `tests/photon_provenance_smoke.rs` can verify the 7 status branches and the
 // per-seed rendering without constructing a full Agent (Ollama-free).
 pub use commands::build_photon_why_message;
+
+// Issue #606: integration-test-only seams for the completion-evidence
+// pipeline. Marked `#[doc(hidden)]` so they do not appear in the public docs
+// but are reachable from `tests/completion_evidence_smoke.rs`.
+//
+// `classify_repo_edit_path_for_test` exposes the SSOT path classifier so
+// integration tests can pin the DR1-001 ordering invariant (`.mdx → Docs`)
+// from outside the crate without reaching into `pub(crate)` types.
+//
+// `is_completion_verifier_command_for_test` exposes the DR4-002 security
+// gate so tests can pin that shell control operators reject a verifier
+// invocation without spinning up a full Agent.
+#[doc(hidden)]
+pub fn classify_repo_edit_path_for_test(path: &std::path::Path) -> &'static str {
+    use completion_evidence::RepoEditCategory;
+    match completion_evidence::classify_repo_edit_path(path) {
+        RepoEditCategory::Impl => "impl",
+        RepoEditCategory::Test => "test",
+        RepoEditCategory::Docs => "docs",
+        RepoEditCategory::Setup => "setup",
+        RepoEditCategory::Other => "other",
+    }
+}
+
+#[doc(hidden)]
+pub fn is_completion_verifier_command_for_test(command: &str) -> bool {
+    completion_evidence::is_completion_verifier_command(command)
+}
 
 // Issue #465 / Phase 5: expose Reminder types needed by tests/agent_skill_registry_smoke.rs
 // (E2E tests live outside the crate so `pub(crate) mod reminder` cannot be reached
@@ -394,6 +430,17 @@ pub struct Agent {
     /// independent variables (Issue S7-001 SSOT).
     pub(super) last_auto_promote_outcome:
         Option<crate::agent::loop_run::auto_promote::AutoPromoteOutcomeSummary>,
+    /// Issue #606 (DR1-007 / #D-06): per-turn accumulator of post-hoc
+    /// completion-evidence observations. Push-only `Vec` populated by the
+    /// Bash hook (`VerifierExitZero`) and the Edit/Write hook (`RepoEdit`)
+    /// in `turn.rs::execute_tool_call`, consumed by
+    /// `success.rs::run_post_loop_success_verifier` via
+    /// `ProtocolKind::evidence_set_satisfies`. Reset at the head of
+    /// `run_actor_loop` alongside the existing per-turn caps so multi-turn
+    /// sessions never observe stale evidence. **Not serialized** — lives
+    /// on `Agent` instead of `SessionSnapshot` because the OR-satisfaction
+    /// is evaluated within the same turn the evidence was observed.
+    pub(super) evidence_set_this_turn: completion_evidence::EvidenceSet,
 }
 
 /// Issue #594: state machine for the `/photon-why` slash command. Lives at
@@ -513,6 +560,7 @@ impl Agent {
             last_injected_summary_turn_index: None,
             photon_user_feedback_called_this_turn: false,
             last_auto_promote_outcome: None,
+            evidence_set_this_turn: completion_evidence::EvidenceSet::new(),
         }
     }
 }

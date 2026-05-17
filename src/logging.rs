@@ -143,6 +143,82 @@ pub(crate) fn is_secret_like_key(key: &str) -> bool {
     upper.ends_with("_KEY") || upper.ends_with("_TOKEN")
 }
 
+// ---------------------------------------------------------------------------
+// Issue #606 T-1.9: completion-evidence log helpers.
+//
+// Three events are emitted along the post-hoc evidence observation pipeline:
+//   * `agent.completion_evidence.observed` — fired from the Bash hook
+//     (`VerifierExitZero`) and Edit/Write hook (`RepoEdit`) the moment the
+//     tool result confirms a completion-relevant signal.
+//   * `agent.completion_evidence.satisfied` — fired from success.rs when the
+//     OR-fold over the per-turn `EvidenceSet` returns true and Stage-2
+//     short-circuits the per-protocol reject text.
+//   * `agent.completion_evidence.unsatisfied` — fired from success.rs when
+//     the protocol's reject text is still produced; the payload carries the
+//     `missing_shapes` slice from `evidence_set_missing_shapes`.
+//
+// All three payloads pass through `mask_payload_inplace` (called from
+// `log_llm_event`) as the final defence line per CLAUDE.md Security
+// Invariants. The helpers only construct the payload — they do not bypass
+// that pipeline.
+// ---------------------------------------------------------------------------
+
+/// Issue #606 T-1.9 — `agent.completion_evidence.observed`.
+///
+/// `event_label` is a `&'static str` matching the `serde tag = "kind"`
+/// variant name (`repo_edit` / `verifier_exit_zero` / `answer_only`) so log
+/// readers can pivot without re-parsing the inner payload. `detail` is the
+/// optional structured side-data (e.g. `RepoEditCategory`, masked verifier
+/// command class).
+pub(crate) fn log_completion_evidence_observed(
+    turn_index: usize,
+    iter_index: usize,
+    event_label: &'static str,
+    detail: Value,
+) {
+    let payload = json!({
+        "turn_index": turn_index,
+        "iter_index": iter_index,
+        "evidence_kind": event_label,
+        "detail": detail,
+    });
+    log_llm_event("agent.completion_evidence.observed", payload);
+}
+
+/// Issue #606 T-1.9 — `agent.completion_evidence.satisfied`. `protocol_kind`
+/// is passed as `&'static str` (one of `"python"` / `"typescript_ui"` /
+/// `"docs"` / `"answer_only"` / `"generic_code"`) so this helper stays in
+/// the `crate::logging` layer without pulling in `agent::loop_run`'s
+/// `pub(super)` `ProtocolKind` enum (DR3-002 layer rule).
+pub(crate) fn log_completion_evidence_satisfied(
+    turn_index: usize,
+    protocol_kind: &'static str,
+    observed_count: usize,
+) {
+    let payload = json!({
+        "turn_index": turn_index,
+        "protocol_kind": protocol_kind,
+        "observed_count": observed_count,
+    });
+    log_llm_event("agent.completion_evidence.satisfied", payload);
+}
+
+/// Issue #606 T-1.9 — `agent.completion_evidence.unsatisfied`.
+pub(crate) fn log_completion_evidence_unsatisfied(
+    turn_index: usize,
+    protocol_kind: &'static str,
+    missing_shapes: &[&'static str],
+    observed_count: usize,
+) {
+    let payload = json!({
+        "turn_index": turn_index,
+        "protocol_kind": protocol_kind,
+        "missing_shapes": missing_shapes,
+        "observed_count": observed_count,
+    });
+    log_llm_event("agent.completion_evidence.unsatisfied", payload);
+}
+
 #[cfg(test)]
 mod tests {
     use super::{is_secret_like_key, mask_payload_inplace};
@@ -295,6 +371,56 @@ mod tests {
         assert_eq!(
             payload["MY_API_KEY_BACKUP"],
             Value::String("***".to_string())
+        );
+    }
+
+    /// Issue #606 U-16: pin that `mask_payload_inplace` preserves the
+    /// payload key set used by the three completion-evidence events
+    /// (`agent.completion_evidence.{observed,satisfied,unsatisfied}`).
+    /// Same shape as the existing reminder-payload pin (VR-06).
+    #[test]
+    fn mask_payload_inplace_preserves_completion_evidence_payload_key_set() {
+        let mut payload = json!({
+            "turn_index": 5,
+            "iter_index": 2,
+            "evidence_kind": "verifier_exit_zero",
+            "detail": {
+                "command_class": "BuildTest",
+            },
+            "protocol_kind": "python",
+            "missing_shapes": ["repo_edit_impl_or_test", "verifier_exit_zero"],
+            "observed_count": 3,
+        });
+        let before_keys: Vec<String> = payload
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        mask_payload_inplace(&mut payload);
+        let after_keys: Vec<String> = payload
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(before_keys, after_keys);
+        // Inner non-secret payload values preserved.
+        assert_eq!(payload["turn_index"], json!(5));
+        assert_eq!(payload["iter_index"], json!(2));
+        assert_eq!(payload["observed_count"], json!(3));
+        assert_eq!(
+            payload["evidence_kind"].as_str().unwrap(),
+            "verifier_exit_zero"
+        );
+        assert_eq!(payload["protocol_kind"].as_str().unwrap(), "python");
+        assert_eq!(
+            payload["detail"]["command_class"].as_str().unwrap(),
+            "BuildTest"
+        );
+        assert_eq!(
+            payload["missing_shapes"][0].as_str().unwrap(),
+            "repo_edit_impl_or_test"
         );
     }
 

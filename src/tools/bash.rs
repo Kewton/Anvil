@@ -76,6 +76,11 @@ where
 /// the agent layer (Issue #450). Not part of `ToolRegistry::execute`'s
 /// `Result<String, String>` contract; turn.rs invokes
 /// `run_with_outcome` directly when it needs the structured form.
+///
+/// Issue #606 T-1.2: `class` is populated by `run_with_outcome` so the agent
+/// layer can post-hoc-observe `CompletionEvidence::VerifierExitZero` without
+/// re-running `classify_command` on the raw command string. Defaults to
+/// `BashCommandClass::General`.
 #[derive(Debug, Clone, Default)]
 pub struct BashExecutionOutcome {
     pub command: String,
@@ -85,6 +90,7 @@ pub struct BashExecutionOutcome {
     pub timed_out: bool,
     pub blocked_reason: Option<String>,
     pub interrupted: bool,
+    pub class: BashCommandClass,
 }
 
 impl BashExecutionOutcome {
@@ -369,7 +375,13 @@ const LONG_RUNNING_TIMEOUT: Duration = Duration::from_secs(15);
 const TERMINATE_GRACE: Duration = Duration::from_secs(2);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Issue #606 T-1.1: `serde` derives + `Default` impl so the class can travel
+/// through `BashExecutionOutcome` and be serialized in completion-evidence
+/// payloads / persisted snapshots. `Default = General` matches the historical
+/// behaviour where unclassified commands fell through to the catch-all branch
+/// in `classify_command`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum BashCommandClass {
     ReadOnly,
     BuildTest,
@@ -377,6 +389,7 @@ pub enum BashCommandClass {
     Network,
     Mutating,
     Dangerous,
+    #[default]
     General,
 }
 
@@ -465,6 +478,7 @@ pub fn run_with_outcome(
                 timed_out: false,
                 blocked_reason: None,
                 interrupted: true,
+                class,
             };
             return Ok((
                 format!(
@@ -489,6 +503,7 @@ pub fn run_with_outcome(
                 timed_out: true,
                 blocked_reason: None,
                 interrupted: false,
+                class,
             };
             return Ok((
                 format!(
@@ -518,6 +533,7 @@ pub fn run_with_outcome(
         timed_out: false,
         blocked_reason: None,
         interrupted: false,
+        class,
     };
     Ok((
         format!(
@@ -1569,6 +1585,32 @@ mod tests {
         assert_eq!(outcome.exit_code, Some(0));
         assert!(outcome.stdout.contains("hello"));
         assert!(!outcome.timed_out);
+    }
+
+    /// Issue #606 U-17: `BashExecutionOutcome::default()` yields the catch-all
+    /// `General` class so the completion-evidence pipeline never reads
+    /// uninitialised data on legacy literal sites that use
+    /// `..Default::default()`.
+    #[test]
+    fn bash_execution_outcome_class_defaults_to_general() {
+        let outcome = BashExecutionOutcome::default();
+        assert_eq!(outcome.class, BashCommandClass::General);
+    }
+
+    /// Issue #606 U-18: `run_with_outcome` populates `class` from
+    /// `classify_command`, so a `cargo test`-style command surfaces as
+    /// `BuildTest` even before the bash exit code is inspected.
+    #[test]
+    fn bash_execution_outcome_class_populates_build_test_for_cargo_test() {
+        let temp = tempdir().unwrap();
+        // `printf` keeps the test hermetic — we only care that
+        // `run_with_outcome` plumbed the class through; the command body is
+        // wrapped through `classify_command` before spawn, so we choose a
+        // canonical BuildTest invocation that exits 0 quickly.
+        let (_text, outcome) =
+            run_with_outcome("cargo test --help", temp.path(), None, false, None, None)
+                .expect("cargo test --help must run");
+        assert_eq!(outcome.class, BashCommandClass::BuildTest);
     }
 
     /// CB-003: a Bash command that emits invalid UTF-8 on stdout must NOT
