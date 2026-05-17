@@ -13,8 +13,8 @@ Rust 版 local-first coding agent (Ollama 専用、`workspace/v0.1.0` ベース)
 - `src/photon/*` — Photon サイドカー HTTP 連携 / context_pack レンダラー / adoption signal
 - `src/agent/loop_run/*` — エージェントループ / turn 制御 / 各種 confirm skill (work_mode / feedback_kind / quality / photon_user_feedback)
 - `src/agent/skills/*` — SkillRegistry 基盤 (`AgentSkill` trait, `SkillTrustTier`)
-- `src/session/*` — セッションストア / `FeedbackFrame` / `Precaution` / `AnvilScore` / `CaseRecord` / `eval_log` / `case_retrieval` / `case_photon_bridge` / `tmp_tests` / `rollout_policy`
-- `src/tools/*` — built-in tools (`bash.rs::check_blocked_command` SSOT, Read/Write/Edit)
+- `src/session/*` — セッションストア / `FeedbackFrame` / `Precaution` / `AnvilScore` / `CaseRecord` / `eval_log` / `case_retrieval` / `case_photon_bridge` / `tmp_tests` / `rollout_policy` / `feedback.rs::redact_verifier_command_for_storage` (verifier command redactor SSOT) / `store.rs::VerifierInvocationRecord` (Phase α-2)
+- `src/tools/*` — built-in tools (`bash.rs::check_blocked_command` SSOT, Read/Write/Edit, `test_output.rs` failed-name + trim formatter)
 - `src/repo_graph/*` — `RepoGraph` v1 (import scan + LRU persist)
 - `src/util/file_classify.rs` — `is_test_file` / `is_setup_file` / `is_implementation_file` SSOT
 - `src/util/git_hardened.rs` — `run_git` SSOT (hardened git command runner)

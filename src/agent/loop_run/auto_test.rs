@@ -192,10 +192,17 @@ impl AutoTestRunner {
             }
             combined.push_str(&stderr);
         }
+        // Issue #608 AP-08: apply the `test_output` formatter (pytest/cargo/
+        // npm summary + tail trim) to the display-side `output` only. The
+        // raw `stdout` / `stderr` / `combined` strings consumed by
+        // `classify_auto_test` / feedback confirmation paths are NOT
+        // mutated — they remain the verbatim child output (design §4.6 /
+        // T2.B.2 raw-combined invariant).
+        let formatted = crate::tools::test_output::format_for_tool_result(&combined);
         Ok(AutoTestResult {
             command: plan.command.clone(),
             passed: output.status.success(),
-            output: truncate(&combined, MAX_OUTPUT_BYTES),
+            output: truncate(&formatted, MAX_OUTPUT_BYTES),
             exit_code: output.status.code(),
             stdout,
             stderr,

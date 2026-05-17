@@ -49,9 +49,6 @@
 //! it today, and adding the variant pre-commits to a fragile NLP gate).
 
 use std::path::Path;
-use std::sync::OnceLock;
-
-use regex::Regex;
 
 use crate::tools::bash::BashCommandClass;
 use crate::util::file_classify::{is_implementation_file, is_setup_file, is_test_file};
@@ -240,69 +237,23 @@ pub(crate) fn contains_evidence_poisoning_shell_control(command: &str) -> bool {
     false
 }
 
-// --- CB-002 fix: dedicated redaction for stored verifier commands -----------
+// --- Issue #608 Phase α-2: verifier command redactor moved to session layer
 
-/// Match `Authorization: ...`, `Cookie: ...`, `X-API-Key: ...` and similar
-/// header-shaped key/value pairs whose value can be a credential.
-///
-/// The value side (`[^'"\n\r]+`) deliberately runs **through internal
-/// whitespace** so multi-token credentials like `Bearer abc123` collapse to
-/// a single `<REDACTED>` rather than leaving the secret tail (`abc123`)
-/// visible after the scheme word. We stop at the next quote / newline /
-/// carriage return — the typical shell-quoted header form is
-/// `-H 'Authorization: Bearer abc123'`, where the closing `'` bounds the
-/// value precisely. Bare-token forms like `Authorization=Bearer abc123`
-/// without a surrounding quote also work because the regex consumes
-/// everything up to the next quote / newline, which on a one-line
-/// command-string post-control-char-neutralization is end-of-string.
-///
-/// The `regex` crate is configured with `default-features = false` plus
-/// `unicode-perl` (Cargo.toml), so `(?i)` is unavailable; we spell out the
-/// ASCII case explicitly via character classes, matching the style used in
-/// `src/session/feedback.rs::kv_secret_regex`.
-fn auth_header_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(
-            r#"([Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]|[Cc][Oo][Oo][Kk][Ii][Ee]|[Xx]-[Aa][Pp][Ii]-[Kk][Ee][Yy])\s*[:=]\s*[^'"\n\r]+"#,
-        )
-        .expect("valid static auth header regex")
-    })
-}
-
-/// Issue #606 Stage 4 (DR4-003): canonical redactor for the verifier command
-/// string stored inside `CompletionEvidence::VerifierExitZero.command` (and,
-/// in alpha-2, `SessionSnapshot.last_verifier_command` /
+/// Issue #606 Stage 4 (DR4-003) → Issue #608 Phase α-2 / 設計判断 #7:
+/// canonical redactor for the verifier command string stored inside
+/// `CompletionEvidence::VerifierExitZero.command` (and, in alpha-2,
+/// `SessionSnapshot.last_verifier_command` /
 /// `VerifierInvocationRecord.command`).
 ///
-/// Pipeline:
-///   1. `mask_secrets` — token-prefix / kv / URL-userinfo redaction (SSOT
-///      lives in `src/session/feedback.rs`).
-///   2. Auth-header family redaction — `Authorization: Bearer ...`,
-///      `Cookie: ...`, `X-API-Key: ...` are reduced to `<HEADER>: <REDACTED>`
-///      so the credential tail is removed even when it doesn't look like one
-///      of the `kv_secret_regex` keywords.
-///   3. Control-char neutralization — ASCII `\x00..=\x1f` plus DEL (`\x7f`)
-///      get collapsed to a single space so an embedded `\n` / `\r` / `\t`
-///      can't break log lines or hide trailing operators in display.
-///
-/// Pure / safe to call on any UTF-8 string. Used in the verifier-evidence
-/// observation hook (`observe_evidence_from_bash_outcome`) and reserved for
-/// the alpha-2 last-verifier-command persistence path.
+/// The actual redactor SSOT now lives in
+/// [`crate::session::feedback::redact_verifier_command_for_storage`] (session
+/// layer, owning the mask_secrets + auth_header + control-char + 4096-byte cap
+/// pipeline). This agent-layer wrapper exists only for backward source
+/// compatibility — the in-process `observe_evidence_from_bash_outcome` hook
+/// continues to call this name, and the session layer must not import from
+/// the agent layer (DR3-002 single-directional dependency).
 pub(crate) fn redact_verifier_command_for_storage(cmd: &str) -> String {
-    let s1 = crate::session::feedback::mask_secrets(cmd);
-    let s2 = auth_header_regex()
-        .replace_all(&s1, "$1: <REDACTED>")
-        .into_owned();
-    s2.chars()
-        .map(|c| {
-            if (c as u32) < 0x20 || c == '\x7f' {
-                ' '
-            } else {
-                c
-            }
-        })
-        .collect()
+    crate::session::feedback::redact_verifier_command_for_storage(cmd)
 }
 
 #[cfg(test)]
