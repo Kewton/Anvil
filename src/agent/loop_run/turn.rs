@@ -7476,38 +7476,32 @@ impl Agent {
             }
         }
 
-        if outcome.exit_code != Some(0) {
+        // Issue #607 (β): build VerifierExitZero evidence for BuildTest |
+        // EnvSetup exit-zero outcomes (per `build_verifier_exit_zero_evidence`).
+        let Some(evidence) = build_verifier_exit_zero_evidence(outcome) else {
             return;
-        }
-        if !matches!(outcome.class, BashCommandClass::BuildTest) {
+        };
+        let crate::agent::loop_run::completion_evidence::CompletionEvidence::VerifierExitZero {
+            class,
+            ..
+        } = evidence
+        else {
+            // build_verifier_exit_zero_evidence only ever constructs
+            // VerifierExitZero today; the match keeps us honest if a future
+            // helper returns a different variant.
+            self.evidence_set_this_turn.push(evidence);
             return;
-        }
-        if !super::completion_evidence::is_completion_verifier_command(&outcome.command) {
-            return;
-        }
-        // Mask the command through the dedicated verifier-storage redactor
-        // before pushing it into the in-process EvidenceSet. This wraps
-        // `mask_secrets` with the additional Authorization / Cookie /
-        // X-API-Key header family redaction and control-char neutralization
-        // mandated by Stage 4 DR4-003 (see design §6.2 / §12.2). The same
-        // helper is reserved for the alpha-2
-        // `SessionSnapshot::last_verifier_command` /
-        // `VerifierInvocationRecord::command` persistence path so a single
-        // SSOT redactor covers every place a verifier command lands on disk.
-        let masked =
-            super::completion_evidence::redact_verifier_command_for_storage(&outcome.command);
-        self.evidence_set_this_turn.push(
-            super::completion_evidence::CompletionEvidence::VerifierExitZero {
-                class: outcome.class,
-                command: masked,
-            },
-        );
+        };
+        self.evidence_set_this_turn.push(evidence.clone());
         crate::logging::log_completion_evidence_observed(
             self.current_turn_index,
             0, // α-1: iter_index plumbing is α-2 work; emit 0 for now.
             "verifier_exit_zero",
             serde_json::json!({
-                "command_class": format!("{:?}", outcome.class),
+                // Issue #607 BP-07 / S3-002: snake_case label matches serde
+                // rename_all so `command_class` reads `"env_setup"` /
+                // `"build_test"` instead of `"EnvSetup"` / `"BuildTest"`.
+                "command_class": class.as_str(),
             }),
         );
     }
@@ -8665,22 +8659,154 @@ pub(crate) fn unicode_supported() -> bool {
     false
 }
 
+/// Issue #606 T-1.6 / Issue #607: pure projection from a Bash outcome to an
+/// optional `VerifierExitZero` completion-evidence record. Gates:
+///
+/// 1. `exit_code == Some(0)` — non-zero / timeout / interrupted is failure.
+/// 2. `class ∈ { BuildTest, EnvSetup }` — read-only / network / mutating /
+///    dangerous classes never produce verifier evidence.
+/// 3. `is_completion_verifier_command` — rejects shell-control-laundered
+///    exit codes (DR4-002, e.g. `cargo test || true`).
+///
+/// The returned command field is run through
+/// `redact_verifier_command_for_storage` so secret tokens never reach the
+/// in-process EvidenceSet (Issue #607 SEC4-003).
+pub(super) fn build_verifier_exit_zero_evidence(
+    outcome: &crate::tools::bash::BashExecutionOutcome,
+) -> Option<super::completion_evidence::CompletionEvidence> {
+    use crate::tools::bash::BashCommandClass;
+    if outcome.exit_code != Some(0) {
+        return None;
+    }
+    if !matches!(
+        outcome.class,
+        BashCommandClass::BuildTest | BashCommandClass::EnvSetup
+    ) {
+        return None;
+    }
+    if !super::completion_evidence::is_completion_verifier_command(&outcome.command) {
+        return None;
+    }
+    let masked = super::completion_evidence::redact_verifier_command_for_storage(&outcome.command);
+    Some(
+        super::completion_evidence::CompletionEvidence::VerifierExitZero {
+            class: outcome.class,
+            command: masked,
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         PlanExplorationKey, answer_only_reply_is_inadequate, answer_only_script_command_allowed,
         answer_only_script_execution_fallback_response, assistant_model_for_mode,
-        deterministic_timeout_fallback_plan, effective_non_streaming_timeout_secs,
-        latest_tool_result_since_last_user, non_streaming_assistant_reply_timeout_secs,
-        normalize_exploration_path, normalize_plan_exploration_key,
-        request_explicitly_requests_script_execution, should_fallback_plan_model_after_timeout,
-        should_materialize_plan_after_timeout,
+        build_verifier_exit_zero_evidence, deterministic_timeout_fallback_plan,
+        effective_non_streaming_timeout_secs, latest_tool_result_since_last_user,
+        non_streaming_assistant_reply_timeout_secs, normalize_exploration_path,
+        normalize_plan_exploration_key, request_explicitly_requests_script_execution,
+        should_fallback_plan_model_after_timeout, should_materialize_plan_after_timeout,
         should_materialize_plan_after_tool_call_format_error, should_use_streaming_transport,
     };
+    use crate::agent::loop_run::completion_evidence::CompletionEvidence;
     use crate::modes::plan_act::{ExecutionMode, TaskProfile};
     use crate::session::store::ConversationMessage;
+    use crate::tools::bash::{BashCommandClass, BashExecutionOutcome};
     use serde_json::json;
     use tempfile::tempdir;
+
+    fn make_outcome(
+        command: &str,
+        exit_code: Option<i32>,
+        class: BashCommandClass,
+    ) -> BashExecutionOutcome {
+        BashExecutionOutcome {
+            command: command.to_string(),
+            exit_code,
+            stdout: String::new(),
+            stderr: String::new(),
+            timed_out: false,
+            blocked_reason: None,
+            interrupted: false,
+            class,
+        }
+    }
+
+    /// Issue #607 VR-β-04 (e): EnvSetup outcome with exit 0 promoted to
+    /// `VerifierExitZero { class: EnvSetup, .. }`.
+    #[test]
+    fn build_verifier_exit_zero_promotes_env_setup_success() {
+        let outcome = make_outcome("npm install", Some(0), BashCommandClass::EnvSetup);
+        let evidence = build_verifier_exit_zero_evidence(&outcome).expect("EnvSetup success");
+        match evidence {
+            CompletionEvidence::VerifierExitZero { class, command } => {
+                assert_eq!(class, BashCommandClass::EnvSetup);
+                assert_eq!(command, "npm install");
+            }
+            other => panic!("expected VerifierExitZero, got {other:?}"),
+        }
+    }
+
+    /// VR-β-04 (e) negative: EnvSetup outcome with non-zero exit produces no
+    /// evidence (install failure must not silently count as success).
+    #[test]
+    fn build_verifier_exit_zero_rejects_env_setup_failure() {
+        let outcome = make_outcome("npm install", Some(1), BashCommandClass::EnvSetup);
+        assert!(build_verifier_exit_zero_evidence(&outcome).is_none());
+    }
+
+    /// Existing BuildTest path is preserved (regression guard).
+    #[test]
+    fn build_verifier_exit_zero_still_promotes_build_test_success() {
+        let outcome = make_outcome("cargo test", Some(0), BashCommandClass::BuildTest);
+        let evidence = build_verifier_exit_zero_evidence(&outcome).expect("BuildTest success");
+        assert!(matches!(
+            evidence,
+            CompletionEvidence::VerifierExitZero {
+                class: BashCommandClass::BuildTest,
+                ..
+            }
+        ));
+    }
+
+    /// VR-β-04 (i): secret-bearing install args are masked before reaching
+    /// the EvidenceSet — the helper routes through
+    /// `redact_verifier_command_for_storage`, so a `--token=...` flag value
+    /// is replaced.
+    #[test]
+    fn build_verifier_exit_zero_masks_secret_in_install_command() {
+        let raw = "npm install --token=ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let outcome = make_outcome(raw, Some(0), BashCommandClass::EnvSetup);
+        let evidence = build_verifier_exit_zero_evidence(&outcome).expect("masked evidence");
+        let stored = match evidence {
+            CompletionEvidence::VerifierExitZero { command, .. } => command,
+            other => panic!("expected VerifierExitZero, got {other:?}"),
+        };
+        assert!(
+            !stored.contains("ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            "raw token leaked into EvidenceSet: {stored}"
+        );
+    }
+
+    /// Read-only / network / mutating outcomes are never evidence — the gate
+    /// rejects anything outside `BuildTest | EnvSetup`.
+    #[test]
+    fn build_verifier_exit_zero_rejects_non_verifier_classes() {
+        for class in [
+            BashCommandClass::ReadOnly,
+            BashCommandClass::Network,
+            BashCommandClass::Mutating,
+            BashCommandClass::Dangerous,
+            BashCommandClass::ScriptRun,
+            BashCommandClass::General,
+        ] {
+            let outcome = make_outcome("pwd", Some(0), class);
+            assert!(
+                build_verifier_exit_zero_evidence(&outcome).is_none(),
+                "class {class:?} must not produce verifier evidence"
+            );
+        }
+    }
 
     #[test]
     fn normalizes_read_path_to_repo_relative_key() {
@@ -8993,6 +9119,38 @@ mod tests {
         let frame = super::build_feedback_for_bash(&outcome, dir.path()).expect("frame");
         assert_eq!(frame.kind, crate::session::feedback::FeedbackKind::Timeout);
         assert_eq!(frame.command(), Some("npm run dev"));
+    }
+
+    /// Issue #607 VR-β-04 (i) — install failure feedback masks secret
+    /// tokens in the recorded command / stdout / stderr / primary_error so
+    /// the model-facing FeedbackFrame can not leak credentials.
+    #[test]
+    fn build_feedback_for_bash_masks_secrets_in_env_setup_failure() {
+        let dir = tempdir().unwrap();
+        let token = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let outcome = crate::tools::bash::BashExecutionOutcome {
+            command: format!("npm install --token={token}"),
+            exit_code: Some(1),
+            stdout: format!("downloaded via {token}"),
+            stderr: format!("auth failed for {token}"),
+            timed_out: false,
+            blocked_reason: None,
+            interrupted: false,
+            class: BashCommandClass::EnvSetup,
+        };
+        let frame = super::build_feedback_for_bash(&outcome, dir.path())
+            .expect("install failure produces feedback");
+        let cmd = frame.command().unwrap_or("");
+        let stdout = frame.stdout_excerpt();
+        let stderr = frame.stderr_excerpt();
+        let primary = frame.primary_error.as_deref().unwrap_or("");
+        assert!(!cmd.contains(token), "secret leaked in command: {cmd}");
+        assert!(!stdout.contains(token), "secret leaked in stdout: {stdout}");
+        assert!(!stderr.contains(token), "secret leaked in stderr: {stderr}");
+        assert!(
+            !primary.contains(token),
+            "secret leaked in primary_error: {primary}"
+        );
     }
 
     /// AC5 (unsafe command): pre-dispatch unsafe block path produces

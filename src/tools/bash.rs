@@ -372,6 +372,10 @@ pub(crate) fn apply_unix_pgroup(_cmd: &mut Command) {
     // No-op on non-unix; `terminate_child` falls back to `child.kill()`.
 }
 const LONG_RUNNING_TIMEOUT: Duration = Duration::from_secs(15);
+/// Issue #607: env-setup commands (npm install / pip install / ...) routinely
+/// take minutes for cold caches. 10 minutes mirrors the typical CI ceiling for
+/// `npm install` of a `create-react-app` scaffold while still bounding hangs.
+const ENV_SETUP_TIMEOUT: Duration = Duration::from_secs(600);
 const TERMINATE_GRACE: Duration = Duration::from_secs(2);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -385,12 +389,38 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 pub enum BashCommandClass {
     ReadOnly,
     BuildTest,
+    /// Issue #607: dependency / environment setup commands. Examples:
+    /// `npm install`, `pip install`, `poetry install`, `uv sync`,
+    /// `cargo fetch`, `bundle install`. Promoted to a dedicated variant so
+    /// `classify_command` can route them ahead of Network, so
+    /// `select_timeout` can grant them the 600s ceiling, and so
+    /// `observe_evidence_from_bash_outcome` can accept them as
+    /// `VerifierExitZero` completion evidence.
+    EnvSetup,
     ScriptRun,
     Network,
     Mutating,
     Dangerous,
     #[default]
     General,
+}
+
+impl BashCommandClass {
+    /// Issue #607 S3-002: stable snake_case label used in log payloads.
+    /// Mirrors `#[serde(rename_all = "snake_case")]` so logged
+    /// `command_class` matches the variant the serde derive would emit.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            BashCommandClass::ReadOnly => "read_only",
+            BashCommandClass::BuildTest => "build_test",
+            BashCommandClass::EnvSetup => "env_setup",
+            BashCommandClass::ScriptRun => "script_run",
+            BashCommandClass::Network => "network",
+            BashCommandClass::Mutating => "mutating",
+            BashCommandClass::Dangerous => "dangerous",
+            BashCommandClass::General => "general",
+        }
+    }
 }
 
 pub fn run(
@@ -461,8 +491,10 @@ pub fn run_with_outcome(
     // Issue #459 / DR1-003: explicit_timeout takes precedence over the
     // long-running heuristic so the Tester smoke runner can always cap
     // execution at TESTER_SMOKE_TIMEOUT_SECS.
-    let timeout = explicit_timeout
-        .or_else(|| likely_long_running_command(&normalized).then_some(LONG_RUNNING_TIMEOUT));
+    // Issue #607: EnvSetup commands inherit ENV_SETUP_TIMEOUT (600s) via
+    // `select_timeout` so cold `npm install` / `pip install` runs finish
+    // before being killed at 15s.
+    let timeout = explicit_timeout.or_else(|| select_timeout(class, &normalized));
     let started = Instant::now();
 
     let status = loop {
@@ -575,6 +607,11 @@ pub fn classify_command(command: &str) -> BashCommandClass {
     let normalized = command.trim().to_ascii_lowercase();
     if is_dangerous_command(&normalized) {
         BashCommandClass::Dangerous
+    } else if is_env_setup_command(&normalized) {
+        // Issue #607: EnvSetup must beat Network so `npm install` / `pip install`
+        // resolve to EnvSetup rather than Network. `command_uses_network` no
+        // longer lists those install-system commands; SSOT lives here.
+        BashCommandClass::EnvSetup
     } else if command_uses_network(&normalized) {
         BashCommandClass::Network
     } else if is_read_only_command(&normalized) {
@@ -587,6 +624,97 @@ pub fn classify_command(command: &str) -> BashCommandClass {
         BashCommandClass::Mutating
     } else {
         BashCommandClass::General
+    }
+}
+
+/// Issue #607: returns true when `normalized` (already lower-cased, trimmed) is
+/// a single env-setup invocation from a recognized package manager that does
+/// not embed shell-control / redirect / substitution characters. The
+/// shell-control guard mirrors
+/// `completion_evidence::contains_evidence_poisoning_shell_control` so the
+/// EnvSetup → completion-evidence path stays safe (`npm install && curl ...`
+/// is not EnvSetup; SEC4-001).
+fn is_env_setup_command(normalized: &str) -> bool {
+    if contains_env_setup_control_operator(normalized) {
+        return false;
+    }
+    const NEEDLES: &[&str] = &[
+        "npm install",
+        "npm ci",
+        "npm i",
+        "npm add",
+        "pnpm install",
+        "pnpm i",
+        "pnpm add",
+        "yarn install",
+        "yarn add",
+        "pip install",
+        "pip3 install",
+        "poetry install",
+        "poetry add",
+        "uv pip install",
+        "uv sync",
+        "bundle install",
+        "go mod download",
+        "go mod tidy",
+        "cargo fetch",
+        "mix deps.get",
+        "composer install",
+    ];
+    NEEDLES
+        .iter()
+        .any(|needle| env_setup_token_starts_with(normalized, needle))
+}
+
+/// True when `normalized` begins with `needle` and either equals it or has a
+/// trailing space — keeps `npm install` / `npm installer` distinct and avoids
+/// matching `npm-cli install` shapes.
+fn env_setup_token_starts_with(normalized: &str, needle: &str) -> bool {
+    normalized == needle
+        || normalized
+            .strip_prefix(needle)
+            .is_some_and(|rest| rest.starts_with(' '))
+}
+
+/// Issue #607 SEC4-001: deny shell-control / redirect / substitution / escape
+/// inside an EnvSetup candidate. Mirrors
+/// `completion_evidence::contains_evidence_poisoning_shell_control` but is
+/// kept local because `tools` must not import from the `agent` layer
+/// (DR3-002).
+fn contains_env_setup_control_operator(normalized: &str) -> bool {
+    let bytes = normalized.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match b {
+            b';' | b'&' | b'|' | b'<' | b'>' | b'`' | b'\n' | b'\r' | b'\\' => {
+                return true;
+            }
+            b'$' => {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'(' {
+                    return true;
+                }
+                i += 1;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    false
+}
+
+/// Issue #607: SSOT for which (class, normalized) combinations earn a wall
+/// clock timeout. Priority: explicit_timeout (caller) > ENV_SETUP_TIMEOUT >
+/// LONG_RUNNING_TIMEOUT > none. EnvSetup is intentionally NOT added to
+/// `likely_long_running_command` so the 15s ceiling never overrides 600s.
+fn select_timeout(class: BashCommandClass, normalized: &str) -> Option<Duration> {
+    if class == BashCommandClass::EnvSetup {
+        Some(ENV_SETUP_TIMEOUT)
+    } else if likely_long_running_command(normalized) {
+        Some(LONG_RUNNING_TIMEOUT)
+    } else {
+        None
     }
 }
 
@@ -875,6 +1003,16 @@ pub(crate) fn enforce_offline_policy(
             command.trim()
         ));
     }
+    if matches!(class, BashCommandClass::EnvSetup) {
+        // Issue #607 S3-001: two-stage guard. `command_uses_network` no
+        // longer lists install commands, so we reject EnvSetup explicitly
+        // here when offline. Distinct error text aids debugging the
+        // "why was my npm install rejected" question.
+        return Err(format!(
+            "offline mode blocks env-setup commands (network registry access required): {}",
+            command.trim()
+        ));
+    }
     if matches!(
         class,
         BashCommandClass::General
@@ -1005,6 +1143,11 @@ fn is_build_test_command(normalized: &str) -> bool {
 
 fn command_uses_network(command: &str) -> bool {
     let normalized = command.trim().to_ascii_lowercase();
+    // Issue #607: npm/pnpm/yarn/pip/poetry install variants moved to
+    // `is_env_setup_command` (SSOT). Entries that remain here have either
+    // system-wide side effects (`cargo install`, `brew install`,
+    // `apt install`, `docker pull`) or fetch arbitrary modules
+    // (`go get`, `npx`).
     [
         "curl ",
         "wget ",
@@ -1015,16 +1158,6 @@ fn command_uses_network(command: &str) -> bool {
         "git clone",
         "git fetch",
         "git pull",
-        "npm install",
-        "npm add",
-        "pnpm install",
-        "pnpm add",
-        "yarn install",
-        "yarn add",
-        "pip install",
-        "pip3 install",
-        "poetry install",
-        "poetry add",
         "cargo install",
         "cargo add",
         "go get",
@@ -1078,13 +1211,14 @@ pub(crate) fn terminate_child(child: &mut Child) {
 #[cfg(test)]
 mod tests {
     use super::{
-        BashCommandClass, BlockCategory, BlockReason, check_blocked_command, classify_command,
-        command_uses_network, has_shell_control_operator, launches_persistent_service,
+        BashCommandClass, BlockCategory, BlockReason, ENV_SETUP_TIMEOUT, LONG_RUNNING_TIMEOUT,
+        check_blocked_command, classify_command, command_uses_network, enforce_offline_policy,
+        has_shell_control_operator, is_env_setup_command, launches_persistent_service,
         likely_long_running_command, match_dangerous_verb, matches_device_redirect,
         matches_fork_bomb, matches_kill_signal_one, normalize_background_command,
         normalize_noninteractive_scaffold_command, render_block_error,
-        requests_background_execution, run, run_with_outcome, split_shell_control_segments,
-        strip_trailing_background_operator,
+        requests_background_execution, run, run_with_outcome, select_timeout,
+        split_shell_control_segments, strip_trailing_background_operator,
     };
     use std::time::{Duration, Instant};
 
@@ -1402,8 +1536,251 @@ mod tests {
     #[test]
     fn detects_networked_commands() {
         assert!(command_uses_network("curl -I https://example.com"));
-        assert!(command_uses_network("npm install vitest"));
+        // Issue #607 S3-003: install variants moved out of
+        // `command_uses_network`. `classify_command` should pick them up
+        // as EnvSetup ahead of Network.
+        assert!(!command_uses_network("npm install vitest"));
+        assert_eq!(
+            classify_command("npm install vitest"),
+            BashCommandClass::EnvSetup
+        );
         assert!(!command_uses_network("cargo test"));
+        // System-wide install variants remain Network.
+        assert!(command_uses_network("cargo install ripgrep"));
+        assert!(command_uses_network("brew install jq"));
+        assert!(command_uses_network("docker pull alpine"));
+    }
+
+    // ---------------------------------------------------------------------
+    // Issue #607: VR-β-04 (a)/(b) — is_env_setup_command positive / negative
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn is_env_setup_command_accepts_package_manager_installs() {
+        let positives = [
+            "npm install",
+            "npm install --save-dev vitest",
+            "npm ci",
+            "npm i",
+            "npm i react",
+            "npm add eslint",
+            "pnpm install",
+            "pnpm i",
+            "pnpm add tailwindcss",
+            "yarn install",
+            "yarn add jest",
+            "pip install requests",
+            "pip3 install requests",
+            "poetry install",
+            "poetry add httpx",
+            "uv pip install requests",
+            "uv sync",
+            "bundle install",
+            "go mod download",
+            "go mod tidy",
+            "cargo fetch",
+            "mix deps.get",
+            "composer install",
+        ];
+        for cmd in positives {
+            assert!(is_env_setup_command(cmd), "expected EnvSetup: {cmd}");
+        }
+    }
+
+    #[test]
+    fn is_env_setup_command_rejects_non_setup_or_shell_control_commands() {
+        let negatives = [
+            "cargo install ripgrep",
+            "cargo add serde",
+            "brew install jq",
+            "apt install vim",
+            "docker pull alpine",
+            "npx create-next-app",
+            "npm test",
+            "cargo test",
+            "npm run dev",
+            "pip --version",
+            "npm init",
+            "npm installer",
+            "go get example.com/foo",
+            // shell-control / redirect / substitution — SEC4-001.
+            "npm install && npm test",
+            "npm install ; curl https://example.com",
+            "npm install > out.log",
+            "cd frontend && npm install",
+            "npm install | tee log",
+            "npm install $(echo foo)",
+            "npm install `whoami`",
+            "npm install\nrm -rf /",
+        ];
+        for cmd in negatives {
+            assert!(!is_env_setup_command(cmd), "expected NOT EnvSetup: {cmd}");
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Issue #607: VR-β-04 (c) — classify_command picks EnvSetup ahead of Network
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn classify_command_picks_env_setup_ahead_of_network() {
+        assert_eq!(classify_command("npm install"), BashCommandClass::EnvSetup);
+        assert_eq!(
+            classify_command("npm install vitest"),
+            BashCommandClass::EnvSetup
+        );
+        assert_eq!(
+            classify_command("pip install requests"),
+            BashCommandClass::EnvSetup
+        );
+        assert_eq!(classify_command("uv sync"), BashCommandClass::EnvSetup);
+        // Invariants preserved.
+        assert_eq!(classify_command("cargo test"), BashCommandClass::BuildTest);
+        assert_eq!(
+            classify_command("cargo install foo"),
+            BashCommandClass::Network
+        );
+        assert_eq!(classify_command("rm -rf /"), BashCommandClass::Dangerous);
+    }
+
+    // ---------------------------------------------------------------------
+    // Issue #607: VR-β-04 (d) — select_timeout SSOT
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn select_timeout_grants_env_setup_ten_minutes() {
+        assert_eq!(
+            select_timeout(BashCommandClass::EnvSetup, "npm install"),
+            Some(ENV_SETUP_TIMEOUT)
+        );
+        assert_eq!(
+            select_timeout(BashCommandClass::EnvSetup, "pip install requests"),
+            Some(ENV_SETUP_TIMEOUT)
+        );
+        assert_eq!(ENV_SETUP_TIMEOUT, Duration::from_secs(600));
+    }
+
+    #[test]
+    fn select_timeout_does_not_cap_build_test_runs() {
+        assert_eq!(
+            select_timeout(BashCommandClass::BuildTest, "cargo test"),
+            None
+        );
+        assert_eq!(
+            select_timeout(BashCommandClass::BuildTest, "npm test"),
+            None
+        );
+    }
+
+    #[test]
+    fn select_timeout_preserves_likely_long_running_for_dev_servers() {
+        assert_eq!(
+            select_timeout(BashCommandClass::General, "npm run dev"),
+            Some(LONG_RUNNING_TIMEOUT)
+        );
+        assert_eq!(LONG_RUNNING_TIMEOUT, Duration::from_secs(15));
+    }
+
+    #[test]
+    fn select_timeout_returns_none_for_read_only() {
+        assert_eq!(select_timeout(BashCommandClass::ReadOnly, "ls"), None);
+        assert_eq!(select_timeout(BashCommandClass::General, "echo hi"), None);
+    }
+
+    // ---------------------------------------------------------------------
+    // Issue #607: VR-β-04 (h) — offline policy rejects EnvSetup with
+    // a dedicated message and keeps existing arms unaffected.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn enforce_offline_policy_rejects_env_setup_with_dedicated_message() {
+        let err = enforce_offline_policy("npm install", BashCommandClass::EnvSetup, true)
+            .expect_err("offline must reject EnvSetup");
+        assert!(
+            err.contains(
+                "offline mode blocks env-setup commands (network registry access required)"
+            ),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn enforce_offline_policy_online_allows_env_setup() {
+        assert!(enforce_offline_policy("npm install", BashCommandClass::EnvSetup, false).is_ok());
+    }
+
+    #[test]
+    fn enforce_offline_policy_keeps_existing_rejections() {
+        assert!(
+            enforce_offline_policy("curl https://example.com", BashCommandClass::Network, true)
+                .is_err()
+        );
+        assert!(enforce_offline_policy("rm -rf /", BashCommandClass::Dangerous, true).is_err());
+        assert!(enforce_offline_policy("ls", BashCommandClass::ReadOnly, true).is_ok());
+    }
+
+    // ---------------------------------------------------------------------
+    // Issue #607: VR-β-04 (g) — command_uses_network drops install variants
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn command_uses_network_excludes_package_installs() {
+        for cmd in [
+            "npm install vitest",
+            "npm add foo",
+            "pnpm install",
+            "yarn install",
+            "pip install requests",
+            "pip3 install httpx",
+            "poetry install",
+        ] {
+            assert!(!command_uses_network(cmd), "should not be Network: {cmd}");
+        }
+    }
+
+    #[test]
+    fn command_uses_network_keeps_system_wide_installs() {
+        for cmd in [
+            "curl -L https://example.com",
+            "wget https://example.com",
+            "ping example.com",
+            "cargo install ripgrep",
+            "brew install jq",
+            "apt install vim",
+            "docker pull alpine",
+            "go get example.com/foo",
+        ] {
+            assert!(command_uses_network(cmd), "should be Network: {cmd}");
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Issue #607: BashCommandClass::as_str + serde round-trip
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn bash_command_class_serde_round_trip_for_env_setup() {
+        let serialized = serde_json::to_string(&BashCommandClass::EnvSetup).unwrap();
+        assert_eq!(serialized, "\"env_setup\"");
+        let parsed: BashCommandClass = serde_json::from_str("\"env_setup\"").unwrap();
+        assert_eq!(parsed, BashCommandClass::EnvSetup);
+    }
+
+    #[test]
+    fn bash_command_class_default_is_general() {
+        assert_eq!(BashCommandClass::default(), BashCommandClass::General);
+    }
+
+    #[test]
+    fn bash_command_class_as_str_matches_serde_label() {
+        assert_eq!(BashCommandClass::ReadOnly.as_str(), "read_only");
+        assert_eq!(BashCommandClass::BuildTest.as_str(), "build_test");
+        assert_eq!(BashCommandClass::EnvSetup.as_str(), "env_setup");
+        assert_eq!(BashCommandClass::ScriptRun.as_str(), "script_run");
+        assert_eq!(BashCommandClass::Network.as_str(), "network");
+        assert_eq!(BashCommandClass::Mutating.as_str(), "mutating");
+        assert_eq!(BashCommandClass::Dangerous.as_str(), "dangerous");
+        assert_eq!(BashCommandClass::General.as_str(), "general");
     }
 
     #[test]
