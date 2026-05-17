@@ -75,6 +75,19 @@ fn run_with_stub_dir_on_path(
 /// VR-β-05 (1) — setup → test flow: a real `npm install` exit-0 outcome
 /// classifies as `EnvSetup` and is promoted to `VerifierExitZero` evidence
 /// with the `env_setup` class label (BP-01 / BP-07).
+///
+/// Skipped on macOS CI: `run_with_outcome` dispatches via `sh -lc` (login
+/// shell), which on macOS sources `/etc/profile` and runs
+/// `/usr/libexec/path_helper`. `path_helper` rewrites `PATH` from
+/// `/etc/paths`, dropping our prepended `stub_dir` and resolving the
+/// pre-installed runner `npm` instead. The classifier and outcome shape
+/// are platform-independent and fully covered by the unit suites in
+/// `src/tools/bash.rs` and `src/agent/loop_run/turn.rs`; Linux CI exercises
+/// the full E2E with the `PATH` stub honored.
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "sh -lc + path_helper on macOS CI bypasses PATH-shadowed npm stub; see module-level comment"
+)]
 #[test]
 fn npm_install_success_yields_env_setup_completion_evidence() {
     let workspace = tempdir().expect("workspace");
@@ -102,6 +115,10 @@ fn npm_install_success_yields_env_setup_completion_evidence() {
 /// VR-β-05 (2) — install failure: exit_code != 0 means no completion
 /// evidence is promoted. Higher layers can build a `FeedbackFrame` from the
 /// non-zero outcome so the model receives the failure (BP-06).
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "sh -lc + path_helper on macOS CI bypasses PATH-shadowed npm stub; see npm_install_success_yields_env_setup_completion_evidence"
+)]
 #[test]
 fn npm_install_failure_does_not_yield_completion_evidence() {
     let workspace = tempdir().expect("workspace");
@@ -127,6 +144,10 @@ fn npm_install_failure_does_not_yield_completion_evidence() {
 /// the correct class + evidence shape. Agent loop dispatches them as
 /// separate tool calls in a single turn (compound commands carry shell
 /// control operators which disqualify EnvSetup classification by design).
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "sh -lc + path_helper on macOS CI bypasses PATH-shadowed npm stub; see npm_install_success_yields_env_setup_completion_evidence"
+)]
 #[test]
 fn install_then_test_flow_promotes_env_setup_evidence() {
     let workspace = tempdir().expect("workspace");
