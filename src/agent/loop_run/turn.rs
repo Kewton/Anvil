@@ -1373,11 +1373,20 @@ fn should_apply_repo_change_partial_progress_recovery(
     action_expectation: recovery::ActionExpectation,
     repo_edit_calls_made_this_turn: usize,
     final_reply: &str,
-    task_contract_verify_pending: bool,
+    task_contract_action: Option<&super::task_contract::ArtifactRecoveryAction>,
 ) -> bool {
+    let contract_allows_generic_recovery = match task_contract_action {
+        None | Some(super::task_contract::ArtifactRecoveryAction::Done) => true,
+        Some(
+            super::task_contract::ArtifactRecoveryAction::Continue { .. }
+            | super::task_contract::ArtifactRecoveryAction::RunVerifier
+            | super::task_contract::ArtifactRecoveryAction::RepairArtifact { .. },
+        ) => false,
+    };
+
     action_expectation == recovery::ActionExpectation::RepoChange
         && repo_edit_calls_made_this_turn > 0
-        && !task_contract_verify_pending
+        && contract_allows_generic_recovery
         && reply_looks_like_future_work(final_reply)
 }
 
@@ -5329,6 +5338,155 @@ impl Agent {
             }
 
             let final_reply = reply.content.trim().to_string();
+            let task_contract_action = if self.session.mode_state.mode == ExecutionMode::Plan {
+                None
+            } else {
+                task_contract.as_ref().map(|contract| {
+                    self.task_contract_recovery_action(
+                        contract,
+                        contract_verifier_repair_edit_count,
+                        repo_edit_calls_made_this_turn,
+                    )
+                })
+            };
+            if let (Some(contract), Some(action)) =
+                (task_contract.as_ref(), task_contract_action.as_ref())
+            {
+                match action {
+                    super::task_contract::ArtifactRecoveryAction::Continue {
+                        missing,
+                        target_hint,
+                    } => {
+                        let decision = super::task_contract::CompletionDecision::Continue {
+                            missing: missing.clone(),
+                        };
+                        if !contract_deterministic_fallback_materialized
+                            && self.maybe_materialize_task_contract_fallback(&decision, last_iter)
+                        {
+                            contract_deterministic_fallback_materialized = true;
+                            self.set_artifact_recovery_target_for_decision(
+                                &decision,
+                                contract_completion_retries.saturating_add(1),
+                            );
+                            let scaffold_note = "[Task Contract] Deterministic fallback created framework scaffold files only. Treat them as bootstrap, edit them to satisfy the user's specific request, then update tests and docs before final response.";
+                            self.push_system_note(scaffold_note.to_string());
+                            continue;
+                        }
+                        contract_completion_retries += 1;
+                        let missing_labels =
+                            missing.iter().map(|role| role.label()).collect::<Vec<_>>();
+                        let attempt_limit = contract.recovery_attempt_limit();
+                        if contract_completion_retries >= attempt_limit {
+                            exit_reason = ExitReason::MissingRepoEdits;
+                            error_text = format!(
+                                "task contract incomplete; missing required artifact(s): {}",
+                                missing_labels.join(", ")
+                            );
+                            break 'outer;
+                        }
+                        write_stdout_rendered(
+                            &format_iteration_status(
+                                last_iter,
+                                self.config.max_iterations,
+                                "Task contract",
+                                &format!(
+                                    "Asked the model to complete missing artifact(s): {}.",
+                                    missing_labels.join(", ")
+                                ),
+                                self.footer.current_cols(),
+                            ),
+                            true,
+                        );
+                        log_llm_event(
+                            "agent.task_contract.incomplete",
+                            serde_json::json!({
+                                "session_id": self.session_store.session_id(),
+                                "turn_index": self.current_turn_index,
+                                "iter": last_iter,
+                                "missing": missing_labels,
+                            }),
+                        );
+                        let target_hint = target_hint.clone().and_then(|hint| {
+                            self.set_artifact_recovery_target_from_hint(
+                                hint,
+                                contract_completion_retries,
+                            )
+                        });
+                        self.push_system_note(
+                            super::task_contract::render_contract_recovery_note_with_hint(
+                                &decision,
+                                self.active_request_text().as_deref().unwrap_or_default(),
+                                contract_completion_retries,
+                                attempt_limit,
+                                target_hint.as_ref(),
+                            ),
+                        );
+                        continue;
+                    }
+                    super::task_contract::ArtifactRecoveryAction::RepairArtifact { .. } => {
+                        repo_change_retries += 1;
+                        if repo_change_retries >= 3 {
+                            exit_reason = ExitReason::MissingRepoEdits;
+                            error_text = "assistant stopped before repairing the verifier failure"
+                                .to_string();
+                            break 'outer;
+                        }
+                        write_stdout_rendered(
+                            &format_iteration_status(
+                                last_iter,
+                                self.config.max_iterations,
+                                "Retry requested",
+                                "Verifier repair requires a repository edit before verification is retried.",
+                                self.footer.current_cols(),
+                            ),
+                            true,
+                        );
+                        if !self.push_artifact_directed_recovery_note(repo_change_retries) {
+                            self.push_system_note(task_contract_verifier_edit_required_note(
+                                repo_change_retries,
+                                TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT,
+                            ));
+                        }
+                        continue;
+                    }
+                    super::task_contract::ArtifactRecoveryAction::RunVerifier => {
+                        match self.drive_task_contract_verifier(TaskContractVerifierFlowArgs {
+                            before_snapshot: &before_snapshot,
+                            accumulated: &accumulated,
+                            repo_edit_calls_made_this_turn,
+                            task_contract: task_contract.as_ref(),
+                            contract_verification_retries: &mut contract_verification_retries,
+                            contract_verifier_repair_edit_count:
+                                &mut contract_verifier_repair_edit_count,
+                            repo_change_retries: &mut repo_change_retries,
+                            task_contract_verify_commands_collected:
+                                &mut task_contract_verify_commands_collected,
+                            task_contract_verifier_passed_in_loop:
+                                &mut task_contract_verifier_passed_in_loop,
+                            last_iter,
+                        }) {
+                            TaskContractVerifierFlowOutcome::Continue => {
+                                no_tool_retries = 0;
+                                continue;
+                            }
+                            TaskContractVerifierFlowOutcome::Done { final_prose: prose } => {
+                                final_prose = prose;
+                                exit_reason = ExitReason::Done;
+                                break 'outer;
+                            }
+                            TaskContractVerifierFlowOutcome::Exit {
+                                reason,
+                                error_text: verifier_error,
+                            } => {
+                                exit_reason = reason;
+                                error_text = verifier_error;
+                                break 'outer;
+                            }
+                        }
+                    }
+                    super::task_contract::ArtifactRecoveryAction::Done => {}
+                }
+            }
             if final_reply.is_empty() {
                 if action_expectation == recovery::ActionExpectation::RepoChange {
                     repo_change_retries += 1;
@@ -5838,89 +5996,11 @@ impl Agent {
                 continue;
             }
 
-            let task_contract_action = if self.session.mode_state.mode == ExecutionMode::Plan {
-                None
-            } else {
-                task_contract.as_ref().map(|contract| {
-                    self.task_contract_recovery_action(
-                        contract,
-                        contract_verifier_repair_edit_count,
-                        repo_edit_calls_made_this_turn,
-                    )
-                })
-            };
-            let task_contract_verify_pending = matches!(
-                task_contract_action,
-                Some(super::task_contract::ArtifactRecoveryAction::RunVerifier)
-            );
-            if let Some(super::task_contract::ArtifactRecoveryAction::RepairArtifact { .. }) =
-                task_contract_action.as_ref()
-            {
-                repo_change_retries += 1;
-                if repo_change_retries >= 3 {
-                    exit_reason = ExitReason::MissingRepoEdits;
-                    error_text =
-                        "assistant stopped before repairing the verifier failure".to_string();
-                    break 'outer;
-                }
-                write_stdout_rendered(
-                    &format_iteration_status(
-                        last_iter,
-                        self.config.max_iterations,
-                        "Retry requested",
-                        "Verifier repair requires a repository edit before verification is retried.",
-                        self.footer.current_cols(),
-                    ),
-                    true,
-                );
-                if !self.push_artifact_directed_recovery_note(repo_change_retries) {
-                    self.push_system_note(task_contract_verifier_edit_required_note(
-                        repo_change_retries,
-                        TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT,
-                    ));
-                }
-                continue;
-            }
-            if task_contract_verify_pending {
-                match self.drive_task_contract_verifier(TaskContractVerifierFlowArgs {
-                    before_snapshot: &before_snapshot,
-                    accumulated: &accumulated,
-                    repo_edit_calls_made_this_turn,
-                    task_contract: task_contract.as_ref(),
-                    contract_verification_retries: &mut contract_verification_retries,
-                    contract_verifier_repair_edit_count: &mut contract_verifier_repair_edit_count,
-                    repo_change_retries: &mut repo_change_retries,
-                    task_contract_verify_commands_collected:
-                        &mut task_contract_verify_commands_collected,
-                    task_contract_verifier_passed_in_loop:
-                        &mut task_contract_verifier_passed_in_loop,
-                    last_iter,
-                }) {
-                    TaskContractVerifierFlowOutcome::Continue => {
-                        no_tool_retries = 0;
-                        continue;
-                    }
-                    TaskContractVerifierFlowOutcome::Done { final_prose: prose } => {
-                        final_prose = prose;
-                        exit_reason = ExitReason::Done;
-                        break 'outer;
-                    }
-                    TaskContractVerifierFlowOutcome::Exit {
-                        reason,
-                        error_text: verifier_error,
-                    } => {
-                        exit_reason = reason;
-                        error_text = verifier_error;
-                        break 'outer;
-                    }
-                }
-            }
-
             if should_apply_repo_change_partial_progress_recovery(
                 action_expectation,
                 repo_edit_calls_made_this_turn,
                 &final_reply,
-                task_contract_verify_pending,
+                task_contract_action.as_ref(),
             ) {
                 repo_change_retries += 1;
                 if repo_change_retries >= 3 {
@@ -6004,139 +6084,6 @@ impl Agent {
                     repo_change_retries,
                 ));
                 continue;
-            }
-
-            if self.session.mode_state.mode != ExecutionMode::Plan
-                && let Some(contract) = task_contract.as_ref()
-            {
-                let action = self.task_contract_recovery_action(
-                    contract,
-                    contract_verifier_repair_edit_count,
-                    repo_edit_calls_made_this_turn,
-                );
-                match action {
-                    super::task_contract::ArtifactRecoveryAction::Continue {
-                        missing,
-                        ref target_hint,
-                    } => {
-                        let decision = super::task_contract::CompletionDecision::Continue {
-                            missing: missing.clone(),
-                        };
-                        if !contract_deterministic_fallback_materialized
-                            && self.maybe_materialize_task_contract_fallback(&decision, last_iter)
-                        {
-                            contract_deterministic_fallback_materialized = true;
-                            self.set_artifact_recovery_target_for_decision(
-                                &decision,
-                                contract_completion_retries.saturating_add(1),
-                            );
-                            self.push_system_note(
-                            "[Task Contract] Deterministic fallback created framework scaffold files only. Treat them as bootstrap, edit them to satisfy the user's specific request, then update tests and docs before final response."
-                                .to_string(),
-                        );
-                            continue;
-                        }
-                        contract_completion_retries += 1;
-                        let missing_labels =
-                            missing.iter().map(|role| role.label()).collect::<Vec<_>>();
-                        let attempt_limit = contract.recovery_attempt_limit();
-                        if contract_completion_retries >= attempt_limit {
-                            exit_reason = ExitReason::MissingRepoEdits;
-                            error_text = format!(
-                                "task contract incomplete; missing required artifact(s): {}",
-                                missing_labels.join(", ")
-                            );
-                            break 'outer;
-                        }
-                        write_stdout_rendered(
-                            &format_iteration_status(
-                                last_iter,
-                                self.config.max_iterations,
-                                "Task contract",
-                                &format!(
-                                    "Asked the model to complete missing artifact(s): {}.",
-                                    missing_labels.join(", ")
-                                ),
-                                self.footer.current_cols(),
-                            ),
-                            true,
-                        );
-                        log_llm_event(
-                            "agent.task_contract.incomplete",
-                            serde_json::json!({
-                                "session_id": self.session_store.session_id(),
-                                "turn_index": self.current_turn_index,
-                                "iter": last_iter,
-                                "missing": missing_labels,
-                            }),
-                        );
-                        let target_hint = target_hint.clone().and_then(|hint| {
-                            self.set_artifact_recovery_target_from_hint(
-                                hint,
-                                contract_completion_retries,
-                            )
-                        });
-                        self.push_system_note(
-                            super::task_contract::render_contract_recovery_note_with_hint(
-                                &decision,
-                                self.active_request_text().as_deref().unwrap_or_default(),
-                                contract_completion_retries,
-                                attempt_limit,
-                                target_hint.as_ref(),
-                            ),
-                        );
-                        continue;
-                    }
-                    super::task_contract::ArtifactRecoveryAction::RepairArtifact { .. } => {
-                        repo_change_retries += 1;
-                        if repo_change_retries >= 3 {
-                            exit_reason = ExitReason::MissingRepoEdits;
-                            error_text = "assistant stopped before repairing the verifier failure"
-                                .to_string();
-                            break 'outer;
-                        }
-                        if !self.push_artifact_directed_recovery_note(repo_change_retries) {
-                            self.push_system_note(task_contract_verifier_edit_required_note(
-                                repo_change_retries,
-                                TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT,
-                            ));
-                        }
-                        continue;
-                    }
-                    super::task_contract::ArtifactRecoveryAction::RunVerifier => {
-                        match self.drive_task_contract_verifier(TaskContractVerifierFlowArgs {
-                            before_snapshot: &before_snapshot,
-                            accumulated: &accumulated,
-                            repo_edit_calls_made_this_turn,
-                            task_contract: task_contract.as_ref(),
-                            contract_verification_retries: &mut contract_verification_retries,
-                            contract_verifier_repair_edit_count:
-                                &mut contract_verifier_repair_edit_count,
-                            repo_change_retries: &mut repo_change_retries,
-                            task_contract_verify_commands_collected:
-                                &mut task_contract_verify_commands_collected,
-                            task_contract_verifier_passed_in_loop:
-                                &mut task_contract_verifier_passed_in_loop,
-                            last_iter,
-                        }) {
-                            TaskContractVerifierFlowOutcome::Continue => continue,
-                            TaskContractVerifierFlowOutcome::Done { final_prose: prose } => {
-                                final_prose = prose;
-                                exit_reason = ExitReason::Done;
-                                break 'outer;
-                            }
-                            TaskContractVerifierFlowOutcome::Exit {
-                                reason,
-                                error_text: verifier_error,
-                            } => {
-                                exit_reason = reason;
-                                error_text = verifier_error;
-                                break 'outer;
-                            }
-                        }
-                    }
-                    super::task_contract::ArtifactRecoveryAction::Done => {}
-                }
             }
 
             // Done
@@ -13373,7 +13320,7 @@ fn build_recent_tool_summary(
 #[cfg(test)]
 mod truncate_tests {
     use super::super::completion_evidence::{CompletionEvidence, EvidenceSet, RepoEditCategory};
-    use super::super::task_contract::{ArtifactRole, TaskContract};
+    use super::super::task_contract::{ArtifactRecoveryAction, ArtifactRole, TaskContract};
     use super::{
         ScaffoldFramework, changed_files_for_verifier, deterministic_nextjs_scaffold_reply,
         extract_filename_with_suffix, focused_edit_tool_policy_error, reply_looks_like_future_work,
@@ -13444,6 +13391,7 @@ mod truncate_tests {
         let verify_pending =
             task_contract_needs_verification(ExecutionMode::Act, Some(&contract), &evidence);
         assert!(verify_pending);
+        let action = ArtifactRecoveryAction::RunVerifier;
         assert!(reply_looks_like_future_work(
             "次にテストを実行して確認します。"
         ));
@@ -13451,7 +13399,35 @@ mod truncate_tests {
             ActionExpectation::RepoChange,
             3,
             "次にテストを実行して確認します。",
-            verify_pending,
+            Some(&action),
+        ));
+    }
+
+    #[test]
+    fn task_contract_continue_preempts_future_work_repo_recovery() {
+        let action = ArtifactRecoveryAction::Continue {
+            missing: vec![ArtifactRole::UsageDocs],
+            target_hint: None,
+        };
+
+        assert!(reply_looks_like_future_work("次にREADMEを更新します。"));
+        assert!(!should_apply_repo_change_partial_progress_recovery(
+            ActionExpectation::RepoChange,
+            2,
+            "次にREADMEを更新します。",
+            Some(&action),
+        ));
+    }
+
+    #[test]
+    fn generic_partial_progress_recovery_runs_when_contract_is_done() {
+        let action = ArtifactRecoveryAction::Done;
+
+        assert!(should_apply_repo_change_partial_progress_recovery(
+            ActionExpectation::RepoChange,
+            1,
+            "Next, I will update the remaining file.",
+            Some(&action),
         ));
     }
 
