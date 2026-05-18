@@ -474,14 +474,15 @@ pub struct Agent {
     /// can constrain file tools to this artifact without forcing focused-edit
     /// mode immediately.
     current_artifact_recovery_target: Option<crate::agent::loop_run::task_contract::RecoveryTarget>,
-    /// Issue #623 follow-up / #625: verifier repair is a diagnostic phase. If
-    /// the verifier output names a workspace file, `verifier_repair_context`
-    /// focuses the next edit there; otherwise the loop allows brief project
-    /// inspection plus Write/Edit until a repository edit lands.
+    /// Issue #623 follow-up / #625 / #627: verifier repair is a diagnostic phase.
+    /// The context is turn-local control data, not conversation memory. It keeps
+    /// verifier output, deterministic facts, and one bounded assessment so the
+    /// tool policy can choose a repair target without polluting the assistant
+    /// history with long-lived diagnostic state.
     task_contract_verifier_repair_pending: bool,
-    /// Issue #625: turn-local diagnostic context for a failed task-contract
+    /// Issue #625 / #627: turn-local diagnostic context for a failed task-contract
     /// verifier. This keeps verifier output as data and lets the tool policy
-    /// focus the next repair turn on the workspace file named by the failure,
+    /// focus the next repair turn on the most likely workspace repair file,
     /// without adding framework-specific recovery rules.
     verifier_repair_context: Option<VerifierRepairContext>,
 }
@@ -490,11 +491,54 @@ pub struct Agent {
 struct VerifierRepairContext {
     command: String,
     output_excerpt: String,
+    failure_type: VerifierFailureType,
     target_hint: Option<crate::agent::loop_run::task_contract::RecoveryTargetHint>,
+    repair_target_hint: Option<crate::agent::loop_run::task_contract::RecoveryTargetHint>,
+    changed_file_hints: Vec<crate::agent::loop_run::task_contract::RecoveryTargetHint>,
+    assessment: Option<VerifierRepairAssessment>,
+    assessment_attempts: usize,
     target_line: Option<usize>,
     error_kind: Option<String>,
     failure_signature: String,
     repair_attempt: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerifierFailureType {
+    CompileOrSyntax,
+    ImportOrDependency,
+    RuntimeError,
+    AssertionFailure,
+    MissingVerifierOrConfig,
+    Unknown,
+}
+
+impl VerifierFailureType {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CompileOrSyntax => "compile_or_syntax",
+            Self::ImportOrDependency => "import_or_dependency",
+            Self::RuntimeError => "runtime_error",
+            Self::AssertionFailure => "assertion_failure",
+            Self::MissingVerifierOrConfig => "missing_verifier_or_config",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VerifierRepairAssessment {
+    failure_type: VerifierFailureType,
+    probable_cause_role: Option<crate::agent::loop_run::task_contract::ArtifactRole>,
+    needed_reads: Vec<crate::agent::loop_run::task_contract::RecoveryTargetHint>,
+    repair_target_hint: Option<crate::agent::loop_run::task_contract::RecoveryTargetHint>,
+    source: VerifierRepairAssessmentSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerifierRepairAssessmentSource {
+    Model,
+    DeterministicFallback,
 }
 
 /// Issue #594: state machine for the `/photon-why` slash command. Lives at
