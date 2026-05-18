@@ -498,12 +498,36 @@ struct VerifierRepairContext {
     assessment: Option<VerifierRepairAssessment>,
     assessment_attempts: usize,
     diagnostic_attempted: bool,
+    diagnostic_unavailable: bool,
     diagnostic_error: Option<String>,
     applied_repair_intents: Vec<String>,
     target_line: Option<usize>,
     error_kind: Option<String>,
     failure_signature: String,
+    failure_count: Option<usize>,
+    previous_failure_signature: Option<String>,
+    previous_failure_count: Option<usize>,
+    rerun_outcome: Option<VerifierRepairRerunOutcome>,
     repair_attempt: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerifierRepairRerunOutcome {
+    Improved,
+    SameFailureRemaining,
+    NewFailure,
+    Worsened,
+}
+
+impl VerifierRepairRerunOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Improved => "improved",
+            Self::SameFailureRemaining => "same_failure_remaining",
+            Self::NewFailure => "new_failure",
+            Self::Worsened => "worsened",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -536,6 +560,7 @@ struct VerifierRepairAssessment {
     probable_cause_role: Option<crate::agent::loop_run::task_contract::ArtifactRole>,
     needed_reads: Vec<crate::agent::loop_run::task_contract::RecoveryTargetHint>,
     repair_target_hint: Option<crate::agent::loop_run::task_contract::RecoveryTargetHint>,
+    repair_plan: Vec<crate::agent::loop_run::task_contract::RecoveryTargetHint>,
     summary: Option<String>,
     source: VerifierRepairAssessmentSource,
 }
