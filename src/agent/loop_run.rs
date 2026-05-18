@@ -497,6 +497,8 @@ struct VerifierRepairContext {
     changed_file_hints: Vec<crate::agent::loop_run::task_contract::RecoveryTargetHint>,
     assessment: Option<VerifierRepairAssessment>,
     assessment_attempts: usize,
+    diagnostic_attempted: bool,
+    diagnostic_error: Option<String>,
     target_line: Option<usize>,
     error_kind: Option<String>,
     failure_signature: String,
@@ -528,17 +530,49 @@ impl VerifierFailureType {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct VerifierRepairAssessment {
+    failure_kind: VerifierDiagnosticFailureKind,
     failure_type: VerifierFailureType,
     probable_cause_role: Option<crate::agent::loop_run::task_contract::ArtifactRole>,
     needed_reads: Vec<crate::agent::loop_run::task_contract::RecoveryTargetHint>,
     repair_target_hint: Option<crate::agent::loop_run::task_contract::RecoveryTargetHint>,
+    summary: Option<String>,
     source: VerifierRepairAssessmentSource,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VerifierRepairAssessmentSource {
-    Model,
-    DeterministicFallback,
+    DiagnosticPass,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerifierDiagnosticFailureKind {
+    DependencyMissing,
+    LocalImportContractMismatch,
+    CompileOrSyntaxError,
+    AssertionMismatch,
+    RuntimeError,
+    TestBug,
+    ConfigOrVerifierError,
+    Unknown,
+}
+
+impl VerifierDiagnosticFailureKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::DependencyMissing => "dependency_missing",
+            Self::LocalImportContractMismatch => "local_import_contract_mismatch",
+            Self::CompileOrSyntaxError => "compile_or_syntax_error",
+            Self::AssertionMismatch => "assertion_mismatch",
+            Self::RuntimeError => "runtime_error",
+            Self::TestBug => "test_bug",
+            Self::ConfigOrVerifierError => "config_or_verifier_error",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    fn allows_setup_target(self) -> bool {
+        matches!(self, Self::DependencyMissing | Self::ConfigOrVerifierError)
+    }
 }
 
 /// Issue #594: state machine for the `/photon-why` slash command. Lives at
