@@ -499,6 +499,7 @@ struct VerifierRepairContext {
     assessment_attempts: usize,
     diagnostic_attempted: bool,
     diagnostic_error: Option<String>,
+    applied_repair_intents: Vec<String>,
     target_line: Option<usize>,
     error_kind: Option<String>,
     failure_signature: String,
