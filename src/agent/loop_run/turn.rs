@@ -73,6 +73,7 @@ const CREATE_NEXT_APP_PACKAGE_VERSION: &str = "16.2.4";
 struct EffectiveToolPolicy {
     allowed_tools: Option<Vec<&'static str>>,
     focused_edit: Option<FocusedEditPolicy>,
+    reason: EffectiveToolPolicyReason,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,22 +82,44 @@ struct FocusedEditPolicy {
     target_already_read: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EffectiveToolPolicyReason {
+    Unrestricted,
+    AnswerOnly,
+    FocusedEditRecovery,
+    LocalLlmSmallEditAfterRead,
+}
+
+impl EffectiveToolPolicyReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unrestricted => "unrestricted",
+            Self::AnswerOnly => "answer_only",
+            Self::FocusedEditRecovery => "focused_edit_recovery",
+            Self::LocalLlmSmallEditAfterRead => "local_llm_small_edit_after_read",
+        }
+    }
+}
+
 impl EffectiveToolPolicy {
     fn unrestricted() -> Self {
         Self {
             allowed_tools: None,
             focused_edit: None,
+            reason: EffectiveToolPolicyReason::Unrestricted,
         }
     }
 
-    fn restricted(allowed_tools: Vec<&'static str>) -> Self {
+    fn restricted(reason: EffectiveToolPolicyReason, allowed_tools: Vec<&'static str>) -> Self {
         Self {
             allowed_tools: Some(allowed_tools),
             focused_edit: None,
+            reason,
         }
     }
 
     fn focused_edit(
+        reason: EffectiveToolPolicyReason,
         allowed_tools: Vec<&'static str>,
         target: PathBuf,
         target_already_read: bool,
@@ -107,6 +130,7 @@ impl EffectiveToolPolicy {
                 target,
                 target_already_read,
             }),
+            reason,
         }
     }
 
@@ -116,6 +140,10 @@ impl EffectiveToolPolicy {
 
     fn focused_edit_policy(&self) -> Option<&FocusedEditPolicy> {
         self.focused_edit.as_ref()
+    }
+
+    fn reason(&self) -> EffectiveToolPolicyReason {
+        self.reason
     }
 }
 
@@ -4349,14 +4377,14 @@ impl Agent {
             }
 
             let effective_tool_policy = self.effective_tool_policy();
-            if let Some(policy) = effective_tool_policy.focused_edit_policy() {
-                let target = &policy.target;
-                let target_already_read = policy.target_already_read;
-                match focused_edit_tool_batch_action(
+            if effective_tool_policy
+                .allowed_tool_names_for_prompt()
+                .is_some()
+            {
+                match effective_tool_batch_action(
                     &prepared_tool_calls,
-                    target,
+                    &effective_tool_policy,
                     &self.work_root,
-                    target_already_read,
                 ) {
                     FocusedEditBatchAction::Accept => {}
                     FocusedEditBatchAction::TruncateToFirst => {
@@ -4373,9 +4401,10 @@ impl Agent {
                         );
                     }
                     FocusedEditBatchAction::Reject(err) => {
+                        let focused_retry = effective_tool_policy.focused_edit_policy().cloned();
                         self.session.working_memory.note_error(err);
                         focused_policy_retries += 1;
-                        if focused_policy_retries >= 3 {
+                        if focused_retry.is_some() && focused_policy_retries >= 3 {
                             let request = self.active_request_text().unwrap_or_default();
                             let fallback =
                                 match self.maybe_apply_local_llm_small_edit_fallback(&request) {
@@ -4397,21 +4426,39 @@ impl Agent {
                             error_text = exit_reason.default_error_text().to_string();
                             break 'outer;
                         }
+                        if focused_retry.is_none() && focused_policy_retries >= 3 {
+                            exit_reason = ExitReason::ToolCallFormatError;
+                            error_text =
+                                "assistant kept calling tools outside the current tool policy"
+                                    .to_string();
+                            break 'outer;
+                        }
+                        let retry_status_note = if focused_retry.is_some() {
+                            "Focused edit recovery requires exactly one compact tool call on the target file. Asked the model to retry with a single action."
+                        } else {
+                            "The tool call violated the current tool policy. Asked the model to retry with an allowed tool."
+                        };
                         write_stdout_rendered(
                             &format_iteration_status(
                                 last_iter,
                                 self.config.max_iterations,
                                 "Retry requested",
-                                "Focused edit recovery requires exactly one compact tool call on the target file. Asked the model to retry with a single action.",
+                                retry_status_note,
                                 self.footer.current_cols(),
                             ),
                             true,
                         );
-                        self.push_system_note(self.focused_edit_no_tool_note_for_target(
-                            target,
-                            target_already_read,
-                            focused_policy_retries,
-                        ));
+                        if let Some(policy) = focused_retry {
+                            self.push_system_note(self.focused_edit_no_tool_note_for_target(
+                                &policy.target,
+                                policy.target_already_read,
+                                focused_policy_retries,
+                            ));
+                        } else {
+                            self.push_system_note(format!(
+                                "The previous tool call violated the current tool policy and was not executed. Emit exactly one allowed tool call now. tool_policy_retry_attempt={focused_policy_retries}"
+                            ));
+                        }
                         continue;
                     }
                 }
@@ -4784,12 +4831,14 @@ impl Agent {
                             self.execute_tool_call(
                                 &tool_name,
                                 &tool_call.arguments,
+                                Some(&effective_tool_policy),
                                 Some(interrupt_flag.flag.clone()),
                             )
                         } else {
                             self.execute_tool_call(
                                 &tool_name,
                                 &tool_call.arguments,
+                                Some(&effective_tool_policy),
                                 Some(interrupt_flag.flag.clone()),
                             )
                         }
@@ -4798,12 +4847,14 @@ impl Agent {
                         self.execute_tool_call(
                             &tool_name,
                             &tool_call.arguments,
+                            Some(&effective_tool_policy),
                             Some(interrupt_flag.flag.clone()),
                         )
                     } else {
                         self.execute_tool_call(
                             &tool_name,
                             &tool_call.arguments,
+                            Some(&effective_tool_policy),
                             Some(interrupt_flag.flag.clone()),
                         )
                     };
@@ -6724,12 +6775,10 @@ impl Agent {
                         tool_call_format_retry_count += 1;
                         tool_call_format_retries_remaining -= 1;
                         let lower_err = err.to_ascii_lowercase();
-                        if let Some(target) = self.focused_edit_recovery_target() {
-                            let target_already_read = focused_edit_target_already_read(
-                                &self.session.messages,
-                                &target,
-                                &self.work_root,
-                            );
+                        let effective_tool_policy = self.effective_tool_policy();
+                        if let Some(policy) = effective_tool_policy.focused_edit_policy() {
+                            let target = &policy.target;
+                            let target_already_read = policy.target_already_read;
                             let target_display = progress_path_display(
                                 &target.display().to_string(),
                                 &self.work_root,
@@ -6765,18 +6814,6 @@ impl Agent {
                                 );
                                 continue;
                             }
-                        } else if let Some(target) = self.qwen35_small_edit_target() {
-                            let target_display = progress_path_display(
-                                &target.display().to_string(),
-                                &self.work_root,
-                                self.session.mode_state.active_plan_path.as_deref(),
-                                120,
-                            );
-                            self.push_system_note(recovery::forced_small_edit_recovery_note(
-                                &target_display,
-                                tool_call_format_retry_count,
-                            ));
-                            continue;
                         }
                         {
                             self.push_system_note(recovery::tool_call_format_recovery_note(
@@ -6796,9 +6833,12 @@ impl Agent {
                         );
                         return Ok(reply);
                     }
+                    let timeout_focused_policy =
+                        self.effective_tool_policy().focused_edit_policy().cloned();
                     if err.to_ascii_lowercase().contains("timed out")
-                        && let Some(target) = self.focused_edit_recovery_target()
+                        && let Some(policy) = timeout_focused_policy
                     {
+                        let target = &policy.target;
                         if let Some(reply) =
                             self.maybe_apply_deterministic_quality_fallback_after_timeout(&err)
                         {
@@ -6808,11 +6848,7 @@ impl Agent {
                             );
                             return Ok(reply);
                         }
-                        let target_already_read = focused_edit_target_already_read(
-                            &self.session.messages,
-                            &target,
-                            &self.work_root,
-                        );
+                        let target_already_read = policy.target_already_read;
                         focused_edit_timeout_retry_count += 1;
                         if focused_edit_timeout_retry_count >= 2 {
                             return Err(err);
@@ -6861,18 +6897,22 @@ impl Agent {
         let protocol =
             prompting::ToolProtocol::from_native_tools_enabled(self.native_tools_enabled);
         let native_tools_enabled = protocol.native_tools_enabled();
-        let messages = self.build_request_messages(protocol);
+        let effective_tool_policy = self.effective_tool_policy();
+        let focused_edit_target = effective_tool_policy
+            .focused_edit_policy()
+            .map(|policy| policy.target.as_path());
+        let messages = self.build_request_messages(protocol, &effective_tool_policy);
         let assistant_model = self.current_assistant_model();
         let focused_edit_timeout_override = focused_edit_timeout_override_secs(
             assistant_model.as_str(),
             &self.session.messages,
-            self.focused_edit_recovery_target().as_deref(),
+            focused_edit_target,
             &self.work_root,
         );
         let focused_edit_max_predict_override = focused_edit_max_predict_override(
             assistant_model.as_str(),
             &self.session.messages,
-            self.focused_edit_recovery_target().as_deref(),
+            focused_edit_target,
             &self.work_root,
         );
         let force_non_streaming_for_focused_edit =
@@ -6885,7 +6925,7 @@ impl Agent {
                 io::stdin().is_terminal(),
             );
 
-        let tool_specs = self.effective_tool_specs();
+        let tool_specs = self.tool_specs_for_policy(&effective_tool_policy);
 
         if use_streaming_transport {
             let mut first_chunk = true;
@@ -6958,6 +6998,7 @@ impl Agent {
             self.request_assistant_reply_non_streaming(
                 assistant_model.as_str(),
                 &messages,
+                &tool_specs,
                 native_tools_enabled,
                 focused_edit_timeout_override,
                 focused_edit_max_predict_override,
@@ -6969,6 +7010,7 @@ impl Agent {
         &self,
         model: &str,
         messages: &[ConversationMessage],
+        tool_specs: &[ToolSpec],
         native_tools_enabled: bool,
         timeout_override_secs: Option<u64>,
         max_predict_override: Option<usize>,
@@ -6980,7 +7022,7 @@ impl Agent {
             self.client.clone()
         };
         let model = model.to_string();
-        let tool_specs = self.effective_tool_specs();
+        let tool_specs = tool_specs.to_vec();
         let owned_messages = messages.to_vec();
         let timeout = Duration::from_secs(effective_non_streaming_timeout_secs(
             &model,
@@ -7233,18 +7275,21 @@ impl Agent {
     fn build_request_messages(
         &mut self,
         protocol: prompting::ToolProtocol,
+        effective_tool_policy: &EffectiveToolPolicy,
     ) -> Vec<ConversationMessage> {
         let mut messages = Vec::new();
-        let focused_edit_target = self.focused_edit_recovery_target();
+        let focused_edit_policy = effective_tool_policy.focused_edit_policy().cloned();
+        let focused_edit_target = focused_edit_policy
+            .as_ref()
+            .map(|policy| policy.target.clone());
         let successful_repo_edits = successful_non_plan_repo_edit_count(
             &self.session.messages,
             &self.work_root,
             self.session.mode_state.active_plan_path.as_deref(),
         );
-        let focused_edit_target_already_read =
-            focused_edit_target.as_deref().is_some_and(|target| {
-                focused_edit_target_already_read(&self.session.messages, target, &self.work_root)
-            });
+        let focused_edit_target_already_read = focused_edit_policy
+            .as_ref()
+            .is_some_and(|policy| policy.target_already_read);
         let plan_contents = if self.session.mode_state.mode == ExecutionMode::Plan {
             self.current_plan_contents().ok().flatten()
         } else {
@@ -7262,7 +7307,6 @@ impl Agent {
             .map(lifecycle::plan_next_stage_sections)
             .unwrap_or_default();
 
-        let effective_tool_policy = self.effective_tool_policy();
         messages.push(ConversationMessage::system(build_system_prompt(
             self.session.mode_state.mode,
             self.session.mode_state.active_plan_path.as_deref(),
@@ -7274,17 +7318,6 @@ impl Agent {
         )));
         if let Some(message) = self.mode_policy_message() {
             messages.push(message);
-        }
-        if let Some(target) = self.qwen35_small_edit_target() {
-            messages.push(ConversationMessage::system(format!(
-                "[Local LLM Focused Edit] The target file has already been read: {}. Emit exactly one small Edit on this file next. Do not use Read, Write, Bash, Glob, or Grep. Anchor the Edit to exact text from the latest Read and keep the replacement compact.",
-                progress_path_display(
-                    &target.display().to_string(),
-                    &self.work_root,
-                    self.session.mode_state.active_plan_path.as_deref(),
-                    120
-                )
-            )));
         }
         if focused_edit_target.is_none() {
             if self.active_task_expects_repo_change() && self.workspace_appears_empty() {
@@ -7499,45 +7532,60 @@ impl Agent {
     fn effective_tool_policy(&self) -> EffectiveToolPolicy {
         if self.answer_only_mode_active() {
             if self.workspace_appears_empty() {
-                return EffectiveToolPolicy::restricted(Vec::new());
+                return EffectiveToolPolicy::restricted(
+                    EffectiveToolPolicyReason::AnswerOnly,
+                    Vec::new(),
+                );
             }
             if self.script_execution_requested() {
-                return EffectiveToolPolicy::restricted(vec!["Read", "Glob", "Grep", "Bash"]);
+                return EffectiveToolPolicy::restricted(
+                    EffectiveToolPolicyReason::AnswerOnly,
+                    vec!["Read", "Glob", "Grep", "Bash"],
+                );
             } else {
-                return EffectiveToolPolicy::restricted(vec!["Read", "Glob", "Grep"]);
+                return EffectiveToolPolicy::restricted(
+                    EffectiveToolPolicyReason::AnswerOnly,
+                    vec!["Read", "Glob", "Grep"],
+                );
             }
-        }
-        if self.qwen35_small_edit_target().is_some() {
-            return EffectiveToolPolicy::restricted(vec!["Edit"]);
         }
         if let Some(target) = self.focused_edit_recovery_target() {
-            let target_already_read =
-                focused_edit_target_already_read(&self.session.messages, &target, &self.work_root);
-            if !target.is_file() {
-                return EffectiveToolPolicy::focused_edit(
-                    vec!["Write"],
-                    target,
-                    target_already_read,
-                );
-            } else if target_already_read {
-                return EffectiveToolPolicy::focused_edit(
-                    vec!["Edit"],
-                    target,
-                    target_already_read,
-                );
-            } else {
-                return EffectiveToolPolicy::focused_edit(
-                    vec!["Read", "Edit"],
-                    target,
-                    target_already_read,
-                );
-            }
+            return self.focused_edit_policy_for_target(
+                target,
+                EffectiveToolPolicyReason::FocusedEditRecovery,
+            );
+        }
+        if let Some(target) = self.local_llm_small_edit_target() {
+            return self.focused_edit_policy_for_target(
+                target,
+                EffectiveToolPolicyReason::LocalLlmSmallEditAfterRead,
+            );
         }
         EffectiveToolPolicy::unrestricted()
     }
 
-    fn effective_tool_specs(&self) -> Vec<ToolSpec> {
-        let policy = self.effective_tool_policy();
+    fn focused_edit_policy_for_target(
+        &self,
+        target: PathBuf,
+        reason: EffectiveToolPolicyReason,
+    ) -> EffectiveToolPolicy {
+        let target_already_read =
+            focused_edit_target_already_read(&self.session.messages, &target, &self.work_root);
+        if !target.is_file() {
+            EffectiveToolPolicy::focused_edit(reason, vec!["Write"], target, target_already_read)
+        } else if target_already_read {
+            EffectiveToolPolicy::focused_edit(reason, vec!["Edit"], target, target_already_read)
+        } else {
+            EffectiveToolPolicy::focused_edit(
+                reason,
+                vec!["Read", "Edit"],
+                target,
+                target_already_read,
+            )
+        }
+    }
+
+    fn tool_specs_for_policy(&self, policy: &EffectiveToolPolicy) -> Vec<ToolSpec> {
         let mut specs = self.tool_registry.specs().to_vec();
         if let Some(allowed_tools) = policy.allowed_tool_names_for_prompt() {
             specs.retain(|spec| allowed_tools.contains(&spec.function.name.as_str()));
@@ -7545,7 +7593,7 @@ impl Agent {
         specs
     }
 
-    fn qwen35_small_edit_target(&self) -> Option<PathBuf> {
+    fn local_llm_small_edit_target(&self) -> Option<PathBuf> {
         if !model_capabilities(&self.current_assistant_model()).read_after_small_edit_protocol {
             return None;
         }
@@ -7570,7 +7618,10 @@ impl Agent {
             )
             .then_some(target);
         }
-        latest_turn_preferred_read_edit_target(&self.session.messages, &self.work_root)
+        let target =
+            latest_turn_preferred_read_edit_target(&self.session.messages, &self.work_root)?;
+        focused_edit_target_already_read(&self.session.messages, &target, &self.work_root)
+            .then_some(target)
     }
 
     fn mode_policy_message(&self) -> Option<ConversationMessage> {
@@ -7813,6 +7864,7 @@ impl Agent {
         &mut self,
         name: &str,
         arguments: &serde_json::Value,
+        effective_tool_policy: Option<&EffectiveToolPolicy>,
         cancel_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> String {
         if let Some(err) = self.answer_only_policy_error(name, arguments) {
@@ -7823,7 +7875,12 @@ impl Agent {
             self.session.working_memory.note_error(err.clone());
             return lifecycle::format_tool_error(&err);
         }
-        if let Some(err) = self.focused_edit_policy_error(name, arguments) {
+        let effective_policy_error = if let Some(policy) = effective_tool_policy {
+            effective_tool_policy_error_for_call(policy, name, arguments, &self.work_root)
+        } else {
+            self.effective_tool_policy_error(name, arguments)
+        };
+        if let Some(err) = effective_policy_error {
             self.session.working_memory.note_error(err.clone());
             return lifecycle::format_tool_error(&err);
         }
@@ -8231,19 +8288,17 @@ impl Agent {
             .is_some_and(request_explicitly_requests_script_execution)
     }
 
-    fn focused_edit_policy_error(
+    fn effective_tool_policy_error(
         &self,
         name: &str,
         arguments: &serde_json::Value,
     ) -> Option<String> {
         let effective_tool_policy = self.effective_tool_policy();
-        let policy = effective_tool_policy.focused_edit_policy()?;
-        focused_edit_tool_policy_error(
+        effective_tool_policy_error_for_call(
+            &effective_tool_policy,
             name,
             arguments,
-            &policy.target,
             &self.work_root,
-            policy.target_already_read,
         )
     }
 
@@ -8775,6 +8830,7 @@ impl Agent {
             let raw_result = self.execute_tool_call(
                 &tool_call.name,
                 &tool_call.arguments,
+                None,
                 Some(interrupt_flag.flag.clone()),
             );
             if tool_result_failed(&raw_result) {
@@ -9429,9 +9485,11 @@ if __name__ == "__main__":
             && let Ok(resolved) = resolve_user_path(&self.work_root, raw_path)
         {
             let resolved = if tool_call.name == "Read" {
-                self.focused_edit_recovery_target()
-                    .and_then(|target| {
-                        focused_read_target_for_directory(&resolved, &target).then_some(target)
+                self.effective_tool_policy()
+                    .focused_edit_policy()
+                    .and_then(|policy| {
+                        focused_read_target_for_directory(&resolved, &policy.target)
+                            .then_some(policy.target.clone())
                     })
                     .unwrap_or(resolved)
             } else {
@@ -11890,6 +11948,65 @@ fn focused_edit_tool_policy_error(
     }
 }
 
+fn effective_tool_policy_error_for_call(
+    policy: &EffectiveToolPolicy,
+    name: &str,
+    arguments: &serde_json::Value,
+    work_root: &Path,
+) -> Option<String> {
+    if let Some(allowed_tools) = policy.allowed_tool_names_for_prompt()
+        && !allowed_tools.contains(&name)
+    {
+        return Some(restricted_tool_policy_error(
+            policy,
+            name,
+            allowed_tools,
+            work_root,
+        ));
+    }
+
+    if let Some(focused) = policy.focused_edit_policy() {
+        return focused_edit_tool_policy_error(
+            name,
+            arguments,
+            &focused.target,
+            work_root,
+            focused.target_already_read,
+        );
+    }
+
+    None
+}
+
+fn restricted_tool_policy_error(
+    policy: &EffectiveToolPolicy,
+    name: &str,
+    allowed_tools: &[&str],
+    work_root: &Path,
+) -> String {
+    let rejected_tool = compact_tool_name_for_policy_feedback(name);
+    let allowed = if allowed_tools.is_empty() {
+        "none".to_string()
+    } else {
+        allowed_tools.join(", ")
+    };
+    let mut message = format!(
+        "tool policy rejected {rejected_tool}; allowed tools: {allowed}; reason: {}",
+        policy.reason().as_str()
+    );
+    if let Some(focused) = policy.focused_edit_policy() {
+        let path_display = focused
+            .target
+            .strip_prefix(work_root)
+            .unwrap_or(&focused.target)
+            .to_string_lossy()
+            .replace('\\', "/");
+        message.push_str("; target: ");
+        message.push_str(&path_display);
+    }
+    message
+}
+
 fn compact_tool_name_for_policy_feedback(name: &str) -> String {
     let mut compact = name
         .chars()
@@ -11909,7 +12026,8 @@ fn focused_edit_policy_violation_feedback_note(
 ) -> Option<String> {
     let error = unresolved_errors.iter().rev().find(|error| {
         let is_policy_error = error.starts_with("focused edit recovery rejected ")
-            || error.starts_with("focused edit recovery only allows ");
+            || error.starts_with("focused edit recovery only allows ")
+            || error.starts_with("tool policy rejected ");
         is_policy_error && target_display.is_none_or(|target| error.contains(target))
     })?;
     let allowed = allowed_tools
@@ -11957,6 +12075,36 @@ fn focused_edit_tool_batch_action(
     } else {
         FocusedEditBatchAction::Reject(first_call_error.unwrap_or_default())
     }
+}
+
+fn effective_tool_batch_action(
+    tool_calls: &[ToolCall],
+    policy: &EffectiveToolPolicy,
+    work_root: &Path,
+) -> FocusedEditBatchAction {
+    let Some(first_tool_call) = tool_calls.first() else {
+        return FocusedEditBatchAction::Accept;
+    };
+
+    if let Some(err) = effective_tool_policy_error_for_call(
+        policy,
+        &first_tool_call.name,
+        &first_tool_call.arguments,
+        work_root,
+    ) {
+        return FocusedEditBatchAction::Reject(err);
+    }
+
+    if let Some(focused) = policy.focused_edit_policy() {
+        return focused_edit_tool_batch_action(
+            tool_calls,
+            &focused.target,
+            work_root,
+            focused.target_already_read,
+        );
+    }
+
+    FocusedEditBatchAction::Accept
 }
 
 fn tool_path_matches_target(raw_path: &str, target: &Path, work_root: &Path) -> bool {
@@ -13025,19 +13173,20 @@ mod truncate_tests {
 #[cfg(test)]
 mod progress_tests {
     use super::{
-        FocusedEditBatchAction, deterministic_empty_framework_app_files,
-        deterministic_empty_framework_game_files, deterministic_framework_app_files_needed,
-        deterministic_framework_game_files_needed, deterministic_support_target_relative,
-        extract_page_copy_block_from_numbered_read, first_existing_impl_target,
-        focused_edit_compact_anchor_note, focused_edit_compact_recovery_anchor,
-        focused_edit_exact_anchor_history, focused_edit_exact_recovery_anchor,
-        focused_edit_first_slice_note, focused_edit_first_slice_uses_exact_anchor,
-        focused_edit_guidance_note, focused_edit_history, focused_edit_max_predict_override,
-        focused_edit_minimal_history, focused_edit_policy_violation_feedback_note,
-        focused_edit_second_slice_note, focused_edit_target_already_read,
-        focused_edit_timeout_override_secs, focused_edit_tool_batch_action,
-        focused_edit_tool_policy_error, focused_read_target_for_directory,
-        format_blocked_progress_line, format_progress_line,
+        EffectiveToolPolicy, EffectiveToolPolicyReason, FocusedEditBatchAction,
+        deterministic_empty_framework_app_files, deterministic_empty_framework_game_files,
+        deterministic_framework_app_files_needed, deterministic_framework_game_files_needed,
+        deterministic_support_target_relative, effective_tool_batch_action,
+        effective_tool_policy_error_for_call, extract_page_copy_block_from_numbered_read,
+        first_existing_impl_target, focused_edit_compact_anchor_note,
+        focused_edit_compact_recovery_anchor, focused_edit_exact_anchor_history,
+        focused_edit_exact_recovery_anchor, focused_edit_first_slice_note,
+        focused_edit_first_slice_uses_exact_anchor, focused_edit_guidance_note,
+        focused_edit_history, focused_edit_max_predict_override, focused_edit_minimal_history,
+        focused_edit_policy_violation_feedback_note, focused_edit_second_slice_note,
+        focused_edit_target_already_read, focused_edit_timeout_override_secs,
+        focused_edit_tool_batch_action, focused_edit_tool_policy_error,
+        focused_read_target_for_directory, format_blocked_progress_line, format_progress_line,
         framework_app_fallback_continuation_note, has_successful_non_plan_repo_edit,
         has_successful_non_plan_repo_edit_after_latest_truncated_tool_call,
         has_successful_repo_edit, implementation_quality_issue_for_request, is_utf8_locale,
@@ -14991,6 +15140,100 @@ export default function App() {
     }
 
     #[test]
+    fn effective_policy_rejects_tool_not_in_allowed_list_without_raw_arguments() {
+        let temp = tempdir().unwrap();
+        let policy =
+            EffectiveToolPolicy::restricted(EffectiveToolPolicyReason::AnswerOnly, vec!["Read"]);
+
+        let err = effective_tool_policy_error_for_call(
+            &policy,
+            "Bash",
+            &json!({"command":"curl 'https://example.test/?token=secret-token'"}),
+            temp.path(),
+        )
+        .expect("expected policy error");
+
+        assert!(err.contains("tool policy rejected Bash"), "got: {err}");
+        assert!(err.contains("allowed tools: Read"), "got: {err}");
+        assert!(err.contains("reason: answer_only"), "got: {err}");
+        assert!(!err.contains("secret-token"), "got: {err}");
+        assert!(!err.contains("curl"), "got: {err}");
+    }
+
+    #[test]
+    fn local_small_edit_policy_rejects_glob_before_execution() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        let target = work_root.join("app/main.py");
+        std::fs::write(&target, "from fastapi import FastAPI\napp = FastAPI()\n").unwrap();
+        let policy = EffectiveToolPolicy::focused_edit(
+            EffectiveToolPolicyReason::LocalLlmSmallEditAfterRead,
+            vec!["Edit"],
+            target,
+            true,
+        );
+
+        let action = effective_tool_batch_action(
+            &[ToolCall {
+                id: "xml-1".to_string(),
+                name: "Glob".to_string(),
+                arguments: json!({"path":".","pattern":"**/*"}),
+            }],
+            &policy,
+            work_root,
+        );
+
+        match action {
+            FocusedEditBatchAction::Reject(err) => {
+                assert!(err.contains("tool policy rejected Glob"), "got: {err}");
+                assert!(err.contains("allowed tools: Edit"), "got: {err}");
+                assert!(
+                    err.contains("reason: local_llm_small_edit_after_read"),
+                    "got: {err}"
+                );
+                assert!(err.contains("target: app/main.py"), "got: {err}");
+                assert!(!err.contains("**/*"), "got: {err}");
+            }
+            other => panic!("expected reject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn local_small_edit_policy_rejects_wrong_path_edit() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        let target = work_root.join("app/main.py");
+        std::fs::write(&target, "from fastapi import FastAPI\napp = FastAPI()\n").unwrap();
+        std::fs::write(work_root.join("README.md"), "# demo\n").unwrap();
+        let policy = EffectiveToolPolicy::focused_edit(
+            EffectiveToolPolicyReason::LocalLlmSmallEditAfterRead,
+            vec!["Edit"],
+            target,
+            true,
+        );
+
+        let err = effective_tool_policy_error_for_call(
+            &policy,
+            "Edit",
+            &json!({
+                "path":"README.md",
+                "old_string":"demo",
+                "new_string":"secret-token"
+            }),
+            work_root,
+        )
+        .expect("expected policy error");
+
+        assert!(
+            err.contains("only allows Edit on app/main.py"),
+            "got: {err}"
+        );
+        assert!(!err.contains("secret-token"), "got: {err}");
+    }
+
+    #[test]
     fn focused_edit_policy_error_redacts_untrusted_arguments() {
         let temp = tempdir().unwrap();
         let work_root = temp.path();
@@ -15047,6 +15290,23 @@ export default function App() {
         assert!(note.contains("rejected Bash"));
         assert!(note.contains("Allowed tools now: Edit"));
         assert!(note.contains("was not executed"));
+    }
+
+    #[test]
+    fn focused_edit_policy_violation_feedback_accepts_generic_policy_rejects() {
+        let errors = vec![
+            "tool policy rejected Glob; allowed tools: Edit; reason: local_llm_small_edit_after_read; target: app/main.py"
+                .to_string(),
+        ];
+        let note = focused_edit_policy_violation_feedback_note(
+            &errors,
+            Some(&["Edit"]),
+            Some("app/main.py"),
+        )
+        .expect("expected feedback note");
+
+        assert!(note.contains("tool policy rejected Glob"), "got: {note}");
+        assert!(note.contains("Allowed tools now: Edit"), "got: {note}");
     }
 
     #[test]
