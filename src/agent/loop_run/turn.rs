@@ -1434,6 +1434,16 @@ fn task_contract_needs_verification(
     })
 }
 
+fn task_contract_continue_requires_tool_recovery(
+    action: Option<&super::task_contract::ArtifactRecoveryAction>,
+    current_reply_tool_calls: usize,
+) -> bool {
+    matches!(
+        action,
+        Some(super::task_contract::ArtifactRecoveryAction::Continue { .. })
+    ) && current_reply_tool_calls == 0
+}
+
 fn should_apply_repo_change_partial_progress_recovery(
     action_expectation: recovery::ActionExpectation,
     repo_edit_calls_made_this_turn: usize,
@@ -5022,6 +5032,7 @@ impl Agent {
                 break 'outer;
             }
 
+            let current_reply_tool_call_count = reply.tool_calls.len();
             let mut prepared_tool_calls = reply
                 .tool_calls
                 .into_iter()
@@ -5916,6 +5927,52 @@ impl Agent {
                         let decision = super::task_contract::CompletionDecision::Continue {
                             missing: missing.clone(),
                         };
+                        let target_hint = target_hint.clone().and_then(|hint| {
+                            self.set_artifact_recovery_target_from_hint(
+                                hint,
+                                contract_completion_retries.saturating_add(1),
+                            )
+                        });
+                        if task_contract_continue_requires_tool_recovery(
+                            Some(action),
+                            current_reply_tool_call_count,
+                        ) {
+                            no_tool_retries += 1;
+                            if no_tool_retries >= 3 {
+                                exit_reason = ExitReason::MissingRepoEdits;
+                                error_text = format!(
+                                    "assistant stopped before editing missing artifact(s): {}",
+                                    missing
+                                        .iter()
+                                        .map(|role| role.label())
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                );
+                                break 'outer;
+                            }
+                            write_stdout_rendered(
+                                &format_iteration_status(
+                                    last_iter,
+                                    self.config.max_iterations,
+                                    "Retry requested",
+                                    "Task contract requires a repository edit on the missing artifact target.",
+                                    self.footer.current_cols(),
+                                ),
+                                true,
+                            );
+                            if !self.push_artifact_directed_recovery_note(no_tool_retries) {
+                                self.push_system_note(
+                                    super::task_contract::render_contract_recovery_note_with_hint(
+                                        &decision,
+                                        self.active_request_text().as_deref().unwrap_or_default(),
+                                        contract_completion_retries.saturating_add(1),
+                                        contract.recovery_attempt_limit(),
+                                        target_hint.as_ref(),
+                                    ),
+                                );
+                            }
+                            continue;
+                        }
                         if !contract_deterministic_fallback_materialized
                             && self.maybe_materialize_task_contract_fallback(&decision, last_iter)
                         {
@@ -5962,12 +6019,6 @@ impl Agent {
                                 "missing": missing_labels,
                             }),
                         );
-                        let target_hint = target_hint.clone().and_then(|hint| {
-                            self.set_artifact_recovery_target_from_hint(
-                                hint,
-                                contract_completion_retries,
-                            )
-                        });
                         self.push_system_note(
                             super::task_contract::render_contract_recovery_note_with_hint(
                                 &decision,
@@ -13423,13 +13474,17 @@ fn validate_verifier_repair_intents(
             apply_bounded_replace_all(&contents, &intent.old_string, &intent.new_string)
                 .map_err(|err| format!("repair intent replace_all rejected: {err}"))?
         } else {
-            crate::tools::edit::apply_exact_once(&contents, &intent.old_string, &intent.new_string)
-                .map_err(|err| {
-                    format!(
-                        "repair intent exact edit rejected: {err}; old_string_excerpt={}",
-                        compact_verifier_failure_text(&intent.old_string, 120)
-                    )
-                })?
+            apply_exact_once_with_whitespace_fallback(
+                &contents,
+                &intent.old_string,
+                &intent.new_string,
+            )
+            .map_err(|err| {
+                format!(
+                    "repair intent exact edit rejected: {err}; old_string_excerpt={}",
+                    compact_verifier_failure_text(&intent.old_string, 120)
+                )
+            })?
         };
     }
 
@@ -13443,6 +13498,149 @@ fn validate_verifier_repair_intents(
         updated_contents: contents,
         fingerprint,
     })
+}
+
+fn apply_exact_once_with_whitespace_fallback(
+    contents: &str,
+    old: &str,
+    new: &str,
+) -> Result<String, String> {
+    match crate::tools::edit::apply_exact_once(contents, old, new) {
+        Ok(updated) => Ok(updated),
+        Err(err) if err == "old_string was not found" => {
+            apply_unique_whitespace_normalized_replacement(contents, old, new).map_err(
+                |fallback_err| format!("{err}; whitespace fallback rejected: {fallback_err}"),
+            )
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn apply_unique_whitespace_normalized_replacement(
+    contents: &str,
+    old: &str,
+    new: &str,
+) -> Result<String, String> {
+    if old.trim().len() < 16 {
+        return Err("old_string is too short for whitespace-normalized matching".to_string());
+    }
+    let tokens = old.split_whitespace().collect::<Vec<_>>();
+    if tokens.len() < 2 {
+        return Err("old_string has too few non-whitespace tokens".to_string());
+    }
+
+    let include_leading_whitespace = old.chars().next().is_some_and(|ch| ch.is_whitespace());
+    let include_trailing_whitespace = old.chars().next_back().is_some_and(|ch| ch.is_whitespace());
+    let mut matches = Vec::new();
+    let first = tokens[0];
+    let mut search_from = 0usize;
+
+    while search_from <= contents.len() {
+        let Some(relative_start) = contents[search_from..].find(first) else {
+            break;
+        };
+        let token_start = search_from + relative_start;
+        let token_end = token_start + first.len();
+        search_from = token_end;
+
+        if !is_whitespace_boundary_before(contents, token_start) {
+            continue;
+        }
+
+        let mut pos = token_end;
+        let mut matched = true;
+        for token in tokens.iter().skip(1) {
+            let before_skip = pos;
+            pos = skip_whitespace(contents, pos);
+            if pos == before_skip || !contents[pos..].starts_with(token) {
+                matched = false;
+                break;
+            }
+            pos += token.len();
+        }
+        if !matched {
+            continue;
+        }
+
+        let span_end = if include_trailing_whitespace {
+            let extended = skip_whitespace(contents, pos);
+            if extended == pos {
+                continue;
+            }
+            extended
+        } else if is_whitespace_boundary_after(contents, pos) {
+            pos
+        } else {
+            continue;
+        };
+        let span_start = if include_leading_whitespace {
+            let extended = backtrack_whitespace(contents, token_start);
+            if extended == token_start {
+                continue;
+            }
+            extended
+        } else {
+            token_start
+        };
+
+        matches.push((span_start, span_end));
+        if matches.len() > 1 {
+            return Err(
+                "old_string matched more than once after whitespace normalization".to_string(),
+            );
+        }
+    }
+
+    let Some((start, end)) = matches.into_iter().next() else {
+        return Err("old_string was not found after whitespace normalization".to_string());
+    };
+    let mut updated = String::with_capacity(contents.len() + new.len().saturating_sub(end - start));
+    updated.push_str(&contents[..start]);
+    updated.push_str(new);
+    updated.push_str(&contents[end..]);
+    Ok(updated)
+}
+
+fn skip_whitespace(value: &str, mut pos: usize) -> usize {
+    while pos < value.len() {
+        let Some(ch) = value[pos..].chars().next() else {
+            break;
+        };
+        if !ch.is_whitespace() {
+            break;
+        }
+        pos += ch.len_utf8();
+    }
+    pos
+}
+
+fn backtrack_whitespace(value: &str, mut pos: usize) -> usize {
+    while pos > 0 {
+        let Some((previous_pos, ch)) = value[..pos].char_indices().next_back() else {
+            break;
+        };
+        if !ch.is_whitespace() {
+            break;
+        }
+        pos = previous_pos;
+    }
+    pos
+}
+
+fn is_whitespace_boundary_before(value: &str, pos: usize) -> bool {
+    pos == 0
+        || value[..pos]
+            .chars()
+            .next_back()
+            .is_some_and(|ch| ch.is_whitespace())
+}
+
+fn is_whitespace_boundary_after(value: &str, pos: usize) -> bool {
+    pos == value.len()
+        || value[pos..]
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_whitespace())
 }
 
 fn apply_bounded_replace_all(contents: &str, old: &str, new: &str) -> Result<String, String> {
@@ -15891,8 +16089,9 @@ mod truncate_tests {
         repo_edit_satisfies_artifact_recovery_target, requested_scaffold_framework,
         scaffold_candidate_for_missing_role_from_snapshots, scaffold_command_matches_framework,
         scaffold_file_snapshot, should_apply_repo_change_partial_progress_recovery,
-        task_contract_needs_verification, task_contract_verifier_repair_note,
-        task_or_plan_requires_nextjs_scaffold, task_requires_nextjs_scaffold, truncate,
+        task_contract_continue_requires_tool_recovery, task_contract_needs_verification,
+        task_contract_verifier_repair_note, task_or_plan_requires_nextjs_scaffold,
+        task_requires_nextjs_scaffold, truncate,
     };
     use crate::agent::orchestration::RepoVerification;
     use crate::agent::recovery::ActionExpectation;
@@ -15980,6 +16179,27 @@ mod truncate_tests {
             2,
             "次にREADMEを更新します。",
             Some(&action),
+        ));
+    }
+
+    #[test]
+    fn task_contract_continue_no_tool_requires_targeted_recovery() {
+        let action = ArtifactRecoveryAction::Continue {
+            missing: vec![ArtifactRole::UsageDocs],
+            target_hint: None,
+        };
+
+        assert!(task_contract_continue_requires_tool_recovery(
+            Some(&action),
+            0
+        ));
+        assert!(!task_contract_continue_requires_tool_recovery(
+            Some(&action),
+            1
+        ));
+        assert!(!task_contract_continue_requires_tool_recovery(
+            Some(&ArtifactRecoveryAction::Done),
+            0
         ));
     }
 
@@ -17298,6 +17518,69 @@ mod progress_tests {
         let edit = validate_verifier_repair_intent(work_root, &context, &target, intent).unwrap();
         assert_eq!(edit.relative_path, "app/main.py");
         assert!(edit.updated_contents.contains("value = 2"));
+    }
+
+    #[test]
+    fn verifier_repair_intent_validation_applies_unique_whitespace_normalized_edit() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        std::fs::write(
+            work_root.join("app/main.py"),
+            "class ToDoCreate(BaseModel):\n    title: str\n    due_date: Optional[str] = None  # ISO-8601 date string\n",
+        )
+        .unwrap();
+        let context = verifier_context_for("app/main.py");
+        let target = context
+            .assessment
+            .as_ref()
+            .unwrap()
+            .repair_target_hint
+            .as_ref()
+            .unwrap()
+            .clone();
+        let intent = VerifierRepairIntent {
+            path: "app/main.py".to_string(),
+            old_string: "class ToDoCreate(BaseModel):\n    title: str\n    due_date: Optional[str] = None   # ISO-8601 date string".to_string(),
+            new_string: "class ToDoCreate(BaseModel):\n    title: str\n    due_date: Optional[str] = None   # ISO-8601 date string\n    completed: bool = False".to_string(),
+            reason: "allow create request to set completed".to_string(),
+            replace_all: false,
+        };
+
+        let edit = validate_verifier_repair_intent(work_root, &context, &target, intent).unwrap();
+        assert!(edit.updated_contents.contains("completed: bool = False"));
+    }
+
+    #[test]
+    fn verifier_repair_intent_validation_rejects_ambiguous_whitespace_normalized_edit() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        std::fs::write(
+            work_root.join("app/main.py"),
+            "section alpha:\n    value = 1\nsection  alpha:\n    value  = 1\n",
+        )
+        .unwrap();
+        let context = verifier_context_for("app/main.py");
+        let target = context
+            .assessment
+            .as_ref()
+            .unwrap()
+            .repair_target_hint
+            .as_ref()
+            .unwrap()
+            .clone();
+        let intent = VerifierRepairIntent {
+            path: "app/main.py".to_string(),
+            old_string: "section   alpha:\n    value   =   1".to_string(),
+            new_string: "section alpha:\n    value = 2".to_string(),
+            reason: "test ambiguous whitespace".to_string(),
+            replace_all: false,
+        };
+
+        let err =
+            validate_verifier_repair_intent(work_root, &context, &target, intent).unwrap_err();
+        assert!(err.contains("matched more than once"), "got: {err}");
     }
 
     #[test]
