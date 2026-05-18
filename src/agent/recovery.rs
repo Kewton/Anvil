@@ -234,6 +234,12 @@ pub fn focused_edit_no_tool_recovery_note(
     }
 }
 
+pub fn focused_edit_missing_target_recovery_note(path: &str, attempt: usize) -> String {
+    format!(
+        "Focused edit recovery is active on missing target {path}. Do not answer in prose. Emit exactly one Write tool call now on that exact path, with complete JSON and no prose before or after the tool call. Do not call Read, Bash, Glob, or Grep. focused_edit_missing_target_attempt={attempt}"
+    )
+}
+
 pub fn focused_edit_timeout_recovery_note(
     path: &str,
     already_read: bool,

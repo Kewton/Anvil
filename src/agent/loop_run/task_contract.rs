@@ -57,6 +57,25 @@ pub(super) struct RecoveryTargetHint {
     pub(super) reason: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RecoveryTarget {
+    pub(super) role: ArtifactRole,
+    pub(super) path: String,
+    pub(super) reason: String,
+    pub(super) attempt: usize,
+}
+
+impl RecoveryTarget {
+    pub(super) fn from_hint(hint: RecoveryTargetHint, attempt: usize) -> Self {
+        Self {
+            role: hint.role,
+            path: hint.path,
+            reason: hint.reason,
+            attempt,
+        }
+    }
+}
+
 impl TaskContract {
     pub(super) fn from_request(request: &str) -> Self {
         let lower = request.to_ascii_lowercase();

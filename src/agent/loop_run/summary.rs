@@ -5,6 +5,8 @@ pub(super) enum ExitReason {
     EmptyResponses,
     NoToolCalls,
     MissingRepoEdits,
+    MissingVerification,
+    VerifierFailed,
     PlanIncomplete,
     ToolCallFormatError,
     TransportError,
@@ -23,6 +25,8 @@ impl ExitReason {
                 | ExitReason::EmptyResponses
                 | ExitReason::NoToolCalls
                 | ExitReason::MissingRepoEdits
+                | ExitReason::MissingVerification
+                | ExitReason::VerifierFailed
                 | ExitReason::PlanIncomplete
                 | ExitReason::ToolCallFormatError
                 | ExitReason::Interrupted
@@ -36,6 +40,8 @@ impl ExitReason {
             ExitReason::EmptyResponses => "empty_responses",
             ExitReason::NoToolCalls => "no_tool_calls",
             ExitReason::MissingRepoEdits => "missing_repo_edits",
+            ExitReason::MissingVerification => "missing_verification",
+            ExitReason::VerifierFailed => "verifier_failed",
             ExitReason::PlanIncomplete => "plan_incomplete",
             ExitReason::ToolCallFormatError => "tool_call_format_error",
             ExitReason::TransportError => "transport_error",
@@ -54,6 +60,10 @@ impl ExitReason {
             ExitReason::MissingRepoEdits => {
                 "assistant kept stopping before making the requested repository edits"
             }
+            ExitReason::MissingVerification => {
+                "assistant completed repository artifacts but did not obtain required verification"
+            }
+            ExitReason::VerifierFailed => "required verifier failed after repository edits",
             ExitReason::PlanIncomplete => {
                 "assistant did not finish the plan after repeated planning retries"
             }
@@ -218,6 +228,8 @@ mod tests {
             ExitReason::EmptyResponses,
             ExitReason::NoToolCalls,
             ExitReason::MissingRepoEdits,
+            ExitReason::MissingVerification,
+            ExitReason::VerifierFailed,
             ExitReason::PlanIncomplete,
             ExitReason::ToolCallFormatError,
             ExitReason::TransportError,
@@ -235,6 +247,8 @@ mod tests {
         assert!(!ExitReason::EmptyResponses.is_success());
         assert!(!ExitReason::NoToolCalls.is_success());
         assert!(!ExitReason::MissingRepoEdits.is_success());
+        assert!(!ExitReason::MissingVerification.is_success());
+        assert!(!ExitReason::VerifierFailed.is_success());
         assert!(!ExitReason::PlanIncomplete.is_success());
         assert!(!ExitReason::ToolCallFormatError.is_success());
         assert!(!ExitReason::TransportError.is_success());
@@ -260,6 +274,8 @@ mod tests {
         assert!(ExitReason::EmptyResponses.keeps_repl_alive());
         assert!(ExitReason::NoToolCalls.keeps_repl_alive());
         assert!(ExitReason::MissingRepoEdits.keeps_repl_alive());
+        assert!(ExitReason::MissingVerification.keeps_repl_alive());
+        assert!(ExitReason::VerifierFailed.keeps_repl_alive());
         assert!(ExitReason::PlanIncomplete.keeps_repl_alive());
         assert!(ExitReason::ToolCallFormatError.keeps_repl_alive());
         assert!(ExitReason::Interrupted.keeps_repl_alive());

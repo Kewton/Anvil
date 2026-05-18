@@ -463,6 +463,16 @@ pub struct Agent {
     /// on `Agent` instead of `SessionSnapshot` because the OR-satisfaction
     /// is evaluated within the same turn the evidence was observed.
     pub(super) evidence_set_this_turn: completion_evidence::EvidenceSet,
+    /// Issue #618: task-contract-specific evidence. This mirrors
+    /// `evidence_set_this_turn` only for artifacts that are allowed to satisfy
+    /// the currently active artifact recovery target. Generic protocol
+    /// satisfaction still uses `evidence_set_this_turn` so unrelated repo edits
+    /// remain visible as progress without completing the required artifact.
+    task_contract_evidence_set_this_turn: completion_evidence::EvidenceSet,
+    /// Issue #618: actor-loop-local artifact recovery target. Reset at the
+    /// start of every user turn; while populated, no-tool/prose-only/focused
+    /// edit/tool-format recovery all converge on the same artifact path.
+    current_artifact_recovery_target: Option<crate::agent::loop_run::task_contract::RecoveryTarget>,
 }
 
 /// Issue #594: state machine for the `/photon-why` slash command. Lives at
@@ -583,6 +593,8 @@ impl Agent {
             photon_user_feedback_called_this_turn: false,
             last_auto_promote_outcome: None,
             evidence_set_this_turn: completion_evidence::EvidenceSet::new(),
+            task_contract_evidence_set_this_turn: completion_evidence::EvidenceSet::new(),
+            current_artifact_recovery_target: None,
         }
     }
 }

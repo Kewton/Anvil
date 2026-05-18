@@ -173,6 +173,7 @@ impl Agent {
         final_verif: &RepoVerification,
         stats: &LoopStats,
         model_repo_edits_this_turn: usize,
+        verifier_already_dispatched: bool,
         exit_reason: &mut ExitReason,
         error_text: &mut String,
     ) -> Vec<String> {
@@ -236,7 +237,7 @@ impl Agent {
                         self.evidence_set_this_turn.len(),
                     );
                 }
-                true
+                !verifier_already_dispatched
             }
         } else {
             false
@@ -364,7 +365,7 @@ impl Agent {
                             AutoTestKindView::Build => "Build",
                             AutoTestKindView::Test => "Test",
                         };
-                        *exit_reason = ExitReason::MissingRepoEdits;
+                        *exit_reason = ExitReason::VerifierFailed;
                         *error_text = format!(
                             "auto test failed for protocol {kind_dbg}: {}\n{}",
                             auto_test_command, auto_test_output
