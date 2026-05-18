@@ -11712,6 +11712,65 @@ fn format_numbered_read_block(contents: &str) -> String {
         .join("\n")
 }
 
+#[derive(Debug, Clone)]
+struct ToolExchange {
+    result_index: Option<usize>,
+    tool_call: ToolCall,
+    result: Option<ConversationMessage>,
+}
+
+fn tool_exchanges(messages: &[ConversationMessage]) -> Vec<ToolExchange> {
+    let mut exchanges = Vec::new();
+    for (assistant_index, message) in messages.iter().enumerate() {
+        if message.role != "assistant" || message.tool_calls.is_empty() {
+            continue;
+        }
+
+        let mut result_index = assistant_index + 1;
+        for tool_call in &message.tool_calls {
+            let result = messages
+                .get(result_index)
+                .filter(|candidate| candidate.role == "tool")
+                .cloned();
+            let exchange_result_index = result.as_ref().map(|_| result_index);
+            if result.is_some() {
+                result_index += 1;
+            }
+            exchanges.push(ToolExchange {
+                result_index: exchange_result_index,
+                tool_call: tool_call.clone(),
+                result,
+            });
+        }
+    }
+    exchanges
+}
+
+fn tool_call_path_matches_target(tool_call: &ToolCall, target: &Path, work_root: &Path) -> bool {
+    let Some(path) = tool_call
+        .arguments
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return false;
+    };
+    tool_path_matches_target(path, target, work_root)
+}
+
+fn exchange_is_successful_read_for_target(
+    exchange: &ToolExchange,
+    target: &Path,
+    work_root: &Path,
+) -> bool {
+    exchange.tool_call.name == "Read"
+        && tool_call_path_matches_target(&exchange.tool_call, target, work_root)
+        && exchange.result.as_ref().is_some_and(|result| {
+            result.role == "tool"
+                && result.name.as_deref() == Some("Read")
+                && !result.content.trim_start().starts_with("Error:")
+        })
+}
+
 fn focused_edit_tool_policy_error(
     name: &str,
     arguments: &serde_json::Value,
@@ -11826,20 +11885,20 @@ fn latest_read_exchange_for_target(
     target: &Path,
     work_root: &Path,
 ) -> Option<(ConversationMessage, ConversationMessage)> {
-    for (index, message) in messages.iter().enumerate().rev() {
-        if message.role != "assistant" || !assistant_reads_target(message, target, work_root) {
+    for exchange in tool_exchanges(messages).into_iter().rev() {
+        if !exchange_is_successful_read_for_target(&exchange, target, work_root) {
             continue;
         }
-        let tool_message = messages.get(index + 1)?;
-        if tool_message.role == "tool" && tool_message.name.as_deref() == Some("Read") {
-            if messages[index + 2..]
-                .iter()
-                .any(is_successful_repo_edit_tool_result)
-            {
-                continue;
-            }
-            return Some((message.clone(), tool_message.clone()));
+        let result_index = exchange.result_index?;
+        if messages[result_index + 1..]
+            .iter()
+            .any(is_successful_repo_edit_tool_result)
+        {
+            continue;
         }
+        let assistant = ConversationMessage::assistant(String::new(), vec![exchange.tool_call]);
+        let tool_message = exchange.result?;
+        return Some((assistant, tool_message));
     }
     None
 }
@@ -11848,25 +11907,6 @@ fn is_successful_repo_edit_tool_result(message: &ConversationMessage) -> bool {
     message.role == "tool"
         && matches!(message.name.as_deref(), Some("Write" | "Edit"))
         && !message.content.trim_start().starts_with("Error:")
-}
-
-fn assistant_reads_target(message: &ConversationMessage, target: &Path, work_root: &Path) -> bool {
-    let normalized_target = std::fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
-    message.tool_calls.iter().any(|tool_call| {
-        if tool_call.name != "Read" {
-            return false;
-        }
-        let Some(path) = tool_call
-            .arguments
-            .get("path")
-            .and_then(serde_json::Value::as_str)
-        else {
-            return false;
-        };
-        resolve_user_path(work_root, path)
-            .ok()
-            .is_some_and(|resolved| resolved == normalized_target)
-    })
 }
 
 fn plan_sections_with_content(contents: &str) -> Vec<&'static str> {
@@ -13476,6 +13516,67 @@ mod progress_tests {
     }
 
     #[test]
+    fn focused_edit_history_pairs_target_read_result_by_tool_call_position() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        let target = work_root.join("app").join("main.py");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "from fastapi import FastAPI\napp = FastAPI()\n").unwrap();
+        std::fs::write(
+            work_root.join("pyproject.toml"),
+            "[project]\nname = \"demo\"\n",
+        )
+        .unwrap();
+        let messages = vec![
+            ConversationMessage::system("[Act Mode / coding] Execute the plan.".to_string()),
+            ConversationMessage::user("build an API".to_string()),
+            ConversationMessage::assistant(
+                String::new(),
+                vec![
+                    ToolCall {
+                        id: "call-1".to_string(),
+                        name: "Read".to_string(),
+                        arguments: json!({"path":"pyproject.toml"}),
+                    },
+                    ToolCall {
+                        id: "call-2".to_string(),
+                        name: "Read".to_string(),
+                        arguments: json!({"path":"app/main.py"}),
+                    },
+                    ToolCall {
+                        id: "call-3".to_string(),
+                        name: "Read".to_string(),
+                        arguments: json!({"path":"README.md"}),
+                    },
+                ],
+            ),
+            ConversationMessage::tool("Read".to_string(), "[project]\nname = \"demo\"".to_string()),
+            ConversationMessage::tool(
+                "Read".to_string(),
+                "   1: from fastapi import FastAPI\n   2: app = FastAPI()".to_string(),
+            ),
+            ConversationMessage::tool("Read".to_string(), "# Demo".to_string()),
+        ];
+
+        assert!(focused_edit_target_already_read(
+            &messages, &target, &work_root
+        ));
+        let filtered = focused_edit_history(&messages, &target, &work_root);
+
+        assert_eq!(filtered.len(), 4, "got: {filtered:?}");
+        assert_eq!(filtered[2].role, "assistant");
+        assert_eq!(filtered[2].tool_calls.len(), 1);
+        assert_eq!(filtered[2].tool_calls[0].id, "call-2");
+        assert_eq!(
+            filtered[2].tool_calls[0].arguments.get("path"),
+            Some(&json!("app/main.py"))
+        );
+        assert_eq!(filtered[3].name.as_deref(), Some("Read"));
+        assert!(filtered[3].content.contains("from fastapi import FastAPI"));
+        assert!(!filtered[3].content.contains("[project]"));
+    }
+
+    #[test]
     fn focused_edit_minimal_history_keeps_only_act_note_and_user() {
         let messages = vec![
             ConversationMessage::system("[Plan Mode / coding] old".to_string()),
@@ -13516,6 +13617,113 @@ mod progress_tests {
             ConversationMessage::tool("Read".to_string(), "1: export default".to_string()),
         ];
         assert!(focused_edit_target_already_read(
+            &messages, &target, &work_root
+        ));
+    }
+
+    #[test]
+    fn focused_edit_target_read_requires_matching_result_for_target_position() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        let target = work_root.join("app").join("main.py");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "from fastapi import FastAPI\n").unwrap();
+        std::fs::write(work_root.join("pyproject.toml"), "[project]\n").unwrap();
+        let messages = vec![
+            ConversationMessage::assistant(
+                String::new(),
+                vec![
+                    ToolCall {
+                        id: "call-1".to_string(),
+                        name: "Read".to_string(),
+                        arguments: json!({"path":"pyproject.toml"}),
+                    },
+                    ToolCall {
+                        id: "call-2".to_string(),
+                        name: "Read".to_string(),
+                        arguments: json!({"path":"app/main.py"}),
+                    },
+                ],
+            ),
+            ConversationMessage::tool("Read".to_string(), "[project]".to_string()),
+        ];
+
+        assert!(!focused_edit_target_already_read(
+            &messages, &target, &work_root
+        ));
+        assert!(
+            focused_edit_history(&messages, &target, &work_root)
+                .iter()
+                .all(|message| message.role != "tool")
+        );
+    }
+
+    #[test]
+    fn focused_edit_target_read_rejects_tool_error_and_mismatched_result() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        let target = work_root.join("app").join("main.py");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "from fastapi import FastAPI\n").unwrap();
+
+        let error_messages = vec![
+            ConversationMessage::assistant(
+                String::new(),
+                vec![ToolCall {
+                    id: "call-1".to_string(),
+                    name: "Read".to_string(),
+                    arguments: json!({"path":"app/main.py"}),
+                }],
+            ),
+            ConversationMessage::tool("Read".to_string(), "Error: permission denied".to_string()),
+        ];
+        assert!(!focused_edit_target_already_read(
+            &error_messages,
+            &target,
+            &work_root
+        ));
+
+        let mismatched_messages = vec![
+            ConversationMessage::assistant(
+                String::new(),
+                vec![ToolCall {
+                    id: "call-1".to_string(),
+                    name: "Read".to_string(),
+                    arguments: json!({"path":"app/main.py"}),
+                }],
+            ),
+            ConversationMessage::tool("Bash".to_string(), "not a read result".to_string()),
+        ];
+        assert!(!focused_edit_target_already_read(
+            &mismatched_messages,
+            &target,
+            &work_root
+        ));
+    }
+
+    #[test]
+    fn focused_edit_target_read_rejects_path_traversal_outside_workspace() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().join("workspace");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let target = work_root.join("app").join("main.py");
+        std::fs::write(&target, "from fastapi import FastAPI\n").unwrap();
+        std::fs::write(outside.join("main.py"), "outside\n").unwrap();
+        let messages = vec![
+            ConversationMessage::assistant(
+                String::new(),
+                vec![ToolCall {
+                    id: "call-1".to_string(),
+                    name: "Read".to_string(),
+                    arguments: json!({"path":"../outside/main.py"}),
+                }],
+            ),
+            ConversationMessage::tool("Read".to_string(), "outside".to_string()),
+        ];
+
+        assert!(!focused_edit_target_already_read(
             &messages, &target, &work_root
         ));
     }
