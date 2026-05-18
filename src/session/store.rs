@@ -719,6 +719,43 @@ where
     }
 }
 
+/// Generic artifact role attached to deterministic scaffold files.
+///
+/// This lives in the session layer as plain persisted data rather than in the
+/// agent TaskContract module so resume can reload the provenance snapshot
+/// without introducing a session -> agent dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScaffoldArtifactRole {
+    Implementation,
+    Test,
+    UsageDocs,
+    Setup,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ScaffoldArtifactFileSnapshot {
+    pub path: String,
+    pub content_hash: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<ScaffoldArtifactRole>,
+    #[serde(default = "default_true")]
+    pub bootstrap_only: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ScaffoldArtifactSnapshot {
+    pub created_turn_index: usize,
+    pub request_hash: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<ScaffoldArtifactFileSnapshot>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub struct SessionSnapshot {
     pub mode_state: ModeState,
@@ -775,6 +812,13 @@ pub struct SessionSnapshot {
     /// resumed sessions keep their accumulated streak.
     #[serde(default)]
     pub consecutive_no_progress_turns: usize,
+    /// Issue #616: deterministic scaffold provenance. Each snapshot records
+    /// files produced by a bootstrap scaffold and their content hash at the
+    /// moment they were written. The agent later compares Write/Edit output
+    /// against this baseline so scaffold-only files do not become completion
+    /// evidence until the model actually changes them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scaffold_artifact_snapshots: Vec<ScaffoldArtifactSnapshot>,
     /// Issue #456: turn-local flag set when at least one `Write` / `Edit`
     /// tool call returned `Ok`. Reset to `false` at the top of `run_turn`,
     /// consumed by `compute_anvil_score` to determine `user_visible_artifact`.
@@ -1103,7 +1147,10 @@ pub fn reconcile_resume_state(session: &mut SessionSnapshot, _cwd: &Path) {
 mod tests {
     use crate::session::precaution::PrecautionSource;
 
-    use super::{Precaution, PrecautionStatus, Severity, WorkingMemory, compute_precaution_id};
+    use super::{
+        Precaution, PrecautionStatus, ScaffoldArtifactFileSnapshot, ScaffoldArtifactRole,
+        ScaffoldArtifactSnapshot, Severity, WorkingMemory, compute_precaution_id,
+    };
     use tempfile::tempdir;
 
     fn make_precaution(text: &str, severity: Severity, status: PrecautionStatus) -> Precaution {
@@ -1681,6 +1728,31 @@ mod tests {
         assert!(json.contains("anvil-ws-abcdef"));
         let decoded: SessionSnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.workspace_key, "anvil-ws-abcdef");
+    }
+
+    #[test]
+    fn scaffold_artifact_snapshots_survive_round_trip() {
+        let snap = SessionSnapshot {
+            scaffold_artifact_snapshots: vec![ScaffoldArtifactSnapshot {
+                created_turn_index: 7,
+                request_hash: "abc123".to_string(),
+                files: vec![ScaffoldArtifactFileSnapshot {
+                    path: "README.md".to_string(),
+                    content_hash: "deadbeef".to_string(),
+                    roles: vec![ScaffoldArtifactRole::UsageDocs],
+                    bootstrap_only: true,
+                }],
+            }],
+            ..SessionSnapshot::default()
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(json.contains("scaffold_artifact_snapshots"));
+        let decoded: SessionSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            decoded.scaffold_artifact_snapshots[0].files[0].roles,
+            vec![ScaffoldArtifactRole::UsageDocs]
+        );
+        assert!(decoded.scaffold_artifact_snapshots[0].files[0].bootstrap_only);
     }
 
     /// VR-04: `mask_payload_inplace`-style erasure of `*_key` fields does

@@ -32,9 +32,12 @@ use crate::session::feedback::{
     FeedbackFrame, FeedbackFrameDraft, FeedbackKind, build_feedback_frame,
 };
 use crate::session::precaution::{Precaution, PrecautionStatus, severity_order};
-use crate::session::store::WorkingMemory;
+use crate::session::store::{
+    ScaffoldArtifactFileSnapshot, ScaffoldArtifactRole, ScaffoldArtifactSnapshot, WorkingMemory,
+};
 use crate::tools::registry::{BashErrorClass, ToolSpec, resolve_plan_mode_write_target};
 use crate::util::file_classify::{is_implementation_file, is_setup_file, is_test_file};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -4079,11 +4082,9 @@ impl Agent {
 
             if action_expectation == recovery::ActionExpectation::RepoChange
                 && repo_edit_calls_made_this_turn == 0
-                && let Some(summary) = self.maybe_materialize_mode_deterministic_fallback(last_iter)
+                && self.maybe_materialize_mode_deterministic_fallback(last_iter)
             {
-                final_prose = summary;
-                exit_reason = ExitReason::Done;
-                break 'outer;
+                continue;
             }
 
             if action_expectation == recovery::ActionExpectation::RepoChange
@@ -5616,7 +5617,7 @@ impl Agent {
                     {
                         contract_deterministic_fallback_materialized = true;
                         self.push_system_note(
-                            "[Task Contract] Deterministic fallback created missing task artifacts. Run the appropriate verifier next, repair failures if any, and only then give the final answer."
+                            "[Task Contract] Deterministic fallback created framework scaffold files only. Treat them as bootstrap, edit them to satisfy the user's specific request, then update tests and docs before final response."
                                 .to_string(),
                         );
                         continue;
@@ -5654,12 +5655,16 @@ impl Agent {
                             "missing": missing,
                         }),
                     );
-                    self.push_system_note(super::task_contract::render_contract_recovery_note(
-                        &decision,
-                        self.active_request_text().as_deref().unwrap_or_default(),
-                        contract_completion_retries,
-                        attempt_limit,
-                    ));
+                    let target_hint = self.task_contract_recovery_target(&decision);
+                    self.push_system_note(
+                        super::task_contract::render_contract_recovery_note_with_hint(
+                            &decision,
+                            self.active_request_text().as_deref().unwrap_or_default(),
+                            contract_completion_retries,
+                            attempt_limit,
+                            target_hint.as_ref(),
+                        ),
+                    );
                     continue;
                 }
             }
@@ -7575,8 +7580,25 @@ impl Agent {
     /// and applies the DR1-001 ordering rule (`.mdx → Docs` even though
     /// `is_implementation_file` would otherwise claim it).
     fn observe_evidence_from_repo_edit(&mut self, path: &str) {
-        let category =
-            super::completion_evidence::classify_repo_edit_path(std::path::Path::new(path));
+        let Some(relative_path) = workspace_relative_path_for_tool_arg(&self.work_root, path)
+        else {
+            return;
+        };
+        let category = super::completion_evidence::classify_repo_edit_path(std::path::Path::new(
+            &relative_path,
+        ));
+        if !self.repo_edit_has_post_scaffold_delta(&relative_path) {
+            crate::logging::log_completion_evidence_observed(
+                self.current_turn_index,
+                0,
+                "repo_edit_scaffold_unchanged",
+                serde_json::json!({
+                    "category": format!("{:?}", category),
+                    "path": relative_path,
+                }),
+            );
+            return;
+        }
         self.evidence_set_this_turn
             .push(super::completion_evidence::CompletionEvidence::RepoEdit { category, count: 1 });
         crate::logging::log_completion_evidence_observed(
@@ -7585,8 +7607,58 @@ impl Agent {
             "repo_edit",
             serde_json::json!({
                 "category": format!("{:?}", category),
+                "path": relative_path,
             }),
         );
+    }
+
+    fn repo_edit_has_post_scaffold_delta(&self, relative_path: &str) -> bool {
+        match scaffold_diff_status(
+            &self.session.scaffold_artifact_snapshots,
+            relative_path,
+            current_file_hash_for_relative_path(&self.work_root, relative_path).as_deref(),
+        ) {
+            ScaffoldDiffStatus::NotScaffold => true,
+            ScaffoldDiffStatus::Changed => true,
+            ScaffoldDiffStatus::UnchangedOrMissing => false,
+        }
+    }
+
+    fn task_contract_recovery_target(
+        &self,
+        decision: &super::task_contract::CompletionDecision,
+    ) -> Option<super::task_contract::RecoveryTargetHint> {
+        let super::task_contract::CompletionDecision::Continue { missing } = decision else {
+            return None;
+        };
+        let role = missing.first().copied()?;
+        if let Some(path) = self.scaffold_candidate_for_missing_role(role) {
+            return Some(super::task_contract::RecoveryTargetHint {
+                role,
+                path,
+                reason: "bootstrap scaffold artifact for the missing role is still unchanged"
+                    .to_string(),
+            });
+        }
+        if let Some(path) = existing_workspace_candidate_for_role(&self.work_root, role) {
+            return Some(super::task_contract::RecoveryTargetHint {
+                role,
+                path,
+                reason: "existing workspace artifact matches the missing role".to_string(),
+            });
+        }
+        None
+    }
+
+    fn scaffold_candidate_for_missing_role(
+        &self,
+        role: super::task_contract::ArtifactRole,
+    ) -> Option<String> {
+        scaffold_candidate_for_missing_role_from_snapshots(
+            &self.session.scaffold_artifact_snapshots,
+            &self.work_root,
+            role,
+        )
     }
 
     fn answer_only_policy_error(
@@ -7696,58 +7768,62 @@ impl Agent {
         None
     }
 
-    fn maybe_materialize_mode_deterministic_fallback(
-        &mut self,
-        last_iter: usize,
-    ) -> Option<String> {
+    fn maybe_materialize_mode_deterministic_fallback(&mut self, last_iter: usize) -> bool {
         if !self
             .config
             .deterministic_fallback
             .allows_template_completion()
         {
-            return None;
+            return false;
         }
         let policy = self.session.mode_state.policy();
-        let request = self.active_request_text()?;
-        let (label, event, files, final_message) = if policy.allow_python_deterministic_fallback {
-            if let Some(files) = deterministic::fastapi_crud_files(&request) {
+        let Some(request) = self.active_request_text() else {
+            return false;
+        };
+        let (label, event, files, scaffold_kind) = if policy.allow_python_deterministic_fallback {
+            if let Some(files) = deterministic::fastapi_scaffold_files(&request) {
                 (
-                    "FastAPI fallback",
-                    "agent.empty_workspace.deterministic_fastapi_crud",
+                    "FastAPI scaffold",
+                    "agent.empty_workspace.deterministic_fastapi_scaffold",
                     files,
-                    "Implemented the requested FastAPI CRUD API with deterministic files."
-                        .to_string(),
+                    "FastAPI",
                 )
             } else {
                 let (script_name, sample_name) =
                     self.python_csv_names_from_request_and_anvil(&request);
                 (
-                    "Python fallback",
+                    "Python scaffold",
                     "agent.empty_workspace.deterministic_python_cli",
-                    deterministic::empty_python_cli_files_with_names(
+                    match deterministic::empty_python_cli_files_with_names(
                         &request,
                         script_name.as_deref(),
                         sample_name.as_deref(),
-                    )?,
-                    "Implemented the requested Python CSV CLI with deterministic files."
-                        .to_string(),
+                    ) {
+                        Some(files) => files,
+                        None => return false,
+                    },
+                    "Python",
                 )
             }
         } else if policy.allow_docs_deterministic_fallback {
             (
-                "Docs fallback",
+                "Docs scaffold",
                 "agent.empty_workspace.deterministic_docs",
-                deterministic::empty_docs_files(&request)?,
-                "Created the requested documentation with deterministic files.".to_string(),
+                match deterministic::empty_docs_files(&request) {
+                    Some(files) => files,
+                    None => return false,
+                },
+                "Docs",
             )
         } else {
-            return None;
+            return false;
         };
         if !self.workspace_appears_empty() {
-            return None;
+            return false;
         }
 
         let mut written = Vec::<PathBuf>::new();
+        let mut snapshot_files = Vec::<ScaffoldArtifactFileSnapshot>::new();
         for (relative, content) in files {
             let target = self.work_root.join(&relative);
             if let Some(parent) = target.parent()
@@ -7757,15 +7833,20 @@ impl Agent {
                     "deterministic fallback: failed to create {}: {err}",
                     parent.display()
                 ));
-                return None;
+                return false;
             }
-            if let Err(err) = std::fs::write(&target, content) {
+            if let Err(err) = std::fs::write(&target, content.as_bytes()) {
                 self.session.working_memory.note_error(format!(
                     "deterministic fallback: failed to write {}: {err}",
                     target.display()
                 ));
-                return None;
+                return false;
             }
+            let relative_display = relative.to_string_lossy().replace('\\', "/");
+            snapshot_files.push(scaffold_file_snapshot(
+                &relative_display,
+                content.as_bytes(),
+            ));
             self.session
                 .working_memory
                 .note_touched_file(normalize_memory_path(
@@ -7785,7 +7866,7 @@ impl Agent {
                 self.config.max_iterations,
                 label,
                 &format!(
-                    "Materialized deterministic files: {}.",
+                    "Materialized deterministic scaffold files: {}.",
                     written_paths.join(", ")
                 ),
                 self.footer.current_cols(),
@@ -7799,15 +7880,24 @@ impl Agent {
                 "work_root": self.work_root.display().to_string(),
                 "work_mode": self.session.mode_state.work_mode.as_str(),
                 "fallback_level": self.config.deterministic_fallback.fallback_level(),
-                "fallback_action": "full_template",
+                "fallback_action": "bootstrap_scaffold",
+                "completion_evidence": false,
                 "files": written_paths,
             }),
         );
+        self.record_scaffold_artifact_snapshot(&request, snapshot_files);
         self.session.messages.push(ConversationMessage::assistant(
-            format!("{final_message} Files: {}.", written_paths.join(", ")),
+            format!(
+                "Created deterministic {scaffold_kind} scaffold files as bootstrap only: {}. This is not task completion.",
+                written_paths.join(", ")
+            ),
             Vec::new(),
         ));
-        Some(final_message)
+        self.push_system_note(render_deterministic_scaffold_continuation_note(
+            &request,
+            &written_paths,
+        ));
+        true
     }
 
     fn maybe_materialize_task_contract_fallback(
@@ -7836,14 +7926,18 @@ impl Agent {
         {
             return false;
         }
+        if !self.workspace_appears_empty() {
+            return false;
+        }
         let Some(request) = self.active_request_text() else {
             return false;
         };
-        let Some(files) = deterministic::fastapi_crud_files(&request) else {
+        let Some(files) = deterministic::fastapi_scaffold_files(&request) else {
             return false;
         };
 
         let mut written = Vec::<PathBuf>::new();
+        let mut snapshot_files = Vec::<ScaffoldArtifactFileSnapshot>::new();
         for (relative, content) in files {
             let target = self.work_root.join(&relative);
             if target.exists() {
@@ -7858,7 +7952,7 @@ impl Agent {
                 ));
                 return false;
             }
-            if let Err(err) = std::fs::write(&target, content) {
+            if let Err(err) = std::fs::write(&target, content.as_bytes()) {
                 self.session.working_memory.note_error(format!(
                     "task contract deterministic fallback: failed to write {}: {err}",
                     target.display()
@@ -7866,21 +7960,19 @@ impl Agent {
                 return false;
             }
             let relative_display = relative.to_string_lossy().to_string();
+            snapshot_files.push(scaffold_file_snapshot(
+                &relative_display.replace('\\', "/"),
+                content.as_bytes(),
+            ));
             self.session
                 .working_memory
                 .note_touched_file(normalize_memory_path(&relative_display, &self.work_root));
-            self.observe_evidence_from_repo_edit(&relative_display);
             written.push(relative);
         }
         if written.is_empty() {
             return false;
         }
 
-        self.session.repo_edit_succeeded_this_turn = true;
-        self.session
-            .record_feedback_if_unset(build_feedback_for_deterministic_content_fallback(
-                &self.work_root,
-            ));
         let written_paths = written
             .iter()
             .map(|path| path.to_string_lossy().to_string())
@@ -7889,9 +7981,9 @@ impl Agent {
             &format_iteration_status(
                 last_iter,
                 self.config.max_iterations,
-                "Task fallback",
+                "Task scaffold",
                 &format!(
-                    "Materialized deterministic task files: {}.",
+                    "Materialized deterministic scaffold files: {}.",
                     written_paths.join(", ")
                 ),
                 self.footer.current_cols(),
@@ -7899,24 +7991,51 @@ impl Agent {
             true,
         );
         log_llm_event(
-            "agent.task_contract.deterministic_fastapi_crud",
+            "agent.task_contract.deterministic_fastapi_scaffold",
             serde_json::json!({
                 "session_id": self.session_store.session_id(),
                 "work_root": self.work_root.display().to_string(),
                 "work_mode": self.session.mode_state.work_mode.as_str(),
                 "fallback_level": self.config.deterministic_fallback.fallback_level(),
-                "fallback_action": "full_template",
+                "fallback_action": "bootstrap_scaffold",
+                "completion_evidence": false,
                 "files": written_paths,
             }),
         );
+        self.record_scaffold_artifact_snapshot(&request, snapshot_files);
         self.session.messages.push(ConversationMessage::assistant(
             format!(
-                "Materialized deterministic FastAPI CRUD task files as contract recovery: {}. Continue with verification before treating the task as complete.",
+                "Created deterministic FastAPI scaffold files as contract recovery: {}. This is not task completion.",
                 written_paths.join(", ")
             ),
             Vec::new(),
         ));
+        self.push_system_note(render_deterministic_scaffold_continuation_note(
+            &request,
+            &written_paths,
+        ));
         true
+    }
+
+    fn record_scaffold_artifact_snapshot(
+        &mut self,
+        request: &str,
+        files: Vec<ScaffoldArtifactFileSnapshot>,
+    ) {
+        if files.is_empty() {
+            return;
+        }
+        self.session
+            .scaffold_artifact_snapshots
+            .push(ScaffoldArtifactSnapshot {
+                created_turn_index: self.current_turn_index,
+                request_hash: sha256_hex(request.as_bytes()),
+                files,
+            });
+        const MAX_SCAFFOLD_SNAPSHOTS: usize = 4;
+        while self.session.scaffold_artifact_snapshots.len() > MAX_SCAFFOLD_SNAPSHOTS {
+            self.session.scaffold_artifact_snapshots.remove(0);
+        }
     }
 
     fn python_csv_names_from_request_and_anvil(
@@ -10497,6 +10616,169 @@ fn framework_app_fallback_continuation_note() -> &'static str {
     "[Deterministic App Fallback] Treat the materialized framework files as a recovery scaffold only, not as task completion. Continue by reading and editing the real UI entry file with task-specific implementation details, then verify the app before final response."
 }
 
+fn render_deterministic_scaffold_continuation_note(
+    request: &str,
+    written_paths: &[String],
+) -> String {
+    let request_json = serde_json::to_string(request).unwrap_or_else(|_| "\"<invalid>\"".into());
+    format!(
+        "[Deterministic Scaffold] The generated files are bootstrap scaffold only and do not satisfy the task by themselves. request_json={request_json}. Read and edit the scaffold to implement the user's specific requirements, including domain-specific implementation, tests, and usage documentation. Existing scaffold files: {}. Do not give a final answer until the implementation, tests, and docs match request_json and verification has run.",
+        written_paths.join(", ")
+    )
+}
+
+fn scaffold_file_snapshot(path: &str, content: &[u8]) -> ScaffoldArtifactFileSnapshot {
+    ScaffoldArtifactFileSnapshot {
+        path: path.to_string(),
+        content_hash: sha256_hex(content),
+        roles: vec![scaffold_role_for_path(Path::new(path))],
+        bootstrap_only: true,
+    }
+}
+
+fn scaffold_role_for_path(path: &Path) -> ScaffoldArtifactRole {
+    match super::completion_evidence::classify_repo_edit_path(path) {
+        super::completion_evidence::RepoEditCategory::Impl => ScaffoldArtifactRole::Implementation,
+        super::completion_evidence::RepoEditCategory::Test => ScaffoldArtifactRole::Test,
+        super::completion_evidence::RepoEditCategory::Docs => ScaffoldArtifactRole::UsageDocs,
+        super::completion_evidence::RepoEditCategory::Setup => ScaffoldArtifactRole::Setup,
+        super::completion_evidence::RepoEditCategory::Other => ScaffoldArtifactRole::Other,
+    }
+}
+
+fn scaffold_role_matches_artifact_role(
+    candidate: ScaffoldArtifactRole,
+    role: super::task_contract::ArtifactRole,
+) -> bool {
+    matches!(
+        (candidate, role),
+        (
+            ScaffoldArtifactRole::Implementation,
+            super::task_contract::ArtifactRole::Implementation
+        ) | (
+            ScaffoldArtifactRole::Test,
+            super::task_contract::ArtifactRole::Test
+        ) | (
+            ScaffoldArtifactRole::UsageDocs,
+            super::task_contract::ArtifactRole::UsageDocs
+        ) | (
+            ScaffoldArtifactRole::Setup,
+            super::task_contract::ArtifactRole::Setup
+        )
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScaffoldDiffStatus {
+    NotScaffold,
+    Changed,
+    UnchangedOrMissing,
+}
+
+fn scaffold_diff_status(
+    snapshots: &[ScaffoldArtifactSnapshot],
+    relative_path: &str,
+    current_hash: Option<&str>,
+) -> ScaffoldDiffStatus {
+    let Some(file) = snapshots
+        .iter()
+        .rev()
+        .flat_map(|snapshot| snapshot.files.iter())
+        .find(|file| file.bootstrap_only && file.path == relative_path)
+    else {
+        return ScaffoldDiffStatus::NotScaffold;
+    };
+    match current_hash {
+        Some(hash) if hash != file.content_hash => ScaffoldDiffStatus::Changed,
+        _ => ScaffoldDiffStatus::UnchangedOrMissing,
+    }
+}
+
+fn scaffold_candidate_for_missing_role_from_snapshots(
+    snapshots: &[ScaffoldArtifactSnapshot],
+    work_root: &Path,
+    role: super::task_contract::ArtifactRole,
+) -> Option<String> {
+    snapshots
+        .iter()
+        .rev()
+        .flat_map(|snapshot| snapshot.files.iter())
+        .find(|file| {
+            file.bootstrap_only
+                && file
+                    .roles
+                    .iter()
+                    .any(|candidate| scaffold_role_matches_artifact_role(*candidate, role))
+                && matches!(
+                    scaffold_diff_status(
+                        snapshots,
+                        &file.path,
+                        current_file_hash_for_relative_path(work_root, &file.path).as_deref(),
+                    ),
+                    ScaffoldDiffStatus::UnchangedOrMissing
+                )
+        })
+        .map(|file| file.path.clone())
+}
+
+fn current_file_hash_for_relative_path(work_root: &Path, relative_path: &str) -> Option<String> {
+    let target = resolve_user_path(work_root, relative_path).ok()?;
+    let root = std::fs::canonicalize(work_root).unwrap_or_else(|_| work_root.to_path_buf());
+    if target.strip_prefix(root).is_err() || !target.is_file() {
+        return None;
+    }
+    std::fs::read(target)
+        .ok()
+        .map(|bytes| sha256_hex(bytes.as_slice()))
+}
+
+fn workspace_relative_path_for_tool_arg(work_root: &Path, raw_path: &str) -> Option<String> {
+    let resolved = resolve_user_path(work_root, raw_path).ok()?;
+    let root = std::fs::canonicalize(work_root).unwrap_or_else(|_| work_root.to_path_buf());
+    let relative = resolved.strip_prefix(root).ok()?;
+    Some(relative.to_string_lossy().replace('\\', "/"))
+}
+
+fn existing_workspace_candidate_for_role(
+    work_root: &Path,
+    role: super::task_contract::ArtifactRole,
+) -> Option<String> {
+    let files = meaningful_workspace_files(work_root, 64)?;
+    files
+        .into_iter()
+        .find(|path| {
+            artifact_role_from_repo_edit_category(
+                super::completion_evidence::classify_repo_edit_path(path),
+            )
+            .is_some_and(|candidate| candidate == role)
+        })
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+}
+
+fn artifact_role_from_repo_edit_category(
+    category: super::completion_evidence::RepoEditCategory,
+) -> Option<super::task_contract::ArtifactRole> {
+    match category {
+        super::completion_evidence::RepoEditCategory::Impl => {
+            Some(super::task_contract::ArtifactRole::Implementation)
+        }
+        super::completion_evidence::RepoEditCategory::Test => {
+            Some(super::task_contract::ArtifactRole::Test)
+        }
+        super::completion_evidence::RepoEditCategory::Docs => {
+            Some(super::task_contract::ArtifactRole::UsageDocs)
+        }
+        super::completion_evidence::RepoEditCategory::Setup => {
+            Some(super::task_contract::ArtifactRole::Setup)
+        }
+        super::completion_evidence::RepoEditCategory::Other => None,
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
 const DETERMINISTIC_FRAMEWORK_APP_FALLBACK_MARKER: &str =
     "Materialized deterministic framework app fallback files";
 
@@ -11920,19 +12202,21 @@ mod progress_tests {
         latest_truncated_tool_call_note_index, latest_turn_preferred_read_edit_target,
         post_scaffold_continuation_active, post_scaffold_recovery_active, progress_available_width,
         prune_plan_mode_messages, recent_deterministic_framework_app_fallback_seen,
-        recent_scaffold_command_seen, recent_truncated_tool_call_attempt, repo_change_request_text,
+        recent_scaffold_command_seen, recent_truncated_tool_call_attempt,
+        render_deterministic_scaffold_continuation_note, repo_change_request_text,
         request_needs_playable_ui_quality_gate, sanitize_for_progress,
-        should_apply_repo_change_quality_gate, should_try_framework_app_fallback,
-        should_use_streaming_transport, strip_read_line_number_prefix,
-        successful_non_plan_repo_edit_count, successful_repo_edit_count,
-        sync_package_json_with_existing_lock, tool_color, tool_display, tool_emoji,
-        unicode_supported, workspace_appears_empty,
+        scaffold_candidate_for_missing_role_from_snapshots, scaffold_diff_status,
+        scaffold_file_snapshot, sha256_hex, should_apply_repo_change_quality_gate,
+        should_try_framework_app_fallback, should_use_streaming_transport,
+        strip_read_line_number_prefix, successful_non_plan_repo_edit_count,
+        successful_repo_edit_count, sync_package_json_with_existing_lock, tool_color, tool_display,
+        tool_emoji, unicode_supported, workspace_appears_empty,
     };
     use crate::agent::recovery::ActionExpectation;
     use crate::modes::plan_act::{ExecutionMode, PlanStage};
     use crate::ollama::xml_fallback::ToolCall;
     use crate::safety::path_guard::resolve_user_path;
-    use crate::session::store::ConversationMessage;
+    use crate::session::store::{ConversationMessage, ScaffoldArtifactSnapshot};
     use serde_json::json;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
@@ -13046,6 +13330,98 @@ mod progress_tests {
 
         std::fs::write(work_root.join("README.md"), "# app\n").unwrap();
         assert!(!workspace_appears_empty(work_root));
+    }
+
+    #[test]
+    fn deterministic_scaffold_note_requires_requirement_editing_before_final() {
+        let note = render_deterministic_scaffold_continuation_note(
+            "ToDo管理のバックエンドをFastAPIで開発してください。",
+            &[
+                "pyproject.toml".to_string(),
+                "app/main.py".to_string(),
+                "tests/test_health.py".to_string(),
+            ],
+        );
+
+        assert!(note.contains("bootstrap scaffold only"), "got: {note}");
+        assert!(note.contains("do not satisfy the task"), "got: {note}");
+        assert!(note.contains("request_json="), "got: {note}");
+        assert!(
+            note.contains("domain-specific implementation"),
+            "got: {note}"
+        );
+        assert!(note.contains("Do not give a final answer"), "got: {note}");
+    }
+
+    #[test]
+    fn scaffold_snapshot_classifies_docs_and_tracks_content_delta() {
+        let file = scaffold_file_snapshot("README.md", b"# FastAPI Application Scaffold\n");
+        assert_eq!(file.path, "README.md");
+        assert_eq!(
+            file.content_hash,
+            sha256_hex(b"# FastAPI Application Scaffold\n")
+        );
+        assert_eq!(
+            file.roles,
+            vec![crate::session::store::ScaffoldArtifactRole::UsageDocs]
+        );
+
+        let snapshot = ScaffoldArtifactSnapshot {
+            created_turn_index: 3,
+            request_hash: "request".to_string(),
+            files: vec![file.clone()],
+        };
+        assert_eq!(
+            scaffold_diff_status(
+                std::slice::from_ref(&snapshot),
+                "README.md",
+                Some(&file.content_hash),
+            ),
+            super::ScaffoldDiffStatus::UnchangedOrMissing
+        );
+        assert_eq!(
+            scaffold_diff_status(
+                std::slice::from_ref(&snapshot),
+                "README.md",
+                Some(&sha256_hex(b"# ToDo API\n")),
+            ),
+            super::ScaffoldDiffStatus::Changed
+        );
+        assert_eq!(
+            scaffold_diff_status(&[snapshot], "docs/usage.md", Some("anything")),
+            super::ScaffoldDiffStatus::NotScaffold
+        );
+    }
+
+    #[test]
+    fn unchanged_scaffold_file_is_recovery_candidate_until_model_changes_it() {
+        let temp = tempdir().unwrap();
+        std::fs::write(temp.path().join("README.md"), "# Scaffold\n").unwrap();
+        let file = scaffold_file_snapshot("README.md", b"# Scaffold\n");
+        let snapshot = ScaffoldArtifactSnapshot {
+            created_turn_index: 1,
+            request_hash: "request".to_string(),
+            files: vec![file],
+        };
+
+        assert_eq!(
+            scaffold_candidate_for_missing_role_from_snapshots(
+                std::slice::from_ref(&snapshot),
+                temp.path(),
+                super::super::task_contract::ArtifactRole::UsageDocs,
+            ),
+            Some("README.md".to_string())
+        );
+
+        std::fs::write(temp.path().join("README.md"), "# Actual usage\n").unwrap();
+        assert_eq!(
+            scaffold_candidate_for_missing_role_from_snapshots(
+                &[snapshot],
+                temp.path(),
+                super::super::task_contract::ArtifactRole::UsageDocs,
+            ),
+            None
+        );
     }
 
     #[test]
