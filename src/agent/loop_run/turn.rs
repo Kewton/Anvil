@@ -73,6 +73,7 @@ const CREATE_NEXT_APP_PACKAGE_VERSION: &str = "16.2.4";
 struct EffectiveToolPolicy {
     allowed_tools: Option<Vec<&'static str>>,
     focused_edit: Option<FocusedEditPolicy>,
+    artifact_directed: Option<ArtifactDirectedPolicy>,
     reason: EffectiveToolPolicyReason,
 }
 
@@ -82,10 +83,16 @@ struct FocusedEditPolicy {
     target_already_read: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArtifactDirectedPolicy {
+    target: PathBuf,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EffectiveToolPolicyReason {
     Unrestricted,
     AnswerOnly,
+    ArtifactDirectedRecovery,
     FocusedEditRecovery,
     LocalLlmSmallEditAfterRead,
 }
@@ -95,6 +102,7 @@ impl EffectiveToolPolicyReason {
         match self {
             Self::Unrestricted => "unrestricted",
             Self::AnswerOnly => "answer_only",
+            Self::ArtifactDirectedRecovery => "artifact_directed_recovery",
             Self::FocusedEditRecovery => "focused_edit_recovery",
             Self::LocalLlmSmallEditAfterRead => "local_llm_small_edit_after_read",
         }
@@ -106,6 +114,7 @@ impl EffectiveToolPolicy {
         Self {
             allowed_tools: None,
             focused_edit: None,
+            artifact_directed: None,
             reason: EffectiveToolPolicyReason::Unrestricted,
         }
     }
@@ -114,7 +123,17 @@ impl EffectiveToolPolicy {
         Self {
             allowed_tools: Some(allowed_tools),
             focused_edit: None,
+            artifact_directed: None,
             reason,
+        }
+    }
+
+    fn artifact_directed(target: PathBuf) -> Self {
+        Self {
+            allowed_tools: Some(vec!["Read", "Write", "Edit"]),
+            focused_edit: None,
+            artifact_directed: Some(ArtifactDirectedPolicy { target }),
+            reason: EffectiveToolPolicyReason::ArtifactDirectedRecovery,
         }
     }
 
@@ -130,6 +149,7 @@ impl EffectiveToolPolicy {
                 target,
                 target_already_read,
             }),
+            artifact_directed: None,
             reason,
         }
     }
@@ -140,6 +160,10 @@ impl EffectiveToolPolicy {
 
     fn focused_edit_policy(&self) -> Option<&FocusedEditPolicy> {
         self.focused_edit.as_ref()
+    }
+
+    fn artifact_directed_policy(&self) -> Option<&ArtifactDirectedPolicy> {
+        self.artifact_directed.as_ref()
     }
 
     fn reason(&self) -> EffectiveToolPolicyReason {
@@ -4393,8 +4417,8 @@ impl Agent {
                             &format_iteration_status(
                                 last_iter,
                                 self.config.max_iterations,
-                                "Focused edit narrowed",
-                                "Ignored extra tool calls and kept only the first focused action on the target file.",
+                                "Tool policy narrowed",
+                                "Ignored extra tool calls and kept only the first allowed action on the target file.",
                                 self.footer.current_cols(),
                             ),
                             true,
@@ -5214,14 +5238,15 @@ impl Agent {
                     repo_change_retries += 1;
                     if repo_change_retries >= 2 {
                         if repo_change_retries == 2
-                            && self.push_repo_change_no_edit_recovery_note(repo_change_retries)
+                            && (self.push_artifact_directed_recovery_note(repo_change_retries)
+                                || self.push_repo_change_no_edit_recovery_note(repo_change_retries))
                         {
                             write_stdout_rendered(
                                 &format_iteration_status(
                                     last_iter,
                                     self.config.max_iterations,
                                     "Retry requested",
-                                    "The target file was already read. Asked the model to emit one Edit tool call now.",
+                                    "Asked the model to continue with one allowed repository edit on the target artifact.",
                                     self.footer.current_cols(),
                                 ),
                                 true,
@@ -5270,7 +5295,9 @@ impl Agent {
                         ),
                         true,
                     );
-                    if !self.push_repo_change_no_edit_recovery_note(repo_change_retries) {
+                    if !self.push_artifact_directed_recovery_note(repo_change_retries)
+                        && !self.push_repo_change_no_edit_recovery_note(repo_change_retries)
+                    {
                         self.push_system_note(recovery::repo_change_recovery_note(
                             repo_change_retries,
                         ));
@@ -5362,14 +5389,15 @@ impl Agent {
                     repo_change_retries += 1;
                     if repo_change_retries >= 2 {
                         if repo_change_retries == 2
-                            && self.push_repo_change_no_edit_recovery_note(repo_change_retries)
+                            && (self.push_artifact_directed_recovery_note(repo_change_retries)
+                                || self.push_repo_change_no_edit_recovery_note(repo_change_retries))
                         {
                             write_stdout_rendered(
                                 &format_iteration_status(
                                     last_iter,
                                     self.config.max_iterations,
                                     "Retry requested",
-                                    "The target file was already read. Asked the model to emit one Edit tool call now.",
+                                    "Asked the model to continue with one allowed repository edit on the target artifact.",
                                     self.footer.current_cols(),
                                 ),
                                 true,
@@ -5429,7 +5457,9 @@ impl Agent {
                             target_already_read,
                             repo_change_retries,
                         ));
-                    } else if !self.push_repo_change_no_edit_recovery_note(repo_change_retries) {
+                    } else if !self.push_artifact_directed_recovery_note(repo_change_retries)
+                        && !self.push_repo_change_no_edit_recovery_note(repo_change_retries)
+                    {
                         self.push_system_note(recovery::repo_change_no_tool_recovery_note(
                             repo_change_retries,
                         ));
@@ -5626,7 +5656,7 @@ impl Agent {
                         target_already_read,
                         repo_change_retries,
                     ));
-                } else {
+                } else if !self.push_artifact_directed_recovery_note(repo_change_retries) {
                     self.push_system_note(recovery::repo_change_recovery_note(repo_change_retries));
                 }
                 continue;
@@ -7433,6 +7463,12 @@ impl Agent {
         if let Some(note) = self.post_scaffold_continuation_recovery_message() {
             messages.push(ConversationMessage::system(note));
         }
+        if let Some(note) = self.artifact_directed_policy_violation_message(effective_tool_policy) {
+            messages.push(ConversationMessage::system(note));
+        }
+        if let Some(note) = self.artifact_directed_recovery_message(effective_tool_policy) {
+            messages.push(ConversationMessage::system(note));
+        }
         let current_request_paths = extract_current_request_paths(self, &self.work_root);
         let last_suspected = self
             .session
@@ -7548,6 +7584,15 @@ impl Agent {
                     vec!["Read", "Glob", "Grep"],
                 );
             }
+        }
+        if let Some(target) = self.forced_small_edit_recovery_target() {
+            return self.focused_edit_policy_for_target(
+                target,
+                EffectiveToolPolicyReason::FocusedEditRecovery,
+            );
+        }
+        if let Some(target) = self.artifact_recovery_target_path() {
+            return EffectiveToolPolicy::artifact_directed(target);
         }
         if let Some(target) = self.focused_edit_recovery_target() {
             return self.focused_edit_policy_for_target(
@@ -7773,8 +7818,7 @@ impl Agent {
     }
 
     fn focused_edit_recovery_target(&self) -> Option<PathBuf> {
-        self.artifact_recovery_target_path()
-            .or_else(|| self.forced_small_edit_recovery_target())
+        self.forced_small_edit_recovery_target()
             .or_else(|| self.post_scaffold_edit_recovery_target())
             .or_else(|| self.post_scaffold_continuation_recovery_target())
     }
@@ -7827,6 +7871,21 @@ impl Agent {
         true
     }
 
+    fn push_artifact_directed_recovery_note(&mut self, attempt: usize) -> bool {
+        if self.focused_edit_recovery_target().is_some() {
+            return false;
+        }
+        let Some(target) = self.current_artifact_recovery_target.as_ref() else {
+            return false;
+        };
+        self.push_system_note(recovery::artifact_directed_recovery_note(
+            target.role.label(),
+            &target.path,
+            attempt,
+        ));
+        true
+    }
+
     fn focused_edit_no_tool_note_for_target(
         &self,
         target: &Path,
@@ -7848,6 +7907,42 @@ impl Agent {
                 attempt,
             )
         }
+    }
+
+    fn artifact_directed_recovery_message(
+        &self,
+        effective_tool_policy: &EffectiveToolPolicy,
+    ) -> Option<String> {
+        let policy = effective_tool_policy.artifact_directed_policy()?;
+        let target = self.current_artifact_recovery_target.as_ref()?;
+        let target_display = progress_path_display(
+            &policy.target.display().to_string(),
+            &self.work_root,
+            self.session.mode_state.active_plan_path.as_deref(),
+            120,
+        );
+        Some(format!(
+            "[Artifact Directed Recovery] Missing role: {}. Target file: {target_display}. Allowed tools for this turn are Read, Write, and Edit on that exact target path only. Do not call Bash, Glob, Grep, or switch files. Use Write if a small scaffold file should be replaced; otherwise use a compact Edit.",
+            target.role.label()
+        ))
+    }
+
+    fn artifact_directed_policy_violation_message(
+        &self,
+        effective_tool_policy: &EffectiveToolPolicy,
+    ) -> Option<String> {
+        let policy = effective_tool_policy.artifact_directed_policy()?;
+        let target_display = policy
+            .target
+            .strip_prefix(&self.work_root)
+            .unwrap_or(&policy.target)
+            .to_string_lossy()
+            .replace('\\', "/");
+        focused_edit_policy_violation_feedback_note(
+            &self.session.working_memory.unresolved_errors,
+            effective_tool_policy.allowed_tool_names_for_prompt(),
+            Some(&target_display),
+        )
     }
 
     fn push_deterministic_ui_recovery_continuation_note(
@@ -11975,7 +12070,36 @@ fn effective_tool_policy_error_for_call(
         );
     }
 
+    if let Some(artifact) = policy.artifact_directed_policy() {
+        return artifact_directed_tool_policy_error(name, arguments, &artifact.target, work_root);
+    }
+
     None
+}
+
+fn artifact_directed_tool_policy_error(
+    name: &str,
+    arguments: &serde_json::Value,
+    target: &Path,
+    work_root: &Path,
+) -> Option<String> {
+    let path_matches = arguments
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|raw_path| tool_path_matches_target(raw_path, target, work_root));
+    if path_matches {
+        return None;
+    }
+
+    let rejected_tool = compact_tool_name_for_policy_feedback(name);
+    let path_display = target
+        .strip_prefix(work_root)
+        .unwrap_or(target)
+        .to_string_lossy()
+        .replace('\\', "/");
+    Some(format!(
+        "artifact-directed recovery rejected {rejected_tool}; only allows Read, Write, or Edit on {path_display}"
+    ))
 }
 
 fn restricted_tool_policy_error(
@@ -11994,17 +12118,27 @@ fn restricted_tool_policy_error(
         "tool policy rejected {rejected_tool}; allowed tools: {allowed}; reason: {}",
         policy.reason().as_str()
     );
-    if let Some(focused) = policy.focused_edit_policy() {
-        let path_display = focused
-            .target
+    if let Some(target) = policy_target_path(policy) {
+        let path_display = target
             .strip_prefix(work_root)
-            .unwrap_or(&focused.target)
+            .unwrap_or(target)
             .to_string_lossy()
             .replace('\\', "/");
         message.push_str("; target: ");
         message.push_str(&path_display);
     }
     message
+}
+
+fn policy_target_path(policy: &EffectiveToolPolicy) -> Option<&Path> {
+    policy
+        .focused_edit_policy()
+        .map(|focused| focused.target.as_path())
+        .or_else(|| {
+            policy
+                .artifact_directed_policy()
+                .map(|artifact| artifact.target.as_path())
+        })
 }
 
 fn compact_tool_name_for_policy_feedback(name: &str) -> String {
@@ -12027,6 +12161,7 @@ fn focused_edit_policy_violation_feedback_note(
     let error = unresolved_errors.iter().rev().find(|error| {
         let is_policy_error = error.starts_with("focused edit recovery rejected ")
             || error.starts_with("focused edit recovery only allows ")
+            || error.starts_with("artifact-directed recovery rejected ")
             || error.starts_with("tool policy rejected ");
         is_policy_error && target_display.is_none_or(|target| error.contains(target))
     })?;
@@ -12102,6 +12237,10 @@ fn effective_tool_batch_action(
             work_root,
             focused.target_already_read,
         );
+    }
+
+    if policy.artifact_directed_policy().is_some() && tool_calls.len() > 1 {
+        return FocusedEditBatchAction::TruncateToFirst;
     }
 
     FocusedEditBatchAction::Accept
@@ -13174,19 +13313,20 @@ mod truncate_tests {
 mod progress_tests {
     use super::{
         EffectiveToolPolicy, EffectiveToolPolicyReason, FocusedEditBatchAction,
-        deterministic_empty_framework_app_files, deterministic_empty_framework_game_files,
-        deterministic_framework_app_files_needed, deterministic_framework_game_files_needed,
-        deterministic_support_target_relative, effective_tool_batch_action,
-        effective_tool_policy_error_for_call, extract_page_copy_block_from_numbered_read,
-        first_existing_impl_target, focused_edit_compact_anchor_note,
-        focused_edit_compact_recovery_anchor, focused_edit_exact_anchor_history,
-        focused_edit_exact_recovery_anchor, focused_edit_first_slice_note,
-        focused_edit_first_slice_uses_exact_anchor, focused_edit_guidance_note,
-        focused_edit_history, focused_edit_max_predict_override, focused_edit_minimal_history,
-        focused_edit_policy_violation_feedback_note, focused_edit_second_slice_note,
-        focused_edit_target_already_read, focused_edit_timeout_override_secs,
-        focused_edit_tool_batch_action, focused_edit_tool_policy_error,
-        focused_read_target_for_directory, format_blocked_progress_line, format_progress_line,
+        artifact_directed_tool_policy_error, deterministic_empty_framework_app_files,
+        deterministic_empty_framework_game_files, deterministic_framework_app_files_needed,
+        deterministic_framework_game_files_needed, deterministic_support_target_relative,
+        effective_tool_batch_action, effective_tool_policy_error_for_call,
+        extract_page_copy_block_from_numbered_read, first_existing_impl_target,
+        focused_edit_compact_anchor_note, focused_edit_compact_recovery_anchor,
+        focused_edit_exact_anchor_history, focused_edit_exact_recovery_anchor,
+        focused_edit_first_slice_note, focused_edit_first_slice_uses_exact_anchor,
+        focused_edit_guidance_note, focused_edit_history, focused_edit_max_predict_override,
+        focused_edit_minimal_history, focused_edit_policy_violation_feedback_note,
+        focused_edit_second_slice_note, focused_edit_target_already_read,
+        focused_edit_timeout_override_secs, focused_edit_tool_batch_action,
+        focused_edit_tool_policy_error, focused_read_target_for_directory,
+        format_blocked_progress_line, format_progress_line,
         framework_app_fallback_continuation_note, has_successful_non_plan_repo_edit,
         has_successful_non_plan_repo_edit_after_latest_truncated_tool_call,
         has_successful_repo_edit, implementation_quality_issue_for_request, is_utf8_locale,
@@ -15158,6 +15298,113 @@ export default function App() {
         assert!(err.contains("reason: answer_only"), "got: {err}");
         assert!(!err.contains("secret-token"), "got: {err}");
         assert!(!err.contains("curl"), "got: {err}");
+    }
+
+    #[test]
+    fn artifact_directed_policy_allows_target_read_write_edit() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        let target = work_root.join("app/main.py");
+        std::fs::write(&target, "from fastapi import FastAPI\napp = FastAPI()\n").unwrap();
+        let policy = EffectiveToolPolicy::artifact_directed(target);
+
+        for tool in ["Read", "Write", "Edit"] {
+            assert!(
+                effective_tool_policy_error_for_call(
+                    &policy,
+                    tool,
+                    &json!({"path":"app/main.py"}),
+                    work_root,
+                )
+                .is_none(),
+                "{tool} should be allowed on target path"
+            );
+        }
+    }
+
+    #[test]
+    fn artifact_directed_policy_rejects_exploration_tools_before_execution() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        let target = work_root.join("app/main.py");
+        std::fs::write(&target, "from fastapi import FastAPI\napp = FastAPI()\n").unwrap();
+        let policy = EffectiveToolPolicy::artifact_directed(target);
+
+        let err = effective_tool_policy_error_for_call(
+            &policy,
+            "Glob",
+            &json!({"pattern":"**/*", "token":"secret-token"}),
+            work_root,
+        )
+        .expect("expected policy error");
+
+        assert!(err.contains("tool policy rejected Glob"), "got: {err}");
+        assert!(
+            err.contains("allowed tools: Read, Write, Edit"),
+            "got: {err}"
+        );
+        assert!(
+            err.contains("reason: artifact_directed_recovery"),
+            "got: {err}"
+        );
+        assert!(err.contains("target: app/main.py"), "got: {err}");
+        assert!(!err.contains("secret-token"), "got: {err}");
+        assert!(!err.contains("**/*"), "got: {err}");
+    }
+
+    #[test]
+    fn artifact_directed_policy_rejects_wrong_target_path() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        let target = work_root.join("app/main.py");
+        std::fs::write(&target, "from fastapi import FastAPI\napp = FastAPI()\n").unwrap();
+        std::fs::write(work_root.join("README.md"), "# demo\n").unwrap();
+
+        let err = artifact_directed_tool_policy_error(
+            "Write",
+            &json!({"path":"README.md", "content":"secret-token"}),
+            &target,
+            work_root,
+        )
+        .expect("expected policy error");
+
+        assert!(
+            err.contains("only allows Read, Write, or Edit on app/main.py"),
+            "got: {err}"
+        );
+        assert!(!err.contains("secret-token"), "got: {err}");
+    }
+
+    #[test]
+    fn artifact_directed_policy_truncates_extra_tool_calls() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        let target = work_root.join("app/main.py");
+        std::fs::write(&target, "from fastapi import FastAPI\napp = FastAPI()\n").unwrap();
+        let policy = EffectiveToolPolicy::artifact_directed(target);
+
+        let action = effective_tool_batch_action(
+            &[
+                ToolCall {
+                    id: "read-1".to_string(),
+                    name: "Read".to_string(),
+                    arguments: json!({"path":"app/main.py"}),
+                },
+                ToolCall {
+                    id: "read-2".to_string(),
+                    name: "Read".to_string(),
+                    arguments: json!({"path":"README.md"}),
+                },
+            ],
+            &policy,
+            work_root,
+        );
+
+        assert_eq!(action, FocusedEditBatchAction::TruncateToFirst);
     }
 
     #[test]

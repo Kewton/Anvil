@@ -141,6 +141,12 @@ pub fn repo_change_after_read_no_edit_note(path: &str, attempt: usize) -> String
     )
 }
 
+pub fn artifact_directed_recovery_note(role: &str, path: &str, attempt: usize) -> String {
+    format!(
+        "Artifact-directed recovery is active for missing role {role} at {path}. Do not answer in prose. Emit exactly one tool call now on that same path using Read, Write, or Edit only. Use Write when a small scaffold file should be replaced, or Edit when an exact local change is enough. Do not call Bash, Glob, Grep, or switch files. artifact_directed_attempt={attempt}"
+    )
+}
+
 pub fn repo_change_after_setup_note() -> String {
     "Setup or verification shell commands have already run, but the requested repository change is still missing. On the next turn, first inspect the target implementation file with Read, then make exactly one small Edit or short Write. Do not run another scaffold or dev-server command until a concrete repo change exists.".to_string()
 }
@@ -455,15 +461,16 @@ pub fn should_block_restart_discovery(tool_name: &str, progress_exists: bool) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        empty_workspace_scaffold_note, first_scaffold_shell_edit_exact_anchor_note,
-        first_scaffold_shell_edit_note, focused_edit_no_tool_recovery_note,
-        focused_edit_timeout_recovery_note, focused_edit_truncated_tool_call_note,
-        focused_edit_unterminated_tool_call_note, forced_small_edit_recovery_note,
-        framework_scaffold_now_note, is_scaffold_command, post_scaffold_continuation_note,
-        post_scaffold_edit_recovery_note, repo_change_after_read_no_edit_note,
-        repo_change_after_setup_note, repo_change_no_tool_recovery_note,
-        repo_change_partial_progress_note, repo_change_quality_gate_note,
-        second_scaffold_shell_edit_exact_anchor_note, tool_call_format_recovery_note,
+        artifact_directed_recovery_note, empty_workspace_scaffold_note,
+        first_scaffold_shell_edit_exact_anchor_note, first_scaffold_shell_edit_note,
+        focused_edit_no_tool_recovery_note, focused_edit_timeout_recovery_note,
+        focused_edit_truncated_tool_call_note, focused_edit_unterminated_tool_call_note,
+        forced_small_edit_recovery_note, framework_scaffold_now_note, is_scaffold_command,
+        post_scaffold_continuation_note, post_scaffold_edit_recovery_note,
+        repo_change_after_read_no_edit_note, repo_change_after_setup_note,
+        repo_change_no_tool_recovery_note, repo_change_partial_progress_note,
+        repo_change_quality_gate_note, second_scaffold_shell_edit_exact_anchor_note,
+        tool_call_format_recovery_note,
     };
 
     #[test]
@@ -503,6 +510,15 @@ mod tests {
             note.contains("repo_change_after_read_no_edit_attempt=2"),
             "got: {note}"
         );
+    }
+
+    #[test]
+    fn artifact_directed_note_allows_file_tools_on_same_target_only() {
+        let note = artifact_directed_recovery_note("implementation", "app/main.py", 2);
+        assert!(note.contains("Read, Write, or Edit"), "got: {note}");
+        assert!(note.contains("same path"), "got: {note}");
+        assert!(note.contains("Do not call Bash, Glob, Grep"), "got: {note}");
+        assert!(note.contains("artifact_directed_attempt=2"), "got: {note}");
     }
 
     #[test]

@@ -469,9 +469,10 @@ pub struct Agent {
     /// satisfaction still uses `evidence_set_this_turn` so unrelated repo edits
     /// remain visible as progress without completing the required artifact.
     task_contract_evidence_set_this_turn: completion_evidence::EvidenceSet,
-    /// Issue #618: actor-loop-local artifact recovery target. Reset at the
-    /// start of every user turn; while populated, no-tool/prose-only/focused
-    /// edit/tool-format recovery all converge on the same artifact path.
+    /// Issue #618 / #622: actor-loop-local artifact recovery target. Reset at
+    /// the start of every user turn; while populated, task-contract recovery
+    /// can constrain file tools to this artifact without forcing focused-edit
+    /// mode immediately.
     current_artifact_recovery_target: Option<crate::agent::loop_run::task_contract::RecoveryTarget>,
 }
 
