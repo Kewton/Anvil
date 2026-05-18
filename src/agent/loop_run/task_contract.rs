@@ -44,12 +44,6 @@ pub(super) enum CompletionDecision {
     Done,
 }
 
-impl CompletionDecision {
-    pub(super) fn is_continue(&self) -> bool {
-        matches!(self, CompletionDecision::Continue { .. })
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RecoveryTargetHint {
     pub(super) role: ArtifactRole,
@@ -72,6 +66,172 @@ impl RecoveryTarget {
             path: hint.path,
             reason: hint.reason,
             attempt,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ArtifactStateKind {
+    ExistsButUnverified,
+    ChangedThisTurn,
+    ScaffoldUnchanged,
+    #[allow(dead_code)]
+    Verified,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ArtifactState {
+    pub(super) role: ArtifactRole,
+    pub(super) path: Option<String>,
+    pub(super) kind: ArtifactStateKind,
+}
+
+impl ArtifactState {
+    pub(super) fn exists(role: ArtifactRole, path: impl Into<String>) -> Self {
+        Self {
+            role,
+            path: Some(path.into()),
+            kind: ArtifactStateKind::ExistsButUnverified,
+        }
+    }
+
+    pub(super) fn scaffold(role: ArtifactRole, path: impl Into<String>) -> Self {
+        Self {
+            role,
+            path: Some(path.into()),
+            kind: ArtifactStateKind::ScaffoldUnchanged,
+        }
+    }
+
+    pub(super) fn changed(role: ArtifactRole) -> Self {
+        Self {
+            role,
+            path: None,
+            kind: ArtifactStateKind::ChangedThisTurn,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum VerifierRepairState {
+    None,
+    WaitingForEdit {
+        target_hint: Option<RecoveryTargetHint>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ArtifactRecoveryAction {
+    Continue {
+        missing: Vec<ArtifactRole>,
+        target_hint: Option<RecoveryTargetHint>,
+    },
+    RunVerifier,
+    RepairArtifact {
+        target_hint: Option<RecoveryTargetHint>,
+    },
+    Done,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ArtifactRecoveryInputs<'a> {
+    pub(super) contract: &'a TaskContract,
+    pub(super) evidence: &'a EvidenceSet,
+    pub(super) artifacts: &'a [ArtifactState],
+    pub(super) repair_state: &'a VerifierRepairState,
+}
+
+pub(super) fn plan_artifact_recovery(inputs: ArtifactRecoveryInputs<'_>) -> ArtifactRecoveryAction {
+    if matches!(inputs.contract.intent, TaskIntent::Explain) {
+        return ArtifactRecoveryAction::Done;
+    }
+
+    if let VerifierRepairState::WaitingForEdit { target_hint } = inputs.repair_state {
+        return ArtifactRecoveryAction::RepairArtifact {
+            target_hint: target_hint.clone(),
+        };
+    }
+
+    let observed = observed_artifacts(inputs.evidence);
+    let verifier_passed = has_build_test_verifier(inputs.evidence);
+    let mut missing = Vec::new();
+    for role in &inputs.contract.required_artifacts {
+        if observed.contains(role) || artifact_ready_for_verification(inputs.artifacts, *role) {
+            continue;
+        }
+        missing.push(*role);
+    }
+
+    if !missing.is_empty() {
+        return ArtifactRecoveryAction::Continue {
+            target_hint: recovery_target_hint_for_missing(inputs.artifacts, &missing),
+            missing,
+        };
+    }
+
+    let existing_unverified_used = inputs.artifacts.iter().any(|artifact| {
+        inputs.contract.required_artifacts.contains(&artifact.role)
+            && artifact.kind == ArtifactStateKind::ExistsButUnverified
+            && !observed.contains(&artifact.role)
+    });
+    let code_or_test_required = inputs.contract.required_artifacts.iter().any(|role| {
+        matches!(
+            role,
+            ArtifactRole::Implementation | ArtifactRole::Test | ArtifactRole::Setup
+        )
+    });
+
+    if !verifier_passed
+        && (inputs.contract.verification_required
+            || (existing_unverified_used && code_or_test_required))
+    {
+        return ArtifactRecoveryAction::RunVerifier;
+    }
+
+    inputs.contract.evaluate(inputs.evidence).into()
+}
+
+fn artifact_ready_for_verification(artifacts: &[ArtifactState], role: ArtifactRole) -> bool {
+    artifacts.iter().any(|artifact| {
+        artifact.role == role
+            && matches!(
+                artifact.kind,
+                ArtifactStateKind::ExistsButUnverified
+                    | ArtifactStateKind::ChangedThisTurn
+                    | ArtifactStateKind::Verified
+            )
+    })
+}
+
+fn recovery_target_hint_for_missing(
+    artifacts: &[ArtifactState],
+    missing: &[ArtifactRole],
+) -> Option<RecoveryTargetHint> {
+    let role = missing.first().copied()?;
+    artifacts
+        .iter()
+        .find(|artifact| {
+            artifact.role == role && artifact.kind == ArtifactStateKind::ScaffoldUnchanged
+        })
+        .and_then(|artifact| {
+            artifact.path.as_ref().map(|path| RecoveryTargetHint {
+                role,
+                path: path.clone(),
+                reason: "bootstrap scaffold artifact for the missing role is still unchanged"
+                    .to_string(),
+            })
+        })
+}
+
+impl From<CompletionDecision> for ArtifactRecoveryAction {
+    fn from(decision: CompletionDecision) -> Self {
+        match decision {
+            CompletionDecision::Continue { missing } => ArtifactRecoveryAction::Continue {
+                missing,
+                target_hint: None,
+            },
+            CompletionDecision::Verify => ArtifactRecoveryAction::RunVerifier,
+            CompletionDecision::Done => ArtifactRecoveryAction::Done,
         }
     }
 }
@@ -185,7 +345,8 @@ pub(super) fn render_contract_recovery_note_with_hint(
     note
 }
 
-pub(super) fn missing_labels(decision: &CompletionDecision) -> Vec<&'static str> {
+#[cfg(test)]
+fn missing_labels(decision: &CompletionDecision) -> Vec<&'static str> {
     match decision {
         CompletionDecision::Continue { missing } => {
             missing.iter().map(|role| role.label()).collect()
@@ -623,6 +784,102 @@ mod tests {
         assert_eq!(contract.evaluate(&evidence), CompletionDecision::Verify);
         evidence.push(build_test());
         assert_eq!(contract.evaluate(&evidence), CompletionDecision::Done);
+    }
+
+    #[test]
+    fn controller_runs_verifier_when_existing_candidates_cover_required_artifacts() {
+        let contract = TaskContract::from_request(
+            "ToDo管理のバックエンドをFastAPIで開発してください。使用方法をREADME.mdに記述してください。テストコードも実装してください。",
+        );
+        let evidence = EvidenceSet::new();
+        let artifacts = vec![
+            ArtifactState::exists(ArtifactRole::Implementation, "app/main.py"),
+            ArtifactState::exists(ArtifactRole::Test, "tests/test_todos.py"),
+            ArtifactState::exists(ArtifactRole::UsageDocs, "README.md"),
+        ];
+        let repair_state = VerifierRepairState::None;
+
+        assert_eq!(
+            plan_artifact_recovery(ArtifactRecoveryInputs {
+                contract: &contract,
+                evidence: &evidence,
+                artifacts: &artifacts,
+                repair_state: &repair_state,
+            }),
+            ArtifactRecoveryAction::RunVerifier
+        );
+    }
+
+    #[test]
+    fn controller_does_not_count_unchanged_scaffold_as_verifier_ready() {
+        let contract = TaskContract::from_request(
+            "FastAPIでCRUD APIを作成してREADMEとテストも追加してください",
+        );
+        let evidence = EvidenceSet::new();
+        let artifacts = vec![
+            ArtifactState::scaffold(ArtifactRole::Implementation, "app/main.py"),
+            ArtifactState::scaffold(ArtifactRole::Test, "tests/test_health.py"),
+            ArtifactState::scaffold(ArtifactRole::UsageDocs, "README.md"),
+        ];
+        let repair_state = VerifierRepairState::None;
+
+        let action = plan_artifact_recovery(ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &evidence,
+            artifacts: &artifacts,
+            repair_state: &repair_state,
+        });
+
+        assert_eq!(
+            action,
+            ArtifactRecoveryAction::Continue {
+                missing: vec![
+                    ArtifactRole::Implementation,
+                    ArtifactRole::Test,
+                    ArtifactRole::UsageDocs,
+                ],
+                target_hint: Some(RecoveryTargetHint {
+                    role: ArtifactRole::Implementation,
+                    path: "app/main.py".to_string(),
+                    reason: "bootstrap scaffold artifact for the missing role is still unchanged"
+                        .to_string(),
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn controller_blocks_verifier_rerun_while_repair_edit_is_pending() {
+        let contract = TaskContract::from_request(
+            "FastAPIでCRUD APIを作成してREADMEとテストも追加してください",
+        );
+        let evidence = EvidenceSet::new();
+        let artifacts = vec![
+            ArtifactState::exists(ArtifactRole::Implementation, "app/main.py"),
+            ArtifactState::exists(ArtifactRole::Test, "tests/test_todos.py"),
+            ArtifactState::exists(ArtifactRole::UsageDocs, "README.md"),
+        ];
+        let target_hint = RecoveryTargetHint {
+            role: ArtifactRole::Test,
+            path: "tests/test_todos.py".to_string(),
+            reason: "verifier output or changed files identify this artifact as repair target"
+                .to_string(),
+        };
+        let repair_state = VerifierRepairState::WaitingForEdit {
+            target_hint: Some(target_hint.clone()),
+        };
+
+        assert_eq!(
+            plan_artifact_recovery(ArtifactRecoveryInputs {
+                contract: &contract,
+                evidence: &evidence,
+                artifacts: &artifacts,
+                repair_state: &repair_state,
+            }),
+            ArtifactRecoveryAction::RepairArtifact {
+                target_hint: Some(target_hint),
+            }
+        );
     }
 
     #[test]

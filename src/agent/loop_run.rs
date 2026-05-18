@@ -474,6 +474,11 @@ pub struct Agent {
     /// can constrain file tools to this artifact without forcing focused-edit
     /// mode immediately.
     current_artifact_recovery_target: Option<crate::agent::loop_run::task_contract::RecoveryTarget>,
+    /// Issue #623 follow-up: verifier repair is a repository-level diagnostic
+    /// phase, not a single-artifact completion phase. While this is true, the
+    /// loop disables path-focused edit policies and allows normal project-file
+    /// inspection plus Write/Edit until a repository edit lands.
+    task_contract_verifier_repair_pending: bool,
 }
 
 /// Issue #594: state machine for the `/photon-why` slash command. Lives at
@@ -596,6 +601,7 @@ impl Agent {
             evidence_set_this_turn: completion_evidence::EvidenceSet::new(),
             task_contract_evidence_set_this_turn: completion_evidence::EvidenceSet::new(),
             current_artifact_recovery_target: None,
+            task_contract_verifier_repair_pending: false,
         }
     }
 }
