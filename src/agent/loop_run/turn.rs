@@ -1383,6 +1383,12 @@ fn task_contract_verifier_repair_note(
     )
 }
 
+fn task_contract_verifier_edit_required_note(attempt: usize, attempt_limit: usize) -> String {
+    format!(
+        "[Task Contract Verification] The verifier already failed and no repository edit has been made since that diagnostic. Do not rerun verification and do not answer in prose. Emit exactly one Write or Edit tool call that repairs the failing implementation, tests, or setup. task_contract_verify_edit_attempt={attempt}/{attempt_limit}"
+    )
+}
+
 fn task_contract_no_verifier_note(attempt: usize, attempt_limit: usize) -> String {
     format!(
         "[Task Contract Verification] Required artifacts are present, but no runnable verifier was detected for this workspace. Do not finish with prose. Add or fix a project-local verification path, such as a test command, test configuration, or missing dependency metadata, then continue. task_contract_verify_attempt={attempt}/{attempt_limit}"
@@ -4236,6 +4242,7 @@ impl Agent {
         let mut focused_policy_retries = 0usize;
         let mut contract_completion_retries = 0usize;
         let mut contract_verification_retries = 0usize;
+        let mut contract_verifier_repair_edit_count: Option<usize> = None;
         let mut task_contract_verifier_passed_in_loop = false;
         let mut task_contract_verify_commands_collected = Vec::<String>::new();
         let mut python_test_retries = 0usize;
@@ -5748,6 +5755,35 @@ impl Agent {
                 &self.task_contract_evidence_set_this_turn,
             );
             if task_contract_verify_pending {
+                if contract_verifier_repair_edit_count
+                    .is_some_and(|edit_count| repo_edit_calls_made_this_turn <= edit_count)
+                {
+                    repo_change_retries += 1;
+                    if repo_change_retries >= 3 {
+                        exit_reason = ExitReason::MissingRepoEdits;
+                        error_text =
+                            "assistant stopped before repairing the verifier failure".to_string();
+                        break 'outer;
+                    }
+                    write_stdout_rendered(
+                        &format_iteration_status(
+                            last_iter,
+                            self.config.max_iterations,
+                            "Retry requested",
+                            "Verifier repair requires a repository edit before verification is retried.",
+                            self.footer.current_cols(),
+                        ),
+                        true,
+                    );
+                    if !self.push_artifact_directed_recovery_note(repo_change_retries) {
+                        self.push_system_note(task_contract_verifier_edit_required_note(
+                            repo_change_retries,
+                            TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT,
+                        ));
+                    }
+                    continue;
+                }
+                contract_verifier_repair_edit_count = None;
                 self.clear_artifact_recovery_target("verify_pending");
                 let current_verif = verify_repo_progress(&before_snapshot, &self.work_root);
                 let changed_files = changed_files_for_verifier(&accumulated, &current_verif);
@@ -5798,6 +5834,18 @@ impl Agent {
                                 crate::session::feedback::mask_secrets(&output)
                             );
                             break 'outer;
+                        }
+                        contract_verifier_repair_edit_count = Some(repo_edit_calls_made_this_turn);
+                        if let Some(hint) = verifier_repair_target_hint_from_output(
+                            &self.work_root,
+                            &output,
+                            &changed_files,
+                        ) {
+                            let target = super::task_contract::RecoveryTarget::from_hint(
+                                hint,
+                                contract_verification_retries,
+                            );
+                            self.current_artifact_recovery_target = Some(target);
                         }
                         repo_change_retries = 0;
                         no_tool_retries = 0;
@@ -11469,16 +11517,50 @@ fn existing_workspace_candidate_for_role(
     work_root: &Path,
     role: super::task_contract::ArtifactRole,
 ) -> Option<String> {
-    let files = meaningful_workspace_files(work_root, 64)?;
-    files
+    let mut candidates = meaningful_workspace_files(work_root, 64)?
         .into_iter()
-        .find(|path| {
+        .filter(|path| {
             artifact_role_from_repo_edit_category(
                 super::completion_evidence::classify_repo_edit_path(path),
             )
             .is_some_and(|candidate| candidate == role)
         })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|path| {
+        scaffold_candidate_priority(work_root, role, &path.to_string_lossy().replace('\\', "/"))
+    });
+    candidates
+        .first()
         .map(|path| path.to_string_lossy().replace('\\', "/"))
+}
+
+fn verifier_repair_target_hint_from_output(
+    work_root: &Path,
+    output: &str,
+    changed_files: &[String],
+) -> Option<super::task_contract::RecoveryTargetHint> {
+    let mut candidates = extract_path_tokens_from_text(output, work_root);
+    candidates.extend(changed_files.iter().cloned());
+    for path in candidates {
+        let Ok(resolved) = resolve_user_path(work_root, &path) else {
+            continue;
+        };
+        if !resolved.is_file() {
+            continue;
+        }
+        let category =
+            super::completion_evidence::classify_repo_edit_path(std::path::Path::new(&path));
+        let Some(role) = artifact_role_from_repo_edit_category(category) else {
+            continue;
+        };
+        return Some(super::task_contract::RecoveryTargetHint {
+            role,
+            path: path.replace('\\', "/"),
+            reason: "verifier output or changed files identify this artifact as repair target"
+                .to_string(),
+        });
+    }
+    None
 }
 
 fn artifact_role_from_repo_edit_category(
@@ -13317,16 +13399,16 @@ mod progress_tests {
         deterministic_empty_framework_game_files, deterministic_framework_app_files_needed,
         deterministic_framework_game_files_needed, deterministic_support_target_relative,
         effective_tool_batch_action, effective_tool_policy_error_for_call,
-        extract_page_copy_block_from_numbered_read, first_existing_impl_target,
-        focused_edit_compact_anchor_note, focused_edit_compact_recovery_anchor,
-        focused_edit_exact_anchor_history, focused_edit_exact_recovery_anchor,
-        focused_edit_first_slice_note, focused_edit_first_slice_uses_exact_anchor,
-        focused_edit_guidance_note, focused_edit_history, focused_edit_max_predict_override,
-        focused_edit_minimal_history, focused_edit_policy_violation_feedback_note,
-        focused_edit_second_slice_note, focused_edit_target_already_read,
-        focused_edit_timeout_override_secs, focused_edit_tool_batch_action,
-        focused_edit_tool_policy_error, focused_read_target_for_directory,
-        format_blocked_progress_line, format_progress_line,
+        existing_workspace_candidate_for_role, extract_page_copy_block_from_numbered_read,
+        first_existing_impl_target, focused_edit_compact_anchor_note,
+        focused_edit_compact_recovery_anchor, focused_edit_exact_anchor_history,
+        focused_edit_exact_recovery_anchor, focused_edit_first_slice_note,
+        focused_edit_first_slice_uses_exact_anchor, focused_edit_guidance_note,
+        focused_edit_history, focused_edit_max_predict_override, focused_edit_minimal_history,
+        focused_edit_policy_violation_feedback_note, focused_edit_second_slice_note,
+        focused_edit_target_already_read, focused_edit_timeout_override_secs,
+        focused_edit_tool_batch_action, focused_edit_tool_policy_error,
+        focused_read_target_for_directory, format_blocked_progress_line, format_progress_line,
         framework_app_fallback_continuation_note, has_successful_non_plan_repo_edit,
         has_successful_non_plan_repo_edit_after_latest_truncated_tool_call,
         has_successful_repo_edit, implementation_quality_issue_for_request, is_utf8_locale,
@@ -13341,8 +13423,9 @@ mod progress_tests {
         scaffold_file_snapshot, sha256_hex, should_apply_repo_change_quality_gate,
         should_try_framework_app_fallback, should_use_streaming_transport,
         strip_read_line_number_prefix, successful_non_plan_repo_edit_count,
-        successful_repo_edit_count, sync_package_json_with_existing_lock, tool_color, tool_display,
-        tool_emoji, unicode_supported, workspace_appears_empty,
+        successful_repo_edit_count, sync_package_json_with_existing_lock,
+        task_contract_verifier_edit_required_note, tool_color, tool_display, tool_emoji,
+        unicode_supported, verifier_repair_target_hint_from_output, workspace_appears_empty,
     };
     use crate::agent::recovery::ActionExpectation;
     use crate::modes::plan_act::{ExecutionMode, PlanStage};
@@ -15119,6 +15202,73 @@ export default function App() {
         std::fs::write(nuxt_root.join("app.vue"), "<template><main /></template>\n").unwrap();
         let target = first_existing_impl_target(nuxt_root).unwrap();
         assert!(target.ends_with("app.vue"), "got: {}", target.display());
+    }
+
+    #[test]
+    fn existing_workspace_implementation_candidate_prefers_main_over_package_init() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        std::fs::create_dir_all(work_root.join("tests")).unwrap();
+        std::fs::write(work_root.join("app/__init__.py"), "").unwrap();
+        std::fs::write(
+            work_root.join("app/main.py"),
+            "from fastapi import FastAPI\n",
+        )
+        .unwrap();
+        std::fs::write(
+            work_root.join("tests/test_health.py"),
+            "def test_health(): pass\n",
+        )
+        .unwrap();
+        std::fs::write(work_root.join("README.md"), "# Scaffold\n").unwrap();
+
+        let target = existing_workspace_candidate_for_role(
+            work_root,
+            super::super::task_contract::ArtifactRole::Implementation,
+        )
+        .unwrap();
+
+        assert_eq!(target, "app/main.py");
+    }
+
+    #[test]
+    fn verifier_repair_target_prefers_failed_test_path_from_output() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        std::fs::create_dir_all(work_root.join("tests")).unwrap();
+        std::fs::write(
+            work_root.join("app/main.py"),
+            "from fastapi import FastAPI\n",
+        )
+        .unwrap();
+        std::fs::write(
+            work_root.join("tests/test_health.py"),
+            "def test_health(): pass\n",
+        )
+        .unwrap();
+        std::fs::write(work_root.join("README.md"), "# Scaffold\n").unwrap();
+        let output = "FAILED tests/test_health.py::test_get_todos - AssertionError";
+        let changed = vec![
+            "README.md".to_string(),
+            "app/main.py".to_string(),
+            "tests/test_health.py".to_string(),
+        ];
+
+        let hint = verifier_repair_target_hint_from_output(work_root, output, &changed).unwrap();
+
+        assert_eq!(hint.path, "tests/test_health.py");
+        assert_eq!(hint.role, super::super::task_contract::ArtifactRole::Test);
+    }
+
+    #[test]
+    fn verifier_edit_required_note_blocks_prose_and_rerun() {
+        let note = task_contract_verifier_edit_required_note(2, 3);
+        assert!(note.contains("no repository edit"), "got: {note}");
+        assert!(note.contains("Do not rerun verification"), "got: {note}");
+        assert!(note.contains("Write or Edit"), "got: {note}");
+        assert!(note.contains("task_contract_verify_edit_attempt=2/3"));
     }
 
     #[test]
