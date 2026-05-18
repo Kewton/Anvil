@@ -90,6 +90,16 @@ struct ArtifactDirectedPolicy {
     target: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VerifierRepairDecision {
+    NoRepair,
+    NeedTargetDiscovery,
+    NeedFreshRead(PathBuf),
+    NeedWrite(PathBuf),
+    NeedEdit(PathBuf),
+    ReadyToVerify,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EffectiveToolPolicyReason {
     Unrestricted,
@@ -1348,6 +1358,7 @@ struct TaskContractVerifierFlowArgs<'a, 'b> {
     contract_verification_retries: &'b mut usize,
     contract_verifier_repair_edit_count: &'b mut Option<usize>,
     repo_change_retries: &'b mut usize,
+    verifier_repair_retries: &'b mut usize,
     task_contract_verify_commands_collected: &'b mut Vec<String>,
     task_contract_verifier_passed_in_loop: &'b mut bool,
     last_iter: usize,
@@ -1447,6 +1458,12 @@ fn task_contract_verifier_edit_required_note(attempt: usize, attempt_limit: usiz
     )
 }
 
+fn task_contract_verifier_target_discovery_note(attempt: usize, attempt_limit: usize) -> String {
+    format!(
+        "[Task Contract Verification] The verifier already failed, but Anvil did not identify a safe workspace repair target yet. Do not rerun verification and do not answer in prose. Emit exactly one Read, Glob, or Grep tool call to identify the local file to repair. Do not use Bash, Write, or Edit until a target file is known. task_contract_verify_discovery_attempt={attempt}/{attempt_limit}"
+    )
+}
+
 fn task_contract_verifier_targeted_edit_required_note(
     context: &super::VerifierRepairContext,
     work_root: &Path,
@@ -1474,7 +1491,7 @@ fn task_contract_verifier_targeted_edit_required_note(
     let next_action = if target_already_read {
         "Use exactly one compact Edit on that target file now."
     } else {
-        "Use one Read on that target file if needed, then repair it with Edit."
+        "Use exactly one Read on that target file now. After the fresh Read, Anvil will request the compact repair Edit."
     };
     let repeated = if context.repair_attempt > 1 {
         " The same verifier failure signature is still present after a previous repair edit."
@@ -4339,6 +4356,7 @@ impl Agent {
         let mut empty_retries = 0usize;
         let mut no_tool_retries = 0usize;
         let mut repo_change_retries = 0usize;
+        let mut verifier_repair_retries = 0usize;
         let mut focused_policy_retries = 0usize;
         let mut contract_completion_retries = 0usize;
         let mut contract_verification_retries = 0usize;
@@ -4403,6 +4421,7 @@ impl Agent {
                     contract_verification_retries: &mut contract_verification_retries,
                     contract_verifier_repair_edit_count: &mut contract_verifier_repair_edit_count,
                     repo_change_retries: &mut repo_change_retries,
+                    verifier_repair_retries: &mut verifier_repair_retries,
                     task_contract_verify_commands_collected:
                         &mut task_contract_verify_commands_collected,
                     task_contract_verifier_passed_in_loop:
@@ -4622,9 +4641,9 @@ impl Agent {
                             true,
                         );
                         if let Some(policy) = focused_retry {
-                            self.push_system_note(self.focused_edit_no_tool_note_for_target(
-                                &policy.target,
-                                policy.target_already_read,
+                            self.push_system_note(self.focused_edit_no_tool_note_for_policy(
+                                &policy,
+                                &effective_tool_policy,
                                 focused_policy_retries,
                             ));
                         } else {
@@ -5477,8 +5496,8 @@ impl Agent {
                         continue;
                     }
                     super::task_contract::ArtifactRecoveryAction::RepairArtifact { .. } => {
-                        repo_change_retries += 1;
-                        if repo_change_retries >= 3 {
+                        verifier_repair_retries += 1;
+                        if verifier_repair_retries >= 3 {
                             exit_reason = ExitReason::MissingRepoEdits;
                             error_text = "assistant stopped before repairing the verifier failure"
                                 .to_string();
@@ -5494,11 +5513,11 @@ impl Agent {
                             ),
                             true,
                         );
-                        if !self.push_verifier_repair_recovery_note(repo_change_retries)
-                            && !self.push_artifact_directed_recovery_note(repo_change_retries)
+                        if !self.push_verifier_repair_recovery_note(verifier_repair_retries)
+                            && !self.push_artifact_directed_recovery_note(verifier_repair_retries)
                         {
                             self.push_system_note(task_contract_verifier_edit_required_note(
-                                repo_change_retries,
+                                verifier_repair_retries,
                                 TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT,
                             ));
                         }
@@ -5514,6 +5533,7 @@ impl Agent {
                             contract_verifier_repair_edit_count:
                                 &mut contract_verifier_repair_edit_count,
                             repo_change_retries: &mut repo_change_retries,
+                            verifier_repair_retries: &mut verifier_repair_retries,
                             task_contract_verify_commands_collected:
                                 &mut task_contract_verify_commands_collected,
                             task_contract_verifier_passed_in_loop:
@@ -6630,6 +6650,7 @@ impl Agent {
                     args.task_contract_verify_commands_collected.push(sanitized);
                 }
                 self.verifier_repair_context = None;
+                *args.verifier_repair_retries = 0;
                 *args.task_contract_verifier_passed_in_loop = true;
                 TaskContractVerifierFlowOutcome::Done {
                     final_prose: format!(
@@ -6662,6 +6683,7 @@ impl Agent {
                 );
                 self.verifier_repair_context = Some(repair_context);
                 *args.repo_change_retries = 0;
+                *args.verifier_repair_retries = 0;
                 write_stdout_rendered(
                     &format_iteration_status(
                         args.last_iter,
@@ -6696,6 +6718,7 @@ impl Agent {
                 self.task_contract_verifier_repair_pending = true;
                 self.verifier_repair_context = None;
                 *args.repo_change_retries = 0;
+                *args.verifier_repair_retries = 0;
                 write_stdout_rendered(
                     &format_iteration_status(
                         args.last_iter,
@@ -7778,11 +7801,14 @@ impl Agent {
             ) {
                 messages.push(ConversationMessage::system(note));
             }
-            messages.push(ConversationMessage::system(focused_edit_guidance_note(
-                &target,
-                &self.work_root,
-                focused_edit_target_already_read,
-            )));
+            messages.push(ConversationMessage::system(
+                focused_edit_guidance_note_for_policy(
+                    effective_tool_policy,
+                    &target,
+                    &self.work_root,
+                    focused_edit_target_already_read,
+                ),
+            ));
             if compact_anchor.is_some() {
                 messages.push(ConversationMessage::system(
                     focused_edit_compact_anchor_note(&target, &self.work_root),
@@ -7849,16 +7875,7 @@ impl Agent {
             }
         }
         if self.task_contract_verifier_repair_pending {
-            if let Some(target) = self.verifier_repair_target_path() {
-                return self.focused_edit_policy_for_target(
-                    target,
-                    EffectiveToolPolicyReason::VerifierRepair,
-                );
-            }
-            return EffectiveToolPolicy::restricted(
-                EffectiveToolPolicyReason::VerifierRepair,
-                vec!["Read", "Glob", "Grep", "Write", "Edit"],
-            );
+            return verifier_repair_policy_for_decision(self.verifier_repair_decision_for_policy());
         }
         if let Some(target) = self.forced_small_edit_recovery_target() {
             return self.focused_edit_policy_for_target(
@@ -7884,6 +7901,17 @@ impl Agent {
         EffectiveToolPolicy::unrestricted()
     }
 
+    fn verifier_repair_decision_for_policy(&self) -> VerifierRepairDecision {
+        verifier_repair_decision(
+            self.task_contract_verifier_repair_pending,
+            self.verifier_repair_context.as_ref(),
+            &self.session.messages,
+            &self.work_root,
+            None,
+            0,
+        )
+    }
+
     fn focused_edit_policy_for_target(
         &self,
         target: PathBuf,
@@ -7903,11 +7931,6 @@ impl Agent {
                 target_already_read,
             )
         }
-    }
-
-    fn verifier_repair_target_path(&self) -> Option<PathBuf> {
-        let context = self.verifier_repair_context.as_ref()?;
-        verifier_repair_context_target_path(&self.work_root, context)
     }
 
     fn tool_specs_for_policy(&self, policy: &EffectiveToolPolicy) -> Vec<ToolSpec> {
@@ -8152,22 +8175,62 @@ impl Agent {
     }
 
     fn push_verifier_repair_recovery_note(&mut self, attempt: usize) -> bool {
-        let Some(context) = self.verifier_repair_context.as_ref() else {
-            return false;
-        };
-        let Some(target) = verifier_repair_context_target_path(&self.work_root, context) else {
-            return false;
-        };
-        let target_already_read =
-            focused_edit_target_already_read(&self.session.messages, &target, &self.work_root);
-        self.push_system_note(task_contract_verifier_targeted_edit_required_note(
-            context,
-            &self.work_root,
-            target_already_read,
-            attempt,
-            TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT,
-        ));
-        true
+        match self.verifier_repair_decision_for_policy() {
+            VerifierRepairDecision::NeedTargetDiscovery => {
+                self.push_system_note(task_contract_verifier_target_discovery_note(
+                    attempt,
+                    TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT,
+                ));
+                true
+            }
+            VerifierRepairDecision::NeedFreshRead(target) => {
+                if let Some(context) = self.verifier_repair_context.as_ref() {
+                    self.push_system_note(task_contract_verifier_targeted_edit_required_note(
+                        context,
+                        &self.work_root,
+                        focused_edit_target_already_read(
+                            &self.session.messages,
+                            &target,
+                            &self.work_root,
+                        ),
+                        attempt,
+                        TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT,
+                    ));
+                } else {
+                    let target_display = verifier_repair_target_display(&target, &self.work_root);
+                    self.push_system_note(format!(
+                        "[Task Contract Verification] The verifier failed and repair target discovery selected {target_display}. Emit exactly one Read on that file now. Do not run Bash, switch files, or answer in prose. task_contract_verify_read_attempt={attempt}/{TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT}"
+                    ));
+                }
+                true
+            }
+            VerifierRepairDecision::NeedEdit(target) => {
+                if let Some(context) = self.verifier_repair_context.as_ref() {
+                    self.push_system_note(task_contract_verifier_targeted_edit_required_note(
+                        context,
+                        &self.work_root,
+                        true,
+                        attempt,
+                        TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT,
+                    ));
+                } else {
+                    let target_display = verifier_repair_target_display(&target, &self.work_root);
+                    self.push_system_note(format!(
+                        "[Task Contract Verification] The verifier failed and {target_display} is the discovered repair target. Emit exactly one compact Edit on that file now. Do not run Bash, switch files, or answer in prose. task_contract_verify_edit_attempt={attempt}/{TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT}"
+                    ));
+                }
+                true
+            }
+            VerifierRepairDecision::NeedWrite(target) => {
+                let target_display = verifier_repair_target_display(&target, &self.work_root);
+                self.push_system_note(recovery::focused_edit_missing_target_recovery_note(
+                    &target_display,
+                    attempt,
+                ));
+                true
+            }
+            VerifierRepairDecision::NoRepair | VerifierRepairDecision::ReadyToVerify => false,
+        }
     }
 
     fn push_artifact_directed_recovery_note(&mut self, attempt: usize) -> bool {
@@ -8208,6 +8271,45 @@ impl Agent {
         }
     }
 
+    fn focused_edit_no_tool_note_for_policy(
+        &self,
+        policy: &FocusedEditPolicy,
+        effective_tool_policy: &EffectiveToolPolicy,
+        attempt: usize,
+    ) -> String {
+        let target_display = progress_path_display(
+            &policy.target.display().to_string(),
+            &self.work_root,
+            self.session.mode_state.active_plan_path.as_deref(),
+            120,
+        );
+        if effective_tool_policy.reason() == EffectiveToolPolicyReason::VerifierRepair {
+            match effective_tool_policy.allowed_tool_names_for_prompt() {
+                Some(["Read"]) => {
+                    return format!(
+                        "Verifier repair is waiting for a fresh read of {target_display}. The previous response was not executed. Emit exactly one Read tool call on that file now. Do not call Edit, Bash, Glob, Grep, or answer in prose. verifier_repair_read_attempt={attempt}"
+                    );
+                }
+                Some(["Edit"]) => {
+                    return format!(
+                        "Verifier repair is waiting for a compact edit of {target_display}. The previous response was not executed. Emit exactly one Edit tool call on that file now. Do not call Read, Bash, Glob, Grep, or answer in prose. verifier_repair_edit_attempt={attempt}"
+                    );
+                }
+                Some(["Write"]) => {
+                    return format!(
+                        "Verifier repair is waiting for the missing target {target_display}. The previous response was not executed. Emit exactly one Write tool call on that exact path now. Do not call Read, Bash, Glob, Grep, or answer in prose. verifier_repair_write_attempt={attempt}"
+                    );
+                }
+                _ => {}
+            }
+        }
+        self.focused_edit_no_tool_note_for_target(
+            &policy.target,
+            policy.target_already_read,
+            attempt,
+        )
+    }
+
     fn artifact_directed_recovery_message(
         &self,
         effective_tool_policy: &EffectiveToolPolicy,
@@ -8231,35 +8333,54 @@ impl Agent {
         effective_tool_policy: &EffectiveToolPolicy,
     ) -> Option<String> {
         (effective_tool_policy.reason() == EffectiveToolPolicyReason::VerifierRepair).then(|| {
-            if let Some(context) = self.verifier_repair_context.as_ref()
-                && let Some(target) = verifier_repair_context_target_path(&self.work_root, context)
-            {
-                let target_display = target
-                    .strip_prefix(&self.work_root)
-                    .unwrap_or(&target)
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                let line = context
-                    .target_line
-                    .map(|line| format!(":{line}"))
-                    .unwrap_or_default();
-                let repeated = if context.repair_attempt > 1 {
-                    " The same failure signature is still present after a previous repair edit."
-                } else {
-                    ""
-                };
-                let error_kind = context
-                    .error_kind
-                    .as_ref()
-                    .map(|error| format!(" Error kind: {error}."))
-                    .unwrap_or_default();
-                format!(
-                    "[Verifier Repair Policy] A verifier failure is pending.{repeated} Failure signature: {}.{error_kind} Target file: {target_display}{line}. Use the allowed focused-edit tool on that target only; do not use Bash, switch files, or finish with prose. Anvil will rerun the verifier after the target file is edited.",
-                    context.failure_signature
-                )
-            } else {
-                "[Verifier Repair Policy] A verifier failure is pending. Use Read, Glob, or Grep to inspect project files if needed, then use Write or Edit to repair the repository. Do not run Bash or finish with prose; Anvil will rerun the verifier after a repository edit."
-                    .to_string()
+            let context = self.verifier_repair_context.as_ref();
+            let decision = self.verifier_repair_decision_for_policy();
+            let diagnostics = context
+                .map(|context| {
+                    let repeated = if context.repair_attempt > 1 {
+                        " The same failure signature is still present after a previous repair edit."
+                    } else {
+                        ""
+                    };
+                    let error_kind = context
+                        .error_kind
+                        .as_ref()
+                        .map(|error| format!(" Error kind: {error}."))
+                        .unwrap_or_default();
+                    format!(
+                        "{repeated} Failure signature: {}.{error_kind}",
+                        context.failure_signature
+                    )
+                })
+                .unwrap_or_else(|| " Failure signature: <unknown>.".to_string());
+            match decision {
+                VerifierRepairDecision::NeedFreshRead(target) => {
+                    let target_display = verifier_repair_target_display(&target, &self.work_root);
+                    format!(
+                        "[Verifier Repair Policy] A verifier failure is pending.{diagnostics} Target file: {target_display}. Next required action: exactly one Read on that target. Do not use Edit, Bash, switch files, or finish with prose."
+                    )
+                }
+                VerifierRepairDecision::NeedEdit(target) => {
+                    let target_display = verifier_repair_target_display(&target, &self.work_root);
+                    format!(
+                        "[Verifier Repair Policy] A verifier failure is pending.{diagnostics} Target file: {target_display}. Next required action: exactly one compact Edit on that target. Do not call Read again, Bash, switch files, or finish with prose. Anvil will rerun the verifier after the edit."
+                    )
+                }
+                VerifierRepairDecision::NeedWrite(target) => {
+                    let target_display = verifier_repair_target_display(&target, &self.work_root);
+                    format!(
+                        "[Verifier Repair Policy] A verifier failure is pending.{diagnostics} Missing target file: {target_display}. Next required action: exactly one Write on that target. Do not use Bash, switch files, or finish with prose. Anvil will rerun the verifier after the write."
+                    )
+                }
+                VerifierRepairDecision::NeedTargetDiscovery => {
+                    format!(
+                        "[Verifier Repair Policy] A verifier failure is pending.{diagnostics} No safe repair target was identified yet. Next required action: inspect with exactly one Read, Glob, or Grep. Do not use Bash, Write, Edit, or finish with prose until a target file is known."
+                    )
+                }
+                VerifierRepairDecision::NoRepair | VerifierRepairDecision::ReadyToVerify => {
+                    "[Verifier Repair Policy] A verifier repair transition is pending. Do not answer in prose; wait for Anvil to drive the next verifier step."
+                        .to_string()
+                }
             }
         })
     }
@@ -8629,14 +8750,26 @@ impl Agent {
         repair_edit_count: Option<usize>,
         repo_edit_calls_made_this_turn: usize,
     ) -> super::task_contract::VerifierRepairState {
-        if repair_edit_count.is_some_and(|edit_count| repo_edit_calls_made_this_turn <= edit_count)
-        {
-            return super::task_contract::VerifierRepairState::WaitingForEdit {
-                target_hint: self
-                    .verifier_repair_context
-                    .as_ref()
-                    .and_then(|context| context.target_hint.clone()),
-            };
+        match verifier_repair_decision(
+            self.task_contract_verifier_repair_pending,
+            self.verifier_repair_context.as_ref(),
+            &self.session.messages,
+            &self.work_root,
+            repair_edit_count,
+            repo_edit_calls_made_this_turn,
+        ) {
+            VerifierRepairDecision::NeedTargetDiscovery
+            | VerifierRepairDecision::NeedFreshRead(_)
+            | VerifierRepairDecision::NeedWrite(_)
+            | VerifierRepairDecision::NeedEdit(_) => {
+                return super::task_contract::VerifierRepairState::WaitingForEdit {
+                    target_hint: self
+                        .verifier_repair_context
+                        .as_ref()
+                        .and_then(|context| context.target_hint.clone()),
+                };
+            }
+            VerifierRepairDecision::NoRepair | VerifierRepairDecision::ReadyToVerify => {}
         }
         super::task_contract::VerifierRepairState::None
     }
@@ -12151,6 +12284,80 @@ fn verifier_repair_context_target_path(
     resolve_user_path(work_root, &hint.path).ok()
 }
 
+fn verifier_repair_decision(
+    pending: bool,
+    context: Option<&super::VerifierRepairContext>,
+    messages: &[ConversationMessage],
+    work_root: &Path,
+    repair_edit_count: Option<usize>,
+    repo_edit_calls_made_this_turn: usize,
+) -> VerifierRepairDecision {
+    if !pending {
+        return VerifierRepairDecision::NoRepair;
+    }
+    if repair_edit_count.is_some_and(|edit_count| repo_edit_calls_made_this_turn > edit_count) {
+        return VerifierRepairDecision::ReadyToVerify;
+    }
+    let target = context
+        .and_then(|context| verifier_repair_context_target_path(work_root, context))
+        .or_else(|| {
+            latest_successful_read_existing_path(
+                messages,
+                work_root,
+                latest_verifier_repair_note_index(messages),
+            )
+        });
+    let Some(target) = target else {
+        return VerifierRepairDecision::NeedTargetDiscovery;
+    };
+    if !target.is_file() {
+        return VerifierRepairDecision::NeedWrite(target);
+    }
+    if focused_edit_target_already_read(messages, &target, work_root) {
+        VerifierRepairDecision::NeedEdit(target)
+    } else {
+        VerifierRepairDecision::NeedFreshRead(target)
+    }
+}
+
+fn verifier_repair_policy_for_decision(decision: VerifierRepairDecision) -> EffectiveToolPolicy {
+    match decision {
+        VerifierRepairDecision::NeedFreshRead(target) => EffectiveToolPolicy::focused_edit(
+            EffectiveToolPolicyReason::VerifierRepair,
+            vec!["Read"],
+            target,
+            false,
+        ),
+        VerifierRepairDecision::NeedWrite(target) => EffectiveToolPolicy::focused_edit(
+            EffectiveToolPolicyReason::VerifierRepair,
+            vec!["Write"],
+            target,
+            false,
+        ),
+        VerifierRepairDecision::NeedEdit(target) => EffectiveToolPolicy::focused_edit(
+            EffectiveToolPolicyReason::VerifierRepair,
+            vec!["Edit"],
+            target,
+            true,
+        ),
+        VerifierRepairDecision::NeedTargetDiscovery => EffectiveToolPolicy::restricted(
+            EffectiveToolPolicyReason::VerifierRepair,
+            vec!["Read", "Glob", "Grep"],
+        ),
+        VerifierRepairDecision::NoRepair | VerifierRepairDecision::ReadyToVerify => {
+            EffectiveToolPolicy::restricted(EffectiveToolPolicyReason::VerifierRepair, Vec::new())
+        }
+    }
+}
+
+fn verifier_repair_target_display(target: &Path, work_root: &Path) -> String {
+    target
+        .strip_prefix(work_root)
+        .unwrap_or(target)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
 fn artifact_role_from_repo_edit_category(
     category: super::completion_evidence::RepoEditCategory,
 ) -> Option<super::task_contract::ArtifactRole> {
@@ -12278,6 +12485,40 @@ fn focused_edit_guidance_note(
             "[Focused Edit Recovery] Keep this turn minimal. If you need context, do one Read on {path} first; otherwise use exactly one compact Edit. Do not attempt a full-file rewrite, multi-file change, scaffold command, or dev-server command. Replace only one contiguous block from the last Read and move the implementation forward with the first concrete slice."
         )
     }
+}
+
+fn focused_edit_guidance_note_for_policy(
+    policy: &EffectiveToolPolicy,
+    target: &Path,
+    work_root: &Path,
+    target_already_read: bool,
+) -> String {
+    if policy.reason() == EffectiveToolPolicyReason::VerifierRepair {
+        let path = target
+            .strip_prefix(work_root)
+            .unwrap_or(target)
+            .to_string_lossy()
+            .replace('\\', "/");
+        match policy.allowed_tool_names_for_prompt() {
+            Some(["Read"]) => {
+                return format!(
+                    "[Verifier Repair] The verifier failure target is {path}, but the current file contents have not been read since the latest target edit. The only available tool for this turn is Read. Emit exactly one Read on that file now. Do not call Edit, Bash, Glob, Grep, or answer in prose."
+                );
+            }
+            Some(["Edit"]) => {
+                return format!(
+                    "[Verifier Repair] The verifier failure target is {path} and its current contents have been read. The only available tool for this turn is Edit. Emit exactly one compact Edit on that file now. Do not call Read again, Bash, or answer in prose."
+                );
+            }
+            Some(["Write"]) => {
+                return format!(
+                    "[Verifier Repair] The verifier failure target {path} is missing. The only available tool for this turn is Write on that exact path. Do not call Read, Bash, Glob, Grep, or answer in prose."
+                );
+            }
+            _ => {}
+        }
+    }
+    focused_edit_guidance_note(target, work_root, target_already_read)
 }
 
 fn focused_edit_compact_anchor_note(target: &Path, work_root: &Path) -> String {
@@ -12660,13 +12901,92 @@ fn exchange_is_successful_read_for_target(
     target: &Path,
     work_root: &Path,
 ) -> bool {
-    exchange.tool_call.name == "Read"
+    exchange_is_successful_named_tool_for_target(exchange, &["Read"], target, work_root)
+}
+
+fn exchange_is_successful_write_or_edit_for_target(
+    exchange: &ToolExchange,
+    target: &Path,
+    work_root: &Path,
+) -> bool {
+    exchange_is_successful_named_tool_for_target(exchange, &["Write", "Edit"], target, work_root)
+}
+
+fn exchange_is_successful_named_tool_for_target(
+    exchange: &ToolExchange,
+    tool_names: &[&str],
+    target: &Path,
+    work_root: &Path,
+) -> bool {
+    tool_names.contains(&exchange.tool_call.name.as_str())
         && tool_call_path_matches_target(&exchange.tool_call, target, work_root)
         && exchange.result.as_ref().is_some_and(|result| {
             result.role == "tool"
-                && result.name.as_deref() == Some("Read")
+                && result.name.as_deref() == Some(exchange.tool_call.name.as_str())
                 && !result.content.trim_start().starts_with("Error:")
         })
+}
+
+fn latest_successful_read_existing_path(
+    messages: &[ConversationMessage],
+    work_root: &Path,
+    after_message_index: Option<usize>,
+) -> Option<PathBuf> {
+    let mut latest_existing = None;
+    for exchange in tool_exchanges(messages).into_iter().rev() {
+        if let Some(after_message_index) = after_message_index
+            && exchange
+                .result_index
+                .is_none_or(|result_index| result_index <= after_message_index)
+        {
+            continue;
+        }
+        if exchange.tool_call.name != "Read" {
+            continue;
+        }
+        if !exchange.result.as_ref().is_some_and(|result| {
+            result.role == "tool"
+                && result.name.as_deref() == Some("Read")
+                && !result.content.trim_start().starts_with("Error:")
+        }) {
+            continue;
+        }
+        let Some(path) = exchange
+            .tool_call
+            .arguments
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        let Ok(candidate) = resolve_user_path(work_root, path) else {
+            continue;
+        };
+        if !candidate.is_file() {
+            continue;
+        }
+        latest_existing.get_or_insert_with(|| candidate.clone());
+        if is_preferred_read_edit_target(&candidate) {
+            return Some(candidate);
+        }
+    }
+    latest_existing
+}
+
+fn latest_verifier_repair_note_index(messages: &[ConversationMessage]) -> Option<usize> {
+    messages.iter().rposition(|message| {
+        message.role == "system"
+            && (message.content.contains("task_contract_verify_attempt=")
+                || message
+                    .content
+                    .contains("task_contract_verify_edit_attempt=")
+                || message
+                    .content
+                    .contains("task_contract_verify_discovery_attempt=")
+                || message
+                    .content
+                    .contains("task_contract_verify_read_attempt="))
+    })
 }
 
 fn focused_edit_tool_policy_error(
@@ -12949,28 +13269,26 @@ fn latest_read_exchange_for_target(
     target: &Path,
     work_root: &Path,
 ) -> Option<(ConversationMessage, ConversationMessage)> {
-    for exchange in tool_exchanges(messages).into_iter().rev() {
-        if !exchange_is_successful_read_for_target(&exchange, target, work_root) {
+    let exchanges = tool_exchanges(messages);
+    for exchange in exchanges.iter().rev() {
+        if !exchange_is_successful_read_for_target(exchange, target, work_root) {
             continue;
         }
         let result_index = exchange.result_index?;
-        if messages[result_index + 1..]
-            .iter()
-            .any(is_successful_repo_edit_tool_result)
-        {
+        if exchanges.iter().any(|later| {
+            later
+                .result_index
+                .is_some_and(|later_index| later_index > result_index)
+                && exchange_is_successful_write_or_edit_for_target(later, target, work_root)
+        }) {
             continue;
         }
-        let assistant = ConversationMessage::assistant(String::new(), vec![exchange.tool_call]);
-        let tool_message = exchange.result?;
+        let assistant =
+            ConversationMessage::assistant(String::new(), vec![exchange.tool_call.clone()]);
+        let tool_message = exchange.result.clone()?;
         return Some((assistant, tool_message));
     }
     None
-}
-
-fn is_successful_repo_edit_tool_result(message: &ConversationMessage) -> bool {
-    message.role == "tool"
-        && matches!(message.name.as_deref(), Some("Write" | "Edit"))
-        && !message.content.trim_start().starts_with("Error:")
 }
 
 fn plan_sections_with_content(contents: &str) -> Vec<&'static str> {
@@ -14013,16 +14331,17 @@ mod truncate_tests {
 mod progress_tests {
     use super::{
         EffectiveToolPolicy, EffectiveToolPolicyReason, FocusedEditBatchAction,
-        artifact_directed_tool_policy_error, deterministic_empty_framework_app_files,
-        deterministic_empty_framework_game_files, deterministic_framework_app_files_needed,
-        deterministic_framework_game_files_needed, deterministic_support_target_relative,
-        effective_tool_batch_action, effective_tool_policy_error_for_call,
-        existing_workspace_candidate_for_role, extract_page_copy_block_from_numbered_read,
-        first_existing_impl_target, focused_edit_compact_anchor_note,
-        focused_edit_compact_recovery_anchor, focused_edit_exact_anchor_history,
-        focused_edit_exact_recovery_anchor, focused_edit_first_slice_note,
-        focused_edit_first_slice_uses_exact_anchor, focused_edit_guidance_note,
-        focused_edit_history, focused_edit_max_predict_override, focused_edit_minimal_history,
+        VerifierRepairDecision, artifact_directed_tool_policy_error,
+        deterministic_empty_framework_app_files, deterministic_empty_framework_game_files,
+        deterministic_framework_app_files_needed, deterministic_framework_game_files_needed,
+        deterministic_support_target_relative, effective_tool_batch_action,
+        effective_tool_policy_error_for_call, existing_workspace_candidate_for_role,
+        extract_page_copy_block_from_numbered_read, first_existing_impl_target,
+        focused_edit_compact_anchor_note, focused_edit_compact_recovery_anchor,
+        focused_edit_exact_anchor_history, focused_edit_exact_recovery_anchor,
+        focused_edit_first_slice_note, focused_edit_first_slice_uses_exact_anchor,
+        focused_edit_guidance_note, focused_edit_guidance_note_for_policy, focused_edit_history,
+        focused_edit_max_predict_override, focused_edit_minimal_history,
         focused_edit_policy_violation_feedback_note, focused_edit_second_slice_note,
         focused_edit_target_already_read, focused_edit_timeout_override_secs,
         focused_edit_tool_batch_action, focused_edit_tool_policy_error,
@@ -14042,10 +14361,11 @@ mod progress_tests {
         should_try_framework_app_fallback, should_use_streaming_transport,
         strip_read_line_number_prefix, successful_non_plan_repo_edit_count,
         successful_repo_edit_count, sync_package_json_with_existing_lock,
-        task_contract_verifier_edit_required_note, tool_color, tool_display, tool_emoji,
-        unicode_supported, verifier_repair_context_from_failure,
-        verifier_repair_target_candidate_from_output, verifier_repair_target_hint_from_output,
-        workspace_appears_empty,
+        task_contract_verifier_edit_required_note, task_contract_verifier_target_discovery_note,
+        tool_color, tool_display, tool_emoji, unicode_supported,
+        verifier_repair_context_from_failure, verifier_repair_decision,
+        verifier_repair_policy_for_decision, verifier_repair_target_candidate_from_output,
+        verifier_repair_target_hint_from_output, workspace_appears_empty,
     };
     use crate::agent::recovery::ActionExpectation;
     use crate::modes::plan_act::{ExecutionMode, PlanStage};
@@ -14861,10 +15181,213 @@ mod progress_tests {
     }
 
     #[test]
+    fn focused_edit_target_read_survives_unrelated_repo_edit() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        let target = work_root.join("app").join("main.py");
+        let other = work_root.join("README.md");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "from fastapi import FastAPI\n").unwrap();
+        std::fs::write(&other, "# App\n").unwrap();
+        let messages = vec![
+            ConversationMessage::assistant(
+                String::new(),
+                vec![ToolCall {
+                    id: "xml-1".to_string(),
+                    name: "Read".to_string(),
+                    arguments: json!({"path":"app/main.py"}),
+                }],
+            ),
+            ConversationMessage::tool(
+                "Read".to_string(),
+                "1: from fastapi import FastAPI".to_string(),
+            ),
+            ConversationMessage::assistant(
+                String::new(),
+                vec![ToolCall {
+                    id: "xml-2".to_string(),
+                    name: "Write".to_string(),
+                    arguments: json!({"path":"README.md","content":"# Updated\n"}),
+                }],
+            ),
+            ConversationMessage::tool("Write".to_string(), "wrote README.md".to_string()),
+        ];
+
+        assert!(focused_edit_target_already_read(
+            &messages, &target, &work_root
+        ));
+    }
+
+    #[test]
     fn focused_edit_guidance_note_requires_edit_after_read() {
         let note = focused_edit_guidance_note(Path::new("app/page.tsx"), Path::new("."), true);
         assert!(note.contains("Do not call Read again"));
         assert!(note.contains("exactly one compact Edit"));
+    }
+
+    fn verifier_context_for(path: &str) -> super::super::VerifierRepairContext {
+        super::super::VerifierRepairContext {
+            command: "python3 -m pytest".to_string(),
+            output_excerpt: "failure".to_string(),
+            target_hint: Some(super::super::task_contract::RecoveryTargetHint {
+                role: super::super::task_contract::ArtifactRole::Implementation,
+                path: path.to_string(),
+                reason: "test".to_string(),
+            }),
+            target_line: None,
+            error_kind: Some("TypeError".to_string()),
+            failure_signature: format!("{path} TypeError"),
+            repair_attempt: 1,
+        }
+    }
+
+    #[test]
+    fn verifier_repair_requires_fresh_read_before_edit() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        let target = work_root.join("app").join("main.py");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "title: str | None = None\n").unwrap();
+        let context = verifier_context_for("app/main.py");
+        let messages = vec![
+            ConversationMessage::assistant(
+                String::new(),
+                vec![ToolCall {
+                    id: "xml-1".to_string(),
+                    name: "Write".to_string(),
+                    arguments: json!({"path":"app/main.py","content":"title: str | None = None\n"}),
+                }],
+            ),
+            ConversationMessage::tool("Write".to_string(), "wrote app/main.py".to_string()),
+        ];
+
+        let decision =
+            verifier_repair_decision(true, Some(&context), &messages, &work_root, Some(1), 1);
+        assert_eq!(
+            decision,
+            VerifierRepairDecision::NeedFreshRead(std::fs::canonicalize(&target).unwrap())
+        );
+        let policy = verifier_repair_policy_for_decision(decision);
+        assert_eq!(policy.allowed_tool_names_for_prompt().unwrap(), ["Read"]);
+        assert!(effective_tool_policy_error_for_call(
+            &policy,
+            "Edit",
+            &json!({"path":"app/main.py","old_string":"str | None","new_string":"Optional[str]"}),
+            &work_root,
+        )
+        .is_some());
+        assert!(
+            effective_tool_policy_error_for_call(
+                &policy,
+                "Read",
+                &json!({"path":"app/main.py"}),
+                &work_root,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn verifier_repair_allows_only_edit_after_fresh_read() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        let target = work_root.join("app").join("main.py");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "title: str | None = None\n").unwrap();
+        let context = verifier_context_for("app/main.py");
+        let messages = vec![
+            ConversationMessage::assistant(
+                String::new(),
+                vec![ToolCall {
+                    id: "xml-1".to_string(),
+                    name: "Write".to_string(),
+                    arguments: json!({"path":"app/main.py","content":"title: str | None = None\n"}),
+                }],
+            ),
+            ConversationMessage::tool("Write".to_string(), "wrote app/main.py".to_string()),
+            ConversationMessage::assistant(
+                String::new(),
+                vec![ToolCall {
+                    id: "xml-2".to_string(),
+                    name: "Read".to_string(),
+                    arguments: json!({"path":"app/main.py"}),
+                }],
+            ),
+            ConversationMessage::tool(
+                "Read".to_string(),
+                "1: title: str | None = None".to_string(),
+            ),
+        ];
+
+        let decision =
+            verifier_repair_decision(true, Some(&context), &messages, &work_root, Some(1), 1);
+        assert_eq!(
+            decision,
+            VerifierRepairDecision::NeedEdit(std::fs::canonicalize(&target).unwrap())
+        );
+        let policy = verifier_repair_policy_for_decision(decision);
+        assert_eq!(policy.allowed_tool_names_for_prompt().unwrap(), ["Edit"]);
+        let note = focused_edit_guidance_note_for_policy(&policy, &target, &work_root, true);
+        assert!(note.contains("only available tool for this turn is Edit"));
+        assert!(note.contains("Do not call Read again"));
+    }
+
+    #[test]
+    fn verifier_repair_unknown_target_uses_discovery_then_latest_read_target() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        let target = work_root.join("src").join("lib.rs");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "pub fn answer() -> i32 { 0 }\n").unwrap();
+
+        let mut messages = vec![ConversationMessage::system(
+            task_contract_verifier_target_discovery_note(1, 3),
+        )];
+        let decision = verifier_repair_decision(true, None, &messages, &work_root, Some(0), 0);
+        assert_eq!(decision, VerifierRepairDecision::NeedTargetDiscovery);
+        let policy = verifier_repair_policy_for_decision(decision);
+        assert_eq!(
+            policy.allowed_tool_names_for_prompt().unwrap(),
+            ["Read", "Glob", "Grep"]
+        );
+        assert!(
+            effective_tool_policy_error_for_call(
+                &policy,
+                "Write",
+                &json!({"path":"src/lib.rs","content":""}),
+                &work_root,
+            )
+            .is_some()
+        );
+
+        messages.push(ConversationMessage::assistant(
+            String::new(),
+            vec![ToolCall {
+                id: "xml-1".to_string(),
+                name: "Read".to_string(),
+                arguments: json!({"path":"src/lib.rs"}),
+            }],
+        ));
+        messages.push(ConversationMessage::tool(
+            "Read".to_string(),
+            "1: pub fn answer() -> i32 { 0 }".to_string(),
+        ));
+        assert_eq!(
+            verifier_repair_decision(true, None, &messages, &work_root, Some(0), 0),
+            VerifierRepairDecision::NeedEdit(std::fs::canonicalize(&target).unwrap())
+        );
+    }
+
+    #[test]
+    fn verifier_repair_ready_to_verify_after_repair_edit() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        let context = verifier_context_for("app/main.py");
+
+        assert_eq!(
+            verifier_repair_decision(true, Some(&context), &[], &work_root, Some(2), 3),
+            VerifierRepairDecision::ReadyToVerify
+        );
     }
 
     #[test]
