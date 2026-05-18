@@ -474,11 +474,27 @@ pub struct Agent {
     /// can constrain file tools to this artifact without forcing focused-edit
     /// mode immediately.
     current_artifact_recovery_target: Option<crate::agent::loop_run::task_contract::RecoveryTarget>,
-    /// Issue #623 follow-up: verifier repair is a repository-level diagnostic
-    /// phase, not a single-artifact completion phase. While this is true, the
-    /// loop disables path-focused edit policies and allows normal project-file
+    /// Issue #623 follow-up / #625: verifier repair is a diagnostic phase. If
+    /// the verifier output names a workspace file, `verifier_repair_context`
+    /// focuses the next edit there; otherwise the loop allows brief project
     /// inspection plus Write/Edit until a repository edit lands.
     task_contract_verifier_repair_pending: bool,
+    /// Issue #625: turn-local diagnostic context for a failed task-contract
+    /// verifier. This keeps verifier output as data and lets the tool policy
+    /// focus the next repair turn on the workspace file named by the failure,
+    /// without adding framework-specific recovery rules.
+    verifier_repair_context: Option<VerifierRepairContext>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VerifierRepairContext {
+    command: String,
+    output_excerpt: String,
+    target_hint: Option<crate::agent::loop_run::task_contract::RecoveryTargetHint>,
+    target_line: Option<usize>,
+    error_kind: Option<String>,
+    failure_signature: String,
+    repair_attempt: usize,
 }
 
 /// Issue #594: state machine for the `/photon-why` slash command. Lives at
@@ -602,6 +618,7 @@ impl Agent {
             task_contract_evidence_set_this_turn: completion_evidence::EvidenceSet::new(),
             current_artifact_recovery_target: None,
             task_contract_verifier_repair_pending: false,
+            verifier_repair_context: None,
         }
     }
 }
