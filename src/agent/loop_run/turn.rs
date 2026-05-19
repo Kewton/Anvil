@@ -7062,9 +7062,10 @@ impl Agent {
             && self.session.mode_state.mode == ExecutionMode::Act
             && (!self.active_python_request_requires_tests() || self.python_test_artifact_exists())
         {
+            // Issue #634: 旧文言は qwen3.5 を名指ししていたが、capability ベース
+            // (`finish_after_edit_format_error`) に統一されたためモデル非依存の文言に変更。
             final_prose =
-                "Applied repository edits before qwen3.5 emitted a malformed follow-up tool call."
-                    .to_string();
+                "Applied repository edits before a malformed follow-up tool call.".to_string();
             exit_reason = ExitReason::Done;
             error_text.clear();
         }
@@ -7852,12 +7853,21 @@ impl Agent {
                     {
                         return Ok(reply);
                     }
+                    // Issue #634: Format-error 経路の制御フロー不変条件 (SSOT)
+                    //   (1) 評価順序固定: `maybe_apply_*` → `maybe_finish_*` の順で呼ぶ
+                    //       (順序を変えると edit-then-finish の意味が崩れる)。
+                    //   (2) flag off で apply は no-op (`Ok(None)`)。loop は次の
+                    //       handler (`maybe_finish_*`) にフォールスルー。
+                    //   (3) `maybe_finish_*` は capability gate (`finish_after_edit_format_error`)
+                    //       のみで動く汎用 path (experimental flag 非依存)。
+                    //       qwen3.5 ユーザーの format-error 後 finish は flag off
+                    //       でも維持される。
                     if let Some(reply) =
-                        self.maybe_apply_qwen35_obvious_edit_fallback_after_format_error(&err)?
+                        self.maybe_apply_deterministic_edit_after_format_error(&err)?
                     {
                         return Ok(reply);
                     }
-                    if let Some(reply) = self.maybe_finish_after_qwen35_edit_format_error(&err) {
+                    if let Some(reply) = self.maybe_finish_after_edit_format_error(&err) {
                         return Ok(reply);
                     }
                     if lifecycle::is_tool_call_format_error(&err)
@@ -8149,7 +8159,11 @@ impl Agent {
         )
     }
 
-    fn maybe_finish_after_qwen35_edit_format_error(&self, err: &str) -> Option<AssistantReply> {
+    /// Issue #634: 旧名 `maybe_finish_after_qwen35_edit_format_error`。
+    /// 「format error でも edit success なら finish」というモデル非依存の汎用
+    /// 挙動を担う。`finish_after_edit_format_error` capability のみで gate される
+    /// (experimental flag 非依存)。
+    fn maybe_finish_after_edit_format_error(&self, err: &str) -> Option<AssistantReply> {
         if !lifecycle::is_tool_call_format_error(err)
             || !model_capabilities(&self.current_assistant_model()).finish_after_edit_format_error
             || self.session.mode_state.mode != ExecutionMode::Act
@@ -8165,17 +8179,29 @@ impl Agent {
             self.session.mode_state.active_plan_path.as_deref(),
         );
         (edits > 0).then(|| AssistantReply {
-            content: "Applied the focused edit; stopping after a malformed follow-up tool call from qwen3.5.".to_string(),
+            content: "Applied the focused edit; stopping after a malformed follow-up tool call."
+                .to_string(),
             tool_calls: Vec::new(),
             prompt_tokens: None,
             completion_tokens: None,
         })
     }
 
-    fn maybe_apply_qwen35_obvious_edit_fallback_after_format_error(
+    /// Issue #634: 旧名 `maybe_apply_qwen35_obvious_edit_fallback_after_format_error`。
+    /// 固定 arithmetic patch 系の edit 特化 fallback。experimental flag および
+    /// capability の双方が ON のときのみ動く。flag off では `Ok(None)` を返し、
+    /// 呼出側の format-error loop は次の handler (`maybe_finish_after_edit_format_error`)
+    /// にフォールスルーする。
+    fn maybe_apply_deterministic_edit_after_format_error(
         &mut self,
         err: &str,
     ) -> Result<Option<AssistantReply>, String> {
+        // Issue #634: edit 系特化 fallback (固定 arithmetic patch) は experimental
+        // flag のみで gate (template 系と異なり `FullTemplate` 制約は不要)。
+        // 既存 capability gate (`deterministic_edit_after_format_error`) も維持。
+        if !self.config.specialized_fallback_enabled() {
+            return Ok(None);
+        }
         if !lifecycle::is_tool_call_format_error(err)
             || !model_capabilities(&self.current_assistant_model())
                 .deterministic_edit_after_format_error
@@ -8228,7 +8254,7 @@ impl Agent {
         );
         Ok(Some(AssistantReply {
             content: format!(
-                "Applied a deterministic small-edit fallback for qwen3.5 after malformed tool calls in {relative}."
+                "Applied a deterministic small-edit fallback after malformed tool calls in {relative}."
             ),
             tool_calls: Vec::new(),
             prompt_tokens: None,
