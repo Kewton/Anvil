@@ -42,6 +42,10 @@ mod footer;
 mod interrupt;
 mod lifecycle;
 pub mod photon_user_feedback;
+// Issue #639: ProjectVerifier capability. Module is intentionally *not*
+// re-exported (DR3-001) — `turn.rs` is the only in-crate consumer via
+// `super::project_verifier::*`.
+mod project_verifier;
 mod protocol;
 mod quality;
 pub(crate) mod quality_confirm;
