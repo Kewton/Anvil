@@ -144,12 +144,95 @@ pub(super) enum ArtifactRecoveryAction {
     Done,
 }
 
+/// Issue #636: bounded `ArtifactRole -> excerpt` sidecar carried alongside
+/// the existing artifact / evidence inputs into `plan_artifact_recovery`.
+/// `KISS / DR1-004`: kept as a `HashMap` type alias instead of a wrapper
+/// struct. The `bounded_post_edit_excerpt` SSOT in `turn.rs` is responsible
+/// for sizing each value at or below [`MAX_ARTIFACT_EXCERPT_BYTES`] before
+/// insertion. No `pub use` is added at the loop_run facade (DR3-001).
+pub(super) type ArtifactExcerpts = std::collections::HashMap<ArtifactRole, String>;
+
+/// Issue #636: upper byte cap for any single post-edit excerpt collected
+/// by `bounded_post_edit_excerpt`. 8 KiB is intentionally smaller than
+/// `required_behavior::MAX_REQUEST_SCAN_BYTES` (64 KiB) so per-turn excerpt
+/// memory stays bounded even when many artifact roles fire. Used as the
+/// SSOT by `turn.rs::bounded_post_edit_excerpt`; not re-exported via the
+/// `loop_run` facade (DR3-001).
+pub(super) const MAX_ARTIFACT_EXCERPT_BYTES: usize = 8 * 1024;
+
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ArtifactRecoveryInputs<'a> {
     pub(super) contract: &'a TaskContract,
     pub(super) evidence: &'a EvidenceSet,
     pub(super) artifacts: &'a [ArtifactState],
     pub(super) repair_state: &'a VerifierRepairState,
+    /// Issue #636: bounded post-edit excerpt per observed role.
+    /// `&ArtifactExcerpts::new()` (empty) is the back-compat sentinel that
+    /// disables behavior-coverage gating.
+    pub(super) artifact_excerpts: &'a ArtifactExcerpts,
+}
+
+// ---------------------------------------------------------------------------
+// Issue #636: behavior coverage judgement (private to task_contract).
+// ---------------------------------------------------------------------------
+
+/// Whether the contract has any actionable behavior signal that can drive
+/// the coverage gate. If neither `operations` nor `domain_terms` was
+/// extracted, the gate is disabled and the legacy completion path runs.
+fn behavior_coverage_enabled(contract: &TaskContract) -> bool {
+    contract.required_behavior.operations.is_some()
+        || contract.required_behavior.domain_terms.is_some()
+}
+
+/// True when `excerpt` either hits any operation keyword or contains any
+/// domain term. Both judgements stay behind the `required_behavior`
+/// SSOT (DR1-005) so `KeywordMatch` / `OPERATION_KEYWORDS` never escape
+/// the schema module.
+fn excerpt_satisfies_behavior(contract: &TaskContract, excerpt: &str) -> bool {
+    contract
+        .required_behavior
+        .excerpt_hits_any_operation(excerpt)
+        || contract
+            .required_behavior
+            .excerpt_hits_any_domain_term(excerpt)
+}
+
+/// `usage_docs` surface marker categories. Short tokens (`run`) use the
+/// token-boundary helper so "running" / "github.run" do not false-positive.
+const USAGE_DOCS_SETUP_MARKERS: &[(&str, bool)] = &[("install", false), ("setup", false)];
+const USAGE_DOCS_RUN_MARKERS: &[(&str, bool)] = &[("run", true), ("start", false)];
+const USAGE_DOCS_VERIFY_MARKERS: &[(&str, bool)] = &[("test", false), ("verify", false)];
+
+/// At least two of {setup, run, verification} surface categories must
+/// appear in the README excerpt for usage_docs to count as covered. One
+/// category is too weak (scaffold READMEs that only mention `install`),
+/// three is overly strict for minimal but honest docs.
+fn usage_docs_surface_satisfied(excerpt: &str) -> bool {
+    let lower = excerpt.to_ascii_lowercase();
+    let hit = |markers: &[(&str, bool)]| -> bool {
+        markers
+            .iter()
+            .any(|(needle, token_boundary)| usage_docs_marker_hit(&lower, needle, *token_boundary))
+    };
+    let mut categories = 0;
+    if hit(USAGE_DOCS_SETUP_MARKERS) {
+        categories += 1;
+    }
+    if hit(USAGE_DOCS_RUN_MARKERS) {
+        categories += 1;
+    }
+    if hit(USAGE_DOCS_VERIFY_MARKERS) {
+        categories += 1;
+    }
+    categories >= 2
+}
+
+fn usage_docs_marker_hit(lower: &str, needle: &str, token_boundary: bool) -> bool {
+    if token_boundary {
+        contains_ascii_token(lower, needle)
+    } else {
+        lower.contains(needle)
+    }
 }
 
 pub(super) fn plan_artifact_recovery(inputs: ArtifactRecoveryInputs<'_>) -> ArtifactRecoveryAction {
@@ -178,6 +261,36 @@ pub(super) fn plan_artifact_recovery(inputs: ArtifactRecoveryInputs<'_>) -> Arti
             target_hint: recovery_target_hint_for_missing(inputs.artifacts, &missing),
             missing,
         };
+    }
+
+    // Issue #636: behavior-coverage gate. When the contract carries
+    // operations / domain_terms and we have at least one excerpt to
+    // inspect, observed roles must demonstrate the requested behavior.
+    // If the excerpt is absent for a role we skip its check (back-compat).
+    // Setup is treated as covered (no excerpt-level coverage rule yet).
+    if behavior_coverage_enabled(inputs.contract) && !inputs.artifact_excerpts.is_empty() {
+        for role in inputs.contract.required_artifacts.iter() {
+            if !observed.contains(role) {
+                continue;
+            }
+            let Some(excerpt) = inputs.artifact_excerpts.get(role) else {
+                continue;
+            };
+            let covered = match *role {
+                ArtifactRole::Implementation | ArtifactRole::Test => {
+                    excerpt_satisfies_behavior(inputs.contract, excerpt)
+                }
+                ArtifactRole::UsageDocs => usage_docs_surface_satisfied(excerpt),
+                ArtifactRole::Setup => true,
+            };
+            if !covered {
+                let missing = vec![*role];
+                return ArtifactRecoveryAction::Continue {
+                    target_hint: recovery_target_hint_for_missing(inputs.artifacts, &missing),
+                    missing,
+                };
+            }
+        }
     }
 
     let existing_unverified_used = inputs.artifacts.iter().any(|artifact| {
@@ -568,7 +681,11 @@ fn observed_artifacts(evidence: &EvidenceSet) -> Vec<ArtifactRole> {
     roles
 }
 
-fn role_from_repo_edit(category: RepoEditCategory) -> Option<ArtifactRole> {
+// Issue #636: `pub(super)` so `turn.rs::observe_evidence_from_repo_edit`
+// can map a `RepoEditCategory` to an `ArtifactRole` for the excerpt
+// sidecar without duplicating the table (DR1-001). DR3-001 maintained:
+// no `pub use` from `src/agent/loop_run.rs`.
+pub(super) fn role_from_repo_edit(category: RepoEditCategory) -> Option<ArtifactRole> {
     match category {
         RepoEditCategory::Impl => Some(ArtifactRole::Implementation),
         RepoEditCategory::Test => Some(ArtifactRole::Test),
@@ -837,6 +954,7 @@ mod tests {
                 evidence: &evidence,
                 artifacts: &artifacts,
                 repair_state: &repair_state,
+                artifact_excerpts: &ArtifactExcerpts::new(),
             }),
             ArtifactRecoveryAction::RunVerifier
         );
@@ -860,6 +978,7 @@ mod tests {
             evidence: &evidence,
             artifacts: &artifacts,
             repair_state: &repair_state,
+            artifact_excerpts: &ArtifactExcerpts::new(),
         });
 
         assert_eq!(
@@ -907,6 +1026,7 @@ mod tests {
                 evidence: &evidence,
                 artifacts: &artifacts,
                 repair_state: &repair_state,
+                artifact_excerpts: &ArtifactExcerpts::new(),
             }),
             ArtifactRecoveryAction::RepairArtifact {
                 target_hint: Some(target_hint),
@@ -922,5 +1042,267 @@ mod tests {
 
         assert_eq!(contract.intent, TaskIntent::Install);
         assert_eq!(contract.evaluate(&evidence), CompletionDecision::Done);
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #636: behavior-aware completion (7 tests)
+    //
+    // These exercise `plan_artifact_recovery` with the new
+    // `artifact_excerpts` sidecar populated. Tests share a fixed
+    // English request so the deterministic schema extractor populates
+    // `operations` / `domain_terms` (Japanese-only requests bypass the
+    // coverage gate by design — see `behavior_coverage_skipped_when_*`).
+    // -----------------------------------------------------------------
+
+    fn build_excerpts(pairs: &[(ArtifactRole, &str)]) -> ArtifactExcerpts {
+        let mut map = ArtifactExcerpts::new();
+        for (role, body) in pairs {
+            map.insert(*role, (*body).to_string());
+        }
+        map
+    }
+
+    #[test]
+    fn scaffold_only_does_not_complete_when_behavior_unsatisfied() {
+        // Use a behaviour-bearing English request without punctuation
+        // that the deterministic extractor would also pull into
+        // domain_terms verbatim (e.g. `/`, dotted identifiers).
+        let contract = TaskContract::from_request("Implement a TaskRepo that can create entries.");
+        // Sanity: behavior schema must carry at least one signal.
+        assert!(
+            behavior_coverage_enabled(&contract),
+            "schema must have ops or terms, got behavior={:?}",
+            contract.required_behavior
+        );
+        // Implementation evidence observed but the excerpt does not hit
+        // any operation keyword or domain term.
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit(RepoEditCategory::Impl));
+        let excerpts = build_excerpts(&[(
+            ArtifactRole::Implementation,
+            "fn placeholder() {}\nfn another() {}\n",
+        )]);
+        let repair_state = VerifierRepairState::None;
+        let action = plan_artifact_recovery(ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &evidence,
+            artifacts: &[],
+            repair_state: &repair_state,
+            artifact_excerpts: &excerpts,
+        });
+        match action {
+            ArtifactRecoveryAction::Continue { missing, .. } => {
+                assert!(
+                    missing.contains(&ArtifactRole::Implementation),
+                    "expected Implementation missing, got: {missing:?}"
+                );
+            }
+            other => panic!(
+                "expected Continue, got {other:?}. behavior={:?}",
+                contract.required_behavior
+            ),
+        }
+    }
+
+    #[test]
+    fn implementation_excerpt_without_operations_or_terms_is_not_complete() {
+        let contract = TaskContract::from_request(
+            "Build a Task CRUD API: create / read / update / delete a Task entity.",
+        );
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit(RepoEditCategory::Impl));
+        let excerpts = build_excerpts(&[(
+            ArtifactRole::Implementation,
+            "fn placeholder() {}\nfn another() {}\n",
+        )]);
+        let repair_state = VerifierRepairState::None;
+        let action = plan_artifact_recovery(ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &evidence,
+            artifacts: &[],
+            repair_state: &repair_state,
+            artifact_excerpts: &excerpts,
+        });
+        assert!(
+            matches!(action, ArtifactRecoveryAction::Continue { .. }),
+            "expected Continue, got {action:?}"
+        );
+    }
+
+    #[test]
+    fn implementation_excerpt_with_operation_satisfies_coverage() {
+        let contract = TaskContract::from_request(
+            "Build a Task CRUD API: create / read / update / delete a Task entity. Verify with tests.",
+        );
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit(RepoEditCategory::Impl));
+        evidence.push(repo_edit(RepoEditCategory::Test));
+        evidence.push(repo_edit(RepoEditCategory::Docs));
+        let excerpts = build_excerpts(&[
+            (
+                ArtifactRole::Implementation,
+                "fn create_task(t: Task) -> Task { /* persist */ }\nfn delete_task(id: u64) {}\n",
+            ),
+            (
+                ArtifactRole::Test,
+                "fn test_create_task() { create_task(...); }\n",
+            ),
+            (
+                ArtifactRole::UsageDocs,
+                "## Setup\ninstall deps\n## Run\nrun the server\n## Test\nrun the tests\n",
+            ),
+        ]);
+        let repair_state = VerifierRepairState::None;
+        let action = plan_artifact_recovery(ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &evidence,
+            artifacts: &[],
+            repair_state: &repair_state,
+            artifact_excerpts: &excerpts,
+        });
+        // With coverage satisfied + tests required, the planner falls
+        // through to verifier execution.
+        assert_eq!(action, ArtifactRecoveryAction::RunVerifier);
+    }
+
+    #[test]
+    fn test_excerpt_with_operation_satisfies_coverage() {
+        let contract =
+            TaskContract::from_request("Implement create and read for Task entity. Add tests.");
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit(RepoEditCategory::Impl));
+        evidence.push(repo_edit(RepoEditCategory::Test));
+        let excerpts = build_excerpts(&[
+            (
+                ArtifactRole::Implementation,
+                "fn create_task() -> Task { Task::new() }\n",
+            ),
+            (
+                ArtifactRole::Test,
+                "fn test_create_task() { let t = create_task(); assert!(true); }\n",
+            ),
+        ]);
+        let repair_state = VerifierRepairState::None;
+        let action = plan_artifact_recovery(ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &evidence,
+            artifacts: &[],
+            repair_state: &repair_state,
+            artifact_excerpts: &excerpts,
+        });
+        assert_eq!(action, ArtifactRecoveryAction::RunVerifier);
+    }
+
+    #[test]
+    fn usage_docs_excerpt_lacking_two_surfaces_falls_to_continue() {
+        let contract = TaskContract::from_request(
+            "Build a Task CRUD API with create / read. Document usage in README.",
+        );
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit(RepoEditCategory::Impl));
+        evidence.push(repo_edit(RepoEditCategory::Docs));
+        // Implementation excerpt satisfies behavior; UsageDocs excerpt
+        // only mentions install (single surface). Coverage must fail.
+        let excerpts = build_excerpts(&[
+            (
+                ArtifactRole::Implementation,
+                "fn create_task() -> Task { Task::new() }\n",
+            ),
+            (
+                ArtifactRole::UsageDocs,
+                "# Project\nTo install: cargo install foo\n",
+            ),
+        ]);
+        let repair_state = VerifierRepairState::None;
+        let action = plan_artifact_recovery(ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &evidence,
+            artifacts: &[],
+            repair_state: &repair_state,
+            artifact_excerpts: &excerpts,
+        });
+        match action {
+            ArtifactRecoveryAction::Continue { missing, .. } => {
+                assert!(
+                    missing.contains(&ArtifactRole::UsageDocs),
+                    "expected UsageDocs missing, got: {missing:?}"
+                );
+            }
+            other => panic!("expected Continue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn behavior_coverage_skipped_when_operations_and_domain_terms_both_none() {
+        // Pure-kanji request: extractor cannot populate operations or
+        // domain_terms, so behavior coverage stays disabled and the
+        // existing artifact-observation path drives completion.
+        let contract = TaskContract::from_request("使用方法を更新してください");
+        // Sanity-check that the schema is empty.
+        assert!(contract.required_behavior.operations.is_none());
+        assert!(contract.required_behavior.domain_terms.is_none());
+
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit(RepoEditCategory::Docs));
+        // Even a trivial / unsatisfying excerpt must not block completion.
+        let excerpts = build_excerpts(&[(ArtifactRole::UsageDocs, "x")]);
+        let repair_state = VerifierRepairState::None;
+        let action = plan_artifact_recovery(ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &evidence,
+            artifacts: &[],
+            repair_state: &repair_state,
+            artifact_excerpts: &excerpts,
+        });
+        assert_eq!(action, ArtifactRecoveryAction::Done);
+    }
+
+    #[test]
+    fn short_keyword_read_uses_token_boundary() {
+        // README must not satisfy a `read` operation contract; only an
+        // actual `read` token boundary does. Light coverage that the
+        // task_contract route delegates to the required_behavior SSOT.
+        let contract = TaskContract::from_request("implement a read endpoint");
+        assert!(
+            contract
+                .required_behavior
+                .operations
+                .as_ref()
+                .is_some_and(|ops| ops.contains(&required_behavior::Operation::Read)),
+            "schema={:?}",
+            contract.required_behavior
+        );
+        assert!(
+            contract
+                .required_artifacts
+                .contains(&ArtifactRole::Implementation)
+        );
+        // The lowercase-only request must NOT yield any CamelCase domain
+        // term that would let the README excerpt false-positive via the
+        // domain_term substring path.
+        assert!(
+            contract.required_behavior.domain_terms.is_none(),
+            "schema={:?}",
+            contract.required_behavior
+        );
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit(RepoEditCategory::Impl));
+        // Excerpt mentions only README — must NOT count as a `read` hit.
+        let excerpts = build_excerpts(&[(
+            ArtifactRole::Implementation,
+            "// see README for details\nfn nothing() {}\n",
+        )]);
+        let repair_state = VerifierRepairState::None;
+        let action = plan_artifact_recovery(ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &evidence,
+            artifacts: &[],
+            repair_state: &repair_state,
+            artifact_excerpts: &excerpts,
+        });
+        assert!(
+            matches!(action, ArtifactRecoveryAction::Continue { .. }),
+            "expected Continue (token boundary), got {action:?}"
+        );
     }
 }

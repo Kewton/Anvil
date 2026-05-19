@@ -513,6 +513,16 @@ pub struct Agent {
     /// of every user turn alongside `repair_job`. Not persisted to
     /// `self.session.messages` (design policy §5 — A-only, turn-local).
     repair_failure_snapshot: Option<repair_job::VerifierFailureSnapshot>,
+    /// Issue #636: per-turn behavior-coverage excerpts keyed by artifact role.
+    /// Populated by `turn.rs::observe_evidence_from_repo_edit` via
+    /// `bounded_post_edit_excerpt`, read by
+    /// `task_contract::plan_artifact_recovery` through
+    /// `ArtifactRecoveryInputs::artifact_excerpts`. Reset at the head of
+    /// `run_actor_loop` together with the other `*_this_turn` per-turn
+    /// state so excerpts never bleed across user turns. Not serialized —
+    /// the behavior-coverage decision is evaluated within the same turn
+    /// the excerpts were observed.
+    task_contract_excerpts: task_contract::ArtifactExcerpts,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -729,6 +739,7 @@ impl Agent {
             repair_job: None,
             repair_job_artifact_attempts: 0,
             repair_failure_snapshot: None,
+            task_contract_excerpts: task_contract::ArtifactExcerpts::new(),
         }
     }
 
