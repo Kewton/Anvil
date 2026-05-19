@@ -1981,18 +1981,66 @@ fn tighten_history_perms(path: &Path) {
     }
 }
 
+/// Issue #634: shared test helper. `test_agent` の Config 差し替え版で、
+/// `experimental_specialized_fallback` / `deterministic_fallback` 等を
+/// テスト側から自由に渡せる。required Config 値 (cwd / requested_model /
+/// ollama_host / state_dir_override) は `test_agent` と同等の SSOT を持ち、
+/// 呼び出し側からは差分のみ与える。
+///
+/// `pub(crate)` + `#[cfg(test)]` 構成で `commands::tests` 以外の
+/// loop_run 配下 test module からも参照できる (例: `turn.rs::tests`)。
+#[cfg(test)]
+pub(crate) fn test_agent_with_config(
+    mut cfg: crate::config::Config,
+) -> (super::Agent, tempfile::TempDir) {
+    use super::FooterHandle;
+    use crate::model_registry::RuntimeModels;
+    use crate::ollama::client::OllamaClient;
+    use crate::session::store::{SessionSnapshot, SessionStore};
+    use tempfile::tempdir;
+
+    let temp = tempdir().unwrap();
+    let state_root = temp.path().join(".anvil-state");
+    let session_id = "0199fe00-0000-7000-8000-000000000454";
+    let workspace_key = "test-workspace";
+    cfg.cwd = temp.path().to_path_buf();
+    if cfg.requested_model.is_none() {
+        cfg.requested_model = Some("test-model".to_string());
+    }
+    if cfg.ollama_host.is_empty() {
+        cfg.ollama_host = "http://127.0.0.1:11434".to_string();
+    }
+    if cfg.state_dir_override.is_none() {
+        cfg.state_dir_override = Some(state_root.clone());
+    }
+    let client = OllamaClient::new(cfg.ollama_host.clone()).unwrap();
+    let session = SessionSnapshot {
+        id: session_id.to_string(),
+        workspace_key: workspace_key.to_string(),
+        ..SessionSnapshot::default()
+    };
+    let agent = super::Agent::new(
+        cfg,
+        RuntimeModels {
+            main: "test-model".to_string(),
+            sidecar: None,
+        },
+        client,
+        SessionStore::new(&state_root, session_id, workspace_key),
+        session,
+        FooterHandle::disabled(),
+    );
+    (agent, temp)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::loop_run::FooterHandle;
     use crate::config::Config;
-    use crate::model_registry::RuntimeModels;
     use crate::modes::plan_act::ExecutionMode;
-    use crate::ollama::client::OllamaClient;
-    use crate::session::store::{SessionSnapshot, SessionStore};
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
-    use tempfile::{TempDir, tempdir};
+    use tempfile::TempDir;
 
     /// Serialize env-mutating tests within this module so `cargo test`'s
     /// default parallel runner cannot race on `NO_COLOR`.
@@ -2050,36 +2098,10 @@ mod tests {
     }
 
     fn test_agent(yes_mode: bool) -> (Agent, TempDir) {
-        let temp = tempdir().unwrap();
-        let state_root = temp.path().join(".anvil-state");
-        let session_id = "0199fe00-0000-7000-8000-000000000454";
-        let workspace_key = "test-workspace";
-        let config = Config {
-            cwd: temp.path().to_path_buf(),
-            requested_model: Some("test-model".to_string()),
-            ollama_host: "http://127.0.0.1:11434".to_string(),
+        super::test_agent_with_config(Config {
             yes_mode,
-            state_dir_override: Some(state_root.clone()),
             ..Config::default()
-        };
-        let client = OllamaClient::new(config.ollama_host.clone()).unwrap();
-        let session = SessionSnapshot {
-            id: session_id.to_string(),
-            workspace_key: workspace_key.to_string(),
-            ..SessionSnapshot::default()
-        };
-        let agent = Agent::new(
-            config,
-            RuntimeModels {
-                main: "test-model".to_string(),
-                sidecar: None,
-            },
-            client,
-            SessionStore::new(&state_root, session_id, workspace_key),
-            session,
-            FooterHandle::disabled(),
-        );
-        (agent, temp)
+        })
     }
 
     fn continue_message(event: AgentEvent) -> String {

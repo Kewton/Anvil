@@ -145,6 +145,46 @@ fn merge_deterministic_fallback_prefers_later_sources() {
     );
 }
 
+/// Issue #634: merge precedence for the experimental specialized fallback flag.
+/// CLI (last source) wins; absent sources don't clobber explicit values.
+#[test]
+fn merge_experimental_specialized_fallback_prefers_later_sources() {
+    let merged = merge_partial_configs(&[
+        PartialConfig {
+            experimental_specialized_fallback: Some(false),
+            ..PartialConfig::default()
+        },
+        PartialConfig {
+            experimental_specialized_fallback: Some(true),
+            ..PartialConfig::default()
+        },
+    ]);
+    assert_eq!(merged.experimental_specialized_fallback, Some(true));
+
+    // Absent later sources don't clobber.
+    let merged = merge_partial_configs(&[
+        PartialConfig {
+            experimental_specialized_fallback: Some(true),
+            ..PartialConfig::default()
+        },
+        PartialConfig::default(),
+    ]);
+    assert_eq!(merged.experimental_specialized_fallback, Some(true));
+}
+
+/// Issue #634: `parse_key_value_config` accepts the new
+/// `experimental_specialized_fallback` key (parsed downstream by
+/// `load_config_file`).
+#[test]
+fn parses_experimental_specialized_fallback_from_config_file() {
+    let map = parse_key_value_config("experimental_specialized_fallback = true\n");
+    assert_eq!(
+        map.get("experimental_specialized_fallback")
+            .map(String::as_str),
+        Some("true")
+    );
+}
+
 #[test]
 fn merge_state_dir_override_prefers_cli_over_env() {
     let env_config = PartialConfig {
@@ -508,6 +548,7 @@ fn minimal_args(cwd: &std::path::Path) -> CliArgs {
         auto_plan: false,
         offline: false,
         deterministic_fallback: None,
+        experimental_specialized_fallback: None,
         no_footer: false,
         resume: None,
         state_dir: None,

@@ -48,6 +48,12 @@ pub struct CliArgs {
     /// legacy full template recovery. `support-only` and `full` remain aliases.
     #[arg(long = "deterministic-fallback", value_enum)]
     pub deterministic_fallback: Option<DeterministicFallbackMode>,
+    /// Issue #634: experimental opt-in for specialized fallback paths
+    /// (FastAPI scaffold / Python CSV / FizzBuzz / fixed arithmetic patch /
+    /// qwen3.5 固有 deterministic edit). Default off. Template 系は
+    /// `--deterministic-fallback full-template` との AND 条件で発火。
+    #[arg(long = "experimental-specialized-fallback")]
+    pub experimental_specialized_fallback: Option<bool>,
     /// Disable the fixed footer status bar (mode / token usage / log level).
     #[arg(long = "no-footer")]
     pub no_footer: bool,
@@ -281,6 +287,7 @@ mod tests {
             auto_plan: false,
             offline: false,
             deterministic_fallback: None,
+            experimental_specialized_fallback: None,
             no_footer: false,
             resume: None,
             cwd: None,
