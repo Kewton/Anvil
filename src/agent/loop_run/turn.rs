@@ -43,7 +43,6 @@ use crate::util::file_classify::{is_implementation_file, is_setup_file, is_test_
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use super::deterministic;
@@ -101,7 +100,6 @@ const VERIFIER_REPAIR_PASS_MAX_EDIT_BYTES: usize = 32_768;
 const VERIFIER_REPAIR_PASS_MAX_REASON_CHARS: usize = 180;
 const VERIFIER_REPAIR_PASS_MAX_EDITS: usize = 16;
 const VERIFIER_REPAIR_PASS_MAX_REPLACE_ALL_MATCHES: usize = 32;
-const VERIFIER_REPAIR_CHEAP_CHECK_TIMEOUT_SECS: u64 = 5;
 const USER_INTERRUPT_ERROR: &str = "__anvil_user_interrupt__";
 const CREATE_NEXT_APP_PACKAGE_VERSION: &str = "16.2.4";
 
@@ -135,9 +133,59 @@ enum VerifierDiagnosticPassOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum VerifierRepairPassOutcome {
-    Applied { relative_path: String },
-    Invalid { error: String },
+    Applied {
+        relative_path: String,
+    },
+    Invalid {
+        error: String,
+    },
+    /// Issue #639: no safe project verifier exists for the candidate path.
+    /// The caller should defer to a full verifier rerun rather than treating
+    /// the repair attempt as a failure or success.
+    Unavailable {
+        relative_path: String,
+    },
     Skipped,
+}
+
+/// Issue #639: control-flow vocabulary for `validate_verifier_repair_*` to
+/// distinguish a cheap-check failure (which feeds the existing retry-message
+/// pipeline) from "no safe verifier exists" (which short-circuits to a full
+/// verifier rerun). `impl From<String>` lets `?` automatically convert
+/// existing `Err(String)` paths into `CheapCheckOutcome::Failed`.
+#[derive(Debug)]
+enum CheapCheckOutcome {
+    Failed(String),
+    Unavailable,
+}
+
+impl From<String> for CheapCheckOutcome {
+    fn from(message: String) -> Self {
+        CheapCheckOutcome::Failed(message)
+    }
+}
+
+impl std::fmt::Display for CheapCheckOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CheapCheckOutcome::Failed(message) => f.write_str(message),
+            CheapCheckOutcome::Unavailable => f.write_str("<cheap check unavailable>"),
+        }
+    }
+}
+
+#[cfg(test)]
+impl CheapCheckOutcome {
+    /// Test-only convenience to preserve the previous `err.contains("...")`
+    /// assertion style used throughout `turn.rs::tests`. Unavailable never
+    /// matches, so a test expecting a Failed message will fail loudly if the
+    /// validator ever short-circuits with Unavailable instead.
+    fn contains(&self, needle: &str) -> bool {
+        match self {
+            CheapCheckOutcome::Failed(message) => message.contains(needle),
+            CheapCheckOutcome::Unavailable => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,12 +205,6 @@ struct ValidatedVerifierRepairEdit {
     preimage_hash: String,
     postimage_hash: String,
     fingerprint: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VerifierRepairCheapCheckPolicy {
-    Disabled,
-    PythonSyntaxOnly,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5124,6 +5166,28 @@ impl Agent {
                             true,
                         );
                     }
+                    VerifierRepairPassOutcome::Unavailable { relative_path } => {
+                        // Issue #639: no safe project verifier was available for
+                        // this candidate path. Do not count this as a repair
+                        // attempt — defer to the next verifier rerun for a full
+                        // re-check. We keep `verifier_repair_retries` unchanged
+                        // so the natural attempt budget is preserved.
+                        self.record_controller_verifier_repair_invalid(&format!(
+                            "deferred to full verifier rerun (no safe cheap check available for {relative_path})"
+                        ));
+                        write_stdout_rendered(
+                            &format_iteration_status(
+                                last_iter,
+                                self.config.max_iterations,
+                                "Verifier repair",
+                                &format!(
+                                    "No safe cheap check available for {relative_path}; deferring to full verifier rerun."
+                                ),
+                                self.footer.current_cols(),
+                            ),
+                            true,
+                        );
+                    }
                     VerifierRepairPassOutcome::Skipped => {}
                 }
                 continue;
@@ -9292,14 +9356,21 @@ impl Agent {
             if !reply.tool_calls.is_empty() {
                 last_error = "repair reply contained unexpected tool calls".to_string();
             } else {
-                match parse_verifier_repair_intents_reply(&reply.content).and_then(|intents| {
-                    validate_verifier_repair_intents(
-                        &self.work_root,
-                        &context,
-                        &target_hint,
-                        intents,
-                    )
-                }) {
+                // Issue #639: split parse / validate so the latter can signal
+                // `CheapCheckOutcome::Unavailable` separately from a Failed
+                // string. Unavailable short-circuits the whole repair pass
+                // and defers to a full verifier rerun.
+                let validation = parse_verifier_repair_intents_reply(&reply.content)
+                    .map_err(CheapCheckOutcome::Failed)
+                    .and_then(|intents| {
+                        validate_verifier_repair_intents(
+                            &self.work_root,
+                            &context,
+                            &target_hint,
+                            intents,
+                        )
+                    });
+                match validation {
                     Ok(edit) => {
                         if context.applied_repair_intents.contains(&edit.fingerprint) {
                             last_error =
@@ -9329,8 +9400,22 @@ impl Agent {
                             };
                         }
                     }
-                    Err(err) => {
-                        last_error = err;
+                    Err(CheapCheckOutcome::Failed(message)) => {
+                        last_error = message;
+                    }
+                    Err(CheapCheckOutcome::Unavailable) => {
+                        log_llm_event(
+                            "agent.verifier_repair_pass.unavailable",
+                            serde_json::json!({
+                                "session_id": self.session_store.session_id(),
+                                "model": model,
+                                "target_path": target_hint.path,
+                                "attempt": attempt,
+                            }),
+                        );
+                        return VerifierRepairPassOutcome::Unavailable {
+                            relative_path: target_hint.path.clone(),
+                        };
                     }
                 }
             }
@@ -14120,7 +14205,7 @@ fn validate_verifier_repair_intent(
     context: &super::repair_job::RepairJob,
     target_hint: &super::task_contract::RecoveryTargetHint,
     intent: VerifierRepairIntent,
-) -> Result<ValidatedVerifierRepairEdit, String> {
+) -> Result<ValidatedVerifierRepairEdit, CheapCheckOutcome> {
     validate_verifier_repair_intents(work_root, context, target_hint, vec![intent])
 }
 
@@ -14129,32 +14214,50 @@ fn validate_verifier_repair_intents(
     context: &super::repair_job::RepairJob,
     target_hint: &super::task_contract::RecoveryTargetHint,
     intents: Vec<VerifierRepairIntent>,
-) -> Result<ValidatedVerifierRepairEdit, String> {
+) -> Result<ValidatedVerifierRepairEdit, CheapCheckOutcome> {
+    // Issue #639: every early-return path here represents a *Failed* cheap
+    // check (validation rejection). Only `validate_verifier_repair_candidate_contents`
+    // can produce `CheapCheckOutcome::Unavailable`, which propagates verbatim
+    // via the trailing `?` below. The `impl From<String> for CheapCheckOutcome`
+    // makes `.into()` on a `String` produce a `Failed` variant.
     if intents.is_empty() {
-        return Err("repair intent list must not be empty".to_string());
+        return Err(CheapCheckOutcome::Failed(
+            "repair intent list must not be empty".to_string(),
+        ));
     }
     if intents.len() > VERIFIER_REPAIR_PASS_MAX_EDITS {
-        return Err("repair intent list contained too many edits".to_string());
+        return Err(CheapCheckOutcome::Failed(
+            "repair intent list contained too many edits".to_string(),
+        ));
     }
     if !verifier_repair_path_input_is_safe(&target_hint.path) {
-        return Err("selected repair target path is not safe".to_string());
+        return Err(CheapCheckOutcome::Failed(
+            "selected repair target path is not safe".to_string(),
+        ));
     }
 
     let root = std::fs::canonicalize(work_root)
         .map_err(|err| format!("failed to canonicalize workspace: {err}"))?;
-    let selected = resolve_user_path(work_root, &target_hint.path)?;
+    let selected =
+        resolve_user_path(work_root, &target_hint.path).map_err(CheapCheckOutcome::Failed)?;
     let canonical = std::fs::canonicalize(&selected)
         .map_err(|err| format!("selected repair target cannot be resolved: {err}"))?;
     if canonical.strip_prefix(&root).is_err() {
-        return Err("repair intent target escapes workspace".to_string());
+        return Err(CheapCheckOutcome::Failed(
+            "repair intent target escapes workspace".to_string(),
+        ));
     }
     if !canonical.is_file() {
-        return Err("repair intent target is not an existing file".to_string());
+        return Err(CheapCheckOutcome::Failed(
+            "repair intent target is not an existing file".to_string(),
+        ));
     }
     let metadata = std::fs::metadata(&canonical)
         .map_err(|err| format!("failed to read repair target metadata: {err}"))?;
     if metadata.len() > VERIFIER_REPAIR_PASS_MAX_FILE_BYTES {
-        return Err("repair target file is too large".to_string());
+        return Err(CheapCheckOutcome::Failed(
+            "repair target file is too large".to_string(),
+        ));
     }
     let bytes =
         std::fs::read(&canonical).map_err(|err| format!("failed to read repair target: {err}"))?;
@@ -14171,39 +14274,56 @@ fn validate_verifier_repair_intents(
     let mut used_whitespace_fallback = false;
     for intent in &intents {
         if !verifier_repair_path_input_is_safe(&intent.path) {
-            return Err("repair intent path is not a safe workspace-relative path".to_string());
+            return Err(CheapCheckOutcome::Failed(
+                "repair intent path is not a safe workspace-relative path".to_string(),
+            ));
         }
-        let candidate = resolve_user_path(work_root, &intent.path)?;
+        let candidate =
+            resolve_user_path(work_root, &intent.path).map_err(CheapCheckOutcome::Failed)?;
         let candidate = std::fs::canonicalize(&candidate)
             .map_err(|err| format!("repair intent target cannot be resolved: {err}"))?;
         if candidate != canonical {
-            return Err("repair intent path does not match selected repair target".to_string());
+            return Err(CheapCheckOutcome::Failed(
+                "repair intent path does not match selected repair target".to_string(),
+            ));
         }
         if intent.old_string.is_empty() {
-            return Err("repair intent old_string must not be empty".to_string());
+            return Err(CheapCheckOutcome::Failed(
+                "repair intent old_string must not be empty".to_string(),
+            ));
         }
         if intent.old_string == intent.new_string {
-            return Err("repair intent old_string and new_string are identical".to_string());
+            return Err(CheapCheckOutcome::Failed(
+                "repair intent old_string and new_string are identical".to_string(),
+            ));
         }
         total_edit_bytes = total_edit_bytes
             .saturating_add(intent.old_string.len())
             .saturating_add(intent.new_string.len());
         if total_edit_bytes > VERIFIER_REPAIR_PASS_MAX_EDIT_BYTES {
-            return Err("repair intent edit is too large".to_string());
+            return Err(CheapCheckOutcome::Failed(
+                "repair intent edit is too large".to_string(),
+            ));
         }
         if verifier_repair_contains_tool_or_markdown(&intent.old_string)
             || verifier_repair_contains_tool_or_markdown(&intent.new_string)
             || verifier_repair_contains_tool_or_markdown(&intent.reason)
         {
-            return Err("repair intent string contained markdown or tool-call markup".to_string());
+            return Err(CheapCheckOutcome::Failed(
+                "repair intent string contained markdown or tool-call markup".to_string(),
+            ));
         }
         if introduces_obvious_secret(&intent.old_string, &intent.new_string) {
-            return Err("repair intent appears to introduce a secret".to_string());
+            return Err(CheapCheckOutcome::Failed(
+                "repair intent appears to introduce a secret".to_string(),
+            ));
         }
         if !verifier_repair_path_allows_shell_controls(&relative_path)
             && verifier_repair_contains_suspicious_shell_payload(&intent.new_string)
         {
-            return Err("repair intent contains suspicious shell-control payload".to_string());
+            return Err(CheapCheckOutcome::Failed(
+                "repair intent contains suspicious shell-control payload".to_string(),
+            ));
         }
         contents = if intent.replace_all {
             apply_bounded_replace_all(&contents, &intent.old_string, &intent.new_string)
@@ -14232,7 +14352,9 @@ fn validate_verifier_repair_intents(
 
     let fingerprint = verifier_repair_intents_fingerprint(context, &relative_path, &intents);
     if context.applied_repair_intents.contains(&fingerprint) {
-        return Err("duplicate repair edit intent for the same failure".to_string());
+        return Err(CheapCheckOutcome::Failed(
+            "duplicate repair edit intent for the same failure".to_string(),
+        ));
     }
     Ok(ValidatedVerifierRepairEdit {
         relative_path,
@@ -14284,33 +14406,25 @@ fn validate_verifier_repair_candidate_contents(
     relative_path: &str,
     candidate_contents: &str,
     used_whitespace_fallback: bool,
-) -> Result<(), String> {
-    match verifier_repair_cheap_check_policy(relative_path) {
-        VerifierRepairCheapCheckPolicy::Disabled => {
+) -> Result<(), CheapCheckOutcome> {
+    use super::project_verifier::{ProjectVerifier, ProjectVerifierOutcome};
+
+    match ProjectVerifier::for_path(relative_path) {
+        None => {
             if used_whitespace_fallback
                 && verifier_repair_path_is_whitespace_sensitive(relative_path)
             {
-                return Err(
-                    "whitespace fallback rejected: no safe cheap check is available".to_string(),
-                );
+                return Err(CheapCheckOutcome::Unavailable);
             }
             Ok(())
         }
-        VerifierRepairCheapCheckPolicy::PythonSyntaxOnly => {
-            run_python_syntax_cheap_check(relative_path, candidate_contents).map_err(|err| {
-                format!("repair candidate cheap check failed for {relative_path}: {err}")
-            })
-        }
-    }
-}
-
-fn verifier_repair_cheap_check_policy(relative_path: &str) -> VerifierRepairCheapCheckPolicy {
-    match Path::new(relative_path)
-        .extension()
-        .and_then(|extension| extension.to_str())
-    {
-        Some("py") | Some("pyw") => VerifierRepairCheapCheckPolicy::PythonSyntaxOnly,
-        _ => VerifierRepairCheapCheckPolicy::Disabled,
+        Some(verifier) => match verifier.check(relative_path, candidate_contents) {
+            ProjectVerifierOutcome::Ok => Ok(()),
+            ProjectVerifierOutcome::Failed(err) => Err(CheapCheckOutcome::Failed(format!(
+                "repair candidate cheap check failed for {relative_path}: {err}"
+            ))),
+            ProjectVerifierOutcome::Unavailable => Err(CheapCheckOutcome::Unavailable),
+        },
     }
 }
 
@@ -14321,87 +14435,6 @@ fn verifier_repair_path_is_whitespace_sensitive(relative_path: &str) -> bool {
             .and_then(|extension| extension.to_str()),
         Some("py") | Some("pyw") | Some("yaml") | Some("yml")
     )
-}
-
-fn run_python_syntax_cheap_check(relative_path: &str, contents: &str) -> Result<(), String> {
-    let temp_root = std::env::temp_dir().join(format!(
-        "anvil-verifier-repair-{}-{}",
-        std::process::id(),
-        uuid::Uuid::now_v7()
-    ));
-    let result = (|| {
-        std::fs::create_dir_all(&temp_root)
-            .map_err(|err| format!("failed to create cheap check temp dir: {err}"))?;
-        let file_name = Path::new(relative_path)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .filter(|name| !name.is_empty())
-            .unwrap_or("candidate.py");
-        let shadow_path = temp_root.join(file_name);
-        std::fs::write(&shadow_path, contents.as_bytes())
-            .map_err(|err| format!("failed to write cheap check shadow file: {err}"))?;
-        let mut command = Command::new("python3");
-        command
-            .arg("-I")
-            .arg("-B")
-            .arg("-m")
-            .arg("py_compile")
-            .arg(&shadow_path)
-            .current_dir(&temp_root)
-            .env_remove("PYTHONPATH")
-            .env_remove("VIRTUAL_ENV")
-            .env("PYTHONDONTWRITEBYTECODE", "1")
-            .env("PYTHONNOUSERSITE", "1")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let output = run_verifier_repair_command_with_timeout(
-            command,
-            Duration::from_secs(VERIFIER_REPAIR_CHEAP_CHECK_TIMEOUT_SECS),
-        )?;
-        if output.status.success() {
-            return Ok(());
-        }
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let combined = format!("{stderr}\n{stdout}");
-        Err(compact_verifier_failure_text(&combined, 320))
-    })();
-    let _ = std::fs::remove_dir_all(&temp_root);
-    result
-}
-
-fn run_verifier_repair_command_with_timeout(
-    mut command: Command,
-    timeout: Duration,
-) -> Result<std::process::Output, String> {
-    let mut child = command
-        .spawn()
-        .map_err(|err| format!("failed to start cheap check command: {err}"))?;
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                return child
-                    .wait_with_output()
-                    .map_err(|err| format!("failed to collect cheap check output: {err}"));
-            }
-            Ok(None) if start.elapsed() >= timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!(
-                    "cheap check timed out after {}s",
-                    timeout.as_secs()
-                ));
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-            Err(err) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("failed while waiting for cheap check: {err}"));
-            }
-        }
-    }
 }
 
 fn apply_unique_whitespace_normalized_replacement(
