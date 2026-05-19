@@ -67,6 +67,17 @@ use super::success::DETERMINISTIC_CONTENT_FALLBACK_TAG;
 
 /// Maximum number of characters of tool-call arguments retained in trace logs.
 const LOG_ARGS_MAX_CHARS: usize = 200;
+
+// Issue #634: SSOT for specialized-fallback ログ event 名。emit 側 / test 側の
+// 双方が参照し、typo による検証無効化を防ぐ。文字列値そのものは既存テスト互換の
+// ため不変。`EVENT_DETERMINISTIC_PYTHON_TEST_FALLBACK` は本 Issue で新規追加。
+const EVENT_DETERMINISTIC_FASTAPI_SCAFFOLD: &str =
+    "agent.empty_workspace.deterministic_fastapi_scaffold";
+const EVENT_DETERMINISTIC_PYTHON_CLI: &str = "agent.empty_workspace.deterministic_python_cli";
+const EVENT_DETERMINISTIC_FORMAT_ERROR_SMALL_EDIT: &str =
+    "agent.deterministic_format_error_small_edit";
+const EVENT_DETERMINISTIC_PYTHON_TEST_FALLBACK: &str =
+    "agent.empty_workspace.deterministic_python_test_fallback";
 const PLAN_REPEATED_EXPLORATION_BLOCK_THRESHOLD: usize = 2;
 const TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT: usize = 3;
 const TASK_CONTRACT_VERIFIER_REPAIR_ATTEMPT_LIMIT: usize = 6;
@@ -8206,7 +8217,7 @@ impl Agent {
             .working_memory
             .note_touched_file(relative.clone());
         log_llm_event(
-            "agent.deterministic_format_error_small_edit",
+            EVENT_DETERMINISTIC_FORMAT_ERROR_SMALL_EDIT,
             serde_json::json!({
                 "session_id": self.session_store.session_id(),
                 "work_root": self.work_root.display().to_string(),
@@ -10149,7 +10160,7 @@ impl Agent {
             if let Some(files) = deterministic::fastapi_scaffold_files(&request) {
                 (
                     "FastAPI scaffold",
-                    "agent.empty_workspace.deterministic_fastapi_scaffold",
+                    EVENT_DETERMINISTIC_FASTAPI_SCAFFOLD,
                     files,
                     "FastAPI",
                 )
@@ -10158,7 +10169,7 @@ impl Agent {
                     self.python_csv_names_from_request_and_anvil(&request);
                 (
                     "Python scaffold",
-                    "agent.empty_workspace.deterministic_python_cli",
+                    EVENT_DETERMINISTIC_PYTHON_CLI,
                     match deterministic::empty_python_cli_files_with_names(
                         &request,
                         script_name.as_deref(),
